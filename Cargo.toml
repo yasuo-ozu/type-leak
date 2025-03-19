@@ -1,0 +1,30 @@
+[package]
+name = "type-leak"
+description = "Enable sharing type context beyond crate boundary"
+authors = ["Yasuo Ozu <yasuo@ozu.email>"]
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/yasuo-ozu/type-leak"
+keywords = ["macros", "syn", "typesystem", "typeleak"]
+categories = [
+  "development-tools::procedural-macro-helpers",
+  "no-std::no-alloc",
+  "rust-patterns",
+]
+license = "MIT"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+petgraph = "0.7.1"
+aquamarine = "0.6.0"
+proc-macro2 = "1.0"
+template-quote = "0.4"
+
+[dependencies.syn]
+version = "2.0"
+features = ["full", "derive", "printing", "extra-traits", "fold", "visit"]
+
+[dev-dependencies]
+aquamarine = "0.6.0"
