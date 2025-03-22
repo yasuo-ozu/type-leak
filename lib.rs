@@ -13,18 +13,10 @@ use template_quote::{quote, ToTokens};
 
 pub use syn;
 
-fn random() -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    std::collections::hash_map::RandomState::new()
-        .build_hasher()
-        .finish()
-}
-
 /// The entry point of this crate.
-#[derive(Clone, Debug)]
 pub struct Leaker {
     /// Referred by [`Leaker::finish()`]
-    pub generics: Generics,
+    generics: Generics,
     graph: Graph<Type, ()>,
     map: HashMap<Type, NodeIndex<DefaultIx>>,
     must_intern_nodes: HashSet<NodeIndex<DefaultIx>>,
@@ -33,7 +25,7 @@ pub struct Leaker {
     /// is a trait, the marker path should refers a type called marker type.
     ///
     /// Referred by [`Leaker::finish()`].
-    pub default_alternate_path: Path,
+    pub implementor_type_fn: Box<dyn Fn(PathArguments) -> Type>,
 }
 
 /// Error represents that the type is not internable.
@@ -47,6 +39,28 @@ impl std::fmt::Display for NotInternableError {
 }
 
 impl std::error::Error for NotInternableError {}
+
+/// Encode [`GenericParam`]s to a type.
+pub fn encode_generics_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericArgument>) -> Type {
+    Type::Tuple(TypeTuple {
+        paren_token: Default::default(),
+        elems: iter
+            .into_iter()
+            .map(|param| -> Type {
+                match param {
+                    GenericArgument::Lifetime(lifetime) => {
+                        parse_quote!(& #lifetime ())
+                    }
+                    GenericArgument::Const(expr) => {
+                        parse_quote!([(); #expr as usize])
+                    }
+                    GenericArgument::Type(ty) => ty.clone(),
+                    _ => panic!(),
+                }
+            })
+            .collect(),
+    })
+}
 
 /// Represents result of [`Leaker::check()`], holding the cause in its tuple item.
 #[derive(Clone, Debug)]
@@ -171,8 +185,11 @@ impl Leaker {
     /// let leaker = Leaker::from_struct(&test_struct).unwrap();
     /// ```
     pub fn from_struct(input: &ItemStruct) -> std::result::Result<Self, NotInternableError> {
-        let ident = &input.ident;
-        let mut leaker = Leaker::with_generics_and_ty(input.generics.clone(), parse_quote!(#ident));
+        let name = input.ident.clone();
+        let mut leaker = Leaker::with_generics_and_implementor(
+            input.generics.clone(),
+            Box::new(move |args: PathArguments| parse_quote!(#name #args)),
+        );
         let mut visitor = AnalyzeVisitor {
             leaker: &mut leaker,
             parent: None,
@@ -188,8 +205,11 @@ impl Leaker {
 
     /// Initialize with [`ItemEnum`]
     pub fn from_enum(input: &ItemEnum) -> std::result::Result<Self, NotInternableError> {
-        let name = &input.ident;
-        let mut leaker = Self::with_generics_and_ty(input.generics.clone(), parse_quote!(#name));
+        let name = input.ident.clone();
+        let mut leaker = Self::with_generics_and_implementor(
+            input.generics.clone(),
+            Box::new(move |args: PathArguments| parse_quote!(#name #args)),
+        );
         let mut visitor = AnalyzeVisitor {
             leaker: &mut leaker,
             parent: None,
@@ -207,7 +227,7 @@ impl Leaker {
     ///
     /// Unlike enum nor struct, it requires ~alternative path~, an absolute path of a struct
     /// which is declared the same crate with the leaker trait and also visible from
-    /// [`Refferrer`]s' context. That struct is used as an `impl` target of `Repeater`
+    /// [`Referrer`]s' context. That struct is used as an `impl` target of `Repeater`
     /// instead of the Leaker's path.
     ///
     /// ```
@@ -221,13 +241,14 @@ impl Leaker {
     /// let alternate: ItemStruct = parse_quote!{
     ///     pub struct MyAlternate;
     /// };
-    /// let _ = Leaker::from_trait(&s, parse_quote!(::path::to::Alternate));
+    /// let _ = Leaker::from_trait(&s, Box::new(|_| parse_quote!(::path::to::Implementor)));
     /// ```
     pub fn from_trait(
         input: &ItemTrait,
-        alternate_path: Path,
+        implementor_type_fn: Box<dyn Fn(PathArguments) -> Type>,
     ) -> std::result::Result<Self, NotInternableError> {
-        let mut leaker = Self::with_generics_and_ty(input.generics.clone(), alternate_path);
+        let mut leaker =
+            Self::with_generics_and_implementor(input.generics.clone(), implementor_type_fn);
         let mut visitor = AnalyzeVisitor {
             leaker: &mut leaker,
             parent: None,
@@ -245,14 +266,17 @@ impl Leaker {
     ///
     /// Types, consts, lifetimes defined in the [`Generics`] is treated as "no needs to be interned" although
     /// they looks like relative path names.
-    pub fn with_generics_and_ty(generics: Generics, default_alternate_path: Path) -> Self {
+    pub fn with_generics_and_implementor(
+        generics: Generics,
+        implementor_type_fn: Box<dyn Fn(PathArguments) -> Type>,
+    ) -> Self {
         Self {
             generics,
             graph: Graph::new(),
             map: HashMap::new(),
             must_intern_nodes: HashSet::new(),
             root_nodes: HashSet::new(),
-            default_alternate_path,
+            implementor_type_fn,
         }
     }
 
@@ -496,9 +520,8 @@ impl Leaker {
     pub fn finish(
         self,
         mut repeater_path_fn: impl FnMut(usize) -> Path,
-        alternate_path: Option<Path>,
     ) -> (Vec<ItemImpl>, Referrer) {
-        let (impl_generics, ty_generics, where_clause) = self.generics.split_for_impl();
+        let (impl_generics, _, where_clause) = self.generics.split_for_impl();
         let id_map: HashMap<_, _> = self
             .root_nodes
             .iter()
@@ -510,21 +533,39 @@ impl Leaker {
                 )
             })
             .collect();
-        let alternate_path = alternate_path.unwrap_or(self.default_alternate_path.clone());
+        let path_args = PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+            colon2_token: None,
+            lt_token: Token![<](Span::call_site()),
+            args: self
+                .generics
+                .params
+                .iter()
+                .map(|param| match param {
+                    GenericParam::Lifetime(lifetime_param) => {
+                        GenericArgument::Lifetime(lifetime_param.lifetime.clone())
+                    }
+                    GenericParam::Type(TypeParam { ident, .. }) => {
+                        GenericArgument::Type(parse_quote!(#ident))
+                    }
+                    GenericParam::Const(ConstParam { ident, .. }) => {
+                        GenericArgument::Const(parse_quote!(#ident))
+                    }
+                })
+                .collect(),
+            gt_token: Token![>](Span::call_site()),
+        });
         (
             id_map
                 .iter()
                 .map(|(ty, n)| {
                     parse2(quote! {
-                impl #impl_generics #{repeater_path_fn(*n)} for #alternate_path #ty_generics #where_clause {
+                impl #impl_generics #{repeater_path_fn(*n)} for #{(*self.implementor_type_fn)(path_args.clone())} #where_clause {
                     type Type = #ty;
                 }
             }).expect("hello4")
                 })
                 .collect(),
-            Referrer {
-                map: id_map,
-            },
+            Referrer { map: id_map },
         )
     }
 
@@ -599,7 +640,7 @@ impl Leaker {
     ///
     pub fn reduce_roots(&mut self) {
         self.reduce_unreachable_nodes();
-        // self.reduce_obvious_nodes();
+        self.reduce_obvious_nodes();
         // TODO: unobvious root reduction with heaulistics
     }
 
@@ -716,6 +757,10 @@ pub struct Referrer {
 }
 
 impl Referrer {
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     pub fn expand(
         &self,
         ty: Type,
