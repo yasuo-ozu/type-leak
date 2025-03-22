@@ -23,7 +23,7 @@ fn random() -> u64 {
 /// The entry point of this crate.
 #[derive(Clone, Debug)]
 pub struct Leaker {
-    /// Referred by [`Leaker::check()`]
+    /// Referred by [`Leaker::finish()`]
     pub generics: Generics,
     graph: Graph<Type, ()>,
     map: HashMap<Type, NodeIndex<DefaultIx>>,
@@ -33,7 +33,7 @@ pub struct Leaker {
     /// is a trait, the marker path should refers a type called marker type.
     ///
     /// Referred by [`Leaker::finish()`].
-    pub default_marker_path: Path,
+    pub default_alternate_path: Path,
 }
 
 /// Error represents that the type is not internable.
@@ -65,13 +65,45 @@ pub enum CheckResult {
 
 struct AnalyzeVisitor<'a> {
     leaker: &'a mut Leaker,
+    generics: Generics,
     parent: Option<NodeIndex<DefaultIx>>,
     error: Option<Span>,
 }
 
 impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
+    fn visit_trait_item_fn(&mut self, i: &TraitItemFn) {
+        let mut visitor = AnalyzeVisitor {
+            leaker: &mut self.leaker,
+            generics: self.generics.clone(),
+            parent: self.parent.clone(),
+            error: self.error.clone(),
+        };
+        for g in &i.sig.generics.params {
+            visitor.generics.params.push(g.clone());
+        }
+        let mut i = i.clone();
+        i.default = None;
+        i.semi_token = Some(Default::default());
+        syn::visit::visit_trait_item_fn(&mut visitor, &mut i);
+        self.error = visitor.error;
+    }
+
+    fn visit_trait_item_type(&mut self, i: &TraitItemType) {
+        let mut visitor = AnalyzeVisitor {
+            leaker: &mut self.leaker,
+            generics: self.generics.clone(),
+            parent: self.parent.clone(),
+            error: self.error.clone(),
+        };
+        for g in &i.generics.params {
+            visitor.generics.params.push(g.clone());
+        }
+        syn::visit::visit_trait_item_type(&mut visitor, i);
+        self.error = visitor.error;
+    }
+
     fn visit_type(&mut self, i: &Type) {
-        match self.leaker.check(i) {
+        match self.leaker.check(&self.generics, i) {
             Err((_, s)) | Ok(CheckResult::MustNotIntern(s)) => {
                 // Emit error and terminate searching
                 self.error = Some(s);
@@ -136,15 +168,16 @@ impl Leaker {
     ///         field3: &'a (T1, T2),
     ///     }
     /// );
-    /// let leaker = Leaker::from_item_struct(&test_struct).unwrap();
+    /// let leaker = Leaker::from_struct(&test_struct).unwrap();
     /// ```
-    pub fn from_item_struct(input: &ItemStruct) -> std::result::Result<Self, NotInternableError> {
+    pub fn from_struct(input: &ItemStruct) -> std::result::Result<Self, NotInternableError> {
         let ident = &input.ident;
         let mut leaker = Leaker::with_generics_and_ty(input.generics.clone(), parse_quote!(#ident));
         let mut visitor = AnalyzeVisitor {
             leaker: &mut leaker,
             parent: None,
             error: None,
+            generics: input.generics.clone(),
         };
         visitor.visit_item_struct(input);
         if let Some(e) = visitor.error {
@@ -154,13 +187,14 @@ impl Leaker {
     }
 
     /// Initialize with [`ItemEnum`]
-    pub fn from_item_enum(input: &ItemEnum) -> std::result::Result<Self, NotInternableError> {
+    pub fn from_enum(input: &ItemEnum) -> std::result::Result<Self, NotInternableError> {
         let name = &input.ident;
         let mut leaker = Self::with_generics_and_ty(input.generics.clone(), parse_quote!(#name));
         let mut visitor = AnalyzeVisitor {
             leaker: &mut leaker,
             parent: None,
             error: None,
+            generics: input.generics.clone(),
         };
         visitor.visit_item_enum(input);
         if let Some(e) = visitor.error {
@@ -171,74 +205,68 @@ impl Leaker {
 
     /// Build an [`Leaker`] with given trait.
     ///
-    /// Unlike enum nor struct, it requires ~marker type~, which is declared the same crate with
-    /// the leaker trait and also visible from [`Refferrer`]s' context. Marker types are used as
-    /// leakers, instead of actual trait definitions.
+    /// Unlike enum nor struct, it requires ~alternative path~, an absolute path of a struct
+    /// which is declared the same crate with the leaker trait and also visible from
+    /// [`Refferrer`]s' context. That struct is used as an `impl` target of `Repeater`
+    /// instead of the Leaker's path.
+    ///
+    /// ```
+    /// # use syn::*;
+    /// # use type_leak::Leaker;
+    /// let s: ItemTrait = parse_quote!{
+    ///     pub trait MyTrait<T, U> {
+    ///         fn func(self, t: T) -> U;
+    ///     }
+    /// };
+    /// let alternate: ItemStruct = parse_quote!{
+    ///     pub struct MyAlternate;
+    /// };
+    /// let _ = Leaker::from_trait(&s, parse_quote!(::path::to::Alternate));
+    /// ```
     pub fn from_trait(
         input: &ItemTrait,
-        marker_name: Option<&Ident>,
-    ) -> std::result::Result<(Self, ItemStruct), NotInternableError> {
-        let marker_name = marker_name.cloned().unwrap_or_else(|| {
-            Ident::new(
-                &format!("__TypeLeak_Marker_{}", random()),
-                Span::call_site(),
-            )
-        });
-        let mut leaker =
-            Self::with_generics_and_ty(input.generics.clone(), parse_quote!(#marker_name));
+        alternate_path: Path,
+    ) -> std::result::Result<Self, NotInternableError> {
+        let mut leaker = Self::with_generics_and_ty(input.generics.clone(), alternate_path);
         let mut visitor = AnalyzeVisitor {
             leaker: &mut leaker,
             parent: None,
             error: None,
+            generics: input.generics.clone(),
         };
         visitor.visit_item_trait(input);
         if let Some(e) = visitor.error {
             return Err(NotInternableError(e));
         }
-        let (impl_generics, _, _) = input.generics.split_for_impl();
-        let phantom_tys = input
-            .generics
-            .params
-            .iter()
-            .filter_map(|p| match &p {
-                GenericParam::Lifetime(_) => Some(quote!(&#p ())),
-                GenericParam::Type(_) => Some(quote!(#p)),
-                GenericParam::Const(_) => None,
-            })
-            .collect::<Vec<_>>();
-        Ok((
-            leaker,
-            parse2(quote! {
-                #{&input.vis} struct #marker_name #impl_generics {
-                    _phantom: ::core::marker::PhantomData<(#(#phantom_tys,)*)>,
-                    _infallible: ::core::convert::Infallible,
-                }
-            })
-            .unwrap(),
-        ))
+        Ok(leaker)
     }
 
     /// Initialize empty [`Leaker`] with given generics.
     ///
     /// Types, consts, lifetimes defined in the [`Generics`] is treated as "no needs to be interned" although
     /// they looks like relative path names.
-    pub fn with_generics_and_ty(generics: Generics, default_marker_path: Path) -> Self {
+    pub fn with_generics_and_ty(generics: Generics, default_alternate_path: Path) -> Self {
         Self {
             generics,
             graph: Graph::new(),
             map: HashMap::new(),
             must_intern_nodes: HashSet::new(),
             root_nodes: HashSet::new(),
-            default_marker_path,
+            default_alternate_path,
         }
     }
 
     /// Intern the given type as a root node.
-    pub fn intern(&mut self, ty: &Type) -> std::result::Result<&mut Self, NotInternableError> {
+    pub fn intern(
+        &mut self,
+        generics: Generics,
+        ty: &Type,
+    ) -> std::result::Result<&mut Self, NotInternableError> {
         let mut visitor = AnalyzeVisitor {
             leaker: self,
             parent: None,
             error: None,
+            generics,
         };
         visitor.visit_type(ty);
         if let Some(e) = visitor.error {
@@ -253,7 +281,11 @@ impl Leaker {
     ///
     ///
     /// See [`CheckResult`].
-    pub fn check(&self, ty: &Type) -> std::result::Result<CheckResult, (Span, Span)> {
+    pub fn check(
+        &self,
+        generics: &Generics,
+        ty: &Type,
+    ) -> std::result::Result<CheckResult, (Span, Span)> {
         use syn::visit::Visit;
         #[derive(Clone)]
         struct Visitor {
@@ -394,8 +426,8 @@ impl Leaker {
                 fn visit_expr(&mut self, i: &Expr) {
                     match i {
                         Expr::Closure(_)
+                        | Expr::Assign(_)
                         | Expr::Verbatim(_)
-                        | Expr::MethodCall(_)
                         | Expr::Macro(_)
                         | Expr::Infer(_) => {
                             self.impossible = Some(i.span());
@@ -405,23 +437,29 @@ impl Leaker {
                     syn::visit::visit_expr(self, i)
                 }
                 fn visit_path(&mut self, i: &Path) {
-                    match (i.leading_colon, i.get_ident()) {
-                        // i is a generic parameter
-                        (None, Some(ident)) if self.generic_idents.contains(&ident) => {}
-                        // relative path, not a generic parameter
-                        (None, _) => {
-                            self.must = Some((-1, i.span()));
+                    if matches!(i.segments.iter().next(), Some(PathSegment { ident, arguments }) if ident == "Self" && arguments.is_none())
+                    {
+                        // do nothing
+                    } else {
+                        match (i.leading_colon, i.get_ident()) {
+                            // i is a generic parameter
+                            (None, Some(ident))
+                                if self.generic_idents.contains(&ident) || ident == "Self" => {}
+                            // relative path, not a generic parameter
+                            (None, _) => {
+                                self.must = Some((-1, i.span()));
+                            }
+                            // absolute path
+                            (Some(_), _) => (),
                         }
-                        // absolute path
-                        (Some(_), _) => (),
                     }
+
                     syn::visit::visit_path(self, i)
                 }
             }
         };
         let mut visitor = Visitor {
-            generic_lifetimes: self
-                .generics
+            generic_lifetimes: generics
                 .params
                 .iter()
                 .filter_map(|gp| {
@@ -432,8 +470,7 @@ impl Leaker {
                     }
                 })
                 .collect(),
-            generic_idents: self
-                .generics
+            generic_idents: generics
                 .params
                 .iter()
                 .filter_map(|gp| match gp {
@@ -458,33 +495,35 @@ impl Leaker {
     /// Finish building the [`Leaker`] and convert it into [`Referrer`].
     pub fn finish(
         self,
-        leaker_ty: Type,
-        repeater_path: Path,
-        marker_path: Option<&Path>,
+        mut repeater_path_fn: impl FnMut(usize) -> Path,
+        alternate_path: Option<Path>,
     ) -> (Vec<ItemImpl>, Referrer) {
         let (impl_generics, ty_generics, where_clause) = self.generics.split_for_impl();
         let id_map: HashMap<_, _> = self
             .root_nodes
             .iter()
             .enumerate()
-            .map(|(n, idx)| (self.graph.node_weight(idx.clone()).unwrap().clone(), n))
+            .map(|(n, idx)| {
+                (
+                    self.graph.node_weight(idx.clone()).expect("hello3").clone(),
+                    n,
+                )
+            })
             .collect();
-        let marker_path = marker_path.unwrap_or(&self.default_marker_path);
+        let alternate_path = alternate_path.unwrap_or(self.default_alternate_path.clone());
         (
             id_map
                 .iter()
                 .map(|(ty, n)| {
                     parse2(quote! {
-                impl #impl_generics #repeater_path<#n> for #marker_path #ty_generics #where_clause {
+                impl #impl_generics #{repeater_path_fn(*n)} for #alternate_path #ty_generics #where_clause {
                     type Type = #ty;
                 }
-            }).unwrap()
+            }).expect("hello4")
                 })
                 .collect(),
             Referrer {
                 map: id_map,
-                leaker_ty,
-                default_repeater_path: repeater_path,
             },
         )
     }
@@ -504,7 +543,7 @@ impl Leaker {
     /// }
     /// ```
     ///
-    /// [`Leaker`], when initialized with [`Leaker::from_item_struct()`], analyze the AST and
+    /// [`Leaker`], when initialized with [`Leaker::from_struct()`], analyze the AST and
     /// construct a DAG which represents all (internable) types and the dependency relations like
     /// this:
     ///
@@ -617,7 +656,6 @@ impl Leaker {
             .intersection(&reachable_backward)
             .cloned()
             .collect::<HashSet<_>>();
-        dbg!(&reachable);
         self.graph = self.graph.filter_map(
             |ix, node| reachable.contains(&ix).then_some(node.clone()),
             |ix, _| {
@@ -625,11 +663,29 @@ impl Leaker {
                 (reachable.contains(&e1) && reachable.contains(&e2)).then_some(())
             },
         );
-        self.root_nodes = self.root_nodes.intersection(&reachable).cloned().collect();
+        let mut new_graph = Graph::new();
+        let mut node_map = HashMap::new();
+        for node in self.graph.node_indices() {
+            if reachable.contains(&node) {
+                let new_node = new_graph.add_node(self.graph[node].clone());
+                node_map.insert(node, new_node);
+            }
+        }
+        for edge in self.graph.edge_indices() {
+            let (n1, n2) = self.graph.edge_endpoints(edge).unwrap();
+            if let (Some(nn1), Some(nn2)) = (node_map.get(&n1), node_map.get(&n2)) {
+                new_graph.add_edge(*nn1, *nn2, ());
+            }
+        }
+        self.root_nodes = self
+            .root_nodes
+            .iter()
+            .filter_map(|n| node_map.get(n).cloned())
+            .collect();
         self.must_intern_nodes = self
             .must_intern_nodes
-            .intersection(&reachable)
-            .cloned()
+            .iter()
+            .filter_map(|n| node_map.get(n).cloned())
             .collect();
     }
 }
@@ -654,30 +710,34 @@ fn get_reachable_nodes<N, E>(
     ret
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Referrer {
     map: HashMap<Type, usize>,
-    leaker_ty: Type,
-    default_repeater_path: Path,
 }
 
 impl Referrer {
-    pub fn expand(&self, ty: Type, repeater_path: Option<Path>) -> Type {
+    pub fn expand(
+        &self,
+        ty: Type,
+        leaker_ty: &Type,
+        repeater_path_fn: impl FnMut(usize) -> Path,
+    ) -> Type {
         use syn::fold::Fold;
 
-        struct Folder<'a>(&'a Referrer);
-        impl<'a> Fold for Folder<'a> {
+        struct Folder<'a, F>(&'a Referrer, &'a Type, F);
+        impl<'a, F: FnMut(usize) -> Path> Fold for Folder<'a, F> {
             fn fold_type(&mut self, ty: Type) -> Type {
                 if let Some(idx) = self.0.map.get(&ty) {
                     parse2(quote! {
-                        <#{&self.0.leaker_ty} as #{&self.0.default_repeater_path}<#idx>>::Type
+                        <#{&self.1} as #{&self.2(*idx)}>::Type
                     })
-                    .unwrap()
+                    .expect("hello2")
                 } else {
                     syn::fold::fold_type(self, ty)
                 }
             }
         }
-        let mut folder = Folder(self);
+        let mut folder = Folder(self, leaker_ty, repeater_path_fn);
         folder.fold_type(ty)
     }
 }
@@ -697,26 +757,18 @@ impl Parse for Referrer {
             }
             map_content.parse::<Token![,]>()?;
         }
-        let leaker_ty = input.parse()?;
-        input.parse::<Token![,]>()?;
-        let repeater_path = input.parse()?;
-        let _ = input.parse::<Token![,]>();
-        Ok(Self {
-            map,
-            leaker_ty,
-            default_repeater_path: repeater_path,
-        })
+        Ok(Self { map })
     }
 }
 
 impl ToTokens for Referrer {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
         tokens.extend(quote! {
-            ( #(for (key, val) in &self.map), {
-                #key: #val
-            })
-            #{&self.leaker_ty},
-            #{&self.default_repeater_path}
+            (
+                #(for (key, val) in &self.map), {
+                    #key: #val
+                }
+            )
         })
     }
 }
