@@ -15,18 +15,11 @@ fn test_leaker() {
     let mut leaker = Leaker::from_struct(&test_struct).unwrap();
     leaker.reduce_roots();
     let (repeater_impls, referrer) = leaker.finish(|_| parse_quote!(LeakerType));
-    let repeater_impl_tys = repeater_impls
-        .iter()
-        .map(|rimp| {
-            rimp.items.iter().filter_map(|item| match item {
-                ImplItem::Type(ImplItemType { ty, .. }) => Some(format!("{}", quote!(#ty))),
-                _ => None,
-            })
-        })
-        .flatten()
-        .collect::<BTreeSet<_>>();
     assert_eq!(
-        repeater_impl_tys,
+        referrer
+            .iter()
+            .map(|i| quote!(#i).to_string())
+            .collect::<BTreeSet<_>>(),
         [
             "(MyType2 , MyType3 < MyType1 > , MyType4 , MyType5)",
             "MyType1",

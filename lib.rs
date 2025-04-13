@@ -671,17 +671,17 @@ impl Leaker {
             {
                 self.graph.update_edge(edge_in_source, node2, ());
                 self.graph.remove_edge(edge_in);
-                must_intern_nodes.iter_mut().for_each(|n| {
-                    if n == &node1 {
-                        *n = node2.clone()
-                    }
-                });
-                root_nodes.iter_mut().for_each(|n| {
-                    if n == &node1 {
-                        *n = node2.clone()
-                    }
-                });
             }
+            must_intern_nodes.iter_mut().for_each(|n| {
+                if n == &node1 {
+                    *n = node2.clone()
+                }
+            });
+            root_nodes.iter_mut().for_each(|n| {
+                if n == &node1 {
+                    *n = node2.clone()
+                }
+            });
             self.graph.remove_node(node1);
         }
         self.must_intern_nodes = must_intern_nodes.into_iter().collect();
@@ -698,13 +698,13 @@ impl Leaker {
             .intersection(&reachable_backward)
             .cloned()
             .collect::<HashSet<_>>();
-        self.graph = self.graph.filter_map(
-            |ix, node| reachable.contains(&ix).then_some(node.clone()),
-            |ix, _| {
-                let (e1, e2) = self.graph.edge_endpoints(ix).unwrap();
-                (reachable.contains(&e1) && reachable.contains(&e2)).then_some(())
-            },
-        );
+        // self.graph = self.graph.filter_map(
+        //     |ix, node| reachable.contains(&ix).then_some(node.clone()),
+        //     |ix, _| {
+        //         let (e1, e2) = self.graph.edge_endpoints(ix).unwrap();
+        //         (reachable.contains(&e1) && reachable.contains(&e2)).then_some(())
+        //     },
+        // );
         let mut new_graph = Graph::new();
         let mut node_map = HashMap::new();
         for node in self.graph.node_indices() {
@@ -729,6 +729,7 @@ impl Leaker {
             .iter()
             .filter_map(|n| node_map.get(n).cloned())
             .collect();
+        let _ = std::mem::replace(&mut self.graph, new_graph);
     }
 }
 
@@ -744,7 +745,13 @@ fn get_reachable_nodes<N, E>(
             .map(|node| graph.neighbors(node.clone()))
             .flatten()
             .collect();
-        if !buf.iter().any(|node| ret.insert(node.clone())) {
+        let mut count = 0;
+        for node in &buf {
+            if ret.insert(node.clone()) {
+                count += 1;
+            }
+        }
+        if count == 0 {
             break;
         }
         std::mem::swap(&mut frontier, &mut buf);
@@ -789,7 +796,7 @@ impl Referrer {
                     parse2(quote! {
                         <#{&self.1} as #{&self.2(*idx)}>::Type
                     })
-                    .expect("hello2")
+                    .unwrap()
                 } else {
                     syn::fold::fold_type(self, ty)
                 }
