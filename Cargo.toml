@@ -24,7 +24,15 @@ template-quote = "0.4"
 
 [dependencies.syn]
 version = "2.0"
-features = ["full", "derive", "printing", "extra-traits", "fold", "visit"]
+features = [
+  "full",
+  "derive",
+  "printing",
+  "extra-traits",
+  "fold",
+  "visit",
+  "visit-mut",
+]
 
 [dev-dependencies]
 aquamarine = "0.6.0"

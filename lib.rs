@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use syn::parse::Parse;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
+use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
 
@@ -761,6 +762,18 @@ impl Referrer {
         self.map.is_empty()
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &Type> {
+        self.map.keys()
+    }
+
+    pub fn into_visitor<F: FnMut(usize) -> Path + Clone>(
+        self,
+        leaker_ty: Type,
+        repeater_path_fn: F,
+    ) -> Visitor<F> {
+        Visitor(self, leaker_ty, repeater_path_fn)
+    }
+
     pub fn expand(
         &self,
         ty: Type,
@@ -784,6 +797,135 @@ impl Referrer {
         }
         let mut folder = Folder(self, leaker_ty, repeater_path_fn);
         folder.fold_type(ty)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Visitor<F>(Referrer, Type, F);
+
+impl<F: FnMut(usize) -> Path + Clone> Visitor<F> {
+    fn with_generics(&mut self, generics: &mut Generics) -> Self {
+        let mut visitor = self.clone();
+        for gp in generics.params.iter_mut() {
+            if let GenericParam::Type(TypeParam { ident, .. }) = gp {
+                visitor.0.map.remove(&parse_quote!(#ident));
+            }
+            visitor.visit_generic_param_mut(gp);
+        }
+        visitor
+    }
+
+    fn with_signature(&mut self, sig: &mut Signature) -> Self {
+        let mut visitor = self.with_generics(&mut sig.generics);
+        for input in sig.inputs.iter_mut() {
+            visitor.visit_fn_arg_mut(input);
+        }
+        visitor.visit_return_type_mut(&mut sig.output);
+        visitor
+    }
+}
+
+impl<F: FnMut(usize) -> Path + Clone> VisitMut for Visitor<F> {
+    fn visit_type_mut(&mut self, i: &mut Type) {
+        *i = self.0.expand(i.clone(), &self.1, &mut self.2);
+    }
+    fn visit_item_struct_mut(&mut self, i: &mut ItemStruct) {
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        let mut visitor = self.with_generics(&mut i.generics);
+        visitor.visit_fields_mut(&mut i.fields);
+    }
+    fn visit_item_enum_mut(&mut self, i: &mut ItemEnum) {
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        let mut visitor = self.with_generics(&mut i.generics);
+        for variant in i.variants.iter_mut() {
+            visitor.visit_variant_mut(variant);
+        }
+    }
+    fn visit_item_trait_mut(&mut self, i: &mut ItemTrait) {
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        let mut visitor = self.with_generics(&mut i.generics);
+        for supertrait in i.supertraits.iter_mut() {
+            visitor.visit_type_param_bound_mut(supertrait);
+        }
+        for item in i.items.iter_mut() {
+            visitor.visit_trait_item_mut(item);
+        }
+    }
+    fn visit_item_union_mut(&mut self, i: &mut ItemUnion) {
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        let mut visitor = self.with_generics(&mut i.generics);
+        visitor.visit_fields_named_mut(&mut i.fields);
+    }
+    fn visit_item_type_mut(&mut self, i: &mut ItemType) {
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        let mut visitor = self.with_generics(&mut i.generics);
+        visitor.visit_type_mut(&mut i.ty);
+    }
+    fn visit_item_fn_mut(&mut self, i: &mut ItemFn) {
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        let mut visitor = self.with_signature(&mut i.sig);
+        visitor.visit_block_mut(i.block.as_mut());
+    }
+    fn visit_trait_item_fn_mut(&mut self, i: &mut TraitItemFn) {
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        let mut visitor = self.with_signature(&mut i.sig);
+        if let Some(block) = &mut i.default {
+            visitor.visit_block_mut(block);
+        }
+    }
+    fn visit_trait_item_type_mut(&mut self, i: &mut TraitItemType) {
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        let mut visitor = self.with_generics(&mut i.generics);
+        for bound in i.bounds.iter_mut() {
+            visitor.visit_type_param_bound_mut(bound);
+        }
+        if let Some((_, ty)) = &mut i.default {
+            visitor.visit_type_mut(ty);
+        }
+    }
+    fn visit_trait_item_const_mut(&mut self, i: &mut TraitItemConst) {
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        let mut visitor = self.with_generics(&mut i.generics);
+        visitor.visit_type_mut(&mut i.ty);
+        if let Some((_, expr)) = &mut i.default {
+            visitor.visit_expr_mut(expr);
+        }
+    }
+    fn visit_block_mut(&mut self, i: &mut Block) {
+        let mut visitor = self.clone();
+        for stmt in &i.stmts {
+            match stmt {
+                Stmt::Item(Item::Struct(ItemStruct { ident, .. }))
+                | Stmt::Item(Item::Enum(ItemEnum { ident, .. }))
+                | Stmt::Item(Item::Union(ItemUnion { ident, .. }))
+                | Stmt::Item(Item::Trait(ItemTrait { ident, .. }))
+                | Stmt::Item(Item::Type(ItemType { ident, .. })) => {
+                    visitor.0.map.remove(&parse_quote!(#ident));
+                }
+                _ => (),
+            }
+        }
+        for stmt in i.stmts.iter_mut() {
+            visitor.visit_stmt_mut(stmt);
+        }
     }
 }
 
