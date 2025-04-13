@@ -189,4 +189,11 @@ fn test_check() {
         leaker.check(&test_struct.generics, &parse_quote!(&Self)),
         Ok(CheckResult::Neutral) // relative path
     ));
+    assert!(matches!(
+        leaker.check(
+            &test_struct.generics,
+            &parse_quote!(::core::fmt::Formatter<'_>)
+        ),
+        Ok(CheckResult::Neutral) // relative path
+    ));
 }

@@ -412,10 +412,7 @@ impl Leaker {
                                 }
                             }
                         }
-                        Type::ImplTrait(_)
-                        | Type::Infer(_)
-                        | Type::Macro(_)
-                        | Type::Verbatim(_) => {
+                        Type::ImplTrait(_) | Type::Macro(_) | Type::Verbatim(_) => {
                             self.impossible = Some(i.span());
                         }
                         _ => (),
@@ -442,6 +439,7 @@ impl Leaker {
                 }
                 fn visit_lifetime(&mut self, i: &Lifetime) {
                     if i.to_string() != "'static"
+                        && i.to_string() != "'_"
                         && !self.generic_lifetimes.iter().any(|lt| lt == i)
                     {
                         self.must = Some((-1, i.span()));
@@ -450,11 +448,7 @@ impl Leaker {
                 }
                 fn visit_expr(&mut self, i: &Expr) {
                     match i {
-                        Expr::Closure(_)
-                        | Expr::Assign(_)
-                        | Expr::Verbatim(_)
-                        | Expr::Macro(_)
-                        | Expr::Infer(_) => {
+                        Expr::Closure(_) | Expr::Assign(_) | Expr::Verbatim(_) | Expr::Macro(_) => {
                             self.impossible = Some(i.span());
                         }
                         _ => (),
@@ -640,8 +634,10 @@ impl Leaker {
     /// ```
     ///
     pub fn reduce_roots(&mut self) {
+        // dbg!(&self.graph, &self.root_nodes);
         self.reduce_unreachable_nodes();
-        self.reduce_obvious_nodes();
+        // self.reduce_obvious_nodes();
+        // dbg!(&self.graph, &self.root_nodes);
         // TODO: unobvious root reduction with heaulistics
     }
 
