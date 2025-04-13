@@ -634,10 +634,8 @@ impl Leaker {
     /// ```
     ///
     pub fn reduce_roots(&mut self) {
-        // dbg!(&self.graph, &self.root_nodes);
         self.reduce_unreachable_nodes();
-        // self.reduce_obvious_nodes();
-        // dbg!(&self.graph, &self.root_nodes);
+        self.reduce_obvious_nodes();
         // TODO: unobvious root reduction with heaulistics
     }
 
@@ -657,6 +655,7 @@ impl Leaker {
                 None
             })
             .collect();
+        let mut removing_nodes = HashSet::new();
         for (node1, node2, edge) in nodes {
             self.graph.remove_edge(edge);
             for (edge_in_source, edge_in) in self
@@ -678,10 +677,31 @@ impl Leaker {
                     *n = node2.clone()
                 }
             });
-            self.graph.remove_node(node1);
+            removing_nodes.insert(node1);
         }
-        self.must_intern_nodes = must_intern_nodes.into_iter().collect();
-        self.root_nodes = root_nodes.into_iter().collect();
+        let mut new_graph = Graph::new();
+        let mut node_map = HashMap::new();
+        for node in self.graph.node_indices() {
+            if !removing_nodes.contains(&node) {
+                let new_node = new_graph.add_node(self.graph[node].clone());
+                node_map.insert(node, new_node);
+            }
+        }
+        for edge in self.graph.edge_indices() {
+            let (n1, n2) = self.graph.edge_endpoints(edge).unwrap();
+            if let (Some(nn1), Some(nn2)) = (node_map.get(&n1), node_map.get(&n2)) {
+                new_graph.add_edge(*nn1, *nn2, ());
+            }
+        }
+        self.root_nodes = root_nodes
+            .iter()
+            .filter_map(|n| node_map.get(n).cloned())
+            .collect();
+        self.must_intern_nodes = must_intern_nodes
+            .iter()
+            .filter_map(|n| node_map.get(n).cloned())
+            .collect();
+        let _ = std::mem::replace(&mut self.graph, new_graph);
     }
 
     fn reduce_unreachable_nodes(&mut self) {
