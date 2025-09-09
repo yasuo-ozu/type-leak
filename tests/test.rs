@@ -30,13 +30,13 @@ fn test_leaker() {
         .collect::<BTreeSet<_>>()
     );
     let mut f = |_, _| parse_quote!(::path::to::Implementor);
-    assert_ne!(
+    assert_eq!(
         quote!(#{referrer.expand(parse_quote!(MyType1),  &mut f)}).to_string(),
-        quote!(MyType1).to_string()
+        quote!(::path::to::Implementor).to_string()
     );
-    assert_ne!(
+    assert_eq!(
         quote!(#{referrer.expand(parse_quote!((MyType2 , MyType3 < MyType1 > , MyType4 , MyType5)),  &mut f)}).to_string(),
-        quote!((MyType2 , MyType3 < MyType1 > , MyType4 , MyType5)).to_string()
+        quote!(::path::to::Implementor).to_string()
     );
 }
 
