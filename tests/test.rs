@@ -237,3 +237,52 @@ fn test_check() {
         Ok(CheckResult::MustNotIntern(_)) // relative path
     ));
 }
+
+#[test]
+fn test_check_self_no_internable() {
+    use type_leak::{Leaker, CheckResult};
+    
+    let test_struct: ItemStruct = parse_quote!(
+        pub struct MyStruct<'l1, const N1: usize, T1, T2, T3>;
+    );
+    
+    // Test with self_ty_can_be_interned = true (default behavior)
+    let leaker_true = Leaker::with_generics(test_struct.generics.clone());
+    assert!(matches!(
+        leaker_true.check(
+            &test_struct.generics,
+            &parse_quote!(Self)
+        ),
+        Ok(CheckResult::Neutral) // Self should be allowed by default
+    ));
+    
+    // Test with self_ty_can_be_interned = false
+    let mut leaker_false = Leaker::with_generics(test_struct.generics.clone());
+    // Set the flag to false to disallow Self types
+    leaker_false.self_ty_can_be_interned = false;
+    assert!(matches!(
+        leaker_false.check(
+            &test_struct.generics,
+            &parse_quote!(Self)
+        ),
+        Ok(CheckResult::MustNotIntern(_)) // Self should be rejected when flag is false
+    ));
+    
+    // Test with complex Self usage
+    assert!(matches!(
+        leaker_false.check(
+            &test_struct.generics,
+            &parse_quote!(&Self)
+        ),
+        Ok(CheckResult::MustNotIntern(_)) // Reference to Self should also be rejected
+    ));
+    
+    // Test that non-Self types are unaffected by the flag
+    assert!(matches!(
+        leaker_false.check(
+            &test_struct.generics,
+            &parse_quote!(T1)
+        ),
+        Ok(CheckResult::Neutral) // Generic type should still work
+    ));
+}

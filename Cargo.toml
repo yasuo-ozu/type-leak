@@ -17,7 +17,7 @@ license = "MIT"
 path = "lib.rs"
 
 [dependencies]
-petgraph = "0.7.1"
+gotgraph = "0.2.0"
 aquamarine = "0.6.0"
 proc-macro2 = "1.0"
 template-quote = "0.4"

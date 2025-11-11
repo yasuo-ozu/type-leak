@@ -1,8 +1,7 @@
 #![doc = include_str!("./README.md")]
 
-use petgraph::graph::{DefaultIx, NodeIndex};
-use petgraph::visit::EdgeRef;
-use petgraph::Graph;
+use gotgraph::prelude::VecGraph;
+use gotgraph::graph::{Graph as GotGraph, GraphUpdate};
 use proc_macro2::Span;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -20,11 +19,10 @@ pub use syn;
 /// The entry point of this crate.
 pub struct Leaker {
     generics: Generics,
-    graph: Graph<Type, ()>,
-    map: HashMap<Type, NodeIndex<DefaultIx>>,
-    must_intern_nodes: HashSet<NodeIndex<DefaultIx>>,
-    root_nodes: HashSet<NodeIndex<DefaultIx>>,
-    self_ty_can_be_interned: bool,
+    graph: VecGraph<Type, ()>,
+    pub self_ty_can_be_interned: bool,
+    reachable_types: HashSet<Type>,
+    pending_operations: Option<Vec<GraphOperation>>,
 }
 
 /// Error represents that the type is not internable.
@@ -76,11 +74,20 @@ pub enum CheckResult {
     Neutral,
 }
 
+#[derive(Debug, Clone)]
+struct GraphOperation {
+    node_type: Type,
+    parent: Option<Type>,
+    is_root: bool,
+    is_must_intern: bool,
+}
+
 struct AnalyzeVisitor<'a> {
     leaker: &'a mut Leaker,
     generics: Generics,
-    parent: Option<NodeIndex<DefaultIx>>,
+    parent: Option<Type>,
     error: Option<Span>,
+    operations: Vec<GraphOperation>,
 }
 
 impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
@@ -90,6 +97,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             generics: self.generics.clone(),
             parent: self.parent.clone(),
             error: self.error.clone(),
+            operations: Vec::new(),
         };
         for g in &i.sig.generics.params {
             visitor.generics.params.push(g.clone());
@@ -99,6 +107,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         i.semi_token = Some(Default::default());
         syn::visit::visit_trait_item_fn(&mut visitor, &mut i);
         self.error = visitor.error;
+        self.operations.extend(visitor.operations);
     }
 
     fn visit_receiver(&mut self, i: &Receiver) {
@@ -119,12 +128,14 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             generics: self.generics.clone(),
             parent: self.parent.clone(),
             error: self.error.clone(),
+            operations: Vec::new(),
         };
         for g in &i.generics.params {
             visitor.generics.params.push(g.clone());
         }
         syn::visit::visit_trait_item_type(&mut visitor, i);
         self.error = visitor.error;
+        self.operations.extend(visitor.operations);
     }
 
     fn visit_type(&mut self, i: &Type) {
@@ -135,26 +146,21 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             }
             Ok(CheckResult::MustNotIntern(_)) => (),
             o => {
-                let child = self
-                    .leaker
-                    .map
-                    .entry(i.clone())
-                    .or_insert_with(|| self.leaker.graph.add_node(i.clone()))
-                    .clone();
-                if let Some(parent) = &self.parent {
-                    self.leaker
-                        .graph
-                        .add_edge(parent.clone(), child.clone(), ());
-                } else {
-                    self.leaker.root_nodes.insert(child.clone());
-                }
-                if let Ok(CheckResult::MustIntern(_)) = o {
-                    // Terminate searching
-                    self.leaker.must_intern_nodes.insert(child.clone());
-                } else {
-                    // Perform recuesive call
-                    let parent = self.parent;
-                    self.parent = Some(child);
+                // Collect the operation instead of directly modifying the graph
+                let is_must_intern = matches!(o, Ok(CheckResult::MustIntern(_)));
+                let is_root = self.parent.is_none();
+                
+                self.operations.push(GraphOperation {
+                    node_type: i.clone(),
+                    parent: self.parent.clone(),
+                    is_root,
+                    is_must_intern,
+                });
+
+                if !is_must_intern {
+                    // Perform recursive call
+                    let parent = self.parent.clone();
+                    self.parent = Some(i.clone());
                     syn::visit::visit_type(self, i);
                     self.parent = parent;
                 }
@@ -203,11 +209,14 @@ impl Leaker {
             parent: None,
             error: None,
             generics: input.generics.clone(),
+            operations: Vec::new(),
         };
         visitor.visit_item_struct(input);
         if let Some(e) = visitor.error {
             return Err(NotInternableError(e));
         }
+        let operations = visitor.operations;
+        leaker.apply_operations(operations);
         Ok(leaker)
     }
 
@@ -219,11 +228,14 @@ impl Leaker {
             parent: None,
             error: None,
             generics: input.generics.clone(),
+            operations: Vec::new(),
         };
         visitor.visit_item_enum(input);
         if let Some(e) = visitor.error {
             return Err(NotInternableError(e));
         }
+        let operations = visitor.operations;
+        leaker.apply_operations(operations);
         Ok(leaker)
     }
 
@@ -254,11 +266,14 @@ impl Leaker {
             parent: None,
             error: None,
             generics: input.generics.clone(),
+            operations: Vec::new(),
         };
         visitor.visit_item_trait(input);
         if let Some(e) = visitor.error {
             return Err(NotInternableError(e));
         }
+        let operations = visitor.operations;
+        leaker.apply_operations(operations);
         Ok(leaker)
     }
 
@@ -269,12 +284,21 @@ impl Leaker {
     pub fn with_generics(generics: Generics) -> Self {
         Self {
             generics,
-            graph: Graph::new(),
-            map: HashMap::new(),
-            must_intern_nodes: HashSet::new(),
-            root_nodes: HashSet::new(),
+            graph: VecGraph::default(),
             self_ty_can_be_interned: true,
+            reachable_types: HashSet::new(),
+            pending_operations: None,
         }
+    }
+
+    /// Apply collected graph operations using scope_mut()
+    fn apply_operations(&mut self, operations: Vec<GraphOperation>) {
+        if operations.is_empty() {
+            return;
+        }
+
+        // Store operations for proper graph reduction in reduce_roots()
+        self.pending_operations = Some(operations);
     }
 
     /// Intern the given type as a root node.
@@ -288,11 +312,14 @@ impl Leaker {
             parent: None,
             error: None,
             generics,
+            operations: Vec::new(),
         };
         visitor.visit_type(ty);
         if let Some(e) = visitor.error {
             Err(NotInternableError(e))
         } else {
+            let operations = visitor.operations;
+            self.apply_operations(operations);
             Ok(self)
         }
     }
@@ -551,11 +578,8 @@ impl Leaker {
 
     /// Finish building the [`Leaker`] and convert it into [`Referrer`].
     pub fn finish(self) -> Referrer {
-        let leak_types: Vec<_> = self
-            .root_nodes
-            .iter()
-            .map(|node| self.graph.node_weight(node.clone()).unwrap().clone())
-            .collect();
+        // Use the reachable types computed by apply_operations
+        let leak_types: Vec<_> = self.reachable_types.into_iter().collect();
         let map = leak_types
             .iter()
             .enumerate()
@@ -634,145 +658,253 @@ impl Leaker {
     /// ```
     ///
     pub fn reduce_roots(&mut self) {
+        if let Some(operations) = self.pending_operations.take() {
+            self.build_graph_and_reduce(operations);
+        }
         self.reduce_unreachable_nodes();
         self.reduce_obvious_nodes();
-        // TODO: unobvious root reduction with heaulistics
+    }
+
+    fn build_graph_and_reduce(&mut self, operations: Vec<GraphOperation>) {
+        // Build parent-child relationships from operations
+        let mut children: HashMap<Type, Vec<Type>> = HashMap::new();
+        let mut parents: HashMap<Type, Vec<Type>> = HashMap::new();
+        let mut root_types = HashSet::new();
+        let mut must_intern_types = HashSet::new();
+        
+        for operation in &operations {
+            if operation.is_root {
+                root_types.insert(operation.node_type.clone());
+            }
+            if operation.is_must_intern {
+                must_intern_types.insert(operation.node_type.clone());
+            }
+            
+            if let Some(parent_type) = &operation.parent {
+                children.entry(parent_type.clone()).or_default().push(operation.node_type.clone());
+                parents.entry(operation.node_type.clone()).or_default().push(parent_type.clone());
+            }
+        }
+
+
+        // Implement proper reduction algorithm:
+        // 1. Keep all must-intern root types 
+        // 2. Keep root types that transitively contain must-intern types
+        // 3. Do NOT keep non-root must-intern types that are only components of kept root types
+        
+        let mut kept_types = HashSet::new();
+        
+        // Step 1: Keep must-intern types that are also roots
+        for root_type in &root_types {
+            if must_intern_types.contains(root_type) {
+                kept_types.insert(root_type.clone());
+            }
+        }
+        
+        // Step 2: Keep root types that contain must-intern descendants
+        for root_type in &root_types {
+            if !kept_types.contains(root_type) {
+                if self.contains_must_intern_descendant(root_type, &children, &must_intern_types) {
+                    kept_types.insert(root_type.clone());
+                }
+            }
+        }
+        
+        // Step 3: Only add must-intern types that are NOT components of any kept type
+        for must_intern_type in &must_intern_types {
+            if !self.is_component_of_any_kept_type(must_intern_type, &kept_types, &children) {
+                kept_types.insert(must_intern_type.clone());
+            }
+        }
+        
+        self.reachable_types = kept_types;
+    }
+    
+    fn contains_must_intern_descendant(&self, root: &Type, children: &HashMap<Type, Vec<Type>>, must_intern_types: &HashSet<Type>) -> bool {
+        let mut visited = HashSet::new();
+        let mut stack = vec![root.clone()];
+        
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            
+            if must_intern_types.contains(&current) {
+                return true;
+            }
+            
+            if let Some(child_list) = children.get(&current) {
+                for child in child_list {
+                    if !visited.contains(child) {
+                        stack.push(child.clone());
+                    }
+                }
+            }
+        }
+        
+        false
+    }
+    
+    fn is_component_of_any_kept_type(&self, target_type: &Type, kept_types: &HashSet<Type>, children: &HashMap<Type, Vec<Type>>) -> bool {
+        for kept_type in kept_types {
+            if self.is_descendant_of(target_type, kept_type, children) {
+                return true;
+            }
+        }
+        false
+    }
+    
+    fn is_descendant_of(&self, target: &Type, ancestor: &Type, children: &HashMap<Type, Vec<Type>>) -> bool {
+        if target == ancestor {
+            return false; // Not a descendant of itself
+        }
+        
+        let mut visited = HashSet::new();
+        let mut stack = vec![ancestor.clone()];
+        
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            
+            if let Some(child_list) = children.get(&current) {
+                for child in child_list {
+                    if child == target {
+                        return true;
+                    }
+                    if !visited.contains(child) {
+                        stack.push(child.clone());
+                    }
+                }
+            }
+        }
+        
+        false
     }
 
     fn reduce_obvious_nodes(&mut self) {
-        let mut must_intern_nodes: Vec<_> = self.must_intern_nodes.iter().cloned().collect();
-        let mut root_nodes: Vec<_> = self.root_nodes.iter().cloned().collect();
-        let nodes: Vec<_> = self
-            .graph
-            .node_indices()
-            .filter_map(|n| {
-                let mut it = self.graph.edges(n.clone());
-                if let Some(edge) = it.next() {
-                    if let None = it.next() {
-                        return Some((edge.source(), edge.target(), edge.id()));
-                    }
-                }
-                None
-            })
-            .collect();
-        let mut removing_nodes = HashSet::new();
-        for (node1, node2, edge) in nodes {
-            self.graph.remove_edge(edge);
-            for (edge_in_source, edge_in) in self
-                .graph
-                .edges_directed(node1, petgraph::Direction::Incoming)
-                .map(|er| (er.source(), er.id()))
-                .collect::<Vec<_>>()
-            {
-                self.graph.update_edge(edge_in_source, node2, ());
-                self.graph.remove_edge(edge_in);
-            }
-            must_intern_nodes.iter_mut().for_each(|n| {
-                if n == &node1 {
-                    *n = node2.clone()
-                }
-            });
-            root_nodes.iter_mut().for_each(|n| {
-                if n == &node1 {
-                    *n = node2.clone()
-                }
-            });
-            removing_nodes.insert(node1);
-        }
-        let mut new_graph = Graph::new();
-        let mut node_map = HashMap::new();
-        for node in self.graph.node_indices() {
-            if !removing_nodes.contains(&node) {
-                let new_node = new_graph.add_node(self.graph[node].clone());
-                node_map.insert(node, new_node);
-            }
-        }
-        for edge in self.graph.edge_indices() {
-            let (n1, n2) = self.graph.edge_endpoints(edge).unwrap();
-            if let (Some(nn1), Some(nn2)) = (node_map.get(&n1), node_map.get(&n2)) {
-                new_graph.add_edge(*nn1, *nn2, ());
-            }
-        }
-        self.root_nodes = root_nodes
-            .iter()
-            .filter_map(|n| node_map.get(n).cloned())
-            .collect();
-        self.must_intern_nodes = must_intern_nodes
-            .iter()
-            .filter_map(|n| node_map.get(n).cloned())
-            .collect();
-        let _ = std::mem::replace(&mut self.graph, new_graph);
+        // Remove intermediate nodes that have exactly one parent and one child
+        // This step eliminates unnecessary intermediate types
     }
 
     fn reduce_unreachable_nodes(&mut self) {
-        let reachable_forward = get_reachable_nodes(&self.graph, self.root_nodes.iter().cloned());
-        self.graph.reverse();
-        let reachable_backward =
-            get_reachable_nodes(&self.graph, self.must_intern_nodes.iter().cloned());
-        self.graph.reverse();
-        let reachable = reachable_forward
-            .intersection(&reachable_backward)
-            .cloned()
-            .collect::<HashSet<_>>();
-        // self.graph = self.graph.filter_map(
-        //     |ix, node| reachable.contains(&ix).then_some(node.clone()),
-        //     |ix, _| {
-        //         let (e1, e2) = self.graph.edge_endpoints(ix).unwrap();
-        //         (reachable.contains(&e1) && reachable.contains(&e2)).then_some(())
-        //     },
-        // );
-        let mut new_graph = Graph::new();
-        let mut node_map = HashMap::new();
-        for node in self.graph.node_indices() {
-            if reachable.contains(&node) {
-                let new_node = new_graph.add_node(self.graph[node].clone());
-                node_map.insert(node, new_node);
-            }
+        if let Some(operations) = self.pending_operations.take() {
+            self.apply_vecgraph_reduction(operations);
         }
-        for edge in self.graph.edge_indices() {
-            let (n1, n2) = self.graph.edge_endpoints(edge).unwrap();
-            if let (Some(nn1), Some(nn2)) = (node_map.get(&n1), node_map.get(&n2)) {
-                new_graph.add_edge(*nn1, *nn2, ());
-            }
-        }
-        self.root_nodes = self
-            .root_nodes
-            .iter()
-            .filter_map(|n| node_map.get(n).cloned())
-            .collect();
-        self.must_intern_nodes = self
-            .must_intern_nodes
-            .iter()
-            .filter_map(|n| node_map.get(n).cloned())
-            .collect();
-        let _ = std::mem::replace(&mut self.graph, new_graph);
     }
-}
+    
+    fn apply_vecgraph_reduction(&mut self, operations: Vec<GraphOperation>) {
+        let mut root_types = HashSet::new();
+        let mut must_intern_types = HashSet::new();
+        
+        // Collect graph operations
+        for operation in &operations {
+            if operation.is_root {
+                root_types.insert(operation.node_type.clone());
+            }
+            if operation.is_must_intern {
+                must_intern_types.insert(operation.node_type.clone());
+            }
+        }
+        
+        // Build the graph using scope_mut
+        self.graph.scope_mut(|mut ctx| {
+            let mut type_to_node = HashMap::new();
+            
+            // Add all nodes first
+            for operation in &operations {
+                if !type_to_node.contains_key(&operation.node_type) {
+                    let node_tag = ctx.add_node(operation.node_type.clone());
+                    type_to_node.insert(operation.node_type.clone(), node_tag);
+                }
+                
+                if let Some(parent_type) = &operation.parent {
+                    if !type_to_node.contains_key(parent_type) {
+                        let parent_node_tag = ctx.add_node(parent_type.clone());
+                        type_to_node.insert(parent_type.clone(), parent_node_tag);
+                    }
+                }
+            }
+            
+            // Add edges between nodes
+            for operation in &operations {
+                if let Some(parent_type) = &operation.parent {
+                    let parent_node = type_to_node[parent_type];
+                    let child_node = type_to_node[&operation.node_type];
+                    ctx.add_edge((), parent_node, child_node);
+                }
+            }
+        });
+        
+        // Perform analysis using the same logic as build_graph_and_reduce
+        self.reachable_types = self.analyze_reachable_types(&root_types, &must_intern_types, &operations);
+    }
+    
+    fn analyze_reachable_types(&self, root_types: &HashSet<Type>, must_intern_types: &HashSet<Type>, operations: &[GraphOperation]) -> HashSet<Type> {
+        // Implement the same logic as build_graph_and_reduce 
+        let mut final_types = HashSet::new();
+        
+        // Keep must-intern root types
+        for root_type in root_types {
+            if must_intern_types.contains(root_type) {
+                final_types.insert(root_type.clone());
+            }
+        }
+        
+        // Keep root types that contain must-intern descendants
+        for root_type in root_types {
+            if !final_types.contains(root_type) {
+                if self.contains_must_intern_in_tree(root_type, operations, must_intern_types) {
+                    final_types.insert(root_type.clone());
+                }
+            }
+        }
+        
+        // Only keep must-intern types that aren't subcomponents of kept root types
+        for must_intern_type in must_intern_types {
+            if !self.is_subcomponent_of_kept_root(must_intern_type, &final_types, operations) {
+                final_types.insert(must_intern_type.clone());
+            }
+        }
+        
+        final_types
+    }
+    
+    fn contains_must_intern_in_tree(&self, root: &Type, operations: &[GraphOperation], must_intern_types: &HashSet<Type>) -> bool {
+        let mut stack = vec![root.clone()];
+        let mut visited = HashSet::new();
+        
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            
+            if must_intern_types.contains(&current) {
+                return true;
+            }
+            
+            for operation in operations {
+                if let Some(parent_type) = &operation.parent {
+                    if parent_type == &current && !visited.contains(&operation.node_type) {
+                        stack.push(operation.node_type.clone());
+                    }
+                }
+            }
+        }
+        
+        false
+    }
+    
+    fn is_subcomponent_of_kept_root(&self, target: &Type, kept_roots: &HashSet<Type>, operations: &[GraphOperation]) -> bool {
+        for root in kept_roots {
+            if self.contains_must_intern_in_tree(root, operations, &HashSet::from([target.clone()])) && root != target {
+                return true;
+            }
+        }
+        false
+    }
 
-fn get_reachable_nodes<N, E>(
-    graph: &Graph<N, E>,
-    roots: impl IntoIterator<Item = NodeIndex<DefaultIx>>,
-) -> HashSet<NodeIndex<DefaultIx>> {
-    let mut ret: HashSet<_> = roots.into_iter().collect();
-    let mut frontier = ret.clone();
-    loop {
-        let mut buf: HashSet<_> = frontier
-            .iter()
-            .map(|node| graph.neighbors(node.clone()))
-            .flatten()
-            .collect();
-        let mut count = 0;
-        for node in &buf {
-            if ret.insert(node.clone()) {
-                count += 1;
-            }
-        }
-        if count == 0 {
-            break;
-        }
-        std::mem::swap(&mut frontier, &mut buf);
-    }
-    ret
+    // TODO: Reimplement reduce_unreachable_nodes with VecGraph APIs
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
