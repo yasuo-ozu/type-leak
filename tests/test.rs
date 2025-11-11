@@ -78,14 +78,12 @@ fn test_check() {
     assert!(matches!(
         leaker.check(
             &test_struct.generics,
-            &test_struct.generics,
             &parse_quote!(T1)
         ),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
         leaker.check(
-            &test_struct.generics,
             &test_struct.generics,
             &parse_quote!((T1, T2))
         ),
@@ -94,14 +92,12 @@ fn test_check() {
     assert!(matches!(
         leaker.check(
             &test_struct.generics,
-            &test_struct.generics,
             &parse_quote!([T1; 123])
         ),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
         leaker.check(
-            &test_struct.generics,
             &test_struct.generics,
             &parse_quote!([T1; N])
         ),
@@ -110,14 +106,12 @@ fn test_check() {
     assert!(matches!(
         leaker.check(
             &test_struct.generics,
-            &test_struct.generics,
             &parse_quote!([T1; ::path::to::N])
         ),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
         leaker.check(
-            &test_struct.generics,
             &test_struct.generics,
             &parse_quote!([(); N1])
         ),
@@ -126,14 +120,12 @@ fn test_check() {
     assert!(matches!(
         leaker.check(
             &test_struct.generics,
-            &test_struct.generics,
             &parse_quote!(some::path)
         ),
         Ok(CheckResult::MustIntern(_)) // relavice path
     ));
     assert!(matches!(
         leaker.check(
-            &test_struct.generics,
             &test_struct.generics,
             &parse_quote!(::some::path)
         ),
@@ -142,14 +134,12 @@ fn test_check() {
     assert!(matches!(
         leaker.check(
             &test_struct.generics,
-            &test_struct.generics,
             &parse_quote!(<T1 as ::abs::path::MyTrait<T2>>::Ty)
         ),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
         leaker.check(
-            &test_struct.generics,
             &test_struct.generics,
             &parse_quote!(<MyType as ::abs::path::MyTrait<T2>>::Ty)
         ),
@@ -158,14 +148,12 @@ fn test_check() {
     assert!(matches!(
         leaker.check(
             &test_struct.generics,
-            &test_struct.generics,
             &parse_quote!(<::path::to::MyType as MyTrait<T2>>::Ty)
         ),
         Ok(CheckResult::MustIntern(_)) // relative path
     ));
     assert!(matches!(
         leaker.check(
-            &test_struct.generics,
             &test_struct.generics,
             &parse_quote!(<::path::to::MyType as ::path::to::MyTrait<MyType2>>::Ty)
         ),
@@ -174,14 +162,12 @@ fn test_check() {
     assert!(matches!(
         leaker.check(
             &test_struct.generics,
-            &test_struct.generics,
             &parse_quote!(())
         ),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
         leaker.check(
-            &test_struct.generics,
             &test_struct.generics,
             &parse_quote!(&'l1 ())
         ),
@@ -190,14 +176,12 @@ fn test_check() {
     assert!(matches!(
         leaker.check(
             &test_struct.generics,
-            &test_struct.generics,
             &parse_quote!(&'static ())
         ),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
         leaker.check(
-            &test_struct.generics,
             &test_struct.generics,
             &parse_quote!(&'my_lifetime ())
         ),
@@ -206,14 +190,12 @@ fn test_check() {
     assert!(matches!(
         leaker.check(
             &test_struct.generics,
-            &test_struct.generics,
             &parse_quote!(impl ::path::to::MyTrait)
         ),
         Ok(CheckResult::MustNotIntern(_)) // impl Trait
     ));
     assert!(matches!(
         leaker.check(
-            &test_struct.generics,
             &test_struct.generics,
             &parse_quote!(impl MyTrait)
         ),
@@ -222,14 +204,12 @@ fn test_check() {
     assert!(matches!(
         leaker.check(
             &test_struct.generics,
-            &test_struct.generics,
             &parse_quote!(dyn ::path::to::MyTrait)
         ),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
         leaker.check(
-            &test_struct.generics,
             &test_struct.generics,
             &parse_quote!(Self)
         ),
@@ -238,7 +218,6 @@ fn test_check() {
     assert!(matches!(
         leaker.check(
             &test_struct.generics,
-            &test_struct.generics,
             &parse_quote!(&Self)
         ),
         Ok(CheckResult::MustNotIntern(_))
@@ -246,14 +225,12 @@ fn test_check() {
     assert!(matches!(
         leaker.check(
             &test_struct.generics,
-            &test_struct.generics,
             &parse_quote!(&'a Self)
         ),
         Ok(CheckResult::MustIntern(_))
     ));
     assert!(matches!(
         leaker.check(
-            &test_struct.generics,
             &test_struct.generics,
             &parse_quote!(::core::fmt::Formatter<'_>)
         ),

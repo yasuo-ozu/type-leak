@@ -24,6 +24,7 @@ pub struct Leaker {
     map: HashMap<Type, NodeIndex<DefaultIx>>,
     must_intern_nodes: HashSet<NodeIndex<DefaultIx>>,
     root_nodes: HashSet<NodeIndex<DefaultIx>>,
+    self_ty_can_be_interned: bool,
 }
 
 /// Error represents that the type is not internable.
@@ -78,7 +79,6 @@ pub enum CheckResult {
 struct AnalyzeVisitor<'a> {
     leaker: &'a mut Leaker,
     generics: Generics,
-    generics_base: Generics,
     parent: Option<NodeIndex<DefaultIx>>,
     error: Option<Span>,
 }
@@ -88,7 +88,6 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         let mut visitor = AnalyzeVisitor {
             leaker: &mut self.leaker,
             generics: self.generics.clone(),
-            generics_base: self.generics_base.clone(),
             parent: self.parent.clone(),
             error: self.error.clone(),
         };
@@ -118,7 +117,6 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         let mut visitor = AnalyzeVisitor {
             leaker: &mut self.leaker,
             generics: self.generics.clone(),
-            generics_base: self.generics_base.clone(),
             parent: self.parent.clone(),
             error: self.error.clone(),
         };
@@ -130,7 +128,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     }
 
     fn visit_type(&mut self, i: &Type) {
-        match self.leaker.check(&self.generics_base, &self.generics, i) {
+        match self.leaker.check(&self.generics, i) {
             Err((_, s)) => {
                 // Emit error and terminate searching
                 self.error = Some(s);
@@ -205,7 +203,6 @@ impl Leaker {
             parent: None,
             error: None,
             generics: input.generics.clone(),
-            generics_base: input.generics.clone(),
         };
         visitor.visit_item_struct(input);
         if let Some(e) = visitor.error {
@@ -222,7 +219,6 @@ impl Leaker {
             parent: None,
             error: None,
             generics: input.generics.clone(),
-            generics_base: input.generics.clone(),
         };
         visitor.visit_item_enum(input);
         if let Some(e) = visitor.error {
@@ -258,7 +254,6 @@ impl Leaker {
             parent: None,
             error: None,
             generics: input.generics.clone(),
-            generics_base: input.generics.clone(),
         };
         visitor.visit_item_trait(input);
         if let Some(e) = visitor.error {
@@ -278,6 +273,7 @@ impl Leaker {
             map: HashMap::new(),
             must_intern_nodes: HashSet::new(),
             root_nodes: HashSet::new(),
+            self_ty_can_be_interned: true,
         }
     }
 
@@ -291,7 +287,6 @@ impl Leaker {
             leaker: self,
             parent: None,
             error: None,
-            generics_base: generics.clone(),
             generics,
         };
         visitor.visit_type(ty);
@@ -309,7 +304,6 @@ impl Leaker {
     /// See [`CheckResult`].
     pub fn check(
         &self,
-        generics_base: &Generics,
         generics: &Generics,
         ty: &Type,
     ) -> std::result::Result<CheckResult, (Span, Span)> {
@@ -322,6 +316,7 @@ impl Leaker {
             generic_idents: Vec<Ident>,
             impossible: Option<Span>,
             must: Option<(isize, Span)>,
+            self_ty_can_be_interned: bool,
         }
 
         const _: () = {
@@ -473,7 +468,9 @@ impl Leaker {
                     if matches!(i.segments.iter().next(), Some(PathSegment { ident, arguments }) if ident == "Self" && arguments.is_none())
                         && i.leading_colon.is_none()
                     {
-                        // do nothing
+                        if !self.self_ty_can_be_interned {
+                            self.impossible = Some(i.span());
+                        }
                     } else {
                         match (i.leading_colon, i.get_ident()) {
                             // i is a generic parameter
@@ -494,7 +491,7 @@ impl Leaker {
             }
         };
         let mut visitor = Visitor {
-            generic_lifetimes_base: generics_base
+            generic_lifetimes_base: self.generics
                 .params
                 .iter()
                 .filter_map(|gp| {
@@ -505,7 +502,7 @@ impl Leaker {
                     }
                 })
                 .collect(),
-            generic_idents_base: generics_base
+            generic_idents_base: self.generics
                 .params
                 .iter()
                 .filter_map(|gp| match gp {
@@ -536,6 +533,7 @@ impl Leaker {
                 .collect(),
             impossible: None,
             must: None,
+            self_ty_can_be_interned: self.self_ty_can_be_interned,
         };
         visitor.visit_type(ty);
         match (visitor.must, visitor.impossible) {
