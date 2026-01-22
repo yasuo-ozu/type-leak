@@ -1,7 +1,7 @@
 #![doc = include_str!("./README.md")]
 
-use gotgraph::prelude::VecGraph;
 use gotgraph::graph::{Graph as GotGraph, GraphUpdate};
+use gotgraph::prelude::VecGraph;
 use proc_macro2::Span;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -37,8 +37,8 @@ impl std::fmt::Display for NotInternableError {
 
 impl std::error::Error for NotInternableError {}
 
-/// Encode [`GenericParam`]s to a type.
-pub fn encode_generics_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericArgument>) -> Type {
+/// Encode [`GenericArgument`]s to a type.
+pub fn encode_generics_args_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericArgument>) -> Type {
     Type::Tuple(TypeTuple {
         paren_token: Default::default(),
         elems: iter
@@ -53,6 +53,27 @@ pub fn encode_generics_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericArgum
                     }
                     GenericArgument::Type(ty) => ty.clone(),
                     _ => panic!(),
+                }
+            })
+            .collect(),
+    })
+}
+
+/// Encode [`GenericParam`]s to a type.
+pub fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericParam>) -> Type {
+    Type::Tuple(TypeTuple {
+        paren_token: Default::default(),
+        elems: iter
+            .into_iter()
+            .map(|param| -> Type {
+                match param {
+                    GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
+                        parse_quote!(& #lifetime ())
+                    }
+                    GenericParam::Const(ConstParam { ident, .. }) => {
+                        parse_quote!([(); #ident as usize])
+                    }
+                    GenericParam::Type(TypeParam { ident, .. }) => parse_quote!(#ident),
                 }
             })
             .collect(),
@@ -139,7 +160,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     }
 
     fn visit_type(&mut self, i: &Type) {
-        match self.leaker.check(&self.generics, i) {
+        match self.leaker.check(i) {
             Err((_, s)) => {
                 // Emit error and terminate searching
                 self.error = Some(s);
@@ -149,7 +170,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                 // Collect the operation instead of directly modifying the graph
                 let is_must_intern = matches!(o, Ok(CheckResult::MustIntern(_)));
                 let is_root = self.parent.is_none();
-                
+
                 self.operations.push(GraphOperation {
                     node_type: i.clone(),
                     parent: self.parent.clone(),
@@ -187,6 +208,12 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     }
 }
 
+impl Default for Leaker {
+    fn default() -> Self {
+        Self::with_generics(Generics::default())
+    }
+}
+
 impl Leaker {
     /// Initialize with [`ItemStruct`]
     ///
@@ -203,39 +230,19 @@ impl Leaker {
     /// let leaker = Leaker::from_struct(&test_struct).unwrap();
     /// ```
     pub fn from_struct(input: &ItemStruct) -> std::result::Result<Self, NotInternableError> {
-        let mut leaker = Leaker::with_generics(input.generics.clone());
-        let mut visitor = AnalyzeVisitor {
-            leaker: &mut leaker,
-            parent: None,
-            error: None,
-            generics: input.generics.clone(),
-            operations: Vec::new(),
-        };
-        visitor.visit_item_struct(input);
-        if let Some(e) = visitor.error {
-            return Err(NotInternableError(e));
-        }
-        let operations = visitor.operations;
-        leaker.apply_operations(operations);
+        let mut leaker = Self::with_generics(input.generics.clone());
+        leaker.intern_with(|visitor| {
+            visitor.visit_item_struct(input);
+        })?;
         Ok(leaker)
     }
 
     /// Initialize with [`ItemEnum`]
     pub fn from_enum(input: &ItemEnum) -> std::result::Result<Self, NotInternableError> {
         let mut leaker = Self::with_generics(input.generics.clone());
-        let mut visitor = AnalyzeVisitor {
-            leaker: &mut leaker,
-            parent: None,
-            error: None,
-            generics: input.generics.clone(),
-            operations: Vec::new(),
-        };
-        visitor.visit_item_enum(input);
-        if let Some(e) = visitor.error {
-            return Err(NotInternableError(e));
-        }
-        let operations = visitor.operations;
-        leaker.apply_operations(operations);
+        leaker.intern_with(|visitor| {
+            visitor.visit_item_enum(input);
+        })?;
         Ok(leaker)
     }
 
@@ -261,20 +268,15 @@ impl Leaker {
     /// ```
     pub fn from_trait(input: &ItemTrait) -> std::result::Result<Self, NotInternableError> {
         let mut leaker = Self::with_generics(input.generics.clone());
-        let mut visitor = AnalyzeVisitor {
-            leaker: &mut leaker,
-            parent: None,
-            error: None,
-            generics: input.generics.clone(),
-            operations: Vec::new(),
-        };
-        visitor.visit_item_trait(input);
-        if let Some(e) = visitor.error {
-            return Err(NotInternableError(e));
-        }
-        let operations = visitor.operations;
-        leaker.apply_operations(operations);
+        leaker.intern_with(|visitor| {
+            visitor.visit_item_trait(input);
+        })?;
         Ok(leaker)
+    }
+
+    /// Initialize empty [`Leaker`] with no generics.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Initialize empty [`Leaker`] with given generics.
@@ -301,12 +303,15 @@ impl Leaker {
         self.pending_operations = Some(operations);
     }
 
-    /// Intern the given type as a root node.
-    pub fn intern(
+    /// Intern ast elements with visitor
+    pub fn intern_with<'ast, F>(
         &mut self,
-        generics: Generics,
-        ty: &Type,
-    ) -> std::result::Result<&mut Self, NotInternableError> {
+        f: F,
+    ) -> std::result::Result<&mut Self, NotInternableError>
+    where
+        F: FnOnce(&mut dyn syn::visit::Visit<'ast>),
+    {
+        let generics = self.generics.clone();
         let mut visitor = AnalyzeVisitor {
             leaker: self,
             parent: None,
@@ -314,7 +319,7 @@ impl Leaker {
             generics,
             operations: Vec::new(),
         };
-        visitor.visit_type(ty);
+        f(&mut visitor);
         if let Some(e) = visitor.error {
             Err(NotInternableError(e))
         } else {
@@ -329,11 +334,7 @@ impl Leaker {
     ///
     ///
     /// See [`CheckResult`].
-    pub fn check(
-        &self,
-        generics: &Generics,
-        ty: &Type,
-    ) -> std::result::Result<CheckResult, (Span, Span)> {
+    pub fn check(&self, ty: &Type) -> std::result::Result<CheckResult, (Span, Span)> {
         use syn::visit::Visit;
         #[derive(Clone)]
         struct Visitor {
@@ -518,7 +519,8 @@ impl Leaker {
             }
         };
         let mut visitor = Visitor {
-            generic_lifetimes_base: self.generics
+            generic_lifetimes_base: self
+                .generics
                 .params
                 .iter()
                 .filter_map(|gp| {
@@ -529,7 +531,8 @@ impl Leaker {
                     }
                 })
                 .collect(),
-            generic_idents_base: self.generics
+            generic_idents_base: self
+                .generics
                 .params
                 .iter()
                 .filter_map(|gp| match gp {
@@ -538,7 +541,8 @@ impl Leaker {
                     _ => None,
                 })
                 .collect(),
-            generic_lifetimes: generics
+            generic_lifetimes: self
+                .generics
                 .params
                 .iter()
                 .filter_map(|gp| {
@@ -549,7 +553,8 @@ impl Leaker {
                     }
                 })
                 .collect(),
-            generic_idents: generics
+            generic_idents: self
+                .generics
                 .params
                 .iter()
                 .filter_map(|gp| match gp {
@@ -671,7 +676,7 @@ impl Leaker {
         let mut parents: HashMap<Type, Vec<Type>> = HashMap::new();
         let mut root_types = HashSet::new();
         let mut must_intern_types = HashSet::new();
-        
+
         for operation in &operations {
             if operation.is_root {
                 root_types.insert(operation.node_type.clone());
@@ -679,28 +684,33 @@ impl Leaker {
             if operation.is_must_intern {
                 must_intern_types.insert(operation.node_type.clone());
             }
-            
+
             if let Some(parent_type) = &operation.parent {
-                children.entry(parent_type.clone()).or_default().push(operation.node_type.clone());
-                parents.entry(operation.node_type.clone()).or_default().push(parent_type.clone());
+                children
+                    .entry(parent_type.clone())
+                    .or_default()
+                    .push(operation.node_type.clone());
+                parents
+                    .entry(operation.node_type.clone())
+                    .or_default()
+                    .push(parent_type.clone());
             }
         }
 
-
         // Implement proper reduction algorithm:
-        // 1. Keep all must-intern root types 
+        // 1. Keep all must-intern root types
         // 2. Keep root types that transitively contain must-intern types
         // 3. Do NOT keep non-root must-intern types that are only components of kept root types
-        
+
         let mut kept_types = HashSet::new();
-        
+
         // Step 1: Keep must-intern types that are also roots
         for root_type in &root_types {
             if must_intern_types.contains(root_type) {
                 kept_types.insert(root_type.clone());
             }
         }
-        
+
         // Step 2: Keep root types that contain must-intern descendants
         for root_type in &root_types {
             if !kept_types.contains(root_type) {
@@ -709,30 +719,35 @@ impl Leaker {
                 }
             }
         }
-        
+
         // Step 3: Only add must-intern types that are NOT components of any kept type
         for must_intern_type in &must_intern_types {
             if !self.is_component_of_any_kept_type(must_intern_type, &kept_types, &children) {
                 kept_types.insert(must_intern_type.clone());
             }
         }
-        
+
         self.reachable_types = kept_types;
     }
-    
-    fn contains_must_intern_descendant(&self, root: &Type, children: &HashMap<Type, Vec<Type>>, must_intern_types: &HashSet<Type>) -> bool {
+
+    fn contains_must_intern_descendant(
+        &self,
+        root: &Type,
+        children: &HashMap<Type, Vec<Type>>,
+        must_intern_types: &HashSet<Type>,
+    ) -> bool {
         let mut visited = HashSet::new();
         let mut stack = vec![root.clone()];
-        
+
         while let Some(current) = stack.pop() {
             if !visited.insert(current.clone()) {
                 continue;
             }
-            
+
             if must_intern_types.contains(&current) {
                 return true;
             }
-            
+
             if let Some(child_list) = children.get(&current) {
                 for child in child_list {
                     if !visited.contains(child) {
@@ -741,11 +756,16 @@ impl Leaker {
                 }
             }
         }
-        
+
         false
     }
-    
-    fn is_component_of_any_kept_type(&self, target_type: &Type, kept_types: &HashSet<Type>, children: &HashMap<Type, Vec<Type>>) -> bool {
+
+    fn is_component_of_any_kept_type(
+        &self,
+        target_type: &Type,
+        kept_types: &HashSet<Type>,
+        children: &HashMap<Type, Vec<Type>>,
+    ) -> bool {
         for kept_type in kept_types {
             if self.is_descendant_of(target_type, kept_type, children) {
                 return true;
@@ -753,20 +773,25 @@ impl Leaker {
         }
         false
     }
-    
-    fn is_descendant_of(&self, target: &Type, ancestor: &Type, children: &HashMap<Type, Vec<Type>>) -> bool {
+
+    fn is_descendant_of(
+        &self,
+        target: &Type,
+        ancestor: &Type,
+        children: &HashMap<Type, Vec<Type>>,
+    ) -> bool {
         if target == ancestor {
             return false; // Not a descendant of itself
         }
-        
+
         let mut visited = HashSet::new();
         let mut stack = vec![ancestor.clone()];
-        
+
         while let Some(current) = stack.pop() {
             if !visited.insert(current.clone()) {
                 continue;
             }
-            
+
             if let Some(child_list) = children.get(&current) {
                 for child in child_list {
                     if child == target {
@@ -778,7 +803,7 @@ impl Leaker {
                 }
             }
         }
-        
+
         false
     }
 
@@ -792,11 +817,11 @@ impl Leaker {
             self.apply_vecgraph_reduction(operations);
         }
     }
-    
+
     fn apply_vecgraph_reduction(&mut self, operations: Vec<GraphOperation>) {
         let mut root_types = HashSet::new();
         let mut must_intern_types = HashSet::new();
-        
+
         // Collect graph operations
         for operation in &operations {
             if operation.is_root {
@@ -806,18 +831,18 @@ impl Leaker {
                 must_intern_types.insert(operation.node_type.clone());
             }
         }
-        
+
         // Build the graph using scope_mut
         self.graph.scope_mut(|mut ctx| {
             let mut type_to_node = HashMap::new();
-            
+
             // Add all nodes first
             for operation in &operations {
                 if !type_to_node.contains_key(&operation.node_type) {
                     let node_tag = ctx.add_node(operation.node_type.clone());
                     type_to_node.insert(operation.node_type.clone(), node_tag);
                 }
-                
+
                 if let Some(parent_type) = &operation.parent {
                     if !type_to_node.contains_key(parent_type) {
                         let parent_node_tag = ctx.add_node(parent_type.clone());
@@ -825,7 +850,7 @@ impl Leaker {
                     }
                 }
             }
-            
+
             // Add edges between nodes
             for operation in &operations {
                 if let Some(parent_type) = &operation.parent {
@@ -835,22 +860,28 @@ impl Leaker {
                 }
             }
         });
-        
+
         // Perform analysis using the same logic as build_graph_and_reduce
-        self.reachable_types = self.analyze_reachable_types(&root_types, &must_intern_types, &operations);
+        self.reachable_types =
+            self.analyze_reachable_types(&root_types, &must_intern_types, &operations);
     }
-    
-    fn analyze_reachable_types(&self, root_types: &HashSet<Type>, must_intern_types: &HashSet<Type>, operations: &[GraphOperation]) -> HashSet<Type> {
-        // Implement the same logic as build_graph_and_reduce 
+
+    fn analyze_reachable_types(
+        &self,
+        root_types: &HashSet<Type>,
+        must_intern_types: &HashSet<Type>,
+        operations: &[GraphOperation],
+    ) -> HashSet<Type> {
+        // Implement the same logic as build_graph_and_reduce
         let mut final_types = HashSet::new();
-        
+
         // Keep must-intern root types
         for root_type in root_types {
             if must_intern_types.contains(root_type) {
                 final_types.insert(root_type.clone());
             }
         }
-        
+
         // Keep root types that contain must-intern descendants
         for root_type in root_types {
             if !final_types.contains(root_type) {
@@ -859,30 +890,35 @@ impl Leaker {
                 }
             }
         }
-        
+
         // Only keep must-intern types that aren't subcomponents of kept root types
         for must_intern_type in must_intern_types {
             if !self.is_subcomponent_of_kept_root(must_intern_type, &final_types, operations) {
                 final_types.insert(must_intern_type.clone());
             }
         }
-        
+
         final_types
     }
-    
-    fn contains_must_intern_in_tree(&self, root: &Type, operations: &[GraphOperation], must_intern_types: &HashSet<Type>) -> bool {
+
+    fn contains_must_intern_in_tree(
+        &self,
+        root: &Type,
+        operations: &[GraphOperation],
+        must_intern_types: &HashSet<Type>,
+    ) -> bool {
         let mut stack = vec![root.clone()];
         let mut visited = HashSet::new();
-        
+
         while let Some(current) = stack.pop() {
             if !visited.insert(current.clone()) {
                 continue;
             }
-            
+
             if must_intern_types.contains(&current) {
                 return true;
             }
-            
+
             for operation in operations {
                 if let Some(parent_type) = &operation.parent {
                     if parent_type == &current && !visited.contains(&operation.node_type) {
@@ -891,13 +927,20 @@ impl Leaker {
                 }
             }
         }
-        
+
         false
     }
-    
-    fn is_subcomponent_of_kept_root(&self, target: &Type, kept_roots: &HashSet<Type>, operations: &[GraphOperation]) -> bool {
+
+    fn is_subcomponent_of_kept_root(
+        &self,
+        target: &Type,
+        kept_roots: &HashSet<Type>,
+        operations: &[GraphOperation],
+    ) -> bool {
         for root in kept_roots {
-            if self.contains_must_intern_in_tree(root, operations, &HashSet::from([target.clone()])) && root != target {
+            if self.contains_must_intern_in_tree(root, operations, &HashSet::from([target.clone()]))
+                && root != target
+            {
                 return true;
             }
         }
@@ -907,6 +950,10 @@ impl Leaker {
     // TODO: Reimplement reduce_unreachable_nodes with VecGraph APIs
 }
 
+/// Holds the list of types that need to be encoded, produced by [`Leaker::finish()`].
+///
+/// The `Referrer` provides methods to iterate over leak types and to expand/transform
+/// types using a custom mapping function.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Referrer {
     leak_types: Vec<Type>,
@@ -914,18 +961,45 @@ pub struct Referrer {
 }
 
 impl Referrer {
+    /// Returns `true` if there are no types to be encoded.
     pub fn is_empty(&self) -> bool {
         self.leak_types.is_empty()
     }
 
+    /// Returns an iterator over the types that need to be encoded.
+    ///
+    /// ```ignore
+    /// let args = encode_generics_params_to_ty(&generics.params);
+    /// referrer.iter().enumerate().map(|(ix, ty)| quote!{
+    ///     impl #crate::TypeRef<#ix, #args> for #marker_ty {
+    ///         type Type = #ty;
+    ///     }
+    /// }).collect::<TokenStream>();
+    /// ```
     pub fn iter(&self) -> impl Iterator<Item = &Type> {
         self.leak_types.iter()
     }
 
+    /// Converts this `Referrer` into a [`Visitor`] that can be used to transform AST nodes.
+    ///
+    /// The `type_fn` callback is called for each type that needs to be converted,
+    /// receiving the original type and its index, and returning the replacement type.
+    /// See [`Referrer::expand()`] for details.
     pub fn into_visitor<F: FnMut(Type, usize) -> Type>(self, type_fn: F) -> Visitor<F> {
         Visitor(self, Rc::new(RefCell::new(type_fn)))
     }
 
+    /// Expands a type by replacing any interned types using the provided mapping function.
+    ///
+    /// The `type_fn` callback is called for each subtype that needs to be converted,
+    /// receiving the original type and its index, and returning the replacement type.
+    ///
+    /// ```ignore
+    /// let args = encode_generics_params_to_ty(&generics.params);
+    /// referrer.expand(ty, |_, ix| {
+    ///     parse_quote!(<#marker_ty as #crate::TypeRef<#ix, #args>>::Type)
+    /// })
+    /// ```
     pub fn expand(&self, ty: Type, type_fn: impl FnMut(Type, usize) -> Type) -> Type {
         use syn::fold::Fold;
         struct Folder<'a, F>(&'a Referrer, F);
