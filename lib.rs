@@ -37,6 +37,8 @@ impl std::fmt::Display for NotInternableError {
 
 impl std::error::Error for NotInternableError {}
 
+// TODO: impl Spanned for NotInternableError
+
 /// Encode [`GenericArgument`]s to a type.
 pub fn encode_generics_args_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericArgument>) -> Type {
     Type::Tuple(TypeTuple {
@@ -593,7 +595,6 @@ impl Leaker {
         Referrer { leak_types, map }
     }
 
-    #[cfg_attr(doc, aquamarine::aquamarine)]
     /// Reduce nodes to decrease cost of {`Leaker`}'s implementation.
     ///
     /// # Algorithm
@@ -612,29 +613,7 @@ impl Leaker {
     /// construct a DAG which represents all (internable) types and the dependency relations like
     /// this:
     ///
-    /// ```mermaid
-    /// graph TD
-    ///   1["★MyType1
-    ///   (Node 1)"]
-    ///   2["★(MyType2, MyType3#lt;MyType1#gt;, MyType4, MyType5)
-    ///   (Node 2)"] -->3["MyType2
-    ///   (Node 3)"]
-    ///   2 -->4["MyType3#lt;MyType1#gt;
-    ///   (Node 4)"]
-    ///   2 -->0["★MyType4
-    ///   (Node 0)"]
-    ///   2 -->5["MyType5
-    ///   (Node 5)"]
-    ///   6["★&a (T1, T2)
-    ///   (Node 6)"] -->7["(T1, T2)
-    ///   (Node 7)"]
-    ///   7 -->8["T1
-    ///   (Node 8)"]
-    ///   7 -->9["T2
-    ///   (Node 9)"]
-    ///   classDef redNode stroke:#ff0000;
-    ///   class 0,1,3,4,5 redNode;
-    /// ```
+    /// ![before_graph](https://raw.github.com/yasuo-ozu/type-leak/master/resources/before_graph.svg)
     ///
     /// The **red** node is flagged as [`CheckResult::MustIntern`] by [`Leaker::check()`] (which means
     /// the type literature depends on the type context, so it must be interned).
@@ -650,18 +629,7 @@ impl Leaker {
     ///
     /// So finally, it results like:
     ///
-    /// ```mermaid
-    /// graph TD
-    ///   0["MyType4
-    ///   (Node 0)"]
-    ///   1["MyType1
-    ///   (Node 1)"]
-    ///   2["(MyType2, MyType3 #lt; MyType1 #gt;, MyType4, MyType5)
-    ///   (Node 2)"]
-    ///   classDef redNode stroke:#ff0000;
-    ///   class 0,1,2 redNode;
-    /// ```
-    ///
+    /// ![after_graph](https://raw.github.com/yasuo-ozu/type-leak/master/resources/after_graph.svg)
     pub fn reduce_roots(&mut self) {
         if let Some(operations) = self.pending_operations.take() {
             self.build_graph_and_reduce(operations);
