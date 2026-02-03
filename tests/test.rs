@@ -278,3 +278,27 @@ fn test_check_allowed_paths() {
         Ok(CheckResult::MustIntern(_))
     ));
 }
+
+#[test]
+fn test_intern() {
+    use syn::visit::Visit;
+
+    let tokens = quote! {
+        pub trait Unparse<Atom> {
+            fn unparse<S: crate::parse::unparse::Emitter<Atom>>(
+                &self,
+                sink: &mut S,
+            ) -> ::core::result::Result<(), S::Error>;
+        }
+    };
+    let item: ItemTrait = parse_quote!(#tokens);
+    let mut leaker = Leaker::new();
+    leaker.allowed_paths.push(parse_quote!(crate));
+
+    leaker
+        .intern_with(&item.generics, |visitor| {
+            visitor.visit_item_trait(&item);
+        })
+        .unwrap();
+    assert!(leaker.finish().is_empty());
+}
