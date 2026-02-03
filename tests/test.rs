@@ -220,3 +220,61 @@ fn test_check_self_no_internable() {
         Ok(CheckResult::Neutral) // Generic type should still work
     ));
 }
+
+#[test]
+fn test_check_allows_dollar_crate() {
+    let mut leaker = Leaker::new();
+    leaker.allowed_paths.push(parse_quote!(crate));
+
+    let item: ItemTrait = parse_quote!(
+        pub trait Parse: ::core::marker::Sized {
+            type Error: crate::error::Error;
+            fn parse(
+                stream: impl crate::parse::into_parse_stream::IntoParseStream<Atom = Atom>,
+            ) -> ::core::result::Result<Self, Self::Error>;
+        }
+    );
+    leaker
+        .intern_with(&item.generics, |visitor| {
+            visitor.visit_item_trait(&item);
+        })
+        .unwrap();
+    leaker.reduce_roots();
+    assert!(leaker.finish().is_empty());
+}
+
+#[test]
+fn test_check_allowed_paths() {
+    use type_leak::CheckResult;
+
+    let test_struct: ItemStruct = parse_quote!(
+        pub struct MyStruct<'l1, const N1: usize, T1>;
+    );
+    let mut leaker = Leaker::new();
+    let generics = &test_struct.generics;
+
+    leaker.allowed_paths.push(parse_quote!(some::path));
+
+    assert!(matches!(
+        leaker.check(&parse_quote!(some::path), generics),
+        Ok(CheckResult::Neutral)
+    ));
+    assert!(matches!(
+        leaker.check(&parse_quote!(some::path::Type), generics),
+        Ok(CheckResult::Neutral)
+    ));
+    assert!(matches!(
+        leaker.check(&parse_quote!(other::path), generics),
+        Ok(CheckResult::MustIntern(_))
+    ));
+
+    leaker.allowed_paths.push(parse_quote!(::abs::path));
+    assert!(matches!(
+        leaker.check(&parse_quote!(::abs::path::Type), generics),
+        Ok(CheckResult::Neutral)
+    ));
+    assert!(matches!(
+        leaker.check(&parse_quote!(abs::path::Type), generics),
+        Ok(CheckResult::MustIntern(_))
+    ));
+}

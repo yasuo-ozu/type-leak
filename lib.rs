@@ -127,7 +127,9 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         i.default = None;
         i.semi_token = Some(Default::default());
         syn::visit::visit_trait_item_fn(&mut visitor, &i);
-        self.error = visitor.error;
+        if visitor.error.is_some() {
+            self.error = visitor.error;
+        }
         self.operations.extend(visitor.operations);
     }
 
@@ -148,7 +150,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             leaker: self.leaker,
             generics: self.generics.clone(),
             parent: self.parent.clone(),
-            error: self.error,
+            error: self.error.clone(),
             operations: Vec::new(),
         };
         for g in &i.generics.params {
@@ -190,12 +192,30 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     }
 
     fn visit_trait_bound(&mut self, i: &TraitBound) {
-        if i.path.leading_colon.is_none() {
-            // Trait bounds with relative oath
+        // Trait bounds with non-absolute oath
+        if i.path.leading_colon.is_none()
+            && !matches!(
+                i.path.segments.iter().next(),
+                Some(PathSegment {
+                    ident,
+                    arguments: PathArguments::None,
+                }) if ident.to_string() == "$crate"
+            )
+            && !self.leaker.allowed_paths.iter().any(|allowed| {
+                allowed.leading_colon == i.path.leading_colon
+                    && allowed.segments.len() <= i.path.segments.len()
+                    && allowed.segments.iter().zip(i.path.segments.iter()).all(
+                        |(allowed_seg, seg)| {
+                            allowed_seg.arguments == seg.arguments
+                                && allowed_seg.ident.to_string() == seg.ident.to_string()
+                        },
+                    )
+            })
+        {
             self.error = Some(i.span());
-        } else {
-            syn::visit::visit_trait_bound(self, i)
+            return;
         }
+        syn::visit::visit_trait_bound(self, i)
     }
 
     fn visit_expr_path(&mut self, i: &ExprPath) {
@@ -244,6 +264,12 @@ impl Leaker {
             visitor.visit_item_enum(input);
         })?;
         Ok(leaker)
+    }
+
+    /// Allow paths starting with `crate`.
+    pub fn allow_crate(&mut self) -> &mut Self {
+        self.allowed_paths.push(parse_quote!(crate));
+        self
     }
 
     /// Build an [`Leaker`] with given trait.
@@ -396,8 +422,6 @@ impl Leaker {
         use syn::visit::Visit;
         #[derive(Clone)]
         struct Visitor {
-            generic_lifetimes_base: Vec<Lifetime>,
-            generic_idents_base: Vec<Ident>,
             generic_lifetimes: Vec<Lifetime>,
             generic_idents: Vec<Ident>,
             impossible: Option<Span>,
@@ -532,10 +556,7 @@ impl Leaker {
                     match i.to_string().as_str() {
                         "'static" => (),
                         "'_" => self.impossible = Some(i.span()),
-                        _ if self.generic_lifetimes_base.iter().any(|lt| lt == i) => {}
-                        _ if self.generic_lifetimes.iter().any(|lt| lt == i) => {
-                            self.impossible = Some(i.span());
-                        }
+                        _ if self.generic_lifetimes.iter().any(|lt| lt == i) => {}
                         _ => {
                             self.must = Some((-1, i.span()));
                         }
@@ -555,11 +576,12 @@ impl Leaker {
                     if self.allowed_paths.iter().any(|allowed| {
                         allowed.leading_colon == i.leading_colon
                             && allowed.segments.len() <= i.segments.len()
-                            && allowed
-                                .segments
-                                .iter()
-                                .zip(i.segments.iter())
-                                .all(|(allowed_seg, seg)| allowed_seg == seg)
+                            && allowed.segments.iter().zip(i.segments.iter()).all(
+                                |(allowed_seg, seg)| {
+                                    allowed_seg.arguments == seg.arguments
+                                        && allowed_seg.ident.to_string() == seg.ident.to_string()
+                                },
+                            )
                     }) {
                         return;
                     }
@@ -570,23 +592,23 @@ impl Leaker {
                             self.impossible = Some(i.span());
                         }
                     } else {
+                        if i.leading_colon.is_none()
+                            && matches!(
+                                i.segments.iter().next(),
+                                Some(PathSegment {
+                                    ident,
+                                    arguments: PathArguments::None,
+                                }) if ident.to_string() == "$crate"
+                            )
+                        {
+                            return;
+                        }
                         match (i.leading_colon, i.get_ident()) {
                             // i is a generic parameter
-                            (None, Some(ident)) if self.generic_idents_base.contains(ident) => {}
-                            (None, Some(ident)) if self.generic_idents.contains(ident) => {
-                                self.impossible = Some(i.span());
-                            }
+                            (None, Some(ident)) if self.generic_idents.contains(ident) => {}
+                            // relative path, not a generic parameter
                             (None, _) => {
-                                if !matches!(
-                                    i.segments.iter().next(),
-                                    Some(PathSegment {
-                                        ident,
-                                        arguments: PathArguments::None,
-                                    }) if ident == "$crate"
-                                ) {
-                                    // relative path, not a generic parameter
-                                    self.must = Some((-1, i.span()));
-                                }
+                                self.must = Some((-1, i.span()));
                             }
                             // absolute path
                             (Some(_), _) => (),
@@ -597,26 +619,6 @@ impl Leaker {
             }
         };
         let mut visitor = Visitor {
-            generic_lifetimes_base: generics
-                .params
-                .iter()
-                .filter_map(|gp| {
-                    if let GenericParam::Lifetime(lt) = gp {
-                        Some(lt.lifetime.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            generic_idents_base: generics
-                .params
-                .iter()
-                .filter_map(|gp| match gp {
-                    GenericParam::Type(TypeParam { ident, .. })
-                    | GenericParam::Const(ConstParam { ident, .. }) => Some(ident.clone()),
-                    _ => None,
-                })
-                .collect(),
             generic_lifetimes: generics
                 .params
                 .iter()
