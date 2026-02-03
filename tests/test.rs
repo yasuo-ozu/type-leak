@@ -25,7 +25,7 @@ fn test_leaker() {
             "MyType1",
             "MyType4"
         ]
-        .into_iter()
+        .iter()
         .map(|s| s.to_string())
         .collect::<BTreeSet<_>>()
     );
@@ -74,161 +74,149 @@ fn test_check() {
     let test_struct: ItemStruct = parse_quote! {
         struct MyStruct<'l1, const N1: usize, T1, T2, T3>;
     };
-    let leaker = Leaker::from_struct(&test_struct).unwrap();
+    let leaker = Leaker::new();
+    let generics = &test_struct.generics;
     assert!(matches!(
-        leaker.check(&parse_quote!(T1)
-        ),
+        leaker.check(&parse_quote!(T1), generics),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!((T1, T2))
-        ),
+        leaker.check(&parse_quote!((T1, T2)), generics),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!([T1; 123])
-        ),
+        leaker.check(&parse_quote!([T1; 123]), generics),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!([T1; N])
-        ),
+        leaker.check(&parse_quote!([T1; N]), generics),
         Ok(CheckResult::MustIntern(_)) // constant
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!([T1; ::path::to::N])
-        ),
+        leaker.check(&parse_quote!([T1; ::path::to::N]), generics),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!([(); N1])
-        ),
+        leaker.check(&parse_quote!([(); N1]), generics),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(some::path)
-        ),
+        leaker.check(&parse_quote!(some::path), generics),
         Ok(CheckResult::MustIntern(_)) // relavice path
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(::some::path)
+        leaker.check(&parse_quote!(::some::path), generics),
+        Ok(CheckResult::Neutral)
+    ));
+    assert!(matches!(
+        leaker.check(
+            &parse_quote!(<T1 as ::abs::path::MyTrait<T2>>::Ty),
+            generics
         ),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(<T1 as ::abs::path::MyTrait<T2>>::Ty)
-        ),
-        Ok(CheckResult::Neutral)
-    ));
-    assert!(matches!(
-        leaker.check(&parse_quote!(<MyType as ::abs::path::MyTrait<T2>>::Ty)
+        leaker.check(
+            &parse_quote!(<MyType as ::abs::path::MyTrait<T2>>::Ty),
+            generics
         ),
         Ok(CheckResult::MustInternOrInherit(_)) // relative path
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(<::path::to::MyType as MyTrait<T2>>::Ty)
+        leaker.check(
+            &parse_quote!(<::path::to::MyType as MyTrait<T2>>::Ty),
+            generics
         ),
         Ok(CheckResult::MustIntern(_)) // relative path
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(<::path::to::MyType as ::path::to::MyTrait<MyType2>>::Ty)
+        leaker.check(
+            &parse_quote!(<::path::to::MyType as ::path::to::MyTrait<MyType2>>::Ty),
+            generics
         ),
         Ok(CheckResult::MustInternOrInherit(_)) // relative path
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(())
-        ),
+        leaker.check(&parse_quote!(()), generics),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(&'l1 ())
-        ),
+        leaker.check(&parse_quote!(&'l1 ()), generics),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(&'static ())
-        ),
+        leaker.check(&parse_quote!(&'static ()), generics),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(&'my_lifetime ())
-        ),
+        leaker.check(&parse_quote!(&'my_lifetime ()), generics),
         Ok(CheckResult::MustIntern(_)) // lifetime
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(impl ::path::to::MyTrait)
-        ),
+        leaker.check(&parse_quote!(impl ::path::to::MyTrait), generics),
         Ok(CheckResult::MustNotIntern(_)) // impl Trait
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(impl MyTrait)
-        ),
+        leaker.check(&parse_quote!(impl MyTrait), generics),
         Err(_) // impl Trait and relative path
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(dyn ::path::to::MyTrait)
-        ),
+        leaker.check(&parse_quote!(dyn ::path::to::MyTrait), generics),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(Self)
-        ),
+        leaker.check(&parse_quote!(Self), generics),
         Ok(CheckResult::Neutral)
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(&Self)
-        ),
+        leaker.check(&parse_quote!(&Self), generics),
         Ok(CheckResult::MustNotIntern(_))
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(&'a Self)
-        ),
+        leaker.check(&parse_quote!(&'a Self), generics),
         Ok(CheckResult::MustIntern(_))
     ));
     assert!(matches!(
-        leaker.check(&parse_quote!(::core::fmt::Formatter<'_>)
-        ),
+        leaker.check(&parse_quote!(::core::fmt::Formatter<'_>), generics),
         Ok(CheckResult::MustNotIntern(_)) // relative path
     ));
 }
 
 #[test]
 fn test_check_self_no_internable() {
-    use type_leak::{Leaker, CheckResult};
-    
+    use type_leak::{CheckResult, Leaker};
+
     let test_struct: ItemStruct = parse_quote!(
         pub struct MyStruct<'l1, const N1: usize, T1, T2, T3>;
     );
-    
+
     // Test with self_ty_can_be_interned = true (default behavior)
-    let leaker_true = Leaker::with_generics(test_struct.generics.clone());
+    let leaker_true = Leaker::new();
+    let generics_true = &test_struct.generics;
     assert!(matches!(
-        leaker_true.check(&parse_quote!(Self)
-        ),
+        leaker_true.check(&parse_quote!(Self), generics_true),
         Ok(CheckResult::Neutral) // Self should be allowed by default
     ));
-    
+
     // Test with self_ty_can_be_interned = false
-    let mut leaker_false = Leaker::with_generics(test_struct.generics.clone());
+    let mut leaker_false = Leaker::new();
     // Set the flag to false to disallow Self types
     leaker_false.self_ty_can_be_interned = false;
+    let generics_false = &test_struct.generics;
     assert!(matches!(
-        leaker_false.check(&parse_quote!(Self)
-        ),
+        leaker_false.check(&parse_quote!(Self), generics_false),
         Ok(CheckResult::MustNotIntern(_)) // Self should be rejected when flag is false
     ));
-    
+
     // Test with complex Self usage
     assert!(matches!(
-        leaker_false.check(&parse_quote!(&Self)
-        ),
+        leaker_false.check(&parse_quote!(&Self), generics_false),
         Ok(CheckResult::MustNotIntern(_)) // Reference to Self should also be rejected
     ));
-    
+
     // Test that non-Self types are unaffected by the flag
     assert!(matches!(
-        leaker_false.check(&parse_quote!(T1)
-        ),
+        leaker_false.check(&parse_quote!(T1), generics_false),
         Ok(CheckResult::Neutral) // Generic type should still work
     ));
 }

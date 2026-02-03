@@ -18,8 +18,8 @@ pub use syn;
 
 /// The entry point of this crate.
 pub struct Leaker {
-    generics: Generics,
     graph: VecGraph<Type, ()>,
+    pub allowed_paths: Vec<Path>,
     pub self_ty_can_be_interned: bool,
     reachable_types: HashSet<Type>,
     pending_operations: Option<Vec<GraphOperation>>,
@@ -36,8 +36,6 @@ impl std::fmt::Display for NotInternableError {
 }
 
 impl std::error::Error for NotInternableError {}
-
-// TODO: impl Spanned for NotInternableError
 
 /// Encode [`GenericArgument`]s to a type.
 pub fn encode_generics_args_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericArgument>) -> Type {
@@ -116,10 +114,10 @@ struct AnalyzeVisitor<'a> {
 impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     fn visit_trait_item_fn(&mut self, i: &TraitItemFn) {
         let mut visitor = AnalyzeVisitor {
-            leaker: &mut self.leaker,
+            leaker: self.leaker,
             generics: self.generics.clone(),
             parent: self.parent.clone(),
-            error: self.error.clone(),
+            error: self.error,
             operations: Vec::new(),
         };
         for g in &i.sig.generics.params {
@@ -128,7 +126,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         let mut i = i.clone();
         i.default = None;
         i.semi_token = Some(Default::default());
-        syn::visit::visit_trait_item_fn(&mut visitor, &mut i);
+        syn::visit::visit_trait_item_fn(&mut visitor, &i);
         self.error = visitor.error;
         self.operations.extend(visitor.operations);
     }
@@ -147,10 +145,10 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
 
     fn visit_trait_item_type(&mut self, i: &TraitItemType) {
         let mut visitor = AnalyzeVisitor {
-            leaker: &mut self.leaker,
+            leaker: self.leaker,
             generics: self.generics.clone(),
             parent: self.parent.clone(),
-            error: self.error.clone(),
+            error: self.error,
             operations: Vec::new(),
         };
         for g in &i.generics.params {
@@ -162,7 +160,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     }
 
     fn visit_type(&mut self, i: &Type) {
-        match self.leaker.check(i) {
+        match self.leaker.check(i, &self.generics) {
             Err((_, s)) => {
                 // Emit error and terminate searching
                 self.error = Some(s);
@@ -212,7 +210,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
 
 impl Default for Leaker {
     fn default() -> Self {
-        Self::with_generics(Generics::default())
+        Self::new()
     }
 }
 
@@ -232,8 +230,8 @@ impl Leaker {
     /// let leaker = Leaker::from_struct(&test_struct).unwrap();
     /// ```
     pub fn from_struct(input: &ItemStruct) -> std::result::Result<Self, NotInternableError> {
-        let mut leaker = Self::with_generics(input.generics.clone());
-        leaker.intern_with(|visitor| {
+        let mut leaker = Self::new();
+        leaker.intern_with(&input.generics, |visitor| {
             visitor.visit_item_struct(input);
         })?;
         Ok(leaker)
@@ -241,8 +239,8 @@ impl Leaker {
 
     /// Initialize with [`ItemEnum`]
     pub fn from_enum(input: &ItemEnum) -> std::result::Result<Self, NotInternableError> {
-        let mut leaker = Self::with_generics(input.generics.clone());
-        leaker.intern_with(|visitor| {
+        let mut leaker = Self::new();
+        leaker.intern_with(&input.generics, |visitor| {
             visitor.visit_item_enum(input);
         })?;
         Ok(leaker)
@@ -269,8 +267,8 @@ impl Leaker {
     /// let _ = Leaker::from_trait(&s);
     /// ```
     pub fn from_trait(input: &ItemTrait) -> std::result::Result<Self, NotInternableError> {
-        let mut leaker = Self::with_generics(input.generics.clone());
-        leaker.intern_with(|visitor| {
+        let mut leaker = Self::new();
+        leaker.intern_with(&input.generics, |visitor| {
             visitor.visit_item_trait(input);
         })?;
         Ok(leaker)
@@ -278,17 +276,9 @@ impl Leaker {
 
     /// Initialize empty [`Leaker`] with no generics.
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Initialize empty [`Leaker`] with given generics.
-    ///
-    /// Types, consts, lifetimes defined in the [`Generics`] is treated as "no needs to be interned" although
-    /// they looks like relative path names.
-    pub fn with_generics(generics: Generics) -> Self {
         Self {
-            generics,
             graph: VecGraph::default(),
+            allowed_paths: Vec::new(),
             self_ty_can_be_interned: true,
             reachable_types: HashSet::new(),
             pending_operations: None,
@@ -308,17 +298,17 @@ impl Leaker {
     /// Intern ast elements with visitor
     pub fn intern_with<'ast, F>(
         &mut self,
+        generics: &Generics,
         f: F,
     ) -> std::result::Result<&mut Self, NotInternableError>
     where
         F: FnOnce(&mut dyn syn::visit::Visit<'ast>),
     {
-        let generics = self.generics.clone();
         let mut visitor = AnalyzeVisitor {
             leaker: self,
             parent: None,
             error: None,
-            generics,
+            generics: generics.clone(),
             operations: Vec::new(),
         };
         f(&mut visitor);
@@ -331,12 +321,78 @@ impl Leaker {
         }
     }
 
+    /// Allow primitive types from `::core::primitive`.
+    pub fn allow_primitive(&mut self) -> &mut Self {
+        self.allowed_paths.extend([
+            parse_quote!(bool),
+            parse_quote!(char),
+            parse_quote!(str),
+            parse_quote!(u8),
+            parse_quote!(u16),
+            parse_quote!(u32),
+            parse_quote!(u64),
+            parse_quote!(u128),
+            parse_quote!(usize),
+            parse_quote!(i8),
+            parse_quote!(i16),
+            parse_quote!(i32),
+            parse_quote!(i64),
+            parse_quote!(i128),
+            parse_quote!(isize),
+            parse_quote!(f32),
+            parse_quote!(f64),
+        ]);
+        self
+    }
+
+    /// Allow items in the standard prelude (`std::prelude::v1`).
+    pub fn allow_std_prelude(&mut self) -> &mut Self {
+        self.allowed_paths.extend([
+            parse_quote!(Box),
+            parse_quote!(String),
+            parse_quote!(Vec),
+            parse_quote!(Option),
+            parse_quote!(Result),
+            parse_quote!(Copy),
+            parse_quote!(Send),
+            parse_quote!(Sized),
+            parse_quote!(Sync),
+            parse_quote!(Unpin),
+            parse_quote!(Drop),
+            parse_quote!(Fn),
+            parse_quote!(FnMut),
+            parse_quote!(FnOnce),
+            parse_quote!(Clone),
+            parse_quote!(PartialEq),
+            parse_quote!(PartialOrd),
+            parse_quote!(Eq),
+            parse_quote!(Ord),
+            parse_quote!(AsRef),
+            parse_quote!(AsMut),
+            parse_quote!(Into),
+            parse_quote!(From),
+            parse_quote!(Default),
+            parse_quote!(Iterator),
+            parse_quote!(IntoIterator),
+            parse_quote!(Extend),
+            parse_quote!(FromIterator),
+            parse_quote!(ToOwned),
+            parse_quote!(ToString),
+            parse_quote!(drop),
+        ]);
+        self
+    }
+
     /// Check that the internableness of give `ty`. It returns `Err` in contradiction (the type
     /// must and must not be interned).
     ///
     ///
     /// See [`CheckResult`].
-    pub fn check(&self, ty: &Type) -> std::result::Result<CheckResult, (Span, Span)> {
+    pub fn check(
+        &self,
+        ty: &Type,
+        generics: &Generics,
+    ) -> std::result::Result<CheckResult, (Span, Span)> {
         use syn::visit::Visit;
         #[derive(Clone)]
         struct Visitor {
@@ -347,6 +403,7 @@ impl Leaker {
             impossible: Option<Span>,
             must: Option<(isize, Span)>,
             self_ty_can_be_interned: bool,
+            allowed_paths: Vec<Path>,
         }
 
         const _: () = {
@@ -386,7 +443,7 @@ impl Leaker {
                             if self.impossible.is_none() {
                                 self.impossible = visitor.impossible;
                             }
-                            match (self.must.clone(), visitor.must.clone()) {
+                            match (self.must, visitor.must) {
                                 (Some((s_l, _)), Some((v_l, v_m))) if v_l + 1 < s_l => {
                                     self.must = Some((v_l + 1, v_m))
                                 }
@@ -422,7 +479,7 @@ impl Leaker {
                                         if self.impossible.is_none() {
                                             self.impossible = visitor.impossible;
                                         }
-                                        match (self.must.clone(), visitor.must.clone()) {
+                                        match (self.must, visitor.must) {
                                             (Some((s_l, _)), Some((v_l, v_m))) if v_l + 1 < s_l => {
                                                 self.must = Some((v_l + 1, v_m))
                                             }
@@ -457,7 +514,7 @@ impl Leaker {
                     if visitor.impossible.is_some() {
                         self.impossible = visitor.impossible;
                     }
-                    match (self.must.clone(), visitor.must.clone()) {
+                    match (self.must, visitor.must) {
                         (Some((s_l, _)), Some((v_l, v_m))) if v_l + 1 < s_l => {
                             self.must = Some((v_l + 1, v_m))
                         }
@@ -495,6 +552,17 @@ impl Leaker {
                     syn::visit::visit_expr(self, i)
                 }
                 fn visit_path(&mut self, i: &Path) {
+                    if self.allowed_paths.iter().any(|allowed| {
+                        allowed.leading_colon == i.leading_colon
+                            && allowed.segments.len() <= i.segments.len()
+                            && allowed
+                                .segments
+                                .iter()
+                                .zip(i.segments.iter())
+                                .all(|(allowed_seg, seg)| allowed_seg == seg)
+                    }) {
+                        return;
+                    }
                     if matches!(i.segments.iter().next(), Some(PathSegment { ident, arguments }) if ident == "Self" && arguments.is_none())
                         && i.leading_colon.is_none()
                     {
@@ -504,13 +572,21 @@ impl Leaker {
                     } else {
                         match (i.leading_colon, i.get_ident()) {
                             // i is a generic parameter
-                            (None, Some(ident)) if self.generic_idents_base.contains(&ident) => {}
-                            (None, Some(ident)) if self.generic_idents.contains(&ident) => {
+                            (None, Some(ident)) if self.generic_idents_base.contains(ident) => {}
+                            (None, Some(ident)) if self.generic_idents.contains(ident) => {
                                 self.impossible = Some(i.span());
                             }
-                            // relative path, not a generic parameter
                             (None, _) => {
-                                self.must = Some((-1, i.span()));
+                                if !matches!(
+                                    i.segments.iter().next(),
+                                    Some(PathSegment {
+                                        ident,
+                                        arguments: PathArguments::None,
+                                    }) if ident == "$crate"
+                                ) {
+                                    // relative path, not a generic parameter
+                                    self.must = Some((-1, i.span()));
+                                }
                             }
                             // absolute path
                             (Some(_), _) => (),
@@ -521,8 +597,7 @@ impl Leaker {
             }
         };
         let mut visitor = Visitor {
-            generic_lifetimes_base: self
-                .generics
+            generic_lifetimes_base: generics
                 .params
                 .iter()
                 .filter_map(|gp| {
@@ -533,8 +608,7 @@ impl Leaker {
                     }
                 })
                 .collect(),
-            generic_idents_base: self
-                .generics
+            generic_idents_base: generics
                 .params
                 .iter()
                 .filter_map(|gp| match gp {
@@ -543,8 +617,7 @@ impl Leaker {
                     _ => None,
                 })
                 .collect(),
-            generic_lifetimes: self
-                .generics
+            generic_lifetimes: generics
                 .params
                 .iter()
                 .filter_map(|gp| {
@@ -555,8 +628,7 @@ impl Leaker {
                     }
                 })
                 .collect(),
-            generic_idents: self
-                .generics
+            generic_idents: generics
                 .params
                 .iter()
                 .filter_map(|gp| match gp {
@@ -568,6 +640,7 @@ impl Leaker {
             impossible: None,
             must: None,
             self_ty_can_be_interned: self.self_ty_can_be_interned,
+            allowed_paths: self.allowed_paths.clone(),
         };
         visitor.visit_type(ty);
         match (visitor.must, visitor.impossible) {
@@ -577,10 +650,6 @@ impl Leaker {
             (None, Some(span)) => Ok(CheckResult::MustNotIntern(span)),
             (Some((_, span0)), Some(span1)) => Err((span0, span1)),
         }
-    }
-
-    pub fn generics(&self) -> &Generics {
-        &self.generics
     }
 
     /// Finish building the [`Leaker`] and convert it into [`Referrer`].
@@ -624,7 +693,7 @@ impl Leaker {
     /// Here, there are some choice in its freedom:
     ///
     /// - Intern all **red** nodes and ignore others (because other nodes are not needed to be
-    /// intern, or constructable with red nodes)
+    ///   intern, or constructable with red nodes)
     /// - Not directly intern **red** nodes; intern common ancessors instead if it is affordable.
     ///
     /// So finally, it results like:
@@ -681,10 +750,10 @@ impl Leaker {
 
         // Step 2: Keep root types that contain must-intern descendants
         for root_type in &root_types {
-            if !kept_types.contains(root_type) {
-                if self.contains_must_intern_descendant(root_type, &children, &must_intern_types) {
-                    kept_types.insert(root_type.clone());
-                }
+            if !kept_types.contains(root_type)
+                && self.contains_must_intern_descendant(root_type, &children, &must_intern_types)
+            {
+                kept_types.insert(root_type.clone());
             }
         }
 
@@ -852,10 +921,10 @@ impl Leaker {
 
         // Keep root types that contain must-intern descendants
         for root_type in root_types {
-            if !final_types.contains(root_type) {
-                if self.contains_must_intern_in_tree(root_type, operations, must_intern_types) {
-                    final_types.insert(root_type.clone());
-                }
+            if !final_types.contains(root_type)
+                && self.contains_must_intern_in_tree(root_type, operations, must_intern_types)
+            {
+                final_types.insert(root_type.clone());
             }
         }
 
