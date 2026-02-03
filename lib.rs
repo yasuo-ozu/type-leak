@@ -2,7 +2,7 @@
 
 use gotgraph::graph::{Graph as GotGraph, GraphUpdate};
 use gotgraph::prelude::VecGraph;
-use proc_macro2::Span;
+use proc_macro2::{Span, TokenStream};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -16,6 +16,96 @@ use template_quote::{quote, ToTokens};
 
 pub use syn;
 
+/// Configuration for building a [`Leaker`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LeakerConfig {
+    pub allowed_paths: Vec<Path>,
+    pub self_ty_can_be_interned: bool,
+}
+
+impl Default for LeakerConfig {
+    fn default() -> Self {
+        Self {
+            allowed_paths: Vec::new(),
+            self_ty_can_be_interned: true,
+        }
+    }
+}
+
+impl LeakerConfig {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    /// Allow primitive types from `::core::primitive`.
+    pub fn allow_primitive(&mut self) -> &mut Self {
+        self.allowed_paths.extend([
+            parse_quote!(bool),
+            parse_quote!(char),
+            parse_quote!(str),
+            parse_quote!(u8),
+            parse_quote!(u16),
+            parse_quote!(u32),
+            parse_quote!(u64),
+            parse_quote!(u128),
+            parse_quote!(usize),
+            parse_quote!(i8),
+            parse_quote!(i16),
+            parse_quote!(i32),
+            parse_quote!(i64),
+            parse_quote!(i128),
+            parse_quote!(isize),
+            parse_quote!(f32),
+            parse_quote!(f64),
+        ]);
+        self
+    }
+
+    /// Allow items in the standard prelude (`std::prelude::v1`).
+    pub fn allow_std_prelude(&mut self) -> &mut Self {
+        self.allowed_paths.extend([
+            parse_quote!(Box),
+            parse_quote!(String),
+            parse_quote!(Vec),
+            parse_quote!(Option),
+            parse_quote!(Result),
+            parse_quote!(Copy),
+            parse_quote!(Send),
+            parse_quote!(Sized),
+            parse_quote!(Sync),
+            parse_quote!(Unpin),
+            parse_quote!(Drop),
+            parse_quote!(Fn),
+            parse_quote!(FnMut),
+            parse_quote!(FnOnce),
+            parse_quote!(Clone),
+            parse_quote!(PartialEq),
+            parse_quote!(PartialOrd),
+            parse_quote!(Eq),
+            parse_quote!(Ord),
+            parse_quote!(AsRef),
+            parse_quote!(AsMut),
+            parse_quote!(Into),
+            parse_quote!(From),
+            parse_quote!(Default),
+            parse_quote!(Iterator),
+            parse_quote!(IntoIterator),
+            parse_quote!(Extend),
+            parse_quote!(FromIterator),
+            parse_quote!(ToOwned),
+            parse_quote!(ToString),
+            parse_quote!(drop),
+        ]);
+        self
+    }
+
+    /// Allow paths starting with `crate`.
+    pub fn allow_crate(&mut self) -> &mut Self {
+        self.allowed_paths.push(parse_quote!(crate));
+        self
+    }
+}
+
 /// The entry point of this crate.
 pub struct Leaker {
     graph: VecGraph<Type, ()>,
@@ -27,15 +117,21 @@ pub struct Leaker {
 
 /// Error represents that the type is not internable.
 #[derive(Debug, Clone)]
-pub struct NotInternableError(pub Span);
+pub struct NotInternableError(pub TokenStream);
 
 impl std::fmt::Display for NotInternableError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Not internable")
+        f.write_str(&format!("use absolute path: '{}'", &self.0))
     }
 }
 
 impl std::error::Error for NotInternableError {}
+
+impl NotInternableError {
+    pub fn span(&self) -> Span {
+        self.0.span()
+    }
+}
 
 /// Encode [`GenericArgument`]s to a type.
 pub fn encode_generics_args_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericArgument>) -> Type {
@@ -84,13 +180,13 @@ pub fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a Gener
 #[derive(Clone, Debug)]
 pub enum CheckResult {
     /// The type must be interned because it directly depends on the type context.
-    MustIntern(Span),
+    MustIntern(TokenStream),
     /// The type must be interned because one of the types which it constituted with must be
     /// interned.
-    MustInternOrInherit(Span),
+    MustInternOrInherit(TokenStream),
     /// The type must not be interned, because `type_leak` cannot intern this. (e.g. `impl Trait`s,
     /// `_`, trait bounds with relative trait path, ...)
-    MustNotIntern(Span),
+    MustNotIntern(TokenStream),
     /// Other.
     Neutral,
 }
@@ -107,7 +203,7 @@ struct AnalyzeVisitor<'a> {
     leaker: &'a mut Leaker,
     generics: Generics,
     parent: Option<Type>,
-    error: Option<Span>,
+    error: Option<TokenStream>,
     operations: Vec<GraphOperation>,
 }
 
@@ -117,7 +213,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             leaker: self.leaker,
             generics: self.generics.clone(),
             parent: self.parent.clone(),
-            error: self.error,
+            error: self.error.clone(),
             operations: Vec::new(),
         };
         for g in &i.sig.generics.params {
@@ -212,7 +308,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                     )
             })
         {
-            self.error = Some(i.span());
+            self.error = Some(quote!(#i));
             return;
         }
         syn::visit::visit_trait_bound(self, i)
@@ -221,7 +317,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     fn visit_expr_path(&mut self, i: &ExprPath) {
         if i.path.leading_colon.is_none() {
             // Value or trait bounds with relative oath
-            self.error = Some(i.span());
+            self.error = Some(quote!(#i));
         } else {
             syn::visit::visit_expr_path(self, i)
         }
@@ -266,12 +362,6 @@ impl Leaker {
         Ok(leaker)
     }
 
-    /// Allow paths starting with `crate`.
-    pub fn allow_crate(&mut self) -> &mut Self {
-        self.allowed_paths.push(parse_quote!(crate));
-        self
-    }
-
     /// Build an [`Leaker`] with given trait.
     ///
     /// Unlike enum nor struct, it requires ~alternative path~, an absolute path of a struct
@@ -306,6 +396,17 @@ impl Leaker {
             graph: VecGraph::default(),
             allowed_paths: Vec::new(),
             self_ty_can_be_interned: true,
+            reachable_types: HashSet::new(),
+            pending_operations: None,
+        }
+    }
+
+    /// Initialize [`Leaker`] from configuration.
+    pub fn from_config(config: LeakerConfig) -> Self {
+        Self {
+            graph: VecGraph::default(),
+            allowed_paths: config.allowed_paths,
+            self_ty_can_be_interned: config.self_ty_can_be_interned,
             reachable_types: HashSet::new(),
             pending_operations: None,
         }
@@ -347,68 +448,6 @@ impl Leaker {
         }
     }
 
-    /// Allow primitive types from `::core::primitive`.
-    pub fn allow_primitive(&mut self) -> &mut Self {
-        self.allowed_paths.extend([
-            parse_quote!(bool),
-            parse_quote!(char),
-            parse_quote!(str),
-            parse_quote!(u8),
-            parse_quote!(u16),
-            parse_quote!(u32),
-            parse_quote!(u64),
-            parse_quote!(u128),
-            parse_quote!(usize),
-            parse_quote!(i8),
-            parse_quote!(i16),
-            parse_quote!(i32),
-            parse_quote!(i64),
-            parse_quote!(i128),
-            parse_quote!(isize),
-            parse_quote!(f32),
-            parse_quote!(f64),
-        ]);
-        self
-    }
-
-    /// Allow items in the standard prelude (`std::prelude::v1`).
-    pub fn allow_std_prelude(&mut self) -> &mut Self {
-        self.allowed_paths.extend([
-            parse_quote!(Box),
-            parse_quote!(String),
-            parse_quote!(Vec),
-            parse_quote!(Option),
-            parse_quote!(Result),
-            parse_quote!(Copy),
-            parse_quote!(Send),
-            parse_quote!(Sized),
-            parse_quote!(Sync),
-            parse_quote!(Unpin),
-            parse_quote!(Drop),
-            parse_quote!(Fn),
-            parse_quote!(FnMut),
-            parse_quote!(FnOnce),
-            parse_quote!(Clone),
-            parse_quote!(PartialEq),
-            parse_quote!(PartialOrd),
-            parse_quote!(Eq),
-            parse_quote!(Ord),
-            parse_quote!(AsRef),
-            parse_quote!(AsMut),
-            parse_quote!(Into),
-            parse_quote!(From),
-            parse_quote!(Default),
-            parse_quote!(Iterator),
-            parse_quote!(IntoIterator),
-            parse_quote!(Extend),
-            parse_quote!(FromIterator),
-            parse_quote!(ToOwned),
-            parse_quote!(ToString),
-            parse_quote!(drop),
-        ]);
-        self
-    }
-
     /// Check that the internableness of give `ty`. It returns `Err` in contradiction (the type
     /// must and must not be interned).
     ///
@@ -418,14 +457,14 @@ impl Leaker {
         &self,
         ty: &Type,
         generics: &Generics,
-    ) -> std::result::Result<CheckResult, (Span, Span)> {
+    ) -> std::result::Result<CheckResult, (TokenStream, TokenStream)> {
         use syn::visit::Visit;
         #[derive(Clone)]
         struct Visitor {
             generic_lifetimes: Vec<Lifetime>,
             generic_idents: Vec<Ident>,
-            impossible: Option<Span>,
-            must: Option<(isize, Span)>,
+            impossible: Option<TokenStream>,
+            must: Option<(isize, TokenStream)>,
             self_ty_can_be_interned: bool,
             allowed_paths: Vec<Path>,
         }
@@ -467,7 +506,7 @@ impl Leaker {
                             if self.impossible.is_none() {
                                 self.impossible = visitor.impossible;
                             }
-                            match (self.must, visitor.must) {
+                            match (self.must.clone(), visitor.must) {
                                 (Some((s_l, _)), Some((v_l, v_m))) if v_l + 1 < s_l => {
                                     self.must = Some((v_l + 1, v_m))
                                 }
@@ -503,7 +542,7 @@ impl Leaker {
                                         if self.impossible.is_none() {
                                             self.impossible = visitor.impossible;
                                         }
-                                        match (self.must, visitor.must) {
+                                        match (self.must.clone(), visitor.must) {
                                             (Some((s_l, _)), Some((v_l, v_m))) if v_l + 1 < s_l => {
                                                 self.must = Some((v_l + 1, v_m))
                                             }
@@ -515,7 +554,7 @@ impl Leaker {
                                         return;
                                     }
                                     TypeParamBound::Verbatim(_) => {
-                                        self.impossible = Some(bound.span());
+                                        self.impossible = Some(quote!(#bound));
                                         return;
                                     }
                                     _ => (),
@@ -523,11 +562,11 @@ impl Leaker {
                             }
                         }
                         Type::ImplTrait(_) | Type::Macro(_) | Type::Verbatim(_) => {
-                            self.impossible = Some(i.span());
+                            self.impossible = Some(quote!(#i));
                         }
                         Type::Reference(TypeReference { lifetime, .. }) => {
                             if lifetime.is_none() {
-                                self.impossible = Some(i.span());
+                                self.impossible = Some(quote!(#i));
                             }
                         }
                         _ => (),
@@ -538,7 +577,7 @@ impl Leaker {
                     if visitor.impossible.is_some() {
                         self.impossible = visitor.impossible;
                     }
-                    match (self.must, visitor.must) {
+                    match (self.must.clone(), visitor.must) {
                         (Some((s_l, _)), Some((v_l, v_m))) if v_l + 1 < s_l => {
                             self.must = Some((v_l + 1, v_m))
                         }
@@ -548,17 +587,18 @@ impl Leaker {
                 }
                 fn visit_qself(&mut self, i: &QSelf) {
                     if i.as_token.is_none() {
-                        self.impossible = Some(i.span());
+                        let ty = &i.ty;
+                        self.impossible = Some(quote!(#ty));
                     }
                     syn::visit::visit_qself(self, i)
                 }
                 fn visit_lifetime(&mut self, i: &Lifetime) {
                     match i.to_string().as_str() {
                         "'static" => (),
-                        "'_" => self.impossible = Some(i.span()),
+                        "'_" => self.impossible = Some(quote!(#i)),
                         _ if self.generic_lifetimes.iter().any(|lt| lt == i) => {}
                         _ => {
-                            self.must = Some((-1, i.span()));
+                            self.must = Some((-1, quote!(#i)));
                         }
                     }
                     syn::visit::visit_lifetime(self, i)
@@ -566,7 +606,7 @@ impl Leaker {
                 fn visit_expr(&mut self, i: &Expr) {
                     match i {
                         Expr::Closure(_) | Expr::Assign(_) | Expr::Verbatim(_) | Expr::Macro(_) => {
-                            self.impossible = Some(i.span());
+                            self.impossible = Some(quote!(#i));
                         }
                         _ => (),
                     }
@@ -589,7 +629,7 @@ impl Leaker {
                         && i.leading_colon.is_none()
                     {
                         if !self.self_ty_can_be_interned {
-                            self.impossible = Some(i.span());
+                            self.impossible = Some(quote!(#i));
                         }
                     } else {
                         if i.leading_colon.is_none()
@@ -608,7 +648,7 @@ impl Leaker {
                             (None, Some(ident)) if self.generic_idents.contains(ident) => {}
                             // relative path, not a generic parameter
                             (None, _) => {
-                                self.must = Some((-1, i.span()));
+                                self.must = Some((-1, quote!(#i)));
                             }
                             // absolute path
                             (Some(_), _) => (),
