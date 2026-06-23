@@ -4,6 +4,7 @@ description = "Enable sharing type context beyond crate boundary"
 authors = ["Yasuo Ozu <yasuo@ozu.email>"]
 version = "0.6.0"
 edition = "2018"
+rust-version = "1.56"
 repository = "https://github.com/yasuo-ozu/type-leak"
 keywords = ["macros", "syn", "typesystem", "typeleak"]
 categories = [
@@ -17,7 +18,7 @@ license = "MIT"
 path = "lib.rs"
 
 [dependencies]
-gotgraph = "0.2.0"
+safegraph = { version = "0.1.0", default-features = false }
 proc-macro2 = "1.0"
 template-quote = "0.4"
 

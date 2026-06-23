@@ -1,8 +1,9 @@
 #![doc = include_str!("./README.md")]
 
-use gotgraph::graph::{Graph as GotGraph, GraphUpdate};
-use gotgraph::prelude::VecGraph;
 use proc_macro2::{Span, TokenStream};
+use safegraph::graph::edge::Endpoints;
+use safegraph::graph::Graph;
+use safegraph::VecGraph;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -644,8 +645,14 @@ impl Leaker {
                             return;
                         }
                         match (i.leading_colon, i.get_ident()) {
-                            // i is a generic parameter
+                            // i is a generic parameter (single-segment, e.g. `T`)
                             (None, Some(ident)) if self.generic_idents.contains(ident) => {}
+                            // i is an associated type of a generic param (e.g. `S::Item`)
+                            (None, _)
+                                if i.segments.first().map_or(false, |seg| {
+                                    matches!(&seg.arguments, PathArguments::None)
+                                        && self.generic_idents.contains(&seg.ident)
+                                }) => {}
                             // relative path, not a generic parameter
                             (None, _) => {
                                 self.must = Some((-1, quote!(#i)));
@@ -918,13 +925,13 @@ impl Leaker {
             // Add all nodes first
             for operation in &operations {
                 if !type_to_node.contains_key(&operation.node_type) {
-                    let node_tag = ctx.add_node(operation.node_type.clone());
+                    let node_tag = ctx.insert_node(operation.node_type.clone()).unwrap();
                     type_to_node.insert(operation.node_type.clone(), node_tag);
                 }
 
                 if let Some(parent_type) = &operation.parent {
                     if !type_to_node.contains_key(parent_type) {
-                        let parent_node_tag = ctx.add_node(parent_type.clone());
+                        let parent_node_tag = ctx.insert_node(parent_type.clone()).unwrap();
                         type_to_node.insert(parent_type.clone(), parent_node_tag);
                     }
                 }
@@ -935,7 +942,9 @@ impl Leaker {
                 if let Some(parent_type) = &operation.parent {
                     let parent_node = type_to_node[parent_type];
                     let child_node = type_to_node[&operation.node_type];
-                    ctx.add_edge((), parent_node, child_node);
+                    let ep =
+                        <_ as Endpoints>::try_from_node_indices([parent_node, child_node]).unwrap();
+                    ctx.insert_edge((), ep).unwrap();
                 }
             }
         });
