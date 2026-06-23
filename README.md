@@ -7,17 +7,17 @@
 [GitHub Actions]: https://github.com/yasuo-ozu/type-leak/actions/workflows/rust.yml/badge.svg
 [actions]: https://github.com/yasuo-ozu/type-leak/actions/workflows/rust.yml
 
-In Rust, type references depend on the type context in which they are described. For example, relative paths rely on the location of the type context and the imported namespaces. Even absolute paths depend on the crate itself and other crates that the crate depends on. This fact becomes problematic when defining macros that copy user-written type references as token sequences into another type context. In other words, type references written by the user are valid in their original type context but are not necessarily valid in the type context to which they are copied.
+In Rust, type references depend on the type context in which they appear. For example, relative paths rely on the location of the type context and the imported namespaces. Even absolute paths depend on the crate itself and the crates it depends on. This becomes problematic when defining macros that copy user-written type references as token sequences into another type context. In short, type references written by the user are valid in their original type context but may not be valid in the type context into which they are copied.
 
-`type-leak` is a concept (or library) that assists you in rewriting type references when copying user-defined type definitions within the macros you create. This is crucial because type references in Rust depend on the context in which they are defined. When you copy these definitions into a different context, their type references might not be valid anymore. "Type-leak" helps address this problem by handling the rewriting process. Three key elements are involved:
+`type-leak` is a concept (and library) that helps you rewrite type references when copying user-defined type definitions within the macros you create. This is crucial because type references in Rust depend on the context in which they are defined. When you copy these definitions into a different context, the type references they contain may no longer be valid. `type-leak` addresses this problem by handling the rewriting process. Three key elements are involved:
 
-1. The "Leaker" is a user-defined type (such as an enum or struct) or trait definition that is intended to be copied into another type context. It must be located in a position that can be referenced from the Referrer (which we will describe next) via absolute paths, relative paths, or through type aliases. If "Leaker" is an trait definition, you should specify leaker type, which has the same type parameters with the leaker definition.
+1. The **Leaker** is a user-defined type (such as an enum or struct) or a trait definition intended to be copied into another type context. It must be located where it can be referenced from the Referrer (described below) via absolute paths, relative paths, or type aliases. If the Leaker is a trait definition, you must also specify a leaker struct type that has the same type parameters as the leaker trait.
 
-2. The "Repeater" is a trait that facilitates passing type information from the Leaker to the Referrer. It must be accessible from both the Leaker and the Referrer using absolute or relative paths. This trait is defined in the type-leak crate. The repeater has a const generic, which distinguishes a type referrence in the leaker.
+2. The **Repeater** is a trait that passes type information from the Leaker to the Referrer. It must be accessible from both the Leaker and the Referrer via absolute or relative paths. This trait is defined in the `type-leak` crate. The Repeater has a `const` generic parameter that uniquely identifies each type reference in the Leaker.
 
-3. The "Referrer" is the definition into which the type references written in the Leaker are copied. The type-leak crate parses the definition of the Referrer and replaces the type references inside it as necessary. Referrer also knows the location of leaker, and type arguments passed to that.
+3. The **Referrer** is the definition into which the Leaker's type references are copied. The `type-leak` crate parses the Referrer's definition and replaces the type references inside it as needed. The Referrer also records the location of the Leaker and the type arguments passed to it.
 
-The three components are generally defined in different crates, and thus `type-leak` allows copying type context beyond crate boundary.
+The three components are generally defined in different crates, so `type-leak` enables copying type context across crate boundaries.
 
 # Core mechanism
 
@@ -38,7 +38,7 @@ enum MyLeaker<T, U, ...> {
 }
 ```
 
-Or if the leaker is an trait definition, the leaker type is like:
+Or if the leaker is a trait definition, the leaker type is like:
 
 ```rust,ignore
 trait MyLeaker<T, U, ..> {
@@ -48,9 +48,9 @@ trait MyLeaker<T, U, ..> {
 struct MyLeakerType<T, U, ...>(::core::convert::Infallible);
 ```
 
-`type-leak` automatically analyze definition of `MyLeakerType` or `MyLeaker` to find all type references which depends on the typa context of this definition. For each type references it assigns unique IDs (of just an incremented variable) to be distinguished through a common repeater.
+`type-leak` automatically analyzes the definition of `MyLeakerType` or `MyLeaker` to find all type references that depend on the type context of that definition. For each such type reference, it assigns a unique ID (simply an incrementing integer) so they can be distinguished through a common Repeater.
 
-With given referrer, `type-leak` also analyze type referrences in the same way, and generates new type referrences which only depends on the path of repeater trait.
+Given a Referrer, `type-leak` also analyzes its type references in the same way and generates new type references that depend only on the path of the Repeater trait.
 
 Example of leaking a type in the leaker's type context:
 
@@ -66,7 +66,7 @@ impl<T, U, ..> path::to::Repeater<1> for MyLeakerType<T, U, ..> {
 // MyLeakerType definition is placed here
 ```
 
-Example of referrence in the referrer's type context:
+Example of a reference in the referrer's type context:
 
 ```rust,ignore
 <MyLeakerType<T, U, ..> as path::to::Repeater<0>>::Type
