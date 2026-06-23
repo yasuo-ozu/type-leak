@@ -115,7 +115,7 @@ pub struct Leaker {
     pending_operations: Option<Vec<GraphOperation>>,
 }
 
-/// Error represents that the type is not internable.
+/// Error indicating that a type is not internable.
 #[derive(Debug, Clone)]
 pub struct NotInternableError(pub TokenStream);
 
@@ -176,16 +176,15 @@ pub fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a Gener
     })
 }
 
-/// Represents result of [`Leaker::check()`], holding the cause in its tuple item.
+/// Represents the result of [`Leaker::check()`], holding the cause in its tuple field.
 #[derive(Clone, Debug)]
 pub enum CheckResult {
     /// The type must be interned because it directly depends on the type context.
     MustIntern(TokenStream),
-    /// The type must be interned because one of the types which it constituted with must be
-    /// interned.
+    /// The type must be interned because one of the types it is composed of must be interned.
     MustInternOrInherit(TokenStream),
-    /// The type must not be interned, because `type_leak` cannot intern this. (e.g. `impl Trait`s,
-    /// `_`, trait bounds with relative trait path, ...)
+    /// The type must not be interned because `type_leak` cannot intern it (e.g. `impl Trait`,
+    /// `_`, trait bounds with a relative trait path, ...)
     MustNotIntern(TokenStream),
     /// Other.
     Neutral,
@@ -288,7 +287,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     }
 
     fn visit_trait_bound(&mut self, i: &TraitBound) {
-        // Trait bounds with non-absolute oath
+        // Trait bounds with a non-absolute path
         if i.path.leading_colon.is_none()
             && !matches!(
                 i.path.segments.iter().next(),
@@ -316,7 +315,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
 
     fn visit_expr_path(&mut self, i: &ExprPath) {
         if i.path.leading_colon.is_none() {
-            // Value or trait bounds with relative oath
+            // Value or trait bounds with a relative path
             self.error = Some(quote!(#i));
         } else {
             syn::visit::visit_expr_path(self, i)
@@ -362,11 +361,11 @@ impl Leaker {
         Ok(leaker)
     }
 
-    /// Build an [`Leaker`] with given trait.
+    /// Build a [`Leaker`] from a given trait.
     ///
-    /// Unlike enum nor struct, it requires ~alternative path~, an absolute path of a struct
-    /// which is declared the same crate with the leaker trait and also visible from
-    /// [`Referrer`]s' context. That struct is used as an `impl` target of `Repeater`
+    /// Unlike an enum or struct, a trait Leaker requires an alternate struct — an absolute path
+    /// to a struct declared in the same crate as the leaker trait and visible from
+    /// [`Referrer`]s' context. That struct serves as the `impl` target of the Repeater
     /// instead of the Leaker's path.
     ///
     /// ```
@@ -412,7 +411,7 @@ impl Leaker {
         }
     }
 
-    /// Apply collected graph operations using scope_mut()
+    /// Apply collected graph operations using `scope_mut()`.
     fn apply_operations(&mut self, operations: Vec<GraphOperation>) {
         if operations.is_empty() {
             return;
@@ -422,7 +421,7 @@ impl Leaker {
         self.pending_operations = Some(operations);
     }
 
-    /// Intern ast elements with visitor
+    /// Intern AST elements using a visitor callback.
     pub fn intern_with<'ast, F>(
         &mut self,
         generics: &Generics,
@@ -448,8 +447,8 @@ impl Leaker {
         }
     }
 
-    /// Check that the internableness of give `ty`. It returns `Err` in contradiction (the type
-    /// must and must not be interned).
+    /// Check whether the given `ty` is internable. Returns `Err` when there is a contradiction
+    /// (the type must both be interned and must not be interned).
     ///
     ///
     /// See [`CheckResult`].
@@ -706,11 +705,11 @@ impl Leaker {
         Referrer { leak_types, map }
     }
 
-    /// Reduce nodes to decrease cost of {`Leaker`}'s implementation.
+    /// Reduce nodes to decrease the cost of the [`Leaker`]'s implementation.
     ///
     /// # Algorithm
     ///
-    /// To consult the algorithm, see the following [`Leaker`]'s input:
+    /// Consider the following [`Leaker`] input:
     ///
     /// ```ignore
     /// pub struct MyStruct<'a, T1, T2: ::path::to::MyType1<MyType4>> {
@@ -720,25 +719,25 @@ impl Leaker {
     /// }
     /// ```
     ///
-    /// [`Leaker`], when initialized with [`Leaker::from_struct()`], analyze the AST and
-    /// construct a DAG which represents all (internable) types and the dependency relations like
-    /// this:
+    /// When initialized with [`Leaker::from_struct()`], the [`Leaker`] analyzes the AST and
+    /// constructs a DAG representing all internable types and their dependency relations:
     ///
     /// ![before_graph](https://raw.github.com/yasuo-ozu/type-leak/master/resources/before_graph.svg)
     ///
-    /// The **red** node is flagged as [`CheckResult::MustIntern`] by [`Leaker::check()`] (which means
-    /// the type literature depends on the type context, so it must be interned).
+    /// **Red** nodes are flagged as [`CheckResult::MustIntern`] by [`Leaker::check()`], meaning
+    /// the type literally depends on the type context and must be interned.
     ///
-    /// This algorithm reduce the nodes, remaining that all root type (annotated with ★) can be
-    /// expressed with existing **red** nodes.
+    /// This algorithm reduces the node set while ensuring that every root type (annotated with ★)
+    /// can still be expressed using the remaining **red** nodes.
     ///
-    /// Here, there are some choice in its freedom:
+    /// There are two degrees of freedom in this reduction:
     ///
-    /// - Intern all **red** nodes and ignore others (because other nodes are not needed to be
-    ///   intern, or constructable with red nodes)
-    /// - Not directly intern **red** nodes; intern common ancessors instead if it is affordable.
+    /// - Intern all **red** nodes and ignore the rest (since non-red nodes either do not need to
+    ///   be interned or can be reconstructed from red nodes).
+    /// - Skip interning individual **red** nodes and instead intern their common ancestors when
+    ///   doing so is more efficient.
     ///
-    /// So finally, it results like:
+    /// The final result looks like:
     ///
     /// ![after_graph](https://raw.github.com/yasuo-ozu/type-leak/master/resources/after_graph.svg)
     pub fn reduce_roots(&mut self) {
@@ -1029,9 +1028,9 @@ impl Leaker {
     // TODO: Reimplement reduce_unreachable_nodes with VecGraph APIs
 }
 
-/// Holds the list of types that need to be encoded, produced by [`Leaker::finish()`].
+/// Holds the list of types that need to be encoded, as produced by [`Leaker::finish()`].
 ///
-/// The `Referrer` provides methods to iterate over leak types and to expand/transform
+/// `Referrer` provides methods to iterate over leak types and to expand or transform
 /// types using a custom mapping function.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Referrer {
