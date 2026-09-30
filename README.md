@@ -82,7 +82,9 @@ are interned instead. A type which cannot be decomposed (such as `MyWrap<B>` in
 `fn f<const B: bool>()`) is interned together with the local generics it depends on, which
 `Referrer::local_generics()` returns. The Repeater's implementation must then declare these
 generics (lifetimes first) and constrain them in its trait arguments, so the Repeater needs a type
-parameter to carry them (e.g. `Repeater<T: ?Sized, const INDEX: usize>`).
+parameter to carry them (e.g. `Repeater<T: ?Sized, const INDEX: usize>`). Their bounds may mention
+`Self`, which refers to the implementor of the Leaker trait, so the Repeater should be implemented
+for the implementor (e.g. `impl<.., S: ?Sized> Repeater<..> for S where S: MyTrait<..>`).
 
 Known limitations, due to the stable Rust type system:
 
@@ -94,11 +96,13 @@ Known limitations, due to the stable Rust type system:
 - The type of a const parameter must be a primitive type or a context-free path (e.g. an absolute
   path to a type alias), since it cannot be a projection.
 - `encode_generics_params_to_ty()` encodes `const N: usize` as `[(); N]`, and there is no stable
-  type in `core` with a const parameter of other types. To encode generics of any kind, use a type
-  with the same generics as the Leaker: the Leaker's type itself for a struct or an enum, or a
-  carrier struct generated next to a trait with `GenericsCarrier::definition()` (then
-  `GenericsCarrier::encode_generics_params_to_ty()` and `GenericsCarrier::encode_generics_args_to_ty()`).
-  The carrier supports const parameters of any type and omitted default arguments.
+  type in `core` with a const parameter of other types. To encode const generics of any primitive
+  type, define the Repeater with `repeater_definition()`, which adds a defaulted const "slot" per
+  primitive type (`Repeater<T, ID, NTH, const BOOL: bool = false, ...>`), and encode generics with
+  `RepeaterSlots`. A const value is then encoded as a trait object of the Repeater with its slot
+  filled (e.g. `*const dyn Repeater<(), 0, 0, B, Type = ()>` for `const B: bool`), so the Repeater
+  is still the only item shared by the Leaker and the Referrer. Const parameters whose type is a
+  type alias cannot be encoded.
 
 # Application
 

@@ -91,6 +91,29 @@ fn limit_conflicting_local_generics() {
     .unwrap();
     assert_eq!(leak_trait(&item), Ok(vec![]));
 
+    // The same type with and without local generics (here `B` is a type in `g`).
+    for item in [
+        parse2::<ItemTrait>(quote! {
+            pub trait MyTrait {
+                fn f<const B: bool>(&self) -> Wrap<B>;
+                fn g(&self) -> Wrap<B>;
+            }
+        })
+        .unwrap(),
+        parse2::<ItemTrait>(quote! {
+            pub trait MyTrait {
+                fn g(&self) -> Wrap<B>;
+                fn f<const B: bool>(&self) -> Wrap<B>;
+            }
+        })
+        .unwrap(),
+    ] {
+        assert_eq!(
+            leak_trait(&item),
+            Err("use absolute path: 'Wrap < B >'".to_string())
+        );
+    }
+
     // The same local generics in several methods are fine.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait {
@@ -126,25 +149,23 @@ fn limit_const_param_ty_alias() {
     .unwrap();
     assert_eq!(leak_trait(&abs_item), Ok(vec!["RelType".to_string()]));
 
-    // `GenericsCarrier` supports it, since it copies the type of const parameters as it is.
-    let carrier = GenericsCarrier::definition(
-        &parse2(quote!(pub)).unwrap(),
-        &parse2(quote!(Carrier)).unwrap(),
-        &abs_item.generics,
+    // `RepeaterSlots` cannot encode an alias (relative or absolute), because it cannot know which
+    // slot to use.
+    let slots = RepeaterSlots::new(parse2(quote!(crate::Repeater)).unwrap());
+    let err = slots
+        .encode_generics_params_to_ty(&abs_item.generics.params)
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unsupported type of const parameter: ':: my_crate :: Idx'"
     );
-    let expected: ItemStruct = parse2(quote! {
-        #[doc(hidden)]
-        pub struct Carrier<const N: ::my_crate::Idx>;
-    })
-    .unwrap();
-    assert_eq!(quote!(#carrier).to_string(), quote!(#expected).to_string());
 }
 
 #[test]
 fn limit_plain_encoders_usize_only() {
     // `encode_generics_params_to_ty()` and `encode_generics_args_to_ty()` encode const generics as
     // array lengths, which must be `usize`. For other types they produce `[(); B]` or
-    // `[(); true]`, which rustc rejects; `GenericsCarrier` must be used instead.
+    // `[(); true]`, which rustc rejects; `RepeaterSlots` must be used instead.
     let generics: Generics = parse2(quote!(<const B: bool>)).unwrap();
     let ty = encode_generics_params_to_ty(&generics.params);
     assert_eq!(ty_string(&ty), expected_ty(quote!(([(); B],))));
@@ -153,11 +174,25 @@ fn limit_plain_encoders_usize_only() {
     let ty = encode_generics_args_to_ty(&args.args);
     assert_eq!(ty_string(&ty), expected_ty(quote!(([(); true],))));
 
-    let carrier = GenericsCarrier::new(parse2(quote!(crate::m::Carrier)).unwrap());
-    let ty = carrier.encode_generics_params_to_ty(&generics.params);
-    assert_eq!(ty_string(&ty), expected_ty(quote!(crate::m::Carrier<B>)));
-    let ty = carrier.encode_generics_args_to_ty(&args.args);
-    assert_eq!(ty_string(&ty), expected_ty(quote!(crate::m::Carrier<true>)));
+    let slots = RepeaterSlots::new(parse2(quote!(crate::Repeater)).unwrap());
+    let ty = slots
+        .encode_generics_params_to_ty(&generics.params)
+        .unwrap();
+    assert_eq!(
+        ty_string(&ty),
+        expected_ty(quote!(
+            (*const dyn crate::Repeater<(), 0, 0, B, Type = ()>,)
+        ))
+    );
+    let ty = slots
+        .encode_generics_args_to_ty(&args.args, &generics.params)
+        .unwrap();
+    assert_eq!(
+        ty_string(&ty),
+        expected_ty(quote!((
+            *const dyn crate::Repeater<(), 0, 0, true, Type = ()>,
+        )))
+    );
 }
 
 // ── holes ────────────────────────────────────────────────────────────────────
@@ -169,7 +204,7 @@ fn hole_omitted_default_arg() {
     // The plain encoders encode all parameters, but only the given arguments, so the two
     // encodings differ and the Repeater's implementation is not found.
     // Expected after fix: missing arguments are filled from the parameters' defaults, giving
-    // `(u8, [(); 3])`. `GenericsCarrier` avoids it, since rustc fills the carrier's defaults.
+    // `(u8, [(); 3])`, as `RepeaterSlots` does.
     let generics: Generics = parse2(quote!(<T, const N: usize = 3>)).unwrap();
     let args: AngleBracketedGenericArguments = parse2(quote!(<u8>)).unwrap();
 
@@ -179,6 +214,12 @@ fn hole_omitted_default_arg() {
     });
     assert_eq!(ty_string(&params_ty), expected_ty(quote!((T, [(); N]))));
     assert_eq!(ty_string(&args_ty), expected_ty(quote!((u8,))));
+
+    let slots = RepeaterSlots::new(parse2(quote!(crate::Repeater)).unwrap());
+    let ty = slots
+        .encode_generics_args_to_ty(&args.args, &generics.params)
+        .unwrap();
+    assert_eq!(ty_string(&ty), expected_ty(quote!((u8, [(); 3]))));
 }
 
 #[test]
@@ -186,7 +227,7 @@ fn hole_assoc_binding_arg() {
     // HOLE: the plain encoders panic on an associated binding in the arguments.
     //
     // Expected after fix: bindings are skipped when encoding the arguments, giving `(u8,)`, as
-    // `GenericsCarrier` does.
+    // `RepeaterSlots` does.
     let args: AngleBracketedGenericArguments = parse2(quote!(<u8, Item = u8>)).unwrap();
 
     let result = std::panic::catch_unwind(|| encode_generics_args_to_ty(&args.args));
@@ -196,9 +237,12 @@ fn hole_assoc_binding_arg() {
         Some("unsupported generic argument: 'Item = u8'")
     );
 
-    let carrier = GenericsCarrier::new(parse2(quote!(crate::m::Carrier)).unwrap());
-    let ty = carrier.encode_generics_args_to_ty(&args.args);
-    assert_eq!(ty_string(&ty), expected_ty(quote!(crate::m::Carrier<u8>)));
+    let generics: Generics = parse2(quote!(<T>)).unwrap();
+    let slots = RepeaterSlots::new(parse2(quote!(crate::Repeater)).unwrap());
+    let ty = slots
+        .encode_generics_args_to_ty(&args.args, &generics.params)
+        .unwrap();
+    assert_eq!(ty_string(&ty), expected_ty(quote!((u8,))));
 }
 
 #[test]
@@ -250,8 +294,8 @@ fn hole_plain_args_encoder_bare_const() {
     // (parsed by syn as a type argument) is a const, and encodes it as the type `N` instead of
     // `[(); N]`, so it does not match `encode_generics_params_to_ty()`.
     //
-    // Not fixable without the parameters; `encode_generics_args_to_ty_with()` with the parameters
-    // handles it, and `GenericsCarrier` avoids it.
+    // Not fixable without the parameters; `encode_generics_args_to_ty_with()` and `RepeaterSlots`
+    // with the parameters handle it.
     let generics: Generics = parse2(quote!(<T, const N: usize>)).unwrap();
     let args: AngleBracketedGenericArguments = parse2(quote!(<u8, N>)).unwrap();
 
@@ -270,8 +314,8 @@ fn hole_args_not_checked_against_params() {
     // an extra argument is encoded as is, and the encoding silently differs from the parameters'
     // encoding.
     //
-    // Expected after fix: a mismatch is reported (e.g. by a panic or a `Result`).
-    // `GenericsCarrier` avoids it, since rustc reports a wrong number of arguments (E0107).
+    // Expected after fix: a mismatch is reported (e.g. by a panic or a `Result`), as
+    // `RepeaterSlots` does.
     let generics: Generics = parse2(quote!(<const N: usize>)).unwrap();
     let args: AngleBracketedGenericArguments = parse2(quote!(<3, u8>)).unwrap();
 
@@ -279,6 +323,12 @@ fn hole_args_not_checked_against_params() {
         parse2(quote!([(); #expr])).unwrap()
     });
     assert_eq!(ty_string(&ty), expected_ty(quote!(([(); 3], u8))));
+
+    let slots = RepeaterSlots::new(parse2(quote!(crate::Repeater)).unwrap());
+    let err = slots
+        .encode_generics_args_to_ty(&args.args, &generics.params)
+        .unwrap_err();
+    assert_eq!(err.to_string(), "unexpected generic argument: 'u8'");
 }
 
 // ── error messages ───────────────────────────────────────────────────────────

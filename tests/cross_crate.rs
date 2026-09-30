@@ -1,7 +1,7 @@
 //! Uses `type-leak` across crate boundaries through a proc macro, as a downstream crate would.
 //!
 //! - `tests/crates/macro`: the proc macro using `type-leak` (`Leaker`, `Referrer` and
-//!   `GenericsCarrier`).
+//!   `RepeaterSlots`).
 //! - `tests/crates/leaker`: the Leaker's crate, defining traits with relative types.
 //! - `tests/crates/referrer`: the Referrer's crate, implementing the traits for wrappers which
 //!   forward to `Inner`.

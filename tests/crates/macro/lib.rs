@@ -5,7 +5,7 @@
 //!
 //! ```ignore
 //! pub use type_leak_test_macro as __macro;
-//! pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> { type Type: ?Sized; }
+//! type_leak_test_macro::define_repeater!(pub Repeater);
 //!
 //! pub mod m {
 //!     pub struct MyType;
@@ -16,9 +16,9 @@
 //! }
 //! ```
 //!
-//! The generics are encoded into the Repeater's trait arguments with [`GenericsCarrier`]s, which
-//! are generated next to the trait (`__MyTraitParams` for the trait's generics, and
-//! `__MyTraitLocals{ix}` for the local generics of the `ix`-th leaked type).
+//! The generics (including the local generics of each leaked type) are encoded into the
+//! Repeater's trait arguments with [`RepeaterSlots`], so the Repeater (defined by
+//! [`repeater_definition()`]) is the only item shared by the Leaker and the Referrer.
 //!
 //! In the Referrer's crate, `MyTrait!` implements `MyTrait` for a wrapper by forwarding each
 //! method to the field `.0`, with the types in the signatures rewritten by the [`Referrer`]:
@@ -72,28 +72,21 @@ impl Parse for LeakArgs {
     }
 }
 
-/// The carrier of the trait's generics.
-fn params_carrier_ident(trait_ident: &Ident) -> Ident {
-    Ident::new(&format!("__{}Params", trait_ident), trait_ident.span())
-}
-
-/// The carrier of the local generics of the `ix`-th leaked type.
-fn locals_carrier_ident(trait_ident: &Ident, ix: usize) -> Ident {
-    Ident::new(
-        &format!("__{}Locals{}", trait_ident, ix),
-        trait_ident.span(),
-    )
-}
-
-/// Encodes local generics with their carrier, or `()` if there are none.
-fn encode_locals(module: &Path, trait_ident: &Ident, ix: usize, locals: &Generics) -> Type {
-    if locals.params.is_empty() {
-        parse_quote!(())
-    } else {
-        let ident = locals_carrier_ident(trait_ident, ix);
-        GenericsCarrier::new(parse_quote!(#module::#ident))
-            .encode_generics_params_to_ty(&locals.params)
+/// Emits the Repeater defined by [`repeater_definition()`]: `define_repeater!(pub Repeater);`.
+#[proc_macro]
+pub fn define_repeater(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    struct Input(Visibility, Ident);
+    impl Parse for Input {
+        fn parse(input: ParseStream) -> Result<Self> {
+            let vis = input.parse()?;
+            let ident = input.parse()?;
+            let _: Option<Token![;]> = input.parse()?;
+            Ok(Self(vis, ident))
+        }
     }
+    let Input(vis, ident) = parse_macro_input!(input as Input);
+    let def = repeater_definition(&vis, &ident);
+    quote!(#def).into()
 }
 
 /// Returns a deterministic ID of the trait, used as the Repeater's `ID`.
@@ -194,14 +187,10 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let vis = &item_trait.vis;
     let params = &item_trait.generics.params;
     let trait_args: Vec<_> = params.iter().map(param_as_arg).collect();
-    let params_carrier = params_carrier_ident(trait_ident);
-    let mut carriers = vec![GenericsCarrier::definition(
-        vis,
-        &params_carrier,
-        &item_trait.generics,
-    )];
-    let encoded_params = GenericsCarrier::new(parse_quote!(#module::#params_carrier))
-        .encode_generics_params_to_ty(params);
+    let slots = RepeaterSlots::new(repeater.clone());
+    let encoded_params = slots
+        .encode_generics_params_to_ty(params)
+        .map_err(Error::from)?;
     let outer_predicates = item_trait
         .generics
         .where_clause
@@ -210,14 +199,9 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
 
     let mut repeater_impls = TokenStream::new();
     for (ix, (ty, locals)) in referrer.iter_with_local_generics().enumerate() {
-        if !locals.params.is_empty() {
-            carriers.push(GenericsCarrier::definition(
-                vis,
-                &locals_carrier_ident(trait_ident, ix),
-                locals,
-            ));
-        }
-        let encoded_locals = encode_locals(module, trait_ident, ix, locals);
+        let encoded_locals = slots
+            .encode_generics_params_to_ty(&locals.params)
+            .map_err(Error::from)?;
         let impl_params = lifetimes_first(params.iter().chain(locals.params.iter()));
         let local_predicates = locals.where_clause.as_ref().map(|wc| &wc.predicates);
         repeater_impls.extend(quote! {
@@ -243,7 +227,6 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let module = dollar_crate(module);
     Ok(quote! {
         #item_trait
-        #(#carriers)*
         #repeater_impls
         #[doc(hidden)]
         #[macro_export]
@@ -417,10 +400,10 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     } = input;
     let params = &item_trait.generics.params;
     let trait_ident = &item_trait.ident;
-    // The arguments are used as they are; rustc resolves them against the carrier's parameters.
-    let params_carrier = params_carrier_ident(trait_ident);
-    let encoded_args = GenericsCarrier::new(parse_quote!(#module::#params_carrier))
-        .encode_generics_args_to_ty(&trait_args.args);
+    let slots = RepeaterSlots::new(repeater.clone());
+    let encoded_args = slots
+        .encode_generics_args_to_ty(&trait_args.args, params)
+        .map_err(Error::from)?;
 
     // Map the trait's generic parameters to the given arguments.
     let mut substitute = Substitute {
@@ -487,7 +470,10 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     // are in scope with the same names.
     let mut projections = Vec::new();
     for (ix, (_, locals)) in referrer.iter_with_local_generics().enumerate() {
-        let encoded_locals = encode_locals(&module, trait_ident, ix, locals);
+        // The local generics are in scope with the same names, so they are encoded as parameters.
+        let encoded_locals = slots
+            .encode_generics_params_to_ty(&locals.params)
+            .map_err(Error::from)?;
         projections.push(parse_quote! {
             <Self as #repeater<(#encoded_args, #encoded_locals), #id, #ix>>::Type
         });

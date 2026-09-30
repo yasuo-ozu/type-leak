@@ -4,10 +4,8 @@
 #[doc(hidden)]
 pub use type_leak_test_macro as __macro;
 
-/// The Repeater. Its type parameter carries the encoded generics (including local generics).
-pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> {
-    type Type: ?Sized;
-}
+// The Repeater, with const slots to encode const generics of any primitive type.
+type_leak_test_macro::define_repeater!(pub Repeater);
 
 pub mod m {
     use type_leak_test_macro::leak;

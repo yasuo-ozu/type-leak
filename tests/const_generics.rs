@@ -112,3 +112,21 @@ fn test_local_generics_leaked() {
     let parsed: type_leak::Referrer = parse_quote!(#tokens);
     assert_eq!(parsed, referrer);
 }
+
+#[test]
+fn test_local_generics_keep_self() {
+    // Bounds of local generics are kept as they are, including `Self`, which refers to the
+    // implementor of the Leaker trait.
+    let item: ItemTrait = parse_quote! {
+        trait MyTrait {
+            fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> MyWrap<T>;
+        }
+    };
+    let mut leaker = Leaker::from_trait(&item).unwrap();
+    leaker.reduce_roots();
+    let referrer = leaker.finish();
+    let (ty, generics) = referrer.iter_with_local_generics().next().unwrap();
+    assert_eq!(quote!(#ty).to_string(), quote!(MyWrap<T>).to_string());
+    let expected: Generics = parse_quote!(<T: ::core::cmp::PartialEq<Self>>);
+    assert_eq!(quote!(#generics).to_string(), quote!(#expected).to_string());
+}
