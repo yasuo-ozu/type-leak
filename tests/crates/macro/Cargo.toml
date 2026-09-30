@@ -1,0 +1,16 @@
+[package]
+name = "type-leak-test-macro"
+version = "0.0.0"
+edition = "2018"
+publish = false
+description = "Proc macro using type-leak as a downstream crate would, for tests/cross_crate.rs"
+
+[lib]
+path = "lib.rs"
+proc-macro = true
+
+[dependencies]
+type-leak = { path = "../../.." }
+proc-macro2 = "1.0"
+template-quote = "0.4"
+syn = { version = "2.0", features = ["full", "visit", "visit-mut"] }

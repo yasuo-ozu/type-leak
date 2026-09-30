@@ -1,0 +1,12 @@
+[package]
+name = "type-leak-test-referrer"
+version = "0.0.0"
+edition = "2018"
+publish = false
+description = "Referrer crate for tests/cross_crate.rs"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+type-leak-test-leaker = { path = "../leaker" }

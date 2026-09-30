@@ -33,3 +33,7 @@ features = [
   "visit",
   "visit-mut",
 ]
+
+[dev-dependencies]
+type-leak-test-leaker = { path = "tests/crates/leaker" }
+type-leak-test-referrer = { path = "tests/crates/referrer" }

@@ -1,0 +1,12 @@
+[package]
+name = "type-leak-test-leaker"
+version = "0.0.0"
+edition = "2018"
+publish = false
+description = "Leaker crate for tests/cross_crate.rs"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+type-leak-test-macro = { path = "../macro" }
