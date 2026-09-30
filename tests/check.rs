@@ -162,7 +162,7 @@ fn test_check_allows_dollar_crate() {
     leaker.allowed_paths.push(parse_quote!(crate));
 
     let item: ItemTrait = parse_quote!(
-        pub trait Parse: ::core::marker::Sized {
+        pub trait Parse<Atom>: ::core::marker::Sized {
             type Error: crate::error::Error;
             fn parse(
                 stream: impl crate::parse::into_parse_stream::IntoParseStream<Atom = Atom>,
@@ -212,4 +212,54 @@ fn test_check_allowed_paths() {
         leaker.check(&parse_quote!(abs::path::Type), generics),
         Ok(CheckResult::MustIntern(_))
     ));
+}
+
+#[test]
+fn test_check_allowed_paths_with_generic_args() {
+    use type_leak::{CheckResult, LeakerConfig};
+
+    let test_struct: ItemStruct = parse_quote!(
+        pub struct MyStruct<T1>;
+    );
+    let generics = &test_struct.generics;
+    let mut config = LeakerConfig::new();
+    config.allow_std_prelude().allow_primitive();
+    let leaker = Leaker::from_config(config);
+
+    // An allowed path with generic arguments is still allowed.
+    assert!(matches!(
+        leaker.check(&parse_quote!(Option<u8>), generics),
+        Ok(CheckResult::Neutral)
+    ));
+    assert!(matches!(
+        leaker.check(&parse_quote!(Vec<Option<T1>>), generics),
+        Ok(CheckResult::Neutral)
+    ));
+    // Its generic arguments are still checked.
+    assert!(matches!(
+        leaker.check(&parse_quote!(Option<RelType>), generics),
+        Ok(CheckResult::MustInternOrInherit(_))
+    ));
+
+    // Trait bounds with generic arguments on allowed paths are accepted, and relative types in
+    // them are leaked.
+    let mut config = LeakerConfig::new();
+    config.allow_std_prelude().allow_primitive();
+    let mut leaker = Leaker::from_config(config);
+    let item: ItemTrait = parse_quote! {
+        trait MyTrait: Into<u8> {
+            fn f<I: Iterator<Item = u8>>(&self, i: I);
+            fn g<I: Iterator<Item = RelType>>(&self, i: I);
+        }
+    };
+    leaker
+        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
+        .unwrap();
+    leaker.reduce_roots();
+    let leaked: Vec<String> = leaker
+        .finish()
+        .iter()
+        .map(|t| template_quote::quote!(#t).to_string())
+        .collect();
+    assert_eq!(leaked, vec!["RelType".to_string()]);
 }

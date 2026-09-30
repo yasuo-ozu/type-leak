@@ -280,3 +280,148 @@ fn hole_args_not_checked_against_params() {
     });
     assert_eq!(ty_string(&ty), expected_ty(quote!(([(); 3], u8))));
 }
+
+// ── error messages ───────────────────────────────────────────────────────────
+
+/// Runs a Leaker with the default configuration (no allowed paths), returning the error message
+/// and note.
+fn leak_error_default(item_trait: &ItemTrait) -> Option<(String, Option<String>)> {
+    let mut leaker = Leaker::new();
+    leaker
+        .intern_with(&item_trait.generics, |v| v.visit_item_trait(item_trait))
+        .err()
+        .map(|e| (e.to_string(), e.note()))
+}
+
+fn error(message: &str, note: Option<&str>) -> Option<(String, Option<String>)> {
+    Some((message.to_string(), note.map(str::to_string)))
+}
+
+#[test]
+fn note_suggests_absolute_prelude_path() {
+    // A prelude trait in a bound, without `allow_std_prelude()`.
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait {
+            fn f<T: Iterator<Item = u8>>(&self, t: T);
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        leak_error_default(&item),
+        error(
+            "use absolute path: 'Iterator < Item = u8 >'",
+            Some("use `::core::iter::Iterator` instead of `Iterator`")
+        )
+    );
+
+    // A prelude item from `alloc`, in a supertrait.
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait: ToString {}
+    })
+    .unwrap();
+    assert_eq!(
+        leak_error_default(&item),
+        error(
+            "use absolute path: 'ToString'",
+            Some("use `::std::string::ToString` instead of `ToString`")
+        )
+    );
+
+    // The relative part of an `impl Trait` is reported, rather than the whole `impl Trait`.
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait {
+            fn f(&self, x: impl Clone);
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        leak_error_default(&item),
+        error(
+            "use absolute path: 'Clone'",
+            Some("use `::core::clone::Clone` instead of `Clone`")
+        )
+    );
+
+    // A 2021-edition prelude item.
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait: TryFrom<u8> {}
+    })
+    .unwrap();
+    assert_eq!(
+        leak_error_default(&item),
+        error(
+            "use absolute path: 'TryFrom < u8 >'",
+            Some("use `::core::convert::TryFrom` instead of `TryFrom`")
+        )
+    );
+}
+
+#[test]
+fn note_suggests_absolute_primitive_path() {
+    // A primitive in a const expression of a bound, without `allow_primitive()`.
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait: ::my_crate::Sup<{ usize::MAX }> {}
+    })
+    .unwrap();
+    assert_eq!(
+        leak_error_default(&item),
+        error(
+            "use absolute path: 'usize :: MAX'",
+            Some("use `::core::primitive::usize` instead of `usize`")
+        )
+    );
+}
+
+#[test]
+fn no_note() {
+    // Not a prelude item or a primitive.
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait: MyBound {}
+    })
+    .unwrap();
+    assert_eq!(
+        leak_error_default(&item),
+        error("use absolute path: 'MyBound'", None)
+    );
+
+    // A prelude name used as the second segment of a relative path.
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait: my_mod::Clone {}
+    })
+    .unwrap();
+    assert_eq!(
+        leak_error_default(&item),
+        error("use absolute path: 'my_mod :: Clone'", None)
+    );
+}
+
+#[test]
+fn note_in_syn_error() {
+    // The note is rendered as a `note` of the diagnostic; without a note, the message is kept.
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait: Clone {}
+    })
+    .unwrap();
+    let mut leaker = Leaker::new();
+    let err: syn::Error = leaker
+        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
+        .err()
+        .unwrap()
+        .into();
+    assert_eq!(
+        err.to_string(),
+        "use absolute path: 'Clone'\n\n  = note: use `::core::clone::Clone` instead of `Clone`\n"
+    );
+
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait: MyBound {}
+    })
+    .unwrap();
+    let mut leaker = Leaker::new();
+    let err: syn::Error = leaker
+        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
+        .err()
+        .unwrap()
+        .into();
+    assert_eq!(err.to_string(), "use absolute path: 'MyBound'");
+}

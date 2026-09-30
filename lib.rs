@@ -118,12 +118,17 @@ pub struct Leaker {
 }
 
 /// Error indicating that a type is not internable.
+///
+/// When the offending path starts with an item of the standard prelude or a primitive type,
+/// [`NotInternableError::note()`] suggests the absolute path to use instead, e.g. "use
+/// `::std::vec::Vec` instead of `Vec`". Converting the error into [`syn::Error`] renders it as a
+/// `note` of the diagnostic.
 #[derive(Debug, Clone)]
 pub struct NotInternableError(pub TokenStream);
 
 impl std::fmt::Display for NotInternableError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&format!("use absolute path: '{}'", &self.0))
+        write!(f, "use absolute path: '{}'", &self.0)
     }
 }
 
@@ -133,6 +138,149 @@ impl NotInternableError {
     pub fn span(&self) -> Span {
         self.0.span()
     }
+
+    /// Returns a note suggesting the absolute path to use instead of the first segment of the
+    /// offending path, if it is an item of the standard prelude or a primitive type.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemTrait = parse_quote!(trait MyTrait: Clone {});
+    /// let err = Leaker::from_trait(&item).err().unwrap();
+    /// assert_eq!(err.to_string(), "use absolute path: 'Clone'");
+    /// assert_eq!(
+    ///     err.note().as_deref(),
+    ///     Some("use `::core::clone::Clone` instead of `Clone`")
+    /// );
+    /// ```
+    pub fn note(&self) -> Option<String> {
+        let name = first_path_ident(self.0.clone())?.to_string();
+        ABSOLUTE_PATHS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(name, absolute)| format!("use `{}` instead of `{}`", absolute, name))
+    }
+}
+
+/// Converts into a [`syn::Error`] at [`NotInternableError::span()`], with the
+/// [`NotInternableError::note()`] rendered as a `note` of the diagnostic.
+///
+/// Since stable Rust has no API for sub-diagnostics of proc macros, the note is appended to the
+/// message (as `proc-macro-error` does on stable), which rustc renders as:
+///
+/// ```text
+/// error: use absolute path: 'Clone'
+///
+///          = note: use `::core::clone::Clone` instead of `Clone`
+/// ```
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let item: ItemTrait = parse_quote!(trait MyTrait: Clone {});
+/// let err: syn::Error = Leaker::from_trait(&item).err().unwrap().into();
+/// assert_eq!(
+///     err.to_string(),
+///     "use absolute path: 'Clone'\n\n  = note: use `::core::clone::Clone` instead of `Clone`\n"
+/// );
+/// ```
+impl From<NotInternableError> for syn::Error {
+    fn from(err: NotInternableError) -> Self {
+        let message = match err.note() {
+            Some(note) => format!("{}\n\n  = note: {}\n", err, note),
+            None => err.to_string(),
+        };
+        syn::Error::new(err.span(), message)
+    }
+}
+
+/// Items of the standard prelude and primitive types, with their absolute paths.
+const ABSOLUTE_PATHS: &[(&str, &str)] = &[
+    ("Box", "::std::boxed::Box"),
+    ("String", "::std::string::String"),
+    ("Vec", "::std::vec::Vec"),
+    ("Option", "::core::option::Option"),
+    ("Result", "::core::result::Result"),
+    ("Copy", "::core::marker::Copy"),
+    ("Send", "::core::marker::Send"),
+    ("Sized", "::core::marker::Sized"),
+    ("Sync", "::core::marker::Sync"),
+    ("Unpin", "::core::marker::Unpin"),
+    ("Drop", "::core::ops::Drop"),
+    ("Fn", "::core::ops::Fn"),
+    ("FnMut", "::core::ops::FnMut"),
+    ("FnOnce", "::core::ops::FnOnce"),
+    ("Clone", "::core::clone::Clone"),
+    ("PartialEq", "::core::cmp::PartialEq"),
+    ("PartialOrd", "::core::cmp::PartialOrd"),
+    ("Eq", "::core::cmp::Eq"),
+    ("Ord", "::core::cmp::Ord"),
+    ("AsRef", "::core::convert::AsRef"),
+    ("AsMut", "::core::convert::AsMut"),
+    ("Into", "::core::convert::Into"),
+    ("From", "::core::convert::From"),
+    ("Default", "::core::default::Default"),
+    ("Iterator", "::core::iter::Iterator"),
+    ("IntoIterator", "::core::iter::IntoIterator"),
+    ("Extend", "::core::iter::Extend"),
+    ("FromIterator", "::core::iter::FromIterator"),
+    ("ToOwned", "::std::borrow::ToOwned"),
+    ("ToString", "::std::string::ToString"),
+    ("drop", "::core::mem::drop"),
+    // In the prelude of the 2021 edition.
+    ("TryFrom", "::core::convert::TryFrom"),
+    ("TryInto", "::core::convert::TryInto"),
+    ("Some", "::core::option::Option::Some"),
+    ("None", "::core::option::Option::None"),
+    ("Ok", "::core::result::Result::Ok"),
+    ("Err", "::core::result::Result::Err"),
+    // Primitive types.
+    ("bool", "::core::primitive::bool"),
+    ("char", "::core::primitive::char"),
+    ("str", "::core::primitive::str"),
+    ("u8", "::core::primitive::u8"),
+    ("u16", "::core::primitive::u16"),
+    ("u32", "::core::primitive::u32"),
+    ("u64", "::core::primitive::u64"),
+    ("u128", "::core::primitive::u128"),
+    ("usize", "::core::primitive::usize"),
+    ("i8", "::core::primitive::i8"),
+    ("i16", "::core::primitive::i16"),
+    ("i32", "::core::primitive::i32"),
+    ("i64", "::core::primitive::i64"),
+    ("i128", "::core::primitive::i128"),
+    ("isize", "::core::primitive::isize"),
+    ("f32", "::core::primitive::f32"),
+    ("f64", "::core::primitive::f64"),
+];
+
+/// Returns the first segment of the first relative path in `tokens`, skipping keywords, sigils
+/// and lifetimes before it (e.g. `Iterator` in `impl for<'a> Iterator<Item = &'a u8>`).
+fn first_path_ident(tokens: TokenStream) -> Option<proc_macro2::Ident> {
+    let mut prev_punct: Option<char> = None;
+    for tt in tokens {
+        match tt {
+            proc_macro2::TokenTree::Ident(ident) => {
+                let s = ident.to_string();
+                match (prev_punct, s.as_str()) {
+                    // A lifetime (`'a`), or a segment after `::` (e.g. an absolute path).
+                    (Some('\''), _) | (Some(':'), _) => {
+                        if prev_punct == Some(':') {
+                            return None;
+                        }
+                    }
+                    (_, "impl" | "dyn" | "mut" | "for" | "const" | "unsafe" | "extern") => (),
+                    _ => return Some(ident),
+                }
+                prev_punct = None;
+            }
+            proc_macro2::TokenTree::Punct(punct) => prev_punct = Some(punct.as_char()),
+            proc_macro2::TokenTree::Group(_) | proc_macro2::TokenTree::Literal(_) => {
+                prev_punct = None
+            }
+        }
+    }
+    None
 }
 
 /// Encode [`GenericArgument`]s to a type.
@@ -259,6 +407,19 @@ fn is_const_param_ty(ty: &Type) -> bool {
         }
         _ => false,
     }
+}
+
+/// Returns `true` if the segments of `path` start with those of `prefix` (e.g. `Option<T>` starts
+/// with `Option`, and `std::vec::Vec<T>` starts with `std::vec`), comparing only the identifiers:
+/// generic arguments of `path` are allowed.
+fn path_starts_with(path: &Path, prefix: &Path) -> bool {
+    prefix.leading_colon.is_some() == path.leading_colon.is_some()
+        && prefix.segments.len() <= path.segments.len()
+        && prefix
+            .segments
+            .iter()
+            .zip(path.segments.iter())
+            .all(|(prefix_seg, seg)| prefix_seg.ident.to_string() == seg.ident.to_string())
 }
 
 /// Returns `true` if `ty` refers to any of `generics`.
@@ -753,8 +914,10 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             &self.generics.params.iter().collect::<Vec<_>>()[self.n_outer_generics..];
         let mentions_local = mentions_generics(i, local_generics.iter().copied());
         match self.leaker.check(i, &self.generics) {
-            Err((_, s)) => {
-                // Emit error and terminate searching
+            Err((s, _)) => {
+                // The type must be interned (because of `s`, which depends on the type context)
+                // but cannot be (e.g. it is `impl Trait`). Report `s`, which should be made
+                // absolute.
                 self.error = Some(s);
             }
             Ok(CheckResult::MustNotIntern(_)) => (),
@@ -959,16 +1122,10 @@ impl Leaker {
                     arguments: PathArguments::None,
                 }) if ident.to_string() == "$crate"
             )
-            || self.allowed_paths.iter().any(|allowed| {
-                allowed.leading_colon == path.leading_colon
-                    && allowed.segments.len() <= path.segments.len()
-                    && allowed.segments.iter().zip(path.segments.iter()).all(
-                        |(allowed_seg, seg)| {
-                            allowed_seg.arguments == seg.arguments
-                                && allowed_seg.ident.to_string() == seg.ident.to_string()
-                        },
-                    )
-            })
+            || self
+                .allowed_paths
+                .iter()
+                .any(|allowed| path_starts_with(path, allowed))
     }
 
     /// Apply collected graph operations using `scope_mut()`.
@@ -1196,17 +1353,14 @@ impl Leaker {
                     syn::visit::visit_expr(self, i)
                 }
                 fn visit_path(&mut self, i: &Path) {
-                    if self.allowed_paths.iter().any(|allowed| {
-                        allowed.leading_colon == i.leading_colon
-                            && allowed.segments.len() <= i.segments.len()
-                            && allowed.segments.iter().zip(i.segments.iter()).all(
-                                |(allowed_seg, seg)| {
-                                    allowed_seg.arguments == seg.arguments
-                                        && allowed_seg.ident.to_string() == seg.ident.to_string()
-                                },
-                            )
-                    }) {
-                        return;
+                    if self
+                        .allowed_paths
+                        .iter()
+                        .any(|allowed| path_starts_with(i, allowed))
+                    {
+                        // The path itself does not depend on the type context, but its generic
+                        // arguments may (e.g. `RelType` in `Option<RelType>`).
+                        return syn::visit::visit_path(self, i);
                     }
                     if matches!(i.segments.iter().next(), Some(PathSegment { ident, arguments }) if ident == "Self" && arguments.is_none())
                         && i.leading_colon.is_none()
@@ -1224,7 +1378,8 @@ impl Leaker {
                                 }) if ident.to_string() == "$crate"
                             )
                         {
-                            return;
+                            // Same as allowed paths: the generic arguments are still checked.
+                            return syn::visit::visit_path(self, i);
                         }
                         match (i.leading_colon, i.get_ident()) {
                             // i is a generic parameter (single-segment, e.g. `T`)

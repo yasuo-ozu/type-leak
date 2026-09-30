@@ -180,7 +180,7 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     });
     leaker
         .intern_with(&item_trait.generics, |v| v.visit_item_trait(&item_trait))
-        .map_err(|e| Error::new(e.span(), e))?;
+        .map_err(Error::from)?;
     leaker.reduce_roots();
     let referrer = leaker.finish();
 
