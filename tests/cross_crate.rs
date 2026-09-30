@@ -1,12 +1,12 @@
 //! Uses `type-leak` across crate boundaries through a proc macro, as a downstream crate would.
 //!
 //! - `tests/crates/macro`: the proc macro using `type-leak` (`Leaker`, `Referrer` and
-//!   `ConstMarkers`).
+//!   `GenericsCarrier`).
 //! - `tests/crates/leaker`: the Leaker's crate, defining traits with relative types.
 //! - `tests/crates/referrer`: the Referrer's crate, implementing the traits for wrappers which
 //!   forward to `Inner`.
 
-use type_leak_test_leaker::m::{Consts, Holder, Inner};
+use type_leak_test_leaker::m::{Consts, Defaults, Holder, Inner};
 use type_leak_test_referrer::{Concrete, Generic};
 
 #[test]
@@ -44,4 +44,15 @@ fn local_generics() {
     );
     let n = 9;
     assert_eq!(c.holder(Holder(&n)), 9);
+}
+
+#[test]
+fn omitted_default_args() {
+    let c = Concrete(Inner);
+    assert_eq!(c.default_array().len(), 2);
+    assert!(c.default_flag().get());
+
+    let g = Generic::<false, 5>(Inner);
+    assert_eq!(g.default_array().len(), 5);
+    assert!(g.default_flag().get());
 }

@@ -137,8 +137,8 @@ impl NotInternableError {
 
 /// Encode [`GenericArgument`]s to a type.
 ///
-/// A const argument `N` is encoded as `[(); N]`, so it must be of type `usize`. Use
-/// [`encode_generics_args_to_ty_with()`] to encode const arguments of other types.
+/// A const argument `N` is encoded as `[(); N]`, so it must be of type `usize`. To encode generics
+/// of any kind, use [`GenericsCarrier`].
 ///
 /// A bare identifier such as `N` in `MyTrait<N>` is parsed as a type argument even if it refers to
 /// a const. Use [`encode_generics_args_to_ty_with()`] with the corresponding [`GenericParam`]s to
@@ -146,7 +146,8 @@ impl NotInternableError {
 ///
 /// # Panics
 ///
-/// Panics if an argument cannot be encoded (see [`EncodeError::UnsupportedArgument`]).
+/// Panics if an argument is not a lifetime, a type or a const (e.g. an associated type binding
+/// `Item = u8`).
 pub fn encode_generics_args_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericArgument>) -> Type {
     encode_generics_args_to_ty_with(iter, None, |expr, _| parse_quote!([(); #expr]))
 }
@@ -174,22 +175,13 @@ pub fn encode_generics_args_to_ty<'a>(iter: impl IntoIterator<Item = &'a Generic
 ///
 /// # Panics
 ///
-/// Panics if an argument cannot be encoded (see [`EncodeError::UnsupportedArgument`]).
+/// Panics if an argument is not a lifetime, a type or a const (e.g. an associated type binding
+/// `Item = u8`).
 pub fn encode_generics_args_to_ty_with<'a, 'b>(
     iter: impl IntoIterator<Item = &'a GenericArgument>,
     params: Option<&'b Punctuated<GenericParam, Token![,]>>,
     mut const_fn: impl FnMut(&Expr, Option<&'b ConstParam>) -> Type,
 ) -> Type {
-    try_encode_generics_args_to_ty_with(iter, params, |expr, cp| Ok(const_fn(expr, cp)))
-        .unwrap_or_else(|e| panic!("{}", e))
-}
-
-/// Fallible version of [`encode_generics_args_to_ty_with()`].
-fn try_encode_generics_args_to_ty_with<'a, 'b>(
-    iter: impl IntoIterator<Item = &'a GenericArgument>,
-    params: Option<&'b Punctuated<GenericParam, Token![,]>>,
-    mut const_fn: impl FnMut(&Expr, Option<&'b ConstParam>) -> std::result::Result<Type, EncodeError>,
-) -> std::result::Result<Type, EncodeError> {
     // Lifetime arguments may be omitted, so type and const arguments are matched only against type
     // and const parameters.
     let mut params = params.map(|params| {
@@ -197,11 +189,11 @@ fn try_encode_generics_args_to_ty_with<'a, 'b>(
             .iter()
             .filter(|param| !matches!(param, GenericParam::Lifetime(_)))
     });
-    Ok(Type::Tuple(TypeTuple {
+    Type::Tuple(TypeTuple {
         paren_token: Default::default(),
         elems: iter
             .into_iter()
-            .map(|arg| -> std::result::Result<Type, EncodeError> {
+            .map(|arg| -> Type {
                 let param = if matches!(arg, GenericArgument::Lifetime(_)) {
                     None
                 } else {
@@ -212,11 +204,11 @@ fn try_encode_generics_args_to_ty_with<'a, 'b>(
                 } else {
                     None
                 };
-                Ok(match (arg, const_param) {
+                match (arg, const_param) {
                     (GenericArgument::Lifetime(lifetime), _) => {
                         parse_quote!(& #lifetime ())
                     }
-                    (GenericArgument::Const(expr), _) => const_fn(unwrap_block(expr), const_param)?,
+                    (GenericArgument::Const(expr), _) => const_fn(unwrap_block(expr), const_param),
                     (
                         GenericArgument::Type(Type::Path(TypePath { qself: None, path })),
                         Some(cp),
@@ -227,73 +219,46 @@ fn try_encode_generics_args_to_ty_with<'a, 'b>(
                             path: path.clone(),
                         }),
                         Some(cp),
-                    )?,
+                    ),
                     (GenericArgument::Type(ty), _) => ty.clone(),
-                    (arg, _) => {
-                        return Err(EncodeError::UnsupportedArgument(Box::new(arg.clone())))
-                    }
-                })
+                    (arg, _) => panic!("unsupported generic argument: '{}'", quote!(#arg)),
+                }
             })
-            .collect::<std::result::Result<_, _>>()?,
-    }))
+            .collect(),
+    })
 }
 
-/// Primitive types which can be the type of const parameters on stable Rust, paired with the name
-/// of the marker type used by [`ConstMarkers`].
-const CONST_PARAM_PRIMITIVES: &[(&str, &str)] = &[
-    ("bool", "ConstBool"),
-    ("char", "ConstChar"),
-    ("u8", "ConstU8"),
-    ("u16", "ConstU16"),
-    ("u32", "ConstU32"),
-    ("u64", "ConstU64"),
-    ("u128", "ConstU128"),
-    ("usize", "ConstUsize"),
-    ("i8", "ConstI8"),
-    ("i16", "ConstI16"),
-    ("i32", "ConstI32"),
-    ("i64", "ConstI64"),
-    ("i128", "ConstI128"),
-    ("isize", "ConstIsize"),
+/// Primitive types which can be the type of const parameters on stable Rust.
+const CONST_PARAM_PRIMITIVES: &[&str] = &[
+    "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128",
+    "isize",
 ];
 
-/// Returns the name of the primitive type if `ty` is a valid type of const parameters which does
-/// not depend on the type context.
-fn const_param_primitive(ty: &Type) -> Option<&'static str> {
+/// Returns `true` if `ty` is a primitive type which can be the type of const parameters (e.g.
+/// `bool` or `::core::primitive::bool`), and thus does not depend on the type context.
+fn is_const_param_ty(ty: &Type) -> bool {
     match ty {
         Type::Path(TypePath { qself: None, path }) => {
+            if path.segments.iter().any(|seg| !seg.arguments.is_none()) {
+                return false;
+            }
             let segs: Vec<_> = path
                 .segments
                 .iter()
-                .map(|seg| {
-                    if seg.arguments.is_none() {
-                        Some(seg.ident.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Option<_>>()?;
+                .map(|seg| seg.ident.to_string())
+                .collect();
             let name = match (path.leading_colon.is_some(), segs.as_slice()) {
                 (false, [s]) => s,
                 (_, [c, p, s]) if (c == "core" || c == "std") && p == "primitive" => s,
-                _ => return None,
+                _ => return false,
             };
-            CONST_PARAM_PRIMITIVES
-                .iter()
-                .find(|(prim, _)| prim == name)
-                .map(|(prim, _)| *prim)
+            CONST_PARAM_PRIMITIVES.contains(&name.as_str())
         }
         Type::Group(TypeGroup { elem, .. }) | Type::Paren(TypeParen { elem, .. }) => {
-            const_param_primitive(elem)
+            is_const_param_ty(elem)
         }
-        _ => None,
+        _ => false,
     }
-}
-
-/// Returns `true` if `ty` is a valid type of const parameters which does not depend on the type
-/// context.
-fn is_const_param_ty(ty: &Type) -> bool {
-    const_param_primitive(ty).is_some()
 }
 
 /// Returns `true` if `ty` refers to any of `generics`.
@@ -475,8 +440,8 @@ fn unwrap_block(expr: &Expr) -> &Expr {
 ///
 /// A const parameter `N` is encoded as `[(); N]`, which constrains `N` when used in the trait
 /// arguments of an `impl`. Because array lengths are `usize`, this only works for
-/// `const N: usize`. Use [`encode_generics_params_to_ty_with()`] to encode const parameters of
-/// other types (e.g. with a marker type `MyConstBool<const B: bool>`).
+/// `const N: usize`. To encode generics of any kind, use [`GenericsCarrier`], or
+/// [`encode_generics_params_to_ty_with()`] with user-defined types.
 pub fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericParam>) -> Type {
     encode_generics_params_to_ty_with(iter, |ConstParam { ident, .. }| parse_quote!([(); #ident]))
 }
@@ -501,202 +466,183 @@ pub fn encode_generics_params_to_ty_with<'a>(
     iter: impl IntoIterator<Item = &'a GenericParam>,
     mut const_fn: impl FnMut(&'a ConstParam) -> Type,
 ) -> Type {
-    match try_encode_generics_params_to_ty_with(iter, |cp| {
-        Ok::<_, std::convert::Infallible>(const_fn(cp))
-    }) {
-        Ok(ty) => ty,
-        Err(e) => match e {},
-    }
-}
-
-/// Fallible version of [`encode_generics_params_to_ty_with()`].
-fn try_encode_generics_params_to_ty_with<'a, E>(
-    iter: impl IntoIterator<Item = &'a GenericParam>,
-    mut const_fn: impl FnMut(&'a ConstParam) -> std::result::Result<Type, E>,
-) -> std::result::Result<Type, E> {
-    Ok(Type::Tuple(TypeTuple {
+    Type::Tuple(TypeTuple {
         paren_token: Default::default(),
         elems: iter
             .into_iter()
-            .map(|param| -> std::result::Result<Type, E> {
-                Ok(match param {
+            .map(|param| -> Type {
+                match param {
                     GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
                         parse_quote!(& #lifetime ())
                     }
-                    GenericParam::Const(cp) => const_fn(cp)?,
+                    GenericParam::Const(cp) => const_fn(cp),
                     GenericParam::Type(TypeParam { ident, .. }) => parse_quote!(#ident),
-                })
+                }
             })
-            .collect::<std::result::Result<_, _>>()?,
-    }))
+            .collect(),
+    })
 }
 
-/// Error returned by [`ConstMarkers`] when generics cannot be encoded into a type.
-#[derive(Clone, Debug)]
-pub enum EncodeError {
-    /// The type of a const parameter is not a primitive type (e.g. a type alias such as
-    /// `::my_crate::Idx`), so the marker type cannot be chosen.
-    UnsupportedConstType(Box<Type>),
-    /// A generic argument which does not correspond to a generic parameter, such as an associated
-    /// type binding (`Item = u8`).
-    UnsupportedArgument(Box<GenericArgument>),
-}
-
-impl std::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EncodeError::UnsupportedConstType(ty) => write!(
-                f,
-                "unsupported type of const parameter: '{}' (use a primitive type)",
-                quote!(#ty)
-            ),
-            EncodeError::UnsupportedArgument(arg) => {
-                write!(f, "unsupported generic argument: '{}'", quote!(#arg))
-            }
-        }
-    }
-}
-
-impl std::error::Error for EncodeError {}
-
-impl EncodeError {
-    pub fn span(&self) -> Span {
-        match self {
-            EncodeError::UnsupportedConstType(ty) => ty.span(),
-            EncodeError::UnsupportedArgument(arg) => arg.span(),
-        }
-    }
-}
-
-/// Marker types to encode const generics of any type into types.
+/// A struct with the same generics as a Leaker, used to encode those generics into a type.
 ///
-/// [`encode_generics_params_to_ty()`] encodes a const parameter `N` as `[(); N]`, which only works
-/// for `const N: usize`, because Rust (without `generic_const_exprs`) does not allow operations
-/// such as `N as usize` on generic parameters, and there is no type in `core` with a const
-/// parameter of other types. `ConstMarkers` instead encodes a const parameter as a marker type,
-/// such as `path::to::markers::ConstBool<B>` for `const B: bool`.
+/// Encoding generics into a type (e.g. for the Repeater's trait arguments) requires a type which
+/// takes a parameter of the same kind and type for each generic parameter. For a struct or an
+/// enum Leaker, the Leaker's type itself can be used. For a trait Leaker (or for the local generics
+/// of its methods, see [`Referrer::local_generics()`]), such a "carrier" struct can be generated
+/// next to the trait with [`GenericsCarrier::definition()`].
 ///
-/// The marker types must be defined with [`ConstMarkers::definitions()`] at a module which is
-/// accessible from both the Leaker and the Referrer (like the Repeater), and that module's path is
-/// given to [`ConstMarkers::new()`].
+/// Unlike [`encode_generics_params_to_ty()`] (which encodes `const N: usize` as `[(); N]`), the
+/// carrier supports const parameters of any type (including type aliases), since there is no
+/// stable type in `core` with a const parameter of non-`usize` types. The Referrer's generic
+/// arguments are used as they are: rustc resolves bare identifiers such as `N`, fills omitted
+/// arguments with the parameters' defaults, and reports a wrong number of arguments. The carrier
+/// must be accessible from the Referrer, like the Leaker.
 ///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
 /// # use template_quote::quote;
-/// let markers = ConstMarkers::new(parse_quote!(::my_crate::markers));
+/// // In the Leaker's module, next to `pub trait MyTrait<'a, T, const B: bool, const N: usize = 3>`
+/// let generics: Generics = parse_quote!(<'a, T, const B: bool, const N: usize = 3>);
+/// let def = GenericsCarrier::definition(
+///     &parse_quote!(pub),
+///     &parse_quote!(__MyTraitCarrier),
+///     &generics,
+/// );
+/// let expected: ItemStruct = parse_quote! {
+///     #[doc(hidden)]
+///     pub struct __MyTraitCarrier<'a, T: ?::core::marker::Sized, const B: bool, const N: usize = 3>(
+///         ::core::marker::PhantomData<(&'a (), *const T,)>
+///     );
+/// };
+/// assert_eq!(quote!(#def).to_string(), quote!(#expected).to_string());
 ///
-/// // In the Leaker
-/// let generics: Generics = parse_quote!(<T, const B: bool, const C: char, const N: usize>);
-/// let ty = markers.encode_generics_params_to_ty(&generics.params).unwrap();
-/// let expected: Type = parse_quote!((
-///     T,
-///     ::my_crate::markers::ConstBool<B>,
-///     ::my_crate::markers::ConstChar<C>,
-///     [(); N]
-/// ));
+/// let carrier = GenericsCarrier::new(parse_quote!(::my_crate::m::__MyTraitCarrier));
+///
+/// // In the Leaker (e.g. in the Repeater's `impl`)
+/// let ty = carrier.encode_generics_params_to_ty(&generics.params);
+/// let expected: Type = parse_quote!(::my_crate::m::__MyTraitCarrier<'a, T, B, N>);
 /// assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
 ///
-/// // In the Referrer
-/// let args: AngleBracketedGenericArguments = parse_quote!(<u8, B, 'x', { 1 + 2 }>);
-/// let ty = markers.encode_generics_args_to_ty(&args.args, &generics.params).unwrap();
-/// let expected: Type = parse_quote!((
-///     u8,
-///     ::my_crate::markers::ConstBool<B>,
-///     ::my_crate::markers::ConstChar<'x'>,
-///     [(); 1 + 2]
-/// ));
+/// // In the Referrer (e.g. for `impl MyTrait<'static, u8, true> for X`)
+/// let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8, true>);
+/// let ty = carrier.encode_generics_args_to_ty(&args.args);
+/// let expected: Type = parse_quote!(::my_crate::m::__MyTraitCarrier<'static, u8, true>);
 /// assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ConstMarkers {
-    /// Path to the module containing the marker types.
+pub struct GenericsCarrier {
+    /// Path to the carrier struct.
     pub path: Path,
 }
 
-impl ConstMarkers {
-    /// Specifies the path to the module containing the definitions made by
-    /// [`ConstMarkers::definitions()`].
+impl GenericsCarrier {
+    /// Specifies the path to the carrier struct made by [`GenericsCarrier::definition()`].
     pub fn new(path: Path) -> Self {
         Self { path }
     }
 
-    /// Definitions of the marker types, such as `pub struct ConstBool<const V: bool>;`.
+    /// Definition of a carrier struct named `ident` with `generics`.
     ///
-    /// ```
-    /// # use type_leak::*;
-    /// let defs = ConstMarkers::definitions();
-    /// assert!(defs.to_string().contains("ConstBool"));
-    /// ```
-    pub fn definitions() -> TokenStream {
-        CONST_PARAM_PRIMITIVES
+    /// The parameters keep their defaults, but not their bounds, so that naming the carrier does
+    /// not require the bounds to hold. Type parameters are `?Sized`. The where clause is dropped.
+    pub fn definition(vis: &Visibility, ident: &Ident, generics: &Generics) -> ItemStruct {
+        let mut phantom: Vec<Type> = Vec::new();
+        let params: Punctuated<GenericParam, Token![,]> = generics
+            .params
             .iter()
-            .map(|(prim, marker)| {
-                let prim = Ident::new(prim, Span::call_site());
-                let marker = Ident::new(marker, Span::call_site());
-                quote! {
-                    #[doc(hidden)]
-                    pub struct #marker<const V: ::core::primitive::#prim>;
+            .map(|param| match param {
+                GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
+                    phantom.push(parse_quote!(&#lifetime ()));
+                    GenericParam::Lifetime(LifetimeParam::new(lifetime.clone()))
                 }
+                GenericParam::Type(TypeParam {
+                    ident,
+                    eq_token,
+                    default,
+                    ..
+                }) => {
+                    phantom.push(parse_quote!(*const #ident));
+                    GenericParam::Type(TypeParam {
+                        attrs: Vec::new(),
+                        ident: ident.clone(),
+                        colon_token: Some(Default::default()),
+                        bounds: parse_quote!(?::core::marker::Sized),
+                        eq_token: *eq_token,
+                        default: default.clone(),
+                    })
+                }
+                GenericParam::Const(cp) => GenericParam::Const(ConstParam {
+                    attrs: Vec::new(),
+                    ..cp.clone()
+                }),
             })
-            .collect()
-    }
-
-    /// Encodes a const value `value` of type `ty` into a type. A `usize` value is encoded as
-    /// `[(); value]`.
-    ///
-    /// Returns [`EncodeError::UnsupportedConstType`] if `ty` is not a primitive type.
-    pub fn encode_const(&self, value: &Expr, ty: &Type) -> std::result::Result<Type, EncodeError> {
-        let prim = const_param_primitive(ty)
-            .ok_or_else(|| EncodeError::UnsupportedConstType(Box::new(ty.clone())))?;
-        let value = unwrap_block(value);
-        if prim == "usize" {
-            return Ok(parse_quote!([(); #value]));
+            .collect();
+        let generics = Generics {
+            lt_token: Some(Default::default()),
+            params,
+            gt_token: Some(Default::default()),
+            where_clause: None,
+        };
+        if phantom.is_empty() {
+            parse_quote! {
+                #[doc(hidden)]
+                #vis struct #ident #generics;
+            }
+        } else {
+            parse_quote! {
+                #[doc(hidden)]
+                #vis struct #ident #generics(::core::marker::PhantomData<(#(#phantom,)*)>);
+            }
         }
-        let marker = CONST_PARAM_PRIMITIVES
-            .iter()
-            .find(|(p, _)| *p == prim)
-            .map(|(_, marker)| Ident::new(marker, Span::call_site()))
-            .unwrap();
-        let path = &self.path;
-        Ok(match value {
-            Expr::Lit(_) | Expr::Path(_) => parse_quote!(#path::#marker<#value>),
-            _ => parse_quote!(#path::#marker<{ #value }>),
-        })
     }
 
-    /// Encodes [`GenericParam`]s into a type, like [`encode_generics_params_to_ty()`].
-    ///
-    /// Returns [`EncodeError::UnsupportedConstType`] if the type of a const parameter is not a
-    /// primitive type.
+    /// Encodes [`GenericParam`]s into a type, i.e. the carrier applied to the parameters.
     pub fn encode_generics_params_to_ty<'a>(
         &self,
         iter: impl IntoIterator<Item = &'a GenericParam>,
-    ) -> std::result::Result<Type, EncodeError> {
-        try_encode_generics_params_to_ty_with(iter, |ConstParam { ident, ty, .. }| {
-            self.encode_const(&parse_quote!(#ident), ty)
-        })
+    ) -> Type {
+        let args = iter.into_iter().map(|param| -> GenericArgument {
+            match param {
+                GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
+                    GenericArgument::Lifetime(lifetime.clone())
+                }
+                GenericParam::Type(TypeParam { ident, .. }) => {
+                    GenericArgument::Type(parse_quote!(#ident))
+                }
+                GenericParam::Const(ConstParam { ident, .. }) => {
+                    GenericArgument::Const(parse_quote!(#ident))
+                }
+            }
+        });
+        self.encode_generics_args_to_ty(&args.collect::<Vec<_>>())
     }
 
-    /// Encodes [`GenericArgument`]s into a type, like [`encode_generics_args_to_ty()`].
-    /// `params` are the [`GenericParam`]s of the Leaker corresponding to `iter`, which are used
-    /// to find the types of const arguments.
+    /// Encodes [`GenericArgument`]s into a type, i.e. the carrier applied to the arguments.
     ///
-    /// The result is the same type as [`ConstMarkers::encode_generics_params_to_ty()`] with
-    /// `params` substituted by `iter`.
-    ///
-    /// Returns [`EncodeError::UnsupportedConstType`] if the type of a const parameter is not a
-    /// primitive type, and [`EncodeError::UnsupportedArgument`] if an argument cannot be encoded
-    /// (e.g. an associated type binding).
+    /// The arguments are used as they are, except for associated item bindings and constraints
+    /// (e.g. `Item = u8`), which are not generic arguments of the carrier and are skipped.
     pub fn encode_generics_args_to_ty<'a>(
         &self,
         iter: impl IntoIterator<Item = &'a GenericArgument>,
-        params: &Punctuated<GenericParam, Token![,]>,
-    ) -> std::result::Result<Type, EncodeError> {
-        try_encode_generics_args_to_ty_with(iter, Some(params), |expr, cp| match cp {
-            Some(ConstParam { ty, .. }) => self.encode_const(expr, ty),
-            None => Ok(parse_quote!([(); #expr])),
-        })
+    ) -> Type {
+        let args: Vec<&GenericArgument> = iter
+            .into_iter()
+            .filter(|arg| {
+                matches!(
+                    arg,
+                    GenericArgument::Lifetime(_)
+                        | GenericArgument::Type(_)
+                        | GenericArgument::Const(_)
+                )
+            })
+            .collect();
+        let path = &self.path;
+        if args.is_empty() {
+            parse_quote!(#path)
+        } else {
+            parse_quote!(#path<#(#args),*>)
+        }
     }
 }
 

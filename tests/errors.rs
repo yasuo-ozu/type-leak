@@ -126,29 +126,25 @@ fn limit_const_param_ty_alias() {
     .unwrap();
     assert_eq!(leak_trait(&abs_item), Ok(vec!["RelType".to_string()]));
 
-    // `ConstMarkers` cannot encode an alias (relative or absolute), because it cannot know the
-    // underlying primitive type.
-    let markers = ConstMarkers::new(parse2(quote!(crate::markers)).unwrap());
-    let ty: Type = parse2(quote!(Idx)).unwrap();
-    let expected =
-        Err("unsupported type of const parameter: 'Idx' (use a primitive type)".to_string());
-    let result = markers.encode_const(&parse2(quote!(0)).unwrap(), &ty);
-    assert_eq!(
-        result.map(|ty| ty_string(&ty)).map_err(|e| e.to_string()),
-        expected
+    // `GenericsCarrier` supports it, since it copies the type of const parameters as it is.
+    let carrier = GenericsCarrier::definition(
+        &parse2(quote!(pub)).unwrap(),
+        &parse2(quote!(Carrier)).unwrap(),
+        &abs_item.generics,
     );
-    let result = markers.encode_generics_params_to_ty(&item.generics.params);
-    assert_eq!(
-        result.map(|ty| ty_string(&ty)).map_err(|e| e.to_string()),
-        expected
-    );
+    let expected: ItemStruct = parse2(quote! {
+        #[doc(hidden)]
+        pub struct Carrier<const N: ::my_crate::Idx>;
+    })
+    .unwrap();
+    assert_eq!(quote!(#carrier).to_string(), quote!(#expected).to_string());
 }
 
 #[test]
 fn limit_plain_encoders_usize_only() {
     // `encode_generics_params_to_ty()` and `encode_generics_args_to_ty()` encode const generics as
     // array lengths, which must be `usize`. For other types they produce `[(); B]` or
-    // `[(); true]`, which rustc rejects; `ConstMarkers` must be used instead.
+    // `[(); true]`, which rustc rejects; `GenericsCarrier` must be used instead.
     let generics: Generics = parse2(quote!(<const B: bool>)).unwrap();
     let ty = encode_generics_params_to_ty(&generics.params);
     assert_eq!(ty_string(&ty), expected_ty(quote!(([(); B],))));
@@ -157,21 +153,11 @@ fn limit_plain_encoders_usize_only() {
     let ty = encode_generics_args_to_ty(&args.args);
     assert_eq!(ty_string(&ty), expected_ty(quote!(([(); true],))));
 
-    let markers = ConstMarkers::new(parse2(quote!(crate::markers)).unwrap());
-    let ty = markers
-        .encode_generics_params_to_ty(&generics.params)
-        .unwrap();
-    assert_eq!(
-        ty_string(&ty),
-        expected_ty(quote!((crate::markers::ConstBool<B>,)))
-    );
-    let ty = markers
-        .encode_generics_args_to_ty(&args.args, &generics.params)
-        .unwrap();
-    assert_eq!(
-        ty_string(&ty),
-        expected_ty(quote!((crate::markers::ConstBool<true>,)))
-    );
+    let carrier = GenericsCarrier::new(parse2(quote!(crate::m::Carrier)).unwrap());
+    let ty = carrier.encode_generics_params_to_ty(&generics.params);
+    assert_eq!(ty_string(&ty), expected_ty(quote!(crate::m::Carrier<B>)));
+    let ty = carrier.encode_generics_args_to_ty(&args.args);
+    assert_eq!(ty_string(&ty), expected_ty(quote!(crate::m::Carrier<true>)));
 }
 
 // ── holes ────────────────────────────────────────────────────────────────────
@@ -180,39 +166,28 @@ fn limit_plain_encoders_usize_only() {
 fn hole_omitted_default_arg() {
     // HOLE: a defaulted const parameter omitted in the Referrer's arguments.
     //
-    // The Leaker encodes all parameters, but the Referrer encodes only the given arguments, so
-    // the two encodings differ and the Repeater's implementation is not found.
+    // The plain encoders encode all parameters, but only the given arguments, so the two
+    // encodings differ and the Repeater's implementation is not found.
     // Expected after fix: missing arguments are filled from the parameters' defaults, giving
-    // `(u8, [(); 3])`.
+    // `(u8, [(); 3])`. `GenericsCarrier` avoids it, since rustc fills the carrier's defaults.
     let generics: Generics = parse2(quote!(<T, const N: usize = 3>)).unwrap();
     let args: AngleBracketedGenericArguments = parse2(quote!(<u8>)).unwrap();
-    let markers = ConstMarkers::new(parse2(quote!(crate::markers)).unwrap());
 
-    let params_ty = markers
-        .encode_generics_params_to_ty(&generics.params)
-        .unwrap();
-    let args_ty = markers
-        .encode_generics_args_to_ty(&args.args, &generics.params)
-        .unwrap();
+    let params_ty = encode_generics_params_to_ty(&generics.params);
+    let args_ty = encode_generics_args_to_ty_with(&args.args, Some(&generics.params), |expr, _| {
+        parse2(quote!([(); #expr])).unwrap()
+    });
     assert_eq!(ty_string(&params_ty), expected_ty(quote!((T, [(); N]))));
     assert_eq!(ty_string(&args_ty), expected_ty(quote!((u8,))));
 }
 
 #[test]
 fn hole_assoc_binding_arg() {
-    // HOLE: an associated binding in the arguments cannot be encoded. `ConstMarkers` returns
-    // `EncodeError::UnsupportedArgument`, and the plain `encode_generics_args_to_ty()` panics.
+    // HOLE: the plain encoders panic on an associated binding in the arguments.
     //
-    // Expected after fix: bindings are skipped when encoding the arguments, giving `(u8,)`.
-    let generics: Generics = parse2(quote!(<T>)).unwrap();
+    // Expected after fix: bindings are skipped when encoding the arguments, giving `(u8,)`, as
+    // `GenericsCarrier` does.
     let args: AngleBracketedGenericArguments = parse2(quote!(<u8, Item = u8>)).unwrap();
-    let markers = ConstMarkers::new(parse2(quote!(crate::markers)).unwrap());
-
-    let result = markers.encode_generics_args_to_ty(&args.args, &generics.params);
-    assert_eq!(
-        result.map(|ty| ty_string(&ty)).map_err(|e| e.to_string()),
-        Err("unsupported generic argument: 'Item = u8'".to_string())
-    );
 
     let result = std::panic::catch_unwind(|| encode_generics_args_to_ty(&args.args));
     let payload = result.unwrap_err();
@@ -220,6 +195,10 @@ fn hole_assoc_binding_arg() {
         payload.downcast_ref::<String>().map(String::as_str),
         Some("unsupported generic argument: 'Item = u8'")
     );
+
+    let carrier = GenericsCarrier::new(parse2(quote!(crate::m::Carrier)).unwrap());
+    let ty = carrier.encode_generics_args_to_ty(&args.args);
+    assert_eq!(ty_string(&ty), expected_ty(quote!(crate::m::Carrier<u8>)));
 }
 
 #[test]
@@ -250,27 +229,19 @@ fn hole_bare_const_in_bound() {
 
 #[test]
 fn hole_shadowed_primitive() {
-    // HOLE: the type of a const parameter is recognized only by its name, so a shadowed primitive
-    // name selects the wrong marker (`ConstU8` for `const X: u8` where `type u8 = i32;`).
+    // HOLE: the type of a const parameter is recognized as a primitive only by its name, so a
+    // shadowed primitive name (e.g. `type u8 = i32;` in the Leaker's context) is accepted as
+    // context-free and copied as it is into the Referrer, where it means the real `u8`.
     //
-    // Not fixable without name resolution; the generated code fails to compile instead of
-    // silently resolving to another type.
+    // Not fixable without name resolution; the Referrer's copy then has another type
+    // (`const M: u8` instead of `i32`), which fails to compile rather than resolving silently.
     let item: ItemTrait = parse2(quote! {
-        pub trait MyTrait<const X: u8> {
-            fn f(&self) -> Wrap<X>;
+        pub trait MyTrait {
+            fn f<const M: u8>(&self);
         }
     })
     .unwrap();
-    assert_eq!(leak_trait(&item), Ok(vec!["Wrap < X >".to_string()]));
-
-    let markers = ConstMarkers::new(parse2(quote!(crate::markers)).unwrap());
-    let ty = markers
-        .encode_generics_params_to_ty(&item.generics.params)
-        .unwrap();
-    assert_eq!(
-        ty_string(&ty),
-        expected_ty(quote!((crate::markers::ConstU8<X>,)))
-    );
+    assert_eq!(leak_trait(&item), Ok(vec![]));
 }
 
 #[test]
@@ -279,8 +250,8 @@ fn hole_plain_args_encoder_bare_const() {
     // (parsed by syn as a type argument) is a const, and encodes it as the type `N` instead of
     // `[(); N]`, so it does not match `encode_generics_params_to_ty()`.
     //
-    // Not fixable without the parameters; `encode_generics_args_to_ty_with()` (or
-    // `ConstMarkers::encode_generics_args_to_ty()`) with the parameters handles it.
+    // Not fixable without the parameters; `encode_generics_args_to_ty_with()` with the parameters
+    // handles it, and `GenericsCarrier` avoids it.
     let generics: Generics = parse2(quote!(<T, const N: usize>)).unwrap();
     let args: AngleBracketedGenericArguments = parse2(quote!(<u8, N>)).unwrap();
 
@@ -300,15 +271,12 @@ fn hole_args_not_checked_against_params() {
     // encoding.
     //
     // Expected after fix: a mismatch is reported (e.g. by a panic or a `Result`).
-    let generics: Generics = parse2(quote!(<const B: bool>)).unwrap();
-    let args: AngleBracketedGenericArguments = parse2(quote!(<true, u8>)).unwrap();
-    let markers = ConstMarkers::new(parse2(quote!(crate::markers)).unwrap());
+    // `GenericsCarrier` avoids it, since rustc reports a wrong number of arguments (E0107).
+    let generics: Generics = parse2(quote!(<const N: usize>)).unwrap();
+    let args: AngleBracketedGenericArguments = parse2(quote!(<3, u8>)).unwrap();
 
-    let ty = markers
-        .encode_generics_args_to_ty(&args.args, &generics.params)
-        .unwrap();
-    assert_eq!(
-        ty_string(&ty),
-        expected_ty(quote!((crate::markers::ConstBool<true>, u8)))
-    );
+    let ty = encode_generics_args_to_ty_with(&args.args, Some(&generics.params), |expr, _| {
+        parse2(quote!([(); #expr])).unwrap()
+    });
+    assert_eq!(ty_string(&ty), expected_ty(quote!(([(); 3], u8))));
 }

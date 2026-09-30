@@ -13,3 +13,11 @@ pub struct Generic<const B: bool, const N: usize>(pub Inner);
 type_leak_test_leaker::m::Consts!(
     impl<const B: bool, const N: usize> Consts<u16, N, B, 'y', { 1 + 2 }> for Generic<B, N> => 0
 );
+
+// All defaulted arguments omitted: `Defaults<u8, 2, true>`.
+type_leak_test_leaker::m::Defaults!(impl Defaults<u8> for Concrete => 0);
+
+// Only some defaulted arguments given: `Defaults<u16, N, true>`.
+type_leak_test_leaker::m::Defaults!(
+    impl<const B: bool, const N: usize> Defaults<u16, N> for Generic<B, N> => 0
+);

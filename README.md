@@ -93,11 +93,12 @@ Known limitations, due to the stable Rust type system:
   `MyTrait<MY_CONST>`) is indistinguishable from a type, so it is interned as a type.
 - The type of a const parameter must be a primitive type or a context-free path (e.g. an absolute
   path to a type alias), since it cannot be a projection.
-- `encode_generics_params_to_ty()` encodes `const N: usize` as `[(); N]`, and there is no type in
-  `core` with a const parameter of other types. To encode const parameters of any type (e.g.
-  `const B: bool` as `ConstBool<B>`), place the marker types from `ConstMarkers::definitions()` next
-  to the Repeater and use `ConstMarkers::encode_generics_params_to_ty()` and
-  `ConstMarkers::encode_generics_args_to_ty()`.
+- `encode_generics_params_to_ty()` encodes `const N: usize` as `[(); N]`, and there is no stable
+  type in `core` with a const parameter of other types. To encode generics of any kind, use a type
+  with the same generics as the Leaker: the Leaker's type itself for a struct or an enum, or a
+  carrier struct generated next to a trait with `GenericsCarrier::definition()` (then
+  `GenericsCarrier::encode_generics_params_to_ty()` and `GenericsCarrier::encode_generics_args_to_ty()`).
+  The carrier supports const parameters of any type and omitted default arguments.
 
 # Application
 

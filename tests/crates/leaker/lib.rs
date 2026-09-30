@@ -9,11 +9,6 @@ pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> {
     type Type: ?Sized;
 }
 
-/// Marker types of `type_leak::ConstMarkers`.
-pub mod markers {
-    type_leak_test_macro::const_markers!();
-}
-
 pub mod m {
     use type_leak_test_macro::leak;
 
@@ -39,7 +34,6 @@ pub mod m {
     #[leak(
         helper = crate::__macro,
         repeater = crate::Repeater,
-        markers = crate::markers,
         module = crate::m,
     )]
     pub trait Consts<T, const N: usize, const B: bool, const C: char, const X: i32> {
@@ -59,8 +53,29 @@ pub mod m {
         fn holder<'b>(&self, h: Holder<'b>) -> u32;
     }
 
-    /// Implements [`Consts`] for any arguments; the Referrer's wrappers forward to it.
+    /// Defaulted const parameters, which the Referrer may omit.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::m,
+    )]
+    pub trait Defaults<T, const N: usize = 2, const B: bool = true> {
+        fn default_array(&self) -> [RelType; N];
+        fn default_flag(&self) -> Flag<B>;
+    }
+
+    /// Implements [`Consts`] and [`Defaults`] for any arguments; the Referrer's wrappers forward
+    /// to it.
     pub struct Inner;
+
+    impl<T, const N: usize, const B: bool> Defaults<T, N, B> for Inner {
+        fn default_array(&self) -> [RelType; N] {
+            [(); N].map(|()| RelType(0))
+        }
+        fn default_flag(&self) -> Flag<B> {
+            Flag
+        }
+    }
 
     impl<T, const N: usize, const B: bool, const C: char, const X: i32> Consts<T, N, B, C, X>
         for Inner

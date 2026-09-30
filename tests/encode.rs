@@ -1,4 +1,4 @@
-//! Tests for encoding generics into types (`encode_generics_*`, `ConstMarkers`).
+//! Tests for encoding generics into types (`encode_generics_*`, `GenericsCarrier`).
 
 use syn::*;
 use template_quote::quote;
@@ -34,27 +34,51 @@ fn test_encode_generics_const() {
 }
 
 #[test]
-fn test_const_markers() {
+fn test_generics_carrier() {
     use type_leak::*;
-    let markers = ConstMarkers::new(parse_quote!(::m));
-    let generics: Generics = parse_quote!(<'a, T, const B: bool, const X: i32, const N: usize>);
-    let ty = markers
-        .encode_generics_params_to_ty(&generics.params)
-        .unwrap();
-    let expected: Type = parse_quote!((&'a (), T, ::m::ConstBool<B>, ::m::ConstI32<X>, [(); N]));
-    assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
+    let to_string = |ty: &Type| quote!(#ty).to_string();
 
-    // Omitted lifetime, bare const ident, negative value and braced expression.
-    let args: AngleBracketedGenericArguments = parse_quote!(<u8, B, -3, { 1 + 2 }>);
-    let ty = markers
-        .encode_generics_args_to_ty(&args.args, &generics.params)
-        .unwrap();
-    let expected: Type = parse_quote!((u8, ::m::ConstBool<B>, ::m::ConstI32<-3>, [(); 1 + 2]));
-    assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
+    // Const parameters of any type (including aliases) and defaults are kept; bounds and the
+    // where clause are dropped.
+    let mut generics: Generics =
+        parse_quote!(<'a, T: ::core::clone::Clone, const B: bool, const N: Idx = 3>);
+    generics.where_clause = Some(parse_quote!(where T: 'a));
+    let def = GenericsCarrier::definition(&parse_quote!(pub), &parse_quote!(Carrier), &generics);
+    let expected: ItemStruct = parse_quote! {
+        #[doc(hidden)]
+        pub struct Carrier<'a, T: ?::core::marker::Sized, const B: bool, const N: Idx = 3>(
+            ::core::marker::PhantomData<(&'a (), *const T,)>
+        );
+    };
+    assert_eq!(quote!(#def).to_string(), quote!(#expected).to_string());
 
-    // `::core::primitive::*` paths are accepted; type aliases are not.
-    let ty: Type = parse_quote!(::core::primitive::char);
-    assert!(markers.encode_const(&parse_quote!('x'), &ty).is_ok());
-    let ty: Type = parse_quote!(MyIdx);
-    assert!(markers.encode_const(&parse_quote!(0), &ty).is_err());
+    // Only const parameters: a unit struct.
+    let generics: Generics = parse_quote!(<const M: bool>);
+    let def = GenericsCarrier::definition(&parse_quote!(pub), &parse_quote!(Local), &generics);
+    let expected: ItemStruct = parse_quote! {
+        #[doc(hidden)]
+        pub struct Local<const M: bool>;
+    };
+    assert_eq!(quote!(#def).to_string(), quote!(#expected).to_string());
+
+    let carrier = GenericsCarrier::new(parse_quote!(crate::m::Carrier));
+    let generics: Generics = parse_quote!(<'a, T, const B: bool, const N: Idx = 3>);
+    let ty = carrier.encode_generics_params_to_ty(&generics.params);
+    assert_eq!(
+        to_string(&ty),
+        to_string(&parse_quote!(crate::m::Carrier<'a, T, B, N>))
+    );
+
+    // Arguments are used as they are (a bare const `B`, an omitted default), and associated
+    // bindings are skipped.
+    let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8, B, Item = u8>);
+    let ty = carrier.encode_generics_args_to_ty(&args.args);
+    assert_eq!(
+        to_string(&ty),
+        to_string(&parse_quote!(crate::m::Carrier<'static, u8, B>))
+    );
+
+    // No generics.
+    let ty = carrier.encode_generics_params_to_ty(&Generics::default().params);
+    assert_eq!(to_string(&ty), to_string(&parse_quote!(crate::m::Carrier)));
 }
