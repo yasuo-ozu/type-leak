@@ -72,6 +72,33 @@ Example of a reference in the referrer's type context:
 <MyLeakerType<T, U, ..> as path::to::Repeater<0>>::Type
 ```
 
+# Const generics
+
+Const generic parameters of the Leaker (e.g. `N` in `struct MyLeaker<const N: usize>`), including
+those declared on trait methods, are treated as context-free, like type parameters. A type that
+mentions a method-local generic (such as `[MyType; M]` in `fn f<const M: usize>()`) is not interned
+as a whole, because the Repeater's implementation cannot refer to `M`; its components (`MyType`)
+are interned instead. A type which cannot be decomposed (such as `MyWrap<B>` in
+`fn f<const B: bool>()`) is interned together with the local generics it depends on, which
+`Referrer::local_generics()` returns. The Repeater's implementation must then declare these
+generics (lifetimes first) and constrain them in its trait arguments, so the Repeater needs a type
+parameter to carry them (e.g. `Repeater<T: ?Sized, const INDEX: usize>`).
+
+Known limitations, due to the stable Rust type system:
+
+- A const value can be leaked only as part of a type (e.g. `[u8; MY_CONST]` or
+  `::path::to::MyType<MY_CONST>`). A relative const in a trait bound (e.g.
+  `T: ::path::to::MyTrait<{ MY_CONST }>`) is rejected, because a const cannot be recovered from an
+  associated type in a generic context without `generic_const_exprs`. A bare identifier (e.g.
+  `MyTrait<MY_CONST>`) is indistinguishable from a type, so it is interned as a type.
+- The type of a const parameter must be a primitive type or a context-free path (e.g. an absolute
+  path to a type alias), since it cannot be a projection.
+- `encode_generics_params_to_ty()` encodes `const N: usize` as `[(); N]`, and there is no type in
+  `core` with a const parameter of other types. To encode const parameters of any type (e.g.
+  `const B: bool` as `ConstBool<B>`), place the marker types from `ConstMarkers::definitions()` next
+  to the Repeater and use `ConstMarkers::encode_generics_params_to_ty()` and
+  `ConstMarkers::encode_generics_args_to_ty()`.
+
 # Application
 
 - [sumtype](https://crates.io/crates/sumtype)

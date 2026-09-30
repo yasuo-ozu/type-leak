@@ -114,6 +114,7 @@ pub struct Leaker {
     pub self_ty_can_be_interned: bool,
     reachable_types: HashSet<Type>,
     pending_operations: Option<Vec<GraphOperation>>,
+    local_generics: HashMap<Type, Generics>,
 }
 
 /// Error indicating that a type is not internable.
@@ -135,46 +136,568 @@ impl NotInternableError {
 }
 
 /// Encode [`GenericArgument`]s to a type.
+///
+/// A const argument `N` is encoded as `[(); N]`, so it must be of type `usize`. Use
+/// [`encode_generics_args_to_ty_with()`] to encode const arguments of other types.
+///
+/// A bare identifier such as `N` in `MyTrait<N>` is parsed as a type argument even if it refers to
+/// a const. Use [`encode_generics_args_to_ty_with()`] with the corresponding [`GenericParam`]s to
+/// encode such arguments correctly.
+///
+/// # Panics
+///
+/// Panics if an argument cannot be encoded (see [`EncodeError::UnsupportedArgument`]).
 pub fn encode_generics_args_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericArgument>) -> Type {
-    Type::Tuple(TypeTuple {
+    encode_generics_args_to_ty_with(iter, None, |expr, _| parse_quote!([(); #expr]))
+}
+
+/// Encode [`GenericArgument`]s to a type, using `const_fn` to encode const arguments.
+///
+/// If `params` is given, its type and const parameters are matched against the type and const
+/// arguments of `iter` by position. A type argument that
+/// corresponds to a [`ConstParam`] and consists only of a single identifier (e.g. `N` in
+/// `MyTrait<N>`) is then treated as a const argument. `const_fn` receives each const argument
+/// together with its corresponding [`ConstParam`] (if known), and must return the same type as the
+/// `const_fn` passed to [`encode_generics_params_to_ty_with()`] for the same value.
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// # use template_quote::quote;
+/// let generics: Generics = parse_quote!(<T, const N: usize>);
+/// let args: AngleBracketedGenericArguments = parse_quote!(<u8, N>);
+/// let ty = encode_generics_args_to_ty_with(&args.args, Some(&generics.params), |expr, _| {
+///     parse_quote!([(); #expr])
+/// });
+/// assert_eq!(quote!(#ty).to_string(), quote!((u8, [(); N])).to_string());
+/// ```
+///
+/// # Panics
+///
+/// Panics if an argument cannot be encoded (see [`EncodeError::UnsupportedArgument`]).
+pub fn encode_generics_args_to_ty_with<'a, 'b>(
+    iter: impl IntoIterator<Item = &'a GenericArgument>,
+    params: Option<&'b Punctuated<GenericParam, Token![,]>>,
+    mut const_fn: impl FnMut(&Expr, Option<&'b ConstParam>) -> Type,
+) -> Type {
+    try_encode_generics_args_to_ty_with(iter, params, |expr, cp| Ok(const_fn(expr, cp)))
+        .unwrap_or_else(|e| panic!("{}", e))
+}
+
+/// Fallible version of [`encode_generics_args_to_ty_with()`].
+fn try_encode_generics_args_to_ty_with<'a, 'b>(
+    iter: impl IntoIterator<Item = &'a GenericArgument>,
+    params: Option<&'b Punctuated<GenericParam, Token![,]>>,
+    mut const_fn: impl FnMut(&Expr, Option<&'b ConstParam>) -> std::result::Result<Type, EncodeError>,
+) -> std::result::Result<Type, EncodeError> {
+    // Lifetime arguments may be omitted, so type and const arguments are matched only against type
+    // and const parameters.
+    let mut params = params.map(|params| {
+        params
+            .iter()
+            .filter(|param| !matches!(param, GenericParam::Lifetime(_)))
+    });
+    Ok(Type::Tuple(TypeTuple {
         paren_token: Default::default(),
         elems: iter
             .into_iter()
-            .map(|param| -> Type {
-                match param {
-                    GenericArgument::Lifetime(lifetime) => {
+            .map(|arg| -> std::result::Result<Type, EncodeError> {
+                let param = if matches!(arg, GenericArgument::Lifetime(_)) {
+                    None
+                } else {
+                    params.as_mut().and_then(|params| params.next())
+                };
+                let const_param = if let Some(GenericParam::Const(cp)) = param {
+                    Some(cp)
+                } else {
+                    None
+                };
+                Ok(match (arg, const_param) {
+                    (GenericArgument::Lifetime(lifetime), _) => {
                         parse_quote!(& #lifetime ())
                     }
-                    GenericArgument::Const(expr) => {
-                        parse_quote!([(); #expr as usize])
+                    (GenericArgument::Const(expr), _) => const_fn(unwrap_block(expr), const_param)?,
+                    (
+                        GenericArgument::Type(Type::Path(TypePath { qself: None, path })),
+                        Some(cp),
+                    ) if path.get_ident().is_some() => const_fn(
+                        &Expr::Path(ExprPath {
+                            attrs: Vec::new(),
+                            qself: None,
+                            path: path.clone(),
+                        }),
+                        Some(cp),
+                    )?,
+                    (GenericArgument::Type(ty), _) => ty.clone(),
+                    (arg, _) => {
+                        return Err(EncodeError::UnsupportedArgument(Box::new(arg.clone())))
                     }
-                    GenericArgument::Type(ty) => ty.clone(),
-                    _ => panic!(),
-                }
+                })
             })
-            .collect(),
-    })
+            .collect::<std::result::Result<_, _>>()?,
+    }))
+}
+
+/// Primitive types which can be the type of const parameters on stable Rust, paired with the name
+/// of the marker type used by [`ConstMarkers`].
+const CONST_PARAM_PRIMITIVES: &[(&str, &str)] = &[
+    ("bool", "ConstBool"),
+    ("char", "ConstChar"),
+    ("u8", "ConstU8"),
+    ("u16", "ConstU16"),
+    ("u32", "ConstU32"),
+    ("u64", "ConstU64"),
+    ("u128", "ConstU128"),
+    ("usize", "ConstUsize"),
+    ("i8", "ConstI8"),
+    ("i16", "ConstI16"),
+    ("i32", "ConstI32"),
+    ("i64", "ConstI64"),
+    ("i128", "ConstI128"),
+    ("isize", "ConstIsize"),
+];
+
+/// Returns the name of the primitive type if `ty` is a valid type of const parameters which does
+/// not depend on the type context.
+fn const_param_primitive(ty: &Type) -> Option<&'static str> {
+    match ty {
+        Type::Path(TypePath { qself: None, path }) => {
+            let segs: Vec<_> = path
+                .segments
+                .iter()
+                .map(|seg| {
+                    if seg.arguments.is_none() {
+                        Some(seg.ident.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<_>>()?;
+            let name = match (path.leading_colon.is_some(), segs.as_slice()) {
+                (false, [s]) => s,
+                (_, [c, p, s]) if (c == "core" || c == "std") && p == "primitive" => s,
+                _ => return None,
+            };
+            CONST_PARAM_PRIMITIVES
+                .iter()
+                .find(|(prim, _)| prim == name)
+                .map(|(prim, _)| *prim)
+        }
+        Type::Group(TypeGroup { elem, .. }) | Type::Paren(TypeParen { elem, .. }) => {
+            const_param_primitive(elem)
+        }
+        _ => None,
+    }
+}
+
+/// Returns `true` if `ty` is a valid type of const parameters which does not depend on the type
+/// context.
+fn is_const_param_ty(ty: &Type) -> bool {
+    const_param_primitive(ty).is_some()
+}
+
+/// Returns `true` if `ty` refers to any of `generics`.
+fn mentions_generics<'a>(ty: &Type, generics: impl IntoIterator<Item = &'a GenericParam>) -> bool {
+    struct Visitor {
+        idents: Vec<Ident>,
+        lifetimes: Vec<Lifetime>,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Visitor {
+        fn visit_path(&mut self, i: &'ast Path) {
+            if i.leading_colon.is_none()
+                && i.segments
+                    .first()
+                    .map_or(false, |seg| self.idents.contains(&seg.ident))
+            {
+                self.found = true;
+            }
+            syn::visit::visit_path(self, i)
+        }
+        fn visit_lifetime(&mut self, i: &'ast Lifetime) {
+            if self.lifetimes.contains(i) {
+                self.found = true;
+            }
+        }
+    }
+    let mut visitor = Visitor {
+        idents: Vec::new(),
+        lifetimes: Vec::new(),
+        found: false,
+    };
+    for gp in generics {
+        match gp {
+            GenericParam::Type(TypeParam { ident, .. })
+            | GenericParam::Const(ConstParam { ident, .. }) => visitor.idents.push(ident.clone()),
+            GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
+                visitor.lifetimes.push(lifetime.clone())
+            }
+        }
+    }
+    if visitor.idents.is_empty() && visitor.lifetimes.is_empty() {
+        return false;
+    }
+    visitor.visit_type(ty);
+    visitor.found
+}
+
+/// Collects the names of identifiers and lifetimes (e.g. `N` and `'a`) in `tokens`.
+fn token_names(tokens: TokenStream, names: &mut HashSet<String>) {
+    let mut after_quote = false;
+    for tt in tokens {
+        match &tt {
+            proc_macro2::TokenTree::Ident(ident) if after_quote => {
+                names.insert(format!("'{}", ident));
+            }
+            proc_macro2::TokenTree::Ident(ident) => {
+                names.insert(ident.to_string());
+            }
+            proc_macro2::TokenTree::Group(group) => token_names(group.stream(), names),
+            _ => (),
+        }
+        after_quote = false;
+        if let proc_macro2::TokenTree::Punct(punct) = &tt {
+            after_quote = punct.as_char() == '\'';
+        }
+    }
+}
+
+/// Returns the name of a generic parameter, e.g. `N` or `'a`.
+fn generic_param_name(param: &GenericParam) -> String {
+    match param {
+        GenericParam::Type(TypeParam { ident, .. })
+        | GenericParam::Const(ConstParam { ident, .. }) => ident.to_string(),
+        GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => lifetime.to_string(),
+    }
+}
+
+/// Returns the local generics which `ty` depends on, including those used in the bounds and
+/// where predicates of them, in the order of declaration.
+///
+/// Identifiers are matched by name, so a local generic may be included even if the name refers to
+/// something else (e.g. `::path::N`). This is harmless, because the Leaker and the Referrer
+/// include the same generics.
+fn required_local_generics(
+    ty: &Type,
+    locals: &[&GenericParam],
+    predicates: &[WherePredicate],
+) -> Generics {
+    let mut names = HashSet::new();
+    token_names(quote!(#ty), &mut names);
+    let mut included_params = vec![false; locals.len()];
+    let mut included_predicates = vec![false; predicates.len()];
+    loop {
+        let mut changed = false;
+        for (included, param) in included_params.iter_mut().zip(locals) {
+            if !*included && names.contains(&generic_param_name(param)) {
+                *included = true;
+                token_names(quote!(#param), &mut names);
+                changed = true;
+            }
+        }
+        for (included, predicate) in included_predicates.iter_mut().zip(predicates) {
+            if *included {
+                continue;
+            }
+            let mut predicate_names = HashSet::new();
+            token_names(quote!(#predicate), &mut predicate_names);
+            let mentions_included = locals
+                .iter()
+                .zip(&included_params)
+                .any(|(param, inc)| *inc && predicate_names.contains(&generic_param_name(param)));
+            if mentions_included {
+                *included = true;
+                names.extend(predicate_names);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let params: Punctuated<GenericParam, Token![,]> = locals
+        .iter()
+        .zip(&included_params)
+        .filter(|(_, inc)| **inc)
+        .map(|(param, _)| {
+            let mut param = (*param).clone();
+            match &mut param {
+                GenericParam::Type(tp) => {
+                    tp.eq_token = None;
+                    tp.default = None;
+                }
+                GenericParam::Const(cp) => {
+                    cp.eq_token = None;
+                    cp.default = None;
+                }
+                GenericParam::Lifetime(_) => (),
+            }
+            param
+        })
+        .collect();
+    let predicates: Punctuated<WherePredicate, Token![,]> = predicates
+        .iter()
+        .zip(&included_predicates)
+        .filter(|(_, inc)| **inc)
+        .map(|(predicate, _)| predicate.clone())
+        .collect();
+    Generics {
+        lt_token: Some(Default::default()),
+        gt_token: Some(Default::default()),
+        where_clause: if predicates.is_empty() {
+            None
+        } else {
+            Some(WhereClause {
+                where_token: Default::default(),
+                predicates,
+            })
+        },
+        params,
+    }
+}
+
+/// Removes redundant braces around a const argument, e.g. `{ N }` -> `N`.
+fn unwrap_block(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Block(ExprBlock {
+            attrs,
+            label: None,
+            block,
+        }) if attrs.is_empty() && block.stmts.len() == 1 => match &block.stmts[0] {
+            Stmt::Expr(inner, None) => unwrap_block(inner),
+            _ => expr,
+        },
+        _ => expr,
+    }
 }
 
 /// Encode [`GenericParam`]s to a type.
+///
+/// A const parameter `N` is encoded as `[(); N]`, which constrains `N` when used in the trait
+/// arguments of an `impl`. Because array lengths are `usize`, this only works for
+/// `const N: usize`. Use [`encode_generics_params_to_ty_with()`] to encode const parameters of
+/// other types (e.g. with a marker type `MyConstBool<const B: bool>`).
 pub fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericParam>) -> Type {
-    Type::Tuple(TypeTuple {
+    encode_generics_params_to_ty_with(iter, |ConstParam { ident, .. }| parse_quote!([(); #ident]))
+}
+
+/// Encode [`GenericParam`]s to a type, using `const_fn` to encode const parameters.
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// # use template_quote::quote;
+/// let generics: Generics = parse_quote!(<'a, T, const B: bool>);
+/// // `::my_crate::ConstBool` is defined as `pub struct ConstBool<const B: bool>;`
+/// let ty = encode_generics_params_to_ty_with(&generics.params, |ConstParam { ident, .. }| {
+///     parse_quote!(::my_crate::ConstBool<#ident>)
+/// });
+/// assert_eq!(
+///     quote!(#ty).to_string(),
+///     quote!((&'a (), T, ::my_crate::ConstBool<B>)).to_string()
+/// );
+/// ```
+pub fn encode_generics_params_to_ty_with<'a>(
+    iter: impl IntoIterator<Item = &'a GenericParam>,
+    mut const_fn: impl FnMut(&'a ConstParam) -> Type,
+) -> Type {
+    match try_encode_generics_params_to_ty_with(iter, |cp| {
+        Ok::<_, std::convert::Infallible>(const_fn(cp))
+    }) {
+        Ok(ty) => ty,
+        Err(e) => match e {},
+    }
+}
+
+/// Fallible version of [`encode_generics_params_to_ty_with()`].
+fn try_encode_generics_params_to_ty_with<'a, E>(
+    iter: impl IntoIterator<Item = &'a GenericParam>,
+    mut const_fn: impl FnMut(&'a ConstParam) -> std::result::Result<Type, E>,
+) -> std::result::Result<Type, E> {
+    Ok(Type::Tuple(TypeTuple {
         paren_token: Default::default(),
         elems: iter
             .into_iter()
-            .map(|param| -> Type {
-                match param {
+            .map(|param| -> std::result::Result<Type, E> {
+                Ok(match param {
                     GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
                         parse_quote!(& #lifetime ())
                     }
-                    GenericParam::Const(ConstParam { ident, .. }) => {
-                        parse_quote!([(); #ident as usize])
-                    }
+                    GenericParam::Const(cp) => const_fn(cp)?,
                     GenericParam::Type(TypeParam { ident, .. }) => parse_quote!(#ident),
+                })
+            })
+            .collect::<std::result::Result<_, _>>()?,
+    }))
+}
+
+/// Error returned by [`ConstMarkers`] when generics cannot be encoded into a type.
+#[derive(Clone, Debug)]
+pub enum EncodeError {
+    /// The type of a const parameter is not a primitive type (e.g. a type alias such as
+    /// `::my_crate::Idx`), so the marker type cannot be chosen.
+    UnsupportedConstType(Box<Type>),
+    /// A generic argument which does not correspond to a generic parameter, such as an associated
+    /// type binding (`Item = u8`).
+    UnsupportedArgument(Box<GenericArgument>),
+}
+
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncodeError::UnsupportedConstType(ty) => write!(
+                f,
+                "unsupported type of const parameter: '{}' (use a primitive type)",
+                quote!(#ty)
+            ),
+            EncodeError::UnsupportedArgument(arg) => {
+                write!(f, "unsupported generic argument: '{}'", quote!(#arg))
+            }
+        }
+    }
+}
+
+impl std::error::Error for EncodeError {}
+
+impl EncodeError {
+    pub fn span(&self) -> Span {
+        match self {
+            EncodeError::UnsupportedConstType(ty) => ty.span(),
+            EncodeError::UnsupportedArgument(arg) => arg.span(),
+        }
+    }
+}
+
+/// Marker types to encode const generics of any type into types.
+///
+/// [`encode_generics_params_to_ty()`] encodes a const parameter `N` as `[(); N]`, which only works
+/// for `const N: usize`, because Rust (without `generic_const_exprs`) does not allow operations
+/// such as `N as usize` on generic parameters, and there is no type in `core` with a const
+/// parameter of other types. `ConstMarkers` instead encodes a const parameter as a marker type,
+/// such as `path::to::markers::ConstBool<B>` for `const B: bool`.
+///
+/// The marker types must be defined with [`ConstMarkers::definitions()`] at a module which is
+/// accessible from both the Leaker and the Referrer (like the Repeater), and that module's path is
+/// given to [`ConstMarkers::new()`].
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// # use template_quote::quote;
+/// let markers = ConstMarkers::new(parse_quote!(::my_crate::markers));
+///
+/// // In the Leaker
+/// let generics: Generics = parse_quote!(<T, const B: bool, const C: char, const N: usize>);
+/// let ty = markers.encode_generics_params_to_ty(&generics.params).unwrap();
+/// let expected: Type = parse_quote!((
+///     T,
+///     ::my_crate::markers::ConstBool<B>,
+///     ::my_crate::markers::ConstChar<C>,
+///     [(); N]
+/// ));
+/// assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
+///
+/// // In the Referrer
+/// let args: AngleBracketedGenericArguments = parse_quote!(<u8, B, 'x', { 1 + 2 }>);
+/// let ty = markers.encode_generics_args_to_ty(&args.args, &generics.params).unwrap();
+/// let expected: Type = parse_quote!((
+///     u8,
+///     ::my_crate::markers::ConstBool<B>,
+///     ::my_crate::markers::ConstChar<'x'>,
+///     [(); 1 + 2]
+/// ));
+/// assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ConstMarkers {
+    /// Path to the module containing the marker types.
+    pub path: Path,
+}
+
+impl ConstMarkers {
+    /// Specifies the path to the module containing the definitions made by
+    /// [`ConstMarkers::definitions()`].
+    pub fn new(path: Path) -> Self {
+        Self { path }
+    }
+
+    /// Definitions of the marker types, such as `pub struct ConstBool<const V: bool>;`.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// let defs = ConstMarkers::definitions();
+    /// assert!(defs.to_string().contains("ConstBool"));
+    /// ```
+    pub fn definitions() -> TokenStream {
+        CONST_PARAM_PRIMITIVES
+            .iter()
+            .map(|(prim, marker)| {
+                let prim = Ident::new(prim, Span::call_site());
+                let marker = Ident::new(marker, Span::call_site());
+                quote! {
+                    #[doc(hidden)]
+                    pub struct #marker<const V: ::core::primitive::#prim>;
                 }
             })
-            .collect(),
-    })
+            .collect()
+    }
+
+    /// Encodes a const value `value` of type `ty` into a type. A `usize` value is encoded as
+    /// `[(); value]`.
+    ///
+    /// Returns [`EncodeError::UnsupportedConstType`] if `ty` is not a primitive type.
+    pub fn encode_const(&self, value: &Expr, ty: &Type) -> std::result::Result<Type, EncodeError> {
+        let prim = const_param_primitive(ty)
+            .ok_or_else(|| EncodeError::UnsupportedConstType(Box::new(ty.clone())))?;
+        let value = unwrap_block(value);
+        if prim == "usize" {
+            return Ok(parse_quote!([(); #value]));
+        }
+        let marker = CONST_PARAM_PRIMITIVES
+            .iter()
+            .find(|(p, _)| *p == prim)
+            .map(|(_, marker)| Ident::new(marker, Span::call_site()))
+            .unwrap();
+        let path = &self.path;
+        Ok(match value {
+            Expr::Lit(_) | Expr::Path(_) => parse_quote!(#path::#marker<#value>),
+            _ => parse_quote!(#path::#marker<{ #value }>),
+        })
+    }
+
+    /// Encodes [`GenericParam`]s into a type, like [`encode_generics_params_to_ty()`].
+    ///
+    /// Returns [`EncodeError::UnsupportedConstType`] if the type of a const parameter is not a
+    /// primitive type.
+    pub fn encode_generics_params_to_ty<'a>(
+        &self,
+        iter: impl IntoIterator<Item = &'a GenericParam>,
+    ) -> std::result::Result<Type, EncodeError> {
+        try_encode_generics_params_to_ty_with(iter, |ConstParam { ident, ty, .. }| {
+            self.encode_const(&parse_quote!(#ident), ty)
+        })
+    }
+
+    /// Encodes [`GenericArgument`]s into a type, like [`encode_generics_args_to_ty()`].
+    /// `params` are the [`GenericParam`]s of the Leaker corresponding to `iter`, which are used
+    /// to find the types of const arguments.
+    ///
+    /// The result is the same type as [`ConstMarkers::encode_generics_params_to_ty()`] with
+    /// `params` substituted by `iter`.
+    ///
+    /// Returns [`EncodeError::UnsupportedConstType`] if the type of a const parameter is not a
+    /// primitive type, and [`EncodeError::UnsupportedArgument`] if an argument cannot be encoded
+    /// (e.g. an associated type binding).
+    pub fn encode_generics_args_to_ty<'a>(
+        &self,
+        iter: impl IntoIterator<Item = &'a GenericArgument>,
+        params: &Punctuated<GenericParam, Token![,]>,
+    ) -> std::result::Result<Type, EncodeError> {
+        try_encode_generics_args_to_ty_with(iter, Some(params), |expr, cp| match cp {
+            Some(ConstParam { ty, .. }) => self.encode_const(expr, ty),
+            None => Ok(parse_quote!([(); #expr])),
+        })
+    }
 }
 
 /// Represents the result of [`Leaker::check()`], holding the cause in its tuple field.
@@ -197,11 +720,19 @@ struct GraphOperation {
     parent: Option<Type>,
     is_root: bool,
     is_must_intern: bool,
+    /// Local generics (e.g. of trait methods or GATs) which `node_type` depends on.
+    local_generics: Generics,
 }
 
 struct AnalyzeVisitor<'a> {
     leaker: &'a mut Leaker,
     generics: Generics,
+    /// The number of leading `generics.params` which belong to the Leaker itself. The rest are
+    /// local generics (e.g. of trait methods or GATs), which cannot be referred to from the
+    /// Repeater's implementation.
+    n_outer_generics: usize,
+    /// Where predicates of the local generics.
+    local_predicates: Vec<WherePredicate>,
     parent: Option<Type>,
     error: Option<TokenStream>,
     operations: Vec<GraphOperation>,
@@ -212,12 +743,19 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         let mut visitor = AnalyzeVisitor {
             leaker: self.leaker,
             generics: self.generics.clone(),
+            n_outer_generics: self.n_outer_generics,
+            local_predicates: self.local_predicates.clone(),
             parent: self.parent.clone(),
             error: self.error.clone(),
             operations: Vec::new(),
         };
         for g in &i.sig.generics.params {
             visitor.generics.params.push(g.clone());
+        }
+        if let Some(wc) = &i.sig.generics.where_clause {
+            visitor
+                .local_predicates
+                .extend(wc.predicates.iter().cloned());
         }
         let mut i = i.clone();
         i.default = None;
@@ -245,6 +783,8 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         let mut visitor = AnalyzeVisitor {
             leaker: self.leaker,
             generics: self.generics.clone(),
+            n_outer_generics: self.n_outer_generics,
+            local_predicates: self.local_predicates.clone(),
             parent: self.parent.clone(),
             error: self.error.clone(),
             operations: Vec::new(),
@@ -252,18 +792,49 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         for g in &i.generics.params {
             visitor.generics.params.push(g.clone());
         }
+        if let Some(wc) = &i.generics.where_clause {
+            visitor
+                .local_predicates
+                .extend(wc.predicates.iter().cloned());
+        }
         syn::visit::visit_trait_item_type(&mut visitor, i);
         self.error = visitor.error;
         self.operations.extend(visitor.operations);
     }
 
     fn visit_type(&mut self, i: &Type) {
+        let local_generics =
+            &self.generics.params.iter().collect::<Vec<_>>()[self.n_outer_generics..];
+        let mentions_local = mentions_generics(i, local_generics.iter().copied());
         match self.leaker.check(i, &self.generics) {
             Err((_, s)) => {
                 // Emit error and terminate searching
                 self.error = Some(s);
             }
             Ok(CheckResult::MustNotIntern(_)) => (),
+            Ok(CheckResult::MustIntern(_)) if mentions_local => {
+                // The type depends on both the type context and local generics, and cannot be
+                // decomposed further. It is interned together with the local generics it needs,
+                // which the Repeater's implementation must declare (see
+                // [`Referrer::local_generics()`]).
+                let local_generics = required_local_generics(
+                    i,
+                    &self.generics.params.iter().collect::<Vec<_>>()[self.n_outer_generics..],
+                    &self.local_predicates,
+                );
+                self.operations.push(GraphOperation {
+                    node_type: i.clone(),
+                    parent: self.parent.clone(),
+                    is_root: self.parent.is_none(),
+                    is_must_intern: true,
+                    local_generics,
+                });
+            }
+            Ok(_) if mentions_local => {
+                // The type itself cannot be interned because the Repeater's implementation
+                // cannot refer to the local generics, but its components can.
+                syn::visit::visit_type(self, i);
+            }
             o => {
                 // Collect the operation instead of directly modifying the graph
                 let is_must_intern = matches!(o, Ok(CheckResult::MustIntern(_)));
@@ -274,6 +845,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                     parent: self.parent.clone(),
                     is_root,
                     is_must_intern,
+                    local_generics: Generics::default(),
                 });
 
                 if !is_must_intern {
@@ -287,27 +859,29 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         }
     }
 
+    fn visit_const_param(&mut self, i: &ConstParam) {
+        // The type of a const parameter cannot be a projection (such as
+        // `<MyLeakerType as Repeater<0>>::Type`), so it is never interned. It must be a primitive
+        // type, or a context-free path to a type alias of it (e.g. `::my_crate::Idx`).
+        for attr in &i.attrs {
+            self.visit_attribute(attr);
+        }
+        let is_context_free_path = matches!(
+            &i.ty,
+            Type::Path(TypePath { qself: None, path }) if self.leaker.is_context_free_path(path)
+        );
+        if !is_const_param_ty(&i.ty) && !is_context_free_path {
+            self.error = Some(quote!(#{&i.ty}));
+            return;
+        }
+        if let Some(expr) = &i.default {
+            self.visit_expr(expr);
+        }
+    }
+
     fn visit_trait_bound(&mut self, i: &TraitBound) {
         // Trait bounds with a non-absolute path
-        if i.path.leading_colon.is_none()
-            && !matches!(
-                i.path.segments.iter().next(),
-                Some(PathSegment {
-                    ident,
-                    arguments: PathArguments::None,
-                }) if ident.to_string() == "$crate"
-            )
-            && !self.leaker.allowed_paths.iter().any(|allowed| {
-                allowed.leading_colon == i.path.leading_colon
-                    && allowed.segments.len() <= i.path.segments.len()
-                    && allowed.segments.iter().zip(i.path.segments.iter()).all(
-                        |(allowed_seg, seg)| {
-                            allowed_seg.arguments == seg.arguments
-                                && allowed_seg.ident.to_string() == seg.ident.to_string()
-                        },
-                    )
-            })
-        {
+        if !self.leaker.is_context_free_path(&i.path) {
             self.error = Some(quote!(#i));
             return;
         }
@@ -315,11 +889,25 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     }
 
     fn visit_expr_path(&mut self, i: &ExprPath) {
-        if i.path.leading_colon.is_none() {
+        // Values starting with a generic parameter in scope (e.g. `N` or `T::N` where
+        // `const N: usize` or `T` is a generic parameter) or `Self` do not depend on the type
+        // context.
+        let starts_with_generic = i.qself.is_none()
+            && i.path.leading_colon.is_none()
+            && i.path.segments.first().map_or(false, |seg| {
+                seg.arguments.is_none()
+                    && ((seg.ident == "Self" && self.leaker.self_ty_can_be_interned)
+                        || self.generics.params.iter().any(|gp| match gp {
+                            GenericParam::Type(TypeParam { ident, .. })
+                            | GenericParam::Const(ConstParam { ident, .. }) => ident == &seg.ident,
+                            _ => false,
+                        }))
+            });
+        if starts_with_generic || self.leaker.is_context_free_path(&i.path) {
+            syn::visit::visit_expr_path(self, i)
+        } else {
             // Value or trait bounds with a relative path
             self.error = Some(quote!(#i));
-        } else {
-            syn::visit::visit_expr_path(self, i)
         }
     }
 }
@@ -398,6 +986,7 @@ impl Leaker {
             self_ty_can_be_interned: true,
             reachable_types: HashSet::new(),
             pending_operations: None,
+            local_generics: HashMap::new(),
         }
     }
 
@@ -409,7 +998,31 @@ impl Leaker {
             self_ty_can_be_interned: config.self_ty_can_be_interned,
             reachable_types: HashSet::new(),
             pending_operations: None,
+            local_generics: HashMap::new(),
         }
+    }
+
+    /// Returns `true` if `path` does not depend on the type context, i.e. it is absolute, starts
+    /// with `$crate`, or starts with one of [`Leaker::allowed_paths`].
+    fn is_context_free_path(&self, path: &Path) -> bool {
+        path.leading_colon.is_some()
+            || matches!(
+                path.segments.iter().next(),
+                Some(PathSegment {
+                    ident,
+                    arguments: PathArguments::None,
+                }) if ident.to_string() == "$crate"
+            )
+            || self.allowed_paths.iter().any(|allowed| {
+                allowed.leading_colon == path.leading_colon
+                    && allowed.segments.len() <= path.segments.len()
+                    && allowed.segments.iter().zip(path.segments.iter()).all(
+                        |(allowed_seg, seg)| {
+                            allowed_seg.arguments == seg.arguments
+                                && allowed_seg.ident.to_string() == seg.ident.to_string()
+                        },
+                    )
+            })
     }
 
     /// Apply collected graph operations using `scope_mut()`.
@@ -419,7 +1032,9 @@ impl Leaker {
         }
 
         // Store operations for proper graph reduction in reduce_roots()
-        self.pending_operations = Some(operations);
+        self.pending_operations
+            .get_or_insert_with(Vec::new)
+            .extend(operations);
     }
 
     /// Intern AST elements using a visitor callback.
@@ -436,6 +1051,8 @@ impl Leaker {
             parent: None,
             error: None,
             generics: generics.clone(),
+            n_outer_generics: generics.params.len(),
+            local_predicates: Vec::new(),
             operations: Vec::new(),
         };
         f(&mut visitor);
@@ -443,6 +1060,26 @@ impl Leaker {
             Err(NotInternableError(e))
         } else {
             let operations = visitor.operations;
+            for operation in &operations {
+                if operation.local_generics.params.is_empty() {
+                    continue;
+                }
+                match self.local_generics.get(&operation.node_type) {
+                    Some(existing) if existing != &operation.local_generics => {
+                        // The same type depends on different local generics (e.g. `Wrap<B>` in
+                        // `fn f<const B: bool>` and `fn g<const B: u8>`).
+                        let ty = &operation.node_type;
+                        return Err(NotInternableError(quote!(#ty)));
+                    }
+                    Some(_) => (),
+                    None => {
+                        self.local_generics.insert(
+                            operation.node_type.clone(),
+                            operation.local_generics.clone(),
+                        );
+                    }
+                }
+            }
             self.apply_operations(operations);
             Ok(self)
         }
@@ -703,13 +1340,22 @@ impl Leaker {
     /// Finish building the [`Leaker`] and convert it into [`Referrer`].
     pub fn finish(self) -> Referrer {
         // Use the reachable types computed by apply_operations
+        let local_generics_map = self.local_generics;
         let leak_types: Vec<_> = self.reachable_types.into_iter().collect();
         let map = leak_types
             .iter()
             .enumerate()
             .map(|(n, ty)| (ty.clone(), n))
             .collect();
-        Referrer { leak_types, map }
+        let local_generics = leak_types
+            .iter()
+            .map(|ty| local_generics_map.get(ty).cloned().unwrap_or_default())
+            .collect();
+        Referrer {
+            leak_types,
+            map,
+            local_generics,
+        }
     }
 
     /// Reduce nodes to decrease the cost of the [`Leaker`]'s implementation.
@@ -1045,6 +1691,7 @@ impl Leaker {
 pub struct Referrer {
     leak_types: Vec<Type>,
     map: HashMap<Type, usize>,
+    local_generics: Vec<Generics>,
 }
 
 impl Referrer {
@@ -1065,6 +1712,46 @@ impl Referrer {
     /// ```
     pub fn iter(&self) -> impl Iterator<Item = &Type> {
         self.leak_types.iter()
+    }
+
+    /// Returns the local generics which the `ix`-th type depends on, i.e. generics of a trait
+    /// method or a GAT which are not generics of the Leaker. It is empty for most types.
+    ///
+    /// A type such as `Wrap<B>` in `fn f<const B: bool>(&self) -> Wrap<B>` (where `Wrap` depends
+    /// on the type context) cannot be decomposed, so it is interned together with `B`. The
+    /// Repeater's implementation must then declare these generics and constrain them in its trait
+    /// arguments, e.g. with [`encode_generics_params_to_ty()`]. The Referrer declares the same
+    /// generics with the same names (as it copies the method's signature), so it can encode them
+    /// in the same way. Note that lifetimes must be declared before the other generics when
+    /// merging them with the Leaker's generics:
+    ///
+    /// ```ignore
+    /// // In the Leaker
+    /// for (ix, (ty, locals)) in referrer.iter_with_local_generics().enumerate() {
+    ///     let args = encode_generics_params_to_ty(&generics.params);
+    ///     let local_args = encode_generics_params_to_ty(&locals.params);
+    ///     let (_, _, local_where) = locals.split_for_impl();
+    ///     quote! {
+    ///         impl<#generics_params, #locals_params> Repeater<(#args, #local_args), #ix>
+    ///             for #marker_ty #local_where
+    ///         {
+    ///             type Type = #ty;
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// // In the Referrer
+    /// let local_args = encode_generics_params_to_ty(&referrer.local_generics(ix).params);
+    /// parse_quote!(<#marker_ty as Repeater<(#args, #local_args), #ix>>::Type)
+    /// ```
+    pub fn local_generics(&self, ix: usize) -> &Generics {
+        &self.local_generics[ix]
+    }
+
+    /// Returns an iterator over the types that need to be encoded, together with their local
+    /// generics. See [`Referrer::local_generics()`].
+    pub fn iter_with_local_generics(&self) -> impl Iterator<Item = (&Type, &Generics)> {
+        self.leak_types.iter().zip(self.local_generics.iter())
     }
 
     /// Converts this `Referrer` into a [`Visitor`] that can be used to transform AST nodes.
@@ -1138,6 +1825,15 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
 impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
     fn visit_type_mut(&mut self, i: &mut Type) {
         *i = self.0.expand(i.clone(), &mut *self.1.borrow_mut());
+    }
+    fn visit_const_param_mut(&mut self, i: &mut ConstParam) {
+        // The type of a const parameter cannot be a projection, so it is kept as is.
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        if let Some(expr) = &mut i.default {
+            self.visit_expr_mut(expr);
+        }
     }
     fn visit_item_struct_mut(&mut self, i: &mut ItemStruct) {
         for attr in i.attrs.iter_mut() {
@@ -1243,15 +1939,31 @@ impl Parse for Referrer {
     fn parse(input: parse::ParseStream) -> Result<Self> {
         let content: syn::parse::ParseBuffer<'_>;
         parenthesized!(content in input);
-        let leak_types: Vec<Type> = Punctuated::<Type, Token![,]>::parse_terminated(&content)?
-            .into_iter()
-            .collect();
+        // Each entry is either `Type` or `{ <local generics> where ..; Type }`.
+        let entries =
+            Punctuated::<(Generics, Type), Token![,]>::parse_terminated_with(&content, |input| {
+                if input.peek(token::Brace) {
+                    let content: syn::parse::ParseBuffer<'_>;
+                    braced!(content in input);
+                    let mut generics: Generics = content.parse()?;
+                    generics.where_clause = content.parse()?;
+                    content.parse::<Token![;]>()?;
+                    Ok((generics, content.parse()?))
+                } else {
+                    Ok((Generics::default(), input.parse()?))
+                }
+            })?;
+        let (local_generics, leak_types): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
         let map = leak_types
             .iter()
             .enumerate()
             .map(|(n, ty)| (ty.clone(), n))
             .collect();
-        Ok(Self { map, leak_types })
+        Ok(Self {
+            map,
+            leak_types,
+            local_generics,
+        })
     }
 }
 
@@ -1259,8 +1971,12 @@ impl ToTokens for Referrer {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
         tokens.extend(quote! {
             (
-                #(for item in &self.leak_types), {
-                    #item
+                #(for (item, generics) in self.leak_types.iter().zip(&self.local_generics)), {
+                    #(if generics.params.is_empty()) {
+                        #item
+                    } #(else) {
+                        { #generics #{&generics.where_clause}; #item }
+                    }
                 }
             )
         })
