@@ -21,3 +21,9 @@ type_leak_test_leaker::m::Defaults!(impl Defaults<u8> for Concrete => 0);
 type_leak_test_leaker::m::Defaults!(
     impl<const B: bool, const N: usize> Defaults<u16, N> for Generic<B, N> => 0
 );
+
+// Where clauses, typed receivers, argument patterns, HRTB, elided lifetimes and RPITIT.
+type_leak_test_leaker::m::Edge!(impl Edge<u8> for Concrete => 0);
+
+// A trait without generic arguments.
+type_leak_test_leaker::m::Plain!(impl Plain for Concrete => 0);

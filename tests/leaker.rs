@@ -92,3 +92,188 @@ fn test_intern() {
     leaker.reduce_roots();
     assert!(leaker.finish().is_empty());
 }
+
+// ── regressions ──────────────────────────────────────────────────────────────
+
+fn leak_struct(item: &ItemStruct) -> Result<Vec<String>> {
+    let mut config = type_leak::LeakerConfig::new();
+    config.allow_primitive().allow_std_prelude();
+    let mut leaker = Leaker::from_config(config);
+    leaker
+        .intern_with(&item.generics, |v| v.visit_item_struct(item))
+        .map_err(|e| Error::new(e.span(), e))?;
+    Ok(leaker
+        .finish()
+        .iter()
+        .map(|t| quote!(#t).to_string())
+        .collect())
+}
+
+fn leak_trait(item: &ItemTrait) -> Result<Vec<String>> {
+    let mut config = type_leak::LeakerConfig::new();
+    config.allow_primitive().allow_std_prelude();
+    let mut leaker = Leaker::from_config(config);
+    leaker
+        .intern_with(&item.generics, |v| v.visit_item_trait(item))
+        .map_err(|e| Error::new(e.span(), e))?;
+    Ok(leaker
+        .finish()
+        .iter()
+        .map(|t| quote!(#t).to_string())
+        .collect())
+}
+
+fn strings(tys: &[&str]) -> Vec<String> {
+    tys.iter()
+        .map(|s| {
+            let ty: Type = parse_str(s).unwrap();
+            quote!(#ty).to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn test_hrtb_lifetimes_are_not_leaked() {
+    // Lifetimes of `for<..>` binders are in scope inside them, not leaked.
+    let item: ItemStruct = parse_quote! {
+        struct S<T, F: for<'a> ::core::ops::Fn(&'a u8)>
+        where
+            for<'a> &'a T: ::core::iter::IntoIterator,
+        {
+            t: T,
+            f: F,
+            g: for<'a> fn(&'a u8),
+        }
+    };
+    assert_eq!(leak_struct(&item).unwrap(), Vec::<String>::new());
+
+    // Relative types inside them are leaked without the lifetimes.
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            fn f<F: for<'a> ::core::ops::Fn(&'a MyType)>(&self, f: F);
+        }
+    };
+    assert_eq!(leak_trait(&item).unwrap(), strings(&["MyType"]));
+}
+
+#[test]
+fn test_finish_reduces_and_accumulates() {
+    // `finish()` without `reduce_roots()`.
+    let item: ItemStruct = parse_quote!(
+        struct S {
+            a: A,
+        }
+    );
+    let leaker = Leaker::from_struct(&item).unwrap();
+    assert_eq!(leaker.finish().iter().count(), 1);
+
+    // Several `intern_with()` and `reduce_roots()` calls accumulate.
+    let s: ItemStruct = parse_quote!(
+        struct S {
+            a: A,
+        }
+    );
+    let u: ItemStruct = parse_quote!(
+        struct U {
+            b: B,
+        }
+    );
+    let mut leaker = Leaker::new();
+    leaker
+        .intern_with(&s.generics, |v| v.visit_item_struct(&s))
+        .unwrap();
+    leaker.reduce_roots();
+    leaker
+        .intern_with(&u.generics, |v| v.visit_item_struct(&u))
+        .unwrap();
+    leaker.reduce_roots();
+    let leaked: Vec<String> = leaker
+        .finish()
+        .iter()
+        .map(|t| quote!(#t).to_string())
+        .collect();
+    assert_eq!(leaked, strings(&["A", "B"]));
+}
+
+#[test]
+fn test_finish_order_is_deterministic() {
+    // Leaked types are ordered by their first appearance.
+    let item: ItemStruct = parse_quote! {
+        struct S { e: E, c: C, a: A, d: D, b: B, a2: A }
+    };
+    for _ in 0..8 {
+        assert_eq!(
+            leak_struct(&item).unwrap(),
+            strings(&["E", "C", "A", "D", "B"])
+        );
+    }
+}
+
+#[test]
+fn test_uninternable_types_are_decomposed() {
+    // An elided lifetime or `impl Trait` prevents interning the type as a whole, but its
+    // components are leaked.
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            fn f(&self, x: &MyType1) -> &MyType2;
+            fn g(&self) -> impl Iterator<Item = MyType3>;
+            fn h(&self, x: Box<dyn Fn(&MyType4)>);
+        }
+    };
+    assert_eq!(
+        leak_trait(&item).unwrap(),
+        strings(&["MyType1", "MyType2", "MyType3", "MyType4"])
+    );
+
+    // A relative path with an elided lifetime cannot be decomposed.
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            fn f(&self, x: MyType<'_>);
+        }
+    };
+    assert_eq!(
+        leak_trait(&item).unwrap_err().to_string(),
+        "use absolute path: 'MyType < '_ >'"
+    );
+}
+
+#[test]
+fn test_all_dyn_bounds_are_checked() {
+    // Both orders of the bounds are leaked as a whole.
+    let item: ItemStruct = parse_quote! {
+        struct S {
+            a: Box<dyn MyTrait + Send>,
+            b: Box<dyn Send + MyTrait>,
+        }
+    };
+    assert_eq!(
+        leak_struct(&item).unwrap(),
+        strings(&["Box<dyn MyTrait + Send>", "Box<dyn Send + MyTrait>"])
+    );
+}
+
+#[test]
+fn test_type_macros_are_leaked_whole() {
+    let item: ItemStruct = parse_quote! {
+        struct S {
+            a: my_ty!(),
+            b: ::k::ty!(MyType),
+        }
+    };
+    assert_eq!(
+        leak_struct(&item).unwrap(),
+        strings(&["my_ty!()", "::k::ty!(MyType)"])
+    );
+}
+
+#[test]
+fn test_trait_const_defaults_are_ignored() {
+    // Like method bodies, defaults of associated consts are not analyzed.
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            const X: usize = helper();
+            fn f(&self) { helper(); }
+        }
+    };
+    assert_eq!(leak_trait(&item).unwrap(), Vec::<String>::new());
+}

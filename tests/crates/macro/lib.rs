@@ -191,11 +191,12 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let encoded_params = slots
         .encode_generics_params_to_ty(params)
         .map_err(Error::from)?;
-    let outer_predicates = item_trait
+    let outer_predicates: Vec<WherePredicate> = item_trait
         .generics
         .where_clause
-        .as_ref()
-        .map(|wc| wc.predicates.clone());
+        .iter()
+        .flat_map(|wc| wc.predicates.iter().cloned())
+        .collect();
 
     let mut repeater_impls = TokenStream::new();
     for (ix, (ty, locals)) in referrer.iter_with_local_generics().enumerate() {
@@ -203,14 +204,18 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
             .encode_generics_params_to_ty(&locals.params)
             .map_err(Error::from)?;
         let impl_params = lifetimes_first(params.iter().chain(locals.params.iter()));
-        let local_predicates = locals.where_clause.as_ref().map(|wc| &wc.predicates);
+        let local_predicates: Vec<&WherePredicate> = locals
+            .where_clause
+            .iter()
+            .flat_map(|wc| wc.predicates.iter())
+            .collect();
         repeater_impls.extend(quote! {
             impl<#(#impl_params,)* __S: ?::core::marker::Sized>
                 #repeater<(#encoded_params, #encoded_locals), #id, #ix> for __S
             where
                 __S: #module::#trait_ident<#(#trait_args),*>,
-                #outer_predicates
-                #local_predicates
+                #(#outer_predicates,)*
+                #(#local_predicates,)*
             {
                 type Type = #ty;
             }
@@ -283,7 +288,17 @@ impl Parse for ImplementInput {
                 format!("expected `{}`", item_trait.ident),
             ));
         }
-        let trait_args = input.parse()?;
+        // `<..>` is optional for traits without generic parameters (then it is `<>`).
+        let trait_args = if input.peek(Token![<]) {
+            input.parse()?
+        } else {
+            AngleBracketedGenericArguments {
+                colon2_token: None,
+                lt_token: Default::default(),
+                args: Punctuated::new(),
+                gt_token: Default::default(),
+            }
+        };
         input.parse::<Token![for]>()?;
         let self_ty = input.parse()?;
         generics.where_clause = input.parse()?;
@@ -374,6 +389,45 @@ impl VisitMut for Resolve<'_> {
         }
         syn::visit_mut::visit_type_mut(self, i)
     }
+}
+
+/// Forwards the receiver of a method to the field `field`.
+fn forward_receiver(receiver: &Receiver, field: &Member) -> Result<TokenStream> {
+    let is_self = |ty: &Type| matches!(ty, Type::Path(TypePath { qself: None, path }) if path.is_ident("Self"));
+    let ty = receiver.ty.as_ref();
+    Ok(match ty {
+        // `self`, `mut self`, `&self`, `&mut self` (also with a lifetime)
+        _ if receiver.colon_token.is_none() => match &receiver.reference {
+            Some(_) if receiver.mutability.is_some() => quote!(&mut self.#field),
+            Some(_) => quote!(&self.#field),
+            None => quote!(self.#field),
+        },
+        // `self: Self`, `self: &Self`, `self: &mut Self`
+        _ if is_self(ty) => quote!(self.#field),
+        Type::Reference(TypeReference {
+            mutability, elem, ..
+        }) if is_self(elem) => match mutability {
+            Some(_) => quote!(&mut self.#field),
+            None => quote!(&self.#field),
+        },
+        // `self: Box<Self>`
+        Type::Path(TypePath { qself: None, path })
+            if path.segments.last().map_or(false, |seg| {
+                seg.ident == "Box"
+                    && matches!(&seg.arguments, PathArguments::AngleBracketed(args)
+                        if args.args.len() == 1
+                            && matches!(&args.args[0], GenericArgument::Type(t) if is_self(t)))
+            }) =>
+        {
+            quote!(::std::boxed::Box::new((*self).#field))
+        }
+        _ => {
+            return Err(Error::new(
+                ty.span(),
+                "this receiver type is not supported by this test macro",
+            ))
+        }
+    })
 }
 
 /// The Referrer side, invoked through the `macro_rules!` exported by `#[leak(..)]`.
@@ -507,15 +561,7 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
 
         // Forward to the field: `Trait::<args>::method::<generics>(&self.field, args..)`.
         let receiver = match sig.receiver() {
-            Some(Receiver {
-                reference: Some(_),
-                mutability: Some(_),
-                ..
-            }) => quote!(&mut self.#field),
-            Some(Receiver {
-                reference: Some(_), ..
-            }) => quote!(&self.#field),
-            Some(_) => quote!(self.#field),
+            Some(receiver) => forward_receiver(receiver, &field)?,
             None => {
                 return Err(Error::new(
                     sig.span(),
@@ -523,14 +569,15 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
                 ))
             }
         };
-        let arg_pats = sig
-            .inputs
-            .iter()
-            .filter_map(|input| match input {
-                FnArg::Typed(PatType { pat, .. }) => Some(pat.as_ref().clone()),
-                FnArg::Receiver(_) => None,
-            })
-            .collect::<Vec<_>>();
+        // The arguments may be patterns (e.g. `_` or `mut x`), so they are renamed.
+        let mut arg_pats = Vec::new();
+        for (n, input) in sig.inputs.iter_mut().enumerate() {
+            if let FnArg::Typed(PatType { pat, .. }) = input {
+                let ident = Ident::new(&format!("__arg{}", n), Span::call_site());
+                *pat = Box::new(parse_quote!(#ident));
+                arg_pats.push(ident);
+            }
+        }
         let turbofish: Vec<_> = sig
             .generics
             .params

@@ -91,10 +91,7 @@ fn test_check() {
         leaker.check(&parse_quote!(impl ::path::to::MyTrait), generics),
         Ok(CheckResult::MustNotIntern(_)) // impl Trait
     ));
-    assert!(matches!(
-        leaker.check(&parse_quote!(impl MyTrait), generics),
-        Err(_) // impl Trait and relative path
-    ));
+    assert!(leaker.check(&parse_quote!(impl MyTrait), generics).is_err()); // impl Trait and relative path
     assert!(matches!(
         leaker.check(&parse_quote!(dyn ::path::to::MyTrait), generics),
         Ok(CheckResult::Neutral)

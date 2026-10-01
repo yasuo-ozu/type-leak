@@ -74,14 +74,14 @@ fn test_repeater_slots() {
     ));
     assert_eq!(to_string(&ty), to_string(&expected));
 
-    // Arguments: a bare const `B`, a negative literal, an expression, an omitted lifetime, a
-    // skipped binding, and an omitted default referring to a preceding parameter (redundant
-    // braces are removed).
-    let args: AngleBracketedGenericArguments = parse_quote!(<u8, 3, 7, B, -5, Item = u8>);
+    // Arguments: a bare const `B`, a negative literal, a skipped binding, and an omitted default
+    // referring to a preceding parameter (redundant braces are removed).
+    let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8, 3, 7, B, -5, Item = u8>);
     let ty = slots
         .encode_generics_args_to_ty(&args.args, &generics.params)
         .unwrap();
     let expected: Type = parse_quote!((
+        &'static (),
         u8,
         [(); 3],
         *const dyn crate::Repeater<(), 7, 0, Type = ()>,
@@ -106,8 +106,18 @@ fn test_repeater_slots() {
     ));
     assert_eq!(to_string(&ty), to_string(&expected));
 
-    // Errors.
-    let args: AngleBracketedGenericArguments = parse_quote!(<u8>);
+    // Errors: a missing lifetime, an extra lifetime, a missing argument without a default.
+    let args: AngleBracketedGenericArguments = parse_quote!(<u8, 3, 7, B, -5>);
+    let err = slots
+        .encode_generics_args_to_ty(&args.args, &generics.params)
+        .unwrap_err();
+    assert_eq!(err.to_string(), "missing generic argument for ''a'");
+    let args: AngleBracketedGenericArguments = parse_quote!(<'static, 'static, u8, 3, 7, B, -5>);
+    let err = slots
+        .encode_generics_args_to_ty(&args.args, &generics.params)
+        .unwrap_err();
+    assert_eq!(err.to_string(), "unexpected generic argument: ''static'");
+    let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8>);
     let err = slots
         .encode_generics_args_to_ty(&args.args, &generics.params)
         .unwrap_err();
@@ -134,4 +144,74 @@ fn test_repeater_slots() {
         .encode_generics_params_to_ty(&generics.params)
         .unwrap();
     assert_eq!(to_string(&ty), to_string(&parse_quote!((T,))));
+}
+
+#[test]
+fn test_const_args_are_braced_when_needed() {
+    use type_leak::*;
+    let to_string = |ty: &Type| quote!(#ty).to_string();
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+
+    // A multi-segment path (written with or without braces) must be braced to be parsed as a
+    // const argument; a literal or a single identifier is not.
+    let i32_ty: Type = parse_quote!(i32);
+    for (value, expected) in [
+        (quote!(i32::MIN), quote!({ i32::MIN })),
+        (quote!({ i32::MIN }), quote!({ i32::MIN })),
+        (quote!({ m::FOO }), quote!({ m::FOO })),
+        (quote!({ FOO }), quote!(FOO)),
+        (quote!(-3), quote!(-3)),
+    ] {
+        let ty = slots
+            .encode_const(&parse2(value).unwrap(), &i32_ty)
+            .unwrap();
+        let expected: Type = parse_quote! {
+            *const dyn crate::Repeater<(), 0, 0, false, '\0', 0, 0, 0, 0, 0, 0, #expected, Type = ()>
+        };
+        assert_eq!(to_string(&ty), to_string(&expected));
+    }
+    let u64_ty: Type = parse_quote!(u64);
+    let ty = slots
+        .encode_const(&parse_quote!({ m::FOO }), &u64_ty)
+        .unwrap();
+    let expected: Type = parse_quote!(*const dyn crate::Repeater<(), { m::FOO }, 0, Type = ()>);
+    assert_eq!(to_string(&ty), to_string(&expected));
+
+    // The braces are also kept for the callback of `encode_generics_args_to_ty_with()`.
+    let args: AngleBracketedGenericArguments = parse_quote!(<{ i32::MIN }, { N }>);
+    let ty = encode_generics_args_to_ty_with(
+        &args.args,
+        None,
+        |expr, _| parse_quote!(::my_crate::ConstI32<#expr>),
+    );
+    let expected: Type =
+        parse_quote!((::my_crate::ConstI32<{ i32::MIN }>, ::my_crate::ConstI32<N>));
+    assert_eq!(to_string(&ty), to_string(&expected));
+}
+
+#[test]
+fn test_defaults_substitute_const_type_arguments() {
+    use type_leak::*;
+    let to_string = |ty: &Type| quote!(#ty).to_string();
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    // `N` in `IntoIter<u8, N>` is parsed as a type argument.
+    let generics: Generics = parse_quote!(<const N: usize, U = ::core::array::IntoIter<u8, N>>);
+    let args: AngleBracketedGenericArguments = parse_quote!(<3>);
+    let ty = slots
+        .encode_generics_args_to_ty(&args.args, &generics.params)
+        .unwrap();
+    let expected: Type = parse_quote!(([(); 3], ::core::array::IntoIter<u8, 3>));
+    assert_eq!(to_string(&ty), to_string(&expected));
+}
+
+#[test]
+fn test_encode_generics_params_to_ty_with() {
+    use type_leak::*;
+    let generics: Generics = parse_quote!(<'a, T, const B: bool>);
+    let ty = encode_generics_params_to_ty_with(
+        &generics.params,
+        |ConstParam { ident, .. }| parse_quote!(::my_crate::ConstBool<#ident>),
+    );
+    let expected: Type = parse_quote!((&'a (), T, ::my_crate::ConstBool<B>));
+    assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
 }

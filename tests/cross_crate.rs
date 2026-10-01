@@ -6,7 +6,7 @@
 //! - `tests/crates/referrer`: the Referrer's crate, implementing the traits for wrappers which
 //!   forward to `Inner`.
 
-use type_leak_test_leaker::m::{Consts, Defaults, Holder, Inner};
+use type_leak_test_leaker::m::{Consts, Defaults, Edge, Holder, Inner, Plain, RelType};
 use type_leak_test_referrer::{Concrete, Generic};
 
 #[test]
@@ -55,4 +55,22 @@ fn omitted_default_args() {
     let g = Generic::<false, 5>(Inner);
     assert_eq!(g.default_array().len(), 5);
     assert!(g.default_flag().get());
+}
+
+#[test]
+fn edge_cases() {
+    let c = Concrete(Inner);
+    let pair = Edge::<u8>::e_where(&c, 7u8);
+    assert_eq!((pair.0, pair.1), (7, 7));
+    assert_eq!(Edge::<u8>::e_where_rel(&c, 9u32), 9);
+    assert_eq!(Edge::<u8>::e_ref(&c).0, 2);
+    assert_eq!(Edge::<u8>::e_pat(&c, RelType(0), 4), 5);
+    assert_eq!(Edge::<u8>::e_hrtb(&c, |r: &RelType| r.0 * 10), 30);
+    assert_eq!(Edge::<u8>::e_elided(&c, &RelType(6)), 6);
+    assert_eq!(
+        Edge::<u8>::e_impl(&c).map(|r| r.0).collect::<Vec<_>>(),
+        vec![4]
+    );
+    assert_eq!(Edge::<u8>::e_box(Box::new(Concrete(Inner))).0, 1);
+    assert_eq!(c.p().0, 5);
 }

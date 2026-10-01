@@ -62,9 +62,95 @@ pub mod m {
         fn default_flag(&self) -> Flag<B>;
     }
 
-    /// Implements [`Consts`] and [`Defaults`] for any arguments; the Referrer's wrappers forward
-    /// to it.
+    pub struct Pair<V>(pub V, pub V);
+
+    /// Where clauses, typed receivers, argument patterns, HRTB, elided lifetimes and RPITIT.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::m,
+    )]
+    pub trait Edge<T>
+    where
+        T: ::core::clone::Clone,
+    {
+        /// Outer and local where predicates.
+        fn e_where<V>(&self, v: V) -> Pair<V>
+        where
+            V: ::core::marker::Copy;
+        /// A leaked type in a where clause.
+        fn e_where_rel<U>(&self, u: U) -> u32
+        where
+            U: ::core::convert::Into<RelType>;
+        fn e_box(self: Box<Self>) -> RelType;
+        fn e_ref(self: &Self) -> RelType;
+        /// Argument patterns.
+        fn e_pat(&self, _: RelType, mut x: u32) -> u32 {
+            x += 1;
+            x
+        }
+        /// A higher-ranked lifetime.
+        fn e_hrtb<F: for<'a> ::core::ops::Fn(&'a RelType) -> u32>(&self, f: F) -> u32;
+        /// An elided lifetime.
+        fn e_elided(&self, x: &RelType) -> u32;
+        /// A return type `impl Trait`.
+        fn e_impl(&self) -> impl ::core::iter::Iterator<Item = RelType>;
+    }
+
+    /// A trait without generic parameters.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::m,
+    )]
+    pub trait Plain {
+        fn p(&self) -> RelType;
+    }
+
+    /// Implements the traits above for any arguments; the Referrer's wrappers forward to it.
     pub struct Inner;
+
+    impl<T: ::core::clone::Clone> Edge<T> for Inner {
+        fn e_where<V>(&self, v: V) -> Pair<V>
+        where
+            V: ::core::marker::Copy,
+        {
+            Pair(v, v)
+        }
+        fn e_where_rel<U>(&self, u: U) -> u32
+        where
+            U: ::core::convert::Into<RelType>,
+        {
+            u.into().0
+        }
+        fn e_box(self: Box<Self>) -> RelType {
+            RelType(1)
+        }
+        fn e_ref(self: &Self) -> RelType {
+            RelType(2)
+        }
+        fn e_hrtb<F: for<'a> ::core::ops::Fn(&'a RelType) -> u32>(&self, f: F) -> u32 {
+            f(&RelType(3))
+        }
+        fn e_elided(&self, x: &RelType) -> u32 {
+            x.0
+        }
+        fn e_impl(&self) -> impl ::core::iter::Iterator<Item = RelType> {
+            ::core::iter::once(RelType(4))
+        }
+    }
+
+    impl Plain for Inner {
+        fn p(&self) -> RelType {
+            RelType(5)
+        }
+    }
+
+    impl From<u32> for RelType {
+        fn from(n: u32) -> Self {
+            RelType(n)
+        }
+    }
 
     impl<T, const N: usize, const B: bool> Defaults<T, N, B> for Inner {
         fn default_array(&self) -> [RelType; N] {

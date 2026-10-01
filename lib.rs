@@ -1,9 +1,6 @@
 #![doc = include_str!("./README.md")]
 
 use proc_macro2::{Span, TokenStream};
-use safegraph::graph::edge::Endpoints;
-use safegraph::graph::Graph;
-use safegraph::VecGraph;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -109,11 +106,13 @@ impl LeakerConfig {
 
 /// The entry point of this crate.
 pub struct Leaker {
-    graph: VecGraph<Type, ()>,
     pub allowed_paths: Vec<Path>,
     pub self_ty_can_be_interned: bool,
-    reachable_types: HashSet<Type>,
-    pending_operations: Option<Vec<GraphOperation>>,
+    /// All the operations collected by [`Leaker::intern_with()`].
+    operations: Vec<GraphOperation>,
+    /// The types to be interned, computed from `operations` by [`Leaker::reduce_roots()`] (`None`
+    /// if not computed yet, or outdated).
+    reachable_types: Option<Vec<Type>>,
     local_generics: HashMap<Type, Generics>,
     /// Types interned without local generics, to detect conflicts with `local_generics`.
     plain_types: HashSet<Type>,
@@ -130,7 +129,7 @@ pub struct NotInternableError(pub TokenStream);
 
 impl std::fmt::Display for NotInternableError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "use absolute path: '{}'", &self.0)
+        write!(f, "use absolute path: '{}'", self.0)
     }
 }
 
@@ -305,7 +304,8 @@ pub fn encode_generics_args_to_ty<'a>(iter: impl IntoIterator<Item = &'a Generic
 /// Encode [`GenericArgument`]s to a type, using `const_fn` to encode const arguments.
 ///
 /// If `params` is given, its type and const parameters are matched against the type and const
-/// arguments of `iter` by position. A type argument that
+/// arguments of `iter` by position (omitted arguments are not filled with the parameters'
+/// defaults; [`RepeaterSlots::encode_generics_args_to_ty()`] does). A type argument that
 /// corresponds to a [`ConstParam`] and consists only of a single identifier (e.g. `N` in
 /// `MyTrait<N>`) is then treated as a const argument. `const_fn` receives each const argument
 /// together with its corresponding [`ConstParam`] (if known), and must return the same type as the
@@ -358,7 +358,9 @@ pub fn encode_generics_args_to_ty_with<'a, 'b>(
                     (GenericArgument::Lifetime(lifetime), _) => {
                         parse_quote!(& #lifetime ())
                     }
-                    (GenericArgument::Const(expr), _) => const_fn(unwrap_block(expr), const_param),
+                    (GenericArgument::Const(expr), _) => {
+                        const_fn(&normalize_const_arg(expr), const_param)
+                    }
                     (
                         GenericArgument::Type(Type::Path(TypePath { qself: None, path })),
                         Some(cp),
@@ -430,11 +432,28 @@ fn path_starts_with(path: &Path, prefix: &Path) -> bool {
             .segments
             .iter()
             .zip(path.segments.iter())
-            .all(|(prefix_seg, seg)| prefix_seg.ident.to_string() == seg.ident.to_string())
+            .all(|(prefix_seg, seg)| prefix_seg.ident == seg.ident)
 }
 
 /// Returns `true` if `ty` refers to any of `generics`.
 fn mentions_generics<'a>(ty: &Type, generics: impl IntoIterator<Item = &'a GenericParam>) -> bool {
+    let mut idents = Vec::new();
+    let mut lifetimes = Vec::new();
+    for gp in generics {
+        match gp {
+            GenericParam::Type(TypeParam { ident, .. })
+            | GenericParam::Const(ConstParam { ident, .. }) => idents.push(ident.clone()),
+            GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
+                lifetimes.push(lifetime.clone())
+            }
+        }
+    }
+    mentions_names(ty, idents, lifetimes)
+}
+
+/// Returns `true` if `ty` refers to any of `idents` (as the first segment of a relative path) or
+/// `lifetimes`.
+fn mentions_names(ty: &Type, idents: Vec<Ident>, lifetimes: Vec<Lifetime>) -> bool {
     struct Visitor {
         idents: Vec<Ident>,
         lifetimes: Vec<Lifetime>,
@@ -456,21 +475,29 @@ fn mentions_generics<'a>(ty: &Type, generics: impl IntoIterator<Item = &'a Gener
                 self.found = true;
             }
         }
-    }
-    let mut visitor = Visitor {
-        idents: Vec::new(),
-        lifetimes: Vec::new(),
-        found: false,
-    };
-    for gp in generics {
-        match gp {
-            GenericParam::Type(TypeParam { ident, .. })
-            | GenericParam::Const(ConstParam { ident, .. }) => visitor.idents.push(ident.clone()),
-            GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
-                visitor.lifetimes.push(lifetime.clone())
+        fn visit_macro(&mut self, i: &'ast Macro) {
+            // The tokens of a macro are not parsed, so they are matched by name.
+            let mut names = HashSet::new();
+            token_names(i.tokens.clone(), &mut names);
+            if self
+                .idents
+                .iter()
+                .any(|ident| names.contains(&ident.to_string()))
+                || self
+                    .lifetimes
+                    .iter()
+                    .any(|lt| names.contains(&lt.to_string()))
+            {
+                self.found = true;
             }
+            syn::visit::visit_macro(self, i)
         }
     }
+    let mut visitor = Visitor {
+        idents,
+        lifetimes,
+        found: false,
+    };
     if visitor.idents.is_empty() && visitor.lifetimes.is_empty() {
         return false;
     }
@@ -593,6 +620,30 @@ fn required_local_generics(
     }
 }
 
+/// Normalizes a const argument: redundant braces are removed from a literal or a single
+/// identifier (e.g. `{ N }` -> `N`), and any other expression is braced (e.g. `i32::MIN` ->
+/// `{ i32::MIN }`), which is required where it could be parsed as a type.
+fn normalize_const_arg(expr: &Expr) -> Expr {
+    let inner = unwrap_block(expr);
+    let is_simple = match inner {
+        Expr::Lit(_) => true,
+        Expr::Path(ExprPath {
+            qself: None, path, ..
+        }) => path.get_ident().is_some(),
+        Expr::Unary(ExprUnary {
+            op: UnOp::Neg(_),
+            expr,
+            ..
+        }) => matches!(expr.as_ref(), Expr::Lit(_)),
+        _ => false,
+    };
+    if is_simple {
+        inner.clone()
+    } else {
+        parse_quote!({ #inner })
+    }
+}
+
 /// Removes redundant braces around a const argument, e.g. `{ N }` -> `N`.
 fn unwrap_block(expr: &Expr) -> &Expr {
     match expr {
@@ -693,10 +744,13 @@ const REPEATER_SLOTS: &[(&str, &str, &str)] = &[
 /// }
 /// ```
 ///
-/// The slots have defaults, so a Repeater used as `Repeater<T, ID, NTH>` works as before, and a
-/// Repeater without the slots can still be used with generics other than non-`usize`, non-`u64`
-/// const parameters. The user crate defines it once, e.g. by emitting this definition from a
+/// The slots have defaults, so a Repeater used as `Repeater<T, ID, NTH>` works as before. A
+/// Repeater without the slots also works with [`RepeaterSlots`] as long as all const parameters are
+/// `usize` or `u64`. The user crate defines it once, e.g. by emitting this definition from a
 /// macro.
+///
+/// The generated definition requires Rust 1.59 (defaults of const parameters) and the 2018 edition
+/// (paths starting with `::core`).
 ///
 /// ```
 /// # use type_leak::*;
@@ -727,6 +781,7 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
 
 /// Error returned by [`RepeaterSlots`] when generics cannot be encoded into a type.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum EncodeError {
     /// The type of a const parameter is not a primitive type (e.g. a type alias), so its slot
     /// cannot be chosen.
@@ -829,16 +884,7 @@ impl RepeaterSlots {
     pub fn encode_const(&self, value: &Expr, ty: &Type) -> std::result::Result<Type, EncodeError> {
         let prim = const_param_primitive(ty)
             .ok_or_else(|| EncodeError::UnsupportedConstType(Box::new(ty.clone())))?;
-        let value = unwrap_block(value);
-        let value: Expr = match value {
-            Expr::Lit(_) | Expr::Path(_) => value.clone(),
-            Expr::Unary(ExprUnary {
-                op: UnOp::Neg(_),
-                expr,
-                ..
-            }) if matches!(expr.as_ref(), Expr::Lit(_)) => value.clone(),
-            _ => parse_quote!({ #value }),
-        };
+        let value = normalize_const_arg(value);
         let repeater = &self.repeater;
         if prim == "usize" {
             return Ok(parse_quote!([(); #value]));
@@ -890,12 +936,16 @@ impl RepeaterSlots {
     /// The result is the same type as [`RepeaterSlots::encode_generics_params_to_ty()`] with
     /// `params` substituted by `iter`:
     ///
-    /// - Arguments are matched with parameters by position; lifetime arguments only with lifetime
-    ///   parameters, since they may be omitted (then they are not encoded).
+    /// - Arguments are matched with parameters by position (lifetime arguments with lifetime
+    ///   parameters, and the others with type and const parameters). Every lifetime parameter
+    ///   needs an argument (lifetimes cannot be elided in the trait of an `impl`).
     /// - A bare identifier corresponding to a const parameter (e.g. `N` in `MyTrait<N>`, parsed as
     ///   a type argument) is treated as a const argument.
     /// - Omitted type and const arguments take the parameters' defaults, in which the preceding
-    ///   parameters are substituted by their arguments.
+    ///   parameters are substituted by their arguments. The defaults are used as they are written,
+    ///   so they should not depend on the Leaker's type context (e.g. `= MY_CONST` or
+    ///   `= MyType<N>` would not resolve in the Referrer's context); otherwise the arguments
+    ///   should be given explicitly.
     /// - Associated item bindings and constraints (e.g. `Item = u8`) are skipped.
     ///
     /// Returns [`EncodeError`] if the type of a const parameter is not a primitive type, if there
@@ -910,7 +960,7 @@ impl RepeaterSlots {
         let mut other_args = Vec::new();
         for arg in iter {
             match arg {
-                GenericArgument::Lifetime(lifetime) => lifetime_args.push(lifetime),
+                GenericArgument::Lifetime(_) => lifetime_args.push(arg),
                 GenericArgument::Type(_) | GenericArgument::Const(_) => other_args.push(arg),
                 _ => (),
             }
@@ -923,9 +973,12 @@ impl RepeaterSlots {
         for param in params {
             match param {
                 GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
-                    if let Some(arg) = lifetime_args.next() {
-                        substitute.lifetimes.insert(lifetime.clone(), arg.clone());
-                        elems.push(parse_quote!(& #arg ()));
+                    match lifetime_args.next() {
+                        Some(GenericArgument::Lifetime(arg)) => {
+                            substitute.lifetimes.insert(lifetime.clone(), arg.clone());
+                            elems.push(parse_quote!(& #arg ()));
+                        }
+                        _ => return Err(EncodeError::MissingArgument(Box::new(param.clone()))),
                     }
                 }
                 GenericParam::Type(tp) => {
@@ -967,7 +1020,7 @@ impl RepeaterSlots {
                 }
             }
         }
-        if let Some(arg) = other_args.next() {
+        if let Some(arg) = lifetime_args.next().or_else(|| other_args.next()) {
             return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())));
         }
         Ok(Type::Tuple(TypeTuple {
@@ -1014,6 +1067,15 @@ impl syn::fold::Fold for SubstituteParams {
             }
         }
         syn::fold::fold_expr(self, expr)
+    }
+    fn fold_generic_argument(&mut self, arg: GenericArgument) -> GenericArgument {
+        // A bare const parameter is parsed as a type argument, e.g. `N` in `Foo<N>`.
+        if let GenericArgument::Type(Type::Path(TypePath { qself: None, path })) = &arg {
+            if let Some(value) = path.get_ident().and_then(|ident| self.consts.get(ident)) {
+                return GenericArgument::Const(normalize_const_arg(value));
+            }
+        }
+        syn::fold::fold_generic_argument(self, arg)
     }
     fn fold_lifetime(&mut self, lifetime: Lifetime) -> Lifetime {
         self.lifetimes.get(&lifetime).cloned().unwrap_or(lifetime)
@@ -1127,11 +1189,16 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             &self.generics.params.iter().collect::<Vec<_>>()[self.n_outer_generics..];
         let mentions_local = mentions_generics(i, local_generics.iter().copied());
         match self.leaker.check(i, &self.generics) {
-            Err((s, _)) => {
+            Err((s, _)) if self.has_relative_own_path(i) => {
                 // The type must be interned (because of `s`, which depends on the type context)
-                // but cannot be (e.g. it is `impl Trait`). Report `s`, which should be made
-                // absolute.
+                // but cannot be (e.g. `MyType<'_>`), and cannot be decomposed either. Report `s`,
+                // which should be made absolute.
                 self.error = Some(s);
+            }
+            Err(_) => {
+                // The type cannot be interned as a whole (e.g. `&MyType` with an elided lifetime,
+                // or `impl Iterator<Item = MyType>`), but its components can.
+                syn::visit::visit_type(self, i);
             }
             Ok(CheckResult::MustNotIntern(_)) => (),
             Ok(CheckResult::MustIntern(_)) if mentions_local => {
@@ -1207,7 +1274,28 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             self.error = Some(quote!(#i));
             return;
         }
-        syn::visit::visit_trait_bound(self, i)
+        self.with_bound_lifetimes(i.lifetimes.as_ref(), |v| {
+            syn::visit::visit_trait_bound(v, i)
+        })
+    }
+
+    fn visit_type_bare_fn(&mut self, i: &TypeBareFn) {
+        self.with_bound_lifetimes(i.lifetimes.as_ref(), |v| {
+            syn::visit::visit_type_bare_fn(v, i)
+        })
+    }
+
+    fn visit_predicate_type(&mut self, i: &PredicateType) {
+        self.with_bound_lifetimes(i.lifetimes.as_ref(), |v| {
+            syn::visit::visit_predicate_type(v, i)
+        })
+    }
+
+    fn visit_trait_item_const(&mut self, i: &TraitItemConst) {
+        // Like the bodies of methods, defaults of associated consts are not copied.
+        let mut i = i.clone();
+        i.default = None;
+        syn::visit::visit_trait_item_const(self, &i)
     }
 
     fn visit_expr_path(&mut self, i: &ExprPath) {
@@ -1230,6 +1318,56 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         } else {
             // Value or trait bounds with a relative path
             self.error = Some(quote!(#i));
+        }
+    }
+}
+
+impl AnalyzeVisitor<'_> {
+    /// Runs `f` with the lifetimes of a `for<..>` binder (e.g. `'a` in `for<'a> Fn(&'a T)`) in
+    /// scope. They are treated as local generics, which the Repeater's implementation cannot
+    /// refer to.
+    fn with_bound_lifetimes<R>(
+        &mut self,
+        lifetimes: Option<&BoundLifetimes>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let len = self.generics.params.len();
+        if let Some(lifetimes) = lifetimes {
+            self.generics
+                .params
+                .extend(lifetimes.lifetimes.iter().cloned());
+        }
+        let result = f(self);
+        while self.generics.params.len() > len {
+            self.generics.params.pop();
+        }
+        result
+    }
+
+    /// Returns `true` if `ty` is a path which depends on the type context itself (as opposed to
+    /// its components), so it cannot be decomposed.
+    fn has_relative_own_path(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Path(TypePath { qself: Some(_), .. }) => true,
+            Type::Path(TypePath { qself: None, path }) => {
+                let starts_with_generic = path.leading_colon.is_none()
+                    && path.segments.first().map_or(false, |seg| {
+                        seg.ident == "Self"
+                            || self.generics.params.iter().any(|gp| match gp {
+                                GenericParam::Type(TypeParam { ident, .. })
+                                | GenericParam::Const(ConstParam { ident, .. }) => {
+                                    ident == &seg.ident
+                                }
+                                _ => false,
+                            })
+                    });
+                !starts_with_generic && !self.leaker.is_context_free_path(path)
+            }
+            Type::Group(TypeGroup { elem, .. }) | Type::Paren(TypeParen { elem, .. }) => {
+                self.has_relative_own_path(elem)
+            }
+            Type::Macro(_) | Type::Verbatim(_) => true,
+            _ => false,
         }
     }
 }
@@ -1303,11 +1441,10 @@ impl Leaker {
     /// Initialize empty [`Leaker`] with no generics.
     pub fn new() -> Self {
         Self {
-            graph: VecGraph::default(),
             allowed_paths: Vec::new(),
             self_ty_can_be_interned: true,
-            reachable_types: HashSet::new(),
-            pending_operations: None,
+            operations: Vec::new(),
+            reachable_types: None,
             local_generics: HashMap::new(),
             plain_types: HashSet::new(),
         }
@@ -1316,11 +1453,10 @@ impl Leaker {
     /// Initialize [`Leaker`] from configuration.
     pub fn from_config(config: LeakerConfig) -> Self {
         Self {
-            graph: VecGraph::default(),
             allowed_paths: config.allowed_paths,
             self_ty_can_be_interned: config.self_ty_can_be_interned,
-            reachable_types: HashSet::new(),
-            pending_operations: None,
+            operations: Vec::new(),
+            reachable_types: None,
             local_generics: HashMap::new(),
             plain_types: HashSet::new(),
         }
@@ -1335,7 +1471,7 @@ impl Leaker {
                 Some(PathSegment {
                     ident,
                     arguments: PathArguments::None,
-                }) if ident.to_string() == "$crate"
+                }) if ident == "$crate"
             )
             || self
                 .allowed_paths
@@ -1343,16 +1479,14 @@ impl Leaker {
                 .any(|allowed| path_starts_with(path, allowed))
     }
 
-    /// Apply collected graph operations using `scope_mut()`.
+    /// Adds collected operations. The reduction is recomputed over all operations (including those
+    /// of previous calls of [`Leaker::intern_with()`]).
     fn apply_operations(&mut self, operations: Vec<GraphOperation>) {
         if operations.is_empty() {
             return;
         }
-
-        // Store operations for proper graph reduction in reduce_roots()
-        self.pending_operations
-            .get_or_insert_with(Vec::new)
-            .extend(operations);
+        self.operations.extend(operations);
+        self.reachable_types = None;
     }
 
     /// Intern AST elements using a visitor callback.
@@ -1419,7 +1553,6 @@ impl Leaker {
         ty: &Type,
         generics: &Generics,
     ) -> std::result::Result<CheckResult, (TokenStream, TokenStream)> {
-        use syn::visit::Visit;
         #[derive(Clone)]
         struct Visitor {
             generic_lifetimes: Vec<Lifetime>,
@@ -1431,7 +1564,6 @@ impl Leaker {
         }
 
         const _: () = {
-            use syn::visit::Visit;
             impl<'a> Visit<'a> for Visitor {
                 fn visit_type(&mut self, i: &Type) {
                     match i {
@@ -1512,7 +1644,6 @@ impl Leaker {
                                             }
                                             _ => (),
                                         }
-                                        return;
                                     }
                                     TypeParamBound::Verbatim(_) => {
                                         self.impossible = Some(quote!(#bound));
@@ -1521,14 +1652,23 @@ impl Leaker {
                                     _ => (),
                                 }
                             }
+                            // All the bounds are checked (e.g. both `A` and `B` in `dyn A + B`).
+                            return;
                         }
-                        Type::ImplTrait(_) | Type::Macro(_) | Type::Verbatim(_) => {
+                        Type::Macro(_) => {
+                            // The tokens of a type macro cannot be analyzed, so it is interned as
+                            // a whole (it is expanded in the Leaker's context).
+                            match &self.must {
+                                Some((level, _)) if *level <= 0 => (),
+                                _ => self.must = Some((0, quote!(#i))),
+                            }
+                            return;
+                        }
+                        Type::ImplTrait(_) | Type::Verbatim(_) => {
                             self.impossible = Some(quote!(#i));
                         }
-                        Type::Reference(TypeReference { lifetime, .. }) => {
-                            if lifetime.is_none() {
-                                self.impossible = Some(quote!(#i));
-                            }
+                        Type::Reference(TypeReference { lifetime: None, .. }) => {
+                            self.impossible = Some(quote!(#i));
                         }
                         _ => (),
                     }
@@ -1596,7 +1736,7 @@ impl Leaker {
                                 Some(PathSegment {
                                     ident,
                                     arguments: PathArguments::None,
-                                }) if ident.to_string() == "$crate"
+                                }) if ident == "$crate"
                             )
                         {
                             // Same as allowed paths: the generic arguments are still checked.
@@ -1660,10 +1800,14 @@ impl Leaker {
     }
 
     /// Finish building the [`Leaker`] and convert it into [`Referrer`].
-    pub fn finish(self) -> Referrer {
-        // Use the reachable types computed by apply_operations
+    ///
+    /// The types are reduced by [`Leaker::reduce_roots()`] (called here if needed), and ordered
+    /// by their first appearance, so the result (including the index of each type) is
+    /// deterministic.
+    pub fn finish(mut self) -> Referrer {
+        self.reduce_roots();
         let local_generics_map = self.local_generics;
-        let leak_types: Vec<_> = self.reachable_types.into_iter().collect();
+        let leak_types: Vec<_> = self.reachable_types.unwrap_or_default();
         let map = leak_types
             .iter()
             .enumerate()
@@ -1716,21 +1860,20 @@ impl Leaker {
     ///
     /// ![after_graph](https://raw.github.com/yasuo-ozu/type-leak/master/resources/after_graph.svg)
     pub fn reduce_roots(&mut self) {
-        if let Some(operations) = self.pending_operations.take() {
-            self.build_graph_and_reduce(operations);
+        if self.reachable_types.is_none() {
+            self.reachable_types = Some(self.build_graph_and_reduce(&self.operations));
         }
-        self.reduce_unreachable_nodes();
-        self.reduce_obvious_nodes();
     }
 
-    fn build_graph_and_reduce(&mut self, operations: Vec<GraphOperation>) {
+    /// Returns the types to be interned, in the order of their first appearance in `operations`.
+    fn build_graph_and_reduce(&self, operations: &[GraphOperation]) -> Vec<Type> {
         // Build parent-child relationships from operations
         let mut children: HashMap<Type, Vec<Type>> = HashMap::new();
         let mut parents: HashMap<Type, Vec<Type>> = HashMap::new();
         let mut root_types = HashSet::new();
         let mut must_intern_types = HashSet::new();
 
-        for operation in &operations {
+        for operation in operations {
             if operation.is_root {
                 root_types.insert(operation.node_type.clone());
             }
@@ -1780,7 +1923,14 @@ impl Leaker {
             }
         }
 
-        self.reachable_types = kept_types;
+        // Order by the first appearance, for deterministic output.
+        let mut seen = HashSet::new();
+        operations
+            .iter()
+            .map(|operation| &operation.node_type)
+            .filter(|ty| kept_types.contains(*ty) && seen.insert((*ty).clone()))
+            .cloned()
+            .collect()
     }
 
     fn contains_must_intern_descendant(
@@ -1859,150 +2009,6 @@ impl Leaker {
 
         false
     }
-
-    fn reduce_obvious_nodes(&mut self) {
-        // Remove intermediate nodes that have exactly one parent and one child
-        // This step eliminates unnecessary intermediate types
-    }
-
-    fn reduce_unreachable_nodes(&mut self) {
-        if let Some(operations) = self.pending_operations.take() {
-            self.apply_vecgraph_reduction(operations);
-        }
-    }
-
-    fn apply_vecgraph_reduction(&mut self, operations: Vec<GraphOperation>) {
-        let mut root_types = HashSet::new();
-        let mut must_intern_types = HashSet::new();
-
-        // Collect graph operations
-        for operation in &operations {
-            if operation.is_root {
-                root_types.insert(operation.node_type.clone());
-            }
-            if operation.is_must_intern {
-                must_intern_types.insert(operation.node_type.clone());
-            }
-        }
-
-        // Build the graph using scope_mut
-        self.graph.scope_mut(|mut ctx| {
-            let mut type_to_node = HashMap::new();
-
-            // Add all nodes first
-            for operation in &operations {
-                if !type_to_node.contains_key(&operation.node_type) {
-                    let node_tag = ctx.insert_node(operation.node_type.clone()).unwrap();
-                    type_to_node.insert(operation.node_type.clone(), node_tag);
-                }
-
-                if let Some(parent_type) = &operation.parent {
-                    if !type_to_node.contains_key(parent_type) {
-                        let parent_node_tag = ctx.insert_node(parent_type.clone()).unwrap();
-                        type_to_node.insert(parent_type.clone(), parent_node_tag);
-                    }
-                }
-            }
-
-            // Add edges between nodes
-            for operation in &operations {
-                if let Some(parent_type) = &operation.parent {
-                    let parent_node = type_to_node[parent_type];
-                    let child_node = type_to_node[&operation.node_type];
-                    let ep =
-                        <_ as Endpoints>::try_from_node_indices([parent_node, child_node]).unwrap();
-                    ctx.insert_edge((), ep).unwrap();
-                }
-            }
-        });
-
-        // Perform analysis using the same logic as build_graph_and_reduce
-        self.reachable_types =
-            self.analyze_reachable_types(&root_types, &must_intern_types, &operations);
-    }
-
-    fn analyze_reachable_types(
-        &self,
-        root_types: &HashSet<Type>,
-        must_intern_types: &HashSet<Type>,
-        operations: &[GraphOperation],
-    ) -> HashSet<Type> {
-        // Implement the same logic as build_graph_and_reduce
-        let mut final_types = HashSet::new();
-
-        // Keep must-intern root types
-        for root_type in root_types {
-            if must_intern_types.contains(root_type) {
-                final_types.insert(root_type.clone());
-            }
-        }
-
-        // Keep root types that contain must-intern descendants
-        for root_type in root_types {
-            if !final_types.contains(root_type)
-                && self.contains_must_intern_in_tree(root_type, operations, must_intern_types)
-            {
-                final_types.insert(root_type.clone());
-            }
-        }
-
-        // Only keep must-intern types that aren't subcomponents of kept root types
-        for must_intern_type in must_intern_types {
-            if !self.is_subcomponent_of_kept_root(must_intern_type, &final_types, operations) {
-                final_types.insert(must_intern_type.clone());
-            }
-        }
-
-        final_types
-    }
-
-    fn contains_must_intern_in_tree(
-        &self,
-        root: &Type,
-        operations: &[GraphOperation],
-        must_intern_types: &HashSet<Type>,
-    ) -> bool {
-        let mut stack = vec![root.clone()];
-        let mut visited = HashSet::new();
-
-        while let Some(current) = stack.pop() {
-            if !visited.insert(current.clone()) {
-                continue;
-            }
-
-            if must_intern_types.contains(&current) {
-                return true;
-            }
-
-            for operation in operations {
-                if let Some(parent_type) = &operation.parent {
-                    if parent_type == &current && !visited.contains(&operation.node_type) {
-                        stack.push(operation.node_type.clone());
-                    }
-                }
-            }
-        }
-
-        false
-    }
-
-    fn is_subcomponent_of_kept_root(
-        &self,
-        target: &Type,
-        kept_roots: &HashSet<Type>,
-        operations: &[GraphOperation],
-    ) -> bool {
-        for root in kept_roots {
-            if self.contains_must_intern_in_tree(root, operations, &HashSet::from([target.clone()]))
-                && root != target
-            {
-                return true;
-            }
-        }
-        false
-    }
-
-    // TODO: Reimplement reduce_unreachable_nodes with VecGraph APIs
 }
 
 /// Holds the list of types that need to be encoded, as produced by [`Leaker::finish()`].
@@ -2056,23 +2062,27 @@ impl Referrer {
     ///
     ///
     /// ```ignore
-    /// // In the Leaker
+    /// // In the Leaker (`MyTrait` is the Leaker trait with `generics`)
     /// for (ix, (ty, locals)) in referrer.iter_with_local_generics().enumerate() {
     ///     let args = encode_generics_params_to_ty(&generics.params);
     ///     let local_args = encode_generics_params_to_ty(&locals.params);
-    ///     let (_, _, local_where) = locals.split_for_impl();
+    ///     let local_where = locals.where_clause.iter().flat_map(|wc| wc.predicates.iter());
     ///     quote! {
-    ///         impl<#generics_params, #locals_params> Repeater<(#args, #local_args), #ix>
-    ///             for #marker_ty #local_where
+    ///         impl<#generics_params, #locals_params, S: ?Sized>
+    ///             Repeater<(#args, #local_args), #ID, #ix> for S
+    ///         where
+    ///             S: MyTrait<#generics_args>,
+    ///             #(#local_where,)*
     ///         {
     ///             type Type = #ty;
     ///         }
     ///     }
     /// }
     ///
-    /// // In the Referrer
+    /// // In the Referrer (in the implementation of `MyTrait<#trait_args>`)
+    /// let args = encode_generics_args_to_ty(&trait_args);
     /// let local_args = encode_generics_params_to_ty(&referrer.local_generics(ix).params);
-    /// parse_quote!(<#marker_ty as Repeater<(#args, #local_args), #ix>>::Type)
+    /// parse_quote!(<Self as Repeater<(#args, #local_args), #ID, #ix>>::Type)
     /// ```
     pub fn local_generics(&self, ix: usize) -> &Generics {
         &self.local_generics[ix]
@@ -2131,13 +2141,92 @@ impl<F> Clone for Visitor<F> {
 }
 
 impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
+    /// Stops rewriting the leaked types which mention the generic parameters declared here (they
+    /// refer to these parameters rather than to the Leaker's items), unless the leaked type was
+    /// interned together with local generics of the same name (see
+    /// [`Referrer::local_generics()`]).
+    fn shadow_generics(&mut self, generics: &Generics) {
+        let referrer = &self.0;
+        let shadowed: Vec<Type> = referrer
+            .map
+            .iter()
+            .filter(|(ty, ix)| {
+                let locals = &referrer.local_generics[**ix];
+                let params = generics.params.iter().filter(|gp| {
+                    !locals
+                        .params
+                        .iter()
+                        .any(|local| generic_param_name(local) == generic_param_name(gp))
+                });
+                mentions_generics(ty, params)
+            })
+            .map(|(ty, _)| ty.clone())
+            .collect();
+        for ty in shadowed {
+            self.0.map.remove(&ty);
+        }
+    }
+
+    /// Stops rewriting the leaked types which mention `idents` (items or imports declared in a
+    /// block or a module).
+    fn shadow_idents(&mut self, idents: Vec<Ident>) {
+        let shadowed: Vec<Type> = self
+            .0
+            .map
+            .keys()
+            .filter(|ty| mentions_names(ty, idents.clone(), Vec::new()))
+            .cloned()
+            .collect();
+        for ty in shadowed {
+            self.0.map.remove(&ty);
+        }
+    }
+
+    /// Shadows the items declared in `items`.
+    fn shadow_items<'a>(&mut self, items: impl IntoIterator<Item = &'a Item>) {
+        fn use_names(tree: &UseTree, names: &mut Vec<Ident>) {
+            match tree {
+                UseTree::Path(UsePath { tree, .. }) => use_names(tree, names),
+                UseTree::Name(UseName { ident }) if ident != "self" => names.push(ident.clone()),
+                UseTree::Rename(UseRename { rename, .. }) => names.push(rename.clone()),
+                UseTree::Group(UseGroup { items, .. }) => {
+                    for tree in items {
+                        use_names(tree, names)
+                    }
+                }
+                _ => (),
+            }
+        }
+        let mut names = Vec::new();
+        for item in items {
+            match item {
+                Item::Struct(ItemStruct { ident, .. })
+                | Item::Enum(ItemEnum { ident, .. })
+                | Item::Union(ItemUnion { ident, .. })
+                | Item::Trait(ItemTrait { ident, .. })
+                | Item::TraitAlias(ItemTraitAlias { ident, .. })
+                | Item::Type(ItemType { ident, .. })
+                | Item::Const(ItemConst { ident, .. })
+                | Item::Static(ItemStatic { ident, .. })
+                | Item::Mod(ItemMod { ident, .. }) => names.push(ident.clone()),
+                Item::Use(ItemUse { tree, .. }) => use_names(tree, &mut names),
+                _ => (),
+            }
+        }
+        if !names.is_empty() {
+            self.shadow_idents(names);
+        }
+    }
+
     fn with_generics(&mut self, generics: &mut Generics) -> Self {
         let mut visitor = self.clone();
+        // All the parameters are in scope of each other's bounds.
+        visitor.shadow_generics(generics);
         for gp in generics.params.iter_mut() {
-            if let GenericParam::Type(TypeParam { ident, .. }) = gp {
-                visitor.0.map.remove(&parse_quote!(#ident));
-            }
             visitor.visit_generic_param_mut(gp);
+        }
+        if let Some(where_clause) = &mut generics.where_clause {
+            visitor.visit_where_clause_mut(where_clause);
         }
         visitor
     }
@@ -2207,6 +2296,48 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         let mut visitor = self.with_generics(&mut i.generics);
         visitor.visit_type_mut(&mut i.ty);
     }
+    fn visit_signature_mut(&mut self, i: &mut Signature) {
+        self.with_signature(i);
+    }
+    fn visit_item_impl_mut(&mut self, i: &mut ItemImpl) {
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        let mut visitor = self.with_generics(&mut i.generics);
+        if let Some((_, path, _)) = &mut i.trait_ {
+            visitor.visit_path_mut(path);
+        }
+        visitor.visit_type_mut(&mut i.self_ty);
+        for item in i.items.iter_mut() {
+            visitor.visit_impl_item_mut(item);
+        }
+    }
+    fn visit_impl_item_fn_mut(&mut self, i: &mut ImplItemFn) {
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        let mut visitor = self.with_signature(&mut i.sig);
+        visitor.visit_block_mut(&mut i.block);
+    }
+    fn visit_impl_item_type_mut(&mut self, i: &mut ImplItemType) {
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        let mut visitor = self.with_generics(&mut i.generics);
+        visitor.visit_type_mut(&mut i.ty);
+    }
+    fn visit_item_mod_mut(&mut self, i: &mut ItemMod) {
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        if let Some((_, items)) = &mut i.content {
+            let mut visitor = self.clone();
+            visitor.shadow_items(items.iter());
+            for item in items.iter_mut() {
+                visitor.visit_item_mut(item);
+            }
+        }
+    }
     fn visit_item_fn_mut(&mut self, i: &mut ItemFn) {
         for attr in i.attrs.iter_mut() {
             self.visit_attribute_mut(attr);
@@ -2247,18 +2378,10 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
     }
     fn visit_block_mut(&mut self, i: &mut Block) {
         let mut visitor = self.clone();
-        for stmt in &i.stmts {
-            match stmt {
-                Stmt::Item(Item::Struct(ItemStruct { ident, .. }))
-                | Stmt::Item(Item::Enum(ItemEnum { ident, .. }))
-                | Stmt::Item(Item::Union(ItemUnion { ident, .. }))
-                | Stmt::Item(Item::Trait(ItemTrait { ident, .. }))
-                | Stmt::Item(Item::Type(ItemType { ident, .. })) => {
-                    visitor.0.map.remove(&parse_quote!(#ident));
-                }
-                _ => (),
-            }
-        }
+        visitor.shadow_items(i.stmts.iter().filter_map(|stmt| match stmt {
+            Stmt::Item(item) => Some(item),
+            _ => None,
+        }));
         for stmt in i.stmts.iter_mut() {
             visitor.visit_stmt_mut(stmt);
         }

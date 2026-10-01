@@ -20,3 +20,36 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  msrv:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust 1.56 (the `rust-version` in Cargo.toml)
+      run: rustup toolchain install 1.56 --profile minimal
+    - name: Generate a lockfile compatible with Rust 1.56
+      run: CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo +stable generate-lockfile
+    - name: Build the library with Rust 1.56
+      run: cargo +1.56 build --lib --verbose
+
+  docs:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build docs
+      run: cargo doc --no-deps --verbose
+      env:
+        RUSTDOCFLAGS: -D warnings
+
+  clippy:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Run clippy
+      run: cargo clippy --all-targets -- -D warnings
