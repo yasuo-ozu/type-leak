@@ -1,5 +1,8 @@
 //! Tests for encoding generics into types (`encode_generics_*`, `RepeaterSlots`).
 
+// Some tests check the deprecated `encode_generics_args_to_ty()`.
+#![allow(deprecated)]
+
 use syn::*;
 use template_quote::quote;
 

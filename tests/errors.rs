@@ -2,8 +2,11 @@
 //!
 //! - `limit_*`: inputs which cannot be leaked on stable Rust. `type-leak` must reject them with
 //!   [`NotInternableError`].
-//! - `hole_*`: inputs which `type-leak` currently mishandles (a panic, or an output which does not
-//!   compile). These tests record the current behavior; update them when the hole is fixed.
+//! - `limit_*`, recording behavior: inputs which cannot be handled exactly without name resolution
+//!   (e.g. shadowed primitive names), and how they are detected.
+
+// Some tests check the deprecated `encode_generics_args_to_ty()`.
+#![allow(deprecated)]
 
 use syn::*;
 use template_quote::quote;
@@ -243,39 +246,57 @@ fn limit_plain_args_encoder_without_params() {
 // ── holes ────────────────────────────────────────────────────────────────────
 
 #[test]
-fn hole_bare_const_in_bound() {
-    // HOLE: a bare relative const in a trait bound is parsed as a type, and leaked as a type
-    // (generating `type Type = SIZE;`, which does not compile).
-    //
-    // syn cannot distinguish `SIZE` (a const) from a type without name resolution.
-    // Expected after fix: rejected with "use absolute path" like `{ SIZE }`
-    // (see `limit_const_in_bound`).
+fn limit_bare_const_in_bound() {
+    // A bare relative const in a trait bound (e.g. `SIZE` in `Sup<SIZE>`) is parsed as a type by
+    // syn. It cannot be leaked on its own (like `Sup<{ SIZE }>`, see `limit_const_in_bound`), so
+    // an identifier named like a const (`SCREAMING_SNAKE_CASE`) is rejected instead of being
+    // leaked as a type.
+    for item in [
+        parse2::<ItemTrait>(quote! {
+            pub trait MyTrait: crate::l::Sup<SIZE> {
+                fn f(&self);
+            }
+        })
+        .unwrap(),
+        parse2::<ItemTrait>(quote! {
+            pub trait MyTrait {
+                fn f<T: crate::l::Sup<SIZE>>(&self);
+            }
+        })
+        .unwrap(),
+    ] {
+        assert_eq!(
+            leak_trait(&item),
+            Err("use absolute path: 'SIZE'".to_string())
+        );
+    }
+
+    // A relative type named in `UpperCamelCase` is leaked as before.
     let item: ItemTrait = parse2(quote! {
-        pub trait MyTrait: crate::l::Sup<SIZE> {
+        pub trait MyTrait: crate::l::Sup<MyType> {
             fn f(&self);
         }
     })
     .unwrap();
-    assert_eq!(leak_trait(&item), Ok(vec!["SIZE".to_string()]));
+    assert_eq!(leak_trait(&item), Ok(vec!["MyType".to_string()]));
 
-    // The same applies to bounds of method-level generics.
+    // The suggested fix works.
     let item: ItemTrait = parse2(quote! {
-        pub trait MyTrait {
-            fn f<T: crate::l::Sup<SIZE>>(&self);
+        pub trait MyTrait: crate::l::Sup<{ ::my_crate::SIZE }> {
+            fn f(&self);
         }
     })
     .unwrap();
-    assert_eq!(leak_trait(&item), Ok(vec!["SIZE".to_string()]));
+    assert_eq!(leak_trait(&item), Ok(vec![]));
 }
 
 #[test]
-fn hole_shadowed_primitive() {
-    // HOLE: the type of a const parameter is recognized as a primitive only by its name, so a
-    // shadowed primitive name (e.g. `type u8 = i32;` in the Leaker's context) is accepted as
-    // context-free and copied as it is into the Referrer, where it means the real `u8`.
-    //
-    // Not fixable without name resolution; the Referrer's copy then has another type
-    // (`const M: u8` instead of `i32`), which fails to compile rather than resolving silently.
+fn limit_shadowed_primitive() {
+    // The type of a const parameter is recognized as a primitive only by its name, so a shadowed
+    // primitive name (e.g. `type u8 = i32;` in the Leaker's context) is accepted and copied as it
+    // is into the Referrer, where it means the real `u8`. This cannot be known without name
+    // resolution, so `Leaker::assertions()` checks it at compile time in the Leaker's context
+    // (it fails with "mismatched types" if the name is shadowed).
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait {
             fn f<const M: u8>(&self);
@@ -283,6 +304,19 @@ fn hole_shadowed_primitive() {
     })
     .unwrap();
     assert_eq!(leak_trait(&item), Ok(vec![]));
+
+    let leaker = Leaker::from_trait(&item).unwrap();
+    let expected = quote! {
+        #[allow(dead_code, non_snake_case)]
+        const _: () = {
+            fn __type_leak_assert_u8_is_primitive(x: &u8) -> &::core::primitive::u8 { x }
+        };
+    };
+    let (actual, expected): (Item, Item) = (
+        parse2(leaker.assertions()).unwrap(),
+        parse2(expected).unwrap(),
+    );
+    assert_eq!(quote!(#actual).to_string(), quote!(#expected).to_string());
 }
 
 // ── error messages ───────────────────────────────────────────────────────────

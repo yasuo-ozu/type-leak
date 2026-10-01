@@ -277,3 +277,47 @@ fn test_trait_const_defaults_are_ignored() {
     };
     assert_eq!(leak_trait(&item).unwrap(), Vec::<String>::new());
 }
+
+#[test]
+fn test_assertions_for_assumed_primitives() {
+    // Primitive names in const parameter types, and in types where they are allowed, are
+    // checked once each; absolute paths and leaked (not allowed) primitives are not.
+    let item: ItemTrait = parse_quote! {
+        trait Tr<const N: u8> {
+            fn f<const M: u8>(&self, x: u16) -> ::core::primitive::u32;
+        }
+    };
+    let mut config = type_leak::LeakerConfig::new();
+    config.allow_primitive();
+    let mut leaker = Leaker::from_config(config);
+    leaker
+        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
+        .unwrap();
+    let assertions = leaker.assertions().to_string();
+    assert!(assertions.contains("__type_leak_assert_u8_is_primitive"));
+    assert!(assertions.contains("__type_leak_assert_u16_is_primitive"));
+    assert!(!assertions.contains("__type_leak_assert_u32_is_primitive"));
+    assert_eq!(
+        assertions
+            .matches("__type_leak_assert_u8_is_primitive")
+            .count(),
+        1
+    );
+
+    // Without `allow_primitive()`, `u16` in a type is leaked, so it is not assumed.
+    let mut leaker = Leaker::new();
+    leaker
+        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
+        .unwrap();
+    let assertions = leaker.assertions().to_string();
+    assert!(assertions.contains("__type_leak_assert_u8_is_primitive"));
+    assert!(!assertions.contains("__type_leak_assert_u16_is_primitive"));
+
+    // No primitives, no items.
+    let item: ItemStruct = parse_quote!(
+        struct S<T> {
+            t: T,
+        }
+    );
+    assert!(Leaker::from_struct(&item).unwrap().assertions().is_empty());
+}

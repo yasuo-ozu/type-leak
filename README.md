@@ -114,7 +114,11 @@ Known limitations, due to the stable Rust type system:
   `::path::to::MyType<MY_CONST>`). A relative const in a trait bound (e.g.
   `T: ::path::to::MyTrait<{ MY_CONST }>`) is rejected, because a const cannot be recovered from an
   associated type in a generic context without `generic_const_exprs`. A bare identifier (e.g.
-  `MyTrait<MY_CONST>`) is indistinguishable from a type, so it is interned as a type.
+  `MyTrait<MY_CONST>`) is parsed as a type; it is rejected likewise if it is named like a const
+  (`SCREAMING_SNAKE_CASE`), and otherwise interned as a type.
+- Names of primitive types (e.g. `u8` in `const N: u8`) are copied as they are, assuming they are
+  not shadowed in the Leaker's type context (e.g. by `type u8 = i32;`). Emit
+  `Leaker::assertions()` in the Leaker's type context to check it at compile time.
 - The type of a const parameter must be a primitive type or a context-free path (e.g. an absolute
   path to a type alias), since it cannot be a projection.
 - `encode_generics_params_to_ty()` encodes `const N: usize` as `[(); N]`, and there is no stable

@@ -116,6 +116,9 @@ pub struct Leaker {
     local_generics: HashMap<Type, Generics>,
     /// Types interned without local generics, to detect conflicts with `local_generics`.
     plain_types: HashSet<Type>,
+    /// Names of primitive types which were assumed to be the primitive types (not shadowed), as
+    /// they are copied as they are (see [`Leaker::assertions()`]).
+    assumed_primitives: Vec<Ident>,
 }
 
 /// Error indicating that a type is not internable: the offending tokens and the reason.
@@ -320,7 +323,13 @@ fn first_path_ident(tokens: TokenStream) -> Option<proc_macro2::Ident> {
 /// Without the corresponding [`GenericParam`]s, the arguments are encoded as they are, so omitted
 /// arguments are not filled with the parameters' defaults, and a bare identifier such as `N` in
 /// `MyTrait<N>` is encoded as a type even if it refers to a const (syn parses it as a type
-/// argument). Use [`encode_generics_args_to_ty_with()`] with the parameters to handle them.
+/// argument). So the result may not match [`encode_generics_params_to_ty()`]; use
+/// [`encode_generics_args_to_ty_with()`] with the parameters instead.
+#[deprecated(
+    since = "0.8.0",
+    note = "cannot handle bare const arguments and omitted defaults without the parameters; use \
+            `encode_generics_args_to_ty_with()` with the parameters"
+)]
 pub fn encode_generics_args_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericArgument>) -> Type {
     encode_generics_args_to_ty_with(iter, None, |expr, _| parse_quote!([(); #expr]))
         .expect("encoding without parameters never fails")
@@ -510,6 +519,30 @@ fn path_starts_with(path: &Path, prefix: &Path) -> bool {
             .iter()
             .zip(path.segments.iter())
             .all(|(prefix_seg, seg)| prefix_seg.ident == seg.ident)
+}
+
+/// Returns `true` if `ident` is the name of a primitive type (e.g. `u8` or `str`).
+fn is_primitive_name(ident: &Ident) -> bool {
+    ABSOLUTE_PATHS
+        .iter()
+        .any(|(name, absolute)| ident == name && absolute.starts_with("::core::primitive::"))
+}
+
+/// Returns `true` if `ty` is a single identifier named like a const by the naming convention
+/// (`SCREAMING_SNAKE_CASE` with at least two characters, e.g. `SIZE`), which syn parses as a type
+/// when used as a generic argument.
+fn looks_like_const(ty: &Type) -> bool {
+    match ty {
+        Type::Path(TypePath { qself: None, path }) => path.get_ident().map_or(false, |ident| {
+            let name = ident.to_string();
+            name.len() >= 2
+                && name.chars().any(|c| c.is_ascii_uppercase())
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        }),
+        _ => false,
+    }
 }
 
 /// Returns `true` if `ty` refers to any of `generics`.
@@ -1235,6 +1268,14 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                 let is_must_intern = matches!(o, Ok(CheckResult::MustIntern(_)));
                 let is_root = self.parent.is_none();
 
+                if is_root && is_must_intern && looks_like_const(i) {
+                    // A bare identifier such as `SIZE` in `T: MyTrait<SIZE>` is parsed as a type,
+                    // but is probably a const (by the naming convention), which cannot be leaked
+                    // on its own (like `T: MyTrait<{ SIZE }>`).
+                    self.error = Some(quote!(#i));
+                    return;
+                }
+
                 self.operations.push(GraphOperation {
                     node_type: i.clone(),
                     parent: self.parent.clone(),
@@ -1265,6 +1306,13 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             &i.ty,
             Type::Path(TypePath { qself: None, path }) if self.leaker.is_context_free_path(path)
         );
+        if let Type::Path(TypePath { qself: None, path }) = &i.ty {
+            if let Some(ident) = path.get_ident() {
+                if is_const_param_ty(&i.ty) {
+                    self.leaker.assume_primitive(ident);
+                }
+            }
+        }
         if !is_const_param_ty(&i.ty) && !is_context_free_path {
             self.error = Some(quote!(#{&i.ty}));
             return;
@@ -1295,6 +1343,24 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         self.with_bound_lifetimes(i.lifetimes.as_ref(), |v| {
             syn::visit::visit_predicate_type(v, i)
         })
+    }
+
+    fn visit_path(&mut self, i: &Path) {
+        // A primitive type allowed by `allowed_paths` (e.g. by `LeakerConfig::allow_primitive()`)
+        // is copied as it is, assuming that its name is not shadowed.
+        if i.leading_colon.is_none() && self.leaker.is_context_free_path(i) {
+            if let Some(seg) = i.segments.first() {
+                let is_generic = self.generics.params.iter().any(|gp| match gp {
+                    GenericParam::Type(TypeParam { ident, .. })
+                    | GenericParam::Const(ConstParam { ident, .. }) => ident == &seg.ident,
+                    _ => false,
+                });
+                if !is_generic && is_primitive_name(&seg.ident) {
+                    self.leaker.assume_primitive(&seg.ident);
+                }
+            }
+        }
+        syn::visit::visit_path(self, i)
     }
 
     fn visit_trait_item_const(&mut self, i: &TraitItemConst) {
@@ -1453,6 +1519,7 @@ impl Leaker {
             reachable_types: None,
             local_generics: HashMap::new(),
             plain_types: HashSet::new(),
+            assumed_primitives: Vec::new(),
         }
     }
 
@@ -1465,6 +1532,53 @@ impl Leaker {
             reachable_types: None,
             local_generics: HashMap::new(),
             plain_types: HashSet::new(),
+            assumed_primitives: Vec::new(),
+        }
+    }
+
+    fn assume_primitive(&mut self, ident: &Ident) {
+        if !self.assumed_primitives.iter().any(|p| p == ident) {
+            self.assumed_primitives.push(ident.clone());
+        }
+    }
+
+    /// Items to emit in the Leaker's type context, which check the assumptions made by the
+    /// Leaker at compile time.
+    ///
+    /// The names of primitive types (e.g. `u8` in `const N: u8`, or in a type when allowed by
+    /// [`LeakerConfig::allow_primitive()`]) are copied as they are, assuming that they are not
+    /// shadowed in the Leaker's type context (e.g. by `type u8 = i32;`), which cannot be known
+    /// without name resolution. These items fail to compile (with "mismatched types") if a name
+    /// is shadowed, instead of the copies silently referring to another type.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemTrait = parse_quote!(trait MyTrait<const N: u8> {});
+    /// let leaker = Leaker::from_trait(&item).unwrap();
+    /// assert!(leaker
+    ///     .assertions()
+    ///     .to_string()
+    ///     .contains("__type_leak_assert_u8_is_primitive"));
+    /// ```
+    pub fn assertions(&self) -> TokenStream {
+        if self.assumed_primitives.is_empty() {
+            return TokenStream::new();
+        }
+        let fns = self.assumed_primitives.iter().map(|ident| {
+            let fn_ident = Ident::new(
+                &format!("__type_leak_assert_{}_is_primitive", ident),
+                Span::call_site(),
+            );
+            quote! {
+                fn #fn_ident(x: &#ident) -> &::core::primitive::#ident { x }
+            }
+        });
+        quote! {
+            #[allow(dead_code, non_snake_case)]
+            const _: () = {
+                #(#fns)*
+            };
         }
     }
 
@@ -2089,7 +2203,9 @@ impl Referrer {
     /// }
     ///
     /// // In the Referrer (in the implementation of `MyTrait<#trait_args>`)
-    /// let args = encode_generics_args_to_ty(&trait_args);
+    /// let args = encode_generics_args_to_ty_with(&trait_args, Some(&generics.params), |expr, _| {
+    ///     parse_quote!([(); #expr])
+    /// })?;
     /// let local_args = encode_generics_params_to_ty(&referrer.local_generics(ix).params);
     /// parse_quote!(<Self as Repeater<(#args, #local_args), #ID, #ix>>::Type)
     /// ```

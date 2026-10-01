@@ -174,6 +174,8 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     leaker
         .intern_with(&item_trait.generics, |v| v.visit_item_trait(&item_trait))
         .map_err(Error::from)?;
+    // Compile-time checks of the Leaker's assumptions (e.g. that `u8` is not shadowed).
+    let assertions = leaker.assertions();
     leaker.reduce_roots();
     let referrer = leaker.finish();
 
@@ -232,6 +234,7 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let module = dollar_crate(module);
     Ok(quote! {
         #item_trait
+        #assertions
         #repeater_impls
         #[doc(hidden)]
         #[macro_export]
