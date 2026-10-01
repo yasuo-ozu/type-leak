@@ -1,6 +1,9 @@
 #![doc = include_str!("./README.md")]
 
 use proc_macro2::{Span, TokenStream};
+use safegraph::collection::IndexKey;
+use safegraph::graph::Graph;
+use safegraph::HashGraph;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -108,14 +111,11 @@ impl LeakerConfig {
 pub struct Leaker {
     pub allowed_paths: Vec<Path>,
     pub self_ty_can_be_interned: bool,
-    /// All the operations collected by [`Leaker::intern_with()`].
-    operations: Vec<GraphOperation>,
-    /// The types to be interned, computed from `operations` by [`Leaker::reduce_roots()`] (`None`
-    /// if not computed yet, or outdated).
-    reachable_types: Option<Vec<Type>>,
-    local_generics: HashMap<Type, Generics>,
-    /// Types interned without local generics, to detect conflicts with `local_generics`.
-    plain_types: HashSet<Type>,
+    /// The types found by [`Leaker::intern_with()`] and their composition.
+    types: TypeGraph,
+    /// The nodes of the types to be interned, computed from `types` by [`Leaker::reduce_roots()`]
+    /// (`None` if not computed yet, or outdated).
+    reachable_types: Option<Vec<TypeKey>>,
     /// Names of primitive types which were assumed to be the primitive types (not shadowed), as
     /// they are copied as they are (see [`Leaker::assertions()`]).
     assumed_primitives: Vec<Ident>,
@@ -217,11 +217,38 @@ impl NotInternableError {
 /// ```
 impl From<NotInternableError> for syn::Error {
     fn from(err: NotInternableError) -> Self {
-        let message = match err.note() {
-            Some(note) => format!("{}\n\n  = note: {}\n", err, note),
-            None => err.to_string(),
+        err.to_syn_error()
+    }
+}
+
+impl NotInternableError {
+    fn to_syn_error(&self) -> syn::Error {
+        let message = match self.note() {
+            Some(note) => format!("{}\n\n  = note: {}\n", self, note),
+            None => self.to_string(),
         };
-        syn::Error::new(err.span(), message)
+        syn::Error::new(self.span(), message)
+    }
+}
+
+/// Emits the error as a `compile_error!` invocation at [`NotInternableError::span()`], with the
+/// [`NotInternableError::note()`] rendered as in the conversion into [`syn::Error`], so a proc
+/// macro can report it with e.g. `Err(e) => e.into_token_stream().into()`.
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// # use template_quote::ToTokens;
+/// let item: ItemTrait = parse_quote!(trait MyTrait: Clone {});
+/// let err = Leaker::from_trait(&item).err().unwrap();
+/// assert_eq!(
+///     err.to_token_stream().to_string(),
+///     syn::Error::from(err).to_compile_error().to_string()
+/// );
+/// ```
+impl ToTokens for NotInternableError {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        tokens.extend(self.to_syn_error().to_compile_error());
     }
 }
 
@@ -1135,14 +1162,166 @@ pub enum CheckResult {
     Neutral,
 }
 
-#[derive(Debug, Clone)]
-struct GraphOperation {
-    node_type: Type,
-    parent: Option<Type>,
-    is_root: bool,
-    is_must_intern: bool,
-    /// Local generics (e.g. of trait methods or GATs) which `node_type` depends on.
-    local_generics: Generics,
+/// A type as a node of [`TypeGraph`].
+///
+/// safegraph requires node keys to be [`IndexKey`] (`Clone + Eq + Ord + Hash`) and [`Display`]
+/// (`std::fmt::Display`), which `syn::Type` is not (it has no `Ord` or `Display`), so a type is
+/// compared, hashed and displayed by its tokens.
+#[derive(Clone, Debug)]
+struct TypeKey {
+    tokens: String,
+    ty: Type,
+}
+
+impl TypeKey {
+    fn new(ty: &Type) -> Self {
+        Self {
+            tokens: quote!(#ty).to_string(),
+            ty: ty.clone(),
+        }
+    }
+}
+
+impl PartialEq for TypeKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.tokens == other.tokens
+    }
+}
+
+impl Eq for TypeKey {}
+
+impl PartialOrd for TypeKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TypeKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.tokens.cmp(&other.tokens)
+    }
+}
+
+impl std::hash::Hash for TypeKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.tokens.hash(state)
+    }
+}
+
+impl std::fmt::Display for TypeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.tokens)
+    }
+}
+
+// SAFETY: `Eq`, `Ord` and `Hash` are those of `tokens` (a `String`), so they are consistent with
+// each other and deterministic, and none of them (nor `Clone`) panics.
+unsafe impl IndexKey for TypeKey {}
+
+/// An edge of [`TypeGraph`]: the type `.0` is composed of the type `.1`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Composition(TypeKey, TypeKey);
+
+impl std::fmt::Display for Composition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} > {}", self.0, self.1)
+    }
+}
+
+// SAFETY: the derived impls are those of `(TypeKey, TypeKey)`, which satisfy the requirements as
+// `TypeKey` does.
+unsafe impl IndexKey for Composition {}
+
+/// The types found by the analysis, and their composition.
+#[derive(Default)]
+struct TypeGraph {
+    /// An edge goes from a type to each internable type it is composed of.
+    graph: HashGraph<TypeKey, Composition>,
+    /// The types in the order of their first appearance.
+    order: Vec<TypeKey>,
+    /// The types appearing as roots (not as components of another internable type).
+    roots: HashSet<TypeKey>,
+    /// The types which must be interned (they directly depend on the type context).
+    must_intern: HashSet<TypeKey>,
+    /// The local generics (e.g. of trait methods or GATs) which each type depends on (empty if
+    /// none, see [`Referrer::local_generics()`]). A type must depend on the same local generics
+    /// wherever it appears, since the Referrer finds leaked types by the type alone.
+    local_generics: HashMap<TypeKey, Generics>,
+}
+
+impl TypeGraph {
+    /// Adds an occurrence of `ty` (a component of `parent`, or a root), and returns its key.
+    /// Returns `Err` if it conflicts with another occurrence of the same type, depending on
+    /// other local generics.
+    fn add(
+        &mut self,
+        ty: &Type,
+        parent: Option<&TypeKey>,
+        is_must_intern: bool,
+        local_generics: Generics,
+    ) -> std::result::Result<TypeKey, ()> {
+        let key = TypeKey::new(ty);
+        match self.local_generics.get(&key) {
+            Some(existing) if existing != &local_generics => return Err(()),
+            Some(_) => (),
+            None => {
+                self.graph.insert_node(key.clone()).ok().unwrap();
+                self.order.push(key.clone());
+                self.local_generics.insert(key.clone(), local_generics);
+            }
+        }
+        match parent {
+            Some(parent) => self.add_edge(parent.clone(), key.clone()),
+            None => {
+                self.roots.insert(key.clone());
+            }
+        }
+        if is_must_intern {
+            self.must_intern.insert(key.clone());
+        }
+        Ok(key)
+    }
+
+    fn add_edge(&mut self, from: TypeKey, to: TypeKey) {
+        let edge = Composition(from.clone(), to.clone());
+        if !self.graph.contains_edge_index(&edge) {
+            self.graph.insert_edge(edge, [from, to]).ok().unwrap();
+        }
+    }
+
+    /// Returns the components of `key`.
+    fn children(&self, key: &TypeKey) -> Vec<TypeKey> {
+        self.graph.neighbor_indices_from(key).collect()
+    }
+
+    /// Returns the first type in `other` which depends on other local generics than in this
+    /// graph.
+    fn find_conflict<'a>(&self, other: &'a TypeGraph) -> Option<&'a TypeKey> {
+        other.order.iter().find(|key| {
+            matches!(
+                self.local_generics.get(*key),
+                Some(existing) if existing != &other.local_generics[*key]
+            )
+        })
+    }
+
+    /// Merges `other` into this graph (which must not conflict, see
+    /// [`TypeGraph::find_conflict()`]).
+    fn merge(&mut self, other: TypeGraph) {
+        for key in &other.order {
+            if !self.local_generics.contains_key(key) {
+                self.graph.insert_node(key.clone()).ok().unwrap();
+                self.order.push(key.clone());
+                self.local_generics
+                    .insert(key.clone(), other.local_generics[key].clone());
+            }
+        }
+        for Composition(from, to) in other.graph.edge_indices() {
+            self.add_edge(from.clone(), to.clone());
+        }
+        self.roots.extend(other.roots);
+        self.must_intern.extend(other.must_intern);
+    }
 }
 
 struct AnalyzeVisitor<'a> {
@@ -1154,9 +1333,11 @@ struct AnalyzeVisitor<'a> {
     n_outer_generics: usize,
     /// Where predicates of the local generics.
     local_predicates: Vec<WherePredicate>,
-    parent: Option<Type>,
-    error: Option<TokenStream>,
-    operations: Vec<GraphOperation>,
+    /// The type whose components are being visited.
+    parent: Option<TypeKey>,
+    error: Option<NotInternableError>,
+    /// The types found by this visitor, merged into the Leaker if successful.
+    types: TypeGraph,
 }
 
 impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
@@ -1168,7 +1349,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             local_predicates: self.local_predicates.clone(),
             parent: self.parent.clone(),
             error: self.error.clone(),
-            operations: Vec::new(),
+            types: std::mem::take(&mut self.types),
         };
         for g in &i.sig.generics.params {
             visitor.generics.params.push(g.clone());
@@ -1185,7 +1366,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         if visitor.error.is_some() {
             self.error = visitor.error;
         }
-        self.operations.extend(visitor.operations);
+        self.types = visitor.types;
     }
 
     fn visit_receiver(&mut self, i: &Receiver) {
@@ -1208,7 +1389,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             local_predicates: self.local_predicates.clone(),
             parent: self.parent.clone(),
             error: self.error.clone(),
-            operations: Vec::new(),
+            types: std::mem::take(&mut self.types),
         };
         for g in &i.generics.params {
             visitor.generics.params.push(g.clone());
@@ -1220,7 +1401,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         }
         syn::visit::visit_trait_item_type(&mut visitor, i);
         self.error = visitor.error;
-        self.operations.extend(visitor.operations);
+        self.types = visitor.types;
     }
 
     fn visit_type(&mut self, i: &Type) {
@@ -1232,7 +1413,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                 // The type must be interned (because of `s`, which depends on the type context)
                 // but cannot be (e.g. `MyType<'_>`), and cannot be decomposed either. Report `s`,
                 // which should be made absolute.
-                self.error = Some(s);
+                self.error = Some(NotInternableError(s, NotInternableReason::RelativePath));
             }
             Err(_) => {
                 // The type cannot be interned as a whole (e.g. `&MyType` with an elided lifetime,
@@ -1250,13 +1431,16 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                     &self.generics.params.iter().collect::<Vec<_>>()[self.n_outer_generics..],
                     &self.local_predicates,
                 );
-                self.operations.push(GraphOperation {
-                    node_type: i.clone(),
-                    parent: self.parent.clone(),
-                    is_root: self.parent.is_none(),
-                    is_must_intern: true,
-                    local_generics,
-                });
+                if self
+                    .types
+                    .add(i, self.parent.as_ref(), true, local_generics)
+                    .is_err()
+                {
+                    self.error = Some(NotInternableError(
+                        quote!(#i),
+                        NotInternableReason::ConflictingLocalGenerics,
+                    ));
+                }
             }
             Ok(_) if mentions_local => {
                 // The type itself cannot be interned because the Repeater's implementation
@@ -1272,22 +1456,32 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                     // A bare identifier such as `SIZE` in `T: MyTrait<SIZE>` is parsed as a type,
                     // but is probably a const (by the naming convention), which cannot be leaked
                     // on its own (like `T: MyTrait<{ SIZE }>`).
-                    self.error = Some(quote!(#i));
+                    self.error = Some(NotInternableError(
+                        quote!(#i),
+                        NotInternableReason::RelativePath,
+                    ));
                     return;
                 }
 
-                self.operations.push(GraphOperation {
-                    node_type: i.clone(),
-                    parent: self.parent.clone(),
-                    is_root,
+                let ix = match self.types.add(
+                    i,
+                    self.parent.as_ref(),
                     is_must_intern,
-                    local_generics: Generics::default(),
-                });
+                    Generics::default(),
+                ) {
+                    Ok(ix) => ix,
+                    Err(()) => {
+                        self.error = Some(NotInternableError(
+                            quote!(#i),
+                            NotInternableReason::ConflictingLocalGenerics,
+                        ));
+                        return;
+                    }
+                };
 
                 if !is_must_intern {
-                    // Perform recursive call
-                    let parent = self.parent.clone();
-                    self.parent = Some(i.clone());
+                    // Visit the components
+                    let parent = self.parent.replace(ix);
                     syn::visit::visit_type(self, i);
                     self.parent = parent;
                 }
@@ -1314,7 +1508,10 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             }
         }
         if !is_const_param_ty(&i.ty) && !is_context_free_path {
-            self.error = Some(quote!(#{&i.ty}));
+            self.error = Some(NotInternableError(
+                quote!(#{&i.ty}),
+                NotInternableReason::RelativePath,
+            ));
             return;
         }
         if let Some(expr) = &i.default {
@@ -1325,7 +1522,10 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     fn visit_trait_bound(&mut self, i: &TraitBound) {
         // Trait bounds with a non-absolute path
         if !self.leaker.is_context_free_path(&i.path) {
-            self.error = Some(quote!(#i));
+            self.error = Some(NotInternableError(
+                quote!(#i),
+                NotInternableReason::RelativePath,
+            ));
             return;
         }
         self.with_bound_lifetimes(i.lifetimes.as_ref(), |v| {
@@ -1389,7 +1589,10 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             syn::visit::visit_expr_path(self, i)
         } else {
             // Value or trait bounds with a relative path
-            self.error = Some(quote!(#i));
+            self.error = Some(NotInternableError(
+                quote!(#i),
+                NotInternableReason::RelativePath,
+            ));
         }
     }
 }
@@ -1515,10 +1718,8 @@ impl Leaker {
         Self {
             allowed_paths: Vec::new(),
             self_ty_can_be_interned: true,
-            operations: Vec::new(),
+            types: TypeGraph::default(),
             reachable_types: None,
-            local_generics: HashMap::new(),
-            plain_types: HashSet::new(),
             assumed_primitives: Vec::new(),
         }
     }
@@ -1528,10 +1729,8 @@ impl Leaker {
         Self {
             allowed_paths: config.allowed_paths,
             self_ty_can_be_interned: config.self_ty_can_be_interned,
-            operations: Vec::new(),
+            types: TypeGraph::default(),
             reachable_types: None,
-            local_generics: HashMap::new(),
-            plain_types: HashSet::new(),
             assumed_primitives: Vec::new(),
         }
     }
@@ -1599,17 +1798,10 @@ impl Leaker {
                 .any(|allowed| path_starts_with(path, allowed))
     }
 
-    /// Adds collected operations. The reduction is recomputed over all operations (including those
-    /// of previous calls of [`Leaker::intern_with()`]).
-    fn apply_operations(&mut self, operations: Vec<GraphOperation>) {
-        if operations.is_empty() {
-            return;
-        }
-        self.operations.extend(operations);
-        self.reachable_types = None;
-    }
-
     /// Intern AST elements using a visitor callback.
+    ///
+    /// The types found are added to those of the previous calls; nothing is added if an error is
+    /// returned.
     pub fn intern_with<'ast, F>(
         &mut self,
         generics: &Generics,
@@ -1625,45 +1817,28 @@ impl Leaker {
             generics: generics.clone(),
             n_outer_generics: generics.params.len(),
             local_predicates: Vec::new(),
-            operations: Vec::new(),
+            types: TypeGraph::default(),
         };
         f(&mut visitor);
         if let Some(e) = visitor.error {
-            Err(NotInternableError(e, NotInternableReason::RelativePath))
-        } else {
-            let operations = visitor.operations;
-            // The Referrer finds leaked types by the type alone, so the same type must depend on
-            // the same local generics wherever it appears.
-            for operation in &operations {
-                let ty = &operation.node_type;
-                let conflicts = if operation.local_generics.params.is_empty() {
-                    // e.g. `Wrap<B>` in `fn f(&self) -> Wrap<B>` (where `B` is a type) and in
-                    // `fn g<const B: bool>(&self) -> Wrap<B>`.
-                    self.local_generics.contains_key(ty)
-                } else {
-                    // e.g. `Wrap<B>` in `fn f<const B: bool>` and `fn g<const B: u8>`.
-                    self.plain_types.contains(ty)
-                        || matches!(
-                            self.local_generics.get(ty),
-                            Some(existing) if existing != &operation.local_generics
-                        )
-                };
-                if conflicts {
-                    return Err(NotInternableError(
-                        quote!(#ty),
-                        NotInternableReason::ConflictingLocalGenerics,
-                    ));
-                }
-                if operation.local_generics.params.is_empty() {
-                    self.plain_types.insert(ty.clone());
-                } else {
-                    self.local_generics
-                        .insert(ty.clone(), operation.local_generics.clone());
-                }
-            }
-            self.apply_operations(operations);
-            Ok(self)
+            return Err(e);
         }
+        let types = visitor.types;
+        // The Referrer finds leaked types by the type alone, so the same type must depend on the
+        // same local generics wherever it appears (e.g. not `Wrap<B>` both in
+        // `fn f<const B: bool>()` and in `fn g()` where `B` is a type).
+        if let Some(key) = self.types.find_conflict(&types) {
+            let ty = &key.ty;
+            return Err(NotInternableError(
+                quote!(#ty),
+                NotInternableReason::ConflictingLocalGenerics,
+            ));
+        }
+        if !types.order.is_empty() {
+            self.types.merge(types);
+            self.reachable_types = None;
+        }
+        Ok(self)
     }
 
     /// Check whether the given `ty` is internable. Returns `Err` when there is a contradiction
@@ -1929,16 +2104,16 @@ impl Leaker {
     /// deterministic.
     pub fn finish(mut self) -> Referrer {
         self.reduce_roots();
-        let local_generics_map = self.local_generics;
-        let leak_types: Vec<_> = self.reachable_types.unwrap_or_default();
+        let keys = self.reachable_types.take().unwrap_or_default();
+        let leak_types: Vec<Type> = keys.iter().map(|key| key.ty.clone()).collect();
         let map = leak_types
             .iter()
             .enumerate()
-            .map(|(n, ty)| (ty.clone(), n))
+            .map(|(n, ty)| (TypeKey::new(ty), n))
             .collect();
-        let local_generics = leak_types
+        let local_generics = keys
             .iter()
-            .map(|ty| local_generics_map.get(ty).cloned().unwrap_or_default())
+            .map(|key| self.types.local_generics[key].clone())
             .collect();
         Referrer {
             leak_types,
@@ -1984,154 +2159,69 @@ impl Leaker {
     /// ![after_graph](https://raw.githubusercontent.com/yasuo-ozu/type-leak/main/resources/after_graph.svg)
     pub fn reduce_roots(&mut self) {
         if self.reachable_types.is_none() {
-            self.reachable_types = Some(self.build_graph_and_reduce(&self.operations));
+            self.reachable_types = Some(self.build_graph_and_reduce());
         }
     }
 
-    /// Returns the types to be interned, in the order of their first appearance in `operations`.
-    fn build_graph_and_reduce(&self, operations: &[GraphOperation]) -> Vec<Type> {
-        // Build parent-child relationships from operations
-        let mut children: HashMap<Type, Vec<Type>> = HashMap::new();
-        let mut parents: HashMap<Type, Vec<Type>> = HashMap::new();
-        let mut root_types = HashSet::new();
-        let mut must_intern_types = HashSet::new();
+    /// Returns the types to be interned, in the order of their first appearance.
+    fn build_graph_and_reduce(&self) -> Vec<TypeKey> {
+        let types = &self.types;
+        let children: HashMap<&TypeKey, Vec<TypeKey>> = types
+            .order
+            .iter()
+            .map(|key| (key, types.children(key)))
+            .collect();
 
-        for operation in operations {
-            if operation.is_root {
-                root_types.insert(operation.node_type.clone());
-            }
-            if operation.is_must_intern {
-                must_intern_types.insert(operation.node_type.clone());
-            }
-
-            if let Some(parent_type) = &operation.parent {
-                children
-                    .entry(parent_type.clone())
-                    .or_default()
-                    .push(operation.node_type.clone());
-                parents
-                    .entry(operation.node_type.clone())
-                    .or_default()
-                    .push(parent_type.clone());
-            }
-        }
-
-        // Implement proper reduction algorithm:
-        // 1. Keep all must-intern root types
-        // 2. Keep root types that transitively contain must-intern types
-        // 3. Do NOT keep non-root must-intern types that are only components of kept root types
-
-        let mut kept_types = HashSet::new();
-
-        // Step 1: Keep must-intern types that are also roots
-        for root_type in &root_types {
-            if must_intern_types.contains(root_type) {
-                kept_types.insert(root_type.clone());
-            }
-        }
-
-        // Step 2: Keep root types that contain must-intern descendants
-        for root_type in &root_types {
-            if !kept_types.contains(root_type)
-                && self.contains_must_intern_descendant(root_type, &children, &must_intern_types)
-            {
-                kept_types.insert(root_type.clone());
-            }
-        }
-
-        // Step 3: Only add must-intern types that are NOT components of any kept type
-        for must_intern_type in &must_intern_types {
-            if !self.is_component_of_any_kept_type(must_intern_type, &kept_types, &children) {
-                kept_types.insert(must_intern_type.clone());
-            }
-        }
+        // 1. Keep the roots which must be interned, or contain types which must be interned.
+        let mut kept: HashSet<&TypeKey> = types
+            .order
+            .iter()
+            .filter(|key| types.roots.contains(*key))
+            .filter(|key| reaches(key, &children, |key| types.must_intern.contains(key)))
+            .collect();
+        // 2. Keep the types which must be interned and are not components of kept types.
+        let components: HashSet<TypeKey> = kept
+            .iter()
+            .flat_map(|key| descendants(key, &children))
+            .collect();
+        kept.extend(
+            types
+                .must_intern
+                .iter()
+                .filter(|key| !components.contains(*key)),
+        );
 
         // Order by the first appearance, for deterministic output.
-        let mut seen = HashSet::new();
-        operations
+        types
+            .order
             .iter()
-            .map(|operation| &operation.node_type)
-            .filter(|ty| kept_types.contains(*ty) && seen.insert((*ty).clone()))
+            .filter(|key| kept.contains(*key))
             .cloned()
             .collect()
     }
+}
 
-    fn contains_must_intern_descendant(
-        &self,
-        root: &Type,
-        children: &HashMap<Type, Vec<Type>>,
-        must_intern_types: &HashSet<Type>,
-    ) -> bool {
-        let mut visited = HashSet::new();
-        let mut stack = vec![root.clone()];
+/// Returns `true` if `start` or any of its descendants satisfies `pred`.
+fn reaches(
+    start: &TypeKey,
+    children: &HashMap<&TypeKey, Vec<TypeKey>>,
+    pred: impl Fn(&TypeKey) -> bool,
+) -> bool {
+    pred(start) || descendants(start, children).iter().any(pred)
+}
 
-        while let Some(current) = stack.pop() {
-            if !visited.insert(current.clone()) {
-                continue;
-            }
-
-            if must_intern_types.contains(&current) {
-                return true;
-            }
-
-            if let Some(child_list) = children.get(&current) {
-                for child in child_list {
-                    if !visited.contains(child) {
-                        stack.push(child.clone());
-                    }
-                }
-            }
+/// Returns the descendants of `start` (excluding `start` itself, unless it is in a cycle).
+fn descendants(start: &TypeKey, children: &HashMap<&TypeKey, Vec<TypeKey>>) -> Vec<TypeKey> {
+    let mut visited = HashSet::new();
+    let mut stack: Vec<TypeKey> = children.get(start).cloned().unwrap_or_default();
+    let mut result = Vec::new();
+    while let Some(key) = stack.pop() {
+        if visited.insert(key.clone()) {
+            stack.extend(children.get(&key).into_iter().flatten().cloned());
+            result.push(key);
         }
-
-        false
     }
-
-    fn is_component_of_any_kept_type(
-        &self,
-        target_type: &Type,
-        kept_types: &HashSet<Type>,
-        children: &HashMap<Type, Vec<Type>>,
-    ) -> bool {
-        for kept_type in kept_types {
-            if self.is_descendant_of(target_type, kept_type, children) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn is_descendant_of(
-        &self,
-        target: &Type,
-        ancestor: &Type,
-        children: &HashMap<Type, Vec<Type>>,
-    ) -> bool {
-        if target == ancestor {
-            return false; // Not a descendant of itself
-        }
-
-        let mut visited = HashSet::new();
-        let mut stack = vec![ancestor.clone()];
-
-        while let Some(current) = stack.pop() {
-            if !visited.insert(current.clone()) {
-                continue;
-            }
-
-            if let Some(child_list) = children.get(&current) {
-                for child in child_list {
-                    if child == target {
-                        return true;
-                    }
-                    if !visited.contains(child) {
-                        stack.push(child.clone());
-                    }
-                }
-            }
-        }
-
-        false
-    }
+    result
 }
 
 /// Holds the list of types that need to be encoded, as produced by [`Leaker::finish()`].
@@ -2141,7 +2231,9 @@ impl Leaker {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Referrer {
     leak_types: Vec<Type>,
-    map: HashMap<Type, usize>,
+    /// Keyed by [`TypeKey`] (by tokens) as in the Leaker, so that e.g. a type wrapped in an
+    /// invisible group is found as well.
+    map: HashMap<TypeKey, usize>,
     local_generics: Vec<Generics>,
 }
 
@@ -2244,7 +2336,7 @@ impl Referrer {
         struct Folder<'a, F>(&'a Referrer, F);
         impl<'a, F: FnMut(Type, usize) -> Type> Fold for Folder<'a, F> {
             fn fold_type(&mut self, ty: Type) -> Type {
-                if let Some(idx) = self.0.map.get(&ty) {
+                if let Some(idx) = self.0.map.get(&TypeKey::new(&ty)) {
                     self.1(ty, *idx)
                 } else {
                     syn::fold::fold_type(self, ty)
@@ -2272,10 +2364,10 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
     /// [`Referrer::local_generics()`]).
     fn shadow_generics(&mut self, generics: &Generics) {
         let referrer = &self.0;
-        let shadowed: Vec<Type> = referrer
+        let shadowed: Vec<TypeKey> = referrer
             .map
             .iter()
-            .filter(|(ty, ix)| {
+            .filter(|(key, ix)| {
                 let locals = &referrer.local_generics[**ix];
                 let params = generics.params.iter().filter(|gp| {
                     !locals
@@ -2283,27 +2375,27 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
                         .iter()
                         .any(|local| generic_param_name(local) == generic_param_name(gp))
                 });
-                mentions_generics(ty, params)
+                mentions_generics(&key.ty, params)
             })
-            .map(|(ty, _)| ty.clone())
+            .map(|(key, _)| key.clone())
             .collect();
-        for ty in shadowed {
-            self.0.map.remove(&ty);
+        for key in shadowed {
+            self.0.map.remove(&key);
         }
     }
 
     /// Stops rewriting the leaked types which mention `idents` (items or imports declared in a
     /// block or a module).
     fn shadow_idents(&mut self, idents: Vec<Ident>) {
-        let shadowed: Vec<Type> = self
+        let shadowed: Vec<TypeKey> = self
             .0
             .map
             .keys()
-            .filter(|ty| mentions_names(ty, idents.clone(), Vec::new()))
+            .filter(|key| mentions_names(&key.ty, idents.clone(), Vec::new()))
             .cloned()
             .collect();
-        for ty in shadowed {
-            self.0.map.remove(&ty);
+        for key in shadowed {
+            self.0.map.remove(&key);
         }
     }
 
@@ -2535,7 +2627,7 @@ impl Parse for Referrer {
         let map = leak_types
             .iter()
             .enumerate()
-            .map(|(n, ty)| (ty.clone(), n))
+            .map(|(n, ty)| (TypeKey::new(ty), n))
             .collect();
         Ok(Self {
             map,

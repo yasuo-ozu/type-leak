@@ -463,3 +463,25 @@ fn note_in_syn_error() {
         .into();
     assert_eq!(err.to_string(), "use absolute path: 'MyBound'");
 }
+
+#[test]
+fn error_to_tokens() {
+    // The error is emitted as `compile_error!` with the note, as `syn::Error` is.
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait: Clone {}
+    })
+    .unwrap();
+    let mut leaker = Leaker::new();
+    let err = leaker
+        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
+        .err()
+        .unwrap();
+    let tokens = quote!(#err).to_string();
+    assert!(tokens.contains("compile_error"), "{}", tokens);
+    assert!(
+        tokens.contains("= note: use `::core::clone::Clone` instead of `Clone`"),
+        "{}",
+        tokens
+    );
+    assert_eq!(tokens, syn::Error::from(err).to_compile_error().to_string());
+}

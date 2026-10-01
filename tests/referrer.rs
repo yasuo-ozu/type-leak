@@ -142,3 +142,30 @@ fn test_items_in_blocks_and_modules_shadow_leaked_types() {
         })
     );
 }
+
+#[test]
+fn test_grouped_types_are_found() {
+    // A type passed through `macro_rules!` (`$t:ty`) is wrapped in an invisible group, which
+    // `syn` distinguishes from the bare type although the tokens are the same.
+    let grouped = Type::Group(TypeGroup {
+        group_token: Default::default(),
+        elem: Box::new(parse_quote!(RelA)),
+    });
+    let item: ItemStruct = parse_quote! {
+        struct S { a: #grouped, b: RelA }
+    };
+    let mut leaker = type_leak::Leaker::new();
+    leaker
+        .intern_with(&item.generics, |v| {
+            syn::visit::Visit::visit_item_struct(v, &item)
+        })
+        .unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(referrer.iter().count(), 1);
+    assert_eq!(
+        rewrite(quote!(#referrer), Item::Struct(item)),
+        expected(parse_quote! {
+            struct S { a: P<0usize>, b: P<0usize> }
+        })
+    );
+}

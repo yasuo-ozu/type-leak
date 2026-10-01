@@ -129,7 +129,8 @@ Known limitations, due to the stable Rust type system:
   filled (e.g. `*const dyn Repeater<(), 0, 0, B, Type = ()>` for `const B: bool`), so the Repeater
   is still the only item shared by the Leaker and the Referrer. Const parameters whose type is a
   type alias cannot be encoded. The generated Repeater requires Rust 1.59 and the 2018 edition
-  (the `type-leak` crate itself supports Rust 1.56).
+  (the `type-leak` crate itself supports Rust 1.56; on Rust older than 1.66, pin its dependency
+  with `cargo update -p unicode-width --precise 0.1.11`).
 
 # Application
 

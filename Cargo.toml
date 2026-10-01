@@ -20,6 +20,7 @@ exclude = ["tests/crates", "tests/cross_crate.rs"]
 path = "lib.rs"
 
 [dependencies]
+safegraph = { version = "0.3.0", default-features = false }
 proc-macro2 = "1.0"
 template-quote = "0.4"
 
