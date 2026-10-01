@@ -118,18 +118,37 @@ pub struct Leaker {
     plain_types: HashSet<Type>,
 }
 
-/// Error indicating that a type is not internable.
+/// Error indicating that a type is not internable: the offending tokens and the reason.
 ///
-/// When the offending path starts with an item of the standard prelude or a primitive type,
-/// [`NotInternableError::note()`] suggests the absolute path to use instead, e.g. "use
-/// `::std::vec::Vec` instead of `Vec`". Converting the error into [`syn::Error`] renders it as a
-/// `note` of the diagnostic.
+/// [`NotInternableError::note()`] suggests how to fix it, e.g. "use `::std::vec::Vec` instead of
+/// `Vec`" when the offending path starts with an item of the standard prelude or a primitive type.
+/// Converting the error into [`syn::Error`] renders it as a `note` of the diagnostic.
 #[derive(Debug, Clone)]
-pub struct NotInternableError(pub TokenStream);
+pub struct NotInternableError(pub TokenStream, pub NotInternableReason);
+
+/// The reason of a [`NotInternableError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NotInternableReason {
+    /// The path depends on the type context, but cannot be leaked (e.g. a trait in a bound, or a
+    /// value in a const expression), so it should be absolute.
+    RelativePath,
+    /// The type is used with different method-local generics (or with and without them) in
+    /// different places, so a Referrer cannot tell which one a copy refers to. (The Referrer
+    /// finds leaked types by the type alone; see [`Referrer::local_generics()`].)
+    ConflictingLocalGenerics,
+}
 
 impl std::fmt::Display for NotInternableError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "use absolute path: '{}'", self.0)
+        match self.1 {
+            NotInternableReason::RelativePath => write!(f, "use absolute path: '{}'", self.0),
+            NotInternableReason::ConflictingLocalGenerics => write!(
+                f,
+                "'{}' is used with different method-local generics, which cannot be leaked",
+                self.0
+            ),
+        }
     }
 }
 
@@ -140,8 +159,9 @@ impl NotInternableError {
         self.0.span()
     }
 
-    /// Returns a note suggesting the absolute path to use instead of the first segment of the
-    /// offending path, if it is an item of the standard prelude or a primitive type.
+    /// Returns a note suggesting how to fix the error: for [`NotInternableReason::RelativePath`],
+    /// the absolute path to use instead of the first segment of the offending path, if it is an
+    /// item of the standard prelude or a primitive type.
     ///
     /// ```
     /// # use type_leak::*;
@@ -155,6 +175,13 @@ impl NotInternableError {
     /// );
     /// ```
     pub fn note(&self) -> Option<String> {
+        if self.1 == NotInternableReason::ConflictingLocalGenerics {
+            return Some(
+                "use an absolute path for it, or the same method-local generics wherever it is \
+                 used"
+                    .to_string(),
+            );
+        }
         let name = first_path_ident(self.0.clone())?.to_string();
         ABSOLUTE_PATHS
             .iter()
@@ -287,97 +314,147 @@ fn first_path_ident(tokens: TokenStream) -> Option<proc_macro2::Ident> {
 /// Encode [`GenericArgument`]s to a type.
 ///
 /// A const argument `N` is encoded as `[(); N]`, so it must be of type `usize`. To encode generics
-/// of any kind, use [`RepeaterSlots`].
+/// of any kind, use [`RepeaterSlots`]. Associated item bindings and constraints (e.g. `Item = u8`)
+/// are skipped.
 ///
-/// A bare identifier such as `N` in `MyTrait<N>` is parsed as a type argument even if it refers to
-/// a const. Use [`encode_generics_args_to_ty_with()`] with the corresponding [`GenericParam`]s to
-/// encode such arguments correctly.
-///
-/// # Panics
-///
-/// Panics if an argument is not a lifetime, a type or a const (e.g. an associated type binding
-/// `Item = u8`).
+/// Without the corresponding [`GenericParam`]s, the arguments are encoded as they are, so omitted
+/// arguments are not filled with the parameters' defaults, and a bare identifier such as `N` in
+/// `MyTrait<N>` is encoded as a type even if it refers to a const (syn parses it as a type
+/// argument). Use [`encode_generics_args_to_ty_with()`] with the parameters to handle them.
 pub fn encode_generics_args_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericArgument>) -> Type {
     encode_generics_args_to_ty_with(iter, None, |expr, _| parse_quote!([(); #expr]))
+        .expect("encoding without parameters never fails")
 }
 
 /// Encode [`GenericArgument`]s to a type, using `const_fn` to encode const arguments.
 ///
-/// If `params` is given, its type and const parameters are matched against the type and const
-/// arguments of `iter` by position (omitted arguments are not filled with the parameters'
-/// defaults; [`RepeaterSlots::encode_generics_args_to_ty()`] does). A type argument that
-/// corresponds to a [`ConstParam`] and consists only of a single identifier (e.g. `N` in
-/// `MyTrait<N>`) is then treated as a const argument. `const_fn` receives each const argument
-/// together with its corresponding [`ConstParam`] (if known), and must return the same type as the
-/// `const_fn` passed to [`encode_generics_params_to_ty_with()`] for the same value.
+/// `const_fn` receives each const argument together with its corresponding [`ConstParam`] (if
+/// known), and must return the same type as the `const_fn` passed to
+/// [`encode_generics_params_to_ty_with()`] for the same value. Associated item bindings and
+/// constraints (e.g. `Item = u8`) are skipped.
+///
+/// If `params` (the [`GenericParam`]s corresponding to `iter`) is given, the result is the same
+/// type as [`encode_generics_params_to_ty_with()`] with `params` substituted by `iter`, as
+/// [`RepeaterSlots::encode_generics_args_to_ty()`] does: arguments are matched with parameters by
+/// position, a bare identifier corresponding to a const parameter (e.g. `N` in `MyTrait<N>`) is
+/// treated as a const argument, omitted arguments take the parameters' defaults, and
+/// [`EncodeError`] is returned if there are too many arguments or a missing argument without a
+/// default. Without `params`, the arguments are encoded as they are, and this never fails.
 ///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
 /// # use template_quote::quote;
-/// let generics: Generics = parse_quote!(<T, const N: usize>);
+/// let generics: Generics = parse_quote!(<T, const N: usize, const M: usize = 3>);
 /// let args: AngleBracketedGenericArguments = parse_quote!(<u8, N>);
 /// let ty = encode_generics_args_to_ty_with(&args.args, Some(&generics.params), |expr, _| {
 ///     parse_quote!([(); #expr])
-/// });
-/// assert_eq!(quote!(#ty).to_string(), quote!((u8, [(); N])).to_string());
+/// })
+/// .unwrap();
+/// let expected: Type = parse_quote!((u8, [(); N], [(); 3]));
+/// assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
 /// ```
-///
-/// # Panics
-///
-/// Panics if an argument is not a lifetime, a type or a const (e.g. an associated type binding
-/// `Item = u8`).
 pub fn encode_generics_args_to_ty_with<'a, 'b>(
     iter: impl IntoIterator<Item = &'a GenericArgument>,
     params: Option<&'b Punctuated<GenericParam, Token![,]>>,
     mut const_fn: impl FnMut(&Expr, Option<&'b ConstParam>) -> Type,
-) -> Type {
-    // Lifetime arguments may be omitted, so type and const arguments are matched only against type
-    // and const parameters.
-    let mut params = params.map(|params| {
-        params
-            .iter()
-            .filter(|param| !matches!(param, GenericParam::Lifetime(_)))
-    });
-    Type::Tuple(TypeTuple {
-        paren_token: Default::default(),
-        elems: iter
-            .into_iter()
-            .map(|arg| -> Type {
-                let param = if matches!(arg, GenericArgument::Lifetime(_)) {
-                    None
-                } else {
-                    params.as_mut().and_then(|params| params.next())
-                };
-                let const_param = if let Some(GenericParam::Const(cp)) = param {
-                    Some(cp)
-                } else {
-                    None
-                };
-                match (arg, const_param) {
-                    (GenericArgument::Lifetime(lifetime), _) => {
-                        parse_quote!(& #lifetime ())
-                    }
-                    (GenericArgument::Const(expr), _) => {
-                        const_fn(&normalize_const_arg(expr), const_param)
-                    }
-                    (
-                        GenericArgument::Type(Type::Path(TypePath { qself: None, path })),
-                        Some(cp),
-                    ) if path.get_ident().is_some() => const_fn(
-                        &Expr::Path(ExprPath {
-                            attrs: Vec::new(),
-                            qself: None,
-                            path: path.clone(),
-                        }),
-                        Some(cp),
-                    ),
-                    (GenericArgument::Type(ty), _) => ty.clone(),
-                    (arg, _) => panic!("unsupported generic argument: '{}'", quote!(#arg)),
-                }
+) -> std::result::Result<Type, EncodeError> {
+    if let Some(params) = params {
+        return encode_generics_args_with_params(iter, params, |value, cp| {
+            Ok(const_fn(value, Some(cp)))
+        });
+    }
+    let elems = iter
+        .into_iter()
+        .filter_map(|arg| -> Option<Type> {
+            Some(match arg {
+                GenericArgument::Lifetime(lifetime) => parse_quote!(& #lifetime ()),
+                GenericArgument::Const(expr) => const_fn(&normalize_const_arg(expr), None),
+                GenericArgument::Type(ty) => ty.clone(),
+                _ => return None,
             })
-            .collect(),
-    })
+        })
+        .collect();
+    Ok(Type::Tuple(TypeTuple {
+        paren_token: Default::default(),
+        elems: with_trailing_comma(elems),
+    }))
+}
+
+/// Encodes `iter` matched with `params`, filling omitted arguments with the defaults (see
+/// [`RepeaterSlots::encode_generics_args_to_ty()`]). `const_fn` encodes a (normalized) const
+/// value of the given parameter.
+fn encode_generics_args_with_params<'a, 'b>(
+    iter: impl IntoIterator<Item = &'a GenericArgument>,
+    params: &'b Punctuated<GenericParam, Token![,]>,
+    mut const_fn: impl FnMut(&Expr, &'b ConstParam) -> std::result::Result<Type, EncodeError>,
+) -> std::result::Result<Type, EncodeError> {
+    use syn::fold::Fold;
+    let mut lifetime_args = Vec::new();
+    let mut other_args = Vec::new();
+    for arg in iter {
+        match arg {
+            GenericArgument::Lifetime(_) => lifetime_args.push(arg),
+            GenericArgument::Type(_) | GenericArgument::Const(_) => other_args.push(arg),
+            _ => (),
+        }
+    }
+    let mut lifetime_args = lifetime_args.into_iter();
+    let mut other_args = other_args.into_iter();
+    // Substitution of the preceding parameters, used for defaults.
+    let mut substitute = SubstituteParams::default();
+    let mut elems = Punctuated::<Type, Token![,]>::new();
+    for param in params {
+        match param {
+            GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => match lifetime_args.next() {
+                Some(GenericArgument::Lifetime(arg)) => {
+                    substitute.lifetimes.insert(lifetime.clone(), arg.clone());
+                    elems.push(parse_quote!(& #arg ()));
+                }
+                _ => return Err(EncodeError::MissingArgument(Box::new(param.clone()))),
+            },
+            GenericParam::Type(tp) => {
+                let ty: Type = match other_args.next() {
+                    Some(GenericArgument::Type(ty)) => ty.clone(),
+                    Some(arg) => {
+                        return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())))
+                    }
+                    None => match &tp.default {
+                        Some(default) => substitute.fold_type(default.clone()),
+                        None => return Err(EncodeError::MissingArgument(Box::new(param.clone()))),
+                    },
+                };
+                substitute.types.insert(tp.ident.clone(), ty.clone());
+                elems.push(ty);
+            }
+            GenericParam::Const(cp) => {
+                let value: Expr = match other_args.next() {
+                    Some(GenericArgument::Const(expr)) => expr.clone(),
+                    Some(GenericArgument::Type(Type::Path(TypePath { qself: None, path })))
+                        if path.get_ident().is_some() =>
+                    {
+                        parse_quote!(#path)
+                    }
+                    Some(arg) => {
+                        return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())))
+                    }
+                    None => match &cp.default {
+                        Some(default) => substitute.fold_expr(default.clone()),
+                        None => return Err(EncodeError::MissingArgument(Box::new(param.clone()))),
+                    },
+                };
+                substitute.consts.insert(cp.ident.clone(), value.clone());
+                elems.push(const_fn(&normalize_const_arg(&value), cp)?);
+            }
+        }
+    }
+    if let Some(arg) = lifetime_args.next().or_else(|| other_args.next()) {
+        return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())));
+    }
+    Ok(Type::Tuple(TypeTuple {
+        paren_token: Default::default(),
+        elems: with_trailing_comma(elems),
+    }))
 }
 
 /// Primitive types which can be the type of const parameters on stable Rust.
@@ -955,78 +1032,7 @@ impl RepeaterSlots {
         iter: impl IntoIterator<Item = &'a GenericArgument>,
         params: &Punctuated<GenericParam, Token![,]>,
     ) -> std::result::Result<Type, EncodeError> {
-        use syn::fold::Fold;
-        let mut lifetime_args = Vec::new();
-        let mut other_args = Vec::new();
-        for arg in iter {
-            match arg {
-                GenericArgument::Lifetime(_) => lifetime_args.push(arg),
-                GenericArgument::Type(_) | GenericArgument::Const(_) => other_args.push(arg),
-                _ => (),
-            }
-        }
-        let mut lifetime_args = lifetime_args.into_iter();
-        let mut other_args = other_args.into_iter();
-        // Substitution of the preceding parameters, used for defaults.
-        let mut substitute = SubstituteParams::default();
-        let mut elems = Punctuated::<Type, Token![,]>::new();
-        for param in params {
-            match param {
-                GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
-                    match lifetime_args.next() {
-                        Some(GenericArgument::Lifetime(arg)) => {
-                            substitute.lifetimes.insert(lifetime.clone(), arg.clone());
-                            elems.push(parse_quote!(& #arg ()));
-                        }
-                        _ => return Err(EncodeError::MissingArgument(Box::new(param.clone()))),
-                    }
-                }
-                GenericParam::Type(tp) => {
-                    let ty: Type = match other_args.next() {
-                        Some(GenericArgument::Type(ty)) => ty.clone(),
-                        Some(arg) => {
-                            return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())))
-                        }
-                        None => match &tp.default {
-                            Some(default) => substitute.fold_type(default.clone()),
-                            None => {
-                                return Err(EncodeError::MissingArgument(Box::new(param.clone())))
-                            }
-                        },
-                    };
-                    substitute.types.insert(tp.ident.clone(), ty.clone());
-                    elems.push(ty);
-                }
-                GenericParam::Const(cp) => {
-                    let value: Expr = match other_args.next() {
-                        Some(GenericArgument::Const(expr)) => expr.clone(),
-                        Some(GenericArgument::Type(Type::Path(TypePath { qself: None, path })))
-                            if path.get_ident().is_some() =>
-                        {
-                            parse_quote!(#path)
-                        }
-                        Some(arg) => {
-                            return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())))
-                        }
-                        None => match &cp.default {
-                            Some(default) => substitute.fold_expr(default.clone()),
-                            None => {
-                                return Err(EncodeError::MissingArgument(Box::new(param.clone())))
-                            }
-                        },
-                    };
-                    substitute.consts.insert(cp.ident.clone(), value.clone());
-                    elems.push(self.encode_const(&value, &cp.ty)?);
-                }
-            }
-        }
-        if let Some(arg) = lifetime_args.next().or_else(|| other_args.next()) {
-            return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())));
-        }
-        Ok(Type::Tuple(TypeTuple {
-            paren_token: Default::default(),
-            elems: with_trailing_comma(elems),
-        }))
+        encode_generics_args_with_params(iter, params, |value, cp| self.encode_const(value, &cp.ty))
     }
 }
 
@@ -1509,7 +1515,7 @@ impl Leaker {
         };
         f(&mut visitor);
         if let Some(e) = visitor.error {
-            Err(NotInternableError(e))
+            Err(NotInternableError(e, NotInternableReason::RelativePath))
         } else {
             let operations = visitor.operations;
             // The Referrer finds leaked types by the type alone, so the same type must depend on
@@ -1529,7 +1535,10 @@ impl Leaker {
                         )
                 };
                 if conflicts {
-                    return Err(NotInternableError(quote!(#ty)));
+                    return Err(NotInternableError(
+                        quote!(#ty),
+                        NotInternableReason::ConflictingLocalGenerics,
+                    ));
                 }
                 if operation.local_generics.params.is_empty() {
                     self.plain_types.insert(ty.clone());
@@ -1841,7 +1850,7 @@ impl Leaker {
     /// When initialized with [`Leaker::from_struct()`], the [`Leaker`] analyzes the AST and
     /// constructs a DAG representing all internable types and their dependency relations:
     ///
-    /// ![before_graph](https://raw.github.com/yasuo-ozu/type-leak/master/resources/before_graph.svg)
+    /// ![before_graph](https://raw.githubusercontent.com/yasuo-ozu/type-leak/main/resources/before_graph.svg)
     ///
     /// **Red** nodes are flagged as [`CheckResult::MustIntern`] by [`Leaker::check()`], meaning
     /// the type literally depends on the type context and must be interned.
@@ -1858,7 +1867,7 @@ impl Leaker {
     ///
     /// The final result looks like:
     ///
-    /// ![after_graph](https://raw.github.com/yasuo-ozu/type-leak/master/resources/after_graph.svg)
+    /// ![after_graph](https://raw.githubusercontent.com/yasuo-ozu/type-leak/main/resources/after_graph.svg)
     pub fn reduce_roots(&mut self) {
         if self.reachable_types.is_none() {
             self.reachable_types = Some(self.build_graph_and_reduce(&self.operations));

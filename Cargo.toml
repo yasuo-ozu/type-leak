@@ -13,6 +13,8 @@ categories = [
   "rust-patterns",
 ]
 license = "MIT"
+# The cross-crate test depends on the test crates under tests/crates, which are not published.
+exclude = ["tests/crates", "tests/cross_crate.rs"]
 
 [lib]
 path = "lib.rs"

@@ -78,7 +78,10 @@ fn limit_conflicting_local_generics() {
     .unwrap();
     assert_eq!(
         leak_trait(&item),
-        Err("use absolute path: 'Wrap < B >'".to_string())
+        Err(
+            "'Wrap < B >' is used with different method-local generics, which cannot be leaked"
+                .to_string()
+        )
     );
 
     // The suggested fix works: an absolute path does not need to be leaked.
@@ -110,9 +113,31 @@ fn limit_conflicting_local_generics() {
     ] {
         assert_eq!(
             leak_trait(&item),
-            Err("use absolute path: 'Wrap < B >'".to_string())
+            Err(
+                "'Wrap < B >' is used with different method-local generics, which cannot be leaked"
+                    .to_string()
+            )
         );
     }
+
+    // The note suggests how to fix it.
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait {
+            fn f<const B: bool>(&self) -> Wrap<B>;
+            fn g<const B: u8>(&self) -> Wrap<B>;
+        }
+    })
+    .unwrap();
+    let mut leaker = Leaker::from_config(leaker_config());
+    let err = leaker
+        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
+        .err()
+        .unwrap();
+    assert_eq!(err.1, NotInternableReason::ConflictingLocalGenerics);
+    assert_eq!(
+        err.note().as_deref(),
+        Some("use an absolute path for it, or the same method-local generics wherever it is used")
+    );
 
     // The same local generics in several methods are fine.
     let item: ItemTrait = parse2(quote! {
@@ -195,55 +220,27 @@ fn limit_plain_encoders_usize_only() {
     );
 }
 
-// ── holes ────────────────────────────────────────────────────────────────────
-
 #[test]
-fn hole_omitted_default_arg() {
-    // HOLE: a defaulted const parameter omitted in the Referrer's arguments.
-    //
-    // The plain encoders encode all parameters, but only the given arguments, so the two
-    // encodings differ and the Repeater's implementation is not found.
-    // Expected after fix: missing arguments are filled from the parameters' defaults, giving
-    // `(u8, [(); 3])`, as `RepeaterSlots` does.
-    let generics: Generics = parse2(quote!(<T, const N: usize = 3>)).unwrap();
-    let args: AngleBracketedGenericArguments = parse2(quote!(<u8>)).unwrap();
+fn limit_plain_args_encoder_without_params() {
+    // Without the parameters, `encode_generics_args_to_ty()` encodes the arguments as they are:
+    // a bare `N` (parsed by syn as a type argument) is encoded as a type instead of `[(); N]`, and
+    // omitted arguments are not filled with the parameters' defaults, so the result may differ
+    // from `encode_generics_params_to_ty()`. `encode_generics_args_to_ty_with()` with the
+    // parameters handles both.
+    let generics: Generics = parse2(quote!(<T, const N: usize, const M: usize = 3>)).unwrap();
+    let args: AngleBracketedGenericArguments = parse2(quote!(<u8, N>)).unwrap();
 
-    let params_ty = encode_generics_params_to_ty(&generics.params);
-    let args_ty = encode_generics_args_to_ty_with(&args.args, Some(&generics.params), |expr, _| {
+    let ty = encode_generics_args_to_ty(&args.args);
+    assert_eq!(ty_string(&ty), expected_ty(quote!((u8, N))));
+
+    let ty = encode_generics_args_to_ty_with(&args.args, Some(&generics.params), |expr, _| {
         parse2(quote!([(); #expr])).unwrap()
-    });
-    assert_eq!(ty_string(&params_ty), expected_ty(quote!((T, [(); N]))));
-    assert_eq!(ty_string(&args_ty), expected_ty(quote!((u8,))));
-
-    let slots = RepeaterSlots::new(parse2(quote!(crate::Repeater)).unwrap());
-    let ty = slots
-        .encode_generics_args_to_ty(&args.args, &generics.params)
-        .unwrap();
-    assert_eq!(ty_string(&ty), expected_ty(quote!((u8, [(); 3]))));
+    })
+    .unwrap();
+    assert_eq!(ty_string(&ty), expected_ty(quote!((u8, [(); N], [(); 3]))));
 }
 
-#[test]
-fn hole_assoc_binding_arg() {
-    // HOLE: the plain encoders panic on an associated binding in the arguments.
-    //
-    // Expected after fix: bindings are skipped when encoding the arguments, giving `(u8,)`, as
-    // `RepeaterSlots` does.
-    let args: AngleBracketedGenericArguments = parse2(quote!(<u8, Item = u8>)).unwrap();
-
-    let result = std::panic::catch_unwind(|| encode_generics_args_to_ty(&args.args));
-    let payload = result.unwrap_err();
-    assert_eq!(
-        payload.downcast_ref::<String>().map(String::as_str),
-        Some("unsupported generic argument: 'Item = u8'")
-    );
-
-    let generics: Generics = parse2(quote!(<T>)).unwrap();
-    let slots = RepeaterSlots::new(parse2(quote!(crate::Repeater)).unwrap());
-    let ty = slots
-        .encode_generics_args_to_ty(&args.args, &generics.params)
-        .unwrap();
-    assert_eq!(ty_string(&ty), expected_ty(quote!((u8,))));
-}
+// ── holes ────────────────────────────────────────────────────────────────────
 
 #[test]
 fn hole_bare_const_in_bound() {
@@ -286,49 +283,6 @@ fn hole_shadowed_primitive() {
     })
     .unwrap();
     assert_eq!(leak_trait(&item), Ok(vec![]));
-}
-
-#[test]
-fn hole_plain_args_encoder_bare_const() {
-    // HOLE: without the parameters, `encode_generics_args_to_ty()` cannot tell that a bare `N`
-    // (parsed by syn as a type argument) is a const, and encodes it as the type `N` instead of
-    // `[(); N]`, so it does not match `encode_generics_params_to_ty()`.
-    //
-    // Not fixable without the parameters; `encode_generics_args_to_ty_with()` and `RepeaterSlots`
-    // with the parameters handle it.
-    let generics: Generics = parse2(quote!(<T, const N: usize>)).unwrap();
-    let args: AngleBracketedGenericArguments = parse2(quote!(<u8, N>)).unwrap();
-
-    let ty = encode_generics_args_to_ty(&args.args);
-    assert_eq!(ty_string(&ty), expected_ty(quote!((u8, N))));
-
-    let ty = encode_generics_args_to_ty_with(&args.args, Some(&generics.params), |expr, _| {
-        parse2(quote!([(); #expr])).unwrap()
-    });
-    assert_eq!(ty_string(&ty), expected_ty(quote!((u8, [(); N]))));
-}
-
-#[test]
-fn hole_args_not_checked_against_params() {
-    // HOLE: arguments are paired with parameters by position without checking their number, so
-    // an extra argument is encoded as is, and the encoding silently differs from the parameters'
-    // encoding.
-    //
-    // Expected after fix: a mismatch is reported (e.g. by a panic or a `Result`), as
-    // `RepeaterSlots` does.
-    let generics: Generics = parse2(quote!(<const N: usize>)).unwrap();
-    let args: AngleBracketedGenericArguments = parse2(quote!(<3, u8>)).unwrap();
-
-    let ty = encode_generics_args_to_ty_with(&args.args, Some(&generics.params), |expr, _| {
-        parse2(quote!([(); #expr])).unwrap()
-    });
-    assert_eq!(ty_string(&ty), expected_ty(quote!(([(); 3], u8))));
-
-    let slots = RepeaterSlots::new(parse2(quote!(crate::Repeater)).unwrap());
-    let err = slots
-        .encode_generics_args_to_ty(&args.args, &generics.params)
-        .unwrap_err();
-    assert_eq!(err.to_string(), "unexpected generic argument: 'u8'");
 }
 
 // ── error messages ───────────────────────────────────────────────────────────

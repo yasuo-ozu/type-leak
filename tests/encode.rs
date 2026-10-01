@@ -19,7 +19,8 @@ fn test_encode_generics_const() {
         &args.args,
         Some(&generics.params),
         |expr, _| parse_quote!([(); #expr]),
-    );
+    )
+    .unwrap();
     assert_eq!(
         quote!(#ty).to_string(),
         quote!((&'static (), u8, [(); N])).to_string()
@@ -183,7 +184,8 @@ fn test_const_args_are_braced_when_needed() {
         &args.args,
         None,
         |expr, _| parse_quote!(::my_crate::ConstI32<#expr>),
-    );
+    )
+    .unwrap();
     let expected: Type =
         parse_quote!((::my_crate::ConstI32<{ i32::MIN }>, ::my_crate::ConstI32<N>));
     assert_eq!(to_string(&ty), to_string(&expected));
@@ -214,4 +216,43 @@ fn test_encode_generics_params_to_ty_with() {
     );
     let expected: Type = parse_quote!((&'a (), T, ::my_crate::ConstBool<B>));
     assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
+}
+
+#[test]
+fn test_plain_args_encoder_with_params() {
+    use type_leak::*;
+    let to_string = |ty: &Type| quote!(#ty).to_string();
+    let encode = |args: &AngleBracketedGenericArguments, generics: &Generics| {
+        encode_generics_args_to_ty_with(
+            &args.args,
+            Some(&generics.params),
+            |expr, _| parse_quote!([(); #expr]),
+        )
+    };
+
+    // Omitted defaults are filled, a bare `N` is a const, and bindings are skipped.
+    let generics: Generics = parse_quote!(<'a, T, const N: usize, U = Vec<T>>);
+    let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8, N, Item = u8>);
+    let expected: Type = parse_quote!((&'static (), u8, [(); N], Vec<u8>));
+    assert_eq!(
+        to_string(&encode(&args, &generics).unwrap()),
+        to_string(&expected)
+    );
+
+    // Too many or missing arguments are reported.
+    let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8, 3, u16, u32>);
+    assert_eq!(
+        encode(&args, &generics).unwrap_err().to_string(),
+        "unexpected generic argument: 'u32'"
+    );
+    let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8>);
+    assert_eq!(
+        encode(&args, &generics).unwrap_err().to_string(),
+        "missing generic argument for 'const N : usize'"
+    );
+
+    // Without the parameters, bindings are skipped (they used to panic).
+    let args: AngleBracketedGenericArguments = parse_quote!(<u8, Item = u8>);
+    let ty = encode_generics_args_to_ty(&args.args);
+    assert_eq!(to_string(&ty), to_string(&parse_quote!((u8,))));
 }
