@@ -1,6 +1,6 @@
 //! The error of the analysis by the [`Leaker`](crate::Leaker).
 
-use crate::check::CheckResult;
+use crate::analyze::CheckResult;
 use proc_macro2::{Span, TokenStream};
 use syn::spanned::Spanned;
 use template_quote::ToTokens;

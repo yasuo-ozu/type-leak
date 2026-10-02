@@ -1,19 +1,13 @@
 //! The [`Leaker`], which finds the types depending on the type context.
 
-use crate::check::CheckResult;
+use crate::analyze::{AnalyzeVisitor, CheckResult};
 use crate::config::LeakerConfig;
-use crate::encode::is_const_param_ty;
 use crate::error::NotInternableError;
 use crate::graph::{descendants, reaches, TypeGraph, TypeKey};
 use crate::referrer::Referrer;
-use crate::util::{
-    generic_param_name, is_primitive_name, looks_like_const, mentions_generics, path_starts_with,
-    token_names, unwrap_type_group,
-};
+use crate::util::path_starts_with;
 use proc_macro2::{Span, TokenStream};
 use std::collections::{HashMap, HashSet};
-use syn::punctuated::Punctuated;
-use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
 
@@ -29,368 +23,6 @@ pub struct Leaker {
     /// Names of primitive types which were assumed to be the primitive types (not shadowed), as
     /// they are copied as they are (see [`Leaker::assertions()`]).
     assumed_primitives: Vec<Ident>,
-}
-
-/// Returns the local generics which `ty` depends on, including those used in the bounds and
-/// where predicates of them, in the order of declaration.
-///
-/// Identifiers are matched by name, so a local generic may be included even if the name refers to
-/// something else (e.g. `::path::N`). This is harmless, because the Leaker and the Referrer
-/// include the same generics.
-fn required_local_generics<'a>(
-    ty: &Type,
-    locals: impl Iterator<Item = &'a GenericParam> + Clone,
-    predicates: &[WherePredicate],
-) -> Generics {
-    let mut names = HashSet::new();
-    token_names(quote!(#ty), &mut names);
-    let mut included_params = vec![false; locals.clone().count()];
-    let mut included_predicates = vec![false; predicates.len()];
-    loop {
-        let mut changed = false;
-        for (included, param) in included_params.iter_mut().zip(locals.clone()) {
-            if !*included && names.contains(&generic_param_name(param)) {
-                *included = true;
-                token_names(quote!(#param), &mut names);
-                changed = true;
-            }
-        }
-        for (included, predicate) in included_predicates.iter_mut().zip(predicates) {
-            if *included {
-                continue;
-            }
-            let mut predicate_names = HashSet::new();
-            token_names(quote!(#predicate), &mut predicate_names);
-            let mentions_included = locals
-                .clone()
-                .zip(&included_params)
-                .any(|(param, inc)| *inc && predicate_names.contains(&generic_param_name(param)));
-            if mentions_included {
-                *included = true;
-                names.extend(predicate_names);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    let params: Punctuated<GenericParam, Token![,]> = locals
-        .zip(&included_params)
-        .filter(|(_, inc)| **inc)
-        .map(|(param, _)| {
-            let mut param = param.clone();
-            match &mut param {
-                GenericParam::Type(tp) => {
-                    tp.eq_token = None;
-                    tp.default = None;
-                }
-                GenericParam::Const(cp) => {
-                    cp.eq_token = None;
-                    cp.default = None;
-                }
-                GenericParam::Lifetime(_) => (),
-            }
-            param
-        })
-        .collect();
-    let predicates: Punctuated<WherePredicate, Token![,]> = predicates
-        .iter()
-        .zip(&included_predicates)
-        .filter(|(_, inc)| **inc)
-        .map(|(predicate, _)| predicate.clone())
-        .collect();
-    Generics {
-        lt_token: Some(Default::default()),
-        gt_token: Some(Default::default()),
-        where_clause: if predicates.is_empty() {
-            None
-        } else {
-            Some(WhereClause {
-                where_token: Default::default(),
-                predicates,
-            })
-        },
-        params,
-    }
-}
-
-struct AnalyzeVisitor<'a> {
-    leaker: &'a mut Leaker,
-    generics: Generics,
-    /// The number of leading `generics.params` which belong to the Leaker itself. The rest are
-    /// local generics (e.g. of trait methods or GATs), which cannot be referred to from the
-    /// Repeater's implementation.
-    n_outer_generics: usize,
-    /// Where predicates of the local generics.
-    local_predicates: Vec<WherePredicate>,
-    /// The type whose components are being visited.
-    parent: Option<TypeKey>,
-    /// The relative paths which cannot be interned.
-    errors: Vec<CheckResult>,
-    /// The first type used with different local generics in different places.
-    conflicting_local_generics: Option<TokenStream>,
-    /// The types found by this visitor, merged into the Leaker if successful.
-    types: TypeGraph,
-}
-
-impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
-    fn visit_trait_item_fn(&mut self, i: &TraitItemFn) {
-        let mut i = i.clone();
-        i.default = None;
-        i.semi_token = Some(Default::default());
-        self.with_local_generics(&i.sig.generics, |visitor| {
-            syn::visit::visit_trait_item_fn(visitor, &i)
-        });
-    }
-
-    fn visit_trait_item_type(&mut self, i: &TraitItemType) {
-        self.with_local_generics(&i.generics, |visitor| {
-            syn::visit::visit_trait_item_type(visitor, i)
-        });
-    }
-
-    fn visit_type(&mut self, i: &Type) {
-        let locals = self.generics.params.iter().skip(self.n_outer_generics);
-        let mentions_local = mentions_generics(i, locals.clone());
-        let result = self.leaker.check(i, &self.generics);
-        if !result.impossible.is_empty() {
-            if result.is_own {
-                // The type must be interned (because of its own path, the first of `must`, which
-                // depends on the type context) but cannot be (e.g. `MyType<'_>`), and cannot be
-                // decomposed either. The path should be made absolute.
-                self.errors.push(result);
-            } else if !result.must.is_empty() {
-                // The type cannot be interned as a whole (e.g. `&MyType` with an elided lifetime,
-                // or `impl Iterator<Item = MyType>`), but its components can.
-                syn::visit::visit_type(self, i);
-            }
-            // Otherwise, the type cannot be interned, but does not need to be (e.g.
-            // `impl ::path::Trait`).
-            return;
-        }
-        let is_must_intern = result.is_own;
-        if mentions_local {
-            if is_must_intern {
-                // The type depends on both the type context and local generics, and cannot be
-                // decomposed further. It is interned together with the local generics it needs,
-                // which the Repeater's implementation must declare (see
-                // [`Referrer::local_generics()`]).
-                let local_generics = required_local_generics(i, locals, &self.local_predicates);
-                if self
-                    .types
-                    .add(i, self.parent.as_ref(), true, local_generics)
-                    .is_err()
-                {
-                    self.conflict_local_generics(i);
-                }
-            } else {
-                // The type itself cannot be interned because the Repeater's implementation
-                // cannot refer to the local generics, but its components can.
-                syn::visit::visit_type(self, i);
-            }
-            return;
-        }
-
-        if self.parent.is_none() && is_must_intern && looks_like_const(i) {
-            // A bare identifier such as `SIZE` in `T: MyTrait<SIZE>` is parsed as a type, but is
-            // probably a const (by the naming convention), which cannot be leaked on its own (like
-            // `T: MyTrait<{ SIZE }>`).
-            self.relative_path(quote!(#i), quote!(#i));
-            return;
-        }
-
-        let ix = match self
-            .types
-            .add(i, self.parent.as_ref(), is_must_intern, Generics::default())
-        {
-            Ok(ix) => ix,
-            Err(()) => {
-                self.conflict_local_generics(i);
-                return;
-            }
-        };
-
-        if !is_must_intern {
-            // Visit the components
-            let parent = self.parent.replace(ix);
-            syn::visit::visit_type(self, i);
-            self.parent = parent;
-        }
-    }
-
-    fn visit_const_param(&mut self, i: &ConstParam) {
-        // The type of a const parameter cannot be a projection (such as
-        // `<MyLeakerType as Repeater<0>>::Type`), so it is never interned. It must be a primitive
-        // type, or a context-free path to a type alias of it (e.g. `::my_crate::Idx`).
-        for attr in &i.attrs {
-            self.visit_attribute(attr);
-        }
-        match unwrap_type_group(&i.ty) {
-            ty @ Type::Path(TypePath { qself: None, path }) if is_const_param_ty(ty) => {
-                // A bare primitive name (e.g. `u8`, not `::core::primitive::u8`) is copied as it
-                // is, assuming that it is not shadowed.
-                if let Some(ident) = path.get_ident() {
-                    self.leaker.assume_primitive(ident);
-                }
-            }
-            Type::Path(TypePath { qself: None, path })
-                if self.leaker.is_context_free_path(path) => {}
-            _ => {
-                // The type of a const parameter cannot be interned.
-                self.relative_path(quote!(#{&i.ty}), quote!(#i));
-                return;
-            }
-        }
-        if let Some(expr) = &i.default {
-            self.visit_expr(expr);
-        }
-    }
-
-    fn visit_trait_bound(&mut self, i: &TraitBound) {
-        // Trait bounds with a non-absolute path
-        if !self.leaker.is_context_free_path(&i.path) {
-            // A trait bound cannot be interned.
-            self.relative_path(quote!(#i), quote!(#i));
-            return;
-        }
-        self.with_bound_lifetimes(i.lifetimes.as_ref(), |v| {
-            syn::visit::visit_trait_bound(v, i)
-        })
-    }
-
-    fn visit_type_bare_fn(&mut self, i: &TypeBareFn) {
-        self.with_bound_lifetimes(i.lifetimes.as_ref(), |v| {
-            syn::visit::visit_type_bare_fn(v, i)
-        })
-    }
-
-    fn visit_predicate_type(&mut self, i: &PredicateType) {
-        self.with_bound_lifetimes(i.lifetimes.as_ref(), |v| {
-            syn::visit::visit_predicate_type(v, i)
-        })
-    }
-
-    fn visit_path(&mut self, i: &Path) {
-        // A primitive type allowed by `allowed_paths` (e.g. by `LeakerConfig::allow_primitive()`)
-        // is copied as it is, assuming that its name is not shadowed. The name alone cannot
-        // prove it (e.g. `type u16 = i32;` in the Leaker's module), so it is recorded for
-        // `Leaker::assertions()`, which fails to compile there if the name is shadowed.
-        if i.leading_colon.is_none() && self.leaker.is_context_free_path(i) {
-            if let Some(seg) = i.segments.first() {
-                let is_generic = self.generics.params.iter().any(|gp| match gp {
-                    GenericParam::Type(TypeParam { ident, .. })
-                    | GenericParam::Const(ConstParam { ident, .. }) => ident == &seg.ident,
-                    _ => false,
-                });
-                if !is_generic && is_primitive_name(&seg.ident) {
-                    self.leaker.assume_primitive(&seg.ident);
-                }
-            }
-        }
-        syn::visit::visit_path(self, i)
-    }
-
-    fn visit_trait_item_const(&mut self, i: &TraitItemConst) {
-        // Like the bodies of methods, defaults of associated consts are not copied.
-        let mut i = i.clone();
-        i.default = None;
-        syn::visit::visit_trait_item_const(self, &i)
-    }
-
-    fn visit_expr_path(&mut self, i: &ExprPath) {
-        // Values starting with a generic parameter in scope (e.g. `N` or `T::N` where
-        // `const N: usize` or `T` is a generic parameter) or `Self` do not depend on the type
-        // context.
-        let starts_with_generic = i.qself.is_none()
-            && i.path.leading_colon.is_none()
-            && i.path.segments.first().map_or(false, |seg| {
-                seg.arguments.is_none()
-                    && ((seg.ident == "Self" && self.leaker.self_ty_can_be_interned)
-                        || self.generics.params.iter().any(|gp| match gp {
-                            GenericParam::Type(TypeParam { ident, .. })
-                            | GenericParam::Const(ConstParam { ident, .. }) => ident == &seg.ident,
-                            _ => false,
-                        }))
-            });
-        if starts_with_generic || self.leaker.is_context_free_path(&i.path) {
-            syn::visit::visit_expr_path(self, i)
-        } else {
-            // A value with a relative path, which cannot be interned
-            self.relative_path(quote!(#i), quote!(#i));
-        }
-    }
-}
-
-impl AnalyzeVisitor<'_> {
-    /// Records that the relative path `must` cannot be interned (because of `impossible`, e.g. a
-    /// trait bound or a value containing it), so it should be absolute.
-    fn relative_path(&mut self, must: TokenStream, impossible: TokenStream) {
-        self.errors.push(CheckResult {
-            must: vec![must],
-            impossible: vec![impossible],
-            is_own: true,
-        });
-    }
-
-    /// Records that `ty` is used with different local generics in different places.
-    fn conflict_local_generics(&mut self, ty: &Type) {
-        self.conflicting_local_generics
-            .get_or_insert_with(|| quote!(#ty));
-    }
-
-    /// Runs `f` with a visitor where `generics` (of a trait method or a GAT) are added as local
-    /// generics, sharing the error and the types found with this visitor.
-    fn with_local_generics(
-        &mut self,
-        generics: &Generics,
-        f: impl FnOnce(&mut AnalyzeVisitor<'_>),
-    ) {
-        let mut visitor = AnalyzeVisitor {
-            leaker: self.leaker,
-            generics: self.generics.clone(),
-            n_outer_generics: self.n_outer_generics,
-            local_predicates: self.local_predicates.clone(),
-            parent: self.parent.clone(),
-            errors: std::mem::take(&mut self.errors),
-            conflicting_local_generics: self.conflicting_local_generics.take(),
-            types: std::mem::take(&mut self.types),
-        };
-        visitor
-            .generics
-            .params
-            .extend(generics.params.iter().cloned());
-        if let Some(wc) = &generics.where_clause {
-            visitor
-                .local_predicates
-                .extend(wc.predicates.iter().cloned());
-        }
-        f(&mut visitor);
-        self.errors = visitor.errors;
-        self.conflicting_local_generics = visitor.conflicting_local_generics;
-        self.types = visitor.types;
-    }
-
-    /// Runs `f` with the lifetimes of a `for<..>` binder (e.g. `'a` in `for<'a> Fn(&'a T)`) in
-    /// scope. They are treated as local generics, which the Repeater's implementation cannot
-    /// refer to.
-    fn with_bound_lifetimes<R>(
-        &mut self,
-        lifetimes: Option<&BoundLifetimes>,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        let len = self.generics.params.len();
-        if let Some(lifetimes) = lifetimes {
-            self.generics
-                .params
-                .extend(lifetimes.lifetimes.iter().cloned());
-        }
-        let result = f(self);
-        while self.generics.params.len() > len {
-            self.generics.params.pop();
-        }
-        result
-    }
 }
 
 impl Default for Leaker {
@@ -574,24 +206,19 @@ impl Leaker {
     where
         F: FnOnce(&mut dyn syn::visit::Visit<'ast>),
     {
-        let mut visitor = AnalyzeVisitor {
-            leaker: self,
-            parent: None,
-            errors: Vec::new(),
-            conflicting_local_generics: None,
-            generics: generics.clone(),
-            n_outer_generics: generics.params.len(),
-            local_predicates: Vec::new(),
-            types: TypeGraph::default(),
-        };
+        let mut visitor = AnalyzeVisitor::new(self, generics);
         f(&mut visitor);
-        if !visitor.errors.is_empty() {
-            return Err(NotInternableError::RelativePath(visitor.errors));
+        let analysis = visitor.finish();
+        for ident in &analysis.primitives {
+            self.assume_primitive(ident);
         }
-        if let Some(ty) = visitor.conflicting_local_generics {
+        if !analysis.errors.is_empty() {
+            return Err(NotInternableError::RelativePath(analysis.errors));
+        }
+        if let Some(ty) = analysis.conflicting_local_generics {
             return Err(NotInternableError::ConflictingLocalGenerics(ty));
         }
-        let types = visitor.types;
+        let types = analysis.types;
         // The Referrer finds leaked types by the type alone, so the same type must depend on the
         // same local generics wherever it appears (e.g. not `Wrap<B>` both in
         // `fn f<const B: bool>()` and in `fn g()` where `B` is a type).
@@ -608,7 +235,7 @@ impl Leaker {
 
     /// Checks whether the given `ty` must be interned, and whether it can be. See [`CheckResult`].
     pub fn check(&self, ty: &Type, generics: &Generics) -> CheckResult {
-        crate::check::check(self, ty, generics)
+        AnalyzeVisitor::check(self, ty, generics)
     }
 
     /// Finish building the [`Leaker`] and convert it into [`Referrer`].

@@ -490,3 +490,15 @@ fn test_qualified_paths_are_decomposed() {
         "use absolute path: 'RelTrait < '_ > :: Ty'"
     );
 }
+
+#[test]
+fn test_impl_trait_binders() {
+    // The lifetimes of a `for<..>` binder in an `impl Trait` bound are in scope inside it, so they
+    // are not leaked (nor reported as relative).
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            fn f(&self, x: impl for<'b> ::p::F<&'b RelA>);
+        }
+    };
+    assert_eq!(leak_trait(&item).unwrap(), strings(&["RelA"]));
+}

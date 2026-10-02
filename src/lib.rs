@@ -4,7 +4,7 @@
 #[cfg(type_leak_diagnostic)]
 extern crate proc_macro;
 
-mod check;
+mod analyze;
 mod config;
 mod encode;
 mod error;
@@ -16,7 +16,7 @@ mod util;
 
 pub use syn;
 
-pub use crate::check::CheckResult;
+pub use crate::analyze::CheckResult;
 pub use crate::config::LeakerConfig;
 #[allow(deprecated)]
 pub use crate::encode::encode_generics_args_to_ty;
