@@ -27,3 +27,15 @@ type_leak_test_leaker::m::Edge!(impl Edge<u8> for Concrete => 0);
 
 // A trait without generic arguments.
 type_leak_test_leaker::m::Plain!(impl Plain for Concrete => 0);
+
+/// The omitted default `RelDefault<u8>` is relative to the Leaker's module.
+pub struct Omitted(pub Inner);
+type_leak_test_leaker::m::Defaulted!(impl Defaulted<u8> for Omitted => 0);
+
+/// The default is given explicitly.
+pub struct Explicit(pub Inner);
+type_leak_test_leaker::m::Defaulted!(impl Defaulted<u8, u32> for Explicit => 0);
+
+/// A generic argument is used by the default.
+pub struct Generic2<T>(pub Inner, pub core::marker::PhantomData<T>);
+type_leak_test_leaker::m::Defaulted!(impl<T> Defaulted<T> for Generic2<T> => 0);

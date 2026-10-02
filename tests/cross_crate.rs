@@ -6,8 +6,10 @@
 //! - `tests/crates/referrer`: the Referrer's crate, implementing the traits for wrappers which
 //!   forward to `Inner`.
 
-use type_leak_test_leaker::m::{Consts, Defaults, Edge, Holder, Inner, Plain, RelType};
-use type_leak_test_referrer::{Concrete, Generic};
+use type_leak_test_leaker::m::{
+    Consts, Defaulted, Defaults, Edge, Holder, Inner, Plain, RelDefault, RelType,
+};
+use type_leak_test_referrer::{Concrete, Explicit, Generic, Generic2, Omitted};
 
 #[test]
 fn concrete_args() {
@@ -55,6 +57,22 @@ fn omitted_default_args() {
     let g = Generic::<false, 5>(Inner);
     assert_eq!(g.default_array().len(), 5);
     assert!(g.default_flag().get());
+}
+
+#[test]
+fn omitted_relative_default() {
+    // The omitted `U` is the Leaker's `RelDefault<u8>`, which the Referrer's crate cannot name.
+    let r: RelDefault<u8> = <Omitted as Defaulted<u8>>::get(&Omitted(Inner), 7);
+    assert_eq!(r, RelDefault(7));
+    // The default mentions the argument given for `T`.
+    let r: RelDefault<&str> =
+        <Generic2<&str> as Defaulted<&str>>::get(&Generic2(Inner, Default::default()), "x");
+    assert_eq!(r, RelDefault("x"));
+    // An explicit argument is used as it is.
+    assert_eq!(
+        <Explicit as Defaulted<u8, u32>>::get(&Explicit(Inner), 5),
+        105
+    );
 }
 
 #[test]

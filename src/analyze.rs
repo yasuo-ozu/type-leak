@@ -11,6 +11,7 @@ use crate::leaker::Leaker;
 use crate::requirements::{Requirements, Scope};
 use crate::util::{is_primitive_name, looks_like_const, unwrap_type_group};
 use proc_macro2::TokenStream;
+use std::collections::HashSet;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
@@ -78,6 +79,9 @@ struct Frame {
     /// The minimum index in the visitor's `scopes` of the local generics mentioned in the type
     /// (`usize::MAX` if none).
     local_scope: usize,
+    /// The type mentions an item declared in an analyzed module (see
+    /// [`AnalyzeVisitor::is_module_path()`]).
+    module_item: bool,
     /// The effects, which are applied if the type is decomposed.
     effects: Vec<Effect>,
 }
@@ -89,6 +93,7 @@ impl Frame {
             impossible_start,
             min_depth: usize::MAX,
             local_scope: usize::MAX,
+            module_item: false,
             effects: Vec::new(),
         }
     }
@@ -114,6 +119,9 @@ pub(crate) struct AnalyzeVisitor<'a> {
     /// or `for<..>` binders), the innermost last. The Repeater's implementation cannot refer to
     /// them, so a type depending on them is interned with its [`Requirements`].
     scopes: Vec<Scope>,
+    /// The names declared directly in each module being analyzed (see [`Leaker::from_module()`]),
+    /// the innermost last. Paths to them are copied with the module, so they are portable.
+    modules: Vec<HashSet<String>>,
     /// The causes which depend on the type context (see [`CheckResult::must`]), each with the
     /// depth of the type it is found in, in the order of appearance.
     musts: Vec<(usize, TokenStream)>,
@@ -136,6 +144,7 @@ impl<'a> AnalyzeVisitor<'a> {
             context,
             root: generics.clone(),
             scopes: Vec::new(),
+            modules: Vec::new(),
             musts: Vec::new(),
             impossibles: Vec::new(),
             frame: Frame::new(0, 0),
@@ -150,6 +159,19 @@ impl<'a> AnalyzeVisitor<'a> {
         visitor.visit_type(ty);
         // Everything found is in `ty`, which is at the depth 1.
         visitor.causes(0, 0, 1)
+    }
+
+    /// Analyzes `ty` alone, in `context` with the root generics `generics` (see
+    /// [`Leaker::intern_with()`]).
+    pub(crate) fn analyze_type(
+        leaker: &Leaker,
+        context: usize,
+        ty: &Type,
+        generics: &Generics,
+    ) -> Analysis {
+        let mut visitor = AnalyzeVisitor::new(leaker, context, generics);
+        visitor.visit_type(ty);
+        visitor.finish()
     }
 
     /// Builds the [`CheckResult`] of the type at `depth` from the causes found in it, since
@@ -211,6 +233,7 @@ impl<'a> AnalyzeVisitor<'a> {
         // component.
         self.frame.min_depth = self.frame.min_depth.min(inner.min_depth);
         self.frame.local_scope = self.frame.local_scope.min(inner.local_scope);
+        self.frame.module_item |= inner.module_item;
         let has_impossible = self.impossibles.len() > inner.impossible_start;
         let has_must = inner.min_depth != usize::MAX;
         let is_own = inner.min_depth == depth;
@@ -250,9 +273,10 @@ impl<'a> AnalyzeVisitor<'a> {
                 looks_like_const: !is_local && looks_like_const(ty),
                 components: Vec::new(),
             })));
-        } else if mentions_local {
+        } else if mentions_local || inner.module_item {
             // The type itself cannot be interned because the Repeater's implementation
-            // cannot refer to the local generics, but its components can.
+            // cannot refer to the local generics (or because it refers to an item of the module,
+            // which the Referrer shadows in the copy of the module), but its components can.
             self.frame.effects.extend(effects);
         } else {
             // The type may be interned as a whole, or its components.
@@ -274,6 +298,68 @@ impl<'a> AnalyzeVisitor<'a> {
             impossible: vec![impossible],
             is_own: true,
         }));
+    }
+
+    /// Returns `true` if `path` does not depend on the type context: it is context-free for the
+    /// Leaker (see [`Leaker::is_context_free_path()`]), or it is portable in the analyzed module
+    /// (see [`AnalyzeVisitor::is_module_path()`]).
+    fn is_context_free(&self, path: &Path) -> bool {
+        self.leaker.is_context_free_path(path) || self.is_module_path(path)
+    }
+
+    /// Returns `true` if `path` refers to an item declared in the module being analyzed (see
+    /// [`Leaker::from_module()`]), which is copied with it, like Rust resolves it: it starts with
+    /// a name declared in the current module (and not shadowed by a generic parameter in scope),
+    /// or with `self::` or `super::` (repeated) followed by a name declared in the module it
+    /// refers to, which is not outside the root module.
+    fn is_module_path(&self, path: &Path) -> bool {
+        if self.modules.is_empty() || path.leading_colon.is_some() {
+            return false;
+        }
+        let mut current = self.modules.len() - 1;
+        let mut segments = path.segments.iter().peekable();
+        let explicit = match segments.peek() {
+            Some(seg) if seg.ident == "self" => {
+                segments.next();
+                true
+            }
+            Some(seg) if seg.ident == "super" => {
+                while matches!(segments.peek(), Some(seg) if seg.ident == "super") {
+                    segments.next();
+                    match current.checked_sub(1) {
+                        Some(parent) => current = parent,
+                        // It leaves the root module.
+                        None => return false,
+                    }
+                }
+                true
+            }
+            _ => false,
+        };
+        match segments.next() {
+            Some(seg) => {
+                let name = seg.ident.to_string();
+                self.modules[current].contains(&name)
+                    && (explicit
+                        || !self.params().any(|param| match param {
+                            GenericParam::Type(TypeParam { ident, .. })
+                            | GenericParam::Const(ConstParam { ident, .. }) => ident == &seg.ident,
+                            GenericParam::Lifetime(_) => false,
+                        }))
+            }
+            None => false,
+        }
+    }
+
+    /// Runs `f` with the names declared in the module `i` in scope.
+    fn with_module(&mut self, i: &ItemMod, f: impl FnOnce(&mut Self)) {
+        let items = match &i.content {
+            Some((_, items)) => items,
+            None => return f(self),
+        };
+        self.modules.push(declared_names(items));
+        f(self);
+        self.modules.pop();
     }
 
     /// Returns the generic parameters in scope, those of the Leaker and the local ones.
@@ -345,6 +431,13 @@ impl<'a> AnalyzeVisitor<'a> {
 }
 
 impl Analysis {
+    /// Merges `other` into this analysis.
+    pub(crate) fn merge(&mut self, other: Analysis) {
+        self.types.merge(other.types);
+        self.errors.extend(other.errors);
+        self.primitives.extend(other.primitives);
+    }
+
     /// Applies `effects` in order, adding the types in `context` as components of `parent` (if
     /// any).
     fn apply(&mut self, context: usize, effects: Vec<Effect>, parent: Option<&NodeKey>) {
@@ -380,6 +473,24 @@ impl Analysis {
 }
 
 impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
+    fn visit_type_param(&mut self, i: &TypeParam) {
+        // The default of a type parameter of the root generics is analyzed in its own context
+        // (see [`Leaker::intern_with()`]), not copied in this one.
+        let is_root_default = i.default.is_some()
+            && self.item_depth <= 1
+            && self.scopes.is_empty()
+            && self.root.params.iter().any(|param| {
+                matches!(param, GenericParam::Type(TypeParam { ident, default: Some(_), .. }) if ident == &i.ident)
+            });
+        if is_root_default {
+            let mut i = i.clone();
+            i.eq_token = None;
+            i.default = None;
+            return syn::visit::visit_type_param(self, &i);
+        }
+        syn::visit::visit_type_param(self, i)
+    }
+
     fn visit_trait_item_fn(&mut self, i: &TraitItemFn) {
         let mut i = i.clone();
         i.default = None;
@@ -498,7 +609,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         // A module has no generics, but the items in it are nested items (see
         // [`Leaker::from_module()`]), whose generics are local.
         self.with_item_generics(&Generics::default(), |visitor| {
-            syn::visit::visit_item_mod(visitor, i)
+            visitor.with_module(i, |visitor| syn::visit::visit_item_mod(visitor, i))
         });
     }
 
@@ -566,7 +677,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     fn visit_trait_bound(&mut self, i: &TraitBound) {
         // A trait bound with a relative path cannot be interned (in a type, e.g. `dyn MyTrait`,
         // the path is a cause of the type instead).
-        if self.type_depth == 0 && !self.leaker.is_context_free_path(&i.path) {
+        if self.type_depth == 0 && !self.is_context_free(&i.path) {
             self.relative_path(quote!(#i), quote!(#i));
             return;
         }
@@ -590,8 +701,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                     self.frame.effects.push(Effect::Primitive(ident.clone()));
                 }
             }
-            Type::Path(TypePath { qself: None, path })
-                if self.leaker.is_context_free_path(path) => {}
+            Type::Path(TypePath { qself: None, path }) if self.is_context_free(path) => {}
             _ => {
                 // The type of a const parameter cannot be interned.
                 self.relative_path(quote!(#{&i.ty}), quote!(#i));
@@ -612,13 +722,18 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                 }
             }
         }
-        if self.leaker.is_context_free_path(i) || starts_with_generic {
+        let in_module =
+            !starts_with_generic && !self.leaker.is_context_free_path(i) && self.is_module_path(i);
+        if in_module && self.type_depth > 0 {
+            self.frame.module_item = true;
+        }
+        if self.leaker.is_context_free_path(i) || starts_with_generic || in_module {
             // A primitive type allowed by `allowed_paths` (e.g. by
             // `LeakerConfig::allow_primitive()`) is copied as it is, assuming that its name is not
             // shadowed. The name alone cannot prove it (e.g. `type u16 = i32;` in the Leaker's
             // module), so it is recorded for `Leaker::assertions()`, which fails to compile there
             // if the name is shadowed.
-            if !starts_with_generic && i.leading_colon.is_none() {
+            if !starts_with_generic && !in_module && i.leading_colon.is_none() {
                 if let Some(seg) = i.segments.first() {
                     if is_primitive_name(&seg.ident) {
                         self.frame
@@ -687,7 +802,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             && matches!(i.path.segments.first(), Some(seg) if seg.ident == "Self" && seg.arguments.is_none());
         if (i.qself.is_none() && self.starts_with_generic(&i.path))
             || (is_self && self.leaker.self_ty_can_be_interned)
-            || self.leaker.is_context_free_path(&i.path)
+            || self.is_context_free(&i.path)
         {
             syn::visit::visit_expr_path(self, i)
         } else {
@@ -695,4 +810,66 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             self.relative_path(quote!(#i), quote!(#i));
         }
     }
+}
+
+/// Returns the names declared directly in `items`: items, `macro_rules!` macros, and the names
+/// imported by `use` declarations with an absolute path (starting with `::` or `$crate`), which
+/// are portable. The names imported by the others (e.g. `use super::X`, `use crate::X`) refer to
+/// the items outside the module.
+fn declared_names(items: &[Item]) -> HashSet<String> {
+    fn use_names(tree: &UseTree, last: Option<&Ident>, names: &mut HashSet<String>) {
+        match tree {
+            UseTree::Path(UsePath { ident, tree, .. }) => use_names(tree, Some(ident), names),
+            UseTree::Name(UseName { ident }) if ident == "self" => {
+                names.extend(last.map(|ident| ident.to_string()));
+            }
+            UseTree::Name(UseName { ident }) => {
+                names.insert(ident.to_string());
+            }
+            UseTree::Rename(UseRename { rename, .. }) if rename != "_" => {
+                names.insert(rename.to_string());
+            }
+            UseTree::Group(UseGroup { items, .. }) => {
+                for tree in items {
+                    use_names(tree, last, names)
+                }
+            }
+            _ => (),
+        }
+    }
+    let mut names = HashSet::new();
+    for item in items {
+        match item {
+            Item::Struct(ItemStruct { ident, .. })
+            | Item::Enum(ItemEnum { ident, .. })
+            | Item::Union(ItemUnion { ident, .. })
+            | Item::Trait(ItemTrait { ident, .. })
+            | Item::TraitAlias(ItemTraitAlias { ident, .. })
+            | Item::Type(ItemType { ident, .. })
+            | Item::Const(ItemConst { ident, .. })
+            | Item::Static(ItemStatic { ident, .. })
+            | Item::Mod(ItemMod { ident, .. })
+            | Item::Macro(ItemMacro {
+                ident: Some(ident), ..
+            }) => {
+                names.insert(ident.to_string());
+            }
+            Item::Fn(ItemFn { sig, .. }) => {
+                names.insert(sig.ident.to_string());
+            }
+            Item::Use(ItemUse {
+                leading_colon,
+                tree,
+                ..
+            }) => {
+                let is_absolute = leading_colon.is_some()
+                    || matches!(tree, UseTree::Path(UsePath { ident, .. }) if ident == "$crate");
+                if is_absolute {
+                    use_names(tree, None, &mut names);
+                }
+            }
+            _ => (),
+        }
+    }
+    names
 }

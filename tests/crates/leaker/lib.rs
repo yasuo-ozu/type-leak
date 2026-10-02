@@ -62,6 +62,20 @@ pub mod m {
         fn default_flag(&self) -> Flag<B>;
     }
 
+    /// The default of a type parameter, which is relative to this module.
+    #[derive(Debug, PartialEq)]
+    pub struct RelDefault<T>(pub T);
+
+    /// A defaulted type parameter whose default is a relative type, which the Referrer may omit.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::m,
+    )]
+    pub trait Defaulted<T, U = RelDefault<T>> {
+        fn get(&self, t: T) -> U;
+    }
+
     pub struct Pair<V>(pub V, pub V);
 
     /// Where clauses, typed receivers, argument patterns, HRTB, elided lifetimes and RPITIT.
@@ -149,6 +163,18 @@ pub mod m {
     impl From<u32> for RelType {
         fn from(n: u32) -> Self {
             RelType(n)
+        }
+    }
+
+    impl<T> Defaulted<T, RelDefault<T>> for Inner {
+        fn get(&self, t: T) -> RelDefault<T> {
+            RelDefault(t)
+        }
+    }
+
+    impl Defaulted<u8, u32> for Inner {
+        fn get(&self, t: u8) -> u32 {
+            t as u32 + 100
         }
     }
 

@@ -97,6 +97,45 @@ pub(crate) fn encode_generics_args_with_params<'a, 'b>(
     mut const_fn: impl FnMut(&Expr, &'b ConstParam) -> std::result::Result<Type, EncodeError>,
 ) -> std::result::Result<Type, EncodeError> {
     use syn::fold::Fold;
+    let args = complete_generics_args(iter, params, |_, _, default, substitute, _| {
+        Ok(substitute.fold_type(default.clone()))
+    })?;
+    let mut elems = Punctuated::<Type, Token![,]>::new();
+    for (param, arg) in params.iter().zip(args) {
+        elems.push(match (param, arg) {
+            (_, GenericArgument::Lifetime(arg)) => parse_quote!(& #arg ()),
+            (_, GenericArgument::Type(ty)) => ty,
+            (GenericParam::Const(cp), GenericArgument::Const(value)) => const_fn(&value, cp)?,
+            // `complete_generics_args()` returns an argument of the kind of each parameter.
+            _ => unreachable!(),
+        });
+    }
+    Ok(Type::Tuple(TypeTuple {
+        paren_token: Default::default(),
+        elems: with_trailing_comma(elems),
+    }))
+}
+
+/// Matches `iter` with `params` and returns the complete argument list, one for each parameter
+/// in order: arguments are matched by position (lifetime arguments with lifetime parameters, and
+/// the others with type and const parameters), a bare identifier corresponding to a const
+/// parameter is a const argument (normalized, see [`normalize_const_arg()`]), and an omitted
+/// const argument takes the default, in which the preceding parameters are substituted.
+///
+/// An omitted type argument takes `default_type(index, param, default, substitute, args)`, where
+/// `substitute` substitutes the preceding parameters by their arguments `args`.
+pub(crate) fn complete_generics_args<'a>(
+    iter: impl IntoIterator<Item = &'a GenericArgument>,
+    params: &Punctuated<GenericParam, Token![,]>,
+    mut default_type: impl FnMut(
+        usize,
+        &TypeParam,
+        &Type,
+        &mut SubstituteParams,
+        &[GenericArgument],
+    ) -> std::result::Result<Type, EncodeError>,
+) -> std::result::Result<Vec<GenericArgument>, EncodeError> {
+    use syn::fold::Fold;
     let mut lifetime_args = Vec::new();
     let mut other_args = Vec::new();
     for arg in iter {
@@ -110,13 +149,13 @@ pub(crate) fn encode_generics_args_with_params<'a, 'b>(
     let mut other_args = other_args.into_iter();
     // Substitution of the preceding parameters, used for defaults.
     let mut substitute = SubstituteParams::default();
-    let mut elems = Punctuated::<Type, Token![,]>::new();
-    for param in params {
+    let mut completed = Vec::<GenericArgument>::new();
+    for (index, param) in params.iter().enumerate() {
         match param {
             GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => match lifetime_args.next() {
                 Some(GenericArgument::Lifetime(arg)) => {
                     substitute.lifetimes.insert(lifetime.clone(), arg.clone());
-                    elems.push(parse_quote!(& #arg ()));
+                    completed.push(GenericArgument::Lifetime(arg.clone()));
                 }
                 _ => return Err(EncodeError::MissingArgument(Box::new(param.clone()))),
             },
@@ -127,12 +166,14 @@ pub(crate) fn encode_generics_args_with_params<'a, 'b>(
                         return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())))
                     }
                     None => match &tp.default {
-                        Some(default) => substitute.fold_type(default.clone()),
+                        Some(default) => {
+                            default_type(index, tp, default, &mut substitute, &completed)?
+                        }
                         None => return Err(EncodeError::MissingArgument(Box::new(param.clone()))),
                     },
                 };
                 substitute.types.insert(tp.ident.clone(), ty.clone());
-                elems.push(ty);
+                completed.push(GenericArgument::Type(ty));
             }
             GenericParam::Const(cp) => {
                 let value: Expr = match other_args.next() {
@@ -151,17 +192,14 @@ pub(crate) fn encode_generics_args_with_params<'a, 'b>(
                     },
                 };
                 substitute.consts.insert(cp.ident.clone(), value.clone());
-                elems.push(const_fn(&normalize_const_arg(&value), cp)?);
+                completed.push(GenericArgument::Const(normalize_const_arg(&value)));
             }
         }
     }
     if let Some(arg) = lifetime_args.next().or_else(|| other_args.next()) {
         return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())));
     }
-    Ok(Type::Tuple(TypeTuple {
-        paren_token: Default::default(),
-        elems: with_trailing_comma(elems),
-    }))
+    Ok(completed)
 }
 
 /// Primitive types which can be the type of const parameters on stable Rust.
@@ -350,7 +388,7 @@ pub(crate) fn with_trailing_comma(
 
 /// Substitutes generic parameters (single-segment paths and lifetimes) with arguments.
 #[derive(Default)]
-struct SubstituteParams {
+pub(crate) struct SubstituteParams {
     types: HashMap<Ident, Type>,
     consts: HashMap<Ident, Expr>,
     lifetimes: HashMap<Lifetime, Lifetime>,

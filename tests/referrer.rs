@@ -231,7 +231,7 @@ fn test_contexts() {
     assert_eq!(
         tokens.to_string(),
         format!(
-            "\"{}\" 2 (RelA , Wrap < T >) (RelA , Wrap < U >)",
+            "\"{}\" 2 < T > ; (RelA , Wrap < T >) < U > ; (RelA , Wrap < U >)",
             env!("CARGO_PKG_VERSION")
         )
     );
@@ -258,7 +258,7 @@ fn test_contexts() {
     let ty = referrer.expand_in(1, parse_quote!(::p::Q<RelA>), |_, ix| parse_quote!(P<#ix>));
     assert_eq!(quote!(#ty).to_string(), quote!(#expected_ty).to_string());
 
-    // Contexts without types are not serialized, unless followed by one with types.
+    // Contexts without types are serialized too (with their root generics, if not empty).
     let mut leaker = type_leak::Leaker::new();
     let empty: ItemStruct = parse_quote! { struct S; };
     leaker
@@ -273,6 +273,14 @@ fn test_contexts() {
         .unwrap();
     let referrer = leaker.finish();
     assert_eq!(referrer.context(0), 1);
+    assert_eq!(referrer.n_contexts(), 2);
+    assert_eq!(
+        quote!(#referrer).to_string(),
+        format!(
+            "\"{}\" 2 () < T > ; (RelA , Wrap < T >)",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
     let parsed: Referrer = parse2(quote!(#referrer)).unwrap();
     assert_eq!(parsed, referrer);
 }
@@ -362,4 +370,162 @@ fn test_outermost_generics_as_leakers() {
             }
         })
     );
+}
+
+fn referrer_of(tr: ItemTrait) -> Referrer {
+    type_leak::Leaker::from_trait(&tr).unwrap().finish()
+}
+
+#[test]
+fn test_has_self() {
+    let with_self = [
+        "fn f(&self) -> Rel<Self>;",
+        "fn f(&self) -> Rel<Self::Item>;",
+        "fn f(&self) -> Rel<<Self as ::p::Tr>::X>;",
+        "fn f(&self) -> Wrap<[u8; <Self as ::p::Tr>::N]>;",
+        "fn f(&self) -> Rel<m!(Self)>;",
+        // A local bound mentioning `Self`.
+        "fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> Wrap<T>;",
+    ];
+    let without_self = [
+        "fn f(&self) -> Rel;",
+        "fn f(&self) -> Wrap<u8>;",
+        "fn f(&self) -> Rel<::p::Self>;",
+        "fn f(&self) -> Rel<SelfLike>;",
+        "fn f<T: ::core::cmp::PartialEq>(&self) -> Wrap<T>;",
+        "fn f(&self);",
+    ];
+    for (items, expected) in [(&with_self[..], true), (&without_self[..], false)] {
+        for item in items {
+            let tr: ItemTrait = parse_str(&format!("trait Tr {{ {} }}", item)).unwrap();
+            let referrer = referrer_of(tr);
+            assert_eq!(referrer.has_self(), expected, "{}", item);
+            // It is computed from the entries, so it survives a round trip.
+            let parsed: Referrer = parse2(quote!(#referrer)).unwrap();
+            assert_eq!(parsed.has_self(), expected, "{}", item);
+        }
+    }
+    // `Self` cannot be interned if `self_ty_can_be_interned` is unset.
+    let leak = |item: &str| {
+        let tr: ItemTrait = parse_str(&format!("trait Tr {{ {} }}", item)).unwrap();
+        let mut config = type_leak::LeakerConfig::new();
+        config.self_ty_can_be_interned = false;
+        let mut leaker = type_leak::Leaker::from_config(config);
+        leaker.intern_with(&tr.generics, |v| {
+            syn::visit::Visit::visit_item_trait(v, &tr)
+        })?;
+        Ok::<_, type_leak::NotInternableError>(leaker.finish())
+    };
+    assert!(leak("fn f(&self, x: Rel<Self>) -> Rel2;").is_err());
+    let referrer = leak("fn f(&self, x: Rel) -> Rel2;").unwrap();
+    assert!(!referrer.is_empty());
+    assert!(!referrer.has_self());
+    // Only the local generics can still mention `Self`, as they are not analyzed.
+    let referrer = leak("fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> Wrap<T>;").unwrap();
+    assert!(referrer.has_self());
+}
+
+#[test]
+fn test_iter_with_self() {
+    let referrer = referrer_of(parse_quote! {
+        trait Tr {
+            fn a(&self) -> Rel<Self>;
+            fn b(&self) -> Wrap<Self::Item>;
+            fn c(&self) -> <Self as ::p::Tr>::X<Rel3>;
+            fn d(&self) -> Rel4;
+            fn e<T: ::core::cmp::PartialEq<Self>>(&self) -> Wrap2<T>;
+            fn g(&self) -> Rel5<m!(Self, [u8; 1])>;
+        }
+    });
+    let marker: Type = parse_quote!(__S);
+    let items: Vec<(String, String)> = referrer
+        .iter_with_self(&marker)
+        .map(|(ty, generics)| {
+            (
+                quote!(#ty).to_string(),
+                quote!(#generics #{&generics.where_clause}).to_string(),
+            )
+        })
+        .collect();
+    let find = |ty: Type| {
+        let ty = quote!(#ty).to_string();
+        items
+            .iter()
+            .find(|(t, _)| *t == ty)
+            .unwrap_or_else(|| panic!("{} not in {:?}", ty, items))
+            .clone()
+    };
+    let is_str = |ty: Type| quote!(#ty).to_string();
+    // `Self` alone, `Self::A`, the self type of a qualified path, a macro, and unchanged types.
+    find(parse_quote!(Rel<__S>));
+    find(parse_quote!(Wrap<<__S>::Item>));
+    find(parse_quote!(<__S as ::p::Tr>::X<Rel3>));
+    find(parse_quote!(Rel4));
+    find(parse_quote!(Rel5<m!(__S, [u8; 1])>));
+    // A local bound is rewritten.
+    let (ty, generics) = find(parse_quote!(Wrap2<T>));
+    assert_eq!(ty, is_str(parse_quote!(Wrap2<T>)));
+    assert_eq!(
+        generics,
+        quote!(<T: ::core::cmp::PartialEq<__S> >).to_string()
+    );
+    // The originals keep `Self`, so a copy of the Leaker's trait is still found.
+    assert!(referrer
+        .iter()
+        .any(|ty| quote!(#ty).to_string() == "Rel < Self >"));
+    let mut sig: Signature = parse_quote!(fn a(&self) -> Rel<Self>);
+    referrer
+        .clone()
+        .into_visitor(|_, ix| parse_quote!(P<#ix>))
+        .visit_signature_mut(&mut sig);
+    let expected: Signature = parse_quote!(fn a(&self) -> P<1usize>);
+    assert_eq!(quote!(#sig).to_string(), quote!(#expected).to_string());
+}
+
+#[test]
+fn test_visitor_with_self() {
+    let referrer = referrer_of(parse_quote! {
+        trait Tr { fn f(&self, x: Rel<Self>, y: ::p::W<Self>) -> Self::Out; }
+    });
+    let sig: Signature = parse_quote!(fn f(&self, x: Rel<Self>, y: ::p::W<Self>) -> Self::Out);
+
+    // Without `with_self`, `Self` is kept.
+    let mut plain = sig.clone();
+    referrer
+        .clone()
+        .into_visitor(|_, ix| parse_quote!(P<#ix>))
+        .visit_signature_mut(&mut plain);
+    let expected: Signature = parse_quote!(fn f(&self, x: P<0usize>, y: ::p::W<Self>) -> Self::Out);
+    assert_eq!(quote!(#plain).to_string(), quote!(#expected).to_string());
+
+    // With it, the callback receives the type with `Self` replaced, the rest is replaced as well,
+    // and the receiver is untouched.
+    let mut rewritten = sig.clone();
+    let mut received = Vec::new();
+    referrer
+        .clone()
+        .into_visitor(|ty, ix| {
+            received.push((quote!(#ty).to_string(), ix));
+            // Not rewritten again, though it mentions `Self`.
+            parse_quote!(<Marker<Self> as R<#ix>>::Type)
+        })
+        .with_self(parse_quote!(__S))
+        .visit_signature_mut(&mut rewritten);
+    assert_eq!(received, [(quote!(Rel<__S>).to_string(), 0)],);
+    let expected: Signature = parse_quote!(
+        fn f(&self, x: <Marker<Self> as R<0usize>>::Type, y: ::p::W<__S>) -> <__S>::Out
+    );
+    assert_eq!(
+        quote!(#rewritten).to_string(),
+        quote!(#expected).to_string()
+    );
+
+    // The receiver with an explicit type is kept as well.
+    let mut sig: Signature = parse_quote!(fn f(self: Box<Self>) -> Rel<Self>);
+    referrer
+        .into_visitor(|_, ix| parse_quote!(P<#ix>))
+        .with_self(parse_quote!(__S))
+        .visit_signature_mut(&mut sig);
+    let expected: Signature = parse_quote!(fn f(self: Box<Self>) -> P<0usize>);
+    assert_eq!(quote!(#sig).to_string(), quote!(#expected).to_string());
 }

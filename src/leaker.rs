@@ -5,9 +5,10 @@ use crate::config::LeakerConfig;
 use crate::error::NotInternableError;
 use crate::graph::{descendants, reaches, NodeKey, TypeGraph};
 use crate::referrer::Referrer;
-use crate::util::path_starts_with;
+use crate::util::{generic_param_name, path_starts_with, token_names};
 use proc_macro2::{Span, TokenStream};
 use std::collections::{HashMap, HashSet};
+use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::quote;
 
@@ -20,9 +21,11 @@ pub struct Leaker {
     /// The nodes of the types to be interned, computed from `types` by [`Leaker::reduce_roots()`]
     /// (`None` if not computed yet, or outdated).
     reachable_types: Option<Vec<NodeKey>>,
-    /// The number of successful calls of [`Leaker::intern_with()`], each of which is a context (see
-    /// [`Referrer::context()`](crate::Referrer::context())).
-    n_contexts: usize,
+    /// The root generics of each context, in the order of the contexts (see
+    /// [`Referrer::context_generics()`](crate::Referrer::context_generics())). A successful call
+    /// of [`Leaker::intern_with()`] adds a context, followed by one for each defaulted type
+    /// parameter.
+    context_generics: Vec<Generics>,
     /// Names of primitive types which were assumed to be the primitive types (not shadowed), as
     /// they are copied as they are (see [`Leaker::assertions()`]).
     assumed_primitives: Vec<Ident>,
@@ -124,6 +127,15 @@ impl Leaker {
     /// [`Referrer::local_generics()`]). The bodies of functions and the values of consts are not
     /// analyzed. A module without content (`mod m;`) has nothing to analyze.
     ///
+    /// The items declared in the module are copied with it, so paths to them are not leaked,
+    /// like Rust resolves them: a name declared directly in the current module (not shadowed by
+    /// a generic parameter), `self::` or `super::` followed by a name declared in that module
+    /// (without leaving the analyzed module), and the names imported by `use` with an absolute
+    /// path (starting with `::`). A type mentioning them is decomposed instead of being interned
+    /// as a whole (e.g. only `Rel` is interned for `S<Rel>`, where `S` is declared in the
+    /// module). Other relative paths (including the names imported by `use super::X` or `use
+    /// crate::X`) are leaked.
+    ///
     /// ```
     /// # use syn::*;
     /// # use type_leak::Leaker;
@@ -151,7 +163,7 @@ impl Leaker {
             self_ty_can_be_interned: true,
             types: TypeGraph::default(),
             reachable_types: None,
-            n_contexts: 0,
+            context_generics: Vec::new(),
             assumed_primitives: Vec::new(),
         }
     }
@@ -163,7 +175,7 @@ impl Leaker {
             self_ty_can_be_interned: config.self_ty_can_be_interned,
             types: TypeGraph::default(),
             reachable_types: None,
-            n_contexts: 0,
+            context_generics: Vec::new(),
             assumed_primitives: Vec::new(),
         }
     }
@@ -233,6 +245,15 @@ impl Leaker {
     /// [`Referrer::context()`](crate::Referrer::context())): the types found are added to those of
     /// the previous calls, but are never shared with them, since `generics` may differ. Nothing is
     /// added if an error is returned.
+    ///
+    /// The default of a type parameter of `generics` is not analyzed in the context of the call,
+    /// as it is not copied there: a default is written in the Leaker's type context, so it is
+    /// rewritten on its own by [`Referrer::complete_args()`]. It is analyzed in a context of its
+    /// own, whose root generics are the parameters before it (see
+    /// [`Referrer::context_generics()`](crate::Referrer::context_generics())). So a call
+    /// allocates the context of its own, followed by one context for each defaulted type
+    /// parameter, in the order of the parameters, even if the default leaks nothing. The defaults
+    /// of const parameters are analyzed in the context of the call.
     pub fn intern_with<'ast, F>(
         &mut self,
         generics: &Generics,
@@ -241,9 +262,27 @@ impl Leaker {
     where
         F: FnOnce(&mut dyn syn::visit::Visit<'ast>),
     {
-        let mut visitor = AnalyzeVisitor::new(self, self.n_contexts, generics);
+        let context = self.context_generics.len();
+        let mut visitor = AnalyzeVisitor::new(self, context, generics);
         f(&mut visitor);
-        let analysis = visitor.finish();
+        let mut analysis = visitor.finish();
+        let mut contexts = vec![without_defaults(generics, generics.params.len())];
+        for (index, param) in generics.params.iter().enumerate() {
+            if let GenericParam::Type(TypeParam {
+                default: Some(default),
+                ..
+            }) = param
+            {
+                let root = without_defaults(generics, index);
+                analysis.merge(AnalyzeVisitor::analyze_type(
+                    self,
+                    context + contexts.len(),
+                    default,
+                    &root,
+                ));
+                contexts.push(root);
+            }
+        }
         for ident in &analysis.primitives {
             self.assume_primitive(ident);
         }
@@ -255,7 +294,7 @@ impl Leaker {
             self.types.merge(types);
             self.reachable_types = None;
         }
-        self.n_contexts += 1;
+        self.context_generics.extend(contexts);
         Ok(self)
     }
 
@@ -275,6 +314,7 @@ impl Leaker {
         Referrer::new(
             keys.into_iter()
                 .map(|key| (key.context, key.ty.ty, key.requirements)),
+            self.context_generics,
         )
     }
 
@@ -354,5 +394,69 @@ impl Leaker {
             )
         });
         kept
+    }
+}
+
+/// Returns the first `n` parameters of `generics`, without their defaults, and the where
+/// predicates which do not mention the other parameters (matched by name).
+fn without_defaults(generics: &Generics, n: usize) -> Generics {
+    let params: Punctuated<GenericParam, Token![,]> = generics
+        .params
+        .iter()
+        .take(n)
+        .cloned()
+        .map(|mut param| {
+            match &mut param {
+                GenericParam::Type(tp) => {
+                    tp.eq_token = None;
+                    tp.default = None;
+                }
+                GenericParam::Const(cp) => {
+                    cp.eq_token = None;
+                    cp.default = None;
+                }
+                GenericParam::Lifetime(_) => (),
+            }
+            param
+        })
+        .collect();
+    let later: HashSet<String> = generics
+        .params
+        .iter()
+        .skip(n)
+        .map(generic_param_name)
+        .collect();
+    let predicates: Punctuated<WherePredicate, Token![,]> = generics
+        .where_clause
+        .iter()
+        .flat_map(|wc| wc.predicates.iter())
+        .filter(|predicate| {
+            let mut names = HashSet::new();
+            token_names(quote!(#predicate), &mut names);
+            names.is_disjoint(&later)
+        })
+        .cloned()
+        .collect();
+    let has_params = !params.is_empty();
+    Generics {
+        lt_token: if has_params {
+            Some(Default::default())
+        } else {
+            None
+        },
+        params,
+        gt_token: if has_params {
+            Some(Default::default())
+        } else {
+            None
+        },
+        where_clause: if predicates.is_empty() {
+            None
+        } else {
+            Some(WhereClause {
+                where_token: Default::default(),
+                predicates,
+            })
+        },
     }
 }
