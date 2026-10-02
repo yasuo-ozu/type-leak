@@ -7,6 +7,9 @@ use syn::*;
 pub struct LeakerConfig {
     pub allowed_paths: Vec<Path>,
     pub self_ty_can_be_interned: bool,
+    /// Whether a path with a leading `::` (e.g. `::foo::X`) is context-free (default `true`). See
+    /// [`Leaker::allow_external_crates`](crate::Leaker::allow_external_crates).
+    pub allow_external_crates: bool,
 }
 
 impl Default for LeakerConfig {
@@ -14,6 +17,7 @@ impl Default for LeakerConfig {
         Self {
             allowed_paths: Vec::new(),
             self_ty_can_be_interned: true,
+            allow_external_crates: true,
         }
     }
 }
@@ -21,6 +25,15 @@ impl Default for LeakerConfig {
 impl LeakerConfig {
     pub fn new() -> Self {
         Default::default()
+    }
+
+    /// Sets [`LeakerConfig::allow_external_crates`]. With `false`, only `::core` and the
+    /// [`allowed_paths`](LeakerConfig::allowed_paths) (e.g. `::serde`) are context-free among the
+    /// paths with a leading `::`, so the other external crates are leaked (or reported as
+    /// [`NotInternableError::NotPortable`](crate::NotInternableError::NotPortable)).
+    pub fn allow_external_crates(&mut self, allow: bool) -> &mut Self {
+        self.allow_external_crates = allow;
+        self
     }
 
     /// Allow primitive types from `::core::primitive`.

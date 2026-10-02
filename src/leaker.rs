@@ -7,7 +7,7 @@ use crate::graph::{descendants, reaches, NodeKey, TypeGraph};
 use crate::referrer::Referrer;
 use crate::util::{generic_param_name, path_starts_with, token_names};
 use proc_macro2::{Span, TokenStream};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::quote;
@@ -16,6 +16,18 @@ use template_quote::quote;
 pub struct Leaker {
     pub allowed_paths: Vec<Path>,
     pub self_ty_can_be_interned: bool,
+    /// Whether a path with a leading `::` (e.g. `::foo::X`) is context-free (default `true`).
+    ///
+    /// Such a path resolves against the external crates of the crate compiling it, so it is not
+    /// portable to the Referrer's crate if that crate does not depend on `foo` (or renamed it, or
+    /// uses another version). With `false`, only a path starting with `::core` (always available),
+    /// `$crate`, or one of [`Leaker::allowed_paths`] (e.g. `::serde`) is context-free, and the
+    /// others are treated like relative paths: leaked in a type (see
+    /// [`Referrer::external_crates_require()`](crate::Referrer::external_crates_require()) and
+    /// [`Referrer::must()`](crate::Referrer::must())), and
+    /// [`NotInternableError::NotPortable`] in a trait bound, a value or the type of a const
+    /// parameter.
+    pub allow_external_crates: bool,
     /// The types found by [`Leaker::intern_with()`] and their composition.
     types: TypeGraph,
     /// The nodes of the types to be interned, computed from `types` by [`Leaker::reduce_roots()`]
@@ -161,6 +173,7 @@ impl Leaker {
         Self {
             allowed_paths: Vec::new(),
             self_ty_can_be_interned: true,
+            allow_external_crates: true,
             types: TypeGraph::default(),
             reachable_types: None,
             context_generics: Vec::new(),
@@ -173,6 +186,7 @@ impl Leaker {
         Self {
             allowed_paths: config.allowed_paths,
             self_ty_can_be_interned: config.self_ty_can_be_interned,
+            allow_external_crates: config.allow_external_crates,
             types: TypeGraph::default(),
             reachable_types: None,
             context_generics: Vec::new(),
@@ -223,9 +237,13 @@ impl Leaker {
     }
 
     /// Returns `true` if `path` does not depend on the type context, i.e. it is absolute, starts
-    /// with `$crate`, or starts with one of [`Leaker::allowed_paths`].
+    /// with `$crate`, or starts with one of [`Leaker::allowed_paths`]. Unless
+    /// [`Leaker::allow_external_crates`], an absolute path is context-free only if it starts with
+    /// `::core` or an allowed path.
     pub(crate) fn is_context_free_path(&self, path: &Path) -> bool {
-        path.leading_colon.is_some()
+        (path.leading_colon.is_some()
+            && (self.allow_external_crates
+                || matches!(path.segments.first(), Some(seg) if seg.ident == "core")))
             || matches!(
                 path.segments.iter().next(),
                 Some(PathSegment {
@@ -287,7 +305,11 @@ impl Leaker {
             self.assume_primitive(ident);
         }
         if !analysis.errors.is_empty() {
-            return Err(NotInternableError::RelativePath(analysis.errors));
+            return Err(if self.allow_external_crates {
+                NotInternableError::RelativePath(analysis.errors)
+            } else {
+                NotInternableError::NotPortable(analysis.errors)
+            });
         }
         let types = analysis.types;
         if !types.is_empty() {
@@ -311,9 +333,13 @@ impl Leaker {
     pub fn finish(mut self) -> Referrer {
         self.reduce_roots();
         let keys = self.reachable_types.take().unwrap_or_default();
+        let types = self.types;
         Referrer::new(
-            keys.into_iter()
-                .map(|key| (key.context, key.ty.ty, key.requirements)),
+            keys.into_iter().map(|key| {
+                let must = types.hard.contains(&key);
+                let crates = external_crates(&key.ty.ty, key.requirements.generics());
+                (key.context, key.ty.ty, key.requirements, must, crates)
+            }),
             self.context_generics,
         )
     }
@@ -459,4 +485,65 @@ fn without_defaults(generics: &Generics, n: usize) -> Generics {
             })
         },
     }
+}
+
+/// Returns the sorted names of the external crates (other than `core`) named by the absolute
+/// paths (`::name::..`) in `ty` and `generics`.
+fn external_crates(ty: &Type, generics: &Generics) -> Vec<String> {
+    use proc_macro2::TokenTree;
+    use syn::visit::Visit;
+    #[derive(Default)]
+    struct Finder(BTreeSet<String>);
+    impl Finder {
+        /// Scans the tokens of a macro for `::` followed by a name at the start of a path.
+        fn scan(&mut self, tokens: TokenStream) {
+            let mut prev: Option<TokenTree> = None;
+            let mut iter = tokens.into_iter().peekable();
+            while let Some(tt) = iter.next() {
+                match &tt {
+                    TokenTree::Group(group) => self.scan(group.stream()),
+                    TokenTree::Punct(p)
+                        if p.as_char() == ':' && p.spacing() == proc_macro2::Spacing::Joint =>
+                    {
+                        let starts_path = !matches!(&prev, Some(TokenTree::Ident(_)))
+                            && !matches!(&prev, Some(TokenTree::Punct(p)) if p.as_char() == '>');
+                        if starts_path {
+                            if let Some(TokenTree::Punct(second)) = iter.peek() {
+                                if second.as_char() == ':' {
+                                    iter.next();
+                                    if let Some(TokenTree::Ident(ident)) = iter.peek() {
+                                        if ident != "core" {
+                                            self.0.insert(ident.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => (),
+                }
+                prev = Some(tt);
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Finder {
+        fn visit_path(&mut self, i: &'ast Path) {
+            if i.leading_colon.is_some() {
+                if let Some(seg) = i.segments.first() {
+                    if seg.ident != "core" {
+                        self.0.insert(seg.ident.to_string());
+                    }
+                }
+            }
+            syn::visit::visit_path(self, i)
+        }
+        fn visit_macro(&mut self, i: &'ast Macro) {
+            self.scan(i.tokens.clone());
+            syn::visit::visit_macro(self, i)
+        }
+    }
+    let mut finder = Finder::default();
+    finder.visit_type(ty);
+    finder.visit_generics(generics);
+    finder.0.into_iter().collect()
 }

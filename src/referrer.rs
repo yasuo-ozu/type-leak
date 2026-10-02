@@ -31,6 +31,14 @@ pub struct Referrer {
     pub(crate) leak_types: Vec<Type>,
     pub(crate) requirements: Vec<Requirements>,
     pub(crate) contexts: Vec<usize>,
+    /// Whether each entry is required (see [`Referrer::must()`]).
+    pub(crate) musts: Vec<bool>,
+    /// The sorted names of the external crates each entry requires (see
+    /// [`Referrer::external_crates_require()`]).
+    pub(crate) external_crates: Vec<Vec<String>>,
+    /// The external crates available to the Referrer's crate, if known (see
+    /// [`Referrer::with_available_external_crates()`]). Not serialized.
+    pub(crate) available_external_crates: Option<Vec<String>>,
     /// The root generics of each context, including contexts without entries (see
     /// [`Referrer::context_generics()`]).
     pub(crate) context_generics: Vec<Generics>,
@@ -40,21 +48,25 @@ pub struct Referrer {
 }
 
 impl Referrer {
-    /// Builds a Referrer from its entries (the context, the type and its requirements), in the
-    /// order of their indices, and the root generics of the contexts. There is at least one
-    /// context, and one for each context of the entries.
+    /// Builds a Referrer from its entries (the context, the type, its requirements, whether it is
+    /// required and the external crates it requires), in the order of their indices, and the root
+    /// generics of the contexts. There is at least one context, and one for each context of the
+    /// entries.
     pub(crate) fn new(
-        entries: impl IntoIterator<Item = (usize, Type, Requirements)>,
+        entries: impl IntoIterator<Item = (usize, Type, Requirements, bool, Vec<String>)>,
         mut context_generics: Vec<Generics>,
     ) -> Self {
         let mut referrer = Self {
             leak_types: Vec::new(),
             requirements: Vec::new(),
             contexts: Vec::new(),
+            musts: Vec::new(),
+            external_crates: Vec::new(),
+            available_external_crates: None,
             context_generics: Vec::new(),
             map: HashMap::new(),
         };
-        for (ix, (context, ty, requirements)) in entries.into_iter().enumerate() {
+        for (ix, (context, ty, requirements, must, crates)) in entries.into_iter().enumerate() {
             referrer
                 .map
                 .entry((context, TypeKey::new(&ty)))
@@ -63,6 +75,8 @@ impl Referrer {
             referrer.leak_types.push(ty);
             referrer.requirements.push(requirements);
             referrer.contexts.push(context);
+            referrer.musts.push(must);
+            referrer.external_crates.push(crates);
         }
         let n_contexts = referrer
             .contexts
@@ -81,10 +95,78 @@ impl Referrer {
     fn find(&self, context: usize, ty: &Type, scopes: &[Scope]) -> Option<usize> {
         let candidates = self.map.get(&(context, TypeKey::new(ty)))?;
         let requirements = Requirements::of(ty, scopes);
-        candidates
+        let ix = candidates
             .iter()
             .find(|(candidate, _)| candidate == &requirements)
-            .map(|(_, ix)| *ix)
+            .map(|(_, ix)| *ix)?;
+        // An optional entry whose crates are all available is left as written.
+        if !self.musts[ix] {
+            if let Some(available) = &self.available_external_crates {
+                if self.external_crates[ix]
+                    .iter()
+                    .all(|name| available.contains(name))
+                {
+                    return None;
+                }
+            }
+        }
+        Some(ix)
+    }
+
+    /// Sets the names of the external crates which the Referrer's crate can refer to with an
+    /// absolute path (`::name::..`), e.g. its dependencies (default: unknown, `None`). This is not
+    /// serialized.
+    ///
+    /// An entry which is not [required](Referrer::must()) (it is leaked only because a path names
+    /// an external crate, see [`Leaker::allow_external_crates`](crate::Leaker::allow_external_crates))
+    /// is not replaced by [`Referrer::into_visitor()`], [`Referrer::expand()`] etc. if all the
+    /// crates it [requires](Referrer::external_crates_require()) are in `crates`: it is left as
+    /// written, and the types inside it are looked up as for a type which is not leaked. If the
+    /// available crates are unknown, or one of the crates is missing, it is replaced as usual. An
+    /// entry which is required is always replaced.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let mut leaker = Leaker::new();
+    /// leaker.allow_external_crates = false;
+    /// let item: ItemStruct = parse_quote!(struct S { a: ::foo::X });
+    /// leaker.intern_with(&item.generics, |v| v.visit_item_struct(&item)).unwrap();
+    /// let referrer = leaker.finish();
+    /// assert!(!referrer.must(0));
+    /// assert_eq!(referrer.external_crates_require(0), ["foo"]);
+    /// let ty: Type = parse_quote!(::foo::X);
+    /// let replaced: Type = parse_quote!(Replaced);
+    /// // Replaced when `foo` is not known to be available.
+    /// assert_eq!(referrer.expand(ty.clone(), |_, _| replaced.clone()), replaced);
+    /// let referrer = referrer.with_available_external_crates(["foo"]);
+    /// assert_eq!(referrer.expand(ty.clone(), |_, _| replaced.clone()), ty);
+    /// ```
+    pub fn with_available_external_crates(
+        mut self,
+        crates: impl IntoIterator<Item = impl ToString>,
+    ) -> Self {
+        self.available_external_crates = Some(crates.into_iter().map(|c| c.to_string()).collect());
+        self
+    }
+
+    /// Returns the sorted, deduplicated names of the external crates (other than `core`) named by
+    /// absolute paths (`::name::..`, by their first segment) in the `ix`-th type and its
+    /// [local generics](Referrer::local_generics()). The type can be left as written if the
+    /// Referrer's crate has all of them (see [`Referrer::with_available_external_crates()`]).
+    pub fn external_crates_require(&self, ix: usize) -> &[String] {
+        &self.external_crates[ix]
+    }
+
+    /// Returns `false` if the `ix`-th type is leaked only because of paths to external crates,
+    /// which is possible only with
+    /// [`Leaker::allow_external_crates`](crate::Leaker::allow_external_crates) unset. Such an
+    /// entry is not replaced when the crates it requires are available (see
+    /// [`Referrer::with_available_external_crates()`]). It is `true` if any cause of the entry is
+    /// something else (a relative path, a relative lifetime, a type macro, ...), and then the entry
+    /// is always replaced.
+    pub fn must(&self, ix: usize) -> bool {
+        self.musts[ix]
     }
 
     /// Returns `true` if there are no types to be encoded.
@@ -1059,7 +1141,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `type-leak` as a string literal, (the number of contexts if it is more than one,) and a group
 /// for each context (see [`Referrer::context()`]): its root generics if they are not empty (the
 /// generics and the where clause, followed by `;`, see [`Referrer::context_generics()`]), and the
-/// leaked types in parentheses. The tokens after it are not consumed, so a Referrer can be
+/// leaked types in parentheses. A leaked type may be preceded by `?` if it is not
+/// [required](Referrer::must()), and by `@[crate, ..]` if it
+/// [requires external crates](Referrer::external_crates_require()), in this order (e.g. `?
+/// @[foo, bar] ::foo::X`); a plain type is required and requires no crate. The tokens after it are not consumed, so a Referrer can be
 /// followed by other tokens. It is an error if the version differs from that of this crate.
 impl Parse for Referrer {
     fn parse(input: parse::ParseStream) -> Result<Self> {
@@ -1092,27 +1177,34 @@ impl Parse for Referrer {
             context_generics.push(generics);
             let content: syn::parse::ParseBuffer<'_>;
             parenthesized!(content in input);
-            // Each entry is either `Type` or `{ <local generics> where ..; Type }`.
-            let group = Punctuated::<(Generics, Type), Token![,]>::parse_terminated_with(
-                &content,
-                |input| {
-                    if input.peek(token::Brace) {
-                        let content: syn::parse::ParseBuffer<'_>;
-                        braced!(content in input);
-                        let mut generics: Generics = content.parse()?;
-                        generics.where_clause = content.parse()?;
-                        content.parse::<Token![;]>()?;
-                        Ok((generics, content.parse()?))
-                    } else {
-                        Ok((Generics::default(), input.parse()?))
-                    }
-                },
-            )?;
-            entries.extend(
-                group
-                    .into_iter()
-                    .map(|(generics, ty)| (context, ty, Requirements::new(generics))),
-            );
+            // Each entry is `[?] [@[crate, ..]] Type` or
+            // `[?] [@[crate, ..]] { <local generics> where ..; Type }`.
+            type Entry = (Generics, Type, bool, Vec<String>);
+            let group = Punctuated::<Entry, Token![,]>::parse_terminated_with(&content, |input| {
+                let must = input.parse::<Option<Token![?]>>()?.is_none();
+                let mut crates = Vec::new();
+                if input.parse::<Option<Token![@]>>()?.is_some() {
+                    let list: syn::parse::ParseBuffer<'_>;
+                    bracketed!(list in input);
+                    crates = Punctuated::<Ident, Token![,]>::parse_terminated(&list)?
+                        .into_iter()
+                        .map(|ident| ident.to_string())
+                        .collect();
+                }
+                if input.peek(token::Brace) {
+                    let content: syn::parse::ParseBuffer<'_>;
+                    braced!(content in input);
+                    let mut generics: Generics = content.parse()?;
+                    generics.where_clause = content.parse()?;
+                    content.parse::<Token![;]>()?;
+                    Ok((generics, content.parse()?, must, crates))
+                } else {
+                    Ok((Generics::default(), input.parse()?, must, crates))
+                }
+            })?;
+            entries.extend(group.into_iter().map(|(generics, ty, must, crates)| {
+                (context, ty, Requirements::new(generics), must, crates)
+            }));
         }
         Ok(Self::new(entries, context_generics))
     }
@@ -1123,7 +1215,9 @@ impl Parse for Referrer {
 /// (at least one), preceded by the number of the groups if it is more than one (e.g. `"0.8.0" 2
 /// (MyType) <T> ; (Wrap<T>)`). A group is the leaked types in parentheses, preceded by the root
 /// generics of the context (see [`Referrer::context_generics()`]) and `;` if they are not empty
-/// (e.g. `<T> where T: Clone ; (Wrap<T>)`).
+/// (e.g. `<T> where T: Clone ; (Wrap<T>)`). An entry which is not required is preceded by `?`,
+/// and one which requires external crates by `@[foo, bar]` (e.g. `(? @[foo] ::foo::X)`), before
+/// its local generics if any.
 ///
 /// ```
 /// # use type_leak::*;
@@ -1152,8 +1246,11 @@ impl ToTokens for Referrer {
                 .iter()
                 .zip(&self.requirements)
                 .zip(&self.contexts)
-                .filter(|(_, c)| **c == context)
-                .map(|(entry, _)| entry)
+                .zip(self.musts.iter().zip(&self.external_crates))
+                .filter(|((_, c), _)| **c == context)
+                .map(|(((item, requirements), _), (must, crates))| {
+                    (item, requirements, *must, crates)
+                })
                 .collect();
             let generics = &self.context_generics[context];
             if !generics.params.is_empty() || generics.where_clause.is_some() {
@@ -1161,7 +1258,11 @@ impl ToTokens for Referrer {
             }
             tokens.extend(quote! {
                 (
-                    #(for (item, requirements) in entries), {
+                    #(for (item, requirements, must, crates) in entries), {
+                        #(if !must) { ? }
+                        #(if !crates.is_empty()) {
+                            @[#(for name in crates), { #{Ident::new(name, proc_macro2::Span::call_site())} }]
+                        }
                         #(if requirements.is_empty()) {
                             #item
                         } #(else) {

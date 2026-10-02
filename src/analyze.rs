@@ -47,6 +47,9 @@ pub struct CheckResult {
 struct PendingType {
     ty: Type,
     is_must_intern: bool,
+    /// A cause of the type is not the path of an external crate (see
+    /// [`Referrer::must()`](crate::Referrer::must())).
+    is_hard: bool,
     requirements: Requirements,
     /// The type looks like a const (see [`looks_like_const()`]), which is an error unless it is a
     /// component of another type.
@@ -82,6 +85,9 @@ struct Frame {
     /// The type mentions an item declared in an analyzed module (see
     /// [`AnalyzeVisitor::is_module_path()`]).
     module_item: bool,
+    /// A cause found in the type is not the path of an external crate (an absolute path whose
+    /// first segment is not `core`).
+    hard: bool,
     /// The effects, which are applied if the type is decomposed.
     effects: Vec<Effect>,
 }
@@ -94,6 +100,7 @@ impl Frame {
             min_depth: usize::MAX,
             local_scope: usize::MAX,
             module_item: false,
+            hard: false,
             effects: Vec::new(),
         }
     }
@@ -188,7 +195,8 @@ impl<'a> AnalyzeVisitor<'a> {
     }
 
     /// Records a cause which depends on the type context, found in the type being visited.
-    fn push_must(&mut self, must: TokenStream) {
+    fn push_must(&mut self, must: TokenStream, hard: bool) {
+        self.frame.hard |= hard;
         self.musts.push((self.type_depth, must));
         self.frame.min_depth = self.frame.min_depth.min(self.type_depth);
     }
@@ -234,6 +242,7 @@ impl<'a> AnalyzeVisitor<'a> {
         self.frame.min_depth = self.frame.min_depth.min(inner.min_depth);
         self.frame.local_scope = self.frame.local_scope.min(inner.local_scope);
         self.frame.module_item |= inner.module_item;
+        self.frame.hard |= inner.hard;
         let has_impossible = self.impossibles.len() > inner.impossible_start;
         let has_must = inner.min_depth != usize::MAX;
         let is_own = inner.min_depth == depth;
@@ -269,6 +278,7 @@ impl<'a> AnalyzeVisitor<'a> {
             self.frame.effects.push(Effect::Type(Box::new(PendingType {
                 ty: ty.clone(),
                 is_must_intern: true,
+                is_hard: inner.hard,
                 requirements,
                 looks_like_const: !is_local && looks_like_const(ty),
                 components: Vec::new(),
@@ -283,6 +293,7 @@ impl<'a> AnalyzeVisitor<'a> {
             self.frame.effects.push(Effect::Type(Box::new(PendingType {
                 ty: ty.clone(),
                 is_must_intern: false,
+                is_hard: inner.hard,
                 requirements: Requirements::none(),
                 looks_like_const: false,
                 components: effects,
@@ -462,6 +473,7 @@ impl Analysis {
                         pending.requirements,
                         parent,
                         pending.is_must_intern,
+                        pending.is_hard,
                     );
                     self.apply(context, pending.components, Some(&key));
                 }
@@ -633,7 +645,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             Type::Macro(_) => {
                 // The tokens of a type macro cannot be analyzed, so it is interned as a whole (it
                 // is expanded in the Leaker's context).
-                self.push_must(quote!(#i));
+                self.push_must(quote!(#i), true);
                 if !Requirements::of(i, &self.scopes).is_empty() {
                     self.mention_local(0);
                 }
@@ -747,7 +759,9 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                 && matches!(i.segments.first(), Some(seg) if seg.ident == "Self" && seg.arguments.is_none());
             if !is_self {
                 // The path depends on the type context.
-                self.push_must(quote!(#i));
+                let external = i.leading_colon.is_some()
+                    && matches!(i.segments.first(), Some(seg) if seg.ident != "core");
+                self.push_must(quote!(#i), !external);
             } else if !self.leaker.self_ty_can_be_interned {
                 self.push_impossible(quote!(#i));
             }
@@ -776,7 +790,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             self.mention_local(scope);
         } else if i.ident != "static" && !self.is_generic_lifetime(i) {
             // The lifetime depends on the type context.
-            self.push_must(quote!(#i));
+            self.push_must(quote!(#i), true);
         }
     }
 

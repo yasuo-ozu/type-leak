@@ -27,6 +27,12 @@ pub enum NotInternableError {
     /// or the type of a const parameter, [`CheckResult::impossible`] is the bound, the value or
     /// the const parameter. Never empty.
     RelativePath(Vec<CheckResult>),
+    /// Like [`NotInternableError::RelativePath`], for a [`Leaker`](crate::Leaker) with
+    /// [`allow_external_crates`](crate::Leaker::allow_external_crates) unset: the offending path
+    /// is relative, or absolute but not `::core` (nor an allowed path), so it may not resolve in
+    /// the Referrer's crate. It should start with `$crate` (e.g. re-exported by the Leaker's
+    /// crate), or with `::core`. Never empty.
+    NotPortable(Vec<CheckResult>),
 }
 
 /// One error to report: the offending tokens, the message and the notes.
@@ -40,44 +46,53 @@ struct Report {
 impl NotInternableError {
     /// Returns the errors to report, one per offending path (or type).
     fn reports(&self) -> Vec<Report> {
-        match self {
-            NotInternableError::RelativePath(conflicts) => conflicts
-                .iter()
-                .filter_map(|conflict| {
-                    let (tokens, others) = conflict.must.split_first()?;
-                    let mut notes: Vec<_> = absolute_path_note(tokens).into_iter().collect();
-                    // Why it cannot be leaked as a whole (unless it is the path itself, e.g. a
-                    // trait bound).
-                    notes.extend(
-                        conflict
-                            .impossible
-                            .iter()
-                            .filter(|cause| cause.to_string() != tokens.to_string())
-                            .map(|cause| {
-                                (
-                                    cause.span(),
-                                    format!(
-                                        "it cannot be leaked as a whole because of `{}`",
-                                        cause
-                                    ),
-                                )
-                            }),
-                    );
-                    // The other paths inside it, which are found after this one is fixed.
-                    notes.extend(others.iter().map(|other| {
-                        (
-                            other.span(),
-                            format!("`{}` also depends on the type context", other),
-                        )
-                    }));
-                    Some(Report {
-                        tokens: tokens.clone(),
-                        message: format!("use absolute path: '{}'", tokens),
-                        notes,
-                    })
+        let (conflicts, portable) = match self {
+            NotInternableError::RelativePath(conflicts) => (conflicts, false),
+            NotInternableError::NotPortable(conflicts) => (conflicts, true),
+        };
+        conflicts
+            .iter()
+            .filter_map(|conflict| {
+                let (tokens, others) = conflict.must.split_first()?;
+                let mut notes: Vec<_> = if portable {
+                    portable_path_note(tokens)
+                } else {
+                    absolute_path_note(tokens)
+                }
+                .into_iter()
+                .collect();
+                // Why it cannot be leaked as a whole (unless it is the path itself, e.g. a
+                // trait bound).
+                notes.extend(
+                    conflict
+                        .impossible
+                        .iter()
+                        .filter(|cause| cause.to_string() != tokens.to_string())
+                        .map(|cause| {
+                            (
+                                cause.span(),
+                                format!("it cannot be leaked as a whole because of `{}`", cause),
+                            )
+                        }),
+                );
+                // The other paths inside it, which are found after this one is fixed.
+                notes.extend(others.iter().map(|other| {
+                    (
+                        other.span(),
+                        format!("`{}` also depends on the type context", other),
+                    )
+                }));
+                Some(Report {
+                    tokens: tokens.clone(),
+                    message: if portable {
+                        format!("use a path starting with `$crate`: '{}'", tokens)
+                    } else {
+                        format!("use absolute path: '{}'", tokens)
+                    },
+                    notes,
                 })
-                .collect(),
-        }
+            })
+            .collect()
     }
 
     /// Returns the span of the first error.
@@ -109,15 +124,55 @@ impl NotInternableError {
     }
 }
 
-/// Returns a note suggesting the absolute path to use instead of the first segment of `tokens`
-/// (a path or a trait bound, e.g. `for<'a> Fn(&'a u8)`), with the span of the segment.
-fn absolute_path_note(tokens: &TokenStream) -> Option<(Span, String)> {
-    let path = syn::parse2::<syn::Path>(tokens.clone()).ok().or_else(|| {
+/// Parses the offending `tokens`, a path or a trait bound (e.g. `for<'a> Fn(&'a u8)`).
+fn offending_path(tokens: &TokenStream) -> Option<syn::Path> {
+    syn::parse2::<syn::Path>(tokens.clone()).ok().or_else(|| {
         match syn::parse2(tokens.clone()).ok()? {
             syn::TypeParamBound::Trait(bound) => Some(bound.path),
             _ => None,
         }
-    })?;
+    })
+}
+
+/// Returns a note suggesting how to make the offending path of a
+/// [`NotInternableError::NotPortable`] start with `$crate` (or `::core`), with the span of its
+/// first segment.
+fn portable_path_note(tokens: &TokenStream) -> Option<(Span, String)> {
+    let path = offending_path(tokens)?;
+    let ident = &path.segments.iter().next()?.ident;
+    let name = ident.to_string();
+    let reexport = |path: &str| {
+        (
+            ident.span(),
+            format!(
+                "re-export it in this crate (e.g. `#[doc(hidden)] pub use {};`) and refer to it \
+                 with a path starting with `$crate`",
+                path
+            ),
+        )
+    };
+    if path.leading_colon.is_some() {
+        // An external crate: `::foo::X` is `$crate::foo::X` after `pub use ::foo;`.
+        return Some(reexport(&format!("::{}", name)));
+    }
+    match ABSOLUTE_PATHS.iter().find(|(n, _)| *n == name) {
+        Some((name, absolute)) if absolute.starts_with("::core::") => Some((
+            ident.span(),
+            format!("use `{}` instead of `{}`", absolute, name),
+        )),
+        Some((_, absolute)) => Some(reexport(absolute)),
+        None => Some((
+            ident.span(),
+            "re-export it in this crate and refer to it with a path starting with `$crate`"
+                .to_string(),
+        )),
+    }
+}
+
+/// Returns a note suggesting the absolute path to use instead of the first segment of `tokens`
+/// (a path or a trait bound, e.g. `for<'a> Fn(&'a u8)`), with the span of the segment.
+fn absolute_path_note(tokens: &TokenStream) -> Option<(Span, String)> {
+    let path = offending_path(tokens)?;
     if path.leading_colon.is_some() {
         return None;
     }
