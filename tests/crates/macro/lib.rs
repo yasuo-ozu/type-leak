@@ -151,6 +151,20 @@ fn param_as_arg(param: &GenericParam) -> TokenStream {
     }
 }
 
+/// Analyzes a trait without allowing any relative path, reporting a `NotInternableError` with
+/// its `ToTokens` implementation (for tests/diagnostic.rs).
+#[proc_macro_attribute]
+pub fn leak_strict(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let item_trait = parse_macro_input!(item as ItemTrait);
+    match Leaker::from_trait(&item_trait) {
+        Ok(_) => quote!(#item_trait).into(),
+        Err(e) => quote!(#e).into(),
+    }
+}
+
 /// The Leaker side: `#[leak(..)]` on a trait.
 #[proc_macro_attribute]
 pub fn leak(

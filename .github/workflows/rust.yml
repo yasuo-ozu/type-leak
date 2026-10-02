@@ -21,6 +21,17 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+  nightly:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install nightly Rust
+      run: rustup toolchain install nightly --profile minimal
+    - name: Run tests (with notes emitted as diagnostics with their own spans)
+      run: cargo +nightly test --verbose
+
   msrv:
 
     runs-on: ubuntu-latest

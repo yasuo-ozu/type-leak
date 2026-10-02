@@ -95,7 +95,7 @@ fn test_intern() {
 
 // ── regressions ──────────────────────────────────────────────────────────────
 
-fn leak_struct(item: &ItemStruct) -> Result<Vec<String>> {
+fn leak_struct(item: &ItemStruct) -> Result<BTreeSet<String>> {
     let mut config = type_leak::LeakerConfig::new();
     config.allow_primitive().allow_std_prelude();
     let mut leaker = Leaker::from_config(config);
@@ -109,7 +109,7 @@ fn leak_struct(item: &ItemStruct) -> Result<Vec<String>> {
         .collect())
 }
 
-fn leak_trait(item: &ItemTrait) -> Result<Vec<String>> {
+fn leak_trait(item: &ItemTrait) -> Result<BTreeSet<String>> {
     let mut config = type_leak::LeakerConfig::new();
     config.allow_primitive().allow_std_prelude();
     let mut leaker = Leaker::from_config(config);
@@ -123,7 +123,7 @@ fn leak_trait(item: &ItemTrait) -> Result<Vec<String>> {
         .collect())
 }
 
-fn strings(tys: &[&str]) -> Vec<String> {
+fn strings(tys: &[&str]) -> BTreeSet<String> {
     tys.iter()
         .map(|s| {
             let ty: Type = parse_str(s).unwrap();
@@ -145,7 +145,7 @@ fn test_hrtb_lifetimes_are_not_leaked() {
             g: for<'a> fn(&'a u8),
         }
     };
-    assert_eq!(leak_struct(&item).unwrap(), Vec::<String>::new());
+    assert_eq!(leak_struct(&item).unwrap(), BTreeSet::<String>::new());
 
     // Relative types inside them are leaked without the lifetimes.
     let item: ItemTrait = parse_quote! {
@@ -187,7 +187,7 @@ fn test_finish_reduces_and_accumulates() {
         .intern_with(&u.generics, |v| v.visit_item_struct(&u))
         .unwrap();
     leaker.reduce_roots();
-    let leaked: Vec<String> = leaker
+    let leaked: BTreeSet<String> = leaker
         .finish()
         .iter()
         .map(|t| quote!(#t).to_string())
@@ -197,15 +197,25 @@ fn test_finish_reduces_and_accumulates() {
 
 #[test]
 fn test_finish_order_is_deterministic() {
-    // Leaked types are ordered by their first appearance.
+    // The leaked types (and so their indices) are the same in every run, whatever the order.
     let item: ItemStruct = parse_quote! {
         struct S { e: E, c: C, a: A, d: D, b: B, a2: A }
     };
+    let finish = || -> Vec<String> {
+        Leaker::from_struct(&item)
+            .unwrap()
+            .finish()
+            .iter()
+            .map(|t| quote!(#t).to_string())
+            .collect()
+    };
+    let first = finish();
+    assert_eq!(
+        first.iter().cloned().collect::<BTreeSet<_>>(),
+        strings(&["A", "B", "C", "D", "E"])
+    );
     for _ in 0..8 {
-        assert_eq!(
-            leak_struct(&item).unwrap(),
-            strings(&["E", "C", "A", "D", "B"])
-        );
+        assert_eq!(finish(), first);
     }
 }
 
@@ -275,7 +285,7 @@ fn test_trait_const_defaults_are_ignored() {
             fn f(&self) { helper(); }
         }
     };
-    assert_eq!(leak_trait(&item).unwrap(), Vec::<String>::new());
+    assert_eq!(leak_trait(&item).unwrap(), BTreeSet::<String>::new());
 }
 
 #[test]
@@ -320,4 +330,163 @@ fn test_assertions_for_assumed_primitives() {
         }
     );
     assert!(Leaker::from_struct(&item).unwrap().assertions().is_empty());
+}
+
+#[test]
+fn test_leaker_from_union() {
+    let item: ItemUnion = parse_quote! {
+        pub union MyUnion<'a, T: ::core::marker::Copy> {
+            a: ::core::mem::ManuallyDrop<MyType1>,
+            b: &'a T,
+            c: (MyType2, u8),
+        }
+    };
+    let referrer = Leaker::from_union(&item).unwrap().finish();
+    assert_eq!(
+        referrer
+            .iter()
+            .map(|i| quote!(#i).to_string())
+            .collect::<BTreeSet<_>>(),
+        [
+            ":: core :: mem :: ManuallyDrop < MyType1 >",
+            "(MyType2 , u8)"
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<BTreeSet<_>>()
+    );
+    // Bounds must use absolute paths as for structs.
+    assert!(Leaker::from_union(&parse_quote! {
+        union MyUnion<T: Copy> { a: T }
+    })
+    .is_err());
+}
+
+#[test]
+fn test_receivers() {
+    // The type of a receiver (`&self` is `self: &Self`) is analyzed as any other type, where
+    // `Self` alone is never leaked.
+    let leak = |sig: proc_macro2::TokenStream,
+                self_ty_can_be_interned: bool|
+     -> std::result::Result<BTreeSet<String>, String> {
+        let item: ItemTrait = parse_quote!(trait Tr<'a> { #sig });
+        let mut leaker = Leaker::new();
+        leaker.self_ty_can_be_interned = self_ty_can_be_interned;
+        leaker
+            .intern_with(&item.generics, |v| v.visit_item_trait(&item))
+            .map_err(|e| e.to_string())?;
+        Ok(leaker
+            .finish()
+            .iter()
+            .map(|t| quote!(#t).to_string())
+            .collect::<BTreeSet<_>>())
+    };
+    for self_ty_can_be_interned in [true, false] {
+        for sig in [
+            quote!(
+                fn f(&self);
+            ),
+            quote!(
+                fn f(&'a mut self);
+            ),
+            quote!(
+                fn f(mut self);
+            ),
+            quote!(
+                fn f(self: ::std::boxed::Box<Self>);
+            ),
+            quote!(
+                fn f(self: &'a Self);
+            ),
+            quote!(
+                fn f(&self) -> &Self;
+            ),
+        ] {
+            assert_eq!(
+                leak(sig, self_ty_can_be_interned),
+                Ok(BTreeSet::new()),
+                "{}",
+                self_ty_can_be_interned
+            );
+        }
+    }
+
+    // A relative type applied to `Self` is leaked as a whole only if `Self` can be interned.
+    assert_eq!(
+        leak(
+            quote!(
+                fn f(self: Rel<Self>);
+            ),
+            true
+        ),
+        Ok(strings(&["Rel<Self>"]))
+    );
+    assert_eq!(
+        leak(
+            quote!(
+                fn f(self: Rel<Self>);
+            ),
+            false
+        ),
+        Err("use absolute path: 'Rel < Self >'".to_string())
+    );
+    assert_eq!(
+        leak(
+            quote!(
+                fn f(self: ::k::W<Rel, Self>);
+            ),
+            false
+        ),
+        Ok(strings(&["Rel"]))
+    );
+}
+
+#[test]
+fn test_grouped_const_param_type_is_asserted() {
+    // A primitive type of a const parameter passed through `macro_rules!` (`$t:ty`, wrapped in an
+    // invisible group) is copied as it is, so it is asserted not to be shadowed as a bare one is.
+    let grouped = Type::Group(TypeGroup {
+        group_token: Default::default(),
+        elem: Box::new(parse_quote!(u8)),
+    });
+    for ty in [parse_quote!(u8), grouped] {
+        let item: ItemTrait = parse_quote!(trait Tr<const N: #ty> {});
+        let assertions = Leaker::from_trait(&item).unwrap().assertions().to_string();
+        assert!(
+            assertions.contains("__type_leak_assert_u8_is_primitive"),
+            "{}",
+            assertions
+        );
+    }
+    // An absolute path to a primitive type needs no assertion.
+    let item: ItemTrait = parse_quote!(
+        trait Tr<const N: ::core::primitive::u8> {}
+    );
+    assert!(Leaker::from_trait(&item).unwrap().assertions().is_empty());
+}
+
+#[test]
+fn test_qualified_paths_are_decomposed() {
+    // A qualified path with a context-free trait is decomposed like any other path, so only its
+    // components which depend on the type context are leaked.
+    let item: ItemTrait = parse_quote! {
+        trait Tr<T> {
+            fn f(&self, a: <T as ::p::Tr<RelA, '_>>::Ty, b: <(RelB, &'_ u8) as ::p::Tr>::Ty);
+            fn g(&self, c: <T as ::p::Tr>::Ty<'_, RelC>);
+        }
+    };
+    assert_eq!(
+        leak_trait(&item).unwrap(),
+        strings(&["RelA", "RelB", "RelC"])
+    );
+    // A relative trait cannot be decomposed.
+    let item: ItemTrait = parse_quote! {
+        trait Tr<T> {
+            fn f(&self, a: <T as RelTrait<'_>>::Ty);
+        }
+    };
+    assert_eq!(
+        leak_trait(&item).unwrap_err().to_string(),
+        "use absolute path: 'RelTrait < '_ > :: Ty'"
+    );
 }

@@ -5,10 +5,15 @@ use syn::*;
 use template_quote::quote;
 use type_leak::Referrer;
 
-/// Rewrites `item` with the Referrer `referrer` (in its serialized form), replacing the `ix`-th
-/// leaked type with `P<ix>`.
-fn rewrite(referrer: proc_macro2::TokenStream, mut item: Item) -> String {
-    let referrer: Referrer = parse2(referrer).unwrap();
+/// Rewrites `item` with the Referrer of the leaked types `types` (in its serialized form, without
+/// the version), replacing the `ix`-th leaked type with `P<ix>`.
+fn rewrite(types: proc_macro2::TokenStream, item: Item) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    rewrite_with(parse2(quote!(#version #types)).unwrap(), item)
+}
+
+/// Rewrites `item` with `referrer`, replacing the `ix`-th leaked type with `P<ix>`.
+fn rewrite_with(referrer: Referrer, mut item: Item) -> String {
     let mut visitor = referrer.into_visitor(|_, ix| parse_quote!(P<#ix>));
     visitor.visit_item_mut(&mut item);
     quote!(#item).to_string()
@@ -163,9 +168,24 @@ fn test_grouped_types_are_found() {
     let referrer = leaker.finish();
     assert_eq!(referrer.iter().count(), 1);
     assert_eq!(
-        rewrite(quote!(#referrer), Item::Struct(item)),
+        rewrite_with(referrer, Item::Struct(item)),
         expected(parse_quote! {
             struct S { a: P<0usize>, b: P<0usize> }
         })
     );
+}
+
+#[test]
+fn test_version_is_checked() {
+    // A Referrer emitted by another version of type-leak is rejected.
+    let err = parse2::<Referrer>(quote!("0.0.0"(RelA))).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "the Referrer was emitted by type-leak 0.0.0, but is parsed by type-leak {}",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    // Without the version, it is not a Referrer.
+    assert!(parse2::<Referrer>(quote!((RelA))).is_err());
 }

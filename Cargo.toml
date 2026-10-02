@@ -13,11 +13,9 @@ categories = [
   "rust-patterns",
 ]
 license = "MIT"
-# The cross-crate test depends on the test crates under tests/crates, which are not published.
-exclude = ["tests/crates", "tests/cross_crate.rs"]
-
-[lib]
-path = "lib.rs"
+# The cross-crate and diagnostic tests depend on the test crates under tests/crates, which are not
+# published.
+exclude = ["tests/crates", "tests/cross_crate.rs", "tests/diagnostic.rs"]
 
 [dependencies]
 safegraph = { version = "0.3.0", default-features = false }
