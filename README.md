@@ -106,7 +106,11 @@ are interned instead. A type which cannot be decomposed (such as `MyWrap<B>` in
 generics (lifetimes first) and constrain them in its trait arguments, so the Repeater needs a type
 parameter to carry them (e.g. `Repeater<T: ?Sized, const INDEX: usize>`). Their bounds may mention
 `Self`, which refers to the implementor of the Leaker trait, so the Repeater should be implemented
-for the implementor (e.g. `impl<.., S: ?Sized> Repeater<..> for S where S: MyTrait<..>`).
+for the implementor (e.g. `impl<.., S: ?Sized> Repeater<..> for S where S: MyTrait<..>`). The same
+type depending on different local generics (e.g. `MyWrap<B>` where `B` is a `bool` in one method and
+a `u8` in another) is a separate entry for each, and the `Referrer` rewrites each copy to its own.
+Likewise, each successful call of `Leaker::intern_with()` is a context (`Referrer::context()`),
+since its generics may differ, and its types are not shared with those of other contexts.
 
 Known limitations, due to the stable Rust type system:
 

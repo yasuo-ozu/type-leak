@@ -1,7 +1,9 @@
 //! The [`Referrer`], which rewrites copies of the analyzed items.
 
 use crate::graph::TypeKey;
-use crate::util::{generic_param_name, mentions_generics, mentions_names};
+use crate::requirements::{Requirements, Scope};
+use crate::util::mentions_names;
+use proc_macro2::TokenStream;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -16,16 +18,56 @@ use template_quote::{quote, ToTokens};
 ///
 /// `Referrer` provides methods to iterate over leak types and to expand or transform
 /// types using a custom mapping function.
+///
+/// Each type is an entry, identified by its context (see [`Referrer::context()`]), its tokens, and
+/// the local generics it depends on (see [`Referrer::local_generics()`]): the same tokens with
+/// different local generics (e.g. `Wrap<B>` where `B` is a `bool` in one method and a `u8` in
+/// another) are separate entries, and the one a copy refers to is found by resolving the generics
+/// in scope where it appears.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Referrer {
     pub(crate) leak_types: Vec<Type>,
-    /// Keyed by [`TypeKey`] (by tokens) as in the Leaker, so that e.g. a type wrapped in an
-    /// invisible group is found as well.
-    pub(crate) map: HashMap<TypeKey, usize>,
-    pub(crate) local_generics: Vec<Generics>,
+    pub(crate) requirements: Vec<Requirements>,
+    pub(crate) contexts: Vec<usize>,
+    /// The candidates (and their indices) of a type in a context, keyed by [`TypeKey`] (by tokens)
+    /// as in the Leaker, so that e.g. a type wrapped in an invisible group is found as well.
+    pub(crate) map: HashMap<(usize, TypeKey), Vec<(Requirements, usize)>>,
 }
 
 impl Referrer {
+    /// Builds a Referrer from its entries (the context, the type and its requirements), in the
+    /// order of their indices.
+    pub(crate) fn new(entries: impl IntoIterator<Item = (usize, Type, Requirements)>) -> Self {
+        let mut referrer = Self {
+            leak_types: Vec::new(),
+            requirements: Vec::new(),
+            contexts: Vec::new(),
+            map: HashMap::new(),
+        };
+        for (ix, (context, ty, requirements)) in entries.into_iter().enumerate() {
+            referrer
+                .map
+                .entry((context, TypeKey::new(&ty)))
+                .or_default()
+                .push((requirements.clone(), ix));
+            referrer.leak_types.push(ty);
+            referrer.requirements.push(requirements);
+            referrer.contexts.push(context);
+        }
+        referrer
+    }
+
+    /// Returns the index of the type `ty` in `context`, if it is leaked with the requirements it
+    /// has with the generics in `scopes`.
+    fn find(&self, context: usize, ty: &Type, scopes: &[Scope]) -> Option<usize> {
+        let candidates = self.map.get(&(context, TypeKey::new(ty)))?;
+        let requirements = Requirements::of(ty, scopes);
+        candidates
+            .iter()
+            .find(|(candidate, _)| candidate == &requirements)
+            .map(|(_, ix)| *ix)
+    }
+
     /// Returns `true` if there are no types to be encoded.
     pub fn is_empty(&self) -> bool {
         self.leak_types.is_empty()
@@ -46,7 +88,12 @@ impl Referrer {
     }
 
     /// Returns the local generics which the `ix`-th type depends on, i.e. generics of a trait
-    /// method or a GAT which are not generics of the Leaker. It is empty for most types.
+    /// method or a GAT (or of a nested item, or a `for<..>` binder) which are not generics of the
+    /// Leaker. It is empty for most types.
+    ///
+    /// They are in a canonical form, which is the same for declarations with the same meaning: the
+    /// parameters are sorted by name (lifetimes first), and the bounds are sorted and moved from
+    /// the where clause to the parameter they bound, if any. Defaults are removed.
     ///
     /// A type such as `Wrap<B>` in `fn f<const B: bool>(&self) -> Wrap<B>` (where `Wrap` depends on
     /// the type context) cannot be decomposed, so it is interned together with `B`. The Repeater's
@@ -90,28 +137,56 @@ impl Referrer {
     /// parse_quote!(<Self as Repeater<(#args, #local_args), #ID, #ix>>::Type)
     /// ```
     pub fn local_generics(&self, ix: usize) -> &Generics {
-        &self.local_generics[ix]
+        self.requirements[ix].generics()
+    }
+
+    /// Returns the context of the `ix`-th type: the number of the
+    /// [`Leaker::intern_with()`](crate::Leaker::intern_with()) call it was found by (counting the
+    /// successful calls from 0), or its constructor ([`Leaker::from_struct()`](crate::Leaker::from_struct())
+    /// etc.), which is the call 0. A type found in several contexts has an entry for each, since
+    /// the generics of the Leaker may differ.
+    pub fn context(&self, ix: usize) -> usize {
+        self.contexts[ix]
     }
 
     /// Returns an iterator over the types that need to be encoded, together with their local
     /// generics. See [`Referrer::local_generics()`].
     pub fn iter_with_local_generics(&self) -> impl Iterator<Item = (&Type, &Generics)> {
-        self.leak_types.iter().zip(self.local_generics.iter())
+        self.leak_types
+            .iter()
+            .zip(self.requirements.iter().map(Requirements::generics))
     }
 
-    /// Converts this `Referrer` into a [`Visitor`] that can be used to transform AST nodes.
+    /// Converts this `Referrer` into a [`Visitor`] that can be used to transform AST nodes of the
+    /// context 0.
     ///
     /// The `type_fn` callback is called for each type that needs to be converted,
     /// receiving the original type and its index, and returning the replacement type.
     /// See [`Referrer::expand()`] for details.
     pub fn into_visitor<F: FnMut(Type, usize) -> Type>(self, type_fn: F) -> Visitor<F> {
-        Visitor(self, Rc::new(RefCell::new(type_fn)))
+        self.into_visitor_in(0, type_fn)
+    }
+
+    /// Like [`Referrer::into_visitor()`], for AST nodes of `context` (see
+    /// [`Referrer::context()`]): only the types found in it are replaced.
+    pub fn into_visitor_in<F: FnMut(Type, usize) -> Type>(
+        self,
+        context: usize,
+        type_fn: F,
+    ) -> Visitor<F> {
+        Visitor {
+            referrer: self,
+            type_fn: Rc::new(RefCell::new(type_fn)),
+            context,
+            scopes: Vec::new(),
+        }
     }
 
     /// Expands a type by replacing any interned types using the provided mapping function.
     ///
     /// The `type_fn` callback is called for each subtype that needs to be converted,
-    /// receiving the original type and its index, and returning the replacement type.
+    /// receiving the original type and its index, and returning the replacement type. The type is
+    /// expanded as in the context 0, with no generics in scope other than those of the Leaker.
     ///
     /// ```ignore
     /// let args = encode_generics_params_to_ty(&generics.params);
@@ -120,71 +195,111 @@ impl Referrer {
     /// })
     /// ```
     pub fn expand(&self, ty: Type, type_fn: impl FnMut(Type, usize) -> Type) -> Type {
+        self.expand_in(0, ty, type_fn)
+    }
+
+    /// Like [`Referrer::expand()`], for a type of `context` (see [`Referrer::context()`]).
+    pub fn expand_in(
+        &self,
+        context: usize,
+        ty: Type,
+        type_fn: impl FnMut(Type, usize) -> Type,
+    ) -> Type {
+        self.expand_with(context, &mut Vec::new(), ty, type_fn)
+    }
+
+    /// Expands `ty` as in `context`, where the generics of `scopes` are in scope.
+    fn expand_with(
+        &self,
+        context: usize,
+        scopes: &mut Vec<Scope>,
+        ty: Type,
+        type_fn: impl FnMut(Type, usize) -> Type,
+    ) -> Type {
         use syn::fold::Fold;
-        struct Folder<'a, F>(&'a Referrer, F);
-        impl<'a, F: FnMut(Type, usize) -> Type> Fold for Folder<'a, F> {
-            fn fold_type(&mut self, ty: Type) -> Type {
-                if let Some(idx) = self.0.map.get(&TypeKey::new(&ty)) {
-                    self.1(ty, *idx)
-                } else {
-                    syn::fold::fold_type(self, ty)
-                }
+        struct Folder<'a, F> {
+            referrer: &'a Referrer,
+            context: usize,
+            scopes: &'a mut Vec<Scope>,
+            type_fn: F,
+        }
+        impl<'a, F> Folder<'a, F> {
+            /// Pushes the scope of the lifetimes of a `for<..>` binder, as the Leaker does.
+            fn push_binder(&mut self, lifetimes: Option<&BoundLifetimes>) -> bool {
+                lifetimes
+                    .map(|lifetimes| self.scopes.push(Scope::binder(lifetimes)))
+                    .is_some()
             }
         }
-        let mut folder = Folder(self, type_fn);
-        folder.fold_type(ty)
+        impl<'a, F: FnMut(Type, usize) -> Type> Fold for Folder<'a, F> {
+            fn fold_type(&mut self, ty: Type) -> Type {
+                match self.referrer.find(self.context, &ty, self.scopes) {
+                    Some(ix) => (self.type_fn)(ty, ix),
+                    None => syn::fold::fold_type(self, ty),
+                }
+            }
+            fn fold_type_bare_fn(&mut self, i: TypeBareFn) -> TypeBareFn {
+                let pushed = self.push_binder(i.lifetimes.as_ref());
+                let i = syn::fold::fold_type_bare_fn(self, i);
+                if pushed {
+                    self.scopes.pop();
+                }
+                i
+            }
+            fn fold_trait_bound(&mut self, i: TraitBound) -> TraitBound {
+                let pushed = self.push_binder(i.lifetimes.as_ref());
+                let i = syn::fold::fold_trait_bound(self, i);
+                if pushed {
+                    self.scopes.pop();
+                }
+                i
+            }
+        }
+        Folder {
+            referrer: self,
+            context,
+            scopes,
+            type_fn,
+        }
+        .fold_type(ty)
     }
 }
 
+/// Rewrites AST nodes with the leaked types of a [`Referrer`], see [`Referrer::into_visitor()`].
+///
+/// It keeps track of the generics declared at the visited site (those of items, methods, impls and
+/// `for<..>` binders), including those of the outermost item visited: a type is rewritten only if
+/// it was leaked with the same local generics as it depends on here (see
+/// [`Referrer::local_generics()`]). A type mentioning generics which are not leaked with it (e.g.
+/// `T` in the `impl<T>` of the visited item) is not rewritten, since it refers to them rather than
+/// to the Leaker's items.
 #[derive(Debug)]
-pub struct Visitor<F>(Referrer, Rc<RefCell<F>>);
+pub struct Visitor<F> {
+    referrer: Referrer,
+    type_fn: Rc<RefCell<F>>,
+    context: usize,
+    /// The generics in scope, the innermost last.
+    scopes: Vec<Scope>,
+}
 
 impl<F> Clone for Visitor<F> {
     fn clone(&self) -> Self {
-        Self(self.0.clone(), self.1.clone())
+        Self {
+            referrer: self.referrer.clone(),
+            type_fn: self.type_fn.clone(),
+            context: self.context,
+            scopes: self.scopes.clone(),
+        }
     }
 }
 
 impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
-    /// Stops rewriting the leaked types which mention the generic parameters declared here (they
-    /// refer to these parameters rather than to the Leaker's items), unless the leaked type was
-    /// interned together with local generics of the same name (see
-    /// [`Referrer::local_generics()`]).
-    fn shadow_generics(&mut self, generics: &Generics) {
-        let referrer = &self.0;
-        let shadowed: Vec<TypeKey> = referrer
-            .map
-            .iter()
-            .filter(|(key, ix)| {
-                let locals = &referrer.local_generics[**ix];
-                let params = generics.params.iter().filter(|gp| {
-                    !locals
-                        .params
-                        .iter()
-                        .any(|local| generic_param_name(local) == generic_param_name(gp))
-                });
-                mentions_generics(&key.ty, params)
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in shadowed {
-            self.0.map.remove(&key);
-        }
-    }
-
     /// Stops rewriting the leaked types which mention `idents` (items or imports declared in a
     /// block or a module).
     fn shadow_idents(&mut self, idents: Vec<Ident>) {
-        let shadowed: Vec<TypeKey> = self
-            .0
+        self.referrer
             .map
-            .keys()
-            .filter(|key| mentions_names(&key.ty, idents.clone(), Vec::new()))
-            .cloned()
-            .collect();
-        for key in shadowed {
-            self.0.map.remove(&key);
-        }
+            .retain(|(_, key), _| !mentions_names(&key.ty, idents.clone(), Vec::new()));
     }
 
     /// Shadows the items declared in `items`.
@@ -226,7 +341,7 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
     fn with_generics(&mut self, generics: &mut Generics) -> Self {
         let mut visitor = self.clone();
         // All the parameters are in scope of each other's bounds.
-        visitor.shadow_generics(generics);
+        visitor.scopes.push(Scope::new(generics));
         for gp in generics.params.iter_mut() {
             visitor.visit_generic_param_mut(gp);
         }
@@ -248,7 +363,30 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
 
 impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
     fn visit_type_mut(&mut self, i: &mut Type) {
-        *i = self.0.expand(i.clone(), &mut *self.1.borrow_mut());
+        *i = self.referrer.expand_with(
+            self.context,
+            &mut self.scopes,
+            i.clone(),
+            &mut *self.type_fn.borrow_mut(),
+        );
+    }
+    fn visit_predicate_type_mut(&mut self, i: &mut PredicateType) {
+        let binder = i.lifetimes.as_ref().map(Scope::binder);
+        let pushed = binder.is_some();
+        self.scopes.extend(binder);
+        syn::visit_mut::visit_predicate_type_mut(self, i);
+        if pushed {
+            self.scopes.pop();
+        }
+    }
+    fn visit_trait_bound_mut(&mut self, i: &mut TraitBound) {
+        let binder = i.lifetimes.as_ref().map(Scope::binder);
+        let pushed = binder.is_some();
+        self.scopes.extend(binder);
+        syn::visit_mut::visit_trait_bound_mut(self, i);
+        if pushed {
+            self.scopes.pop();
+        }
     }
     fn visit_const_param_mut(&mut self, i: &mut ConstParam) {
         // The type of a const parameter cannot be a projection, so it is kept as is.
@@ -398,8 +536,10 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Parses a [`Referrer`] serialized with its [`ToTokens`] implementation: the version of
-/// `type-leak` as a string literal, followed by the leaked types in parentheses. It is an error if
-/// the version differs from that of this crate.
+/// `type-leak` as a string literal, (the number of contexts if it is more than one,) and the
+/// leaked types in parentheses, one group for each context (see [`Referrer::context()`]). The
+/// tokens after it are not consumed, so a Referrer can be followed by other tokens. It is an error
+/// if the version differs from that of this crate.
 impl Parse for Referrer {
     fn parse(input: parse::ParseStream) -> Result<Self> {
         let version: LitStr = input.parse()?;
@@ -413,38 +553,45 @@ impl Parse for Referrer {
                 ),
             ));
         }
-        let content: syn::parse::ParseBuffer<'_>;
-        parenthesized!(content in input);
-        // Each entry is either `Type` or `{ <local generics> where ..; Type }`.
-        let entries =
-            Punctuated::<(Generics, Type), Token![,]>::parse_terminated_with(&content, |input| {
-                if input.peek(token::Brace) {
-                    let content: syn::parse::ParseBuffer<'_>;
-                    braced!(content in input);
-                    let mut generics: Generics = content.parse()?;
-                    generics.where_clause = content.parse()?;
-                    content.parse::<Token![;]>()?;
-                    Ok((generics, content.parse()?))
-                } else {
-                    Ok((Generics::default(), input.parse()?))
-                }
-            })?;
-        let (local_generics, leak_types): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
-        let map = leak_types
-            .iter()
-            .enumerate()
-            .map(|(n, ty)| (TypeKey::new(ty), n))
-            .collect();
-        Ok(Self {
-            map,
-            leak_types,
-            local_generics,
-        })
+        let n_contexts = if input.peek(LitInt) {
+            input.parse::<LitInt>()?.base10_parse::<usize>()?
+        } else {
+            1
+        };
+        let mut entries = Vec::new();
+        for context in 0..n_contexts {
+            let content: syn::parse::ParseBuffer<'_>;
+            parenthesized!(content in input);
+            // Each entry is either `Type` or `{ <local generics> where ..; Type }`.
+            let group = Punctuated::<(Generics, Type), Token![,]>::parse_terminated_with(
+                &content,
+                |input| {
+                    if input.peek(token::Brace) {
+                        let content: syn::parse::ParseBuffer<'_>;
+                        braced!(content in input);
+                        let mut generics: Generics = content.parse()?;
+                        generics.where_clause = content.parse()?;
+                        content.parse::<Token![;]>()?;
+                        Ok((generics, content.parse()?))
+                    } else {
+                        Ok((Generics::default(), input.parse()?))
+                    }
+                },
+            )?;
+            entries.extend(
+                group
+                    .into_iter()
+                    .map(|(generics, ty)| (context, ty, Requirements::new(generics))),
+            );
+        }
+        Ok(Self::new(entries))
     }
 }
 
 /// Serializes the [`Referrer`] (with the version of `type-leak`), to be parsed back with its
-/// [`Parse`] implementation, e.g. in another macro invocation.
+/// [`Parse`] implementation, e.g. in another macro invocation. The types are in parentheses, one
+/// group for each context up to the last one with a type (at least one group), preceded by the
+/// number of the groups if it is more than one (e.g. `"0.8.0" 2 (MyType) (Wrap<T>)`).
 ///
 /// ```
 /// # use type_leak::*;
@@ -460,18 +607,33 @@ impl Parse for Referrer {
 /// assert_eq!(parse2::<Referrer>(tokens).unwrap(), referrer);
 /// ```
 impl ToTokens for Referrer {
-    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
-        tokens.extend(quote! {
-            #VERSION
-            (
-                #(for (item, generics) in self.leak_types.iter().zip(&self.local_generics)), {
-                    #(if generics.params.is_empty()) {
-                        #item
-                    } #(else) {
-                        { #generics #{&generics.where_clause}; #item }
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        tokens.extend(quote!(#VERSION));
+        let n_contexts = self.contexts.iter().max().map_or(1, |context| context + 1);
+        if n_contexts > 1 {
+            // The number of the groups, so that the Referrer can be followed by other tokens.
+            tokens.extend(quote!(#{proc_macro2::Literal::usize_unsuffixed(n_contexts)}));
+        }
+        for context in 0..n_contexts {
+            let entries: Vec<_> = self
+                .leak_types
+                .iter()
+                .zip(&self.requirements)
+                .zip(&self.contexts)
+                .filter(|(_, c)| **c == context)
+                .map(|(entry, _)| entry)
+                .collect();
+            tokens.extend(quote! {
+                (
+                    #(for (item, requirements) in entries), {
+                        #(if requirements.is_empty()) {
+                            #item
+                        } #(else) {
+                            { #{requirements.generics()} #{&requirements.generics().where_clause}; #item }
+                        }
                     }
-                }
-            )
-        })
+                )
+            });
+        }
     }
 }

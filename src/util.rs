@@ -43,25 +43,6 @@ pub(crate) fn looks_like_const(ty: &Type) -> bool {
     }
 }
 
-/// Returns `true` if `ty` refers to any of `generics`.
-pub(crate) fn mentions_generics<'a>(
-    ty: &Type,
-    generics: impl IntoIterator<Item = &'a GenericParam>,
-) -> bool {
-    let mut idents = Vec::new();
-    let mut lifetimes = Vec::new();
-    for gp in generics {
-        match gp {
-            GenericParam::Type(TypeParam { ident, .. })
-            | GenericParam::Const(ConstParam { ident, .. }) => idents.push(ident.clone()),
-            GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
-                lifetimes.push(lifetime.clone())
-            }
-        }
-    }
-    mentions_names(ty, idents, lifetimes)
-}
-
 /// Returns `true` if `ty` refers to any of `idents` (as the first segment of a relative path) or
 /// `lifetimes`.
 pub(crate) fn mentions_names(ty: &Type, idents: Vec<Ident>, lifetimes: Vec<Lifetime>) -> bool {

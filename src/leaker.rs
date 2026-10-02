@@ -3,7 +3,7 @@
 use crate::analyze::{AnalyzeVisitor, CheckResult};
 use crate::config::LeakerConfig;
 use crate::error::NotInternableError;
-use crate::graph::{descendants, reaches, TypeGraph, TypeKey};
+use crate::graph::{descendants, reaches, NodeKey, TypeGraph};
 use crate::referrer::Referrer;
 use crate::util::path_starts_with;
 use proc_macro2::{Span, TokenStream};
@@ -19,7 +19,10 @@ pub struct Leaker {
     types: TypeGraph,
     /// The nodes of the types to be interned, computed from `types` by [`Leaker::reduce_roots()`]
     /// (`None` if not computed yet, or outdated).
-    reachable_types: Option<Vec<TypeKey>>,
+    reachable_types: Option<Vec<NodeKey>>,
+    /// The number of successful calls of [`Leaker::intern_with()`], each of which is a context (see
+    /// [`Referrer::context()`](crate::Referrer::context())).
+    n_contexts: usize,
     /// Names of primitive types which were assumed to be the primitive types (not shadowed), as
     /// they are copied as they are (see [`Leaker::assertions()`]).
     assumed_primitives: Vec<Ident>,
@@ -120,6 +123,7 @@ impl Leaker {
             self_ty_can_be_interned: true,
             types: TypeGraph::default(),
             reachable_types: None,
+            n_contexts: 0,
             assumed_primitives: Vec::new(),
         }
     }
@@ -131,6 +135,7 @@ impl Leaker {
             self_ty_can_be_interned: config.self_ty_can_be_interned,
             types: TypeGraph::default(),
             reachable_types: None,
+            n_contexts: 0,
             assumed_primitives: Vec::new(),
         }
     }
@@ -196,8 +201,10 @@ impl Leaker {
 
     /// Intern AST elements using a visitor callback.
     ///
-    /// The types found are added to those of the previous calls; nothing is added if an error is
-    /// returned.
+    /// Each successful call is a new context, numbered from 0 in order (see
+    /// [`Referrer::context()`](crate::Referrer::context())): the types found are added to those of
+    /// the previous calls, but are never shared with them, since `generics` may differ. Nothing is
+    /// added if an error is returned.
     pub fn intern_with<'ast, F>(
         &mut self,
         generics: &Generics,
@@ -206,7 +213,7 @@ impl Leaker {
     where
         F: FnOnce(&mut dyn syn::visit::Visit<'ast>),
     {
-        let mut visitor = AnalyzeVisitor::new(self, generics);
+        let mut visitor = AnalyzeVisitor::new(self, self.n_contexts, generics);
         f(&mut visitor);
         let analysis = visitor.finish();
         for ident in &analysis.primitives {
@@ -215,21 +222,12 @@ impl Leaker {
         if !analysis.errors.is_empty() {
             return Err(NotInternableError::RelativePath(analysis.errors));
         }
-        if let Some(ty) = analysis.conflicting_local_generics {
-            return Err(NotInternableError::ConflictingLocalGenerics(ty));
-        }
         let types = analysis.types;
-        // The Referrer finds leaked types by the type alone, so the same type must depend on the
-        // same local generics wherever it appears (e.g. not `Wrap<B>` both in
-        // `fn f<const B: bool>()` and in `fn g()` where `B` is a type).
-        if let Some(key) = self.types.find_conflict(&types) {
-            let ty = &key.ty;
-            return Err(NotInternableError::ConflictingLocalGenerics(quote!(#ty)));
-        }
         if !types.is_empty() {
             self.types.merge(types);
             self.reachable_types = None;
         }
+        self.n_contexts += 1;
         Ok(self)
     }
 
@@ -241,25 +239,15 @@ impl Leaker {
     /// Finish building the [`Leaker`] and convert it into [`Referrer`].
     ///
     /// The types are reduced by [`Leaker::reduce_roots()`] (called here if needed), and sorted by
-    /// their tokens, so the result (including the index of each type) is deterministic.
+    /// their context, tokens and requirements, so the result (including the index of each type) is
+    /// deterministic.
     pub fn finish(mut self) -> Referrer {
         self.reduce_roots();
         let keys = self.reachable_types.take().unwrap_or_default();
-        let leak_types: Vec<Type> = keys.iter().map(|key| key.ty.clone()).collect();
-        let map = leak_types
-            .iter()
-            .enumerate()
-            .map(|(n, ty)| (TypeKey::new(ty), n))
-            .collect();
-        let local_generics = keys
-            .iter()
-            .map(|key| self.types.local_generics[key].clone())
-            .collect();
-        Referrer {
-            leak_types,
-            map,
-            local_generics,
-        }
+        Referrer::new(
+            keys.into_iter()
+                .map(|key| (key.context, key.ty.ty, key.requirements)),
+        )
     }
 
     /// Reduce nodes to decrease the cost of the [`Leaker`]'s implementation.
@@ -304,20 +292,20 @@ impl Leaker {
         }
     }
 
-    /// Returns the types to be interned, sorted by their tokens.
-    fn build_graph_and_reduce(&self) -> Vec<TypeKey> {
+    /// Returns the types to be interned, sorted by their context, tokens and requirements.
+    fn build_graph_and_reduce(&self) -> Vec<NodeKey> {
         let types = &self.types;
-        let children: HashMap<&TypeKey, Vec<TypeKey>> =
+        let children: HashMap<&NodeKey, Vec<NodeKey>> =
             types.keys().map(|key| (key, types.children(key))).collect();
 
         // 1. Keep the roots which must be interned, or contain types which must be interned.
-        let mut kept: HashSet<&TypeKey> = types
+        let mut kept: HashSet<&NodeKey> = types
             .roots
             .iter()
             .filter(|key| reaches(key, &children, |key| types.must_intern.contains(key)))
             .collect();
         // 2. Keep the types which must be interned and are not components of kept types.
-        let components: HashSet<TypeKey> = kept
+        let components: HashSet<NodeKey> = kept
             .iter()
             .flat_map(|key| descendants(key, &children))
             .collect();
@@ -328,9 +316,15 @@ impl Leaker {
                 .filter(|key| !components.contains(*key)),
         );
 
-        // Sort by the tokens, for deterministic output.
-        let mut kept: Vec<TypeKey> = kept.into_iter().cloned().collect();
-        kept.sort_by_cached_key(|key| key.to_string());
+        // Sort for deterministic output.
+        let mut kept: Vec<NodeKey> = kept.into_iter().cloned().collect();
+        kept.sort_by_cached_key(|key| {
+            (
+                key.context,
+                key.ty.to_string(),
+                key.requirements.key().to_string(),
+            )
+        });
         kept
     }
 }

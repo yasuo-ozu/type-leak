@@ -12,6 +12,7 @@ mod graph;
 mod leaker;
 mod referrer;
 mod repeater;
+mod requirements;
 mod util;
 
 pub use syn;

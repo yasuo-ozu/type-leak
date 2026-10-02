@@ -189,3 +189,130 @@ fn test_version_is_checked() {
     // Without the version, it is not a Referrer.
     assert!(parse2::<Referrer>(quote!((RelA))).is_err());
 }
+
+#[test]
+fn test_contexts() {
+    let mut leaker = type_leak::Leaker::new();
+    let item0: ItemStruct = parse_quote! { struct S<T> { a: RelA, b: Wrap<T> } };
+    let item1: ItemStruct = parse_quote! { struct S<U> { a: RelA, b: Wrap<U> } };
+    leaker
+        .intern_with(&item0.generics, |v| {
+            syn::visit::Visit::visit_item_struct(v, &item0)
+        })
+        .unwrap();
+    // A failed call is not a context.
+    let bad: ItemStruct = parse_quote! { struct S { a: RelB<'_> } };
+    assert!(leaker
+        .intern_with(&bad.generics, |v| {
+            syn::visit::Visit::visit_item_struct(v, &bad)
+        })
+        .is_err());
+    leaker
+        .intern_with(&item1.generics, |v| {
+            syn::visit::Visit::visit_item_struct(v, &item1)
+        })
+        .unwrap();
+    let referrer = leaker.finish();
+    // The same type in different contexts is not shared.
+    assert_eq!(
+        referrer
+            .iter()
+            .map(|ty| quote!(#ty).to_string())
+            .collect::<Vec<_>>(),
+        ["RelA", "Wrap < T >", "RelA", "Wrap < U >"]
+    );
+    assert_eq!(
+        (0..4).map(|ix| referrer.context(ix)).collect::<Vec<_>>(),
+        [0, 0, 1, 1]
+    );
+
+    // The contexts survive a round trip through `ToTokens` and `Parse`.
+    let tokens = quote!(#referrer);
+    assert_eq!(
+        tokens.to_string(),
+        format!(
+            "\"{}\" 2 (RelA , Wrap < T >) (RelA , Wrap < U >)",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    let parsed: Referrer = parse2(tokens).unwrap();
+    assert_eq!(parsed, referrer);
+    assert_eq!(parsed.context(3), 1);
+
+    // A visitor rewrites the types of its context only.
+    let item: Item = parse_quote! { struct X { a: RelA, b: Wrap<U> } };
+    assert_eq!(
+        rewrite_with(referrer.clone(), item.clone()),
+        expected(parse_quote! { struct X { a: P<0usize>, b: Wrap<U> } })
+    );
+    let mut rewritten = item;
+    referrer
+        .clone()
+        .into_visitor_in(1, |_, ix| parse_quote!(P<#ix>))
+        .visit_item_mut(&mut rewritten);
+    assert_eq!(
+        quote!(#rewritten).to_string(),
+        expected(parse_quote! { struct X { a: P<2usize>, b: P<3usize> } })
+    );
+    let expected_ty: Type = parse_quote!(::p::Q<P<2usize>>);
+    let ty = referrer.expand_in(1, parse_quote!(::p::Q<RelA>), |_, ix| parse_quote!(P<#ix>));
+    assert_eq!(quote!(#ty).to_string(), quote!(#expected_ty).to_string());
+
+    // Contexts without types are not serialized, unless followed by one with types.
+    let mut leaker = type_leak::Leaker::new();
+    let empty: ItemStruct = parse_quote! { struct S; };
+    leaker
+        .intern_with(&empty.generics, |v| {
+            syn::visit::Visit::visit_item_struct(v, &empty)
+        })
+        .unwrap();
+    leaker
+        .intern_with(&item0.generics, |v| {
+            syn::visit::Visit::visit_item_struct(v, &item0)
+        })
+        .unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(referrer.context(0), 1);
+    let parsed: Referrer = parse2(quote!(#referrer)).unwrap();
+    assert_eq!(parsed, referrer);
+}
+
+#[test]
+fn test_referrer_followed_by_tokens() {
+    // A serialized Referrer can be followed by other tokens (e.g. in a macro invocation), also
+    // with several contexts.
+    struct Embedded(Referrer, Ident);
+    impl syn::parse::Parse for Embedded {
+        fn parse(input: syn::parse::ParseStream) -> Result<Self> {
+            let referrer = input.parse()?;
+            input.parse::<Token![,]>()?;
+            let content;
+            parenthesized!(content in input);
+            Ok(Embedded(referrer, content.parse()?))
+        }
+    }
+    let item_a: ItemStruct = parse_quote!(
+        struct A {
+            a: RelA,
+        }
+    );
+    let item_b: ItemStruct = parse_quote!(
+        struct B {
+            b: RelB,
+        }
+    );
+    for items in [vec![&item_a], vec![&item_a, &item_b]] {
+        let mut leaker = type_leak::Leaker::new();
+        for item in items {
+            leaker
+                .intern_with(&item.generics, |v| {
+                    syn::visit::Visit::visit_item_struct(v, item)
+                })
+                .unwrap();
+        }
+        let referrer = leaker.finish();
+        let parsed: Embedded = parse2(quote!(#referrer, (after))).unwrap();
+        assert_eq!(parsed.0, referrer);
+        assert_eq!(parsed.1, "after");
+    }
+}

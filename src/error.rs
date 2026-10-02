@@ -27,11 +27,6 @@ pub enum NotInternableError {
     /// or the type of a const parameter, [`CheckResult::impossible`] is the bound, the value or
     /// the const parameter. Never empty.
     RelativePath(Vec<CheckResult>),
-    /// The type is used with different method-local generics (or with and without them) in
-    /// different places, so a Referrer cannot tell which one a copy refers to. (The Referrer finds
-    /// leaked types by the type alone; see
-    /// [`Referrer::local_generics()`](crate::Referrer::local_generics()).)
-    ConflictingLocalGenerics(TokenStream),
 }
 
 /// One error to report: the offending tokens, the message and the notes.
@@ -82,19 +77,6 @@ impl NotInternableError {
                     })
                 })
                 .collect(),
-            NotInternableError::ConflictingLocalGenerics(tokens) => vec![Report {
-                tokens: tokens.clone(),
-                message: format!(
-                    "'{}' is used with different method-local generics, which cannot be leaked",
-                    tokens
-                ),
-                notes: vec![(
-                    tokens.span(),
-                    "use an absolute path for it, or the same method-local generics wherever it \
-                     is used"
-                        .to_string(),
-                )],
-            }],
         }
     }
 
