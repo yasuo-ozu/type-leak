@@ -502,3 +502,143 @@ fn test_impl_trait_binders() {
     };
     assert_eq!(leak_trait(&item).unwrap(), strings(&["RelA"]));
 }
+
+#[test]
+fn test_self_ty_cannot_be_interned() {
+    let leak = |sig: proc_macro2::TokenStream,
+                self_ty_can_be_interned: bool|
+     -> std::result::Result<BTreeSet<String>, syn::Error> {
+        let item: ItemTrait = parse_quote!(trait Tr { #sig });
+        let mut leaker = Leaker::new();
+        leaker.self_ty_can_be_interned = self_ty_can_be_interned;
+        leaker
+            .intern_with(&item.generics, |v| v.visit_item_trait(&item))
+            .map_err(syn::Error::from)?;
+        Ok(leaker
+            .finish()
+            .iter()
+            .map(|t| quote!(#t).to_string())
+            .collect::<BTreeSet<_>>())
+    };
+    let set = |types: &[&str]| types.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+
+    // A relative type applied to `Self` cannot be leaked as a whole, so the path is an error.
+    let err = leak(
+        quote!(
+            fn f(&self) -> Rel<Self>;
+        ),
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.starts_with("use absolute path: 'Rel < Self >'"),
+        "{}",
+        err
+    );
+    assert!(
+        err.contains("it cannot be leaked as a whole because of `Self`"),
+        "{}",
+        err
+    );
+    assert_eq!(
+        leak(
+            quote!(
+                fn f(&self) -> Rel<Self>;
+            ),
+            true
+        )
+        .unwrap(),
+        set(&["Rel < Self >"])
+    );
+
+    // The components are leaked instead if the type can be decomposed.
+    for ty in [quote!(::k::W<Rel, Self>), quote!((Rel, Self))] {
+        let sig = quote!(
+            fn f(&self) -> #ty;
+        );
+        assert_eq!(leak(sig.clone(), false).unwrap(), set(&["Rel"]));
+        assert_eq!(
+            leak(sig, true).unwrap(),
+            set(&[&quote!(#ty).to_string()]),
+            "{}",
+            ty
+        );
+    }
+
+    // `Self` alone is never leaked.
+    for ty in [
+        quote!(Self),
+        quote!(Self::Item),
+        quote!(&Self),
+        quote!(::k::W<Self>),
+    ] {
+        assert_eq!(
+            leak(
+                quote!(
+                    fn f(&self) -> #ty;
+                ),
+                false
+            )
+            .unwrap(),
+            BTreeSet::new(),
+            "{}",
+            ty
+        );
+    }
+}
+
+#[test]
+fn test_bodies_are_not_analyzed() {
+    // The bodies of functions and the values of consts are not analyzed, while the signatures and
+    // the types are.
+    let item: ItemImpl = parse_quote! {
+        impl ::k::Tr for ::k::W {
+            const C: RelC = RelCVal::new();
+            fn f(&self, a: RelArg) -> RelRet {
+                let x: RelBody = RelBody::new();
+                fn g() -> RelNested { RelNested::new() }
+                x
+            }
+        }
+    };
+    let mut leaker = Leaker::new();
+    leaker
+        .intern_with(&Generics::default(), |v| v.visit_item_impl(&item))
+        .unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(
+        referrer
+            .iter()
+            .map(|t| quote!(#t).to_string())
+            .collect::<BTreeSet<_>>(),
+        ["RelC", "RelArg", "RelRet"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<BTreeSet<_>>()
+    );
+
+    // Also those of the nested items.
+    let item: ItemMod = parse_quote! {
+        mod m {
+            const C: RelC = RelCVal::new();
+            static S: RelS = RelSVal::new();
+            fn f() -> RelRet { let x: RelBody = RelBody::new(); x }
+        }
+    };
+    let mut leaker = Leaker::new();
+    leaker
+        .intern_with(&Generics::default(), |v| v.visit_item_mod(&item))
+        .unwrap();
+    assert_eq!(
+        leaker
+            .finish()
+            .iter()
+            .map(|t| quote!(#t).to_string())
+            .collect::<BTreeSet<_>>(),
+        ["RelC", "RelS", "RelRet"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<BTreeSet<_>>()
+    );
+}

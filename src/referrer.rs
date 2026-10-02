@@ -179,6 +179,8 @@ impl Referrer {
             type_fn: Rc::new(RefCell::new(type_fn)),
             context,
             scopes: Vec::new(),
+            outermost_as_leakers: false,
+            item_depth: 0,
         }
     }
 
@@ -268,11 +270,12 @@ impl Referrer {
 /// Rewrites AST nodes with the leaked types of a [`Referrer`], see [`Referrer::into_visitor()`].
 ///
 /// It keeps track of the generics declared at the visited site (those of items, methods, impls and
-/// `for<..>` binders), including those of the outermost item visited: a type is rewritten only if
-/// it was leaked with the same local generics as it depends on here (see
+/// `for<..>` binders), including those of the outermost item visited by default: a type is
+/// rewritten only if it was leaked with the same local generics as it depends on here (see
 /// [`Referrer::local_generics()`]). A type mentioning generics which are not leaked with it (e.g.
 /// `T` in the `impl<T>` of the visited item) is not rewritten, since it refers to them rather than
-/// to the Leaker's items.
+/// to the Leaker's items. See [`Visitor::with_outermost_generics_as_leakers()`] to treat the
+/// generics of the outermost item as those of the Leaker instead.
 #[derive(Debug)]
 pub struct Visitor<F> {
     referrer: Referrer,
@@ -280,6 +283,10 @@ pub struct Visitor<F> {
     context: usize,
     /// The generics in scope, the innermost last.
     scopes: Vec<Scope>,
+    /// See [`Visitor::with_outermost_generics_as_leakers()`].
+    outermost_as_leakers: bool,
+    /// The number of items enclosing the syntax being visited.
+    item_depth: usize,
 }
 
 impl<F> Clone for Visitor<F> {
@@ -289,11 +296,31 @@ impl<F> Clone for Visitor<F> {
             type_fn: self.type_fn.clone(),
             context: self.context,
             scopes: self.scopes.clone(),
+            outermost_as_leakers: self.outermost_as_leakers,
+            item_depth: self.item_depth,
         }
     }
 }
 
 impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
+    /// Treats the generics of the outermost item visited as those of the Leaker, like
+    /// [`Leaker::intern_with()`](crate::Leaker::intern_with()) does for the item it visits: they
+    /// are not kept track of as local generics, so a type depending on them only (e.g. `Wrap<T>`
+    /// in `impl<T> MyTrait<T> for W { fn f(&self) -> Wrap<T>; }`, visited as a whole, where `T` is
+    /// a generic of the Leaker's trait) is rewritten if it was leaked.
+    ///
+    /// The outermost item is a struct, enum, union, trait, type alias, function, impl or trait
+    /// alias (or the signature, if only a signature is visited). The generics of the items,
+    /// methods, associated types and consts and `for<..>` binders in it are still local, and a
+    /// module (which has no generics) only makes the items in it nested.
+    ///
+    /// By default, the generics of the outermost item are local too, so such a type is not
+    /// rewritten.
+    pub fn with_outermost_generics_as_leakers(mut self) -> Self {
+        self.outermost_as_leakers = true;
+        self
+    }
+
     /// Stops rewriting the leaked types which mention `idents` (items or imports declared in a
     /// block or a module).
     fn shadow_idents(&mut self, idents: Vec<Ident>) {
@@ -338,10 +365,16 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
         }
     }
 
-    fn with_generics(&mut self, generics: &mut Generics) -> Self {
+    /// Returns a visitor with the generics of an item (or of a method, an associated type or a
+    /// const if not `item`) in scope, and visits them. Those of the outermost item are not in
+    /// scope if [`Visitor::with_outermost_generics_as_leakers()`] is set.
+    fn with_generics_as(&mut self, generics: &mut Generics, item: bool) -> Self {
         let mut visitor = self.clone();
+        visitor.item_depth += 1;
         // All the parameters are in scope of each other's bounds.
-        visitor.scopes.push(Scope::new(generics));
+        if !(item && self.outermost_as_leakers && self.item_depth == 0) {
+            visitor.scopes.push(Scope::new(generics));
+        }
         for gp in generics.params.iter_mut() {
             visitor.visit_generic_param_mut(gp);
         }
@@ -351,8 +384,16 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
         visitor
     }
 
-    fn with_signature(&mut self, sig: &mut Signature) -> Self {
-        let mut visitor = self.with_generics(&mut sig.generics);
+    fn with_item_generics(&mut self, generics: &mut Generics) -> Self {
+        self.with_generics_as(generics, true)
+    }
+
+    fn with_generics(&mut self, generics: &mut Generics) -> Self {
+        self.with_generics_as(generics, false)
+    }
+
+    fn with_signature_as(&mut self, sig: &mut Signature, item: bool) -> Self {
+        let mut visitor = self.with_generics_as(&mut sig.generics, item);
         for input in sig.inputs.iter_mut() {
             visitor.visit_fn_arg_mut(input);
         }
@@ -401,14 +442,14 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         for attr in i.attrs.iter_mut() {
             self.visit_attribute_mut(attr);
         }
-        let mut visitor = self.with_generics(&mut i.generics);
+        let mut visitor = self.with_item_generics(&mut i.generics);
         visitor.visit_fields_mut(&mut i.fields);
     }
     fn visit_item_enum_mut(&mut self, i: &mut ItemEnum) {
         for attr in i.attrs.iter_mut() {
             self.visit_attribute_mut(attr);
         }
-        let mut visitor = self.with_generics(&mut i.generics);
+        let mut visitor = self.with_item_generics(&mut i.generics);
         for variant in i.variants.iter_mut() {
             visitor.visit_variant_mut(variant);
         }
@@ -417,7 +458,7 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         for attr in i.attrs.iter_mut() {
             self.visit_attribute_mut(attr);
         }
-        let mut visitor = self.with_generics(&mut i.generics);
+        let mut visitor = self.with_item_generics(&mut i.generics);
         for supertrait in i.supertraits.iter_mut() {
             visitor.visit_type_param_bound_mut(supertrait);
         }
@@ -429,24 +470,24 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         for attr in i.attrs.iter_mut() {
             self.visit_attribute_mut(attr);
         }
-        let mut visitor = self.with_generics(&mut i.generics);
+        let mut visitor = self.with_item_generics(&mut i.generics);
         visitor.visit_fields_named_mut(&mut i.fields);
     }
     fn visit_item_type_mut(&mut self, i: &mut ItemType) {
         for attr in i.attrs.iter_mut() {
             self.visit_attribute_mut(attr);
         }
-        let mut visitor = self.with_generics(&mut i.generics);
+        let mut visitor = self.with_item_generics(&mut i.generics);
         visitor.visit_type_mut(&mut i.ty);
     }
     fn visit_signature_mut(&mut self, i: &mut Signature) {
-        self.with_signature(i);
+        self.with_signature_as(i, true);
     }
     fn visit_item_impl_mut(&mut self, i: &mut ItemImpl) {
         for attr in i.attrs.iter_mut() {
             self.visit_attribute_mut(attr);
         }
-        let mut visitor = self.with_generics(&mut i.generics);
+        let mut visitor = self.with_item_generics(&mut i.generics);
         if let Some((_, path, _)) = &mut i.trait_ {
             visitor.visit_path_mut(path);
         }
@@ -459,7 +500,7 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         for attr in i.attrs.iter_mut() {
             self.visit_attribute_mut(attr);
         }
-        let mut visitor = self.with_signature(&mut i.sig);
+        let mut visitor = self.with_signature_as(&mut i.sig, false);
         visitor.visit_block_mut(&mut i.block);
     }
     fn visit_impl_item_type_mut(&mut self, i: &mut ImplItemType) {
@@ -475,6 +516,8 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         }
         if let Some((_, items)) = &mut i.content {
             let mut visitor = self.clone();
+            // The items in the module are nested items.
+            visitor.item_depth += 1;
             visitor.shadow_items(items.iter());
             for item in items.iter_mut() {
                 visitor.visit_item_mut(item);
@@ -485,14 +528,14 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         for attr in i.attrs.iter_mut() {
             self.visit_attribute_mut(attr);
         }
-        let mut visitor = self.with_signature(&mut i.sig);
+        let mut visitor = self.with_signature_as(&mut i.sig, true);
         visitor.visit_block_mut(i.block.as_mut());
     }
     fn visit_trait_item_fn_mut(&mut self, i: &mut TraitItemFn) {
         for attr in i.attrs.iter_mut() {
             self.visit_attribute_mut(attr);
         }
-        let mut visitor = self.with_signature(&mut i.sig);
+        let mut visitor = self.with_signature_as(&mut i.sig, false);
         if let Some(block) = &mut i.default {
             visitor.visit_block_mut(block);
         }

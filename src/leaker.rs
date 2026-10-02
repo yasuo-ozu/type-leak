@@ -116,6 +116,34 @@ impl Leaker {
         Ok(leaker)
     }
 
+    /// Initialize [`Leaker`] from a module.
+    ///
+    /// The module has no generics, and every item in it (structs, enums, unions, traits, type
+    /// aliases, functions, impls and nested modules) is a nested item, so its generics are local
+    /// generics, which the types depending on them are interned with (see
+    /// [`Referrer::local_generics()`]). The bodies of functions and the values of consts are not
+    /// analyzed. A module without content (`mod m;`) has nothing to analyze.
+    ///
+    /// ```
+    /// # use syn::*;
+    /// # use type_leak::Leaker;
+    /// let m: ItemMod = parse_quote!{
+    ///     mod m {
+    ///         pub struct S<T> { x: Rel<T> }
+    ///         pub type A = Rel2;
+    ///     }
+    /// };
+    /// let referrer = Leaker::from_module(&m).unwrap().finish();
+    /// assert_eq!(referrer.iter().count(), 2);
+    /// ```
+    pub fn from_module(input: &ItemMod) -> std::result::Result<Self, NotInternableError> {
+        let mut leaker = Self::new();
+        leaker.intern_with(&Generics::default(), |visitor| {
+            visitor.visit_item_mod(input);
+        })?;
+        Ok(leaker)
+    }
+
     /// Initialize empty [`Leaker`] with no generics.
     pub fn new() -> Self {
         Self {

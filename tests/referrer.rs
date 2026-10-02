@@ -316,3 +316,50 @@ fn test_referrer_followed_by_tokens() {
         assert_eq!(parsed.1, "after");
     }
 }
+
+#[test]
+fn test_outermost_generics_as_leakers() {
+    // The Leaker is made from the trait, whose generics are those of the Leaker.
+    let tr: ItemTrait = parse_quote! {
+        trait MyTrait<T> {
+            fn f(&self) -> Wrap<T>;
+            fn g<const B: bool>(&self) -> Wrap2<B>;
+        }
+    };
+    let referrer = type_leak::Leaker::from_trait(&tr).unwrap().finish();
+    let item: Item = parse_quote! {
+        impl<T> MyTrait<T> for W {
+            fn f(&self) -> Wrap<T> { todo!() }
+            fn g<const B: bool>(&self) -> Wrap2<B> { todo!() }
+        }
+    };
+    let rewrite = |outermost_as_leakers: bool| {
+        let mut item = item.clone();
+        let mut visitor = referrer.clone().into_visitor(|_, ix| parse_quote!(P<#ix>));
+        if outermost_as_leakers {
+            visitor = visitor.with_outermost_generics_as_leakers();
+        }
+        visitor.visit_item_mut(&mut item);
+        quote!(#item).to_string()
+    };
+    // By default, `T` is a local generic of the impl, so `Wrap<T>` is not rewritten.
+    assert_eq!(
+        rewrite(false),
+        expected(parse_quote! {
+            impl<T> MyTrait<T> for W {
+                fn f(&self) -> Wrap<T> { todo!() }
+                fn g<const B: bool>(&self) -> P<1usize> { todo!() }
+            }
+        })
+    );
+    // The generics of the method are still local.
+    assert_eq!(
+        rewrite(true),
+        expected(parse_quote! {
+            impl<T> MyTrait<T> for W {
+                fn f(&self) -> P<0usize> { todo!() }
+                fn g<const B: bool>(&self) -> P<1usize> { todo!() }
+            }
+        })
+    );
+}
