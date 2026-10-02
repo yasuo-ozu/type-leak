@@ -7,7 +7,7 @@
 //!   forward to `Inner`.
 
 use type_leak_test_leaker::m::{
-    Consts, Defaulted, Defaults, Edge, Holder, Inner, Plain, RelDefault, RelType,
+    Consts, Defaulted, Defaults, DollarCrate, Edge, Holder, Inner, Plain, RelDefault, RelType,
 };
 use type_leak_test_referrer::{Concrete, Explicit, Generic, Generic2, Omitted};
 
@@ -91,4 +91,20 @@ fn edge_cases() {
     );
     assert_eq!(Edge::<u8>::e_box(Box::new(Concrete(Inner))).0, 1);
     assert_eq!(c.p().0, 5);
+}
+
+/// The `$crate` paths of `DollarCrate` (a supertrait, types, an array length and a bound), which
+/// the Referrer's crate copies, resolve to the Leaker's crate.
+///
+/// The exact results of the Leaker for such paths (with and without
+/// `allow_external_crates`) are checked when the Leaker's crate is compiled, by
+/// `check_leak!` in `tests/crates/leaker`.
+#[test]
+fn dollar_crate_paths() {
+    use type_leak_test_leaker::m_portable::{Portable, Wrap};
+    let c = Concrete(Inner);
+    let _: Portable = c.d_ret();
+    assert_eq!(c.d_arg(Wrap(4)), 5);
+    assert_eq!(c.d_arr(), [7, 7]);
+    assert_eq!(c.d_rel(Portable).0, 11);
 }

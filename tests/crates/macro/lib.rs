@@ -165,6 +165,118 @@ pub fn leak_strict(
     }
 }
 
+/// Input of `check_leak!`: `{ expected } { config } item`.
+struct CheckLeakInput {
+    /// The leaked types, or the message of the error.
+    expected: std::result::Result<Vec<String>, String>,
+    allow_external_crates: bool,
+    item: Item,
+}
+
+/// Prints a type as `to_string()` does, after parsing, so that the spacing is normalized.
+fn type_string(ty: &Type) -> String {
+    quote!(#ty).to_string()
+}
+
+impl Parse for CheckLeakInput {
+    fn parse(input: ParseStream) -> Result<Self> {
+        let expected_tokens: TokenStream = braced_parse(input)?;
+        let expected = syn::parse::Parser::parse2(
+            |input: ParseStream| -> Result<std::result::Result<Vec<String>, String>> {
+                if input.peek(Ident) && input.peek2(Token![:]) && !input.peek2(Token![::]) {
+                    let key: Ident = input.parse()?;
+                    if key != "error" {
+                        return Err(Error::new(key.span(), "expected `error`"));
+                    }
+                    input.parse::<Token![:]>()?;
+                    let lit: LitStr = input.parse()?;
+                    return Ok(Err(lit.value()));
+                }
+                let types = Punctuated::<Type, Token![,]>::parse_terminated(input)?;
+                Ok(Ok(types.iter().map(type_string).collect()))
+            },
+            expected_tokens,
+        )?;
+        let config_tokens: TokenStream = braced_parse(input)?;
+        let mut allow_external_crates = true;
+        syn::parse::Parser::parse2(
+            |input: ParseStream| -> Result<()> {
+                while !input.is_empty() {
+                    let key: Ident = input.parse()?;
+                    input.parse::<Token![=]>()?;
+                    let value: LitBool = input.parse()?;
+                    match key.to_string().as_str() {
+                        "allow_external_crates" => allow_external_crates = value.value,
+                        _ => return Err(Error::new(key.span(), "unknown flag")),
+                    }
+                    let _: Option<Token![,]> = input.parse()?;
+                }
+                Ok(())
+            },
+            config_tokens,
+        )?;
+        Ok(Self {
+            expected,
+            allow_external_crates,
+            item: input.parse()?,
+        })
+    }
+}
+
+/// Checks the leaked types (or the error) of the Leaker for an item, which may contain real
+/// `$crate` tokens when invoked from a `macro_rules!`:
+///
+/// ```ignore
+/// check_leak! {
+///     { Rel, Other<u8> }                     // the leaked types, sorted, or `error: "message"`
+///     { allow_external_crates = false }      // the config (`allow_primitive` is always set)
+///     trait Tr { fn f(&self) -> $crate::m::Wrap<Rel>; } // a trait, a struct or a module
+/// }
+/// ```
+///
+/// It expands to nothing if the result is as expected, and to a `compile_error!` otherwise.
+#[proc_macro]
+pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let CheckLeakInput {
+        expected,
+        allow_external_crates,
+        item,
+    } = parse_macro_input!(input as CheckLeakInput);
+    let mut leaker = Leaker::from_config({
+        let mut config = LeakerConfig::new();
+        config
+            .allow_primitive()
+            .allow_external_crates(allow_external_crates);
+        config
+    });
+    let result = match &item {
+        Item::Trait(item) => leaker.intern_with(&item.generics, |v| v.visit_item_trait(item)),
+        Item::Struct(item) => leaker.intern_with(&item.generics, |v| v.visit_item_struct(item)),
+        Item::Mod(item) => leaker.intern_with(&Generics::default(), |v| v.visit_item_mod(item)),
+        _ => return quote!(compile_error!("unsupported item");).into(),
+    };
+    let got: std::result::Result<Vec<String>, String> = match result {
+        Ok(_) => {
+            let mut types: Vec<String> = leaker.finish().iter().map(type_string).collect();
+            types.sort();
+            Ok(types)
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    let expected = match expected {
+        Ok(mut types) => {
+            types.sort();
+            Ok(types)
+        }
+        Err(e) => Err(e),
+    };
+    if got == expected {
+        return proc_macro::TokenStream::new();
+    }
+    let message = format!("expected {:?}, got {:?}", expected, got);
+    quote!(compile_error!(#message);).into()
+}
+
 /// The Leaker side: `#[leak(..)]` on a trait.
 #[proc_macro_attribute]
 pub fn leak(

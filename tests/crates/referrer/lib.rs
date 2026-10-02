@@ -39,3 +39,8 @@ type_leak_test_leaker::m::Defaulted!(impl Defaulted<u8, u32> for Explicit => 0);
 /// A generic argument is used by the default.
 pub struct Generic2<T>(pub Inner, pub core::marker::PhantomData<T>);
 type_leak_test_leaker::m::Defaulted!(impl<T> Defaulted<T> for Generic2<T> => 0);
+
+// A trait using `$crate` paths (a supertrait, types, an array length and a bound): they resolve to
+// the Leaker's crate from here.
+impl type_leak_test_leaker::m_portable::PortTr for Concrete {}
+type_leak_test_leaker::m::DollarCrate!(impl DollarCrate for Concrete => 0);
