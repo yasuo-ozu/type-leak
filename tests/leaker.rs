@@ -249,7 +249,7 @@ fn test_uninternable_types_are_decomposed() {
 
 #[test]
 fn test_all_dyn_bounds_are_checked() {
-    // Both orders of the bounds are leaked as a whole.
+    // Both orders of the bounds are leaked as a whole (inside the `Box`, which is rebuilt).
     let item: ItemStruct = parse_quote! {
         struct S {
             a: Box<dyn MyTrait + Send>,
@@ -258,7 +258,7 @@ fn test_all_dyn_bounds_are_checked() {
     };
     assert_eq!(
         leak_struct(&item).unwrap(),
-        strings(&["Box<dyn MyTrait + Send>", "Box<dyn Send + MyTrait>"])
+        strings(&["dyn MyTrait + Send", "dyn Send + MyTrait"])
     );
 }
 
@@ -347,13 +347,10 @@ fn test_leaker_from_union() {
             .iter()
             .map(|i| quote!(#i).to_string())
             .collect::<BTreeSet<_>>(),
-        [
-            ":: core :: mem :: ManuallyDrop < MyType1 >",
-            "(MyType2 , u8)"
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<BTreeSet<_>>()
+        ["MyType1", "(MyType2 , u8)"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<BTreeSet<_>>()
     );
     // Bounds must use absolute paths as for structs.
     assert!(Leaker::from_union(&parse_quote! {
@@ -558,12 +555,8 @@ fn test_self_ty_cannot_be_interned() {
             fn f(&self) -> #ty;
         );
         assert_eq!(leak(sig.clone(), false).unwrap(), set(&["Rel"]));
-        assert_eq!(
-            leak(sig, true).unwrap(),
-            set(&[&quote!(#ty).to_string()]),
-            "{}",
-            ty
-        );
+        // `Self` does not depend on the context by itself, so `Rel` is enough.
+        assert_eq!(leak(sig, true).unwrap(), set(&["Rel"]), "{}", ty);
     }
 
     // `Self` alone is never leaked.

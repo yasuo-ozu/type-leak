@@ -175,7 +175,7 @@ fn from_module_generics_shadow_module_items() {
         }
     };
     // `S` in `A` is the generic parameter. Local generics are interned with the types depending
-    // on them (see `Referrer::local_generics()`), but `Wrap<S>` is relative either way.
+    // on them (see `Referrer::generics()`), but `Wrap<S>` is relative either way.
     let referrer = Leaker::from_module(&m).unwrap().finish();
     assert_eq!(
         referrer
@@ -309,13 +309,7 @@ fn types_not_depending_on_the_module_are_shared() {
         })
         .unwrap();
     let referrer = leaker.finish();
-    assert_eq!(
-        modules_of(&referrer),
-        [
-            ":: core :: option :: Option < :: foo :: X >@",
-            ":: foo :: X@"
-        ]
-    );
+    assert_eq!(modules_of(&referrer), [":: foo :: X@"]);
     assert_eq!(referrer.n_contexts(), 1);
     // A relative type next to it is still keyed by its module.
     let m: ItemMod = parse_quote! {

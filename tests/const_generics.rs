@@ -55,7 +55,8 @@ fn test_const_generic_param_in_expr() {
     };
     let mut leaker = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
-    let expected: Type = parse_quote!([RelType; N]);
+    // The element is interned (the innermost minimum cut), and the array is rebuilt around it.
+    let expected: Type = parse_quote!(RelType);
     assert_eq!(
         finish_as_strings(leaker),
         BTreeSet::from([quote!(#expected).to_string()])
@@ -142,7 +143,7 @@ fn test_local_generics_leaked() {
             expected(parse_quote!(MyWrap<B>), parse_quote!(<const B: bool>)),
             expected(parse_quote!(MyVec<S::Item>), g_generics),
             expected(parse_quote!(MyHolder<'c>), parse_quote!(<'c>)),
-            expected(parse_quote!([RelType; 2]), Generics::default()),
+            expected(parse_quote!(RelType), Generics::default()),
         ])
     );
 

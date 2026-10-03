@@ -175,6 +175,10 @@ pub(crate) struct AnalyzeVisitor<'a> {
     /// (its lifetime is elided or local), so a trait object without a lifetime bound, which
     /// defaults to that lifetime, cannot be interned alone.
     elided_ref: bool,
+    /// The type being visited is the referent of a reference with a lifetime of the Leaker's
+    /// generics, so a trait object without a lifetime bound defaults to that lifetime, and is not
+    /// the same type when interned alone (it would default to `'static`).
+    ref_lifetime: bool,
 }
 
 impl<'a> AnalyzeVisitor<'a> {
@@ -206,6 +210,7 @@ impl<'a> AnalyzeVisitor<'a> {
             type_depth: 0,
             item_depth: 0,
             elided_ref: false,
+            ref_lifetime: false,
         }
     }
 
@@ -341,6 +346,26 @@ impl<'a> AnalyzeVisitor<'a> {
     }
 
     /// Decides how to handle the type `ty` at `depth`, given what is found in it (`inner`).
+    /// Merges what is found in a trait object into the reference it is the referent of, in place
+    /// of [`AnalyzeVisitor::decide()`] (which would make it a type of its own).
+    fn decide_as_reference(&mut self, depth: usize, mut inner: Frame) {
+        // The reference is at `depth - 1`, which is where the trait object's own causes are.
+        let min_depth = if inner.min_depth == depth {
+            depth - 1
+        } else {
+            inner.min_depth
+        };
+        self.frame.min_depth = self.frame.min_depth.min(min_depth);
+        self.frame.local_scope = self.frame.local_scope.min(inner.local_scope);
+        self.frame.mentions_root |= inner.mentions_root;
+        self.frame.mentions_self |= inner.mentions_self;
+        self.frame.module_item |= inner.module_item;
+        self.frame.hard |= inner.hard;
+        self.frame.relative |= inner.relative;
+        let effects = std::mem::take(&mut inner.effects);
+        self.frame.effects.extend(effects);
+    }
+
     fn decide(&mut self, ty: &Type, depth: usize, mut inner: Frame) {
         // The causes and the local generics also belong to the enclosing type, as those of a
         // component.
@@ -850,6 +875,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         // Whether this is (directly) the referent of a reference which cannot be interned as a whole
         // (its lifetime is elided or local).
         let elided_ref = std::mem::take(&mut self.elided_ref);
+        let ref_lifetime = std::mem::take(&mut self.ref_lifetime);
         self.type_depth += 1;
         match i {
             Type::Macro(m) => {
@@ -873,6 +899,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             }
             Type::Paren(_) | Type::Group(_) => {
                 self.elided_ref = elided_ref;
+                self.ref_lifetime = ref_lifetime;
                 syn::visit::visit_type(self, i)
             }
             Type::Reference(TypeReference { lifetime, .. }) => {
@@ -883,7 +910,8 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                         self.elided_ref = lifetime.ident == "_"
                             || self
                                 .scope_of(&lifetime.to_string())
-                                .map_or(false, |scope| scope > 0)
+                                .map_or(false, |scope| scope > 0);
+                        self.ref_lifetime = !self.elided_ref && lifetime.ident != "static";
                     }
                     None => {
                         self.push_impossible(quote!(#i));
@@ -911,7 +939,19 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             _ => syn::visit::visit_type(self, i),
         }
         let inner = std::mem::replace(&mut self.frame, outer);
-        self.decide(i, self.type_depth, inner);
+        if ref_lifetime
+            && matches!(i, Type::TraitObject(object) if !object
+                .bounds
+                .iter()
+                .any(|bound| matches!(bound, TypeParamBound::Lifetime(_))))
+            && self.impossibles.len() == inner.impossible_start
+        {
+            // Not interned alone (see `ref_lifetime`): its components are those of the reference,
+            // which is interned as a whole, and must be if the trait object has to be.
+            self.decide_as_reference(self.type_depth, inner);
+        } else {
+            self.decide(i, self.type_depth, inner);
+        }
         self.type_depth -= 1;
     }
 

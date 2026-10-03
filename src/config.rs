@@ -5,7 +5,11 @@ use syn::*;
 /// Configuration for building a [`Leaker`](crate::Leaker).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LeakerConfig {
+    /// Relative paths treated as context-free (not leaked). See
+    /// [`Leaker::allowed_paths`](crate::Leaker::allowed_paths).
     pub allowed_paths: Vec<Path>,
+    /// Whether a type mentioning `Self` may be leaked as a whole (default `true`). See
+    /// [`Leaker::self_ty_can_be_interned`](crate::Leaker::self_ty_can_be_interned).
     pub self_ty_can_be_interned: bool,
     /// Whether a path with a leading `::` (e.g. `::foo::X`) is context-free (default `true`). See
     /// [`Leaker::allow_external_crates`](crate::Leaker::allow_external_crates).

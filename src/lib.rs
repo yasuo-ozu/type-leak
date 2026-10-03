@@ -19,8 +19,6 @@ pub use syn;
 
 pub use crate::analyze::CheckResult;
 pub use crate::config::LeakerConfig;
-#[allow(deprecated)]
-pub use crate::encode::encode_generics_args_to_ty;
 pub use crate::encode::{
     encode_generics_args_to_ty_with, encode_generics_params_to_ty,
     encode_generics_params_to_ty_with, EncodeError,

@@ -189,29 +189,3 @@ impl TypeGraph {
         self.hard.extend(other.hard);
     }
 }
-
-/// Returns `true` if `start` or any of its descendants satisfies `pred`.
-pub(crate) fn reaches(
-    start: &NodeKey,
-    children: &HashMap<&NodeKey, Vec<NodeKey>>,
-    pred: impl Fn(&NodeKey) -> bool,
-) -> bool {
-    pred(start) || descendants(start, children).iter().any(pred)
-}
-
-/// Returns the descendants of `start` (excluding `start` itself, unless it is in a cycle).
-pub(crate) fn descendants(
-    start: &NodeKey,
-    children: &HashMap<&NodeKey, Vec<NodeKey>>,
-) -> Vec<NodeKey> {
-    let mut visited = HashSet::new();
-    let mut stack: Vec<NodeKey> = children.get(start).cloned().unwrap_or_default();
-    let mut result = Vec::new();
-    while let Some(key) = stack.pop() {
-        if visited.insert(key.clone()) {
-            stack.extend(children.get(&key).into_iter().flatten().cloned());
-            result.push(key);
-        }
-    }
-    result
-}

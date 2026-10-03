@@ -76,19 +76,16 @@ fn test_reduce_roots_neutral_root_without_must_intern_dropped() {
 
 #[test]
 fn test_reduce_roots_root_covers_descendant() {
-    // A must-intern type nested inside a compound wrapper: the wrapper root is kept
-    // but the inner type must NOT appear separately.
+    // A must-intern type nested inside a compound wrapper: the inner type is interned (it
+    // is the innermost minimum cut), and the wrapper is rebuilt around it.
     let item: ItemStruct = parse_quote! {
         struct S { a: (RelType, ::std::string::String) }
     };
     let mut leaker = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
-    let expected: Type = parse_quote!((RelType, ::std::string::String));
+    let expected: Type = parse_quote!(RelType);
     let result = finish_as_strings(leaker);
     assert_eq!(result, BTreeSet::from([quote!(#expected).to_string()]));
-    // The inner type must not appear as its own entry.
-    let inner: Type = parse_quote!(RelType);
-    assert!(!result.contains(&quote!(#inner).to_string()));
 }
 
 #[test]
@@ -107,26 +104,22 @@ fn test_reduce_roots_mixed_neutral_and_must_intern() {
 
 #[test]
 fn test_reduce_roots_deep_nesting() {
-    // A relative type two levels deep: only the outermost root is kept; neither the
-    // intermediate Vec wrapper nor the inner type appears as a separate entry.
+    // A relative type two levels deep: only the inner type is kept; neither the
+    // intermediate Vec wrapper nor the outer tuple appears as a separate entry.
     let item: ItemStruct = parse_quote! {
         struct S { a: (::std::vec::Vec<RelInner>, ::std::string::String) }
     };
     let mut leaker = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
-    let expected: Type = parse_quote!((::std::vec::Vec<RelInner>, ::std::string::String));
+    let expected: Type = parse_quote!(RelInner);
     let result = finish_as_strings(leaker);
     assert_eq!(result, BTreeSet::from([quote!(#expected).to_string()]));
-    let inner: Type = parse_quote!(RelInner);
-    let vec_ty: Type = parse_quote!(::std::vec::Vec<RelInner>);
-    assert!(!result.contains(&quote!(#inner).to_string()));
-    assert!(!result.contains(&quote!(#vec_ty).to_string()));
 }
 
 #[test]
 fn test_reduce_roots_type_in_both_positions() {
     // A type appears as a direct must-intern root (field a) AND as a must-intern
-    // descendant inside a compound root (field b). Both must be kept.
+    // descendant inside a compound root (field b). Interning it covers both.
     let item: ItemStruct = parse_quote! {
         struct S {
             a: RelType,
@@ -136,11 +129,81 @@ fn test_reduce_roots_type_in_both_positions() {
     let mut leaker = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
     let ta: Type = parse_quote!(RelType);
-    let tb: Type = parse_quote!((RelType, ::std::string::String));
     assert_eq!(
         finish_as_strings(leaker),
-        BTreeSet::from([quote!(#ta).to_string(), quote!(#tb).to_string()])
+        BTreeSet::from([quote!(#ta).to_string()])
     );
+}
+
+fn leaked_of(item: ItemStruct) -> Vec<String> {
+    let mut leaker = Leaker::from_struct(&item).unwrap();
+    leaker.reduce_roots();
+    finish_as_strings(leaker).into_iter().collect()
+}
+
+fn ty_string(ty: Type) -> String {
+    quote!(#ty).to_string()
+}
+
+#[test]
+fn test_reduce_roots_wrappers_of_one_type() {
+    // Four wrappers of the same type: interning it takes one implementation, not four.
+    let leaked = leaked_of(parse_quote! {
+        struct S {
+            a: ::std::vec::Vec<Rel>,
+            b: ::core::option::Option<Rel>,
+            c: (Rel, ::std::string::String),
+            d: ::std::boxed::Box<Rel>,
+        }
+    });
+    assert_eq!(leaked, [ty_string(parse_quote!(Rel))]);
+    // With the bare type as well.
+    let leaked = leaked_of(parse_quote! {
+        struct S {
+            a: ::std::vec::Vec<Rel>,
+            b: ::core::option::Option<Rel>,
+            c: (Rel, ::std::string::String),
+            d: ::std::boxed::Box<Rel>,
+            e: Rel,
+        }
+    });
+    assert_eq!(leaked, [ty_string(parse_quote!(Rel))]);
+}
+
+#[test]
+fn test_reduce_roots_common_ancestor() {
+    // The same tuple of three types twice: the tuple (1) is cheaper than its parts (3).
+    let leaked = leaked_of(parse_quote! {
+        struct S {
+            a: (RelA, RelB, RelC),
+            b: ::std::vec::Vec<(RelA, RelB, RelC)>,
+        }
+    });
+    assert_eq!(leaked, [ty_string(parse_quote!((RelA, RelB, RelC)))]);
+    // Two tuples sharing a part: the two tuples (2) are cheaper than the three parts (3).
+    let leaked = leaked_of(parse_quote! {
+        struct S {
+            a: (RelA, RelB),
+            b: (RelA, RelC),
+        }
+    });
+    assert_eq!(
+        leaked,
+        [
+            ty_string(parse_quote!((RelA, RelB))),
+            ty_string(parse_quote!((RelA, RelC))),
+        ]
+    );
+}
+
+#[test]
+fn test_reduce_roots_prefers_inner_type_on_a_tie() {
+    // `Vec<Rel>` and `Rel` cover the only path equally; the inner one is taken.
+    let leaked = leaked_of(parse_quote! { struct S { a: ::std::vec::Vec<Rel> } });
+    assert_eq!(leaked, [ty_string(parse_quote!(Rel))]);
+    // A red root is interned itself.
+    let leaked = leaked_of(parse_quote! { struct S { a: Rel } });
+    assert_eq!(leaked, [ty_string(parse_quote!(Rel))]);
 }
 
 #[test]
@@ -183,4 +246,41 @@ fn test_reduce_roots_generic_assoc_type_neutral() {
     let mut leaker = Leaker::from_trait(&item).unwrap();
     leaker.reduce_roots();
     assert!(leaker.finish().is_empty());
+}
+
+#[test]
+fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
+    // The wrappers are not leaked, but a copy of them is rewritten around the inner entry.
+    let item: ItemStruct = parse_quote! {
+        struct S {
+            a: ::std::vec::Vec<Rel>,
+            b: (Rel, ::std::string::String),
+            c: &'static Rel,
+        }
+    };
+    let referrer = Leaker::from_struct(&item).unwrap().finish();
+    // `&'static Rel` is not rebuilt around `Rel` (`Rel: 'static` is not known of the entry).
+    assert_eq!(referrer.iter().count(), 2);
+    let mut copy: ItemStruct = parse_quote! {
+        struct S {
+            a: ::std::vec::Vec<Rel>,
+            b: (Rel, ::std::string::String),
+        }
+    };
+    let rel_ix = referrer
+        .iter()
+        .position(|ty| quote!(#ty).to_string() == "Rel")
+        .unwrap();
+    syn::visit_mut::VisitMut::visit_item_struct_mut(
+        &mut referrer.into_visitor(None, |_, ix| parse_quote!(P<#ix>)),
+        &mut copy,
+    );
+    let expected: ItemStruct = syn::parse2(quote! {
+        struct S {
+            a: ::std::vec::Vec<P<#rel_ix>>,
+            b: (P<#rel_ix>, ::std::string::String),
+        }
+    })
+    .unwrap();
+    assert_eq!(quote!(#copy).to_string(), quote!(#expected).to_string());
 }

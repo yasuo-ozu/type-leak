@@ -421,10 +421,11 @@ macro_rules! check_dollar_crate {
             { }
             trait T1 { fn f(&self) -> $crate::m::Portable; }
         }
-        // A generic argument which is relative makes the whole type leaked, as it does for
+        // A generic argument which is relative is leaked (and the wrapper is rebuilt around it), as it
+        // is for
         // `::core::option::Option<Rel>`.
         check_leak! {
-            { $crate::m::Wrap<Rel> }
+            { Rel }
             { }
             trait T2 { fn g(&self) -> $crate::m::Wrap<Rel>; }
         }
@@ -459,7 +460,7 @@ macro_rules! check_dollar_crate {
             trait N1 { fn f(&self) -> $crate::m::Portable; }
         }
         check_leak! {
-            { $crate::m::Wrap<Rel> }
+            { Rel }
             { allow_external_crates = false }
             trait N2 { fn g(&self) -> $crate::m::Wrap<Rel>; }
         }
@@ -491,7 +492,7 @@ macro_rules! check_dollar_crate {
         }
 
         check_leak! {
-            { ::core::option::Option<Rel> }
+            { Rel }
             { }
             trait C1 { fn g(&self) -> ::core::option::Option<Rel>; }
         }

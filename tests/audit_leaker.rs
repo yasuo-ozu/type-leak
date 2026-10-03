@@ -166,14 +166,11 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
         trait Tr { fn f<'a>(&'a self) -> &'a (dyn RelTr + 'a); }
     });
     assert_eq!(entries(&referrer), [e("dyn RelTr + 'a", "< 'a >")]);
-    // The default of a `Box` is `'static`.
+    // The default of a `Box` is `'static`, so the trait object is interned alone.
     let referrer = leak_trait(parse_quote! {
         trait Tr { fn f(&self) -> ::std::boxed::Box<dyn RelTr>; }
     });
-    assert_eq!(
-        entries(&referrer),
-        [e(":: std :: boxed :: Box < dyn RelTr >", "")]
-    );
+    assert_eq!(entries(&referrer), [e("dyn RelTr", "")]);
     // `check()` agrees.
     let result = Leaker::new().check(&parse_quote!(&dyn RelTr), &Generics::default());
     assert_eq!(

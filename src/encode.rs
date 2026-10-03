@@ -8,27 +8,6 @@ use syn::spanned::Spanned;
 use syn::*;
 use template_quote::quote;
 
-/// Encode [`GenericArgument`]s to a type.
-///
-/// A const argument `N` is encoded as `[(); N]`, so it must be of type `usize`. To encode generics
-/// of any kind, use [`RepeaterSlots`](crate::RepeaterSlots). Associated item bindings and
-/// constraints (e.g. `Item = u8`) are skipped.
-///
-/// Without the corresponding [`GenericParam`]s, the arguments are encoded as they are, so omitted
-/// arguments are not filled with the parameters' defaults, and a bare identifier such as `N` in
-/// `MyTrait<N>` is encoded as a type even if it refers to a const (syn parses it as a type
-/// argument). So the result may not match [`encode_generics_params_to_ty()`]; use
-/// [`encode_generics_args_to_ty_with()`] with the parameters instead.
-#[deprecated(
-    since = "0.8.0",
-    note = "cannot handle bare const arguments and omitted defaults without the parameters; use \
-            `encode_generics_args_to_ty_with()` with the parameters"
-)]
-pub fn encode_generics_args_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericArgument>) -> Type {
-    encode_generics_args_to_ty_with(iter, None, |expr, _| parse_quote!([(); #expr]))
-        .expect("encoding without parameters never fails")
-}
-
 /// Encode [`GenericArgument`]s to a type, using `const_fn` to encode const arguments.
 ///
 /// `const_fn` receives each const argument together with its corresponding [`ConstParam`] (if

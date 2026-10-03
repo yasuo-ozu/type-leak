@@ -5,9 +5,6 @@
 //! - `limit_*`, recording behavior: inputs which cannot be handled exactly without name resolution
 //!   (e.g. shadowed primitive names), and how they are detected.
 
-// Some tests check the deprecated `encode_generics_args_to_ty()`.
-#![allow(deprecated)]
-
 use std::collections::BTreeSet;
 use syn::*;
 use template_quote::quote;
@@ -110,7 +107,7 @@ fn limit_const_param_ty_alias() {
 
 #[test]
 fn limit_plain_encoders_usize_only() {
-    // `encode_generics_params_to_ty()` and `encode_generics_args_to_ty()` encode const generics as
+    // `encode_generics_params_to_ty()` and `encode_generics_args_to_ty_with()` with a `[(); N]` callback encode const generics as
     // array lengths, which must be `usize`. For other types they produce `[(); B]` or
     // `[(); true]`, which rustc rejects; `RepeaterSlots` must be used instead.
     let generics: Generics = parse2(quote!(<const B: bool>)).unwrap();
@@ -118,7 +115,10 @@ fn limit_plain_encoders_usize_only() {
     assert_eq!(ty_string(&ty), expected_ty(quote!(([(); B],))));
 
     let args: AngleBracketedGenericArguments = parse2(quote!(<true>)).unwrap();
-    let ty = encode_generics_args_to_ty(&args.args);
+    let ty = encode_generics_args_to_ty_with(&args.args, None, |expr, _| {
+        parse2(quote!([(); #expr])).unwrap()
+    })
+    .unwrap();
     assert_eq!(ty_string(&ty), expected_ty(quote!(([(); true],))));
 
     let slots = RepeaterSlots::new(parse2(quote!(crate::Repeater)).unwrap());
@@ -144,15 +144,17 @@ fn limit_plain_encoders_usize_only() {
 
 #[test]
 fn limit_plain_args_encoder_without_params() {
-    // Without the parameters, `encode_generics_args_to_ty()` encodes the arguments as they are:
+    // Without the parameters, `encode_generics_args_to_ty_with()` encodes the arguments as they are:
     // a bare `N` (parsed by syn as a type argument) is encoded as a type instead of `[(); N]`, and
     // omitted arguments are not filled with the parameters' defaults, so the result may differ
-    // from `encode_generics_params_to_ty()`. `encode_generics_args_to_ty_with()` with the
-    // parameters handles both.
+    // from `encode_generics_params_to_ty()`. Giving the parameters handles both.
     let generics: Generics = parse2(quote!(<T, const N: usize, const M: usize = 3>)).unwrap();
     let args: AngleBracketedGenericArguments = parse2(quote!(<u8, N>)).unwrap();
 
-    let ty = encode_generics_args_to_ty(&args.args);
+    let ty = encode_generics_args_to_ty_with(&args.args, None, |expr, _| {
+        parse2(quote!([(); #expr])).unwrap()
+    })
+    .unwrap();
     assert_eq!(ty_string(&ty), expected_ty(quote!((u8, N))));
 
     let ty = encode_generics_args_to_ty_with(&args.args, Some(&generics.params), |expr, _| {

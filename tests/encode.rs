@@ -1,8 +1,5 @@
 //! Tests for encoding generics into types (`encode_generics_*`, `RepeaterSlots`).
 
-// Some tests check the deprecated `encode_generics_args_to_ty()`.
-#![allow(deprecated)]
-
 use syn::*;
 use template_quote::quote;
 
@@ -30,7 +27,8 @@ fn test_encode_generics_const() {
     );
 
     let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8, { 3 }>);
-    let ty = encode_generics_args_to_ty(&args.args);
+    let ty = encode_generics_args_to_ty_with(&args.args, None, |expr, _| parse_quote!([(); #expr]))
+        .unwrap();
     assert_eq!(
         quote!(#ty).to_string(),
         quote!((&'static (), u8, [(); 3])).to_string()
@@ -256,6 +254,7 @@ fn test_plain_args_encoder_with_params() {
 
     // Without the parameters, bindings are skipped (they used to panic).
     let args: AngleBracketedGenericArguments = parse_quote!(<u8, Item = u8>);
-    let ty = encode_generics_args_to_ty(&args.args);
+    let ty = encode_generics_args_to_ty_with(&args.args, None, |expr, _| parse_quote!([(); #expr]))
+        .unwrap();
     assert_eq!(to_string(&ty), to_string(&parse_quote!((u8,))));
 }

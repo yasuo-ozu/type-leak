@@ -476,7 +476,7 @@ fn test_iter_with_self() {
         trait Tr {
             fn a(&self) -> Rel<Self>;
             fn b(&self) -> Wrap<Self::Item>;
-            fn c(&self) -> <Self as ::p::Tr>::X<Rel3>;
+            fn c(&self) -> Rel3<<Self as ::p::Tr>::X>;
             fn d(&self) -> Rel4;
             fn e<T: ::core::cmp::PartialEq<Self>>(&self) -> Wrap2<T>;
             fn g(&self) -> Rel5<m!(Self, [u8; 1])>;
@@ -504,7 +504,7 @@ fn test_iter_with_self() {
     // `Self` alone, `Self::A`, the self type of a qualified path, a macro, and unchanged types.
     find(parse_quote!(Rel<__S>));
     find(parse_quote!(Wrap<<__S>::Item>));
-    find(parse_quote!(<__S as ::p::Tr>::X<Rel3>));
+    find(parse_quote!(Rel3<<__S as ::p::Tr>::X>));
     find(parse_quote!(Rel4));
     find(parse_quote!(Rel5<m!(__S, [u8; 1])>));
     // A local bound is rewritten.
@@ -523,7 +523,7 @@ fn test_iter_with_self() {
         .clone()
         .into_visitor(None, |_, ix| parse_quote!(P<#ix>))
         .visit_signature_mut(&mut sig);
-    let expected: Signature = parse_quote!(fn a(&self) -> P<1usize>);
+    let expected: Signature = parse_quote!(fn a(&self) -> P<0usize>);
     assert_eq!(quote!(#sig).to_string(), quote!(#expected).to_string());
 }
 

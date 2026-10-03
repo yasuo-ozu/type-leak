@@ -61,9 +61,10 @@ fn test_default_requirements() {
     };
     let referrer = referrer(&tr);
     // The contexts are the requirements of the types, numbered in the order of their first
-    // appearance: nothing (`RelW` and `RelC`), `Rel<T>` (the default of `U`, which uses the
-    // parameters before it) and `(RelB, U)` (the default of `V`). The default of `N` is a const.
-    assert_eq!(referrer.n_contexts(), 3);
+    // appearance: nothing (`RelB`, `RelW` and `RelC`) and `Rel<T>` (the default of `U`, which uses
+    // the parameters before it). The default of `V`, `(RelB, U)`, is not interned, as `RelB` is
+    // enough (it is rebuilt around it). The default of `N` is a const.
+    assert_eq!(referrer.n_contexts(), 2);
     let leaked: Vec<_> = referrer
         .iter()
         .enumerate()
@@ -72,10 +73,10 @@ fn test_default_requirements() {
     assert_eq!(
         leaked,
         [
+            (0, "RelB".to_string()),
             (0, "RelC".to_string()),
             (0, "RelW".to_string()),
             (1, "Rel < T >".to_string()),
-            (2, "(RelB , U)".to_string())
         ]
     );
     let generics = |c: usize| {
@@ -90,15 +91,13 @@ fn test_default_requirements() {
             quote!(<T: ::core::clone::Clone + ::p::Conv<RelW>>)
         ))
     );
-    // `V` does not use `T`.
-    assert_eq!(generics(2), s(&parse_generics(quote!(<U: ::p::Late>))));
-    assert!((0..3).all(|c| referrer.context_self(c).is_none()));
+    assert!((0..2).all(|c| referrer.context_self(c).is_none()));
 
     // The round trip keeps the requirements.
     let tokens = quote!(#referrer);
     let parsed: Referrer = parse2(tokens).unwrap();
     assert_eq!(parsed, referrer);
-    for context in 0..3 {
+    for context in 0..2 {
         assert_eq!(
             s(parsed.context_generics(context)),
             s(referrer.context_generics(context))
@@ -256,20 +255,20 @@ fn test_complete_args() {
             "'x".to_string(),
             "u8".to_string(),
             "3".to_string(),
-            projection(1),
             projection(2),
+            format!("({} , {} , u8)", projection(0), projection(2)),
         ]
     );
     let args_of = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
     assert_eq!(
         calls,
         [
-            ("Rel < T , N >".to_string(), 1, args_of(&["'x", "u8", "3"])),
+            ("Rel < T , N >".to_string(), 2, args_of(&["'x", "u8", "3"])),
             (
-                // A root is interned as a whole, together with its components.
-                "(RelB , U , T)".to_string(),
-                2,
-                args_of(&["'x", "u8", "3", &projection(1)])
+                // The tuple is rebuilt around `RelB`, which is interned.
+                "RelB".to_string(),
+                0,
+                args_of(&["'x", "u8", "3", &projection(2)])
             ),
         ]
     );
@@ -286,14 +285,17 @@ fn test_complete_args() {
     // Only `V` is omitted.
     let completed = complete(&referrer, params, &args(parse_quote!(<'x, u8, 5, i32>))).unwrap();
     assert_eq!(completed[..4], ["'x", "u8", "5", "i32"]);
-    assert_eq!(completed[4], "< Self as R < 2usize > > :: Type");
+    assert_eq!(completed[4], format!("({} , i32 , u8)", projection(0)));
 
     // A parameter named like a leaked type is not substituted inside a projection: here `T`
     // is the argument (a type named `U`), and `U` is the omitted argument.
     let completed = complete(&referrer, params, &args(parse_quote!(<'x, U>))).unwrap();
     assert_eq!(completed[1], "U");
-    assert_eq!(completed[3], "< Self as R < 1usize > > :: Type");
-    assert_eq!(completed[4], "< Self as R < 2usize > > :: Type");
+    assert_eq!(completed[3], projection(2));
+    assert_eq!(
+        completed[4],
+        format!("({} , {} , U)", projection(0), projection(2))
+    );
 }
 
 #[test]

@@ -3,11 +3,14 @@
 use crate::analyze::{Analysis, AnalyzeVisitor, CheckResult};
 use crate::config::LeakerConfig;
 use crate::error::NotInternableError;
-use crate::graph::{descendants, reaches, NodeKey, TypeGraph};
+use crate::graph::{NodeKey, TypeGraph};
 use crate::referrer::Referrer;
 use crate::requirements::{Contexts, Requirements};
 use crate::util::{generic_param_name, path_starts_with, token_names};
 use proc_macro2::{Span, TokenStream};
+use safegraph::algo::max_flow::edmonds_karp_with_flows;
+use safegraph::graph::Graph;
+use safegraph::BTreeGraph;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use syn::punctuated::Punctuated;
 use syn::*;
@@ -15,7 +18,22 @@ use template_quote::quote;
 
 /// The entry point of this crate.
 pub struct Leaker {
+    /// Relative paths treated as context-free (not leaked), e.g. the names of the standard
+    /// prelude (`Vec`, `Option`, ...) with [`LeakerConfig::allow_std_prelude()`], primitive types
+    /// with [`LeakerConfig::allow_primitive()`], or `crate` with [`LeakerConfig::allow_crate()`].
+    /// A relative path is context-free if it starts with the segments of one of them; its generic
+    /// arguments are still analyzed (e.g. `Rel` in `Option<Rel>`). They apply to relative paths
+    /// only (see [`Leaker::allow_external_crates`] for paths with a leading `::`). Primitive names
+    /// copied as they are are checked by [`Leaker::assertions()`].
     pub allowed_paths: Vec<Path>,
+    /// Whether a type mentioning `Self` may be leaked as a whole (default `true`).
+    ///
+    /// With `true`, the Repeater impl of such a type is written for the implementor, as given by
+    /// its Self requirement (see [`Referrer::context_self()`](crate::Referrer::context_self())).
+    /// Set it to `false` when the Repeater impls cannot refer to `Self` (e.g. they are written
+    /// for a marker type without rewriting `Self`): a type mentioning `Self` is then decomposed
+    /// (only its other components are leaked), and an error is reported when it cannot be (e.g.
+    /// `Rel<Self>`) or when the bounds of the generics it uses mention `Self`.
     pub self_ty_can_be_interned: bool,
     /// Whether a path with a leading `::` (e.g. `::foo::X`) is context-free (default `true`).
     ///
@@ -385,15 +403,34 @@ impl Leaker {
     /// ([`CheckResult::is_own`] by [`Leaker::check()`]), meaning the type literally depends on the
     /// type context and must be interned.
     ///
-    /// This algorithm reduces the node set while ensuring that every root type (annotated with ★)
-    /// can still be expressed using the remaining **red** nodes.
+    /// This algorithm chooses the smallest set of nodes to intern such that every root type
+    /// (annotated with ★) can still be expressed using the interned nodes, i.e. such that every
+    /// path from a root to a **red** node in the graph contains an interned node (a root, or a
+    /// **red** node itself, is on its own path). Since a Repeater implementation is needed for
+    /// each node interned, this minimizes the number of the implementations. Either of the
+    /// following is chosen for each **red** node, whichever is cheaper in total:
     ///
-    /// There are two degrees of freedom in this reduction:
+    /// - Intern the **red** node itself (non-red nodes either do not need to be interned or can be
+    ///   reconstructed from the interned ones).
+    /// - Skip interning it and instead intern a common ancestor, when one type covers several
+    ///   **red** nodes at once.
     ///
-    /// - Intern all **red** nodes and ignore the rest (since non-red nodes either do not need to
-    ///   be interned or can be reconstructed from red nodes).
-    /// - Skip interning individual **red** nodes and instead intern their common ancestors when
-    ///   doing so is more efficient.
+    /// Only the nodes of the graph are candidates, and a node is not interned instead of a
+    /// reference with a lifetime containing it (`Rel` instead of `&'a Rel`), as the copy of the
+    /// reference needs `Rel: 'a`, which cannot be proved of the type interned in its place: such
+    /// a reference is interned as a whole, like a **red** node.
+    ///
+    /// For example, `Vec<Rel>`, `Option<Rel>`, `(Rel, u8)` and `Box<Rel>` in fields are covered by
+    /// interning `Rel` only, and `(A, B, C)` used twice by interning the tuple only.
+    ///
+    /// This is a minimum vertex cut between the roots and the **red** nodes, solved exactly as a
+    /// maximum flow (Edmonds-Karp): each node `v` is split into `v_in -> v_out` of capacity 1, each
+    /// edge of the graph `u -> v` becomes `u_out -> v_in` of infinite capacity, and a super source
+    /// is connected to the roots and the **red** nodes to a super sink. When several cuts have
+    /// the minimum size, the one closest to the sink is taken (the nodes which can reach the sink
+    /// in the residual network of the maximum flow form its sink side), which prefers the inner
+    /// types (`Rel` to `Vec<Rel>` when that is all there is), so that the result is
+    /// deterministic.
     ///
     /// The final result looks like:
     ///
@@ -405,33 +442,135 @@ impl Leaker {
     }
 
     /// Returns the types to be interned, sorted by their context and tokens.
+    ///
+    /// This is a minimum vertex cut between the roots and the **red** nodes (see
+    /// [`Leaker::reduce_roots()`]), found by a maximum flow.
     fn build_graph_and_reduce(&self) -> Vec<NodeKey> {
         let types = &self.types;
-        let children: HashMap<&NodeKey, Vec<NodeKey>> =
-            types.keys().map(|key| (key, types.children(key))).collect();
+        let mut keys: Vec<&NodeKey> = types.keys().collect();
+        keys.sort();
+        let index: HashMap<&NodeKey, u32> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (*k, i as u32))
+            .collect();
+        let n = keys.len() as u32;
+        // The nodes of the network: `v_in` is `2 * v`, `v_out` is `2 * v + 1`.
+        let (source, sink) = (2 * n, 2 * n + 1);
+        // Larger than the sum of all the capacities of the nodes, so it is never the bottleneck.
+        let infinite = n + 1;
+        // The types which are red or contain a red type.
+        let mut has_red: HashSet<&NodeKey> = types.must_intern.iter().collect();
+        let mut parents: HashMap<&NodeKey, Vec<&NodeKey>> = HashMap::new();
+        for key in &keys {
+            for child in types.children(key) {
+                parents
+                    .entry(keys[index[&child] as usize])
+                    .or_default()
+                    .push(key);
+            }
+        }
+        let mut stack: Vec<&NodeKey> = has_red.iter().copied().collect();
+        while let Some(key) = stack.pop() {
+            for parent in parents.get(key).into_iter().flatten() {
+                if has_red.insert(*parent) {
+                    stack.push(*parent);
+                }
+            }
+        }
+        let mut edges: Vec<(u32, u32, u32)> = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            let i = i as u32;
+            edges.push((2 * i, 2 * i + 1, 1));
+            for child in types.children(key) {
+                if has_red.contains(&child) && self.needs_parent(key) {
+                    // The child cannot stand for the parent, which is to be interned as a whole
+                    // like a red type, and not through the child.
+                    edges.push((2 * i + 1, sink, infinite));
+                } else {
+                    edges.push((2 * i + 1, 2 * index[&child], infinite));
+                }
+            }
+            if types.roots.contains(*key) {
+                edges.push((source, 2 * i, infinite));
+            }
+            if types.must_intern.contains(*key) {
+                edges.push((2 * i + 1, sink, infinite));
+            }
+        }
 
-        // 1. Keep the roots which must be interned, or contain types which must be interned.
-        let mut kept: HashSet<&NodeKey> = types
-            .roots
+        // The edges are keyed by their number in `edges`, which tells their capacities.
+        let mut network = BTreeGraph::<u32, u32>::default();
+        for node in 0..2 * n + 2 {
+            network.insert_node(node).unwrap();
+        }
+        for (eix, (from, to, _)) in edges.iter().enumerate() {
+            network.insert_edge(eix as u32, [*from, *to]).unwrap();
+        }
+        let (_, flows) =
+            edmonds_karp_with_flows(&network, source, sink, |eix| edges[*eix as usize].2);
+
+        // The nodes which can reach the sink in the residual network, found by a BFS backwards.
+        // An edge `from -> to` of the network is also usable as `to -> from` if it carries flow
+        // (cancelling it), and as `from -> to` if it has spare capacity.
+        let mut into: Vec<Vec<u32>> = vec![Vec::new(); 2 * n as usize + 2];
+        for (eix, (from, to, capacity)) in edges.iter().enumerate() {
+            let flow = flows.get(&(eix as u32)).copied().unwrap_or(0);
+            if flow < *capacity {
+                into[*to as usize].push(*from);
+            }
+            if flow > 0 {
+                into[*from as usize].push(*to);
+            }
+        }
+        let mut reaches_sink = vec![false; 2 * n as usize + 2];
+        reaches_sink[sink as usize] = true;
+        let mut queue = vec![sink];
+        while let Some(node) = queue.pop() {
+            for &pred in &into[node as usize] {
+                if !reaches_sink[pred as usize] {
+                    reaches_sink[pred as usize] = true;
+                    queue.push(pred);
+                }
+            }
+        }
+
+        // The cut is the nodes whose edge `v_in -> v_out` goes from the side which cannot reach the
+        // sink to the side which can. The set of the nodes which can reach the sink in the
+        // residual network is the smallest sink side of all the minimum cuts, so this cut is the
+        // minimum cut closest to the sink, i.e. the one made of the innermost types (a component
+        // is preferred to the type containing it when either of them cuts the same paths).
+        let mut kept: Vec<NodeKey> = keys
             .iter()
-            .filter(|key| reaches(key, &children, |key| types.must_intern.contains(key)))
+            .enumerate()
+            .filter(|(i, _)| reaches_sink[2 * i + 1] && !reaches_sink[2 * i])
+            .map(|(_, key)| (*key).clone())
             .collect();
-        // 2. Keep the types which must be interned and are not components of kept types.
-        let components: HashSet<NodeKey> = kept
-            .iter()
-            .flat_map(|key| descendants(key, &children))
-            .collect();
-        kept.extend(
-            types
-                .must_intern
-                .iter()
-                .filter(|key| !components.contains(*key)),
-        );
 
         // Sort for deterministic output.
-        let mut kept: Vec<NodeKey> = kept.into_iter().cloned().collect();
         kept.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
         kept
+    }
+}
+
+impl Leaker {
+    /// Returns `true` if `child` cannot be interned instead of `parent`, because the copy of
+    /// `parent` is well-formed only with a bound which the copy of `child` would not have: a
+    /// reference with a lifetime requires its referent to outlive it (e.g. `Rel<T>: 'a` for
+    /// `&'a Rel<T>`, or `Rel: 'static`), which holds for the type itself but cannot be proved of
+    /// the type which is interned in its place.
+    fn needs_parent(&self, parent: &NodeKey) -> bool {
+        let mut ty = &parent.ty.ty;
+        while let Type::Paren(TypeParen { elem, .. }) | Type::Group(TypeGroup { elem, .. }) = ty {
+            ty = elem;
+        }
+        matches!(
+            ty,
+            Type::Reference(TypeReference {
+                lifetime: Some(_),
+                ..
+            })
+        )
     }
 }
 

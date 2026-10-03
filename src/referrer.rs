@@ -359,18 +359,23 @@ impl Referrer {
         self.leak_types.is_empty()
     }
 
-    /// Returns an iterator over the types that need to be encoded, by their index.
+    /// Returns an iterator over the leaked types, by their index.
     ///
-    /// This is enough only for types which use no generics and do not mention `Self`; use
-    /// [`Referrer::iter_with_generics()`] or [`Referrer::iter_with_self()`] otherwise (see
-    /// [`Referrer::generics()`] for the Repeater's implementation of an entry).
+    /// The Repeater implementation of an entry depends on its context: the generics it uses
+    /// ([`Referrer::generics()`]), its `Self` ([`Referrer::context_self()`]) and, for
+    /// [`Leaker::from_module()`](crate::Leaker::from_module()), the module where it must be
+    /// written ([`Referrer::context_module()`]). See [`Referrer::generics()`] for the complete
+    /// pattern (and [`Referrer::iter_with_generics()`] / [`Referrer::iter_with_self()`]); the
+    /// simple form below is valid only for entries without any of them:
     ///
     /// ```ignore
-    /// referrer.iter().enumerate().map(|(ix, ty)| quote!{
-    ///     impl<__S: ?Sized> #repeater<(), #id, #ix> for __S {
-    ///         type Type = #ty;
-    ///     }
-    /// }).collect::<TokenStream>();
+    /// for (ix, ty) in referrer.iter().enumerate() {
+    ///     let c = referrer.context(ix);
+    ///     assert!(referrer.generics(ix).params.is_empty()
+    ///         && referrer.context_self(c).is_none()
+    ///         && referrer.context_module(c).is_none());
+    ///     quote!(impl<__S: ?Sized> #repeater<(), #id, #ix> for __S { type Type = #ty; })
+    /// }
     /// ```
     pub fn iter(&self) -> impl Iterator<Item = &Type> {
         self.leak_types.iter()
@@ -452,15 +457,6 @@ impl Referrer {
     /// ```
     pub fn generics(&self, ix: usize) -> &Generics {
         self.context_generics(self.contexts[ix])
-    }
-
-    /// Returns the generics which the `ix`-th type uses.
-    #[deprecated(
-        since = "0.8.0",
-        note = "the generics of a type include those of the Leaker it uses; use `generics()`"
-    )]
-    pub fn local_generics(&self, ix: usize) -> &Generics {
-        self.generics(ix)
     }
 
     /// Returns the context of the `ix`-th type: the number of its requirements, i.e. of the
@@ -810,16 +806,6 @@ impl Referrer {
             .iter()
             .zip(&self.contexts)
             .map(move |(ty, context)| (ty, self.requirements[*context].generics()))
-    }
-
-    /// Returns an iterator over the types that need to be encoded, together with the generics
-    /// they use.
-    #[deprecated(
-        since = "0.8.0",
-        note = "the generics of a type include those of the Leaker it uses; use `iter_with_generics()`"
-    )]
-    pub fn iter_with_local_generics(&self) -> impl Iterator<Item = (&Type, &Generics)> {
-        self.iter_with_generics()
     }
 
     /// Converts this `Referrer` into a [`Visitor`] that can be used to transform AST nodes.
