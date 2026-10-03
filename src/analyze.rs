@@ -102,6 +102,10 @@ struct Frame {
     /// A cause found in the type is not the path of an external crate (an absolute path whose
     /// first segment is not `core`).
     hard: bool,
+    /// A cause found in the type is a relative path resolved in the module where the type is
+    /// written (not a generic, `Self`, an absolute path, `crate::`, or a path portable with the
+    /// module), so the type means something else in another module.
+    relative: bool,
     /// The effects, which are applied if the type is decomposed.
     effects: Vec<Effect>,
 }
@@ -117,6 +121,7 @@ impl Frame {
             mentions_self: false,
             module_item: false,
             hard: false,
+            relative: false,
             effects: Vec::new(),
         }
     }
@@ -150,6 +155,9 @@ pub(crate) struct AnalyzeVisitor<'a> {
     /// The names declared directly in each module being analyzed (see [`Leaker::from_module()`]),
     /// the innermost last. Paths to them are copied with the module, so they are portable.
     modules: Vec<HashSet<String>>,
+    /// The path of the module being visited, relative to the outermost module visited (see
+    /// [`Requirements`]): the idents of the modules entered below it.
+    module_path: Vec<Ident>,
     /// The causes which depend on the type context (see [`CheckResult::must`]), each with the
     /// depth of the type it is found in, in the order of appearance.
     musts: Vec<(usize, TokenStream)>,
@@ -187,6 +195,7 @@ impl<'a> AnalyzeVisitor<'a> {
             self_ty: Some(SelfRequirement::Call(call)),
             in_default: false,
             modules: Vec::new(),
+            module_path: Vec::new(),
             musts: Vec::new(),
             impossibles: Vec::new(),
             frame: Frame::new(0, 0),
@@ -261,10 +270,18 @@ impl<'a> AnalyzeVisitor<'a> {
 
     /// Returns the requirements of `ty`, in which `inner` is found.
     fn requirements_of(&self, ty: &Type, inner: &Frame) -> Requirements {
-        if inner.mentions_root || inner.mentions_self || inner.local_scope < self.scopes.len() {
+        let requirements = if inner.mentions_root
+            || inner.mentions_self
+            || inner.local_scope < self.scopes.len()
+        {
             Requirements::of(ty, &self.scopes, self.self_ty.as_ref())
         } else {
             Requirements::none()
+        };
+        if inner.relative && !self.modules.is_empty() {
+            requirements.with_module(Some(self.module_path.clone()))
+        } else {
+            requirements
         }
     }
 
@@ -292,6 +309,7 @@ impl<'a> AnalyzeVisitor<'a> {
         self.frame.mentions_self |= inner.mentions_self;
         self.frame.module_item |= inner.module_item;
         self.frame.hard |= inner.hard;
+        self.frame.relative |= inner.relative;
         let has_impossible = self.impossibles.len() > inner.impossible_start;
         let has_must = inner.min_depth != usize::MAX;
         let is_own = inner.min_depth == depth;
@@ -391,6 +409,15 @@ impl<'a> AnalyzeVisitor<'a> {
         self.leaker.is_context_free_path(path) || self.is_module_path(path)
     }
 
+    /// Returns `true` if `path`, which is not a generic or `Self`, is resolved in the module where
+    /// it is written: it is relative, and neither starts with `crate` nor is portable with the
+    /// module.
+    fn is_relative(&self, path: &Path) -> bool {
+        path.leading_colon.is_none()
+            && !matches!(path.segments.first(), Some(seg) if seg.ident == "crate")
+            && !self.is_context_free(path)
+    }
+
     /// Returns `true` if `path` refers to an item declared in the module being analyzed (see
     /// [`Leaker::from_module()`]), which is copied with it, like Rust resolves it: it starts with
     /// a name declared in the current module (and not shadowed by a generic parameter in scope),
@@ -441,9 +468,17 @@ impl<'a> AnalyzeVisitor<'a> {
             Some((_, items)) => items,
             None => return f(self),
         };
+        // The outermost module is the root of the paths.
+        let nested = !self.modules.is_empty();
+        if nested {
+            self.module_path.push(i.ident.clone());
+        }
         self.modules.push(declared_names(items));
         f(self);
         self.modules.pop();
+        if nested {
+            self.module_path.pop();
+        }
     }
 
     /// Returns the generic parameters in scope, those of the Leaker and the local ones.
@@ -732,10 +767,11 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         let outer = std::mem::replace(&mut self.frame, frame);
         self.type_depth += 1;
         match i {
-            Type::Macro(_) => {
+            Type::Macro(m) => {
                 // The tokens of a type macro cannot be analyzed, so it is interned as a whole (it
                 // is expanded in the Leaker's context).
                 self.push_must(quote!(#i), true);
+                self.frame.relative |= self.is_relative(&m.mac.path);
                 // The generics (and `Self`) are matched by name.
                 let mut names = HashSet::new();
                 token_names(quote!(#i), &mut names);
@@ -864,6 +900,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                 let external = i.leading_colon.is_some()
                     && matches!(i.segments.first(), Some(seg) if seg.ident != "core");
                 self.push_must(quote!(#i), !external);
+                self.frame.relative |= self.is_relative(i);
             } else if !self.leaker.self_ty_can_be_interned {
                 self.push_impossible(quote!(#i));
             }

@@ -1,5 +1,6 @@
 //! Tests for `Leaker::from_module()`.
 
+use proc_macro2::TokenStream;
 use std::collections::BTreeSet;
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -231,5 +232,406 @@ fn from_module_referrer_keeps_module_items() {
             }
         }
     };
+    assert_eq!(quote!(#item).to_string(), quote!(#expected).to_string());
+}
+
+fn ident(name: &str) -> Ident {
+    Ident::new(name, proc_macro2::Span::call_site())
+}
+
+fn nested_module() -> ItemMod {
+    parse_quote! {
+        mod m {
+            pub struct A { y: Rel }
+            pub mod inner {
+                use super::super::Rel;
+                pub struct C { y: Rel }
+            }
+        }
+    }
+}
+
+/// The modules of the entries, as `type@a::b`.
+fn modules_of(referrer: &type_leak::Referrer) -> Vec<String> {
+    referrer
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| {
+            let module = match referrer.context_module(referrer.context(ix)) {
+                None => String::new(),
+                Some([]) => "self".to_string(),
+                Some(path) => {
+                    let path: Vec<String> = path.iter().map(|i| i.to_string()).collect();
+                    path.join("::")
+                }
+            };
+            format!("{}@{}", quote!(#ty), module)
+        })
+        .collect()
+}
+
+#[test]
+fn same_tokens_in_different_modules_are_different_entries() {
+    let referrer = Leaker::from_module(&nested_module()).unwrap().finish();
+    assert_eq!(modules_of(&referrer), ["Rel@self", "Rel@inner"]);
+    assert_eq!(referrer.n_contexts(), 2);
+    assert_eq!(referrer.context_module(0), Some(&[][..]));
+    assert_eq!(referrer.context_module(1), Some(&[ident("inner")][..]));
+}
+
+#[test]
+fn deep_module_path() {
+    let m: ItemMod = parse_quote! {
+        mod m { pub mod a { pub mod b { pub struct S<T> { x: Wrap<T> } } } }
+    };
+    let referrer = Leaker::from_module(&m).unwrap().finish();
+    assert_eq!(modules_of(&referrer), ["Wrap < T >@a::b"]);
+    assert_eq!(
+        referrer.context_module(0),
+        Some(&[ident("a"), ident("b")][..])
+    );
+}
+
+#[test]
+fn types_not_depending_on_the_module_are_shared() {
+    let m: ItemMod = parse_quote! {
+        mod m {
+            pub struct A { x: ::foo::X, y: ::core::option::Option<::foo::X> }
+            pub mod inner { pub struct C { x: ::foo::X } }
+        }
+    };
+    let mut config = type_leak::LeakerConfig::new();
+    config.allow_external_crates(false);
+    let mut leaker = Leaker::from_config(config);
+    leaker
+        .intern_with(&Generics::default(), |v| {
+            syn::visit::Visit::visit_item_mod(v, &m)
+        })
+        .unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(
+        modules_of(&referrer),
+        [
+            ":: core :: option :: Option < :: foo :: X >@",
+            ":: foo :: X@"
+        ]
+    );
+    assert_eq!(referrer.n_contexts(), 1);
+    // A relative type next to it is still keyed by its module.
+    let m: ItemMod = parse_quote! {
+        mod m {
+            pub struct A { x: ::foo::X }
+            pub mod inner { pub struct C { x: ::foo::X, y: &'static Rel } }
+        }
+    };
+    let mut config = type_leak::LeakerConfig::new();
+    config.allow_external_crates(false);
+    let mut leaker = Leaker::from_config(config);
+    leaker
+        .intern_with(&Generics::default(), |v| {
+            syn::visit::Visit::visit_item_mod(v, &m)
+        })
+        .unwrap();
+    assert_eq!(
+        modules_of(&leaker.finish()),
+        [":: foo :: X@", "& 'static Rel@inner"]
+    );
+}
+
+#[test]
+fn referrer_rewrites_each_module_to_its_own_entry() {
+    let referrer = Leaker::from_module(&nested_module()).unwrap().finish();
+    let mut item = nested_module();
+    referrer
+        .into_visitor(None, |_, ix| parse_str(&format!("P{}", ix)).unwrap())
+        .visit_item_mod_mut(&mut item);
+    let expected: ItemMod = parse_quote! {
+        mod m {
+            pub struct A { y: P0 }
+            pub mod inner {
+                use super::super::Rel;
+                pub struct C { y: P1 }
+            }
+        }
+    };
+    assert_eq!(quote!(#item).to_string(), quote!(#expected).to_string());
+}
+
+#[test]
+fn referrer_visits_a_copy_in_a_module() {
+    let referrer = Leaker::from_module(&nested_module()).unwrap().finish();
+    let copy = |module: Option<Vec<Ident>>| {
+        let mut visitor = referrer
+            .clone()
+            .into_visitor(None, |_, ix| parse_str(&format!("P{}", ix)).unwrap());
+        if let Some(module) = module {
+            visitor = visitor.in_module(module);
+        }
+        let mut item: ItemStruct = parse_quote!(
+            pub struct C {
+                y: Rel,
+            }
+        );
+        visitor.visit_item_struct_mut(&mut item);
+        quote!(#item).to_string()
+    };
+    let expected = |n: usize| quote!(pub struct C { y: #{ident(&format!("P{}", n))}, }).to_string();
+    // In the module of the entry.
+    assert_eq!(copy(Some(vec![ident("inner")])), expected(1));
+    assert_eq!(copy(Some(vec![])), expected(0));
+    // The module is unknown, so the analyzed module is preferred.
+    assert_eq!(copy(None), expected(0));
+    // Only `inner` has the entry `Rel`, which does not match in the analyzed module.
+    let m: ItemMod = parse_quote!(
+        mod m {
+            pub mod inner {
+                pub struct C {
+                    y: Rel,
+                }
+            }
+        }
+    );
+    let referrer = Leaker::from_module(&m).unwrap().finish();
+    let visit = |visitor: type_leak::Visitor<_>| {
+        let mut item: ItemStruct = parse_quote!(
+            pub struct C {
+                y: Rel,
+            }
+        );
+        let mut visitor = visitor;
+        visitor.visit_item_struct_mut(&mut item);
+        quote!(#item).to_string()
+    };
+    let rewrite = |_: Type, _| -> Type { parse_quote!(P) };
+    let unchanged = quote!(
+        pub struct C {
+            y: Rel,
+        }
+    )
+    .to_string();
+    let rewritten = quote!(
+        pub struct C {
+            y: P,
+        }
+    )
+    .to_string();
+    // Unknown module: any is accepted.
+    assert_eq!(
+        visit(referrer.clone().into_visitor(None, rewrite)),
+        rewritten
+    );
+    assert_eq!(
+        visit(
+            referrer
+                .clone()
+                .into_visitor(None, rewrite)
+                .in_module(vec![ident("inner")])
+        ),
+        rewritten
+    );
+    assert_eq!(
+        visit(
+            referrer
+                .clone()
+                .into_visitor(None, rewrite)
+                .in_module(vec![])
+        ),
+        unchanged
+    );
+    // The module is always compared with a root.
+    let root = Generics::default();
+    assert_eq!(
+        visit(
+            referrer
+                .clone()
+                .into_visitor_with_root(&root, None, rewrite)
+        ),
+        unchanged
+    );
+    assert_eq!(
+        visit(
+            referrer
+                .into_visitor_with_root(&root, None, rewrite)
+                .in_module(vec![ident("inner")])
+        ),
+        rewritten
+    );
+}
+
+#[test]
+fn referrer_tracks_the_modules_it_enters() {
+    // Only `inner` has `Rel`, entered from a copy of the whole module.
+    let m: ItemMod = parse_quote!(
+        mod m {
+            pub mod inner {
+                pub struct C {
+                    y: Rel,
+                }
+            }
+        }
+    );
+    let referrer = Leaker::from_module(&m).unwrap().finish();
+    let mut item = m.clone();
+    referrer
+        .clone()
+        .into_visitor_with_root(&Generics::default(), None, |_, _| parse_quote!(P))
+        .visit_item_mod_mut(&mut item);
+    let expected: ItemMod = parse_quote!(
+        mod m {
+            pub mod inner {
+                pub struct C {
+                    y: P,
+                }
+            }
+        }
+    );
+    assert_eq!(quote!(#item).to_string(), quote!(#expected).to_string());
+    // A copy of `inner` alone, whose first module is the root `[]`, does not match.
+    let mut item: ItemMod = parse_quote!(
+        mod inner {
+            pub struct C {
+                y: Rel,
+            }
+        }
+    );
+    referrer
+        .clone()
+        .into_visitor_with_root(&Generics::default(), None, |_, _| parse_quote!(P))
+        .visit_item_mod_mut(&mut item);
+    let unchanged: ItemMod = parse_quote!(
+        mod inner {
+            pub struct C {
+                y: Rel,
+            }
+        }
+    );
+    assert_eq!(quote!(#item).to_string(), quote!(#unchanged).to_string());
+    // Unless it is a copy of the module `m::inner`.
+    let mut item: ItemMod = parse_quote!(
+        mod inner {
+            pub struct C {
+                y: Rel,
+            }
+        }
+    );
+    referrer
+        .into_visitor_with_root(&Generics::default(), None, |_, _| parse_quote!(P))
+        .in_module(vec![ident("inner")])
+        .visit_item_mod_mut(&mut item);
+    // `inner` is entered below `m::inner`, which is `m::inner::inner`.
+    assert_eq!(quote!(#item).to_string(), quote!(#unchanged).to_string());
+}
+
+#[test]
+fn serialization_with_modules() {
+    use template_quote::ToTokens;
+    let m: ItemMod = parse_quote! {
+        mod m {
+            pub struct A { y: Rel }
+            pub mod a { pub mod b { pub struct C<T> { y: Rel, z: Wrap<T> } } }
+        }
+    };
+    let referrer = Leaker::from_module(&m).unwrap().finish();
+    assert_eq!(
+        modules_of(&referrer),
+        ["Rel@self", "Rel@a::b", "Wrap < T >@a::b"]
+    );
+    let tokens = referrer.to_token_stream();
+    let version = env!("CARGO_PKG_VERSION");
+    assert_eq!(
+        tokens.to_string(),
+        format!(
+            "\"{}\" 3 mod self ; (Rel) mod a :: b ; (Rel) < T > ; mod a :: b ; (Wrap < T >)",
+            version
+        )
+    );
+    // It can be followed by other tokens.
+    struct Followed(type_leak::Referrer, TokenStream);
+    impl parse::Parse for Followed {
+        fn parse(input: parse::ParseStream) -> Result<Self> {
+            Ok(Self(input.parse()?, input.parse()?))
+        }
+    }
+    let followed: Followed = parse2(quote!(#tokens struct Z;)).unwrap();
+    assert_eq!(followed.0, referrer);
+    assert_eq!(followed.1.to_string(), "struct Z ;");
+    assert_eq!(parse2::<type_leak::Referrer>(tokens).unwrap(), referrer);
+    // The simplest Referrer has no module (nor has one of an analysis without modules).
+    let simple: ItemStruct = parse_quote!(
+        pub struct A(Rel, Rel2);
+    );
+    let tokens = Leaker::from_struct(&simple)
+        .unwrap()
+        .finish()
+        .to_token_stream();
+    assert_eq!(tokens.to_string(), format!("\"{}\" (Rel , Rel2)", version));
+}
+
+#[test]
+fn root_relative_type_does_not_match_in_a_nested_module() {
+    let m: ItemMod = parse_quote!(
+        mod m {
+            pub struct A {
+                y: Rel,
+            }
+        }
+    );
+    let referrer = Leaker::from_module(&m).unwrap().finish();
+    let copy = |module: Option<Vec<Ident>>| {
+        let mut visitor = referrer.clone().into_visitor(None, |_, _| parse_quote!(P));
+        if let Some(module) = module {
+            visitor = visitor.in_module(module);
+        }
+        let mut item: ItemStruct = parse_quote!(
+            pub struct C {
+                y: Rel,
+            }
+        );
+        visitor.visit_item_struct_mut(&mut item);
+        quote!(#item).to_string()
+    };
+    let unchanged = quote!(
+        pub struct C {
+            y: Rel,
+        }
+    )
+    .to_string();
+    let rewritten = quote!(
+        pub struct C {
+            y: P,
+        }
+    )
+    .to_string();
+    assert_eq!(copy(Some(vec![])), rewritten);
+    assert_eq!(copy(None), rewritten);
+    assert_eq!(copy(Some(vec![ident("inner")])), unchanged);
+    // A copy of the whole module with a nested module without an entry for it.
+    let mut item: ItemMod = parse_quote!(
+        mod m {
+            pub struct A {
+                y: Rel,
+            }
+            pub mod inner {
+                pub struct C {
+                    y: Rel,
+                }
+            }
+        }
+    );
+    referrer
+        .into_visitor_with_root(&Generics::default(), None, |_, _| parse_quote!(P))
+        .visit_item_mod_mut(&mut item);
+    let expected: ItemMod = parse_quote!(
+        mod m {
+            pub struct A {
+                y: P,
+            }
+            pub mod inner {
+                pub struct C {
+                    y: Rel,
+                }
+            }
+        }
+    );
     assert_eq!(quote!(#item).to_string(), quote!(#expected).to_string());
 }

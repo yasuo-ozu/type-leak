@@ -151,12 +151,21 @@ fn strip_default(mut param: GenericParam) -> GenericParam {
 /// a bound is written inline or in the where clause (e.g. `<T: Debug + Clone, U>` and `<U, T>
 /// where T: Clone + Debug`), are equal.
 ///
+/// If the type depends on the module where it is written (it has a relative path, which resolves
+/// differently in another module) in an analysis of a module, the path of that module is part of
+/// the requirements too (see
+/// [`Referrer::context_module()`](crate::Referrer::context_module())).
+///
 /// Types with the same tokens and equal requirements are the same leaked type, whichever call of
 /// [`Leaker::intern_with()`](crate::Leaker::intern_with()) found them.
 #[derive(Clone, Debug)]
 pub(crate) struct Requirements {
     generics: Generics,
     self_ty: Option<SelfRequirement>,
+    /// The path of the module where the type is written, relative to the analyzed module (empty
+    /// for the analyzed module itself). `None` for a type which does not depend on its module, or
+    /// if no module is analyzed.
+    module: Option<Vec<Ident>>,
 }
 
 impl Requirements {
@@ -165,7 +174,14 @@ impl Requirements {
         Self {
             generics: canonicalize(generics),
             self_ty,
+            module: None,
         }
+    }
+
+    /// Returns the requirements with the module `module` (see [`Requirements`]).
+    pub(crate) fn with_module(mut self, module: Option<Vec<Ident>>) -> Self {
+        self.module = module;
+        self
     }
 
     /// Returns the tokens of the canonical form, by which requirements are compared.
@@ -175,6 +191,18 @@ impl Requirements {
         let mut rendered = quote!(#generics #where_clause).to_string();
         if let Some(self_ty) = &self.self_ty {
             rendered.push_str(&self_ty.render());
+        }
+        if let Some(module) = &self.module {
+            rendered.push_str(" mod ");
+            if module.is_empty() {
+                rendered.push_str("self");
+            }
+            for (i, ident) in module.iter().enumerate() {
+                if i > 0 {
+                    rendered.push_str("::");
+                }
+                rendered.push_str(&ident.to_string());
+            }
         }
         rendered
     }
@@ -271,6 +299,8 @@ impl Requirements {
         Self::new(Generics::default(), None)
     }
 
+    /// Returns `true` if the type depends on no generics and not on `Self` (whichever module it
+    /// is written in).
     pub(crate) fn is_empty(&self) -> bool {
         self.generics.params.is_empty()
             && self.generics.where_clause.is_none()
@@ -283,6 +313,15 @@ impl Requirements {
 
     pub(crate) fn self_ty(&self) -> Option<&SelfRequirement> {
         self.self_ty.as_ref()
+    }
+
+    pub(crate) fn module(&self) -> Option<&[Ident]> {
+        self.module.as_deref()
+    }
+
+    /// Returns the requirements without the module.
+    pub(crate) fn without_module(&self) -> Self {
+        self.clone().with_module(None)
     }
 }
 

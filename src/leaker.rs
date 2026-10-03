@@ -150,6 +150,15 @@ impl Leaker {
     /// module). Other relative paths (including the names imported by `use super::X` or `use
     /// crate::X`) are leaked.
     ///
+    /// A relative path resolves in the module where it is written, so a leaked type depending on
+    /// one (e.g. `Rel` in `mod m` and in `mod m::inner`, where `use super::super::Rel;` may
+    /// import another one) is keyed by the path of that module, relative to `input` (`[]` for
+    /// `input` itself, as opposed to a type which depends on no module), together with its generics (see [`Referrer::context_module()`]). The
+    /// Repeater's implementation of the type must be written inside that module, e.g. an
+    /// attribute macro on `mod m` can emit the implementations of the types of `m::inner` inside
+    /// it. A type which does not depend on its module (e.g. one with only absolute paths) is
+    /// shared by all the modules, in the module `[]`.
+    ///
     /// ```
     /// # use syn::*;
     /// # use type_leak::Leaker;
