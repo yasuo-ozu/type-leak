@@ -694,7 +694,7 @@ impl Referrer {
     /// let completed: Vec<GenericArgument> = vec![parse_quote!(u8)];
     /// let args = referrer.generic_args(0, &tr.generics.params, &completed).unwrap();
     /// // `T` is the argument of the trait, and `B` is declared by the method.
-    /// let expected: Vec<GenericArgument> = vec![parse_quote!(B), parse_quote!(u8)];
+    /// let expected: Vec<GenericArgument> = vec![parse_quote!(u8), parse_quote!(B)];
     /// assert_eq!(quote!(#(#args),*).to_string(), quote!(#(#expected),*).to_string());
     /// ```
     ///

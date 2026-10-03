@@ -168,7 +168,7 @@ fn only_the_generics_used_are_required() {
         entries(&referrer),
         [entry(
             parse_quote!(Wrap<'a, 'b, T, B>),
-            parse_quote!(<'a, 'b, const B: bool, T>)
+            parse_quote!(<'a, 'b, T, const B: bool>)
         )]
     );
 
@@ -204,11 +204,11 @@ fn self_of_a_trait() {
         [
             entry(
                 parse_quote!(Rel<Self>),
-                parse_quote!(<'a, const N: usize, T, U>)
+                parse_quote!(<'a, T, U, const N: usize>)
             ),
             entry(
                 parse_quote!(Wrap<Self::Item, T>),
-                parse_quote!(<'a, const N: usize, T, U>)
+                parse_quote!(<'a, T, U, const N: usize>)
             ),
             entry(parse_quote!(Rel2), Generics::default()),
         ]
@@ -467,7 +467,7 @@ fn generic_args_of_the_root_and_local_generics() {
         .unwrap();
     assert_eq!(
         args.iter().map(s).collect::<Vec<_>>(),
-        ["'x", "'b", "B", "u8", "V"]
+        ["'x", "'b", "u8", "V", "B"]
     );
     // A const argument of the trait is passed as it is.
     let tr: ItemTrait = parse_quote! {
@@ -480,7 +480,7 @@ fn generic_args_of_the_root_and_local_generics() {
     let args = referrer
         .generic_args(0, &tr.generics.params, &completed)
         .unwrap();
-    assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["{ 1 + 2 }", "V"]);
+    assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "{ 1 + 2 }"]);
     // Too few arguments.
     assert!(matches!(
         referrer.generic_args(0, &tr.generics.params, &[]),
@@ -488,7 +488,7 @@ fn generic_args_of_the_root_and_local_generics() {
     ));
     // Without the parameters of the trait, everything is passed by name.
     let args = referrer.generic_args(0, &Punctuated::new(), &[]).unwrap();
-    assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["N", "V"]);
+    assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "N"]);
 }
 
 fn rewrite<F: FnMut(Type, usize) -> Type>(mut visitor: Visitor<F>, sig: &str) -> String {

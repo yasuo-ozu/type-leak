@@ -3,6 +3,7 @@
 use crate::error::ABSOLUTE_PATHS;
 use proc_macro2::TokenStream;
 use std::collections::HashSet;
+use syn::ext::IdentExt;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
@@ -98,7 +99,12 @@ pub(crate) fn mentions_names(ty: &Type, idents: Vec<Ident>, lifetimes: Vec<Lifet
     visitor.found
 }
 
-/// Collects the names of identifiers and lifetimes (e.g. `N` and `'a`) in `tokens`.
+/// Returns the name of `ident` without `r#` (e.g. `T` for `r#T`), by which names are compared.
+pub(crate) fn ident_name(ident: &Ident) -> String {
+    ident.unraw().to_string()
+}
+
+/// Collects the names of identifiers and lifetimes (e.g. `N` and `'a`) in `tokens`, without `r#`.
 pub(crate) fn token_names(tokens: TokenStream, names: &mut HashSet<String>) {
     let mut after_quote = false;
     for tt in tokens {
@@ -107,7 +113,7 @@ pub(crate) fn token_names(tokens: TokenStream, names: &mut HashSet<String>) {
                 names.insert(format!("'{}", ident));
             }
             proc_macro2::TokenTree::Ident(ident) => {
-                names.insert(ident.to_string());
+                names.insert(ident_name(ident));
             }
             proc_macro2::TokenTree::Group(group) => token_names(group.stream(), names),
             _ => (),
@@ -123,7 +129,7 @@ pub(crate) fn token_names(tokens: TokenStream, names: &mut HashSet<String>) {
 pub(crate) fn generic_param_name(param: &GenericParam) -> String {
     match param {
         GenericParam::Type(TypeParam { ident, .. })
-        | GenericParam::Const(ConstParam { ident, .. }) => ident.to_string(),
+        | GenericParam::Const(ConstParam { ident, .. }) => ident_name(ident),
         GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => lifetime.to_string(),
     }
 }

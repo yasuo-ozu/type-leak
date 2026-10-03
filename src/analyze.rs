@@ -10,11 +10,11 @@ use crate::graph::{NodeKey, TypeGraph};
 use crate::leaker::Leaker;
 use crate::requirements::{Contexts, Requirements, Scope, SelfRequirement};
 use crate::util::{
-    first_self_in_generics, first_self_in_type, generic_param_name, is_primitive_name,
+    first_self_in_generics, first_self_in_type, generic_param_name, ident_name, is_primitive_name,
     looks_like_const, token_names, unwrap_type_group,
 };
 use proc_macro2::TokenStream;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
@@ -154,7 +154,7 @@ pub(crate) struct AnalyzeVisitor<'a> {
     in_default: bool,
     /// The names declared directly in each module being analyzed (see [`Leaker::from_module()`]),
     /// the innermost last. Paths to them are copied with the module, so they are portable.
-    modules: Vec<HashSet<String>>,
+    modules: Vec<ModuleNames>,
     /// The path of the module being visited, relative to the outermost module visited (see
     /// [`Requirements`]): the idents of the modules entered below it.
     module_path: Vec<Ident>,
@@ -171,6 +171,10 @@ pub(crate) struct AnalyzeVisitor<'a> {
     /// The number of items enclosing the syntax being visited. The generics of the outermost item
     /// are the `root`.
     item_depth: usize,
+    /// The type being visited is the referent of a reference which cannot be interned as a whole
+    /// (its lifetime is elided or local), so a trait object without a lifetime bound, which
+    /// defaults to that lifetime, cannot be interned alone.
+    elided_ref: bool,
 }
 
 impl<'a> AnalyzeVisitor<'a> {
@@ -201,6 +205,7 @@ impl<'a> AnalyzeVisitor<'a> {
             frame: Frame::new(0, 0),
             type_depth: 0,
             item_depth: 0,
+            elided_ref: false,
         }
     }
 
@@ -278,11 +283,47 @@ impl<'a> AnalyzeVisitor<'a> {
         } else {
             Requirements::none()
         };
-        if inner.relative && !self.modules.is_empty() {
+        if !self.modules.is_empty() && (inner.relative || self.depends_on_module(&requirements)) {
             requirements.with_module(Some(self.module_path.clone()))
         } else {
             requirements
         }
+    }
+
+    /// Returns `true` if `requirements` (the bounds and predicates of the generics, and what `Self`
+    /// means) refer to a path resolved in the module where it is written, i.e. one which is not
+    /// absolute, `crate::`, `$crate`, allowed by the Leaker, a generic or `Self`.
+    fn depends_on_module(&self, requirements: &Requirements) -> bool {
+        struct Finder<'v, 'l> {
+            visitor: &'v AnalyzeVisitor<'l>,
+            found: bool,
+        }
+        impl<'v, 'l, 'ast> Visit<'ast> for Finder<'v, 'l> {
+            fn visit_path(&mut self, i: &'ast Path) {
+                let local = i.leading_colon.is_none()
+                    && matches!(i.segments.first(), Some(seg)
+                        if seg.ident != "crate" && seg.ident != "$crate" && seg.ident != "Self")
+                    && !self.visitor.starts_with_generic(i)
+                    && !self.visitor.leaker.is_context_free_path(i);
+                self.found |= local;
+                syn::visit::visit_path(self, i)
+            }
+            fn visit_macro(&mut self, _: &'ast Macro) {
+                // The tokens are resolved where the macro is expanded.
+                self.found = true;
+            }
+        }
+        let mut finder = Finder {
+            visitor: self,
+            found: false,
+        };
+        finder.visit_generics(requirements.generics());
+        match requirements.self_ty() {
+            Some(SelfRequirement::Bound(path)) => finder.visit_path(path),
+            Some(SelfRequirement::Type(ty)) => finder.visit_type(ty),
+            _ => (),
+        }
+        finder.found
     }
 
     /// Returns the first mention of `Self` in the generics which `requirements` declare, which
@@ -328,9 +369,12 @@ impl<'a> AnalyzeVisitor<'a> {
                 // The type cannot be interned as a whole (e.g. `&MyType` with an elided lifetime,
                 // or `impl Iterator<Item = MyType>`), but its components can.
                 self.frame.effects.extend(effects);
+            } else {
+                // Otherwise, the type cannot be interned, but does not need to be (e.g.
+                // `impl ::path::Trait`). It is copied as it is, so the primitive types in it are
+                // assumed.
+                self.frame.effects.extend(primitive_effects(effects));
             }
-            // Otherwise, the type cannot be interned, but does not need to be (e.g.
-            // `impl ::path::Trait`).
         } else if is_own {
             let requirements = self.requirements_of(ty, &inner);
             if self.in_default && inner.mentions_self {
@@ -447,19 +491,38 @@ impl<'a> AnalyzeVisitor<'a> {
             }
             _ => false,
         };
-        match segments.next() {
-            Some(seg) => {
-                let name = seg.ident.to_string();
-                self.modules[current].contains(&name)
-                    && (explicit
-                        || !self.params().any(|param| match param {
-                            GenericParam::Type(TypeParam { ident, .. })
-                            | GenericParam::Const(ConstParam { ident, .. }) => ident == &seg.ident,
-                            GenericParam::Lifetime(_) => false,
-                        }))
+        let mut module = &self.modules[current];
+        let mut first = true;
+        loop {
+            let seg = match segments.next() {
+                Some(seg) => seg,
+                None => return false,
+            };
+            let name = ident_name(&seg.ident);
+            // The name must be declared (not imported by a relative `use`) in the module it is
+            // looked up in.
+            if !module.names.contains(&name) || (first && !explicit && self.is_generic(&seg.ident))
+            {
+                return false;
             }
-            None => false,
+            first = false;
+            match module.modules.get(&name) {
+                // The path goes through a module, which declares the next name.
+                Some(inner) if segments.peek().is_some() => module = inner,
+                // The rest (if any) is resolved through the item.
+                _ => return true,
+            }
         }
+    }
+
+    /// Returns `true` if `ident` is a type or const parameter in scope.
+    fn is_generic(&self, ident: &Ident) -> bool {
+        let name = ident_name(ident);
+        self.params().any(|param| match param {
+            GenericParam::Type(TypeParam { ident, .. })
+            | GenericParam::Const(ConstParam { ident, .. }) => ident_name(ident) == name,
+            GenericParam::Lifetime(_) => false,
+        })
     }
 
     /// Runs `f` with the names declared in the module `i` in scope.
@@ -486,16 +549,28 @@ impl<'a> AnalyzeVisitor<'a> {
         self.scopes.iter().flat_map(|scope| scope.params())
     }
 
+    /// Returns `true` if the associated item of `qself` (e.g. `<T>::X`, without `as`) is resolved
+    /// through the bounds of its self type, a generic parameter in scope or `Self`.
+    fn resolves_through_bounds(&self, qself: &QSelf) -> bool {
+        qself.as_token.is_none()
+            && match unwrap_type_group(&qself.ty) {
+                Type::Path(TypePath { qself: None, path }) => {
+                    path.leading_colon.is_none()
+                        && path.segments.len() == 1
+                        && path.segments.iter().all(|seg| {
+                            seg.arguments.is_none()
+                                && (seg.ident == "Self" || self.is_generic(&seg.ident))
+                        })
+                }
+                _ => false,
+            }
+    }
+
     /// Returns `true` if `path` starts with a generic parameter (e.g. `T` or `T::Item`).
     fn starts_with_generic(&self, path: &Path) -> bool {
         path.leading_colon.is_none()
             && path.segments.first().map_or(false, |seg| {
-                seg.arguments.is_none()
-                    && self.params().any(|param| match param {
-                        GenericParam::Type(TypeParam { ident, .. })
-                        | GenericParam::Const(ConstParam { ident, .. }) => ident == &seg.ident,
-                        GenericParam::Lifetime(_) => false,
-                    })
+                seg.arguments.is_none() && self.is_generic(&seg.ident)
             })
     }
 
@@ -752,6 +827,13 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     fn visit_item_impl(&mut self, i: &ItemImpl) {
         let self_ty = SelfRequirement::Type((*i.self_ty).clone());
         self.with_item(&i.generics, Some(Some(self_ty)), |visitor| {
+            // The trait is checked like a trait bound, but its generic arguments are analyzed in
+            // any case.
+            if let Some((_, path, _)) = &i.trait_ {
+                if !visitor.is_context_free(path) {
+                    visitor.relative_path(quote!(#path), quote!(#path));
+                }
+            }
             syn::visit::visit_item_impl(visitor, i)
         });
     }
@@ -765,13 +847,17 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     fn visit_type(&mut self, i: &Type) {
         let frame = Frame::new(self.musts.len(), self.impossibles.len());
         let outer = std::mem::replace(&mut self.frame, frame);
+        // Whether this is (directly) the referent of a reference which cannot be interned as a whole
+        // (its lifetime is elided or local).
+        let elided_ref = std::mem::take(&mut self.elided_ref);
         self.type_depth += 1;
         match i {
             Type::Macro(m) => {
                 // The tokens of a type macro cannot be analyzed, so it is interned as a whole (it
                 // is expanded in the Leaker's context).
                 self.push_must(quote!(#i), true);
-                self.frame.relative |= self.is_relative(&m.mac.path);
+                // It is expanded in the module where it is written, whatever its path is.
+                self.frame.relative |= !self.modules.is_empty() || self.is_relative(&m.mac.path);
                 // The generics (and `Self`) are matched by name.
                 let mut names = HashSet::new();
                 token_names(quote!(#i), &mut names);
@@ -781,10 +867,44 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                     }
                 }
                 self.frame.mentions_self |= names.contains("Self");
+                if names.contains("Self") && !self.leaker.self_ty_can_be_interned {
+                    self.push_impossible(quote!(Self));
+                }
             }
-            Type::ImplTrait(_)
-            | Type::Verbatim(_)
-            | Type::Reference(TypeReference { lifetime: None, .. }) => {
+            Type::Paren(_) | Type::Group(_) => {
+                self.elided_ref = elided_ref;
+                syn::visit::visit_type(self, i)
+            }
+            Type::Reference(TypeReference { lifetime, .. }) => {
+                match lifetime {
+                    // A local lifetime (or `'_`, a cause itself) keeps the reference from being
+                    // interned as a whole, so the trait object would be alone.
+                    Some(lifetime) => {
+                        self.elided_ref = lifetime.ident == "_"
+                            || self
+                                .scope_of(&lifetime.to_string())
+                                .map_or(false, |scope| scope > 0)
+                    }
+                    None => {
+                        self.push_impossible(quote!(#i));
+                        self.elided_ref = true;
+                    }
+                }
+                syn::visit::visit_type(self, i)
+            }
+            Type::TraitObject(object)
+                if elided_ref
+                    && !object
+                        .bounds
+                        .iter()
+                        .any(|bound| matches!(bound, TypeParamBound::Lifetime(_))) =>
+            {
+                // Its lifetime defaults to that of the reference, which is not interned as a whole,
+                // so it cannot be interned alone (see [`NotInternableError`]).
+                self.push_impossible(quote!(#i));
+                syn::visit::visit_type(self, i)
+            }
+            Type::ImplTrait(_) | Type::Verbatim(_) => {
                 self.push_impossible(quote!(#i));
                 syn::visit::visit_type(self, i);
             }
@@ -807,6 +927,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             match bound {
                 TypeParamBound::Trait(bound) => self.visit_trait_bound(bound),
                 TypeParamBound::Verbatim(_) => self.push_impossible(quote!(#bound)),
+                TypeParamBound::Lifetime(lifetime) => self.visit_lifetime(lifetime),
                 _ => (),
             }
         }
@@ -861,7 +982,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         let starts_with_generic = self.starts_with_generic(i);
         if self.type_depth > 0 && starts_with_generic {
             if let Some(seg) = i.segments.first() {
-                if let Some(scope) = self.scope_of(&seg.ident.to_string()) {
+                if let Some(scope) = self.scope_of(&ident_name(&seg.ident)) {
                     self.mention(scope);
                 }
             }
@@ -910,9 +1031,23 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         syn::visit::visit_path(self, i)
     }
 
+    fn visit_type_path(&mut self, i: &TypePath) {
+        match &i.qself {
+            Some(qself) if self.resolves_through_bounds(qself) => {
+                // `<T>::X` is resolved through the bounds of `T`, so `X` does not depend on the
+                // type context (only the generic arguments in the path do).
+                self.visit_qself(qself);
+                for seg in &i.path.segments {
+                    self.visit_path_arguments(&seg.arguments);
+                }
+            }
+            _ => syn::visit::visit_type_path(self, i),
+        }
+    }
+
     fn visit_qself(&mut self, i: &QSelf) {
-        // `<T>::Ty` cannot be interned.
-        if self.type_depth > 0 && i.as_token.is_none() {
+        // `<T>::Ty` cannot be interned, unless `T` is a generic parameter (or `Self`).
+        if self.type_depth > 0 && i.as_token.is_none() && !self.resolves_through_bounds(i) {
             let ty = &i.ty;
             self.push_impossible(quote!(#ty));
         }
@@ -965,22 +1100,44 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     }
 }
 
+/// Returns the effects which assume the primitive types, among `effects` (and those of the types
+/// in them).
+fn primitive_effects(effects: Vec<Effect>) -> Vec<Effect> {
+    let mut found = Vec::new();
+    for effect in effects {
+        match effect {
+            Effect::Primitive(_) => found.push(effect),
+            Effect::Type(pending) => found.extend(primitive_effects(pending.components)),
+            Effect::Error(_) => (),
+        }
+    }
+    found
+}
+
+/// The names declared in a module (see [`declared_names()`]), and those of the modules declared
+/// in it.
+#[derive(Default)]
+struct ModuleNames {
+    names: HashSet<String>,
+    modules: HashMap<String, ModuleNames>,
+}
+
 /// Returns the names declared directly in `items`: items, `macro_rules!` macros, and the names
 /// imported by `use` declarations with an absolute path (starting with `::` or `$crate`), which
 /// are portable. The names imported by the others (e.g. `use super::X`, `use crate::X`) refer to
 /// the items outside the module.
-fn declared_names(items: &[Item]) -> HashSet<String> {
+fn declared_names(items: &[Item]) -> ModuleNames {
     fn use_names(tree: &UseTree, last: Option<&Ident>, names: &mut HashSet<String>) {
         match tree {
             UseTree::Path(UsePath { ident, tree, .. }) => use_names(tree, Some(ident), names),
             UseTree::Name(UseName { ident }) if ident == "self" => {
-                names.extend(last.map(|ident| ident.to_string()));
+                names.extend(last.map(ident_name));
             }
             UseTree::Name(UseName { ident }) => {
-                names.insert(ident.to_string());
+                names.insert(ident_name(ident));
             }
             UseTree::Rename(UseRename { rename, .. }) if rename != "_" => {
-                names.insert(rename.to_string());
+                names.insert(ident_name(rename));
             }
             UseTree::Group(UseGroup { items, .. }) => {
                 for tree in items {
@@ -990,9 +1147,20 @@ fn declared_names(items: &[Item]) -> HashSet<String> {
             _ => (),
         }
     }
-    let mut names = HashSet::new();
+    let mut module = ModuleNames::default();
+    let names = &mut module.names;
     for item in items {
         match item {
+            Item::Mod(ItemMod {
+                ident,
+                content: Some((_, items)),
+                ..
+            }) => {
+                names.insert(ident_name(ident));
+                module
+                    .modules
+                    .insert(ident_name(ident), declared_names(items));
+            }
             Item::Struct(ItemStruct { ident, .. })
             | Item::Enum(ItemEnum { ident, .. })
             | Item::Union(ItemUnion { ident, .. })
@@ -1005,10 +1173,10 @@ fn declared_names(items: &[Item]) -> HashSet<String> {
             | Item::Macro(ItemMacro {
                 ident: Some(ident), ..
             }) => {
-                names.insert(ident.to_string());
+                names.insert(ident_name(ident));
             }
             Item::Fn(ItemFn { sig, .. }) => {
-                names.insert(sig.ident.to_string());
+                names.insert(ident_name(&sig.ident));
             }
             Item::Use(ItemUse {
                 leading_colon,
@@ -1018,11 +1186,11 @@ fn declared_names(items: &[Item]) -> HashSet<String> {
                 let is_absolute = leading_colon.is_some()
                     || matches!(tree, UseTree::Path(UsePath { ident, .. }) if ident == "$crate");
                 if is_absolute {
-                    use_names(tree, None, &mut names);
+                    use_names(tree, None, names);
                 }
             }
             _ => (),
         }
     }
-    names
+    module
 }

@@ -64,18 +64,24 @@ impl NotInternableError {
                 .collect();
                 // Why it cannot be leaked as a whole (unless it is the path itself, e.g. a
                 // trait bound).
-                notes.extend(
-                    conflict
-                        .impossible
-                        .iter()
-                        .filter(|cause| cause.to_string() != tokens.to_string())
-                        .map(|cause| {
-                            (
-                                cause.span(),
-                                format!("it cannot be leaked as a whole because of `{}`", cause),
-                            )
-                        }),
-                );
+                for cause in conflict
+                    .impossible
+                    .iter()
+                    .filter(|cause| cause.to_string() != tokens.to_string())
+                {
+                    notes.push((
+                        cause.span(),
+                        format!("it cannot be leaked as a whole because of `{}`", cause),
+                    ));
+                    if is_default_lifetime_object(cause) {
+                        notes.push((
+                            cause.span(),
+                            "the lifetime of the trait object defaults to that of the reference; \
+                             name it (e.g. `&'a dyn Trait`)"
+                                .to_string(),
+                        ));
+                    }
+                }
                 // The other paths inside it, which are found after this one is fixed.
                 notes.extend(others.iter().map(|other| {
                     (
@@ -122,6 +128,18 @@ impl NotInternableError {
     pub fn note(&self) -> Option<String> {
         let report = self.reports().into_iter().next()?;
         report.notes.into_iter().next().map(|(_, note)| note)
+    }
+}
+
+/// Returns `true` if `cause` is a trait object without a lifetime bound (e.g. `dyn Trait`), which is
+/// a cause only if it is the referent of a reference with an elided lifetime.
+fn is_default_lifetime_object(cause: &TokenStream) -> bool {
+    match syn::parse2::<syn::Type>(cause.clone()) {
+        Ok(syn::Type::TraitObject(object)) => !object
+            .bounds
+            .iter()
+            .any(|bound| matches!(bound, syn::TypeParamBound::Lifetime(_))),
+        _ => false,
     }
 }
 

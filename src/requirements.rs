@@ -2,12 +2,13 @@
 //! [`Referrer::generics()`](crate::Referrer::generics())).
 
 use crate::util::{
-    generic_param_mentions_self, generic_param_name, token_names, type_mentions_self,
+    generic_param_mentions_self, generic_param_name, ident_name, token_names, type_mentions_self,
     where_predicate_mentions_self,
 };
 use proc_macro2::TokenStream;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use syn::punctuated::Punctuated;
+use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
 
@@ -238,7 +239,35 @@ impl Requirements {
             .collect();
         let mut params = BTreeMap::new();
         let mut predicates = BTreeMap::new();
-        while let Some((from, name)) = work.pop() {
+        // Whether the predicates bounding `Self` are included (once `Self` is mentioned).
+        let mut swept_self = false;
+        loop {
+            let (from, name) = match work.pop() {
+                Some(item) => item,
+                None if mentions_self && !swept_self => {
+                    // A predicate bounding `Self` (e.g. `where Self: Sized`) is part of what the
+                    // type depends on, as the implementation must declare it too.
+                    swept_self = true;
+                    for (ix, scope) in scopes.iter().enumerate() {
+                        for (k, predicate) in scope.predicates.iter().enumerate() {
+                            let bounds_self = match predicate {
+                                WherePredicate::Type(predicate) => {
+                                    type_mentions_self(&predicate.bounded_ty)
+                                }
+                                _ => false,
+                            };
+                            if bounds_self && !predicates.contains_key(&(ix, k)) {
+                                let mut names = HashSet::new();
+                                token_names(quote!(#predicate), &mut names);
+                                predicates.insert((ix, k), predicate.clone());
+                                work.extend(names.into_iter().map(|name| (ix, name)));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                None => break,
+            };
             let found = (0..=from).rev().find_map(|ix| {
                 scopes[ix]
                     .params
@@ -281,14 +310,17 @@ impl Requirements {
                 );
             }
         }
+        let params: Vec<GenericParam> = params.into_values().collect();
+        let mut predicates: Vec<WherePredicate> = predicates.into_values().collect();
+        predicates.extend(implied_outlives(ty, &params));
         let mut generics = Generics {
-            params: params.into_values().collect(),
+            params: params.into_iter().collect(),
             ..Default::default()
         };
         if !predicates.is_empty() {
             generics.where_clause = Some(WhereClause {
                 where_token: Default::default(),
-                predicates: predicates.into_values().collect(),
+                predicates: predicates.into_iter().collect(),
             });
         }
         Self::new(generics, self_req.filter(|_| mentions_self).cloned())
@@ -401,9 +433,45 @@ fn sort_bounds<T: template_quote::ToTokens, P: Default>(
     bounds.into_iter().map(|(_, bound)| bound).collect()
 }
 
+/// Returns the predicates `X: 'a` which `ty` implies by containing `&'a X` (or `&'a mut X`) where
+/// `'a` is a lifetime parameter in `params` and `X` mentions a type parameter in `params`: the
+/// implementation must declare them, as the type is well-formed only if they hold.
+fn implied_outlives(ty: &Type, params: &[GenericParam]) -> Vec<WherePredicate> {
+    struct Finder<'a> {
+        params: &'a [GenericParam],
+        found: Vec<WherePredicate>,
+    }
+    impl<'a, 'ast> Visit<'ast> for Finder<'a> {
+        fn visit_type_reference(&mut self, i: &'ast TypeReference) {
+            if let Some(lifetime) = &i.lifetime {
+                let is_param = self.params.iter().any(
+                    |param| matches!(param, GenericParam::Lifetime(param) if &param.lifetime == lifetime),
+                );
+                let mut names = HashSet::new();
+                let elem = &i.elem;
+                token_names(quote!(#elem), &mut names);
+                let mentions_type = self.params.iter().any(|param| {
+                    matches!(param, GenericParam::Type(_))
+                        && names.contains(&generic_param_name(param))
+                });
+                if is_param && mentions_type {
+                    self.found.push(parse_quote!(#elem: #lifetime));
+                }
+            }
+            syn::visit::visit_type_reference(self, i)
+        }
+    }
+    let mut finder = Finder {
+        params,
+        found: Vec::new(),
+    };
+    finder.visit_type(ty);
+    finder.found
+}
+
 /// Returns the canonical form of `generics` (see [`Requirements`]): the bounds of a single
 /// parameter in the where clause are moved to the parameter, the bounds are sorted and
-/// deduplicated, the parameters are sorted by name (lifetimes first), the other predicates are
+/// deduplicated, the parameters are sorted by kind (lifetimes, types, consts) and name, the other predicates are
 /// sorted, and defaults and attributes are removed (an implementation cannot have them).
 fn canonicalize(generics: Generics) -> Generics {
     let mut params: Vec<GenericParam> = generics.params.into_iter().collect();
@@ -421,7 +489,7 @@ fn canonicalize(generics: Generics) -> Generics {
                 ..
             }) => path.get_ident().and_then(|ident| {
                 params.iter().position(|param| {
-                    matches!(param, GenericParam::Type(param) if &param.ident == ident)
+                    matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == ident_name(ident))
                 })
             }),
             WherePredicate::Lifetime(PredicateLifetime { lifetime, .. }) => {
@@ -466,9 +534,14 @@ fn canonicalize(generics: Generics) -> Generics {
             }
         }
     }
+    // Lifetimes, then types, then consts (the order valid on every version of Rust).
     params.sort_by_cached_key(|param| {
         (
-            !matches!(param, GenericParam::Lifetime(_)),
+            match param {
+                GenericParam::Lifetime(_) => 0,
+                GenericParam::Type(_) => 1,
+                GenericParam::Const(_) => 2,
+            },
             generic_param_name(param),
         )
     });

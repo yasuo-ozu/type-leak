@@ -107,11 +107,6 @@ impl Leaker {
 
     /// Build a [`Leaker`] from a given trait.
     ///
-    /// Unlike an enum or struct, a trait Leaker requires an alternate struct — an absolute path
-    /// to a struct declared in the same crate as the leaker trait and visible from
-    /// [`Referrer`]s' context. That struct serves as the `impl` target of the Repeater
-    /// instead of the Leaker's path.
-    ///
     /// ```
     /// # use syn::*;
     /// # use type_leak::Leaker;
@@ -119,9 +114,6 @@ impl Leaker {
     ///     pub trait MyTrait<T, U> {
     ///         fn func(self, t: T) -> U;
     ///     }
-    /// };
-    /// let alternate: ItemStruct = parse_quote!{
-    ///     pub struct MyAlternate;
     /// };
     /// let _ = Leaker::from_trait(&s);
     /// ```
@@ -152,7 +144,9 @@ impl Leaker {
     ///
     /// A relative path resolves in the module where it is written, so a leaked type depending on
     /// one (e.g. `Rel` in `mod m` and in `mod m::inner`, where `use super::super::Rel;` may
-    /// import another one) is keyed by the path of that module, relative to `input` (`[]` for
+    /// import another one), or whose requirements do (what `Self` means, or a bound of its
+    /// generics, mentioning a path which is not absolute, `crate::` or `$crate`), or which is a
+    /// type macro, is keyed by the path of that module, relative to `input` (`[]` for
     /// `input` itself, as opposed to a type which depends on no module), together with its generics (see [`Referrer::context_module()`]). The
     /// Repeater's implementation of the type must be written inside that module, e.g. an
     /// attribute macro on `mod m` can emit the implementations of the types of `m::inner` inside
@@ -318,9 +312,6 @@ impl Leaker {
         let contexts = self.contexts.len();
         let mut analysis = Analysis::default();
         analysis.apply(&mut self.contexts, effects, None);
-        for ident in &analysis.primitives {
-            self.assume_primitive(ident);
-        }
         if !analysis.errors.is_empty() {
             self.contexts.truncate(contexts);
             return Err(if self.allow_external_crates {
@@ -328,6 +319,9 @@ impl Leaker {
             } else {
                 NotInternableError::NotPortable(analysis.errors)
             });
+        }
+        for ident in &analysis.primitives {
+            self.assume_primitive(ident);
         }
         self.calls += 1;
         if !analysis.types.is_empty() {
@@ -506,10 +500,12 @@ fn without_defaults(generics: &Generics, n: usize) -> Generics {
 }
 
 /// Returns the sorted names of the external crates (other than `core`) named by the absolute
-/// paths (`::name::..`) in `ty` and `requirements` (the generics and what `Self` means).
+/// paths (`::name::..`) in `ty` and `requirements` (the generics and what `Self` means), without
+/// `r#` (e.g. `async` for `::r#async::X`).
 fn external_crates(ty: &Type, requirements: &Requirements) -> Vec<String> {
     use crate::requirements::SelfRequirement;
     use proc_macro2::TokenTree;
+    use syn::ext::IdentExt;
     use syn::visit::Visit;
     #[derive(Default)]
     struct Finder(BTreeSet<String>);
@@ -531,8 +527,8 @@ fn external_crates(ty: &Type, requirements: &Requirements) -> Vec<String> {
                                 if second.as_char() == ':' {
                                     iter.next();
                                     if let Some(TokenTree::Ident(ident)) = iter.peek() {
-                                        if ident != "core" {
-                                            self.0.insert(ident.to_string());
+                                        if ident.unraw() != "core" {
+                                            self.0.insert(ident.unraw().to_string());
                                         }
                                     }
                                 }
@@ -549,8 +545,8 @@ fn external_crates(ty: &Type, requirements: &Requirements) -> Vec<String> {
         fn visit_path(&mut self, i: &'ast Path) {
             if i.leading_colon.is_some() {
                 if let Some(seg) = i.segments.first() {
-                    if seg.ident != "core" {
-                        self.0.insert(seg.ident.to_string());
+                    if seg.ident.unraw() != "core" {
+                        self.0.insert(seg.ident.unraw().to_string());
                     }
                 }
             }
