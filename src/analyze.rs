@@ -8,8 +8,11 @@
 use crate::encode::is_const_param_ty;
 use crate::graph::{NodeKey, TypeGraph};
 use crate::leaker::Leaker;
-use crate::requirements::{Requirements, Scope};
-use crate::util::{is_primitive_name, looks_like_const, unwrap_type_group};
+use crate::requirements::{Contexts, Requirements, Scope, SelfRequirement};
+use crate::util::{
+    first_self_in_generics, first_self_in_type, generic_param_name, is_primitive_name,
+    looks_like_const, token_names, unwrap_type_group,
+};
 use proc_macro2::TokenStream;
 use std::collections::HashSet;
 use syn::visit::Visit;
@@ -41,15 +44,22 @@ pub struct CheckResult {
     /// only its components. `false` if `must` is empty, or all of `must` are in components (e.g.
     /// `MyType` in `::path::Wrap<MyType, '_>`), which can be interned alone.
     pub is_own: bool,
+    /// An explanation of the conflict, if it is not clear from the causes (e.g. why `Self` cannot
+    /// be leaked). It is reported first.
+    pub note: Option<String>,
 }
 
 /// A type to be added to the [`TypeGraph`], with its components.
-struct PendingType {
+pub(crate) struct PendingType {
     ty: Type,
     is_must_intern: bool,
     /// A cause of the type is not the path of an external crate (see
     /// [`Referrer::must()`](crate::Referrer::must())).
     is_hard: bool,
+    /// The type or a component of it is a cause (see [`CheckResult::must`]). Otherwise the type is
+    /// never interned, so it is not added.
+    has_must: bool,
+    /// The requirements of the type, which decide its context.
     requirements: Requirements,
     /// The type looks like a const (see [`looks_like_const()`]), which is an error unless it is a
     /// component of another type.
@@ -59,7 +69,7 @@ struct PendingType {
 }
 
 /// An effect of the analysis, applied (in order) when the analysis is finished.
-enum Effect {
+pub(crate) enum Effect {
     /// A type to add (not as a component of another type).
     Type(Box<PendingType>),
     /// A relative path which cannot be interned.
@@ -79,9 +89,13 @@ struct Frame {
     impossible_start: usize,
     /// The minimum depth of the causes found in the type (`usize::MAX` if none).
     min_depth: usize,
-    /// The minimum index in the visitor's `scopes` of the local generics mentioned in the type
-    /// (`usize::MAX` if none).
+    /// The minimum index in the visitor's `scopes` of the local generics (not those of the Leaker,
+    /// which are the scope 0) mentioned in the type (`usize::MAX` if none).
     local_scope: usize,
+    /// The type mentions a generic of the Leaker.
+    mentions_root: bool,
+    /// The type mentions `Self`.
+    mentions_self: bool,
     /// The type mentions an item declared in an analyzed module (see
     /// [`AnalyzeVisitor::is_module_path()`]).
     module_item: bool,
@@ -99,6 +113,8 @@ impl Frame {
             impossible_start,
             min_depth: usize::MAX,
             local_scope: usize::MAX,
+            mentions_root: false,
+            mentions_self: false,
             module_item: false,
             hard: false,
             effects: Vec::new(),
@@ -106,7 +122,8 @@ impl Frame {
     }
 }
 
-/// The result of [`AnalyzeVisitor`].
+/// The result of applying the effects of [`AnalyzeVisitor`].
+#[derive(Default)]
 pub(crate) struct Analysis {
     pub(crate) types: TypeGraph,
     /// The relative paths which cannot be interned.
@@ -118,14 +135,18 @@ pub(crate) struct Analysis {
 /// Analyzes items (see [`Leaker::intern_with()`]) and types (see [`Leaker::check()`]).
 pub(crate) struct AnalyzeVisitor<'a> {
     leaker: &'a Leaker,
-    /// The context of the types found (see [`Referrer::context()`](crate::Referrer::context())).
-    context: usize,
-    /// The generics of the Leaker, which the Repeater's implementation can refer to.
-    root: Generics,
-    /// The generics declared inside the Leaker's item (e.g. by trait methods, GATs, nested items
-    /// or `for<..>` binders), the innermost last. The Repeater's implementation cannot refer to
-    /// them, so a type depending on them is interned with its [`Requirements`].
+    /// The generics in scope: those of the Leaker first (the root, which is always there), and
+    /// then those declared inside the Leaker's item (e.g. by trait methods, GATs, nested items or
+    /// `for<..>` binders), the innermost last. A type depending on them is interned with its
+    /// [`Requirements`], which the Repeater's implementation declares.
     scopes: Vec<Scope>,
+    /// The type parameters of the Leaker's generics with a default.
+    root_defaulted: Vec<Ident>,
+    /// What `Self` means where the syntax being visited is (see [`SelfRequirement`]), if known.
+    self_ty: Option<SelfRequirement>,
+    /// The type being analyzed is the default of a parameter (see [`Leaker::intern_with()`]),
+    /// which cannot depend on `Self`.
+    in_default: bool,
     /// The names declared directly in each module being analyzed (see [`Leaker::from_module()`]),
     /// the innermost last. Paths to them are copied with the module, so they are portable.
     modules: Vec<HashSet<String>>,
@@ -145,12 +166,26 @@ pub(crate) struct AnalyzeVisitor<'a> {
 }
 
 impl<'a> AnalyzeVisitor<'a> {
-    pub(crate) fn new(leaker: &'a Leaker, context: usize, generics: &Generics) -> Self {
+    /// Returns a visitor with the generics `generics` of the Leaker, for the `call`-th successful
+    /// call of [`Leaker::intern_with()`] (see [`SelfRequirement::Call`]).
+    pub(crate) fn new(leaker: &'a Leaker, call: usize, generics: &Generics) -> Self {
         Self {
             leaker,
-            context,
-            root: generics.clone(),
-            scopes: Vec::new(),
+            scopes: vec![Scope::new(generics)],
+            root_defaulted: generics
+                .params
+                .iter()
+                .filter_map(|param| match param {
+                    GenericParam::Type(TypeParam {
+                        ident,
+                        default: Some(_),
+                        ..
+                    }) => Some(ident.clone()),
+                    _ => None,
+                })
+                .collect(),
+            self_ty: Some(SelfRequirement::Call(call)),
+            in_default: false,
             modules: Vec::new(),
             musts: Vec::new(),
             impossibles: Vec::new(),
@@ -168,15 +203,13 @@ impl<'a> AnalyzeVisitor<'a> {
         visitor.causes(0, 0, 1)
     }
 
-    /// Analyzes `ty` alone, in `context` with the root generics `generics` (see
+    /// Analyzes the default `ty` of a type parameter, with the parameters before it (and the
+    /// where predicates which do not mention the others) as the root generics `generics` (see
     /// [`Leaker::intern_with()`]).
-    pub(crate) fn analyze_type(
-        leaker: &Leaker,
-        context: usize,
-        ty: &Type,
-        generics: &Generics,
-    ) -> Analysis {
-        let mut visitor = AnalyzeVisitor::new(leaker, context, generics);
+    pub(crate) fn analyze_default(leaker: &Leaker, ty: &Type, generics: &Generics) -> Vec<Effect> {
+        let mut visitor = AnalyzeVisitor::new(leaker, 0, generics);
+        visitor.self_ty = None;
+        visitor.in_default = true;
         visitor.visit_type(ty);
         visitor.finish()
     }
@@ -191,6 +224,7 @@ impl<'a> AnalyzeVisitor<'a> {
             is_own: must.first().map_or(false, |(d, _)| *d == depth),
             must: must.into_iter().map(|(_, m)| m.clone()).collect(),
             impossible: self.impossibles[impossible_start..].to_vec(),
+            note: None,
         }
     }
 
@@ -206,41 +240,56 @@ impl<'a> AnalyzeVisitor<'a> {
         self.impossibles.push(impossible);
     }
 
-    /// Records that the type being visited mentions the local generic declared in the scope
-    /// `scope`.
-    fn mention_local(&mut self, scope: usize) {
-        self.frame.local_scope = self.frame.local_scope.min(scope);
+    /// Records that the type being visited mentions the generic declared in the scope `scope`.
+    fn mention(&mut self, scope: usize) {
+        if scope == 0 {
+            self.frame.mentions_root = true;
+        } else {
+            self.frame.local_scope = self.frame.local_scope.min(scope);
+        }
     }
 
-    /// Returns the index of the innermost scope declaring a type or const parameter named
-    /// `ident`, or a lifetime parameter if `lifetime`.
-    fn local_scope(&self, name: &str, lifetime: bool) -> Option<usize> {
+    /// Returns the index of the innermost scope declaring the type or const parameter named
+    /// `name`, or the lifetime parameter if it starts with `'` (e.g. `'a`).
+    fn scope_of(&self, name: &str) -> Option<usize> {
         self.scopes.iter().rposition(|scope| {
-            scope.params().any(|param| match param {
-                GenericParam::Type(TypeParam { ident, .. })
-                | GenericParam::Const(ConstParam { ident, .. }) => !lifetime && ident == name,
-                GenericParam::Lifetime(param) => lifetime && param.lifetime.ident == name,
-            })
+            scope
+                .params()
+                .any(|param| generic_param_name(param) == name)
         })
     }
 
-    /// Finishes the analysis, adding the types found to a graph.
-    pub(crate) fn finish(self) -> Analysis {
-        let mut analysis = Analysis {
-            types: TypeGraph::default(),
-            errors: Vec::new(),
-            primitives: Vec::new(),
-        };
-        analysis.apply(self.context, self.frame.effects, None);
-        analysis
+    /// Returns the requirements of `ty`, in which `inner` is found.
+    fn requirements_of(&self, ty: &Type, inner: &Frame) -> Requirements {
+        if inner.mentions_root || inner.mentions_self || inner.local_scope < self.scopes.len() {
+            Requirements::of(ty, &self.scopes, self.self_ty.as_ref())
+        } else {
+            Requirements::none()
+        }
+    }
+
+    /// Returns the first mention of `Self` in the generics which `requirements` declare, which
+    /// cannot be leaked unless [`Leaker::self_ty_can_be_interned`].
+    fn self_in_bounds(&self, requirements: &Requirements) -> Option<TokenStream> {
+        if self.leaker.self_ty_can_be_interned {
+            return None;
+        }
+        first_self_in_generics(requirements.generics())
+    }
+
+    /// Finishes the analysis, returning the effects to be applied.
+    pub(crate) fn finish(self) -> Vec<Effect> {
+        self.frame.effects
     }
 
     /// Decides how to handle the type `ty` at `depth`, given what is found in it (`inner`).
-    fn decide(&mut self, ty: &Type, depth: usize, inner: Frame) {
+    fn decide(&mut self, ty: &Type, depth: usize, mut inner: Frame) {
         // The causes and the local generics also belong to the enclosing type, as those of a
         // component.
         self.frame.min_depth = self.frame.min_depth.min(inner.min_depth);
         self.frame.local_scope = self.frame.local_scope.min(inner.local_scope);
+        self.frame.mentions_root |= inner.mentions_root;
+        self.frame.mentions_self |= inner.mentions_self;
         self.frame.module_item |= inner.module_item;
         self.frame.hard |= inner.hard;
         let has_impossible = self.impossibles.len() > inner.impossible_start;
@@ -248,7 +297,7 @@ impl<'a> AnalyzeVisitor<'a> {
         let is_own = inner.min_depth == depth;
         // The scopes declared inside the type (e.g. by a binder) are not in scope any more.
         let mentions_local = inner.local_scope < self.scopes.len();
-        let effects = inner.effects;
+        let effects = std::mem::take(&mut inner.effects);
 
         if has_impossible {
             if is_own {
@@ -265,39 +314,62 @@ impl<'a> AnalyzeVisitor<'a> {
             // Otherwise, the type cannot be interned, but does not need to be (e.g.
             // `impl ::path::Trait`).
         } else if is_own {
-            let requirements = if mentions_local {
-                Requirements::of(ty, &self.scopes)
+            let requirements = self.requirements_of(ty, &inner);
+            if self.in_default && inner.mentions_self {
+                // The Repeater's implementation of the default cannot know what `Self` is, as
+                // the default is also used to compute the arguments of the trait.
+                self.frame.effects.push(Effect::Error(CheckResult {
+                    must: vec![first_self_in_type(ty).unwrap_or_else(|| quote!(Self))],
+                    impossible: vec![quote!(#ty)],
+                    is_own: true,
+                    note: Some("a default of a parameter cannot depend on `Self`".to_string()),
+                }));
+            } else if let Some(self_path) = self.self_in_bounds(&requirements) {
+                self.frame.effects.push(Effect::Error(CheckResult {
+                    must: vec![quote!(#ty)],
+                    impossible: vec![self_path],
+                    is_own: true,
+                    note: Some(
+                        "the bounds of its generics mention `Self`, which cannot be leaked"
+                            .to_string(),
+                    ),
+                }));
             } else {
-                Requirements::none()
-            };
-            // If the type depends on both the type context and local generics, it cannot be
-            // decomposed further. It is interned together with the local generics it needs,
-            // which the Repeater's implementation must declare (see
-            // [`Referrer::local_generics()`](crate::Referrer::local_generics())).
-            let is_local = !requirements.is_empty();
-            self.frame.effects.push(Effect::Type(Box::new(PendingType {
-                ty: ty.clone(),
-                is_must_intern: true,
-                is_hard: inner.hard,
-                requirements,
-                looks_like_const: !is_local && looks_like_const(ty),
-                components: Vec::new(),
-            })));
-        } else if mentions_local || inner.module_item {
-            // The type itself cannot be interned because the Repeater's implementation
-            // cannot refer to the local generics (or because it refers to an item of the module,
-            // which the Referrer shadows in the copy of the module), but its components can.
+                // If the type depends on both the type context and generics, it cannot be
+                // decomposed further. It is interned together with the generics it needs, which
+                // the Repeater's implementation must declare (see
+                // [`Referrer::generics()`](crate::Referrer::generics())).
+                self.frame.effects.push(Effect::Type(Box::new(PendingType {
+                    ty: ty.clone(),
+                    is_must_intern: true,
+                    is_hard: inner.hard,
+                    has_must: true,
+                    looks_like_const: requirements.is_empty() && looks_like_const(ty),
+                    requirements,
+                    components: Vec::new(),
+                })));
+            }
+        } else if mentions_local || inner.module_item || (self.in_default && inner.mentions_self) {
+            // The type itself is not interned because it depends on local generics (or refers to
+            // an item of the module, which the Referrer shadows in the copy of the module, or to
+            // `Self` in a default), but its components can be.
             self.frame.effects.extend(effects);
         } else {
             // The type may be interned as a whole, or its components.
-            self.frame.effects.push(Effect::Type(Box::new(PendingType {
-                ty: ty.clone(),
-                is_must_intern: false,
-                is_hard: inner.hard,
-                requirements: Requirements::none(),
-                looks_like_const: false,
-                components: effects,
-            })));
+            let requirements = self.requirements_of(ty, &inner);
+            if self.self_in_bounds(&requirements).is_some() {
+                self.frame.effects.extend(effects);
+            } else {
+                self.frame.effects.push(Effect::Type(Box::new(PendingType {
+                    ty: ty.clone(),
+                    is_must_intern: false,
+                    is_hard: inner.hard,
+                    has_must,
+                    requirements,
+                    looks_like_const: false,
+                    components: effects,
+                })));
+            }
         }
     }
 
@@ -308,6 +380,7 @@ impl<'a> AnalyzeVisitor<'a> {
             must: vec![must],
             impossible: vec![impossible],
             is_own: true,
+            note: None,
         }));
     }
 
@@ -375,16 +448,7 @@ impl<'a> AnalyzeVisitor<'a> {
 
     /// Returns the generic parameters in scope, those of the Leaker and the local ones.
     fn params(&self) -> impl Iterator<Item = &GenericParam> {
-        self.root
-            .params
-            .iter()
-            .chain(self.scopes.iter().flat_map(|scope| scope.params()))
-    }
-
-    fn is_generic_lifetime(&self, lifetime: &Lifetime) -> bool {
-        self.params().any(
-            |param| matches!(param, GenericParam::Lifetime(param) if &param.lifetime == lifetime),
-        )
+        self.scopes.iter().flat_map(|scope| scope.params())
     }
 
     /// Returns `true` if `path` starts with a generic parameter (e.g. `T` or `T::Item`).
@@ -426,6 +490,24 @@ impl<'a> AnalyzeVisitor<'a> {
         self.item_depth -= 1;
     }
 
+    /// Like [`AnalyzeVisitor::with_item_generics()`], with `Self` meaning `self_ty` (if given) in
+    /// the item. Unlike the generics, this applies to a nested item as well.
+    fn with_item(
+        &mut self,
+        generics: &Generics,
+        self_ty: Option<Option<SelfRequirement>>,
+        f: impl FnOnce(&mut Self),
+    ) {
+        let outer = match self_ty {
+            Some(self_ty) => Some(std::mem::replace(&mut self.self_ty, self_ty)),
+            None => None,
+        };
+        self.with_item_generics(generics, f);
+        if let Some(outer) = outer {
+            self.self_ty = outer;
+        }
+    }
+
     /// Runs `f` with the lifetimes of a `for<..>` binder (e.g. `'a` in `for<'a> Fn(&'a T)`) in
     /// scope. They are treated as local generics, which the Repeater's implementation cannot
     /// refer to.
@@ -442,18 +524,21 @@ impl<'a> AnalyzeVisitor<'a> {
 }
 
 impl Analysis {
-    /// Merges `other` into this analysis.
-    pub(crate) fn merge(&mut self, other: Analysis) {
-        self.types.merge(other.types);
-        self.errors.extend(other.errors);
-        self.primitives.extend(other.primitives);
-    }
-
-    /// Applies `effects` in order, adding the types in `context` as components of `parent` (if
-    /// any).
-    fn apply(&mut self, context: usize, effects: Vec<Effect>, parent: Option<&NodeKey>) {
+    /// Applies `effects` in order, adding the types as components of `parent` (if any), each in
+    /// the context of its requirements (numbered in the order of the first appearance).
+    pub(crate) fn apply(
+        &mut self,
+        contexts: &mut Contexts,
+        effects: Vec<Effect>,
+        parent: Option<&NodeKey>,
+    ) {
         for effect in effects {
             match effect {
+                Effect::Type(pending) if !pending.has_must => {
+                    // A type with no cause in it is never interned, so it is not added (nor its
+                    // context), but the assumptions of its components are kept.
+                    self.apply(contexts, pending.components, parent);
+                }
                 Effect::Type(pending) => {
                     let ty = &pending.ty;
                     if parent.is_none() && pending.looks_like_const {
@@ -464,18 +549,19 @@ impl Analysis {
                             must: vec![quote!(#ty)],
                             impossible: vec![quote!(#ty)],
                             is_own: true,
+                            note: None,
                         });
                         continue;
                     }
+                    let context = contexts.intern(pending.requirements);
                     let key = self.types.add(
                         context,
                         ty,
-                        pending.requirements,
                         parent,
                         pending.is_must_intern,
                         pending.is_hard,
                     );
-                    self.apply(context, pending.components, Some(&key));
+                    self.apply(contexts, pending.components, Some(&key));
                 }
                 Effect::Error(error) => self.errors.push(error),
                 Effect::Primitive(ident) => self.primitives.push(ident),
@@ -486,14 +572,12 @@ impl Analysis {
 
 impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     fn visit_type_param(&mut self, i: &TypeParam) {
-        // The default of a type parameter of the root generics is analyzed in its own context
-        // (see [`Leaker::intern_with()`]), not copied in this one.
+        // The default of a type parameter of the root generics is analyzed on its own, with the
+        // parameters before it (see [`Leaker::intern_with()`]), not copied in this one.
         let is_root_default = i.default.is_some()
             && self.item_depth <= 1
-            && self.scopes.is_empty()
-            && self.root.params.iter().any(|param| {
-                matches!(param, GenericParam::Type(TypeParam { ident, default: Some(_), .. }) if ident == &i.ident)
-            });
+            && self.scopes.len() == 1
+            && self.root_defaulted.contains(&i.ident);
         if is_root_default {
             let mut i = i.clone();
             i.eq_token = None;
@@ -577,25 +661,29 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     }
 
     fn visit_item_struct(&mut self, i: &ItemStruct) {
-        self.with_item_generics(&i.generics, |visitor| {
+        let self_ty = SelfRequirement::of_item(&i.ident, &i.generics);
+        self.with_item(&i.generics, Some(Some(self_ty)), |visitor| {
             syn::visit::visit_item_struct(visitor, i)
         });
     }
 
     fn visit_item_enum(&mut self, i: &ItemEnum) {
-        self.with_item_generics(&i.generics, |visitor| {
+        let self_ty = SelfRequirement::of_item(&i.ident, &i.generics);
+        self.with_item(&i.generics, Some(Some(self_ty)), |visitor| {
             syn::visit::visit_item_enum(visitor, i)
         });
     }
 
     fn visit_item_union(&mut self, i: &ItemUnion) {
-        self.with_item_generics(&i.generics, |visitor| {
+        let self_ty = SelfRequirement::of_item(&i.ident, &i.generics);
+        self.with_item(&i.generics, Some(Some(self_ty)), |visitor| {
             syn::visit::visit_item_union(visitor, i)
         });
     }
 
     fn visit_item_trait(&mut self, i: &ItemTrait) {
-        self.with_item_generics(&i.generics, |visitor| {
+        let self_ty = SelfRequirement::of_trait(&i.ident, &i.generics);
+        self.with_item(&i.generics, Some(Some(self_ty)), |visitor| {
             syn::visit::visit_item_trait(visitor, i)
         });
     }
@@ -620,13 +708,15 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     fn visit_item_mod(&mut self, i: &ItemMod) {
         // A module has no generics, but the items in it are nested items (see
         // [`Leaker::from_module()`]), whose generics are local.
-        self.with_item_generics(&Generics::default(), |visitor| {
+        // `Self` has no meaning in a module, only in the items in it.
+        self.with_item(&Generics::default(), Some(None), |visitor| {
             visitor.with_module(i, |visitor| syn::visit::visit_item_mod(visitor, i))
         });
     }
 
     fn visit_item_impl(&mut self, i: &ItemImpl) {
-        self.with_item_generics(&i.generics, |visitor| {
+        let self_ty = SelfRequirement::Type((*i.self_ty).clone());
+        self.with_item(&i.generics, Some(Some(self_ty)), |visitor| {
             syn::visit::visit_item_impl(visitor, i)
         });
     }
@@ -646,9 +736,15 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                 // The tokens of a type macro cannot be analyzed, so it is interned as a whole (it
                 // is expanded in the Leaker's context).
                 self.push_must(quote!(#i), true);
-                if !Requirements::of(i, &self.scopes).is_empty() {
-                    self.mention_local(0);
+                // The generics (and `Self`) are matched by name.
+                let mut names = HashSet::new();
+                token_names(quote!(#i), &mut names);
+                for name in &names {
+                    if let Some(scope) = self.scope_of(name) {
+                        self.mention(scope);
+                    }
                 }
+                self.frame.mentions_self |= names.contains("Self");
             }
             Type::ImplTrait(_)
             | Type::Verbatim(_)
@@ -729,10 +825,16 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         let starts_with_generic = self.starts_with_generic(i);
         if self.type_depth > 0 && starts_with_generic {
             if let Some(seg) = i.segments.first() {
-                if let Some(scope) = self.local_scope(&seg.ident.to_string(), false) {
-                    self.mention_local(scope);
+                if let Some(scope) = self.scope_of(&seg.ident.to_string()) {
+                    self.mention(scope);
                 }
             }
+        }
+        if self.type_depth > 0
+            && i.leading_colon.is_none()
+            && matches!(i.segments.first(), Some(seg) if seg.ident == "Self")
+        {
+            self.frame.mentions_self = true;
         }
         let in_module =
             !starts_with_generic && !self.leaker.is_context_free_path(i) && self.is_module_path(i);
@@ -786,9 +888,9 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         }
         if i.ident == "_" {
             self.push_impossible(quote!(#i));
-        } else if let Some(scope) = self.local_scope(&i.ident.to_string(), true) {
-            self.mention_local(scope);
-        } else if i.ident != "static" && !self.is_generic_lifetime(i) {
+        } else if let Some(scope) = self.scope_of(&i.to_string()) {
+            self.mention(scope);
+        } else if i.ident != "static" {
             // The lifetime depends on the type context.
             self.push_must(quote!(#i), true);
         }

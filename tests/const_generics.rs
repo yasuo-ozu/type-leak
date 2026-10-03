@@ -21,7 +21,7 @@ fn leak(item: &ItemTrait) -> Referrer {
 /// Returns the leaked types with their local generics (with the where clause), by index.
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
-        .iter_with_local_generics()
+        .iter_with_generics()
         .map(|(ty, generics)| {
             let wc = &generics.where_clause;
             (quote!(#ty).to_string(), quote!(#generics #wc).to_string())
@@ -38,7 +38,7 @@ fn entry(ty: Type, generics: Generics) -> (String, String) {
 fn rewrite(referrer: Referrer, item: ItemTrait) -> String {
     let mut item = Item::Trait(item);
     referrer
-        .into_visitor(|_, ix| parse_quote!(P<#ix>))
+        .into_visitor(None, |_, ix| parse_quote!(P<#ix>))
         .visit_item_mut(&mut item);
     quote!(#item).to_string()
 }
@@ -124,7 +124,7 @@ fn test_local_generics_leaked() {
     leaker.reduce_roots();
     let referrer = leaker.finish();
     let actual: BTreeSet<(String, String)> = referrer
-        .iter_with_local_generics()
+        .iter_with_generics()
         .map(|(ty, generics)| {
             let wc = &generics.where_clause;
             (quote!(#ty).to_string(), quote!(#generics #wc).to_string())
@@ -164,7 +164,7 @@ fn test_local_generics_keep_self() {
     let mut leaker = Leaker::from_trait(&item).unwrap();
     leaker.reduce_roots();
     let referrer = leaker.finish();
-    let (ty, generics) = referrer.iter_with_local_generics().next().unwrap();
+    let (ty, generics) = referrer.iter_with_generics().next().unwrap();
     assert_eq!(quote!(#ty).to_string(), quote!(MyWrap<T>).to_string());
     let expected: Generics = parse_quote!(<T: ::core::cmp::PartialEq<Self>>);
     assert_eq!(quote!(#generics).to_string(), quote!(#expected).to_string());
@@ -233,19 +233,20 @@ fn test_type_with_and_without_local_generics() {
         }
     };
     let referrer = leak(&item);
+    // The contexts are numbered in the order of their first appearance.
     assert_eq!(
         entries(&referrer),
         [
-            entry(parse_quote!(Wrap<B>), Generics::default()),
             entry(parse_quote!(Wrap<B>), parse_quote!(<const B: bool>)),
+            entry(parse_quote!(Wrap<B>), Generics::default()),
         ]
     );
     assert_eq!(
         rewrite(referrer, item),
         expected(parse_quote! {
             trait MyTrait {
-                fn f<const B: bool>(&self) -> P<1usize>;
-                fn g(&self) -> P<0usize>;
+                fn f<const B: bool>(&self) -> P<0usize>;
+                fn g(&self) -> P<1usize>;
             }
         })
     );

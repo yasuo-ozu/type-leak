@@ -1,14 +1,18 @@
-//! The generics which a leaked type depends on, other than those of the Leaker itself (see
-//! [`Referrer::local_generics()`](crate::Referrer::local_generics())).
+//! The generics (and the meaning of `Self`) which a leaked type depends on (see
+//! [`Referrer::generics()`](crate::Referrer::generics())).
 
-use crate::util::{generic_param_name, token_names};
-use std::collections::{BTreeMap, HashSet};
+use crate::util::{
+    generic_param_mentions_self, generic_param_name, token_names, type_mentions_self,
+    where_predicate_mentions_self,
+};
+use proc_macro2::TokenStream;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::quote;
 
-/// The generics declared at one level inside an item, e.g. by a trait method, a GAT, a nested
-/// item or a `for<..>` binder.
+/// The generics declared at one level: those of the Leaker (the outermost level), or those inside
+/// it, e.g. declared by a trait method, a GAT, a nested item or a `for<..>` binder.
 #[derive(Clone, Debug)]
 pub(crate) struct Scope {
     params: Vec<GenericParam>,
@@ -16,9 +20,11 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
+    /// Returns the scope of `generics`, without the defaults (which are not part of a
+    /// declaration an implementation can copy, and are not dependencies of the type).
     pub(crate) fn new(generics: &Generics) -> Self {
         Self {
-            params: generics.params.iter().cloned().collect(),
+            params: generics.params.iter().cloned().map(strip_default).collect(),
             predicates: generics
                 .where_clause
                 .iter()
@@ -40,45 +46,167 @@ impl Scope {
     }
 }
 
+/// What `Self` means in a leaked type (see [`Referrer::context_self()`]).
+///
+/// A leaked type mentioning `Self` is the same type only where `Self` has the same meaning, so it
+/// is part of the requirements of the type. The Repeater's implementation must be written for
+/// the type described, e.g. `impl<..> Repeater<..> for S` where `S` is the implementor of the
+/// trait.
+///
+/// [`Referrer::context_self()`]: crate::Referrer::context_self()
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum SelfRequirement {
+    /// `Self` is the implementor of the trait: `Self: path<args>` (e.g. `Self: MyTrait<T, U>`).
+    Bound(Path),
+    /// `Self` is this type (a struct, enum, union, or the self type of an impl), e.g.
+    /// `MyStruct<T>`.
+    Type(Type),
+    /// `Self` of an [`intern_with()`](crate::Leaker::intern_with()) call without an enclosing item
+    /// (identified by the number of the call).
+    Call(usize),
+}
+
+impl SelfRequirement {
+    /// Returns the `Self` of the trait `ident` with the parameters `generics` as arguments, e.g.
+    /// `MyTrait<'a, T, N>` for `trait MyTrait<'a, T, const N: usize>`.
+    pub(crate) fn of_trait(ident: &Ident, generics: &Generics) -> Self {
+        let args = generics_as_args(generics);
+        Self::Bound(parse2(quote!(#ident #args)).unwrap())
+    }
+
+    /// Returns the `Self` of the struct, enum or union `ident` with the parameters `generics` as
+    /// arguments, e.g. `MyStruct<T>`.
+    pub(crate) fn of_item(ident: &Ident, generics: &Generics) -> Self {
+        let args = generics_as_args(generics);
+        Self::Type(parse2(quote!(#ident #args)).unwrap())
+    }
+
+    /// Returns the names in the description (e.g. `T` in `MyStruct<T>`).
+    fn names(&self, names: &mut HashSet<String>) {
+        match self {
+            Self::Bound(path) => token_names(quote!(#path), names),
+            Self::Type(ty) => token_names(quote!(#ty), names),
+            Self::Call(_) => (),
+        }
+    }
+
+    /// Returns the tokens by which the descriptions are compared.
+    fn render(&self) -> String {
+        match self {
+            Self::Bound(path) => format!(" Self: {}", quote!(#path)),
+            Self::Type(ty) => format!(" Self = {}", quote!(#ty)),
+            Self::Call(n) => format!(" Self = #{}", n),
+        }
+    }
+}
+
+impl PartialEq for SelfRequirement {
+    fn eq(&self, other: &Self) -> bool {
+        self.render() == other.render()
+    }
+}
+
+impl Eq for SelfRequirement {}
+
+impl std::hash::Hash for SelfRequirement {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.render().hash(state)
+    }
+}
+
+/// Returns the parameters of `generics` as the arguments of a path: `<'a, T, N>` (or nothing if
+/// there are no parameters).
+fn generics_as_args(generics: &Generics) -> TokenStream {
+    if generics.params.is_empty() {
+        return TokenStream::new();
+    }
+    let args = generics.params.iter().map(|param| match param {
+        GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => quote!(#lifetime),
+        GenericParam::Type(TypeParam { ident, .. })
+        | GenericParam::Const(ConstParam { ident, .. }) => quote!(#ident),
+    });
+    quote!(<#(#args),*>)
+}
+
+/// Removes the default of a parameter.
+fn strip_default(mut param: GenericParam) -> GenericParam {
+    match &mut param {
+        GenericParam::Type(param) => {
+            param.eq_token = None;
+            param.default = None;
+        }
+        GenericParam::Const(param) => {
+            param.eq_token = None;
+            param.default = None;
+        }
+        GenericParam::Lifetime(_) => (),
+    }
+    param
+}
+
 /// The generics (with their bounds and the where predicates mentioning them) which a type depends
-/// on, in a canonical form: two declarations with the same meaning up to the order of the
-/// parameters, the bounds and the predicates, and to whether a bound is written inline or in the
-/// where clause (e.g. `<T: Debug + Clone, U>` and `<U, T> where T: Clone + Debug`), are equal.
+/// on, and what `Self` means if it mentions it, in a canonical form: two declarations with the
+/// same meaning up to the order of the parameters, the bounds and the predicates, and to whether
+/// a bound is written inline or in the where clause (e.g. `<T: Debug + Clone, U>` and `<U, T>
+/// where T: Clone + Debug`), are equal.
+///
+/// Types with the same tokens and equal requirements are the same leaked type, whichever call of
+/// [`Leaker::intern_with()`](crate::Leaker::intern_with()) found them.
 #[derive(Clone, Debug)]
 pub(crate) struct Requirements {
     generics: Generics,
-    /// The tokens of the canonical form, by which requirements are compared.
-    key: String,
+    self_ty: Option<SelfRequirement>,
 }
 
 impl Requirements {
-    /// Returns the canonical form of `generics`.
-    pub(crate) fn new(generics: Generics) -> Self {
-        let generics = canonicalize(generics);
-        let where_clause = &generics.where_clause;
-        let key = quote!(#generics #where_clause).to_string();
-        Self { generics, key }
+    /// Returns the canonical form of `generics`, with `self_ty`.
+    pub(crate) fn new(generics: Generics, self_ty: Option<SelfRequirement>) -> Self {
+        Self {
+            generics: canonicalize(generics),
+            self_ty,
+        }
     }
 
-    /// Returns the generics declared in `scopes` (the innermost last) which `ty` depends on. A
+    /// Returns the tokens of the canonical form, by which requirements are compared.
+    fn render(&self) -> String {
+        let generics = &self.generics;
+        let where_clause = &generics.where_clause;
+        let mut rendered = quote!(#generics #where_clause).to_string();
+        if let Some(self_ty) = &self.self_ty {
+            rendered.push_str(&self_ty.render());
+        }
+        rendered
+    }
+
+    /// Returns the generics declared in `scopes` (the outermost, i.e. those of the Leaker, first,
+    /// and the innermost last) which `ty` depends on, and `self_req` if it mentions `Self`. A
     /// name refers to its innermost declaration visible from where it is used: from the type for
     /// the names in it, and from the declaring scope for the names in the bounds of a parameter.
-    /// Names which are not declared in `scopes` (e.g. the generics of the Leaker, or paths) are
-    /// ignored.
+    /// The names in `self_req` (e.g. the parameters of the trait) are used by the type as well.
+    /// Names which are not declared in `scopes` (e.g. paths) are ignored.
+    ///
+    /// If a bound or a predicate of a generic the type depends on mentions `Self`, the type
+    /// depends on the meaning of `Self` too.
     ///
     /// Identifiers are matched by name, so a parameter may be included even if the name refers to
     /// something else (e.g. `::path::N`). This is harmless, because the Leaker and the Referrer
     /// include the same generics.
-    pub(crate) fn of(ty: &Type, scopes: &[Scope]) -> Self {
-        if scopes.is_empty() {
-            return Self::none();
-        }
+    pub(crate) fn of(ty: &Type, scopes: &[Scope], self_req: Option<&SelfRequirement>) -> Self {
         let mut names = HashSet::new();
         token_names(quote!(#ty), &mut names);
+        let mut mentions_self = type_mentions_self(ty);
+        let mut self_names = HashSet::new();
+        if let Some(self_req) = self_req {
+            self_req.names(&mut self_names);
+        }
+        if mentions_self {
+            names.extend(self_names.iter().cloned());
+        }
         // The names to resolve, each with the innermost scope it is visible from.
         let mut work: Vec<(usize, String)> = names
             .into_iter()
-            .map(|name| (scopes.len() - 1, name))
+            .filter_map(|name| Some((scopes.len().checked_sub(1)?, name)))
             .collect();
         let mut params = BTreeMap::new();
         let mut predicates = BTreeMap::new();
@@ -102,6 +230,7 @@ impl Requirements {
             let mut names = HashSet::new();
             token_names(quote!(#param), &mut names);
             work.extend(names.into_iter().map(|name| (ix, name)));
+            let mut found_self = generic_param_mentions_self(param);
             // The predicates mentioning the parameter, and the names in them.
             for (k, predicate) in scopes[ix].predicates.iter().enumerate() {
                 if predicates.contains_key(&(ix, k)) {
@@ -112,7 +241,16 @@ impl Requirements {
                 if names.contains(&name) {
                     predicates.insert((ix, k), predicate.clone());
                     work.extend(names.into_iter().map(|name| (ix, name)));
+                    found_self |= where_predicate_mentions_self(predicate);
                 }
+            }
+            if found_self && !mentions_self {
+                mentions_self = true;
+                work.extend(
+                    self_names
+                        .iter()
+                        .map(|name| (scopes.len() - 1, name.clone())),
+                );
             }
         }
         let mut generics = Generics {
@@ -125,30 +263,32 @@ impl Requirements {
                 predicates: predicates.into_values().collect(),
             });
         }
-        Self::new(generics)
+        Self::new(generics, self_req.filter(|_| mentions_self).cloned())
     }
 
-    /// Returns the requirements of a type which depends on no generics of `scopes`.
+    /// Returns the requirements of a type which depends on no generics and not on `Self`.
     pub(crate) fn none() -> Self {
-        Self::new(Generics::default())
+        Self::new(Generics::default(), None)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.generics.params.is_empty() && self.generics.where_clause.is_none()
+        self.generics.params.is_empty()
+            && self.generics.where_clause.is_none()
+            && self.self_ty.is_none()
     }
 
     pub(crate) fn generics(&self) -> &Generics {
         &self.generics
     }
 
-    pub(crate) fn key(&self) -> &str {
-        &self.key
+    pub(crate) fn self_ty(&self) -> Option<&SelfRequirement> {
+        self.self_ty.as_ref()
     }
 }
 
 impl PartialEq for Requirements {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        self.render() == other.render()
     }
 }
 
@@ -162,13 +302,50 @@ impl PartialOrd for Requirements {
 
 impl Ord for Requirements {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key.cmp(&other.key)
+        self.render().cmp(&other.render())
     }
 }
 
 impl std::hash::Hash for Requirements {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.key.hash(state)
+        self.render().hash(state)
+    }
+}
+
+/// The distinct [`Requirements`] of the leaked types, which are the contexts of the types (see
+/// [`Referrer::context()`](crate::Referrer::context())), numbered from 0 in the order of their
+/// first appearance.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Contexts {
+    numbers: HashMap<Requirements, usize>,
+    list: Vec<Requirements>,
+}
+
+impl Contexts {
+    /// Returns the number of `requirements`, which is added if it is new.
+    pub(crate) fn intern(&mut self, requirements: Requirements) -> usize {
+        if let Some(number) = self.numbers.get(&requirements) {
+            return *number;
+        }
+        let number = self.list.len();
+        self.numbers.insert(requirements.clone(), number);
+        self.list.push(requirements);
+        number
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    pub(crate) fn get(&self, number: usize) -> &Requirements {
+        &self.list[number]
+    }
+
+    /// Removes the contexts numbered `len` or more (added after `len()` returned `len`).
+    pub(crate) fn truncate(&mut self, len: usize) {
+        for requirements in self.list.drain(len..) {
+            self.numbers.remove(&requirements);
+        }
     }
 }
 

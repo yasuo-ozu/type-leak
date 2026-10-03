@@ -74,43 +74,59 @@ Example of a reference in the referrer's type context:
 
 ## Repeaters keyed by generics
 
-The Repeater above is implemented for the leaker type, whose generics constrain the generics of the `impl`. When there is no such type (e.g. for a trait Leaker implemented by any type), the Repeater instead takes the generics encoded into a type (see `encode_generics_params_to_ty()` and `RepeaterSlots`), together with an ID of the Leaker and the index of the type reference, and is implemented for the implementor of the Leaker trait:
+The Repeater above is implemented for the leaker type, whose generics constrain the generics of the `impl`. When there is no such type (e.g. for a trait Leaker implemented by any type), the Repeater instead takes the generics encoded into a type (see `encode_generics_params_to_ty()` and `RepeaterSlots`), together with an ID of the Leaker and the index of the type reference.
+
+A type reference is keyed by the generics it actually uses, not by all the generics of the Leaker: `Referrer::generics()` is exactly what the Repeater's implementation of an entry declares and encodes, so a type which uses no generics (like `MyType1` below) is implemented once for any type, and shared by every Leaker, and a type using only `T` is implemented for any `T`:
 
 ```rust,ignore
 pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> {
     type Type: ?Sized;
 }
 
-impl<T, U, .., S: ?Sized> path::to::Repeater<(T, U, ..), 42, 0> for S
-where
-    S: MyLeaker<T, U, ..>,
-{
+// `MyType1` uses no generics, and `MyType2<T>` uses `T` (not `U`).
+impl<S: ?Sized> path::to::Repeater<(), 42, 0> for S {
     type Type = path::to::MyType1;
 }
 
+impl<T, S: ?Sized> path::to::Repeater<(T,), 42, 1> for S {
+    type Type = path::to::MyType2<T>;
+}
+
 // In an implementation of `MyLeaker<u8, u16, ..>` in the referrer's type context:
-<Self as path::to::Repeater<(u8, u16, ..), 42, 0>>::Type
+<Self as path::to::Repeater<(), 42, 0>>::Type
+<Self as path::to::Repeater<(u8,), 42, 1>>::Type
+```
+
+The arguments at the use site are given by `Referrer::generic_args()`: a generic of the type named like a parameter of the Leaker takes the argument of the implementation (completed with the defaults by `Referrer::complete_args()`), and any other generic (e.g. a generic of a method) is passed by its own name, which is in scope where the signature is copied. The bounds and where predicates of the generics used (transitively) are declared by the implementation, in a canonical form (`Referrer::generics()`).
+
+If the type mentions `Self` (`Rel<Self>`, `Self::Item`, ...), what `Self` means is part of the requirements too (`SelfRequirement`, `Referrer::context_self()`): `Self` is the implementor of the trait (`Self: MyLeaker<T, U>`, the trait parameters are then used by the type), or a type (a struct, an enum, a union or the self type of an impl), or the visited type of an `intern_with()` call which is not an item. The implementation is for the implementor, bounded by the trait, for the type, or for any type respectively:
+
+```rust,ignore
+// `Rel<Self>` in `trait MyLeaker<T, U>`
+impl<T, U, S: ?Sized + MyLeaker<T, U>> path::to::Repeater<(T, U), 42, 2> for S {
+    type Type = path::to::Rel<Self>;
+}
+// `Rel<Self>` in `struct MyStruct<T>`
+impl<T> path::to::Repeater<(T,), 42, 3> for MyStruct<T> {
+    type Type = path::to::Rel<Self>;
+}
 ```
 
 `repeater_definition()` generates this Repeater with additional const parameters, which are used to encode const generics (see below).
 
+Each type reference is an entry of the `Referrer`, whose context (`Referrer::context()`) is the number of its requirements (the generics it uses and `Self`): the same type found by several calls of `Leaker::intern_with()` is one entry if the requirements are equal, whatever the other generics of the calls are, and the same tokens with different requirements (e.g. `MyWrap<B>` where `B` is a `bool` in one method and a `u8` in another) are separate entries, and the `Referrer` rewrites each copy to its own (`Referrer::into_visitor()` checks the generics declared where the copy is, `Referrer::into_visitor_with_root()` compares the exact requirements).
+
+The default of a type parameter (`trait MyLeaker<T, U = MyType<T>>`) is written in the Leaker's type context, so it is analyzed with the parameters before it as the generics of the Leaker (it cannot use the later ones, and cannot depend on `Self`), and rewritten on its own by `Referrer::complete_args()` where the Referrer omits the argument.
+
 # Const generics
 
 Const generic parameters of the Leaker (e.g. `N` in `struct MyLeaker<const N: usize>`), including
-those declared on trait methods, are treated as context-free, like type parameters. A type that
-mentions a method-local generic (such as `[MyType; M]` in `fn f<const M: usize>()`) is not interned
-as a whole, because the Repeater's implementation cannot refer to `M`; its components (`MyType`)
-are interned instead. A type which cannot be decomposed (such as `MyWrap<B>` in
-`fn f<const B: bool>()`) is interned together with the local generics it depends on, which
-`Referrer::local_generics()` returns. The Repeater's implementation must then declare these
-generics (lifetimes first) and constrain them in its trait arguments, so the Repeater needs a type
-parameter to carry them (e.g. `Repeater<T: ?Sized, const INDEX: usize>`). Their bounds may mention
-`Self`, which refers to the implementor of the Leaker trait, so the Repeater should be implemented
-for the implementor (e.g. `impl<.., S: ?Sized> Repeater<..> for S where S: MyTrait<..>`). The same
-type depending on different local generics (e.g. `MyWrap<B>` where `B` is a `bool` in one method and
-a `u8` in another) is a separate entry for each, and the `Referrer` rewrites each copy to its own.
-Likewise, each successful call of `Leaker::intern_with()` is a context (`Referrer::context()`),
-since its generics may differ, and its types are not shared with those of other contexts.
+those declared on trait methods, are treated like type parameters: a type that uses them (such as
+`[MyType; N]` or `MyWrap<B>` in `fn f<const B: bool>()`) is interned together with the generics it
+uses, which the Repeater's implementation declares and constrains in its trait arguments (see
+above), so the Repeater needs a type parameter to carry them (e.g. `Repeater<T: ?Sized, const
+INDEX: usize>`). The bounds of the generics may mention `Self`, which the requirements of the type
+describe.
 
 Known limitations, due to the stable Rust type system:
 

@@ -1,6 +1,5 @@
 //! The graph of the types found by the analysis.
 
-use crate::requirements::Requirements;
 use safegraph::collection::IndexKey;
 use safegraph::graph::Graph;
 use safegraph::raw_graph::linked_adj_edge::{EdgeRepr, LinkedAdjEdgeGraph, NodeRepr};
@@ -72,30 +71,26 @@ impl std::fmt::Display for TypeKey {
 /// A leaked type, as a node of [`TypeGraph`] (and the key of a [`Referrer`](crate::Referrer)'s
 /// entry).
 ///
-/// Equal keys are the same leaked type, which is shared by all its occurrences. The same tokens
-/// with different requirements (see [`Requirements`]), or in different contexts (see
+/// Equal keys are the same leaked type, which is shared by all its occurrences, whichever call of
+/// [`Leaker::intern_with()`](crate::Leaker::intern_with()) found them. The same tokens with
+/// different requirements, i.e. in different contexts (see
 /// [`Referrer::context()`](crate::Referrer::context())), are separate entries.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct NodeKey {
-    /// The context (the `intern_with()` call) in which the type is found.
+    /// The number of the requirements of the type (see `Contexts`).
     pub(crate) context: usize,
     pub(crate) ty: TypeKey,
-    pub(crate) requirements: Requirements,
 }
 
 impl std::fmt::Display for NodeKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.context, self.ty)?;
-        if !self.requirements.is_empty() {
-            write!(f, " with {}", self.requirements.key())?;
-        }
-        Ok(())
+        write!(f, "{}:{}", self.context, self.ty)
     }
 }
 
-// SAFETY: `Eq`, `Ord` and `Hash` are derived from those of the fields (an integer, the tokens and
-// the canonical tokens of the requirements, each of which is deterministic), so they are
-// consistent with each other, and none of them (nor `Clone`) panics.
+// SAFETY: `Eq`, `Ord` and `Hash` are derived from those of the fields (an integer and the tokens,
+// each of which is deterministic), so they are consistent with each other, and none of them (nor
+// `Clone`) panics.
 unsafe impl IndexKey for NodeKey {}
 
 /// A graph whose nodes are keyed by [`NodeKey`] (in a `HashMap`), and whose edges are stored in a
@@ -120,13 +115,12 @@ pub(crate) struct TypeGraph {
 }
 
 impl TypeGraph {
-    /// Adds an occurrence of `ty` with `requirements` in `context` (a component of `parent`, or a
-    /// root), and returns its key.
+    /// Adds an occurrence of `ty` in `context` (a component of `parent`, or a root), and returns
+    /// its key.
     pub(crate) fn add(
         &mut self,
         context: usize,
         ty: &Type,
-        requirements: Requirements,
         parent: Option<&NodeKey>,
         is_must_intern: bool,
         is_hard: bool,
@@ -134,7 +128,6 @@ impl TypeGraph {
         let key = NodeKey {
             context,
             ty: TypeKey::new(ty),
-            requirements,
         };
         if self.nodes.insert(key.clone()) {
             self.graph.insert_node(key.clone()).ok().unwrap();

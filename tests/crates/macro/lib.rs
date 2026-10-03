@@ -16,9 +16,10 @@
 //! }
 //! ```
 //!
-//! The generics (including the local generics of each leaked type) are encoded into the
-//! Repeater's trait arguments with [`RepeaterSlots`], so the Repeater (defined by
-//! [`repeater_definition()`]) is the only item shared by the Leaker and the Referrer.
+//! The generics each leaked type uses (those of the trait and those of its methods, see
+//! [`Referrer::generics()`]) are encoded into the Repeater's trait arguments with
+//! [`RepeaterSlots`], so the Repeater (defined by [`repeater_definition()`]) is the only item
+//! shared by the Leaker and the Referrer.
 //!
 //! In the Referrer's crate, `MyTrait!` implements `MyTrait` for a wrapper by forwarding each
 //! method to the field `.0`, with the types in the signatures rewritten by the [`Referrer`]:
@@ -108,30 +109,6 @@ fn dollar_crate(path: &Path) -> TokenStream {
         tokens.insert(0, TokenTree::Punct(Punct::new('$', Spacing::Alone)));
     }
     tokens.into_iter().collect()
-}
-
-/// Removes defaults from generic parameters, which are not allowed in `impl`s.
-fn strip_defaults(param: &GenericParam) -> GenericParam {
-    let mut param = param.clone();
-    match &mut param {
-        GenericParam::Type(tp) => {
-            tp.eq_token = None;
-            tp.default = None;
-        }
-        GenericParam::Const(cp) => {
-            cp.eq_token = None;
-            cp.default = None;
-        }
-        GenericParam::Lifetime(_) => (),
-    }
-    param
-}
-
-/// Sorts generic parameters so that lifetimes come first.
-fn lifetimes_first<'a>(params: impl IntoIterator<Item = &'a GenericParam>) -> Vec<GenericParam> {
-    let mut params: Vec<GenericParam> = params.into_iter().map(strip_defaults).collect();
-    params.sort_by_key(|p| !matches!(p, GenericParam::Lifetime(_)));
-    params
 }
 
 fn param_as_arg(param: &GenericParam) -> TokenStream {
@@ -313,42 +290,35 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let id = trait_id(module, &item_trait.ident);
     let trait_ident = &item_trait.ident;
     let vis = &item_trait.vis;
-    let params = &item_trait.generics.params;
-    let trait_args: Vec<_> = params.iter().map(param_as_arg).collect();
     let slots = RepeaterSlots::new(repeater.clone());
 
-    // The Repeater's implementation of each type declares the root generics of its context (and
-    // the local generics of the type), and encodes exactly them. The context 0 is the trait
-    // itself. The others are the defaults of the type parameters, whose later arguments are
-    // unknown (they are what is being computed), so the implementation cannot be bounded by the
-    // trait.
+    // The Repeater's implementation of each type declares exactly the generics the type uses, and
+    // encodes them. If the type mentions `Self`, it is implemented for the implementor of the
+    // trait (bounded by the trait with its parameters) or for the type `Self` is.
     let mut repeater_impls = TokenStream::new();
-    for (ix, (ty, locals)) in referrer.iter_with_local_generics().enumerate() {
-        let context = referrer.context(ix);
-        let root = referrer.context_generics(context);
-        let encoded_root = slots
-            .encode_generics_params_to_ty(&root.params)
+    for (ix, (ty, generics)) in referrer.iter_with_generics().enumerate() {
+        let encoded = slots
+            .encode_generics_params_to_ty(&generics.params)
             .map_err(Error::from)?;
-        let encoded_locals = slots
-            .encode_generics_params_to_ty(&locals.params)
-            .map_err(Error::from)?;
-        let impl_params = lifetimes_first(root.params.iter().chain(locals.params.iter()));
-        let root_predicates = root.where_clause.iter().flat_map(|wc| wc.predicates.iter());
-        let local_predicates = locals
-            .where_clause
-            .iter()
-            .flat_map(|wc| wc.predicates.iter());
-        let predicates: Vec<&WherePredicate> = root_predicates.chain(local_predicates).collect();
-        let trait_bound = if context == 0 {
-            quote!(__S: #module::#trait_ident<#(#trait_args),*>,)
-        } else {
-            TokenStream::new()
+        let impl_params: Vec<_> = generics.params.iter().collect();
+        let predicates = generics.where_clause.iter().flat_map(|wc| wc.predicates.iter());
+        let header = match referrer.context_self(referrer.context(ix)) {
+            Some(SelfRequirement::Bound(path)) => quote! {
+                impl<#(#impl_params,)* __S: ?::core::marker::Sized + #module::#path>
+                    #repeater<#encoded, #id, #ix> for __S
+            },
+            Some(SelfRequirement::Type(self_ty)) => quote! {
+                impl<#(#impl_params),*> #repeater<#encoded, #id, #ix> for #self_ty
+            },
+            // `Call` is not tied to a type.
+            _ => quote! {
+                impl<#(#impl_params,)* __S: ?::core::marker::Sized>
+                    #repeater<#encoded, #id, #ix> for __S
+            },
         };
         repeater_impls.extend(quote! {
-            impl<#(#impl_params,)* __S: ?::core::marker::Sized>
-                #repeater<(#encoded_root, #encoded_locals), #id, #ix> for __S
+            #header
             where
-                #trait_bound
                 #(#predicates,)*
             {
                 type Type = #ty;
@@ -591,35 +561,35 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     let trait_ident = &item_trait.ident;
     let slots = RepeaterSlots::new(repeater.clone());
 
+    // The projection to the leaked type `ix`: the Repeater is encoded with the arguments of the
+    // generics the type uses, which are those of the trait or are in scope with the same names (the
+    // generics of the method).
+    let projection = |ix: usize,
+                      root_params: &Punctuated<GenericParam, Token![,]>,
+                      root_args: &[GenericArgument]|
+     -> Result<Type> {
+        let args = referrer.generic_args(ix, root_params, root_args)?;
+        let encoded = slots.encode_generics_args_to_ty(&args, &referrer.generics(ix).params)?;
+        Ok(parse_quote!(<Self as #repeater<#encoded, #id, #ix>>::Type))
+    };
+
     // Complete the arguments: an omitted argument takes the default, which is rewritten in the
     // Leaker's type context (it may be relative to the Leaker's module), and then the arguments
     // are encoded as in the Leaker.
     let mut encode_error = None;
     let completed = referrer
-        .complete_args(0, &trait_args.args, params, |_, ix, context_args| {
-            // The arguments of the root generics of the context of the type.
-            let root = referrer.context_generics(referrer.context(ix));
-            let encoded_root = slots.encode_generics_args_to_ty(context_args, &root.params);
-            let encoded_locals =
-                slots.encode_generics_params_to_ty(&referrer.local_generics(ix).params);
-            match (encoded_root, encoded_locals) {
-                (Ok(root), Ok(locals)) => parse_quote! {
-                    <Self as #repeater<(#root, #locals), #id, #ix>>::Type
-                },
-                (Err(e), _) | (_, Err(e)) => {
-                    encode_error = Some(e);
-                    parse_quote!(())
-                }
-            }
+        .complete_args(&trait_args.args, params, |_, ix, prefix| {
+            let before: Punctuated<GenericParam, Token![,]> =
+                params.iter().take(prefix.len()).cloned().collect();
+            projection(ix, &before, prefix).unwrap_or_else(|e| {
+                encode_error = Some(e);
+                parse_quote!(())
+            })
         })
         .map_err(Error::from)?;
     if let Some(e) = encode_error {
-        return Err(e.into());
+        return Err(e);
     }
-    let encoded_args = slots
-        .encode_generics_args_to_ty(&completed, params)
-        .map_err(Error::from)?;
-
     // Map the trait's generic parameters to the complete arguments.
     let mut substitute = Substitute {
         types: HashMap::new(),
@@ -641,18 +611,18 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         }
     }
 
-    // Projections to the leaked types of the context 0. Each depends on the local generics of the
-    // method, which are in scope with the same names.
+    // Projections to the leaked types. The generics of a method are in scope with the same names.
     let mut projections = Vec::new();
-    for (ix, (_, locals)) in referrer.iter_with_local_generics().enumerate() {
-        // The local generics are in scope with the same names, so they are encoded as parameters.
-        let encoded_locals = slots
-            .encode_generics_params_to_ty(&locals.params)
-            .map_err(Error::from)?;
-        projections.push(parse_quote! {
-            <Self as #repeater<(#encoded_args, #encoded_locals), #id, #ix>>::Type
-        });
+    for ix in 0..referrer.iter().count() {
+        projections.push(projection(ix, params, &completed)?);
     }
+    // What `Self` is in the trait: the implementor, bounded by the trait with its parameters.
+    let trait_params: Vec<_> = params.iter().map(param_as_arg).collect();
+    let self_path: Path = if trait_params.is_empty() {
+        parse_quote!(#trait_ident)
+    } else {
+        parse_quote!(#trait_ident<#(#trait_params),*>)
+    };
 
     let mut methods = TokenStream::new();
     for trait_item in &item_trait.items {
@@ -672,7 +642,9 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         let mut sig = trait_fn.sig.clone();
         let mut visitor = referrer
             .clone()
-            .into_visitor(|_, ix| parse_quote!(__TypeLeakTestPlaceholder<#ix>));
+            .into_visitor(Some(SelfRequirement::Bound(self_path.clone())), |_, ix| {
+                parse_quote!(__TypeLeakTestPlaceholder<#ix>)
+            });
         visitor.visit_signature_mut(&mut sig);
         substitute.visit_signature_mut(&mut sig);
         Resolve {

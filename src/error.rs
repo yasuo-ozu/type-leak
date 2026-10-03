@@ -29,7 +29,7 @@ pub enum NotInternableError {
     RelativePath(Vec<CheckResult>),
     /// Like [`NotInternableError::RelativePath`], for a [`Leaker`](crate::Leaker) with
     /// [`allow_external_crates`](crate::Leaker::allow_external_crates) unset: the offending path
-    /// is relative, or absolute but not `::core` (nor an allowed path), so it may not resolve in
+    /// is relative, or absolute but not `::core`, so it may not resolve in
     /// the Referrer's crate. It should start with `$crate` (e.g. re-exported by the Leaker's
     /// crate), or with `::core`. Never empty.
     NotPortable(Vec<CheckResult>),
@@ -54,10 +54,11 @@ impl NotInternableError {
             .iter()
             .filter_map(|conflict| {
                 let (tokens, others) = conflict.must.split_first()?;
-                let mut notes: Vec<_> = if portable {
-                    portable_path_note(tokens)
-                } else {
-                    absolute_path_note(tokens)
+                let mut notes: Vec<_> = match &conflict.note {
+                    // The conflict is not about the path.
+                    Some(note) => Some((tokens.span(), note.clone())),
+                    None if portable => portable_path_note(tokens),
+                    None => absolute_path_note(tokens),
                 }
                 .into_iter()
                 .collect();

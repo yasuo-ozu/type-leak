@@ -1,9 +1,9 @@
-//! Tests for the defaults of type parameters, analyzed in contexts of their own, and for
+//! Tests for the defaults of type parameters, analyzed with the parameters before them, and for
 //! `Referrer::complete_args()`.
 
 use syn::*;
 use template_quote::quote;
-use type_leak::{EncodeError, Leaker, Referrer};
+use type_leak::{Leaker, Referrer};
 
 fn referrer(tr: &ItemTrait) -> Referrer {
     Leaker::from_trait(tr).unwrap().finish()
@@ -13,11 +13,15 @@ fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
 }
 
+fn parse_generics(tokens: proc_macro2::TokenStream) -> Generics {
+    parse2(tokens).unwrap()
+}
+
 fn args(args: AngleBracketedGenericArguments) -> Vec<GenericArgument> {
     args.args.into_iter().collect()
 }
 
-/// A call of `type_fn`: the leaked type, its index and the arguments of its context.
+/// A call of `type_fn`: the leaked type, its index and the arguments of the preceding parameters.
 type Call = (String, usize, Vec<String>);
 
 /// Completes `given` with projections `<Self as R<ix>>::Type`, and returns the calls of `type_fn`.
@@ -28,8 +32,8 @@ fn complete_calls(
 ) -> Result<(Vec<String>, Vec<Call>)> {
     let mut calls = Vec::new();
     let completed = referrer
-        .complete_args(0, given, params, |ty, ix, context_args| {
-            calls.push((s(&ty), ix, context_args.iter().map(s).collect()));
+        .complete_args(given, params, |ty, ix, prefix| {
+            calls.push((s(&ty), ix, prefix.iter().map(s).collect()));
             parse_quote!(<Self as R<#ix>>::Type)
         })
         .map_err(Error::from)?;
@@ -45,7 +49,7 @@ fn complete(
 }
 
 #[test]
-fn test_default_contexts() {
+fn test_default_requirements() {
     let tr: ItemTrait = parse_quote! {
         trait Tr<'a, T: ::core::clone::Clone, const N: usize = 3, U = Rel<T>, V = (RelB, U)>
         where
@@ -56,38 +60,10 @@ fn test_default_contexts() {
         }
     };
     let referrer = referrer(&tr);
-    // The trait, the default of `U` and the default of `V`. The default of `N` is a const.
+    // The contexts are the requirements of the types, numbered in the order of their first
+    // appearance: nothing (`RelW` and `RelC`), `Rel<T>` (the default of `U`, which uses the
+    // parameters before it) and `(RelB, U)` (the default of `V`). The default of `N` is a const.
     assert_eq!(referrer.n_contexts(), 3);
-    let generics = referrer.context_generics(0);
-    assert_eq!(
-        s(generics),
-        s(
-            &parse2::<Generics>(quote!(<'a, T: ::core::clone::Clone, const N: usize, U, V>))
-                .unwrap()
-        )
-    );
-    assert_eq!(generics.where_clause.as_ref().unwrap().predicates.len(), 2);
-    // The root generics of a default are the parameters before it, and the predicates which do not
-    // mention the others.
-    let generics = referrer.context_generics(1);
-    assert_eq!(
-        s(generics),
-        s(&parse2::<Generics>(quote!(<'a, T: ::core::clone::Clone, const N: usize>)).unwrap())
-    );
-    assert_eq!(
-        s(&generics.where_clause),
-        s(&Some(
-            parse2::<WhereClause>(quote!(where T: ::p::Conv<RelW>)).unwrap()
-        ))
-    );
-    let generics = referrer.context_generics(2);
-    assert_eq!(
-        s(generics),
-        s(&parse2::<Generics>(quote!(<'a, T: ::core::clone::Clone, const N: usize, U>)).unwrap())
-    );
-    assert_eq!(generics.where_clause.as_ref().unwrap().predicates.len(), 2);
-
-    // The defaults are not leaked in the context 0.
     let leaked: Vec<_> = referrer
         .iter()
         .enumerate()
@@ -102,8 +78,23 @@ fn test_default_contexts() {
             (2, "(RelB , U)".to_string())
         ]
     );
+    let generics = |c: usize| {
+        let generics = referrer.context_generics(c);
+        s(&quote!(#generics #{&generics.where_clause}))
+    };
+    assert_eq!(generics(0), "");
+    // The bounds of `T` (also in the where clause) and the predicates mentioning it are used.
+    assert_eq!(
+        generics(1),
+        s(&parse_generics(
+            quote!(<T: ::core::clone::Clone + ::p::Conv<RelW>>)
+        ))
+    );
+    // `V` does not use `T`.
+    assert_eq!(generics(2), s(&parse_generics(quote!(<U: ::p::Late>))));
+    assert!((0..3).all(|c| referrer.context_self(c).is_none()));
 
-    // The round trip keeps the root generics.
+    // The round trip keeps the requirements.
     let tokens = quote!(#referrer);
     let parsed: Referrer = parse2(tokens).unwrap();
     assert_eq!(parsed, referrer);
@@ -120,7 +111,63 @@ fn test_default_contexts() {
 }
 
 #[test]
-fn test_default_contexts_are_allocated_per_call() {
+fn test_default_is_shared_with_the_items() {
+    // `Rel<T>` in the default of `U` and in a method is the same type with the same requirements.
+    let tr: ItemTrait = parse_quote!(
+        trait Tr<T, U = Rel<T>> {
+            fn f(&self, t: T) -> Rel<T>;
+        }
+    );
+    let referrer = referrer(&tr);
+    assert_eq!(referrer.iter().count(), 1);
+    assert_eq!(referrer.n_contexts(), 1);
+}
+
+#[test]
+fn test_default_cannot_depend_on_self() {
+    // A leaked type of a default mentioning `Self` is an error.
+    let tr: ItemTrait = parse_quote!(
+        trait Tr<T, U = Rel<Self>> {}
+    );
+    let err = Leaker::from_trait(&tr).err().unwrap();
+    assert_eq!(err.to_string(), "use absolute path: 'Self'");
+    assert_eq!(
+        err.note().as_deref(),
+        Some("a default of a parameter cannot depend on `Self`")
+    );
+    let mut leaker = Leaker::from_config({
+        let mut config = type_leak::LeakerConfig::new();
+        config.allow_external_crates(false);
+        config
+    });
+    let err = leaker
+        .intern_with(&tr.generics, |v| {
+            syn::visit::Visit::visit_item_trait(v, &tr)
+        })
+        .err()
+        .unwrap();
+    assert!(matches!(err, type_leak::NotInternableError::NotPortable(_)));
+
+    // Nothing is leaked in `::p::W<Self>` or `Self`, which are copied, and in `(Rel, Self)` only
+    // `Rel` is.
+    for (default, leaked) in [
+        (quote!(::p::W<Self>), 0),
+        (quote!(Self), 0),
+        (quote!((Rel, Self)), 1),
+    ] {
+        let tr: ItemTrait = parse_quote!(trait Tr<T, U = #default> {});
+        let referrer = referrer_of(&tr);
+        assert_eq!(referrer.iter().count(), leaked, "{}", s(&default));
+        assert!(!referrer.has_self());
+    }
+}
+
+fn referrer_of(tr: &ItemTrait) -> Referrer {
+    Leaker::from_trait(tr).unwrap().finish()
+}
+
+#[test]
+fn test_defaults_of_several_calls_are_shared() {
     let tr: ItemTrait = parse_quote!(
         trait Tr<T, U = ::std::vec::Vec<T>> {
             fn f(&self) -> Rel;
@@ -142,7 +189,7 @@ fn test_default_contexts_are_allocated_per_call() {
             syn::visit::Visit::visit_item_trait(v, &tr)
         })
         .unwrap();
-    // A failed call allocates nothing.
+    // A failed call adds nothing.
     let bad: ItemTrait = parse_quote!(
         trait Tr<T, U = ::std::vec::Vec<T>> {
             fn f(&self) -> Rel<'_>;
@@ -154,16 +201,13 @@ fn test_default_contexts_are_allocated_per_call() {
         ))
         .is_err());
     let referrer = leaker.finish();
-    // A context for the struct, the trait, and its default (which leaks nothing).
-    assert_eq!(referrer.n_contexts(), 3);
-    assert_eq!(referrer.context_generics(0).params.len(), 1);
-    assert_eq!(referrer.context_generics(1).params.len(), 2);
-    assert_eq!(referrer.context_generics(2).params.len(), 1);
-    assert_eq!(referrer.context(1), 1);
-    // The main context is given to `complete_args()`.
+    // The types use no generics, so they are in one context, whichever call found them.
+    assert_eq!(referrer.iter().count(), 2);
+    assert_eq!(referrer.n_contexts(), 1);
+    assert_eq!(referrer.generics(0).params.len(), 0);
+    // The default is copied (nothing in it is leaked), as in any call.
     let completed = referrer
         .complete_args(
-            1,
             &args(parse_quote!(<u8>)),
             &tr.generics.params,
             |_, _, _| unreachable!(),
@@ -173,16 +217,6 @@ fn test_default_contexts_are_allocated_per_call() {
         completed.iter().map(s).collect::<Vec<_>>(),
         ["u8", ":: std :: vec :: Vec < u8 >"]
     );
-    // There is no context for the default in the context 2.
-    assert!(matches!(
-        referrer.complete_args(
-            2,
-            &args(parse_quote!(<u8>)),
-            &tr.generics.params,
-            |_, _, _| { unreachable!() }
-        ),
-        Err(EncodeError::MissingArgument(_))
-    ));
 }
 
 #[test]
@@ -196,7 +230,6 @@ fn test_default_const_is_kept() {
         trait Tr<T, const N: usize = 3, const M: usize = { 1 + 2 }> {}
     );
     let referrer = referrer(&tr);
-    assert_eq!(referrer.n_contexts(), 1);
     let completed = complete(&referrer, &tr.generics.params, &args(parse_quote!(<u8>))).unwrap();
     assert_eq!(completed, ["u8", "3", "{ 1 + 2 }"]);
 }
@@ -211,8 +244,9 @@ fn test_complete_args() {
     let referrer = referrer(&tr);
     let params = &tr.generics.params;
 
-    // Omitted arguments take the defaults rewritten in the context of the default. `type_fn`
-    // receives the leaked type, its index and the complete arguments of the preceding parameters.
+    // Omitted arguments take the defaults, rewritten with the entries which use the preceding
+    // parameters. `type_fn` receives the leaked type, its index and the complete arguments of the
+    // preceding parameters.
     let (completed, calls) =
         complete_calls(&referrer, params, &args(parse_quote!(<'x, u8>))).unwrap();
     let projection = |ix: usize| format!("< Self as R < {}usize > > :: Type", ix);
@@ -292,14 +326,13 @@ fn test_complete_args_nested_leaked_types() {
     let referrer = referrer(&tr);
     let completed = referrer
         .complete_args(
-            0,
             &args(parse_quote!(<Rel<u8>>)),
             &tr.generics.params,
-            |ty, ix, context_args| {
+            |ty, ix, prefix| {
                 assert_eq!(ix, 0);
                 assert_eq!(s(&ty), "Rel < T >");
-                assert_eq!(context_args.len(), 1);
-                parse_quote!(P<#(#context_args),*>)
+                assert_eq!(prefix.len(), 1);
+                parse_quote!(P<#(#prefix),*>)
             },
         )
         .unwrap();
@@ -322,12 +355,9 @@ fn test_complete_args_no_substitution_in_projections() {
     );
     let referrer = referrer(&tr);
     let completed = referrer
-        .complete_args(
-            0,
-            &args(parse_quote!(<u8>)),
-            &tr.generics.params,
-            |_, _, _| parse_quote!(<T as Proj>::Type),
-        )
+        .complete_args(&args(parse_quote!(<u8>)), &tr.generics.params, |_, _, _| {
+            parse_quote!(<T as Proj>::Type)
+        })
         .unwrap();
     assert_eq!(
         s(&completed[1]),

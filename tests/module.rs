@@ -24,7 +24,7 @@ fn from_module_leaks_with_local_generics() {
     let referrer = Leaker::from_module(&module()).unwrap().finish();
     assert_eq!(
         referrer
-            .iter_with_local_generics()
+            .iter_with_generics()
             .map(|(ty, generics)| (quote!(#ty).to_string(), quote!(#generics).to_string()))
             .collect::<BTreeSet<_>>(),
         [
@@ -45,7 +45,7 @@ fn from_module_referrer_rewrites_a_copy() {
     let mut item = module();
     referrer
         .clone()
-        .into_visitor(|ty, ix| {
+        .into_visitor(None, |ty, ix| {
             let ty = quote!(#ty).to_string();
             let name = ty.replace(' ', "");
             let _ = ix;
@@ -178,7 +178,7 @@ fn from_module_generics_shadow_module_items() {
     let referrer = Leaker::from_module(&m).unwrap().finish();
     assert_eq!(
         referrer
-            .iter_with_local_generics()
+            .iter_with_generics()
             .map(|(ty, generics)| (quote!(#ty).to_string(), quote!(#generics).to_string()))
             .collect::<Vec<_>>(),
         [("Wrap < S >".to_string(), "< S >".to_string())]
@@ -207,7 +207,7 @@ fn from_module_referrer_keeps_module_items() {
     let referrer = referrer_with_prelude(&portable_module());
     let mut item = portable_module();
     referrer
-        .into_visitor(|ty, _| {
+        .into_visitor(None, |ty, _| {
             let name = quote!(#ty).to_string();
             parse_str(&format!("P_{}", name)).unwrap()
         })

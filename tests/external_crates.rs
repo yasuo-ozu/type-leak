@@ -127,19 +127,27 @@ fn disallowed_std_is_external() {
 fn disallowed_crates_in_local_generics() {
     let item: ItemTrait = parse_quote! {
         trait T {
+            fn f<U: ::core::convert::Into<::bar::B>>(&self) -> ::foo::W<U>;
+        }
+    };
+    // The bound of a local generic is copied with the type using it, so it requires its crates.
+    let entries = entries_of(false, item);
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|e| !e.1));
+    let find = |ty: &str| entries.iter().find(|e| e.0 == ty).unwrap().2.clone();
+    assert_eq!(find("::bar::B"), crates(&["bar"]));
+    assert_eq!(find("::foo::W<U>"), crates(&["bar", "foo"]));
+
+    // A bound with a path to an external crate is not portable.
+    let item: ItemTrait = parse_quote! {
+        trait T {
             fn f<U: ::bar::B>(&self) -> ::foo::W<U>;
         }
     };
-    // The bound of a local generic must be context-free (here allowed explicitly).
-    let mut config = LeakerConfig::new();
-    config.allow_external_crates(false);
-    config.allowed_paths.push(parse_quote!(::bar));
-    let mut leaker = Leaker::from_config(config);
-    leak_trait(&mut leaker, &item).unwrap();
-    let entries = entries(&leaker.finish());
-    assert_eq!(entries.len(), 1);
-    assert!(!entries[0].1);
-    assert_eq!(entries[0].2, crates(&["bar", "foo"]));
+    assert!(matches!(
+        error_of(false, item),
+        NotInternableError::NotPortable(_)
+    ));
 }
 
 #[test]
@@ -170,13 +178,14 @@ fn disallowed_macro_crates() {
 
 #[test]
 fn allowed_path_is_context_free() {
+    // An allowed path applies to relative paths only.
     let mut config = LeakerConfig::new();
     config.allow_external_crates(false);
-    config.allowed_paths.push(parse_quote!(::foo));
+    config.allowed_paths.push(parse_quote!(my));
     let mut leaker = Leaker::from_config(config);
     let item: ItemTrait = parse_quote! {
-        trait T: ::foo::Tr {
-            fn f(&self, a: ::foo::X) -> ::bar::Y;
+        trait T: my::Tr {
+            fn f(&self, a: my::X) -> ::bar::Y;
         }
     };
     leak_trait(&mut leaker, &item).unwrap();
@@ -184,6 +193,46 @@ fn allowed_path_is_context_free() {
         entries(&leaker.finish()),
         vec![("::bar::Y".to_string(), false, crates(&["bar"]))]
     );
+}
+
+#[test]
+fn allowed_path_does_not_allow_an_external_crate() {
+    // The external crates are allowed only by `allow_external_crates` (and by the Referrer, see
+    // `Referrer::with_available_external_crates()`), not by `allowed_paths`.
+    let mut config = LeakerConfig::new();
+    config.allow_external_crates(false);
+    config.allowed_paths.push(parse_quote!(::foo));
+    let mut leaker = Leaker::from_config(config);
+    let item: ItemTrait = parse_quote! {
+        trait T {
+            fn f(&self, a: ::foo::X) -> ::bar::Y;
+        }
+    };
+    leak_trait(&mut leaker, &item).unwrap();
+    assert_eq!(
+        entries(&leaker.finish()),
+        vec![
+            ("::bar::Y".to_string(), false, crates(&["bar"])),
+            ("::foo::X".to_string(), false, crates(&["foo"])),
+        ]
+    );
+    let item: ItemTrait = parse_quote!(
+        trait T: ::foo::Tr {}
+    );
+    let mut config = LeakerConfig::new();
+    config.allow_external_crates(false);
+    config.allowed_paths.push(parse_quote!(::foo));
+    let err = leak_trait(&mut Leaker::from_config(config), &item)
+        .err()
+        .unwrap();
+    assert!(matches!(err, NotInternableError::NotPortable(_)));
+    // The check of a type agrees.
+    let mut config = LeakerConfig::new();
+    config.allow_external_crates(false);
+    config.allowed_paths.push(parse_quote!(::foo));
+    let ty: Type = parse_quote!(::foo::X);
+    let result = Leaker::from_config(config).check(&ty, &Generics::default());
+    assert_eq!(result.must.len(), 1);
 }
 
 fn error_of(allow: bool, item: ItemTrait) -> NotInternableError {
@@ -330,7 +379,7 @@ fn referrer_visitor_respects_available_crates() {
         }
     );
     referrer
-        .into_visitor(|_, ix| parse_quote!(P<#ix>))
+        .into_visitor(None, |_, ix| parse_quote!(P<#ix>))
         .visit_item_trait_mut(&mut item);
     let s = quote!(#item).to_string();
     assert!(s.contains(":: foo :: X"), "{}", s);
@@ -341,13 +390,10 @@ fn referrer_visitor_respects_available_crates() {
 fn referrer_serialization_round_trip() {
     let item: ItemTrait = parse_quote! {
         trait T {
-            fn f<U: ::bar::B>(&self, u: U, x: ::foo::X, r: Rel) -> ::foo::W<U>;
+            fn f<U: ::core::convert::Into<::bar::B>>(&self, u: U, x: ::foo::X, r: Rel) -> ::foo::W<U>;
         }
     };
-    let mut config = LeakerConfig::new();
-    config.allow_external_crates(false);
-    config.allowed_paths.push(parse_quote!(::bar));
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = leaker(false);
     leak_trait(&mut leaker, &item).unwrap();
     let referrer = leaker.finish();
     let before = entries(&referrer);

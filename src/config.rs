@@ -27,10 +27,12 @@ impl LeakerConfig {
         Default::default()
     }
 
-    /// Sets [`LeakerConfig::allow_external_crates`]. With `false`, only `::core` and the
-    /// [`allowed_paths`](LeakerConfig::allowed_paths) (e.g. `::serde`) are context-free among the
-    /// paths with a leading `::`, so the other external crates are leaked (or reported as
-    /// [`NotInternableError::NotPortable`](crate::NotInternableError::NotPortable)).
+    /// Sets [`LeakerConfig::allow_external_crates`]. With `false`, only `::core` is context-free
+    /// among the paths with a leading `::` (the [`allowed_paths`](LeakerConfig::allowed_paths)
+    /// apply to relative paths only), so the external crates are leaked (or reported as
+    /// [`NotInternableError::NotPortable`](crate::NotInternableError::NotPortable)). The
+    /// Referrer tells which of them it can refer to (see
+    /// [`Referrer::with_available_external_crates()`](crate::Referrer::with_available_external_crates())).
     pub fn allow_external_crates(&mut self, allow: bool) -> &mut Self {
         self.allow_external_crates = allow;
         self
