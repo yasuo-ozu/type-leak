@@ -574,3 +574,125 @@ fn test_visitor_with_self() {
     let expected: Signature = parse_quote!(fn f(self: Box<Self>) -> P<0usize>);
     assert_eq!(quote!(#sig).to_string(), quote!(#expected).to_string());
 }
+
+#[test]
+fn test_nested_items_define_their_own_self() {
+    let referrer = referrer_of(parse_quote! {
+        trait Tr { fn f(&self) -> Rel<Self>; fn g(&self) -> Other; }
+    });
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            fn f(&self) -> Rel<Self> {
+                struct Inner;
+                impl Inner {
+                    fn new() -> Rel<Self> { loop {} }
+                    fn other() -> Other { loop {} }
+                }
+                let _: Rel<Self>;
+                loop {}
+            }
+        }
+    };
+    // `Self` means `Inner` in the nested impl, so `Rel<Self>` there is not the leaked type, and
+    // it is not replaced by `with_self`. The rest is as before.
+    let mut rewritten = item.clone();
+    referrer
+        .clone()
+        .into_visitor(None, |_, ix| parse_quote!(P<#ix>))
+        .with_self(parse_quote!(__S))
+        .visit_item_trait_mut(&mut rewritten);
+    let expected: ItemTrait = parse_quote! {
+        trait Tr {
+            fn f(&self) -> P<0usize> {
+                struct Inner;
+                impl Inner {
+                    fn new() -> Rel<Self> { loop {} }
+                    fn other() -> P<1usize> { loop {} }
+                }
+                let _: P<0usize>;
+                loop {}
+            }
+        }
+    };
+    assert_eq!(
+        quote!(#rewritten).to_string(),
+        quote!(#expected).to_string()
+    );
+
+    // `Self` is kept in the other nested items as well, also without `with_self`, and in an
+    // item of a block of a function copied alone.
+    let mut item: ItemFn = parse_quote! {
+        fn f() {
+            enum E { A(Rel<Self>) }
+            trait T { fn t() -> Self::Out; fn u() -> Rel<Self>; }
+            union U { a: Rel<Self> }
+        }
+    };
+    let expected = item.clone();
+    referrer
+        .into_visitor(None, |_, ix| parse_quote!(P<#ix>))
+        .with_self(parse_quote!(__S))
+        .visit_item_fn_mut(&mut item);
+    assert_eq!(quote!(#item).to_string(), quote!(#expected).to_string());
+}
+
+#[test]
+fn test_module_items_do_not_shadow_submodules() {
+    // The items of `m` are not in scope in `m::inner`, where `Rel` is imported from the parent
+    // and keyed by that module.
+    let m: ItemMod = parse_quote! {
+        mod m {
+            pub struct Rel;
+            pub struct A { x: Rel }
+            pub mod inner { use super::Rel; pub struct C { y: Rel } }
+        }
+    };
+    let referrer = type_leak::Leaker::from_module(&m).unwrap().finish();
+    // Only the `Rel` of `m::inner` is leaked.
+    assert_eq!(referrer.n_contexts(), 1);
+    let mut item = Item::Mod(m);
+    referrer
+        .into_visitor(None, |_, ix| parse_quote!(P<#ix>))
+        .visit_item_mut(&mut item);
+    // `Rel` of `m` is declared there, and the one of `m::inner` is rewritten.
+    let expected: Item = parse_quote! {
+        mod m {
+            pub struct Rel;
+            pub struct A { x: Rel }
+            pub mod inner { use super::Rel; pub struct C { y: P<0usize> } }
+        }
+    };
+    assert_eq!(quote!(#item).to_string(), quote!(#expected).to_string());
+}
+
+#[test]
+fn test_extern_crates_and_trait_aliases_shadow_and_declare() {
+    // `extern crate foo as Other;` declares `Other`, like a `use`.
+    let item: Item = parse_quote! {
+        fn g() {
+            extern crate foo as Other;
+            let a: Other;
+            let b: Rel;
+        }
+    };
+    assert_eq!(
+        rewrite(quote!((Other, Rel)), item),
+        expected(parse_quote! {
+            fn g() {
+                extern crate foo as Other;
+                let a: Other;
+                let b: P<1usize>;
+            }
+        })
+    );
+    // The generics of a trait alias are in scope in its bounds.
+    let item: Item = parse_quote! {
+        trait Alias<T> = ::x::Conv<T, Rel>;
+    };
+    assert_eq!(
+        rewrite(quote!((Rel, T)), item),
+        expected(parse_quote! {
+            trait Alias<T> = ::x::Conv<T, P<0usize>>;
+        })
+    );
+}

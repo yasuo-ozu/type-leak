@@ -44,3 +44,21 @@ type_leak_test_leaker::m::Defaulted!(impl<T> Defaulted<T> for Generic2<T> => 0);
 // the Leaker's crate from here.
 impl type_leak_test_leaker::m_portable::PortTr for Concrete {}
 type_leak_test_leaker::m::DollarCrate!(impl DollarCrate for Concrete => 0);
+
+// `Self` in the leaked types: the implementations of methods which return `Self` are given
+// verbatim (the forwarded value would be the field's type), and so are the associated types.
+type_leak_test_leaker::s::SelfSized!(impl SelfSized for Concrete => 0 {
+    fn me(&self) -> type_leak_test_leaker::s::Wrap<Self>
+    where
+        Self: ::core::marker::Sized,
+    {
+        type_leak_test_leaker::s::Wrap(Concrete(Inner))
+    }
+});
+type_leak_test_leaker::s::Assoc!(impl Assoc for Concrete => 0 {
+    type Item = u8;
+    type G<'a, V: 'a> = &'a V;
+});
+type_leak_test_leaker::s::Out!(impl<'x, T> Out<'x, T> for Concrete => 0);
+type_leak_test_leaker::s::DynRoot!(impl<'x> DynRoot<'x> for Concrete => 0);
+type_leak_test_leaker::s::Q!(impl<I: ::core::iter::Iterator> Q<I> for Concrete => 0);

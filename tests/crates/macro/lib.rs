@@ -296,7 +296,18 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     // encodes them. If the type mentions `Self`, it is implemented for the implementor of the
     // trait (bounded by the trait with its parameters) or for the type `Self` is.
     let mut repeater_impls = TokenStream::new();
+    // For `Self` bounded by the trait, the implementation is for `__S` (the implementor), where
+    // `Self` of the trait is not available: so the types and generics are those with `Self`
+    // replaced by `__S` (see `Referrer::iter_with_self()`), e.g. `Self::Item` is `<__S>::Item`
+    // and `Self: Sized` is `__S: Sized`. For `Self` as a type, the implementation is for that
+    // type, where `Self` means it.
+    let marker: Type = parse_quote!(__S);
+    let replaced: Vec<(Type, Generics)> = referrer.iter_with_self(&marker).collect();
     for (ix, (ty, generics)) in referrer.iter_with_generics().enumerate() {
+        let (ty, generics) = match referrer.context_self(referrer.context(ix)) {
+            Some(SelfRequirement::Bound(_)) => (&replaced[ix].0, &replaced[ix].1),
+            _ => (ty, generics),
+        };
         let encoded = slots
             .encode_generics_params_to_ty(&generics.params)
             .map_err(Error::from)?;
@@ -369,6 +380,9 @@ struct ImplementInput {
     trait_args: AngleBracketedGenericArguments,
     self_ty: Type,
     field: Member,
+    /// Items of the implementation given verbatim: the associated types and consts of the trait,
+    /// and the methods which are not forwarded.
+    extra: Vec<ImplItem>,
 }
 
 fn braced_parse<T: Parse>(input: ParseStream) -> Result<T> {
@@ -409,6 +423,14 @@ impl Parse for ImplementInput {
         generics.where_clause = input.parse()?;
         input.parse::<Token![=>]>()?;
         let field = input.parse()?;
+        let mut extra = Vec::new();
+        if input.peek(token::Brace) {
+            let content;
+            braced!(content in input);
+            while !content.is_empty() {
+                extra.push(content.parse()?);
+            }
+        }
         Ok(Self {
             item_trait,
             referrer,
@@ -419,6 +441,7 @@ impl Parse for ImplementInput {
             trait_args,
             self_ty,
             field,
+            extra,
         })
     }
 }
@@ -556,6 +579,7 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         trait_args,
         self_ty,
         field,
+        extra,
     } = input;
     let params = &item_trait.generics.params;
     let trait_ident = &item_trait.ident;
@@ -628,13 +652,19 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     for trait_item in &item_trait.items {
         let trait_fn = match trait_item {
             TraitItem::Fn(trait_fn) => trait_fn,
+            // Given verbatim in `extra`.
+            TraitItem::Type(_) | TraitItem::Const(_) => continue,
             _ => {
                 return Err(Error::new(
                     trait_item.span(),
-                    "only methods are supported by this test macro",
+                    "only methods, types and consts are supported by this test macro",
                 ))
             }
         };
+        // A method given verbatim is not forwarded.
+        if extra.iter().any(|item| matches!(item, ImplItem::Fn(f) if f.sig.ident == trait_fn.sig.ident)) {
+            continue;
+        }
         // 1. Replace the leaked types with placeholders, 2. substitute the trait's generic
         // parameters, and 3. replace the placeholders with the projections. Substituting before
         // the replacement would break the lookup of leaked types (keyed by the parameters'
@@ -691,6 +721,7 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     let (impl_generics, _, where_clause) = generics.split_for_impl();
     Ok(quote! {
         impl #impl_generics #module::#trait_ident #trait_args for #self_ty #where_clause {
+            #(#extra)*
             #methods
         }
     })

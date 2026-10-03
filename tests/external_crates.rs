@@ -421,3 +421,36 @@ fn referrer_plain_entry_syntax() {
         ]
     );
 }
+
+#[test]
+fn raw_identifier_crates_are_stored_unraw_and_serialized_back() {
+    use template_quote::ToTokens;
+    let item: ItemTrait = parse_quote! {
+        trait T {
+            fn f(&self, a: ::r#async::X, b: ::r#fn::Y, c: ::plain::Z);
+        }
+    };
+    let mut leaker = leaker(false);
+    leak_trait(&mut leaker, &item).unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(
+        entries(&referrer),
+        [
+            ("::plain::Z".to_string(), false, crates(&["plain"])),
+            ("::r#async::X".to_string(), false, crates(&["async"])),
+            ("::r#fn::Y".to_string(), false, crates(&["fn"])),
+        ]
+    );
+    // It is serialized with the raw identifiers, and parsed back.
+    let tokens = referrer.to_token_stream();
+    assert!(tokens.to_string().contains("@ [r#async]"));
+    assert_eq!(parse2::<Referrer>(tokens).unwrap(), referrer);
+    // The available crates are given by their names.
+    let available = referrer.with_available_external_crates(["async", "r#fn"]);
+    assert_eq!(
+        expand(&available, parse_quote!(::r#async::X)),
+        ":: r#async :: X"
+    );
+    assert_eq!(expand(&available, parse_quote!(::r#fn::Y)), ":: r#fn :: Y");
+    assert_eq!(expand(&available, parse_quote!(::plain::Z)), "P < 0usize >");
+}

@@ -10,6 +10,7 @@ use proc_macro2::TokenStream;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use syn::ext::IdentExt;
 use syn::parse::Parse;
 use syn::punctuated::Punctuated;
 use syn::visit_mut::VisitMut;
@@ -55,14 +56,28 @@ enum Matching<'a> {
     /// generics of the Leaker. If `self_ty` is given, an entry mentioning `Self` must be for it.
     Lenient {
         self_ty: Option<&'a SelfRequirement>,
+        /// `Self` means something else here (in an item nested in the visited syntax which
+        /// defines its own), so no entry which mentions it matches.
+        no_self: bool,
     },
     /// The first scope is that of the Leaker, so the requirements are compared exactly. If
     /// `self_ty` is given, `Self` means it, and otherwise it is not checked.
     Exact {
         self_ty: Option<&'a SelfRequirement>,
+        no_self: bool,
     },
     /// The scope is that of the parameters before a defaulted one: the entry must use only them.
     Default,
+}
+
+impl Matching<'_> {
+    /// Returns `true` if the entries which mention `Self` do not match.
+    fn no_self(&self) -> bool {
+        match self {
+            Matching::Lenient { no_self, .. } | Matching::Exact { no_self, .. } => *no_self,
+            Matching::Default => false,
+        }
+    }
 }
 
 impl Referrer {
@@ -117,6 +132,11 @@ impl Referrer {
         let mut best: Option<(usize, usize, usize)> = None;
         for &ix in candidates {
             let entry = &self.requirements[self.contexts[ix]];
+            if matching.no_self()
+                && (entry.self_ty().is_some() || type_mentions_self(&self.leak_types[ix]))
+            {
+                continue;
+            }
             let rank = match (module, entry.module()) {
                 (Some(module), Some(entry)) if entry == module => 0,
                 (Some(_), Some(_)) => continue,
@@ -154,7 +174,7 @@ impl Referrer {
         entry: &Requirements,
     ) -> Option<usize> {
         match matching {
-            Matching::Exact { self_ty } => {
+            Matching::Exact { self_ty, .. } => {
                 let requirements =
                     Requirements::of(ty, scopes, self_ty.or_else(|| entry.self_ty()));
                 if requirements == entry.without_module() {
@@ -163,7 +183,7 @@ impl Referrer {
                     None
                 }
             }
-            Matching::Lenient { self_ty } => {
+            Matching::Lenient { self_ty, .. } => {
                 if let (Some(wanted), Some(actual)) = (self_ty, entry.self_ty()) {
                     if wanted != actual {
                         return None;
@@ -301,7 +321,16 @@ impl Referrer {
         mut self,
         crates: impl IntoIterator<Item = impl ToString>,
     ) -> Self {
-        self.available_external_crates = Some(crates.into_iter().map(|c| c.to_string()).collect());
+        self.available_external_crates = Some(
+            crates
+                .into_iter()
+                .map(|c| {
+                    let name = c.to_string();
+                    // The names are stored without `r#`.
+                    name.strip_prefix("r#").map_or(name.clone(), str::to_string)
+                })
+                .collect(),
+        );
         self
     }
 
@@ -330,12 +359,15 @@ impl Referrer {
         self.leak_types.is_empty()
     }
 
-    /// Returns an iterator over the types that need to be encoded.
+    /// Returns an iterator over the types that need to be encoded, by their index.
+    ///
+    /// This is enough only for types which use no generics and do not mention `Self`; use
+    /// [`Referrer::iter_with_generics()`] or [`Referrer::iter_with_self()`] otherwise (see
+    /// [`Referrer::generics()`] for the Repeater's implementation of an entry).
     ///
     /// ```ignore
-    /// let args = encode_generics_params_to_ty(&generics.params);
     /// referrer.iter().enumerate().map(|(ix, ty)| quote!{
-    ///     impl #crate::TypeRef<#ix, #args> for #marker_ty {
+    ///     impl<__S: ?Sized> #repeater<(), #id, #ix> for __S {
     ///         type Type = #ty;
     ///     }
     /// }).collect::<TokenStream>();
@@ -373,18 +405,43 @@ impl Referrer {
     /// predicates of the generics are kept as they are, so they may mention `Self` too (e.g.
     /// `fn f<T: PartialEq<Self>>(&self)`), with the same meaning.
     ///
+    /// The Repeater's implementation also depends on what `Self` means in the type
+    /// ([`Referrer::context_self()`]) and, with [`Leaker::from_module()`](crate::Leaker::from_module()),
+    /// on the module ([`Referrer::context_module()`]). For a type mentioning `Self` whose
+    /// `context_self()` is [`SelfRequirement::Bound`], the implementation is for `__S`, where
+    /// `Self` of the trait is not available, so its type and generics are those of
+    /// [`Referrer::iter_with_self()`] with `__S` (e.g. `Wrap<Self::Item>` is `Wrap<<__S>::Item>`,
+    /// and `Self: Sized` is `__S: Sized`):
+    ///
     /// ```ignore
     /// // In the Leaker's crate
+    /// let marker: Type = parse_quote!(__S);
+    /// let replaced: Vec<_> = referrer.iter_with_self(&marker).collect();
     /// for (ix, (ty, generics)) in referrer.iter_with_generics().enumerate() {
+    ///     let context = referrer.context(ix);
+    ///     let (ty, generics) = match referrer.context_self(context) {
+    ///         Some(SelfRequirement::Bound(_)) => (&replaced[ix].0, &replaced[ix].1),
+    ///         _ => (ty, generics),
+    ///     };
     ///     let encoded = slots.encode_generics_params_to_ty(&generics.params)?;
-    ///     let (params, predicates) = (&generics.params, generics.where_clause.iter());
-    ///     quote! {
-    ///         impl<#params, __S: ?Sized> Repeater<#encoded, #ID, #ix> for __S
-    ///         #predicates
-    ///         {
-    ///             type Type = #ty;
-    ///         }
-    ///     }
+    ///     // There may be no parameters: `impl<__S: ?Sized>`.
+    ///     let params = generics.params.iter();
+    ///     let predicates = generics.where_clause.iter().flat_map(|wc| &wc.predicates);
+    ///     let header = match referrer.context_self(context) {
+    ///         // `path` is the trait with its parameters, written in the Leaker's module.
+    ///         Some(SelfRequirement::Bound(path)) => quote! {
+    ///             impl<#(#params,)* __S: ?Sized + #path> Repeater<#encoded, #ID, #ix> for __S
+    ///         },
+    ///         Some(SelfRequirement::Type(self_ty)) => quote! {
+    ///             impl<#(#params),*> Repeater<#encoded, #ID, #ix> for #self_ty
+    ///         },
+    ///         // `None`, or `Call`, which is not tied to a type.
+    ///         _ => quote! {
+    ///             impl<#(#params,)* __S: ?Sized> Repeater<#encoded, #ID, #ix> for __S
+    ///         },
+    ///     };
+    ///     // If `referrer.context_module(context)` is `Some`, emit it inside that module.
+    ///     quote! { #header where #(#predicates,)* { type Type = #ty; } }
     /// }
     ///
     /// // In the Referrer's crate (in the implementation of `MyTrait<#trait_args>`)
@@ -451,6 +508,12 @@ impl Referrer {
     /// __S`), and [`SelfRequirement::Type`] for the type (`impl<..> Repeater<..> for Type`).
     /// [`SelfRequirement::Call`] is not tied to a type, so the implementation may be for any type
     /// like `None`.
+    ///
+    /// In an implementation for `__S` (`None`, `Call` and `Bound`), `Self` of the leaked type
+    /// would be `__S` itself, so for a `Bound` entry (e.g. `Wrap<Self::Item>`, or a bound
+    /// `Self: Sized`) emit the type and the generics from [`Referrer::iter_with_self()`] with
+    /// `__S` (`Wrap<<__S>::Item>`, `__S: Sized`). For `Type`, `Self` is the type of the `impl`, so
+    /// the type is emitted as it is (see [`Referrer::generics()`] for the whole pattern).
     ///
     /// ```
     /// # use type_leak::*;
@@ -532,6 +595,12 @@ impl Referrer {
     /// the generics (see [`Referrer::has_self()`]), for a Repeater implemented for another type
     /// than the implementor of the Leaker trait (e.g. a marker type generic over `__S`), where
     /// `Self` would refer to that type instead.
+    ///
+    /// This is how the Repeater's implementation of an entry whose
+    /// [`context_self()`](Referrer::context_self()) is [`SelfRequirement::Bound`] is written, with
+    /// `self_ty` being its `__S` (`impl<.., __S: ?Sized + Trait<..>> Repeater<..> for __S`): for
+    /// the types and for the generics (e.g. `where Self: Sized` becomes `where __S: Sized`),
+    /// whereas [`Referrer::iter_with_generics()`] suits the other entries.
     ///
     /// `Self` alone becomes `self_ty`, `Self::A::B` becomes `<self_ty>::A::B`, and the self type
     /// of a qualified path (e.g. `<Self as ::p::Tr>::X`) is replaced as well. In the tokens of a
@@ -791,6 +860,7 @@ impl Referrer {
             outermost_as_leakers: false,
             self_ty: None,
             item_depth: 0,
+            own_self: false,
             module: None,
         }
     }
@@ -833,13 +903,16 @@ impl Referrer {
     ///
     /// ```ignore
     /// referrer.expand(ty, |_, ix| {
-    ///     let encoded = ...;
-    ///     parse_quote!(<#marker_ty as #crate::TypeRef<#encoded, #ix>>::Type)
+    ///     let encoded = ...; // the generics of the entry, see `Referrer::generic_args()`
+    ///     parse_quote!(<Self as #repeater<#encoded, #id, #ix>>::Type)
     /// })
     /// ```
     pub fn expand(&self, ty: Type, type_fn: impl FnMut(Type, usize) -> Type) -> Type {
         self.expand_with(
-            Matching::Lenient { self_ty: None },
+            Matching::Lenient {
+                self_ty: None,
+                no_self: false,
+            },
             None,
             &mut Vec::new(),
             None,
@@ -1095,6 +1168,11 @@ impl<'a, F: FnMut(Type, usize, &[GenericArgument]) -> Type> syn::fold::Fold for 
 /// with `T` alone) is not rewritten, since it refers to them rather than to the Leaker's items.
 /// See [`Visitor::with_outermost_generics_as_leakers()`] to treat the generics of the outermost
 /// item as those of the Leaker instead.
+///
+/// The items and imports declared in a block shadow the leaked types mentioning their names in
+/// the block, and those declared in a module do so in that module only, not in its submodules
+/// (where the types depending on a module are keyed by that module, see
+/// [`Referrer::context_module()`]), as in Rust's scoping rules.
 #[derive(Debug)]
 pub struct Visitor<F> {
     referrer: Referrer,
@@ -1112,6 +1190,10 @@ pub struct Visitor<F> {
     self_ty: Option<Type>,
     /// The number of items enclosing the syntax being visited.
     item_depth: usize,
+    /// Whether the syntax being visited is in an item nested in the visited syntax which defines
+    /// its own `Self` (a struct, enum, union, trait or impl), where `Self` is not that of the
+    /// copy.
+    own_self: bool,
     /// The path of the module being visited, relative to the first module visited, if known (see
     /// [`Visitor::in_module()`]).
     module: Option<Vec<Ident>>,
@@ -1128,6 +1210,7 @@ impl<F> Clone for Visitor<F> {
             outermost_as_leakers: self.outermost_as_leakers,
             self_ty: self.self_ty.clone(),
             item_depth: self.item_depth,
+            own_self: self.own_self,
             module: self.module.clone(),
         }
     }
@@ -1183,6 +1266,11 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
     /// by `type_fn`. Receivers (e.g. `&self`) and expressions other than those in types are not
     /// rewritten.
     ///
+    /// `Self` means something else in a struct, an enum, a union, a trait or an impl nested in the
+    /// visited syntax (e.g. in a method body), so there it is not replaced, and no leaked type
+    /// mentioning `Self` is found. The outermost item visited, and the signature if only that is
+    /// visited, are not nested.
+    ///
     /// ```
     /// # use type_leak::*;
     /// # use syn::*;
@@ -1205,25 +1293,31 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
         self
     }
 
+    /// Returns the type which replaces `Self` (see [`Visitor::with_self()`]), unless `Self` means
+    /// something else here.
+    fn replaced_self(&self) -> Option<&Type> {
+        self.self_ty.as_ref().filter(|_| !self.own_self)
+    }
+
     /// Stops rewriting the leaked types which mention `idents` (items or imports declared in a
-    /// block or a module), except the entries in the module `keep`, if given: their relative
-    /// paths were resolved in that very module.
-    fn shadow_idents(&mut self, idents: Vec<Ident>, keep: Option<&[Ident]>) {
+    /// block or a module). The items of a module are not in scope in its submodules, so, if
+    /// `module`, only the entries which depend on no module are shadowed: the others are keyed by
+    /// the module whose scope resolves them, which no other module's declarations shadow (and
+    /// its own are the ones their paths were resolved with).
+    fn shadow_idents(&mut self, idents: Vec<Ident>, module: bool) {
         let requirements = &self.referrer.requirements;
         let contexts = &self.referrer.contexts;
         self.referrer.map.retain(|key, entries| {
             if mentions_names(&key.ty, idents.clone(), Vec::new()) {
-                entries.retain(|&ix| {
-                    let module = requirements[contexts[ix]].module();
-                    module.is_some() && module == keep
-                });
+                entries.retain(|&ix| module && requirements[contexts[ix]].module().is_some());
             }
             !entries.is_empty()
         });
     }
 
-    /// Shadows the items declared in `items` (see [`Visitor::shadow_idents()`]).
-    fn shadow_items<'a>(&mut self, items: impl IntoIterator<Item = &'a Item>, keep: bool) {
+    /// Shadows the items declared in `items`, which are those of a module if `module` (see
+    /// [`Visitor::shadow_idents()`]).
+    fn shadow_items<'a>(&mut self, items: impl IntoIterator<Item = &'a Item>, module: bool) {
         fn use_names(tree: &UseTree, names: &mut Vec<Ident>) {
             match tree {
                 UseTree::Path(UsePath { tree, .. }) => use_names(tree, names),
@@ -1250,12 +1344,14 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
                 | Item::Static(ItemStatic { ident, .. })
                 | Item::Mod(ItemMod { ident, .. }) => names.push(ident.clone()),
                 Item::Use(ItemUse { tree, .. }) => use_names(tree, &mut names),
+                Item::ExternCrate(ItemExternCrate { ident, rename, .. }) => {
+                    names.push(rename.as_ref().map_or(ident, |(_, rename)| rename).clone())
+                }
                 _ => (),
             }
         }
         if !names.is_empty() {
-            let module = self.module.clone();
-            self.shadow_idents(names, module.as_deref().filter(|_| keep));
+            self.shadow_idents(names, module);
         }
     }
 
@@ -1265,6 +1361,12 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
     fn with_generics_as(&mut self, generics: &mut Generics, item: bool) -> Self {
         let mut visitor = self.clone();
         visitor.item_depth += 1;
+        // An item nested in the visited syntax defines its own `Self` if it is a struct, an enum,
+        // a union, a trait or an impl (for the others, which cannot use `Self`, it does not
+        // matter).
+        if item && self.item_depth > 0 {
+            visitor.own_self = true;
+        }
         // All the parameters are in scope of each other's bounds.
         if !(item && self.outermost_as_leakers && self.item_depth == 0) {
             visitor.scopes.push(Scope::new(generics));
@@ -1299,24 +1401,28 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
 impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
     fn visit_type_mut(&mut self, i: &mut Type) {
         let self_ty = self.self_requirement.as_ref();
+        let no_self = self.own_self;
         let (matching, module) = if self.exact {
             // The module is always compared.
             let module = self.module.as_deref().unwrap_or(&[]);
-            (Matching::Exact { self_ty }, Some(module))
+            (Matching::Exact { self_ty, no_self }, Some(module))
         } else {
-            (Matching::Lenient { self_ty }, self.module.as_deref())
+            (
+                Matching::Lenient { self_ty, no_self },
+                self.module.as_deref(),
+            )
         };
         *i = self.referrer.expand_with(
             matching,
             module,
             &mut self.scopes,
-            self.self_ty.as_ref(),
+            self.self_ty.as_ref().filter(|_| !no_self),
             i.clone(),
             &mut *self.type_fn.borrow_mut(),
         );
     }
     fn visit_receiver_mut(&mut self, i: &mut Receiver) {
-        if self.self_ty.is_none() {
+        if self.replaced_self().is_none() {
             return syn::visit_mut::visit_receiver_mut(self, i);
         }
         // The type of a receiver (`self: Box<Self>`, or `Self` in `&self`) is not rewritten.
@@ -1377,6 +1483,15 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         }
         for item in i.items.iter_mut() {
             visitor.visit_trait_item_mut(item);
+        }
+    }
+    fn visit_item_trait_alias_mut(&mut self, i: &mut ItemTraitAlias) {
+        for attr in i.attrs.iter_mut() {
+            self.visit_attribute_mut(attr);
+        }
+        let mut visitor = self.with_item_generics(&mut i.generics);
+        for bound in i.bounds.iter_mut() {
+            visitor.visit_type_param_bound_mut(bound);
         }
     }
     fn visit_item_union_mut(&mut self, i: &mut ItemUnion) {
@@ -1583,7 +1698,7 @@ impl Parse for Referrer {
                     bracketed!(list in input);
                     crates = Punctuated::<Ident, Token![,]>::parse_terminated(&list)?
                         .into_iter()
-                        .map(|ident| ident.to_string())
+                        .map(|ident| ident.unraw().to_string())
                         .collect();
                 }
                 Ok((input.parse()?, must, crates))
@@ -1595,6 +1710,16 @@ impl Parse for Referrer {
             );
         }
         Ok(Self::new(entries, requirements))
+    }
+}
+
+/// Returns the identifier of the external crate `name` (stored without `r#`), as `r#name` if it is
+/// a keyword, so that it is parsed back as an identifier.
+fn crate_ident(name: &str) -> Ident {
+    if parse_str::<Ident>(name).is_ok() {
+        Ident::new(name, proc_macro2::Span::call_site())
+    } else {
+        Ident::new_raw(name, proc_macro2::Span::call_site())
     }
 }
 
@@ -1676,7 +1801,7 @@ impl ToTokens for Referrer {
                     #(for (item, must, crates) in entries), {
                         #(if !must) { ? }
                         #(if !crates.is_empty()) {
-                            @[#(for name in crates), { #{Ident::new(name, proc_macro2::Span::call_site())} }]
+                            @[#(for name in crates), { #{crate_ident(name)} }]
                         }
                         #item
                     }

@@ -259,6 +259,142 @@ pub mod m {
     }
 }
 
+/// Types which mention `Self`, an associated type of it, or the generics of the trait (a lifetime
+/// and a type with a projection), in a module of their own.
+pub mod s {
+    use type_leak_test_macro::leak;
+
+    pub use crate::m::Inner;
+
+    #[derive(Debug, PartialEq)]
+    pub struct Wrap<U>(pub U);
+
+    pub trait RelTr {
+        fn rel(&self) -> u32;
+    }
+
+    pub struct RelImpl;
+
+    impl RelTr for RelImpl {
+        fn rel(&self) -> u32 {
+            31
+        }
+    }
+
+    /// `Self` in a leaked type, with a bound `Self: Sized` in a where clause.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::s,
+    )]
+    pub trait SelfSized {
+        fn me(&self) -> Wrap<Self>
+        where
+            Self: ::core::marker::Sized;
+        fn plain(&self) -> Wrap<u8>;
+    }
+
+    impl SelfSized for Inner {
+        fn me(&self) -> Wrap<Self> {
+            Wrap(Inner)
+        }
+        fn plain(&self) -> Wrap<u8> {
+            Wrap(1)
+        }
+    }
+
+    /// An associated type of `Self` in leaked types, also in a bound and as a GAT.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::s,
+    )]
+    pub trait Assoc {
+        type Item;
+        type G<'a, V: 'a>: ::core::marker::Sized
+        where
+            Self: 'a;
+        fn item(&self) -> Wrap<Self::Item>;
+        fn u<U: ::core::convert::Into<Self::Item>>(&self, u: U) -> Wrap<U>;
+        fn gat<'a, V: 'a>(&'a self, v: &'a V) -> Wrap<Self::G<'a, V>>
+        where
+            Self: 'a;
+    }
+
+    impl Assoc for Inner {
+        type Item = u8;
+        type G<'a, V: 'a> = &'a V;
+        fn item(&self) -> Wrap<Self::Item> {
+            Wrap(8)
+        }
+        fn u<U: ::core::convert::Into<Self::Item>>(&self, u: U) -> Wrap<U> {
+            Wrap(u)
+        }
+        fn gat<'a, V: 'a>(&'a self, v: &'a V) -> Wrap<Self::G<'a, V>>
+        where
+            Self: 'a,
+        {
+            Wrap(v)
+        }
+    }
+
+    /// A lifetime parameter of the trait in a leaked type.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::s,
+    )]
+    pub trait Out<'a, T> {
+        fn f(&self, x: &'a T) -> Wrap<&'a T>;
+    }
+
+    impl<'a, T> Out<'a, T> for Inner {
+        fn f(&self, x: &'a T) -> Wrap<&'a T> {
+            Wrap(x)
+        }
+    }
+
+    /// A trait object of a relative trait with the lifetime of the trait, boxed and borrowed.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::s,
+    )]
+    pub trait DynRoot<'a> {
+        fn boxed(&self) -> ::std::boxed::Box<dyn RelTr + 'a>;
+        fn borrowed(&self, x: &'a dyn RelTr) -> u32;
+        fn lent(&self) -> Wrap<&'a dyn RelTr>;
+    }
+
+    impl<'a> DynRoot<'a> for Inner {
+        fn boxed(&self) -> ::std::boxed::Box<dyn RelTr + 'a> {
+            ::std::boxed::Box::new(RelImpl)
+        }
+        fn borrowed(&self, x: &'a dyn RelTr) -> u32 {
+            x.rel() + 1
+        }
+        fn lent(&self) -> Wrap<&'a dyn RelTr> {
+            Wrap(&RelImpl)
+        }
+    }
+
+    /// A projection of a type parameter of the trait, `<T>::Item`.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::s,
+    )]
+    pub trait Q<T: ::core::iter::Iterator> {
+        fn f(&self, x: <T>::Item) -> Wrap<<T>::Item>;
+    }
+
+    impl<T: ::core::iter::Iterator> Q<T> for Inner {
+        fn f(&self, x: <T>::Item) -> Wrap<<T>::Item> {
+            Wrap(x)
+        }
+    }
+}
+
 /// Items reached through `$crate`, which are portable (resolved from the Referrer's crate).
 pub mod m_portable {
     pub struct Portable;

@@ -108,3 +108,35 @@ fn dollar_crate_paths() {
     assert_eq!(c.d_arr(), [7, 7]);
     assert_eq!(c.d_rel(Portable).0, 11);
 }
+
+/// `Self`, its associated types (also as a GAT and in a bound) and the generics of the trait in
+/// the leaked types of `type_leak_test_leaker::s`.
+#[test]
+fn self_and_associated_types() {
+    use type_leak_test_leaker::s::{Assoc, SelfSized, Wrap};
+    let c = Concrete(Inner);
+    // `Wrap<Self>` where `Self: Sized`, implemented by the Referrer's crate.
+    let me: Wrap<Concrete> = c.me();
+    let _ = me;
+    assert_eq!(c.plain(), Wrap(1));
+    // `Self::Item` is `u8` for `Concrete`.
+    let item: Wrap<u8> = c.item();
+    assert_eq!(item, Wrap(8));
+    assert_eq!(c.u(3u8), Wrap(3u8));
+    let v = 5u16;
+    let g: Wrap<&u16> = c.gat(&v);
+    assert_eq!(g, Wrap(&5));
+}
+
+#[test]
+fn lifetimes_trait_objects_and_projections() {
+    use type_leak_test_leaker::s::{DynRoot, Out, RelImpl, Wrap, Q};
+    let c = Concrete(Inner);
+    let x = 4u64;
+    assert_eq!(Out::f(&c, &x), Wrap(&4));
+    assert_eq!(c.boxed().rel(), 31);
+    assert_eq!(c.borrowed(&RelImpl), 32);
+    assert_eq!(c.lent().0.rel(), 31);
+    // `<T>::Item` with `T` = `Range<u32>`.
+    assert_eq!(Q::<::core::ops::Range<u32>>::f(&c, 6), Wrap(6));
+}
