@@ -177,7 +177,7 @@ fn only_the_generics_used_are_required() {
         entries(&referrer),
         [entry(
             parse_quote!(Wrap<'a, 'b, T, B>),
-            parse_quote!(<'a, 'b, T, const B: bool>)
+            parse_quote!(<'a, 'b, T: 'a + 'b, const B: bool>)
         )]
     );
 

@@ -1,0 +1,15 @@
+[package]
+name = "type-leak-test-outlives"
+version = "0.0.0"
+edition = "2018"
+publish = false
+description = "Crate failing to compile with E0309 in the Repeater's implementations, for tests/outlives.rs"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+type-leak-test-macro = { path = "../macro" }
+
+# Built on its own by tests/outlives.rs.
+[workspace]

@@ -195,9 +195,10 @@ fn references_imply_outlives_bounds() {
             fn f(&self) -> &'a mut Rel<T>;
         }
     });
+    // The bound is on the parameter (`T: 'a`), where it is encoded, and not on the referent.
     assert_eq!(
         entries(&referrer),
-        [e("& 'a mut Rel < T >", "< 'a , T > where Rel < T > : 'a")]
+        [e("& 'a mut Rel < T >", "< 'a , T : 'a >")]
     );
     // Not for a referent which does not mention a type parameter.
     let referrer = leak_trait(parse_quote! {
@@ -408,7 +409,7 @@ fn parameters_are_ordered_by_kind() {
         entries(&referrer),
         [e(
             "Wrap < 'b , 'a , N , U , T >",
-            "< 'a , 'b , T , U , const N : usize >"
+            "< 'a , 'b , T : 'a + 'b , U : 'a + 'b , const N : usize >"
         )]
     );
 }

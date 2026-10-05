@@ -1,8 +1,8 @@
 //! The definition of the Repeater trait, and encoding generics into its const slots.
 
 use crate::encode::{
-    const_param_primitive, encode_generics_args_with_params, normalize_const_arg,
-    with_trailing_comma, EncodeError,
+    const_param_primitive, encode_generics_args_with_params, encode_outlives_bounds,
+    normalize_const_arg, params_as_args, with_trailing_comma, EncodeError,
 };
 use proc_macro2::Span;
 use syn::punctuated::Punctuated;
@@ -88,7 +88,11 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
 /// encoded into a tuple type: a lifetime `'a` as `&'a ()`, a type `T` as `T` and a `const N: usize`
 /// as `[(); N]`. A const parameter of another primitive type is encoded as a trait object of the
 /// Repeater with the corresponding slot filled, e.g. `*const dyn path::Repeater<(), 0, 0, B, Type =
-/// ()>` for `const B: bool`, and `const X: u64` uses the `ID` parameter.
+/// ()>` for `const B: bool`, and `const X: u64` uses the `ID` parameter. The lifetime bounds of the
+/// parameters follow them: `T: 'a` as `&'a T`, and `'b: 'a` as `&'a &'b ()` (see
+/// [`encode_generics_params_to_ty_with()`](crate::encode_generics_params_to_ty_with())). The
+/// Repeater's `impl` declares the generics without these bounds, which its header implies: see
+/// [`Referrer::impl_generics()`](crate::Referrer::impl_generics()).
 ///
 /// ```
 /// # use type_leak::*;
@@ -118,6 +122,18 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
 ///     *const dyn crate::Repeater<(), 0, 0, true, Type = ()>,
 ///     *const dyn crate::Repeater<(), 0, 0, false, 'z', Type = ()>
 /// ));
+/// assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
+///
+/// // A lifetime bound is encoded after the parameters, with the arguments substituted.
+/// let generics: Generics = parse_quote!(<'a, T: 'a>);
+/// let ty = slots.encode_generics_params_to_ty(&generics.params).unwrap();
+/// let expected: Type = parse_quote!((&'a (), T, &'a T));
+/// assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
+/// let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8>);
+/// let ty = slots
+///     .encode_generics_args_to_ty(&args.args, &generics.params)
+///     .unwrap();
+/// let expected: Type = parse_quote!((&'static (), u8, &'static u8));
 /// assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -157,7 +173,12 @@ impl RepeaterSlots {
     }
 
     /// Encodes [`GenericParam`]s into a type, like
-    /// [`encode_generics_params_to_ty()`](crate::encode_generics_params_to_ty()).
+    /// [`encode_generics_params_to_ty()`](crate::encode_generics_params_to_ty()), including the
+    /// lifetime bounds of the parameters, which follow the parameters (`T: 'a` as `&'a T`, and
+    /// `'b: 'a` as `&'a &'b ()`, see
+    /// [`encode_generics_params_to_ty_with()`](crate::encode_generics_params_to_ty_with())). The
+    /// `impl` declares the generics without these bounds (see
+    /// [`Referrer::impl_generics()`](crate::Referrer::impl_generics())).
     ///
     /// Returns [`EncodeError::UnsupportedConstType`] if the type of a const parameter is not a
     /// primitive type.
@@ -165,8 +186,9 @@ impl RepeaterSlots {
         &self,
         iter: impl IntoIterator<Item = &'a GenericParam>,
     ) -> std::result::Result<Type, EncodeError> {
-        let elems = iter
-            .into_iter()
+        let params: Vec<&GenericParam> = iter.into_iter().collect();
+        let mut elems = params
+            .iter()
             .map(|param| -> std::result::Result<Type, EncodeError> {
                 Ok(match param {
                     GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
@@ -179,6 +201,8 @@ impl RepeaterSlots {
                 })
             })
             .collect::<std::result::Result<Punctuated<Type, Token![,]>, _>>()?;
+        // The arguments are the parameters themselves, which cannot fail.
+        elems.extend(encode_outlives_bounds(&params, &params_as_args(&params))?);
         Ok(Type::Tuple(TypeTuple {
             paren_token: Default::default(),
             elems: with_trailing_comma(elems),
@@ -202,9 +226,15 @@ impl RepeaterSlots {
     ///   `= MyType<N>` would not resolve in the Referrer's context); otherwise the arguments
     ///   should be given explicitly.
     /// - Associated item bindings and constraints (e.g. `Item = u8`) are skipped.
+    /// - The lifetime bounds of `params` are encoded after the parameters, with the arguments
+    ///   substituted: `T: 'a` with the arguments `'static` and `u8` is `&'static u8`, and `'b: 'a`
+    ///   is `&'a &'b ()`.
     ///
     /// Returns [`EncodeError`] if the type of a const parameter is not a primitive type, if there
-    /// are too many arguments, or if an argument without a default is missing.
+    /// are too many arguments, if an argument without a default is missing, or if the argument of
+    /// a type with a lifetime bound is a trait object without a lifetime bound (its lifetime bound
+    /// defaults to that of the reference `&'a dyn Tr` it is encoded in, not to that of the other
+    /// elements: write it, e.g. `dyn Tr + 'static`, see [`EncodeError::UnboundedTraitObject`]).
     pub fn encode_generics_args_to_ty<'a>(
         &self,
         iter: impl IntoIterator<Item = &'a GenericArgument>,

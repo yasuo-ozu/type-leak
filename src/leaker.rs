@@ -2,11 +2,11 @@
 
 use crate::analyze::{Analysis, AnalyzeVisitor, CheckResult};
 use crate::config::LeakerConfig;
+use crate::context::{Context, ContextId, Contexts};
 use crate::error::NotInternableError;
 use crate::graph::{NodeKey, TypeGraph};
 use crate::referrer::Referrer;
-use crate::requirements::{ContextId, Contexts, Requirements};
-use crate::util::{generic_param_name, path_starts_with, token_names};
+use crate::util::{generic_param_name, path_starts_with, token_names, unwrap_type_group};
 use proc_macro2::{Span, TokenStream};
 use safegraph::algo::max_flow::edmonds_karp_with_flows;
 use safegraph::graph::Graph;
@@ -54,7 +54,7 @@ pub struct Leaker {
     /// The nodes of the types to be interned, computed from `types` by [`Leaker::reduce_roots()`]
     /// (`None` if not computed yet, or outdated).
     reachable_types: Option<Vec<NodeKey>>,
-    /// The requirements of the types found (see [`Referrer::context()`](crate::Referrer::context())),
+    /// The contexts of the types found (see [`Referrer::context()`](crate::Referrer::context())),
     /// and the generics of the calls of [`Leaker::intern_with()`].
     contexts: Contexts,
     /// The top-level contexts of the successful calls of [`Leaker::intern_with()`] (see there),
@@ -180,7 +180,7 @@ impl Leaker {
     ///
     /// A relative path resolves in the module where it is written, so a leaked type depending on
     /// one (e.g. `Rel` in `mod m` and in `mod m::inner`, where `use super::super::Rel;` may
-    /// import another one), or whose requirements do (what `Self` means, or a bound of its
+    /// import another one), or whose context does (what `Self` means, or a bound of its
     /// generics, mentioning a path which is not absolute, `crate::` or `$crate`), or which is a
     /// type macro, is keyed by the path of that module, relative to `input` (`[]` for
     /// `input` itself, as opposed to a type which depends on no module), together with its generics (see [`Referrer::context_module()`]). The
@@ -312,27 +312,27 @@ impl Leaker {
     ///
     /// `generics` are the generics of the Leaker, which the Repeater's implementations declare
     /// (the ones a type uses, see [`Referrer::generics()`](crate::Referrer::generics())). A type
-    /// found is keyed by its tokens and its requirements: the generics it uses (resolved through
+    /// found is keyed by its tokens and its context: the generics it uses (resolved through
     /// their bounds and where predicates, with those of `generics` as the outermost scope) and
     /// what `Self` means if it mentions it. So the same type found by several calls (whatever
-    /// the other generics of the calls are) is shared if its requirements are equal, and it is a
+    /// the other generics of the calls are) is shared if its contexts are equal, and it is a
     /// separate entry otherwise (see [`Referrer::context()`](crate::Referrer::context())).
     /// Nothing is added if an error is returned.
     ///
     /// Returns the top-level context of the call: the [`ContextId`] of `generics` (in the canonical
-    /// form of the requirements, so without the defaults, and the bounds sorted and moved to the
+    /// form of a context, so without the defaults, and the bounds sorted and moved to the
     /// parameters), with no `Self` and no module. It identifies the generics of the call itself
     /// (e.g. of the trait), whereas the entries are in the contexts of the generics they actually
     /// use (see [`Referrer::context()`](crate::Referrer::context())), which may differ: `Rel` in
-    /// `trait Tr<T> { fn f(&self) -> Rel; }` is in the context of no generics. The two are
-    /// the same context if the requirements are exactly equal (e.g. the generics of `Wrap<T>` in
-    /// `struct S<T> { a: Wrap<T> }` are those of `S`), and a call with the same generics returns
-    /// the same id as another one. Ids are assigned in the order of the first appearance of the
-    /// requirements (those of the call, after those of the types it found), and they are the ones
-    /// the [`Referrer`] uses.
+    /// `trait Tr<T> { fn f(&self) -> Rel; }` is in the context of no generics. The two are the
+    /// same context if the generics (with no `Self` and no module) are exactly equal (e.g. the
+    /// generics of `Wrap<T>` in `struct S<T> { a: Wrap<T> }` are those of `S`), and a call with
+    /// the same generics returns the same id as another one. Ids are assigned in the order of
+    /// the first appearance of the contexts (that of the call, after those of the types it
+    /// found), and they are the ones the [`Referrer`] uses.
     ///
-    /// The [`Referrer`] has the requirements of the top-level context of every successful call,
-    /// also if no entry is in it (see
+    /// The [`Referrer`] has the top-level context of every successful call, also if no entry is
+    /// in it (see
     /// [`Referrer::contexts()`](crate::Referrer::contexts())): its generics are given by
     /// [`Referrer::context_generics()`](crate::Referrer::context_generics()). A failed call
     /// takes no id.
@@ -390,9 +390,7 @@ impl Leaker {
             self.reachable_types = None;
         }
         // The generics of the call, in the same context as an entry which requires exactly them.
-        let top_level = self
-            .contexts
-            .intern(Requirements::new(generics.clone(), None));
+        let top_level = self.contexts.intern(Context::new(generics.clone(), None));
         self.top_levels.insert(top_level);
         Ok(top_level)
     }
@@ -405,8 +403,7 @@ impl Leaker {
     /// Finish building the [`Leaker`] and convert it into [`Referrer`].
     ///
     /// The types are reduced by [`Leaker::reduce_roots()`] (called here if needed), and sorted by
-    /// their context (the contexts are numbered in the order of the first appearance of their
-    /// requirements) and tokens, so the result (including the index of each type) is
+    /// their context (the contexts are numbered in the order of their first appearance) and tokens, so the result (including the index of each type) is
     /// deterministic. The [`ContextId`]s are those returned by [`Leaker::intern_with()`], not
     /// renumbered: the Referrer has the top-level contexts of the calls and the contexts of the
     /// types kept, and no other.
@@ -415,7 +412,7 @@ impl Leaker {
         let keys = self.reachable_types.take().unwrap_or_default();
         let types = self.types;
         let contexts = self.contexts;
-        let mut requirements: BTreeMap<ContextId, Requirements> = self
+        let mut context_map: BTreeMap<ContextId, Context> = self
             .top_levels
             .iter()
             .map(|context| (*context, contexts.get(*context).clone()))
@@ -423,14 +420,14 @@ impl Leaker {
         let mut entries = Vec::new();
         for key in keys {
             let context = key.context;
-            let context_requirements = requirements
+            let ctx = context_map
                 .entry(context)
                 .or_insert_with(|| contexts.get(context).clone());
             let must = types.hard.contains(&key);
-            let crates = external_crates(&key.ty.ty, context_requirements);
+            let crates = external_crates(&key.ty.ty, ctx);
             entries.push((context, key.ty.ty, must, crates));
         }
-        Referrer::new(entries, requirements)
+        Referrer::new(entries, context_map)
     }
 
     /// Reduce nodes to decrease the cost of the [`Leaker`]'s implementation.
@@ -471,11 +468,17 @@ impl Leaker {
     /// Only the nodes of the graph are candidates, and a node is not interned instead of a
     /// reference with a lifetime containing it (`Rel` instead of `&'a Rel`), as the copy of the
     /// reference needs `Rel: 'a`, which cannot be proved of the type interned in its place: such
-    /// a reference is interned as a whole, like a **red** node. So is any type which cannot be
+    /// a reference is interned as a whole, like a **red** node. A trait object is the exception:
+    /// the reference to it needs nothing of its arguments, so `Rel` is interned instead of `&'a
+    /// dyn ::path::Tr<Item = Rel>`. So is any type which cannot be
     /// copied around the types interned in place of its components, so they are not nodes of the
     /// graph (its causes are its own, see [`CheckResult::is_own`]): a path with a lifetime
-    /// argument and a trait object without a lifetime bound as an argument (`Ref<'a, dyn
-    /// Trait>`, where the trait object defaults to `'a` but would be `'static` interned alone), a
+    /// argument or a reference with a lifetime of the generics, and a trait object without a
+    /// lifetime bound as an argument or the referent which has to be
+    /// interned itself (`Ref<'a, dyn RelTrait>` or `&'a dyn RelTrait`, where the trait object
+    /// defaults to `'a` but would be `'static` interned alone; such a trait object is never
+    /// interned alone, but what is inside it is, e.g. `Rel` of `Ref<'a, dyn ::path::Tr<Item =
+    /// Rel>>`), a
     /// path with a bare identifier written as an argument (`Wrap<SIZE>`, where syn parses a const
     /// as a type, so it may be one, and it cannot be interned alone) and a type with a type in an
     /// expression (`[u8; size_of::<Big>()]`, where the copy would have a projection in an
@@ -670,18 +673,22 @@ impl Leaker {
     /// reference with a lifetime requires its referent to outlive it (e.g. `Rel<T>: 'a` for
     /// `&'a Rel<T>`, or `Rel: 'static`), which holds for the type itself but cannot be proved of
     /// the type which is interned in its place.
+    ///
+    /// A trait object (also inside parentheses and groups) is not affected: it outlives the
+    /// lifetime if its own lifetime bound does, whatever its arguments are, and the copy keeps it
+    /// in the reference, so it keeps the bound it defaults to (`'a` for `&'a dyn Trait`). If the
+    /// trait object has to be interned itself, it cannot be alone, as its default would be
+    /// `'static`: the analysis makes the reference the type to intern then, so it has no
+    /// components (see `Inherits::Reference`). With `'static`, the default is the same alone.
     fn needs_parent(&self, parent: &NodeKey) -> bool {
-        let mut ty = &parent.ty.ty;
-        while let Type::Paren(TypeParen { elem, .. }) | Type::Group(TypeGroup { elem, .. }) = ty {
-            ty = elem;
-        }
-        matches!(
-            ty,
+        match unwrap_type_group(&parent.ty.ty) {
             Type::Reference(TypeReference {
                 lifetime: Some(_),
+                elem,
                 ..
-            })
-        )
+            }) => !matches!(unwrap_type_group(elem), Type::TraitObject(_)),
+            _ => false,
+        }
     }
 }
 
@@ -801,10 +808,10 @@ fn without_defaults(generics: &Generics, n: usize) -> Generics {
 }
 
 /// Returns the sorted names of the external crates (other than `core`) named by the absolute
-/// paths (`::name::..`) in `ty` and `requirements` (the generics and what `Self` means), without
+/// paths (`::name::..`) in `ty` and `context` (the generics and what `Self` means), without
 /// `r#` (e.g. `async` for `::r#async::X`).
-fn external_crates(ty: &Type, requirements: &Requirements) -> Vec<String> {
-    use crate::requirements::SelfRequirement;
+fn external_crates(ty: &Type, context: &Context) -> Vec<String> {
+    use crate::context::SelfRequirement;
     use proc_macro2::TokenTree;
     use syn::ext::IdentExt;
     use syn::visit::Visit;
@@ -860,8 +867,8 @@ fn external_crates(ty: &Type, requirements: &Requirements) -> Vec<String> {
     }
     let mut finder = Finder::default();
     finder.visit_type(ty);
-    finder.visit_generics(requirements.generics());
-    match requirements.self_ty() {
+    finder.visit_generics(context.generics());
+    match context.self_ty() {
         Some(SelfRequirement::Bound(path)) => finder.visit_path(path),
         Some(SelfRequirement::Type(ty)) => finder.visit_type(ty),
         _ => (),

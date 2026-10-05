@@ -142,7 +142,9 @@ fn lifetimes_trait_objects_and_projections() {
 }
 
 /// A trait object without a lifetime bound, as an argument of a path with a lifetime (`Ref<'a, dyn
-/// RelTr>`), takes the lifetime from the path, so it is leaked together with the path.
+/// RelTr>`), takes the lifetime from the path, so it is leaked together with the path if it has to
+/// be (it names a relative trait). Otherwise only what is inside it is leaked, and the copy keeps
+/// the trait object where it is.
 #[test]
 fn trait_object_inheriting_the_path_lifetime() {
     use std::cell::RefCell;
@@ -158,6 +160,11 @@ fn trait_object_inheriting_the_path_lifetime() {
     let boxed: Box<dyn RelTr> = Box::new(RelImpl);
     let cell = RefCell::new(boxed);
     assert_eq!(c.boxed(cell.borrow()), 35);
+    let cell = RefCell::new(Box::new(RelImpl));
+    let r = ::core::cell::Ref::map(cell.borrow(), |b| {
+        b as &dyn ::core::ops::Deref<Target = RelImpl>
+    });
+    assert_eq!(c.inside(r), 36);
 }
 
 /// A bare identifier as an argument, which syn parses as a type, may be a const: it is not leaked

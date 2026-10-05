@@ -6,25 +6,25 @@ extern crate proc_macro;
 
 mod analyze;
 mod config;
+mod context;
 mod encode;
 mod error;
 mod graph;
 mod leaker;
 mod referrer;
 mod repeater;
-mod requirements;
 mod util;
 
 pub use syn;
 
 pub use crate::analyze::CheckResult;
 pub use crate::config::LeakerConfig;
+pub use crate::context::{ContextId, SelfRequirement};
 pub use crate::encode::{
     encode_generics_args_to_ty_with, encode_generics_params_to_ty,
-    encode_generics_params_to_ty_with, EncodeError,
+    encode_generics_params_to_ty_with, without_encoded_bounds, EncodeError,
 };
 pub use crate::error::NotInternableError;
 pub use crate::leaker::Leaker;
 pub use crate::referrer::{Referrer, Visitor};
 pub use crate::repeater::{repeater_definition, RepeaterSlots};
-pub use crate::requirements::{ContextId, SelfRequirement};

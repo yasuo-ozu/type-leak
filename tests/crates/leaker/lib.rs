@@ -400,7 +400,8 @@ pub mod s {
 
     /// A trait object whose lifetime bound defaults to the lifetime of the path it is an argument
     /// of (`Ref<'a, T: 'a>`), so it must not be leaked alone (it would be `dyn RelTr + 'static`):
-    /// the path is leaked as a whole.
+    /// the path is leaked as a whole if the trait object has to be (it names a relative trait),
+    /// and what is inside it is leaked otherwise (the copy keeps the trait object where it is).
     #[leak(
         helper = crate::__macro,
         repeater = crate::Repeater,
@@ -413,6 +414,9 @@ pub mod s {
         fn bound(&self, x: ::core::cell::Ref<'a, dyn RelTr + 'a>) -> u32;
         /// Not the argument of the path, so it defaults to `'static`.
         fn boxed(&self, x: ::core::cell::Ref<'a, ::std::boxed::Box<dyn RelTr>>) -> u32;
+        /// Nothing of the trait object itself is relative: only `RelImpl` is leaked.
+        fn inside(&self, x: ::core::cell::Ref<'a, dyn ::core::ops::Deref<Target = RelImpl>>)
+            -> u32;
     }
 
     impl<'a> PathDyn<'a> for Inner {
@@ -427,6 +431,32 @@ pub mod s {
         }
         fn boxed(&self, x: ::core::cell::Ref<'a, ::std::boxed::Box<dyn RelTr>>) -> u32 {
             x.rel() + 4
+        }
+        fn inside(
+            &self,
+            x: ::core::cell::Ref<'a, dyn ::core::ops::Deref<Target = RelImpl>>,
+        ) -> u32 {
+            ::core::ops::Deref::deref(&*x).rel() + 5
+        }
+    }
+
+    // The leaked types of `PathDyn`, checked when this crate is compiled.
+    type_leak_test_macro::check_leak! {
+        {
+            ::core::cell::Ref<'a, dyn RelTr>,
+            ::core::cell::Ref<'a, (dyn RelTr)>,
+            dyn RelTr + 'a,
+            dyn RelTr,
+            RelImpl
+        }
+        { }
+        trait PathDynLeaks<'a> {
+            fn path(&self, x: ::core::cell::Ref<'a, dyn RelTr>) -> u32;
+            fn paren(&self, x: ::core::cell::Ref<'a, (dyn RelTr)>) -> u32;
+            fn bound(&self, x: ::core::cell::Ref<'a, dyn RelTr + 'a>) -> u32;
+            fn boxed(&self, x: ::core::cell::Ref<'a, ::std::boxed::Box<dyn RelTr>>) -> u32;
+            fn inside(&self, x: ::core::cell::Ref<'a, dyn ::core::ops::Deref<Target = RelImpl>>)
+                -> u32;
         }
     }
 

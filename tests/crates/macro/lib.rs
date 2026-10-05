@@ -19,7 +19,9 @@
 //! The generics each leaked type uses (those of the trait and those of its methods, see
 //! [`Referrer::generics()`]) are encoded into the Repeater's trait arguments with
 //! [`RepeaterSlots`], so the Repeater (defined by [`repeater_definition()`]) is the only item
-//! shared by the Leaker and the Referrer.
+//! shared by the Leaker and the Referrer. The lifetime bounds in them (`T: 'a`) are encoded too
+//! (`&'a T`), so the Repeater's implementations declare the generics without them, as
+//! [`Referrer::impl_generics()`] returns them.
 //!
 //! In the Referrer's crate, `MyTrait!` implements `MyTrait` for a wrapper by forwarding each
 //! method to the field `.0`, with the types in the signatures rewritten by the [`Referrer`]:
@@ -304,16 +306,25 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let marker: Type = parse_quote!(__S);
     let replaced: Vec<(Type, Generics)> = referrer.iter_with_self(&marker).collect();
     for (ix, (ty, generics)) in referrer.iter_with_generics().enumerate() {
-        let (ty, generics) = match referrer.context_self(referrer.context(ix)) {
+        let context = referrer.context(ix);
+        let (ty, generics) = match referrer.context_self(context) {
             Some(SelfRequirement::Bound(_)) => (&replaced[ix].0, &replaced[ix].1),
             _ => (ty, generics),
         };
         let encoded = slots
             .encode_generics_params_to_ty(&generics.params)
             .map_err(Error::from)?;
-        let impl_params: Vec<_> = generics.params.iter().collect();
+        // The lifetime bounds in the trait arguments are implied by the header, so they are not
+        // declared. For `Bound`, `generics` has `Self` replaced (see `iter_with_self()`).
+        let impl_params: Vec<GenericParam> = match referrer.context_self(context) {
+            Some(SelfRequirement::Bound(_)) => without_encoded_bounds(generics),
+            _ => referrer.impl_generics(context),
+        }
+        .params
+        .into_iter()
+        .collect();
         let predicates = generics.where_clause.iter().flat_map(|wc| wc.predicates.iter());
-        let header = match referrer.context_self(referrer.context(ix)) {
+        let header = match referrer.context_self(context) {
             Some(SelfRequirement::Bound(path)) => quote! {
                 impl<#(#impl_params,)* __S: ?::core::marker::Sized + #module::#path>
                     #repeater<#encoded, #id, #ix> for __S

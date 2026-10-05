@@ -29,7 +29,7 @@ pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> {
 }
 ```
 
-`ID` identifies the Leaker (e.g. a hash of the path of the trait), and `NTH` is the index of a leaked type of the `Referrer`, so that each type reference is distinguished through the common Repeater. `T` encodes the generics the type reference uses (see `encode_generics_params_to_ty()` and `RepeaterSlots`).
+`ID` identifies the Leaker (e.g. a hash of the path of the trait), and `NTH` is the index of a leaked type of the `Referrer`, so that each type reference is distinguished through the common Repeater. `T` encodes the generics the type reference uses and their lifetime bounds (see `encode_generics_params_to_ty()` and `RepeaterSlots`).
 
 The Leaker is a user-defined type (an enum, a struct, ...) or a trait definition. `type-leak` analyzes it (`Leaker::intern_with()` and its relatives) to find all type references which depend on its type context: relative paths, `Self`, the generics of the Leaker, ... Each of them is an entry of the `Referrer` (`Leaker::finish()`), with an index.
 
@@ -72,9 +72,9 @@ impl<T, S: ?Sized> path::to::Repeater<(T,), 42, 1> for S {
 <Self as path::to::Repeater<(u8,), 42, 1>>::Type
 ```
 
-The arguments at the use site are given by `Referrer::generic_args()`: a generic of the type named like a parameter of the Leaker takes the argument of the implementation (completed with the defaults by `Referrer::complete_args()`), and any other generic (e.g. a generic of a method) is passed by its own name, which is in scope where the signature is copied. The bounds and where predicates of the generics used (transitively) are declared by the implementation, in a canonical form (`Referrer::generics()`).
+The arguments at the use site are given by `Referrer::generic_args()`: a generic of the type named like a parameter of the Leaker takes the argument of the implementation (completed with the defaults by `Referrer::complete_args()`), and any other generic (e.g. a generic of a method) is passed by its own name, which is in scope where the signature is copied. The bounds and where predicates of the generics used (transitively) are declared by the implementation, in a canonical form (`Referrer::generics()`), except for the lifetime bounds (see "Outlives bounds" below): `Referrer::impl_generics()` returns the generics to declare.
 
-If the type mentions `Self` (`Rel<Self>`, `Self::Item`, ...), what `Self` means is part of the requirements too (`SelfRequirement`, `Referrer::context_self()`): `Self` is the implementor of the trait (`Self: MyLeaker<T, U>`, the trait parameters are then used by the type), or a type (a struct, an enum, a union or the self type of an impl), or the visited type of an `intern_with()` call which is not an item. The implementation is for the implementor, bounded by the trait, for the type, or for any type respectively:
+If the type mentions `Self` (`Rel<Self>`, `Self::Item`, ...), what `Self` means is part of the context too (`SelfRequirement`, `Referrer::context_self()`): `Self` is the implementor of the trait (`Self: MyLeaker<T, U>`, the trait parameters are then used by the type), or a type (a struct, an enum, a union or the self type of an impl), or the visited type of an `intern_with()` call which is not an item. The implementation is for the implementor, bounded by the trait, for the type, or for any type respectively:
 
 ```rust,ignore
 // `Rel<Self>` in `trait MyLeaker<T, U>`
@@ -120,9 +120,33 @@ The Referrer's copy uses `<Self as path::to::Repeater<.., 42, N>>::Type`, where 
 
 `repeater_definition()` generates this Repeater with additional const parameters, which are used to encode const generics (see below).
 
-Each type reference is an entry of the `Referrer`, whose context (`Referrer::context()`) is the `ContextId` of its requirements (the generics it uses and `Self`, and the module with `Leaker::from_module()`). The id is assigned by the Leaker when the requirements first appear, and never renumbered. `Leaker::intern_with()` and `Leaker::from_struct()` and its relatives return the top-level context of the call, the id of its own generics (e.g. those of the trait), which may differ from the generics the entries use (`Rel` in `trait MyLeaker<T> { fn f(&self) -> Rel; }` uses none): it is the same context if an entry uses exactly the generics of the call (`MyWrap<T>` in `struct S<T> { a: MyWrap<T> }`), and the `Referrer` keeps it (`Referrer::contexts()`, `Referrer::context_generics()`) also if no entry is in it, while the id of any other context without an entry left by `Leaker::reduce_roots()` is missing. The same type found by several calls of `Leaker::intern_with()` is one entry if the requirements are equal, whatever the other generics of the calls are, and the same tokens with different requirements (e.g. `MyWrap<B>` where `B` is a `bool` in one method and a `u8` in another) are separate entries, and the `Referrer` rewrites each copy to its own (`Referrer::into_visitor()` checks the generics declared where the copy is, `Referrer::into_visitor_with_root()` compares the exact requirements).
+Each type reference is an entry of the `Referrer`, whose context (`Referrer::context()`) is a `ContextId`, which identifies the generics it uses, `Self`, and the module with `Leaker::from_module()`. The id is assigned by the Leaker when the context first appears, and never renumbered. `Leaker::intern_with()` and `Leaker::from_struct()` and its relatives return the top-level context of the call, the id of its own generics (e.g. those of the trait), which may differ from the generics the entries use (`Rel` in `trait MyLeaker<T> { fn f(&self) -> Rel; }` uses none): it is the same context if an entry uses exactly the generics of the call (`MyWrap<T>` in `struct S<T> { a: MyWrap<T> }`), and the `Referrer` keeps it (`Referrer::contexts()`, `Referrer::context_generics()`) also if no entry is in it, while the id of any other context without an entry left by `Leaker::reduce_roots()` is missing. The same type found by several calls of `Leaker::intern_with()` is one entry if the contexts are equal, whatever the other generics of the calls are, and the same tokens in different contexts (e.g. `MyWrap<B>` where `B` is a `bool` in one method and a `u8` in another) are separate entries, and the `Referrer` rewrites each copy to its own (`Referrer::into_visitor()` checks the generics declared where the copy is, `Referrer::into_visitor_with_root()` compares the exact contexts).
 
 The default of a type parameter (`trait MyLeaker<T, U = MyType<T>>`) is written in the Leaker's type context, so it is analyzed with the parameters before it as the generics of the Leaker (it cannot use the later ones, and cannot depend on `Self`), and rewritten on its own by `Referrer::complete_args()` where the Referrer omits the argument.
+
+### Outlives bounds
+
+A type is well-formed only if the outlives bounds it implies hold: `&'a X` requires `X: 'a`, and so does a path with a lifetime argument whose definition says so (`struct Rel<'a, T>(&'a T)` has `T: 'a` inferred, RFC 2093, so `fn f<'a, T>(x: Rel<'a, T>)` implies `T: 'a`). The implementation `impl<'a, T> Repeater<(&'a (), T), 42, 0> for S { type Type = Rel<'a, T>; }` is rejected by rustc (E0309), as is the copy `fn f<'a, T>(x: <Self as Repeater<(&'a (), T), 42, 0>>::Type)`, because `(&'a (), T)` implies nothing about `T: 'a`. So the Leaker adds the bounds a leaked type implies to the bounds of its generics, and the encoders encode each lifetime bound as a reference after the parameters, which implies it wherever it is written (`&'a T` for `T: 'a`, and `&'a &'b ()` for `'b: 'a`):
+
+```rust,ignore
+// `Rel<'a, T>` has the generics `<'a, T: 'a>`
+impl<'a, T, S: ?Sized> path::to::Repeater<(&'a (), T, &'a T), 42, 4> for S {
+    type Type = path::to::Rel<'a, T>;
+}
+// In the Referrer's copy of `fn f<'a, T>(x: Rel<'a, T>)`
+fn f<'a, T>(x: <Self as path::to::Repeater<(&'a (), T, &'a T), 42, 4>>::Type);
+```
+
+The rule is, for a reference `&'a X` (exact) and for each type argument `X` of a path with a lifetime argument `R<'a, .., X, ..>` (assumed, as we cannot see the definition of `R`), where `'a` is a lifetime parameter (not `'static`, `'_`, or a lifetime of a `for<..>` binder): `T: 'a` for each type parameter `T` mentioned in `X`, and `'b: 'a` for each other lifetime parameter `'b` mentioned in `X`. A trait object is not looked into (`dyn Tr<T> + 'b` outlives `'a` if `'b` does), so only its explicit lifetime bound counts. If the definition of `R` does not require `T: 'a` (`struct Loose<'a, T>(&'a (), T)`), the copy is stricter than the original: a caller with a `T` shorter than `'a` is rejected (E0521, where `'a` cannot be shortened). The bounds written in the Leaker (`fn f<'a, T: 'a>`) are encoded too, and the bounds by other lifetimes (`T: 'static`) are not.
+
+The implementation does not declare the lifetime bounds it encodes (`impl<'a, T>`, not `impl<'a, T: 'a>`): its header implies them, whereas a declared bound is an obligation wherever the implementation is selected, which may not hold at a copy (the assumed `T: 'a` of `Loose<'a, T>`, whose copy `fn f<'a, T>(x: <Self as Repeater<(&'a (), T, &'a T), 42, 4>>::Type)` is rejected with E0309 if the implementation declares `T: 'a`). Declare `Referrer::impl_generics(context)` instead of `Referrer::context_generics(context)` (or `without_encoded_bounds()` for the generics of `Referrer::iter_with_self()`): it removes exactly the bounds the encoders encode, a bound by a lifetime parameter of the generics on a type parameter (`T: 'a`) or a lifetime parameter (`'b: 'a`), and keeps the others (`T: 'static`, a bound by a lifetime which is not a parameter, trait bounds and where predicates).
+
+```rust,ignore
+// The Repeater's implementation in the Leaker's crate
+let params = referrer.impl_generics(context).params;   // `'a, T` for `<'a, T: 'a>`
+let encoded = slots.encode_generics_params_to_ty(&referrer.context_generics(context).params)?;
+quote! { impl<#(#params,)* __S: ?Sized> Repeater<#encoded, #ID, #ix> for __S { type Type = #ty; } }
+```
 
 # Const generics
 
@@ -131,8 +155,8 @@ those declared on trait methods, are treated like type parameters: a type that u
 `[MyType; N]` or `MyWrap<B>` in `fn f<const B: bool>()`) is interned together with the generics it
 uses, which the Repeater's implementation declares and constrains in its trait arguments (see
 above), so the Repeater needs a type parameter to carry them (e.g. `Repeater<T: ?Sized, const
-INDEX: usize>`). The bounds of the generics may mention `Self`, which the requirements of the type
-describe.
+INDEX: usize>`). The bounds of the generics may mention `Self`, which the context of the type
+describes.
 
 Known limitations, due to the stable Rust type system:
 
@@ -171,9 +195,9 @@ Known limitations, due to the stable Rust type system:
 
 # Limitations of the analysis
 
-- The outlives bounds that a signature implies are added to the generics of an entry only for references: `&'a T` makes `T: 'a` part of the bounds the type uses. The other implied bounds (e.g. `Wrapper<'a, T>` whose definition requires `T: 'a`) are not, so the Repeater's implementation may need the bound written in the Leaker.
-- A `dyn Trait` borrowed through an elided or method-local lifetime (`&dyn RelTrait`, or `&'b dyn RelTrait` in a method declaring `'b`) is reported as an error: its object lifetime bound defaults to that of the reference, which the Repeater cannot name, and the error notes the lifetime. A lifetime of the Leaker (e.g. `&'a dyn RelTrait` or `Box<dyn RelTrait + 'a>` in `trait MyLeaker<'a>`) is encoded in the generics, so it works. `&'static dyn RelTrait` and `Box<dyn RelTrait + 'b>` (with the bound written) are fine too.
-- A `dyn Trait` without a lifetime bound as an argument of a path with a lifetime argument (`::core::cell::Ref<'a, dyn RelTrait>`) is treated likewise, because the path may give it its lifetime (`Ref<'a, T: 'a>` makes it `dyn RelTrait + 'a`, whereas the trait object interned alone would be `dyn RelTrait + 'static`): with a lifetime of the Leaker, the whole path is interned (also if its components could be interned on their own); with an elided or method-local lifetime, or in a trait bound (`T: ::path::to::Tr<'a, dyn RelTrait>`), it is an error. `::path::to::Wrap<'static, dyn RelTrait>` and `::core::cell::Ref<'a, Box<dyn RelTrait>>` (not an argument of the path) are not affected.
+- The outlives bounds that a type implies (see "Outlives bounds") are those of the type leaked, not of the types around it. A type leaked alone inside a type with a lifetime does not carry them: `Rel2<T>` of `::core::cell::Ref<'a, Rel2<T>>` (where `Ref<'a, T: 'a>`) is leaked with the generics `<T>`, and its copy `Ref<'a, <Self as Repeater<(T,), ..>>::Type>` is well-formed in a signature (the original's implied bound is implied there as well), but not in the field of a struct (E0309, the struct needs `T: 'a`). The lifetime arguments of a path are not related to each other (`'b: 'a` of `R<'a, 'b>`), and `Self: 'a` is not encoded.
+- A `dyn Trait` borrowed through an elided or method-local lifetime (`&dyn RelTrait`, or `&'b dyn RelTrait` in a method declaring `'b`) is reported as an error: its object lifetime bound defaults to that of the reference, which the Repeater cannot name, and the error notes the lifetime. A lifetime of the Leaker (e.g. `&'a dyn RelTrait` or `Box<dyn RelTrait + 'a>` in `trait MyLeaker<'a>`) is encoded in the generics, so it works. `&'static dyn RelTrait` and `Box<dyn RelTrait + 'b>` (with the bound written) are fine too. A reference with a lifetime of the Leaker to a trait object is handled like a path with a lifetime: the trait object is not interned alone, but what is inside it is (`Rel` of `&'a dyn ::path::to::Tr<Item = Rel>`, whose copy keeps the reference and the trait object where they are, so it keeps the lifetime bound it defaults to), unless the trait object has to be interned itself (it names a relative trait, `&'a dyn RelTrait`, or a bare identifier in it may be a const, `&'a dyn ::path::to::Tr<SIZE>`), when the whole reference is interned. Unlike the reference to another type (`&'a Rel`, which is interned as a whole, because the copy needs `Rel: 'a`), nothing of the arguments of the trait object is required to outlive the reference.
+- A `dyn Trait` without a lifetime bound as an argument of a path with a lifetime argument (`::core::cell::Ref<'a, dyn RelTrait>`) is treated likewise, because the path may give it its lifetime (`Ref<'a, T: 'a>` makes it `dyn RelTrait + 'a`, whereas the trait object interned alone would be `dyn RelTrait + 'static`): the trait object is never interned alone, but what is inside it can be (`Rel` of `::core::cell::Ref<'a, dyn ::path::to::Tr<Item = Rel>>`, which keeps the trait object where it is, so it keeps its lifetime). If the trait object has to be interned itself (it names a relative trait, `dyn RelTrait`, or a bare identifier in it may be a const, `dyn ::path::to::Tr<SIZE>`), the whole path is interned with a lifetime of the Leaker; with an elided or method-local lifetime, or in a trait bound (`T: ::path::to::Tr<'a, dyn RelTrait>`), it is an error. `::path::to::Wrap<'static, dyn RelTrait>` and `::core::cell::Ref<'a, Box<dyn RelTrait>>` (not an argument of the path) are not affected.
 
 # Application
 

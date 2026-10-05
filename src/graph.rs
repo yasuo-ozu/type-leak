@@ -1,6 +1,6 @@
 //! The graph of the types found by the analysis.
 
-use crate::requirements::ContextId;
+use crate::context::ContextId;
 use safegraph::collection::IndexKey;
 use safegraph::graph::Graph;
 use safegraph::raw_graph::linked_adj_edge::{EdgeRepr, LinkedAdjEdgeGraph, NodeRepr};
@@ -73,12 +73,12 @@ impl std::fmt::Display for TypeKey {
 /// entry).
 ///
 /// Equal keys are the same leaked type, which is shared by all its occurrences, whichever call of
-/// [`Leaker::intern_with()`](crate::Leaker::intern_with()) found them. The same tokens with
-/// different requirements, i.e. in different contexts (see
-/// [`Referrer::context()`](crate::Referrer::context())), are separate entries.
+/// [`Leaker::intern_with()`](crate::Leaker::intern_with()) found them. The same tokens in
+/// different contexts (see [`Referrer::context()`](crate::Referrer::context())) are separate
+/// entries.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct NodeKey {
-    /// The context of the requirements of the type (see `Contexts`).
+    /// The context of the type (see `Contexts`).
     pub(crate) context: ContextId,
     pub(crate) ty: TypeKey,
 }
