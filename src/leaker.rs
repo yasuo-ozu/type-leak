@@ -5,13 +5,13 @@ use crate::config::LeakerConfig;
 use crate::error::NotInternableError;
 use crate::graph::{NodeKey, TypeGraph};
 use crate::referrer::Referrer;
-use crate::requirements::{Contexts, Requirements};
+use crate::requirements::{ContextId, Contexts, Requirements};
 use crate::util::{generic_param_name, path_starts_with, token_names};
 use proc_macro2::{Span, TokenStream};
 use safegraph::algo::max_flow::edmonds_karp_with_flows;
 use safegraph::graph::Graph;
 use safegraph::BTreeGraph;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::quote;
@@ -54,8 +54,12 @@ pub struct Leaker {
     /// The nodes of the types to be interned, computed from `types` by [`Leaker::reduce_roots()`]
     /// (`None` if not computed yet, or outdated).
     reachable_types: Option<Vec<NodeKey>>,
-    /// The requirements of the types found (see [`Referrer::context()`](crate::Referrer::context())).
+    /// The requirements of the types found (see [`Referrer::context()`](crate::Referrer::context())),
+    /// and the generics of the calls of [`Leaker::intern_with()`].
     contexts: Contexts,
+    /// The top-level contexts of the successful calls of [`Leaker::intern_with()`] (see there),
+    /// which the [`Referrer`] keeps even without an entry.
+    top_levels: BTreeSet<ContextId>,
     /// The number of the successful calls of [`Leaker::intern_with()`].
     calls: usize,
     /// Names of primitive types which were assumed to be the primitive types (not shadowed), as
@@ -70,7 +74,8 @@ impl Default for Leaker {
 }
 
 impl Leaker {
-    /// Initialize with [`ItemStruct`]
+    /// Initialize with [`ItemStruct`], and returns its top-level context (see
+    /// [`Leaker::intern_with()`]).
     ///
     /// ```
     /// # use type_leak::*;
@@ -82,26 +87,32 @@ impl Leaker {
     ///         field3: &'a (T1, T2),
     ///     }
     /// );
-    /// let leaker = Leaker::from_struct(&test_struct).unwrap();
+    /// let (leaker, context) = Leaker::from_struct(&test_struct).unwrap();
     /// ```
-    pub fn from_struct(input: &ItemStruct) -> std::result::Result<Self, NotInternableError> {
+    pub fn from_struct(
+        input: &ItemStruct,
+    ) -> std::result::Result<(Self, ContextId), NotInternableError> {
         let mut leaker = Self::new();
-        leaker.intern_with(&input.generics, |visitor| {
+        let context = leaker.intern_with(&input.generics, |visitor| {
             visitor.visit_item_struct(input);
         })?;
-        Ok(leaker)
+        Ok((leaker, context))
     }
 
-    /// Initialize with [`ItemEnum`]
-    pub fn from_enum(input: &ItemEnum) -> std::result::Result<Self, NotInternableError> {
+    /// Initialize with [`ItemEnum`], and returns its top-level context (see
+    /// [`Leaker::intern_with()`]).
+    pub fn from_enum(
+        input: &ItemEnum,
+    ) -> std::result::Result<(Self, ContextId), NotInternableError> {
         let mut leaker = Self::new();
-        leaker.intern_with(&input.generics, |visitor| {
+        let context = leaker.intern_with(&input.generics, |visitor| {
             visitor.visit_item_enum(input);
         })?;
-        Ok(leaker)
+        Ok((leaker, context))
     }
 
-    /// Initialize with [`ItemUnion`]
+    /// Initialize with [`ItemUnion`], and returns its top-level context (see
+    /// [`Leaker::intern_with()`]).
     ///
     /// ```
     /// # use syn::*;
@@ -112,18 +123,22 @@ impl Leaker {
     ///         b: MyType,
     ///     }
     /// };
-    /// let referrer = Leaker::from_union(&u).unwrap().finish();
+    /// let (leaker, _context) = Leaker::from_union(&u).unwrap();
+    /// let referrer = leaker.finish();
     /// assert_eq!(referrer.iter().collect::<Vec<_>>(), [&parse_quote!(MyType)]);
     /// ```
-    pub fn from_union(input: &ItemUnion) -> std::result::Result<Self, NotInternableError> {
+    pub fn from_union(
+        input: &ItemUnion,
+    ) -> std::result::Result<(Self, ContextId), NotInternableError> {
         let mut leaker = Self::new();
-        leaker.intern_with(&input.generics, |visitor| {
+        let context = leaker.intern_with(&input.generics, |visitor| {
             visitor.visit_item_union(input);
         })?;
-        Ok(leaker)
+        Ok((leaker, context))
     }
 
-    /// Build a [`Leaker`] from a given trait.
+    /// Build a [`Leaker`] from a given trait, and returns its top-level context (see
+    /// [`Leaker::intern_with()`]).
     ///
     /// ```
     /// # use syn::*;
@@ -135,15 +150,18 @@ impl Leaker {
     /// };
     /// let _ = Leaker::from_trait(&s);
     /// ```
-    pub fn from_trait(input: &ItemTrait) -> std::result::Result<Self, NotInternableError> {
+    pub fn from_trait(
+        input: &ItemTrait,
+    ) -> std::result::Result<(Self, ContextId), NotInternableError> {
         let mut leaker = Self::new();
-        leaker.intern_with(&input.generics, |visitor| {
+        let context = leaker.intern_with(&input.generics, |visitor| {
             visitor.visit_item_trait(input);
         })?;
-        Ok(leaker)
+        Ok((leaker, context))
     }
 
-    /// Initialize [`Leaker`] from a module.
+    /// Initialize [`Leaker`] from a module, and returns its top-level context (see
+    /// [`Leaker::intern_with()`]), which is that of no generics.
     ///
     /// The module has no generics, and every item in it (structs, enums, unions, traits, type
     /// aliases, functions, impls and nested modules) is a nested item, so its generics are local
@@ -180,15 +198,20 @@ impl Leaker {
     ///         pub type A = Rel2;
     ///     }
     /// };
-    /// let referrer = Leaker::from_module(&m).unwrap().finish();
+    /// let (leaker, context) = Leaker::from_module(&m).unwrap();
+    /// let referrer = leaker.finish();
     /// assert_eq!(referrer.iter().count(), 2);
+    /// // The module has no generics.
+    /// assert!(referrer.context_generics(context).params.is_empty());
     /// ```
-    pub fn from_module(input: &ItemMod) -> std::result::Result<Self, NotInternableError> {
+    pub fn from_module(
+        input: &ItemMod,
+    ) -> std::result::Result<(Self, ContextId), NotInternableError> {
         let mut leaker = Self::new();
-        leaker.intern_with(&Generics::default(), |visitor| {
+        let context = leaker.intern_with(&Generics::default(), |visitor| {
             visitor.visit_item_mod(input);
         })?;
-        Ok(leaker)
+        Ok((leaker, context))
     }
 
     /// Initialize empty [`Leaker`] with no generics.
@@ -200,6 +223,7 @@ impl Leaker {
             types: TypeGraph::default(),
             reachable_types: None,
             contexts: Contexts::default(),
+            top_levels: BTreeSet::new(),
             calls: 0,
             assumed_primitives: Vec::new(),
         }
@@ -214,6 +238,7 @@ impl Leaker {
             types: TypeGraph::default(),
             reachable_types: None,
             contexts: Contexts::default(),
+            top_levels: BTreeSet::new(),
             calls: 0,
             assumed_primitives: Vec::new(),
         }
@@ -238,7 +263,7 @@ impl Leaker {
     /// # use type_leak::*;
     /// # use syn::*;
     /// let item: ItemTrait = parse_quote!(trait MyTrait<const N: u8> {});
-    /// let leaker = Leaker::from_trait(&item).unwrap();
+    /// let (leaker, _) = Leaker::from_trait(&item).unwrap();
     /// assert!(leaker
     ///     .assertions()
     ///     .to_string()
@@ -294,6 +319,24 @@ impl Leaker {
     /// separate entry otherwise (see [`Referrer::context()`](crate::Referrer::context())).
     /// Nothing is added if an error is returned.
     ///
+    /// Returns the top-level context of the call: the [`ContextId`] of `generics` (in the canonical
+    /// form of the requirements, so without the defaults, and the bounds sorted and moved to the
+    /// parameters), with no `Self` and no module. It identifies the generics of the call itself
+    /// (e.g. of the trait), whereas the entries are in the contexts of the generics they actually
+    /// use (see [`Referrer::context()`](crate::Referrer::context())), which may differ: `Rel` in
+    /// `trait Tr<T> { fn f(&self) -> Rel; }` is in the context of no generics. The two are
+    /// the same context if the requirements are exactly equal (e.g. the generics of `Wrap<T>` in
+    /// `struct S<T> { a: Wrap<T> }` are those of `S`), and a call with the same generics returns
+    /// the same id as another one. Ids are assigned in the order of the first appearance of the
+    /// requirements (those of the call, after those of the types it found), and they are the ones
+    /// the [`Referrer`] uses.
+    ///
+    /// The [`Referrer`] has the requirements of the top-level context of every successful call,
+    /// also if no entry is in it (see
+    /// [`Referrer::contexts()`](crate::Referrer::contexts())): its generics are given by
+    /// [`Referrer::context_generics()`](crate::Referrer::context_generics()). A failed call
+    /// takes no id.
+    ///
     /// `Self` is the implementor of the visited trait, or the visited struct, enum, union or the
     /// self type of the visited impl (see [`SelfRequirement`](crate::SelfRequirement)). Outside
     /// any item (e.g. if only a type is visited), it is the `n`-th call (counting the successful
@@ -310,7 +353,7 @@ impl Leaker {
         &mut self,
         generics: &Generics,
         f: F,
-    ) -> std::result::Result<&mut Self, NotInternableError>
+    ) -> std::result::Result<ContextId, NotInternableError>
     where
         F: FnOnce(&mut dyn syn::visit::Visit<'ast>),
     {
@@ -346,7 +389,12 @@ impl Leaker {
             self.types.merge(analysis.types);
             self.reachable_types = None;
         }
-        Ok(self)
+        // The generics of the call, in the same context as an entry which requires exactly them.
+        let top_level = self
+            .contexts
+            .intern(Requirements::new(generics.clone(), None));
+        self.top_levels.insert(top_level);
+        Ok(top_level)
     }
 
     /// Checks whether the given `ty` must be interned, and whether it can be. See [`CheckResult`].
@@ -358,24 +406,29 @@ impl Leaker {
     ///
     /// The types are reduced by [`Leaker::reduce_roots()`] (called here if needed), and sorted by
     /// their context (the contexts are numbered in the order of the first appearance of their
-    /// requirements, and renumbered without those of the types removed) and tokens, so the result
-    /// (including the index of each type) is deterministic.
+    /// requirements) and tokens, so the result (including the index of each type) is
+    /// deterministic. The [`ContextId`]s are those returned by [`Leaker::intern_with()`], not
+    /// renumbered: the Referrer has the top-level contexts of the calls and the contexts of the
+    /// types kept, and no other.
     pub fn finish(mut self) -> Referrer {
         self.reduce_roots();
         let keys = self.reachable_types.take().unwrap_or_default();
         let types = self.types;
-        // Renumber the contexts of the types kept (the keys are sorted by context).
-        let mut renumbered: Vec<usize> = Vec::new();
-        let mut requirements: Vec<Requirements> = Vec::new();
+        let contexts = self.contexts;
+        let mut requirements: BTreeMap<ContextId, Requirements> = self
+            .top_levels
+            .iter()
+            .map(|context| (*context, contexts.get(*context).clone()))
+            .collect();
         let mut entries = Vec::new();
         for key in keys {
-            if renumbered.last() != Some(&key.context) {
-                renumbered.push(key.context);
-                requirements.push(self.contexts.get(key.context).clone());
-            }
+            let context = key.context;
+            let context_requirements = requirements
+                .entry(context)
+                .or_insert_with(|| contexts.get(context).clone());
             let must = types.hard.contains(&key);
-            let crates = external_crates(&key.ty.ty, &requirements[requirements.len() - 1]);
-            entries.push((requirements.len() - 1, key.ty.ty, must, crates));
+            let crates = external_crates(&key.ty.ty, context_requirements);
+            entries.push((context, key.ty.ty, must, crates));
         }
         Referrer::new(entries, requirements)
     }

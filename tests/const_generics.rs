@@ -53,7 +53,7 @@ fn test_const_generic_param_in_expr() {
     let item: ItemStruct = parse_quote! {
         struct S<const N: usize> { a: [RelType; N], b: [::core::primitive::u8; N] }
     };
-    let mut leaker = Leaker::from_struct(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
     // The element is interned (the innermost minimum cut), and the array is rebuilt around it.
     let expected: Type = parse_quote!(RelType);
@@ -67,14 +67,14 @@ fn test_const_generic_param_in_expr() {
 fn test_const_generic_param_ty_not_interned() {
     // The type of a const parameter cannot be a projection, so it must not be interned.
     let item: ItemStruct = parse_quote! { struct S<const N: usize, const B: bool>; };
-    let mut leaker = Leaker::from_struct(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
     assert!(leaker.finish().is_empty());
 
     let item: ItemTrait = parse_quote! {
         trait MyTrait { fn f<const M: ::core::primitive::u8>(&self); }
     };
-    let mut leaker = Leaker::from_trait(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_trait(&item).unwrap();
     leaker.reduce_roots();
     assert!(leaker.finish().is_empty());
 
@@ -94,7 +94,7 @@ fn test_method_local_generics_not_interned() {
             fn i<const M: usize>(&self) -> [::core::primitive::u8; M];
         }
     };
-    let mut leaker = Leaker::from_trait(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_trait(&item).unwrap();
     leaker.reduce_roots();
     assert_eq!(
         finish_as_strings(leaker),
@@ -121,7 +121,7 @@ fn test_local_generics_leaked() {
             fn h<'c>(&self, x: MyHolder<'c>, y: [RelType; 2]);
         }
     };
-    let mut leaker = Leaker::from_trait(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_trait(&item).unwrap();
     leaker.reduce_roots();
     let referrer = leaker.finish();
     let actual: BTreeSet<(String, String)> = referrer
@@ -162,7 +162,7 @@ fn test_local_generics_keep_self() {
             fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> MyWrap<T>;
         }
     };
-    let mut leaker = Leaker::from_trait(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_trait(&item).unwrap();
     leaker.reduce_roots();
     let referrer = leaker.finish();
     let (ty, generics) = referrer.iter_with_generics().next().unwrap();

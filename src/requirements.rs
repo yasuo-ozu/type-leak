@@ -5,12 +5,13 @@ use crate::util::{
     generic_param_mentions_self, generic_param_name, ident_name, token_names, type_mentions_self,
     where_predicate_mentions_self,
 };
-use proc_macro2::TokenStream;
+use proc_macro2::{Literal, TokenStream};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::*;
-use template_quote::quote;
+use template_quote::{quote, ToTokens};
 
 /// The generics declared at one level: those of the Leaker (the outermost level), or those inside
 /// it, e.g. declared by a trait method, a GAT, a nested item or a `for<..>` binder.
@@ -383,39 +384,108 @@ impl std::hash::Hash for Requirements {
     }
 }
 
+/// The identifier of a context: a distinct set of requirements of the leaked types (the generics
+/// a type uses, what `Self` means in it, and its module), see
+/// [`Referrer::context()`](crate::Referrer::context()). It identifies the generics of a call of
+/// [`Leaker::intern_with()`](crate::Leaker::intern_with()) too, as its top-level context.
+///
+/// The entries of a [`Referrer`](crate::Referrer) whose Repeater impls are written the same way
+/// (they declare the same generics, are for the same `Self` and in the same module) have the same
+/// id, also if they were found by different calls of
+/// [`Leaker::intern_with()`](crate::Leaker::intern_with()). An id is assigned when the
+/// requirements first appear in the [`Leaker`](crate::Leaker), counting from 0, and it is never
+/// renumbered: it is the same in the value returned by
+/// [`Leaker::intern_with()`](crate::Leaker::intern_with()) and in the
+/// [`Referrer`](crate::Referrer) (see [`Referrer::contexts()`](crate::Referrer::contexts())),
+/// where the ids of the contexts which have no entry left (and are not top-level) do not appear
+/// (so they may have gaps).
+///
+/// It is written as an integer literal (e.g. `3`) by [`ToTokens`], and parsed from one (with the
+/// suffix `usize` or without any) by [`Parse`].
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// # use template_quote::ToTokens;
+/// let (_, id) = Leaker::from_struct(&parse_quote!(struct S { a: Rel })).unwrap();
+/// assert_eq!(id.to_string(), "0");
+/// assert_eq!(id.to_token_stream().to_string(), "0");
+/// assert_eq!(parse_str::<ContextId>("0usize").unwrap(), id);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContextId(usize);
+
+impl ContextId {
+    pub(crate) fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    /// Returns the number of the id, counting from 0 in the order in which the requirements first
+    /// appear in the [`Leaker`](crate::Leaker).
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ContextId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl ToTokens for ContextId {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        Literal::usize_unsuffixed(self.0).to_tokens(tokens)
+    }
+}
+
+impl Parse for ContextId {
+    fn parse(input: ParseStream) -> Result<Self> {
+        let lit: LitInt = input.parse()?;
+        if !matches!(lit.suffix(), "" | "usize") {
+            return Err(Error::new(
+                lit.span(),
+                "a context id is an integer, with no suffix or `usize`",
+            ));
+        }
+        Ok(Self(lit.base10_parse()?))
+    }
+}
+
 /// The distinct [`Requirements`] of the leaked types, which are the contexts of the types (see
 /// [`Referrer::context()`](crate::Referrer::context())), numbered from 0 in the order of their
-/// first appearance.
+/// first appearance. The number of a context is never changed by the calls which follow, as the
+/// contexts are only added (but for those of a failed call, see [`Contexts::truncate()`]).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Contexts {
-    numbers: HashMap<Requirements, usize>,
+    ids: HashMap<Requirements, ContextId>,
     list: Vec<Requirements>,
 }
 
 impl Contexts {
-    /// Returns the number of `requirements`, which is added if it is new.
-    pub(crate) fn intern(&mut self, requirements: Requirements) -> usize {
-        if let Some(number) = self.numbers.get(&requirements) {
-            return *number;
+    /// Returns the id of `requirements`, which is added if it is new.
+    pub(crate) fn intern(&mut self, requirements: Requirements) -> ContextId {
+        if let Some(id) = self.ids.get(&requirements) {
+            return *id;
         }
-        let number = self.list.len();
-        self.numbers.insert(requirements.clone(), number);
+        let id = ContextId(self.list.len());
+        self.ids.insert(requirements.clone(), id);
         self.list.push(requirements);
-        number
+        id
     }
 
     pub(crate) fn len(&self) -> usize {
         self.list.len()
     }
 
-    pub(crate) fn get(&self, number: usize) -> &Requirements {
-        &self.list[number]
+    pub(crate) fn get(&self, id: ContextId) -> &Requirements {
+        &self.list[id.0]
     }
 
     /// Removes the contexts numbered `len` or more (added after `len()` returned `len`).
     pub(crate) fn truncate(&mut self, len: usize) {
         for requirements in self.list.drain(len..) {
-            self.numbers.remove(&requirements);
+            self.ids.remove(&requirements);
         }
     }
 }

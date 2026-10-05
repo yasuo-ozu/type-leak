@@ -1,5 +1,6 @@
 //! The graph of the types found by the analysis.
 
+use crate::requirements::ContextId;
 use safegraph::collection::IndexKey;
 use safegraph::graph::Graph;
 use safegraph::raw_graph::linked_adj_edge::{EdgeRepr, LinkedAdjEdgeGraph, NodeRepr};
@@ -77,8 +78,8 @@ impl std::fmt::Display for TypeKey {
 /// [`Referrer::context()`](crate::Referrer::context())), are separate entries.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct NodeKey {
-    /// The number of the requirements of the type (see `Contexts`).
-    pub(crate) context: usize,
+    /// The context of the requirements of the type (see `Contexts`).
+    pub(crate) context: ContextId,
     pub(crate) ty: TypeKey,
 }
 
@@ -88,7 +89,7 @@ impl std::fmt::Display for NodeKey {
     }
 }
 
-// SAFETY: `Eq`, `Ord` and `Hash` are derived from those of the fields (an integer and the tokens,
+// SAFETY: `Eq`, `Ord` and `Hash` are derived from those of the fields (an id and the tokens,
 // each of which is deterministic), so they are consistent with each other, and none of them (nor
 // `Clone`) panics.
 unsafe impl IndexKey for NodeKey {}
@@ -119,7 +120,7 @@ impl TypeGraph {
     /// its key.
     pub(crate) fn add(
         &mut self,
-        context: usize,
+        context: ContextId,
         ty: &Type,
         parent: Option<&NodeKey>,
         is_must_intern: bool,

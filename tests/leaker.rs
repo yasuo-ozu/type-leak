@@ -14,7 +14,7 @@ fn test_leaker() {
             field3: &'a (T1, T2),
         }
     );
-    let mut leaker = Leaker::from_struct(&test_struct).unwrap();
+    let (mut leaker, _) = Leaker::from_struct(&test_struct).unwrap();
     leaker.reduce_roots();
     let referrer = leaker.finish();
     assert_eq!(
@@ -164,7 +164,7 @@ fn test_finish_reduces_and_accumulates() {
             a: A,
         }
     );
-    let leaker = Leaker::from_struct(&item).unwrap();
+    let (leaker, _) = Leaker::from_struct(&item).unwrap();
     assert_eq!(leaker.finish().iter().count(), 1);
 
     // Several `intern_with()` and `reduce_roots()` calls accumulate.
@@ -204,6 +204,7 @@ fn test_finish_order_is_deterministic() {
     let finish = || -> Vec<String> {
         Leaker::from_struct(&item)
             .unwrap()
+            .0
             .finish()
             .iter()
             .map(|t| quote!(#t).to_string())
@@ -329,7 +330,11 @@ fn test_assertions_for_assumed_primitives() {
             t: T,
         }
     );
-    assert!(Leaker::from_struct(&item).unwrap().assertions().is_empty());
+    assert!(Leaker::from_struct(&item)
+        .unwrap()
+        .0
+        .assertions()
+        .is_empty());
 }
 
 #[test]
@@ -341,7 +346,7 @@ fn test_leaker_from_union() {
             c: (MyType2, u8),
         }
     };
-    let referrer = Leaker::from_union(&item).unwrap().finish();
+    let referrer = Leaker::from_union(&item).unwrap().0.finish();
     assert_eq!(
         referrer
             .iter()
@@ -448,7 +453,11 @@ fn test_grouped_const_param_type_is_asserted() {
     });
     for ty in [parse_quote!(u8), grouped] {
         let item: ItemTrait = parse_quote!(trait Tr<const N: #ty> {});
-        let assertions = Leaker::from_trait(&item).unwrap().assertions().to_string();
+        let assertions = Leaker::from_trait(&item)
+            .unwrap()
+            .0
+            .assertions()
+            .to_string();
         assert!(
             assertions.contains("__type_leak_assert_u8_is_primitive"),
             "{}",
@@ -459,7 +468,7 @@ fn test_grouped_const_param_type_is_asserted() {
     let item: ItemTrait = parse_quote!(
         trait Tr<const N: ::core::primitive::u8> {}
     );
-    assert!(Leaker::from_trait(&item).unwrap().assertions().is_empty());
+    assert!(Leaker::from_trait(&item).unwrap().0.assertions().is_empty());
 }
 
 #[test]

@@ -222,10 +222,12 @@ fn test_contexts() {
         ["RelA", "Wrap < T >", "Wrap < U >"]
     );
     assert_eq!(
-        (0..3).map(|ix| referrer.context(ix)).collect::<Vec<_>>(),
+        (0..3)
+            .map(|ix| referrer.context(ix).index())
+            .collect::<Vec<_>>(),
         [0, 1, 2]
     );
-    assert_eq!(referrer.n_contexts(), 3);
+    assert_eq!(referrer.contexts().count(), 3);
 
     // The contexts survive a round trip through `ToTokens` and `Parse`.
     let tokens = quote!(#referrer);
@@ -238,7 +240,7 @@ fn test_contexts() {
     );
     let parsed: Referrer = parse2(tokens).unwrap();
     assert_eq!(parsed, referrer);
-    assert_eq!(parsed.context(2), 2);
+    assert_eq!(parsed.context(2).index(), 2);
 
     // The generics which are not declared in the visited syntax are assumed to be the Leaker's,
     // so both are rewritten.
@@ -283,8 +285,8 @@ fn test_contexts() {
         })
         .unwrap();
     let referrer = leaker.finish();
-    assert_eq!(referrer.context(0), 0);
-    assert_eq!(referrer.n_contexts(), 2);
+    assert_eq!(referrer.context(0).index(), 0);
+    assert_eq!(referrer.contexts().count(), 2);
     assert_eq!(
         quote!(#referrer).to_string(),
         format!(
@@ -296,7 +298,7 @@ fn test_contexts() {
     assert_eq!(parsed, referrer);
     // Without any type, there is a context for the types which use nothing.
     let referrer = type_leak::Leaker::new().finish();
-    assert_eq!(referrer.n_contexts(), 1);
+    assert_eq!(referrer.contexts().count(), 1);
     assert_eq!(
         quote!(#referrer).to_string(),
         format!("\"{}\" ()", env!("CARGO_PKG_VERSION"))
@@ -352,7 +354,7 @@ fn test_outermost_generics_as_leakers() {
             fn g<const B: bool>(&self) -> Wrap2<B>;
         }
     };
-    let referrer = type_leak::Leaker::from_trait(&tr).unwrap().finish();
+    let referrer = type_leak::Leaker::from_trait(&tr).unwrap().0.finish();
     let rewrite = |item: &Item, outermost_as_leakers: bool| {
         let mut item = item.clone();
         let mut visitor = referrer
@@ -410,7 +412,7 @@ fn test_outermost_generics_as_leakers() {
 }
 
 fn referrer_of(tr: ItemTrait) -> Referrer {
-    type_leak::Leaker::from_trait(&tr).unwrap().finish()
+    type_leak::Leaker::from_trait(&tr).unwrap().0.finish()
 }
 
 #[test]
@@ -647,9 +649,9 @@ fn test_module_items_do_not_shadow_submodules() {
             pub mod inner { use super::Rel; pub struct C { y: Rel } }
         }
     };
-    let referrer = type_leak::Leaker::from_module(&m).unwrap().finish();
-    // Only the `Rel` of `m::inner` is leaked.
-    assert_eq!(referrer.n_contexts(), 1);
+    let referrer = type_leak::Leaker::from_module(&m).unwrap().0.finish();
+    // Only the `Rel` of `m::inner` is leaked (in its context, and the top-level one is another).
+    assert_eq!(referrer.contexts().count(), 2);
     let mut item = Item::Mod(m);
     referrer
         .into_visitor(None, |_, ix| parse_quote!(P<#ix>))

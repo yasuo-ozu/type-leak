@@ -3,10 +3,10 @@
 
 use syn::*;
 use template_quote::quote;
-use type_leak::{Leaker, Referrer};
+use type_leak::{ContextId, Leaker, Referrer};
 
 fn referrer(tr: &ItemTrait) -> Referrer {
-    Leaker::from_trait(tr).unwrap().finish()
+    Leaker::from_trait(tr).unwrap().0.finish()
 }
 
 fn s(x: &impl template_quote::ToTokens) -> String {
@@ -59,16 +59,20 @@ fn test_default_requirements() {
             fn f(&self) -> RelC;
         }
     };
-    let referrer = referrer(&tr);
+    let (leaker, top_level) = Leaker::from_trait(&tr).unwrap();
+    let referrer = leaker.finish();
     // The contexts are the requirements of the types, numbered in the order of their first
     // appearance: nothing (`RelB`, `RelW` and `RelC`) and `Rel<T>` (the default of `U`, which uses
     // the parameters before it). The default of `V`, `(RelB, U)`, is not interned, as `RelB` is
-    // enough (it is rebuilt around it). The default of `N` is a const.
-    assert_eq!(referrer.n_contexts(), 2);
+    // enough (it is rebuilt around it), so its context 2 (`<.., U: ::p::Late>`) is not in the
+    // Referrer. The default of `N` is a const. The last context is the top-level one, the
+    // generics of the trait, which no type uses exactly.
+    assert_eq!(referrer.contexts().count(), 3);
+    assert_eq!(top_level.index(), 3);
     let leaked: Vec<_> = referrer
         .iter()
         .enumerate()
-        .map(|(ix, ty)| (referrer.context(ix), s(ty)))
+        .map(|(ix, ty)| (referrer.context(ix).index(), s(ty)))
         .collect();
     assert_eq!(
         leaked,
@@ -79,25 +83,33 @@ fn test_default_requirements() {
             (1, "Rel < T >".to_string()),
         ]
     );
-    let generics = |c: usize| {
+    let contexts: Vec<ContextId> = referrer.contexts().collect();
+    let generics = |c: ContextId| {
         let generics = referrer.context_generics(c);
         s(&quote!(#generics #{&generics.where_clause}))
     };
-    assert_eq!(generics(0), "");
+    assert_eq!(generics(contexts[0]), "");
     // The bounds of `T` (also in the where clause) and the predicates mentioning it are used.
     assert_eq!(
-        generics(1),
+        generics(contexts[1]),
         s(&parse_generics(
             quote!(<T: ::core::clone::Clone + ::p::Conv<RelW>>)
         ))
     );
-    assert!((0..2).all(|c| referrer.context_self(c).is_none()));
+    // The defaults are removed, and the bounds are moved to the parameters.
+    assert_eq!(
+        generics(top_level),
+        s(&parse_generics(quote!(
+            <'a, T: ::core::clone::Clone + ::p::Conv<RelW>, U: ::p::Late, V, const N: usize>
+        )))
+    );
+    assert!(contexts.iter().all(|c| referrer.context_self(*c).is_none()));
 
     // The round trip keeps the requirements.
     let tokens = quote!(#referrer);
     let parsed: Referrer = parse2(tokens).unwrap();
     assert_eq!(parsed, referrer);
-    for context in 0..2 {
+    for context in referrer.contexts() {
         assert_eq!(
             s(parsed.context_generics(context)),
             s(referrer.context_generics(context))
@@ -117,9 +129,14 @@ fn test_default_is_shared_with_the_items() {
             fn f(&self, t: T) -> Rel<T>;
         }
     );
-    let referrer = referrer(&tr);
+    let (leaker, top_level) = Leaker::from_trait(&tr).unwrap();
+    let referrer = leaker.finish();
     assert_eq!(referrer.iter().count(), 1);
-    assert_eq!(referrer.n_contexts(), 1);
+    // The entry uses `T` only, whereas the generics of the trait are `<T, U>`.
+    assert_eq!(referrer.contexts().count(), 2);
+    assert_ne!(referrer.context(0), top_level);
+    assert_eq!(referrer.context_generics(top_level).params.len(), 2);
+    assert_eq!(referrer.generics(0).params.len(), 1);
 }
 
 #[test]
@@ -162,7 +179,7 @@ fn test_default_cannot_depend_on_self() {
 }
 
 fn referrer_of(tr: &ItemTrait) -> Referrer {
-    Leaker::from_trait(tr).unwrap().finish()
+    Leaker::from_trait(tr).unwrap().0.finish()
 }
 
 #[test]
@@ -178,12 +195,12 @@ fn test_defaults_of_several_calls_are_shared() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker
+    let top_plain = leaker
         .intern_with(&plain.generics, |v| {
             syn::visit::Visit::visit_item_struct(v, &plain)
         })
         .unwrap();
-    leaker
+    let top_tr = leaker
         .intern_with(&tr.generics, |v| {
             syn::visit::Visit::visit_item_trait(v, &tr)
         })
@@ -200,10 +217,13 @@ fn test_defaults_of_several_calls_are_shared() {
         ))
         .is_err());
     let referrer = leaker.finish();
-    // The types use no generics, so they are in one context, whichever call found them.
+    // The types use no generics, so they are in one context, whichever call found them, and the
+    // generics of the calls (without the defaults) are two other contexts without entries.
     assert_eq!(referrer.iter().count(), 2);
-    assert_eq!(referrer.n_contexts(), 1);
+    assert_eq!(referrer.contexts().count(), 3);
     assert_eq!(referrer.generics(0).params.len(), 0);
+    assert_eq!(referrer.context_generics(top_plain).params.len(), 1);
+    assert_eq!(referrer.context_generics(top_tr).params.len(), 2);
     // The default is copied (nothing in it is leaked), as in any call.
     let completed = referrer
         .complete_args(

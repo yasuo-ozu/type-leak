@@ -73,7 +73,7 @@ fn self_predicates_are_requirements() {
         )]
     );
     assert!(matches!(
-        referrer.context_self(0),
+        referrer.context_self(referrer.context(0)),
         Some(SelfRequirement::Bound(_))
     ));
 

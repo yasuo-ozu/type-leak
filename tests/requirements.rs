@@ -71,19 +71,25 @@ fn types_are_shared_by_calls() {
         }
     );
     let mut leaker = Leaker::new();
-    for item in [&a, &b] {
-        leaker
-            .intern_with(&item.generics, |v| v.visit_item_struct(item))
-            .unwrap();
-    }
+    let tops: Vec<_> = [&a, &b]
+        .iter()
+        .map(|item| {
+            leaker
+                .intern_with(&item.generics, |v| v.visit_item_struct(item))
+                .unwrap()
+        })
+        .collect();
     let referrer = leaker.finish();
     assert_eq!(
         referrer.iter().map(s).collect::<Vec<_>>(),
         ["Rel", "RelA", "RelB < u8 >"]
     );
-    // They use no generics, whichever the generics of the calls are.
-    assert_eq!(referrer.n_contexts(), 1);
+    // They use no generics, whichever the generics of the calls are: the generics of `A` (none)
+    // are the context of the types, and those of `B` are another context without an entry.
     assert_eq!(referrer.generics(0).params.len(), 0);
+    assert_eq!(referrer.contexts().count(), 2);
+    assert_eq!(tops[0], referrer.context(0));
+    assert_eq!(referrer.context_generics(tops[1]).params.len(), 1);
 }
 
 #[test]
@@ -121,8 +127,11 @@ fn equal_requirements_are_shared_and_different_ones_are_not() {
             entry(parse_quote!(Wrap<T>), parse_quote!(<const T: usize>)),
         ]
     );
-    assert_eq!(referrer.n_contexts(), 2);
-    assert_eq!((referrer.context(0), referrer.context(1)), (0, 1));
+    assert_eq!(referrer.contexts().count(), 2);
+    assert_eq!(
+        (referrer.context(0).index(), referrer.context(1).index()),
+        (0, 1)
+    );
     // The bounds are different.
     let referrer = leak(&[
         call("<T: ::core::clone::Clone>"),
@@ -221,8 +230,9 @@ fn self_of_a_trait() {
             "-"
         ]
     );
-    // The two types are in one context.
-    assert_eq!(referrer.n_contexts(), 2);
+    // The two types are in one context, and the generics of the trait (without `Self`) are
+    // another one.
+    assert_eq!(referrer.contexts().count(), 3);
     assert_eq!(referrer.context(0), referrer.context(1));
     assert!(referrer.has_self());
 
@@ -257,7 +267,8 @@ fn self_in_different_traits_is_different() {
         ["Rel < Self >", "Rel2", "Rel < Self >"]
     );
     assert_eq!(selfs(&referrer), ["Self: X < T >", "-", "Self: Y < T >"]);
-    assert_eq!(referrer.n_contexts(), 3);
+    // The generics of the traits are the same (`<T>`), so the calls share their top-level context.
+    assert_eq!(referrer.contexts().count(), 4);
 
     // The same trait twice is shared.
     let tr: ItemTrait = parse_quote!(
@@ -358,7 +369,7 @@ fn self_of_a_module_is_that_of_its_items() {
             pub trait Tr { fn f(&self) -> Rel2<Self>; }
         }
     };
-    let referrer = Leaker::from_module(&m).unwrap().finish();
+    let referrer = Leaker::from_module(&m).unwrap().0.finish();
     assert_eq!(selfs(&referrer), ["Self = S < T >", "Self: Tr"]);
     assert_eq!(
         entries(&referrer),
@@ -803,7 +814,9 @@ fn node_numbers_follow_the_first_appearance() {
         ["Rel1", "Rel2", "Wrap < T >"]
     );
     assert_eq!(
-        (0..3).map(|ix| referrer.context(ix)).collect::<Vec<_>>(),
+        (0..3)
+            .map(|ix| referrer.context(ix).index())
+            .collect::<Vec<_>>(),
         [0, 0, 1]
     );
 }

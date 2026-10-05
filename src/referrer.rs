@@ -2,13 +2,13 @@
 
 use crate::encode::{complete_generics_args, EncodeError};
 use crate::graph::TypeKey;
-use crate::requirements::{Requirements, Scope, SelfRequirement};
+use crate::requirements::{ContextId, Requirements, Scope, SelfRequirement};
 use crate::util::{
     first_self_in_generics, generic_param_name, mentions_names, token_names, type_mentions_self,
 };
 use proc_macro2::TokenStream;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use syn::ext::IdentExt;
 use syn::parse::Parse;
@@ -25,15 +25,17 @@ use template_quote::{quote, ToTokens};
 ///
 /// Each type is an entry, identified by its tokens and its requirements: the generics it uses
 /// (see [`Referrer::generics()`]) and, if it mentions `Self`, what `Self` means (see
-/// [`SelfRequirement`]). The requirements are shared by the entries of a context (see
-/// [`Referrer::context()`]). The same tokens with different requirements (e.g. `Wrap<B>` where
-/// `B` is a `bool` in one method and a `u8` in another) are separate entries, and the one a copy
-/// refers to is found by resolving the generics in scope where it appears.
+/// [`SelfRequirement`]). The requirements are shared by the entries of a context, identified by a
+/// [`ContextId`] (see [`Referrer::context()`]). The Referrer has the contexts of the generics of
+/// the calls of [`Leaker::intern_with()`](crate::Leaker::intern_with()) too (the top-level
+/// contexts), also if no entry is in them. The same tokens with different requirements (e.g.
+/// `Wrap<B>` where `B` is a `bool` in one method and a `u8` in another) are separate entries, and
+/// the one a copy refers to is found by resolving the generics in scope where it appears.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Referrer {
     pub(crate) leak_types: Vec<Type>,
     /// The context of each entry (see [`Referrer::context()`]).
-    pub(crate) contexts: Vec<usize>,
+    pub(crate) contexts: Vec<ContextId>,
     /// Whether each entry is required (see [`Referrer::must()`]).
     pub(crate) musts: Vec<bool>,
     /// The sorted names of the external crates each entry requires (see
@@ -42,8 +44,11 @@ pub struct Referrer {
     /// The external crates available to the Referrer's crate, if known (see
     /// [`Referrer::with_available_external_crates()`]). Not serialized.
     pub(crate) available_external_crates: Option<Vec<String>>,
-    /// The requirements of each context, which are distinct (see [`Referrer::context_generics()`]).
-    pub(crate) requirements: Vec<Requirements>,
+    /// The requirements of each context, which are distinct (see [`Referrer::context_generics()`]):
+    /// those of the contexts of the entries and the top-level contexts of the calls of the Leaker
+    /// (which may have no entry). The keys are the ids of the contexts, which may have gaps (see
+    /// [`Referrer::contexts()`]).
+    pub(crate) requirements: BTreeMap<ContextId, Requirements>,
     /// The candidates of a type, keyed by [`TypeKey`] (by tokens) as in the Leaker, so that e.g. a
     /// type wrapped in an invisible group is found as well.
     pub(crate) map: HashMap<TypeKey, Vec<usize>>,
@@ -83,14 +88,15 @@ impl Matching<'_> {
 impl Referrer {
     /// Builds a Referrer from its entries (the context, the type, whether it is required and the
     /// external crates it requires), in the order of their indices, and the requirements of the
-    /// contexts, which are distinct. There is at least one context, and one for each context of
-    /// the entries.
+    /// contexts, which are distinct. There is at least one context (the context 0 of the types
+    /// which use no generics, if there are no contexts at all), and one for each context of the
+    /// entries; the others have no entry.
     pub(crate) fn new(
-        entries: impl IntoIterator<Item = (usize, Type, bool, Vec<String>)>,
-        mut requirements: Vec<Requirements>,
+        entries: impl IntoIterator<Item = (ContextId, Type, bool, Vec<String>)>,
+        mut requirements: BTreeMap<ContextId, Requirements>,
     ) -> Self {
         if requirements.is_empty() {
-            requirements.push(Requirements::none());
+            requirements.insert(ContextId::new(0), Requirements::none());
         }
         let mut referrer = Self {
             leak_types: Vec::new(),
@@ -131,7 +137,7 @@ impl Referrer {
         let candidates = self.map.get(&TypeKey::new(ty))?;
         let mut best: Option<(usize, usize, usize)> = None;
         for &ix in candidates {
-            let entry = &self.requirements[self.contexts[ix]];
+            let entry = &self.requirements[&self.contexts[ix]];
             if matching.no_self()
                 && (entry.self_ty().is_some() || type_mentions_self(&self.leak_types[ix]))
             {
@@ -371,7 +377,7 @@ impl Referrer {
     /// ```ignore
     /// for (ix, ty) in referrer.iter().enumerate() {
     ///     let c = referrer.context(ix);
-    ///     assert!(referrer.generics(ix).params.is_empty()
+    ///     assert!(referrer.context_generics(c).params.is_empty()
     ///         && referrer.context_self(c).is_none()
     ///         && referrer.context_module(c).is_none());
     ///     quote!(impl<__S: ?Sized> #repeater<(), #id, #ix> for __S { type Type = #ty; })
@@ -459,24 +465,53 @@ impl Referrer {
         self.context_generics(self.contexts[ix])
     }
 
-    /// Returns the context of the `ix`-th type: the number of its requirements, i.e. of the
+    /// Returns the context of the `ix`-th type: the [`ContextId`] of its requirements, i.e. of the
     /// generics it uses and what `Self` means in it (see [`Referrer::generics()`] and
     /// [`Referrer::context_self()`]). The entries with equal requirements are in the same
     /// context, whichever call of [`Leaker::intern_with()`](crate::Leaker::intern_with()) found
-    /// them, and the contexts are numbered from 0 in the order of their first entry.
-    pub fn context(&self, ix: usize) -> usize {
+    /// them.
+    ///
+    /// The ids are those assigned by the [`Leaker`](crate::Leaker) when the requirements first
+    /// appeared (from 0, in that order), and returned by
+    /// [`Leaker::intern_with()`](crate::Leaker::intern_with()): they are not renumbered by
+    /// [`Leaker::finish()`](crate::Leaker::finish()), so the ids of the contexts of the types
+    /// removed by [`Leaker::reduce_roots()`](crate::Leaker::reduce_roots()) are missing here (see
+    /// [`Referrer::contexts()`]).
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let tr: ItemTrait = parse_quote!(trait Tr<T> { fn f(&self, t: T) -> Rel<T>; });
+    /// let (leaker, top_level) = Leaker::from_trait(&tr).unwrap();
+    /// let referrer = leaker.finish();
+    /// // `Rel<T>` uses exactly the generics of the trait.
+    /// assert_eq!(top_level, referrer.context(0));
+    /// ```
+    pub fn context(&self, ix: usize) -> ContextId {
         self.contexts[ix]
     }
 
-    /// Returns the number of contexts (at least 1). There is no context without entries unless
-    /// there are no entries at all, when it is the context of the types which use no generics.
-    pub fn n_contexts(&self) -> usize {
-        self.requirements.len()
+    /// Returns the contexts in ascending order, the arguments for
+    /// [`Referrer::context_generics()`], [`Referrer::context_self()`] and
+    /// [`Referrer::context_module()`]: the contexts of the entries (see [`Referrer::context()`]),
+    /// and the top-level contexts returned by
+    /// [`Leaker::intern_with()`](crate::Leaker::intern_with()) and the other methods of the
+    /// [`Leaker`](crate::Leaker) analyzing an item, which have no entry if none of the types
+    /// leaked uses exactly the generics of the item. The other ids are missing, so there may be
+    /// gaps: a context of which [`Leaker::reduce_roots()`](crate::Leaker::reduce_roots()) keeps
+    /// no type is not here, unless it is a top-level context.
+    ///
+    /// There is at least one context: if there are no others, it is the context 0 of the types
+    /// which use no generics.
+    pub fn contexts(&self) -> impl Iterator<Item = ContextId> + '_ {
+        self.requirements.keys().copied()
     }
 
     /// Returns the generics which the types of `context` use, in the form to be declared by the
     /// Repeater's implementation of an entry in `context`, which must encode exactly their
-    /// parameters in its trait arguments. See [`Referrer::generics()`].
+    /// parameters in its trait arguments. See [`Referrer::generics()`]. For the top-level context
+    /// of a call of [`Leaker::intern_with()`](crate::Leaker::intern_with()), they are the generics
+    /// of the call (without the defaults), also if no type uses exactly them.
     ///
     /// ```
     /// # use type_leak::*;
@@ -485,18 +520,29 @@ impl Referrer {
     ///     fn f<const B: bool>(&self, t: T) -> Wrap<B>;
     ///     fn g(&self) -> Rel2;
     /// });
-    /// let referrer = Leaker::from_trait(&tr).unwrap().finish();
+    /// let (leaker, top_level) = Leaker::from_trait(&tr).unwrap();
+    /// let referrer = leaker.finish();
     /// // `Wrap<B>` uses `B`, `Rel2` uses nothing and `Rel<T>` (the default of `U`) uses `T`, in
-    /// // the order of their first appearance.
-    /// assert_eq!(referrer.n_contexts(), 3);
-    /// let used: Vec<usize> = (0..3).map(|c| referrer.context_generics(c).params.len()).collect();
-    /// assert_eq!(used, [1, 0, 1]);
+    /// // the order of their first appearance, and then there are the generics of the trait
+    /// // `<T, U>`, which no type uses exactly.
+    /// assert_eq!(referrer.contexts().count(), 4);
+    /// let used: Vec<usize> = referrer
+    ///     .contexts()
+    ///     .map(|c| referrer.context_generics(c).params.len())
+    ///     .collect();
+    /// assert_eq!(used, [1, 0, 1, 2]);
+    /// assert_eq!(referrer.context_generics(top_level).params.len(), 2);
     /// ```
-    pub fn context_generics(&self, context: usize) -> &Generics {
-        self.requirements[context].generics()
+    ///
+    /// # Panics
+    ///
+    /// Panics if `context` is not one of the [`Referrer::contexts()`].
+    pub fn context_generics(&self, context: ContextId) -> &Generics {
+        self.requirements[&context].generics()
     }
 
-    /// Returns what `Self` means in the types of `context`, if they mention it.
+    /// Returns what `Self` means in the types of `context`, if they mention it (it is `None` for
+    /// a top-level context, see [`Leaker::intern_with()`](crate::Leaker::intern_with())).
     ///
     /// The Repeater's implementation of an entry in `context` is for the type described: `None`
     /// for any type (`impl<.., __S: ?Sized> Repeater<..> for __S`), [`SelfRequirement::Bound`] for
@@ -516,16 +562,20 @@ impl Referrer {
     /// # use syn::*;
     /// # use template_quote::quote;
     /// let tr: ItemTrait = parse_quote!(trait Tr<T> { fn f(&self) -> Rel<Self>; });
-    /// let referrer = Leaker::from_trait(&tr).unwrap().finish();
-    /// match referrer.context_self(0) {
+    /// let referrer = Leaker::from_trait(&tr).unwrap().0.finish();
+    /// match referrer.context_self(referrer.context(0)) {
     ///     Some(SelfRequirement::Bound(path)) => {
     ///         assert_eq!(quote!(#path).to_string(), "Tr < T >")
     ///     }
     ///     _ => unreachable!(),
     /// }
     /// ```
-    pub fn context_self(&self, context: usize) -> Option<&SelfRequirement> {
-        self.requirements[context].self_ty()
+    ///
+    /// # Panics
+    ///
+    /// Panics if `context` is not one of the [`Referrer::contexts()`].
+    pub fn context_self(&self, context: ContextId) -> Option<&SelfRequirement> {
+        self.requirements[&context].self_ty()
     }
 
     /// Returns the path of the module where the types of `context` are written, relative to the
@@ -539,7 +589,8 @@ impl Referrer {
     /// inside that module (relative to the analyzed module), where the relative paths resolve
     /// like in the original: e.g. an attribute macro on `mod m` can emit them inside `m::inner`.
     /// It is `None` for the other types (e.g. with only absolute paths), which are shared by all
-    /// the modules, and if no module is analyzed.
+    /// the modules, if no module is analyzed, and for a top-level context (see
+    /// [`Leaker::intern_with()`](crate::Leaker::intern_with())).
     ///
     /// ```
     /// # use type_leak::*;
@@ -548,21 +599,30 @@ impl Referrer {
     ///     pub struct A { y: Rel }
     ///     pub mod inner { pub struct C { y: Rel } }
     /// });
-    /// let referrer = Leaker::from_module(&m).unwrap().finish();
-    /// assert_eq!(referrer.n_contexts(), 2);
-    /// assert_eq!(referrer.context_module(0), Some(&[][..]));
+    /// let (leaker, top_level) = Leaker::from_module(&m).unwrap();
+    /// let referrer = leaker.finish();
+    /// let contexts: Vec<ContextId> = referrer.contexts().collect();
+    /// // The module itself, `inner` and the top-level context of the module.
+    /// assert_eq!(contexts.len(), 3);
+    /// assert_eq!(referrer.context_module(contexts[0]), Some(&[][..]));
     /// assert_eq!(
-    ///     referrer.context_module(1),
+    ///     referrer.context_module(contexts[1]),
     ///     Some(&[Ident::new("inner", proc_macro2::Span::call_site())][..])
     /// );
+    /// assert_eq!(referrer.context_module(top_level), None);
     /// ```
-    pub fn context_module(&self, context: usize) -> Option<&[Ident]> {
-        self.requirements[context].module()
+    ///
+    /// # Panics
+    ///
+    /// Panics if `context` is not one of the [`Referrer::contexts()`].
+    pub fn context_module(&self, context: ContextId) -> Option<&[Ident]> {
+        self.requirements[&context].module()
     }
 
     /// Returns `true` if a leaked type, or the generics (the bounds and the where predicates) of
     /// an entry, refers to `Self` (e.g. `Self`, `Self::Item`, `Rel<Self>`, `&Self`, or `<Self as
-    /// ::p::Tr>::X`, but not `::p::Self`).
+    /// ::p::Tr>::X`, but not `::p::Self`). The generics of a top-level context which has no entry
+    /// are not considered.
     ///
     /// Then the Repeater must be implemented for the implementor of the Leaker trait, or the type
     /// `Self` is, where `Self` has the same meaning (see [`Referrer::context_self()`]), and not
@@ -575,16 +635,15 @@ impl Referrer {
     /// # use type_leak::*;
     /// # use syn::*;
     /// let tr: ItemTrait = parse_quote!(trait Tr { fn f(&self) -> Rel<Self>; });
-    /// assert!(Leaker::from_trait(&tr).unwrap().finish().has_self());
+    /// assert!(Leaker::from_trait(&tr).unwrap().0.finish().has_self());
     /// let tr: ItemTrait = parse_quote!(trait Tr { fn f(&self) -> Rel; });
-    /// assert!(!Leaker::from_trait(&tr).unwrap().finish().has_self());
+    /// assert!(!Leaker::from_trait(&tr).unwrap().0.finish().has_self());
     /// ```
     pub fn has_self(&self) -> bool {
         self.leak_types.iter().any(type_mentions_self)
-            || self
-                .requirements
-                .iter()
-                .any(|requirements| first_self_in_generics(requirements.generics()).is_some())
+            || self.contexts.iter().any(|context| {
+                first_self_in_generics(self.requirements[context].generics()).is_some()
+            })
     }
 
     /// Like [`Referrer::iter_with_generics()`], with `Self` replaced by `self_ty` in the types and
@@ -609,7 +668,7 @@ impl Referrer {
     /// # use syn::*;
     /// # use template_quote::quote;
     /// let tr: ItemTrait = parse_quote!(trait Tr { fn f(&self) -> Rel<Self::Item>; });
-    /// let referrer = Leaker::from_trait(&tr).unwrap().finish();
+    /// let referrer = Leaker::from_trait(&tr).unwrap().0.finish();
     /// assert!(referrer.has_self());
     /// let marker: Type = parse_quote!(__S);
     /// for (ix, (ty, _generics)) in referrer.iter_with_self(&marker).enumerate() {
@@ -666,7 +725,7 @@ impl Referrer {
     /// # use template_quote::quote;
     /// // In the Leaker's crate
     /// let tr: ItemTrait = parse_quote!(trait Tr<T, U = Rel<T>> { fn f(&self, t: T) -> U; });
-    /// let referrer = Leaker::from_trait(&tr).unwrap().finish();
+    /// let referrer = Leaker::from_trait(&tr).unwrap().0.finish();
     ///
     /// // In the Referrer's crate (for `impl Tr<u8> for ..`, omitting `U`)
     /// let args: AngleBracketedGenericArguments = parse_quote!(<u8>);
@@ -754,7 +813,7 @@ impl Referrer {
     /// let tr: ItemTrait = parse_quote!(trait Tr<T> {
     ///     fn f<const B: bool>(&self, t: T) -> Wrap<T, B>;
     /// });
-    /// let referrer = Leaker::from_trait(&tr).unwrap().finish();
+    /// let referrer = Leaker::from_trait(&tr).unwrap().0.finish();
     /// // For `impl Tr<u8> for ..`
     /// let completed: Vec<GenericArgument> = vec![parse_quote!(u8)];
     /// let args = referrer.generic_args(0, &tr.generics.params, &completed).unwrap();
@@ -805,7 +864,7 @@ impl Referrer {
         self.leak_types
             .iter()
             .zip(&self.contexts)
-            .map(move |(ty, context)| (ty, self.requirements[*context].generics()))
+            .map(move |(ty, context)| (ty, self.requirements[context].generics()))
     }
 
     /// Converts this `Referrer` into a [`Visitor`] that can be used to transform AST nodes.
@@ -1263,7 +1322,7 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
     /// # use syn::visit_mut::VisitMut;
     /// # use template_quote::quote;
     /// let tr: ItemTrait = parse_quote!(trait Tr { fn f(&self, x: Rel<Self>) -> Self::Out; });
-    /// let referrer = Leaker::from_trait(&tr).unwrap().finish();
+    /// let referrer = Leaker::from_trait(&tr).unwrap().0.finish();
     /// let mut sig: Signature = parse_quote!(fn f(&self, x: Rel<Self>) -> Self::Out);
     /// referrer
     ///     .into_visitor(None, |_, ix| parse_quote!(<Marker<__S> as Repeater<#ix>>::Type))
@@ -1295,7 +1354,7 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
         let contexts = &self.referrer.contexts;
         self.referrer.map.retain(|key, entries| {
             if mentions_names(&key.ty, idents.clone(), Vec::new()) {
-                entries.retain(|&ix| module && requirements[contexts[ix]].module().is_some());
+                entries.retain(|&ix| module && requirements[&contexts[ix]].module().is_some());
             }
             !entries.is_empty()
         });
@@ -1602,13 +1661,16 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Parses a [`Referrer`] serialized with its [`ToTokens`] implementation: the version of
 /// `type-leak` as a string literal, (the number of contexts if it is more than one,) and a group
-/// for each context (see [`Referrer::context()`]): the generics it uses if they are not empty
-/// (the generics and the where clause, followed by `;`, see [`Referrer::context_generics()`]),
+/// for each context (see [`Referrer::context()`]), in ascending order of their ids: the id as `#
+/// n` if it is not the expected one (0 for the first group, and the id of the previous group plus
+/// one for the others, so it is omitted if there are no gaps), the generics it uses if they are not
+/// empty (the generics and the where clause, followed by `;`, see [`Referrer::context_generics()`]),
 /// what `Self` means if it mentions it (`Self: path<args> ;` for a [`SelfRequirement::Bound`],
 /// `Self = Type ;` for a [`SelfRequirement::Type`] or `Self = # n ;` for a
 /// [`SelfRequirement::Call`], see [`Referrer::context_self()`]), the module if the types
-/// depend on one (`mod a::b ;`, or `mod self ;` for the analyzed module itself, see [`Referrer::context_module()`]), and the leaked types in
-/// parentheses. A leaked type may be preceded by `?` if it is not [required](Referrer::must()),
+/// depend on one (`mod a::b ;`, or `mod self ;` for the analyzed module itself, see
+/// [`Referrer::context_module()`]), and the leaked types in parentheses (none for a top-level
+/// context which no type is in, see [`Leaker::intern_with()`](crate::Leaker::intern_with())). A leaked type may be preceded by `?` if it is not [required](Referrer::must()),
 /// and by `@[crate, ..]` if it [requires external crates](Referrer::external_crates_require()),
 /// in this order (e.g. `? @[foo, bar] ::foo::X`); a plain type is required and requires no
 /// crate. The tokens after it are not consumed, so a Referrer can be followed by other tokens. It
@@ -1632,8 +1694,27 @@ impl Parse for Referrer {
             1
         };
         let mut entries = Vec::new();
-        let mut requirements = Vec::new();
-        for context in 0..n_contexts {
+        let mut requirements = BTreeMap::new();
+        // The id of a group without one: 0, and then the one after the previous group.
+        let mut next = 0;
+        for _ in 0..n_contexts {
+            let span = input.span();
+            let context = if input.parse::<Option<Token![#]>>()?.is_some() {
+                let context: ContextId = input.parse()?;
+                if context.index() < next {
+                    return Err(Error::new(
+                        span,
+                        "the ids of the contexts must be in ascending order",
+                    ));
+                }
+                context
+            } else {
+                ContextId::new(next)
+            };
+            next = context
+                .index()
+                .checked_add(1)
+                .ok_or_else(|| Error::new(span, "the id of the context is too large"))?;
             // The generics, if any, are followed by `;`.
             let mut generics = Generics::default();
             if input.peek(Token![<]) || input.peek(Token![where]) {
@@ -1671,7 +1752,10 @@ impl Parse for Referrer {
                 });
                 input.parse::<Token![;]>()?;
             }
-            requirements.push(Requirements::new(generics, self_ty).with_module(module));
+            requirements.insert(
+                context,
+                Requirements::new(generics, self_ty).with_module(module),
+            );
             let content: syn::parse::ParseBuffer<'_>;
             parenthesized!(content in input);
             // Each entry is `[?] [@[crate, ..]] Type`.
@@ -1699,6 +1783,11 @@ impl Parse for Referrer {
     }
 }
 
+/// Returns the token `#`, which cannot be written in `quote!` (it interpolates).
+fn pound() -> proc_macro2::TokenTree {
+    proc_macro2::TokenTree::Punct(proc_macro2::Punct::new('#', proc_macro2::Spacing::Alone))
+}
+
 /// Returns the identifier of the external crate `name` (stored without `r#`), as `r#name` if it is
 /// a keyword, so that it is parsed back as an identifier.
 fn crate_ident(name: &str) -> Ident {
@@ -1711,10 +1800,16 @@ fn crate_ident(name: &str) -> Ident {
 
 /// Serializes the [`Referrer`] (with the version of `type-leak`), to be parsed back with its
 /// [`Parse`] implementation, e.g. in another macro invocation. There is a group for each context
-/// (at least one), preceded by the number of the groups if it is more than one (e.g. `"0.8.0" 2
-/// (MyType) <T> ; (Wrap<T>)`). A group is the leaked types in parentheses, preceded by the
-/// generics which the types of the context use (see [`Referrer::context_generics()`]) and `;` if
-/// they are not empty (e.g. `<T> where T: Clone ; (Wrap<T>)`), and by what `Self` means (see
+/// (at least one, also the top-level ones which have no entry: `()`), in ascending order of
+/// their ids ([`Referrer::contexts()`]), preceded by the
+/// number of the groups if it is more than one (e.g. `"0.8.0" 2 (MyType) <T> ; (Wrap<T>)`). A
+/// group is the leaked types in parentheses, preceded by the id of the context as `# 3`, if it
+/// is not the expected one (0 for the first group, and the id of the previous group plus one for
+/// the others, so the ids are written only where there are gaps: `"0.8.0" 2 (MyType) # 2 <T> ;
+/// (Wrap<T>)` has the contexts 0 and 2, and a Referrer of the context 1 alone is `"0.8.0" # 1
+/// (MyType)`), by the generics which the types of the context use (see
+/// [`Referrer::context_generics()`]) and `;` if they are not empty (e.g. `<T> where T: Clone ;
+/// (Wrap<T>)`), and by what `Self` means (see
 /// [`Referrer::context_self()`]) and `;` if the types mention it (e.g. `Self: MyTrait<T> ;
 /// (Rel<Self>)`, `Self = MyStruct<T> ; (Rel<Self>)` or `Self = # 0 ; (Rel<Self>)`), and by `mod
 /// a::b ;` (or `mod self ;`) if the types depend on their module (see [`Referrer::context_module()`]). An entry
@@ -1726,7 +1821,7 @@ fn crate_ident(name: &str) -> Ident {
 /// # use syn::*;
 /// # use template_quote::{quote, ToTokens};
 /// let item: ItemStruct = parse_quote!(struct S { a: MyType });
-/// let referrer = Leaker::from_struct(&item).unwrap().finish();
+/// let referrer = Leaker::from_struct(&item).unwrap().0.finish();
 /// let tokens = referrer.to_token_stream();
 /// assert_eq!(
 ///     tokens.to_string(),
@@ -1736,14 +1831,21 @@ fn crate_ident(name: &str) -> Ident {
 /// ```
 impl ToTokens for Referrer {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        use proc_macro2::{Literal, Punct, Spacing};
+        use proc_macro2::Literal;
         tokens.extend(quote!(#VERSION));
-        let n_contexts = self.n_contexts();
+        let n_contexts = self.requirements.len();
         if n_contexts > 1 {
             // The number of the groups, so that the Referrer can be followed by other tokens.
             tokens.extend(quote!(#{Literal::usize_unsuffixed(n_contexts)}));
         }
-        for context in 0..n_contexts {
+        // The id of a group which has none written: 0, and then the one after the previous group.
+        let mut next = 0;
+        for context in self.contexts() {
+            if context.index() != next {
+                tokens.extend(Some(pound()));
+                tokens.extend(quote!(#context));
+            }
+            next = context.index() + 1;
             let entries: Vec<_> = self
                 .leak_types
                 .iter()
@@ -1762,10 +1864,7 @@ impl ToTokens for Referrer {
                 Some(SelfRequirement::Type(ty)) => tokens.extend(quote!(Self = #ty ;)),
                 Some(SelfRequirement::Call(n)) => {
                     tokens.extend(quote!(Self =));
-                    tokens.extend(Some(proc_macro2::TokenTree::Punct(Punct::new(
-                        '#',
-                        Spacing::Alone,
-                    ))));
+                    tokens.extend(Some(pound()));
                     tokens.extend(quote!(#{Literal::usize_unsuffixed(*n)} ;));
                 }
             }

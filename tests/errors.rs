@@ -229,7 +229,7 @@ fn limit_shadowed_primitive() {
     .unwrap();
     assert_eq!(leak_trait(&item), Ok(BTreeSet::new()));
 
-    let leaker = Leaker::from_trait(&item).unwrap();
+    let (leaker, _) = Leaker::from_trait(&item).unwrap();
     let expected = quote! {
         #[allow(dead_code, non_snake_case)]
         const _: () = {

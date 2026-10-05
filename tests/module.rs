@@ -22,7 +22,7 @@ fn module() -> ItemMod {
 
 #[test]
 fn from_module_leaks_with_local_generics() {
-    let referrer = Leaker::from_module(&module()).unwrap().finish();
+    let referrer = Leaker::from_module(&module()).unwrap().0.finish();
     assert_eq!(
         referrer
             .iter_with_generics()
@@ -42,7 +42,7 @@ fn from_module_leaks_with_local_generics() {
 
 #[test]
 fn from_module_referrer_rewrites_a_copy() {
-    let referrer = Leaker::from_module(&module()).unwrap().finish();
+    let referrer = Leaker::from_module(&module()).unwrap().0.finish();
     let mut item = module();
     referrer
         .clone()
@@ -80,7 +80,7 @@ fn from_module_errors_and_bodies() {
             pub fn f<T>() -> Rel<T> { let x: RelBody = RelBody::new(); x.into() }
         }
     };
-    let referrer = Leaker::from_module(&m).unwrap().finish();
+    let referrer = Leaker::from_module(&m).unwrap().0.finish();
     assert_eq!(
         referrer
             .iter()
@@ -93,7 +93,7 @@ fn from_module_errors_and_bodies() {
     let m: ItemMod = parse_quote!(
         mod m;
     );
-    assert!(Leaker::from_module(&m).unwrap().finish().is_empty());
+    assert!(Leaker::from_module(&m).unwrap().0.finish().is_empty());
 }
 
 /// Analyzes the module like `Leaker::from_module()`, allowing the primitive types and the
@@ -176,7 +176,7 @@ fn from_module_generics_shadow_module_items() {
     };
     // `S` in `A` is the generic parameter. Local generics are interned with the types depending
     // on them (see `Referrer::generics()`), but `Wrap<S>` is relative either way.
-    let referrer = Leaker::from_module(&m).unwrap().finish();
+    let referrer = Leaker::from_module(&m).unwrap().0.finish();
     assert_eq!(
         referrer
             .iter_with_generics()
@@ -272,11 +272,19 @@ fn modules_of(referrer: &type_leak::Referrer) -> Vec<String> {
 
 #[test]
 fn same_tokens_in_different_modules_are_different_entries() {
-    let referrer = Leaker::from_module(&nested_module()).unwrap().finish();
+    let (leaker, top_level) = Leaker::from_module(&nested_module()).unwrap();
+    let referrer = leaker.finish();
     assert_eq!(modules_of(&referrer), ["Rel@self", "Rel@inner"]);
-    assert_eq!(referrer.n_contexts(), 2);
-    assert_eq!(referrer.context_module(0), Some(&[][..]));
-    assert_eq!(referrer.context_module(1), Some(&[ident("inner")][..]));
+    // The module has no generics, and its top-level context is in no module.
+    assert_eq!(referrer.contexts().count(), 3);
+    assert_eq!(referrer.context_module(referrer.context(0)), Some(&[][..]));
+    assert_eq!(
+        referrer.context_module(referrer.context(1)),
+        Some(&[ident("inner")][..])
+    );
+    assert_eq!(top_level.index(), 2);
+    assert_eq!(referrer.context_module(top_level), None);
+    assert!(referrer.context_generics(top_level).params.is_empty());
 }
 
 #[test]
@@ -284,10 +292,10 @@ fn deep_module_path() {
     let m: ItemMod = parse_quote! {
         mod m { pub mod a { pub mod b { pub struct S<T> { x: Wrap<T> } } } }
     };
-    let referrer = Leaker::from_module(&m).unwrap().finish();
+    let referrer = Leaker::from_module(&m).unwrap().0.finish();
     assert_eq!(modules_of(&referrer), ["Wrap < T >@a::b"]);
     assert_eq!(
-        referrer.context_module(0),
+        referrer.context_module(referrer.context(0)),
         Some(&[ident("a"), ident("b")][..])
     );
 }
@@ -310,7 +318,7 @@ fn types_not_depending_on_the_module_are_shared() {
         .unwrap();
     let referrer = leaker.finish();
     assert_eq!(modules_of(&referrer), [":: foo :: X@"]);
-    assert_eq!(referrer.n_contexts(), 1);
+    assert_eq!(referrer.contexts().count(), 1);
     // A relative type next to it is still keyed by its module.
     let m: ItemMod = parse_quote! {
         mod m {
@@ -334,7 +342,7 @@ fn types_not_depending_on_the_module_are_shared() {
 
 #[test]
 fn referrer_rewrites_each_module_to_its_own_entry() {
-    let referrer = Leaker::from_module(&nested_module()).unwrap().finish();
+    let referrer = Leaker::from_module(&nested_module()).unwrap().0.finish();
     let mut item = nested_module();
     referrer
         .into_visitor(None, |_, ix| parse_str(&format!("P{}", ix)).unwrap())
@@ -353,7 +361,7 @@ fn referrer_rewrites_each_module_to_its_own_entry() {
 
 #[test]
 fn referrer_visits_a_copy_in_a_module() {
-    let referrer = Leaker::from_module(&nested_module()).unwrap().finish();
+    let referrer = Leaker::from_module(&nested_module()).unwrap().0.finish();
     let copy = |module: Option<Vec<Ident>>| {
         let mut visitor = referrer
             .clone()
@@ -385,7 +393,7 @@ fn referrer_visits_a_copy_in_a_module() {
             }
         }
     );
-    let referrer = Leaker::from_module(&m).unwrap().finish();
+    let referrer = Leaker::from_module(&m).unwrap().0.finish();
     let visit = |visitor: type_leak::Visitor<_>| {
         let mut item: ItemStruct = parse_quote!(
             pub struct C {
@@ -464,7 +472,7 @@ fn referrer_tracks_the_modules_it_enters() {
             }
         }
     );
-    let referrer = Leaker::from_module(&m).unwrap().finish();
+    let referrer = Leaker::from_module(&m).unwrap().0.finish();
     let mut item = m.clone();
     referrer
         .clone()
@@ -525,7 +533,7 @@ fn serialization_with_modules() {
             pub mod a { pub mod b { pub struct C<T> { y: Rel, z: Wrap<T> } } }
         }
     };
-    let referrer = Leaker::from_module(&m).unwrap().finish();
+    let referrer = Leaker::from_module(&m).unwrap().0.finish();
     assert_eq!(
         modules_of(&referrer),
         ["Rel@self", "Rel@a::b", "Wrap < T >@a::b"]
@@ -535,7 +543,7 @@ fn serialization_with_modules() {
     assert_eq!(
         tokens.to_string(),
         format!(
-            "\"{}\" 3 mod self ; (Rel) mod a :: b ; (Rel) < T > ; mod a :: b ; (Wrap < T >)",
+            "\"{}\" 4 mod self ; (Rel) mod a :: b ; (Rel) < T > ; mod a :: b ; (Wrap < T >) ()",
             version
         )
     );
@@ -556,6 +564,7 @@ fn serialization_with_modules() {
     );
     let tokens = Leaker::from_struct(&simple)
         .unwrap()
+        .0
         .finish()
         .to_token_stream();
     assert_eq!(tokens.to_string(), format!("\"{}\" (Rel , Rel2)", version));
@@ -570,7 +579,7 @@ fn root_relative_type_does_not_match_in_a_nested_module() {
             }
         }
     );
-    let referrer = Leaker::from_module(&m).unwrap().finish();
+    let referrer = Leaker::from_module(&m).unwrap().0.finish();
     let copy = |module: Option<Vec<Ident>>| {
         let mut visitor = referrer.clone().into_visitor(None, |_, _| parse_quote!(P));
         if let Some(module) = module {

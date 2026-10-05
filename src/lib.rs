@@ -27,4 +27,4 @@ pub use crate::error::NotInternableError;
 pub use crate::leaker::Leaker;
 pub use crate::referrer::{Referrer, Visitor};
 pub use crate::repeater::{repeater_definition, RepeaterSlots};
-pub use crate::requirements::SelfRequirement;
+pub use crate::requirements::{ContextId, SelfRequirement};

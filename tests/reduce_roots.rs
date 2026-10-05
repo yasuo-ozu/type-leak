@@ -20,7 +20,7 @@ fn test_reduce_roots_empty_leaker() {
 fn test_reduce_roots_neutral_generics() {
     // All fields are the struct's own generic params → all neutral → empty.
     let item: ItemStruct = parse_quote! { struct S<T, U> { a: T, b: U } };
-    let mut leaker = Leaker::from_struct(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
     assert!(leaker.finish().is_empty());
 }
@@ -31,7 +31,7 @@ fn test_reduce_roots_absolute_paths_only() {
     let item: ItemStruct = parse_quote! {
         struct S { a: ::std::string::String }
     };
-    let mut leaker = Leaker::from_struct(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
     assert!(leaker.finish().is_empty());
 }
@@ -40,7 +40,7 @@ fn test_reduce_roots_absolute_paths_only() {
 fn test_reduce_roots_single_must_intern() {
     // A single relative-path field is a must-intern root and must be kept.
     let item: ItemStruct = parse_quote! { struct S { a: RelType } };
-    let mut leaker = Leaker::from_struct(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
     let expected: Type = parse_quote!(RelType);
     assert_eq!(
@@ -53,7 +53,7 @@ fn test_reduce_roots_single_must_intern() {
 fn test_reduce_roots_multiple_must_intern() {
     // Two independent must-intern roots: both survive reduction.
     let item: ItemStruct = parse_quote! { struct S { a: TypeA, b: TypeB } };
-    let mut leaker = Leaker::from_struct(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
     let ta: Type = parse_quote!(TypeA);
     let tb: Type = parse_quote!(TypeB);
@@ -69,7 +69,7 @@ fn test_reduce_roots_neutral_root_without_must_intern_dropped() {
     let item: ItemStruct = parse_quote! {
         struct S<T> { a: (T, ::std::string::String) }
     };
-    let mut leaker = Leaker::from_struct(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
     assert!(leaker.finish().is_empty());
 }
@@ -81,7 +81,7 @@ fn test_reduce_roots_root_covers_descendant() {
     let item: ItemStruct = parse_quote! {
         struct S { a: (RelType, ::std::string::String) }
     };
-    let mut leaker = Leaker::from_struct(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
     let expected: Type = parse_quote!(RelType);
     let result = finish_as_strings(leaker);
@@ -93,7 +93,7 @@ fn test_reduce_roots_mixed_neutral_and_must_intern() {
     // Generic field (neutral root) alongside a relative-path field (must-intern root):
     // only the must-intern root survives.
     let item: ItemStruct = parse_quote! { struct S<T> { a: T, b: RelType } };
-    let mut leaker = Leaker::from_struct(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
     let expected: Type = parse_quote!(RelType);
     assert_eq!(
@@ -109,7 +109,7 @@ fn test_reduce_roots_deep_nesting() {
     let item: ItemStruct = parse_quote! {
         struct S { a: (::std::vec::Vec<RelInner>, ::std::string::String) }
     };
-    let mut leaker = Leaker::from_struct(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
     let expected: Type = parse_quote!(RelInner);
     let result = finish_as_strings(leaker);
@@ -126,7 +126,7 @@ fn test_reduce_roots_type_in_both_positions() {
             b: (RelType, ::std::string::String),
         }
     };
-    let mut leaker = Leaker::from_struct(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
     let ta: Type = parse_quote!(RelType);
     assert_eq!(
@@ -136,7 +136,7 @@ fn test_reduce_roots_type_in_both_positions() {
 }
 
 fn leaked_of(item: ItemStruct) -> Vec<String> {
-    let mut leaker = Leaker::from_struct(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
     finish_as_strings(leaker).into_iter().collect()
 }
@@ -229,7 +229,7 @@ fn test_reduce_roots_self_assoc_type_neutral() {
             fn method() -> Self::Assoc;
         }
     };
-    let mut leaker = Leaker::from_trait(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_trait(&item).unwrap();
     leaker.reduce_roots();
     assert!(leaker.finish().is_empty());
 }
@@ -243,7 +243,7 @@ fn test_reduce_roots_generic_assoc_type_neutral() {
             fn method<S: ::core::iter::Iterator>() -> S::Item;
         }
     };
-    let mut leaker = Leaker::from_trait(&item).unwrap();
+    let (mut leaker, _) = Leaker::from_trait(&item).unwrap();
     leaker.reduce_roots();
     assert!(leaker.finish().is_empty());
 }
@@ -258,7 +258,7 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
             c: &'static Rel,
         }
     };
-    let referrer = Leaker::from_struct(&item).unwrap().finish();
+    let referrer = Leaker::from_struct(&item).unwrap().0.finish();
     // `&'static Rel` is not rebuilt around `Rel` (`Rel: 'static` is not known of the entry).
     assert_eq!(referrer.iter().count(), 2);
     let mut copy: ItemStruct = parse_quote! {
