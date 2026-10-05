@@ -28,23 +28,6 @@ pub(crate) fn is_primitive_name(ident: &Ident) -> bool {
         .any(|(name, absolute)| ident == name && absolute.starts_with("::core::primitive::"))
 }
 
-/// Returns `true` if `ty` is a single identifier named like a const by the naming convention
-/// (`SCREAMING_SNAKE_CASE` with at least two characters, e.g. `SIZE`), which syn parses as a type
-/// when used as a generic argument.
-pub(crate) fn looks_like_const(ty: &Type) -> bool {
-    match ty {
-        Type::Path(TypePath { qself: None, path }) => path.get_ident().map_or(false, |ident| {
-            let name = ident.to_string();
-            name.len() >= 2
-                && name.chars().any(|c| c.is_ascii_uppercase())
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        }),
-        _ => false,
-    }
-}
-
 /// Returns `true` if `ty` refers to any of `idents` (as the first segment of a relative path) or
 /// `lifetimes`.
 pub(crate) fn mentions_names(ty: &Type, idents: Vec<Ident>, lifetimes: Vec<Lifetime>) -> bool {

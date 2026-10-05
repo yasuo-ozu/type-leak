@@ -62,3 +62,15 @@ type_leak_test_leaker::s::Assoc!(impl Assoc for Concrete => 0 {
 type_leak_test_leaker::s::Out!(impl<'x, T> Out<'x, T> for Concrete => 0);
 type_leak_test_leaker::s::DynRoot!(impl<'x> DynRoot<'x> for Concrete => 0);
 type_leak_test_leaker::s::Q!(impl<I: ::core::iter::Iterator> Q<I> for Concrete => 0);
+
+// A trait object inheriting the lifetime of its path, a bare identifier argument which is a const
+// and types in expressions, which are leaked as a whole. The implementors of the last are generic, where a
+// projection (as in `[u8; size_of::<<Self as Repeater<..>>::Type>()]`) is not permitted in an
+// anonymous constant.
+type_leak_test_leaker::s::PathDyn!(impl<'x> PathDyn<'x> for Concrete => 0);
+type_leak_test_leaker::s::ConstArg!(impl ConstArg for Concrete => 0);
+type_leak_test_leaker::s::ExprTypes!(impl ExprTypes for Concrete => 0);
+
+/// A generic implementor.
+pub struct GenericExpr<const B: bool>(pub Inner);
+type_leak_test_leaker::s::ExprTypes!(impl<const B: bool> ExprTypes for GenericExpr<B> => 0);

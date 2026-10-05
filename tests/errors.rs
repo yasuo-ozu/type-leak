@@ -167,11 +167,13 @@ fn limit_plain_args_encoder_without_params() {
 // ── holes ────────────────────────────────────────────────────────────────────
 
 #[test]
-fn limit_bare_const_in_bound() {
-    // A bare relative const in a trait bound (e.g. `SIZE` in `Sup<SIZE>`) is parsed as a type by
-    // syn. It cannot be leaked on its own (like `Sup<{ SIZE }>`, see `limit_const_in_bound`), so
-    // an identifier named like a const (`SCREAMING_SNAKE_CASE`) is rejected instead of being
-    // leaked as a type.
+fn bare_identifier_in_bound_is_leaked_as_a_type() {
+    // A bare relative identifier in a trait bound (e.g. `SIZE` in `Sup<SIZE>`) is parsed as a
+    // type by syn, though it may be a const. There is no type to intern it in (unlike
+    // `Wrap<SIZE>`, which is interned as a whole, see `tests/reduce_roots.rs`), so it is leaked as
+    // a type whatever its name is. If it is a const, the result does not compile: it should be
+    // written as `Sup<{ SIZE }>`, which is an error (see `limit_const_in_bound`), or with an
+    // absolute path.
     for item in [
         parse2::<ItemTrait>(quote! {
             pub trait MyTrait: crate::l::Sup<SIZE> {
@@ -188,11 +190,11 @@ fn limit_bare_const_in_bound() {
     ] {
         assert_eq!(
             leak_trait(&item),
-            Err("use absolute path: 'SIZE'".to_string())
+            Ok(vec!["SIZE".to_string()].into_iter().collect())
         );
     }
 
-    // A relative type named in `UpperCamelCase` is leaked as before.
+    // So is a relative type.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait: crate::l::Sup<MyType> {
             fn f(&self);

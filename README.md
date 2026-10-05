@@ -139,9 +139,20 @@ Known limitations, due to the stable Rust type system:
 - A const value can be leaked only as part of a type (e.g. `[u8; MY_CONST]` or
   `::path::to::MyType<MY_CONST>`). A relative const in a trait bound (e.g.
   `T: ::path::to::MyTrait<{ MY_CONST }>`) is rejected, because a const cannot be recovered from an
-  associated type in a generic context without `generic_const_exprs`. A bare identifier (e.g.
-  `MyTrait<MY_CONST>`) is parsed as a type; it is rejected likewise if it is named like a const
-  (`SCREAMING_SNAKE_CASE`), and otherwise interned as a type.
+  associated type in a generic context without `generic_const_exprs`. A bare identifier written
+  as a generic argument (e.g. `MY_CONST` in `::path::to::MyType<MY_CONST>`) is parsed as a type, so
+  it may be a type or a const, which is told by neither syn nor its name (there is no naming
+  convention): the type containing it (`::path::to::MyType<MY_CONST>`) is interned as a whole, as
+  a const cannot be interned on its own. If that type cannot be interned (e.g. it has an elided
+  lifetime or `impl Trait`, as `::path::to::MyType<'_, MY_CONST>` does, or it is not a type but a
+  trait bound, as `T: ::path::to::MyTrait<MY_CONST>`), the identifier is interned as a type, which
+  does not compile if it is a const: write the const in braces with an absolute path (e.g.
+  `{ ::my_crate::MY_CONST }`), which is not leaked. An identifier in another position (e.g. in a
+  tuple, an array or a binding such as `Item = X`) is a type.
+- A type in an expression of a type (an array length such as `[u8; size_of::<MyType>()]`, or a
+  const argument such as `::path::to::MyType<{ size_of::<MyType>() }>`) is not interned on its
+  own, because its copy would contain a projection in an anonymous constant, which generic
+  implementors cannot have: the type containing the expression is interned as a whole.
 - Names of primitive types (e.g. `u8` in `const N: u8`) are copied as they are, assuming they are
   not shadowed in the Leaker's type context (e.g. by `type u8 = i32;`). Emit
   `Leaker::assertions()` in the Leaker's type context to check it at compile time.
@@ -162,6 +173,7 @@ Known limitations, due to the stable Rust type system:
 
 - The outlives bounds that a signature implies are added to the generics of an entry only for references: `&'a T` makes `T: 'a` part of the bounds the type uses. The other implied bounds (e.g. `Wrapper<'a, T>` whose definition requires `T: 'a`) are not, so the Repeater's implementation may need the bound written in the Leaker.
 - A `dyn Trait` borrowed through an elided or method-local lifetime (`&dyn RelTrait`, or `&'b dyn RelTrait` in a method declaring `'b`) is reported as an error: its object lifetime bound defaults to that of the reference, which the Repeater cannot name, and the error notes the lifetime. A lifetime of the Leaker (e.g. `&'a dyn RelTrait` or `Box<dyn RelTrait + 'a>` in `trait MyLeaker<'a>`) is encoded in the generics, so it works. `&'static dyn RelTrait` and `Box<dyn RelTrait + 'b>` (with the bound written) are fine too.
+- A `dyn Trait` without a lifetime bound as an argument of a path with a lifetime argument (`::core::cell::Ref<'a, dyn RelTrait>`) is treated likewise, because the path may give it its lifetime (`Ref<'a, T: 'a>` makes it `dyn RelTrait + 'a`, whereas the trait object interned alone would be `dyn RelTrait + 'static`): with a lifetime of the Leaker, the whole path is interned (also if its components could be interned on their own); with an elided or method-local lifetime, or in a trait bound (`T: ::path::to::Tr<'a, dyn RelTrait>`), it is an error. `::path::to::Wrap<'static, dyn RelTrait>` and `::core::cell::Ref<'a, Box<dyn RelTrait>>` (not an argument of the path) are not affected.
 
 # Application
 

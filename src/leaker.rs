@@ -22,7 +22,7 @@ pub struct Leaker {
     /// prelude (`Vec`, `Option`, ...) with [`LeakerConfig::allow_std_prelude()`], primitive types
     /// with [`LeakerConfig::allow_primitive()`], or `crate` with [`LeakerConfig::allow_crate()`].
     /// A relative path is context-free if it starts with the segments of one of them; its generic
-    /// arguments are still analyzed (e.g. `Rel` in `Option<Rel>`). They apply to relative paths
+    /// arguments are still analyzed (e.g. `Rel` in `Option<(Rel,)>`). They apply to relative paths
     /// only (see [`Leaker::allow_external_crates`] for paths with a leading `::`). Primitive names
     /// copied as they are are checked by [`Leaker::assertions()`].
     pub allowed_paths: Vec<Path>,
@@ -175,8 +175,8 @@ impl Leaker {
     /// (without leaving the analyzed module), and the names imported by `use` with an absolute
     /// path (starting with `::`). A type mentioning them is decomposed instead of being interned
     /// as a whole (e.g. only `Rel` is interned for `S<Rel>`, where `S` is declared in the
-    /// module). Other relative paths (including the names imported by `use super::X` or `use
-    /// crate::X`) are leaked.
+    /// module). Other relative paths (including the names imported by `use super::X` or
+    /// `use crate::X`) are leaked.
     ///
     /// A relative path resolves in the module where it is written, so a leaked type depending on
     /// one (e.g. `Rel` in `mod m` and in `mod m::inner`, where `use super::super::Rel;` may
@@ -471,10 +471,25 @@ impl Leaker {
     /// Only the nodes of the graph are candidates, and a node is not interned instead of a
     /// reference with a lifetime containing it (`Rel` instead of `&'a Rel`), as the copy of the
     /// reference needs `Rel: 'a`, which cannot be proved of the type interned in its place: such
-    /// a reference is interned as a whole, like a **red** node.
+    /// a reference is interned as a whole, like a **red** node. So is any type which cannot be
+    /// copied around the types interned in place of its components, so they are not nodes of the
+    /// graph (its causes are its own, see [`CheckResult::is_own`]): a path with a lifetime
+    /// argument and a trait object without a lifetime bound as an argument (`Ref<'a, dyn
+    /// Trait>`, where the trait object defaults to `'a` but would be `'static` interned alone), a
+    /// path with a bare identifier written as an argument (`Wrap<SIZE>`, where syn parses a const
+    /// as a type, so it may be one, and it cannot be interned alone) and a type with a type in an
+    /// expression (`[u8; size_of::<Big>()]`, where the copy would have a projection in an
+    /// anonymous constant). A bare identifier is told from a type by its position only, not by
+    /// its name: the path is interned as a whole if it can be, and otherwise (e.g. `Wrap<'_,
+    /// SIZE>`, with a lifetime which cannot be interned, or `S<SIZE>`, where `S` is declared in the
+    /// module analyzed by [`Leaker::from_module()`]) the identifier is interned as a type like
+    /// any other, which does not compile if it is a const. Another position (`Wrap<(SIZE,)>`,
+    /// `Wrap<[SIZE; 3]>`, `Wrap<(SIZE)>`, `Wrap<Item = SIZE>`, a bound `Sup<SIZE>` of the Leaker)
+    /// is a type, or has no type to be interned as a whole.
     ///
-    /// For example, `Vec<Rel>`, `Option<Rel>`, `(Rel, u8)` and `Box<Rel>` in fields are covered by
-    /// interning `Rel` only, and `(A, B, C)` used twice by interning the tuple only.
+    /// For example, `Vec<(Rel,)>`, `Option<(Rel,)>`, `(Rel, u8)` and `Box<(Rel,)>` in fields are
+    /// covered by interning `Rel` only, and `(A, B, C)` used twice by interning the tuple only
+    /// (`Vec<Rel>`, with a bare `Rel`, is interned as a whole).
     ///
     /// This is a minimum vertex cut between the roots and the **red** nodes, solved exactly as a
     /// maximum flow (Edmonds-Karp): each node `v` is split into `v_in -> v_out` of capacity 1, each
@@ -482,8 +497,14 @@ impl Leaker {
     /// is connected to the roots and the **red** nodes to a super sink. When several cuts have
     /// the minimum size, the one closest to the sink is taken (the nodes which can reach the sink
     /// in the residual network of the maximum flow form its sink side), which prefers the inner
-    /// types (`Rel` to `Vec<Rel>` when that is all there is), so that the result is
+    /// types (`Rel` to `Vec<(Rel,)>` when that is all there is), so that the result is
     /// deterministic.
+    ///
+    /// The search of the maximum flow is repeated for each unit of flow, over the whole network,
+    /// so it takes quadratic time in the size of the item. So a **red** root, which is in every
+    /// minimum cut, is interned without a flow, and the network is split into the weakly
+    /// connected components of the graph (an item has many independent fields), each solved on
+    /// its own with the same result.
     ///
     /// The final result looks like:
     ///
@@ -501,104 +522,141 @@ impl Leaker {
     fn build_graph_and_reduce(&self) -> Vec<NodeKey> {
         let types = &self.types;
         let mut keys: Vec<&NodeKey> = types.keys().collect();
-        keys.sort();
-        let index: HashMap<&NodeKey, u32> = keys
+        keys.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
+        let index: HashMap<&NodeKey, usize> =
+            keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+        let n = keys.len();
+        let children: Vec<Vec<usize>> = keys
             .iter()
-            .enumerate()
-            .map(|(i, k)| (*k, i as u32))
+            .map(|key| types.children(key).iter().map(|c| index[c]).collect())
             .collect();
-        let n = keys.len() as u32;
-        // The nodes of the network: `v_in` is `2 * v`, `v_out` is `2 * v + 1`.
-        let (source, sink) = (2 * n, 2 * n + 1);
-        // Larger than the sum of all the capacities of the nodes, so it is never the bottleneck.
-        let infinite = n + 1;
+        let red: Vec<bool> = keys
+            .iter()
+            .map(|k| types.must_intern.contains(*k))
+            .collect();
+        let root: Vec<bool> = keys.iter().map(|k| types.roots.contains(*k)).collect();
         // The types which are red or contain a red type.
-        let mut has_red: HashSet<&NodeKey> = types.must_intern.iter().collect();
-        let mut parents: HashMap<&NodeKey, Vec<&NodeKey>> = HashMap::new();
-        for key in &keys {
-            for child in types.children(key) {
-                parents
-                    .entry(keys[index[&child] as usize])
-                    .or_default()
-                    .push(key);
+        let mut has_red = red.clone();
+        let mut parents: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, children) in children.iter().enumerate() {
+            for &child in children {
+                parents[child].push(i);
             }
         }
-        let mut stack: Vec<&NodeKey> = has_red.iter().copied().collect();
-        while let Some(key) = stack.pop() {
-            for parent in parents.get(key).into_iter().flatten() {
-                if has_red.insert(*parent) {
-                    stack.push(*parent);
+        let mut stack: Vec<usize> = (0..n).filter(|&i| red[i]).collect();
+        while let Some(i) = stack.pop() {
+            for &parent in &parents[i] {
+                if !has_red[parent] {
+                    has_red[parent] = true;
+                    stack.push(parent);
                 }
             }
         }
-        let mut edges: Vec<(u32, u32, u32)> = Vec::new();
-        for (i, key) in keys.iter().enumerate() {
-            let i = i as u32;
-            edges.push((2 * i, 2 * i + 1, 1));
-            for child in types.children(key) {
-                if has_red.contains(&child) && self.needs_parent(key) {
+
+        // A red root is in every minimum cut, as the only node of the path `source -> v_in ->
+        // v_out -> sink`, so it is in the one closest to the sink as well. It is cut without a
+        // flow, and removed from the network (the paths through it are cut).
+        let mut kept: Vec<NodeKey> = (0..n)
+            .filter(|&i| red[i] && root[i])
+            .map(|i| keys[i].clone())
+            .collect();
+
+        // The edges of the network between the other types (a type which has red components goes
+        // to the sink if it is red, or if its components cannot stand for it), without those that
+        // cannot be on a path from a root to the sink.
+        let mut next: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut to_sink = vec![false; n];
+        for i in 0..n {
+            if !has_red[i] || (red[i] && root[i]) {
+                continue;
+            }
+            to_sink[i] = red[i];
+            let whole = self.needs_parent(keys[i]);
+            for &child in &children[i] {
+                if !has_red[child] {
+                    continue;
+                }
+                if whole {
                     // The child cannot stand for the parent, which is to be interned as a whole
                     // like a red type, and not through the child.
-                    edges.push((2 * i + 1, sink, infinite));
-                } else {
-                    edges.push((2 * i + 1, 2 * index[&child], infinite));
-                }
-            }
-            if types.roots.contains(*key) {
-                edges.push((source, 2 * i, infinite));
-            }
-            if types.must_intern.contains(*key) {
-                edges.push((2 * i + 1, sink, infinite));
-            }
-        }
-
-        // The edges are keyed by their number in `edges`, which tells their capacities.
-        let mut network = BTreeGraph::<u32, u32>::default();
-        for node in 0..2 * n + 2 {
-            network.insert_node(node).unwrap();
-        }
-        for (eix, (from, to, _)) in edges.iter().enumerate() {
-            network.insert_edge(eix as u32, [*from, *to]).unwrap();
-        }
-        let (_, flows) =
-            edmonds_karp_with_flows(&network, source, sink, |eix| edges[*eix as usize].2);
-
-        // The nodes which can reach the sink in the residual network, found by a BFS backwards.
-        // An edge `from -> to` of the network is also usable as `to -> from` if it carries flow
-        // (cancelling it), and as `from -> to` if it has spare capacity.
-        let mut into: Vec<Vec<u32>> = vec![Vec::new(); 2 * n as usize + 2];
-        for (eix, (from, to, capacity)) in edges.iter().enumerate() {
-            let flow = flows.get(&(eix as u32)).copied().unwrap_or(0);
-            if flow < *capacity {
-                into[*to as usize].push(*from);
-            }
-            if flow > 0 {
-                into[*from as usize].push(*to);
-            }
-        }
-        let mut reaches_sink = vec![false; 2 * n as usize + 2];
-        reaches_sink[sink as usize] = true;
-        let mut queue = vec![sink];
-        while let Some(node) = queue.pop() {
-            for &pred in &into[node as usize] {
-                if !reaches_sink[pred as usize] {
-                    reaches_sink[pred as usize] = true;
-                    queue.push(pred);
+                    to_sink[i] = true;
+                } else if !(red[child] && root[child]) {
+                    next[i].push(child);
                 }
             }
         }
-
-        // The cut is the nodes whose edge `v_in -> v_out` goes from the side which cannot reach the
-        // sink to the side which can. The set of the nodes which can reach the sink in the
-        // residual network is the smallest sink side of all the minimum cuts, so this cut is the
-        // minimum cut closest to the sink, i.e. the one made of the innermost types (a component
-        // is preferred to the type containing it when either of them cuts the same paths).
-        let mut kept: Vec<NodeKey> = keys
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| reaches_sink[2 * i + 1] && !reaches_sink[2 * i])
-            .map(|(_, key)| (*key).clone())
+        let mut reached = vec![false; n];
+        let mut stack: Vec<usize> = (0..n)
+            .filter(|&i| root[i] && has_red[i] && !red[i])
             .collect();
+        for &i in &stack {
+            reached[i] = true;
+        }
+        while let Some(i) = stack.pop() {
+            for &child in &next[i] {
+                if !reached[child] {
+                    reached[child] = true;
+                    stack.push(child);
+                }
+            }
+        }
+
+        // The flows of weakly connected components are independent (they share only the source
+        // and the sink), and so are their minimum cuts closest to the sink, so each component is
+        // solved on its own: the maximum flow takes a search of the whole network per unit of
+        // flow, so it is quadratic in the size of the network.
+        let mut component: Vec<usize> = (0..n).collect();
+        for i in (0..n).filter(|&i| reached[i]) {
+            for &child in &next[i] {
+                let (a, b) = (find(&mut component, i), find(&mut component, child));
+                component[a.max(b)] = a.min(b);
+            }
+        }
+        let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for i in (0..n).filter(|&i| reached[i]) {
+            members.entry(find(&mut component, i)).or_default().push(i);
+        }
+        let mut local = vec![0u32; n];
+        for members in members.values() {
+            for (l, &i) in members.iter().enumerate() {
+                local[i] = l as u32;
+            }
+            // The nodes of the network: `v_in` is `2 * v`, `v_out` is `2 * v + 1`.
+            let m = members.len() as u32;
+            let (source, sink) = (2 * m, 2 * m + 1);
+            // Larger than the sum of all the capacities of the nodes, so it is never the bottleneck.
+            let infinite = m + 1;
+            let mut edges: Vec<(u32, u32, u32)> = Vec::new();
+            for &i in members {
+                let l = local[i];
+                edges.push((2 * l, 2 * l + 1, 1));
+                for &child in &next[i] {
+                    edges.push((2 * l + 1, 2 * local[child], infinite));
+                }
+                if root[i] {
+                    edges.push((source, 2 * l, infinite));
+                }
+                if to_sink[i] {
+                    edges.push((2 * l + 1, sink, infinite));
+                }
+            }
+            let reaches_sink = sink_side(2 * m + 2, &edges, source, sink);
+            // The cut is the nodes whose edge `v_in -> v_out` goes from the side which cannot
+            // reach the sink to the side which can. The set of the nodes which can reach the sink
+            // in the residual network is the smallest sink side of all the minimum cuts, so this
+            // cut is the minimum cut closest to the sink, i.e. the one made of the innermost types
+            // (a component is preferred to the type containing it when either of them cuts the
+            // same paths).
+            kept.extend(
+                members
+                    .iter()
+                    .filter(|&&i| {
+                        let l = local[i] as usize;
+                        reaches_sink[2 * l + 1] && !reaches_sink[2 * l]
+                    })
+                    .map(|&i| keys[i].clone()),
+            );
+        }
 
         // Sort for deterministic output.
         kept.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
@@ -625,6 +683,57 @@ impl Leaker {
             })
         )
     }
+}
+
+/// Solves the maximum flow from `source` to `sink` in the network of `nodes` nodes and `edges`
+/// (`(from, to, capacity)`), and returns the nodes which can reach the sink in the residual
+/// network.
+fn sink_side(nodes: u32, edges: &[(u32, u32, u32)], source: u32, sink: u32) -> Vec<bool> {
+    // The edges are keyed by their number in `edges`, which tells their capacities.
+    let mut network = BTreeGraph::<u32, u32>::default();
+    for node in 0..nodes {
+        network.insert_node(node).unwrap();
+    }
+    for (eix, (from, to, _)) in edges.iter().enumerate() {
+        network.insert_edge(eix as u32, [*from, *to]).unwrap();
+    }
+    let (_, flows) = edmonds_karp_with_flows(&network, source, sink, |eix| edges[*eix as usize].2);
+
+    // The nodes which can reach the sink in the residual network, found by a BFS backwards.
+    // An edge `from -> to` of the network is also usable as `to -> from` if it carries flow
+    // (cancelling it), and as `from -> to` if it has spare capacity.
+    let mut into: Vec<Vec<u32>> = vec![Vec::new(); nodes as usize];
+    for (eix, (from, to, capacity)) in edges.iter().enumerate() {
+        let flow = flows.get(&(eix as u32)).copied().unwrap_or(0);
+        if flow < *capacity {
+            into[*to as usize].push(*from);
+        }
+        if flow > 0 {
+            into[*from as usize].push(*to);
+        }
+    }
+    let mut reaches_sink = vec![false; nodes as usize];
+    reaches_sink[sink as usize] = true;
+    let mut queue = vec![sink];
+    while let Some(node) = queue.pop() {
+        for &pred in &into[node as usize] {
+            if !reaches_sink[pred as usize] {
+                reaches_sink[pred as usize] = true;
+                queue.push(pred);
+            }
+        }
+    }
+    reaches_sink
+}
+
+/// Returns the representative of the set of `i` in the disjoint sets `component` (each element
+/// points to another of its set, or to itself if it is the representative).
+fn find(component: &mut [usize], mut i: usize) -> usize {
+    while component[i] != i {
+        component[i] = component[component[i]];
+        i = component[i];
+    }
+    i
 }
 
 /// Returns the first `n` parameters of `generics`, without their defaults, and the where

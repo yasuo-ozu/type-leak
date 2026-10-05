@@ -138,8 +138,8 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
     assert!(err.contains("use absolute path: 'RelTr'"), "{}", err);
     assert!(
         err.contains(
-            "the lifetime of the trait object defaults to that of the reference; name it \
-             (e.g. `&'a dyn Trait`)"
+            "the lifetime of the trait object defaults to that of the enclosing reference or \
+             path; name it (e.g. `&'a dyn Trait` or `dyn Trait + 'a`)"
         ),
         "{}",
         err

@@ -352,10 +352,15 @@ fn test_leaker_from_union() {
             .iter()
             .map(|i| quote!(#i).to_string())
             .collect::<BTreeSet<_>>(),
-        ["MyType1", "(MyType2 , u8)"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<BTreeSet<_>>()
+        // `MyType1` is a bare identifier as an argument, which may be a const, so the path is
+        // leaked as a whole.
+        [
+            ":: core :: mem :: ManuallyDrop < MyType1 >",
+            "(MyType2 , u8)"
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<BTreeSet<_>>()
     );
     // Bounds must use absolute paths as for structs.
     assert!(Leaker::from_union(&parse_quote! {
@@ -559,7 +564,7 @@ fn test_self_ty_cannot_be_interned() {
     );
 
     // The components are leaked instead if the type can be decomposed.
-    for ty in [quote!(::k::W<Rel, Self>), quote!((Rel, Self))] {
+    for ty in [quote!(::k::W<(Rel,), Self>), quote!((Rel, Self))] {
         let sig = quote!(
             fn f(&self) -> #ty;
         );
@@ -567,6 +572,14 @@ fn test_self_ty_cannot_be_interned() {
         // `Self` does not depend on the context by itself, so `Rel` is enough.
         assert_eq!(leak(sig, true).unwrap(), set(&["Rel"]), "{}", ty);
     }
+
+    // `Rel` as an argument may be a const, so the path is interned as a whole if it can be (with
+    // `Self` allowed), and otherwise `Rel` is leaked as a type.
+    let sig = quote!(
+        fn f(&self) -> ::k::W<Rel, Self>;
+    );
+    assert_eq!(leak(sig.clone(), false).unwrap(), set(&["Rel"]));
+    assert_eq!(leak(sig, true).unwrap(), set(&[":: k :: W < Rel , Self >"]));
 
     // `Self` alone is never leaked.
     for ty in [

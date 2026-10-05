@@ -140,3 +140,45 @@ fn lifetimes_trait_objects_and_projections() {
     // `<T>::Item` with `T` = `Range<u32>`.
     assert_eq!(Q::<::core::ops::Range<u32>>::f(&c, 6), Wrap(6));
 }
+
+/// A trait object without a lifetime bound, as an argument of a path with a lifetime (`Ref<'a, dyn
+/// RelTr>`), takes the lifetime from the path, so it is leaked together with the path.
+#[test]
+fn trait_object_inheriting_the_path_lifetime() {
+    use std::cell::RefCell;
+    use type_leak_test_leaker::s::{PathDyn, RelImpl, RelTr};
+    let c = Concrete(Inner);
+    let cell = RefCell::new(RelImpl);
+    let r = ::core::cell::Ref::map(cell.borrow(), |r| r as &dyn RelTr);
+    assert_eq!(c.path(r), 32);
+    let r = ::core::cell::Ref::map(cell.borrow(), |r| r as &dyn RelTr);
+    assert_eq!(c.paren(r), 33);
+    let r = ::core::cell::Ref::map(cell.borrow(), |r| r as &(dyn RelTr + '_));
+    assert_eq!(c.bound(r), 34);
+    let boxed: Box<dyn RelTr> = Box::new(RelImpl);
+    let cell = RefCell::new(boxed);
+    assert_eq!(c.boxed(cell.borrow()), 35);
+}
+
+/// A bare identifier as an argument, which syn parses as a type, may be a const: it is not leaked
+/// as a type, whatever it is named, but the type containing it is leaked as a whole.
+#[test]
+fn bare_const_argument() {
+    use type_leak_test_leaker::s::{ConstArg, Len, SIZE};
+    assert_eq!(Concrete(Inner).bare().n(), SIZE);
+    assert_eq!(Concrete(Inner).bare_mixed_case().n(), Len);
+}
+
+/// The types in an array length or in a const argument are not leaked alone, whatever the
+/// implementor is (a projection is not permitted in an anonymous constant with its generics).
+#[test]
+fn types_in_expressions() {
+    use type_leak_test_leaker::s::ExprTypes;
+    use type_leak_test_referrer::GenericExpr;
+    let c = Concrete(Inner);
+    assert_eq!(c.expr_array(), Some([1, 2, 3]));
+    assert_eq!(c.expr_arg().n(), 3);
+    let g = GenericExpr::<true>(Inner);
+    assert_eq!(g.expr_array(), Some([1, 2, 3]));
+    assert_eq!(g.expr_arg().n(), 3);
+}

@@ -76,8 +76,8 @@ impl NotInternableError {
                     if is_default_lifetime_object(cause) {
                         notes.push((
                             cause.span(),
-                            "the lifetime of the trait object defaults to that of the reference; \
-                             name it (e.g. `&'a dyn Trait`)"
+                            "the lifetime of the trait object defaults to that of the enclosing \
+                             reference or path; name it (e.g. `&'a dyn Trait` or `dyn Trait + 'a`)"
                                 .to_string(),
                         ));
                     }
@@ -132,7 +132,8 @@ impl NotInternableError {
 }
 
 /// Returns `true` if `cause` is a trait object without a lifetime bound (e.g. `dyn Trait`), which is
-/// a cause only if it is the referent of a reference with an elided lifetime.
+/// a cause only if it is the referent of a reference, or an argument of a path, with an elided or
+/// local lifetime.
 fn is_default_lifetime_object(cause: &TokenStream) -> bool {
     match syn::parse2::<syn::Type>(cause.clone()) {
         Ok(syn::Type::TraitObject(object)) => !object

@@ -73,11 +73,18 @@ fn test_check() {
     ); // relative path
     assert_eq!(
         kind(&leaker.check(
-            &parse_quote!(<::path::to::MyType as ::path::to::MyTrait<MyType2>>::Ty),
+            &parse_quote!(<::path::to::MyType as ::path::to::MyTrait<(MyType2,)>>::Ty),
             generics
         )),
         "MustInternOrInherit"
-    ); // relative path
+    ); // relative path in an argument
+    assert_eq!(
+        kind(&leaker.check(
+            &parse_quote!(<::path::to::MyType as ::path::to::MyTrait<MyType2>>::Ty),
+            generics
+        )),
+        "MustIntern"
+    ); // a bare identifier as an argument may be a const, so the type is interned as a whole
     assert_eq!(kind(&leaker.check(&parse_quote!(()), generics)), "Neutral");
     assert_eq!(
         kind(&leaker.check(&parse_quote!(&'l1 ()), generics)),
@@ -237,8 +244,13 @@ fn test_check_allowed_paths_with_generic_args() {
     );
     // Its generic arguments are still checked.
     assert_eq!(
-        kind(&leaker.check(&parse_quote!(Option<RelType>), generics)),
+        kind(&leaker.check(&parse_quote!(Option<(RelType,)>), generics)),
         "MustInternOrInherit"
+    );
+    // A bare identifier as an argument may be a const, so the type is interned as a whole.
+    assert_eq!(
+        kind(&leaker.check(&parse_quote!(Option<RelType>), generics)),
+        "MustIntern"
     );
 
     // Trait bounds with generic arguments on allowed paths are accepted, and relative types in
@@ -298,13 +310,20 @@ fn test_check_conflict() {
     // All the causes are collected, the outermost ones first.
     assert_eq!(
         conflict(parse_quote!(
-            ::path::Wrap<'_, ::path::Wrap<C>, A, B<D>, impl ::path::Tr>
+            ::path::Wrap<'_, ::path::Wrap<(C,)>, A, B<D>, impl ::path::Tr>
         )),
         (
-            v(&["A", "B < D >", "C", "D"]),
+            v(&["A", "B < D >", "D", "C"]),
             v(&["'_", "impl :: path :: Tr"]),
             false
         )
+    );
+    // A bare identifier as an argument may be a const, so the type containing it is interned as a
+    // whole (with the cause in its own path) if it can be, as `::path::Wrap<C>` here, but not the
+    // outer one, which has impossible causes (`A` is a type of its own).
+    assert_eq!(
+        conflict(parse_quote!(::path::Wrap<'_, ::path::Wrap<C>, A>)),
+        (v(&["C", "A"]), v(&["'_"]), false)
     );
     assert_eq!(
         conflict(parse_quote!(dyn A + B<'_>)),

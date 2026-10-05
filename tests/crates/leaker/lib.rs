@@ -1,6 +1,10 @@
 //! The Leaker's crate: traits whose signatures use types relative to `mod m`, which the
 //! Referrer's crate (`type-leak-test-referrer`) cannot name.
 
+// The Repeater's implementations copy the types as they are written, including the parentheses
+// of `(dyn RelTr)` in `s::PathDyn`.
+#![allow(unused_parens)]
+
 #[doc(hidden)]
 pub use type_leak_test_macro as __macro;
 
@@ -393,6 +397,96 @@ pub mod s {
             Wrap(x)
         }
     }
+
+    /// A trait object whose lifetime bound defaults to the lifetime of the path it is an argument
+    /// of (`Ref<'a, T: 'a>`), so it must not be leaked alone (it would be `dyn RelTr + 'static`):
+    /// the path is leaked as a whole.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::s,
+    )]
+    pub trait PathDyn<'a> {
+        fn path(&self, x: ::core::cell::Ref<'a, dyn RelTr>) -> u32;
+        fn paren(&self, x: ::core::cell::Ref<'a, (dyn RelTr)>) -> u32;
+        /// With the bound written, only the trait object is leaked.
+        fn bound(&self, x: ::core::cell::Ref<'a, dyn RelTr + 'a>) -> u32;
+        /// Not the argument of the path, so it defaults to `'static`.
+        fn boxed(&self, x: ::core::cell::Ref<'a, ::std::boxed::Box<dyn RelTr>>) -> u32;
+    }
+
+    impl<'a> PathDyn<'a> for Inner {
+        fn path(&self, x: ::core::cell::Ref<'a, dyn RelTr>) -> u32 {
+            x.rel() + 1
+        }
+        fn paren(&self, x: ::core::cell::Ref<'a, (dyn RelTr)>) -> u32 {
+            x.rel() + 2
+        }
+        fn bound(&self, x: ::core::cell::Ref<'a, dyn RelTr + 'a>) -> u32 {
+            x.rel() + 3
+        }
+        fn boxed(&self, x: ::core::cell::Ref<'a, ::std::boxed::Box<dyn RelTr>>) -> u32 {
+            x.rel() + 4
+        }
+    }
+
+    pub const SIZE: usize = 4;
+    /// A const which is not named in `SCREAMING_SNAKE_CASE`: there is no naming convention to tell
+    /// it from a type.
+    #[allow(non_upper_case_globals)]
+    pub const Len: usize = 5;
+
+    pub struct Big(pub [u8; 3]);
+
+    /// A bare identifier as an argument, which is a const here (which syn parses as a type), and
+    /// types in expressions, which cannot be leaked alone: the types around them are leaked as a
+    /// whole.
+    macro_rules! define_const_traits {
+        () => {
+            #[leak(
+                helper = crate::__macro,
+                repeater = crate::Repeater,
+                module = crate::s,
+            )]
+            pub trait ConstArg {
+                fn bare(&self) -> $crate::m_portable::CW<SIZE>;
+                /// Named like a type.
+                fn bare_mixed_case(&self) -> $crate::m_portable::CW<Len>;
+            }
+
+            #[leak(
+                helper = crate::__macro,
+                repeater = crate::Repeater,
+                module = crate::s,
+            )]
+            pub trait ExprTypes {
+                /// A type in an array length.
+                fn expr_array(&self) -> Option<[u8; ::core::mem::size_of::<Big>()]>;
+                /// A type in a const argument.
+                fn expr_arg(&self) -> $crate::m_portable::CW<{ ::core::mem::size_of::<Big>() }>;
+            }
+        };
+    }
+
+    define_const_traits!();
+
+    impl ConstArg for Inner {
+        fn bare(&self) -> crate::m_portable::CW<SIZE> {
+            crate::m_portable::CW
+        }
+        fn bare_mixed_case(&self) -> crate::m_portable::CW<Len> {
+            crate::m_portable::CW
+        }
+    }
+
+    impl ExprTypes for Inner {
+        fn expr_array(&self) -> Option<[u8; ::core::mem::size_of::<Big>()]> {
+            Some([1, 2, 3])
+        }
+        fn expr_arg(&self) -> crate::m_portable::CW<{ ::core::mem::size_of::<Big>() }> {
+            crate::m_portable::CW
+        }
+    }
 }
 
 /// Items reached through `$crate`, which are portable (resolved from the Referrer's crate).
@@ -403,6 +497,13 @@ pub mod m_portable {
     impl PortTr for Portable {}
     pub const LEN: usize = 2;
     pub type Idx = usize;
+
+    pub struct CW<const N: usize>;
+    impl<const N: usize> CW<N> {
+        pub fn n(&self) -> usize {
+            N
+        }
+    }
 }
 
 /// Exact results of the Leaker for paths starting with `$crate`. They are checked when this
@@ -422,12 +523,17 @@ macro_rules! check_dollar_crate {
             trait T1 { fn f(&self) -> $crate::m::Portable; }
         }
         // A generic argument which is relative is leaked (and the wrapper is rebuilt around it), as it
-        // is for
-        // `::core::option::Option<Rel>`.
+        // is for `::core::option::Option<(Rel,)>`. (A bare `Rel` as the argument may be a const, so
+        // the wrapper is leaked as a whole instead.)
         check_leak! {
             { Rel }
             { }
-            trait T2 { fn g(&self) -> $crate::m::Wrap<Rel>; }
+            trait T2 { fn g(&self) -> $crate::m::Wrap<(Rel,)>; }
+        }
+        check_leak! {
+            { $crate::m::Wrap<Rel> }
+            { }
+            trait T2b { fn g(&self) -> $crate::m::Wrap<Rel>; }
         }
         check_leak! {
             { }
@@ -462,7 +568,7 @@ macro_rules! check_dollar_crate {
         check_leak! {
             { Rel }
             { allow_external_crates = false }
-            trait N2 { fn g(&self) -> $crate::m::Wrap<Rel>; }
+            trait N2 { fn g(&self) -> $crate::m::Wrap<(Rel,)>; }
         }
         check_leak! {
             { }
@@ -494,7 +600,12 @@ macro_rules! check_dollar_crate {
         check_leak! {
             { Rel }
             { }
-            trait C1 { fn g(&self) -> ::core::option::Option<Rel>; }
+            trait C1 { fn g(&self) -> ::core::option::Option<(Rel,)>; }
+        }
+        check_leak! {
+            { ::core::option::Option<Rel> }
+            { }
+            trait C2 { fn g(&self) -> ::core::option::Option<Rel>; }
         }
         // Modules: `use $crate::..` is portable.
         check_leak! {

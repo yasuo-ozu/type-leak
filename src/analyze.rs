@@ -11,7 +11,7 @@ use crate::leaker::Leaker;
 use crate::requirements::{Contexts, Requirements, Scope, SelfRequirement};
 use crate::util::{
     first_self_in_generics, first_self_in_type, generic_param_name, ident_name, is_primitive_name,
-    looks_like_const, token_names, unwrap_type_group,
+    token_names, unwrap_type_group,
 };
 use proc_macro2::TokenStream;
 use std::collections::{HashMap, HashSet};
@@ -43,6 +43,11 @@ pub struct CheckResult {
     /// the type must be interned as a whole: it cannot be decomposed, i.e. copied while interning
     /// only its components. `false` if `must` is empty, or all of `must` are in components (e.g.
     /// `MyType` in `::path::Wrap<MyType, '_>`), which can be interned alone.
+    ///
+    /// A bare identifier written as a generic argument (e.g. `SIZE` in `::path::Wrap<SIZE>`) may
+    /// be a const, which cannot be interned alone (syn parses it as a type), so it is treated as
+    /// the cause of the type containing it, which is own, if that can be interned as a whole.
+    /// Otherwise (e.g. `::path::Wrap<'_, SIZE>`) it is a component, interned alone as a type.
     pub is_own: bool,
     /// An explanation of the conflict, if it is not clear from the causes (e.g. why `Self` cannot
     /// be leaked). It is reported first.
@@ -61,9 +66,10 @@ pub(crate) struct PendingType {
     has_must: bool,
     /// The requirements of the type, which decide its context.
     requirements: Requirements,
-    /// The type looks like a const (see [`looks_like_const()`]), which is an error unless it is a
-    /// component of another type.
-    looks_like_const: bool,
+    /// The type is a bare identifier written as a generic argument, which may be a const (syn
+    /// parses both as a type). Its parent is interned as a whole if possible, otherwise it is
+    /// leaked as a type.
+    ambiguous: bool,
     /// The effects of its components, applied if the type is added.
     components: Vec<Effect>,
 }
@@ -171,14 +177,36 @@ pub(crate) struct AnalyzeVisitor<'a> {
     /// The number of items enclosing the syntax being visited. The generics of the outermost item
     /// are the `root`.
     item_depth: usize,
-    /// The type being visited is the referent of a reference which cannot be interned as a whole
-    /// (its lifetime is elided or local), so a trait object without a lifetime bound, which
-    /// defaults to that lifetime, cannot be interned alone.
+    /// The type being visited is the referent of a reference, or a type argument of a path, which
+    /// cannot be interned as a whole (its lifetime is elided or local, or the path is in a trait
+    /// bound), so a trait object without a lifetime bound, which defaults to that lifetime, cannot
+    /// be interned alone.
     elided_ref: bool,
-    /// The type being visited is the referent of a reference with a lifetime of the Leaker's
-    /// generics, so a trait object without a lifetime bound defaults to that lifetime, and is not
-    /// the same type when interned alone (it would default to `'static`).
-    ref_lifetime: bool,
+    /// The type being visited is (directly) a bare identifier written as a generic argument (e.g.
+    /// `SIZE` in `W<SIZE>`), which may be a const (see [`PendingType::ambiguous`]).
+    ambiguous_arg: bool,
+    /// The type being visited is the referent of a reference, or a type argument of a path, with a
+    /// lifetime of the Leaker's generics, so a trait object without a lifetime bound defaults to
+    /// that lifetime, and is not the same type when interned alone (it would default to
+    /// `'static`).
+    inherits: Option<Inherits>,
+    /// The depth of the type owning the expression being visited in a type (an array length or a
+    /// const argument), if any. The types in it are not interned on their own: the copy of the
+    /// expression would have a projection (`<Self as Repeater<..>>::Type`) in an anonymous
+    /// constant, which is not permitted if the generics (or `Self`) are in it.
+    expr_owner: Option<usize>,
+}
+
+/// What a trait object without a lifetime bound inherits its lifetime from (see
+/// [`AnalyzeVisitor::inherits`]).
+#[derive(Clone, Copy)]
+enum Inherits {
+    /// A reference, which is interned as a whole (see `Leaker::needs_parent()`).
+    Reference,
+    /// A path with lifetime arguments (e.g. `Ref<'a, dyn Trait>`, where `Ref<'a, T: 'a>` makes the
+    /// default `'a`), which is the type at the given depth. The default depends on the path, which
+    /// we cannot resolve, so it is interned as a whole.
+    Path(usize),
 }
 
 impl<'a> AnalyzeVisitor<'a> {
@@ -210,7 +238,9 @@ impl<'a> AnalyzeVisitor<'a> {
             type_depth: 0,
             item_depth: 0,
             elided_ref: false,
-            ref_lifetime: false,
+            ambiguous_arg: false,
+            inherits: None,
+            expr_owner: None,
         }
     }
 
@@ -345,7 +375,6 @@ impl<'a> AnalyzeVisitor<'a> {
         self.frame.effects
     }
 
-    /// Decides how to handle the type `ty` at `depth`, given what is found in it (`inner`).
     /// Merges what is found in a trait object into the reference it is the referent of, in place
     /// of [`AnalyzeVisitor::decide()`] (which would make it a type of its own).
     fn decide_as_reference(&mut self, depth: usize, mut inner: Frame) {
@@ -366,7 +395,93 @@ impl<'a> AnalyzeVisitor<'a> {
         self.frame.effects.extend(effects);
     }
 
-    fn decide(&mut self, ty: &Type, depth: usize, mut inner: Frame) {
+    /// Merges what is found in a type which cannot be interned on its own (e.g. a trait object
+    /// inheriting the lifetime of its path, or a type in an array length) into `owner`, the depth
+    /// of the enclosing type which is interned as a whole instead, in place of
+    /// [`AnalyzeVisitor::decide()`]: all its causes are those of the owner, as if they were in
+    /// its own path, and its components are not interned either (the owner is not decomposed).
+    fn decide_as_owner(&mut self, owner: usize, mut inner: Frame) {
+        if inner.min_depth != usize::MAX {
+            self.own_causes(inner.must_start, owner);
+            inner.min_depth = owner;
+        }
+        self.frame.min_depth = self.frame.min_depth.min(inner.min_depth);
+        self.frame.local_scope = self.frame.local_scope.min(inner.local_scope);
+        self.frame.mentions_root |= inner.mentions_root;
+        self.frame.mentions_self |= inner.mentions_self;
+        self.frame.module_item |= inner.module_item;
+        self.frame.hard |= inner.hard;
+        self.frame.relative |= inner.relative;
+        let effects = std::mem::take(&mut inner.effects);
+        self.frame.effects.extend(effects);
+    }
+
+    /// Makes the causes found since `must_start` those of the type at `depth` (see
+    /// [`CheckResult::is_own`]).
+    fn own_causes(&mut self, must_start: usize, depth: usize) {
+        for must in &mut self.musts[must_start..] {
+            must.0 = depth;
+        }
+    }
+
+    /// Returns the requirements of the type `ty` at `depth`, given what is found in it (`inner`),
+    /// if it can be interned as a whole because of its own path (see [`CheckResult::is_own`]).
+    /// Otherwise returns the conflict: it must be interned but cannot be, and cannot be decomposed
+    /// either, so its path should be made absolute.
+    fn own_requirements(
+        &self,
+        ty: &Type,
+        depth: usize,
+        inner: &Frame,
+    ) -> std::result::Result<Requirements, CheckResult> {
+        if self.impossibles.len() > inner.impossible_start {
+            // The type cannot be interned (e.g. `MyType<'_>`).
+            return Err(self.causes(inner.must_start, inner.impossible_start, depth));
+        }
+        if self.in_default && inner.mentions_self {
+            // The Repeater's implementation of the default cannot know what `Self` is, as the
+            // default is also used to compute the arguments of the trait.
+            return Err(CheckResult {
+                must: vec![first_self_in_type(ty).unwrap_or_else(|| quote!(Self))],
+                impossible: vec![quote!(#ty)],
+                is_own: true,
+                note: Some("a default of a parameter cannot depend on `Self`".to_string()),
+            });
+        }
+        let requirements = self.requirements_of(ty, inner);
+        match self.self_in_bounds(&requirements) {
+            Some(self_path) => Err(CheckResult {
+                must: vec![quote!(#ty)],
+                impossible: vec![self_path],
+                is_own: true,
+                note: Some(
+                    "the bounds of its generics mention `Self`, which cannot be leaked".to_string(),
+                ),
+            }),
+            None => Ok(requirements),
+        }
+    }
+
+    /// Decides how to handle the type `ty` at `depth`, given what is found in it (`inner`).
+    /// `ambiguous` is `true` if it is (directly) a bare identifier written as a generic argument.
+    fn decide(&mut self, ty: &Type, depth: usize, ambiguous: bool, mut inner: Frame) {
+        // A bare identifier as a generic argument (e.g. `SIZE` in `W<SIZE>`) may be a const, which
+        // syn parses as a type, and which cannot be interned on its own. So the type it is a
+        // component of is interned as a whole, with the cause in its own path, if it can be.
+        // Otherwise the identifier is a type like any other. A type referring to an item of the
+        // module is not interned either, as the Referrer shadows the item in the copy of the
+        // module. A group is transparent (see `has_ambiguous()`). Parentheses are not interned in
+        // place of the type containing them either: a trait object inheriting a lifetime in them
+        // is not interned alone (see `decide_as_owner()`).
+        if inner.min_depth != depth
+            && !inner.module_item
+            && !matches!(ty, Type::Group(_) | Type::Paren(_))
+            && has_ambiguous(&inner.effects)
+            && self.own_requirements(ty, depth, &inner).is_ok()
+        {
+            self.own_causes(inner.must_start, depth);
+            inner.min_depth = depth;
+        }
         // The causes and the local generics also belong to the enclosing type, as those of a
         // component.
         self.frame.min_depth = self.frame.min_depth.min(inner.min_depth);
@@ -383,14 +498,29 @@ impl<'a> AnalyzeVisitor<'a> {
         let mentions_local = inner.local_scope < self.scopes.len();
         let effects = std::mem::take(&mut inner.effects);
 
-        if has_impossible {
-            if is_own {
+        if is_own {
+            match self.own_requirements(ty, depth, &inner) {
+                Ok(requirements) => {
+                    // If the type depends on both the type context and generics, it cannot be
+                    // decomposed further. It is interned together with the generics it needs,
+                    // which the Repeater's implementation must declare (see
+                    // [`Referrer::generics()`](crate::Referrer::generics())).
+                    self.frame.effects.push(Effect::Type(Box::new(PendingType {
+                        ty: ty.clone(),
+                        is_must_intern: true,
+                        is_hard: inner.hard,
+                        has_must: true,
+                        ambiguous: ambiguous && requirements.is_empty(),
+                        requirements,
+                        components: Vec::new(),
+                    })));
+                }
                 // The type must be interned (because of its own path, the first of `must`, which
-                // depends on the type context) but cannot be (e.g. `MyType<'_>`), and cannot be
-                // decomposed either. The path should be made absolute.
-                let result = self.causes(inner.must_start, inner.impossible_start, depth);
-                self.frame.effects.push(Effect::Error(result));
-            } else if has_must {
+                // depends on the type context) but cannot be, and cannot be decomposed either.
+                Err(conflict) => self.frame.effects.push(Effect::Error(conflict)),
+            }
+        } else if has_impossible {
+            if has_must {
                 // The type cannot be interned as a whole (e.g. `&MyType` with an elided lifetime,
                 // or `impl Iterator<Item = MyType>`), but its components can.
                 self.frame.effects.extend(effects);
@@ -399,42 +529,6 @@ impl<'a> AnalyzeVisitor<'a> {
                 // `impl ::path::Trait`). It is copied as it is, so the primitive types in it are
                 // assumed.
                 self.frame.effects.extend(primitive_effects(effects));
-            }
-        } else if is_own {
-            let requirements = self.requirements_of(ty, &inner);
-            if self.in_default && inner.mentions_self {
-                // The Repeater's implementation of the default cannot know what `Self` is, as
-                // the default is also used to compute the arguments of the trait.
-                self.frame.effects.push(Effect::Error(CheckResult {
-                    must: vec![first_self_in_type(ty).unwrap_or_else(|| quote!(Self))],
-                    impossible: vec![quote!(#ty)],
-                    is_own: true,
-                    note: Some("a default of a parameter cannot depend on `Self`".to_string()),
-                }));
-            } else if let Some(self_path) = self.self_in_bounds(&requirements) {
-                self.frame.effects.push(Effect::Error(CheckResult {
-                    must: vec![quote!(#ty)],
-                    impossible: vec![self_path],
-                    is_own: true,
-                    note: Some(
-                        "the bounds of its generics mention `Self`, which cannot be leaked"
-                            .to_string(),
-                    ),
-                }));
-            } else {
-                // If the type depends on both the type context and generics, it cannot be
-                // decomposed further. It is interned together with the generics it needs, which
-                // the Repeater's implementation must declare (see
-                // [`Referrer::generics()`](crate::Referrer::generics())).
-                self.frame.effects.push(Effect::Type(Box::new(PendingType {
-                    ty: ty.clone(),
-                    is_must_intern: true,
-                    is_hard: inner.hard,
-                    has_must: true,
-                    looks_like_const: requirements.is_empty() && looks_like_const(ty),
-                    requirements,
-                    components: Vec::new(),
-                })));
             }
         } else if mentions_local || inner.module_item || (self.in_default && inner.mentions_self) {
             // The type itself is not interned because it depends on local generics (or refers to
@@ -453,7 +547,7 @@ impl<'a> AnalyzeVisitor<'a> {
                     is_hard: inner.hard,
                     has_must,
                     requirements,
-                    looks_like_const: false,
+                    ambiguous: false,
                     components: effects,
                 })));
             }
@@ -675,23 +769,10 @@ impl Analysis {
                     self.apply(contexts, pending.components, parent);
                 }
                 Effect::Type(pending) => {
-                    let ty = &pending.ty;
-                    if parent.is_none() && pending.looks_like_const {
-                        // A bare identifier such as `SIZE` in `T: MyTrait<SIZE>` is parsed as a
-                        // type, but is probably a const (by the naming convention), which cannot be
-                        // leaked on its own (like `T: MyTrait<{ SIZE }>`).
-                        self.errors.push(CheckResult {
-                            must: vec![quote!(#ty)],
-                            impossible: vec![quote!(#ty)],
-                            is_own: true,
-                            note: None,
-                        });
-                        continue;
-                    }
                     let context = contexts.intern(pending.requirements);
                     let key = self.types.add(
                         context,
-                        ty,
+                        &pending.ty,
                         parent,
                         pending.is_must_intern,
                         pending.is_hard,
@@ -872,10 +953,13 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     fn visit_type(&mut self, i: &Type) {
         let frame = Frame::new(self.musts.len(), self.impossibles.len());
         let outer = std::mem::replace(&mut self.frame, frame);
-        // Whether this is (directly) the referent of a reference which cannot be interned as a whole
-        // (its lifetime is elided or local).
+        // Whether this is (directly) the referent of a reference, or an argument of a path, which
+        // cannot be interned as a whole (its lifetime is elided or local), or one with a lifetime
+        // of the Leaker (see `inherits`).
         let elided_ref = std::mem::take(&mut self.elided_ref);
-        let ref_lifetime = std::mem::take(&mut self.ref_lifetime);
+        // Whether this is a bare identifier written as a generic argument (see `ambiguous_arg`).
+        let ambiguous = std::mem::take(&mut self.ambiguous_arg);
+        let inherits = self.inherits.take();
         self.type_depth += 1;
         match i {
             Type::Macro(m) => {
@@ -899,7 +983,9 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             }
             Type::Paren(_) | Type::Group(_) => {
                 self.elided_ref = elided_ref;
-                self.ref_lifetime = ref_lifetime;
+                self.inherits = inherits;
+                // `W<(N)>` is unambiguously a type, unlike `W<N>` (also in an invisible group).
+                self.ambiguous_arg = ambiguous && matches!(i, Type::Group(_));
                 syn::visit::visit_type(self, i)
             }
             Type::Reference(TypeReference { lifetime, .. }) => {
@@ -911,7 +997,9 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                             || self
                                 .scope_of(&lifetime.to_string())
                                 .map_or(false, |scope| scope > 0);
-                        self.ref_lifetime = !self.elided_ref && lifetime.ident != "static";
+                        if !self.elided_ref && lifetime.ident != "static" {
+                            self.inherits = Some(Inherits::Reference);
+                        }
                     }
                     None => {
                         self.push_impossible(quote!(#i));
@@ -939,18 +1027,22 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             _ => syn::visit::visit_type(self, i),
         }
         let inner = std::mem::replace(&mut self.frame, outer);
-        if ref_lifetime
-            && matches!(i, Type::TraitObject(object) if !object
+        let inherits = inherits.filter(|_| {
+            matches!(i, Type::TraitObject(object) if !object
                 .bounds
                 .iter()
                 .any(|bound| matches!(bound, TypeParamBound::Lifetime(_))))
-            && self.impossibles.len() == inner.impossible_start
-        {
-            // Not interned alone (see `ref_lifetime`): its components are those of the reference,
+                && self.impossibles.len() == inner.impossible_start
+        });
+        match (self.expr_owner, inherits) {
+            // Not interned alone (see `expr_owner`).
+            (Some(owner), _) => self.decide_as_owner(owner, inner),
+            // Not interned alone (see `inherits`): its components are those of the reference,
             // which is interned as a whole, and must be if the trait object has to be.
-            self.decide_as_reference(self.type_depth, inner);
-        } else {
-            self.decide(i, self.type_depth, inner);
+            (None, Some(Inherits::Reference)) => self.decide_as_reference(self.type_depth, inner),
+            // Likewise, with all its causes in the path.
+            (None, Some(Inherits::Path(owner))) => self.decide_as_owner(owner, inner),
+            (None, None) => self.decide(i, self.type_depth, ambiguous, inner),
         }
         self.type_depth -= 1;
     }
@@ -1114,7 +1206,50 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                 self.push_impossible(quote!(#i));
             }
         }
-        syn::visit::visit_expr(self, i)
+        // The types in an expression of a type belong to the type (see `expr_owner`).
+        let outer = self.expr_owner;
+        if self.type_depth > 0 && outer.is_none() {
+            self.expr_owner = Some(self.type_depth);
+        }
+        syn::visit::visit_expr(self, i);
+        self.expr_owner = outer;
+    }
+
+    fn visit_angle_bracketed_generic_arguments(&mut self, i: &AngleBracketedGenericArguments) {
+        // A trait object without a lifetime bound, as an argument of a path with lifetime
+        // arguments, may default to one of them (e.g. `Ref<'a, dyn Trait>` is `Ref<'a, dyn Trait +
+        // 'a>`, because of the bound `T: 'a` of `Ref<'a, T>`), which only the definition of the
+        // path tells. So it is treated like the referent of a reference with the lifetime.
+        let mut elided = false;
+        let mut inherited = false;
+        for arg in &i.args {
+            if let GenericArgument::Lifetime(lifetime) = arg {
+                if lifetime.ident == "_"
+                    || self
+                        .scope_of(&lifetime.to_string())
+                        .map_or(false, |scope| scope > 0)
+                {
+                    elided = true;
+                } else if lifetime.ident != "static" {
+                    inherited = true;
+                }
+            }
+        }
+        // The path is interned as a whole, which needs a type (not a trait bound, for instance).
+        let elided = elided || (inherited && self.type_depth == 0);
+        for arg in &i.args {
+            if let GenericArgument::Type(ty) = arg {
+                self.elided_ref = elided;
+                if inherited && !elided {
+                    self.inherits = Some(Inherits::Path(self.type_depth));
+                }
+                // A bare identifier may be a const, which syn parses as a type (see
+                // `ambiguous_arg`). Not so the types in the other syntax, such as associated type
+                // bindings or the elements of a tuple.
+                self.ambiguous_arg = is_bare_ident(ty);
+            }
+            self.visit_generic_argument(arg);
+        }
     }
 
     fn visit_expr_path(&mut self, i: &ExprPath) {
@@ -1138,6 +1273,29 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             self.relative_path(quote!(#i), quote!(#i));
         }
     }
+}
+
+/// Returns `true` if `ty` is a single identifier (e.g. `SIZE`), which may be a const when it is a
+/// generic argument. Invisible groups (e.g. from `$t:ty` in `macro_rules!`) are transparent, but
+/// parentheses are not: `(SIZE)` is a type.
+fn is_bare_ident(ty: &Type) -> bool {
+    match ty {
+        Type::Group(TypeGroup { elem, .. }) => is_bare_ident(elem),
+        Type::Path(TypePath { qself: None, path }) => path.get_ident().is_some(),
+        _ => false,
+    }
+}
+
+/// Returns `true` if a type among `effects` is ambiguous (see [`PendingType::ambiguous`]), also
+/// inside a group, which is transparent.
+fn has_ambiguous(effects: &[Effect]) -> bool {
+    effects.iter().any(|effect| match effect {
+        Effect::Type(pending) => {
+            pending.ambiguous
+                || (matches!(pending.ty, Type::Group(_)) && has_ambiguous(&pending.components))
+        }
+        _ => false,
+    })
 }
 
 /// Returns the effects which assume the primitive types, among `effects` (and those of the types
