@@ -525,10 +525,13 @@ fn test_self_ty_cannot_be_interned() {
         leaker
             .intern_with(&item.generics, |v| v.visit_item_trait(&item))
             .map_err(syn::Error::from)?;
-        Ok(leaker
-            .finish()
+        // The required entries (the optional ones are those of external crates, below).
+        let referrer = leaker.finish();
+        Ok(referrer
             .iter()
-            .map(|t| quote!(#t).to_string())
+            .enumerate()
+            .filter(|(ix, _)| referrer.must(*ix))
+            .map(|(_, t)| quote!(#t).to_string())
             .collect::<BTreeSet<_>>())
     };
     let set = |types: &[&str]| types.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
@@ -581,6 +584,30 @@ fn test_self_ty_cannot_be_interned() {
     assert_eq!(leak(sig.clone(), false).unwrap(), set(&["Rel"]));
     assert_eq!(leak(sig, true).unwrap(), set(&[":: k :: W < Rel , Self >"]));
 
+    // The type of an external crate with `Self` in it is an optional entry (which the Referrer
+    // may replace) only if `Self` can be leaked (old: not an entry, as the crate was trusted).
+    let optional = |self_ty_can_be_interned: bool| {
+        let item: ItemTrait = parse_quote!(
+            trait Tr {
+                fn f(&self) -> ::k::W<(Rel,), Self>;
+            }
+        );
+        let mut leaker = Leaker::new();
+        leaker.self_ty_can_be_interned = self_ty_can_be_interned;
+        leaker
+            .intern_with(&item.generics, |v| v.visit_item_trait(&item))
+            .unwrap();
+        let referrer = leaker.finish();
+        referrer
+            .iter()
+            .enumerate()
+            .filter(|(ix, _)| !referrer.must(*ix))
+            .map(|(_, t)| quote!(#t).to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(optional(true), [":: k :: W < (Rel ,) , Self >"]);
+    assert!(optional(false).is_empty());
+
     // `Self` alone is never leaked.
     for ty in [
         quote!(Self),
@@ -622,15 +649,22 @@ fn test_bodies_are_not_analyzed() {
         .intern_with(&Generics::default(), |v| v.visit_item_impl(&item))
         .unwrap();
     let referrer = leaker.finish();
+    // `::k::W`, the type of an external crate, is an optional entry, after the required ones.
     assert_eq!(
         referrer
             .iter()
-            .map(|t| quote!(#t).to_string())
-            .collect::<BTreeSet<_>>(),
-        ["RelC", "RelArg", "RelRet"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<BTreeSet<_>>()
+            .enumerate()
+            .map(|(ix, t)| (quote!(#t).to_string(), referrer.must(ix)))
+            .collect::<Vec<_>>(),
+        [
+            ("RelArg", true),
+            ("RelC", true),
+            ("RelRet", true),
+            (":: k :: W", false)
+        ]
+        .iter()
+        .map(|(s, must)| (s.to_string(), *must))
+        .collect::<Vec<_>>()
     );
 
     // Also those of the nested items.

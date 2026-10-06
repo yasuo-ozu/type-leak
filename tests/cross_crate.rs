@@ -96,8 +96,8 @@ fn edge_cases() {
 /// The `$crate` paths of `DollarCrate` (a supertrait, types, an array length and a bound), which
 /// the Referrer's crate copies, resolve to the Leaker's crate.
 ///
-/// The exact results of the Leaker for such paths (with and without
-/// `allow_external_crates`) are checked when the Leaker's crate is compiled, by
+/// The exact results of the Leaker for such paths (and for the absolute paths of the external
+/// crates, which are optional entries) are checked when the Leaker's crate is compiled, by
 /// `check_leak!` in `tests/crates/leaker`.
 #[test]
 fn dollar_crate_paths() {
@@ -188,4 +188,34 @@ fn types_in_expressions() {
     let g = GenericExpr::<true>(Inner);
     assert_eq!(g.expr_array(), Some([1, 2, 3]));
     assert_eq!(g.expr_arg().n(), 3);
+}
+
+/// The types of external crates (`::std::vec::Vec<..>`, which the Leaker does not allow) are
+/// optional entries: the Referrer's crate, which leaves them as written (`Trusting`) and the one
+/// which replaces them by the Repeater's projections (`Strict`) both compile and forward.
+#[test]
+fn external_crate_types() {
+    use type_leak_test_leaker::m::External;
+    use type_leak_test_referrer::{Strict, Trusting};
+
+    fn check<E: External<u8>>(e: E) -> E {
+        assert_eq!(
+            e.wrapped().iter().map(|(r,)| r.0).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(e.generic(vec![1u8, 2, 3]), 3);
+        assert_eq!(e.borrowed(&"xyz".to_string()), "yz");
+        let nested = e.nested();
+        assert_eq!((nested.0.clone(), (nested.1).0), (vec![3, 4], 5));
+        assert_eq!(e.dynamic(Box::new(|r| r.0 * 2)), 14);
+        e
+    }
+    assert_eq!(
+        <Trusting as External<u8>>::receiver(Box::new(check(Trusting(Inner)))),
+        6
+    );
+    assert_eq!(
+        <Strict as External<u8>>::receiver(Box::new(check(Strict(Inner)))),
+        6
+    );
 }

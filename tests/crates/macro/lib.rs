@@ -46,6 +46,9 @@ struct LeakArgs {
     helper: Path,
     repeater: Path,
     module: Path,
+    /// An external crate which the Leaker allows (`allow = ::std`), whose types are not optional
+    /// entries.
+    allow: Option<Path>,
 }
 
 impl Parse for LeakArgs {
@@ -67,10 +70,12 @@ impl Parse for LeakArgs {
             map.remove(key)
                 .ok_or_else(|| Error::new(Span::call_site(), format!("missing `{}`", key)))
         };
+        let allow = take("allow").ok();
         Ok(Self {
             helper: take("helper")?,
             repeater: take("repeater")?,
             module: take("module")?,
+            allow,
         })
     }
 }
@@ -146,9 +151,10 @@ pub fn leak_strict(
 
 /// Input of `check_leak!`: `{ expected } { config } item`.
 struct CheckLeakInput {
-    /// The leaked types, or the message of the error.
+    /// The leaked types (an optional entry is preceded by `?`), or the message of the error.
     expected: std::result::Result<Vec<String>, String>,
-    allow_external_crates: bool,
+    /// The paths allowed by the config (`allow = ::foo`).
+    allowed: Vec<Path>,
     item: Item,
 }
 
@@ -171,21 +177,26 @@ impl Parse for CheckLeakInput {
                     let lit: LitStr = input.parse()?;
                     return Ok(Err(lit.value()));
                 }
-                let types = Punctuated::<Type, Token![,]>::parse_terminated(input)?;
-                Ok(Ok(types.iter().map(type_string).collect()))
+                let mut types = Vec::new();
+                while !input.is_empty() {
+                    let optional = input.parse::<Option<Token![?]>>()?.is_some();
+                    let ty: Type = input.parse()?;
+                    types.push(entry_string(&ty, !optional));
+                    let _: Option<Token![,]> = input.parse()?;
+                }
+                Ok(Ok(types))
             },
             expected_tokens,
         )?;
         let config_tokens: TokenStream = braced_parse(input)?;
-        let mut allow_external_crates = true;
+        let mut allowed = Vec::new();
         syn::parse::Parser::parse2(
             |input: ParseStream| -> Result<()> {
                 while !input.is_empty() {
                     let key: Ident = input.parse()?;
                     input.parse::<Token![=]>()?;
-                    let value: LitBool = input.parse()?;
                     match key.to_string().as_str() {
-                        "allow_external_crates" => allow_external_crates = value.value,
+                        "allow" => allowed.push(input.parse()?),
                         _ => return Err(Error::new(key.span(), "unknown flag")),
                     }
                     let _: Option<Token![,]> = input.parse()?;
@@ -196,9 +207,18 @@ impl Parse for CheckLeakInput {
         )?;
         Ok(Self {
             expected,
-            allow_external_crates,
+            allowed,
             item: input.parse()?,
         })
+    }
+}
+
+/// Prints an entry: the type, preceded by `? ` if it is optional.
+fn entry_string(ty: &Type, must: bool) -> String {
+    if must {
+        type_string(ty)
+    } else {
+        format!("? {}", type_string(ty))
     }
 }
 
@@ -207,25 +227,25 @@ impl Parse for CheckLeakInput {
 ///
 /// ```ignore
 /// check_leak! {
-///     { Rel, Other<u8> }                     // the leaked types, sorted, or `error: "message"`
-///     { allow_external_crates = false }      // the config (`allow_primitive` is always set)
+///     { Rel, ? ::foo::X, Other<u8> }         // the leaked types, sorted, or `error: "message"`
+///     { allow = ::bar }                      // the config (`allow_primitive` is always set)
 ///     trait Tr { fn f(&self) -> $crate::m::Wrap<Rel>; } // a trait, a struct or a module
 /// }
 /// ```
 ///
-/// It expands to nothing if the result is as expected, and to a `compile_error!` otherwise.
+/// The optional entries (see `Referrer::must()`) are preceded by `?`. It expands to nothing if the
+/// result is as expected, and to a `compile_error!` otherwise.
 #[proc_macro]
 pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let CheckLeakInput {
         expected,
-        allow_external_crates,
+        allowed,
         item,
     } = parse_macro_input!(input as CheckLeakInput);
     let mut leaker = Leaker::from_config({
         let mut config = LeakerConfig::new();
-        config
-            .allow_primitive()
-            .allow_external_crates(allow_external_crates);
+        config.allow_primitive();
+        config.allowed_paths.extend(allowed);
         config
     });
     let result = match &item {
@@ -236,7 +256,12 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     };
     let got: std::result::Result<Vec<String>, String> = match result {
         Ok(_) => {
-            let mut types: Vec<String> = leaker.finish().iter().map(type_string).collect();
+            let referrer = leaker.finish();
+            let mut types: Vec<String> = referrer
+                .iter()
+                .enumerate()
+                .map(|(ix, ty)| entry_string(ty, referrer.must(ix)))
+                .collect();
             types.sort();
             Ok(types)
         }
@@ -274,6 +299,7 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let mut leaker = Leaker::from_config({
         let mut config = LeakerConfig::new();
         config.allow_primitive().allow_std_prelude();
+        config.allowed_paths.extend(args.allow.clone());
         config
     });
     leaker
@@ -288,6 +314,7 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
         helper,
         repeater,
         module,
+        ..
     } = &args;
     let id = trait_id(module, &item_trait.ident);
     let trait_ident = &item_trait.ident;
@@ -445,6 +472,13 @@ impl Parse for Input {
             repeater: braced_parse::<Path>(input)?,
             module: braced_parse::<Path>(input)?,
         };
+        // `strict` makes the Referrer replace the optional entries as well (it does not trust the
+        // names of the crates, see `Referrer::allow_ambiguous_crate_name()`).
+        let mut header = header;
+        if input.peek(Ident) && input.fork().parse::<Ident>()? == "strict" {
+            input.parse::<Ident>()?;
+            header.referrer = header.referrer.allow_ambiguous_crate_name(false);
+        }
         if input.peek(Ident) && !input.peek(Token![impl]) {
             let keyword: Ident = input.parse()?;
             if keyword != "copy" {
@@ -652,8 +686,9 @@ pub fn __implement(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 
 /// Copies the items of `copy [SelfTy] { items }` with the leaked types rewritten, as the Referrer
 /// does the signatures of the trait: `<SelfTy as Repeater<..>>::Type` (`Self` if there is no
-/// `SelfTy`) in place of the leaked types, where `Self` of the leaked types is `SelfTy`. The trait
-/// has no generic parameters.
+/// `SelfTy`) in place of the leaked types, where `Self` of the leaked types is `SelfTy`. The
+/// generic parameters of the trait are in scope in the items with the same names (e.g. the
+/// `'a` of an `impl<'a> Trait<'a> for Wrapper`).
 fn copy_impl(input: CopyInput) -> Result<TokenStream> {
     let CopyInput {
         header:
@@ -667,15 +702,18 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
         self_ty,
         items,
     } = input;
-    if !item_trait.generics.params.is_empty() {
-        return Err(Error::new(
-            item_trait.generics.span(),
-            "`copy` supports only traits without generic parameters",
-        ));
-    }
     let slots = RepeaterSlots::new(repeater.clone());
     let trait_ident = &item_trait.ident;
-    let self_path: Path = parse_quote!(#trait_ident);
+    let params = &item_trait.generics.params;
+    let trait_params: Vec<GenericArgument> = params
+        .iter()
+        .map(|param| parse2(param_as_arg(param)))
+        .collect::<Result<_>>()?;
+    let self_path: Path = if trait_params.is_empty() {
+        parse_quote!(#trait_ident)
+    } else {
+        parse_quote!(#trait_ident<#(#trait_params),*>)
+    };
     let self_in_copy: Type = self_ty.clone().unwrap_or_else(|| parse_quote!(Self));
     let mut error = None;
     let mut copies = TokenStream::new();
@@ -684,7 +722,7 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
             .clone()
             .into_visitor(Some(SelfRequirement::Bound(self_path.clone())), |_, ix| {
                 let projection = (|| -> Result<Type> {
-                    let args = referrer.generic_args(ix, &Punctuated::new(), &[])?;
+                    let args = referrer.generic_args(ix, params, &trait_params)?;
                     let encoded = slots.encode_generics_args_to_ty_with_self(
                         &args,
                         &referrer.generics(ix).params,

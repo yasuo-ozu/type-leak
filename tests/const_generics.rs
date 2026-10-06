@@ -316,10 +316,19 @@ fn test_binder_in_type() {
         }
     };
     let referrer = leak(&item);
+    // The `Box` of an external crate is an optional entry (a type with the lifetime of the binder
+    // inside it, which does not use the binder itself), and `Rel<L>` is the required one.
     assert_eq!(
         entries(&referrer),
-        [entry(parse_quote!(Rel<L>), parse_quote!(<L>))]
+        [
+            entry(parse_quote!(Rel<L>), parse_quote!(<L>)),
+            entry(
+                parse_quote!(::std::boxed::Box<dyn for<'b> ::p::F<&'b Rel<L>>>),
+                parse_quote!(<L>)
+            ),
+        ]
     );
+    assert!(referrer.must(0) && !referrer.must(1));
     assert_eq!(
         rewrite(referrer, item),
         expected(parse_quote! {

@@ -74,3 +74,21 @@ type_leak_test_leaker::s::ExprTypes!(impl ExprTypes for Concrete => 0);
 /// A generic implementor.
 pub struct GenericExpr<const B: bool>(pub Inner);
 type_leak_test_leaker::s::ExprTypes!(impl<const B: bool> ExprTypes for GenericExpr<B> => 0);
+
+/// The types of external crates are optional entries: the Referrer leaves them as written, or
+/// replaces them with the Repeater's projections (`strict`, the Referrer does not trust the names
+/// of the crates), with the relative types in them replaced either way.
+pub struct Trusting(pub Inner);
+type_leak_test_leaker::m::External!(impl<T> External<T> for Trusting => 0 {
+    fn receiver(self: ::std::boxed::Box<Self>) -> usize {
+        type_leak_test_leaker::m::External::<T>::receiver(::std::boxed::Box::new(self.0))
+    }
+});
+
+/// The same, replacing the optional entries as well.
+pub struct Strict(pub Inner);
+type_leak_test_leaker::m::External!(strict impl<T> External<T> for Strict => 0 {
+    fn receiver(self: ::std::boxed::Box<Self>) -> usize {
+        type_leak_test_leaker::m::External::<T>::receiver(::std::boxed::Box::new(self.0))
+    }
+});

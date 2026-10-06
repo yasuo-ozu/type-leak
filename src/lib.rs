@@ -21,8 +21,9 @@ pub use crate::analyze::CheckResult;
 pub use crate::config::LeakerConfig;
 pub use crate::context::{ContextId, SelfRequirement};
 pub use crate::encode::{
-    encode_generics_args_to_ty_with, encode_generics_params_to_ty,
-    encode_generics_params_to_ty_with, without_encoded_bounds, EncodeError,
+    encode_generics_args_to_ty_with, encode_generics_args_to_ty_with_self,
+    encode_generics_params_to_ty, encode_generics_params_to_ty_with,
+    encode_generics_params_to_ty_with_self, without_encoded_bounds, EncodeError,
 };
 pub use crate::error::NotInternableError;
 pub use crate::leaker::Leaker;

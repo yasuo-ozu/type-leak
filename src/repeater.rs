@@ -1,8 +1,8 @@
 //! The definition of the Repeater trait, and encoding generics into its const slots.
 
 use crate::encode::{
-    const_param_primitive, encode_generics_args_with_params, encode_outlives_bounds,
-    encode_self_outlives, normalize_const_arg, params_as_args, with_trailing_comma, EncodeError,
+    const_param_primitive, encode_generics_args_with_params, encode_generics_params_with,
+    normalize_const_arg, EncodeError,
 };
 use proc_macro2::Span;
 use syn::punctuated::Punctuated;
@@ -211,6 +211,10 @@ impl RepeaterSlots {
     /// [`EncodeError::UnsupportedConstType`] if the type of a const parameter is not a primitive
     /// type.
     ///
+    /// This is [`encode_generics_params_to_ty_with_self()`](crate::encode_generics_params_to_ty_with_self())
+    /// with the const parameters encoded by the slots of the Repeater: both are implemented by the
+    /// same function, so they encode the same, except for the const parameters.
+    ///
     /// ```
     /// # use type_leak::*;
     /// # use syn::*;
@@ -237,31 +241,9 @@ impl RepeaterSlots {
         iter: impl IntoIterator<Item = &'a GenericParam>,
         self_outlives: Option<(&Type, &[Lifetime])>,
     ) -> std::result::Result<Type, EncodeError> {
-        let params: Vec<&GenericParam> = iter.into_iter().collect();
-        let mut elems = params
-            .iter()
-            .map(|param| -> std::result::Result<Type, EncodeError> {
-                Ok(match param {
-                    GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
-                        parse_quote!(& #lifetime ())
-                    }
-                    GenericParam::Type(TypeParam { ident, .. }) => parse_quote!(#ident),
-                    GenericParam::Const(ConstParam { ident, ty, .. }) => {
-                        self.encode_const(&parse_quote!(#ident), ty)?
-                    }
-                })
-            })
-            .collect::<std::result::Result<Punctuated<Type, Token![,]>, _>>()?;
-        // The arguments are the parameters themselves, which cannot fail.
-        let args = params_as_args(&params);
-        elems.extend(encode_outlives_bounds(&params, &args)?);
-        if let Some((self_ty, lifetimes)) = self_outlives {
-            elems.extend(encode_self_outlives(&params, &args, self_ty, lifetimes)?);
-        }
-        Ok(Type::Tuple(TypeTuple {
-            paren_token: Default::default(),
-            elems: with_trailing_comma(elems),
-        }))
+        encode_generics_params_with(iter, self_outlives, |ConstParam { ident, ty, .. }| {
+            self.encode_const(&parse_quote!(#ident), ty)
+        })
     }
 
     /// Encodes [`GenericArgument`]s into a type. `params` are the [`GenericParam`]s of the Leaker
@@ -309,6 +291,10 @@ impl RepeaterSlots {
     /// argument of `'a` and `Self` is `self_ty`: the type whose Repeater is used, i.e. `Self` in
     /// the implementation of the Leaker's trait. It is the same type as the encoding of
     /// [`RepeaterSlots::encode_generics_params_to_ty_with_self()`] (see there).
+    ///
+    /// This is [`encode_generics_args_to_ty_with_self()`](crate::encode_generics_args_to_ty_with_self())
+    /// with the const arguments encoded by the slots of the Repeater: both are implemented by the
+    /// same function, so they encode the same, except for the const arguments.
     ///
     /// ```
     /// # use type_leak::*;

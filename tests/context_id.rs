@@ -10,8 +10,9 @@ use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{ContextId, Leaker, Referrer, SelfRequirement};
 
-fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+/// The tag of the format of a serialized Referrer, which it starts with.
+fn version() -> String {
+    format!("type-leak-format-{}", Referrer::FORMAT_VERSION)
 }
 
 fn id(n: usize) -> ContextId {
@@ -602,4 +603,125 @@ fn ids_must_ascend() {
     // The largest id cannot be followed by another one.
     let text = format!("\"{}\" # {} (A)", version, usize::MAX);
     assert!(parse_str::<Referrer>(&text).is_err());
+}
+
+/// Parses `Referrer, ContextId`, as the Referrer's macro receives them from the Leaker's.
+fn parse_referrer_and_top_level(tokens: TokenStream) -> (Referrer, ContextId) {
+    use parse::Parser;
+    (|input: parse::ParseStream| -> Result<(Referrer, ContextId)> {
+        let referrer = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let top_level = input.parse()?;
+        input.parse::<parse::Nothing>()?;
+        Ok((referrer, top_level))
+    })
+    .parse2(tokens)
+    .unwrap()
+}
+
+#[test]
+fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
+    use type_leak::{encode_generics_args_to_ty_with, encode_generics_params_to_ty_with};
+    let usize_const =
+        |ConstParam { ident, .. }: &ConstParam| -> Type { parse_quote!([(); #ident]) };
+
+    // The Referrer cannot tell the top-level context (it is not serialized, as it may also be
+    // the context of an entry), but the id returned by the Leaker is the same in the Referrer
+    // parsed from tokens, and it is written and parsed as an integer.
+    let tr: ItemTrait = parse_quote! {
+        trait Tr<'a, const N: usize, T: 'a, U = ::core::primitive::u8> {
+            fn f(&self, x: Rel<'a, T>) -> Wrap<N>;
+        }
+    };
+    let (leaker, top_level) = Leaker::from_trait(&tr).unwrap();
+    let referrer = leaker.finish();
+    // The generics are in the canonical form: sorted by kind and name, without defaults.
+    assert_eq!(
+        s(referrer.context_generics(top_level)),
+        "< 'a , T : 'a , U , const N : usize >"
+    );
+    let leaker_params = &referrer.context_generics(top_level).params;
+    let on_leaker_side = encode_generics_params_to_ty_with(leaker_params, usize_const);
+    let expected: Type = parse_quote!((&'a (), T, U, [(); N], &'a T));
+    assert_eq!(s(&on_leaker_side), s(&expected));
+
+    let tokens = quote!(#referrer, #top_level);
+    let (parsed, parsed_top_level) = parse_referrer_and_top_level(tokens);
+    assert_eq!(parsed, referrer);
+    assert_eq!(parsed_top_level, top_level);
+    let params = &parsed.context_generics(parsed_top_level).params;
+    assert_eq!(s(params), s(leaker_params));
+
+    // The arguments of the trait are completed (the generics of a context have no defaults), and
+    // put in the order of the generics (that of the trait differs): the encoding is that of the
+    // generics with the arguments substituted. Matching them by position would be wrong.
+    let args: AngleBracketedGenericArguments = parse_quote!(<'q, 3, u16>);
+    let err =
+        encode_generics_args_to_ty_with(&args.args, params, |_, _| unreachable!()).unwrap_err();
+    assert!(
+        matches!(err, type_leak::EncodeError::UnexpectedArgument(_)),
+        "{}",
+        err
+    );
+    let completed = parsed
+        .complete_args(&args.args, &tr.generics.params, |_, _, _| unreachable!())
+        .unwrap();
+    let args = parsed
+        .context_generic_args(parsed_top_level, &tr.generics.params, &completed)
+        .unwrap();
+    assert_eq!(
+        args.iter().map(s).collect::<Vec<_>>(),
+        ["'q", "u16", ":: core :: primitive :: u8", "3"]
+    );
+    let on_referrer_side =
+        encode_generics_args_to_ty_with(&args, params, |expr, _| parse_quote!([(); #expr]))
+            .unwrap();
+    let expected: Type = parse_quote!((&'q (), u16, ::core::primitive::u8, [(); 3], &'q u16));
+    assert_eq!(s(&on_referrer_side), s(&expected));
+
+    // It is `generic_args()` of an entry for the context of the entry.
+    for ix in 0..parsed.iter().count() {
+        assert_eq!(
+            parsed
+                .generic_args(ix, &tr.generics.params, &completed)
+                .unwrap()
+                .iter()
+                .map(s)
+                .collect::<Vec<_>>(),
+            parsed
+                .context_generic_args(parsed.context(ix), &tr.generics.params, &completed)
+                .unwrap()
+                .iter()
+                .map(s)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn the_top_level_generics_do_not_have_the_bounds_the_entries_imply() {
+    // `&'a Rel<T>` implies `T: 'a`, which the trait does not declare: the generics of its entry
+    // have the bound, and those of the top-level context do not, so a Repeater encoding the
+    // generics of the trait for every entry does not carry it (the implementation of such an
+    // entry is rejected with E0309), whereas the generics of the entry do. (A path with a
+    // lifetime argument, `Rel<'a, T>`, implies none: it is not assumed to.)
+    let tr: ItemTrait = parse_quote! {
+        trait Tr<'a, T, const N: usize> { fn f(&self, x: &'a Rel<T>) -> Wrap<N>; }
+    };
+    let (leaker, top_level) = Leaker::from_trait(&tr).unwrap();
+    let referrer = leaker.finish();
+    let ix = referrer
+        .iter()
+        .position(|ty| s(ty) == "& 'a Rel < T >")
+        .unwrap();
+    assert_ne!(referrer.context(ix), top_level);
+    assert_eq!(s(referrer.generics(ix)), "< 'a , T : 'a >");
+    assert_eq!(
+        s(referrer.context_generics(top_level)),
+        "< 'a , T , const N : usize >"
+    );
+    assert_eq!(
+        s(&referrer.impl_generics(referrer.context(ix))),
+        "< 'a , T >"
+    );
 }

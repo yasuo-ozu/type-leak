@@ -7,6 +7,11 @@ use syn::*;
 use template_quote::quote;
 use type_leak::Leaker;
 
+/// The tag of the format of a serialized Referrer, which it starts with.
+fn tag() -> String {
+    format!("type-leak-format-{}", type_leak::Referrer::FORMAT_VERSION)
+}
+
 fn module() -> ItemMod {
     parse_quote! {
         mod m {
@@ -308,15 +313,8 @@ fn types_not_depending_on_the_module_are_shared() {
             pub mod inner { pub struct C { x: ::foo::X } }
         }
     };
-    let mut config = type_leak::LeakerConfig::new();
-    config.allow_external_crates(false);
-    let mut leaker = Leaker::from_config(config);
-    leaker
-        .intern_with(&Generics::default(), |v| {
-            syn::visit::Visit::visit_item_mod(v, &m)
-        })
-        .unwrap();
-    let referrer = leaker.finish();
+    // `::foo::X` is an optional entry, which does not depend on a module.
+    let referrer = Leaker::from_module(&m).unwrap().0.finish();
     assert_eq!(modules_of(&referrer), [":: foo :: X@"]);
     assert_eq!(referrer.contexts().count(), 1);
     // A relative type next to it is still keyed by its module.
@@ -326,17 +324,9 @@ fn types_not_depending_on_the_module_are_shared() {
             pub mod inner { pub struct C { x: ::foo::X, y: &'static Rel } }
         }
     };
-    let mut config = type_leak::LeakerConfig::new();
-    config.allow_external_crates(false);
-    let mut leaker = Leaker::from_config(config);
-    leaker
-        .intern_with(&Generics::default(), |v| {
-            syn::visit::Visit::visit_item_mod(v, &m)
-        })
-        .unwrap();
     assert_eq!(
-        modules_of(&leaker.finish()),
-        [":: foo :: X@", "& 'static Rel@inner"]
+        modules_of(&Leaker::from_module(&m).unwrap().0.finish()),
+        ["& 'static Rel@inner", ":: foo :: X@"]
     );
 }
 
@@ -539,7 +529,7 @@ fn serialization_with_modules() {
         ["Rel@self", "Rel@a::b", "Wrap < T >@a::b"]
     );
     let tokens = referrer.to_token_stream();
-    let version = env!("CARGO_PKG_VERSION");
+    let version = tag();
     assert_eq!(
         tokens.to_string(),
         format!(

@@ -3,7 +3,7 @@ name = "type-leak-test-outlives"
 version = "0.0.0"
 edition = "2018"
 publish = false
-description = "Crate failing to compile with E0309 in the Repeater's implementations, for tests/outlives.rs"
+description = "Crate with outlives bounds in the Repeater's implementations and copies, for tests/outlives.rs"
 
 [lib]
 path = "lib.rs"

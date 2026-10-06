@@ -17,7 +17,7 @@ fn test_encode_generics_const() {
     let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8, N>);
     let ty = encode_generics_args_to_ty_with(
         &args.args,
-        Some(&generics.params),
+        &generics.params,
         |expr, _| parse_quote!([(); #expr]),
     )
     .unwrap();
@@ -27,8 +27,12 @@ fn test_encode_generics_const() {
     );
 
     let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8, { 3 }>);
-    let ty = encode_generics_args_to_ty_with(&args.args, None, |expr, _| parse_quote!([(); #expr]))
-        .unwrap();
+    let ty = encode_generics_args_to_ty_with(
+        &args.args,
+        &generics.params,
+        |expr, _| parse_quote!([(); #expr]),
+    )
+    .unwrap();
     assert_eq!(
         quote!(#ty).to_string(),
         quote!((&'static (), u8, [(); 3])).to_string()
@@ -180,10 +184,11 @@ fn test_const_args_are_braced_when_needed() {
     assert_eq!(to_string(&ty), to_string(&expected));
 
     // The braces are also kept for the callback of `encode_generics_args_to_ty_with()`.
+    let generics: Generics = parse_quote!(<const A: i32, const B: i32>);
     let args: AngleBracketedGenericArguments = parse_quote!(<{ i32::MIN }, { N }>);
     let ty = encode_generics_args_to_ty_with(
         &args.args,
-        None,
+        &generics.params,
         |expr, _| parse_quote!(::my_crate::ConstI32<#expr>),
     )
     .unwrap();
@@ -226,7 +231,7 @@ fn test_plain_args_encoder_with_params() {
     let encode = |args: &AngleBracketedGenericArguments, generics: &Generics| {
         encode_generics_args_to_ty_with(
             &args.args,
-            Some(&generics.params),
+            &generics.params,
             |expr, _| parse_quote!([(); #expr]),
         )
     };
@@ -252,11 +257,13 @@ fn test_plain_args_encoder_with_params() {
         "missing generic argument for 'const N : usize'"
     );
 
-    // Without the parameters, bindings are skipped (they used to panic).
+    // Bindings are skipped (they used to panic).
+    let generics: Generics = parse_quote!(<T>);
     let args: AngleBracketedGenericArguments = parse_quote!(<u8, Item = u8>);
-    let ty = encode_generics_args_to_ty_with(&args.args, None, |expr, _| parse_quote!([(); #expr]))
-        .unwrap();
-    assert_eq!(to_string(&ty), to_string(&parse_quote!((u8,))));
+    assert_eq!(
+        to_string(&encode(&args, &generics).unwrap()),
+        to_string(&parse_quote!((u8,)))
+    );
 }
 
 #[test]
@@ -332,7 +339,7 @@ fn test_lifetime_bounds_are_substituted_by_the_arguments() {
     assert_eq!(to_string(&ty), to_string(&expected));
     let ty = encode_generics_args_to_ty_with(
         &args.args,
-        Some(&generics.params),
+        &generics.params,
         |expr, _| parse_quote!([(); #expr]),
     )
     .unwrap();
@@ -376,7 +383,7 @@ fn test_lifetime_bounds_are_substituted_by_the_arguments() {
         let plain_params = encode_generics_params_to_ty(&generics.params);
         let plain_args = encode_generics_args_to_ty_with(
             &args,
-            Some(&generics.params),
+            &generics.params,
             |expr, _| parse_quote!([(); #expr]),
         )
         .unwrap();
@@ -427,12 +434,9 @@ fn test_trait_object_arguments_of_a_type_with_a_lifetime_bound() {
             err
         );
         assert!(err.to_string().contains("no lifetime bound"), "{}", err);
-        let err = encode_generics_args_to_ty_with(
-            &args.args,
-            Some(&generics.params),
-            |_, _| unreachable!(),
-        )
-        .unwrap_err();
+        let err =
+            encode_generics_args_to_ty_with(&args.args, &generics.params, |_, _| unreachable!())
+                .unwrap_err();
         assert!(
             matches!(err, EncodeError::UnboundedTraitObject(_)),
             "{}",
@@ -463,24 +467,178 @@ fn test_trait_object_arguments_of_a_type_with_a_lifetime_bound() {
 }
 
 #[test]
-fn test_plain_args_encoder_without_params_does_not_encode_bounds() {
+fn test_free_encoders_with_self() {
     use type_leak::*;
     let to_string = |ty: &Type| quote!(#ty).to_string();
-    // Without the parameters, which argument is bounded by which cannot be told, so the
-    // lifetime bounds are not encoded: the result differs from the encoding of the parameters
-    // they replace, and the parameters (e.g. `Referrer::generics()`) must be given.
+    let usize_const =
+        |ConstParam { ident, .. }: &ConstParam| -> Type { parse_quote!([(); #ident]) };
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let a: Lifetime = parse_quote!('a);
+    let b: Lifetime = parse_quote!('b);
+
+    // `Self: 'a` follows the lifetime bounds, in the order of the lifetimes.
+    let generics: Generics = parse_quote!(<'a, 'b, T: 'a, const N: usize>);
+    let expected: Type = parse_quote!((&'a (), &'b (), T, [(); N], &'a T, &'b __S, &'a __S));
+    let ty = encode_generics_params_to_ty_with_self(
+        &generics.params,
+        &parse_quote!(__S),
+        &[b.clone(), a.clone()],
+        usize_const,
+    )
+    .unwrap();
+    assert_eq!(to_string(&ty), to_string(&expected));
+
+    // Without the lifetimes it is `encode_generics_params_to_ty_with()`, and a lifetime which is
+    // not a parameter is skipped.
+    for lifetimes in [&[][..], &[parse_quote!('c)][..]] {
+        let ty = encode_generics_params_to_ty_with_self(
+            &generics.params,
+            &parse_quote!(__S),
+            lifetimes,
+            usize_const,
+        )
+        .unwrap();
+        let plain = encode_generics_params_to_ty(&generics.params);
+        assert_eq!(to_string(&ty), to_string(&plain));
+    }
+
+    // The arguments replace the parameters in the encoding of the parameters, `Self` included.
+    let args: AngleBracketedGenericArguments = parse_quote!(<'p, 'q, ::p::W, N>);
+    let ty = encode_generics_args_to_ty_with_self(
+        &args.args,
+        &generics.params,
+        &parse_quote!(Self),
+        &[b.clone(), a.clone()],
+        |expr, _| parse_quote!([(); #expr]),
+    )
+    .unwrap();
+    let expected: Type = parse_quote!((
+        &'p (),
+        &'q (),
+        ::p::W,
+        [(); N],
+        &'p ::p::W,
+        &'q Self,
+        &'p Self
+    ));
+    assert_eq!(to_string(&ty), to_string(&expected));
+
+    // The free functions and `RepeaterSlots` are the same encoder: they agree wherever the
+    // const parameters are encoded in the same way (`usize` is `[(); N]` for both).
+    for generics in [
+        parse_quote!(<'a, 'b: 'a, T: 'a + 'b, const N: usize>),
+        parse_quote!(<'a, T: 'a, U: 'static>),
+        parse_quote!(<'a: 'a, 'b: 'a>),
+        parse_quote!(<T, const N: usize>),
+        parse_quote!(<>),
+    ] {
+        let generics: Generics = generics;
+        let args = args_of(&generics);
+        let lifetimes = [a.clone(), b.clone()];
+        for self_ty in [
+            parse_quote!(__S),
+            parse_quote!(Self),
+            parse_quote!(::p::S<T>),
+        ] {
+            let self_ty: Type = self_ty;
+            let free = encode_generics_params_to_ty_with_self(
+                &generics.params,
+                &self_ty,
+                &lifetimes,
+                usize_const,
+            )
+            .unwrap();
+            let slotted = slots
+                .encode_generics_params_to_ty_with_self(&generics.params, &self_ty, &lifetimes)
+                .unwrap();
+            assert_eq!(to_string(&free), to_string(&slotted));
+            let free = encode_generics_args_to_ty_with_self(
+                &args,
+                &generics.params,
+                &self_ty,
+                &lifetimes,
+                |expr, _| parse_quote!([(); #expr]),
+            )
+            .unwrap();
+            let slotted = slots
+                .encode_generics_args_to_ty_with_self(&args, &generics.params, &self_ty, &lifetimes)
+                .unwrap();
+            assert_eq!(to_string(&free), to_string(&slotted));
+            // and the arguments of the parameters are the parameters
+            let params = encode_generics_params_to_ty_with_self(
+                &generics.params,
+                &self_ty,
+                &lifetimes,
+                usize_const,
+            )
+            .unwrap();
+            assert_eq!(to_string(&free), to_string(&params));
+        }
+    }
+
+    // A trait object without a lifetime bound is rejected as `Self`, if there is a lifetime
+    // to outlive, with either function.
+    let generics: Generics = parse_quote!(<'a>);
+    let dyn_self: Type = parse_quote!(dyn Tr);
+    let err = encode_generics_params_to_ty_with_self(
+        &generics.params,
+        &dyn_self,
+        std::slice::from_ref(&a),
+        usize_const,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, EncodeError::UnboundedTraitObject(_)),
+        "{}",
+        err
+    );
+    let args: AngleBracketedGenericArguments = parse_quote!(<'x>);
+    let err = encode_generics_args_to_ty_with_self(
+        &args.args,
+        &generics.params,
+        &dyn_self,
+        std::slice::from_ref(&a),
+        |_, _| unreachable!(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, EncodeError::UnboundedTraitObject(_)),
+        "{}",
+        err
+    );
+    // but not if there is none, and it is fine with the bound written.
+    let ty = encode_generics_params_to_ty_with_self(&generics.params, &dyn_self, &[], usize_const)
+        .unwrap();
+    assert_eq!(to_string(&ty), to_string(&parse_quote!((&'a (),))));
+    let bounded: Type = parse_quote!(dyn Tr + 'static);
+    let ty = encode_generics_params_to_ty_with_self(&generics.params, &bounded, &[a], usize_const)
+        .unwrap();
+    assert_eq!(
+        to_string(&ty),
+        to_string(&parse_quote!((&'a (), &'a (dyn Tr + 'static))))
+    );
+}
+
+#[test]
+fn test_args_encoder_requires_the_params_to_encode_the_bounds() {
+    use type_leak::*;
+    let to_string = |ty: &Type| quote!(#ty).to_string();
+    // The encoding of the arguments has the encoded bounds of the parameters (`&'static u8` for
+    // `T: 'a`), which the arguments alone cannot tell, so the parameters are required: the
+    // result is that of the parameters.
     let generics: Generics = parse_quote!(<'a, T: 'a>);
     let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8>);
-    let without = encode_generics_args_to_ty_with(&args.args, None, |_, _| unreachable!()).unwrap();
-    let with =
-        encode_generics_args_to_ty_with(&args.args, Some(&generics.params), |_, _| unreachable!())
-            .unwrap();
+    let ty = encode_generics_args_to_ty_with(&args.args, &generics.params, |_, _| unreachable!())
+        .unwrap();
     assert_eq!(
-        to_string(&without),
-        to_string(&parse_quote!((&'static (), u8)))
-    );
-    assert_eq!(
-        to_string(&with),
+        to_string(&ty),
         to_string(&parse_quote!((&'static (), u8, &'static u8)))
     );
+    // A context whose generics have no defaults (such as the top-level context) needs the
+    // arguments complete.
+    let generics: Generics = parse_quote!(<T, U>);
+    let args: AngleBracketedGenericArguments = parse_quote!(<u8>);
+    let err = encode_generics_args_to_ty_with(&args.args, &generics.params, |_, _| unreachable!())
+        .unwrap_err();
+    assert_eq!(err.to_string(), "missing generic argument for 'U'");
 }

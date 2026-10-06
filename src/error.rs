@@ -29,12 +29,6 @@ pub enum NotInternableError {
     /// parameter, [`CheckResult::impossible`] is the bound, the value or the const parameter. Never
     /// empty.
     RelativePath(Vec<CheckResult>),
-    /// Like [`NotInternableError::RelativePath`], for a [`Leaker`](crate::Leaker) with
-    /// [`allow_external_crates`](crate::Leaker::allow_external_crates) unset: the offending path
-    /// is relative, or absolute but not `::core`, so it may not resolve in
-    /// the Referrer's crate. It should start with `$crate` (e.g. re-exported by the Leaker's
-    /// crate), or with `::core`. Never empty.
-    NotPortable(Vec<CheckResult>),
 }
 
 /// One error to report: the offending tokens, the message and the notes.
@@ -48,10 +42,7 @@ struct Report {
 impl NotInternableError {
     /// Returns the errors to report, one per offending path (or type).
     fn reports(&self) -> Vec<Report> {
-        let (conflicts, portable) = match self {
-            NotInternableError::RelativePath(conflicts) => (conflicts, false),
-            NotInternableError::NotPortable(conflicts) => (conflicts, true),
-        };
+        let NotInternableError::RelativePath(conflicts) = self;
         conflicts
             .iter()
             .filter_map(|conflict| {
@@ -59,7 +50,6 @@ impl NotInternableError {
                 let mut notes: Vec<_> = match &conflict.note {
                     // The conflict is not about the path.
                     Some(note) => Some((tokens.span(), note.clone())),
-                    None if portable => portable_path_note(tokens),
                     None => absolute_path_note(tokens),
                 }
                 .into_iter()
@@ -93,11 +83,7 @@ impl NotInternableError {
                 }));
                 Some(Report {
                     tokens: tokens.clone(),
-                    message: if portable {
-                        format!("use a path starting with `$crate`: '{}'", tokens)
-                    } else {
-                        format!("use absolute path: '{}'", tokens)
-                    },
+                    message: format!("use absolute path: '{}'", tokens),
                     notes,
                 })
             })
@@ -134,8 +120,9 @@ impl NotInternableError {
 }
 
 /// Returns `true` if `cause` is a trait object without a lifetime bound (e.g. `dyn Trait`), which is
-/// a cause only if it is the referent of a reference, or an argument of a path, with an elided or
-/// local lifetime.
+/// a cause only if it is the referent of a reference, or an argument of a path, with an elided
+/// lifetime, or one the path cannot be interned with (several lifetimes, a method lifetime which
+/// the copy would leave unconstrained, or a trait bound).
 fn is_default_lifetime_object(cause: &TokenStream) -> bool {
     match syn::parse2::<syn::Type>(cause.clone()) {
         Ok(syn::Type::TraitObject(object)) => !object
@@ -154,41 +141,6 @@ fn offending_path(tokens: &TokenStream) -> Option<syn::Path> {
             _ => None,
         }
     })
-}
-
-/// Returns a note suggesting how to make the offending path of a
-/// [`NotInternableError::NotPortable`] start with `$crate` (or `::core`), with the span of its
-/// first segment.
-fn portable_path_note(tokens: &TokenStream) -> Option<(Span, String)> {
-    let path = offending_path(tokens)?;
-    let ident = &path.segments.iter().next()?.ident;
-    let name = ident.to_string();
-    let reexport = |path: &str| {
-        (
-            ident.span(),
-            format!(
-                "re-export it in this crate (e.g. `#[doc(hidden)] pub use {};`) and refer to it \
-                 with a path starting with `$crate`",
-                path
-            ),
-        )
-    };
-    if path.leading_colon.is_some() {
-        // An external crate: `::foo::X` is `$crate::foo::X` after `pub use ::foo;`.
-        return Some(reexport(&format!("::{}", name)));
-    }
-    match ABSOLUTE_PATHS.iter().find(|(n, _)| *n == name) {
-        Some((name, absolute)) if absolute.starts_with("::core::") => Some((
-            ident.span(),
-            format!("use `{}` instead of `{}`", absolute, name),
-        )),
-        Some((_, absolute)) => Some(reexport(absolute)),
-        None => Some((
-            ident.span(),
-            "re-export it in this crate and refer to it with a path starting with `$crate`"
-                .to_string(),
-        )),
-    }
 }
 
 /// Returns a note suggesting the absolute path to use instead of the first segment of `tokens`

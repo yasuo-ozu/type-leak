@@ -1,7 +1,10 @@
 //! The outlives bounds which a leaked type implies are added to the bounds of the generics it
 //! uses (see `Referrer::generics()`), so that the Repeater's implementation and the copies of the
-//! type have them: `T: 'a` for `&'a X` and for the type arguments `X` of a path with a lifetime
-//! argument (assumed), where `X` mentions `T`, and `'b: 'a` where it mentions `'b`.
+//! type have them: `T: 'a` for `&'a X`, where `X` mentions `T`, and `'b: 'a` where it mentions
+//! `'b`. A path with a lifetime argument (`Rel<'a, T>`) implies none: its definition is not seen
+//! (`struct Rel<'a, T>(&'a T)` makes `T: 'a` part of it, `struct Loose<'a, T>(&'a (), T)` does
+//! not), so only a bound which is written is a bound of the generics (`fn f<'a, T: 'a>(x: Rel<'a,
+//! T>)`), and the lifetime of a path does not bound what is in it, in the type or around it.
 
 use syn::*;
 use template_quote::{quote, ToTokens};
@@ -33,37 +36,39 @@ fn e(ty: &str, generics: &str) -> (String, String) {
 }
 
 #[test]
-fn a_path_with_a_lifetime_argument_assumes_the_bounds() {
-    // `struct Rel<'a, T>(&'a T)` has `T: 'a` inferred, which the signature implies.
+fn a_path_with_a_lifetime_argument_assumes_no_bound() {
+    // `struct Rel<'a, T>(&'a T)` has `T: 'a` inferred, which the signature implies, but the
+    // definition of the path is not seen, so no bound is recorded: the generics are as written.
     assert_eq!(
         leaked(parse_quote! { trait Tr { fn f<'a, T>(&self, x: Rel<'a, T>); } }),
-        [e("Rel < 'a , T >", "< 'a , T : 'a >")]
+        [e("Rel < 'a , T >", "< 'a , T >")]
     );
     // The generics of the trait, and a mix of both.
     assert_eq!(
         leaked(parse_quote! { trait Tr<'a, T> { fn f(&self, x: Rel<'a, T>); } }),
-        [e("Rel < 'a , T >", "< 'a , T : 'a >")]
+        [e("Rel < 'a , T >", "< 'a , T >")]
     );
     assert_eq!(
         leaked(parse_quote! { trait Tr<'a> { fn f<T>(&self, x: Rel<'a, T>); } }),
-        [e("Rel < 'a , T >", "< 'a , T : 'a >")]
+        [e("Rel < 'a , T >", "< 'a , T >")]
     );
-    // Each type argument is bounded by each lifetime argument, and every type parameter in it.
+    // Not for each type argument and each lifetime argument either, nor for every type parameter
+    // in an argument.
     assert_eq!(
         leaked(parse_quote! {
             trait Tr<'a, 'b, T, U> { fn f(&self, x: Rel<'a, 'b, (T, Vec<U>)>); }
         }),
         [e(
             "Rel < 'a , 'b , (T , Vec < U >) >",
-            "< 'a , 'b , T : 'a + 'b , U : 'a + 'b >"
+            "< 'a , 'b , T , U >"
         )]
     );
-    // Not for a lifetime argument which is not a lifetime parameter (`'static`).
+    // Nor for a lifetime argument which is not a lifetime parameter (`'static`).
     assert_eq!(
         leaked(parse_quote! { trait Tr { fn f<T>(&self, x: Rel<'static, T>); } }),
         [e("Rel < 'static , T >", "< T >")]
     );
-    // Not for a const parameter, which has no lifetime bound, nor a type that is not a parameter.
+    // Not for a const parameter, nor a type that is not a parameter.
     assert_eq!(
         leaked(parse_quote! {
             trait Tr<const N: usize> { fn f<'a>(&self, x: Rel<'a, N, u8>); }
@@ -75,12 +80,27 @@ fn a_path_with_a_lifetime_argument_assumes_the_bounds() {
         leaked(parse_quote! { trait Tr { fn f<'a, 'b>(&self, x: Rel<'a, 'b>); } }),
         [e("Rel < 'a , 'b >", "< 'a , 'b >")]
     );
-    // Nested: the inner path bounds by its own lifetime too.
+    // Nested: the inner path does not bound by its own lifetime either.
     assert_eq!(
         leaked(parse_quote! { trait Tr { fn f<'a, 'b, T>(&self, x: Rel<'a, Rel<'b, T>>); } }),
+        [e("Rel < 'a , Rel < 'b , T > >", "< 'a , 'b , T >")]
+    );
+    // A bound which is written is a bound as any other, in the generics or in the where clause.
+    assert_eq!(
+        leaked(parse_quote! { trait Tr { fn f<'a, T: 'a>(&self, x: Rel<'a, T>); } }),
+        [e("Rel < 'a , T >", "< 'a , T : 'a >")]
+    );
+    assert_eq!(
+        leaked(parse_quote! { trait Tr { fn f<'a, T>(&self, x: Rel<'a, T>) where T: 'a; } }),
+        [e("Rel < 'a , T >", "< 'a , T : 'a >")]
+    );
+    assert_eq!(
+        leaked(
+            parse_quote! { trait Tr<'a, 'b: 'a, T: 'b> { fn f(&self, x: Rel<'a, Rel<'b, T>>); } }
+        ),
         [e(
             "Rel < 'a , Rel < 'b , T > >",
-            "< 'a , 'b : 'a , T : 'a + 'b >"
+            "< 'a , 'b : 'a , T : 'b >"
         )]
     );
 }
@@ -110,6 +130,12 @@ fn a_reference_requires_its_referent_to_outlive_it() {
         leaked(parse_quote! { trait Tr<'a> { fn f(&self, x: &'a Rel); } }),
         [e("& 'a Rel", "< 'a >")]
     );
+    // What a path in the referent mentions is bounded, whichever its definition (and its
+    // lifetime arguments) say: `Rel<'b, T>: 'a` requires `'b: 'a` and `T: 'a`.
+    assert_eq!(
+        leaked(parse_quote! { trait Tr<'a, 'b, T> { fn f(&self, x: &'a Rel<'b, T>); } }),
+        [e("& 'a Rel < 'b , T >", "< 'a , 'b : 'a , T : 'a >")]
+    );
     // A component of a reference with a local lifetime is leaked alone, with the bound which the
     // reference implies on it (see `tests/outlives_ancestors.rs`).
     assert_eq!(
@@ -119,16 +145,26 @@ fn a_reference_requires_its_referent_to_outlive_it() {
 }
 
 #[test]
-fn lifetimes_in_the_arguments_are_bounded_too() {
-    // `R<'a, &'b T>`: `'b: 'a` and `T: 'a` (by the path), and `T: 'b` (by the reference).
+fn a_reference_in_the_arguments_bounds_what_it_mentions_only() {
+    // `R<'a, &'b T>`: the reference gives `T: 'b`, and the path gives nothing (`'b: 'a` and `T:
+    // 'a` would be assumed for it).
     assert_eq!(
         leaked(parse_quote! { trait Tr { fn f<'a, 'b, T>(&self, x: Rel<'a, &'b T>); } }),
-        [e("Rel < 'a , & 'b T >", "< 'a , 'b : 'a , T : 'a + 'b >")]
+        [e("Rel < 'a , & 'b T >", "< 'a , 'b , T : 'b >")]
     );
-    // The lifetimes in an argument which are `'static`, elided or not generic are not.
+    // The lifetimes in an argument which are `'static`, elided or not generic are not bounded.
     assert_eq!(
         leaked(parse_quote! { trait Tr { fn f<'a, T>(&self, x: Rel<'a, &'static T>); } }),
-        [e("Rel < 'a , & 'static T >", "< 'a , T : 'a >")]
+        [e("Rel < 'a , & 'static T >", "< 'a , T >")]
+    );
+    // A reference around the path bounds everything in it: the lifetimes and the types in the
+    // arguments of the path, and in the reference inside.
+    assert_eq!(
+        leaked(parse_quote! { trait Tr<'a, 'b, 'c, T> { fn f(&self, x: &'a Rel<'b, &'c T>); } }),
+        [e(
+            "& 'a Rel < 'b , & 'c T >",
+            "< 'a , 'b : 'a , 'c : 'a , T : 'a + 'c >"
+        )]
     );
     // The bounds written are merged with these, without duplicates.
     assert_eq!(
@@ -151,11 +187,37 @@ fn lifetimes_in_the_arguments_are_bounded_too() {
 #[test]
 fn a_trait_object_requires_its_arguments_to_outlive_too() {
     // `dyn Tr<T> + 'b` outlives `'a` only if `'b` and `T` do (rustc checks each argument, also
-    // with the lifetime bound `'static`, whatever `T: 'b` says: `struct S<'a, T>(Ref<'a, dyn
-    // Iterator<Item = Rel2<T>>>)` has `T: 'a` inferred, which the copy of the field needs too).
+    // with the lifetime bound `'static`, whatever `T: 'b` says), which a reference requires of
+    // its referent.
+    assert_eq!(
+        leaked(parse_quote! {
+            trait Tr<'a, T> { fn f(&self, x: &'a (dyn RelTr<T> + 'a)); }
+        }),
+        [e("& 'a (dyn RelTr < T > + 'a)", "< 'a , T : 'a >")]
+    );
+    assert_eq!(
+        leaked(parse_quote! {
+            trait Tr<'a, 'b, T> { fn f(&self, x: &'a (dyn ::p::Tr<T> + 'b)); }
+        }),
+        [e(
+            "& 'a (dyn :: p :: Tr < T > + 'b)",
+            "< 'a , 'b : 'a , T : 'a >"
+        )]
+    );
+    // Also inside a path, which passes on what the reference requires.
+    assert_eq!(
+        leaked(parse_quote! {
+            trait Tr<'a, T> { fn f(&self, x: &'a Rel<Box<dyn ::p::Tr<T>>>); }
+        }),
+        [e(
+            "& 'a Rel < Box < dyn :: p :: Tr < T > > >",
+            "< 'a , T : 'a >"
+        )]
+    );
+    // A path with a lifetime does not require anything of its arguments.
     assert_eq!(
         leaked(parse_quote! { trait Tr<'a, T> { fn f(&self, x: Rel<'a, dyn ::p::Tr<T>>); } }),
-        [e("Rel < 'a , dyn :: p :: Tr < T > >", "< 'a , T : 'a >")]
+        [e("Rel < 'a , dyn :: p :: Tr < T > >", "< 'a , T >")]
     );
     assert_eq!(
         leaked(parse_quote! {
@@ -163,15 +225,8 @@ fn a_trait_object_requires_its_arguments_to_outlive_too() {
         }),
         [e(
             "Rel < 'a , dyn :: p :: Tr < T > + 'b >",
-            "< 'a , 'b : 'a , T : 'a >"
+            "< 'a , 'b , T >"
         )]
-    );
-    // Also for a reference.
-    assert_eq!(
-        leaked(parse_quote! {
-            trait Tr<'a, T> { fn f(&self, x: &'a (dyn RelTr<T> + 'a)); }
-        }),
-        [e("& 'a (dyn RelTr < T > + 'a)", "< 'a , T : 'a >")]
     );
     // A trait with a lifetime argument in a bound is not a path to assume a bound for.
     assert_eq!(
@@ -190,18 +245,44 @@ fn binder_lifetimes_are_not_generics() {
         leaked(parse_quote! { trait Tr<T> { fn f(&self, x: for<'x> fn(Rel<'x, T>)); } }),
         [e("Rel < 'x , T >", "< 'x , T >")]
     );
-    // Nor is `'x: 'a` for the argument of a path with a generic lifetime.
+    assert_eq!(
+        leaked(parse_quote! { trait Tr<T> { fn f(&self, x: for<'x> fn(&'x Rel<T>)); } }),
+        [e("Rel < T >", "< T >")]
+    );
+    // Nor is `'x: 'a` for the referent of a reference with a generic lifetime.
+    assert_eq!(
+        leaked(parse_quote! {
+            trait Tr<'a, T> { fn f(&self, x: &'a Rel<for<'x> fn(&'x T) -> &'x ()>); }
+        }),
+        [e(
+            "& 'a Rel < for < 'x > fn (& 'x T) -> & 'x () >",
+            "< 'a , T : 'a >"
+        )]
+    );
+    // The same for a path with a generic lifetime, which bounds nothing.
     assert_eq!(
         leaked(parse_quote! {
             trait Tr<'a, T> { fn f(&self, x: Rel<'a, for<'x> fn(&'x T) -> &'x ()>); }
         }),
         [e(
             "Rel < 'a , for < 'x > fn (& 'x T) -> & 'x () >",
-            "< 'a , T : 'a >"
+            "< 'a , T >"
         )]
     );
     // Nor in a `dyn for<'x> Tr<'x, ..>`, whose arguments are looked into like any other (so `T`
-    // is bounded by `'a`), and in which a path with the lifetime is not assumed to bound by it.
+    // is bounded by the reference's `'a`), and in which a path with the lifetime does not bound
+    // by it.
+    assert_eq!(
+        leaked(parse_quote! {
+            trait Tr<'a, T> {
+                fn f(&self, x: &'a Box<dyn for<'x> ::p::Tr<'x, Rel<'x, T>>>);
+            }
+        }),
+        [e(
+            "& 'a Box < dyn for < 'x > :: p :: Tr < 'x , Rel < 'x , T > > >",
+            "< 'a , T : 'a >"
+        )]
+    );
     assert_eq!(
         leaked(parse_quote! {
             trait Tr<'a, T> {
@@ -210,7 +291,7 @@ fn binder_lifetimes_are_not_generics() {
         }),
         [e(
             "Rel < 'a , Box < dyn for < 'x > :: p :: Tr < 'x , Rel < 'x , T > > > >",
-            "< 'a , T : 'a >"
+            "< 'a , T >"
         )]
     );
 }
@@ -218,8 +299,8 @@ fn binder_lifetimes_are_not_generics() {
 #[test]
 fn bounds_are_part_of_the_context() {
     // The context of the type differs from the top-level context of the trait (which has the
-    // generics as they are written), although it uses all of them.
-    let tr: ItemTrait = parse_quote! { trait Tr<'a, T> { fn f(&self, x: Rel<'a, T>); } };
+    // generics as they are written), although it uses all of them: the reference implies `T: 'a`.
+    let tr: ItemTrait = parse_quote! { trait Tr<'a, T> { fn f(&self, x: &'a Rel<T>); } };
     let (leaker, top_level) = Leaker::from_trait(&tr).unwrap();
     let referrer = leaker.finish();
     assert_ne!(referrer.context(0), top_level);
@@ -228,11 +309,29 @@ fn bounds_are_part_of_the_context() {
         s(referrer.context_generics(referrer.context(0))),
         "< 'a , T : 'a >"
     );
+    // A path with the lifetime implies none, so the context is the top-level one.
+    let tr: ItemTrait = parse_quote! { trait Tr<'a, T> { fn f(&self, x: Rel<'a, T>); } };
+    let (leaker, top_level) = Leaker::from_trait(&tr).unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(referrer.context(0), top_level);
+    assert_eq!(
+        s(referrer.context_generics(referrer.context(0))),
+        "< 'a , T >"
+    );
     // A struct with the bound written is the same context as the type.
     let st: ItemStruct = parse_quote! { struct S<'a, T: 'a>(Rel<'a, T>); };
     let (leaker, top_level) = Leaker::from_struct(&st).unwrap();
     let referrer = leaker.finish();
     assert_eq!(referrer.context(0), top_level);
+    // Without it, the context is that of the generics as they are as well: the path implies none.
+    let st: ItemStruct = parse_quote! { struct S<'a, T>(Rel<'a, T>); };
+    let (leaker, top_level) = Leaker::from_struct(&st).unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(referrer.context(0), top_level);
+    assert_eq!(
+        s(referrer.context_generics(referrer.context(0))),
+        "< 'a , T >"
+    );
     // Two declarations of the same meaning give the same context (the bound is not duplicated).
     let a: ItemTrait = parse_quote! { trait Tr { fn f<'a, T: 'a>(&self, x: Rel<'a, T>); } };
     let b: ItemTrait = parse_quote! { trait Tr { fn f<'a, T>(&self, x: Rel<'a, T>) where T: 'a; } };
@@ -242,6 +341,28 @@ fn bounds_are_part_of_the_context() {
     };
     assert_eq!(contexts(&a), contexts(&b));
     assert_eq!(leaked(a), leaked(b));
+    // The same for a bound which a reference implies, and the same bound written: one context,
+    // so one entry of the same Leaker.
+    let written: ItemTrait = parse_quote! {
+        trait Tr { fn f<'a, T: 'a>(&self, x: &'a Rel<T>); }
+    };
+    let implied: ItemTrait = parse_quote! {
+        trait Tr { fn f<'a, T>(&self, x: &'a Rel<T>); }
+    };
+    let mut leaker = Leaker::new();
+    leaker
+        .intern_with(&written.generics, |v| v.visit_item_trait(&written))
+        .unwrap();
+    leaker
+        .intern_with(&implied.generics, |v| v.visit_item_trait(&implied))
+        .unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(referrer.iter().count(), 1);
+    assert_eq!(
+        s(referrer.context_generics(referrer.context(0))),
+        "< 'a , T : 'a >"
+    );
+    assert_eq!(leaked(written), leaked(implied));
 }
 
 #[test]
@@ -250,12 +371,16 @@ fn the_referrer_finds_the_entries_with_the_generics_it_sees_declared() {
     // Leaker: the bounds the type implies on the declared generics must be the Leaker's.
     for tr in [
         // `T` is declared by the method and `'a` is not.
-        parse_quote! { trait Tr<'a> { fn f<T>(&self, x: Rel<'a, T>); } },
+        parse_quote! { trait Tr<'a> { fn f<T>(&self, x: &'a Rel<T>); } },
         // `'b` is declared by the method and `T` and `'a` are not.
-        parse_quote! { trait Tr<'a, T> { fn f<'b>(&self, x: Rel<'b, (&'a T, u8)>); } },
+        parse_quote! { trait Tr<'a, T> { fn f<'b>(&self, x: &'b Rel<(&'a T, u8)>); } },
         // `T` is bounded by the lifetime written at the method.
         parse_quote! { trait Tr { fn f<'a, T: 'a>(&self, x: Rel<'a, T>); } },
+        parse_quote! { trait Tr { fn f<'a, T: 'a>(&self, x: &'a Rel<T>); } },
         // Nothing is declared.
+        parse_quote! { trait Tr<'a, T> { fn f(&self, x: &'a Rel<T>); } },
+        // The path implies no bound, so the entry has none either.
+        parse_quote! { trait Tr<'a> { fn f<T>(&self, x: Rel<'a, T>); } },
         parse_quote! { trait Tr<'a, T> { fn f(&self, x: Rel<'a, T>); } },
     ] {
         let tr: ItemTrait = tr;
@@ -292,6 +417,33 @@ fn the_referrer_finds_the_entries_with_the_generics_it_sees_declared() {
     let referrer = Leaker::from_trait(&tr).unwrap().0.finish();
     let mut sig: Signature = parse_quote!(fn f<'a, T: ::core::clone::Clone>(x: Rel<'a, T>));
     syn::visit_mut::VisitMut::visit_signature_mut(
+        &mut referrer
+            .clone()
+            .into_visitor(None, |_, ix| parse_quote!(P<#ix>)),
+        &mut sig,
+    );
+    assert!(s(&sig).contains("Rel"), "{}", s(&sig));
+    // The one without the bound, for a path which implies none, is not the entry which has it.
+    let mut sig: Signature = parse_quote!(fn f<'a, T>(x: Rel<'a, T>));
+    syn::visit_mut::VisitMut::visit_signature_mut(
+        &mut referrer.into_visitor(None, |_, ix| parse_quote!(P<#ix>)),
+        &mut sig,
+    );
+    assert!(s(&sig).contains("Rel"), "{}", s(&sig));
+    // A reference implies the bound `T: 'a`, so the signature which does not write it is the
+    // entry's, and one with another bound is not.
+    let tr: ItemTrait = parse_quote! { trait Tr { fn f<'a, T>(&self, x: &'a Rel<T>); } };
+    let referrer = Leaker::from_trait(&tr).unwrap().0.finish();
+    let mut sig: Signature = parse_quote!(fn f<'a, T>(x: &'a Rel<T>));
+    syn::visit_mut::VisitMut::visit_signature_mut(
+        &mut referrer
+            .clone()
+            .into_visitor(None, |_, ix| parse_quote!(P<#ix>)),
+        &mut sig,
+    );
+    assert!(!s(&sig).contains("Rel"), "{}", s(&sig));
+    let mut sig: Signature = parse_quote!(fn f<'a, T: ::core::clone::Clone>(x: &'a Rel<T>));
+    syn::visit_mut::VisitMut::visit_signature_mut(
         &mut referrer.into_visitor(None, |_, ix| parse_quote!(P<#ix>)),
         &mut sig,
     );
@@ -302,7 +454,7 @@ fn the_referrer_finds_the_entries_with_the_generics_it_sees_declared() {
 fn the_bounds_survive_serialization() {
     let tr: ItemTrait = parse_quote! {
         trait Tr<'a, T> {
-            fn f<'b, U>(&self, x: Rel<'b, (&'a T, U)>) -> &'a Rel2<T>;
+            fn f<'b, U>(&self, x: &'b Rel<(&'a T, U)>) -> &'a Rel2<T>;
         }
     };
     let referrer = Leaker::from_trait(&tr).unwrap().0.finish();
@@ -331,18 +483,29 @@ fn pair(impl_generics: &str, context_generics: &str) -> (String, String) {
 
 #[test]
 fn impl_generics_drop_the_encoded_bounds() {
-    // `Rel<'a, T>` gives the context generics `<'a, T: 'a>`, which the trait arguments encode
+    // `&'a Rel<T>` gives the context generics `<'a, T: 'a>`, which the trait arguments encode
     // (`&'a T`), so the implementation declares `<'a, T>`.
     assert_eq!(
-        impl_and_context(parse_quote! { trait Tr<'a, T> { fn f(&self, x: Rel<'a, T>); } }),
+        impl_and_context(parse_quote! { trait Tr<'a, T> { fn f(&self, x: &'a Rel<T>); } }),
         pair("< 'a , T >", "< 'a , T : 'a >")
     );
     // `'b: 'a` is encoded (`&'a &'b ()`) as well.
     assert_eq!(
         impl_and_context(parse_quote! {
-            trait Tr { fn f<'a, 'b, T>(&self, x: Rel<'a, Rel<'b, T>>); }
+            trait Tr<'a, 'b, T> { fn f(&self, x: &'a &'b Rel<T>); }
         }),
         pair("< 'a , 'b , T >", "< 'a , 'b : 'a , T : 'a + 'b >")
+    );
+    // A path with a lifetime implies no bound: nothing to drop.
+    assert_eq!(
+        impl_and_context(parse_quote! { trait Tr<'a, T> { fn f(&self, x: Rel<'a, T>); } }),
+        pair("< 'a , T >", "< 'a , T >")
+    );
+    assert_eq!(
+        impl_and_context(parse_quote! {
+            trait Tr { fn f<'a, 'b, T>(&self, x: Rel<'a, Rel<'b, T>>); }
+        }),
+        pair("< 'a , 'b , T >", "< 'a , 'b , T >")
     );
     // A bound written by the Leaker is not special.
     assert_eq!(
@@ -376,11 +539,20 @@ fn impl_generics_drop_the_encoded_bounds() {
     // parameters do not take.
     assert_eq!(
         impl_and_context(parse_quote! {
-            trait Tr { fn f<'a, T>(&self, x: Rel<'a, T>) where ::std::vec::Vec<T>: ::core::clone::Clone; }
+            trait Tr { fn f<'a, T>(&self, x: &'a Rel<T>) where ::std::vec::Vec<T>: ::core::clone::Clone; }
         }),
         pair(
             "< 'a , T > where :: std :: vec :: Vec < T > : :: core :: clone :: Clone",
             "< 'a , T : 'a > where :: std :: vec :: Vec < T > : :: core :: clone :: Clone"
+        )
+    );
+    assert_eq!(
+        impl_and_context(parse_quote! {
+            trait Tr { fn f<'a, T>(&self, x: Rel<'a, T>) where ::std::vec::Vec<T>: ::core::clone::Clone; }
+        }),
+        pair(
+            "< 'a , T > where :: std :: vec :: Vec < T > : :: core :: clone :: Clone",
+            "< 'a , T > where :: std :: vec :: Vec < T > : :: core :: clone :: Clone"
         )
     );
     // Nothing to drop: the generics as they are.
@@ -394,7 +566,7 @@ fn impl_generics_drop_the_encoded_bounds() {
         )
     );
     // The generics of the top-level context are the call's (no bound is implied there).
-    let tr: ItemTrait = parse_quote! { trait Tr<'a, T> { fn f(&self, x: Rel<'a, T>); } };
+    let tr: ItemTrait = parse_quote! { trait Tr<'a, T> { fn f(&self, x: &'a Rel<T>); } };
     let (leaker, top_level) = Leaker::from_trait(&tr).unwrap();
     let referrer = leaker.finish();
     assert_eq!(s(&referrer.impl_generics(top_level)), "< 'a , T >");

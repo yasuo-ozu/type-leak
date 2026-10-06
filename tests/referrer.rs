@@ -5,10 +5,15 @@ use syn::*;
 use template_quote::quote;
 use type_leak::Referrer;
 
+/// The tag of the format of a serialized Referrer, which it starts with.
+fn tag() -> String {
+    format!("type-leak-format-{}", type_leak::Referrer::FORMAT_VERSION)
+}
+
 /// Rewrites `item` with the Referrer of the leaked types `types` (in its serialized form, without
 /// the version), replacing the `ix`-th leaked type with `P<ix>`.
 fn rewrite(types: proc_macro2::TokenStream, item: Item) -> String {
-    let version = env!("CARGO_PKG_VERSION");
+    let version = tag();
     rewrite_with(parse2(quote!(#version #types)).unwrap(), item)
 }
 
@@ -175,19 +180,76 @@ fn test_grouped_types_are_found() {
     );
 }
 
+/// The error of parsing `tokens` as a Referrer.
+fn parse_error(tokens: proc_macro2::TokenStream) -> String {
+    parse2::<Referrer>(tokens).unwrap_err().to_string()
+}
+
 #[test]
-fn test_version_is_checked() {
-    // A Referrer emitted by another version of type-leak is rejected.
-    let err = parse2::<Referrer>(quote!("0.0.0"(RelA))).unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        format!(
-            "the Referrer was emitted by type-leak 0.0.0, but is parsed by type-leak {}",
-            env!("CARGO_PKG_VERSION")
-        )
+fn format_version_round_trip() {
+    let item: ItemStruct = parse_quote! { struct S<T> { a: RelA, b: Wrap<T> } };
+    let referrer = type_leak::Leaker::from_struct(&item).unwrap().0.finish();
+    let tokens = quote!(#referrer);
+    // The tag is the first token, a string literal.
+    let first = tokens.clone().into_iter().next().unwrap().to_string();
+    assert_eq!(first, format!("\"{}\"", tag()));
+    assert_eq!(parse2::<Referrer>(tokens).unwrap(), referrer);
+}
+
+#[test]
+fn format_version_is_checked() {
+    let expected = format!(
+        "(format {}, expected {})",
+        Referrer::FORMAT_VERSION + 1,
+        Referrer::FORMAT_VERSION
     );
-    // Without the version, it is not a Referrer.
-    assert!(parse2::<Referrer>(quote!((RelA))).is_err());
+    // A tampered version is rejected, with a clear error.
+    let tampered = format!("type-leak-format-{}", Referrer::FORMAT_VERSION + 1);
+    let message = parse_error(quote!(#tampered (RelA)));
+    assert!(
+        message.contains("serialized by an incompatible type-leak"),
+        "{}",
+        message
+    );
+    assert!(message.contains(&expected), "{}", message);
+    // So is one of the previous format (no compatibility).
+    let old = format!(
+        "type-leak-format-{}",
+        Referrer::FORMAT_VERSION.wrapping_sub(1)
+    );
+    assert!(parse_error(quote!(#old (RelA))).contains("incompatible type-leak (format"));
+    // A literal which is not a tag (what a version of type-leak which had no format tag wrote:
+    // its own version) is reported as such.
+    let message = parse_error(quote!("0.8.0"(RelA)));
+    assert!(
+        message.contains("incompatible type-leak (an unrecognized tag \"0.8.0\""),
+        "{}",
+        message
+    );
+    let message = parse_error(quote!("type-leak-format-"(RelA)));
+    assert!(message.contains("an unrecognized tag"), "{}", message);
+    // The check comes first, whatever follows.
+    let message = parse_error(quote!("0.0.0" 2 (RelA) (RelB)));
+    assert!(message.contains("incompatible type-leak"), "{}", message);
+}
+
+#[test]
+fn data_without_the_format_tag_is_rejected() {
+    // The data of a version without the tag does not start with a string literal at all.
+    let message = parse_error(quote!((RelA)));
+    assert!(
+        message.contains(&format!(
+            "incompatible type-leak (no format tag, expected {})",
+            Referrer::FORMAT_VERSION
+        )),
+        "{}",
+        message
+    );
+    assert!(parse2::<Referrer>(quote!()).is_err());
+    assert!(parse_error(quote!(2(RelA)(RelB))).contains("no format tag"));
+    // The tag is accepted when it is there.
+    let tag = tag();
+    assert!(parse2::<Referrer>(quote!(#tag (RelA))).is_ok());
 }
 
 #[test]
@@ -235,7 +297,7 @@ fn test_contexts() {
         tokens.to_string(),
         format!(
             "\"{}\" 3 (RelA) < T > ; (Wrap < T >) < U > ; (Wrap < U >)",
-            env!("CARGO_PKG_VERSION")
+            tag()
         )
     );
     let parsed: Referrer = parse2(tokens).unwrap();
@@ -289,20 +351,14 @@ fn test_contexts() {
     assert_eq!(referrer.contexts().count(), 2);
     assert_eq!(
         quote!(#referrer).to_string(),
-        format!(
-            "\"{}\" 2 (RelA) < T > ; (Wrap < T >)",
-            env!("CARGO_PKG_VERSION")
-        )
+        format!("\"{}\" 2 (RelA) < T > ; (Wrap < T >)", tag())
     );
     let parsed: Referrer = parse2(quote!(#referrer)).unwrap();
     assert_eq!(parsed, referrer);
     // Without any type, there is a context for the types which use nothing.
     let referrer = type_leak::Leaker::new().finish();
     assert_eq!(referrer.contexts().count(), 1);
-    assert_eq!(
-        quote!(#referrer).to_string(),
-        format!("\"{}\" ()", env!("CARGO_PKG_VERSION"))
-    );
+    assert_eq!(quote!(#referrer).to_string(), format!("\"{}\" ()", tag()));
 }
 
 #[test]

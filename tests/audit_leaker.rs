@@ -34,11 +34,25 @@ fn leak_module_with(config: LeakerConfig, item: &ItemMod) -> std::result::Result
     Ok(leaker)
 }
 
-/// The leaked types with their generics (and where clause).
+/// The required leaked types with their generics (and where clause). The optional entries (the
+/// types with the path of an external crate, see `Referrer::must()`) are left out: these tests are
+/// about the required ones, and the optional ones are tested by `optional_entries()`.
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
         .iter_with_generics()
-        .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
+        .enumerate()
+        .filter(|(ix, _)| referrer.must(*ix))
+        .map(|(_, (ty, generics))| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
+        .collect()
+}
+
+/// The optional leaked types with their generics (and where clause).
+fn optional_entries(referrer: &Referrer) -> Vec<(String, String)> {
+    referrer
+        .iter_with_generics()
+        .enumerate()
+        .filter(|(ix, _)| !referrer.must(*ix))
+        .map(|(_, (ty, generics))| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
         .collect()
 }
 
@@ -77,7 +91,8 @@ fn self_predicates_are_requirements() {
         Some(SelfRequirement::Bound(_))
     ));
 
-    // The root predicates and those bounding `Self` with a lifetime too.
+    // The root predicates and those bounding `Self` with a lifetime too: `Self: 'a` is not a
+    // predicate of the generics (it is in `context_self_outlives()`, encoded and never declared).
     let referrer = leak_trait(parse_quote! {
         trait Tr<T> where Self: ::core::marker::Send, T: ::core::marker::Sync {
             fn f<'a>(&'a self) -> Wrap<'a, Self> where Self: 'a;
@@ -87,8 +102,13 @@ fn self_predicates_are_requirements() {
         entries(&referrer),
         [e(
             "Wrap < 'a , Self >",
-            "< 'a , T : :: core :: marker :: Sync > where Self : 'a , Self : :: core :: marker :: Send"
+            "< 'a , T : :: core :: marker :: Sync > where Self : :: core :: marker :: Send"
         )]
+    );
+    let lifetime: Lifetime = parse_quote!('a);
+    assert_eq!(
+        referrer.context_self_outlives(referrer.context(0)),
+        [lifetime]
     );
 
     // A type which does not mention `Self` does not get them.
@@ -109,6 +129,11 @@ fn dyn_lifetime_bounds_are_visited() {
         }
     });
     assert_eq!(entries(&referrer), [e("dyn RelTr + 'a", "< 'a >")]);
+    // The `Box` is an optional entry, with the lifetime among its generics.
+    assert_eq!(
+        optional_entries(&referrer),
+        [e(":: std :: boxed :: Box < dyn RelTr + 'a >", "< 'a >")]
+    );
     let leaker = Leaker::new();
     let generics = Generics::default();
     // `'_` is impossible.
@@ -154,18 +179,96 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
         trait Tr { fn f(&self) -> &dyn ::p::Tr<Rel>; }
     });
     assert_eq!(entries(&referrer), [e("Rel", "")]);
-    // A named lifetime is inherited by the trait object, so the reference is interned whole.
+    // A named lifetime is inherited by the trait object (or its trait has a bound of its own, which
+    // rustc knows and the Leaker does not), so the reference is interned whole.
     let referrer = leak_trait(parse_quote! {
         trait Tr<'a> { fn f(&self) -> &'a dyn RelTr; }
     });
     assert_eq!(entries(&referrer), [e("& 'a dyn RelTr", "< 'a >")]);
-    // The reference of a local lifetime is not, so the trait object would be alone.
-    let item: ItemTrait = parse_quote! { trait Tr { fn f<'a>(&'a self) -> &'a dyn RelTr; } };
-    assert!(leak_trait_with(config(), &item).is_err());
+    // So is the reference of a lifetime of the method, which the receiver keeps constrained in the
+    // copy.
+    let referrer = leak_trait(parse_quote! {
+        trait Tr { fn f<'a>(&'a self) -> &'a dyn RelTr; }
+    });
+    assert_eq!(entries(&referrer), [e("& 'a dyn RelTr", "< 'a >")]);
+    // Unless the return type mentions it and nothing else keeps it as written: the copy would have
+    // it only in a projection, which rustc rejects (E0195).
+    let err = leak_trait_with(
+        config(),
+        &parse_quote! { trait Tr { fn f<'a>(&self, x: &'a dyn RelTr) -> &'a dyn RelTr; } },
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("use absolute path: 'RelTr'"), "{}", err);
+    assert!(err.contains("E0195"), "{}", err);
     let referrer = leak_trait(parse_quote! {
         trait Tr { fn f<'a>(&'a self) -> &'a (dyn RelTr + 'a); }
     });
     assert_eq!(entries(&referrer), [e("dyn RelTr + 'a", "< 'a >")]);
+    // No argument mentions the lifetime (it is in the return type only: early-bound in the
+    // original and in the copy alike, which has it only in a projection, so rustc accepts the
+    // implementation): old, an error, as the E0195 above; new, the reference or the path is leaked.
+    let referrer = leak_trait(parse_quote! {
+        trait Tr { fn f<'a>(&self) -> &'a dyn RelTr; }
+    });
+    assert_eq!(entries(&referrer), [e("& 'a dyn RelTr", "< 'a >")]);
+    let referrer = leak_trait(parse_quote! {
+        trait Tr { fn f<'a>(&self) -> ::core::cell::Ref<'a, dyn RelTr>; }
+    });
+    assert_eq!(
+        entries(&referrer),
+        [e(":: core :: cell :: Ref < 'a , dyn RelTr >", "< 'a >")]
+    );
+    // An argument which mentions it without keeping it as written does not exempt it.
+    let err = leak_trait_with(
+        config(),
+        &parse_quote! { trait Tr { fn f<'a>(&self, x: ::std::vec::Vec<&'a u8>) -> &'a dyn RelTr; } },
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("E0195"), "{}", err);
+    // An absolute trait object of `::core` (which is not leaked as a whole) keeps it as written,
+    // whatever is inside it, which is leaked alone: old, an error; new, the other reference is
+    // leaked.
+    let referrer = leak_trait(parse_quote! {
+        trait Tr {
+            fn f<'a>(&self, x: &'a dyn RelTr, y: &'a dyn ::core::fmt::Debug) -> &'a ();
+            fn g<'a>(&self, x: &'a dyn RelTr, y: &'a dyn ::core::iter::Iterator<Item = Rel>) -> &'a ();
+        }
+    });
+    assert_eq!(
+        entries(&referrer),
+        [e("& 'a dyn RelTr", "< 'a >"), e("Rel", "")]
+    );
+    // One which may be a cause itself does not (conservative): a relative trait, a bare
+    // identifier which may be a const, and an external crate which is not allowed (old: only with
+    // `allow_external_crates` unset): the Referrer may replace the reference to it, which then
+    // keeps nothing as written.
+    for y in [
+        "&'a dyn RelTr2",
+        "&'a dyn ::core::convert::AsRef<N>",
+        "&'a dyn ::p::Tr",
+        "&'a dyn ::p::Tr<Item = Rel>",
+    ] {
+        let y: Type = syn::parse_str(y).unwrap();
+        let err = leak_trait_with(
+            config(),
+            &parse_quote! { trait Tr { fn f<'a>(&self, x: &'a dyn RelTr, y: #y) -> &'a u8; } },
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("E0195"), "{}: {}", s(&y), err);
+    }
+    // Unless it is allowed, as `::core` is.
+    let mut allowed = config();
+    allowed.allowed_paths.push(parse_quote!(::p));
+    let referrer = leak_trait_with(
+        allowed,
+        &parse_quote! { trait Tr { fn f<'a>(&self, x: &'a dyn RelTr, y: &'a dyn ::p::Tr) -> &'a (); } },
+    )
+    .unwrap()
+    .finish();
+    assert_eq!(entries(&referrer), [e("& 'a dyn RelTr", "< 'a >")]);
     // The default of a `Box` is `'static`, so the trait object is interned alone.
     let referrer = leak_trait(parse_quote! {
         trait Tr { fn f(&self) -> ::std::boxed::Box<dyn RelTr>; }
@@ -409,7 +512,7 @@ fn parameters_are_ordered_by_kind() {
         entries(&referrer),
         [e(
             "Wrap < 'b , 'a , N , U , T >",
-            "< 'a , 'b , T : 'a + 'b , U : 'a + 'b , const N : usize >"
+            "< 'a , 'b , T , U , const N : usize >"
         )]
     );
 }

@@ -7,6 +7,11 @@ use syn::*;
 use template_quote::quote;
 use type_leak::{EncodeError, Leaker, LeakerConfig, Referrer, SelfRequirement, Visitor};
 
+/// The tag of the format of a serialized Referrer, which it starts with.
+fn tag() -> String {
+    format!("type-leak-format-{}", type_leak::Referrer::FORMAT_VERSION)
+}
+
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
 }
@@ -177,7 +182,7 @@ fn only_the_generics_used_are_required() {
         entries(&referrer),
         [entry(
             parse_quote!(Wrap<'a, 'b, T, B>),
-            parse_quote!(<'a, 'b, T: 'a + 'b, const B: bool>)
+            parse_quote!(<'a, 'b, T, const B: bool>)
         )]
     );
 
@@ -422,30 +427,27 @@ fn self_in_the_bounds_of_the_generics() {
     // Otherwise it cannot be, as the Repeater's implementation copies the bounds.
     let mut config = LeakerConfig::new();
     config.self_ty_can_be_interned = false;
-    for portable in [true, false] {
-        config.allow_external_crates(portable);
-        let mut leaker = Leaker::from_config(config.clone());
-        let err = leaker
-            .intern_with(&tr.generics, |v| v.visit_item_trait(&tr))
-            .err()
-            .unwrap();
-        assert_eq!(
-            matches!(err, type_leak::NotInternableError::RelativePath(_)),
-            portable
-        );
-        assert_eq!(
-            err.note().as_deref(),
-            Some("the bounds of its generics mention `Self`, which cannot be leaked")
-        );
-        assert!(err
-            .to_string()
-            .lines()
-            .next()
-            .unwrap()
-            .contains("Wrap < T >"));
-        // Nothing is added by a failed call.
-        assert!(leaker.finish().is_empty());
-    }
+    let mut leaker = Leaker::from_config(config.clone());
+    let err = leaker
+        .intern_with(&tr.generics, |v| v.visit_item_trait(&tr))
+        .err()
+        .unwrap();
+    assert!(matches!(
+        err,
+        type_leak::NotInternableError::RelativePath(_)
+    ));
+    assert_eq!(
+        err.note().as_deref(),
+        Some("the bounds of its generics mention `Self`, which cannot be leaked")
+    );
+    assert!(err
+        .to_string()
+        .lines()
+        .next()
+        .unwrap()
+        .contains("Wrap < T >"));
+    // Nothing is added by a failed call.
+    assert!(leaker.finish().is_empty());
 
     // A type which is not interned as a whole (it has no cause itself) is decomposed.
     let tr: ItemTrait = parse_quote! {
@@ -775,7 +777,7 @@ fn serialization_with_self() {
              < T > ; Self = S < T > ; (RelS < Self >) \
              Self = # 2 ; (RelC < Self >) \
              (RelP)",
-            env!("CARGO_PKG_VERSION")
+            tag()
         )
     );
     let parsed: Referrer = parse2(tokens).unwrap();
@@ -793,7 +795,7 @@ fn serialization_with_self() {
     assert_eq!(followed.0, referrer);
     assert_eq!(followed.1, "after");
     // Only a self part (no generics).
-    let version = env!("CARGO_PKG_VERSION");
+    let version = tag();
     let parsed: Referrer = parse2(quote!(#version Self : X ; (Rel < Self >))).unwrap();
     assert_eq!(selfs(&parsed), ["Self: X"]);
 }

@@ -115,7 +115,7 @@ fn limit_plain_encoders_usize_only() {
     assert_eq!(ty_string(&ty), expected_ty(quote!(([(); B],))));
 
     let args: AngleBracketedGenericArguments = parse2(quote!(<true>)).unwrap();
-    let ty = encode_generics_args_to_ty_with(&args.args, None, |expr, _| {
+    let ty = encode_generics_args_to_ty_with(&args.args, &generics.params, |expr, _| {
         parse2(quote!([(); #expr])).unwrap()
     })
     .unwrap();
@@ -143,21 +143,14 @@ fn limit_plain_encoders_usize_only() {
 }
 
 #[test]
-fn limit_plain_args_encoder_without_params() {
-    // Without the parameters, `encode_generics_args_to_ty_with()` encodes the arguments as they are:
-    // a bare `N` (parsed by syn as a type argument) is encoded as a type instead of `[(); N]`, and
-    // omitted arguments are not filled with the parameters' defaults, so the result may differ
-    // from `encode_generics_params_to_ty()`. Giving the parameters handles both.
+fn limit_plain_args_encoder_needs_params() {
+    // A bare `N` (parsed by syn as a type argument) is a const, and omitted arguments take the
+    // parameters' defaults, which the arguments alone cannot tell, so the parameters are required
+    // and the result is that of `encode_generics_params_to_ty()`.
     let generics: Generics = parse2(quote!(<T, const N: usize, const M: usize = 3>)).unwrap();
     let args: AngleBracketedGenericArguments = parse2(quote!(<u8, N>)).unwrap();
 
-    let ty = encode_generics_args_to_ty_with(&args.args, None, |expr, _| {
-        parse2(quote!([(); #expr])).unwrap()
-    })
-    .unwrap();
-    assert_eq!(ty_string(&ty), expected_ty(quote!((u8, N))));
-
-    let ty = encode_generics_args_to_ty_with(&args.args, Some(&generics.params), |expr, _| {
+    let ty = encode_generics_args_to_ty_with(&args.args, &generics.params, |expr, _| {
         parse2(quote!([(); #expr])).unwrap()
     })
     .unwrap();

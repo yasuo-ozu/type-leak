@@ -12,8 +12,8 @@ use crate::encode::is_const_param_ty;
 use crate::graph::{NodeKey, TypeGraph};
 use crate::leaker::Leaker;
 use crate::util::{
-    first_self_in_generics, first_self_in_type, generic_param_name, ident_name, is_primitive_name,
-    token_names, unwrap_type_group,
+    first_self_in_generics, first_self_in_type, generic_param_name, has_lifetime_bound, ident_name,
+    is_primitive_name, token_names, trait_object_of, unwrap_type_group,
 };
 use proc_macro2::TokenStream;
 use std::collections::{HashMap, HashSet};
@@ -56,16 +56,28 @@ pub struct CheckResult {
     pub note: Option<String>,
 }
 
-/// A type to be added to the [`TypeGraph`], with its components.
+/// A type to be added to the [`TypeGraph`]s, with its components.
+///
+/// The types are added to two graphs: that of the required entries (the types which depend on the
+/// type context, see [`CheckResult::must`]), and that of the optional ones (the types whose own
+/// path is an absolute one naming an external crate, see [`Leaker::is_soft_path()`]), which the
+/// Referrer may or may not replace (see [`Referrer::must()`](crate::Referrer::must())).
 pub(crate) struct PendingType {
     ty: Type,
     is_must_intern: bool,
-    /// A cause of the type is not the path of an external crate (see
-    /// [`Referrer::must()`](crate::Referrer::must())).
-    is_hard: bool,
     /// The type or a component of it is a cause (see [`CheckResult::must`]). Otherwise the type is
-    /// never interned, so it is not added.
+    /// never interned, so it is not added to the graph of the required entries.
     has_must: bool,
+    /// The type is a candidate of the graph of the required entries (if it has a cause). It is not
+    /// if it is only an optional type (an optional entry depending on local generics, which is
+    /// not decomposed into a required one).
+    in_graph: bool,
+    /// The type is an optional entry if the Referrer replaces it: its own path names an external
+    /// crate, and it can be leaked as a whole (it has no cause of its own, or it would be a
+    /// required entry), so it is a red node of the graph of the optional entries.
+    optional: bool,
+    /// The type or a component of it is optional (see `optional`).
+    has_optional: bool,
     /// The context of the type.
     context: Context,
     /// The type is a bare identifier written as a generic argument, which may be a const (syn
@@ -107,9 +119,10 @@ struct Frame {
     /// The type mentions an item declared in an analyzed module (see
     /// [`AnalyzeVisitor::is_module_path()`]).
     module_item: bool,
-    /// A cause found in the type is not the path of an external crate (an absolute path whose
-    /// first segment is not `core`).
-    hard: bool,
+    /// The minimum depth of the types whose own path is an absolute one naming an external crate
+    /// (see [`Leaker::is_soft_path()`]) found in the type (`usize::MAX` if none). They are not
+    /// causes: the type is an optional entry if one is its own (see [`PendingType::optional`]).
+    soft_depth: usize,
     /// A cause found in the type is a relative path resolved in the module where the type is
     /// written (not a generic, `Self`, an absolute path, `crate::`, or a path portable with the
     /// module), so the type means something else in another module.
@@ -120,6 +133,10 @@ struct Frame {
     /// is decided, which reports it in the note of the conflict (see
     /// [`AnalyzeVisitor::own_context()`]).
     binder: Option<(usize, Lifetime)>,
+    /// The type is a trait object without a lifetime bound, which defaults to this lifetime of a
+    /// method, which the copy would leave unconstrained (see [`AnalyzeVisitor::unconstrained_lifetimes()`]), so
+    /// the path or the reference holding it cannot be interned as a whole.
+    unconstrained: Option<Lifetime>,
     /// The effects, which are applied if the type is decomposed.
     effects: Vec<Effect>,
 }
@@ -134,9 +151,10 @@ impl Frame {
             mentions_root: false,
             mentions_self: false,
             module_item: false,
-            hard: false,
+            soft_depth: usize::MAX,
             relative: false,
             binder: None,
+            unconstrained: None,
             effects: Vec::new(),
         }
     }
@@ -189,7 +207,10 @@ enum BinderInput<'a> {
 /// The result of applying the effects of [`AnalyzeVisitor`].
 #[derive(Default)]
 pub(crate) struct Analysis {
+    /// The graph of the required entries.
     pub(crate) types: TypeGraph,
+    /// The graph of the optional entries, in the contexts of `Leaker::optional_contexts`.
+    pub(crate) optional: TypeGraph,
     /// The relative paths which cannot be interned.
     pub(crate) errors: Vec<CheckResult>,
     /// The names of the primitive types copied as they are (see [`Leaker::assertions()`]).
@@ -237,24 +258,39 @@ pub(crate) struct AnalyzeVisitor<'a> {
     /// are the `root`.
     item_depth: usize,
     /// The type being visited is the referent of a reference, or a type argument of a path, which
-    /// cannot be interned as a whole (its lifetime is elided or local, or the path is in a trait
-    /// bound), so a trait object without a lifetime bound, which defaults to that lifetime, cannot
-    /// be interned alone.
+    /// cannot be interned as a whole (its lifetime is elided, the path has several local
+    /// lifetimes, or it is in a trait bound), so a trait object without a lifetime bound, which
+    /// defaults to that lifetime, cannot be interned alone.
     elided_ref: bool,
+    /// The type being visited is a type argument of a path whose only lifetime argument is this
+    /// lifetime of a method, or the referent of a reference with it, which the copy would leave
+    /// unconstrained if the path or the reference were interned as a whole (see
+    /// [`AnalyzeVisitor::signatures`]): a trait object without a lifetime bound cannot be interned
+    /// alone, like with `elided_ref`, and the conflict has a note of its own.
+    unconstrained_ref: Option<Lifetime>,
     /// The type being visited is (directly) a bare identifier written as a generic argument (e.g.
     /// `SIZE` in `W<SIZE>`), which may be a const (see [`PendingType::ambiguous`]).
     ambiguous_arg: bool,
     /// The type being visited is the referent of a reference, or a type argument of a path, with a
-    /// lifetime of the Leaker's generics, so a trait object without a lifetime bound defaults to
+    /// lifetime which is a generic (of the Leaker, or a local one), so a trait object defaults to
     /// that lifetime, and is not the same type when interned alone (it would default to
     /// `'static`). Only the trait object is affected (also inside parentheses and groups): what
     /// is inside it is not, and can be interned.
     inherits: Option<Inherits>,
+    /// The functions whose signatures are being visited, each with the index in `scopes` of the
+    /// scope of its generics and the lifetimes among them whose copy would be early-bound where
+    /// the original is late-bound if a type using them were interned (see
+    /// [`AnalyzeVisitor::unconstrained_lifetimes()`]), the innermost last.
+    signatures: Vec<(usize, Vec<Lifetime>)>,
     /// The depth of the type owning the expression being visited in a type (an array length or a
     /// const argument), if any. The types in it are not interned on their own: the copy of the
     /// expression would have a projection (`<Self as Repeater<..>>::Type`) in an anonymous
     /// constant, which is not permitted if the generics (or `Self`) are in it.
     expr_owner: Option<usize>,
+    /// The syntax being visited is a receiver (`self: Box<Self>`), whose type the Referrer cannot
+    /// replace: rustc accepts only `Self` and the types dereferencing to it there, not a
+    /// projection. So no type in it is an optional entry.
+    in_receiver: bool,
     /// The lifetimes which the type being visited must outlive because of the types around it,
     /// and which its context carries (see [`Enclosing`]). The Referrer keeps track of the same
     /// lifetimes where it looks the types up, so that it finds the entry of the type. While the
@@ -267,13 +303,23 @@ pub(crate) struct AnalyzeVisitor<'a> {
 /// [`AnalyzeVisitor::inherits`]).
 #[derive(Clone, Copy)]
 enum Inherits {
-    /// A reference `&'a dyn Trait`, which is the type at the given depth. The default is `'a`, so
-    /// the trait object is not interned alone. Neither is one with a lifetime bound written
-    /// (`&'a (dyn Trait + 'b)`), which could be: the reference is the type that carries the bound
-    /// `'b: 'a` it implies. It is a transparent part of the reference (its components are the
+    /// A reference `&'a dyn Trait` with a lifetime of the Leaker's generics, or a local one (of a
+    /// method, an associated type, a nested item or a `for<..>` binder) which the copy does not
+    /// leave unconstrained (see [`AnalyzeVisitor::unconstrained_lifetimes()`]), which is the type at the given
+    /// depth. The default of the trait object is `'a` unless the trait has a lifetime bound of its
+    /// own (`trait Trait: 'static`, which makes it `'static` whatever the reference is), which the
+    /// Leaker cannot see for a relative trait: rustc computes it from the definition of the trait,
+    /// so the trait object is not interned alone (`dyn Trait + 'a` would be rejected by the
+    /// Repeater's implementation, E0478, for such a trait), and a trait object interned alone
+    /// would be `'static`. It is a transparent part of the reference (its components are the
     /// reference's, and it is not a type to intern, see `Leaker::needs_parent()`), unless it must
     /// be interned itself (it has a cause of its own), when the reference is interned as a whole
-    /// instead.
+    /// instead, with `'a` among its generics, so rustc gives the trait object its default in the
+    /// implementation of the Repeater.
+    ///
+    /// Neither is a trait object with a lifetime bound written (`&'a (dyn Trait + 'b)`) of a
+    /// lifetime of the Leaker, which could be: the reference is the type that carries the bound
+    /// `'b: 'a` it implies.
     Reference(usize),
     /// A path with lifetime arguments (e.g. `Ref<'a, dyn Trait>`, where `Ref<'a, T: 'a>` makes the
     /// default `'a`), which is the type at the given depth. The default depends on the path, which
@@ -325,9 +371,12 @@ impl<'a> AnalyzeVisitor<'a> {
             type_depth: 0,
             item_depth: 0,
             elided_ref: false,
+            unconstrained_ref: None,
             ambiguous_arg: false,
             inherits: None,
+            signatures: Vec::new(),
             expr_owner: None,
+            in_receiver: false,
             enclosing: Enclosing::default(),
         }
     }
@@ -366,10 +415,15 @@ impl<'a> AnalyzeVisitor<'a> {
     }
 
     /// Records a cause which depends on the type context, found in the type being visited.
-    fn push_must(&mut self, must: TokenStream, hard: bool) {
-        self.frame.hard |= hard;
+    fn push_must(&mut self, must: TokenStream) {
         self.musts.push((self.type_depth, must));
         self.frame.min_depth = self.frame.min_depth.min(self.type_depth);
+    }
+
+    /// Records that the own path of the type being visited is an absolute one naming an external
+    /// crate (see [`Leaker::is_soft_path()`]), which the Referrer may replace: not a cause.
+    fn push_soft(&mut self) {
+        self.frame.soft_depth = self.frame.soft_depth.min(self.type_depth);
     }
 
     /// Records a cause which cannot be interned, found in the type being visited.
@@ -456,12 +510,15 @@ impl<'a> AnalyzeVisitor<'a> {
     }
 
     /// Returns the first mention of `Self` in the generics which `context` declares, which
-    /// cannot be leaked unless [`Leaker::self_ty_can_be_interned`].
+    /// cannot be leaked unless [`Leaker::self_ty_can_be_interned`]. A bound `Self: 'a` which the
+    /// item writes is not among them (it is encoded as `&'a Self`, see
+    /// [`Context::self_outlives()`]), but the implementation needs `Self` to encode it as well.
     fn self_in_bounds(&self, context: &Context) -> Option<TokenStream> {
         if self.leaker.self_ty_can_be_interned {
             return None;
         }
         first_self_in_generics(context.generics())
+            .or_else(|| (!context.self_outlives().is_empty()).then(|| quote!(Self)))
     }
 
     /// Returns the lifetime which `context` declares and which the output of a `for<..>` binder
@@ -506,12 +563,16 @@ impl<'a> AnalyzeVisitor<'a> {
             self.own_causes(inner.must_start, owner);
             inner.min_depth = owner;
         }
+        // The same goes for the types naming an external crate (see `Frame::soft_depth`).
+        if inner.soft_depth != usize::MAX {
+            inner.soft_depth = owner;
+        }
         self.frame.min_depth = self.frame.min_depth.min(inner.min_depth);
+        self.frame.soft_depth = self.frame.soft_depth.min(inner.soft_depth);
         self.frame.local_scope = self.frame.local_scope.min(inner.local_scope);
         self.frame.mentions_root |= inner.mentions_root;
         self.frame.mentions_self |= inner.mentions_self;
         self.frame.module_item |= inner.module_item;
-        self.frame.hard |= inner.hard;
         self.frame.relative |= inner.relative;
         self.merge_binder(&inner);
         let effects = std::mem::take(&mut inner.effects);
@@ -525,11 +586,11 @@ impl<'a> AnalyzeVisitor<'a> {
     /// by what is inherited (the copy keeps the trait object where it is).
     fn decide_through(&mut self, mut inner: Frame) {
         self.frame.min_depth = self.frame.min_depth.min(inner.min_depth);
+        self.frame.soft_depth = self.frame.soft_depth.min(inner.soft_depth);
         self.frame.local_scope = self.frame.local_scope.min(inner.local_scope);
         self.frame.mentions_root |= inner.mentions_root;
         self.frame.mentions_self |= inner.mentions_self;
         self.frame.module_item |= inner.module_item;
-        self.frame.hard |= inner.hard;
         self.frame.relative |= inner.relative;
         self.merge_binder(&inner);
         let effects = std::mem::take(&mut inner.effects);
@@ -572,7 +633,8 @@ impl<'a> AnalyzeVisitor<'a> {
                 .binder
                 .as_ref()
                 .filter(|(owner, _)| *owner == depth)
-                .map(|(_, lifetime)| binder_note(lifetime, true));
+                .map(|(_, lifetime)| binder_note(lifetime, true))
+                .or_else(|| inner.unconstrained.as_ref().map(unconstrained_note));
             return Err(conflict);
         }
         if self.in_default && inner.mentions_self {
@@ -639,20 +701,47 @@ impl<'a> AnalyzeVisitor<'a> {
             }
             own = Some(Err(self.binder_conflict(&inner, depth, &lifetime)));
         }
+        // The same for a type naming an external crate with a lifetime of such a binder (which no
+        // input anchors, as a type of an external crate is no anchor): it cannot be an optional
+        // entry alone either, so the type holding the binder is, instead. That does not make it
+        // own the causes in it (the required entries do not depend on the optional ones).
+        if own.is_none() && inner.soft_depth == depth && !inner.module_item && !self.in_receiver {
+            if let Ok(context) = self.own_context(ty, depth, &inner) {
+                if let Some((_, owner)) = self.output_binder(&context) {
+                    if owner > 0 {
+                        inner.soft_depth = owner;
+                        return self.decide_through(inner);
+                    }
+                }
+            }
+        }
         // The causes and the local generics also belong to the enclosing type, as those of a
         // component.
         self.frame.min_depth = self.frame.min_depth.min(inner.min_depth);
+        self.frame.soft_depth = self.frame.soft_depth.min(inner.soft_depth);
         self.frame.local_scope = self.frame.local_scope.min(inner.local_scope);
         self.frame.mentions_root |= inner.mentions_root;
         self.frame.mentions_self |= inner.mentions_self;
         self.frame.module_item |= inner.module_item;
-        self.frame.hard |= inner.hard;
         self.frame.relative |= inner.relative;
         self.merge_binder(&inner);
         let has_impossible = self.impossibles.len() > inner.impossible_start;
         let has_must = inner.min_depth != usize::MAX;
         // The scopes declared inside the type (e.g. by a binder) are not in scope any more.
         let mentions_local = inner.local_scope < self.scopes.len();
+        // The type is an optional entry if its own path names an external crate (see
+        // `Leaker::is_soft_path()`) and no cause is its own (it is a required entry then), and it
+        // can be leaked as a whole. It is no conflict otherwise: it is just not leaked, and
+        // copied as it is.
+        let optional = if own.is_none()
+            && inner.soft_depth == depth
+            && !inner.module_item
+            && !self.in_receiver
+        {
+            self.optional_context(ty, depth, &inner)
+        } else {
+            None
+        };
         let effects = std::mem::take(&mut inner.effects);
 
         if let Some(own) = own {
@@ -665,8 +754,10 @@ impl<'a> AnalyzeVisitor<'a> {
                     self.frame.effects.push(Effect::Type(Box::new(PendingType {
                         ty: ty.clone(),
                         is_must_intern: true,
-                        is_hard: inner.hard,
                         has_must: true,
+                        in_graph: true,
+                        optional: false,
+                        has_optional: false,
                         ambiguous: ambiguous && context.is_empty(),
                         context,
                         components: Vec::new(),
@@ -681,6 +772,10 @@ impl<'a> AnalyzeVisitor<'a> {
                 // The type cannot be interned as a whole (e.g. `&MyType` with an elided lifetime,
                 // or `impl Iterator<Item = MyType>`), but its components can.
                 self.frame.effects.extend(effects);
+            } else if has_optional(&effects) {
+                // The same for the types which may be replaced (`impl Iterator<Item =
+                // ::path::MyType>`), as they have no cause: the primitive types are assumed.
+                self.frame.effects.extend(effects);
             } else {
                 // Otherwise, the type cannot be interned, but does not need to be (e.g.
                 // `impl ::path::Trait`). It is copied as it is, so the primitive types in it are
@@ -690,8 +785,24 @@ impl<'a> AnalyzeVisitor<'a> {
         } else if mentions_local || inner.module_item || (self.in_default && inner.mentions_self) {
             // The type itself is not interned because it depends on local generics (or refers to
             // an item of the module, which the Referrer shadows in the copy of the module, or to
-            // `Self` in a default), but its components can be.
-            self.frame.effects.extend(effects);
+            // `Self` in a default), but its components can be. It may be replaced if it is an
+            // optional entry, which does not decompose into the required ones.
+            match optional {
+                Some(context) => {
+                    self.frame.effects.push(Effect::Type(Box::new(PendingType {
+                        ty: ty.clone(),
+                        is_must_intern: false,
+                        has_must,
+                        in_graph: false,
+                        optional: true,
+                        has_optional: true,
+                        context,
+                        ambiguous: false,
+                        components: effects,
+                    })));
+                }
+                None => self.frame.effects.extend(effects),
+            }
         } else {
             // The type may be interned as a whole, or its components.
             let context = self.context_of(ty, &inner);
@@ -701,13 +812,27 @@ impl<'a> AnalyzeVisitor<'a> {
                 self.frame.effects.push(Effect::Type(Box::new(PendingType {
                     ty: ty.clone(),
                     is_must_intern: false,
-                    is_hard: inner.hard,
                     has_must,
+                    in_graph: true,
+                    optional: optional.is_some(),
+                    has_optional: optional.is_some() || has_optional(&effects),
                     context,
                     ambiguous: false,
                     components: effects,
                 })));
             }
+        }
+    }
+
+    /// Returns the context of the type `ty` at `depth` (see `decide()`) if it can be an optional
+    /// entry: it can be leaked as a whole (see [`AnalyzeVisitor::own_context()`]), and does not use
+    /// a lifetime of a `for<..>` binder which its output mentions (see [`Binder`]), which `decide()`
+    /// leaves to the type holding the binder.
+    fn optional_context(&self, ty: &Type, depth: usize, inner: &Frame) -> Option<Context> {
+        let context = self.own_context(ty, depth, inner).ok()?;
+        match self.output_binder(&context) {
+            Some(_) => None,
+            None => Some(context),
         }
     }
 
@@ -894,6 +1019,35 @@ impl<'a> AnalyzeVisitor<'a> {
         }
     }
 
+    /// Runs `f` with the generics of the function `sig` (a method, or an item if `item`) in scope,
+    /// and the lifetimes which the copy of its signature would leave unconstrained (see
+    /// [`AnalyzeVisitor::unconstrained_lifetimes()`]).
+    fn with_signature(&mut self, sig: &Signature, item: bool, f: impl FnOnce(&mut Self)) {
+        // The generics of the outermost item are those of the Leaker (the scope 0).
+        let local = !item || self.item_depth > 0;
+        if local {
+            let risky = self.unconstrained_lifetimes(sig);
+            self.signatures.push((self.scopes.len(), risky));
+        }
+        if item {
+            self.with_item_generics(&sig.generics, f);
+        } else {
+            self.with_local_generics(&sig.generics, f);
+        }
+        if local {
+            self.signatures.pop();
+        }
+    }
+
+    /// Returns `true` if `lifetime`, declared in the scope `scope`, is one of a method which the
+    /// copy of its signature would leave unconstrained if a type using it were interned as a whole
+    /// (see [`AnalyzeVisitor::unconstrained_lifetimes()`]).
+    fn is_unconstrained(&self, lifetime: &Lifetime, scope: usize) -> bool {
+        self.signatures
+            .iter()
+            .any(|(at, risky)| *at == scope && risky.contains(lifetime))
+    }
+
     /// Runs `f` with the lifetimes of a `for<..>` binder (e.g. `'a` in `for<'a> Fn(&'a T)`) in
     /// scope. They are local generics: a type using one is interned with it among its generics,
     /// which the Repeater's implementation declares. Unless the output of the binder mentions it
@@ -932,9 +1086,9 @@ impl<'a> AnalyzeVisitor<'a> {
     /// rustc requires a lifetime of the output to be constrained by the inputs, where a projection
     /// constrains nothing, and the copy replaces the types leaked by projections. So a lifetime is
     /// fine if an input keeps it where it is written in the copy: an *anchor*, an occurrence of it
-    /// in a position which constrains it (not in a projection, nor in an associated type binding,
-    /// see [`AnalyzeVisitor::scan_anchors()`]), with none of the types from the input down to
-    /// the occurrence interned. The types interned alone are those which depend on the type
+    /// in a position which constrains it (anywhere but in a projection, see
+    /// [`AnalyzeVisitor::scan_anchors()`]), with none of the types from the input down to the
+    /// occurrence interned. The types interned alone are those which depend on the type
     /// context by their own path (they are interned as a whole), and those holding the binder
     /// (see [`Binder`]), and no other, as a type which mentions a lifetime of the binder is never
     /// interned unless it has a cause of its own (see [`AnalyzeVisitor::decide()`]: it depends on
@@ -949,8 +1103,10 @@ impl<'a> AnalyzeVisitor<'a> {
     /// afterwards) which logs the types found to be interned as a whole. The binders inside it are
     /// not probed again (the cost of a binder is that of its content, not exponential in the
     /// nesting): they take all their lifetimes of the output as unanchored there, which can only
-    /// make more types interned, i.e. fewer anchors. Only the types on the way to an anchor count,
-    /// and a binder is never on it (see [`AnalyzeVisitor::scan_anchors()`]).
+    /// make more types interned, i.e. fewer anchors (a function pointer or a trait object with a
+    /// binder of its own on the way to an anchor is one of them if a type using the lifetime of its
+    /// binder is interned in its place). Only the types on the way to an anchor count (see
+    /// [`AnalyzeVisitor::scan_anchors()`]).
     fn unanchored(
         &mut self,
         lifetimes: &BoundLifetimes,
@@ -1034,16 +1190,29 @@ impl<'a> AnalyzeVisitor<'a> {
     /// in a projection), pushing to `anchors` the types from the root of the input (`chain`, which
     /// is the way down to `ty`, exclusive) down to the one holding it.
     ///
-    /// Everything constrains, but a projection (`<T as Tr<'x>>::A`, `T::A<'x>`, `Self::A<'x>`),
-    /// the length of an array (an unevaluated constant) and `impl Trait`, and a path whose
+    /// Everything constrains but a projection (`<T as Tr<'x>>::A`, `T::A<'x>`, `Self::A<'x>`), the
+    /// length of an array (an unevaluated constant), `impl Trait` and a type macro, which are not
+    /// looked into. rustc checks the input as a type: whatever it holds counts, however deep, and
+    /// whether it is a generic argument, an associated type binding (`dyn Iterator<Item = &'x u8>`),
+    /// the output of `Fn(..) -> R`, the lifetime bound of a trait object (`dyn Tr + 'x`), or inside a
+    /// function pointer or a trait object with a binder of its own (`dyn for<'y> Fn(&'x u8, &'y u8)`),
+    /// while a projection is skipped wherever it is (also in a binding). Only the bound itself,
+    /// whose associated type bindings are its output (see [`bound_inputs()`]), differs. A path whose
     /// definition is not seen is assumed to be a struct, an enum or a union (a type alias of a
     /// projection, or one which drops the lifetime, does not constrain, and is not told from them).
-    /// rustc counts the associated type bindings and the lifetime bound of a trait object too,
-    /// which are not looked into: they are the output of a bound, not the input. Neither are the
-    /// function pointers and the bounds with a binder of their own, whose lifetimes are bound inside
-    /// them (a type holding a binder is interned as a whole if it is a cause of one, see
-    /// [`Binder`], which cannot be told from here), and type macros. When in doubt it is not an
-    /// anchor, the rule of [`Binder`] applies then.
+    ///
+    /// The occurrence is an anchor only if it stays in the copy as written: none of the types on the
+    /// chain is interned as a whole (see [`AnalyzeVisitor::unanchored()`]), which the chain
+    /// records. That includes the trait objects, the function pointers and the paths holding it,
+    /// which are not leaked if they mention `'x` unless they have a cause of their own (a relative
+    /// trait or path). When in doubt it is not an anchor, the rule of [`Binder`] applies then.
+    ///
+    /// The Referrer may replace a type with the path of an external crate (`::other::Wrap<&'x
+    /// u8>`, see [`Leaker::is_soft_path()`]) as a whole, and the Leaker does not know whether it
+    /// does (see `Referrer::allow_ambiguous_crate_name()`), so such a type, and a trait object with
+    /// such a path in a bound, are on the chain of a type which may be leaked: nothing in them is an
+    /// anchor, whichever the Referrer does. The paths of `::core` and those allowed by the Leaker
+    /// stay where they are, so what is in them counts.
     fn scan_anchors(
         &self,
         ty: &Type,
@@ -1053,6 +1222,10 @@ impl<'a> AnalyzeVisitor<'a> {
     ) {
         chain.push(ty as *const Type as usize);
         match ty {
+            // A reference to a trait object of an external crate without a lifetime bound is leaked
+            // as a whole if the trait object is (it inherits the lifetime of the reference, see
+            // `Inherits::Reference`), which the Referrer may replace.
+            Type::Reference(reference) if self.is_external_object(&reference.elem) => {}
             Type::Reference(reference) => {
                 if reference.lifetime.as_ref() == Some(wanted) {
                     anchors.push(chain.clone());
@@ -1061,6 +1234,9 @@ impl<'a> AnalyzeVisitor<'a> {
             }
             Type::Ptr(ptr) => self.scan_anchors(&ptr.elem, wanted, chain, anchors),
             Type::Slice(slice) => self.scan_anchors(&slice.elem, wanted, chain, anchors),
+            // The length of an array naming an external crate makes the array a type which may be
+            // replaced as a whole.
+            Type::Array(array) if self.names_external_crate_in_expr(&array.len) => {}
             Type::Array(array) => self.scan_anchors(&array.elem, wanted, chain, anchors),
             Type::Paren(paren) => self.scan_anchors(&paren.elem, wanted, chain, anchors),
             Type::Group(group) => self.scan_anchors(&group.elem, wanted, chain, anchors),
@@ -1069,15 +1245,30 @@ impl<'a> AnalyzeVisitor<'a> {
                     self.scan_anchors(elem, wanted, chain, anchors);
                 }
             }
-            Type::Path(TypePath { qself: None, path }) if !self.is_projection(path) => {
+            // The path of an external crate (`::other::Wrap<&'x u8>`) may be leaked as a whole by
+            // the Referrer (see `Leaker::is_soft_path()`), so nothing in it is an anchor.
+            Type::Path(TypePath { qself: None, path })
+                if !self.is_projection(path)
+                    && !self.leaker.is_soft_path(path)
+                    && !self.holds_external_object(path) =>
+            {
                 if let Some(seg) = path.segments.last() {
                     self.scan_arguments(&seg.arguments, wanted, chain, anchors);
                 }
             }
-            Type::TraitObject(object) => {
+            Type::BareFn(f) if !declares(f.lifetimes.as_ref(), wanted) => {
+                for arg in &f.inputs {
+                    self.scan_anchors(&arg.ty, wanted, chain, anchors);
+                }
+                self.scan_output(&f.output, wanted, chain, anchors);
+            }
+            // The same goes for a trait object naming an external crate.
+            Type::TraitObject(object) if !self.names_external_crate(object) => {
                 for bound in &object.bounds {
                     match bound {
-                        TypeParamBound::Trait(bound) if bound.lifetimes.is_none() => {
+                        TypeParamBound::Trait(bound)
+                            if !declares(bound.lifetimes.as_ref(), wanted) =>
+                        {
                             if let Some(seg) = bound.path.segments.last() {
                                 self.scan_arguments(&seg.arguments, wanted, chain, anchors);
                             }
@@ -1094,8 +1285,9 @@ impl<'a> AnalyzeVisitor<'a> {
         chain.pop();
     }
 
-    /// Finds the occurrences of `wanted` in the generic arguments (the associated type bindings and
-    /// the output of `Fn(..) -> R` are not looked into), see [`AnalyzeVisitor::scan_anchors()`].
+    /// Finds the occurrences of `wanted` in the generic arguments of a path in an input, including
+    /// the associated type bindings and the output of `Fn(..) -> R` (it is not the bound being
+    /// checked, whose output does not constrain), see [`AnalyzeVisitor::scan_anchors()`].
     fn scan_arguments(
         &self,
         arguments: &PathArguments,
@@ -1111,6 +1303,9 @@ impl<'a> AnalyzeVisitor<'a> {
                             anchors.push(chain.clone())
                         }
                         GenericArgument::Type(ty) => self.scan_anchors(ty, wanted, chain, anchors),
+                        GenericArgument::AssocType(binding) => {
+                            self.scan_anchors(&binding.ty, wanted, chain, anchors)
+                        }
                         _ => (),
                     }
                 }
@@ -1119,9 +1314,79 @@ impl<'a> AnalyzeVisitor<'a> {
                 for ty in &args.inputs {
                     self.scan_anchors(ty, wanted, chain, anchors);
                 }
+                self.scan_output(&args.output, wanted, chain, anchors);
             }
             PathArguments::None => (),
         }
+    }
+
+    /// Finds the occurrences of `wanted` in the return type of a function pointer or of `Fn(..)`
+    /// in an input, see [`AnalyzeVisitor::scan_anchors()`].
+    fn scan_output(
+        &self,
+        output: &ReturnType,
+        wanted: &Lifetime,
+        chain: &mut Vec<usize>,
+        anchors: &mut Vec<Vec<usize>>,
+    ) {
+        if let ReturnType::Type(_, ty) = output {
+            self.scan_anchors(ty, wanted, chain, anchors);
+        }
+    }
+
+    /// Returns `true` if `ty` (also in parentheses and groups) is a trait object without a
+    /// lifetime bound which names an external crate: it inherits the lifetime of the reference or
+    /// the path around it, which is leaked as a whole instead of it if it is (see
+    /// `Inherits`), so what is around it may be replaced by the Referrer.
+    fn is_external_object(&self, ty: &Type) -> bool {
+        trait_object_of(ty).map_or(false, |object| {
+            self.names_external_crate(object) && !has_lifetime_bound(object)
+        })
+    }
+
+    /// Returns `true` if the last segment of `path` has a lifetime argument and an argument which
+    /// is such a trait object (see [`AnalyzeVisitor::is_external_object()`]): the path is leaked as
+    /// a whole if the trait object is.
+    fn holds_external_object(&self, path: &Path) -> bool {
+        match path.segments.last().map(|seg| &seg.arguments) {
+            Some(PathArguments::AngleBracketed(args)) => args
+                .args
+                .iter()
+                .any(|arg| matches!(arg, GenericArgument::Lifetime(_)))
+                && args.args.iter().any(
+                    |arg| matches!(arg, GenericArgument::Type(ty) if self.is_external_object(ty)),
+                ),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if a path in the expression `expr` is the path of an external crate (see
+    /// [`Leaker::is_soft_path()`]).
+    fn names_external_crate_in_expr(&self, expr: &Expr) -> bool {
+        struct Finder<'v, 'l> {
+            visitor: &'v AnalyzeVisitor<'l>,
+            found: bool,
+        }
+        impl<'v, 'l, 'ast> Visit<'ast> for Finder<'v, 'l> {
+            fn visit_path(&mut self, i: &'ast Path) {
+                self.found |= self.visitor.leaker.is_soft_path(i);
+                syn::visit::visit_path(self, i)
+            }
+        }
+        let mut finder = Finder {
+            visitor: self,
+            found: false,
+        };
+        finder.visit_expr(expr);
+        finder.found
+    }
+
+    /// Returns `true` if a bound of the trait object is the path of an external crate (see
+    /// [`Leaker::is_soft_path()`]): the trait object may be leaked as a whole by the Referrer.
+    fn names_external_crate(&self, object: &TypeTraitObject) -> bool {
+        object.bounds.iter().any(|bound| {
+            matches!(bound, TypeParamBound::Trait(bound) if self.leaker.is_soft_path(&bound.path))
+        })
     }
 
     /// Returns `true` if `path` is a projection: an associated item of a generic parameter in
@@ -1137,36 +1402,66 @@ impl<'a> AnalyzeVisitor<'a> {
 
 impl Analysis {
     /// Applies `effects` in order, adding the types as components of `parent` (if any), each in
-    /// its context (numbered in the order of the first appearance).
+    /// its context (numbered in the order of the first appearance), to the graph of the required
+    /// entries.
     pub(crate) fn apply(
         &mut self,
         contexts: &mut Contexts,
-        effects: Vec<Effect>,
+        effects: &[Effect],
         parent: Option<&NodeKey>,
     ) {
         for effect in effects {
             match effect {
-                Effect::Type(pending) if !pending.has_must => {
+                Effect::Type(pending) if !pending.has_must || !pending.in_graph => {
                     // A type with no cause in it is never interned, so it is not added (nor its
                     // context), but the assumptions of its components are kept.
-                    self.apply(contexts, pending.components, parent);
+                    self.apply(contexts, &pending.components, parent);
                 }
                 Effect::Type(pending) => {
-                    let context = contexts.intern(pending.context);
-                    let key = self.types.add(
-                        context,
-                        &pending.ty,
-                        parent,
-                        pending.is_must_intern,
-                        pending.is_hard,
-                    );
-                    self.apply(contexts, pending.components, Some(&key));
+                    let context = contexts.intern(pending.context.clone());
+                    let key = self
+                        .types
+                        .add(context, &pending.ty, parent, pending.is_must_intern);
+                    self.apply(contexts, &pending.components, Some(&key));
                 }
-                Effect::Error(error) => self.errors.push(error),
-                Effect::Primitive(ident) => self.primitives.push(ident),
+                Effect::Error(error) => self.errors.push(error.clone()),
+                Effect::Primitive(ident) => self.primitives.push(ident.clone()),
             }
         }
     }
+
+    /// Applies `effects` in order, like [`Analysis::apply()`], adding the types to the graph of the
+    /// optional entries instead: the types which may be replaced (see [`PendingType::optional`]),
+    /// and the types containing them, in contexts of their own (`contexts`, not those of the
+    /// required entries). The types interned as a whole by their own cause are required (leaked in
+    /// both graphs), so they are not in this one, nor the types in them.
+    pub(crate) fn apply_optional(
+        &mut self,
+        contexts: &mut Contexts,
+        effects: &[Effect],
+        parent: Option<&NodeKey>,
+    ) {
+        for effect in effects {
+            if let Effect::Type(pending) = effect {
+                if pending.is_must_intern || !(pending.optional || pending.has_optional) {
+                    continue;
+                }
+                let context = contexts.intern(pending.context.clone());
+                let key = self
+                    .optional
+                    .add(context, &pending.ty, parent, pending.optional);
+                self.apply_optional(contexts, &pending.components, Some(&key));
+            }
+        }
+    }
+}
+
+/// Returns `true` if a type among `effects` is optional, or contains one (see
+/// [`PendingType::optional`]).
+fn has_optional(effects: &[Effect]) -> bool {
+    effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Type(pending) if pending.optional || pending.has_optional))
 }
 
 impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
@@ -1190,7 +1485,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         let mut i = i.clone();
         i.default = None;
         i.semi_token = Some(Default::default());
-        self.with_local_generics(&i.sig.generics, |visitor| {
+        self.with_signature(&i.sig, false, |visitor| {
             syn::visit::visit_trait_item_fn(visitor, &i)
         });
     }
@@ -1199,6 +1494,12 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         self.with_local_generics(&i.generics, |visitor| {
             syn::visit::visit_trait_item_type(visitor, i)
         });
+    }
+
+    fn visit_receiver(&mut self, i: &Receiver) {
+        let outer = std::mem::replace(&mut self.in_receiver, true);
+        syn::visit::visit_receiver(self, i);
+        self.in_receiver = outer;
     }
 
     fn visit_trait_item_const(&mut self, i: &TraitItemConst) {
@@ -1213,7 +1514,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     fn visit_impl_item_fn(&mut self, i: &ImplItemFn) {
         // The body is not analyzed, as it is not a type: the copy of the function is rewritten by
         // the Referrer, which does not need its types to be leaked.
-        self.with_local_generics(&i.sig.generics, |visitor| {
+        self.with_signature(&i.sig, false, |visitor| {
             for attr in &i.attrs {
                 visitor.visit_attribute(attr);
             }
@@ -1295,7 +1596,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
 
     fn visit_item_fn(&mut self, i: &ItemFn) {
         // The body is not analyzed, like that of a method.
-        self.with_item_generics(&i.sig.generics, |visitor| {
+        self.with_signature(&i.sig, true, |visitor| {
             for attr in &i.attrs {
                 visitor.visit_attribute(attr);
             }
@@ -1340,6 +1641,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         // cannot be interned as a whole (its lifetime is elided or local), or one with a lifetime
         // of the Leaker (see `inherits`).
         let elided_ref = std::mem::take(&mut self.elided_ref);
+        let unconstrained = self.unconstrained_ref.take();
         // Whether this is a bare identifier written as a generic argument (see `ambiguous_arg`).
         let ambiguous = std::mem::take(&mut self.ambiguous_arg);
         let inherits = self.inherits.take();
@@ -1351,7 +1653,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             Type::Macro(m) => {
                 // The tokens of a type macro cannot be analyzed, so it is interned as a whole (it
                 // is expanded in the Leaker's context).
-                self.push_must(quote!(#i), true);
+                self.push_must(quote!(#i));
                 // It is expanded in the module where it is written, whatever its path is.
                 self.frame.relative |= !self.modules.is_empty() || self.is_relative(&m.mac.path);
                 // The generics (and `Self`) are matched by name.
@@ -1369,22 +1671,36 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             }
             Type::Paren(_) | Type::Group(_) => {
                 self.elided_ref = elided_ref;
+                self.unconstrained_ref = unconstrained;
                 self.inherits = inherits;
                 // `W<(N)>` is unambiguously a type, unlike `W<N>` (also in an invisible group).
                 self.ambiguous_arg = ambiguous && matches!(i, Type::Group(_));
                 syn::visit::visit_type(self, i)
             }
-            Type::Reference(TypeReference { lifetime, .. }) => {
-                match lifetime {
-                    // A local lifetime (or `'_`, a cause itself) keeps the reference from being
-                    // interned as a whole, so the trait object would be alone.
+            Type::Reference(reference) => {
+                match &reference.lifetime {
+                    // `'_` is a cause itself, and keeps the reference from being interned as a
+                    // whole, so the trait object would be alone.
+                    Some(lifetime) if lifetime.ident == "_" => self.elided_ref = true,
+                    Some(lifetime) if lifetime.ident == "static" => (),
                     Some(lifetime) => {
-                        self.elided_ref = lifetime.ident == "_"
-                            || self
-                                .scope_of(&lifetime.to_string())
-                                .map_or(false, |scope| scope > 0);
-                        if !self.elided_ref && lifetime.ident != "static" {
-                            self.inherits = Some(Inherits::Reference(self.type_depth));
+                        let local = self
+                            .scope_of(&lifetime.to_string())
+                            .filter(|&scope| scope > 0);
+                        let bounded =
+                            trait_object_of(&reference.elem).map_or(false, has_lifetime_bound);
+                        match local {
+                            // A lifetime of the Leaker (or one no scope declares).
+                            None => self.inherits = Some(Inherits::Reference(self.type_depth)),
+                            // A local one, with a lifetime bound written on the trait object: it
+                            // is interned alone, with its bound.
+                            Some(_) if bounded => {}
+                            // A local one which the copy would leave unconstrained (see
+                            // `unconstrained_ref`).
+                            Some(scope) if self.is_unconstrained(lifetime, scope) => {
+                                self.unconstrained_ref = Some(lifetime.clone())
+                            }
+                            Some(_) => self.inherits = Some(Inherits::Reference(self.type_depth)),
                         }
                     }
                     None => {
@@ -1406,6 +1722,15 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                 self.push_impossible(quote!(#i));
                 syn::visit::visit_type(self, i)
             }
+            Type::TraitObject(object) if unconstrained.is_some() && !has_lifetime_bound(object) => {
+                // Its lifetime defaults to a lifetime of the path which the copy would leave
+                // unconstrained, so the path cannot be interned as a whole, nor can it alone.
+                if let Some(lifetime) = &unconstrained {
+                    self.push_impossible(quote!(#lifetime));
+                }
+                self.frame.unconstrained = unconstrained;
+                syn::visit::visit_type(self, i)
+            }
             Type::ImplTrait(_) | Type::Verbatim(_) => {
                 self.push_impossible(quote!(#i));
                 syn::visit::visit_type(self, i);
@@ -1413,7 +1738,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             _ => syn::visit::visit_type(self, i),
         }
         self.enclosing = enclosing;
-        let inner = std::mem::replace(&mut self.frame, outer);
+        let mut inner = std::mem::replace(&mut self.frame, outer);
         // Also parentheses and groups around the trait object, which are not interned alone
         // either. One with a lifetime bound inherits nothing, but the reference is still the type
         // to carry the bound (see `Inherits::Reference`).
@@ -1441,6 +1766,11 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                 if own {
                     self.decide_as_owner(owner, inner)
                 } else {
+                    // A trait object naming an external crate is not an optional entry alone
+                    // either: the reference or the path is, if it can be.
+                    if inner.soft_depth == self.type_depth || inner.soft_depth == owner {
+                        inner.soft_depth = owner;
+                    }
                     self.decide_through(inner)
                 }
             }
@@ -1578,14 +1908,22 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                     }
                 }
             }
+            // The path of an external crate (`::foo::X`) is not resolved against the type context
+            // but by the name of the crate, which the Referrer may not name as the Leaker does: the
+            // type is an optional entry (see `PendingType::optional`).
+            if self.type_depth > 0
+                && !starts_with_generic
+                && !in_module
+                && self.leaker.is_soft_path(i)
+            {
+                self.push_soft();
+            }
         } else if self.type_depth > 0 {
             let is_self = i.leading_colon.is_none()
                 && matches!(i.segments.first(), Some(seg) if seg.ident == "Self" && seg.arguments.is_none());
             if !is_self {
                 // The path depends on the type context.
-                let external = i.leading_colon.is_some()
-                    && matches!(i.segments.first(), Some(seg) if seg.ident != "core");
-                self.push_must(quote!(#i), !external);
+                self.push_must(quote!(#i));
                 self.frame.relative |= self.is_relative(i);
             } else if !self.leaker.self_ty_can_be_interned {
                 self.push_impossible(quote!(#i));
@@ -1629,7 +1967,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             self.mention(scope);
         } else if i.ident != "static" {
             // The lifetime depends on the type context.
-            self.push_must(quote!(#i), true);
+            self.push_must(quote!(#i));
         }
     }
 
@@ -1655,17 +1993,33 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         // A trait object without a lifetime bound, as an argument of a path with lifetime
         // arguments, may default to one of them (e.g. `Ref<'a, dyn Trait>` is `Ref<'a, dyn Trait +
         // 'a>`, because of the bound `T: 'a` of `Ref<'a, T>`), which only the definition of the
-        // path tells. So it is treated like the referent of a reference with the lifetime.
+        // path tells. So the path is interned as a whole if the trait object has to be, which
+        // needs a type and lifetimes it can have among its generics: not `'_`, and not a local
+        // lifetime if there are several lifetime arguments, or the copy would leave it
+        // unconstrained (see `unconstrained_lifetimes()`).
         let mut elided = false;
         let mut inherited = false;
+        let mut unconstrained_lifetime = None;
+        let lifetimes = i
+            .args
+            .iter()
+            .filter(|arg| matches!(arg, GenericArgument::Lifetime(_)))
+            .count();
         for arg in &i.args {
             if let GenericArgument::Lifetime(lifetime) = arg {
-                if lifetime.ident == "_"
-                    || self
-                        .scope_of(&lifetime.to_string())
-                        .map_or(false, |scope| scope > 0)
-                {
+                if lifetime.ident == "_" {
                     elided = true;
+                } else if let Some(scope) = self.scope_of(&lifetime.to_string()) {
+                    // The local lifetimes of a method, an associated type, a nested item or a
+                    // binder are generics of the whole path.
+                    if scope > 0 && lifetimes > 1 {
+                        elided = true;
+                    } else {
+                        inherited = true;
+                        if scope > 0 && self.is_unconstrained(lifetime, scope) {
+                            unconstrained_lifetime = Some(lifetime.clone());
+                        }
+                    }
                 } else if lifetime.ident != "static" {
                     inherited = true;
                 }
@@ -1676,7 +2030,8 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         for arg in &i.args {
             if let GenericArgument::Type(ty) = arg {
                 self.elided_ref = elided;
-                if inherited && !elided {
+                self.unconstrained_ref = unconstrained_lifetime.clone().filter(|_| !elided);
+                if inherited && !elided && unconstrained_lifetime.is_none() {
                     self.inherits = Some(Inherits::Path(self.type_depth));
                 }
                 // A bare identifier may be a const, which syn parses as a type (see
@@ -1709,6 +2064,189 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             self.relative_path(quote!(#i), quote!(#i));
         }
     }
+}
+
+impl<'a> AnalyzeVisitor<'a> {
+    /// Returns the lifetimes declared by the generics of the function `sig` which the copy of its
+    /// signature would leave unconstrained if a type using them in the inputs were interned as a
+    /// whole (a path with the lifetime as its only lifetime argument, or a reference with it to a
+    /// trait object without a lifetime bound: the copy has it only in a projection, which does not
+    /// constrain it), in a way which makes the copy early-bound where the original is late-bound:
+    /// rustc rejects the implementation of a method whose lifetime parameters differ in whether
+    /// they are early- or late-bound from those of the trait's (E0195). A lifetime is late-bound
+    /// if an input constrains it, or if it is not in the return type and in no bound or where
+    /// clause, and early-bound otherwise, so it is the lifetimes which the return type mentions
+    /// (also inside a type, e.g. `Box<dyn Tr + 'b>`), which no bound or where predicate mentions
+    /// (that makes it early-bound in both), which some input mentions, and which no input keeps
+    /// constrained where it is written: the receiver and the arguments which are references with it
+    /// (`&'b self`, `x: &'b X`, also inside a tuple, an array, a slice or a pointer: the types
+    /// which are never interned as a whole because of their own path, so they stay in the copy), but
+    /// for a reference to a trait object without a lifetime bound, `&'b dyn Tr`, which is interned
+    /// as a whole if the trait object has to be (it is a cause itself, see
+    /// `AnalyzeVisitor::is_not_a_cause()`). Anything else, e.g. `Vec<&'b X>`, may be interned, so
+    /// it is not counted (conservative).
+    ///
+    /// A lifetime which no input mentions is not affected: it is early-bound in the original (it
+    /// is in the return type only), and so it is in the copy, where it is in the return type only
+    /// as well (`fn f<'b>(&self) -> &'b dyn RelTr`, `-> Ref<'b, dyn RelTr>`).
+    fn unconstrained_lifetimes(&self, sig: &Signature) -> Vec<Lifetime> {
+        let declared: Vec<Lifetime> = sig
+            .generics
+            .params
+            .iter()
+            .filter_map(|param| match param {
+                GenericParam::Lifetime(param) => Some(param.lifetime.clone()),
+                _ => None,
+            })
+            .collect();
+        if declared.is_empty() {
+            return Vec::new();
+        }
+        let mut output = Lifetimes::default();
+        output.visit_return_type(&sig.output);
+        // The lifetimes in bounds are early-bound: `'b: 'c` (both), `T: 'b` and `T: Tr<'b>`.
+        let mut bounded = Lifetimes::default();
+        for param in &sig.generics.params {
+            match param {
+                GenericParam::Lifetime(param) => {
+                    if !param.bounds.is_empty() {
+                        bounded.0.push(param.lifetime.clone());
+                    }
+                    for bound in &param.bounds {
+                        bounded.visit_lifetime(bound);
+                    }
+                }
+                GenericParam::Type(param) => {
+                    for bound in &param.bounds {
+                        bounded.visit_type_param_bound(bound);
+                    }
+                }
+                GenericParam::Const(_) => (),
+            }
+        }
+        if let Some(where_clause) = &sig.generics.where_clause {
+            bounded.visit_where_clause(where_clause);
+        }
+        // The generics in scope where the trait objects of the inputs are, for `is_not_a_cause()`.
+        let in_scope: Generics = Generics {
+            params: self
+                .params()
+                .chain(sig.generics.params.iter())
+                .cloned()
+                .collect(),
+            ..Default::default()
+        };
+        let not_a_cause = |object: &TypeTraitObject| self.is_not_a_cause(object, &in_scope);
+        let mut mentioned = Lifetimes::default();
+        let mut kept = Vec::new();
+        for input in &sig.inputs {
+            mentioned.visit_fn_arg(input);
+            match input {
+                FnArg::Receiver(receiver) => {
+                    kept.extend(receiver.lifetime().cloned());
+                    kept_lifetimes(&receiver.ty, &mut kept, &not_a_cause);
+                }
+                FnArg::Typed(arg) => kept_lifetimes(&arg.ty, &mut kept, &not_a_cause),
+            }
+        }
+        declared
+            .into_iter()
+            .filter(|lifetime| {
+                output.0.contains(lifetime)
+                    && mentioned.0.contains(lifetime)
+                    && !bounded.0.contains(lifetime)
+                    && !kept.contains(lifetime)
+            })
+            .collect()
+    }
+
+    /// Returns `true` if the trait object `object` is certainly not a cause itself (an own path
+    /// which depends on the type context, an elided lifetime, a bare identifier which may be a
+    /// const, ...: see [`CheckResult::is_own`]), nor an optional entry (its own path is the one of
+    /// an external crate, which the Referrer may replace: see [`Leaker::is_soft_path()`]), so
+    /// that a reference to it is never interned as a whole because of it (see
+    /// `Inherits::Reference`), and the reference stays in the copy as it is written. `in_scope`
+    /// are the generics in scope where it is. It is analyzed on its own like [`Leaker::check()`]
+    /// does, so it is `false` when unsure: a path which is relative (or names a module of the
+    /// analyzed one, which the analysis of the object alone does not see), a type or a lifetime
+    /// which `in_scope` does not declare, and anything impossible to leak.
+    fn is_not_a_cause(&self, object: &TypeTraitObject, in_scope: &Generics) -> bool {
+        let ty = Type::TraitObject(object.clone());
+        let mut visitor = AnalyzeVisitor::new(self.leaker, 0, in_scope);
+        visitor.visit_type(&ty);
+        // Everything found is in `ty`, which is at the depth 1.
+        let result = visitor.causes(0, 0, 1);
+        // A trait object naming an external crate may be leaked by the Referrer (with the reference
+        // holding it), which keeps nothing as written.
+        let optional = visitor.frame.soft_depth == 1;
+        !result.is_own && !optional && result.impossible.is_empty()
+    }
+}
+
+/// Pushes the lifetimes which `ty` (an input) keeps constrained where they are written in the copy
+/// (see [`AnalyzeVisitor::unconstrained_lifetimes()`]): those of the references in it, outside any
+/// path, except the references to a trait object without a lifetime bound, which are interned as a
+/// whole if the trait object has to be (see `Inherits::Reference`): they count only if
+/// `not_a_cause` says the trait object is certainly not a cause itself.
+fn kept_lifetimes(
+    ty: &Type,
+    kept: &mut Vec<Lifetime>,
+    not_a_cause: &dyn Fn(&TypeTraitObject) -> bool,
+) {
+    match ty {
+        Type::Reference(reference) => {
+            let unbounded = trait_object_of(&reference.elem).map_or(false, |object| {
+                !has_lifetime_bound(object) && !not_a_cause(object)
+            });
+            if !unbounded {
+                kept.extend(reference.lifetime.clone());
+            }
+            kept_lifetimes(&reference.elem, kept, not_a_cause);
+        }
+        Type::Ptr(TypePtr { elem, .. })
+        | Type::Slice(TypeSlice { elem, .. })
+        | Type::Array(TypeArray { elem, .. })
+        | Type::Paren(TypeParen { elem, .. })
+        | Type::Group(TypeGroup { elem, .. }) => kept_lifetimes(elem, kept, not_a_cause),
+        Type::Tuple(tuple) => {
+            for elem in &tuple.elems {
+                kept_lifetimes(elem, kept, not_a_cause);
+            }
+        }
+        _ => (),
+    }
+}
+
+/// Collects the lifetimes mentioned in the syntax visited, in the tokens of a macro as well.
+#[derive(Default)]
+struct Lifetimes(Vec<Lifetime>);
+
+impl<'ast> Visit<'ast> for Lifetimes {
+    fn visit_lifetime(&mut self, i: &'ast Lifetime) {
+        self.0.push(i.clone());
+    }
+    fn visit_macro(&mut self, i: &'ast Macro) {
+        let mut names = HashSet::new();
+        token_names(i.tokens.clone(), &mut names);
+        self.0.extend(
+            names
+                .iter()
+                .filter(|name| name.starts_with('\''))
+                .map(|name| Lifetime::new(name, proc_macro2::Span::call_site())),
+        );
+    }
+}
+
+/// The note of the conflict of a trait object defaulting to the lifetime of a method which the copy
+/// would leave unconstrained (see [`AnalyzeVisitor::unconstrained_lifetimes()`]).
+fn unconstrained_note(lifetime: &Lifetime) -> String {
+    format!(
+        "the lifetime of the trait object defaults to `{0}`, a lifetime of the method which its \
+         return type mentions and no other argument keeps as written (e.g. `&{0} self`), so the \
+         copy would have `{0}` only in a projection, and rustc rejects the implementation of a \
+         method whose lifetime is early-bound where the trait's is late-bound (E0195)",
+        lifetime
+    )
 }
 
 /// The note of the conflict of a type using the lifetime of a `for<..>` binder (see [`Binder`]).
@@ -1860,13 +2398,10 @@ impl<'ast> Visit<'ast> for OutputLifetimes {
     }
 }
 
-/// Returns `true` if the trait object has a lifetime bound (e.g. `dyn Trait + 'a`), so it does not
-/// inherit one.
-fn has_lifetime_bound(object: &TypeTraitObject) -> bool {
-    object
-        .bounds
-        .iter()
-        .any(|bound| matches!(bound, TypeParamBound::Lifetime(_)))
+/// Returns `true` if the `for<..>` binder `lifetimes` declares `wanted`, which then is another
+/// lifetime inside it (rustc rejects such a shadowing, but a macro may produce it).
+fn declares(lifetimes: Option<&BoundLifetimes>, wanted: &Lifetime) -> bool {
+    binder_lifetimes(lifetimes).any(|lifetime| lifetime == *wanted)
 }
 
 /// Returns `true` if `ty` is a single identifier (e.g. `SIZE`), which may be a const when it is a

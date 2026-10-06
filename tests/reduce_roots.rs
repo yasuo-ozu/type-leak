@@ -27,9 +27,19 @@ fn test_reduce_roots_neutral_generics() {
 
 #[test]
 fn test_reduce_roots_absolute_paths_only() {
-    // Absolute-path field types are neutral → nothing interned.
+    // Absolute-path field types are neutral → nothing is required (old: nothing interned at all;
+    // now the type of an external crate is an optional entry, see `Referrer::must()`).
     let item: ItemStruct = parse_quote! {
         struct S { a: ::std::string::String }
+    };
+    let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
+    leaker.reduce_roots();
+    let referrer = leaker.finish();
+    assert_eq!(referrer.iter().count(), 1);
+    assert!(!referrer.must(0));
+    // `::core` is never leaked.
+    let item: ItemStruct = parse_quote! {
+        struct S { a: ::core::option::Option<(::core::primitive::u8, ::core::primitive::bool)> }
     };
     let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
@@ -65,9 +75,25 @@ fn test_reduce_roots_multiple_must_intern() {
 
 #[test]
 fn test_reduce_roots_neutral_root_without_must_intern_dropped() {
-    // A neutral root whose children are all neutral is dropped entirely.
+    // A neutral root whose children are all neutral is dropped entirely (but for the type of an
+    // external crate in it, which is an optional entry: the inner one, as it is the cut closest to
+    // the sink, see below).
     let item: ItemStruct = parse_quote! {
-        struct S<T> { a: (T, ::std::string::String) }
+        struct S<T> { a: (T, ::std::string::String), b: (T, ::core::primitive::u8) }
+    };
+    let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
+    leaker.reduce_roots();
+    let referrer = leaker.finish();
+    assert_eq!(
+        referrer
+            .iter()
+            .map(|t| ty_string(t.clone()))
+            .collect::<Vec<_>>(),
+        [":: std :: string :: String"]
+    );
+    assert!(!referrer.must(0));
+    let item: ItemStruct = parse_quote! {
+        struct S<T> { a: (T, ::core::string::String) }
     };
     let (mut leaker, _) = Leaker::from_struct(&item).unwrap();
     leaker.reduce_roots();
@@ -262,20 +288,39 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
         }
     };
     let referrer = Leaker::from_struct(&item).unwrap().0.finish();
-    // `&'static Rel` is not rebuilt around `Rel` (`Rel: 'static` is not known of the entry).
-    assert_eq!(referrer.iter().count(), 2);
+    // `&'static Rel` is not rebuilt around `Rel` (`Rel: 'static` is not known of the entry). The
+    // two types of external crates are optional entries (old: none), after the required ones: the
+    // `Vec` (one cut covers it, whatever else is in it) and the `String`.
+    assert_eq!(
+        (0..referrer.iter().count())
+            .map(|ix| referrer.must(ix))
+            .collect::<Vec<_>>(),
+        [true, true, false, false]
+    );
+    let strings: Vec<String> = referrer.iter().map(|t| quote!(#t).to_string()).collect();
+    assert_eq!(
+        strings,
+        [
+            "& 'static Rel",
+            "Rel",
+            ":: std :: string :: String",
+            ":: std :: vec :: Vec < (Rel ,) >"
+        ]
+    );
     let mut copy: ItemStruct = parse_quote! {
         struct S {
             a: ::std::vec::Vec<(Rel,)>,
             b: (Rel, ::std::string::String),
         }
     };
-    let rel_ix = referrer
-        .iter()
-        .position(|ty| quote!(#ty).to_string() == "Rel")
-        .unwrap();
+    let rel_ix = strings.iter().position(|ty| ty == "Rel").unwrap();
+    let vec_ix = strings.iter().position(|ty| ty.contains("Vec")).unwrap();
+    let string_ix = strings.iter().position(|ty| ty.contains("String")).unwrap();
+    let mut replaced = copy.clone();
     syn::visit_mut::VisitMut::visit_item_struct_mut(
-        &mut referrer.into_visitor(None, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer
+            .clone()
+            .into_visitor(None, |_, ix| parse_quote!(P<#ix>)),
         &mut copy,
     );
     let expected: ItemStruct = syn::parse2(quote! {
@@ -286,15 +331,46 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
     })
     .unwrap();
     assert_eq!(quote!(#copy).to_string(), quote!(#expected).to_string());
+    // The Referrer which does not trust the names of the crates replaces them as well: the `Vec`
+    // as a whole, and the `String`, with `Rel` inside the tuple.
+    syn::visit_mut::VisitMut::visit_item_struct_mut(
+        &mut referrer
+            .allow_ambiguous_crate_name(false)
+            .into_visitor(None, |_, ix| parse_quote!(P<#ix>)),
+        &mut replaced,
+    );
+    let expected: ItemStruct = syn::parse2(quote! {
+        struct S {
+            a: P<#vec_ix>,
+            b: (P<#rel_ix>, P<#string_ix>),
+        }
+    })
+    .unwrap();
+    assert_eq!(quote!(#replaced).to_string(), quote!(#expected).to_string());
 }
 
-/// The leaked types of a trait, with the generics each uses.
+/// The required leaked types of a trait, with the generics each uses.
 fn leaked_trait(item: &ItemTrait) -> Vec<(String, String)> {
     let (leaker, _) = Leaker::from_trait(item).unwrap();
     let referrer = leaker.finish();
     referrer
         .iter_with_generics()
-        .map(|(ty, generics)| (ty_string(ty.clone()), quote!(#generics).to_string()))
+        .enumerate()
+        .filter(|(ix, _)| referrer.must(*ix))
+        .map(|(_, (ty, generics))| (ty_string(ty.clone()), quote!(#generics).to_string()))
+        .collect()
+}
+
+/// The optional leaked types of a trait (those of external crates, see `Referrer::must()`), with
+/// the generics each uses.
+fn optional_trait(item: &ItemTrait) -> Vec<(String, String)> {
+    let (leaker, _) = Leaker::from_trait(item).unwrap();
+    let referrer = leaker.finish();
+    referrer
+        .iter_with_generics()
+        .enumerate()
+        .filter(|(ix, _)| !referrer.must(*ix))
+        .map(|(_, (ty, generics))| (ty_string(ty.clone()), quote!(#generics).to_string()))
         .collect()
 }
 
@@ -593,9 +669,10 @@ fn test_reduce_roots_reference_to_a_trait_object() {
 
     // The trait object has to be interned itself (it names a relative trait, or a bare
     // identifier in it may be a const, which cannot be interned alone): it cannot be alone,
-    // because its default would be `'static` instead of `'a`, so the whole reference is. The same
-    // with a lifetime bound written, as before: the reference is the type that carries the
-    // bound `'b: 'a` it implies.
+    // because its default would be `'static` instead of `'a` (and it is the lifetime bound of the
+    // trait if it has one, `trait RelTr: 'static`, which the Leaker cannot see, so the default
+    // cannot be written out either), so the whole reference is. The same with a lifetime bound
+    // written, as before: the reference is the type that carries the bound `'b: 'a` it implies.
     let rel_object = group(parse_quote!(dyn RelTr));
     let wholes: Vec<Type> = vec![
         parse_quote!(&'a dyn RelTr),
@@ -691,29 +768,84 @@ fn test_reduce_roots_trait_object_with_its_own_lifetime() {
     }
 }
 
+/// A trait whose method `f` declares the lifetime `'b` and takes `ty`.
+fn local_trait(ty: &Type) -> ItemTrait {
+    parse_quote! { trait Tr { fn f<'b>(&self, x: #ty); } }
+}
+
 #[test]
 fn test_reduce_roots_trait_object_inheriting_a_local_lifetime() {
-    // Like the referent of a reference (`&'b dyn RelTr`): the lifetime of the path is local or
-    // elided, so the path cannot be interned as a whole, and the trait object cannot alone.
+    // A path with a lifetime of a method (the only lifetime argument) is a whole like one with a
+    // lifetime of the trait: the trait object cannot be interned alone (its lifetime bound defaults
+    // to `'b`), so the whole path is, with `'b` among its generics, which the copy leaves in the
+    // trait arguments of the Repeater (`<S as Repeater<(&'b (),), ..>>::Type`).
+    let group = group(parse_quote!(dyn RelTr));
+    for ty in [
+        parse_quote!(::p::W<'b, dyn RelTr>),
+        parse_quote!(::p::W<'b, (dyn RelTr)>),
+        parse_quote!(::p::W<'b, #group>),
+        parse_quote!(::core::cell::Ref<'b, dyn RelTr>),
+        parse_quote!(::p::W<'b, (), dyn RelTr>),
+        parse_quote!(::p::W<'b, dyn RelTr<Rel>>),
+        // `Rel` may be a const (a bare identifier as an argument), which cannot be interned alone,
+        // so the trait object has to be, and so is the path.
+        parse_quote!(::p::W<'b, dyn ::p::Tr<Rel>>),
+    ] {
+        let ty: Type = ty;
+        let item = local_trait(&ty);
+        assert_eq!(
+            leaked_trait(&item),
+            [entry(ty.clone(), "< 'b >")],
+            "{}",
+            ty_string(ty.clone())
+        );
+        assert_eq!(
+            rewritten(&item),
+            printed(parse_quote! { trait Tr { fn f<'b>(&self, x: P<0usize>); } })
+        );
+    }
+    // The argument is that of the innermost path, which is the one with a lifetime.
+    let item = local_trait(&parse_quote!(::p::V<::p::W<'b, dyn RelTr>>));
+    assert_eq!(
+        leaked_trait(&item),
+        [entry(parse_quote!(::p::W<'b, dyn RelTr>), "< 'b >")]
+    );
+    // A lifetime of a nested item, of an associated type or of a `for<..>` binder is local as well.
+    let leaked = leaked_trait(&parse_quote! {
+        trait Tr { fn f(&self, f: for<'x> fn(::p::W<'x, dyn RelTr>) -> ()); }
+    });
+    assert_eq!(
+        leaked,
+        [entry(parse_quote!(::p::W<'x, dyn RelTr>), "< 'x >")]
+    );
+    let leaked = leaked_trait(&parse_quote! {
+        trait Tr { type A<'b>: ::p::Bound<::p::W<'b, dyn RelTr>>; }
+    });
+    assert_eq!(
+        leaked,
+        [entry(parse_quote!(::p::W<'b, dyn RelTr>), "< 'b >")]
+    );
+
+    // Not for `'_`, a path with several lifetime arguments (as before), nor in a trait bound,
+    // which is not a type to be interned as a whole: the trait object cannot be alone, and the
+    // path cannot be interned.
     let note =
         "the lifetime of the trait object defaults to that of the enclosing reference or path";
     for item in [
-        parse_quote! { trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn RelTr>); } },
-        parse_quote! { trait Tr { fn f<'b>(&self, x: ::p::W<'b, (dyn RelTr)>); } },
         parse_quote! { trait Tr { fn f(&self, x: ::p::W<'_, dyn RelTr>); } },
         parse_quote! { trait Tr<'a> { fn f<'b>(&self, x: ::p::W<'a, 'b, dyn RelTr>); } },
-        // A trait bound is not a type, so it has nothing to be interned as a whole.
+        parse_quote! { trait Tr { fn f<'b, 'c>(&self, x: ::p::W<'b, 'c, dyn RelTr>); } },
         parse_quote! { trait Tr<'a, T: ::p::Bound<'a, dyn RelTr>> {} },
         parse_quote! { trait Tr<'a>: ::p::Bound<'a, dyn RelTr> {} },
+        parse_quote! { trait Tr { fn f<'b, T: ::p::Bound<'b, dyn RelTr>>(&self, t: T); } },
+        parse_quote! { trait Tr { fn f<'b, T>(&self, t: T) where T: ::p::Bound<'b, dyn RelTr>; } },
+        parse_quote! { trait Tr { type A<'b>: ::p::Bound<'b, dyn RelTr>; } },
     ] {
         let item: ItemTrait = item;
         let err = error_of(&item);
         assert!(err.contains("use absolute path: 'RelTr'"), "{}", err);
         assert!(err.contains(note), "{}", err);
     }
-    // The same as for a reference.
-    let err = error_of(&parse_quote! { trait Tr { fn f<'b>(&'b self, x: &'b dyn RelTr); } });
-    assert!(err.contains(note), "{}", err);
     // With nothing of the type context in the trait object, there is no error.
     for item in [
         parse_quote! { trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn ::core::any::Any>); } },
@@ -725,9 +857,544 @@ fn test_reduce_roots_trait_object_inheriting_a_local_lifetime() {
     }
     // Its components can still be leaked, as for a reference.
     let leaked = leaked_trait(&parse_quote! {
-        trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn ::p::Tr<Rel>>); }
+        trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn ::p::Tr<Item = Rel>>); }
     });
     assert_eq!(leaked, [entry(parse_quote!(Rel), "")]);
+}
+
+#[test]
+fn test_reduce_roots_path_with_a_lifetime_the_copy_would_leave_unconstrained() {
+    // The copy of the whole path has `'b` only in a projection, which does not constrain it. A
+    // lifetime which no bound mentions is late-bound only if an input constrains it or the return
+    // type does not mention it, so the copy of a method whose return type mentions `'b` has it
+    // early-bound where the trait's is late-bound, which rustc rejects when the method is
+    // implemented (E0195). So the path is not interned: an error, like for `'_`.
+    let note = "the lifetime of the trait object defaults to `'b`, a lifetime of the method which \
+                its return type mentions";
+    for item in [
+        parse_quote! { trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn RelTr>) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&self, x: ::p::W<'b, (dyn RelTr)>) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn RelTr>) -> ::p::V<'b>; } },
+        parse_quote! { trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn RelTr>) -> Box<dyn Other + 'b>; } },
+        // Not constrained by `Vec<&'b ()>`, which may be interned: conservative.
+        parse_quote! {
+            trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn RelTr>, y: Vec<&'b ()>) -> &'b (); }
+        },
+    ] {
+        let item: ItemTrait = item;
+        let err = error_of(&item);
+        assert!(err.contains("use absolute path: 'RelTr'"), "{}", err);
+        assert!(err.contains(note), "{}", err);
+        assert!(err.contains("E0195"), "{}", err);
+        assert!(
+            err.contains("it cannot be leaked as a whole because of `'b`"),
+            "{}",
+            err
+        );
+        // Not the note which suggests to name the lifetime, which is named.
+        assert!(!err.contains("name it"), "{}", err);
+    }
+    // The components are leaked if it is not the trait object which has to be interned.
+    let leaked = leaked_trait(&parse_quote! {
+        trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn ::p::Tr<Item = Rel>>) -> &'b (); }
+    });
+    assert_eq!(leaked, [entry(parse_quote!(Rel), "")]);
+    // An input keeping `'b` where it is written constrains it in the copy (a reference, also in
+    // a tuple, an array, a slice, a pointer or a reference to it; the receiver as well), so it is
+    // late-bound in the copy as in the trait.
+    for item in [
+        parse_quote! { trait Tr { fn f<'b>(&'b self, x: ::p::W<'b, dyn RelTr>) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&'b mut self, x: ::p::W<'b, dyn RelTr>) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(self: &'b Self, x: ::p::W<'b, dyn RelTr>) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn RelTr>, y: &'b ()) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn RelTr>, y: ((), &'b ())) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn RelTr>, y: [&'b (); 2]) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn RelTr>, y: &[&'b ()]) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn RelTr>, y: *const &'b ()) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn RelTr>, y: (&'b ())) -> &'b (); } },
+        // A bound or a where predicate makes it early-bound in both.
+        parse_quote! {
+            trait Tr { fn f<'b, 'c: 'b>(&self, x: ::p::W<'b, dyn RelTr>, y: &'c ()) -> &'b (); }
+        },
+        parse_quote! {
+            trait Tr { fn f<'b, T: 'b>(&self, x: ::p::W<'b, dyn RelTr>, y: T) -> &'b (); }
+        },
+        parse_quote! {
+            trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn RelTr>) -> &'b () where Self: 'b; }
+        },
+        parse_quote! {
+            trait Tr { fn f<'b, T>(&self, x: ::p::W<'b, dyn RelTr>, t: T) -> &'b () where T: ::p::Bound<'b>; }
+        },
+        // The return type does not mention it.
+        parse_quote! { trait Tr { fn f<'b>(&self, x: ::p::W<'b, dyn RelTr>) -> (); } },
+        // Another lifetime of the return type.
+        parse_quote! { trait Tr { fn f<'b, 'c>(&self, x: ::p::W<'b, dyn RelTr>, y: &'c ()) -> &'c (); } },
+    ] {
+        let item: ItemTrait = item;
+        let leaked = leaked_trait(&item);
+        assert_eq!(leaked.len(), 1, "{}", ty_string_of(&item));
+        // (Its context has the generics which a predicate mentioning `'b` brings along.)
+        assert_eq!(leaked[0].0, ty_string(parse_quote!(::p::W<'b, dyn RelTr>)));
+        assert!(leaked[0].1.starts_with("< 'b"), "{}", leaked[0].1);
+    }
+    // The lifetime of the trait is not a lifetime of the method: nothing to compare.
+    let leaked = leaked_trait(&parse_quote! {
+        trait Tr<'a> { fn f(&self, x: ::p::W<'a, dyn RelTr>) -> &'a (); }
+    });
+    assert_eq!(
+        leaked,
+        [entry(parse_quote!(::p::W<'a, dyn RelTr>), "< 'a >")]
+    );
+    // A function, which is not compared with a declaration, is not affected either: the lifetime
+    // is a generic of the Leaker for the outermost item, and local for a nested one, as for a
+    // method.
+    let item: ItemFn = parse_quote! { fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () { loop {} } };
+    let mut leaker = Leaker::new();
+    leaker
+        .intern_with(&item.sig.generics, |v| v.visit_item_fn(&item))
+        .unwrap();
+    assert_eq!(leaker.finish().iter().count(), 1);
+    let item: ItemMod = parse_quote! {
+        mod m { fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () { loop {} } }
+    };
+    let err = Leaker::from_module(&item).err().unwrap();
+    assert!(syn::Error::from(err).to_string().contains("E0195"));
+}
+
+/// The signature of the trait, for the messages.
+fn ty_string_of(item: &ItemTrait) -> String {
+    quote!(#item).to_string()
+}
+
+#[test]
+fn test_reduce_roots_reference_with_a_local_lifetime() {
+    // Like with a lifetime of the trait, the whole reference is interned if the trait object has
+    // to be, with `'b` among its generics (the copy has `<S as Repeater<(&'b (),), ..>>::Type`),
+    // so rustc gives the trait object its default in the Repeater's implementation: `'b`, or the
+    // lifetime bound of the trait if it has one (`trait RelTr: 'static`), which the Leaker cannot
+    // see. `fn f<'b, 'c, T>(&self, x: ..)` has no return type, so there is nothing to compare.
+    let rel_object = group(parse_quote!(dyn RelTr));
+    let wholes: Vec<(Type, &str)> = vec![
+        (parse_quote!(&'b dyn RelTr), "< 'b >"),
+        (parse_quote!(&'b mut dyn RelTr), "< 'b >"),
+        (parse_quote!(&'b (dyn RelTr)), "< 'b >"),
+        (parse_quote!(&'b ((dyn RelTr))), "< 'b >"),
+        (parse_quote!(&'b #rel_object), "< 'b >"),
+        (parse_quote!(&'b (dyn RelTr + Send)), "< 'b >"),
+        (parse_quote!(&'b dyn RelTr<Item = ::p::X>), "< 'b >"),
+        // A bare identifier in the arguments may be a const, which cannot be interned alone.
+        (parse_quote!(&'b dyn ::p::Tr<SIZE>), "< 'b >"),
+        // What is inside the trait object is bounded by the lifetime (`dyn Tr<T> + 'b: 'b`).
+        (
+            parse_quote!(&'b dyn RelTr<Item = ::p::X<T>>),
+            "< 'b , T : 'b >",
+        ),
+    ];
+    for (ty, generics) in wholes {
+        let item: ItemTrait = parse_quote! { trait Tr { fn f<'b, 'c, T>(&self, x: #ty); } };
+        assert_eq!(
+            leaked_trait(&item),
+            [entry(ty.clone(), generics)],
+            "{}",
+            ty_string(ty.clone())
+        );
+        assert_eq!(
+            rewritten(&item),
+            printed(parse_quote! { trait Tr { fn f<'b, 'c, T>(&self, x: P<0usize>); } }),
+            "{}",
+            ty_string(ty.clone())
+        );
+    }
+    // The innermost reference is the type to intern, with the others bounding it.
+    let item: ItemTrait = parse_quote! { trait Tr { fn f<'b, 'c>(&self, x: &'b &'c dyn RelTr); } };
+    assert_eq!(
+        leaked_trait(&item),
+        [entry(parse_quote!(&'c dyn RelTr), "< 'b , 'c : 'b >")]
+    );
+    assert_eq!(
+        rewritten(&item),
+        printed(parse_quote! { trait Tr { fn f<'b, 'c>(&self, x: &'b P<0usize>); } })
+    );
+    // With a lifetime bound written, the trait object is the same alone and the reference stays
+    // in the copy, as before.
+    for (ty, leaked, generics) in [
+        (
+            parse_quote!(&'b (dyn RelTr + 'static)),
+            parse_quote!(dyn RelTr + 'static),
+            "",
+        ),
+        (
+            parse_quote!(&'b (dyn RelTr + 'b)),
+            parse_quote!(dyn RelTr + 'b),
+            "< 'b >",
+        ),
+    ] {
+        let (ty, leaked): (Type, Type) = (ty, leaked);
+        let item: ItemTrait = parse_quote! { trait Tr { fn f<'b>(&self, x: #ty); } };
+        assert_eq!(
+            leaked_trait(&item),
+            [entry(leaked, generics)],
+            "{}",
+            ty_string(ty.clone())
+        );
+        assert_eq!(
+            rewritten(&item),
+            printed(parse_quote! { trait Tr { fn f<'b>(&self, x: &'b (P<0usize>)); } }),
+            "{}",
+            ty_string(ty.clone())
+        );
+    }
+    // Its components are interned if the trait object need not be, as for a lifetime of the
+    // trait, and the reference and the trait object stay where they are.
+    let item: ItemTrait = parse_quote! {
+        trait Tr { fn f<'b>(&self, x: &'b dyn ::p::Tr<Item = Rel>); }
+    };
+    assert_eq!(leaked_trait(&item), [entry(parse_quote!(Rel), "")]);
+    assert_eq!(
+        rewritten(&item),
+        printed(
+            parse_quote! { trait Tr { fn f<'b>(&self, x: &'b dyn ::p::Tr<Item = P<0usize>>); } }
+        )
+    );
+    // `check()` agrees, with the lifetime a generic of the context, as the lifetime of the trait.
+    let result = Leaker::new().check(&parse_quote!(&'b dyn RelTr), &parse_quote!(<'b>));
+    assert!(result.is_own);
+    assert_eq!(result.must.len(), 1);
+}
+
+#[test]
+fn test_reduce_roots_reference_with_a_lifetime_the_copy_would_leave_unconstrained() {
+    // The same as for a path: the copy of the whole reference has `'b` only in a projection,
+    // which does not constrain it, so a method whose return type mentions `'b` has it early-bound
+    // in the copy where it is late-bound in the trait (if an input constrains it), which rustc
+    // rejects when the method is implemented (E0195, checked with rustc on stable and nightly,
+    // like for `::p::W<'b, dyn RelTr>`). So the reference is not interned: an error, which names
+    // the lifetime.
+    let errors: Vec<(ItemTrait, &str)> = vec![
+        (
+            parse_quote! { trait Tr { fn f<'b>(&self, x: &'b dyn RelTr) -> &'b (); } },
+            "b",
+        ),
+        (
+            parse_quote! { trait Tr { fn f<'b>(&self, x: &'b mut dyn RelTr) -> &'b (); } },
+            "b",
+        ),
+        (
+            parse_quote! { trait Tr { fn f<'b>(&self, x: &'b (dyn RelTr)) -> &'b (); } },
+            "b",
+        ),
+        (
+            parse_quote! { trait Tr { fn f<'b>(&self, x: &'b dyn RelTr) -> ::p::V<'b>; } },
+            "b",
+        ),
+        (
+            parse_quote! { trait Tr { fn f<'b>(&self, x: &'b dyn RelTr) -> Box<dyn Other + 'b>; } },
+            "b",
+        ),
+        (
+            parse_quote! { trait Tr { fn f<'b>(&self, x: &'b dyn RelTr) -> &'b dyn RelTr; } },
+            "b",
+        ),
+        // The other arguments are references to a trait object, which are interned as well.
+        (
+            parse_quote! {
+                trait Tr { fn f<'b>(&self, x: &'b dyn RelTr, y: &'b dyn RelTr2) -> &'b (); }
+            },
+            "b",
+        ),
+        // The reference around `&'c dyn RelTr` keeps `'b`, not `'c`.
+        (
+            parse_quote! { trait Tr { fn f<'b, 'c>(&self, x: &'b &'c dyn RelTr) -> &'c (); } },
+            "c",
+        ),
+        // Not constrained by `Vec<&'b ()>`, which may be interned: conservative.
+        (
+            parse_quote! {
+                trait Tr { fn f<'b>(&self, x: &'b dyn RelTr, y: Vec<&'b ()>) -> &'b (); }
+            },
+            "b",
+        ),
+    ];
+    for (item, lifetime) in errors {
+        let err = error_of(&item);
+        assert!(err.contains("use absolute path: 'RelTr'"), "{}", err);
+        assert!(
+            err.contains(&format!(
+                "the lifetime of the trait object defaults to `'{0}`, a lifetime of the method \
+                 which its return type mentions",
+                lifetime
+            )),
+            "{}",
+            err
+        );
+        assert!(err.contains("E0195"), "{}", err);
+        assert!(
+            err.contains(&format!(
+                "it cannot be leaked as a whole because of `'{}`",
+                lifetime
+            )),
+            "{}",
+            err
+        );
+        // Not the note which suggests to name the lifetime, which is named.
+        assert!(!err.contains("name it"), "{}", err);
+    }
+    // The components are leaked if it is not the trait object which has to be interned.
+    let leaked = leaked_trait(&parse_quote! {
+        trait Tr { fn f<'b>(&self, x: &'b dyn ::p::Tr<Item = Rel>) -> &'b (); }
+    });
+    assert_eq!(leaked, [entry(parse_quote!(Rel), "")]);
+    // So is the trait object with the lifetime bound written, which is interned alone, and the
+    // reference stays in the copy.
+    let leaked = leaked_trait(&parse_quote! {
+        trait Tr { fn f<'b>(&self, x: &'b (dyn RelTr + 'b)) -> &'b (); }
+    });
+    assert_eq!(leaked, [entry(parse_quote!(dyn RelTr + 'b), "< 'b >")]);
+    // An input keeping `'b` where it is written constrains it in the copy (the receiver, a
+    // reference, also in a tuple, an array, a slice, a pointer or a reference to it), so it is
+    // late-bound in the copy as in the trait.
+    for item in [
+        parse_quote! { trait Tr { fn f<'b>(&'b self, x: &'b dyn RelTr) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&'b mut self, x: &'b dyn RelTr) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(self: &'b Self, x: &'b dyn RelTr) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&self, x: &'b dyn RelTr, y: &'b ()) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&self, x: &'b dyn RelTr, y: ((), &'b ())) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&self, x: &'b dyn RelTr, y: [&'b (); 2]) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&self, x: &'b dyn RelTr, y: &[&'b ()]) -> &'b (); } },
+        parse_quote! { trait Tr { fn f<'b>(&self, x: &'b dyn RelTr, y: *const &'b ()) -> &'b (); } },
+        // A bound or a where predicate makes it early-bound in both (`'c: 'b` also makes `'c`).
+        parse_quote! {
+            trait Tr { fn f<'b, 'c: 'b>(&self, x: &'b dyn RelTr, y: &'c ()) -> &'b (); }
+        },
+        parse_quote! {
+            trait Tr { fn f<'b, 'c: 'b>(&self, x: &'b &'c dyn RelTr) -> &'c (); }
+        },
+        parse_quote! {
+            trait Tr { fn f<'b, T: 'b>(&self, x: &'b dyn RelTr, y: T) -> &'b (); }
+        },
+        parse_quote! {
+            trait Tr { fn f<'b>(&self, x: &'b dyn RelTr) -> &'b () where Self: 'b; }
+        },
+        // The return type does not mention it.
+        parse_quote! { trait Tr { fn f<'b>(&self, x: &'b dyn RelTr) -> (); } },
+        // Another lifetime of the return type.
+        parse_quote! { trait Tr { fn f<'b, 'c>(&self, x: &'b dyn RelTr, y: &'c ()) -> &'c (); } },
+    ] {
+        let item: ItemTrait = item;
+        let leaked = leaked_trait(&item);
+        assert_eq!(leaked.len(), 1, "{}", ty_string_of(&item));
+        assert!(
+            leaked[0].0.starts_with("& 'b dyn RelTr") || leaked[0].0.starts_with("& 'c dyn RelTr"),
+            "{}: {:?}",
+            ty_string_of(&item),
+            leaked
+        );
+        assert!(leaked[0].1.starts_with("< 'b"), "{}", leaked[0].1);
+    }
+    // A reference with a lifetime bound written on the trait object keeps `'b` (the trait object
+    // is interned alone, and the reference stays in the copy).
+    let mut leaked = leaked_trait(&parse_quote! {
+        trait Tr { fn f<'b>(&self, x: &'b dyn RelTr, y: &'b (dyn RelTr + 'static)) -> &'b (); }
+    });
+    leaked.sort();
+    assert_eq!(
+        leaked,
+        [
+            entry(parse_quote!(&'b dyn RelTr), "< 'b >"),
+            entry(parse_quote!(dyn RelTr + 'static), ""),
+        ]
+    );
+    // The lifetime of the trait is not a lifetime of the method: nothing to compare.
+    let leaked = leaked_trait(&parse_quote! {
+        trait Tr<'a> { fn f(&self, x: &'a dyn RelTr) -> &'a (); }
+    });
+    assert_eq!(leaked, [entry(parse_quote!(&'a dyn RelTr), "< 'a >")]);
+    // A nested function is checked like a method, an outermost one is not (see paths).
+    let item: ItemFn = parse_quote! { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } };
+    let mut leaker = Leaker::new();
+    leaker
+        .intern_with(&item.sig.generics, |v| v.visit_item_fn(&item))
+        .unwrap();
+    assert_eq!(leaker.finish().iter().count(), 1);
+    let item: ItemMod = parse_quote! {
+        mod m { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } }
+    };
+    let err = Leaker::from_module(&item).err().unwrap();
+    assert!(syn::Error::from(err).to_string().contains("E0195"));
+}
+
+#[test]
+fn test_reduce_roots_reference_to_a_trait_object_in_other_places() {
+    // The reference is a type wherever it is written, so it is interned as a whole in a trait
+    // bound, in a binder, in an associated type, as it is for a lifetime of the trait, while a
+    // path with a local lifetime argument in a bound is an error.
+    for item in [
+        parse_quote! { trait Tr { fn f<'b, T: ::p::Bound<&'b dyn RelTr>>(&self, t: T); } },
+        parse_quote! { trait Tr { fn f<'b, T>(&self, t: T) where T: ::p::Bound<&'b dyn RelTr>; } },
+        parse_quote! { trait Tr { type A<'b>: ::p::Bound<&'b dyn RelTr>; } },
+        parse_quote! { trait Tr<'b>: ::p::Bound<&'b dyn RelTr> {} },
+        parse_quote! { trait Tr<'b, T: ::p::Bound<&'b mut dyn RelTr>> {} },
+        parse_quote! { trait Tr { fn f(&self, f: for<'b> fn(&'b dyn RelTr) -> ()); } },
+        parse_quote! { trait Tr { fn f<F: for<'b> ::core::ops::Fn(&'b dyn RelTr) -> ()>(&self, f: F); } },
+        parse_quote! { trait Tr { fn f<F>(&self, f: F) where for<'b> F: ::core::ops::Fn(&'b dyn RelTr); } },
+    ] {
+        let item: ItemTrait = item;
+        let leaked = leaked_trait(&item);
+        assert_eq!(leaked.len(), 1, "{}", ty_string_of(&item));
+        assert!(
+            leaked[0].0.starts_with("& 'b dyn RelTr")
+                || leaked[0].0.starts_with("& 'b mut dyn RelTr"),
+            "{}: {:?}",
+            ty_string_of(&item),
+            leaked
+        );
+        // (The context also has what a bound mentioning the lifetime brings along.)
+        assert!(leaked[0].1.starts_with("< 'b"), "{:?}", leaked);
+    }
+    // The path in a bound is still an error, and so is the elided reference in a bound.
+    for item in [
+        parse_quote! { trait Tr { fn f<'b, T: ::p::Bound<'b, dyn RelTr>>(&self, t: T); } },
+        parse_quote! { trait Tr { fn f<T: ::p::Bound<&dyn RelTr>>(&self, t: T); } },
+        parse_quote! { trait Tr { fn f<T: ::p::Bound<&'_ dyn RelTr>>(&self, t: T); } },
+    ] {
+        let item: ItemTrait = item;
+        let err = error_of(&item);
+        assert!(err.contains("use absolute path: 'RelTr'"), "{}", err);
+    }
+    // An undeclared lifetime is one of the type context, which makes the reference the type to
+    // intern, as before.
+    assert_eq!(
+        leaked_trait(&parse_quote! { trait Tr { fn f(&self, x: &'r dyn RelTr); } }),
+        [entry(parse_quote!(&'r dyn RelTr), "")]
+    );
+    // `'static` is the default of a trait object alone.
+    assert_eq!(
+        leaked_trait(&parse_quote! { trait Tr { fn f(&self, x: &'static mut dyn RelTr); } }),
+        [entry(parse_quote!(dyn RelTr), "")]
+    );
+}
+
+#[test]
+fn test_reduce_roots_reference_with_a_local_lifetime_is_found_by_every_lookup() {
+    use syn::visit_mut::VisitMut;
+    // The entries are the whole references (`&'b dyn RelTr` of the method, `&'a mut dyn RelTr` of
+    // the trait), found whichever way the lifetime is known where the copy is: declared by the
+    // method (`into_visitor()`, `into_visitor_with_root()`), or assumed to be a generic of the
+    // Leaker (`expand()`, and a visitor of the signature alone).
+    let tr: ItemTrait = parse_quote! {
+        trait Tr<'a> {
+            fn f<'b>(&'b self, x: &'b dyn RelTr, y: &'a mut dyn RelTr) -> &'b dyn RelTr;
+        }
+    };
+    let (leaker, top_level) = Leaker::from_trait(&tr).unwrap();
+    let referrer = leaker.finish();
+    let mut entries: Vec<(String, String)> = referrer
+        .iter_with_generics()
+        .map(|(ty, generics)| (ty_string(ty.clone()), quote!(#generics).to_string()))
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        [
+            entry(parse_quote!(&'a mut dyn RelTr), "< 'a >"),
+            entry(parse_quote!(&'b dyn RelTr), "< 'b >"),
+        ]
+    );
+    let expected: ItemTrait = parse_quote! {
+        trait Tr<'a> {
+            fn f<'b>(&'b self, x: P<{b}>, y: P<{a}>) -> P<{b}>;
+        }
+    };
+    let index_of = |ty: &str| {
+        referrer
+            .iter()
+            .position(|found| ty_string(found.clone()) == ty)
+            .unwrap()
+    };
+    let (a, b) = (index_of("& 'a mut dyn RelTr"), index_of("& 'b dyn RelTr"));
+    let printed_expected = {
+        let text = quote!(#expected).to_string();
+        text.replace("{ b }", &format!("{}usize", b))
+            .replace("{ a }", &format!("{}usize", a))
+    };
+    let rewrite = |visitor: &mut dyn FnMut(&mut ItemTrait)| {
+        let mut copy = tr.clone();
+        visitor(&mut copy);
+        quote!(#copy).to_string()
+    };
+    let self_requirement = referrer.context_self(top_level).cloned();
+    // The lenient lookup.
+    let by_lenient = rewrite(&mut |copy| {
+        referrer
+            .clone()
+            .into_visitor(self_requirement.clone(), |_, ix| parse_quote!(P<#ix>))
+            .visit_item_trait_mut(copy)
+    });
+    assert_eq!(by_lenient, printed_expected);
+    // With the generics of the trait as those of the Leaker.
+    let by_leakers = rewrite(&mut |copy| {
+        referrer
+            .clone()
+            .into_visitor(self_requirement.clone(), |_, ix| parse_quote!(P<#ix>))
+            .with_outermost_generics_as_leakers()
+            .visit_item_trait_mut(copy)
+    });
+    assert_eq!(by_leakers, printed_expected);
+    // The exact lookup.
+    let by_exact = rewrite(&mut |copy| {
+        referrer
+            .clone()
+            .into_visitor_with_root(
+                &tr.generics,
+                self_requirement.clone(),
+                |_, ix| parse_quote!(P<#ix>),
+            )
+            .with_outermost_generics_as_leakers()
+            .visit_item_trait_mut(copy)
+    });
+    assert_eq!(by_exact, printed_expected);
+    // The type passed to the callback is the one leaked, whichever lookup it is.
+    for exact in [false, true] {
+        let mut seen = Vec::new();
+        let mut copy = tr.clone();
+        let record = |ty: Type, ix: usize| -> Type {
+            seen.push(ty_string(ty));
+            parse_quote!(P<#ix>)
+        };
+        if exact {
+            referrer
+                .clone()
+                .into_visitor_with_root(&tr.generics, self_requirement.clone(), record)
+                .with_outermost_generics_as_leakers()
+                .visit_item_trait_mut(&mut copy);
+        } else {
+            referrer
+                .clone()
+                .into_visitor(self_requirement.clone(), record)
+                .visit_item_trait_mut(&mut copy);
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen, ["& 'a mut dyn RelTr", "& 'b dyn RelTr"]);
+    }
+    // `expand()` of the type found alone (nothing declared): the lifetimes are the Leaker's.
+    let ty: Type = parse_quote!(&'b dyn RelTr);
+    let expanded = referrer.expand(ty, |_, ix| parse_quote!(P<#ix>));
+    assert_eq!(ty_string(expanded), format!("P < {}usize >", b));
+    // A trait object which is not under the reference is not an entry: its default is that of
+    // another path or `'static`.
+    let ty: Type = parse_quote!(::std::boxed::Box<dyn RelTr>);
+    let expanded = referrer.expand(ty.clone(), |_, ix| parse_quote!(P<#ix>));
+    assert_eq!(ty_string(expanded), ty_string(ty));
+    let ty: Type = parse_quote!(&'b ::std::boxed::Box<dyn RelTr>);
+    let expanded = referrer.expand(ty.clone(), |_, ix| parse_quote!(P<#ix>));
+    assert_eq!(ty_string(expanded), ty_string(ty));
+    // The Referrer survives the serialization.
+    let tokens = quote!(#referrer);
+    let parsed: type_leak::Referrer = syn::parse2(tokens).unwrap();
+    assert_eq!(parsed, referrer);
+    let again = parsed.expand(parse_quote!(&'b dyn RelTr), |_, ix| parse_quote!(P<#ix>));
+    assert_eq!(ty_string(again), format!("P < {}usize >", b));
 }
 
 /// A group around `ty`, like the one `$t:ty` of a `macro_rules!` is parsed as.
@@ -1503,4 +2170,100 @@ fn test_reduce_roots_is_the_minimum_cut_closest_to_the_sink() {
         checked += 1;
     }
     assert!(checked > 100, "{}", checked);
+}
+
+/// The optional entries (the types of external crates, see `Referrer::must()`) are a minimum cut
+/// of their own, and the required entries are cut for free in it.
+#[test]
+fn test_reduce_roots_optional_entries() {
+    let optional = |item: ItemTrait| -> Vec<String> {
+        optional_trait(&item)
+            .into_iter()
+            .map(|(ty, _)| ty)
+            .collect()
+    };
+    let required = |item: ItemTrait| -> Vec<String> {
+        leaked_trait(&item).into_iter().map(|(ty, _)| ty).collect()
+    };
+    // One entry covers a type which is used twice with everything in it, as a cut of the graph.
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            fn f(&self) -> (::a::A, ::b::B, ::c::C);
+            fn g(&self, x: (::a::A, ::b::B, ::c::C), y: ::d::D);
+        }
+    };
+    assert_eq!(
+        optional(item.clone()),
+        ["(:: a :: A , :: b :: B , :: c :: C)", ":: d :: D"]
+    );
+    assert!(required(item).is_empty());
+    // The inner types are preferred on a tie, as for the required ones.
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            fn f(&self) -> ((Rel,), ::a::A);
+            fn g(&self) -> (::a::A, (Rel,), ::b::B);
+        }
+    };
+    assert_eq!(optional(item.clone()), [":: a :: A", ":: b :: B"]);
+    assert_eq!(required(item), ["Rel"]);
+    // The required entries do not depend on the optional ones: the type of an external crate
+    // which has a required type in it (`Rel`, and the tuple, which one cut covers) is optional
+    // as a whole, and the required types in it are entries of their own.
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            fn f(&self) -> ::core::option::Option<(Rel, ::a::A, ::b::B)>;
+            fn g(&self) -> ::core::option::Option<(Rel, ::a::A, ::b::B)>;
+            fn h(&self) -> ::a::W<(Rel,), ::b::X>;
+            fn i(&self) -> ::b::X;
+        }
+    };
+    assert_eq!(
+        optional(item.clone()),
+        [
+            "(Rel , :: a :: A , :: b :: B)",
+            ":: a :: W < (Rel ,) , :: b :: X >",
+            ":: b :: X",
+        ]
+    );
+    assert_eq!(required(item), ["Rel"]);
+    // A required entry which is cut covers the optional types in it: they are not entries.
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            fn f(&self) -> Rel<::a::A, ::b::B>;
+            fn g(&self) -> Rel<::a::A, ::b::B>;
+        }
+    };
+    assert!(optional(item.clone()).is_empty());
+    assert_eq!(required(item), ["Rel < :: a :: A , :: b :: B >"]);
+    // A reference with a lifetime is leaked as a whole around the type of an external crate, as it
+    // is around a required one (the copy needs `Type: 'a` of the type which is interned).
+    let item: ItemTrait = parse_quote! {
+        trait Tr<'a> {
+            fn f(&self, x: &'a ::a::A);
+            fn g(&self, x: &'a (::a::A, ::b::B));
+        }
+    };
+    assert_eq!(
+        optional_trait(&item),
+        [
+            (
+                "& 'a (:: a :: A , :: b :: B)".to_string(),
+                "< 'a >".to_string()
+            ),
+            ("& 'a :: a :: A".to_string(), "< 'a >".to_string()),
+        ]
+    );
+    // And the optional ones of the call come after the required ones, whatever the contexts are.
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            fn a(&self) -> ::z::Z;
+            fn f<U>(&self, u: ::foo::V<U>) -> Rel<U>;
+            fn g(&self) -> Rel2;
+        }
+    };
+    let referrer = Leaker::from_trait(&item).unwrap().0.finish();
+    let musts: Vec<bool> = (0..referrer.iter().count())
+        .map(|ix| referrer.must(ix))
+        .collect();
+    assert_eq!(musts, [true, true, false, false]);
 }

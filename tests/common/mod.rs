@@ -2,11 +2,15 @@ use std::collections::BTreeSet;
 use template_quote::quote;
 use type_leak::Leaker;
 
-/// Converts a `Referrer`'s types to a `BTreeSet<String>` for order-independent comparison.
+/// Converts the required types of a `Referrer` (see `Referrer::must()`) to a `BTreeSet<String>`
+/// for order-independent comparison. The optional ones, which only the paths of external crates
+/// (`::std::vec::Vec<..>`) cause, are not among them.
 pub fn finish_as_strings(leaker: Leaker) -> BTreeSet<String> {
-    leaker
-        .finish()
+    let referrer = leaker.finish();
+    referrer
         .iter()
-        .map(|t| quote!(#t).to_string())
+        .enumerate()
+        .filter(|(ix, _)| referrer.must(*ix))
+        .map(|(_, t)| quote!(#t).to_string())
         .collect()
 }

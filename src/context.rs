@@ -3,7 +3,7 @@
 
 use crate::util::{
     generic_param_mentions_self, generic_param_name, ident_name, token_names, type_mentions_self,
-    where_predicate_mentions_self,
+    unwrap_type_group, where_predicate_mentions_self,
 };
 use proc_macro2::{Literal, TokenStream};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -176,9 +176,11 @@ pub(crate) struct Context {
     generics: Generics,
     self_ty: Option<SelfRequirement>,
     /// The lifetimes `'a` (parameters of `generics`) such that the types of the context imply
-    /// `Self: 'a`, e.g. by `Rel<'a, Self>` or `&'a Self::Item` (see [`implied_outlives()`]), sorted
-    /// and without duplicates. Empty if `self_ty` is `None`, as `Self` has no meaning then. They
-    /// are not among the bounds of `generics`, which `Self` is not a parameter of.
+    /// `Self: 'a`, e.g. by `&'a Self::Item` (see [`implied_outlives()`]), or
+    /// that a predicate written in the item says so (`where Self: 'a`, see
+    /// [`written_self_outlives()`]), sorted and without duplicates. Empty if `self_ty` is `None`,
+    /// as `Self` has no meaning then. They are not among the bounds of `generics`, which `Self` is
+    /// not a parameter of, nor among its where predicates.
     self_outlives: Vec<Lifetime>,
     /// The path of the module where the type is written, relative to the analyzed module (empty
     /// for the analyzed module itself). `None` for a type which does not depend on its module, or
@@ -260,11 +262,11 @@ impl Context {
     /// If a bound or a predicate of a generic the type depends on mentions `Self`, the type
     /// depends on the meaning of `Self` too.
     ///
-    /// The outlives bounds which the type implies on the generics (e.g. `T: 'a` for `&'a T` and for
-    /// `Rel<'a, T>`, see [`implied_outlives()`]) are added to the bounds of the parameters, as if
-    /// they were written: the Repeater's implementation encodes them in its trait arguments, so
-    /// that they are implied wherever the type is copied (and does not declare them, see
-    /// [`Referrer::generics()`](crate::Referrer::generics())).
+    /// The outlives bounds which the type implies on the generics (e.g. `T: 'a` for `&'a T`, see
+    /// [`implied_outlives()`]; not one for `Rel<'a, T>`, whose definition is not seen) are added to
+    /// the bounds of the parameters, as if they were written: the Repeater's implementation encodes
+    /// them in its trait arguments, so that they are implied wherever the type is copied (and does
+    /// not declare them, see [`Referrer::generics()`](crate::Referrer::generics())).
     ///
     /// Identifiers are matched by name, so a parameter may be included even if the name refers to
     /// something else (e.g. `::path::N`). This is harmless, because the Leaker and the Referrer
@@ -273,15 +275,15 @@ impl Context {
     /// `assumed` are the generics which no scope declares, but which are known to be generics of
     /// the Leaker, as the Referrer assumes the generics it does not see declared (see
     /// [`Referrer::into_visitor()`](crate::Referrer::into_visitor())): the outlives bounds
-    /// implied by the type on the declared generics (e.g. `T: 'a` of `Rel<'a, T>` where only `T`
-    /// is declared) are those of the Leaker's. The Leaker passes none: a lifetime which no scope
+    /// implied by the type on the declared generics (e.g. `T: 'a` of `&'a T` where only `T` is
+    /// declared) are those of the Leaker's. The Leaker passes none: a lifetime which no scope
     /// declares is a relative one, not a generic.
     ///
     /// `enclosing` are the lifetimes which the types around `ty` make it outlive (see
     /// [`Enclosing`]): `ty: 'a` implies the same bounds as the types inside `ty` do (see
     /// [`implied_outlives()`]), for each generic lifetime `'a` of them, so a type leaked alone
-    /// (e.g. `Rel2<T>` of `::core::cell::Ref<'a, Rel2<T>>`) has the bounds which the type it is a
-    /// component of implies on it. `'a` is among the generics of the context then, even if the type
+    /// (e.g. `Rel2<T>` of `&'a Vec<Rel2<T>>`) has the bounds which the type it is a component of
+    /// implies on it. `'a` is among the generics of the context then, even if the type
     /// does not mention it.
     pub(crate) fn of(
         ty: &Type,
@@ -408,8 +410,15 @@ impl Context {
             }
         }
         let mut params: Vec<GenericParam> = params.into_values().collect();
-        let predicates: Vec<WherePredicate> = predicates.into_values().collect();
+        let mut predicates: Vec<WherePredicate> = predicates.into_values().collect();
         let mut self_outlives = Vec::new();
+        // A bound `Self: 'a` which is written (`where Self: 'a`, `where Self: Sized + 'a`) is the
+        // same as one which the type implies: it is a part of the context as `self_outlives`, so it
+        // is encoded as `&'a Self` and never declared, and a context is the same whether it is
+        // written or implied (see `written_self_outlives()`).
+        if self_req.is_some() {
+            self_outlives.extend(written_self_outlives(&mut predicates, &params));
+        }
         for (bounded, lifetime) in
             implied_outlives(ty, scopes, assumed, &params, self_req.is_some(), &ancestors)
         {
@@ -600,6 +609,11 @@ impl Contexts {
         id
     }
 
+    /// Returns the id of `context` if it is there.
+    pub(crate) fn find(&self, context: &Context) -> Option<ContextId> {
+        self.ids.get(context).copied()
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.list.len()
     }
@@ -629,6 +643,50 @@ fn sort_bounds<T: template_quote::ToTokens, P: Default>(
     bounds.into_iter().map(|(_, bound)| bound).collect()
 }
 
+/// Moves the lifetime bounds on `Self` out of `predicates`. For each written predicate `Self: 'a
+/// + ..` (not under a `for<..>` binder), the bounds by a lifetime parameter of `params` are
+/// removed from it and returned, and the predicate is removed if nothing else is left of it
+/// (`Self: Sized + 'a` is left as `Self: Sized`). The others stay, as ordinary bounds: a bound by
+/// `'static` or by a lifetime which is not a parameter of the context, and the trait bounds.
+fn written_self_outlives(
+    predicates: &mut Vec<WherePredicate>,
+    params: &[GenericParam],
+) -> Vec<Lifetime> {
+    let is_param = |lifetime: &Lifetime| {
+        params.iter().any(
+            |param| matches!(param, GenericParam::Lifetime(param) if &param.lifetime == lifetime),
+        )
+    };
+    let mut moved = Vec::new();
+    let mut remaining = Vec::with_capacity(predicates.len());
+    for predicate in std::mem::take(predicates) {
+        match predicate {
+            WherePredicate::Type(mut predicate)
+                if predicate.lifetimes.is_none()
+                    && matches!(unwrap_type_group(&predicate.bounded_ty),
+                        Type::Path(TypePath { qself: None, path }) if path.is_ident("Self")) =>
+            {
+                let mut kept: Punctuated<TypeParamBound, Token![+]> = Punctuated::new();
+                for bound in std::mem::take(&mut predicate.bounds) {
+                    match bound {
+                        TypeParamBound::Lifetime(lifetime) if is_param(&lifetime) => {
+                            moved.push(lifetime)
+                        }
+                        bound => kept.push(bound),
+                    }
+                }
+                if !kept.is_empty() {
+                    predicate.bounds = kept;
+                    remaining.push(WherePredicate::Type(predicate));
+                }
+            }
+            predicate => remaining.push(predicate),
+        }
+    }
+    *predicates = remaining;
+    moved
+}
+
 /// The generics of the Leaker which no scope declares, but which are known to be generics: the
 /// Referrer assumes the generics it does not see declared to be those of the Leaker (see
 /// [`Context::of()`]).
@@ -643,12 +701,34 @@ pub(crate) struct Assumed {
 /// The lifetimes which a type must outlive because of the types around it (it is a component of
 /// them, in the sense of [`Enclosing::components_of()`]), each with the number of scopes in scope
 /// where it is written, which tells the parameter it names (see [`is_generic_lifetime()`]). The
-/// type `X` of `&'a X` is one, and so is `Rel2<T>` of `Ref<'a, Vec<Rel2<T>>>`: `Ref<'a, Vec<X>>` is
+/// type `X` of `&'a X` is one, and so is `Rel2<T>` of `&'a Vec<Rel2<T>>`: `&'a Vec<X>` is
 /// well-formed only if `X: 'a`, which neither the implementation of the Repeater nor the copy of
 /// a field (rustc infers the bound of the original, but not through a projection) has unless the
-/// context of `X` carries it.
+/// context of `X` carries it. The lifetime arguments of a path (`Ref<'a, Rel2<T>>`) are not
+/// recorded: they are not assumed to bound its type arguments, whose definition is not seen (see
+/// [`implied_outlives()`]).
+///
+/// Whether a path `T::A<X>` is a projection depends on `T` being a type parameter, which the
+/// Referrer may not see declared (it assumes the generics it does not see declared to be those of
+/// the Leaker, see [`Assumed`]). So it is recorded as such, and what the type outlives is resolved
+/// when the context is computed, with the scopes and the generics assumed then (see
+/// [`Enclosing::generic()`]): the Leaker knows the generics in scope, and the Referrer knows them
+/// per entry it compares the context with.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Enclosing(Vec<(Lifetime, usize)>);
+pub(crate) struct Enclosing(Vec<Link>);
+
+/// A link of [`Enclosing`], in the order of the types around the one being looked up (the outermost
+/// first).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Link {
+    /// The types inside must outlive the lifetime of a reference, written where `depth` scopes
+    /// were in scope.
+    Lifetime { lifetime: Lifetime, depth: usize },
+    /// The path `head::A<..>` (written where `depth` scopes were in scope), which is a projection
+    /// if `head` is a type parameter. A projection does not pass on what is required of it to the
+    /// types inside it (see [`Enclosing::components_of()`]), so everything before it is dropped.
+    Projection { head: String, depth: usize },
+}
 
 impl Enclosing {
     /// Returns what the types which are components of `ty` must outlive, when `self` is what `ty`
@@ -656,20 +736,24 @@ impl Enclosing {
     /// requirement `ty: 'a` is that of its components, as rustc derives it (see
     /// [`implied_outlives()`] for what it makes of them):
     ///
-    /// - `&'a X` (also `&'a mut X`) requires `X: 'a`, so `X` must outlive `'a` too, and so do the
-    ///   type arguments of a path with a lifetime argument `R<'a, X>` (assumed, as the definition
-    ///   of `R` cannot be seen).
+    /// - `&'a X` (also `&'a mut X`) requires `X: 'a`, so `X` must outlive `'a` too. It is the only
+    ///   type which adds a lifetime to what its components must outlive: the lifetime arguments of
+    ///   a path (`R<'a, X>`) do not, as `R<'a, X>` is well-formed without `X: 'a` unless the
+    ///   definition of `R` says so, which cannot be seen, and a bound is not assumed (see
+    ///   [`implied_outlives()`]).
     /// - Everything else which is made of types passes what `ty` must outlive on to them: the
     ///   elements of a tuple, an array or a slice, the type in parentheses or a group or behind a
     ///   raw pointer, the type arguments of a path (also one without a lifetime argument, like
     ///   `Vec<X>`), the inputs and the output of a function pointer, and the type arguments and
     ///   the associated type bindings of a trait object (`dyn Tr<X> + 'b: 'a` requires `X: 'a`
     ///   as well as `'b: 'a`, whatever the bound `X: 'b` says).
-    /// - A projection with a qualified self (`<X as Tr<Y>>::A`) does not: it outlives `'a` if its
-    ///   components do (but also by a bound written for it), so `X: 'a` is not required, and an
-    ///   `impl Trait` is not made of types in this sense. Neither is the length of an array.
-    ///   `T::A<X>` cannot be told from the path of a type, as the Referrer may not see `T`
-    ///   declared, so it is treated as one (the Leaker and the Referrer must agree).
+    /// - A projection does not: it outlives `'a` if its components do (but also by a bound
+    ///   written for it), so `X: 'a` is not required of `X`. That is the projection with a
+    ///   qualified self (`<X as Tr<Y>>::A<Z>`), and a path starting with a type parameter or
+    ///   `Self` (`T::A<X>`, `Self::A<X>`), whose arguments are not those of a type either (a GAT
+    ///   bound is not implied). A path starting with a type parameter is told by the generics in
+    ///   scope, so it is recorded as such and decided by [`Enclosing::generic()`]. An `impl Trait`
+    ///   is not made of types in this sense, and neither is the length of an array.
     ///
     /// A `for<..>` binder does not change them (`&'a for<'x> fn(&'x X)` requires `X: 'a`), but its
     /// own lifetimes are not generics, so they are never recorded (see
@@ -682,14 +766,16 @@ impl Enclosing {
                 ..
             }) => next.push(lifetime, depth),
             Type::Path(TypePath { qself: None, path }) => {
-                for seg in &path.segments {
-                    if let PathArguments::AngleBracketed(args) = &seg.arguments {
-                        for arg in &args.args {
-                            if let GenericArgument::Lifetime(lifetime) = arg {
-                                next.push(lifetime, depth);
-                            }
-                        }
-                    }
+                let head = projection_head(path);
+                if head.map_or(false, |head| head == "Self") {
+                    // `Self::A<X>` is always a projection.
+                    return Self::default();
+                }
+                if let Some(head) = head {
+                    next.0.push(Link::Projection {
+                        head: ident_name(head),
+                        depth,
+                    });
                 }
             }
             Type::Path(_) | Type::ImplTrait(_) => return Self::default(),
@@ -699,31 +785,112 @@ impl Enclosing {
     }
 
     fn push(&mut self, lifetime: &Lifetime, depth: usize) {
-        let entry = (lifetime.clone(), depth);
-        if lifetime.ident != "static" && lifetime.ident != "_" && !self.0.contains(&entry) {
-            self.0.push(entry);
+        let link = Link::Lifetime {
+            lifetime: lifetime.clone(),
+            depth,
+        };
+        if lifetime.ident != "static" && lifetime.ident != "_" && !self.0.contains(&link) {
+            self.0.push(link);
         }
+    }
+
+    /// Returns the lifetimes which the types must outlive, each with the number of scopes where it
+    /// was written, once the paths which are projections (the first segment of which is a type
+    /// parameter, see [`is_type_parameter()`]) have dropped what was before them.
+    fn active(&self, scopes: &[Scope], assumed: &Assumed) -> Vec<(Lifetime, usize)> {
+        let mut active: Vec<(Lifetime, usize)> = Vec::new();
+        for link in &self.0 {
+            match link {
+                Link::Projection { head, depth } => {
+                    if is_type_parameter(head, visible(scopes, *depth), assumed) {
+                        active.clear();
+                    }
+                }
+                Link::Lifetime { lifetime, depth } => {
+                    let entry = (lifetime.clone(), *depth);
+                    if !active.contains(&entry) {
+                        active.push(entry);
+                    }
+                }
+            }
+        }
+        active
     }
 
     /// Returns the lifetimes which are generic (see [`is_generic_lifetime()`]), each with the
     /// number of scopes it was written in, in the order they enclose the type, from the outermost.
+    /// `assumed` tells which names are type parameters if no scope declares them (see
+    /// [`Enclosing::undeclared_heads()`]).
     pub(crate) fn generic(&self, scopes: &[Scope], assumed: &Assumed) -> Vec<(Lifetime, usize)> {
         let mut generic: Vec<(Lifetime, usize)> = Vec::new();
-        for (lifetime, depth) in &self.0 {
+        for (lifetime, depth) in self.active(scopes, assumed) {
             // What the lifetime names is what the scopes declared where it is written say.
-            let visible = &scopes[..(*depth).min(scopes.len())];
-            if is_generic_lifetime(visible, assumed, &[], lifetime)
-                && !generic.iter().any(|(other, _)| other == lifetime)
+            if is_generic_lifetime(visible(scopes, depth), assumed, &[], &lifetime)
+                && !generic.iter().any(|(other, _)| *other == lifetime)
             {
-                generic.push((lifetime.clone(), *depth));
+                generic.push((lifetime, depth));
             }
         }
         generic
     }
 
-    /// Returns the lifetimes.
-    pub(crate) fn lifetimes(&self) -> impl Iterator<Item = &Lifetime> {
-        self.0.iter().map(|(lifetime, _)| lifetime)
+    /// Returns the lifetimes (see [`Enclosing::generic()`], also those which are not generic).
+    pub(crate) fn lifetimes(&self, scopes: &[Scope], assumed: &Assumed) -> Vec<Lifetime> {
+        self.active(scopes, assumed)
+            .into_iter()
+            .map(|(lifetime, _)| lifetime)
+            .collect()
+    }
+
+    /// Returns the first segments of the paths (`head::A<..>`) around the type which no scope
+    /// declares, and which are not among the types assumed: the Referrer cannot tell whether they
+    /// are type parameters of the Leaker (which the entry does not mention, so it does not know
+    /// them either) or something else (a module, an enum, ..). Sorted and without duplicates.
+    pub(crate) fn undeclared_heads(&self, scopes: &[Scope], assumed: &Assumed) -> Vec<String> {
+        let mut heads: Vec<String> = Vec::new();
+        for link in &self.0 {
+            let (head, depth) = match link {
+                Link::Projection { head, depth } => (head, *depth),
+                Link::Lifetime { .. } => continue,
+            };
+            let declared = visible(scopes, depth)
+                .iter()
+                .any(|scope| scope.declares(head));
+            if !declared && !assumed.types.contains(head) && !heads.contains(head) {
+                heads.push(head.clone());
+            }
+        }
+        heads.sort();
+        heads
+    }
+}
+
+/// Returns the scopes in scope where `depth` of them were declared.
+fn visible(scopes: &[Scope], depth: usize) -> &[Scope] {
+    &scopes[..depth.min(scopes.len())]
+}
+
+/// Returns the first segment of `path` if it may start a projection (`T::A<X>`, `Self::A<X>`): the
+/// path is relative, has an associated item after it, and the segment has no arguments. Whether it
+/// is a type parameter (or `Self`) is not told by the path.
+fn projection_head(path: &Path) -> Option<&Ident> {
+    if path.leading_colon.is_some() || path.segments.len() < 2 {
+        return None;
+    }
+    path.segments
+        .first()
+        .filter(|seg| seg.arguments.is_none())
+        .map(|seg| &seg.ident)
+}
+
+/// Returns `true` if `name` is a type parameter in `scopes`: declared by the innermost scope
+/// which declares it, or, if no scope does, one of the generics `assumed` to be the Leaker's.
+fn is_type_parameter(name: &str, scopes: &[Scope], assumed: &Assumed) -> bool {
+    match scopes.iter().rev().find(|scope| scope.declares(name)) {
+        Some(scope) => scope.params().any(
+            |param| matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == name),
+        ),
+        None => assumed.types.iter().any(|assumed| assumed == name),
     }
 }
 
@@ -840,11 +1007,16 @@ impl<'a, 'ast> Visit<'ast> for Mentions<'a> {
 /// [`encode_generics_params_to_ty()`](crate::encode_generics_params_to_ty())).
 ///
 /// - A reference `&'a X` requires `X: 'a`.
-/// - A path with a lifetime argument `R<'a, .., X, ..>` is assumed to require `X: 'a` for each
-///   type argument `X`, as it usually does (e.g. `struct R<'a, T>(&'a T)` makes `T: 'a` part of
-///   its definition by RFC 2093), but we cannot see the definition of `R`.
 /// - `ancestors` (the generic lifetimes among the [`Enclosing`] ones) require `ty: 'a`, which is
 ///   `X: 'a` for `ty` as `X` (a type leaked alone is a component of the type around it).
+///
+/// A path with a lifetime argument `R<'a, .., X, ..>` is not assumed to require `X: 'a` (it does
+/// if the definition of `R` says so, e.g. `struct R<'a, T>(&'a T)`, but that cannot be seen, and
+/// where it does not, as with `struct R<'a, T>(&'a (), T)`, an assumed bound would make the copy
+/// stricter than the original): only the bounds which hold whatever the definitions say are
+/// recorded, so `T: 'a` of such a type must be written. A lifetime which `ty` must outlive passes
+/// through a path to its arguments, though (`&'a R<X>` requires `X: 'a`, see
+/// [`Enclosing::components_of()`]).
 ///
 /// `X: 'a` is `T: 'a` for each type parameter `T` mentioned in `X`, and `'b: 'a` for each
 /// lifetime parameter `'b` mentioned in `X` other than `'a`, and `Self: 'a` if `X` mentions `Self`
@@ -911,26 +1083,6 @@ fn implied_outlives(
                 self.require(lifetime, &i.elem);
             }
             syn::visit::visit_type_reference(self, i)
-        }
-        fn visit_type_path(&mut self, i: &'ast TypePath) {
-            // The arguments of an associated item of a qualified path are not those of a type
-            // (a GAT bound is not implied).
-            if i.qself.is_none() {
-                for seg in &i.path.segments {
-                    if let PathArguments::AngleBracketed(args) = &seg.arguments {
-                        for lifetime in &args.args {
-                            if let GenericArgument::Lifetime(lifetime) = lifetime {
-                                for arg in &args.args {
-                                    if let GenericArgument::Type(referent) = arg {
-                                        self.require(lifetime, referent);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            syn::visit::visit_type_path(self, i)
         }
         fn visit_type_bare_fn(&mut self, i: &'ast TypeBareFn) {
             let outer = self.binders.len();

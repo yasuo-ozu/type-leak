@@ -128,6 +128,23 @@ pub(crate) fn unwrap_type_group(ty: &Type) -> &Type {
     }
 }
 
+/// Returns `true` if the trait object has a lifetime bound (e.g. `dyn Trait + 'a`), so it does not
+/// default to one.
+pub(crate) fn has_lifetime_bound(object: &TypeTraitObject) -> bool {
+    object
+        .bounds
+        .iter()
+        .any(|bound| matches!(bound, TypeParamBound::Lifetime(_)))
+}
+
+/// Returns the trait object which `ty` is, also inside parentheses and groups.
+pub(crate) fn trait_object_of(ty: &Type) -> Option<&TypeTraitObject> {
+    match unwrap_type_group(ty) {
+        Type::TraitObject(object) => Some(object),
+        _ => None,
+    }
+}
+
 /// Finds the first mention of `Self` (a path starting with it, e.g. `Self`, `Self::X` or the self
 /// type of `<Self as ..>`, or the name in the tokens of a macro, but not `::p::Self`).
 #[derive(Default)]

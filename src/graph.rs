@@ -108,11 +108,10 @@ pub(crate) struct TypeGraph {
     nodes: HashSet<NodeKey>,
     /// The types appearing as roots (not as components of another internable type).
     pub(crate) roots: HashSet<NodeKey>,
-    /// The types which must be interned (they directly depend on the type context).
+    /// The types which must be interned: they directly depend on the type context (the graph of
+    /// the required entries), or they may be replaced by the Referrer (the graph of the optional
+    /// ones, see [`Referrer::must()`](crate::Referrer::must())).
     pub(crate) must_intern: HashSet<NodeKey>,
-    /// The types with a cause which is not an external crate's path (see
-    /// [`Referrer::must()`](crate::Referrer::must())).
-    pub(crate) hard: HashSet<NodeKey>,
 }
 
 impl TypeGraph {
@@ -124,7 +123,6 @@ impl TypeGraph {
         ty: &Type,
         parent: Option<&NodeKey>,
         is_must_intern: bool,
-        is_hard: bool,
     ) -> NodeKey {
         let key = NodeKey {
             context,
@@ -141,9 +139,6 @@ impl TypeGraph {
         }
         if is_must_intern {
             self.must_intern.insert(key.clone());
-        }
-        if is_hard {
-            self.hard.insert(key.clone());
         }
         key
     }
@@ -187,6 +182,5 @@ impl TypeGraph {
         }
         self.roots.extend(other.roots);
         self.must_intern.extend(other.must_intern);
-        self.hard.extend(other.hard);
     }
 }

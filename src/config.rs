@@ -5,15 +5,19 @@ use syn::*;
 /// Configuration for building a [`Leaker`](crate::Leaker).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LeakerConfig {
-    /// Relative paths treated as context-free (not leaked). See
-    /// [`Leaker::allowed_paths`](crate::Leaker::allowed_paths).
+    /// Paths treated as context-free (not leaked), relative or absolute (e.g. `parse_quote!(::serde)`
+    /// allows `::serde::Serialize`, and not the relative `serde::Serialize`). See
+    /// [`Leaker::allowed_paths`](crate::Leaker::allowed_paths), which also tells how the paths
+    /// with a leading `::` are dealt with (the external crates, which the Referrer may or may not
+    /// replace).
+    ///
+    /// An absolute path which is allowed is assumed to name the same crate in the Referrer's
+    /// crate: the crates are matched by **name only**, whatever their version, package or origin
+    /// is, so allow only the crates known to be identical on both sides.
     pub allowed_paths: Vec<Path>,
     /// Whether a type mentioning `Self` may be leaked as a whole (default `true`). See
     /// [`Leaker::self_ty_can_be_interned`](crate::Leaker::self_ty_can_be_interned).
     pub self_ty_can_be_interned: bool,
-    /// Whether a path with a leading `::` (e.g. `::foo::X`) is context-free (default `true`). See
-    /// [`Leaker::allow_external_crates`](crate::Leaker::allow_external_crates).
-    pub allow_external_crates: bool,
 }
 
 impl Default for LeakerConfig {
@@ -21,7 +25,6 @@ impl Default for LeakerConfig {
         Self {
             allowed_paths: Vec::new(),
             self_ty_can_be_interned: true,
-            allow_external_crates: true,
         }
     }
 }
@@ -29,17 +32,6 @@ impl Default for LeakerConfig {
 impl LeakerConfig {
     pub fn new() -> Self {
         Default::default()
-    }
-
-    /// Sets [`LeakerConfig::allow_external_crates`]. With `false`, only `::core` is context-free
-    /// among the paths with a leading `::` (the [`allowed_paths`](LeakerConfig::allowed_paths)
-    /// apply to relative paths only), so the external crates are leaked (or reported as
-    /// [`NotInternableError::NotPortable`](crate::NotInternableError::NotPortable)). The
-    /// Referrer tells which of them it can refer to (see
-    /// [`Referrer::with_available_external_crates()`](crate::Referrer::with_available_external_crates())).
-    pub fn allow_external_crates(&mut self, allow: bool) -> &mut Self {
-        self.allow_external_crates = allow;
-        self
     }
 
     /// Allow primitive types from `::core::primitive`.

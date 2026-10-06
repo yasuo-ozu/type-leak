@@ -151,19 +151,6 @@ fn test_default_cannot_depend_on_self() {
         err.note().as_deref(),
         Some("a default of a parameter cannot depend on `Self`")
     );
-    let mut leaker = Leaker::from_config({
-        let mut config = type_leak::LeakerConfig::new();
-        config.allow_external_crates(false);
-        config
-    });
-    let err = leaker
-        .intern_with(&tr.generics, |v| {
-            syn::visit::Visit::visit_item_trait(v, &tr)
-        })
-        .err()
-        .unwrap();
-    assert!(matches!(err, type_leak::NotInternableError::NotPortable(_)));
-
     // Nothing is leaked in `::p::W<Self>` or `Self`, which are copied, and in `(Rel, Self)` only
     // `Rel` is.
     for (default, leaked) in [
@@ -218,13 +205,23 @@ fn test_defaults_of_several_calls_are_shared() {
         .is_err());
     let referrer = leaker.finish();
     // The types use no generics, so they are in one context, whichever call found them, and the
-    // generics of the calls (without the defaults) are two other contexts without entries.
-    assert_eq!(referrer.iter().count(), 2);
+    // generics of the calls (without the defaults) are two other contexts. The default of `U`,
+    // the type of an external crate, is an optional entry (after the required ones), which uses
+    // `T`: it is in the context of the generics of `S<T>` (old: it was no entry, and that context
+    // had none).
+    assert_eq!(referrer.iter().count(), 3);
     assert_eq!(referrer.contexts().count(), 3);
     assert_eq!(referrer.generics(0).params.len(), 0);
+    assert_eq!(referrer.generics(1).params.len(), 0);
+    assert!(referrer.must(0) && referrer.must(1) && !referrer.must(2));
+    assert_eq!(
+        s(referrer.iter().nth(2).unwrap()),
+        ":: std :: vec :: Vec < T >"
+    );
+    assert_eq!(referrer.context(2), top_plain);
     assert_eq!(referrer.context_generics(top_plain).params.len(), 1);
     assert_eq!(referrer.context_generics(top_tr).params.len(), 2);
-    // The default is copied (nothing in it is leaked), as in any call.
+    // The default is copied (the optional entry is left as it is), as in any call.
     let completed = referrer
         .complete_args(
             &args(parse_quote!(<u8>)),
@@ -236,6 +233,21 @@ fn test_defaults_of_several_calls_are_shared() {
         completed.iter().map(s).collect::<Vec<_>>(),
         ["u8", ":: std :: vec :: Vec < u8 >"]
     );
+    // A Referrer which does not trust the names of the crates replaces the default by the entry.
+    let strict = referrer.allow_ambiguous_crate_name(false);
+    let mut replaced = Vec::new();
+    let completed = strict
+        .complete_args(
+            &args(parse_quote!(<u8>)),
+            &tr.generics.params,
+            |ty, ix, prefix| {
+                replaced.push((s(&ty), ix, prefix.len()));
+                parse_quote!(P)
+            },
+        )
+        .unwrap();
+    assert_eq!(completed.iter().map(s).collect::<Vec<_>>(), ["u8", "P"]);
+    assert_eq!(replaced, [(":: std :: vec :: Vec < T >".to_string(), 2, 1)]);
 }
 
 #[test]

@@ -166,8 +166,54 @@ pub mod m {
         fn p(&self) -> RelType;
     }
 
+    /// Types of external crates (`::std`), which the Leaker does not allow: they are optional
+    /// entries, whose Repeater's implementations are written like the others. The Referrer
+    /// leaves them as written, or replaces them (`strict`), with the relative types in them
+    /// replaced either way.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::m,
+    )]
+    pub trait External<T> {
+        /// An external type with a relative one in it: `RelType` is required, and the `Vec` is
+        /// optional.
+        fn wrapped(&self) -> ::std::vec::Vec<(RelType,)>;
+        /// The generics of the trait in it.
+        fn generic(&self, t: ::std::vec::Vec<T>) -> usize;
+        /// A lifetime of the method, behind a reference (kept as written in either).
+        fn borrowed<'a>(&self, x: &'a ::std::string::String) -> &'a str;
+        /// One optional type around a required one, around another optional one.
+        fn nested(&self) -> ::std::boxed::Box<(::std::vec::Vec<u8>, RelType)>;
+        /// The type of a receiver is never replaced.
+        fn receiver(self: ::std::boxed::Box<Self>) -> usize;
+        /// A trait object of an external crate.
+        fn dynamic(&self, f: ::std::boxed::Box<dyn ::core::ops::Fn(RelType) -> u32>) -> u32;
+    }
+
     /// Implements the traits above for any arguments; the Referrer's wrappers forward to it.
     pub struct Inner;
+
+    impl<T> External<T> for Inner {
+        fn wrapped(&self) -> ::std::vec::Vec<(RelType,)> {
+            vec![(RelType(1),), (RelType(2),)]
+        }
+        fn generic(&self, t: ::std::vec::Vec<T>) -> usize {
+            t.len()
+        }
+        fn borrowed<'a>(&self, x: &'a ::std::string::String) -> &'a str {
+            &x[1..]
+        }
+        fn nested(&self) -> ::std::boxed::Box<(::std::vec::Vec<u8>, RelType)> {
+            ::std::boxed::Box::new((vec![3, 4], RelType(5)))
+        }
+        fn receiver(self: ::std::boxed::Box<Self>) -> usize {
+            6
+        }
+        fn dynamic(&self, f: ::std::boxed::Box<dyn ::core::ops::Fn(RelType) -> u32>) -> u32 {
+            f(RelType(7))
+        }
+    }
 
     impl<T: ::core::clone::Clone> Edge<T> for Inner {
         fn e_where<V>(&self, v: V) -> Pair<V>
@@ -447,7 +493,8 @@ pub mod s {
             ::core::cell::Ref<'a, (dyn RelTr)>,
             dyn RelTr + 'a,
             dyn RelTr,
-            RelImpl
+            RelImpl,
+            ? ::std::boxed::Box<dyn RelTr>
         }
         { }
         trait PathDynLeaks<'a> {
@@ -588,42 +635,42 @@ macro_rules! check_dollar_crate {
             struct S1<const N: $crate::m::Idx>([u8; N], $crate::m::Portable);
         }
 
-        // `$crate` paths are portable even if external crates are not allowed, unlike the
-        // other absolute paths.
+        // `$crate` paths are portable, unlike the other absolute paths.
         check_leak! {
             { }
-            { allow_external_crates = false }
+            { }
             trait N1 { fn f(&self) -> $crate::m::Portable; }
         }
         check_leak! {
             { Rel }
-            { allow_external_crates = false }
+            { }
             trait N2 { fn g(&self) -> $crate::m::Wrap<(Rel,)>; }
         }
         check_leak! {
             { }
-            { allow_external_crates = false }
+            { }
             trait N3<T: $crate::m::PortTr>: $crate::m::PortTr {}
         }
         check_leak! {
             { }
-            { allow_external_crates = false }
+            { }
             trait N4<const N: $crate::m::Idx> { fn a(&self) -> [u8; $crate::m::LEN]; }
         }
+        // An absolute path of an external crate is an optional entry, unless it is allowed.
         check_leak! {
             { }
-            { allow_external_crates = true }
+            { allow = ::foo }
             trait E1 { fn f(&self) -> ::foo::X; }
         }
-        // A type of another crate is leaked (requiring that crate), instead of being an error.
         check_leak! {
-            { ::foo::X }
-            { allow_external_crates = false }
+            { ? ::foo::X }
+            { }
             trait E2 { fn f(&self) -> ::foo::X; }
         }
+        // A trait bound is copied as it is, which is not an error.
         check_leak! {
-            { error: "use a path starting with `$crate`: ':: foo :: Tr'" }
-            { allow_external_crates = false }
+            { }
+            { }
             trait E3<T: ::foo::Tr> {}
         }
 
@@ -641,14 +688,6 @@ macro_rules! check_dollar_crate {
         check_leak! {
             { Rel }
             { }
-            mod mm {
-                use $crate::m::Portable;
-                pub struct S { a: Portable, b: Rel }
-            }
-        }
-        check_leak! {
-            { Rel }
-            { allow_external_crates = false }
             mod mm {
                 use $crate::m::Portable;
                 pub struct S { a: Portable, b: Rel }

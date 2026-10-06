@@ -18,13 +18,36 @@ use template_quote::quote;
 
 /// The entry point of this crate.
 pub struct Leaker {
-    /// Relative paths treated as context-free (not leaked), e.g. the names of the standard
-    /// prelude (`Vec`, `Option`, ...) with [`LeakerConfig::allow_std_prelude()`], primitive types
-    /// with [`LeakerConfig::allow_primitive()`], or `crate` with [`LeakerConfig::allow_crate()`].
-    /// A relative path is context-free if it starts with the segments of one of them; its generic
-    /// arguments are still analyzed (e.g. `Rel` in `Option<(Rel,)>`). They apply to relative paths
-    /// only (see [`Leaker::allow_external_crates`] for paths with a leading `::`). Primitive names
-    /// copied as they are are checked by [`Leaker::assertions()`].
+    /// Paths treated as context-free (not leaked), e.g. the names of the standard prelude (`Vec`,
+    /// `Option`, ...) with [`LeakerConfig::allow_std_prelude()`], primitive types with
+    /// [`LeakerConfig::allow_primitive()`], `crate` with [`LeakerConfig::allow_crate()`], or an
+    /// external crate (`parse_quote!(::serde)`, see "External crates" below). A path is
+    /// context-free if it starts with the segments of one of them, and both have a leading `::`
+    /// or neither has (`::serde` allows `::serde::Serialize`, and not `serde::Serialize`, which
+    /// is relative); its generic arguments are still analyzed (e.g. `Rel` in `Option<(Rel,)>`).
+    /// Primitive names copied as they are are checked by [`Leaker::assertions()`].
+    ///
+    /// # External crates
+    ///
+    /// A type with an absolute path (a leading `::`, e.g. `::serde::Wrap<Rel>`) does not depend on
+    /// the type context, but it names the crate by its **name only**, which the Referrer's crate
+    /// may not mean the same crate by (another version, a renamed dependency, ...), so the Leaker
+    /// cannot tell whether it can be copied as it is. So it is a *node*: an optional entry of the
+    /// [`Referrer`] ([`Referrer::must()`](crate::Referrer::must()) is `false`), which the
+    /// Referrer leaves as written, or replaces, as it chooses (see
+    /// [`Referrer::allow_ambiguous_crate_name()`](crate::Referrer::allow_ambiguous_crate_name())).
+    /// [`Referrer::external_crates_require()`](crate::Referrer::external_crates_require()) lists
+    /// the crates an entry names. These paths are not nodes:
+    ///
+    /// - `::core::..`, which every crate has,
+    /// - the paths which start with one of `allowed_paths` (e.g. `parse_quote!(::serde)`), whose
+    ///   crates the caller guarantees to be the same in the Referrer's crate,
+    /// - `$crate::..`, which names the Leaker's crate.
+    ///
+    /// `::std` and `::alloc` are nodes like any other crate, unless allowed. Only types are nodes:
+    /// an absolute path in a trait bound, a value or the type of a const parameter is copied as
+    /// it is whatever the Referrer decides, as it cannot be leaked. So is a type which cannot be
+    /// leaked (`::foo::Wrap<'_>`, `impl ::foo::Tr`): that is not an error.
     pub allowed_paths: Vec<Path>,
     /// Whether a type mentioning `Self` may be leaked as a whole (default `true`).
     ///
@@ -35,28 +58,24 @@ pub struct Leaker {
     /// (only its other components are leaked), and an error is reported when it cannot be (e.g.
     /// `Rel<Self>`) or when the bounds of the generics it uses mention `Self`.
     pub self_ty_can_be_interned: bool,
-    /// Whether a path with a leading `::` (e.g. `::foo::X`) is context-free (default `true`).
-    ///
-    /// Such a path resolves against the external crates of the crate compiling it, so it is not
-    /// portable to the Referrer's crate if that crate does not depend on `foo` (or renamed it, or
-    /// uses another version). With `false`, only a path starting with `::core` (always
-    /// available) or `$crate` is context-free (not even one starting with an
-    /// [allowed path](Leaker::allowed_paths), which applies to relative paths only), and the
-    /// others are treated like relative paths: leaked in a type (see
-    /// [`Referrer::external_crates_require()`](crate::Referrer::external_crates_require()) and
-    /// [`Referrer::must()`](crate::Referrer::must())), and
-    /// [`NotInternableError::NotPortable`] in a trait bound, a value or the type of a const
-    /// parameter. The Referrer tells which crates it can refer to (see
-    /// [`Referrer::with_available_external_crates()`](crate::Referrer::with_available_external_crates())).
-    pub allow_external_crates: bool,
-    /// The types found by [`Leaker::intern_with()`] and their composition.
+    /// The types found by [`Leaker::intern_with()`] and their composition: those which depend on
+    /// the type context (the required entries).
     types: TypeGraph,
-    /// The nodes of the types to be interned, computed from `types` by [`Leaker::reduce_roots()`]
-    /// (`None` if not computed yet, or outdated).
-    reachable_types: Option<Vec<NodeKey>>,
+    /// The types which may be replaced by the Referrer (their own path names an external crate,
+    /// see [`Leaker::allowed_paths`]) and the types containing them (the optional entries), in
+    /// the contexts of `optional_contexts`.
+    optional_types: TypeGraph,
+    /// The nodes of the types to be interned, computed from `types` and `optional_types` by
+    /// [`Leaker::reduce_roots()`] (`None` if not computed yet, or outdated): the required ones
+    /// and then the optional ones, in the contexts of `contexts`.
+    reachable_types: Option<(Vec<NodeKey>, Vec<NodeKey>)>,
     /// The contexts of the types found (see [`Referrer::context()`](crate::Referrer::context())),
     /// and the generics of the calls of [`Leaker::intern_with()`].
     contexts: Contexts,
+    /// The contexts of the optional types, numbered on their own so that those of the required
+    /// ones are not affected by them (those of the optional entries are added to `contexts`
+    /// by [`Leaker::reduce_roots()`]).
+    optional_contexts: Contexts,
     /// The top-level contexts of the successful calls of [`Leaker::intern_with()`] (see there),
     /// which the [`Referrer`] keeps even without an entry.
     top_levels: BTreeSet<ContextId>,
@@ -219,10 +238,11 @@ impl Leaker {
         Self {
             allowed_paths: Vec::new(),
             self_ty_can_be_interned: true,
-            allow_external_crates: true,
             types: TypeGraph::default(),
+            optional_types: TypeGraph::default(),
             reachable_types: None,
             contexts: Contexts::default(),
+            optional_contexts: Contexts::default(),
             top_levels: BTreeSet::new(),
             calls: 0,
             assumed_primitives: Vec::new(),
@@ -234,10 +254,11 @@ impl Leaker {
         Self {
             allowed_paths: config.allowed_paths,
             self_ty_can_be_interned: config.self_ty_can_be_interned,
-            allow_external_crates: config.allow_external_crates,
             types: TypeGraph::default(),
+            optional_types: TypeGraph::default(),
             reachable_types: None,
             contexts: Contexts::default(),
+            optional_contexts: Contexts::default(),
             top_levels: BTreeSet::new(),
             calls: 0,
             assumed_primitives: Vec::new(),
@@ -287,13 +308,10 @@ impl Leaker {
     }
 
     /// Returns `true` if `path` does not depend on the type context, i.e. it is absolute, starts
-    /// with `$crate`, or is relative and starts with one of [`Leaker::allowed_paths`]. Unless
-    /// [`Leaker::allow_external_crates`], an absolute path is context-free only if it starts with
-    /// `::core`.
+    /// with `$crate`, or is relative and starts with one of [`Leaker::allowed_paths`]. A type
+    /// with an absolute path may still be an optional entry (see [`Leaker::is_soft_path()`]).
     pub(crate) fn is_context_free_path(&self, path: &Path) -> bool {
-        (path.leading_colon.is_some()
-            && (self.allow_external_crates
-                || matches!(path.segments.first(), Some(seg) if seg.ident == "core")))
+        path.leading_colon.is_some()
             || matches!(
                 path.segments.iter().next(),
                 Some(PathSegment {
@@ -301,11 +319,27 @@ impl Leaker {
                     arguments: PathArguments::None,
                 }) if ident == "$crate"
             )
-            || (path.leading_colon.is_none()
-                && self
-                    .allowed_paths
-                    .iter()
-                    .any(|allowed| path_starts_with(path, allowed)))
+            || self.is_allowed_path(path)
+    }
+
+    /// Returns `true` if `path` starts with the segments of one of [`Leaker::allowed_paths`] (and
+    /// both have a leading `::`, or neither has).
+    fn is_allowed_path(&self, path: &Path) -> bool {
+        self.allowed_paths
+            .iter()
+            .any(|allowed| path_starts_with(path, allowed))
+    }
+
+    /// Returns `true` if `path` is an absolute path which names an external crate: it has a
+    /// leading `::`, and does not start with `::core` or an [allowed path](Leaker::allowed_paths).
+    /// It is resolved by the name of the crate, which the Referrer's crate may not mean the same
+    /// crate by, so a type with such a path is an optional entry (see [`Leaker::allowed_paths`]),
+    /// which the Referrer may replace: nothing in it can be taken to stay where it is written
+    /// (see `AnalyzeVisitor::scan_anchors()`).
+    pub(crate) fn is_soft_path(&self, path: &Path) -> bool {
+        path.leading_colon.is_some()
+            && !matches!(path.segments.first(), Some(seg) if seg.ident == "core")
+            && !self.is_allowed_path(path)
     }
 
     /// Intern AST elements using a visitor callback.
@@ -335,7 +369,10 @@ impl Leaker {
     /// in it (see
     /// [`Referrer::contexts()`](crate::Referrer::contexts())): its generics are given by
     /// [`Referrer::context_generics()`](crate::Referrer::context_generics()). A failed call
-    /// takes no id.
+    /// takes no id. The Referrer does not tell which of its contexts are top-level (and it is not
+    /// serialized), so pass the id along with it to the Referrer's crate if the generics of the
+    /// call are needed there, e.g. to encode the arguments of the trait (see
+    /// [`Referrer::context_generics()`](crate::Referrer::context_generics())).
     ///
     /// `Self` is the implementor of the visited trait, or the visited struct, enum, union or the
     /// self type of the visited impl (see [`SelfRequirement`](crate::SelfRequirement)). Outside
@@ -372,21 +409,24 @@ impl Leaker {
         }
         let contexts = self.contexts.len();
         let mut analysis = Analysis::default();
-        analysis.apply(&mut self.contexts, effects, None);
+        analysis.apply(&mut self.contexts, &effects, None);
         if !analysis.errors.is_empty() {
             self.contexts.truncate(contexts);
-            return Err(if self.allow_external_crates {
-                NotInternableError::RelativePath(analysis.errors)
-            } else {
-                NotInternableError::NotPortable(analysis.errors)
-            });
+            return Err(NotInternableError::RelativePath(analysis.errors));
         }
+        // The optional entries do not fail the call (a type which cannot be leaked is copied as
+        // it is), and have contexts of their own.
+        analysis.apply_optional(&mut self.optional_contexts, &effects, None);
         for ident in &analysis.primitives {
             self.assume_primitive(ident);
         }
         self.calls += 1;
         if !analysis.types.is_empty() {
             self.types.merge(analysis.types);
+            self.reachable_types = None;
+        }
+        if !analysis.optional.is_empty() {
+            self.optional_types.merge(analysis.optional);
             self.reachable_types = None;
         }
         // The generics of the call, in the same context as an entry which requires exactly them.
@@ -396,21 +436,28 @@ impl Leaker {
     }
 
     /// Checks whether the given `ty` must be interned, and whether it can be. See [`CheckResult`].
+    ///
+    /// The absolute path of an external crate (`::foo::X`) is not a cause: it need not be
+    /// interned, as the Referrer may leave it as written (it is an optional entry, see
+    /// [`Leaker::allowed_paths`]). So `::foo::W<Rel>` has `Rel` as its only cause.
     pub fn check(&self, ty: &Type, generics: &Generics) -> CheckResult {
         AnalyzeVisitor::check(self, ty, generics)
     }
 
     /// Finish building the [`Leaker`] and convert it into [`Referrer`].
     ///
-    /// The types are reduced by [`Leaker::reduce_roots()`] (called here if needed), and sorted by
-    /// their context (the contexts are numbered in the order of their first appearance) and tokens, so the result (including the index of each type) is
-    /// deterministic. The [`ContextId`]s are those returned by [`Leaker::intern_with()`], not
-    /// renumbered: the Referrer has the top-level contexts of the calls and the contexts of the
-    /// types kept, and no other.
+    /// The types are reduced by [`Leaker::reduce_roots()`] (called here if needed). The required
+    /// entries come first, sorted by their context (the contexts are numbered in the order of
+    /// their first appearance) and tokens, and then the optional ones (see
+    /// [`Referrer::must()`](crate::Referrer::must())), sorted in the same way, so the result
+    /// (including the index of each type) is deterministic, and the indices of the required
+    /// entries do not depend on the optional ones. The [`ContextId`]s are those returned by
+    /// [`Leaker::intern_with()`], not renumbered: the Referrer has the top-level contexts of the
+    /// calls and the contexts of the types kept, and no other (the contexts that only optional
+    /// entries use are numbered after those of the calls, in the order of the entries).
     pub fn finish(mut self) -> Referrer {
         self.reduce_roots();
-        let keys = self.reachable_types.take().unwrap_or_default();
-        let types = self.types;
+        let (required, optional) = self.reachable_types.take().unwrap_or_default();
         let contexts = self.contexts;
         let mut context_map: BTreeMap<ContextId, Context> = self
             .top_levels
@@ -418,12 +465,15 @@ impl Leaker {
             .map(|context| (*context, contexts.get(*context).clone()))
             .collect();
         let mut entries = Vec::new();
-        for key in keys {
+        for (key, must) in required
+            .into_iter()
+            .map(|key| (key, true))
+            .chain(optional.into_iter().map(|key| (key, false)))
+        {
             let context = key.context;
             let ctx = context_map
                 .entry(context)
                 .or_insert_with(|| contexts.get(context).clone());
-            let must = types.hard.contains(&key);
             let crates = external_crates(&key.ty.ty, ctx);
             entries.push((context, key.ty.ty, must, crates));
         }
@@ -473,12 +523,13 @@ impl Leaker {
     /// dyn ::path::Tr<Item = Rel>`. So is any type which cannot be
     /// copied around the types interned in place of its components, so they are not nodes of the
     /// graph (its causes are its own, see [`CheckResult::is_own`]): a path with a lifetime
-    /// argument or a reference with a lifetime of the generics, and a trait object without a
-    /// lifetime bound as an argument or the referent which has to be
+    /// argument or a reference with a lifetime of the generics or a local one, and a
+    /// trait object without a lifetime bound as an argument or the referent which has to be
     /// interned itself (`Ref<'a, dyn RelTrait>` or `&'a dyn RelTrait`, where the trait object
-    /// defaults to `'a` but would be `'static` interned alone; such a trait object is never
-    /// interned alone, but what is inside it is, e.g. `Rel` of `Ref<'a, dyn ::path::Tr<Item =
-    /// Rel>>`), a
+    /// defaults to `'a` (to the lifetime bound of the trait if it has one, `trait RelTrait:
+    /// 'static`, which the Leaker cannot see) but would be `'static` interned alone; such a trait
+    /// object is never interned alone, but what is inside it is, e.g. `Rel` of `Ref<'a, dyn
+    /// ::path::Tr<Item = Rel>>`), a
     /// path with a bare identifier written as an argument (`Wrap<SIZE>`, where syn parses a const
     /// as a type, so it may be one, and it cannot be interned alone) and a type with a type in an
     /// expression (`[u8; size_of::<Big>()]`, where the copy would have a projection in an
@@ -509,190 +560,244 @@ impl Leaker {
     /// connected components of the graph (an item has many independent fields), each solved on
     /// its own with the same result.
     ///
+    /// # Optional entries
+    ///
+    /// The types with an absolute path naming an external crate (see [`Leaker::allowed_paths`]) are
+    /// not **red** nodes of this graph, as they do not depend on the type context, and they do
+    /// not affect which types are required: the required entries are exactly those of a Leaker
+    /// which does not see them. They are the **red** nodes of a graph of their own, in which a
+    /// second minimum cut is taken, with the required entries already cut: an optional entry
+    /// inside a required one is not an entry, and the entries are no more than the types the
+    /// Referrer may replace need (see [`Referrer::must()`](crate::Referrer::must())). A type
+    /// which is both (e.g. `::foo::W<Rel, Rel2>`, which one cut chooses to cover `Rel` and
+    /// `Rel2` at once) is required. The contexts that only optional entries use are numbered
+    /// (after the others) when this is called, or by [`Leaker::finish()`].
+    ///
     /// The final result looks like:
     ///
     /// ![after_graph](https://raw.githubusercontent.com/yasuo-ozu/type-leak/main/resources/after_graph.svg)
     pub fn reduce_roots(&mut self) {
         if self.reachable_types.is_none() {
-            self.reachable_types = Some(self.build_graph_and_reduce());
-        }
-    }
-
-    /// Returns the types to be interned, sorted by their context and tokens.
-    ///
-    /// This is a minimum vertex cut between the roots and the **red** nodes (see
-    /// [`Leaker::reduce_roots()`]), found by a maximum flow.
-    fn build_graph_and_reduce(&self) -> Vec<NodeKey> {
-        let types = &self.types;
-        let mut keys: Vec<&NodeKey> = types.keys().collect();
-        keys.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
-        let index: HashMap<&NodeKey, usize> =
-            keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
-        let n = keys.len();
-        let children: Vec<Vec<usize>> = keys
-            .iter()
-            .map(|key| types.children(key).iter().map(|c| index[c]).collect())
-            .collect();
-        let red: Vec<bool> = keys
-            .iter()
-            .map(|k| types.must_intern.contains(*k))
-            .collect();
-        let root: Vec<bool> = keys.iter().map(|k| types.roots.contains(*k)).collect();
-        // The types which are red or contain a red type.
-        let mut has_red = red.clone();
-        let mut parents: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for (i, children) in children.iter().enumerate() {
-            for &child in children {
-                parents[child].push(i);
-            }
-        }
-        let mut stack: Vec<usize> = (0..n).filter(|&i| red[i]).collect();
-        while let Some(i) = stack.pop() {
-            for &parent in &parents[i] {
-                if !has_red[parent] {
-                    has_red[parent] = true;
-                    stack.push(parent);
-                }
-            }
-        }
-
-        // A red root is in every minimum cut, as the only node of the path `source -> v_in ->
-        // v_out -> sink`, so it is in the one closest to the sink as well. It is cut without a
-        // flow, and removed from the network (the paths through it are cut).
-        let mut kept: Vec<NodeKey> = (0..n)
-            .filter(|&i| red[i] && root[i])
-            .map(|i| keys[i].clone())
-            .collect();
-
-        // The edges of the network between the other types (a type which has red components goes
-        // to the sink if it is red, or if its components cannot stand for it), without those that
-        // cannot be on a path from a root to the sink.
-        let mut next: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut to_sink = vec![false; n];
-        for i in 0..n {
-            if !has_red[i] || (red[i] && root[i]) {
-                continue;
-            }
-            to_sink[i] = red[i];
-            let whole = self.needs_parent(keys[i]);
-            for &child in &children[i] {
-                if !has_red[child] {
-                    continue;
-                }
-                if whole {
-                    // The child cannot stand for the parent, which is to be interned as a whole
-                    // like a red type, and not through the child.
-                    to_sink[i] = true;
-                } else if !(red[child] && root[child]) {
-                    next[i].push(child);
-                }
-            }
-        }
-        let mut reached = vec![false; n];
-        let mut stack: Vec<usize> = (0..n)
-            .filter(|&i| root[i] && has_red[i] && !red[i])
-            .collect();
-        for &i in &stack {
-            reached[i] = true;
-        }
-        while let Some(i) = stack.pop() {
-            for &child in &next[i] {
-                if !reached[child] {
-                    reached[child] = true;
-                    stack.push(child);
-                }
-            }
-        }
-
-        // The flows of weakly connected components are independent (they share only the source
-        // and the sink), and so are their minimum cuts closest to the sink, so each component is
-        // solved on its own: the maximum flow takes a search of the whole network per unit of
-        // flow, so it is quadratic in the size of the network.
-        let mut component: Vec<usize> = (0..n).collect();
-        for i in (0..n).filter(|&i| reached[i]) {
-            for &child in &next[i] {
-                let (a, b) = (find(&mut component, i), find(&mut component, child));
-                component[a.max(b)] = a.min(b);
-            }
-        }
-        let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for i in (0..n).filter(|&i| reached[i]) {
-            members.entry(find(&mut component, i)).or_default().push(i);
-        }
-        let mut local = vec![0u32; n];
-        for members in members.values() {
-            for (l, &i) in members.iter().enumerate() {
-                local[i] = l as u32;
-            }
-            // The nodes of the network: `v_in` is `2 * v`, `v_out` is `2 * v + 1`.
-            let m = members.len() as u32;
-            let (source, sink) = (2 * m, 2 * m + 1);
-            // Larger than the sum of all the capacities of the nodes, so it is never the bottleneck.
-            let infinite = m + 1;
-            let mut edges: Vec<(u32, u32, u32)> = Vec::new();
-            for &i in members {
-                let l = local[i];
-                edges.push((2 * l, 2 * l + 1, 1));
-                for &child in &next[i] {
-                    edges.push((2 * l + 1, 2 * local[child], infinite));
-                }
-                if root[i] {
-                    edges.push((source, 2 * l, infinite));
-                }
-                if to_sink[i] {
-                    edges.push((2 * l + 1, sink, infinite));
-                }
-            }
-            let reaches_sink = sink_side(2 * m + 2, &edges, source, sink);
-            // The cut is the nodes whose edge `v_in -> v_out` goes from the side which cannot
-            // reach the sink to the side which can. The set of the nodes which can reach the sink
-            // in the residual network is the smallest sink side of all the minimum cuts, so this
-            // cut is the minimum cut closest to the sink, i.e. the one made of the innermost types
-            // (a component is preferred to the type containing it when either of them cuts the
-            // same paths).
-            kept.extend(
-                members
-                    .iter()
-                    .filter(|&&i| {
-                        let l = local[i] as usize;
-                        reaches_sink[2 * l + 1] && !reaches_sink[2 * l]
+            let required = reduce(&self.types, &HashSet::new());
+            // The required entries are cut for free in the graph of the optional ones, which has
+            // contexts of its own.
+            let blocked: HashSet<NodeKey> = required
+                .iter()
+                .filter_map(|key| {
+                    let context = self
+                        .optional_contexts
+                        .find(self.contexts.get(key.context))?;
+                    Some(NodeKey {
+                        context,
+                        ty: key.ty.clone(),
                     })
-                    .map(|&i| keys[i].clone()),
-            );
+                })
+                .collect();
+            let mut optional: Vec<NodeKey> = reduce(&self.optional_types, &blocked)
+                .into_iter()
+                .map(|key| NodeKey {
+                    context: self
+                        .contexts
+                        .intern(self.optional_contexts.get(key.context).clone()),
+                    ty: key.ty,
+                })
+                .collect();
+            optional.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
+            self.reachable_types = Some((required, optional));
         }
-
-        // Sort for deterministic output.
-        kept.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
-        kept
     }
 }
 
-impl Leaker {
-    /// Returns `true` if `child` is not interned instead of `parent`, because the copy of
-    /// `parent` is well-formed only with a bound which the copy of `child` may not have: a
-    /// reference with a lifetime requires its referent to outlive it (e.g. `Rel<T>: 'a` for
-    /// `&'a Rel<T>`, or `Rel: 'static`), which holds for the type itself but cannot be proved of
-    /// the type which is interned in its place. The context of the referent carries the bound of a
-    /// generic lifetime now (it has the lifetimes around it, see `Enclosing`), so this is no longer
-    /// needed for those: it is kept, so that a reference stays one entry as it did, and it is
-    /// needed for `'static`, which no context carries.
-    ///
-    /// A trait object (also inside parentheses and groups) is not affected: the copy keeps it in
-    /// the reference, so it keeps the bound it defaults to (`'a` for `&'a dyn Trait`), and its
-    /// arguments, which must outlive the lifetime as well (`dyn Tr<X> + 'b: 'a` requires `X: 'a`),
-    /// are the components, whose contexts carry the bound. If the trait object has to be interned
-    /// itself, it cannot be alone, as its default would be `'static`: the analysis makes the
-    /// reference the type to intern then, so it has no components (see `Inherits::Reference`).
-    /// With `'static`, the default is the same alone.
-    fn needs_parent(&self, parent: &NodeKey) -> bool {
-        match unwrap_type_group(&parent.ty.ty) {
-            Type::Reference(TypeReference {
-                lifetime: Some(_),
-                elem,
-                ..
-            }) => !matches!(unwrap_type_group(elem), Type::TraitObject(_)),
-            _ => false,
+/// Returns the types to be interned in the graph `types`, sorted by their context and tokens, with
+/// the types in `blocked` (and the paths through them) left out.
+///
+/// This is a minimum vertex cut between the roots and the **red** nodes (see
+/// [`Leaker::reduce_roots()`]), found by a maximum flow.
+fn reduce(types: &TypeGraph, blocked: &HashSet<NodeKey>) -> Vec<NodeKey> {
+    let mut keys: Vec<&NodeKey> = types.keys().collect();
+    keys.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
+    let index: HashMap<&NodeKey, usize> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+    let n = keys.len();
+    // A blocked type is not in the network: it has no component, is no component and is neither
+    // a root nor red.
+    let is_blocked: Vec<bool> = keys.iter().map(|k| blocked.contains(*k)).collect();
+    let children: Vec<Vec<usize>> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            if is_blocked[i] {
+                return Vec::new();
+            }
+            types
+                .children(key)
+                .iter()
+                .map(|c| index[c])
+                .filter(|&c| !is_blocked[c])
+                .collect()
+        })
+        .collect();
+    let red: Vec<bool> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| !is_blocked[i] && types.must_intern.contains(*k))
+        .collect();
+    let root: Vec<bool> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| !is_blocked[i] && types.roots.contains(*k))
+        .collect();
+    // The types which are red or contain a red type.
+    let mut has_red = red.clone();
+    let mut parents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, children) in children.iter().enumerate() {
+        for &child in children {
+            parents[child].push(i);
         }
+    }
+    let mut stack: Vec<usize> = (0..n).filter(|&i| red[i]).collect();
+    while let Some(i) = stack.pop() {
+        for &parent in &parents[i] {
+            if !has_red[parent] {
+                has_red[parent] = true;
+                stack.push(parent);
+            }
+        }
+    }
+
+    // A red root is in every minimum cut, as the only node of the path `source -> v_in ->
+    // v_out -> sink`, so it is in the one closest to the sink as well. It is cut without a
+    // flow, and removed from the network (the paths through it are cut).
+    let mut kept: Vec<NodeKey> = (0..n)
+        .filter(|&i| red[i] && root[i])
+        .map(|i| keys[i].clone())
+        .collect();
+
+    // The edges of the network between the other types (a type which has red components goes
+    // to the sink if it is red, or if its components cannot stand for it), without those that
+    // cannot be on a path from a root to the sink.
+    let mut next: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut to_sink = vec![false; n];
+    for i in 0..n {
+        if !has_red[i] || (red[i] && root[i]) {
+            continue;
+        }
+        to_sink[i] = red[i];
+        let whole = needs_parent(keys[i]);
+        for &child in &children[i] {
+            if !has_red[child] {
+                continue;
+            }
+            if whole {
+                // The child cannot stand for the parent, which is to be interned as a whole
+                // like a red type, and not through the child.
+                to_sink[i] = true;
+            } else if !(red[child] && root[child]) {
+                next[i].push(child);
+            }
+        }
+    }
+    let mut reached = vec![false; n];
+    let mut stack: Vec<usize> = (0..n)
+        .filter(|&i| root[i] && has_red[i] && !red[i])
+        .collect();
+    for &i in &stack {
+        reached[i] = true;
+    }
+    while let Some(i) = stack.pop() {
+        for &child in &next[i] {
+            if !reached[child] {
+                reached[child] = true;
+                stack.push(child);
+            }
+        }
+    }
+
+    // The flows of weakly connected components are independent (they share only the source
+    // and the sink), and so are their minimum cuts closest to the sink, so each component is
+    // solved on its own: the maximum flow takes a search of the whole network per unit of
+    // flow, so it is quadratic in the size of the network.
+    let mut component: Vec<usize> = (0..n).collect();
+    for i in (0..n).filter(|&i| reached[i]) {
+        for &child in &next[i] {
+            let (a, b) = (find(&mut component, i), find(&mut component, child));
+            component[a.max(b)] = a.min(b);
+        }
+    }
+    let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for i in (0..n).filter(|&i| reached[i]) {
+        members.entry(find(&mut component, i)).or_default().push(i);
+    }
+    let mut local = vec![0u32; n];
+    for members in members.values() {
+        for (l, &i) in members.iter().enumerate() {
+            local[i] = l as u32;
+        }
+        // The nodes of the network: `v_in` is `2 * v`, `v_out` is `2 * v + 1`.
+        let m = members.len() as u32;
+        let (source, sink) = (2 * m, 2 * m + 1);
+        // Larger than the sum of all the capacities of the nodes, so it is never the bottleneck.
+        let infinite = m + 1;
+        let mut edges: Vec<(u32, u32, u32)> = Vec::new();
+        for &i in members {
+            let l = local[i];
+            edges.push((2 * l, 2 * l + 1, 1));
+            for &child in &next[i] {
+                edges.push((2 * l + 1, 2 * local[child], infinite));
+            }
+            if root[i] {
+                edges.push((source, 2 * l, infinite));
+            }
+            if to_sink[i] {
+                edges.push((2 * l + 1, sink, infinite));
+            }
+        }
+        let reaches_sink = sink_side(2 * m + 2, &edges, source, sink);
+        // The cut is the nodes whose edge `v_in -> v_out` goes from the side which cannot
+        // reach the sink to the side which can. The set of the nodes which can reach the sink
+        // in the residual network is the smallest sink side of all the minimum cuts, so this
+        // cut is the minimum cut closest to the sink, i.e. the one made of the innermost types
+        // (a component is preferred to the type containing it when either of them cuts the
+        // same paths).
+        kept.extend(
+            members
+                .iter()
+                .filter(|&&i| {
+                    let l = local[i] as usize;
+                    reaches_sink[2 * l + 1] && !reaches_sink[2 * l]
+                })
+                .map(|&i| keys[i].clone()),
+        );
+    }
+
+    // Sort for deterministic output.
+    kept.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
+    kept
+}
+
+/// Returns `true` if `child` is not interned instead of `parent`, because the copy of
+/// `parent` is well-formed only with a bound which the copy of `child` may not have: a
+/// reference with a lifetime requires its referent to outlive it (e.g. `Rel<T>: 'a` for
+/// `&'a Rel<T>`, or `Rel: 'static`), which holds for the type itself but cannot be proved of
+/// the type which is interned in its place. The context of the referent carries the bound of a
+/// generic lifetime now (it has the lifetimes around it, see `Enclosing`), so this is no longer
+/// needed for those: it is kept, so that a reference stays one entry as it did, and it is
+/// needed for `'static`, which no context carries.
+///
+/// A trait object (also inside parentheses and groups) is not affected: the copy keeps it in
+/// the reference, so it keeps the bound it defaults to (`'a` for `&'a dyn Trait`), and its
+/// arguments, which must outlive the lifetime as well (`dyn Tr<X> + 'b: 'a` requires `X: 'a`),
+/// are the components, whose contexts carry the bound. If the trait object has to be interned
+/// itself, it cannot be alone, as its default would be `'static`: the analysis makes the
+/// reference the type to intern then, so it has no components (see `Inherits::Reference`).
+/// With `'static`, the default is the same alone.
+fn needs_parent(parent: &NodeKey) -> bool {
+    match unwrap_type_group(&parent.ty.ty) {
+        Type::Reference(TypeReference {
+            lifetime: Some(_),
+            elem,
+            ..
+        }) => !matches!(unwrap_type_group(elem), Type::TraitObject(_)),
+        _ => false,
     }
 }
 
