@@ -110,10 +110,11 @@ fn a_reference_requires_its_referent_to_outlive_it() {
         leaked(parse_quote! { trait Tr<'a> { fn f(&self, x: &'a Rel); } }),
         [e("& 'a Rel", "< 'a >")]
     );
-    // A component of a reference with a local lifetime is leaked alone: nothing bounds it.
+    // A component of a reference with a local lifetime is leaked alone, with the bound which the
+    // reference implies on it (see `tests/outlives_ancestors.rs`).
     assert_eq!(
         leaked(parse_quote! { trait Tr { fn f<'a, T>(&self, x: &'a Vec<T>); } }),
-        [e("Vec < T >", "< T >")]
+        [e("Vec < T >", "< 'a , T : 'a >")]
     );
 }
 
@@ -148,11 +149,13 @@ fn lifetimes_in_the_arguments_are_bounded_too() {
 }
 
 #[test]
-fn a_trait_object_needs_only_its_lifetime_bound() {
-    // `dyn Tr<T> + 'b` outlives `'a` if `'b` does, whatever `T` is.
+fn a_trait_object_requires_its_arguments_to_outlive_too() {
+    // `dyn Tr<T> + 'b` outlives `'a` only if `'b` and `T` do (rustc checks each argument, also
+    // with the lifetime bound `'static`, whatever `T: 'b` says: `struct S<'a, T>(Ref<'a, dyn
+    // Iterator<Item = Rel2<T>>>)` has `T: 'a` inferred, which the copy of the field needs too).
     assert_eq!(
         leaked(parse_quote! { trait Tr<'a, T> { fn f(&self, x: Rel<'a, dyn ::p::Tr<T>>); } }),
-        [e("Rel < 'a , dyn :: p :: Tr < T > >", "< 'a , T >")]
+        [e("Rel < 'a , dyn :: p :: Tr < T > >", "< 'a , T : 'a >")]
     );
     assert_eq!(
         leaked(parse_quote! {
@@ -160,7 +163,7 @@ fn a_trait_object_needs_only_its_lifetime_bound() {
         }),
         [e(
             "Rel < 'a , dyn :: p :: Tr < T > + 'b >",
-            "< 'a , 'b : 'a , T >"
+            "< 'a , 'b : 'a , T : 'a >"
         )]
     );
     // Also for a reference.
@@ -168,7 +171,7 @@ fn a_trait_object_needs_only_its_lifetime_bound() {
         leaked(parse_quote! {
             trait Tr<'a, T> { fn f(&self, x: &'a (dyn RelTr<T> + 'a)); }
         }),
-        [e("& 'a (dyn RelTr < T > + 'a)", "< 'a , T >")]
+        [e("& 'a (dyn RelTr < T > + 'a)", "< 'a , T : 'a >")]
     );
     // A trait with a lifetime argument in a bound is not a path to assume a bound for.
     assert_eq!(
@@ -197,8 +200,8 @@ fn binder_lifetimes_are_not_generics() {
             "< 'a , T : 'a >"
         )]
     );
-    // Nor in a `dyn for<'x> Tr<'x, ..>`, which the path does not look into (so `T` is not
-    // bounded by `'a`), and in which a path with the lifetime is not assumed to bound by it.
+    // Nor in a `dyn for<'x> Tr<'x, ..>`, whose arguments are looked into like any other (so `T`
+    // is bounded by `'a`), and in which a path with the lifetime is not assumed to bound by it.
     assert_eq!(
         leaked(parse_quote! {
             trait Tr<'a, T> {
@@ -207,7 +210,7 @@ fn binder_lifetimes_are_not_generics() {
         }),
         [e(
             "Rel < 'a , Box < dyn for < 'x > :: p :: Tr < 'x , Rel < 'x , T > > > >",
-            "< 'a , T >"
+            "< 'a , T : 'a >"
         )]
     );
 }

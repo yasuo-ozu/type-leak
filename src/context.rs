@@ -175,6 +175,11 @@ fn strip_default(mut param: GenericParam) -> GenericParam {
 pub(crate) struct Context {
     generics: Generics,
     self_ty: Option<SelfRequirement>,
+    /// The lifetimes `'a` (parameters of `generics`) such that the types of the context imply
+    /// `Self: 'a`, e.g. by `Rel<'a, Self>` or `&'a Self::Item` (see [`implied_outlives()`]), sorted
+    /// and without duplicates. Empty if `self_ty` is `None`, as `Self` has no meaning then. They
+    /// are not among the bounds of `generics`, which `Self` is not a parameter of.
+    self_outlives: Vec<Lifetime>,
     /// The path of the module where the type is written, relative to the analyzed module (empty
     /// for the analyzed module itself). `None` for a type which does not depend on its module, or
     /// if no module is analyzed.
@@ -187,8 +192,29 @@ impl Context {
         Self {
             generics: canonicalize(generics),
             self_ty,
+            self_outlives: Vec::new(),
             module: None,
         }
+    }
+
+    /// Returns the context with `Self: 'a` for each of `lifetimes` (see [`Context`]), if `Self` has
+    /// a meaning in it.
+    pub(crate) fn with_self_outlives(mut self, lifetimes: Vec<Lifetime>) -> Self {
+        let mut lifetimes: Vec<(String, Lifetime)> = lifetimes
+            .into_iter()
+            .map(|lifetime| (lifetime.to_string(), lifetime))
+            .collect();
+        lifetimes.sort_by(|a, b| a.0.cmp(&b.0));
+        lifetimes.dedup_by(|a, b| a.0 == b.0);
+        self.self_outlives = if self.self_ty.is_some() {
+            lifetimes
+                .into_iter()
+                .map(|(_, lifetime)| lifetime)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self
     }
 
     /// Returns the context with the module `module` (see [`Context`]).
@@ -204,6 +230,10 @@ impl Context {
         let mut rendered = quote!(#generics #where_clause).to_string();
         if let Some(self_ty) = &self.self_ty {
             rendered.push_str(&self_ty.render());
+        }
+        for (i, lifetime) in self.self_outlives.iter().enumerate() {
+            rendered.push_str(if i == 0 { " Self: " } else { " + " });
+            rendered.push_str(&lifetime.to_string());
         }
         if let Some(module) = &self.module {
             rendered.push_str(" mod ");
@@ -240,17 +270,25 @@ impl Context {
     /// something else (e.g. `::path::N`). This is harmless, because the Leaker and the Referrer
     /// include the same generics.
     ///
-    /// `assumed` are the lifetimes which no scope declares, but which are known to be generics of
+    /// `assumed` are the generics which no scope declares, but which are known to be generics of
     /// the Leaker, as the Referrer assumes the generics it does not see declared (see
     /// [`Referrer::into_visitor()`](crate::Referrer::into_visitor())): the outlives bounds
     /// implied by the type on the declared generics (e.g. `T: 'a` of `Rel<'a, T>` where only `T`
     /// is declared) are those of the Leaker's. The Leaker passes none: a lifetime which no scope
     /// declares is a relative one, not a generic.
+    ///
+    /// `enclosing` are the lifetimes which the types around `ty` make it outlive (see
+    /// [`Enclosing`]): `ty: 'a` implies the same bounds as the types inside `ty` do (see
+    /// [`implied_outlives()`]), for each generic lifetime `'a` of them, so a type leaked alone
+    /// (e.g. `Rel2<T>` of `::core::cell::Ref<'a, Rel2<T>>`) has the bounds which the type it is a
+    /// component of implies on it. `'a` is among the generics of the context then, even if the type
+    /// does not mention it.
     pub(crate) fn of(
         ty: &Type,
         scopes: &[Scope],
         self_req: Option<&SelfRequirement>,
-        assumed: &[Lifetime],
+        assumed: &Assumed,
+        enclosing: &Enclosing,
     ) -> Self {
         let mut names = HashSet::new();
         token_names(quote!(#ty), &mut names);
@@ -266,6 +304,35 @@ impl Context {
         let mut work: Vec<(usize, String)> = names
             .into_iter()
             .filter_map(|name| Some((scopes.len().checked_sub(1)?, name)))
+            .collect();
+        // The lifetimes around the type which it is bounded by (see `Enclosing`). One which a scope
+        // declares is a generic of the context (with its own bounds, as any other) if the type
+        // mentions a generic to bound by it: it is not named by the type otherwise.
+        let ancestors = enclosing.generic(scopes, assumed);
+        let mentions = Mentions::of(ty, scopes, assumed, !ancestors.is_empty());
+        for (lifetime, depth) in &ancestors {
+            // A type parameter, which a lifetime bounds (a const parameter is not bounded).
+            let is_type_param = |name: &String| {
+                scopes.iter().any(|scope| {
+                    scope.params().any(|param| {
+                        matches!(param, GenericParam::Type(param) if &ident_name(&param.ident) == name)
+                    })
+                })
+            };
+            let bounds_something = (self_req.is_some()
+                && mentions.types.iter().any(|name| name == "Self"))
+                || mentions
+                    .types
+                    .iter()
+                    .any(|name| is_type_param(name) || assumed.types.contains(name))
+                || mentions.lifetimes.iter().any(|other| other != lifetime);
+            if let (true, Some(from)) = (bounds_something, depth.checked_sub(1)) {
+                work.push((from, lifetime.to_string()));
+            }
+        }
+        let ancestors: Vec<Lifetime> = ancestors
+            .into_iter()
+            .map(|(lifetime, _)| lifetime)
             .collect();
         let mut params = BTreeMap::new();
         let mut predicates = BTreeMap::new();
@@ -342,7 +409,14 @@ impl Context {
         }
         let mut params: Vec<GenericParam> = params.into_values().collect();
         let predicates: Vec<WherePredicate> = predicates.into_values().collect();
-        for (bounded, lifetime) in implied_outlives(ty, scopes, assumed, &params) {
+        let mut self_outlives = Vec::new();
+        for (bounded, lifetime) in
+            implied_outlives(ty, scopes, assumed, &params, self_req.is_some(), &ancestors)
+        {
+            if bounded == Bounded::SelfTy {
+                self_outlives.push(lifetime);
+                continue;
+            }
             for param in params.iter_mut() {
                 match (param, &bounded) {
                     (GenericParam::Type(param), Bounded::Type(name))
@@ -372,6 +446,7 @@ impl Context {
             });
         }
         Self::new(generics, self_req.filter(|_| mentions_self).cloned())
+            .with_self_outlives(self_outlives)
     }
 
     /// Returns the context of a type which depends on no generics and not on `Self`.
@@ -393,6 +468,10 @@ impl Context {
 
     pub(crate) fn self_ty(&self) -> Option<&SelfRequirement> {
         self.self_ty.as_ref()
+    }
+
+    pub(crate) fn self_outlives(&self) -> &[Lifetime] {
+        &self.self_outlives
     }
 
     pub(crate) fn module(&self) -> Option<&[Ident]> {
@@ -550,6 +629,104 @@ fn sort_bounds<T: template_quote::ToTokens, P: Default>(
     bounds.into_iter().map(|(_, bound)| bound).collect()
 }
 
+/// The generics of the Leaker which no scope declares, but which are known to be generics: the
+/// Referrer assumes the generics it does not see declared to be those of the Leaker (see
+/// [`Context::of()`]).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Assumed {
+    /// The lifetime parameters.
+    pub(crate) lifetimes: Vec<Lifetime>,
+    /// The names of the type parameters.
+    pub(crate) types: Vec<String>,
+}
+
+/// The lifetimes which a type must outlive because of the types around it (it is a component of
+/// them, in the sense of [`Enclosing::components_of()`]), each with the number of scopes in scope
+/// where it is written, which tells the parameter it names (see [`is_generic_lifetime()`]). The
+/// type `X` of `&'a X` is one, and so is `Rel2<T>` of `Ref<'a, Vec<Rel2<T>>>`: `Ref<'a, Vec<X>>` is
+/// well-formed only if `X: 'a`, which neither the implementation of the Repeater nor the copy of
+/// a field (rustc infers the bound of the original, but not through a projection) has unless the
+/// context of `X` carries it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Enclosing(Vec<(Lifetime, usize)>);
+
+impl Enclosing {
+    /// Returns what the types which are components of `ty` must outlive, when `self` is what `ty`
+    /// itself must (`depth` is the number of scopes in scope where `ty` is written). The
+    /// requirement `ty: 'a` is that of its components, as rustc derives it (see
+    /// [`implied_outlives()`] for what it makes of them):
+    ///
+    /// - `&'a X` (also `&'a mut X`) requires `X: 'a`, so `X` must outlive `'a` too, and so do the
+    ///   type arguments of a path with a lifetime argument `R<'a, X>` (assumed, as the definition
+    ///   of `R` cannot be seen).
+    /// - Everything else which is made of types passes what `ty` must outlive on to them: the
+    ///   elements of a tuple, an array or a slice, the type in parentheses or a group or behind a
+    ///   raw pointer, the type arguments of a path (also one without a lifetime argument, like
+    ///   `Vec<X>`), the inputs and the output of a function pointer, and the type arguments and
+    ///   the associated type bindings of a trait object (`dyn Tr<X> + 'b: 'a` requires `X: 'a`
+    ///   as well as `'b: 'a`, whatever the bound `X: 'b` says).
+    /// - A projection with a qualified self (`<X as Tr<Y>>::A`) does not: it outlives `'a` if its
+    ///   components do (but also by a bound written for it), so `X: 'a` is not required, and an
+    ///   `impl Trait` is not made of types in this sense. Neither is the length of an array.
+    ///   `T::A<X>` cannot be told from the path of a type, as the Referrer may not see `T`
+    ///   declared, so it is treated as one (the Leaker and the Referrer must agree).
+    ///
+    /// A `for<..>` binder does not change them (`&'a for<'x> fn(&'x X)` requires `X: 'a`), but its
+    /// own lifetimes are not generics, so they are never recorded (see
+    /// [`is_generic_lifetime()`]).
+    pub(crate) fn components_of(&self, ty: &Type, depth: usize) -> Self {
+        let mut next = self.clone();
+        match ty {
+            Type::Reference(TypeReference {
+                lifetime: Some(lifetime),
+                ..
+            }) => next.push(lifetime, depth),
+            Type::Path(TypePath { qself: None, path }) => {
+                for seg in &path.segments {
+                    if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                        for arg in &args.args {
+                            if let GenericArgument::Lifetime(lifetime) = arg {
+                                next.push(lifetime, depth);
+                            }
+                        }
+                    }
+                }
+            }
+            Type::Path(_) | Type::ImplTrait(_) => return Self::default(),
+            _ => (),
+        }
+        next
+    }
+
+    fn push(&mut self, lifetime: &Lifetime, depth: usize) {
+        let entry = (lifetime.clone(), depth);
+        if lifetime.ident != "static" && lifetime.ident != "_" && !self.0.contains(&entry) {
+            self.0.push(entry);
+        }
+    }
+
+    /// Returns the lifetimes which are generic (see [`is_generic_lifetime()`]), each with the
+    /// number of scopes it was written in, in the order they enclose the type, from the outermost.
+    pub(crate) fn generic(&self, scopes: &[Scope], assumed: &Assumed) -> Vec<(Lifetime, usize)> {
+        let mut generic: Vec<(Lifetime, usize)> = Vec::new();
+        for (lifetime, depth) in &self.0 {
+            // What the lifetime names is what the scopes declared where it is written say.
+            let visible = &scopes[..(*depth).min(scopes.len())];
+            if is_generic_lifetime(visible, assumed, &[], lifetime)
+                && !generic.iter().any(|(other, _)| other == lifetime)
+            {
+                generic.push((lifetime.clone(), *depth));
+            }
+        }
+        generic
+    }
+
+    /// Returns the lifetimes.
+    pub(crate) fn lifetimes(&self) -> impl Iterator<Item = &Lifetime> {
+        self.0.iter().map(|(lifetime, _)| lifetime)
+    }
+}
+
 /// A generic which an outlives bound implied by a type is on (see [`implied_outlives()`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Bounded {
@@ -557,6 +734,9 @@ enum Bounded {
     Type(String),
     /// The lifetime parameter.
     Lifetime(Lifetime),
+    /// `Self`, which is not a parameter, but is encoded as if it was (see
+    /// [`Context::self_outlives`]).
+    SelfTy,
 }
 
 /// Returns `true` if `lifetime` is a lifetime parameter of the context of a type: not `'static`,
@@ -565,7 +745,7 @@ enum Bounded {
 /// declares is a generic only if it is one of `assumed` (see [`Context::of()`]).
 fn is_generic_lifetime(
     scopes: &[Scope],
-    assumed: &[Lifetime],
+    assumed: &Assumed,
     binders: &[Lifetime],
     lifetime: &Lifetime,
 ) -> bool {
@@ -576,7 +756,81 @@ fn is_generic_lifetime(
             .iter()
             .rev()
             .find(|scope| scope.declares(&lifetime.to_string()))
-            .map_or_else(|| assumed.contains(lifetime), |scope| !scope.binder)
+            .map_or_else(
+                || assumed.lifetimes.contains(lifetime),
+                |scope| !scope.binder,
+            )
+}
+
+/// The generics mentioned in a type, which `X: 'a` bounds by `'a` (see [`implied_outlives()`]).
+struct Mentions<'a> {
+    scopes: &'a [Scope],
+    assumed: &'a Assumed,
+    binders: Vec<Lifetime>,
+    /// The first segments of the paths (the names which may be type parameters, and `Self`).
+    types: Vec<String>,
+    /// The generic lifetimes.
+    lifetimes: Vec<Lifetime>,
+}
+
+impl<'a> Mentions<'a> {
+    /// The generics mentioned in `ty`, if `wanted` (it may be skipped otherwise).
+    fn of(ty: &Type, scopes: &'a [Scope], assumed: &'a Assumed, wanted: bool) -> Self {
+        let mut mentions = Self::new(scopes, assumed, Vec::new());
+        if wanted {
+            mentions.visit_type(ty);
+        }
+        mentions
+    }
+
+    fn new(scopes: &'a [Scope], assumed: &'a Assumed, binders: Vec<Lifetime>) -> Self {
+        Self {
+            scopes,
+            assumed,
+            binders,
+            types: Vec::new(),
+            lifetimes: Vec::new(),
+        }
+    }
+}
+
+impl<'a, 'ast> Visit<'ast> for Mentions<'a> {
+    fn visit_path(&mut self, i: &'ast Path) {
+        if i.leading_colon.is_none() {
+            self.types
+                .extend(i.segments.first().map(|seg| ident_name(&seg.ident)));
+        }
+        syn::visit::visit_path(self, i)
+    }
+    fn visit_lifetime(&mut self, i: &'ast Lifetime) {
+        if is_generic_lifetime(self.scopes, self.assumed, &self.binders, i) {
+            self.lifetimes.push(i.clone());
+        }
+    }
+    fn visit_type_impl_trait(&mut self, i: &'ast TypeImplTrait) {
+        // Not made of the types in its bounds (it cannot be leaked, see `Enclosing`): only its
+        // lifetime bounds count.
+        for bound in &i.bounds {
+            if let TypeParamBound::Lifetime(lifetime) = bound {
+                self.visit_lifetime(lifetime);
+            }
+        }
+    }
+    fn visit_type_bare_fn(&mut self, i: &'ast TypeBareFn) {
+        let outer = self.binders.len();
+        self.binders.extend(binder_lifetimes(i.lifetimes.as_ref()));
+        syn::visit::visit_type_bare_fn(self, i);
+        self.binders.truncate(outer);
+    }
+    fn visit_trait_bound(&mut self, i: &'ast TraitBound) {
+        let outer = self.binders.len();
+        self.binders.extend(binder_lifetimes(i.lifetimes.as_ref()));
+        syn::visit::visit_trait_bound(self, i);
+        self.binders.truncate(outer);
+    }
+    // The types in an expression are not components.
+    fn visit_expr(&mut self, _: &'ast Expr) {}
+    fn visit_macro(&mut self, _: &'ast Macro) {}
 }
 
 /// Returns the outlives bounds which `ty` implies on the generics in `params`, each with the
@@ -589,69 +843,30 @@ fn is_generic_lifetime(
 /// - A path with a lifetime argument `R<'a, .., X, ..>` is assumed to require `X: 'a` for each
 ///   type argument `X`, as it usually does (e.g. `struct R<'a, T>(&'a T)` makes `T: 'a` part of
 ///   its definition by RFC 2093), but we cannot see the definition of `R`.
+/// - `ancestors` (the generic lifetimes among the [`Enclosing`] ones) require `ty: 'a`, which is
+///   `X: 'a` for `ty` as `X` (a type leaked alone is a component of the type around it).
 ///
 /// `X: 'a` is `T: 'a` for each type parameter `T` mentioned in `X`, and `'b: 'a` for each
-/// lifetime parameter `'b` mentioned in `X` other than `'a`. A trait object is not looked into:
-/// `dyn Tr<T> + 'b` outlives `'a` if `'b` does, so only its lifetime bound counts. `'a` must be
-/// a lifetime parameter (see [`is_generic_lifetime()`]), and the lifetimes of a `for<..>` binder
-/// are not mentioned.
+/// lifetime parameter `'b` mentioned in `X` other than `'a`, and `Self: 'a` if `X` mentions `Self`
+/// (`Self`, `Self::Item`, `<Self as Tr>::Item`), when `has_self` (it has a meaning, so it is
+/// encoded: `Self::Item: 'a` follows from `Self: 'a`). Everything in `X` is looked into, as rustc
+/// does (a trait object `dyn Tr<T> + 'b` outlives `'a` if `'b` and its type arguments do), but
+/// the lifetimes of a `for<..>` binder are not mentioned, and `'a` must be a lifetime parameter
+/// (see [`is_generic_lifetime()`]).
 fn implied_outlives(
     ty: &Type,
     scopes: &[Scope],
-    assumed: &[Lifetime],
+    assumed: &Assumed,
     params: &[GenericParam],
+    has_self: bool,
+    ancestors: &[Lifetime],
 ) -> Vec<(Bounded, Lifetime)> {
-    /// The generics mentioned in a type.
-    struct Mentions<'a> {
-        scopes: &'a [Scope],
-        assumed: &'a [Lifetime],
-        binders: Vec<Lifetime>,
-        types: Vec<String>,
-        lifetimes: Vec<Lifetime>,
-    }
-    impl<'a, 'ast> Visit<'ast> for Mentions<'a> {
-        fn visit_path(&mut self, i: &'ast Path) {
-            if i.leading_colon.is_none() {
-                self.types
-                    .extend(i.segments.first().map(|seg| ident_name(&seg.ident)));
-            }
-            syn::visit::visit_path(self, i)
-        }
-        fn visit_lifetime(&mut self, i: &'ast Lifetime) {
-            if is_generic_lifetime(self.scopes, self.assumed, &self.binders, i) {
-                self.lifetimes.push(i.clone());
-            }
-        }
-        fn visit_type_trait_object(&mut self, i: &'ast TypeTraitObject) {
-            for bound in &i.bounds {
-                if let TypeParamBound::Lifetime(lifetime) = bound {
-                    self.visit_lifetime(lifetime);
-                }
-            }
-        }
-        fn visit_type_impl_trait(&mut self, i: &'ast TypeImplTrait) {
-            for bound in &i.bounds {
-                if let TypeParamBound::Lifetime(lifetime) = bound {
-                    self.visit_lifetime(lifetime);
-                }
-            }
-        }
-        fn visit_type_bare_fn(&mut self, i: &'ast TypeBareFn) {
-            let outer = self.binders.len();
-            self.binders.extend(binder_lifetimes(i.lifetimes.as_ref()));
-            syn::visit::visit_type_bare_fn(self, i);
-            self.binders.truncate(outer);
-        }
-        // The types in an expression are not components.
-        fn visit_expr(&mut self, _: &'ast Expr) {}
-        fn visit_macro(&mut self, _: &'ast Macro) {}
-    }
-
     /// The types containing a lifetime-carrying construct.
     struct Finder<'a> {
         scopes: &'a [Scope],
-        assumed: &'a [Lifetime],
+        assumed: &'a Assumed,
         params: &'a [GenericParam],
+        has_self: bool,
         binders: Vec<Lifetime>,
         found: Vec<(Bounded, Lifetime)>,
     }
@@ -661,14 +876,16 @@ fn implied_outlives(
             if !is_generic_lifetime(self.scopes, self.assumed, &self.binders, lifetime) {
                 return;
             }
-            let mut mentions = Mentions {
-                scopes: self.scopes,
-                assumed: self.assumed,
-                binders: self.binders.clone(),
-                types: Vec::new(),
-                lifetimes: Vec::new(),
-            };
+            self.require_generic(lifetime, referent)
+        }
+
+        /// Like [`Finder::require()`], for a lifetime which is known to be generic.
+        fn require_generic(&mut self, lifetime: &Lifetime, referent: &Type) {
+            let mut mentions = Mentions::new(self.scopes, self.assumed, self.binders.clone());
             mentions.visit_type(referent);
+            if self.has_self && mentions.types.iter().any(|name| name == "Self") {
+                self.found.push((Bounded::SelfTy, lifetime.clone()));
+            }
             for name in mentions.types {
                 let is_param = self.params.iter().any(|param| {
                     matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == name)
@@ -734,15 +951,74 @@ fn implied_outlives(
         scopes,
         assumed,
         params,
+        has_self,
         binders: Vec::new(),
         found: Vec::new(),
     };
     finder.visit_type(ty);
+    for lifetime in ancestors {
+        finder.require_generic(lifetime, ty);
+    }
     finder.found
 }
 
+/// Returns `true` if the bounds which `ty` implies (see [`implied_outlives()`], with the
+/// lifetimes of `enclosing`) on the generics of `entry` which `scopes` do not declare, are bounds
+/// of them in `entry`. The Referrer assumes those to be generics of the Leaker (see
+/// [`Context::of()`], whose generics are only the declared ones), so it cannot compare their
+/// declarations, but they must have at least the bounds the type implies where it is found: the
+/// entry of a type found alone (`Rel2<T>`) differs from that of the same type found under a
+/// reference (`&'a Rel2<T>`), where `T: 'a` as well.
+pub(crate) fn assumed_bounds_hold(
+    ty: &Type,
+    scopes: &[Scope],
+    assumed: &Assumed,
+    enclosing: &Enclosing,
+    entry: &Context,
+) -> bool {
+    let undeclared: Vec<GenericParam> = entry
+        .generics()
+        .params
+        .iter()
+        .filter(|param| {
+            let name = generic_param_name(param);
+            !scopes.iter().any(|scope| scope.declares(&name))
+        })
+        .cloned()
+        .collect();
+    if undeclared.is_empty() {
+        return true;
+    }
+    let ancestors: Vec<Lifetime> = enclosing
+        .generic(scopes, assumed)
+        .into_iter()
+        .map(|(lifetime, _)| lifetime)
+        .collect();
+    implied_outlives(ty, scopes, assumed, &undeclared, false, &ancestors)
+        .iter()
+        .all(|(bounded, lifetime)| {
+            undeclared.iter().any(|param| match (param, bounded) {
+                (GenericParam::Type(param), Bounded::Type(name))
+                    if &ident_name(&param.ident) == name =>
+                {
+                    param.bounds.iter().any(
+                        |bound| matches!(bound, TypeParamBound::Lifetime(other) if other == lifetime),
+                    )
+                }
+                (GenericParam::Lifetime(param), Bounded::Lifetime(name))
+                    if &param.lifetime == name =>
+                {
+                    param.bounds.iter().any(|other| other == lifetime)
+                }
+                _ => false,
+            })
+        })
+}
+
 /// Returns the lifetimes declared by a `for<..>` binder.
-fn binder_lifetimes(lifetimes: Option<&BoundLifetimes>) -> impl Iterator<Item = Lifetime> + '_ {
+pub(crate) fn binder_lifetimes(
+    lifetimes: Option<&BoundLifetimes>,
+) -> impl Iterator<Item = Lifetime> + '_ {
     lifetimes
         .into_iter()
         .flat_map(|lifetimes| lifetimes.lifetimes.iter())

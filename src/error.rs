@@ -21,11 +21,13 @@ use template_quote::ToTokens;
 #[non_exhaustive]
 pub enum NotInternableError {
     /// Paths which depend on the type context, but cannot be leaked (e.g. `MyType` in
-    /// `MyType<'_>`, a trait in a bound, or a value in a const expression), so they should be
-    /// absolute. Each conflict is reported at the first of its [`CheckResult::must`] (the
-    /// offending path), with [`CheckResult::is_own`] being `true`. For a trait bound, a value
-    /// or the type of a const parameter, [`CheckResult::impossible`] is the bound, the value or
-    /// the const parameter. Never empty.
+    /// `MyType<'_>`, a trait in a bound, a value in a const expression, or `Rel` in `F: for<'x>
+    /// Fn(Rel<'x>) -> &'x u8`, which cannot be leaked with a lifetime that the output of its
+    /// binder mentions and no input keeps as written), so they should be absolute. Each conflict
+    /// is reported at the first of its [`CheckResult::must`] (the offending path), with
+    /// [`CheckResult::is_own`] being `true`. For a trait bound, a value or the type of a const
+    /// parameter, [`CheckResult::impossible`] is the bound, the value or the const parameter. Never
+    /// empty.
     RelativePath(Vec<CheckResult>),
     /// Like [`NotInternableError::RelativePath`], for a [`Leaker`](crate::Leaker) with
     /// [`allow_external_crates`](crate::Leaker::allow_external_crates) unset: the offending path

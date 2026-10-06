@@ -39,6 +39,9 @@ use template_quote::quote;
 /// The `impl` of the Repeater declares the generics without the encoded bounds (see
 /// [`Referrer::impl_generics()`]).
 ///
+/// `Self: 'a` (see [`Referrer::context_self_outlives()`]) is not encoded, which needs the type
+/// `Self` is: use [`RepeaterSlots::encode_generics_args_to_ty_with_self()`], or append `&'a Self`.
+///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
@@ -64,15 +67,17 @@ use template_quote::quote;
 /// ```
 ///
 /// [`RepeaterSlots::encode_generics_args_to_ty()`]: crate::RepeaterSlots::encode_generics_args_to_ty
+/// [`RepeaterSlots::encode_generics_args_to_ty_with_self()`]: crate::RepeaterSlots::encode_generics_args_to_ty_with_self
 /// [`Referrer::generics()`]: crate::Referrer::generics
 /// [`Referrer::impl_generics()`]: crate::Referrer::impl_generics
+/// [`Referrer::context_self_outlives()`]: crate::Referrer::context_self_outlives
 pub fn encode_generics_args_to_ty_with<'a, 'b>(
     iter: impl IntoIterator<Item = &'a GenericArgument>,
     params: Option<&'b Punctuated<GenericParam, Token![,]>>,
     mut const_fn: impl FnMut(&Expr, Option<&'b ConstParam>) -> Type,
 ) -> std::result::Result<Type, EncodeError> {
     if let Some(params) = params {
-        return encode_generics_args_with_params(iter, params, |value, cp| {
+        return encode_generics_args_with_params(iter, params, None, |value, cp| {
             Ok(const_fn(value, Some(cp)))
         });
     }
@@ -95,12 +100,15 @@ pub fn encode_generics_args_to_ty_with<'a, 'b>(
 
 /// Encodes `iter` matched with `params`, filling omitted arguments with the defaults (see
 /// [`RepeaterSlots::encode_generics_args_to_ty()`]). `const_fn` encodes a (normalized) const value
-/// of the given parameter.
+/// of the given parameter. `self_outlives` is `Self` and the lifetimes `'a` (parameters of
+/// `params`) such that `Self: 'a`, which are encoded after the lifetime bounds (see
+/// [`encode_self_outlives()`]).
 ///
 /// [`RepeaterSlots::encode_generics_args_to_ty()`]: crate::RepeaterSlots::encode_generics_args_to_ty
 pub(crate) fn encode_generics_args_with_params<'a, 'b>(
     iter: impl IntoIterator<Item = &'a GenericArgument>,
     params: &'b Punctuated<GenericParam, Token![,]>,
+    self_outlives: Option<(&Type, &[Lifetime])>,
     mut const_fn: impl FnMut(&Expr, &'b ConstParam) -> std::result::Result<Type, EncodeError>,
 ) -> std::result::Result<Type, EncodeError> {
     use syn::fold::Fold;
@@ -119,6 +127,9 @@ pub(crate) fn encode_generics_args_with_params<'a, 'b>(
     }
     let params: Vec<&GenericParam> = params.iter().collect();
     elems.extend(encode_outlives_bounds(&params, &args)?);
+    if let Some((self_ty, lifetimes)) = self_outlives {
+        elems.extend(encode_self_outlives(&params, &args, self_ty, lifetimes)?);
+    }
     Ok(Type::Tuple(TypeTuple {
         paren_token: Default::default(),
         elems: with_trailing_comma(elems),
@@ -327,6 +338,9 @@ pub fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a Gener
 /// type such as `struct Loose<'a, T>(&'a (), T)`, which does not imply `T: 'a`): declare
 /// [`Referrer::impl_generics()`] (or [`without_encoded_bounds()`]) instead of the generics.
 ///
+/// `Self: 'a` (see [`Referrer::context_self_outlives()`]) is not encoded, which needs the type
+/// `Self` is: use [`RepeaterSlots::encode_generics_params_to_ty_with_self()`], or append `&'a Self`.
+///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
@@ -352,6 +366,8 @@ pub fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a Gener
 ///
 /// [`Referrer::generics()`]: crate::Referrer::generics
 /// [`Referrer::impl_generics()`]: crate::Referrer::impl_generics
+/// [`Referrer::context_self_outlives()`]: crate::Referrer::context_self_outlives
+/// [`RepeaterSlots::encode_generics_params_to_ty_with_self()`]: crate::RepeaterSlots::encode_generics_params_to_ty_with_self
 pub fn encode_generics_params_to_ty_with<'a>(
     iter: impl IntoIterator<Item = &'a GenericParam>,
     mut const_fn: impl FnMut(&'a ConstParam) -> Type,
@@ -526,6 +542,43 @@ pub(crate) fn encode_outlives_bounds(
                 lifetime: Some(outliving.clone()),
                 mutability: None,
                 elem: Box::new(referent),
+            }));
+        }
+    }
+    Ok(elems)
+}
+
+/// Returns the elements which encode `Self: 'a` for each of the `lifetimes`, after those encoding
+/// the lifetime bounds of `params` (see [`encode_outlives_bounds()`]), with `args` as the arguments
+/// of the parameters (one for each, see [`params_as_args()`]): `&'a Self` where `Self` is
+/// `self_ty` and `'a` is the argument of the lifetime parameter of `params` with the same name.
+/// Like a lifetime bound, it implies the bound wherever the encoding is written, which an
+/// implementation for `Self` or for the type `__S` cannot declare (a declared `__S: 'a` is an
+/// obligation at every use, and fails in the signature of a free function or the field of a
+/// struct, where nothing proves it, whereas `&'a __S` implies it). A lifetime which is not a
+/// parameter of `params` is skipped, like a bound by one.
+///
+/// [`EncodeError::UnboundedTraitObject`] is returned if `self_ty` is a trait object without a
+/// lifetime bound and there is a lifetime.
+pub(crate) fn encode_self_outlives(
+    params: &[&GenericParam],
+    args: &[GenericArgument],
+    self_ty: &Type,
+    lifetimes: &[Lifetime],
+) -> std::result::Result<Vec<Type>, EncodeError> {
+    let mut elems = Vec::new();
+    for lifetime in lifetimes {
+        let outliving =
+            encoded_bound_position(params, lifetime).and_then(|pos| match args.get(pos) {
+                Some(GenericArgument::Lifetime(outliving)) => Some(outliving),
+                _ => None,
+            });
+        if let Some(outliving) = outliving {
+            elems.push(Type::Reference(TypeReference {
+                and_token: Default::default(),
+                lifetime: Some(outliving.clone()),
+                mutability: None,
+                elem: Box::new(referent_of_reference(self_ty)?),
             }));
         }
     }

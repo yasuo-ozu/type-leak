@@ -1,10 +1,13 @@
 //! The [`Referrer`], which rewrites copies of the analyzed items.
 
-use crate::context::{Context, ContextId, Scope, SelfRequirement};
+use crate::context::{
+    assumed_bounds_hold, Assumed, Context, ContextId, Enclosing, Scope, SelfRequirement,
+};
 use crate::encode::{complete_generics_args, without_encoded_bounds, EncodeError};
 use crate::graph::TypeKey;
 use crate::util::{
-    first_self_in_generics, generic_param_name, mentions_names, token_names, type_mentions_self,
+    first_self_in_generics, generic_param_name, ident_name, mentions_names, token_names,
+    type_mentions_self,
 };
 use proc_macro2::TokenStream;
 use std::cell::RefCell;
@@ -132,6 +135,7 @@ impl Referrer {
         module: Option<&[Ident]>,
         ty: &Type,
         scopes: &[Scope],
+        enclosing: &Enclosing,
     ) -> Option<usize> {
         let candidates = self.map.get(&TypeKey::new(ty))?;
         let mut best: Option<(usize, usize, usize)> = None;
@@ -149,7 +153,7 @@ impl Referrer {
                 (None, None) => 0,
                 (None, Some(entry)) => 1 + usize::from(!entry.is_empty()),
             };
-            if let Some(assumed) = Self::matches(matching, ty, scopes, entry) {
+            if let Some(assumed) = Self::matches(matching, ty, scopes, enclosing, entry) {
                 if best.map_or(true, |(r, fewest, _)| (rank, assumed) < (r, fewest)) {
                     best = Some((rank, assumed, ix));
                 }
@@ -172,10 +176,22 @@ impl Referrer {
 
     /// Returns the number of the generics of the Leaker which `entry` assumes (see
     /// [`Referrer::find()`]) if it matches the type `ty` in `scopes`.
-    fn matches(matching: Matching, ty: &Type, scopes: &[Scope], entry: &Context) -> Option<usize> {
+    fn matches(
+        matching: Matching,
+        ty: &Type,
+        scopes: &[Scope],
+        enclosing: &Enclosing,
+        entry: &Context,
+    ) -> Option<usize> {
         match matching {
             Matching::Exact { self_ty, .. } => {
-                let context = Context::of(ty, scopes, self_ty.or_else(|| entry.self_ty()), &[]);
+                let context = Context::of(
+                    ty,
+                    scopes,
+                    self_ty.or_else(|| entry.self_ty()),
+                    &Assumed::default(),
+                    enclosing,
+                );
                 if context == entry.without_module() {
                     Some(0)
                 } else {
@@ -193,23 +209,41 @@ impl Referrer {
                     .flat_map(|scope| scope.params())
                     .map(generic_param_name)
                     .collect();
-                // The lifetimes of the entry which are not declared here are generics of the
-                // Leaker, so the bounds the type implies on the generics declared here are those
-                // of the entry, which the context has to agree with.
-                let assumed: Vec<Lifetime> = entry
-                    .generics()
-                    .params
-                    .iter()
-                    .filter_map(|param| match param {
+                // The generics of the entry which are not declared here are generics of the
+                // Leaker, and so are the lifetimes around the type which are not declared (the
+                // visited syntax does not declare the generics of the item, see
+                // `Visitor::with_outermost_generics_as_leakers()`). So the bounds the type implies
+                // on the generics declared here are those of the entry, which the context has to
+                // agree with, and the bounds it implies on the others must be among theirs.
+                let mut assumed = Assumed::default();
+                for param in &entry.generics().params {
+                    match param {
                         GenericParam::Lifetime(param)
                             if !declared.contains(&param.lifetime.to_string()) =>
                         {
-                            Some(param.lifetime.clone())
+                            assumed.lifetimes.push(param.lifetime.clone())
                         }
-                        _ => None,
-                    })
-                    .collect();
-                let context = Context::of(ty, scopes, entry.self_ty(), &assumed);
+                        GenericParam::Type(param)
+                            if !declared.contains(&ident_name(&param.ident)) =>
+                        {
+                            assumed.types.push(ident_name(&param.ident))
+                        }
+                        _ => (),
+                    }
+                }
+                for lifetime in enclosing.lifetimes() {
+                    if !declared.contains(&lifetime.to_string())
+                        && !assumed.lifetimes.contains(lifetime)
+                    {
+                        assumed.lifetimes.push(lifetime.clone());
+                    }
+                }
+                let context = Context::of(ty, scopes, entry.self_ty(), &assumed, enclosing);
+                if context.self_outlives() != entry.self_outlives()
+                    || !assumed_bounds_hold(ty, scopes, &assumed, enclosing, entry)
+                {
+                    return None;
+                }
                 Self::matches_declared(&declared, &context, entry)
             }
             Matching::Default => {
@@ -217,7 +251,7 @@ impl Referrer {
                     return None;
                 }
                 let root: HashSet<String> = scopes[0].params().map(generic_param_name).collect();
-                let context = Context::of(ty, &scopes[..1], None, &[]);
+                let context = Context::of(ty, &scopes[..1], None, &Assumed::default(), enclosing);
                 let used = names_of_params(context.generics());
                 let entry_params = names_of_params(entry.generics());
                 if used.is_subset(&entry_params) && entry_params.is_subset(&root) {
@@ -436,9 +470,9 @@ impl Referrer {
     ///
     /// For each such `'a` which is a generic lifetime (not `'static`, `'_`, or the lifetime of a
     /// `for<..>` binder), `T: 'a` is added for each type parameter `T` mentioned in `X`, and `'b:
-    /// 'a` for each other lifetime parameter `'b` mentioned in `X`. A trait object in `X` is not
-    /// looked into: `dyn Tr<T> + 'b` outlives `'a` if `'b` does, so only its explicit lifetime
-    /// bound counts. The bounds written in the Leaker are kept, merged with these.
+    /// 'a` for each other lifetime parameter `'b` mentioned in `X`. Everything in `X` is looked
+    /// into, as rustc does, the arguments of a trait object included: `dyn Tr<T> + 'b` outlives
+    /// `'a` only if `'b` and `T` do. The bounds written in the Leaker are kept, merged with these.
     ///
     /// If `R` does not require `T: 'a` (e.g. `struct Loose<'a, T>(&'a (), T)`), the bound is
     /// assumed anyway, so the copy is stricter than the original: a caller whose `T` is shorter
@@ -457,10 +491,38 @@ impl Referrer {
     /// assumed `T: 'a` of `Loose<'a, T>` is not implied by the copy of its signature, whereas
     /// that of `Rel<'a, T>` is, see [`Referrer::impl_generics()`]).
     ///
-    /// The bounds of an enclosing type are not passed to the components that are leaked alone:
-    /// `Rel2<T>` of `Ref<'a, Rel2<T>>` (where `Ref<'a, T: 'a>`) is leaked with the generics `<T>`,
-    /// and its copy `Ref<'a, <Self as Repeater<(T,), ..>>::Type>` is well-formed in a signature,
-    /// but not in the field of a struct, which needs `T: 'a` (E0309).
+    /// `Self: 'a` is not among them, as `Self` is not a generic. The same types imply it
+    /// (`Rel<'a, Self>`, `Rel<'a, Self::Item>` and `&'a Self`, with the same assumptions), and it
+    /// is a part of the context of the type instead, which the encoding carries as well, as `&'a
+    /// Self` (see [`Referrer::context_self_outlives()`]). Like the others it is not declared by the
+    /// implementation, which is rejected with E0309 without it (`__S` may not live long enough),
+    /// whereas a declared `__S: 'a` fails in the signature of a free function or the field of a
+    /// struct. A bound written in the item (`where Self: 'a`) is a where predicate like another,
+    /// which the implementation declares, besides the encoding.
+    ///
+    /// A type leaked alone is a component of the types around it, and has the bounds that they
+    /// imply on it: `Rel2<T>` of `Ref<'a, Rel2<T>>` (where `Ref<'a, T: 'a>`) is leaked with the
+    /// generics `<'a, T: 'a>`, as if it was written `&'a Rel2<T>`, and so is the one of `&'a
+    /// Rel2<T>`, `Ref<'a, Vec<Rel2<T>>>` and `Ref<'a, dyn Iterator<Item = Rel2<T>>>`. The copy
+    /// `Ref<'a, <Self as Repeater<(&'a (), T, &'a T), ..>>::Type>` is well-formed in the field of
+    /// a struct, where the one without the bound (`Repeater<(T,), ..>`) is rejected (E0309): the
+    /// original has `T: 'a` inferred by RFC 2093, which does not go through a projection. `'a` is
+    /// among the generics even if the type does not mention it, and the same type under other
+    /// lifetimes, or under none, is another entry.
+    ///
+    /// The types that pass on the lifetimes they must outlive are those of rustc: the referent of
+    /// `&'a X`, `&'a mut X` and the type arguments of a path with a lifetime argument `R<'a, X>`
+    /// (assumed as above) add `'a`, and everything made of types passes on what it must outlive
+    /// (the elements of tuples, arrays and slices, parentheses, groups and raw pointers, the type
+    /// arguments of any path, the inputs and the output of a function pointer, and the arguments
+    /// and the associated type bindings of a trait object), but not a projection (`<X as Tr>::A`,
+    /// which does not require `X: 'a`), an `impl Trait` and the length of an array. `'static`,
+    /// `'_` and the lifetimes of a `for<..>` binder are not generics, so they are not recorded
+    /// (`T: 'static` stays to be declared by the struct, which the original needs as well).
+    ///
+    /// [`Referrer::into_visitor()`], [`Referrer::expand()`] and the others compute the same from
+    /// the types around the one they look up, so give them the whole type (or item): a type taken
+    /// out of another is looked up as if nothing was around it.
     ///
     /// If the type mentions `Self` (see [`Referrer::context_self()`]), the Repeater's
     /// implementation is for the implementor or the type `Self` is. The bounds and where
@@ -485,9 +547,18 @@ impl Referrer {
     ///         Some(SelfRequirement::Bound(_)) => (&replaced[ix].0, &replaced[ix].1),
     ///         _ => (ty, generics),
     ///     };
-    ///     let encoded = slots.encode_generics_params_to_ty(&generics.params)?;
+    ///     // `Self: 'a` is encoded as `&'a Self` (`&'a __S` here) too.
+    ///     let self_in_impl: Type = match referrer.context_self(context) {
+    ///         Some(SelfRequirement::Type(_)) => parse_quote!(Self),
+    ///         _ => marker.clone(),
+    ///     };
+    ///     let encoded = slots.encode_generics_params_to_ty_with_self(
+    ///         &generics.params,
+    ///         &self_in_impl,
+    ///         referrer.context_self_outlives(context),
+    ///     )?;
     ///     // There may be no parameters: `impl<__S: ?Sized>`. The lifetime bounds which `encoded`
-    ///     // contains (`T: 'a`) are implied by the header, so they are not declared.
+    ///     // contains (`T: 'a`, `Self: 'a`) are implied by the header, so they are not declared.
     ///     // (`referrer.impl_generics(context)` is the same for the generics of the context.)
     ///     let params = without_encoded_bounds(generics).params;
     ///     let predicates = generics.where_clause.iter().flat_map(|wc| &wc.predicates);
@@ -511,9 +582,42 @@ impl Referrer {
     /// // In the Referrer's crate (in the implementation of `MyTrait<#trait_args>`)
     /// let completed = referrer.complete_args(&trait_args, &trait_params, |..| ..)?;
     /// let args = referrer.generic_args(ix, &trait_params, &completed)?;
-    /// let encoded = slots.encode_generics_args_to_ty(&args, &referrer.generics(ix).params)?;
+    /// let encoded = slots.encode_generics_args_to_ty_with_self(
+    ///     &args,
+    ///     &referrer.generics(ix).params,
+    ///     &parse_quote!(Self),
+    ///     referrer.context_self_outlives(referrer.context(ix)),
+    /// )?;
     /// parse_quote!(<Self as Repeater<#encoded, #ID, #ix>>::Type)
     /// ```
+    ///
+    /// # Lifetimes of `for<..>` binders
+    ///
+    /// The lifetimes of a binder are generics of the types inside it (`Rel<'x>` in `for<'x>
+    /// fn(Rel<'x>)` or in `F: for<'x> Fn(Rel<'x>)` is leaked with `<'x>`), unless the output of the
+    /// binder mentions them (the return type of a function pointer, or of the parenthesized
+    /// arguments of a trait (`Fn(A) -> R`), or an associated type binding (`Iterator<Item = R>`))
+    /// and no input keeps them as written. The copy `for<'x> fn(<Self as Repeater<(&'x (),),
+    /// ..>>::Type) -> &'x u8` would be rejected then (E0581, or E0582 in a bound or a trait
+    /// object), because a lifetime which occurs only in a projection is not constrained by the
+    /// inputs.
+    ///
+    /// An input keeps `'x` (an *anchor*) if it occurs in a position of the input which constrains
+    /// it (a reference, a pointer, a slice, an array, a tuple, a path or a trait object, but not a
+    /// projection, the length of an array or what is in the output of a trait object) and no type
+    /// from the input down to it is leaked: in `F: for<'x> Fn(&'x str, Parser<'x>) -> &'x str`
+    /// the reference `&'x str` stays, so `Parser<'x>` is leaked alone, as in `for<'x> fn(&'x u8) ->
+    /// Rel<'x>`. A type using `'x` is never leaked unless its own path depends on the type context
+    /// (`Parser<'x>`, `Rel2<&'x str>`, which then holds the anchor, so it is not one), so the types
+    /// around the anchor, such as a tuple, are never leaked.
+    ///
+    /// Without an anchor, a type using such a lifetime is not leaked on its own: the function
+    /// pointer or the trait object holding the binder is leaked as a whole instead (it declares the
+    /// lifetime, so it is not among its generics), and it is an error
+    /// ([`NotInternableError`](crate::NotInternableError)) if that cannot be (it has an elided
+    /// lifetime, or is `impl Trait`), or if the binder is in a bound or a where predicate, which is
+    /// not a type. A path whose definition is not seen is assumed to be a struct, an enum or a
+    /// union: a type alias of a projection does not constrain `'x`.
     pub fn generics(&self, ix: usize) -> &Generics {
         self.context_generics(self.contexts[ix])
     }
@@ -562,8 +666,10 @@ impl Referrer {
 
     /// Returns the generics which the types of `context` use, in the canonical form, which the
     /// Repeater's implementation of an entry in `context` must encode exactly (the parameters and
-    /// the lifetime bounds) in its trait arguments. See [`Referrer::generics()`], including the
-    /// outlives bounds that a type implies, which are among the bounds here. The implementation
+    /// the lifetime bounds, and `Self: 'a`, see [`Referrer::context_self_outlives()`]) in its trait
+    /// arguments. See [`Referrer::generics()`], including the
+    /// outlives bounds that a type implies, and those the types around it imply (and the lifetimes
+    /// of them, which are among the generics), which are among the bounds here. The implementation
     /// declares [`Referrer::impl_generics()`] instead: these generics without the lifetime bounds
     /// that are encoded, which it must not declare. For the top-level context
     /// of a call of [`Leaker::intern_with()`](crate::Leaker::intern_with()), they are the generics
@@ -686,6 +792,52 @@ impl Referrer {
     /// Panics if `context` is not one of the [`Referrer::contexts()`].
     pub fn context_self(&self, context: ContextId) -> Option<&SelfRequirement> {
         self.context_map[&context].self_ty()
+    }
+
+    /// Returns the lifetimes `'a` such that the types of `context` imply `Self: 'a` (they are
+    /// parameters of [`Referrer::context_generics()`] of `context`, sorted), e.g. `'a` for
+    /// `Rel<'a, Self>` and `Rel<'a, Self::Item>` (where `struct Rel<'a, T>(&'a T)`), or `&'a Self`:
+    /// the type is well-formed only if `Self: 'a`, like `&'a T` requires `T: 'a`, with the same
+    /// assumptions (see [`Referrer::generics()`]). It is empty if the types do not imply it, and
+    /// if they do not mention `Self` ([`Referrer::context_self()`] is `None`).
+    ///
+    /// The encoding of the generics carries `Self: 'a` like a lifetime bound (`&'a Self`, or `&'a
+    /// __S` in the implementation for any type of the trait), so the Repeater's implementation
+    /// does not declare it, whereas the generics do not mention it, as `Self` is not a generic: use
+    /// [`RepeaterSlots::encode_generics_params_to_ty_with_self()`](crate::RepeaterSlots::encode_generics_params_to_ty_with_self())
+    /// and
+    /// [`RepeaterSlots::encode_generics_args_to_ty_with_self()`](crate::RepeaterSlots::encode_generics_args_to_ty_with_self())
+    /// to encode it, with the type of the implementation, or `Self` where the copy is, as `self_ty`.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// # use template_quote::quote;
+    /// let tr: ItemTrait = parse_quote!(trait Tr { fn f<'a>(&'a self) -> Rel<'a, Self>; });
+    /// let referrer = Leaker::from_trait(&tr).unwrap().0.finish();
+    /// let context = referrer.context(0);
+    /// let lifetime: Lifetime = parse_quote!('a);
+    /// assert_eq!(referrer.context_self_outlives(context), [lifetime]);
+    ///
+    /// // In the Leaker's crate, the implementation is for the implementor `__S` of the trait.
+    /// let slots = RepeaterSlots::new(parse_quote!(Repeater));
+    /// let marker: Type = parse_quote!(__S);
+    /// let encoded = slots
+    ///     .encode_generics_params_to_ty_with_self(
+    ///         &referrer.context_generics(context).params,
+    ///         &marker,
+    ///         referrer.context_self_outlives(context),
+    ///     )
+    ///     .unwrap();
+    /// let expected: Type = parse_quote!((&'a (), &'a __S));
+    /// assert_eq!(quote!(#encoded).to_string(), quote!(#expected).to_string());
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `context` is not one of the [`Referrer::contexts()`].
+    pub fn context_self_outlives(&self, context: ContextId) -> &[Lifetime] {
+        self.context_map[&context].self_outlives()
     }
 
     /// Returns the path of the module where the types of `context` are written, relative to the
@@ -990,7 +1142,12 @@ impl Referrer {
     /// entry. The other generics of the entry are assumed to be the generics of the Leaker, as
     /// the visited syntax does not declare them (see
     /// [`Visitor::with_outermost_generics_as_leakers()`]). If several entries match, the one which
-    /// assumes the fewest generics of the Leaker is chosen, and then the first. So if the Leaker
+    /// assumes the fewest generics of the Leaker is chosen, and then the first. The context of a
+    /// type has the lifetimes which the types around it make it outlive (see
+    /// [`Referrer::generics()`]), which the visitor keeps track of while it walks down the types
+    /// it visits: the bounds which a type implies on the generics of the Leaker which are not
+    /// declared there must be among those of the entry, so `Rel2<T>` of `Ref<'a, Rel2<T>>` is not
+    /// replaced by the entry of `Rel2<T>` on its own, whichever generics are declared. So if the Leaker
     /// is analyzed by several calls of
     /// [`Leaker::intern_with()`](crate::Leaker::intern_with()) which declare the same generics
     /// differently (e.g. `T` with different bounds), use [`Referrer::into_visitor_with_root()`]
@@ -1054,7 +1211,10 @@ impl Referrer {
     /// The `type_fn` callback is called for each subtype that needs to be converted,
     /// receiving the original type and its index, and returning the replacement type. The type is
     /// expanded with no generics in scope, so the generics of the entries are assumed to be those
-    /// of the Leaker (see [`Referrer::into_visitor()`]).
+    /// of the Leaker (see [`Referrer::into_visitor()`]), and with nothing around it: the
+    /// lifetimes that the types around a type make it outlive are part of its context (see
+    /// [`Referrer::generics()`]), and are known only for the types inside `ty`. A type taken out of
+    /// a larger one is found as the one on its own, so expand the larger type.
     ///
     /// ```ignore
     /// referrer.expand(ty, |_, ix| {
@@ -1095,6 +1255,10 @@ impl Referrer {
             module: Option<&'b [Ident]>,
             scopes: &'a mut Vec<Scope>,
             replace_self: Option<ReplaceSelf<'a>>,
+            /// What the type being folded must outlive because of the types around it, as the
+            /// Leaker sees it (see [`Enclosing`]); while its components are folded, what they
+            /// must.
+            enclosing: Enclosing,
             type_fn: F,
         }
         impl<'a, 'b, F> Folder<'a, 'b, F> {
@@ -1107,22 +1271,31 @@ impl Referrer {
         }
         impl<'a, 'b, F: FnMut(Type, usize) -> Type> Fold for Folder<'a, 'b, F> {
             fn fold_type(&mut self, ty: Type) -> Type {
-                match (
+                let enclosing = self.enclosing.clone();
+                let found =
                     self.referrer
-                        .find(self.matching, self.module, &ty, self.scopes),
-                    self.replace_self,
-                ) {
+                        .find(self.matching, self.module, &ty, self.scopes, &enclosing);
+                if found.is_none() {
+                    self.enclosing = enclosing.components_of(&ty, self.scopes.len());
+                }
+                let folded = match (found, self.replace_self) {
                     (Some(ix), None) => (self.type_fn)(ty, ix),
                     (Some(ix), Some(mut replace)) => (self.type_fn)(replace.fold_type(ty), ix),
                     (None, None) => syn::fold::fold_type(self, ty),
                     (None, Some(replace)) => replace.fold_type_with(self, ty),
-                }
+                };
+                self.enclosing = enclosing;
+                folded
             }
             fn fold_expr(&mut self, expr: Expr) -> Expr {
-                match self.replace_self {
+                // The types in an expression are not components of the types around it.
+                let enclosing = std::mem::take(&mut self.enclosing);
+                let folded = match self.replace_self {
                     Some(replace) => replace.fold_expr_with(self, expr),
                     None => syn::fold::fold_expr(self, expr),
-                }
+                };
+                self.enclosing = enclosing;
+                folded
             }
             fn fold_macro(&mut self, i: Macro) -> Macro {
                 match self.replace_self {
@@ -1153,6 +1326,7 @@ impl Referrer {
             module,
             scopes,
             replace_self: self_ty.map(|self_ty| ReplaceSelf { self_ty }),
+            enclosing: Enclosing::default(),
             type_fn,
         }
         .fold_type(ty)
@@ -1323,6 +1497,11 @@ impl<'a, F: FnMut(Type, usize, &[GenericArgument]) -> Type> syn::fold::Fold for 
 /// with `T` alone) is not rewritten, since it refers to them rather than to the Leaker's items.
 /// See [`Visitor::with_outermost_generics_as_leakers()`] to treat the generics of the outermost
 /// item as those of the Leaker instead.
+///
+/// A type visited (`VisitMut::visit_type_mut()`) is looked up as a whole, with the lifetimes
+/// which the types inside it get from the ones around them (see [`Referrer::generics()`]), but
+/// with nothing around it: visit the type or the item which holds it, not a type taken out of
+/// another one.
 ///
 /// The items and imports declared in a block shadow the leaked types mentioning their names in
 /// the block, and those declared in a module do so in that module only, not in its submodules
@@ -1777,7 +1956,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// empty (the generics and the where clause, followed by `;`, see [`Referrer::context_generics()`]),
 /// what `Self` means if it mentions it (`Self: path<args> ;` for a [`SelfRequirement::Bound`],
 /// `Self = Type ;` for a [`SelfRequirement::Type`] or `Self = # n ;` for a
-/// [`SelfRequirement::Call`], see [`Referrer::context_self()`]), the module if the types
+/// [`SelfRequirement::Call`], see [`Referrer::context_self()`]), the lifetimes which `Self` is
+/// implied to outlive if there are any (`Self : 'a + 'b ;`, see
+/// [`Referrer::context_self_outlives()`]), the module if the types
 /// depend on one (`mod a::b ;`, or `mod self ;` for the analyzed module itself, see
 /// [`Referrer::context_module()`]), and the leaked types in parentheses (none for a top-level
 /// context which no type is in, see [`Leaker::intern_with()`](crate::Leaker::intern_with())). A leaked type may be preceded by `?` if it is not [required](Referrer::must()),
@@ -1832,12 +2013,21 @@ impl Parse for Referrer {
                 generics.where_clause = input.parse()?;
                 input.parse::<Token![;]>()?;
             }
-            // What `Self` means, if it is mentioned, is followed by `;` too.
+            // What `Self` means, if it is mentioned, is followed by `;` too, and so are the
+            // lifetimes it outlives (`Self: 'a + 'b ;`, which a path cannot start with).
             let mut self_ty = None;
-            if input.peek(Token![Self]) {
+            let mut self_outlives = Vec::new();
+            while input.peek(Token![Self]) {
                 input.parse::<Token![Self]>()?;
                 if input.parse::<Option<Token![:]>>()?.is_some() {
-                    self_ty = Some(SelfRequirement::Bound(input.parse()?));
+                    if input.peek(Lifetime) {
+                        self_outlives =
+                            Punctuated::<Lifetime, Token![+]>::parse_separated_nonempty(input)?
+                                .into_iter()
+                                .collect();
+                    } else {
+                        self_ty = Some(SelfRequirement::Bound(input.parse()?));
+                    }
                 } else {
                     input.parse::<Token![=]>()?;
                     if input.parse::<Option<Token![#]>>()?.is_some() {
@@ -1862,7 +2052,12 @@ impl Parse for Referrer {
                 });
                 input.parse::<Token![;]>()?;
             }
-            context_map.insert(context, Context::new(generics, self_ty).with_module(module));
+            context_map.insert(
+                context,
+                Context::new(generics, self_ty)
+                    .with_self_outlives(self_outlives)
+                    .with_module(module),
+            );
             let content: syn::parse::ParseBuffer<'_>;
             parenthesized!(content in input);
             // Each entry is `[?] [@[crate, ..]] Type`.
@@ -1918,7 +2113,9 @@ fn crate_ident(name: &str) -> Ident {
 /// [`Referrer::context_generics()`]) and `;` if they are not empty (e.g. `<T> where T: Clone ;
 /// (Wrap<T>)`), and by what `Self` means (see
 /// [`Referrer::context_self()`]) and `;` if the types mention it (e.g. `Self: MyTrait<T> ;
-/// (Rel<Self>)`, `Self = MyStruct<T> ; (Rel<Self>)` or `Self = # 0 ; (Rel<Self>)`), and by `mod
+/// (Rel<Self>)`, `Self = MyStruct<T> ; (Rel<Self>)` or `Self = # 0 ; (Rel<Self>)`), by the
+/// lifetimes which `Self` is implied to outlive (see [`Referrer::context_self_outlives()`]) and `;`
+/// if there are any (e.g. `<'a> ; Self: MyTrait ; Self: 'a ; (Rel<'a, Self>)`), and by `mod
 /// a::b ;` (or `mod self ;`) if the types depend on their module (see [`Referrer::context_module()`]). An entry
 /// which is not required is preceded by `?`, and one which requires external crates by `@[foo,
 /// bar]` (e.g. `(? @[foo] ::foo::X)`).
@@ -1974,6 +2171,17 @@ impl ToTokens for Referrer {
                     tokens.extend(Some(pound()));
                     tokens.extend(quote!(#{Literal::usize_unsuffixed(*n)} ;));
                 }
+            }
+            let outlives = self.context_self_outlives(context);
+            if !outlives.is_empty() {
+                tokens.extend(quote!(Self :));
+                for (i, lifetime) in outlives.iter().enumerate() {
+                    if i > 0 {
+                        tokens.extend(quote!(+));
+                    }
+                    tokens.extend(quote!(#lifetime));
+                }
+                tokens.extend(quote!(;));
             }
             if let Some(module) = self.context_module(context) {
                 tokens.extend(quote!(mod));

@@ -311,8 +311,19 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
             Some(SelfRequirement::Bound(_)) => (&replaced[ix].0, &replaced[ix].1),
             _ => (ty, generics),
         };
+        // `Self: 'a` is encoded as `&'a Self` like a lifetime bound (`&'a __S` in the
+        // implementation for any type of the trait), so the header implies it and the
+        // implementation does not declare it.
+        let self_in_impl: Type = match referrer.context_self(context) {
+            Some(SelfRequirement::Type(_)) => parse_quote!(Self),
+            _ => marker.clone(),
+        };
         let encoded = slots
-            .encode_generics_params_to_ty(&generics.params)
+            .encode_generics_params_to_ty_with_self(
+                &generics.params,
+                &self_in_impl,
+                referrer.context_self_outlives(context),
+            )
             .map_err(Error::from)?;
         // The lifetime bounds in the trait arguments are implied by the header, so they are not
         // declared. For `Bound`, `generics` has `Self` replaced (see `iter_with_self()`).
@@ -380,7 +391,30 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
 }
 
 /// Input of `__implement!`: the data passed by the exported `macro_rules!`, followed by
-/// `impl<generics> Trait<args> for SelfTy => field`.
+/// `impl<generics> Trait<args> for SelfTy => field`, or by `copy [SelfTy] { items }`.
+enum Input {
+    Implement(ImplementInput),
+    Copy(CopyInput),
+}
+
+/// The data passed by the exported `macro_rules!`.
+struct Header {
+    item_trait: ItemTrait,
+    referrer: Referrer,
+    id: LitInt,
+    repeater: Path,
+    module: Path,
+}
+
+/// `copy [SelfTy] { items }`: the items written with the types of the Leaker (even a free function
+/// or a struct, which have no `Self`: it is `SelfTy`, if given) are copied with the leaked types
+/// rewritten.
+struct CopyInput {
+    header: Header,
+    self_ty: Option<Type>,
+    items: Vec<Item>,
+}
+
 struct ImplementInput {
     item_trait: ItemTrait,
     referrer: Referrer,
@@ -402,13 +436,46 @@ fn braced_parse<T: Parse>(input: ParseStream) -> Result<T> {
     content.parse()
 }
 
-impl Parse for ImplementInput {
+impl Parse for Input {
     fn parse(input: ParseStream) -> Result<Self> {
-        let item_trait: ItemTrait = braced_parse(input)?;
-        let referrer = braced_parse(input)?;
-        let id = braced_parse(input)?;
-        let repeater = braced_parse::<Path>(input)?;
-        let module = braced_parse::<Path>(input)?;
+        let header = Header {
+            item_trait: braced_parse(input)?,
+            referrer: braced_parse(input)?,
+            id: braced_parse(input)?,
+            repeater: braced_parse::<Path>(input)?,
+            module: braced_parse::<Path>(input)?,
+        };
+        if input.peek(Ident) && !input.peek(Token![impl]) {
+            let keyword: Ident = input.parse()?;
+            if keyword != "copy" {
+                return Err(Error::new(keyword.span(), "expected `impl` or `copy`"));
+            }
+            let content;
+            bracketed!(content in input);
+            let self_ty = if content.is_empty() {
+                None
+            } else {
+                Some(content.parse()?)
+            };
+            let content;
+            braced!(content in input);
+            let mut items = Vec::new();
+            while !content.is_empty() {
+                items.push(content.parse()?);
+            }
+            return Ok(Input::Copy(CopyInput {
+                header,
+                self_ty,
+                items,
+            }));
+        }
+        let Header {
+            item_trait,
+            referrer,
+            id,
+            repeater,
+            module,
+        } = header;
         input.parse::<Token![impl]>()?;
         let mut generics: Generics = input.parse()?;
         let trait_ident: Ident = input.parse()?;
@@ -442,7 +509,7 @@ impl Parse for ImplementInput {
                 extra.push(content.parse()?);
             }
         }
-        Ok(Self {
+        Ok(Input::Implement(ImplementInput {
             item_trait,
             referrer,
             id,
@@ -453,7 +520,7 @@ impl Parse for ImplementInput {
             self_ty,
             field,
             extra,
-        })
+        }))
     }
 }
 
@@ -573,9 +640,74 @@ fn forward_receiver(receiver: &Receiver, field: &Member) -> Result<TokenStream> 
 #[doc(hidden)]
 #[proc_macro]
 pub fn __implement(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    match implement_impl(parse_macro_input!(input as ImplementInput)) {
+    let result = match parse_macro_input!(input as Input) {
+        Input::Implement(input) => implement_impl(input),
+        Input::Copy(input) => copy_impl(input),
+    };
+    match result {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Copies the items of `copy [SelfTy] { items }` with the leaked types rewritten, as the Referrer
+/// does the signatures of the trait: `<SelfTy as Repeater<..>>::Type` (`Self` if there is no
+/// `SelfTy`) in place of the leaked types, where `Self` of the leaked types is `SelfTy`. The trait
+/// has no generic parameters.
+fn copy_impl(input: CopyInput) -> Result<TokenStream> {
+    let CopyInput {
+        header:
+            Header {
+                item_trait,
+                referrer,
+                id,
+                repeater,
+                ..
+            },
+        self_ty,
+        items,
+    } = input;
+    if !item_trait.generics.params.is_empty() {
+        return Err(Error::new(
+            item_trait.generics.span(),
+            "`copy` supports only traits without generic parameters",
+        ));
+    }
+    let slots = RepeaterSlots::new(repeater.clone());
+    let trait_ident = &item_trait.ident;
+    let self_path: Path = parse_quote!(#trait_ident);
+    let self_in_copy: Type = self_ty.clone().unwrap_or_else(|| parse_quote!(Self));
+    let mut error = None;
+    let mut copies = TokenStream::new();
+    for mut item in items {
+        let mut visitor = referrer
+            .clone()
+            .into_visitor(Some(SelfRequirement::Bound(self_path.clone())), |_, ix| {
+                let projection = (|| -> Result<Type> {
+                    let args = referrer.generic_args(ix, &Punctuated::new(), &[])?;
+                    let encoded = slots.encode_generics_args_to_ty_with_self(
+                        &args,
+                        &referrer.generics(ix).params,
+                        &self_in_copy,
+                        referrer.context_self_outlives(referrer.context(ix)),
+                    )?;
+                    Ok(parse_quote!(<#self_in_copy as #repeater<#encoded, #id, #ix>>::Type))
+                })();
+                projection.unwrap_or_else(|e| {
+                    error = Some(e);
+                    parse_quote!(())
+                })
+            });
+        if let Some(self_ty) = &self_ty {
+            visitor = visitor.with_self(self_ty.clone());
+        }
+        visitor.visit_item_mut(&mut item);
+        drop(visitor);
+        copies.extend(quote!(#item));
+    }
+    match error {
+        Some(e) => Err(e),
+        None => Ok(copies),
     }
 }
 
@@ -604,7 +736,12 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
                       root_args: &[GenericArgument]|
      -> Result<Type> {
         let args = referrer.generic_args(ix, root_params, root_args)?;
-        let encoded = slots.encode_generics_args_to_ty(&args, &referrer.generics(ix).params)?;
+        let encoded = slots.encode_generics_args_to_ty_with_self(
+            &args,
+            &referrer.generics(ix).params,
+            &parse_quote!(Self),
+            referrer.context_self_outlives(referrer.context(ix)),
+        )?;
         Ok(parse_quote!(<Self as #repeater<#encoded, #id, #ix>>::Type))
     };
 

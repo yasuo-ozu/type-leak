@@ -2,7 +2,7 @@
 
 use crate::encode::{
     const_param_primitive, encode_generics_args_with_params, encode_outlives_bounds,
-    normalize_const_arg, params_as_args, with_trailing_comma, EncodeError,
+    encode_self_outlives, normalize_const_arg, params_as_args, with_trailing_comma, EncodeError,
 };
 use proc_macro2::Span;
 use syn::punctuated::Punctuated;
@@ -180,11 +180,62 @@ impl RepeaterSlots {
     /// `impl` declares the generics without these bounds (see
     /// [`Referrer::impl_generics()`](crate::Referrer::impl_generics())).
     ///
+    /// `Self: 'a` is not encoded: use [`RepeaterSlots::encode_generics_params_to_ty_with_self()`]
+    /// for the generics of a context with
+    /// [`Referrer::context_self_outlives()`](crate::Referrer::context_self_outlives()).
+    ///
     /// Returns [`EncodeError::UnsupportedConstType`] if the type of a const parameter is not a
     /// primitive type.
     pub fn encode_generics_params_to_ty<'a>(
         &self,
         iter: impl IntoIterator<Item = &'a GenericParam>,
+    ) -> std::result::Result<Type, EncodeError> {
+        self.encode_params(iter, None)
+    }
+
+    /// Like [`RepeaterSlots::encode_generics_params_to_ty()`], with `Self: 'a` for each lifetime of
+    /// `self_outlives` (the lifetimes of
+    /// [`Referrer::context_self_outlives()`](crate::Referrer::context_self_outlives()) of the
+    /// context whose generics `iter` are) encoded after the lifetime bounds as `&'a Self`, where
+    /// `Self` is `self_ty`: the type the implementation of the Repeater is for, `__S` for an
+    /// implementation for any type of the trait (`impl<'a, __S: ?Sized + MyLeaker> Repeater<(&'a
+    /// (), &'a __S), ..> for __S`, see
+    /// [`Referrer::iter_with_self()`](crate::Referrer::iter_with_self())), or `Self` for an
+    /// implementation for a type. The header implies `__S: 'a` then, which the implementation must
+    /// not declare, as nothing proves it where the type is copied but this encoding (see
+    /// [`Referrer::generics()`](crate::Referrer::generics())).
+    ///
+    /// A lifetime which is not a parameter of `iter` is skipped, like a lifetime bound by one.
+    /// Returns [`EncodeError::UnboundedTraitObject`] if `self_ty` is a trait object without a
+    /// lifetime bound (its lifetime would default to the lifetime of the reference), and
+    /// [`EncodeError::UnsupportedConstType`] if the type of a const parameter is not a primitive
+    /// type.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// # use template_quote::quote;
+    /// let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    /// let generics: Generics = parse_quote!(<'a>);
+    /// let ty = slots
+    ///     .encode_generics_params_to_ty_with_self(&generics.params, &parse_quote!(__S), &[parse_quote!('a)])
+    ///     .unwrap();
+    /// let expected: Type = parse_quote!((&'a (), &'a __S));
+    /// assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
+    /// ```
+    pub fn encode_generics_params_to_ty_with_self<'a>(
+        &self,
+        iter: impl IntoIterator<Item = &'a GenericParam>,
+        self_ty: &Type,
+        self_outlives: &[Lifetime],
+    ) -> std::result::Result<Type, EncodeError> {
+        self.encode_params(iter, Some((self_ty, self_outlives)))
+    }
+
+    fn encode_params<'a>(
+        &self,
+        iter: impl IntoIterator<Item = &'a GenericParam>,
+        self_outlives: Option<(&Type, &[Lifetime])>,
     ) -> std::result::Result<Type, EncodeError> {
         let params: Vec<&GenericParam> = iter.into_iter().collect();
         let mut elems = params
@@ -202,7 +253,11 @@ impl RepeaterSlots {
             })
             .collect::<std::result::Result<Punctuated<Type, Token![,]>, _>>()?;
         // The arguments are the parameters themselves, which cannot fail.
-        elems.extend(encode_outlives_bounds(&params, &params_as_args(&params))?);
+        let args = params_as_args(&params);
+        elems.extend(encode_outlives_bounds(&params, &args)?);
+        if let Some((self_ty, lifetimes)) = self_outlives {
+            elems.extend(encode_self_outlives(&params, &args, self_ty, lifetimes)?);
+        }
         Ok(Type::Tuple(TypeTuple {
             paren_token: Default::default(),
             elems: with_trailing_comma(elems),
@@ -230,6 +285,8 @@ impl RepeaterSlots {
     ///   substituted: `T: 'a` with the arguments `'static` and `u8` is `&'static u8`, and `'b: 'a`
     ///   is `&'a &'b ()`.
     ///
+    /// - `Self: 'a` is not encoded (see [`RepeaterSlots::encode_generics_args_to_ty_with_self()`]).
+    ///
     /// Returns [`EncodeError`] if the type of a const parameter is not a primitive type, if there
     /// are too many arguments, if an argument without a default is missing, or if the argument of
     /// a type with a lifetime bound is a trait object without a lifetime bound (its lifetime bound
@@ -240,6 +297,50 @@ impl RepeaterSlots {
         iter: impl IntoIterator<Item = &'a GenericArgument>,
         params: &Punctuated<GenericParam, Token![,]>,
     ) -> std::result::Result<Type, EncodeError> {
-        encode_generics_args_with_params(iter, params, |value, cp| self.encode_const(value, &cp.ty))
+        encode_generics_args_with_params(iter, params, None, |value, cp| {
+            self.encode_const(value, &cp.ty)
+        })
+    }
+
+    /// Like [`RepeaterSlots::encode_generics_args_to_ty()`], with `Self: 'a` for each lifetime of
+    /// `self_outlives` (the lifetimes of
+    /// [`Referrer::context_self_outlives()`](crate::Referrer::context_self_outlives()), which are
+    /// parameters of `params`) encoded after the lifetime bounds as `&'b Self`, where `'b` is the
+    /// argument of `'a` and `Self` is `self_ty`: the type whose Repeater is used, i.e. `Self` in
+    /// the implementation of the Leaker's trait. It is the same type as the encoding of
+    /// [`RepeaterSlots::encode_generics_params_to_ty_with_self()`] (see there).
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// # use template_quote::quote;
+    /// let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    /// let generics: Generics = parse_quote!(<'a>);
+    /// // For `impl<'q> MyLeaker<'q> for ..`, where the Leaker's `'a` is `'q`
+    /// let args: AngleBracketedGenericArguments = parse_quote!(<'q>);
+    /// let ty = slots
+    ///     .encode_generics_args_to_ty_with_self(
+    ///         &args.args,
+    ///         &generics.params,
+    ///         &parse_quote!(Self),
+    ///         &[parse_quote!('a)],
+    ///     )
+    ///     .unwrap();
+    /// let expected: Type = parse_quote!((&'q (), &'q Self));
+    /// assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
+    /// ```
+    pub fn encode_generics_args_to_ty_with_self<'a>(
+        &self,
+        iter: impl IntoIterator<Item = &'a GenericArgument>,
+        params: &Punctuated<GenericParam, Token![,]>,
+        self_ty: &Type,
+        self_outlives: &[Lifetime],
+    ) -> std::result::Result<Type, EncodeError> {
+        encode_generics_args_with_params(
+            iter,
+            params,
+            Some((self_ty, self_outlives)),
+            |value, cp| self.encode_const(value, &cp.ty),
+        )
     }
 }

@@ -668,18 +668,22 @@ impl Leaker {
 }
 
 impl Leaker {
-    /// Returns `true` if `child` cannot be interned instead of `parent`, because the copy of
-    /// `parent` is well-formed only with a bound which the copy of `child` would not have: a
+    /// Returns `true` if `child` is not interned instead of `parent`, because the copy of
+    /// `parent` is well-formed only with a bound which the copy of `child` may not have: a
     /// reference with a lifetime requires its referent to outlive it (e.g. `Rel<T>: 'a` for
     /// `&'a Rel<T>`, or `Rel: 'static`), which holds for the type itself but cannot be proved of
-    /// the type which is interned in its place.
+    /// the type which is interned in its place. The context of the referent carries the bound of a
+    /// generic lifetime now (it has the lifetimes around it, see `Enclosing`), so this is no longer
+    /// needed for those: it is kept, so that a reference stays one entry as it did, and it is
+    /// needed for `'static`, which no context carries.
     ///
-    /// A trait object (also inside parentheses and groups) is not affected: it outlives the
-    /// lifetime if its own lifetime bound does, whatever its arguments are, and the copy keeps it
-    /// in the reference, so it keeps the bound it defaults to (`'a` for `&'a dyn Trait`). If the
-    /// trait object has to be interned itself, it cannot be alone, as its default would be
-    /// `'static`: the analysis makes the reference the type to intern then, so it has no
-    /// components (see `Inherits::Reference`). With `'static`, the default is the same alone.
+    /// A trait object (also inside parentheses and groups) is not affected: the copy keeps it in
+    /// the reference, so it keeps the bound it defaults to (`'a` for `&'a dyn Trait`), and its
+    /// arguments, which must outlive the lifetime as well (`dyn Tr<X> + 'b: 'a` requires `X: 'a`),
+    /// are the components, whose contexts carry the bound. If the trait object has to be interned
+    /// itself, it cannot be alone, as its default would be `'static`: the analysis makes the
+    /// reference the type to intern then, so it has no components (see `Inherits::Reference`).
+    /// With `'static`, the default is the same alone.
     fn needs_parent(&self, parent: &NodeKey) -> bool {
         match unwrap_type_group(&parent.ty.ty) {
             Type::Reference(TypeReference {

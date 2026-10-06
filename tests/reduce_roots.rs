@@ -581,11 +581,15 @@ fn test_reduce_roots_reference_to_a_trait_object() {
         }
     });
     assert_eq!(leaked, [entry(parse_quote!(Rel), "")]);
-    // The generics are those of the type inside, not of the reference.
+    // The generics are those of the type inside, not of the reference, with the bound which the
+    // reference implies on it (`dyn Tr<Item = X> + 'a: 'a` requires `X: 'a`).
     let item: ItemTrait = parse_quote! {
         trait Tr<'a, T> { fn f(&self, x: &'a dyn ::p::Tr<Item = Rel2<T>>); }
     };
-    assert_eq!(leaked_trait(&item), [entry(parse_quote!(Rel2<T>), "< T >")]);
+    assert_eq!(
+        leaked_trait(&item),
+        [entry(parse_quote!(Rel2<T>), "< 'a , T : 'a >")]
+    );
 
     // The trait object has to be interned itself (it names a relative trait, or a bare
     // identifier in it may be a const, which cannot be interned alone): it cannot be alone,

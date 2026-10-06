@@ -5,7 +5,9 @@
 //! reported as an error, and the effects of its components (the types to intern, the errors and
 //! the assumed primitives) are kept or discarded accordingly.
 
-use crate::context::{Context, Contexts, Scope, SelfRequirement};
+use crate::context::{
+    binder_lifetimes, Assumed, Context, Contexts, Enclosing, Scope, SelfRequirement,
+};
 use crate::encode::is_const_param_ty;
 use crate::graph::{NodeKey, TypeGraph};
 use crate::leaker::Leaker;
@@ -112,6 +114,12 @@ struct Frame {
     /// written (not a generic, `Self`, an absolute path, `crate::`, or a path portable with the
     /// module), so the type means something else in another module.
     relative: bool,
+    /// A type in the type was not interned alone because it mentions a lifetime of a `for<..>`
+    /// binder which its output mentions (see [`Binder`]): the depth of the type holding the
+    /// binder, which is interned as a whole instead, and the lifetime. It is kept until that type
+    /// is decided, which reports it in the note of the conflict (see
+    /// [`AnalyzeVisitor::own_context()`]).
+    binder: Option<(usize, Lifetime)>,
     /// The effects, which are applied if the type is decomposed.
     effects: Vec<Effect>,
 }
@@ -128,9 +136,54 @@ impl Frame {
             module_item: false,
             hard: false,
             relative: false,
+            binder: None,
             effects: Vec::new(),
         }
     }
+}
+
+/// A `for<..>` binder being visited, with the lifetimes which a type cannot be interned alone with:
+/// those which its output mentions (the return type of a function pointer, or of the
+/// parenthesized arguments of a trait (`Fn(A) -> R`), or an associated type binding
+/// (`Iterator<Item = R>`) in the bounds of the binder) and no input keeps as written. The copy
+/// `for<'x> Fn(<S as Repeater<&'x (), ..>>::Type) -> &'x u8` is rejected by rustc: a lifetime which
+/// occurs only in a projection is not constrained by the inputs (E0582 for the binding of an
+/// associated type, E0581 for the return type of a function pointer). If an input keeps `'x` where
+/// it is written (an *anchor*, see [`AnalyzeVisitor::unanchored()`]) it is constrained, whatever the
+/// types leaked alone are, and it is not among them.
+struct Binder {
+    /// The depth of the type holding the binder (a function pointer, a trait object or an
+    /// `impl Trait`), which is interned as a whole instead (the lifetime is bound inside it), or 0
+    /// if the binder is in a bound or a where predicate, where there is none.
+    owner: usize,
+    /// The lifetimes of the binder which its output mentions and no input anchors.
+    output: Vec<Lifetime>,
+}
+
+/// A lifetime of a `for<..>` binder which the output mentions, with the occurrences of it in the
+/// inputs which constrain it (see [`AnalyzeVisitor::unanchored()`]).
+struct OutputUse {
+    lifetime: Lifetime,
+    /// Each occurrence in a constraining position of the inputs, as the types from the input
+    /// holding it down to the one directly holding it (as the addresses of the syntax, the
+    /// outermost first; none if it is an argument of the bound itself). It stays in the copy as
+    /// written unless one of the types is interned: an anchor.
+    anchors: Vec<Vec<usize>>,
+}
+
+/// The output and the inputs of a function pointer, or of one bound (`Fn(A, B) -> R`,
+/// `Iterator<Item = R>`) of a trait object, an `impl Trait`, a predicate or a generic parameter,
+/// which rustc checks together (see [`Binder`]).
+struct BinderGroup<'a> {
+    /// The lifetimes of the binder which the output mentions.
+    output: Vec<Lifetime>,
+    inputs: Vec<BinderInput<'a>>,
+}
+
+/// An input of a [`BinderGroup`].
+enum BinderInput<'a> {
+    Type(&'a Type),
+    Lifetime(&'a Lifetime),
 }
 
 /// The result of applying the effects of [`AnalyzeVisitor`].
@@ -151,6 +204,12 @@ pub(crate) struct AnalyzeVisitor<'a> {
     /// `for<..>` binders), the innermost last. A type depending on them is interned with its
     /// [`Context`], which the Repeater's implementation declares.
     scopes: Vec<Scope>,
+    /// The `for<..>` binders being visited whose output mentions some of their lifetimes, the
+    /// innermost last (see [`Binder`]).
+    binders: Vec<Binder>,
+    /// Set while a binder is being probed (see [`AnalyzeVisitor::unanchored()`]): the addresses of
+    /// the types found to be interned as a whole.
+    probe: Option<HashSet<usize>>,
     /// The type parameters of the Leaker's generics with a default.
     root_defaulted: Vec<Ident>,
     /// What `Self` means where the syntax being visited is (see [`SelfRequirement`]), if known.
@@ -196,6 +255,12 @@ pub(crate) struct AnalyzeVisitor<'a> {
     /// expression would have a projection (`<Self as Repeater<..>>::Type`) in an anonymous
     /// constant, which is not permitted if the generics (or `Self`) are in it.
     expr_owner: Option<usize>,
+    /// The lifetimes which the type being visited must outlive because of the types around it,
+    /// and which its context carries (see [`Enclosing`]). The Referrer keeps track of the same
+    /// lifetimes where it looks the types up, so that it finds the entry of the type. While the
+    /// components of a type are visited, it is what they must outlive, and it is restored when
+    /// they are done. It is empty outside any type (and in an expression of a type).
+    enclosing: Enclosing,
 }
 
 /// What a trait object without a lifetime bound inherits its lifetime from (see
@@ -236,6 +301,8 @@ impl<'a> AnalyzeVisitor<'a> {
         Self {
             leaker,
             scopes: vec![Scope::new(generics)],
+            binders: Vec::new(),
+            probe: None,
             root_defaulted: generics
                 .params
                 .iter()
@@ -261,6 +328,7 @@ impl<'a> AnalyzeVisitor<'a> {
             ambiguous_arg: false,
             inherits: None,
             expr_owner: None,
+            enclosing: Enclosing::default(),
         }
     }
 
@@ -334,7 +402,13 @@ impl<'a> AnalyzeVisitor<'a> {
             || inner.mentions_self
             || inner.local_scope < self.scopes.len()
         {
-            Context::of(ty, &self.scopes, self.self_ty.as_ref(), &[])
+            Context::of(
+                ty,
+                &self.scopes,
+                self.self_ty.as_ref(),
+                &Assumed::default(),
+                &self.enclosing,
+            )
         } else {
             Context::none()
         };
@@ -390,6 +464,32 @@ impl<'a> AnalyzeVisitor<'a> {
         first_self_in_generics(context.generics())
     }
 
+    /// Returns the lifetime which `context` declares and which the output of a `for<..>` binder
+    /// being visited mentions (see [`Binder`]), with the depth of the type holding the binder
+    /// (the outermost binder first).
+    fn output_binder(&self, context: &Context) -> Option<(Lifetime, usize)> {
+        self.binders.iter().find_map(|binder| {
+            binder
+                .output
+                .iter()
+                .find(|lifetime| {
+                    context.generics().params.iter().any(|param| {
+                        matches!(param, GenericParam::Lifetime(param) if &param.lifetime == *lifetime)
+                    })
+                })
+                .map(|lifetime| (lifetime.clone(), binder.owner))
+        })
+    }
+
+    /// Returns the conflict of the type `ty` at `depth`, which is interned with the lifetime of a
+    /// binder (see [`Binder`]) but there is no type holding it to be interned as a whole.
+    fn binder_conflict(&self, inner: &Frame, depth: usize, lifetime: &Lifetime) -> CheckResult {
+        let mut conflict = self.causes(inner.must_start, inner.impossible_start, depth);
+        conflict.impossible.insert(0, quote!(#lifetime));
+        conflict.note = Some(binder_note(lifetime, false));
+        conflict
+    }
+
     /// Finishes the analysis, returning the effects to be applied.
     pub(crate) fn finish(self) -> Vec<Effect> {
         self.frame.effects
@@ -413,6 +513,7 @@ impl<'a> AnalyzeVisitor<'a> {
         self.frame.module_item |= inner.module_item;
         self.frame.hard |= inner.hard;
         self.frame.relative |= inner.relative;
+        self.merge_binder(&inner);
         let effects = std::mem::take(&mut inner.effects);
         self.frame.effects.extend(effects);
     }
@@ -430,8 +531,18 @@ impl<'a> AnalyzeVisitor<'a> {
         self.frame.module_item |= inner.module_item;
         self.frame.hard |= inner.hard;
         self.frame.relative |= inner.relative;
+        self.merge_binder(&inner);
         let effects = std::mem::take(&mut inner.effects);
         self.frame.effects.extend(effects);
+    }
+
+    /// Keeps the binder of the type just visited (see [`Frame::binder`]) for the enclosing type,
+    /// unless that is the type holding the binder.
+    fn merge_binder(&mut self, inner: &Frame) {
+        if self.frame.binder.is_none() {
+            let depth = self.type_depth;
+            self.frame.binder = inner.binder.clone().filter(|(owner, _)| *owner < depth);
+        }
     }
 
     /// Makes the causes found since `must_start` those of the type at `depth` (see
@@ -454,7 +565,15 @@ impl<'a> AnalyzeVisitor<'a> {
     ) -> std::result::Result<Context, CheckResult> {
         if self.impossibles.len() > inner.impossible_start {
             // The type cannot be interned (e.g. `MyType<'_>`).
-            return Err(self.causes(inner.must_start, inner.impossible_start, depth));
+            let mut conflict = self.causes(inner.must_start, inner.impossible_start, depth);
+            // A type in it, which is interned as a whole in its place, mentions a lifetime of a
+            // binder (see `Binder`).
+            conflict.note = inner
+                .binder
+                .as_ref()
+                .filter(|(owner, _)| *owner == depth)
+                .map(|(_, lifetime)| binder_note(lifetime, true));
+            return Err(conflict);
         }
         if self.in_default && inner.mentions_self {
             // The Repeater's implementation of the default cannot know what `Self` is, as the
@@ -500,6 +619,26 @@ impl<'a> AnalyzeVisitor<'a> {
             self.own_causes(inner.must_start, depth);
             inner.min_depth = depth;
         }
+        // A type interned as a whole (because of its own path, see `CheckResult::is_own`) with a
+        // lifetime of a `for<..>` binder which the output of the binder mentions cannot be (see
+        // `Binder`). The type holding the binder is interned as a whole instead, which can be
+        // (unless it is a conflict itself), or it is a conflict if there is none (the binder is in
+        // a bound).
+        let mut own = (inner.min_depth == depth).then(|| self.own_context(ty, depth, &inner));
+        if let (Some(_), Some(probe)) = (&own, &mut self.probe) {
+            probe.insert(ty as *const Type as usize);
+        }
+        let binder = match &own {
+            Some(Ok(context)) => self.output_binder(context),
+            _ => None,
+        };
+        if let Some((lifetime, owner)) = binder {
+            if owner > 0 {
+                inner.binder = Some((owner, lifetime));
+                return self.decide_as_owner(owner, inner);
+            }
+            own = Some(Err(self.binder_conflict(&inner, depth, &lifetime)));
+        }
         // The causes and the local generics also belong to the enclosing type, as those of a
         // component.
         self.frame.min_depth = self.frame.min_depth.min(inner.min_depth);
@@ -509,15 +648,15 @@ impl<'a> AnalyzeVisitor<'a> {
         self.frame.module_item |= inner.module_item;
         self.frame.hard |= inner.hard;
         self.frame.relative |= inner.relative;
+        self.merge_binder(&inner);
         let has_impossible = self.impossibles.len() > inner.impossible_start;
         let has_must = inner.min_depth != usize::MAX;
-        let is_own = inner.min_depth == depth;
         // The scopes declared inside the type (e.g. by a binder) are not in scope any more.
         let mentions_local = inner.local_scope < self.scopes.len();
         let effects = std::mem::take(&mut inner.effects);
 
-        if is_own {
-            match self.own_context(ty, depth, &inner) {
+        if let Some(own) = own {
+            match own {
                 Ok(context) => {
                     // If the type depends on both the type context and generics, it cannot be
                     // decomposed further. It is interned together with the generics it needs,
@@ -756,17 +895,243 @@ impl<'a> AnalyzeVisitor<'a> {
     }
 
     /// Runs `f` with the lifetimes of a `for<..>` binder (e.g. `'a` in `for<'a> Fn(&'a T)`) in
-    /// scope. They are treated as local generics, which the Repeater's implementation cannot
-    /// refer to.
+    /// scope. They are local generics: a type using one is interned with it among its generics,
+    /// which the Repeater's implementation declares. Unless the output of the binder mentions it
+    /// and no input anchors it (`uses` are the lifetimes of the binder which the output mentions,
+    /// see [`Binder`] and [`AnalyzeVisitor::unanchored()`]): a type using it is not interned alone
+    /// then, but with the type holding the binder.
+    ///
+    /// `f` may be run twice (see [`AnalyzeVisitor::unanchored()`]).
     fn with_bound_lifetimes(
         &mut self,
         lifetimes: Option<&BoundLifetimes>,
-        f: impl FnOnce(&mut Self),
+        uses: Vec<OutputUse>,
+        f: impl Fn(&mut Self),
     ) {
-        match lifetimes {
-            Some(lifetimes) => self.with_scope(Scope::binder(lifetimes), f),
-            None => f(self),
+        let lifetimes = match lifetimes {
+            Some(lifetimes) => lifetimes,
+            None => return f(self),
+        };
+        let output = self.unanchored(lifetimes, &uses, &f);
+        let tracked = !output.is_empty();
+        if tracked {
+            self.binders.push(Binder {
+                owner: self.type_depth,
+                output,
+            });
         }
+        self.with_scope(Scope::binder(lifetimes), |v| f(v));
+        if tracked {
+            self.binders.pop();
+        }
+    }
+
+    /// Returns the lifetimes of `uses` (those of the binder `lifetimes` which its output mentions)
+    /// which no input anchors: the types using them cannot be interned alone (see [`Binder`]).
+    ///
+    /// rustc requires a lifetime of the output to be constrained by the inputs, where a projection
+    /// constrains nothing, and the copy replaces the types leaked by projections. So a lifetime is
+    /// fine if an input keeps it where it is written in the copy: an *anchor*, an occurrence of it
+    /// in a position which constrains it (not in a projection, nor in an associated type binding,
+    /// see [`AnalyzeVisitor::scan_anchors()`]), with none of the types from the input down to
+    /// the occurrence interned. The types interned alone are those which depend on the type
+    /// context by their own path (they are interned as a whole), and those holding the binder
+    /// (see [`Binder`]), and no other, as a type which mentions a lifetime of the binder is never
+    /// interned unless it has a cause of its own (see [`AnalyzeVisitor::decide()`]: it depends on
+    /// local generics, so its components are interned instead), so the types on the way down to the
+    /// occurrence are decomposed, never interned whole.
+    ///
+    /// Whether a type has a cause of its own is known only when it is visited, and the anchor must
+    /// be known before the inputs are (a type using the lifetime may precede the anchor, as in
+    /// `Fn(Rel<'x>, &'x str) -> &'x str`, or the type holding the anchor may be interned itself, as
+    /// `Rel2<&'x str>` of `Fn(Rel2<&'x str>) -> &'x str` is). So the binder is probed first when
+    /// some lifetime has an occurrence: the same code visits it in an isolated state (restored
+    /// afterwards) which logs the types found to be interned as a whole. The binders inside it are
+    /// not probed again (the cost of a binder is that of its content, not exponential in the
+    /// nesting): they take all their lifetimes of the output as unanchored there, which can only
+    /// make more types interned, i.e. fewer anchors. Only the types on the way to an anchor count,
+    /// and a binder is never on it (see [`AnalyzeVisitor::scan_anchors()`]).
+    fn unanchored(
+        &mut self,
+        lifetimes: &BoundLifetimes,
+        uses: &[OutputUse],
+        f: &impl Fn(&mut Self),
+    ) -> Vec<Lifetime> {
+        let probing = self.probe.is_some();
+        // An anchor with no type in the way (an argument of the bound itself) cannot be lost.
+        let to_check = uses
+            .iter()
+            .any(|used| used.anchors.iter().any(|anchor| !anchor.is_empty()));
+        let own = if !probing && to_check {
+            self.probe_binder(lifetimes, f)
+        } else {
+            HashSet::new()
+        };
+        let mut unanchored: Vec<Lifetime> = Vec::new();
+        for used in uses {
+            let anchored = used
+                .anchors
+                .iter()
+                .any(|anchor| anchor.iter().all(|ty| !own.contains(ty)));
+            if !anchored && !unanchored.contains(&used.lifetime) {
+                unanchored.push(used.lifetime.clone());
+            }
+        }
+        unanchored
+    }
+
+    /// Runs `f` with the binder `lifetimes` in scope, without effect on the analysis, and returns
+    /// the addresses of the types found to be interned as a whole in it (see
+    /// [`AnalyzeVisitor::unanchored()`]).
+    fn probe_binder(
+        &mut self,
+        lifetimes: &BoundLifetimes,
+        f: &impl Fn(&mut Self),
+    ) -> HashSet<usize> {
+        let frame = Frame::new(self.musts.len(), self.impossibles.len());
+        let frame = std::mem::replace(&mut self.frame, frame);
+        let (musts, impossibles) = (self.musts.len(), self.impossibles.len());
+        self.probe = Some(HashSet::new());
+        self.with_scope(Scope::binder(lifetimes), |v| f(v));
+        self.frame = frame;
+        self.musts.truncate(musts);
+        self.impossibles.truncate(impossibles);
+        self.probe.take().unwrap_or_default()
+    }
+
+    /// Returns the lifetimes of the binder which the output of each group mentions
+    /// (see [`Binder`]), with their anchors in its inputs.
+    fn binder_uses(&self, groups: Vec<BinderGroup>) -> Vec<OutputUse> {
+        let mut uses = Vec::new();
+        for group in groups {
+            for lifetime in &group.output {
+                let mut anchors = Vec::new();
+                // The binders inside a probe do not look for anchors (see `unanchored()`).
+                if self.probe.is_none() {
+                    for input in &group.inputs {
+                        match input {
+                            BinderInput::Type(ty) => {
+                                self.scan_anchors(ty, lifetime, &mut Vec::new(), &mut anchors)
+                            }
+                            BinderInput::Lifetime(input) if *input == lifetime => {
+                                anchors.push(Vec::new())
+                            }
+                            BinderInput::Lifetime(_) => (),
+                        }
+                    }
+                }
+                uses.push(OutputUse {
+                    lifetime: lifetime.clone(),
+                    anchors,
+                });
+            }
+        }
+        uses
+    }
+
+    /// Finds the occurrences of the lifetime `wanted` in `ty` which constrain it in rustc's sense
+    /// (an input of a function pointer or of `Fn(..)` constrains the lifetimes it mentions, except
+    /// in a projection), pushing to `anchors` the types from the root of the input (`chain`, which
+    /// is the way down to `ty`, exclusive) down to the one holding it.
+    ///
+    /// Everything constrains, but a projection (`<T as Tr<'x>>::A`, `T::A<'x>`, `Self::A<'x>`),
+    /// the length of an array (an unevaluated constant) and `impl Trait`, and a path whose
+    /// definition is not seen is assumed to be a struct, an enum or a union (a type alias of a
+    /// projection, or one which drops the lifetime, does not constrain, and is not told from them).
+    /// rustc counts the associated type bindings and the lifetime bound of a trait object too,
+    /// which are not looked into: they are the output of a bound, not the input. Neither are the
+    /// function pointers and the bounds with a binder of their own, whose lifetimes are bound inside
+    /// them (a type holding a binder is interned as a whole if it is a cause of one, see
+    /// [`Binder`], which cannot be told from here), and type macros. When in doubt it is not an
+    /// anchor, the rule of [`Binder`] applies then.
+    fn scan_anchors(
+        &self,
+        ty: &Type,
+        wanted: &Lifetime,
+        chain: &mut Vec<usize>,
+        anchors: &mut Vec<Vec<usize>>,
+    ) {
+        chain.push(ty as *const Type as usize);
+        match ty {
+            Type::Reference(reference) => {
+                if reference.lifetime.as_ref() == Some(wanted) {
+                    anchors.push(chain.clone());
+                }
+                self.scan_anchors(&reference.elem, wanted, chain, anchors);
+            }
+            Type::Ptr(ptr) => self.scan_anchors(&ptr.elem, wanted, chain, anchors),
+            Type::Slice(slice) => self.scan_anchors(&slice.elem, wanted, chain, anchors),
+            Type::Array(array) => self.scan_anchors(&array.elem, wanted, chain, anchors),
+            Type::Paren(paren) => self.scan_anchors(&paren.elem, wanted, chain, anchors),
+            Type::Group(group) => self.scan_anchors(&group.elem, wanted, chain, anchors),
+            Type::Tuple(tuple) => {
+                for elem in &tuple.elems {
+                    self.scan_anchors(elem, wanted, chain, anchors);
+                }
+            }
+            Type::Path(TypePath { qself: None, path }) if !self.is_projection(path) => {
+                if let Some(seg) = path.segments.last() {
+                    self.scan_arguments(&seg.arguments, wanted, chain, anchors);
+                }
+            }
+            Type::TraitObject(object) => {
+                for bound in &object.bounds {
+                    match bound {
+                        TypeParamBound::Trait(bound) if bound.lifetimes.is_none() => {
+                            if let Some(seg) = bound.path.segments.last() {
+                                self.scan_arguments(&seg.arguments, wanted, chain, anchors);
+                            }
+                        }
+                        TypeParamBound::Lifetime(lifetime) if lifetime == wanted => {
+                            anchors.push(chain.clone())
+                        }
+                        _ => (),
+                    }
+                }
+            }
+            _ => (),
+        }
+        chain.pop();
+    }
+
+    /// Finds the occurrences of `wanted` in the generic arguments (the associated type bindings and
+    /// the output of `Fn(..) -> R` are not looked into), see [`AnalyzeVisitor::scan_anchors()`].
+    fn scan_arguments(
+        &self,
+        arguments: &PathArguments,
+        wanted: &Lifetime,
+        chain: &mut Vec<usize>,
+        anchors: &mut Vec<Vec<usize>>,
+    ) {
+        match arguments {
+            PathArguments::AngleBracketed(args) => {
+                for arg in &args.args {
+                    match arg {
+                        GenericArgument::Lifetime(lifetime) if lifetime == wanted => {
+                            anchors.push(chain.clone())
+                        }
+                        GenericArgument::Type(ty) => self.scan_anchors(ty, wanted, chain, anchors),
+                        _ => (),
+                    }
+                }
+            }
+            PathArguments::Parenthesized(args) => {
+                for ty in &args.inputs {
+                    self.scan_anchors(ty, wanted, chain, anchors);
+                }
+            }
+            PathArguments::None => (),
+        }
+    }
+
+    /// Returns `true` if `path` is a projection: an associated item of a generic parameter in
+    /// scope or of `Self` (`T::A`, `Self::A`), which constrains nothing (`<T as Tr>::A` has a
+    /// qualified self).
+    fn is_projection(&self, path: &Path) -> bool {
+        path.leading_colon.is_none()
+            && path.segments.len() > 1
+            && matches!(path.segments.first(), Some(seg)
+                if seg.ident == "Self" || self.is_generic(&seg.ident))
     }
 }
 
@@ -979,6 +1344,9 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
         let ambiguous = std::mem::take(&mut self.ambiguous_arg);
         let inherits = self.inherits.take();
         self.type_depth += 1;
+        // What the type must outlive is that of the components while they are visited.
+        let enclosing = self.enclosing.clone();
+        self.enclosing = enclosing.components_of(i, self.scopes.len());
         match i {
             Type::Macro(m) => {
                 // The tokens of a type macro cannot be analyzed, so it is interned as a whole (it
@@ -1044,6 +1412,7 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             }
             _ => syn::visit::visit_type(self, i),
         }
+        self.enclosing = enclosing;
         let inner = std::mem::replace(&mut self.frame, outer);
         // Also parentheses and groups around the trait object, which are not interned alone
         // either. One with a lifetime bound inherits nothing, but the reference is still the type
@@ -1081,7 +1450,17 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     }
 
     fn visit_type_bare_fn(&mut self, i: &TypeBareFn) {
-        self.with_bound_lifetimes(i.lifetimes.as_ref(), |v| {
+        let output = output_lifetimes(i.lifetimes.as_ref(), |v| v.visit_return_type(&i.output));
+        let group = BinderGroup {
+            output,
+            inputs: i
+                .inputs
+                .iter()
+                .map(|arg| BinderInput::Type(&arg.ty))
+                .collect(),
+        };
+        let uses = self.binder_uses(vec![group]);
+        self.with_bound_lifetimes(i.lifetimes.as_ref(), uses, |v| {
             syn::visit::visit_type_bare_fn(v, i)
         })
     }
@@ -1099,7 +1478,24 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
     }
 
     fn visit_predicate_type(&mut self, i: &PredicateType) {
-        self.with_bound_lifetimes(i.lifetimes.as_ref(), |v| {
+        // rustc checks each bound on its own, with the bounded type among its inputs.
+        let groups = i
+            .bounds
+            .iter()
+            .filter_map(|bound| match bound {
+                TypeParamBound::Trait(bound) => Some(bound),
+                _ => None,
+            })
+            .map(|bound| {
+                let output =
+                    output_lifetimes(i.lifetimes.as_ref(), |v| v.visit_bound_output(bound));
+                let mut inputs = vec![BinderInput::Type(&i.bounded_ty)];
+                bound_inputs(bound, &mut inputs);
+                BinderGroup { output, inputs }
+            })
+            .collect();
+        let uses = self.binder_uses(groups);
+        self.with_bound_lifetimes(i.lifetimes.as_ref(), uses, |v| {
             syn::visit::visit_predicate_type(v, i)
         })
     }
@@ -1111,7 +1507,11 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             self.relative_path(quote!(#i), quote!(#i));
             return;
         }
-        self.with_bound_lifetimes(i.lifetimes.as_ref(), |v| {
+        let output = output_lifetimes(i.lifetimes.as_ref(), |v| v.visit_bound_output(i));
+        let mut inputs = Vec::new();
+        bound_inputs(i, &mut inputs);
+        let uses = self.binder_uses(vec![BinderGroup { output, inputs }]);
+        self.with_bound_lifetimes(i.lifetimes.as_ref(), uses, |v| {
             syn::visit::visit_trait_bound(v, i)
         })
     }
@@ -1239,12 +1639,15 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
                 self.push_impossible(quote!(#i));
             }
         }
-        // The types in an expression of a type belong to the type (see `expr_owner`).
+        // The types in an expression of a type belong to the type (see `expr_owner`), and are not
+        // components of the types around it.
         let outer = self.expr_owner;
         if self.type_depth > 0 && outer.is_none() {
             self.expr_owner = Some(self.type_depth);
         }
+        let enclosing = std::mem::take(&mut self.enclosing);
         syn::visit::visit_expr(self, i);
+        self.enclosing = enclosing;
         self.expr_owner = outer;
     }
 
@@ -1305,6 +1708,155 @@ impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
             // A value with a relative path, which cannot be interned
             self.relative_path(quote!(#i), quote!(#i));
         }
+    }
+}
+
+/// The note of the conflict of a type using the lifetime of a `for<..>` binder (see [`Binder`]).
+/// `owned` is `true` if the type holding the binder would be interned as a whole instead, which is
+/// a conflict as well.
+fn binder_note(lifetime: &Lifetime, owned: bool) -> String {
+    format!(
+        "`{}` is declared by a `for<..>` binder and used in its output (a return type or an \
+         associated type binding), and no input keeps it as written, so a type using it cannot be \
+         leaked{}: the copy would have `{}` only in a projection, which does not constrain it \
+         (E0581, E0582)",
+        lifetime,
+        if owned {
+            " alone, and the type declaring the binder would be leaked as a whole instead"
+        } else {
+            ""
+        },
+        lifetime
+    )
+}
+
+/// Returns the lifetimes declared by the `for<..>` binder `lifetimes` which are mentioned by the
+/// output visited by `f` (see [`Binder`]).
+fn output_lifetimes(
+    lifetimes: Option<&BoundLifetimes>,
+    f: impl FnOnce(&mut OutputLifetimes),
+) -> Vec<Lifetime> {
+    let declared: Vec<Lifetime> = binder_lifetimes(lifetimes).collect();
+    if declared.is_empty() {
+        return Vec::new();
+    }
+    let mut visitor = OutputLifetimes {
+        declared,
+        shadowed: Vec::new(),
+        found: Vec::new(),
+    };
+    f(&mut visitor);
+    visitor.found
+}
+
+/// Pushes the inputs of the bound `bound` to `inputs`: the generic arguments of the trait
+/// (`Fn(A, B)` or `Tr<'x, A>`), not the associated type bindings or the return type, which are the
+/// output (see [`Binder`]).
+fn bound_inputs<'a>(bound: &'a TraitBound, inputs: &mut Vec<BinderInput<'a>>) {
+    let seg = match bound.path.segments.last() {
+        Some(seg) => seg,
+        None => return,
+    };
+    match &seg.arguments {
+        PathArguments::AngleBracketed(args) => {
+            for arg in &args.args {
+                match arg {
+                    GenericArgument::Lifetime(lifetime) => {
+                        inputs.push(BinderInput::Lifetime(lifetime))
+                    }
+                    GenericArgument::Type(ty) => inputs.push(BinderInput::Type(ty)),
+                    _ => (),
+                }
+            }
+        }
+        PathArguments::Parenthesized(args) => {
+            inputs.extend(args.inputs.iter().map(BinderInput::Type));
+        }
+        PathArguments::None => (),
+    }
+}
+
+/// Finds the lifetimes of a binder (`declared`) which are mentioned in the syntax visited, unless
+/// a binder inside it declares the same name (`shadowed`).
+struct OutputLifetimes {
+    declared: Vec<Lifetime>,
+    shadowed: Vec<Lifetime>,
+    found: Vec<Lifetime>,
+}
+
+impl OutputLifetimes {
+    fn mention(&mut self, lifetime: &Lifetime) {
+        if self.declared.contains(lifetime)
+            && !self.shadowed.contains(lifetime)
+            && !self.found.contains(lifetime)
+        {
+            self.found.push(lifetime.clone());
+        }
+    }
+
+    /// Scans the tokens, which are not parsed (e.g. of a macro), for the lifetimes by name.
+    fn scan(&mut self, tokens: TokenStream) {
+        let mut names = HashSet::new();
+        token_names(tokens, &mut names);
+        for lifetime in self.declared.clone() {
+            if names.contains(&lifetime.to_string()) {
+                self.mention(&lifetime);
+            }
+        }
+    }
+
+    /// Visits the output of a bound: the return type of the parenthesized arguments (`Fn(A) -> R`)
+    /// and the associated type bindings (`Iterator<Item = R>`). The bounds on an associated type
+    /// (`Iterator<Item: Tr<'x>>`) are not, they are where predicates which the lifetime is
+    /// declared for.
+    fn visit_bound_output(&mut self, bound: &TraitBound) {
+        for seg in &bound.path.segments {
+            match &seg.arguments {
+                PathArguments::Parenthesized(args) => self.visit_return_type(&args.output),
+                PathArguments::AngleBracketed(args) => {
+                    for arg in &args.args {
+                        if let GenericArgument::AssocType(binding) = arg {
+                            self.visit_type(&binding.ty);
+                        }
+                    }
+                }
+                PathArguments::None => (),
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for OutputLifetimes {
+    fn visit_lifetime(&mut self, i: &'ast Lifetime) {
+        self.mention(i);
+    }
+    fn visit_macro(&mut self, i: &'ast Macro) {
+        self.scan(i.tokens.clone());
+        syn::visit::visit_macro(self, i)
+    }
+    fn visit_type(&mut self, i: &'ast Type) {
+        if let Type::Verbatim(tokens) = i {
+            self.scan(tokens.clone());
+        }
+        syn::visit::visit_type(self, i)
+    }
+    fn visit_type_bare_fn(&mut self, i: &'ast TypeBareFn) {
+        let outer = self.shadowed.len();
+        self.shadowed.extend(binder_lifetimes(i.lifetimes.as_ref()));
+        syn::visit::visit_type_bare_fn(self, i);
+        self.shadowed.truncate(outer);
+    }
+    fn visit_trait_bound(&mut self, i: &'ast TraitBound) {
+        let outer = self.shadowed.len();
+        self.shadowed.extend(binder_lifetimes(i.lifetimes.as_ref()));
+        syn::visit::visit_trait_bound(self, i);
+        self.shadowed.truncate(outer);
+    }
+    fn visit_predicate_type(&mut self, i: &'ast PredicateType) {
+        let outer = self.shadowed.len();
+        self.shadowed.extend(binder_lifetimes(i.lifetimes.as_ref()));
+        syn::visit::visit_predicate_type(self, i);
+        self.shadowed.truncate(outer);
     }
 }
 
