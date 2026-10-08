@@ -1,15 +1,17 @@
 //! What the analysis of the [`Leaker`] found: the [`CheckResult`] of a type, and the effects of
 //! visiting it, which the [`Analysis`] turns into the graphs of the entries.
 
-use crate::context::{Context, Contexts};
+use crate::context::{Context, Contexts, SelfRequirement};
 use crate::error::NotInternableError;
 use crate::graph::{NodeKey, TypeGraph};
 #[cfg(doc)]
 use crate::leaker::Leaker;
+#[cfg(doc)]
+use crate::view::View;
 use proc_macro2::TokenStream;
 use syn::{Ident, Type};
 
-/// What [`Leaker::check()`] found in a type: causes that force it to be leaked, and causes that
+/// What [`View::check()`] found in a type: causes that force it to be leaked, and causes that
 /// forbid it.
 ///
 /// - Both empty: copy the type as it is.
@@ -17,21 +19,37 @@ use syn::{Ident, Type};
 ///   `::path::Wrap<MyType>`).
 /// - Only `impossible`: the type cannot be leaked and need not be (`impl ::path::Trait`).
 /// - Both: a conflict (`MyType<'_>`). Unless `is_own`, the parts can be leaked instead.
+///
+/// `Self` where it has no meaning (in a module, or in generics that no struct, enum, union, impl or
+/// trait encloses) is an `impossible` cause, with the mention of `Self` as written and a `note`.
+/// A scope fails on it, so it can be neither leaked nor copied. See [Self rules](crate#self-rules).
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct CheckResult {
     /// Causes that depend on the context (`A` and `B` in `::path::Wrap<A, B>`). Outermost first,
     /// then in order of appearance.
     pub must: Vec<TokenStream>,
-    /// Causes that cannot be leaked (an elided lifetime, `impl Trait`), in order of appearance.
+    /// Causes that cannot be leaked (an elided lifetime, `impl Trait`), in order of appearance,
+    /// then the mentions of `Self` that have no meaning.
     pub impossible: Vec<TokenStream>,
     /// `true` if the first of `must` is the type's own path (`MyType` in `MyType<'_>`), so the type
     /// must be leaked whole. `false` if `must` is empty or only its parts are causes
     /// (`::path::Wrap<MyType, '_>`). A bare identifier argument counts as a cause of the type
     /// holding it. See [Bare identifiers and consts](crate#bare-identifiers-and-consts).
     pub is_own: bool,
-    /// Explains the conflict if the causes do not (why `Self` cannot be leaked). Reported first.
+    /// `true` if the type is an optional entry: it has no cause of its own, and its own path names
+    /// an external crate (`::path::X`, `::path::Wrap<(MyType,)>`), which the Referrer may not
+    /// share. `must` holds only its parts, if any. A type with an impossible cause is not one, as
+    /// it is copied as written. See [External crates](crate#external-crates).
+    pub optional: bool,
+    /// Explains the conflict if the causes do not (why `Self` cannot be leaked, or has no
+    /// meaning). Reported first.
     pub note: Option<String>,
+    /// The headline of the error, if the fault is not that the path of the type is relative, which
+    /// the default `use absolute path: '..'` says. Set for a type that uses a generic whose bound
+    /// mentions a `Self` that has no name here (see [Self rules](crate#self-rules)): the fault is
+    /// that bound, `must` is the type that uses it, and `impossible` is the mention of `Self`.
+    pub headline: Option<String>,
 }
 
 pub(crate) struct PendingType {
@@ -153,13 +171,14 @@ fn collect_errors(effects: &[Effect], errors: &mut Vec<CheckResult>) {
     }
 }
 
-/// Returns `true` if a type that may become an entry names `Self`, so the Referrer needs to know
-/// what `Self` is to find it.
-pub(crate) fn names_self(effects: &[Effect]) -> bool {
+/// Returns `true` if a type that may become an entry names `Self`, or has bounds rewritten for the
+/// `Self` that `declared` is, so the Referrer needs to know what `Self` is to find it.
+pub(crate) fn names_self(effects: &[Effect], declared: &SelfRequirement) -> bool {
     effects.iter().any(|effect| match effect {
         Effect::Type(pending) => {
-            (pending.in_graph && pending.context.self_ty().is_some())
-                || names_self(&pending.components)
+            (pending.in_graph
+                && (pending.context.self_ty().is_some() || pending.context.substitutes(declared)))
+                || names_self(&pending.components, declared)
         }
         _ => false,
     })

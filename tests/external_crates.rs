@@ -2,6 +2,9 @@
 //! entries of the Referrer: the Leaker's `allowed_paths`, `Referrer::must()`,
 //! `Referrer::external_crates_require()` and `Referrer::allow_ambiguous_crate_name()`.
 
+mod common;
+
+use common::check_in;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
@@ -127,16 +130,25 @@ fn absolute_paths_which_are_not_types_are_copied() {
 #[test]
 fn check_does_not_report_absolute_types() {
     // `check()` tells the causes which make a type be interned: an absolute path of an external
-    // crate is not one, as the Referrer may not replace it (as before).
-    let leaker = leaker();
-    let result = leaker.check(&parse_quote!(::foo::W<(Rel,)>), &Generics::default());
+    // crate is not one, as the Referrer may not replace it (as before). Such a type is an optional
+    // entry, which `check()` tells too.
+    let mut leaker = leaker();
+    let generics = Generics::default();
+    let result = check_in(&mut leaker, &parse_quote!(::foo::W<(Rel,)>), &generics);
     assert_eq!(
         result.must.iter().map(squash).collect::<Vec<_>>(),
         vec!["Rel"]
     );
     assert!(!result.is_own);
-    let result = leaker.check(&parse_quote!(::foo::X), &Generics::default());
+    assert!(result.optional);
+    let result = check_in(&mut leaker, &parse_quote!(::foo::X), &generics);
     assert!(result.must.is_empty() && result.impossible.is_empty());
+    assert!(result.optional);
+    // Not so if it has a cause of its own, or cannot be leaked.
+    let result = check_in(&mut leaker, &parse_quote!(::foo::W<Rel>), &generics);
+    assert!(result.is_own && !result.optional);
+    let result = check_in(&mut leaker, &parse_quote!(::foo::W<'_>), &generics);
+    assert!(!result.impossible.is_empty() && !result.optional);
 }
 
 #[test]
@@ -150,9 +162,9 @@ fn core_is_never_a_node() {
     let entries = entries_of(item);
     assert_eq!(entries, vec![entry("Rel", true, &[])]);
     // `check()` agrees.
-    let leaker = leaker();
+    let mut leaker = leaker();
     let ty: Type = parse_quote!(::core::option::Option<(Rel,)>);
-    let result = leaker.check(&ty, &Generics::default());
+    let result = check_in(&mut leaker, &ty, &Generics::default());
     assert_eq!(
         result.must.iter().map(squash).collect::<Vec<_>>(),
         vec!["Rel"]
@@ -248,7 +260,7 @@ fn allowed_absolute_path_is_never_a_node() {
     let ty: Type = parse_quote!(::foo::W<(Rel,)>);
     let mut config = LeakerConfig::new();
     config.allowed_paths.push(parse_quote!(::foo));
-    let result = Leaker::from_config(config).check(&ty, &Generics::default());
+    let result = check_in(&mut Leaker::from_config(config), &ty, &Generics::default());
     assert_eq!(
         result.must.iter().map(squash).collect::<Vec<_>>(),
         vec!["Rel"]

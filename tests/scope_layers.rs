@@ -6,6 +6,9 @@
 //! one), the entries, the rollback of the call as one unit, the panics and what `Self` and
 //! `allow_self` mean.
 
+mod common;
+
+use common::visit_function;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{ContextId, Leaker, NotInternableError, Referrer, SelfRequirement, View};
@@ -610,11 +613,16 @@ use absolute path: 'Wrap2 < Self >'
 
 #[test]
 fn a_scope_of_an_item_or_a_module_adds_no_scope_of_its_own() {
-    // `visit_signature()` compares the generics of the signature with those of the innermost scope
-    // (whose generics are those of the Leaker if it is the outermost one): a module has none of its
-    // own, and an item is the scope of its generics.
+    // A function which is the analyzed item is visited in the scope of its generics (`as_item()`),
+    // whose generics are those of the Leaker if it is the outermost one: a module has none of its
+    // own, and an item is the scope of its generics. The same function nested in a scope has local
+    // generics (`nested()`).
     let sig: Signature = parse_quote!(fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b ());
     let plain: Signature = parse_quote!(fn g(x: ::p::W<dyn RelTr>));
+    let as_item = |v: &mut View<'_>, sig: &Signature| visit_function(v, sig);
+    let nested = |v: &mut View<'_>, sig: &Signature| {
+        v.visit_item(&parse_quote!(#sig { loop {} }));
+    };
     let b: Generics = parse_quote!(<'b>);
     let none = Generics::default();
     let mut lines = Vec::new();
@@ -626,53 +634,53 @@ fn a_scope_of_an_item_or_a_module_adds_no_scope_of_its_own() {
     };
     for kind in ["struct", "impl", "trait"] {
         check(format!("{} of the generics", kind), &|l| {
-            outcome(enter!(l, kind, &b, true, |v| v.visit_signature(&sig)))
+            outcome(enter!(l, kind, &b, true, |v| as_item(v, &sig)))
         });
         check(format!("{} of others", kind), &|l| {
-            outcome(enter!(l, kind, &none, true, |v| v.visit_signature(&sig)))
+            outcome(enter!(l, kind, &none, true, |v| nested(v, &sig)))
         });
         check(format!("{}, mod", kind), &|l| {
             outcome(enter!(l, kind, &b, true, |v| {
-                v.enter_mod("m", [], |v| v.visit_signature(&sig)).unwrap();
+                v.enter_mod("m", [], |v| as_item(v, &sig)).unwrap();
             }))
         });
         check(format!("generics, {} of the generics", kind), &|l| {
             outcome(l.enter_generics(&b, |v| {
-                outcome(enter!(v, kind, &b, true, |v| v.visit_signature(&sig)))
+                outcome(enter!(v, kind, &b, true, |v| nested(v, &sig)))
             }))
         });
         check(format!("mod, {} of the generics", kind), &|l| {
             outcome(l.enter_mod("m", [], |v| {
-                outcome(enter!(v, kind, &b, true, |v| v.visit_signature(&sig)))
+                outcome(enter!(v, kind, &b, true, |v| nested(v, &sig)))
             }))
         });
         check(format!("{}, {}, mod", kind, kind), &|l| {
             outcome(enter!(l, kind, &b, true, |v| {
                 outcome(enter!(v, kind, &b, true, |v| {
-                    outcome(v.enter_mod("m", [], |v| v.visit_signature(&sig)))
+                    outcome(v.enter_mod("m", [], |v| nested(v, &sig)))
                 }))
             }))
         });
     }
     check("mod".to_string(), &|l| {
-        outcome(l.enter_mod("m", [], |v| v.visit_signature(&sig)))
+        outcome(l.enter_mod("m", [], |v| nested(v, &sig)))
     });
     check("mod, no generics".to_string(), &|l| {
-        outcome(l.enter_mod("m", [], |v| v.visit_signature(&plain)))
+        outcome(l.enter_mod("m", [], |v| as_item(v, &plain)))
     });
     check("generics, mod".to_string(), &|l| {
         outcome(l.enter_generics(&b, |v| {
-            v.enter_mod("m", [], |v| v.visit_signature(&sig)).unwrap();
+            v.enter_mod("m", [], |v| as_item(v, &sig)).unwrap();
         }))
     });
     check("mod, mod, no generics".to_string(), &|l| {
         outcome(l.enter_mod("m", [], |v| {
-            v.enter_mod("n", [], |v| v.visit_signature(&plain)).unwrap();
+            v.enter_mod("n", [], |v| as_item(v, &plain)).unwrap();
         }))
     });
     check("mod, generics".to_string(), &|l| {
         outcome(l.enter_mod("m", [], |v| {
-            outcome(v.enter_generics(&b, |v| v.visit_signature(&sig)))
+            outcome(v.enter_generics(&b, |v| nested(v, &sig)))
         }))
     });
     pin("signatures", &lines.join("\n"), SIGNATURES);

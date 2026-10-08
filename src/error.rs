@@ -19,7 +19,11 @@ pub enum NotInternableError {
     ///
     /// Examples: `MyType` in `MyType<'_>`, a trait in a bound, a value in a const expression, and
     /// `Rel` in `F: for<'x> Fn(Rel<'x>) -> &'x u8` ([Binder lifetimes](crate#binder-lifetimes)).
-    /// Each conflict is reported at the first of its [`CheckResult::must`], with
+    /// Also a type with a generic whose bound names the `Self` of a trait (or `Self::X`), where
+    /// `Self` is something else, so the bound cannot be written ([Self rules](crate#self-rules)).
+    /// That is not about the path of the type, so its headline is "the bound of `T` mentions a
+    /// `Self` which has no name here" ([`CheckResult::headline`]), with a note on why, at the
+    /// type. Each conflict is reported at the first of its [`CheckResult::must`], with
     /// [`CheckResult::is_own`] `true`. For a trait bound, a value or the type of a const
     /// parameter, [`CheckResult::impossible`] is that bound, value or parameter. Never empty.
     RelativePath(Vec<CheckResult>),
@@ -42,7 +46,8 @@ struct Report {
     notes: Vec<(Span, String)>,
 }
 
-const SELF_NOTE: &str = "`Self` has no meaning here: it is declared only by a struct, an enum, a \
+pub(crate) const SELF_NOTE: &str =
+    "`Self` has no meaning here: it is declared only by a struct, an enum, a \
                          union, an impl or a trait, not by a module or generics";
 
 impl NotInternableError {
@@ -98,7 +103,10 @@ impl NotInternableError {
                 }));
                 Some(Report {
                     tokens: tokens.clone(),
-                    message: format!("use absolute path: '{}'", tokens),
+                    message: conflict
+                        .headline
+                        .clone()
+                        .unwrap_or_else(|| format!("use absolute path: '{}'", tokens)),
                     notes,
                 })
             })

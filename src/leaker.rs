@@ -1,6 +1,6 @@
 //! The [`Leaker`], which finds the types depending on the type context.
 
-use crate::analysis::{names_self, Analysis, CheckResult};
+use crate::analysis::{names_self, Analysis};
 use crate::analyze::{
     declared_names, AnalyzeVisitor, Finished, ModuleNames, Res, ScopeSpec, Scopes,
 };
@@ -128,13 +128,15 @@ impl Leaker {
     /// values. The trait path must not depend on the context. For `allow_self` see
     /// [`Leaker::intern_struct()`]. This is [`Leaker::enter_impl()`] with the item visited.
     pub fn intern_impl(&mut self, item: &ItemImpl, allow_self: bool) -> Res<ContextId> {
-        self.enter_impl(&item.generics, &item.self_ty, allow_self, |view| {
-            // The walk analyzes the trait's arguments but does not check its path.
-            if let Some((_, path, _)) = &item.trait_ {
-                view.check_bound_path(path);
-            }
-            syn::visit::visit_item_impl(view, item)
-        })
+        // The scope checks the path of the trait, and the walk analyzes its arguments.
+        let trait_path = item.trait_.as_ref().map(|(_, path, _)| path);
+        self.enter_impl_of(
+            &item.generics,
+            &item.self_ty,
+            trait_path,
+            allow_self,
+            |view| syn::visit::visit_item_impl(view, item),
+        )
         .map(|(context, ())| context)
     }
 
@@ -266,15 +268,6 @@ impl Leaker {
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
         Scopes::enter_trait(self, ident, generics, allow_self, f)
-    }
-
-    /// Checks whether `ty` must become an entry, and whether it can ([`CheckResult`]).
-    ///
-    /// `ty` is checked alone, so `Self` is not denied: only `Rel` is a cause of `Rel<Self>`. Use a
-    /// scope that declares `Self` to deny it. An absolute path of an external crate (`::foo::X`) is
-    /// not a cause, so `::foo::W<Rel>` has only `Rel`.
-    pub fn check(&self, ty: &Type, generics: &Generics) -> CheckResult {
-        AnalyzeVisitor::check(AllowedPaths::new(&self.allowed_paths), ty, generics)
     }
 
     /// Finishes the analysis and returns the [`Referrer`]. It calls [`Leaker::reduce_roots()`] if
@@ -415,8 +408,11 @@ impl Scopes for Leaker {
         self.types.merge(analysis.types);
         self.optional_types.merge(analysis.optional);
         // Shares the context of an entry that uses exactly these generics.
-        // `Self` is part of the top-level context only if an entry names it.
-        let scope_self = spec.declared_self().filter(|_| names_self(&effects));
+        // `Self` is part of the top-level context only if an entry names it, or has a bound
+        // rewritten for it (see `Context::of()`).
+        let scope_self = spec
+            .declared_self()
+            .filter(|declared| names_self(&effects, declared));
         let top_level =
             module.unwrap_or_else(|| self.contexts.intern(Context::new(root, scope_self)));
         self.top_levels.insert(top_level);

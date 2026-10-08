@@ -2,7 +2,7 @@ use proc_macro2::TokenStream;
 use std::collections::BTreeSet;
 use syn::*;
 use template_quote::quote;
-use type_leak::{ContextId, Leaker, NotInternableError};
+use type_leak::{CheckResult, ContextId, Leaker, NotInternableError, View};
 
 /// Converts the required types of a `Referrer` (see `Referrer::must()`) to a `BTreeSet<String>`
 /// for order-independent comparison. The optional ones, which only the paths of external crates
@@ -30,4 +30,41 @@ pub fn intern_fns(
     let where_clause = &generics.where_clause;
     let item: ItemTrait = parse_quote!(trait Tr #generics #where_clause { #items });
     leaker.intern_trait(&item, allow_self)
+}
+
+/// Analyzes the types of the function `sig`, which is itself the analyzed item, in a scope that
+/// declares its generics: its inputs, its output and its where clause (see `View`). The function
+/// has no receiver.
+#[allow(dead_code)]
+pub fn visit_function(view: &mut View<'_>, sig: &Signature) {
+    for input in &sig.inputs {
+        if let FnArg::Typed(arg) = input {
+            view.visit_type(&arg.ty);
+        }
+    }
+    if let ReturnType::Type(_, ty) = &sig.output {
+        view.visit_type(ty);
+    }
+    if let Some(where_clause) = &sig.generics.where_clause {
+        view.visit_where_clause(where_clause);
+    }
+}
+
+/// Enters the generics of the function `sig` and analyzes it there ([`visit_function()`]).
+#[allow(dead_code)]
+pub fn enter_function(
+    leaker: &mut Leaker,
+    sig: &Signature,
+) -> std::result::Result<(ContextId, ()), NotInternableError> {
+    leaker.enter_generics(&sig.generics, |view| visit_function(view, sig))
+}
+
+/// Checks `ty` in a scope that declares the generics `generics` and nothing else (see
+/// `View::check()`). `Self` has no meaning there.
+#[allow(dead_code)]
+pub fn check_in(leaker: &mut Leaker, ty: &Type, generics: &Generics) -> CheckResult {
+    leaker
+        .enter_generics(generics, |view| view.check(ty))
+        .unwrap()
+        .1
 }

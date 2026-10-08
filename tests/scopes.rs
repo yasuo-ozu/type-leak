@@ -1,6 +1,10 @@
 //! The scopes of the `Leaker` (`enter_*()`) and the `View` they give to their closure: what each
 //! scope declares, nested scopes, `Self`, and the rollback of a scope which fails.
 
+mod common;
+
+use common::{enter_function, visit_function};
+use syn::visit::Visit;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{ContextId, Leaker, NotInternableError, Referrer, SelfRequirement, View};
@@ -250,7 +254,8 @@ fn the_entry_points_of_the_view() {
             view.visit_path_arguments(&PathArguments::AngleBracketed(parse_quote!(
                 <Rel3, (T, Rel4)>
             )));
-            // A path, as the root of a trait bound: it is not leaked, its arguments are.
+            // A path at the root (`Visit::visit_path()`): it is not checked nor leaked, its
+            // arguments are.
             view.visit_path(&parse_quote!(::p::Tr::<Rel5>));
             // A where clause and a bound.
             view.visit_where_clause(&parse_quote!(where T: ::p::Tr<Rel6>));
@@ -261,7 +266,7 @@ fn the_entry_points_of_the_view() {
                     loop {}
                 }
             ));
-            // A signature, whose generics are local ones as well.
+            // A signature (`Visit::visit_signature()`), whose generics are local ones as well.
             view.visit_signature(&parse_quote!(fn g<W>(x: Rel10<W>) -> Rel11));
         })
         .unwrap();
@@ -1169,14 +1174,14 @@ fn modules_are_serialized() {
 
 #[test]
 fn the_format_of_the_previous_version_is_rejected() {
-    assert_eq!(Referrer::FORMAT_VERSION, 3);
+    assert_eq!(Referrer::FORMAT_VERSION, 4);
     // The serialized form of a module in the format 1.
     let old: proc_macro2::TokenStream =
         "\"type-leak-format-1\" 2 mod self ; (Rel) mod a :: b ; (Rel)"
             .parse()
             .unwrap();
     let err = parse2::<Referrer>(old).err().unwrap();
-    assert!(err.to_string().contains("format 1, expected 3"), "{}", err);
+    assert!(err.to_string().contains("format 1, expected 4"), "{}", err);
     // The format 2 had the same grammar, but its top-level contexts did not tell `Self` or the
     // module of the scope, which the visitor needs.
     let old: proc_macro2::TokenStream =
@@ -1184,12 +1189,21 @@ fn the_format_of_the_previous_version_is_rejected() {
             .parse()
             .unwrap();
     let err = parse2::<Referrer>(old).err().unwrap();
-    assert!(err.to_string().contains("format 2, expected 3"), "{}", err);
+    assert!(err.to_string().contains("format 2, expected 4"), "{}", err);
+    // The format 3 had the same grammar too, but a top-level context did not tell `Self` when only
+    // a bound rewritten for it depended on it (`T: Tr<Self>` as `T: Tr<S<T>>`).
+    let old: proc_macro2::TokenStream = "\"type-leak-format-3\" 2 < T > ; () < T > ; (Rel)"
+        .parse()
+        .unwrap();
+    let err = parse2::<Referrer>(old).err().unwrap();
+    assert!(err.to_string().contains("format 3, expected 4"), "{}", err);
     // And one without a module is too.
-    let old: proc_macro2::TokenStream = "\"type-leak-format-1\" (MyType)".parse().unwrap();
-    assert!(parse2::<Referrer>(old).is_err());
-    let old: proc_macro2::TokenStream = "\"type-leak-format-2\" (MyType)".parse().unwrap();
-    assert!(parse2::<Referrer>(old).is_err());
+    for version in 1..=3 {
+        let old: proc_macro2::TokenStream = format!("\"type-leak-format-{}\" (MyType)", version)
+            .parse()
+            .unwrap();
+        assert!(parse2::<Referrer>(old).is_err(), "format {}", version);
+    }
     let current = format!("\"type-leak-format-{}\" (MyType)", Referrer::FORMAT_VERSION);
     assert!(parse_str::<Referrer>(&current).is_ok());
 }
@@ -1911,7 +1925,11 @@ fn a_nested_item_has_a_self_of_its_own_whatever_the_scope_around_says() {
     // A function does not declare `Self`, so it is the one of the scope around which it denies.
     let mut leaker = Leaker::new();
     let result = leaker.enter_impl(&Generics::default(), &parse_quote!(::p::W), false, |view| {
-        view.visit_signature(&parse_quote!(fn f() -> Rel<Self>));
+        view.visit_item(&parse_quote!(
+            fn f() -> Rel<Self> {
+                loop {}
+            }
+        ));
     });
     assert!(result.is_err());
     // The items of a module analyzed as a whole have their own, as they have always had (the
@@ -2035,32 +2053,65 @@ fn allow_self_applies_to_traits() {
     }
 }
 
-// ── `visit_signature()` ──────────────────────────────────────────────────────────────────────
+// ── a function as the analyzed item, and `Visit::visit_signature()` ──────────────────────────
 
 #[test]
-fn visit_signature_declares_the_generics_of_the_signature_once() {
-    // A function analyzed with its generics as those of the Leaker: it is not declared again, so
-    // the lifetime is the Leaker's, and the signature is compared with no declaration.
+fn a_function_which_is_the_analyzed_item_is_analyzed_in_a_scope_of_its_generics() {
+    // The function is the item analyzed: its generics are those of the Leaker (the scope declares
+    // them), and the types of the signature are visited in it.
     let sig: Signature = parse_quote!(fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b ());
     let mut leaker = Leaker::new();
-    let (top, ()) = leaker
-        .enter_generics(&sig.generics, |view| view.visit_signature(&sig))
-        .unwrap();
+    let (top, ()) = enter_function(&mut leaker, &sig).unwrap();
     let referrer = leaker.finish();
     assert_eq!(
         entries(&referrer),
         [e(":: p :: W < 'b , dyn RelTr >", "< 'b >")]
     );
     assert_eq!(s(referrer.context_generics(top)), "< 'b >");
-    // The same signature with its generics local ones, as for a method, which the Repeater's copy
-    // would turn into an early-bound lifetime where the trait's is late-bound (E0195).
-    for scope in 0..3 {
+    // The lifetime is a generic of the scope: the signature is not compared with a declaration, so
+    // it is not checked for E0195, which only the generics of a method or a nested function are.
+    // Nor is it when the scope is nested in another one.
+    let mut leaker = Leaker::new();
+    let (_, inner) = leaker
+        .enter_generics(&Generics::default(), |view| {
+            view.enter_generics(&sig.generics, |view| visit_function(view, &sig))
+                .map(|_| ())
+        })
+        .unwrap();
+    assert!(inner.is_ok());
+}
+
+#[test]
+fn the_generics_of_a_method_are_local_and_checked_for_e0195() {
+    // The same signature as a method: the lifetime is local, which the Repeater's copy would turn
+    // into an early-bound one where the trait's is late-bound (E0195).
+    let sig: Signature = parse_quote!(fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b ());
+    for scope in 0..4 {
         let mut leaker = Leaker::new();
         let result = match scope {
-            0 => leaker.enter_generics(&Generics::default(), |view| view.visit_signature(&sig)),
-            1 => leaker.enter_impl(&Generics::default(), &parse_quote!(::p::W), true, |view| {
-                view.visit_signature(&sig)
+            // A function nested in generics (it is no method, but its generics are local too).
+            0 => leaker.enter_generics(&Generics::default(), |view| {
+                view.visit_item(&parse_quote!(
+                    fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () {
+                        loop {}
+                    }
+                ))
             }),
+            1 => leaker.enter_impl(&Generics::default(), &parse_quote!(::p::W), true, |view| {
+                let method: ImplItemFn = parse_quote!(
+                    fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () {
+                        loop {}
+                    }
+                );
+                view.visit_impl_item_fn(&method)
+            }),
+            2 => leaker.enter_trait(&ident("Tr"), &Generics::default(), true, |view| {
+                let method: TraitItemFn = parse_quote!(
+                    fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b ();
+                );
+                view.visit_trait_item_fn(&method)
+            }),
+            // The signature alone is the one of a method.
             _ => leaker.enter_trait(&ident("Tr"), &Generics::default(), true, |view| {
                 view.visit_signature(&sig)
             }),
@@ -2072,18 +2123,13 @@ fn visit_signature_declares_the_generics_of_the_signature_once() {
             scope
         );
     }
-    // Any other generics around do not declare those of the signature.
+    // Generics around do not declare those of the signature, whichever they are.
     let mut leaker = Leaker::new();
     let result = leaker.enter_generics(&parse_quote!(<'a>), |view| view.visit_signature(&sig));
     assert!(result.is_err());
-    // Nor does a nested scope with them, and the outermost one is not compared.
     let mut leaker = Leaker::new();
-    let result = leaker.enter_generics(&Generics::default(), |view| {
-        view.enter_generics(&sig.generics, |view| view.visit_signature(&sig))
-            .map(|_| ())
-    });
-    // (A nested scope has local generics, which are compared with a declaration.)
-    assert!(result.unwrap().1.is_err());
+    let result = leaker.enter_generics(&sig.generics, |view| view.visit_signature(&sig));
+    assert!(result.is_err());
 }
 
 #[test]
@@ -2132,6 +2178,25 @@ fn visit_signature_is_visit_item_of_a_nested_function() {
         })
         .unwrap();
     assert_eq!(leaker.finish().iter().count(), 1);
+}
+
+#[test]
+fn the_signature_of_a_foreign_function_declares_nothing() {
+    // It is not a method: the lifetime of its signature is not declared, so it is not checked for
+    // E0195 (as `Visit::visit_signature()` does for a method).
+    let item: ItemMod = parse_quote!(
+        mod m {
+            extern "C" {
+                fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b ();
+            }
+        }
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_mod(&item).unwrap();
+    assert_eq!(
+        entries(&leaker.finish()),
+        [e(":: p :: W < 'b , dyn RelTr >", ""), e("& 'b ()", "")]
+    );
 }
 
 // ── `NotInternableError::SelfWithoutMeaning` ─────────────────────────────────────────────────
@@ -2186,8 +2251,8 @@ fn self_without_meaning_is_an_error_of_its_own() {
 // ── the root of a trait bound ────────────────────────────────────────────────────────────────
 
 #[test]
-fn visit_path_checks_the_path_like_a_bound() {
-    // A portable path is fine, and its arguments are analyzed.
+fn visit_path_at_the_root_analyzes_the_arguments_and_does_not_check_the_path() {
+    // `Visit::visit_path()` outside a type: the path is not leaked, the types in its arguments are.
     let mut leaker = Leaker::new();
     leaker
         .enter_generics(&parse_quote!(<T>), |view| {
@@ -2200,7 +2265,42 @@ fn visit_path_checks_the_path_like_a_bound() {
         entries(&leaker.finish()),
         [e("Rel < T >", "< T >"), e("Rel2", "")]
     );
-    // A relative path is not, as in `visit_type_param_bound()`.
+    // It does not check it: a relative path, or `Self` where it has no meaning, is no error.
+    let mut leaker = Leaker::new();
+    leaker
+        .enter_generics(&Generics::default(), |view| {
+            view.visit_path(&parse_quote!(Tr<Rel>));
+            view.visit_path(&parse_quote!(m::Tr<Rel2>));
+            view.visit_path(&parse_quote!(self::Tr));
+            view.visit_path(&parse_quote!(Self::X));
+        })
+        .unwrap();
+    assert_eq!(entries(&leaker.finish()), [e("Rel", ""), e("Rel2", "")]);
+    let mut leaker = Leaker::new();
+    leaker
+        .enter_trait(&ident("Tr"), &Generics::default(), true, |view| {
+            view.visit_path(&parse_quote!(Self::X))
+        })
+        .unwrap();
+    assert!(leaker.finish().is_empty());
+}
+
+#[test]
+fn visit_type_param_bound_checks_the_root_of_a_trait_bound() {
+    // A portable path is fine, and its arguments are analyzed.
+    let mut leaker = Leaker::new();
+    leaker
+        .enter_generics(&parse_quote!(<T>), |view| {
+            view.visit_type_param_bound(&parse_quote!(::p::Tr<Rel<T>>));
+            view.visit_type_param_bound(&parse_quote!(::core::marker::Copy));
+            view.visit_type_param_bound(&parse_quote!(::p::Tr<Rel2>));
+        })
+        .unwrap();
+    assert_eq!(
+        entries(&leaker.finish()),
+        [e("Rel < T >", "< T >"), e("Rel2", "")]
+    );
+    // A relative path is not, whatever it is.
     for path in [
         parse_quote!(Tr),
         parse_quote!(Tr<Rel>),
@@ -2209,41 +2309,21 @@ fn visit_path_checks_the_path_like_a_bound() {
         parse_quote!(super::Tr),
     ] {
         let path: Path = path;
-        let by_path = Leaker::new()
-            .enter_generics(&Generics::default(), |view| view.visit_path(&path))
-            .unwrap_err();
-        let by_bound = Leaker::new()
+        let err = Leaker::new()
             .enter_generics(&Generics::default(), |view| {
                 view.visit_type_param_bound(&parse_quote!(#path))
             })
             .unwrap_err();
-        assert!(
-            by_path.to_string().starts_with("use absolute path"),
-            "{}",
-            s(&path)
-        );
+        // The error is about the path of the trait, at the root.
         assert_eq!(
-            by_path.to_string().lines().next(),
-            by_bound.to_string().lines().next(),
+            err.to_string(),
+            format!("use absolute path: '{}'", s(&path)),
             "{}",
             s(&path)
         );
     }
-    // The error is about the path of the trait, at the root.
-    let err = Leaker::new()
-        .enter_generics(&Generics::default(), |view| {
-            view.visit_path(&parse_quote!(Tr<Rel>))
-        })
-        .unwrap_err();
-    assert_eq!(err.to_string(), "use absolute path: 'Tr < Rel >'");
     // `Self` at the root is an error where it has no meaning, and in the scope of an item it is a
     // path of the type context (a trait is not an associated type).
-    let err = Leaker::new()
-        .enter_generics(&Generics::default(), |view| {
-            view.visit_path(&parse_quote!(Self::X))
-        })
-        .unwrap_err();
-    assert!(matches!(err, NotInternableError::SelfWithoutMeaning(_)));
     let err = Leaker::new()
         .enter_generics(&Generics::default(), |view| {
             view.visit_type_param_bound(&parse_quote!(Self::X))
@@ -2252,16 +2332,55 @@ fn visit_path_checks_the_path_like_a_bound() {
     assert!(matches!(err, NotInternableError::SelfWithoutMeaning(_)));
     let err = Leaker::new()
         .enter_trait(&ident("Tr"), &Generics::default(), true, |view| {
-            view.visit_path(&parse_quote!(Self::X))
+            view.visit_type_param_bound(&parse_quote!(Self::X))
         })
         .unwrap_err();
     assert!(err
         .to_string()
         .starts_with("use absolute path: 'Self :: X'"));
+}
+
+#[test]
+fn an_impl_checks_the_path_of_its_trait_on_entering_the_scope() {
     // The path of the trait of an impl is checked in the same way.
     let item: ItemImpl = parse_quote!(impl Tr for W {});
     let err = Leaker::new().intern_impl(&item, true).unwrap_err();
     assert_eq!(err.to_string(), "use absolute path: 'Tr'");
     let item: ItemImpl = parse_quote!(impl ::p::Tr for W {});
     assert!(Leaker::new().intern_impl(&item, true).is_ok());
+    // The check comes first, before what is visited of the impl, and the arguments of the trait
+    // are analyzed once (`Rel` is one entry).
+    let item: ItemImpl = parse_quote!(
+        impl<T: Rel3> m::Tr<Rel> for W<T> {
+            type A = Rel4<'_>;
+        }
+    );
+    let err = Leaker::new().intern_impl(&item, true).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "use absolute path: 'm :: Tr < Rel >'\nuse absolute path: 'Rel3'\n\
+         use absolute path: 'Rel4 < '_ >'"
+    );
+    let item: ItemImpl = parse_quote!(impl ::p::Tr<Rel> for () {});
+    let mut leaker = Leaker::new();
+    leaker.intern_impl(&item, true).unwrap();
+    assert_eq!(entries(&leaker.finish()), [e("Rel", "")]);
+    // `enter_impl()` has no trait: the caller visits the bound, or the arguments of the path.
+    let item: ItemImpl = parse_quote!(impl Tr<Rel> for W {});
+    let (_, trait_path, _) = item.trait_.as_ref().unwrap();
+    let mut leaker = Leaker::new();
+    let err = leaker
+        .enter_impl(&item.generics, &item.self_ty, true, |view| {
+            view.visit_type_param_bound(&parse_quote!(#trait_path))
+        })
+        .unwrap_err();
+    assert_eq!(err.to_string(), "use absolute path: 'Tr < Rel >'");
+    // The same path visited as `Visit::visit_path()` is not checked.
+    let mut leaker = Leaker::new();
+    leaker
+        .enter_impl(&item.generics, &item.self_ty, true, |view| {
+            view.visit_path(trait_path)
+        })
+        .unwrap();
+    assert_eq!(entries(&leaker.finish()), [e("Rel", "")]);
 }

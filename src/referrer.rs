@@ -3,7 +3,9 @@
 use crate::context::{Context, ContextId, Enclosing, ModuleInfo, Scope, SelfRequirement};
 use crate::encode::{complete_generics_args, param_as_arg, without_encoded_bounds, EncodeError};
 use crate::graph::TypeKey;
-use crate::util::{first_self_in_generics, generic_param_name, mentions_names, type_mentions_self};
+use crate::util::{
+    first_self_in_generics, generic_param_name, mentions_names, type_mentions_self, ReplaceSelf,
+};
 use proc_macro2::{Literal, Punct, Spacing, Span, TokenStream};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -165,7 +167,8 @@ impl Referrer {
     ) -> Option<usize> {
         match matching {
             Matching::Scope { self_ty, .. } => {
-                let context = Context::of(ty, scopes, self_ty, enclosing);
+                // A bound that has no name here (see `Context::of()`) is in no entry.
+                let context = Context::of(ty, scopes, self_ty, enclosing).ok()?;
                 let entry = entry.without_module();
                 if context == entry {
                     Some(0)
@@ -180,7 +183,7 @@ impl Referrer {
                     return None;
                 }
                 let root = param_names(scopes[0].params());
-                let context = Context::of(ty, &scopes[..1], None, enclosing);
+                let context = Context::of(ty, &scopes[..1], None, enclosing).ok()?;
                 let used = param_names(&context.generics().params);
                 let entry_params = param_names(&entry.generics().params);
                 (used.is_subset(&entry_params) && entry_params.is_subset(&root))
@@ -200,7 +203,7 @@ impl Referrer {
             found.module().map_or(ModulePos::Outside, ModulePos::In)
         };
         (
-            Scope::new(found.generics()),
+            Scope::new(found.generics(), found.self_ty().cloned()),
             found.self_ty().cloned(),
             module,
         )
@@ -315,7 +318,8 @@ impl Referrer {
     /// For an entry's context it is `Some` only if the types name `Self`. The Repeater impl is for
     /// any type (`None`), for the implementors of the trait ([`SelfRequirement::Bound`]) or for
     /// the type ([`SelfRequirement::Type`]). For the top-level context of a scope it is what the
-    /// scope declares, but only if an entry of the scope names `Self`: nothing else depends on it.
+    /// scope declares, but only if an entry names `Self`, or has a bound of the scope's generics
+    /// rewritten for it (a nested scope has a `Self` of its own): nothing else depends on it.
     /// It is `None` for a scope that declares nothing (`enter_generics()`, a module). So a
     /// top-level id tells the Referrer what `Self` is where it matters. See
     /// [Self rules](crate#self-rules).
@@ -448,7 +452,7 @@ impl Referrer {
                 let ty = self.expand_with(
                     Matching::Default,
                     ModulePos::Outside,
-                    &mut vec![Scope::new(&root)],
+                    &mut vec![Scope::new(&root, None)],
                     None,
                     default.clone(),
                     |ty, ix| {
@@ -544,8 +548,11 @@ impl Referrer {
     /// `T` of `impl<T: Clone> MyTrait<T> for ..`, must be declared as the entry has it, unless you
     /// call [`Visitor::with_outermost_generics_as_leakers()`]. An entry which has, besides, bounds
     /// on `Self` alone (`where Self: Sized`) is found too, if no entry has exactly the context:
-    /// a copy where `Self` is a type parameter cannot write them. Visit the whole item, not a
-    /// type cut out of another.
+    /// a copy where `Self` is a type parameter cannot write them. A struct, enum, union, trait or
+    /// impl nested in the copy has a `Self` of its own, as in the Leaker: a type there that uses a
+    /// generic of `context` whose bound names `Self` has it rewritten for the `Self` of `context`
+    /// ([Self rules](crate#self-rules)), so the copy must nest the same items as the scopes of the
+    /// Leaker. Visit the whole item, not a type cut out of another.
     ///
     /// # Panics
     /// Panics if `context` is not one of the [`Referrer::contexts()`].
@@ -563,9 +570,10 @@ impl Referrer {
             scopes: vec![scope],
             outermost_as_leakers: false,
             self_ty: None,
-            // The items of a module are nested items, which declare their own `Self`.
+            // The items of a module are nested items.
             item_depth: usize::from(in_module),
             own_self: false,
+            defaults_without_self: false,
             module,
         }
     }
@@ -682,106 +690,6 @@ fn param_names<'a>(params: impl IntoIterator<Item = &'a GenericParam>) -> HashSe
     params.into_iter().map(generic_param_name).collect()
 }
 
-#[derive(Clone, Copy)]
-struct ReplaceSelf<'a> {
-    self_ty: &'a Type,
-}
-
-impl<'a> ReplaceSelf<'a> {
-    fn replace_tokens(&self, tokens: TokenStream) -> TokenStream {
-        use proc_macro2::{Group, TokenTree};
-        tokens
-            .into_iter()
-            .map(|tt| match tt {
-                TokenTree::Ident(ident) if ident == "Self" => self.self_ty.to_token_stream(),
-                TokenTree::Group(group) => {
-                    let mut new =
-                        Group::new(group.delimiter(), self.replace_tokens(group.stream()));
-                    new.set_span(group.span());
-                    TokenTree::Group(new).into()
-                }
-                tt => tt.into(),
-            })
-            .collect()
-    }
-
-    // `Some(Some(rest))` for `Self::A::B`, `Some(None)` for `Self` alone.
-    fn strip_self(path: &Path) -> Option<Option<Path>> {
-        let first = path.segments.first()?;
-        if path.leading_colon.is_some() || first.ident != "Self" || !first.arguments.is_none() {
-            return None;
-        }
-        // The `::` after the qualified self type (see `qself()`).
-        Some((path.segments.len() > 1).then(|| Path {
-            leading_colon: Some(Default::default()),
-            segments: path.segments.iter().skip(1).cloned().collect(),
-        }))
-    }
-
-    fn qself(&self) -> QSelf {
-        QSelf {
-            lt_token: Default::default(),
-            ty: Box::new(self.self_ty.clone()),
-            position: 0,
-            as_token: None,
-            gt_token: Default::default(),
-        }
-    }
-
-    fn fold_type_with(&self, folder: &mut impl syn::fold::Fold, ty: Type) -> Type {
-        let stripped = match &ty {
-            Type::Path(TypePath { qself: None, path }) => Self::strip_self(path),
-            _ => None,
-        };
-        match (ty, stripped) {
-            (_, Some(None)) => self.self_ty.clone(),
-            (_, Some(Some(rest))) => Type::Path(TypePath {
-                qself: Some(self.qself()),
-                path: folder.fold_path(rest),
-            }),
-            (Type::Verbatim(tokens), _) => Type::Verbatim(self.replace_tokens(tokens)),
-            (ty, _) => syn::fold::fold_type(folder, ty),
-        }
-    }
-
-    /// `Self` alone in an expression is a value, so only `Self::A` is replaced.
-    fn fold_expr_with(&self, folder: &mut impl syn::fold::Fold, expr: Expr) -> Expr {
-        let stripped = match &expr {
-            Expr::Path(ExprPath {
-                qself: None, path, ..
-            }) => Self::strip_self(path),
-            _ => None,
-        };
-        match (expr, stripped) {
-            (Expr::Path(path), Some(Some(rest))) => Expr::Path(ExprPath {
-                qself: Some(self.qself()),
-                path: folder.fold_path(rest),
-                ..path
-            }),
-            (expr, _) => syn::fold::fold_expr(folder, expr),
-        }
-    }
-}
-
-impl<'a> syn::fold::Fold for ReplaceSelf<'a> {
-    fn fold_type(&mut self, ty: Type) -> Type {
-        let this = *self;
-        this.fold_type_with(self, ty)
-    }
-
-    fn fold_expr(&mut self, expr: Expr) -> Expr {
-        let this = *self;
-        this.fold_expr_with(self, expr)
-    }
-
-    fn fold_macro(&mut self, i: Macro) -> Macro {
-        Macro {
-            tokens: self.replace_tokens(i.tokens),
-            ..i
-        }
-    }
-}
-
 // Prefix of the placeholder names in `Referrer::complete_args()`.
 const PLACEHOLDER: &str = "__TypeLeakPlaceholder";
 
@@ -816,8 +724,8 @@ impl<'a, F: FnMut(Type, usize, &[GenericArgument]) -> Type> syn::fold::Fold for 
 /// Rewrites a copy by replacing its leaked types. Get it with [`Referrer::visitor()`].
 ///
 /// It implements `syn::visit_mut::VisitMut` and tracks the generics in scope: those of the
-/// context it was made for, then those the visited syntax declares. A type is replaced only if an
-/// entry has the context it has there. So `T: Clone` of a visited `impl<T: Clone>` does not match
+/// context it was made for, then those the visited syntax declares, each with the `Self` in force
+/// where it is declared. A type is replaced only if an entry has the context it has there. So `T: Clone` of a visited `impl<T: Clone>` does not match
 /// an entry with `T` alone, unless you call [`Visitor::with_outermost_generics_as_leakers()`].
 ///
 /// Visit a whole type or item. A type cut out of another is looked up with nothing around it
@@ -830,15 +738,20 @@ impl<'a, F: FnMut(Type, usize, &[GenericArgument]) -> Type> syn::fold::Fold for 
 pub struct Visitor<F> {
     referrer: Referrer,
     type_fn: Rc<RefCell<F>>,
-    /// What `Self` means in the context.
+    /// What `Self` means here: in the context, or in the nested item that declares it. Each scope
+    /// in `scopes` keeps the one in force where it was declared.
     self_requirement: Option<SelfRequirement>,
     /// The generics in scope, innermost last. The first are those of the context.
     scopes: Vec<Scope>,
     outermost_as_leakers: bool,
     self_ty: Option<Type>,
     item_depth: usize,
-    /// In a nested item that defines its own `Self`.
+    /// In a nested struct, enum, union, trait or impl, which declare their own `Self`. A function,
+    /// type alias, trait alias, const or static keeps the `Self` around, as in the Leaker.
     own_self: bool,
+    /// While the generics of a scope that this visit declares are visited: the defaults of their
+    /// parameters have no `Self`, as in the Leaker (see `Visitor::visit_type_param_mut()`).
+    defaults_without_self: bool,
     module: ModulePos,
 }
 
@@ -853,6 +766,7 @@ impl<F> Clone for Visitor<F> {
             self_ty: self.self_ty.clone(),
             item_depth: self.item_depth,
             own_self: self.own_self,
+            defaults_without_self: self.defaults_without_self,
             module: self.module,
         }
     }
@@ -962,25 +876,45 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
     /// `generics` are those of the context, in any order and with the bounds anywhere.
     fn is_context_generics(&self, generics: &Generics) -> bool {
         let canonical = Context::new(generics.clone(), None);
-        self.scopes.first() == Some(&Scope::new(canonical.generics()))
+        let canonical = Scope::new(canonical.generics(), None);
+        matches!(self.scopes.first(), Some(first) if first.same_generics(&canonical))
     }
 
     /// Visits the attributes, then returns a nested visitor that has visited `generics` and has
-    /// them in scope. `item` is for an item, which may define its own `Self`.
-    fn enter(&mut self, attrs: &mut [Attribute], generics: &mut Generics, item: bool) -> Self {
+    /// them in scope. `item` is for an item, not an associated item. `declares` is what `Self` is
+    /// in an item that declares it (a struct, an enum, a union, a trait or an impl), as the Leaker
+    /// has it. The other items keep the `Self` around.
+    fn enter(
+        &mut self,
+        attrs: &mut [Attribute],
+        generics: &mut Generics,
+        declares: Option<SelfRequirement>,
+        item: bool,
+    ) -> Self {
         self.visit_attrs(attrs);
         let mut visitor = self.clone();
         visitor.item_depth += 1;
-        // Only an item nested in the visited syntax defines its own `Self`.
-        visitor.own_self |= item && self.item_depth > 0;
+        // Only an item nested in the visited syntax that declares `Self` has one of its own: the
+        // Leaker keeps the `Self` around for a function, a type alias or a trait alias.
+        if self.item_depth > 0 {
+            if let Some(declared) = declares {
+                visitor.own_self = true;
+                visitor.self_requirement = Some(declared);
+            }
+        }
         // Declare before visiting: every parameter is in scope of each other's bounds. The
         // outermost item is the scope itself if it declares the generics of the context as they
         // are, or if `with_outermost_generics_as_leakers()` says so: they are not declared again.
         let outermost = item && self.item_depth == 0;
-        if !(outermost && (self.outermost_as_leakers || self.is_context_generics(generics))) {
-            visitor.scopes.push(Scope::new(generics));
+        let declared =
+            !(outermost && (self.outermost_as_leakers || self.is_context_generics(generics)));
+        if declared {
+            let declared_for = visitor.self_requirement.clone();
+            visitor.scopes.push(Scope::new(generics, declared_for));
         }
+        visitor.defaults_without_self = declared;
         visitor.visit_generics_mut(generics);
+        visitor.defaults_without_self = false;
         visitor
     }
 
@@ -990,7 +924,7 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
         sig: &mut Signature,
         item: bool,
     ) -> Self {
-        let mut visitor = self.enter(attrs, &mut sig.generics, item);
+        let mut visitor = self.enter(attrs, &mut sig.generics, None, item);
         for input in sig.inputs.iter_mut() {
             visitor.visit_fn_arg_mut(input);
         }
@@ -1030,6 +964,27 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         syn::visit_mut::visit_trait_bound_mut(self, i);
         self.scopes.truncate(depth);
     }
+    fn visit_type_param_mut(&mut self, i: &mut TypeParam) {
+        if !self.defaults_without_self {
+            return syn::visit_mut::visit_type_param_mut(self, i);
+        }
+        // The Leaker analyzes the default of a parameter of a nested scope without `Self`: it
+        // cannot depend on it, so the bounds of the scopes around that mention `Self` are
+        // rewritten for the `Self` they were written for, also where the nested scope has the same
+        // one. The scope itself is declared without `Self` for its default.
+        let default = i.default.take();
+        syn::visit_mut::visit_type_param_mut(self, i);
+        i.default = default;
+        if let Some(default) = &mut i.default {
+            let self_requirement = self.self_requirement.take();
+            let own = self.scopes.last_mut().map(|scope| scope.replace_self(None));
+            self.visit_type_mut(default);
+            if let (Some(scope), Some(own)) = (self.scopes.last_mut(), own) {
+                scope.replace_self(own);
+            }
+            self.self_requirement = self_requirement;
+        }
+    }
     fn visit_const_param_mut(&mut self, i: &mut ConstParam) {
         // The type of a const parameter cannot be an associated type path, so it stays.
         self.visit_attrs(&mut i.attrs);
@@ -1038,17 +993,20 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         }
     }
     fn visit_item_struct_mut(&mut self, i: &mut ItemStruct) {
-        self.enter(&mut i.attrs, &mut i.generics, true)
+        let declares = SelfRequirement::of_item(&i.ident, &i.generics);
+        self.enter(&mut i.attrs, &mut i.generics, Some(declares), true)
             .visit_fields_mut(&mut i.fields);
     }
     fn visit_item_enum_mut(&mut self, i: &mut ItemEnum) {
-        let mut visitor = self.enter(&mut i.attrs, &mut i.generics, true);
+        let declares = SelfRequirement::of_item(&i.ident, &i.generics);
+        let mut visitor = self.enter(&mut i.attrs, &mut i.generics, Some(declares), true);
         for variant in i.variants.iter_mut() {
             visitor.visit_variant_mut(variant);
         }
     }
     fn visit_item_trait_mut(&mut self, i: &mut ItemTrait) {
-        let mut visitor = self.enter(&mut i.attrs, &mut i.generics, true);
+        let declares = SelfRequirement::of_trait(&i.ident, &i.generics);
+        let mut visitor = self.enter(&mut i.attrs, &mut i.generics, Some(declares), true);
         for supertrait in i.supertraits.iter_mut() {
             visitor.visit_type_param_bound_mut(supertrait);
         }
@@ -1057,24 +1015,26 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         }
     }
     fn visit_item_trait_alias_mut(&mut self, i: &mut ItemTraitAlias) {
-        let mut visitor = self.enter(&mut i.attrs, &mut i.generics, true);
+        let mut visitor = self.enter(&mut i.attrs, &mut i.generics, None, true);
         for bound in i.bounds.iter_mut() {
             visitor.visit_type_param_bound_mut(bound);
         }
     }
     fn visit_item_union_mut(&mut self, i: &mut ItemUnion) {
-        self.enter(&mut i.attrs, &mut i.generics, true)
+        let declares = SelfRequirement::of_item(&i.ident, &i.generics);
+        self.enter(&mut i.attrs, &mut i.generics, Some(declares), true)
             .visit_fields_named_mut(&mut i.fields);
     }
     fn visit_item_type_mut(&mut self, i: &mut ItemType) {
-        self.enter(&mut i.attrs, &mut i.generics, true)
+        self.enter(&mut i.attrs, &mut i.generics, None, true)
             .visit_type_mut(&mut i.ty);
     }
     fn visit_signature_mut(&mut self, i: &mut Signature) {
         self.enter_signature(&mut [], i, true);
     }
     fn visit_item_impl_mut(&mut self, i: &mut ItemImpl) {
-        let mut visitor = self.enter(&mut i.attrs, &mut i.generics, true);
+        let declares = SelfRequirement::Type((*i.self_ty).clone());
+        let mut visitor = self.enter(&mut i.attrs, &mut i.generics, Some(declares), true);
         if let Some((_, path, _)) = &mut i.trait_ {
             visitor.visit_path_mut(path);
         }
@@ -1088,7 +1048,7 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         visitor.visit_block_mut(&mut i.block);
     }
     fn visit_impl_item_type_mut(&mut self, i: &mut ImplItemType) {
-        self.enter(&mut i.attrs, &mut i.generics, false)
+        self.enter(&mut i.attrs, &mut i.generics, None, false)
             .visit_type_mut(&mut i.ty);
     }
     fn visit_item_mod_mut(&mut self, i: &mut ItemMod) {
@@ -1096,8 +1056,9 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         if let Some((_, items)) = &mut i.content {
             let mut visitor = self.clone();
             visitor.module = self.referrer.module_in(self.module, &i.ident);
-            // A module has no generics: it only makes its items nested.
+            // A module has no generics: it only makes its items nested. `Self` has no meaning in it.
             visitor.item_depth += 1;
+            visitor.self_requirement = None;
             visitor.shadow_items(items.iter(), true);
             for item in items.iter_mut() {
                 visitor.visit_item_mut(item);
@@ -1115,7 +1076,7 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         }
     }
     fn visit_trait_item_type_mut(&mut self, i: &mut TraitItemType) {
-        let mut visitor = self.enter(&mut i.attrs, &mut i.generics, false);
+        let mut visitor = self.enter(&mut i.attrs, &mut i.generics, None, false);
         for bound in i.bounds.iter_mut() {
             visitor.visit_type_param_bound_mut(bound);
         }
@@ -1124,7 +1085,7 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         }
     }
     fn visit_trait_item_const_mut(&mut self, i: &mut TraitItemConst) {
-        let mut visitor = self.enter(&mut i.attrs, &mut i.generics, false);
+        let mut visitor = self.enter(&mut i.attrs, &mut i.generics, None, false);
         visitor.visit_type_mut(&mut i.ty);
         if let Some((_, expr)) = &mut i.default {
             visitor.visit_expr_mut(expr);
@@ -1163,8 +1124,10 @@ impl Referrer {
     // an entry is found. Docs, errors and encoders need no bump.
     // 1: first tagged, contexts carry the bounds enclosing types imply. 2: modules are contexts
     // (`mod 3 ;`, `mod { .. } ;`), no `Self = # 0 ;`. 3: the top-level context of a scope keeps
-    // what `Self` means and the module the scope is in, for `Referrer::visitor()`.
-    pub const FORMAT_VERSION: u32 = 3;
+    // what `Self` means and the module the scope is in, for `Referrer::visitor()`. 4: it keeps
+    // `Self` also when an outer bound was rewritten for it (`T: Tr<Self>` as `T: Tr<S<T>>`). The
+    // tokens look the same, but the data of 3 would not find those entries the same way.
+    pub const FORMAT_VERSION: u32 = 4;
 }
 
 /// Parses a [`Referrer`] written by its [`ToTokens`] implementation.

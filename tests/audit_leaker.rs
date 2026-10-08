@@ -2,6 +2,9 @@
 //! module keys, the causes found in trait objects, impls, macros and qualified paths, and the
 //! assumptions about primitive types.
 
+mod common;
+
+use common::check_in;
 use syn::*;
 use template_quote::quote;
 use type_leak::{Leaker, LeakerConfig, Referrer, SelfRequirement};
@@ -139,20 +142,20 @@ fn dyn_lifetime_bounds_are_visited() {
         optional_entries(&referrer),
         [e(":: std :: boxed :: Box < dyn RelTr + 'a >", "< 'a >")]
     );
-    let leaker = Leaker::new();
+    let mut leaker = Leaker::new();
     let generics = Generics::default();
     // `'_` is impossible.
     let ty: Type = parse_quote!(::p::Wrap<dyn ::p::Tr + '_>);
-    let result = leaker.check(&ty, &generics);
+    let result = check_in(&mut leaker, &ty, &generics);
     assert_eq!(result.impossible.iter().map(s).collect::<Vec<_>>(), ["'_"]);
     // A lifetime which is not a generic is a cause.
     let ty: Type = parse_quote!(::p::Wrap<dyn ::p::Tr + 'b>);
-    let result = leaker.check(&ty, &generics);
+    let result = check_in(&mut leaker, &ty, &generics);
     assert_eq!(result.must.iter().map(s).collect::<Vec<_>>(), ["'b"]);
     assert!(result.impossible.is_empty());
     // A generic one is not.
     let generics: Generics = parse_quote!(<'b>);
-    let result = leaker.check(&ty, &generics);
+    let result = check_in(&mut leaker, &ty, &generics);
     assert!(result.must.is_empty());
 }
 
@@ -280,7 +283,11 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
     });
     assert_eq!(entries(&referrer), [e("dyn RelTr", "")]);
     // `check()` agrees.
-    let result = Leaker::new().check(&parse_quote!(&dyn RelTr), &Generics::default());
+    let result = check_in(
+        &mut Leaker::new(),
+        &parse_quote!(&dyn RelTr),
+        &Generics::default(),
+    );
     assert_eq!(
         result.impossible.iter().map(s).collect::<Vec<_>>(),
         ["& dyn RelTr", "dyn RelTr"]
@@ -501,17 +508,32 @@ fn qualified_self_through_generics() {
         trait Tr<T> { fn f(&self) -> Wrap<<T>::X>; }
     });
     assert_eq!(entries(&referrer), [e("Wrap < < T > :: X >", "< T >")]);
+    // `check()` in the trait agrees, where `Self` is the implementor.
     let generics: Generics = parse_quote!(<T>);
-    let leaker = Leaker::new();
-    let result = leaker.check(&parse_quote!(<T>::X), &generics);
-    assert!(result.must.is_empty() && result.impossible.is_empty());
-    let result = leaker.check(&parse_quote!(<Self>::X), &generics);
-    assert!(result.must.is_empty() && result.impossible.is_empty());
+    let mut leaker = Leaker::new();
+    let (_, results) = leaker
+        .enter_trait(&parse_quote!(Tr), &generics, true, |view| {
+            let mut check = |ty: Type| view.check(&ty);
+            [
+                check(parse_quote!(<T>::X)),
+                check(parse_quote!(<Self>::X)),
+                check(parse_quote!(<Rel>::X)),
+                check(parse_quote!(<U>::X)),
+            ]
+        })
+        .unwrap();
+    let [through_param, through_self, relative, undeclared] = results;
+    assert!(through_param.must.is_empty() && through_param.impossible.is_empty());
+    assert!(through_self.must.is_empty() && through_self.impossible.is_empty());
     // Otherwise it is impossible.
-    let result = leaker.check(&parse_quote!(<Rel>::X), &generics);
-    assert_eq!(result.impossible.iter().map(s).collect::<Vec<_>>(), ["Rel"]);
-    let result = leaker.check(&parse_quote!(<U>::X), &generics);
-    assert_eq!(result.impossible.iter().map(s).collect::<Vec<_>>(), ["U"]);
+    assert_eq!(
+        relative.impossible.iter().map(s).collect::<Vec<_>>(),
+        ["Rel"]
+    );
+    assert_eq!(
+        undeclared.impossible.iter().map(s).collect::<Vec<_>>(),
+        ["U"]
+    );
 }
 
 #[test]

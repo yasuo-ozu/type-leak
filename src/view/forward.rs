@@ -1,4 +1,5 @@
-//! The [`Visit`] implementation of the [`View`], which forwards the methods the analysis overrides.
+//! The `visit_*` methods of the [`View`]: its own, and the [`Visit`] implementation, which forwards
+//! the methods the analysis overrides.
 
 use super::View;
 use syn::visit::Visit;
@@ -15,6 +16,42 @@ macro_rules! forward {
     };
 }
 
+impl View<'_> {
+    /// Analyzes a nested item, such as a struct, a trait, an impl, a module or a function.
+    ///
+    /// It is analyzed like an item of a module
+    /// ([`Leaker::intern_mod()`](crate::Leaker::intern_mod)). Its generics are local, and the
+    /// generics around stay in scope. Use an `intern_*` method to analyze an item with its own
+    /// generics as the Leaker's. A struct, enum, union, trait or impl declares its own `Self`,
+    /// which may be interned whatever `allow_self` the scope around has.
+    pub fn visit_item(&mut self, item: &Item) {
+        Visit::visit_item(&mut *self.visitor, item)
+    }
+
+    /// Analyzes a type, with the generics in scope.
+    pub fn visit_type(&mut self, ty: &Type) {
+        Visit::visit_type(&mut *self.visitor, ty)
+    }
+
+    /// Analyzes the arguments of a path whose name is resolved elsewhere (`<Rel>` of `Wrap<Rel>`).
+    pub fn visit_path_arguments(&mut self, arguments: &PathArguments) {
+        Visit::visit_path_arguments(&mut *self.visitor, arguments)
+    }
+
+    /// Analyzes a where clause, like the one of the generics of the scope.
+    pub fn visit_where_clause(&mut self, where_clause: &WhereClause) {
+        Visit::visit_where_clause(&mut *self.visitor, where_clause)
+    }
+
+    /// Analyzes a bound, like a bound of a generic parameter of the scope.
+    ///
+    /// The path of a trait bound must not depend on the context, nor start with `Self` where it has
+    /// no meaning. It is an error otherwise.
+    pub fn visit_type_param_bound(&mut self, bound: &TypeParamBound) {
+        Visit::visit_type_param_bound(&mut *self.visitor, bound)
+    }
+}
+
 /// Forwards only the methods the analysis overrides, so walking the view walks the analysis.
 ///
 /// The default walk of the other methods reaches the forwarded ones through the view. The test
@@ -25,6 +62,7 @@ impl<'ast> Visit<'ast> for View<'_> {
         visit_const_param: ConstParam,
         visit_expr: Expr,
         visit_expr_path: ExprPath,
+        visit_foreign_item_fn: ForeignItemFn,
         visit_impl_item_const: ImplItemConst,
         visit_impl_item_fn: ImplItemFn,
         visit_impl_item_type: ImplItemType,
@@ -44,6 +82,7 @@ impl<'ast> Visit<'ast> for View<'_> {
         visit_predicate_type: PredicateType,
         visit_qself: QSelf,
         visit_receiver: Receiver,
+        visit_signature: Signature,
         visit_trait_bound: TraitBound,
         visit_trait_item_const: TraitItemConst,
         visit_trait_item_fn: TraitItemFn,

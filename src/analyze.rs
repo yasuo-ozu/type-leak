@@ -6,9 +6,10 @@ use crate::analysis::{
 };
 use crate::context::{
     binder_lifetimes, Context, ContextId, Contexts, Enclosing, ModuleInfo, Scope, SelfRequirement,
+    UnnameableSelf,
 };
 use crate::encode::is_const_param_ty;
-use crate::error::NotInternableError;
+use crate::error::{NotInternableError, SELF_NOTE};
 #[cfg(doc)]
 use crate::leaker::Leaker;
 use crate::util::{
@@ -104,6 +105,9 @@ pub(crate) enum ScopeSpec {
         generics: Generics,
         /// What `Self` is inside, if the scope declares it. `None` keeps the `Self` around.
         declares: Option<DeclaredSelf>,
+        /// The trait of an impl, checked on entering the scope like the root of a trait bound: it
+        /// must not depend on the context, but its arguments are analyzed by the walk of the impl.
+        trait_path: Option<Box<Path>>,
     },
 }
 
@@ -177,6 +181,7 @@ pub(crate) trait Scopes {
             ScopeSpec::Generics {
                 generics,
                 declares: None,
+                trait_path: None,
             },
             f,
         )
@@ -187,14 +192,19 @@ pub(crate) trait Scopes {
         generics: &Generics,
         requirement: SelfRequirement,
         allow_self: bool,
+        trait_path: Option<&Path>,
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
         let declares = Some(DeclaredSelf {
             requirement,
             allow_self,
         });
-        let generics = generics.clone();
-        self.enter_spec(ScopeSpec::Generics { generics, declares }, f)
+        let spec = ScopeSpec::Generics {
+            generics: generics.clone(),
+            declares,
+            trait_path: trait_path.map(|path| Box::new(path.clone())),
+        };
+        self.enter_spec(spec, f)
     }
 
     fn enter_type<R>(
@@ -205,7 +215,7 @@ pub(crate) trait Scopes {
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
         let requirement = SelfRequirement::of_item(ident, generics);
-        self.enter_declaring(generics, requirement, allow_self, f)
+        self.enter_declaring(generics, requirement, allow_self, None, f)
     }
 
     fn enter_impl<R>(
@@ -215,8 +225,21 @@ pub(crate) trait Scopes {
         allow_self: bool,
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
+        self.enter_impl_of(generics, self_ty, None, allow_self, f)
+    }
+
+    /// Like `enter_impl()` for an impl of the trait `trait_path`, which must not depend on the
+    /// context.
+    fn enter_impl_of<R>(
+        &mut self,
+        generics: &Generics,
+        self_ty: &Type,
+        trait_path: Option<&Path>,
+        allow_self: bool,
+        f: impl FnOnce(&mut View<'_>) -> R,
+    ) -> Res<(ContextId, R)> {
         let requirement = SelfRequirement::Type(self_ty.clone());
-        self.enter_declaring(generics, requirement, allow_self, f)
+        self.enter_declaring(generics, requirement, allow_self, trait_path, f)
     }
 
     fn enter_trait<R>(
@@ -227,7 +250,7 @@ pub(crate) trait Scopes {
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
         let requirement = SelfRequirement::of_trait(ident, generics);
-        self.enter_declaring(generics, requirement, allow_self, f)
+        self.enter_declaring(generics, requirement, allow_self, None, f)
     }
 }
 
@@ -242,6 +265,33 @@ struct ScopeMark {
     self_ty: Option<SelfRequirement>,
     allow_self: bool,
     module: Option<ContextId>,
+}
+
+/// What [`AnalyzeVisitor::check()`] puts back as it found it. The visit replaces the frame of the
+/// scope, and appends to the causes and, for an expression with an item, to the contexts. `walk`
+/// is the state that only a visit in progress changes, which a panic would leave half-way.
+struct Checkpoint {
+    mark: ScopeMark,
+    frame: Frame,
+    musts: usize,
+    impossibles: usize,
+    walk: Walk,
+}
+
+/// The state of the walk of a type, which is back to what it was when the walk ends.
+struct Walk {
+    type_depth: usize,
+    binders: usize,
+    signatures: usize,
+    probe: Option<HashSet<usize>>,
+    in_default: Option<bool>,
+    expr_owner: Option<usize>,
+    in_receiver: bool,
+    enclosing: Enclosing,
+    elided_ref: bool,
+    unconstrained_ref: Option<Lifetime>,
+    ambiguous_arg: bool,
+    inherits: Option<Inherits>,
 }
 
 pub(crate) struct Finished {
@@ -269,8 +319,6 @@ pub(crate) struct AnalyzeVisitor {
     /// What `Self` means here, if anything. It has none directly in a module, or in generics that
     /// no item declaring it encloses, so mentioning it there is an error.
     self_ty: Option<SelfRequirement>,
-    /// `Self` is never an error: a throwaway visitor with no scope (see [`Leaker::check()`]).
-    self_unchecked: bool,
     root_declares_self: bool,
     /// The type is the default of a parameter, which cannot mention `Self`. It holds whether the
     /// declaring scope gives `Self` a meaning. `self_ty` is `None` meanwhile.
@@ -335,14 +383,13 @@ impl AnalyzeVisitor {
             self_errors: Vec::new(),
             top_levels: Vec::new(),
             allow_self: true,
-            scopes: vec![Scope::new(generics)],
+            scopes: vec![Scope::new(generics, None)],
             binders: Vec::new(),
             probe: None,
             root_defaulted: defaulted(generics)
                 .map(|(_, ident, _)| ident.clone())
                 .collect(),
             self_ty: None,
-            self_unchecked: false,
             root_declares_self: false,
             in_default: None,
             modules: Vec::new(),
@@ -376,19 +423,6 @@ impl AnalyzeVisitor {
         f(&mut AnalyzeVisitor::new(allowed, generics))
     }
 
-    pub(crate) fn check(allowed: AllowedPaths, ty: &Type, generics: &Generics) -> CheckResult {
-        Self::check_alone(allowed, ty, generics).0
-    }
-
-    fn check_alone(allowed: AllowedPaths, ty: &Type, generics: &Generics) -> (CheckResult, bool) {
-        Self::alone(allowed, generics, |visitor| {
-            visitor.self_unchecked = true;
-            visitor.visit_type(ty);
-            // `ty` is the only type visited, at depth 1.
-            (visitor.causes(0, 0, 1), visitor.frame.soft_depth == 1)
-        })
-    }
-
     /// Analyzes the default `ty` of a type parameter, with the parameters before it as the root
     /// generics. Returns the effects and the mentions of `Self` that have no meaning.
     fn analyze_default(
@@ -414,8 +448,32 @@ impl AnalyzeVisitor {
             is_own: must.first().map_or(false, |(d, _)| *d == depth),
             must: must.into_iter().map(|(_, m)| m.clone()).collect(),
             impossible: self.impossibles[impossible_start..].to_vec(),
+            optional: false,
             note: None,
+            headline: None,
         }
+    }
+
+    /// Visits `ty` and returns what it found at its own depth: the causes, whether it is an
+    /// optional entry, and the conflict if it is one by itself (see
+    /// [`AnalyzeVisitor::own_context()`]). What the visit records stays: a throwaway visitor does
+    /// not care, [`AnalyzeVisitor::check()`] rolls it back.
+    fn found(&mut self, ty: &Type) -> CheckResult {
+        let (must_start, impossible_start) = (self.musts.len(), self.impossibles.len());
+        let effects_start = self.frame.effects.len();
+        let depth = self.type_depth + 1;
+        self.visit_type(ty);
+        let mut result = self.causes(must_start, impossible_start, depth);
+        match &self.frame.effects[effects_start..] {
+            // The type is decided at its own depth, so the only effect of a type with a cause of
+            // its own is its own: the conflict is what a scope reports (with the note).
+            [Effect::Error(conflict)] if result.is_own => result = conflict.clone(),
+            [Effect::Type(pending)] if pending.optional && pending.ty == *ty => {
+                result.optional = true
+            }
+            _ => (),
+        }
+        result
     }
 
     fn new_frame(&mut self) -> Frame {
@@ -444,21 +502,22 @@ impl AnalyzeVisitor {
         })
     }
 
-    fn context_of(&self, ty: &Type, inner: &Frame) -> Context {
+    /// Returns the context of `ty`, or why it cannot be written (see [`Context::of()`]).
+    fn context_of(&self, ty: &Type, inner: &Frame) -> std::result::Result<Context, UnnameableSelf> {
         let context = if inner.mentions_root
             || inner.mentions_self
             || inner.local_scope < self.scopes.len()
         {
-            Context::of(ty, &self.scopes, self.self_ty.as_ref(), &self.enclosing)
+            Context::of(ty, &self.scopes, self.self_ty.as_ref(), &self.enclosing)?
         } else {
             Context::none()
         };
-        match self.modules.last() {
+        Ok(match self.modules.last() {
             Some(module) if inner.relative || self.depends_on_module(&context) => {
                 context.with_module(Some(module.id))
             }
             _ => context,
-        }
+        })
     }
 
     fn depends_on_module(&self, context: &Context) -> bool {
@@ -541,8 +600,10 @@ impl AnalyzeVisitor {
         self.enter_scope(spec, true);
     }
 
-    fn enter_scope(&mut self, spec: &ScopeSpec, root: bool) -> ScopeMark {
-        let mut mark = ScopeMark {
+    /// Marks what a scope or a check records, to roll it back with
+    /// [`AnalyzeVisitor::leave_scope()`].
+    fn mark(&self) -> ScopeMark {
+        ScopeMark {
             effects: self.frame.effects.len(),
             self_errors: self.self_errors.len(),
             contexts: self.contexts.len(),
@@ -553,7 +614,11 @@ impl AnalyzeVisitor {
             self_ty: self.self_ty.clone(),
             allow_self: self.allow_self,
             module: None,
-        };
+        }
+    }
+
+    fn enter_scope(&mut self, spec: &ScopeSpec, root: bool) -> ScopeMark {
+        let mut mark = self.mark();
         match spec {
             // `Self` has no meaning in a module, only in its items, which may leak it again.
             ScopeSpec::Module { names, path, hint } => {
@@ -571,17 +636,27 @@ impl AnalyzeVisitor {
                 self.allow_self = true;
                 mark.module = Some(id);
             }
-            ScopeSpec::Generics { generics, declares } => {
+            ScopeSpec::Generics {
+                generics,
+                declares,
+                trait_path,
+            } => {
                 if let Some(declared) = declares {
                     self.self_ty = Some(declared.requirement.clone());
                     self.allow_self = declared.allow_self;
                 }
-                if !root {
-                    self.scopes.push(Scope::new(generics));
+                if root {
+                    self.scopes[0].set_self(self.self_ty.clone());
+                } else {
+                    self.scopes.push(Scope::new(generics, self.self_ty.clone()));
                 }
                 if self.self_ty.is_none() {
                     let generics = without_defaults(generics, generics.params.len());
                     self.self_errors.extend(selves_in_generics(&generics));
+                }
+                // Checked like the root of a trait bound, before what the closure visits.
+                if let Some(path) = trait_path.as_deref() {
+                    self.check_bound_path(path, quote!(#path));
                 }
             }
         }
@@ -603,6 +678,59 @@ impl AnalyzeVisitor {
         }
     }
 
+    /// Starts a check: sets the frame of the scope aside for the visit to use a new one.
+    fn checkpoint(&mut self) -> Checkpoint {
+        let mark = self.mark();
+        let walk = Walk {
+            type_depth: self.type_depth,
+            binders: self.binders.len(),
+            signatures: self.signatures.len(),
+            probe: self.probe.clone(),
+            in_default: self.in_default,
+            expr_owner: self.expr_owner,
+            in_receiver: self.in_receiver,
+            enclosing: self.enclosing.clone(),
+            elided_ref: self.elided_ref,
+            unconstrained_ref: self.unconstrained_ref.clone(),
+            ambiguous_arg: self.ambiguous_arg,
+            inherits: self.inherits,
+        };
+        Checkpoint {
+            mark,
+            walk,
+            musts: self.musts.len(),
+            impossibles: self.impossibles.len(),
+            frame: self.new_frame(),
+        }
+    }
+
+    /// Ends a check, also after a panic: everything the visit recorded is gone.
+    fn restore(&mut self, checkpoint: Checkpoint) {
+        let Checkpoint {
+            mark,
+            frame,
+            musts,
+            impossibles,
+            walk,
+        } = checkpoint;
+        self.frame = frame;
+        self.leave_scope(mark, true);
+        self.musts.truncate(musts);
+        self.impossibles.truncate(impossibles);
+        self.type_depth = walk.type_depth;
+        self.binders.truncate(walk.binders);
+        self.signatures.truncate(walk.signatures);
+        self.probe = walk.probe;
+        self.in_default = walk.in_default;
+        self.expr_owner = walk.expr_owner;
+        self.in_receiver = walk.in_receiver;
+        self.enclosing = walk.enclosing;
+        self.elided_ref = walk.elided_ref;
+        self.unconstrained_ref = walk.unconstrained_ref;
+        self.ambiguous_arg = walk.ambiguous_arg;
+        self.inherits = walk.inherits;
+    }
+
     /// Leaves a nested scope and returns its top-level context. It is all-or-nothing: on an error,
     /// everything recorded since it was entered is rolled back, and its errors are returned.
     fn end_scope(&mut self, mark: ScopeMark, spec: &ScopeSpec) -> Res<ContextId> {
@@ -617,11 +745,12 @@ impl AnalyzeVisitor {
         );
         let module = mark.module;
         // A scope that declares nothing keeps the `Self` around, so take it before leaving. It is
-        // part of the top-level context only if an entry names it: nothing else depends on it.
+        // part of the top-level context only if an entry names it, or has a bound rewritten for
+        // it: nothing else depends on it.
         let scope_self = self
             .self_ty
             .clone()
-            .filter(|_| names_self(&self.frame.effects[mark.effects..]));
+            .filter(|declared| names_self(&self.frame.effects[mark.effects..], declared));
         self.leave_scope(mark, error.is_some());
         if let Some(error) = error {
             return Err(error);
@@ -639,7 +768,7 @@ impl AnalyzeVisitor {
     fn analyze_default_inline(&mut self, ty: &Type, before: &Generics) {
         // The root scope is always there.
         let at = self.scopes.len() - 1;
-        let scope = std::mem::replace(&mut self.scopes[at], Scope::new(before));
+        let scope = std::mem::replace(&mut self.scopes[at], Scope::new(before, None));
         let self_ty = self.self_ty.take();
         let in_default = self.in_default.replace(self_ty.is_some());
         self.visit_type(ty);
@@ -652,7 +781,7 @@ impl AnalyzeVisitor {
     /// parameter of a scope that declares nothing.
     fn check_self_has_meaning(&mut self, tokens: TokenStream) {
         let declared = self.in_default.unwrap_or_else(|| self.self_ty.is_some());
-        if !declared && !self.self_unchecked {
+        if !declared {
             self.self_errors.push(tokens);
         }
     }
@@ -724,18 +853,34 @@ impl AnalyzeVisitor {
                 must: vec![first_self_in_type(ty).unwrap_or_else(|| quote!(Self))],
                 impossible: vec![quote!(#ty)],
                 is_own: true,
+                optional: false,
                 note: Some("a default of a parameter cannot depend on `Self`".to_string()),
+                headline: None,
             });
         }
-        let context = self.context_of(ty, inner);
+        let context = match self.context_of(ty, inner) {
+            Ok(context) => context,
+            Err(unnameable) => {
+                return Err(CheckResult {
+                    must: vec![quote!(#ty)],
+                    impossible: vec![unnameable.cause],
+                    is_own: true,
+                    optional: false,
+                    note: Some(unnameable.note),
+                    headline: Some(unnameable.headline),
+                })
+            }
+        };
         match self.self_in_bounds(&context) {
             Some(self_path) => Err(CheckResult {
                 must: vec![quote!(#ty)],
                 impossible: vec![self_path],
                 is_own: true,
+                optional: false,
                 note: Some(
                     "the bounds of its generics mention `Self`, which cannot be leaked".to_string(),
                 ),
+                headline: None,
             }),
             None => Ok(context),
         }
@@ -837,10 +982,11 @@ impl AnalyzeVisitor {
                 }
             }
             None => {
-                let context = self.context_of(ty, &inner);
-                if self.self_in_bounds(&context).is_some() {
-                    return self.frame.effects.extend(effects);
-                }
+                // Not leaked itself if its generics cannot be written (`Self`).
+                let context = match self.context_of(ty, &inner) {
+                    Ok(context) if self.self_in_bounds(&context).is_none() => context,
+                    _ => return self.frame.effects.extend(effects),
+                };
                 PendingType {
                     in_graph: has_must,
                     optional: optional.is_some(),
@@ -857,14 +1003,16 @@ impl AnalyzeVisitor {
             must: vec![must],
             impossible: vec![impossible],
             is_own: true,
+            optional: false,
             note: None,
+            headline: None,
         }));
     }
 
     /// Records an error if a trait path depends on the context or starts with `Self` without a
     /// meaning. Returns `true` if so.
     fn check_bound_path(&mut self, path: &Path, tokens: TokenStream) -> bool {
-        if self_segment(path).is_some() && self.self_ty.is_none() && !self.self_unchecked {
+        if self_segment(path).is_some() && self.self_ty.is_none() {
             self.self_errors.push(tokens);
             true
         } else if !self.is_context_free(path) {
@@ -990,7 +1138,7 @@ impl AnalyzeVisitor {
     }
 
     fn with_local_generics(&mut self, generics: &Generics, f: impl FnOnce(&mut Self)) {
-        self.with_scope(Scope::new(generics), f)
+        self.with_scope(Scope::new(generics, self.self_ty.clone()), f)
     }
 
     /// Runs `f` with the generics of an item: the Leaker's if outermost, local otherwise.
@@ -1129,9 +1277,9 @@ impl AnalyzeVisitor {
     /// undeclared name) it is `false`.
     fn is_not_a_cause(&self, object: &TypeTraitObject, in_scope: &Generics) -> bool {
         let ty = Type::TraitObject(object.clone());
-        let (result, optional) = Self::check_alone(self.allowed.clone(), &ty, in_scope);
+        let result = Self::alone(self.allowed.clone(), in_scope, |visitor| visitor.found(&ty));
         // The Referrer may replace an external trait object, with the reference holding it.
-        !result.is_own && !optional && result.impossible.is_empty()
+        !result.is_own && !result.optional && result.impossible.is_empty()
     }
 
     /// Runs `f` with the lifetimes of a `for<..>` binder in scope. `groups` are its outputs and
@@ -1393,21 +1541,30 @@ fn defaulted(generics: &Generics) -> impl Iterator<Item = (usize, &Ident, &Type)
 /// What a [`View`] asks of the analysis it wraps. The view forwards the `visit_*` methods the
 /// analysis overrides to it.
 impl AnalyzeVisitor {
-    /// Checks `path` as the root of a trait bound (see [`View::visit_path()`]).
-    pub(crate) fn check_bound_root(&mut self, path: &Path) {
-        self.check_bound_path(path, quote!(#path));
-    }
-
-    /// Analyzes a signature as [`View::visit_signature()`] does.
-    pub(crate) fn analyze_signature(&mut self, i: &Signature) {
-        match self.scopes.last() {
-            // The generics are not declared again: they are those of that scope, so the lifetimes
-            // are not compared with a declaration (see `with_signature()`).
-            Some(scope) if scope.is_of(&i.generics) => {
-                let at = self.scopes.len() - 1;
-                self.with_risky(i, at, at > 0, |visitor| Visit::visit_signature(visitor, i));
+    /// Checks `ty` where the visitor is, as [`View::check()`] does: what the visit of `ty` finds,
+    /// and nothing stays recorded.
+    ///
+    /// The visit runs on a new frame of the scope, and what it appends to the visitor is cut off
+    /// after it (see [`Checkpoint`]), also if it panics, which goes on.
+    pub(crate) fn check(&mut self, ty: &Type) -> CheckResult {
+        let checkpoint = self.checkpoint();
+        let selves = self.self_errors.len();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let mut result = self.found(ty);
+            // `Self` without meaning fails the scope, which a check does not: it is told as a cause
+            // that cannot be leaked.
+            let without_meaning = &self.self_errors[selves..];
+            if !without_meaning.is_empty() {
+                result.impossible.extend(without_meaning.iter().cloned());
+                result.optional = false;
+                result.note.get_or_insert_with(|| SELF_NOTE.to_string());
             }
-            _ => self.with_signature(i, false, |visitor| Visit::visit_signature(visitor, i)),
+            result
+        }));
+        self.restore(checkpoint);
+        match outcome {
+            Ok(result) => result,
+            Err(payload) => resume_unwind(payload),
         }
     }
 
@@ -1448,15 +1605,25 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
         let mut i = i.clone();
         i.default = None;
         i.semi_token = Some(Default::default());
-        self.with_signature(&i.sig, false, |visitor| {
-            syn::visit::visit_trait_item_fn(visitor, &i)
-        });
+        syn::visit::visit_trait_item_fn(self, &i)
+    }
+
+    /// The signature of a method: its generics are local, and it is checked for E0195. A function
+    /// item declares its own generics instead (`visit_item_fn()`).
+    fn visit_signature(&mut self, i: &Signature) {
+        self.with_signature(i, false, |visitor| syn::visit::visit_signature(visitor, i))
     }
 
     fn visit_trait_item_type(&mut self, i: &TraitItemType) {
         self.with_local_generics(&i.generics, |visitor| {
             syn::visit::visit_trait_item_type(visitor, i)
         });
+    }
+
+    fn visit_foreign_item_fn(&mut self, i: &ForeignItemFn) {
+        // Not a method: its signature declares nothing here, as before `visit_signature()`.
+        self.visit_head(&i.attrs, &i.vis);
+        syn::visit::visit_signature(self, &i.sig);
     }
 
     fn visit_receiver(&mut self, i: &Receiver) {
@@ -1474,10 +1641,8 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
     }
 
     fn visit_impl_item_fn(&mut self, i: &ImplItemFn) {
-        self.with_signature(&i.sig, false, |visitor| {
-            visitor.visit_head(&i.attrs, &i.vis);
-            visitor.visit_signature(&i.sig);
-        });
+        self.visit_head(&i.attrs, &i.vis);
+        self.visit_signature(&i.sig);
     }
 
     fn visit_impl_item_type(&mut self, i: &ImplItemType) {
@@ -1542,7 +1707,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
     fn visit_item_fn(&mut self, i: &ItemFn) {
         self.with_signature(&i.sig, true, |visitor| {
             visitor.visit_head(&i.attrs, &i.vis);
-            visitor.visit_signature(&i.sig);
+            syn::visit::visit_signature(visitor, &i.sig);
         });
     }
 

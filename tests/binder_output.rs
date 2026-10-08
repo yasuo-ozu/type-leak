@@ -19,6 +19,9 @@
 //! `Rel2` is leaked as a whole. Which positions constrain was checked with rustc (stable and
 //! nightly, from 1.61 on), for the inputs of function pointers and of `Fn(..)` and other bounds.
 
+mod common;
+
+use common::check_in;
 use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::quote;
@@ -424,8 +427,8 @@ fn the_type_holding_the_binder_which_cannot_be_leaked_is_an_error() {
 
 #[test]
 fn check_tells_the_type_holding_the_binder_is_interned() {
-    let leaker = leaker();
-    let check = |ty: Type| leaker.check(&ty, &Generics::default());
+    let mut leaker = leaker();
+    let mut check = |ty: Type| check_in(&mut leaker, &ty, &Generics::default());
     let tokens = |tokens: &[proc_macro2::TokenStream]| -> Vec<String> {
         tokens.iter().map(|t| t.to_string()).collect()
     };
@@ -1130,8 +1133,8 @@ fn the_anchor_is_checked_for_each_binder() {
 
 #[test]
 fn check_tells_the_anchored_type_is_interned_alone() {
-    let leaker = leaker();
-    let check = |ty: Type| leaker.check(&ty, &Generics::default());
+    let mut leaker = leaker();
+    let mut check = |ty: Type| check_in(&mut leaker, &ty, &Generics::default());
     let tokens = |tokens: &[proc_macro2::TokenStream]| -> Vec<String> {
         tokens.iter().map(|t| t.to_string()).collect()
     };
@@ -1444,20 +1447,23 @@ fn an_external_crate_type_which_uses_the_lifetime_of_a_binder_is_leaked_with_its
 
 #[test]
 fn the_anchor_of_an_external_crate_type_is_checked_by_check() {
-    let leaker = leaker_allowing_nothing();
-    let result = leaker.check(
+    let mut leaker = leaker_allowing_nothing();
+    let result = check_in(
+        &mut leaker,
         &parse_quote!(for<'x> fn(::other::Wrap<&'x u8>) -> Parser<'x>),
         &Generics::default(),
     );
     // The function pointer holding `'x` is interned as a whole instead of `Parser<'x>`.
     assert!(result.is_own && result.impossible.is_empty());
-    let result = leaker_allowing_other().check(
+    let result = check_in(
+        &mut leaker_allowing_other(),
         &parse_quote!(for<'x> fn(::other::Wrap<&'x u8>) -> Parser<'x>),
         &Generics::default(),
     );
     assert!(!result.is_own && result.impossible.is_empty());
     // A path of `::core` anchors.
-    let result = leaker.check(
+    let result = check_in(
+        &mut leaker,
         &parse_quote!(for<'x> fn(::core::option::Option<&'x u8>) -> Parser<'x>),
         &Generics::default(),
     );

@@ -124,7 +124,7 @@ The context of an entry decides which Repeater impl it needs.
 - Equal declarations give equal contexts. Parameters are sorted by kind and name, bounds are sorted and moved from the where clause to their parameter, and defaults are removed.
 - The Leaker numbers a context when it first appears, from 0. It numbers a module when it is entered, a nested scope when it is left, and the types of the outermost scope when it is left. It never renumbers them, except for the contexts of a scope that fails and is rolled back. So `Referrer::contexts()` can have gaps. It has at least one context. With no other, it is context 0 of the types that use no generics.
 - The top-level context is the one of the generics of the item or scope itself. It differs from an entry's context if the entry uses fewer generics, as `Rel` does in `trait Tr<T> { fn f(&self) -> Rel; }`. The Referrer keeps it even if it has no entry.
-- The top-level context also records what `Self` is, if an entry of the scope names it (`Referrer::context_self()`), and the module the scope was entered in (`Referrer::context_module()`). So scopes with the same generics but another `Self` return other ids, and `Referrer::visitor(context, ..)` knows the generics, `Self` and module of the copy from the id alone.
+- The top-level context also records what `Self` is, if an entry names it or has a bound rewritten for it ([Self rules](#self-rules)) (`Referrer::context_self()`), and the module the scope was entered in (`Referrer::context_module()`). So scopes with the same generics but another `Self` return other ids, and `Referrer::visitor(context, ..)` knows the generics, `Self` and module of the copy from the id alone.
 - A type is replaced if its context, computed from the generics in scope, is an entry's. The generics in scope are those of `context`, then those that the visited syntax declares. A name that neither declares is not a generic, so it is not matched: the Referrer does not guess which generics are the Leaker's. If no entry has exactly the context, one that has bounds on `Self` alone besides (`where Self: Sized`) is taken, since a copy where `Self` is a type parameter (`Visitor::with_self()`) cannot write them. An outermost item that declares exactly the generics of `context` (the copy of the item itself) does not declare them again. If the copy declares them with other bounds (`impl<T: Clone> MyLeaker<T> for ..`), call `Visitor::with_outermost_generics_as_leakers()`.
 - `Referrer::expand()` knows only the generics of `context`. It does not find a type that names a generic of a method: visit the signature.
 
@@ -136,7 +136,7 @@ Some types are always entries as a whole, never replaced by their parts. They ar
 
 # Scopes
 
-`intern_*` analyzes a whole item. To analyze a fragment, whose generics and `Self` the caller knows, enter a scope. `Leaker::enter_impl()`, `enter_type()`, `enter_trait()`, `enter_generics()` and `enter_mod()` take a closure. The closure gets a `View`. A `View` has `visit_item()`, `visit_signature()`, `visit_type()`, `visit_path()`, `visit_path_arguments()`, `visit_where_clause()` and `visit_type_param_bound()`. It also has the same `enter_*` methods for nested scopes. A scope returns its top-level `ContextId` and the value of the closure.
+`intern_*` analyzes a whole item. To analyze a fragment, whose generics and `Self` the caller knows, enter a scope. `Leaker::enter_impl()`, `enter_type()`, `enter_trait()`, `enter_generics()` and `enter_mod()` take a closure. The closure gets a `View`. A `View` has `visit_item()`, `visit_type()`, `visit_path_arguments()`, `visit_where_clause()` and `visit_type_param_bound()`. It also has the same `enter_*` methods for nested scopes. A scope returns its top-level `ContextId` and the value of the closure.
 
 ```rust
 use syn::{parse_quote, ItemImpl, Type};
@@ -155,7 +155,9 @@ let mut leaker = Leaker::new();
 leaker
     .enter_impl(&item.generics, &item.self_ty, true, |view| {
         view.visit_path_arguments(self_args);
-        view.visit_path(trait_path);
+        for seg in &trait_path.segments {
+            view.visit_path_arguments(&seg.arguments);
+        }
     })
     .unwrap();
 // `Rel<T>` uses `T`, and `Rel2` uses nothing.
@@ -163,6 +165,9 @@ assert_eq!(leaker.finish().iter().count(), 2);
 ```
 
 - The generics of a scope are those of the Leaker. In a nested scope they are local generics, and the generics around it stay in scope.
+- `View` implements `syn::visit::Visit`, so a `syn::visit` walk of an item analyzes it. `Visit::visit_signature()` is a method's signature, with local generics (and the check of [Method lifetimes](#method-lifetimes)). `Visit::visit_path()` at the root analyzes only the arguments of a path and does not check the path: to analyze a trait bound with its root checked, use `visit_type_param_bound()`.
+- `check()` finds what `visit_type()` would find in a type here (the causes that force it to be leaked and those that forbid it, and whether it is an optional entry), with the generics around, `Self` and the module, and records nothing.
+- A function that is itself the analyzed item has no local generics: enter its generics with `enter_generics(&sig.generics, ..)` and visit its input and output types and its where clause with `visit_type()` and `visit_where_clause()`.
 - `Self` is what the scope declares. In `enter_generics()` and `enter_mod()` it has no meaning, so naming it is an error. An item visited with `visit_item()` has a `Self` of its own.
 - Scopes with equal generics return the same id, if they are in the same module and, when an entry names `Self`, declare the same `Self`.
 - The generics of a scope are not analyzed. To copy their bounds or where clause, visit them with `visit_type_param_bound()` and `visit_where_clause()`. The default of a type parameter is analyzed with the earlier parameters as the generics. The defaults of const parameters are analyzed with the syntax that visits them.
@@ -307,6 +312,7 @@ impl<T> path::Repeater<(T,), 42, 3> for MyStruct<T> {
 - With `allow_self = true`, a type that names `Self` is one entry, written for the implementor or the type.
 - With `allow_self = false`, such a type is split into parts. That is an error if it cannot be (`Rel<Self>`, `Self::Item`), or if the bounds of the generics it uses name `Self`. Use it if the Repeater impls are for a marker type, which cannot name `Self`. `Visitor::with_self()` then replaces `Self` in copies in the same way.
 - `Self` has no meaning in `enter_generics()`, `enter_mod()` and the generics of a scope. Naming it there is an error.
+- The bounds and where predicates of a generic are written for the `Self` of the scope that declares it. A type that uses the generic where `Self` is something else (in an impl, a struct, an enum, a union or a trait nested in the scope) gets them rewritten for that `Self`, and its entry does not depend on the other one: `T: ::p::Tr<Self>` of `struct S<T: ::p::Tr<Self>>` is `T: ::p::Tr<S<T>>` in `impl W { fn f(x: Rel<T>); }`. That fails with an error if `Self` is the implementor of a trait (it has no name), or if the bound names an associated item of `Self` (`Self::X`, ambiguous for a type). The headline of the error is about the bound, not the path of the type ("the bound of `T` mentions a `Self` which has no name here"), and `CheckResult::headline` has it for `View::check()`. The scope that declares the bound records its `Self` in its top-level context, so `Referrer::visitor(context, ..)` knows it. The copy must nest the same scopes, as the Leaker did: the Referrer takes `Self` of a nested struct, enum, union, trait or impl from the item it visits, and computes the same contexts. Where `Self` is the same, nothing is rewritten, except for the default of a type parameter of a scope: it has no `Self`, so the bounds around it are rewritten for the `Self` that declared them (or fail) whatever `Self` the scope has. `Referrer::visitor(context, ..)` does the same for the defaults of the scopes it visits. A nested function, type alias, trait alias, const or static has no `Self` of its own, in the Leaker and in the Referrer.
 - `Self: 'a` is encoded by the `*_with_self()` encoders, with `Referrer::context_self_outlives()`. The impl does not declare it. See [Outlives bounds](#outlives-bounds).
 
 # MSRV

@@ -8,7 +8,7 @@ use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::*;
-use template_quote::quote;
+use template_quote::{quote, ToTokens};
 
 /// Returns `true` if `path` starts with `prefix`, comparing identifiers. Both have a leading `::`
 /// or neither.
@@ -183,6 +183,8 @@ pub(crate) fn trait_object_of(ty: &Type) -> Option<&TypeTraitObject> {
 #[derive(Default)]
 struct SelfFinder {
     found: Vec<TokenStream>,
+    /// The paths of `found` with an item after `Self` (`Self::X`).
+    associated: Vec<TokenStream>,
 }
 
 impl SelfFinder {
@@ -200,6 +202,9 @@ impl<'ast> Visit<'ast> for SelfFinder {
     fn visit_path(&mut self, i: &'ast Path) {
         if i.leading_colon.is_none() && i.segments.first().map_or(false, |s| s.ident == "Self") {
             self.found.push(quote!(#i));
+            if i.segments.len() > 1 {
+                self.associated.push(quote!(#i));
+            }
         }
         syn::visit::visit_path(self, i)
     }
@@ -231,6 +236,34 @@ pub(crate) fn where_predicate_mentions_self(predicate: &WherePredicate) -> bool 
     let mut finder = SelfFinder::default();
     finder.visit_where_predicate(predicate);
     !finder.found.is_empty()
+}
+
+/// The mentions of `Self` in a generic parameter or a where predicate.
+pub(crate) struct SelfMentions {
+    pub(crate) first: Option<TokenStream>,
+    /// The first `Self::X`, an associated item of `Self`.
+    pub(crate) associated: Option<TokenStream>,
+}
+
+impl From<SelfFinder> for SelfMentions {
+    fn from(finder: SelfFinder) -> Self {
+        Self {
+            first: finder.found.into_iter().next(),
+            associated: finder.associated.into_iter().next(),
+        }
+    }
+}
+
+pub(crate) fn self_in_param(param: &GenericParam) -> SelfMentions {
+    let mut finder = SelfFinder::default();
+    finder.visit_generic_param(param);
+    finder.into()
+}
+
+pub(crate) fn self_in_predicate(predicate: &WherePredicate) -> SelfMentions {
+    let mut finder = SelfFinder::default();
+    finder.visit_where_predicate(predicate);
+    finder.into()
 }
 
 pub(crate) fn first_self_in_generics(generics: &Generics) -> Option<TokenStream> {
@@ -311,5 +344,106 @@ pub(crate) fn without_defaults(generics: &Generics, n: usize) -> Generics {
                 predicates,
             })
         },
+    }
+}
+
+/// Replaces `Self` by a type, in the types, expressions and macros it folds.
+#[derive(Clone, Copy)]
+pub(crate) struct ReplaceSelf<'a> {
+    pub(crate) self_ty: &'a Type,
+}
+
+impl<'a> ReplaceSelf<'a> {
+    fn replace_tokens(&self, tokens: TokenStream) -> TokenStream {
+        use proc_macro2::{Group, TokenTree};
+        tokens
+            .into_iter()
+            .map(|tt| match tt {
+                TokenTree::Ident(ident) if ident == "Self" => self.self_ty.to_token_stream(),
+                TokenTree::Group(group) => {
+                    let mut new =
+                        Group::new(group.delimiter(), self.replace_tokens(group.stream()));
+                    new.set_span(group.span());
+                    TokenTree::Group(new).into()
+                }
+                tt => tt.into(),
+            })
+            .collect()
+    }
+
+    // `Some(Some(rest))` for `Self::A::B`, `Some(None)` for `Self` alone.
+    fn strip_self(path: &Path) -> Option<Option<Path>> {
+        let first = path.segments.first()?;
+        if path.leading_colon.is_some() || first.ident != "Self" || !first.arguments.is_none() {
+            return None;
+        }
+        // The `::` after the qualified self type (see `qself()`).
+        Some((path.segments.len() > 1).then(|| Path {
+            leading_colon: Some(Default::default()),
+            segments: path.segments.iter().skip(1).cloned().collect(),
+        }))
+    }
+
+    fn qself(&self) -> QSelf {
+        QSelf {
+            lt_token: Default::default(),
+            ty: Box::new(self.self_ty.clone()),
+            position: 0,
+            as_token: None,
+            gt_token: Default::default(),
+        }
+    }
+
+    pub(crate) fn fold_type_with(&self, folder: &mut impl syn::fold::Fold, ty: Type) -> Type {
+        let stripped = match &ty {
+            Type::Path(TypePath { qself: None, path }) => Self::strip_self(path),
+            _ => None,
+        };
+        match (ty, stripped) {
+            (_, Some(None)) => self.self_ty.clone(),
+            (_, Some(Some(rest))) => Type::Path(TypePath {
+                qself: Some(self.qself()),
+                path: folder.fold_path(rest),
+            }),
+            (Type::Verbatim(tokens), _) => Type::Verbatim(self.replace_tokens(tokens)),
+            (ty, _) => syn::fold::fold_type(folder, ty),
+        }
+    }
+
+    /// `Self` alone in an expression is a value, so only `Self::A` is replaced.
+    pub(crate) fn fold_expr_with(&self, folder: &mut impl syn::fold::Fold, expr: Expr) -> Expr {
+        let stripped = match &expr {
+            Expr::Path(ExprPath {
+                qself: None, path, ..
+            }) => Self::strip_self(path),
+            _ => None,
+        };
+        match (expr, stripped) {
+            (Expr::Path(path), Some(Some(rest))) => Expr::Path(ExprPath {
+                qself: Some(self.qself()),
+                path: folder.fold_path(rest),
+                ..path
+            }),
+            (expr, _) => syn::fold::fold_expr(folder, expr),
+        }
+    }
+}
+
+impl<'a> syn::fold::Fold for ReplaceSelf<'a> {
+    fn fold_type(&mut self, ty: Type) -> Type {
+        let this = *self;
+        this.fold_type_with(self, ty)
+    }
+
+    fn fold_expr(&mut self, expr: Expr) -> Expr {
+        let this = *self;
+        this.fold_expr_with(self, expr)
+    }
+
+    fn fold_macro(&mut self, i: Macro) -> Macro {
+        Macro {
+            tokens: self.replace_tokens(i.tokens),
+            ..i
+        }
     }
 }

@@ -2,8 +2,9 @@
 
 mod common;
 
-use common::finish_as_strings;
+use common::{check_in, enter_function, finish_as_strings};
 use std::collections::BTreeSet;
+use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
 use type_leak::Leaker;
@@ -547,11 +548,16 @@ fn test_reduce_roots_trait_object_inheriting_the_lifetime_of_its_path() {
     );
 
     // `check()` agrees: the path must be interned as a whole.
-    let result = Leaker::new().check(&parse_quote!(::p::W<'a, dyn RelTr>), &parse_quote!(<'a>));
+    let result = check_in(
+        &mut Leaker::new(),
+        &parse_quote!(::p::W<'a, dyn RelTr>),
+        &parse_quote!(<'a>),
+    );
     assert!(result.is_own);
     assert_eq!(result.must.len(), 1);
     // Unless only the components of the trait object have to be interned.
-    let result = Leaker::new().check(
+    let result = check_in(
+        &mut Leaker::new(),
         &parse_quote!(::p::W<'a, dyn ::p::Tr<Item = Rel>>),
         &parse_quote!(<'a>),
     );
@@ -754,10 +760,15 @@ fn test_reduce_roots_reference_to_a_trait_object() {
     }
 
     // `check()` agrees.
-    let result = Leaker::new().check(&parse_quote!(&'a dyn RelTr), &parse_quote!(<'a>));
+    let result = check_in(
+        &mut Leaker::new(),
+        &parse_quote!(&'a dyn RelTr),
+        &parse_quote!(<'a>),
+    );
     assert!(result.is_own);
     assert_eq!(result.must.len(), 1);
-    let result = Leaker::new().check(
+    let result = check_in(
+        &mut Leaker::new(),
         &parse_quote!(&'a dyn ::p::Tr<Item = Rel>),
         &parse_quote!(<'a>),
     );
@@ -964,19 +975,20 @@ fn test_reduce_roots_path_with_a_lifetime_the_copy_would_leave_unconstrained() {
         leaked,
         [entry(parse_quote!(::p::W<'a, dyn RelTr>), "< 'a >")]
     );
-    // A function, which is not compared with a declaration, is not affected either: the lifetime
-    // is a generic of the Leaker for the outermost item, and local for a nested one, as for a
+    // A function which is the analyzed item (its generics are those of the scope) is not affected
+    // either: the lifetime is a generic of the Leaker, and local for a nested one, as for a
     // method.
     let item: ItemFn = parse_quote! { fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () { loop {} } };
     let mut leaker = Leaker::new();
-    leaker
-        .enter_generics(&item.sig.generics, |view| view.visit_signature(&item.sig))
-        .unwrap();
+    enter_function(&mut leaker, &item.sig).unwrap();
     assert_eq!(leaker.finish().iter().count(), 1);
-    // As local generics it is checked, in a scope which does not declare them, in a module and in
-    // the function nested in one.
+    // As local generics it is checked, in a method, in the function nested in a scope and in one
+    // of a module.
     let err = Leaker::new()
-        .enter_generics(&Generics::default(), |view| view.visit_signature(&item.sig))
+        .enter_impl(&Generics::default(), &parse_quote!(::p::W), true, |view| {
+            let sig = &item.sig;
+            view.visit_impl_item_fn(&parse_quote!(#sig { loop {} }))
+        })
         .unwrap_err();
     assert!(syn::Error::from(err).to_string().contains("E0195"));
     let err = Leaker::new()
@@ -1088,7 +1100,11 @@ fn test_reduce_roots_reference_with_a_local_lifetime() {
         )
     );
     // `check()` agrees, with the lifetime a generic of the context, as the lifetime of the trait.
-    let result = Leaker::new().check(&parse_quote!(&'b dyn RelTr), &parse_quote!(<'b>));
+    let result = check_in(
+        &mut Leaker::new(),
+        &parse_quote!(&'b dyn RelTr),
+        &parse_quote!(<'b>),
+    );
     assert!(result.is_own);
     assert_eq!(result.must.len(), 1);
 }
@@ -1240,15 +1256,16 @@ fn test_reduce_roots_reference_with_a_lifetime_the_copy_would_leave_unconstraine
         trait Tr<'a> { fn f(&self, x: &'a dyn RelTr) -> &'a (); }
     });
     assert_eq!(leaked, [entry(parse_quote!(&'a dyn RelTr), "< 'a >")]);
-    // A nested function is checked like a method, an outermost one is not (see paths).
+    // A method is checked, the function which is the analyzed item is not (see paths).
     let item: ItemFn = parse_quote! { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } };
     let mut leaker = Leaker::new();
-    leaker
-        .enter_generics(&item.sig.generics, |view| view.visit_signature(&item.sig))
-        .unwrap();
+    enter_function(&mut leaker, &item.sig).unwrap();
     assert_eq!(leaker.finish().iter().count(), 1);
     let err = Leaker::new()
-        .enter_generics(&Generics::default(), |view| view.visit_signature(&item.sig))
+        .enter_impl(&Generics::default(), &parse_quote!(::p::W), true, |view| {
+            let sig = &item.sig;
+            view.visit_impl_item_fn(&parse_quote!(#sig { loop {} }))
+        })
         .unwrap_err();
     assert!(syn::Error::from(err).to_string().contains("E0195"));
     let item: ItemMod = parse_quote! {
@@ -1561,7 +1578,11 @@ fn test_reduce_roots_bare_identifier_argument() {
     })
     .is_empty());
     // `check()` agrees: the path must be interned as a whole.
-    let result = Leaker::new().check(&parse_quote!(::p::W<SIZE>), &Generics::default());
+    let result = check_in(
+        &mut Leaker::new(),
+        &parse_quote!(::p::W<SIZE>),
+        &Generics::default(),
+    );
     assert!(result.is_own);
     assert!(result.impossible.is_empty());
     assert_eq!(result.must.len(), 1);
@@ -1606,7 +1627,11 @@ fn test_reduce_roots_bare_identifier_is_a_type_if_the_path_cannot_be_interned() 
         [entry(parse_quote!(SIZE), "")]
     );
     // `check()` agrees: the identifier is the cause, not the path.
-    let result = Leaker::new().check(&parse_quote!(::p::W<'_, SIZE>), &Generics::default());
+    let result = check_in(
+        &mut Leaker::new(),
+        &parse_quote!(::p::W<'_, SIZE>),
+        &Generics::default(),
+    );
     assert!(!result.is_own);
     assert_eq!(result.impossible.len(), 1);
     assert_eq!(result.must.len(), 1);
@@ -1871,7 +1896,8 @@ fn test_reduce_roots_types_in_expressions() {
     })
     .is_empty());
     // `check()` agrees: the array must be interned as a whole.
-    let result = Leaker::new().check(
+    let result = check_in(
+        &mut Leaker::new(),
         &parse_quote!([::core::primitive::u8; ::core::mem::size_of::<Big>()]),
         &Generics::default(),
     );

@@ -388,6 +388,187 @@ fn a_nested_item_declares_its_own_self() {
     assert!(s(&item).contains("Rel < Self >"), "{}", s(&item));
 }
 
+/// What `Self` of the entry that is the type `ty` (as `to_string()` has it) means.
+fn self_of_entry(referrer: &Referrer, ty: &str) -> String {
+    let ix = referrer
+        .iter()
+        .position(|entry| s(entry) == ty)
+        .unwrap_or_else(|| panic!("no entry {}", ty));
+    match referrer.context_self(referrer.context(ix)) {
+        None => "-".to_string(),
+        Some(SelfRequirement::Bound(path)) => format!("Self: {}", s(path)),
+        Some(SelfRequirement::Type(ty)) => format!("Self = {}", s(ty)),
+        Some(other) => format!("{:?}", other),
+    }
+}
+
+#[test]
+fn a_nested_function_or_type_alias_keeps_the_self_around() {
+    // The Leaker has the `Self` of the scope in a function or a type alias nested in it: `Self` is
+    // E0401 there, so the one around is its only meaning. Only a struct, an enum, a union, a trait
+    // and an impl have a `Self` of their own, and the Referrer must agree.
+    let mut leaker = Leaker::new();
+    let (context, ()) = leaker
+        .enter_impl(&Generics::default(), &parse_quote!(W), true, |v| {
+            for item in [
+                parse_quote!(
+                    fn f(x: Rel<Self>) {}
+                ),
+                parse_quote!(
+                    type A = Rel2<Self>;
+                ),
+                parse_quote!(
+                    struct V {
+                        a: Rel3<Self>,
+                    }
+                ),
+            ] {
+                let item: Item = item;
+                v.visit_item(&item);
+            }
+        })
+        .unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(referrer.iter().count(), 3);
+    assert_eq!(self_of_entry(&referrer, "Rel < Self >"), "Self = W");
+    assert_eq!(self_of_entry(&referrer, "Rel2 < Self >"), "Self = W");
+    // The struct has its own `Self`, which the entry names.
+    assert_eq!(self_of_entry(&referrer, "Rel3 < Self >"), "Self = V");
+    let index = |ty: &str| referrer.iter().position(|entry| s(entry) == ty).unwrap();
+    let (rel, rel2) = (index("Rel < Self >"), index("Rel2 < Self >"));
+    let tokens = quote!(#referrer);
+    let read_back: Referrer = syn::parse2(tokens).unwrap();
+    assert_eq!(read_back, referrer);
+    for referrer in [referrer.clone(), read_back] {
+        // In a method of an impl for `W`, the nested function and type alias are found. The struct
+        // nested in the impl has `Self` of its own: the same `Rel<Self>` there is not the entry.
+        let mut copy: ItemImpl = parse_quote!(
+            impl Foo for W {
+                fn m() {
+                    fn f(x: Rel<Self>) {}
+                    type A = Rel2<Self>;
+                    struct V2 {
+                        a: Rel<Self>,
+                    }
+                    struct V {
+                        a: Rel3<Self>,
+                    }
+                }
+            }
+        );
+        referrer
+            .clone()
+            .visitor(context, replace)
+            .visit_item_impl_mut(&mut copy);
+        let (rel, rel2) = (
+            proc_macro2::Literal::usize_unsuffixed(rel),
+            proc_macro2::Literal::usize_unsuffixed(rel2),
+        );
+        let expected: ItemImpl = parse_quote!(
+            impl Foo for W {
+                fn m() {
+                    fn f(x: P<#rel>) {}
+                    type A = P<#rel2>;
+                    struct V2 {
+                        a: Rel<Self>,
+                    }
+                    struct V {
+                        a: Rel3<Self>,
+                    }
+                }
+            }
+        );
+        assert_eq!(s(&copy), s(&expected));
+        // Not in a method: a function that is not one, which has them nested.
+        let mut copy: ItemFn = parse_quote!(
+            fn outer() {
+                fn f(x: Rel<Self>) {}
+                type A = Rel2<Self>;
+                fn g() {
+                    type B = Rel2<Self>;
+                }
+            }
+        );
+        referrer
+            .clone()
+            .visitor(context, replace)
+            .visit_item_fn_mut(&mut copy);
+        let expected: ItemFn = parse_quote!(
+            fn outer() {
+                fn f(x: P<#rel>) {}
+                type A = P<#rel2>;
+                fn g() {
+                    type B = P<#rel2>;
+                }
+            }
+        );
+        assert_eq!(s(&copy), s(&expected));
+    }
+}
+
+#[test]
+fn a_nested_type_alias_in_a_trait_keeps_the_self_of_the_trait() {
+    // The implementors of the trait are `Self` in a nested function or type alias too.
+    let mut leaker = Leaker::new();
+    let (context, ()) = leaker
+        .enter_trait(&parse_quote!(Tr), &Generics::default(), true, |v| {
+            for item in [
+                parse_quote!(
+                    type A = Rel<Self>;
+                ),
+                parse_quote!(
+                    fn f(x: Rel2<Self>) {}
+                ),
+                // The trait alias has no `Self` of its own either.
+                parse_quote!(
+                    trait Al = ::p::Bar<Rel3<Self>>;
+                ),
+            ] {
+                let item: Item = item;
+                v.visit_item(&item);
+            }
+        })
+        .unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(referrer.iter().count(), 3);
+    assert_eq!(self_of_entry(&referrer, "Rel < Self >"), "Self: Tr");
+    let mut copy: ItemTrait = parse_quote!(
+        trait Tr {
+            fn m() {
+                type A = Rel<Self>;
+                fn f(x: Rel2<Self>) {}
+                trait Al = ::p::Bar<Rel3<Self>>;
+                trait Inner {
+                    type B = Rel<Self>;
+                }
+            }
+        }
+    );
+    let ix = |ty: &str| {
+        proc_macro2::Literal::usize_unsuffixed(
+            referrer.iter().position(|entry| s(entry) == ty).unwrap(),
+        )
+    };
+    let (rel, rel2, rel3) = (ix("Rel < Self >"), ix("Rel2 < Self >"), ix("Rel3 < Self >"));
+    referrer
+        .visitor(context, replace)
+        .visit_item_trait_mut(&mut copy);
+    // The nested trait has its own `Self`.
+    let expected: ItemTrait = parse_quote!(
+        trait Tr {
+            fn m() {
+                type A = P<#rel>;
+                fn f(x: P<#rel2>) {}
+                trait Al = ::p::Bar<P<#rel3>>;
+                trait Inner {
+                    type B = Rel<Self>;
+                }
+            }
+        }
+    );
+    assert_eq!(s(&copy), s(&expected));
+}
+
 // ── the generics come from the context ───────────────────────────────────────────────────────
 
 #[test]

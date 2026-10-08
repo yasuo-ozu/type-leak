@@ -1,11 +1,13 @@
 //! The context of a leaked type: its generics, what `Self` means, and its module.
 
 use crate::util::{
-    generic_param_mentions_self, generic_param_name, ident_name, token_names, type_mentions_self,
-    unwrap_type_group, where_predicate_mentions_self,
+    generic_param_mentions_self, generic_param_name, ident_name, self_in_param, self_in_predicate,
+    token_names, type_mentions_self, unwrap_type_group, where_predicate_mentions_self, ReplaceSelf,
+    SelfMentions,
 };
 use proc_macro2::{Literal, TokenStream};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use syn::fold::Fold;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
@@ -13,16 +15,20 @@ use syn::*;
 use template_quote::{quote, ToTokens};
 
 /// The generics declared at one level: those of the Leaker, or local ones.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct Scope {
     params: Vec<GenericParam>,
     predicates: Vec<WherePredicate>,
     binder: bool,
+    /// What `Self` meant where the generics were declared, which their bounds and where predicates
+    /// are written for. `None` where it has no meaning. See [`Context::of()`].
+    self_ty: Option<SelfRequirement>,
 }
 
 impl Scope {
-    /// Defaults are dropped: an impl cannot copy them and the type does not depend on them.
-    pub(crate) fn new(generics: &Generics) -> Self {
+    /// `self_ty` is what `Self` means where `generics` are declared. Defaults are dropped: an impl
+    /// cannot copy them and the type does not depend on them.
+    pub(crate) fn new(generics: &Generics, self_ty: Option<SelfRequirement>) -> Self {
         Self {
             params: generics.params.iter().cloned().map(strip_default).collect(),
             predicates: generics
@@ -31,6 +37,7 @@ impl Scope {
                 .flat_map(|wc| wc.predicates.iter().cloned())
                 .collect(),
             binder: false,
+            self_ty,
         }
     }
 
@@ -39,15 +46,37 @@ impl Scope {
             params: lifetimes.lifetimes.iter().cloned().collect(),
             predicates: Vec::new(),
             binder: true,
+            self_ty: None,
         }
+    }
+
+    /// Sets what `Self` meant where the generics were declared, for a scope that exists before it
+    /// is known.
+    pub(crate) fn set_self(&mut self, self_ty: Option<SelfRequirement>) {
+        self.self_ty = self_ty;
+    }
+
+    /// Like [`Scope::set_self()`], returning what `Self` meant before.
+    pub(crate) fn replace_self(
+        &mut self,
+        self_ty: Option<SelfRequirement>,
+    ) -> Option<SelfRequirement> {
+        std::mem::replace(&mut self.self_ty, self_ty)
+    }
+
+    /// Returns `true` if the generics are the same, whatever `Self` meant where they were declared.
+    pub(crate) fn same_generics(&self, other: &Scope) -> bool {
+        self.params == other.params
+            && self.predicates == other.predicates
+            && self.binder == other.binder
     }
 
     pub(crate) fn params(&self) -> impl Iterator<Item = &GenericParam> {
         self.params.iter()
     }
 
-    pub(crate) fn is_of(&self, generics: &Generics) -> bool {
-        !self.binder && *self == Self::new(generics)
+    fn self_ty(&self) -> Option<&SelfRequirement> {
+        self.self_ty.as_ref()
     }
 
     fn declares(&self, name: &str) -> bool {
@@ -148,6 +177,23 @@ pub(crate) struct Context {
     module: Option<ContextId>,
     /// Set for the context of a module scope: it makes each one distinct.
     scope: Option<usize>,
+    /// The `Self` of the scopes whose bounds were rewritten for another `Self` (see
+    /// [`Context::of()`]). Not part of the identity: it only tells the scope that declares one of
+    /// them that this context depends on it, so its top-level context records it.
+    substituted: Vec<SelfRequirement>,
+}
+
+/// A bound that mentions the `Self` of an outer scope, which cannot be written where `Self` is
+/// something else (see [`Context::of()`]).
+#[derive(Clone, Debug)]
+pub(crate) struct UnnameableSelf {
+    /// The mention of `Self` that cannot be written.
+    pub(crate) cause: TokenStream,
+    /// Tells what is wrong, as the headline of the error: the problem is the bound, not the path
+    /// of the type that uses it.
+    pub(crate) headline: String,
+    /// Tells why, and where `Self` is something else.
+    pub(crate) note: String,
 }
 
 impl Context {
@@ -158,6 +204,7 @@ impl Context {
             self_outlives: Vec::new(),
             module: None,
             scope: None,
+            substituted: Vec::new(),
         }
     }
 
@@ -184,6 +231,12 @@ impl Context {
             Vec::new()
         };
         self
+    }
+
+    /// Returns `true` if a bound of this context was rewritten for another `Self`, the one that
+    /// `declared` is.
+    pub(crate) fn substitutes(&self, declared: &SelfRequirement) -> bool {
+        self.substituted.contains(declared)
     }
 
     pub(crate) fn with_module(mut self, module: Option<ContextId>) -> Self {
@@ -214,12 +267,21 @@ impl Context {
     /// Returns the context of `ty` in `scopes` (outermost first). Names match by name only, which
     /// is harmless: the Referrer computes the same. `enclosing` lifetimes become generics even if
     /// `ty` does not name them.
+    ///
+    /// `self_req` is what `Self` means where `ty` is written. The bounds and where predicates of a
+    /// generic are written for the `Self` of the scope that declares it. If that is not `self_req`
+    /// (a nested impl, struct or trait has a `Self` of its own), the bounds that mention `Self` are
+    /// rewritten for the one that declared them: `T: Tr<Self>` of `struct S<T: Tr<Self>>` is
+    /// `T: Tr<S<T>>` where `Self` is something else, and the context does not depend on `Self`.
+    /// That is impossible if the `Self` of the scope is an implementor of a trait, or if the
+    /// bound names an associated item of `Self` (`Self::X`): it fails with [`UnnameableSelf`]. The
+    /// Referrer has the same scopes with the same `Self`, so it computes the same context.
     pub(crate) fn of(
         ty: &Type,
         scopes: &[Scope],
         self_req: Option<&SelfRequirement>,
         enclosing: &Enclosing,
-    ) -> Self {
+    ) -> std::result::Result<Self, UnnameableSelf> {
         let mut names = HashSet::new();
         token_names(quote!(#ty), &mut names);
         let mut mentions_self = type_mentions_self(ty);
@@ -260,6 +322,13 @@ impl Context {
         let mut params = BTreeMap::new();
         let mut predicates = BTreeMap::new();
         let mut swept_self = false;
+        // The `Self` of the scope `ix`, if it is not the one where `ty` is written.
+        let foreign = |ix: usize| {
+            scopes[ix]
+                .self_ty()
+                .filter(|outer| Some(*outer) != self_req)
+        };
+        let mut substituted: Vec<SelfRequirement> = Vec::new();
         loop {
             let (from, name) = match work.pop() {
                 Some(item) => item,
@@ -267,6 +336,10 @@ impl Context {
                     // `where Self: Sized` belongs to the context: the impl must declare it too.
                     swept_self = true;
                     for (ix, scope) in scopes.iter().enumerate() {
+                        // What bounds another `Self` is no business of this one.
+                        if foreign(ix).is_some() {
+                            continue;
+                        }
                         for (k, predicate) in scope.predicates.iter().enumerate() {
                             let bounds_self = match predicate {
                                 WherePredicate::Type(predicate) => {
@@ -300,12 +373,20 @@ impl Context {
             if params.contains_key(&(ix, pos)) {
                 continue;
             }
-            let param = &scopes[ix].params[pos];
-            params.insert((ix, pos), param.clone());
+            // The bounds are written for the `Self` of the scope, which may not be this one.
+            let outer = foreign(ix);
+            let mut param = scopes[ix].params[pos].clone();
+            if let Some(outer) = outer.filter(|_| generic_param_mentions_self(&param)) {
+                param = for_self_of(outer, &param)?;
+                if !substituted.contains(outer) {
+                    substituted.push(outer.clone());
+                }
+            }
             let mut names = HashSet::new();
             token_names(quote!(#param), &mut names);
             work.extend(names.into_iter().map(|name| (ix, name)));
-            let mut found_self = generic_param_mentions_self(param);
+            let mut found_self = generic_param_mentions_self(&param);
+            params.insert((ix, pos), param);
             for (k, predicate) in scopes[ix].predicates.iter().enumerate() {
                 if predicates.contains_key(&(ix, k)) {
                     continue;
@@ -313,9 +394,19 @@ impl Context {
                 let mut names = HashSet::new();
                 token_names(quote!(#predicate), &mut names);
                 if names.contains(&name) {
-                    predicates.insert((ix, k), predicate.clone());
+                    let mut predicate = predicate.clone();
+                    if let Some(outer) = outer.filter(|_| where_predicate_mentions_self(&predicate))
+                    {
+                        predicate = for_self_of(outer, &predicate)?;
+                        if !substituted.contains(outer) {
+                            substituted.push(outer.clone());
+                        }
+                        names.clear();
+                        token_names(quote!(#predicate), &mut names);
+                    }
                     work.extend(names.into_iter().map(|name| (ix, name)));
-                    found_self |= where_predicate_mentions_self(predicate);
+                    found_self |= where_predicate_mentions_self(&predicate);
+                    predicates.insert((ix, k), predicate);
                 }
             }
             if found_self && !mentions_self {
@@ -369,8 +460,10 @@ impl Context {
                 predicates: predicates.into_iter().collect(),
             });
         }
-        Self::new(generics, self_req.filter(|_| mentions_self).cloned())
-            .with_self_outlives(self_outlives)
+        let mut context = Self::new(generics, self_req.filter(|_| mentions_self).cloned())
+            .with_self_outlives(self_outlives);
+        context.substituted = substituted;
+        Ok(context)
     }
 
     pub(crate) fn none() -> Self {
@@ -641,6 +734,79 @@ fn written_self_outlives(
     }
     *predicates = remaining;
     moved
+}
+
+/// A generic parameter or a where predicate, written for the `Self` of the scope that declares it.
+trait WrittenForSelf: Clone {
+    fn self_mentions(&self) -> SelfMentions;
+    /// What it is, for the note of an error.
+    fn what(&self) -> String;
+    fn rewrite(self, folder: &mut ReplaceSelf<'_>) -> Self;
+}
+
+impl WrittenForSelf for GenericParam {
+    fn self_mentions(&self) -> SelfMentions {
+        self_in_param(self)
+    }
+    fn what(&self) -> String {
+        format!("the bound of `{}`", generic_param_name(self))
+    }
+    fn rewrite(self, folder: &mut ReplaceSelf<'_>) -> Self {
+        folder.fold_generic_param(self)
+    }
+}
+
+impl WrittenForSelf for WherePredicate {
+    fn self_mentions(&self) -> SelfMentions {
+        self_in_predicate(self)
+    }
+    fn what(&self) -> String {
+        format!("the where predicate `{}`", quote!(#self))
+    }
+    fn rewrite(self, folder: &mut ReplaceSelf<'_>) -> Self {
+        folder.fold_where_predicate(self)
+    }
+}
+
+/// Rewrites `node`, which is written for `outer` as `Self`, for any other `Self`: `Self` becomes
+/// the type that `outer` is. It fails if `outer` is the implementor of a trait, or if `node` names
+/// an associated item of `Self`, which have no name where `Self` is something else (`S::X` of a
+/// type is ambiguous).
+fn for_self_of<T: WrittenForSelf>(
+    outer: &SelfRequirement,
+    node: &T,
+) -> std::result::Result<T, UnnameableSelf> {
+    let mentions = node.self_mentions();
+    match outer {
+        SelfRequirement::Bound(path) => Err(UnnameableSelf {
+            cause: mentions.first.unwrap_or_else(|| quote!(Self)),
+            headline: format!("{} mentions a `Self` which has no name here", node.what()),
+            note: format!(
+                "{} mentions the `Self` of the trait `{}`, which has no name here: `Self` is \
+                 something else in the item around",
+                node.what(),
+                quote!(#path)
+            ),
+        }),
+        SelfRequirement::Type(ty) => match mentions.associated {
+            Some(cause) => Err(UnnameableSelf {
+                headline: format!(
+                    "{} mentions `{}`, which has no name here",
+                    node.what(),
+                    cause
+                ),
+                note: format!(
+                    "{} mentions `{}`, an associated item of the `Self` of `{}`, which has no \
+                     name here: `Self` is something else in the item around",
+                    node.what(),
+                    cause,
+                    quote!(#ty)
+                ),
+                cause,
+            }),
+            None => Ok(node.clone().rewrite(&mut ReplaceSelf { self_ty: ty })),
+        },
+    }
 }
 
 /// The lifetimes a type must outlive because of the types around it, as in `&'a Vec<Rel2<T>>`
