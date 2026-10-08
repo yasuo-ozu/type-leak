@@ -28,7 +28,7 @@ proc-macro2 = "1.0"
 template-quote = "0.4"
 
 [dependencies.syn]
-version = "2.0.15"
+version = "2.0.25"
 features = [
   "full",
   "derive",
