@@ -42,8 +42,10 @@ jobs:
       run: rustup toolchain install 1.56 --profile minimal
     - name: Generate a lockfile compatible with Rust 1.56
       run: CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo +stable generate-lockfile
-    - name: Pin unicode-width (a dependency of safegraph; 0.1.14 requires Rust 1.66 without declaring it)
-      run: cargo +stable update -p unicode-width --precise 0.1.11
+    - name: Pin unicode-width (a dependency of safegraph; 0.1.14 requires Rust 1.66 without declaring it) and syn (the minimum in Cargo.toml)
+      run: |
+        cargo +stable update -p unicode-width --precise 0.1.11
+        cargo +stable update -p syn@2 --precise "$(sed -n '/^\[dependencies.syn\]/,/^\[/{s/^version = "\(.*\)"$/\1/p}' Cargo.toml)"
     - name: Build the library with Rust 1.56
       run: cargo +1.56 build --lib --verbose
 
