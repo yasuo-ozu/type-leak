@@ -349,11 +349,19 @@ fn context_of_a_dropped_id_panics() {
 
 #[test]
 fn lookups_work_with_gaps() {
-    let (referrer, _) = gap_referrer();
-    let rewritten = referrer.expand(parse_quote!((Rel1, T)), |_, ix| parse_quote!(P<#ix>));
+    let (referrer, top_level) = gap_referrer();
+    let rewritten = referrer.expand(
+        top_level,
+        parse_quote!((Rel1, T)),
+        |_, ix| parse_quote!(P<#ix>),
+    );
     let expected: Type = parse_quote!((P<1usize>, T));
     assert_eq!(s(&rewritten), s(&expected));
-    let rewritten = referrer.expand(parse_quote!(Wrap<U>), |_, ix| parse_quote!(P<#ix>));
+    let rewritten = referrer.expand(
+        top_level,
+        parse_quote!(Wrap<U>),
+        |_, ix| parse_quote!(P<#ix>),
+    );
     let expected: Type = parse_quote!(P<2usize>);
     assert_eq!(s(&rewritten), s(&expected));
     assert_eq!(
@@ -373,7 +381,7 @@ fn lookups_work_with_gaps() {
         parse_quote! { struct S<T, U> { a: Rel0, b: (Rel1, T), c: Wrap<U> } };
     referrer
         .clone()
-        .into_visitor(None, None, |_, ix| parse_quote!(P<#ix>))
+        .visitor(top_level, |_, ix| parse_quote!(P<#ix>))
         .visit_item_struct_mut(&mut item);
     let expected: ItemStruct =
         parse_quote! { struct S<T, U> { a: P<0usize>, b: (P<1usize>, T), c: P<2usize> } };
@@ -384,7 +392,7 @@ fn lookups_work_with_gaps() {
         fn f<U>() { struct Wrap<X>(X); let _a: Wrap<U>; let _b: Rel0; }
     };
     referrer
-        .into_visitor(None, None, |_, ix| parse_quote!(P<#ix>))
+        .visitor(top_level, |_, ix| parse_quote!(P<#ix>))
         .visit_item_fn_mut(&mut item);
     let expected: ItemFn = parse_quote! {
         fn f<U>() { struct Wrap<X>(X); let _a: Wrap<U>; let _b: P<0usize>; }
@@ -574,15 +582,19 @@ fn serialization_with_gaps_keeps_the_requirements() {
     let top_level = leaker.intern_trait(&tr, true).unwrap();
     let referrer = leaker.finish();
     // `Rel<Self>` uses `Self`, `T` and `U` (the context 0), the tuple uses `T` (the context 1),
-    // `RelB` nothing (2), and the generics of the trait are the context 3 (without `Self`).
-    assert_eq!(top_level, id(3));
-    assert_eq!(ids(&referrer), [0, 2, 3]);
+    // and `RelB` nothing (2). The top-level context has the generics of the trait and, as an
+    // entry names `Self`, what `Self` is: it is the context 0.
+    assert_eq!(top_level, id(0));
+    assert_eq!(ids(&referrer), [0, 2]);
     assert!(matches!(
         referrer.context_self(id(0)),
         Some(SelfRequirement::Bound(_))
     ));
     assert_eq!(referrer.context_self(id(2)), None);
-    assert_eq!(referrer.context_self(top_level), None);
+    assert_eq!(
+        referrer.context_self(top_level),
+        referrer.context_self(id(0))
+    );
     assert_eq!(s(referrer.context_generics(top_level)), "< T , U >");
     let parsed: Referrer = parse2(referrer.to_token_stream()).unwrap();
     assert_eq!(parsed, referrer);

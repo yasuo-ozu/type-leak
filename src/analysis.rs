@@ -153,6 +153,18 @@ fn collect_errors(effects: &[Effect], errors: &mut Vec<CheckResult>) {
     }
 }
 
+/// Returns `true` if a type that may become an entry names `Self`, so the Referrer needs to know
+/// what `Self` is to find it.
+pub(crate) fn names_self(effects: &[Effect]) -> bool {
+    effects.iter().any(|effect| match effect {
+        Effect::Type(pending) => {
+            (pending.in_graph && pending.context.self_ty().is_some())
+                || names_self(&pending.components)
+        }
+        _ => false,
+    })
+}
+
 pub(crate) fn has_optional(effects: &[Effect]) -> bool {
     effects
         .iter()

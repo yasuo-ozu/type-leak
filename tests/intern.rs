@@ -90,7 +90,10 @@ fn intern_enum() {
         ]
     );
     assert_eq!(ids(&referrer), [0, 0, 1, 2]);
-    assert_eq!(top_level.index(), 3);
+    // The top-level context has the generics of the enum and, as `Rel2<Self>` names `Self`, what
+    // `Self` is: it is the context of that entry.
+    assert_eq!(top_level.index(), 2);
+    assert_eq!(top_level, referrer.context(3));
     assert!(referrer.has_self());
     // Without `Self` it is an error to leak `Rel2<Self>`, and the others are not.
     assert!(Leaker::new().intern_enum(&item, false).is_err());
@@ -141,7 +144,10 @@ fn intern_trait() {
         ]
     );
     assert_eq!(ids(&referrer), [0, 1, 2]);
-    assert_eq!(top_level.index(), 3);
+    // The top-level context has the generics of the trait and, as `Rel2<Self>` names `Self`, what
+    // `Self` is: it is the context of that entry.
+    assert_eq!(top_level.index(), 0);
+    assert_eq!(top_level, referrer.context(0));
     assert_eq!(s(referrer.context_generics(top_level)), "< T , U >");
     // The relative bounds and the relative supertraits are errors.
     assert!(Leaker::new()

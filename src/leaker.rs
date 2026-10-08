@@ -1,6 +1,6 @@
 //! The [`Leaker`], which finds the types depending on the type context.
 
-use crate::analysis::{Analysis, CheckResult};
+use crate::analysis::{names_self, Analysis, CheckResult};
 use crate::analyze::{
     declared_names, AnalyzeVisitor, Finished, ModuleNames, Res, ScopeSpec, Scopes,
 };
@@ -415,7 +415,10 @@ impl Scopes for Leaker {
         self.types.merge(analysis.types);
         self.optional_types.merge(analysis.optional);
         // Shares the context of an entry that uses exactly these generics.
-        let top_level = module.unwrap_or_else(|| self.contexts.intern(Context::new(root, None)));
+        // `Self` is part of the top-level context only if an entry names it.
+        let scope_self = spec.declared_self().filter(|_| names_self(&effects));
+        let top_level =
+            module.unwrap_or_else(|| self.contexts.intern(Context::new(root, scope_self)));
         self.top_levels.insert(top_level);
         self.top_levels.extend(top_levels);
         Ok((top_level, result))

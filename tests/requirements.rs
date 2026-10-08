@@ -7,7 +7,7 @@ use syn::punctuated::Punctuated;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{EncodeError, Leaker, Referrer, SelfRequirement, Visitor};
+use type_leak::{ContextId, EncodeError, Leaker, Referrer, SelfRequirement, Visitor};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -20,11 +20,17 @@ fn s(x: &impl template_quote::ToTokens) -> String {
 
 /// Leaks the types of the traits (one call each).
 fn leak_traits(traits: &[ItemTrait]) -> Referrer {
+    leak_traits_in(traits).0
+}
+
+/// Like `leak_traits()`, with the top-level context of each trait: the scope of its copy.
+fn leak_traits_in(traits: &[ItemTrait]) -> (Referrer, Vec<ContextId>) {
     let mut leaker = Leaker::new();
-    for item in traits {
-        leaker.intern_trait(item, true).unwrap();
-    }
-    leaker.finish()
+    let contexts = traits
+        .iter()
+        .map(|item| leaker.intern_trait(item, true).unwrap())
+        .collect();
+    (leaker.finish(), contexts)
 }
 
 fn leak_trait(item: ItemTrait) -> Referrer {
@@ -199,13 +205,13 @@ fn only_the_generics_used_are_required() {
 #[test]
 fn self_of_a_trait() {
     // `Self` is the implementor of the trait, and the parameters of the trait are used.
-    let referrer = leak_trait(parse_quote! {
+    let (referrer, contexts) = leak_traits_in(&[parse_quote! {
         trait X<'a, T, const N: usize, U> {
             fn f(&self) -> Rel<Self>;
             fn g(&self) -> Rel2;
             fn h(&self) -> Wrap<Self::Item, T>;
         }
-    });
+    }]);
     assert_eq!(
         entries(&referrer),
         [
@@ -228,10 +234,11 @@ fn self_of_a_trait() {
             "-"
         ]
     );
-    // The two types are in one context, and the generics of the trait (without `Self`) are
-    // another one.
-    assert_eq!(referrer.contexts().count(), 3);
+    // The two types are in one context, which is also the top-level one: it has the generics of
+    // the trait and, as an entry names `Self`, what `Self` is.
+    assert_eq!(referrer.contexts().count(), 2);
     assert_eq!(referrer.context(0), referrer.context(1));
+    assert_eq!(referrer.context(0), contexts[0]);
     assert!(referrer.has_self());
 
     // A trait without parameters.
@@ -245,7 +252,7 @@ fn self_of_a_trait() {
 
 #[test]
 fn self_in_different_traits_is_different() {
-    let referrer = leak_traits(&[
+    let (referrer, contexts) = leak_traits_in(&[
         parse_quote!(
             trait X<T> {
                 fn f(&self) -> Rel<Self>;
@@ -265,8 +272,10 @@ fn self_in_different_traits_is_different() {
         ["Rel < Self >", "Rel2", "Rel < Self >"]
     );
     assert_eq!(selfs(&referrer), ["Self: X < T >", "-", "Self: Y < T >"]);
-    // The generics of the traits are the same (`<T>`), so the calls share their top-level context.
-    assert_eq!(referrer.contexts().count(), 4);
+    // The generics of the traits are the same (`<T>`), but the top-level context has `Self` as an
+    // entry names it, so it is not shared by the calls: it is the context of `Rel<Self>`.
+    assert_eq!(referrer.contexts().count(), 3);
+    assert_eq!(contexts, [referrer.context(0), referrer.context(2)]);
 
     // The same trait twice is shared.
     let tr: ItemTrait = parse_quote!(
@@ -485,23 +494,38 @@ fn rewritten(sig: &str) -> String {
 }
 
 #[test]
-fn lenient_matching() {
+fn matching_with_the_generics_of_the_context() {
     let tr: ItemTrait = parse_quote! {
         trait X<T: ::core::clone::Clone, U> {
             fn f<const B: bool>(&self, a: Wrap<T>, b: Wrap<B>, c: Rel, d: Wrap<U>);
         }
     };
-    let referrer = leak_trait(tr);
-    // The generics which are not declared in the visited syntax are assumed to be those of the
-    // Leaker, whatever their declaration is.
+    let z: ItemTrait = parse_quote! {
+        trait Z {
+            fn f(&self);
+        }
+    };
+    let (referrer, contexts) = leak_traits_in(&[tr, z]);
+    let (context, none) = (contexts[0], contexts[1]);
+    // The generics which are not declared in the visited syntax are those of the context, as it
+    // declares them.
     assert_eq!(
         rewrite(
-            referrer.clone().into_visitor(None, None, placeholder),
+            referrer.clone().visitor(context, placeholder),
             "fn f<const B: bool>(&self, a: Wrap<T>, b: Wrap<B>, c: Rel, d: Wrap<U>)"
         ),
         rewritten(
             "fn f<const B: bool>(&self, a: P<0usize>, b: P<1usize>, c: P<2usize>, d: P<3usize>)"
         )
+    );
+    // They are not those of another context (the generics which no scope declares are not
+    // assumed to be the Leaker's), but what uses none is found.
+    assert_eq!(
+        rewrite(
+            referrer.clone().visitor(none, placeholder),
+            "fn f<const B: bool>(&self, a: Wrap<T>, b: Wrap<B>, c: Rel, d: Wrap<U>)"
+        ),
+        rewritten("fn f<const B: bool>(&self, a: Wrap<T>, b: P<1usize>, c: P<2usize>, d: Wrap<U>)")
     );
     // The generics declared in the visited syntax must be declared in the same way, and the same
     // generics must be used.
@@ -514,7 +538,7 @@ fn lenient_matching() {
         let sig = format!("fn f{}(&self, a: Wrap<T>)", generics);
         let expected = format!("fn f{}(&self, a: {})", generics, a);
         assert_eq!(
-            rewrite(referrer.clone().into_visitor(None, None, placeholder), &sig),
+            rewrite(referrer.clone().visitor(context, placeholder), &sig),
             rewritten(&expected),
             "{}",
             generics
@@ -523,14 +547,14 @@ fn lenient_matching() {
     // `Wrap<B>` is for a `bool`.
     assert_eq!(
         rewrite(
-            referrer.clone().into_visitor(None, None, placeholder),
+            referrer.clone().visitor(context, placeholder),
             "fn f<const B: bool>(&self, b: Wrap<B>)"
         ),
         rewritten("fn f<const B: bool>(&self, b: P<1usize>)")
     );
     assert_eq!(
         rewrite(
-            referrer.clone().into_visitor(None, None, placeholder),
+            referrer.clone().visitor(context, placeholder),
             "fn f<const B: u8>(&self, b: Wrap<B>)"
         ),
         rewritten("fn f<const B: u8>(&self, b: Wrap<B>)")
@@ -538,7 +562,7 @@ fn lenient_matching() {
 }
 
 #[test]
-fn matching_prefers_the_entry_assuming_the_fewest_generics() {
+fn matching_is_exact_where_a_name_is_declared_or_not() {
     // `B` is a `bool` in `f`, and `B` is not declared in `g` (it is a type there).
     let tr: ItemTrait = parse_quote! {
         trait X {
@@ -546,18 +570,18 @@ fn matching_prefers_the_entry_assuming_the_fewest_generics() {
             fn g(&self) -> Wrap<B>;
         }
     };
-    let referrer = leak_trait(tr);
+    let (referrer, contexts) = leak_traits_in(&[tr]);
     assert_eq!(referrer.iter().count(), 2);
     assert_eq!(
         rewrite(
-            referrer.clone().into_visitor(None, None, placeholder),
+            referrer.clone().visitor(contexts[0], placeholder),
             "fn g(&self) -> Wrap<B>"
         ),
         rewritten("fn g(&self) -> P<1usize>")
     );
     assert_eq!(
         rewrite(
-            referrer.into_visitor(None, None, placeholder),
+            referrer.visitor(contexts[0], placeholder),
             "fn f<const B: bool>(&self) -> Wrap<B>"
         ),
         rewritten("fn f<const B: bool>(&self) -> P<0usize>")
@@ -565,9 +589,9 @@ fn matching_prefers_the_entry_assuming_the_fewest_generics() {
 }
 
 #[test]
-fn matching_with_the_root_generics_of_the_call() {
-    // Two calls declare `T` differently, so the entries of `Wrap<T>` are ambiguous without the
-    // generics of the call.
+fn matching_with_the_generics_of_each_scope() {
+    // Two calls declare `T` differently, so the entries of `Wrap<T>` are told apart by the
+    // context of the copy.
     let a: ItemTrait = parse_quote!(
         trait A<T: ::core::clone::Clone> {
             fn f(&self) -> Wrap<T>;
@@ -578,49 +602,39 @@ fn matching_with_the_root_generics_of_the_call() {
             fn f(&self) -> Wrap<T>;
         }
     );
-    let referrer = leak_traits(&[a.clone(), b.clone()]);
-    assert_eq!(referrer.iter().count(), 2);
-    let sig = "fn f(&self) -> Wrap<T>";
-    // Leniently, the first of the entries is used.
-    assert_eq!(
-        rewrite(referrer.clone().into_visitor(None, None, placeholder), sig),
-        rewritten("fn f(&self) -> P<0usize>")
-    );
-    // With the generics of the call, the entry is exact.
-    for (tr, ix) in [(&a, 0usize), (&b, 1)] {
-        assert_eq!(
-            rewrite(
-                referrer
-                    .clone()
-                    .into_visitor_with_root(&tr.generics, None, None, placeholder),
-                sig
-            ),
-            rewritten(&format!("fn f(&self) -> P<{}usize>", ix))
-        );
-    }
-    // No entry has these requirements.
-    let other: Generics = parse_quote!(<T>);
-    assert_eq!(
-        rewrite(
-            referrer
-                .clone()
-                .into_visitor_with_root(&other, None, None, placeholder),
-            sig
-        ),
-        rewritten(sig)
-    );
-    // A type which does not use the generics is found whatever they are.
-    let tr: ItemTrait = parse_quote!(
+    let c: ItemTrait = parse_quote!(
         trait C<T: ::core::clone::Clone> {
             fn f(&self) -> Rel;
         }
     );
-    let referrer = leak_trait(tr);
+    let mut leaker = Leaker::new();
+    let contexts: Vec<ContextId> = [&a, &b]
+        .iter()
+        .map(|tr| leaker.intern_trait(tr, true).unwrap())
+        .collect();
+    // No entry has these generics.
+    let other: Generics = parse_quote!(<T>);
+    let (other, ()) = leaker.enter_generics(&other, |_| ()).unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(referrer.iter().count(), 2);
+    let sig = "fn f(&self) -> Wrap<T>";
+    for (context, ix) in [(contexts[0], 0usize), (contexts[1], 1)] {
+        assert_eq!(
+            rewrite(referrer.clone().visitor(context, placeholder), sig),
+            rewritten(&format!("fn f(&self) -> P<{}usize>", ix))
+        );
+    }
     assert_eq!(
-        rewrite(
-            referrer.into_visitor_with_root(&other, None, None, placeholder),
-            "fn f(&self) -> Rel"
-        ),
+        rewrite(referrer.visitor(other, placeholder), sig),
+        rewritten(sig)
+    );
+    // A type which does not use the generics is found whatever they are.
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&c, true).unwrap();
+    let (other, ()) = leaker.enter_generics(&parse_quote!(<T>), |_| ()).unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(
+        rewrite(referrer.visitor(other, placeholder), "fn f(&self) -> Rel"),
         rewritten("fn f(&self) -> P<0usize>")
     );
 }
@@ -637,79 +651,58 @@ fn matching_self() {
             fn f(&self, a: Rel<Self>, b: Rel2, c: Wrap<T>);
         }
     );
-    let referrer = leak_traits(&[x.clone(), y.clone()]);
+    // `Z` has no entry that names `Self`, and a scope with generics only does not declare it.
+    let z: ItemTrait = parse_quote!(
+        trait Z<T> {
+            fn f(&self, b: Rel2, c: Wrap<T>);
+        }
+    );
+    let mut leaker = Leaker::new();
+    let contexts: Vec<ContextId> = [&x, &y, &z]
+        .iter()
+        .map(|tr| leaker.intern_trait(tr, true).unwrap())
+        .collect();
+    let (generics, ()) = leaker.enter_generics(&parse_quote!(<T>), |_| ()).unwrap();
+    let referrer = leaker.finish();
     // `Rel<Self>` of X, `Rel2`, `Wrap<T>` and `Rel<Self>` of Y.
     assert_eq!(
         referrer.iter().map(s).collect::<Vec<_>>(),
         ["Rel < Self >", "Rel2", "Wrap < T >", "Rel < Self >"]
     );
     let sig = "fn f(&self, a: Rel<Self>, b: Rel2, c: Wrap<T>)";
-    let bound = |name: &str| SelfRequirement::Bound(parse_str(&format!("{}<T>", name)).unwrap());
-    // The entries which do not mention `Self` are not affected by it.
+    // `Self` is that of the context, as it records it: the entries that do not mention `Self` are
+    // not affected by it.
     assert_eq!(
-        rewrite(
-            referrer
-                .clone()
-                .into_visitor(Some(bound("X")), None, placeholder),
-            sig
-        ),
+        rewrite(referrer.clone().visitor(contexts[0], placeholder), sig),
         rewritten("fn f(&self, a: P<0usize>, b: P<1usize>, c: P<2usize>)")
     );
     assert_eq!(
-        rewrite(
-            referrer
-                .clone()
-                .into_visitor(Some(bound("Y")), None, placeholder),
-            sig
-        ),
+        rewrite(referrer.clone().visitor(contexts[1], placeholder), sig),
         rewritten("fn f(&self, a: P<3usize>, b: P<1usize>, c: P<2usize>)")
     );
-    assert_eq!(
-        rewrite(
-            referrer
-                .clone()
-                .into_visitor(Some(bound("Z")), None, placeholder),
-            sig
-        ),
-        rewritten("fn f(&self, a: Rel<Self>, b: P<1usize>, c: P<2usize>)")
+    // The context of `Z` has no `Self` that an entry names, and the one of `enter_generics()` has
+    // none at all: `Rel<Self>` is not found.
+    for context in [contexts[2], generics] {
+        assert_eq!(
+            rewrite(referrer.clone().visitor(context, placeholder), sig),
+            rewritten("fn f(&self, a: Rel<Self>, b: P<1usize>, c: P<2usize>)")
+        );
+    }
+    // The same with the generics of the trait declared again (they are those of the context).
+    let mut copy: ItemTrait = parse_quote!(
+        trait Y<T> {
+            fn f(&self, a: Rel<Self>, b: Rel2, c: Wrap<T>);
+        }
     );
-    // Without it, `Self` is not checked, so the first entry is used.
-    assert_eq!(
-        rewrite(referrer.clone().into_visitor(None, None, placeholder), sig),
-        rewritten("fn f(&self, a: P<0usize>, b: P<1usize>, c: P<2usize>)")
+    referrer
+        .visitor(contexts[1], placeholder)
+        .visit_item_trait_mut(&mut copy);
+    let expected: ItemTrait = parse_quote!(
+        trait Y<T> {
+            fn f(&self, a: P<3usize>, b: P<1usize>, c: P<2usize>);
+        }
     );
-    // With the root, it is exact: `Self` is the one given or, if it is not given, the entry's.
-    assert_eq!(
-        rewrite(
-            referrer.clone().into_visitor_with_root(
-                &y.generics,
-                Some(bound("Y")),
-                None,
-                placeholder
-            ),
-            sig
-        ),
-        rewritten("fn f(&self, a: P<3usize>, b: P<1usize>, c: P<2usize>)")
-    );
-    assert_eq!(
-        rewrite(
-            referrer.clone().into_visitor_with_root(
-                &y.generics,
-                Some(bound("Z")),
-                None,
-                placeholder
-            ),
-            sig
-        ),
-        rewritten("fn f(&self, a: Rel<Self>, b: P<1usize>, c: P<2usize>)")
-    );
-    assert_eq!(
-        rewrite(
-            referrer.into_visitor_with_root(&y.generics, None, None, placeholder),
-            sig
-        ),
-        rewritten("fn f(&self, a: P<0usize>, b: P<1usize>, c: P<2usize>)")
-    );
+    assert_eq!(s(&copy), s(&expected));
 }
 
 #[test]

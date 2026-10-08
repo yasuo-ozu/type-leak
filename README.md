@@ -33,7 +33,7 @@ pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> {
 
 # Walkthrough
 
-The three steps below show both sides in one place. The first two run in the Leaker's crate. The third runs in the Referrer's crate. A macro passes the `Referrer` from the first side to the second as tokens.
+The three steps below show both sides in one place. The first two run in the Leaker's crate. The third runs in the Referrer's crate. A macro passes the `Referrer` and the top-level `ContextId` from the first side to the second as tokens.
 
 ```rust
 use syn::visit_mut::VisitMut;
@@ -80,11 +80,12 @@ let expected: ItemImpl = parse_quote! {
 };
 assert_eq!(impls[0], expected);
 
-// 3. In the Referrer's crate, copy `f` into `impl MyLeaker<u8> for ..`.
+// 3. In the Referrer's crate, copy `f` into `impl MyLeaker<u8> for ..`. `top_level` is the scope
+// of the copy: it gives the visitor the generics (`T`), `Self` and the module.
 // Each leaked type becomes a path through the Repeater, with its generics as arguments.
 let trait_args: Vec<GenericArgument> = vec![parse_quote!(u8)];
 let mut sig: Signature = parse_quote!(fn f(&self, t: T) -> MyWrap<T>);
-let mut visitor = referrer.clone().into_visitor(None, None, |_ty, ix| {
+let mut visitor = referrer.clone().visitor(top_level, |_ty, ix| {
     let args = referrer.generic_args(ix, &item.generics.params, &trait_args).unwrap();
     let used = &referrer.generics(ix).params;
     let encoded = slots.encode_generics_args_to_ty(&args, used).unwrap();
@@ -104,10 +105,11 @@ Notes:
 - `intern_struct()`, `intern_enum()`, `intern_union()`, `intern_impl()` and `intern_trait()` take `(&item, allow_self)`. `Self` is the type for the first four and the implementor for a trait. `intern_mod()` takes only the module. See [Self rules](#self-rules) for `allow_self`.
 - An impl declares only the generics its type uses. `MyWrap<T>` uses `T`, and `MyType` uses none. The encoding is `&'a ()` for a lifetime `'a` and `T` for a type `T`. A generic that the copy declares itself, such as one of a method, is passed by its own name.
 - If the Referrer omits an argument with a default, complete the arguments with `Referrer::complete_args()` first. A default is analyzed with the parameters before it, so it cannot name a later one or `Self`.
-- For the arguments of the trait itself (`u8` of `impl MyLeaker<u8>`), use `Referrer::context_generics(top_level)` and `Referrer::context_generic_args()`. The generics of a context are sorted, so they are matched by name and not by position. Pass `top_level` along with the `Referrer`, because the Referrer does not know which context is the top-level one. A `ContextId` is written and parsed as an integer.
+- For the arguments of the trait itself (`u8` of `impl MyLeaker<u8>`), use `Referrer::context_generics(top_level)` and `Referrer::context_generic_args()`. The generics of a context are sorted, so they are matched by name and not by position. Pass `top_level` along with the `Referrer` (`quote!(#referrer, #top_level)`), because the Referrer does not know which context is the top-level one, and `Referrer::visitor()` needs it. A `ContextId` is written and parsed as an integer.
 - Do not encode the generics of the top-level context for every entry. They have only the bounds the trait writes, so rustc rejects them (E0309) for an entry such as `&'a Rel<T>`. Encode the generics of each entry, as above.
 - A lifetime bound of an entry (`T: 'a`) is encoded in the trait arguments, so the impl must not declare it. Use `Referrer::impl_generics()`, or `without_encoded_bounds()` for other generics. See [Outlives bounds](#outlives-bounds).
-- `Referrer::expand()` rewrites one type instead of a whole item. Give it, and `into_visitor()`, the whole type or item. See [Outlives bounds](#outlives-bounds).
+- `Referrer::visitor(context, ..)` is the rewriter of a copy. `context` is the scope of the copy, the top-level `ContextId` of the call that analyzed what the copy is made from, and the visited syntax is inside it. `Referrer::expand(context, ty, ..)` rewrites one type instead of a whole item. Give them the whole type or item. See [Outlives bounds](#outlives-bounds).
+- `Referrer::visitor()` and `Referrer::expand()` panic if `context` is not one of the `Referrer::contexts()`.
 
 ## Const generics
 
@@ -122,7 +124,9 @@ The context of an entry decides which Repeater impl it needs.
 - Equal declarations give equal contexts. Parameters are sorted by kind and name, bounds are sorted and moved from the where clause to their parameter, and defaults are removed.
 - The Leaker numbers a context when it first appears, from 0. It numbers a module when it is entered, a nested scope when it is left, and the types of the outermost scope when it is left. It never renumbers them, except for the contexts of a scope that fails and is rolled back. So `Referrer::contexts()` can have gaps. It has at least one context. With no other, it is context 0 of the types that use no generics.
 - The top-level context is the one of the generics of the item or scope itself. It differs from an entry's context if the entry uses fewer generics, as `Rel` does in `trait Tr<T> { fn f(&self) -> Rel; }`. The Referrer keeps it even if it has no entry.
-- `Referrer::into_visitor()` checks only the generics declared where the copy is. `Referrer::into_visitor_with_root()` compares whole contexts.
+- The top-level context also records what `Self` is, if an entry of the scope names it (`Referrer::context_self()`), and the module the scope was entered in (`Referrer::context_module()`). So scopes with the same generics but another `Self` return other ids, and `Referrer::visitor(context, ..)` knows the generics, `Self` and module of the copy from the id alone.
+- A type is replaced if its context, computed from the generics in scope, is an entry's. The generics in scope are those of `context`, then those that the visited syntax declares. A name that neither declares is not a generic, so it is not matched: the Referrer does not guess which generics are the Leaker's. If no entry has exactly the context, one that has bounds on `Self` alone besides (`where Self: Sized`) is taken, since a copy where `Self` is a type parameter (`Visitor::with_self()`) cannot write them. An outermost item that declares exactly the generics of `context` (the copy of the item itself) does not declare them again. If the copy declares them with other bounds (`impl<T: Clone> MyLeaker<T> for ..`), call `Visitor::with_outermost_generics_as_leakers()`.
+- `Referrer::expand()` knows only the generics of `context`. It does not find a type that names a generic of a method: visit the signature.
 
 ## Which types become entries
 
@@ -160,7 +164,7 @@ assert_eq!(leaker.finish().iter().count(), 2);
 
 - The generics of a scope are those of the Leaker. In a nested scope they are local generics, and the generics around it stay in scope.
 - `Self` is what the scope declares. In `enter_generics()` and `enter_mod()` it has no meaning, so naming it is an error. An item visited with `visit_item()` has a `Self` of its own.
-- Scopes with equal generics return the same id.
+- Scopes with equal generics return the same id, if they are in the same module and, when an entry names `Self`, declare the same `Self`.
 - The generics of a scope are not analyzed. To copy their bounds or where clause, visit them with `visit_type_param_bound()` and `visit_where_clause()`. The default of a type parameter is analyzed with the earlier parameters as the generics. The defaults of const parameters are analyzed with the syntax that visits them.
 - A scope is all-or-nothing. If the syntax it visits has an error, it rolls back everything it recorded, including its inner scopes. It returns its own errors with spans, in order. It never returns those of a failed inner scope, with or without `?`. Ids returned earlier stay valid. The scope around it can go on. A panic in the closure rolls the scope back too, and an outer scope may catch it with `catch_unwind()` and go on.
 
@@ -172,10 +176,12 @@ assert_eq!(leaker.finish().iter().count(), 2);
 - A relative path means what it means in its module. So an entry is keyed by its module if its path is relative, if a path in what `Self` means or in a bound of its generics is neither absolute nor starts with `crate::` or `$crate::`, or if it is a type macro. Other entries are shared by all modules.
 - Emit the Repeater impl of a keyed entry inside its module. `Referrer::context_module()` tells which module it is. `Referrer::module_path()` gives its path relative to the module of `intern_mod()` (`[]` for that module). A module found by `visit_item()` has such a path. A module entered by `enter_mod()` has no path, only its hint.
 
-To rewrite a copy, tell the visitor where it is: `Referrer::into_visitor(self_requirement, module, ..)`. An entry with no module matches in every module. An entry of a module matches only there.
+To rewrite a copy, tell the visitor where it is: `Referrer::visitor(context, ..)`. An entry with no module matches in every module. An entry of a module matches only there.
 
-- `Some(module)`: the copy is in `module`. A `mod` item inside it is a nested module, found by name. If the Leaker saw no such module, it counts as a module no entry depends on. An id that is not a module of the Referrer counts the same way, so only entries with no module match there. A `mod` item that is the root of the visit is `module` itself. So the copy of `mod m2 { .. }` that a second `intern_mod()` analyzed is rewritten with the id of that call. For a module entered by `enter_mod()` inside another, pass its id, because it has no path.
-- `None`: the module is unknown, so an entry of any module matches. Entries with no module come first, then those of a module nested in no other. A root `mod` item is taken to be the only root module, if there is exactly one and it is named like the item. The visitor does not guess among several roots. If equal entries are in different modules, nothing is rewritten.
+- The visited syntax is inside the module of `context`, which is `context` itself if it is a module, and else `Referrer::context_module(context)`. A `mod` item is a module nested in it, found by name, never the module itself. If the Leaker saw no such module, it counts as a module no entry depends on, so only entries with no module match in it. To rewrite a copy of a whole module, visit its items, or a `File` of them. A `File` hides the entries of no module that name what it declares, as a module does. Items visited one by one do not know their siblings.
+- A context with no module (`intern_trait()`, `enter_generics()`) matches only entries with no module. A `mod` item there is a module found with no module around it, which is found by its name.
+- The module of a scope entered inside a module is that module, so a copy in the scope is looked up there. The top-level context of a nested scope has only the generics of that scope, not those around it.
+- Two `intern_mod()` calls return the ids of two modules. Rewrite the copy of each with its own id.
 
 # Limitations
 
@@ -192,10 +198,9 @@ fn f<'a, T: 'a>(x: Rel<'a, T>);  // good
 
 Instead, write the bound: `T: 'a`, or `where Self: 'a` for `Rel<'a, Self>`. A struct that holds a leaked type under such a path writes it too: `struct F<'a, T: 'a>(Ref<'a, Rel2<T>>)`. The copy must write the same bound, or the entry is not found.
 
-- The lifetimes around a type count. `Rel2<T>` in `&'a Vec<Rel2<T>>` is an entry with the generics `<'a, T: 'a>`. A reference, tuple, array, slice, pointer, path argument, function pointer or trait object passes the lifetime on. An associated type path (`<X as Tr>::A`, `T::A<X>`), `impl Trait` and an array length do not. The same type under another lifetime is another entry. rustc infers `T: 'a` for the original `struct F<'a, T>(&'a Vec<Rel2<T>>)`, but not for a copy that uses `<S as Repeater<..>>::Type` (E0309). So give `expand()` and `into_visitor()` the whole type or item, not a type cut out of another.
+- The lifetimes around a type count. `Rel2<T>` in `&'a Vec<Rel2<T>>` is an entry with the generics `<'a, T: 'a>`. A reference, tuple, array, slice, pointer, path argument, function pointer or trait object passes the lifetime on. An associated type path (`<X as Tr>::A`, `T::A<X>`), `impl Trait` and an array length do not. The same type under another lifetime is another entry. rustc infers `T: 'a` for the original `struct F<'a, T>(&'a Vec<Rel2<T>>)`, but not for a copy that uses `<S as Repeater<..>>::Type` (E0309). So give `expand()` and `visitor()` the whole type or item, not a type cut out of another.
 - A trait object argument counts too, also if the object has its own bound. `&'a dyn Iterator<Item = Rel2<T>>` needs `T: 'a`.
 - Only a lifetime parameter counts as `'a`. `'static`, `'_` and the lifetime of a `for<..>` binder are never recorded, and `T: 'static` is not encoded. A binder around the type does not stop the lifetimes outside it: `&'a for<'x> fn(&'x X)` needs `X: 'a`.
-- The Referrer assumes that the generics it does not see declared are the Leaker's. The bounds a type implies on them must be among those of the entry.
 - `where Self: 'a` and `where Self: Sized + 'a` count as `Self: 'a`. Only a bound by a lifetime parameter moves into `Referrer::context_self_outlives()`. `Self: 'static`, a bound under `for<..>` and `Self::Item: 'a` stay where predicates. A `Self: 'a` that only the where clause of the trait writes is not in the copy of a method. For a lifetime that the copy declares (`impl<'a> MyLeaker<'a> for ..`), write `where Self: 'a` in the copy again.
 - A type with `'static` needs no bound. The original already declares `T: 'static`, because rustc infers none for a struct, and so must the copy.
 - The value of an associated type or GAT, such as `type A<'a, T> = Ref<'a, Rel2<T>>;`, is rejected like the original. Write `type A<'a, T: 'a>`.

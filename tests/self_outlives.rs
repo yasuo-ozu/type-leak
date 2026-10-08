@@ -414,34 +414,21 @@ fn the_referrer_finds_the_entries_with_the_lifetimes_declared_where_the_copy_is(
         let mut leaker = Leaker::new();
         let top_level = leaker.intern_trait(&tr, true).unwrap();
         let referrer = leaker.finish();
-        let self_requirement = match referrer.context_self(top_level) {
-            Some(requirement) => requirement.clone(),
-            None => SelfRequirement::Bound(parse_quote!(Tr<'t>)),
-        };
         // The copy of each method is rewritten, with the lifetimes declared there or not (`'t` is
         // a generic of the trait, which the signature does not declare).
         let mut copy = tr.clone();
         referrer
             .clone()
-            .into_visitor(
-                Some(self_requirement.clone()),
-                None,
-                |_, ix| parse_quote!(P<#ix>),
-            )
+            .visitor(top_level, |_, ix| parse_quote!(P<#ix>))
             .visit_item_trait_mut(&mut copy);
         let text = s(&copy);
         assert_eq!(text.matches("P < ").count(), 4, "{}", text);
         assert!(!text.contains("Rel <"), "{}", text);
-        // The exact lookup agrees.
+        // Taking the generics of the trait as those of the context agrees.
         let mut copy = tr.clone();
         referrer
             .clone()
-            .into_visitor_with_root(
-                &tr.generics,
-                Some(self_requirement),
-                None,
-                |_, ix| parse_quote!(P<#ix>),
-            )
+            .visitor(top_level, |_, ix| parse_quote!(P<#ix>))
             .with_outermost_generics_as_leakers()
             .visit_item_trait_mut(&mut copy);
         let text = s(&copy);
@@ -757,43 +744,20 @@ fn a_written_bound_is_encoded_and_never_declared() {
     assert_eq!(s(&encoded), s(&expected));
 }
 
-/// Rewrites a copy of `tr` with each leaked type replaced by `P<index>`, as the lookup `how`
-/// finds them, and counts those it found.
+/// Rewrites a copy of `tr` in the scope `top_level` with each leaked type replaced by `P<index>`,
+/// as the lookup `how` finds them (`"declared"`: the generics of the trait are declared again by
+/// the copy, `"leakers"`: they are those of the context), and counts those it found.
 fn found(tr: &ItemTrait, referrer: &Referrer, top_level: ContextId, how: &str) -> usize {
-    let self_requirement = referrer.context_self(top_level).cloned().or_else(|| {
-        let ident = &tr.ident;
-        let generics = &tr.generics;
-        let args: Vec<GenericParam> = generics.params.iter().cloned().collect();
-        let names: Vec<proc_macro2::TokenStream> = args
-            .iter()
-            .map(|param| match param {
-                GenericParam::Lifetime(param) => quote!(#{&param.lifetime}),
-                GenericParam::Type(param) => quote!(#{&param.ident}),
-                GenericParam::Const(param) => quote!(#{&param.ident}),
-            })
-            .collect();
-        let path: Path = if names.is_empty() {
-            parse_quote!(#ident)
-        } else {
-            parse_quote!(#ident<#(#names),*>)
-        };
-        Some(SelfRequirement::Bound(path))
-    });
     let mut copy = tr.clone();
     let visitor = |ix| -> Type { parse_quote!(P<#ix>) };
     match how {
-        "lenient" => referrer
+        "declared" => referrer
             .clone()
-            .into_visitor(self_requirement, None, |_, ix| visitor(ix))
+            .visitor(top_level, |_, ix| visitor(ix))
             .visit_item_trait_mut(&mut copy),
         "leakers" => referrer
             .clone()
-            .into_visitor(self_requirement, None, |_, ix| visitor(ix))
-            .with_outermost_generics_as_leakers()
-            .visit_item_trait_mut(&mut copy),
-        "exact" => referrer
-            .clone()
-            .into_visitor_with_root(&tr.generics, self_requirement, None, |_, ix| visitor(ix))
+            .visitor(top_level, |_, ix| visitor(ix))
             .with_outermost_generics_as_leakers()
             .visit_item_trait_mut(&mut copy),
         other => panic!("{}", other),
@@ -805,8 +769,8 @@ fn found(tr: &ItemTrait, referrer: &Referrer, top_level: ContextId, how: &str) -
 fn the_referrer_finds_an_entry_with_a_written_bound() {
     // The copy has the bound written (in the method, or in the where clause of the trait, where
     // the `impl` does not repeat it), or it is implied by a reference (or there is none, for a
-    // path with a lifetime, which implies nothing): the entry is found by every lookup, the
-    // lenient one with the lifetimes declared where the copy is or not, and the exact one.
+    // path with a lifetime, which implies nothing): the entry is found by both lookups, with the
+    // generics of the trait declared again by the copy or taken from the context.
     for tr in [
         parse_quote! {
             trait Tr {
@@ -859,7 +823,7 @@ fn the_referrer_finds_an_entry_with_a_written_bound() {
         let top_level = leaker.intern_trait(&tr, true).unwrap();
         let referrer = leaker.finish();
         assert_eq!(referrer.iter().count(), 1, "{}", s(&tr));
-        for how in ["lenient", "leakers", "exact"] {
+        for how in ["declared", "leakers"] {
             assert_eq!(
                 found(&tr, &referrer, top_level, how),
                 2,
@@ -868,14 +832,19 @@ fn the_referrer_finds_an_entry_with_a_written_bound() {
                 s(&tr)
             );
         }
-        // `expand()` knows no generic: those of the entry are the Leaker's.
+        // `expand()` takes the generics and `Self` of the context. A lifetime of a method is not
+        // among them, so the entry that has it is not found there: visit the method instead.
         let ty = referrer.iter().next().unwrap().clone();
-        let expanded = referrer.expand(ty, |_, ix| parse_quote!(P<#ix>));
-        assert_eq!(s(&expanded), "P < 0usize >", "{}", s(&tr));
+        let expanded = referrer.expand(top_level, ty.clone(), |_, ix| parse_quote!(P<#ix>));
+        if tr.generics.params.is_empty() {
+            assert_eq!(s(&expanded), s(&ty), "{}", s(&tr));
+        } else {
+            assert_eq!(s(&expanded), "P < 0usize >", "{}", s(&tr));
+        }
         // And the same after the serialization.
         let parsed: Referrer = parse2(referrer.to_token_stream()).unwrap();
         assert_eq!(parsed, referrer);
-        for how in ["lenient", "leakers", "exact"] {
+        for how in ["declared", "leakers"] {
             assert_eq!(
                 found(&tr, &parsed, top_level, how),
                 2,
@@ -898,7 +867,7 @@ fn the_referrer_finds_an_entry_with_a_written_bound() {
         referrer.context_self_outlives(referrer.context(0)),
         lifetimes(&["'a", "'z"])
     );
-    for how in ["lenient", "leakers", "exact"] {
+    for how in ["declared", "leakers"] {
         assert_eq!(found(&other, &referrer, top_level, how), 1, "{}", how);
     }
     let implied: ItemTrait = parse_quote! {
@@ -907,7 +876,7 @@ fn the_referrer_finds_an_entry_with_a_written_bound() {
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_trait(&implied, true).unwrap();
     let referrer = leaker.finish();
-    for how in ["lenient", "leakers"] {
+    for how in ["declared", "leakers"] {
         assert_eq!(found(&other, &referrer, top_level, how), 0, "{}", how);
     }
     // With a path, which implies `Self: 'a` for neither, the written `'z` alone is the context.
@@ -921,7 +890,7 @@ fn the_referrer_finds_an_entry_with_a_written_bound() {
         referrer.context_self_outlives(referrer.context(0)),
         lifetimes(&["'z"])
     );
-    for how in ["lenient", "leakers", "exact"] {
+    for how in ["declared", "leakers"] {
         assert_eq!(found(&path, &referrer, top_level, how), 1, "{}", how);
     }
 }

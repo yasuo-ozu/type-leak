@@ -1,11 +1,11 @@
 //! The analysis of items and types by the [`Leaker`].
 
 use crate::analysis::{
-    has_ambiguous, has_optional, primitive_effects, scope_error, CheckResult, Effect, PendingType,
+    has_ambiguous, has_optional, names_self, primitive_effects, scope_error, CheckResult, Effect,
+    PendingType,
 };
 use crate::context::{
-    binder_lifetimes, Assumed, Context, ContextId, Contexts, Enclosing, ModuleInfo, Scope,
-    SelfRequirement,
+    binder_lifetimes, Context, ContextId, Contexts, Enclosing, ModuleInfo, Scope, SelfRequirement,
 };
 use crate::encode::is_const_param_ty;
 use crate::error::NotInternableError;
@@ -117,6 +117,17 @@ impl ScopeSpec {
         match self {
             Self::Module { .. } => Generics::default(),
             Self::Generics { generics, .. } => generics.clone(),
+        }
+    }
+
+    /// What `Self` is in the scope, if it declares it.
+    pub(crate) fn declared_self(&self) -> Option<SelfRequirement> {
+        match self {
+            Self::Generics {
+                declares: Some(declared),
+                ..
+            } => Some(declared.requirement.clone()),
+            _ => None,
         }
     }
 }
@@ -438,13 +449,7 @@ impl AnalyzeVisitor {
             || inner.mentions_self
             || inner.local_scope < self.scopes.len()
         {
-            Context::of(
-                ty,
-                &self.scopes,
-                self.self_ty.as_ref(),
-                &Assumed::default(),
-                &self.enclosing,
-            )
+            Context::of(ty, &self.scopes, self.self_ty.as_ref(), &self.enclosing)
         } else {
             Context::none()
         };
@@ -611,13 +616,21 @@ impl AnalyzeVisitor {
             &self.self_errors[mark.self_errors..],
         );
         let module = mark.module;
+        // A scope that declares nothing keeps the `Self` around, so take it before leaving. It is
+        // part of the top-level context only if an entry names it: nothing else depends on it.
+        let scope_self = self
+            .self_ty
+            .clone()
+            .filter(|_| names_self(&self.frame.effects[mark.effects..]));
         self.leave_scope(mark, error.is_some());
         if let Some(error) = error {
             return Err(error);
         }
         let top_level = module.unwrap_or_else(|| {
-            self.contexts
-                .intern(Context::new(spec.declared_generics(), None))
+            // The scope is in the module around it, if any.
+            let around = self.modules.last().map(|module| module.id);
+            let context = Context::new(spec.declared_generics(), scope_self);
+            self.contexts.intern(context.with_module(around))
         });
         self.top_levels.push(top_level);
         Ok(top_level)

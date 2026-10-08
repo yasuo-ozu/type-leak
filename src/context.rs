@@ -212,13 +212,12 @@ impl Context {
     }
 
     /// Returns the context of `ty` in `scopes` (outermost first). Names match by name only, which
-    /// is harmless: the Referrer computes the same. `assumed` generics belong to the Leaker (the
-    /// Leaker passes none). `enclosing` lifetimes become generics even if `ty` does not name them.
+    /// is harmless: the Referrer computes the same. `enclosing` lifetimes become generics even if
+    /// `ty` does not name them.
     pub(crate) fn of(
         ty: &Type,
         scopes: &[Scope],
         self_req: Option<&SelfRequirement>,
-        assumed: &Assumed,
         enclosing: &Enclosing,
     ) -> Self {
         let mut names = HashSet::new();
@@ -236,8 +235,8 @@ impl Context {
             .filter_map(|name| Some((scopes.len().checked_sub(1)?, name)))
             .collect();
         // An enclosing lifetime is a generic only if the type has a generic to bound by it.
-        let ancestors = enclosing.generic(scopes, assumed);
-        let mentions = Mentions::of(ty, scopes, assumed, !ancestors.is_empty());
+        let ancestors = enclosing.generic(scopes);
+        let mentions = Mentions::of(ty, scopes, !ancestors.is_empty());
         for (lifetime, depth) in &ancestors {
             let is_type_param = |name: &String| {
                 scopes.iter().any(|scope| {
@@ -248,10 +247,7 @@ impl Context {
             };
             let bounds_something = (self_req.is_some()
                 && mentions.types.iter().any(|name| name == "Self"))
-                || mentions
-                    .types
-                    .iter()
-                    .any(|name| is_type_param(name) || assumed.types.contains(name))
+                || mentions.types.iter().any(is_type_param)
                 || mentions.lifetimes.iter().any(|other| other != lifetime);
             if let (true, Some(from)) = (bounds_something, depth.checked_sub(1)) {
                 work.push((from, lifetime.to_string()));
@@ -339,7 +335,7 @@ impl Context {
             self_outlives.extend(written_self_outlives(&mut predicates, &params));
         }
         for (bounded, lifetime) in
-            implied_outlives(ty, scopes, assumed, &params, self_req.is_some(), &ancestors)
+            implied_outlives(ty, scopes, &params, self_req.is_some(), &ancestors)
         {
             if bounded == Bounded::SelfTy {
                 self_outlives.push(lifetime);
@@ -410,6 +406,48 @@ impl Context {
 
     pub(crate) fn without_module(&self) -> Self {
         self.clone().with_module(None)
+    }
+
+    /// Returns `true` if `entry` is this context plus where predicates that name none of the
+    /// generics (bounds on `Self` alone, such as `Self: Sized`). A copy that writes `Self`
+    /// otherwise, as a type parameter, cannot repeat them.
+    pub(crate) fn is_entry_with_extra_self_predicates(&self, entry: &Context) -> bool {
+        let show = |tokens: &dyn ToTokens| tokens.to_token_stream().to_string();
+        if self.self_ty != entry.self_ty
+            || self.self_outlives != entry.self_outlives
+            || self.module != entry.module
+            || self.scope != entry.scope
+        {
+            return false;
+        }
+        let (params, entry_params) = (&self.generics.params, &entry.generics.params);
+        if params.len() != entry_params.len()
+            || params
+                .iter()
+                .zip(entry_params)
+                .any(|(a, b)| show(a) != show(b))
+        {
+            return false;
+        }
+        let predicates = |context: &Context| -> Vec<(String, WherePredicate)> {
+            context
+                .generics
+                .where_clause
+                .iter()
+                .flat_map(|where_clause| where_clause.predicates.iter())
+                .map(|predicate| (show(predicate), predicate.clone()))
+                .collect()
+        };
+        let (mine, theirs) = (predicates(self), predicates(entry));
+        let names: HashSet<String> = entry_params.iter().map(generic_param_name).collect();
+        mine.iter()
+            .all(|(text, _)| theirs.iter().any(|(other, _)| other == text))
+            && theirs.iter().all(|(text, predicate)| {
+                let mut used = HashSet::new();
+                token_names(predicate.to_token_stream(), &mut used);
+                mine.iter().any(|(other, _)| other == text)
+                    || !used.iter().any(|name| names.contains(name))
+            })
     }
 }
 
@@ -605,16 +643,9 @@ fn written_self_outlives(
     moved
 }
 
-/// Generics no scope declares that are known to be the Leaker's (see [`Context::of()`]).
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Assumed {
-    pub(crate) lifetimes: Vec<Lifetime>,
-    pub(crate) types: Vec<String>,
-}
-
 /// The lifetimes a type must outlive because of the types around it, as in `&'a Vec<Rel2<T>>`
-/// (see [Outlives bounds](crate#outlives-bounds)). `T::A<X>` is decided late, because the Referrer
-/// may not see `T` declared as a type parameter: see [`Enclosing::generic()`].
+/// (see [Outlives bounds](crate#outlives-bounds)). `T::A<X>` is decided late, by the scopes in
+/// scope where it is written: see [`Enclosing::generic()`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Enclosing(Vec<Link>);
 
@@ -668,12 +699,12 @@ impl Enclosing {
     }
 
     /// The lifetimes still required after associated type paths drop what came before them.
-    fn active(&self, scopes: &[Scope], assumed: &Assumed) -> Vec<(Lifetime, usize)> {
+    fn active(&self, scopes: &[Scope]) -> Vec<(Lifetime, usize)> {
         let mut active: Vec<(Lifetime, usize)> = Vec::new();
         for link in &self.0 {
             match link {
                 Link::Projection { head, depth } => {
-                    if is_type_parameter(head, visible(scopes, *depth), assumed) {
+                    if is_type_parameter(head, visible(scopes, *depth)) {
                         active.clear();
                     }
                 }
@@ -689,45 +720,17 @@ impl Enclosing {
     }
 
     /// The generic lifetimes among them, outermost first, each with its depth.
-    pub(crate) fn generic(&self, scopes: &[Scope], assumed: &Assumed) -> Vec<(Lifetime, usize)> {
+    pub(crate) fn generic(&self, scopes: &[Scope]) -> Vec<(Lifetime, usize)> {
         let mut generic: Vec<(Lifetime, usize)> = Vec::new();
-        for (lifetime, depth) in self.active(scopes, assumed) {
+        for (lifetime, depth) in self.active(scopes) {
             // The scopes in scope where it is written decide what it names.
-            if is_generic_lifetime(visible(scopes, depth), assumed, &[], &lifetime)
+            if is_generic_lifetime(visible(scopes, depth), &[], &lifetime)
                 && !generic.iter().any(|(other, _)| *other == lifetime)
             {
                 generic.push((lifetime, depth));
             }
         }
         generic
-    }
-
-    /// Like [`Enclosing::generic()`], but also the lifetimes that are not generic.
-    pub(crate) fn lifetimes(&self, scopes: &[Scope], assumed: &Assumed) -> Vec<Lifetime> {
-        self.active(scopes, assumed)
-            .into_iter()
-            .map(|(lifetime, _)| lifetime)
-            .collect()
-    }
-
-    /// Heads of the paths `head::A<..>` that no scope or `assumed` declares: the Referrer cannot
-    /// tell if they are type parameters of the Leaker or something else. Sorted, deduplicated.
-    pub(crate) fn undeclared_heads(&self, scopes: &[Scope], assumed: &Assumed) -> Vec<String> {
-        let mut heads: Vec<String> = Vec::new();
-        for link in &self.0 {
-            let (head, depth) = match link {
-                Link::Projection { head, depth } => (head, *depth),
-                Link::Lifetime { .. } => continue,
-            };
-            let declared = visible(scopes, depth)
-                .iter()
-                .any(|scope| scope.declares(head));
-            if !declared && !assumed.types.contains(head) && !heads.contains(head) {
-                heads.push(head.clone());
-            }
-        }
-        heads.sort();
-        heads
     }
 }
 
@@ -747,14 +750,17 @@ fn projection_head(path: &Path) -> Option<&Ident> {
         .map(|seg| &seg.ident)
 }
 
-/// `name` is a type parameter of the innermost scope that declares it, or one of `assumed`.
-fn is_type_parameter(name: &str, scopes: &[Scope], assumed: &Assumed) -> bool {
-    match scopes.iter().rev().find(|scope| scope.declares(name)) {
-        Some(scope) => scope.params().any(
-            |param| matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == name),
-        ),
-        None => assumed.types.iter().any(|assumed| assumed == name),
-    }
+/// `name` is a type parameter of the innermost scope that declares it.
+fn is_type_parameter(name: &str, scopes: &[Scope]) -> bool {
+    scopes
+        .iter()
+        .rev()
+        .find(|scope| scope.declares(name))
+        .map_or(false, |scope| {
+            scope.params().any(
+                |param| matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == name),
+            )
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -766,13 +772,8 @@ enum Bounded {
 }
 
 /// `lifetime` is a lifetime parameter of the context. `'static`, `'_` and `for<..>` lifetimes are
-/// not, as the impl cannot declare them. An undeclared one counts only if `assumed` has it.
-fn is_generic_lifetime(
-    scopes: &[Scope],
-    assumed: &Assumed,
-    binders: &[Lifetime],
-    lifetime: &Lifetime,
-) -> bool {
+/// not, as the impl cannot declare them. An undeclared one is not either.
+fn is_generic_lifetime(scopes: &[Scope], binders: &[Lifetime], lifetime: &Lifetime) -> bool {
     lifetime.ident != "static"
         && lifetime.ident != "_"
         && !binders.contains(lifetime)
@@ -780,16 +781,12 @@ fn is_generic_lifetime(
             .iter()
             .rev()
             .find(|scope| scope.declares(&lifetime.to_string()))
-            .map_or_else(
-                || assumed.lifetimes.contains(lifetime),
-                |scope| !scope.binder,
-            )
+            .map_or(false, |scope| !scope.binder)
 }
 
 /// The generics a type mentions, which `X: 'a` bounds (see [`implied_outlives()`]).
 struct Mentions<'a> {
     scopes: &'a [Scope],
-    assumed: &'a Assumed,
     binders: Vec<Lifetime>,
     /// The first segments of paths: names that may be type parameters, and `Self`.
     types: Vec<String>,
@@ -797,18 +794,17 @@ struct Mentions<'a> {
 }
 
 impl<'a> Mentions<'a> {
-    fn of(ty: &Type, scopes: &'a [Scope], assumed: &'a Assumed, wanted: bool) -> Self {
-        let mut mentions = Self::new(scopes, assumed, Vec::new());
+    fn of(ty: &Type, scopes: &'a [Scope], wanted: bool) -> Self {
+        let mut mentions = Self::new(scopes, Vec::new());
         if wanted {
             mentions.visit_type(ty);
         }
         mentions
     }
 
-    fn new(scopes: &'a [Scope], assumed: &'a Assumed, binders: Vec<Lifetime>) -> Self {
+    fn new(scopes: &'a [Scope], binders: Vec<Lifetime>) -> Self {
         Self {
             scopes,
-            assumed,
             binders,
             types: Vec::new(),
             lifetimes: Vec::new(),
@@ -825,7 +821,7 @@ impl<'a, 'ast> Visit<'ast> for Mentions<'a> {
         syn::visit::visit_path(self, i)
     }
     fn visit_lifetime(&mut self, i: &'ast Lifetime) {
-        if is_generic_lifetime(self.scopes, self.assumed, &self.binders, i) {
+        if is_generic_lifetime(self.scopes, &self.binders, i) {
             self.lifetimes.push(i.clone());
         }
     }
@@ -860,14 +856,12 @@ impl<'a, 'ast> Visit<'ast> for Mentions<'a> {
 fn implied_outlives(
     ty: &Type,
     scopes: &[Scope],
-    assumed: &Assumed,
     params: &[GenericParam],
     has_self: bool,
     ancestors: &[Lifetime],
 ) -> Vec<(Bounded, Lifetime)> {
     struct Finder<'a> {
         scopes: &'a [Scope],
-        assumed: &'a Assumed,
         params: &'a [GenericParam],
         has_self: bool,
         binders: Vec<Lifetime>,
@@ -875,14 +869,14 @@ fn implied_outlives(
     }
     impl<'a> Finder<'a> {
         fn require(&mut self, lifetime: &Lifetime, referent: &Type) {
-            if !is_generic_lifetime(self.scopes, self.assumed, &self.binders, lifetime) {
+            if !is_generic_lifetime(self.scopes, &self.binders, lifetime) {
                 return;
             }
             self.require_generic(lifetime, referent)
         }
 
         fn require_generic(&mut self, lifetime: &Lifetime, referent: &Type) {
-            let mut mentions = Mentions::new(self.scopes, self.assumed, self.binders.clone());
+            let mut mentions = Mentions::new(self.scopes, self.binders.clone());
             mentions.visit_type(referent);
             if self.has_self && mentions.types.iter().any(|name| name == "Self") {
                 self.found.push((Bounded::SelfTy, lifetime.clone()));
@@ -930,7 +924,6 @@ fn implied_outlives(
     }
     let mut finder = Finder {
         scopes,
-        assumed,
         params,
         has_self,
         binders: Vec::new(),
@@ -941,55 +934,6 @@ fn implied_outlives(
         finder.require_generic(lifetime, ty);
     }
     finder.found
-}
-
-/// Returns `true` if the bounds `ty` implies on the generics of `entry` that `scopes` do not
-/// declare are bounds of them in `entry`. Only bounds can be compared, as those generics are the
-/// Leaker's: `Rel2<T>` alone and under `&'a` are different entries.
-pub(crate) fn assumed_bounds_hold(
-    ty: &Type,
-    scopes: &[Scope],
-    assumed: &Assumed,
-    enclosing: &Enclosing,
-    entry: &Context,
-) -> bool {
-    let undeclared: Vec<GenericParam> = entry
-        .generics()
-        .params
-        .iter()
-        .filter(|param| {
-            let name = generic_param_name(param);
-            !scopes.iter().any(|scope| scope.declares(&name))
-        })
-        .cloned()
-        .collect();
-    if undeclared.is_empty() {
-        return true;
-    }
-    let ancestors: Vec<Lifetime> = enclosing
-        .generic(scopes, assumed)
-        .into_iter()
-        .map(|(lifetime, _)| lifetime)
-        .collect();
-    implied_outlives(ty, scopes, assumed, &undeclared, false, &ancestors)
-        .iter()
-        .all(|(bounded, lifetime)| {
-            undeclared.iter().any(|param| match (param, bounded) {
-                (GenericParam::Type(param), Bounded::Type(name))
-                    if &ident_name(&param.ident) == name =>
-                {
-                    param.bounds.iter().any(
-                        |bound| matches!(bound, TypeParamBound::Lifetime(other) if other == lifetime),
-                    )
-                }
-                (GenericParam::Lifetime(param), Bounded::Lifetime(name))
-                    if &param.lifetime == name =>
-                {
-                    param.bounds.iter().any(|other| other == lifetime)
-                }
-                _ => false,
-            })
-        })
 }
 
 pub(crate) fn binder_lifetimes(

@@ -492,19 +492,20 @@ fn optional_entries_do_not_change_the_required_ones() {
     }
 }
 
-fn referrer_with_foo() -> Referrer {
+/// The Referrer and the top-level context of the trait.
+fn referrer_with_foo() -> (Referrer, ContextId) {
     let item: ItemTrait = parse_quote! {
         trait T {
             fn f(&self, a: ::foo::X) -> Rel;
         }
     };
     let mut leaker = leaker();
-    leak_trait(&mut leaker, &item).unwrap();
-    leaker.finish()
+    let context = leaker.intern_trait(&item, true).unwrap();
+    (leaker.finish(), context)
 }
 
-fn expand(referrer: &Referrer, ty: Type) -> String {
-    let ty = referrer.expand(ty, |_, ix| parse_quote!(P<#ix>));
+fn expand(referrer: &Referrer, context: ContextId, ty: Type) -> String {
+    let ty = referrer.expand(context, ty, |_, ix| parse_quote!(P<#ix>));
     quote!(#ty).to_string()
 }
 
@@ -513,13 +514,16 @@ fn referrer_leaves_optional_entries_by_default() {
     // Old: an optional entry was replaced unless the crates were `with_available_external_crates`;
     // and with `allow_external_crates` set (the default) there was no such entry. New: the default
     // leaves it as written, as the default did.
-    let referrer = referrer_with_foo();
+    let (referrer, context) = referrer_with_foo();
     let ix_foo = referrer
         .iter()
         .position(|t| squash(quote!(#t)) == "::foo::X")
         .unwrap();
     assert!(!referrer.must(ix_foo));
-    assert_eq!(expand(&referrer, parse_quote!(::foo::X)), ":: foo :: X");
+    assert_eq!(
+        expand(&referrer, context, parse_quote!(::foo::X)),
+        ":: foo :: X"
+    );
     // A required entry is always replaced.
     let ix_rel = referrer
         .iter()
@@ -527,24 +531,28 @@ fn referrer_leaves_optional_entries_by_default() {
         .unwrap();
     assert!(referrer.must(ix_rel));
     assert_eq!(
-        expand(&referrer, parse_quote!(Rel)),
+        expand(&referrer, context, parse_quote!(Rel)),
         format!("P < {}usize >", ix_rel)
     );
     // Also with the flag set to `true` explicitly.
     let referrer = referrer.allow_ambiguous_crate_name(true);
-    assert_eq!(expand(&referrer, parse_quote!(::foo::X)), ":: foo :: X");
+    assert_eq!(
+        expand(&referrer, context, parse_quote!(::foo::X)),
+        ":: foo :: X"
+    );
 }
 
 #[test]
 fn referrer_replaces_optional_entries_without_ambiguous_crate_names() {
-    let referrer = referrer_with_foo().allow_ambiguous_crate_name(false);
+    let (referrer, context) = referrer_with_foo();
+    let referrer = referrer.allow_ambiguous_crate_name(false);
     let ix_foo = referrer
         .iter()
         .position(|t| squash(quote!(#t)) == "::foo::X")
         .unwrap();
     assert!(!referrer.must(ix_foo));
     assert_eq!(
-        expand(&referrer, parse_quote!(::foo::X)),
+        expand(&referrer, context, parse_quote!(::foo::X)),
         format!("P < {}usize >", ix_foo)
     );
     // The types inside an optional entry which is left as written are looked up as usual.
@@ -554,7 +562,7 @@ fn referrer_replaces_optional_entries_without_ambiguous_crate_names() {
         }
     );
     let mut leaker = leaker();
-    leak_trait(&mut leaker, &item).unwrap();
+    let context = leaker.intern_trait(&item, true).unwrap();
     let referrer = leaker.finish();
     let ix_rel = referrer
         .iter()
@@ -565,18 +573,18 @@ fn referrer_replaces_optional_entries_without_ambiguous_crate_names() {
         .position(|t| squash(quote!(#t)) == "::foo::W<(Rel,)>")
         .unwrap();
     assert_eq!(
-        expand(&referrer, parse_quote!(::foo::W<(Rel,)>)),
+        expand(&referrer, context, parse_quote!(::foo::W<(Rel,)>)),
         format!(":: foo :: W < (P < {}usize > ,) >", ix_rel)
     );
     // And replaced as a whole otherwise.
     let referrer = referrer.allow_ambiguous_crate_name(false);
     assert_eq!(
-        expand(&referrer, parse_quote!(::foo::W<(Rel,)>)),
+        expand(&referrer, context, parse_quote!(::foo::W<(Rel,)>)),
         format!("P < {}usize >", ix_w)
     );
     // Rel alone is replaced either way.
     assert_eq!(
-        expand(&referrer, parse_quote!(Rel)),
+        expand(&referrer, context, parse_quote!(Rel)),
         format!("P < {}usize >", ix_rel)
     );
 }
@@ -589,15 +597,17 @@ fn referrer_visitor_respects_the_flag() {
         }
     );
     let mut replaced = item.clone();
-    referrer_with_foo()
-        .into_visitor(None, None, |_, ix| parse_quote!(P<#ix>))
+    let (referrer, context) = referrer_with_foo();
+    referrer
+        .clone()
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
         .visit_item_trait_mut(&mut item);
     let s = quote!(#item).to_string();
     assert!(s.contains(":: foo :: X"), "{}", s);
     assert!(s.contains("P <"), "{}", s);
-    referrer_with_foo()
+    referrer
         .allow_ambiguous_crate_name(false)
-        .into_visitor(None, None, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
         .visit_item_trait_mut(&mut replaced);
     let s = quote!(#replaced).to_string();
     assert!(!s.contains(":: foo"), "{}", s);
@@ -612,7 +622,7 @@ fn referrer_serialization_round_trip() {
         }
     };
     let mut leaker = leaker();
-    leak_trait(&mut leaker, &item).unwrap();
+    let context = leaker.intern_trait(&item, true).unwrap();
     let referrer = leaker.finish();
     let before = entries(&referrer);
     assert!(before.iter().any(|e| !e.1 && !e.2.is_empty()));
@@ -630,13 +640,16 @@ fn referrer_serialization_round_trip() {
     let parsed: Referrer = parse2(quote!(#strict)).unwrap();
     assert_eq!(parsed, referrer);
     assert_eq!(
-        expand(&parsed, parse_quote!(::foo::X)),
+        expand(&parsed, context, parse_quote!(::foo::X)),
         ":: foo :: X",
         "a parsed Referrer has the default"
     );
     let reset = parsed.allow_ambiguous_crate_name(false);
     assert_eq!(reset, strict);
-    assert_ne!(expand(&reset, parse_quote!(::foo::X)), ":: foo :: X");
+    assert_ne!(
+        expand(&reset, context, parse_quote!(::foo::X)),
+        ":: foo :: X"
+    );
 }
 
 #[test]

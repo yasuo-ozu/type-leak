@@ -1,14 +1,9 @@
 //! The [`Referrer`], which rewrites copies of the analyzed items.
 
-use crate::context::{
-    assumed_bounds_hold, Assumed, Context, ContextId, Enclosing, ModuleInfo, Scope, SelfRequirement,
-};
+use crate::context::{Context, ContextId, Enclosing, ModuleInfo, Scope, SelfRequirement};
 use crate::encode::{complete_generics_args, param_as_arg, without_encoded_bounds, EncodeError};
 use crate::graph::TypeKey;
-use crate::util::{
-    first_self_in_generics, generic_param_name, ident_name, mentions_names, token_names,
-    type_mentions_self,
-};
+use crate::util::{first_self_in_generics, generic_param_name, mentions_names, type_mentions_self};
 use proc_macro2::{Literal, Punct, Spacing, Span, TokenStream};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -42,26 +37,21 @@ pub struct Referrer {
 /// Where a visitor is, among the modules of the Leaker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModulePos {
-    Unknown,
+    /// In no module: the context has none, so only entries with no module match. A `mod` item is
+    /// a module found with no module around it.
+    Outside,
     In(ContextId),
-    /// A module no entry depends on: only entries with no module match.
+    /// In a module no entry depends on: only entries with no module match.
     Elsewhere,
 }
 
-/// How [`Referrer::find()`] compares contexts with the generics in scope.
+/// How [`Referrer::find()`] compares the context of a type with those of the entries.
 #[derive(Clone, Copy)]
 enum Matching<'a> {
-    /// Undeclared generics are the Leaker's. An entry that names `Self` must be for `self_ty`.
-    Lenient {
+    /// The context of the type, computed from the generics in scope and `self_ty`, is the entry's.
+    Scope {
         self_ty: Option<&'a SelfRequirement>,
         /// `Self` means something else here, so no entry that names it matches.
-        no_self: bool,
-        /// Type parameters that the visited syntax does not declare.
-        leakers: &'a [String],
-    },
-    /// Contexts are compared exactly. If `self_ty` is given, `Self` means it.
-    Exact {
-        self_ty: Option<&'a SelfRequirement>,
         no_self: bool,
     },
     /// The scope is that of the parameters before a defaulted one: the entry must use only them.
@@ -102,8 +92,18 @@ impl Referrer {
         &self.context_map[&self.contexts[ix]]
     }
 
-    /// Returns the entry for `ty` that assumes the fewest Leaker generics, then the first. A tie
-    /// between modules gives `None` if the module is unknown ([Modules](crate#modules)).
+    fn get_context(&self, context: ContextId) -> &Context {
+        self.context_map.get(&context).unwrap_or_else(|| {
+            panic!(
+                "the context {} is not one of the contexts of this Referrer",
+                context
+            )
+        })
+    }
+
+    /// Returns the entry for `ty` that matches: the first of the best rank, then of the least cost.
+    /// An entry of `module` comes before one with no module, and an entry of another module never
+    /// matches ([Modules](crate#modules)).
     fn find(
         &self,
         matching: Matching,
@@ -112,13 +112,8 @@ impl Referrer {
         scopes: &[Scope],
         enclosing: &Enclosing,
     ) -> Option<usize> {
-        let exact = matches!(matching, Matching::Exact { .. });
-        let no_self = matches!(
-            matching,
-            Matching::Lenient { no_self: true, .. } | Matching::Exact { no_self: true, .. }
-        );
-        let mut best: Option<((usize, usize, usize), usize)> = None;
-        let mut ambiguous = false;
+        let no_self = matches!(matching, Matching::Scope { no_self: true, .. });
+        let mut best: Option<((usize, usize), usize)> = None;
         for &ix in self.map.get(&TypeKey::new(ty))? {
             let entry = self.entry_context(ix);
             if no_self && (entry.self_ty().is_some() || type_mentions_self(&self.leak_types[ix])) {
@@ -126,217 +121,89 @@ impl Referrer {
             }
             let rank = match (module, entry.module()) {
                 (ModulePos::In(module), Some(entry)) if entry == module => 0,
-                (ModulePos::In(_) | ModulePos::Elsewhere, Some(_)) => continue,
-                (ModulePos::In(_) | ModulePos::Elsewhere, None) => 1,
-                // Exact contexts: an unknown module is the one `intern_mod()` analyzed.
-                (ModulePos::Unknown, None) => usize::from(exact),
-                (ModulePos::Unknown, Some(entry)) => {
-                    let nested =
-                        matches!(self.modules.get(&entry), Some(info) if info.parent.is_some());
-                    match (exact, nested) {
-                        (true, true) => continue,
-                        (true, false) => 0,
-                        (false, nested) => 1 + usize::from(nested),
-                    }
-                }
+                (_, Some(_)) => continue,
+                (_, None) => 1,
             };
-            if let Some((assumed, hypothesised)) =
-                Self::matches(matching, ty, scopes, enclosing, entry)
-            {
-                // Fewest assumed generics first, then fewest guessed names.
-                let key = (rank, assumed + hypothesised, hypothesised);
-                match best {
-                    Some((better, at)) if key == better => {
-                        ambiguous |= module == ModulePos::Unknown
-                            && self.entry_context(at).module() != entry.module();
-                    }
-                    Some((better, _)) if better < key => (),
-                    _ => {
-                        best = Some((key, ix));
-                        ambiguous = false;
-                    }
+            if let Some(cost) = Self::matches(matching, ty, scopes, enclosing, entry) {
+                let key = (rank, cost);
+                if best.map_or(true, |(better, _)| key < better) {
+                    best = Some((key, ix));
                 }
             }
         }
-        let ix = best.filter(|_| !ambiguous)?.1;
+        let ix = best?.1;
         Some(ix).filter(|&ix| !self.allow_ambiguous_crate_name || self.musts[ix])
     }
 
-    /// Returns where a visited `mod ident` is, inside `module`. A root `mod` item (`root`) is the
-    /// module itself ([Modules](crate#modules)): if the module is unknown, the only root module,
-    /// if it is named `ident`.
-    fn module_in(&self, module: ModulePos, root: bool, ident: &Ident) -> ModulePos {
-        match (root, module) {
-            (true, ModulePos::Unknown) => {
-                let mut roots = self.modules.iter().filter(|(_, info)| info.parent.is_none());
-                match (roots.next(), roots.next()) {
-                    (Some((id, info)), None)
-                        if matches!(info.path.as_deref(), Some([]))
-                            || matches!(info.path.as_deref(), Some([name]) if name == ident) =>
-                    {
-                        ModulePos::In(*id)
-                    }
-                    _ => ModulePos::Unknown,
-                }
-            }
-            (false, ModulePos::In(parent)) => self
-                .modules
-                .iter()
-                .find(|(_, info)| {
-                    info.parent == Some(parent)
-                        && matches!(info.path.as_ref().and_then(|path| path.last()), Some(last) if last == ident)
-                })
-                // No entry depends on it.
-                .map_or(ModulePos::Elsewhere, |(id, _)| ModulePos::In(*id)),
-            (_, module) => module,
-        }
+    /// Returns where a visited `mod ident` is, inside `module`: the module nested in it with that
+    /// name ([Modules](crate#modules)). A module that the Leaker did not see, or one nested in such
+    /// a module, is a module no entry depends on.
+    fn module_in(&self, module: ModulePos, ident: &Ident) -> ModulePos {
+        let parent = match module {
+            ModulePos::Outside => None,
+            ModulePos::In(parent) => Some(parent),
+            ModulePos::Elsewhere => return ModulePos::Elsewhere,
+        };
+        self.modules
+            .iter()
+            .find(|(_, info)| {
+                info.parent == parent
+                    && matches!(info.path.as_ref().and_then(|path| path.last()), Some(last) if last == ident)
+            })
+            .map_or(ModulePos::Elsewhere, |(id, _)| ModulePos::In(*id))
     }
 
-    /// Returns (assumed Leaker generics, guessed type parameters) if `entry` matches `ty`.
+    /// Returns the cost of `entry` for `ty`, or `None` if it does not match. It is `0` if the
+    /// context of `ty` in `scopes` is `entry`'s. The entries of a default have a choice: the
+    /// fewer parameters the entry uses, the less its cost.
     fn matches(
         matching: Matching,
         ty: &Type,
         scopes: &[Scope],
         enclosing: &Enclosing,
         entry: &Context,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<usize> {
         match matching {
-            Matching::Exact { self_ty, .. } => {
-                let context = Context::of(
-                    ty,
-                    scopes,
-                    self_ty.or_else(|| entry.self_ty()),
-                    &Assumed::default(),
-                    enclosing,
-                );
-                (context == entry.without_module()).then(|| (0, 0))
-            }
-            Matching::Lenient {
-                self_ty, leakers, ..
-            } => {
-                if matches!((self_ty, entry.self_ty()), (Some(wanted), Some(actual)) if wanted != actual)
-                {
-                    return None;
+            Matching::Scope { self_ty, .. } => {
+                let context = Context::of(ty, scopes, self_ty, enclosing);
+                let entry = entry.without_module();
+                if context == entry {
+                    Some(0)
+                } else if context.is_entry_with_extra_self_predicates(&entry) {
+                    Some(1)
+                } else {
+                    None
                 }
-                let declared = param_names(scopes.iter().flat_map(|scope| scope.params()));
-                // Entry generics not declared here are the Leaker's, and so are undeclared
-                // lifetimes around the type. Bounds the type implies on them must be the entry's.
-                let mut assumed = Assumed::default();
-                for param in &entry.generics().params {
-                    if declared.contains(&generic_param_name(param)) {
-                        continue;
-                    }
-                    match param {
-                        GenericParam::Lifetime(param) => {
-                            assumed.lifetimes.push(param.lifetime.clone())
-                        }
-                        GenericParam::Type(param) => assumed.types.push(ident_name(&param.ident)),
-                        GenericParam::Const(_) => (),
-                    }
-                }
-                for name in leakers {
-                    if !declared.contains(name) && !assumed.types.contains(name) {
-                        assumed.types.push(name.clone());
-                    }
-                }
-                let attempt = |mut assumed: Assumed| -> Option<usize> {
-                    for lifetime in enclosing.lifetimes(scopes, &assumed) {
-                        if !declared.contains(&lifetime.to_string())
-                            && !assumed.lifetimes.contains(&lifetime)
-                        {
-                            assumed.lifetimes.push(lifetime);
-                        }
-                    }
-                    let context = Context::of(ty, scopes, entry.self_ty(), &assumed, enclosing);
-                    // The entry may have more `Self: 'a` only for lifetimes the copy does not
-                    // declare (README #outlives-bounds).
-                    let (found, wanted) = (context.self_outlives(), entry.self_outlives());
-                    if !found.iter().all(|lifetime| wanted.contains(lifetime))
-                        || !wanted.iter().all(|lifetime| {
-                            found.contains(lifetime) || !declared.contains(&lifetime.to_string())
-                        })
-                        || !assumed_bounds_hold(ty, scopes, &assumed, enclosing, entry)
-                    {
-                        return None;
-                    }
-                    Self::matches_declared(&declared, &context, entry)
-                };
-                if let Some(assumed) = attempt(assumed.clone()) {
-                    return Some((assumed, 0));
-                }
-                // An undeclared `T` in `T::A<X>` may be a Leaker type parameter, whose associated
-                // type path passes on no lifetimes. Try that second and prefer it less: too few
-                // bounds fail with E0309, too many only make the copy stricter.
-                let heads = enclosing.undeclared_heads(scopes, &assumed);
-                let count = heads.len();
-                if count == 0 {
-                    return None;
-                }
-                assumed.types.extend(heads);
-                attempt(assumed).map(|assumed| (assumed, count))
             }
             Matching::Default => {
                 if entry.self_ty().is_some() {
                     return None;
                 }
                 let root = param_names(scopes[0].params());
-                let context = Context::of(ty, &scopes[..1], None, &Assumed::default(), enclosing);
+                let context = Context::of(ty, &scopes[..1], None, enclosing);
                 let used = param_names(&context.generics().params);
                 let entry_params = param_names(&entry.generics().params);
                 (used.is_subset(&entry_params) && entry_params.is_subset(&root))
-                    .then(|| (entry_params.len(), 0))
+                    .then(|| entry_params.len())
             }
         }
     }
 
-    /// Compares the type's context with `entry`: generics declared here must be used by both, with
-    /// the same declaration. Returns how many other generics are assumed to be the Leaker's.
-    fn matches_declared(
-        declared: &HashSet<String>,
-        context: &Context,
-        entry: &Context,
-    ) -> Option<usize> {
-        let show = |tokens: &dyn ToTokens| tokens.to_token_stream().to_string();
-        let wanted: HashMap<String, String> = context
-            .generics()
-            .params
-            .iter()
-            .map(|param| (generic_param_name(param), show(param)))
-            .collect();
-        let entry_names = param_names(&entry.generics().params);
-        if !wanted.keys().all(|name| entry_names.contains(name)) {
-            return None;
-        }
-        let mut assumed = 0;
-        for param in &entry.generics().params {
-            let name = generic_param_name(param);
-            if !declared.contains(&name) {
-                assumed += 1;
-            } else if wanted.get(&name) != Some(&show(param)) {
-                return None;
-            }
-        }
-        let wanted_predicates: HashSet<String> = where_predicates(context.generics())
-            .map(|predicate| show(predicate))
-            .collect();
-        let mut actual_predicates = HashSet::new();
-        for predicate in where_predicates(entry.generics()) {
-            let text = show(predicate);
-            // A predicate of the entry which mentions only generics declared here is required here.
-            let mut names = HashSet::new();
-            token_names(predicate.to_token_stream(), &mut names);
-            names.retain(|name| entry_names.contains(name));
-            if !names.is_empty()
-                && names.iter().all(|name| declared.contains(name))
-                && !wanted_predicates.contains(&text)
-            {
-                return None;
-            }
-            actual_predicates.insert(text);
-        }
-        wanted_predicates
-            .is_subset(&actual_predicates)
-            .then(|| assumed)
+    /// Returns the generics, what `Self` means and the module of the scope of `context`.
+    ///
+    /// The module is the context itself if it is a module, else the module it was entered in.
+    fn place(&self, context: ContextId) -> (Scope, Option<SelfRequirement>, ModulePos) {
+        let found = self.get_context(context);
+        let module = if found.is_module_scope() {
+            ModulePos::In(context)
+        } else {
+            found.module().map_or(ModulePos::Outside, ModulePos::In)
+        };
+        (
+            Scope::new(found.generics()),
+            found.self_ty().cloned(),
+            module,
+        )
     }
 
     /// Chooses whether optional entries are left as written (`true`, the default) or replaced.
@@ -349,13 +216,13 @@ impl Referrer {
     /// # use type_leak::*;
     /// # use syn::*;
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_struct(&parse_quote!(struct S { a: ::foo::X }), true).unwrap();
+    /// let context = leaker.intern_struct(&parse_quote!(struct S { a: ::foo::X }), true).unwrap();
     /// let referrer = leaker.finish();
     /// let ty: Type = parse_quote!(::foo::X);
     /// let replaced: Type = parse_quote!(Replaced);
-    /// assert_eq!(referrer.expand(ty.clone(), |_, _| replaced.clone()), ty);
+    /// assert_eq!(referrer.expand(context, ty.clone(), |_, _| replaced.clone()), ty);
     /// let referrer = referrer.allow_ambiguous_crate_name(false);
-    /// assert_eq!(referrer.expand(ty.clone(), |_, _| replaced.clone()), replaced);
+    /// assert_eq!(referrer.expand(context, ty.clone(), |_, _| replaced.clone()), replaced);
     /// ```
     pub fn allow_ambiguous_crate_name(mut self, allow: bool) -> Self {
         self.allow_ambiguous_crate_name = allow;
@@ -427,7 +294,7 @@ impl Referrer {
     /// # Panics
     /// Panics if `context` is not one of the [`Referrer::contexts()`].
     pub fn context_generics(&self, context: ContextId) -> &Generics {
-        self.context_map[&context].generics()
+        self.get_context(context).generics()
     }
 
     /// Returns the generics that a Repeater impl declares for the entries of `context`.
@@ -443,16 +310,20 @@ impl Referrer {
         without_encoded_bounds(self.context_generics(context))
     }
 
-    /// Returns what `Self` means in the types of `context`, if they name it.
+    /// Returns what `Self` means in `context`.
     ///
-    /// It is `None` for a top-level context. The Repeater impl is for any type (`None`), for the
-    /// implementors of the trait ([`SelfRequirement::Bound`]) or for the type
-    /// ([`SelfRequirement::Type`]). See [Self rules](crate#self-rules).
+    /// For an entry's context it is `Some` only if the types name `Self`. The Repeater impl is for
+    /// any type (`None`), for the implementors of the trait ([`SelfRequirement::Bound`]) or for
+    /// the type ([`SelfRequirement::Type`]). For the top-level context of a scope it is what the
+    /// scope declares, but only if an entry of the scope names `Self`: nothing else depends on it.
+    /// It is `None` for a scope that declares nothing (`enter_generics()`, a module). So a
+    /// top-level id tells the Referrer what `Self` is where it matters. See
+    /// [Self rules](crate#self-rules).
     ///
     /// # Panics
     /// Panics if `context` is not one of the [`Referrer::contexts()`].
     pub fn context_self(&self, context: ContextId) -> Option<&SelfRequirement> {
-        self.context_map[&context].self_ty()
+        self.get_context(context).self_ty()
     }
 
     /// Returns the lifetime parameters `'a` of the context for which its types need `Self: 'a`.
@@ -464,18 +335,20 @@ impl Referrer {
     /// # Panics
     /// Panics if `context` is not one of the [`Referrer::contexts()`].
     pub fn context_self_outlives(&self, context: ContextId) -> &[Lifetime] {
-        self.context_map[&context].self_outlives()
+        self.get_context(context).self_outlives()
     }
 
     /// Returns the module where the types of `context` are written, as its `ContextId`.
     ///
-    /// It is `Some` only for types with a relative path, and `None` for a top-level context. Emit
-    /// the Repeater impls of such types inside that module. See [Modules](crate#modules).
+    /// For an entry's context it is `Some` only for types with a relative path. Emit the Repeater
+    /// impls of such types inside that module. For the top-level context of a scope entered in a
+    /// module it is that module. It is `None` for a module context, which is the module itself.
+    /// See [Modules](crate#modules).
     ///
     /// # Panics
     /// Panics if `context` is not one of the [`Referrer::contexts()`].
     pub fn context_module(&self, context: ContextId) -> Option<ContextId> {
-        self.context_map[&context].module()
+        self.get_context(context).module()
     }
 
     /// Returns the path of `module` from its root: `[]` for the module of `intern_mod()`.
@@ -511,7 +384,7 @@ impl Referrer {
     ///
     /// Use it for an entry whose [`context_self()`](Referrer::context_self) is `Bound`, or for a
     /// marker type. `Self::A::B` becomes `<self_ty>::A::B`. Qualified paths and macro tokens are
-    /// rewritten too. Only the returned copies change: `into_visitor()` still finds the types by
+    /// rewritten too. Only the returned copies change: `visitor()` still finds the types by
     /// their original tokens. See [Self rules](crate#self-rules).
     pub fn iter_with_self<'a>(
         &'a self,
@@ -535,6 +408,8 @@ impl Referrer {
     /// A default may name leaked types. `type_fn(leaked, index, args)` replaces each one, where
     /// `args` are the complete arguments before the defaulted parameter. Return a path through the
     /// Repeater, for example built with [`Referrer::generic_args()`]. It is not substituted again.
+    /// A default is written in the trait's own scope, so only the entries of no module are looked
+    /// up.
     ///
     /// ```
     /// # use type_leak::*;
@@ -572,7 +447,7 @@ impl Referrer {
                 let mut leaked = Vec::new();
                 let ty = self.expand_with(
                     Matching::Default,
-                    ModulePos::Unknown,
+                    ModulePos::Outside,
                     &mut vec![Scope::new(&root)],
                     None,
                     default.clone(),
@@ -655,66 +530,67 @@ impl Referrer {
 
     /// Converts this Referrer into a [`Visitor`] that rewrites the leaked types in a copy.
     ///
-    /// `type_fn` gets each leaked type and its index, and returns the replacement. Generics that
-    /// the copy declares must match the entry's, the others are taken to be the Leaker's, and the
-    /// entry that assumes the fewest wins. Visit the whole item, not a type cut out of another.
-    /// `self_requirement` is what `Self` means (`None` skips the check). `module` is where the copy
-    /// is, `None` if unknown: see [Modules](crate#modules).
-    pub fn into_visitor<F: FnMut(Type, usize) -> Type>(
+    /// `context` is the scope of the copy: the top-level [`ContextId`] that the `intern_*` or
+    /// `enter_*` method of the Leaker returned for the item the copy is made from. Pass it along
+    /// with the Referrer (it is written and parsed as an integer). The visitor takes from it the
+    /// generics in scope, what `Self` means ([`Referrer::context_self()`]) and the module
+    /// ([`Referrer::context_module()`], or `context` itself if it is a module). The visited syntax
+    /// is inside that scope. See [Modules](crate#modules).
+    ///
+    /// `type_fn` gets each leaked type and its index, and returns the replacement. A type is
+    /// replaced if its context, computed from the generics in scope, is that of an entry: the
+    /// generics of the scope and those the visited syntax declares are compared exactly, and
+    /// others are not generics. So a generic that the visited syntax declares again, such as the
+    /// `T` of `impl<T: Clone> MyTrait<T> for ..`, must be declared as the entry has it, unless you
+    /// call [`Visitor::with_outermost_generics_as_leakers()`]. An entry which has, besides, bounds
+    /// on `Self` alone (`where Self: Sized`) is found too, if no entry has exactly the context:
+    /// a copy where `Self` is a type parameter cannot write them. Visit the whole item, not a
+    /// type cut out of another.
+    ///
+    /// # Panics
+    /// Panics if `context` is not one of the [`Referrer::contexts()`].
+    pub fn visitor<F: FnMut(Type, usize) -> Type>(
         self,
-        self_requirement: Option<SelfRequirement>,
-        module: Option<ContextId>,
+        context: ContextId,
         type_fn: F,
     ) -> Visitor<F> {
+        let (scope, self_requirement, module) = self.place(context);
+        let in_module = self.get_context(context).is_module_scope();
         Visitor {
             referrer: self,
             type_fn: Rc::new(RefCell::new(type_fn)),
-            exact: false,
-            leaker_types: Vec::new(),
             self_requirement,
-            scopes: Vec::new(),
+            scopes: vec![scope],
             outermost_as_leakers: false,
             self_ty: None,
-            item_depth: 0,
+            // The items of a module are nested items, which declare their own `Self`.
+            item_depth: usize::from(in_module),
             own_self: false,
-            module: module.map_or(ModulePos::Unknown, ModulePos::In),
-            root: true,
+            module,
         }
-    }
-
-    /// Like [`Referrer::into_visitor()`], but compares exact contexts.
-    ///
-    /// `root_generics` are the Leaker's generics, as given to `enter_generics()`. Use it if several
-    /// scopes declare the same generics differently. `self_requirement` is what `Self` means
-    /// everywhere. `module` is always compared, and `None` means the module of `intern_mod()`.
-    /// If the visited item declares `root_generics`, also call
-    /// [`Visitor::with_outermost_generics_as_leakers()`].
-    pub fn into_visitor_with_root<F: FnMut(Type, usize) -> Type>(
-        self,
-        root_generics: &Generics,
-        self_requirement: Option<SelfRequirement>,
-        module: Option<ContextId>,
-        type_fn: F,
-    ) -> Visitor<F> {
-        let mut visitor = self.into_visitor(self_requirement, module, type_fn);
-        visitor.exact = true;
-        visitor.scopes.push(Scope::new(root_generics));
-        visitor
     }
 
     /// Replaces the leaked types in `ty` with what `type_fn(leaked, index)` returns.
     ///
-    /// No generics are in scope, so the generics of an entry are the Leaker's. Pass the whole type,
-    /// not one cut out of a larger type: see [Outlives bounds](crate#outlives-bounds).
-    pub fn expand(&self, ty: Type, type_fn: impl FnMut(Type, usize) -> Type) -> Type {
+    /// `ty` is inside the scope `context`, as for [`Referrer::visitor()`]. Pass the whole type, not
+    /// one cut out of a larger type: see [Outlives bounds](crate#outlives-bounds).
+    ///
+    /// # Panics
+    /// Panics if `context` is not one of the [`Referrer::contexts()`].
+    pub fn expand(
+        &self,
+        context: ContextId,
+        ty: Type,
+        type_fn: impl FnMut(Type, usize) -> Type,
+    ) -> Type {
+        let (scope, self_requirement, module) = self.place(context);
         self.expand_with(
-            Matching::Lenient {
-                self_ty: None,
+            Matching::Scope {
+                self_ty: self_requirement.as_ref(),
                 no_self: false,
-                leakers: &[],
             },
-            ModulePos::Unknown,
-            &mut Vec::new(),
+            module,
+            &mut vec![scope],
             None,
             ty,
             type_fn,
@@ -804,13 +680,6 @@ impl Referrer {
 
 fn param_names<'a>(params: impl IntoIterator<Item = &'a GenericParam>) -> HashSet<String> {
     params.into_iter().map(generic_param_name).collect()
-}
-
-fn where_predicates(generics: &Generics) -> impl Iterator<Item = &WherePredicate> {
-    generics
-        .where_clause
-        .iter()
-        .flat_map(|where_clause| where_clause.predicates.iter())
 }
 
 #[derive(Clone, Copy)]
@@ -944,25 +813,26 @@ impl<'a, F: FnMut(Type, usize, &[GenericArgument]) -> Type> syn::fold::Fold for 
     }
 }
 
-/// Rewrites a copy by replacing its leaked types. Get it with [`Referrer::into_visitor()`].
+/// Rewrites a copy by replacing its leaked types. Get it with [`Referrer::visitor()`].
 ///
-/// It implements `syn::visit_mut::VisitMut` and tracks the generics declared where the copy is.
-/// A type is replaced only if an entry has the context it has there. So `T: Clone` of a visited
-/// `impl<T: Clone>` does not match an entry with `T` alone, unless you call
-/// [`Visitor::with_outermost_generics_as_leakers()`].
+/// It implements `syn::visit_mut::VisitMut` and tracks the generics in scope: those of the
+/// context it was made for, then those the visited syntax declares. A type is replaced only if an
+/// entry has the context it has there. So `T: Clone` of a visited `impl<T: Clone>` does not match
+/// an entry with `T` alone, unless you call [`Visitor::with_outermost_generics_as_leakers()`].
 ///
 /// Visit a whole type or item. A type cut out of another is looked up with nothing around it
-/// ([Outlives bounds](crate#outlives-bounds)). Items and imports declared in a block hide the
-/// leaked types that name them there. Those declared in a module hide them in that module only.
+/// ([Outlives bounds](crate#outlives-bounds)). The visited syntax is inside the module of the
+/// context, so a `mod` item is a module nested in it, found by name, and the items of a module
+/// are visited as items of it ([Modules](crate#modules)). Items and imports declared in a block
+/// hide the leaked types that name them there. Those declared in a module, or in a `File`, hide
+/// the entries of no module that name them.
 #[derive(Debug)]
 pub struct Visitor<F> {
     referrer: Referrer,
     type_fn: Rc<RefCell<F>>,
-    exact: bool,
-    /// Type parameters of the outermost item that `scopes` does not declare.
-    leaker_types: Vec<String>,
+    /// What `Self` means in the context.
     self_requirement: Option<SelfRequirement>,
-    /// The generics in scope, innermost last.
+    /// The generics in scope, innermost last. The first are those of the context.
     scopes: Vec<Scope>,
     outermost_as_leakers: bool,
     self_ty: Option<Type>,
@@ -970,8 +840,6 @@ pub struct Visitor<F> {
     /// In a nested item that defines its own `Self`.
     own_self: bool,
     module: ModulePos,
-    /// A `mod` item is `module` itself when it is the root of the visit.
-    root: bool,
 }
 
 impl<F> Clone for Visitor<F> {
@@ -979,8 +847,6 @@ impl<F> Clone for Visitor<F> {
         Self {
             referrer: self.referrer.clone(),
             type_fn: self.type_fn.clone(),
-            exact: self.exact,
-            leaker_types: self.leaker_types.clone(),
             self_requirement: self.self_requirement.clone(),
             scopes: self.scopes.clone(),
             outermost_as_leakers: self.outermost_as_leakers,
@@ -988,29 +854,25 @@ impl<F> Clone for Visitor<F> {
             item_depth: self.item_depth,
             own_self: self.own_self,
             module: self.module,
-            root: self.root,
         }
     }
 }
 
 impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
-    /// Treats the generics of the outermost item visited as those of the Leaker.
+    /// Treats the generics of the outermost item visited as those of the context.
     ///
-    /// A type that names them is replaced if it was leaked, whatever bounds they have in the copy.
-    /// Example: `Wrap<T>` in `impl<T: Clone> MyTrait<T> for W { fn f(&self) -> Wrap<T>; }`.
-    /// The outermost item is a struct, enum, union, trait, type alias, function, impl or trait
-    /// alias, or the signature if only that is visited. Deeper generics stay declared.
-    /// By default they are declared too, so they must match the entry's.
-    /// Either way, `T::A<X>` is an associated type path, as in the Leaker.
+    /// Use it if the copy declares the generics of the scope again, with other bounds. A type that
+    /// names them is replaced if it was leaked, whatever bounds they have in the copy. Example:
+    /// `Wrap<T>` in `impl<T: Clone> MyTrait<T> for W { fn f(&self) -> Wrap<T>; }`, for the context
+    /// of `trait MyTrait<T>`. The outermost item is a struct, enum, union, trait, type alias,
+    /// function, impl or trait alias, or the signature if only that is visited. Deeper generics
+    /// stay declared. By default they are declared too, so they must match the entry's, except
+    /// that an outermost item which declares exactly the generics of the context (the copy of the
+    /// item itself) does not declare them again. Either way, `T::A<X>` is an associated type path,
+    /// as in the Leaker.
     pub fn with_outermost_generics_as_leakers(mut self) -> Self {
         self.outermost_as_leakers = true;
         self
-    }
-
-    fn nested(&self) -> Self {
-        let mut visitor = self.clone();
-        visitor.root = false;
-        visitor
     }
 
     /// Replaces `Self` by `self_ty` in the copy, as [`Referrer::iter_with_self()`] does.
@@ -1028,11 +890,11 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
     /// # use syn::visit_mut::VisitMut;
     /// let tr: ItemTrait = parse_quote!(trait Tr { fn f(&self, x: Rel<Self>) -> Self::Out; });
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true).unwrap();
+    /// let context = leaker.intern_trait(&tr, true).unwrap();
     /// let mut sig: Signature = parse_quote!(fn f(&self, x: Rel<Self>) -> Self::Out);
     /// leaker
     ///     .finish()
-    ///     .into_visitor(None, None, |_, ix| parse_quote!(<Marker<__S> as Repeater<#ix>>::Type))
+    ///     .visitor(context, |_, ix| parse_quote!(<Marker<__S> as Repeater<#ix>>::Type))
     ///     .with_self(parse_quote!(__S))
     ///     .visit_signature_mut(&mut sig);
     /// let expected: Signature =
@@ -1097,24 +959,25 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
         }
     }
 
+    /// `generics` are those of the context, in any order and with the bounds anywhere.
+    fn is_context_generics(&self, generics: &Generics) -> bool {
+        let canonical = Context::new(generics.clone(), None);
+        self.scopes.first() == Some(&Scope::new(canonical.generics()))
+    }
+
     /// Visits the attributes, then returns a nested visitor that has visited `generics` and has
     /// them in scope. `item` is for an item, which may define its own `Self`.
     fn enter(&mut self, attrs: &mut [Attribute], generics: &mut Generics, item: bool) -> Self {
         self.visit_attrs(attrs);
-        let mut visitor = self.nested();
+        let mut visitor = self.clone();
         visitor.item_depth += 1;
         // Only an item nested in the visited syntax defines its own `Self`.
         visitor.own_self |= item && self.item_depth > 0;
         // Declare before visiting: every parameter is in scope of each other's bounds. The
-        // outermost item's generics are left out with `with_outermost_generics_as_leakers()`.
-        if item && self.outermost_as_leakers && self.item_depth == 0 {
-            visitor
-                .leaker_types
-                .extend(generics.params.iter().filter_map(|param| match param {
-                    GenericParam::Type(param) => Some(ident_name(&param.ident)),
-                    _ => None,
-                }));
-        } else {
+        // outermost item is the scope itself if it declares the generics of the context as they
+        // are, or if `with_outermost_generics_as_leakers()` says so: they are not declared again.
+        let outermost = item && self.item_depth == 0;
+        if !(outermost && (self.outermost_as_leakers || self.is_context_generics(generics))) {
             visitor.scopes.push(Scope::new(generics));
         }
         visitor.visit_generics_mut(generics);
@@ -1139,17 +1002,8 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
 impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
     fn visit_type_mut(&mut self, i: &mut Type) {
         let (self_ty, no_self) = (self.self_requirement.as_ref(), self.own_self);
-        let matching = if self.exact {
-            Matching::Exact { self_ty, no_self }
-        } else {
-            Matching::Lenient {
-                self_ty,
-                no_self,
-                leakers: &self.leaker_types,
-            }
-        };
         *i = self.referrer.expand_with(
-            matching,
+            Matching::Scope { self_ty, no_self },
             self.module,
             &mut self.scopes,
             self.self_ty.as_ref().filter(|_| !no_self),
@@ -1240,8 +1094,8 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
     fn visit_item_mod_mut(&mut self, i: &mut ItemMod) {
         self.visit_attrs(&mut i.attrs);
         if let Some((_, items)) = &mut i.content {
-            let mut visitor = self.nested();
-            visitor.module = self.referrer.module_in(self.module, self.root, &i.ident);
+            let mut visitor = self.clone();
+            visitor.module = self.referrer.module_in(self.module, &i.ident);
             // A module has no generics: it only makes its items nested.
             visitor.item_depth += 1;
             visitor.shadow_items(items.iter(), true);
@@ -1277,12 +1131,13 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         }
     }
     fn visit_file_mut(&mut self, i: &mut File) {
-        // A file is not a module, so a `mod` item in it is not the root.
-        let mut visitor = self.nested();
+        // The items of a file are declared together, as those of a module.
+        let mut visitor = self.clone();
+        visitor.shadow_items(i.items.iter(), true);
         syn::visit_mut::visit_file_mut(&mut visitor, i)
     }
     fn visit_block_mut(&mut self, i: &mut Block) {
-        let mut visitor = self.nested();
+        let mut visitor = self.clone();
         visitor.shadow_items(
             i.stmts.iter().filter_map(|stmt| match stmt {
                 Stmt::Item(item) => Some(item),
@@ -1307,8 +1162,9 @@ impl Referrer {
     // context holds, how enclosing lifetimes pass on, which paths are associated type paths, or how
     // an entry is found. Docs, errors and encoders need no bump.
     // 1: first tagged, contexts carry the bounds enclosing types imply. 2: modules are contexts
-    // (`mod 3 ;`, `mod { .. } ;`), no `Self = # 0 ;`.
-    pub const FORMAT_VERSION: u32 = 2;
+    // (`mod 3 ;`, `mod { .. } ;`), no `Self = # 0 ;`. 3: the top-level context of a scope keeps
+    // what `Self` means and the module the scope is in, for `Referrer::visitor()`.
+    pub const FORMAT_VERSION: u32 = 3;
 }
 
 /// Parses a [`Referrer`] written by its [`ToTokens`] implementation.

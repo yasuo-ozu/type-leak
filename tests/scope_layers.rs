@@ -178,11 +178,10 @@ fn the_outermost_scope_of_an_item_returns_the_generics_context() {
 }
 
 const ROOT_ITEM: &str = r#"
-id top = 3
+id top = 0
 context 0: < 'a , T : :: p :: Tr < Self > , U > ; Self = S < 'a , T , U > ; in module -
 context 1: < 'a , U : 'a > ; - ; in module -
 context 2:  ; - ; in module -
-context 3: < 'a , T : :: p :: Tr < Self > , U > ; - ; in module -
 entry 0: Rel < Self , T > in 0
 entry 1: Rel4 < T > in 0
 entry 2: Rel2 < & 'a U > in 1
@@ -191,11 +190,10 @@ entry 4: Rel3 in 2
 entry 5: Rel5 in 2
 "#;
 const ROOT_ITEM_IMPL: &str = r#"
-id top = 3
+id top = 0
 context 0: < 'a , T : :: p :: Tr < Self > , U > ; Self = :: p :: W < 'a , T , U > ; in module -
 context 1: < 'a , U : 'a > ; - ; in module -
 context 2:  ; - ; in module -
-context 3: < 'a , T : :: p :: Tr < Self > , U > ; - ; in module -
 entry 0: Rel < Self , T > in 0
 entry 1: Rel4 < T > in 0
 entry 2: Rel2 < & 'a U > in 1
@@ -204,11 +202,10 @@ entry 4: Rel3 in 2
 entry 5: Rel5 in 2
 "#;
 const ROOT_ITEM_TRAIT: &str = r#"
-id top = 3
+id top = 0
 context 0: < 'a , T : :: p :: Tr < Self > , U > ; Self: S < 'a , T , U > ; in module -
 context 1: < 'a , U : 'a > ; - ; in module -
 context 2:  ; - ; in module -
-context 3: < 'a , T : :: p :: Tr < Self > , U > ; - ; in module -
 entry 0: Rel < Self , T > in 0
 entry 1: Rel4 < T > in 0
 entry 2: Rel2 < & 'a U > in 1
@@ -218,7 +215,7 @@ entry 5: Rel5 in 2
 "#;
 
 /// The ids of several scopes in one: the contexts of the generics are those of the generics, and
-/// the items and the modules add none.
+/// the items and the modules add none, except `Self` if an entry of the scope names it.
 fn nested_ids() -> String {
     let mut leaker = Leaker::new();
     let s_ident = ident("S");
@@ -231,7 +228,8 @@ fn nested_ids() -> String {
                     view.visit_type(&parse_quote!(Rel<Self, U>))
                 })
                 .unwrap();
-            // The same generics, whatever the kind of the item.
+            // The same generics, but another `Self`, which an entry names: another context. (`d`
+            // below has no entry that names `Self`, so its context is that of the generics.)
             let (b, ()) = view
                 .enter_type(&ident("E"), &generics, true, |view| {
                     view.visit_type(&parse_quote!(Rel<Self, U>))
@@ -299,43 +297,42 @@ fn nested_ids() -> String {
 
 const NESTED_IDS: &str = r#"
 id a = 0
-id b = 0
-id c = 1
-id m = 2
-id inner = 3
-id m2 = 4
-id d = 0
-id e = 0
-id f = 0
-id m3 = 7
-id top = 16
-context 0: < U > ; - ; in module -
-context 1: < 'a > ; - ; in module -
-context 2:  ; - ; in module - is module Some("m") None
-context 3: < V > ; - ; in module -
-context 4:  ; - ; in module - is module Some("m2") None
-context 5:  ; - ; in module - is module Some("m4") None
-context 6: < W > ; - ; in module -
-context 7:  ; - ; in module - is module Some("m3") None
-context 8: < U > ; Self = S < U > ; in module -
-context 9: < U > ; Self = E < U > ; in module -
-context 10:  ; - ; in module 2
-context 11: < V > ; Self = S2 < V > ; in module 2
-context 12:  ; - ; in module 4
-context 13: < U > ; Self = :: p :: Wrap < U > ; in module -
-context 14: < W > ; Self: Tr2 < W > ; in module 5
-context 15: < X > ; - ; in module 7
-context 16: < X > ; - ; in module -
-entry 0: Rel7 < U > in 0
-entry 1: Rel2 < & 'a () > in 1
-entry 2: Rel < Self , U > in 8
-entry 3: Rel < Self , U > in 9
-entry 4: Rel3 in 10
-entry 5: Rel4 < Self , V > in 11
-entry 6: Rel3 in 12
-entry 7: Rel6 < Self , U > in 13
-entry 8: Rel8 < Self , W > in 14
-entry 9: Rel5 < X > in 15
+id b = 1
+id c = 2
+id m = 3
+id inner = 4
+id m2 = 5
+id d = 6
+id e = 7
+id f = 10
+id m3 = 11
+id top = 15
+context 0: < U > ; Self = S < U > ; in module -
+context 1: < U > ; Self = E < U > ; in module -
+context 2: < 'a > ; - ; in module -
+context 3:  ; - ; in module - is module Some("m") None
+context 4: < V > ; Self = S2 < V > ; in module 3
+context 5:  ; - ; in module - is module Some("m2") None
+context 6: < U > ; - ; in module -
+context 7: < U > ; Self = :: p :: Wrap < U > ; in module -
+context 8:  ; - ; in module - is module Some("m4") None
+context 9: < W > ; Self: Tr2 < W > ; in module 8
+context 10: < U > ; Self: Tr < U > ; in module -
+context 11:  ; - ; in module - is module Some("m3") None
+context 12:  ; - ; in module 3
+context 13:  ; - ; in module 5
+context 14: < X > ; - ; in module 11
+context 15: < X > ; - ; in module -
+entry 0: Rel < Self , U > in 0
+entry 1: Rel < Self , U > in 1
+entry 2: Rel2 < & 'a () > in 2
+entry 3: Rel4 < Self , V > in 4
+entry 4: Rel7 < U > in 6
+entry 5: Rel6 < Self , U > in 7
+entry 6: Rel8 < Self , W > in 9
+entry 7: Rel3 in 12
+entry 8: Rel3 in 13
+entry 9: Rel5 < X > in 14
 "#;
 
 #[test]
@@ -417,17 +414,15 @@ id outer = 0
 id first = 1
 id last = 3
 context 0:  ; - ; in module - is module Some("outer") None
-context 1: < A > ; - ; in module -
+context 1: < A > ; Self = F < A > ; in module 0
 context 2:  ; - ; in module - is module Some("kept") None
-context 3: < C > ; - ; in module -
+context 3: < C > ; Self = L < C > ; in module 0
 context 4:  ; - ; in module 0
-context 5: < A > ; Self = F < A > ; in module 0
-context 6: < C > ; Self = L < C > ; in module 0
-context 7:  ; - ; in module 2
-entry 0: Rel in 4
-entry 1: RelA < Self , A > in 5
-entry 2: RelC < Self , C > in 6
-entry 3: RelK in 7
+context 5:  ; - ; in module 2
+entry 0: RelA < Self , A > in 1
+entry 1: RelC < Self , C > in 3
+entry 2: Rel in 4
+entry 3: RelK in 5
 "#;
 const FAILING_ERRORS: &str = r#"
 use absolute path: 'Bad1 < '_ >'

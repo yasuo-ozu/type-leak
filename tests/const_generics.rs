@@ -7,13 +7,13 @@ use std::collections::BTreeSet;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{Leaker, Referrer};
+use type_leak::{ContextId, Leaker, Referrer};
 
-/// Leaks the types of `item` (in the context 0).
-fn leak(item: &ItemTrait) -> Referrer {
+/// Leaks the types of `item`, and returns the top-level context of the trait.
+fn leak(item: &ItemTrait) -> (Referrer, ContextId) {
     let mut leaker = Leaker::new();
-    leaker.intern_trait(item, true).unwrap();
-    leaker.finish()
+    let context = leaker.intern_trait(item, true).unwrap();
+    (leaker.finish(), context)
 }
 
 /// Returns the leaked types with their local generics (with the where clause), by index.
@@ -32,11 +32,11 @@ fn entry(ty: Type, generics: Generics) -> (String, String) {
     (quote!(#ty).to_string(), quote!(#generics #wc).to_string())
 }
 
-/// Rewrites `item` with `referrer`, replacing the `ix`-th leaked type with `P<ix>`.
-fn rewrite(referrer: Referrer, item: ItemTrait) -> String {
+/// Rewrites `item`, a copy in the scope `context`, replacing the `ix`-th leaked type with `P<ix>`.
+fn rewrite(referrer: Referrer, context: ContextId, item: ItemTrait) -> String {
     let mut item = Item::Trait(item);
     referrer
-        .into_visitor(None, None, |_, ix| parse_quote!(P<#ix>))
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
         .visit_item_mut(&mut item);
     quote!(#item).to_string()
 }
@@ -187,7 +187,7 @@ fn test_same_type_with_different_local_generics() {
             fn g<const B: u8>(&self) -> Wrap<B>;
         }
     };
-    let referrer = leak(&item);
+    let (referrer, context) = leak(&item);
     assert_eq!(
         entries(&referrer),
         [
@@ -196,7 +196,7 @@ fn test_same_type_with_different_local_generics() {
         ]
     );
     assert_eq!(
-        rewrite(referrer, item),
+        rewrite(referrer, context, item),
         expected(parse_quote! {
             trait MyTrait {
                 fn f<const B: bool>(&self) -> P<0usize>;
@@ -214,13 +214,13 @@ fn test_same_local_generics_share_an_entry() {
             fn g<const B: bool>(&self, x: Wrap<B>);
         }
     };
-    let referrer = leak(&item);
+    let (referrer, context) = leak(&item);
     assert_eq!(
         entries(&referrer),
         [entry(parse_quote!(Wrap<B>), parse_quote!(<const B: bool>))]
     );
     assert_eq!(
-        rewrite(referrer, item),
+        rewrite(referrer, context, item),
         expected(parse_quote! {
             trait MyTrait {
                 fn f<const B: bool>(&self) -> P<0usize>;
@@ -239,7 +239,7 @@ fn test_type_with_and_without_local_generics() {
             fn g(&self) -> Wrap<B>;
         }
     };
-    let referrer = leak(&item);
+    let (referrer, context) = leak(&item);
     // The contexts are numbered in the order of their first appearance.
     assert_eq!(
         entries(&referrer),
@@ -249,7 +249,7 @@ fn test_type_with_and_without_local_generics() {
         ]
     );
     assert_eq!(
-        rewrite(referrer, item),
+        rewrite(referrer, context, item),
         expected(parse_quote! {
             trait MyTrait {
                 fn f<const B: bool>(&self) -> P<0usize>;
@@ -268,7 +268,7 @@ fn test_equivalent_local_generics_share_an_entry() {
             fn g<U, T>(&self) -> Wrap<T, U> where T: ::core::clone::Clone + ::core::fmt::Debug;
         }
     };
-    let referrer = leak(&item);
+    let (referrer, context) = leak(&item);
     assert_eq!(
         entries(&referrer),
         [entry(
@@ -277,7 +277,7 @@ fn test_equivalent_local_generics_share_an_entry() {
         )]
     );
     assert_eq!(
-        rewrite(referrer, item),
+        rewrite(referrer, context, item),
         expected(parse_quote! {
             trait MyTrait {
                 fn f<T: ::core::fmt::Debug + ::core::clone::Clone, U>(&self) -> P<0usize>;
@@ -294,7 +294,7 @@ fn test_local_generics_include_those_in_bounds() {
             fn f<T, U: ::core::cmp::PartialEq<T>>(&self) -> Wrap<U>;
         }
     };
-    let referrer = leak(&item);
+    let (referrer, context) = leak(&item);
     assert_eq!(
         entries(&referrer),
         [entry(
@@ -303,7 +303,7 @@ fn test_local_generics_include_those_in_bounds() {
         )]
     );
     assert_eq!(
-        rewrite(referrer, item),
+        rewrite(referrer, context, item),
         expected(parse_quote! {
             trait MyTrait {
                 fn f<T, U: ::core::cmp::PartialEq<T>>(&self) -> P<0usize>;
@@ -321,7 +321,7 @@ fn test_binder_in_type() {
             fn f<L>(&self, x: ::std::boxed::Box<dyn for<'b> ::p::F<&'b Rel<L>>>);
         }
     };
-    let referrer = leak(&item);
+    let (referrer, context) = leak(&item);
     // The `Box` of an external crate is an optional entry (a type with the lifetime of the binder
     // inside it, which does not use the binder itself), and `Rel<L>` is the required one.
     assert_eq!(
@@ -336,7 +336,7 @@ fn test_binder_in_type() {
     );
     assert!(referrer.must(0) && !referrer.must(1));
     assert_eq!(
-        rewrite(referrer, item),
+        rewrite(referrer, context, item),
         expected(parse_quote! {
             trait MyTrait {
                 fn f<L>(&self, x: ::std::boxed::Box<dyn for<'b> ::p::F<&'b P<0usize>>>);

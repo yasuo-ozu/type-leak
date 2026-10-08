@@ -17,7 +17,7 @@ fn test_leaker() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&test_struct, true).unwrap();
+    let context = leaker.intern_struct(&test_struct, true).unwrap();
     leaker.reduce_roots();
     let referrer = leaker.finish();
     assert_eq!(
@@ -36,11 +36,11 @@ fn test_leaker() {
     );
     let mut f = |_, _| parse_quote!(::path::to::Implementor);
     assert_ne!(
-        quote!(#{referrer.expand(parse_quote!(MyType1),  &mut f)}).to_string(),
+        quote!(#{referrer.expand(context, parse_quote!(MyType1),  &mut f)}).to_string(),
         quote!(MyType1).to_string()
     );
     assert_ne!(
-        quote!(#{referrer.expand(parse_quote!((MyType2 , MyType3 < MyType1 > , MyType4 , MyType5)),  &mut f)}).to_string(),
+        quote!(#{referrer.expand(context, parse_quote!((MyType2 , MyType3 < MyType1 > , MyType4 , MyType5)),  &mut f)}).to_string(),
         quote!((MyType2 , MyType3 < MyType1 > , MyType4 , MyType5)).to_string()
     );
 }

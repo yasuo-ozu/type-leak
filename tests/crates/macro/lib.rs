@@ -302,7 +302,7 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
         config.allowed_paths.extend(args.allow.clone());
         config
     });
-    leaker
+    let context = leaker
         .intern_trait(&item_trait, true)
         .map_err(Error::from)?;
     // Compile-time checks of the Leaker's assumptions (e.g. that `u8` is not shadowed).
@@ -404,7 +404,8 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
             (#dollar(#dollar t:tt)*) => {
                 #helper::__implement! {
                     { #item_trait }
-                    { #referrer }
+                    // The scope of the copy goes with the Referrer, as an integer.
+                    { #referrer , #context }
                     { #id }
                     { #repeater }
                     { #module }
@@ -428,6 +429,8 @@ enum Input {
 struct Header {
     item_trait: ItemTrait,
     referrer: Referrer,
+    /// The top-level context of the trait: the scope of the copies.
+    context: ContextId,
     id: LitInt,
     repeater: Path,
     module: Path,
@@ -445,6 +448,7 @@ struct CopyInput {
 struct ImplementInput {
     item_trait: ItemTrait,
     referrer: Referrer,
+    context: ContextId,
     id: LitInt,
     repeater: Path,
     module: Path,
@@ -465,9 +469,18 @@ fn braced_parse<T: Parse>(input: ParseStream) -> Result<T> {
 
 impl Parse for Input {
     fn parse(input: ParseStream) -> Result<Self> {
+        let item_trait = braced_parse(input)?;
+        let (referrer, context) = {
+            let content;
+            braced!(content in input);
+            let referrer = content.parse()?;
+            content.parse::<Token![,]>()?;
+            (referrer, content.parse()?)
+        };
         let header = Header {
-            item_trait: braced_parse(input)?,
-            referrer: braced_parse(input)?,
+            item_trait,
+            referrer,
+            context,
             id: braced_parse(input)?,
             repeater: braced_parse::<Path>(input)?,
             module: braced_parse::<Path>(input)?,
@@ -506,6 +519,7 @@ impl Parse for Input {
         let Header {
             item_trait,
             referrer,
+            context,
             id,
             repeater,
             module,
@@ -546,6 +560,7 @@ impl Parse for Input {
         Ok(Input::Implement(ImplementInput {
             item_trait,
             referrer,
+            context,
             id,
             repeater,
             module,
@@ -695,6 +710,7 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
             Header {
                 item_trait,
                 referrer,
+                context,
                 id,
                 repeater,
                 ..
@@ -703,43 +719,39 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
         items,
     } = input;
     let slots = RepeaterSlots::new(repeater.clone());
-    let trait_ident = &item_trait.ident;
     let params = &item_trait.generics.params;
     let trait_params: Vec<GenericArgument> = params
         .iter()
         .map(|param| parse2(param_as_arg(param)))
         .collect::<Result<_>>()?;
-    let self_path: Path = if trait_params.is_empty() {
-        parse_quote!(#trait_ident)
-    } else {
-        parse_quote!(#trait_ident<#(#trait_params),*>)
-    };
     let self_in_copy: Type = self_ty.clone().unwrap_or_else(|| parse_quote!(Self));
     let mut error = None;
     let mut copies = TokenStream::new();
     for mut item in items {
-        let mut visitor = referrer.clone().into_visitor(
-            Some(SelfRequirement::Bound(self_path.clone())),
-            None,
-            |_, ix| {
-                let projection = (|| -> Result<Type> {
-                    let args = referrer.generic_args(ix, params, &trait_params)?;
-                    let encoded = slots.encode_generics_args_to_ty_with_self(
-                        &args,
-                        &referrer.generics(ix).params,
-                        &self_in_copy,
-                        referrer.context_self_outlives(referrer.context(ix)),
-                    )?;
-                    Ok(parse_quote!(<#self_in_copy as #repeater<#encoded, #id, #ix>>::Type))
-                })();
-                projection.unwrap_or_else(|e| {
-                    error = Some(e);
-                    parse_quote!(())
-                })
-            },
-        );
+        // `Self` is what the context says: the implementor of the trait.
+        let mut visitor = referrer.clone().visitor(context, |_, ix| {
+            let projection = (|| -> Result<Type> {
+                let args = referrer.generic_args(ix, params, &trait_params)?;
+                let encoded = slots.encode_generics_args_to_ty_with_self(
+                    &args,
+                    &referrer.generics(ix).params,
+                    &self_in_copy,
+                    referrer.context_self_outlives(referrer.context(ix)),
+                )?;
+                Ok(parse_quote!(<#self_in_copy as #repeater<#encoded, #id, #ix>>::Type))
+            })();
+            projection.unwrap_or_else(|e| {
+                error = Some(e);
+                parse_quote!(())
+            })
+        });
         if let Some(self_ty) = &self_ty {
             visitor = visitor.with_self(self_ty.clone());
+        }
+        // An impl of the trait declares its parameters again (`impl<'a> Trait<'a> for ..`), with
+        // the bounds it needs there, which are not those of the trait: they are the trait's.
+        if matches!(item, Item::Impl(_)) && !params.is_empty() {
+            visitor = visitor.with_outermost_generics_as_leakers();
         }
         visitor.visit_item_mut(&mut item);
         drop(visitor);
@@ -755,6 +767,7 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     let ImplementInput {
         item_trait,
         referrer,
+        context,
         id,
         repeater,
         module,
@@ -828,13 +841,6 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     for ix in 0..referrer.iter().count() {
         projections.push(projection(ix, params, &completed)?);
     }
-    // What `Self` is in the trait: the implementor, bounded by the trait with its parameters.
-    let trait_params: Vec<_> = params.iter().map(param_as_arg).collect();
-    let self_path: Path = if trait_params.is_empty() {
-        parse_quote!(#trait_ident)
-    } else {
-        parse_quote!(#trait_ident<#(#trait_params),*>)
-    };
 
     let mut methods = TokenStream::new();
     for trait_item in &item_trait.items {
@@ -858,11 +864,11 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         // the replacement would break the lookup of leaked types (keyed by the parameters'
         // names), and substituting after it would rewrite the projections.
         let mut sig = trait_fn.sig.clone();
-        let mut visitor = referrer.clone().into_visitor(
-            Some(SelfRequirement::Bound(self_path.clone())),
-            None,
-            |_, ix| parse_quote!(__TypeLeakTestPlaceholder<#ix>),
-        );
+        // The context of the trait says what `Self` is (the implementor) and which generics are in
+        // scope.
+        let mut visitor = referrer
+            .clone()
+            .visitor(context, |_, ix| parse_quote!(__TypeLeakTestPlaceholder<#ix>));
         visitor.visit_signature_mut(&mut sig);
         substitute.visit_signature_mut(&mut sig);
         Resolve {

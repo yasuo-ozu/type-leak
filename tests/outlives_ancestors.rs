@@ -13,14 +13,13 @@
 //! the arguments of a trait object, ..), as rustc does.
 //!
 //! The Leaker and the Referrer compute it from the same rules (which components of a type carry
-//! what the type outlives, see the table below), so that the Referrer finds the entry, in the
-//! exact and in the lenient matching, and whether the generics of the Leaker are declared where it
-//! looks the type up or not.
+//! what the type outlives, see the table below), so that the Referrer finds the entry, whether the
+//! generics are declared by the copy or are those of the context (the scope of the copy).
 
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{Leaker, LeakerConfig, Referrer, SelfRequirement};
+use type_leak::{ContextId, Leaker, LeakerConfig, Referrer, SelfRequirement};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
@@ -33,9 +32,14 @@ fn leaker() -> Leaker {
 }
 
 fn referrer_of(item: &ItemTrait) -> Referrer {
+    referrer_in(item).0
+}
+
+/// The Referrer, with the top-level context of the trait: the scope of its copies.
+fn referrer_in(item: &ItemTrait) -> (Referrer, ContextId) {
     let mut leaker = leaker();
-    leaker.intern_trait(item, true).unwrap();
-    leaker.finish()
+    let context = leaker.intern_trait(item, true).unwrap();
+    (leaker.finish(), context)
 }
 
 /// The generics (and the where clause) of each leaked type, by its tokens.
@@ -469,42 +473,32 @@ fn self_is_bounded_too() {
     assert!(found.contains(&(String::new(), vec![])), "{:?}", found);
 }
 
-/// How a Referrer looks the types up.
-#[derive(Clone, Copy, Debug)]
-enum Mode {
-    /// The generics of the item visited are declared (and so are those of the trait if the item
-    /// is a copy of a signature, which is not the case here), the others assumed.
-    Lenient,
-    /// The generics of the outermost item visited are not declared.
-    Leakers,
-    /// The exact contexts, with the generics of the trait as the root.
-    Exact,
-}
-
-const MODES: [Mode; 3] = [Mode::Lenient, Mode::Leakers, Mode::Exact];
-
-/// Rewrites `item`, replacing each leaked type by `P<ix>`.
-fn rewrite(referrer: &Referrer, root: &Generics, mode: Mode, item: &Item) -> String {
+/// Rewrites `item`, a copy in the scope `context`, replacing each leaked type by `P<ix>`.
+fn rewrite(referrer: &Referrer, context: ContextId, item: &Item) -> String {
     let mut item = item.clone();
     let replace = |_: Type, ix: usize| -> Type {
         let ix = proc_macro2::Literal::usize_unsuffixed(ix);
         parse_quote!(P<#ix>)
     };
-    match mode {
-        Mode::Lenient => referrer
-            .clone()
-            .into_visitor(None, None, replace)
-            .visit_item_mut(&mut item),
-        Mode::Leakers => referrer
-            .clone()
-            .into_visitor(None, None, replace)
-            .with_outermost_generics_as_leakers()
-            .visit_item_mut(&mut item),
-        Mode::Exact => referrer
-            .clone()
-            .into_visitor_with_root(root, None, None, replace)
-            .visit_item_mut(&mut item),
-    }
+    referrer
+        .clone()
+        .visitor(context, replace)
+        .visit_item_mut(&mut item);
+    s(&item)
+}
+
+/// Like `rewrite()`, with the generics of the outermost item taken as those of the context.
+fn rewrite_as_leakers(referrer: &Referrer, context: ContextId, item: &Item) -> String {
+    let mut item = item.clone();
+    let replace = |_: Type, ix: usize| -> Type {
+        let ix = proc_macro2::Literal::usize_unsuffixed(ix);
+        parse_quote!(P<#ix>)
+    };
+    referrer
+        .clone()
+        .visitor(context, replace)
+        .with_outermost_generics_as_leakers()
+        .visit_item_mut(&mut item);
     s(&item)
 }
 
@@ -527,12 +521,12 @@ fn the_referrer_finds_the_entry_of_a_type_under_the_lifetimes_around_it() {
             );
         }
     };
-    let referrer = referrer_of(&tr);
+    let (referrer, context) = referrer_in(&tr);
     let around = entry(&referrer, "Rel2 < T >", "< 'a , T : 'a >");
     let alone = entry(&referrer, "Rel2 < T >", "< T >");
     assert_ne!(around, alone);
     let cases: Vec<(Item, usize)> = vec![
-        // A struct field: what the copy needs, in each of the lookups.
+        // A struct field: what the copy needs. The copy declares the generics of the method.
         (
             parse_quote!(
                 struct G<'a, T>(&'a Rel2<T>);
@@ -609,42 +603,29 @@ fn the_referrer_finds_the_entry_of_a_type_under_the_lifetimes_around_it() {
     ];
     for (item, ix) in cases {
         let item: Item = item;
-        for mode in MODES {
-            let copy = rewrite(&referrer, &tr.generics, mode, &item);
-            assert!(!copy.contains("Rel2"), "{:?}: {}", mode, copy);
-            assert!(
-                copy.contains(&format!("P < {} >", ix)),
-                "{:?}: {} has not P<{}>",
-                mode,
-                copy,
-                ix
-            );
-            let other = if ix == around { alone } else { around };
-            assert!(
-                !copy.contains(&format!("P < {} >", other)),
-                "{:?}: {}",
-                mode,
-                copy
-            );
-        }
+        let copy = rewrite(&referrer, context, &item);
+        assert!(!copy.contains("Rel2"), "{}", copy);
+        assert!(
+            copy.contains(&format!("P < {} >", ix)),
+            "{} has not P<{}>",
+            copy,
+            ix
+        );
+        let other = if ix == around { alone } else { around };
+        assert!(!copy.contains(&format!("P < {} >", other)), "{}", copy);
     }
     // The bound is written in the struct: the same generics as the entry of the reference's
-    // component, so it is found where the generics of the struct are seen declared (not with the
-    // outermost generics as the Leaker's, where `T: 'a` is not seen and the entry with the fewest
-    // generics assumed is the one with nothing around).
+    // component, so it is found where the generics of the struct are declared.
     let item: Item = parse_quote!(
         struct F<'a, T: 'a>(::core::cell::Ref<'a, Rel2<T>>);
     );
-    for mode in [Mode::Lenient, Mode::Exact] {
-        let copy = rewrite(&referrer, &tr.generics, mode, &item);
-        assert!(!copy.contains("Rel2"), "{:?}: {}", mode, copy);
-        assert!(
-            copy.contains(&format!("P < {} >", around)),
-            "{:?}: {}",
-            mode,
-            copy
-        );
-    }
+    let copy = rewrite(&referrer, context, &item);
+    assert!(!copy.contains("Rel2"), "{}", copy);
+    assert!(copy.contains(&format!("P < {} >", around)), "{}", copy);
+    // The context declares none of them: the generics of the outermost item cannot be taken as
+    // its, so nothing is found.
+    let copy = rewrite_as_leakers(&referrer, context, &item);
+    assert!(copy.contains("Rel2"), "{}", copy);
 }
 
 #[test]
@@ -654,38 +635,34 @@ fn the_referrer_does_not_mistake_a_type_for_another_lifetime() {
             fn f<'a, T>(&self, x: &'a dyn ::core::iter::Iterator<Item = Rel2<T>>);
         }
     };
-    let referrer = referrer_of(&tr);
+    let (referrer, context) = referrer_in(&tr);
     let around = entry(&referrer, "Rel2 < T >", "< 'a , T : 'a >");
     // The lifetime is named differently: the generics declared here are not those of the entry.
     let item: Item = parse_quote!(
         struct F<'b, T>(&'b dyn ::core::iter::Iterator<Item = Rel2<T>>);
     );
-    for mode in [Mode::Lenient, Mode::Exact] {
-        let copy = rewrite(&referrer, &tr.generics, mode, &item);
-        assert!(copy.contains("Rel2"), "{:?}: {}", mode, copy);
-    }
-    // The same bounds, with other generics around: not replaced either in the exact lookup.
+    let copy = rewrite(&referrer, context, &item);
+    assert!(copy.contains("Rel2"), "{}", copy);
+    // The same bounds, with other generics around: replaced, as the type does not name them.
     let item: Item = parse_quote!(
         struct F<'a, 'b: 'a, T>(&'a dyn ::core::iter::Iterator<Item = Rel2<T>>);
     );
-    let copy = rewrite(&referrer, &tr.generics, Mode::Exact, &item);
+    let copy = rewrite(&referrer, context, &item);
     assert!(copy.contains(&format!("P < {} >", around)), "{}", copy);
     // The lifetime of a path is not the lifetime of the entry either: it is no lifetime around
     // the type, so the entry of the type alone is the one which is found, not this one.
     let item: Item = parse_quote!(
         struct F<'a, T>(::core::cell::Ref<'a, Rel2<T>>);
     );
-    for mode in [Mode::Lenient, Mode::Exact] {
-        let copy = rewrite(&referrer, &tr.generics, mode, &item);
-        assert!(copy.contains("Rel2"), "{:?}: {}", mode, copy);
-    }
+    let copy = rewrite(&referrer, context, &item);
+    assert!(copy.contains("Rel2"), "{}", copy);
 }
 
 #[test]
-fn the_referrer_tells_the_entries_apart_with_the_generics_of_the_leaker_undeclared() {
-    // The generics of the trait are not declared where the signature is copied, so the Referrer
-    // assumes them: the entry with the fewest assumed generics would be the one without the
-    // lifetime, were it not for the bounds which the type implies where it is found.
+fn the_referrer_tells_the_entries_apart_with_the_generics_of_the_context() {
+    // The generics of the trait are not declared where the signature is copied, but they are
+    // those of the context: the entry is the one whose bounds are those which the type implies
+    // where it is found.
     let tr: ItemTrait = parse_quote! {
         trait Tr<'a, T> {
             fn f(
@@ -697,12 +674,12 @@ fn the_referrer_tells_the_entries_apart_with_the_generics_of_the_leaker_undeclar
             );
         }
     };
-    let referrer = referrer_of(&tr);
+    let (referrer, context) = referrer_in(&tr);
     let around = entry(&referrer, "Rel2 < T >", "< 'a , T : 'a >");
     let alone = entry(&referrer, "Rel2 < T >", "< T >");
-    // `expand()` declares nothing.
+    // `expand()` declares nothing but the generics of the context.
     let expand = |ty: Type| -> String {
-        s(&referrer.expand(ty, |_, ix| {
+        s(&referrer.expand(context, ty, |_, ix| {
             let ix = proc_macro2::Literal::usize_unsuffixed(ix);
             parse_quote!(P<#ix>)
         }))
@@ -729,8 +706,8 @@ fn the_referrer_tells_the_entries_apart_with_the_generics_of_the_leaker_undeclar
         expand(parse_quote!(::core::cell::Ref<'a, Rel2<T>>)),
         format!(":: core :: cell :: Ref < 'a , P < {} > >", alone)
     );
-    // The signatures, with the generics of the trait undeclared (the default of the visitor
-    // `Referrer::into_visitor()`, for a signature, declares only those of the method).
+    // The signatures, with the generics of the trait undeclared (the visitor, for a signature,
+    // declares only those of the method, and those of the trait are the context's).
     let sig: Signature = parse_quote!(
         fn f(
             &self,
@@ -745,15 +722,12 @@ fn the_referrer_tells_the_entries_apart_with_the_generics_of_the_leaker_undeclar
         parse_quote!(P<#ix>)
     };
     for mut visitor in [
-        referrer.clone().into_visitor(None, None, replace),
+        referrer.clone().visitor(context, replace),
+        // The signature declares no generics, which are those of the context in any case.
         referrer
             .clone()
-            .into_visitor(None, None, replace)
+            .visitor(context, replace)
             .with_outermost_generics_as_leakers(),
-        // The generics of the trait are the root, those of the method are declared.
-        referrer
-            .clone()
-            .into_visitor_with_root(&tr.generics, None, None, replace),
     ] {
         let mut copy = sig.clone();
         visitor.visit_signature_mut(&mut copy);
@@ -789,9 +763,8 @@ fn the_referrer_tells_the_entries_apart_with_the_generics_of_the_leaker_undeclar
 
 #[test]
 fn the_referrer_finds_the_entry_with_a_lifetime_of_the_method() {
-    // The lifetime is declared by the method, and the type by the trait (assumed), the way round
-    // of the lenient lookup of the generics which the entry has and the type here does not
-    // mention.
+    // The lifetime is declared by the method, and the type by the trait (the context), so the
+    // generics which the entry has are declared by two scopes.
     let tr: ItemTrait = parse_quote! {
         trait Tr<T> {
             fn f<'a>(
@@ -802,7 +775,7 @@ fn the_referrer_finds_the_entry_with_a_lifetime_of_the_method() {
             );
         }
     };
-    let referrer = referrer_of(&tr);
+    let (referrer, context) = referrer_in(&tr);
     let around = entry(&referrer, "Rel2 < T >", "< 'a , T : 'a >");
     let alone = entry(&referrer, "Rel2 < T >", "< T >");
     let sig: Signature = parse_quote!(
@@ -817,39 +790,28 @@ fn the_referrer_finds_the_entry_with_a_lifetime_of_the_method() {
         let ix = proc_macro2::Literal::usize_unsuffixed(ix);
         parse_quote!(P<#ix>)
     };
-    for mut visitor in [
-        referrer.clone().into_visitor(None, None, replace),
-        referrer
-            .clone()
-            .into_visitor(None, None, replace)
-            .with_outermost_generics_as_leakers(),
-        // The generics of the trait are the root, those of the method are declared.
-        referrer
-            .clone()
-            .into_visitor_with_root(&tr.generics, None, None, replace),
-    ] {
-        let mut copy = sig.clone();
-        visitor.visit_signature_mut(&mut copy);
-        let copy = s(&copy);
-        assert!(!copy.contains("Rel2"), "{}", copy);
-        assert!(
-            copy.contains(&format!(
-                "x : & 'a dyn :: core :: iter :: Iterator < Item = P < {} > >",
-                around
-            )),
-            "{}",
-            copy
-        );
-        assert!(copy.contains(&format!("y : P < {} >", alone)), "{}", copy);
-        assert!(
-            copy.contains(&format!(
-                "w : :: core :: cell :: Ref < 'a , P < {} > >",
-                alone
-            )),
-            "{}",
-            copy
-        );
-    }
+    let mut visitor = referrer.clone().visitor(context, replace);
+    let mut copy = sig.clone();
+    visitor.visit_signature_mut(&mut copy);
+    let copy = s(&copy);
+    assert!(!copy.contains("Rel2"), "{}", copy);
+    assert!(
+        copy.contains(&format!(
+            "x : & 'a dyn :: core :: iter :: Iterator < Item = P < {} > >",
+            around
+        )),
+        "{}",
+        copy
+    );
+    assert!(copy.contains(&format!("y : P < {} >", alone)), "{}", copy);
+    assert!(
+        copy.contains(&format!(
+            "w : :: core :: cell :: Ref < 'a , P < {} > >",
+            alone
+        )),
+        "{}",
+        copy
+    );
 }
 
 #[test]
@@ -864,7 +826,7 @@ fn the_entries_of_the_types_around_survive_serialization() {
             );
         }
     };
-    let referrer = referrer_of(&tr);
+    let (referrer, context) = referrer_in(&tr);
     let tokens = referrer.to_token_stream();
     let parsed: Referrer = parse2(tokens.clone()).unwrap();
     assert_eq!(parsed, referrer);
@@ -879,9 +841,7 @@ fn the_entries_of_the_types_around_survive_serialization() {
         parse_quote!(P<#ix>)
     };
     let mut copy = item.clone();
-    parsed
-        .into_visitor(None, None, replace)
-        .visit_item_mut(&mut copy);
+    parsed.visitor(context, replace).visit_item_mut(&mut copy);
     assert!(!s(&copy).contains("Rel2"), "{}", s(&copy));
 }
 
@@ -890,7 +850,8 @@ fn the_entries_of_the_types_around_survive_serialization() {
 /// original field of a struct is well-formed without `U: 'a`, whereas the one which the copy has
 /// for `Rel2<U>` would be stricter with it), so the type inside does not carry what the types
 /// around it outlive (a reference's lifetime: a path's own lifetime is never carried). The
-/// Referrer, which may not see `T` declared, finds the entry.
+/// Referrer finds the entry from the generics in scope: `T` is a type parameter if a scope
+/// declares it.
 mod projection_paths {
     use super::*;
 
@@ -1039,8 +1000,8 @@ mod projection_paths {
     }
 
     /// The trait of the Leaker: `x` has the type inside a projection path, and `y` the same type
-    /// under the lifetime of a reference without it.
-    fn both() -> (ItemTrait, Referrer) {
+    /// under the lifetime of a reference without it. Returns its Referrer and top-level context.
+    fn both() -> (Referrer, ContextId) {
         let tr: ItemTrait = parse_quote! {
             trait Tr {
                 fn f<'a, T: ::p::Gat, U>(
@@ -1050,13 +1011,12 @@ mod projection_paths {
                 );
             }
         };
-        let referrer = referrer_of(&tr);
-        (tr, referrer)
+        referrer_in(&tr)
     }
 
     #[test]
-    fn the_referrer_finds_the_entry_in_the_exact_and_in_the_lenient_matching() {
-        let (tr, referrer) = both();
+    fn the_referrer_finds_the_entry_of_a_type_in_a_projection_path() {
+        let (referrer, context) = both();
         let projected = entry(&referrer, "Rel2 < U >", "< U >");
         let around = entry(&referrer, "Rel2 < U >", "< 'a , U : 'a >");
         assert_ne!(projected, around);
@@ -1105,37 +1065,29 @@ mod projection_paths {
             ),
         ];
         for (item, ix) in cases {
-            for mode in MODES {
-                let copy = rewrite(&referrer, &tr.generics, mode, &item);
-                assert!(!copy.contains("Rel2"), "{:?}: {}", mode, copy);
-                assert!(
-                    copy.contains(&format!("P < {} >", ix)),
-                    "{:?}: {} has not P<{}>",
-                    mode,
-                    copy,
-                    ix
-                );
-                let other = if ix == around { projected } else { around };
-                assert!(
-                    !copy.contains(&format!("P < {} >", other)),
-                    "{:?}: {}",
-                    mode,
-                    copy
-                );
-            }
+            let copy = rewrite(&referrer, context, &item);
+            assert!(!copy.contains("Rel2"), "{}", copy);
+            assert!(
+                copy.contains(&format!("P < {} >", ix)),
+                "{} has not P<{}>",
+                copy,
+                ix
+            );
+            let other = if ix == around { projected } else { around };
+            assert!(!copy.contains(&format!("P < {} >", other)), "{}", copy);
         }
     }
 
     #[test]
     fn the_referrer_finds_the_entry_with_the_generics_of_the_method_declared() {
         // The generics of the method are declared where its signature is copied, those of the
-        // trait are not (`Lenient`), or are the root (`Exact`).
+        // trait are the context's.
         let tr: ItemTrait = parse_quote! {
             trait Tr<T: ::p::Gat> {
                 fn f<'a, U>(&self, x: ::core::cell::Ref<'a, T::A<Rel2<U>>>);
             }
         };
-        let referrer = referrer_of(&tr);
+        let (referrer, context) = referrer_in(&tr);
         assert_eq!(contexts_of(&referrer, "Rel2 < U >"), ["< U >"]);
         let sig: Signature = parse_quote!(
             fn f<'a, U>(&self, x: ::core::cell::Ref<'a, T::A<Rel2<U>>>)
@@ -1144,99 +1096,140 @@ mod projection_paths {
             let ix = proc_macro2::Literal::usize_unsuffixed(ix);
             parse_quote!(P<#ix>)
         };
-        for mut visitor in [
-            referrer.clone().into_visitor(None, None, replace),
-            referrer
-                .clone()
-                .into_visitor(None, None, replace)
-                .with_outermost_generics_as_leakers(),
-            referrer
-                .clone()
-                .into_visitor_with_root(&tr.generics, None, None, replace),
-        ] {
-            let mut copy = sig.clone();
-            visitor.visit_signature_mut(&mut copy);
-            assert!(!s(&copy).contains("Rel2"), "{}", s(&copy));
-        }
+        let mut copy = sig.clone();
+        referrer
+            .visitor(context, replace)
+            .visit_signature_mut(&mut copy);
+        assert!(!s(&copy).contains("Rel2"), "{}", s(&copy));
     }
 
     #[test]
-    fn the_referrer_finds_the_entry_with_nothing_declared() {
-        // `T` is not declared where the type is looked up, and the entry (`Rel2<U>`) does not
-        // mention it, so the Referrer cannot know it is a type parameter of the Leaker: it assumes
-        // it where the type is not found otherwise.
+    fn a_generic_which_no_scope_declares_is_not_assumed() {
+        // The generics of the method are not those of the context, so `expand()`, which has
+        // nothing else, does not find the entry (`Rel2<U>` with `<U>`): `U` is no generic there,
+        // and `T` is no type parameter. The Referrer used to assume what no scope declared.
         let tr: ItemTrait = parse_quote! {
             trait Tr {
                 fn f<'a, T: ::p::Gat, U>(&self, x: ::core::cell::Ref<'a, T::A<Rel2<U>>>);
             }
         };
-        let referrer = referrer_of(&tr);
+        let (referrer, context) = referrer_in(&tr);
         let projected = entry(&referrer, "Rel2 < U >", "< U >");
-        let expand = |ty: Type| -> String {
-            s(&referrer.expand(ty, |_, ix| {
-                let ix = proc_macro2::Literal::usize_unsuffixed(ix);
-                parse_quote!(P<#ix>)
-            }))
+        let replace = |_: Type, ix: usize| -> Type {
+            let ix = proc_macro2::Literal::usize_unsuffixed(ix);
+            parse_quote!(P<#ix>)
         };
+        let expand = |ty: Type| -> String { s(&referrer.expand(context, ty, replace)) };
         for ty in [
             parse_quote!(::core::cell::Ref<'a, T::A<Rel2<U>>>),
             parse_quote!(&'a T::A<Rel2<U>>),
             parse_quote!(&'a ::std::vec::Vec<T::A<Rel2<U>>>),
             parse_quote!(&'a T::A::B<(u8, Rel2<U>)>),
             parse_quote!(::core::cell::Ref<'a, ::std::vec::Vec<T::A<Rel2<U>>>>),
+            parse_quote!(::core::cell::Ref<'a, Rel2<U>>),
         ] {
             let ty: Type = ty;
-            assert!(!expand(ty.clone()).contains("Rel2"), "{}", s(&ty));
-            assert!(
-                expand(ty.clone()).contains(&format!("P < {} >", projected)),
-                "{}",
-                s(&ty)
-            );
+            assert!(expand(ty.clone()).contains("Rel2"), "{}", s(&ty));
         }
-        // Another name is no better than `T`: the type could be one of the Leaker's.
-        assert!(!expand(parse_quote!(::core::cell::Ref<'a, X::A<Rel2<U>>>)).contains("Rel2"));
-        // Without any projection, the type under the lifetime of a reference is no entry of this
-        // Referrer, whereas under a path it is the one with nothing around it.
-        assert!(expand(parse_quote!(&'a ::std::vec::Vec<Rel2<U>>)).contains("Rel2"));
-        assert!(!expand(parse_quote!(::core::cell::Ref<'a, Rel2<U>>)).contains("Rel2"));
+        // The signatures which declare the generics of the method find it.
+        let rewrite_sig = |sig: Signature| -> String {
+            let mut sig = sig;
+            referrer
+                .clone()
+                .visitor(context, replace)
+                .visit_signature_mut(&mut sig);
+            s(&sig)
+        };
+        let copy = rewrite_sig(parse_quote!(
+            fn f<'a, T: ::p::Gat, U>(&self, x: ::core::cell::Ref<'a, T::A<Rel2<U>>>)
+        ));
+        assert!(!copy.contains("Rel2"), "{}", copy);
+        assert!(copy.contains(&format!("P < {} >", projected)), "{}", copy);
+        // Under the lifetime of a reference, a head which is declared (here by the method) is a
+        // projection, which carries no bound: the entry found is the one without it. A head
+        // which no scope declares is an ordinary path, so the lifetime is passed on, and there is
+        // no entry for it in this trait.
+        let copy = rewrite_sig(parse_quote!(
+            fn f<'a, T: ::p::Gat, U>(&self, x: &'a T::A<Rel2<U>>)
+        ));
+        assert!(copy.contains(&format!("P < {} >", projected)), "{}", copy);
+        let copy = rewrite_sig(parse_quote!(
+            fn f<'a, U>(&self, x: &'a X::A<Rel2<U>>)
+        ));
+        assert!(copy.contains("Rel2"), "{}", copy);
     }
 
     #[test]
-    fn an_entry_with_the_bound_wins_where_the_name_may_be_anything() {
-        // Both types are in the Leaker: with nothing declared, `X::A<Rel2<U>>` may be a path
-        // which is no projection, so the entry which is stricter is the one found (the copy of
-        // the other would be rejected by rustc if `X` was no type parameter), unless `X` is known
-        // to be a type parameter: declared, or a generic of the outermost item.
-        let (tr, referrer) = both();
+    fn the_head_of_a_projection_is_a_type_parameter_if_a_scope_declares_it() {
+        // `T` and `U` are declared by the trait, so they are the context's; `'a` is the method's.
+        // Both types are in the Leaker.
+        let tr: ItemTrait = parse_quote! {
+            trait Tr<T: ::p::Gat, U> {
+                fn f<'a>(&self, x: &'a T::A<Rel2<U>>, y: &'a ::std::vec::Vec<Rel2<U>>);
+            }
+        };
+        let (referrer, context) = referrer_in(&tr);
         let projected = entry(&referrer, "Rel2 < U >", "< U >");
         let around = entry(&referrer, "Rel2 < U >", "< 'a , U : 'a >");
-        let ty: Type = parse_quote!(&'a T::A<Rel2<U>>);
+        assert_ne!(projected, around);
         let replace = |_: Type, ix: usize| -> Type {
             let ix = proc_macro2::Literal::usize_unsuffixed(ix);
             parse_quote!(P<#ix>)
         };
-        assert!(s(&referrer.expand(ty, replace)).contains(&format!("P < {} >", around)));
+        let rewrite_sig = |sig: Signature| -> String {
+            let mut sig = sig;
+            referrer
+                .clone()
+                .visitor(context, replace)
+                .visit_signature_mut(&mut sig);
+            s(&sig)
+        };
+        // A head which a scope declares (here, the trait) is a projection: nothing is carried
+        // from the reference.
+        let copy = rewrite_sig(parse_quote!(fn f<'a>(&self, x: &'a T::A<Rel2<U>>)));
+        assert!(copy.contains(&format!("P < {} >", projected)), "{}", copy);
+        // An undeclared one is an ordinary path, so the lifetime is passed on: the stricter entry
+        // is the one (the copy of the other would be rejected by rustc if `X` was no type
+        // parameter).
+        let copy = rewrite_sig(parse_quote!(fn f<'a>(&self, x: &'a X::A<Rel2<U>>)));
+        assert!(copy.contains(&format!("P < {} >", around)), "{}", copy);
         // With a path's lifetime there is no bound to be stricter by: the entry of the projection.
-        let ty: Type = parse_quote!(::core::cell::Ref<'a, T::A<Rel2<U>>>);
-        assert!(s(&referrer.expand(ty, replace)).contains(&format!("P < {} >", projected)));
-        // The generics of the item are known to the visitor, declared or not.
+        let copy = rewrite_sig(parse_quote!(
+            fn f<'a>(&self, x: ::core::cell::Ref<'a, X::A<Rel2<U>>>)
+        ));
+        assert!(copy.contains(&format!("P < {} >", projected)), "{}", copy);
+        // `T` shadowed by the method is declared there, and it is a type parameter too.
+        let copy = rewrite_sig(parse_quote!(fn f<'a, T>(&self, x: &'a T::A<Rel2<U>>)));
+        assert!(copy.contains(&format!("P < {} >", projected)), "{}", copy);
+        // And a const parameter of the method is not.
+        let copy = rewrite_sig(parse_quote!(fn f<'a, const T: usize>(&self, x: &'a T::A<Rel2<U>>)));
+        assert!(copy.contains(&format!("P < {} >", around)), "{}", copy);
+        // `expand()` has the generics of the context only.
+        let expand = |ty: Type| -> String { s(&referrer.expand(context, ty, replace)) };
+        assert!(expand(parse_quote!(T::A<Rel2<U>>)).contains(&format!("P < {} >", projected)));
+        // The copy of the trait declares its generics as they are (so it is the scope), or with
+        // other bounds, which are those of the context with the outermost generics as leakers.
         let item: Item = parse_quote!(
-            struct F<'a, T: ::p::Gat, U>(::core::cell::Ref<'a, T::A<Rel2<U>>>);
+            trait Tr<T: ::p::Gat, U> {
+                fn f<'a>(&self, x: &'a T::A<Rel2<U>>);
+            }
         );
-        for mode in MODES {
-            let copy = rewrite(&referrer, &tr.generics, mode, &item);
-            assert!(
-                copy.contains(&format!("P < {} >", projected)),
-                "{:?}: {}",
-                mode,
-                copy
-            );
-        }
+        let copy = rewrite(&referrer, context, &item);
+        assert!(copy.contains(&format!("P < {} >", projected)), "{}", copy);
+        assert!(!copy.contains("Rel2"), "{}", copy);
+        let item: Item = parse_quote!(
+            impl<T: ::p::Gat + ::core::clone::Clone, U> Tr<T, U> for W {
+                fn f<'a>(&self, x: &'a T::A<Rel2<U>>) {}
+            }
+        );
+        let copy = rewrite_as_leakers(&referrer, context, &item);
+        assert!(copy.contains(&format!("P < {} >", projected)), "{}", copy);
+        assert!(!copy.contains("Rel2"), "{}", copy);
     }
 
     #[test]
     fn the_entries_survive_serialization() {
-        let (_, referrer) = both();
+        let (referrer, context) = both();
         let tokens = referrer.to_token_stream();
         let parsed: Referrer = parse2(tokens).unwrap();
         assert_eq!(parsed, referrer);
@@ -1248,9 +1241,7 @@ mod projection_paths {
             parse_quote!(P<#ix>)
         };
         let mut copy = item.clone();
-        parsed
-            .into_visitor(None, None, replace)
-            .visit_item_mut(&mut copy);
+        parsed.visitor(context, replace).visit_item_mut(&mut copy);
         assert!(!s(&copy).contains("Rel2"), "{}", s(&copy));
     }
 }

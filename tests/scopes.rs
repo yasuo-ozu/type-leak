@@ -108,9 +108,15 @@ fn a_struct_an_enum_and_a_union_declare_self_as_the_item() {
             "{}",
             kind
         );
-        // The top-level context has the generics of the item, and no `Self`.
+        // The top-level context has the generics of the item and, as an entry names `Self`, what
+        // `Self` is: it is the context of the entry.
         assert_eq!(s(referrer.context_generics(context)), "< 'a , T >");
-        assert!(referrer.context_self(context).is_none());
+        assert_eq!(context, referrer.context(0));
+        assert_eq!(
+            referrer.context_self(context),
+            referrer.context_self(referrer.context(0))
+        );
+        assert!(referrer.context_self(context).is_some());
     }
 }
 
@@ -1005,7 +1011,7 @@ fn module_path_and_hint() {
 #[test]
 fn the_visitor_enters_the_module_by_its_id() {
     use syn::visit_mut::VisitMut;
-    // The modules `a` and `b` have `Rel` each, entered by `enter_mod()`.
+    // The modules `a` and `b` have `Rel` each, entered by `enter_mod()`, and `empty` has none.
     let mut leaker = Leaker::new();
     let (a, ()) = leaker
         .enter_mod("a", [], |view| view.visit_type(&parse_quote!(Rel)))
@@ -1013,12 +1019,13 @@ fn the_visitor_enters_the_module_by_its_id() {
     let (b, ()) = leaker
         .enter_mod("b", [], |view| view.visit_type(&parse_quote!(Rel)))
         .unwrap();
+    let (empty, ()) = leaker.enter_mod("empty", [], |_| ()).unwrap();
     let referrer = leaker.finish();
     assert_eq!(referrer.iter().count(), 2);
-    let copy = |module: Option<ContextId>| {
-        let mut visitor = referrer.clone().into_visitor(None, module, |_, ix| {
-            parse_str(&format!("P{}", ix)).unwrap()
-        });
+    let copy = |module: ContextId| {
+        let mut visitor = referrer
+            .clone()
+            .visitor(module, |_, ix| parse_str(&format!("P{}", ix)).unwrap());
         let mut item: ItemStruct = parse_quote!(
             struct C {
                 y: Rel,
@@ -1029,13 +1036,11 @@ fn the_visitor_enters_the_module_by_its_id() {
     };
     let in_a = referrer.context_module(referrer.context(0)) == Some(a);
     let (first, second) = if in_a { (a, b) } else { (b, a) };
-    assert_eq!(copy(Some(first)), "struct C { y : P0 , }");
-    assert_eq!(copy(Some(second)), "struct C { y : P1 , }");
-    // An unknown module: the entries are of two modules, so the visitor does not choose (the first
-    // was found before the module was given when the visitor was created).
-    assert_eq!(copy(None), "struct C { y : Rel , }");
-    // A module which is not one of those of the entries.
-    assert_eq!(copy(Some(id(99))), "struct C { y : Rel , }");
+    assert_eq!(copy(first), "struct C { y : P0 , }");
+    assert_eq!(copy(second), "struct C { y : P1 , }");
+    // A module which is not one of those of the entries: only the entries with no module match
+    // there, and `Rel` is in a module.
+    assert_eq!(copy(empty), "struct C { y : Rel , }");
 }
 
 #[test]
@@ -1056,10 +1061,8 @@ fn the_visitor_finds_the_modules_found_in_a_module_by_their_names() {
         })
         .unwrap();
     let referrer = leaker.finish();
-    let copy = |item: &ItemMod, module: Option<ContextId>| {
-        let mut visitor = referrer
-            .clone()
-            .into_visitor(None, module, |_, _| parse_quote!(P));
+    let copy = |item: &ItemMod, module: ContextId| {
+        let mut visitor = referrer.clone().visitor(module, |_, _| parse_quote!(P));
         let mut item = item.clone();
         visitor.visit_item_mod_mut(&mut item);
         s(&item)
@@ -1073,14 +1076,11 @@ fn the_visitor_finds_the_modules_found_in_a_module_by_their_names() {
     );
     let rewritten = s(&rewritten);
     let unchanged = s(&inner);
-    // A copy of `outer` with `inner` in it: the root node is `outer`, and `inner` is looked up by
-    // its name below it.
-    let wrap = |item: &ItemMod| -> ItemMod { parse_quote!(mod outer { #item }) };
-    let wrapped =
-        |text: &str| s(&parse_str::<ItemMod>(&format!("mod outer {{ {} }}", text)).unwrap());
-    assert_eq!(copy(&wrap(&inner), Some(outer)), wrapped(&rewritten));
-    // Not below it, or below a module which has no entry: the entry of `inner` is not found.
-    assert_eq!(copy(&wrap(&inner), Some(id(99))), wrapped(&unchanged));
+    // `inner` is a module in `outer`, the module of the context: it is looked up by its name below
+    // it.
+    assert_eq!(copy(&inner, outer), rewritten);
+    // A module of another name is not one that the Leaker saw below `outer`: no entry depends on
+    // it, and the entry of `inner` is not found there.
     let other: ItemMod = parse_quote!(
         mod other {
             pub struct C {
@@ -1088,16 +1088,17 @@ fn the_visitor_finds_the_modules_found_in_a_module_by_their_names() {
             }
         }
     );
-    assert_eq!(copy(&wrap(&other), Some(outer)), wrapped(&s(&other)));
-    // The root node visited is the module which is given, not one nested in it: `inner` alone is
-    // `outer`, which has no entry, and it is `inner` if its own id is given.
+    assert_eq!(copy(&other, outer), s(&other));
+    // The visited `mod` item is never the module of the context. `outer` below `outer` is not a
+    // module which the Leaker saw, so nothing in it is found, `inner` neither. Neither is `inner`
+    // below `inner`, the module of the entry.
+    let wrapped =
+        |text: &str| s(&parse_str::<ItemMod>(&format!("mod outer {{ {} }}", text)).unwrap());
+    let wrap = |item: &ItemMod| -> ItemMod { parse_quote!(mod outer { #item }) };
+    assert_eq!(copy(&wrap(&inner), outer), wrapped(&unchanged));
     let inner_id = referrer.context_module(referrer.context(0)).unwrap();
     assert_ne!(inner_id, outer);
-    assert_eq!(copy(&inner, Some(outer)), unchanged);
-    assert_eq!(copy(&inner, Some(inner_id)), rewritten);
-    assert_eq!(copy(&other, Some(outer)), s(&other));
-    // The module is not known: it is found anyway (there is no other entry).
-    assert_eq!(copy(&inner, None), rewritten);
+    assert_eq!(copy(&inner, inner_id), unchanged);
 }
 
 #[test]
@@ -1112,7 +1113,7 @@ fn modules_are_serialized() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&m).unwrap();
+    let root = leaker.intern_mod(&m).unwrap();
     let (hinted, ()) = leaker
         .enter_mod("with \"quotes\"", [], |view| {
             view.visit_type(&parse_quote!(Rel2));
@@ -1140,29 +1141,26 @@ fn modules_are_serialized() {
     let text = tokens.to_string();
     assert!(text.contains("mod { path = [] }"), "{}", text);
     assert!(text.contains("hint = \"nested\" , parent ="), "{}", text);
-    // The module is used to find the entries after the round trip.
+    // The module is used to find the entries after the round trip: the items of `m` are visited
+    // in the context of `m`, and `inner` is looked up by its name below it.
     use syn::visit_mut::VisitMut;
     let mut item: ItemMod = parse_quote!(
-        mod m {
-            pub mod inner {
-                pub struct C {
-                    y: Rel,
-                }
+        mod inner {
+            pub struct C {
+                y: Rel,
             }
         }
     );
     parsed
         .clone()
-        .into_visitor(None, None, |_, _| parse_quote!(P))
+        .visitor(root, |_, _| parse_quote!(P))
         .visit_item_mod_mut(&mut item);
     assert_eq!(
         s(&item),
         s(&parse_quote!(
-            mod m {
-                pub mod inner {
-                    pub struct C {
-                        y: P,
-                    }
+            mod inner {
+                pub struct C {
+                    y: P,
                 }
             }
         ) as &ItemMod)
@@ -1171,16 +1169,26 @@ fn modules_are_serialized() {
 
 #[test]
 fn the_format_of_the_previous_version_is_rejected() {
-    assert_eq!(Referrer::FORMAT_VERSION, 2);
+    assert_eq!(Referrer::FORMAT_VERSION, 3);
     // The serialized form of a module in the format 1.
     let old: proc_macro2::TokenStream =
         "\"type-leak-format-1\" 2 mod self ; (Rel) mod a :: b ; (Rel)"
             .parse()
             .unwrap();
     let err = parse2::<Referrer>(old).err().unwrap();
-    assert!(err.to_string().contains("format 1, expected 2"), "{}", err);
+    assert!(err.to_string().contains("format 1, expected 3"), "{}", err);
+    // The format 2 had the same grammar, but its top-level contexts did not tell `Self` or the
+    // module of the scope, which the visitor needs.
+    let old: proc_macro2::TokenStream =
+        "\"type-leak-format-2\" 2 mod { path = [] } ; () mod 0 ; (Rel)"
+            .parse()
+            .unwrap();
+    let err = parse2::<Referrer>(old).err().unwrap();
+    assert!(err.to_string().contains("format 2, expected 3"), "{}", err);
     // And one without a module is too.
     let old: proc_macro2::TokenStream = "\"type-leak-format-1\" (MyType)".parse().unwrap();
+    assert!(parse2::<Referrer>(old).is_err());
+    let old: proc_macro2::TokenStream = "\"type-leak-format-2\" (MyType)".parse().unwrap();
     assert!(parse2::<Referrer>(old).is_err());
     let current = format!("\"type-leak-format-{}\" (MyType)", Referrer::FORMAT_VERSION);
     assert!(parse_str::<Referrer>(&current).is_ok());
