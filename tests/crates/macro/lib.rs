@@ -143,7 +143,7 @@ pub fn leak_strict(
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
     let item_trait = parse_macro_input!(item as ItemTrait);
-    match Leaker::from_trait(&item_trait) {
+    match Leaker::new().intern_trait(&item_trait, true) {
         Ok(_) => quote!(#item_trait).into(),
         Err(e) => quote!(#e).into(),
     }
@@ -249,9 +249,9 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         config
     });
     let result = match &item {
-        Item::Trait(item) => leaker.intern_with(&item.generics, |v| v.visit_item_trait(item)),
-        Item::Struct(item) => leaker.intern_with(&item.generics, |v| v.visit_item_struct(item)),
-        Item::Mod(item) => leaker.intern_with(&Generics::default(), |v| v.visit_item_mod(item)),
+        Item::Trait(item) => leaker.intern_trait(item, true),
+        Item::Struct(item) => leaker.intern_struct(item, true),
+        Item::Mod(item) => leaker.intern_mod(item),
         _ => return quote!(compile_error!("unsupported item");).into(),
     };
     let got: std::result::Result<Vec<String>, String> = match result {
@@ -303,7 +303,7 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
         config
     });
     leaker
-        .intern_with(&item_trait.generics, |v| v.visit_item_trait(&item_trait))
+        .intern_trait(&item_trait, true)
         .map_err(Error::from)?;
     // Compile-time checks of the Leaker's assumptions (e.g. that `u8` is not shadowed).
     let assertions = leaker.assertions();
@@ -370,7 +370,7 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
             Some(SelfRequirement::Type(self_ty)) => quote! {
                 impl<#(#impl_params),*> #repeater<#encoded, #id, #ix> for #self_ty
             },
-            // `Call` is not tied to a type.
+            // `None`: the implementation is for any type.
             _ => quote! {
                 impl<#(#impl_params,)* __S: ?::core::marker::Sized>
                     #repeater<#encoded, #id, #ix> for __S
@@ -718,9 +718,10 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
     let mut error = None;
     let mut copies = TokenStream::new();
     for mut item in items {
-        let mut visitor = referrer
-            .clone()
-            .into_visitor(Some(SelfRequirement::Bound(self_path.clone())), |_, ix| {
+        let mut visitor = referrer.clone().into_visitor(
+            Some(SelfRequirement::Bound(self_path.clone())),
+            None,
+            |_, ix| {
                 let projection = (|| -> Result<Type> {
                     let args = referrer.generic_args(ix, params, &trait_params)?;
                     let encoded = slots.encode_generics_args_to_ty_with_self(
@@ -735,7 +736,8 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
                     error = Some(e);
                     parse_quote!(())
                 })
-            });
+            },
+        );
         if let Some(self_ty) = &self_ty {
             visitor = visitor.with_self(self_ty.clone());
         }
@@ -856,11 +858,11 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         // the replacement would break the lookup of leaked types (keyed by the parameters'
         // names), and substituting after it would rewrite the projections.
         let mut sig = trait_fn.sig.clone();
-        let mut visitor = referrer
-            .clone()
-            .into_visitor(Some(SelfRequirement::Bound(self_path.clone())), |_, ix| {
-                parse_quote!(__TypeLeakTestPlaceholder<#ix>)
-            });
+        let mut visitor = referrer.clone().into_visitor(
+            Some(SelfRequirement::Bound(self_path.clone())),
+            None,
+            |_, ix| parse_quote!(__TypeLeakTestPlaceholder<#ix>),
+        );
         visitor.visit_signature_mut(&mut sig);
         substitute.visit_signature_mut(&mut sig);
         Resolve {

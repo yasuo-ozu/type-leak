@@ -4,6 +4,7 @@
 #[cfg(type_leak_diagnostic)]
 extern crate proc_macro;
 
+mod analysis;
 mod analyze;
 mod config;
 mod context;
@@ -14,10 +15,11 @@ mod leaker;
 mod referrer;
 mod repeater;
 mod util;
+mod view;
 
 pub use syn;
 
-pub use crate::analyze::CheckResult;
+pub use crate::analysis::CheckResult;
 pub use crate::config::LeakerConfig;
 pub use crate::context::{ContextId, SelfRequirement};
 pub use crate::encode::{
@@ -29,3 +31,4 @@ pub use crate::error::NotInternableError;
 pub use crate::leaker::Leaker;
 pub use crate::referrer::{Referrer, Visitor};
 pub use crate::repeater::{repeater_definition, RepeaterSlots};
+pub use crate::view::View;

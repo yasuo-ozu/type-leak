@@ -20,7 +20,7 @@ fn leaker_config() -> LeakerConfig {
 fn leak_trait(item_trait: &ItemTrait) -> std::result::Result<BTreeSet<String>, String> {
     let mut leaker = Leaker::from_config(leaker_config());
     leaker
-        .intern_with(&item_trait.generics, |v| v.visit_item_trait(item_trait))
+        .intern_trait(item_trait, true)
         .map_err(|e| e.to_string())?;
     leaker.reduce_roots();
     Ok(leaker
@@ -224,7 +224,8 @@ fn limit_shadowed_primitive() {
     .unwrap();
     assert_eq!(leak_trait(&item), Ok(BTreeSet::new()));
 
-    let (leaker, _) = Leaker::from_trait(&item).unwrap();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true).unwrap();
     let expected = quote! {
         #[allow(dead_code, non_snake_case)]
         const _: () = {
@@ -245,7 +246,7 @@ fn limit_shadowed_primitive() {
 fn leak_error_default(item_trait: &ItemTrait) -> Option<(String, Option<String>)> {
     let mut leaker = Leaker::new();
     leaker
-        .intern_with(&item_trait.generics, |v| v.visit_item_trait(item_trait))
+        .intern_trait(item_trait, true)
         .err()
         .map(|e| (e.to_string(), e.note()))
 }
@@ -360,11 +361,7 @@ fn note_in_syn_error() {
     })
     .unwrap();
     let mut leaker = Leaker::new();
-    let err: syn::Error = leaker
-        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
-        .err()
-        .unwrap()
-        .into();
+    let err: syn::Error = leaker.intern_trait(&item, true).err().unwrap().into();
     assert_eq!(
         err.to_string(),
         "use absolute path: 'Clone'\n\n  = note: use `::core::clone::Clone` instead of `Clone`\n"
@@ -375,11 +372,7 @@ fn note_in_syn_error() {
     })
     .unwrap();
     let mut leaker = Leaker::new();
-    let err: syn::Error = leaker
-        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
-        .err()
-        .unwrap()
-        .into();
+    let err: syn::Error = leaker.intern_trait(&item, true).err().unwrap().into();
     assert_eq!(err.to_string(), "use absolute path: 'MyBound'");
 }
 
@@ -391,10 +384,7 @@ fn error_to_tokens() {
     })
     .unwrap();
     let mut leaker = Leaker::new();
-    let err = leaker
-        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
-        .err()
-        .unwrap();
+    let err = leaker.intern_trait(&item, true).err().unwrap();
     let tokens = quote!(#err).to_string();
     assert!(tokens.contains("compile_error"), "{}", tokens);
     assert!(
@@ -442,10 +432,7 @@ fn all_relative_paths_are_reported() {
     })
     .unwrap();
     let mut leaker = Leaker::new();
-    let err = leaker
-        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
-        .err()
-        .unwrap();
+    let err = leaker.intern_trait(&item, true).err().unwrap();
     let conflicts = match &err {
         NotInternableError::RelativePath(conflicts) => conflicts,
         _ => panic!("{:?}", err),
@@ -503,7 +490,7 @@ fn notes_explain_conflicts() {
         }
     })
     .unwrap();
-    let err = Leaker::from_trait(&item).err().unwrap();
+    let err = Leaker::new().intern_trait(&item, true).err().unwrap();
     // The suggestion of the absolute path comes first.
     assert_eq!(
         err.note().as_deref(),

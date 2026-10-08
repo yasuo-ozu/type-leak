@@ -8,87 +8,20 @@ use syn::spanned::Spanned;
 use syn::*;
 use template_quote::quote;
 
-/// Encode [`GenericArgument`]s to a type, using `const_fn` to encode const arguments.
+/// Encodes generic arguments into the type that [`encode_generics_params_to_ty_with()`] gives for
+/// `params`.
 ///
-/// `params` are the [`GenericParam`]s corresponding to `iter`: the generics of the Leaker, in the
-/// form the Leaker encodes them with [`encode_generics_params_to_ty_with()`] (see below for where
-/// they come from in the Referrer). They are required, as the encoding of the arguments is that
-/// of the parameters with the arguments substituted, which cannot be told from the arguments
-/// alone: which of them is bounded by which (the lifetime bounds of the parameters are part of the
-/// encoding), whether a bare identifier is a const, and what an omitted argument is.
+/// `params` are the generics the Leaker encoded: `Referrer::generics()` of an entry with the
+/// arguments of `Referrer::generic_args()`, or `Referrer::context_generics()` of the top-level
+/// context. `const_fn` encodes each const argument as it did for the parameters.
+/// Arguments match by position, lifetimes first. A bare identifier for a const parameter is a
+/// const argument, and bindings such as `Item = u8` are skipped. Omitted arguments take the
+/// defaults of `params`, so complete the arguments of a context with `Referrer::complete_args()`.
+/// Bounds are encoded with the arguments substituted: `T: 'a` with `'static` and `u8` is
+/// `&'static u8`. `Self: 'a` is not: use [`encode_generics_args_to_ty_with_self()`].
 ///
-/// The result is the same type as [`encode_generics_params_to_ty_with()`] with `params`
-/// substituted by `iter`, as [`RepeaterSlots::encode_generics_args_to_ty()`] does, and `const_fn`
-/// must return the same type as the `const_fn` passed there for the same value (it receives each
-/// const argument together with its [`ConstParam`]):
-///
-/// - Arguments are matched with parameters by position (lifetime arguments with lifetime
-///   parameters, and the others with type and const parameters).
-/// - A bare identifier corresponding to a const parameter (e.g. `N` in `MyTrait<N>`, which is
-///   parsed as a type argument) is treated as a const argument.
-/// - Omitted arguments take the parameters' defaults (the generics of a context have none, see
-///   [`Referrer::complete_args()`]).
-/// - Associated item bindings and constraints (e.g. `Item = u8`) are skipped.
-/// - The lifetime bounds of `params` are encoded after the parameters, with the arguments
-///   substituted: `T: 'a` with the arguments `'static` and `u8` is encoded as `&'static u8`, and
-///   `'b: 'a` as `&'a &'b ()` (see [`encode_generics_params_to_ty_with()`]).
-///
-/// [`EncodeError`] is returned if there are too many arguments, or a missing argument without a
-/// default, or if the argument of a type with such a bound is a trait object without a lifetime
-/// bound (e.g. `dyn Tr`): its lifetime bound would default to the lifetime of the reference
-/// (`&'a dyn Tr` is `&'a (dyn Tr + 'a)`), which is not the one in the other elements of the type,
-/// so write the bound (e.g. `dyn Tr + 'static`).
-///
-/// The `impl` of the Repeater declares the generics without the encoded bounds (see
-/// [`Referrer::impl_generics()`]).
-///
-/// `Self: 'a` (see [`Referrer::context_self_outlives()`]) is not encoded: use
-/// [`encode_generics_args_to_ty_with_self()`].
-///
-/// # Getting `params` in the Referrer
-///
-/// The parameters are those the Leaker encoded. A Referrer which has the arguments of one of its
-/// entries gets them with [`Referrer::generics()`] (and the arguments of its generics from
-/// [`Referrer::generic_args()`]). One which encodes the arguments of the Leaker's trait for every
-/// entry (e.g. `MyTrait<u8, 3>` of an `impl`) uses the generics of the top-level context
-/// returned by [`Leaker::from_trait()`] and the other methods of the Leaker, which the Leaker
-/// passes along with the Referrer (a [`ContextId`] is written and parsed as an integer): see
-/// [`Referrer::context_generics()`]. As they have no defaults, complete the arguments with
-/// [`Referrer::complete_args()`] first, if some are omitted.
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// # use template_quote::quote;
-/// let generics: Generics = parse_quote!(<T, const N: usize, const M: usize = 3>);
-/// let args: AngleBracketedGenericArguments = parse_quote!(<u8, N>);
-/// let ty = encode_generics_args_to_ty_with(&args.args, &generics.params, |expr, _| {
-///     parse_quote!([(); #expr])
-/// })
-/// .unwrap();
-/// let expected: Type = parse_quote!((u8, [(); N], [(); 3]));
-/// assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
-///
-/// // A lifetime bound is encoded with the arguments substituted.
-/// let generics: Generics = parse_quote!(<'a, T: 'a>);
-/// let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8>);
-/// let ty = encode_generics_args_to_ty_with(&args.args, &generics.params, |_, _| {
-///     unreachable!()
-/// })
-/// .unwrap();
-/// let expected: Type = parse_quote!((&'static (), u8, &'static u8));
-/// assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
-/// ```
-///
-/// [`RepeaterSlots::encode_generics_args_to_ty()`]: crate::RepeaterSlots::encode_generics_args_to_ty
-/// [`Leaker::from_trait()`]: crate::Leaker::from_trait
-/// [`ContextId`]: crate::ContextId
-/// [`Referrer::generics()`]: crate::Referrer::generics
-/// [`Referrer::generic_args()`]: crate::Referrer::generic_args
-/// [`Referrer::complete_args()`]: crate::Referrer::complete_args
-/// [`Referrer::context_generics()`]: crate::Referrer::context_generics
-/// [`Referrer::impl_generics()`]: crate::Referrer::impl_generics
-/// [`Referrer::context_self_outlives()`]: crate::Referrer::context_self_outlives
+/// Fails with [`EncodeError`] for too many or missing arguments, and with
+/// [`EncodeError::UnboundedTraitObject`] for a trait object argument without a lifetime bound.
 pub fn encode_generics_args_to_ty_with<'a, 'b>(
     iter: impl IntoIterator<Item = &'a GenericArgument>,
     params: &'b Punctuated<GenericParam, Token![,]>,
@@ -97,41 +30,15 @@ pub fn encode_generics_args_to_ty_with<'a, 'b>(
     encode_generics_args_with_params(iter, params, None, |value, cp| Ok(const_fn(value, cp)))
 }
 
-/// Like [`encode_generics_args_to_ty_with()`], with `Self: 'a` for each lifetime of `self_outlives`
-/// (the lifetimes of [`Referrer::context_self_outlives()`], which are parameters of `params`)
-/// encoded after the lifetime bounds as `&'b Self`, where `'b` is the argument of `'a` and `Self`
-/// is `self_ty`: the type whose Repeater is used, i.e. `Self` in the implementation of the
-/// Leaker's trait. It is the same type as the encoding of
-/// [`encode_generics_params_to_ty_with_self()`] (see there), the same as
-/// [`RepeaterSlots::encode_generics_args_to_ty_with_self()`] encodes, with the same arguments but
-/// `const_fn`, which is the last.
+/// Like [`encode_generics_args_to_ty_with()`], but also encodes `Self: 'a`.
 ///
-/// A lifetime which is not a parameter of `params` is skipped, like a lifetime bound by one.
-/// [`EncodeError::UnboundedTraitObject`] is returned if `self_ty` is a trait object without a
-/// lifetime bound (its lifetime would default to the lifetime of the reference), as for the
-/// arguments.
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// # use template_quote::quote;
-/// let generics: Generics = parse_quote!(<'a, const N: usize>);
-/// // For `impl<'q> MyLeaker<'q, 3> for ..`, where the Leaker's `'a` is `'q`
-/// let args: AngleBracketedGenericArguments = parse_quote!(<'q, 3>);
-/// let ty = encode_generics_args_to_ty_with_self(
-///     &args.args,
-///     &generics.params,
-///     &parse_quote!(Self),
-///     &[parse_quote!('a)],
-///     |expr, _| parse_quote!([(); #expr]),
-/// )
-/// .unwrap();
-/// let expected: Type = parse_quote!((&'q (), [(); 3], &'q Self));
-/// assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
-/// ```
-///
-/// [`RepeaterSlots::encode_generics_args_to_ty_with_self()`]: crate::RepeaterSlots::encode_generics_args_to_ty_with_self
-/// [`Referrer::context_self_outlives()`]: crate::Referrer::context_self_outlives
+/// Each lifetime `'a` of `self_outlives` adds `&'b Self` after the bounds, where `'b` is the
+/// argument of `'a`. Pass `Referrer::context_self_outlives()`. `self_ty` is `Self` in the impl of
+/// the Leaker's trait. A lifetime that is not a parameter of `params` is skipped.
+/// It yields the type of [`encode_generics_params_to_ty_with_self()`]. The arguments are those of
+/// `RepeaterSlots::encode_generics_args_to_ty_with_self()`, then `const_fn`. Fails like
+/// [`encode_generics_args_to_ty_with()`], and with [`EncodeError::UnboundedTraitObject`] if
+/// `self_ty` is a trait object without a lifetime bound.
 pub fn encode_generics_args_to_ty_with_self<'a, 'b>(
     iter: impl IntoIterator<Item = &'a GenericArgument>,
     params: &'b Punctuated<GenericParam, Token![,]>,
@@ -144,13 +51,6 @@ pub fn encode_generics_args_to_ty_with_self<'a, 'b>(
     })
 }
 
-/// Encodes `iter` matched with `params`, filling omitted arguments with the defaults (see
-/// [`RepeaterSlots::encode_generics_args_to_ty()`]). `const_fn` encodes a (normalized) const value
-/// of the given parameter. `self_outlives` is `Self` and the lifetimes `'a` (parameters of
-/// `params`) such that `Self: 'a`, which are encoded after the lifetime bounds (see
-/// [`encode_self_outlives()`]).
-///
-/// [`RepeaterSlots::encode_generics_args_to_ty()`]: crate::RepeaterSlots::encode_generics_args_to_ty
 pub(crate) fn encode_generics_args_with_params<'a, 'b>(
     iter: impl IntoIterator<Item = &'a GenericArgument>,
     params: &'b Punctuated<GenericParam, Token![,]>,
@@ -182,14 +82,7 @@ pub(crate) fn encode_generics_args_with_params<'a, 'b>(
     }))
 }
 
-/// Matches `iter` with `params` and returns the complete argument list, one for each parameter
-/// in order: arguments are matched by position (lifetime arguments with lifetime parameters, and
-/// the others with type and const parameters), a bare identifier corresponding to a const
-/// parameter is a const argument (normalized, see [`normalize_const_arg()`]), and an omitted
-/// const argument takes the default, in which the preceding parameters are substituted.
-///
-/// An omitted type argument takes `default_type(index, param, default, substitute, args)`, where
-/// `substitute` substitutes the preceding parameters by their arguments `args`.
+/// Completes `iter` to one argument per parameter. `default_type` makes an omitted type argument.
 pub(crate) fn complete_generics_args<'a>(
     iter: impl IntoIterator<Item = &'a GenericArgument>,
     params: &Punctuated<GenericParam, Token![,]>,
@@ -213,7 +106,6 @@ pub(crate) fn complete_generics_args<'a>(
     }
     let mut lifetime_args = lifetime_args.into_iter();
     let mut other_args = other_args.into_iter();
-    // Substitution of the preceding parameters, used for defaults.
     let mut substitute = SubstituteParams::default();
     let mut completed = Vec::<GenericArgument>::new();
     for (index, param) in params.iter().enumerate() {
@@ -274,14 +166,11 @@ const CONST_PARAM_PRIMITIVES: &[&str] = &[
     "isize",
 ];
 
-/// Returns `true` if `ty` is a primitive type which can be the type of const parameters (e.g.
-/// `bool` or `::core::primitive::bool`), and thus does not depend on the type context.
+/// A primitive that can type a const parameter, so it is context-free.
 pub(crate) fn is_const_param_ty(ty: &Type) -> bool {
     const_param_primitive(ty).is_some()
 }
 
-/// Returns the name of the primitive type if `ty` is a primitive type which can be the type of
-/// const parameters (e.g. `"bool"` for `bool` or `::core::primitive::bool`).
 pub(crate) fn const_param_primitive(ty: &Type) -> Option<&'static str> {
     match unwrap_type_group(ty) {
         Type::Path(TypePath { qself: None, path }) => {
@@ -307,9 +196,7 @@ pub(crate) fn const_param_primitive(ty: &Type) -> Option<&'static str> {
     }
 }
 
-/// Normalizes a const argument: redundant braces are removed from a literal or a single
-/// identifier (e.g. `{ N }` -> `N`), and any other expression is braced (e.g. `i32::MIN` ->
-/// `{ i32::MIN }`), which is required where it could be parsed as a type.
+/// Braces everything but a literal or an identifier, or it could parse as a type.
 pub(crate) fn normalize_const_arg(expr: &Expr) -> Expr {
     let inner = unwrap_block(expr);
     let is_simple = match inner {
@@ -331,7 +218,6 @@ pub(crate) fn normalize_const_arg(expr: &Expr) -> Expr {
     }
 }
 
-/// Removes redundant braces around a const argument, e.g. `{ N }` -> `N`.
 fn unwrap_block(expr: &Expr) -> &Expr {
     match expr {
         Expr::Block(ExprBlock {
@@ -346,122 +232,55 @@ fn unwrap_block(expr: &Expr) -> &Expr {
     }
 }
 
-/// Encode [`GenericParam`]s to a type.
+/// Encodes generic parameters into a tuple type, with `const N: usize` as `[(); N]`.
 ///
-/// A const parameter `N` is encoded as `[(); N]`, which constrains `N` when used in the trait
-/// arguments of an `impl`. Because array lengths are `usize`, this only works for `const N: usize`.
-/// To encode generics of any kind, use [`RepeaterSlots`](crate::RepeaterSlots), or
-/// [`encode_generics_params_to_ty_with()`] with user-defined types.
-///
-/// The lifetime bounds of the parameters are encoded too (see
-/// [`encode_generics_params_to_ty_with()`]), so the `impl` declares the generics without them:
-/// see [`Referrer::impl_generics()`]. `Self: 'a` is not: see
+/// `[(); N]` constrains `N` in the trait arguments of an impl. Array lengths are `usize`, so other
+/// const types need `RepeaterSlots`, or [`encode_generics_params_to_ty_with()`] with your own
+/// types. That function describes the encoding. `Self: 'a` is encoded by
 /// [`encode_generics_params_to_ty_with_self()`]. The Referrer encodes the arguments with
-/// [`encode_generics_args_to_ty_with()`], which requires the same parameters.
+/// [`encode_generics_args_to_ty_with()`], which needs the same parameters.
 ///
-/// [`Referrer::impl_generics()`]: crate::Referrer::impl_generics
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let generics: Generics = parse_quote!(<'a, 'b: 'a, T: 'a + Clone, const N: usize>);
+/// // The bounds follow the parameters.
+/// let ty = encode_generics_params_to_ty(&generics.params);
+/// assert_eq!(ty, parse_quote!((&'a (), &'b (), T, [(); N], &'a &'b (), &'a T)));
+/// ```
 pub fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericParam>) -> Type {
     encode_generics_params_to_ty_with(iter, |ConstParam { ident, .. }| parse_quote!([(); #ident]))
 }
 
-/// Encode [`GenericParam`]s to a type, using `const_fn` to encode const parameters.
+/// Encodes generic parameters into a tuple type, using `const_fn` for const parameters.
 ///
-/// A lifetime `'a` is encoded as `&'a ()` and a type `T` as `T`. The lifetime bounds of the
-/// parameters are encoded after them, in the order of the parameters and of their bounds: a bound
-/// `T: 'a` as `&'a T`, and `'b: 'a` as `&'a &'b ()`. The type of an `impl` header containing them
-/// implies the bound (`&'a T` is well-formed only if `T: 'a`), so the bound is implied wherever
-/// the same encoding is written, e.g. in a signature copied by the Referrer, which does not know
-/// the bound otherwise: it is not implied by `(&'a (), T)`.
-///
-/// This is how the outlives bounds of a leaked type are carried: those which a reference implies
-/// (`T: 'a` of `&'a T`) and those which are written (e.g. `T: 'a` of `fn f<'a, T: 'a>(x: Rel<'a,
-/// T>)` where `struct Rel<'a, T>(&'a T)`: the bound of a path with a lifetime is not assumed, see
-/// [`Referrer::generics()`]). Without them the implementation `impl<'a, T> Repeater<(&'a (), T),
-/// ..> for S { type Type = Rel<'a, T>; }` is rejected with E0309, and so is the copy `<S as
-/// Repeater<(&'a (), T), ..>>::Type` of a signature. Only the bounds by a lifetime which is a
-/// parameter of `iter` are encoded: a bound by `'static` (or another lifetime) adds nothing a
-/// signature does not know, and cannot be written by a type.
-///
-/// The `impl` must not declare the bounds it encodes (a declared bound is an obligation wherever
-/// the implementation is selected, which may not hold there): declare
-/// [`Referrer::impl_generics()`] (or [`without_encoded_bounds()`]) instead of the generics.
-///
-/// `Self: 'a` (see [`Referrer::context_self_outlives()`]) is not encoded, which needs the type
-/// `Self` is: use [`encode_generics_params_to_ty_with_self()`].
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// # use template_quote::quote;
-/// let generics: Generics = parse_quote!(<'a, T, const B: bool>);
-/// // `::my_crate::ConstBool` is defined as `pub struct ConstBool<const B: bool>;`
-/// let ty = encode_generics_params_to_ty_with(&generics.params, |ConstParam { ident, .. }| {
-///     parse_quote!(::my_crate::ConstBool<#ident>)
-/// });
-/// assert_eq!(
-///     quote!(#ty).to_string(),
-///     quote!((&'a (), T, ::my_crate::ConstBool<B>)).to_string()
-/// );
-///
-/// // The bounds `T: 'a` and `'b: 'a`.
-/// let generics: Generics = parse_quote!(<'a, 'b: 'a, T: 'a + Clone>);
-/// let ty = encode_generics_params_to_ty(&generics.params);
-/// assert_eq!(
-///     quote!(#ty).to_string(),
-///     quote!((&'a (), &'b (), T, &'a &'b (), &'a T)).to_string()
-/// );
-/// ```
-///
-/// [`Referrer::generics()`]: crate::Referrer::generics
-/// [`Referrer::impl_generics()`]: crate::Referrer::impl_generics
-/// [`Referrer::context_self_outlives()`]: crate::Referrer::context_self_outlives
+/// A lifetime `'a` becomes `&'a ()` and a type `T` becomes `T`. The lifetime bounds follow, in the
+/// order of the parameters and their bounds: `T: 'a` becomes `&'a T`, and `'b: 'a` becomes
+/// `&'a &'b ()`. Only a bound by a lifetime parameter of `iter` is encoded.
+/// A reference implies its bound wherever it is written. So the impl must not declare the bounds
+/// it encodes. Declare `Referrer::impl_generics()` or [`without_encoded_bounds()`] instead (see
+/// [Outlives bounds](crate#outlives-bounds)). `Self: 'a` is not encoded: use
+/// [`encode_generics_params_to_ty_with_self()`].
 pub fn encode_generics_params_to_ty_with<'a>(
     iter: impl IntoIterator<Item = &'a GenericParam>,
     mut const_fn: impl FnMut(&'a ConstParam) -> Type,
 ) -> Type {
-    // Without `Self`, the bounds are those of the parameters, which cannot fail.
     encode_generics_params_with(iter, None, |cp| Ok(const_fn(cp)))
         .expect("the parameters are not trait objects")
 }
 
-/// Like [`encode_generics_params_to_ty_with()`], with `Self: 'a` for each lifetime of
-/// `self_outlives` (the lifetimes of [`Referrer::context_self_outlives()`] of the context whose
-/// generics `iter` are) encoded after the lifetime bounds as `&'a Self`, where `Self` is
-/// `self_ty`: the type the implementation of the Repeater is for, `__S` for an implementation for
-/// any type of the trait (`impl<'a, __S: ?Sized + MyLeaker> Repeater<(&'a (), &'a __S), ..> for
-/// __S`, see [`Referrer::iter_with_self()`]), or `Self` for an implementation for a type. The
-/// header implies `__S: 'a` then, which the implementation must not declare, as nothing proves it
-/// where the type is copied but this encoding (see [`Referrer::generics()`]).
+/// Like [`encode_generics_params_to_ty_with()`], but also encodes `Self: 'a`.
 ///
-/// The arguments are those of [`RepeaterSlots::encode_generics_params_to_ty_with_self()`], which
-/// encodes the same, and `const_fn`, which is the last (the same as of
-/// [`encode_generics_params_to_ty_with()`]); the Referrer encodes the arguments with
-/// [`encode_generics_args_to_ty_with_self()`].
-///
-/// A lifetime which is not a parameter of `iter` is skipped, like a lifetime bound by one.
-/// Returns [`EncodeError::UnboundedTraitObject`] if `self_ty` is a trait object without a
-/// lifetime bound (its lifetime would default to the lifetime of the reference).
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// # use template_quote::quote;
-/// let generics: Generics = parse_quote!(<'a, const N: usize>);
-/// let ty = encode_generics_params_to_ty_with_self(
-///     &generics.params,
-///     &parse_quote!(__S),
-///     &[parse_quote!('a)],
-///     |ConstParam { ident, .. }| parse_quote!([(); #ident]),
-/// )
-/// .unwrap();
-/// let expected: Type = parse_quote!((&'a (), [(); N], &'a __S));
-/// assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
-/// ```
-///
-/// [`Referrer::generics()`]: crate::Referrer::generics
-/// [`Referrer::iter_with_self()`]: crate::Referrer::iter_with_self
-/// [`Referrer::context_self_outlives()`]: crate::Referrer::context_self_outlives
-/// [`RepeaterSlots::encode_generics_params_to_ty_with_self()`]: crate::RepeaterSlots::encode_generics_params_to_ty_with_self
+/// Each lifetime `'a` of `self_outlives` adds `&'a Self` after the bounds, with `Self` being
+/// `self_ty`. Pass `Referrer::context_self_outlives()` of the context of `iter`. A lifetime that
+/// is not a parameter of `iter` is skipped.
+/// `self_ty` is the type of the impl: `__S` for any implementor (see `Referrer::iter_with_self()`),
+/// or `Self` for an impl for a type. The impl must not declare `__S: 'a`, because the encoding
+/// implies it.
+/// The arguments are those of `RepeaterSlots::encode_generics_params_to_ty_with_self()`, then
+/// `const_fn`. The Referrer encodes the arguments with [`encode_generics_args_to_ty_with_self()`].
+/// Fails with [`EncodeError::UnboundedTraitObject`] if `self_ty` is a trait object without a
+/// lifetime bound.
 pub fn encode_generics_params_to_ty_with_self<'a>(
     iter: impl IntoIterator<Item = &'a GenericParam>,
     self_ty: &Type,
@@ -471,12 +290,7 @@ pub fn encode_generics_params_to_ty_with_self<'a>(
     encode_generics_params_with(iter, Some((self_ty, self_outlives)), |cp| Ok(const_fn(cp)))
 }
 
-/// Encodes `iter` as the parameters of a context: the parameters, then their lifetime bounds (see
-/// [`encode_outlives_bounds()`]), and then `Self: 'a` for each lifetime of `self_outlives` (see
-/// [`encode_self_outlives()`]). `const_fn` encodes a const parameter. This is the encoding of the
-/// Leaker, shared by [`encode_generics_params_to_ty_with()`], [`encode_generics_params_to_ty_with_self()`]
-/// and [`RepeaterSlots`](crate::RepeaterSlots), and the one the Referrer reproduces with
-/// [`encode_generics_args_with_params()`].
+/// The Leaker's encoding, which `encode_generics_args_with_params()` must reproduce.
 pub(crate) fn encode_generics_params_with<'a>(
     iter: impl IntoIterator<Item = &'a GenericParam>,
     self_outlives: Option<(&Type, &[Lifetime])>,
@@ -495,7 +309,6 @@ pub(crate) fn encode_generics_params_with<'a>(
             })
         })
         .collect::<std::result::Result<Punctuated<Type, Token![,]>, _>>()?;
-    // The arguments are the parameters themselves.
     let args = params_as_args(&params);
     elems.extend(encode_outlives_bounds(&params, &args)?);
     if let Some((self_ty, lifetimes)) = self_outlives {
@@ -507,27 +320,24 @@ pub(crate) fn encode_generics_params_with<'a>(
     }))
 }
 
-/// Returns the parameters as the arguments of a path with the same names (a const as an
-/// identifier).
 pub(crate) fn params_as_args(params: &[&GenericParam]) -> Vec<GenericArgument> {
-    params
-        .iter()
-        .map(|param| match param {
-            GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
-                GenericArgument::Lifetime(lifetime.clone())
-            }
-            GenericParam::Type(TypeParam { ident, .. }) => {
-                GenericArgument::Type(parse_quote!(#ident))
-            }
-            GenericParam::Const(ConstParam { ident, .. }) => {
-                GenericArgument::Const(parse_quote!(#ident))
-            }
-        })
-        .collect()
+    params.iter().map(|param| param_as_arg(param)).collect()
 }
 
-/// Returns the lifetime bounds written on `param` (`T: 'a` of a type parameter, `'b: 'a` of a
-/// lifetime parameter), in order. A where predicate is not one.
+/// The argument that passes `param` on by its own name.
+pub(crate) fn param_as_arg(param: &GenericParam) -> GenericArgument {
+    match param {
+        GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
+            GenericArgument::Lifetime(lifetime.clone())
+        }
+        GenericParam::Type(TypeParam { ident, .. }) => GenericArgument::Type(parse_quote!(#ident)),
+        GenericParam::Const(ConstParam { ident, .. }) => {
+            GenericArgument::Const(parse_quote!(#ident))
+        }
+    }
+}
+
+/// The lifetime bounds written on `param`, in order. A where predicate is not one.
 fn lifetime_bounds(param: &GenericParam) -> Vec<&Lifetime> {
     match param {
         GenericParam::Lifetime(param) => param.bounds.iter().collect(),
@@ -543,52 +353,31 @@ fn lifetime_bounds(param: &GenericParam) -> Vec<&Lifetime> {
     }
 }
 
-/// Returns the position in `params` of the lifetime parameter `bound`, if a lifetime bound `bound`
-/// of one of `params` is encoded (see [`encode_outlives_bounds()`]): it is the lifetime of a
-/// lifetime parameter of `params`. A bound by another lifetime (`'static`, or a lifetime which
-/// the type context provides) is not.
-///
-/// This is the only rule deciding which bounds are encoded: the encoders use it to find the
-/// argument of the lifetime, and [`without_encoded_bounds()`] to leave the others.
+/// The only rule that decides which bounds are encoded. [`without_encoded_bounds()`] keeps the
+/// others.
 fn encoded_bound_position(params: &[&GenericParam], bound: &Lifetime) -> Option<usize> {
     params.iter().position(
         |param| matches!(param, GenericParam::Lifetime(param) if &param.lifetime == bound),
     )
 }
 
-/// Returns `generics` without the lifetime bounds that [`encode_generics_params_to_ty()`] (and the
-/// other encoders, see [`encode_generics_params_to_ty_with()`]) encode in the trait arguments: a
-/// bound `'a` on a type parameter (`T: 'a`) or on a lifetime parameter (`'b: 'a`), where `'a` is a
-/// lifetime parameter of `generics`. Everything else is kept: the other bounds (`T: 'static`, a
-/// bound by a lifetime which is not a parameter, trait bounds), the const parameters, and the where
-/// clause (which the encoders do not look into).
+/// Returns `generics` without the lifetime bounds that the encoders encode.
 ///
-/// This is the form to declare as the generics of a Repeater's `impl`, whose trait arguments
-/// encode the bounds (see [`Referrer::impl_generics()`]): the header implies them, and a declared
-/// bound would be an obligation wherever the implementation is selected, which may not hold.
-/// Use this function for generics which are not those of a context, such as those returned by
-/// [`Referrer::iter_with_self()`].
-///
-/// A bound on `Self` in the where clause (`where Self: 'a`) is not a bound of a parameter, so it is
-/// not removed here, but the generics of a context do not have one: a `Self: 'a` which the item
-/// writes is moved by the Leaker from the where predicates into
-/// [`Referrer::context_self_outlives()`], where it is encoded by
-/// [`encode_generics_params_to_ty_with_self()`] and never declared, like the one the type
-/// implies.
+/// Removed: a bound by a lifetime parameter of `generics`, on a type parameter (`T: 'a`) or a
+/// lifetime parameter (`'b: 'a`). Kept: other bounds (`T: 'static`, a bound by a lifetime that is
+/// not a parameter, trait bounds), const parameters and the where clause.
+/// Declare the result as the generics of a Repeater impl. `Referrer::impl_generics()` does this
+/// for a context. Use this function for other generics, such as those of
+/// `Referrer::iter_with_self()`. `where Self: 'a` is not removed. A context has none, because the
+/// Leaker moves it into `Referrer::context_self_outlives()` for the `*_with_self()` encoders.
 ///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
-/// # use template_quote::quote;
 /// let generics: Generics = parse_quote!(<'a, 'b: 'a, T: 'a + Clone, U: 'static, V: 'c>);
 /// let declared = without_encoded_bounds(&generics);
-/// let expected: Generics = parse_quote!(<'a, 'b, T: Clone, U: 'static, V: 'c>);
-/// assert_eq!(quote!(#declared).to_string(), quote!(#expected).to_string());
+/// assert_eq!(declared, parse_quote!(<'a, 'b, T: Clone, U: 'static, V: 'c>));
 /// ```
-///
-/// [`Referrer::impl_generics()`]: crate::Referrer::impl_generics
-/// [`Referrer::iter_with_self()`]: crate::Referrer::iter_with_self
-/// [`Referrer::context_self_outlives()`]: crate::Referrer::context_self_outlives
 pub fn without_encoded_bounds(generics: &Generics) -> Generics {
     let params: Vec<&GenericParam> = generics.params.iter().collect();
     let mut declared = generics.clone();
@@ -625,15 +414,7 @@ pub fn without_encoded_bounds(generics: &Generics) -> Generics {
     declared
 }
 
-/// Returns the elements which encode the lifetime bounds of `params` (in the order of the
-/// parameters and of their bounds), after the elements encoding the parameters, with `args` as the
-/// arguments of the parameters (one for each, see [`params_as_args()`]): `&'a T` for the bound `T:
-/// 'a` of a type parameter, and `&'a &'b ()` for `'b: 'a` of a lifetime parameter, where `T`, `'b`
-/// and `'a` are the arguments. A bound is encoded if the lifetime is a lifetime parameter of
-/// `params` (see [`without_encoded_bounds()`], which leaves the others).
-///
-/// [`EncodeError::UnboundedTraitObject`] is returned if the argument of a type with a bound is a
-/// trait object without a lifetime bound.
+/// The elements encoding the lifetime bounds of `params`, after those of the parameters.
 pub(crate) fn encode_outlives_bounds(
     params: &[&GenericParam],
     args: &[GenericArgument],
@@ -641,7 +422,6 @@ pub(crate) fn encode_outlives_bounds(
     let mut elems = Vec::new();
     for (param, arg) in params.iter().zip(args) {
         for bound in lifetime_bounds(param) {
-            // The argument of the lifetime parameter `bound`, if it is one of `params`.
             let outliving =
                 encoded_bound_position(params, bound).and_then(|pos| match args.get(pos) {
                     Some(GenericArgument::Lifetime(outliving)) => Some(outliving),
@@ -667,18 +447,8 @@ pub(crate) fn encode_outlives_bounds(
     Ok(elems)
 }
 
-/// Returns the elements which encode `Self: 'a` for each of the `lifetimes`, after those encoding
-/// the lifetime bounds of `params` (see [`encode_outlives_bounds()`]), with `args` as the arguments
-/// of the parameters (one for each, see [`params_as_args()`]): `&'a Self` where `Self` is
-/// `self_ty` and `'a` is the argument of the lifetime parameter of `params` with the same name.
-/// Like a lifetime bound, it implies the bound wherever the encoding is written, which an
-/// implementation for `Self` or for the type `__S` cannot declare (a declared `__S: 'a` is an
-/// obligation at every use, and fails where nothing proves it, such as the signature of a
-/// free function, whereas `&'a __S` implies it). A lifetime which is not a
-/// parameter of `params` is skipped, like a bound by one.
-///
-/// [`EncodeError::UnboundedTraitObject`] is returned if `self_ty` is a trait object without a
-/// lifetime bound and there is a lifetime.
+/// `&'a __S` implies `__S: 'a` wherever it is written. A declared `__S: 'a` would fail where
+/// nothing proves it, such as in a free function signature.
 pub(crate) fn encode_self_outlives(
     params: &[&GenericParam],
     args: &[GenericArgument],
@@ -704,9 +474,8 @@ pub(crate) fn encode_self_outlives(
     Ok(elems)
 }
 
-/// Returns `ty` as the referent of a reference: a trait object is parenthesized (`&'a (dyn Tr +
-/// 'b)`), and must have a lifetime bound, because it defaults to the lifetime of the reference
-/// otherwise.
+/// Returns `ty` as the referent of a reference. A trait object is parenthesized, and needs a
+/// lifetime bound, or it would default to the lifetime of the reference.
 fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
     match unwrap_type_group(ty) {
         Type::TraitObject(object) => {
@@ -726,24 +495,21 @@ fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
     }
 }
 
-/// Error returned by [`RepeaterSlots`](crate::RepeaterSlots) when generics cannot be encoded into a
-/// type.
+/// The error of the encoders: the free functions and `RepeaterSlots`.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum EncodeError {
-    /// The type of a const parameter is not a primitive type (e.g. a type alias), so its slot
-    /// cannot be chosen.
+    /// The type of a const parameter is not a primitive type (e.g. an alias).
     UnsupportedConstType(Box<Type>),
-    /// A generic argument which does not correspond to any generic parameter (i.e. too many
-    /// arguments).
+    /// There are more arguments than parameters.
     UnexpectedArgument(Box<GenericArgument>),
-    /// A generic parameter without a corresponding argument nor a default.
+    /// A parameter that has neither an argument nor a default.
     MissingArgument(Box<GenericParam>),
-    /// The argument of a type parameter with a lifetime bound (e.g. `T: 'a`, which is encoded as
-    /// `&'a T`) is a trait object without a lifetime bound, e.g. `dyn Tr`. The bound defaults to
-    /// `'a` there, but to another lifetime (often `'static`) in the other elements of the
-    /// encoding, so the encoding would not be that of the generics. Write the bound
-    /// (e.g. `dyn Tr + 'static`).
+    /// The argument of a type parameter with a lifetime bound is a trait object without one
+    /// (`dyn Tr`).
+    ///
+    /// Its bound would default to `'a` in `&'a T` and to another lifetime elsewhere. Write it, e.g.
+    /// `dyn Tr + 'static`.
     UnboundedTraitObject(Box<Type>),
 }
 
@@ -772,6 +538,7 @@ impl std::fmt::Display for EncodeError {
 impl std::error::Error for EncodeError {}
 
 impl EncodeError {
+    /// Returns the span of the offending parameter, argument or type.
     pub fn span(&self) -> Span {
         match self {
             EncodeError::UnsupportedConstType(ty) => ty.span(),
@@ -798,7 +565,6 @@ pub(crate) fn with_trailing_comma(
     elems
 }
 
-/// Substitutes generic parameters (single-segment paths and lifetimes) with arguments.
 #[derive(Default)]
 pub(crate) struct SubstituteParams {
     types: HashMap<Ident, Type>,

@@ -6,7 +6,11 @@ use template_quote::quote;
 use type_leak::{ContextId, Leaker, Referrer};
 
 fn referrer(tr: &ItemTrait) -> Referrer {
-    Leaker::from_trait(tr).unwrap().0.finish()
+    {
+        let mut leaker = Leaker::new();
+        leaker.intern_trait(tr, true).unwrap();
+        leaker.finish()
+    }
 }
 
 fn s(x: &impl template_quote::ToTokens) -> String {
@@ -59,7 +63,8 @@ fn test_default_requirements() {
             fn f(&self) -> RelC;
         }
     };
-    let (leaker, top_level) = Leaker::from_trait(&tr).unwrap();
+    let mut leaker = Leaker::new();
+    let top_level = leaker.intern_trait(&tr, true).unwrap();
     let referrer = leaker.finish();
     // The contexts are the requirements of the types, numbered in the order of their first
     // appearance: nothing (`RelB`, `RelW` and `RelC`) and `Rel<T>` (the default of `U`, which uses
@@ -129,7 +134,8 @@ fn test_default_is_shared_with_the_items() {
             fn f(&self, t: T) -> Rel<T>;
         }
     );
-    let (leaker, top_level) = Leaker::from_trait(&tr).unwrap();
+    let mut leaker = Leaker::new();
+    let top_level = leaker.intern_trait(&tr, true).unwrap();
     let referrer = leaker.finish();
     assert_eq!(referrer.iter().count(), 1);
     // The entry uses `T` only, whereas the generics of the trait are `<T, U>`.
@@ -145,7 +151,7 @@ fn test_default_cannot_depend_on_self() {
     let tr: ItemTrait = parse_quote!(
         trait Tr<T, U = Rel<Self>> {}
     );
-    let err = Leaker::from_trait(&tr).err().unwrap();
+    let err = Leaker::new().intern_trait(&tr, true).err().unwrap();
     assert_eq!(err.to_string(), "use absolute path: 'Self'");
     assert_eq!(
         err.note().as_deref(),
@@ -166,7 +172,11 @@ fn test_default_cannot_depend_on_self() {
 }
 
 fn referrer_of(tr: &ItemTrait) -> Referrer {
-    Leaker::from_trait(tr).unwrap().0.finish()
+    {
+        let mut leaker = Leaker::new();
+        leaker.intern_trait(tr, true).unwrap();
+        leaker.finish()
+    }
 }
 
 #[test]
@@ -182,27 +192,15 @@ fn test_defaults_of_several_calls_are_shared() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_plain = leaker
-        .intern_with(&plain.generics, |v| {
-            syn::visit::Visit::visit_item_struct(v, &plain)
-        })
-        .unwrap();
-    let top_tr = leaker
-        .intern_with(&tr.generics, |v| {
-            syn::visit::Visit::visit_item_trait(v, &tr)
-        })
-        .unwrap();
+    let top_plain = leaker.intern_struct(&plain, true).unwrap();
+    let top_tr = leaker.intern_trait(&tr, true).unwrap();
     // A failed call adds nothing.
     let bad: ItemTrait = parse_quote!(
         trait Tr<T, U = ::std::vec::Vec<T>> {
             fn f(&self) -> Rel<'_>;
         }
     );
-    assert!(leaker
-        .intern_with(&bad.generics, |v| syn::visit::Visit::visit_item_trait(
-            v, &bad
-        ))
-        .is_err());
+    assert!(leaker.intern_trait(&bad, true).is_err());
     let referrer = leaker.finish();
     // The types use no generics, so they are in one context, whichever call found them, and the
     // generics of the calls (without the defaults) are two other contexts. The default of `U`,
@@ -256,7 +254,7 @@ fn test_default_const_is_kept() {
     let tr: ItemTrait = parse_quote!(
         trait Tr<T, const N: usize = MY_N> {}
     );
-    assert!(Leaker::from_trait(&tr).is_err());
+    assert!(Leaker::new().intern_trait(&tr, true).is_err());
     let tr: ItemTrait = parse_quote!(
         trait Tr<T, const N: usize = 3, const M: usize = { 1 + 2 }> {}
     );

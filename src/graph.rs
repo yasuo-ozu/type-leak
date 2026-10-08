@@ -8,8 +8,7 @@ use std::collections::{HashMap, HashSet};
 use syn::*;
 use template_quote::ToTokens;
 
-/// A type compared, hashed and displayed by its tokens, since `syn::Type` has no `Ord` or
-/// `Display` (which safegraph requires of [`IndexKey`]s).
+/// A type compared by its tokens: `syn::Type` has no `Ord` or `Display`, which safegraph needs.
 #[derive(Clone, Debug)]
 pub(crate) struct TypeKey {
     pub(crate) ty: Type,
@@ -69,16 +68,9 @@ impl std::fmt::Display for TypeKey {
     }
 }
 
-/// A leaked type, as a node of [`TypeGraph`] (and the key of a [`Referrer`](crate::Referrer)'s
-/// entry).
-///
-/// Equal keys are the same leaked type, which is shared by all its occurrences, whichever call of
-/// [`Leaker::intern_with()`](crate::Leaker::intern_with()) found them. The same tokens in
-/// different contexts (see [`Referrer::context()`](crate::Referrer::context())) are separate
-/// entries.
+/// A leaked type in a context. The same tokens in two contexts are two nodes of the [`TypeGraph`].
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct NodeKey {
-    /// The context of the type (see `Contexts`).
     pub(crate) context: ContextId,
     pub(crate) ty: TypeKey,
 }
@@ -89,13 +81,9 @@ impl std::fmt::Display for NodeKey {
     }
 }
 
-// SAFETY: `Eq`, `Ord` and `Hash` are derived from those of the fields (an id and the tokens,
-// each of which is deterministic), so they are consistent with each other, and none of them (nor
-// `Clone`) panics.
+// SAFETY: `Eq`, `Ord` and `Hash` derive from deterministic fields, and none of them panics.
 unsafe impl IndexKey for NodeKey {}
 
-/// A graph whose nodes are keyed by [`NodeKey`] (in a `HashMap`), and whose edges are stored in a
-/// `Vec` with no payload, so an edge holds its endpoints only once (as the endpoints).
 type CompositionGraph =
     LinkedAdjEdgeGraph<HashMap<NodeKey, NodeRepr<u32>>, Vec<((), EdgeRepr<NodeKey, u32>)>>;
 
@@ -104,19 +92,17 @@ type CompositionGraph =
 pub(crate) struct TypeGraph {
     /// An edge goes from a type to each internable type it is composed of.
     graph: CompositionGraph,
-    /// The nodes of `graph`.
     nodes: HashSet<NodeKey>,
-    /// The types appearing as roots (not as components of another internable type).
+    /// The types that appear as roots, not as components of another type.
     pub(crate) roots: HashSet<NodeKey>,
-    /// The types which must be interned: they directly depend on the type context (the graph of
-    /// the required entries), or they may be replaced by the Referrer (the graph of the optional
-    /// ones, see [`Referrer::must()`](crate::Referrer::must())).
+    /// The types that must be interned: they depend on the context, or the Referrer may replace
+    /// them.
     pub(crate) must_intern: HashSet<NodeKey>,
 }
 
 impl TypeGraph {
-    /// Adds an occurrence of `ty` in `context` (a component of `parent`, or a root), and returns
-    /// its key.
+    /// Adds an occurrence of `ty` in `context`, a component of `parent` or a root, and returns its
+    /// key.
     pub(crate) fn add(
         &mut self,
         context: ContextId,
@@ -153,22 +139,19 @@ impl TypeGraph {
         }
     }
 
-    /// Returns `true` if no type has been added.
     pub(crate) fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
 
-    /// Returns the types (in no particular order).
+    /// Returns the types, in no particular order.
     pub(crate) fn keys(&self) -> impl Iterator<Item = &NodeKey> {
         self.nodes.iter()
     }
 
-    /// Returns the components of `key`.
     pub(crate) fn children(&self, key: &NodeKey) -> Vec<NodeKey> {
         self.graph.neighbor_indices_from(key).collect()
     }
 
-    /// Merges `other` into this graph.
     pub(crate) fn merge(&mut self, other: TypeGraph) {
         for key in other.keys() {
             if self.nodes.insert(key.clone()) {

@@ -1,11 +1,13 @@
 //! Tests for the requirements of the leaked types: the generics they use and what `Self` means,
 //! which decide the entries (and contexts) of the `Referrer`.
 
+mod common;
+
 use syn::punctuated::Punctuated;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{EncodeError, Leaker, LeakerConfig, Referrer, SelfRequirement, Visitor};
+use type_leak::{EncodeError, Leaker, Referrer, SelfRequirement, Visitor};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -20,9 +22,7 @@ fn s(x: &impl template_quote::ToTokens) -> String {
 fn leak_traits(traits: &[ItemTrait]) -> Referrer {
     let mut leaker = Leaker::new();
     for item in traits {
-        leaker
-            .intern_with(&item.generics, |v| v.visit_item_trait(item))
-            .unwrap();
+        leaker.intern_trait(item, true).unwrap();
     }
     leaker.finish()
 }
@@ -54,7 +54,6 @@ fn selfs(referrer: &Referrer) -> Vec<String> {
             None => "-".to_string(),
             Some(SelfRequirement::Bound(path)) => format!("Self: {}", s(path)),
             Some(SelfRequirement::Type(ty)) => format!("Self = {}", s(ty)),
-            Some(SelfRequirement::Call(n)) => format!("Self = #{}", n),
             Some(_) => unreachable!(),
         })
         .collect()
@@ -78,11 +77,7 @@ fn types_are_shared_by_calls() {
     let mut leaker = Leaker::new();
     let tops: Vec<_> = [&a, &b]
         .iter()
-        .map(|item| {
-            leaker
-                .intern_with(&item.generics, |v| v.visit_item_struct(item))
-                .unwrap()
-        })
+        .map(|item| leaker.intern_struct(item, true).unwrap())
         .collect();
     let referrer = leaker.finish();
     assert_eq!(
@@ -105,9 +100,7 @@ fn equal_requirements_are_shared_and_different_ones_are_not() {
     let leak = |items: &[ItemStruct]| {
         let mut leaker = Leaker::new();
         for item in items {
-            leaker
-                .intern_with(&item.generics, |v| v.visit_item_struct(item))
-                .unwrap();
+            leaker.intern_struct(item, true).unwrap();
         }
         leaker.finish()
     };
@@ -317,29 +310,21 @@ fn self_of_a_struct_enum_union_and_impl() {
             b: Wrap<T>,
         }
     );
-    leaker
-        .intern_with(&st.generics, |v| v.visit_item_struct(&st))
-        .unwrap();
+    leaker.intern_struct(&st, true).unwrap();
     let en: ItemEnum = parse_quote!(
         enum E<'a, T> {
             A(Rel<Self>, &'a T),
         }
     );
-    leaker
-        .intern_with(&en.generics, |v| v.visit_item_enum(&en))
-        .unwrap();
+    leaker.intern_enum(&en, true).unwrap();
     let un: ItemUnion = parse_quote!(union U { a: Rel<Self> });
-    leaker
-        .intern_with(&un.generics, |v| v.visit_item_union(&un))
-        .unwrap();
+    leaker.intern_union(&un, true).unwrap();
     let im: ItemImpl = parse_quote! {
         impl<T> ::p::Tr for W<T> {
             fn f(&self) -> Rel<Self> { todo!() }
         }
     };
-    leaker
-        .intern_with(&im.generics, |v| v.visit_item_impl(&im))
-        .unwrap();
+    leaker.intern_impl(&im, true).unwrap();
     let referrer = leaker.finish();
     assert_eq!(
         entries(&referrer),
@@ -374,7 +359,9 @@ fn self_of_a_module_is_that_of_its_items() {
             pub trait Tr { fn f(&self) -> Rel2<Self>; }
         }
     };
-    let referrer = Leaker::from_module(&m).unwrap().0.finish();
+    let mut leaker = Leaker::new();
+    leaker.intern_mod(&m).unwrap();
+    let referrer = leaker.finish();
     assert_eq!(selfs(&referrer), ["Self = S < T >", "Self: Tr"]);
     assert_eq!(
         entries(&referrer),
@@ -383,33 +370,6 @@ fn self_of_a_module_is_that_of_its_items() {
             entry(parse_quote!(Rel2<Self>), Generics::default()),
         ]
     );
-}
-
-#[test]
-fn self_without_an_item_is_the_call() {
-    let ty: Type = parse_quote!(Rel<Self>);
-    let other: Type = parse_quote!(Rel2);
-    let mut leaker = Leaker::new();
-    // The numbers are those of the successful calls.
-    leaker
-        .intern_with(&Generics::default(), |v| v.visit_type(&ty))
-        .unwrap();
-    leaker
-        .intern_with(&Generics::default(), |v| v.visit_type(&other))
-        .unwrap();
-    let failing: Type = parse_quote!(Rel3<'_>);
-    assert!(leaker
-        .intern_with(&Generics::default(), |v| v.visit_type(&failing))
-        .is_err());
-    leaker
-        .intern_with(&Generics::default(), |v| v.visit_type(&ty))
-        .unwrap();
-    let referrer = leaker.finish();
-    assert_eq!(
-        referrer.iter().map(s).collect::<Vec<_>>(),
-        ["Rel < Self >", "Rel2", "Rel < Self >"]
-    );
-    assert_eq!(selfs(&referrer), ["Self = #0", "-", "Self = #2"]);
 }
 
 #[test]
@@ -425,13 +385,15 @@ fn self_in_the_bounds_of_the_generics() {
     assert!(referrer.has_self());
 
     // Otherwise it cannot be, as the Repeater's implementation copies the bounds.
-    let mut config = LeakerConfig::new();
-    config.self_ty_can_be_interned = false;
-    let mut leaker = Leaker::from_config(config.clone());
-    let err = leaker
-        .intern_with(&tr.generics, |v| v.visit_item_trait(&tr))
-        .err()
-        .unwrap();
+    let mut leaker = Leaker::new();
+    let err = common::intern_fns(
+        &mut leaker,
+        &tr.generics,
+        quote! { fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> Wrap<T>; },
+        false,
+    )
+    .err()
+    .unwrap();
     assert!(matches!(
         err,
         type_leak::NotInternableError::RelativePath(_)
@@ -455,10 +417,14 @@ fn self_in_the_bounds_of_the_generics() {
             fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> (Rel, ::core::option::Option<T>);
         }
     };
-    let mut leaker = Leaker::from_config(config.clone());
-    leaker
-        .intern_with(&tr.generics, |v| v.visit_item_trait(&tr))
-        .unwrap();
+    let mut leaker = Leaker::new();
+    common::intern_fns(
+        &mut leaker,
+        &tr.generics,
+        quote! { fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> (Rel, ::core::option::Option<T>); },
+        false,
+    )
+    .unwrap();
     assert_eq!(leaker.finish().iter().map(s).collect::<Vec<_>>(), ["Rel"]);
 }
 
@@ -530,7 +496,7 @@ fn lenient_matching() {
     // Leaker, whatever their declaration is.
     assert_eq!(
         rewrite(
-            referrer.clone().into_visitor(None, placeholder),
+            referrer.clone().into_visitor(None, None, placeholder),
             "fn f<const B: bool>(&self, a: Wrap<T>, b: Wrap<B>, c: Rel, d: Wrap<U>)"
         ),
         rewritten(
@@ -548,7 +514,7 @@ fn lenient_matching() {
         let sig = format!("fn f{}(&self, a: Wrap<T>)", generics);
         let expected = format!("fn f{}(&self, a: {})", generics, a);
         assert_eq!(
-            rewrite(referrer.clone().into_visitor(None, placeholder), &sig),
+            rewrite(referrer.clone().into_visitor(None, None, placeholder), &sig),
             rewritten(&expected),
             "{}",
             generics
@@ -557,14 +523,14 @@ fn lenient_matching() {
     // `Wrap<B>` is for a `bool`.
     assert_eq!(
         rewrite(
-            referrer.clone().into_visitor(None, placeholder),
+            referrer.clone().into_visitor(None, None, placeholder),
             "fn f<const B: bool>(&self, b: Wrap<B>)"
         ),
         rewritten("fn f<const B: bool>(&self, b: P<1usize>)")
     );
     assert_eq!(
         rewrite(
-            referrer.clone().into_visitor(None, placeholder),
+            referrer.clone().into_visitor(None, None, placeholder),
             "fn f<const B: u8>(&self, b: Wrap<B>)"
         ),
         rewritten("fn f<const B: u8>(&self, b: Wrap<B>)")
@@ -584,14 +550,14 @@ fn matching_prefers_the_entry_assuming_the_fewest_generics() {
     assert_eq!(referrer.iter().count(), 2);
     assert_eq!(
         rewrite(
-            referrer.clone().into_visitor(None, placeholder),
+            referrer.clone().into_visitor(None, None, placeholder),
             "fn g(&self) -> Wrap<B>"
         ),
         rewritten("fn g(&self) -> P<1usize>")
     );
     assert_eq!(
         rewrite(
-            referrer.into_visitor(None, placeholder),
+            referrer.into_visitor(None, None, placeholder),
             "fn f<const B: bool>(&self) -> Wrap<B>"
         ),
         rewritten("fn f<const B: bool>(&self) -> P<0usize>")
@@ -617,7 +583,7 @@ fn matching_with_the_root_generics_of_the_call() {
     let sig = "fn f(&self) -> Wrap<T>";
     // Leniently, the first of the entries is used.
     assert_eq!(
-        rewrite(referrer.clone().into_visitor(None, placeholder), sig),
+        rewrite(referrer.clone().into_visitor(None, None, placeholder), sig),
         rewritten("fn f(&self) -> P<0usize>")
     );
     // With the generics of the call, the entry is exact.
@@ -626,7 +592,7 @@ fn matching_with_the_root_generics_of_the_call() {
             rewrite(
                 referrer
                     .clone()
-                    .into_visitor_with_root(&tr.generics, None, placeholder),
+                    .into_visitor_with_root(&tr.generics, None, None, placeholder),
                 sig
             ),
             rewritten(&format!("fn f(&self) -> P<{}usize>", ix))
@@ -638,7 +604,7 @@ fn matching_with_the_root_generics_of_the_call() {
         rewrite(
             referrer
                 .clone()
-                .into_visitor_with_root(&other, None, placeholder),
+                .into_visitor_with_root(&other, None, None, placeholder),
             sig
         ),
         rewritten(sig)
@@ -652,7 +618,7 @@ fn matching_with_the_root_generics_of_the_call() {
     let referrer = leak_trait(tr);
     assert_eq!(
         rewrite(
-            referrer.into_visitor_with_root(&other, None, placeholder),
+            referrer.into_visitor_with_root(&other, None, None, placeholder),
             "fn f(&self) -> Rel"
         ),
         rewritten("fn f(&self) -> P<0usize>")
@@ -682,52 +648,64 @@ fn matching_self() {
     // The entries which do not mention `Self` are not affected by it.
     assert_eq!(
         rewrite(
-            referrer.clone().into_visitor(Some(bound("X")), placeholder),
+            referrer
+                .clone()
+                .into_visitor(Some(bound("X")), None, placeholder),
             sig
         ),
         rewritten("fn f(&self, a: P<0usize>, b: P<1usize>, c: P<2usize>)")
     );
     assert_eq!(
         rewrite(
-            referrer.clone().into_visitor(Some(bound("Y")), placeholder),
+            referrer
+                .clone()
+                .into_visitor(Some(bound("Y")), None, placeholder),
             sig
         ),
         rewritten("fn f(&self, a: P<3usize>, b: P<1usize>, c: P<2usize>)")
     );
     assert_eq!(
         rewrite(
-            referrer.clone().into_visitor(Some(bound("Z")), placeholder),
+            referrer
+                .clone()
+                .into_visitor(Some(bound("Z")), None, placeholder),
             sig
         ),
         rewritten("fn f(&self, a: Rel<Self>, b: P<1usize>, c: P<2usize>)")
     );
     // Without it, `Self` is not checked, so the first entry is used.
     assert_eq!(
-        rewrite(referrer.clone().into_visitor(None, placeholder), sig),
+        rewrite(referrer.clone().into_visitor(None, None, placeholder), sig),
         rewritten("fn f(&self, a: P<0usize>, b: P<1usize>, c: P<2usize>)")
     );
     // With the root, it is exact: `Self` is the one given or, if it is not given, the entry's.
     assert_eq!(
         rewrite(
-            referrer
-                .clone()
-                .into_visitor_with_root(&y.generics, Some(bound("Y")), placeholder),
+            referrer.clone().into_visitor_with_root(
+                &y.generics,
+                Some(bound("Y")),
+                None,
+                placeholder
+            ),
             sig
         ),
         rewritten("fn f(&self, a: P<3usize>, b: P<1usize>, c: P<2usize>)")
     );
     assert_eq!(
         rewrite(
-            referrer
-                .clone()
-                .into_visitor_with_root(&y.generics, Some(bound("Z")), placeholder),
+            referrer.clone().into_visitor_with_root(
+                &y.generics,
+                Some(bound("Z")),
+                None,
+                placeholder
+            ),
             sig
         ),
         rewritten("fn f(&self, a: Rel<Self>, b: P<1usize>, c: P<2usize>)")
     );
     assert_eq!(
         rewrite(
-            referrer.into_visitor_with_root(&y.generics, None, placeholder),
+            referrer.into_visitor_with_root(&y.generics, None, None, placeholder),
             sig
         ),
         rewritten("fn f(&self, a: P<0usize>, b: P<1usize>, c: P<2usize>)")
@@ -743,39 +721,28 @@ fn serialization_with_self() {
             fn g(&self) -> Wrap<T>;
         }
     );
-    leaker
-        .intern_with(&tr.generics, |v| v.visit_item_trait(&tr))
-        .unwrap();
+    leaker.intern_trait(&tr, true).unwrap();
     let st: ItemStruct = parse_quote!(
         struct S<T> {
             a: RelS<Self>,
         }
     );
-    leaker
-        .intern_with(&st.generics, |v| v.visit_item_struct(&st))
-        .unwrap();
-    let ty: Type = parse_quote!(RelC<Self>);
-    leaker
-        .intern_with(&Generics::default(), |v| v.visit_type(&ty))
-        .unwrap();
+    leaker.intern_struct(&st, true).unwrap();
     let plain: ItemStruct = parse_quote!(
         struct P {
             a: RelP,
         }
     );
-    leaker
-        .intern_with(&plain.generics, |v| v.visit_item_struct(&plain))
-        .unwrap();
+    leaker.intern_struct(&plain, true).unwrap();
     let referrer = leaker.finish();
     let tokens = quote!(#referrer);
     assert_eq!(
         tokens.to_string(),
         format!(
-            "\"{}\" 5 \
+            "\"{}\" 4 \
              < T > ; Self : X < T > ; (Rel < Self >) \
              < T > ; (Wrap < T >) \
              < T > ; Self = S < T > ; (RelS < Self >) \
-             Self = # 2 ; (RelC < Self >) \
              (RelP)",
             tag()
         )
@@ -798,6 +765,14 @@ fn serialization_with_self() {
     let version = tag();
     let parsed: Referrer = parse2(quote!(#version Self : X ; (Rel < Self >))).unwrap();
     assert_eq!(selfs(&parsed), ["Self: X"]);
+}
+
+#[test]
+fn a_call_as_self_is_not_parsed() {
+    // `Self` has no meaning outside the scopes which declare it, so there is no `Self` of a call
+    // (`Self = # 2 ;` was one, in the first format).
+    let text = format!("\"{}\" Self = # 2 ; (Rel < Self >)", tag());
+    assert!(parse_str::<Referrer>(&text).is_err());
 }
 
 #[test]

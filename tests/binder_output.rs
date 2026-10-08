@@ -50,7 +50,7 @@ fn analyze_with(
     mut leaker: Leaker,
     item: &ItemTrait,
 ) -> std::result::Result<Referrer, NotInternableError> {
-    leaker.intern_with(&item.generics, |v| v.visit_item_trait(item))?;
+    leaker.intern_trait(item, true)?;
     Ok(leaker.finish())
 }
 
@@ -250,9 +250,7 @@ fn the_type_holding_the_binder_is_leaked_as_a_whole() {
     // The fields of a struct.
     let item: ItemStruct = parse_quote! { struct S { f: for<'x> fn(Rel<'x>) -> &'x u8 } };
     let mut leaker = leaker();
-    leaker
-        .intern_with(&item.generics, |v| v.visit_item_struct(&item))
-        .unwrap();
+    leaker.intern_struct(&item, true).unwrap();
     let referrer = leaker.finish();
     assert_eq!(
         referrer.iter().map(s).collect::<Vec<_>>(),
@@ -451,7 +449,7 @@ fn the_copy_is_rewritten_to_the_type_holding_the_binder() {
     );
     let mut copy = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer.into_visitor(None, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.into_visitor(None, None, |_, ix| parse_quote!(P<#ix>)),
         &mut copy,
     );
     let expected: ItemTrait = parse_quote! {
@@ -1000,7 +998,7 @@ fn the_types_on_the_way_to_the_anchor_are_never_leaked() {
     let referrer = analyze(&item).unwrap();
     let mut copy = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer.into_visitor(None, |ty, _| {
+        &mut referrer.into_visitor(None, None, |ty, _| {
             let ty = s(&ty);
             parse_quote!(P<#ty>)
         }),
@@ -1035,7 +1033,7 @@ fn the_copy_keeps_the_trait_object_holding_the_anchor() {
     );
     let mut copy = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer.into_visitor(None, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.into_visitor(None, None, |_, ix| parse_quote!(P<#ix>)),
         &mut copy,
     );
     let expected: ItemTrait = parse_quote! {
@@ -1473,7 +1471,7 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     syn::visit_mut::VisitMut::visit_item_trait_mut(
         &mut referrer
             .clone()
-            .into_visitor(None, |_, ix| parse_quote!(P<#ix>)),
+            .into_visitor(None, None, |_, ix| parse_quote!(P<#ix>)),
         &mut kept,
     );
     let expected: ItemTrait = parse_quote! {
@@ -1486,9 +1484,11 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     // anchors `'x`, so the copy is valid.
     let mut replaced = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer
-            .allow_ambiguous_crate_name(false)
-            .into_visitor(None, |_, ix| parse_quote!(P<#ix>)),
+        &mut referrer.allow_ambiguous_crate_name(false).into_visitor(
+            None,
+            None,
+            |_, ix| parse_quote!(P<#ix>),
+        ),
         &mut replaced,
     );
     let expected: ItemTrait = parse_quote! {
@@ -1510,7 +1510,7 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
             &mut referrer
                 .clone()
                 .allow_ambiguous_crate_name(allow)
-                .into_visitor(None, |_, ix| parse_quote!(P<#ix>)),
+                .into_visitor(None, None, |_, ix| parse_quote!(P<#ix>)),
             &mut copy,
         );
         let expected: ItemTrait = parse_quote! {

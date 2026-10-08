@@ -134,35 +134,31 @@ fn test_check_self_no_internable() {
         pub struct MyStruct<'l1, const N1: usize, T1, T2, T3>;
     );
 
-    // Test with self_ty_can_be_interned = true (default behavior)
-    let leaker_true = Leaker::new();
-    let generics_true = &test_struct.generics;
+    // `Self` is allowed by `check()`.
+    let leaker = Leaker::new();
     assert_eq!(
-        kind(&leaker_true.check(&parse_quote!(Self), generics_true)),
+        kind(&leaker.check(&parse_quote!(Self), &test_struct.generics)),
         "Neutral"
-    ); // Self should be allowed by default
+    );
 
-    // Test with self_ty_can_be_interned = false
-    let mut leaker_false = Leaker::new();
-    // Set the flag to false to disallow Self types
-    leaker_false.self_ty_can_be_interned = false;
-    let generics_false = &test_struct.generics;
-    assert_eq!(
-        kind(&leaker_false.check(&parse_quote!(Self), generics_false)),
-        "MustNotIntern"
-    ); // Self should be rejected when flag is false
-
-    // Test with complex Self usage
-    assert_eq!(
-        kind(&leaker_false.check(&parse_quote!(&Self), generics_false)),
-        "MustNotIntern"
-    ); // Reference to Self should also be rejected
-
-    // Test that non-Self types are unaffected by the flag
-    assert_eq!(
-        kind(&leaker_false.check(&parse_quote!(T1), generics_false)),
-        "Neutral"
-    ); // Generic type should still work
+    // With `allow_self` unset, a type mentioning `Self` cannot be interned as a whole, as it is
+    // for the items.
+    let item: ItemStruct = parse_quote!(
+        pub struct MyStruct<T1> {
+            a: Rel<Self>,
+            b: T1,
+        }
+    );
+    assert!(Leaker::new().intern_struct(&item, true).is_ok());
+    assert!(Leaker::new().intern_struct(&item, false).is_err());
+    // The types which do not mention it are not affected.
+    let item: ItemStruct = parse_quote!(
+        pub struct MyStruct<T1> {
+            a: Rel<T1>,
+            b: Self,
+        }
+    );
+    assert!(Leaker::new().intern_struct(&item, false).is_ok());
 }
 
 #[test]
@@ -178,11 +174,7 @@ fn test_check_allows_dollar_crate() {
             ) -> ::core::result::Result<Self, Self::Error>;
         }
     );
-    leaker
-        .intern_with(&item.generics, |visitor| {
-            visitor.visit_item_trait(&item);
-        })
-        .unwrap();
+    leaker.intern_trait(&item, true).unwrap();
     leaker.reduce_roots();
     assert!(leaker.finish().is_empty());
 }
@@ -264,9 +256,7 @@ fn test_check_allowed_paths_with_generic_args() {
             fn g<I: Iterator<Item = RelType>>(&self, i: I);
         }
     };
-    leaker
-        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
-        .unwrap();
+    leaker.intern_trait(&item, true).unwrap();
     leaker.reduce_roots();
     let leaked: std::collections::BTreeSet<String> = leaker
         .finish()

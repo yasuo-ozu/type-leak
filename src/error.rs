@@ -1,48 +1,65 @@
 //! The error of the analysis by the [`Leaker`](crate::Leaker).
 
-use crate::analyze::CheckResult;
+use crate::analysis::CheckResult;
 use proc_macro2::{Span, TokenStream};
 use syn::spanned::Spanned;
 use template_quote::ToTokens;
 
-/// Error indicating that an item cannot be analyzed by the [`Leaker`](crate::Leaker).
+/// The error returned when an item cannot be analyzed by the [`Leaker`](crate::Leaker).
 ///
-/// It is reported as one error per offending path (or type), each with notes:
-///
-/// - how to fix it if possible, e.g. "use `::std::vec::Vec` instead of `Vec`" when the offending
-///   path starts with an item of the standard prelude or a primitive type,
-/// - why it cannot be leaked as a whole (the [`CheckResult::impossible`] causes, e.g. `'_`), and
-/// - the other paths inside it which depend on the type context (the rest of
-///   [`CheckResult::must`]), which are reported after it is fixed.
-///
-/// Converting the error into [`syn::Error`] (or into tokens with [`ToTokens`]) renders the notes
-/// as `note`s of the diagnostics.
+/// It has one error per offending path or type. Each has notes: a fix if possible (e.g. "use
+/// `::std::vec::Vec` instead of `Vec`"), the [`CheckResult::impossible`] causes that stop it from
+/// being leaked as a whole, and the other paths in it that depend on the context (the rest of
+/// [`CheckResult::must`]), which are reported once the first is fixed.
+/// [`syn::Error`] and [`ToTokens`] render the notes as `note`s.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum NotInternableError {
-    /// Paths which depend on the type context, but cannot be leaked (e.g. `MyType` in
-    /// `MyType<'_>`, a trait in a bound, a value in a const expression, or `Rel` in `F: for<'x>
-    /// Fn(Rel<'x>) -> &'x u8`, which cannot be leaked with a lifetime that the output of its
-    /// binder mentions and no input keeps as written), so they should be absolute. Each conflict
-    /// is reported at the first of its [`CheckResult::must`] (the offending path), with
-    /// [`CheckResult::is_own`] being `true`. For a trait bound, a value or the type of a const
-    /// parameter, [`CheckResult::impossible`] is the bound, the value or the const parameter. Never
-    /// empty.
+    /// Paths that depend on the context but cannot be leaked, so they must be absolute.
+    ///
+    /// Examples: `MyType` in `MyType<'_>`, a trait in a bound, a value in a const expression, and
+    /// `Rel` in `F: for<'x> Fn(Rel<'x>) -> &'x u8` ([Binder lifetimes](crate#binder-lifetimes)).
+    /// Each conflict is reported at the first of its [`CheckResult::must`], with
+    /// [`CheckResult::is_own`] `true`. For a trait bound, a value or the type of a const
+    /// parameter, [`CheckResult::impossible`] is that bound, value or parameter. Never empty.
     RelativePath(Vec<CheckResult>),
+    /// `Self` where no scope gives it a meaning. Never empty.
+    ///
+    /// That is directly in a module, or in generics that no struct, enum, union, impl or trait
+    /// encloses (`Leaker::enter_mod()`, `Leaker::enter_generics()`). It is also an error in the
+    /// bounds, where predicates and defaults of those generics. See
+    /// [Self rules](crate#self-rules).
+    /// Each item is the tokens of a mention (`Self`, `Self::Item`, or a type macro that names it).
+    /// Its span is where the error is reported, with the message "`Self` has no meaning here".
+    /// If a scope finds both kinds of errors, only [`NotInternableError::RelativePath`] is
+    /// returned. This kind is found after those are fixed.
+    SelfWithoutMeaning(Vec<TokenStream>),
 }
 
-/// One error to report: the offending tokens, the message and the notes.
 struct Report {
     tokens: TokenStream,
     message: String,
-    /// The notes, with the spans they refer to.
     notes: Vec<(Span, String)>,
 }
 
+const SELF_NOTE: &str = "`Self` has no meaning here: it is declared only by a struct, an enum, a \
+                         union, an impl or a trait, not by a module or generics";
+
 impl NotInternableError {
-    /// Returns the errors to report, one per offending path (or type).
     fn reports(&self) -> Vec<Report> {
-        let NotInternableError::RelativePath(conflicts) = self;
+        let conflicts = match self {
+            NotInternableError::RelativePath(conflicts) => conflicts,
+            NotInternableError::SelfWithoutMeaning(selves) => {
+                return selves
+                    .iter()
+                    .map(|tokens| Report {
+                        tokens: tokens.clone(),
+                        message: "`Self` has no meaning here".to_string(),
+                        notes: vec![(tokens.span(), SELF_NOTE.to_string())],
+                    })
+                    .collect();
+            }
+        };
         conflicts
             .iter()
             .filter_map(|conflict| {
@@ -54,8 +71,7 @@ impl NotInternableError {
                 }
                 .into_iter()
                 .collect();
-                // Why it cannot be leaked as a whole (unless it is the path itself, e.g. a
-                // trait bound).
+                // A cause that is the path itself (e.g. a trait bound) needs no note.
                 for cause in conflict
                     .impossible
                     .iter()
@@ -74,7 +90,6 @@ impl NotInternableError {
                         ));
                     }
                 }
-                // The other paths inside it, which are found after this one is fixed.
                 notes.extend(others.iter().map(|other| {
                     (
                         other.span(),
@@ -97,16 +112,17 @@ impl NotInternableError {
             .map_or_else(Span::call_site, |report| report.tokens.span())
     }
 
-    /// Returns the note of the first error, suggesting how to fix it: for
-    /// [`NotInternableError::RelativePath`], the absolute path to use instead of the first
-    /// segment of the offending path, if it is an item of the standard prelude or a primitive
-    /// type.
+    /// Returns the note of the first error, which suggests how to fix it.
+    ///
+    /// For `RelativePath` it is the absolute path to use instead of the first segment, if that is a
+    /// prelude item or a primitive type. For `SelfWithoutMeaning` it tells which items declare
+    /// `Self`.
     ///
     /// ```
     /// # use type_leak::*;
     /// # use syn::*;
     /// let item: ItemTrait = parse_quote!(trait MyTrait: Clone {});
-    /// let err = Leaker::from_trait(&item).err().unwrap();
+    /// let err = Leaker::new().intern_trait(&item, true).err().unwrap();
     /// assert_eq!(err.to_string(), "use absolute path: 'Clone'");
     /// assert_eq!(
     ///     err.note().as_deref(),
@@ -119,10 +135,8 @@ impl NotInternableError {
     }
 }
 
-/// Returns `true` if `cause` is a trait object without a lifetime bound (e.g. `dyn Trait`), which is
-/// a cause only if it is the referent of a reference, or an argument of a path, with an elided
-/// lifetime, or one the path cannot be interned with (several lifetimes, a method lifetime which
-/// the copy would leave unconstrained, or a trait bound).
+/// A trait object without a lifetime bound is a cause only under an elided lifetime, or where the
+/// path cannot be leaked (see [Trait objects](crate#trait-objects)).
 fn is_default_lifetime_object(cause: &TokenStream) -> bool {
     match syn::parse2::<syn::Type>(cause.clone()) {
         Ok(syn::Type::TraitObject(object)) => !object
@@ -143,8 +157,6 @@ fn offending_path(tokens: &TokenStream) -> Option<syn::Path> {
     })
 }
 
-/// Returns a note suggesting the absolute path to use instead of the first segment of `tokens`
-/// (a path or a trait bound, e.g. `for<'a> Fn(&'a u8)`), with the span of the segment.
 fn absolute_path_note(tokens: &TokenStream) -> Option<(Span, String)> {
     let path = offending_path(tokens)?;
     if path.leading_colon.is_some() {
@@ -178,28 +190,10 @@ impl std::fmt::Display for NotInternableError {
 
 impl std::error::Error for NotInternableError {}
 
-/// Converts into a [`syn::Error`] with one error per offending path (combined with
-/// [`syn::Error::combine()`]), each with its notes rendered as `note`s of the diagnostic.
+/// Converts into a [`syn::Error`], with one error per offending path combined by
+/// [`syn::Error::combine()`].
 ///
-/// Since stable Rust has no API for sub-diagnostics of proc macros, the note is appended to the
-/// message (as `proc-macro-error` does on stable), which rustc renders as:
-///
-/// ```text
-/// error: use absolute path: 'Clone'
-///
-///          = note: use `::core::clone::Clone` instead of `Clone`
-/// ```
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// let item: ItemTrait = parse_quote!(trait MyTrait: Clone {});
-/// let err: syn::Error = Leaker::from_trait(&item).err().unwrap().into();
-/// assert_eq!(
-///     err.to_string(),
-///     "use absolute path: 'Clone'\n\n  = note: use `::core::clone::Clone` instead of `Clone`\n"
-/// );
-/// ```
+/// Stable Rust has no sub-diagnostics for proc macros, so each note is appended to the message.
 impl From<NotInternableError> for syn::Error {
     fn from(err: NotInternableError) -> Self {
         err.to_syn_error()
@@ -229,39 +223,12 @@ impl NotInternableError {
     }
 }
 
-/// Emits the errors as `compile_error!` invocations, with the notes rendered as in the conversion
-/// into [`syn::Error`], so a proc macro can report them with e.g.
-/// `Err(e) => e.into_token_stream().into()`.
+/// Emits the errors as `compile_error!` invocations, with the notes rendered as for [`syn::Error`].
+/// A proc macro can report them with `Err(e) => e.into_token_stream().into()`.
 ///
-/// On nightly Rust (when `proc_macro::Diagnostic` is available), inside a proc macro, the errors
-/// are instead emitted directly as diagnostics, whose notes have their own spans (e.g. the first
-/// segment of the offending path), and no tokens are produced:
-///
-/// ```text
-/// error: use absolute path: 'Clone'
-///  --> src/lib.rs:2:20
-///   |
-/// 2 | pub trait MyTrait: Clone {}
-///   |                    ^^^^^
-///   |
-/// note: use `::core::clone::Clone` instead of `Clone`
-///  --> src/lib.rs:2:20
-///   |
-/// 2 | pub trait MyTrait: Clone {}
-///   |                    ^^^^^
-/// ```
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// # use template_quote::ToTokens;
-/// let item: ItemTrait = parse_quote!(trait MyTrait: Clone {});
-/// let err = Leaker::from_trait(&item).err().unwrap();
-/// assert_eq!(
-///     err.to_token_stream().to_string(),
-///     syn::Error::from(err).to_compile_error().to_string()
-/// );
-/// ```
+/// On nightly, when `proc_macro::Diagnostic` is available inside a proc macro, the errors are
+/// emitted as diagnostics instead, with notes at their own spans (e.g. the first segment of the
+/// offending path), and no tokens are produced.
 impl ToTokens for NotInternableError {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         // Only compiled on nightly, so the MSRV does not apply.
@@ -277,7 +244,6 @@ impl ToTokens for NotInternableError {
 
 #[cfg(type_leak_diagnostic)]
 impl NotInternableError {
-    /// Emits the errors as diagnostics, with the notes at their own spans.
     fn emit_diagnostics(&self) {
         /// Converts a span into that of the compiler (only valid inside a proc macro).
         fn unwrap_span(span: Span) -> proc_macro::Span {
@@ -302,7 +268,7 @@ impl NotInternableError {
     }
 }
 
-/// Items of the standard prelude and primitive types, with their absolute paths.
+/// Absolute paths of the standard prelude items and the primitive types.
 pub(crate) const ABSOLUTE_PATHS: &[(&str, &str)] = &[
     ("Box", "::std::boxed::Box"),
     ("String", "::std::string::String"),
@@ -342,7 +308,6 @@ pub(crate) const ABSOLUTE_PATHS: &[(&str, &str)] = &[
     ("None", "::core::option::Option::None"),
     ("Ok", "::core::result::Result::Ok"),
     ("Err", "::core::result::Result::Err"),
-    // Primitive types.
     ("bool", "::core::primitive::bool"),
     ("char", "::core::primitive::char"),
     ("str", "::core::primitive::str"),

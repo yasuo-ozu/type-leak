@@ -2,39 +2,22 @@
 
 use syn::*;
 
-/// Configuration for building a [`Leaker`](crate::Leaker).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Configuration for [`Leaker::from_config()`](crate::Leaker::from_config).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LeakerConfig {
-    /// Paths treated as context-free (not leaked), relative or absolute (e.g. `parse_quote!(::serde)`
-    /// allows `::serde::Serialize`, and not the relative `serde::Serialize`). See
-    /// [`Leaker::allowed_paths`](crate::Leaker::allowed_paths), which also tells how the paths
-    /// with a leading `::` are dealt with (the external crates, which the Referrer may or may not
-    /// replace).
-    ///
-    /// An absolute path which is allowed is assumed to name the same crate in the Referrer's
-    /// crate: the crates are matched by **name only**, whatever their version, package or origin
-    /// is, so allow only the crates known to be identical on both sides.
+    /// Paths that are not leaked. See [`Leaker::allowed_paths`](crate::Leaker::allowed_paths).
+    /// Allow only crates that are the same on both sides ([External
+    /// crates](crate#external-crates)).
     pub allowed_paths: Vec<Path>,
-    /// Whether a type mentioning `Self` may be leaked as a whole (default `true`). See
-    /// [`Leaker::self_ty_can_be_interned`](crate::Leaker::self_ty_can_be_interned).
-    pub self_ty_can_be_interned: bool,
-}
-
-impl Default for LeakerConfig {
-    fn default() -> Self {
-        Self {
-            allowed_paths: Vec::new(),
-            self_ty_can_be_interned: true,
-        }
-    }
 }
 
 impl LeakerConfig {
+    /// Creates a configuration which allows no path.
     pub fn new() -> Self {
         Default::default()
     }
 
-    /// Allow primitive types from `::core::primitive`.
+    /// Allows the primitive types (`u8`, `bool`, `str`, ...).
     pub fn allow_primitive(&mut self) -> &mut Self {
         self.allowed_paths.extend([
             parse_quote!(bool),
@@ -58,7 +41,7 @@ impl LeakerConfig {
         self
     }
 
-    /// Allow items in the standard prelude (`std::prelude::v1`).
+    /// Allows the names of the standard prelude (`Vec`, `Option`, `Clone`, ...).
     pub fn allow_std_prelude(&mut self) -> &mut Self {
         self.allowed_paths.extend([
             parse_quote!(Box),
@@ -96,7 +79,7 @@ impl LeakerConfig {
         self
     }
 
-    /// Allow paths starting with `crate`.
+    /// Allows paths that start with `crate`.
     pub fn allow_crate(&mut self) -> &mut Self {
         self.allowed_paths.push(parse_quote!(crate));
         self

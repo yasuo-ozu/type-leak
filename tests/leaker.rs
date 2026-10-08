@@ -1,5 +1,7 @@
 //! Tests for building a `Leaker` and interning items.
 
+mod common;
+
 use std::collections::BTreeSet;
 use syn::*;
 use template_quote::quote;
@@ -14,7 +16,8 @@ fn test_leaker() {
             field3: &'a (T1, T2),
         }
     );
-    let (mut leaker, _) = Leaker::from_struct(&test_struct).unwrap();
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&test_struct, true).unwrap();
     leaker.reduce_roots();
     let referrer = leaker.finish();
     assert_eq!(
@@ -44,30 +47,54 @@ fn test_leaker() {
 
 #[test]
 fn test_leaker_construction() {
-    assert!(Leaker::from_struct(&parse_quote! {
-        struct MyStruct<T: path::to::MyTrait>();
-    })
-    .is_err());
-    assert!(Leaker::from_struct(&parse_quote! {
-        struct MyStruct<T: ::path::to::MyTrait>();
-    })
-    .is_ok());
-    assert!(Leaker::from_trait(&parse_quote! {
-        trait MyTrait: MyTrait2 {}
-    },)
-    .is_err());
-    assert!(Leaker::from_trait(&parse_quote! {
-        trait MyTrait: ::path::to::MyTrait2 {}
-    },)
-    .is_ok());
-    assert!(Leaker::from_trait(&parse_quote! {
-        trait MyTrait: ::path::to::MyTrait2<{<Self as ::path::to::MyTrait3>::N}> {}
-    },)
-    .is_ok());
-    assert!(Leaker::from_trait(&parse_quote! {
-        trait MyTrait: ::path::to::MyTrait2<{<Self as MyTrait3>::N}> {}
-    },)
-    .is_err());
+    assert!(Leaker::new()
+        .intern_struct(
+            &parse_quote! {
+                struct MyStruct<T: path::to::MyTrait>();
+            },
+            true
+        )
+        .is_err());
+    assert!(Leaker::new()
+        .intern_struct(
+            &parse_quote! {
+                struct MyStruct<T: ::path::to::MyTrait>();
+            },
+            true
+        )
+        .is_ok());
+    assert!(Leaker::new()
+        .intern_trait(
+            &parse_quote! {
+                trait MyTrait: MyTrait2 {}
+            },
+            true
+        )
+        .is_err());
+    assert!(Leaker::new()
+        .intern_trait(
+            &parse_quote! {
+                trait MyTrait: ::path::to::MyTrait2 {}
+            },
+            true
+        )
+        .is_ok());
+    assert!(Leaker::new()
+        .intern_trait(
+            &parse_quote! {
+                trait MyTrait: ::path::to::MyTrait2<{<Self as ::path::to::MyTrait3>::N}> {}
+            },
+            true
+        )
+        .is_ok());
+    assert!(Leaker::new()
+        .intern_trait(
+            &parse_quote! {
+                trait MyTrait: ::path::to::MyTrait2<{<Self as MyTrait3>::N}> {}
+            },
+            true
+        )
+        .is_err());
 }
 
 #[test]
@@ -84,11 +111,7 @@ fn test_intern() {
     let mut leaker = Leaker::new();
     leaker.allowed_paths.push(parse_quote!(crate));
 
-    leaker
-        .intern_with(&item.generics, |visitor| {
-            visitor.visit_item_trait(&item);
-        })
-        .unwrap();
+    leaker.intern_trait(&item, true).unwrap();
     leaker.reduce_roots();
     assert!(leaker.finish().is_empty());
 }
@@ -100,7 +123,7 @@ fn leak_struct(item: &ItemStruct) -> Result<BTreeSet<String>> {
     config.allow_primitive().allow_std_prelude();
     let mut leaker = Leaker::from_config(config);
     leaker
-        .intern_with(&item.generics, |v| v.visit_item_struct(item))
+        .intern_struct(item, true)
         .map_err(|e| Error::new(e.span(), e))?;
     Ok(leaker
         .finish()
@@ -114,7 +137,7 @@ fn leak_trait(item: &ItemTrait) -> Result<BTreeSet<String>> {
     config.allow_primitive().allow_std_prelude();
     let mut leaker = Leaker::from_config(config);
     leaker
-        .intern_with(&item.generics, |v| v.visit_item_trait(item))
+        .intern_trait(item, true)
         .map_err(|e| Error::new(e.span(), e))?;
     Ok(leaker
         .finish()
@@ -164,10 +187,11 @@ fn test_finish_reduces_and_accumulates() {
             a: A,
         }
     );
-    let (leaker, _) = Leaker::from_struct(&item).unwrap();
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&item, true).unwrap();
     assert_eq!(leaker.finish().iter().count(), 1);
 
-    // Several `intern_with()` and `reduce_roots()` calls accumulate.
+    // Several `intern_struct()` and `reduce_roots()` calls accumulate.
     let s: ItemStruct = parse_quote!(
         struct S {
             a: A,
@@ -179,13 +203,9 @@ fn test_finish_reduces_and_accumulates() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker
-        .intern_with(&s.generics, |v| v.visit_item_struct(&s))
-        .unwrap();
+    leaker.intern_struct(&s, true).unwrap();
     leaker.reduce_roots();
-    leaker
-        .intern_with(&u.generics, |v| v.visit_item_struct(&u))
-        .unwrap();
+    leaker.intern_struct(&u, true).unwrap();
     leaker.reduce_roots();
     let leaked: BTreeSet<String> = leaker
         .finish()
@@ -202,13 +222,14 @@ fn test_finish_order_is_deterministic() {
         struct S { e: E, c: C, a: A, d: D, b: B, a2: A }
     };
     let finish = || -> Vec<String> {
-        Leaker::from_struct(&item)
-            .unwrap()
-            .0
-            .finish()
-            .iter()
-            .map(|t| quote!(#t).to_string())
-            .collect()
+        {
+            let mut leaker = Leaker::new();
+            leaker.intern_struct(&item, true).unwrap();
+            leaker.finish()
+        }
+        .iter()
+        .map(|t| quote!(#t).to_string())
+        .collect()
     };
     let first = finish();
     assert_eq!(
@@ -301,9 +322,7 @@ fn test_assertions_for_assumed_primitives() {
     let mut config = type_leak::LeakerConfig::new();
     config.allow_primitive();
     let mut leaker = Leaker::from_config(config);
-    leaker
-        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
-        .unwrap();
+    leaker.intern_trait(&item, true).unwrap();
     let assertions = leaker.assertions().to_string();
     assert!(assertions.contains("__type_leak_assert_u8_is_primitive"));
     assert!(assertions.contains("__type_leak_assert_u16_is_primitive"));
@@ -317,9 +336,7 @@ fn test_assertions_for_assumed_primitives() {
 
     // Without `allow_primitive()`, `u16` in a type is leaked, so it is not assumed.
     let mut leaker = Leaker::new();
-    leaker
-        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
-        .unwrap();
+    leaker.intern_trait(&item, true).unwrap();
     let assertions = leaker.assertions().to_string();
     assert!(assertions.contains("__type_leak_assert_u8_is_primitive"));
     assert!(!assertions.contains("__type_leak_assert_u16_is_primitive"));
@@ -330,15 +347,13 @@ fn test_assertions_for_assumed_primitives() {
             t: T,
         }
     );
-    assert!(Leaker::from_struct(&item)
-        .unwrap()
-        .0
-        .assertions()
-        .is_empty());
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&item, true).unwrap();
+    assert!(leaker.assertions().is_empty());
 }
 
 #[test]
-fn test_leaker_from_union() {
+fn test_leaker_intern_union() {
     let item: ItemUnion = parse_quote! {
         pub union MyUnion<'a, T: ::core::marker::Copy> {
             a: ::core::mem::ManuallyDrop<MyType1>,
@@ -346,7 +361,9 @@ fn test_leaker_from_union() {
             c: (MyType2, u8),
         }
     };
-    let referrer = Leaker::from_union(&item).unwrap().0.finish();
+    let mut leaker = Leaker::new();
+    leaker.intern_union(&item, true).unwrap();
+    let referrer = leaker.finish();
     assert_eq!(
         referrer
             .iter()
@@ -363,10 +380,14 @@ fn test_leaker_from_union() {
         .collect::<BTreeSet<_>>()
     );
     // Bounds must use absolute paths as for structs.
-    assert!(Leaker::from_union(&parse_quote! {
-        union MyUnion<T: Copy> { a: T }
-    })
-    .is_err());
+    assert!(Leaker::new()
+        .intern_union(
+            &parse_quote! {
+                union MyUnion<T: Copy> { a: T }
+            },
+            true
+        )
+        .is_err());
 }
 
 #[test]
@@ -374,13 +395,10 @@ fn test_receivers() {
     // The type of a receiver (`&self` is `self: &Self`) is analyzed as any other type, where
     // `Self` alone is never leaked.
     let leak = |sig: proc_macro2::TokenStream,
-                self_ty_can_be_interned: bool|
+                allow_self: bool|
      -> std::result::Result<BTreeSet<String>, String> {
-        let item: ItemTrait = parse_quote!(trait Tr<'a> { #sig });
         let mut leaker = Leaker::new();
-        leaker.self_ty_can_be_interned = self_ty_can_be_interned;
-        leaker
-            .intern_with(&item.generics, |v| v.visit_item_trait(&item))
+        common::intern_fns(&mut leaker, &parse_quote!(<'a>), sig, allow_self)
             .map_err(|e| e.to_string())?;
         Ok(leaker
             .finish()
@@ -388,7 +406,7 @@ fn test_receivers() {
             .map(|t| quote!(#t).to_string())
             .collect::<BTreeSet<_>>())
     };
-    for self_ty_can_be_interned in [true, false] {
+    for allow_self in [true, false] {
         for sig in [
             quote!(
                 fn f(&self);
@@ -409,12 +427,7 @@ fn test_receivers() {
                 fn f(&self) -> &Self;
             ),
         ] {
-            assert_eq!(
-                leak(sig, self_ty_can_be_interned),
-                Ok(BTreeSet::new()),
-                "{}",
-                self_ty_can_be_interned
-            );
+            assert_eq!(leak(sig, allow_self), Ok(BTreeSet::new()), "{}", allow_self);
         }
     }
 
@@ -458,11 +471,9 @@ fn test_grouped_const_param_type_is_asserted() {
     });
     for ty in [parse_quote!(u8), grouped] {
         let item: ItemTrait = parse_quote!(trait Tr<const N: #ty> {});
-        let assertions = Leaker::from_trait(&item)
-            .unwrap()
-            .0
-            .assertions()
-            .to_string();
+        let mut leaker = Leaker::new();
+        leaker.intern_trait(&item, true).unwrap();
+        let assertions = leaker.assertions().to_string();
         assert!(
             assertions.contains("__type_leak_assert_u8_is_primitive"),
             "{}",
@@ -473,7 +484,9 @@ fn test_grouped_const_param_type_is_asserted() {
     let item: ItemTrait = parse_quote!(
         trait Tr<const N: ::core::primitive::u8> {}
     );
-    assert!(Leaker::from_trait(&item).unwrap().0.assertions().is_empty());
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true).unwrap();
+    assert!(leaker.assertions().is_empty());
 }
 
 #[test]
@@ -517,13 +530,10 @@ fn test_impl_trait_binders() {
 #[test]
 fn test_self_ty_cannot_be_interned() {
     let leak = |sig: proc_macro2::TokenStream,
-                self_ty_can_be_interned: bool|
+                allow_self: bool|
      -> std::result::Result<BTreeSet<String>, syn::Error> {
-        let item: ItemTrait = parse_quote!(trait Tr { #sig });
         let mut leaker = Leaker::new();
-        leaker.self_ty_can_be_interned = self_ty_can_be_interned;
-        leaker
-            .intern_with(&item.generics, |v| v.visit_item_trait(&item))
+        common::intern_fns(&mut leaker, &Generics::default(), sig, allow_self)
             .map_err(syn::Error::from)?;
         // The required entries (the optional ones are those of external crates, below).
         let referrer = leaker.finish();
@@ -586,17 +596,17 @@ fn test_self_ty_cannot_be_interned() {
 
     // The type of an external crate with `Self` in it is an optional entry (which the Referrer
     // may replace) only if `Self` can be leaked (old: not an entry, as the crate was trusted).
-    let optional = |self_ty_can_be_interned: bool| {
-        let item: ItemTrait = parse_quote!(
-            trait Tr {
-                fn f(&self) -> ::k::W<(Rel,), Self>;
-            }
-        );
+    let optional = |allow_self: bool| {
         let mut leaker = Leaker::new();
-        leaker.self_ty_can_be_interned = self_ty_can_be_interned;
-        leaker
-            .intern_with(&item.generics, |v| v.visit_item_trait(&item))
-            .unwrap();
+        common::intern_fns(
+            &mut leaker,
+            &Generics::default(),
+            quote!(
+                fn f(&self) -> ::k::W<(Rel,), Self>;
+            ),
+            allow_self,
+        )
+        .unwrap();
         let referrer = leaker.finish();
         referrer
             .iter()
@@ -645,9 +655,7 @@ fn test_bodies_are_not_analyzed() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker
-        .intern_with(&Generics::default(), |v| v.visit_item_impl(&item))
-        .unwrap();
+    leaker.intern_impl(&item, true).unwrap();
     let referrer = leaker.finish();
     // `::k::W`, the type of an external crate, is an optional entry, after the required ones.
     assert_eq!(
@@ -676,9 +684,7 @@ fn test_bodies_are_not_analyzed() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker
-        .intern_with(&Generics::default(), |v| v.visit_item_mod(&item))
-        .unwrap();
+    leaker.intern_mod(&item).unwrap();
     assert_eq!(
         leaker
             .finish()

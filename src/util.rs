@@ -4,13 +4,13 @@ use crate::error::ABSOLUTE_PATHS;
 use proc_macro2::TokenStream;
 use std::collections::HashSet;
 use syn::ext::IdentExt;
+use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
 
-/// Returns `true` if the segments of `path` start with those of `prefix` (e.g. `Option<T>` starts
-/// with `Option`, and `std::vec::Vec<T>` starts with `std::vec`), comparing only the identifiers:
-/// generic arguments of `path` are allowed.
+/// Returns `true` if `path` starts with `prefix`, comparing identifiers. Both have a leading `::`
+/// or neither.
 pub(crate) fn path_starts_with(path: &Path, prefix: &Path) -> bool {
     prefix.leading_colon.is_some() == path.leading_colon.is_some()
         && prefix.segments.len() <= path.segments.len()
@@ -21,14 +21,45 @@ pub(crate) fn path_starts_with(path: &Path, prefix: &Path) -> bool {
             .all(|(prefix_seg, seg)| prefix_seg.ident == seg.ident)
 }
 
-/// Returns `true` if `ident` is the name of a primitive type (e.g. `u8` or `str`).
+/// The paths a Leaker treats as context-free.
+#[derive(Clone, Copy)]
+pub(crate) struct AllowedPaths<'a>(pub(crate) &'a [Path]);
+
+impl AllowedPaths<'_> {
+    /// Returns `true` if `path` is absolute, starts with `$crate`, or starts with an allowed path.
+    /// A type with an absolute path may still be an optional entry (see `is_soft_path()`).
+    pub(crate) fn is_context_free_path(&self, path: &Path) -> bool {
+        path.leading_colon.is_some()
+            || matches!(
+                path.segments.iter().next(),
+                Some(PathSegment {
+                    ident,
+                    arguments: PathArguments::None,
+                }) if ident == "$crate"
+            )
+            || self.is_allowed_path(path)
+    }
+
+    fn is_allowed_path(&self, path: &Path) -> bool {
+        self.0.iter().any(|allowed| path_starts_with(path, allowed))
+    }
+
+    /// Returns `true` for an absolute path to an external crate (not `::core`, not allowed). The
+    /// Referrer may replace such a type, so nothing in it is anchored (see `scan_anchors()`).
+    pub(crate) fn is_soft_path(&self, path: &Path) -> bool {
+        path.leading_colon.is_some()
+            && !matches!(path.segments.first(), Some(seg) if seg.ident == "core")
+            && !self.is_allowed_path(path)
+    }
+}
+
 pub(crate) fn is_primitive_name(ident: &Ident) -> bool {
     ABSOLUTE_PATHS
         .iter()
         .any(|(name, absolute)| ident == name && absolute.starts_with("::core::primitive::"))
 }
 
-/// Returns `true` if `ty` refers to any of `idents` (as the first segment of a relative path) or
+/// Returns `true` if `ty` refers to `idents` (as the first segment of a relative path) or
 /// `lifetimes`.
 pub(crate) fn mentions_names(ty: &Type, idents: Vec<Ident>, lifetimes: Vec<Lifetime>) -> bool {
     struct Visitor {
@@ -82,12 +113,12 @@ pub(crate) fn mentions_names(ty: &Type, idents: Vec<Ident>, lifetimes: Vec<Lifet
     visitor.found
 }
 
-/// Returns the name of `ident` without `r#` (e.g. `T` for `r#T`), by which names are compared.
+/// Returns the name of `ident` without `r#`, by which names are compared.
 pub(crate) fn ident_name(ident: &Ident) -> String {
     ident.unraw().to_string()
 }
 
-/// Collects the names of identifiers and lifetimes (e.g. `N` and `'a`) in `tokens`, without `r#`.
+/// Collects the names of the identifiers and lifetimes in `tokens`, without `r#`.
 pub(crate) fn token_names(tokens: TokenStream, names: &mut HashSet<String>) {
     let mut after_quote = false;
     for tt in tokens {
@@ -108,7 +139,6 @@ pub(crate) fn token_names(tokens: TokenStream, names: &mut HashSet<String>) {
     }
 }
 
-/// Returns the name of a generic parameter, e.g. `N` or `'a`.
 pub(crate) fn generic_param_name(param: &GenericParam) -> String {
     match param {
         GenericParam::Type(TypeParam { ident, .. })
@@ -117,8 +147,7 @@ pub(crate) fn generic_param_name(param: &GenericParam) -> String {
     }
 }
 
-/// Returns the type inside invisible groups (e.g. from `$t:ty` in `macro_rules!`) and
-/// parentheses.
+/// Returns the type inside invisible groups (from `$t:ty` in `macro_rules!`) and parentheses.
 pub(crate) fn unwrap_type_group(ty: &Type) -> &Type {
     match ty {
         Type::Group(TypeGroup { elem, .. }) | Type::Paren(TypeParen { elem, .. }) => {
@@ -128,8 +157,6 @@ pub(crate) fn unwrap_type_group(ty: &Type) -> &Type {
     }
 }
 
-/// Returns `true` if the trait object has a lifetime bound (e.g. `dyn Trait + 'a`), so it does not
-/// default to one.
 pub(crate) fn has_lifetime_bound(object: &TypeTraitObject) -> bool {
     object
         .bounds
@@ -137,7 +164,7 @@ pub(crate) fn has_lifetime_bound(object: &TypeTraitObject) -> bool {
         .any(|bound| matches!(bound, TypeParamBound::Lifetime(_)))
 }
 
-/// Returns the trait object which `ty` is, also inside parentheses and groups.
+/// Returns the trait object that `ty` is, also inside parentheses and groups.
 pub(crate) fn trait_object_of(ty: &Type) -> Option<&TypeTraitObject> {
     match unwrap_type_group(ty) {
         Type::TraitObject(object) => Some(object),
@@ -145,20 +172,20 @@ pub(crate) fn trait_object_of(ty: &Type) -> Option<&TypeTraitObject> {
     }
 }
 
-/// Finds the first mention of `Self` (a path starting with it, e.g. `Self`, `Self::X` or the self
-/// type of `<Self as ..>`, or the name in the tokens of a macro, but not `::p::Self`).
+/// Finds the mentions of `Self`: a path starting with it (`Self`, `Self::X`, the self type of
+/// `<Self as ..>`), or the name in the tokens of a macro. `::p::Self` is not one.
 #[derive(Default)]
 struct SelfFinder {
-    found: Option<TokenStream>,
+    found: Vec<TokenStream>,
 }
 
 impl SelfFinder {
-    /// Scans the tokens, which are not parsed (e.g. of a macro), for the name.
+    /// Scans tokens that are not parsed, such as those of a macro, for the name.
     fn scan(&mut self, tokens: TokenStream) {
         let mut names = HashSet::new();
         token_names(tokens, &mut names);
         if names.contains("Self") {
-            self.found.get_or_insert_with(|| quote!(Self));
+            self.found.push(quote!(Self));
         }
     }
 }
@@ -166,7 +193,7 @@ impl SelfFinder {
 impl<'ast> Visit<'ast> for SelfFinder {
     fn visit_path(&mut self, i: &'ast Path) {
         if i.leading_colon.is_none() && i.segments.first().map_or(false, |s| s.ident == "Self") {
-            self.found.get_or_insert_with(|| quote!(#i));
+            self.found.push(quote!(#i));
         }
         syn::visit::visit_path(self, i)
     }
@@ -182,37 +209,101 @@ impl<'ast> Visit<'ast> for SelfFinder {
     }
 }
 
-/// Returns `true` if `ty` mentions `Self`.
 pub(crate) fn type_mentions_self(ty: &Type) -> bool {
     let mut finder = SelfFinder::default();
     finder.visit_type(ty);
-    finder.found.is_some()
+    !finder.found.is_empty()
 }
 
-/// Returns `true` if the bounds (or the default) of `param` mention `Self`.
 pub(crate) fn generic_param_mentions_self(param: &GenericParam) -> bool {
     let mut finder = SelfFinder::default();
     finder.visit_generic_param(param);
-    finder.found.is_some()
+    !finder.found.is_empty()
 }
 
-/// Returns `true` if `predicate` mentions `Self`.
 pub(crate) fn where_predicate_mentions_self(predicate: &WherePredicate) -> bool {
     let mut finder = SelfFinder::default();
     finder.visit_where_predicate(predicate);
-    finder.found.is_some()
+    !finder.found.is_empty()
 }
 
-/// Returns the first mention of `Self` in `generics` (the bounds and the where predicates).
 pub(crate) fn first_self_in_generics(generics: &Generics) -> Option<TokenStream> {
+    selves_in_generics(generics).into_iter().next()
+}
+
+/// Returns the mentions of `Self` in the bounds, defaults and where predicates of `generics`.
+pub(crate) fn selves_in_generics(generics: &Generics) -> Vec<TokenStream> {
     let mut finder = SelfFinder::default();
     finder.visit_generics(generics);
     finder.found
 }
 
-/// Returns the first mention of `Self` in `ty`.
 pub(crate) fn first_self_in_type(ty: &Type) -> Option<TokenStream> {
     let mut finder = SelfFinder::default();
     finder.visit_type(ty);
-    finder.found
+    finder.found.into_iter().next()
+}
+
+/// Returns the first `n` parameters without defaults, and the where predicates that do not name the
+/// others.
+pub(crate) fn without_defaults(generics: &Generics, n: usize) -> Generics {
+    let params: Punctuated<GenericParam, Token![,]> = generics
+        .params
+        .iter()
+        .take(n)
+        .cloned()
+        .map(|mut param| {
+            match &mut param {
+                GenericParam::Type(tp) => {
+                    tp.eq_token = None;
+                    tp.default = None;
+                }
+                GenericParam::Const(cp) => {
+                    cp.eq_token = None;
+                    cp.default = None;
+                }
+                GenericParam::Lifetime(_) => (),
+            }
+            param
+        })
+        .collect();
+    let later: HashSet<String> = generics
+        .params
+        .iter()
+        .skip(n)
+        .map(generic_param_name)
+        .collect();
+    let predicates: Punctuated<WherePredicate, Token![,]> = generics
+        .where_clause
+        .iter()
+        .flat_map(|wc| wc.predicates.iter())
+        .filter(|predicate| {
+            let mut names = HashSet::new();
+            token_names(quote!(#predicate), &mut names);
+            names.is_disjoint(&later)
+        })
+        .cloned()
+        .collect();
+    let has_params = !params.is_empty();
+    Generics {
+        lt_token: if has_params {
+            Some(Default::default())
+        } else {
+            None
+        },
+        params,
+        gt_token: if has_params {
+            Some(Default::default())
+        } else {
+            None
+        },
+        where_clause: if predicates.is_empty() {
+            None
+        } else {
+            Some(WhereClause {
+                where_token: Default::default(),
+                predicates,
+            })
+        },
+    }
 }

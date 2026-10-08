@@ -17,7 +17,7 @@ fn config() -> LeakerConfig {
 fn leak_trait_with(config: LeakerConfig, item: &ItemTrait) -> std::result::Result<Leaker, String> {
     let mut leaker = Leaker::from_config(config);
     leaker
-        .intern_with(&item.generics, |v| v.visit_item_trait(item))
+        .intern_trait(item, true)
         .map_err(|e| syn::Error::from(e).to_string())?;
     Ok(leaker)
 }
@@ -29,7 +29,7 @@ fn leak_trait(item: ItemTrait) -> Referrer {
 fn leak_module_with(config: LeakerConfig, item: &ItemMod) -> std::result::Result<Leaker, String> {
     let mut leaker = Leaker::from_config(config);
     leaker
-        .intern_with(&Generics::default(), |v| v.visit_item_mod(item))
+        .intern_mod(item)
         .map_err(|e| syn::Error::from(e).to_string())?;
     Ok(leaker)
 }
@@ -56,13 +56,18 @@ fn optional_entries(referrer: &Referrer) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The module key of each entry.
+/// The path of the module of each entry (see `Referrer::module_path()`).
 fn modules(referrer: &Referrer) -> Vec<Option<Vec<String>>> {
     (0..referrer.iter().count())
         .map(|ix| {
-            referrer
-                .context_module(referrer.context(ix))
-                .map(|m| m.iter().map(|i| i.to_string()).collect())
+            referrer.context_module(referrer.context(ix)).map(|m| {
+                referrer
+                    .module_path(m)
+                    .unwrap()
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect()
+            })
         })
         .collect()
 }
@@ -418,9 +423,17 @@ fn type_macros() {
         trait Tr { fn f(&self) -> ::p::Wrap<::p::m!(Self)>; }
     };
     assert!(leak_trait_with(config(), &item).is_ok());
-    let mut noself = config();
-    noself.self_ty_can_be_interned = false;
-    let err = leak_trait_with(noself, &item).err().unwrap();
+    let item: ItemStruct = parse_quote! {
+        struct S { f: ::p::Wrap<::p::m!(Self)> }
+    };
+    assert!(Leaker::from_config(config())
+        .intern_struct(&item, true)
+        .is_ok());
+    let err = Leaker::from_config(config())
+        .intern_struct(&item, false)
+        .err()
+        .map(|e| syn::Error::from(e).to_string())
+        .unwrap();
     assert!(err.contains("because of `Self`"), "{}", err);
     // In a module, a macro is expanded where it is written, whatever its path is.
     let m: ItemMod = parse_quote! {
@@ -461,9 +474,7 @@ fn primitives_are_assumed_when_the_type_is_copied() {
     // Nothing is recorded on an error.
     let mut leaker = Leaker::from_config(config);
     let item: ItemTrait = parse_quote! { trait Tr: Clone { fn f(&self) -> u8; } };
-    assert!(leaker
-        .intern_with(&item.generics, |v| v.visit_item_trait(&item))
-        .is_err());
+    assert!(leaker.intern_trait(&item, true).is_err());
     assert!(leaker.assertions().is_empty());
 }
 

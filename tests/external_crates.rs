@@ -33,9 +33,7 @@ fn leak_trait(
     leaker: &mut Leaker,
     item: &ItemTrait,
 ) -> std::result::Result<(), NotInternableError> {
-    leaker
-        .intern_with(&item.generics, |v| v.visit_item_trait(item))
-        .map(|_| ())
+    leaker.intern_trait(item, true).map(|_| ())
 }
 
 /// Prints tokens without whitespace, to compare them with the source.
@@ -592,14 +590,14 @@ fn referrer_visitor_respects_the_flag() {
     );
     let mut replaced = item.clone();
     referrer_with_foo()
-        .into_visitor(None, |_, ix| parse_quote!(P<#ix>))
+        .into_visitor(None, None, |_, ix| parse_quote!(P<#ix>))
         .visit_item_trait_mut(&mut item);
     let s = quote!(#item).to_string();
     assert!(s.contains(":: foo :: X"), "{}", s);
     assert!(s.contains("P <"), "{}", s);
     referrer_with_foo()
         .allow_ambiguous_crate_name(false)
-        .into_visitor(None, |_, ix| parse_quote!(P<#ix>))
+        .into_visitor(None, None, |_, ix| parse_quote!(P<#ix>))
         .visit_item_trait_mut(&mut replaced);
     let s = quote!(#replaced).to_string();
     assert!(!s.contains(":: foo"), "{}", s);

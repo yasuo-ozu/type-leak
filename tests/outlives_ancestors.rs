@@ -34,9 +34,7 @@ fn leaker() -> Leaker {
 
 fn referrer_of(item: &ItemTrait) -> Referrer {
     let mut leaker = leaker();
-    leaker
-        .intern_with(&item.generics, |v| v.visit_item_trait(item))
-        .unwrap();
+    leaker.intern_trait(item, true).unwrap();
     leaker.finish()
 }
 
@@ -495,16 +493,16 @@ fn rewrite(referrer: &Referrer, root: &Generics, mode: Mode, item: &Item) -> Str
     match mode {
         Mode::Lenient => referrer
             .clone()
-            .into_visitor(None, replace)
+            .into_visitor(None, None, replace)
             .visit_item_mut(&mut item),
         Mode::Leakers => referrer
             .clone()
-            .into_visitor(None, replace)
+            .into_visitor(None, None, replace)
             .with_outermost_generics_as_leakers()
             .visit_item_mut(&mut item),
         Mode::Exact => referrer
             .clone()
-            .into_visitor_with_root(root, None, replace)
+            .into_visitor_with_root(root, None, None, replace)
             .visit_item_mut(&mut item),
     }
     s(&item)
@@ -747,15 +745,15 @@ fn the_referrer_tells_the_entries_apart_with_the_generics_of_the_leaker_undeclar
         parse_quote!(P<#ix>)
     };
     for mut visitor in [
-        referrer.clone().into_visitor(None, replace),
+        referrer.clone().into_visitor(None, None, replace),
         referrer
             .clone()
-            .into_visitor(None, replace)
+            .into_visitor(None, None, replace)
             .with_outermost_generics_as_leakers(),
         // The generics of the trait are the root, those of the method are declared.
         referrer
             .clone()
-            .into_visitor_with_root(&tr.generics, None, replace),
+            .into_visitor_with_root(&tr.generics, None, None, replace),
     ] {
         let mut copy = sig.clone();
         visitor.visit_signature_mut(&mut copy);
@@ -820,15 +818,15 @@ fn the_referrer_finds_the_entry_with_a_lifetime_of_the_method() {
         parse_quote!(P<#ix>)
     };
     for mut visitor in [
-        referrer.clone().into_visitor(None, replace),
+        referrer.clone().into_visitor(None, None, replace),
         referrer
             .clone()
-            .into_visitor(None, replace)
+            .into_visitor(None, None, replace)
             .with_outermost_generics_as_leakers(),
         // The generics of the trait are the root, those of the method are declared.
         referrer
             .clone()
-            .into_visitor_with_root(&tr.generics, None, replace),
+            .into_visitor_with_root(&tr.generics, None, None, replace),
     ] {
         let mut copy = sig.clone();
         visitor.visit_signature_mut(&mut copy);
@@ -881,7 +879,9 @@ fn the_entries_of_the_types_around_survive_serialization() {
         parse_quote!(P<#ix>)
     };
     let mut copy = item.clone();
-    parsed.into_visitor(None, replace).visit_item_mut(&mut copy);
+    parsed
+        .into_visitor(None, None, replace)
+        .visit_item_mut(&mut copy);
     assert!(!s(&copy).contains("Rel2"), "{}", s(&copy));
 }
 
@@ -1145,14 +1145,14 @@ mod projection_paths {
             parse_quote!(P<#ix>)
         };
         for mut visitor in [
-            referrer.clone().into_visitor(None, replace),
+            referrer.clone().into_visitor(None, None, replace),
             referrer
                 .clone()
-                .into_visitor(None, replace)
+                .into_visitor(None, None, replace)
                 .with_outermost_generics_as_leakers(),
             referrer
                 .clone()
-                .into_visitor_with_root(&tr.generics, None, replace),
+                .into_visitor_with_root(&tr.generics, None, None, replace),
         ] {
             let mut copy = sig.clone();
             visitor.visit_signature_mut(&mut copy);
@@ -1248,7 +1248,9 @@ mod projection_paths {
             parse_quote!(P<#ix>)
         };
         let mut copy = item.clone();
-        parsed.into_visitor(None, replace).visit_item_mut(&mut copy);
+        parsed
+            .into_visitor(None, None, replace)
+            .visit_item_mut(&mut copy);
         assert!(!s(&copy).contains("Rel2"), "{}", s(&copy));
     }
 }
