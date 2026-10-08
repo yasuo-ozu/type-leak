@@ -9,7 +9,7 @@ macro_rules! forward {
     ($($method:ident: $ty:ty,)*) => {
         $(
             fn $method(&mut self, i: &'ast $ty) {
-                Visit::$method(&mut *self.host, i)
+                Visit::$method(&mut *self.visitor, i)
             }
         )*
     };

@@ -1,6 +1,6 @@
 //! The [`View`], which a scope of the [`Leaker`](crate::Leaker) gives to its closure.
 
-use crate::analyze::{Host, Res, ScopeSpec, Scopes};
+use crate::analyze::{AnalyzeVisitor, Res, ScopeSpec, Scopes};
 use crate::context::ContextId;
 use std::fmt::Display;
 use syn::visit::Visit;
@@ -17,12 +17,12 @@ mod forward;
 /// walk the item the scope is for. [`View::visit_path()`] and [`View::visit_signature()`] differ
 /// from the [`Visit`] methods of the same name, which the `syn::visit` functions call.
 pub struct View<'v> {
-    host: &'v mut dyn Host,
+    visitor: &'v mut AnalyzeVisitor,
 }
 
 impl<'v> View<'v> {
-    pub(crate) fn new(host: &'v mut dyn Host) -> Self {
-        Self { host }
+    pub(crate) fn new(visitor: &'v mut AnalyzeVisitor) -> Self {
+        Self { visitor }
     }
 
     /// Like [`Leaker::enter_mod()`](crate::Leaker::enter_mod), nested in the module around if any.
@@ -85,12 +85,12 @@ impl<'v> View<'v> {
     /// generics as the Leaker's. A struct, enum, union, trait or impl declares its own `Self`,
     /// which may be interned whatever `allow_self` the scope around has.
     pub fn visit_item(&mut self, item: &Item) {
-        Visit::visit_item(&mut *self.host, item)
+        Visit::visit_item(&mut *self.visitor, item)
     }
 
     /// Checks `path` as the root of a trait bound without analyzing it.
     pub(crate) fn check_bound_path(&mut self, path: &Path) {
-        self.host.host_check_bound_path(path)
+        self.visitor.check_bound_root(path)
     }
 
     /// Analyzes the signature of a function or method. Its generics are local, and the body is not
@@ -101,12 +101,12 @@ impl<'v> View<'v> {
     /// `sig.generics`, they are not declared again, and the lifetimes are not checked. Walking a
     /// function with `syn::visit` declares and checks as well.
     pub fn visit_signature(&mut self, sig: &Signature) {
-        self.host.host_visit_signature(sig)
+        self.visitor.analyze_signature(sig)
     }
 
     /// Analyzes a type, with the generics in scope.
     pub fn visit_type(&mut self, ty: &Type) {
-        Visit::visit_type(&mut *self.host, ty)
+        Visit::visit_type(&mut *self.visitor, ty)
     }
 
     /// Analyzes a path as the root of a trait bound.
@@ -115,18 +115,18 @@ impl<'v> View<'v> {
     /// path must not depend on the context: a relative path, or `Self::X` where `Self` has no
     /// meaning, is an error. The arguments are analyzed even then.
     pub fn visit_path(&mut self, path: &Path) {
-        self.host.host_check_bound_path(path);
-        Visit::visit_path(&mut *self.host, path)
+        self.visitor.check_bound_root(path);
+        Visit::visit_path(&mut *self.visitor, path)
     }
 
     /// Analyzes the arguments of a path whose name is resolved elsewhere (`<Rel>` of `Wrap<Rel>`).
     pub fn visit_path_arguments(&mut self, arguments: &PathArguments) {
-        Visit::visit_path_arguments(&mut *self.host, arguments)
+        Visit::visit_path_arguments(&mut *self.visitor, arguments)
     }
 
     /// Analyzes a where clause, like the one of the generics of the scope.
     pub fn visit_where_clause(&mut self, where_clause: &WhereClause) {
-        Visit::visit_where_clause(&mut *self.host, where_clause)
+        Visit::visit_where_clause(&mut *self.visitor, where_clause)
     }
 
     /// Analyzes a bound, like a bound of a generic parameter of the scope.
@@ -134,7 +134,7 @@ impl<'v> View<'v> {
     /// The path of a trait bound must not depend on the context, nor start with `Self` where it has
     /// no meaning. It is an error otherwise.
     pub fn visit_type_param_bound(&mut self, bound: &TypeParamBound) {
-        Visit::visit_type_param_bound(&mut *self.host, bound)
+        Visit::visit_type_param_bound(&mut *self.visitor, bound)
     }
 }
 
@@ -144,16 +144,6 @@ impl Scopes for View<'_> {
         spec: ScopeSpec,
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
-        let mut f = Some(f);
-        let mut out = None;
-        let context = self.host.host_enter(spec, &mut |view| {
-            if let Some(f) = f.take() {
-                out = Some(f(view));
-            }
-        })?;
-        match out {
-            Some(out) => Ok((context, out)),
-            None => unreachable!("a scope runs its closure"),
-        }
+        self.visitor.enter(spec, f)
     }
 }

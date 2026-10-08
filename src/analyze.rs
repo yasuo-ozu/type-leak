@@ -239,10 +239,11 @@ pub(crate) struct Finished {
     pub(crate) module: Option<ContextId>,
 }
 
-pub(crate) struct AnalyzeVisitor<'a> {
-    allowed: AllowedPaths<'a>,
-    contexts: &'a mut Contexts,
-    rollback: Option<usize>,
+pub(crate) struct AnalyzeVisitor {
+    allowed: AllowedPaths,
+    /// The Leaker's table while it analyzes (see [`AnalyzeVisitor::swap_contexts()`]), an empty one
+    /// in a throwaway visitor.
+    contexts: Contexts,
     /// Mentions of `Self` where it has no meaning (see [`NotInternableError::SelfWithoutMeaning`]).
     /// Kept apart from the effects, because a type leaked whole drops those of its parts.
     self_errors: Vec<TokenStream>,
@@ -315,16 +316,11 @@ impl Inherits {
     }
 }
 
-impl<'a> AnalyzeVisitor<'a> {
-    pub(crate) fn new(
-        allowed: AllowedPaths<'a>,
-        contexts: &'a mut Contexts,
-        generics: &Generics,
-    ) -> Self {
+impl AnalyzeVisitor {
+    pub(crate) fn new(allowed: AllowedPaths, generics: &Generics) -> Self {
         Self {
             allowed,
-            contexts,
-            rollback: None,
+            contexts: Contexts::default(),
             self_errors: Vec::new(),
             top_levels: Vec::new(),
             allow_self: true,
@@ -355,14 +351,18 @@ impl<'a> AnalyzeVisitor<'a> {
         }
     }
 
+    /// Exchanges the table of contexts with `other`, which cannot fail. The outermost scope of the
+    /// Leaker swaps its table in before the analysis and out after it, whatever the outcome.
+    pub(crate) fn swap_contexts(&mut self, other: &mut Contexts) {
+        std::mem::swap(&mut self.contexts, other);
+    }
+
     fn alone<R>(
         allowed: AllowedPaths,
         generics: &Generics,
-        f: impl FnOnce(&mut AnalyzeVisitor<'_>) -> R,
+        f: impl FnOnce(&mut AnalyzeVisitor) -> R,
     ) -> R {
-        let mut contexts = Contexts::default();
-        let mut visitor = AnalyzeVisitor::new(allowed, &mut contexts, generics);
-        f(&mut visitor)
+        f(&mut AnalyzeVisitor::new(allowed, generics))
     }
 
     pub(crate) fn check(allowed: AllowedPaths, ty: &Type, generics: &Generics) -> CheckResult {
@@ -498,15 +498,15 @@ impl<'a> AnalyzeVisitor<'a> {
         })
     }
 
-    /// Finishes the outermost scope, or rolls back the contexts recorded since the start on an
-    /// error. Defaults of type parameters are analyzed alone, with the parameters before them, and
-    /// may not leak `Self`.
-    pub(crate) fn finish(mut self, generics: &Generics) -> Res<Finished> {
+    /// Finishes the outermost scope. Defaults of type parameters are analyzed alone, with the
+    /// parameters before them, and may not leak `Self`. On an error the caller rolls back the
+    /// contexts recorded since the start.
+    pub(crate) fn finish(&mut self, generics: &Generics) -> Res<Finished> {
         let mut effects = std::mem::take(&mut self.frame.effects);
         for (index, _, default) in defaulted(generics) {
             let root = without_defaults(generics, index);
             let (found, self_errors) = AnalyzeVisitor::analyze_default(
-                self.allowed,
+                self.allowed.clone(),
                 default,
                 &root,
                 self.root_declares_self,
@@ -515,10 +515,8 @@ impl<'a> AnalyzeVisitor<'a> {
             self.self_errors.extend(self_errors);
         }
         if let Some(error) = scope_error(&effects, &self.self_errors) {
-            // `rollback` is still armed: the contexts are truncated when `self` is dropped.
             return Err(error);
         }
-        self.rollback = None;
         Ok(Finished {
             effects,
             top_levels: std::mem::take(&mut self.top_levels),
@@ -526,10 +524,8 @@ impl<'a> AnalyzeVisitor<'a> {
         })
     }
 
-    /// Starts the outermost scope, entering it if it is a module. If the visitor is dropped
-    /// unfinished (also on a panic), the contexts recorded since are rolled back.
+    /// Starts the outermost scope, entering it if it is a module.
     pub(crate) fn start(&mut self, spec: &ScopeSpec) {
-        self.rollback = Some(self.contexts.len());
         self.root_declares_self = matches!(
             spec,
             ScopeSpec::Generics {
@@ -1120,7 +1116,7 @@ impl<'a> AnalyzeVisitor<'a> {
     /// undeclared name) it is `false`.
     fn is_not_a_cause(&self, object: &TypeTraitObject, in_scope: &Generics) -> bool {
         let ty = Type::TraitObject(object.clone());
-        let (result, optional) = Self::check_alone(self.allowed, &ty, in_scope);
+        let (result, optional) = Self::check_alone(self.allowed.clone(), &ty, in_scope);
         // The Referrer may replace an external trait object, with the reference holding it.
         !result.is_own && !optional && result.impossible.is_empty()
     }
@@ -1366,14 +1362,6 @@ impl<'a> AnalyzeVisitor<'a> {
     }
 }
 
-impl Drop for AnalyzeVisitor<'_> {
-    fn drop(&mut self) {
-        if let Some(contexts) = self.rollback {
-            self.contexts.truncate(contexts);
-        }
-    }
-}
-
 fn defaulted(generics: &Generics) -> impl Iterator<Item = (usize, &Ident, &Type)> {
     generics
         .params
@@ -1389,20 +1377,16 @@ fn defaulted(generics: &Generics) -> impl Iterator<Item = (usize, &Ident, &Type)
         })
 }
 
-/// What a [`View`] does with the analysis it wraps. The view forwards the `visit_*` methods the
+/// What a [`View`] asks of the analysis it wraps. The view forwards the `visit_*` methods the
 /// analysis overrides to it.
-pub(crate) trait Host: for<'ast> Visit<'ast> {
-    fn host_check_bound_path(&mut self, i: &Path);
-    fn host_visit_signature(&mut self, i: &Signature);
-    /// Enters the scope `spec`, runs `f` and leaves it (also if `f` panics, which goes on).
-    fn host_enter(&mut self, spec: ScopeSpec, f: &mut dyn FnMut(&mut View<'_>)) -> Res<ContextId>;
-}
-
-impl Host for AnalyzeVisitor<'_> {
-    fn host_check_bound_path(&mut self, i: &Path) {
-        self.check_bound_path(i, quote!(#i));
+impl AnalyzeVisitor {
+    /// Checks `path` as the root of a trait bound (see [`View::visit_path()`]).
+    pub(crate) fn check_bound_root(&mut self, path: &Path) {
+        self.check_bound_path(path, quote!(#path));
     }
-    fn host_visit_signature(&mut self, i: &Signature) {
+
+    /// Analyzes a signature as [`View::visit_signature()`] does.
+    pub(crate) fn analyze_signature(&mut self, i: &Signature) {
         match self.scopes.last() {
             // The generics are not declared again: they are those of that scope, so the lifetimes
             // are not compared with a declaration (see `with_signature()`).
@@ -1413,11 +1397,17 @@ impl Host for AnalyzeVisitor<'_> {
             _ => self.with_signature(i, false, |visitor| Visit::visit_signature(visitor, i)),
         }
     }
-    fn host_enter(&mut self, spec: ScopeSpec, f: &mut dyn FnMut(&mut View<'_>)) -> Res<ContextId> {
+
+    /// Enters the nested scope `spec`, runs `f` and leaves it (also if `f` panics, which goes on).
+    pub(crate) fn enter<R>(
+        &mut self,
+        spec: ScopeSpec,
+        f: impl FnOnce(&mut View<'_>) -> R,
+    ) -> Res<(ContextId, R)> {
         let mark = self.enter_scope(&spec, false);
         // The closure may panic and the scope around may catch it: leave the scope as if it failed.
         match catch_unwind(AssertUnwindSafe(|| f(&mut View::new(self)))) {
-            Ok(()) => self.end_scope(mark, &spec),
+            Ok(result) => self.end_scope(mark, &spec).map(|context| (context, result)),
             Err(payload) => {
                 self.leave_scope(mark, true);
                 resume_unwind(payload)
@@ -1426,7 +1416,7 @@ impl Host for AnalyzeVisitor<'_> {
     }
 }
 
-impl<'a, 'ast> Visit<'ast> for AnalyzeVisitor<'a> {
+impl<'ast> Visit<'ast> for AnalyzeVisitor {
     fn visit_type_param(&mut self, i: &TypeParam) {
         let is_root_default = i.default.is_some()
             && self.item_depth <= 1

@@ -18,6 +18,7 @@ use safegraph::graph::Graph;
 use safegraph::BTreeGraph;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
@@ -273,7 +274,7 @@ impl Leaker {
     /// scope that declares `Self` to deny it. An absolute path of an external crate (`::foo::X`) is
     /// not a cause, so `::foo::W<Rel>` has only `Rel`.
     pub fn check(&self, ty: &Type, generics: &Generics) -> CheckResult {
-        AnalyzeVisitor::check(AllowedPaths(&self.allowed_paths), ty, generics)
+        AnalyzeVisitor::check(AllowedPaths::new(&self.allowed_paths), ty, generics)
     }
 
     /// Finishes the analysis and returns the [`Referrer`]. It calls [`Leaker::reduce_roots()`] if
@@ -370,15 +371,35 @@ impl Scopes for Leaker {
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
         let root = spec.declared_generics();
-        let mut visitor =
-            AnalyzeVisitor::new(AllowedPaths(&self.allowed_paths), &mut self.contexts, &root);
-        visitor.start(&spec);
-        let result = f(&mut View::new(&mut visitor));
+        let mut visitor = AnalyzeVisitor::new(AllowedPaths::new(&self.allowed_paths), &root);
+        let mark = self.contexts.len();
+        // The visitor owns the table of contexts while it analyzes, so the swap is the only step
+        // before `catch_unwind`: no allocation, no user code. Whatever happens next (a result, an
+        // error, or a panic of `f`), the table is swapped back before anything else, and an
+        // unfinished analysis is rolled back to `mark`.
+        visitor.swap_contexts(&mut self.contexts);
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            visitor.start(&spec);
+            let result = f(&mut View::new(&mut visitor));
+            visitor.finish(&root).map(|finished| (finished, result))
+        }));
+        visitor.swap_contexts(&mut self.contexts);
+        let (finished, result) = match outcome {
+            Ok(Ok(done)) => done,
+            Ok(Err(error)) => {
+                self.contexts.truncate(mark);
+                return Err(error);
+            }
+            Err(payload) => {
+                self.contexts.truncate(mark);
+                resume_unwind(payload)
+            }
+        };
         let Finished {
             effects,
             top_levels,
             module,
-        } = visitor.finish(&root)?;
+        } = finished;
         let mut analysis = Analysis::default();
         analysis.apply(&mut self.contexts, &effects, None);
         // Optional entries never fail the call: a type that cannot be leaked is copied as written.

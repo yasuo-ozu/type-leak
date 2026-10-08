@@ -3,6 +3,7 @@
 use crate::error::ABSOLUTE_PATHS;
 use proc_macro2::TokenStream;
 use std::collections::HashSet;
+use std::rc::Rc;
 use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
@@ -21,11 +22,16 @@ pub(crate) fn path_starts_with(path: &Path, prefix: &Path) -> bool {
             .all(|(prefix_seg, seg)| prefix_seg.ident == seg.ident)
 }
 
-/// The paths a Leaker treats as context-free.
-#[derive(Clone, Copy)]
-pub(crate) struct AllowedPaths<'a>(pub(crate) &'a [Path]);
+/// The paths a Leaker treats as context-free: a copy of its `allowed_paths` taken when an analysis
+/// starts, shared by the throwaway visitors of that analysis.
+#[derive(Clone)]
+pub(crate) struct AllowedPaths(Rc<[Path]>);
 
-impl AllowedPaths<'_> {
+impl AllowedPaths {
+    pub(crate) fn new(paths: &[Path]) -> Self {
+        Self(Rc::from(paths))
+    }
+
     /// Returns `true` if `path` is absolute, starts with `$crate`, or starts with an allowed path.
     /// A type with an absolute path may still be an optional entry (see `is_soft_path()`).
     pub(crate) fn is_context_free_path(&self, path: &Path) -> bool {

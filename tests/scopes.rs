@@ -1465,6 +1465,192 @@ fn a_panic_caught_in_the_outermost_scope_of_a_generics_scope_keeps_the_top_level
     assert_eq!(referrer.context_module(referrer.context(0)), None);
 }
 
+// ── a panic in an outermost scope ────────────────────────────────────────────────────────────
+
+/// Runs `f`, which panics with the message `message`, and checks that the panic goes on unchanged.
+fn caught_with(message: &str, f: impl FnOnce()) {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_err();
+    assert_eq!(
+        payload.downcast_ref::<String>().map(|s| s.as_str()),
+        Some(message)
+    );
+}
+
+/// A Leaker with contexts from earlier calls: a trait, and a struct with other generics.
+fn leaker_with_contexts() -> (Leaker, Vec<ContextId>) {
+    let mut leaker = Leaker::new();
+    let first = leaker
+        .intern_trait(
+            &parse_quote!(
+                trait Tr<T> {
+                    type A: ::p::X<Rel<T>>;
+                }
+            ),
+            true,
+        )
+        .unwrap();
+    let second = leaker
+        .intern_struct(
+            &parse_quote!(
+                struct S<U>(Rel2<U>);
+            ),
+            true,
+        )
+        .unwrap();
+    (leaker, vec![first, second])
+}
+
+/// What a scope that panics leaves behind, if the table of contexts were not rolled back: a nested
+/// module and nested generics with their own contexts.
+fn record_and_panic(view: &mut View<'_>, message: &str) {
+    view.visit_type(&parse_quote!(RelLost<V>));
+    view.enter_mod("lost", [], |_| ()).unwrap();
+    view.enter_generics(&parse_quote!(<X, Y>), |_| ()).unwrap();
+    panic!("{}", message);
+}
+
+/// The ids of the calls after the panic and the Referrer, with the panic (or without).
+fn after_a_panic(panic: bool) -> (Vec<ContextId>, Referrer) {
+    let (mut leaker, mut ids) = leaker_with_contexts();
+    if panic {
+        caught_with("an outermost closure panics", || {
+            let _ = leaker.enter_generics(&parse_quote!(<V>), |view| {
+                record_and_panic(view, "an outermost closure panics")
+            });
+        });
+        caught_with("an outermost closure panics", || {
+            let _ = leaker.enter_mod("lost", [], |view| {
+                record_and_panic(view, "an outermost closure panics")
+            });
+        });
+        caught_with("an outermost closure panics", || {
+            let _ = leaker.enter_type(&ident("S3"), &parse_quote!(<V>), true, |view| {
+                record_and_panic(view, "an outermost closure panics")
+            });
+        });
+    }
+    // New contexts get the numbers they would get without the panic.
+    ids.push(
+        leaker
+            .intern_struct(
+                &parse_quote!(
+                    struct S3<W>(Rel3<W>);
+                ),
+                true,
+            )
+            .unwrap(),
+    );
+    ids.push(
+        leaker
+            .enter_mod("kept", [], |view| view.visit_type(&parse_quote!(Rel4)))
+            .unwrap()
+            .0,
+    );
+    // The context of the earlier trait is still there: the same generics share it.
+    ids.push(
+        leaker
+            .intern_struct(
+                &parse_quote!(
+                    struct Again<T>(Rel5<T>);
+                ),
+                true,
+            )
+            .unwrap(),
+    );
+    (ids, leaker.finish())
+}
+
+#[test]
+fn a_panic_in_an_outermost_scope_keeps_the_earlier_contexts_and_ids() {
+    let (ids, referrer) = after_a_panic(true);
+    let (expected_ids, expected) = after_a_panic(false);
+    assert_eq!(ids, expected_ids);
+    assert_eq!(referrer, expected);
+    assert_eq!(
+        referrer.to_token_stream().to_string(),
+        expected.to_token_stream().to_string()
+    );
+    // The earlier calls, then the new ones in order, and then `<T>` of the trait again.
+    assert_eq!(ids, [id(0), id(1), id(2), id(3), id(0)]);
+    assert_eq!(s(referrer.context_generics(ids[0])), "< T >");
+    assert_eq!(s(referrer.context_generics(ids[1])), "< U >");
+    assert_eq!(s(referrer.context_generics(ids[2])), "< W >");
+    assert_eq!(referrer.module_hint(ids[3]), Some("kept"));
+    assert_eq!(
+        entries(&referrer),
+        [
+            e("Rel < T >", "< T >"),
+            e("Rel5 < T >", "< T >"),
+            e("Rel2 < U >", "< U >"),
+            e("Rel3 < W >", "< W >"),
+            e("Rel4", ""),
+        ]
+    );
+}
+
+/// A nested panic that nothing in the outermost scope catches ends at the Leaker. The payload is
+/// the one of the closure, and the Leaker is as if the scope had not been entered.
+fn after_a_nested_panic(panic: bool) -> (Vec<ContextId>, Referrer) {
+    let (mut leaker, mut ids) = leaker_with_contexts();
+    if panic {
+        caught_with("a nested closure panics", || {
+            let _ = leaker.enter_generics(&parse_quote!(<V>), |view| {
+                view.visit_type(&parse_quote!(RelOuter<V>));
+                view.enter_mod("lost", [], |_| ()).unwrap();
+                let _ = view.enter_type(&ident("N"), &parse_quote!(<N>), true, |view| {
+                    view.visit_type(&parse_quote!(RelNested<N>));
+                    // Two levels down: the scopes around are left in turn.
+                    let _ = view.enter_impl(
+                        &parse_quote!(<I>),
+                        &parse_quote!(::p::W<I>),
+                        true,
+                        |view| record_and_panic(view, "a nested closure panics"),
+                    );
+                    unreachable!("the panic goes through the scopes around");
+                });
+                unreachable!("the panic goes through the scopes around");
+            });
+        });
+    }
+    ids.push(
+        leaker
+            .intern_struct(
+                &parse_quote!(
+                    struct S3<W>(Rel3<W>);
+                ),
+                true,
+            )
+            .unwrap(),
+    );
+    ids.push(
+        leaker
+            .enter_generics(&parse_quote!(<V>), |view| {
+                view.visit_type(&parse_quote!(RelOuter<V>))
+            })
+            .unwrap()
+            .0,
+    );
+    (ids, leaker.finish())
+}
+
+#[test]
+fn a_nested_panic_not_caught_in_an_outermost_scope_ends_at_the_leaker_with_its_contexts() {
+    let (ids, referrer) = after_a_nested_panic(true);
+    let (expected_ids, expected) = after_a_nested_panic(false);
+    assert_eq!(ids, expected_ids);
+    assert_eq!(referrer, expected);
+    assert_eq!(ids, [id(0), id(1), id(2), id(3)]);
+    assert_eq!(
+        entries(&referrer),
+        [
+            e("Rel < T >", "< T >"),
+            e("Rel2 < U >", "< U >"),
+            e("Rel3 < W >", "< W >"),
+            e("RelOuter < V >", "< V >"),
+        ]
+    );
+}
+
 // ── `Self` in the generics of a scope ────────────────────────────────────────────────────────
 
 /// The mentions of `Self` which `NotInternableError::SelfWithoutMeaning` has, as tokens.
