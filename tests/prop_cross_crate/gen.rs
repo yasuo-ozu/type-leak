@@ -157,6 +157,28 @@ pub struct Features {
     /// predicate defines by the entry: a cycle (E0275, F21, fixed: on by default, the Leaker
     /// rejects it). Off, the predicate with `Item = ..` is dropped where the bound is.
     pub iterator_item_cycle: bool,
+    /// A bound of an iterator whose `Item` a supertrait fixes (`T: ::krate::base::BItem`, `trait
+    /// BItem: Iterator<Item = u8>`) that names the `Item` (`T: Fn(<T as Iterator>::Item) -> u8`),
+    /// and a predicate with an entry that uses the iterator (`Rel<T>: Default`): the Leaker does not
+    /// read the supertraits, so the copy is E0277, like F21 (F25: a bug, off by default).
+    pub supertrait_item: bool,
+    /// The same with the `Item` fixed by a bound (`T: Iterator<Item = u8>`) and the bound naming it
+    /// through a type alias of the Leaker's crate (`T: Fn(::krate::base::BIt<T>) -> u8`), which the
+    /// Leaker takes for a struct (F26: a limitation, off by default).
+    pub alias_item: bool,
+    /// An argument-position `impl Trait` whose bound names an entry that uses a generic with a bound
+    /// that names a leaked type (`X: Fn(Rel0) -> u8`, `a: impl Into<Rel1<X>>`): the Leaker does not
+    /// treat it as the bound of a generic, so the copy is E0277, like F2 (F27: a bug, off by
+    /// default). The oracle of the test macro does not compare a position that has `impl Trait`.
+    pub impl_trait_args: bool,
+    /// A path that hides a lifetime in the inputs of an elided `fn(..) -> &R` or `Fn(..) -> &R`
+    /// (`fn(::core::str::Chars, A) -> &R`), next to a type that adds lifetimes: E0106 in the copy
+    /// like F12, as the Leaker does not see the lifetime (F28: a bug, off by default).
+    pub hidden_lifetimes: bool,
+    /// `Rel<&'a T::Item>` in a method of a trait, where `'a` is a lifetime of the trait and `T` an
+    /// iterator that does not outlive it: the signature implies `T::Item: 'a`, the Leaker records `T:
+    /// 'a`, which the copy cannot prove: E0309, like F16 (F30: a bug, off by default).
+    pub projection_outlives: bool,
 }
 
 impl Features {
@@ -205,6 +227,11 @@ impl Features {
                     features.impl_self_bound_cycle = true;
                     features.trait_assoc_bound_cycle = true;
                     features.iterator_item_cycle = true;
+                    features.supertrait_item = true;
+                    features.alias_item = true;
+                    features.impl_trait_args = true;
+                    features.hidden_lifetimes = true;
+                    features.projection_outlives = true;
                 }
                 "inferred_outlives" => features.inferred_outlives = true,
                 "impl_assoc_self" => features.impl_assoc_self = true,
@@ -223,6 +250,11 @@ impl Features {
                 "impl_self_bound_cycle" => features.impl_self_bound_cycle = true,
                 "trait_assoc_bound_cycle" => features.trait_assoc_bound_cycle = true,
                 "iterator_item_cycle" => features.iterator_item_cycle = true,
+                "supertrait_item" => features.supertrait_item = true,
+                "alias_item" => features.alias_item = true,
+                "impl_trait_args" => features.impl_trait_args = true,
+                "hidden_lifetimes" => features.hidden_lifetimes = true,
+                "projection_outlives" => features.projection_outlives = true,
                 "unsized_params" => features.unsized_params = true,
                 "bound_cycles" => features.bound_cycles = true,
                 other => panic!("unknown feature `{}`", other),
@@ -341,6 +373,9 @@ struct TyParam {
     outlives: Vec<String>,
     /// It is an `Iterator`: `T::Item` is a type.
     iter: bool,
+    /// An iterator whose `Item` is fixed to `u8` by a supertrait (1, `supertrait_item`) or by a
+    /// bound (2, `alias_item`): no predicate equates it to another type.
+    fixed_item: u8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -1212,6 +1247,11 @@ impl Gen {
         }
     }
 
+    /// A type of the standard library that hides a lifetime in its path (`hidden_lifetimes`).
+    fn hidden_path(&mut self) -> &'static str {
+        self.pick(&["::core::str::Chars", "::core::slice::Iter<u8>"])
+    }
+
     fn head_app(&mut self, sc: &Scope, c: Con, depth: u32) -> Option<Ty> {
         if self.env.heads.is_empty() {
             return None;
@@ -1344,7 +1384,18 @@ impl Gen {
         // `elided_fn_generics` asks for `fn(&A) -> &R` too: the elided lifetime of the input is the
         // output's, so the Leaker leaks the function pointer as a whole where `A` has lifetimes.
         if self.features.elided_fn_generics && self.chance(25) {
-            let a = self.ty(sc, Con::unsized_ok().with_scope(c), depth + 1);
+            // `hidden_lifetimes` asks for the lifetime of the input to be hidden by a path: `fn(Chars,
+            // A) -> &R`, which `A` must be `Sized` for.
+            let hidden = self.features.hidden_lifetimes && self.chance(50);
+            let a = self.ty(
+                sc,
+                if hidden {
+                    Con::sized().with_scope(c)
+                } else {
+                    Con::unsized_ok().with_scope(c)
+                },
+                depth + 1,
+            );
             let r = self.ty(sc, Con::unsized_ok().with_scope(c), depth + 1);
             // The copy writes `Self` with lifetimes if it has any (`self_elision`), so `Self` is
             // only named in the scopes that are not a trait method (a struct, an enum, a union, an
@@ -1356,7 +1407,12 @@ impl Gen {
                 && (self.features.self_elision || !a.adds_lts)
             {
                 self.elided_self |= a.uses_self;
-                let text = format!("{}fn(&{}) -> &{}", prefix, paren(&a.text), paren(&r.text));
+                let input = if hidden {
+                    format!("{}, {}", self.hidden_path(), a.text)
+                } else {
+                    format!("&{}", paren(&a.text))
+                };
+                let text = format!("{}fn({}) -> &{}", prefix, input, paren(&r.text));
                 return Some(Ty::with(text, &[&a, &r]).no_infer());
             }
         }
@@ -1518,6 +1574,8 @@ impl Gen {
             }
             _ => {
                 // Elided lifetimes in the sugar of `Fn`: one in the input, so it is the output's.
+                // `hidden_lifetimes` asks for it to be hidden by a path.
+                let hidden = self.features.hidden_lifetimes && self.chance(50);
                 let a = self.ty(sc, closed, depth + 1);
                 let r = self.ty(sc, closed, depth + 1);
                 if a.text.contains(['\'', '&'])
@@ -1535,9 +1593,14 @@ impl Gen {
                     return self.dyn_bare(sc, depth, false);
                 }
                 self.elided_self |= a.uses_self;
+                let input = if hidden {
+                    format!("{}, {}", self.hidden_path(), a.text)
+                } else {
+                    format!("&{}", paren(&a.text))
+                };
                 let text = format!(
-                    "dyn ::core::ops::Fn(&{}) -> &{}",
-                    paren(&a.text),
+                    "dyn ::core::ops::Fn({}) -> &{}",
+                    input,
                     ret_paren(&paren(&r.text))
                 );
                 parts.push(a);
@@ -1705,12 +1768,23 @@ impl Gen {
                 } else {
                     10
                 });
+            let mut fixed_item = 0;
             if iter {
-                bound_texts.push(if self.bare() {
+                let iterator = if self.bare() {
                     "Iterator".to_string()
                 } else {
                     "::core::iter::Iterator".to_string()
-                });
+                };
+                // `supertrait_item` and `alias_item` ask for an `Item` that is fixed.
+                if self.features.supertrait_item && self.chance(50) {
+                    bound_texts.push(format!("::{}::base::BItem", self.cfg.krate));
+                    fixed_item = 1;
+                } else if self.features.alias_item && self.chance(50) {
+                    bound_texts.push("::core::iter::Iterator<Item = u8>".to_string());
+                    fixed_item = 2;
+                } else {
+                    bound_texts.push(iterator);
+                }
             }
             sk.tys.push(TyParam {
                 name: name.to_string(),
@@ -1719,6 +1793,7 @@ impl Gen {
                 bound_texts,
                 outlives: outlives_list,
                 iter,
+                fixed_item,
             });
         }
         for name in consts.iter().take(n_const) {
@@ -1842,7 +1917,8 @@ impl Gen {
                 }
                 3 if !sized_params.is_empty() => {
                     let p = self.pick(&sized_params).clone();
-                    if bounded.contains(&(p.name.clone(), "iter")) {
+                    // The `Item` of a supertrait or of a bound is not equated to another type.
+                    if bounded.contains(&(p.name.clone(), "iter")) || p.fixed_item != 0 {
                         continue;
                     }
                     bounded.push((p.name.clone(), "iter"));
@@ -1921,7 +1997,7 @@ impl Gen {
             let iters: Vec<TyParam> = sc
                 .tys
                 .iter()
-                .filter(|p| p.iter && p.sized)
+                .filter(|p| p.iter && p.sized && p.fixed_item == 0)
                 .cloned()
                 .collect();
             let heads: Vec<String> = self
@@ -1965,6 +2041,40 @@ impl Gen {
                 }
             }
         }
+        // `supertrait_item` and `alias_item` ask for a bound of an iterator that names its `Item`,
+        // which a supertrait or a bound fixes, and an entry that uses the iterator in a predicate:
+        // `X: Fn(<X as Iterator>::Item) -> u8` (or through the alias `BIt<X>`), `Rel<X>: Default`.
+        if self.features.supertrait_item || self.features.alias_item {
+            let fixed: Vec<TyParam> = sc
+                .tys
+                .iter()
+                .filter(|p| p.fixed_item != 0 && p.sized)
+                .cloned()
+                .collect();
+            let heads: Vec<String> = self
+                .env
+                .heads
+                .iter()
+                .filter(|head| head.shape == Shape::T1)
+                .map(|head| head.name.clone())
+                .collect();
+            if !fixed.is_empty() && !heads.is_empty() && self.chance(60) {
+                let x = self.pick(&fixed).clone();
+                if !bounded.contains(&(x.name.clone(), "fn")) {
+                    bounded.push((x.name.clone(), "fn"));
+                    let head = self.pick(&heads).clone();
+                    let item = if x.fixed_item == 2 {
+                        format!("::{}::base::BIt<{}>", self.cfg.krate, x.name)
+                    } else {
+                        format!("<{} as ::core::iter::Iterator>::Item", x.name)
+                    };
+                    sk.preds
+                        .push(format!("{}: ::core::ops::Fn({}) -> u8", x.name, item));
+                    sk.preds
+                        .push(format!("{}<{}>: ::core::default::Default", head, x.name));
+                }
+            }
+        }
         sk.bounded = bounded;
         self.env = saved_env;
         self.abs_only = saved_abs;
@@ -1979,6 +2089,45 @@ impl Gen {
     /// type only is early-bound in the copy, and late-bound in the trait (E0195, see
     /// `method_lifetime_paths`).
     fn method_ty(&mut self, sc: &Scope) -> Ty {
+        // `projection_outlives` asks for `Rel<&'a T::Item>`, where `'a` is a lifetime of the item,
+        // `T` an iterator that does not outlive it, and the signature implies `T::Item: 'a`.
+        if self.features.projection_outlives && !sc.pred && self.chance(30) {
+            let item_lifetimes: Vec<String> = sc
+                .lifetimes
+                .iter()
+                .filter(|l| !sc.ref_only.contains(*l))
+                .cloned()
+                .collect();
+            let iters: Vec<TyParam> = sc
+                .tys
+                .iter()
+                .filter(|p| p.iter && p.sized)
+                .cloned()
+                .collect();
+            let heads: Vec<String> = self
+                .env
+                .heads
+                .iter()
+                .filter(|head| head.shape == Shape::T1 && !head.name.starts_with("::"))
+                .map(|head| head.name.clone())
+                .collect();
+            if !item_lifetimes.is_empty() && !iters.is_empty() && !heads.is_empty() {
+                let lt = self.pick(&item_lifetimes).clone();
+                let candidates: Vec<TyParam> = iters
+                    .into_iter()
+                    .filter(|p| !p.outlives.contains(&lt))
+                    .collect();
+                if !candidates.is_empty() {
+                    let p = self.pick(&candidates).clone();
+                    let head = self.pick(&heads).clone();
+                    let mut ty = Ty::new(format!("{}<&{} {}::Item>", head, lt, p.name)).no_infer();
+                    ty.tys.insert(p.name);
+                    ty.lts.insert(lt);
+                    ty.projection = true;
+                    return ty;
+                }
+            }
+        }
         // `implied_outlives` asks for `&'x mut Self::A` where only the signature implies
         // `Self::A: 'x`.
         if self.features.implied_outlives
@@ -2160,6 +2309,36 @@ impl Gen {
                     .push(format!("{}: ::core::ops::Fn(&{}) -> u8", x, named));
                 sk.preds
                     .push(format!("{}<{}>: ::core::default::Default", head, x));
+            }
+        }
+        // `impl_trait_args` asks for an argument `impl Into<Rel<X>>` where `X` has a bound that
+        // names a leaked type, `X: Fn(Rel0) -> u8`: the bound of the `impl Trait` is a bound of the
+        // function, and the entry in it is in a cycle with the bound of `X`.
+        if self.features.impl_trait_args && self.chance(35) {
+            let sized: Vec<String> = sk
+                .tys
+                .iter()
+                .filter(|p| p.sized && !sk.bounded.contains(&(p.name.clone(), "fn")))
+                .map(|p| p.name.clone())
+                .collect();
+            let relative = |shape: Shape| -> Vec<String> {
+                self.env
+                    .heads
+                    .iter()
+                    .filter(|head| head.shape == shape && !head.name.starts_with("::"))
+                    .map(|head| head.name.clone())
+                    .collect()
+            };
+            let units = relative(Shape::Unit);
+            let heads = relative(Shape::T1);
+            if !sized.is_empty() && !units.is_empty() && !heads.is_empty() {
+                let x = self.pick(&sized).clone();
+                let unit = self.pick(&units).clone();
+                let head = self.pick(&heads).clone();
+                sk.bounded.push((x.clone(), "fn"));
+                sk.preds
+                    .push(format!("{}: ::core::ops::Fn({}) -> u8", x, unit));
+                params.push(format!("ai: impl ::core::convert::Into<{}<{}>>", head, x));
             }
         }
         if self_sized && outer.self_kind == SelfKind::MaybeUnsized {
@@ -2821,6 +3000,7 @@ impl Gen {
                 bound_texts: texts,
                 outlives: Vec::new(),
                 iter: false,
+                fixed_item: 0,
             });
             extra = Some("E".to_string());
         }
@@ -2979,9 +3159,12 @@ impl Gen {
             let mut sig = self.method_sig(&sc, &m, false);
             // The copy of a check has no receiver, so `Self: 'x` would not be implied.
             if !self.features.impl_self_outlives && sig.contains("Self") {
+                // Only the receiver: `(&'x self::R0, ..)` is a tuple with a type of the module.
                 sig = sig
-                    .replace("(&'x self", "(&self")
-                    .replace("(&'y self", "(&self");
+                    .replace("(&'x self,", "(&self,")
+                    .replace("(&'x self)", "(&self)")
+                    .replace("(&'y self,", "(&self,")
+                    .replace("(&'y self)", "(&self)");
             }
             body.push(format!("pub {} {{ loop {{}} }}", sig));
         }
@@ -3118,7 +3301,16 @@ pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Feat
     lib += &format!("extern crate self as {};\n", krate);
     lib += "#[doc(hidden)]\npub use type_leak_test_macro as __macro;\n";
     lib += "type_leak_test_macro::define_repeater!(pub Repeater);\n";
-    lib += &format!("pub mod base {{\n{}\n}}\n", types_template("B"));
+    let mut base = types_template("B");
+    // The supertrait that fixes the `Item` of an iterator, and an alias of its projection
+    // (`supertrait_item`, `alias_item`).
+    if g.features.supertrait_item {
+        base += "pub trait BItem: ::core::iter::Iterator<Item = u8> {}\n";
+    }
+    if g.features.alias_item {
+        base += "pub type BIt<T> = <T as ::core::iter::Iterator>::Item;\n";
+    }
+    lib += &format!("pub mod base {{\n{}\n}}\n", base);
 
     // Modules whose items are analyzed one by one.
     let n_item_modules = g.range(2, 3);
@@ -3269,6 +3461,7 @@ fn names_item(pred: &str, x: &str) -> bool {
     pred.contains(&format!("{}::Item", x))
         || pred.contains(&format!("<{} as ::core::iter::Iterator>::Item", x))
         || pred.contains(&format!("<{} as Iterator>::Item", x))
+        || pred.contains(&format!("::base::BIt<{}>", x))
 }
 
 /// Whether the predicate `pred` equates the `Item` of the parameter `x` to a type.
@@ -3277,12 +3470,13 @@ fn binds_item(pred: &str, x: &str) -> bool {
 }
 
 /// Whether the where clause of `tr` names the `Item` of an iterator that a predicate of the trait or
-/// of a method equates to a type.
+/// of a method equates to a type, or that a supertrait or a bound fixes (`fixed_item`).
 fn item_bound_in_trait(tr: &TraitInfo) -> bool {
     tr.sk.tys.iter().filter(|t| t.iter).any(|t| {
         let x = &t.name;
         tr.sk.preds.iter().any(|p| names_item(p, x))
-            && (tr.sk.preds.iter().any(|p| binds_item(p, x))
+            && (t.fixed_item != 0
+                || tr.sk.preds.iter().any(|p| binds_item(p, x))
                 || tr
                     .methods
                     .iter()

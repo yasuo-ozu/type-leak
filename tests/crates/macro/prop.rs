@@ -804,10 +804,25 @@ fn self_breaks_elision(pos: &Position) -> bool {
     (found.bare && ty_lifetimes()) || (found.assoc && (ty_lifetimes() || trait_lifetimes()))
 }
 
-/// Whether a position has no witness: it has an elided lifetime, or `Self` cannot be written out
-/// in it.
+/// Finds an argument-position `impl Trait`: its type is not a type that a witness can return.
+struct HasImplTrait(bool);
+
+impl<'ast> Visit<'ast> for HasImplTrait {
+    fn visit_type_impl_trait(&mut self, _: &'ast TypeImplTrait) {
+        self.0 = true;
+    }
+}
+
+fn has_impl_trait(ty: &Type) -> bool {
+    let mut found = HasImplTrait(false);
+    found.visit_type(ty);
+    found.0
+}
+
+/// Whether a position has no witness: it has an elided lifetime or an `impl Trait`, or `Self`
+/// cannot be written out in it.
 fn has_no_witness(pos: &Position) -> bool {
-    has_elided(&pos.ty) || self_breaks_elision(pos)
+    has_elided(&pos.ty) || has_impl_trait(&pos.ty) || self_breaks_elision(pos)
 }
 
 // ---------------------------------------------------------------------------------------------

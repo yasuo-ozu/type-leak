@@ -40,6 +40,13 @@
 //!   (F17, about the strict items too), `impl_self_bound_cycle` (F19), `trait_assoc_bound_cycle`
 //!   (F20) and `iterator_item_cycle` (F21) are fixed findings: they are on by default (the Leaker
 //!   encodes or rewrites them, records what they need, or rejects and counts what it cannot copy).
+//!   `supertrait_item` (F25), `alias_item` (F26, a limitation), `impl_trait_args` (F27),
+//!   `hidden_lifetimes` (F28) and `projection_outlives` (F30) are known failures that the
+//!   generator does not make by default: with one of them, or `all`, the test fails with the
+//!   reproduction of that finding (E0277 for the first three of the bound cycles, E0106, E0309).
+//!   The other findings of `tests/findings.rs` that are not fixed (F22 to F24: the Leaker rejects
+//!   what compiles, F29, F31, F32) are not features: a rejection is counted as success, and the
+//!   test cannot show a toolchain or a lint.
 //!
 //! The test is ignored by default: it is slow, as it builds the generated crates. Run it with
 //!
