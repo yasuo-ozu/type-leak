@@ -1,6 +1,6 @@
 //! Encoding generic parameters and arguments into types.
 
-use crate::util::unwrap_type_group;
+use crate::util::{parenthesize_pointee, unwrap_type_group};
 use proc_macro2::Span;
 use std::collections::HashMap;
 use syn::punctuated::Punctuated;
@@ -510,17 +510,23 @@ pub(crate) fn is_maybe_unsized(param: &TypeParam) -> bool {
 /// The element of the trait arguments for the type `ty` of a `?Sized` parameter: `*const ty`.
 ///
 /// A tuple is well-formed only if the elements but the last are `Sized`, and a raw pointer is
-/// `Sized` whatever it points to. A trait object is parenthesized, since `*const dyn A + B` does
-/// not parse.
+/// `Sized` whatever it points to. A trait object with several bounds is parenthesized, since
+/// `*const dyn A + B` does not parse, and one with a single bound is not, as the parentheses are
+/// needless there (rustc's `unused_parens` reports `*const (dyn A)`): the rule is that of
+/// [`parenthesize_pointee()`]. Parentheses and groups around a trait object are dropped, so that
+/// only the one that is needed remains. The Leaker (the parameter, `T`) and the Referrer (its
+/// argument) both come here, so the parentheses are the same wherever it is a trait object.
 fn unsized_element(ty: &Type) -> Type {
     let pointee = match unwrap_type_group(ty) {
-        Type::TraitObject(object) => Type::Paren(TypeParen {
-            paren_token: Default::default(),
-            elem: Box::new(Type::TraitObject(object.clone())),
-        }),
+        object @ Type::TraitObject(_) => object.clone(),
         _ => ty.clone(),
     };
-    parse_quote!(*const #pointee)
+    parenthesize_pointee(Type::Ptr(TypePtr {
+        star_token: Default::default(),
+        const_token: Some(Default::default()),
+        mutability: None,
+        elem: Box::new(pointee),
+    }))
 }
 
 /// Returns `ty` as the referent of a reference. A trait object is parenthesized, and needs a

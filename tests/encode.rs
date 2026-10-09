@@ -454,7 +454,8 @@ fn test_trait_object_arguments_of_a_type_with_a_lifetime_bound() {
             Type::Paren(TypeParen { elem, .. }) => elem.as_ref().clone(),
             arg => arg.clone(),
         };
-        // A `?Sized` parameter is a pointer (a trait object in parentheses), so as to be `Sized`.
+        // A `?Sized` parameter is a pointer (a trait object with several bounds in parentheses), so
+        // as to be `Sized`.
         let expected: Type = parse_quote!((&'x (), *const (#object), &'x (#object)));
         assert_eq!(to_string(&ty), to_string(&expected));
     }
@@ -466,7 +467,7 @@ fn test_trait_object_arguments_of_a_type_with_a_lifetime_bound() {
         .unwrap();
     assert_eq!(
         to_string(&ty),
-        to_string(&parse_quote!((&'x (), *const (dyn Tr))))
+        to_string(&parse_quote!((&'x (), *const dyn Tr)))
     );
 }
 

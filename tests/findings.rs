@@ -39,7 +39,7 @@
 //! | `f29_entry_hides_lifetime` | an entry (a relative path) hides a lifetime: its Repeater impl does not compile | limitation |
 //! | `f30_implied_outlives_of_generic_projection_recorded_as_component` | `&'x T::Item` is recorded as `T: 'x`, which the copy cannot prove | bug |
 //! | `f31_nested_signature_has_its_own_lifetimes` | a signature inside an input has its own lifetimes only for rustc 1.64 and later | limitation |
-//! | `f32_parentheses_only_where_rustc_needs_them` | a trait object with one bound is parenthesized in the encoding of a `?Sized` argument | bug |
+//! | `f32_parentheses_only_where_rustc_needs_them` | a trait object with one bound is parenthesized in the encoding of a `?Sized` argument | fixed |
 //!
 //! The bugs that are not fixed (`bug` in the table) are `#[ignore]`d, as they fail today (a fixed
 //! one has no `#[ignore]`, and `fixed` in the table): run them with
@@ -4333,10 +4333,10 @@ fn needless_parens_in(generics: &Generics) -> Vec<String> {
     parens.needless
 }
 
-/// F32 (bug): the Leaker parenthesizes a trait object that needs no parentheses.
+/// F32 (fixed): the encoding parenthesized a trait object that needs no parentheses.
 ///
 /// Trigger: the encoding of a `?Sized` parameter whose argument is a trait object with one bound:
-/// `encode_generics_args_to_ty()` gives `(*const (dyn Tr),)` for `T: ?Sized` and `dyn Tr`
+/// `encode_generics_args_to_ty()` gave `(*const (dyn Tr),)` for `T: ?Sized` and `dyn Tr`
 /// (`unsized_element()`), as it gives `*const (dyn Tr + Send)` for two bounds, where without the
 /// parentheses it is E0178 ("ambiguous `+` in a type"). With one bound `*const dyn Tr` parses and
 /// means the same, so those parentheses are for nothing, and rustc's `unused_parens` says "unnecessary
@@ -4357,9 +4357,13 @@ fn needless_parens_in(generics: &Generics) -> Vec<String> {
 /// `Fn(..)` that ends in a trait object is the last one, and needs no parentheses, unless another
 /// bound sorts after it (`Clone + Fn() -> &dyn A`, but `Fn() -> (&dyn A) + Send`).
 ///
+/// The fix: `unsized_element()` parenthesizes the pointee by the rule of `parenthesize_pointee()`,
+/// the one for a reference, which is for a trait object with several bounds. The Leaker and the
+/// Referrer both call it, so they print the same tokens (the Leaker's argument is the parameter
+/// `T`, a path, which has none). The encoding is not serialized, so `Referrer::FORMAT_VERSION` stays.
+///
 /// The assertion: each parenthesis of the output is one that rustc needs (`NeedlessParens`).
 #[test]
-#[ignore = "a trait object with one bound is parenthesized in the encoding of a `?Sized` argument (`*const (dyn A)`)"]
 fn f32_parentheses_only_where_rustc_needs_them() {
     let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     // The encoding of the arguments of a `T: ?Sized`.
@@ -4380,6 +4384,17 @@ fn f32_parentheses_only_where_rustc_needs_them() {
             "(* const (dyn :: p :: A + 'static) ,)",
         ),
         (parse_quote!(str), "(* const str ,)"),
+        // One bound, with the parentheses that rustc does not need, or none.
+        (parse_quote!(dyn ::p::A), "(* const dyn :: p :: A ,)"),
+        (parse_quote!((dyn ::p::A)), "(* const dyn :: p :: A ,)"),
+        (
+            parse_quote!(dyn for<'a> ::p::B<'a>),
+            "(* const dyn for < 'a > :: p :: B < 'a > ,)",
+        ),
+        (
+            parse_quote!(dyn Fn(u8) -> &'static dyn ::p::A),
+            "(* const dyn Fn (u8) -> & 'static dyn :: p :: A ,)",
+        ),
     ] {
         let encoded = encode(arg);
         assert_eq!(string(&encoded), expected);
@@ -4444,7 +4459,11 @@ fn f32_parentheses_only_where_rustc_needs_them() {
             string(&copy)
         );
     }
-    // The one that is not: a trait object with one bound.
+    // The Leaker's encoding of the parameter is the Referrer's of the same argument.
+    let leaker_side = slots.encode_generics_params_to_ty(&params).unwrap();
+    assert_eq!(string(&leaker_side), string(&encode(parse_quote!(T))));
+    assert_eq!(string(&leaker_side), "(* const T ,)");
+    // A trait object with one bound, and with a lifetime bound (two).
     for arg in [parse_quote!(dyn ::p::A), parse_quote!(dyn ::p::A + 'static)] {
         let arg: Type = arg;
         let encoded = encode(arg.clone());
