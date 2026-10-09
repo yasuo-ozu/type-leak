@@ -314,7 +314,8 @@ impl Context {
             .collect();
         // An enclosing lifetime is a generic only if the type has a generic to bound by it.
         let ancestors = enclosing.generic(scopes);
-        let mentions = Mentions::of(ty, scopes, !ancestors.is_empty());
+        let self_bound = matches!(self_req, Some(SelfRequirement::Bound(_)));
+        let mentions = Mentions::of(ty, scopes, self_bound, !ancestors.is_empty());
         for (lifetime, depth) in &ancestors {
             let is_type_param = |name: &String| {
                 scopes.iter().any(|scope| {
@@ -457,10 +458,6 @@ impl Context {
             match bounded {
                 Bounded::SelfTy => {
                     self_outlives.push(lifetime);
-                    continue;
-                }
-                Bounded::SelfProjection(ident) => {
-                    predicates.push(parse_quote!(Self::#ident: #lifetime));
                     continue;
                 }
                 Bounded::Projection(projection) => {
@@ -986,11 +983,9 @@ enum Bounded {
     Lifetime(Lifetime),
     /// `Self` is not a parameter, but it is encoded as if it were (see [`Context::self_outlives`]).
     SelfTy,
-    /// `Self::A`, an associated type of the implementor of a trait. It stays a where predicate of
-    /// the context (see [`implied_outlives()`]).
-    SelfProjection(Ident),
-    /// `T::A` or `<T as Tr>::A`, an associated type of a generic (see [`is_generic_projection()`]). It
-    /// stays a where predicate of the context, as `Self::A` does (see [`implied_outlives()`]).
+    /// `T::A` or `<T as Tr>::A`, an associated type of a generic, or `Self::A` and `<Self as
+    /// Tr>::A`, one of the implementor of a trait (see [`is_generic_projection()`]). It stays a where
+    /// predicate of the context (see [`implied_outlives()`]).
     Projection(TypePath),
 }
 
@@ -1010,6 +1005,9 @@ fn is_generic_lifetime(scopes: &[Scope], binders: &[Lifetime], lifetime: &Lifeti
 /// The generics a type mentions, which `X: 'a` bounds (see [`implied_outlives()`]).
 struct Mentions<'a> {
     scopes: &'a [Scope],
+    /// `Self` is the implementor of a trait, so `Self::A` is an associated type of a generic too
+    /// (see [`is_generic_projection()`]).
+    self_bound: bool,
     /// The associated types that the bounds of the context equate (see [`Binding`]).
     env: &'a [Binding],
     /// How many bindings were substituted on the way here.
@@ -1025,17 +1023,23 @@ struct Mentions<'a> {
 }
 
 impl<'a> Mentions<'a> {
-    fn of(ty: &Type, scopes: &'a [Scope], wanted: bool) -> Self {
-        let mut mentions = Self::new(scopes, &[], Vec::new());
+    fn of(ty: &Type, scopes: &'a [Scope], self_bound: bool, wanted: bool) -> Self {
+        let mut mentions = Self::new(scopes, self_bound, &[], Vec::new());
         if wanted {
             mentions.visit_type(ty);
         }
         mentions
     }
 
-    fn new(scopes: &'a [Scope], env: &'a [Binding], binders: Vec<Lifetime>) -> Self {
+    fn new(
+        scopes: &'a [Scope],
+        self_bound: bool,
+        env: &'a [Binding],
+        binders: Vec<Lifetime>,
+    ) -> Self {
         Self {
             scopes,
+            self_bound,
             env,
             depth: 0,
             binders,
@@ -1048,13 +1052,14 @@ impl<'a> Mentions<'a> {
 
 impl<'a, 'ast> Visit<'ast> for Mentions<'a> {
     fn visit_type_path(&mut self, i: &'ast TypePath) {
-        if is_generic_projection(i, self.scopes) {
+        if is_generic_projection(i, self.scopes, self.self_bound) {
             match Binding::find(self.env, i) {
                 // The bounds equate it: rustc normalizes the path, in the environment of the impl
                 // and in the signature, so what outlives is the type it equals. A binding is not
                 // cyclic, but the depth is limited all the same.
                 Some(value) if self.depth < 16 => {
-                    let mut equal = Mentions::new(self.scopes, self.env, self.binders.clone());
+                    let mut equal =
+                        Mentions::new(self.scopes, self.self_bound, self.env, self.binders.clone());
                     equal.depth = self.depth + 1;
                     equal.visit_type(&value);
                     self.types.extend(equal.types);
@@ -1111,20 +1116,24 @@ impl<'a, 'ast> Visit<'ast> for Mentions<'a> {
 
 /// Returns `true` if `ty` is an associated type path of a generic, which `&'a ty` makes outlive
 /// `'a` as a whole: `T::A` and `<T as Tr<..>>::A` with `T` a type parameter in `scopes`, or such a
-/// path in place of `T` (`<T::A as Tr2>::B`). An associated type of a type that is not a type
-/// parameter (`<Vec<T> as IntoIterator>::Item`) is not one: rustc normalizes it, so what it
-/// becomes is what outlives `'a`.
-fn is_generic_projection(ty: &TypePath, scopes: &[Scope]) -> bool {
-    // The type parameter or the projection that the associated type belongs to.
-    fn base(ty: &Type, scopes: &[Scope]) -> bool {
+/// path in place of `T` (`<T::A as Tr2>::B`). `Self` counts as a type parameter where it is the
+/// implementor of a trait (`self_bound`): `Self::A`, `<Self as Tr<..>>::A` and `Self::A<'b>` are
+/// the same. An associated type of a type that is not a type parameter (`<Vec<T> as
+/// IntoIterator>::Item`) is not one: rustc normalizes it, so what it becomes is what outlives `'a`.
+fn is_generic_projection(ty: &TypePath, scopes: &[Scope], self_bound: bool) -> bool {
+    // The type parameter, `Self` of a trait, or the projection that the associated type belongs to.
+    fn is_base(name: &str, scopes: &[Scope], self_bound: bool) -> bool {
+        (self_bound && name == "Self") || is_type_parameter(name, scopes)
+    }
+    fn base(ty: &Type, scopes: &[Scope], self_bound: bool) -> bool {
         match unwrap_type_group(ty) {
             Type::Path(TypePath { qself: None, path }) if path.segments.len() == 1 => {
                 let seg = &path.segments[0];
                 path.leading_colon.is_none()
                     && seg.arguments.is_none()
-                    && is_type_parameter(&ident_name(&seg.ident), scopes)
+                    && is_base(&ident_name(&seg.ident), scopes, self_bound)
             }
-            Type::Path(path) => is_generic_projection(path, scopes),
+            Type::Path(path) => is_generic_projection(path, scopes, self_bound),
             _ => false,
         }
     }
@@ -1140,7 +1149,7 @@ fn is_generic_projection(ty: &TypePath, scopes: &[Scope]) -> bool {
             ) {
                 (None, Some(first), Some(_), None) => {
                     first.arguments.is_none()
-                        && is_type_parameter(&ident_name(&first.ident), scopes)
+                        && is_base(&ident_name(&first.ident), scopes, self_bound)
                 }
                 _ => false,
             }
@@ -1150,7 +1159,7 @@ fn is_generic_projection(ty: &TypePath, scopes: &[Scope]) -> bool {
         Some(qself) => {
             qself.position > 0
                 && ty.path.segments.len() == qself.position + 1
-                && base(&qself.ty, scopes)
+                && base(&qself.ty, scopes, self_bound)
         }
     }
 }
@@ -1313,48 +1322,29 @@ impl Binding {
     }
 }
 
-/// The `A` of the `Self::A` in a type: an associated type of `Self` with the trait not written and
-/// no arguments. `Self::A<'b>` and `Self::A::B` are not (the first may name a lifetime the context
-/// does not have).
-struct SelfProjections(Vec<Ident>);
-
-impl<'ast> Visit<'ast> for SelfProjections {
-    fn visit_type_path(&mut self, i: &'ast TypePath) {
-        let mut segments = i.path.segments.iter();
-        if let (None, None, Some(first), Some(second), None) = (
-            &i.qself,
-            &i.path.leading_colon,
-            segments.next(),
-            segments.next(),
-            segments.next(),
-        ) {
-            if first.ident == "Self" && first.arguments.is_none() && second.arguments.is_none() {
-                self.0.push(second.ident.clone());
-            }
-        }
-        syn::visit::visit_type_path(self, i)
-    }
-    // As for `Mentions`: `impl Trait` is not a component, and the types in an expression are not.
-    fn visit_type_impl_trait(&mut self, _: &'ast TypeImplTrait) {}
-    fn visit_expr(&mut self, _: &'ast Expr) {}
-    fn visit_macro(&mut self, _: &'ast Macro) {}
-}
-
 /// Returns the outlives bounds `ty` implies on `params`: `&'a X` requires `X: 'a`, as does each of
 /// `ancestors` for `ty`. A path with a lifetime argument adds none, as a guessed bound could make
 /// the copy stricter than the original. See [Outlives bounds](crate#outlives-bounds).
 ///
-/// `Self::A` of a trait (`self_req` is its bound) requires `Self::A: 'a`, which the original gets
-/// from the well-formedness of its signature, and the Repeater's impl has no signature. It is
-/// returned as itself and not as the bounds of its components (`Self` and the arguments of the
-/// trait): the copy, where only the projection is known to outlive `'a`, could not prove those.
-/// The same holds for an associated type path of a generic (`T::A`, `<T as Tr<'b>>::A`: see
-/// [`is_generic_projection()`]), which is returned as itself (`T::A: 'a`) and brings no `T: 'a`: the
-/// signature of a trait gives `T::A: 'a` and not `T: 'a`, so an impl for another type, whose
-/// signature has the encoded `T: 'a`, could not prove it (E0309). If a bound of the context equates
-/// the associated type (`T: Iterator<Item = X>`, see [`Binding`]), rustc normalizes the path in the
-/// signature and in the environment of the impl, where the predicate would be `X: 'a`, which is
-/// not decomposed into the bounds of the parts of `X`: the parts of `X` are mentioned instead.
+/// An associated type path of a generic (`T::A`, `<T as Tr<'b>>::A`: see [`is_generic_projection()`])
+/// requires `T::A: 'a`, which the original gets from the well-formedness of its signature, and the
+/// Repeater's impl has no signature. It is returned as itself and not as the bounds of its
+/// components (`T` and the arguments of the trait): the copy, where only the projection is known to
+/// outlive `'a`, could not prove those. The signature of a trait gives `T::A: 'a` and not `T: 'a`,
+/// so an impl for another type, whose signature has the encoded `T: 'a`, could not prove it
+/// (E0309).
+///
+/// The same holds for the associated types of `Self` of a trait (`self_req` is its bound):
+/// `Self::A`, `<Self as Tr<'b, U>>::A` and `Self::A<'b>` are returned as themselves, and bring no
+/// `Self: 'a` (it would be stricter than the original, as `T: 'a` is: the copy for a generic host
+/// `Gen<H>` needs `&'a Gen<H>`, where the original needs `H::Item: 'a`), nor `'b: 'a` or `U: 'a`
+/// for the arguments of the trait. `Self` mentioned elsewhere in the type does require `Self: 'a`.
+///
+/// If a bound of the context equates the associated type (`T: Iterator<Item = X>`, `where Self:
+/// Iterator<Item = X>`, see [`Binding`]), rustc normalizes the path in the signature and in the
+/// environment of the impl, where the predicate would be `X: 'a`, which is not decomposed into the
+/// bounds of the parts of `X`: the parts of `X` are mentioned instead. A supertrait that equates it
+/// (`trait Tr: Iterator<Item = X>`) is not seen, since the Referrer's copy has none.
 fn implied_outlives(
     ty: &Type,
     scopes: &[Scope],
@@ -1365,6 +1355,7 @@ fn implied_outlives(
 ) -> Vec<(Bounded, Lifetime)> {
     struct Finder<'a> {
         scopes: &'a [Scope],
+        self_bound: bool,
         env: &'a [Binding],
         params: &'a [GenericParam],
         self_req: Option<&'a SelfRequirement>,
@@ -1380,20 +1371,11 @@ fn implied_outlives(
         }
 
         fn require_generic(&mut self, lifetime: &Lifetime, referent: &Type) {
-            let mut mentions = Mentions::new(self.scopes, self.env, self.binders.clone());
+            let mut mentions =
+                Mentions::new(self.scopes, self.self_bound, self.env, self.binders.clone());
             mentions.visit_type(referent);
             if self.self_req.is_some() && mentions.types.iter().any(|name| name == "Self") {
                 self.found.push((Bounded::SelfTy, lifetime.clone()));
-            }
-            if let Some(SelfRequirement::Bound(_)) = self.self_req {
-                let mut projections = SelfProjections(Vec::new());
-                projections.visit_type(referent);
-                self.found.extend(
-                    projections
-                        .0
-                        .into_iter()
-                        .map(|ident| (Bounded::SelfProjection(ident), lifetime.clone())),
-                );
             }
             self.found.extend(
                 mentions
@@ -1444,6 +1426,7 @@ fn implied_outlives(
     }
     let mut finder = Finder {
         scopes,
+        self_bound: matches!(self_req, Some(SelfRequirement::Bound(_))),
         env,
         params,
         self_req,

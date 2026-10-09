@@ -1,5 +1,8 @@
-//! `Self: 'a`, which a leaked type implies (`&'a Rel<Self>`, `&'a Self::Item`, `&'a (Self, T)`: a
-//! reference requires its referent to outlive it) or the item writes (`where Self: 'a`): `Self` is
+//! `Self: 'a`, which a leaked type implies (`&'a Rel<Self>`, `&'a (Self, T)`: a reference requires
+//! its referent to outlive it) or the item writes (`where Self: 'a`). An associated type of `Self`
+//! (`&'a Self::Item`, `&'a <Self as Tr>::Item`) implies `Self::Item: 'a` instead, which is a where
+//! predicate of the context and no `Self: 'a`: the original gets no more from the well-formedness
+//! of its signature, and a copy that asks for `Self: 'a` is stricter (F34). `Self` is
 //! not a generic parameter, so it is not among the bounds of the generics of the context, but its
 //! own part of it (`Referrer::context_self_outlives()`), which the encoders encode as `&'a Self`
 //! (`&'a __S` in the Repeater's implementation for the implementor of the trait), after the
@@ -68,12 +71,11 @@ fn slots() -> RepeaterSlots {
 
 #[test]
 fn a_type_implying_it_records_it_in_the_context() {
-    // `&'a Rel<Self>` and `&'a Rel<Self::Item>` need `Self: 'a`, with a lifetime of the method or
-    // of the trait.
+    // `&'a Rel<Self>` needs `Self: 'a`, with a lifetime of the method or of the trait.
     for item in [
         parse_quote! { trait Tr { fn f<'a>(&self, x: &'a Rel<Self>); } },
-        parse_quote! { trait Tr { type Item; fn f<'a>(&self, x: &'a Rel<Self::Item>); } },
-        parse_quote! { trait Tr { type Item; fn f<'a>(&self, x: &'a Rel<<Self as Tr>::Item>); } },
+        // `Self` apart from its associated type.
+        parse_quote! { trait Tr { type Item; fn f<'a>(&self, x: &'a Rel<(Self, Self::Item)>); } },
         parse_quote! { trait Tr<'a> { fn f(&self, x: &'a Rel<Self>); } },
         parse_quote! { trait Tr { fn f<'a>(&self, x: &'a Rel<(u8, Vec<Self>)>); } },
         // The arguments of a trait object must outlive too (`dyn Tr<Self> + 'b: 'a`).
@@ -118,6 +120,63 @@ fn a_type_implying_it_records_it_in_the_context() {
             vec!["'a".to_string(), "'b".to_string()]
         )
     );
+}
+
+#[test]
+fn an_associated_type_of_self_implies_its_own_outlives_and_not_self() {
+    // `&'a Rel<Self::Item>`, `&'a Rel<<Self as Tr>::Item>`, `&'a Rel<<Self as Tr<T>>::Item>` and
+    // `&'a Rel<Self::G<'b>>` need `<path>: 'a`, which the original has from its signature. The
+    // context has it as a where predicate, and `Self: 'a` is not recorded (F34).
+    for (item, predicate) in [
+        (
+            parse_quote! { trait Tr { type Item; fn f<'a>(&self, x: &'a Rel<Self::Item>); } },
+            "Self :: Item : 'a",
+        ),
+        (
+            parse_quote! {
+                trait Tr { type Item; fn f<'a>(&self, x: &'a Rel<<Self as Tr>::Item>); }
+            },
+            "< Self as Tr > :: Item : 'a",
+        ),
+        (
+            parse_quote! {
+                trait Tr<T> { type Item; fn f<'a>(&self, x: &'a Rel<<Self as Tr<T>>::Item>); }
+            },
+            "< Self as Tr < T > > :: Item : 'a",
+        ),
+        (
+            parse_quote! {
+                trait Tr<'b> { type G<'g>; fn f<'a>(&self, x: &'a Rel<Self::G<'b>>); }
+            },
+            "Self :: G < 'b > : 'a",
+        ),
+        (
+            parse_quote! {
+                trait Tr<'a> { type Item; fn f(&self, x: &'a Rel<Self::Item>); }
+            },
+            "Self :: Item : 'a",
+        ),
+    ] {
+        let item: ItemTrait = item;
+        let referrer = of_trait(item.clone());
+        for (types, outlives) in outlives(&referrer) {
+            assert!(
+                outlives.is_empty(),
+                "{}: {:?} has {:?}",
+                s(&item),
+                types,
+                outlives
+            );
+        }
+        let predicates: Vec<String> = referrer
+            .context_generics(referrer.context(0))
+            .where_clause
+            .iter()
+            .flat_map(|w| &w.predicates)
+            .map(s)
+            .collect();
+        assert_eq!(predicates, [predicate], "{}", s(&item));
+    }
 }
 
 #[test]

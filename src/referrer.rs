@@ -1153,8 +1153,11 @@ impl Referrer {
     // tokens look the same, but the data of 3 would not find those entries the same way.
     // 5: the context of `&'a Self::A` in a trait has the where predicate `Self::A: 'a`, which the
     // Referrer computes for a copy too, so the entries of 4 are not found. 6: so has that of `&'a
-    // T::A` or `&'a <T as Tr>::A` with `T` a generic (`T::A: 'a`, and no `T: 'a`).
-    pub const FORMAT_VERSION: u32 = 6;
+    // T::A` or `&'a <T as Tr>::A` with `T` a generic (`T::A: 'a`, and no `T: 'a`). 7: so have
+    // those of `&'a <Self as Tr<..>>::A` and `&'a Self::A<'b>` (the predicate, and no `'b: 'a` or
+    // `T: 'a`), and of a `Self::A` that a where clause equates (what it equals is mentioned); no
+    // projection of `Self` records `Self: 'a` any more.
+    pub const FORMAT_VERSION: u32 = 7;
 }
 
 /// Parses a [`Referrer`] written by its [`ToTokens`] implementation.

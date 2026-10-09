@@ -1049,8 +1049,9 @@ fn host_impl(
                 items.extend(quote!(const #name: #ty = #value;));
             }
             (TraitItem::Type(t), _) => {
-                let name = &t.ident;
-                items.extend(quote!(type #name = u8;));
+                // A generic associated type keeps its parameters.
+                let (name, generics) = (&t.ident, &t.generics);
+                items.extend(quote!(type #name #generics = u8;));
             }
             _ => (),
         }

@@ -194,6 +194,12 @@ pub struct Features {
     /// `Item` that the entry defines: a cycle (E0275, F33, fixed: on by default, the Leaker rejects
     /// it). Off, the equation is dropped where an enclosing predicate names the `Item`.
     pub item_predicate_cycle: bool,
+    /// `Rel<&'a P>` where `P` is an associated type path of `Self` that is not the bare `Self::A0`
+    /// of a receiver's lifetime: `<Self as Tr<'a, T>>::A0`, `Self::A0` with a lifetime of the trait,
+    /// or `Self::G<'b>` of a generic associated type. The signature implies `P: 'a` and nothing of
+    /// `Self` or of the arguments of the trait, which the copy for a host type has to prove from
+    /// the predicate that the Leaker records (E0491, E0477, E0309, F34: fixed, on by default).
+    pub self_projection_outlives: bool,
 }
 
 impl Features {
@@ -223,6 +229,7 @@ impl Features {
             impl_trait_args: true,
             projection_outlives: true,
             item_predicate_cycle: true,
+            self_projection_outlives: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -253,6 +260,7 @@ impl Features {
                     features.hidden_lifetimes = true;
                     features.projection_outlives = true;
                     features.item_predicate_cycle = true;
+                    features.self_projection_outlives = true;
                 }
                 "inferred_outlives" => features.inferred_outlives = true,
                 "impl_assoc_self" => features.impl_assoc_self = true,
@@ -277,6 +285,7 @@ impl Features {
                 "hidden_lifetimes" => features.hidden_lifetimes = true,
                 "projection_outlives" => features.projection_outlives = true,
                 "item_predicate_cycle" => features.item_predicate_cycle = true,
+                "self_projection_outlives" => features.self_projection_outlives = true,
                 "unsized_params" => features.unsized_params = true,
                 "bound_cycles" => features.bound_cycles = true,
                 other => panic!("unknown feature `{}`", other),
@@ -423,6 +432,8 @@ struct Scope {
     self_outlives: Vec<String>,
     /// `Self::A` of a trait, with the bounds of `A`.
     assoc: Vec<(String, Bounds)>,
+    /// The trait with its arguments (`Tr<'a, T>`), for `<Self as Tr<'a, T>>::A`.
+    trait_ref: String,
     /// `Self` is the struct, enum or union that is declared: it must not contain itself.
     adt_self: bool,
     /// The outlives bounds of the type parameters in a field are inferred by rustc.
@@ -433,8 +444,9 @@ struct Scope {
     /// `method_lifetime_paths`, or a method that no trait declares (a free function, a method of
     /// an inherent impl), where the copy compiles with the lifetime early-bound (F22).
     method_paths: bool,
-    /// `(parameter, "iter" | "fn")`: a parameter has one `Iterator` and one `Fn` bound at most,
-    /// or the bounds conflict.
+    /// `(parameter, "iter" | "fn" | "into")`: a parameter has one `Iterator`, one `Fn` and one
+    /// `Into` bound at most, or the bounds conflict (two `Into` bounds that differ by a lifetime
+    /// only are ambiguous to rustc: E0283).
     bounded: Vec<(String, &'static str)>,
     /// `Self` has lifetimes where a copy writes it out: the self type of an impl that names one,
     /// an ADT with lifetime parameters (`self_elision`).
@@ -789,6 +801,8 @@ struct TraitInfo {
     sk: Skeleton,
     supers: Bounds,
     assoc: Vec<(String, Bounds)>,
+    /// The trait declares `type G<'g>;`.
+    gat: bool,
     /// `const C0: ::core::marker::PhantomData<..>` or `const K0: usize`, with its value in an impl.
     consts: Vec<(String, String)>,
     /// The signatures of the methods, with their where clauses.
@@ -1934,6 +1948,10 @@ impl Gen {
                 }
                 1 if !sized_params.is_empty() => {
                     let p = self.pick(&sized_params).clone();
+                    if bounded.contains(&(p.name.clone(), "into")) {
+                        continue;
+                    }
+                    bounded.push((p.name.clone(), "into"));
                     let a = self.ty(sc, sized, 1);
                     format!("{}: ::core::convert::Into<{}>", p.name, a.text)
                 }
@@ -2177,6 +2195,24 @@ impl Gen {
     // Methods.
     // -----------------------------------------------------------------------------------------
 
+    /// An associated type path of `Self` that a method of a trait can name: `Self::A0` and, with
+    /// `self_projection_outlives`, `<Self as Tr<..>>::A0`.
+    fn self_projection(&mut self, sc: &Scope) -> Option<String> {
+        let more = self.features.self_projection_outlives && !sc.trait_ref.is_empty();
+        let mut forms: Vec<String> = Vec::new();
+        for (name, _) in &sc.assoc {
+            forms.push(format!("Self::{}", name));
+            if more {
+                forms.push(format!("<Self as {}>::{}", sc.trait_ref, name));
+            }
+        }
+        if forms.is_empty() {
+            None
+        } else {
+            Some(self.pick(&forms).clone())
+        }
+    }
+
     /// A parameter or the result of a method. The lifetimes of the method are written in a
     /// reference at the top of the type only, which the copy keeps: a lifetime that is in a leaked
     /// type only is early-bound in the copy, and late-bound in the trait (E0195, see
@@ -2221,6 +2257,45 @@ impl Gen {
                 }
             }
         }
+        // `self_projection_outlives` asks for `Rel<&'a P>` or `&'a P`, where `'a` is a lifetime of
+        // the trait and `P` an associated type path of `Self` (`Self::A0`, `<Self as Tr<'a,
+        // T>>::A0`): the signature implies `P: 'a`, and not `Self: 'a` or the arguments of the
+        // trait.
+        let item_lifetimes: Vec<String> = sc
+            .lifetimes
+            .iter()
+            .filter(|l| !sc.ref_only.contains(*l))
+            .cloned()
+            .collect();
+        if self.features.self_projection_outlives
+            && !self.no_self
+            && !sc.pred
+            && !sc.assoc.is_empty()
+            && !item_lifetimes.is_empty()
+            && self.chance(30)
+        {
+            let lt = self.pick(&item_lifetimes).clone();
+            if let Some(path) = self.self_projection(sc) {
+                let heads: Vec<String> = self
+                    .env
+                    .heads
+                    .iter()
+                    .filter(|head| head.shape == Shape::T1 && !head.name.starts_with("::"))
+                    .map(|head| head.name.clone())
+                    .collect();
+                let text = if !heads.is_empty() && self.chance(50) {
+                    format!("{}<&{} {}>", self.pick(&heads), lt, path)
+                } else {
+                    format!("&{} {}", lt, path)
+                };
+                let mut ty = Ty::new(text).no_infer();
+                ty.uses_self = true;
+                ty.projection = true;
+                ty.adds_lts = sc.assoc_lts || sc.self_lts;
+                ty.lts.insert(lt);
+                return ty;
+            }
+        }
         // `implied_outlives` asks for `&'x mut Self::A` where only the signature implies
         // `Self::A: 'x`.
         if self.features.implied_outlives
@@ -2230,9 +2305,9 @@ impl Gen {
             && self.chance(35)
         {
             let lt = self.pick(&sc.self_outlives).clone();
-            let (name, _) = self.pick(&sc.assoc).clone();
+            let path = self.self_projection(sc).unwrap();
             let m = if self.chance(30) { "mut " } else { "" };
-            let mut ty = Ty::new(format!("&{} {}Self::{}", lt, m, name)).no_infer();
+            let mut ty = Ty::new(format!("&{} {}{}", lt, m, path)).no_infer();
             ty.uses_self = true;
             ty.lts.insert(lt);
             return ty;
@@ -2938,6 +3013,20 @@ impl Gen {
             });
             assoc.push((n, b));
         }
+        // `self_projection_outlives` asks for a generic associated type `type G<'g>;`, and a method
+        // that names it with a lifetime of the trait that nothing else names (`'c`, which no
+        // skeleton declares, and is declared after the other methods are made): rustc requires
+        // bounds on the associated type for each outlives relation that the signature or the trait
+        // has with the lifetime it is given ("missing required bound"), and the reference around
+        // it has another lifetime.
+        let gat = self.features.self_projection_outlives
+            && !sk.lifetimes.is_empty()
+            && !self.no_self
+            && self.chance(30);
+        let mut with_gat = sk.clone();
+        if gat {
+            with_gat.lifetimes.push("'c".to_string());
+        }
         let base = Scope {
             self_kind: if self_sized {
                 SelfKind::Sized
@@ -2945,6 +3034,7 @@ impl Gen {
                 SelfKind::Unsized
             },
             assoc: assoc.clone(),
+            trait_ref: format!("{}{}", name, with_gat.args()),
             assoc_lts: !sk.lifetimes.is_empty(),
             ..Default::default()
         };
@@ -2989,6 +3079,18 @@ impl Gen {
             let m = self.name("m");
             methods.push(self.method_sig(&method_scope, &m, true));
         }
+        if gat {
+            let outer = self.pick(&sk.lifetimes).clone();
+            sk.lifetimes.push("'c".to_string());
+            let path = if self.chance(50) {
+                "Self::G<'c>".to_string()
+            } else {
+                format!("<Self as {}{}>::G<'c>", name, sk.args())
+            };
+            let m = self.name("m");
+            methods.push(format!("fn {}(&self, a: &{} {})", m, outer, path));
+            assoc_texts.push("type G<'g>;".to_string());
+        }
         self.self_prob = saved_prob;
 
         let attr = ann.map_or(String::new(), |(id, a)| self.attr(id, a));
@@ -3025,6 +3127,7 @@ impl Gen {
             sk,
             supers,
             assoc,
+            gat,
             consts,
             uses_assoc_self: body.iter().any(|item| item.contains("Self::")),
             self_assoc_in_pred,
@@ -3192,6 +3295,9 @@ impl Gen {
         let mut body: Vec<String> = Vec::new();
         for (n, _) in &tr.assoc {
             body.push(format!("type {} = u8;", n));
+        }
+        if tr.gat {
+            body.push("type G<'g> = u8;".to_string());
         }
         for (decl, value) in &tr.consts {
             body.push(format!("{} = {};", decl, value));
