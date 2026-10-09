@@ -17,6 +17,12 @@ macro_rules! forward {
 }
 
 impl View<'_> {
+    /// Walks the parts of an impl of the scope: the walk of `syn::visit::visit_item_impl()`, with
+    /// the self type checked.
+    pub(crate) fn walk_item_impl(&mut self, item: &ItemImpl) {
+        self.visitor.walk_item_impl(item)
+    }
+
     /// Analyzes a nested item, such as a struct, a trait, an impl, a module or a function.
     ///
     /// It is analyzed like an item of a module

@@ -96,7 +96,8 @@ pub struct Features {
     pub module_crate_paths: bool,
     /// A bound of the generics of an impl that names `Self` (`impl<T: AsRef<Option<Self>>> W<T>`):
     /// the self type is an entry that depends on `Self`, which is the self type itself, so the
-    /// copy cannot write it (F13).
+    /// copy cannot write it (F13, fixed: the Leaker rejects it, and the rejections are counted, so
+    /// it is on by default).
     pub impl_self_bounds: bool,
     /// An impl of a trait whose where clause names a leaked type (`impl<T> Tr<T> for S where T:
     /// Fn(Rel)`), and a method of it with a predicate that names `Self::A`
@@ -138,7 +139,9 @@ pub struct Features {
     /// (`X: Fn(&Self) -> u8`) and a leaked type in another predicate that uses the generic
     /// (`Rel<X>: Default`): the entry's Repeater impl has the bound with the Leaker's self type,
     /// and the copy has it with `Self` = the unnormalized projection that replaces the self type
-    /// (E0277, E0271, F19). Off, the other predicates that use the generic are dropped.
+    /// (E0277, E0271, F19). Off, the other predicates that use the generic are dropped, and a
+    /// trait whose where clause has such a bound (`impl_self_bounds`) is not implemented where a
+    /// method predicate uses the generic.
     pub impl_self_bound_cycle: bool,
     /// The same in a trait with a bound that names `Self::A` (`X: Fn(&Self::A0) -> u8`): the
     /// impl of the Repeater for the host has the bound with the host's type for `A0`, and the copy
@@ -169,6 +172,7 @@ impl Features {
             bound_cycles: true,
             implied_outlives: true,
             self_elision: true,
+            impl_self_bounds: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -2747,6 +2751,15 @@ impl Gen {
                         .iter()
                         .any(|p| names_self_in_bound(p))
             })
+            // A generic whose bound names `Self`, which another predicate or a where clause of a
+            // method uses in a leaked type, is F19 in an impl whose self type is leaked
+            // (`impl_self_bound_cycle`).
+            .filter(|&i| {
+                let tr = &self.traits[i];
+                let names: Vec<String> = tr.sk.tys.iter().map(|t| t.name.clone()).collect();
+                self.features.impl_self_bound_cycle
+                    || !self_bound_used(&tr.sk.preds, &tr.methods, &names)
+            })
             // The impl has the where clause of the trait, and the methods with their predicates:
             // a predicate that names `Self::A` makes rustc prove the impl in its environment,
             // where the bound of the impl that names a leaked type is not normalized yet
@@ -3261,6 +3274,27 @@ fn drop_self_bound_cycles(preds: &mut Vec<String>, params: &[String]) {
         return;
     }
     preds.retain(|p| bound_of(p).is_some() || !cyclic.iter().any(|x| has_word(p, x)));
+}
+
+/// Whether a generic of `params` is in a predicate of `preds` that names `Self`
+/// (`X: Fn(&Self) -> u8`, `Vec<X>: Into<Self::A>`), and in another predicate or in the where clause
+/// of a method (`Rel<X>: Default`). The entry of the second has the first in its context.
+fn self_bound_used(preds: &[String], methods: &[String], params: &[String]) -> bool {
+    params
+        .iter()
+        .filter(|x| {
+            preds
+                .iter()
+                .any(|p| names_self_in_bound(p) && has_word(p, x))
+        })
+        .any(|x| {
+            preds
+                .iter()
+                .any(|p| !names_self_in_bound(p) && has_word(p, x))
+                || methods
+                    .iter()
+                    .any(|m| m.find(" where ").map_or(false, |at| has_word(&m[at..], x)))
+        })
 }
 
 /// Whether `text` names a lifetime other than `'static`.

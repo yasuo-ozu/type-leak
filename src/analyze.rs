@@ -1721,6 +1721,52 @@ impl AnalyzeVisitor {
         }));
     }
 
+    /// Walks the parts of an impl as `syn::visit::visit_item_impl()` does, with the self type
+    /// apart: the copy writes it as a type, and `Self` stands for it in the rest of the impl, so
+    /// no entry in it can depend on `Self` (see [`AnalyzeVisitor::cut_self_cycles()`]).
+    pub(crate) fn walk_item_impl(&mut self, i: &ItemImpl) {
+        for attr in &i.attrs {
+            self.visit_attribute(attr);
+        }
+        self.visit_generics(&i.generics);
+        if let Some((_, path, _)) = &i.trait_ {
+            self.visit_path(path);
+        }
+        let start = self.frame.effects.len();
+        self.visit_type(&i.self_ty);
+        self.cut_self_cycles(start, &i.generics);
+        for item in &i.items {
+            self.visit_impl_item(item);
+        }
+    }
+
+    /// Called after the self type of an impl with `generics` is visited, with `start` the first
+    /// effect it made.
+    ///
+    /// The Repeater's impl of an entry whose context depends on `Self` (a bound of the generics
+    /// of the impl names it) is for the self type, so the copy writes `<Self as Repeater<..>>::Type`
+    /// with the self type, as the Referrer has it, for `Self`. An entry in the self type has none:
+    /// it is the one that is being written (`T: AsRef<Option<Self>>` in `impl<T> S<T>`: `S<T>` is
+    /// its own `Self`, and a path that stands for itself is a cycle, E0391). Replacing the bound
+    /// of the context by one for the self type does not help, as the bound would then name a
+    /// leaked type that is the entry itself (E0277, see [Bounds that name leaked
+    /// types](crate#bounds-that-name-leaked-types)), and the parts of the self type depend on
+    /// `Self` as it does.
+    ///
+    /// So a type that must be an entry is an error, and one that may be is not. An optional entry
+    /// is copied as written, which the Referrer cannot do if it replaces them (see
+    /// [`AnalyzeVisitor::env_cycle()`]). Only a bound that `generics` declare counts: a bound of
+    /// an outer scope that names its own `Self` is written for the type that scope knows.
+    fn cut_self_cycles(&mut self, start: usize, generics: &Generics) {
+        let mut not_optional = Vec::new();
+        cut_conflicts(
+            &mut self.frame.effects[start..],
+            &|pending| self_type_conflict(pending, generics),
+            &mut not_optional,
+        );
+        self.not_optional.extend(not_optional);
+    }
+
     /// Records an error if a trait path depends on the context or starts with `Self` without a
     /// meaning. Returns `true` if so.
     fn check_bound_path(&mut self, path: &Path, tokens: TokenStream) -> bool {
@@ -2647,7 +2693,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
             if let Some((_, path, _)) = &i.trait_ {
                 visitor.check_bound_path(path, quote!(#path));
             }
-            syn::visit::visit_item_impl(visitor, i)
+            visitor.walk_item_impl(i)
         });
     }
 
@@ -3197,6 +3243,125 @@ fn assoc_self_note(cause: &TokenStream, self_ty: &Type) -> String {
         cause,
         quote!(#self_ty)
     )
+}
+
+/// Cuts the entries of the self type of an impl for which `conflict` returns the conflict (see
+/// [`AnalyzeVisitor::cut_self_cycles()`]). A type that must be an entry is an error, and so is a
+/// reference with a lifetime that has a part that must be one, as its parts cannot stand for it
+/// (`is_whole_reference()`). Another type cannot be an entry, and an optional one is not (the
+/// optional entries are added to `not_optional`).
+fn cut_conflicts(
+    effects: &mut [Effect],
+    conflict: &dyn Fn(&PendingType) -> Option<CheckResult>,
+    not_optional: &mut Vec<(Context, String)>,
+) {
+    for effect in effects.iter_mut() {
+        let pending = match &mut *effect {
+            Effect::Type(pending) => pending,
+            _ => continue,
+        };
+        if let Some(error) = conflict(pending) {
+            let whole = is_whole_reference(&pending.ty);
+            if pending.in_graph && (pending.is_must_intern || whole) {
+                *effect = Effect::Error(error);
+                continue;
+            }
+            pending.no_entry |= pending.in_graph;
+            pending.no_optional_entry |= pending.has_optional;
+            if pending.has_optional && whole {
+                // The optional entries under a reference cannot stand for it either.
+                not_optional.extend(optional_keys(&pending.components));
+            }
+            if pending.optional {
+                let ty = &pending.ty;
+                not_optional.push((pending.context.clone(), quote!(#ty).to_string()));
+                pending.optional = false;
+            }
+        }
+        cut_conflicts(&mut pending.components, conflict, not_optional);
+    }
+}
+
+/// Returns the first mention of `Self` in the bounds that the generics `declared` of an impl give
+/// to `context`: the bounds of its parameters and its where predicates.
+fn declared_self_mention(declared: &Generics, context: &Context) -> Option<TokenStream> {
+    let names: HashSet<String> = declared.params.iter().map(generic_param_name).collect();
+    let written: HashSet<String> = declared
+        .where_clause
+        .iter()
+        .flat_map(|where_clause| where_clause.predicates.iter())
+        .map(|predicate| quote!(#predicate).to_string())
+        .collect();
+    let predicates: Vec<WherePredicate> = context
+        .generics()
+        .where_clause
+        .iter()
+        .flat_map(|where_clause| where_clause.predicates.iter())
+        .filter(|predicate| written.contains(&quote!(#predicate).to_string()))
+        .cloned()
+        .collect();
+    let own = Generics {
+        params: context
+            .generics()
+            .params
+            .iter()
+            .filter(|param| names.contains(&generic_param_name(param)))
+            .cloned()
+            .collect(),
+        where_clause: (!predicates.is_empty()).then(|| WhereClause {
+            where_token: Default::default(),
+            predicates: predicates.into_iter().collect(),
+        }),
+        ..Generics::default()
+    };
+    first_self_in_generics(&own).or_else(|| {
+        // A written `Self: 'a` moved to `self_outlives`, which is encoded as `&'a Self`.
+        if context.self_outlives().is_empty() {
+            return None;
+        }
+        first_self_in_generics(&Generics {
+            where_clause: declared.where_clause.clone(),
+            ..Generics::default()
+        })
+    })
+}
+
+/// The conflict of `pending`, an entry in the self type of an impl with the generics `declared`, if
+/// its context depends on the `Self` that they bound (see [`AnalyzeVisitor::cut_self_cycles()`]).
+fn self_type_conflict(pending: &PendingType, declared: &Generics) -> Option<CheckResult> {
+    let ty = &pending.ty;
+    let context = &pending.context;
+    let self_ty = match context.self_ty() {
+        Some(SelfRequirement::Type(self_ty)) => self_ty,
+        _ => return None,
+    };
+    let cause = declared_self_mention(declared, context)?;
+    let shown = quote!(#ty).to_string();
+    let what = if quote!(#self_ty).to_string() == shown {
+        format!("`Self` is `{}`, the self type of the impl", shown)
+    } else {
+        format!(
+            "`Self` is the self type `{}` of the impl, which contains `{}`",
+            quote!(#self_ty),
+            shown
+        )
+    };
+    Some(CheckResult {
+        must: vec![quote!(#ty)],
+        impossible: vec![cause],
+        is_own: true,
+        optional: false,
+        note: Some(format!(
+            "{}. The copy writes `{}` as a path through the Repeater, whose impl is for `Self`, \
+             so the Referrer has no type to write for `Self`: it is the one being replaced. Write \
+             the self type with an absolute path, or the bounds of its generics without `Self`",
+            what, shown
+        )),
+        headline: Some(format!(
+            "`{}` is in the self type of the impl, and a bound of its generics names `Self`",
+            shown
+        )),
+    })
 }
 
 /// Returns the lifetimes that the return type of `sig` mentions, and those that a bound names:

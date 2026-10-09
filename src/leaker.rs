@@ -125,7 +125,9 @@ impl Leaker {
     /// The generics of the item are those of the Leaker, and `Self` is the self type
     /// ([`SelfRequirement::Type`]). It analyzes the generics, the trait and its arguments, the self
     /// type, and the signatures, associated types and consts. It skips function bodies and const
-    /// values. The trait path must not depend on the context. For `allow_self` see
+    /// values. The trait path must not depend on the context. An entry in the self type cannot
+    /// depend on `Self` through a bound of the generics ([Self rules](crate#self-rules)). For
+    /// `allow_self` see
     /// [`Leaker::intern_struct()`]. This is [`Leaker::enter_impl()`] with the item visited.
     pub fn intern_impl(&mut self, item: &ItemImpl, allow_self: bool) -> Res<ContextId> {
         // The scope checks the path of the trait, and the walk analyzes its arguments.
@@ -135,7 +137,7 @@ impl Leaker {
             &item.self_ty,
             trait_path,
             allow_self,
-            |view| syn::visit::visit_item_impl(view, item),
+            |view| view.walk_item_impl(item),
         )
         .map(|(context, ())| context)
     }

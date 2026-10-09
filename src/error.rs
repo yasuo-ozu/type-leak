@@ -35,7 +35,10 @@ pub enum NotInternableError {
     /// Repeater, as rustc cannot prove a bound of its generics that names a leaked type: its
     /// headline is "`Wrap<T>` is in a bound or where predicate, and a bound of its generics names a
     /// leaked type", or "`Rel<Self>` names `Self` in a bound or where predicate of its trait"
-    /// ([Bounds that name leaked types](crate#bounds-that-name-leaked-types)). Each
+    /// ([Bounds that name leaked types](crate#bounds-that-name-leaked-types)). Also a type in the
+    /// self type of an impl whose context depends on `Self` through a bound of the impl: its
+    /// headline is "`S<T>` is in the self type of the impl, and a bound of its generics names
+    /// `Self`" ([Self rules](crate#self-rules)). Each
     /// conflict is reported at the first of its [`CheckResult::must`], with
     /// [`CheckResult::is_own`] `true`. For a trait bound, a value or the type of a const
     /// parameter, [`CheckResult::impossible`] is that bound, value or parameter. Never empty.

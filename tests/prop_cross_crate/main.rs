@@ -31,16 +31,15 @@
 //! - `TYPE_LEAK_PROP_FEATURES`: a comma-separated list of constructs that `type-leak` is known to
 //!   fail on (see `gen::Features`). The generator avoids them by default, so that the test passes
 //!   on the current library, and a new failure is a new finding. With one of `inferred_outlives`,
-//!   `impl_self_outlives`, `impl_self_bounds` (F13), `impl_pred_leaked` (F14),
-//!   `strict_cycles` (F17), `strict_anchors` (F18),
+//!   `impl_self_outlives`, `impl_pred_leaked` (F14), `strict_cycles` (F17), `strict_anchors` (F18),
 //!   `impl_self_bound_cycle` (F19), `trait_assoc_bound_cycle` (F20), `iterator_item_cycle` (F21),
 //!   or `all`, the test fails with the reproduction of that finding (`tests/findings.rs` has each
 //!   one as a library-level test; `strict_cycles` and `strict_anchors` are about the items that
 //!   are invoked as `strict`, a quarter of them). `unsized_params`, `bound_cycles`,
 //!   `impl_assoc_self`, `method_lifetime_paths`, `module_crate_paths`, `bound_merge_syntax`,
-//!   `fn_pointer_self`, `elided_fn_generics`, `self_elision` (F15) and `implied_outlives` (F16)
-//!   are fixed findings: they are on by default (the Leaker encodes or rewrites them, records what
-//!   they need, or rejects and counts what it cannot copy).
+//!   `fn_pointer_self`, `elided_fn_generics`, `impl_self_bounds` (F13), `self_elision` (F15) and
+//!   `implied_outlives` (F16) are fixed findings: they are on by default (the Leaker encodes or
+//!   rewrites them, records what they need, or rejects and counts what it cannot copy).
 //!
 //! The test is ignored by default: it is slow, as it builds the generated crates. Run it with
 //!
@@ -353,6 +352,12 @@ fn reason_head(detail: &str) -> String {
     // The cycles of a bound that names a leaked type (F2) are counted together.
     if detail.contains("in a bound or where predicate") {
         return "a leaked type in a bound or where predicate that rustc cannot normalize"
+            .to_string();
+    }
+    // An entry in the self type of an impl whose context depends on `Self` (F13) is counted
+    // together.
+    if detail.contains("is in the self type of the impl") {
+        return "a type in the self type of an impl that a bound of the impl makes depend on `Self`"
             .to_string();
     }
     // "use absolute path: 'Vec < X >'" is counted by the start of the type.
