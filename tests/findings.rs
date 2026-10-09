@@ -20,6 +20,15 @@
 //! | `f10_module_bound_names_declared_item` | a bound of an entry names an item of the module | limitation |
 //! | `f11_copied_impl_param_constrained_only_by_leaked_type` | a copied impl whose self type is an entry | limitation |
 //! | `f12_elided_lifetime_in_fn_sugar_with_generics` | `Fn(&Rel<T>) -> &u8` with an entry that has lifetimes | fixed |
+//! | `f13_impl_bound_names_self_of_leaked_self_type` | a bound of an impl names `Self`, and the self type is an entry: it is its own `Self` | bug |
+//! | `f14_impl_predicate_names_self_projection_with_leaked_bound` | `Self::A` in a predicate of an impl whose bound names a leaked type | bug |
+//! | `f15_self_rewritten_in_elided_signature` | `with_self()` writes `Self`, with lifetimes, into `fn(&Self) -> &u8` | bug |
+//! | `f16_implied_outlives_of_self_projection_lost` | `T: 'x` and `'a: 'x` of `&'x Self::A0` are not recorded | bug |
+//! | `f17_optional_entry_in_own_context` | a strict Referrer replaces an optional entry whose own context names it | bug |
+//! | `f18_strict_referrer_replaces_anchor_of_method_lifetime` | a strict Referrer replaces the optional type that holds a method lifetime | limitation |
+//! | `f19_impl_self_in_bound_of_entry_in_predicate` | an entry in a predicate has a bound of its context that names `Self`, in an impl whose self type is leaked | bug |
+//! | `f20_trait_assoc_in_bound_of_entry_in_predicate` | an entry in a predicate has a bound of its context that names `Self::A`, in a trait | bug |
+//! | `f21_iterator_item_in_bound_of_entry_in_item_binding` | an entry in `T: Iterator<Item = ..>` has a bound of its context that names the `Item` | bug |
 //!
 //! The bugs that are not fixed are `#[ignore]`d, as they fail today (a fixed one has no
 //! `#[ignore]`, and `fixed` in the table): run them with
@@ -38,6 +47,14 @@
 //!
 //! F10 and F11 are errors of rustc on a copy of a module or an impl that the test macro makes
 //! (E0277, E0207). The tests pin the behaviour of the library that is the cause, not the errors.
+//!
+//! The features of the bugs (F13 to F17 and F19 to F21: `impl_self_bounds`, `impl_pred_leaked`,
+//! `self_elision`, `implied_outlives`, `strict_cycles`, `impl_self_bound_cycle`,
+//! `trait_assoc_bound_cycle` and `iterator_item_cycle`) and of the limitation F18
+//! (`strict_anchors`) are off in
+//! the property test: the generator does not make what they fail on (the last two only decide that
+//! an item is not invoked as strict). Each test of a bug asserts that the Leaker either rejects
+//! the item or gives what the Referrer needs, and says which of the two is up to the fix.
 
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
@@ -1451,5 +1468,1271 @@ fn f12_elided_lifetime_in_fn_sugar_with_generics() {
             .unwrap_or_else(|| panic!("{} is accepted", string(&item)));
         let note = err.note().unwrap();
         assert!(note.contains("E0106"), "{}: {}", string(&item), note);
+    }
+}
+
+// ── F13 ──────────────────────────────────────────────────────────────────────
+
+/// Whether `generics` name `Self`: in a bound or a where predicate.
+fn generics_name_self(generics: &Generics) -> bool {
+    struct Find(bool);
+    impl<'ast> Visit<'ast> for Find {
+        fn visit_path(&mut self, i: &'ast Path) {
+            self.0 |= i.leading_colon.is_none()
+                && i.segments.first().map_or(false, |s| s.ident == "Self");
+            syn::visit::visit_path(self, i)
+        }
+    }
+    let mut find = Find(false);
+    find.visit_generics(generics);
+    find.0
+}
+
+/// The entries that the Referrer cannot replace: the entry is the self type of its own context, and
+/// the generics of that context name `Self`. What the copy writes for `Self` is the entry itself,
+/// `<Self as Repeater<..>>::Type` where `Self` is that same projection.
+fn self_referential_entries(referrer: &Referrer) -> Vec<String> {
+    referrer
+        .iter()
+        .enumerate()
+        .filter(|(ix, ty)| {
+            let own_self = matches!(
+                referrer.context_self(referrer.context(*ix)),
+                Some(SelfRequirement::Type(self_ty)) if string(self_ty) == string(*ty)
+            );
+            own_self && generics_name_self(referrer.generics(*ix))
+        })
+        .map(|(_, ty)| string(ty))
+        .collect()
+}
+
+/// F13: a bound of the generics of an impl names `Self`, and the self type of the impl is leaked.
+///
+/// Trigger: `impl<T> S<T> where T: AsRef<Option<Self>> { .. }` (also the bound written inline,
+/// `impl<T: AsRef<[Self]>, const N: usize> S<T, N>`, and an impl of a trait). The self type `S<T>`
+/// is an entry, whose context has the generics `<T: AsRef<Option<Self>>>` and `Self` = `S<T>`. The
+/// Repeater's impl of the entry is `impl<T: AsRef<Option<Self>>> Repeater<..> for S<T>`, which
+/// compiles; but the Referrer writes the projection `<S<T> as Repeater<..>>::Type` with the
+/// Leaker's `S<T>` as the implementing type, which in the copy is the projection itself. The
+/// entry is its own `Self`: there is no type to write for it (the test macro of the property test
+/// says "no type for Self", and a real macro has the same problem: `Referrer::context_self()` is
+/// `Type(S<T>)`, the type being replaced). Found by the property test with
+/// `TYPE_LEAK_PROP_FEATURES=impl_self_bounds`.
+///
+/// The Leaker should reject it, like the other bounds that make the entry depend on what the copy
+/// has not written yet (README, "Self rules" and "Bounds that name leaked types"), or not leak the
+/// self type. The assertion is that no entry of an accepted item is its own `Self`. An optional
+/// entry counts too: a strict Referrer (`allow_ambiguous_crate_name(false)`) replaces it.
+///
+/// The controls are accepted: a self type that is not leaked (an allowed path), and bounds that do
+/// not name `Self`.
+#[test]
+#[ignore = "the entry S<T> is its own Self when a bound of the impl names Self"]
+fn f13_impl_bound_names_self_of_leaked_self_type() {
+    let items: Vec<ItemImpl> = vec![
+        parse_quote!(
+            impl<T> S<T>
+            where
+                T: AsRef<Option<Self>>,
+            {
+                fn f(&self, a: Rel) {}
+            }
+        ),
+        parse_quote!(
+            impl<T: AsRef<[Self]>, const N: usize> S<T, N> {
+                fn f(&self, a: Rel) {}
+            }
+        ),
+        parse_quote!(
+            impl<T> ::p::Tr for S<T>
+            where
+                T: AsRef<Option<Self>>,
+            {
+                fn f(&self, a: Rel) {}
+            }
+        ),
+        // An absolute path of a crate that the Leaker does not allow: an optional entry.
+        parse_quote!(
+            impl<T> ::ext::S<T> where T: AsRef<Option<Self>> {}
+        ),
+    ];
+    let controls: Vec<ItemImpl> = vec![
+        // The self type is not leaked: it is copied as written.
+        parse_quote!(
+            impl<T> ::p::S<T>
+            where
+                T: AsRef<Option<Self>>,
+            {
+                fn f(&self, a: Rel) {}
+            }
+        ),
+        // The bounds do not name `Self`.
+        parse_quote!(
+            impl<T> S<T>
+            where
+                T: AsRef<Option<Rel2>>,
+            {
+                fn f(&self, a: Rel) {}
+            }
+        ),
+        // `Self` is in a signature, not in a bound.
+        parse_quote!(
+            impl<T: Clone> S<T> {
+                fn f(&self, a: Option<Self>) {}
+            }
+        ),
+    ];
+    let leaker_for = || {
+        let mut config = LeakerConfig::new();
+        config.allow_primitive().allow_std_prelude();
+        config.allowed_paths.push(parse_quote!(::p));
+        Leaker::from_config(config)
+    };
+    for item in &items {
+        let mut leaker = leaker_for();
+        // Rejected is fine.
+        if leaker.intern_impl(item, true).is_err() {
+            continue;
+        }
+        let referrer = leaker.finish();
+        let entries = self_referential_entries(&referrer);
+        assert!(
+            entries.is_empty(),
+            "`{}` is accepted, and the entries {:?} are their own `Self`: the Referrer has no type to write for it",
+            string(item),
+            entries
+        );
+    }
+    for item in &controls {
+        let mut leaker = leaker_for();
+        leaker
+            .intern_impl(item, true)
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), e));
+        let referrer = leaker.finish();
+        assert!(
+            self_referential_entries(&referrer).is_empty(),
+            "{}",
+            string(item)
+        );
+    }
+}
+
+// ── F14 ──────────────────────────────────────────────────────────────────────
+
+/// The predicates of an impl and of its methods (the bounds of a parameter and the where
+/// predicates) that name `Self::A`.
+#[derive(Default)]
+struct SelfProjectionsInPredicates(Vec<String>);
+
+/// Whether a node names `Self::A`, an associated type of `Self`.
+#[derive(Default)]
+struct NamesSelfProjection(bool);
+
+impl<'ast> Visit<'ast> for NamesSelfProjection {
+    fn visit_path(&mut self, i: &'ast Path) {
+        self.0 |= i.leading_colon.is_none()
+            && i.segments.len() > 1
+            && i.segments.first().map_or(false, |s| s.ident == "Self");
+        syn::visit::visit_path(self, i)
+    }
+}
+
+impl<'ast> Visit<'ast> for SelfProjectionsInPredicates {
+    fn visit_type_param(&mut self, i: &'ast TypeParam) {
+        let mut names = NamesSelfProjection::default();
+        names.visit_type_param(i);
+        if names.0 {
+            self.0.push(string(i));
+        }
+        syn::visit::visit_type_param(self, i)
+    }
+    fn visit_predicate_type(&mut self, i: &'ast PredicateType) {
+        let mut names = NamesSelfProjection::default();
+        names.visit_predicate_type(i);
+        if names.0 {
+            self.0.push(string(i));
+        }
+        syn::visit::visit_predicate_type(self, i)
+    }
+}
+
+/// The copy of `item` that a macro makes (the entries replaced by `P<ix>`), with a strict Referrer
+/// or not, and whether the Leaker accepts `item`.
+fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, NotInternableError> {
+    let mut config = LeakerConfig::new();
+    config.allow_primitive().allow_std_prelude();
+    config.allowed_paths.push(parse_quote!(::p));
+    let mut leaker = Leaker::from_config(config);
+    let context = leaker.intern_impl(item, true)?;
+    let mut referrer = leaker.finish();
+    if strict {
+        referrer = referrer.allow_ambiguous_crate_name(false);
+    }
+    let mut copy = Item::Impl(item.clone());
+    referrer
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visit_item_mut(&mut copy);
+    match copy {
+        Item::Impl(copy) => Ok(copy),
+        _ => unreachable!(),
+    }
+}
+
+/// F14: a where predicate of a method names `Self::A`, in an impl of a trait whose own bound names
+/// a leaked type.
+///
+/// Trigger: `impl<T> ::p::Tr<T> for u8 where T: Fn(Rel) { type A1 = u8; fn m<X>(&self, a: Rel) where
+/// X: Into<Self::A1> {} }` (the bound can be inline, `impl<T: Fn(Rel)> ..`; and the predicate can
+/// be on `T` or on a type that is not a generic, `u8: Into<Self::A1>`). `Rel` is leaked, so the
+/// copy has `T: Fn(<() as Repeater<..>>::Type)`. rustc normalizes the predicate `X:
+/// Into<Self::A1>` while it builds the environment of the method, which needs the impl of `Tr<T>`
+/// for `u8`, and so its bound `T: Fn(Rel)`, which the environment has as `T:
+/// Fn(<() as Repeater<..>>::Type)`, not normalized yet: E0277 "expected an `Fn(Rel)` closure,
+/// found `T`" (E0271 for `T: for<'h> Fn(&'h Rel) -> &'h T`, "type mismatch resolving"). The same
+/// shape as F2, but the check of F2 (a bound of a generic that the leaked type uses names a leaked
+/// type) does not see it: the context of `Rel` has no generics, and the context of `Self::A1` of
+/// an impl has none either (it is `Self` = `u8`, with no generic written in the path), although
+/// the trait impl that rustc proves needs all the generics of the impl. With one of them
+/// removed (`where X: Into<Rel>`, `a: Self::A1`, `T: Clone`) the copy compiles. Found by the
+/// property test with `TYPE_LEAK_PROP_FEATURES=impl_pred_leaked`.
+///
+/// The trait case is rejected already (`trait Tr<T: Fn(Rel)> { fn m<X>(&self) where X:
+/// Into<Self::A1>; }`, "It is `Self::A`" of the README); the impl needs the same rule, with the
+/// generics of the impl instead of those of the context. The assertion: if the Leaker accepts
+/// the impl, its copy does not have a replacement in a bound or where predicate of the impl and
+/// `Self::A` in a predicate. An optional entry counts if the Referrer is strict (it replaces it).
+///
+/// The controls are accepted, as they compile: a bound that names no leaked type, and a leaked
+/// bound with `Self::A1` outside the predicates.
+#[test]
+#[ignore = "a where predicate that names Self::A, in an impl whose bound names a leaked type: the copy cannot prove the impl"]
+fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
+    let items: Vec<(ItemImpl, bool)> = vec![
+        (
+            parse_quote!(
+                impl<T> ::p::Tr<T> for u8
+                where
+                    T: Fn(Rel),
+                {
+                    type A1 = u8;
+                    fn m<X>(&self, a: Rel)
+                    where
+                        X: Into<Self::A1>,
+                    {
+                    }
+                }
+            ),
+            false,
+        ),
+        // The bound written inline, the predicate on a type that is not a generic.
+        (
+            parse_quote!(
+                impl<T: Fn(Rel)> ::p::Tr<T> for u8 {
+                    type A1 = u8;
+                    fn m(&self, a: Rel)
+                    where
+                        u8: Into<Self::A1>,
+                    {
+                    }
+                }
+            ),
+            false,
+        ),
+        // The leaked type of the bound is an optional entry, which a strict Referrer replaces.
+        (
+            parse_quote!(
+                impl<T> ::p::Tr<T> for u8
+                where
+                    T: Fn(::ext::Rel),
+                {
+                    type A1 = u8;
+                    fn m<X>(&self, a: u8)
+                    where
+                        X: Into<Self::A1>,
+                    {
+                    }
+                }
+            ),
+            true,
+        ),
+    ];
+    let controls: Vec<(ItemImpl, bool)> = vec![
+        // The bound names no leaked type.
+        (
+            parse_quote!(
+                impl<T: Clone> ::p::Tr<T> for u8 {
+                    type A1 = u8;
+                    fn m<X>(&self, a: Rel)
+                    where
+                        X: Into<Self::A1>,
+                    {
+                    }
+                }
+            ),
+            false,
+        ),
+        // `Self::A1` is a type of the signature, which rustc normalizes once the environment is built.
+        (
+            parse_quote!(
+                impl<T> ::p::Tr<T> for u8
+                where
+                    T: Fn(Rel),
+                {
+                    type A1 = u8;
+                    fn m<X>(&self, a: Self::A1, b: Rel)
+                    where
+                        X: Into<Rel>,
+                    {
+                    }
+                }
+            ),
+            false,
+        ),
+        // An optional entry is left as written by a Referrer that is not strict.
+        (
+            parse_quote!(
+                impl<T> ::p::Tr<T> for u8
+                where
+                    T: Fn(::ext::Rel),
+                {
+                    type A1 = u8;
+                    fn m<X>(&self, a: u8)
+                    where
+                        X: Into<Self::A1>,
+                    {
+                    }
+                }
+            ),
+            false,
+        ),
+    ];
+    for (item, strict) in &items {
+        // Rejected is fine.
+        let Ok(copy) = f14_copy(item, *strict) else {
+            continue;
+        };
+        let mut bounds = EntryMentions::default();
+        bounds.visit_generics(&copy.generics);
+        let mut projections = SelfProjectionsInPredicates::default();
+        projections.visit_item_impl(&copy);
+        assert!(
+            (bounds.in_bounds.is_empty() && bounds.in_where.is_empty()) || projections.0.is_empty(),
+            "in the copy `{}`, the bounds {:?} and where predicates {:?} of the impl name entries, \
+             and the predicates {:?} name `Self::A`: rustc cannot prove the impl in the environment",
+            string(&copy),
+            bounds.in_bounds,
+            bounds.in_where,
+            projections.0
+        );
+    }
+    for (item, strict) in &controls {
+        let copy = f14_copy(item, *strict)
+            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        let mut projections = SelfProjectionsInPredicates::default();
+        projections.visit_item_impl(&copy);
+        let mut bounds = EntryMentions::default();
+        bounds.visit_generics(&copy.generics);
+        // What is accepted compiles: not both, as above.
+        assert!(
+            (bounds.in_bounds.is_empty() && bounds.in_where.is_empty()) || projections.0.is_empty(),
+            "{}",
+            string(&copy)
+        );
+    }
+}
+
+// ── F15 ──────────────────────────────────────────────────────────────────────
+
+/// The copy of a struct, an enum or a union that a macro makes with `Referrer::visitor(..)
+/// .with_self(self_ty)`, where `self_ty` is the type as the Leaker's crate names it
+/// (`::p::S<'a, T>`).
+fn f15_copy(item: &Item) -> std::result::Result<Item, NotInternableError> {
+    let (ident, generics) = match item {
+        Item::Struct(i) => (&i.ident, &i.generics),
+        Item::Enum(i) => (&i.ident, &i.generics),
+        Item::Union(i) => (&i.ident, &i.generics),
+        _ => panic!("unsupported item"),
+    };
+    let mut leaker = new_leaker();
+    let context = match item {
+        Item::Struct(i) => leaker.intern_struct(i, true)?,
+        Item::Enum(i) => leaker.intern_enum(i, true)?,
+        Item::Union(i) => leaker.intern_union(i, true)?,
+        _ => unreachable!(),
+    };
+    let referrer = leaker.finish();
+    let args: Vec<GenericArgument> = generics.params.iter().map(param_arg).collect();
+    let self_ty: Type = parse_quote!(::p::#ident<#(#args),*>);
+    let mut copy = item.clone();
+    referrer
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .with_self(self_ty)
+        .visit_item_mut(&mut copy);
+    Ok(copy)
+}
+
+/// F15: `Referrer::visitor(..).with_self(ty)` replaces `Self` in a signature with an elided output
+/// lifetime, and `ty` has lifetimes.
+///
+/// Trigger: `struct S<'a> { f: fn(&Self) -> &u8, g: &'a u8 }` copied with `with_self(::p::S<'a>)`,
+/// as the macro of a Referrer does for a struct, an enum or a union (so that `Self` is the
+/// Leaker's type). The elided lifetime of the output is that of the only lifetime of the input,
+/// `&Self`. The copy has `fn(&::p::S<'a>) -> &u8`, whose input has two (the elided one and `'a`):
+/// E0106 "missing lifetime specifier ... which one of argument 1's 2 lifetimes it is borrowed
+/// from". The same for `Fn(&Self) -> &u8` of a trait object. `S<T>` (no lifetime) is fine. The
+/// replacement of an entry has the same problem and F12 fixed it, by leaking the whole holder;
+/// this is `Self`, which the Leaker does not replace, and the Referrer does, without looking at
+/// the signature.
+///
+/// The property test shows it with `TYPE_LEAK_PROP_FEATURES=self_elision`, but the generated
+/// crates fail in the *oracle* of the test macro, not in the library: a witness (`pub fn
+/// __tl_w_k<..>() -> PhantomData<Ty>`) and a check write the original type with `Self` replaced
+/// by the self type of an impl (`&'static unsafe fn(i32)`, with a lifetime), or `Self::A0` by
+/// `<__Self as Tr<'a, ..>>::A0` (with the lifetime parameters of the trait), and that breaks
+/// the elision of `fn(&Self) -> &Y` in the Leaker's crate (E0106). The library does not
+/// substitute `Self` there: the Repeater's impl for the implementors writes `Self::A0` as
+/// `<__S>::A0` (`Referrer::iter_with_self()`), which adds no lifetime, and an impl for a type keeps
+/// `Self`. `with_self()` is the substitution of the library that can break it, so that is what
+/// the test is about.
+///
+/// The visitor should give the elided lifetime a name (`for<'e> fn(&'e ::p::S<'a>) -> &'e u8`,
+/// which compiles), or the Leaker should leak the whole signature or reject the item, as F12
+/// does. The assertion is that no sugar of `Fn(..)` and no function pointer of the copy has an
+/// elided output lifetime that its inputs cannot resolve (`Signatures`, as in F12).
+#[test]
+#[ignore = "with_self() writes Self, as a type with lifetimes, into fn(&Self) -> &u8: the elision fails"]
+fn f15_self_rewritten_in_elided_signature() {
+    let items: Vec<Item> = vec![
+        parse_quote!(
+            pub struct S<'a> {
+                f: fn(&Self) -> &u8,
+                g: &'a u8,
+            }
+        ),
+        parse_quote!(
+            pub struct S<'a>(Box<dyn Fn(&Self) -> &u8>, &'a u8);
+        ),
+        parse_quote!(
+            pub enum E<'a, T> {
+                A(fn(&(T, Self)) -> &u8),
+                B(&'a T),
+            }
+        ),
+        parse_quote!(
+            pub union U<'a> {
+                f: fn(&Self) -> &u8,
+                g: &'a u8,
+            }
+        ),
+    ];
+    // Where `Self` has no lifetime (a type of type parameters only), or the lifetimes are named,
+    // there is nothing to resolve.
+    let controls: Vec<Item> = vec![
+        parse_quote!(
+            pub struct S<T> {
+                f: fn(&Self) -> &u8,
+                g: T,
+            }
+        ),
+        parse_quote!(
+            pub struct S<'a> {
+                f: for<'e> fn(&'e Self) -> &'e u8,
+                g: &'a u8,
+            }
+        ),
+        parse_quote!(
+            pub struct S<'a> {
+                f: fn(&'a Self) -> &'a u8,
+                g: &'a u8,
+            }
+        ),
+    ];
+    for item in &items {
+        // Rejected is fine.
+        let Ok(copy) = f15_copy(item) else {
+            continue;
+        };
+        let mut signatures = Signatures::default();
+        signatures.visit_item(&copy);
+        assert!(
+            signatures.broken.is_empty(),
+            "the copy `{}` of `{}` has signatures that elision cannot resolve: {:?}",
+            string(&copy),
+            string(item),
+            signatures.broken
+        );
+    }
+    for item in &controls {
+        let copy = f15_copy(item)
+            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        let mut signatures = Signatures::default();
+        signatures.visit_item(&copy);
+        assert!(
+            signatures.broken.is_empty(),
+            "{}: {:?}",
+            string(&copy),
+            signatures.broken
+        );
+    }
+}
+
+// ── F16 ──────────────────────────────────────────────────────────────────────
+
+/// Whether `generics` say `name: 'lifetime`, where `name` is a type parameter (`T`) or a
+/// lifetime parameter (`'a`), as a bound or as a where predicate.
+fn generics_say_outlives(generics: &Generics, name: &str, lifetime: &str) -> bool {
+    let has = |bounds: &Punctuated<TypeParamBound, Token![+]>| {
+        bounds
+            .iter()
+            .any(|b| matches!(b, TypeParamBound::Lifetime(l) if l.to_string() == lifetime))
+    };
+    let has_lt =
+        |bounds: &Punctuated<Lifetime, Token![+]>| bounds.iter().any(|l| l.to_string() == lifetime);
+    generics.params.iter().any(|param| match param {
+        GenericParam::Type(t) => t.ident == name && has(&t.bounds),
+        GenericParam::Lifetime(l) => l.lifetime.to_string() == name && has_lt(&l.bounds),
+        GenericParam::Const(_) => false,
+    }) || generics
+        .where_clause
+        .iter()
+        .flat_map(|w| &w.predicates)
+        .any(|predicate| match predicate {
+            WherePredicate::Type(p) => string(&p.bounded_ty) == name && has(&p.bounds),
+            WherePredicate::Lifetime(p) => p.lifetime.to_string() == name && has_lt(&p.bounds),
+            _ => false,
+        })
+}
+
+/// The parameters of the trait that `Self::A` depends on, as `(name, is a lifetime)`.
+fn trait_params(path: &Path) -> Vec<(String, bool)> {
+    let mut params = Vec::new();
+    for segment in &path.segments {
+        if let PathArguments::AngleBracketed(args) = &segment.arguments {
+            for arg in &args.args {
+                match arg {
+                    GenericArgument::Lifetime(l) => params.push((l.to_string(), true)),
+                    GenericArgument::Type(ty) => params.push((string(ty), false)),
+                    _ => (),
+                }
+            }
+        }
+    }
+    params
+}
+
+/// What the Repeater's impl of the entry `ix` needs to prove `Self::A: 'lifetime`, for the
+/// reference `&'lifetime Self::A` in the entry, and whether the context records it: either
+/// `Self::A: 'lifetime` itself, or every component, as rustc proves a projection (`Self` and
+/// each parameter of the trait outlive the lifetime).
+fn projection_outlives_recorded(referrer: &Referrer, ix: usize, lifetime: &str) -> Vec<String> {
+    let context = referrer.context(ix);
+    let generics = referrer.generics(ix);
+    let projection = generics.where_clause.iter().flat_map(|w| &w.predicates).any(|predicate| {
+        matches!(predicate, WherePredicate::Type(p)
+            if string(&p.bounded_ty).starts_with("Self ::")
+                && p.bounds.iter().any(|b| matches!(b, TypeParamBound::Lifetime(l) if l.to_string() == lifetime)))
+    });
+    if projection {
+        return Vec::new();
+    }
+    let mut missing = Vec::new();
+    if !referrer
+        .context_self_outlives(context)
+        .iter()
+        .any(|l| l.to_string() == lifetime)
+    {
+        missing.push(format!("Self: {}", lifetime));
+    }
+    if let Some(SelfRequirement::Bound(path)) = referrer.context_self(context) {
+        for (name, _) in trait_params(path) {
+            if !generics_say_outlives(generics, &name, lifetime) {
+                missing.push(format!("{}: {}", name, lifetime));
+            }
+        }
+    }
+    missing
+}
+
+/// F16: the outlives bounds that the signature of a method implies are not in the context of an
+/// entry that needs them.
+///
+/// Trigger: `trait Tr<'a, T> { type A0; fn m<'x>(&'x self, a: Rel<&'x mut Self::A0>) where Self: 'x;
+/// }`. The original relies on the well-formedness of its signature: `&'x mut Self::A0` in the
+/// parameter implies `Self::A0: 'x`. The Repeater's impl of the entry `Rel<&'x mut Self::A0>` is
+/// `impl<'a, 'x, T, __S: Tr<'a, T>> Repeater<..> for __S { type Type = Rel<&'x mut <__S as Tr<'a,
+/// T>>::A0>; }`, with no signature around it: it needs `<__S as Tr<'a, T>>::A0: 'x`, which holds
+/// if `__S`, `T` and `'a` outlive `'x`. The Leaker records `Self: 'x` for the reference (the
+/// context has `Referrer::context_self_outlives()` = `['x]`), and no more: `T: 'x` and `'a: 'x` are
+/// lost. E0309 "the associated type `<__S as Tr<'a, T>>::A0` may not live long enough" in the
+/// Leaker's crate. With them written (`where T: 'x, 'a: 'x`) they are recorded, and the impl
+/// compiles. Found by the property test with `TYPE_LEAK_PROP_FEATURES=implied_outlives`
+/// (seeds 1, 4, 5 and 7 of 60 cases: seed 5 has this projection, the others the same E0309 for
+/// `Self` itself, below).
+///
+/// The same family, which is documented and not a bug (F5, README "Outlives bounds"): a path with
+/// a lifetime argument records nothing, so `Rel<Wrap<'x, [Self]>>` with `fn m<'x>(&'x self)`,
+/// where `Wrap<'a, T: 'a>` needs `Self: 'x` and the receiver implies it, has no `Self: 'x` in
+/// the context (`BL<'x, [Self]>` in the property test). The README asks to write the bound. And a
+/// where predicate `X: Into<&'x Self>` of a method relies on the receiver as well, which the
+/// witness and the check of the property test (functions with no receiver) do not have: E0309 in
+/// the Leaker's crate, from the test macro's own oracle.
+///
+/// For `&'x Self::A0`, the Leaker has what it needs: it sees the reference, and the generics of the
+/// trait path. So it should record all the components (the Repeater's arguments encode them as
+/// `&'x T` and `&'x &'a ()`, which the impl does not declare), or `Self::A0: 'x` itself as a
+/// where predicate of the context, or reject the item. A rustc experiment: `impl<'a, 'x, T, __S:
+/// ?Sized + Tr<'a, T>> Repeater<(&'a (), &'x (), T, &'x __S), 0> for __S { type Type = Rel<&'x
+/// mut <__S as Tr<'a, T>>::A0>; }` is E0309, and with `&'x T, &'x &'a ()` added to the arguments
+/// it compiles. The assertion is that, if the Leaker accepts the item, the context records them.
+///
+/// The control has the bounds written (`where Self: 'x, T: 'x, 'a: 'x`), which is recorded.
+#[test]
+#[ignore = "the outlives of the components of Self::A under &'x (T: 'x, 'a: 'x) are not recorded, only Self: 'x"]
+fn f16_implied_outlives_of_self_projection_lost() {
+    let items: Vec<ItemTrait> = vec![
+        parse_quote!(
+            pub trait Tr<'a, T> {
+                type A0;
+                fn m<'x>(&'x self, a: Rel<&'x mut Self::A0>)
+                where
+                    Self: 'x;
+            }
+        ),
+        // Only the receiver implies `Self: 'x`: it is recorded for the reference all the same.
+        parse_quote!(
+            pub trait Tr<T> {
+                type A0;
+                fn m<'x>(&'x self, a: Rel<&'x Self::A0>);
+            }
+        ),
+        // Under a function pointer.
+        parse_quote!(
+            pub trait Tr<'a, T> {
+                type A0;
+                fn m<'x>(&'x self, a: Rel<fn(&u8) -> &&'x Self::A0>)
+                where
+                    Self: 'x;
+            }
+        ),
+    ];
+    let control: ItemTrait = parse_quote!(
+        pub trait Tr<'a, T> {
+            type A0;
+            fn m<'x>(&'x self, a: Rel<&'x mut Self::A0>)
+            where
+                Self: 'x,
+                T: 'x,
+                'a: 'x;
+        }
+    );
+    for item in &items {
+        let mut leaker = new_leaker();
+        // Rejected is fine.
+        if leaker.intern_trait(item, true).is_err() {
+            continue;
+        }
+        let referrer = leaker.finish();
+        for ix in 0..referrer.iter().count() {
+            // Every entry that has the reference `&'x Self::A0`.
+            let ty = string(referrer.iter().nth(ix).unwrap());
+            if !(ty.contains("& 'x") && ty.contains("Self :: A0")) {
+                continue;
+            }
+            let missing = projection_outlives_recorded(&referrer, ix, "'x");
+            assert!(
+                missing.is_empty(),
+                "`{}`: the context of the entry `{}` (generics `{}`) lacks {:?}: the Repeater's impl cannot prove `<__S as Tr<..>>::A0: 'x` (E0309)",
+                string(item),
+                ty,
+                string(referrer.generics(ix)),
+                missing
+            );
+        }
+    }
+    let mut leaker = new_leaker();
+    leaker.intern_trait(&control, true).unwrap();
+    let referrer = leaker.finish();
+    let ix = entry(&referrer, "Rel < & 'x mut Self :: A0 >");
+    assert_eq!(
+        projection_outlives_recorded(&referrer, ix, "'x"),
+        Vec::<String>::new()
+    );
+}
+
+// ── F17 ──────────────────────────────────────────────────────────────────────
+
+/// Whether `generics` name the type `ty` in a bound or a where predicate.
+fn generics_name_type(generics: &Generics, ty: &Type) -> bool {
+    struct Find<'a>(&'a Type, bool);
+    impl<'ast, 'a> Visit<'ast> for Find<'a> {
+        fn visit_type(&mut self, i: &'ast Type) {
+            self.1 |= string(i) == string(self.0);
+            syn::visit::visit_type(self, i)
+        }
+    }
+    let mut find = Find(ty, false);
+    find.visit_generics(generics);
+    find.1
+}
+
+/// The entries (required or optional: a strict Referrer replaces both) that the bounds or where
+/// predicates of their own context name: they need themselves.
+fn entries_in_own_context(referrer: &Referrer) -> Vec<String> {
+    referrer
+        .iter()
+        .enumerate()
+        .filter(|(ix, ty)| generics_name_type(referrer.generics(*ix), ty))
+        .map(|(_, ty)| string(ty))
+        .collect()
+}
+
+/// F17: an optional entry in a where predicate that names a lifetime, which the predicate is part
+/// of the context of.
+///
+/// Trigger: `struct S<'a, T: 'a> where T: Fn(&'a ::ext::W<T, ::ext::B0>) -> u8 { .. }`, where
+/// `::ext` is a crate that the Leaker does not allow, and a strict Referrer
+/// (`allow_ambiguous_crate_name(false)`, the Referrer's choice, for a Referrer whose dependencies
+/// may differ from the Leaker's) replaces the optional entries. `&'a ::ext::W<T, ::ext::B0>` is an
+/// optional entry (it holds `::ext::B0`, another optional type, so it is not left alone as `T:
+/// Fn(&'a ::ext::W<T>)` is), and its context has `'a`, `T` and the where predicate that names
+/// `'a`, which is the predicate that names the entry. The copy has `T: Fn(<() as Repeater<(&'a (),
+/// T, &'a T), ..>>::Type)`, and the Repeater's impl for it has `T: Fn(&'a ::ext::W<T,
+/// ::ext::B0>)`, which the environment of the copy does not have in that form: E0277 "expected an
+/// `Fn(&W<T, B0>)` closure, found `T`" (standalone with rustc, too). That is F2, whose rule
+/// ("optional entry in such a place is copied as written", README "Bounds that name leaked
+/// types") does not see this one: the same item with `::ext::W<T>` (no optional type inside), or
+/// with a required entry (`Rel`), is not an entry or is rejected. Found by the property test
+/// with `TYPE_LEAK_PROP_FEATURES=strict_cycles` (seeds 1 to 8 of 60 cases), which only affects the
+/// items that the generator invokes as strict, 25% of them.
+///
+/// The Leaker should leave that type as written (not an entry), or reject the item. The assertion is
+/// that no entry of an accepted item is named by the bounds or where predicates of its own
+/// context.
+#[test]
+#[ignore = "an optional entry in a where predicate that names 'a has that predicate in its context: it needs itself"]
+fn f17_optional_entry_in_own_context() {
+    let items: Vec<ItemStruct> = vec![
+        parse_quote!(
+            pub struct S<'a, T: 'a>
+            where
+                T: Fn(&'a ::ext::W<T, ::ext::B0>) -> u8,
+            {
+                f0: u8,
+            }
+        ),
+        // The bound written inline, a trait object that holds the other optional type.
+        parse_quote!(
+            pub struct S<'a, T: 'a + Fn(&'a ::ext::W<dyn Fn(T) -> ::ext::B0 + 'a>) -> u8> {
+                f0: &'a T,
+            }
+        ),
+    ];
+    let controls: Vec<ItemStruct> = vec![
+        // No optional type inside: left as written.
+        parse_quote!(
+            pub struct S<'a, T: 'a>
+            where
+                T: Fn(&'a ::ext::W<T>) -> u8,
+            {
+                f0: u8,
+            }
+        ),
+        // No lifetime around: the predicate is not part of the context of `::ext::B0`.
+        parse_quote!(
+            pub struct S<'a, T: 'a>
+            where
+                T: Fn(::ext::W<T, ::ext::B0>) -> u8,
+            {
+                f0: &'a T,
+            }
+        ),
+    ];
+    for item in &items {
+        let mut leaker = new_leaker();
+        // Rejected is fine.
+        if leaker.intern_struct(item, true).is_err() {
+            continue;
+        }
+        let referrer = leaker.finish();
+        let entries = entries_in_own_context(&referrer);
+        assert!(
+            entries.is_empty(),
+            "`{}` is accepted, and its entries {:?} are named by the bounds of their own context: a strict Referrer replaces them by a path that needs the bound",
+            string(item),
+            entries
+        );
+    }
+    for item in &controls {
+        let mut leaker = new_leaker();
+        leaker
+            .intern_struct(item, true)
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), e));
+        let referrer = leaker.finish();
+        assert!(
+            entries_in_own_context(&referrer).is_empty(),
+            "{}",
+            string(item)
+        );
+    }
+}
+
+// ── F18 ──────────────────────────────────────────────────────────────────────
+
+/// F18 (limitation): a strict Referrer replaces the optional entry that holds a lifetime of a
+/// method, so the copy does not have it where the original did.
+///
+/// README, "External crates": an absolute path of a crate that the Leaker does not allow is an
+/// optional entry, which a Referrer leaves as written by default and replaces if it is strict
+/// (`allow_ambiguous_crate_name(false)`); "replacing a type can lose an anchor or a method
+/// lifetime". Trigger: `trait Tr { fn m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>; }`. In the
+/// trait, `'x` is late-bound (the argument holds it, and no bound names it). The Leaker counts the
+/// optional type as an anchor, as the default Referrer keeps it. The strict copy is `fn m<'x>(&self,
+/// a: P<1>) -> P<0>`: both are projections, which do not constrain `'x`, so it is early-bound, and
+/// rustc rejects the impl of the Referrer's crate, where the trait has it late-bound (E0195
+/// "lifetime parameters differ in whether they are early- or late-bound"). Found by the property
+/// test with `TYPE_LEAK_PROP_FEATURES=strict_anchors`, for the items that the generator invokes as
+/// strict (25% of them): the Leaker's analysis cannot know what the Referrer chooses.
+///
+/// It is a limitation and not a bug: counting the optional type as an anchor is what lets the
+/// default Referrer (and a Referrer of the same dependency graph) copy the item; the other choice
+/// would reject the item for every Referrer. Instead, allow the crate (`LeakerConfig::allowed_paths`),
+/// so that the type is not an entry for any Referrer, or keep the anchor in a required type, or use
+/// a Referrer that is not strict. The test pins the two copies.
+#[test]
+fn f18_strict_referrer_replaces_anchor_of_method_lifetime() {
+    let item: ItemTrait = parse_quote!(
+        pub trait Tr {
+            fn m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>;
+        }
+    );
+    // The names of the lifetimes that the arguments of the method of the copy hold.
+    let held = |copy: &ItemTrait| -> Vec<String> {
+        let Some(TraitItem::Fn(method)) = copy.items.first() else {
+            panic!("no method");
+        };
+        let mut lifetimes = Lifetimes::default();
+        for input in &method.sig.inputs {
+            if let FnArg::Typed(input) = input {
+                lifetimes.visit_type(&input.ty);
+            }
+        }
+        lifetimes.named
+    };
+    let copy_of = |config: LeakerConfig, strict: bool| {
+        let mut leaker = Leaker::from_config(config);
+        let context = leaker.intern_trait(&item, true).unwrap();
+        let mut referrer = leaker.finish();
+        if strict {
+            referrer = referrer.allow_ambiguous_crate_name(false);
+        }
+        let mut copy = item.clone();
+        referrer
+            .visitor(context, |_, ix| parse_quote!(P<#ix>))
+            .visit_item_trait_mut(&mut copy);
+        copy
+    };
+    let mut config = LeakerConfig::new();
+    config.allow_primitive().allow_std_prelude();
+
+    // The default Referrer keeps the optional type, which holds `'x`.
+    assert_eq!(held(&copy_of(config.clone(), false)), ["'x"]);
+    // The strict one replaces it: nothing of the arguments holds `'x`.
+    assert_eq!(held(&copy_of(config.clone(), true)), Vec::<String>::new());
+    // With the crate allowed it is not an entry, for either.
+    config.allowed_paths.push(parse_quote!(::ext));
+    assert_eq!(held(&copy_of(config.clone(), false)), ["'x"]);
+    assert_eq!(held(&copy_of(config, true)), ["'x"]);
+}
+
+// ── F19 and F20 ──────────────────────────────────────────────────────────────
+
+/// The indices `ix` of the replacements `P<ix>` in the bounds of a parameter and in the where
+/// predicates of an item and of its methods.
+#[derive(Default)]
+struct ReplacementsInPredicates(Vec<usize>);
+
+/// The indices of the replacements in a node.
+struct Indices<'a>(&'a mut Vec<usize>);
+
+impl<'ast> Visit<'ast> for Indices<'_> {
+    fn visit_path_segment(&mut self, seg: &'ast PathSegment) {
+        if seg.ident == "P" {
+            if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                if let Some(arg) = args.args.first() {
+                    if let Ok(ix) = string(arg).trim_end_matches("usize").trim().parse() {
+                        self.0.push(ix);
+                    }
+                }
+            }
+        }
+        syn::visit::visit_path_segment(self, seg)
+    }
+}
+
+impl<'ast> Visit<'ast> for ReplacementsInPredicates {
+    fn visit_type_param(&mut self, i: &'ast TypeParam) {
+        for bound in &i.bounds {
+            if let Ok(ty) = parse2::<Type>(quote!(dyn #bound)) {
+                Indices(&mut self.0).visit_type(&ty);
+            }
+        }
+        syn::visit::visit_type_param(self, i)
+    }
+    fn visit_predicate_type(&mut self, i: &'ast PredicateType) {
+        Indices(&mut self.0).visit_predicate_type(i);
+        syn::visit::visit_predicate_type(self, i)
+    }
+}
+
+/// The copy of `item` that a macro makes: the entries replaced by `P<ix>`.
+fn f19_copy(item: &Item) -> std::result::Result<(Referrer, Item), NotInternableError> {
+    let mut leaker = new_leaker();
+    let context = match item {
+        Item::Impl(i) => leaker.intern_impl(i, true)?,
+        Item::Trait(i) => leaker.intern_trait(i, true)?,
+        _ => panic!("unsupported item"),
+    };
+    let referrer = leaker.finish();
+    let mut copy = item.clone();
+    referrer
+        .clone()
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visit_item_mut(&mut copy);
+    Ok((referrer, copy))
+}
+
+/// The entries that a predicate of the copy names, and that have a bound of their context that names
+/// `Self`, where `self_is_leaked` says that what `Self` is in the context is replaced in the copy:
+/// the Repeater's impl of the entry has the bound with the Leaker's `Self`, and the environment of
+/// the copy has it with the copy's, not normalized yet.
+fn entries_with_self_bound_in_predicates(
+    referrer: &Referrer,
+    copy: &Item,
+    self_is_leaked: impl Fn(&Referrer, ContextId) -> bool,
+) -> Vec<String> {
+    let mut used = ReplacementsInPredicates::default();
+    used.visit_item(copy);
+    let mut found: Vec<String> = used
+        .0
+        .iter()
+        .filter(|&&ix| {
+            ix < referrer.iter().count()
+                && generics_name_self(referrer.generics(ix))
+                && self_is_leaked(referrer, referrer.context(ix))
+        })
+        .map(|&ix| string(referrer.iter().nth(ix).unwrap()))
+        .collect();
+    found.dedup();
+    found
+}
+
+/// F19: in an impl whose self type is leaked, a method has a bound that names `Self` on a generic,
+/// and a predicate that names a leaked type that uses the generic.
+///
+/// Trigger: `impl S { fn m<X>(&self) where X: Fn(Self) -> u8, Rel<X>: Default {} }`, with `S` and
+/// `Rel` leaked (also `for<'h> Fn(&'h Self) -> &'h Result<Self, f64>`, which rustc reports as
+/// E0271 "type mismatch resolving"). The entry `Rel<X>` has the context `<X: Fn(Self) -> u8>`
+/// with `Self` = `S`, so the Repeater's impl for `S` has `X: Fn(S) -> u8`. The copy has `X:
+/// Fn(Self) -> u8` with `Self` = `<() as Repeater<..>>::Type`, the replaced self type, which rustc
+/// has not normalized yet in the environment where it proves the predicate `<S as
+/// Repeater<(X,), ..>>::Type: Default`: E0277 "expected an `Fn(S)` closure, found `X`" (the same
+/// with rustc alone). That is F2 with `Self` as the leaked type that the bound names, and the
+/// check of the README ("It is `Self`, in an impl whose self type is leaked, and a bound of the
+/// generics of the impl names a leaked type") only looks at the generics of the impl, not at
+/// those of a method. With the entry in a position (`a0: Rel<X>`) it compiles. Found by the
+/// property test with `TYPE_LEAK_PROP_FEATURES=impl_self_bound_cycle`.
+///
+/// The assertion: if the Leaker accepts the impl, no entry that a predicate of the copy names has
+/// a bound of its context that names `Self` while the self type is an entry.
+#[test]
+#[ignore = "an entry in a predicate has a bound of its context that names Self, in an impl whose self type is leaked"]
+fn f19_impl_self_in_bound_of_entry_in_predicate() {
+    let items: Vec<Item> = vec![
+        parse_quote!(
+            impl S {
+                fn m<X>(&self)
+                where
+                    X: Fn(Self) -> u8,
+                    Rel<X>: Default,
+                {
+                }
+            }
+        ),
+        parse_quote!(
+            impl S {
+                fn m<X>(&self, a0: X)
+                where
+                    X: for<'h> Fn(&'h Self) -> &'h Result<Self, f64>,
+                    Rel<Rel2<X>>: Default,
+                {
+                }
+            }
+        ),
+        // The bound inline.
+        parse_quote!(
+            impl S {
+                fn m<X: Fn(&Self) -> u8>(&self)
+                where
+                    Rel<X>: Default,
+                {
+                }
+            }
+        ),
+    ];
+    let controls: Vec<Item> = vec![
+        // The entry is in a position, which rustc normalizes once the environment is built.
+        parse_quote!(
+            impl S {
+                fn m<X>(&self, a0: Rel<X>)
+                where
+                    X: Fn(Self) -> u8,
+                {
+                }
+            }
+        ),
+        // The bound does not name `Self`.
+        parse_quote!(
+            impl S {
+                fn m<X>(&self)
+                where
+                    X: Fn(u8) -> u8,
+                    Rel<X>: Default,
+                {
+                }
+            }
+        ),
+    ];
+    let self_is_leaked = |referrer: &Referrer, context: ContextId| {
+        matches!(
+            referrer.context_self(context),
+            Some(SelfRequirement::Type(self_ty))
+                if referrer.iter().any(|entry| string(entry) == string(self_ty))
+        )
+    };
+    for item in &items {
+        // Rejected is fine.
+        let Ok((referrer, copy)) = f19_copy(item) else {
+            continue;
+        };
+        let found = entries_with_self_bound_in_predicates(&referrer, &copy, self_is_leaked);
+        assert!(
+            found.is_empty(),
+            "in the copy `{}`, a predicate names the entries {:?}, which have a bound that names `Self`, the replaced self type",
+            string(&copy),
+            found
+        );
+    }
+    for item in &controls {
+        let (referrer, copy) = f19_copy(item)
+            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        assert!(
+            entries_with_self_bound_in_predicates(&referrer, &copy, self_is_leaked).is_empty(),
+            "{}",
+            string(&copy)
+        );
+    }
+}
+
+/// F20: in a trait, a method has a bound that names `Self::A` on a generic, and a predicate that
+/// names a leaked type that uses the generic.
+///
+/// Trigger: `trait Tr { type A0; fn m<X>(&self) where X: Fn(&Self::A0) -> u8, Rel<X>: Default; }`
+/// (the property test has `T: for<'h> Fn(&'h (X, Self::A1, &'a dyn Any)) -> &'h String`, E0271).
+/// The entry `Rel<X>` has the context `<X: Fn(&Self::A0) -> u8>` and `Self` bound by `Tr`, so the
+/// Repeater's impl for the implementors has `X: Fn(&<__S as Tr>::A0) -> u8`. The environment of the
+/// copy for the host has `X: Fn(&<Host as Tr>::A0) -> u8`, with the projection not normalized yet,
+/// where rustc proves `<Host as Repeater<(X,), ..>>::Type: Default`, which needs the impl with
+/// `A0` = `u8`: E0277 "expected an `Fn(&u8)` closure, found `X`" (the same with rustc alone).
+/// The README rule for `Self::A` ("a bound of the generics of the trait names a leaked type")
+/// looks at the bounds of the trait, not at those of the method that are in the context of
+/// an entry in a predicate. Found by the property test with
+/// `TYPE_LEAK_PROP_FEATURES=trait_assoc_bound_cycle`.
+///
+/// The assertion: if the Leaker accepts the trait, no entry that a predicate of the copy names has
+/// a bound of its context that names `Self::A`.
+#[test]
+#[ignore = "an entry in a predicate has a bound of its context that names Self::A, in a trait"]
+fn f20_trait_assoc_in_bound_of_entry_in_predicate() {
+    let items: Vec<Item> = vec![
+        parse_quote!(
+            pub trait Tr {
+                type A0;
+                fn m<X>(&self)
+                where
+                    X: Fn(&Self::A0) -> u8,
+                    Rel<X>: Default;
+            }
+        ),
+        parse_quote!(
+            pub trait Tr<'a, T> {
+                type A1;
+                fn m<X>(&self)
+                where
+                    T: for<'h> Fn(&'h (X, Self::A1, &'a dyn ::core::any::Any)) -> &'h String,
+                    Rel<T, X>: Default;
+            }
+        ),
+    ];
+    let controls: Vec<Item> = vec![
+        parse_quote!(
+            pub trait Tr {
+                type A0;
+                fn m<X>(&self, a0: Rel<X>)
+                where
+                    X: Fn(&Self::A0) -> u8;
+            }
+        ),
+        parse_quote!(
+            pub trait Tr {
+                type A0;
+                fn m<X>(&self)
+                where
+                    X: Fn(&u8) -> u8,
+                    Rel<X>: Default;
+            }
+        ),
+    ];
+    let bound = |referrer: &Referrer, context: ContextId| {
+        matches!(
+            referrer.context_self(context),
+            Some(SelfRequirement::Bound(_))
+        )
+    };
+    for item in &items {
+        // Rejected is fine.
+        let Ok((referrer, copy)) = f19_copy(item) else {
+            continue;
+        };
+        let found = entries_with_self_bound_in_predicates(&referrer, &copy, bound);
+        assert!(
+            found.is_empty(),
+            "in the copy `{}`, a predicate names the entries {:?}, which have a bound that names `Self::A`",
+            string(&copy),
+            found
+        );
+    }
+    for item in &controls {
+        let (referrer, copy) = f19_copy(item)
+            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        assert!(
+            entries_with_self_bound_in_predicates(&referrer, &copy, bound).is_empty(),
+            "{}",
+            string(&copy)
+        );
+    }
+}
+
+// ── F21 ──────────────────────────────────────────────────────────────────────
+
+/// Whether `generics` name an `Item`: `T::Item`, `<T as Iterator>::Item`.
+fn generics_name_item(generics: &Generics) -> bool {
+    struct Find(bool);
+    impl<'ast> Visit<'ast> for Find {
+        fn visit_path(&mut self, i: &'ast Path) {
+            self.0 |=
+                i.segments.len() > 1 && i.segments.last().map_or(false, |s| s.ident == "Item");
+            syn::visit::visit_path(self, i)
+        }
+    }
+    let mut find = Find(false);
+    find.visit_generics(generics);
+    find.0
+}
+
+/// F21: a bound of an iterator names its `Item`, and a predicate of an inner item equates the
+/// `Item` to a leaked type.
+///
+/// Trigger: `impl<T: Iterator> S<T> where T: Fn(T::Item) { fn m(&self) where T: Iterator<Item =
+/// Rel<T>> {} }` (and a trait with the bound in its where clause and the equation in a method). The
+/// entry `Rel<T>` is in the predicate `T: Iterator<Item = Rel<T>>`, and its context has the
+/// generics `<T: Fn(T::Item) + Iterator>`: the Repeater's impl has `T: Fn(T::Item)`. The copy has
+/// `T: Iterator<Item = <() as Repeater<(T,), ..>>::Type>`, so rustc proves that impl while it
+/// normalizes `T::Item`, which the predicate defines by the entry: E0275 "overflow evaluating the
+/// requirement `<() as Repeater<..>>::Type == <T as Iterator>::Item`" (the same with rustc
+/// alone; E0277 "expected an `Fn((Rel<T>, u8))` closure" for a tuple). The check of F2 does not see
+/// it, as the bound names no leaked type, only the `Item` that the entry defines: the same item
+/// with both predicates in one where clause is rejected, but the bound is of an enclosing item here.
+/// Found by the property test with `TYPE_LEAK_PROP_FEATURES=iterator_item_cycle`.
+///
+/// The assertion: if the Leaker accepts the item, no entry that a predicate of the copy names has
+/// a bound of its context that names an `Item`.
+#[test]
+#[ignore = "an entry in an Item = .. binding has a bound of its context that names the Item: rustc cycles"]
+fn f21_iterator_item_in_bound_of_entry_in_item_binding() {
+    let items: Vec<Item> = vec![
+        parse_quote!(
+            impl<T: Iterator> S<T>
+            where
+                T: Fn(T::Item),
+            {
+                fn m(&self)
+                where
+                    T: Iterator<Item = Result<T, I0>>,
+                {
+                }
+            }
+        ),
+        parse_quote!(
+            pub trait Tr<T: Iterator>
+            where
+                T: Fn(<T as Iterator>::Item),
+            {
+                fn m(&self)
+                where
+                    T: Iterator<Item = Rel<T>>;
+            }
+        ),
+    ];
+    let controls: Vec<Item> = vec![
+        // The `Item` is in a position.
+        parse_quote!(
+            pub trait Tr<T: Iterator> {
+                fn m(&self, a: T::Item)
+                where
+                    T: Iterator<Item = Rel<T>>;
+            }
+        ),
+        // The bound names no `Item`.
+        parse_quote!(
+            pub trait Tr<T: Iterator>
+            where
+                T: Fn(u8),
+            {
+                fn m(&self)
+                where
+                    T: Iterator<Item = Rel<T>>;
+            }
+        ),
+    ];
+    let check = |item: &Item| {
+        let (referrer, copy) = f19_copy(item)?;
+        let mut used = ReplacementsInPredicates::default();
+        used.visit_item(&copy);
+        let found: Vec<String> = used
+            .0
+            .iter()
+            .filter(|&&ix| {
+                ix < referrer.iter().count() && generics_name_item(referrer.generics(ix))
+            })
+            .map(|&ix| string(referrer.iter().nth(ix).unwrap()))
+            .collect();
+        Ok::<_, NotInternableError>((copy, found))
+    };
+    for item in &items {
+        // Rejected is fine.
+        let Ok((copy, found)) = check(item) else {
+            continue;
+        };
+        assert!(
+            found.is_empty(),
+            "in the copy `{}`, a predicate names the entries {:?}, which have a bound that names an `Item`",
+            string(&copy),
+            found
+        );
+    }
+    for item in &controls {
+        let (copy, found) = check(item)
+            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        assert!(found.is_empty(), "{}", string(&copy));
     }
 }

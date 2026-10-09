@@ -35,48 +35,9 @@
 //! generator also avoids the constructs that cannot be copied to another crate whatever
 //! `type-leak` does, such as an inherent impl on a type of another module in the copy of a module.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeSet;
-
-// ---------------------------------------------------------------------------------------------
-// Random numbers.
-// ---------------------------------------------------------------------------------------------
-
-/// splitmix64
-pub struct Rng(u64);
-
-impl Rng {
-    pub fn new(seed: u64) -> Self {
-        let mut rng = Rng(seed ^ 0x9e37_79b9_7f4a_7c15);
-        rng.next();
-        rng
-    }
-
-    pub fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    /// A number in `0..n`.
-    pub fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    /// `true` with the probability `percent`%.
-    pub fn chance(&mut self, percent: u32) -> bool {
-        self.below(100) < percent as usize
-    }
-
-    pub fn range(&mut self, lo: usize, hi: usize) -> usize {
-        lo + self.below(hi - lo + 1)
-    }
-
-    pub fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
-        &xs[self.below(xs.len())]
-    }
-}
+use std::hash::Hasher;
 
 // ---------------------------------------------------------------------------------------------
 // Configuration and results.
@@ -135,8 +96,57 @@ pub struct Features {
     pub module_crate_paths: bool,
     /// A bound of the generics of an impl that names `Self` (`impl<T: AsRef<Option<Self>>> W<T>`):
     /// the self type is an entry that depends on `Self`, which is the self type itself, so the
-    /// copy cannot write it.
+    /// copy cannot write it (F13).
     pub impl_self_bounds: bool,
+    /// An impl of a trait whose where clause names a leaked type (`impl<T> Tr<T> for S where T:
+    /// Fn(Rel)`), and a method of it with a predicate that names `Self::A`
+    /// (`where X: Into<Self::A>`): rustc normalizes the projection in the environment of the
+    /// method, and the impl it needs has `T: Fn(Rel)`, which the copy writes as `T:
+    /// Fn(<() as Repeater<..>>::Type)`, not normalized yet (E0277, E0271). The context of the
+    /// leaked type has no generics, so the check for a bound that names a leaked type misses it
+    /// (F14). Off, the impls of the traits that have both are not generated.
+    pub impl_pred_leaked: bool,
+    /// `fn(&A) -> &R` or `Fn(&A) -> &R` (the elided lifetime of the input is the output's) where
+    /// `A` names `Self`, and the copy writes `Self` as a type that has lifetimes (the self type of
+    /// an impl, an ADT with lifetime parameters), or `Self::A` as `<Self as Tr<'a, ..>>::A` with
+    /// the lifetime parameters of the trait: the input then has more lifetimes, and rustc cannot
+    /// tell which one the output has (E0106, F15). Off, such a sugar is not generated.
+    pub self_elision: bool,
+    /// An outlives bound that the original has only by the well-formedness of its signature
+    /// (`Self: 'x` from `&'x self`, `Self::A: 'x` from `&'x mut Self::A`, with the other
+    /// parameters of the trait), which the Repeater's impl lacks (E0309, F16). Off, `Self` under
+    /// a path or a trait object with a lifetime needs `Self: 'x` written, and `Self::A` is not
+    /// put under a lifetime.
+    pub implied_outlives: bool,
+    /// A strict Referrer (`allow_ambiguous_crate_name(false)`) replaces the optional entries too.
+    /// An optional entry in a where predicate that names a lifetime (`T: Fn(&'a ::ext::W<T,
+    /// ::ext::B0>)`) has the predicate in its context, so it is replaced by a path that needs
+    /// itself (E0277, F17): `not_optional` of the Leaker misses the type that holds another
+    /// optional type. Off, the item that has it is not invoked as strict.
+    pub strict_cycles: bool,
+    /// A strict Referrer replaces an optional entry that holds a lifetime of a method (`fn
+    /// m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>`): the copy has `'x` in no argument that
+    /// constrains it, so it is early-bound, where it is late-bound in the trait (E0195, F18: the
+    /// README, "External crates", says that replacing a type can lose a method lifetime). Off,
+    /// the item that has it is not invoked as strict.
+    pub strict_anchors: bool,
+    /// In an impl whose self type is leaked, a method with a bound of a generic that names `Self`
+    /// (`X: Fn(&Self) -> u8`) and a leaked type in another predicate that uses the generic
+    /// (`Rel<X>: Default`): the entry's Repeater impl has the bound with the Leaker's self type,
+    /// and the copy has it with `Self` = the unnormalized projection that replaces the self type
+    /// (E0277, E0271, F19). Off, the other predicates that use the generic are dropped.
+    pub impl_self_bound_cycle: bool,
+    /// The same in a trait with a bound that names `Self::A` (`X: Fn(&Self::A0) -> u8`): the
+    /// impl of the Repeater for the host has the bound with the host's type for `A0`, and the copy
+    /// has `<Host as Tr>::A0`, which rustc does not normalize in the environment (E0271, F20).
+    /// Off, the other predicates that use the generic are dropped.
+    pub trait_assoc_bound_cycle: bool,
+    /// A bound of an iterator that names its `Item` (`T: Fn(<T as Iterator>::Item)`), and a
+    /// predicate that equates the `Item` to a leaked type (`T: Iterator<Item = Rel<T>>`): the
+    /// entry has the first bound in its context, and rustc must normalize `T::Item`, which the
+    /// predicate defines by the entry: a cycle (E0275, F21). Off, the predicate with `Item = ..`
+    /// is dropped where the bound is.
+    pub iterator_item_cycle: bool,
 }
 
 impl Features {
@@ -169,6 +179,14 @@ impl Features {
                     features.method_lifetime_paths = true;
                     features.module_crate_paths = true;
                     features.impl_self_bounds = true;
+                    features.impl_pred_leaked = true;
+                    features.self_elision = true;
+                    features.implied_outlives = true;
+                    features.strict_cycles = true;
+                    features.strict_anchors = true;
+                    features.impl_self_bound_cycle = true;
+                    features.trait_assoc_bound_cycle = true;
+                    features.iterator_item_cycle = true;
                 }
                 "inferred_outlives" => features.inferred_outlives = true,
                 "impl_assoc_self" => features.impl_assoc_self = true,
@@ -179,6 +197,14 @@ impl Features {
                 "method_lifetime_paths" => features.method_lifetime_paths = true,
                 "module_crate_paths" => features.module_crate_paths = true,
                 "impl_self_bounds" => features.impl_self_bounds = true,
+                "impl_pred_leaked" => features.impl_pred_leaked = true,
+                "self_elision" => features.self_elision = true,
+                "implied_outlives" => features.implied_outlives = true,
+                "strict_cycles" => features.strict_cycles = true,
+                "strict_anchors" => features.strict_anchors = true,
+                "impl_self_bound_cycle" => features.impl_self_bound_cycle = true,
+                "trait_assoc_bound_cycle" => features.trait_assoc_bound_cycle = true,
+                "iterator_item_cycle" => features.iterator_item_cycle = true,
                 "unsized_params" => features.unsized_params = true,
                 "bound_cycles" => features.bound_cycles = true,
                 other => panic!("unknown feature `{}`", other),
@@ -331,6 +357,21 @@ struct Scope {
     /// `(parameter, "iter" | "fn")`: a parameter has one `Iterator` and one `Fn` bound at most,
     /// or the bounds conflict.
     bounded: Vec<(String, &'static str)>,
+    /// `Self` has lifetimes where a copy writes it out: the self type of an impl that names one,
+    /// an ADT with lifetime parameters (`self_elision`).
+    self_lts: bool,
+    /// `Self::A` has lifetimes where a copy writes it out: the trait has lifetime parameters
+    /// (`<Self as Tr<'a>>::A`, `self_elision`).
+    assoc_lts: bool,
+    /// The types are in a where predicate: rustc proves their well-formedness, with the bounds
+    /// that the signature implies as the only help (`implied_outlives`).
+    pred: bool,
+    /// The lifetimes `'x` of a `Self: 'x` that a where clause writes.
+    self_written: Vec<String>,
+    /// The parameters whose `Item` a predicate of an enclosing item names (`T: Fn(T::Item)`), and
+    /// those whose `Item` it equates to a type (`T: Iterator<Item = Rel>`) (`iterator_item_cycle`).
+    names_item: Vec<String>,
+    binds_item: Vec<String>,
 }
 
 /// What a type to generate must be.
@@ -390,6 +431,8 @@ struct Ty {
     /// It names an associated type of a parameter (`T::Item`), which a bound may equate to
     /// another type: `T: 'a` does not tell it outlives `'a`.
     projection: bool,
+    /// It names `Self` or `Self::A`, and a copy writes that with lifetimes (`self_elision`).
+    adds_lts: bool,
 }
 
 impl Ty {
@@ -411,6 +454,7 @@ impl Ty {
             ty.self_sized |= part.self_sized;
             ty.infer_ok &= part.infer_ok;
             ty.projection |= part.projection;
+            ty.adds_lts |= part.adds_lts;
         }
         ty
     }
@@ -421,7 +465,9 @@ impl Ty {
     }
 }
 
-fn outlives(sc: &Scope, ty: &Ty, lt: &str, infer: bool) -> bool {
+/// Whether `ty` outlives `lt`. `written`: `Self: 'x` must be written in a where clause to count (a
+/// path or a trait object with a lifetime records no bound, `implied_outlives`).
+fn outlives(sc: &Scope, ty: &Ty, lt: &str, infer: bool, written: bool) -> bool {
     for p in &ty.tys {
         let declared = sc
             .tys
@@ -437,7 +483,12 @@ fn outlives(sc: &Scope, ty: &Ty, lt: &str, infer: bool) -> bool {
             return false;
         }
     }
-    !ty.projection && (!ty.uses_self || sc.self_outlives.iter().any(|l| l == lt))
+    let self_ok = if written {
+        sc.self_written.iter().any(|l| l == lt)
+    } else {
+        sc.self_outlives.iter().any(|l| l == lt)
+    };
+    !ty.projection && (!ty.uses_self || self_ok)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -556,6 +607,20 @@ struct Skeleton {
     consts: Vec<(String, &'static str)>,
     preds: Vec<String>,
     bounded: Vec<(String, &'static str)>,
+    /// A where predicate names a lifetime and an external type (`Risk::cycle`).
+    risk_cycle: bool,
+}
+
+/// What makes an item break under a strict Referrer, which replaces the optional entries
+/// (`strict_cycles`, `strict_anchors`): the item is not invoked as strict then, unless a feature
+/// asks for it.
+#[derive(Clone, Copy, Default, Debug)]
+struct Risk {
+    /// A where predicate names a lifetime and an absolute type of a crate that the Leaker does not
+    /// allow.
+    cycle: bool,
+    /// A method names a lifetime of its own inside such a type.
+    anchor: bool,
 }
 
 impl Skeleton {
@@ -621,6 +686,14 @@ impl Skeleton {
         sc.tys.extend(self.tys.iter().cloned());
         sc.consts.extend(self.consts.iter().cloned());
         sc.bounded.extend(self.bounded.iter().cloned());
+        for t in &self.tys {
+            if self.preds.iter().any(|p| names_item(p, &t.name)) {
+                sc.names_item.push(t.name.clone());
+            }
+            if self.preds.iter().any(|p| binds_item(p, &t.name)) {
+                sc.binds_item.push(t.name.clone());
+            }
+        }
         sc
     }
 }
@@ -645,10 +718,19 @@ struct TraitInfo {
     uses_assoc_self: bool,
     /// A method has `where Self: 'x`, or a receiver `&'x self` and names `Self`.
     uses_self_outlives: bool,
+    /// A where predicate of a method names `Self::A` (`impl_pred_leaked`).
+    self_assoc_in_pred: bool,
+    /// The where clause of the trait names a type that may be leaked (`impl_pred_leaked`).
+    preds_leakable: bool,
+    /// An elided `fn(&Self) -> &R` or `Fn(..)` is in it (`self_elision`).
+    elided_self: bool,
+    risk: Risk,
 }
 
 pub struct Gen {
-    pub rng: Rng,
+    /// The state of the random numbers: each one is the hash of the seed and of what was drawn
+    /// before (`finish()` does not reset a `DefaultHasher`).
+    rng: DefaultHasher,
     cfg: Config,
     features: Features,
     env: ModEnv,
@@ -674,6 +756,11 @@ pub struct Gen {
     items: Vec<Item>,
     /// The kinds of the items in the module analyzed as a whole.
     contents: Vec<&'static str>,
+    /// An elided `fn(&A) -> &R` or `Fn(&A) -> &R` with `Self` in `A` was generated since it was
+    /// cleared (`self_elision`).
+    elided_self: bool,
+    /// What the item being generated has that breaks under a strict Referrer.
+    risk: Risk,
 }
 
 const PRIMS: &[&str] = &[
@@ -682,14 +769,15 @@ const PRIMS: &[&str] = &[
 
 impl Gen {
     pub fn new(seed: u64, krate: String, features: Features) -> Self {
-        let mut rng = Rng::new(seed);
+        let mut rng = DefaultHasher::new();
+        rng.write_u64(seed);
         let cfg = Config {
             krate,
-            prelude: rng.chance(50),
-            allow_std: rng.chance(35),
-            allow_crate: rng.chance(30),
+            prelude: false,
+            allow_std: false,
+            allow_crate: false,
         };
-        Gen {
+        let mut g = Gen {
             rng,
             cfg,
             features,
@@ -707,7 +795,37 @@ impl Gen {
             adts: Vec::new(),
             items: Vec::new(),
             contents: Vec::new(),
-        }
+            elided_self: false,
+            risk: Risk::default(),
+        };
+        g.cfg.prelude = g.chance(50);
+        g.cfg.allow_std = g.chance(35);
+        g.cfg.allow_crate = g.chance(30);
+        g
+    }
+
+    /// The next random number: the hash of the seed and of what was drawn before.
+    fn next(&mut self) -> u64 {
+        self.rng.write_u64(0);
+        self.rng.finish()
+    }
+
+    /// A number in `0..n`.
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    /// `true` with the probability `percent`%.
+    fn chance(&mut self, percent: u32) -> bool {
+        self.below(100) < percent as usize
+    }
+
+    fn range(&mut self, lo: usize, hi: usize) -> usize {
+        lo + self.below(hi - lo + 1)
+    }
+
+    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+        &xs[self.below(xs.len())]
     }
 
     fn binder(&mut self) -> String {
@@ -726,7 +844,7 @@ impl Gen {
 
     fn bare(&mut self) -> bool {
         let p = if self.cfg.prelude { 35 } else { 4 };
-        let chosen = self.rng.chance(p);
+        let chosen = self.chance(p);
         // The names of the prelude are not leaked if the Leaker allows them.
         chosen && (!self.abs_only || self.cfg.prelude)
     }
@@ -767,9 +885,9 @@ impl Gen {
 
     fn leaf(&mut self, sc: &Scope, c: Con) -> Ty {
         for _ in 0..8 {
-            let pick = self.rng.below(100);
+            let pick = self.below(100);
             let ty = match pick {
-                0..=29 => Some(Ty::new(*self.rng.pick(PRIMS))),
+                0..=29 => Some(Ty::new(*self.pick(PRIMS))),
                 30..=34 => {
                     let bare = self.bare();
                     if !bare && self.abs_only && !self.cfg.allow_std {
@@ -805,7 +923,7 @@ impl Gen {
         if units.is_empty() {
             return None;
         }
-        Some(Ty::new(self.rng.pick(&units).clone()))
+        Some(Ty::new(self.pick(&units).clone()))
     }
 
     fn param(&mut self, sc: &Scope, c: Con) -> Option<Ty> {
@@ -820,10 +938,10 @@ impl Gen {
         if candidates.is_empty() {
             return None;
         }
-        let p = (*self.rng.pick(&candidates)).clone();
+        let p = (*self.pick(&candidates)).clone();
         // `T::Item` and `<T as Iterator>::Item` are associated type paths.
-        if p.iter && c.bounds.is_none() && !self.no_assoc_paths && self.rng.chance(40) {
-            let text = if self.rng.chance(50) {
+        if p.iter && c.bounds.is_none() && !self.no_assoc_paths && self.chance(40) {
+            let text = if self.chance(50) {
                 format!("{}::Item", p.name)
             } else if self.bare() {
                 format!("<{} as Iterator>::Item", p.name)
@@ -847,18 +965,24 @@ impl Gen {
         if sc.assoc.is_empty() && sc.self_kind == SelfKind::No {
             return None;
         }
-        if !self.rng.chance(self.self_prob) {
+        if !self.chance(self.self_prob) {
             return None;
         }
         // `Self::A`
-        if !sc.assoc.is_empty() && self.rng.chance(40) {
-            let (name, _) = self.rng.pick(&sc.assoc).clone();
+        if !sc.assoc.is_empty() && self.chance(40) {
+            let (name, _) = self.pick(&sc.assoc).clone();
             let mut ty = Ty::new(format!("Self::{}", name)).no_infer();
             ty.uses_self = true;
+            ty.adds_lts = sc.assoc_lts || sc.self_lts;
+            // `Self::A: 'x` needs `Self: 'x` and the parameters of the trait to outlive `'x` too.
+            // A signature implies it for its types, but not a where predicate: and the Repeater's
+            // impl has neither (`implied_outlives`).
+            ty.projection = sc.pred || !self.features.implied_outlives;
             return Some(ty);
         }
         let mut ty = Ty::new("Self");
         ty.uses_self = true;
+        ty.adds_lts = sc.self_lts;
         match sc.self_kind {
             SelfKind::No => return None,
             SelfKind::Sized => {
@@ -877,11 +1001,11 @@ impl Gen {
     }
 
     fn ty(&mut self, sc: &Scope, c: Con, depth: u32) -> Ty {
-        if depth >= 3 || self.rng.chance(30) {
+        if depth >= 3 || self.chance(30) {
             return self.leaf(sc, c);
         }
         for _ in 0..6 {
-            let pick = self.rng.below(100);
+            let pick = self.below(100);
             let ty = match pick {
                 0..=10 => self.tuple(sc, c, depth),
                 11..=17 => self.array(sc, c, depth),
@@ -903,7 +1027,7 @@ impl Gen {
     }
 
     fn tuple(&mut self, sc: &Scope, c: Con, depth: u32) -> Option<Ty> {
-        let n = self.rng.range(2, 3);
+        let n = self.range(2, 3);
         let elem = Con { sized: true, ..c };
         let parts: Vec<Ty> = (0..n).map(|_| self.ty(sc, elem, depth + 1)).collect();
         let text = format!(
@@ -936,29 +1060,29 @@ impl Gen {
             .filter(|(_, ty)| *ty == "usize")
             .map(|(n, _)| n)
             .collect();
-        if !literal_only && !usizes.is_empty() && self.rng.chance(45) {
-            return (*self.rng.pick(&usizes)).clone();
+        if !literal_only && !usizes.is_empty() && self.chance(45) {
+            return (*self.pick(&usizes)).clone();
         }
-        if !self.env.consts.is_empty() && self.rng.chance(20) {
-            return self.rng.pick(&self.env.consts).clone();
+        if !self.env.consts.is_empty() && self.chance(20) {
+            let consts = self.env.consts.clone();
+            return self.pick(&consts).clone();
         }
-        self.rng.pick(&["2", "3", "0", "1"]).to_string()
+        self.pick(&["2", "3", "0", "1"]).to_string()
     }
 
     fn std_wrap(&mut self, sc: &Scope, c: Con, depth: u32) -> Option<Ty> {
         // (names, argument may be unsized, behind a pointer, ok with the bounds)
-        let which = self.rng.below(7);
+        let which = self.below(7);
         let (name, unsized_ok, indirect): (String, bool, bool) = match which {
             0 => (
                 if self.abs_only {
-                    if self.cfg.prelude && self.rng.chance(30) {
+                    if self.cfg.prelude && self.chance(30) {
                         "Option".to_string()
                     } else {
                         "::core::option::Option".to_string()
                     }
                 } else {
-                    self.rng
-                        .pick(&["::core::option::Option", "::std::option::Option", "Option"])
+                    self.pick(&["::core::option::Option", "::std::option::Option", "Option"])
                         .to_string()
                 },
                 false,
@@ -993,7 +1117,7 @@ impl Gen {
             }
             _ => ("::core::marker::PhantomData".into(), true, true),
         };
-        if name == "Option" && !self.cfg.prelude && !self.rng.chance(15) {
+        if name == "Option" && !self.cfg.prelude && !self.chance(15) {
             return None;
         }
         // A path of `::std` is an optional entry unless the Leaker allows the crate.
@@ -1019,7 +1143,7 @@ impl Gen {
     }
 
     fn std_two(&mut self, sc: &Scope, c: Con, depth: u32) -> Option<Ty> {
-        let (name, ok) = match self.rng.below(3) {
+        let (name, ok) = match self.below(3) {
             0 => (
                 if self.bare() {
                     "Result"
@@ -1031,7 +1155,7 @@ impl Gen {
             1 => ("::std::collections::BTreeMap", true),
             _ => ("::std::collections::HashMap", true),
         };
-        if !ok || (name == "Result" && !self.cfg.prelude && !self.rng.chance(20)) {
+        if !ok || (name == "Result" && !self.cfg.prelude && !self.chance(20)) {
             return None;
         }
         if self.abs_only && name.starts_with("::std") && !self.cfg.allow_std {
@@ -1062,10 +1186,10 @@ impl Gen {
             .iter()
             .filter(|l| for_ref || self.features.method_lifetime_paths || !sc.ref_only.contains(*l))
             .collect();
-        if c.closed || c.no_params || c.no_lifetimes || pool.is_empty() || self.rng.chance(15) {
+        if c.closed || c.no_params || c.no_lifetimes || pool.is_empty() || self.chance(15) {
             "'static".to_string()
         } else {
-            (*self.rng.pick(&pool)).clone()
+            (*self.pick(&pool)).clone()
         }
     }
 
@@ -1073,7 +1197,7 @@ impl Gen {
         if self.env.heads.is_empty() {
             return None;
         }
-        let head = self.rng.pick(&self.env.heads.clone()).clone();
+        let head = self.pick(&self.env.heads.clone()).clone();
         let inner = Con {
             sized: false,
             bounds: Bounds::default(),
@@ -1098,7 +1222,7 @@ impl Gen {
                 let lt = self.lifetime(sc, c, false);
                 let a = self.ty(sc, inner, depth + 1);
                 // The bound `T: 'a` of the definition must be written, as the README says.
-                if !outlives(sc, &a, &lt, false) {
+                if !outlives(sc, &a, &lt, false, !self.features.implied_outlives) {
                     return None;
                 }
                 let mut ty =
@@ -1133,11 +1257,10 @@ impl Gen {
                     .filter(|(_, ty)| *ty == "bool")
                     .map(|(n, _)| n)
                     .collect();
-                let value = if !bools.is_empty() && !c.no_params && !c.closed && self.rng.chance(60)
-                {
-                    (*self.rng.pick(&bools)).clone()
+                let value = if !bools.is_empty() && !c.no_params && !c.closed && self.chance(60) {
+                    (*self.pick(&bools)).clone()
                 } else {
-                    self.rng.pick(&["true", "false"]).to_string()
+                    self.pick(&["true", "false"]).to_string()
                 };
                 let mut ty = Ty::new(format!("{}<{}>", head.name, value));
                 if sc.consts.iter().any(|(n, _)| *n == value) {
@@ -1159,10 +1282,14 @@ impl Gen {
             ..c
         };
         let a = self.ty(sc, inner_con, depth + 1);
-        if !outlives(sc, &a, &lt, sc.infer) {
+        // A where predicate has no help of the receiver: `&'x Self` there needs `Self: 'x` written
+        // (the witness of the Leaker and the check of the Referrer have no receiver,
+        // `implied_outlives`).
+        let written = sc.pred && !self.features.implied_outlives;
+        if !outlives(sc, &a, &lt, sc.infer, written) {
             return None;
         }
-        let m = if self.rng.chance(25) { "mut " } else { "" };
+        let m = if self.chance(25) { "mut " } else { "" };
         let mut ty = Ty::with(format!("&{} {}{}", lt, m, paren(&a.text)), &[&a]);
         if lt != "'static" {
             ty.lts.insert(lt);
@@ -1180,7 +1307,7 @@ impl Gen {
             ..c
         };
         let a = self.ty(sc, inner_con, depth + 1);
-        let m = if self.rng.chance(50) { "const" } else { "mut" };
+        let m = if self.chance(50) { "const" } else { "mut" };
         Some(Ty::with(format!("*{} {}", m, paren(&a.text)), &[&a]))
     }
 
@@ -1193,31 +1320,32 @@ impl Gen {
             direct: false,
             ..c
         };
-        let prefix = *self
-            .rng
-            .pick(&["", "", "unsafe ", "extern \"C\" ", "unsafe extern \"C\" "]);
+        let prefix = *self.pick(&["", "", "unsafe ", "extern \"C\" ", "unsafe extern \"C\" "]);
         // `elided_fn_generics` asks for `fn(&A) -> &R` too: the elided lifetime of the input is the
         // output's, so the Leaker leaks the function pointer as a whole where `A` has lifetimes.
-        if self.features.elided_fn_generics && self.rng.chance(25) {
+        if self.features.elided_fn_generics && self.chance(25) {
             let a = self.ty(sc, Con::unsized_ok().with_scope(c), depth + 1);
             let r = self.ty(sc, Con::unsized_ok().with_scope(c), depth + 1);
+            // The copy writes `Self` with lifetimes if it has any (`self_elision`).
             if !a.text.contains(['\'', '&'])
                 && !(a.uses_self && sc.self_kind != SelfKind::MaybeUnsized)
+                && (self.features.self_elision || !a.adds_lts)
             {
+                self.elided_self |= a.uses_self;
                 let text = format!("{}fn(&{}) -> &{}", prefix, paren(&a.text), paren(&r.text));
                 return Some(Ty::with(text, &[&a, &r]).no_infer());
             }
         }
-        let n = self.rng.range(0, 2);
+        let n = self.range(0, 2);
         let mut parts: Vec<Ty> = Vec::new();
-        let (text, hr) = if self.rng.chance(40) {
+        let (text, hr) = if self.chance(40) {
             // `for<'h> fn(&'h A, B) -> &'h R`: an input keeps `'h`.
             let a = self.ty(sc, Con::unsized_ok().with_scope(c), depth + 1);
             let h = self.binder();
             let mut args = vec![format!("&{} {}", h, paren(&a.text))];
             parts.push(a);
             // A type of the module with the lifetime of the binder: `Rl<'h>`.
-            if self.rng.chance(40) {
+            if self.chance(40) {
                 let heads: Vec<String> = self
                     .env
                     .heads
@@ -1226,7 +1354,7 @@ impl Gen {
                     .map(|head| head.name.clone())
                     .collect();
                 if !heads.is_empty() {
-                    args.push(format!("{}<{}>", self.rng.pick(&heads), h));
+                    args.push(format!("{}<{}>", self.pick(&heads), h));
                 }
             }
             for _ in 0..n {
@@ -1234,12 +1362,12 @@ impl Gen {
                 args.push(t.text.clone());
                 parts.push(t);
             }
-            let ret = if self.rng.chance(60) {
+            let ret = if self.chance(60) {
                 let r = self.ty(sc, Con::unsized_ok().with_scope(c), depth + 1);
                 let text = format!(" -> &{} {}", h, paren(&r.text));
                 parts.push(r);
                 text
-            } else if self.rng.chance(50) {
+            } else if self.chance(50) {
                 let r = self.ty(sc, arg, depth + 1);
                 let text = format!(" -> {}", r.text);
                 parts.push(r);
@@ -1258,7 +1386,7 @@ impl Gen {
                 args.push(t.text.clone());
                 parts.push(t);
             }
-            let ret = if self.rng.chance(50) {
+            let ret = if self.chance(50) {
                 let r = self.ty(sc, arg, depth + 1);
                 let text = format!(" -> {}", r.text);
                 parts.push(r);
@@ -1273,7 +1401,7 @@ impl Gen {
     }
 
     fn slice_or_str(&mut self, sc: &Scope, c: Con, depth: u32) -> Option<Ty> {
-        if self.rng.chance(30) {
+        if self.chance(30) {
             return Some(Ty::new("str"));
         }
         let elem = Con {
@@ -1297,17 +1425,17 @@ impl Gen {
         };
         let mut parts: Vec<Ty> = Vec::new();
         // `elided_fn_generics` asks for the elided form, with generics in the input.
-        let pick = if self.features.elided_fn_generics && open && self.rng.chance(60) {
+        let pick = if self.features.elided_fn_generics && open && self.chance(60) {
             8
         } else {
-            self.rng.below(9)
+            self.below(9)
         };
         let text = match pick {
             0 => "dyn ::core::fmt::Debug".to_string(),
             1 => "dyn ::core::any::Any".to_string(),
             2 | 3 if !self.env.theads.is_empty() => {
                 let ts: Vec<THead> = self.env.theads.clone();
-                let t = self.rng.pick(&ts).clone();
+                let t = self.pick(&ts).clone();
                 match t.shape {
                     TShape::T0 => format!("dyn {}", t.name),
                     TShape::T1 => {
@@ -1326,7 +1454,7 @@ impl Gen {
             }
             2 | 3 => "dyn ::core::fmt::Debug".to_string(),
             4 | 5 => {
-                let f = *self.rng.pick(&["Fn", "FnMut", "FnOnce"]);
+                let f = *self.pick(&["Fn", "FnMut", "FnOnce"]);
                 let path = if self.cfg.prelude && self.bare() {
                     f.to_string()
                 } else {
@@ -1370,6 +1498,7 @@ impl Gen {
                 let r = self.ty(sc, closed, depth + 1);
                 if a.text.contains(['\'', '&'])
                     || (a.uses_self && sc.self_kind != SelfKind::MaybeUnsized)
+                    || (!self.features.self_elision && a.adds_lts)
                 {
                     return self.dyn_bare(sc, depth, open);
                 }
@@ -1379,6 +1508,7 @@ impl Gen {
                 if open && !self.features.elided_fn_generics {
                     return self.dyn_bare(sc, depth, false);
                 }
+                self.elided_self |= a.uses_self;
                 let text = format!(
                     "dyn ::core::ops::Fn(&{}) -> &{}",
                     paren(&a.text),
@@ -1389,7 +1519,7 @@ impl Gen {
                 text
             }
         };
-        let text = if self.rng.chance(12) && !text.contains("Any") {
+        let text = if self.chance(12) && !text.contains("Any") {
             format!("{} + ::core::marker::Send", text)
         } else {
             text
@@ -1401,17 +1531,19 @@ impl Gen {
         if !c.bounds.is_none() {
             return None;
         }
-        let open = !c.closed && !c.no_params && !c.no_lifetimes && self.rng.chance(30);
+        let open = !c.closed && !c.no_params && !c.no_lifetimes && self.chance(30);
         let obj = self.dyn_bare(sc, depth, open);
         // The bound of the object: `'static` by default for a box, the lifetime of a reference.
-        let lt_bound = if open || self.rng.chance(35) {
+        let lt_bound = if open || self.chance(35) {
             Some(self.lifetime(sc, c, false))
         } else {
             None
         };
         if let Some(lt) = &lt_bound {
             // `Any: 'static`, so only `dyn Any + 'static` is well formed (E0478).
-            if !outlives(sc, &obj, lt, false) || (obj.text.contains("Any") && lt != "'static") {
+            if !outlives(sc, &obj, lt, false, !self.features.implied_outlives)
+                || (obj.text.contains("Any") && lt != "'static")
+            {
                 return None;
             }
         } else if open && (!obj.tys.is_empty() || !obj.lts.is_empty() || obj.uses_self) {
@@ -1422,7 +1554,7 @@ impl Gen {
         let mut ty;
         // `Box` and `Rc` are paths of `::std`.
         let std_ok = !self.abs_only || self.cfg.allow_std;
-        match if std_ok { self.rng.below(4) } else { 2 } {
+        match if std_ok { self.below(4) } else { 2 } {
             0 | 1 => {
                 let text = match &lt_bound {
                     Some(lt) => with_bound(&obj.text, lt),
@@ -1436,7 +1568,7 @@ impl Gen {
                     Some(lt) => lt.clone(),
                     None => self.lifetime(sc, c, true),
                 };
-                if !outlives(sc, &obj, &lt, false) {
+                if !outlives(sc, &obj, &lt, false, false) {
                     return None;
                 }
                 let text = match &lt_bound {
@@ -1474,33 +1606,33 @@ impl Gen {
             Level::Method => (&["'x", "'y"], &["X", "Y"], &["M"]),
         };
         let mut sk = Skeleton::default();
-        let n_lt = match self.rng.below(100) {
+        let n_lt = match self.below(100) {
             0..=44 => 0,
             45..=79 => 1,
             _ => 2,
         }
         .min(lts.len());
-        let n_ty = match self.rng.below(100) {
+        let n_ty = match self.below(100) {
             0..=24 => 0,
             25..=64 => 1,
             65..=92 => 2,
             _ => 3,
         }
         .min(tys.len());
-        let n_const = if self.rng.chance(30) { 1 } else { 0 };
+        let n_const = if self.chance(30) { 1 } else { 0 };
         for l in lts.iter().take(n_lt) {
             sk.lifetimes.push(l.to_string());
         }
-        if sk.lifetimes.len() >= 2 && self.rng.chance(30) {
+        if sk.lifetimes.len() >= 2 && self.chance(30) {
             sk.outlives
                 .push((sk.lifetimes[1].clone(), sk.lifetimes[0].clone()));
         }
         if level == Level::Method
             && !sk.lifetimes.is_empty()
             && !outer.lifetimes.is_empty()
-            && self.rng.chance(15)
+            && self.chance(15)
         {
-            let outer_lt = self.rng.pick(&outer.lifetimes).clone();
+            let outer_lt = self.pick(&outer.lifetimes).clone();
             sk.outlives.push((sk.lifetimes[0].clone(), outer_lt));
         }
         let all_lts: Vec<String> = outer
@@ -1510,11 +1642,11 @@ impl Gen {
             .cloned()
             .collect();
         for name in tys.iter().take(n_ty) {
-            let sized = !self.features.unsized_params || self.rng.chance(82);
+            let sized = !self.features.unsized_params || self.chance(82);
             let mut bounds = Bounds {
-                clone: self.rng.chance(20) && sized,
-                debug: self.rng.chance(20),
-                default: self.rng.chance(15) && sized,
+                clone: self.chance(20) && sized,
+                debug: self.chance(20),
+                default: self.chance(15) && sized,
             };
             if !sized {
                 bounds.clone = false;
@@ -1532,16 +1664,22 @@ impl Gen {
             bound_texts.extend(self.bound_texts(bounds));
             let mut outlives_list = Vec::new();
             for l in &all_lts {
-                if self.rng.chance(45) {
+                if self.chance(45) {
                     outlives_list.push(l.clone());
                     bound_texts.push(l.clone());
                 }
             }
-            if self.rng.chance(5) {
+            if self.chance(5) {
                 outlives_list.push("'static".to_string());
                 bound_texts.push("'static".to_string());
             }
-            let iter = sized && self.rng.chance(10);
+            // `iterator_item_cycle` asks for iterators.
+            let iter = sized
+                && self.chance(if self.features.iterator_item_cycle {
+                    40
+                } else {
+                    10
+                });
             if iter {
                 bound_texts.push(if self.bare() {
                     "Iterator".to_string()
@@ -1559,7 +1697,7 @@ impl Gen {
             });
         }
         for name in consts.iter().take(n_const) {
-            let ty = if self.rng.chance(70) { "usize" } else { "bool" };
+            let ty = if self.chance(70) { "usize" } else { "bool" };
             sk.consts.push((name.to_string(), ty));
         }
         sk
@@ -1572,6 +1710,7 @@ impl Gen {
         if sc.self_kind == SelfKind::MaybeUnsized {
             sc.self_kind = SelfKind::Unsized;
         }
+        sc.pred = true;
         let sc = &sc;
         // A bound that names a leaked type that uses a generic is cyclic once rewritten, if the
         // generic has a bound itself, and a where predicate that names a lifetime is part of the
@@ -1612,14 +1751,51 @@ impl Gen {
             self.env.theads.retain(|h| !declared(&h.name));
             self.env.consts.retain(|c| !declared(c));
         }
-        let n = self.rng.below(max + 1);
+        let n = self.below(max + 1);
         for _ in 0..n {
             let sized_params: Vec<TyParam> = sc.tys.iter().filter(|p| p.sized).cloned().collect();
-            let pred = match self.rng.below(8) {
+            // `impl_pred_leaked` asks for a predicate of a method that names `Self::A`.
+            if self.features.impl_pred_leaked
+                && !self.no_self
+                && !sc.assoc.is_empty()
+                && !sized_params.is_empty()
+                && self.chance(30)
+            {
+                let p = self.pick(&sized_params).clone();
+                let (a, _) = self.pick(&sc.assoc).clone();
+                sk.preds
+                    .push(format!("{}: ::core::convert::Into<Self::{}>", p.name, a));
+                continue;
+            }
+            let kinds = if self.features.strict_cycles { 9 } else { 8 };
+            let pred = match self.below(kinds) {
+                // `strict_cycles` asks for an optional entry in a predicate that names a
+                // lifetime: `T: Fn(&'a ::krate::base::B2<T, ::krate::base::B0>) -> u8`.
+                8 => {
+                    let mut candidates: Vec<(TyParam, String)> = Vec::new();
+                    for p in &sized_params {
+                        for l in p.outlives.iter().filter(|l| *l != "'static") {
+                            candidates.push((p.clone(), l.clone()));
+                        }
+                    }
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                    let (p, lt) = self.pick(&candidates).clone();
+                    if bounded.contains(&(p.name.clone(), "fn")) {
+                        continue;
+                    }
+                    bounded.push((p.name.clone(), "fn"));
+                    let krate = self.cfg.krate.clone();
+                    format!(
+                        "{}: ::core::ops::Fn(&{} ::{}::base::B2<{}, ::{}::base::B0>) -> u8",
+                        p.name, lt, krate, p.name, krate
+                    )
+                }
                 0 if !sc.tys.is_empty() => {
-                    let p = self.rng.pick(&sc.tys).clone();
+                    let p = self.pick(&sc.tys).clone();
                     let b = if p.sized {
-                        *self.rng.pick(&[
+                        *self.pick(&[
                             Bounds::only_clone(),
                             Bounds::only_debug(),
                             Bounds::only_default(),
@@ -1630,17 +1806,17 @@ impl Gen {
                     format!("{}: {}", p.name, self.bound_texts(b).join(" + "))
                 }
                 1 if !sized_params.is_empty() => {
-                    let p = self.rng.pick(&sized_params).clone();
+                    let p = self.pick(&sized_params).clone();
                     let a = self.ty(sc, sized, 1);
                     format!("{}: ::core::convert::Into<{}>", p.name, a.text)
                 }
                 2 if !sc.tys.is_empty() => {
-                    let p = self.rng.pick(&sc.tys).clone();
+                    let p = self.pick(&sc.tys).clone();
                     let a = self.ty(sc, unsized_ok, 1);
                     format!("{}: ::core::convert::AsRef<{}>", p.name, a.text)
                 }
                 3 if !sized_params.is_empty() => {
-                    let p = self.rng.pick(&sized_params).clone();
+                    let p = self.pick(&sized_params).clone();
                     if bounded.contains(&(p.name.clone(), "iter")) {
                         continue;
                     }
@@ -1653,7 +1829,7 @@ impl Gen {
                     format!("{}: ::core::iter::Iterator<Item = {}>", p.name, a.text)
                 }
                 4 if !sized_params.is_empty() => {
-                    let p = self.rng.pick(&sized_params).clone();
+                    let p = self.pick(&sized_params).clone();
                     if bounded.contains(&(p.name.clone(), "fn")) {
                         continue;
                     }
@@ -1669,7 +1845,7 @@ impl Gen {
                 }
                 5 if !sized_params.is_empty() => {
                     let h = self.binder();
-                    let p = self.rng.pick(&sized_params).clone();
+                    let p = self.pick(&sized_params).clone();
                     if bounded.contains(&(p.name.clone(), "fn")) {
                         continue;
                     }
@@ -1691,7 +1867,7 @@ impl Gen {
                 }
                 6 => {
                     // A type with bounds it has: `Vec<T>: Debug`.
-                    let b = *self.rng.pick(&[
+                    let b = *self.pick(&[
                         Bounds::only_clone(),
                         Bounds::only_debug(),
                         Bounds::only_default(),
@@ -1709,7 +1885,60 @@ impl Gen {
                 }
                 _ => continue,
             };
+            if names_lifetime(&pred) && self.names_external(&pred) {
+                self.risk.cycle = true;
+            }
             sk.preds.push(pred);
+        }
+        if self.features.iterator_item_cycle {
+            // They ask for both on an iterator: `T: Fn(<T as Iterator>::Item) -> u8` and `T:
+            // Iterator<Item = (Rel<T>, u8)>`.
+            let iters: Vec<TyParam> = sc
+                .tys
+                .iter()
+                .filter(|p| p.iter && p.sized)
+                .cloned()
+                .collect();
+            let heads: Vec<String> = self
+                .env
+                .heads
+                .iter()
+                .filter(|head| head.shape == Shape::T1)
+                .map(|head| head.name.clone())
+                .collect();
+            if !iters.is_empty() && !heads.is_empty() && self.chance(60) {
+                let x = self.pick(&iters).name.clone();
+                if !bounded.contains(&(x.clone(), "fn")) && !bounded.contains(&(x.clone(), "iter"))
+                {
+                    bounded.push((x.clone(), "fn"));
+                    bounded.push((x.clone(), "iter"));
+                    let head = self.pick(&heads).clone();
+                    sk.preds.push(format!(
+                        "{}: ::core::ops::Fn(<{} as ::core::iter::Iterator>::Item) -> u8",
+                        x, x
+                    ));
+                    sk.preds.push(format!(
+                        "{}: ::core::iter::Iterator<Item = ({}<{}>, u8)>",
+                        x, head, x
+                    ));
+                }
+            }
+        } else {
+            // A bound of an iterator that names its `Item`, and a predicate that equates the
+            // `Item` to a type: the second goes (`iterator_item_cycle`).
+            for t in sc.tys.iter().filter(|t| t.iter) {
+                let x = &t.name;
+                let names_outer = sc.names_item.contains(x);
+                let binds_outer = sc.binds_item.contains(x);
+                let names_here = sk.preds.iter().any(|p| names_item(p, x));
+                let binds_here = sk.preds.iter().any(|p| binds_item(p, x));
+                if (names_outer || names_here) && (binds_outer || binds_here) {
+                    sk.preds.retain(|p| !binds_item(p, x));
+                    if binds_outer {
+                        sk.preds.retain(|p| !names_item(p, x));
+                    }
+                }
+            }
         }
         sk.bounded = bounded;
         self.env = saved_env;
@@ -1725,15 +1954,31 @@ impl Gen {
     /// type only is early-bound in the copy, and late-bound in the trait (E0195, see
     /// `method_lifetime_paths`).
     fn method_ty(&mut self, sc: &Scope) -> Ty {
+        // `implied_outlives` asks for `&'x mut Self::A` where only the signature implies
+        // `Self::A: 'x`.
+        if self.features.implied_outlives
+            && !self.no_self
+            && !sc.assoc.is_empty()
+            && !sc.self_outlives.is_empty()
+            && self.chance(35)
+        {
+            let lt = self.pick(&sc.self_outlives).clone();
+            let (name, _) = self.pick(&sc.assoc).clone();
+            let m = if self.chance(30) { "mut " } else { "" };
+            let mut ty = Ty::new(format!("&{} {}Self::{}", lt, m, name)).no_infer();
+            ty.uses_self = true;
+            ty.lts.insert(lt);
+            return ty;
+        }
         if self.features.method_lifetime_paths || sc.ref_only.is_empty() {
             return self.ty(sc, Con::sized(), 0);
         }
         let mut inner = sc.clone();
         inner.lifetimes.retain(|l| !sc.ref_only.contains(l));
-        if self.rng.chance(30) {
-            let lt = self.rng.pick(&sc.ref_only).clone();
+        if self.chance(30) {
+            let lt = self.pick(&sc.ref_only).clone();
             let a = self.ty(&inner, Con::unsized_ok().indirect(), 1);
-            if outlives(sc, &a, &lt, false) {
+            if outlives(sc, &a, &lt, false, false) {
                 let mut ty = Ty::with(format!("&{} {}", lt, paren(&a.text)), &[&a]);
                 ty.lts.insert(lt);
                 return ty;
@@ -1752,7 +1997,17 @@ impl Gen {
         let typed_self_ok = !self.no_self && has_self && !outer.adt_self;
         let by_value_ok = !self.no_self && has_self;
         let mut self_sized = false;
-        let receiver = match self.rng.below(100) {
+        // `implied_outlives` asks for the lifetime of the receiver, which implies `Self: 'x`.
+        let pick = if self.features.implied_outlives
+            && in_trait
+            && !sk.lifetimes.is_empty()
+            && self.chance(40)
+        {
+            55
+        } else {
+            self.below(100)
+        };
+        let receiver = match pick {
             0..=9 => None,
             _ if !has_self => None,
             10..=39 => Some("&self".to_string()),
@@ -1779,17 +2034,18 @@ impl Gen {
             && receiver.is_some()
             && by_value_ok
             && (in_trait || self.features.impl_self_outlives)
-            && self.rng.chance(12)
+            && self.chance(12)
         {
             let l = sk.lifetimes[sk.lifetimes.len() - 1].clone();
             pre_preds.push(format!("Self: {}", l));
+            sc.self_written.push(l.clone());
             sc.self_outlives.push(l);
         }
         let mut params = Vec::new();
         if let Some(r) = &receiver {
             params.push(r.clone());
         }
-        let n = match self.rng.below(100) {
+        let n = match self.below(100) {
             0..=24 => 0,
             25..=59 => 1,
             60..=84 => 2,
@@ -1801,25 +2057,183 @@ impl Gen {
             params.push(format!("a{}: {}", i, t.text));
         }
         let mut ret = String::new();
-        if self.rng.chance(60) {
+        if self.chance(60) {
             let t = self.method_ty(&sc);
             self_sized |= t.self_sized;
             ret = format!(" -> {}", t.text);
         }
+        // `strict_anchors` asks for an external type that holds a lifetime of the method, and a
+        // return type that names it: a strict Referrer replaces the one, so nothing constrains it.
+        if self.features.strict_anchors && !sk.lifetimes.is_empty() && self.chance(25) {
+            let l = sk.lifetimes[0].clone();
+            let holder = if !self.cfg.allow_crate {
+                Some(format!("::{}::base::B1<&{} u8>", self.cfg.krate, l))
+            } else if !self.cfg.allow_std {
+                Some(format!("::std::boxed::Box<&{} u8>", l))
+            } else {
+                None
+            };
+            let heads: Vec<String> = self
+                .env
+                .heads
+                .iter()
+                .filter(|head| head.shape == Shape::LOnly)
+                .map(|head| head.name.clone())
+                .collect();
+            if let (Some(holder), false) = (holder, heads.is_empty()) {
+                params.push(format!("a{}: {}", n, holder));
+                ret = format!(" -> {}<{}>", self.pick(&heads), l);
+            }
+        }
         let mut sk = sk;
         sk.preds = pre_preds;
         self.preds(&sc, &mut sk, 2);
+        let generic_names: Vec<String> = sc.tys.iter().map(|t| t.name.clone()).collect();
+        let (allowed, can_name) = if in_trait {
+            (
+                self.features.trait_assoc_bound_cycle,
+                !sc.assoc.is_empty() && !self.no_self,
+            )
+        } else {
+            (
+                self.features.impl_self_bound_cycle,
+                has_self && !self.no_self && sc.self_kind == SelfKind::Sized,
+            )
+        };
+        if !allowed {
+            // A bound of a generic that names `Self`, and a predicate that uses the generic:
+            // the entry of the second has the bound in its context (`impl_self_bound_cycle`,
+            // `trait_assoc_bound_cycle`).
+            drop_self_bound_cycles(&mut sk.preds, &generic_names);
+        } else if can_name && self.chance(30) {
+            // They ask for both: `X: Fn(&Self) -> u8` or `X: Fn(&Self::A) -> u8`, and `Rel<X>:
+            // Default`.
+            let sized: Vec<&TyParam> = sc.tys.iter().filter(|p| p.sized).collect();
+            let heads: Vec<String> = self
+                .env
+                .heads
+                .iter()
+                .filter(|head| head.shape == Shape::T1)
+                .map(|head| head.name.clone())
+                .collect();
+            if !sized.is_empty() && !heads.is_empty() {
+                let x = self.pick(&sized).name.clone();
+                let named = if in_trait {
+                    format!("Self::{}", self.pick(&sc.assoc).0)
+                } else {
+                    "Self".to_string()
+                };
+                let head = self.pick(&heads).clone();
+                sk.preds
+                    .push(format!("{}: ::core::ops::Fn(&{}) -> u8", x, named));
+                sk.preds
+                    .push(format!("{}<{}>: ::core::default::Default", head, x));
+            }
+        }
         if self_sized && outer.self_kind == SelfKind::MaybeUnsized {
             sk.preds.push("Self: ::core::marker::Sized".to_string());
         }
-        format!(
+        let sig = format!(
             "fn {}{}({}){}{}",
             name,
             sk.params(),
             params.join(", "),
             ret,
             sk.where_clause()
-        )
+        );
+        if self.external_holds_lifetime(&sig, &sk.lifetimes) {
+            self.risk.anchor = true;
+        }
+        sig
+    }
+
+    /// Whether `text` names a type of a crate that the Leaker does not allow by an absolute path:
+    /// an optional entry.
+    fn names_external(&self, text: &str) -> bool {
+        (!self.cfg.allow_std && text.contains("::std::"))
+            || (!self.cfg.allow_crate && text.contains(&format!("::{}::", self.cfg.krate)))
+    }
+
+    /// Whether the arguments of an external absolute path in `text` name one of `lifetimes`, or an
+    /// array whose length is an external constant (it is leaked as a whole).
+    fn external_holds_lifetime(&self, text: &str, lifetimes: &[String]) -> bool {
+        if !self.cfg.allow_crate {
+            let length = format!("; ::{}::base::BLEN]", self.cfg.krate);
+            let mut from = 0;
+            while let Some(at) = text[from..].find(&length) {
+                let end = from + at;
+                from = end + length.len();
+                // The `[` that opens the array.
+                let mut depth = 0;
+                let mut start = 0;
+                for (i, c) in text[..end].char_indices().rev() {
+                    match c {
+                        ']' => depth += 1,
+                        '[' if depth == 0 => {
+                            start = i;
+                            break;
+                        }
+                        '[' => depth -= 1,
+                        _ => (),
+                    }
+                }
+                if lifetimes
+                    .iter()
+                    .any(|l| text[start..end].contains(l.as_str()))
+                {
+                    return true;
+                }
+            }
+        }
+        let mut prefixes = Vec::new();
+        if !self.cfg.allow_std {
+            prefixes.push("::std::".to_string());
+        }
+        if !self.cfg.allow_crate {
+            prefixes.push(format!("::{}::", self.cfg.krate));
+        }
+        for prefix in prefixes {
+            let mut from = 0;
+            while let Some(at) = text[from..].find(&prefix) {
+                let start = from + at;
+                from = start + prefix.len();
+                // The type that starts with the path: its arguments, and the bounds of a trait
+                // object (`dyn ::ext::Tr + 'y`), up to the end of the enclosing element.
+                let mut depth = 0;
+                let mut end = text.len();
+                let mut previous = ' ';
+                for (i, c) in text[start..].char_indices() {
+                    match c {
+                        '<' | '(' | '[' => depth += 1,
+                        '>' if previous == '-' => (),
+                        '>' | ')' | ']' if depth == 0 => {
+                            end = start + i;
+                            break;
+                        }
+                        '>' | ')' | ']' => depth -= 1,
+                        ',' | ';' | '{' if depth == 0 => {
+                            end = start + i;
+                            break;
+                        }
+                        _ => (),
+                    }
+                    previous = c;
+                }
+                if lifetimes
+                    .iter()
+                    .any(|l| text[start..end].contains(l.as_str()))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether the item that is generated may be invoked as strict.
+    fn strict_ok(&self) -> bool {
+        (self.features.strict_cycles || !self.risk.cycle)
+            && (self.features.strict_anchors || !self.risk.anchor)
     }
 }
 
@@ -1928,18 +2342,18 @@ impl Gen {
             let mut paths: Vec<String> = Vec::new();
             // Declared in the module.
             paths.push(format!("R{}", suffix));
-            if self.rng.chance(30) {
+            if self.chance(30) {
                 paths.push(format!("self::R{}", suffix));
             }
-            if path.len() > 1 && self.rng.chance(30) {
+            if path.len() > 1 && self.chance(30) {
                 paths.push(format!("super::R{}", suffix));
             }
             // Declared in `base`, by path or imported.
             paths.push(format!("{}base::B{}", up, suffix));
             paths.push(format!("crate::base::B{}", suffix));
             paths.push(format!("::{}::base::B{}", krate, suffix));
-            if self.rng.chance(45) {
-                let from = if self.rng.chance(70) {
+            if self.chance(45) {
+                let from = if self.chance(70) {
                     format!("{}base", up)
                 } else {
                     "crate::base".to_string()
@@ -1947,7 +2361,7 @@ impl Gen {
                 uses += &format!("use {}::B{} as I{};\n", from, suffix, suffix);
                 paths.push(format!("I{}", suffix));
             }
-            if self.rng.chance(15) {
+            if self.chance(15) {
                 uses += &format!("use ::{}::base::B{} as J{};\n", krate, suffix, suffix);
                 paths.push(format!("J{}", suffix));
             }
@@ -1980,7 +2394,7 @@ impl Gen {
             env.consts.push("crate::base::BLEN".to_string());
         }
         env.consts.push(format!("::{}::base::BLEN", krate));
-        if self.rng.chance(30) {
+        if self.chance(30) {
             uses += &format!("use {}base::BLEN as ILEN;\n", up);
             if relative_consts {
                 env.consts.push("ILEN".to_string());
@@ -1990,7 +2404,7 @@ impl Gen {
     }
 
     fn adt_field_count(&mut self) -> usize {
-        match self.rng.below(100) {
+        match self.below(100) {
             0..=14 => 0,
             15..=49 => 1,
             50..=79 => 2,
@@ -2013,11 +2427,12 @@ impl Gen {
         let base = Scope {
             self_kind: SelfKind::Sized,
             adt_self: true,
-            infer: self.features.inferred_outlives && self.rng.chance(35),
+            infer: self.features.inferred_outlives && self.chance(35),
             ..Default::default()
         };
         let mut sk = self.skeleton(Level::Item, &Scope::default(), Bounds::default());
-        let sc = sk.scope(&base);
+        let mut sc = sk.scope(&base);
+        sc.self_lts = !sk.lifetimes.is_empty();
 
         let mut used_tys = BTreeSet::new();
         let mut used_lts = BTreeSet::new();
@@ -2033,14 +2448,14 @@ impl Gen {
         };
         // The fields of each variant (one for a struct or a union).
         let n_variants = if kind == AdtKind::Enum {
-            self.rng.range(1, 3)
+            self.range(1, 3)
         } else {
             1
         };
         let mut variants: Vec<Vec<String>> = Vec::new();
         for _ in 0..n_variants {
             let n = if kind == AdtKind::Union {
-                self.rng.range(1, 3)
+                self.range(1, 3)
             } else {
                 self.adt_field_count()
             };
@@ -2089,7 +2504,7 @@ impl Gen {
             AdtKind::Struct => {
                 let mut fields = variants.remove(0);
                 fields.extend(phantoms);
-                let style = self.rng.below(100);
+                let style = self.below(100);
                 if fields.is_empty() {
                     format!("pub struct {}{}{};", name, params, wc)
                 } else if style < 55 {
@@ -2115,7 +2530,7 @@ impl Gen {
                 for (i, fields) in variants.iter().enumerate() {
                     let text = if fields.is_empty() {
                         format!("V{}", i)
-                    } else if self.rng.chance(50) {
+                    } else if self.chance(50) {
                         format!("V{}({})", i, fields.join(", "))
                     } else {
                         let body: Vec<String> = fields
@@ -2140,6 +2555,7 @@ impl Gen {
             }
         };
         let _ = kw;
+        sk.risk_cycle = self.risk.cycle;
         self.adts.push((name, sk));
         format!("{}{}\n", attr, text)
     }
@@ -2152,14 +2568,15 @@ impl Gen {
             self.self_prob = 6;
         }
         let mut sk = self.skeleton(Level::Item, &Scope::default(), Bounds::default());
+        self.elided_self = false;
         // Supertraits.
         let supers = Bounds {
-            clone: self.rng.chance(15),
-            debug: self.rng.chance(25),
-            default: self.rng.chance(10),
+            clone: self.chance(15),
+            debug: self.chance(25),
+            default: self.chance(10),
         };
         let mut super_texts = self.bound_texts(supers);
-        let explicit_sized = self.rng.chance(8);
+        let explicit_sized = self.chance(8);
         if explicit_sized {
             super_texts.push("::core::marker::Sized".to_string());
         }
@@ -2167,14 +2584,14 @@ impl Gen {
         // Associated types.
         let mut assoc: Vec<(String, Bounds)> = Vec::new();
         let mut assoc_texts: Vec<String> = Vec::new();
-        for i in 0..self.rng.range(0, 2) {
+        for i in 0..self.range(0, 2) {
             let b = Bounds {
-                clone: self.rng.chance(30),
-                debug: self.rng.chance(30),
-                default: self.rng.chance(20),
+                clone: self.chance(30),
+                debug: self.chance(30),
+                default: self.chance(20),
             };
             let mut texts = self.bound_texts(b);
-            if self.rng.chance(20) {
+            if self.chance(20) {
                 texts.push("::core::convert::Into<u32>".to_string());
             }
             let n = format!("A{}", i);
@@ -2192,27 +2609,30 @@ impl Gen {
                 SelfKind::Unsized
             },
             assoc: assoc.clone(),
+            assoc_lts: !sk.lifetimes.is_empty(),
             ..Default::default()
         };
         let sc = sk.scope(&base);
         // A where clause of the trait that names `Self::A` is cyclic once the trait is implemented.
         let mut pred_scope = sc.clone();
         pred_scope.assoc.clear();
-        self.preds(&pred_scope, &mut sk, 1);
+        self.preds(
+            &pred_scope,
+            &mut sk,
+            if self.features.impl_pred_leaked { 2 } else { 1 },
+        );
         let sc = sk.scope(&base);
         // Constants.
         let mut consts: Vec<(String, String)> = Vec::new();
         let mut const_texts: Vec<String> = Vec::new();
-        for i in 0..self.rng.range(0, 2) {
-            if self.rng.chance(70) {
+        for i in 0..self.range(0, 2) {
+            if self.chance(70) {
                 let t = self.ty(&sc, Con::unsized_ok().indirect(), 1);
                 let decl = format!("const C{}: ::core::marker::PhantomData<{}>", i, t.text);
                 consts.push((decl.clone(), "::core::marker::PhantomData".to_string()));
                 const_texts.push(format!("{};", decl));
             } else {
-                let (ty, value) = *self
-                    .rng
-                    .pick(&[("usize", "0"), ("bool", "false"), ("u8", "1")]);
+                let (ty, value) = *self.pick(&[("usize", "0"), ("bool", "false"), ("u8", "1")]);
                 let decl = format!("const K{}: {}", i, ty);
                 consts.push((decl.clone(), value.to_string()));
                 const_texts.push(format!("{};", decl));
@@ -2228,7 +2648,7 @@ impl Gen {
             ..sc.clone()
         };
         let mut methods: Vec<String> = Vec::new();
-        for _ in 0..self.rng.range(0, 4) {
+        for _ in 0..self.range(0, 4) {
             let m = self.name("m");
             methods.push(self.method_sig(&method_scope, &m, true));
         }
@@ -2255,6 +2675,14 @@ impl Gen {
             sk.where_clause(),
             body.join("\n")
         );
+        let self_assoc_in_pred = methods.iter().any(|m| {
+            m.split_once(" where ")
+                .map_or(false, |(_, w)| w.contains("Self::"))
+        });
+        let preds_leakable = {
+            let params: Vec<String> = sk.tys.iter().map(|t| t.name.clone()).collect();
+            sk.preds.iter().any(|p| names_leakable(p, &params))
+        };
         self.traits.push(TraitInfo {
             name,
             sk,
@@ -2262,6 +2690,10 @@ impl Gen {
             assoc,
             consts,
             uses_assoc_self: body.iter().any(|item| item.contains("Self::")),
+            self_assoc_in_pred,
+            preds_leakable,
+            elided_self: self.elided_self,
+            risk: self.risk,
             uses_self_outlives: body.iter().any(|item| {
                 item.contains("Self: '")
                     || ((item.contains("(&'x self") || item.contains("(&'y self"))
@@ -2283,10 +2715,15 @@ impl Gen {
         let candidates: Vec<usize> = (0..self.traits.len())
             .filter(|&i| !self.traits[i].implemented)
             .filter(|&i| !self.traits[i].uses_assoc_self || self.features.impl_assoc_self)
+            // `Self: 'x` (or the lifetime of a receiver) holds of the type of an impl only if it
+            // is the function pointer that `fn_pointer_self` gives it, which has no parameter: a
+            // check has no receiver to imply it (`impl_self_outlives`).
             .filter(|&i| {
                 !self.traits[i].uses_self_outlives
                     || self.features.impl_self_outlives
-                    || self.features.fn_pointer_self
+                    || (self.features.fn_pointer_self
+                        && !self.traits[i].supers.default
+                        && !(self.traits[i].elided_self && !self.features.self_elision))
             })
             // The impl has the predicates of the trait.
             .filter(|&i| {
@@ -2297,13 +2734,24 @@ impl Gen {
                         .iter()
                         .any(|p| names_self_in_bound(p))
             })
+            // The impl has the where clause of the trait, and the methods with their predicates:
+            // a predicate that names `Self::A` makes rustc prove the impl in its environment,
+            // where the bound of the impl that names a leaked type is not normalized yet
+            // (`impl_pred_leaked`).
+            .filter(|&i| {
+                self.features.impl_pred_leaked
+                    || !(self.traits[i].self_assoc_in_pred && self.traits[i].preds_leakable)
+            })
             .collect();
         if candidates.is_empty() {
             return None;
         }
-        let idx = *self.rng.pick(&candidates);
+        let idx = *self.pick(&candidates);
         self.traits[idx].implemented = true;
         let tr = self.traits[idx].clone();
+        // The impl has the where clause and the methods of the trait.
+        self.risk.cycle |= tr.risk.cycle;
+        self.risk.anchor |= tr.risk.anchor;
         let allow_self = ann.map_or(true, |(_, a)| a);
         let saved_prob = self.self_prob;
         if !allow_self {
@@ -2312,9 +2760,10 @@ impl Gen {
         // The impl declares the generics of the trait, and maybe one more.
         let mut sk = tr.sk.clone();
         let mut extra: Option<String> = None;
-        if self.rng.chance(30) {
+        let function_pointer_self = tr.uses_self_outlives && !self.features.impl_self_outlives;
+        if self.chance(30) && !function_pointer_self {
             let mut bounds = tr.supers;
-            bounds.clone |= self.rng.chance(20);
+            bounds.clone |= self.chance(20);
             let mut texts = self.bound_texts(bounds);
             // Besides `Sized`, which a type parameter has by default.
             texts.retain(|t| !t.is_empty());
@@ -2359,9 +2808,17 @@ impl Gen {
         if !self.features.fn_pointer_self && self_ty.text.contains("fn(") {
             self_ty = Ty::new("u8");
         }
+        // A self type with a lifetime adds it to the inputs of `fn(&Self) -> &R`, where the copy
+        // (and the witness) writes it out (`self_elision`).
+        let lifetime_free = tr.elided_self && !self.features.self_elision;
         // `fn_pointer_self` asks for a function pointer to implement the trait.
-        if self.features.fn_pointer_self && !tr.supers.default && extra.is_none() {
+        if self.features.fn_pointer_self && !tr.supers.default && extra.is_none() && !lifetime_free
+        {
             self_ty = Ty::new("&'static unsafe fn(i32)");
+        }
+        if lifetime_free {
+            // An entry of the self type with a bound `T: 'a` has `'a` in its arguments too.
+            self_ty = Ty::new("u8");
         }
         self.no_self = saved_no_self;
         let self_text = match &extra {
@@ -2419,9 +2876,10 @@ impl Gen {
             })
             .cloned()
             .collect();
-        let (sk, self_text) = if !adts.is_empty() && self.rng.chance(55) {
+        let (sk, self_text) = if !adts.is_empty() && self.chance(55) {
             // An ADT of this module, with the generics it declares.
-            let (name, sk) = self.rng.pick(&adts).clone();
+            let (name, sk) = self.pick(&adts).clone();
+            self.risk.cycle |= sk.risk_cycle;
             let text = format!("{}{}", name, sk.args());
             (sk, text)
         } else {
@@ -2465,10 +2923,11 @@ impl Gen {
         };
         let sc = sk.scope(&Scope {
             self_kind: SelfKind::Sized,
+            self_lts: self_text.contains('\'') || !sk.lifetimes.is_empty(),
             ..Default::default()
         });
         let mut body: Vec<String> = Vec::new();
-        for _ in 0..self.rng.range(1, 3) {
+        for _ in 0..self.range(1, 3) {
             let m = self.name("m");
             let mut sig = self.method_sig(&sc, &m, false);
             // The copy of a check has no receiver, so `Self: 'x` would not be implied.
@@ -2479,7 +2938,7 @@ impl Gen {
             }
             body.push(format!("pub {} {{ loop {{}} }}", sig));
         }
-        if self.rng.chance(35) {
+        if self.chance(35) {
             let t = self.ty(&sc, Con::unsized_ok().indirect(), 1);
             let n = self.name("C");
             body.push(format!(
@@ -2522,11 +2981,14 @@ impl Gen {
             (None, true)
         } else {
             let id = self.new_id();
-            let allow_self = self.rng.chance(70);
+            let allow_self = self.chance(70);
             (Some((id, allow_self)), allow_self)
         };
         let ann_id = ann.map(|(id, _)| id);
-        let pick = self.rng.below(100);
+        if ann.is_some() {
+            self.risk = Risk::default();
+        }
+        let pick = self.below(100);
         let (kind, text): (&'static str, String) = match pick {
             0..=21 => ("struct", self.gen_adt(AdtKind::Struct, ann)),
             22..=36 => ("enum", self.gen_adt(AdtKind::Enum, ann)),
@@ -2550,7 +3012,8 @@ impl Gen {
             _ => ("struct", self.gen_adt(AdtKind::Struct, ann)),
         };
         if let Some(id) = ann_id {
-            let strict = self.rng.chance(25);
+            let want_strict = self.chance(25);
+            let strict = want_strict && self.strict_ok();
             self.items.push(Item {
                 id,
                 kind,
@@ -2588,7 +3051,7 @@ impl Gen {
             let name = format!("n{}", i);
             let mut sub = path.to_vec();
             sub.push(name.clone());
-            let n = self.rng.range(2, items.max(3));
+            let n = self.range(2, items.max(3));
             let body = self.gen_module_body(&sub, whole, n, 0);
             text += &format!("pub mod {} {{\n{}\n}}\n", name, body);
         }
@@ -2611,31 +3074,33 @@ pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Feat
     lib += &format!("pub mod base {{\n{}\n}}\n", types_template("B"));
 
     // Modules whose items are analyzed one by one.
-    let n_item_modules = g.rng.range(2, 3);
+    let n_item_modules = g.range(2, 3);
     for i in 0..n_item_modules {
         let name = format!("m{}", i);
-        let n = g.rng.range(4, items_per_module);
-        let nested = usize::from(g.rng.chance(50));
+        let n = g.range(4, items_per_module);
+        let nested = usize::from(g.chance(50));
         let body = g.gen_module_body(std::slice::from_ref(&name), false, n, nested);
         lib += &format!("pub mod {} {{\n{}\n}}\n", name, body);
     }
     // Modules analyzed as a whole.
-    let n_whole = g.rng.range(1, 2);
+    let n_whole = g.range(1, 2);
     for i in 0..n_whole {
         let name = format!("mm{}", i);
         let id = g.new_id();
         g.no_self = true;
         g.module_mode = true;
         g.contents.clear();
-        let n = g.rng.range(4, items_per_module);
-        let nested = usize::from(g.rng.chance(60));
+        g.risk = Risk::default();
+        let n = g.range(4, items_per_module);
+        let nested = usize::from(g.chance(60));
         let body = g.gen_module_body(std::slice::from_ref(&name), true, n, nested);
         g.no_self = false;
         g.module_mode = false;
         let attr = g.attr(id, true);
         let module = format!("{}pub mod {} {{\n{}\n}}\n", attr, name, body);
         lib += &module;
-        let strict = g.rng.chance(25);
+        let want_strict = g.chance(25);
+        let strict = want_strict && g.strict_ok();
         let contents = std::mem::take(&mut g.contents);
         g.items.push(Item {
             id,
@@ -2675,6 +3140,125 @@ pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Feat
         items,
         referrer_lines,
     }
+}
+
+/// Whether the where predicate `pred` may name a type that the Leaker leaks: a name that is not
+/// from `::core`, a primitive or a generic parameter (`params`). A relative path is, and an
+/// absolute path of another crate is an optional entry that a strict Referrer replaces.
+fn names_leakable(pred: &str, params: &[String]) -> bool {
+    const KNOWN: &[&str] = &[
+        "core",
+        "ops",
+        "Fn",
+        "FnMut",
+        "FnOnce",
+        "fmt",
+        "Debug",
+        "convert",
+        "Into",
+        "AsRef",
+        "iter",
+        "Iterator",
+        "Item",
+        "clone",
+        "Clone",
+        "default",
+        "Default",
+        "marker",
+        "Sized",
+        "Send",
+        "PhantomData",
+        "option",
+        "Option",
+        "result",
+        "Result",
+        "any",
+        "Any",
+        "Self",
+        "for",
+        "dyn",
+        "fn",
+        "unsafe",
+        "extern",
+        "mut",
+        "const",
+        "str",
+        "C",
+        "static",
+        "true",
+        "false",
+    ];
+    let chars: Vec<char> = pred.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if !(chars[i].is_alphanumeric() || chars[i] == '_') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        let word: String = chars[start..i].iter().collect();
+        // A lifetime, a number, a name of the item's own, an associated type (`A0`).
+        let lifetime = start > 0 && chars[start - 1] == '\'';
+        let number = word.chars().next().unwrap().is_ascii_digit();
+        let assoc = word.len() == 2 && word.starts_with('A');
+        if !(lifetime
+            || number
+            || assoc
+            || KNOWN.contains(&word.as_str())
+            || PRIMS.contains(&word.as_str())
+            || params.contains(&word))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the predicate `pred` names the `Item` of the parameter `x` (`x::Item`).
+fn names_item(pred: &str, x: &str) -> bool {
+    pred.contains(&format!("{}::Item", x))
+        || pred.contains(&format!("<{} as ::core::iter::Iterator>::Item", x))
+        || pred.contains(&format!("<{} as Iterator>::Item", x))
+}
+
+/// Whether the predicate `pred` equates the `Item` of the parameter `x` to a type.
+fn binds_item(pred: &str, x: &str) -> bool {
+    pred.starts_with(&format!("{}: ::core::iter::Iterator<Item = ", x))
+}
+
+/// Whether `text` has `name` as a word (an identifier).
+fn has_word(text: &str, name: &str) -> bool {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|word| word == name)
+}
+
+/// Drops the predicates that use a generic whose bound names `Self` (`X: Fn(&Self) -> u8`): the
+/// bound itself stays.
+fn drop_self_bound_cycles(preds: &mut Vec<String>, params: &[String]) {
+    let bound_of = |pred: &str| -> Option<String> {
+        let (bounded, bounds) = pred.split_once(": ")?;
+        (params.iter().any(|p| p == bounded) && has_word(bounds, "Self"))
+            .then(|| bounded.to_string())
+    };
+    let cyclic: Vec<String> = preds.iter().filter_map(|p| bound_of(p)).collect();
+    if cyclic.is_empty() {
+        return;
+    }
+    preds.retain(|p| bound_of(p).is_some() || !cyclic.iter().any(|x| has_word(p, x)));
+}
+
+/// Whether `text` names a lifetime other than `'static`.
+fn names_lifetime(text: &str) -> bool {
+    text.match_indices('\'').any(|(at, _)| {
+        let name: String = text[at + 1..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        !name.is_empty() && name != "static"
+    })
 }
 
 /// Whether the predicate `pred` names `Self` in a bound or in a bounded type that is not `Self`.
