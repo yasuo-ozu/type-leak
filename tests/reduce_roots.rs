@@ -982,8 +982,10 @@ fn test_reduce_roots_path_with_a_lifetime_the_copy_would_leave_unconstrained() {
     let mut leaker = Leaker::new();
     enter_function(&mut leaker, &item.sig).unwrap();
     assert_eq!(leaker.finish().iter().count(), 1);
-    // As local generics it is checked, in a method, in the function nested in a scope and in one
-    // of a module.
+    // As local generics it is checked in a method of a trait or of an impl of a trait (a method
+    // that the walk reaches alone may be one). A function nested in a scope or in a module, and a
+    // method of an inherent impl, have no signature to differ from, so the copy compiles with
+    // `'b` early-bound (F22).
     let err = Leaker::new()
         .enter_impl(&Generics::default(), &parse_quote!(::p::W), true, |view| {
             let sig = &item.sig;
@@ -991,17 +993,36 @@ fn test_reduce_roots_path_with_a_lifetime_the_copy_would_leave_unconstrained() {
         })
         .unwrap_err();
     assert!(syn::Error::from(err).to_string().contains("E0195"));
+    let sig = &item.sig;
+    let of_trait: ItemImpl = parse_quote! { impl ::p::Tr for ::p::W { #sig { loop {} } } };
     let err = Leaker::new()
         .enter_generics(&Generics::default(), |view| {
-            view.visit_item(&Item::Fn(item.clone()))
+            view.visit_item(&Item::Impl(of_trait.clone()))
         })
         .unwrap_err();
     assert!(syn::Error::from(err).to_string().contains("E0195"));
+    let inherent: ItemImpl = parse_quote! { impl ::p::W { #sig { loop {} } } };
+    let mut leaker = Leaker::new();
+    leaker
+        .enter_generics(&Generics::default(), |view| {
+            view.visit_item(&Item::Impl(inherent.clone()))
+        })
+        .unwrap();
+    // The self type (an external path) and the path.
+    assert_eq!(leaker.finish().iter().count(), 2);
+    let mut leaker = Leaker::new();
+    leaker
+        .enter_generics(&Generics::default(), |view| {
+            view.visit_item(&Item::Fn(item.clone()))
+        })
+        .unwrap();
+    assert_eq!(leaker.finish().iter().count(), 1);
     let item: ItemMod = parse_quote! {
         mod m { fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () { loop {} } }
     };
-    let err = Leaker::new().intern_mod(&item).err().unwrap();
-    assert!(syn::Error::from(err).to_string().contains("E0195"));
+    let mut leaker = Leaker::new();
+    leaker.intern_mod(&item).unwrap();
+    assert_eq!(leaker.finish().iter().count(), 1);
 }
 
 /// The signature of the trait, for the messages.
@@ -1256,7 +1277,8 @@ fn test_reduce_roots_reference_with_a_lifetime_the_copy_would_leave_unconstraine
         trait Tr<'a> { fn f(&self, x: &'a dyn RelTr) -> &'a (); }
     });
     assert_eq!(leaked, [entry(parse_quote!(&'a dyn RelTr), "< 'a >")]);
-    // A method is checked, the function which is the analyzed item is not (see paths).
+    // A method of a trait or of an impl of a trait is checked, the function which is the analyzed
+    // item and a function of a module are not, nor a method of an inherent impl (see paths, F22).
     let item: ItemFn = parse_quote! { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } };
     let mut leaker = Leaker::new();
     enter_function(&mut leaker, &item.sig).unwrap();
@@ -1271,8 +1293,15 @@ fn test_reduce_roots_reference_with_a_lifetime_the_copy_would_leave_unconstraine
     let item: ItemMod = parse_quote! {
         mod m { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } }
     };
-    let err = Leaker::new().intern_mod(&item).err().unwrap();
-    assert!(syn::Error::from(err).to_string().contains("E0195"));
+    let mut leaker = Leaker::new();
+    leaker.intern_mod(&item).unwrap();
+    assert_eq!(leaker.finish().iter().count(), 1);
+    let item: ItemImpl =
+        parse_quote! { impl ::p::W { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } } };
+    let mut leaker = Leaker::new();
+    leaker.intern_impl(&item, true).unwrap();
+    // The self type and the reference.
+    assert_eq!(leaker.finish().iter().count(), 2);
 }
 
 #[test]

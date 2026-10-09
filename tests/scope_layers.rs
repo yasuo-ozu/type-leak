@@ -616,12 +616,18 @@ fn a_scope_of_an_item_or_a_module_adds_no_scope_of_its_own() {
     // A function which is the analyzed item is visited in the scope of its generics (`as_item()`),
     // whose generics are those of the Leaker if it is the outermost one: a module has none of its
     // own, and an item is the scope of its generics. The same function nested in a scope has local
-    // generics (`nested()`).
+    // generics (`nested()`). It is a method of a trait there: the copy of a function item may have
+    // `'b` early-bound, and only that of a method is an error for a lifetime that no argument
+    // constrains (E0195, F22), which shows that `'b` is local.
     let sig: Signature = parse_quote!(fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b ());
     let plain: Signature = parse_quote!(fn g(x: ::p::W<dyn RelTr>));
     let as_item = |v: &mut View<'_>, sig: &Signature| visit_function(v, sig);
     let nested = |v: &mut View<'_>, sig: &Signature| {
-        v.visit_item(&parse_quote!(#sig { loop {} }));
+        v.visit_item(&parse_quote!(
+            trait Nested {
+                #sig;
+            }
+        ));
     };
     let b: Generics = parse_quote!(<'b>);
     let none = Generics::default();

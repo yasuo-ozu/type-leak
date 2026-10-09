@@ -24,7 +24,9 @@ mod forward;
 ///   lifetime that the copy would leave unconstrained (E0195, see [Method
 ///   lifetimes](crate#method-lifetimes)), and for an elided output lifetime that the copy could
 ///   not resolve (E0106, see [Elided lifetimes](crate#elided-lifetimes)). Walking a trait or an
-///   impl reaches it for each method.
+///   impl reaches it for each method. The first is not reported for the methods of an inherent
+///   impl that the walk is in, whose signature no trait declares; a signature visited alone may be
+///   a trait's, so it is reported.
 /// - `Visit::visit_path(view, &path)` at the root, outside a type, analyzes only the arguments of
 ///   the path and does not check the path itself, which is resolved elsewhere. To analyze a trait
 ///   bound with its root checked, use [`View::visit_type_param_bound()`]: the path of the trait

@@ -29,7 +29,8 @@ pub enum NotInternableError {
     /// type (an impl, a struct, an enum or a union), which the Repeater's impl cannot write
     /// ("`Self::A` cannot be written in the impl of the Repeater"). A type leaked as a whole that
     /// names a lifetime of a method which the copy would leave unconstrained (`Wrap<'x>` in
-    /// `fn f<'x>(&self, a: Wrap<'x>) -> &'x u8`) has a note on E0195
+    /// `fn f<'x>(&self, a: Wrap<'x>) -> &'x u8`) has a note on E0195, for a method of a trait or of
+    /// an impl of a trait, not for a free function or a method of an inherent impl
     /// ([Method lifetimes](crate#method-lifetimes)). Also a type in a bound or where predicate that
     /// the copy cannot write through the
     /// Repeater, as rustc cannot prove a bound of its generics that names a leaked type: its

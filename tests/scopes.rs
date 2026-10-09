@@ -2101,17 +2101,9 @@ fn the_generics_of_a_method_are_local_and_checked_for_e0195() {
     // The same signature as a method: the lifetime is local, which the Repeater's copy would turn
     // into an early-bound one where the trait's is late-bound (E0195).
     let sig: Signature = parse_quote!(fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b ());
-    for scope in 0..4 {
+    for scope in 1..5 {
         let mut leaker = Leaker::new();
         let result = match scope {
-            // A function nested in generics (it is no method, but its generics are local too).
-            0 => leaker.enter_generics(&Generics::default(), |view| {
-                view.visit_item(&parse_quote!(
-                    fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () {
-                        loop {}
-                    }
-                ))
-            }),
             1 => leaker.enter_impl(&Generics::default(), &parse_quote!(::p::W), true, |view| {
                 let method: ImplItemFn = parse_quote!(
                     fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () {
@@ -2127,8 +2119,18 @@ fn the_generics_of_a_method_are_local_and_checked_for_e0195() {
                 view.visit_trait_item_fn(&method)
             }),
             // The signature alone is the one of a method.
-            _ => leaker.enter_trait(&ident("Tr"), &Generics::default(), true, |view| {
+            3 => leaker.enter_trait(&ident("Tr"), &Generics::default(), true, |view| {
                 view.visit_signature(&sig)
+            }),
+            // A method of an impl of a trait, nested in generics.
+            _ => leaker.enter_generics(&Generics::default(), |view| {
+                view.visit_item(&parse_quote!(
+                    impl ::p::Tr for ::p::W {
+                        fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () {
+                            loop {}
+                        }
+                    }
+                ))
             }),
         };
         let err = result.unwrap_err();
@@ -2138,6 +2140,33 @@ fn the_generics_of_a_method_are_local_and_checked_for_e0195() {
             scope
         );
     }
+    // A function nested in generics, and a method of an inherent impl, are no methods of a trait:
+    // nothing to differ from (F22), but their generics are local too.
+    let mut leaker = Leaker::new();
+    leaker
+        .enter_generics(&Generics::default(), |view| {
+            view.visit_item(&parse_quote!(
+                fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () {
+                    loop {}
+                }
+            ))
+        })
+        .unwrap();
+    assert_eq!(leaker.finish().iter().count(), 1);
+    let mut leaker = Leaker::new();
+    leaker
+        .enter_generics(&Generics::default(), |view| {
+            view.visit_item(&parse_quote!(
+                impl ::p::W {
+                    fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () {
+                        loop {}
+                    }
+                }
+            ))
+        })
+        .unwrap();
+    // The self type and the path.
+    assert_eq!(leaker.finish().iter().count(), 2);
     // Generics around do not declare those of the signature, whichever they are.
     let mut leaker = Leaker::new();
     let result = leaker.enter_generics(&parse_quote!(<'a>), |view| view.visit_signature(&sig));

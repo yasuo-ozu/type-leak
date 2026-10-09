@@ -45,7 +45,7 @@
 //!   elided signature where `Self` adds lifetimes to it). `alias_item` (F26, a limitation) is a
 //!   known failure that the generator does not make by default: with it, or `all`, the test fails
 //!   with the reproduction of that finding (E0277).
-//!   The other findings of `tests/findings.rs` that are not fixed (F22: the Leaker rejects
+//!   The other findings of `tests/findings.rs` (F22 to F24: the Leaker rejected
 //!   what compiles, F29, F31, F32) are not features: a rejection is counted as success, and the
 //!   test cannot show a toolchain or a lint.
 //!

@@ -86,9 +86,11 @@ pub struct Features {
     /// the predicate `(&fn()): 'y`, parenthesized because rustc reads `&fn(): 'y` as the start of
     /// a return type (F9, fixed: on by default).
     pub fn_pointer_self: bool,
-    /// A leaked path (`Wrap<'x>`) that names a lifetime of a method which another argument does
-    /// not keep, with the lifetime in the return type: E0195 in the impl of the Referrer, so
-    /// type-leak rejects it (on by default, F7).
+    /// A leaked path (`Wrap<'x>`) that names a lifetime of a method of a trait which another
+    /// argument does not keep, with the lifetime in the return type: E0195 in the impl of the
+    /// Referrer, so type-leak rejects it (on by default, F7). A free function and a method of an
+    /// inherent impl have no trait signature to differ from, so they have such paths whether it
+    /// is on or not (F22).
     pub method_lifetime_paths: bool,
     /// A path relative to the crate (`crate::base::B1<R0>`) in a type of a module analyzed as a
     /// whole that mentions an item of the module: the entry is keyed by the module (on by default,
@@ -415,8 +417,12 @@ struct Scope {
     adt_self: bool,
     /// The outlives bounds of the type parameters in a field are inferred by rustc.
     infer: bool,
-    /// The lifetimes of a method: only references may use them.
+    /// The lifetimes of a method: only references may use them, unless `method_paths`.
     ref_only: Vec<String>,
+    /// The method may name its lifetimes in leaked paths and trait objects: the feature
+    /// `method_lifetime_paths`, or a method that no trait declares (a free function, a method of
+    /// an inherent impl), where the copy compiles with the lifetime early-bound (F22).
+    method_paths: bool,
     /// `(parameter, "iter" | "fn")`: a parameter has one `Iterator` and one `Fn` bound at most,
     /// or the bounds conflict.
     bounded: Vec<(String, &'static str)>,
@@ -1241,14 +1247,15 @@ impl Gen {
 
     /// A lifetime to use in `sc`, or `None` if the type must not use one.
     ///
-    /// `for_ref`: the lifetime of a reference. The lifetimes of a method are used by references
-    /// only: a leaked path or trait object that names one gives a method that does not match the
-    /// trait in the Referrer's crate (E0195, `method_lifetime_paths`).
+    /// `for_ref`: the lifetime of a reference. The lifetimes of a method of a trait are used by
+    /// references only: a leaked path or trait object that names one gives a method that does not
+    /// match the trait in the Referrer's crate (E0195, `method_lifetime_paths`). Those of a free
+    /// function and of a method of an inherent impl may be used anywhere (F22).
     fn lifetime(&mut self, sc: &Scope, c: Con, for_ref: bool) -> String {
         let pool: Vec<&String> = sc
             .lifetimes
             .iter()
-            .filter(|l| for_ref || self.features.method_lifetime_paths || !sc.ref_only.contains(*l))
+            .filter(|l| for_ref || sc.method_paths || !sc.ref_only.contains(*l))
             .collect();
         if c.closed || c.no_params || c.no_lifetimes || pool.is_empty() || self.chance(15) {
             "'static".to_string()
@@ -2158,7 +2165,7 @@ impl Gen {
             ty.lts.insert(lt);
             return ty;
         }
-        if self.features.method_lifetime_paths || sc.ref_only.is_empty() {
+        if sc.method_paths || sc.ref_only.is_empty() {
             return self.ty(sc, Con::sized(), 0);
         }
         let mut inner = sc.clone();
@@ -2180,6 +2187,7 @@ impl Gen {
         let sk = self.skeleton(Level::Method, outer, Bounds::default());
         let mut sc = sk.scope(outer);
         sc.ref_only.extend(sk.lifetimes.iter().cloned());
+        sc.method_paths = self.features.method_lifetime_paths || !in_trait;
         // The receiver.
         let has_self = outer.self_kind != SelfKind::No;
         let typed_self_ok = !self.no_self && has_self && !outer.adt_self;
@@ -2271,6 +2279,30 @@ impl Gen {
             if let (Some(holder), false) = (holder, heads.is_empty()) {
                 params.push(format!("a{}: {}", n, holder));
                 ret = format!(" -> {}<{}>", self.pick(&heads), l);
+            }
+        }
+        // A free function or a method of an inherent impl has no trait signature to differ from,
+        // so a leaked path that is the only argument to name a lifetime of the method, with the
+        // lifetime in the return type, is accepted and its copy compiles, with the lifetime
+        // early-bound (F22). It is made often, as the random types rarely make it. In a trait it
+        // is E0195 (`method_lifetime_paths`). It is decided by the hash of the state and of the
+        // name, which draws nothing: the other choices are the same as without it.
+        if !in_trait && !sk.lifetimes.is_empty() {
+            let mut state = self.rng.clone();
+            state.write(name.as_bytes());
+            let draw = state.finish();
+            let heads: Vec<String> = self
+                .env
+                .heads
+                .iter()
+                .filter(|head| head.shape == Shape::LOnly)
+                .map(|head| head.name.clone())
+                .collect();
+            if draw % 5 == 0 && !heads.is_empty() {
+                let l = sk.lifetimes[0].clone();
+                let head = &heads[(draw / 5) as usize % heads.len()];
+                params.push(format!("af: {}<{}>", head, l));
+                ret = format!(" -> &{} u8", l);
             }
         }
         let mut sk = sk;

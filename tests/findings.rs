@@ -29,7 +29,7 @@
 //! | `f19_impl_self_in_bound_of_entry_in_predicate` | an entry in a predicate has a bound of its context that names `Self`, in an impl whose self type is leaked | fixed |
 //! | `f20_trait_assoc_in_bound_of_entry_in_predicate` | an entry in a predicate has a bound of its context that names `Self::A`, in a trait | fixed |
 //! | `f21_iterator_item_in_bound_of_entry_in_item_binding` | an entry in `T: Iterator<Item = ..>` has a bound of its context that names the `Item` | fixed |
-//! | `f22_method_lifetime_in_free_function_and_inherent_method` | the E0195 check of F7 also rejects a free function and an inherent method | bug |
+//! | `f22_method_lifetime_in_free_function_and_inherent_method` | the E0195 check of F7 also rejects a free function and an inherent method | fixed |
 //! | `f23_self_in_elided_signature_where_referrer_can_rewrite` | `Self` in an elided signature is rejected in a bound and with `allow_self = false`, where the Referrer could write `for<'e>` | fixed |
 //! | `f24_self_in_predicate_with_leaked_bound_of_unused_generic` | a bare `Self` in a predicate is rejected for a leaked bound of a generic that no entry of the self type uses | fixed |
 //! | `f25_supertrait_item_in_bound_of_entry_in_predicate` | a supertrait fixes the `Item` that a bound of an entry's generic names | fixed |
@@ -55,9 +55,12 @@
 //! the one-line reason of each failure is in its `#[ignore]` message. The features of the fixed
 //! findings are on by default in the property test: the Leaker now rejects what they generate (the
 //! rejections are counted), or rewrites it. The feature of F26 is off, as for the other
-//! findings that are not fixed. F22 is a rejection of what compiles: a rejection is
+//! findings that are not fixed. F22 to F24 were rejections of what compiles: a rejection is
 //! counted as a success by the property test, which cannot show them (nor F29, F31 and F32, which
 //! are about a toolchain, a lint, or an error in the Leaker's crate that the Leaker cannot see).
+//! The fix of F22 is checked by the property test the other way: the free functions and inherent
+//! methods that it generates with a method lifetime in a leaked path are accepted, and their copies
+//! must compile.
 //! The tests of F22 to F32 were written from rustc's verdict on a hand-written Leaker's crate (the
 //! trait or item, its Repeater's impls) and Referrer's crate (the copy, and for a trait an impl for a
 //! host type), on stable (1.98.1) and nightly (1.100.0), which each doc says.
@@ -3352,16 +3355,19 @@ fn f21_iterator_item_in_bound_of_entry_in_item_binding() {
 
 // ── F22 ──────────────────────────────────────────────────────────────────────
 
-/// F22 (bug): the check of F7 for E0195 also rejects a free function and an inherent method.
+/// F22 (fixed): the check of F7 for E0195 also rejected a free function and an inherent method.
 ///
 /// Trigger: `mod m { pub fn f<'x>(a: crate::Wrap<'x>) -> &'x u8 { .. } }` analyzed by
 /// `intern_mod()`, and `impl ::p::W { fn f<'x>(&self, a: Wrap<'x>) -> &'x u8 { .. } }`. The note is
 /// that of F7: `'x` is late-bound in the original, and the copy has it only in the projection
 /// `<() as Repeater<(&'x (),), ..>>::Type`, so it is early-bound, "and rustc rejects the
 /// implementation of a method whose lifetime is early-bound where the trait's is late-bound". That
-/// is the whole reason (the check is `check_leaked_lifetimes()`, which `with_signature()` runs for
+/// is the whole reason (the check is `check_leaked_lifetimes()`, which `with_signature()` ran for
 /// every signature that is not the analyzed item): a free function and an inherent method have no
-/// trait signature to differ from, so the copy compiles.
+/// trait signature to differ from, so the copy compiles. The same holds for a trait object that
+/// takes the lifetime from the reference around it (`&'x dyn RelTrait`): the reference is leaked
+/// whole, with the lifetime in the Repeater's arguments, as it is where another argument keeps the
+/// lifetime.
 ///
 /// Checked with rustc (stable 1.98.1 and nightly 1.100.0), with a Leaker's crate that has `struct
 /// Wrap<'a>` and `impl<'a, __S: ?Sized> Repeater<(&'a (),), 0, 0> for __S { type Type = Wrap<'a>; }`,
@@ -3385,13 +3391,16 @@ fn f21_iterator_item_in_bound_of_entry_in_item_binding() {
 /// every projection the copy writes (`Self`, `Self::A`, any entry), not what the check is for, and
 /// the property test does not make it.
 ///
-/// The assertion: the module, and the inherent impl (also in a module), are accepted. The fix
-/// is to run the check only for a method of a trait or of an impl of a trait.
+/// The assertion: the module, and the inherent impl (also in a module), are accepted. The fix runs
+/// the check only for a method of a trait or of an impl of a trait (rustc compares the signature of
+/// a method with the trait's in no other case, which was checked with a method of a generic type
+/// and an inherent impl in a module too), and not for a function item or a method of an inherent
+/// impl. A signature that the walk of a `View` reaches outside an impl (`Visit::visit_signature()`
+/// alone) is checked, as the Leaker does not know what it is for.
 #[test]
-#[ignore = "the E0195 check also rejects a free function and an inherent method, whose copies compile"]
 fn f22_method_lifetime_in_free_function_and_inherent_method() {
     // The controls: the copy of a trait, and of an impl of a trait, has the E0195 of F7.
-    let rejected: Vec<Item> = vec![
+    let mut rejected: Vec<Item> = vec![
         parse_quote!(
             pub trait Tr {
                 fn f<'x>(&self, a: Wrap<'x>) -> &'x u8;
@@ -3414,6 +3423,11 @@ fn f22_method_lifetime_in_free_function_and_inherent_method() {
             }
         ),
     ];
+    rejected.push(parse_quote!(
+        pub trait Tr {
+            fn f<'x>(&self, a: &'x dyn RelTrait) -> &'x u8;
+        }
+    ));
     for item in &rejected {
         let err = intern(&mut f13_leaker(), item).unwrap_err();
         let note = err.note().unwrap();
@@ -3454,6 +3468,21 @@ fn f22_method_lifetime_in_free_function_and_inherent_method() {
                 }
             }
         ),
+        // A trait object that takes the lifetime from the reference.
+        parse_quote!(
+            pub mod m {
+                pub fn f<'x>(a: &'x dyn crate::RelTrait) -> &'x u8 {
+                    loop {}
+                }
+            }
+        ),
+        parse_quote!(
+            impl<T> ::p::W<T> {
+                fn f<'x>(&self, a: &'x dyn RelTrait, b: Wrap<'x>) -> Wrap<'x> {
+                    loop {}
+                }
+            }
+        ),
     ];
     for item in &accepted {
         if let Err(err) = intern(&mut f13_leaker(), item) {
@@ -3465,6 +3494,36 @@ fn f22_method_lifetime_in_free_function_and_inherent_method() {
             );
         }
     }
+    // The walk of a `View` is the same: the methods of an inherent impl are not checked, those of
+    // a trait impl are, and a signature visited alone may be a trait's, so it is.
+    let method: Signature = parse_quote!(fn f<'x>(&self, a: Wrap<'x>) -> &'x u8);
+    let inherent: ItemImpl = parse_quote!(
+        impl ::p::W {
+            fn f<'x>(&self, a: Wrap<'x>) -> &'x u8 {
+                loop {}
+            }
+        }
+    );
+    let of_trait: ItemImpl = parse_quote!(
+        impl ::p::Tr for ::p::W {
+            fn f<'x>(&self, a: Wrap<'x>) -> &'x u8 {
+                loop {}
+            }
+        }
+    );
+    let nested = |item: &ItemImpl| {
+        f13_leaker().enter_mod("m", [], |view| view.visit_item(&Item::Impl(item.clone())))
+    };
+    nested(&inherent).unwrap();
+    assert!(nested(&of_trait)
+        .unwrap_err()
+        .note()
+        .unwrap()
+        .contains("(E0195)"));
+    let err = f13_leaker()
+        .enter_generics(&Generics::default(), |view| view.visit_signature(&method))
+        .unwrap_err();
+    assert!(err.note().unwrap().contains("(E0195)"));
 }
 
 // ── F23 ──────────────────────────────────────────────────────────────────────

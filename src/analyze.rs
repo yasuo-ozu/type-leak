@@ -470,6 +470,7 @@ struct ScopeMark {
     self_depth: usize,
     allow_self: bool,
     self_type_walk: Option<bool>,
+    inherent_impl: bool,
     not_optional: usize,
     env_errors: usize,
     module: Option<ContextId>,
@@ -575,8 +576,12 @@ pub(crate) struct AnalyzeVisitor {
     /// A referent or path argument whose lifetime is a generic. A trait object there defaults to
     /// it, and would default to `'static` if leaked alone. What is inside it is not affected.
     inherits: Option<Inherits>,
-    /// The signatures being visited, innermost last.
+    /// The signatures being visited, innermost last. Only those that rustc compares with a trait's
+    /// have one (see [`AnalyzeVisitor::with_signature()`]).
     signatures: Vec<SignatureWalk>,
+    /// The methods being visited are those of an inherent impl: no trait declares their signature,
+    /// so the copy cannot differ from it (E0195). Anywhere else, a method may be one of a trait.
+    inherent_impl: bool,
     /// The depth of the type owning the expression (array length, const argument) being visited.
     /// Types in it are not leaked alone: the copy would put an associated type path in a constant.
     expr_owner: Option<usize>,
@@ -671,6 +676,7 @@ impl AnalyzeVisitor {
             ambiguous_arg: false,
             inherits: None,
             signatures: Vec::new(),
+            inherent_impl: false,
             expr_owner: None,
             in_receiver: false,
             enclosing: Enclosing::default(),
@@ -978,6 +984,7 @@ impl AnalyzeVisitor {
             self_depth: self.self_depth,
             allow_self: self.allow_self,
             self_type_walk: self.self_type_walk,
+            inherent_impl: self.inherent_impl,
             not_optional: self.not_optional.len(),
             env_errors: self.env_errors.len(),
             module: None,
@@ -1046,6 +1053,7 @@ impl AnalyzeVisitor {
         self.self_depth = mark.self_depth;
         self.allow_self = mark.allow_self;
         self.self_type_walk = mark.self_type_walk;
+        self.inherent_impl = mark.inherent_impl;
         if rollback {
             self.frame.effects.truncate(mark.effects);
             self.self_errors.truncate(mark.self_errors);
@@ -2019,9 +2027,11 @@ impl AnalyzeVisitor {
         self.visit_type(&i.self_ty);
         let end = self.frame.effects.len();
         self.cut_self_cycles(start, &i.generics);
+        let inherent = std::mem::replace(&mut self.inherent_impl, i.trait_.is_none());
         for item in &i.items {
             self.visit_impl_item(item);
         }
+        self.inherent_impl = inherent;
         if self.self_type_walk == Some(true) {
             self.block_unstable_self_types(start, end);
         }
@@ -2272,13 +2282,26 @@ impl AnalyzeVisitor {
         self.visit_visibility(vis);
     }
 
-    fn with_signature(&mut self, sig: &Signature, item: bool, f: impl FnOnce(&mut Self)) {
-        let local = !item || self.item_depth > 0;
-        self.with_risky(sig, self.scopes.len(), local, |visitor| {
+    /// Runs `f`, which visits `sig`. `item`: it is that of a function item, whose generics are the
+    /// item's, and not those of a method. `compared`: rustc compares it with a signature that the
+    /// copy cannot change, so the lifetimes that the copy would leave unconstrained are an error
+    /// (E0195, see [Method lifetimes](crate#method-lifetimes)). That is a method of a trait, which
+    /// the impls of the original are checked against, and one of an impl of a trait, which is
+    /// checked against the trait. A function item and a method of an inherent impl have no such
+    /// signature, so the copy may have the lifetime early-bound where the original has it
+    /// late-bound (F22).
+    fn with_signature(
+        &mut self,
+        sig: &Signature,
+        item: bool,
+        compared: bool,
+        f: impl FnOnce(&mut Self),
+    ) {
+        self.with_risky(sig, self.scopes.len(), compared, |visitor| {
             // The generics are in scope while the lifetimes are checked, which needs them.
             let walk = |visitor: &mut Self| {
                 visitor.with_arguments_of(sig, f);
-                if local {
+                if compared {
                     visitor.check_leaked_lifetimes(sig);
                 }
             };
@@ -2306,8 +2329,14 @@ impl AnalyzeVisitor {
         self.signature = outer;
     }
 
-    fn with_risky(&mut self, sig: &Signature, at: usize, local: bool, f: impl FnOnce(&mut Self)) {
-        if local {
+    fn with_risky(
+        &mut self,
+        sig: &Signature,
+        at: usize,
+        compared: bool,
+        f: impl FnOnce(&mut Self),
+    ) {
+        if compared {
             let risky = self.unconstrained_lifetimes(sig);
             self.signatures.push(SignatureWalk {
                 at,
@@ -2321,7 +2350,7 @@ impl AnalyzeVisitor {
             });
         }
         f(self);
-        if local {
+        if compared {
             self.signatures.pop();
         }
     }
@@ -2894,10 +2923,14 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
         syn::visit::visit_trait_item_fn(self, &i)
     }
 
-    /// The signature of a method: its generics are local, and it is checked for E0195. A function
-    /// item declares its own generics instead (`visit_item_fn()`).
+    /// The signature of a method: its generics are local, and it is checked for E0195 unless the
+    /// method is that of an inherent impl. A function item declares its own generics instead
+    /// (`visit_item_fn()`).
     fn visit_signature(&mut self, i: &Signature) {
-        self.with_signature(i, false, |visitor| syn::visit::visit_signature(visitor, i))
+        let compared = !self.inherent_impl;
+        self.with_signature(i, false, compared, |visitor| {
+            syn::visit::visit_signature(visitor, i)
+        })
     }
 
     fn visit_trait_item_type(&mut self, i: &TraitItemType) {
@@ -3001,7 +3034,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
     }
 
     fn visit_item_fn(&mut self, i: &ItemFn) {
-        self.with_signature(&i.sig, true, |visitor| {
+        self.with_signature(&i.sig, true, false, |visitor| {
             visitor.visit_head(&i.attrs, &i.vis);
             syn::visit::visit_signature(visitor, &i.sig);
         });
