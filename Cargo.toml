@@ -13,13 +13,14 @@ categories = [
   "rust-patterns",
 ]
 license = "MIT"
-# The cross-crate, diagnostic and outlives tests depend on the test crates under tests/crates, which
-# are not published.
+# The cross-crate, diagnostic, outlives and property tests depend on the test crates under
+# tests/crates, which are not published.
 exclude = [
   "tests/crates",
   "tests/cross_crate.rs",
   "tests/diagnostic.rs",
   "tests/outlives.rs",
+  "tests/prop_cross_crate",
 ]
 
 [dependencies]

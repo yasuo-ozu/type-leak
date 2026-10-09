@@ -31,6 +31,8 @@
 //! leaker::m::MyTrait!(impl<const B: bool> MyTrait<B> for Wrapper<B> => 0);
 //! ```
 
+mod prop;
+
 use proc_macro2::{Punct, Spacing, Span, TokenStream, TokenTree};
 use std::collections::HashMap;
 use syn::parse::{Parse, ParseStream};
@@ -919,4 +921,40 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
             #methods
         }
     })
+}
+
+/// The Leaker's side of `tests/prop_cross_crate.rs`: analyzes the struct, enum, union, trait, impl
+/// or module it is put on (`#[prop_leak(id = 3, allow_self = true, prelude = false, allow = "::std")]`),
+/// and emits the Repeater's implementations, the witnesses of its type positions, and the exported
+/// macros `__tl_prop_<id>!` (for the Referrer's crate) and `__tl_report_<id>!`. See `prop.rs`.
+#[proc_macro_attribute]
+pub fn prop_leak(
+    attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    match prop::leak(attr.into(), item.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Like `prop_leak`, but leaves the item as it is: it builds the Leaker's crate without
+/// `type-leak`, to tell a bug of the generator from a bug of `type-leak`.
+#[proc_macro_attribute]
+pub fn prop_leak_noop(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    item
+}
+
+/// The Referrer's side of `tests/prop_cross_crate.rs`, invoked through the `macro_rules!` that
+/// `prop_leak` exports.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __prop_apply(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match prop::apply(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
 }
