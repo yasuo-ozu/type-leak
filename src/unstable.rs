@@ -16,6 +16,13 @@
 //!   it is. A bound of another trait may define it by a supertrait (`trait Tr:
 //!   Iterator<Item = u8>`), which the Leaker cannot read, so `T::Item` of a generic with such a
 //!   bound counts too.
+//!
+//! A where predicate that is not a bound of a generic (`Vec<T::Item>: Default`, `u8:
+//! Into<T::Item>`) is proved by an impl, so it names no unstable bound as far as a leaked type,
+//! `Self` or an associated type of an impl goes. It is not so for the `T::Item` that a predicate in
+//! scope defines (an enclosing item or a method equates it: `T: Iterator<Item = Rel<T>>`): rustc
+//! normalizes it with that predicate, which names the type whose impl needs the predicate, so the
+//! impl overflows (E0275) while it proves its own predicate.
 
 use crate::util::{ident_name, unwrap_type_group};
 use proc_macro2::TokenStream;
@@ -97,6 +104,9 @@ pub(crate) struct Projections<'a, F> {
     /// The `(bounded type, name)` of the equations `T: Tr<Name = ..>` in scope, and
     /// `(bounded type, ANY_NAME)` for a bound that may define any (see [`bindings()`]).
     bindings: &'a [(String, String)],
+    /// Only the associated types that an equation in scope defines count: not `Self::A`, and not
+    /// the projection of a type that an impl defines (see [`Projections::equated()`]).
+    equated_only: bool,
     pub(crate) found: Option<Why>,
 }
 
@@ -105,7 +115,19 @@ impl<'a, F: Fn(&str) -> bool> Projections<'a, F> {
         Self {
             is_param,
             bindings,
+            equated_only: false,
             found: None,
+        }
+    }
+
+    /// Like `new()`, for a type that rustc proves by an impl (the bounded type of a where
+    /// predicate, and the types of its bounds, if it is not a bound of a generic): the impl
+    /// normalizes `Self::A` and the projection of a type that an impl defines to what it needs,
+    /// and the projection of a generic only by the equation that a predicate in scope gives.
+    pub(crate) fn equated(is_param: F, bindings: &'a [(String, String)]) -> Self {
+        Self {
+            equated_only: true,
+            ..Self::new(is_param, bindings)
         }
     }
 
@@ -123,7 +145,7 @@ impl<'a, F: Fn(&str) -> bool> Projections<'a, F> {
                 }
                 let name = ident_name(&segments[1].ident);
                 if first.ident == "Self" {
-                    return Some(Why::SelfAssoc(shown()));
+                    return (!self.equated_only).then(|| Why::SelfAssoc(shown()));
                 }
                 if !(self.is_param)(&ident_name(&first.ident)) {
                     return None;
@@ -134,11 +156,11 @@ impl<'a, F: Fn(&str) -> bool> Projections<'a, F> {
                 let name = ident_name(&i.path.segments.iter().nth(qself.position)?.ident);
                 let ty = unwrap_type_group(&qself.ty);
                 if is_bare_self(ty) {
-                    return Some(Why::SelfAssoc(shown()));
+                    return (!self.equated_only).then(|| Why::SelfAssoc(shown()));
                 }
                 // The associated type of a type that impls define, not of a generic.
                 if !self.rooted_in_param(ty) {
-                    return Some(Why::Projection(shown()));
+                    return (!self.equated_only).then(|| Why::Projection(shown()));
                 }
                 (quote!(#ty).to_string(), name)
             }

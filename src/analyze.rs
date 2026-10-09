@@ -1595,9 +1595,11 @@ impl AnalyzeVisitor {
     /// predicate of the item does it, a bound as well as a where predicate, also the bound that
     /// names `ty` itself (`T: Tr<Wrap<T>>`). Types in fields and signatures are fine: they are
     /// normalized in the environment once it is built. So are bounds that are stable (`T:
-    /// Clone`), and predicates on a type that is not a generic, which an impl proves. The Leaker
-    /// cannot rewrite it, as the Repeater is the only link between the two crates, so it is an
-    /// error.
+    /// Clone`), and predicates on a type that is not a generic, which an impl proves, unless they
+    /// name an `Item` that a predicate in scope defines (`Vec<T::Item>: Default` next to `T:
+    /// Iterator<Item = Rel<T>>`: rustc normalizes the `Item` to the path that needs the
+    /// predicate, E0275). The Leaker cannot rewrite it, as the Repeater is the only link between
+    /// the two crates, so it is an error.
     ///
     fn env_cycle(&self, ty: &Type, context: &Context) -> Option<CheckResult> {
         match self.env_unstable_bound(context, false) {
@@ -1939,20 +1941,29 @@ impl AnalyzeVisitor {
             .where_clause
             .iter()
             .flat_map(|where_clause| &where_clause.predicates)
-            .filter(|predicate| needs_environment(predicate, context))
         {
+            let on_environment = needs_environment(predicate, context);
             // What the predicate bounds is not a bound of it: only the bounds are normalized for
             // the impl that needs them (`Self::A: Clone` is proved by an impl).
             let mut finder = Projections::new(&is_param, &bindings);
-            if let WherePredicate::Type(predicate) = predicate {
+            if let (true, WherePredicate::Type(predicate)) = (on_environment, predicate) {
                 for bound in &predicate.bounds {
                     finder.visit_type_param_bound(bound);
                 }
             }
+            let mut found = finder.found;
+            if found.is_none() {
+                // An impl proves the predicate, and normalizes the `Item` that a predicate in
+                // scope equates, wherever it is named: the bounded type, and the bounds of a
+                // predicate that is not on a generic.
+                let mut finder = Projections::equated(&is_param, &bindings);
+                finder.visit_where_predicate(predicate);
+                found = finder.found;
+            }
             let found = check(
                 quote!(#predicate),
-                finder.found,
-                where_predicate_mentions_self(predicate),
+                found,
+                on_environment && where_predicate_mentions_self(predicate),
             );
             if found.is_some() {
                 return found;

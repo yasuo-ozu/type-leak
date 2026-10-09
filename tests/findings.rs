@@ -40,6 +40,7 @@
 //! | `f30_implied_outlives_of_generic_projection_recorded_as_component` | `&'x T::Item` is recorded as `T: 'x`, which the copy cannot prove | fixed |
 //! | `f31_nested_signature_has_its_own_lifetimes` | a signature inside an input has its own lifetimes only for rustc 1.64 and later | limitation |
 //! | `f32_parentheses_only_where_rustc_needs_them` | a trait object with one bound is parenthesized in the encoding of a `?Sized` argument | fixed |
+//! | `f33_where_predicate_names_item_that_a_predicate_in_scope_defines` | a where predicate of an entry's context names an `Item` that a predicate of a method equates to a leaked type | fixed |
 //!
 //! The bugs that are not fixed (`bug` in the table) are `#[ignore]`d, as they fail today (a fixed
 //! one has no `#[ignore]`, and `fixed` in the table): run them with
@@ -61,7 +62,7 @@
 //! The fix of F22 is checked by the property test the other way: the free functions and inherent
 //! methods that it generates with a method lifetime in a leaked path are accepted, and their copies
 //! must compile.
-//! The tests of F22 to F32 were written from rustc's verdict on a hand-written Leaker's crate (the
+//! The tests of F22 to F33 were written from rustc's verdict on a hand-written Leaker's crate (the
 //! trait or item, its Repeater's impls) and Referrer's crate (the copy, and for a trait an impl for a
 //! host type), on stable (1.98.1) and nightly (1.100.0), which each doc says.
 //!
@@ -5145,5 +5146,309 @@ fn f32_parentheses_only_where_rustc_needs_them() {
             string(&encoded),
             bounds
         );
+    }
+}
+
+// ── F33 ──────────────────────────────────────────────────────────────────────
+
+/// F33: a where predicate of the context of an entry names the `Item` of an iterator, and a
+/// predicate of an inner item equates the `Item` to a leaked type.
+///
+/// Trigger: `trait Tr<T: Iterator> where Vec<T::Item>: Default { fn m(&self) where T: Iterator<Item
+/// = Rel<T>>; }` (also `impl<T: Iterator> ::p::W2<T, u8> where Vec<T::Item>: Default { fn m(&self)
+/// where T: Iterator<Item = Rel<T>> {} }`). The property test found it with `trait Tr18_1<T: Clone +
+/// Debug + Iterator> where R2<[T::Item; 3], B1<T>>: Default { fn m<U>(&self, a: U) where T:
+/// Fn(T::Item) -> u8, T: Iterator<Item = (J1<T>, u8)>; }` (seed 12, 60 cases, case 15, item 18, in a
+/// run whose random numbers a draw of the generator shifted: the shape is a rare one). The entry
+/// `Rel<T>` of the equation has the context `<T: Iterator> where Vec<T::Item>: Default`: a where
+/// predicate that names `T` goes with it, and the Repeater's impl is `impl<T: Iterator, __S: ?Sized>
+/// Repeater<(T,), ..> for __S where Vec<T::Item>: Default`. In the copy rustc proves that predicate
+/// when it normalizes the path `<() as Repeater<(T,), ..>>::Type` of the equation, so it
+/// normalizes `<T as Iterator>::Item`, which the equation defines by the path itself: E0275
+/// "overflow evaluating the requirement `<() as Repeater<(T,), 0, 0>>::Type == <T as
+/// Iterator>::Item`" (nightly says `<T as Iterator>::Item == _`). That is the cycle of F21 and F25,
+/// where the Repeater's impl needs a bound that names the `Item` (`T: Fn(T::Item)`); the check
+/// looked only at the bounds of a generic and of a predicate on a generic (`T: Fn(T::Item)`, `T:
+/// AsRef<T::Item>`). A predicate that is not on a generic (`Vec<T::Item>: Default`, `u8:
+/// Into<T::Item>`) is proved by an impl, which does not need the environment, so it was left out;
+/// and so was the bounded type of one on a generic (`T::Item: Clone`), which "is proved by an
+/// impl" too. Both name the `Item`, and rustc normalizes it with the predicate in scope.
+///
+/// Checked with rustc, stable 1.98.1 and nightly 1.100.0, with a Leaker's crate (`struct Rel<U>`,
+/// the Repeater's impl above, the original item) and a Referrer's crate (the copy: the impl for
+/// a type of the crate, the trait for a host type): the trait, the impl and the original item
+/// (`Tr18_1`) all give E0275 in the copy, and the Leaker's crate compiles. With `Item = u8`
+/// (nothing leaked) rustc compiles the same predicates (`Vec<T::Item>: Default`, `T::Item:
+/// Clone`), but not all of them: `Item = F` with `Vec<T::Item>: Clone` is E0277 "the trait bound
+/// `F: Clone` is not satisfied", and `Item = u8` with `T::Item: Into<T>` is E0277 "the trait bound
+/// `T: From<u8>` is not satisfied", as the environment has the predicate with the projection that
+/// rustc has not normalized yet, and the impl needs it normalized (F25). So a predicate that
+/// names an `Item` that is defined is unstable whatever the equation says, as a bound is.
+///
+/// What compiles: a rigid `Item` (nothing in scope defines it: `Rel<[T::Item; 3]>: Default`), a
+/// predicate and an equation that are both in the same where clause of a method (the context of
+/// `Rel<T>` has the generics of the item, not the predicates of the method), an equation to a type
+/// whose entry has no generics (`T: Iterator<Item = Rel<u8>>`), and one that names an entry of
+/// another generic (`T: Iterator<Item = Rel<X>>`, whose context is `<X>`). The assertions hold
+/// those accepted.
+///
+/// The price: the Leaker cannot tell that a predicate compiles. `T: Iterator<Item = u8>` with
+/// `Vec<T::Item>: Default`, `T: Iterator<Item = F>` with `Vec<T::Item>: Default`, and a generic
+/// with a bound of a trait that the Leaker cannot read (`T: ::p::WIter`, a supertrait may define the
+/// `Item`) with it compile, and are rejected, as `T: Fn(T::Item)` is in the same place (F21, F25).
+///
+/// The property test shows it with `TYPE_LEAK_PROP_FEATURES=item_predicate_cycle` (on by default
+/// since the fix; before it, three cases of seed 1 with 60 cases failed with E0275 in the Referrer's
+/// crate).
+///
+/// The assertion: if the Leaker accepts the item, no entry that a predicate of the copy names has
+/// a bound or predicate of its context that names an `Item`.
+///
+/// Fixed by looking at the whole predicate (`Projections::equated()`): the bounded type, and the
+/// bounds of a predicate that is not on a generic, count if they name a projection that a bound or
+/// predicate in scope defines (`T: Iterator<Item = ..>`, `T: ::p::Tr`, `F: Fn(..) -> ..`). `Self::A`
+/// and the projection of a type that an impl defines are not counted there: an impl proves those.
+#[test]
+fn f33_where_predicate_names_item_that_a_predicate_in_scope_defines() {
+    let items: Vec<Item> = vec![
+        // The finding of the property test.
+        parse_quote!(
+            pub trait Tr18_1<T: Clone + ::core::fmt::Debug + Iterator>
+            where
+                R2<[T::Item; 3], B1<T>>: Default,
+            {
+                fn m<U>(&self, a: U)
+                where
+                    T: Fn(T::Item) -> u8,
+                    T: Iterator<Item = (J1<T>, u8)>;
+            }
+        ),
+        parse_quote!(
+            pub trait Tr<T: Iterator>
+            where
+                Vec<T::Item>: Default,
+            {
+                fn m(&self)
+                where
+                    T: Iterator<Item = Rel<T>>;
+            }
+        ),
+        parse_quote!(
+            impl<T: Iterator> ::p::W2<T, u8>
+            where
+                Vec<T::Item>: Default,
+            {
+                fn m(&self)
+                where
+                    T: Iterator<Item = Rel<T>>,
+                {
+                }
+            }
+        ),
+        // The projection written as a qualified path, a bound of the predicate, a higher-ranked one.
+        parse_quote!(
+            pub trait Tr<T: Iterator>
+            where
+                Vec<<T as Iterator>::Item>: Default,
+            {
+                fn m(&self)
+                where
+                    T: Iterator<Item = Rel<T>>;
+            }
+        ),
+        parse_quote!(
+            pub trait Tr<T: Iterator>
+            where
+                u8: Into<T::Item>,
+            {
+                fn m(&self)
+                where
+                    T: Iterator<Item = Rel<T>>;
+            }
+        ),
+        parse_quote!(
+            pub trait Tr<T: Iterator>
+            where
+                for<'a> &'a [T::Item]: Default,
+            {
+                fn m(&self)
+                where
+                    T: Iterator<Item = Rel<T>>;
+            }
+        ),
+        // The projection is the bounded type of a predicate on a generic.
+        parse_quote!(
+            pub trait Tr<T: Iterator>
+            where
+                T::Item: Clone,
+            {
+                fn m(&self)
+                where
+                    T: Iterator<Item = Rel<T>>;
+            }
+        ),
+        // The equation is another one that an entry does not name (rustc: E0277).
+        parse_quote!(
+            pub trait Tr<T: Iterator<Item = F>, F>
+            where
+                Vec<T::Item>: Clone,
+            {
+                fn m(&self)
+                where
+                    Rel<T>: Default;
+            }
+        ),
+        parse_quote!(
+            pub trait Tr<T: Iterator<Item = u8>>
+            where
+                T::Item: Into<T>,
+            {
+                fn m(&self)
+                where
+                    Rel<T>: Default;
+            }
+        ),
+        // The equation is in a bound of the method, the predicate is in the trait.
+        parse_quote!(
+            pub trait Tr<T: Iterator>
+            where
+                Vec<T::Item>: Default,
+            {
+                fn m<X>(&self, a: X)
+                where
+                    T: Iterator<Item = (Rel<T>, X)>;
+            }
+        ),
+    ];
+    let accepted: Vec<Item> = vec![
+        // Both predicates are in the method: the context of `Rel<T>` has the generics of the trait.
+        parse_quote!(
+            pub trait Tr<T: Iterator> {
+                fn m(&self)
+                where
+                    Vec<T::Item>: Default,
+                    T: Iterator<Item = Rel<T>>;
+            }
+        ),
+        // Nothing defines the `Item`.
+        parse_quote!(
+            pub trait Tr<T: Iterator>
+            where
+                Rel<[T::Item; 3]>: Default,
+            {
+                fn m(&self);
+            }
+        ),
+        parse_quote!(
+            pub trait Tr<T: Iterator>
+            where
+                Vec<T::Item>: Default,
+            {
+                fn m(&self)
+                where
+                    Rel<T>: Default;
+            }
+        ),
+        // The entry of the equation has no generics, or uses another generic.
+        parse_quote!(
+            pub trait Tr<T: Iterator>
+            where
+                Vec<T::Item>: Default,
+            {
+                fn m(&self)
+                where
+                    T: Iterator<Item = Rel<u8>>;
+            }
+        ),
+        parse_quote!(
+            pub trait Tr<T: Iterator, X>
+            where
+                Vec<T::Item>: Default,
+            {
+                fn m(&self)
+                where
+                    T: Iterator<Item = Rel<X>>;
+            }
+        ),
+        // The equation is of a generic of the method, that the predicate of the trait does not name.
+        parse_quote!(
+            pub trait Tr<T: Iterator> {
+                fn m<U>(&self)
+                where
+                    U: Iterator<Item = Rel<T>>,
+                    Vec<U::Item>: Default;
+            }
+        ),
+        // The projection of a type that an impl defines is proved by that impl, whatever defines the
+        // `Item` of `T`.
+        parse_quote!(
+            pub trait Tr<T: Iterator>
+            where
+                Vec<(T, <Vec<T> as IntoIterator>::Item)>: Default,
+            {
+                fn m(&self)
+                where
+                    T: Iterator<Item = Rel<T>>;
+            }
+        ),
+    ];
+    let price: Vec<Item> = vec![
+        // `Item = u8` and `Item = F` compile with this predicate, and the Leaker does not tell.
+        parse_quote!(
+            pub trait Tr<T: Iterator<Item = u8>>
+            where
+                Vec<T::Item>: Default,
+            {
+                fn m(&self)
+                where
+                    Rel<T>: Default;
+            }
+        ),
+        parse_quote!(
+            pub trait Tr<T: Iterator<Item = F>, F>
+            where
+                Vec<T::Item>: Default,
+            {
+                fn m(&self)
+                where
+                    Rel<T>: Default;
+            }
+        ),
+        // A supertrait of the bound may define the `Item`.
+        parse_quote!(
+            pub trait Tr<T: ::p::WIter>
+            where
+                Vec<T::Item>: Default,
+            {
+                fn m(&self)
+                where
+                    Rel<T>: Default;
+            }
+        ),
+    ];
+    for item in &items {
+        // Rejected is fine.
+        let Ok((copy, found)) = entries_naming_item_in_predicates(item) else {
+            continue;
+        };
+        assert!(
+            found.is_empty(),
+            "in the copy `{}`, a predicate names the entries {:?}, whose context names an `Item`",
+            string(&copy),
+            found
+        );
+    }
+    for item in &accepted {
+        f19_copy_with(f13_leaker(), item)
+            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+    }
+    for item in &price {
+        let err = f19_copy_with(f13_leaker(), item).err().unwrap_or_else(|| {
+            panic!(
+                "`{}` is accepted, but this is the price of F33",
+                string(item)
+            )
+        });
+        assert!(err.to_string().contains("`T :: Item`"), "{}", err);
     }
 }

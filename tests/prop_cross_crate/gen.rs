@@ -187,6 +187,13 @@ pub struct Features {
     /// records as the where predicate `T::Item: 'a`, and not as `T: 'a`, which the copy cannot
     /// prove (E0309, like F16; F30: fixed, on by default).
     pub projection_outlives: bool,
+    /// A where predicate of an item that names the `Item` of an iterator without being a bound of
+    /// it (`Option<<T as Iterator>::Item>: Default`), and a predicate of a method that equates the
+    /// `Item` to a type that holds a leaked type (`T: Iterator<Item = (Rel<T>, u8)>`): the entry has
+    /// the predicate in its context, and rustc proves it while it normalizes the entry, with the
+    /// `Item` that the entry defines: a cycle (E0275, F33, fixed: on by default, the Leaker rejects
+    /// it). Off, the equation is dropped where an enclosing predicate names the `Item`.
+    pub item_predicate_cycle: bool,
 }
 
 impl Features {
@@ -215,6 +222,7 @@ impl Features {
             supertrait_item: true,
             impl_trait_args: true,
             projection_outlives: true,
+            item_predicate_cycle: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -244,6 +252,7 @@ impl Features {
                     features.impl_trait_args = true;
                     features.hidden_lifetimes = true;
                     features.projection_outlives = true;
+                    features.item_predicate_cycle = true;
                 }
                 "inferred_outlives" => features.inferred_outlives = true,
                 "impl_assoc_self" => features.impl_assoc_self = true,
@@ -267,6 +276,7 @@ impl Features {
                 "impl_trait_args" => features.impl_trait_args = true,
                 "hidden_lifetimes" => features.hidden_lifetimes = true,
                 "projection_outlives" => features.projection_outlives = true,
+                "item_predicate_cycle" => features.item_predicate_cycle = true,
                 "unsized_params" => features.unsized_params = true,
                 "bound_cycles" => features.bound_cycles = true,
                 other => panic!("unknown feature `{}`", other),
@@ -1820,8 +1830,8 @@ impl Gen {
         sk
     }
 
-    /// Where predicates on the generics of `sc`.
-    fn preds(&mut self, sc: &Scope, sk: &mut Skeleton, max: usize) {
+    /// Where predicates on the generics of `sc`, those of an item or of a method (`level`).
+    fn preds(&mut self, level: Level, sc: &Scope, sk: &mut Skeleton, max: usize) {
         // `Self` is not known to be `Sized` while the predicates are checked.
         let mut sc = sc.clone();
         if sc.self_kind == SelfKind::MaybeUnsized {
@@ -2059,6 +2069,68 @@ impl Gen {
                     if binds_outer {
                         sk.preds.retain(|p| !names_item(p, x));
                     }
+                }
+            }
+        }
+        // `item_predicate_cycle` asks for a predicate of an item that names the `Item` of an
+        // iterator (`Option<<T as Iterator>::Item>: Default`), and a predicate of a method that
+        // equates it to a type that holds an entry (`T: Iterator<Item = (Rel<T>, u8)>`). Both
+        // are decided by the hash of the state, which draws nothing: the other choices are
+        // the same as without it.
+        if self.features.item_predicate_cycle {
+            let iters: Vec<TyParam> = sc
+                .tys
+                .iter()
+                .filter(|p| p.iter && p.sized && p.fixed_item == 0)
+                .cloned()
+                .collect();
+            let mut state = self.rng.clone();
+            state.write(b"item_predicate_cycle");
+            state.write(&[level as u8]);
+            let draw = state.finish();
+            if level == Level::Item && !iters.is_empty() && draw % 100 < 40 {
+                let x = &iters[(draw / 100) as usize % iters.len()].name;
+                let item = format!("<{} as ::core::iter::Iterator>::Item", x);
+                let default = "::core::default::Default";
+                let pred = match (draw / 1000) % 4 {
+                    0 => format!("::core::option::Option<{}>: {}", item, default),
+                    1 => format!("::core::marker::PhantomData<{}>: {}", item, default),
+                    2 => format!("{}: ::core::marker::Sized", item),
+                    _ => format!("::core::option::Option<({}, u8)>: {}", item, default),
+                };
+                sk.preds.push(pred);
+            } else if level == Level::Method && draw % 100 < 70 {
+                let heads: Vec<String> = self
+                    .env
+                    .heads
+                    .iter()
+                    .filter(|head| head.shape == Shape::T1)
+                    .map(|head| head.name.clone())
+                    .collect();
+                let candidates: Vec<&TyParam> = iters
+                    .iter()
+                    .filter(|p| {
+                        sc.names_item.contains(&p.name)
+                            && !bounded.contains(&(p.name.clone(), "iter"))
+                    })
+                    .collect();
+                if !candidates.is_empty() && !heads.is_empty() {
+                    let x = candidates[(draw / 100) as usize % candidates.len()]
+                        .name
+                        .clone();
+                    let head = &heads[(draw / 1000) as usize % heads.len()];
+                    bounded.push((x.clone(), "iter"));
+                    sk.preds.push(format!(
+                        "{}: ::core::iter::Iterator<Item = ({}<{}>, u8)>",
+                        x, head, x
+                    ));
+                }
+            }
+        } else {
+            // The `Item` that a predicate of an enclosing item names is not equated to a type.
+            for t in sc.tys.iter().filter(|t| t.iter) {
+                if sc.names_item.contains(&t.name) {
+                    sk.preds.retain(|p| !binds_item(p, &t.name));
                 }
             }
         }
@@ -2307,7 +2379,7 @@ impl Gen {
         }
         let mut sk = sk;
         sk.preds = pre_preds;
-        self.preds(&sc, &mut sk, 2);
+        self.preds(Level::Method, &sc, &mut sk, 2);
         let generic_names: Vec<String> = sc.tys.iter().map(|t| t.name.clone()).collect();
         let (allowed, can_name) = if in_trait {
             (
@@ -2740,7 +2812,7 @@ impl Gen {
                 phantoms.push(format!("::core::marker::PhantomData<*const {}>", t.name));
             }
         }
-        self.preds(&sc, &mut sk, 2);
+        self.preds(Level::Item, &sc, &mut sk, 2);
         self.self_prob = saved_prob;
 
         let attr = ann.map_or(String::new(), |(id, a)| self.attr(id, a));
@@ -2881,6 +2953,7 @@ impl Gen {
         let mut pred_scope = sc.clone();
         pred_scope.assoc.clear();
         self.preds(
+            Level::Item,
             &pred_scope,
             &mut sk,
             if self.features.impl_pred_leaked { 2 } else { 1 },
