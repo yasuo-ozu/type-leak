@@ -12,7 +12,10 @@
 //! - `Self::A`, which the impl of the trait for the host defines;
 //! - an associated type that rustc normalizes: `T::Item` if a predicate in scope defines it
 //!   (`T: Iterator<Item = ..>`), and `<u8 as Tr>::A`, which an impl defines. `T::Item` of a
-//!   generic with no such predicate stays as it is.
+//!   generic whose bounds are all traits of the standard library, and none defines it, stays as
+//!   it is. A bound of another trait may define it by a supertrait (`trait Tr:
+//!   Iterator<Item = u8>`), which the Leaker cannot read, so `T::Item` of a generic with such a
+//!   bound counts too.
 
 use crate::util::{ident_name, unwrap_type_group};
 use proc_macro2::TokenStream;
@@ -44,9 +47,9 @@ impl Unstable {
                 path
             ),
             Why::Projection(path) => format!(
-                "names `{}`, which rustc normalizes in the impl of the Repeater (an impl, or a \
-                 predicate of the item that equates it, defines it), but not yet in the \
-                 environment (E0277, E0271, E0275)",
+                "names `{}`, which rustc normalizes in the impl of the Repeater (an impl, a \
+                 predicate of the item that equates it, or a supertrait of a bound of its \
+                 generic, defines it), but not yet in the environment (E0277, E0271, E0275)",
                 path
             ),
         }
@@ -91,7 +94,8 @@ impl Why {
 pub(crate) struct Projections<'a, F> {
     /// Whether a name is a type parameter in scope.
     is_param: F,
-    /// The `(bounded type, name)` of the equations `T: Tr<Name = ..>` in scope.
+    /// The `(bounded type, name)` of the equations `T: Tr<Name = ..>` in scope, and
+    /// `(bounded type, ANY_NAME)` for a bound that may define any (see [`bindings()`]).
     bindings: &'a [(String, String)],
     pub(crate) found: Option<Why>,
 }
@@ -141,7 +145,7 @@ impl<'a, F: Fn(&str) -> bool> Projections<'a, F> {
         };
         self.bindings
             .iter()
-            .any(|(bounded, bound)| *bounded == root && *bound == name)
+            .any(|(bounded, bound)| *bounded == root && (*bound == name || *bound == ANY_NAME))
             .then(|| Why::Projection(shown()))
     }
 
@@ -176,9 +180,15 @@ fn is_bare_self(ty: &Type) -> bool {
     matches!(ty, Type::Path(TypePath { qself: None, path }) if path.is_ident("Self"))
 }
 
+/// The name of a bound that may define any associated type of what it bounds: the bound of a trait
+/// that the Leaker cannot read, whose supertrait may equate an associated type of another trait
+/// (`trait Tr: Iterator<Item = u8>`). It is not an identifier, so it is no name.
+const ANY_NAME: &str = "*";
+
 /// Returns the `(bounded type, name)` of the equations of associated types in the bounds of
 /// `params` and in `predicates`: `T: Iterator<Item = ..>` is `("T", "Item")`, and `F: Fn(A) -> B` is
-/// `("F", "Output")`.
+/// `("F", "Output")`. A bound of a trait that is not one of the standard library (`T: ::p::Tr`) is
+/// `("T", ANY_NAME)`.
 pub(crate) fn bindings<'a>(
     params: impl Iterator<Item = &'a GenericParam>,
     predicates: impl Iterator<Item = &'a WherePredicate>,
@@ -212,16 +222,17 @@ pub(crate) fn bindings<'a>(
     found
 }
 
-/// The associated types that a trait bound equates.
+/// The associated types that a trait bound equates, and `ANY_NAME` if a supertrait of the trait may
+/// equate any.
 fn names_of(bound: &TypeParamBound) -> Vec<String> {
-    let seg = match bound {
+    let (path, seg) = match bound {
         TypeParamBound::Trait(bound) => match bound.path.segments.last() {
-            Some(seg) => seg,
+            Some(seg) => (&bound.path, seg),
             None => return Vec::new(),
         },
         _ => return Vec::new(),
     };
-    match &seg.arguments {
+    let mut names: Vec<String> = match &seg.arguments {
         PathArguments::AngleBracketed(args) => args
             .args
             .iter()
@@ -232,5 +243,79 @@ fn names_of(bound: &TypeParamBound) -> Vec<String> {
             .collect(),
         PathArguments::Parenthesized(_) => vec!["Output".to_string()],
         PathArguments::None => Vec::new(),
+    };
+    if !is_std_trait(path) {
+        names.push(ANY_NAME.to_string());
     }
+    names
+}
+
+/// The traits of the standard library that a bare name means (a bound `T: Iterator`): none of them
+/// has a supertrait that equates an associated type. A trait of the analyzed code with the name of
+/// one is taken for it.
+const STD_TRAITS: &[&str] = &[
+    "Sized",
+    "Send",
+    "Sync",
+    "Unpin",
+    "Copy",
+    "Clone",
+    "Drop",
+    "Eq",
+    "PartialEq",
+    "Ord",
+    "PartialOrd",
+    "Default",
+    "Debug",
+    "Display",
+    "Hash",
+    "AsRef",
+    "AsMut",
+    "Into",
+    "From",
+    "TryFrom",
+    "TryInto",
+    "ToString",
+    "ToOwned",
+    "Borrow",
+    "BorrowMut",
+    "Fn",
+    "FnMut",
+    "FnOnce",
+    "Iterator",
+    "IntoIterator",
+    "DoubleEndedIterator",
+    "ExactSizeIterator",
+    "FusedIterator",
+    "Extend",
+    "FromIterator",
+    "Deref",
+    "DerefMut",
+    "Add",
+    "Sub",
+    "Mul",
+    "Div",
+    "Rem",
+    "Neg",
+    "Not",
+    "Index",
+    "IndexMut",
+    "FromStr",
+    "Future",
+    "IntoFuture",
+    "Any",
+];
+
+/// Returns `true` if `path` is a trait of the standard library: an absolute path in `::core`,
+/// `::std` or `::alloc`, or a bare name of `STD_TRAITS`. Another path may be a trait of the analyzed
+/// code, or of a crate that the Leaker cannot read.
+fn is_std_trait(path: &Path) -> bool {
+    let first = match path.segments.first() {
+        Some(first) => ident_name(&first.ident),
+        None => return false,
+    };
+    if path.leading_colon.is_some() {
+        return matches!(first.as_str(), "core" | "std" | "alloc");
+    }
+    path.segments.len() == 1 && STD_TRAITS.contains(&first.as_str())
 }

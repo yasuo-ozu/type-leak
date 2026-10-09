@@ -469,6 +469,7 @@ struct ScopeMark {
     self_written: bool,
     self_depth: usize,
     allow_self: bool,
+    self_type_walk: Option<bool>,
     not_optional: usize,
     env_errors: usize,
     module: Option<ContextId>,
@@ -499,6 +500,7 @@ struct Walk {
     in_receiver: bool,
     enclosing: Enclosing,
     env_depth: usize,
+    in_fn_arg: bool,
     elided_ref: bool,
     unconstrained_ref: Option<Lifetime>,
     ambiguous_arg: bool,
@@ -549,6 +551,11 @@ pub(crate) struct AnalyzeVisitor {
     /// methods.
     self_depth: usize,
     root_declares_self: bool,
+    /// Set while the walk of an impl visits it (see [`AnalyzeVisitor::walk_item_impl()`]): whether
+    /// a bare `Self` in a bound or where predicate of the impl was found. The walk then tells the
+    /// graph not to choose a type in the self type whose bounds are unstable (see
+    /// [`AnalyzeVisitor::block_unstable_self_types()`]).
+    self_type_walk: Option<bool>,
     /// The type is the default of a parameter, which cannot mention `Self`. It holds whether the
     /// declaring scope gives `Self` a meaning. `self_ty` is `None` meanwhile.
     in_default: Option<bool>,
@@ -582,6 +589,9 @@ pub(crate) struct AnalyzeVisitor {
     /// The depth of the bounds and where predicates being visited, which are the predicates of the
     /// item (its environment). See [`AnalyzeVisitor::env_cycle()`].
     env_depth: usize,
+    /// An argument of a function or method is being visited: an `impl Trait` in it is a generic of
+    /// the function, and its bounds are predicates of the item (see `env_depth`).
+    in_fn_arg: bool,
     /// Whether [`AnalyzeVisitor::env_cycle()`] is checked. It is not by the probe that it runs.
     check_env: bool,
     /// The types, with the contexts they are in, that were found to be no optional entries.
@@ -648,6 +658,7 @@ impl AnalyzeVisitor {
             self_written: false,
             self_depth: 0,
             root_declares_self: false,
+            self_type_walk: None,
             in_default: None,
             modules: Vec::new(),
             musts: Vec::new(),
@@ -664,6 +675,7 @@ impl AnalyzeVisitor {
             in_receiver: false,
             enclosing: Enclosing::default(),
             env_depth: 0,
+            in_fn_arg: false,
             check_env: true,
             not_optional: Vec::new(),
             env_errors: Vec::new(),
@@ -965,6 +977,7 @@ impl AnalyzeVisitor {
             self_written: self.self_written,
             self_depth: self.self_depth,
             allow_self: self.allow_self,
+            self_type_walk: self.self_type_walk,
             not_optional: self.not_optional.len(),
             env_errors: self.env_errors.len(),
             module: None,
@@ -1032,6 +1045,7 @@ impl AnalyzeVisitor {
         self.self_written = mark.self_written;
         self.self_depth = mark.self_depth;
         self.allow_self = mark.allow_self;
+        self.self_type_walk = mark.self_type_walk;
         if rollback {
             self.frame.effects.truncate(mark.effects);
             self.self_errors.truncate(mark.self_errors);
@@ -1058,6 +1072,7 @@ impl AnalyzeVisitor {
             in_receiver: self.in_receiver,
             enclosing: self.enclosing.clone(),
             env_depth: self.env_depth,
+            in_fn_arg: self.in_fn_arg,
             elided_ref: self.elided_ref,
             unconstrained_ref: self.unconstrained_ref.clone(),
             ambiguous_arg: self.ambiguous_arg,
@@ -1097,6 +1112,7 @@ impl AnalyzeVisitor {
         self.in_receiver = walk.in_receiver;
         self.enclosing = walk.enclosing;
         self.env_depth = walk.env_depth;
+        self.in_fn_arg = walk.in_fn_arg;
         self.elided_ref = walk.elided_ref;
         self.unconstrained_ref = walk.unconstrained_ref;
         self.ambiguous_arg = walk.ambiguous_arg;
@@ -1436,11 +1452,19 @@ impl AnalyzeVisitor {
                         // `Self::A` needs the bounds of the generics of its context. `Self` of an
                         // impl needs those of the types in the self type that the copy writes as
                         // paths through the Repeater only: rustc normalizes them in the
-                        // environment, not the bounds of a generic that they do not use.
+                        // environment, not the bounds of a generic that they do not use. A type
+                        // in the self type that the graph may choose, and whose bounds are
+                        // unstable, is not chosen then: its parts are (see
+                        // `block_unstable_self_types()`), if the walk of the impl can tell the
+                        // graph.
+                        let blockable = !projection && self.self_type_walk.is_some();
+                        if blockable {
+                            self.self_type_walk = Some(true);
+                        }
                         let needs = if projection {
                             vec![context.clone()]
                         } else {
-                            self.self_type_entries(&context, false)
+                            self.self_type_entries(&context, false, blockable)
                         };
                         for context in &needs {
                             if let Some(conflict) = self.self_env_cycle(ty, context) {
@@ -1450,7 +1474,7 @@ impl AnalyzeVisitor {
                         if projection {
                             self.not_optional_in_bounds(&context);
                         } else {
-                            for context in self.self_type_entries(&context, true) {
+                            for context in self.self_type_entries(&context, true, blockable) {
                                 self.not_optional_in_bounds(&context);
                             }
                         }
@@ -1769,7 +1793,16 @@ impl AnalyzeVisitor {
     /// needs the bounds of the generics that it uses, not those of the other generics of the impl.
     /// An entry that depends on `Self` (a bound of the impl names it) is one that must stay: it is
     /// an error there, and the caller finds the bound that names `Self`.
-    fn self_type_entries(&self, context: &Context, optional: bool) -> Vec<Context> {
+    ///
+    /// With `blockable`, a type that is not one that must be an entry, and whose bounds are
+    /// unstable (`env_unstable_bound()`), is not one the graph may choose: its parts are the entries
+    /// (see [`AnalyzeVisitor::block_unstable_self_types()`], which tells the graph).
+    fn self_type_entries(
+        &self,
+        context: &Context,
+        optional: bool,
+        blockable: bool,
+    ) -> Vec<Context> {
         let ty = match context.self_ty() {
             Some(SelfRequirement::Type(ty)) if self.env_depth > 0 && self.check_env => ty,
             _ => return Vec::new(),
@@ -1778,12 +1811,15 @@ impl AnalyzeVisitor {
             .scopes
             .get(self.self_depth.wrapping_sub(1))
             .map(Scope::generics);
+        let blocked =
+            |context: &Context| blockable && self.env_unstable_bound(context, false).is_some();
         self.probe(context, |probe| {
             probe.visit_type(ty);
             let mut found = Vec::new();
             entry_contexts(
                 &probe.frame.effects,
                 declared.as_ref(),
+                &blocked,
                 optional,
                 &mut found,
             );
@@ -1974,16 +2010,60 @@ impl AnalyzeVisitor {
         for attr in &i.attrs {
             self.visit_attribute(attr);
         }
+        let outer = self.self_type_walk.replace(false);
         self.visit_generics(&i.generics);
         if let Some((_, path, _)) = &i.trait_ {
             self.visit_path(path);
         }
         let start = self.frame.effects.len();
         self.visit_type(&i.self_ty);
+        let end = self.frame.effects.len();
         self.cut_self_cycles(start, &i.generics);
         for item in &i.items {
             self.visit_impl_item(item);
         }
+        if self.self_type_walk == Some(true) {
+            self.block_unstable_self_types(start, end);
+        }
+        self.self_type_walk = outer;
+    }
+
+    /// Called after the walk of an impl, with the effects `start..end` those of its self type,
+    /// where a bare `Self` is in a bound or where predicate.
+    ///
+    /// rustc normalizes `Self` there, with the impls of the Repeater for the types in the self type
+    /// that are entries, and needs the bounds of the generics that each of them uses
+    /// ([`AnalyzeVisitor::self_type_entries()`]). A type that the graph may choose and whose bounds
+    /// are unstable (`env_unstable_bound()`: `W2<T, Rel<U>>` with `T: Fn(Rel2<u8>)`, where `Rel<U>`
+    /// is an entry anyway) would be a cycle, so the graph does not choose it: its parts are the
+    /// entries, whose bounds the check looks at. A type that must be an entry is an error.
+    fn block_unstable_self_types(&mut self, start: usize, end: usize) {
+        fn block(visitor: &AnalyzeVisitor, effects: &mut [Effect]) {
+            for effect in effects {
+                let pending = match effect {
+                    Effect::Type(pending) => pending,
+                    _ => continue,
+                };
+                let candidate = pending.in_graph
+                    && !pending.no_entry
+                    && !pending.is_must_intern
+                    && !is_whole_reference(&pending.ty);
+                if candidate
+                    && visitor
+                        .env_unstable_bound(&pending.context, false)
+                        .is_some()
+                {
+                    pending.no_entry = true;
+                }
+                block(visitor, &mut pending.components);
+            }
+        }
+        // The bounds of a type are those of a type in a predicate.
+        let mut effects = std::mem::take(&mut self.frame.effects);
+        self.env_depth += 1;
+        block(self, &mut effects[start..end]);
+        self.env_depth -= 1;
+        self.frame.effects = effects;
     }
 
     /// Called after the self type of an impl with `generics` is visited, with `start` the first
@@ -2836,7 +2916,9 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
 
     fn visit_fn_arg(&mut self, i: &FnArg) {
         self.elisions.push(self.signature.clone());
+        let outer = std::mem::replace(&mut self.in_fn_arg, true);
         syn::visit::visit_fn_arg(self, i);
+        self.in_fn_arg = outer;
         self.elisions.pop();
     }
 
@@ -3027,7 +3109,13 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
             }
             Type::ImplTrait(_) | Type::Verbatim(_) => {
                 self.impossibles.push(quote!(#i));
+                // `x: impl Tr<Wrap<T>>` is `x: X` with `X: Tr<Wrap<T>>`: the bounds of the
+                // `impl Trait` of an argument are predicates of the item, as those of a generic
+                // are. Not those of a return type, which rustc proves where the body is.
+                let in_env = usize::from(self.in_fn_arg && matches!(i, Type::ImplTrait(_)));
+                self.env_depth += in_env;
                 syn::visit::visit_type(self, i);
+                self.env_depth -= in_env;
             }
             _ => syn::visit::visit_type(self, i),
         }
@@ -3532,10 +3620,12 @@ fn cut_conflicts(
 /// Adds the contexts of the types in `effects` that may be entries of the copy to `found` (see
 /// [`AnalyzeVisitor::self_type_entries()`]). A type that must be an entry has no parts that are
 /// entries. Another one may be, with those of its parts that may, unless its context depends on
-/// the `Self` that the generics `declared` bound (`self_type_conflict()`): it is cut then.
+/// the `Self` that the generics `declared` bound (`self_type_conflict()`): it is cut then, or
+/// `blocked` says that it is not one the graph chooses.
 fn entry_contexts(
     effects: &[Effect],
     declared: Option<&Generics>,
+    blocked: &dyn Fn(&Context) -> bool,
     optional: bool,
     found: &mut Vec<Context>,
 ) {
@@ -3556,13 +3646,13 @@ fn entry_contexts(
         let cut = declared.map_or(false, |declared| {
             self_type_conflict(pending, declared).is_some()
         });
-        let entry = pending.in_graph && !pending.no_entry;
+        let entry = pending.in_graph && !pending.no_entry && !blocked(&pending.context);
         let optional_entry = optional && pending.optional && !pending.no_optional_entry;
         if (entry || optional_entry) && !cut {
             push(&pending.context);
         }
         let mut parts = Vec::new();
-        entry_contexts(&pending.components, declared, optional, &mut parts);
+        entry_contexts(&pending.components, declared, blocked, optional, &mut parts);
         for context in &parts {
             push(context);
         }

@@ -161,16 +161,18 @@ pub struct Features {
     /// A bound of an iterator whose `Item` a supertrait fixes (`T: ::krate::base::BItem`, `trait
     /// BItem: Iterator<Item = u8>`) that names the `Item` (`T: Fn(<T as Iterator>::Item) -> u8`),
     /// and a predicate with an entry that uses the iterator (`Rel<T>: Default`): the Leaker does not
-    /// read the supertraits, so the copy is E0277, like F21 (F25: a bug, off by default).
+    /// read the supertraits, so the copy would be E0277, like F21 (F25, fixed: on by default, the
+    /// Leaker takes the `Item` of a generic with the bound of a trait that is not one of the
+    /// standard library for one that may be fixed, and rejects it).
     pub supertrait_item: bool,
     /// The same with the `Item` fixed by a bound (`T: Iterator<Item = u8>`) and the bound naming it
     /// through a type alias of the Leaker's crate (`T: Fn(::krate::base::BIt<T>) -> u8`), which the
     /// Leaker takes for a struct (F26: a limitation, off by default).
     pub alias_item: bool,
     /// An argument-position `impl Trait` whose bound names an entry that uses a generic with a bound
-    /// that names a leaked type (`X: Fn(Rel0) -> u8`, `a: impl Into<Rel1<X>>`): the Leaker does not
-    /// treat it as the bound of a generic, so the copy is E0277, like F2 (F27: a bug, off by
-    /// default). The oracle of the test macro does not compare a position that has `impl Trait`.
+    /// that names a leaked type (`X: Fn(Rel0) -> u8`, `a: impl Into<Rel1<X>>`): the Leaker treats it
+    /// as the bound of a generic, as F2 does, and rejects it (F27, fixed: on by default). The
+    /// oracle of the test macro does not compare a position that has `impl Trait`.
     pub impl_trait_args: bool,
     /// A path that hides a lifetime in the inputs of an elided `fn(..) -> &R` or `Fn(..) -> &R`
     /// (`fn(::core::str::Chars, A) -> &R`), next to a type that adds lifetimes: E0106 in the copy
@@ -207,6 +209,8 @@ impl Features {
             trait_assoc_bound_cycle: true,
             iterator_item_cycle: true,
             hidden_lifetimes: true,
+            supertrait_item: true,
+            impl_trait_args: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -2325,11 +2329,18 @@ impl Gen {
                 .filter(|p| p.sized && !sk.bounded.contains(&(p.name.clone(), "fn")))
                 .map(|p| p.name.clone())
                 .collect();
+            // In a module analyzed as a whole, a bound of an entry that names an item of the module
+            // is the limitation F10, as in `preds()`.
+            let module_mode = self.module_mode;
+            let declared = |name: &str| {
+                name.starts_with('R') || name.starts_with("self::R") || name.starts_with("super::R")
+            };
             let relative = |shape: Shape| -> Vec<String> {
                 self.env
                     .heads
                     .iter()
                     .filter(|head| head.shape == shape && !head.name.starts_with("::"))
+                    .filter(|head| !(module_mode && declared(&head.name)))
                     .map(|head| head.name.clone())
                     .collect()
             };
