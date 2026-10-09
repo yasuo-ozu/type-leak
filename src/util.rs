@@ -163,6 +163,143 @@ pub(crate) fn unwrap_type_group(ty: &Type) -> &Type {
     }
 }
 
+/// Wraps `ty` in parentheses.
+fn parenthesize(ty: &mut Type) {
+    let inner = std::mem::replace(ty, Type::Verbatim(TokenStream::new()));
+    *ty = Type::Paren(TypeParen {
+        paren_token: Default::default(),
+        elem: Box::new(inner),
+    });
+}
+
+/// Returns the bounds of the trait object (or `impl Trait`) that `ty` ends in, through the pointee
+/// of a reference or a pointer and the output of a function pointer. A parenthesized type ends the
+/// search: nothing in it can be joined by what follows it.
+///
+/// A `+` after such a type joins the bounds: `Fn() -> &dyn A + B` bounds the trait object by `B`,
+/// and rustc rejects it (E0225, "ambiguous `+` in a type").
+fn tail_object(ty: &Type) -> Option<&Punctuated<TypeParamBound, Token![+]>> {
+    match ty {
+        Type::Reference(TypeReference { elem, .. }) | Type::Ptr(TypePtr { elem, .. }) => {
+            tail_object(elem)
+        }
+        Type::BareFn(TypeBareFn {
+            output: ReturnType::Type(_, output),
+            ..
+        }) => tail_object(output),
+        Type::TraitObject(TypeTraitObject { bounds, .. })
+        | Type::ImplTrait(TypeImplTrait { bounds, .. }) => Some(bounds),
+        _ => None,
+    }
+}
+
+/// The output type of a bound that is the sugar of `Fn`: `R` in `Fn(A) -> R`.
+fn bound_output_mut(bound: &mut TypeParamBound) -> Option<&mut Type> {
+    match bound {
+        // A parenthesized bound `(Fn() -> R)` is closed already.
+        TypeParamBound::Trait(TraitBound {
+            paren_token: None,
+            path,
+            ..
+        }) => match &mut path.segments.last_mut()?.arguments {
+            PathArguments::Parenthesized(ParenthesizedGenericArguments {
+                output: ReturnType::Type(_, output),
+                ..
+            }) => Some(output),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Returns the bounds in the form that rustc reads as they mean, whichever way they were written.
+///
+/// The output of the sugar of `Fn` (`Fn(A) -> R`) is parsed without a `+`, so a bare trait object
+/// there cannot be followed by a bound (`Fn() -> &dyn A + B`), nor have several bounds
+/// (`Fn() -> dyn A + B`): they need parentheses. Merging the bounds of a parameter with its where
+/// predicates, and sorting them, decides what follows a bound, so this adds the parentheses that
+/// the order needs, and removes those that it does not, to make the result independent of how the
+/// bounds were written before. The bounds are sorted without the parentheses, so that it is
+/// idempotent.
+pub(crate) fn canonical_bounds(
+    bounds: Punctuated<TypeParamBound, Token![+]>,
+) -> Punctuated<TypeParamBound, Token![+]> {
+    let mut bounds: Vec<(String, TypeParamBound)> = bounds
+        .into_iter()
+        .map(|mut bound| {
+            // Parentheses that a trait object needs, or that it does not.
+            if let Some(output) = bound_output_mut(&mut bound) {
+                while let Type::Paren(TypeParen { elem, .. }) = output {
+                    if tail_object(elem).is_none() {
+                        break;
+                    }
+                    *output = std::mem::replace(&mut **elem, Type::Verbatim(TokenStream::new()));
+                }
+            }
+            (quote!(#bound).to_string(), bound)
+        })
+        .collect();
+    bounds.sort_by(|a, b| a.0.cmp(&b.0));
+    bounds.dedup_by(|a, b| a.0 == b.0);
+    let count = bounds.len();
+    bounds
+        .into_iter()
+        .enumerate()
+        .map(|(ix, (_, mut bound))| {
+            let followed = ix + 1 < count;
+            if let Some(output) = bound_output_mut(&mut bound) {
+                if tail_object(output).map_or(false, |object| followed || object.len() > 1) {
+                    parenthesize(output);
+                }
+            }
+            bound
+        })
+        .collect()
+}
+
+/// Parenthesizes the pointee of a reference or a pointer if it is a trait object with several
+/// bounds: `&(dyn A + B)`. A type that replaces `Self` can be one.
+pub(crate) fn parenthesize_pointee(mut ty: Type) -> Type {
+    if let Type::Reference(TypeReference { elem, .. }) | Type::Ptr(TypePtr { elem, .. }) = &mut ty {
+        let several = match &**elem {
+            Type::TraitObject(TypeTraitObject { bounds, .. })
+            | Type::ImplTrait(TypeImplTrait { bounds, .. }) => bounds.len() > 1,
+            _ => false,
+        };
+        if several {
+            parenthesize(elem);
+        }
+    }
+    ty
+}
+
+/// Parenthesizes the bounded type of a where predicate that rustc cannot parse as it is.
+///
+/// A function pointer without an output that is reached through a reference or a pointer
+/// (`&fn(A): 'a`) takes the `:` for the start of its output (rustc: "return types are denoted
+/// using `->`"). A type that replaces `Self` can be one: `where Self: 'a`.
+pub(crate) fn parenthesize_bounded(ty: &mut Type) {
+    let mut under_pointer = false;
+    let mut current = &*ty;
+    let ambiguous = loop {
+        match current {
+            Type::Reference(TypeReference { elem, .. }) | Type::Ptr(TypePtr { elem, .. }) => {
+                under_pointer = true;
+                current = elem;
+            }
+            Type::BareFn(TypeBareFn {
+                output: ReturnType::Type(_, output),
+                ..
+            }) => current = output,
+            Type::BareFn(_) => break under_pointer,
+            _ => break false,
+        }
+    };
+    if ambiguous {
+        parenthesize(ty);
+    }
+}
+
 pub(crate) fn has_lifetime_bound(object: &TypeTraitObject) -> bool {
     object
         .bounds
@@ -413,7 +550,7 @@ impl<'a> ReplaceSelf<'a> {
                 path: folder.fold_path(rest),
             }),
             (Type::Verbatim(tokens), _) => Type::Verbatim(self.replace_tokens(tokens)),
-            (ty, _) => syn::fold::fold_type(folder, ty),
+            (ty, _) => parenthesize_pointee(syn::fold::fold_type(folder, ty)),
         }
     }
 
@@ -445,6 +582,12 @@ impl<'a> syn::fold::Fold for ReplaceSelf<'a> {
     fn fold_expr(&mut self, expr: Expr) -> Expr {
         let this = *self;
         this.fold_expr_with(self, expr)
+    }
+
+    fn fold_predicate_type(&mut self, i: PredicateType) -> PredicateType {
+        let mut i = syn::fold::fold_predicate_type(self, i);
+        parenthesize_bounded(&mut i.bounded_ty);
+        i
     }
 
     fn fold_macro(&mut self, i: Macro) -> Macro {

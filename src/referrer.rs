@@ -4,7 +4,8 @@ use crate::context::{Context, ContextId, Enclosing, ModuleInfo, Scope, SelfRequi
 use crate::encode::{complete_generics_args, param_as_arg, without_encoded_bounds, EncodeError};
 use crate::graph::TypeKey;
 use crate::util::{
-    first_self_in_generics, generic_param_name, mentions_names, type_mentions_self, ReplaceSelf,
+    first_self_in_generics, generic_param_name, mentions_names, parenthesize_bounded,
+    type_mentions_self, ReplaceSelf,
 };
 use proc_macro2::{Literal, Punct, Spacing, Span, TokenStream};
 use std::cell::RefCell;
@@ -957,6 +958,8 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         self.scopes.extend(i.lifetimes.as_ref().map(Scope::binder));
         syn::visit_mut::visit_predicate_type_mut(self, i);
         self.scopes.truncate(depth);
+        // What replaced the bounded type (`Self`, an entry) may need parentheses there.
+        parenthesize_bounded(&mut i.bounded_ty);
     }
     fn visit_trait_bound_mut(&mut self, i: &mut TraitBound) {
         let depth = self.scopes.len();

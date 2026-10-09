@@ -15,13 +15,14 @@
 //! | `f05_inferred_outlives_of_self_type` | no `T: 'a` for a path with a lifetime; written, it is | limitation |
 //! | `f06_impl_assoc_type_of_self_in_repeater` | `intern_impl` accepts `Self::A` in an entry | fixed |
 //! | `f07_method_lifetime_in_leaked_path` | a method lifetime in a leaked path and the return type | fixed |
-//! | `f08_merged_bound_ambiguous_plus` | merged bounds print `-> &dyn Any + Clone` | bug |
-//! | `f09_fn_pointer_self_predicate_print` | `Self` replaced by `&fn(..)` in a where predicate | bug |
+//! | `f08_merged_bound_ambiguous_plus` | merged bounds print `-> &dyn Any + Clone` | fixed |
+//! | `f09_fn_pointer_self_predicate_print` | `Self` replaced by `&fn(..)` in a where predicate | fixed |
 //! | `f10_module_bound_names_declared_item` | a bound of an entry names an item of the module | limitation |
 //! | `f11_copied_impl_param_constrained_only_by_leaked_type` | a copied impl whose self type is an entry | limitation |
 //! | `f12_elided_lifetime_in_fn_sugar_with_generics` | `Fn(&Rel<T>) -> &u8` with an entry that has lifetimes | bug |
 //!
-//! The bugs are `#[ignore]`d, as they fail today: run them with
+//! The bugs that are not fixed are `#[ignore]`d, as they fail today (a fixed one has no
+//! `#[ignore]`, and `fixed` in the table): run them with
 //!
 //! ```text
 //! cargo test --test findings -- --ignored
@@ -790,37 +791,58 @@ fn f07_method_lifetime_in_leaked_path() {
 
 // ── F8 ───────────────────────────────────────────────────────────────────────
 
-/// Whether a type ends in a bare trait object, through references and pointers: a `+` after it
-/// joins the object (`&dyn Any + Clone`).
-fn ends_in_bare_object(ty: &Type) -> bool {
+/// The number of bounds of the bare trait object that a type ends in, through references and
+/// pointers: a `+` after the type joins them (`&dyn Any + Clone`), and a type with several of them
+/// is ambiguous even alone (`Fn() -> dyn Any + Send`).
+fn bare_object_bounds(ty: &Type) -> Option<usize> {
     match ty {
-        Type::Reference(r) => ends_in_bare_object(&r.elem),
-        Type::Ptr(p) => ends_in_bare_object(&p.elem),
-        Type::TraitObject(_) | Type::ImplTrait(_) => true,
-        Type::BareFn(f) => matches!(&f.output, ReturnType::Type(_, t) if ends_in_bare_object(t)),
-        _ => false,
+        Type::Reference(r) => bare_object_bounds(&r.elem),
+        Type::Ptr(p) => bare_object_bounds(&p.elem),
+        Type::TraitObject(TypeTraitObject { bounds, .. })
+        | Type::ImplTrait(TypeImplTrait { bounds, .. }) => Some(bounds.len()),
+        Type::BareFn(f) => match &f.output {
+            ReturnType::Type(_, t) => bare_object_bounds(t),
+            ReturnType::Default => None,
+        },
+        _ => None,
     }
 }
 
 /// The bounds that rustc reads with an ambiguous `+`: a bound of the sugar of `Fn` whose return
-/// type ends in a bare trait object, followed by another bound.
+/// type ends in a bare trait object, followed by another bound (or with several bounds itself).
 fn ambiguous_plus(bounds: &Punctuated<TypeParamBound, Token![+]>) -> Vec<String> {
     let count = bounds.len();
     bounds
         .iter()
-        .take(count.saturating_sub(1))
-        .filter(|bound| match bound {
+        .enumerate()
+        .filter(|(ix, bound)| match bound {
             TypeParamBound::Trait(TraitBound { path, .. }) => matches!(
                 path.segments.last().map(|seg| &seg.arguments),
                 Some(PathArguments::Parenthesized(ParenthesizedGenericArguments {
                     output: ReturnType::Type(_, ty),
                     ..
-                })) if ends_in_bare_object(ty)
+                })) if matches!(bare_object_bounds(ty), Some(n) if ix + 1 < count || n > 1)
             ),
             _ => false,
         })
-        .map(string)
+        .map(|(_, bound)| string(bound))
         .collect()
+}
+
+/// The bounds of the parameters and where predicates of `generics` with an ambiguous `+`.
+fn ambiguous_in(generics: &Generics) -> Vec<String> {
+    let mut ambiguous = Vec::new();
+    for param in &generics.params {
+        if let GenericParam::Type(t) = param {
+            ambiguous.extend(ambiguous_plus(&t.bounds));
+        }
+    }
+    for predicate in generics.where_clause.iter().flat_map(|w| &w.predicates) {
+        if let WherePredicate::Type(p) = predicate {
+            ambiguous.extend(ambiguous_plus(&p.bounds));
+        }
+    }
+    ambiguous
 }
 
 /// F8: the bounds of a generic are merged and printed with an ambiguous `+`.
@@ -835,8 +857,11 @@ fn ambiguous_plus(bounds: &Punctuated<TypeParamBound, Token![+]>) -> Vec<String>
 /// (`impl_generics()`): no bound of the sugar of `Fn` with such a return type is followed by
 /// another bound, and both bounds are still there. (Parsing the printed generics back with syn
 /// does not show it: syn accepts what rustc rejects.)
+///
+/// Fixed: the canonical bounds of a context parenthesize the return type of a bound that another
+/// bound follows (`Fn(()) -> (&'static dyn Any) + Clone`), or that has several bounds itself, and
+/// do not depend on the parentheses that the source has. The second part checks other shapes.
 #[test]
-#[ignore = "F8: the merged bounds print `Fn(()) -> &'static dyn Any + Clone`, ambiguous (bug)"]
 fn f08_merged_bound_ambiguous_plus() {
     let item: ItemStruct = parse_quote! {
         pub struct S<T: Clone>(pub Rel<T>)
@@ -849,17 +874,7 @@ fn f08_merged_bound_ambiguous_plus() {
     let ix = entry(&referrer, "Rel < T >");
     let generics = referrer.impl_generics(referrer.context(ix));
     let printed = string(&generics);
-    let mut ambiguous = Vec::new();
-    for param in &generics.params {
-        if let GenericParam::Type(t) = param {
-            ambiguous.extend(ambiguous_plus(&t.bounds));
-        }
-    }
-    for predicate in generics.where_clause.iter().flat_map(|w| &w.predicates) {
-        if let WherePredicate::Type(p) = predicate {
-            ambiguous.extend(ambiguous_plus(&p.bounds));
-        }
-    }
+    let ambiguous = ambiguous_in(&generics);
     assert!(
         ambiguous.is_empty(),
         "`{}` has an ambiguous `+` after {:?}",
@@ -871,25 +886,97 @@ fn f08_merged_bound_ambiguous_plus() {
         "a bound is lost in `{}`",
         printed
     );
+
+    // Other shapes, and how many bounds each keeps. The bounds are written with and without the
+    // parentheses that they need, and in another order: they must give the same generics.
+    let items: Vec<ItemStruct> = vec![
+        // Several bounds of this kind, through a pointer and a function pointer.
+        parse_quote! {
+            pub struct S<T: Clone + Send>(pub Rel<T>)
+            where
+                T: ::core::ops::Fn(()) -> &'static dyn ::core::any::Any,
+                T: ::core::ops::FnMut() -> *const dyn ::core::any::Any,
+                T: ::core::ops::FnOnce() -> fn() -> &'static dyn ::core::any::Any;
+        },
+        // The same, with the return types parenthesized in the source.
+        parse_quote! {
+            pub struct S<T: Clone + Send>(pub Rel<T>)
+            where
+                T: ::core::ops::Fn(()) -> (&'static dyn ::core::any::Any),
+                T: ::core::ops::FnMut() -> (*const dyn ::core::any::Any),
+                T: ::core::ops::FnOnce() -> (fn() -> &'static dyn ::core::any::Any);
+        },
+        // A return type with several bounds needs them even if the bound is the last.
+        parse_quote! {
+            pub struct S<T: ::core::ops::Fn(()) -> (dyn ::core::any::Any + Send)>(pub Rel<T>);
+        },
+        // A bound that the context gets from a lifetime that the entry names.
+        parse_quote! {
+            pub struct S<'a, T: ::core::ops::Fn(()) -> &'static dyn ::core::any::Any>(pub Rel<&'a T>);
+        },
+    ];
+    for item in &items {
+        let mut leaker = new_leaker();
+        leaker.intern_struct(item, true).unwrap();
+        let referrer = leaker.finish();
+        for (ix, (_, generics)) in referrer.iter_with_generics().enumerate() {
+            let ambiguous = ambiguous_in(generics);
+            assert!(
+                ambiguous.is_empty(),
+                "the entry {} of `{}` has `{}`: ambiguous `+` after {:?}",
+                ix,
+                string(item),
+                string(generics),
+                ambiguous
+            );
+            let impl_generics = referrer.impl_generics(referrer.context(ix));
+            assert_eq!(
+                ambiguous_in(&impl_generics),
+                Vec::<String>::new(),
+                "`{}`",
+                string(&impl_generics)
+            );
+        }
+    }
+    // The order and the parentheses of the source do not change the generics of the context.
+    let contexts: Vec<String> = items
+        .iter()
+        .take(2)
+        .map(|item| {
+            let mut leaker = new_leaker();
+            leaker.intern_struct(item, true).unwrap();
+            let referrer = leaker.finish();
+            let ix = entry(&referrer, "Rel < T >");
+            string(referrer.context_generics(referrer.context(ix)))
+        })
+        .collect();
+    assert_eq!(contexts[0], contexts[1]);
 }
 
 // ── F9 ───────────────────────────────────────────────────────────────────────
 
-/// Whether a type is a reference or a pointer to a function pointer: as the bounded type of a where
-/// predicate, rustc reads the `:` after `&fn(..)` as the start of a return type.
+/// Whether a type is a function pointer without an output that is reached through a reference or a
+/// pointer (also after the output of another function pointer: `fn() -> &fn()`): as the bounded
+/// type of a where predicate, rustc reads the `:` after it as the start of its return type.
 fn bare_fn_under_pointer(ty: &Type) -> bool {
-    fn tail_is_bare_fn(ty: &Type) -> bool {
+    let mut under_pointer = false;
+    let mut ty = ty;
+    loop {
         match ty {
-            Type::Reference(r) => tail_is_bare_fn(&r.elem),
-            Type::Ptr(p) => tail_is_bare_fn(&p.elem),
-            Type::BareFn(_) => true,
-            _ => false,
+            Type::Reference(r) => {
+                under_pointer = true;
+                ty = &r.elem;
+            }
+            Type::Ptr(p) => {
+                under_pointer = true;
+                ty = &p.elem;
+            }
+            Type::BareFn(f) => match &f.output {
+                ReturnType::Type(_, output) => ty = output,
+                ReturnType::Default => return under_pointer,
+            },
+            _ => return false,
         }
-    }
-    match ty {
-        Type::Reference(r) => tail_is_bare_fn(&r.elem),
-        Type::Ptr(p) => tail_is_bare_fn(&p.elem),
-        _ => false,
     }
 }
 
@@ -902,6 +989,25 @@ impl<'ast> Visit<'ast> for UnparenthesizedPredicates {
             self.0.push(string(predicate));
         }
         syn::visit::visit_predicate_type(self, predicate)
+    }
+}
+
+/// The references and pointers to a trait object with several bounds, unparenthesized: `&dyn A +
+/// B` is ambiguous.
+struct UnparenthesizedPointees(Vec<String>);
+
+impl<'ast> Visit<'ast> for UnparenthesizedPointees {
+    fn visit_type_reference(&mut self, i: &'ast TypeReference) {
+        if matches!(&*i.elem, Type::TraitObject(object) if object.bounds.len() > 1) {
+            self.0.push(string(i));
+        }
+        syn::visit::visit_type_reference(self, i)
+    }
+    fn visit_type_ptr(&mut self, i: &'ast TypePtr) {
+        if matches!(&*i.elem, Type::TraitObject(object) if object.bounds.len() > 1) {
+            self.0.push(string(i));
+        }
+        syn::visit::visit_type_ptr(self, i)
     }
 }
 
@@ -918,31 +1024,80 @@ impl<'ast> Visit<'ast> for UnparenthesizedPredicates {
 ///
 /// The assertion: no where predicate of the copy has a reference or a pointer to a function
 /// pointer as the bounded type, unparenthesized (`fn(..): 'y` alone and `&dyn Any: 'y` are fine).
+///
+/// Fixed: the replacement parenthesizes a bounded type that needs it (`(&fn(..)): 'y`), in the
+/// visitor, in `iter_with_self()` and where the Leaker rewrites a bound for another `Self`. The
+/// same holds for the pointee of a reference or a pointer that `Self` replaces and that has several
+/// bounds (`&(dyn Any + Send)`): the second part pins it.
 #[test]
-#[ignore = "F9: Self replaced by `&fn(..)` is the bounded type of a where predicate without parentheses (bug)"]
 fn f09_fn_pointer_self_predicate_print() {
     let item: ItemTrait = parse_quote! {
         pub trait Tr {
             fn m<'y>(&self, a: u8) where Self: 'y;
             fn n(&self, a: u8) where Self: Clone;
+            fn r(&self) -> Rel<Self> where Self: Clone;
         }
     };
     let mut leaker = new_leaker();
     let context = leaker.intern_trait(&item, true).unwrap();
     let referrer = leaker.finish();
-    let self_ty: Type = parse_quote!(&'static unsafe fn(i32, R0));
+    let self_tys: Vec<Type> = vec![
+        parse_quote!(&'static unsafe fn(i32, R0)),
+        parse_quote!(*const fn(i32)),
+        parse_quote!(fn(i32) -> &'static fn(u8)),
+        parse_quote!(fn(i32)),
+    ];
+    for self_ty in self_tys {
+        let mut copy = Item::Trait(item.clone());
+        referrer
+            .clone()
+            .visitor(context, |_, ix| parse_quote!(P<#ix>))
+            .with_self(self_ty.clone())
+            .visit_item_mut(&mut copy);
+        let mut found = UnparenthesizedPredicates(Vec::new());
+        found.visit_item(&copy);
+        assert!(
+            found.0.is_empty(),
+            "Self = `{}`: unparenthesized bounded types, which rustc cannot parse: {:?}",
+            string(&self_ty),
+            found.0
+        );
+        // The generics of the entry `Rel<Self>`, which has `where Self: Clone`.
+        let mut seen = false;
+        for (_, generics) in referrer.iter_with_self(&self_ty) {
+            let mut found = UnparenthesizedPredicates(Vec::new());
+            found.visit_generics(&generics);
+            seen |= generics.where_clause.is_some();
+            assert!(
+                found.0.is_empty(),
+                "Self = `{}`: iter_with_self() has {:?}",
+                string(&self_ty),
+                found.0
+            );
+        }
+        assert!(seen, "the entry `Rel<Self>` has no where predicate");
+    }
 
+    // The pointee of a reference and of a pointer.
+    let item: ItemTrait = parse_quote! {
+        pub trait Tr2 {
+            fn p(&self, a: &Self, b: *const Self, c: Box<Self>) where &'static Self: Clone;
+        }
+    };
+    let mut leaker = new_leaker();
+    let context = leaker.intern_trait(&item, true).unwrap();
+    let referrer = leaker.finish();
+    let self_ty: Type = parse_quote!(dyn ::core::any::Any + Send + 'static);
     let mut copy = Item::Trait(item.clone());
     referrer
-        .clone()
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
-        .with_self(self_ty.clone())
+        .with_self(self_ty)
         .visit_item_mut(&mut copy);
-    let mut found = UnparenthesizedPredicates(Vec::new());
+    let mut found = UnparenthesizedPointees(Vec::new());
     found.visit_item(&copy);
     assert!(
         found.0.is_empty(),
-        "unparenthesized bounded types, which rustc cannot parse: {:?}",
+        "unparenthesized trait objects with several bounds, which are ambiguous: {:?}",
         found.0
     );
 }

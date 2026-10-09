@@ -459,10 +459,60 @@ fn merge_generics(layers: &[Generics]) -> Generics {
     }
 }
 
-/// Replaces `Self` by what it is at the position of the witness.
+/// Wraps `ty` in parentheses.
+fn parenthesized(ty: &mut Type) {
+    let inner = std::mem::replace(ty, Type::Verbatim(TokenStream::new()));
+    *ty = Type::Paren(TypeParen {
+        paren_token: Default::default(),
+        elem: Box::new(inner),
+    });
+}
+
+/// Whether a type is printed so that rustc cannot read it as the bounded type of a where predicate:
+/// a function pointer without an output, reached through a reference or a pointer, takes the `:`
+/// for the start of its output (`&fn(A): 'y`: "return types are denoted using `->`").
+fn colon_is_taken_as_output(ty: &Type) -> bool {
+    let mut under_pointer = false;
+    let mut ty = ty;
+    loop {
+        match ty {
+            Type::Reference(TypeReference { elem, .. }) | Type::Ptr(TypePtr { elem, .. }) => {
+                under_pointer = true;
+                ty = elem;
+            }
+            Type::BareFn(TypeBareFn {
+                output: ReturnType::Type(_, output),
+                ..
+            }) => ty = output,
+            Type::BareFn(_) => return under_pointer,
+            _ => return false,
+        }
+    }
+}
+
+/// Replaces `Self` by what it is at the position of the witness. The type is substituted as
+/// tokens, so it is parenthesized where its precedence matters: as the bounded type of a where
+/// predicate (`(&fn(A)): 'y`) and as the pointee of a reference or a pointer (`&(dyn A + B)`).
 struct SelfSubst<'a>(&'a SelfSub);
 
 impl VisitMut for SelfSubst<'_> {
+    fn visit_predicate_type_mut(&mut self, i: &mut PredicateType) {
+        syn::visit_mut::visit_predicate_type_mut(self, i);
+        if colon_is_taken_as_output(&i.bounded_ty) {
+            parenthesized(&mut i.bounded_ty);
+        }
+    }
+
+    fn visit_type_reference_mut(&mut self, i: &mut TypeReference) {
+        syn::visit_mut::visit_type_reference_mut(self, i);
+        self.parenthesize_pointee(&mut i.elem);
+    }
+
+    fn visit_type_ptr_mut(&mut self, i: &mut TypePtr) {
+        syn::visit_mut::visit_type_ptr_mut(self, i);
+        self.parenthesize_pointee(&mut i.elem);
+    }
+
     fn visit_type_mut(&mut self, i: &mut Type) {
         if let Type::Path(TypePath { qself: None, path }) = i {
             if path.leading_colon.is_none()
@@ -494,6 +544,14 @@ impl VisitMut for SelfSubst<'_> {
             }
         }
         syn::visit_mut::visit_type_mut(self, i)
+    }
+}
+
+impl SelfSubst<'_> {
+    fn parenthesize_pointee(&self, elem: &mut Type) {
+        if matches!(elem, Type::TraitObject(object) if object.bounds.len() > 1) {
+            parenthesized(elem);
+        }
     }
 }
 

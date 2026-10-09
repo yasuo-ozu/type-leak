@@ -1,9 +1,9 @@
 //! The context of a leaked type: its generics, what `Self` means, and its module.
 
 use crate::util::{
-    generic_param_mentions_self, generic_param_name, ident_name, self_in_param, self_in_predicate,
-    token_names, type_mentions_self, unwrap_type_group, where_predicate_mentions_self, ReplaceSelf,
-    SelfMentions,
+    canonical_bounds, generic_param_mentions_self, generic_param_name, ident_name, self_in_param,
+    self_in_predicate, token_names, type_mentions_self, unwrap_type_group,
+    where_predicate_mentions_self, ReplaceSelf, SelfMentions,
 };
 use proc_macro2::{Literal, TokenStream};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1159,7 +1159,7 @@ fn canonicalize(generics: Generics) -> Generics {
         match param {
             GenericParam::Type(param) => {
                 param.attrs.clear();
-                param.bounds = sort_bounds(std::mem::take(&mut param.bounds));
+                param.bounds = canonical_bounds(std::mem::take(&mut param.bounds));
                 param.colon_token = (!param.bounds.is_empty()).then(Default::default);
                 param.eq_token = None;
                 param.default = None;
@@ -1191,7 +1191,7 @@ fn canonicalize(generics: Generics) -> Generics {
         .into_iter()
         .map(|mut predicate| {
             if let WherePredicate::Type(predicate) = &mut predicate {
-                predicate.bounds = sort_bounds(std::mem::take(&mut predicate.bounds));
+                predicate.bounds = canonical_bounds(std::mem::take(&mut predicate.bounds));
             }
             (quote!(#predicate).to_string(), predicate)
         })
