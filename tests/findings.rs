@@ -8,7 +8,7 @@
 //!
 //! | test | finding | kind |
 //! |------|---------|------|
-//! | `f01_unsized_type_param_encoding` | a `?Sized` parameter is a bare element of the tuple of the trait arguments | bug |
+//! | `f01_unsized_type_param_encoding` | a `?Sized` parameter is a bare element of the tuple of the trait arguments | fixed |
 //! | `f02_bound_names_leaked_type_env_cycle` | a copy with a bound and a where predicate that name entries | bug |
 //! | `f03_where_predicate_pulls_param_into_context` | an entry under a where predicate that names a lifetime is not found | bug |
 //! | `f04_module_crate_relative_path_not_rewritten` | an entry that names a declared item of a module is shared by all modules | fixed |
@@ -159,47 +159,127 @@ fn bare_unsized_element(generics: &Generics, encoded: &Type) -> Option<Ident> {
 /// F1: a `?Sized` type parameter is encoded as a bare tuple element.
 ///
 /// Trigger: `struct S<T: ?Sized, U>(Rel<T, U>)`: the entry `Rel<T, U>` uses `<T: ?Sized, U>`, and
-/// the Repeater's trait arguments encode them as the tuple `(T, U)`. A tuple is well-formed only if
-/// its last element is unsized, so the impl that a macro emits for the entry does not compile
-/// (E0277). Found by the property test with `TYPE_LEAK_PROP_FEATURES=unsized_params`.
+/// the Repeater's trait arguments encoded them as the tuple `(T, U)`. A tuple is well-formed only
+/// if all its elements but the last are `Sized`, so the impl that a macro emits for the entry did
+/// not compile (E0277). Found by the property test, which now generates `?Sized` parameters.
 ///
-/// The assertion: either the Leaker rejects the item, or the encoder fails, or the encoding does
-/// not have a `?Sized` parameter as a bare element but the last. That leaves the fix open
-/// (`*const T`, `PhantomData<*const T>`, an error). The Repeater's argument `T` is `?Sized`, so a
-/// last unsized element is fine.
+/// The fix encodes a parameter with a `?Sized` bound as `*const T`, which is `Sized` whatever `T`
+/// is, and the other parameters as before. Both sides agree because both see the bound: the
+/// Leaker encodes `Referrer::generics()` of the entry, and the Referrer encodes the arguments with
+/// the same generics as parameters.
+///
+/// The assertions: the encoder succeeds, no `?Sized` parameter is a bare element but the last
+/// (the Repeater's argument `T` is `?Sized`, so the last would be fine), and the encoding of the
+/// arguments is that of the parameters.
 #[test]
-#[ignore = "F1: a ?Sized parameter is a bare, not last, element of the encoded tuple (bug)"]
 fn f01_unsized_type_param_encoding() {
     let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
-    let check = |generics: &Generics, what: &str| {
-        // An error is a rejection, which is fine.
-        if let Ok(encoded) = slots.encode_generics_params_to_ty(&generics.params) {
-            assert_eq!(
-                bare_unsized_element(generics, &encoded),
-                None,
-                "{}: `{}` encodes `{}` with an unsized parameter in the middle",
-                what,
-                string(generics),
-                string(&encoded)
-            );
+    let check = |generics: &Generics, expected: Option<&str>, what: &str| {
+        let encoded = slots
+            .encode_generics_params_to_ty(&generics.params)
+            .unwrap_or_else(|e| panic!("{}: `{}`: {}", what, string(generics), e));
+        assert_eq!(
+            bare_unsized_element(generics, &encoded),
+            None,
+            "{}: `{}` encodes `{}` with an unsized parameter in the middle",
+            what,
+            string(generics),
+            string(&encoded)
+        );
+        if let Some(expected) = expected {
+            let expected: Type = parse_str(expected).unwrap();
+            assert_eq!(string(&encoded), string(&expected), "{}", what);
         }
+        // The Referrer passes each parameter by its own name: the same encoding.
+        let args: Vec<GenericArgument> = generics.params.iter().map(param_arg).collect();
+        let on_referrer_side = slots
+            .encode_generics_args_to_ty(&args, &generics.params)
+            .unwrap();
+        assert_eq!(string(&on_referrer_side), string(&encoded), "{}", what);
     };
 
-    // The encoder on its own.
-    check(&parse_quote!(<T: ?Sized, U>), "the encoder");
-    check(&parse_quote!(<T, U: ?Sized, V>), "the encoder");
+    // The encoder on its own: an unsized parameter first, in the middle and last.
+    check(
+        &parse_quote!(<T: ?Sized, U>),
+        Some("(*const T, U)"),
+        "the encoder",
+    );
+    check(
+        &parse_quote!(<T, U: ?Sized, V>),
+        Some("(T, *const U, V)"),
+        "the encoder",
+    );
+    check(
+        &parse_quote!(<T, U: ?Sized>),
+        Some("(T, *const U)"),
+        "the encoder",
+    );
+    check(
+        &parse_quote!(<T: ?Sized>),
+        Some("(*const T,)"),
+        "the encoder",
+    );
+    // Other bounds stay out of the way, and a lifetime bound is encoded as it is for a sized one.
+    check(
+        &parse_quote!(<'a, T: Clone + ?Sized + 'a, U>),
+        Some("(&'a (), *const T, U, &'a T)"),
+        "the encoder",
+    );
+    // A sized parameter is encoded as before.
+    check(&parse_quote!(<T, U: Sized>), Some("(T, U)"), "the encoder");
 
-    // The generics of the entry that the Leaker finds.
-    let item: ItemStruct = parse_quote! {
-        pub struct S<T: ?Sized, U>(Rel<T, U>);
-    };
-    let mut leaker = new_leaker();
-    if leaker.intern_struct(&item, true).is_err() {
-        return;
-    }
-    let referrer = leaker.finish();
-    for (_, generics) in referrer.iter_with_generics() {
-        check(generics, "the entry");
+    // The Referrer's arguments: a pointer to the argument, whatever it is.
+    let generics: Generics = parse_quote!(<T: ?Sized, U: ?Sized, V>);
+    let args: AngleBracketedGenericArguments =
+        parse_quote!(<str, dyn Tr + Send + 'static, [u8; 2]>);
+    let encoded = slots
+        .encode_generics_args_to_ty(&args.args, &generics.params)
+        .unwrap();
+    let expected: Type = parse_quote!((*const str, *const (dyn Tr + Send + 'static), [u8; 2]));
+    assert_eq!(string(&encoded), string(&expected));
+
+    // The generics of the entry that the Leaker finds: the bound is on the parameter, wherever it
+    // was written (a where predicate is moved there).
+    let items: Vec<ItemStruct> = vec![
+        parse_quote!(
+            pub struct S<T: ?Sized, U>(Rel<T, U>);
+        ),
+        parse_quote!(
+            pub struct S<A, B: ?Sized, C>(Rel<A, B, C>);
+        ),
+        parse_quote!(
+            pub struct S<T, U: ?Sized>(Rel<T, U>);
+        ),
+        parse_quote!(
+            pub struct S<T, U>(Rel<T, U>)
+            where
+                T: ?Sized;
+        ),
+        parse_quote!(
+            pub struct S<'a, T: ?Sized + 'a, U>(&'a Rel<T, U>);
+        ),
+    ];
+    for item in items {
+        let mut leaker = new_leaker();
+        // A rejection is fine.
+        if leaker.intern_struct(&item, true).is_err() {
+            continue;
+        }
+        let referrer = leaker.finish();
+        let mut entries = 0;
+        for (_, generics) in referrer.iter_with_generics() {
+            if generics.params.iter().any(|param| {
+                matches!(param, GenericParam::Type(t) if unsized_params(generics).contains(&t.ident))
+            }) {
+                entries += 1;
+                check(generics, None, &string(&item));
+            }
+        }
+        assert!(
+            entries > 0,
+            "`{}` has no entry with a `?Sized` parameter",
+            string(&item)
+        );
     }
 }
 

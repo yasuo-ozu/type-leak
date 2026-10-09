@@ -19,6 +19,8 @@ use template_quote::quote;
 /// defaults of `params`, so complete the arguments of a context with `Referrer::complete_args()`.
 /// Bounds are encoded with the arguments substituted: `T: 'a` with `'static` and `u8` is
 /// `&'static u8`. `Self: 'a` is not: use [`encode_generics_args_to_ty_with_self()`].
+/// The argument of a parameter with a `?Sized` bound is wrapped, as the parameter is:
+/// `T: ?Sized` with `str` is `*const str` (see [`encode_generics_params_to_ty_with()`]).
 ///
 /// Fails with [`EncodeError`] for too many or missing arguments, and with
 /// [`EncodeError::UnboundedTraitObject`] for a trait object argument without a lifetime bound.
@@ -65,6 +67,9 @@ pub(crate) fn encode_generics_args_with_params<'a, 'b>(
     for (param, arg) in params.iter().zip(&args) {
         elems.push(match (param, arg) {
             (_, GenericArgument::Lifetime(arg)) => parse_quote!(& #arg ()),
+            (GenericParam::Type(tp), GenericArgument::Type(ty)) if is_maybe_unsized(tp) => {
+                unsized_element(ty)
+            }
             (_, GenericArgument::Type(ty)) => ty.clone(),
             (GenericParam::Const(cp), GenericArgument::Const(value)) => const_fn(value, cp)?,
             // `complete_generics_args()` returns an argument of the kind of each parameter.
@@ -247,6 +252,11 @@ fn unwrap_block(expr: &Expr) -> &Expr {
 /// // The bounds follow the parameters.
 /// let ty = encode_generics_params_to_ty(&generics.params);
 /// assert_eq!(ty, parse_quote!((&'a (), &'b (), T, [(); N], &'a &'b (), &'a T)));
+///
+/// // A type parameter that may be unsized is a pointer to it, which is always `Sized`.
+/// let generics: Generics = parse_quote!(<T: ?Sized, U>);
+/// let ty = encode_generics_params_to_ty(&generics.params);
+/// assert_eq!(ty, parse_quote!((*const T, U)));
 /// ```
 pub fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericParam>) -> Type {
     encode_generics_params_to_ty_with(iter, |ConstParam { ident, .. }| parse_quote!([(); #ident]))
@@ -254,9 +264,14 @@ pub fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a Gener
 
 /// Encodes generic parameters into a tuple type, using `const_fn` for const parameters.
 ///
-/// A lifetime `'a` becomes `&'a ()` and a type `T` becomes `T`. The lifetime bounds follow, in the
-/// order of the parameters and their bounds: `T: 'a` becomes `&'a T`, and `'b: 'a` becomes
-/// `&'a &'b ()`. Only a bound by a lifetime parameter of `iter` is encoded.
+/// A lifetime `'a` becomes `&'a ()` and a type `T` becomes `T`. A type with a `?Sized` bound
+/// becomes `*const T` instead: all the elements of a tuple but the last must be `Sized`, and a
+/// raw pointer is, whatever it points to. The impl must still declare the `?Sized` bound, which
+/// [`without_encoded_bounds()`] keeps. The bound must be on the parameter, because a where clause
+/// is not seen. The generics of a context have it there: `Referrer::generics()` moves a predicate
+/// `T: ?Sized` to the parameter. The lifetime bounds follow, in the order of the parameters and
+/// their bounds: `T: 'a` becomes `&'a T`, and `'b: 'a` becomes `&'a &'b ()`. Only a bound by a
+/// lifetime parameter of `iter` is encoded.
 /// A reference implies its bound wherever it is written. So the impl must not declare the bounds
 /// it encodes. Declare `Referrer::impl_generics()` or [`without_encoded_bounds()`] instead (see
 /// [Outlives bounds](crate#outlives-bounds)). `Self: 'a` is not encoded: use
@@ -305,6 +320,10 @@ pub(crate) fn encode_generics_params_with<'a>(
                     parse_quote!(& #lifetime ())
                 }
                 GenericParam::Const(cp) => const_fn(cp)?,
+                GenericParam::Type(tp) if is_maybe_unsized(tp) => {
+                    let ident = &tp.ident;
+                    unsized_element(&parse_quote!(#ident))
+                }
                 GenericParam::Type(TypeParam { ident, .. }) => parse_quote!(#ident),
             })
         })
@@ -472,6 +491,36 @@ pub(crate) fn encode_self_outlives(
         }
     }
     Ok(elems)
+}
+
+/// Whether `param` may be unsized: it has a `?Sized` bound, as the generics of a context do (the
+/// Leaker moves a where predicate `T: ?Sized` to the parameter).
+pub(crate) fn is_maybe_unsized(param: &TypeParam) -> bool {
+    param.bounds.iter().any(|bound| {
+        matches!(
+            bound,
+            TypeParamBound::Trait(TraitBound {
+                modifier: TraitBoundModifier::Maybe(_),
+                ..
+            })
+        )
+    })
+}
+
+/// The element of the trait arguments for the type `ty` of a `?Sized` parameter: `*const ty`.
+///
+/// A tuple is well-formed only if the elements but the last are `Sized`, and a raw pointer is
+/// `Sized` whatever it points to. A trait object is parenthesized, since `*const dyn A + B` does
+/// not parse.
+fn unsized_element(ty: &Type) -> Type {
+    let pointee = match unwrap_type_group(ty) {
+        Type::TraitObject(object) => Type::Paren(TypeParen {
+            paren_token: Default::default(),
+            elem: Box::new(Type::TraitObject(object.clone())),
+        }),
+        _ => ty.clone(),
+    };
+    parse_quote!(*const #pointee)
 }
 
 /// Returns `ty` as the referent of a reference. A trait object is parenthesized, and needs a
