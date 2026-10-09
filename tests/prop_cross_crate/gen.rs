@@ -105,7 +105,8 @@ pub struct Features {
     /// method, and the impl it needs has `T: Fn(Rel)`, which the copy writes as `T:
     /// Fn(<() as Repeater<..>>::Type)`, not normalized yet (E0277, E0271). The context of the
     /// leaked type has no generics, so the check for a bound that names a leaked type misses it
-    /// (F14). Off, the impls of the traits that have both are not generated.
+    /// (F14, fixed: on by default, the Leaker rejects it). Off, the impls of the traits that have
+    /// both are not generated.
     pub impl_pred_leaked: bool,
     /// `fn(&A) -> &R` or `Fn(&A) -> &R` (the elided lifetime of the input is the output's) where
     /// `A` names `Self`, and the copy writes `Self` as a type that has lifetimes (the self type of
@@ -127,7 +128,8 @@ pub struct Features {
     /// An optional entry in a where predicate that names a lifetime (`T: Fn(&'a ::ext::W<T,
     /// ::ext::B0>)`) has the predicate in its context, so it is replaced by a path that needs
     /// itself (E0277, F17): `not_optional` of the Leaker misses the type that holds another
-    /// optional type. Off, the item that has it is not invoked as strict.
+    /// optional type. Fixed (on by default): the Leaker copies it as written. Off, the item that
+    /// has it is not invoked as strict.
     pub strict_cycles: bool,
     /// A strict Referrer replaces an optional entry that holds a lifetime of a method (`fn
     /// m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>`): the copy has `'x` in no argument that
@@ -139,20 +141,21 @@ pub struct Features {
     /// (`X: Fn(&Self) -> u8`) and a leaked type in another predicate that uses the generic
     /// (`Rel<X>: Default`): the entry's Repeater impl has the bound with the Leaker's self type,
     /// and the copy has it with `Self` = the unnormalized projection that replaces the self type
-    /// (E0277, E0271, F19). Off, the other predicates that use the generic are dropped, and a
-    /// trait whose where clause has such a bound (`impl_self_bounds`) is not implemented where a
-    /// method predicate uses the generic.
+    /// (E0277, E0271, F19, fixed: on by default, the Leaker rejects it). Off, the other predicates
+    /// that use the generic are dropped, and a trait whose where clause has such a bound
+    /// (`impl_self_bounds`) is not implemented where a method predicate uses the generic.
     pub impl_self_bound_cycle: bool,
     /// The same in a trait with a bound that names `Self::A` (`X: Fn(&Self::A0) -> u8`): the
     /// impl of the Repeater for the host has the bound with the host's type for `A0`, and the copy
-    /// has `<Host as Tr>::A0`, which rustc does not normalize in the environment (E0271, F20).
-    /// Off, the other predicates that use the generic are dropped.
+    /// has `<Host as Tr>::A0`, which rustc does not normalize in the environment (E0271, F20,
+    /// fixed: on by default, the Leaker rejects it). Off, the other predicates that use the
+    /// generic are dropped.
     pub trait_assoc_bound_cycle: bool,
     /// A bound of an iterator that names its `Item` (`T: Fn(<T as Iterator>::Item)`), and a
     /// predicate that equates the `Item` to a leaked type (`T: Iterator<Item = Rel<T>>`): the
     /// entry has the first bound in its context, and rustc must normalize `T::Item`, which the
-    /// predicate defines by the entry: a cycle (E0275, F21). Off, the predicate with `Item = ..`
-    /// is dropped where the bound is.
+    /// predicate defines by the entry: a cycle (E0275, F21, fixed: on by default, the Leaker
+    /// rejects it). Off, the predicate with `Item = ..` is dropped where the bound is.
     pub iterator_item_cycle: bool,
 }
 
@@ -173,6 +176,11 @@ impl Features {
             implied_outlives: true,
             self_elision: true,
             impl_self_bounds: true,
+            impl_pred_leaked: true,
+            strict_cycles: true,
+            impl_self_bound_cycle: true,
+            trait_assoc_bound_cycle: true,
+            iterator_item_cycle: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -2125,7 +2133,13 @@ impl Gen {
         } else if can_name && self.chance(30) {
             // They ask for both: `X: Fn(&Self) -> u8` or `X: Fn(&Self::A) -> u8`, and `Rel<X>:
             // Default`.
-            let sized: Vec<&TyParam> = sc.tys.iter().filter(|p| p.sized).collect();
+            // On a parameter that has no `Fn` bound yet: two of them are ambiguous when `Self::A`
+            // is a type that both can take.
+            let sized: Vec<&TyParam> = sc
+                .tys
+                .iter()
+                .filter(|p| p.sized && !sk.bounded.contains(&(p.name.clone(), "fn")))
+                .collect();
             let heads: Vec<String> = self
                 .env
                 .heads
@@ -2141,6 +2155,7 @@ impl Gen {
                     "Self".to_string()
                 };
                 let head = self.pick(&heads).clone();
+                sk.bounded.push((x.clone(), "fn"));
                 sk.preds
                     .push(format!("{}: ::core::ops::Fn(&{}) -> u8", x, named));
                 sk.preds
@@ -2768,6 +2783,12 @@ impl Gen {
                 self.features.impl_pred_leaked
                     || !(self.traits[i].self_assoc_in_pred && self.traits[i].preds_leakable)
             })
+            // The same without a leaked type: a bound of the trait that names the `Item` of an
+            // iterator that a predicate equates to a type is not normalized in the environment
+            // either, so rustc itself cannot prove the impl there (E0277, with no `type-leak`).
+            .filter(|&i| {
+                !(self.traits[i].self_assoc_in_pred && item_bound_in_trait(&self.traits[i]))
+            })
             .collect();
         if candidates.is_empty() {
             return None;
@@ -3253,6 +3274,20 @@ fn names_item(pred: &str, x: &str) -> bool {
 /// Whether the predicate `pred` equates the `Item` of the parameter `x` to a type.
 fn binds_item(pred: &str, x: &str) -> bool {
     pred.starts_with(&format!("{}: ::core::iter::Iterator<Item = ", x))
+}
+
+/// Whether the where clause of `tr` names the `Item` of an iterator that a predicate of the trait or
+/// of a method equates to a type.
+fn item_bound_in_trait(tr: &TraitInfo) -> bool {
+    tr.sk.tys.iter().filter(|t| t.iter).any(|t| {
+        let x = &t.name;
+        tr.sk.preds.iter().any(|p| names_item(p, x))
+            && (tr.sk.preds.iter().any(|p| binds_item(p, x))
+                || tr
+                    .methods
+                    .iter()
+                    .any(|m| m.contains(&format!("{}: ::core::iter::Iterator<Item = ", x))))
+    })
 }
 
 /// Whether `text` has `name` as a word (an identifier).

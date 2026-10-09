@@ -13,10 +13,12 @@ use crate::error::{NotInternableError, SELF_NOTE};
 use crate::graph::is_whole_reference;
 #[cfg(doc)]
 use crate::leaker::Leaker;
+use crate::unstable::{bindings, Projections, Unstable, Why};
 use crate::util::{
     first_associated_self_in_generics, first_self_in_generics, first_self_in_type,
-    generic_param_name, has_lifetime_bound, ident_name, is_primitive_name, selves_in_generics,
-    token_names, trait_object_of, unwrap_type_group, without_defaults, AllowedPaths,
+    generic_param_mentions_self, generic_param_name, has_lifetime_bound, ident_name,
+    is_primitive_name, selves_in_generics, token_names, trait_object_of, unwrap_type_group,
+    where_predicate_mentions_self, without_defaults, AllowedPaths,
 };
 use crate::view::View;
 use proc_macro2::TokenStream;
@@ -1405,11 +1407,14 @@ impl AnalyzeVisitor {
             if projection || (self.self_written && is_bare_self(ty)) {
                 if let Ok(context) = self.context_of(ty, &inner) {
                     // The self type of an impl needs a rewrite only if it names a leaked type.
-                    if projection || self.self_type_names_leaked(&context) {
+                    if projection || self.self_type_names_leaked(&context, false) {
                         if let Some(conflict) = self.self_env_cycle(ty, &context) {
                             return self.env_errors.push(conflict);
                         }
                         self.not_optional_in_bounds(&context);
+                        if let Some(impl_context) = self.impl_context(projection) {
+                            self.not_optional_in_bounds(&impl_context);
+                        }
                     }
                     if !projection {
                         self.not_optional_in_self_type(&context);
@@ -1485,6 +1490,11 @@ impl AnalyzeVisitor {
                     self.not_optional_in_bounds(&context);
                 }
                 let no_optional_entry = has_optional && self.env_blocked(&context, true);
+                // A reference that is an entry is one as a whole, so its parts cannot stand for
+                // it. If it cannot be an entry, the optional entries in it are not either.
+                if no_optional_entry && is_whole_reference(ty) {
+                    self.not_optional.extend(optional_keys(&effects));
+                }
                 PendingType {
                     in_graph,
                     optional: optional.is_some(),
@@ -1499,34 +1509,40 @@ impl AnalyzeVisitor {
     }
 
     /// Returns the conflict if `ty`, leaked whole in `context`, would make a cycle in the copy: it
-    /// is in a bound or a where predicate, and a bound of its generics names a leaked type, or it
-    /// names `Self` in a predicate of the trait that declares it.
+    /// is in a bound or a where predicate, and a bound of its generics is unstable (see
+    /// [`crate::unstable`]: it names a leaked type, `Self`, `Self::A` or an associated type that
+    /// rustc normalizes), or it names `Self` in a predicate of the trait that declares it.
     ///
-    /// The copy writes both as paths through the Repeater. rustc normalizes the one in a predicate
-    /// of the item while it builds the environment of the item, in which the other is not
+    /// The copy writes it as a path through the Repeater. rustc normalizes it in a predicate of
+    /// the item while it builds the environment of the item, in which the bounds are not
     /// normalized yet: the impl of the Repeater for `ty` needs the bound of its generics (`T:
     /// Fn(Rel)`), and the environment has it as `T: Fn(<() as Repeater<..>>::Type)`. So it
     /// cannot prove it (E0277 "expected an `Fn(Rel)` closure, found `T`", E0275, E0284). Any
     /// predicate of the item does it, a bound as well as a where predicate, also the bound that
     /// names `ty` itself (`T: Tr<Wrap<T>>`). Types in fields and signatures are fine: they are
-    /// normalized in the environment once it is built. So are bounds that name no leaked type
-    /// (`T: Clone`), and predicates on a type that is not a generic, which an impl proves. The
-    /// Leaker cannot rewrite it, as the Repeater is the only link between the two crates, so it is
-    /// an error.
+    /// normalized in the environment once it is built. So are bounds that are stable (`T:
+    /// Clone`), and predicates on a type that is not a generic, which an impl proves. The Leaker
+    /// cannot rewrite it, as the Repeater is the only link between the two crates, so it is an
+    /// error.
     ///
-    /// The impl of the Repeater for a type that names `Self` of a trait is for the implementors,
-    /// bounded by the trait: proving it for the host of the copy needs the predicates of the
-    /// trait, which name the type.
     fn env_cycle(&self, ty: &Type, context: &Context) -> Option<CheckResult> {
-        match self.env_leaked_bound(context, false) {
-            Some(bound) => {
-                let why = format!(
-                    "the bound `{}` of its generics names a type that is leaked too: the copy \
-                     writes both as paths through the Repeater, and rustc cannot normalize the one \
-                     in a bound or where predicate while it checks the bounds (E0277, E0275)",
-                    bound
-                );
-                Some(self.cycle_error(ty, why))
+        match self.env_unstable_bound(context, false) {
+            Some(unstable) => {
+                let why = match &unstable.why {
+                    Why::Leaked => format!(
+                        "the bound `{}` of its generics names a type that is leaked too: the copy \
+                         writes both as paths through the Repeater, and rustc cannot normalize the \
+                         one in a bound or where predicate while it checks the bounds (E0277, \
+                         E0275)",
+                        unstable.bound
+                    ),
+                    _ => format!(
+                        "the bound `{}` of its generics {}",
+                        unstable.bound,
+                        unstable.explain()
+                    ),
+                };
+                Some(self.unstable_error(ty, &unstable, why))
             }
             None => {
                 let bound = self.trait_cycle(context)?;
@@ -1547,28 +1563,64 @@ impl AnalyzeVisitor {
     }
 
     /// Like `env_cycle()` for `Self::A` and for `Self` of an impl: they need the bounds of the
-    /// generics of their context only.
+    /// generics of their context only, and `Self::A` of an impl the bounds of the impl, whose impl
+    /// of the trait rustc selects to resolve it.
     fn self_env_cycle(&self, ty: &Type, context: &Context) -> Option<CheckResult> {
-        let bound = self.env_leaked_bound(context, false)?;
-        let why = if is_self_projection(ty) {
-            format!(
+        let projection = is_self_projection(ty);
+        let (unstable, owner) = match self.env_unstable_bound(context, false) {
+            Some(unstable) => (unstable, "its generics"),
+            None => (self.impl_unstable_bound(projection)?, "the impl"),
+        };
+        let why = match (&unstable.why, projection) {
+            (Why::Leaked, true) => format!(
                 "the copy for a concrete implementor resolves `{}` by the impl of the trait, \
-                 which needs the bound `{}` of its generics, where the copy writes the leaked type \
+                 which needs the bound `{}` of {}, where the copy writes the leaked type \
                  as a path through the Repeater, and rustc cannot normalize the one in a bound or \
                  where predicate while it checks the bounds (E0277, E0275)",
                 quote!(#ty),
-                bound
-            )
-        } else {
-            format!(
+                unstable.bound,
+                owner
+            ),
+            (Why::Leaked, false) => format!(
                 "`Self` is the self type of the impl, which the copy writes with its leaked types \
                  as paths through the Repeater, and the bound `{}` of their generics names a type \
                  that is leaked too, and rustc cannot normalize the one in a bound or where \
                  predicate while it checks the bounds (E0277, E0275)",
-                bound
-            )
+                unstable.bound
+            ),
+            (_, true) => format!(
+                "the copy for a concrete implementor resolves `{}` by the impl of the trait, \
+                 which needs the bound `{}` of {}, which {}",
+                quote!(#ty),
+                unstable.bound,
+                owner,
+                unstable.explain()
+            ),
+            (_, false) => format!(
+                "`Self` is the self type of the impl, which the copy writes with its leaked types \
+                 as paths through the Repeater, and the bound `{}` of their generics {}",
+                unstable.bound,
+                unstable.explain()
+            ),
         };
-        Some(self.cycle_error(ty, why))
+        Some(self.unstable_error(ty, &unstable, why))
+    }
+
+    /// Returns the first bound of the impl that declares `Self` that the environment cannot prove,
+    /// for `Self::A` (`projection`): rustc resolves it by the impl of the trait, which has all the
+    /// generics of the impl, not only those that `Self` uses.
+    fn impl_unstable_bound(&self, projection: bool) -> Option<Unstable> {
+        self.env_unstable_bound(&self.impl_context(projection)?, false)
+    }
+
+    /// Returns the generics of the impl that declares `Self`, if `Self::A` (`projection`) is in
+    /// one of its predicates, as a context.
+    fn impl_context(&self, projection: bool) -> Option<Context> {
+        if !projection || !self.self_written || self.self_depth == 0 {
+            return None;
+        }
+        let scope = self.scopes.get(self.self_depth - 1)?;
+        Some(Context::new(scope.generics(), self.self_ty.clone()))
     }
 
     fn cycle_error(&self, ty: &Type, why: String) -> CheckResult {
@@ -1591,6 +1643,31 @@ impl AnalyzeVisitor {
         }
     }
 
+    /// The error for `ty`, which is in a predicate and needs `unstable`: like `cycle_error()`, with
+    /// the headline and the advice of what the bound names.
+    fn unstable_error(&self, ty: &Type, unstable: &Unstable, why: String) -> CheckResult {
+        if matches!(unstable.why, Why::Leaked) {
+            return self.cycle_error(ty, why);
+        }
+        CheckResult {
+            must: vec![quote!(#ty)],
+            impossible: Vec::new(),
+            is_own: true,
+            optional: false,
+            note: Some(format!(
+                "{}. {}, or use `{}` outside the bounds and where predicates",
+                why,
+                unstable.why.advice(),
+                quote!(#ty)
+            )),
+            headline: Some(format!(
+                "`{}` is in a bound or where predicate, and a bound of its generics names {}",
+                quote!(#ty),
+                unstable.why.names()
+            )),
+        }
+    }
+
     /// Returns `Self: Trait` if a type in `context` names `Self` of a trait, and the predicates of
     /// that trait are being visited (not those of its methods): see `env_cycle()`.
     fn trait_cycle(&self, context: &Context) -> Option<TokenStream> {
@@ -1609,7 +1686,7 @@ impl AnalyzeVisitor {
 
     /// Returns `true` if a type in `context` that is an entry would make a cycle (`env_cycle()`).
     fn env_blocked(&self, context: &Context, optional: bool) -> bool {
-        self.env_leaked_bound(context, optional).is_some() || self.trait_cycle(context).is_some()
+        self.env_unstable_bound(context, optional).is_some() || self.trait_cycle(context).is_some()
     }
 
     /// Runs `visit` on a probe visitor that has the generics and the `Self` of `context`, and
@@ -1624,13 +1701,14 @@ impl AnalyzeVisitor {
     }
 
     /// Returns `true` if the self type of `context`, which is the self type of an impl, names a
-    /// type that is leaked, so the copy writes it as a path through the Repeater.
-    fn self_type_names_leaked(&self, context: &Context) -> bool {
+    /// type that is leaked, so the copy writes it as a path through the Repeater. With `optional`,
+    /// a type that the Referrer may replace counts too.
+    fn self_type_names_leaked(&self, context: &Context, optional: bool) -> bool {
         match context.self_ty() {
             Some(SelfRequirement::Type(ty)) if self.env_depth > 0 && self.check_env => {
                 self.probe(context, |probe| {
                     probe.visit_type(ty);
-                    !probe.musts.is_empty()
+                    !probe.musts.is_empty() || (optional && has_optional(&probe.frame.effects))
                 })
             }
             _ => false,
@@ -1678,15 +1756,107 @@ impl AnalyzeVisitor {
             .map(|predicate| quote!(#predicate))
     }
 
+    /// Returns the first bound of the generics of `context` that the environment cannot prove for
+    /// the impl that rustc selects for a type in a predicate (see [`crate::unstable`]): one that
+    /// names a leaked type (`env_leaked_bound()`), or `Self` if the copy writes the self type as a
+    /// leaked one, `Self::A`, or an associated type that rustc normalizes.
+    fn env_unstable_bound(&self, context: &Context, optional: bool) -> Option<Unstable> {
+        if let Some(bound) = self.env_leaked_bound(context, optional) {
+            return Some(Unstable {
+                bound,
+                why: Why::Leaked,
+            });
+        }
+        if self.env_depth == 0 || !self.check_env {
+            return None;
+        }
+        let generics = context.generics();
+        let bounded = generics.where_clause.is_some()
+            || generics.params.iter().any(|param| match param {
+                GenericParam::Type(param) => !param.bounds.is_empty(),
+                _ => false,
+            });
+        if !bounded {
+            return None;
+        }
+        // The equations of associated types in the environment: `T::Item` of those is not rigid.
+        let bindings = bindings(
+            self.scopes.iter().flat_map(Scope::params),
+            self.scopes.iter().flat_map(Scope::predicates),
+        );
+        let is_param = |name: &str| self.scope_of(name).is_some();
+        // Whether `Self` is the self type of an impl that the copy writes as a leaked type.
+        let mut self_leaked: Option<bool> = None;
+        let mut check = |bound: TokenStream, found: Option<Why>, mentions_self: bool| {
+            let why = match found {
+                Some(why) => why,
+                None if mentions_self
+                    && self.self_written
+                    && *self_leaked
+                        .get_or_insert_with(|| self.self_type_names_leaked(context, optional)) =>
+                {
+                    Why::SelfType
+                }
+                None => return None,
+            };
+            Some(Unstable { bound, why })
+        };
+        for param in &generics.params {
+            if let GenericParam::Type(type_param) = param {
+                let mut finder = Projections::new(&is_param, &bindings);
+                finder.visit_type_param(type_param);
+                let found = check(
+                    quote!(#type_param),
+                    finder.found,
+                    generic_param_mentions_self(param),
+                );
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+        for predicate in generics
+            .where_clause
+            .iter()
+            .flat_map(|where_clause| &where_clause.predicates)
+            .filter(|predicate| needs_environment(predicate, context))
+        {
+            // What the predicate bounds is not a bound of it: only the bounds are normalized for
+            // the impl that needs them (`Self::A: Clone` is proved by an impl).
+            let mut finder = Projections::new(&is_param, &bindings);
+            if let WherePredicate::Type(predicate) = predicate {
+                for bound in &predicate.bounds {
+                    finder.visit_type_param_bound(bound);
+                }
+            }
+            let found = check(
+                quote!(#predicate),
+                finder.found,
+                where_predicate_mentions_self(predicate),
+            );
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+
     /// Called for a type that is leaked in a bound or where predicate, in `context`, and would
     /// make a cycle if the Referrer replaced the optional entries that the bounds of the generics
     /// name (it does if it does not share the crates): they are not optional entries.
     fn not_optional_in_bounds(&mut self, context: &Context) {
-        if self.env_leaked_bound(context, true).is_none() {
-            return;
-        }
+        let unstable = match self.env_unstable_bound(context, true) {
+            Some(unstable) => unstable,
+            None => return,
+        };
         let keys = self.probe(context, |probe| {
             probe.visit_generics(context.generics());
+            // The bound that names `Self` is unstable for the self type that the copy writes.
+            if let (Why::SelfType, Some(SelfRequirement::Type(ty))) =
+                (&unstable.why, context.self_ty())
+            {
+                probe.visit_type(ty);
+            }
             optional_keys(&probe.frame.effects)
         });
         self.not_optional.extend(keys);

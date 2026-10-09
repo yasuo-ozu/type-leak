@@ -277,7 +277,7 @@ Instead, name the lifetime, make the trait path absolute, or write the bound: `&
 
 ## Bounds that name leaked types
 
-A bound or where predicate is rewritten like any other type: `T: Fn(Rel)` becomes `T: Fn(<() as Repeater<..>>::Type)`. That is a problem if a path through the Repeater is in a predicate of the item and its impl needs a bound of the item that names a leaked type. rustc builds the environment of the item from its predicates, and normalizes the path there, while the bounds are not normalized yet. The impl of the Repeater for `Wrap<T>` needs `T: Fn(Rel)`, and the environment has `T: Fn(<() as Repeater<..>>::Type)`: rustc cannot prove it (E0277 "expected an `Fn(Rel)` closure, found `T`", E0275 or E0284). The copy cannot have the original bound, the only link between the crates being the Repeater, so the Leaker reports an error. A type in a field or in a signature is fine, as it is normalized when the environment is built.
+A bound or where predicate is rewritten like any other type: `T: Fn(Rel)` becomes `T: Fn(<() as Repeater<..>>::Type)`. That is a problem if a path through the Repeater is in a predicate of the item and its impl needs a bound of the item that the environment has in another form. rustc builds the environment of the item from its predicates, and normalizes the path there, while the bounds are not normalized yet. The impl of the Repeater for `Wrap<T>` needs `T: Fn(Rel)`, and the environment has `T: Fn(<() as Repeater<..>>::Type)`: rustc cannot prove it (E0277 "expected an `Fn(Rel)` closure, found `T`", E0271, E0275 or E0284). The copy cannot have the original bound, the only link between the crates being the Repeater, so the Leaker reports an error. A type in a field or in a signature is fine, as it is normalized when the environment is built.
 
 ```rust,ignore
 struct S<T: Fn(Rel)>(Wrap<T>) where Wrap<T>: Sized;  // error: `Wrap<T>` is in a predicate, `T: Fn(Rel)` names `Rel`
@@ -285,16 +285,23 @@ struct S<T: Fn(Rel)>(Wrap<T>);                       // good
 struct S<T: Fn(Rel)>(Wrap<T>) where T: Sized;        // good
 ```
 
+A bound is *unstable* if the environment has it in another form than the impl that rustc proves needs it. That is so if it names:
+
+- a leaked type (`T: Fn(Rel)`), which the copy writes as a path through the Repeater;
+- `Self`, if `Self` is the self type of an impl and that is leaked (`X: Fn(Self) -> u8`): the copy writes the self type through the Repeater, and the impl of an entry has the bound with the self type of the Leaker;
+- `Self::A` (`X: Fn(&Self::A) -> u8`): the impl of the Repeater for the implementors has `<__S as Tr>::A`, and the environment of the copy has `<Host as Tr>::A`, which rustc resolves by the impl of the trait;
+- an associated type that rustc normalizes: the `Item` of a generic that an `Iterator<Item = ..>` bound or predicate in scope equates (`T: Fn(T::Item)` next to `T: Iterator<Item = u8>`, also in an enclosing item), the `Output` of `Fn(..)`, a projection of a type that an impl defines (`<Vec<u8> as IntoIterator>::Item`, `<u8 as Tr>::A`). The `Item` of a generic that nothing equates is rigid, and stable. A supertrait that fixes it is not seen.
+
 It is an error for a type in a bound or where predicate of the item or of a method, in these cases:
 
-- It is a leaked type (`where Wrap<T>: Sized`, `U: Into<Wrap<T>>`), and a bound of a generic that it uses names a leaked type. A type that names itself is one: `T: Into<Wrap<T>>`. A bound that names none (`T: Clone`) is fine, and so is a predicate on another type than a generic (`Vec<Rel2<T>>: Clone`), which rustc proves by an impl.
-- It is `Self::A`, an associated type of `Self`, and a bound of the generics of the trait (or of the type of `Self`) names a leaked type. The copy for a concrete implementor resolves it by the impl of the trait.
-- It is `Self`, in an impl whose self type is leaked, and a bound of the generics of the impl names a leaked type. The copy writes the self type through the Repeater, and `Self` stands for it.
+- It is a leaked type (`where Wrap<T>: Sized`, `U: Into<Wrap<T>>`), and a bound of a generic that it uses is unstable. A type that names itself is one: `T: Into<Wrap<T>>`. A bound that is stable (`T: Clone`) is fine, and so is a predicate on another type than a generic (`Vec<Rel2<T>>: Clone`), which rustc proves by an impl. The generics of the type are those of its context, so a bound of the enclosing item counts only if the type uses the generic: `T: Fn(T::Item)` of an impl, and `T: Iterator<Item = Wrap<T>>` of its method.
+- It is `Self::A`, an associated type of `Self`, and a bound of the generics of the trait (or of the type of `Self`) is unstable. The copy for a concrete implementor resolves it by the impl of the trait. In an impl, the impl of the trait has all the generics of the impl, not only those that `Self` uses: `impl<T> Tr<T> for u8 where T: Fn(Rel) { fn m<X>(&self) where X: Into<Self::A>; }` is an error, and so is `impl<T: Fn(Rel)> Tr<T> for u8` with `u8: Into<Self::A>`.
+- It is `Self`, in an impl whose self type is leaked, and a bound of the generics of the impl is unstable. The copy writes the self type through the Repeater, and `Self` stands for it.
 - It is a leaked type that names `Self` of a trait, in a predicate of the trait itself (its where clause, a bound of its generics or a supertrait), not in one of a method: `trait Tr where Rel<Self>: Sized`. The Repeater's impl for it is for the implementors of the trait, so proving that the host of the copy implements the trait needs the predicate, which names the type.
 
-The error names the type and the bound. Instead, write the type of the bound with an absolute path (`T: Fn(::my_crate::Rel)`), or use the type outside of the predicates (in a field or a signature).
+The error names the type and the bound. Instead, write the type of the bound with an absolute path (`T: Fn(::my_crate::Rel)`), write the bound without what it names, or use the type outside of the predicates (in a field or a signature).
 
-Two things are not errors. A type that is an entry only because its parts need it (`(Rel, T, Rel2)` in `T: Fn((Rel, T, Rel2))`) is not one when that makes a cycle: its parts are the entries. An optional entry (see [External crates](#external-crates)) in such a place is not one either, but copied as written, even if the Referrer would replace it.
+Two things are not errors. A type that is an entry only because its parts need it (`(Rel, T, Rel2)` in `T: Fn((Rel, T, Rel2))`) is not one when that makes a cycle: its parts are the entries. An optional entry (see [External crates](#external-crates)) in such a place is not one either, but copied as written, even if the Referrer would replace it. That holds for an optional entry that the bound names (`T: Fn(::ext::X)` and `Wrap<T>: Sized`), for the optional types of a self type that an unstable bound names, and for an optional entry whose own context is unstable (`&'a ::ext::W<T, ::ext::B0>` in `T: Fn(&'a ::ext::W<T, ::ext::B0>)`, where the predicate that names `'a` is part of its context).
 
 ## Method lifetimes
 

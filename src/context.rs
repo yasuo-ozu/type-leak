@@ -75,6 +75,22 @@ impl Scope {
         self.params.iter()
     }
 
+    pub(crate) fn predicates(&self) -> impl Iterator<Item = &WherePredicate> {
+        self.predicates.iter()
+    }
+
+    /// The generics of the scope, as declared.
+    pub(crate) fn generics(&self) -> Generics {
+        Generics {
+            params: self.params.iter().cloned().collect(),
+            where_clause: (!self.predicates.is_empty()).then(|| WhereClause {
+                where_token: Default::default(),
+                predicates: self.predicates.iter().cloned().collect(),
+            }),
+            ..Default::default()
+        }
+    }
+
     fn self_ty(&self) -> Option<&SelfRequirement> {
         self.self_ty.as_ref()
     }

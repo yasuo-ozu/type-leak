@@ -21,14 +21,14 @@
 //! | `f11_copied_impl_param_constrained_only_by_leaked_type` | a copied impl whose self type is an entry | limitation |
 //! | `f12_elided_lifetime_in_fn_sugar_with_generics` | `Fn(&Rel<T>) -> &u8` with an entry that has lifetimes | fixed |
 //! | `f13_impl_bound_names_self_of_leaked_self_type` | a bound of an impl names `Self`, and the self type is an entry: it is its own `Self` | fixed |
-//! | `f14_impl_predicate_names_self_projection_with_leaked_bound` | `Self::A` in a predicate of an impl whose bound names a leaked type | bug |
+//! | `f14_impl_predicate_names_self_projection_with_leaked_bound` | `Self::A` in a predicate of an impl whose bound names a leaked type | fixed |
 //! | `f15_self_rewritten_in_elided_signature` | `with_self()` writes `Self`, with lifetimes, into `fn(&Self) -> &u8` | fixed |
 //! | `f16_implied_outlives_of_self_projection_lost` | `Self::A0: 'x` of `&'x Self::A0` is not recorded, only `Self: 'x` | fixed |
-//! | `f17_optional_entry_in_own_context` | a strict Referrer replaces an optional entry whose own context names it | bug |
+//! | `f17_optional_entry_in_own_context` | a strict Referrer replaces an optional entry whose own context names it | fixed |
 //! | `f18_strict_referrer_replaces_anchor_of_method_lifetime` | a strict Referrer replaces the optional type that holds a method lifetime | limitation |
-//! | `f19_impl_self_in_bound_of_entry_in_predicate` | an entry in a predicate has a bound of its context that names `Self`, in an impl whose self type is leaked | bug |
-//! | `f20_trait_assoc_in_bound_of_entry_in_predicate` | an entry in a predicate has a bound of its context that names `Self::A`, in a trait | bug |
-//! | `f21_iterator_item_in_bound_of_entry_in_item_binding` | an entry in `T: Iterator<Item = ..>` has a bound of its context that names the `Item` | bug |
+//! | `f19_impl_self_in_bound_of_entry_in_predicate` | an entry in a predicate has a bound of its context that names `Self`, in an impl whose self type is leaked | fixed |
+//! | `f20_trait_assoc_in_bound_of_entry_in_predicate` | an entry in a predicate has a bound of its context that names `Self::A`, in a trait | fixed |
+//! | `f21_iterator_item_in_bound_of_entry_in_item_binding` | an entry in `T: Iterator<Item = ..>` has a bound of its context that names the `Item` | fixed |
 //!
 //! The bugs that are not fixed are `#[ignore]`d, as they fail today (a fixed one has no
 //! `#[ignore]`, and `fixed` in the table): run them with
@@ -48,11 +48,8 @@
 //! F10 and F11 are errors of rustc on a copy of a module or an impl that the test macro makes
 //! (E0277, E0207). The tests pin the behaviour of the library that is the cause, not the errors.
 //!
-//! The features of the bugs (F14, F17 and F19 to F21: `impl_pred_leaked`, `strict_cycles`,
-//! `impl_self_bound_cycle`,
-//! `trait_assoc_bound_cycle` and `iterator_item_cycle`) and of the limitation F18
-//! (`strict_anchors`) are off in
-//! the property test: the generator does not make what they fail on (the last two only decide that
+//! The feature of the limitation F18 (`strict_anchors`) is off in
+//! the property test: the generator does not make what it fails on (it only decides that
 //! an item is not invoked as strict). Each test of a bug asserts that the Leaker either rejects
 //! the item or gives what the Referrer needs, and says which of the two is up to the fix.
 
@@ -1856,8 +1853,12 @@ fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, NotI
 ///
 /// The controls are accepted, as they compile: a bound that names no leaked type, and a leaked
 /// bound with `Self::A1` outside the predicates.
+///
+/// Fixed by the rule of F2 for `Self::A` (see "Bounds that name leaked types" of the README and
+/// `tests/bound_cycles.rs`): in an impl, the bounds of the impl count too, not only those of the
+/// generics in the context of `Self::A`, as rustc selects the impl of the trait. The optional
+/// entries that they name are copied as written for a strict Referrer.
 #[test]
-#[ignore = "a where predicate that names Self::A, in an impl whose bound names a leaked type: the copy cannot prove the impl"]
 fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
     let items: Vec<(ItemImpl, bool)> = vec![
         (
@@ -2530,8 +2531,11 @@ fn entries_in_own_context(referrer: &Referrer) -> Vec<String> {
 /// The Leaker should leave that type as written (not an entry), or reject the item. The assertion is
 /// that no entry of an accepted item is named by the bounds or where predicates of its own
 /// context.
+///
+/// Fixed: an optional entry that is leaked as a whole (a reference with a lifetime), and whose own
+/// context is unstable (its bound names it), is not one, and neither are the optional entries
+/// inside it: its parts cannot stand for it. See "Bounds that name leaked types" of the README.
 #[test]
-#[ignore = "an optional entry in a where predicate that names 'a has that predicate in its context: it needs itself"]
 fn f17_optional_entry_in_own_context() {
     let items: Vec<ItemStruct> = vec![
         parse_quote!(
@@ -2766,8 +2770,13 @@ fn entries_with_self_bound_in_predicates(
 ///
 /// The assertion: if the Leaker accepts the impl, no entry that a predicate of the copy names has
 /// a bound of its context that names `Self` while the self type is an entry.
+///
+/// Fixed by generalizing the rule of F2: a bound is unstable if it names a leaked type, `Self` (if
+/// the self type of an impl is leaked, and for a strict Referrer, if it holds an optional entry,
+/// which is copied as written then), `Self::A` or an associated type that rustc normalizes (F20 and
+/// F21). An entry in a predicate whose context has such a bound is an error. See "Bounds that name
+/// leaked types" of the README and `tests/bound_cycles.rs`.
 #[test]
-#[ignore = "an entry in a predicate has a bound of its context that names Self, in an impl whose self type is leaked"]
 fn f19_impl_self_in_bound_of_entry_in_predicate() {
     let items: Vec<Item> = vec![
         parse_quote!(
@@ -2872,8 +2881,9 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
 ///
 /// The assertion: if the Leaker accepts the trait, no entry that a predicate of the copy names has
 /// a bound of its context that names `Self::A`.
+///
+/// Fixed with F19: the bound that names `Self::A` is unstable.
 #[test]
-#[ignore = "an entry in a predicate has a bound of its context that names Self::A, in a trait"]
 fn f20_trait_assoc_in_bound_of_entry_in_predicate() {
     let items: Vec<Item> = vec![
         parse_quote!(
@@ -2978,8 +2988,11 @@ fn generics_name_item(generics: &Generics) -> bool {
 ///
 /// The assertion: if the Leaker accepts the item, no entry that a predicate of the copy names has
 /// a bound of its context that names an `Item`.
+///
+/// Fixed with F19: a bound that names the `Item` (or the `Output` of `Fn(..)`, or a projection that
+/// an impl defines) is unstable if an equation of it is in scope. The `Item` of a generic that
+/// nothing equates is rigid, and `tests/bound_cycles.rs` has that control.
 #[test]
-#[ignore = "an entry in an Item = .. binding has a bound of its context that names the Item: rustc cycles"]
 fn f21_iterator_item_in_bound_of_entry_in_item_binding() {
     let items: Vec<Item> = vec![
         parse_quote!(
