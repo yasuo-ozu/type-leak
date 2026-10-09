@@ -1408,10 +1408,27 @@ impl AnalyzeVisitor {
                 if let Ok(context) = self.context_of(ty, &inner) {
                     // The self type of an impl needs a rewrite only if it names a leaked type.
                     if projection || self.self_type_names_leaked(&context, false) {
-                        if let Some(conflict) = self.self_env_cycle(ty, &context) {
-                            return self.env_errors.push(conflict);
+                        // `Self::A` needs the bounds of the generics of its context. `Self` of an
+                        // impl needs those of the types in the self type that the copy writes as
+                        // paths through the Repeater only: rustc normalizes them in the
+                        // environment, not the bounds of a generic that they do not use.
+                        let needs = if projection {
+                            vec![context.clone()]
+                        } else {
+                            self.self_type_entries(&context, false)
+                        };
+                        for context in &needs {
+                            if let Some(conflict) = self.self_env_cycle(ty, context) {
+                                return self.env_errors.push(conflict);
+                            }
                         }
-                        self.not_optional_in_bounds(&context);
+                        if projection {
+                            self.not_optional_in_bounds(&context);
+                        } else {
+                            for context in self.self_type_entries(&context, true) {
+                                self.not_optional_in_bounds(&context);
+                            }
+                        }
                         if let Some(impl_context) = self.impl_context(projection) {
                             self.not_optional_in_bounds(&impl_context);
                         }
@@ -1564,7 +1581,10 @@ impl AnalyzeVisitor {
 
     /// Like `env_cycle()` for `Self::A` and for `Self` of an impl: they need the bounds of the
     /// generics of their context only, and `Self::A` of an impl the bounds of the impl, whose impl
-    /// of the trait rustc selects to resolve it.
+    /// of the trait rustc selects to resolve it. For `Self` of an impl, `context` is that of a type
+    /// in the self type that the copy writes through the Repeater
+    /// ([`AnalyzeVisitor::self_type_entries()`]): the generics that no such type uses do not
+    /// matter, rustc does not need their bounds to normalize `Self`.
     fn self_env_cycle(&self, ty: &Type, context: &Context) -> Option<CheckResult> {
         let projection = is_self_projection(ty);
         let (unstable, owner) = match self.env_unstable_bound(context, false) {
@@ -1713,6 +1733,37 @@ impl AnalyzeVisitor {
             }
             _ => false,
         }
+    }
+
+    /// Returns the contexts of the types in the self type of `context`, which is the self type of
+    /// an impl, that the copy may write as a path through the Repeater: those that must be entries
+    /// and those that the graph may choose (see [`AnalyzeVisitor::cut_self_cycles()`] for those it
+    /// cannot). With `optional`, the optional entries count too.
+    ///
+    /// rustc normalizes `Self` where a predicate names it, and the Repeater's impl of each of them
+    /// needs the bounds of the generics that it uses, not those of the other generics of the impl.
+    /// An entry that depends on `Self` (a bound of the impl names it) is one that must stay: it is
+    /// an error there, and the caller finds the bound that names `Self`.
+    fn self_type_entries(&self, context: &Context, optional: bool) -> Vec<Context> {
+        let ty = match context.self_ty() {
+            Some(SelfRequirement::Type(ty)) if self.env_depth > 0 && self.check_env => ty,
+            _ => return Vec::new(),
+        };
+        let declared = self
+            .scopes
+            .get(self.self_depth.wrapping_sub(1))
+            .map(Scope::generics);
+        self.probe(context, |probe| {
+            probe.visit_type(ty);
+            let mut found = Vec::new();
+            entry_contexts(
+                &probe.frame.effects,
+                declared.as_ref(),
+                optional,
+                &mut found,
+            );
+            found
+        })
     }
 
     /// Returns the first bound of the generics of `context` that names a type that is leaked, if
@@ -3449,6 +3500,46 @@ fn cut_conflicts(
             }
         }
         cut_conflicts(&mut pending.components, conflict, not_optional);
+    }
+}
+
+/// Adds the contexts of the types in `effects` that may be entries of the copy to `found` (see
+/// [`AnalyzeVisitor::self_type_entries()`]). A type that must be an entry has no parts that are
+/// entries. Another one may be, with those of its parts that may, unless its context depends on
+/// the `Self` that the generics `declared` bound (`self_type_conflict()`): it is cut then.
+fn entry_contexts(
+    effects: &[Effect],
+    declared: Option<&Generics>,
+    optional: bool,
+    found: &mut Vec<Context>,
+) {
+    let mut push = |context: &Context| {
+        if !found.contains(context) {
+            found.push(context.clone());
+        }
+    };
+    for effect in effects {
+        let pending = match effect {
+            Effect::Type(pending) => pending,
+            _ => continue,
+        };
+        if pending.is_must_intern || (pending.in_graph && is_whole_reference(&pending.ty)) {
+            push(&pending.context);
+            continue;
+        }
+        let cut = declared.map_or(false, |declared| {
+            self_type_conflict(pending, declared).is_some()
+        });
+        let entry = pending.in_graph && !pending.no_entry;
+        let optional_entry = optional && pending.optional && !pending.no_optional_entry;
+        if (entry || optional_entry) && !cut {
+            push(&pending.context);
+        }
+        let mut parts = Vec::new();
+        entry_contexts(&pending.components, declared, optional, &mut parts);
+        for context in &parts {
+            push(context);
+        }
     }
 }
 

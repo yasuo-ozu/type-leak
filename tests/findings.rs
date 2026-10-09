@@ -1555,6 +1555,25 @@ fn f13_leaker() -> Leaker {
 /// not replace it either. A bound of an outer scope that names its own `Self` is not the impl's
 /// (`the_same_self_changes_nothing` in `outer_self.rs`). The controls are accepted: a self type
 /// that is not leaked (an allowed path), and bounds that do not name `Self`.
+///
+/// The bound that names `Self` is also fine on a generic that no entry in the self type uses
+/// (`impl<T: AsRef<Self>, U> ::p::W<T, Rel<U>>`, whatever the way the bound is written, in an impl
+/// of a trait too, and for a method). `Self` in the bound is the self type that the copy writes
+/// with `Rel<U>` replaced, and rustc normalizes it in the environment with the Repeater's impl of
+/// `Rel<U>`, whose context has `U` only, no bound. The F19 rule looked at all the generics of the
+/// self type, `T: AsRef<Self>` too, and rejected it: `Self` is unstable only if the bounds of the
+/// generics that its entries use are (F19, narrowed). Checked with rustc (stable 1.98 and nightly
+/// 1.100) on the Leaker's crate with the impl and the Repeater's impls that the macros of
+/// `tests/crates/macro/prop.rs` emit, and on the Referrer's side with the checks that the property
+/// test makes (the rewritten type of each position, with the generics and predicates around it, is
+/// the original type): they compile for each control below, which the F19 rule rejected (the
+/// copy of an impl as a whole is another matter, F11: `U` that only the entry uses is E0207, and
+/// where all the generics are constrained, as in `impl<T: AsRef<Self>, U> ::p::Tr for ::p::W<T, U,
+/// Rel<U>>`, it compiles as well). The ones that stay rejected fail in rustc, with the entries
+/// chosen as the Leaker does (see F19, and `impl<T: Fn(Rel2<u8>), V: AsRef<Self>> ::p::W<Rel<T>,
+/// T, V>`: E0277 "expected an `Fn(Rel2<u8>)` closure, found `T`", as `Self` is normalized with the
+/// impl for `Rel<T>`, which needs the bound of `T`, and the environment has it with `Rel2<u8>`
+/// replaced).
 #[test]
 fn f13_impl_bound_names_self_of_leaked_self_type() {
     let rejected: Vec<ItemImpl> = vec![
@@ -1644,6 +1663,55 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
             impl<T: AsRef<Self>, U> ::p::W<T, Rel<U>> {
                 fn f(&self, a: Rel) {}
             }
+        ),
+        // The same as a where predicate, in an impl of a trait, with the bound inline or not.
+        parse_quote!(
+            impl<T, U> ::p::W<T, Rel<U>>
+            where
+                T: AsRef<Self>,
+            {
+                fn f(&self, a: Rel) {}
+            }
+        ),
+        parse_quote!(
+            impl<T: AsRef<Self>, U> ::p::Tr for ::p::W<T, Rel<U>> {}
+        ),
+        parse_quote!(
+            impl<T, U> ::p::Tr for ::p::W<T, Rel<U>> where T: AsRef<Self> {}
+        ),
+        // Two generics that no entry uses have the bound, and the one that an entry uses has a
+        // bound that is stable.
+        parse_quote!(
+            impl<T: AsRef<Self>, U: Clone, V: AsRef<Self>> ::p::W<T, Rel<U>, V> {}
+        ),
+        // A generic with a bound that names a leaked type, which no entry in the self type uses.
+        parse_quote!(
+            impl<T: Fn(Rel2<u8>), U, V: AsRef<Self>> ::p::W<T, Rel<U>, V> {
+                fn f(&self, a: Rel) {}
+            }
+        ),
+        // `Self` in a bound of a method, and in a where predicate on the type itself.
+        parse_quote!(
+            impl<T, U> ::p::W<T, Rel<U>> where Self: Sized {}
+        ),
+        parse_quote!(
+            impl<T, U> ::p::W<T, Rel<U>> {
+                fn f<X: AsRef<Self>>(&self, x: X, a: Rel) {}
+            }
+        ),
+        // An entry in the trait's arguments or in a method that depends on `Self` (a position, not
+        // a predicate): the Repeater's impl is for the self type, which the copy writes.
+        parse_quote!(
+            impl<T: AsRef<Self>, U> ::p::Tr<Rel2<T>> for ::p::W<T, Rel<U>> {}
+        ),
+        parse_quote!(
+            impl<T: AsRef<Self>, U> ::p::W<T, Rel<U>> {
+                fn f(&self, a: Rel2<T>) {}
+            }
+        ),
+        // An entry in a predicate that does not depend on `Self`.
+        parse_quote!(
+            impl<T: AsRef<Self>, U> ::p::Tr for ::p::W<T, Rel<U>> where Rel2<U>: Default {}
         ),
         // The parts of the self type are the entries, not the tuple that holds them: it would be
         // cheaper, but depends on `Self`.
@@ -2712,7 +2780,15 @@ impl<'ast> Visit<'ast> for ReplacementsInPredicates {
 
 /// The copy of `item` that a macro makes: the entries replaced by `P<ix>`.
 fn f19_copy(item: &Item) -> std::result::Result<(Referrer, Item), NotInternableError> {
-    let mut leaker = new_leaker();
+    f19_copy_with(new_leaker(), item)
+}
+
+/// Like `f19_copy()`, with the Leaker that `f13_leaker()` makes (it allows `::p`, so that the self
+/// type of an impl has parts that are entries and a part that is not).
+fn f19_copy_with(
+    mut leaker: Leaker,
+    item: &Item,
+) -> std::result::Result<(Referrer, Item), NotInternableError> {
     let context = match item {
         Item::Impl(i) => leaker.intern_impl(i, true)?,
         Item::Trait(i) => leaker.intern_trait(i, true)?,
@@ -2776,6 +2852,14 @@ fn entries_with_self_bound_in_predicates(
 /// which is copied as written then), `Self::A` or an associated type that rustc normalizes (F20 and
 /// F21). An entry in a predicate whose context has such a bound is an error. See "Bounds that name
 /// leaked types" of the README and `tests/bound_cycles.rs`.
+///
+/// `Self` itself in a predicate (`T: AsRef<Self>`) is a type that the copy writes with its entries
+/// replaced, and rustc normalizes it with the Repeater's impls of those entries: it is an error
+/// only for the bounds of the generics that they use, not for those of the other generics of the
+/// self type (narrowed after F13: `impl<T: AsRef<Self>, U> ::p::W<T, Rel<U>>` compiles). The
+/// self type with an entry as a part is also `Self` replaced, so the entry in a predicate whose
+/// context has `T: AsRef<Self>` is the same cycle there (the cases of `by_parts` below, which the
+/// first oracle did not look at: it asked for the self type as a whole to be an entry).
 #[test]
 fn f19_impl_self_in_bound_of_entry_in_predicate() {
     let items: Vec<Item> = vec![
@@ -2833,11 +2917,12 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
             }
         ),
     ];
+    // `Self` is replaced in the copy if the self type is an entry, or has one in it.
     let self_is_leaked = |referrer: &Referrer, context: ContextId| {
         matches!(
             referrer.context_self(context),
             Some(SelfRequirement::Type(self_ty))
-                if referrer.iter().any(|entry| string(entry) == string(self_ty))
+                if referrer.iter().any(|entry| type_contains(self_ty, &string(entry)))
         )
     };
     for item in &items {
@@ -2860,6 +2945,115 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
             entries_with_self_bound_in_predicates(&referrer, &copy, self_is_leaked).is_empty(),
             "{}",
             string(&copy)
+        );
+    }
+    // The self type is leaked by its parts only (`::p::W` is allowed, `Rel3<u8>` and `Rel<U>` are
+    // not): `Self` is replaced in the copy as well, and an entry in a predicate whose context has
+    // the bound `T: AsRef<Self>` is the same cycle (E0277 "the trait bound `T:
+    // AsRef<W<T, U, Rel3<u8>>>` is not satisfied", checked with rustc stable and nightly: the
+    // Repeater's impl for the entry has the bound with the Leaker's self type). The bound on `T`
+    // is not a bound of the context of an entry in the self type, so the impl is accepted without
+    // the predicate (F13).
+    let by_parts: Vec<Item> = vec![
+        parse_quote!(
+            impl<T: AsRef<Self>, U> ::p::W<T, U, Rel3<u8>> {
+                fn f(&self, a: Rel3<u8>)
+                where
+                    Rel2<T>: Default,
+                {
+                }
+            }
+        ),
+        parse_quote!(
+            impl<T: AsRef<Self>, U> ::p::Tr for ::p::W<T, U, Rel3<u8>> where Rel2<T>: Default {}
+        ),
+        // The bound of a method that names the type, in the self type with an entry that uses
+        // `U` only.
+        parse_quote!(
+            impl<T: AsRef<Self>, U> ::p::W<T, U, Rel<U>> {
+                fn f<X: Into<Rel2<T>>>(&self, x: X, a: Rel3<u8>) {}
+            }
+        ),
+    ];
+    for item in &by_parts {
+        let err = f19_copy_with(f13_leaker(), item)
+            .err()
+            .unwrap_or_else(|| panic!("`{}` is accepted, and it does not compile", string(item)));
+        assert!(
+            err.to_string()
+                .contains("a bound of its generics names `Self`, which is a leaked type"),
+            "{}: {}",
+            string(item),
+            err
+        );
+    }
+    let by_parts_controls: Vec<Item> = vec![
+        // The predicate names an entry that does not use `T`, whose bound names `Self`.
+        parse_quote!(
+            impl<T: AsRef<Self>, U> ::p::W<T, U, Rel<U>> {
+                fn f(&self, a: Rel3<u8>)
+                where
+                    Rel2<U>: Default,
+                {
+                }
+            }
+        ),
+        parse_quote!(
+            impl<T: AsRef<Self>, U> ::p::Tr<Rel2<U>> for ::p::W<T, U, Rel<U>> where Rel3<U>: Default {}
+        ),
+    ];
+    for item in &by_parts_controls {
+        let (referrer, copy) = f19_copy_with(f13_leaker(), item)
+            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        assert!(
+            entries_with_self_bound_in_predicates(&referrer, &copy, self_is_leaked).is_empty(),
+            "{}",
+            string(&copy)
+        );
+    }
+    // `Self` in a predicate: rustc normalizes the types in the self type that the copy replaces,
+    // with the Repeater's impls of their entries, which need the bounds of the generics that they
+    // use (E0277 "expected an `Fn(Rel3<u8>)` closure, found `T`", checked with rustc stable and
+    // nightly). The bound of a generic that no such type uses does not matter (F13).
+    let normalized: Vec<(ItemImpl, &str)> = vec![
+        (
+            parse_quote!(
+                impl<T: Fn(Rel2<u8>), V: AsRef<Self>> ::p::W<Rel<T>, T, V> {
+                    fn f(&self, a: Rel3<u8>) {}
+                }
+            ),
+            "`Self` is in a bound or where predicate, and a bound of its generics names a leaked type",
+        ),
+        (
+            parse_quote!(
+                impl<T, V> ::p::W<Rel<T>, T, V>
+                where
+                    T: Fn(Rel2<u8>),
+                    V: AsRef<Self>,
+                {
+                }
+            ),
+            "`Self` is in a bound or where predicate, and a bound of its generics names a leaked type",
+        ),
+        // The `Item` that a predicate equates is normalized too (E0277, "expected an `Fn(u8)`
+        // closure, found `I`").
+        (
+            parse_quote!(
+                impl<I: Iterator<Item = u8> + Fn(I::Item), V: AsRef<Self>> ::p::W<Rel<I>, I, V> {}
+            ),
+            "`Self` is in a bound or where predicate, and a bound of its generics names `I :: Item`",
+        ),
+    ];
+    for (item, headline) in &normalized {
+        let err = f13_leaker()
+            .intern_impl(item, true)
+            .err()
+            .unwrap_or_else(|| panic!("`{}` is accepted, and it does not compile", string(item)));
+        assert!(
+            err.to_string().contains(headline),
+            "{}: {}",
+            string(item),
+            err
         );
     }
 }
