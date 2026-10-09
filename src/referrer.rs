@@ -1130,7 +1130,9 @@ impl Referrer {
     // what `Self` means and the module the scope is in, for `Referrer::visitor()`. 4: it keeps
     // `Self` also when an outer bound was rewritten for it (`T: Tr<Self>` as `T: Tr<S<T>>`). The
     // tokens look the same, but the data of 3 would not find those entries the same way.
-    pub const FORMAT_VERSION: u32 = 4;
+    // 5: the context of `&'a Self::A` in a trait has the where predicate `Self::A: 'a`, which the
+    // Referrer computes for a copy too, so the entries of 4 are not found.
+    pub const FORMAT_VERSION: u32 = 5;
 }
 
 /// Parses a [`Referrer`] written by its [`ToTokens`] implementation.

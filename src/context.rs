@@ -434,12 +434,17 @@ impl Context {
         if self_req.is_some() {
             self_outlives.extend(written_self_outlives(&mut predicates, &params));
         }
-        for (bounded, lifetime) in
-            implied_outlives(ty, scopes, &params, self_req.is_some(), &ancestors)
-        {
-            if bounded == Bounded::SelfTy {
-                self_outlives.push(lifetime);
-                continue;
+        for (bounded, lifetime) in implied_outlives(ty, scopes, &params, self_req, &ancestors) {
+            match bounded {
+                Bounded::SelfTy => {
+                    self_outlives.push(lifetime);
+                    continue;
+                }
+                Bounded::SelfProjection(ident) => {
+                    predicates.push(parse_quote!(Self::#ident: #lifetime));
+                    continue;
+                }
+                _ => (),
             }
             for param in params.iter_mut() {
                 match (param, &bounded) {
@@ -958,6 +963,9 @@ enum Bounded {
     Lifetime(Lifetime),
     /// `Self` is not a parameter, but it is encoded as if it were (see [`Context::self_outlives`]).
     SelfTy,
+    /// `Self::A`, an associated type of the implementor of a trait. It stays a where predicate of
+    /// the context (see [`implied_outlives()`]).
+    SelfProjection(Ident),
 }
 
 /// `lifetime` is a lifetime parameter of the context. `'static`, `'_` and `for<..>` lifetimes are
@@ -1039,20 +1047,52 @@ impl<'a, 'ast> Visit<'ast> for Mentions<'a> {
     fn visit_macro(&mut self, _: &'ast Macro) {}
 }
 
+/// The `A` of the `Self::A` in a type: an associated type of `Self` with the trait not written and
+/// no arguments. `Self::A<'b>` and `Self::A::B` are not (the first may name a lifetime the context
+/// does not have).
+struct SelfProjections(Vec<Ident>);
+
+impl<'ast> Visit<'ast> for SelfProjections {
+    fn visit_type_path(&mut self, i: &'ast TypePath) {
+        let mut segments = i.path.segments.iter();
+        if let (None, None, Some(first), Some(second), None) = (
+            &i.qself,
+            &i.path.leading_colon,
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ) {
+            if first.ident == "Self" && first.arguments.is_none() && second.arguments.is_none() {
+                self.0.push(second.ident.clone());
+            }
+        }
+        syn::visit::visit_type_path(self, i)
+    }
+    // As for `Mentions`: `impl Trait` is not a component, and the types in an expression are not.
+    fn visit_type_impl_trait(&mut self, _: &'ast TypeImplTrait) {}
+    fn visit_expr(&mut self, _: &'ast Expr) {}
+    fn visit_macro(&mut self, _: &'ast Macro) {}
+}
+
 /// Returns the outlives bounds `ty` implies on `params`: `&'a X` requires `X: 'a`, as does each of
 /// `ancestors` for `ty`. A path with a lifetime argument adds none, as a guessed bound could make
 /// the copy stricter than the original. See [Outlives bounds](crate#outlives-bounds).
+///
+/// `Self::A` of a trait (`self_req` is its bound) requires `Self::A: 'a`, which the original gets
+/// from the well-formedness of its signature, and the Repeater's impl has no signature. It is
+/// returned as itself and not as the bounds of its components (`Self` and the arguments of the
+/// trait): the copy, where only the projection is known to outlive `'a`, could not prove those.
 fn implied_outlives(
     ty: &Type,
     scopes: &[Scope],
     params: &[GenericParam],
-    has_self: bool,
+    self_req: Option<&SelfRequirement>,
     ancestors: &[Lifetime],
 ) -> Vec<(Bounded, Lifetime)> {
     struct Finder<'a> {
         scopes: &'a [Scope],
         params: &'a [GenericParam],
-        has_self: bool,
+        self_req: Option<&'a SelfRequirement>,
         binders: Vec<Lifetime>,
         found: Vec<(Bounded, Lifetime)>,
     }
@@ -1067,8 +1107,18 @@ fn implied_outlives(
         fn require_generic(&mut self, lifetime: &Lifetime, referent: &Type) {
             let mut mentions = Mentions::new(self.scopes, self.binders.clone());
             mentions.visit_type(referent);
-            if self.has_self && mentions.types.iter().any(|name| name == "Self") {
+            if self.self_req.is_some() && mentions.types.iter().any(|name| name == "Self") {
                 self.found.push((Bounded::SelfTy, lifetime.clone()));
+            }
+            if let Some(SelfRequirement::Bound(_)) = self.self_req {
+                let mut projections = SelfProjections(Vec::new());
+                projections.visit_type(referent);
+                self.found.extend(
+                    projections
+                        .0
+                        .into_iter()
+                        .map(|ident| (Bounded::SelfProjection(ident), lifetime.clone())),
+                );
             }
             for name in mentions.types {
                 let is_param = self.params.iter().any(|param| {
@@ -1114,7 +1164,7 @@ fn implied_outlives(
     let mut finder = Finder {
         scopes,
         params,
-        has_self,
+        self_req,
         binders: Vec::new(),
         found: Vec::new(),
     };

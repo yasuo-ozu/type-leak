@@ -113,10 +113,11 @@ pub struct Features {
     /// tell which one the output has (E0106, F15). Off, such a sugar is not generated.
     pub self_elision: bool,
     /// An outlives bound that the original has only by the well-formedness of its signature
-    /// (`Self: 'x` from `&'x self`, `Self::A: 'x` from `&'x mut Self::A`, with the other
-    /// parameters of the trait), which the Repeater's impl lacks (E0309, F16). Off, `Self` under
-    /// a path or a trait object with a lifetime needs `Self: 'x` written, and `Self::A` is not
-    /// put under a lifetime.
+    /// (`Self::A: 'x` from `&'x mut Self::A`, with `Self: 'x` from `&'x self`), which the
+    /// Repeater's impl lacks (E0309, F16: fixed, on by default). Off, `Self::A` is not put under a
+    /// lifetime. `Self` under a path or a trait object with a lifetime always needs `Self: 'x`
+    /// written, and so does a where predicate: they are the limitation F5 and the test macro's
+    /// witness (no receiver).
     pub implied_outlives: bool,
     /// A strict Referrer (`allow_ambiguous_crate_name(false)`) replaces the optional entries too.
     /// An optional entry in a where predicate that names a lifetime (`T: Fn(&'a ::ext::W<T,
@@ -163,6 +164,7 @@ impl Features {
             fn_pointer_self: true,
             elided_fn_generics: true,
             bound_cycles: true,
+            implied_outlives: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -466,7 +468,8 @@ impl Ty {
 }
 
 /// Whether `ty` outlives `lt`. `written`: `Self: 'x` must be written in a where clause to count (a
-/// path or a trait object with a lifetime records no bound, `implied_outlives`).
+/// path or a trait object with a lifetime records no bound, F5, and a where predicate has no
+/// receiver to imply it).
 fn outlives(sc: &Scope, ty: &Ty, lt: &str, infer: bool, written: bool) -> bool {
     for p in &ty.tys {
         let declared = sc
@@ -1221,8 +1224,10 @@ impl Gen {
             Shape::Lt => {
                 let lt = self.lifetime(sc, c, false);
                 let a = self.ty(sc, inner, depth + 1);
-                // The bound `T: 'a` of the definition must be written, as the README says.
-                if !outlives(sc, &a, &lt, false, !self.features.implied_outlives) {
+                // The bound `T: 'a` of the definition must be written, as the README says: a path
+                // with a lifetime records no bound, so `Self: 'x` that only the receiver implies
+                // is not enough (F5).
+                if !outlives(sc, &a, &lt, false, true) {
                     return None;
                 }
                 let mut ty =
@@ -1283,9 +1288,8 @@ impl Gen {
         };
         let a = self.ty(sc, inner_con, depth + 1);
         // A where predicate has no help of the receiver: `&'x Self` there needs `Self: 'x` written
-        // (the witness of the Leaker and the check of the Referrer have no receiver,
-        // `implied_outlives`).
-        let written = sc.pred && !self.features.implied_outlives;
+        // (the witness of the Leaker and the check of the Referrer have no receiver).
+        let written = sc.pred;
         if !outlives(sc, &a, &lt, sc.infer, written) {
             return None;
         }
@@ -1541,8 +1545,7 @@ impl Gen {
         };
         if let Some(lt) = &lt_bound {
             // `Any: 'static`, so only `dyn Any + 'static` is well formed (E0478).
-            if !outlives(sc, &obj, lt, false, !self.features.implied_outlives)
-                || (obj.text.contains("Any") && lt != "'static")
+            if !outlives(sc, &obj, lt, false, true) || (obj.text.contains("Any") && lt != "'static")
             {
                 return None;
             }

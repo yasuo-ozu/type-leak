@@ -23,7 +23,7 @@
 //! | `f13_impl_bound_names_self_of_leaked_self_type` | a bound of an impl names `Self`, and the self type is an entry: it is its own `Self` | bug |
 //! | `f14_impl_predicate_names_self_projection_with_leaked_bound` | `Self::A` in a predicate of an impl whose bound names a leaked type | bug |
 //! | `f15_self_rewritten_in_elided_signature` | `with_self()` writes `Self`, with lifetimes, into `fn(&Self) -> &u8` | bug |
-//! | `f16_implied_outlives_of_self_projection_lost` | `T: 'x` and `'a: 'x` of `&'x Self::A0` are not recorded | bug |
+//! | `f16_implied_outlives_of_self_projection_lost` | `Self::A0: 'x` of `&'x Self::A0` is not recorded, only `Self: 'x` | fixed |
 //! | `f17_optional_entry_in_own_context` | a strict Referrer replaces an optional entry whose own context names it | bug |
 //! | `f18_strict_referrer_replaces_anchor_of_method_lifetime` | a strict Referrer replaces the optional type that holds a method lifetime | limitation |
 //! | `f19_impl_self_in_bound_of_entry_in_predicate` | an entry in a predicate has a bound of its context that names `Self`, in an impl whose self type is leaked | bug |
@@ -48,8 +48,8 @@
 //! F10 and F11 are errors of rustc on a copy of a module or an impl that the test macro makes
 //! (E0277, E0207). The tests pin the behaviour of the library that is the cause, not the errors.
 //!
-//! The features of the bugs (F13 to F17 and F19 to F21: `impl_self_bounds`, `impl_pred_leaked`,
-//! `self_elision`, `implied_outlives`, `strict_cycles`, `impl_self_bound_cycle`,
+//! The features of the bugs (F13 to F15, F17 and F19 to F21: `impl_self_bounds`,
+//! `impl_pred_leaked`, `self_elision`, `strict_cycles`, `impl_self_bound_cycle`,
 //! `trait_assoc_bound_cycle` and `iterator_item_cycle`) and of the limitation F18
 //! (`strict_anchors`) are off in
 //! the property test: the generator does not make what they fail on (the last two only decide that
@@ -2003,118 +2003,167 @@ fn generics_say_outlives(generics: &Generics, name: &str, lifetime: &str) -> boo
         })
 }
 
-/// The parameters of the trait that `Self::A` depends on, as `(name, is a lifetime)`.
-fn trait_params(path: &Path) -> Vec<(String, bool)> {
-    let mut params = Vec::new();
-    for segment in &path.segments {
-        if let PathArguments::AngleBracketed(args) = &segment.arguments {
-            for arg in &args.args {
-                match arg {
-                    GenericArgument::Lifetime(l) => params.push((l.to_string(), true)),
-                    GenericArgument::Type(ty) => params.push((string(ty), false)),
-                    _ => (),
-                }
-            }
-        }
-    }
-    params
-}
-
-/// What the Repeater's impl of the entry `ix` needs to prove `Self::A: 'lifetime`, for the
-/// reference `&'lifetime Self::A` in the entry, and whether the context records it: either
-/// `Self::A: 'lifetime` itself, or every component, as rustc proves a projection (`Self` and
-/// each parameter of the trait outlive the lifetime).
-fn projection_outlives_recorded(referrer: &Referrer, ix: usize, lifetime: &str) -> Vec<String> {
-    let context = referrer.context(ix);
-    let generics = referrer.generics(ix);
-    let projection = generics.where_clause.iter().flat_map(|w| &w.predicates).any(|predicate| {
-        matches!(predicate, WherePredicate::Type(p)
-            if string(&p.bounded_ty).starts_with("Self ::")
-                && p.bounds.iter().any(|b| matches!(b, TypeParamBound::Lifetime(l) if l.to_string() == lifetime)))
-    });
-    if projection {
-        return Vec::new();
-    }
-    let mut missing = Vec::new();
-    if !referrer
-        .context_self_outlives(context)
-        .iter()
-        .any(|l| l.to_string() == lifetime)
-    {
-        missing.push(format!("Self: {}", lifetime));
-    }
-    if let Some(SelfRequirement::Bound(path)) = referrer.context_self(context) {
-        for (name, _) in trait_params(path) {
-            if !generics_say_outlives(generics, &name, lifetime) {
-                missing.push(format!("{}: {}", name, lifetime));
-            }
-        }
-    }
-    missing
-}
-
-/// F16: the outlives bounds that the signature of a method implies are not in the context of an
-/// entry that needs them.
+/// F16 (fixed): the outlives bound that the signature of a method implies for `&'x Self::A` is in
+/// the context of the entry, as the where predicate `Self::A: 'x`.
 ///
-/// Trigger: `trait Tr<'a, T> { type A0; fn m<'x>(&'x self, a: Rel<&'x mut Self::A0>) where Self: 'x;
-/// }`. The original relies on the well-formedness of its signature: `&'x mut Self::A0` in the
-/// parameter implies `Self::A0: 'x`. The Repeater's impl of the entry `Rel<&'x mut Self::A0>` is
-/// `impl<'a, 'x, T, __S: Tr<'a, T>> Repeater<..> for __S { type Type = Rel<&'x mut <__S as Tr<'a,
-/// T>>::A0>; }`, with no signature around it: it needs `<__S as Tr<'a, T>>::A0: 'x`, which holds
-/// if `__S`, `T` and `'a` outlive `'x`. The Leaker records `Self: 'x` for the reference (the
-/// context has `Referrer::context_self_outlives()` = `['x]`), and no more: `T: 'x` and `'a: 'x` are
-/// lost. E0309 "the associated type `<__S as Tr<'a, T>>::A0` may not live long enough" in the
-/// Leaker's crate. With them written (`where T: 'x, 'a: 'x`) they are recorded, and the impl
-/// compiles. Found by the property test with `TYPE_LEAK_PROP_FEATURES=implied_outlives`
-/// (seeds 1, 4, 5 and 7 of 60 cases: seed 5 has this projection, the others the same E0309 for
-/// `Self` itself, below).
+/// Trigger: `trait Tr<'a, T> { type A0; fn m<'x>(&'x self, a: Rel<&'x mut Self::A0>) where Self:
+/// 'x; }`. The original relies on the well-formedness of its signature: `&'x mut Self::A0` in the
+/// parameter implies `<Self as Tr<'a, T>>::A0: 'x`. The Repeater's impl of the entry
+/// `Rel<&'x mut Self::A0>` is `impl<'a, 'x, T, __S: Tr<'a, T>> Repeater<..> for __S { type Type =
+/// Rel<&'x mut <__S as Tr<'a, T>>::A0>; }`, with no signature around it, so it needs the bound
+/// itself. The Leaker recorded `Self: 'x` for the reference (the context has
+/// `Referrer::context_self_outlives()` = `['x]`) and no more: E0309 "the associated type
+/// `<__S as Tr<'a, T>>::A0` may not live long enough" in the Leaker's crate. With `where
+/// Self::A0: 'x` written it is recorded, and the impl compiles. Found by the property test with
+/// `TYPE_LEAK_PROP_FEATURES=implied_outlives` (seeds 1, 4, 5 and 7 of 60 cases: seed 5 has this
+/// projection, the others `Self` under a path, below).
+///
+/// The fix records `Self::A0: 'x` as a where predicate of the context, as if it was written. The
+/// Referrer computes the same context for the copy, which has the signature and not the
+/// predicate, so it finds the entry. The Repeater's impl declares the predicate (`where <__S as
+/// Tr<'a, T>>::A0: 'x`), and in the copy `<Self as Repeater<..>>::Type` normalizes to the original
+/// type, whose well-formedness implies it.
+///
+/// The alternative of recording the components is not equivalent (`Self`, `T: 'x`, `'a: 'x`:
+/// rustc proves a projection when each of them outlives `'x`, and the encoded arguments would
+/// carry them as `&'x T` and `&'x &'a ()`). The Repeater's impl compiles, but the copy is
+/// stricter than the original, which knows `Self::A0: 'x` and not `'a: 'x`: an impl of the trait
+/// for a host type with the rewritten signature is E0491 "in type `&'x &'a ()`, reference has a
+/// longer lifetime than the data it references" (rustc normalizes the signature to compute its
+/// implied bounds, and the arguments that the projection drops are not among them). The property
+/// test shows it as E0477 in the Referrer's crate (seed 5). So no `T: 'x` or `'a: 'x` is recorded
+/// for the projection (written ones are).
 ///
 /// The same family, which is documented and not a bug (F5, README "Outlives bounds"): a path with
 /// a lifetime argument records nothing, so `Rel<Wrap<'x, [Self]>>` with `fn m<'x>(&'x self)`,
 /// where `Wrap<'a, T: 'a>` needs `Self: 'x` and the receiver implies it, has no `Self: 'x` in
-/// the context (`BL<'x, [Self]>` in the property test). The README asks to write the bound. And a
-/// where predicate `X: Into<&'x Self>` of a method relies on the receiver as well, which the
-/// witness and the check of the property test (functions with no receiver) do not have: E0309 in
-/// the Leaker's crate, from the test macro's own oracle.
+/// the context (`BL<'x, [Self]>` in the property test). The README asks to write the bound, and
+/// the generator writes it. And a where predicate `X: Into<&'x Self>` of a method relies on the
+/// receiver as well, which the witness and the check of the property test (functions with no
+/// receiver) do not have: E0309 in the Leaker's crate, from the test macro's own oracle, so the
+/// generator writes `Self: 'x` there too.
 ///
-/// For `&'x Self::A0`, the Leaker has what it needs: it sees the reference, and the generics of the
-/// trait path. So it should record all the components (the Repeater's arguments encode them as
-/// `&'x T` and `&'x &'a ()`, which the impl does not declare), or `Self::A0: 'x` itself as a
-/// where predicate of the context, or reject the item. A rustc experiment: `impl<'a, 'x, T, __S:
-/// ?Sized + Tr<'a, T>> Repeater<(&'a (), &'x (), T, &'x __S), 0> for __S { type Type = Rel<&'x
-/// mut <__S as Tr<'a, T>>::A0>; }` is E0309, and with `&'x T, &'x &'a ()` added to the arguments
-/// it compiles. The assertion is that, if the Leaker accepts the item, the context records them.
-///
-/// The control has the bounds written (`where Self: 'x, T: 'x, 'a: 'x`), which is recorded.
+/// The assertions, for each entry that has `&'x Self::A0`: the context has the predicate
+/// `Self::A0: 'x` and `Self: 'x`, and the arguments of the Repeater are those of the parameters
+/// and `&'x Self`, with no outlives of `T` or `'a`; the Referrer replaces the entry in a copy of
+/// the trait. The control has the bounds written (`where Self: 'x, T: 'x, 'a: 'x`), which are
+/// recorded as before.
 #[test]
-#[ignore = "the outlives of the components of Self::A under &'x (T: 'x, 'a: 'x) are not recorded, only Self: 'x"]
 fn f16_implied_outlives_of_self_projection_lost() {
-    let items: Vec<ItemTrait> = vec![
-        parse_quote!(
-            pub trait Tr<'a, T> {
-                type A0;
-                fn m<'x>(&'x self, a: Rel<&'x mut Self::A0>)
-                where
-                    Self: 'x;
-            }
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let items: Vec<(ItemTrait, &str)> = vec![
+        (
+            parse_quote!(
+                pub trait Tr<'a, T> {
+                    type A0;
+                    fn m<'x>(&'x self, a: Rel<&'x mut Self::A0>)
+                    where
+                        Self: 'x;
+                }
+            ),
+            "(& 'a () , & 'x () , T , & 'x Self)",
         ),
         // Only the receiver implies `Self: 'x`: it is recorded for the reference all the same.
-        parse_quote!(
-            pub trait Tr<T> {
-                type A0;
-                fn m<'x>(&'x self, a: Rel<&'x Self::A0>);
-            }
+        (
+            parse_quote!(
+                pub trait Tr<T> {
+                    type A0;
+                    fn m<'x>(&'x self, a: Rel<&'x Self::A0>);
+                }
+            ),
+            "(& 'x () , T , & 'x Self)",
+        ),
+        // No generics: `Self: 'x` is all the components.
+        (
+            parse_quote!(
+                pub trait Tr {
+                    type A0;
+                    fn m<'x>(&'x self, a: Rel<&'x Self::A0>);
+                }
+            ),
+            "(& 'x () , & 'x Self)",
         ),
         // Under a function pointer.
-        parse_quote!(
-            pub trait Tr<'a, T> {
-                type A0;
-                fn m<'x>(&'x self, a: Rel<fn(&u8) -> &&'x Self::A0>)
-                where
-                    Self: 'x;
-            }
+        (
+            parse_quote!(
+                pub trait Tr<'a, T> {
+                    type A0;
+                    fn m<'x>(&'x self, a: Rel<fn(&u8) -> &&'x Self::A0>)
+                    where
+                        Self: 'x;
+                }
+            ),
+            "(& 'a () , & 'x () , T , & 'x Self)",
         ),
     ];
+    for (item, encoded) in &items {
+        let mut leaker = new_leaker();
+        let context = leaker
+            .intern_trait(item, true)
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), e));
+        let referrer = leaker.finish();
+        let mut checked = 0;
+        for ix in 0..referrer.iter().count() {
+            // Every entry that has the reference `&'x Self::A0`.
+            let ty = string(referrer.iter().nth(ix).unwrap());
+            if !(ty.contains("& 'x") && ty.contains("Self :: A0")) {
+                continue;
+            }
+            checked += 1;
+            let generics = referrer.generics(ix);
+            let predicate_recorded = generics
+                .where_clause
+                .iter()
+                .flat_map(|w| &w.predicates)
+                .any(|p| string(p) == "Self :: A0 : 'x");
+            assert!(
+                predicate_recorded,
+                "`{}`: the context of the entry `{}` (generics `{}`) lacks `Self::A0: 'x`",
+                string(item),
+                ty,
+                string(generics)
+            );
+            let self_outlives = referrer.context_self_outlives(referrer.context(ix));
+            assert_eq!(
+                self_outlives
+                    .iter()
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>(),
+                vec!["'x".to_string()],
+                "`{}`",
+                string(item)
+            );
+            // The components are not: the copy cannot prove them.
+            for name in ["T", "'a"] {
+                assert!(
+                    !generics_say_outlives(generics, name, "'x"),
+                    "`{}`: `{}: 'x` is recorded for the entry `{}`",
+                    string(item),
+                    name,
+                    ty
+                );
+            }
+            let arguments = slots
+                .encode_generics_params_to_ty_with_self(
+                    &generics.params,
+                    &parse_quote!(Self),
+                    self_outlives,
+                )
+                .unwrap();
+            assert_eq!(string(&arguments), *encoded, "`{}`", string(item));
+        }
+        assert!(checked > 0, "`{}`: no entry", string(item));
+        // The Referrer finds the entry in a copy, which has the signature and not the predicate.
+        let copy = rewrite(&referrer, context, Item::Trait(item.clone()));
+        assert!(
+            !copy.contains("Rel < & 'x") && !copy.contains("Rel < fn"),
+            "`{}`: not replaced in the copy: {}",
+            string(item),
+            copy
+        );
+    }
+
+    // Written: recorded, and encoded.
     let control: ItemTrait = parse_quote!(
         pub trait Tr<'a, T> {
             type A0;
@@ -2125,37 +2174,20 @@ fn f16_implied_outlives_of_self_projection_lost() {
                 'a: 'x;
         }
     );
-    for item in &items {
-        let mut leaker = new_leaker();
-        // Rejected is fine.
-        if leaker.intern_trait(item, true).is_err() {
-            continue;
-        }
-        let referrer = leaker.finish();
-        for ix in 0..referrer.iter().count() {
-            // Every entry that has the reference `&'x Self::A0`.
-            let ty = string(referrer.iter().nth(ix).unwrap());
-            if !(ty.contains("& 'x") && ty.contains("Self :: A0")) {
-                continue;
-            }
-            let missing = projection_outlives_recorded(&referrer, ix, "'x");
-            assert!(
-                missing.is_empty(),
-                "`{}`: the context of the entry `{}` (generics `{}`) lacks {:?}: the Repeater's impl cannot prove `<__S as Tr<..>>::A0: 'x` (E0309)",
-                string(item),
-                ty,
-                string(referrer.generics(ix)),
-                missing
-            );
-        }
-    }
     let mut leaker = new_leaker();
     leaker.intern_trait(&control, true).unwrap();
     let referrer = leaker.finish();
     let ix = entry(&referrer, "Rel < & 'x mut Self :: A0 >");
+    let generics = referrer.generics(ix);
+    assert!(generics_say_outlives(generics, "T", "'x"));
+    assert!(generics_say_outlives(generics, "'a", "'x"));
     assert_eq!(
-        projection_outlives_recorded(&referrer, ix, "'x"),
-        Vec::<String>::new()
+        referrer
+            .context_self_outlives(referrer.context(ix))
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>(),
+        vec!["'x".to_string()]
     );
 }
 

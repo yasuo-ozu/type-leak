@@ -199,10 +199,23 @@ fn repeater_impls(referrer: &Referrer, id: u64) -> Result<Vec<(Vec<Ident>, Token
         .params
         .into_iter()
         .collect();
-        let predicates = generics
+        // `where <__S>::A: 'x` as the first predicate: rustc reads `where<` as generics of the
+        // where clause ("reserved for future use"), so the bounded type is parenthesized.
+        let predicates: Vec<WherePredicate> = generics
             .where_clause
             .iter()
-            .flat_map(|wc| wc.predicates.iter());
+            .flat_map(|wc| wc.predicates.iter())
+            .cloned()
+            .map(|mut predicate| {
+                if let WherePredicate::Type(PredicateType { bounded_ty, .. }) = &mut predicate {
+                    if matches!(bounded_ty, Type::Path(TypePath { qself: Some(q), .. }) if q.as_token.is_none())
+                    {
+                        parenthesized(bounded_ty);
+                    }
+                }
+                predicate
+            })
+            .collect();
         let header = match referrer.context_self(context) {
             Some(SelfRequirement::Bound(path)) => quote! {
                 impl<#(#impl_params,)* __S: ?::core::marker::Sized + #path>
