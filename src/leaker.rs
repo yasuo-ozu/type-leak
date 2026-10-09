@@ -1,6 +1,6 @@
 //! The [`Leaker`], which finds the types depending on the type context.
 
-use crate::analysis::{names_self, Analysis};
+use crate::analysis::{drop_optional, names_self, Analysis};
 use crate::analyze::{
     declared_names, AnalyzeVisitor, Finished, ModuleNames, Res, ScopeSpec, Scopes,
 };
@@ -8,9 +8,9 @@ use crate::config::LeakerConfig;
 use crate::context::{Context, ContextId, Contexts, SelfRequirement};
 #[cfg(doc)]
 use crate::error::NotInternableError;
-use crate::graph::{NodeKey, TypeGraph};
+use crate::graph::{is_whole_reference, NodeKey, TypeGraph};
 use crate::referrer::Referrer;
-use crate::util::{ident_name, unwrap_type_group, AllowedPaths};
+use crate::util::{ident_name, AllowedPaths};
 use crate::view::View;
 use proc_macro2::{Span, TokenStream};
 use safegraph::algo::max_flow::edmonds_karp_with_flows;
@@ -389,10 +389,12 @@ impl Scopes for Leaker {
             }
         };
         let Finished {
-            effects,
+            mut effects,
             top_levels,
             module,
+            not_optional,
         } = finished;
+        drop_optional(&mut effects, &not_optional.into_iter().collect());
         let mut analysis = Analysis::default();
         analysis.apply(&mut self.contexts, &effects, None);
         // Optional entries never fail the call: a type that cannot be leaked is copied as written.
@@ -439,6 +441,12 @@ fn reduce(types: &TypeGraph, blocked: &HashSet<NodeKey>) -> Vec<NodeKey> {
         keys.iter().map(|key| set.contains(*key)).collect()
     };
     let (red, root) = (flags(&types.must_intern), flags(&types.roots));
+    // A type that must be an entry cannot be forbidden to be one.
+    let forbidden: Vec<bool> = flags(&types.forbidden)
+        .into_iter()
+        .enumerate()
+        .map(|(i, forbidden)| forbidden && !red[i] && !needs_parent(keys[i]))
+        .collect();
     let mut parents: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, children) in children.iter().enumerate() {
         for &child in children {
@@ -497,7 +505,9 @@ fn reduce(types: &TypeGraph, blocked: &HashSet<NodeKey>) -> Vec<NodeKey> {
         let mut edges = Vec::new();
         for &i in members {
             let (v_in, v_out) = (2 * local[i], 2 * local[i] + 1);
-            edges.push((v_in, v_out, 1));
+            // The capacity of a type is what cutting it costs: one entry, or none if it cannot be
+            // one.
+            edges.push((v_in, v_out, if forbidden[i] { infinite } else { 1 }));
             for &child in &next[i] {
                 edges.push((v_out, 2 * local[child], infinite));
             }
@@ -538,19 +548,9 @@ fn spread(marked: &mut [bool], edges: &[Vec<usize>]) {
     }
 }
 
-/// Returns `true` for a reference with a lifetime: its components cannot stand for it, as the copy
-/// needs a bound (`Rel: 'static`) that its referent's copy may lack. Only `'static` needs this (see
-/// `Enclosing`), but all lifetimes get it. A trait object referent is exempt (see
-/// `Inherits::Reference`).
+/// See [`is_whole_reference()`].
 fn needs_parent(parent: &NodeKey) -> bool {
-    match unwrap_type_group(&parent.ty.ty) {
-        Type::Reference(TypeReference {
-            lifetime: Some(_),
-            elem,
-            ..
-        }) => !matches!(unwrap_type_group(elem), Type::TraitObject(_)),
-        _ => false,
-    }
+    is_whole_reference(&parent.ty.ty)
 }
 
 /// Runs max flow from `source` to `sink` and returns the nodes that can still reach the sink.

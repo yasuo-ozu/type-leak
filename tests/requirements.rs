@@ -157,9 +157,11 @@ fn only_the_generics_used_are_required() {
     );
     assert!(!referrer.has_self());
 
-    // The generics of the bounds and the where predicates mentioning them are used.
+    // The generics that the bounds of a used generic name are used, whether the bound is written
+    // inline or in the where clause. A bound on another generic (`U: Into<T>`) is not: it is a
+    // bound of `U`, and `Wrap<T>` does not use `U`.
     let referrer = leak_trait(parse_quote! {
-        trait X<T, U, V> where U: ::core::convert::Into<T>, V: ::core::clone::Clone {
+        trait X<T: ::core::convert::Into<U>, U, V, W> where U: ::core::clone::Clone, V: ::core::convert::Into<T>, W: ::core::clone::Clone {
             fn f(&self) -> Wrap<T>;
         }
     });
@@ -167,9 +169,16 @@ fn only_the_generics_used_are_required() {
         entries(&referrer),
         [entry(
             parse_quote!(Wrap<T>),
-            parse_quote!(<T, U: ::core::convert::Into<T>>)
+            parse_quote!(<T: ::core::convert::Into<U>, U: ::core::clone::Clone>)
         )]
     );
+    // The inline spelling is the same.
+    let inline = leak_trait(parse_quote! {
+        trait X<T: ::core::convert::Into<U>, U: ::core::clone::Clone, V: ::core::convert::Into<T>, W: ::core::clone::Clone> {
+            fn f(&self) -> Wrap<T>;
+        }
+    });
+    assert_eq!(entries(&inline), entries(&referrer));
 
     // The generics of the Leaker and of a method are used together.
     let referrer = leak_trait(parse_quote! {

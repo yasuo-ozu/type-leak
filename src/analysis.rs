@@ -9,7 +9,9 @@ use crate::leaker::Leaker;
 #[cfg(doc)]
 use crate::view::View;
 use proc_macro2::TokenStream;
+use std::collections::HashSet;
 use syn::{Ident, Type};
+use template_quote::quote;
 
 /// What [`View::check()`] found in a type: causes that force it to be leaked, and causes that
 /// forbid it.
@@ -63,6 +65,10 @@ pub(crate) struct PendingType {
     pub(crate) context: Context,
     /// A bare identifier argument that may be a const. Its parent is leaked whole if possible.
     pub(crate) ambiguous: bool,
+    /// It cannot be an entry, but its components can: the copy would be cyclic. Like
+    /// `no_optional_entry` for the optional entries.
+    pub(crate) no_entry: bool,
+    pub(crate) no_optional_entry: bool,
     pub(crate) components: Vec<Effect>,
 }
 
@@ -76,6 +82,8 @@ impl PendingType {
             has_optional: false,
             context,
             ambiguous: false,
+            no_entry: false,
+            no_optional_entry: false,
             components,
         }
     }
@@ -113,6 +121,9 @@ impl Analysis {
                     let key = self
                         .types
                         .add(context, &pending.ty, parent, pending.is_must_intern);
+                    if pending.no_entry {
+                        self.types.forbid(&key);
+                    }
                     self.apply(contexts, &pending.components, Some(&key));
                 }
                 Effect::Error(_) => (),
@@ -138,20 +149,25 @@ impl Analysis {
                 let key = self
                     .optional
                     .add(context, &pending.ty, parent, pending.optional);
+                if pending.no_optional_entry {
+                    self.optional.forbid(&key);
+                }
                 self.apply_optional(contexts, &pending.components, Some(&key));
             }
         }
     }
 }
 
-/// Returns the error of a scope: the conflicts among `effects`, or else the mentions of `Self`
-/// without meaning.
+/// Returns the error of a scope: the conflicts among `effects` and `conflicts`, or else the
+/// mentions of `Self` without meaning.
 pub(crate) fn scope_error(
     effects: &[Effect],
     self_errors: &[TokenStream],
+    conflicts: &[CheckResult],
 ) -> Option<NotInternableError> {
     let mut errors = Vec::new();
     collect_errors(effects, &mut errors);
+    errors.extend(conflicts.iter().cloned());
     if !errors.is_empty() {
         Some(NotInternableError::RelativePath(errors))
     } else if !self_errors.is_empty() {
@@ -182,6 +198,21 @@ pub(crate) fn names_self(effects: &[Effect], declared: &SelfRequirement) -> bool
         }
         _ => false,
     })
+}
+
+/// Makes the types in `keys` (with their contexts) no optional entries.
+pub(crate) fn drop_optional(effects: &mut [Effect], keys: &HashSet<(Context, String)>) {
+    for effect in effects {
+        if let Effect::Type(pending) = effect {
+            if pending.optional {
+                let ty = &pending.ty;
+                if keys.contains(&(pending.context.clone(), quote!(#ty).to_string())) {
+                    pending.optional = false;
+                }
+            }
+            drop_optional(&mut pending.components, keys);
+        }
+    }
 }
 
 pub(crate) fn has_optional(effects: &[Effect]) -> bool {

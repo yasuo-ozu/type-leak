@@ -30,12 +30,12 @@
 //! - `TYPE_LEAK_PROP_ITEMS` (default 8): the most items in a module.
 //! - `TYPE_LEAK_PROP_FEATURES`: a comma-separated list of constructs that `type-leak` is known to
 //!   fail on (see `gen::Features`). The generator avoids them by default, so that the test passes
-//!   on the current library, and a new failure is a new finding. With one of `bound_cycles`,
-//!   `inferred_outlives`, `impl_self_outlives`, or `all`, the test fails with the reproduction of
-//!   that finding. `unsized_params`, `impl_assoc_self`, `method_lifetime_paths`,
+//!   on the current library, and a new failure is a new finding. With one of `inferred_outlives`,
+//!   `impl_self_outlives`, `impl_self_bounds`, or `all`, the test fails with the reproduction of
+//!   that finding. `unsized_params`, `bound_cycles`, `impl_assoc_self`, `method_lifetime_paths`,
 //!   `module_crate_paths`, `bound_merge_syntax`, `fn_pointer_self` and `elided_fn_generics` are
-//!   fixed findings: they are on by default (the Leaker encodes them, or rejects and counts what it
-//!   cannot copy).
+//!   fixed findings: they are on by default (the Leaker encodes or rewrites them, or rejects and
+//!   counts what it cannot copy).
 //!
 //! The test is ignored by default: it is slow, as it builds the generated crates. Run it with
 //!
@@ -341,6 +341,11 @@ fn excerpt(text: &str, max: usize) -> String {
 
 /// A short reason of a rejection, for the statistics.
 fn reason_head(detail: &str) -> String {
+    // The cycles of a bound that names a leaked type (F2) are counted together.
+    if detail.contains("in a bound or where predicate") {
+        return "a leaked type in a bound or where predicate that rustc cannot normalize"
+            .to_string();
+    }
     // "use absolute path: 'Vec < X >'" is counted by the start of the type.
     match detail.find('\'') {
         Some(at) => {

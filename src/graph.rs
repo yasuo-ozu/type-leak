@@ -1,6 +1,7 @@
 //! The graph of the types found by the analysis.
 
 use crate::context::ContextId;
+use crate::util::unwrap_type_group;
 use safegraph::collection::IndexKey;
 use safegraph::graph::Graph;
 use safegraph::raw_graph::linked_adj_edge::{EdgeRepr, LinkedAdjEdgeGraph, NodeRepr};
@@ -98,6 +99,9 @@ pub(crate) struct TypeGraph {
     /// The types that must be interned: they depend on the context, or the Referrer may replace
     /// them.
     pub(crate) must_intern: HashSet<NodeKey>,
+    /// The types that cannot be entries, because the copy would be cyclic (see
+    /// `AnalyzeVisitor::env_cycle()`): their components are entries instead.
+    pub(crate) forbidden: HashSet<NodeKey>,
 }
 
 impl TypeGraph {
@@ -127,6 +131,11 @@ impl TypeGraph {
             self.must_intern.insert(key.clone());
         }
         key
+    }
+
+    /// Makes `key` a type that cannot be an entry.
+    pub(crate) fn forbid(&mut self, key: &NodeKey) {
+        self.forbidden.insert(key.clone());
     }
 
     fn add_edge(&mut self, from: NodeKey, to: NodeKey) {
@@ -165,5 +174,21 @@ impl TypeGraph {
         }
         self.roots.extend(other.roots);
         self.must_intern.extend(other.must_intern);
+        self.forbidden.extend(other.forbidden);
+    }
+}
+
+/// Returns `true` for a reference with a lifetime: its components cannot stand for it, as the copy
+/// needs a bound (`Rel: 'static`) that its referent's copy may lack. Only `'static` needs this (see
+/// `Enclosing`), but all lifetimes get it. A trait object referent is exempt (see
+/// `Inherits::Reference`).
+pub(crate) fn is_whole_reference(ty: &Type) -> bool {
+    match unwrap_type_group(ty) {
+        Type::Reference(TypeReference {
+            lifetime: Some(_),
+            elem,
+            ..
+        }) => !matches!(unwrap_type_group(elem), Type::TraitObject(_)),
+        _ => false,
     }
 }

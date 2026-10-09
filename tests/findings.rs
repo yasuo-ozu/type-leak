@@ -9,8 +9,8 @@
 //! | test | finding | kind |
 //! |------|---------|------|
 //! | `f01_unsized_type_param_encoding` | a `?Sized` parameter is a bare element of the tuple of the trait arguments | fixed |
-//! | `f02_bound_names_leaked_type_env_cycle` | a copy with a bound and a where predicate that name entries | bug |
-//! | `f03_where_predicate_pulls_param_into_context` | an entry under a where predicate that names a lifetime is not found | bug |
+//! | `f02_bound_names_leaked_type_env_cycle` | a copy with a bound and a where predicate that name entries | fixed |
+//! | `f03_where_predicate_pulls_param_into_context` | an entry under a where predicate that names a lifetime is not found | fixed |
 //! | `f04_module_crate_relative_path_not_rewritten` | an entry that names a declared item of a module is shared by all modules | fixed |
 //! | `f05_inferred_outlives_of_self_type` | no `T: 'a` for a path with a lifetime; written, it is | limitation |
 //! | `f06_impl_assoc_type_of_self_in_repeater` | `intern_impl` accepts `Self::A` in an entry | fixed |
@@ -349,8 +349,10 @@ fn has_bound_replacement(bound: &TypeParamBound) -> bool {
 /// decision (reject, or write the bound in the Repeater's impl as the copy has it): either the
 /// Leaker rejects the item, or its copy (the entries replaced by `P<ix>`) does not have both a bound
 /// and a where predicate that mention a replacement.
+///
+/// Fixed by rejecting what rustc cannot compile (see "Bounds that name leaked types" of the README
+/// and `tests/bound_cycles.rs`). The control `Tr3` is not rejected: what compiles stays accepted.
 #[test]
-#[ignore = "F2: the copy has a bound and a where predicate that both name entries, which rustc cannot normalize (bug)"]
 fn f02_bound_names_leaked_type_env_cycle() {
     let items: Vec<Item> = vec![
         parse_quote!(
@@ -381,9 +383,11 @@ fn f02_bound_names_leaked_type_env_cycle() {
             }
         ),
     ];
-    for item in items {
+    let control = items.len() - 1;
+    for (ix, item) in items.into_iter().enumerate() {
         let mut leaker = new_leaker();
         let Ok(context) = intern(&mut leaker, &item) else {
+            assert_ne!(ix, control, "the control is rejected, though it compiles");
             continue;
         };
         let referrer = leaker.finish();
@@ -417,8 +421,11 @@ fn f02_bound_names_leaked_type_env_cycle() {
 ///
 /// The assertion: the entry is found, and so rewritten, whether the bound is inline or a where
 /// predicate (and in a field). That does not say which of the two contexts is right.
+///
+/// Fixed: a where predicate on a generic is a bound of it, as the inline one is, so the context of
+/// `Bl<'a>` is `<'a>` in both (the Referrer's scope has the bound inline, the Leaker's had it in
+/// the where clause, and the predicate that names `'a` pulled `T` into the context).
 #[test]
-#[ignore = "F3: an entry under a where predicate that names a lifetime is not found by the visitor (bug)"]
 fn f03_where_predicate_pulls_param_into_context() {
     let items: Vec<Item> = vec![
         // The inline bound.

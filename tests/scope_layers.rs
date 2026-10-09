@@ -161,7 +161,7 @@ fn root_item(kind: &str) -> String {
         view.visit_type(&parse_quote!(Rel<Self, T>));
         view.visit_type(&parse_quote!(Rel2<&'a U>));
         view.visit_type(&parse_quote!(Rel3));
-        view.visit_type_param_bound(&parse_quote!(::p::Tr<Rel4<T>>));
+        view.visit_type_param_bound(&parse_quote!(::p::Tr<Rel4>));
         view.visit_where_clause(&parse_quote!(where T: ::p::Tr2<Rel5>));
         7
     };
@@ -186,10 +186,10 @@ context 0: < 'a , T : :: p :: Tr < Self > , U > ; Self = S < 'a , T , U > ; in m
 context 1: < 'a , U : 'a > ; - ; in module -
 context 2:  ; - ; in module -
 entry 0: Rel < Self , T > in 0
-entry 1: Rel4 < T > in 0
-entry 2: Rel2 < & 'a U > in 1
-entry 3: Rel0 in 2
-entry 4: Rel3 in 2
+entry 1: Rel2 < & 'a U > in 1
+entry 2: Rel0 in 2
+entry 3: Rel3 in 2
+entry 4: Rel4 in 2
 entry 5: Rel5 in 2
 "#;
 const ROOT_ITEM_IMPL: &str = r#"
@@ -198,10 +198,10 @@ context 0: < 'a , T : :: p :: Tr < Self > , U > ; Self = :: p :: W < 'a , T , U 
 context 1: < 'a , U : 'a > ; - ; in module -
 context 2:  ; - ; in module -
 entry 0: Rel < Self , T > in 0
-entry 1: Rel4 < T > in 0
-entry 2: Rel2 < & 'a U > in 1
-entry 3: Rel0 in 2
-entry 4: Rel3 in 2
+entry 1: Rel2 < & 'a U > in 1
+entry 2: Rel0 in 2
+entry 3: Rel3 in 2
+entry 4: Rel4 in 2
 entry 5: Rel5 in 2
 "#;
 const ROOT_ITEM_TRAIT: &str = r#"
@@ -210,10 +210,10 @@ context 0: < 'a , T : :: p :: Tr < Self > , U > ; Self: S < 'a , T , U > ; in mo
 context 1: < 'a , U : 'a > ; - ; in module -
 context 2:  ; - ; in module -
 entry 0: Rel < Self , T > in 0
-entry 1: Rel4 < T > in 0
-entry 2: Rel2 < & 'a U > in 1
-entry 3: Rel0 in 2
-entry 4: Rel3 in 2
+entry 1: Rel2 < & 'a U > in 1
+entry 2: Rel0 in 2
+entry 3: Rel3 in 2
+entry 4: Rel4 in 2
 entry 5: Rel5 in 2
 "#;
 

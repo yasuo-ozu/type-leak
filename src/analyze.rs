@@ -10,6 +10,7 @@ use crate::context::{
 };
 use crate::encode::is_const_param_ty;
 use crate::error::{NotInternableError, SELF_NOTE};
+use crate::graph::is_whole_reference;
 #[cfg(doc)]
 use crate::leaker::Leaker;
 use crate::util::{
@@ -22,6 +23,7 @@ use proc_macro2::TokenStream;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::rc::Rc;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
@@ -248,9 +250,10 @@ impl<'ast> Visit<'ast> for HasReference {
     }
 }
 
+#[derive(Clone)]
 struct ModuleFrame {
     id: ContextId,
-    names: ModuleNames,
+    names: Rc<ModuleNames>,
 }
 
 pub(crate) enum ScopeSpec {
@@ -273,6 +276,8 @@ pub(crate) enum ScopeSpec {
 pub(crate) struct DeclaredSelf {
     requirement: SelfRequirement,
     allow_self: bool,
+    /// `Self` is a type that the copy writes (the self type of an impl), not the item itself.
+    written: bool,
 }
 
 impl ScopeSpec {
@@ -351,12 +356,14 @@ pub(crate) trait Scopes {
         generics: &Generics,
         requirement: SelfRequirement,
         allow_self: bool,
+        written: bool,
         trait_path: Option<&Path>,
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
         let declares = Some(DeclaredSelf {
             requirement,
             allow_self,
+            written,
         });
         let spec = ScopeSpec::Generics {
             generics: generics.clone(),
@@ -374,7 +381,7 @@ pub(crate) trait Scopes {
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
         let requirement = SelfRequirement::of_item(ident, generics);
-        self.enter_declaring(generics, requirement, allow_self, None, f)
+        self.enter_declaring(generics, requirement, allow_self, false, None, f)
     }
 
     fn enter_impl<R>(
@@ -398,7 +405,7 @@ pub(crate) trait Scopes {
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
         let requirement = SelfRequirement::Type(self_ty.clone());
-        self.enter_declaring(generics, requirement, allow_self, trait_path, f)
+        self.enter_declaring(generics, requirement, allow_self, true, trait_path, f)
     }
 
     fn enter_trait<R>(
@@ -409,7 +416,7 @@ pub(crate) trait Scopes {
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
         let requirement = SelfRequirement::of_trait(ident, generics);
-        self.enter_declaring(generics, requirement, allow_self, None, f)
+        self.enter_declaring(generics, requirement, allow_self, false, None, f)
     }
 }
 
@@ -422,7 +429,11 @@ struct ScopeMark {
     modules: usize,
     item_depth: usize,
     self_ty: Option<SelfRequirement>,
+    self_written: bool,
+    self_depth: usize,
     allow_self: bool,
+    not_optional: usize,
+    env_errors: usize,
     module: Option<ContextId>,
 }
 
@@ -450,6 +461,7 @@ struct Walk {
     expr_owner: Option<usize>,
     in_receiver: bool,
     enclosing: Enclosing,
+    env_depth: usize,
     elided_ref: bool,
     unconstrained_ref: Option<Lifetime>,
     ambiguous_arg: bool,
@@ -460,6 +472,9 @@ pub(crate) struct Finished {
     pub(crate) effects: Vec<Effect>,
     pub(crate) top_levels: Vec<ContextId>,
     pub(crate) module: Option<ContextId>,
+    /// The types, with their contexts, that cannot be optional entries (see
+    /// [`AnalyzeVisitor::env_cycle()`]).
+    pub(crate) not_optional: Vec<(Context, String)>,
 }
 
 pub(crate) struct AnalyzeVisitor {
@@ -490,6 +505,12 @@ pub(crate) struct AnalyzeVisitor {
     /// What `Self` means here, if anything. It has none directly in a module, or in generics that
     /// no item declaring it encloses, so mentioning it there is an error.
     self_ty: Option<SelfRequirement>,
+    /// `self_ty` is the self type of an impl, which the copy writes (see [`DeclaredSelf`]).
+    self_written: bool,
+    /// The number of scopes when the scope that declares `Self` is the innermost: 0 if there is no
+    /// `Self`. The predicates of the item that declares `Self` are visited then, not those of its
+    /// methods.
+    self_depth: usize,
     root_declares_self: bool,
     /// The type is the default of a parameter, which cannot mention `Self`. It holds whether the
     /// declaring scope gives `Self` a meaning. `self_ty` is `None` meanwhile.
@@ -521,6 +542,16 @@ pub(crate) struct AnalyzeVisitor {
     /// The lifetimes the type being visited must outlive because of the types around it (see
     /// [`Enclosing`]). The Referrer tracks the same ones to find the entry. Empty outside a type.
     enclosing: Enclosing,
+    /// The depth of the bounds and where predicates being visited, which are the predicates of the
+    /// item (its environment). See [`AnalyzeVisitor::env_cycle()`].
+    env_depth: usize,
+    /// Whether [`AnalyzeVisitor::env_cycle()`] is checked. It is not by the probe that it runs.
+    check_env: bool,
+    /// The types, with the contexts they are in, that were found to be no optional entries.
+    not_optional: Vec<(Context, String)>,
+    /// The cycles that `Self` makes (see [`AnalyzeVisitor::env_cycle()`]). Kept apart from the
+    /// effects, like `self_errors`.
+    env_errors: Vec<CheckResult>,
 }
 
 /// A method signature being visited (see `AnalyzeVisitor::signatures`).
@@ -577,6 +608,8 @@ impl AnalyzeVisitor {
                 .map(|(_, ident, _)| ident.clone())
                 .collect(),
             self_ty: None,
+            self_written: false,
+            self_depth: 0,
             root_declares_self: false,
             in_default: None,
             modules: Vec::new(),
@@ -593,6 +626,10 @@ impl AnalyzeVisitor {
             expr_owner: None,
             in_receiver: false,
             enclosing: Enclosing::default(),
+            env_depth: 0,
+            check_env: true,
+            not_optional: Vec::new(),
+            env_errors: Vec::new(),
         }
     }
 
@@ -821,13 +858,14 @@ impl AnalyzeVisitor {
             effects.extend(found);
             self.self_errors.extend(self_errors);
         }
-        if let Some(error) = scope_error(&effects, &self.self_errors) {
+        if let Some(error) = scope_error(&effects, &self.self_errors, &self.env_errors) {
             return Err(error);
         }
         Ok(Finished {
             effects,
             top_levels: std::mem::take(&mut self.top_levels),
             module: self.modules.first().map(|module| module.id),
+            not_optional: std::mem::take(&mut self.not_optional),
         })
     }
 
@@ -855,7 +893,11 @@ impl AnalyzeVisitor {
             modules: self.modules.len(),
             item_depth: self.item_depth,
             self_ty: self.self_ty.clone(),
+            self_written: self.self_written,
+            self_depth: self.self_depth,
             allow_self: self.allow_self,
+            not_optional: self.not_optional.len(),
+            env_errors: self.env_errors.len(),
             module: None,
         }
     }
@@ -873,9 +915,11 @@ impl AnalyzeVisitor {
                 });
                 self.modules.push(ModuleFrame {
                     id,
-                    names: names.clone(),
+                    names: Rc::new(names.clone()),
                 });
                 self.self_ty = None;
+                self.self_written = false;
+                self.self_depth = 0;
                 self.allow_self = true;
                 mark.module = Some(id);
             }
@@ -886,12 +930,16 @@ impl AnalyzeVisitor {
             } => {
                 if let Some(declared) = declares {
                     self.self_ty = Some(declared.requirement.clone());
+                    self.self_written = declared.written;
                     self.allow_self = declared.allow_self;
                 }
                 if root {
                     self.scopes[0].set_self(self.self_ty.clone());
                 } else {
                     self.scopes.push(Scope::new(generics, self.self_ty.clone()));
+                }
+                if declares.is_some() {
+                    self.self_depth = self.scopes.len();
                 }
                 if self.self_ty.is_none() {
                     let generics = without_defaults(generics, generics.params.len());
@@ -912,12 +960,16 @@ impl AnalyzeVisitor {
         self.modules.truncate(mark.modules);
         self.item_depth = mark.item_depth;
         self.self_ty = mark.self_ty;
+        self.self_written = mark.self_written;
+        self.self_depth = mark.self_depth;
         self.allow_self = mark.allow_self;
         if rollback {
             self.frame.effects.truncate(mark.effects);
             self.self_errors.truncate(mark.self_errors);
             self.contexts.truncate(mark.contexts);
             self.top_levels.truncate(mark.top_levels);
+            self.not_optional.truncate(mark.not_optional);
+            self.env_errors.truncate(mark.env_errors);
         }
     }
 
@@ -936,6 +988,7 @@ impl AnalyzeVisitor {
             expr_owner: self.expr_owner,
             in_receiver: self.in_receiver,
             enclosing: self.enclosing.clone(),
+            env_depth: self.env_depth,
             elided_ref: self.elided_ref,
             unconstrained_ref: self.unconstrained_ref.clone(),
             ambiguous_arg: self.ambiguous_arg,
@@ -974,6 +1027,7 @@ impl AnalyzeVisitor {
         self.expr_owner = walk.expr_owner;
         self.in_receiver = walk.in_receiver;
         self.enclosing = walk.enclosing;
+        self.env_depth = walk.env_depth;
         self.elided_ref = walk.elided_ref;
         self.unconstrained_ref = walk.unconstrained_ref;
         self.ambiguous_arg = walk.ambiguous_arg;
@@ -991,6 +1045,7 @@ impl AnalyzeVisitor {
         let error = scope_error(
             &self.frame.effects[mark.effects..],
             &self.self_errors[mark.self_errors..],
+            &self.env_errors[mark.env_errors..],
         );
         let module = mark.module;
         // A scope that declares nothing keeps the `Self` around, so take it before leaving. It is
@@ -1261,20 +1316,55 @@ impl AnalyzeVisitor {
                 return self.decide_through(inner);
             }
         }
-        let optional = soft.filter(|_| soft_binder.is_none() && soft_elision.is_none());
+        // An optional entry that would make a cycle in the copy (see `env_cycle()`) is not one: the
+        // Referrer cannot replace it, so it is copied as written. That holds for the type in this
+        // context everywhere, as the Referrer finds an entry by its type and context.
+        let optional = match soft.filter(|_| soft_binder.is_none() && soft_elision.is_none()) {
+            Some(context) if self.env_blocked(&context, true) => {
+                self.not_optional.push((context, quote!(#ty).to_string()));
+                None
+            }
+            optional => optional,
+        };
         self.absorb(&inner);
         let has_impossible = self.impossibles.len() > inner.impossible_start;
         let has_must = inner.min_depth != usize::MAX;
         let mentions_local = inner.local_scope < self.scopes.len();
         let effects = std::mem::take(&mut inner.effects);
 
+        // `Self` and its associated types are resolved by what the copy writes for `Self`, also
+        // where `Self` cannot be leaked. The error is kept apart from the effects, as the type
+        // around may be copied, which drops them.
+        if own.is_none() && self.env_depth > 0 && self.check_env {
+            let projection = is_self_projection(ty);
+            if projection || (self.self_written && is_bare_self(ty)) {
+                if let Ok(context) = self.context_of(ty, &inner) {
+                    // The self type of an impl needs a rewrite only if it names a leaked type.
+                    if projection || self.self_type_names_leaked(&context) {
+                        if let Some(conflict) = self.self_env_cycle(ty, &context) {
+                            return self.env_errors.push(conflict);
+                        }
+                        self.not_optional_in_bounds(&context);
+                    }
+                    if !projection {
+                        self.not_optional_in_self_type(&context);
+                    }
+                }
+            }
+        }
         let pending = match own {
-            Some(Ok(context)) => PendingType {
-                is_must_intern: true,
-                in_graph: true,
-                ambiguous: ambiguous && context.is_empty(),
-                ..PendingType::new(ty, context, Vec::new())
-            },
+            Some(Ok(context)) => {
+                if let Some(conflict) = self.env_cycle(ty, &context) {
+                    return self.frame.effects.push(Effect::Error(conflict));
+                }
+                self.not_optional_in_bounds(&context);
+                PendingType {
+                    is_must_intern: true,
+                    in_graph: true,
+                    ambiguous: ambiguous && context.is_empty(),
+                    ..PendingType::new(ty, context, Vec::new())
+                }
+            }
             Some(Err(conflict)) => return self.frame.effects.push(Effect::Error(conflict)),
             None if has_impossible => {
                 if has_must || has_optional(&effects) {
@@ -1315,15 +1405,244 @@ impl AnalyzeVisitor {
                 // It may replace its parts as the entry, if the graph finds it cheaper: not if it
                 // adds lifetimes where elision needs none.
                 let in_graph = has_must && self.elision_broken(&context).is_none();
+                // A type that is an entry only if its parts need it makes a cycle too, but its
+                // parts can be the entries instead, unless it is leaked whole in any case.
+                let leaked_whole = has_must && is_whole_reference(ty);
+                if leaked_whole {
+                    if let Some(conflict) = self.env_cycle(ty, &context) {
+                        return self.frame.effects.push(Effect::Error(conflict));
+                    }
+                    self.not_optional_in_bounds(&context);
+                }
+                let has_optional = optional.is_some() || has_optional(&effects);
+                let no_entry = has_must && self.env_blocked(&context, false);
+                if has_must && !no_entry {
+                    self.not_optional_in_bounds(&context);
+                }
+                let no_optional_entry = has_optional && self.env_blocked(&context, true);
                 PendingType {
                     in_graph,
                     optional: optional.is_some(),
-                    has_optional: optional.is_some() || has_optional(&effects),
+                    has_optional,
+                    no_entry,
+                    no_optional_entry,
                     ..PendingType::new(ty, context, effects)
                 }
             }
         };
         self.frame.effects.push(Effect::Type(Box::new(pending)));
+    }
+
+    /// Returns the conflict if `ty`, leaked whole in `context`, would make a cycle in the copy: it
+    /// is in a bound or a where predicate, and a bound of its generics names a leaked type, or it
+    /// names `Self` in a predicate of the trait that declares it.
+    ///
+    /// The copy writes both as paths through the Repeater. rustc normalizes the one in a predicate
+    /// of the item while it builds the environment of the item, in which the other is not
+    /// normalized yet: the impl of the Repeater for `ty` needs the bound of its generics (`T:
+    /// Fn(Rel)`), and the environment has it as `T: Fn(<() as Repeater<..>>::Type)`. So it
+    /// cannot prove it (E0277 "expected an `Fn(Rel)` closure, found `T`", E0275, E0284). Any
+    /// predicate of the item does it, a bound as well as a where predicate, also the bound that
+    /// names `ty` itself (`T: Tr<Wrap<T>>`). Types in fields and signatures are fine: they are
+    /// normalized in the environment once it is built. So are bounds that name no leaked type
+    /// (`T: Clone`), and predicates on a type that is not a generic, which an impl proves. The
+    /// Leaker cannot rewrite it, as the Repeater is the only link between the two crates, so it is
+    /// an error.
+    ///
+    /// The impl of the Repeater for a type that names `Self` of a trait is for the implementors,
+    /// bounded by the trait: proving it for the host of the copy needs the predicates of the
+    /// trait, which name the type.
+    fn env_cycle(&self, ty: &Type, context: &Context) -> Option<CheckResult> {
+        match self.env_leaked_bound(context, false) {
+            Some(bound) => {
+                let why = format!(
+                    "the bound `{}` of its generics names a type that is leaked too: the copy \
+                     writes both as paths through the Repeater, and rustc cannot normalize the one \
+                     in a bound or where predicate while it checks the bounds (E0277, E0275)",
+                    bound
+                );
+                Some(self.cycle_error(ty, why))
+            }
+            None => {
+                let bound = self.trait_cycle(context)?;
+                let why = format!(
+                    "the copy writes it as a path through the Repeater, whose impl is for the \
+                     implementors of the trait (`{}`), and rustc cannot prove that the host \
+                     implements the trait while it checks this predicate (E0275)",
+                    bound
+                );
+                let mut error = self.cycle_error(ty, why);
+                error.headline = Some(format!(
+                    "`{}` names `Self` in a bound or where predicate of its trait",
+                    quote!(#ty)
+                ));
+                Some(error)
+            }
+        }
+    }
+
+    /// Like `env_cycle()` for `Self::A` and for `Self` of an impl: they need the bounds of the
+    /// generics of their context only.
+    fn self_env_cycle(&self, ty: &Type, context: &Context) -> Option<CheckResult> {
+        let bound = self.env_leaked_bound(context, false)?;
+        let why = if is_self_projection(ty) {
+            format!(
+                "the copy for a concrete implementor resolves `{}` by the impl of the trait, \
+                 which needs the bound `{}` of its generics, where the copy writes the leaked type \
+                 as a path through the Repeater, and rustc cannot normalize the one in a bound or \
+                 where predicate while it checks the bounds (E0277, E0275)",
+                quote!(#ty),
+                bound
+            )
+        } else {
+            format!(
+                "`Self` is the self type of the impl, which the copy writes with its leaked types \
+                 as paths through the Repeater, and the bound `{}` of their generics names a type \
+                 that is leaked too, and rustc cannot normalize the one in a bound or where \
+                 predicate while it checks the bounds (E0277, E0275)",
+                bound
+            )
+        };
+        Some(self.cycle_error(ty, why))
+    }
+
+    fn cycle_error(&self, ty: &Type, why: String) -> CheckResult {
+        CheckResult {
+            must: vec![quote!(#ty)],
+            impossible: Vec::new(),
+            is_own: true,
+            optional: false,
+            note: Some(format!(
+                "{}. Write the leaked type of the bound with an absolute path, or use `{}` outside \
+                 the bounds and where predicates",
+                why,
+                quote!(#ty)
+            )),
+            headline: Some(format!(
+                "`{}` is in a bound or where predicate, and a bound of its generics names a leaked \
+                 type",
+                quote!(#ty)
+            )),
+        }
+    }
+
+    /// Returns `Self: Trait` if a type in `context` names `Self` of a trait, and the predicates of
+    /// that trait are being visited (not those of its methods): see `env_cycle()`.
+    fn trait_cycle(&self, context: &Context) -> Option<TokenStream> {
+        if self.env_depth == 0
+            || !self.check_env
+            || self.self_depth == 0
+            || self.scopes.len() != self.self_depth
+        {
+            return None;
+        }
+        match context.self_ty() {
+            Some(SelfRequirement::Bound(path)) => Some(quote!(Self: #path)),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if a type in `context` that is an entry would make a cycle (`env_cycle()`).
+    fn env_blocked(&self, context: &Context, optional: bool) -> bool {
+        self.env_leaked_bound(context, optional).is_some() || self.trait_cycle(context).is_some()
+    }
+
+    /// Runs `visit` on a probe visitor that has the generics and the `Self` of `context`, and
+    /// checks nothing itself.
+    fn probe<R>(&self, context: &Context, visit: impl FnOnce(&mut AnalyzeVisitor) -> R) -> R {
+        Self::alone(self.allowed.clone(), context.generics(), |probe| {
+            probe.check_env = false;
+            probe.modules = self.modules.clone();
+            probe.self_ty = context.self_ty().cloned();
+            visit(probe)
+        })
+    }
+
+    /// Returns `true` if the self type of `context`, which is the self type of an impl, names a
+    /// type that is leaked, so the copy writes it as a path through the Repeater.
+    fn self_type_names_leaked(&self, context: &Context) -> bool {
+        match context.self_ty() {
+            Some(SelfRequirement::Type(ty)) if self.env_depth > 0 && self.check_env => {
+                self.probe(context, |probe| {
+                    probe.visit_type(ty);
+                    !probe.musts.is_empty()
+                })
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns the first bound of the generics of `context` that names a type that is leaked, if
+    /// the type being visited is in a predicate of the item. With `optional`, a type that the
+    /// Referrer may replace counts too.
+    fn env_leaked_bound(&self, context: &Context, optional: bool) -> Option<TokenStream> {
+        if self.env_depth == 0 || !self.check_env {
+            return None;
+        }
+        let generics = context.generics();
+        // Without bounds, nothing is named.
+        let bounded = generics.where_clause.is_some()
+            || generics.params.iter().any(|param| match param {
+                GenericParam::Type(param) => !param.bounds.is_empty(),
+                _ => false,
+            });
+        if !bounded {
+            return None;
+        }
+        let names_leaked = |visit: &dyn Fn(&mut AnalyzeVisitor)| {
+            self.probe(context, |probe| {
+                visit(probe);
+                !probe.musts.is_empty() || (optional && has_optional(&probe.frame.effects))
+            })
+        };
+        for param in &generics.params {
+            if let GenericParam::Type(param) = param {
+                if names_leaked(&|probe| probe.visit_type_param(param)) {
+                    return Some(quote!(#param));
+                }
+            }
+        }
+        // A where predicate that is not on a parameter has the types of the leaked type in its
+        // bounded type, and rustc may prove it by an impl: it does not need the environment.
+        generics
+            .where_clause
+            .iter()
+            .flat_map(|where_clause| &where_clause.predicates)
+            .filter(|predicate| needs_environment(predicate, context))
+            .find(|predicate| names_leaked(&|probe| probe.visit_where_predicate(predicate)))
+            .map(|predicate| quote!(#predicate))
+    }
+
+    /// Called for a type that is leaked in a bound or where predicate, in `context`, and would
+    /// make a cycle if the Referrer replaced the optional entries that the bounds of the generics
+    /// name (it does if it does not share the crates): they are not optional entries.
+    fn not_optional_in_bounds(&mut self, context: &Context) {
+        if self.env_leaked_bound(context, true).is_none() {
+            return;
+        }
+        let keys = self.probe(context, |probe| {
+            probe.visit_generics(context.generics());
+            optional_keys(&probe.frame.effects)
+        });
+        self.not_optional.extend(keys);
+    }
+
+    /// Like `not_optional_in_bounds()` for the optional entries of the self type of an impl (in
+    /// `context`), which `Self` is in a bound or where predicate.
+    fn not_optional_in_self_type(&mut self, context: &Context) {
+        let ty = match context.self_ty() {
+            Some(SelfRequirement::Type(ty)) if self.env_depth > 0 && self.check_env => ty,
+            _ => return,
+        };
+        let keys = self.probe(context, |probe| {
+            probe.visit_type(ty);
+            optional_keys(&probe.frame.effects)
+        });
+        for (context, ty) in keys {
+            if self.env_leaked_bound(&context, true).is_some() {
+                self.not_optional.push((context, ty));
+            }
+        }
     }
 
     fn relative_path(&mut self, must: TokenStream, impossible: TokenStream) {
@@ -1385,7 +1704,7 @@ impl AnalyzeVisitor {
             }
             _ => false,
         };
-        let mut module = &self.modules[current].names;
+        let mut module: &ModuleNames = &self.modules[current].names;
         let mut first = true;
         loop {
             let seg = match segments.next() {
@@ -1427,7 +1746,7 @@ impl AnalyzeVisitor {
         });
         self.modules.push(ModuleFrame {
             id,
-            names: declared_names(items),
+            names: Rc::new(declared_names(items)),
         });
         f(self);
         self.modules.pop();
@@ -1487,15 +1806,24 @@ impl AnalyzeVisitor {
         &mut self,
         generics: &Generics,
         self_ty: Option<SelfRequirement>,
+        written: bool,
         f: impl FnOnce(&mut Self),
     ) {
         let allow_self = self.allow_self;
         if self_ty.is_none() || self.item_depth > 0 {
             self.allow_self = true;
         }
+        let declares = self_ty.is_some();
         let outer = std::mem::replace(&mut self.self_ty, self_ty);
-        self.with_item_generics(generics, f);
+        let outer_written = std::mem::replace(&mut self.self_written, written);
+        let outer_depth = self.self_depth;
+        self.with_item_generics(generics, |visitor| {
+            visitor.self_depth = if declares { visitor.scopes.len() } else { 0 };
+            f(visitor)
+        });
         self.self_ty = outer;
+        self.self_written = outer_written;
+        self.self_depth = outer_depth;
         self.allow_self = allow_self;
     }
 
@@ -1791,12 +2119,15 @@ impl AnalyzeVisitor {
         let frame = self.new_frame();
         let (musts, impossibles) = (self.musts.len(), self.impossibles.len());
         let self_errors = self.self_errors.len();
+        let (env_errors, not_optional) = (self.env_errors.len(), self.not_optional.len());
         self.probe = Some(HashSet::new());
         self.with_scope(Scope::binder(lifetimes), |v| f(v));
         self.frame = frame;
         self.musts.truncate(musts);
         self.truncate_impossibles(impossibles);
         self.self_errors.truncate(self_errors);
+        self.env_errors.truncate(env_errors);
+        self.not_optional.truncate(not_optional);
         self.probe.take().unwrap_or_default()
     }
 
@@ -1967,6 +2298,80 @@ impl AnalyzeVisitor {
     }
 }
 
+/// Returns `true` if `predicate` bounds a type that only the environment can prove a bound of: a
+/// generic or its associated type (`T`, `T::Item`, `<T as Tr>::Item`), or `Self` in a trait. A
+/// bound on another type (`Vec<T>: Clone`) is proved by an impl.
+fn needs_environment(predicate: &WherePredicate, context: &Context) -> bool {
+    let predicate = match predicate {
+        WherePredicate::Type(predicate) => predicate,
+        _ => return false,
+    };
+    let (qself, path) = match unwrap_type_group(&predicate.bounded_ty) {
+        Type::Path(TypePath { qself, path }) => (qself, path),
+        _ => return false,
+    };
+    let head = match qself {
+        Some(qself) => match unwrap_type_group(&qself.ty) {
+            Type::Path(TypePath { qself: None, path }) => path.get_ident().map(ident_name),
+            _ => None,
+        },
+        None if path.leading_colon.is_none() => {
+            path.segments.first().map(|seg| ident_name(&seg.ident))
+        }
+        None => None,
+    };
+    match head {
+        Some(head) if head == "Self" => {
+            matches!(context.self_ty(), Some(SelfRequirement::Bound(_)))
+        }
+        Some(head) => context.generics().params.iter().any(
+            |param| matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == head),
+        ),
+        None => false,
+    }
+}
+
+/// Returns the types, with their contexts, that are optional entries in `effects`.
+fn optional_keys(effects: &[Effect]) -> Vec<(Context, String)> {
+    let mut keys = Vec::new();
+    for effect in effects {
+        if let Effect::Type(pending) = effect {
+            if pending.optional {
+                let ty = &pending.ty;
+                keys.push((pending.context.clone(), quote!(#ty).to_string()));
+            }
+            keys.extend(optional_keys(&pending.components));
+        }
+    }
+    keys
+}
+
+/// Returns `true` if `ty` is `Self`.
+fn is_bare_self(ty: &Type) -> bool {
+    matches!(
+        unwrap_type_group(ty),
+        Type::Path(TypePath { qself: None, path }) if path.is_ident("Self")
+    )
+}
+
+/// Returns `true` if `ty` is `Self::A` or `<Self as Tr>::A`: an associated type of `Self`.
+fn is_self_projection(ty: &Type) -> bool {
+    match unwrap_type_group(ty) {
+        Type::Path(TypePath { qself: None, path }) => {
+            path.leading_colon.is_none()
+                && path.segments.len() > 1
+                && matches!(path.segments.first(), Some(seg) if seg.ident == "Self")
+        }
+        Type::Path(TypePath {
+            qself: Some(qself), ..
+        }) => matches!(
+            unwrap_type_group(&qself.ty),
+            Type::Path(TypePath { qself: None, path }) if path.is_ident("Self")
+        ),
+        _ => false,
+    }
+}
+
 fn defaulted(generics: &Generics) -> impl Iterator<Item = (usize, &Ident, &Type)> {
     generics
         .params
@@ -2124,28 +2529,28 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
 
     fn visit_item_struct(&mut self, i: &ItemStruct) {
         let self_ty = SelfRequirement::of_item(&i.ident, &i.generics);
-        self.with_item(&i.generics, Some(self_ty), |visitor| {
+        self.with_item(&i.generics, Some(self_ty), false, |visitor| {
             syn::visit::visit_item_struct(visitor, i)
         });
     }
 
     fn visit_item_enum(&mut self, i: &ItemEnum) {
         let self_ty = SelfRequirement::of_item(&i.ident, &i.generics);
-        self.with_item(&i.generics, Some(self_ty), |visitor| {
+        self.with_item(&i.generics, Some(self_ty), false, |visitor| {
             syn::visit::visit_item_enum(visitor, i)
         });
     }
 
     fn visit_item_union(&mut self, i: &ItemUnion) {
         let self_ty = SelfRequirement::of_item(&i.ident, &i.generics);
-        self.with_item(&i.generics, Some(self_ty), |visitor| {
+        self.with_item(&i.generics, Some(self_ty), false, |visitor| {
             syn::visit::visit_item_union(visitor, i)
         });
     }
 
     fn visit_item_trait(&mut self, i: &ItemTrait) {
         let self_ty = SelfRequirement::of_trait(&i.ident, &i.generics);
-        self.with_item(&i.generics, Some(self_ty), |visitor| {
+        self.with_item(&i.generics, Some(self_ty), false, |visitor| {
             syn::visit::visit_item_trait(visitor, i)
         });
     }
@@ -2165,14 +2570,14 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
 
     fn visit_item_mod(&mut self, i: &ItemMod) {
         // A module has no generics and no `Self`; its items are nested items with local generics.
-        self.with_item(&Generics::default(), None, |visitor| {
+        self.with_item(&Generics::default(), None, false, |visitor| {
             visitor.with_module(i, |visitor| syn::visit::visit_item_mod(visitor, i))
         });
     }
 
     fn visit_item_impl(&mut self, i: &ItemImpl) {
         let self_ty = SelfRequirement::Type((*i.self_ty).clone());
-        self.with_item(&i.generics, Some(self_ty), |visitor| {
+        self.with_item(&i.generics, Some(self_ty), true, |visitor| {
             // The trait is checked like a trait bound, but its arguments are analyzed in any case.
             if let Some((_, path, _)) = &i.trait_ {
                 visitor.check_bound_path(path, quote!(#path));
@@ -2365,6 +2770,14 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
         }
     }
 
+    fn visit_type_param_bound(&mut self, i: &TypeParamBound) {
+        // A bound that is not in a type is a predicate of the item (`env_depth`).
+        let in_env = usize::from(self.type_depth == 0);
+        self.env_depth += in_env;
+        syn::visit::visit_type_param_bound(self, i);
+        self.env_depth -= in_env;
+    }
+
     fn visit_predicate_type(&mut self, i: &PredicateType) {
         // rustc checks each bound on its own, with the bounded type among its inputs.
         let groups = i
@@ -2379,9 +2792,11 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
                 _ => None,
             })
             .collect();
+        self.env_depth += 1;
         self.with_bound_lifetimes(i.lifetimes.as_ref(), groups, |v| {
             syn::visit::visit_predicate_type(v, i)
-        })
+        });
+        self.env_depth -= 1;
     }
 
     fn visit_trait_bound(&mut self, i: &TraitBound) {

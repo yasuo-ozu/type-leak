@@ -119,7 +119,7 @@ A const parameter is treated like a type parameter. The Repeater needs a type th
 
 The context of an entry decides which Repeater impl it needs.
 
-- The generics are only those the type uses. They are the ones the type names, those that the bounds of these generics name, and, if the type names `Self`, those in the description of `Self`.
+- The generics are only those the type uses. They are the ones the type names, those that the bounds of these generics name, and, if the type names `Self`, those in the description of `Self`. A where predicate on one generic (`U: Into<T>`) is a bound of it, as if it was written on `U`: it is in the context of what uses `U`, not of what uses `T`, and so is the same one written inline. A predicate on another type (`Vec<T>: Clone`) belongs to each generic it names.
 - The same type found by several scopes is one entry if the contexts are equal, whatever the other generics of the scopes are.
 - Equal declarations give equal contexts. Parameters are sorted by kind and name, bounds are sorted and moved from the where clause to their parameter, and defaults are removed. The output type of the sugar of `Fn` is parenthesized where a `+` would join it (`T: Fn() -> (&dyn Tr) + Clone`), whichever way the source wrote it.
 - The Leaker numbers a context when it first appears, from 0. It numbers a module when it is entered, a nested scope when it is left, and the types of the outermost scope when it is left. It never renumbers them, except for the contexts of a scope that fails and is rolled back. So `Referrer::contexts()` can have gaps. It has at least one context. With no other, it is context 0 of the types that use no generics.
@@ -270,6 +270,27 @@ fn f<'a>(x: &'a dyn RelTrait);   // good: the whole reference is leaked
 ```
 
 Instead, name the lifetime, make the trait path absolute, or write the bound: `&'a (dyn RelTrait + 'a)`.
+
+## Bounds that name leaked types
+
+A bound or where predicate is rewritten like any other type: `T: Fn(Rel)` becomes `T: Fn(<() as Repeater<..>>::Type)`. That is a problem if a path through the Repeater is in a predicate of the item and its impl needs a bound of the item that names a leaked type. rustc builds the environment of the item from its predicates, and normalizes the path there, while the bounds are not normalized yet. The impl of the Repeater for `Wrap<T>` needs `T: Fn(Rel)`, and the environment has `T: Fn(<() as Repeater<..>>::Type)`: rustc cannot prove it (E0277 "expected an `Fn(Rel)` closure, found `T`", E0275 or E0284). The copy cannot have the original bound, the only link between the crates being the Repeater, so the Leaker reports an error. A type in a field or in a signature is fine, as it is normalized when the environment is built.
+
+```rust,ignore
+struct S<T: Fn(Rel)>(Wrap<T>) where Wrap<T>: Sized;  // error: `Wrap<T>` is in a predicate, `T: Fn(Rel)` names `Rel`
+struct S<T: Fn(Rel)>(Wrap<T>);                       // good
+struct S<T: Fn(Rel)>(Wrap<T>) where T: Sized;        // good
+```
+
+It is an error for a type in a bound or where predicate of the item or of a method, in these cases:
+
+- It is a leaked type (`where Wrap<T>: Sized`, `U: Into<Wrap<T>>`), and a bound of a generic that it uses names a leaked type. A type that names itself is one: `T: Into<Wrap<T>>`. A bound that names none (`T: Clone`) is fine, and so is a predicate on another type than a generic (`Vec<Rel2<T>>: Clone`), which rustc proves by an impl.
+- It is `Self::A`, an associated type of `Self`, and a bound of the generics of the trait (or of the type of `Self`) names a leaked type. The copy for a concrete implementor resolves it by the impl of the trait.
+- It is `Self`, in an impl whose self type is leaked, and a bound of the generics of the impl names a leaked type. The copy writes the self type through the Repeater, and `Self` stands for it.
+- It is a leaked type that names `Self` of a trait, in a predicate of the trait itself (its where clause, a bound of its generics or a supertrait), not in one of a method: `trait Tr where Rel<Self>: Sized`. The Repeater's impl for it is for the implementors of the trait, so proving that the host of the copy implements the trait needs the predicate, which names the type.
+
+The error names the type and the bound. Instead, write the type of the bound with an absolute path (`T: Fn(::my_crate::Rel)`), or use the type outside of the predicates (in a field or a signature).
+
+Two things are not errors. A type that is an entry only because its parts need it (`(Rel, T, Rel2)` in `T: Fn((Rel, T, Rel2))`) is not one when that makes a cycle: its parts are the entries. An optional entry (see [External crates](#external-crates)) in such a place is not one either, but copied as written, even if the Referrer would replace it.
 
 ## Method lifetimes
 

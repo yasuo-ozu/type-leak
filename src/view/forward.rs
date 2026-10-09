@@ -92,6 +92,7 @@ impl<'ast> Visit<'ast> for View<'_> {
         visit_type: Type,
         visit_type_bare_fn: TypeBareFn,
         visit_type_param: TypeParam,
+        visit_type_param_bound: TypeParamBound,
         visit_type_path: TypePath,
         visit_type_trait_object: TypeTraitObject,
     }

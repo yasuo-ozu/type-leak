@@ -393,7 +393,16 @@ impl Context {
                 }
                 let mut names = HashSet::new();
                 token_names(quote!(#predicate), &mut names);
-                if names.contains(&name) {
+                // A predicate on a generic of the scope is a bound of it, as `canonicalize()` makes
+                // it: it is in the context of what uses that generic, not of what its arguments
+                // name. So `T: Iterator<Item = Rel<'a>>` is no more in the context of `Rel<'a>`
+                // than the inline bound is, which the Referrer sees. Any other predicate belongs to
+                // each generic it names.
+                let belongs = match bounded_generic(predicate) {
+                    Some(bounded) if scopes[ix].declares(&bounded) => bounded == name,
+                    _ => names.contains(&name),
+                };
+                if belongs {
                     let mut predicate = predicate.clone();
                     if let Some(outer) = outer.filter(|_| where_predicate_mentions_self(&predicate))
                     {
@@ -734,6 +743,20 @@ fn written_self_outlives(
     }
     *predicates = remaining;
     moved
+}
+
+/// The name of the generic that `predicate` bounds, if it is one that `canonicalize()` moves to the
+/// generic: `T: Tr` and `'a: 'b`, but not `Vec<T>: Tr`, `for<'x> T: Tr<'x>` or `Self: Tr`.
+fn bounded_generic(predicate: &WherePredicate) -> Option<String> {
+    match predicate {
+        WherePredicate::Type(PredicateType {
+            lifetimes: None,
+            bounded_ty: Type::Path(TypePath { qself: None, path }),
+            ..
+        }) => path.get_ident().map(ident_name),
+        WherePredicate::Lifetime(PredicateLifetime { lifetime, .. }) => Some(lifetime.to_string()),
+        _ => None,
+    }
 }
 
 /// A generic parameter or a where predicate, written for the `Self` of the scope that declares it.

@@ -30,10 +30,15 @@ pub enum NotInternableError {
     /// ("`Self::A` cannot be written in the impl of the Repeater"). A type leaked as a whole that
     /// names a lifetime of a method which the copy would leave unconstrained (`Wrap<'x>` in
     /// `fn f<'x>(&self, a: Wrap<'x>) -> &'x u8`) has a note on E0195
-    /// ([Method lifetimes](crate#method-lifetimes)). Each conflict is reported at the first of its
-    /// [`CheckResult::must`], with [`CheckResult::is_own`] `true`. For a trait bound, a value or
-    /// the type of a const parameter, [`CheckResult::impossible`] is that bound, value or
-    /// parameter. Never empty.
+    /// ([Method lifetimes](crate#method-lifetimes)). Also a type in a bound or where predicate that
+    /// the copy cannot write through the
+    /// Repeater, as rustc cannot prove a bound of its generics that names a leaked type: its
+    /// headline is "`Wrap<T>` is in a bound or where predicate, and a bound of its generics names a
+    /// leaked type", or "`Rel<Self>` names `Self` in a bound or where predicate of its trait"
+    /// ([Bounds that name leaked types](crate#bounds-that-name-leaked-types)). Each
+    /// conflict is reported at the first of its [`CheckResult::must`], with
+    /// [`CheckResult::is_own`] `true`. For a trait bound, a value or the type of a const
+    /// parameter, [`CheckResult::impossible`] is that bound, value or parameter. Never empty.
     RelativePath(Vec<CheckResult>),
     /// `Self` where no scope gives it a meaning. Never empty.
     ///
