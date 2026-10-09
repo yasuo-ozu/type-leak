@@ -326,6 +326,7 @@ impl Context {
             let bounds_something = (self_req.is_some()
                 && mentions.types.iter().any(|name| name == "Self"))
                 || mentions.types.iter().any(is_type_param)
+                || !mentions.projections.is_empty()
                 || mentions.lifetimes.iter().any(|other| other != lifetime);
             if let (true, Some(from)) = (bounds_something, depth.checked_sub(1)) {
                 work.push((from, lifetime.to_string()));
@@ -450,7 +451,9 @@ impl Context {
         if self_req.is_some() {
             self_outlives.extend(written_self_outlives(&mut predicates, &params));
         }
-        for (bounded, lifetime) in implied_outlives(ty, scopes, &params, self_req, &ancestors) {
+        let env = Binding::of(&params, &predicates);
+        for (bounded, lifetime) in implied_outlives(ty, scopes, &params, &env, self_req, &ancestors)
+        {
             match bounded {
                 Bounded::SelfTy => {
                     self_outlives.push(lifetime);
@@ -458,6 +461,10 @@ impl Context {
                 }
                 Bounded::SelfProjection(ident) => {
                     predicates.push(parse_quote!(Self::#ident: #lifetime));
+                    continue;
+                }
+                Bounded::Projection(projection) => {
+                    predicates.push(parse_quote!(#projection: #lifetime));
                     continue;
                 }
                 _ => (),
@@ -982,6 +989,9 @@ enum Bounded {
     /// `Self::A`, an associated type of the implementor of a trait. It stays a where predicate of
     /// the context (see [`implied_outlives()`]).
     SelfProjection(Ident),
+    /// `T::A` or `<T as Tr>::A`, an associated type of a generic (see [`is_generic_projection()`]). It
+    /// stays a where predicate of the context, as `Self::A` does (see [`implied_outlives()`]).
+    Projection(TypePath),
 }
 
 /// `lifetime` is a lifetime parameter of the context. `'static`, `'_` and `for<..>` lifetimes are
@@ -1000,32 +1010,68 @@ fn is_generic_lifetime(scopes: &[Scope], binders: &[Lifetime], lifetime: &Lifeti
 /// The generics a type mentions, which `X: 'a` bounds (see [`implied_outlives()`]).
 struct Mentions<'a> {
     scopes: &'a [Scope],
+    /// The associated types that the bounds of the context equate (see [`Binding`]).
+    env: &'a [Binding],
+    /// How many bindings were substituted on the way here.
+    depth: usize,
     binders: Vec<Lifetime>,
-    /// The first segments of paths: names that may be type parameters, and `Self`.
+    /// The first segments of paths: names that may be type parameters, and `Self`. Not those of
+    /// `projections`.
     types: Vec<String>,
     lifetimes: Vec<Lifetime>,
+    /// The associated type paths of generics (see [`is_generic_projection()`]), which are a unit: what
+    /// they name is not mentioned.
+    projections: Vec<TypePath>,
 }
 
 impl<'a> Mentions<'a> {
     fn of(ty: &Type, scopes: &'a [Scope], wanted: bool) -> Self {
-        let mut mentions = Self::new(scopes, Vec::new());
+        let mut mentions = Self::new(scopes, &[], Vec::new());
         if wanted {
             mentions.visit_type(ty);
         }
         mentions
     }
 
-    fn new(scopes: &'a [Scope], binders: Vec<Lifetime>) -> Self {
+    fn new(scopes: &'a [Scope], env: &'a [Binding], binders: Vec<Lifetime>) -> Self {
         Self {
             scopes,
+            env,
+            depth: 0,
             binders,
             types: Vec::new(),
             lifetimes: Vec::new(),
+            projections: Vec::new(),
         }
     }
 }
 
 impl<'a, 'ast> Visit<'ast> for Mentions<'a> {
+    fn visit_type_path(&mut self, i: &'ast TypePath) {
+        if is_generic_projection(i, self.scopes) {
+            match Binding::find(self.env, i) {
+                // The bounds equate it: rustc normalizes the path, in the environment of the impl
+                // and in the signature, so what outlives is the type it equals. A binding is not
+                // cyclic, but the depth is limited all the same.
+                Some(value) if self.depth < 16 => {
+                    let mut equal = Mentions::new(self.scopes, self.env, self.binders.clone());
+                    equal.depth = self.depth + 1;
+                    equal.visit_type(&value);
+                    self.types.extend(equal.types);
+                    self.lifetimes.extend(equal.lifetimes);
+                    self.projections.extend(equal.projections);
+                    return;
+                }
+                Some(_) => (),
+                None if is_writable_projection(i, self.scopes, &self.binders) => {
+                    self.projections.push(i.clone());
+                    return;
+                }
+                None => (),
+            }
+        }
+        syn::visit::visit_type_path(self, i)
+    }
     fn visit_path(&mut self, i: &'ast Path) {
         if i.leading_colon.is_none() {
             self.types
@@ -1063,6 +1109,210 @@ impl<'a, 'ast> Visit<'ast> for Mentions<'a> {
     fn visit_macro(&mut self, _: &'ast Macro) {}
 }
 
+/// Returns `true` if `ty` is an associated type path of a generic, which `&'a ty` makes outlive
+/// `'a` as a whole: `T::A` and `<T as Tr<..>>::A` with `T` a type parameter in `scopes`, or such a
+/// path in place of `T` (`<T::A as Tr2>::B`). An associated type of a type that is not a type
+/// parameter (`<Vec<T> as IntoIterator>::Item`) is not one: rustc normalizes it, so what it
+/// becomes is what outlives `'a`.
+fn is_generic_projection(ty: &TypePath, scopes: &[Scope]) -> bool {
+    // The type parameter or the projection that the associated type belongs to.
+    fn base(ty: &Type, scopes: &[Scope]) -> bool {
+        match unwrap_type_group(ty) {
+            Type::Path(TypePath { qself: None, path }) if path.segments.len() == 1 => {
+                let seg = &path.segments[0];
+                path.leading_colon.is_none()
+                    && seg.arguments.is_none()
+                    && is_type_parameter(&ident_name(&seg.ident), scopes)
+            }
+            Type::Path(path) => is_generic_projection(path, scopes),
+            _ => false,
+        }
+    }
+    match &ty.qself {
+        // `T::A`
+        None => {
+            let mut segments = ty.path.segments.iter();
+            match (
+                &ty.path.leading_colon,
+                segments.next(),
+                segments.next(),
+                segments.next(),
+            ) {
+                (None, Some(first), Some(_), None) => {
+                    first.arguments.is_none()
+                        && is_type_parameter(&ident_name(&first.ident), scopes)
+                }
+                _ => false,
+            }
+        }
+        // `<T as Tr>::A`: one segment follows the trait. `<T>::A` is not one: rustc reads it as
+        // generics where a where predicate starts with it (`where <T>::A: 'a`).
+        Some(qself) => {
+            qself.position > 0
+                && ty.path.segments.len() == qself.position + 1
+                && base(&qself.ty, scopes)
+        }
+    }
+}
+
+/// Returns `true` if the associated type path `ty` (see [`is_generic_projection()`]) can be the
+/// bounded type of a where predicate of the context: it names no lifetime other than `'static` and
+/// the lifetime parameters of the context (not a binder's, `'_` or an elided one in a reference),
+/// and no `impl Trait`, `_`, type macro, function pointer or `Fn(..)` sugar. Otherwise its parts
+/// are mentioned as before.
+fn is_writable_projection(ty: &TypePath, scopes: &[Scope], binders: &[Lifetime]) -> bool {
+    struct Writable<'a> {
+        scopes: &'a [Scope],
+        binders: &'a [Lifetime],
+        writable: bool,
+    }
+    impl<'a, 'ast> Visit<'ast> for Writable<'a> {
+        fn visit_lifetime(&mut self, i: &'ast Lifetime) {
+            if i.ident != "static" && !is_generic_lifetime(self.scopes, self.binders, i) {
+                self.writable = false;
+            }
+        }
+        fn visit_type_reference(&mut self, i: &'ast TypeReference) {
+            self.writable &= i.lifetime.is_some();
+            syn::visit::visit_type_reference(self, i)
+        }
+        fn visit_type_impl_trait(&mut self, _: &'ast TypeImplTrait) {
+            self.writable = false;
+        }
+        fn visit_type_infer(&mut self, _: &'ast TypeInfer) {
+            self.writable = false;
+        }
+        fn visit_type_macro(&mut self, _: &'ast TypeMacro) {
+            self.writable = false;
+        }
+        fn visit_type_bare_fn(&mut self, _: &'ast TypeBareFn) {
+            // Its own binder and elision: not probed.
+            self.writable = false;
+        }
+        fn visit_parenthesized_generic_arguments(
+            &mut self,
+            _: &'ast ParenthesizedGenericArguments,
+        ) {
+            self.writable = false;
+        }
+    }
+    let mut writable = Writable {
+        scopes,
+        binders,
+        writable: true,
+    };
+    writable.visit_type_path(ty);
+    writable.writable
+}
+
+/// An associated type that a bound of the context equates: `T: Iterator<Item = X>`, or `F: Fn(A)
+/// -> B`, which equates `Output`. rustc normalizes the path (`T::Item`) to the type in the
+/// environment of an impl that declares the bound, and in the signature of the original, so what
+/// `&'a T::Item` requires is that of `X`, whatever the predicate `T::Item: 'a` says: the
+/// environment of the impl has it as `X: 'a`, and it is no help if `X` is not a parameter.
+#[derive(Clone, Debug)]
+struct Binding {
+    /// The bounded type as written, the part before `::` of the path: `T`, or `T :: A`.
+    bounded: String,
+    /// The last segment of the trait of the bound, unless it is the sugar of `Fn`.
+    of_trait: Option<String>,
+    name: String,
+    value: Type,
+}
+
+impl Binding {
+    /// The bindings of the bounds of `params` and of `predicates`.
+    fn of(params: &[GenericParam], predicates: &[WherePredicate]) -> Vec<Self> {
+        let mut found = Vec::new();
+        let mut collect = |bounded: String, bounds: &Punctuated<TypeParamBound, Token![+]>| {
+            for bound in bounds {
+                let seg = match bound {
+                    TypeParamBound::Trait(bound) => match bound.path.segments.last() {
+                        Some(seg) => seg,
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                match &seg.arguments {
+                    PathArguments::AngleBracketed(args) => {
+                        for arg in &args.args {
+                            if let GenericArgument::AssocType(assoc) = arg {
+                                if assoc.generics.is_none() {
+                                    found.push(Self {
+                                        bounded: bounded.clone(),
+                                        of_trait: Some(ident_name(&seg.ident)),
+                                        name: ident_name(&assoc.ident),
+                                        value: assoc.ty.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    PathArguments::Parenthesized(sugar) => found.push(Self {
+                        bounded: bounded.clone(),
+                        of_trait: None,
+                        name: "Output".to_string(),
+                        value: match &sugar.output {
+                            ReturnType::Type(_, ty) => (**ty).clone(),
+                            ReturnType::Default => parse_quote!(()),
+                        },
+                    }),
+                    PathArguments::None => (),
+                }
+            }
+        };
+        for param in params {
+            if let GenericParam::Type(param) = param {
+                collect(ident_name(&param.ident), &param.bounds);
+            }
+        }
+        for predicate in predicates {
+            if let WherePredicate::Type(predicate) = predicate {
+                let ty = unwrap_type_group(&predicate.bounded_ty);
+                collect(quote!(#ty).to_string(), &predicate.bounds);
+            }
+        }
+        found
+    }
+
+    /// The type that `projection` equals if a binding says so (`projection` has the shape that
+    /// [`is_generic_projection()`] tells).
+    fn find(env: &[Self], projection: &TypePath) -> Option<Type> {
+        let (bounded, of_trait, name) = match &projection.qself {
+            None => {
+                let mut segments = projection.path.segments.iter();
+                let first = segments.next()?;
+                (
+                    ident_name(&first.ident),
+                    None,
+                    ident_name(&segments.next()?.ident),
+                )
+            }
+            Some(qself) => {
+                let ty = unwrap_type_group(&qself.ty);
+                let segments: Vec<&PathSegment> = projection.path.segments.iter().collect();
+                (
+                    quote!(#ty).to_string(),
+                    segments
+                        .get(qself.position - 1)
+                        .map(|seg| ident_name(&seg.ident)),
+                    ident_name(&segments.get(qself.position)?.ident),
+                )
+            }
+        };
+        env.iter()
+            .find(|binding| {
+                binding.bounded == bounded
+                    && binding.name == name
+                    && match (&binding.of_trait, &of_trait) {
+                        (Some(bound), Some(written)) => bound == written,
+                        _ => true,
+                    }
+            })
+            .map(|binding| binding.value.clone())
+    }
+}
+
 /// The `A` of the `Self::A` in a type: an associated type of `Self` with the trait not written and
 /// no arguments. `Self::A<'b>` and `Self::A::B` are not (the first may name a lifetime the context
 /// does not have).
@@ -1098,15 +1348,24 @@ impl<'ast> Visit<'ast> for SelfProjections {
 /// from the well-formedness of its signature, and the Repeater's impl has no signature. It is
 /// returned as itself and not as the bounds of its components (`Self` and the arguments of the
 /// trait): the copy, where only the projection is known to outlive `'a`, could not prove those.
+/// The same holds for an associated type path of a generic (`T::A`, `<T as Tr<'b>>::A`: see
+/// [`is_generic_projection()`]), which is returned as itself (`T::A: 'a`) and brings no `T: 'a`: the
+/// signature of a trait gives `T::A: 'a` and not `T: 'a`, so an impl for another type, whose
+/// signature has the encoded `T: 'a`, could not prove it (E0309). If a bound of the context equates
+/// the associated type (`T: Iterator<Item = X>`, see [`Binding`]), rustc normalizes the path in the
+/// signature and in the environment of the impl, where the predicate would be `X: 'a`, which is
+/// not decomposed into the bounds of the parts of `X`: the parts of `X` are mentioned instead.
 fn implied_outlives(
     ty: &Type,
     scopes: &[Scope],
     params: &[GenericParam],
+    env: &[Binding],
     self_req: Option<&SelfRequirement>,
     ancestors: &[Lifetime],
 ) -> Vec<(Bounded, Lifetime)> {
     struct Finder<'a> {
         scopes: &'a [Scope],
+        env: &'a [Binding],
         params: &'a [GenericParam],
         self_req: Option<&'a SelfRequirement>,
         binders: Vec<Lifetime>,
@@ -1121,7 +1380,7 @@ fn implied_outlives(
         }
 
         fn require_generic(&mut self, lifetime: &Lifetime, referent: &Type) {
-            let mut mentions = Mentions::new(self.scopes, self.binders.clone());
+            let mut mentions = Mentions::new(self.scopes, self.env, self.binders.clone());
             mentions.visit_type(referent);
             if self.self_req.is_some() && mentions.types.iter().any(|name| name == "Self") {
                 self.found.push((Bounded::SelfTy, lifetime.clone()));
@@ -1136,6 +1395,12 @@ fn implied_outlives(
                         .map(|ident| (Bounded::SelfProjection(ident), lifetime.clone())),
                 );
             }
+            self.found.extend(
+                mentions
+                    .projections
+                    .into_iter()
+                    .map(|projection| (Bounded::Projection(projection), lifetime.clone())),
+            );
             for name in mentions.types {
                 let is_param = self.params.iter().any(|param| {
                     matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == name)
@@ -1179,6 +1444,7 @@ fn implied_outlives(
     }
     let mut finder = Finder {
         scopes,
+        env,
         params,
         self_req,
         binders: Vec::new(),

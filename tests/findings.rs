@@ -37,7 +37,7 @@
 //! | `f27_argument_impl_trait_bound_names_leaked_type_env_cycle` | the bound of an argument-position `impl Trait` names an entry whose generic has a leaked bound | fixed |
 //! | `f28_hidden_lifetime_in_elided_signature_with_generics` | a path hides the one lifetime of an elided signature, next to an entry that adds lifetimes | fixed |
 //! | `f29_entry_hides_lifetime` | an entry (a relative path) hides a lifetime: its Repeater impl does not compile | limitation |
-//! | `f30_implied_outlives_of_generic_projection_recorded_as_component` | `&'x T::Item` is recorded as `T: 'x`, which the copy cannot prove | bug |
+//! | `f30_implied_outlives_of_generic_projection_recorded_as_component` | `&'x T::Item` is recorded as `T: 'x`, which the copy cannot prove | fixed |
 //! | `f31_nested_signature_has_its_own_lifetimes` | a signature inside an input has its own lifetimes only for rustc 1.64 and later | limitation |
 //! | `f32_parentheses_only_where_rustc_needs_them` | a trait object with one bound is parenthesized in the encoding of a `?Sized` argument | fixed |
 //!
@@ -54,8 +54,8 @@
 //! The test of a finding says how the property test shows it (`TYPE_LEAK_PROP_FEATURES=..`), and
 //! the one-line reason of each failure is in its `#[ignore]` message. The features of the fixed
 //! findings are on by default in the property test: the Leaker now rejects what they generate (the
-//! rejections are counted), or rewrites it. The features of F26 and F30 are off, as for the
-//! other findings that are not fixed. F22 is a rejection of what compiles: a rejection is
+//! rejections are counted), or rewrites it. The feature of F26 is off, as for the other
+//! findings that are not fixed. F22 is a rejection of what compiles: a rejection is
 //! counted as a success by the property test, which cannot show them (nor F29, F31 and F32, which
 //! are about a toolchain, a lint, or an error in the Leaker's crate that the Leaker cannot see).
 //! The tests of F22 to F32 were written from rustc's verdict on a hand-written Leaker's crate (the
@@ -4455,14 +4455,15 @@ fn f29_entry_hides_lifetime() {
 
 // ── F30 ──────────────────────────────────────────────────────────────────────
 
-/// F30 (bug): the outlives bound that the signature implies for `&'x T::Item`, with `T` a generic,
-/// is recorded as the components `T: 'x`.
+/// F30 (fixed): the outlives bound that the signature implies for `&'x T::Item`, with `T` a
+/// generic, is in the context of the entry as the where predicate `T::Item: 'x`, and not as the
+/// components `T: 'x`.
 ///
 /// Trigger: `trait Tr<'x, T: Iterator> { fn m(&self, x: Rel<&'x T::Item>); }` (also `<T as
 /// WTrA>::A`, a trait with a bound `type A: 'static`, and `where T::Item: 'x` written). It is F16
 /// for a generic: the original relies on the well-formedness of its signature, which implies
-/// `<T as Iterator>::Item: 'x` and not `T: 'x`. The Leaker records `T: 'x` (the context has `<'x, T:
-/// Iterator + 'x>`, encoded `(&'x (), T, &'x T)`), which is more than the original has: the
+/// `<T as Iterator>::Item: 'x` and not `T: 'x`. The Leaker recorded `T: 'x` (the context had `<'x,
+/// T: Iterator + 'x>`, encoded `(&'x (), T, &'x T)`), which is more than the original has: the
 /// impl of the trait for a host type, with the signature `x: <() as Repeater<(&'x (), T, &'x T),
 /// ..>>::Type`, needs `T: 'x` where it is well formed, and its environment has `<T as
 /// Iterator>::Item: 'x` at best: E0309 "the parameter type `T` may not live long enough" (checked
@@ -4472,15 +4473,42 @@ fn f29_entry_hides_lifetime() {
 /// chose, for `Self::A`, to record the projection `Self::A: 'x` and no component, "the copy is
 /// stricter than the original" otherwise; the same holds for a generic.
 ///
-/// The property test shows it with `TYPE_LEAK_PROP_FEATURES=projection_outlives` (off by default; E0309
-/// in the Referrer's crate, seeds 1, 2 and 3 of 60 cases fail).
+/// The property test shows it with `TYPE_LEAK_PROP_FEATURES=projection_outlives` (E0309 in the
+/// Referrer's crate before the fix, seeds 1, 2 and 3 of 60 cases failed).
 ///
-/// The assertion is that of F16: if the Leaker accepts the item, the context of the entry has the
-/// predicate `T::Item: 'x`, and not `T: 'x`, which only a written bound gives (the control
-/// `Tr0<'x, T: Iterator + 'x>`, which compiles).
+/// The fix records the predicate `T::Item: 'x` (`<T as Iterator>::Item: 'x` as written, and so for
+/// `<T as Tr<'b, U>>::A`, a GAT `T::A<'b>`, and `<T::A as Tr2>::B`) as a where predicate of the
+/// context, as F16 does for `Self::A`: the Repeater's impl declares it (`impl<'x, T: Iterator>
+/// Repeater<(&'x (), T), ..> for () where T::Item: 'x`), and in the copy it follows from the
+/// normalized signature. Checked with rustc (stable 1.98.1 and nightly 1.100.0): the Repeater's
+/// impls, the copy of the trait with the signature rewritten, and impls of the trait and of the
+/// copy for a host type, with the lifetime of the trait or of the method, all compile. A written
+/// `where T::Item: 'x` is the same predicate (one, not two). Where `T` is also mentioned apart from
+/// the projection (`&'x (T, T::Item)`), `T: 'x` is recorded as well, as the original requires it.
+/// A projection that cannot be written as a where predicate of the context (it names the lifetime
+/// of a `for<..>` binder), and an associated type of a type that is no generic (`<Vec<T> as
+/// IntoIterator>::Item`, which rustc normalizes to `T`) are mentioned by their parts, as before.
+/// So is a projection that a bound of the context equates (`T: Iterator<Item = X>`): rustc
+/// normalizes it to `X`, in the signature (which implies what `X` outlives, `T: 'x` for `Item =
+/// (Wrap<T>, u8)`) and in the environment of the Repeater's impl, where the predicate `T::Item:
+/// 'x` becomes `(Wrap<T>, u8): 'x`, which rustc does not decompose (E0309 in the Leaker's crate,
+/// checked, and found by the property test, case 28 of seed 1 with the feature on). So what `X`
+/// mentions is recorded (`T: 'x` there, `U: 'x` for `Item = U`, which the encoded `&'x U` gives
+/// to the impl of the Repeater and to the host impl alike, and nothing for `Item = u8`), and no
+/// predicate.
+///
+/// What it costs: a struct that holds the copy (`struct S<'x, T: Iterator>(Rel<&'x T::Item>)`) had
+/// `T: 'x` inferred through the encoded arguments (stricter than the original), and now writes
+/// `where T::Item: 'x`, which rustc infers for the original and not through the projection of the
+/// Repeater (E0309 otherwise, checked with rustc).
+///
+/// The assertions: the context of the entry has the predicate and not `T: 'x`, the encoded
+/// arguments have no `&'x T`, and the Referrer replaces the entry in a copy of the trait, which has
+/// the signature and not the predicate. The control has `T: 'x` written, which is recorded as
+/// before.
 #[test]
-#[ignore = "`T::Item: 'x` of `&'x T::Item` is recorded as `T: 'x`, which the copy cannot prove (E0309)"]
 fn f30_implied_outlives_of_generic_projection_recorded_as_component() {
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     // The control: `T: 'x` written, and recorded.
     let control: ItemTrait = parse_quote!(
         pub trait Tr<'x, T: Iterator + 'x> {
@@ -4492,63 +4520,263 @@ fn f30_implied_outlives_of_generic_projection_recorded_as_component() {
     let referrer = leaker.finish();
     let ix = entry(&referrer, "Rel < & 'x T :: Item >");
     assert!(generics_say_outlives(referrer.generics(ix), "T", "'x"));
-    let items: Vec<ItemTrait> = vec![
-        parse_quote!(
-            pub trait Tr<'x, T: Iterator> {
-                fn m(&self, x: Rel<&'x T::Item>);
-            }
+    // The where predicates, and the generics, of the context of the entry that has `needle`.
+    let context_of = |referrer: &Referrer, needle: &str| -> (Vec<String>, Generics) {
+        let ix = referrer
+            .iter()
+            .position(|t| string(t).contains(needle))
+            .unwrap_or_else(|| panic!("no entry with `{}`", needle));
+        let generics = referrer.generics(ix).clone();
+        let predicates = generics
+            .where_clause
+            .iter()
+            .flat_map(|w| &w.predicates)
+            .map(string)
+            .collect();
+        (predicates, generics)
+    };
+    // (the trait, a text of the entry, the where predicates of its context, whether it has `T:
+    // 'x`, the encoded arguments).
+    let items: Vec<(ItemTrait, &str, &[&str], bool, &str)> = vec![
+        (
+            parse_quote!(
+                pub trait Tr<'x, T: Iterator> {
+                    fn m(&self, x: Rel<&'x T::Item>);
+                }
+            ),
+            "Item",
+            &["T :: Item : 'x"],
+            false,
+            "(& 'x () , T)",
         ),
-        parse_quote!(
-            pub trait Tr<'x, T: Iterator> {
-                fn m(&self, x: Rel<&'x <T as Iterator>::Item>);
-            }
+        (
+            parse_quote!(
+                pub trait Tr<'x, T: Iterator> {
+                    fn m(&self, x: Rel<&'x <T as Iterator>::Item>);
+                }
+            ),
+            "Item",
+            &["< T as Iterator > :: Item : 'x"],
+            false,
+            "(& 'x () , T)",
         ),
-        parse_quote!(
-            pub trait Tr<'x, T: Iterator>
-            where
-                T::Item: 'x,
-            {
-                fn m(&self, x: Rel<&'x T::Item>);
-            }
+        // Written: the same predicate.
+        (
+            parse_quote!(
+                pub trait Tr<'x, T: Iterator>
+                where
+                    T::Item: 'x,
+                {
+                    fn m(&self, x: Rel<&'x T::Item>);
+                }
+            ),
+            "Item",
+            &["T :: Item : 'x"],
+            false,
+            "(& 'x () , T)",
+        ),
+        // The Leaker does not see the bounds of the associated type (`type A: 'static`).
+        (
+            parse_quote!(
+                pub trait Tr<'x, T: ::p::WTrA> {
+                    fn m(&self, x: Rel<&'x <T as ::p::WTrA>::A>);
+                }
+            ),
+            "WTrA > :: A",
+            &["< T as :: p :: WTrA > :: A : 'x"],
+            false,
+            "(& 'x () , T)",
+        ),
+        // A generic of the method.
+        (
+            parse_quote!(
+                pub trait Tr {
+                    fn m<'x, I: Iterator>(&self, x: Rel<&'x I::Item>);
+                }
+            ),
+            "Item",
+            &["I :: Item : 'x"],
+            false,
+            "(& 'x () , I)",
+        ),
+        // The arguments of the trait, with lifetimes of the trait, are not bounded.
+        (
+            parse_quote!(
+                pub trait Tr<'x, 'b, T: ::p::Tr<'b, U>, U> {
+                    fn m(&self, x: Rel<&'x <T as ::p::Tr<'b, U>>::A>);
+                }
+            ),
+            "Tr < 'b , U > > :: A",
+            &["< T as :: p :: Tr < 'b , U > > :: A : 'x"],
+            false,
+            "(& 'b () , & 'x () , T , U)",
+        ),
+        // A generic associated type, and a projection of a projection.
+        (
+            parse_quote!(
+                pub trait Tr<'x, 'b, T: ::p::Gat> {
+                    fn m(&self, x: Rel<&'x T::A<'b>>);
+                }
+            ),
+            "A < 'b >",
+            &["T :: A < 'b > : 'x"],
+            false,
+            "(& 'b () , & 'x () , T)",
+        ),
+        (
+            parse_quote!(
+                pub trait Tr<'x, T: ::p::Tr2>
+                where
+                    T::A: ::p::Tr3,
+                {
+                    fn m(&self, x: Rel<&'x <T::A as ::p::Tr3>::B>);
+                }
+            ),
+            "Tr3 > :: B",
+            &[
+                "< T :: A as :: p :: Tr3 > :: B : 'x",
+                "T :: A : :: p :: Tr3",
+            ],
+            false,
+            "(& 'x () , T)",
+        ),
+        // Around the reference: `&'x Rel<T::Item>` is the entry, with `'x` as its own.
+        (
+            parse_quote!(
+                pub trait Tr<'x, T: Iterator> {
+                    fn m(&self, x: &'x Rel<T::Item>);
+                }
+            ),
+            "& 'x Rel",
+            &["T :: Item : 'x"],
+            false,
+            "(& 'x () , T)",
+        ),
+        // `T` is mentioned apart from the projection: `T: 'x` is required, and recorded too.
+        (
+            parse_quote!(
+                pub trait Tr<'x, T: Iterator> {
+                    fn m(&self, x: Rel<&'x (T, T::Item)>);
+                }
+            ),
+            "Item",
+            &["T :: Item : 'x"],
+            true,
+            "(& 'x () , T , & 'x T)",
+        ),
+        // The bounds equate the associated type: what it equals is mentioned.
+        (
+            parse_quote!(
+                pub trait Tr<'x, T: Iterator<Item = (::p::B1<T>, u8)>> {
+                    fn m(&self, x: Rel<&'x T::Item>);
+                }
+            ),
+            "Item",
+            &[],
+            true,
+            "(& 'x () , T , & 'x T)",
+        ),
+        (
+            parse_quote!(
+                pub trait Tr<'x, T: Iterator<Item = u8>> {
+                    fn m(&self, x: Rel<&'x <T as Iterator>::Item>);
+                }
+            ),
+            "Item",
+            &[],
+            false,
+            "(& 'x () , T)",
+        ),
+        // Not a projection of a generic: `<Vec<T> as IntoIterator>::Item` is `T`.
+        (
+            parse_quote!(
+                pub trait Tr<'x, T> {
+                    fn m(&self, x: Rel<&'x <Vec<T> as IntoIterator>::Item>);
+                }
+            ),
+            "IntoIterator",
+            &[],
+            true,
+            "(& 'x () , T , & 'x T)",
+        ),
+        // The lifetime of a binder is not a generic of the context: no predicate can be written.
+        (
+            parse_quote!(
+                pub trait Tr<'x, T: ::p::Tr<'static, ()>> {
+                    fn m(&self, x: Rel<&'x for<'z> fn(<T as ::p::Tr<'z, ()>>::A, &'z u8)>);
+                }
+            ),
+            "fn",
+            &[],
+            true,
+            "(& 'x () , T , & 'x T)",
         ),
     ];
-    for item in &items {
+    for (item, needle, expected, outlives_t, encoded) in &items {
         let mut leaker = new_leaker();
-        // Rejected is fine.
-        let Ok(_) = leaker.intern_trait(item, true) else {
-            continue;
-        };
+        let context = leaker
+            .intern_trait(item, true)
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), e));
         let referrer = leaker.finish();
-        let mut checked = 0;
-        for ix in 0..referrer.iter().count() {
-            let ty = string(referrer.iter().nth(ix).unwrap());
-            if !(ty.contains("& 'x") && ty.contains("Item")) {
-                continue;
-            }
-            checked += 1;
-            let generics = referrer.generics(ix);
-            assert!(
-                !generics_say_outlives(generics, "T", "'x"),
-                "`{}`: the context of the entry `{}` has `T: 'x` (generics `{}`), which the original does not have",
-                string(item),
-                ty,
-                string(generics)
-            );
-            let predicate_recorded = generics
-                .where_clause
-                .iter()
-                .flat_map(|w| &w.predicates)
-                .any(|p| string(p).ends_with("Item : 'x"));
-            assert!(
-                predicate_recorded,
-                "`{}`: the context of the entry `{}` (generics `{}`) lacks `T::Item: 'x`",
-                string(item),
-                ty,
-                string(generics)
-            );
-        }
-        assert!(checked > 0, "`{}`: no entry", string(item));
+        let (predicates, generics) = context_of(&referrer, needle);
+        assert_eq!(
+            predicates,
+            *expected,
+            "`{}`: the where predicates of the context (generics `{}`)",
+            string(item),
+            string(&generics)
+        );
+        let named = if string(item).contains("I : Iterator") {
+            "I"
+        } else {
+            "T"
+        };
+        assert_eq!(
+            generics_say_outlives(&generics, named, "'x"),
+            *outlives_t,
+            "`{}`: `{}: 'x` in the context (generics `{}`)",
+            string(item),
+            named,
+            string(&generics)
+        );
+        let arguments = slots
+            .encode_generics_params_to_ty_with_self(&generics.params, &parse_quote!(Self), &[])
+            .unwrap();
+        assert_eq!(string(&arguments), *encoded, "`{}`", string(item));
+        // The Referrer finds the entry in the copy, which has the signature and no predicate.
+        let copy = rewrite(&referrer, context, Item::Trait(item.clone()));
+        assert!(
+            !copy.contains("Rel < &") && !copy.contains("& 'x Rel"),
+            "`{}`: not replaced in the copy: {}",
+            string(item),
+            copy
+        );
     }
+    // The bound equates the associated type to another generic: that one outlives.
+    let item: ItemTrait = parse_quote!(
+        pub trait Tr<'x, T: Iterator<Item = U>, U> {
+            fn m(&self, x: Rel<&'x T::Item>);
+        }
+    );
+    let mut leaker = new_leaker();
+    leaker.intern_trait(&item, true).unwrap();
+    let referrer = leaker.finish();
+    let (predicates, generics) = context_of(&referrer, "Item");
+    assert!(predicates.is_empty(), "{:?}", predicates);
+    assert!(generics_say_outlives(&generics, "U", "'x"));
+    assert!(!generics_say_outlives(&generics, "T", "'x"));
+    // An impl, whose `Self` is a type.
+    let item: ItemImpl = parse_quote!(
+        impl<'x, T: Iterator> ::p::Tr<'x> for W<T> {
+            fn m(&self, x: Rel<&'x T::Item>) {}
+        }
+    );
+    let mut leaker = new_leaker();
+    leaker.intern_impl(&item, true).unwrap();
+    let referrer = leaker.finish();
+    let (predicates, generics) = context_of(&referrer, "Rel < & 'x T :: Item >");
+    assert_eq!(string(&generics), "< 'x , T : Iterator >");
+    assert_eq!(predicates, ["T :: Item : 'x"]);
 }
 
 // ── F31 ──────────────────────────────────────────────────────────────────────

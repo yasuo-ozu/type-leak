@@ -181,8 +181,9 @@ pub struct Features {
     /// signature or rejects the item.
     pub hidden_lifetimes: bool,
     /// `Rel<&'a T::Item>` in a method of a trait, where `'a` is a lifetime of the trait and `T` an
-    /// iterator that does not outlive it: the signature implies `T::Item: 'a`, the Leaker records `T:
-    /// 'a`, which the copy cannot prove: E0309, like F16 (F30: a bug, off by default).
+    /// iterator that does not outlive it: the signature implies `T::Item: 'a`, which the Leaker
+    /// records as the where predicate `T::Item: 'a`, and not as `T: 'a`, which the copy cannot
+    /// prove (E0309, like F16; F30: fixed, on by default).
     pub projection_outlives: bool,
 }
 
@@ -211,6 +212,7 @@ impl Features {
             hidden_lifetimes: true,
             supertrait_item: true,
             impl_trait_args: true,
+            projection_outlives: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -1932,8 +1934,12 @@ impl Gen {
                     bounded.push((p.name.clone(), "iter"));
                     // The item does not name the associated types of the iterators (`X::Item`):
                     // `X: Iterator<Item = W<X::Item>>` is a cycle for rustc itself.
+                    // Nor `Self`: a type that holds `X::Item` by value would hold itself (E0391,
+                    // a cycle in its layout).
                     let outer = std::mem::replace(&mut self.no_assoc_paths, true);
+                    let outer_self = std::mem::replace(&mut self.no_self, true);
                     let a = self.ty(sc, sized, 1);
+                    self.no_self = outer_self;
                     self.no_assoc_paths = outer;
                     format!("{}: ::core::iter::Iterator<Item = {}>", p.name, a.text)
                 }

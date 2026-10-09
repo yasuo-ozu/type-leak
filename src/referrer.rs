@@ -1152,8 +1152,9 @@ impl Referrer {
     // `Self` also when an outer bound was rewritten for it (`T: Tr<Self>` as `T: Tr<S<T>>`). The
     // tokens look the same, but the data of 3 would not find those entries the same way.
     // 5: the context of `&'a Self::A` in a trait has the where predicate `Self::A: 'a`, which the
-    // Referrer computes for a copy too, so the entries of 4 are not found.
-    pub const FORMAT_VERSION: u32 = 5;
+    // Referrer computes for a copy too, so the entries of 4 are not found. 6: so has that of `&'a
+    // T::A` or `&'a <T as Tr>::A` with `T` a generic (`T::A: 'a`, and no `T: 'a`).
+    pub const FORMAT_VERSION: u32 = 6;
 }
 
 /// Parses a [`Referrer`] written by its [`ToTokens`] implementation.

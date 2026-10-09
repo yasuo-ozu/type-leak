@@ -1885,11 +1885,19 @@ pub mod user {
     /// which has the bounds that the struct writes (`T: 'a`, as `Ref<'a, X>` requires it, E0309
     /// otherwise).
     pub mod strict_copies {
+        use crate::m::Rel2;
+
         crate::m::Around!(strict copy [StrictWrapper] {
             pub struct Nested<'a, T: 'a>(pub ::core::cell::Ref<'a, ::std::vec::Vec<Rel2<T>>>);
+            // The entry `Vec<T::A<Rel2<U>>>` has the where predicate `T::A<Rel2<U>>: 'a` (the
+            // projection is a unit, which the original gets by RFC 2093 from its field). The
+            // copy of the field does not infer it through the projection of the Repeater: write it
+            // (with `Rel2` in scope, as the predicate is not rewritten, being no entry's context).
             pub struct GatNested<'a, T: ::type_leak_test_outlives::Gat, U>(
                 pub &'a ::std::vec::Vec<T::A<Rel2<U>>>,
-            );
+            )
+            where
+                T::A<Rel2<U>>: 'a;
         });
         pub struct StrictWrapper;
     }

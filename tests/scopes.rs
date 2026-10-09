@@ -1174,14 +1174,14 @@ fn modules_are_serialized() {
 
 #[test]
 fn the_format_of_the_previous_version_is_rejected() {
-    assert_eq!(Referrer::FORMAT_VERSION, 5);
+    assert_eq!(Referrer::FORMAT_VERSION, 6);
     // The serialized form of a module in the format 1.
     let old: proc_macro2::TokenStream =
         "\"type-leak-format-1\" 2 mod self ; (Rel) mod a :: b ; (Rel)"
             .parse()
             .unwrap();
     let err = parse2::<Referrer>(old).err().unwrap();
-    assert!(err.to_string().contains("format 1, expected 5"), "{}", err);
+    assert!(err.to_string().contains("format 1, expected 6"), "{}", err);
     // The format 2 had the same grammar, but its top-level contexts did not tell `Self` or the
     // module of the scope, which the visitor needs.
     let old: proc_macro2::TokenStream =
@@ -1189,23 +1189,31 @@ fn the_format_of_the_previous_version_is_rejected() {
             .parse()
             .unwrap();
     let err = parse2::<Referrer>(old).err().unwrap();
-    assert!(err.to_string().contains("format 2, expected 5"), "{}", err);
+    assert!(err.to_string().contains("format 2, expected 6"), "{}", err);
     // The format 3 had the same grammar too, but a top-level context did not tell `Self` when only
     // a bound rewritten for it depended on it (`T: Tr<Self>` as `T: Tr<S<T>>`).
     let old: proc_macro2::TokenStream = "\"type-leak-format-3\" 2 < T > ; () < T > ; (Rel)"
         .parse()
         .unwrap();
     let err = parse2::<Referrer>(old).err().unwrap();
-    assert!(err.to_string().contains("format 3, expected 5"), "{}", err);
+    assert!(err.to_string().contains("format 3, expected 6"), "{}", err);
     // The format 4 had the same grammar too, but the context of `&'a Self::A` in a trait did not
     // have the where predicate `Self::A: 'a` that the Referrer computes for a copy.
     let old: proc_macro2::TokenStream = "\"type-leak-format-4\" 2 < T > ; () < T > ; (Rel)"
         .parse()
         .unwrap();
     let err = parse2::<Referrer>(old).err().unwrap();
-    assert!(err.to_string().contains("format 4, expected 5"), "{}", err);
+    assert!(err.to_string().contains("format 4, expected 6"), "{}", err);
+    // The format 5 had the same grammar too, but the context of `&'a T::A` (and of `&'a <T as
+    // Tr>::A`), with `T` a generic, had the bound `T: 'a` and not the where predicate `T::A: 'a`
+    // that the Referrer computes for a copy.
+    let old: proc_macro2::TokenStream = "\"type-leak-format-5\" 2 < T > ; () < T > ; (Rel)"
+        .parse()
+        .unwrap();
+    let err = parse2::<Referrer>(old).err().unwrap();
+    assert!(err.to_string().contains("format 5, expected 6"), "{}", err);
     // And one without a module is too.
-    for version in 1..=4 {
+    for version in 1..=5 {
         let old: proc_macro2::TokenStream = format!("\"type-leak-format-{}\" (MyType)", version)
             .parse()
             .unwrap();
