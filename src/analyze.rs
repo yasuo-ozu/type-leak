@@ -106,8 +106,9 @@ enum BinderInput<'a> {
 /// elided lifetime that elision takes from the only lifetime of the inputs. The copy of a type with
 /// lifetimes in the inputs names them in the arguments of its projection, so the inputs have more
 /// lifetimes and elision fails (E0106). Such a type is not leaked alone: the type holding the
-/// signature is leaked as a whole instead if it can be, and it is an error otherwise. See [Elided
-/// lifetimes](crate#elided-lifetimes).
+/// signature is leaked as a whole instead if it can be, and it is an error otherwise. The same
+/// holds for `Self`, which the copy of a struct, an enum or a union writes as the type itself (see
+/// [`AnalyzeVisitor::self_elision_broken()`]). See [Elided lifetimes](crate#elided-lifetimes).
 #[derive(Clone)]
 struct Elision {
     /// The depth of the type holding the signature, leaked whole instead (0 for a method or a
@@ -184,6 +185,24 @@ impl Elision {
         for lifetime in lifetimes {
             if Some(lifetime) != self.kept.as_ref() && !added.contains(lifetime) {
                 added.push(lifetime.clone());
+            }
+        }
+        added
+    }
+
+    /// Returns the lifetimes that a copy adds to the inputs by writing `self_ty` for `Self`
+    /// (`Visitor::with_self()`): those it names, or an elided one (`'_`), not the one the inputs
+    /// keep.
+    fn added_by_self(&self, self_ty: &Type) -> Vec<Lifetime> {
+        let mut lifetimes = InputLifetimes::default();
+        lifetimes.visit_type(self_ty);
+        let mut added: Vec<Lifetime> = Vec::new();
+        if lifetimes.elided > 0 {
+            added.push(Lifetime::new("'_", proc_macro2::Span::call_site()));
+        }
+        for lifetime in lifetimes.named {
+            if Some(&lifetime) != self.kept.as_ref() && !added.contains(&lifetime) {
+                added.push(lifetime);
             }
         }
         added
@@ -842,6 +861,29 @@ impl AnalyzeVisitor {
         }
     }
 
+    /// Returns the signature whose elision the copy would break by writing the type for `Self` or
+    /// `Self::A`, if `ty` is one, with the lifetimes it adds. The copy of a struct, an enum or a
+    /// union is a new item, so `Visitor::with_self()` writes `Self` as the type of the Leaker
+    /// (`::p::S<'a>`), whereas `Self` itself names no lifetime to elision. The copy of an impl
+    /// keeps `Self`, and so does a receiver (`self: Box<Self>`), which the Visitor does not
+    /// rewrite. See [`Elision`].
+    fn self_elision_broken(&self, ty: &Type) -> Option<(Elision, Vec<Lifetime>)> {
+        if self.in_receiver || self.self_written || !is_self_path(ty) {
+            return None;
+        }
+        let self_ty = match &self.self_ty {
+            Some(SelfRequirement::Type(self_ty)) => self_ty,
+            _ => return None,
+        };
+        let elision = self.elisions.last()?.as_ref()?;
+        let added = elision.added_by_self(self_ty);
+        if added.is_empty() {
+            None
+        } else {
+            Some((elision.clone(), added))
+        }
+    }
+
     /// Finishes the outermost scope. Defaults of type parameters are analyzed alone, with the
     /// parameters before them, and may not leak `Self`. On an error the caller rolls back the
     /// contexts recorded since the start.
@@ -1241,6 +1283,26 @@ impl AnalyzeVisitor {
     }
 
     fn decide(&mut self, ty: &Type, depth: usize, ambiguous: bool, mut inner: Frame) {
+        // `Self` (or `Self::A`) that the copy writes as a type with lifetimes, in the inputs of a
+        // signature whose output relies on elision: `Self` is no entry, so it is the type holding
+        // the signature that is leaked whole instead, or a conflict (in a bound or a method). Like
+        // the entries that add lifetimes, below.
+        let mut self_conflict = None;
+        if let Some((elision, added)) = self.self_elision_broken(ty) {
+            if elision.owner > 0 {
+                self.musts.push((elision.owner, quote!(#ty)));
+                let note = self_elision_note(&added, &elision.output, true);
+                inner.elision = Some((elision.owner, note));
+                inner.min_depth = inner.min_depth.min(elision.owner);
+                return self.decide_as_owner(elision.owner, inner);
+            }
+            self.musts.push((depth, quote!(#ty)));
+            inner.min_depth = inner.min_depth.min(depth);
+            let mut conflict = self.causes(inner.must_start, inner.impossible_start, depth);
+            conflict.impossible.insert(0, elision.output.clone());
+            conflict.note = Some(self_elision_note(&added, &elision.output, false));
+            self_conflict = Some(conflict);
+        }
         if inner.min_depth != depth && self.is_ambiguous_owner(ty, depth, &inner) {
             self.own_causes(inner.must_start, depth);
             inner.min_depth = depth;
@@ -1248,6 +1310,9 @@ impl AnalyzeVisitor {
         // A type leaked whole for its own path cannot use a binder lifetime of the output: the type
         // holding the binder is leaked instead, or it is a conflict (in a bound).
         let mut own = (inner.min_depth == depth).then(|| self.own_context(ty, depth, &inner));
+        if let Some(conflict) = self_conflict {
+            own = Some(Err(conflict));
+        }
         if let (Some(_), Some(probe)) = (&own, &mut self.probe) {
             probe.insert(ty as *const Type as usize);
         }
@@ -3215,6 +3280,28 @@ fn elision_note(added: &[Lifetime], output: &TokenStream, owned: bool) -> String
     )
 }
 
+/// The note of a signature whose elision the copy breaks by writing a type with `added` lifetimes
+/// for `Self`.
+fn self_elision_note(added: &[Lifetime], output: &TokenStream, owned: bool) -> String {
+    let added: Vec<String> = added
+        .iter()
+        .map(|lifetime| format!("`{}`", lifetime))
+        .collect();
+    format!(
+        "the output `{}` has an elided lifetime, which elision takes from the only lifetime of the \
+         inputs, but `Self` in the inputs is a type that has {} among its generics, and the copy \
+         writes that type for `Self` (`Visitor::with_self()`), so the inputs have more than one \
+         lifetime (E0106){}",
+        output,
+        added.join(", "),
+        if owned {
+            ", so the type holding the signature would be leaked as a whole instead"
+        } else {
+            ": name the lifetime of the inputs and of the output"
+        }
+    )
+}
+
 fn output_lifetimes(
     lifetimes: Option<&BoundLifetimes>,
     f: impl FnOnce(&mut OutputLifetimes),
@@ -3351,6 +3438,17 @@ fn self_segment(path: &Path) -> Option<&PathSegment> {
     path.segments
         .first()
         .filter(|seg| path.leading_colon.is_none() && seg.ident == "Self")
+}
+
+/// Returns `true` if `ty` is `Self` or `Self::A`, written as a path: not `<Self as Tr>::A`, whose
+/// `Self` is a type of its own.
+fn is_self_path(ty: &Type) -> bool {
+    match ty {
+        Type::Path(TypePath { qself: None, path }) => {
+            matches!(self_segment(path), Some(seg) if seg.arguments.is_none())
+        }
+        _ => false,
+    }
 }
 
 /// Returns `true` if `ty` is a single identifier (`SIZE`), which may be a const as a generic

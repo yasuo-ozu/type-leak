@@ -799,6 +799,11 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
     /// means something else: it is not replaced, and no leaked type that names it is found.
     /// The outermost item, or the signature if only that is visited, is not nested.
     ///
+    /// A `self_ty` with lifetimes (`::p::S<'a>`) gives more input lifetimes to a function pointer
+    /// or `Fn(..)` that names `Self` in its inputs and has an elided lifetime in its output
+    /// (E0106). For the `Self` of a struct, an enum or a union, the Leaker leaks such a signature
+    /// whole or rejects the item. See [Elided lifetimes](crate#elided-lifetimes).
+    ///
     /// ```
     /// # use type_leak::*;
     /// # use syn::*;

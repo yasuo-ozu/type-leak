@@ -22,7 +22,7 @@
 //! | `f12_elided_lifetime_in_fn_sugar_with_generics` | `Fn(&Rel<T>) -> &u8` with an entry that has lifetimes | fixed |
 //! | `f13_impl_bound_names_self_of_leaked_self_type` | a bound of an impl names `Self`, and the self type is an entry: it is its own `Self` | bug |
 //! | `f14_impl_predicate_names_self_projection_with_leaked_bound` | `Self::A` in a predicate of an impl whose bound names a leaked type | bug |
-//! | `f15_self_rewritten_in_elided_signature` | `with_self()` writes `Self`, with lifetimes, into `fn(&Self) -> &u8` | bug |
+//! | `f15_self_rewritten_in_elided_signature` | `with_self()` writes `Self`, with lifetimes, into `fn(&Self) -> &u8` | fixed |
 //! | `f16_implied_outlives_of_self_projection_lost` | `Self::A0: 'x` of `&'x Self::A0` is not recorded, only `Self: 'x` | fixed |
 //! | `f17_optional_entry_in_own_context` | a strict Referrer replaces an optional entry whose own context names it | bug |
 //! | `f18_strict_referrer_replaces_anchor_of_method_lifetime` | a strict Referrer replaces the optional type that holds a method lifetime | limitation |
@@ -48,8 +48,8 @@
 //! F10 and F11 are errors of rustc on a copy of a module or an impl that the test macro makes
 //! (E0277, E0207). The tests pin the behaviour of the library that is the cause, not the errors.
 //!
-//! The features of the bugs (F13 to F15, F17 and F19 to F21: `impl_self_bounds`,
-//! `impl_pred_leaked`, `self_elision`, `strict_cycles`, `impl_self_bound_cycle`,
+//! The features of the bugs (F13, F14, F17 and F19 to F21: `impl_self_bounds`,
+//! `impl_pred_leaked`, `strict_cycles`, `impl_self_bound_cycle`,
 //! `trait_assoc_bound_cycle` and `iterator_item_cycle`) and of the limitation F18
 //! (`strict_anchors`) are off in
 //! the property test: the generator does not make what they fail on (the last two only decide that
@@ -1845,8 +1845,11 @@ fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
 
 /// The copy of a struct, an enum or a union that a macro makes with `Referrer::visitor(..)
 /// .with_self(self_ty)`, where `self_ty` is the type as the Leaker's crate names it
-/// (`::p::S<'a, T>`).
-fn f15_copy(item: &Item) -> std::result::Result<Item, NotInternableError> {
+/// (`::p::S<'a, T>`), and the entries of the item. Each entry is replaced by `P<ix>`.
+fn f15_copy(
+    item: &Item,
+    allow_self: bool,
+) -> std::result::Result<(Vec<String>, Item), NotInternableError> {
     let (ident, generics) = match item {
         Item::Struct(i) => (&i.ident, &i.generics),
         Item::Enum(i) => (&i.ident, &i.generics),
@@ -1855,9 +1858,9 @@ fn f15_copy(item: &Item) -> std::result::Result<Item, NotInternableError> {
     };
     let mut leaker = new_leaker();
     let context = match item {
-        Item::Struct(i) => leaker.intern_struct(i, true)?,
-        Item::Enum(i) => leaker.intern_enum(i, true)?,
-        Item::Union(i) => leaker.intern_union(i, true)?,
+        Item::Struct(i) => leaker.intern_struct(i, allow_self)?,
+        Item::Enum(i) => leaker.intern_enum(i, allow_self)?,
+        Item::Union(i) => leaker.intern_union(i, allow_self)?,
         _ => unreachable!(),
     };
     let referrer = leaker.finish();
@@ -1865,10 +1868,11 @@ fn f15_copy(item: &Item) -> std::result::Result<Item, NotInternableError> {
     let self_ty: Type = parse_quote!(::p::#ident<#(#args),*>);
     let mut copy = item.clone();
     referrer
+        .clone()
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
         .with_self(self_ty)
         .visit_item_mut(&mut copy);
-    Ok(copy)
+    Ok((referrer.iter().map(string).collect(), copy))
 }
 
 /// F15: `Referrer::visitor(..).with_self(ty)` replaces `Self` in a signature with an elided output
@@ -1877,57 +1881,116 @@ fn f15_copy(item: &Item) -> std::result::Result<Item, NotInternableError> {
 /// Trigger: `struct S<'a> { f: fn(&Self) -> &u8, g: &'a u8 }` copied with `with_self(::p::S<'a>)`,
 /// as the macro of a Referrer does for a struct, an enum or a union (so that `Self` is the
 /// Leaker's type). The elided lifetime of the output is that of the only lifetime of the input,
-/// `&Self`. The copy has `fn(&::p::S<'a>) -> &u8`, whose input has two (the elided one and `'a`):
-/// E0106 "missing lifetime specifier ... which one of argument 1's 2 lifetimes it is borrowed
-/// from". The same for `Fn(&Self) -> &u8` of a trait object. `S<T>` (no lifetime) is fine. The
+/// `&Self`: rustc counts none for `Self`. The copy has `fn(&::p::S<'a>) -> &u8`, whose input has
+/// two (the elided one and `'a`): E0106 "missing lifetime specifier ... which one of argument 1's
+/// 2 lifetimes it is borrowed from". The same for `Fn(&Self) -> &u8` of a trait object, and for
+/// `Self::A`, which the visitor writes as `<::p::S<'a>>::A`. `S<T>` (no lifetime) is fine. The
 /// replacement of an entry has the same problem and F12 fixed it, by leaking the whole holder;
 /// this is `Self`, which the Leaker does not replace, and the Referrer does, without looking at
 /// the signature.
 ///
-/// The property test shows it with `TYPE_LEAK_PROP_FEATURES=self_elision`, but the generated
-/// crates fail in the *oracle* of the test macro, not in the library: a witness (`pub fn
-/// __tl_w_k<..>() -> PhantomData<Ty>`) and a check write the original type with `Self` replaced
-/// by the self type of an impl (`&'static unsafe fn(i32)`, with a lifetime), or `Self::A0` by
-/// `<__Self as Tr<'a, ..>>::A0` (with the lifetime parameters of the trait), and that breaks
-/// the elision of `fn(&Self) -> &Y` in the Leaker's crate (E0106). The library does not
-/// substitute `Self` there: the Repeater's impl for the implementors writes `Self::A0` as
-/// `<__S>::A0` (`Referrer::iter_with_self()`), which adds no lifetime, and an impl for a type keeps
-/// `Self`. `with_self()` is the substitution of the library that can break it, so that is what
-/// the test is about.
+/// The fix is the same as F12's: `Self` (when it is a type with lifetimes that a copy writes, the
+/// struct, enum or union itself) in the inputs of such a signature adds lifetimes like an entry
+/// does. The holder (the function pointer, the trait object, the reference that takes its
+/// lifetime) is leaked whole, which keeps `Self` and the elision as written in the impl of the
+/// Repeater (`impl<'a> Repeater<..> for S<'a> { type Type = fn(&Self) -> &u8; }`, which rustc
+/// accepts). With `allow_self == false` it cannot be leaked, and where nothing holds the signature
+/// (a bound, a method) it is a conflict, with the note about E0106. The copy of an impl keeps
+/// `Self`, and so does a trait, whose Repeater impl writes `Self::A` as `<__S>::A`
+/// (`Referrer::iter_with_self()`), and `with_self(Host)` the same, so they are not affected
+/// (rustc accepts `fn(&<__S>::A) -> &u8`, and rejects `fn(&<__Self as Tr<'a>>::A) -> &u8`).
 ///
-/// The visitor should give the elided lifetime a name (`for<'e> fn(&'e ::p::S<'a>) -> &'e u8`,
-/// which compiles), or the Leaker should leak the whole signature or reject the item, as F12
-/// does. The assertion is that no sugar of `Fn(..)` and no function pointer of the copy has an
-/// elided output lifetime that its inputs cannot resolve (`Signatures`, as in F12).
+/// The property test shows it with `TYPE_LEAK_PROP_FEATURES=self_elision` (on by default now).
+/// There were two causes. The *oracle* of the test macro failed in the Leaker's crate: a witness
+/// (`pub fn __tl_w_k<..>() -> PhantomData<Ty>`) and a check write the original type with `Self`
+/// as the self type of an impl (`&'static unsafe fn(i32)`) or `Self::A0` as `<__Self as Tr<'a,
+/// ..>>::A0` (with the lifetime parameters of the trait), and that breaks the elision of
+/// `fn(&Self) -> &Y` (E0106). The oracle does not compare such a position now. The *library*
+/// failed in the Referrer's crate, for the `Self` of a struct, an enum or a union with lifetime
+/// parameters (the generator names `Self` in such a signature with the feature on).
+/// The test asserts which entries there are, and that no sugar of `Fn(..)` and no function pointer
+/// of the copy has an elided output lifetime that its inputs cannot resolve (`Signatures`, as in
+/// F12).
 #[test]
-#[ignore = "with_self() writes Self, as a type with lifetimes, into fn(&Self) -> &u8: the elision fails"]
 fn f15_self_rewritten_in_elided_signature() {
-    let items: Vec<Item> = vec![
-        parse_quote!(
-            pub struct S<'a> {
-                f: fn(&Self) -> &u8,
-                g: &'a u8,
-            }
+    // The holder is the entry: the whole signature is leaked, with `Self` as written.
+    for (item, holder) in [
+        (
+            parse_quote!(
+                pub struct S<'a> {
+                    f: fn(&Self) -> &u8,
+                    g: &'a u8,
+                }
+            ),
+            "fn (& Self) -> & u8",
         ),
-        parse_quote!(
-            pub struct S<'a>(Box<dyn Fn(&Self) -> &u8>, &'a u8);
+        (
+            parse_quote!(
+                pub struct S<'a>(Box<dyn Fn(&Self) -> &u8>, &'a u8);
+            ),
+            "dyn Fn (& Self) -> & u8",
         ),
-        parse_quote!(
-            pub enum E<'a, T> {
-                A(fn(&(T, Self)) -> &u8),
-                B(&'a T),
-            }
+        (
+            parse_quote!(
+                pub enum E<'a, T> {
+                    A(fn(&(T, Self)) -> &u8),
+                    B(&'a T),
+                }
+            ),
+            "fn (& (T , Self)) -> & u8",
         ),
-        parse_quote!(
-            pub union U<'a> {
-                f: fn(&Self) -> &u8,
-                g: &'a u8,
-            }
+        (
+            parse_quote!(
+                pub union U<'a> {
+                    f: fn(&Self) -> &u8,
+                    g: &'a u8,
+                }
+            ),
+            "fn (& Self) -> & u8",
         ),
-    ];
-    // Where `Self` has no lifetime (a type of type parameters only), or the lifetimes are named,
-    // there is nothing to resolve.
-    let controls: Vec<Item> = vec![
+        // `Self` deep in the inputs, next to a type that is allowed.
+        (
+            parse_quote!(
+                pub struct S<'a>(Box<dyn Fn(&Vec<Self>) -> &u8>, &'a u8);
+            ),
+            "dyn Fn (& Vec < Self >) -> & u8",
+        ),
+        // The reference takes its lifetime from the trait object, so it is the holder.
+        (
+            parse_quote!(
+                pub struct S<'a>(&'a dyn Fn(&Self) -> &u8, &'a u8);
+            ),
+            "& 'a dyn Fn (& Self) -> & u8",
+        ),
+        // `Self` as the qualified self type has none of its own either.
+        (
+            parse_quote!(
+                pub struct S<'a>(Box<dyn Fn(&<Self as ::p::Tr>::A) -> &u8>, &'a u8);
+            ),
+            "dyn Fn (& < Self as :: p :: Tr > :: A) -> & u8",
+        ),
+    ] {
+        let item: Item = item;
+        let (entries, copy) = f15_copy(&item, true).unwrap();
+        assert_eq!(entries, [holder], "{}", string(&item));
+        let mut signatures = Signatures::default();
+        signatures.visit_item(&copy);
+        assert_eq!(
+            signatures.count,
+            0,
+            "nothing of it is left: {}",
+            string(&copy)
+        );
+        // With `allow_self == false` the holder cannot be leaked (it names `Self`).
+        let err = f15_copy(&item, false)
+            .err()
+            .unwrap_or_else(|| panic!("{} is accepted", string(&item)));
+        let note = err.note().unwrap();
+        assert!(note.contains("E0106"), "{}: {}", string(&item), note);
+    }
+    // Where the elision is not at stake, `Self` is left alone: `Self` has no lifetime, the inputs
+    // keep the lifetime that `Self` has, or the output does not rely on elision.
+    for item in [
         parse_quote!(
             pub struct S<T> {
                 f: fn(&Self) -> &u8,
@@ -1946,25 +2009,100 @@ fn f15_self_rewritten_in_elided_signature() {
                 g: &'a u8,
             }
         ),
-    ];
-    for item in &items {
-        // Rejected is fine.
-        let Ok(copy) = f15_copy(item) else {
-            continue;
-        };
+        parse_quote!(
+            pub struct S<'a> {
+                f: fn(&'a Self) -> &u8,
+                g: &'a u8,
+            }
+        ),
+        parse_quote!(
+            pub struct S<'a> {
+                f: fn(&Self) -> Self,
+                g: &'a u8,
+            }
+        ),
+        parse_quote!(
+            pub struct S<'a> {
+                f: fn(&u8) -> &Self,
+                g: &'a u8,
+            }
+        ),
+        // Its own signature: the lifetimes of the inner function pointer are not those of the
+        // outer one.
+        parse_quote!(
+            pub struct S<'a> {
+                f: fn(&fn(&Self) -> Self) -> &u8,
+                g: &'a u8,
+            }
+        ),
+    ] {
+        let item: Item = item;
+        let (entries, copy) = f15_copy(&item, true)
+            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(&item), e));
         let mut signatures = Signatures::default();
         signatures.visit_item(&copy);
         assert!(
             signatures.broken.is_empty(),
-            "the copy `{}` of `{}` has signatures that elision cannot resolve: {:?}",
+            "{}: {:?}",
             string(&copy),
-            string(item),
             signatures.broken
         );
+        assert!(entries.is_empty(), "{}: {:?}", string(&item), entries);
     }
-    for item in &controls {
-        let copy = f15_copy(item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+    // Where nothing can hold the signature (a bound, an elided reference), the item is rejected,
+    // not copied wrongly.
+    for item in [
+        parse_quote! { pub struct S<'a, F: Fn(&Self) -> &u8>(&'a F); },
+        parse_quote! { pub struct S<'a>(&'a u8, &dyn Fn(&Self) -> &u8); },
+        parse_quote! { pub enum E<'a, T> where T: Fn(&Self) -> &u8 { A(&'a T) } },
+        // `Self::A` cannot be written in the Repeater's impl for a type, so the holder cannot be
+        // leaked either.
+        parse_quote! { pub struct S<'a>(Box<dyn Fn(&Self::A) -> &u8>, &'a u8); },
+    ] {
+        let item: Item = item;
+        let err = f15_copy(&item, true)
+            .err()
+            .unwrap_or_else(|| panic!("{} is accepted", string(&item)));
+        let note = err.note().unwrap();
+        assert!(
+            note.contains("E0106") || note.contains("Self :: A"),
+            "{}: {}",
+            string(&item),
+            note
+        );
+    }
+    // The copy of an impl keeps `Self`, and so does that of a trait, whose `Self::A` is written
+    // `<Host>::A` (and `<__S>::A` in the Repeater): nothing is leaked.
+    for item in [
+        parse_quote!(
+            impl<'a> ::p::Tr for &'a u8 {
+                type A = u8;
+                fn f(&self, x: Box<dyn Fn(&Self) -> &u8>);
+                fn g(x: &Self) -> &u8;
+                fn h(x: fn(&Self::A, Self) -> &u8);
+            }
+        ),
+        parse_quote!(
+            pub trait Tr<'a> {
+                type A;
+                fn f(&self, x: Box<dyn Fn(&Self) -> &u8>, y: fn(&Self::A) -> &u8);
+            }
+        ),
+    ] {
+        let item: Item = item;
+        let mut leaker = new_leaker();
+        let context = intern(&mut leaker, &item).unwrap();
+        let referrer = leaker.finish();
+        let entries: Vec<String> = referrer.iter().map(string).collect();
+        assert!(entries.is_empty(), "{}: {:?}", string(&item), entries);
+        // The same visitor as for the others: `Self` is not replaced in the copy of an impl.
+        let mut copy = item.clone();
+        let host: Type = parse_quote!(Host);
+        let mut visitor = referrer.visitor(context, |_, ix| parse_quote!(P<#ix>));
+        match &item {
+            Item::Trait(_) => visitor.with_self(host).visit_item_mut(&mut copy),
+            _ => visitor.visit_item_mut(&mut copy),
+        }
         let mut signatures = Signatures::default();
         signatures.visit_item(&copy);
         assert!(

@@ -246,6 +246,8 @@ fn g(x: &Rel<T>) -> &u8;                        // error: no receiver
 fn g<'x>(x: &'x Rel<T>) -> &'x u8;              // good
 F: Fn(&Rel<T>) -> &u8                           // error: a bound
 F: for<'x> Fn(&'x Rel<T>) -> &'x u8             // good
+struct S<'a> { f: fn(&Self) -> &u8, g: &'a u8 } // good: the function pointer is leaked, with `'a`
+struct S<'a, F: Fn(&Self) -> &u8>(&'a F);       // error: a bound
 ```
 
 Instead, name the lifetimes of the inputs and of the output, give the method a receiver, or make the path absolute.
@@ -253,6 +255,7 @@ Instead, name the lifetimes of the inputs and of the output, give the method a r
 - Nothing is added if the inputs keep the lifetimes the entry has: the only lifetime of the inputs is `'a` (`Fn(&'a Rel<T>) -> &u8`). Nor if the output does not rely on elision: it has no lifetime or names one (`Fn(&Rel<T>) -> Rel<T>`, `for<'x> Fn(&'x Rel<T>) -> &'x u8`). `Rel<T>` where `T` has no lifetime bound is leaked alone as usual.
 - A function pointer or `Fn(..)` inside an input has its own signature: its lifetimes do not count for the one around, and the whole inner one is the entry if it adds lifetimes to the outer one. That is how rustc 1.65 and later count (checked on stable and nightly). Older ones also count the lifetimes that the inner one does not bind, so `Fn(&Box<dyn for<'x> Fn(&'x Rel<T>) -> &'x u8>) -> &u8` is rejected there.
 - The elided lifetimes inside a function pointer or `Fn(..)` are its own, so they do not stop it from being leaked as a whole. They stop the types inside it from being leaked alone: `Rel<&Rel2>` in `Fn(Rel<&Rel2>)` is an error, like any type with an elided lifetime.
+- `Self` and `Self::A` in the inputs count as a leaked type with lifetimes, if the copy writes them as a type that has some. `Visitor::with_self()` writes `Self` of a struct, an enum or a union as the type itself (`::path::S<'a>`), and `Self::A` as `<::path::S<'a>>::A`. rustc counts no lifetime for `Self`, so `fn(&Self) -> &u8` is valid in `struct S<'a>`, and the copy `fn(&::path::S<'a>) -> &u8` is E0106. The function pointer or trait object is leaked as a whole, with `Self` as written: the impl of the Repeater for the type keeps it. That is an error with `allow_self = false`, in a bound, in a trait object under an elided reference, and with `Self::A`, which the impl for a type cannot write (see [Self rules](#self-rules)). The copy of an impl keeps `Self`, and so does that of a trait, whose impl of the Repeater writes `Self::A` as `<__S>::A` (`Referrer::iter_with_self()`), so they are not counted. The lifetime that the inputs keep is not added (`fn(&'a Self) -> &u8` in `struct S<'a>`). If you give `with_self()` a type with lifetimes where the Leaker does not expect one, name the lifetimes (`for<'x> fn(&'x Self) -> &'x u8`).
 - A lifetime that a path hides (`Ref<u8>` for `Ref<'a, u8>`) is not seen by the Leaker, so write `Ref<'_, u8>`.
 - A function that is itself the analyzed item has no signature to the Leaker, which sees only the types you visit: write the lifetimes out.
 

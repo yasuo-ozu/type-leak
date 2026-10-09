@@ -706,6 +706,110 @@ fn has_elided(ty: &Type) -> bool {
     elided.0
 }
 
+/// Whether a type or a path names a lifetime, or a reference (an elided lifetime).
+struct NamesLifetime(bool);
+
+impl<'ast> Visit<'ast> for NamesLifetime {
+    fn visit_lifetime(&mut self, _: &'ast Lifetime) {
+        self.0 = true;
+    }
+    fn visit_type_reference(&mut self, _: &'ast TypeReference) {
+        self.0 = true;
+    }
+}
+
+/// Finds `Self` and `Self::A` in the inputs of a function pointer or of the sugar of `Fn(..)`
+/// whose output has an elided lifetime, which elision takes from the inputs.
+#[derive(Default)]
+struct SelfInElidedInputs {
+    /// How many signatures with such an output the visit is in the inputs of.
+    depth: usize,
+    /// `Self` is in the inputs.
+    bare: bool,
+    /// `Self::A` is in the inputs.
+    assoc: bool,
+}
+
+impl SelfInElidedInputs {
+    fn signature<'ast>(
+        &mut self,
+        inputs: impl IntoIterator<Item = &'ast Type>,
+        output: &'ast ReturnType,
+    ) {
+        let mut elided = Elided(false);
+        elided.visit_return_type(output);
+        let counts = usize::from(elided.0);
+        self.depth += counts;
+        for input in inputs {
+            self.visit_type(input);
+        }
+        self.depth -= counts;
+        self.visit_return_type(output);
+    }
+}
+
+impl<'ast> Visit<'ast> for SelfInElidedInputs {
+    fn visit_type_bare_fn(&mut self, i: &'ast TypeBareFn) {
+        self.signature(i.inputs.iter().map(|arg| &arg.ty), &i.output)
+    }
+    fn visit_parenthesized_generic_arguments(&mut self, i: &'ast ParenthesizedGenericArguments) {
+        self.signature(&i.inputs, &i.output)
+    }
+    fn visit_type_path(&mut self, i: &'ast TypePath) {
+        if self.depth > 0 && i.qself.is_none() && i.path.leading_colon.is_none() {
+            if let Some(first) = i.path.segments.first().filter(|seg| seg.ident == "Self") {
+                if i.path.segments.len() == 1 {
+                    self.bare |= first.arguments.is_none();
+                } else {
+                    self.assoc = true;
+                }
+            }
+        }
+        syn::visit::visit_type_path(self, i)
+    }
+}
+
+/// Whether the witness and the check of a position cannot write its `Self` out. They replace `Self`
+/// by the type it is at the position (`SelfSubst`), and `Self::A` by `<Ty as Trait>::A`. Where that
+/// has lifetimes (the type itself `S<'a>`, the self type of an impl, the lifetime parameters of
+/// the trait), a function pointer or `Fn(..)` with `Self` or `Self::A` in its inputs and an elided
+/// output has more input lifetimes than the original: rustc cannot tell which one the output has
+/// (E0106, F15). The position is not compared, like one with an elided lifetime (`has_elided()`).
+/// The library does not rewrite `Self` this way: the Repeater's impl for the implementors writes
+/// `Self::A` as `<__S>::A`, and the Leaker rejects an item whose copy would, or leaks the whole
+/// signature (`Visitor::with_self()`, F15).
+fn self_breaks_elision(pos: &Position) -> bool {
+    let sub = match &pos.self_sub {
+        Some(sub) => sub,
+        None => return false,
+    };
+    // The witness and the check have the generics around the position too.
+    let mut found = SelfInElidedInputs::default();
+    found.visit_type(&pos.ty);
+    for layer in &pos.layers {
+        found.visit_generics(layer);
+    }
+    let ty_lifetimes = || {
+        let mut names = NamesLifetime(false);
+        names.visit_type(&sub.ty);
+        names.0
+    };
+    let trait_lifetimes = || {
+        let mut names = NamesLifetime(false);
+        if let Some(trait_ref) = &sub.trait_ref {
+            names.visit_path(trait_ref);
+        }
+        names.0
+    };
+    (found.bare && ty_lifetimes()) || (found.assoc && (ty_lifetimes() || trait_lifetimes()))
+}
+
+/// Whether a position has no witness: it has an elided lifetime, or `Self` cannot be written out
+/// in it.
+fn has_no_witness(pos: &Position) -> bool {
+    has_elided(&pos.ty) || self_breaks_elision(pos)
+}
+
 // ---------------------------------------------------------------------------------------------
 // The Referrer's side: rewriting a copy.
 // ---------------------------------------------------------------------------------------------
@@ -965,7 +1069,7 @@ fn comparable(
         .zip(original)
         .enumerate()
         .filter(|(_, (pos, orig))| {
-            if has_elided(&orig.ty) {
+            if has_no_witness(orig) {
                 return false;
             }
             if !in_module {
@@ -1095,7 +1199,7 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream) -> Result<TokenStream> 
     let witnesses: Vec<(Vec<Ident>, TokenStream)> = positions
         .iter()
         .enumerate()
-        .filter(|(_, pos)| !has_elided(&pos.ty))
+        .filter(|(_, pos)| !has_no_witness(pos))
         .map(|(j, pos)| (pos.mods.clone(), witness_fn(id, j, pos)))
         .collect();
 

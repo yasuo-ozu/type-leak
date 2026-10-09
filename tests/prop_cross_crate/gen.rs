@@ -110,7 +110,10 @@ pub struct Features {
     /// `A` names `Self`, and the copy writes `Self` as a type that has lifetimes (the self type of
     /// an impl, an ADT with lifetime parameters), or `Self::A` as `<Self as Tr<'a, ..>>::A` with
     /// the lifetime parameters of the trait: the input then has more lifetimes, and rustc cannot
-    /// tell which one the output has (E0106, F15). Off, such a sugar is not generated.
+    /// tell which one the output has (E0106, F15). The oracle of the test macro does not compare a
+    /// position that has it, and the Leaker rejects an item whose copy writes `Self` so, or leaks
+    /// the whole signature, so this is on by default (see `Features::parse()`). Off, such a sugar
+    /// is not generated.
     pub self_elision: bool,
     /// An outlives bound that the original has only by the well-formedness of its signature
     /// (`Self::A: 'x` from `&'x mut Self::A`, with `Self: 'x` from `&'x self`), which the
@@ -165,6 +168,7 @@ impl Features {
             elided_fn_generics: true,
             bound_cycles: true,
             implied_outlives: true,
+            self_elision: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -1330,9 +1334,13 @@ impl Gen {
         if self.features.elided_fn_generics && self.chance(25) {
             let a = self.ty(sc, Con::unsized_ok().with_scope(c), depth + 1);
             let r = self.ty(sc, Con::unsized_ok().with_scope(c), depth + 1);
-            // The copy writes `Self` with lifetimes if it has any (`self_elision`).
+            // The copy writes `Self` with lifetimes if it has any (`self_elision`), so `Self` is
+            // only named in the scopes that are not a trait method (a struct, an enum, a union, an
+            // impl) with that feature.
             if !a.text.contains(['\'', '&'])
-                && !(a.uses_self && sc.self_kind != SelfKind::MaybeUnsized)
+                && !(a.uses_self
+                    && sc.self_kind != SelfKind::MaybeUnsized
+                    && !self.features.self_elision)
                 && (self.features.self_elision || !a.adds_lts)
             {
                 self.elided_self |= a.uses_self;
@@ -1501,7 +1509,9 @@ impl Gen {
                 let a = self.ty(sc, closed, depth + 1);
                 let r = self.ty(sc, closed, depth + 1);
                 if a.text.contains(['\'', '&'])
-                    || (a.uses_self && sc.self_kind != SelfKind::MaybeUnsized)
+                    || (a.uses_self
+                        && sc.self_kind != SelfKind::MaybeUnsized
+                        && !self.features.self_elision)
                     || (!self.features.self_elision && a.adds_lts)
                 {
                     return self.dyn_bare(sc, depth, open);
