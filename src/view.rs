@@ -22,7 +22,9 @@ mod forward;
 /// - `Visit::visit_signature(view, &sig)` is a method's signature, with local generics. It
 ///   declares the generics of `sig` in a scope of their own, and reports an error for a method
 ///   lifetime that the copy would leave unconstrained (E0195, see [Method
-///   lifetimes](crate#method-lifetimes)). Walking a trait or an impl reaches it for each method.
+///   lifetimes](crate#method-lifetimes)), and for an elided output lifetime that the copy could
+///   not resolve (E0106, see [Elided lifetimes](crate#elided-lifetimes)). Walking a trait or an
+///   impl reaches it for each method.
 /// - `Visit::visit_path(view, &path)` at the root, outside a type, analyzes only the arguments of
 ///   the path and does not check the path itself, which is resolved elsewhere. To analyze a trait
 ///   bound with its root checked, use [`View::visit_type_param_bound()`]: the path of the trait

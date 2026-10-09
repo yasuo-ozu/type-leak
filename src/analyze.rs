@@ -40,6 +40,9 @@ struct Frame {
     /// A type not leaked alone because of a binder lifetime: its holder's depth and the lifetime
     /// (see [`Binder`]).
     binder: Option<(usize, Lifetime)>,
+    /// A type not leaked alone because of an elided output lifetime: its holder's depth and the
+    /// note (see [`Elision`]).
+    elision: Option<(usize, String)>,
     unconstrained: Option<Lifetime>,
     /// The first `Self::A` in the type, where `Self` is a type: the Repeater's impl cannot write it,
     /// so a type that names it is not leaked whole.
@@ -60,6 +63,7 @@ impl Frame {
             soft_depth: usize::MAX,
             relative: false,
             binder: None,
+            elision: None,
             unconstrained: None,
             assoc_self: None,
             effects: Vec::new(),
@@ -94,6 +98,154 @@ struct BinderGroup<'a> {
 enum BinderInput<'a> {
     Type(&'a Type),
     Lifetime(&'a Lifetime),
+}
+
+/// A signature (a function pointer, the sugar of `Fn(..) -> R`, or a method) whose output has an
+/// elided lifetime that elision takes from the only lifetime of the inputs. The copy of a type with
+/// lifetimes in the inputs names them in the arguments of its projection, so the inputs have more
+/// lifetimes and elision fails (E0106). Such a type is not leaked alone: the type holding the
+/// signature is leaked as a whole instead if it can be, and it is an error otherwise. See [Elided
+/// lifetimes](crate#elided-lifetimes).
+#[derive(Clone)]
+struct Elision {
+    /// The depth of the type holding the signature, leaked whole instead (0 for a method or a
+    /// bound, which no type holds).
+    owner: usize,
+    /// The only lifetime of the inputs as written, `None` if it is elided.
+    kept: Option<Lifetime>,
+    /// The output, which has the elided lifetime.
+    output: TokenStream,
+}
+
+impl Elision {
+    /// Returns what the copy must keep for a signature with these `inputs` and `output`, if its
+    /// output relies on elision: it has an elided lifetime, and the inputs have exactly one
+    /// lifetime (else the original is not valid, or has no elision to keep).
+    fn of<'a>(
+        owner: usize,
+        inputs: impl IntoIterator<Item = &'a Type>,
+        output: &ReturnType,
+    ) -> Option<Self> {
+        let output = match output {
+            ReturnType::Type(_, output) => output,
+            ReturnType::Default => return None,
+        };
+        let mut elided = ElidedOutput(false);
+        elided.visit_type(output);
+        if !elided.0 {
+            return None;
+        }
+        let mut lifetimes = InputLifetimes::default();
+        for input in inputs {
+            lifetimes.visit_type(input);
+        }
+        let kept = match (lifetimes.elided, lifetimes.named.len()) {
+            (1, 0) => None,
+            (0, 1) => lifetimes.named.pop(),
+            _ => return None,
+        };
+        Some(Self {
+            owner,
+            kept,
+            output: quote!(#output),
+        })
+    }
+
+    /// Returns what `Elision::of()` gives for the signature of a method. A receiver that is a
+    /// reference gives its lifetime to the output, whatever the inputs have.
+    fn of_signature(sig: &Signature) -> Option<Self> {
+        let mut inputs: Vec<&Type> = Vec::new();
+        for input in &sig.inputs {
+            match input {
+                FnArg::Receiver(receiver) => {
+                    let mut references = HasReference(receiver.reference.is_some());
+                    references.visit_type(&receiver.ty);
+                    if references.0 {
+                        return None;
+                    }
+                    inputs.push(&receiver.ty);
+                }
+                FnArg::Typed(arg) => inputs.push(&arg.ty),
+            }
+        }
+        Self::of(0, inputs, &sig.output)
+    }
+
+    /// Returns the lifetimes that the copy of a type with `context` adds to the inputs.
+    fn added(&self, context: &Context) -> Vec<Lifetime> {
+        let mut added: Vec<Lifetime> = Vec::new();
+        let lifetimes = context
+            .generics()
+            .lifetimes()
+            .map(|param| &param.lifetime)
+            .chain(context.self_outlives());
+        for lifetime in lifetimes {
+            if Some(lifetime) != self.kept.as_ref() && !added.contains(lifetime) {
+                added.push(lifetime.clone());
+            }
+        }
+        added
+    }
+}
+
+/// `true` if an output has an elided lifetime: a reference or a lifetime argument without a name,
+/// or `'_`. A function pointer or `Fn(..)` inside has its own elision.
+struct ElidedOutput(bool);
+
+impl<'ast> Visit<'ast> for ElidedOutput {
+    fn visit_type_reference(&mut self, i: &'ast TypeReference) {
+        self.0 |= i.lifetime.is_none();
+        syn::visit::visit_type_reference(self, i)
+    }
+    fn visit_lifetime(&mut self, i: &'ast Lifetime) {
+        self.0 |= i.ident == "_";
+    }
+    fn visit_type_bare_fn(&mut self, _: &'ast TypeBareFn) {}
+    fn visit_parenthesized_generic_arguments(&mut self, _: &'ast ParenthesizedGenericArguments) {}
+}
+
+/// The lifetimes of the inputs of a signature as elision counts them: each elided one is its own,
+/// the named ones count once. A function pointer or `Fn(..)` inside has its own, and so has a
+/// bound with a `for<..>` binder for the lifetimes it declares.
+#[derive(Default)]
+struct InputLifetimes {
+    elided: usize,
+    named: Vec<Lifetime>,
+    declared: Vec<Lifetime>,
+}
+
+impl<'ast> Visit<'ast> for InputLifetimes {
+    fn visit_type_reference(&mut self, i: &'ast TypeReference) {
+        if i.lifetime.is_none() {
+            self.elided += 1;
+        }
+        syn::visit::visit_type_reference(self, i)
+    }
+    fn visit_lifetime(&mut self, i: &'ast Lifetime) {
+        if i.ident == "_" {
+            self.elided += 1;
+        } else if !self.declared.contains(i) && !self.named.contains(i) {
+            self.named.push(i.clone());
+        }
+    }
+    fn visit_trait_bound(&mut self, i: &'ast TraitBound) {
+        let outer = self.declared.len();
+        self.declared.extend(binder_lifetimes(i.lifetimes.as_ref()));
+        syn::visit::visit_trait_bound(self, i);
+        self.declared.truncate(outer);
+    }
+    fn visit_type_bare_fn(&mut self, _: &'ast TypeBareFn) {}
+    fn visit_parenthesized_generic_arguments(&mut self, _: &'ast ParenthesizedGenericArguments) {}
+}
+
+/// `true` if a type has a reference: a receiver (`self: &Self`, `self: Pin<&mut Self>`) gives its
+/// lifetime to the output.
+struct HasReference(bool);
+
+impl<'ast> Visit<'ast> for HasReference {
+    fn visit_type_reference(&mut self, _: &'ast TypeReference) {
+        self.0 = true;
+    }
 }
 
 struct ModuleFrame {
@@ -289,6 +441,9 @@ struct Checkpoint {
 struct Walk {
     type_depth: usize,
     binders: usize,
+    elisions: usize,
+    signature: Option<Elision>,
+    bound_elided: usize,
     signatures: usize,
     probe: Option<HashSet<usize>>,
     in_default: Option<bool>,
@@ -320,6 +475,15 @@ pub(crate) struct AnalyzeVisitor {
     /// The generics in scope, innermost last. The first are the Leaker's.
     scopes: Vec<Scope>,
     binders: Vec<Binder>,
+    /// The signatures whose inputs are being visited, innermost last: what each keeps from its
+    /// inputs (see [`Elision`]). `None` for one that needs nothing, which also hides the ones around
+    /// it: lifetimes in a function pointer or `Fn(..)` are not those of the signature around it.
+    elisions: Vec<Option<Elision>>,
+    /// The elision of the method whose arguments are being visited.
+    signature: Option<Elision>,
+    /// The function pointers and `Fn(..)` being visited, innermost last: the positions in
+    /// `impossibles` of the elided lifetimes each binds (see [`AnalyzeVisitor::push_elided()`]).
+    bound_elided: Vec<Vec<usize>>,
     /// While a binder is probed: the addresses of the types found to be leaked whole.
     probe: Option<HashSet<usize>>,
     root_defaulted: Vec<Ident>,
@@ -405,6 +569,9 @@ impl AnalyzeVisitor {
             allow_self: true,
             scopes: vec![Scope::new(generics, None)],
             binders: Vec::new(),
+            elisions: Vec::new(),
+            signature: None,
+            bound_elided: Vec::new(),
             probe: None,
             root_defaulted: defaulted(generics)
                 .map(|(_, ident, _)| ident.clone())
@@ -501,6 +668,43 @@ impl AnalyzeVisitor {
         std::mem::replace(&mut self.frame, frame)
     }
 
+    /// Cuts `impossibles` to `len`, with the positions that the function pointers and `Fn(..)`
+    /// being visited recorded in it.
+    fn truncate_impossibles(&mut self, len: usize) {
+        self.impossibles.truncate(len);
+        for positions in &mut self.bound_elided {
+            positions.retain(|&at| at < len);
+        }
+    }
+
+    /// Records an elided lifetime as a cause that stops the type holding it from being leaked
+    /// whole: the impl of the Repeater cannot name it. Not so for the type that holds the
+    /// function pointer or `Fn(..)` which binds it, whose copy has it as written (see
+    /// [`AnalyzeVisitor::with_bound_elided()`]). `tokens` is the type or lifetime written.
+    fn push_elided(&mut self, tokens: TokenStream) {
+        if let Some(positions) = self.bound_elided.last_mut() {
+            positions.push(self.impossibles.len());
+        }
+        self.impossibles.push(tokens);
+    }
+
+    /// Runs `f`, which visits a function pointer or `Fn(..)`: the elided lifetimes in it are its
+    /// own. They stop the types inside from being leaked whole, but not the type that holds it, so
+    /// their causes are dropped when `f` ends.
+    fn with_bound_elided(&mut self, f: impl FnOnce(&mut Self)) {
+        self.bound_elided.push(Vec::new());
+        f(self);
+        for at in self
+            .bound_elided
+            .pop()
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+        {
+            self.impossibles.remove(at);
+        }
+    }
+
     fn push_must(&mut self, must: TokenStream) {
         self.musts.push((self.type_depth, must));
         self.frame.min_depth = self.frame.min_depth.min(self.type_depth);
@@ -586,6 +790,19 @@ impl AnalyzeVisitor {
                 })
                 .map(|lifetime| (lifetime.clone(), binder.owner))
         })
+    }
+
+    /// Returns the signature whose elision the copy of a type with `context` would break, with the
+    /// lifetimes it adds. It is the innermost one that has the type in its inputs (see
+    /// [`Elision`]).
+    fn elision_broken(&self, context: &Context) -> Option<(Elision, Vec<Lifetime>)> {
+        let elision = self.elisions.last()?.as_ref()?;
+        let added = elision.added(context);
+        if added.is_empty() {
+            None
+        } else {
+            Some((elision.clone(), added))
+        }
     }
 
     /// Finishes the outermost scope. Defaults of type parameters are analyzed alone, with the
@@ -710,6 +927,9 @@ impl AnalyzeVisitor {
         let walk = Walk {
             type_depth: self.type_depth,
             binders: self.binders.len(),
+            elisions: self.elisions.len(),
+            signature: self.signature.clone(),
+            bound_elided: self.bound_elided.len(),
             signatures: self.signatures.len(),
             probe: self.probe.clone(),
             in_default: self.in_default,
@@ -742,9 +962,12 @@ impl AnalyzeVisitor {
         self.frame = frame;
         self.leave_scope(mark, true);
         self.musts.truncate(musts);
-        self.impossibles.truncate(impossibles);
+        self.truncate_impossibles(impossibles);
         self.type_depth = walk.type_depth;
         self.binders.truncate(walk.binders);
+        self.elisions.truncate(walk.elisions);
+        self.signature = walk.signature;
+        self.bound_elided.truncate(walk.bound_elided);
         self.signatures.truncate(walk.signatures);
         self.probe = walk.probe;
         self.in_default = walk.in_default;
@@ -849,6 +1072,10 @@ impl AnalyzeVisitor {
             let depth = self.type_depth;
             self.frame.binder = inner.binder.clone().filter(|(owner, _)| *owner < depth);
         }
+        if self.frame.elision.is_none() {
+            let depth = self.type_depth;
+            self.frame.elision = inner.elision.clone().filter(|(owner, _)| *owner < depth);
+        }
     }
 
     fn own_causes(&mut self, must_start: usize, depth: usize) {
@@ -872,6 +1099,13 @@ impl AnalyzeVisitor {
                 .as_ref()
                 .filter(|(owner, _)| *owner == depth)
                 .map(|(_, lifetime)| binder_note(lifetime, true))
+                .or_else(|| {
+                    let (_, note) = inner
+                        .elision
+                        .as_ref()
+                        .filter(|(owner, _)| *owner == depth)?;
+                    Some(note.clone())
+                })
                 .or_else(|| {
                     inner
                         .unconstrained
@@ -976,6 +1210,24 @@ impl AnalyzeVisitor {
             conflict.note = Some(binder_note(&lifetime, false));
             own = Some(Err(conflict));
         }
+        // The same for a type that adds lifetimes to the inputs of a signature whose output relies
+        // on elision: the type holding the signature is leaked instead, or it is a conflict (in a
+        // bound or a method).
+        let broken = match &own {
+            Some(Ok(context)) => self.elision_broken(context),
+            _ => None,
+        };
+        if let Some((elision, added)) = broken {
+            if elision.owner > 0 {
+                let note = elision_note(&added, &elision.output, true);
+                inner.elision = Some((elision.owner, note));
+                return self.decide_as_owner(elision.owner, inner);
+            }
+            let mut conflict = self.causes(inner.must_start, inner.impossible_start, depth);
+            conflict.impossible.insert(0, elision.output.clone());
+            conflict.note = Some(elision_note(&added, &elision.output, false));
+            own = Some(Err(conflict));
+        }
         if let Some(Ok(_)) = &own {
             self.record_leaked(ty, depth, &inner);
         }
@@ -1000,7 +1252,16 @@ impl AnalyzeVisitor {
                 return self.decide_through(inner);
             }
         }
-        let optional = soft.filter(|_| soft_binder.is_none());
+        let soft_elision = soft
+            .as_ref()
+            .and_then(|context| self.elision_broken(context));
+        if let Some((elision, _)) = &soft_elision {
+            if elision.owner > 0 {
+                inner.soft_depth = elision.owner;
+                return self.decide_through(inner);
+            }
+        }
+        let optional = soft.filter(|_| soft_binder.is_none() && soft_elision.is_none());
         self.absorb(&inner);
         let has_impossible = self.impossibles.len() > inner.impossible_start;
         let has_must = inner.min_depth != usize::MAX;
@@ -1051,8 +1312,11 @@ impl AnalyzeVisitor {
                     }
                     _ => return self.frame.effects.extend(effects),
                 };
+                // It may replace its parts as the entry, if the graph finds it cheaper: not if it
+                // adds lifetimes where elision needs none.
+                let in_graph = has_must && self.elision_broken(&context).is_none();
                 PendingType {
-                    in_graph: has_must,
+                    in_graph,
                     optional: optional.is_some(),
                     has_optional: optional.is_some() || has_optional(&effects),
                     ..PendingType::new(ty, context, effects)
@@ -1248,7 +1512,7 @@ impl AnalyzeVisitor {
         self.with_risky(sig, self.scopes.len(), local, |visitor| {
             // The generics are in scope while the lifetimes are checked, which needs them.
             let walk = |visitor: &mut Self| {
-                f(visitor);
+                visitor.with_arguments_of(sig, f);
                 if local {
                     visitor.check_leaked_lifetimes(sig);
                 }
@@ -1259,6 +1523,22 @@ impl AnalyzeVisitor {
                 visitor.with_local_generics(&sig.generics, walk)
             }
         });
+    }
+
+    /// Visits the output of a function pointer or of `Fn(..)`. It has its own elision: the
+    /// signature around does not count its lifetimes.
+    fn in_output(&mut self, output: &ReturnType) {
+        self.elisions.push(None);
+        self.visit_return_type(output);
+        self.elisions.pop();
+    }
+
+    /// Runs `f`, which visits the arguments of `sig`, knowing what their elision must keep (see
+    /// [`Elision`]).
+    fn with_arguments_of(&mut self, sig: &Signature, f: impl FnOnce(&mut Self)) {
+        let outer = std::mem::replace(&mut self.signature, Elision::of_signature(sig));
+        f(self);
+        self.signature = outer;
     }
 
     fn with_risky(&mut self, sig: &Signature, at: usize, local: bool, f: impl FnOnce(&mut Self)) {
@@ -1515,7 +1795,7 @@ impl AnalyzeVisitor {
         self.with_scope(Scope::binder(lifetimes), |v| f(v));
         self.frame = frame;
         self.musts.truncate(musts);
-        self.impossibles.truncate(impossibles);
+        self.truncate_impossibles(impossibles);
         self.self_errors.truncate(self_errors);
         self.probe.take().unwrap_or_default()
     }
@@ -1787,7 +2067,15 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
     fn visit_foreign_item_fn(&mut self, i: &ForeignItemFn) {
         // Not a method: its signature declares nothing here, as before `visit_signature()`.
         self.visit_head(&i.attrs, &i.vis);
-        syn::visit::visit_signature(self, &i.sig);
+        self.with_arguments_of(&i.sig, |visitor| {
+            syn::visit::visit_signature(visitor, &i.sig)
+        });
+    }
+
+    fn visit_fn_arg(&mut self, i: &FnArg) {
+        self.elisions.push(self.signature.clone());
+        syn::visit::visit_fn_arg(self, i);
+        self.elisions.pop();
     }
 
     fn visit_receiver(&mut self, i: &Receiver) {
@@ -1958,7 +2246,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
                         }
                     }
                     None => {
-                        self.impossibles.push(quote!(#i));
+                        self.push_elided(quote!(#i));
                         self.elided_ref = true;
                     }
                 }
@@ -2013,16 +2301,56 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
     }
 
     fn visit_type_bare_fn(&mut self, i: &TypeBareFn) {
+        let elision = Elision::of(
+            self.type_depth,
+            i.inputs.iter().map(|arg| &arg.ty),
+            &i.output,
+        );
+        let mut output = output_lifetimes(i.lifetimes.as_ref(), |v| v.visit_return_type(&i.output));
+        // An elided output has the only lifetime of the inputs, which the binder may declare.
+        let elided = elision.as_ref().and_then(|elision| elision.kept.clone());
+        output.extend(
+            elided.filter(|kept| declares(i.lifetimes.as_ref(), kept) && !output.contains(kept)),
+        );
         let group = BinderGroup {
-            output: output_lifetimes(i.lifetimes.as_ref(), |v| v.visit_return_type(&i.output)),
+            output,
             inputs: i
                 .inputs
                 .iter()
                 .map(|arg| BinderInput::Type(&arg.ty))
                 .collect(),
         };
+        // As `syn::visit::visit_type_bare_fn()`, with the inputs apart from the output.
         self.with_bound_lifetimes(i.lifetimes.as_ref(), vec![group], |v| {
-            syn::visit::visit_type_bare_fn(v, i)
+            v.with_bound_elided(|v| {
+                if let Some(lifetimes) = &i.lifetimes {
+                    v.visit_bound_lifetimes(lifetimes);
+                }
+                if let Some(abi) = &i.abi {
+                    v.visit_abi(abi);
+                }
+                v.elisions.push(elision.clone());
+                for arg in &i.inputs {
+                    v.visit_bare_fn_arg(arg);
+                }
+                v.elisions.pop();
+                if let Some(variadic) = &i.variadic {
+                    v.visit_bare_variadic(variadic);
+                }
+                v.in_output(&i.output);
+            })
+        })
+    }
+
+    fn visit_parenthesized_generic_arguments(&mut self, i: &ParenthesizedGenericArguments) {
+        let elision = Elision::of(self.type_depth, &i.inputs, &i.output);
+        self.with_bound_elided(|visitor| {
+            visitor.elisions.push(elision);
+            for input in &i.inputs {
+                visitor.visit_type(input);
+            }
+            visitor.elisions.pop();
+            visitor.in_output(&i.output);
         })
     }
 
@@ -2177,7 +2505,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
             return;
         }
         if i.ident == "_" {
-            self.impossibles.push(quote!(#i));
+            self.push_elided(quote!(#i));
         } else if let Some(scope) = self.scope_of(&i.to_string()) {
             self.mention(scope);
         } else if i.ident != "static" {
@@ -2449,6 +2777,29 @@ fn binder_note(lifetime: &Lifetime, owned: bool) -> String {
     )
 }
 
+/// `owned`: the type holding the signature would be leaked instead.
+fn elision_note(added: &[Lifetime], output: &TokenStream, owned: bool) -> String {
+    let added: Vec<String> = added
+        .iter()
+        .map(|lifetime| format!("`{}`", lifetime))
+        .collect();
+    format!(
+        "the output `{}` has an elided lifetime, which elision takes from the only lifetime of the \
+         inputs, but a leaked type in the inputs has {} among its generics, and the copy names \
+         {} in the arguments of its projection, so the inputs have more than one lifetime \
+         (E0106){}",
+        output,
+        added.join(", "),
+        if added.len() == 1 { "it" } else { "them" },
+        if owned {
+            ", so a type using them cannot be leaked alone, and the type holding the signature \
+             would be leaked as a whole instead"
+        } else {
+            ": name the lifetime of the inputs and of the output"
+        }
+    )
+}
+
 fn output_lifetimes(
     lifetimes: Option<&BoundLifetimes>,
     f: impl FnOnce(&mut OutputLifetimes),
@@ -2473,7 +2824,7 @@ fn bound_group<'a>(
     bound: &'a TraitBound,
     bounded: Option<&'a Type>,
 ) -> BinderGroup<'a> {
-    let output = output_lifetimes(lifetimes, |v| v.visit_bound_output(bound));
+    let mut output = output_lifetimes(lifetimes, |v| v.visit_bound_output(bound));
     let mut inputs: Vec<_> = bounded.map(BinderInput::Type).into_iter().collect();
     match bound.path.segments.last().map(|seg| &seg.arguments) {
         Some(PathArguments::AngleBracketed(args)) => {
@@ -2484,7 +2835,10 @@ fn bound_group<'a>(
             }))
         }
         Some(PathArguments::Parenthesized(args)) => {
-            inputs.extend(args.inputs.iter().map(BinderInput::Type))
+            inputs.extend(args.inputs.iter().map(BinderInput::Type));
+            // An elided output has the only lifetime of the inputs, which the binder may declare.
+            let kept = Elision::of(0, &args.inputs, &args.output).and_then(|elision| elision.kept);
+            output.extend(kept.filter(|kept| declares(lifetimes, kept) && !output.contains(kept)));
         }
         _ => (),
     }

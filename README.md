@@ -212,9 +212,9 @@ Instead, write the bound: `T: 'a`, or `where Self: 'a` for `Rel<'a, Self>`. A st
 
 ## Binder lifetimes
 
-The lifetimes of a `for<..>` binder are generics of the types inside it. `Rel<'x>` in `for<'x> fn(Rel<'x>)` is leaked with `<'x>`. The copy fails if the output names `'x` and no input keeps `'x` as written. The output is a return type, the output of `Fn(A) -> R`, or an associated type binding such as `Iterator<Item = R>`. rustc does not count a lifetime as constrained if it appears only in an associated type path such as `<T as Tr<'x>>::A`. The errors are E0581 for a function pointer and E0582 for `Fn`.
+The lifetimes of a `for<..>` binder are generics of the types inside it. `Rel<'x>` in `for<'x> fn(Rel<'x>)` is leaked with `<'x>`. The copy fails if the output names `'x` and no input keeps `'x` as written. The output is a return type, the output of `Fn(A) -> R`, or an associated type binding such as `Iterator<Item = R>`. An elided lifetime in the output is `'x` if that is the only lifetime of the inputs (`for<'x> fn(Rel<'x>) -> &u8`). rustc does not count a lifetime as constrained if it appears only in an associated type path such as `<T as Tr<'x>>::A`. The errors are E0581 for a function pointer and E0582 for `Fn`.
 
-An input that keeps `'x` is an anchor. With no anchor, the Leaker leaks the whole function pointer or trait object. That is an error if it cannot, as in a bound, in a where predicate, with an elided lifetime or in `impl for<'x> Fn(..)`.
+An input that keeps `'x` is an anchor. With no anchor, the Leaker leaks the whole function pointer or trait object. That is an error if it cannot, as in a bound, in a where predicate, with a trait object under an elided reference (see [Elided lifetimes](#elided-lifetimes)) or in `impl for<'x> Fn(..)`.
 
 ```rust,ignore
 F: for<'x> Fn(Rel<'x>) -> &'x u8                // error: no anchor
@@ -230,6 +230,30 @@ Instead, keep an anchor, or make the path absolute.
 - A type that names `'x` is leaked only if its own path depends on the context. So `(&'x str, Parser<'x>)` keeps `&'x str`, and only `Parser<'x>` is leaked.
 - A binder inside an input is not probed again. A type that uses its lifetime makes the inner function pointer or trait object count as leaked, which loses its anchors. This is cautious.
 - A `::core` or allowed path is assumed to be a struct, an enum or a union. A type alias that drops the lifetime would not anchor, so allow only crates without such aliases.
+
+## Elided lifetimes
+
+An elided lifetime in the output of a signature is the only lifetime of its inputs: the elided one of `&Rel<T>` in `Fn(&Rel<T>) -> &u8`. A leaked type that has lifetimes among its generics names them in the arguments of its projection (`<S as Repeater<(&'a (), T, &'a T), ..>>::Type`), so the inputs of the copy have more lifetimes, and rustc cannot tell which one the output has (E0106). `Rel<T>` has `<'a, T: 'a>` where the Leaker has `'a` and `T: 'a`. The signature is the output of `Fn(..) -> R`, of a function pointer, or of a method with no receiver that is a reference (`&self`, `self: &Self` and `self: Pin<&mut Self>` take the lifetime of the output).
+
+The Leaker leaks the whole function pointer or trait object instead of the type in its inputs. Its impl of the Repeater keeps the elision as written. That is an error if it cannot, as in a bound, in `impl Fn(..)`, in a method, or in a trait object under an elided reference, which takes its lifetime from it.
+
+```rust,ignore
+fn f(&self, x: Box<dyn Fn(&Rel<T>) -> &u8>);    // good: the trait object is leaked, with `'a, T`
+fn f(&self, x: &'a dyn Fn(&Rel<T>) -> &u8);     // good: the whole reference is leaked
+fn f(&self, x: &dyn Fn(&Rel<T>) -> &u8);        // error: elided reference
+fn g(x: &Rel<T>) -> &u8;                        // error: no receiver
+fn g<'x>(x: &'x Rel<T>) -> &'x u8;              // good
+F: Fn(&Rel<T>) -> &u8                           // error: a bound
+F: for<'x> Fn(&'x Rel<T>) -> &'x u8             // good
+```
+
+Instead, name the lifetimes of the inputs and of the output, give the method a receiver, or make the path absolute.
+
+- Nothing is added if the inputs keep the lifetimes the entry has: the only lifetime of the inputs is `'a` (`Fn(&'a Rel<T>) -> &u8`). Nor if the output does not rely on elision: it has no lifetime or names one (`Fn(&Rel<T>) -> Rel<T>`, `for<'x> Fn(&'x Rel<T>) -> &'x u8`). `Rel<T>` where `T` has no lifetime bound is leaked alone as usual.
+- A function pointer or `Fn(..)` inside an input has its own signature: its lifetimes do not count for the one around, and the whole inner one is the entry if it adds lifetimes to the outer one. That is how rustc 1.65 and later count (checked on stable and nightly). Older ones also count the lifetimes that the inner one does not bind, so `Fn(&Box<dyn for<'x> Fn(&'x Rel<T>) -> &'x u8>) -> &u8` is rejected there.
+- The elided lifetimes inside a function pointer or `Fn(..)` are its own, so they do not stop it from being leaked as a whole. They stop the types inside it from being leaked alone: `Rel<&Rel2>` in `Fn(Rel<&Rel2>)` is an error, like any type with an elided lifetime.
+- A lifetime that a path hides (`Ref<u8>` for `Ref<'a, u8>`) is not seen by the Leaker, so write `Ref<'_, u8>`.
+- A function that is itself the analyzed item has no signature to the Leaker, which sees only the types you visit: write the lifetimes out.
 
 ## Trait objects
 

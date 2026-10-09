@@ -18,7 +18,9 @@ pub enum NotInternableError {
     /// Paths that depend on the context but cannot be leaked, so they must be absolute.
     ///
     /// Examples: `MyType` in `MyType<'_>`, a trait in a bound, a value in a const expression, and
-    /// `Rel` in `F: for<'x> Fn(Rel<'x>) -> &'x u8` ([Binder lifetimes](crate#binder-lifetimes)).
+    /// `Rel` in `F: for<'x> Fn(Rel<'x>) -> &'x u8` ([Binder lifetimes](crate#binder-lifetimes)),
+    /// and `Rel<T>` in `F: Fn(&Rel<T>) -> &u8` where `Rel<T>` has lifetimes among its generics
+    /// ([Elided lifetimes](crate#elided-lifetimes)).
     /// Also a type with a generic whose bound names the `Self` of a trait (or `Self::X`), where
     /// `Self` is something else, so the bound cannot be written ([Self rules](crate#self-rules)).
     /// That is not about the path of the type, so its headline is "the bound of `T` mentions a

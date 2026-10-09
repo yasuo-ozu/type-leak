@@ -111,7 +111,8 @@ pub struct Features {
     pub impl_assoc_self: bool,
     /// `dyn Fn(&Rel<T>) -> &u8`, with the elided lifetime of the input given to the output, where
     /// the leaked type uses generics: the path that replaces it names their lifetimes, so the
-    /// elision is ambiguous (E0106).
+    /// elision is ambiguous (E0106). The Leaker leaks the whole holder (`dyn Fn(..) -> &u8`, a
+    /// function pointer) or rejects the item, so this is on by default (see `Features::parse()`).
     pub elided_fn_generics: bool,
     /// A bound `T: Fn(A) -> &'static dyn X` next to other bounds: type-leak moves the where
     /// predicates to the parameter, and prints `T: Fn(A) -> (&'static dyn X) + Y` (F8, fixed: on by
@@ -145,6 +146,7 @@ impl Features {
             module_crate_paths: true,
             bound_merge_syntax: true,
             fn_pointer_self: true,
+            elided_fn_generics: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -1181,6 +1183,18 @@ impl Gen {
         let prefix = *self
             .rng
             .pick(&["", "", "unsafe ", "extern \"C\" ", "unsafe extern \"C\" "]);
+        // `elided_fn_generics` asks for `fn(&A) -> &R` too: the elided lifetime of the input is the
+        // output's, so the Leaker leaks the function pointer as a whole where `A` has lifetimes.
+        if self.features.elided_fn_generics && self.rng.chance(25) {
+            let a = self.ty(sc, Con::unsized_ok().with_scope(c), depth + 1);
+            let r = self.ty(sc, Con::unsized_ok().with_scope(c), depth + 1);
+            if !a.text.contains(['\'', '&'])
+                && !(a.uses_self && sc.self_kind != SelfKind::MaybeUnsized)
+            {
+                let text = format!("{}fn(&{}) -> &{}", prefix, paren(&a.text), paren(&r.text));
+                return Some(Ty::with(text, &[&a, &r]).no_infer());
+            }
+        }
         let n = self.rng.range(0, 2);
         let mut parts: Vec<Ty> = Vec::new();
         let (text, hr) = if self.rng.chance(40) {
@@ -1341,7 +1355,9 @@ impl Gen {
                 // Elided lifetimes in the sugar of `Fn`: one in the input, so it is the output's.
                 let a = self.ty(sc, closed, depth + 1);
                 let r = self.ty(sc, closed, depth + 1);
-                if a.text.contains(['\'', '&']) {
+                if a.text.contains(['\'', '&'])
+                    || (a.uses_self && sc.self_kind != SelfKind::MaybeUnsized)
+                {
                     return self.dyn_bare(sc, depth, open);
                 }
                 // The generics of a leaked type are lifetimes and types in the path that replaces

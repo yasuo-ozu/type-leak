@@ -913,8 +913,8 @@ pub mod m {
             fn f<F: for<'x> ::core::ops::Fn(Rel2<&'x u8>) -> &'x u8>(&self, f: F) -> usize;
         }
     }
-    // A bound, or a function pointer which cannot be leaked as a whole (it has an elided lifetime),
-    // is an error, as the copy of `Hr<'x>` would not compile.
+    // A bound, which cannot be leaked as a whole, is an error, as the copy of `Hr<'x>` would not
+    // compile.
     check_leak! {
         { error: "use absolute path: 'Hr < 'x >'" }
         { }
@@ -922,8 +922,10 @@ pub mod m {
             fn f<F: for<'x> ::core::ops::Fn(Hr<'x>) -> &'x u8>(&self, f: F) -> usize;
         }
     }
+    // A function pointer with an elided lifetime is leaked as a whole: the elided lifetime is its
+    // own, and the impl of the Repeater writes it as the Leaker does.
     check_leak! {
-        { error: "use absolute path: 'Hr < 'x >'" }
+        { for<'x> fn(Hr<'x>, &u8) -> &'x u8 }
         { }
         trait ElidedPointer {
             fn f(&self, f: for<'x> fn(Hr<'x>, &u8) -> &'x u8) -> usize;

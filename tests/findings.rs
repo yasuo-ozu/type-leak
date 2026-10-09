@@ -19,7 +19,7 @@
 //! | `f09_fn_pointer_self_predicate_print` | `Self` replaced by `&fn(..)` in a where predicate | fixed |
 //! | `f10_module_bound_names_declared_item` | a bound of an entry names an item of the module | limitation |
 //! | `f11_copied_impl_param_constrained_only_by_leaked_type` | a copied impl whose self type is an entry | limitation |
-//! | `f12_elided_lifetime_in_fn_sugar_with_generics` | `Fn(&Rel<T>) -> &u8` with an entry that has lifetimes | bug |
+//! | `f12_elided_lifetime_in_fn_sugar_with_generics` | `Fn(&Rel<T>) -> &u8` with an entry that has lifetimes | fixed |
 //!
 //! The bugs that are not fixed are `#[ignore]`d, as they fail today (a fixed one has no
 //! `#[ignore]`, and `fixed` in the table): run them with
@@ -28,9 +28,9 @@
 //! cargo test --test findings -- --ignored
 //! ```
 //!
-//! and remove the `#[ignore]` of the one that a fix makes pass: F4, F6 and F7 are fixed and run
-//! with the others. The limitations are not bugs: they pin behaviour that the README documents, or
-//! that follows from what rustc accepts, and they pass.
+//! and remove the `#[ignore]` of the one that a fix makes pass (the table then says `fixed`, and the
+//! test stays as a regression test). The limitations are not bugs: they pin behaviour that the
+//! README documents, or that follows from what rustc accepts, and they pass.
 //! The test of a finding says how the property test shows it (`TYPE_LEAK_PROP_FEATURES=..`), and
 //! the one-line reason of each failure is in its `#[ignore]` message. The features of the fixed
 //! findings are on by default in the property test: the Leaker now rejects what they generate (the
@@ -1217,119 +1217,232 @@ fn f11_copied_impl_param_constrained_only_by_leaked_type() {
 
 // ── F12 ──────────────────────────────────────────────────────────────────────
 
-/// The lifetimes of a type that elision counts: references (named or elided), and lifetime
-/// arguments. A function pointer or `Fn(..)` inside has its own binder.
+/// The lifetimes of the inputs of a signature as rustc's elision counts them: each elided one is
+/// its own, a named one counts once. A function pointer or `Fn(..)` inside has its own binder.
 #[derive(Default)]
 struct Lifetimes {
-    count: usize,
     elided: usize,
+    named: Vec<String>,
+}
+
+impl Lifetimes {
+    fn count(&self) -> usize {
+        self.elided + self.named.len()
+    }
 }
 
 impl<'ast> Visit<'ast> for Lifetimes {
     fn visit_type_reference(&mut self, i: &'ast TypeReference) {
-        self.count += 1;
-        if i.lifetime.as_ref().map_or(true, |l| l.ident == "_") {
+        if i.lifetime.is_none() {
             self.elided += 1;
         }
-        self.visit_type(&i.elem)
+        syn::visit::visit_type_reference(self, i)
     }
     fn visit_lifetime(&mut self, i: &'ast Lifetime) {
-        self.count += 1;
         if i.ident == "_" {
             self.elided += 1;
+        } else if !self.named.contains(&i.to_string()) {
+            self.named.push(i.to_string());
         }
     }
     fn visit_type_bare_fn(&mut self, _: &'ast TypeBareFn) {}
     fn visit_parenthesized_generic_arguments(&mut self, _: &'ast ParenthesizedGenericArguments) {}
 }
 
-fn lifetimes_of<'a>(types: impl IntoIterator<Item = &'a Type>) -> Lifetimes {
-    let mut lifetimes = Lifetimes::default();
-    for ty in types {
-        lifetimes.visit_type(ty);
+/// `true` if the output has an elided lifetime (a nested signature has its own).
+#[derive(Default)]
+struct ElidedOutput(bool);
+
+impl<'ast> Visit<'ast> for ElidedOutput {
+    fn visit_type_reference(&mut self, i: &'ast TypeReference) {
+        self.0 |= i.lifetime.is_none();
+        syn::visit::visit_type_reference(self, i)
     }
-    lifetimes
+    fn visit_lifetime(&mut self, i: &'ast Lifetime) {
+        self.0 |= i.ident == "_";
+    }
+    fn visit_type_bare_fn(&mut self, _: &'ast TypeBareFn) {}
+    fn visit_parenthesized_generic_arguments(&mut self, _: &'ast ParenthesizedGenericArguments) {}
 }
 
-/// The sugar of `Fn(..) -> ..` whose elided output lifetime elision cannot resolve: it needs
-/// exactly one lifetime in the inputs.
-struct Elision(Vec<String>);
+/// The signatures that are left in a copy: the sugar of `Fn(..) -> ..` and the function pointers,
+/// and those whose elided output lifetime elision cannot resolve (it needs exactly one lifetime in
+/// the inputs).
+#[derive(Default)]
+struct Signatures {
+    /// How many there are.
+    count: usize,
+    /// Those that elision cannot resolve.
+    broken: Vec<String>,
+}
 
-impl<'ast> Visit<'ast> for Elision {
-    fn visit_parenthesized_generic_arguments(&mut self, i: &'ast ParenthesizedGenericArguments) {
-        if let ReturnType::Type(_, output) = &i.output {
-            let inputs = lifetimes_of(&i.inputs);
-            if lifetimes_of([&**output]).elided > 0 && inputs.count != 1 {
-                self.0.push(format!(
-                    "{} (the inputs have {} lifetimes)",
-                    string(i),
-                    inputs.count
-                ));
-            }
+impl Signatures {
+    fn check<'a>(&mut self, inputs: impl IntoIterator<Item = &'a Type>, output: &ReturnType) {
+        self.count += 1;
+        let mut elided = ElidedOutput::default();
+        elided.visit_return_type(output);
+        let mut lifetimes = Lifetimes::default();
+        for input in inputs {
+            lifetimes.visit_type(input);
         }
+        if elided.0 && lifetimes.count() != 1 {
+            self.broken.push(format!(
+                "{} (the inputs have {} lifetimes)",
+                string(output),
+                lifetimes.count()
+            ));
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for Signatures {
+    fn visit_parenthesized_generic_arguments(&mut self, i: &'ast ParenthesizedGenericArguments) {
+        self.check(&i.inputs, &i.output);
         syn::visit::visit_parenthesized_generic_arguments(self, i)
     }
+    fn visit_type_bare_fn(&mut self, i: &'ast TypeBareFn) {
+        self.check(i.inputs.iter().map(|arg| &arg.ty), &i.output);
+        syn::visit::visit_type_bare_fn(self, i)
+    }
 }
 
-/// F12: an elided lifetime in the sugar of `Fn` next to an entry that has lifetimes.
+/// The entries of `item` and its copy, made as a macro does: each entry is replaced by the
+/// projection of the Repeater, with the arguments of the entry encoded by `RepeaterSlots`.
+fn f12_copy(item: &ItemTrait) -> std::result::Result<(Vec<String>, ItemTrait), NotInternableError> {
+    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    let mut leaker = new_leaker();
+    let context = leaker.intern_trait(item, true)?;
+    let referrer = leaker.finish();
+    let root_args: Vec<GenericArgument> = item.generics.params.iter().map(param_arg).collect();
+    let mut copy = item.clone();
+    referrer
+        .clone()
+        .visitor(context, |_, ix| {
+            let args = referrer
+                .generic_args(ix, &item.generics.params, &root_args)
+                .unwrap();
+            let encoded = slots
+                .encode_generics_args_to_ty_with_self(
+                    &args,
+                    &referrer.generics(ix).params,
+                    &parse_quote!(()),
+                    referrer.context_self_outlives(referrer.context(ix)),
+                )
+                .unwrap();
+            parse_quote!(<() as crate::Repeater<#encoded, 0, #ix>>::Type)
+        })
+        .visit_item_trait_mut(&mut copy);
+    Ok((referrer.iter().map(string).collect(), copy))
+}
+
+/// F12: an elided lifetime in the output of the sugar of `Fn` or of a function pointer, next to an
+/// entry that has lifetimes.
 ///
 /// Trigger: `Box<dyn Fn(&Rel<T>) -> &u8>` in `trait Tr<'a, T: 'a>`. The sugar has one input
 /// lifetime, which elision gives to the output. The entry `Rel<T>` has the generics `<'a, T: 'a>`,
 /// so its replacement names lifetimes in its arguments (`<() as Repeater<(&'a (), T, &'a T), ..>>
 /// ::Type`), and the inputs have several: elision fails (E0106 "missing lifetime specifier").
 /// `Tr1<T>`, without `'a`, works. Found by the property test with
-/// `TYPE_LEAK_PROP_FEATURES=elided_fn_generics`.
+/// `TYPE_LEAK_PROP_FEATURES=elided_fn_generics`, which is on by default now.
 ///
-/// The test makes the replacement as a macro does (the projection of the Repeater, with the
-/// arguments of the entry encoded by `RepeaterSlots`), rewrites the copy, and asserts the minimal
-/// property that the copy violates: the sugar of `Fn` with an elided output lifetime has exactly
-/// one lifetime in its inputs. A fix is free to name the lifetime or to reject the item.
+/// The fix leaks the whole holder, which keeps the elision as written (`type Type = dyn Fn(&Rel<T>)
+/// -> &u8;`): the copy has no sugar left. A holder that cannot be leaked (a bound, a method) is an
+/// error. The test asserts, without rustc, which entries there are, and that no sugar or function
+/// pointer of the copy has an elided output lifetime that its inputs cannot resolve
+/// (`Signatures`).
 #[test]
-#[ignore = "F12: the replacement of an entry in `Fn(&Rel<T>) -> &u8` names lifetimes, and elision fails (bug)"]
 fn f12_elided_lifetime_in_fn_sugar_with_generics() {
-    let traits: Vec<ItemTrait> = vec![
-        parse_quote! {
-            pub trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn Fn(&Rel<T>) -> &u8>); }
-        },
-        // The control: no lifetime in the arguments of the entry.
+    // Where the entry has lifetimes, the holder is the entry, whatever it is.
+    for (item, holder) in [
+        (
+            parse_quote! {
+                pub trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn Fn(&Rel<T>) -> &u8>); }
+            },
+            "dyn Fn (& Rel < T >) -> & u8",
+        ),
+        (
+            parse_quote! {
+                pub trait Tr<'a, T: 'a> { fn f(&self, x: fn(&Rel<T>) -> &u8); }
+            },
+            "fn (& Rel < T >) -> & u8",
+        ),
+        (
+            parse_quote! {
+                pub trait Tr<'a, T: 'a> { fn f(&self, x: &'a dyn Fn(&Rel<T>) -> &u8); }
+            },
+            "& 'a dyn Fn (& Rel < T >) -> & u8",
+        ),
+    ] {
+        let item: ItemTrait = item;
+        let (entries, copy) = f12_copy(&item).unwrap();
+        assert_eq!(entries, [holder], "{}", string(&item));
+        let mut signatures = Signatures::default();
+        signatures.visit_item_trait(&copy);
+        assert_eq!(
+            signatures.count,
+            0,
+            "nothing of it is left: {}",
+            string(&copy)
+        );
+    }
+    // The control: no lifetime in the arguments of the entry, so the sugar is left as written,
+    // with the elided lifetime of its input as the only one.
+    for item in [
         parse_quote! {
             pub trait Tr1<T> { fn f(&self, x: Box<dyn Fn(&Rel<T>) -> &u8>); }
         },
-    ];
-    let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
-    for item in traits {
-        let mut leaker = new_leaker();
-        let Ok(context) = leaker.intern_trait(&item, true) else {
-            continue;
-        };
-        let referrer = leaker.finish();
-        let root_args: Vec<GenericArgument> = item.generics.params.iter().map(param_arg).collect();
-        let mut copy = Item::Trait(item.clone());
-        referrer
-            .clone()
-            .visitor(context, |_, ix| {
-                let args = referrer
-                    .generic_args(ix, &item.generics.params, &root_args)
-                    .unwrap();
-                let encoded = slots
-                    .encode_generics_args_to_ty_with_self(
-                        &args,
-                        &referrer.generics(ix).params,
-                        &parse_quote!(()),
-                        referrer.context_self_outlives(referrer.context(ix)),
-                    )
-                    .unwrap();
-                parse_quote!(<() as crate::Repeater<#encoded, 0, #ix>>::Type)
-            })
-            .visit_item_mut(&mut copy);
-        let mut elision = Elision(Vec::new());
-        elision.visit_item(&copy);
-        assert!(
-            elision.0.is_empty(),
-            "`{}`: elision cannot resolve the output of {:?}\nin {}",
-            item.ident,
-            elision.0,
-            string(&copy)
-        );
+        parse_quote! {
+            pub trait Tr1<T> { fn f(&self, x: fn(&Rel<T>) -> &u8); }
+        },
+    ] {
+        let item: ItemTrait = item;
+        let (entries, copy) = f12_copy(&item).unwrap();
+        assert_eq!(entries, ["Rel < T >"], "{}", string(&item));
+        let mut signatures = Signatures::default();
+        signatures.visit_item_trait(&copy);
+        assert_eq!(signatures.count, 1, "{}", string(&copy));
+        assert!(signatures.broken.is_empty(), "{:?}", signatures.broken);
+    }
+    // Where the elision is not at stake, the entry is left alone: the output names its lifetime,
+    // has none, or a method takes it from its receiver.
+    for item in [
+        parse_quote! {
+            pub trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn Fn(&Rel<T>) -> Rel<T>>); }
+        },
+        parse_quote! {
+            pub trait Tr<'a, T: 'a> {
+                fn f(&self, x: Box<dyn for<'x> Fn(&'x Rel<T>) -> &'x u8>);
+            }
+        },
+        parse_quote! {
+            pub trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn Fn(&u8) -> &Rel<T>>); }
+        },
+        parse_quote! {
+            pub trait Tr<'a, T: 'a> { fn f(&self, x: &Rel<T>) -> &u8; }
+        },
+    ] {
+        let item: ItemTrait = item;
+        let (entries, copy) = f12_copy(&item).unwrap();
+        assert_eq!(entries, ["Rel < T >"], "{}", string(&item));
+        let mut signatures = Signatures::default();
+        signatures.visit_item_trait(&copy);
+        assert!(signatures.broken.is_empty(), "{:?}", signatures.broken);
+    }
+    // Where nothing can hold the signature (a bound, a method with no lifetime of its receiver),
+    // the item is rejected, not copied wrongly.
+    for item in [
+        parse_quote! { pub trait Tr<'a, T: 'a> { fn f(x: &Rel<T>) -> &u8; } },
+        parse_quote! { pub trait Tr<'a, T: 'a> { fn f(self: Box<Self>, x: &Rel<T>) -> &u8; } },
+        parse_quote! { pub trait Tr<'a, T: 'a> { fn f<F: Fn(&Rel<T>) -> &u8>(&self, f: F); } },
+        parse_quote! { pub trait Tr<'a, T: 'a, F: Fn(&Rel<T>) -> &u8> {} },
+        // Also where the holder cannot be leaked: a trait object under an elided reference.
+        parse_quote! { pub trait Tr<'a, T: 'a> { fn f(&self, x: &dyn Fn(&Rel<T>) -> &u8); } },
+    ] {
+        let item: ItemTrait = item;
+        let err = f12_copy(&item)
+            .err()
+            .unwrap_or_else(|| panic!("{} is accepted", string(&item)));
+        let note = err.note().unwrap();
+        assert!(note.contains("E0106"), "{}: {}", string(&item), note);
     }
 }

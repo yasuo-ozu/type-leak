@@ -364,11 +364,13 @@ fn the_binders_are_independent() {
 
 #[test]
 fn the_type_holding_the_binder_which_cannot_be_leaked_is_an_error() {
-    // A function pointer with an elided lifetime cannot be leaked as a whole, so `Rel<'x>` has to
-    // be, which cannot be leaked alone: it is an error, not a copy rustc rejects.
+    // A function pointer with a trait object under an elided reference cannot be leaked as a
+    // whole, so `Rel<'x>` has to be, which cannot be leaked alone: it is an error, not a copy
+    // rustc rejects. (An elided lifetime of its own would not stop it, see
+    // `tests/elided_output.rs`.)
     assert_eq!(
         error(parse_quote! {
-            trait Tr { fn f(&self, f: for<'x> fn(Rel<'x>, &u8) -> &'x u8); }
+            trait Tr { fn f(&self, f: for<'x> fn(Rel<'x>, &dyn ::core::fmt::Debug) -> &'x u8); }
         }),
         (
             "use absolute path: 'Rel < 'x >'".to_string(),
@@ -376,7 +378,7 @@ fn the_type_holding_the_binder_which_cannot_be_leaked_is_an_error() {
         )
     );
     let err = analyze(&parse_quote! {
-        trait Tr { fn f(&self, f: for<'x> fn(Rel<'x>, &u8) -> &'x u8); }
+        trait Tr { fn f(&self, f: for<'x> fn(Rel<'x>, &dyn ::core::fmt::Debug) -> &'x u8); }
     })
     .err()
     .unwrap();
@@ -384,7 +386,9 @@ fn the_type_holding_the_binder_which_cannot_be_leaked_is_an_error() {
         syn::Error::from(err).to_string(),
         format!(
             "use absolute path: 'Rel < 'x >'\n\n  = note: {}\n  = note: it cannot be leaked as a \
-             whole because of `& u8`\n",
+             whole because of `dyn :: core :: fmt :: Debug`\n  = note: the lifetime of the trait \
+             object defaults to that of the enclosing reference or path; name it (e.g. `&'a dyn \
+             Trait` or `dyn Trait + 'a`)\n",
             NOTE_OWNED
         )
     );
@@ -417,11 +421,28 @@ fn the_type_holding_the_binder_which_cannot_be_leaked_is_an_error() {
     assert_eq!(
         error(parse_quote! {
             trait Tr {
-                fn f(&self, f: for<'x> fn(for<'y> fn(Rel<'x, 'y>, &u8) -> &'y u8) -> &'x u8);
+                fn f(
+                    &self,
+                    f: for<'x> fn(
+                        for<'y> fn(Rel<'x, 'y>, &dyn ::core::fmt::Debug) -> &'y u8
+                    ) -> &'x u8,
+                );
             }
         })
         .0,
         "use absolute path: 'Rel < 'x , 'y >'"
+    );
+    // With an elided lifetime of its own, the outer function pointer is leaked as a whole.
+    assert_eq!(
+        leaked(parse_quote! {
+            trait Tr {
+                fn f(&self, f: for<'x> fn(for<'y> fn(Rel<'x, 'y>, &u8) -> &'y u8) -> &'x u8);
+            }
+        }),
+        [e(
+            "for < 'x > fn (for < 'y > fn (Rel < 'x , 'y > , & u8) -> & 'y u8) -> & 'x u8",
+            ""
+        )]
     );
 }
 
@@ -439,10 +460,18 @@ fn check_tells_the_type_holding_the_binder_is_interned() {
     let result = check(parse_quote!(for<'x> fn(Rel<'x>) -> &'x u8));
     assert_eq!(tokens(&result.must), ["Rel < 'x >"]);
     assert!(result.is_own && result.impossible.is_empty());
-    // Which is a conflict if it cannot be.
+    // The elided lifetime of the function pointer is its own, so it does not stop it from being
+    // leaked as a whole.
     let result = check(parse_quote!(for<'x> fn(Rel<'x>, &u8) -> &'x u8));
+    assert_eq!(tokens(&result.must), ["Rel < 'x >"]);
+    assert!(result.is_own && result.impossible.is_empty());
+    // Which is a conflict if it cannot be: a trait object under an elided reference takes its
+    // lifetime from it.
+    let result = check(parse_quote!(
+        for<'x> fn(Rel<'x>, &dyn ::core::fmt::Debug) -> &'x u8
+    ));
     assert!(result.is_own);
-    assert_eq!(tokens(&result.impossible), ["& u8"]);
+    assert_eq!(tokens(&result.impossible), ["dyn :: core :: fmt :: Debug"]);
 }
 
 #[test]
@@ -1394,9 +1423,11 @@ fn an_external_crate_type_which_uses_the_lifetime_of_a_binder_is_leaked_with_its
         parse_quote! {
             trait Tr { fn f<F>(&self, f: F) where for<'x> F: Fn(::other::Wrap<&'x u8>) -> &'x u8; }
         },
-        // The holder has an elided lifetime, so it cannot be leaked either.
+        // The holder has a trait object under an elided reference, so it cannot be leaked either.
         parse_quote! {
-            trait Tr { fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, &u8) -> &'x u8); }
+            trait Tr {
+                fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, &dyn ::core::fmt::Debug) -> &'x u8);
+            }
         },
     ] {
         let item: ItemTrait = item;
@@ -1407,6 +1438,19 @@ fn an_external_crate_type_which_uses_the_lifetime_of_a_binder_is_leaked_with_its
             s(&item)
         );
     }
+    // An elided lifetime of its own does not stop the holder from being leaked.
+    assert_eq!(
+        leaked_by(
+            leaker_allowing_nothing(),
+            parse_quote! {
+                trait Tr { fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, &u8) -> &'x u8); }
+            }
+        ),
+        [e(
+            "? for < 'x > fn (:: other :: Wrap < & 'x u8 > , & u8) -> & 'x u8",
+            ""
+        )]
+    );
     // With a cause in it (`Parser`), the required entries are not affected: `Parser` is leaked as
     // usual, and the function pointer, which contains it, is the optional entry.
     assert_eq!(
