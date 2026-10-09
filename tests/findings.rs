@@ -11,10 +11,10 @@
 //! | `f01_unsized_type_param_encoding` | a `?Sized` parameter is a bare element of the tuple of the trait arguments | bug |
 //! | `f02_bound_names_leaked_type_env_cycle` | a copy with a bound and a where predicate that name entries | bug |
 //! | `f03_where_predicate_pulls_param_into_context` | an entry under a where predicate that names a lifetime is not found | bug |
-//! | `f04_module_crate_relative_path_not_rewritten` | `intern_mod` accepts a `crate::` path next to a declared name | bug |
+//! | `f04_module_crate_relative_path_not_rewritten` | an entry that names a declared item of a module is shared by all modules | fixed |
 //! | `f05_inferred_outlives_of_self_type` | no `T: 'a` for a path with a lifetime; written, it is | limitation |
-//! | `f06_impl_assoc_type_of_self_in_repeater` | `intern_impl` accepts `Self::A` | bug |
-//! | `f07_method_lifetime_in_leaked_path` | a method lifetime in a leaked path and the return type | bug |
+//! | `f06_impl_assoc_type_of_self_in_repeater` | `intern_impl` accepts `Self::A` in an entry | fixed |
+//! | `f07_method_lifetime_in_leaked_path` | a method lifetime in a leaked path and the return type | fixed |
 //! | `f08_merged_bound_ambiguous_plus` | merged bounds print `-> &dyn Any + Clone` | bug |
 //! | `f09_fn_pointer_self_predicate_print` | `Self` replaced by `&fn(..)` in a where predicate | bug |
 //! | `f10_module_bound_names_declared_item` | a bound of an entry names an item of the module | limitation |
@@ -27,10 +27,13 @@
 //! cargo test --test findings -- --ignored
 //! ```
 //!
-//! and remove the `#[ignore]` of the one that a fix makes pass. The limitations are not bugs: they
-//! pin behaviour that the README documents, or that follows from what rustc accepts, and they pass.
+//! and remove the `#[ignore]` of the one that a fix makes pass: F4, F6 and F7 are fixed and run
+//! with the others. The limitations are not bugs: they pin behaviour that the README documents, or
+//! that follows from what rustc accepts, and they pass.
 //! The test of a finding says how the property test shows it (`TYPE_LEAK_PROP_FEATURES=..`), and
-//! the one-line reason of each failure is in its `#[ignore]` message.
+//! the one-line reason of each failure is in its `#[ignore]` message. The features of the fixed
+//! findings are on by default in the property test: the Leaker now rejects what they generate (the
+//! rejections are counted), or rewrites it.
 //!
 //! F10 and F11 are errors of rustc on a copy of a module or an impl that the test macro makes
 //! (E0277, E0207). The tests pin the behaviour of the library that is the cause, not the errors.
@@ -374,42 +377,89 @@ fn f03_where_predicate_pulls_param_into_context() {
 
 // ── F4 ───────────────────────────────────────────────────────────────────────
 
-/// F4: `intern_mod` accepts a path relative to the crate next to a name that the module declares.
+/// F4 (fixed): an entry that names an item of the analyzed module is keyed by the module.
 ///
 /// Trigger: `mod mm { struct R0; struct A(crate::base::B1<R0>); }`, and a constant of another
-/// module in a type argument (`RC<{ crate::base::LEN }>`). The type is an entry, but the copy of
-/// the module declares its own `R0`, so the Referrer hides the entry, and `crate::base` cannot
-/// resolve in another crate (E0433). Found by the property test with
+/// module in a type argument (`RC<{ crate::base::LEN }>`, with `RC` declared in the module). The
+/// type is an entry, because `crate::base::B1` cannot be leaked alone. It names a name that the
+/// module declares, so it means something only in the module, like a type with a relative path:
+/// but it was shared by all modules, since its own path starts with `crate::`. The Repeater impl
+/// of such an entry is emitted outside the module, where `R0` is not, and the copy of the module
+/// declares `R0` again, so the Referrer hid the entry and left `crate::base` as written, which
+/// cannot resolve in another crate (E0433). Found by the property test with
 /// `TYPE_LEAK_PROP_FEATURES=module_crate_paths`.
 ///
-/// The assertion: the Leaker rejects the module with a `NotInternableError`.
+/// The fix keys the entry by its module, as `Rel<R0>` is ("Modules": an entry is keyed by its
+/// module if it depends on it). Rejecting it would be inconsistent: a relative path in that place
+/// is accepted, and `crate::` paths are context-free for the rules of keys otherwise. The
+/// assertions: the module is accepted; the entry is keyed by the module (it comes with the path of
+/// its module, `[]`, so a macro emits its impl inside it, where `R0` and `crate::base` resolve);
+/// the copy of the module has it replaced; and an entry that names no item of the module
+/// (`crate::base::B1<u8>`) stays shared by all modules. As for F10, the copy refers to the
+/// Leaker's `R0`, not to its own.
 #[test]
-#[ignore = "F4: intern_mod accepts a `crate::` path whose entry the copy of the module hides (bug)"]
 fn f04_module_crate_relative_path_not_rewritten() {
-    let mods: Vec<ItemMod> = vec![
-        parse_quote! {
-            pub mod mm {
-                pub struct R0;
-                pub struct A(pub crate::base::B1<R0>);
-            }
-        },
-        parse_quote! {
-            pub mod mm1 {
-                pub struct RC<const N: usize>;
-                pub struct S(pub RC<{ crate::base::LEN }>);
-            }
-        },
+    let mods: Vec<(ItemMod, &str)> = vec![
+        (
+            parse_quote! {
+                pub mod mm {
+                    pub struct R0;
+                    pub struct A(pub crate::base::B1<R0>);
+                }
+            },
+            "crate :: base :: B1 < R0 >",
+        ),
+        (
+            parse_quote! {
+                pub mod mm1 {
+                    pub struct RC<const N: usize>;
+                    pub struct S(pub RC<{ crate::base::LEN }>);
+                }
+            },
+            "RC < { crate :: base :: LEN } >",
+        ),
     ];
-    for item in mods {
+    for (item, expected) in mods {
         let mut leaker = new_leaker();
-        let result = leaker.intern_mod(&item);
-        assert!(
-            result.is_err(),
-            "`{}` is accepted, with the entries {:?}",
-            item.ident,
-            leaker.finish().iter().map(string).collect::<Vec<_>>()
-        );
+        let context = leaker.intern_mod(&item).unwrap();
+        let referrer = leaker.finish();
+        assert_eq!(referrer.iter().map(string).collect::<Vec<_>>(), [expected]);
+        // Keyed by the module, which is the one analyzed.
+        let module = referrer.context_module(referrer.context(0)).unwrap();
+        assert_eq!(module, context);
+        assert_eq!(referrer.module_path(module), Some(&[][..]));
+        // The copy of the module: nothing is left of the path.
+        let mut file = File {
+            shebang: None,
+            attrs: Vec::new(),
+            items: item.content.clone().unwrap().1,
+        };
+        referrer
+            .clone()
+            .visitor(context, |_, ix| parse_quote!(P<#ix>))
+            .visit_file_mut(&mut file);
+        let copy = string(&file);
+        assert!(copy.contains("P < 0usize >"), "{}", copy);
+        assert!(!copy.contains("base"), "{}", copy);
     }
+
+    // The control: a type that names no item of the module is shared by all modules (it is the
+    // same entry in `inner`), and one that names an item is keyed by the module it is written in.
+    let item: ItemMod = parse_quote! {
+        pub mod mm {
+            pub struct R0;
+            pub struct A(pub crate::base::B1<u8>, pub Vec<crate::base::B1<R0>>);
+            pub mod inner { pub struct B(pub crate::base::B1<u8>); }
+        }
+    };
+    let mut leaker = new_leaker();
+    leaker.intern_mod(&item).unwrap();
+    let referrer = leaker.finish();
+    let shared = entry(&referrer, "crate :: base :: B1 < u8 >");
+    assert_eq!(referrer.context_module(referrer.context(shared)), None);
+    let keyed = entry(&referrer, "crate :: base :: B1 < R0 >");
+    assert!(referrer.context_module(referrer.context(keyed)).is_some());
+    assert_eq!(referrer.iter().count(), 2);
 }
 
 // ── F5 ───────────────────────────────────────────────────────────────────────
@@ -470,7 +520,7 @@ fn f05_inferred_outlives_of_self_type() {
 
 // ── F6 ───────────────────────────────────────────────────────────────────────
 
-/// F6: `intern_impl` accepts `Self::A` of the implemented trait in a leaked type.
+/// F6 (fixed): `intern_impl` accepts `Self::A` of the implemented trait in a leaked type.
 ///
 /// Trigger: `impl ::leaker::m::Tr for u8 { type A = u8; fn f(&self, x: Rel<Self::A>) {} }`.
 /// `Rel<Self::A>` is an entry, and the impl that a macro emits is `impl Repeater<..> for u8 {
@@ -478,9 +528,13 @@ fn f05_inferred_outlives_of_self_type() {
 /// The context says that `Self` is `u8`, and nothing says which trait `A` belongs to. Found by the
 /// property test with `TYPE_LEAK_PROP_FEATURES=impl_assoc_self`.
 ///
-/// The assertion: the Leaker rejects the impl with a `NotInternableError`.
+/// The assertion: the Leaker rejects the impl with a `NotInternableError` (also if only a bound of
+/// the generics of the entry names `Self::A`), and says so in the headline. A type that names
+/// `Self::A` is never leaked whole, so where it holds no path that must be leaked
+/// (`Vec<Self::A>`) it is copied as written and works, and where it does (`fn(Rel) -> Self::A`)
+/// only its parts are entries. The type with the trait named (`<Self as ::leaker::m::Tr>::A`) and
+/// `Self::A` in a trait, where the Repeater's impl is for the implementor, are fine.
 #[test]
-#[ignore = "F6: intern_impl accepts `Self::A`, which the Repeater's impl cannot write (bug)"]
 fn f06_impl_assoc_type_of_self_in_repeater() {
     let item: ItemImpl = parse_quote! {
         impl ::leaker::m::Tr for u8 {
@@ -490,16 +544,69 @@ fn f06_impl_assoc_type_of_self_in_repeater() {
     };
     let mut leaker = new_leaker();
     let result = leaker.intern_impl(&item, true);
-    assert!(
-        result.is_err(),
-        "accepted, with the entries {:?}",
-        leaker.finish().iter().map(string).collect::<Vec<_>>()
+    let err = match result {
+        Ok(_) => panic!(
+            "accepted, with the entries {:?}",
+            leaker.finish().iter().map(string).collect::<Vec<_>>()
+        ),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err.to_string(),
+        "`Self :: A` cannot be written in the impl of the Repeater"
+    );
+
+    // A bound of the generics of the entry that names it.
+    let item: ItemImpl = parse_quote! {
+        impl<T: ::p::Tr<Self::A>> ::leaker::m::Tr for W<T> {
+            type A = u8;
+            fn f(&self, x: Rel<T>) {}
+        }
+    };
+    assert!(new_leaker().intern_impl(&item, true).is_err());
+
+    // Accepted: not in an entry, or the trait is named, or in a trait.
+    let impls: Vec<ItemImpl> = vec![
+        parse_quote! {
+            impl ::leaker::m::Tr for u8 { type A = u8; fn f(&self, x: Vec<Self::A>) {} }
+        },
+        parse_quote! {
+            impl ::leaker::m::Tr for u8 {
+                type A = u8;
+                fn f(&self, x: Rel<<Self as ::leaker::m::Tr>::A>) {}
+            }
+        },
+    ];
+    for item in impls {
+        new_leaker().intern_impl(&item, true).unwrap();
+    }
+    // A type that holds `Self::A` is not leaked whole, however many entries it would cover: the
+    // fewest entries are its parts (`Rel` and `Rel2`), not the function pointer.
+    let item: ItemImpl = parse_quote! {
+        impl ::leaker::m::Tr for u8 {
+            type A = u8;
+            fn f(&self, x: fn(Rel, Rel2) -> Self::A) {}
+        }
+    };
+    let mut leaker = new_leaker();
+    leaker.intern_impl(&item, true).unwrap();
+    let mut entries: Vec<String> = leaker.finish().iter().map(string).collect();
+    entries.sort();
+    assert_eq!(entries, ["Rel", "Rel2"]);
+    let item: ItemTrait = parse_quote! {
+        pub trait Tr { type A; fn f(&self, x: Rel<Self::A>); }
+    };
+    let mut leaker = new_leaker();
+    leaker.intern_trait(&item, true).unwrap();
+    assert_eq!(
+        string(leaker.finish().iter().next().unwrap()),
+        "Rel < Self :: A >"
     );
 }
 
 // ── F7 ───────────────────────────────────────────────────────────────────────
 
-/// F7: a method lifetime in a leaked path, and in the return type.
+/// F7 (fixed): a method lifetime in a leaked path, and in the return type.
 ///
 /// Trigger: `fn f<'x>(&self, a: Wrap<'x>) -> &'x u8` (and `-> Wrap<'x>`), with `Wrap<'x>` leaked.
 /// `'x` is late-bound in the trait, but the copy `fn f<'x>(&self, a: <Self as Repeater<(&'x (),)>>
@@ -508,10 +615,12 @@ fn f06_impl_assoc_type_of_self_in_repeater() {
 /// error for a trait object leaked as a whole, and the same holds for a leaked path. Found by the
 /// property test with `TYPE_LEAK_PROP_FEATURES=method_lifetime_paths`.
 ///
-/// The assertion: the Leaker rejects those two traits with a `NotInternableError`. `a: &'x u8`
-/// keeps `'x` as written, so that trait is accepted (the control).
+/// The assertion: the Leaker rejects those traits with a `NotInternableError` that has the E0195
+/// note: a type leaked whole holds `'x` in the copy, and no other input constrains it as written.
+/// `a: &'x u8` keeps `'x`, so that trait is accepted (the control), as are the other exemptions: the
+/// receiver keeps it, a type that is not leaked keeps it (`Option<&'x str>`, a function pointer),
+/// a bound makes it early-bound in both, and no input (or no output) mentions it.
 #[test]
-#[ignore = "F7: a method lifetime named by a leaked path and the return type is accepted (bug)"]
 fn f07_method_lifetime_in_leaked_path() {
     let rejected: Vec<ItemTrait> = vec![
         parse_quote!(
@@ -524,16 +633,78 @@ fn f07_method_lifetime_in_leaked_path() {
                 fn f<'x>(&self, a: Wrap<'x>) -> Wrap<'x>;
             }
         ),
+        // The path holds the lifetime in an argument, however deep.
+        parse_quote!(
+            pub trait Tr3 {
+                fn f<'x>(&self, a: Rel<&'x u8>, b: Vec<Wrap<'x>>) -> &'x u8;
+            }
+        ),
+        // Only the second lifetime is kept.
+        parse_quote!(
+            pub trait Tr9 {
+                fn f<'x, 'y>(&self, a: Wrap<'x>, b: &'y u8) -> (&'x u8, &'y u8);
+            }
+        ),
     ];
-    let accepted: ItemTrait = parse_quote!(
-        pub trait Tr2 {
-            fn f<'x>(&self, a: &'x u8) -> Wrap<'x>;
-        }
-    );
-    assert!(new_leaker().intern_trait(&accepted, true).is_ok());
     for item in rejected {
-        let result = new_leaker().intern_trait(&item, true);
-        assert!(result.is_err(), "`{}` is accepted", item.ident);
+        let err = new_leaker().intern_trait(&item, true).unwrap_err();
+        let note = err.note().unwrap();
+        assert!(
+            note.contains("`'x`") && note.contains("(E0195)"),
+            "`{}`: {}",
+            item.ident,
+            note
+        );
+    }
+    let accepted: Vec<ItemTrait> = vec![
+        parse_quote!(
+            pub trait Tr2 {
+                fn f<'x>(&self, a: &'x u8) -> Wrap<'x>;
+            }
+        ),
+        // Another argument keeps it, `&'x self` too.
+        parse_quote!(
+            pub trait Tr4 {
+                fn f<'x>(&self, a: &'x u8, b: Wrap<'x>) -> &'x u8;
+                fn g<'x>(&'x self, a: Wrap<'x>) -> &'x u8;
+            }
+        ),
+        // Kept as written in a type that is not leaked, however deep: a path of the allowed
+        // names, a function pointer, a tuple, or the type that holds the path.
+        parse_quote!(
+            pub trait Tr8 {
+                fn f<'x>(&self, a: Option<&'x str>, b: Wrap<'x>) -> &'x str;
+                fn g<'x>(&self, a: for<'h> fn(&'h u8, &'x u8), b: Wrap<'x>) -> &'x u8;
+                fn h<'x>(&self, a: Box<(&'x u8, Wrap<'x>)>) -> &'x u8;
+                fn i<'x>(&self, a: &'x Wrap<'x>) -> &'x u8;
+            }
+        ),
+        // A bound makes it early-bound in both.
+        parse_quote!(
+            pub trait Tr5 {
+                fn f<'x, 'y: 'x>(&self, a: Wrap<'x>, b: &'y u8) -> &'x u8;
+                fn g<'x>(&self, a: Wrap<'x>) -> &'x u8
+                where
+                    Self: 'x;
+                fn h<'x, T: 'x>(&self, a: Wrap<'x>, t: T) -> &'x u8;
+            }
+        ),
+        // No input mentions it, or the output does not: nothing to compare.
+        parse_quote!(
+            pub trait Tr6 {
+                fn f<'x>(&self) -> Wrap<'x>;
+                fn g<'x>(&self, a: Wrap<'x>);
+            }
+        ),
+        // A lifetime of the trait is not a lifetime of the method.
+        parse_quote!(
+            pub trait Tr7<'a> {
+                fn f(&self, a: Wrap<'a>) -> &'a u8;
+            }
+        ),
+    ];
+    for item in accepted {
+        new_leaker().intern_trait(&item, true).unwrap();
     }
 }
 

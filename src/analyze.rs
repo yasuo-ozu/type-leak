@@ -13,9 +13,9 @@ use crate::error::{NotInternableError, SELF_NOTE};
 #[cfg(doc)]
 use crate::leaker::Leaker;
 use crate::util::{
-    first_self_in_generics, first_self_in_type, generic_param_name, has_lifetime_bound, ident_name,
-    is_primitive_name, selves_in_generics, token_names, trait_object_of, unwrap_type_group,
-    without_defaults, AllowedPaths,
+    first_associated_self_in_generics, first_self_in_generics, first_self_in_type,
+    generic_param_name, has_lifetime_bound, ident_name, is_primitive_name, selves_in_generics,
+    token_names, trait_object_of, unwrap_type_group, without_defaults, AllowedPaths,
 };
 use crate::view::View;
 use proc_macro2::TokenStream;
@@ -41,6 +41,9 @@ struct Frame {
     /// (see [`Binder`]).
     binder: Option<(usize, Lifetime)>,
     unconstrained: Option<Lifetime>,
+    /// The first `Self::A` in the type, where `Self` is a type: the Repeater's impl cannot write it,
+    /// so a type that names it is not leaked whole.
+    assoc_self: Option<TokenStream>,
     effects: Vec<Effect>,
 }
 
@@ -58,6 +61,7 @@ impl Frame {
             relative: false,
             binder: None,
             unconstrained: None,
+            assoc_self: None,
             effects: Vec::new(),
         }
     }
@@ -77,6 +81,9 @@ struct OutputUse {
     /// Each constraining occurrence in the inputs, as the types from the input down to it.
     anchors: Vec<Vec<usize>>,
     chain: Vec<usize>,
+    /// An external type that the Leaker does not allow, which the Referrer may replace, holds no
+    /// occurrence. Else the occurrences are those that rustc sees as constraining.
+    careful: bool,
 }
 
 struct BinderGroup<'a> {
@@ -339,9 +346,8 @@ pub(crate) struct AnalyzeVisitor {
     /// A referent or path argument whose lifetime is a generic. A trait object there defaults to
     /// it, and would default to `'static` if leaked alone. What is inside it is not affected.
     inherits: Option<Inherits>,
-    /// The signatures being visited, innermost last: the index in `scopes` of their generics, and
-    /// their lifetimes that the copy would leave unconstrained (E0195).
-    signatures: Vec<(usize, Vec<Lifetime>)>,
+    /// The signatures being visited, innermost last.
+    signatures: Vec<SignatureWalk>,
     /// The depth of the type owning the expression (array length, const argument) being visited.
     /// Types in it are not leaked alone: the copy would put an associated type path in a constant.
     expr_owner: Option<usize>,
@@ -351,6 +357,20 @@ pub(crate) struct AnalyzeVisitor {
     /// The lifetimes the type being visited must outlive because of the types around it (see
     /// [`Enclosing`]). The Referrer tracks the same ones to find the entry. Empty outside a type.
     enclosing: Enclosing,
+}
+
+/// A method signature being visited (see `AnalyzeVisitor::signatures`).
+struct SignatureWalk {
+    /// The index in `scopes` of its generics.
+    at: usize,
+    /// Its lifetimes.
+    declared: Vec<Lifetime>,
+    /// Its lifetimes that the copy would leave unconstrained (E0195), if a trait object inherits
+    /// them.
+    risky: Vec<Lifetime>,
+    /// The types leaked whole that name a lifetime of it, by address: the lifetimes they name and
+    /// the conflict to report if the copy has nothing but them to constrain a lifetime.
+    leaked: HashMap<usize, (Vec<Lifetime>, CheckResult)>,
 }
 
 /// What a trait object without a lifetime bound takes its lifetime from. See
@@ -512,8 +532,14 @@ impl AnalyzeVisitor {
         } else {
             Context::none()
         };
+        // A type that names an item of the module (`crate::base::B1<R0>` with a declared `R0`) means
+        // something only there, like one with a relative path: the Repeater impl of its entry is
+        // emitted inside the module, where the name resolves, and the copy of the module declares
+        // the name again, so an entry of no module is hidden by the Referrer and left as written.
         Ok(match self.modules.last() {
-            Some(module) if inner.relative || self.depends_on_module(&context) => {
+            Some(module)
+                if inner.relative || inner.module_item || self.depends_on_module(&context) =>
+            {
                 context.with_module(Some(module.id))
             }
             _ => context,
@@ -815,6 +841,9 @@ impl AnalyzeVisitor {
         self.frame.mentions_self |= inner.mentions_self;
         self.frame.module_item |= inner.module_item;
         self.frame.relative |= inner.relative;
+        if self.frame.assoc_self.is_none() {
+            self.frame.assoc_self = inner.assoc_self.clone();
+        }
         // Kept for the enclosing type, unless that is the type holding the binder.
         if self.frame.binder.is_none() {
             let depth = self.type_depth;
@@ -843,7 +872,18 @@ impl AnalyzeVisitor {
                 .as_ref()
                 .filter(|(owner, _)| *owner == depth)
                 .map(|(_, lifetime)| binder_note(lifetime, true))
-                .or_else(|| inner.unconstrained.as_ref().map(unconstrained_note));
+                .or_else(|| {
+                    inner
+                        .unconstrained
+                        .as_ref()
+                        .map(|lifetime| unconstrained_note(lifetime, true))
+                });
+            if let (Some(cause), Some(SelfRequirement::Type(self_ty))) =
+                (&inner.assoc_self, &self.self_ty)
+            {
+                conflict.note = Some(assoc_self_note(cause, self_ty));
+                conflict.headline = Some(assoc_self_headline(cause));
+            }
             return Err(conflict);
         }
         if self.in_default == Some(true) && inner.mentions_self {
@@ -882,7 +922,23 @@ impl AnalyzeVisitor {
                 ),
                 headline: None,
             }),
-            None => Ok(context),
+            None => match self.associated_self_in_bounds(&context) {
+                Some(conflict) => Err(conflict.of(ty)),
+                None => Ok(context),
+            },
+        }
+    }
+
+    /// Returns the first `Self::A` in the bounds of the generics of `context`, if `Self` is a
+    /// type: the Repeater's impl for it would write the bound as it is, and has no trait to take
+    /// `A` from. (The impl for the implementor of a trait can write it: `__S::A`.)
+    fn associated_self_in_bounds(&self, context: &Context) -> Option<AssocSelf> {
+        match context.self_ty() {
+            Some(SelfRequirement::Type(self_ty)) => {
+                first_associated_self_in_generics(context.generics())
+                    .map(|cause| AssocSelf::new(cause, self_ty))
+            }
+            _ => None,
         }
     }
 
@@ -919,6 +975,9 @@ impl AnalyzeVisitor {
             conflict.impossible.insert(0, quote!(#lifetime));
             conflict.note = Some(binder_note(&lifetime, false));
             own = Some(Err(conflict));
+        }
+        if let Some(Ok(_)) = &own {
+            self.record_leaked(ty, depth, &inner);
         }
         // The same for an external type with such a lifetime: the type holding the binder is the
         // optional entry instead. Otherwise it is optional if it has no own cause and can be leaked
@@ -984,7 +1043,12 @@ impl AnalyzeVisitor {
             None => {
                 // Not leaked itself if its generics cannot be written (`Self`).
                 let context = match self.context_of(ty, &inner) {
-                    Ok(context) if self.self_in_bounds(&context).is_none() => context,
+                    Ok(context)
+                        if self.self_in_bounds(&context).is_none()
+                            && self.associated_self_in_bounds(&context).is_none() =>
+                    {
+                        context
+                    }
                     _ => return self.frame.effects.extend(effects),
                 };
                 PendingType {
@@ -1182,10 +1246,17 @@ impl AnalyzeVisitor {
     fn with_signature(&mut self, sig: &Signature, item: bool, f: impl FnOnce(&mut Self)) {
         let local = !item || self.item_depth > 0;
         self.with_risky(sig, self.scopes.len(), local, |visitor| {
+            // The generics are in scope while the lifetimes are checked, which needs them.
+            let walk = |visitor: &mut Self| {
+                f(visitor);
+                if local {
+                    visitor.check_leaked_lifetimes(sig);
+                }
+            };
             if item {
-                visitor.with_item_generics(&sig.generics, f)
+                visitor.with_item_generics(&sig.generics, walk)
             } else {
-                visitor.with_local_generics(&sig.generics, f)
+                visitor.with_local_generics(&sig.generics, walk)
             }
         });
     }
@@ -1193,7 +1264,16 @@ impl AnalyzeVisitor {
     fn with_risky(&mut self, sig: &Signature, at: usize, local: bool, f: impl FnOnce(&mut Self)) {
         if local {
             let risky = self.unconstrained_lifetimes(sig);
-            self.signatures.push((at, risky));
+            self.signatures.push(SignatureWalk {
+                at,
+                declared: sig
+                    .generics
+                    .lifetimes()
+                    .map(|param| param.lifetime.clone())
+                    .collect(),
+                risky,
+                leaked: HashMap::new(),
+            });
         }
         f(self);
         if local {
@@ -1204,7 +1284,106 @@ impl AnalyzeVisitor {
     fn is_unconstrained(&self, lifetime: &Lifetime, scope: usize) -> bool {
         self.signatures
             .iter()
-            .any(|(at, risky)| *at == scope && risky.contains(lifetime))
+            .any(|walk| walk.at == scope && walk.risky.contains(lifetime))
+    }
+
+    /// Notes that `ty` is leaked whole, if it names a lifetime of the signature being visited:
+    /// `check_leaked_lifetimes()` needs it. `inner` and `depth` are those of its decision.
+    fn record_leaked(&mut self, ty: &Type, depth: usize, inner: &Frame) {
+        // The probe of a binder walks its types again for real.
+        if self.probe.is_some() {
+            return;
+        }
+        let walk = match self.signatures.last() {
+            Some(walk) if !walk.declared.is_empty() => walk,
+            _ => return,
+        };
+        let mut finder = OutputLifetimes {
+            declared: walk.declared.clone(),
+            shadowed: Vec::new(),
+            found: Vec::new(),
+        };
+        finder.visit_type(ty);
+        let named: Vec<Lifetime> = finder
+            .found
+            .into_iter()
+            .filter(|lifetime| self.scope_of(&lifetime.to_string()) == Some(walk.at))
+            .collect();
+        if named.is_empty() {
+            return;
+        }
+        let conflict = self.causes(inner.must_start, inner.impossible_start, depth);
+        if let Some(walk) = self.signatures.last_mut() {
+            walk.leaked
+                .insert(ty as *const Type as usize, (named, conflict));
+        }
+    }
+
+    /// Reports the lifetimes of the signature just visited that the copy would leave unconstrained
+    /// because only types leaked whole hold them (E0195, see [Method
+    /// lifetimes](crate#method-lifetimes)). The return type names the lifetime and no bound does,
+    /// so it is late-bound where some input constrains it as written (`Wrap<'x>` does), and it
+    /// is early-bound in the copy where every such input is leaked whole: `Wrap<'x>` becomes a
+    /// projection, which does not constrain it. An input that keeps it, such as `&'x u8`, is no
+    /// type leaked whole, nor is one inside it.
+    fn check_leaked_lifetimes(&mut self, sig: &Signature) {
+        let leaked = match self.signatures.last_mut() {
+            Some(walk) if !walk.leaked.is_empty() => std::mem::take(&mut walk.leaked),
+            _ => return,
+        };
+        let (output, bounded) = output_and_bounded(sig);
+        let mut conflicts = Vec::new();
+        for param in sig.generics.lifetimes() {
+            let lifetime = &param.lifetime;
+            if !output.0.contains(lifetime) || bounded.0.contains(lifetime) {
+                continue;
+            }
+            // The occurrences that constrain the lifetime as written. An external type that the
+            // Leaker does not allow stays as written unless the Referrer replaces it, so it counts.
+            let mut used = OutputUse {
+                lifetime: lifetime.clone(),
+                anchors: Vec::new(),
+                chain: Vec::new(),
+                careful: false,
+            };
+            for input in &sig.inputs {
+                match input {
+                    FnArg::Receiver(receiver) => {
+                        if receiver.lifetime() == Some(lifetime) {
+                            used.anchors.push(Vec::new());
+                        }
+                        self.scan_anchors(&receiver.ty, &mut used)
+                    }
+                    FnArg::Typed(arg) => self.scan_anchors(&arg.ty, &mut used),
+                }
+            }
+            // The original constrains it, and in the copy only types leaked whole hold it: the
+            // first on the way to each occurrence is what to report.
+            let mut culprits: Vec<usize> = Vec::new();
+            let first_leaked =
+                |anchor: &[usize]| anchor.iter().copied().find(|ty| leaked.contains_key(ty));
+            if !used.anchors.is_empty() && used.anchors.iter().all(|a| first_leaked(a).is_some()) {
+                for anchor in &used.anchors {
+                    if let Some(ty) = first_leaked(anchor) {
+                        if !culprits.contains(&ty) {
+                            culprits.push(ty);
+                        }
+                    }
+                }
+            }
+            for ty in culprits {
+                let (named, conflict) = &leaked[&ty];
+                if named.contains(lifetime) {
+                    let mut conflict = conflict.clone();
+                    conflict.impossible.insert(0, quote!(#lifetime));
+                    conflict.note = Some(unconstrained_note(lifetime, false));
+                    conflicts.push(conflict);
+                }
+            }
+        }
+        self.frame
+            .effects
+            .extend(conflicts.into_iter().map(Effect::Error));
     }
 
     /// Returns the lifetimes of `sig` that the copy would leave unconstrained, making them
@@ -1220,26 +1399,7 @@ impl AnalyzeVisitor {
         if declared.is_empty() {
             return Vec::new();
         }
-        let mut output = Lifetimes::default();
-        output.visit_return_type(&sig.output);
-        // A lifetime in a bound is early-bound: `'b: 'c` (both), `T: 'b` and `T: Tr<'b>`.
-        let mut bounded = Lifetimes::default();
-        for param in sig.generics.lifetimes() {
-            if !param.bounds.is_empty() {
-                bounded.0.push(param.lifetime.clone());
-            }
-            for bound in &param.bounds {
-                bounded.visit_lifetime(bound);
-            }
-        }
-        for param in sig.generics.type_params() {
-            for bound in &param.bounds {
-                bounded.visit_type_param_bound(bound);
-            }
-        }
-        if let Some(where_clause) = &sig.generics.where_clause {
-            bounded.visit_where_clause(where_clause);
-        }
+        let (output, bounded) = output_and_bounded(sig);
         let in_scope: Generics = Generics {
             params: self
                 .params()
@@ -1368,6 +1528,7 @@ impl AnalyzeVisitor {
                     lifetime: lifetime.clone(),
                     anchors: Vec::new(),
                     chain: Vec::new(),
+                    careful: true,
                 };
                 if self.probe.is_none() {
                     for input in &group.inputs {
@@ -1395,7 +1556,8 @@ impl AnalyzeVisitor {
         match ty {
             // A reference to an external trait object is leaked whole if it is: the Referrer may
             // replace it.
-            Type::Reference(reference) if self.is_external_object(&reference.elem) => {}
+            Type::Reference(reference)
+                if used.careful && self.is_external_object(&reference.elem) => {}
             Type::Reference(reference) => {
                 if reference.lifetime.as_ref() == Some(&used.lifetime) {
                     used.anchors.push(used.chain.clone());
@@ -1407,7 +1569,8 @@ impl AnalyzeVisitor {
             | Type::Paren(TypeParen { elem, .. })
             | Type::Group(TypeGroup { elem, .. }) => self.scan_anchors(elem, used),
             // An array whose length names an external crate may be replaced as a whole.
-            Type::Array(array) if self.names_external_crate_in_expr(&array.len) => {}
+            Type::Array(array) if used.careful && self.names_external_crate_in_expr(&array.len) => {
+            }
             Type::Array(array) => self.scan_anchors(&array.elem, used),
             Type::Tuple(tuple) => {
                 for elem in &tuple.elems {
@@ -1416,8 +1579,9 @@ impl AnalyzeVisitor {
             }
             Type::Path(TypePath { qself: None, path })
                 if !self.is_projection(path)
-                    && !self.allowed.is_soft_path(path)
-                    && !self.holds_external_object(path) =>
+                    && !(used.careful
+                        && (self.allowed.is_soft_path(path)
+                            || self.holds_external_object(path))) =>
             {
                 if let Some(seg) = path.segments.last() {
                     self.scan_arguments(&seg.arguments, used);
@@ -1429,7 +1593,7 @@ impl AnalyzeVisitor {
                 }
                 self.scan_output(&f.output, used);
             }
-            Type::TraitObject(object) if !self.names_external_crate(object) => {
+            Type::TraitObject(object) if !(used.careful && self.names_external_crate(object)) => {
                 for bound in &object.bounds {
                     match bound {
                         TypeParamBound::Trait(bound)
@@ -1975,6 +2139,17 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
     }
 
     fn visit_type_path(&mut self, i: &TypePath) {
+        // `Self::A` where `Self` is a type: a type that names it is not leaked whole.
+        if i.qself.is_none()
+            && i.path.segments.len() > 1
+            && self_segment(&i.path).is_some()
+            && matches!(self.self_ty, Some(SelfRequirement::Type(_)))
+        {
+            let path = &i.path;
+            let cause = quote!(#path);
+            self.impossibles.push(cause.clone());
+            self.frame.assoc_self.get_or_insert(cause);
+        }
         match &i.qself {
             Some(qself) if self.resolves_through_bounds(qself) => {
                 // `<T>::X` goes through the bounds of `T`: only its arguments depend on the
@@ -2174,12 +2349,85 @@ impl<'ast> Visit<'ast> for Lifetimes {
     }
 }
 
-fn unconstrained_note(lifetime: &Lifetime) -> String {
+/// A `Self::A` that the Repeater's impl for the type `Self` cannot write (see
+/// [`AnalyzeVisitor::associated_self_in_bounds()`]).
+struct AssocSelf {
+    cause: TokenStream,
+    self_ty: Type,
+}
+
+impl AssocSelf {
+    fn new(cause: TokenStream, self_ty: &Type) -> Self {
+        Self {
+            cause,
+            self_ty: self_ty.clone(),
+        }
+    }
+
+    /// The conflict of the type `ty` leaked whole, with the generics that name it.
+    fn of(self, ty: &Type) -> CheckResult {
+        CheckResult {
+            must: vec![quote!(#ty)],
+            impossible: vec![self.cause.clone()],
+            is_own: true,
+            optional: false,
+            note: Some(assoc_self_note(&self.cause, &self.self_ty)),
+            headline: Some(assoc_self_headline(&self.cause)),
+        }
+    }
+}
+
+fn assoc_self_headline(cause: &TokenStream) -> String {
+    format!("`{}` cannot be written in the impl of the Repeater", cause)
+}
+
+fn assoc_self_note(cause: &TokenStream, self_ty: &Type) -> String {
     format!(
-        "the lifetime of the trait object defaults to `{0}`, a lifetime of the method which its \
-         return type mentions and no other argument keeps as written (e.g. `&{0} self`), so the \
-         copy would have `{0}` only in a projection, and rustc rejects the implementation of a \
-         method whose lifetime is early-bound where the trait's is late-bound (E0195)",
+        "`{}` is an associated item of `Self`, which is the type `{}` here, and the impl of the \
+         Repeater for that type has no trait to take it from: name the trait with its absolute \
+         path (`<Self as ::path::Trait>::..`)",
+        cause,
+        quote!(#self_ty)
+    )
+}
+
+/// Returns the lifetimes that the return type of `sig` mentions, and those that a bound names:
+/// `'b: 'c` (both), `T: 'b` and `T: Tr<'b>`. A lifetime in a bound is early-bound.
+fn output_and_bounded(sig: &Signature) -> (Lifetimes, Lifetimes) {
+    let mut output = Lifetimes::default();
+    output.visit_return_type(&sig.output);
+    let mut bounded = Lifetimes::default();
+    for param in sig.generics.lifetimes() {
+        if !param.bounds.is_empty() {
+            bounded.0.push(param.lifetime.clone());
+        }
+        for bound in &param.bounds {
+            bounded.visit_lifetime(bound);
+        }
+    }
+    for param in sig.generics.type_params() {
+        for bound in &param.bounds {
+            bounded.visit_type_param_bound(bound);
+        }
+    }
+    if let Some(where_clause) = &sig.generics.where_clause {
+        bounded.visit_where_clause(where_clause);
+    }
+    (output, bounded)
+}
+
+/// `object`: the type is a trait object that defaults to the lifetime, else it names it.
+fn unconstrained_note(lifetime: &Lifetime, object: bool) -> String {
+    format!(
+        "{} `{1}`, a lifetime of the method which its return type mentions and no other argument \
+         keeps as written (e.g. `&{1} self`), so the copy would have `{1}` only in a projection, \
+         and rustc rejects the implementation of a method whose lifetime is early-bound where \
+         the trait's is late-bound (E0195)",
+        if object {
+            "the lifetime of the trait object defaults to"
+        } else {
+            "it names"
+        },
         lifetime
     )
 }

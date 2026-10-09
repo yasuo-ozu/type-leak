@@ -283,6 +283,13 @@ pub(crate) fn first_self_in_type(ty: &Type) -> Option<TokenStream> {
     finder.found.into_iter().next()
 }
 
+/// Returns the first `Self::X` in the bounds, defaults and where predicates of `generics`.
+pub(crate) fn first_associated_self_in_generics(generics: &Generics) -> Option<TokenStream> {
+    let mut finder = SelfFinder::default();
+    finder.visit_generics(generics);
+    finder.associated.into_iter().next()
+}
+
 /// Returns the first `n` parameters without defaults, and the where predicates that do not name the
 /// others.
 pub(crate) fn without_defaults(generics: &Generics, n: usize) -> Generics {

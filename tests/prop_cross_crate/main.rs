@@ -31,9 +31,10 @@
 //! - `TYPE_LEAK_PROP_FEATURES`: a comma-separated list of constructs that `type-leak` is known to
 //!   fail on (see `gen::Features`). The generator avoids them by default, so that the test passes
 //!   on the current library, and a new failure is a new finding. With one of `unsized_params`,
-//!   `bound_cycles`, `inferred_outlives`, `impl_assoc_self`, `bound_merge_syntax`,
-//!   `impl_self_outlives`, `fn_pointer_self`, `method_lifetime_paths`, `module_crate_paths`,
-//!   `elided_fn_generics`, or `all`, the test fails with the reproduction of that finding.
+//!   `bound_cycles`, `inferred_outlives`, `bound_merge_syntax`, `impl_self_outlives`,
+//!   `fn_pointer_self`, `elided_fn_generics`, or `all`, the test fails with the reproduction of
+//!   that finding. `impl_assoc_self`, `method_lifetime_paths` and `module_crate_paths` are fixed
+//!   findings: they are on by default, and the Leaker rejects (and counts) what it cannot copy.
 //!
 //! The test is ignored by default: it is slow, as it builds the generated crates. Run it with
 //!

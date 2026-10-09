@@ -23,9 +23,15 @@ pub enum NotInternableError {
     /// `Self` is something else, so the bound cannot be written ([Self rules](crate#self-rules)).
     /// That is not about the path of the type, so its headline is "the bound of `T` mentions a
     /// `Self` which has no name here" ([`CheckResult::headline`]), with a note on why, at the
-    /// type. Each conflict is reported at the first of its [`CheckResult::must`], with
-    /// [`CheckResult::is_own`] `true`. For a trait bound, a value or the type of a const
-    /// parameter, [`CheckResult::impossible`] is that bound, value or parameter. Never empty.
+    /// type. The same goes for a type leaked as a whole that names `Self::A` where `Self` is a
+    /// type (an impl, a struct, an enum or a union), which the Repeater's impl cannot write
+    /// ("`Self::A` cannot be written in the impl of the Repeater"). A type leaked as a whole that
+    /// names a lifetime of a method which the copy would leave unconstrained (`Wrap<'x>` in
+    /// `fn f<'x>(&self, a: Wrap<'x>) -> &'x u8`) has a note on E0195
+    /// ([Method lifetimes](crate#method-lifetimes)). Each conflict is reported at the first of its
+    /// [`CheckResult::must`], with [`CheckResult::is_own`] `true`. For a trait bound, a value or
+    /// the type of a const parameter, [`CheckResult::impossible`] is that bound, value or
+    /// parameter. Never empty.
     RelativePath(Vec<CheckResult>),
     /// `Self` where no scope gives it a meaning. Never empty.
     ///
