@@ -30,12 +30,12 @@
 //! | `f20_trait_assoc_in_bound_of_entry_in_predicate` | an entry in a predicate has a bound of its context that names `Self::A`, in a trait | fixed |
 //! | `f21_iterator_item_in_bound_of_entry_in_item_binding` | an entry in `T: Iterator<Item = ..>` has a bound of its context that names the `Item` | fixed |
 //! | `f22_method_lifetime_in_free_function_and_inherent_method` | the E0195 check of F7 also rejects a free function and an inherent method | bug |
-//! | `f23_self_in_elided_signature_where_referrer_can_rewrite` | `Self` in an elided signature is rejected in a bound and with `allow_self = false`, where the Referrer could write `for<'e>` | bug |
+//! | `f23_self_in_elided_signature_where_referrer_can_rewrite` | `Self` in an elided signature is rejected in a bound and with `allow_self = false`, where the Referrer could write `for<'e>` | fixed |
 //! | `f24_self_in_predicate_with_leaked_bound_of_unused_generic` | a bare `Self` in a predicate is rejected for a leaked bound of a generic that no entry of the self type uses | bug |
 //! | `f25_supertrait_item_in_bound_of_entry_in_predicate` | a supertrait fixes the `Item` that a bound of an entry's generic names | bug |
 //! | `f26_alias_hides_projection_in_bound_of_entry_in_predicate` | a type alias hides the projection that such a bound names | limitation |
 //! | `f27_argument_impl_trait_bound_names_leaked_type_env_cycle` | the bound of an argument-position `impl Trait` names an entry whose generic has a leaked bound | bug |
-//! | `f28_hidden_lifetime_in_elided_signature_with_generics` | a path hides the one lifetime of an elided signature, next to an entry that adds lifetimes | bug |
+//! | `f28_hidden_lifetime_in_elided_signature_with_generics` | a path hides the one lifetime of an elided signature, next to an entry that adds lifetimes | fixed |
 //! | `f29_entry_hides_lifetime` | an entry (a relative path) hides a lifetime: its Repeater impl does not compile | limitation |
 //! | `f30_implied_outlives_of_generic_projection_recorded_as_component` | `&'x T::Item` is recorded as `T: 'x`, which the copy cannot prove | bug |
 //! | `f31_nested_signature_has_its_own_lifetimes` | a signature inside an input has its own lifetimes only for rustc 1.64 and later | limitation |
@@ -54,8 +54,8 @@
 //! The test of a finding says how the property test shows it (`TYPE_LEAK_PROP_FEATURES=..`), and
 //! the one-line reason of each failure is in its `#[ignore]` message. The features of the fixed
 //! findings are on by default in the property test: the Leaker now rejects what they generate (the
-//! rejections are counted), or rewrites it. The features of F25 to F28 and F30 are off, as for the
-//! other findings that are not fixed. F22 to F24 are rejections of what compiles: a rejection is
+//! rejections are counted), or rewrites it. The features of F25 to F27 and F30 are off, as for the
+//! other findings that are not fixed. F22 and F24 are rejections of what compiles: a rejection is
 //! counted as a success by the property test, which cannot show them (nor F29, F31 and F32, which
 //! are about a toolchain, a lint, or an error in the Leaker's crate that the Leaker cannot see).
 //! The tests of F22 to F32 were written from rustc's verdict on a hand-written Leaker's crate (the
@@ -2134,16 +2134,22 @@ fn f15_copy(
 /// this is `Self`, which the Leaker does not replace, and the Referrer does, without looking at
 /// the signature.
 ///
-/// The fix is the same as F12's: `Self` (when it is a type with lifetimes that a copy writes, the
-/// struct, enum or union itself) in the inputs of such a signature adds lifetimes like an entry
-/// does. The holder (the function pointer, the trait object, the reference that takes its
+/// The first fix was the same as F12's: `Self` (when it is a type with lifetimes that a copy writes,
+/// the struct, enum or union itself) in the inputs of such a signature adds lifetimes like an entry
+/// does, so the holder (the function pointer, the trait object, the reference that takes its
 /// lifetime) is leaked whole, which keeps `Self` and the elision as written in the impl of the
 /// Repeater (`impl<'a> Repeater<..> for S<'a> { type Type = fn(&Self) -> &u8; }`, which rustc
-/// accepts). With `allow_self == false` it cannot be leaked, and where nothing holds the signature
-/// (a bound, a method) it is a conflict, with the note about E0106. The copy of an impl keeps
-/// `Self`, and so does a trait, whose Repeater impl writes `Self::A` as `<__S>::A`
-/// (`Referrer::iter_with_self()`), and `with_self(Host)` the same, so they are not affected
-/// (rustc accepts `fn(&<__S>::A) -> &u8`, and rejects `fn(&<__Self as Tr<'a>>::A) -> &u8`).
+/// accepts); with `allow_self == false` it cannot be leaked, and where nothing holds the signature
+/// (a bound, a method) it is a conflict, with the note about E0106. F23 refines it: where the
+/// inputs show their one lifetime (`&Self`, `Ref<'_, Self>`, a named one) the Referrer names it
+/// with a fresh `for<'e>` binder in the inputs and the output, so nothing is leaked and nothing is
+/// rejected (`allow_self == false` and a bound too). What the Referrer cannot name is still leaked
+/// whole or rejected, as above: a lifetime that a path hides (`fn(::core::slice::Iter<u8>, Self) ->
+/// &u8`, which the Leaker takes as the elided one, F28) and a method, which has no binder to
+/// write. The copy of an impl keeps `Self`, and so does a trait, whose Repeater impl writes
+/// `Self::A` as `<__S>::A` (`Referrer::iter_with_self()`), and `with_self(Host)` the same, so they
+/// are not affected (rustc accepts `fn(&<__S>::A) -> &u8`, and rejects `fn(&<__Self as
+/// Tr<'a>>::A) -> &u8`).
 ///
 /// The property test shows it with `TYPE_LEAK_PROP_FEATURES=self_elision` (on by default now).
 /// There were two causes. The *oracle* of the test macro failed in the Leaker's crate: a witness
@@ -2158,61 +2164,80 @@ fn f15_copy(
 /// F12).
 #[test]
 fn f15_self_rewritten_in_elided_signature() {
-    // The holder is the entry: the whole signature is leaked, with `Self` as written.
+    // The inputs show their one lifetime: the Referrer names it (F23), so `Self` leaks nothing,
+    // and `allow_self == false` is no obstacle. The copy has the lifetime in a `for<..>` binder.
+    for item in [
+        parse_quote!(
+            pub struct S<'a> {
+                f: fn(&Self) -> &u8,
+                g: &'a u8,
+            }
+        ),
+        parse_quote!(
+            pub struct S<'a>(Box<dyn Fn(&Self) -> &u8>, &'a u8);
+        ),
+        parse_quote!(
+            pub enum E<'a, T> {
+                A(fn(&(T, Self)) -> &u8),
+                B(&'a T),
+            }
+        ),
+        parse_quote!(
+            pub union U<'a> {
+                f: fn(&Self) -> &u8,
+                g: &'a u8,
+            }
+        ),
+        // `Self` deep in the inputs, next to a type that is allowed.
+        parse_quote!(
+            pub struct S<'a>(Box<dyn Fn(&Vec<Self>) -> &u8>, &'a u8);
+        ),
+        // The reference takes its lifetime from the trait object.
+        parse_quote!(
+            pub struct S<'a>(&'a dyn Fn(&Self) -> &u8, &'a u8);
+        ),
+        // `Self::A`, which the visitor writes `<::p::S<'a>>::A`, has no lifetime of its own either.
+        parse_quote!(
+            pub struct S<'a>(Box<dyn Fn(&Self::A) -> &u8>, &'a u8);
+        ),
+    ] {
+        let item: Item = item;
+        for allow_self in [true, false] {
+            let (entries, copy) = f15_copy(&item, allow_self).unwrap_or_else(|e| {
+                panic!(
+                    "`{}` is rejected (allow_self = {}): {}",
+                    string(&item),
+                    allow_self,
+                    e
+                )
+            });
+            assert!(entries.is_empty(), "{}: {:?}", string(&item), entries);
+            let mut signatures = Signatures::default();
+            signatures.visit_item(&copy);
+            assert_eq!(signatures.count, 1, "{}", string(&copy));
+            assert!(
+                signatures.broken.is_empty(),
+                "{}: {:?}",
+                string(&copy),
+                signatures.broken
+            );
+            assert!(string(&copy).contains("for <"), "{}", string(&copy));
+        }
+    }
+    // The holder is the entry where the Referrer cannot name the lifetime: a path hides it (the
+    // Leaker takes it as the one that elision gives, F28), so `Self` adds to it.
     for (item, holder) in [
         (
             parse_quote!(
-                pub struct S<'a> {
-                    f: fn(&Self) -> &u8,
-                    g: &'a u8,
-                }
+                pub struct S<'a>(fn(::core::slice::Iter<u8>, Self) -> &u8, &'a u8);
             ),
-            "fn (& Self) -> & u8",
+            "fn (:: core :: slice :: Iter < u8 > , Self) -> & u8",
         ),
         (
             parse_quote!(
-                pub struct S<'a>(Box<dyn Fn(&Self) -> &u8>, &'a u8);
+                pub struct S<'a>(Box<dyn Fn(::core::slice::Iter<u8>, Self) -> &u8>, &'a u8);
             ),
-            "dyn Fn (& Self) -> & u8",
-        ),
-        (
-            parse_quote!(
-                pub enum E<'a, T> {
-                    A(fn(&(T, Self)) -> &u8),
-                    B(&'a T),
-                }
-            ),
-            "fn (& (T , Self)) -> & u8",
-        ),
-        (
-            parse_quote!(
-                pub union U<'a> {
-                    f: fn(&Self) -> &u8,
-                    g: &'a u8,
-                }
-            ),
-            "fn (& Self) -> & u8",
-        ),
-        // `Self` deep in the inputs, next to a type that is allowed.
-        (
-            parse_quote!(
-                pub struct S<'a>(Box<dyn Fn(&Vec<Self>) -> &u8>, &'a u8);
-            ),
-            "dyn Fn (& Vec < Self >) -> & u8",
-        ),
-        // The reference takes its lifetime from the trait object, so it is the holder.
-        (
-            parse_quote!(
-                pub struct S<'a>(&'a dyn Fn(&Self) -> &u8, &'a u8);
-            ),
-            "& 'a dyn Fn (& Self) -> & u8",
-        ),
-        // `Self` as the qualified self type has none of its own either.
-        (
-            parse_quote!(
-                pub struct S<'a>(Box<dyn Fn(&<Self as ::p::Tr>::A) -> &u8>, &'a u8);
-            ),
-            "dyn Fn (& < Self as :: p :: Tr > :: A) -> & u8",
+            "dyn Fn (:: core :: slice :: Iter < u8 > , Self) -> & u8",
         ),
     ] {
         let item: Item = item;
@@ -2232,6 +2257,41 @@ fn f15_self_rewritten_in_elided_signature() {
             .unwrap_or_else(|| panic!("{} is accepted", string(&item)));
         let note = err.note().unwrap();
         assert!(note.contains("E0106"), "{}: {}", string(&item), note);
+    }
+    // An entry that adds lifetimes to the inputs makes the signature the holder, as in F12: here
+    // `Self` is its qualified self type. It is an optional entry (an external path), so a Referrer
+    // that leaves those as written (the default) gets the lifetime named, as above.
+    {
+        let item: Item = parse_quote!(
+            pub struct S<'a>(Box<dyn Fn(&<Self as ::p::Tr>::A) -> &u8>, &'a u8);
+        );
+        let (entries, copy) = f15_copy(&item, true).unwrap();
+        assert_eq!(
+            entries,
+            ["dyn Fn (& < Self as :: p :: Tr > :: A) -> & u8"],
+            "{}",
+            string(&item)
+        );
+        let mut signatures = Signatures::default();
+        signatures.visit_item(&copy);
+        assert!(
+            signatures.broken.is_empty(),
+            "{}: {:?}",
+            string(&copy),
+            signatures.broken
+        );
+        // With `allow_self == false` the entry that names `Self` is not leaked, so it is left as
+        // written, and the Referrer names the lifetime as above.
+        let (entries, copy) = f15_copy(&item, false).unwrap();
+        assert!(entries.is_empty(), "{}: {:?}", string(&item), entries);
+        let mut signatures = Signatures::default();
+        signatures.visit_item(&copy);
+        assert!(
+            signatures.broken.is_empty(),
+            "{}: {:?}",
+            string(&copy),
+            signatures.broken
+        );
     }
     // Where the elision is not at stake, `Self` is left alone: `Self` has no lifetime, the inputs
     // keep the lifetime that `Self` has, or the output does not rely on elision.
@@ -2293,28 +2353,28 @@ fn f15_self_rewritten_in_elided_signature() {
             signatures.broken
         );
         assert!(entries.is_empty(), "{}: {:?}", string(&item), entries);
+        // Nothing is named that the original does not name: no binder is added.
+        assert_eq!(
+            string(&copy).matches("for <").count(),
+            string(&item).matches("for <").count(),
+            "{}",
+            string(&copy)
+        );
     }
-    // Where nothing can hold the signature (a bound, an elided reference), the item is rejected,
-    // not copied wrongly.
+    // Where nothing can hold the signature and the Referrer cannot name its lifetime (a path hides
+    // it, in a bound), the item is rejected, not copied wrongly.
     for item in [
-        parse_quote! { pub struct S<'a, F: Fn(&Self) -> &u8>(&'a F); },
-        parse_quote! { pub struct S<'a>(&'a u8, &dyn Fn(&Self) -> &u8); },
-        parse_quote! { pub enum E<'a, T> where T: Fn(&Self) -> &u8 { A(&'a T) } },
-        // `Self::A` cannot be written in the Repeater's impl for a type, so the holder cannot be
-        // leaked either.
-        parse_quote! { pub struct S<'a>(Box<dyn Fn(&Self::A) -> &u8>, &'a u8); },
+        parse_quote! { pub struct S<'a, F: Fn(::core::slice::Iter<u8>, Self) -> &u8>(&'a F); },
+        parse_quote! {
+            pub enum E<'a, T> where T: Fn(::core::slice::Iter<u8>, Self) -> &u8 { A(&'a T) }
+        },
     ] {
         let item: Item = item;
         let err = f15_copy(&item, true)
             .err()
             .unwrap_or_else(|| panic!("{} is accepted", string(&item)));
         let note = err.note().unwrap();
-        assert!(
-            note.contains("E0106") || note.contains("Self :: A"),
-            "{}: {}",
-            string(&item),
-            note
-        );
+        assert!(note.contains("E0106"), "{}: {}", string(&item), note);
     }
     // The copy of an impl keeps `Self`, and so does that of a trait, whose `Self::A` is written
     // `<Host>::A` (and `<__S>::A` in the Repeater): nothing is leaked.
@@ -3409,14 +3469,14 @@ fn f22_method_lifetime_in_free_function_and_inherent_method() {
 
 // ── F23 ──────────────────────────────────────────────────────────────────────
 
-/// F23 (bug): `Self` in an elided signature is rejected where the Referrer could write the lifetime.
+/// F23 (fixed): `Self` in an elided signature was rejected where the Referrer could write the lifetime.
 ///
 /// Trigger: `struct S<'a, F: Fn(&Self) -> &u8>(&'a F)`, `enum E<'a, T> where T: Fn(&Self) -> &u8
 /// { A(&'a T) }`, and, with `allow_self = false`, `struct S<'a> { f: fn(&Self) -> &u8, g: &'a u8
-/// }`. F15 makes the Leaker leak the signature whole where `Self` has lifetimes in the copy
+/// }`. F15 made the Leaker leak the signature whole where `Self` has lifetimes in the copy
 /// (`with_self()` writes `::p::S<'a>`, which adds `'a` to the inputs, and elision fails: E0106), and
 /// reject the item where nothing can hold it (a bound, a where predicate) or where `Self` cannot
-/// be in the impl of the Repeater (`allow_self = false`). It also rejects when the caller never
+/// be in the impl of the Repeater (`allow_self = false`). It also rejected when the caller never
 /// calls `with_self()`: the Leaker cannot know it, and the copy `struct S<'a, F: Fn(&Self) ->
 /// &u8>(&'a F)` is the original.
 ///
@@ -3438,16 +3498,26 @@ fn f22_method_lifetime_in_free_function_and_inherent_method() {
 /// ```
 ///
 /// while the plain `with_self()` copy `Fn(&lk::S2<'a, F>) -> &u8` is E0106 ("which one of argument 1's
-/// 2 lifetimes it is borrowed from"), the failure of F15. The same idea might apply to F12's
-/// rejections of an entry that adds lifetimes in a bound (not checked here).
+/// 2 lifetimes it is borrowed from"), the failure of F15. Also checked: the same for a named
+/// lifetime of the inputs (`for<'x> fn(&'x Self) -> &u8` in `S<'a, 'b>`, whose output must be
+/// named `'x`), a `Ref<'_, Self>` input, nested signatures that each have a binder (`fn(&(Self,
+/// fn(&Self) -> &u8)) -> &u8`).
 ///
-/// The assertion is neutral on how: the Leaker accepts each item, and the copy that `with_self()`
-/// makes (as the macros of the property test do) has no function pointer or sugar of `Fn` whose
-/// elided output the inputs cannot resolve (`Signatures`), whether the Leaker leaked the holder or
-/// the Referrer rewrote it. F15 pins the current choice (the holder is the entry, and the rest is an
-/// error): its assertions that these items are rejected are to change with the fix.
+/// The fix is in the Referrer: where `with_self()` writes a type with lifetimes for a `Self` in the
+/// inputs of a function pointer or of `Fn(..)` (in a type, a bound or a where predicate) whose
+/// output has an elided lifetime and whose inputs show exactly one lifetime, it names that lifetime
+/// with a fresh binder (`for<'__tl_e0>`) in the inputs and in the output, or, if the inputs name
+/// it, writes that name in the output. The Leaker does not count `Self` there, so it accepts these
+/// items (`allow_self = false` too). It still leaks the signature whole, or rejects, where the
+/// Referrer cannot name the lifetime: a path hides it (F28), or the signature is a method's. F15
+/// pins that, and the entries that add lifetimes (F12).
+///
+/// The assertion: the Leaker accepts each item with no entry, and the copy that `with_self()` makes
+/// (as the macros of the property test do) has no function pointer or sugar of `Fn` whose elided
+/// output the inputs cannot resolve (`Signatures`), the Referrer having named the lifetime. The
+/// property test shows it with `TYPE_LEAK_PROP_FEATURES=self_elision` (on by default): it no
+/// longer leaks or rejects these items.
 #[test]
-#[ignore = "`Self` in an elided signature is rejected in a bound and with allow_self = false, where the Referrer could write `for<'e>`"]
 fn f23_self_in_elided_signature_where_referrer_can_rewrite() {
     let items: Vec<(Item, bool)> = vec![
         // A bound, and a where predicate: nothing can hold the signature.
@@ -3490,9 +3560,49 @@ fn f23_self_in_elided_signature_where_referrer_can_rewrite() {
             ),
             false,
         ),
+        // The inputs name their lifetime: the output takes it.
+        (
+            parse_quote!(
+                pub struct S<'a, 'b> {
+                    f: for<'x> fn(&'x Self) -> &u8,
+                    g: &'a u8,
+                    h: &'b u8,
+                }
+            ),
+            true,
+        ),
+        (
+            parse_quote!(
+                pub struct S<'a, F: for<'x> Fn(&'x Self) -> &u8>(&'a F);
+            ),
+            false,
+        ),
+        // The lifetime is in a path (`'_`).
+        (
+            parse_quote!(
+                pub struct S<'a>(fn(::core::cell::Ref<'_, Self>) -> &u8, &'a u8);
+            ),
+            false,
+        ),
+        // Each of the nested signatures has its binder.
+        (
+            parse_quote!(
+                pub struct S<'a>(fn(&(Self, fn(&Self) -> &u8)) -> &u8, &'a u8);
+            ),
+            true,
+        ),
+        // Several bounds of one item, and a bound of a where predicate.
+        (
+            parse_quote!(
+                pub struct S<'a, F: Fn(&Vec<Self>) -> &u8, G>(F, G, &'a u8)
+                where
+                    G: Fn(&Self) -> Option<&u8>;
+            ),
+            true,
+        ),
     ];
     for (item, allow_self) in &items {
-        let (_, copy) = f15_copy(item, *allow_self).unwrap_or_else(|e| {
+        let (entries, copy) = f15_copy(item, *allow_self).unwrap_or_else(|e| {
             panic!(
                 "`{}` is rejected (allow_self = {}), and its copy compiles with `for<'e>`: {}\n{}",
                 string(item),
@@ -3501,6 +3611,7 @@ fn f23_self_in_elided_signature_where_referrer_can_rewrite() {
                 e.note().unwrap_or_default()
             )
         });
+        assert!(entries.is_empty(), "{}: {:?}", string(item), entries);
         let mut signatures = Signatures::default();
         signatures.visit_item(&copy);
         assert!(
@@ -3509,6 +3620,7 @@ fn f23_self_in_elided_signature_where_referrer_can_rewrite() {
             string(&copy),
             signatures.broken
         );
+        assert!(signatures.count > 0, "{}", string(&copy));
     }
 }
 
@@ -3899,7 +4011,7 @@ fn f27_argument_impl_trait_bound_names_leaked_type_env_cycle() {
 
 // ── F28 and F29 ──────────────────────────────────────────────────────────────
 
-/// F28 (bug): a path that hides a lifetime in the inputs of an elided signature, next to an entry
+/// F28 (fixed): a path that hides a lifetime in the inputs of an elided signature, next to an entry
 /// that adds lifetimes.
 ///
 /// Trigger: `trait Tr<'a, T: 'a> { fn f(&self, x: fn(::p::WRef<u8>, Rel<T>) -> &u8); }` with
@@ -3910,27 +4022,30 @@ fn f27_argument_impl_trait_bound_names_leaked_type_env_cycle() {
 /// generics `<'a, T: 'a>`, so the copy has `<() as Repeater<(&'a (), T, &'a T), ..>>::Type`, which
 /// names `'a`: two lifetimes, E0106 "which one of argument 1's 2 lifetimes it is borrowed from" (checked
 /// with rustc, stable 1.98.1 and nightly 1.100.0, with the impl of the trait for a host type; it is
-/// what F12 fixed for `&`). The Leaker does not see the hidden lifetime (README: "A lifetime that a
+/// what F12 fixed for `&`). The Leaker did not see the hidden lifetime (README: "A lifetime that a
 /// path hides (`Ref<u8>` for `Ref<'a, u8>`) is not seen by the Leaker, so write `Ref<'_, u8>`"), and
-/// `Rel<T>` alone is the entry.
+/// `Rel<T>` alone was the entry.
 ///
-/// The property test shows it with `TYPE_LEAK_PROP_FEATURES=hidden_lifetimes` (off by default; E0106 in
-/// the Referrer's crate for `fn(::core::str::Chars, A) -> &R` and `fn(::core::slice::Iter<u8>, A) ->
-/// &R`: seeds 2, 5, 6, 7, 8, 9 and 11 of 60 cases fail, 1, 3, 4, 10 and 12 pass, as the entry must add
-/// lifetimes).
+/// The property test showed it with `TYPE_LEAK_PROP_FEATURES=hidden_lifetimes` (E0106 in the
+/// Referrer's crate for `fn(::core::str::Chars, A) -> &R` and `fn(::core::slice::Iter<u8>, A) ->
+/// &R`: seeds 2, 5, 6, 7, 8, 9 and 11 of 60 cases failed, 1, 3, 4, 10 and 12 passed, as the entry
+/// must add lifetimes); it is on by default now.
 ///
-/// The README tells the user to write `WRef<'_, u8>`, which the Leaker leaks whole with the
-/// holder (the control, `Tr1`: compiles, checked). A correct behaviour that needs no advice exists,
-/// since an elided output lifetime with no lifetime in the inputs that the Leaker sees can only be
-/// the hidden one (the original compiles): it counts as the one that elision uses, as `&` does,
-/// and the holder is leaked whole, or the item is rejected where nothing can hold it.
+/// The README told the user to write `WRef<'_, u8>`, which the Leaker leaks whole with the holder
+/// (the control, `Tr1`: compiles, checked). A correct behaviour that needs no advice exists, since
+/// an elided output lifetime with no lifetime in the inputs that the Leaker sees can only be the
+/// hidden one (the original compiles): the fix counts it as the one that elision uses, as `&` does
+/// (`Elision::hidden`), so any lifetime that the copy adds to the inputs breaks it, and the holder
+/// is leaked whole, or the item is rejected where nothing can hold it. The same holds for a
+/// method with no receiver that is a reference. A hidden lifetime in the output is not seen, so the
+/// copy of `fn(&Rel<T>) -> WRef<u8>` is still E0106: the limitation that the README documents.
 ///
 /// The assertion: the Leaker rejects the item with the note of F12 (E0106), or the holder is the
 /// entry, so that nothing of it is left in the copy (`Signatures`). The controls are accepted
 /// as before: the lifetime written, an entry that adds none (`Tr5<T>`), an output that does not
-/// rely on elision, and a hidden lifetime in a signature that has no entry.
+/// rely on elision, and a hidden lifetime in a signature that has no entry. The items that are
+/// rejected name the hidden lifetime in the note, and they are the bound and the method.
 #[test]
-#[ignore = "a lifetime that a path hides is not seen: the copy of an elided signature does not compile (E0106)"]
 fn f28_hidden_lifetime_in_elided_signature_with_generics() {
     // What compiles, and stays accepted.
     let controls: Vec<(ItemTrait, &str)> = vec![
@@ -3976,48 +4091,98 @@ fn f28_hidden_lifetime_in_elided_signature_with_generics() {
             .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
         assert_eq!(entries, [*holder], "{}", string(item));
     }
-    let items: Vec<ItemTrait> = vec![
+    // The holder is leaked whole: its signature keeps the hidden lifetime where it is written.
+    let items: Vec<(ItemTrait, &str)> = vec![
+        (
+            parse_quote!(
+                pub trait Tr<'a, T: 'a> {
+                    fn f(&self, x: fn(::p::WRef<u8>, Rel<T>) -> &u8);
+                }
+            ),
+            "fn (:: p :: WRef < u8 > , Rel < T >) -> & u8",
+        ),
+        (
+            parse_quote!(
+                pub trait Tr<'a, T: 'a> {
+                    fn f(&self, x: Box<dyn Fn(::p::WRef<u8>, Rel<T>) -> &u8>);
+                }
+            ),
+            "dyn Fn (:: p :: WRef < u8 > , Rel < T >) -> & u8",
+        ),
+        (
+            parse_quote!(
+                pub trait Tr<'a, T: 'a> {
+                    fn f(&self, x: fn(::core::slice::Iter<u8>, Rel<T>) -> &u8);
+                }
+            ),
+            "fn (:: core :: slice :: Iter < u8 > , Rel < T >) -> & u8",
+        ),
+        (
+            parse_quote!(
+                pub trait Tr<'a, T: 'a> {
+                    fn f(&self, x: fn(::p::WRef<Rel<T>>) -> &u8);
+                }
+            ),
+            "fn (:: p :: WRef < Rel < T > >) -> & u8",
+        ),
+    ];
+    for (item, holder) in &items {
+        let (entries, copy) = f12_copy_with(f13_leaker(), item)
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), e));
+        assert_eq!(entries, [*holder], "{}", string(item));
+        let mut signatures = Signatures::default();
+        signatures.visit_item_trait(&copy);
+        assert_eq!(
+            signatures.count,
+            0,
+            "`{}`: the entries {:?} leave a signature in the copy, whose elided output has the hidden lifetime and the one of `Rel<T>`: {}",
+            string(item),
+            entries,
+            string(&copy)
+        );
+    }
+    // Where nothing can hold the signature (a bound, a function with no receiver that is a
+    // reference), the item is rejected, with a note that says the lifetime is hidden.
+    let rejected: Vec<ItemTrait> = vec![
+        parse_quote!(
+            pub trait Tr<'a, T: 'a, F: Fn(::p::WRef<u8>, Rel<T>) -> &u8> {}
+        ),
         parse_quote!(
             pub trait Tr<'a, T: 'a> {
-                fn f(&self, x: fn(::p::WRef<u8>, Rel<T>) -> &u8);
+                fn f<F: Fn(::p::WRef<u8>, Rel<T>) -> &u8>(&self, f: F);
             }
         ),
         parse_quote!(
             pub trait Tr<'a, T: 'a> {
-                fn f(&self, x: Box<dyn Fn(::p::WRef<u8>, Rel<T>) -> &u8>);
+                fn f(x: ::p::WRef<u8>, y: Rel<T>) -> &u8;
             }
         ),
         parse_quote!(
             pub trait Tr<'a, T: 'a> {
-                fn f(&self, x: fn(::core::slice::Iter<u8>, Rel<T>) -> &u8);
-            }
-        ),
-        parse_quote!(
-            pub trait Tr<'a, T: 'a> {
-                fn f(&self, x: fn(::p::WRef<Rel<T>>) -> &u8);
+                fn f(self, x: ::core::slice::Iter<u8>, y: Rel<T>) -> &u8;
             }
         ),
     ];
-    for item in &items {
-        match f12_copy_with(f13_leaker(), item) {
-            Err(err) => {
-                let note = err.note().unwrap();
-                assert!(note.contains("E0106"), "{}: {}", string(item), note);
-            }
-            Ok((entries, copy)) => {
-                let mut signatures = Signatures::default();
-                signatures.visit_item_trait(&copy);
-                assert_eq!(
-                    signatures.count,
-                    0,
-                    "`{}`: the entries {:?} leave a signature in the copy, whose elided output has the hidden lifetime and the one of `Rel<T>`: {}",
-                    string(item),
-                    entries,
-                    string(&copy)
-                );
-            }
-        }
+    for item in &rejected {
+        let err = f12_copy_with(f13_leaker(), item)
+            .err()
+            .unwrap_or_else(|| panic!("{} is accepted", string(item)));
+        let note = err.note().unwrap();
+        assert!(
+            note.contains("E0106") && note.contains("hides"),
+            "{}: {}",
+            string(item),
+            note
+        );
     }
+    // A method with a receiver that is a reference takes the lifetime from it: nothing is hidden.
+    let accepted: ItemTrait = parse_quote!(
+        pub trait Tr<'a, T: 'a> {
+            fn f(&self, x: ::p::WRef<u8>, y: Rel<T>) -> &u8;
+        }
+    );
+    let (entries, _) = f12_copy_with(f13_leaker(), &accepted).unwrap();
+    assert_eq!(entries, ["Rel < T >"]);
 }
 
 /// F29 (limitation): an entry that hides a lifetime.
@@ -4183,16 +4348,16 @@ fn f30_implied_outlives_of_generic_projection_recorded_as_component() {
 /// &'x u8>) -> &u8>); }` (and `fn(&for<'x> fn(&'x Rel<T>) -> &'x u8) -> &u8`). The outer sugar has
 /// one lifetime, the `&`; the inner one has its own binder `'x`, and the entry `Rel<T>` in it
 /// names `'a` in the copy. F12's rule follows rustc: the lifetimes of an inner signature do not
-/// count for the outer one, and the entry is `Rel<T>` alone (README, "Elided output": "That is how
-/// rustc 1.65 and later count (checked on stable and nightly)"). Checked now with rustc and the
-/// impl of the trait for a host type: 1.56, 1.61, 1.62 and 1.63 count the lifetimes that the inner
-/// signature does not bind, so they see two for the outer one (`&` and `'a`) and reject the copy
-/// (E0106, and on 1.56 "`impl` item signature doesn't match `trait` item signature"); 1.64, 1.65,
-/// 1.70, stable (1.98.1) and nightly accept it. So the change is in 1.64, a release before what the
-/// README says (a safe bound, as the crate's MSRV is 1.56 and the property test runs on the
-/// current toolchain only). The Leaker does not know the toolchain of the crate that expands its
-/// macros, so it follows the current one, and an item with a nested signature in an input is
-/// rejected or broken on an older rustc. Leaking the outer holder whole (as the Leaker does where
+/// count for the outer one, and the entry is `Rel<T>` alone (README, "Elided lifetimes": "That is
+/// how rustc 1.64 and later count"). Checked with rustc and the impl of the trait for a host type:
+/// 1.56, 1.61, 1.62 and 1.63 count the lifetimes that the inner signature does not bind, so they
+/// see two for the outer one (`&` and `'a`) and reject the copy (E0106, and on 1.56 "`impl` item
+/// signature doesn't match `trait` item signature"); 1.64, 1.65, 1.70, stable (1.98.1) and nightly
+/// accept it. So the change is in 1.64 (the README said 1.65 before F31 measured it, and says 1.64
+/// now; the crate's MSRV is 1.56 and the property test runs on the current toolchain only). The
+/// Leaker does not know the toolchain of the crate that expands its macros, so it follows the
+/// current one, and an item with a nested signature in an input is rejected or broken on an older
+/// rustc. Leaking the outer holder whole (as the Leaker does where
 /// the inner signature has no binder, `fn(&fn(&Rel<T>) -> &u8) -> &u8`) would be right on all, at
 /// the cost of more entries, and is a decision for the maintainers: it follows no rustc, so this test
 /// pins the rule that follows the current ones, and does not run old toolchains.

@@ -1,6 +1,7 @@
 //! The [`Referrer`], which rewrites copies of the analyzed items.
 
 use crate::context::{Context, ContextId, Enclosing, ModuleInfo, Scope, SelfRequirement};
+use crate::elided::{name_elided_in_bare_fn, name_elided_in_bound};
 use crate::encode::{complete_generics_args, param_as_arg, without_encoded_bounds, EncodeError};
 use crate::graph::TypeKey;
 use crate::util::{
@@ -659,14 +660,22 @@ impl Referrer {
                     None => syn::fold::fold_macro(self, i),
                 }
             }
-            fn fold_type_bare_fn(&mut self, i: TypeBareFn) -> TypeBareFn {
+            fn fold_type_bare_fn(&mut self, mut i: TypeBareFn) -> TypeBareFn {
+                // Before the binder is in scope: the one it gets names the lifetime that elision
+                // gives, which `Self` written as a type with lifetimes would break.
+                if let Some(replace) = self.replace_self {
+                    name_elided_in_bare_fn(replace.self_ty, &self.scopes[..], &mut i);
+                }
                 let depth = self.scopes.len();
                 self.scopes.extend(i.lifetimes.as_ref().map(Scope::binder));
                 let i = syn::fold::fold_type_bare_fn(self, i);
                 self.scopes.truncate(depth);
                 i
             }
-            fn fold_trait_bound(&mut self, i: TraitBound) -> TraitBound {
+            fn fold_trait_bound(&mut self, mut i: TraitBound) -> TraitBound {
+                if let Some(replace) = self.replace_self {
+                    name_elided_in_bound(replace.self_ty, &self.scopes[..], &mut i);
+                }
                 let depth = self.scopes.len();
                 self.scopes.extend(i.lifetimes.as_ref().map(Scope::binder));
                 let i = syn::fold::fold_trait_bound(self, i);
@@ -801,8 +810,11 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
     ///
     /// A `self_ty` with lifetimes (`::p::S<'a>`) gives more input lifetimes to a function pointer
     /// or `Fn(..)` that names `Self` in its inputs and has an elided lifetime in its output
-    /// (E0106). For the `Self` of a struct, an enum or a union, the Leaker leaks such a signature
-    /// whole or rejects the item. See [Elided lifetimes](crate#elided-lifetimes).
+    /// (E0106). The visitor names the lifetime that elision gives, with a fresh binder
+    /// (`for<'__tl_e0> fn(&'__tl_e0 ::p::S<'a>) -> &'__tl_e0 u8` for `fn(&Self) -> &u8`), in a
+    /// type, a bound and a where predicate. A lifetime that a path hides cannot be named: for the
+    /// `Self` of a struct, an enum or a union, the Leaker leaks such a signature whole or rejects
+    /// the item. See [Elided lifetimes](crate#elided-lifetimes).
     ///
     /// ```
     /// # use type_leak::*;
@@ -967,6 +979,10 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         parenthesize_bounded(&mut i.bounded_ty);
     }
     fn visit_trait_bound_mut(&mut self, i: &mut TraitBound) {
+        // A bound of the generics is not in a type, which the same rewriting handles.
+        if let Some(self_ty) = self.self_ty.as_ref().filter(|_| !self.own_self) {
+            name_elided_in_bound(self_ty, &self.scopes[..], i);
+        }
         let depth = self.scopes.len();
         self.scopes.extend(i.lifetimes.as_ref().map(Scope::binder));
         syn::visit_mut::visit_trait_bound_mut(self, i);

@@ -95,7 +95,7 @@ impl Scope {
         self.self_ty.as_ref()
     }
 
-    fn declares(&self, name: &str) -> bool {
+    pub(crate) fn declares(&self, name: &str) -> bool {
         self.params
             .iter()
             .any(|param| generic_param_name(param) == name)

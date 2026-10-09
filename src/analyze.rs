@@ -105,19 +105,29 @@ enum BinderInput<'a> {
 }
 
 /// A signature (a function pointer, the sugar of `Fn(..) -> R`, or a method) whose output has an
-/// elided lifetime that elision takes from the only lifetime of the inputs. The copy of a type with
+/// elided lifetime that elision takes from the only lifetime of the inputs (which a path may hide:
+/// `Ref<u8>`, so it is the one that the inputs do not show). The copy of a type with
 /// lifetimes in the inputs names them in the arguments of its projection, so the inputs have more
 /// lifetimes and elision fails (E0106). Such a type is not leaked alone: the type holding the
 /// signature is leaked as a whole instead if it can be, and it is an error otherwise. The same
-/// holds for `Self`, which the copy of a struct, an enum or a union writes as the type itself (see
+/// holds for `Self`, which the copy of a struct, an enum or a union writes as the type itself, but
+/// there the Referrer names the lifetime where it can (see
 /// [`AnalyzeVisitor::self_elision_broken()`]). See [Elided lifetimes](crate#elided-lifetimes).
 #[derive(Clone)]
 struct Elision {
     /// The depth of the type holding the signature, leaked whole instead (0 for a method or a
     /// bound, which no type holds).
     owner: usize,
-    /// The only lifetime of the inputs as written, `None` if it is elided.
+    /// The only lifetime of the inputs as written, `None` if it is elided or hidden.
     kept: Option<Lifetime>,
+    /// The inputs show no lifetime, so the one that the output has is hidden by a path
+    /// (`Ref<u8>` for `Ref<'a, u8>`), which the Leaker does not see: any lifetime that the copy adds
+    /// to the inputs breaks the elision.
+    hidden: bool,
+    /// The signature of a function pointer or of `Fn(..)`, whose elided lifetime the Referrer can
+    /// name with a `for<'e>` binder where `Visitor::with_self()` adds lifetimes to its inputs (see
+    /// [`AnalyzeVisitor::self_elision_broken()`]). A method has none.
+    binder: bool,
     /// The output, which has the elided lifetime.
     output: TokenStream,
 }
@@ -125,9 +135,11 @@ struct Elision {
 impl Elision {
     /// Returns what the copy must keep for a signature with these `inputs` and `output`, if its
     /// output relies on elision: it has an elided lifetime, and the inputs have exactly one
-    /// lifetime (else the original is not valid, or has no elision to keep).
+    /// lifetime (else the original is not valid, or has no elision to keep), or none that is seen,
+    /// so that a path hides it. `binder` is `true` for a function pointer or `Fn(..)`.
     fn of<'a>(
         owner: usize,
+        binder: bool,
         inputs: impl IntoIterator<Item = &'a Type>,
         output: &ReturnType,
     ) -> Option<Self> {
@@ -144,14 +156,18 @@ impl Elision {
         for input in inputs {
             lifetimes.visit_type(input);
         }
-        let kept = match (lifetimes.elided, lifetimes.named.len()) {
-            (1, 0) => None,
-            (0, 1) => lifetimes.named.pop(),
+        let (kept, hidden) = match (lifetimes.elided, lifetimes.named.len()) {
+            (1, 0) => (None, false),
+            (0, 1) => (lifetimes.named.pop(), false),
+            // An elided output with no lifetime in the inputs: the one a path hides.
+            (0, 0) => (None, true),
             _ => return None,
         };
         Some(Self {
             owner,
             kept,
+            hidden,
+            binder,
             output: quote!(#output),
         })
     }
@@ -173,7 +189,7 @@ impl Elision {
                 FnArg::Typed(arg) => inputs.push(&arg.ty),
             }
         }
-        Self::of(0, inputs, &sig.output)
+        Self::of(0, false, inputs, &sig.output)
     }
 
     /// Returns the lifetimes that the copy of a type with `context` adds to the inputs.
@@ -213,7 +229,7 @@ impl Elision {
 
 /// `true` if an output has an elided lifetime: a reference or a lifetime argument without a name,
 /// or `'_`. A function pointer or `Fn(..)` inside has its own elision.
-struct ElidedOutput(bool);
+pub(crate) struct ElidedOutput(pub(crate) bool);
 
 impl<'ast> Visit<'ast> for ElidedOutput {
     fn visit_type_reference(&mut self, i: &'ast TypeReference) {
@@ -231,9 +247,9 @@ impl<'ast> Visit<'ast> for ElidedOutput {
 /// the named ones count once. A function pointer or `Fn(..)` inside has its own, and so has a
 /// bound with a `for<..>` binder for the lifetimes it declares.
 #[derive(Default)]
-struct InputLifetimes {
-    elided: usize,
-    named: Vec<Lifetime>,
+pub(crate) struct InputLifetimes {
+    pub(crate) elided: usize,
+    pub(crate) named: Vec<Lifetime>,
     declared: Vec<Lifetime>,
 }
 
@@ -868,7 +884,13 @@ impl AnalyzeVisitor {
     /// union is a new item, so `Visitor::with_self()` writes `Self` as the type of the Leaker
     /// (`::p::S<'a>`), whereas `Self` itself names no lifetime to elision. The copy of an impl
     /// keeps `Self`, and so does a receiver (`self: Box<Self>`), which the Visitor does not
-    /// rewrite. See [`Elision`].
+    /// rewrite.
+    ///
+    /// The signature of a function pointer or of `Fn(..)` whose inputs show their one lifetime is
+    /// not broken: the Visitor names that lifetime with a `for<'e>` binder, in the inputs and in the
+    /// output, so that `Self` adds nothing to count (`Elision::binder`). What it cannot name is the
+    /// one that a path hides, and a method has no binder to write: those are broken. See
+    /// [`Elision`].
     fn self_elision_broken(&self, ty: &Type) -> Option<(Elision, Vec<Lifetime>)> {
         if self.in_receiver || self.self_written || !is_self_path(ty) {
             return None;
@@ -878,6 +900,9 @@ impl AnalyzeVisitor {
             _ => return None,
         };
         let elision = self.elisions.last()?.as_ref()?;
+        if elision.binder && !elision.hidden {
+            return None;
+        }
         let added = elision.added_by_self(self_ty);
         if added.is_empty() {
             None
@@ -1293,7 +1318,7 @@ impl AnalyzeVisitor {
         if let Some((elision, added)) = self.self_elision_broken(ty) {
             if elision.owner > 0 {
                 self.musts.push((elision.owner, quote!(#ty)));
-                let note = self_elision_note(&added, &elision.output, true);
+                let note = self_elision_note(&added, &elision, true);
                 inner.elision = Some((elision.owner, note));
                 inner.min_depth = inner.min_depth.min(elision.owner);
                 return self.decide_as_owner(elision.owner, inner);
@@ -1302,7 +1327,7 @@ impl AnalyzeVisitor {
             inner.min_depth = inner.min_depth.min(depth);
             let mut conflict = self.causes(inner.must_start, inner.impossible_start, depth);
             conflict.impossible.insert(0, elision.output.clone());
-            conflict.note = Some(self_elision_note(&added, &elision.output, false));
+            conflict.note = Some(self_elision_note(&added, &elision, false));
             self_conflict = Some(conflict);
         }
         if inner.min_depth != depth && self.is_ambiguous_owner(ty, depth, &inner) {
@@ -1341,13 +1366,13 @@ impl AnalyzeVisitor {
         };
         if let Some((elision, added)) = broken {
             if elision.owner > 0 {
-                let note = elision_note(&added, &elision.output, true);
+                let note = elision_note(&added, &elision, true);
                 inner.elision = Some((elision.owner, note));
                 return self.decide_as_owner(elision.owner, inner);
             }
             let mut conflict = self.causes(inner.must_start, inner.impossible_start, depth);
             conflict.impossible.insert(0, elision.output.clone());
-            conflict.note = Some(elision_note(&added, &elision.output, false));
+            conflict.note = Some(elision_note(&added, &elision, false));
             own = Some(Err(conflict));
         }
         if let Some(Ok(_)) = &own {
@@ -3040,6 +3065,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
     fn visit_type_bare_fn(&mut self, i: &TypeBareFn) {
         let elision = Elision::of(
             self.type_depth,
+            true,
             i.inputs.iter().map(|arg| &arg.ty),
             &i.output,
         );
@@ -3080,7 +3106,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
     }
 
     fn visit_parenthesized_generic_arguments(&mut self, i: &ParenthesizedGenericArguments) {
-        let elision = Elision::of(self.type_depth, &i.inputs, &i.output);
+        let elision = Elision::of(self.type_depth, true, &i.inputs, &i.output);
         self.with_bound_elided(|visitor| {
             visitor.elisions.push(elision);
             for input in &i.inputs {
@@ -3683,47 +3709,65 @@ fn binder_note(lifetime: &Lifetime, owned: bool) -> String {
     )
 }
 
+/// Where the elided lifetime of the output comes from, as the notes say it.
+fn elision_source(elision: &Elision) -> &'static str {
+    if elision.hidden {
+        "the only lifetime of the inputs, which a path hides (the Leaker does not see it)"
+    } else {
+        "the only lifetime of the inputs"
+    }
+}
+
+/// What to do to the signature where the copy cannot keep its elision: the lifetimes are named.
+fn elision_advice(elision: &Elision) -> &'static str {
+    if elision.hidden {
+        ": write the lifetime that the path hides (`Ref<'x, u8>`), and name it in the output"
+    } else {
+        ": name the lifetime of the inputs and of the output"
+    }
+}
+
 /// `owned`: the type holding the signature would be leaked instead.
-fn elision_note(added: &[Lifetime], output: &TokenStream, owned: bool) -> String {
+fn elision_note(added: &[Lifetime], elision: &Elision, owned: bool) -> String {
     let added: Vec<String> = added
         .iter()
         .map(|lifetime| format!("`{}`", lifetime))
         .collect();
     format!(
-        "the output `{}` has an elided lifetime, which elision takes from the only lifetime of the \
-         inputs, but a leaked type in the inputs has {} among its generics, and the copy names \
-         {} in the arguments of its projection, so the inputs have more than one lifetime \
-         (E0106){}",
-        output,
+        "the output `{}` has an elided lifetime, which elision takes from {}, but a leaked type in \
+         the inputs has {} among its generics, and the copy names {} in the arguments of its \
+         projection, so the inputs have more than one lifetime (E0106){}",
+        elision.output,
+        elision_source(elision),
         added.join(", "),
         if added.len() == 1 { "it" } else { "them" },
         if owned {
             ", so a type using them cannot be leaked alone, and the type holding the signature \
              would be leaked as a whole instead"
         } else {
-            ": name the lifetime of the inputs and of the output"
+            elision_advice(elision)
         }
     )
 }
 
 /// The note of a signature whose elision the copy breaks by writing a type with `added` lifetimes
 /// for `Self`.
-fn self_elision_note(added: &[Lifetime], output: &TokenStream, owned: bool) -> String {
+fn self_elision_note(added: &[Lifetime], elision: &Elision, owned: bool) -> String {
     let added: Vec<String> = added
         .iter()
         .map(|lifetime| format!("`{}`", lifetime))
         .collect();
     format!(
-        "the output `{}` has an elided lifetime, which elision takes from the only lifetime of the \
-         inputs, but `Self` in the inputs is a type that has {} among its generics, and the copy \
-         writes that type for `Self` (`Visitor::with_self()`), so the inputs have more than one \
-         lifetime (E0106){}",
-        output,
+        "the output `{}` has an elided lifetime, which elision takes from {}, but `Self` in the \
+         inputs is a type that has {} among its generics, and the copy writes that type for `Self` \
+         (`Visitor::with_self()`), so the inputs have more than one lifetime (E0106){}",
+        elision.output,
+        elision_source(elision),
         added.join(", "),
         if owned {
             ", so the type holding the signature would be leaked as a whole instead"
         } else {
-            ": name the lifetime of the inputs and of the output"
+            elision_advice(elision)
         }
     )
 }
@@ -3765,7 +3809,8 @@ fn bound_group<'a>(
         Some(PathArguments::Parenthesized(args)) => {
             inputs.extend(args.inputs.iter().map(BinderInput::Type));
             // An elided output has the only lifetime of the inputs, which the binder may declare.
-            let kept = Elision::of(0, &args.inputs, &args.output).and_then(|elision| elision.kept);
+            let kept =
+                Elision::of(0, true, &args.inputs, &args.output).and_then(|elision| elision.kept);
             output.extend(kept.filter(|kept| declares(lifetimes, kept) && !output.contains(kept)));
         }
         _ => (),

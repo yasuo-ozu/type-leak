@@ -626,6 +626,93 @@ fn test_visitor_with_self() {
     assert_eq!(quote!(#sig).to_string(), quote!(#expected).to_string());
 }
 
+/// Rewrites `sig` as a copy in the scope of `tr`, with `Self` written as `self_ty`.
+fn rewrite_with_self(tr: &ItemTrait, self_ty: Type, sig: Signature) -> String {
+    let (referrer, context) = referrer_of(tr.clone());
+    let mut sig = sig;
+    referrer
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .with_self(self_ty)
+        .visit_signature_mut(&mut sig);
+    quote!(#sig).to_string()
+}
+
+#[test]
+fn test_visitor_with_self_names_the_elided_lifetime() {
+    let tr: ItemTrait = parse_quote! { trait Tr { fn f(&self); } };
+    let host: Type = parse_quote!(Host<'h>);
+    let check = |sig: Signature, expected: Signature| {
+        assert_eq!(
+            rewrite_with_self(&tr, host.clone(), sig),
+            quote!(#expected).to_string()
+        );
+    };
+    // `Self` written as a type with lifetimes adds to the inputs of a function pointer, of a trait
+    // object or of the sugar of a bound, so the lifetime that elision gives is named.
+    check(
+        parse_quote!(fn f(&self, x: fn(&Self) -> &u8)),
+        parse_quote!(fn f(&self, x: for<'__tl_e0> fn(&'__tl_e0 Host<'h>) -> &'__tl_e0 u8)),
+    );
+    check(
+        parse_quote!(fn f(&self, x: Box<dyn Fn(&(u8, Self)) -> &u8 + 'static>)),
+        parse_quote!(fn f(&self, x: Box<dyn for<'__tl_e0> Fn(&'__tl_e0 (u8, Host<'h>)) -> &'__tl_e0 u8 + 'static>)),
+    );
+    check(
+        parse_quote!(fn f<F: Fn(&Self) -> &u8>(&self, f: F) where F: Fn(&Vec<Self>) -> Option<&u8>),
+        parse_quote!(
+            fn f<F: for<'__tl_e0> Fn(&'__tl_e0 Host<'h>) -> &'__tl_e0 u8>(&self, f: F)
+            where F: for<'__tl_e0> Fn(&'__tl_e0 Vec<Host<'h>>) -> Option<&'__tl_e0 u8>
+        ),
+    );
+    // A lifetime in a path counts, and `Self::A` is written as the qualified path.
+    check(
+        parse_quote!(fn f(&self, x: fn(::core::cell::Ref<'_, Self::A>) -> &u8)),
+        parse_quote!(
+            fn f(&self, x: for<'__tl_e0> fn(::core::cell::Ref<'__tl_e0, <Host<'h>>::A>) -> &'__tl_e0 u8)
+        ),
+    );
+    // The lifetime that the inputs name is the output's: no binder.
+    check(
+        parse_quote!(fn f(&self, x: for<'x> fn(&'x Self) -> &u8)),
+        parse_quote!(fn f(&self, x: for<'x> fn(&'x Host<'h>) -> &'x u8)),
+    );
+    // Signatures inside each other have a binder each, with a name that the outer one leaves.
+    check(
+        parse_quote!(fn f(&self, x: fn(&(Self, fn(&Self) -> &u8)) -> &u8)),
+        parse_quote!(
+            fn f(&self, x: for<'__tl_e0> fn(
+                &'__tl_e0 (Host<'h>, for<'__tl_e1> fn(&'__tl_e1 Host<'h>) -> &'__tl_e1 u8)
+            ) -> &'__tl_e0 u8)
+        ),
+    );
+    // The elision is not at stake: the output does not rely on it, `Self` is in the output only or
+    // in a signature of its own, the inputs name every lifetime, or the type has none.
+    for sig in [
+        parse_quote!(fn f(&self, x: fn(&Self) -> Self)),
+        parse_quote!(fn f(&self, x: fn(&u8) -> &Self)),
+        parse_quote!(fn f(&self, x: for<'e> fn(&'e Self) -> &'e u8)),
+        parse_quote!(fn f(&self, x: fn(&fn(&Self) -> Self) -> &u8)),
+        parse_quote!(fn f(&self, x: fn(Self, u8) -> u8)),
+    ] {
+        let sig: Signature = sig;
+        let expected = quote!(#sig).to_string();
+        let expected = expected.replace("Self", "Host < 'h >");
+        assert_eq!(rewrite_with_self(&tr, host.clone(), sig), expected);
+    }
+    let sig: Signature = parse_quote!(fn f(&self, x: fn(&Self) -> &u8));
+    assert_eq!(
+        rewrite_with_self(&tr, parse_quote!(__S), sig.clone()),
+        quote!(#sig).to_string().replace("Self", "__S")
+    );
+    // A lifetime that a path hides cannot be named: the signature is left as it is (the Leaker
+    // leaks it whole, or rejects the item).
+    let sig: Signature = parse_quote!(fn f(&self, x: fn(::core::slice::Iter<u8>, Self) -> &u8));
+    assert_eq!(
+        rewrite_with_self(&tr, host.clone(), sig.clone()),
+        quote!(#sig).to_string().replace("Self", "Host < 'h >")
+    );
+}
+
 #[test]
 fn test_nested_items_define_their_own_self() {
     let (referrer, context) = referrer_of(parse_quote! {

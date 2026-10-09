@@ -8,6 +8,7 @@ mod analysis;
 mod analyze;
 mod config;
 mod context;
+mod elided;
 mod encode;
 mod error;
 mod graph;

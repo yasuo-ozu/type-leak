@@ -113,9 +113,10 @@ pub struct Features {
     /// an impl, an ADT with lifetime parameters), or `Self::A` as `<Self as Tr<'a, ..>>::A` with
     /// the lifetime parameters of the trait: the input then has more lifetimes, and rustc cannot
     /// tell which one the output has (E0106, F15). The oracle of the test macro does not compare a
-    /// position that has it, and the Leaker rejects an item whose copy writes `Self` so, or leaks
-    /// the whole signature, so this is on by default (see `Features::parse()`). Off, such a sugar
-    /// is not generated.
+    /// position that has it, and the Referrer names the lifetime that elision gives (`for<'e>`,
+    /// F23), or the Leaker leaks the whole signature or rejects the item where it cannot (a path
+    /// hides the lifetime, F28), so this is on by default (see `Features::parse()`). Off, such a
+    /// sugar is not generated.
     pub self_elision: bool,
     /// An outlives bound that the original has only by the well-formedness of its signature
     /// (`Self::A: 'x` from `&'x mut Self::A`, with `Self: 'x` from `&'x self`), which the
@@ -173,7 +174,9 @@ pub struct Features {
     pub impl_trait_args: bool,
     /// A path that hides a lifetime in the inputs of an elided `fn(..) -> &R` or `Fn(..) -> &R`
     /// (`fn(::core::str::Chars, A) -> &R`), next to a type that adds lifetimes: E0106 in the copy
-    /// like F12, as the Leaker does not see the lifetime (F28: a bug, off by default).
+    /// like F12, as the Leaker did not see the lifetime (F28, fixed: on by default). An elided
+    /// output with no lifetime in the inputs has the hidden one, so the Leaker leaks the whole
+    /// signature or rejects the item.
     pub hidden_lifetimes: bool,
     /// `Rel<&'a T::Item>` in a method of a trait, where `'a` is a lifetime of the trait and `T` an
     /// iterator that does not outlive it: the signature implies `T::Item: 'a`, the Leaker records `T:
@@ -203,6 +206,7 @@ impl Features {
             impl_self_bound_cycle: true,
             trait_assoc_bound_cycle: true,
             iterator_item_cycle: true,
+            hidden_lifetimes: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
