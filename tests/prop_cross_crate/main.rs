@@ -35,6 +35,13 @@
 //!   `impl_self_outlives`, `fn_pointer_self`, `method_lifetime_paths`, `module_crate_paths`,
 //!   `elided_fn_generics`, or `all`, the test fails with the reproduction of that finding.
 //!
+//! The test is ignored by default: it is slow, as it builds the generated crates. Run it with
+//!
+//! ```text
+//! cargo test --test prop_cross_crate -- --ignored
+//! TYPE_LEAK_PROP_CASES=200 TYPE_LEAK_PROP_SEED=7 cargo test --test prop_cross_crate -- --ignored
+//! ```
+//!
 //! The sources of every case stay in `target/tmp/prop/ws-<seed>-<cases>/`, and each is a workspace
 //! member that builds on its own (`cargo build` there, with `CARGO_TARGET_DIR` as the test has it).
 
@@ -343,6 +350,7 @@ fn reason_head(detail: &str) -> String {
 }
 
 #[test]
+#[ignore = "slow, builds generated crates; run with `cargo test --test prop_cross_crate -- --ignored`"]
 fn random_items_leak_across_crates() {
     let cases: usize = env_or("TYPE_LEAK_PROP_CASES", 24);
     let seed: u64 = env_or("TYPE_LEAK_PROP_SEED", 1);
