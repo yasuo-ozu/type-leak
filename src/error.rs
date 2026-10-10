@@ -7,11 +7,16 @@ use template_quote::ToTokens;
 
 /// The error returned when an item cannot be analyzed by the [`Leaker`](crate::Leaker).
 ///
-/// It has one error per offending path or type. Each has notes: a fix if possible (e.g. "use
-/// `::std::vec::Vec` instead of `Vec`"), the [`CheckResult::impossible`] causes that stop it from
-/// being leaked as a whole, and the other paths in it that depend on the context (the rest of
-/// [`CheckResult::must`]), which are reported once the first is fixed.
-/// [`syn::Error`] and [`ToTokens`] render the notes as `note`s.
+/// It has one error per offending path or type: [`NotInternableError::items()`] returns them, each
+/// with its span, message and notes. The message is the headline of the cause where the fault is
+/// not that a path is relative (`Self`, the bound rules, a default that names `Self`:
+/// [`CheckResult::headline`]), and `use absolute path: '..'` where it is. Display writes the
+/// messages, one per line.
+///
+/// Each error has notes: a fix if possible (e.g. "use `::std::vec::Vec` instead of `Vec`"), the
+/// [`CheckResult::impossible`] causes that stop it from being leaked as a whole, and the other
+/// paths in it that depend on the context (the rest of [`CheckResult::must`]), which are reported
+/// once the first is fixed. [`syn::Error`] and [`ToTokens`] render the notes as `note`s.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum NotInternableError {
@@ -57,10 +62,47 @@ pub enum NotInternableError {
     SelfWithoutMeaning(Vec<TokenStream>),
 }
 
-struct Report {
-    tokens: TokenStream,
-    message: String,
-    notes: Vec<(Span, String)>,
+/// One error of a [`NotInternableError`]: an offending path, type or mention of `Self`.
+///
+/// Get them with [`NotInternableError::items()`] to report each one, for example as a
+/// separate diagnostic of a proc macro, with its own span and notes.
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let item: ItemTrait = parse_quote!(trait Tr: Clone { fn f(&self, a: MyType<'_>); });
+/// let err = Leaker::new().intern_trait(&item, true).err().unwrap();
+/// let items: Vec<_> = err.items().collect();
+/// assert_eq!(items.len(), 2);
+/// assert_eq!(items[0].message, "use absolute path: 'Clone'");
+/// assert_eq!(items[0].note(), Some("use `::core::clone::Clone` instead of `Clone`"));
+/// assert_eq!(items[1].message, "use absolute path: 'MyType < '_ >'");
+/// assert_eq!(items[1].tokens.to_string(), "MyType < '_ >");
+/// // The `Display` of the error is the messages, one per line.
+/// assert_eq!(err.to_string(), format!("{}\n{}", items[0].message, items[1].message));
+/// ```
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ErrorItem {
+    /// The offending path, type or mention of `Self`, as written.
+    pub tokens: TokenStream,
+    /// Where the error is reported: the span of `tokens`.
+    pub span: Span,
+    /// What is wrong: the headline of the cause where the fault is not that the path is relative
+    /// ([`CheckResult::headline`]; "`Self` has no meaning here"), and `use absolute path: '..'`
+    /// where it is.
+    pub message: String,
+    /// Why, and how to fix it, each with the span it is about, the most useful first: a suggestion
+    /// of the absolute path, the causes that stop the path from being leaked as a whole, and the
+    /// other paths that depend on the type context.
+    pub notes: Vec<(Span, String)>,
+}
+
+impl ErrorItem {
+    /// Returns the first note, which suggests how to fix the error, if there is one.
+    pub fn note(&self) -> Option<&str> {
+        self.notes.first().map(|(_, note)| note.as_str())
+    }
 }
 
 pub(crate) const SELF_NOTE: &str =
@@ -68,14 +110,15 @@ pub(crate) const SELF_NOTE: &str =
                          union, an impl or a trait, not by a module or generics";
 
 impl NotInternableError {
-    fn reports(&self) -> Vec<Report> {
+    fn reports(&self) -> Vec<ErrorItem> {
         let conflicts = match self {
             NotInternableError::RelativePath(conflicts) => conflicts,
             NotInternableError::SelfWithoutMeaning(selves) => {
                 return selves
                     .iter()
-                    .map(|tokens| Report {
+                    .map(|tokens| ErrorItem {
                         tokens: tokens.clone(),
+                        span: tokens.span(),
                         message: "`Self` has no meaning here".to_string(),
                         notes: vec![(tokens.span(), SELF_NOTE.to_string())],
                     })
@@ -118,8 +161,9 @@ impl NotInternableError {
                         format!("`{}` also depends on the type context", other),
                     )
                 }));
-                Some(Report {
+                Some(ErrorItem {
                     tokens: tokens.clone(),
+                    span: tokens.span(),
                     message: conflict
                         .headline
                         .clone()
@@ -130,11 +174,22 @@ impl NotInternableError {
             .collect()
     }
 
+    /// Returns the errors, one per offending path, type or mention of `Self`, in order.
+    ///
+    /// Each has its span, a message and notes, so a proc macro can report every one instead of
+    /// only the first ([`NotInternableError::span()`], [`NotInternableError::note()`]). The
+    /// message is the headline of the cause where the fault is not that a path is relative, and
+    /// `use absolute path: '..'` where it is. Display writes the messages, one per line. See
+    /// [`ErrorItem`] for an example. Never empty.
+    pub fn items(&self) -> impl Iterator<Item = ErrorItem> {
+        self.reports().into_iter()
+    }
+
     /// Returns the span of the first error.
     pub fn span(&self) -> Span {
         self.reports()
             .first()
-            .map_or_else(Span::call_site, |report| report.tokens.span())
+            .map_or_else(Span::call_site, |report| report.span)
     }
 
     /// Returns the note of the first error, which suggests how to fix it.
@@ -238,7 +293,7 @@ impl NotInternableError {
                     }
                     message.push('\n');
                 }
-                syn::Error::new(report.tokens.span(), message)
+                syn::Error::new(report.span, message)
             })
             .reduce(|mut combined, error| {
                 combined.combine(error);
@@ -281,7 +336,7 @@ impl NotInternableError {
         }
         for report in self.reports() {
             let mut diagnostic = proc_macro::Diagnostic::spanned(
-                unwrap_span(report.tokens.span()),
+                unwrap_span(report.span),
                 proc_macro::Level::Error,
                 report.message,
             );

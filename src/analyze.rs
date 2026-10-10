@@ -1277,7 +1277,11 @@ impl AnalyzeVisitor {
                 is_own: true,
                 optional: false,
                 note: Some("a default of a parameter cannot depend on `Self`".to_string()),
-                headline: None,
+                // The fault is not that the path is relative: the first cause is `Self`.
+                headline: Some(format!(
+                    "`{}` is in the default of a parameter, and names `Self`",
+                    quote!(#ty)
+                )),
             });
         }
         let context = match self.context_of(ty, inner) {

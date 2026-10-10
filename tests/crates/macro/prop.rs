@@ -172,75 +172,26 @@ fn repeater_impls(referrer: &Referrer, id: u64) -> Result<Vec<(Vec<Ident>, Token
     let repeater: Path = parse_quote!(crate::Repeater);
     let slots = RepeaterSlots::new(repeater.clone());
     // For `Self` bounded by the trait, the implementation is for `__S` (the implementor).
-    let marker: Type = parse_quote!(__S);
-    let replaced: Vec<(Type, Generics)> = referrer.iter_with_self(&marker).collect();
+    let self_param = ident("__S");
     let mut impls = Vec::new();
-    for (ix, (ty, generics)) in referrer.iter_with_generics().enumerate() {
-        let context = referrer.context(ix);
-        let (ty, generics) = match referrer.context_self(context) {
-            Some(SelfRequirement::Bound(_)) => (&replaced[ix].0, &replaced[ix].1),
-            _ => (ty, generics),
-        };
-        let self_in_impl: Type = match referrer.context_self(context) {
-            Some(SelfRequirement::Type(_)) => parse_quote!(Self),
-            _ => marker.clone(),
-        };
-        let encoded = slots
-            .encode_generics_params_to_ty_with_self(
-                &generics.params,
-                &self_in_impl,
-                referrer.context_self_outlives(context),
-            )
-            .map_err(Error::from)?;
-        let impl_params: Vec<GenericParam> = match referrer.context_self(context) {
-            Some(SelfRequirement::Bound(_)) => without_encoded_bounds(generics),
-            _ => referrer.impl_generics(context),
-        }
-        .params
-        .into_iter()
-        .collect();
-        // `where <__S>::A: 'x` as the first predicate: rustc reads `where<` as generics of the
-        // where clause ("reserved for future use"), so the bounded type is parenthesized.
-        let predicates: Vec<WherePredicate> = generics
-            .where_clause
-            .iter()
-            .flat_map(|wc| wc.predicates.iter())
-            .cloned()
-            .map(|mut predicate| {
-                if let WherePredicate::Type(PredicateType { bounded_ty, .. }) = &mut predicate {
-                    if matches!(bounded_ty, Type::Path(TypePath { qself: Some(q), .. }) if q.as_token.is_none())
-                    {
-                        parenthesized(bounded_ty);
-                    }
-                }
-                predicate
+    for ix in 0..referrer.iter().count() {
+        crate::check_plain(referrer, ix, &slots)?;
+        let r = referrer
+            .repeater_impl_with(ix, ImplSelf::Param(&self_param), |value, param| {
+                slots.encode_const(value, &param.ty)
             })
-            .collect();
-        let header = match referrer.context_self(context) {
-            Some(SelfRequirement::Bound(path)) => quote! {
-                impl<#(#impl_params,)* __S: ?::core::marker::Sized + #path>
-                    #repeater<#encoded, #id, #ix> for __S
-            },
-            Some(SelfRequirement::Type(self_ty)) => quote! {
-                impl<#(#impl_params),*> #repeater<#encoded, #id, #ix> for #self_ty
-            },
-            _ => quote! {
-                impl<#(#impl_params,)* __S: ?::core::marker::Sized>
-                    #repeater<#encoded, #id, #ix> for __S
-            },
-        };
-        let module = referrer
-            .context_module(context)
+            .map_err(Error::from)?;
+        let module = r
+            .module
             .and_then(|m| referrer.module_path(m))
             .map(|p| p.to_vec())
             .unwrap_or_default();
+        let (impl_generics, _, where_clause) = r.generics.split_for_impl();
+        let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
         impls.push((
             module,
             quote! {
-                #header
-                where
-                    #(#predicates,)*
-                {
+                impl #impl_generics #repeater<#args, #id, #ix> for #self_ty #where_clause {
                     type Type = #ty;
                 }
             },
@@ -856,18 +807,14 @@ impl Projector<'_> {
                 .ok_or_else(|| Error::new(Span::call_site(), "test macro: no type for Self"))?,
             _ => parse_quote!(()),
         };
-        let args = self
-            .referrer
-            .generic_args(ix, &self.root_params, &self.root_args)
-            .map_err(Error::from)?;
         let slots = RepeaterSlots::new(self.repeater.clone());
-        let encoded = slots
-            .encode_generics_args_to_ty_with_self(
-                &args,
-                &self.referrer.generics(ix).params,
-                &self_ty,
-                self.referrer.context_self_outlives(context),
-            )
+        let site =
+            UseSite::substituting(&self.root_params, &self.root_args).with_self(self_ty.clone());
+        let encoded = self
+            .referrer
+            .entry_args_with(ix, &site, |value, param| {
+                slots.encode_const(value, &param.ty)
+            })
             .map_err(Error::from)?;
         let (repeater, id) = (&self.repeater, self.id);
         Ok(parse_quote!(<#self_ty as #repeater<#encoded, #id, #ix>>::Type))

@@ -111,6 +111,70 @@ Notes:
 - `Referrer::visitor(context, ..)` is the rewriter of a copy. `context` is the scope of the copy, the top-level `ContextId` of the call that analyzed what the copy is made from, and the visited syntax is inside it. `Referrer::expand(context, ty, ..)` rewrites one type instead of a whole item. Give them the whole type or item. See [Outlives bounds](#outlives-bounds).
 - `Referrer::visitor()` and `Referrer::expand()` panic if `context` is not one of the `Referrer::contexts()`.
 
+## Helpers for macro authors
+
+Steps 2 and 3 above are what every macro that uses `type-leak` writes by hand. These helpers write them once, with the encoding that the Leaker itself expects, so the impls and the paths of the copy cannot disagree.
+
+- `Referrer::required()` and `Referrer::has_required()` list the entries that need a Repeater impl. `iter()` and `is_empty()` also count the optional entries: absolute paths of other crates, which a non-strict Referrer leaves as written.
+- `Referrer::repeater_impl(ix, ImplSelf::Param(&ident))` describes the Repeater impl of an entry: the generics to declare (without the encoded bounds, with the parameter for the implementor and its bound when `Self` is a trait), the type the impl is for, the first trait argument, the leaked type with `Self` replaced, and the module to write the impl in. `ImplSelf::Marker(&ty)` writes it for a marker type instead, if the entry does not name `Self`. `Referrer::is_plain(ix)` is `true` for an entry that needs no generics, no `Self` and no module, so `impl Repeater<(), ID, IX> for Marker` is right for it.
+- `Referrer::entry_args(ix, &UseSite)` returns that first trait argument at a use site. `UseSite::identity()` is a copy in the scope of the analysis, where every generic keeps its name. `UseSite::substituting(params, args)` gives the generics of the analyzed item their arguments, as in `impl MyLeaker<u8> for ..`, and `with_self()` says what `Self` is. Both have a `_with` variant that takes a closure for the const parameters, such as `|value, param| slots.encode_const(value, &param.ty)` for `RepeaterSlots`.
+- `encode_generics_args_to_ty()` is the counterpart of `encode_generics_params_to_ty()` for arguments, for generics with no const parameter or only `usize` ones.
+- `NotInternableError::items()` returns one `ErrorItem` per offending path, with its span, message and notes. The message is `use absolute path: '..'` where the fault is that the path is relative (the notes say why it cannot be leaked as a whole), and the headline of the cause in the other cases, such as `Self`, the bound rules and a default that names `Self`.
+
+```rust
+use syn::visit_mut::VisitMut;
+use syn::{parse_quote, GenericArgument, Ident, ItemImpl, ItemTrait, Signature};
+use type_leak::{ImplSelf, Leaker, UseSite};
+
+let item: ItemTrait = parse_quote! {
+    pub trait MyLeaker<T> {
+        fn f(&self, t: T) -> MyWrap<T>;
+        fn g(&self) -> MyType;
+    }
+};
+let mut leaker = Leaker::new();
+let top_level = leaker.intern_trait(&item, false).unwrap();
+let referrer = leaker.finish();
+
+// 2. One impl for each required entry.
+let self_param: Ident = parse_quote!(__S);
+let impls: Vec<ItemImpl> = referrer
+    .required()
+    .map(|(ix, _)| {
+        let r = referrer.repeater_impl(ix, ImplSelf::Param(&self_param)).unwrap();
+        let (impl_generics, _, where_clause) = r.generics.split_for_impl();
+        let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+        parse_quote! {
+            impl #impl_generics path::Repeater<#args, 42u64, #ix> for #self_ty #where_clause {
+                type Type = #ty;
+            }
+        }
+    })
+    .collect();
+let expected: ItemImpl = parse_quote! {
+    impl<T, __S: ?::core::marker::Sized> path::Repeater<(T,), 42u64, 0usize> for __S {
+        type Type = MyWrap<T>;
+    }
+};
+assert_eq!(impls[0], expected);
+
+// 3. The copy in `impl MyLeaker<u8> for ..`, with the path through the Repeater of each entry.
+let trait_args: Vec<GenericArgument> = vec![parse_quote!(u8)];
+let site = UseSite::substituting(&item.generics.params, &trait_args);
+let mut sig: Signature = parse_quote!(fn f(&self, t: T) -> MyWrap<T>);
+referrer
+    .clone()
+    .visitor(top_level, |_ty, ix| {
+        let args = referrer.entry_args(ix, &site).unwrap();
+        parse_quote!(<Self as path::Repeater<#args, 42u64, #ix>>::Type)
+    })
+    .visit_signature_mut(&mut sig);
+let expected: Signature = parse_quote!(
+    fn f(&self, t: T) -> <Self as path::Repeater<(u8,), 42u64, 0usize>>::Type
+);
+assert_eq!(sig, expected);
+```
+
 ## Const generics
 
 A const parameter is treated like a type parameter. The Repeater needs a type that carries its value. `encode_generics_params_to_ty()` encodes `const N: usize` as `[(); N]`. For other primitive types, define the Repeater with `repeater_definition()`. It adds a defaulted const slot for each primitive type, and `RepeaterSlots` encodes values into them. The generated Repeater needs Rust 1.59 and the 2018 edition, while `type-leak` itself supports 1.56.

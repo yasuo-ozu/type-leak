@@ -8,6 +8,54 @@ use syn::spanned::Spanned;
 use syn::*;
 use template_quote::quote;
 
+/// Encodes generic arguments into the type that [`encode_generics_params_to_ty()`] gives for
+/// `params`, with `const N: usize` as `[(); N]`.
+///
+/// It is [`encode_generics_args_to_ty_with()`] without the closure, for generics that have no const
+/// parameter or only `usize` ones (which [`encode_generics_params_to_ty()`] encodes alike). For other
+/// const types use [`RepeaterSlots`](crate::RepeaterSlots). The arguments are completed and matched as
+/// in [`encode_generics_args_to_ty_with()`], and the errors are its errors.
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let generics: Generics = parse_quote!(<'a, T: 'a, const N: usize>);
+/// let args: Vec<GenericArgument> = vec![
+///     parse_quote!('static),
+///     parse_quote!(u8),
+///     parse_quote!(3),
+/// ];
+/// let ty = encode_generics_args_to_ty(&args, &generics.params).unwrap();
+/// // `encode_generics_params_to_ty()` gives `(&'a (), T, [(); N], &'a T)` for the parameters.
+/// assert_eq!(ty, parse_quote!((&'static (), u8, [(); 3], &'static u8)));
+/// ```
+pub fn encode_generics_args_to_ty<'a>(
+    iter: impl IntoIterator<Item = &'a GenericArgument>,
+    params: &Punctuated<GenericParam, Token![,]>,
+) -> std::result::Result<Type, EncodeError> {
+    encode_generics_args_with_params(iter, params, None, |value, _| Ok(array_length(value)))
+}
+
+/// `[(); value]`, as `encode_generics_params_to_ty()` encodes a const parameter.
+pub(crate) fn array_length(value: &Expr) -> Type {
+    let value = normalize_const_arg(value);
+    parse_quote!([(); #value])
+}
+
+/// Like [`array_length()`], but only for a parameter of type `usize`, the type of an array length:
+/// the encoding of the helpers that have no closure for the consts.
+pub(crate) fn usize_array_length(
+    value: &Expr,
+    param: &ConstParam,
+) -> std::result::Result<Type, EncodeError> {
+    match const_param_primitive(&param.ty) {
+        Some("usize") => Ok(array_length(value)),
+        _ => Err(EncodeError::UnsupportedConstType(Box::new(
+            param.ty.clone(),
+        ))),
+    }
+}
+
 /// Encodes generic arguments into the type that [`encode_generics_params_to_ty_with()`] gives for
 /// `params`.
 ///
@@ -566,6 +614,13 @@ pub enum EncodeError {
     /// Its bound would default to `'a` in `&'a T` and to another lifetime elsewhere. Write it, e.g.
     /// `dyn Tr + 'static`.
     UnboundedTraitObject(Box<Type>),
+    /// The type of an entry names `Self`, but the Repeater impl was asked for a marker type
+    /// ([`ImplSelf::Marker`](crate::ImplSelf::Marker)).
+    ///
+    /// Such an impl is for what `Self` stands for: any implementor of the trait, or the type. Use
+    /// [`ImplSelf::Param`](crate::ImplSelf::Param). An entry for which
+    /// [`Referrer::is_plain()`](crate::Referrer::is_plain) holds never gives this error.
+    NeedsSelf(Box<Type>),
 }
 
 impl std::fmt::Display for EncodeError {
@@ -586,6 +641,12 @@ impl std::fmt::Display for EncodeError {
                  in the encoding of a type with a lifetime bound; write it (e.g. `+ 'static`)",
                 quote!(#ty)
             ),
+            EncodeError::NeedsSelf(ty) => write!(
+                f,
+                "the type '{}' names `Self`, so its Repeater impl cannot be for a marker type; use \
+                 `ImplSelf::Param`",
+                quote!(#ty)
+            ),
         }
     }
 }
@@ -600,6 +661,7 @@ impl EncodeError {
             EncodeError::UnexpectedArgument(arg) => arg.span(),
             EncodeError::MissingArgument(param) => param.span(),
             EncodeError::UnboundedTraitObject(ty) => ty.span(),
+            EncodeError::NeedsSelf(ty) => ty.span(),
         }
     }
 }

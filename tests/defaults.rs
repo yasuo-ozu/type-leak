@@ -152,7 +152,10 @@ fn test_default_cannot_depend_on_self() {
         trait Tr<T, U = Rel<Self>> {}
     );
     let err = Leaker::new().intern_trait(&tr, true).err().unwrap();
-    assert_eq!(err.to_string(), "use absolute path: 'Self'");
+    assert_eq!(
+        err.to_string(),
+        "`Rel < Self >` is in the default of a parameter, and names `Self`"
+    );
     assert_eq!(
         err.note().as_deref(),
         Some("a default of a parameter cannot depend on `Self`")

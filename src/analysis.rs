@@ -48,9 +48,13 @@ pub struct CheckResult {
     /// meaning). Reported first.
     pub note: Option<String>,
     /// The headline of the error, if the fault is not that the path of the type is relative, which
-    /// the default `use absolute path: '..'` says. Set for a type that uses a generic whose bound
-    /// mentions a `Self` that has no name here (see [Self rules](crate#self-rules)): the fault is
-    /// that bound, `must` is the type that uses it, and `impossible` is the mention of `Self`.
+    /// the default `use absolute path: '..'` says. [`NotInternableError`] shows it as the message
+    /// of the error. Set for a type that uses a generic whose bound mentions a `Self` that has no
+    /// name here (see [Self rules](crate#self-rules)): the fault is that bound, `must` is the type
+    /// that uses it, and `impossible` is the mention of `Self`. Also set for the other rules
+    /// that are not about a path (the bound rules, `Self::A` where `Self` is a type), and for a
+    /// type in the default of a parameter that names `Self`. A relative path that cannot be leaked
+    /// as a whole (`MyType<'_>`, E0195, E0106) has none: the fault is the path, and `note` says why.
     pub headline: Option<String>,
 }
 

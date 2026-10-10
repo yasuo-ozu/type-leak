@@ -252,18 +252,97 @@ impl Referrer {
         self.musts[ix]
     }
 
+    /// Returns the required entries with their indices: those with [`Referrer::must()`], which
+    /// come first.
+    ///
+    /// These are the entries that need a Repeater impl. The others are optional entries (absolute
+    /// paths of other crates, left as written by a non-strict Referrer: see
+    /// [`Referrer::allow_ambiguous_crate_name()`]), which [`Referrer::iter()`] and
+    /// [`Referrer::is_empty()`] include.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let mut leaker = Leaker::new();
+    /// leaker
+    ///     .intern_struct(&parse_quote!(struct S { a: Rel, b: ::foo::X }), true)
+    ///     .unwrap();
+    /// let referrer = leaker.finish();
+    /// // `::foo::X` is optional: another crate may name it differently.
+    /// assert_eq!(referrer.iter().count(), 2);
+    /// assert_eq!(referrer.required().count(), 1);
+    /// let (ix, ty) = referrer.required().next().unwrap();
+    /// assert_eq!((ix, ty), (0, &parse_quote!(Rel)));
+    /// assert!(referrer.has_required());
+    /// ```
+    pub fn required(&self) -> impl Iterator<Item = (usize, &Type)> {
+        self.leak_types
+            .iter()
+            .enumerate()
+            .filter(move |(ix, _)| self.musts[*ix])
+    }
+
+    /// Returns `true` if some entry is required: [`Referrer::required()`] is not empty.
+    ///
+    /// A copy needs a Repeater impl only then. [`Referrer::is_empty()`] is `false` also for a
+    /// Referrer that has optional entries only.
+    pub fn has_required(&self) -> bool {
+        self.musts.iter().any(|&must| must)
+    }
+
     /// Returns `true` if there are no entries.
+    ///
+    /// Optional entries (absolute paths of other crates, left as written by a non-strict
+    /// Referrer) count. Use [`Referrer::has_required()`] to know whether any Repeater impl is
+    /// needed.
     pub fn is_empty(&self) -> bool {
         self.leak_types.is_empty()
     }
 
     /// Returns the types of the entries, by index.
     ///
-    /// A plain impl for any type is right only for an entry whose context has no generics, no `Self`
-    /// and no module. Otherwise use [`Referrer::iter_with_generics()`] or
-    /// [`Referrer::iter_with_self()`].
+    /// It includes the optional entries (absolute paths of other crates, left as written by a
+    /// non-strict Referrer): use [`Referrer::required()`] for the entries that need a Repeater
+    /// impl.
+    ///
+    /// A plain impl for any type is right only for an entry for which [`Referrer::is_plain()`]
+    /// holds. Otherwise use [`Referrer::iter_with_generics()`], [`Referrer::iter_with_self()`] or
+    /// [`Referrer::repeater_impl()`].
     pub fn iter(&self) -> impl Iterator<Item = &Type> {
         self.leak_types.iter()
+    }
+
+    /// Returns `true` if the `ix`-th entry can be written by an impl with no generics.
+    ///
+    /// That is so if its context has no generics and no where clause, does not name `Self` and
+    /// has no module ([`Referrer::context_generics()`], [`Referrer::context_self()`] and
+    /// [`Referrer::context_module()`]). Then `impl Repeater<(), ID, IX> for Marker { type Type = ..; }`
+    /// is right for any marker, for any type, and in any module. It does not matter whether the
+    /// entry is required.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let mut leaker = Leaker::new();
+    /// leaker
+    ///     .intern_trait(&parse_quote!(trait Tr<T> { fn f(&self, a: Rel, b: Wrap<T>) -> Self::A; }), true)
+    ///     .unwrap();
+    /// let referrer = leaker.finish();
+    /// let plain: Vec<_> = referrer.iter().enumerate().filter(|(ix, _)| referrer.is_plain(*ix)).collect();
+    /// // `Wrap<T>` uses a generic, and `Self::A` names `Self`.
+    /// assert_eq!(plain.len(), 1);
+    /// assert_eq!(plain[0].1, &parse_quote!(Rel));
+    /// ```
+    pub fn is_plain(&self, ix: usize) -> bool {
+        let context = self.contexts[ix];
+        let generics = self.context_generics(context);
+        generics.params.is_empty()
+            && generics
+                .where_clause
+                .as_ref()
+                .map_or(true, |clause| clause.predicates.is_empty())
+            && self.context_self(context).is_none()
+            && self.context_module(context).is_none()
     }
 
     /// Returns the generics that the `ix`-th entry uses, as [`Referrer::context_generics()`] does.
@@ -303,6 +382,8 @@ impl Referrer {
     }
 
     /// Returns the generics that a Repeater impl declares for the entries of `context`.
+    ///
+    /// [`Referrer::repeater_impl()`] describes the whole impl of an entry, with these.
     ///
     /// These are [`Referrer::context_generics()`] without the lifetime bounds that the trait
     /// arguments encode. Other bounds and where predicates stay. For other generics use
@@ -387,6 +468,8 @@ impl Referrer {
     }
 
     /// Like [`Referrer::iter_with_generics()`], with `Self` replaced by `self_ty`, usually `__S`.
+    ///
+    /// [`Referrer::repeater_impl()`] does this and the rest of what a Repeater impl needs.
     ///
     /// Use it for an entry whose [`context_self()`](Referrer::context_self) is `Bound`, or for a
     /// marker type. `Self::A::B` becomes `<self_ty>::A::B`. Qualified paths and macro tokens are
@@ -483,6 +566,9 @@ impl Referrer {
     /// ([`Referrer::complete_args()`]). A generic named like one of them takes its argument. Any
     /// other generic is passed by its own name, so the copy must declare it. `Self` is not an
     /// argument. Fails with [`EncodeError::MissingArgument`] if `completed_args` are too few.
+    ///
+    /// To get the encoded trait argument of the Repeater, which also needs the lifetime bounds,
+    /// `Self: 'a` and the consts, use [`Referrer::entry_args()`], which calls this.
     pub fn generic_args(
         &self,
         ix: usize,

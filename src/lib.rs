@@ -12,6 +12,7 @@ mod elided;
 mod encode;
 mod error;
 mod graph;
+mod helpers;
 mod leaker;
 mod referrer;
 mod repeater;
@@ -25,11 +26,13 @@ pub use crate::analysis::CheckResult;
 pub use crate::config::LeakerConfig;
 pub use crate::context::{ContextId, SelfRequirement};
 pub use crate::encode::{
-    encode_generics_args_to_ty_with, encode_generics_args_to_ty_with_self,
-    encode_generics_params_to_ty, encode_generics_params_to_ty_with,
-    encode_generics_params_to_ty_with_self, without_encoded_bounds, EncodeError,
+    encode_generics_args_to_ty, encode_generics_args_to_ty_with,
+    encode_generics_args_to_ty_with_self, encode_generics_params_to_ty,
+    encode_generics_params_to_ty_with, encode_generics_params_to_ty_with_self,
+    without_encoded_bounds, EncodeError,
 };
-pub use crate::error::NotInternableError;
+pub use crate::error::{ErrorItem, NotInternableError};
+pub use crate::helpers::{ImplSelf, RepeaterImpl, UseSite};
 pub use crate::leaker::Leaker;
 pub use crate::referrer::{Referrer, Visitor};
 pub use crate::repeater::{repeater_definition, RepeaterSlots};

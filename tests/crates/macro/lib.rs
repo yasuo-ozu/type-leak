@@ -137,6 +137,42 @@ fn param_as_arg(param: &GenericParam) -> TokenStream {
     }
 }
 
+/// Checks `Referrer::is_plain()` of the `ix`-th entry against what the impl needs: an entry is
+/// plain if and only if its impl for a marker type declares nothing (no generics, no where clause,
+/// no argument, no module) and does not name `Self`.
+pub(crate) fn check_plain(referrer: &Referrer, ix: usize, slots: &RepeaterSlots) -> Result<()> {
+    let marker: Type = parse_quote!(__Marker);
+    let r = referrer.repeater_impl_with(ix, ImplSelf::Marker(&marker), |value, param| {
+        slots.encode_const(value, &param.ty)
+    });
+    let needs_nothing = match r {
+        Ok(r) => {
+            let predicates = r.generics.where_clause.iter().flat_map(|w| &w.predicates);
+            r.generics.params.is_empty()
+                && predicates.count() == 0
+                && r.args == parse_quote!(())
+                && r.module.is_none()
+        }
+        // The type names `Self`.
+        Err(EncodeError::NeedsSelf(_)) => false,
+        Err(e) => return Err(e.into()),
+    };
+    if referrer.is_plain(ix) == needs_nothing {
+        return Ok(());
+    }
+    let ty = referrer.iter().nth(ix).unwrap();
+    Err(Error::new(
+        Span::call_site(),
+        format!(
+            "`Referrer::is_plain({})` is {}, but the impl for a marker needs {}: {}",
+            ix,
+            referrer.is_plain(ix),
+            if needs_nothing { "nothing" } else { "more" },
+            quote!(#ty)
+        ),
+    ))
+}
+
 /// Analyzes a trait without allowing any relative path, reporting a `NotInternableError` with
 /// its `ToTokens` implementation (for tests/diagnostic.rs).
 #[proc_macro_attribute]
@@ -323,66 +359,23 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let vis = &item_trait.vis;
     let slots = RepeaterSlots::new(repeater.clone());
 
-    // The Repeater's implementation of each type declares exactly the generics the type uses, and
+    // The Repeater's implementation of each entry declares exactly the generics the type uses, and
     // encodes them. If the type mentions `Self`, it is implemented for the implementor of the
-    // trait (bounded by the trait with its parameters) or for the type `Self` is.
+    // trait (bounded by the trait with its parameters) or for the type `Self` is: that is what
+    // `Referrer::repeater_impl()` describes, with the consts encoded by the slots.
     let mut repeater_impls = TokenStream::new();
-    // For `Self` bounded by the trait, the implementation is for `__S` (the implementor), where
-    // `Self` of the trait is not available: so the types and generics are those with `Self`
-    // replaced by `__S` (see `Referrer::iter_with_self()`), e.g. `Self::Item` is `<__S>::Item`
-    // and `Self: Sized` is `__S: Sized`. For `Self` as a type, the implementation is for that
-    // type, where `Self` means it.
-    let marker: Type = parse_quote!(__S);
-    let replaced: Vec<(Type, Generics)> = referrer.iter_with_self(&marker).collect();
-    for (ix, (ty, generics)) in referrer.iter_with_generics().enumerate() {
-        let context = referrer.context(ix);
-        let (ty, generics) = match referrer.context_self(context) {
-            Some(SelfRequirement::Bound(_)) => (&replaced[ix].0, &replaced[ix].1),
-            _ => (ty, generics),
-        };
-        // `Self: 'a` is encoded as `&'a Self` like a lifetime bound (`&'a __S` in the
-        // implementation for any type of the trait), so the header implies it and the
-        // implementation does not declare it.
-        let self_in_impl: Type = match referrer.context_self(context) {
-            Some(SelfRequirement::Type(_)) => parse_quote!(Self),
-            _ => marker.clone(),
-        };
-        let encoded = slots
-            .encode_generics_params_to_ty_with_self(
-                &generics.params,
-                &self_in_impl,
-                referrer.context_self_outlives(context),
-            )
+    let self_param: Ident = parse_quote!(__S);
+    for ix in 0..referrer.iter().count() {
+        let r = referrer
+            .repeater_impl_with(ix, ImplSelf::Param(&self_param), |value, param| {
+                slots.encode_const(value, &param.ty)
+            })
             .map_err(Error::from)?;
-        // The lifetime bounds in the trait arguments are implied by the header, so they are not
-        // declared. For `Bound`, `generics` has `Self` replaced (see `iter_with_self()`).
-        let impl_params: Vec<GenericParam> = match referrer.context_self(context) {
-            Some(SelfRequirement::Bound(_)) => without_encoded_bounds(generics),
-            _ => referrer.impl_generics(context),
-        }
-        .params
-        .into_iter()
-        .collect();
-        let predicates = generics.where_clause.iter().flat_map(|wc| wc.predicates.iter());
-        let header = match referrer.context_self(context) {
-            Some(SelfRequirement::Bound(path)) => quote! {
-                impl<#(#impl_params,)* __S: ?::core::marker::Sized + #module::#path>
-                    #repeater<#encoded, #id, #ix> for __S
-            },
-            Some(SelfRequirement::Type(self_ty)) => quote! {
-                impl<#(#impl_params),*> #repeater<#encoded, #id, #ix> for #self_ty
-            },
-            // `None`: the implementation is for any type.
-            _ => quote! {
-                impl<#(#impl_params,)* __S: ?::core::marker::Sized>
-                    #repeater<#encoded, #id, #ix> for __S
-            },
-        };
+        check_plain(&referrer, ix, &slots)?;
+        let (impl_generics, _, where_clause) = r.generics.split_for_impl();
+        let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
         repeater_impls.extend(quote! {
-            #header
-            where
-                #(#predicates,)*
-            {
+            impl #impl_generics #repeater<#args, #id, #ix> for #self_ty #where_clause {
                 type Type = #ty;
             }
         });
@@ -733,13 +726,11 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
         // `Self` is what the context says: the implementor of the trait.
         let mut visitor = referrer.clone().visitor(context, |_, ix| {
             let projection = (|| -> Result<Type> {
-                let args = referrer.generic_args(ix, params, &trait_params)?;
-                let encoded = slots.encode_generics_args_to_ty_with_self(
-                    &args,
-                    &referrer.generics(ix).params,
-                    &self_in_copy,
-                    referrer.context_self_outlives(referrer.context(ix)),
-                )?;
+                let site =
+                    UseSite::substituting(params, &trait_params).with_self(self_in_copy.clone());
+                let encoded = referrer.entry_args_with(ix, &site, |value, param| {
+                    slots.encode_const(value, &param.ty)
+                })?;
                 Ok(parse_quote!(<#self_in_copy as #repeater<#encoded, #id, #ix>>::Type))
             })();
             projection.unwrap_or_else(|e| {
@@ -790,12 +781,10 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
                       root_params: &Punctuated<GenericParam, Token![,]>,
                       root_args: &[GenericArgument]|
      -> Result<Type> {
-        let args = referrer.generic_args(ix, root_params, root_args)?;
-        let encoded = slots.encode_generics_args_to_ty_with_self(
-            &args,
-            &referrer.generics(ix).params,
-            &parse_quote!(Self),
-            referrer.context_self_outlives(referrer.context(ix)),
+        let encoded = referrer.entry_args_with(
+            ix,
+            &UseSite::substituting(root_params, root_args),
+            |value, param| slots.encode_const(value, &param.ty),
         )?;
         Ok(parse_quote!(<Self as #repeater<#encoded, #id, #ix>>::Type))
     };
