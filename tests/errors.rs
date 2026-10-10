@@ -505,3 +505,104 @@ fn notes_explain_conflicts() {
          \x20 = note: `RelB < '_ >` also depends on the type context\n"
     );
 }
+
+#[test]
+fn a_conflict_that_is_not_about_the_path_has_a_headline_of_its_own() {
+    // E0195: the fault is the lifetime that the copy would leave unconstrained, which an absolute
+    // path is only one way to fix (the README has the others).
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait {
+            fn f<'b>(&self, x: Wrap<'b>) -> &'b u8;
+            fn g<'c>(&self, x: &'c dyn RelTrait) -> &'c u8;
+        }
+    })
+    .unwrap();
+    let err = Leaker::new().intern_trait(&item, true).err().unwrap();
+    assert_eq!(
+        err.to_string(),
+        "`Wrap < 'b >` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)\n\
+         `RelTrait` leaves the lifetime `'c` of the method unconstrained in the copy (E0195)"
+    );
+    // The note says why.
+    let items: Vec<_> = err.items().collect();
+    assert!(items[0].note().unwrap().starts_with("it names `'b`"));
+    assert!(items[1]
+        .note()
+        .unwrap()
+        .starts_with("the lifetime of the trait object defaults to `'c`"));
+
+    // A type that uses a generic whose bound mentions `Self`, where `Self` cannot be leaked: the
+    // fault is the bound.
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait {
+            fn f<T: ::core::cmp::PartialEq<Self>>(&self, x: Wrap<T>);
+        }
+    })
+    .unwrap();
+    let err = Leaker::new().intern_trait(&item, false).err().unwrap();
+    assert_eq!(
+        err.to_string(),
+        "`Wrap < T >` has a generic whose bound mentions `Self`, which cannot be leaked"
+    );
+    assert_eq!(
+        err.note().as_deref(),
+        Some("the bounds of its generics mention `Self`, which cannot be leaked")
+    );
+
+    // A relative path that the type is leaked as a whole for keeps the headline of the path.
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait {
+            fn f(&self, x: MyType<'_>);
+        }
+    })
+    .unwrap();
+    let err = Leaker::new().intern_trait(&item, true).err().unwrap();
+    assert_eq!(err.to_string(), "use absolute path: 'MyType < '_ >'");
+}
+
+#[test]
+fn a_type_that_is_leaked_alone_is_no_cause_of_the_conflict_around_it() {
+    // `Self` cannot be leaked here, so `<Self as Tr<u8>>::X` cannot be leaked as a whole, and its
+    // trait is relative (`Tr`). `u8` in the arguments of the trait is leaked alone, whatever
+    // happens to the type that holds it: it is no error once `Tr` is absolute, so the notes do not
+    // name it.
+    let leak = |ty: Type| {
+        Leaker::new()
+            .enter_impl(&Generics::default(), &parse_quote!(B), false, |view| {
+                view.visit_type(&ty)
+            })
+            .err()
+            .unwrap()
+    };
+    let err = leak(parse_quote!(<Self as super::Tr<u8>>::X));
+    let items: Vec<_> = err.items().collect();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].message,
+        "use absolute path: 'super :: Tr < u8 > :: X'"
+    );
+    assert_eq!(
+        items[0]
+            .notes
+            .iter()
+            .map(|(_, note)| note.as_str())
+            .collect::<Vec<_>>(),
+        ["it cannot be leaked as a whole because of `Self`"]
+    );
+    // The paths that are no entry on their own are still listed: the type around `u8` is leaked
+    // whole (`Rel`, relative), and what it holds cannot be (`Tr`, with `Self`).
+    let err = leak(parse_quote!(Rel<<Self as Tr<u8>>::X>));
+    let items: Vec<_> = err.items().collect();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]
+            .notes
+            .iter()
+            .map(|(_, note)| note.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "it cannot be leaked as a whole because of `Self`",
+            "`Tr < u8 > :: X` also depends on the type context"
+        ]
+    );
+}

@@ -1,6 +1,6 @@
 //! The [`Referrer`], which rewrites copies of the analyzed items.
 
-use crate::context::{Context, ContextId, Enclosing, ModuleInfo, Scope, SelfRequirement};
+use crate::context::{Context, ContextId, Enclosing, Gat, ModuleInfo, Scope, SelfRequirement};
 use crate::elided::{name_elided_in_bare_fn, name_elided_in_bound};
 use crate::encode::{complete_generics_args, param_as_arg, without_encoded_bounds, EncodeError};
 use crate::graph::TypeKey;
@@ -205,7 +205,7 @@ impl Referrer {
             found.module().map_or(ModulePos::Outside, ModulePos::In)
         };
         (
-            Scope::new(found.generics(), found.self_ty().cloned()),
+            Scope::new(found.generics(), found.self_ty().cloned()).with_gats(found.gats().to_vec()),
             found.self_ty().cloned(),
             module,
         )
@@ -1116,7 +1116,17 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
     }
     fn visit_item_trait_mut(&mut self, i: &mut ItemTrait) {
         let declares = SelfRequirement::of_trait(&i.ident, &i.generics);
+        let gats = Gat::of_items(&i.items);
+        let depth = self.scopes.len();
         let mut visitor = self.enter(&mut i.attrs, &mut i.generics, Some(declares), true);
+        // The scope of the trait knows what its generic associated types require, as the Leaker's
+        // does. If the trait does not declare its generics (they are those of the context), the
+        // scope of the context has them.
+        if visitor.scopes.len() > depth {
+            if let Some(scope) = visitor.scopes.last_mut() {
+                scope.set_gats(gats);
+            }
+        }
         for supertrait in i.supertraits.iter_mut() {
             visitor.visit_type_param_bound_mut(supertrait);
         }
@@ -1242,8 +1252,11 @@ impl Referrer {
     // T::A` or `&'a <T as Tr>::A` with `T` a generic (`T::A: 'a`, and no `T: 'a`). 7: so have
     // those of `&'a <Self as Tr<..>>::A` and `&'a Self::A<'b>` (the predicate, and no `'b: 'a` or
     // `T: 'a`), and of a `Self::A` that a where clause equates (what it equals is mentioned); no
-    // projection of `Self` records `Self: 'a` any more.
-    pub const FORMAT_VERSION: u32 = 7;
+    // projection of `Self` records `Self: 'a` any more. 8: the top-level context of a trait scope
+    // carries its generic associated types with outlives (`type G<'b> where Self: 'b ;`), and the
+    // context of an entry that names one has what its where clause requires (`Self: 'x`), as the
+    // Referrer computes it for a copy.
+    pub const FORMAT_VERSION: u32 = 8;
 }
 
 /// Parses a [`Referrer`] written by its [`ToTokens`] implementation.
@@ -1339,6 +1352,18 @@ impl Parse for Referrer {
                 }
                 input.parse::<Token![;]>()?;
             }
+            // The associated types of the trait of the scope, with the outlives they require.
+            let mut gats = Vec::new();
+            let gats_span = input.span();
+            while input.peek(Token![type]) {
+                gats.push(Gat::parse(input)?);
+            }
+            if !gats.is_empty() && !matches!(self_ty, Some(SelfRequirement::Bound(_))) {
+                return Err(Error::new(
+                    gats_span,
+                    "the associated types of a trait need `Self: Trait ;` before them",
+                ));
+            }
             let (mut module, mut module_info) = (None, None);
             if input.parse::<Option<Token![mod]>>()?.is_some() {
                 if input.peek(token::Brace) {
@@ -1360,11 +1385,15 @@ impl Parse for Referrer {
                     if self_ty.is_some() || !self_outlives.is_empty() {
                         return Err(in_module(self_span, "where `Self` has no meaning"));
                     }
+                    if !gats.is_empty() {
+                        return Err(in_module(gats_span, "which has no trait"));
+                    }
                     modules.insert(context, info);
                     Context::module_scope(context.index())
                 }
                 None => Context::new(generics, self_ty)
                     .with_self_outlives(self_outlives)
+                    .with_gats(gats)
                     .with_module(module),
             };
             context_map.insert(context, parsed);
@@ -1512,6 +1541,7 @@ impl ToTokens for Referrer {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         // Grammar: tag [count] then one group per context in ascending id order (at least one):
         // [# id] [<generics> where .. ;] [Self: path ; | Self = Type ;] [Self: 'a + 'b ;]
+        // [type G<'b> where Self: 'b ; ..]
         // [mod 3 ; | mod { path = [a], hint = "h", parent = 1 } ;] ( [?] [@[crate, ..]] Type, .. )
         // `# id` only after a gap in the ids. `()` if no entry. `?`: optional. `@[..]`: crates named.
         let tag = format!("{}{}", FORMAT_TAG_PREFIX, Self::FORMAT_VERSION);
@@ -1540,6 +1570,9 @@ impl ToTokens for Referrer {
             }
             if !outlives.is_empty() {
                 tokens.extend(quote!(Self : #(for lifetime in outlives)+ { #lifetime } ;));
+            }
+            for gat in self.get_context(context).gats() {
+                tokens.extend(quote!(#gat));
             }
             if let Some(info) = self.modules.get(&context) {
                 let fields = [

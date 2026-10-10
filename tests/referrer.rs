@@ -513,7 +513,10 @@ fn test_has_self() {
     let err = leak("fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> Wrap<T>;")
         .err()
         .unwrap();
-    assert_eq!(err.to_string(), "use absolute path: 'Wrap < T >'");
+    assert_eq!(
+        err.to_string(),
+        "`Wrap < T >` has a generic whose bound mentions `Self`, which cannot be leaked"
+    );
     assert_eq!(
         err.note().as_deref(),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
@@ -840,4 +843,98 @@ fn test_extern_crates_and_trait_aliases_shadow_and_declare() {
             trait Alias<T> = ::x::Conv<T, P<0usize>>;
         })
     );
+}
+
+#[test]
+fn the_associated_types_of_a_trait_with_outlives_are_in_its_top_level_context() {
+    // The Referrer computes the context of a signature alone, with no trait around it (what a
+    // macro that copies the methods does), so the top-level context of the trait carries the
+    // outlives relations of its generic associated types that an entry depends on.
+    let tr: ItemTrait = parse_quote!(
+        trait Tr<T> {
+            type G<'b, U: 'b>
+            where
+                T: 'b,
+                Self: 'b,
+                U: ::core::clone::Clone;
+            type H;
+            fn m<'x>(&'x self, a: Rel<&'x Self::G<'x, T>>);
+        }
+    );
+    let mut leaker = type_leak::Leaker::new();
+    let context = leaker.intern_trait(&tr, true).unwrap();
+    let referrer = leaker.finish();
+    let text = quote!(#referrer).to_string();
+    // Only the outlives are kept (`U: Clone` is for the method to write), and a type with none
+    // (`H`) is not.
+    assert!(
+        text.ends_with("type G < 'b , U > where U : 'b , T : 'b , Self : 'b ; ()"),
+        "{}",
+        text
+    );
+    // The entry has what the where clause of `G` requires, with its parameters substituted.
+    assert!(
+        text.contains(
+            "< 'x , T : 'x > where Self :: G < 'x , T > : 'x ; Self : Tr < T > ; Self : 'x ;"
+        ),
+        "{}",
+        text
+    );
+    // It is read back, and finds the entry in a signature alone.
+    let parsed: Referrer = parse2(quote!(#referrer)).unwrap();
+    assert_eq!(parsed, referrer);
+    let TraitItem::Fn(method) = &tr.items[2] else {
+        panic!()
+    };
+    let mut sig = method.sig.clone();
+    parsed
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visit_signature_mut(&mut sig);
+    assert_eq!(
+        quote!(#sig).to_string(),
+        quote!(fn m<'x>(&'x self, a: P<0usize>)).to_string()
+    );
+    // Without it (the trait with no items, as `enter_trait()` has it) the entry has the predicate
+    // only.
+    use syn::visit::Visit;
+    let mut leaker = type_leak::Leaker::new();
+    leaker
+        .enter_trait(&parse_quote!(Tr), &tr.generics, true, |view| {
+            let TraitItem::Fn(method) = &tr.items[2] else {
+                panic!()
+            };
+            view.visit_signature(&method.sig);
+        })
+        .unwrap();
+    let referrer = leaker.finish();
+    let text = quote!(#referrer).to_string();
+    assert!(!text.contains("Self : 'x"), "{}", text);
+    assert!(!text.contains("type G"), "{}", text);
+}
+
+#[test]
+fn malformed_associated_types_in_a_context_are_errors() {
+    let tag = tag();
+    let ok = |text: &str| {
+        let tokens: proc_macro2::TokenStream = format!("\"{}\" {}", tag, text).parse().unwrap();
+        parse2::<Referrer>(tokens)
+    };
+    assert!(ok("Self : Tr ; type G < 'b > where Self : 'b ; (Rel)").is_ok());
+    assert!(
+        ok("Self : Tr ; type G < 'b > where Self : 'b ; type H where Self : 'static ; (Rel)")
+            .is_ok()
+    );
+    for text in [
+        // The associated types are the ones of a trait: `Self` is the implementor.
+        "type G < 'b > where Self : 'b ; (Rel)",
+        "Self = S ; type G < 'b > where Self : 'b ; (Rel)",
+        // A type with no outlives is not kept.
+        "Self : Tr ; type G < 'b > ; (Rel)",
+        "Self : Tr ; type G < 'b > where Self : Clone ; (Rel)",
+        // They come before the module, and a module has no trait.
+        "Self : Tr ; mod { } ; type G < 'b > where Self : 'b ; (Rel)",
+        "type G < 'b > where Self : 'b ; mod { } ; ()",
+    ] {
+        assert!(ok(text).is_err(), "{}", text);
+    }
 }

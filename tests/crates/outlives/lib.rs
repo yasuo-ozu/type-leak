@@ -1066,14 +1066,14 @@ pub mod m {
     // The return type mentions the lifetime of the method, and no other argument keeps it as
     // written (E0195 where the copy is implemented): the reference cannot be leaked.
     check_leak! {
-        { error: "use absolute path: 'RelTr'" }
+        { error: "`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)" }
         { }
         trait LocalUnconstrainedRef {
             fn f<'b>(&self, x: &'b dyn RelTr) -> &'b u8;
         }
     }
     check_leak! {
-        { error: "use absolute path: 'RelTr'\nuse absolute path: 'RelTr2'" }
+        { error: "`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)\n`RelTr2` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)" }
         { }
         trait LocalUnconstrainedRefs {
             fn f<'b>(&self, x: &'b dyn RelTr, y: &'b dyn RelTr2) -> &'b u8;
@@ -1099,7 +1099,7 @@ pub mod m {
     }
     // But some argument which mentions it, without keeping it as written, does not exempt it.
     check_leak! {
-        { error: "use absolute path: 'RelTr'" }
+        { error: "`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)" }
         { }
         trait LocalMentionedAlone {
             fn f<'b>(&self, x: ::std::vec::Vec<&'b u8>) -> &'b dyn RelTr;
@@ -1127,14 +1127,14 @@ pub mod m {
     // relative trait, or a bare identifier which may be a const (`y` is then not leaked as a whole,
     // the identifier alone is, but `x` is left with nothing which keeps `'b`).
     check_leak! {
-        { error: "use absolute path: 'RelTr'\nuse absolute path: 'RelTr2'" }
+        { error: "`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)\n`RelTr2` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)" }
         { }
         trait LocalNotKeptByRelative {
             fn f<'b>(&self, x: &'b dyn RelTr, y: &'b dyn RelTr2) -> &'b u8;
         }
     }
     check_leak! {
-        { error: "use absolute path: 'RelTr'" }
+        { error: "`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)" }
         { }
         trait LocalNotKeptByConst {
             fn f<'b>(&self, x: &'b dyn RelTr, y: &'b dyn ::core::convert::AsRef<SIZE>) -> &'b u8;
@@ -1146,7 +1146,7 @@ pub mod m {
     // other type can only be an optional entry, which cannot be leaked there (E0195 for it as
     // well), so it is copied as it is.
     check_leak! {
-        { error: "use absolute path: 'RelTr'" }
+        { error: "`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)" }
         { }
         trait LocalNotKeptByExternal {
             fn f<'b>(&self, x: &'b dyn RelTr, y: &'b dyn ::other::Tr) -> &'b u8;
@@ -1184,7 +1184,7 @@ pub mod m {
         }
     }
     check_leak! {
-        { error: "use absolute path: 'RelTr'" }
+        { error: "`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)" }
         { }
         trait LocalUnconstrained {
             fn f<'b>(&self, x: ::core::cell::Ref<'b, dyn RelTr>) -> &'b u8;

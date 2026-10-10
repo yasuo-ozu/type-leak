@@ -913,7 +913,13 @@ fn test_reduce_roots_path_with_a_lifetime_the_copy_would_leave_unconstrained() {
     ] {
         let item: ItemTrait = item;
         let err = error_of(&item);
-        assert!(err.contains("use absolute path: 'RelTr'"), "{}", err);
+        assert!(
+            err.contains(
+                "`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)"
+            ),
+            "{}",
+            err
+        );
         assert!(err.contains(note), "{}", err);
         assert!(err.contains("E0195"), "{}", err);
         assert!(
@@ -1185,7 +1191,14 @@ fn test_reduce_roots_reference_with_a_lifetime_the_copy_would_leave_unconstraine
     ];
     for (item, lifetime) in errors {
         let err = error_of(&item);
-        assert!(err.contains("use absolute path: 'RelTr'"), "{}", err);
+        assert!(
+            err.contains(&format!(
+                "`RelTr` leaves the lifetime `'{0}` of the method unconstrained in the copy (E0195)",
+                lifetime
+            )),
+            "{}",
+            err
+        );
         assert!(
             err.contains(&format!(
                 "the lifetime of the trait object defaults to `'{0}`, a lifetime of the method \

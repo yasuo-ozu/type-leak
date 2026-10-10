@@ -5,7 +5,7 @@ use crate::analyze::{
     declared_names, AnalyzeVisitor, Finished, ModuleNames, Res, ScopeSpec, Scopes,
 };
 use crate::config::LeakerConfig;
-use crate::context::{Context, ContextId, Contexts, SelfRequirement};
+use crate::context::{Context, ContextId, Contexts, Gat, SelfRequirement};
 #[cfg(doc)]
 use crate::error::NotInternableError;
 use crate::graph::{is_whole_reference, NodeKey, TypeGraph};
@@ -147,9 +147,14 @@ impl Leaker {
     /// The generics of the item are those of the Leaker, and `Self` is the implementor
     /// ([`SelfRequirement::Bound`]). An entry that names `Self` is written for the implementors.
     /// For `allow_self` see [`Leaker::intern_struct()`]. This is [`Leaker::enter_trait()`] with the
-    /// item visited.
+    /// item visited, and with its generic associated types known: a projection that names one that
+    /// has outlives bounds (`type G<'b> where Self: 'b;`) requires them
+    /// ([Outlives bounds](crate#outlives-bounds)).
     pub fn intern_trait(&mut self, item: &ItemTrait, allow_self: bool) -> Res<ContextId> {
-        self.enter_trait(&item.ident, &item.generics, allow_self, |view| {
+        // The scope knows the generic associated types of the trait: what they require is part of
+        // the context of an entry that names them.
+        let gats = Gat::of_items(&item.items);
+        self.enter_trait_of(&item.ident, &item.generics, gats, allow_self, |view| {
             syn::visit::visit_item_trait(view, item)
         })
         .map(|(context, ())| context)
@@ -261,7 +266,9 @@ impl Leaker {
     /// Returns the top-level context and the result of `f`. `Self` is the implementor, built from
     /// `ident` and the parameters ([`SelfRequirement::Bound`]). For `allow_self` see
     /// [`Leaker::intern_struct()`]. Context, errors and rollback are as in
-    /// [`Leaker::enter_generics()`].
+    /// [`Leaker::enter_generics()`]. The items of the trait are not known here, so the generic
+    /// associated types it declares have no outlives bounds for a projection that names them (use
+    /// [`Leaker::intern_trait()`], or write the bound).
     pub fn enter_trait<R>(
         &mut self,
         ident: &Ident,
@@ -417,8 +424,10 @@ impl Scopes for Leaker {
         let scope_self = spec
             .declared_self()
             .filter(|declared| names_self(&effects, declared));
-        let top_level =
-            module.unwrap_or_else(|| self.contexts.intern(Context::new(root, scope_self)));
+        let top_level = module.unwrap_or_else(|| {
+            let context = Context::new(root, scope_self).with_gats(spec.declared_gats());
+            self.contexts.intern(context)
+        });
         self.top_levels.insert(top_level);
         self.top_levels.extend(top_levels);
         Ok((top_level, result))

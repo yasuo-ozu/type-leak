@@ -5,8 +5,8 @@ use crate::analysis::{
     PendingType,
 };
 use crate::context::{
-    binder_lifetimes, Context, ContextId, Contexts, Enclosing, ModuleInfo, Scope, SelfRequirement,
-    UnnameableSelf,
+    binder_lifetimes, Context, ContextId, Contexts, Enclosing, Gat, ModuleInfo, Scope,
+    SelfRequirement, UnnameableSelf,
 };
 use crate::encode::is_const_param_ty;
 use crate::error::{NotInternableError, SELF_NOTE};
@@ -303,7 +303,7 @@ pub(crate) enum ScopeSpec {
     Generics {
         generics: Generics,
         /// What `Self` is inside, if the scope declares it. `None` keeps the `Self` around.
-        declares: Option<DeclaredSelf>,
+        declares: Option<Box<DeclaredSelf>>,
         /// The trait of an impl, checked on entering the scope like the root of a trait bound: it
         /// must not depend on the context, but its arguments are analyzed by the walk of the impl.
         trait_path: Option<Box<Path>>,
@@ -315,6 +315,9 @@ pub(crate) struct DeclaredSelf {
     allow_self: bool,
     /// `Self` is a type that the copy writes (the self type of an impl), not the item itself.
     written: bool,
+    /// The generic associated types of the trait, if the scope is that of a trait whose items the
+    /// Leaker sees (see [`Gat`]).
+    gats: Vec<Gat>,
 }
 
 impl ScopeSpec {
@@ -322,6 +325,17 @@ impl ScopeSpec {
         match self {
             Self::Module { .. } => Generics::default(),
             Self::Generics { generics, .. } => generics.clone(),
+        }
+    }
+
+    /// The generic associated types of the trait that the scope declares, if it sees them.
+    pub(crate) fn declared_gats(&self) -> Vec<Gat> {
+        match self {
+            Self::Generics {
+                declares: Some(declared),
+                ..
+            } => declared.gats.clone(),
+            _ => Vec::new(),
         }
     }
 
@@ -391,20 +405,13 @@ pub(crate) trait Scopes {
     fn enter_declaring<R>(
         &mut self,
         generics: &Generics,
-        requirement: SelfRequirement,
-        allow_self: bool,
-        written: bool,
+        declares: DeclaredSelf,
         trait_path: Option<&Path>,
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
-        let declares = Some(DeclaredSelf {
-            requirement,
-            allow_self,
-            written,
-        });
         let spec = ScopeSpec::Generics {
             generics: generics.clone(),
-            declares,
+            declares: Some(Box::new(declares)),
             trait_path: trait_path.map(|path| Box::new(path.clone())),
         };
         self.enter_spec(spec, f)
@@ -417,8 +424,13 @@ pub(crate) trait Scopes {
         allow_self: bool,
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
-        let requirement = SelfRequirement::of_item(ident, generics);
-        self.enter_declaring(generics, requirement, allow_self, false, None, f)
+        let declares = DeclaredSelf {
+            requirement: SelfRequirement::of_item(ident, generics),
+            allow_self,
+            written: false,
+            gats: Vec::new(),
+        };
+        self.enter_declaring(generics, declares, None, f)
     }
 
     fn enter_impl<R>(
@@ -441,8 +453,13 @@ pub(crate) trait Scopes {
         allow_self: bool,
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
-        let requirement = SelfRequirement::Type(self_ty.clone());
-        self.enter_declaring(generics, requirement, allow_self, true, trait_path, f)
+        let declares = DeclaredSelf {
+            requirement: SelfRequirement::Type(self_ty.clone()),
+            allow_self,
+            written: true,
+            gats: Vec::new(),
+        };
+        self.enter_declaring(generics, declares, trait_path, f)
     }
 
     fn enter_trait<R>(
@@ -452,8 +469,25 @@ pub(crate) trait Scopes {
         allow_self: bool,
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
-        let requirement = SelfRequirement::of_trait(ident, generics);
-        self.enter_declaring(generics, requirement, allow_self, false, None, f)
+        self.enter_trait_of(ident, generics, Vec::new(), allow_self, f)
+    }
+
+    /// Like `enter_trait()` for a trait whose items the Leaker sees, with their `gats`.
+    fn enter_trait_of<R>(
+        &mut self,
+        ident: &Ident,
+        generics: &Generics,
+        gats: Vec<Gat>,
+        allow_self: bool,
+        f: impl FnOnce(&mut View<'_>) -> R,
+    ) -> Res<(ContextId, R)> {
+        let declares = DeclaredSelf {
+            requirement: SelfRequirement::of_trait(ident, generics),
+            allow_self,
+            written: false,
+            gats,
+        };
+        self.enter_declaring(generics, declares, None, f)
     }
 }
 
@@ -561,7 +595,10 @@ pub(crate) struct AnalyzeVisitor {
     /// declaring scope gives `Self` a meaning. `self_ty` is `None` meanwhile.
     in_default: Option<bool>,
     modules: Vec<ModuleFrame>,
-    musts: Vec<(usize, TokenStream)>,
+    /// The causes that depend on the context: the depth of the type that has it, the path, and
+    /// whether an entry that is leaked alone has it (so it is no conflict of the type around: see
+    /// [`AnalyzeVisitor::conflict_causes()`]).
+    musts: Vec<(usize, TokenStream, bool)>,
     impossibles: Vec<TokenStream>,
     frame: Frame,
     type_depth: usize,
@@ -721,16 +758,40 @@ impl AnalyzeVisitor {
     }
 
     fn causes(&self, must_start: usize, impossible_start: usize, depth: usize) -> CheckResult {
-        let mut must: Vec<&(usize, TokenStream)> = self.musts[must_start..].iter().collect();
-        must.sort_by_key(|(d, _)| *d);
+        let mut must: Vec<&(usize, TokenStream, bool)> = self.musts[must_start..].iter().collect();
+        must.sort_by_key(|(d, _, _)| *d);
         CheckResult {
-            is_own: must.first().map_or(false, |(d, _)| *d == depth),
-            must: must.into_iter().map(|(_, m)| m.clone()).collect(),
+            is_own: must.first().map_or(false, |(d, _, _)| *d == depth),
+            must: must.into_iter().map(|(_, m, _)| m.clone()).collect(),
             impossible: self.impossibles[impossible_start..].to_vec(),
             optional: false,
             note: None,
             headline: None,
         }
+    }
+
+    /// Like [`AnalyzeVisitor::causes()`] for a conflict of the type at `depth`, which cannot be
+    /// leaked whole. A path in a type inside it that is leaked alone (an entry) is no cause of the
+    /// conflict, and it is no error once the first cause is fixed: `u8` in `<Self as Tr<u8>>::X`,
+    /// where `Self` is what cannot be leaked. Only the paths that the type has to be rid of are
+    /// listed, so the notes name those.
+    fn conflict_causes(
+        &self,
+        must_start: usize,
+        impossible_start: usize,
+        depth: usize,
+    ) -> CheckResult {
+        let mut result = self.causes(must_start, impossible_start, depth);
+        let mut must: Vec<&(usize, TokenStream, bool)> = self.musts[must_start..]
+            .iter()
+            .filter(|(_, _, covered)| !covered)
+            .collect();
+        must.sort_by_key(|(d, _, _)| *d);
+        if !must.is_empty() {
+            result.is_own = must.first().map_or(false, |(d, _, _)| *d == depth);
+            result.must = must.into_iter().map(|(_, m, _)| m.clone()).collect();
+        }
+        result
     }
 
     /// Visits `ty` and returns what it found at its own depth: the causes, whether it is an
@@ -798,7 +859,7 @@ impl AnalyzeVisitor {
     }
 
     fn push_must(&mut self, must: TokenStream) {
-        self.musts.push((self.type_depth, must));
+        self.musts.push((self.type_depth, must, false));
         self.frame.min_depth = self.frame.min_depth.min(self.type_depth);
     }
 
@@ -1022,10 +1083,15 @@ impl AnalyzeVisitor {
                     self.self_written = declared.written;
                     self.allow_self = declared.allow_self;
                 }
+                let gats = declares
+                    .as_ref()
+                    .map_or_else(Vec::new, |declared| declared.gats.clone());
                 if root {
                     self.scopes[0].set_self(self.self_ty.clone());
+                    self.scopes[0].set_gats(gats);
                 } else {
-                    self.scopes.push(Scope::new(generics, self.self_ty.clone()));
+                    self.scopes
+                        .push(Scope::new(generics, self.self_ty.clone()).with_gats(gats));
                 }
                 if declares.is_some() {
                     self.self_depth = self.scopes.len();
@@ -1148,6 +1214,14 @@ impl AnalyzeVisitor {
             .self_ty
             .clone()
             .filter(|declared| names_self(&self.frame.effects[mark.effects..], declared));
+        // The generic associated types of that `Self`, which an entry that names them depends on.
+        let scope_gats = scope_self.as_ref().map_or_else(Vec::new, |declared| {
+            self.scopes
+                .iter()
+                .rev()
+                .find(|scope| scope.self_ty() == Some(declared) && !scope.gats().is_empty())
+                .map_or_else(Vec::new, |scope| scope.gats().to_vec())
+        });
         self.leave_scope(mark, error.is_some());
         if let Some(error) = error {
             return Err(error);
@@ -1155,7 +1229,7 @@ impl AnalyzeVisitor {
         let top_level = module.unwrap_or_else(|| {
             // The scope is in the module around it, if any.
             let around = self.modules.last().map(|module| module.id);
-            let context = Context::new(spec.declared_generics(), scope_self);
+            let context = Context::new(spec.declared_generics(), scope_self).with_gats(scope_gats);
             self.contexts.intern(context.with_module(around))
         });
         self.top_levels.push(top_level);
@@ -1241,7 +1315,8 @@ impl AnalyzeVisitor {
         inner: &Frame,
     ) -> std::result::Result<Context, CheckResult> {
         if self.impossibles.len() > inner.impossible_start {
-            let mut conflict = self.causes(inner.must_start, inner.impossible_start, depth);
+            let mut conflict =
+                self.conflict_causes(inner.must_start, inner.impossible_start, depth);
             conflict.note = inner
                 .binder
                 .as_ref()
@@ -1253,13 +1328,11 @@ impl AnalyzeVisitor {
                         .as_ref()
                         .filter(|(owner, _)| *owner == depth)?;
                     Some(note.clone())
-                })
-                .or_else(|| {
-                    inner
-                        .unconstrained
-                        .as_ref()
-                        .map(|lifetime| unconstrained_note(lifetime, true))
                 });
+            if let (None, Some(lifetime)) = (&conflict.note, &inner.unconstrained) {
+                conflict.note = Some(unconstrained_note(lifetime, true));
+                conflict.headline = unconstrained_headline(&conflict, lifetime);
+            }
             if let (Some(cause), Some(SelfRequirement::Type(self_ty))) =
                 (&inner.assoc_self, &self.self_ty)
             {
@@ -1306,7 +1379,11 @@ impl AnalyzeVisitor {
                 note: Some(
                     "the bounds of its generics mention `Self`, which cannot be leaked".to_string(),
                 ),
-                headline: None,
+                // The fault is the bound, not the path of the type that uses it.
+                headline: Some(format!(
+                    "`{}` has a generic whose bound mentions `Self`, which cannot be leaked",
+                    quote!(#ty)
+                )),
             }),
             None => match self.associated_self_in_bounds(&context) {
                 Some(conflict) => Err(conflict.of(ty)),
@@ -1345,15 +1422,16 @@ impl AnalyzeVisitor {
         let mut self_conflict = None;
         if let Some((elision, added)) = self.self_elision_broken(ty) {
             if elision.owner > 0 {
-                self.musts.push((elision.owner, quote!(#ty)));
+                self.musts.push((elision.owner, quote!(#ty), false));
                 let note = self_elision_note(&added, &elision, true);
                 inner.elision = Some((elision.owner, note));
                 inner.min_depth = inner.min_depth.min(elision.owner);
                 return self.decide_as_owner(elision.owner, inner);
             }
-            self.musts.push((depth, quote!(#ty)));
+            self.musts.push((depth, quote!(#ty), false));
             inner.min_depth = inner.min_depth.min(depth);
-            let mut conflict = self.causes(inner.must_start, inner.impossible_start, depth);
+            let mut conflict =
+                self.conflict_causes(inner.must_start, inner.impossible_start, depth);
             conflict.impossible.insert(0, elision.output.clone());
             conflict.note = Some(self_elision_note(&added, &elision, false));
             self_conflict = Some(conflict);
@@ -1380,7 +1458,8 @@ impl AnalyzeVisitor {
                 inner.binder = Some((owner, lifetime));
                 return self.decide_as_owner(owner, inner);
             }
-            let mut conflict = self.causes(inner.must_start, inner.impossible_start, depth);
+            let mut conflict =
+                self.conflict_causes(inner.must_start, inner.impossible_start, depth);
             conflict.impossible.insert(0, quote!(#lifetime));
             conflict.note = Some(binder_note(&lifetime, false));
             own = Some(Err(conflict));
@@ -1398,7 +1477,8 @@ impl AnalyzeVisitor {
                 inner.elision = Some((elision.owner, note));
                 return self.decide_as_owner(elision.owner, inner);
             }
-            let mut conflict = self.causes(inner.must_start, inner.impossible_start, depth);
+            let mut conflict =
+                self.conflict_causes(inner.must_start, inner.impossible_start, depth);
             conflict.impossible.insert(0, elision.output.clone());
             conflict.note = Some(elision_note(&added, &elision, false));
             own = Some(Err(conflict));
@@ -1583,6 +1663,12 @@ impl AnalyzeVisitor {
                 }
             }
         };
+        // An entry leaked alone covers the paths in it: the type around is not in conflict for them.
+        if pending.in_graph {
+            for must in &mut self.musts[inner.must_start..] {
+                must.2 = true;
+            }
+        }
         self.frame.effects.push(Effect::Type(Box::new(pending)));
     }
 
@@ -2252,10 +2338,21 @@ impl AnalyzeVisitor {
 
     /// Runs `f` with the generics of an item: the Leaker's if outermost, local otherwise.
     fn with_item_generics(&mut self, generics: &Generics, f: impl FnOnce(&mut Self)) {
+        self.with_item_generics_of(generics, Vec::new(), f)
+    }
+
+    /// Like `with_item_generics()` for a trait, with its `gats` (see [`Gat`]).
+    fn with_item_generics_of(
+        &mut self,
+        generics: &Generics,
+        gats: Vec<Gat>,
+        f: impl FnOnce(&mut Self),
+    ) {
         let nested = self.item_depth > 0;
         self.item_depth += 1;
         if nested {
-            self.with_local_generics(generics, f);
+            let scope = Scope::new(generics, self.self_ty.clone()).with_gats(gats);
+            self.with_scope(scope, f);
         } else {
             f(self);
         }
@@ -2271,6 +2368,18 @@ impl AnalyzeVisitor {
         written: bool,
         f: impl FnOnce(&mut Self),
     ) {
+        self.with_item_of(generics, self_ty, written, Vec::new(), f)
+    }
+
+    /// Like `with_item()` for a trait, with its `gats` (see [`Gat`]).
+    fn with_item_of(
+        &mut self,
+        generics: &Generics,
+        self_ty: Option<SelfRequirement>,
+        written: bool,
+        gats: Vec<Gat>,
+        f: impl FnOnce(&mut Self),
+    ) {
         let allow_self = self.allow_self;
         if self_ty.is_none() || self.item_depth > 0 {
             self.allow_self = true;
@@ -2279,7 +2388,7 @@ impl AnalyzeVisitor {
         let outer = std::mem::replace(&mut self.self_ty, self_ty);
         let outer_written = std::mem::replace(&mut self.self_written, written);
         let outer_depth = self.self_depth;
-        self.with_item_generics(generics, |visitor| {
+        self.with_item_generics_of(generics, gats, |visitor| {
             visitor.self_depth = if declares { visitor.scopes.len() } else { 0 };
             f(visitor)
         });
@@ -2401,7 +2510,7 @@ impl AnalyzeVisitor {
         if named.is_empty() {
             return;
         }
-        let conflict = self.causes(inner.must_start, inner.impossible_start, depth);
+        let conflict = self.conflict_causes(inner.must_start, inner.impossible_start, depth);
         if let Some(walk) = self.signatures.last_mut() {
             walk.leaked
                 .insert(ty as *const Type as usize, (named, conflict));
@@ -2466,6 +2575,7 @@ impl AnalyzeVisitor {
                     let mut conflict = conflict.clone();
                     conflict.impossible.insert(0, quote!(#lifetime));
                     conflict.note = Some(unconstrained_note(lifetime, false));
+                    conflict.headline = unconstrained_headline(&conflict, lifetime);
                     conflicts.push(conflict);
                 }
             }
@@ -3037,7 +3147,8 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
 
     fn visit_item_trait(&mut self, i: &ItemTrait) {
         let self_ty = SelfRequirement::of_trait(&i.ident, &i.generics);
-        self.with_item(&i.generics, Some(self_ty), false, |visitor| {
+        let gats = Gat::of_items(&i.items);
+        self.with_item_of(&i.generics, Some(self_ty), false, gats, |visitor| {
             syn::visit::visit_item_trait(visitor, i)
         });
     }
@@ -3812,6 +3923,17 @@ fn output_and_bounded(sig: &Signature) -> (Lifetimes, Lifetimes) {
         bounded.visit_where_clause(where_clause);
     }
     (output, bounded)
+}
+
+/// The headline of the conflict that `unconstrained_note()` explains: the fault is that the copy
+/// would leave the lifetime unconstrained (E0195), not that the path is relative, so naming an
+/// absolute path is not what the error says.
+fn unconstrained_headline(conflict: &CheckResult, lifetime: &Lifetime) -> Option<String> {
+    let cause = conflict.must.first()?;
+    Some(format!(
+        "`{}` leaves the lifetime `{}` of the method unconstrained in the copy (E0195)",
+        cause, lifetime
+    ))
 }
 
 /// `object`: the type is a trait object that defaults to the lifetime, else it names it.

@@ -29,7 +29,9 @@ use template_quote::quote;
 #[non_exhaustive]
 pub struct CheckResult {
     /// Causes that depend on the context (`A` and `B` in `::path::Wrap<A, B>`). Outermost first,
-    /// then in order of appearance.
+    /// then in order of appearance. In a conflict, a path in a type inside the type that is leaked
+    /// alone is not listed: it is no error once the others are fixed (`u8` in `<Self as
+    /// Tr<u8>>::X`, which cannot be leaked whole because of `Self`).
     pub must: Vec<TokenStream>,
     /// Causes that cannot be leaked (an elided lifetime, `impl Trait`), in order of appearance,
     /// then the mentions of `Self` that have no meaning.
@@ -52,9 +54,12 @@ pub struct CheckResult {
     /// of the error. Set for a type that uses a generic whose bound mentions a `Self` that has no
     /// name here (see [Self rules](crate#self-rules)): the fault is that bound, `must` is the type
     /// that uses it, and `impossible` is the mention of `Self`. Also set for the other rules
-    /// that are not about a path (the bound rules, `Self::A` where `Self` is a type), and for a
-    /// type in the default of a parameter that names `Self`. A relative path that cannot be leaked
-    /// as a whole (`MyType<'_>`, E0195, E0106) has none: the fault is the path, and `note` says why.
+    /// that are not about a path (the bound rules, `Self::A` where `Self` is a type), for a
+    /// type in the default of a parameter that names `Self`, for a type that uses a generic whose
+    /// bound mentions a `Self` that cannot be leaked, and for a lifetime of a method that the copy
+    /// would leave unconstrained (E0195): the fault is the lifetime. A relative path that cannot
+    /// be leaked as a whole (`MyType<'_>`, E0106) has none: the fault is the path, and `note` says
+    /// why.
     pub headline: Option<String>,
 }
 

@@ -996,9 +996,10 @@ fn host_impl(
                 items.extend(quote!(const #name: #ty = #value;));
             }
             (TraitItem::Type(t), _) => {
-                // A generic associated type keeps its parameters.
+                // A generic associated type keeps its parameters and its where clause.
                 let (name, generics) = (&t.ident, &t.generics);
-                items.extend(quote!(type #name #generics = u8;));
+                let where_clause = &generics.where_clause;
+                items.extend(quote!(type #name #generics = u8 #where_clause;));
             }
             _ => (),
         }

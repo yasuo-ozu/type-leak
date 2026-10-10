@@ -200,6 +200,12 @@ pub struct Features {
     /// `Self` or of the arguments of the trait, which the copy for a host type has to prove from
     /// the predicate that the Leaker records (E0491, E0477, E0309, F34: fixed, on by default).
     pub self_projection_outlives: bool,
+    /// The generic associated type of `self_projection_outlives` has the where clause `where Self:
+    /// 'g, Self: 'c` (rustc requires the second one for a method that names the lifetime of the
+    /// trait), and the impls and the host keep it: the signature that names `Self::G<'c>` implies
+    /// `Self: 'c` through it, which the impl of the Repeater of the entry needs (E0309 on `__S`
+    /// without it, F35: fixed, on by default).
+    pub gat_where_clause: bool,
 }
 
 impl Features {
@@ -230,6 +236,7 @@ impl Features {
             projection_outlives: true,
             item_predicate_cycle: true,
             self_projection_outlives: true,
+            gat_where_clause: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -261,6 +268,7 @@ impl Features {
                     features.projection_outlives = true;
                     features.item_predicate_cycle = true;
                     features.self_projection_outlives = true;
+                    features.gat_where_clause = true;
                 }
                 "inferred_outlives" => features.inferred_outlives = true,
                 "impl_assoc_self" => features.impl_assoc_self = true,
@@ -286,6 +294,7 @@ impl Features {
                 "projection_outlives" => features.projection_outlives = true,
                 "item_predicate_cycle" => features.item_predicate_cycle = true,
                 "self_projection_outlives" => features.self_projection_outlives = true,
+                "gat_where_clause" => features.gat_where_clause = true,
                 "unsized_params" => features.unsized_params = true,
                 "bound_cycles" => features.bound_cycles = true,
                 other => panic!("unknown feature `{}`", other),
@@ -803,6 +812,8 @@ struct TraitInfo {
     assoc: Vec<(String, Bounds)>,
     /// The trait declares `type G<'g>;`.
     gat: bool,
+    /// ... with the where clause `where Self: 'g, Self: 'c` (`gat_where_clause`).
+    gat_where: bool,
     /// `const C0: ::core::marker::PhantomData<..>` or `const K0: usize`, with its value in an impl.
     consts: Vec<(String, String)>,
     /// The signatures of the methods, with their where clauses.
@@ -3023,6 +3034,7 @@ impl Gen {
             && !sk.lifetimes.is_empty()
             && !self.no_self
             && self.chance(30);
+        let gat_where = gat && self.features.gat_where_clause && self.chance(60);
         let mut with_gat = sk.clone();
         if gat {
             with_gat.lifetimes.push("'c".to_string());
@@ -3082,14 +3094,36 @@ impl Gen {
         if gat {
             let outer = self.pick(&sk.lifetimes).clone();
             sk.lifetimes.push("'c".to_string());
+            // `gat_where_clause` asks for the lifetime of the method (`fn m<'x>(&'x self, a:
+            // Rel<&'x Self::G<'x>>)`, F35) in a leaked type, which implies `Self: 'x` through the
+            // where clause of `G`. The other form names the lifetime of the trait, and rustc then
+            // requires `Self: 'c` on `G` too.
+            let heads: Vec<String> = self
+                .env
+                .heads
+                .iter()
+                .filter(|head| head.shape == Shape::T1 && !head.name.starts_with("::"))
+                .map(|head| head.name.clone())
+                .collect();
+            let method_form = gat_where && !heads.is_empty() && self.chance(70);
+            let lt = if method_form { "'x" } else { "'c" };
             let path = if self.chance(50) {
-                "Self::G<'c>".to_string()
+                format!("Self::G<{}>", lt)
             } else {
-                format!("<Self as {}{}>::G<'c>", name, sk.args())
+                format!("<Self as {}{}>::G<{}>", name, sk.args(), lt)
             };
             let m = self.name("m");
-            methods.push(format!("fn {}(&self, a: &{} {})", m, outer, path));
-            assoc_texts.push("type G<'g>;".to_string());
+            if method_form {
+                let head = self.pick(&heads).clone();
+                methods.push(format!("fn {}<'x>(&'x self, a: {}<&'x {}>)", m, head, path));
+            } else {
+                methods.push(format!("fn {}(&self, a: &{} {})", m, outer, path));
+            }
+            assoc_texts.push(if gat_where {
+                "type G<'g> where Self: 'g, Self: 'c;".to_string()
+            } else {
+                "type G<'g>;".to_string()
+            });
         }
         self.self_prob = saved_prob;
 
@@ -3128,6 +3162,7 @@ impl Gen {
             supers,
             assoc,
             gat,
+            gat_where,
             consts,
             uses_assoc_self: body.iter().any(|item| item.contains("Self::")),
             self_assoc_in_pred,
@@ -3297,7 +3332,11 @@ impl Gen {
             body.push(format!("type {} = u8;", n));
         }
         if tr.gat {
-            body.push("type G<'g> = u8;".to_string());
+            body.push(if tr.gat_where {
+                "type G<'g> = u8 where Self: 'g, Self: 'c;".to_string()
+            } else {
+                "type G<'g> = u8;".to_string()
+            });
         }
         for (decl, value) in &tr.consts {
             body.push(format!("{} = {};", decl, value));

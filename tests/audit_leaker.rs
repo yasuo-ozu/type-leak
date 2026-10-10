@@ -207,8 +207,13 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
     )
     .err()
     .unwrap();
-    assert!(err.contains("use absolute path: 'RelTr'"), "{}", err);
-    assert!(err.contains("E0195"), "{}", err);
+    assert!(
+        err.contains(
+            "`RelTr` leaves the lifetime `'a` of the method unconstrained in the copy (E0195)"
+        ),
+        "{}",
+        err
+    );
     let referrer = leak_trait(parse_quote! {
         trait Tr { fn f<'a>(&'a self) -> &'a (dyn RelTr + 'a); }
     });

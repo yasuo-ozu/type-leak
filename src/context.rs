@@ -23,6 +23,9 @@ pub(crate) struct Scope {
     /// What `Self` meant where the generics were declared, which their bounds and where predicates
     /// are written for. `None` where it has no meaning. See [`Context::of()`].
     self_ty: Option<SelfRequirement>,
+    /// The generic associated types of the trait that these generics belong to, if the Leaker can
+    /// see them (see [`Gat`]).
+    gats: Vec<Gat>,
 }
 
 impl Scope {
@@ -38,6 +41,7 @@ impl Scope {
                 .collect(),
             binder: false,
             self_ty,
+            gats: Vec::new(),
         }
     }
 
@@ -47,7 +51,28 @@ impl Scope {
             predicates: Vec::new(),
             binder: true,
             self_ty: None,
+            gats: Vec::new(),
         }
+    }
+
+    /// Sets the generic associated types of the trait of the scope (see [`Gat`]).
+    pub(crate) fn with_gats(mut self, gats: Vec<Gat>) -> Self {
+        self.gats = gats;
+        self
+    }
+
+    /// Like [`Scope::with_gats()`], for a scope that exists before they are known.
+    pub(crate) fn set_gats(&mut self, gats: Vec<Gat>) {
+        self.gats = gats;
+    }
+
+    fn gat(&self, name: &str) -> Option<&Gat> {
+        self.gats.iter().find(|gat| ident_name(&gat.ident) == name)
+    }
+
+    /// The generic associated types of the trait of the scope (see [`Gat`]).
+    pub(crate) fn gats(&self) -> &[Gat] {
+        &self.gats
     }
 
     /// Sets what `Self` meant where the generics were declared, for a scope that exists before it
@@ -91,7 +116,7 @@ impl Scope {
         }
     }
 
-    fn self_ty(&self) -> Option<&SelfRequirement> {
+    pub(crate) fn self_ty(&self) -> Option<&SelfRequirement> {
         self.self_ty.as_ref()
     }
 
@@ -153,6 +178,316 @@ impl std::hash::Hash for SelfRequirement {
     }
 }
 
+/// An associated type of a trait that has outlives bounds in its where clause or on its
+/// parameters (`type G<'b> where Self: 'b;`, `type G<'b, U: 'b>;`), as the Leaker reads it from the
+/// trait it analyzes.
+///
+/// `Self::G<'x>` is well-formed only if `Self: 'x`, which the signature of the original implies and
+/// the impl of the Repeater, which has no signature, does not have: the entry requires it (see
+/// [`implied_outlives()`]). Only the outlives relations are kept: any other predicate must be
+/// written by the method that names the type, as rustc requires. The parameters have no bounds.
+#[derive(Clone, Debug)]
+pub(crate) struct Gat {
+    ident: Ident,
+    /// The parameters of the type, and a where clause of its outlives relations.
+    generics: Generics,
+}
+
+impl Gat {
+    /// The associated types of `items` that have outlives relations.
+    pub(crate) fn of_items(items: &[TraitItem]) -> Vec<Self> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                TraitItem::Type(item) => Self::new(&item.ident, &item.generics),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns the outlives relations of `generics` (the bounds of the parameters and the where
+    /// clause) as the where clause of an associated type, or `None` if it has none.
+    pub(crate) fn new(ident: &Ident, generics: &Generics) -> Option<Self> {
+        let lifetimes = |bounds: &Punctuated<TypeParamBound, Token![+]>| -> Vec<TypeParamBound> {
+            bounds
+                .iter()
+                .filter(|bound| matches!(bound, TypeParamBound::Lifetime(_)))
+                .cloned()
+                .collect()
+        };
+        let mut params = Punctuated::new();
+        let mut predicates: Vec<WherePredicate> = Vec::new();
+        for param in &generics.params {
+            match param {
+                GenericParam::Lifetime(param) => {
+                    let lifetime = &param.lifetime;
+                    let bounds = &param.bounds;
+                    if !bounds.is_empty() {
+                        predicates.push(parse_quote!(#lifetime: #bounds));
+                    }
+                    params.push(GenericParam::Lifetime(LifetimeParam::new(lifetime.clone())));
+                }
+                GenericParam::Type(param) => {
+                    let (name, bounds) = (&param.ident, lifetimes(&param.bounds));
+                    if !bounds.is_empty() {
+                        predicates.push(parse_quote!(#name: #(#bounds)+*));
+                    }
+                    params.push(GenericParam::Type(TypeParam::from(name.clone())));
+                }
+                GenericParam::Const(param) => {
+                    let (name, ty) = (&param.ident, &param.ty);
+                    params.push(parse_quote!(const #name: #ty));
+                }
+            }
+        }
+        for predicate in generics
+            .where_clause
+            .iter()
+            .flat_map(|where_clause| where_clause.predicates.iter())
+        {
+            match predicate {
+                // A bound under `for<..>` is not a relation of the context.
+                WherePredicate::Type(PredicateType {
+                    lifetimes: None,
+                    bounded_ty,
+                    bounds,
+                    ..
+                }) => {
+                    let bounds = lifetimes(bounds);
+                    if !bounds.is_empty() {
+                        predicates.push(parse_quote!(#bounded_ty: #(#bounds)+*));
+                    }
+                }
+                WherePredicate::Lifetime(predicate) if !predicate.bounds.is_empty() => {
+                    predicates.push(WherePredicate::Lifetime(predicate.clone()))
+                }
+                _ => (),
+            }
+        }
+        if predicates.is_empty() {
+            return None;
+        }
+        Some(Self {
+            ident: ident.clone(),
+            generics: Generics {
+                params,
+                where_clause: Some(WhereClause {
+                    where_token: Default::default(),
+                    predicates: predicates.into_iter().collect(),
+                }),
+                ..Default::default()
+            },
+        })
+    }
+
+    /// Reads `type G<'b> where Self: 'b ;` (see [`ToTokens`]).
+    pub(crate) fn parse(input: ParseStream) -> Result<Self> {
+        let span = input.span();
+        input.parse::<Token![type]>()?;
+        let ident: Ident = input.parse()?;
+        let mut generics: Generics = input.parse()?;
+        generics.where_clause = input.parse()?;
+        input.parse::<Token![;]>()?;
+        Self::new(&ident, &generics).ok_or_else(|| {
+            Error::new(
+                span,
+                "an associated type needs an outlives relation in its where clause",
+            )
+        })
+    }
+
+    fn render(&self) -> String {
+        let (ident, generics) = (&self.ident, &self.generics);
+        let where_clause = &generics.where_clause;
+        quote!(type #ident #generics #where_clause ;).to_string()
+    }
+
+    /// Returns the outlives relations that `G<..>` requires, as where predicates of the context:
+    /// those of the where clause of the type, with its parameters substituted by `args`, the
+    /// arguments of the projection, and the `trait_params` of the trait by `trait_args`, the
+    /// arguments of the trait in the path (the parameters are kept if there are none). There are
+    /// none if the arguments are not those of the parameters (a lifetime that is elided in the
+    /// path): nothing can be written for them.
+    fn requirements(
+        &self,
+        args: &[GenericArgument],
+        trait_params: &[GenericParam],
+        trait_args: &[GenericArgument],
+    ) -> Vec<WherePredicate> {
+        let mut substitution = Substitution::default();
+        let params: Vec<&GenericParam> = self.generics.params.iter().collect();
+        if !substitution.add(&params, args) {
+            return Vec::new();
+        }
+        if !trait_args.is_empty() {
+            let trait_params: Vec<&GenericParam> = trait_params.iter().collect();
+            if !substitution.add(&trait_params, trait_args) {
+                return Vec::new();
+            }
+        }
+        self.generics
+            .where_clause
+            .iter()
+            .flat_map(|where_clause| where_clause.predicates.iter())
+            .map(|predicate| substitution.fold_where_predicate(predicate.clone()))
+            .collect()
+    }
+}
+
+impl ToTokens for Gat {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let (ident, generics) = (&self.ident, &self.generics);
+        tokens.extend(quote!(type #ident #generics #{&generics.where_clause} ;));
+    }
+}
+
+/// The arguments that replace the parameters of a generic associated type and of its trait.
+#[derive(Default)]
+struct Substitution {
+    lifetimes: HashMap<String, Lifetime>,
+    types: HashMap<String, Type>,
+}
+
+impl Substitution {
+    /// Returns `false` if `args` are not the arguments of `params`.
+    fn add(&mut self, params: &[&GenericParam], args: &[GenericArgument]) -> bool {
+        if params.len() != args.len() {
+            return false;
+        }
+        for (param, arg) in params.iter().zip(args) {
+            match (param, arg) {
+                (GenericParam::Lifetime(param), GenericArgument::Lifetime(arg)) => {
+                    self.lifetimes
+                        .insert(param.lifetime.to_string(), arg.clone());
+                }
+                (GenericParam::Type(param), GenericArgument::Type(arg)) => {
+                    self.types.insert(ident_name(&param.ident), arg.clone());
+                }
+                // A const argument is no part of an outlives relation.
+                (GenericParam::Const(_), _) => (),
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+impl Fold for Substitution {
+    fn fold_lifetime(&mut self, lifetime: Lifetime) -> Lifetime {
+        self.lifetimes
+            .get(&lifetime.to_string())
+            .cloned()
+            .unwrap_or(lifetime)
+    }
+
+    fn fold_type(&mut self, ty: Type) -> Type {
+        if let Type::Path(TypePath { qself: None, path }) = &ty {
+            let first = path.segments.first();
+            if let Some(arg) = first
+                .filter(|seg| path.leading_colon.is_none() && seg.arguments.is_none())
+                .and_then(|seg| self.types.get(&ident_name(&seg.ident)))
+            {
+                if path.segments.len() == 1 {
+                    return arg.clone();
+                }
+                // `U::Item` is that of the argument, if it is a path.
+                return match arg {
+                    Type::Path(TypePath {
+                        qself: None,
+                        path: arg_path,
+                    }) => {
+                        let mut segments = arg_path.segments.clone();
+                        segments.extend(path.segments.iter().skip(1).cloned());
+                        Type::Path(TypePath {
+                            qself: None,
+                            path: Path {
+                                leading_colon: arg_path.leading_colon,
+                                segments,
+                            },
+                        })
+                    }
+                    _ => ty,
+                };
+            }
+        }
+        syn::fold::fold_type(self, ty)
+    }
+}
+
+/// Returns the outlives relations that the generic associated type named by `projection` requires
+/// (see [`Gat`]), if it is one of the trait that `self_req` is the implementor of: `Self::G<..>`,
+/// or `<Self as Tr<..>>::G<..>` where `Tr` is that trait. The Leaker sees it if it analyzed the
+/// trait with its items. The type of a supertrait, and that of a generic (`T::G<'x>`), are not
+/// seen: nothing is recorded for them.
+fn gat_requirements(
+    projection: &TypePath,
+    scopes: &[Scope],
+    self_req: Option<&SelfRequirement>,
+) -> Vec<WherePredicate> {
+    let trait_path = match self_req {
+        Some(SelfRequirement::Bound(path)) => path,
+        _ => return Vec::new(),
+    };
+    if scopes.iter().all(|scope| scope.gats().is_empty()) {
+        return Vec::new();
+    }
+    let segments: Vec<&PathSegment> = projection.path.segments.iter().collect();
+    let (gat, trait_args) = match &projection.qself {
+        // `Self::G<..>`
+        None => match segments[..] {
+            [first, gat]
+                if projection.path.leading_colon.is_none()
+                    && first.ident == "Self"
+                    && first.arguments.is_none() =>
+            {
+                (gat, None)
+            }
+            _ => return Vec::new(),
+        },
+        // `<Self as Tr<..>>::G<..>`
+        Some(qself) => {
+            let is_self = matches!(unwrap_type_group(&qself.ty),
+                Type::Path(TypePath { qself: None, path }) if path.is_ident("Self"));
+            if !is_self || qself.position == 0 || segments.len() != qself.position + 1 {
+                return Vec::new();
+            }
+            let tr = segments[qself.position - 1];
+            if trait_path.segments.last().map(|seg| &seg.ident) != Some(&tr.ident) {
+                return Vec::new();
+            }
+            (segments[qself.position], Some(&tr.arguments))
+        }
+    };
+    let angle = |arguments: &PathArguments| -> Option<Vec<GenericArgument>> {
+        match arguments {
+            PathArguments::None => Some(Vec::new()),
+            PathArguments::AngleBracketed(args) => Some(args.args.iter().cloned().collect()),
+            PathArguments::Parenthesized(_) => None,
+        }
+    };
+    let (args, trait_args) = match (angle(&gat.arguments), trait_args.map(angle)) {
+        (Some(args), None) => (args, Vec::new()),
+        (Some(args), Some(Some(trait_args))) => (args, trait_args),
+        _ => return Vec::new(),
+    };
+    let name = ident_name(&gat.ident);
+    let scope = scopes
+        .iter()
+        .rev()
+        .find(|scope| scope.self_ty() == self_req && scope.gat(&name).is_some());
+    match scope.and_then(|scope| Some((scope, scope.gat(&name)?))) {
+        Some((scope, gat)) => {
+            let trait_params: Vec<GenericParam> = scope.params().cloned().collect();
+            // A trait with no arguments written takes its parameters as they are.
+            if !trait_args.is_empty() && trait_args.len() != trait_params.len() {
+                return Vec::new();
+            }
+            gat.requirements(&args, &trait_params, &trait_args)
+        }
+        None => Vec::new(),
+    }
+}
+
 fn generics_as_args(generics: &Generics) -> TokenStream {
     if generics.params.is_empty() {
         return TokenStream::new();
@@ -189,6 +524,9 @@ pub(crate) struct Context {
     /// Lifetimes `'a` with `Self: 'a`, implied or written. Sorted, and empty without `self_ty`.
     /// They are not in `generics`, because `Self` is not a parameter.
     self_outlives: Vec<Lifetime>,
+    /// The generic associated types of the trait, for the top-level context of a trait scope whose
+    /// entries depend on them (see [`Gat`]). Sorted by name, and empty in the context of an entry.
+    gats: Vec<Gat>,
     /// The module scope, if the type depends on its module.
     module: Option<ContextId>,
     /// Set for the context of a module scope: it makes each one distinct.
@@ -218,6 +556,7 @@ impl Context {
             generics: canonicalize(generics),
             self_ty,
             self_outlives: Vec::new(),
+            gats: Vec::new(),
             module: None,
             scope: None,
             substituted: Vec::new(),
@@ -255,6 +594,19 @@ impl Context {
         self.substituted.contains(declared)
     }
 
+    /// The generic associated types of the trait that this top-level context is the scope of. They
+    /// are part of its identity, and the Referrer's scope has them (see [`Gat`]). A context where
+    /// `Self` has no meaning has none.
+    pub(crate) fn with_gats(mut self, mut gats: Vec<Gat>) -> Self {
+        gats.sort_by_key(|gat| ident_name(&gat.ident));
+        self.gats = if self.self_ty.is_some() {
+            gats
+        } else {
+            Vec::new()
+        };
+        self
+    }
+
     pub(crate) fn with_module(mut self, module: Option<ContextId>) -> Self {
         self.module = module;
         self
@@ -270,6 +622,10 @@ impl Context {
         for (i, lifetime) in self.self_outlives.iter().enumerate() {
             rendered.push_str(if i == 0 { " Self: " } else { " + " });
             rendered.push_str(&lifetime.to_string());
+        }
+        for gat in &self.gats {
+            rendered.push(' ');
+            rendered.push_str(&gat.render());
         }
         if let Some(module) = &self.module {
             rendered.push_str(&format!(" mod #{}", module.index()));
@@ -521,6 +877,10 @@ impl Context {
 
     pub(crate) fn self_outlives(&self) -> &[Lifetime] {
         &self.self_outlives
+    }
+
+    pub(crate) fn gats(&self) -> &[Gat] {
+        &self.gats
     }
 
     pub(crate) fn module(&self) -> Option<ContextId> {
@@ -1345,6 +1705,12 @@ impl Binding {
 /// environment of the impl, where the predicate would be `X: 'a`, which is not decomposed into the
 /// bounds of the parts of `X`: the parts of `X` are mentioned instead. A supertrait that equates it
 /// (`trait Tr: Iterator<Item = X>`) is not seen, since the Referrer's copy has none.
+///
+/// A projection that names a generic associated type of the trait (`Self::G<'x>`, `<Self as
+/// Tr>::G<'x>`: see [`Gat`]) also requires what its where clause says (`type G<'b> where Self: 'b`
+/// gives `Self: 'x`), with the arguments of the projection for its parameters, wherever it is
+/// written: the well-formedness of the signature gives the original those bounds, and the impl
+/// of the Repeater has no signature.
 fn implied_outlives(
     ty: &Type,
     scopes: &[Scope],
@@ -1368,6 +1734,31 @@ fn implied_outlives(
                 return;
             }
             self.require_generic(lifetime, referent)
+        }
+
+        /// A projection that names a generic associated type of the trait requires what its where
+        /// clause says, wherever it is written (see [`Gat`]).
+        fn require_gat(&mut self, projection: &TypePath) {
+            for predicate in gat_requirements(projection, self.scopes, self.self_req) {
+                match predicate {
+                    WherePredicate::Type(predicate) => {
+                        for bound in &predicate.bounds {
+                            if let TypeParamBound::Lifetime(lifetime) = bound {
+                                self.require(lifetime, &predicate.bounded_ty);
+                            }
+                        }
+                    }
+                    WherePredicate::Lifetime(predicate) => {
+                        // `'a: 'x` is what `&'x &'a ()` requires.
+                        let outlived = &predicate.lifetime;
+                        let referent: Type = parse_quote!(&#outlived ());
+                        for lifetime in &predicate.bounds {
+                            self.require(lifetime, &referent);
+                        }
+                    }
+                    _ => (),
+                }
+            }
         }
 
         fn require_generic(&mut self, lifetime: &Lifetime, referent: &Type) {
@@ -1408,6 +1799,10 @@ fn implied_outlives(
                 self.require(lifetime, &i.elem);
             }
             syn::visit::visit_type_reference(self, i)
+        }
+        fn visit_type_path(&mut self, i: &'ast TypePath) {
+            self.require_gat(i);
+            syn::visit::visit_type_path(self, i)
         }
         fn visit_type_bare_fn(&mut self, i: &'ast TypeBareFn) {
             let outer = self.binders.len();

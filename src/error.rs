@@ -36,7 +36,11 @@ pub enum NotInternableError {
     /// names a lifetime of a method which the copy would leave unconstrained (`Wrap<'x>` in
     /// `fn f<'x>(&self, a: Wrap<'x>) -> &'x u8`) has a note on E0195, for a method of a trait or of
     /// an impl of a trait, not for a free function or a method of an inherent impl
-    /// ([Method lifetimes](crate#method-lifetimes)). Also a type in a bound or where predicate that
+    /// ([Method lifetimes](crate#method-lifetimes)). The fault is the lifetime, which an absolute
+    /// path is only one way to fix, so its headline is "`Wrap<'x>` leaves the lifetime `'x` of the
+    /// method unconstrained in the copy (E0195)". Also a type that uses a generic whose bound
+    /// mentions a `Self` that cannot be leaked: "`Wrap<T>` has a generic whose bound mentions
+    /// `Self`, which cannot be leaked". Also a type in a bound or where predicate that
     /// the copy cannot write through the
     /// Repeater, as rustc cannot prove a bound of its generics that names a leaked type: its
     /// headline is "`Wrap<T>` is in a bound or where predicate, and a bound of its generics names a
