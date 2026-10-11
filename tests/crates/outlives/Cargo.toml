@@ -11,5 +11,13 @@ path = "lib.rs"
 [dependencies]
 type-leak-test-macro = { path = "../macro" }
 
+# The negative controls of lib.rs: each feature enables items which do not compile (the error is
+# in the comment above them), and tests/outlives.rs builds each one and checks the error.
+[features]
+negative-unbounded = []
+negative-unbounded-self = []
+negative-unbounded-around = []
+negative-alone = []
+
 # Built on its own by tests/outlives.rs.
 [workspace]

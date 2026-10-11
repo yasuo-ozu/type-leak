@@ -1,0 +1,9 @@
+[package]
+name = "type-leak-test-ext"
+version = "0.0.0"
+edition = "2018"
+publish = false
+description = "An external crate which the Leaker's crate depends on and the Referrer's crate does not, for tests/cross_crate.rs"
+
+[lib]
+path = "lib.rs"

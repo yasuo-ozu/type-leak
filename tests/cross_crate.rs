@@ -4,7 +4,15 @@
 //!   `RepeaterSlots`).
 //! - `tests/crates/leaker`: the Leaker's crate, defining traits with relative types.
 //! - `tests/crates/referrer`: the Referrer's crate, implementing the traits for wrappers which
-//!   forward to `Inner`.
+//!   forward to `Inner`, and copying items of every kind (struct, enum, union, impl, module, trait)
+//!   and fragments of impls (the scope API), with a witness for each copied type.
+//! - `tests/crates/ext`: a crate which the Leaker's crate depends on and the Referrer's does not,
+//!   for the strict Referrer.
+//!
+//! The copies are compared with the originals when the Referrer's crate is compiled (a witness of
+//! the Leaker's crate returns the original type, and the Referrer's crate returns the rewritten
+//! one from it), so a rewrite which does not give the original type fails the build of this test.
+//! The tests here read what the macros reported and what they wrote.
 
 use type_leak_test_leaker::m::{
     Consts, Defaulted, Defaults, DollarCrate, Edge, Holder, Inner, Plain, RelDefault, RelType,
@@ -218,4 +226,542 @@ fn external_crate_types() {
         <Strict as External<u8>>::receiver(Box::new(check(Strict(Inner)))),
         6
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Items of every kind, copied by the Referrer (`#[prop_leak]`, see `tests/crates/macro/prop.rs`).
+// ---------------------------------------------------------------------------------------------
+
+use std::marker::PhantomData;
+
+/// Removes the whitespace of tokens printed by a compiler, which depends on its version.
+fn squash(text: &str) -> String {
+    text.split_whitespace().collect()
+}
+
+/// A type equality witness: compiles only if both are the same type.
+fn same<T>(_: &T, _: &T) {}
+
+/// What a `#[prop_leak]` macro reported: `<id>|<kind>|ok|entries=E positions=P checked=C`, or
+/// `<id>|<kind>|rej|<message>`.
+#[derive(Debug, PartialEq)]
+enum Reported {
+    Ok {
+        kind: &'static str,
+        entries: usize,
+        positions: usize,
+        checked: usize,
+    },
+    Rejected {
+        kind: &'static str,
+        message: String,
+    },
+}
+
+fn ok(kind: &'static str, entries: usize, positions: usize, checked: usize) -> Reported {
+    Reported::Ok {
+        kind,
+        entries,
+        positions,
+        checked,
+    }
+}
+
+fn rejected(kind: &'static str, message: &str) -> Reported {
+    Reported::Rejected {
+        kind,
+        message: message.to_string(),
+    }
+}
+
+fn reported(id: u32, text: &'static str) -> Reported {
+    let mut parts = text.splitn(4, '|');
+    assert_eq!(parts.next(), Some(id.to_string().as_str()), "{}", text);
+    let kind = parts.next().unwrap();
+    let kind = [
+        "struct",
+        "enum",
+        "union",
+        "impl-inherent",
+        "impl-trait",
+        "mod",
+        "trait",
+    ]
+    .iter()
+    .copied()
+    .find(|k| *k == kind)
+    .unwrap_or_else(|| panic!("unknown kind in {}", text));
+    let (status, rest) = (parts.next().unwrap(), parts.next().unwrap_or(""));
+    if status == "rej" {
+        return rejected(kind, &squash(rest));
+    }
+    assert_eq!(status, "ok", "{}", text);
+    let number = |key: &str| -> usize {
+        rest.split(' ')
+            .find_map(|word| word.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no `{}` in {}", key, text))
+            .parse()
+            .unwrap()
+    };
+    ok(
+        kind,
+        number("entries="),
+        number("positions="),
+        number("checked="),
+    )
+}
+
+/// A struct, an enum, a union, an impl, a module and a trait are each analyzed by the matching
+/// `intern_*` and accepted (or rejected, for a `Self` that is denied) as the Leaker's crate says, and
+/// the Referrer's crate checked every copied type against the original: `checked` is the number of
+/// type positions of the item which have a witness (all but the ones of a module that name what it
+/// declares, which the copy declares again).
+#[test]
+fn every_item_kind_is_leaked_across_crates() {
+    use type_leak_test_leaker::*;
+    let table = [
+        // structs: `Self`, a denied `Self` that is not named, a denied `Self` that is named, and an
+        // optional entry (a type of another crate)
+        (
+            9001,
+            reported(9001, __tl_report_9001!()),
+            ok("struct", 5, 5, 5),
+        ),
+        (
+            9002,
+            reported(9002, __tl_report_9002!()),
+            ok("struct", 3, 3, 3),
+        ),
+        (
+            9003,
+            reported(9003, __tl_report_9003!()),
+            rejected("struct", "useabsolutepath:'Wrap<Self>'"),
+        ),
+        (
+            9004,
+            reported(9004, __tl_report_9004!()),
+            ok("struct", 3, 3, 3),
+        ),
+        // a where clause on a type that is not a parameter, in the context of its entry
+        (
+            9005,
+            reported(9005, __tl_report_9005!()),
+            ok("struct", 2, 1, 1),
+        ),
+        // enums
+        (
+            9011,
+            reported(9011, __tl_report_9011!()),
+            ok("enum", 4, 5, 5),
+        ),
+        (
+            9012,
+            reported(9012, __tl_report_9012!()),
+            ok("enum", 2, 2, 2),
+        ),
+        // unions
+        (
+            9021,
+            reported(9021, __tl_report_9021!()),
+            ok("union", 3, 3, 3),
+        ),
+        (
+            9022,
+            reported(9022, __tl_report_9022!()),
+            ok("union", 2, 2, 2),
+        ),
+        // impls: inherent, of a trait (also with a relative argument), and with `Self` denied
+        (
+            9031,
+            reported(9031, __tl_report_9031!()),
+            ok("impl-inherent", 6, 6, 6),
+        ),
+        (
+            9032,
+            reported(9032, __tl_report_9032!()),
+            ok("impl-trait", 2, 5, 5),
+        ),
+        (
+            9033,
+            reported(9033, __tl_report_9033!()),
+            ok("impl-inherent", 2, 2, 2),
+        ),
+        (
+            9034,
+            reported(9034, __tl_report_9034!()),
+            ok("impl-trait", 2, 5, 5),
+        ),
+        // a module (its own `Local` is declared in it, so the types that name it have no witness)
+        (
+            9041,
+            reported(9041, __tl_report_9041!()),
+            ok("mod", 4, 6, 5),
+        ),
+        // traits: `Self` denied and not named, denied and named, and an unsized implementor
+        (
+            9051,
+            reported(9051, __tl_report_9051!()),
+            ok("trait", 3, 3, 3),
+        ),
+        (
+            9052,
+            reported(9052, __tl_report_9052!()),
+            rejected("trait", "useabsolutepath:'Wrap<Self>'"),
+        ),
+        (
+            9053,
+            reported(9053, __tl_report_9053!()),
+            ok("trait", 4, 6, 6),
+        ),
+    ];
+    for (id, got, expected) in table {
+        assert_eq!(got, expected, "item {}", id);
+    }
+}
+
+/// The copy of a struct, an enum, a union and a module has the types of the original: the fields
+/// of the original go into the copy and back (the Referrer's crate cannot name `Rel`, `Wrap` and
+/// `Pair`, which `type_leak_test_leaker::kinds` declares).
+#[test]
+fn copies_of_items_hold_the_original_types() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_referrer::kinds as r;
+
+    // A struct that does not name `Self`.
+    let rel = l::Rel(7);
+    let copy = r::Plain::<u8> {
+        rel,
+        wrapped: l::Wrap(PhantomData),
+        pair: l::Pair(3u8, rel),
+    };
+    same(&copy.rel, &rel);
+    same(&copy.pair, &l::Pair(0u8, rel));
+    let back = l::Plain::<u8> {
+        rel: copy.rel,
+        wrapped: copy.wrapped,
+        pair: copy.pair,
+    };
+    assert_eq!(back.pair, l::Pair(3, l::Rel(7)));
+
+    // With `Self` in it: the node holds `Wrap<Node>`, the Leaker's.
+    let node = r::Node::<u8> {
+        rel,
+        wrapped: l::Wrap(PhantomData),
+        pair: l::Pair(rel, 4u8),
+        borrowed: &rel,
+        next: Some(Box::new(l::Wrap::<l::Node<'_, u8>>(PhantomData))),
+    };
+    assert_eq!(node.pair.1, 4);
+    assert_eq!(node.borrowed, &l::Rel(7));
+    assert!(node.next.is_some());
+
+    // An enum: each variant has the original types.
+    let choices = [
+        r::Choice::<u8>::Rel(rel),
+        r::Choice::Wrapped(l::Wrap(PhantomData)),
+        r::Choice::Pair {
+            pair: l::Pair(rel, 9),
+            flag: true,
+        },
+        r::Choice::Me(l::Wrap::<l::Choice<u8>>(PhantomData)),
+        r::Choice::Nothing,
+    ];
+    let seen: Vec<_> = choices
+        .iter()
+        .map(|c| match c {
+            r::Choice::Rel(x) => x.0 as usize,
+            r::Choice::Wrapped(_) => 100,
+            r::Choice::Pair { pair, flag } => pair.1 as usize + *flag as usize,
+            r::Choice::Me(_) => 200,
+            r::Choice::Nothing => 300,
+        })
+        .collect();
+    assert_eq!(seen, vec![7, 100, 10, 200, 300]);
+    let n = 3u8;
+    let lt = r::Borrow::Lt(l::Lt(&n));
+    assert!(matches!(lt, r::Borrow::Lt(l::Lt(&3))));
+
+    // A union of the original types, written and read.
+    let bits = r::Bits::<u8> { rel };
+    assert_eq!(unsafe { bits.rel }, l::Rel(7));
+    let bits = r::BitsSelf {
+        me: l::Wrap::<l::BitsSelf>(PhantomData),
+    };
+    let _ = unsafe { bits.me };
+
+    // A module: what it declares (`Local`) is its own, what it uses from outside is the original.
+    let holds = r::nested::Holds::<u8> {
+        rel,
+        wrapped: l::Wrap(PhantomData),
+        pair: l::Pair(rel, 6),
+        local: r::nested::Local(11),
+    };
+    assert_eq!((holds.pair.1, holds.local.0), (6, 11));
+    same(&holds.rel, &rel);
+    assert_eq!(r::nested::deeper::Deep(rel).0, rel);
+}
+
+/// A trait is implemented for an unsized type (`dyn Host`) in the Referrer's crate, with the
+/// signatures it rewrote: the Repeater's impls of the entries that name `Self` must be for
+/// `__S: ?Sized`, or the Referrer's crate would not compile. (The Leaker's crate cannot know the
+/// implementors.)
+#[test]
+fn a_trait_with_an_unsized_implementor() {
+    use type_leak_test_leaker::kinds::{Unsized, Wrap};
+    use type_leak_test_referrer::kinds::Host9053;
+
+    fn implemented_for<T: ?Sized + Unsized>() {}
+    implemented_for::<dyn Host9053>();
+
+    fn me<T: ?Sized>(_: &T) -> Wrap<T> {
+        Wrap(PhantomData)
+    }
+    struct Local;
+    impl Host9053 for Local {}
+    let dynamic: &dyn Host9053 = &Local;
+    same(&me(dynamic), &Wrap::<dyn Host9053>(PhantomData));
+}
+
+// ---------------------------------------------------------------------------------------------
+// A strict Referrer, in a crate without the dependency of an optional entry.
+// ---------------------------------------------------------------------------------------------
+
+/// The type of a crate which the Referrer's crate has no dependency on is an optional entry. The
+/// trusting Referrer leaves it as written (and replaces what is relative in it), and the strict one
+/// replaces the whole type: the text of the two copies of the same items differs in that. Only the
+/// strict one can be compiled where the crate is not a dependency (this crate has none on it):
+/// `tests/trusting.rs` builds both in a crate that has none, and runs the tests of the strict one.
+#[test]
+fn a_strict_referrer_replaces_the_optional_entries_and_a_trusting_one_does_not() {
+    use type_leak_test_referrer::{STRICT_COPY, TRUSTING_COPY};
+    let (trusting, strict) = (squash(TRUSTING_COPY), squash(STRICT_COPY));
+
+    // Trusting: the type of the other crate stays, with the relative type in it (`RelX`, the
+    // required entry 0) replaced; the plain `Ext<u8>` is not touched.
+    assert!(trusting.contains("x:::type_leak_test_ext::Ext<(<Wrapperas$crate::Repeater<(),"));
+    assert!(trusting.contains("0usize>>::Type,)>"));
+    assert!(trusting.contains("y:::type_leak_test_ext::Ext<u8>"));
+    assert_eq!(trusting.matches("type_leak_test_ext").count(), 2);
+    assert_eq!(trusting.matches("Repeater<").count(), 1);
+
+    // Strict: both types of the other crate are replaced as a whole, each by its own entry (1 and
+    // 2, after the required `RelX`), and the crate is not named at all.
+    assert!(!strict.contains("type_leak_test_ext"));
+    assert!(strict.contains("x:<Wrapperas$crate::Repeater<(),"));
+    assert!(strict.contains("1usize>>::Type,y:<Wrapperas$crate::Repeater<(),"));
+    assert!(strict.ends_with("2usize>>::Type){}"));
+    assert_eq!(strict.matches("Repeater<").count(), 2);
+    assert_ne!(trusting, strict);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fragments of impls, analyzed with the scope API.
+// ---------------------------------------------------------------------------------------------
+
+/// `coinduction`'s shape: `enter_impl(.., false, ..)` with `visit_path_arguments()`, the
+/// Repeater's impls for a marker (`ImplSelf::Marker`) of the required entries only
+/// (`has_required()`, `required()`), and the Referrer's copy of the self type, the trait and its
+/// arguments with `Referrer::visitor(context, ..)` and `entry_args_with(ix, &UseSite::identity(),
+/// ..)`. The Referrer's crate checks the copy: each type is the original (a witness), and rustc finds
+/// the Leaker's impl of the trait for the rewritten self type.
+#[test]
+fn the_scope_api_with_a_marker() {
+    // Three required entries: `Rel3` (no generics), `Rel<T>` and `&'a Rel2` (the lifetime encoded
+    // in the first argument of the Repeater).
+    assert_eq!(
+        type_leak_test_leaker::__scope_report_7001!(),
+        "7001|entries=3 required=3 impls=3 types=4"
+    );
+    let (self_ty, trait_path) = (
+        squash(type_leak_test_referrer::scoped::SCOPE_7001_SELF),
+        squash(type_leak_test_referrer::scoped::SCOPE_7001_TRAIT),
+    );
+    let marker = "<::type_leak_test_leaker::scoped::M7001as::type_leak_test_leaker::Repeater<";
+    // `T` of the self type stays (a generic of the impl), `Rel3` goes through the marker.
+    assert_eq!(
+        self_ty,
+        format!(
+            "::type_leak_test_leaker::scoped::Holder<T,{}(),7001u64,0usize>>::Type>",
+            marker
+        )
+    );
+    assert_eq!(
+        trait_path,
+        format!(
+            "::type_leak_test_leaker::scoped::Tr<{m}(T,),7001u64,1usize>>::Type,{m}(&'a(),),7001u64,2usize>>::Type>",
+            m = marker
+        )
+    );
+    // The impls: the entry without generics is plain, the others declare what they use (and the
+    // bound of `T`, but not the lifetime of the reference, which the first argument encodes).
+    assert_eq!(
+        type_leak_test_leaker::__scope_impls_7001!()
+            .split(";;")
+            .map(squash)
+            .collect::<Vec<_>>(),
+        [
+            "implcrate::Repeater<(),7001u64,0usize>forM7001",
+            "impl<T:::core::clone::Clone>crate::Repeater<(T,),7001u64,1usize>forM7001",
+            "impl<'a>crate::Repeater<(&'a(),),7001u64,2usize>forM7001",
+        ]
+    );
+    // The types that were visited, one by one.
+    assert_eq!(
+        type_leak_test_referrer::scoped::SCOPE_7001_TYPES
+            .split(";;")
+            .map(squash)
+            .collect::<Vec<_>>(),
+        vec![
+            "T".to_string(), // never replaced: it is the generic of the impl
+            format!("{}(),7001u64,0usize>>::Type", marker),
+            format!("{}(T,),7001u64,1usize>>::Type", marker),
+            format!("{}(&'a(),),7001u64,2usize>>::Type", marker),
+        ]
+    );
+}
+
+/// `newer-type`'s shape: `Self` is allowed, and the Repeater's impl of an entry that names it is for
+/// the self type (`ImplSelf::Param`), whereas the one that does not is for the marker.
+#[test]
+fn the_scope_api_with_self() {
+    assert_eq!(
+        type_leak_test_leaker::__scope_report_7002!(),
+        "7002|entries=2 required=2 impls=2 types=4"
+    );
+    let trait_path = squash(type_leak_test_referrer::scoped::SCOPE_7002_TRAIT);
+    // `Wrap<Self>` is in the impl of the self type itself, `Rel<T>` in the marker's.
+    assert_eq!(
+        trait_path,
+        concat!(
+            "::type_leak_test_leaker::scoped::Tr<",
+            "<::type_leak_test_leaker::scoped::Holder<T,u8>as::type_leak_test_leaker::Repeater<(T,),7002u64,0usize>>::Type,",
+            "<::type_leak_test_leaker::scoped::M7002as::type_leak_test_leaker::Repeater<(T,),7002u64,1usize>>::Type>"
+        )
+    );
+    assert_eq!(
+        type_leak_test_leaker::__scope_impls_7002!()
+            .split(";;")
+            .map(squash)
+            .collect::<Vec<_>>(),
+        [
+            "impl<T:::core::clone::Clone>crate::Repeater<(T,),7002u64,0usize>forcrate::scoped::Holder<T,u8>",
+            "impl<T:::core::clone::Clone>crate::Repeater<(T,),7002u64,1usize>forM7002",
+        ]
+    );
+    // The self type has nothing to replace.
+    assert_eq!(
+        squash(type_leak_test_referrer::scoped::SCOPE_7002_SELF),
+        "::type_leak_test_leaker::scoped::Holder<T,u8>"
+    );
+}
+
+/// Entries which need no generics are plain: the impl for the marker declares nothing. With an
+/// optional entry only, `has_required()` is `false` and the macro writes no impl; with the impl of
+/// the optional entry too (`all`), the strict Referrer replaces it where its crate has no dependency
+/// on the crate of the type.
+#[test]
+fn the_scope_api_writes_the_impls_that_are_needed() {
+    assert_eq!(
+        type_leak_test_leaker::__scope_report_7003!(),
+        "7003|entries=2 required=2 impls=2 types=4"
+    );
+    assert_eq!(
+        type_leak_test_leaker::__scope_report_7004!(),
+        "7004|entries=1 required=0 impls=0 types=4"
+    );
+    assert_eq!(
+        type_leak_test_leaker::__scope_report_7005!(),
+        "7005|entries=2 required=1 impls=2 types=4"
+    );
+    // A where clause on a type that is not a parameter (`Vec<T>: Clone`) is in the context of the
+    // entry that needs it (`Cl<T>` is well-formed only with it), so the impl of the Repeater has it.
+    assert_eq!(
+        type_leak_test_leaker::__scope_report_7006!(),
+        "7006|entries=1 required=1 impls=1 types=4"
+    );
+    assert_eq!(
+        squash(type_leak_test_leaker::__scope_impls_7006!()),
+        "impl<T>crate::Repeater<(T,),7006u64,0usize>forM7006where::std::vec::Vec<T>:::core::clone::Clone"
+    );
+    // Without `all`, a required entry next to an optional one gets the impl of the required one only.
+    assert_eq!(
+        type_leak_test_leaker::__scope_report_7007!(),
+        "7007|entries=2 required=1 impls=1 types=4"
+    );
+    // (`tests/trusting.rs` applies 7005 as a strict Referrer, in a crate that has no dependency on
+    // the crate of the optional entry.)
+}
+
+/// `NotInternableError::items()` through a macro: one item for each offending path, in order, with
+/// its message, the tokens, the source text at its span and the notes with theirs. The macro
+/// reported them as a const, and as many `compile_error!`s.
+#[test]
+fn errors_are_reported_item_by_item_through_a_macro() {
+    use type_leak_test_leaker::scoped::*;
+    type Row = (String, String, String, Vec<(String, String)>);
+    type Rows = &'static [(
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+    )];
+    fn rows(rows: Rows) -> Vec<Row> {
+        rows.iter()
+            .map(|(message, tokens, source, notes)| {
+                (
+                    squash(message),
+                    squash(tokens),
+                    source.to_string(),
+                    notes
+                        .iter()
+                        .map(|(note, at)| (note.to_string(), at.to_string()))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+    let because = |what: &str| format!("it cannot be leaked as a whole because of `{}`", what);
+
+    // Three paths with an elided lifetime: the self type's argument first, then the trait's. The
+    // note is at the lifetime, the error at the path (its first segment, or the whole path on a
+    // compiler which joins spans).
+    let multi = rows(SCOPE_ERRORS_MULTI);
+    assert_eq!(multi.len(), 3);
+    let expected = [
+        ("useabsolutepath:'Three<'_>'", "Three<'_>", "Three"),
+        ("useabsolutepath:'One<'_>'", "One<'_>", "One"),
+        ("useabsolutepath:'Two<'_,T>'", "Two<'_,T>", "Two"),
+    ];
+    for ((message, tokens, source, notes), (e_message, e_tokens, e_source)) in
+        multi.iter().zip(expected)
+    {
+        assert_eq!(message, e_message);
+        assert_eq!(tokens, e_tokens);
+        assert!(source.starts_with(e_source), "{:?}", source);
+        assert_eq!(notes, &[(because("'_"), "'_".to_string())]);
+    }
+    assert_eq!(SCOPE_ERRORS_MULTI_COMPILE_ERRORS, 3);
+
+    // `Self` is denied for the impl.
+    let denied = rows(SCOPE_ERRORS_SELF_DENIED);
+    assert_eq!(denied.len(), 1);
+    assert_eq!(denied[0].0, "useabsolutepath:'Wrap<Self>'");
+    assert_eq!(denied[0].1, "Wrap<Self>");
+    assert!(denied[0].2.starts_with("Wrap"), "{:?}", denied[0].2);
+    assert_eq!(denied[0].3, vec![(because("Self"), "Self".to_string())]);
+    assert_eq!(SCOPE_ERRORS_SELF_DENIED_COMPILE_ERRORS, 1);
+
+    // `Self` where no scope declares it: one item for each mention, at the mention.
+    let without = rows(SCOPE_ERRORS_SELF_WITHOUT_MEANING);
+    assert_eq!(without.len(), 2);
+    let note = "`Self` has no meaning here: it is declared only by a struct, an enum, a union, an impl or a trait, not by a module or generics";
+    for (row, tokens) in without.iter().zip(["Self", "Self::Item"]) {
+        assert_eq!(row.0, "`Self`hasnomeaninghere");
+        assert_eq!(row.1, tokens);
+        assert!(row.2.starts_with("Self"), "{:?}", row.2);
+        assert_eq!(row.3.len(), 1);
+        assert_eq!(row.3[0].0, note);
+        assert!(row.3[0].1.starts_with("Self"));
+    }
+    assert_eq!(SCOPE_ERRORS_SELF_WITHOUT_MEANING_COMPILE_ERRORS, 2);
 }

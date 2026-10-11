@@ -10,7 +10,8 @@
 //! `impl<'a, T> Repeater<(&'a (), T, &'a T), ..> for S { type Type = Rel<'a, T>; }` has `T: 'a` by
 //! the encoding of the generics (`&'a T` in the trait arguments), and is rejected with E0309
 //! without it, as is the copy of a field of a struct. See `Bounds`, `Around` and `SelfBound`, and
-//! `Unbounded`, `UnboundedSelf` and `UnboundedAround` (disabled, as they do not compile).
+//! `Unbounded`, `UnboundedSelf` and `UnboundedAround` (disabled by features, as they do not
+//! compile, and built by tests/outlives.rs to check the error).
 //!
 //! It does not compile if the encoding of a bound is lost (E0309 in the Repeater's
 //! implementations or in the copies of the signatures), nor if a type is leaked with the lifetime
@@ -1254,16 +1255,16 @@ pub mod m {
         }
     }
 
-    // What the bounds which are written above avoid, disabled (`#[cfg(any())]`) as it does not
-    // compile: a path with a lifetime (`Rel<'a, T>`, `Ref<'a, Rel2<T>>`) is not assumed to
-    // require `T: 'a`, so the Repeater's implementation does not have it, unless the signature
-    // writes it. Enabling these gives the errors of the comments (each checked on stable and
-    // nightly).
+    // What the bounds which are written above avoid, disabled (a feature of the crate that tests/
+    // outlives.rs enables, one at a time, to check the error) as it does not compile: a path
+    // with a lifetime (`Rel<'a, T>`, `Ref<'a, Rel2<T>>`) is not assumed to require `T: 'a`, so
+    // the Repeater's implementation does not have it, unless the signature writes it. Enabling
+    // these gives the errors of the comments (each checked on stable and nightly).
 
     /// `error[E0309]: the parameter type `T` may not live long enough`, at the implementation
     /// `impl<'a, T> Repeater<(&'a (), T), ..> for __S { type Type = Rel<'a, T>; }`: `T: 'a` is
     /// only implied in the original, by the definition of `Rel`, which the Leaker cannot see.
-    #[cfg(any())]
+    #[cfg(feature = "negative-unbounded")]
     #[leak(
         helper = crate::__macro,
         repeater = crate::Repeater,
@@ -1275,7 +1276,7 @@ pub mod m {
 
     /// `error[E0309]: the parameter type `__S` may not live long enough`, as `Rel<'a, Self>`
     /// needs `Self: 'a`, which `where Self: Sized + 'a` writes (see `SelfBound`).
-    #[cfg(any())]
+    #[cfg(feature = "negative-unbounded-self")]
     #[leak(
         helper = crate::__macro,
         repeater = crate::Repeater,
@@ -1294,7 +1295,7 @@ pub mod m {
     /// struct from the field, but nothing infers it through the projection `<S as Repeater<(T,),
     /// ..>>::Type`. Writing `T: 'a` in the signature and the struct makes it the generics of
     /// `Rel2<T>` and the copy compile (see `Around`).
-    #[cfg(any())]
+    #[cfg(feature = "negative-unbounded-around")]
     #[leak(
         helper = crate::__macro,
         repeater = crate::Repeater,
@@ -1967,7 +1968,7 @@ pub mod user {
     // `m::UnboundedAround`): `Rel2<T>` has the generics `<T>` of its signature, and the copy
     // `Ref<'a, <Wrapper as Repeater<(T,), ..>>::Type>` is well-formed only with `T: 'a`, which the
     // struct has to write (see `Around`).
-    #[cfg(any())]
+    #[cfg(feature = "negative-unbounded-around")]
     crate::m::UnboundedAround!(copy [Wrapper] {
         pub struct Unbounded<'a, T>(pub ::core::cell::Ref<'a, Rel2<T>>);
     });
@@ -2045,7 +2046,7 @@ pub mod user {
     // stable, E0478 `lifetime bound not satisfied` on nightly, for `inferred` and `unrelated`, and
     // E0521 in the forwarding body); it compiles for `explicit` only. The Repeater's whole path
     // above is read by rustc from the real definition instead.
-    #[cfg(any())]
+    #[cfg(feature = "negative-alone")]
     mod alone {
         use crate::m::{Explicit, Inferred, Unrelated};
 
@@ -2074,7 +2075,10 @@ pub mod user {
             ) -> Unrelated<'a, <Self as crate::Repeater<(&'a (),), 0, 0>>::Type> {
                 crate::m::ObjectDefaults::<'a>::unrelated(&self.0, x)
             }
-            // `local` is left out: the other methods say it all.
+            // The method with a lifetime of its own is not part of the point: as the original.
+            fn local<'b>(&'b self, x: Inferred<'b, dyn crate::m::RelTr>) -> Inferred<'b, dyn crate::m::RelTr> {
+                x
+            }
         }
     }
     /// The forwarding implementations are called through `&dyn Locals`, and the explicit

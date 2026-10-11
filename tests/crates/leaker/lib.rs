@@ -8,6 +8,9 @@
 #[doc(hidden)]
 pub use type_leak_test_macro as __macro;
 
+// So that the crate can name itself with an absolute path (`::type_leak_test_leaker::kinds::Mark`).
+extern crate self as type_leak_test_leaker;
+
 // The Repeater, with const slots to encode const generics of any primitive type.
 type_leak_test_macro::define_repeater!(pub Repeater);
 
@@ -705,4 +708,349 @@ macro_rules! check_dollar_crate {
 
 mod dollar_crate_checks {
     check_dollar_crate!();
+}
+
+/// The crate which the types below name and the Referrer's crate does not depend on.
+#[doc(hidden)]
+pub use type_leak_test_ext as __ext;
+
+/// Types of a crate which the Referrer's crate has no dependency on: they are optional entries
+/// (`::type_leak_test_ext::Ext<..>`), which a strict Referrer replaces with the Repeater's
+/// projections, so the copy does not name the crate; a trusting one leaves them as written, and its
+/// copy is no use in a crate without the dependency (`tests/trusting.rs`).
+pub mod x {
+    use type_leak_test_macro::leak;
+
+    pub use crate::m::Inner;
+
+    pub struct RelX(pub u32);
+
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::x,
+    )]
+    pub trait ExtDep {
+        /// An external type with a relative one in it: `RelX` is a required entry, and the whole
+        /// type an optional one.
+        fn wrapped(&self) -> ::type_leak_test_ext::Ext<(RelX,)>;
+        /// An external type without any relative one: an optional entry only.
+        fn plain(&self, x: ::type_leak_test_ext::Ext<u8>) -> u8;
+    }
+
+    impl ExtDep for Inner {
+        fn wrapped(&self) -> ::type_leak_test_ext::Ext<(RelX,)> {
+            ::type_leak_test_ext::Ext((RelX(21),))
+        }
+        fn plain(&self, x: ::type_leak_test_ext::Ext<u8>) -> u8 {
+            x.0 + 1
+        }
+    }
+}
+
+/// Fragments of impls, analyzed with the scope API: `scope_leak!` is the shape of `coinduction`
+/// (`Leaker::enter_impl(.., false, ..)` with `visit_path_arguments()`, `ImplSelf::Marker`) and, with
+/// `allow_self = true`, of `newer-type` (`ImplSelf::Param`).
+pub mod scoped {
+    use core::marker::PhantomData;
+    use type_leak_test_macro::{scope_errors, scope_leak};
+
+    pub struct Rel<T>(pub T);
+    pub struct Rel2;
+    pub struct Rel3;
+    pub struct Wrap<T: ?Sized>(pub PhantomData<T>);
+    pub struct Holder<T, U>(pub T, pub U);
+
+    pub trait Tr<A, B> {}
+
+    // The impls of the Leaker's crate, which the rewritten types of the Referrer's crate must find.
+    impl<'a, T: ::core::clone::Clone> Tr<Rel<T>, &'a Rel2> for Holder<T, Rel3> {}
+    impl<T: ::core::clone::Clone> Tr<Wrap<Holder<T, u8>>, Rel<T>> for Holder<T, u8> {}
+    impl Tr<Rel2, Rel3> for Holder<Rel2, Rel3> {}
+
+    // `coinduction`: the trait and the self type are resolved by name, so only their arguments are
+    // leaked. `Self` is denied. Three required entries: `Rel3` (no generics, so the marker's impl is
+    // plain), `Rel<T>` and `&'a Rel2`.
+    scope_leak! {
+        id = 7001, marker = M7001,
+        impl<'a, T: ::core::clone::Clone> crate::scoped::Tr<Rel<T>, &'a Rel2>
+            for crate::scoped::Holder<T, Rel3> {}
+    }
+
+    // `newer-type`: `Self` is the self type, and `Wrap<Self>` is an entry of it (the Repeater's impl
+    // is for the self type, `ImplSelf::Param`), next to `Rel<T>` (the impl is for the marker).
+    scope_leak! {
+        id = 7002, marker = M7002, allow_self = true,
+        impl<T: ::core::clone::Clone> crate::scoped::Tr<Wrap<Self>, Rel<T>>
+            for crate::scoped::Holder<T, u8> {}
+    }
+
+    // Only entries which need no generics: the plain case of the marker.
+    scope_leak! {
+        id = 7003, marker = M7003,
+        impl crate::scoped::Tr<Rel2, Rel3> for crate::scoped::Holder<Rel2, Rel3> {}
+    }
+
+    // An absolute path of another crate is an optional entry: no `Rel` is in it, so there is no
+    // required entry at all, and `has_required()` is `false`: the macro emits no impl (the report
+    // says `impls=0`). A Referrer which does not replace it needs none.
+    scope_leak! {
+        id = 7004, marker = M7004,
+        impl crate::scoped::Tr<::type_leak_test_ext::Ext<u8>, u8> for crate::scoped::Holder<u8, u8> {}
+    }
+
+    // The same with the impl of the optional entry (`all = true`), for a strict Referrer, whose
+    // crate has no dependency on the crate of the type.
+    impl Tr<::type_leak_test_ext::Ext<u8>, Rel<u8>> for Holder<u8, u8> {}
+    scope_leak! {
+        id = 7005, marker = M7005, all = true,
+        impl crate::scoped::Tr<::type_leak_test_ext::Ext<u8>, Rel<u8>> for crate::scoped::Holder<u8, u8> {}
+    }
+
+    // Without `all`, a required entry next to an optional one gets the impl of the required one
+    // only (`required()`).
+    scope_leak! {
+        id = 7007, marker = M7007,
+        impl crate::scoped::Tr<::type_leak_test_ext::Ext<u8>, Rel<u8>> for crate::scoped::Holder<u8, u8> {}
+    }
+
+    // A where predicate on a type that is not a parameter belongs to the generics it names: it is in
+    // the context of `Cl<T>`, and the Repeater's impl has it in its where clause (`Cl<T>` is
+    // well-formed only with it).
+    pub struct Cl<T>(pub T)
+    where
+        ::std::vec::Vec<T>: ::core::clone::Clone;
+    impl<T> Tr<Cl<T>, u8> for Holder<T, u8> where ::std::vec::Vec<T>: ::core::clone::Clone {}
+    scope_leak! {
+        id = 7006, marker = M7006,
+        impl<T> crate::scoped::Tr<Cl<T>, u8> for crate::scoped::Holder<T, u8>
+        where ::std::vec::Vec<T>: ::core::clone::Clone {}
+    }
+
+    // The errors of the analysis (`NotInternableError::items()`), reported through a macro:
+    // several offending paths (a lifetime that is elided in a path), each with its span and notes.
+    scope_errors! {
+        name = SCOPE_ERRORS_MULTI,
+        impl<T> crate::scoped::Tr<One<'_>, Two<'_, T>> for crate::scoped::Holder<Three<'_>, u8> {}
+    }
+    // `Self` is denied by `allow_self = false`.
+    scope_errors! {
+        name = SCOPE_ERRORS_SELF_DENIED, allow_self = false,
+        impl crate::scoped::Tr<Wrap<Self>, u8> for crate::scoped::Holder<u8, u8> {}
+    }
+    // `Self` has no meaning in generics: two mentions, two items.
+    scope_errors! {
+        name = SCOPE_ERRORS_SELF_WITHOUT_MEANING, scope = generics,
+        impl crate::scoped::Tr<Wrap<Self>, Rel<Self::Item>> for crate::scoped::Holder<u8, u8> {}
+    }
+}
+
+/// Items of every kind, analyzed by the matching `intern_*` (`#[prop_leak]`, see
+/// `tests/crates/macro/prop.rs`): the Referrer's crate invokes `__tl_prop_<id>!` for each and gets
+/// a copy, whose every type position it compares with a witness of this crate, and
+/// `__tl_report_<id>!` says what the Leaker found (tests/cross_crate.rs).
+pub mod kinds {
+    use core::marker::PhantomData;
+    use type_leak_test_macro::prop_leak;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
+    pub struct Rel(pub u8);
+
+    pub struct Wrap<T: ?Sized>(pub PhantomData<T>);
+    impl<T: ?Sized> Clone for Wrap<T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+    impl<T: ?Sized> Copy for Wrap<T> {}
+    impl<T: ?Sized> Default for Wrap<T> {
+        fn default() -> Self {
+            Wrap(PhantomData)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
+    pub struct Pair<A, B>(pub A, pub B);
+
+    pub struct Lt<'a, T>(pub &'a T);
+
+    pub trait Mark<A> {
+        type Out;
+        fn mark(&self, a: A) -> Self::Out;
+    }
+
+    // Structs.
+
+    /// `Self` (the type) is an entry of it, as are `Rel`, `Wrap<T>`, `Pair<Rel, T>` and `&'a Rel`.
+    #[prop_leak(id = 9001, allow_self = true, prelude = true)]
+    pub struct Node<'a, T: 'a> {
+        pub rel: Rel,
+        pub wrapped: Wrap<T>,
+        pub pair: Pair<Rel, T>,
+        pub borrowed: &'a Rel,
+        pub next: Option<Box<Wrap<Self>>>,
+    }
+
+    /// `Self` is denied, and the struct does not name it.
+    #[prop_leak(id = 9002, allow_self = false)]
+    pub struct Plain<T> {
+        pub rel: Rel,
+        pub wrapped: Wrap<T>,
+        pub pair: Pair<T, Rel>,
+    }
+
+    /// `Self` is denied, and the struct names it: the Leaker rejects it.
+    #[prop_leak(id = 9003, allow_self = false)]
+    pub struct SelfDenied {
+        pub me: Wrap<Self>,
+    }
+
+    /// An optional entry (a type of another crate), which a strict Referrer replaces. The crate
+    /// is not a dependency of the Referrer's crate.
+    #[prop_leak(id = 9004, allow_self = true)]
+    pub struct Holds {
+        pub wrapped: ::type_leak_test_ext::Ext<(Rel,)>,
+        pub plain: ::type_leak_test_ext::Ext<u8>,
+        pub rel: Rel,
+    }
+
+    /// The where clause of a type that is not a parameter (`Vec<T>: Clone`) is in the context of the
+    /// entry `Cl<T>`, and in the where clause of the Repeater's impl.
+    pub struct Cl<T>(pub T)
+    where
+        ::std::vec::Vec<T>: ::core::clone::Clone;
+
+    #[prop_leak(id = 9005, allow_self = false)]
+    pub struct Needs<T>
+    where
+        ::std::vec::Vec<T>: ::core::clone::Clone,
+    {
+        pub cl: Cl<T>,
+    }
+
+    // Enums.
+
+    #[prop_leak(id = 9011, allow_self = true)]
+    pub enum Choice<T> {
+        Rel(Rel),
+        Wrapped(Wrap<T>),
+        Pair { pair: Pair<Rel, T>, flag: bool },
+        Me(Wrap<Self>),
+        Nothing,
+    }
+
+    #[prop_leak(id = 9012, allow_self = false)]
+    pub enum Borrow<'a, T: 'a> {
+        Lt(Lt<'a, T>),
+        Rel(Rel),
+    }
+
+    // Unions.
+
+    #[prop_leak(id = 9021, allow_self = false)]
+    pub union Bits<T: ::core::marker::Copy> {
+        pub rel: Rel,
+        pub wrapped: Wrap<T>,
+        pub pair: Pair<Rel, Rel>,
+    }
+
+    #[prop_leak(id = 9022, allow_self = true)]
+    pub union BitsSelf {
+        pub rel: Rel,
+        pub me: Wrap<Self>,
+    }
+
+    // Impls.
+
+    pub struct Holder<T>(pub T);
+
+    /// An inherent impl: `Self` is `Holder<T>`.
+    #[prop_leak(id = 9031, allow_self = true)]
+    impl<T> Holder<T> {
+        pub fn rel(&self) -> Rel {
+            Rel(1)
+        }
+        pub fn wrapped(&self) -> Wrap<T> {
+            Wrap(PhantomData)
+        }
+        pub fn me(&self) -> Wrap<Self> {
+            Wrap(PhantomData)
+        }
+        pub fn pair(&self, p: Pair<Rel, T>) -> Pair<T, Rel> {
+            Pair(p.1, p.0)
+        }
+    }
+
+    /// An impl of a trait: the trait is `::type_leak_test_leaker::kinds::Mark`, an absolute path (its arguments must
+    /// be too, as a bound is copied as written), and the associated type and the method are leaked.
+    #[prop_leak(id = 9032, allow_self = true)]
+    impl<T> ::type_leak_test_leaker::kinds::Mark<u8> for Holder<T> {
+        type Out = Pair<Rel, Wrap<T>>;
+        fn mark(&self, a: u8) -> Pair<Rel, Wrap<T>> {
+            Pair(Rel(a), Wrap(PhantomData))
+        }
+    }
+
+    /// A relative argument of the trait is leaked too (the trait itself is resolved by name).
+    #[prop_leak(id = 9034, allow_self = true)]
+    impl<T> ::type_leak_test_leaker::kinds::Mark<Rel> for Holder<Wrap<T>> {
+        type Out = Rel;
+        fn mark(&self, a: Rel) -> Rel {
+            a
+        }
+    }
+
+    /// `Self` is denied for the impl, which does not name it.
+    #[prop_leak(id = 9033, allow_self = false)]
+    impl<T> Holder<Wrap<T>> {
+        pub fn inner(&self) -> Rel {
+            Rel(3)
+        }
+    }
+
+    // Modules.
+
+    /// A module: what it declares (`Local`) is copied with it and is not leaked, the types it gets
+    /// from outside (`super::Rel`) are, and a nested module is analyzed too.
+    #[prop_leak(id = 9041)]
+    pub mod nested {
+        use super::{Pair, Rel, Wrap};
+
+        pub struct Local(pub u8);
+        pub struct Holds<T> {
+            pub rel: Rel,
+            pub wrapped: Wrap<T>,
+            pub pair: Pair<Rel, T>,
+            pub local: Local,
+        }
+        pub mod deeper {
+            use super::super::Rel;
+            pub struct Deep(pub Rel);
+        }
+    }
+
+    // Traits.
+
+    /// `Self` is denied for the trait (`sumtype`'s way), and it does not name `Self`.
+    #[prop_leak(id = 9051, allow_self = false)]
+    pub trait NoSelf {
+        fn wrapped(&self) -> Wrap<Rel>;
+        fn pair<T>(&self, x: Pair<T, Rel>) -> Rel;
+    }
+
+    /// `Self` is denied, and the trait names it: the Leaker rejects it.
+    #[prop_leak(id = 9052, allow_self = false)]
+    pub trait SelfDeniedTrait {
+        fn me(&self) -> Wrap<Self>;
+    }
+
+    /// A trait which is implemented for an unsized type in the Referrer's crate (`dyn_host`): the
+    /// Repeater's impls of the entries that name `Self` must declare `__S: ?Sized`.
+    #[prop_leak(id = 9053, allow_self = true)]
+    pub trait Unsized {
+        fn me(&self) -> Wrap<Self>;
+        fn borrowed<'a>(&'a self, x: &'a Self) -> Wrap<&'a Self>;
+        fn rel(&self) -> Rel;
+        fn pair(&self, x: Pair<Rel, Wrap<Self>>) -> Rel;
+    }
 }

@@ -32,6 +32,7 @@
 //! ```
 
 mod prop;
+mod scope;
 
 use proc_macro2::{Punct, Spacing, Span, TokenStream, TokenTree};
 use std::collections::HashMap;
@@ -184,6 +185,115 @@ pub fn leak_strict(
     match Leaker::new().intern_trait(&item_trait, true) {
         Ok(_) => quote!(#item_trait).into(),
         Err(e) => quote!(#e).into(),
+    }
+}
+
+/// Like `leak_strict`, but enters only the generics of the trait (`Leaker::enter_generics()`), where
+/// `Self` has no meaning, and visits the types of its methods: a mention of `Self` is a
+/// `NotInternableError::SelfWithoutMeaning`, reported with its `ToTokens` implementation (for
+/// tests/diagnostic.rs).
+#[proc_macro_attribute]
+pub fn leak_generics(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let item_trait = parse_macro_input!(item as ItemTrait);
+    let result = Leaker::new().enter_generics(&item_trait.generics, |view| {
+        for trait_item in &item_trait.items {
+            if let TraitItem::Fn(method) = trait_item {
+                for input in &method.sig.inputs {
+                    if let FnArg::Typed(arg) = input {
+                        view.visit_type(&arg.ty);
+                    }
+                }
+                if let ReturnType::Type(_, ty) = &method.sig.output {
+                    view.visit_type(ty);
+                }
+            }
+        }
+    });
+    match result {
+        Ok(_) => quote!(#item_trait).into(),
+        Err(e) => quote!(#e).into(),
+    }
+}
+
+/// `#[leak_tagged(tag = "current")]` on a trait analyzes it and exports `macro_rules!
+/// __tagged_<Trait>` which hands the serialized Referrer to `__read_referrer!`, as the macro of a
+/// Referrer's crate does with the one it gets from the Leaker's crate. The tag of the format
+/// (`Referrer::FORMAT_VERSION`) it carries is `"current"` (the right one), `"stale"` (the previous
+/// version), `"future"` (the next one), `"none"` (missing) or `"garbled"` (not a tag at all), so
+/// that the error of a Referrer serialized by another version of `type-leak` can be tested through
+/// a macro (tests/diagnostic.rs).
+#[proc_macro_attribute]
+pub fn leak_tagged(
+    attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let tag = match &parse_macro_input!(attr as MetaNameValue).value {
+        Expr::Lit(ExprLit {
+            lit: Lit::Str(tag), ..
+        }) => tag.value(),
+        other => return Error::new(other.span(), "expected a string").to_compile_error().into(),
+    };
+    let item_trait = parse_macro_input!(item as ItemTrait);
+    let mut leaker = Leaker::new();
+    let context = match leaker.intern_trait(&item_trait, true) {
+        Ok(context) => context,
+        Err(e) => return quote!(#e).into(),
+    };
+    let referrer = leaker.finish();
+    let mut tokens: Vec<TokenTree> = quote!(#referrer).into_iter().collect();
+    // The first token of a Referrer is its tag, `"type-leak:<version>"` or the like.
+    let current: LitStr = match parse2(tokens[0].clone().into()) {
+        Ok(current) => current,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let prefix = current.value();
+    let prefix = prefix.trim_end_matches(|c: char| c.is_ascii_digit());
+    let version = Referrer::FORMAT_VERSION;
+    match tag.as_str() {
+        "current" => (),
+        "stale" => tokens[0] = proc_macro2::Literal::string(&format!("{}{}", prefix, version - 1)).into(),
+        "future" => tokens[0] = proc_macro2::Literal::string(&format!("{}{}", prefix, version + 1)).into(),
+        "garbled" => tokens[0] = proc_macro2::Literal::string("not-a-tag").into(),
+        "none" => {
+            tokens.remove(0);
+        }
+        _ => return Error::new(Span::call_site(), "unknown tag").to_compile_error().into(),
+    }
+    let mac_name = Ident::new(&format!("__tagged_{}", item_trait.ident), Span::call_site());
+    let tokens: TokenStream = tokens.into_iter().collect();
+    quote! {
+        #item_trait
+        macro_rules! #mac_name {
+            () => {
+                ::type_leak_test_macro::__read_referrer! { { #tokens , #context } }
+            };
+        }
+    }
+    .into()
+}
+
+/// The Referrer's side of `leak_tagged`: parses `{ referrer , context }`, which fails if the
+/// format tag of the Referrer is not the one of this `type-leak`.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __read_referrer(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    struct Input;
+    impl Parse for Input {
+        fn parse(input: ParseStream) -> Result<Self> {
+            let content;
+            braced!(content in input);
+            let _: Referrer = content.parse()?;
+            content.parse::<Token![,]>()?;
+            let _: ContextId = content.parse()?;
+            Ok(Input)
+        }
+    }
+    match syn::parse::<Input>(input) {
+        Ok(Input) => quote!(const _: () = ();).into(),
+        Err(e) => e.to_compile_error().into(),
     }
 }
 
@@ -434,8 +544,14 @@ struct Header {
 /// `copy [SelfTy] { items }`: the items written with the types of the Leaker (even a free function
 /// or a struct, which have no `Self`: it is `SelfTy`, if given) are copied with the leaked types
 /// rewritten.
+///
+/// `show NAME [SelfTy] { items }` does not emit the copies, but `pub const NAME: &str`, which holds
+/// their tokens, so that a test can tell what a Referrer wrote (e.g. a strict one from a trusting
+/// one).
 struct CopyInput {
     header: Header,
+    /// The name of the const of `show`.
+    show: Option<Ident>,
     self_ty: Option<Type>,
     items: Vec<Item>,
 }
@@ -489,9 +605,17 @@ impl Parse for Input {
         }
         if input.peek(Ident) && !input.peek(Token![impl]) {
             let keyword: Ident = input.parse()?;
-            if keyword != "copy" {
-                return Err(Error::new(keyword.span(), "expected `impl` or `copy`"));
+            if keyword != "copy" && keyword != "show" {
+                return Err(Error::new(
+                    keyword.span(),
+                    "expected `impl`, `copy` or `show`",
+                ));
             }
+            let show = if keyword == "show" {
+                Some(input.parse::<Ident>()?)
+            } else {
+                None
+            };
             let content;
             bracketed!(content in input);
             let self_ty = if content.is_empty() {
@@ -507,6 +631,7 @@ impl Parse for Input {
             }
             return Ok(Input::Copy(CopyInput {
                 header,
+                show,
                 self_ty,
                 items,
             }));
@@ -710,6 +835,7 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
                 repeater,
                 ..
             },
+        show,
         self_ty,
         items,
     } = input;
@@ -750,9 +876,13 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
         drop(visitor);
         copies.extend(quote!(#item));
     }
-    match error {
-        Some(e) => Err(e),
-        None => Ok(copies),
+    match (error, show) {
+        (Some(e), _) => Err(e),
+        (None, Some(name)) => {
+            let text = copies.to_string();
+            Ok(quote!(pub const #name: &str = #text;))
+        }
+        (None, None) => Ok(copies),
     }
 }
 
@@ -910,6 +1040,36 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
             #methods
         }
     })
+}
+
+/// The Leaker's side of a fragment of an impl, analyzed with the scope API (`Leaker::enter_impl()`),
+/// in the style of `coinduction`: see `scope.rs`.
+#[proc_macro]
+pub fn scope_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match scope::leak(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Like `scope_leak!`, for an analysis which fails: emits the errors of
+/// `NotInternableError::items()` as a const, see `scope.rs`.
+#[proc_macro]
+pub fn scope_errors(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match scope::errors(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// The Referrer's side of `scope_leak!`, invoked through the `macro_rules!` that it exports.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __scope_apply(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match scope::apply(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
 }
 
 /// The Leaker's side of `tests/prop_cross_crate.rs`: analyzes the struct, enum, union, trait, impl

@@ -10,3 +10,5 @@ path = "lib.rs"
 
 [dependencies]
 type-leak-test-macro = { path = "../macro" }
+# Named by the Leaker's types, but not a dependency of the Referrer's crate.
+type-leak-test-ext = { path = "../ext" }

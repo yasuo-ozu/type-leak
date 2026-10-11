@@ -1,0 +1,21 @@
+[package]
+name = "type-leak-test-trusting"
+version = "0.0.0"
+edition = "2018"
+publish = false
+description = "A Referrer's crate without the dependency of an optional entry, for tests/trusting.rs"
+
+[lib]
+path = "lib.rs"
+
+# This crate depends on the Leaker's crate (`type-leak-test-leaker`), which depends on
+# `type-leak-test-ext`; this crate does not.
+[dependencies]
+type-leak-test-leaker = { path = "../leaker" }
+
+[features]
+# The Referrer replaces the optional entries too. Without it, the crate does not compile.
+strict = []
+
+# Built on its own by tests/trusting.rs.
+[workspace]

@@ -138,7 +138,7 @@ fn analyze(
     Ok((leaker.finish(), context, assertions))
 }
 
-fn identity_args(generics: &Generics) -> Vec<GenericArgument> {
+pub(crate) fn identity_args(generics: &Generics) -> Vec<GenericArgument> {
     generics
         .params
         .iter()
@@ -206,22 +206,22 @@ fn repeater_impls(referrer: &Referrer, id: u64) -> Result<Vec<(Vec<Ident>, Token
 
 /// What `Self` is at a type position, for the witness.
 #[derive(Clone)]
-struct SelfSub {
-    ty: Type,
+pub(crate) struct SelfSub {
+    pub(crate) ty: Type,
     /// The trait `Self::A` is an associated type of.
-    trait_ref: Option<Path>,
+    pub(crate) trait_ref: Option<Path>,
     /// A trait: the witness has the implementor as a type parameter.
-    bound: bool,
+    pub(crate) bound: bool,
 }
 
 /// A type that the item copies: a field, a parameter, a return type, an associated type or const.
-struct Position {
+pub(crate) struct Position {
     /// The modules from the analyzed one, starting with its own name.
-    mods: Vec<Ident>,
+    pub(crate) mods: Vec<Ident>,
     /// The generics around, outermost first.
-    layers: Vec<Generics>,
-    self_sub: Option<SelfSub>,
-    ty: Type,
+    pub(crate) layers: Vec<Generics>,
+    pub(crate) self_sub: Option<SelfSub>,
+    pub(crate) ty: Type,
 }
 
 /// `host`: in the Referrer's crate, the type that implements the trait, and the path of the module
@@ -457,7 +457,7 @@ fn colon_is_taken_as_output(ty: &Type) -> bool {
 /// Replaces `Self` by what it is at the position of the witness. The type is substituted as
 /// tokens, so it is parenthesized where its precedence matters: as the bounded type of a where
 /// predicate (`(&fn(A)): 'y`) and as the pointee of a reference or a pointer (`&(dyn A + B)`).
-struct SelfSubst<'a>(&'a SelfSub);
+pub(crate) struct SelfSubst<'a>(pub(crate) &'a SelfSub);
 
 impl VisitMut for SelfSubst<'_> {
     fn visit_predicate_type_mut(&mut self, i: &mut PredicateType) {
@@ -524,7 +524,7 @@ fn witness_name(id: u64, j: usize) -> Ident {
 }
 
 /// `pub fn __tl_w_<id>_<j><generics>() -> PhantomData<ty>`, with the generics around the position.
-fn witness_fn(id: u64, j: usize, pos: &Position) -> TokenStream {
+pub(crate) fn witness_fn(id: u64, j: usize, pos: &Position) -> TokenStream {
     let mut ty = pos.ty.clone();
     let mut generics = merge_generics(&pos.layers);
     if let Some(sub) = &pos.self_sub {
@@ -823,8 +823,19 @@ impl Projector<'_> {
 
 struct Rewritten {
     item: Item,
-    /// The host type of a trait.
+    /// The name of the host type of a trait.
     host: Option<Ident>,
+    /// The host is `dyn <host>`, an unsized type (the implementor of the trait is not `Sized`).
+    dyn_host: bool,
+}
+
+/// The host type: a unit struct `Host`, or `dyn Host + 'static` if the implementor must be unsized.
+fn host_type(host: &Ident, dyn_host: bool) -> Type {
+    if dyn_host {
+        parse_quote!(dyn #host + 'static)
+    } else {
+        parse_quote!(#host)
+    }
 }
 
 /// Rewrites a copy of `item`, which is in the module `leaker_path` of the Leaker's crate.
@@ -834,6 +845,7 @@ fn rewrite(
     item: &Item,
     args: &Args,
     leaker_path: &Path,
+    dyn_host: bool,
 ) -> Result<Rewritten> {
     let mut repeater = leaker_path.clone();
     repeater.segments = repeater.segments.iter().take(1).cloned().collect();
@@ -872,11 +884,7 @@ fn rewrite(
         }
         Item::Trait(_) => {
             // `Self` is the host in the copy, which is an impl for it.
-            let host: Type = {
-                let host = host.as_ref().unwrap();
-                parse_quote!(#host)
-            };
-            projector.bound_self = Some(host);
+            projector.bound_self = Some(host_type(host.as_ref().unwrap(), dyn_host));
         }
         Item::Impl(i) => {
             // The self type is written in the Leaker's crate: rewrite it like any type.
@@ -928,6 +936,7 @@ fn rewrite(
     Ok(Rewritten {
         item: rewritten,
         host,
+        dyn_host,
     })
 }
 
@@ -965,10 +974,10 @@ fn const_value(ty: &Type) -> Expr {
 }
 
 fn host_arg(rewritten: &Rewritten, leaker_path: &Path) -> Option<Host> {
-    rewritten.host.as_ref().map(|host| {
-        let ty: Type = parse_quote!(#host);
-        (ty, leaker_path.clone())
-    })
+    rewritten
+        .host
+        .as_ref()
+        .map(|host| (host_type(host, rewritten.dyn_host), leaker_path.clone()))
 }
 
 /// An implementation of the Leaker's trait for the host, with the signatures of the copy.
@@ -979,6 +988,7 @@ fn host_impl(
     item: &ItemTrait,
     original: &ItemTrait,
     host: &Ident,
+    dyn_host: bool,
     leaker_path: &Path,
 ) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = item.generics.split_for_impl();
@@ -1004,10 +1014,20 @@ fn host_impl(
             _ => (),
         }
     }
+    let host_ty = host_type(host, dyn_host);
+    // An unsized host is a trait object of a trait of its own: a local type, so that the impl of
+    // the Leaker's trait for it is allowed in the Referrer's crate.
+    let declaration = if dyn_host {
+        quote!(pub trait #host {})
+    } else {
+        quote! {
+            #[derive(Debug, Clone, Default)]
+            pub struct #host;
+        }
+    };
     quote! {
-        #[derive(Debug, Clone, Default)]
-        pub struct #host;
-        impl #impl_generics #leaker_path::#name #ty_generics for #host #where_clause {
+        #declaration
+        impl #impl_generics #leaker_path::#name #ty_generics for #host_ty #where_clause {
             #items
         }
     }
@@ -1064,7 +1084,7 @@ fn comparable(
         .collect()
 }
 
-fn check_fn(id: u64, j: usize, pos: &Position, target: &Path, host: Option<&Ident>) -> TokenStream {
+pub(crate) fn check_fn(id: u64, j: usize, pos: &Position, target: &Path, host: Option<&Type>) -> TokenStream {
     let mut generics = merge_generics(&pos.layers);
     let mut ty = pos.ty.clone();
     if let Some(sub) = &pos.self_sub {
@@ -1169,7 +1189,7 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream) -> Result<TokenStream> 
 
     // Count what the Referrer will check, by rewriting a copy here too.
     let dummy: Path = parse_quote!(::__dummy);
-    let report = match rewrite(&referrer, context, &original, &args, &dummy) {
+    let report = match rewrite(&referrer, context, &original, &args, &dummy, false) {
         Ok(rewritten) => {
             let host = host_arg(&rewritten, &dummy);
             let rewritten_positions = comparable(&rewritten.item, &original, &args, host.as_ref());
@@ -1251,6 +1271,8 @@ struct ApplyInput {
     /// The module that contains the item, in the Leaker's crate.
     path: Path,
     strict: bool,
+    /// The host of a trait is `dyn Host`.
+    dyn_host: bool,
 }
 
 fn braced_parse<T: Parse>(input: ParseStream) -> Result<T> {
@@ -1276,15 +1298,22 @@ impl Parse for ApplyInput {
         }
         input.parse::<Token![=]>()?;
         let path = Path::parse_mod_style(input)?;
-        let strict = if input.parse::<Option<Token![,]>>()?.is_some() {
+        // Flags after the path: `strict`, and `dyn_host` (the trait is implemented for `dyn Host`,
+        // an unsized type, instead of a unit struct).
+        let (mut strict, mut dyn_host) = (false, false);
+        while input.parse::<Option<Token![,]>>()?.is_some() {
             let keyword: Ident = input.parse()?;
-            if keyword != "strict" {
-                return Err(Error::new(keyword.span(), "expected `strict`"));
+            match keyword.to_string().as_str() {
+                "strict" => strict = true,
+                "dyn_host" => dyn_host = true,
+                _ => {
+                    return Err(Error::new(
+                        keyword.span(),
+                        "expected `strict` or `dyn_host`",
+                    ))
+                }
             }
-            true
-        } else {
-            false
-        };
+        }
         Ok(Self {
             referrer,
             context,
@@ -1292,6 +1321,7 @@ impl Parse for ApplyInput {
             item,
             path,
             strict,
+            dyn_host,
         })
     }
 }
@@ -1305,6 +1335,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         item,
         path,
         strict,
+        dyn_host,
     } = parse2(input)?;
     // `strict` makes the Referrer replace the optional entries as well.
     let referrer = if strict {
@@ -1312,7 +1343,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     } else {
         referrer
     };
-    let rewritten = rewrite(&referrer, context, &item, &args, &path)?;
+    let rewritten = rewrite(&referrer, context, &item, &args, &path, dyn_host)?;
     let id = args.id;
 
     // The checks call the witnesses by the path of the module of the item, in the Leaker's crate
@@ -1320,14 +1351,20 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     let host = host_arg(&rewritten, &path);
     let mut checks = TokenStream::new();
     for (j, pos) in comparable(&rewritten.item, &item, &args, host.as_ref()) {
-        checks.extend(check_fn(id, j, &pos, &path, rewritten.host.as_ref()));
+        checks.extend(check_fn(
+            id,
+            j,
+            &pos,
+            &path,
+            host.as_ref().map(|(ty, _)| ty),
+        ));
     }
     let mut copy = rewritten.item.clone();
     let body = match &mut copy {
         Item::Trait(t) => {
             let host = rewritten.host.as_ref().unwrap();
             match &item {
-                Item::Trait(original) => host_impl(t, original, host, &path),
+                Item::Trait(original) => host_impl(t, original, host, dyn_host, &path),
                 _ => unreachable!(),
             }
         }

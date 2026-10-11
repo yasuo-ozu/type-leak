@@ -92,3 +92,57 @@ type_leak_test_leaker::m::External!(strict impl<T> External<T> for Strict => 0 {
         type_leak_test_leaker::m::External::<T>::receiver(::std::boxed::Box::new(self.0))
     }
 });
+
+// What the two Referrers write for the same items, as text: the trusting one names the crate (its
+// relative types are replaced), the strict one replaces the whole type of it. This crate has no
+// dependency on that crate (`type_leak_test_ext`), so it cannot compile either copy: the strict one
+// is compiled in `tests/crates/trusting`, which has the feature `strict` for it.
+type_leak_test_leaker::x::ExtDep!(show TRUSTING_COPY [Wrapper] {
+    pub fn f(x: ::type_leak_test_ext::Ext<(RelX,)>, y: ::type_leak_test_ext::Ext<u8>) {}
+});
+type_leak_test_leaker::x::ExtDep!(strict show STRICT_COPY [Wrapper] {
+    pub fn f(x: ::type_leak_test_ext::Ext<(RelX,)>, y: ::type_leak_test_ext::Ext<u8>) {}
+});
+
+/// Fragments of impls analyzed with the scope API (`Leaker::enter_impl()`): the Referrer's copy of
+/// each is checked against the original with a witness, and by finding the impl of the Leaker's
+/// crate for the rewritten types.
+pub mod scoped {
+    // `coinduction`'s shape: `ImplSelf::Marker`.
+    type_leak_test_leaker::__scope_apply_7001!(path = ::type_leak_test_leaker::scoped);
+    // `newer-type`'s shape: `ImplSelf::Param`, `Self` is the self type.
+    type_leak_test_leaker::__scope_apply_7002!(path = ::type_leak_test_leaker::scoped);
+    type_leak_test_leaker::__scope_apply_7003!(path = ::type_leak_test_leaker::scoped);
+    // A where clause of the impl, which the Repeater's impl has too.
+    type_leak_test_leaker::__scope_apply_7006!(path = ::type_leak_test_leaker::scoped);
+}
+
+/// Items of every kind, copied by the Referrer: each copy has a witness for each type position, so
+/// this crate compiles only if every rewritten type is the original one.
+pub mod kinds {
+    use type_leak_test_leaker::kinds::{Rel, Wrap};
+    pub use type_leak_test_leaker::kinds::Pair;
+    #[allow(unused_imports)]
+    use Rel as _;
+    #[allow(unused_imports)]
+    use Wrap as _;
+
+    type_leak_test_leaker::__tl_prop_9001!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9002!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9005!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9011!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9012!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9021!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9022!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9031!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9032!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9033!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9034!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9041!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9051!(path = ::type_leak_test_leaker::kinds);
+    // The rejected ones expand to nothing.
+    type_leak_test_leaker::__tl_prop_9003!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9052!(path = ::type_leak_test_leaker::kinds);
+    // A trait implemented for an unsized type: `dyn Host9053`.
+    type_leak_test_leaker::__tl_prop_9053!(path = ::type_leak_test_leaker::kinds, dyn_host);
+}

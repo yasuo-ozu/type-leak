@@ -22,9 +22,12 @@
 //! `<S as Repeater<(&'a (), T, &'a T), ..>>::Type` has the same encoding). Without the bound
 //! written (`fn f<'a, T>(&self, x: Rel<'a, T>)`) the header implies nothing about `T: 'a`, and
 //! rustc rejects the implementation with `error[E0309]: the parameter type `T` may not live long
-//! enough`. The fixture has this failing case disabled (`#[cfg(any())]`, `m::Unbounded`), and the
-//! same for `Self` (`m::UnboundedSelf`, E0309 for `__S`) and for the field of a struct (`m::
-//! UnboundedAround`, see below), each checked to fail with E0309 on stable and nightly.
+//! enough`. The fixture has this failing case disabled (the feature `negative-unbounded`, `m::
+//! Unbounded`), and the same for `Self` (`negative-unbounded-self`, `m::UnboundedSelf`, E0309 for
+//! `__S`) and for the field of a struct (`negative-unbounded-around`, `m::UnboundedAround`, see
+//! below). Each is built here with its feature, and must fail with exactly the error written
+//! above it (E0309 on stable and nightly); so must the alternative that is not taken for a trait
+//! object (`negative-alone`, E0308 or E0478, and E0521).
 //!
 //! The fixture also has the cases around it: the control `Loose<'a, T>` (which does not require
 //! the bound, so nothing is written and the copy is the same as the original), references and
@@ -86,25 +89,108 @@
 //! proves it but the header, compile as well.
 //!
 //! The fixture is built on its own, so that a failure of it does not break the other cross-crate
-//! tests (the Leaker's crate in `tests/crates/leaker` is a dependency of all of them).
+//! tests (the Leaker's crate in `tests/crates/leaker` is a dependency of all of them). The tests
+//! check what rustc printed, not only whether it succeeded: the warnings of the good build, and
+//! the errors of each negative control.
 
-use std::process::Command;
+#[path = "common/nested.rs"]
+mod nested;
 
+/// The good build compiles, with no warning but the ones the fixture is known to have: a
+/// parenthesized trait object (`&'a (dyn Iterator<Item = Plain>)`) in the copy of `Dyns`, which the
+/// copy keeps as it is written. Any other lint (an unused lifetime or import, a dead item) in a
+/// copy or in a Repeater's implementation would be new.
 #[test]
 fn implied_outlives_bounds_are_kept() {
-    let output = Command::new(env!("CARGO"))
-        .args(["build", "--quiet", "--manifest-path"])
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/crates/outlives/Cargo.toml"
-        ))
-        .env(
-            "CARGO_TARGET_DIR",
-            concat!(env!("CARGO_TARGET_TMPDIR"), "/outlives"),
-        )
-        .env("CARGO_TERM_COLOR", "never")
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(output.status.success(), "{}", stderr);
+    let built = nested::cargo("outlives", &["build"], &[]);
+    assert!(built.success, "{}", built.stderr);
+    assert!(
+        nested::headlines(&built.stderr, "error").is_empty(),
+        "{}",
+        built.stderr
+    );
+    for warning in nested::headlines(&built.stderr, "warning") {
+        assert_eq!(
+            warning, "warning: unnecessary parentheses around type",
+            "{}",
+            built.stderr
+        );
+    }
+}
+
+/// Builds the fixture with a negative control, which must fail to compile with exactly these
+/// errors (their codes, and the headline of the first).
+fn negative(feature: &str, codes: &[&str], headline: &str) {
+    let built = nested::cargo("outlives", &["check"], &[feature]);
+    assert!(
+        !built.success,
+        "`{}` compiles, but is a negative control:\n{}",
+        feature, built.stderr
+    );
+    let mut got = nested::error_codes(&built.stderr);
+    // The error of a trait object whose lifetime was written where the path makes it `'static` is
+    // E0308 (`method not compatible with trait`) on stable, and E0478 (`lifetime bound not
+    // satisfied`) on nightly.
+    for code in &mut got {
+        if code == "E0478" {
+            *code = "E0308".to_string();
+        }
+    }
+    got.sort();
+    assert_eq!(got, codes, "`{}`:\n{}", feature, built.stderr);
+    assert!(
+        built.stderr.contains(headline),
+        "`{}` has no `{}`:\n{}",
+        feature,
+        headline,
+        built.stderr
+    );
+}
+
+/// `Rel<'a, T>` without `T: 'a` written: the Repeater's implementation, whose header encodes `T`
+/// but implies nothing about `'a`, is rejected (`m::Unbounded`).
+#[test]
+fn the_bound_of_a_path_with_a_lifetime_must_be_written() {
+    negative(
+        "negative-unbounded",
+        &["E0309"],
+        "error[E0309]: the parameter type `T` may not live long enough",
+    );
+}
+
+/// The same for `Self` (`m::UnboundedSelf`): `Rel<'a, Self>` needs `Self: 'a`, and the header
+/// encodes `__S` only.
+#[test]
+fn the_bound_of_self_in_a_path_with_a_lifetime_must_be_written() {
+    negative(
+        "negative-unbounded-self",
+        &["E0309"],
+        "error[E0309]: the parameter type `__S` may not live long enough",
+    );
+}
+
+/// The field of a struct (`m::UnboundedAround`): `Rel2<T>` is leaked with the generics `<T>` its
+/// signature writes, so the copy `Ref<'a, <Wrapper as Repeater<(T,), ..>>::Type>` is not
+/// well-formed without `T: 'a`, which nothing infers through the projection.
+#[test]
+fn the_bound_around_a_type_leaked_alone_must_be_written() {
+    negative(
+        "negative-unbounded-around",
+        &["E0309"],
+        "error[E0309]: the parameter type `T` may not live long enough",
+    );
+}
+
+/// The alternative which is not taken for a trait object without a lifetime bound as the argument
+/// of a path with a lifetime: leaking it alone with `+ 'a` written, and keeping the path around
+/// the projection in the copy. The object lifetime of `Inferred` and `Unrelated` is `'static`, so
+/// the copy returns another type (E0308 on stable, E0478 on nightly, for each of the two), and
+/// the forwarding body hands out a borrow that does not live that long (E0521).
+#[test]
+fn a_trait_object_must_be_leaked_with_its_path() {
+    negative(
+        "negative-alone",
+        &["E0308", "E0308", "E0521", "E0521"],
+        "borrowed data escapes outside of method",
+    );
 }
