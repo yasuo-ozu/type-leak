@@ -36,11 +36,32 @@ A name in Rust means something only where it is written. If a macro copies `fn g
 - **Repeater**: the one trait both crates see. `impl Repeater<ARGS, ID, NTH> for .. { type Type = ..; }` turns the index `NTH` of an entry back into its type. `ID` identifies the Leaker: a number that is unique for each analyzed item (a proc macro does not know the path of the item, so hash the name of its crate and of the item), and `ARGS` encodes the generics the entry uses.
 - **Context**: what gives an entry its meaning: the generics it uses, what `Self` is, the module. A `ContextId` names one. The id returned for an item is its *top-level* context.
 
-Define the Repeater once, at the root of crate A (the crate that writes the impls). Crate A implements it for any `Self`, which the orphan rule (E0210) allows only for a trait of the crate itself: so it is not in the crate of your proc macros, which can export only macros, and not in a third crate. The simplest definition works if the const parameters are `usize` or `u64` (`repeater_definition()` generates one with slots for any primitive type):
+Define the Repeater once, at the root of crate A (the crate that writes the impls). Crate A implements it for any `Self`, which the orphan rule (E0210) allows only for a trait of the crate itself: so it is not in the crate of your proc macros, which can export only macros, and not in a third crate. Emit it with `repeater_definition()`, which generates:
 
 ```rust,ignore
-pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> { type Type: ?Sized; }
+pub trait Repeater<
+    T: ?Sized,
+    const ID: u64,
+    const NTH: usize,
+    // One slot per primitive type, for const generics (`RepeaterSlots` fills them).
+    const BOOL: bool = false,
+    const CHAR: char = '\0',
+    const U8: u8 = 0,
+    const U16: u16 = 0,
+    const U32: u32 = 0,
+    const U128: u128 = 0,
+    const I8: i8 = 0,
+    const I16: i16 = 0,
+    const I32: i32 = 0,
+    const I64: i64 = 0,
+    const I128: i128 = 0,
+    const ISIZE: isize = 0,
+> {
+    type Type: ?Sized;
+}
 ```
+
+Impls and paths write only the first three arguments (`Repeater<ARGS, ID, NTH>`); the slots appear only inside the encoding of a const parameter that is not `usize` ([Const generics]). The slots need Rust 1.59. If every const parameter is `usize` or `u64`, the first three parameters alone are enough.
 
 # Quick start
 
