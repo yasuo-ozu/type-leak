@@ -7,6 +7,8 @@
 [GitHub Actions]: https://github.com/yasuo-ozu/type-leak/actions/workflows/rust.yml/badge.svg
 [actions]: https://github.com/yasuo-ozu/type-leak/actions/workflows/rust.yml
 
+<p align="center"><img src="https://raw.githubusercontent.com/yasuo-ozu/type-leak/main/logo.png" alt="type-leak" width="240"></p>
+
 A name in Rust means something only where it is written. When a proc macro copies `fn get(&self) -> MyType` from crate A into code that crate B expands, the copy looks up `MyType` in crate B, and finds nothing or the wrong type.
 
 `type-leak` fixes this for proc-macro authors. In crate A, it finds the types that depend on where they are written and emits a small impl of a shared trait, the *Repeater*, for each. In crate B, it rewrites the copy so that each such type is written `<Self as Repeater<..>>::Type`, which resolves to the original type.

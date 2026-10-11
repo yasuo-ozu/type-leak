@@ -24,6 +24,7 @@ exclude = [
   "tests/prop_cross_crate",
   "tests/spans.rs",
   "tests/trusting.rs",
+  "logo.png",
   "tests/two_macros.rs",
 ]
 
