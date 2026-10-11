@@ -4,7 +4,8 @@
 //! crate or a Referrer's crate that does not compile, or an item that should have been rejected.
 //! Each finding is minimized here to a test of the API of `type-leak` (`Leaker`, `Referrer`,
 //! `RepeaterSlots`), with no generated crate and no `cargo` build. A test asserts what the library
-//! produces today: what a fix made it produce (`fixed`), or what rules.md documents (`limitation`).
+//! produces today: what a fix made it produce (`fixed`), or what the docs of `Leaker` document
+//! (`limitation`).
 //!
 //! | test | finding | kind |
 //! |------|---------|------|
@@ -46,8 +47,8 @@
 //! | `f36_nested_item_self_entry_not_rewritten` | an entry that names the own `Self` of a struct, enum, union, trait or impl nested in a module is recorded, and the Visitor never rewrote it: `Visitor::with_nested_self()` | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
-//! behaviour that rules.md documents, or that follows from what rustc accepts). No test is
-//! `#[ignore]`d.
+//! behaviour that the docs of `Leaker` document, or that follows from what rustc accepts). No test
+//! is `#[ignore]`d.
 //!
 //! Most fixes are rejections: the Leaker returns an error for an item whose copy rustc cannot
 //! compile. The test of such an item asserts the rejection, with the exact headline of the error and
@@ -546,8 +547,9 @@ fn has_bound_replacement(bound: &TypeParamBound) -> bool {
 /// Leaker rejects the item, or its copy (the entries replaced by `P<ix>`) does not have both a bound
 /// and a where predicate that mention a replacement.
 ///
-/// Fixed by rejecting what rustc cannot compile (see "Bounds that name leaked types" of rules.md
-/// and `tests/bound_cycles.rs`). The control `Tr3` is not rejected: what compiles stays accepted.
+/// Fixed by rejecting what rustc cannot compile (see "Bounds that name leaked types" in the
+/// `Leaker` docs and `tests/bound_cycles.rs`). The control `Tr3` is not rejected: what compiles
+/// stays accepted.
 #[test]
 fn f02_bound_names_leaked_type_env_cycle() {
     let items: Vec<Item> = vec![
@@ -768,10 +770,10 @@ fn f04_module_crate_relative_path_not_rewritten() {
 
 /// F5 (limitation): no `T: 'a` is recorded for a path with a lifetime; the bound written is.
 ///
-/// rules.md, "Outlives bounds": the Leaker cannot read the definition of a path, so a path with a
-/// lifetime argument records nothing, even if its definition needs it. Trigger: `impl<'a, T>
-/// E<'a, T>` with `struct E<'a, T> { f: &'a mut T }`, where rustc infers `T: 'a`. The impl
-/// compiles through the implied bounds of its self type, but the Repeater's impl for the entry
+/// The `Leaker` docs, "Outlives bounds": the Leaker cannot read the definition of a path, so a path
+/// with a lifetime argument records nothing, even if its definition needs it. Trigger:
+/// `impl<'a, T> E<'a, T>` with `struct E<'a, T> { f: &'a mut T }`, where rustc infers `T: 'a`. The
+/// impl compiles through the implied bounds of its self type, but the Repeater's impl for the entry
 /// `E<'a, T>` has no `T: 'a`: E0309 in the Leaker's crate. Found by the property test with
 /// `TYPE_LEAK_PROP_FEATURES=inferred_outlives`.
 ///
@@ -929,9 +931,9 @@ fn f06_impl_assoc_type_of_self_in_repeater() {
 /// Trigger: `fn f<'x>(&self, a: Wrap<'x>) -> &'x u8` (and `-> Wrap<'x>`), with `Wrap<'x>` leaked.
 /// `'x` is late-bound in the trait, but the copy `fn f<'x>(&self, a: <Self as Repeater<(&'x (),)>>
 /// ::Type) -> &'x u8` names it only in a projection, which does not constrain it, so rustc makes it
-/// early-bound and rejects the method (E0195). rules.md, "Method lifetimes": the Leaker reports an
-/// error for a trait object leaked as a whole, and the same holds for a leaked path. Found by the
-/// property test with `TYPE_LEAK_PROP_FEATURES=method_lifetime_paths`.
+/// early-bound and rejects the method (E0195). the `Leaker` docs, "Method lifetimes": the Leaker
+/// reports an error for a trait object leaked as a whole, and the same holds for a leaked path.
+/// Found by the property test with `TYPE_LEAK_PROP_FEATURES=method_lifetime_paths`.
 ///
 /// The assertion: the Leaker rejects those traits with a `NotInternableError` that has the E0195
 /// note: a type leaked whole holds `'x` in the copy, and no other input constrains it as written.
@@ -1343,13 +1345,14 @@ fn f09_fn_pointer_self_predicate_print() {
 
 /// F10 (limitation): a bound of an entry names an item that the module declares.
 ///
-/// rules.md, "Modules": the names that the module declares are copied with it, so they are not
-/// leaked, and an entry is keyed by its module if a path in a bound of its generics is relative.
-/// Trigger: `mod mm { use super::base::B1 as Imp; trait Cv {} struct S<T: Cv>(pub Imp<T>); }`. The
-/// entry `Imp<T>` has the context `<T: Cv>` and is keyed by `mm`; the Repeater's impl for it is
-/// emitted in the Leaker's module, so it requires the Leaker's `Cv`. The copy of the module declares
-/// its own `Cv`, so a projection `<.. as Repeater<(T,), ..>>::Type` in the copy needs `T:
-/// leaker::mm::Cv`, which the copy's `T: Cv` is not (E0277). The generator of the property test
+/// `Leaker::enter_mod()` and `Referrer::context_module()` docs: the names that the module declares
+/// are copied with it, so they are not leaked, and an entry is keyed by its module if a path in a
+/// bound of its generics is relative. Trigger:
+/// `mod mm { use super::base::B1 as Imp; trait Cv {} struct S<T: Cv>(pub Imp<T>); }`. The entry
+/// `Imp<T>` has the context `<T: Cv>` and is keyed by `mm`; the Repeater's impl for it is emitted
+/// in the Leaker's module, so it requires the Leaker's `Cv`. The copy of the module declares its
+/// own `Cv`, so a projection `<.. as Repeater<(T,), ..>>::Type` in the copy needs
+/// `T: leaker::mm::Cv`, which the copy's `T: Cv` is not (E0277). The generator of the property test
 /// avoids it: the predicates of a module use no item of the module.
 ///
 /// It is a limitation and not a bug: the entry is keyed by the module correctly, and a copy that
@@ -1767,8 +1770,8 @@ fn f13_leaker() -> Leaker {
 ///
 /// Fixed by rejecting what rustc cannot compile otherwise. The alternatives do not work: rewriting
 /// the bound for the self type (`T: AsRef<Option<S<T>>>`, the impl being for `()`) makes the bound
-/// name the leaked entry itself (E0277, "Bounds that name leaked types" of rules.md); the type
-/// for `Self` in the copy is a cycle (E0391); and the self type has no parts to leak instead
+/// name the leaked entry itself (E0277, "Bounds that name leaked types" in the `Leaker` docs); the
+/// type for `Self` in the copy is a cycle (E0391); and the self type has no parts to leak instead
 /// (`S<T>` is relative as a whole, `Rel<T>` uses the generic). The error is in the style of the
 /// other `Self` errors: a headline, and a note on why with the way out (an absolute self type, or
 /// bounds without `Self`).
@@ -2140,18 +2143,19 @@ type Rejected<'a> = Option<(&'a str, &'a str)>;
 /// removed (`where X: Into<Rel>`, `a: Self::A1`, `T: Clone`) the copy compiles. Found by the
 /// property test with `TYPE_LEAK_PROP_FEATURES=impl_pred_leaked`.
 ///
-/// The trait case is rejected already (`trait Tr<T: Fn(Rel)> { fn m<X>(&self) where X:
-/// Into<Self::A1>; }`, "It is `Self::A`" of rules.md); the impl needs the same rule, with the
-/// generics of the impl instead of those of the context. The assertion: if the Leaker accepts
-/// the impl, its copy does not have a replacement in a bound or where predicate of the impl and
+/// The trait case is rejected already
+/// (`trait Tr<T: Fn(Rel)> { fn m<X>(&self) where X: Into<Self::A1>; }`, the `Self::A` case of
+/// "Bounds that name leaked types" in the `Leaker` docs); the impl needs the same rule, with the
+/// generics of the impl instead of those of the context. The assertion: if the Leaker accepts the
+/// impl, its copy does not have a replacement in a bound or where predicate of the impl and
 /// `Self::A` in a predicate. An optional entry counts if the Referrer is strict (it replaces it).
 ///
 /// The controls are accepted, as they compile: a bound that names no leaked type, and a leaked
 /// bound with `Self::A1` outside the predicates.
 ///
-/// Fixed by the rule of F2 for `Self::A` (see "Bounds that name leaked types" of rules.md and
-/// `tests/bound_cycles.rs`): in an impl, the bounds of the impl count too, not only those of the
-/// generics in the context of `Self::A`, as rustc selects the impl of the trait. The optional
+/// Fixed by the rule of F2 for `Self::A` (see "Bounds that name leaked types" in the `Leaker` docs
+/// and `tests/bound_cycles.rs`): in an impl, the bounds of the impl count too, not only those of
+/// the generics in the context of `Self::A`, as rustc selects the impl of the trait. The optional
 /// entries that they name are copied as written for a strict Referrer.
 #[test]
 fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
@@ -2700,14 +2704,14 @@ fn generics_say_outlives(generics: &Generics, name: &str, lifetime: &str) -> boo
 /// test shows it as E0477 in the Referrer's crate (seed 5). So no `T: 'x` or `'a: 'x` is recorded
 /// for the projection (written ones are).
 ///
-/// The same family, which is documented and not a bug (F5, rules.md "Outlives bounds"): a path with
-/// a lifetime argument records nothing, so `Rel<Wrap<'x, [Self]>>` with `fn m<'x>(&'x self)`,
-/// where `Wrap<'a, T: 'a>` needs `Self: 'x` and the receiver implies it, has no `Self: 'x` in
-/// the context (`BL<'x, [Self]>` in the property test). Rules.md asks to write the bound, and
-/// the generator writes it. And a where predicate `X: Into<&'x Self>` of a method relies on the
-/// receiver as well, which the witness and the check of the property test (functions with no
-/// receiver) do not have: E0309 in the Leaker's crate, from the test macro's own oracle, so the
-/// generator writes `Self: 'x` there too.
+/// The same family, which is documented and not a bug (F5, the `Leaker` docs, "Outlives bounds"): a
+/// path with a lifetime argument records nothing, so `Rel<Wrap<'x, [Self]>>` with
+/// `fn m<'x>(&'x self)`, where `Wrap<'a, T: 'a>` needs `Self: 'x` and the receiver implies it, has
+/// no `Self: 'x` in the context (`BL<'x, [Self]>` in the property test). The `Leaker` docs ask to
+/// write the bound, and the generator writes it. And a where predicate `X: Into<&'x Self>` of a
+/// method relies on the receiver as well, which the witness and the check of the property test
+/// (functions with no receiver) do not have: E0309 in the Leaker's crate, from the test macro's own
+/// oracle, so the generator writes `Self: 'x` there too.
 ///
 /// F16 kept `Self: 'x` for the reference, besides the predicate. F34 drops it: it is more than the
 /// original has (the receiver implies it at best), and a copy for a generic host `Gen<H>` is E0309
@@ -2907,17 +2911,17 @@ fn entries_in_own_context(referrer: &Referrer) -> Vec<String> {
 /// `::ext` is a crate that the Leaker does not allow, and a strict Referrer
 /// (`allow_ambiguous_crate_name(false)`, the Referrer's choice, for a Referrer whose dependencies
 /// may differ from the Leaker's) replaces the optional entries. `&'a ::ext::W<T, ::ext::B0>` is an
-/// optional entry (it holds `::ext::B0`, another optional type, so it is not left alone as `T:
-/// Fn(&'a ::ext::W<T>)` is), and its context has `'a`, `T` and the where predicate that names
-/// `'a`, which is the predicate that names the entry. The copy has `T: Fn(<() as Repeater<(&'a (),
-/// T, &'a T), ..>>::Type)`, and the Repeater's impl for it has `T: Fn(&'a ::ext::W<T,
-/// ::ext::B0>)`, which the environment of the copy does not have in that form: E0277 "expected an
-/// `Fn(&W<T, B0>)` closure, found `T`" (standalone with rustc, too). That is F2, whose rule
-/// ("optional entry in such a place is copied as written", rules.md "Bounds that name leaked
-/// types") does not see this one: the same item with `::ext::W<T>` (no optional type inside), or
-/// with a required entry (`Rel`), is not an entry or is rejected. Found by the property test
-/// with `TYPE_LEAK_PROP_FEATURES=strict_cycles` (seeds 1 to 8 of 60 cases), which only affects the
-/// items that the generator invokes as strict, 25% of them.
+/// optional entry (it holds `::ext::B0`, another optional type, so it is not left alone as
+/// `T: Fn(&'a ::ext::W<T>)` is), and its context has `'a`, `T` and the where predicate that names
+/// `'a`, which is the predicate that names the entry. The copy has
+/// `T: Fn(<() as Repeater<(&'a (), T, &'a T), ..>>::Type)`, and the Repeater's impl for it has
+/// `T: Fn(&'a ::ext::W<T, ::ext::B0>)`, which the environment of the copy does not have in that
+/// form: E0277 "expected an `Fn(&W<T, B0>)` closure, found `T`" (standalone with rustc, too). That
+/// is F2, whose rule (an optional entry in such a place is copied as written: the `Leaker` docs,
+/// "Bounds that name leaked types") does not see this one: the same item with `::ext::W<T>` (no
+/// optional type inside), or with a required entry (`Rel`), is not an entry or is rejected. Found
+/// by the property test with `TYPE_LEAK_PROP_FEATURES=strict_cycles` (seeds 1 to 8 of 60 cases),
+/// which only affects the items that the generator invokes as strict, 25% of them.
 ///
 /// The Leaker should leave that type as written (not an entry), or reject the item. The assertion is
 /// that no entry of an accepted item is named by the bounds or where predicates of its own
@@ -2925,7 +2929,8 @@ fn entries_in_own_context(referrer: &Referrer) -> Vec<String> {
 ///
 /// Fixed: an optional entry that is leaked as a whole (a reference with a lifetime), and whose own
 /// context is unstable (its bound names it), is not one, and neither are the optional entries
-/// inside it: its parts cannot stand for it. See "Bounds that name leaked types" of rules.md.
+/// inside it: its parts cannot stand for it. See "Bounds that name leaked types" in the `Leaker`
+/// docs.
 #[test]
 fn f17_optional_entry_in_own_context() {
     let items: Vec<ItemStruct> = vec![
@@ -2998,17 +3003,19 @@ fn f17_optional_entry_in_own_context() {
 /// F18 (limitation): a strict Referrer replaces the optional entry that holds a lifetime of a
 /// method, so the copy does not have it where the original did.
 ///
-/// rules.md, "External crates": an absolute path of a crate that the Leaker does not allow is an
+/// `Leaker::allowed_paths` docs: an absolute path of a crate that the Leaker does not allow is an
 /// optional entry, which a Referrer leaves as written by default and replaces if it is strict
 /// (`allow_ambiguous_crate_name(false)`); "replacing a type can lose an anchor or a method
-/// lifetime". Trigger: `trait Tr { fn m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>; }`. In the
-/// trait, `'x` is late-bound (the argument holds it, and no bound names it). The Leaker counts the
-/// optional type as an anchor, as the default Referrer keeps it. The strict copy is `fn m<'x>(&self,
-/// a: P<1>) -> P<0>`: both are projections, which do not constrain `'x`, so it is early-bound, and
-/// rustc rejects the impl of the Referrer's crate, where the trait has it late-bound (E0195
-/// "lifetime parameters differ in whether they are early- or late-bound"). Found by the property
-/// test with `TYPE_LEAK_PROP_FEATURES=strict_anchors`, for the items that the generator invokes as
-/// strict (25% of them): the Leaker's analysis cannot know what the Referrer chooses.
+/// lifetime" (`Referrer::must()`). Trigger:
+/// `trait Tr { fn m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>; }`. In the trait, `'x` is
+/// late-bound (the argument holds it, and no bound names it). The Leaker counts the optional type
+/// as an anchor, as the default Referrer keeps it. The strict copy is
+/// `fn m<'x>(&self, a: P<1>) -> P<0>`: both are projections, which do not constrain `'x`, so it is
+/// early-bound, and rustc rejects the impl of the Referrer's crate, where the trait has it
+/// late-bound (E0195 "lifetime parameters differ in whether they are early- or late-bound"). Found
+/// by the property test with `TYPE_LEAK_PROP_FEATURES=strict_anchors`, for the items that the
+/// generator invokes as strict (25% of them): the Leaker's analysis cannot know what the Referrer
+/// chooses.
 ///
 /// It is a limitation and not a bug: counting the optional type as an anchor is what lets the
 /// default Referrer (and a Referrer of the same dependency graph) copy the item; the other choice
@@ -3155,17 +3162,17 @@ fn entries_with_self_bound_in_predicates(
 /// and a predicate that names a leaked type that uses the generic.
 ///
 /// Trigger: `impl S { fn m<X>(&self) where X: Fn(Self) -> u8, Rel<X>: Default {} }`, with `S` and
-/// `Rel` leaked (also `for<'h> Fn(&'h Self) -> &'h Result<Self, f64>`, which rustc reports as
-/// E0271 "type mismatch resolving"). The entry `Rel<X>` has the context `<X: Fn(Self) -> u8>`
-/// with `Self` = `S`, so the Repeater's impl for `S` has `X: Fn(S) -> u8`. The copy has `X:
-/// Fn(Self) -> u8` with `Self` = `<() as Repeater<..>>::Type`, the replaced self type, which rustc
-/// has not normalized yet in the environment where it proves the predicate `<S as
-/// Repeater<(X,), ..>>::Type: Default`: E0277 "expected an `Fn(S)` closure, found `X`" (the same
-/// with rustc alone). That is F2 with `Self` as the leaked type that the bound names, and the
-/// check of rules.md ("It is `Self`, in an impl whose self type is leaked, and a bound of the
-/// generics of the impl names a leaked type") only looks at the generics of the impl, not at
-/// those of a method. With the entry in a position (`a0: Rel<X>`) it compiles. Found by the
-/// property test with `TYPE_LEAK_PROP_FEATURES=impl_self_bound_cycle`.
+/// `Rel` leaked (also `for<'h> Fn(&'h Self) -> &'h Result<Self, f64>`, which rustc reports as E0271
+/// "type mismatch resolving"). The entry `Rel<X>` has the context `<X: Fn(Self) -> u8>` with `Self`
+/// = `S`, so the Repeater's impl for `S` has `X: Fn(S) -> u8`. The copy has `X: Fn(Self) -> u8`
+/// with `Self` = `<() as Repeater<..>>::Type`, the replaced self type, which rustc has not
+/// normalized yet in the environment where it proves the predicate
+/// `<S as Repeater<(X,), ..>>::Type: Default`: E0277 "expected an `Fn(S)` closure, found `X`" (the
+/// same with rustc alone). That is F2 with `Self` as the leaked type that the bound names, and the
+/// check of the `Leaker` docs ("The type is `Self`, in an impl whose self type is leaked, and a
+/// bound of the generics of a type in the self type ... is unstable") only looks at the generics of
+/// the impl, not at those of a method. With the entry in a position (`a0: Rel<X>`) it compiles.
+/// Found by the property test with `TYPE_LEAK_PROP_FEATURES=impl_self_bound_cycle`.
 ///
 /// The assertion: if the Leaker accepts the impl, no entry that a predicate of the copy names has
 /// a bound of its context that names `Self` while the self type is an entry.
@@ -3174,7 +3181,7 @@ fn entries_with_self_bound_in_predicates(
 /// the self type of an impl is leaked, and for a strict Referrer, if it holds an optional entry,
 /// which is copied as written then), `Self::A` or an associated type that rustc normalizes (F20 and
 /// F21). An entry in a predicate whose context has such a bound is an error. See "Bounds that name
-/// leaked types" of rules.md and `tests/bound_cycles.rs`.
+/// leaked types" in the `Leaker` docs and `tests/bound_cycles.rs`.
 ///
 /// `Self` itself in a predicate (`T: AsRef<Self>`) is a type that the copy writes with its entries
 /// replaced, and rustc normalizes it with the Repeater's impls of those entries: it is an error
@@ -3389,7 +3396,7 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
 /// copy for the host has `X: Fn(&<Host as Tr>::A0) -> u8`, with the projection not normalized yet,
 /// where rustc proves `<Host as Repeater<(X,), ..>>::Type: Default`, which needs the impl with
 /// `A0` = `u8`: E0277 "expected an `Fn(&u8)` closure, found `X`" (the same with rustc alone).
-/// Rules.md rule for `Self::A` ("a bound of the generics of the trait names a leaked type")
+/// The rule of the `Leaker` docs for `Self::A` ("a bound of the generics of the trait" is unstable)
 /// looks at the bounds of the trait, not at those of the method that are in the context of
 /// an entry in a predicate. Found by the property test with
 /// `TYPE_LEAK_PROP_FEATURES=trait_assoc_bound_cycle`.
@@ -3917,15 +3924,16 @@ fn f23_self_in_elided_signature_where_referrer_can_rewrite() {
 /// Trigger: `impl<T: Fn(Rel2<u8>), U> ::p::Tr<U> for ::p::W2<T, Rel<U>> where Self: Clone {}` (also
 /// with a method `fn m<X: AsRef<Self>>(&self, x: X) {}`, and both). The self type has the entry
 /// `Rel<U>`, whose context has `U` and no bound, and `T`, whose bound names the leaked `Rel2<u8>`,
-/// is no entry's. F13 and F19 narrowed the rule to this ("`impl<T: Fn(Rel2), U, V: AsRef<Self>>
-/// ::p::W<T, Rel<U>, V>` is fine", rules.md, "Bounds that name leaked types"): rustc normalizes
-/// `Self` with the impl of the Repeater for `Rel<U>`, which needs the bounds of `U`, not those of
-/// `T`. But with `Self` in a predicate the Leaker rejects it ("`Self` is in a bound or where
-/// predicate, and a bound of its generics names a leaked type"): `self_type_entries()` returns the
-/// contexts of every type of the self type that the graph MAY choose as an entry, and the whole self
-/// type `W2<T, Rel<U>>` is one, with the generics `<T: Fn(Rel2<u8>), U>`, whose bound is unstable.
-/// The graph chooses the parts (two entries, `Rel2<u8>` and `Rel<U>`), as it does where the impl has
-/// no predicate with `Self`, so the check looks at a context that is not in the result.
+/// is no entry's. F13 and F19 narrowed the rule to this
+/// ("`impl<T: Fn(Rel2), U, V: AsRef<Self>> ::p::W<T, Rel<U>, V>` is fine", the `Leaker` docs,
+/// "Bounds that name leaked types"): rustc normalizes `Self` with the impl of the Repeater for
+/// `Rel<U>`, which needs the bounds of `U`, not those of `T`. But with `Self` in a predicate the
+/// Leaker rejects it ("`Self` is in a bound or where predicate, and a bound of its generics names a
+/// leaked type"): `self_type_entries()` returns the contexts of every type of the self type that
+/// the graph MAY choose as an entry, and the whole self type `W2<T, Rel<U>>` is one, with the
+/// generics `<T: Fn(Rel2<u8>), U>`, whose bound is unstable. The graph chooses the parts (two
+/// entries, `Rel2<u8>` and `Rel<U>`), as it does where the impl has no predicate with `Self`, so
+/// the check looks at a context that is not in the result.
 ///
 /// Checked with rustc (stable 1.98.1 and nightly 1.100.0), with the checks of F13: the Leaker's
 /// crate with the impl of the trait, the Repeater's impls of the two entries (`impl<__S: ?Sized>
@@ -4309,13 +4317,14 @@ fn f25_supertrait_item_in_bound_of_entry_in_predicate() {
 /// limitation; seeds 1, 2 and 3 of 60 cases fail with the same E0277 as F25).
 ///
 /// No correct behaviour is possible: the Leaker sees `::p::WIt<T>` as a path with `T` as its
-/// argument, which a struct `::p::WFoo<T>` is as well, and `T: Iterator<Item = u8> + Fn(::p::WFoo<T>)`
-/// with `Rel<T>: Default` compiles (checked: the same impl copy). Rejecting every path that names `T` in
-/// the bounds of a generic that an equation fixes, where an entry that uses it is in a predicate,
-/// would reject what compiles. Rules.md says that "a `::core` or allowed path is assumed to be a
-/// struct, an enum or a union" (an alias that drops a lifetime, or hides a projection, is not seen),
-/// so allow only crates without such aliases, or write the projection. The test pins the
-/// acceptance, and that the written projection is the one that is found.
+/// argument, which a struct `::p::WFoo<T>` is as well, and
+/// `T: Iterator<Item = u8> + Fn(::p::WFoo<T>)` with `Rel<T>: Default` compiles (checked: the same
+/// impl copy). Rejecting every path that names `T` in the bounds of a generic that an equation
+/// fixes, where an entry that uses it is in a predicate, would reject what compiles. The `Leaker`
+/// docs say that a `::core` or allowed path is assumed to be a struct, an enum or a union (an alias
+/// that drops a lifetime, or hides a projection, is not seen), so allow only crates without such
+/// aliases, or write the projection. The test pins the acceptance, and that the written projection
+/// is the one that is found.
 #[test]
 fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
     let alias: Item = parse_quote!(
@@ -4557,25 +4566,25 @@ fn f27_argument_impl_trait_bound_names_leaked_type_env_cycle() {
 /// inside the path, `fn(::p::WRef<Rel<T>>) -> &u8`). The inputs have exactly one lifetime, which
 /// the path hides (`WRef<'_, u8>`), and elision gives it to the output. The entry `Rel<T>` has the
 /// generics `<'a, T: 'a>`, so the copy has `<() as Repeater<(&'a (), T, &'a T), ..>>::Type`, which
-/// names `'a`: two lifetimes, E0106 "which one of argument 1's 2 lifetimes it is borrowed from" (checked
-/// with rustc, stable 1.98.1 and nightly 1.100.0, with the impl of the trait for a host type; it is
-/// what F12 fixed for `&`). The Leaker did not see the hidden lifetime (rules.md: "A lifetime that a
-/// path hides (`Ref<u8>` for `Ref<'a, u8>`) is not seen by the Leaker, so write `Ref<'_, u8>`"), and
-/// `Rel<T>` alone was the entry.
+/// names `'a`: two lifetimes, E0106 "which one of argument 1's 2 lifetimes it is borrowed from"
+/// (checked with rustc, stable 1.98.1 and nightly 1.100.0, with the impl of the trait for a host
+/// type; it is what F12 fixed for `&`). The Leaker did not see the hidden lifetime (the `Leaker`
+/// docs, Elided lifetimes: "A lifetime that a path hides (`Ref<u8>` for `Ref<'a, u8>`) is not
+/// seen", so write `Ref<'_, u8>`), and `Rel<T>` alone was the entry.
 ///
 /// The property test showed it with `TYPE_LEAK_PROP_FEATURES=hidden_lifetimes` (E0106 in the
 /// Referrer's crate for `fn(::core::str::Chars, A) -> &R` and `fn(::core::slice::Iter<u8>, A) ->
 /// &R`: seeds 2, 5, 6, 7, 8, 9 and 11 of 60 cases failed, 1, 3, 4, 10 and 12 passed, as the entry
 /// must add lifetimes); it is on by default now.
 ///
-/// Rules.md told the user to write `WRef<'_, u8>`, which the Leaker leaks whole with the holder
+/// The docs told the user to write `WRef<'_, u8>`, which the Leaker leaks whole with the holder
 /// (the control, `Tr1`: compiles, checked). A correct behaviour that needs no advice exists, since
 /// an elided output lifetime with no lifetime in the inputs that the Leaker sees can only be the
 /// hidden one (the original compiles): the fix counts it as the one that elision uses, as `&` does
 /// (`Elision::hidden`), so any lifetime that the copy adds to the inputs breaks it, and the holder
-/// is leaked whole, or the item is rejected where nothing can hold it. The same holds for a
-/// method with no receiver that is a reference. A hidden lifetime in the output is not seen, so the
-/// copy of `fn(&Rel<T>) -> WRef<u8>` is still E0106: the limitation that rules.md documents.
+/// is leaked whole, or the item is rejected where nothing can hold it. The same holds for a method
+/// with no receiver that is a reference. A hidden lifetime in the output is not seen, so the copy
+/// of `fn(&Rel<T>) -> WRef<u8>` is still E0106: the limitation that the `Leaker` docs document.
 ///
 /// The assertion: the Leaker rejects the item with the note of F12 (E0106), or the holder is the
 /// entry, so that nothing of it is left in the copy (`Signatures`). The controls are accepted
@@ -5129,23 +5138,24 @@ fn f30_implied_outlives_of_generic_projection_recorded_as_component() {
 /// F31 (limitation): a function pointer or `Fn(..)` inside an input has its own signature only for
 /// rustc 1.64 and later.
 ///
-/// Trigger: `trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn Fn(&Box<dyn for<'x> Fn(&'x Rel<T>) ->
-/// &'x u8>) -> &u8>); }` (and `fn(&for<'x> fn(&'x Rel<T>) -> &'x u8) -> &u8`). The outer sugar has
-/// one lifetime, the `&`; the inner one has its own binder `'x`, and the entry `Rel<T>` in it
-/// names `'a` in the copy. F12's rule follows rustc: the lifetimes of an inner signature do not
-/// count for the outer one, and the entry is `Rel<T>` alone (rules.md, "Elided lifetimes": "That is
-/// how rustc 1.64 and later count"). Checked with rustc and the impl of the trait for a host type:
-/// 1.56, 1.61, 1.62 and 1.63 count the lifetimes that the inner signature does not bind, so they
-/// see two for the outer one (`&` and `'a`) and reject the copy (E0106, and on 1.56 "`impl` item
-/// signature doesn't match `trait` item signature"); 1.64, 1.65, 1.70, stable (1.98.1) and nightly
-/// accept it. So the change is in 1.64 (rules.md said 1.65 before F31 measured it, and says 1.64
-/// now; the crate's MSRV is 1.56 and the property test runs on the current toolchain only). The
-/// Leaker does not know the toolchain of the crate that expands its macros, so it follows the
-/// current one, and an item with a nested signature in an input is rejected or broken on an older
-/// rustc. Leaking the outer holder whole (as the Leaker does where
-/// the inner signature has no binder, `fn(&fn(&Rel<T>) -> &u8) -> &u8`) would be right on all, at
-/// the cost of more entries, and is a decision for the maintainers: it follows no rustc, so this test
-/// pins the rule that follows the current ones, and does not run old toolchains.
+/// Trigger:
+/// `trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn Fn(&Box<dyn for<'x> Fn(&'x Rel<T>) -> &'x u8>) -> &u8>); }`
+/// (and `fn(&for<'x> fn(&'x Rel<T>) -> &'x u8) -> &u8`). The outer sugar has one lifetime, the `&`;
+/// the inner one has its own binder `'x`, and the entry `Rel<T>` in it names `'a` in the copy.
+/// F12's rule follows rustc: the lifetimes of an inner signature do not count for the outer one,
+/// and the entry is `Rel<T>` alone (the `Leaker` docs, "Elided lifetimes": "That is how rustc 1.64
+/// and later count"). Checked with rustc and the impl of the trait for a host type: 1.56, 1.61,
+/// 1.62 and 1.63 count the lifetimes that the inner signature does not bind, so they see two for
+/// the outer one (`&` and `'a`) and reject the copy (E0106, and on 1.56 "`impl` item signature
+/// doesn't match `trait` item signature"); 1.64, 1.65, 1.70, stable (1.98.1) and nightly accept it.
+/// So the change is in 1.64 (the docs said 1.65 before F31 measured it, and say 1.64 now; the
+/// crate's MSRV is 1.56 and the property test runs on the current toolchain only). The Leaker does
+/// not know the toolchain of the crate that expands its macros, so it follows the current one, and
+/// an item with a nested signature in an input is rejected or broken on an older rustc. Leaking the
+/// outer holder whole (as the Leaker does where the inner signature has no binder,
+/// `fn(&fn(&Rel<T>) -> &u8) -> &u8`) would be right on all, at the cost of more entries, and is a
+/// decision for the maintainers: it follows no rustc, so this test pins the rule that follows the
+/// current ones, and does not run old toolchains.
 #[test]
 fn f31_nested_signature_has_its_own_lifetimes() {
     for item in [
@@ -5986,17 +5996,18 @@ fn the_oracles_of_the_findings_find_a_hand_written_cycle() {
 ///   m(&self, a: Rel<&'x Self::A0>); }` for `Gen<H>`).
 ///
 /// Where a bound of the context equates the associated type (F30's `Binding`, here for `Self`):
-/// `trait Tr<'x, T> where Self: Iterator<Item = (Vec<T>, u8)> { fn m(&self, a: Rel<&'x
-/// Self::Item>); }`. rustc normalizes `Self::Item` to `(Vec<T>, u8)` in the environment of the
-/// Repeater's impl, where the predicate `Self::Item: 'x` becomes `(Vec<T>, u8): 'x`, which it does
-/// not decompose: E0309 for `T` in the Leaker's crate (both toolchains; the recorded `Self::Item:
-/// 'x` alone, as F16 did for the bare path). What the value mentions outlives instead (`T: 'x`,
-/// encoded `&'x T`), and no predicate: both crates compile (with a host `impl<T> Iterator for
-/// HostT<T>`), also with `&'x Self` in the arguments. A supertrait that equates the associated
-/// type (`trait Tr<'x, T>: Iterator<Item = (Vec<T>, u8)>`) is not read: the Referrer's copy of an
-/// impl has no supertraits, so the context could not be the same. It is E0309 in the Leaker's crate
+/// `trait Tr<'x, T> where Self: Iterator<Item = (Vec<T>, u8)> { fn m(&self, a: Rel<&'x Self::Item>); }`.
+/// rustc normalizes `Self::Item` to `(Vec<T>, u8)` in the environment of the Repeater's impl, where
+/// the predicate `Self::Item: 'x` becomes `(Vec<T>, u8): 'x`, which it does not decompose: E0309
+/// for `T` in the Leaker's crate (both toolchains; the recorded `Self::Item: 'x` alone, as F16 did
+/// for the bare path). What the value mentions outlives instead (`T: 'x`, encoded `&'x T`), and no
+/// predicate: both crates compile (with a host `impl<T> Iterator for HostT<T>`), also with
+/// `&'x Self` in the arguments. A supertrait that equates the associated type
+/// (`trait Tr<'x, T>: Iterator<Item = (Vec<T>, u8)>`) is not read: the Referrer's copy of an impl
+/// has no supertraits, so the context could not be the same. It is E0309 in the Leaker's crate
 /// (checked, for `Self::Item` and `<Self as Iterator>::Item`), and writing `T: 'x` on the trait
-/// makes it compile (checked): a limitation, pinned below, which rules.md "Outlives bounds" says.
+/// makes it compile (checked): a limitation, pinned below, which the `Leaker` docs, "Outlives
+/// bounds", say.
 ///
 /// The fix treats an associated type path of `Self` (the implementor of a trait, `Bound`) like one
 /// of a generic (F30, `is_generic_projection()`): the path is a unit, and what `&'x P` requires is
@@ -6422,7 +6433,7 @@ fn f34_implied_outlives_of_self_projection_forms_recorded_as_components() {
 ///   T: 'x`: F34's and F30's rules record it). A guessed `T: 'x` is no better: for `T::G<'x>` with
 ///   `trait Ext { type G<'b>; }` (no where clause) the original compiles, and the impl for `Host`
 ///   with `&'x T` in the arguments is E0309 on `T` (stable and nightly), as the predicate alone
-///   compiles. So nothing is recorded for them, and rules.md says to write the bound.
+///   compiles. So nothing is recorded for them, and the `Leaker` docs say to write the bound.
 ///
 /// The fix: the Leaker reads the where clauses and the bounds of the generic associated types of
 /// the trait that it analyzes with `intern_trait()`, and a projection that names one (`Self::G<..>`,

@@ -38,11 +38,15 @@ const REPEATER_SLOTS: &[(&str, &str, &str)] = &[
 /// and `NTH` the entry. Besides them, the trait has a defaulted const slot per primitive type:
 /// `BOOL`, `CHAR`, `U8`, `U16`, `U32`, `U128`, `I8`, `I16`, `I32`, `I64`, `I128` and `ISIZE`.
 /// [`RepeaterSlots`] encodes const values into them, and `Repeater<T, ID, NTH>` still works.
-/// Without the slots, it works if every const parameter is `usize` or `u64`. In that case you
-/// can write the trait by hand instead:
+///
+/// A const parameter is treated like a type parameter, and the Repeater needs a type that carries
+/// its value. `const N: usize` is encoded as `[(); N]` (see
+/// [`encode_generics_params_to_ty()`](crate::encode_generics_params_to_ty)), a `u64` value uses the
+/// `ID` slot, and any other primitive type uses its slot. Without the slots, the Repeater works if
+/// every const parameter is `usize` or `u64`. In that case you can write the trait by hand instead:
 /// `pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> { type Type: ?Sized; }`.
-/// The generated trait needs Rust 1.59 and the 2018 edition. See [Const
-/// generics](crate::rules#const-generics).
+/// The generated trait needs Rust 1.59 and the 2018 edition, while `type-leak` itself supports
+/// 1.56.
 ///
 /// ```
 /// # use type_leak::*;
@@ -84,6 +88,12 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
 /// a trait object of the Repeater with its slot filled. The impl declares the generics without the
 /// encoded bounds: `Referrer::impl_generics()`.
 ///
+/// Only a parameter whose type is a primitive type can be encoded: a const parameter of an alias is
+/// an [`EncodeError::UnsupportedConstType`], whatever the alias is. To use the slots with
+/// [`Referrer::repeater_impl_with()`](crate::Referrer::repeater_impl_with) and
+/// [`Referrer::entry_args_with()`](crate::Referrer::entry_args_with), pass
+/// `|value, param| slots.encode_const(value, &param.ty)`.
+///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
@@ -94,6 +104,77 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
 ///     *const dyn crate::Repeater<(), 0, 0, B, Type = ()>,
 ///     *const dyn crate::Repeater<(), 0, 0, false, C, Type = ()>
 /// )));
+/// ```
+///
+/// [`Referrer::repeater_impl()`](crate::Referrer::repeater_impl) and
+/// [`Referrer::entry_args()`](crate::Referrer::entry_args) follow the encoders, so a macro that
+/// uses them cannot disagree with itself. The example does the same by hand. One Repeater impl per
+/// entry declares the generics of its context
+/// ([`Referrer::impl_generics()`](crate::Referrer::impl_generics)) and encodes the generics that
+/// the entry uses in its trait arguments. A copy encodes the arguments that its site gives to the
+/// same generics: those of the trait itself come from
+/// [`Referrer::generic_args()`](crate::Referrer::generic_args), and a generic that the copy
+/// declares itself, such as one of a method, is passed by its own name.
+///
+/// ```
+/// use syn::visit_mut::VisitMut;
+/// use syn::{parse_quote, GenericArgument, ItemImpl, ItemTrait, Signature};
+/// use type_leak::{Leaker, RepeaterSlots};
+///
+/// let item: ItemTrait = parse_quote! {
+///     pub trait MyLeaker<T> {
+///         fn f(&self, t: T) -> MyWrap<T>;
+///         fn g(&self) -> MyType;
+///     }
+/// };
+/// let mut leaker = Leaker::new();
+/// let top_level = leaker.intern_trait(&item, false).unwrap();
+/// let referrer = leaker.finish();
+/// assert_eq!(referrer.iter().count(), 2);
+/// assert_eq!(referrer.context_generics(top_level).params.len(), 1);
+///
+/// // One Repeater impl per entry. It declares `impl_generics()` and encodes the generics the entry
+/// // uses in its trait arguments.
+/// let slots = RepeaterSlots::new(parse_quote!(path::Repeater));
+/// let id = 42u64;
+/// let impls: Vec<ItemImpl> = referrer
+///     .iter()
+///     .enumerate()
+///     .map(|(ix, ty)| {
+///         let context = referrer.context(ix);
+///         let used = referrer.context_generics(context);
+///         let encoded = slots.encode_generics_params_to_ty(&used.params).unwrap();
+///         let declared = referrer.impl_generics(context);
+///         let params = declared.params.iter();
+///         parse_quote! {
+///             impl<#(#params,)* __S: ?Sized> path::Repeater<#encoded, #id, #ix> for __S {
+///                 type Type = #ty;
+///             }
+///         }
+///     })
+///     .collect();
+/// let expected: ItemImpl = parse_quote! {
+///     impl<T, __S: ?Sized> path::Repeater<(T,), 42u64, 0usize> for __S {
+///         type Type = MyWrap<T>;
+///     }
+/// };
+/// assert_eq!(impls[0], expected);
+///
+/// // The copy of `f` in `impl MyLeaker<u8> for ..`. Each leaked type becomes a path through the
+/// // Repeater, with its generics as arguments.
+/// let trait_args: Vec<GenericArgument> = vec![parse_quote!(u8)];
+/// let mut sig: Signature = parse_quote!(fn f(&self, t: T) -> MyWrap<T>);
+/// let mut visitor = referrer.clone().visitor(top_level, |_ty, ix| {
+///     let args = referrer.generic_args(ix, &item.generics.params, &trait_args).unwrap();
+///     let used = &referrer.generics(ix).params;
+///     let encoded = slots.encode_generics_args_to_ty(&args, used).unwrap();
+///     parse_quote!(<Self as path::Repeater<#encoded, #id, #ix>>::Type)
+/// });
+/// visitor.visit_signature_mut(&mut sig);
+/// let expected: Signature = parse_quote!(
+///     fn f(&self, t: T) -> <Self as path::Repeater<(u8,), 42u64, 0usize>>::Type
+/// );
+/// assert_eq!(sig, expected);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RepeaterSlots {

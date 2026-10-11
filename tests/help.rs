@@ -6,7 +6,8 @@
 //! text:
 //!
 //! - `every_kind_of_error_has_a_help` is a table with one row per kind of error (the rows are the
-//!   kinds of `src/rules.md`): the headline and the exact help of each error of the row;
+//!   kinds of error of `NotInternableError`): the headline and the exact help of each error of the
+//!   row;
 //! - `a_help_is_rendered_after_the_notes` asserts how the stable layout (`syn::Error`, which
 //!   `ToTokens` renders as `compile_error!`) shows it, as `= help: ..` after the `= note: ..`s.
 //!

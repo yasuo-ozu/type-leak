@@ -130,9 +130,9 @@ fn the_requirement_goes_down_through_the_components_it_goes_through_in_rustc() {
     );
 }
 
-/// rules.md, Outlives bounds: `impl Trait` does not pass the lifetime on, as an associated type path
-/// does not (the type behind it is opaque to the signature), while a trait object does. Audit
-/// mutant `o_impl_trait_passes` (`impl Trait` treated as a path that passes the lifetime on).
+/// The `Leaker` docs, Outlives bounds: `impl Trait` does not pass the lifetime on, as an associated
+/// type path does not (the type behind it is opaque to the signature), while a trait object does.
+/// Audit mutant `o_impl_trait_passes` (`impl Trait` treated as a path that passes the lifetime on).
 #[test]
 fn impl_trait_does_not_pass_the_lifetime_on() {
     // The reference, around an argument-position `impl Trait`: `Rel2<T>` in its binding is no

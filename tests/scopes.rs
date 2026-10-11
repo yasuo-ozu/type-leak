@@ -871,9 +871,9 @@ fn leaker_with_std() -> Leaker {
     Leaker::from_config(config)
 }
 
-/// rules.md, Scopes: a scope is all-or-nothing. The top-level contexts of the scopes that
-/// succeeded inside a scope that fails are rolled back with it, so the Referrer has the context
-/// of the outermost scope only. Audit mutant `rb_leave_top_levels`.
+/// `Leaker::enter_generics()` docs: a scope is all-or-nothing. The top-level contexts of the scopes
+/// that succeeded inside a scope that fails are rolled back with it, so the Referrer has the
+/// context of the outermost scope only. Audit mutant `rb_leave_top_levels`.
 #[test]
 fn a_failed_scope_drops_the_top_levels_of_its_inner_scopes() {
     let mut leaker = Leaker::new();
@@ -899,8 +899,9 @@ fn a_failed_scope_drops_the_top_levels_of_its_inner_scopes() {
     assert!(referrer.is_empty());
 }
 
-/// rules.md, Scopes: what a failed inner scope found (a cycle of `Self` in its bounds) is rolled back
-/// with it: it does not make the scope around it fail. Audit mutant `rb_leave_env_errors`.
+/// `Leaker::enter_generics()` docs: what a failed inner scope found (a cycle of `Self` in its
+/// bounds) is rolled back with it: it does not make the scope around it fail. Audit mutant
+/// `rb_leave_env_errors`.
 #[test]
 fn a_failed_inner_scope_leaves_no_cycle_in_the_outer_one() {
     let inner = |view: &mut View<'_>| {
@@ -929,9 +930,9 @@ fn a_failed_inner_scope_leaves_no_cycle_in_the_outer_one() {
         .is_err());
 }
 
-/// rules.md, Scopes: the decision that an entry of an external crate is not optional (it is in a
-/// bound that would make a cycle) belongs to the scope that made it; a failed inner scope leaves
-/// no such decision in the outer one. Audit mutant `rb_leave_not_optional`.
+/// `Leaker::enter_generics()` docs: the decision that an entry of an external crate is not optional
+/// (it is in a bound that would make a cycle) belongs to the scope that made it; a failed inner
+/// scope leaves no such decision in the outer one. Audit mutant `rb_leave_not_optional`.
 #[test]
 fn a_failed_inner_scope_leaves_the_optional_entries() {
     let mut leaker = leaker_with_std();

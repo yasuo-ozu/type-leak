@@ -152,7 +152,7 @@ pub struct Features {
     /// A strict Referrer replaces an optional entry that holds a lifetime of a method (`fn
     /// m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>`): the copy has `'x` in no argument that
     /// constrains it, so it is early-bound, where it is late-bound in the trait (E0195, F18: the
-    /// rules.md, "External crates", says that replacing a type can lose a method lifetime). Off,
+    /// `Referrer::must()` docs say that replacing a type can lose a method lifetime). Off,
     /// the item that has it is not invoked as strict.
     pub strict_anchors: bool,
     /// In an impl whose self type is leaked, a method with a bound of a generic that names `Self`
@@ -1439,9 +1439,9 @@ impl Gen {
             Shape::Lt => {
                 let lt = self.lifetime(sc, c, false);
                 let a = self.ty(sc, inner, depth + 1);
-                // The bound `T: 'a` of the definition must be written, as rules.md says: a path
-                // with a lifetime records no bound, so `Self: 'x` that only the receiver implies
-                // is not enough (F5).
+                // The bound `T: 'a` of the definition must be written, as the `Leaker` docs say: a
+                // path with a lifetime records no bound, so `Self: 'x` that only the receiver
+                // implies is not enough (F5).
                 if !outlives(sc, &a, &lt, false, true) {
                     return None;
                 }
@@ -2432,8 +2432,8 @@ impl Gen {
     /// path), or in braces like a path of several segments (`{ self::RLEN }`).
     ///
     /// In a module analyzed as a whole, a path that the module declares (or imports) holds the
-    /// identifier as a type, which is the limitation rules.md names ("Bare identifiers and
-    /// consts"): only a path of `base` is written with it.
+    /// identifier as a type, which is the limitation that the `Leaker` docs name ("Bare identifiers
+    /// and consts"): only a path of `base` is written with it.
     fn const_arg(&mut self, head: &str, len: &str, params: &[(String, &'static str)]) -> String {
         let braced = braced_path(len, params);
         let bare_ok = !self.module_mode || head.contains("base::");

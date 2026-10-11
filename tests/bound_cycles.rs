@@ -986,10 +986,10 @@ fn an_optional_entry_that_an_unstable_bound_makes_cyclic_is_copied_as_written() 
     assert!(referrer.must(0) && !referrer.must(1));
 }
 
-/// rules.md, Bounds that name leaked types: `<Self as ::p::Tr>::A0` in a bound names the associated
-/// type of the host, which rustc normalizes in the impl of the Repeater but not yet in the
-/// environment, as `Self::A0` does. The qualified path is as unstable as the other. Audit mutant
-/// `b_selfassoc_qself_off`.
+/// The `Leaker` docs, Bounds that name leaked types: `<Self as ::p::Tr>::A0` in a bound names the
+/// associated type of the host, which rustc normalizes in the impl of the Repeater but not yet in
+/// the environment, as `Self::A0` does. The qualified path is as unstable as the other. Audit
+/// mutant `b_selfassoc_qself_off`.
 #[test]
 fn a_qualified_associated_type_of_self_in_a_bound_is_unstable() {
     for (written, shown) in [
@@ -1020,7 +1020,7 @@ fn a_qualified_associated_type_of_self_in_a_bound_is_unstable() {
     }
 }
 
-/// rules.md, Bounds that name leaked types / Self rules: a predicate on a type that is not a
+/// The `Leaker` docs, Bounds that name leaked types: a predicate on a type that is not a
 /// generic and names `Self` alone (`Vec<Self>: Clone`, `Self: Clone`) is proved by an impl, so it
 /// is no unstable bound: an entry that names `Self` stays accepted, and `Self` stays an entry
 /// (here the self type of the impl). Audit mutants `b_selftype_pred_on_env` and
@@ -1053,7 +1053,7 @@ fn bare_self_predicates_stay_accepted() {
     }
 }
 
-/// rules.md, Bounds that name leaked types: a predicate on a type that is not a generic
+/// The `Leaker` docs, Bounds that name leaked types: a predicate on a type that is not a generic
 /// (`Vec<Self::A>: AsRef<Self::A>`) is proved by an impl and names no unstable bound as far as
 /// `Self::A` goes, so an entry in a bound of a method of the trait is accepted. Audit mutant
 /// `b_nonparam_pred_bounds_count`.
@@ -1073,10 +1073,10 @@ fn a_predicate_on_a_non_generic_type_with_self_assoc_is_no_unstable_bound() {
     assert!(referrer.must(0));
 }
 
-/// rules.md, Bounds that name leaked types: the self type of an impl is an optional entry (it is a
-/// type of an external crate), but not where a predicate names `Self` and a bound of its generic
-/// names a leaked type: the Referrer's replacement of it would make a cycle. Here the self type
-/// `::ext::W<T>` has `T: Fn(Rel)` and `Self: Clone` is written: the only entry is `Rel`. Audit
+/// The `Leaker` docs, Bounds that name leaked types: the self type of an impl is an optional entry
+/// (it is a type of an external crate), but not where a predicate names `Self` and a bound of its
+/// generic names a leaked type: the Referrer's replacement of it would make a cycle. Here the self
+/// type `::ext::W<T>` has `T: Fn(Rel)` and `Self: Clone` is written: the only entry is `Rel`. Audit
 /// mutant `b_not_optional_in_self_type_off` (which adds the optional `::ext::W<T>`).
 #[test]
 fn an_optional_self_type_is_no_entry_where_self_is_in_a_predicate() {
@@ -1087,11 +1087,11 @@ fn an_optional_self_type_is_no_entry_where_self_is_in_a_predicate() {
     assert_eq!(types(&referrer), ["Rel"]);
 }
 
-/// rules.md, Bounds that name leaked types: a generic whose bounds are all traits of the standard
-/// library, and none defines `Item`, keeps `T::Item` rigid: the name of each trait of the list
-/// (`STD_TRAITS`) is one, and the bound `Fn(T::Item) -> u8` next to it is stable. A trait of the
-/// analyzed code, or a path of another crate, may define the `Item` by a supertrait, so the bound
-/// is unstable. Audit mutants `std_without_<name>` (one per name; also `b_std_without_*`).
+/// The `Leaker` docs, Bounds that name leaked types: a generic whose bounds are all traits of the
+/// standard library, and none defines `Item`, keeps `T::Item` rigid: the name of each trait of the
+/// list (`STD_TRAITS`) is one, and the bound `Fn(T::Item) -> u8` next to it is stable. A trait of
+/// the analyzed code, or a path of another crate, may define the `Item` by a supertrait, so the
+/// bound is unstable. Audit mutants `std_without_<name>` (one per name; also `b_std_without_*`).
 #[test]
 fn the_standard_traits_do_not_define_an_associated_type() {
     let names = [
@@ -1189,9 +1189,9 @@ fn the_standard_traits_do_not_define_an_associated_type() {
     }
 }
 
-/// rules.md, Bounds that name leaked types: `Self::A` in a bound of the impl is not written in the
-/// copy: the headline says to write the trait out, `<Self as ::p::Tr>::A`. Audit mutant
-/// `s_selfassoc_bounds_off` (only the other error of the item remains).
+/// The `Leaker` docs, Bounds that name leaked types: `Self::A` in a bound of the impl is not
+/// written in the copy: the headline says to write the trait out, `<Self as ::p::Tr>::A`. Audit
+/// mutant `s_selfassoc_bounds_off` (only the other error of the item remains).
 #[test]
 fn self_assoc_in_a_bound_of_an_impl_cannot_be_written_in_the_repeater() {
     let item: Item = parse_quote!(

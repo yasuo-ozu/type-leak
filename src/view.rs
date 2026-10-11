@@ -14,22 +14,27 @@ mod forward;
 /// Analyze a fragment with [`View::visit_type()`], [`View::visit_path_arguments()`],
 /// [`View::visit_where_clause()`], [`View::visit_type_param_bound()`] or [`View::visit_item()`].
 /// [`View::check()`] looks at a type without recording anything. The `enter_*` methods open a
-/// nested scope ([Scopes](crate::rules#scopes)). A scope sees what its nested scopes find as if it was
-/// written in it.
+/// nested scope: its generics are local generics, and the generics around stay in scope. A scope
+/// sees what its nested scopes find as if it was written in it. `Self` is what the scope declares.
+/// It has no meaning in `enter_generics()` and `enter_mod()`, so naming it there is an error, and
+/// an item visited with `visit_item()` has a `Self` of its own. The ids, errors and rollback of a
+/// scope are those of [`Leaker::enter_generics()`](crate::Leaker::enter_generics).
 ///
 /// `View` also implements [`Visit`](syn::visit::Visit), so a walk with the `syn::visit` functions
 /// analyzes an item: `syn::visit::visit_item_struct(view, &item)` does what
 /// [`Leaker::intern_struct()`](crate::Leaker::intern_struct) does. The walk declares nothing, so
-/// walk the item the scope is for. Two methods of the trait do more than the walk:
+/// walk the item the scope is for. The default of a type parameter that it visits is analyzed with
+/// the earlier parameters as the generics, and the default of a const parameter with the syntax
+/// that visits it. Two methods of the trait do more than the walk:
 ///
-/// - `Visit::visit_signature(view, &sig)` analyzes a method's signature. The generics of `sig`
-///   are local generics, declared in a scope of their own. It also reports a method lifetime that
-///   the copy would leave unconstrained (E0195, see [Method lifetimes](crate::rules#method-lifetimes))
+/// - `Visit::visit_signature(view, &sig)` analyzes a method's signature. The generics of `sig` are
+///   local generics, declared in a scope of their own. It also reports a method lifetime that the
+///   copy would leave unconstrained (E0195, see [Method lifetimes](crate::Leaker#method-lifetimes))
 ///   and an elided output lifetime that the copy could not resolve (E0106, see [Elided
-///   lifetimes](crate::rules#elided-lifetimes)). Walking a trait or an impl reaches it for each method.
-///   The E0195 check is skipped for the methods of an inherent impl that the walk is in, because
-///   no trait declares their signature. A signature visited alone may be a trait's, so it is
-///   checked.
+///   lifetimes](crate::Leaker#elided-lifetimes)). Walking a trait or an impl reaches it for each
+///   method. The E0195 check is skipped for the methods of an inherent impl that the walk is in,
+///   because no trait declares their signature. A signature visited alone may be a trait's, so it
+///   is checked.
 /// - `Visit::visit_path(view, &path)` at the root, outside a type, analyzes only the arguments of
 ///   the path and does not check the path itself, which is resolved elsewhere. To analyze a trait
 ///   bound with its root checked, use [`View::visit_type_param_bound()`]: the path of the trait

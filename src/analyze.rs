@@ -93,7 +93,7 @@ impl Advice {
 
 /// A `for<..>` binder whose output mentions lifetimes that no input keeps as written (an anchor). A
 /// type using them cannot be leaked alone: its copy holds them only in an associated type path
-/// (E0581, E0582). See [Binder lifetimes](crate::rules#binder-lifetimes).
+/// (E0581, E0582). See [Binder lifetimes](crate::Leaker#binder-lifetimes).
 struct Binder {
     /// The depth of the type holding the binder, leaked whole instead (0 in a bound).
     owner: usize,
@@ -122,13 +122,13 @@ enum BinderInput<'a> {
 
 /// A signature (a function pointer, the sugar of `Fn(..) -> R`, or a method) whose output has an
 /// elided lifetime that elision takes from the only lifetime of the inputs (which a path may hide:
-/// `Ref<u8>`, so it is the one that the inputs do not show). The copy of a type with
-/// lifetimes in the inputs names them in the arguments of its projection, so the inputs have more
-/// lifetimes and elision fails (E0106). Such a type is not leaked alone: the type holding the
-/// signature is leaked as a whole instead if it can be, and it is an error otherwise. The same
-/// holds for `Self`, which the copy of a struct, an enum or a union writes as the type itself, but
-/// there the Referrer names the lifetime where it can (see
-/// [`AnalyzeVisitor::self_elision_broken()`]). See [Elided lifetimes](crate::rules#elided-lifetimes).
+/// `Ref<u8>`, so it is the one that the inputs do not show). The copy of a type with lifetimes in
+/// the inputs names them in the arguments of its projection, so the inputs have more lifetimes and
+/// elision fails (E0106). Such a type is not leaked alone: the type holding the signature is leaked
+/// as a whole instead if it can be, and it is an error otherwise. The same holds for `Self`, which
+/// the copy of a struct, an enum or a union writes as the type itself, but there the Referrer names
+/// the lifetime where it can (see [`AnalyzeVisitor::self_elision_broken()`]). See [Elided
+/// lifetimes](crate::Leaker#elided-lifetimes).
 #[derive(Clone)]
 struct Elision {
     /// The depth of the type holding the signature, leaked whole instead (0 for a method or a
@@ -678,7 +678,7 @@ struct SignatureWalk {
 }
 
 /// What a trait object without a lifetime bound takes its lifetime from. See
-/// [Trait objects](crate::rules#trait-objects).
+/// [Trait objects](crate::Leaker#trait-objects).
 #[derive(Clone, Copy)]
 enum Inherits {
     /// A reference `&'a dyn Trait` (the depth of the reference) with a Leaker lifetime, or a local
@@ -2242,15 +2242,15 @@ impl AnalyzeVisitor {
     /// Called after the self type of an impl with `generics` is visited, with `start` the first
     /// effect it made.
     ///
-    /// The Repeater's impl of an entry whose context depends on `Self` (a bound of the generics
-    /// of the impl names it) is for the self type, so the copy writes `<Self as Repeater<..>>::Type`
+    /// The Repeater's impl of an entry whose context depends on `Self` (a bound of the generics of
+    /// the impl names it) is for the self type, so the copy writes `<Self as Repeater<..>>::Type`
     /// with the self type, as the Referrer has it, for `Self`. An entry in the self type has none:
     /// it is the one that is being written (`T: AsRef<Option<Self>>` in `impl<T> S<T>`: `S<T>` is
-    /// its own `Self`, and a path that stands for itself is a cycle, E0391). Replacing the bound
-    /// of the context by one for the self type does not help, as the bound would then name a
-    /// leaked type that is the entry itself (E0277, see [Bounds that name leaked
-    /// types](crate::rules#bounds-that-name-leaked-types)), and the parts of the self type depend on
-    /// `Self` as it does.
+    /// its own `Self`, and a path that stands for itself is a cycle, E0391). Replacing the bound of
+    /// the context by one for the self type does not help, as the bound would then name a leaked
+    /// type that is the entry itself (E0277, see [Bounds that name leaked
+    /// types](crate::Leaker#bounds-that-name-leaked-types)), and the parts of the self type depend
+    /// on `Self` as it does.
     ///
     /// So a type that must be an entry is an error, and one that may be is not. An optional entry
     /// is copied as written, which the Referrer cannot do if it replaces them (see
@@ -2481,10 +2481,10 @@ impl AnalyzeVisitor {
     /// Runs `f`, which visits `sig`. `item`: it is that of a function item, whose generics are the
     /// item's, and not those of a method. `compared`: rustc compares it with a signature that the
     /// copy cannot change, so the lifetimes that the copy would leave unconstrained are an error
-    /// (E0195, see [Method lifetimes](crate::rules#method-lifetimes)). That is a method of a trait, which
-    /// the impls of the original are checked against, and one of an impl of a trait, which is
-    /// checked against the trait. A function item and a method of an inherent impl have no such
-    /// signature, so the copy may have the lifetime early-bound where the original has it
+    /// (E0195, see [Method lifetimes](crate::Leaker#method-lifetimes)). That is a method of a
+    /// trait, which the impls of the original are checked against, and one of an impl of a trait,
+    /// which is checked against the trait. A function item and a method of an inherent impl have no
+    /// such signature, so the copy may have the lifetime early-bound where the original has it
     /// late-bound (F22).
     fn with_signature(
         &mut self,
@@ -2591,9 +2591,9 @@ impl AnalyzeVisitor {
 
     /// Reports the lifetimes of the signature just visited that the copy would leave unconstrained
     /// because only types leaked whole hold them (E0195, see [Method
-    /// lifetimes](crate::rules#method-lifetimes)). The return type names the lifetime and no bound does,
-    /// so it is late-bound where some input constrains it as written (`Wrap<'x>` does), and it
-    /// is early-bound in the copy where every such input is leaked whole: `Wrap<'x>` becomes a
+    /// lifetimes](crate::Leaker#method-lifetimes)). The return type names the lifetime and no bound
+    /// does, so it is late-bound where some input constrains it as written (`Wrap<'x>` does), and
+    /// it is early-bound in the copy where every such input is leaked whole: `Wrap<'x>` becomes a
     /// projection, which does not constrain it. An input that keeps it, such as `&'x u8`, is no
     /// type leaked whole, nor is one inside it.
     fn check_leaked_lifetimes(&mut self, sig: &Signature) {
@@ -2660,8 +2660,8 @@ impl AnalyzeVisitor {
 
     /// Returns the lifetimes of `sig` that the copy would leave unconstrained, making them
     /// early-bound where the original is late-bound (E0195, see [Method
-    /// lifetimes](crate::rules#method-lifetimes)). The return type and some input mention them, no bound
-    /// does, and no input keeps them: the receiver or a reference with it.
+    /// lifetimes](crate::Leaker#method-lifetimes)). The return type and some input mention them, no
+    /// bound does, and no input keeps them: the receiver or a reference with it.
     fn unconstrained_lifetimes(&self, sig: &Signature) -> Vec<Lifetime> {
         let declared: Vec<Lifetime> = sig
             .generics
@@ -2825,7 +2825,7 @@ impl AnalyzeVisitor {
     /// Finds the occurrences of `used.lifetime` in `ty` that constrain it as rustc sees it (all but
     /// in an associated type path, an array length, `impl Trait` or a type macro). One anchors only
     /// if no type on its chain is leaked whole. When in doubt it does not. See [Binder
-    /// lifetimes](crate::rules#binder-lifetimes).
+    /// lifetimes](crate::Leaker#binder-lifetimes).
     fn scan_anchors(&self, ty: &Type, used: &mut OutputUse) {
         used.chain.push(ty as *const Type as usize);
         match ty {

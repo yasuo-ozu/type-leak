@@ -27,7 +27,8 @@ use template_quote::quote;
 /// `Self` where it has no meaning (in a module, or in generics that no struct, enum, union, impl or
 /// trait encloses) is an `impossible` cause, with the mention of `Self` as written, a `note` and a
 /// `help`.
-/// A scope fails on it, so it can be neither leaked nor copied. See [Self rules](crate::rules#self-rules).
+/// A scope fails on it, so it can be neither leaked nor copied. See
+/// [`Leaker::enter_generics()`](crate::Leaker::enter_generics).
 ///
 /// ```
 /// # use type_leak::*;
@@ -67,12 +68,12 @@ pub struct CheckResult {
     /// `true` if the first of `must` is the type's own path (`MyType` in `MyType<'_>`), so the type
     /// must be leaked whole. `false` if `must` is empty or only its parts are causes
     /// (`::path::Wrap<MyType, '_>`). A bare identifier argument counts as a cause of the type
-    /// holding it. See [Bare identifiers and consts](crate::rules#bare-identifiers-and-consts).
+    /// holding it. See [Bare identifiers and consts](crate::Leaker#bare-identifiers-and-consts).
     pub is_own: bool,
     /// `true` if the type is an optional entry: it has no cause of its own, and its own path names
     /// an external crate (`::path::X`, `::path::Wrap<(MyType,)>`), which the Referrer may not
     /// share. `must` holds only its parts, if any. A type with an impossible cause is not one, as
-    /// it is copied as written. See [External crates](crate::rules#external-crates).
+    /// it is copied as written. See [`Leaker::allowed_paths`](crate::Leaker::allowed_paths).
     pub optional: bool,
     /// Explains the conflict if the causes do not (why `Self` cannot be leaked, or has no
     /// meaning). Reported first. It says why, and `help` says what to write instead.
@@ -89,8 +90,8 @@ pub struct CheckResult {
     /// It is set when the fault is something else than a path:
     ///
     /// - a type that uses a generic whose bound mentions a `Self` that has no name here (see
-    ///   [Self rules](crate::rules#self-rules)): the fault is that bound, `must` is the type that uses
-    ///   it, and `impossible` is the mention of `Self`;
+    ///   [`View::visit_item()`](crate::View::visit_item)): the fault is that bound, `must` is the
+    ///   type that uses it, and `impossible` is the mention of `Self`;
     /// - a type that uses a generic whose bound mentions a `Self` that cannot be leaked;
     /// - a type in the default of a parameter that names `Self`;
     /// - the bound rules, and `Self::A` where `Self` is a type;

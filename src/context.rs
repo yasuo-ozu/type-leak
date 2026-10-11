@@ -128,7 +128,9 @@ impl Scope {
 }
 
 /// What `Self` means in a context (`Referrer::context_self()`). The Repeater impl of an entry that
-/// names `Self` is written for the type described here. See [Self rules](crate::rules#self-rules).
+/// names `Self` is written for the type described here, so `Referrer::context_self()` tells which
+/// form to use. The bounds and where predicates of the generics of such an entry may name `Self`
+/// too.
 ///
 /// ```
 /// # use type_leak::*;
@@ -152,10 +154,30 @@ impl Scope {
 ///     _ => unreachable!(),
 /// }
 /// ```
+///
+/// The two forms of impl, for `Rel<Self>`:
+///
+/// ```ignore
+/// // `Rel<Self>` in `trait MyLeaker<T, U>`: for the implementors of the trait
+/// impl<T, U, __S: ?Sized + MyLeaker<T, U>> path::Repeater<(T, U), 42, 2> for __S {
+///     type Type = path::Rel<__S>;
+/// }
+/// // `Rel<Self>` in `struct MyStruct<T>`: for the type
+/// impl<T> path::Repeater<(T,), 42, 3> for MyStruct<T> {
+///     type Type = path::Rel<Self>;
+/// }
+/// ```
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum SelfRequirement {
     /// `Self` is any implementor of the trait, e.g. `Self: MyTrait<T, U>`.
+    ///
+    /// In the impl for the implementors, `Self` is a type parameter (`__S`). Take the type and
+    /// generics of the entry from [`Referrer::iter_with_self()`](crate::Referrer::iter_with_self)
+    /// with `__S`, which [`Referrer::repeater_impl()`](crate::Referrer::repeater_impl) does:
+    /// `Self::Item` becomes `<__S>::Item`, and `Self: Sized` becomes `__S: Sized`. The copy uses
+    /// `<Self as Repeater<..>>::Type`, where `Self` is the implementor, so the impl in the other
+    /// crate must provide the associated types that the type uses (`type Item = u8;`).
     Bound(Path),
     /// `Self` is this type: a struct, enum, union or the self type of an impl, e.g. `MyStruct<T>`.
     Type(Type),
@@ -977,15 +999,16 @@ impl std::hash::Hash for Context {
     }
 }
 
-/// Identifies a [context](crate::rules#contexts): what gives a leaked type its meaning, which is
-/// the generics it uses, what `Self` is, and the module it is written in.
+/// Identifies a context: what gives a leaked type its meaning, which is the generics it uses, what
+/// `Self` is, and the module it is written in. It decides which Repeater impl an entry needs.
 ///
 /// Every analysis method of the [`Leaker`](crate::Leaker) returns the id of the top-level context
 /// of what it analyzed (keep it: [`Referrer::visitor()`](crate::Referrer::visitor) needs it), and
 /// [`Referrer::context()`](crate::Referrer::context) returns the id of the context of an entry.
-/// Ids count from 0 in order of first appearance and are never renumbered, so the Referrer may
-/// skip some. Entries with the same generics, `Self` and module share an id. `ToTokens` writes it
-/// as an integer literal, and `Parse` reads one with or without `usize`.
+/// Ids count from 0 in order of first appearance and are never renumbered (except for the contexts
+/// of a scope that fails and is rolled back), so the Referrer may skip some. Entries with the same
+/// generics, `Self` and module share an id. `ToTokens` writes it as an integer literal, and `Parse`
+/// reads one with or without `usize`.
 ///
 /// ```
 /// # use type_leak::*;
@@ -1007,6 +1030,59 @@ impl std::hash::Hash for Context {
 /// assert_eq!(id.index(), 3);
 /// assert_eq!(id.to_token_stream().to_string(), "3");
 /// ```
+///
+/// # What a context holds
+///
+/// ```
+/// use syn::{parse_quote, ItemTrait};
+/// use type_leak::Leaker;
+///
+/// let item: ItemTrait = parse_quote! {
+///     trait Tr<T, U> where U: ::core::convert::Into<T> {
+///         fn f(&self) -> Rel;
+///         fn g(&self) -> Wrap<T>;
+///         fn h(&self) -> Wrap<U>;
+///     }
+/// };
+/// let mut leaker = Leaker::new();
+/// leaker.intern_trait(&item, true).unwrap();
+/// let referrer = leaker.finish();
+/// // `Rel` uses no generic. `Wrap<T>` uses `T`. `Wrap<U>` uses `U` and, through the bound
+/// // `U: Into<T>`, `T`.
+/// let used: Vec<usize> = (0..3).map(|ix| referrer.generics(ix).params.len()).collect();
+/// assert_eq!(used, [0, 1, 2]);
+/// ```
+///
+/// - The generics are only those the type uses: the generics the type names, the generics that
+///   the bounds of those generics name, and, if the type names `Self`, the generics in the
+///   description of `Self`.
+/// - A where predicate on one generic (`U: Into<T>`) is a bound of that generic, as if it was
+///   written inline on `U`. It is in the context of what uses `U`, not of what uses `T`. A where
+///   predicate on another type (`Vec<T>: Clone`) belongs to each generic it names.
+///
+/// # When two contexts are equal
+///
+/// - Equal declarations give equal contexts. Parameters are sorted by kind and name, bounds are
+///   sorted and moved from the where clause to their parameter, and defaults are removed. So the
+///   generics of a context are matched with those of the item by name, not by position
+///   ([`Referrer::context_generic_args()`](crate::Referrer::context_generic_args)).
+/// - The same type found by several scopes is one entry if the contexts are equal, whatever the
+///   other generics of the scopes are. Scopes with the same generics but another `Self` return
+///   other ids.
+///
+/// # The top-level context
+///
+/// - It is the context of the generics of the item or scope itself. It differs from the context of
+///   an entry if the entry uses fewer generics, as `Rel` does in
+///   `trait Tr<T> { fn f(&self) -> Rel; }`. The Referrer keeps it even if it has no entry.
+/// - It records what `Self` is if an entry names it, or has a bound rewritten for it
+///   ([`Referrer::context_self()`](crate::Referrer::context_self)), and the module the scope was
+///   entered in ([`Referrer::context_module()`](crate::Referrer::context_module)). So
+///   [`Referrer::visitor()`](crate::Referrer::visitor) knows the generics, `Self` and module of the
+///   copy from the id alone.
+/// - For the trait that [`Leaker::intern_trait()`](crate::Leaker::intern_trait) analyzes, it also
+///   records the generic associated types that have outlives bounds, if an entry names `Self`. So
+///   the visitor finds the entries that name them in a signature alone, as in the trait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContextId(usize);
 
@@ -1249,8 +1325,8 @@ fn for_self_of<T: WrittenForSelf>(
     }
 }
 
-/// The lifetimes a type must outlive because of the types around it, as in `&'a Vec<Rel2<T>>`
-/// (see [Outlives bounds](crate::rules#outlives-bounds)). `T::A<X>` is decided late, by the scopes in
+/// The lifetimes a type must outlive because of the types around it, as in `&'a Vec<Rel2<T>>` (see
+/// [Outlives bounds](crate::Leaker#outlives-bounds)). `T::A<X>` is decided late, by the scopes in
 /// scope where it is written: see [`Enclosing::generic()`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Enclosing(Vec<Link>);
@@ -1716,7 +1792,7 @@ impl Binding {
 
 /// Returns the outlives bounds `ty` implies on `params`: `&'a X` requires `X: 'a`, as does each of
 /// `ancestors` for `ty`. A path with a lifetime argument adds none, as a guessed bound could make
-/// the copy stricter than the original. See [Outlives bounds](crate::rules#outlives-bounds).
+/// the copy stricter than the original. See [Outlives bounds](crate::Leaker#outlives-bounds).
 ///
 /// An associated type path of a generic (`T::A`, `<T as Tr<'b>>::A`: see [`is_generic_projection()`])
 /// requires `T::A: 'a`, which the original gets from the well-formedness of its signature, and the

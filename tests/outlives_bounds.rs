@@ -258,7 +258,7 @@ fn with_self_outlives(referrer: &Referrer) -> Vec<(String, String, Vec<String>)>
         .collect()
 }
 
-/// rules.md, Outlives bounds (generic associated types): only the GATs of the trait that
+/// `Leaker::intern_trait()` docs (generic associated types): only the GATs of the trait that
 /// `intern_trait()` analyzes are read. `<Self as ::p::Other>::G<'x>` names the GAT of another
 /// trait, which the Leaker cannot see: only the predicate that the reference records is there, and
 /// no `Self: 'x`, which the `where Self: 'b` of this trait's own `G` would give. Audit mutant
@@ -303,8 +303,8 @@ fn the_gat_of_another_trait_records_the_predicate_only() {
     );
 }
 
-/// rules.md, Outlives bounds: the GATs of the trait that `intern_trait()` analyzes are read, also
-/// when the trait is nested in a module that `intern_mod()` analyzes. Audit mutant
+/// `Leaker::intern_trait()` docs: the GATs of the trait that `intern_trait()` analyzes are read,
+/// also when the trait is nested in a module that `intern_mod()` analyzes. Audit mutant
 /// `g_nested_trait_gats` (the GATs of a trait in a module are dropped).
 #[test]
 fn the_gats_of_a_trait_in_a_module_are_read() {
@@ -328,10 +328,10 @@ fn the_gats_of_a_trait_in_a_module_are_read() {
     );
 }
 
-/// rules.md, Outlives bounds: the value of an associated type or GAT (`type A<'a, T> = Ref<'a,
-/// Rel2<T>>;`) is analyzed like a type written anywhere else. A path with a lifetime argument
-/// records no bound for what is inside it, so the copy fails like the original without `T: 'a`,
-/// and the bound that is written (`type A<'a, T: 'a>`) is the one of the entry.
+/// The `Leaker` docs, Outlives bounds: the value of an associated type or GAT
+/// (`type A<'a, T> = Ref<'a, Rel2<T>>;`) is analyzed like a type written anywhere else. A path with
+/// a lifetime argument records no bound for what is inside it, so the copy fails like the original
+/// without `T: 'a`, and the bound that is written (`type A<'a, T: 'a>`) is the one of the entry.
 #[test]
 fn the_value_of_an_associated_type_is_analyzed_like_the_original() {
     // Not written: nothing is guessed for `Rel2<T>` and the path.
@@ -342,7 +342,7 @@ fn the_value_of_an_associated_type_is_analyzed_like_the_original() {
             e(":: p :: Ref < 'a , Rel2 < T > >", "< 'a , T >"),
         ]
     );
-    // Written, as rules.md says to: both have it.
+    // Written, as the `Leaker` docs say to: both have it.
     assert_eq!(
         leaked(parse_quote! { trait Tr { type A<'a, T: 'a> = ::p::Ref<'a, Rel2<T>>; } }),
         [

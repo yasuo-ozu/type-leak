@@ -355,7 +355,7 @@ pub fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a Gener
 /// lifetime parameter of `iter` is encoded.
 /// A reference implies its bound wherever it is written. So the impl must not declare the bounds
 /// it encodes. Declare `Referrer::impl_generics()` or [`without_encoded_bounds()`] instead (see
-/// [Outlives bounds](crate::rules#outlives-bounds)). `Self: 'a` is not encoded: use
+/// [Outlives bounds](crate::Leaker#outlives-bounds)). `Self: 'a` is not encoded: use
 /// [`encode_generics_params_to_ty_with_self()`].
 ///
 /// ```

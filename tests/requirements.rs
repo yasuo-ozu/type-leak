@@ -144,7 +144,7 @@ fn equal_requirements_are_shared_and_different_ones_are_not() {
     assert_eq!(referrer.iter().count(), 2);
 }
 
-/// rules.md, Contexts: "equal declarations give equal contexts": the bounds of a lifetime parameter
+/// `ContextId` docs, "equal declarations give equal contexts": the bounds of a lifetime parameter
 /// are sorted, and a where predicate on a lifetime (`where 'b: 'a`) is the bound of the lifetime
 /// (`'b: 'a`), as it is for a type parameter. Audit mutants `ctx_lifetime_bounds_unsorted` and
 /// `ctx_where_lifetime_not_moved`.
@@ -174,7 +174,7 @@ fn equal_lifetime_bounds_give_equal_contexts() {
     assert_eq!(referrer.iter().count(), 2);
 }
 
-/// rules.md, Contexts: the output of the `Fn(..)` sugar is parenthesized only where a `+` would join
+/// `ContextId` docs: the output of the `Fn(..)` sugar is parenthesized only where a `+` would join
 /// it (`Fn() -> (&dyn A) + B`), and however the source wrote it: equal declarations give equal
 /// contexts. Audit mutants `fn_output_paren_always` and `fn_output_unparen_dropped`.
 #[test]
@@ -210,7 +210,7 @@ fn the_output_of_the_fn_sugar_is_parenthesized_only_where_needed() {
     );
 }
 
-/// rules.md, Contexts: the generic associated types of the trait that `intern_trait()` analyzes
+/// `ContextId` docs: the generic associated types of the trait that `intern_trait()` analyzes
 /// (with outlives bounds) are part of its top-level context, so two traits that differ only in
 /// them have two contexts. Audit mutant `ctx_gats_not_in_identity`.
 #[test]

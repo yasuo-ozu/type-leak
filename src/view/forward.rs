@@ -29,9 +29,22 @@ impl View<'_> {
     /// ([`Leaker::intern_mod()`](crate::Leaker::intern_mod)). Its generics are local, and the
     /// generics around stay in scope. To analyze an item with its own generics as the root, use
     /// an `intern_*` method instead. A struct, enum, union, trait or impl declares its own `Self`,
-    /// which may be interned whatever `allow_self` the scope around has. The copy's
+    /// which may be interned whatever `allow_self` the scope around has (the `Self` of the scope
+    /// around is hidden in the item, and is denied as usual). The copy's
     /// [`Visitor`](crate::Visitor) finds the entries that name it with
-    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self).
+    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self). A function, type alias,
+    /// trait alias, const or static has no `Self` of its own: it keeps the one around.
+    ///
+    /// The bounds of a generic are written for the `Self` of the scope that declares it. A type in
+    /// a nested item that uses the generic gets them rewritten for the `Self` of that item, and its
+    /// entry does not depend on the other one: `T: ::p::Tr<Self>` of `struct S<T: ::p::Tr<Self>>`
+    /// is `T: ::p::Tr<S<T>>` in `impl W { fn f(x: Rel<T>); }`. That is an error if `Self` is the
+    /// implementor of a trait (it has no name), or if the bound names an associated item of `Self`
+    /// (`Self::X`, which is ambiguous for a type): the headline is "the bound of `T` mentions a
+    /// `Self` which has no name here" ([`CheckResult::headline`](crate::CheckResult::headline) has
+    /// it for [`View::check()`]). The scope that declares the bound records its `Self` in its
+    /// top-level context, so [`Referrer::visitor()`](crate::Referrer::visitor) knows it, and the
+    /// copy must nest the same scopes as the Leaker did.
     ///
     /// ```
     /// # use type_leak::*;

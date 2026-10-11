@@ -19,8 +19,9 @@ use syn::*;
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LeakerConfig {
-    /// The allowed paths. See [`Leaker::allowed_paths`](crate::Leaker::allowed_paths). Allow only
-    /// crates that are the same on both sides ([External crates](crate::rules#external-crates)).
+    /// The allowed paths. See [`Leaker::allowed_paths`](crate::Leaker::allowed_paths), which also
+    /// tells what happens to an absolute path that is not allowed. Allow only crates that are the
+    /// same on both sides.
     pub allowed_paths: Vec<Path>,
 }
 

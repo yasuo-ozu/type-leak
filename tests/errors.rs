@@ -549,7 +549,7 @@ fn notes_explain_conflicts() {
 #[test]
 fn a_conflict_that_is_not_about_the_path_has_a_headline_of_its_own() {
     // E0195: the fault is the lifetime that the copy would leave unconstrained, which an absolute
-    // path is only one way to fix (rules.md has the others).
+    // path is only one way to fix (the `Leaker` docs, Method lifetimes, have the others).
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait {
             fn f<'b>(&self, x: Wrap<'b>) -> &'b u8;
@@ -647,10 +647,10 @@ fn a_type_that_is_leaked_alone_is_no_cause_of_the_conflict_around_it() {
     );
 }
 
-/// rules.md, Bare identifiers and consts: a type with an expression that cannot be leaked as a whole
-/// (a closure in an array length) is an error naming the closure, not an entry: a closure cannot
-/// be written in the impl of the Repeater. Audit mutant `c_expr_closure_impossible` (the closure
-/// is no obstacle, and the array type is an entry).
+/// The `Leaker` docs, Bare identifiers and consts: a type with an expression that cannot be leaked
+/// as a whole (a closure in an array length) is an error naming the closure, not an entry: a
+/// closure cannot be written in the impl of the Repeater. Audit mutant `c_expr_closure_impossible`
+/// (the closure is no obstacle, and the array type is an entry).
 #[test]
 fn a_closure_in_an_array_length_cannot_be_leaked_as_a_whole() {
     let item: ItemTrait = parse_quote! {
