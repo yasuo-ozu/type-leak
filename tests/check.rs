@@ -126,7 +126,7 @@ fn test_check_self_no_internable() {
     assert!(Leaker::new().intern_struct(&item, false).is_ok());
 }
 
-/// README, External crates: a path that starts with `crate` is leaked, unless the allowed paths
+/// rules.md, External crates: a path that starts with `crate` is leaked, unless the allowed paths
 /// have `crate` (`LeakerConfig::allow_crate()`). A real `$crate` token (which a `macro_rules!`
 /// expansion gives to a proc macro) cannot be made outside one, so the `$crate` paths are pinned
 /// by the fixture crate (`DollarCrate` in `tests/crates/leaker`, with `check_leak!`, and

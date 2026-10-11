@@ -130,7 +130,7 @@ fn the_requirement_goes_down_through_the_components_it_goes_through_in_rustc() {
     );
 }
 
-/// README, Outlives bounds: `impl Trait` does not pass the lifetime on, as an associated type path
+/// rules.md, Outlives bounds: `impl Trait` does not pass the lifetime on, as an associated type path
 /// does not (the type behind it is opaque to the signature), while a trait object does. Audit
 /// mutant `o_impl_trait_passes` (`impl Trait` treated as a path that passes the lifetime on).
 #[test]

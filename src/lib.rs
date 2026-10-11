@@ -22,6 +22,9 @@ mod view;
 
 pub use syn;
 
+#[doc = include_str!("rules.md")]
+pub mod rules {}
+
 pub use crate::analysis::CheckResult;
 pub use crate::config::LeakerConfig;
 pub use crate::context::{ContextId, SelfRequirement};

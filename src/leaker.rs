@@ -23,18 +23,37 @@ use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
 
-/// Finds the leaked types of an item and turns them into a [`Referrer`].
+/// Finds the types of an item that depend on where they are written, and collects them in a
+/// [`Referrer`].
 ///
-/// Analyze a whole item with `intern_*`, or a part of one in a scope with `enter_*`. Then call
-/// [`Leaker::finish()`]. Each method returns the top-level [`ContextId`], and fails with a
-/// [`NotInternableError`]. See the [walkthrough](crate#walkthrough).
+/// This is the first step of copying an item into another crate. Analyze a whole item with an
+/// `intern_*` method, or only some fragments of it in a scope (`enter_*`). Then call
+/// [`Leaker::finish()`] to get the [`Referrer`]. Each analysis method returns the [`ContextId`] of
+/// what it analyzed (its top-level context), or fails with a [`NotInternableError`] that says
+/// which paths must be absolute. See the [quick start](crate#quick-start).
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let item: ItemTrait = parse_quote! {
+///     trait Tr<T> { fn f(&self, t: T) -> Wrap<T>; fn g(&self) -> Rel; }
+/// };
+/// let mut leaker = Leaker::new();
+/// let top_level = leaker.intern_trait(&item, true).unwrap();
+/// let referrer = leaker.finish();
+/// // `Wrap<T>` and `Rel` depend on where they are written, so each needs a Repeater impl.
+/// assert_eq!(referrer.required().count(), 2);
+/// // Keep `top_level` to rewrite a copy of the trait with `Referrer::visitor()`.
+/// assert_eq!(referrer.context_generics(top_level).params.len(), 1);
+/// ```
 #[derive(Default)]
 pub struct Leaker {
-    /// Paths that are not leaked, such as `::serde`.
+    /// Paths that are left as written instead of being leaked, such as `::serde`.
     ///
-    /// A path matches if it starts with one of these, and both have a leading `::` or neither. Its
-    /// generic arguments are still analyzed. An allowed absolute path must name the same crate on
-    /// both sides. See [External crates](crate#external-crates). [`LeakerConfig`] has helpers.
+    /// A path matches if it starts with one of these, and both have a leading `::` or neither.
+    /// The generic arguments of a matching path are still analyzed. You promise that an allowed
+    /// absolute path names the same crate on both sides ([External
+    /// crates](crate::rules#external-crates)). [`LeakerConfig`] has ready-made lists.
     pub allowed_paths: Vec<Path>,
     /// The types that depend on the context (the required entries).
     types: TypeGraph,
@@ -52,12 +71,12 @@ pub struct Leaker {
 }
 
 impl Leaker {
-    /// Creates an empty [`Leaker`].
+    /// Creates a [`Leaker`] that allows no path, so every relative path is leaked.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Creates a [`Leaker`] from a configuration.
+    /// Creates a [`Leaker`] that leaves the paths allowed by `config` as written.
     pub fn from_config(config: LeakerConfig) -> Self {
         Self {
             allowed_paths: config.allowed_paths,
@@ -65,12 +84,12 @@ impl Leaker {
         }
     }
 
-    /// Returns items that fail to compile ("mismatched types") if a primitive type name is
-    /// shadowed.
+    /// Returns a compile-time check that primitive type names are not shadowed.
     ///
     /// The Leaker copies primitive names as they are, such as `u8` in `const N: u8` or a name
-    /// allowed by [`LeakerConfig::allow_primitive()`]. Emit the result in the Leaker's type
-    /// context. A name is shadowed by, for example, `type u8 = i32;`.
+    /// allowed by [`LeakerConfig::allow_primitive()`]. That is wrong if an item shadows the name
+    /// (`type u8 = i32;`). Emit the result in the Leaker's type context: it fails to compile
+    /// ("mismatched types") if a name is shadowed, and is empty if no primitive name was copied.
     pub fn assertions(&self) -> TokenStream {
         if self.assumed_primitives.is_empty() {
             return TokenStream::new();
@@ -88,11 +107,13 @@ impl Leaker {
         }
     }
 
-    /// Analyzes the struct `item` and returns its top-level context.
+    /// Analyzes a struct and returns its top-level context.
     ///
-    /// The generics of the item are those of the Leaker, and `Self` is the struct
-    /// ([`SelfRequirement::Type`]). For `allow_self` see [Self rules](crate#self-rules). This is
-    /// [`Leaker::enter_type()`] with the item visited.
+    /// The generics of the item are the generics of the analysis, and `Self` is the struct
+    /// ([`SelfRequirement::Type`]). With `allow_self`, a type that names `Self` is one entry,
+    /// written for the struct. Without it, such a type is split into parts, and that is an error
+    /// where it cannot be ([Self rules](crate::rules#self-rules)). This is [`Leaker::enter_type()`] with
+    /// the item visited.
     pub fn intern_struct(&mut self, item: &ItemStruct, allow_self: bool) -> Res<ContextId> {
         self.enter_type(&item.ident, &item.generics, allow_self, |view| {
             syn::visit::visit_item_struct(view, item)
@@ -100,7 +121,7 @@ impl Leaker {
         .map(|(context, ())| context)
     }
 
-    /// Analyzes the enum `item` and returns its top-level context.
+    /// Analyzes an enum and returns its top-level context.
     ///
     /// It is [`Leaker::intern_struct()`] for an enum, with the same `Self` and `allow_self`.
     pub fn intern_enum(&mut self, item: &ItemEnum, allow_self: bool) -> Res<ContextId> {
@@ -110,7 +131,7 @@ impl Leaker {
         .map(|(context, ())| context)
     }
 
-    /// Analyzes the union `item` and returns its top-level context.
+    /// Analyzes a union and returns its top-level context.
     ///
     /// It is [`Leaker::intern_struct()`] for a union, with the same `Self` and `allow_self`.
     pub fn intern_union(&mut self, item: &ItemUnion, allow_self: bool) -> Res<ContextId> {
@@ -120,15 +141,16 @@ impl Leaker {
         .map(|(context, ())| context)
     }
 
-    /// Analyzes the impl `item` and returns its top-level context.
+    /// Analyzes an impl and returns its top-level context.
     ///
-    /// The generics of the item are those of the Leaker, and `Self` is the self type
+    /// The generics of the item are the generics of the analysis, and `Self` is the self type
     /// ([`SelfRequirement::Type`]). It analyzes the generics, the trait and its arguments, the self
     /// type, and the signatures, associated types and consts. It skips function bodies and const
-    /// values. The trait path must not depend on the context. An entry in the self type cannot
-    /// depend on `Self` through a bound of the generics ([Self rules](crate#self-rules)). For
-    /// `allow_self` see
-    /// [`Leaker::intern_struct()`]. This is [`Leaker::enter_impl()`] with the item visited.
+    /// values.
+    ///
+    /// The trait path must not depend on the context. An entry in the self type must not depend on
+    /// `Self` through a bound of the generics ([Self rules](crate::rules#self-rules)). `allow_self` is as
+    /// for [`Leaker::intern_struct()`]. This is [`Leaker::enter_impl()`] with the item visited.
     pub fn intern_impl(&mut self, item: &ItemImpl, allow_self: bool) -> Res<ContextId> {
         // The scope checks the path of the trait, and the walk analyzes its arguments.
         let trait_path = item.trait_.as_ref().map(|(_, path, _)| path);
@@ -142,14 +164,39 @@ impl Leaker {
         .map(|(context, ())| context)
     }
 
-    /// Analyzes the trait `item` and returns its top-level context.
+    /// Analyzes a trait and returns its top-level context.
     ///
-    /// The generics of the item are those of the Leaker, and `Self` is the implementor
-    /// ([`SelfRequirement::Bound`]). An entry that names `Self` is written for the implementors.
-    /// For `allow_self` see [`Leaker::intern_struct()`]. This is [`Leaker::enter_trait()`] with the
-    /// item visited, and with its generic associated types known: a projection that names one that
-    /// has outlives bounds (`type G<'b> where Self: 'b;`) requires them
-    /// ([Outlives bounds](crate#outlives-bounds)).
+    /// The generics of the item are the generics of the analysis, and `Self` is the implementor
+    /// ([`SelfRequirement::Bound`]). An entry that names `Self` is written for the implementors of
+    /// the trait. `allow_self` is as for [`Leaker::intern_struct()`].
+    ///
+    /// This is [`Leaker::enter_trait()`] with the item visited, and with its generic associated
+    /// types known: a projection that names one that has outlives bounds
+    /// (`type G<'b> where Self: 'b;`) requires them ([Outlives bounds](crate::rules#outlives-bounds)).
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemTrait = parse_quote! {
+    ///     trait Tr<T> {
+    ///         type Out;
+    ///         fn f(&self, t: T) -> Wrap<T>;
+    ///         fn g(&self) -> Wrap2<Self::Out>;
+    ///     }
+    /// };
+    /// let mut leaker = Leaker::new();
+    /// leaker.intern_trait(&item, true).unwrap();
+    /// let referrer = leaker.finish();
+    /// // `Wrap2<Self::Out>` names `Self`, so its impl is for the implementors of the trait.
+    /// let ix = referrer.iter().position(|ty| *ty == parse_quote!(Wrap2<Self::Out>)).unwrap();
+    /// let context = referrer.context(ix);
+    /// assert!(matches!(referrer.context_self(context), Some(SelfRequirement::Bound(_))));
+    ///
+    /// // A relative trait in a bound cannot be leaked: the error says to write it in full.
+    /// let item: ItemTrait = parse_quote!(trait Tr: Clone {});
+    /// let err = Leaker::new().intern_trait(&item, true).unwrap_err();
+    /// assert_eq!(err.to_string(), "use absolute path: 'Clone'");
+    /// ```
     pub fn intern_trait(&mut self, item: &ItemTrait, allow_self: bool) -> Res<ContextId> {
         // The scope knows the generic associated types of the trait: what they require is part of
         // the context of an entry that names them.
@@ -160,13 +207,14 @@ impl Leaker {
         .map(|(context, ())| context)
     }
 
-    /// Analyzes the module `item` and returns the [`ContextId`] of the module, which has no
-    /// generics.
+    /// Analyzes a module and returns its [`ContextId`]. A module has no generics, and `Self` has no
+    /// meaning in it.
     ///
     /// Every item in it is a nested item, so its generics are local. Function bodies and const
-    /// values are not analyzed, and a `mod m;` has nothing to analyze. Names declared in the module
-    /// are copied with it, so they are not leaked. Nested modules are numbered as in
-    /// [`Leaker::enter_mod()`], with their paths recorded. See [Modules](crate#modules).
+    /// values are not analyzed, and a `mod m;` has nothing to analyze. The names declared in the
+    /// module are copied with it, so they are not leaked. Nested modules get ids as in
+    /// [`Leaker::enter_mod()`], and their paths are recorded ([`Referrer::module_path()`]). See
+    /// [Modules](crate::rules#modules).
     pub fn intern_mod(&mut self, item: &ItemMod) -> Res<ContextId> {
         let names = match &item.content {
             Some((_, items)) => declared_names(items),
@@ -181,13 +229,14 @@ impl Leaker {
             .map(|(context, ())| context)
     }
 
-    /// Enters a module and runs `f` on a [`View`] of it.
+    /// Analyzes part of a module: runs `f` on a [`View`] inside the module.
     ///
     /// Returns the [`ContextId`] of the module, which has no generics, and the result of `f`.
-    /// `declared` lists the names declared in the module (give them first). `hint` is for debugging
-    /// only. Ids come from a counter, so they are unique and equal calls give equal ids. `Self` has
-    /// no meaning directly in `f`. Errors and rollback are as in [`Leaker::enter_generics()`]. See
-    /// [Modules](crate#modules).
+    /// `declared` lists the names declared in the module (give them first): they are copied with
+    /// the module, so they are not leaked. `hint` is only for debugging. Module ids come from a
+    /// counter, so they are unique, and equal calls give equal ids. `Self` has no meaning directly
+    /// in `f`. Errors and rollback are as in [`Leaker::enter_generics()`]. See
+    /// [Modules](crate::rules#modules).
     pub fn enter_mod<R>(
         &mut self,
         hint: impl Display,
@@ -197,13 +246,17 @@ impl Leaker {
         Scopes::enter_mod(self, hint, declared, f)
     }
 
-    /// Enters generics and runs `f` on a [`View`] of them.
+    /// Analyzes types that use the given generics: runs `f` on a [`View`] in which `generics` are
+    /// declared.
     ///
-    /// Returns the top-level [`ContextId`] of `generics` and the result of `f`. The generics are
-    /// not analyzed. `Self` is not declared here, so naming it in `f` or in the generics is an
-    /// error ([`NotInternableError::SelfWithoutMeaning`]). An error in `f` rolls the scope back and
-    /// returns its errors, and an outer scope can go on. A panic in `f` rolls the scope back too.
-    /// See [Scopes](crate#scopes).
+    /// Returns the top-level [`ContextId`] of `generics` and the result of `f`. The generics
+    /// themselves are not analyzed: visit their bounds in `f` if you copy them. `Self` is not
+    /// declared here, so naming it in `f` or in the generics is an error
+    /// ([`NotInternableError::SelfWithoutMeaning`]).
+    ///
+    /// The scope is all-or-nothing. If the syntax visited in `f` has an error, the scope forgets
+    /// everything it found and returns its errors with their spans, and an outer scope can go on.
+    /// A panic in `f` rolls the scope back too. See [Scopes](crate::rules#scopes).
     ///
     /// ```
     /// # use type_leak::*;
@@ -229,11 +282,12 @@ impl Leaker {
         Scopes::enter_generics(self, generics, f)
     }
 
-    /// Enters the type definition `ident` with `generics` and runs `f` on a [`View`] of it.
+    /// Analyzes parts of a struct, an enum or a union: runs `f` on a [`View`] inside the type
+    /// `ident` with `generics`.
     ///
     /// Returns the top-level context and the result of `f`. The fields are not analyzed: visit them
-    /// in `f`. `Self` is `ident` with the parameters as arguments ([`SelfRequirement::Type`]). For
-    /// `allow_self` see [`Leaker::intern_struct()`]. Context, errors and rollback are as in
+    /// in `f`. `Self` is `ident` with the parameters as arguments ([`SelfRequirement::Type`]).
+    /// `allow_self` is as for [`Leaker::intern_struct()`]. Context, errors and rollback are as in
     /// [`Leaker::enter_generics()`], but `generics` may name `Self`.
     pub fn enter_type<R>(
         &mut self,
@@ -245,12 +299,33 @@ impl Leaker {
         Scopes::enter_type(self, ident, generics, allow_self, f)
     }
 
-    /// Enters an impl with `generics` for `self_ty` and runs `f` on a [`View`] of it.
+    /// Analyzes parts of an impl: runs `f` on a [`View`] inside an impl with `generics` for
+    /// `self_ty`.
     ///
     /// Returns the top-level context and the result of `f`. Visit the fragments of the impl in `f`.
-    /// `Self` is `self_ty` ([`SelfRequirement::Type`]). For `allow_self` see
+    /// `Self` is `self_ty` ([`SelfRequirement::Type`]). `allow_self` is as for
     /// [`Leaker::intern_struct()`]. Context, errors and rollback are as in
-    /// [`Leaker::enter_generics()`]. See [Scopes](crate#scopes).
+    /// [`Leaker::enter_generics()`]. See [Scopes](crate::rules#scopes).
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// // Analyze only the arguments of the trait of an impl.
+    /// let item: ItemImpl = parse_quote! {
+    ///     impl<T: ::path::Bound> ::path::MyTrait<Rel<T>> for MyType<T, Rel2> {}
+    /// };
+    /// let (_, trait_path, _) = item.trait_.as_ref().unwrap();
+    /// let mut leaker = Leaker::new();
+    /// let (_top_level, ()) = leaker
+    ///     .enter_impl(&item.generics, &item.self_ty, true, |view| {
+    ///         for segment in &trait_path.segments {
+    ///             view.visit_path_arguments(&segment.arguments);
+    ///         }
+    ///     })
+    ///     .unwrap();
+    /// // Only `Rel<T>` was visited. `Rel2` is in the self type.
+    /// assert_eq!(leaker.finish().iter().count(), 1);
+    /// ```
     pub fn enter_impl<R>(
         &mut self,
         generics: &Generics,
@@ -261,14 +336,16 @@ impl Leaker {
         Scopes::enter_impl(self, generics, self_ty, allow_self, f)
     }
 
-    /// Enters the trait `ident` with `generics` and runs `f` on a [`View`] of it.
+    /// Analyzes parts of a trait: runs `f` on a [`View`] inside the trait `ident` with `generics`.
     ///
     /// Returns the top-level context and the result of `f`. `Self` is the implementor, built from
-    /// `ident` and the parameters ([`SelfRequirement::Bound`]). For `allow_self` see
+    /// `ident` and the parameters ([`SelfRequirement::Bound`]). `allow_self` is as for
     /// [`Leaker::intern_struct()`]. Context, errors and rollback are as in
-    /// [`Leaker::enter_generics()`]. The items of the trait are not known here, so the generic
-    /// associated types it declares have no outlives bounds for a projection that names them (use
-    /// [`Leaker::intern_trait()`], or write the bound).
+    /// [`Leaker::enter_generics()`].
+    ///
+    /// The items of the trait are not known here. So a projection that names a generic associated
+    /// type of the trait gets none of its outlives bounds: use [`Leaker::intern_trait()`], or
+    /// write the bound.
     pub fn enter_trait<R>(
         &mut self,
         ident: &Ident,
@@ -279,15 +356,14 @@ impl Leaker {
         Scopes::enter_trait(self, ident, generics, allow_self, f)
     }
 
-    /// Finishes the analysis and returns the [`Referrer`]. It calls [`Leaker::reduce_roots()`] if
-    /// needed.
+    /// Ends the analysis and returns the [`Referrer`] with the entries found.
     ///
     /// The result is deterministic. Required entries come first, then optional ones
     /// ([`Referrer::must()`]), each sorted by context (in order of first appearance) and tokens. So
     /// optional entries never change the indices of required ones, and contexts used only by
     /// optional entries are numbered last, in the order of the entries. The Referrer keeps the ids
-    /// the scopes returned, for the top-level contexts, the contexts of the entries, and their
-    /// modules with parents.
+    /// the scopes returned: the top-level contexts, the contexts of the entries, and their modules
+    /// with their parents. It calls [`Leaker::reduce_roots()`] if needed.
     pub fn finish(mut self) -> Referrer {
         self.reduce_roots();
         let (required, optional) = self.reachable_types.take().unwrap_or_default();
@@ -331,9 +407,9 @@ impl Leaker {
 
     /// Chooses the fewest entries from which every leaked type can be built.
     ///
-    /// [`Leaker::finish()`] calls it, so you rarely need to. Contexts used only by optional entries
-    /// are numbered, after the others, when this runs. See [Which types become
-    /// entries](crate#which-types-become-entries).
+    /// [`Leaker::finish()`] calls it, so you rarely need to call it yourself. Contexts used only by
+    /// optional entries are numbered, after the others, when this runs. See [Which types become
+    /// entries](crate::rules#which-types-become-entries).
     pub fn reduce_roots(&mut self) {
         if self.reachable_types.is_some() {
             return;

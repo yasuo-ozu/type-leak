@@ -764,7 +764,7 @@ fn a_bound_which_is_not_a_lifetime_parameter_stays_a_predicate() {
     );
 }
 
-/// README, Outlives bounds: "only a bound by a lifetime parameter moves into
+/// rules.md, Outlives bounds: "only a bound by a lifetime parameter moves into
 /// `context_self_outlives()`; ... a bound under `for<..>` ... stay where predicates". The bound is
 /// by the parameter `'a` here, but under a binder, so it stays a predicate. Audit mutant
 /// `o_written_self_forall_moves` (a written `Self: 'a` under a binder moves).

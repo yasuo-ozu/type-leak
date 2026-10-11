@@ -2,17 +2,30 @@
 
 use syn::*;
 
-/// Configuration for [`Leaker::from_config()`](crate::Leaker::from_config).
+/// The paths that a [`Leaker`](crate::Leaker) leaves as written instead of leaking them. Pass it
+/// to [`Leaker::from_config()`](crate::Leaker::from_config).
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let mut config = LeakerConfig::new();
+/// config.allow_primitive().allow_std_prelude();
+/// config.allowed_paths.push(parse_quote!(::serde)); // you promise it is the same crate on both sides
+/// let mut leaker = Leaker::from_config(config);
+/// // `Vec` and `u8` are allowed, so only `MyType` is leaked.
+/// let item: ItemStruct = parse_quote!(struct S { a: Vec<u8>, b: MyType });
+/// leaker.intern_struct(&item, true).unwrap();
+/// assert_eq!(leaker.finish().iter().count(), 1);
+/// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LeakerConfig {
-    /// Paths that are not leaked. See [`Leaker::allowed_paths`](crate::Leaker::allowed_paths).
-    /// Allow only crates that are the same on both sides ([External
-    /// crates](crate#external-crates)).
+    /// The allowed paths. See [`Leaker::allowed_paths`](crate::Leaker::allowed_paths). Allow only
+    /// crates that are the same on both sides ([External crates](crate::rules#external-crates)).
     pub allowed_paths: Vec<Path>,
 }
 
 impl LeakerConfig {
-    /// Creates a configuration which allows no path.
+    /// Creates a configuration that allows no path.
     pub fn new() -> Self {
         Default::default()
     }

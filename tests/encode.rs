@@ -39,7 +39,7 @@ fn test_encode_generics_const() {
     );
 }
 
-/// README, Const generics: the Repeater has `T` (which may be unsized), `ID` and `NTH`, and a
+/// rules.md, Const generics: the Repeater has `T` (which may be unsized), `ID` and `NTH`, and a
 /// defaulted const slot per primitive type, in the documented order and with the documented names;
 /// its type may be unsized. Audit mutants `def_unsized_param` (`T: ?Sized` dropped),
 /// `enc_slot_order` and `enc_slot_name`; the visibility and the unsized `Type` are also pinned by

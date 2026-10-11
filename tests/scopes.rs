@@ -871,7 +871,7 @@ fn leaker_with_std() -> Leaker {
     Leaker::from_config(config)
 }
 
-/// README, Scopes: a scope is all-or-nothing. The top-level contexts of the scopes that
+/// rules.md, Scopes: a scope is all-or-nothing. The top-level contexts of the scopes that
 /// succeeded inside a scope that fails are rolled back with it, so the Referrer has the context
 /// of the outermost scope only. Audit mutant `rb_leave_top_levels`.
 #[test]
@@ -899,7 +899,7 @@ fn a_failed_scope_drops_the_top_levels_of_its_inner_scopes() {
     assert!(referrer.is_empty());
 }
 
-/// README, Scopes: what a failed inner scope found (a cycle of `Self` in its bounds) is rolled back
+/// rules.md, Scopes: what a failed inner scope found (a cycle of `Self` in its bounds) is rolled back
 /// with it: it does not make the scope around it fail. Audit mutant `rb_leave_env_errors`.
 #[test]
 fn a_failed_inner_scope_leaves_no_cycle_in_the_outer_one() {
@@ -929,7 +929,7 @@ fn a_failed_inner_scope_leaves_no_cycle_in_the_outer_one() {
         .is_err());
 }
 
-/// README, Scopes: the decision that an entry of an external crate is not optional (it is in a
+/// rules.md, Scopes: the decision that an entry of an external crate is not optional (it is in a
 /// bound that would make a cycle) belongs to the scope that made it; a failed inner scope leaves
 /// no such decision in the outer one. Audit mutant `rb_leave_not_optional`.
 #[test]

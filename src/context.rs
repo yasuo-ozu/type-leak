@@ -128,7 +128,7 @@ impl Scope {
 }
 
 /// What `Self` means in a context (`Referrer::context_self()`). The Repeater impl of an entry that
-/// names `Self` is written for the type described here. See [Self rules](crate#self-rules).
+/// names `Self` is written for the type described here. See [Self rules](crate::rules#self-rules).
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum SelfRequirement {
@@ -952,7 +952,7 @@ impl std::hash::Hash for Context {
     }
 }
 
-/// Names a [context](crate#contexts), as [`Referrer::context()`](crate::Referrer::context) returns
+/// Names a [context](crate::rules#contexts), as [`Referrer::context()`](crate::Referrer::context) returns
 /// it for an entry.
 ///
 /// A scope returns the id of its top-level context. Ids count from 0 in order of first appearance
@@ -1206,7 +1206,7 @@ fn for_self_of<T: WrittenForSelf>(
 }
 
 /// The lifetimes a type must outlive because of the types around it, as in `&'a Vec<Rel2<T>>`
-/// (see [Outlives bounds](crate#outlives-bounds)). `T::A<X>` is decided late, by the scopes in
+/// (see [Outlives bounds](crate::rules#outlives-bounds)). `T::A<X>` is decided late, by the scopes in
 /// scope where it is written: see [`Enclosing::generic()`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Enclosing(Vec<Link>);
@@ -1672,7 +1672,7 @@ impl Binding {
 
 /// Returns the outlives bounds `ty` implies on `params`: `&'a X` requires `X: 'a`, as does each of
 /// `ancestors` for `ty`. A path with a lifetime argument adds none, as a guessed bound could make
-/// the copy stricter than the original. See [Outlives bounds](crate#outlives-bounds).
+/// the copy stricter than the original. See [Outlives bounds](crate::rules#outlives-bounds).
 ///
 /// An associated type path of a generic (`T::A`, `<T as Tr<'b>>::A`: see [`is_generic_projection()`])
 /// requires `T::A: 'a`, which the original gets from the well-formedness of its signature, and the

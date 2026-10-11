@@ -126,7 +126,7 @@ fn test_default_requirements() {
     }
 }
 
-/// README, Walkthrough notes: a default is analyzed with the parameters before it, and cannot
+/// rules.md, Encoding of the generics: a default is analyzed with the parameters before it, and cannot
 /// name a later one. A where predicate that names the later parameter `U` (`T: Conv<U>`) is not
 /// in the context of the default `Rel<T>`, which has `T` alone. Audit mutant
 /// `default_root_all_params` (the default is analyzed with all the parameters as its root).

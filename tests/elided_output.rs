@@ -245,7 +245,7 @@ fn a_holder_inside_a_signature_is_the_entry_for_the_one_around() {
     );
 }
 
-/// README, Elided lifetimes: "a function pointer or `Fn(..)` inside an input has its own
+/// rules.md, Elided lifetimes: "a function pointer or `Fn(..)` inside an input has its own
 /// signature". The same holds for one in the OUTPUT of the sugar: its elided lifetimes are its
 /// own and do not count for the outer one, whose only lifetime is that of `&`. So `Rel<T>` is
 /// leaked alone, whatever the signature in the output elides. Audit mutant

@@ -798,7 +798,7 @@ fn test_reduce_roots_trait_object_with_its_own_lifetime() {
     }
 }
 
-/// README, Trait objects: "a written lifetime bound changes this ... with a local lifetime the
+/// rules.md, Trait objects: "a written lifetime bound changes this ... with a local lifetime the
 /// trait object alone is leaked with its bound". The reference around it has an elided lifetime
 /// (`&(dyn RelTr + 'a)`), which is no obstacle once the object names its own bound, while
 /// `&dyn RelTr` is an error. Audit mutant `t_dyn_elided_bounded_error` (a trait object under an
@@ -1352,7 +1352,7 @@ fn test_reduce_roots_reference_with_a_lifetime_the_copy_would_leave_unconstraine
     assert_eq!(leaker.finish().iter().count(), 2);
 }
 
-/// README, Method lifetimes: an external type that the Leaker does not allow keeps the method
+/// rules.md, Method lifetimes: an external type that the Leaker does not allow keeps the method
 /// lifetime `'b` (the Referrer leaves it as written unless it replaces it), so the method is not
 /// an error (E0195) although `Wrap<'b>`, which is leaked as a whole, names `'b` as well. A
 /// reference to a trait object of such a type keeps it too. Audit mutant `m_careful_on` (the

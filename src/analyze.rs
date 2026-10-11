@@ -77,7 +77,7 @@ impl Frame {
 
 /// A `for<..>` binder whose output mentions lifetimes that no input keeps as written (an anchor). A
 /// type using them cannot be leaked alone: its copy holds them only in an associated type path
-/// (E0581, E0582). See [Binder lifetimes](crate#binder-lifetimes).
+/// (E0581, E0582). See [Binder lifetimes](crate::rules#binder-lifetimes).
 struct Binder {
     /// The depth of the type holding the binder, leaked whole instead (0 in a bound).
     owner: usize,
@@ -112,7 +112,7 @@ enum BinderInput<'a> {
 /// signature is leaked as a whole instead if it can be, and it is an error otherwise. The same
 /// holds for `Self`, which the copy of a struct, an enum or a union writes as the type itself, but
 /// there the Referrer names the lifetime where it can (see
-/// [`AnalyzeVisitor::self_elision_broken()`]). See [Elided lifetimes](crate#elided-lifetimes).
+/// [`AnalyzeVisitor::self_elision_broken()`]). See [Elided lifetimes](crate::rules#elided-lifetimes).
 #[derive(Clone)]
 struct Elision {
     /// The depth of the type holding the signature, leaked whole instead (0 for a method or a
@@ -658,7 +658,7 @@ struct SignatureWalk {
 }
 
 /// What a trait object without a lifetime bound takes its lifetime from. See
-/// [Trait objects](crate#trait-objects).
+/// [Trait objects](crate::rules#trait-objects).
 #[derive(Clone, Copy)]
 enum Inherits {
     /// A reference `&'a dyn Trait` (the depth of the reference) with a Leaker lifetime, or a local
@@ -2191,7 +2191,7 @@ impl AnalyzeVisitor {
     /// its own `Self`, and a path that stands for itself is a cycle, E0391). Replacing the bound
     /// of the context by one for the self type does not help, as the bound would then name a
     /// leaked type that is the entry itself (E0277, see [Bounds that name leaked
-    /// types](crate#bounds-that-name-leaked-types)), and the parts of the self type depend on
+    /// types](crate::rules#bounds-that-name-leaked-types)), and the parts of the self type depend on
     /// `Self` as it does.
     ///
     /// So a type that must be an entry is an error, and one that may be is not. An optional entry
@@ -2413,7 +2413,7 @@ impl AnalyzeVisitor {
     /// Runs `f`, which visits `sig`. `item`: it is that of a function item, whose generics are the
     /// item's, and not those of a method. `compared`: rustc compares it with a signature that the
     /// copy cannot change, so the lifetimes that the copy would leave unconstrained are an error
-    /// (E0195, see [Method lifetimes](crate#method-lifetimes)). That is a method of a trait, which
+    /// (E0195, see [Method lifetimes](crate::rules#method-lifetimes)). That is a method of a trait, which
     /// the impls of the original are checked against, and one of an impl of a trait, which is
     /// checked against the trait. A function item and a method of an inherent impl have no such
     /// signature, so the copy may have the lifetime early-bound where the original has it
@@ -2523,7 +2523,7 @@ impl AnalyzeVisitor {
 
     /// Reports the lifetimes of the signature just visited that the copy would leave unconstrained
     /// because only types leaked whole hold them (E0195, see [Method
-    /// lifetimes](crate#method-lifetimes)). The return type names the lifetime and no bound does,
+    /// lifetimes](crate::rules#method-lifetimes)). The return type names the lifetime and no bound does,
     /// so it is late-bound where some input constrains it as written (`Wrap<'x>` does), and it
     /// is early-bound in the copy where every such input is leaked whole: `Wrap<'x>` becomes a
     /// projection, which does not constrain it. An input that keeps it, such as `&'x u8`, is no
@@ -2591,7 +2591,7 @@ impl AnalyzeVisitor {
 
     /// Returns the lifetimes of `sig` that the copy would leave unconstrained, making them
     /// early-bound where the original is late-bound (E0195, see [Method
-    /// lifetimes](crate#method-lifetimes)). The return type and some input mention them, no bound
+    /// lifetimes](crate::rules#method-lifetimes)). The return type and some input mention them, no bound
     /// does, and no input keeps them: the receiver or a reference with it.
     fn unconstrained_lifetimes(&self, sig: &Signature) -> Vec<Lifetime> {
         let declared: Vec<Lifetime> = sig
@@ -2756,7 +2756,7 @@ impl AnalyzeVisitor {
     /// Finds the occurrences of `used.lifetime` in `ty` that constrain it as rustc sees it (all but
     /// in an associated type path, an array length, `impl Trait` or a type macro). One anchors only
     /// if no type on its chain is leaked whole. When in doubt it does not. See [Binder
-    /// lifetimes](crate#binder-lifetimes).
+    /// lifetimes](crate::rules#binder-lifetimes).
     fn scan_anchors(&self, ty: &Type, used: &mut OutputUse) {
         used.chain.push(ty as *const Type as usize);
         match ty {

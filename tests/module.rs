@@ -1023,7 +1023,7 @@ fn rewrite_in(referrer: &type_leak::Referrer, context: ContextId, mut item: Item
     quote!(#item).to_string()
 }
 
-/// README, Modules: a `mod` item is a module nested in the context and is found by its name, but
+/// rules.md, Modules: a `mod` item is a module nested in the context and is found by its name, but
 /// only the modules the Leaker saw: a module nested in a module that the Leaker did not see (its
 /// parent is another one) matches only the entries with no module. Audit mutants
 /// `vis_module_in_unknown_outside` and `vis_module_in_elsewhere_stays`.
@@ -1077,7 +1077,7 @@ fn a_module_nested_in_an_unseen_module_is_not_found_by_its_name() {
     }
 }
 
-/// README, Modules: an entry of the module is preferred to an entry with no module for the same
+/// rules.md, Modules: an entry of the module is preferred to an entry with no module for the same
 /// type. Audit mutants `vis_rank_module_last` and `vis_rank_nomodule_equal`.
 #[test]
 fn the_entry_of_the_module_is_preferred_to_the_one_with_no_module() {
@@ -1184,7 +1184,7 @@ fn the_entry_of_the_module_is_preferred_to_the_one_with_no_module() {
     );
 }
 
-/// README, Modules: the items of a module are nested items, so their generics are local even if
+/// rules.md, Modules: the items of a module are nested items, so their generics are local even if
 /// the visitor is told that the outermost generics are those of the context
 /// (`with_outermost_generics_as_leakers()`). Audit mutants `vis_item_depth_module`,
 /// `vis_mod_item_not_nested` and `vis_mod_item_self_kept`.
@@ -1246,7 +1246,7 @@ fn the_items_of_a_module_are_nested_items() {
     );
 }
 
-/// README, Modules: an item declared in a block hides the entry of a module that names it, as it
+/// rules.md, Modules: an item declared in a block hides the entry of a module that names it, as it
 /// does outside a module. Audit mutant `vis_shadow_retain_module_flag`.
 #[test]
 fn a_block_item_hides_the_entry_of_a_module() {
@@ -1281,7 +1281,7 @@ fn a_block_item_hides_the_entry_of_a_module() {
     );
 }
 
-/// README, Modules / Self rules: `Self` has no meaning in a `mod` item, even inside the scope of a
+/// rules.md, Modules / Self rules: `Self` has no meaning in a `mod` item, even inside the scope of a
 /// trait that declares it, so the entry that names the `Self` of the trait is not found in it.
 /// Audit mutant `vis_mod_item_self_kept` (the `Self` of the scope around stays in a `mod` item).
 #[test]

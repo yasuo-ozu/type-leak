@@ -757,7 +757,7 @@ fn test_visitor_with_self_names_the_elided_lifetime() {
     );
 }
 
-/// README, Elided lifetimes: `Visitor::with_self()` names the elided lifetime with a fresh
+/// rules.md, Elided lifetimes: `Visitor::with_self()` names the elided lifetime with a fresh
 /// `for<'__tl_e0>` binder. A binder that the function pointer has already gets the fresh lifetime
 /// added to it (audit mutant `en_existing_binder_off`), the fresh name avoids the names of that
 /// binder (`en_fresh_binder_off`), and the `Fn(..)` sugar inside an input keeps its own elision

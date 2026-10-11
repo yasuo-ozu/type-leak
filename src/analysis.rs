@@ -13,8 +13,10 @@ use std::collections::HashSet;
 use syn::{Ident, Type};
 use template_quote::quote;
 
-/// What [`View::check()`] found in a type: causes that force it to be leaked, and causes that
-/// forbid it.
+/// What [`View::check()`] found in a type: the causes that force it to be leaked, and the causes
+/// that forbid it.
+///
+/// The causes are, for example, a relative path (`must`) and an elided lifetime (`impossible`).
 ///
 /// - Both empty: copy the type as it is.
 /// - Only `must`: leak the type, or only its parts unless `is_own` (`MyType`,
@@ -24,7 +26,7 @@ use template_quote::quote;
 ///
 /// `Self` where it has no meaning (in a module, or in generics that no struct, enum, union, impl or
 /// trait encloses) is an `impossible` cause, with the mention of `Self` as written and a `note`.
-/// A scope fails on it, so it can be neither leaked nor copied. See [Self rules](crate#self-rules).
+/// A scope fails on it, so it can be neither leaked nor copied. See [Self rules](crate::rules#self-rules).
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct CheckResult {
@@ -39,27 +41,31 @@ pub struct CheckResult {
     /// `true` if the first of `must` is the type's own path (`MyType` in `MyType<'_>`), so the type
     /// must be leaked whole. `false` if `must` is empty or only its parts are causes
     /// (`::path::Wrap<MyType, '_>`). A bare identifier argument counts as a cause of the type
-    /// holding it. See [Bare identifiers and consts](crate#bare-identifiers-and-consts).
+    /// holding it. See [Bare identifiers and consts](crate::rules#bare-identifiers-and-consts).
     pub is_own: bool,
     /// `true` if the type is an optional entry: it has no cause of its own, and its own path names
     /// an external crate (`::path::X`, `::path::Wrap<(MyType,)>`), which the Referrer may not
     /// share. `must` holds only its parts, if any. A type with an impossible cause is not one, as
-    /// it is copied as written. See [External crates](crate#external-crates).
+    /// it is copied as written. See [External crates](crate::rules#external-crates).
     pub optional: bool,
     /// Explains the conflict if the causes do not (why `Self` cannot be leaked, or has no
     /// meaning). Reported first.
     pub note: Option<String>,
-    /// The headline of the error, if the fault is not that the path of the type is relative, which
-    /// the default `use absolute path: '..'` says. [`NotInternableError`] shows it as the message
-    /// of the error. Set for a type that uses a generic whose bound mentions a `Self` that has no
-    /// name here (see [Self rules](crate#self-rules)): the fault is that bound, `must` is the type
-    /// that uses it, and `impossible` is the mention of `Self`. Also set for the other rules
-    /// that are not about a path (the bound rules, `Self::A` where `Self` is a type), for a
-    /// type in the default of a parameter that names `Self`, for a type that uses a generic whose
-    /// bound mentions a `Self` that cannot be leaked, and for a lifetime of a method that the copy
-    /// would leave unconstrained (E0195): the fault is the lifetime. A relative path that cannot
-    /// be leaked as a whole (`MyType<'_>`, E0106) has none: the fault is the path, and `note` says
-    /// why.
+    /// The headline of the error, if the fault is not that the path of the type is relative.
+    /// [`NotInternableError`] shows it as the message of the error. If it is `None`, the message
+    /// is `use absolute path: '..'`: the fault is the path, and `note` says why it cannot be
+    /// leaked as a whole (`MyType<'_>`, E0106).
+    ///
+    /// It is set when the fault is something else than a path:
+    ///
+    /// - a type that uses a generic whose bound mentions a `Self` that has no name here (see
+    ///   [Self rules](crate::rules#self-rules)): the fault is that bound, `must` is the type that uses
+    ///   it, and `impossible` is the mention of `Self`;
+    /// - a type that uses a generic whose bound mentions a `Self` that cannot be leaked;
+    /// - a type in the default of a parameter that names `Self`;
+    /// - the bound rules, and `Self::A` where `Self` is a type;
+    /// - a lifetime of a method that the copy would leave unconstrained (E0195): the fault is the
+    ///   lifetime.
     pub headline: Option<String>,
 }
 

@@ -7,61 +7,84 @@ use template_quote::ToTokens;
 
 /// The error returned when an item cannot be analyzed by the [`Leaker`](crate::Leaker).
 ///
-/// It has one error per offending path or type: [`NotInternableError::items()`] returns them, each
-/// with its span, message and notes. The message is the headline of the cause where the fault is
-/// not that a path is relative (`Self`, the bound rules, a default that names `Self`:
-/// [`CheckResult::headline`]), and `use absolute path: '..'` where it is. Display writes the
-/// messages, one per line.
+/// It lists every offending path or type. [`NotInternableError::items()`] returns one
+/// [`ErrorItem`] for each, with its span, a message and notes, so a macro can report them all.
+/// The message says `use absolute path: '..'` where the fault is that a path is relative. It is
+/// the headline of the cause where the fault is something else, such as `Self`, a bound rule or a
+/// default that names `Self` ([`CheckResult::headline`]). `Display` writes the messages, one per
+/// line.
 ///
-/// Each error has notes: a fix if possible (e.g. "use `::std::vec::Vec` instead of `Vec`"), the
-/// [`CheckResult::impossible`] causes that stop it from being leaked as a whole, and the other
-/// paths in it that depend on the context (the rest of [`CheckResult::must`]), which are reported
-/// once the first is fixed. [`syn::Error`] and [`ToTokens`] render the notes as `note`s.
+/// Each error has notes: a fix if one is known (e.g. "use `::std::vec::Vec` instead of `Vec`"),
+/// the causes that stop the type from being leaked as a whole ([`CheckResult::impossible`]), and
+/// the other paths in it that depend on the context (the rest of [`CheckResult::must`]), which
+/// would be reported once the first is fixed. [`syn::Error`] and [`ToTokens`] render the notes as
+/// `note`s.
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let item: ItemTrait = parse_quote!(trait Tr: Clone { fn f(&self, a: MyType<'_>); });
+/// let err = Leaker::new().intern_trait(&item, true).unwrap_err();
+/// // One error for each offending path, in order.
+/// assert_eq!(err.items().count(), 2);
+/// // As one `syn::Error` for a proc macro, with the notes appended to the messages.
+/// let error: syn::Error = err.into();
+/// assert_eq!(error.into_iter().count(), 2);
+/// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum NotInternableError {
-    /// Paths that depend on the context but cannot be leaked, so they must be absolute.
+    /// Paths or types that depend on the context but cannot be leaked, so the code must change:
+    /// usually, the path must be written in full.
     ///
-    /// Examples: `MyType` in `MyType<'_>`, a trait in a bound, a value in a const expression, and
-    /// `Rel` in `F: for<'x> Fn(Rel<'x>) -> &'x u8` ([Binder lifetimes](crate#binder-lifetimes)),
-    /// and `Rel<T>` in `F: Fn(&Rel<T>) -> &u8` where `Rel<T>` has lifetimes among its generics
-    /// ([Elided lifetimes](crate#elided-lifetimes)).
-    /// Also a type with a generic whose bound names the `Self` of a trait (or `Self::X`), where
-    /// `Self` is something else, so the bound cannot be written ([Self rules](crate#self-rules)).
-    /// That is not about the path of the type, so its headline is "the bound of `T` mentions a
-    /// `Self` which has no name here" ([`CheckResult::headline`]), with a note on why, at the
-    /// type. The same goes for a type leaked as a whole that names `Self::A` where `Self` is a
-    /// type (an impl, a struct, an enum or a union), which the Repeater's impl cannot write
-    /// ("`Self::A` cannot be written in the impl of the Repeater"). A type leaked as a whole that
-    /// names a lifetime of a method which the copy would leave unconstrained (`Wrap<'x>` in
-    /// `fn f<'x>(&self, a: Wrap<'x>) -> &'x u8`) has a note on E0195, for a method of a trait or of
-    /// an impl of a trait, not for a free function or a method of an inherent impl
-    /// ([Method lifetimes](crate#method-lifetimes)). The fault is the lifetime, which an absolute
-    /// path is only one way to fix, so its headline is "`Wrap<'x>` leaves the lifetime `'x` of the
-    /// method unconstrained in the copy (E0195)". Also a type that uses a generic whose bound
-    /// mentions a `Self` that cannot be leaked: "`Wrap<T>` has a generic whose bound mentions
-    /// `Self`, which cannot be leaked". Also a type in a bound or where predicate that
-    /// the copy cannot write through the
-    /// Repeater, as rustc cannot prove a bound of its generics that names a leaked type: its
-    /// headline is "`Wrap<T>` is in a bound or where predicate, and a bound of its generics names a
-    /// leaked type", or "`Rel<Self>` names `Self` in a bound or where predicate of its trait"
-    /// ([Bounds that name leaked types](crate#bounds-that-name-leaked-types)). Also a type in the
-    /// self type of an impl whose context depends on `Self` through a bound of the impl: its
-    /// headline is "`S<T>` is in the self type of the impl, and a bound of its generics names
-    /// `Self`" ([Self rules](crate#self-rules)). Each
-    /// conflict is reported at the first of its [`CheckResult::must`], with
-    /// [`CheckResult::is_own`] `true`. For a trait bound, a value or the type of a const
-    /// parameter, [`CheckResult::impossible`] is that bound, value or parameter. Never empty.
+    /// Never empty. Each [`CheckResult`] is one conflict. It is reported at the first of its
+    /// [`CheckResult::must`], with [`CheckResult::is_own`] `true`. For a trait bound, a value or
+    /// the type of a const parameter, [`CheckResult::impossible`] is that bound, value or
+    /// parameter. The cases are:
+    ///
+    /// - A relative path that cannot be leaked, with the headline `use absolute path: '..'`.
+    ///   Examples: `MyType` in `MyType<'_>`, a trait in a bound, a value in a const expression,
+    ///   `Rel` in `F: for<'x> Fn(Rel<'x>) -> &'x u8` ([Binder lifetimes](crate::rules#binder-lifetimes)),
+    ///   and `Rel<T>` in `F: Fn(&Rel<T>) -> &u8` where `Rel<T>` has lifetimes among its generics
+    ///   ([Elided lifetimes](crate::rules#elided-lifetimes)).
+    /// - A type with a generic whose bound names the `Self` of a trait (or `Self::X`), where
+    ///   `Self` is something else, so the bound cannot be written
+    ///   ([Self rules](crate::rules#self-rules)). The fault is that bound, not the path of the type. The
+    ///   headline is "the bound of `T` mentions a `Self` which has no name here", with a note on
+    ///   why, at the type.
+    /// - A type leaked as a whole that names `Self::A` where `Self` is a type (an impl, a struct,
+    ///   an enum or a union), which the Repeater's impl cannot write. The headline is "`Self::A`
+    ///   cannot be written in the impl of the Repeater".
+    /// - A type leaked as a whole that names a lifetime of a method which the copy would leave
+    ///   unconstrained (`Wrap<'x>` in `fn f<'x>(&self, a: Wrap<'x>) -> &'x u8`), for a method of a
+    ///   trait or of an impl of a trait, not for a free function or a method of an inherent impl
+    ///   ([Method lifetimes](crate::rules#method-lifetimes)). The fault is the lifetime, which an
+    ///   absolute path is only one way to fix. The headline is "`Wrap<'x>` leaves the lifetime
+    ///   `'x` of the method unconstrained in the copy (E0195)", with a note on E0195.
+    /// - A type in the default of a parameter that names `Self`. The headline is "`Wrap<Self>` is
+    ///   in the default of a parameter, and names `Self`".
+    /// - A type that uses a generic whose bound mentions a `Self` that cannot be leaked. The
+    ///   headline is "`Wrap<T>` has a generic whose bound mentions `Self`, which cannot be
+    ///   leaked".
+    /// - A type in a bound or where predicate that the copy cannot write through the Repeater,
+    ///   because rustc cannot prove a bound of its generics that names a leaked type
+    ///   ([Bounds that name leaked types](crate::rules#bounds-that-name-leaked-types)). The headline is
+    ///   "`Wrap<T>` is in a bound or where predicate, and a bound of its generics names a leaked
+    ///   type", or "`Rel<Self>` names `Self` in a bound or where predicate of its trait".
+    /// - A type in the self type of an impl whose context depends on `Self` through a bound of
+    ///   the impl ([Self rules](crate::rules#self-rules)). The headline is "`S<T>` is in the self type of
+    ///   the impl, and a bound of its generics names `Self`".
     RelativePath(Vec<CheckResult>),
     /// `Self` where no scope gives it a meaning. Never empty.
     ///
     /// That is directly in a module, or in generics that no struct, enum, union, impl or trait
     /// encloses (`Leaker::enter_mod()`, `Leaker::enter_generics()`). It is also an error in the
     /// bounds, where predicates and defaults of those generics. See
-    /// [Self rules](crate#self-rules).
-    /// Each item is the tokens of a mention (`Self`, `Self::Item`, or a type macro that names it).
-    /// Its span is where the error is reported, with the message "`Self` has no meaning here".
-    /// If a scope finds both kinds of errors, only [`NotInternableError::RelativePath`] is
+    /// [Self rules](crate::rules#self-rules).
+    ///
+    /// Each item is the tokens of a mention (`Self`, `Self::Item`, or a type macro that names
+    /// it). Its span is where the error is reported, with the message "`Self` has no meaning
+    /// here". If a scope finds both kinds of errors, only [`NotInternableError::RelativePath`] is
     /// returned. This kind is found after those are fixed.
     SelfWithoutMeaning(Vec<TokenStream>),
 }
@@ -69,7 +92,8 @@ pub enum NotInternableError {
 /// One error of a [`NotInternableError`]: an offending path, type or mention of `Self`.
 ///
 /// Get them with [`NotInternableError::items()`] to report each one, for example as a
-/// separate diagnostic of a proc macro, with its own span and notes.
+/// separate diagnostic of a proc macro, with its own span and notes. The first note says how to
+/// fix the error, if a fix is known.
 ///
 /// ```
 /// # use type_leak::*;
@@ -182,9 +206,23 @@ impl NotInternableError {
     ///
     /// Each has its span, a message and notes, so a proc macro can report every one instead of
     /// only the first ([`NotInternableError::span()`], [`NotInternableError::note()`]). The
-    /// message is the headline of the cause where the fault is not that a path is relative, and
-    /// `use absolute path: '..'` where it is. Display writes the messages, one per line. See
-    /// [`ErrorItem`] for an example. Never empty.
+    /// message is `use absolute path: '..'` where the fault is that a path is relative, and the
+    /// headline of the cause where it is something else. `Display` writes the messages, one per
+    /// line. Never empty.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemTrait = parse_quote!(trait Tr: Clone { fn f(&self, a: MyType<'_>); });
+    /// let err = Leaker::new().intern_trait(&item, true).unwrap_err();
+    /// for item in err.items() {
+    ///     // Report `item.message` at `item.span`, then each note at its own span.
+    ///     let _ = (&item.message, item.span);
+    ///     for (_span, _note) in &item.notes {}
+    /// }
+    /// let messages: Vec<String> = err.items().map(|item| item.message).collect();
+    /// assert_eq!(messages, ["use absolute path: 'Clone'", "use absolute path: 'MyType < '_ >'"]);
+    /// ```
     pub fn items(&self) -> impl Iterator<Item = ErrorItem> {
         self.reports().into_iter()
     }
@@ -220,7 +258,7 @@ impl NotInternableError {
 }
 
 /// A trait object without a lifetime bound is a cause only under an elided lifetime, or where the
-/// path cannot be leaked (see [Trait objects](crate#trait-objects)).
+/// path cannot be leaked (see [Trait objects](crate::rules#trait-objects)).
 fn is_default_lifetime_object(cause: &TokenStream) -> bool {
     match syn::parse2::<syn::Type>(cause.clone()) {
         Ok(syn::Type::TraitObject(object)) => !object

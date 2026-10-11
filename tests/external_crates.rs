@@ -73,7 +73,7 @@ fn entry(ty: &str, must: bool, names: &[&str]) -> (String, bool, Vec<String>) {
     (ty.to_string(), must, crates(names))
 }
 
-/// README, External crates: an entry that names `Self` where the self type is an external type
+/// rules.md, External crates: an entry that names `Self` where the self type is an external type
 /// (`::ext::W`) requires that crate: the entry `Rel<Self>` is replaced by a Referrer that has
 /// `::ext` too, as `Self` is `::ext::W` there. Audit mutant `x_crates_self_off` (the crates of the
 /// self type are not counted for an entry that names `Self`).

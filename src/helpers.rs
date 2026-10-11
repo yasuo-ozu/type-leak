@@ -13,11 +13,11 @@ use crate::util::ReplaceSelf;
 use syn::punctuated::Punctuated;
 use syn::*;
 
-/// The type that a Repeater impl is written for: see [`Referrer::repeater_impl()`].
+/// Says what a Repeater impl is written for: see [`Referrer::repeater_impl()`].
 ///
-/// An entry that names `Self` is implemented for what `Self` stands for. So the choice is about
-/// the entries that do not ([`Referrer::context_self()`] is `None`), and about how the others are
-/// handled.
+/// An entry that names `Self` is always implemented for what `Self` stands for. So the choice is
+/// mainly about the entries that do not ([`Referrer::context_self()`] is `None`), and about how
+/// the others are handled.
 #[derive(Clone, Copy, Debug)]
 pub enum ImplSelf<'a> {
     /// A type parameter with this name, which the impl declares (`impl<.., __S: ?Sized> .. for
@@ -77,11 +77,12 @@ pub struct RepeaterImpl {
     pub module: Option<ContextId>,
 }
 
-/// Where the encoded arguments of an entry are written: [`Referrer::entry_args()`].
+/// Describes the place where the path through the Repeater of an entry is written:
+/// [`Referrer::entry_args()`] uses it to write the arguments.
 ///
 /// The default, [`UseSite::identity()`], is the scope of the analysis itself. Say how the generics
-/// of the analyzed item are substituted with [`UseSite::substituting()`], and what `Self` is with
-/// [`UseSite::with_self()`].
+/// of the analyzed item are substituted (as in `impl MyTrait<u8> for ..`) with
+/// [`UseSite::substituting()`], and what `Self` is with [`UseSite::with_self()`].
 #[derive(Clone, Debug)]
 pub struct UseSite {
     root_params: Punctuated<GenericParam, Token![,]>,

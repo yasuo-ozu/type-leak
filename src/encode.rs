@@ -8,8 +8,9 @@ use syn::spanned::Spanned;
 use syn::*;
 use template_quote::quote;
 
-/// Encodes generic arguments into the type that [`encode_generics_params_to_ty()`] gives for
-/// `params`, with `const N: usize` as `[(); N]`.
+/// Encodes the arguments that a copy gives to the generics of an entry, into the first argument of
+/// the Repeater. It is the counterpart of [`encode_generics_params_to_ty()`] for `params`, with
+/// `const N: usize` as `[(); N]`.
 ///
 /// It is [`encode_generics_args_to_ty_with()`] without the closure, for generics that have no const
 /// parameter or only `usize` ones (which [`encode_generics_params_to_ty()`] encodes alike). For other
@@ -56,7 +57,8 @@ pub(crate) fn usize_array_length(
     }
 }
 
-/// Encodes generic arguments into the type that [`encode_generics_params_to_ty_with()`] gives for
+/// Encodes the arguments that a copy gives to the generics of an entry, with `const_fn` encoding
+/// the const arguments. It gives the type that [`encode_generics_params_to_ty_with()`] gives for
 /// `params`.
 ///
 /// `params` are the generics the Leaker encoded: `Referrer::generics()` of an entry with the
@@ -285,9 +287,10 @@ fn unwrap_block(expr: &Expr) -> &Expr {
     }
 }
 
-/// Encodes generic parameters into a tuple type, with `const N: usize` as `[(); N]`.
+/// Encodes the generics of an entry into the type that is the first argument of its Repeater impl,
+/// with `const N: usize` as `[(); N]`.
 ///
-/// `[(); N]` constrains `N` in the trait arguments of an impl. Array lengths are `usize`, so other
+/// The result is a tuple type. `[(); N]` constrains `N` in the trait arguments of an impl. Array lengths are `usize`, so other
 /// const types need `RepeaterSlots`, or [`encode_generics_params_to_ty_with()`] with your own
 /// types. That function describes the encoding. `Self: 'a` is encoded by
 /// [`encode_generics_params_to_ty_with_self()`]. The Referrer encodes the arguments with
@@ -322,7 +325,7 @@ pub fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a Gener
 /// lifetime parameter of `iter` is encoded.
 /// A reference implies its bound wherever it is written. So the impl must not declare the bounds
 /// it encodes. Declare `Referrer::impl_generics()` or [`without_encoded_bounds()`] instead (see
-/// [Outlives bounds](crate#outlives-bounds)). `Self: 'a` is not encoded: use
+/// [Outlives bounds](crate::rules#outlives-bounds)). `Self: 'a` is not encoded: use
 /// [`encode_generics_params_to_ty_with_self()`].
 pub fn encode_generics_params_to_ty_with<'a>(
     iter: impl IntoIterator<Item = &'a GenericParam>,
@@ -428,7 +431,8 @@ fn encoded_bound_position(params: &[&GenericParam], bound: &Lifetime) -> Option<
     )
 }
 
-/// Returns `generics` without the lifetime bounds that the encoders encode.
+/// Returns the generics to declare in a Repeater impl: `generics` without the lifetime bounds that
+/// the encoders encode.
 ///
 /// Removed: a bound by a lifetime parameter of `generics`, on a type parameter (`T: 'a`) or a
 /// lifetime parameter (`'b: 'a`). Kept: other bounds (`T: 'static`, a bound by a lifetime that is

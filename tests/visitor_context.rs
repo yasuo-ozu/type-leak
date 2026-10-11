@@ -867,7 +867,7 @@ fn trait_with_bounds() -> ItemTrait {
     }
 }
 
-/// README, Helpers for macro authors: a macro rewrites the trait it leaked (`visit_item_trait_mut`
+/// The docs of `Referrer::visitor()`: a macro rewrites the trait it leaked (`visit_item_trait_mut`
 /// visits the generics, the supertraits and the items), or goes through the parts itself (as
 /// newer-type does: the bounds of the supertraits, the associated types, the signatures of the
 /// methods), and gets the same copy. Audit mutants `D3` (the bounds of an associated type are not
@@ -922,7 +922,7 @@ fn a_trait_is_rewritten_whole_and_part_by_part() {
     assert_eq!(s(&parts), s(&expected));
 }
 
-/// README, Helpers for macro authors: a signature visited by itself is a nested item: its generics
+/// The docs of `Referrer::visitor()`: a signature visited by itself is a nested item: its generics
 /// are its own, unless `with_outermost_generics_as_leakers()` says they are the context's. So the
 /// method `f<T: Clone>` has a `T` of its own, and `Wrap<T>` is not the entry of the trait's `T`,
 /// while with the flag it is. Audit mutant `D5` (`visit_signature_mut` treated as no item).

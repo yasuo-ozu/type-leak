@@ -24,14 +24,24 @@ const REPEATER_SLOTS: &[(&str, &str, &str)] = &[
     ("isize", "ISIZE", "0"),
 ];
 
-/// Returns the definition of a Repeater that supports const generics of any primitive type.
+/// Returns the definition of the Repeater trait, to define once in your crate. It supports const
+/// generics of any primitive type.
 ///
 /// Besides `T`, `ID` and `NTH`, it has a defaulted const slot per primitive type: `BOOL`, `CHAR`,
 /// `U8`, `U16`, `U32`, `U128`, `I8`, `I16`, `I32`, `I64`, `I128` and `ISIZE`.
 /// [`RepeaterSlots`] encodes const values into them, and `Repeater<T, ID, NTH>` still works.
 /// Without the slots, it works if every const parameter is `usize` or `u64`.
-/// Define it once in the user crate, e.g. from a macro. It needs Rust 1.59 and the 2018 edition.
-/// See [Const generics](crate#const-generics).
+/// Emit it once in the user crate, e.g. from a macro. It needs Rust 1.59 and the 2018 edition.
+/// See [Const generics](crate::rules#const-generics).
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let def = repeater_definition(&parse_quote!(pub), &parse_quote!(Repeater));
+/// // `T`, `ID`, `NTH` and a slot for each primitive const type.
+/// assert_eq!(def.generics.params.len(), 3 + 12);
+/// assert_eq!(def.ident, "Repeater");
+/// ```
 pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
     let slots = REPEATER_SLOTS
         .iter()
@@ -53,8 +63,8 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
     }
 }
 
-/// Encodes generics into types, using the const slots of the Repeater from
-/// [`repeater_definition()`].
+/// Encodes the generics of an entry into the first argument of the Repeater, using the const
+/// slots of the Repeater from [`repeater_definition()`].
 ///
 /// It encodes like `encode_generics_params_to_ty()`, lifetime bounds included, except for const
 /// parameters. `const N: usize` is `[(); N]`, `const X: u64` uses `ID`, and any other primitive is
@@ -74,6 +84,7 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RepeaterSlots {
+    /// The path of the Repeater trait, which [`repeater_definition()`] defines.
     pub repeater: Path,
 }
 

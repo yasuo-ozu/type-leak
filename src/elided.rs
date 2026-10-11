@@ -8,7 +8,7 @@
 //! `for<'e>` binder: `for<'e> fn(&'e ::p::S<'a>) -> &'e u8`. The Leaker does not count such a
 //! signature as broken (`AnalyzeVisitor::self_elision_broken()`), so the two agree on which
 //! signatures this handles: those whose inputs show their one lifetime. See
-//! [Elided lifetimes](crate#elided-lifetimes).
+//! [Elided lifetimes](crate::rules#elided-lifetimes).
 
 use crate::analyze::{ElidedOutput, InputLifetimes};
 use crate::context::{binder_lifetimes, Scope};
