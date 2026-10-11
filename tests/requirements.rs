@@ -774,7 +774,9 @@ fn a_call_as_self_is_not_parsed() {
     // `Self` has no meaning outside the scopes which declare it, so there is no `Self` of a call
     // (`Self = # 2 ;` was one, in the first format).
     let text = format!("\"{}\" Self = # 2 ; (Rel < Self >)", tag());
-    assert!(parse_str::<Referrer>(&text).is_err());
+    // `Self = ` is followed by a type, and `#` starts none (syn lists the tokens that do).
+    let err = parse_str::<Referrer>(&text).unwrap_err();
+    assert!(err.to_string().starts_with("expected one of: "), "{}", err);
 }
 
 #[test]

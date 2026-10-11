@@ -59,11 +59,22 @@ fn context_id_tokens_parse_and_display() {
     // It is parsed from an integer, with the suffix `usize` or without any.
     assert_eq!(parse_str::<ContextId>("3usize").unwrap(), three);
     assert_eq!(parse_str::<ContextId>("0").unwrap().index(), 0);
-    assert!(parse_str::<ContextId>("3u8").is_err());
+    let message = |text: &str| parse_str::<ContextId>(text).unwrap_err().to_string();
+    assert_eq!(
+        message("3u8"),
+        "a context id is an integer, with no suffix or `usize`"
+    );
+    assert_eq!(
+        message("3i64"),
+        "a context id is an integer, with no suffix or `usize`"
+    );
     assert!(parse_str::<ContextId>("-3").is_err());
-    assert!(parse_str::<ContextId>("three").is_err());
-    assert!(parse_str::<ContextId>("3 4").is_err());
-    assert!(parse_str::<ContextId>("").is_err());
+    assert_eq!(message("three"), "expected integer literal");
+    assert_eq!(message("3 4"), "unexpected token");
+    assert_eq!(
+        message(""),
+        "unexpected end of input, expected integer literal"
+    );
     // It can be followed by other tokens.
     struct Followed(ContextId, TokenStream);
     impl parse::Parse for Followed {
@@ -341,10 +352,67 @@ fn ids_of_dropped_contexts_are_gaps() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "the context 1 is not one of the contexts of this Referrer")]
 fn context_of_a_dropped_id_panics() {
     let (referrer, _) = gap_referrer();
     let _ = referrer.context_generics(id(1));
+}
+
+// The lookups of a context that document `# Panics` panic with the same message, which names the
+// id: the one of a dropped context (`gap_referrer()` has no context 1), and one beyond the last.
+
+#[test]
+#[should_panic(expected = "the context 1 is not one of the contexts of this Referrer")]
+fn context_self_of_a_dropped_id_panics() {
+    let (referrer, _) = gap_referrer();
+    let _ = referrer.context_self(id(1));
+}
+
+#[test]
+#[should_panic(expected = "the context 99 is not one of the contexts of this Referrer")]
+fn context_self_outlives_of_an_unknown_id_panics() {
+    let (referrer, _) = gap_referrer();
+    let _ = referrer.context_self_outlives(id(99));
+}
+
+#[test]
+#[should_panic(expected = "the context 1 is not one of the contexts of this Referrer")]
+fn context_module_of_a_dropped_id_panics() {
+    let (referrer, _) = gap_referrer();
+    let _ = referrer.context_module(id(1));
+}
+
+#[test]
+#[should_panic(expected = "the context 99 is not one of the contexts of this Referrer")]
+fn impl_generics_of_an_unknown_id_panics() {
+    let (referrer, _) = gap_referrer();
+    let _ = referrer.impl_generics(id(99));
+}
+
+#[test]
+#[should_panic(expected = "the context 1 is not one of the contexts of this Referrer")]
+fn context_generic_args_of_a_dropped_id_panics() {
+    let (referrer, _) = gap_referrer();
+    let params: Generics = parse_quote!(<T, U>);
+    let _ = referrer.context_generic_args(id(1), &params.params, &[]);
+}
+
+#[test]
+fn the_contexts_that_exist_do_not_panic() {
+    // The control of the tests above: the same calls on a context of the Referrer.
+    let (referrer, top_level) = gap_referrer();
+    for context in referrer.contexts() {
+        assert_eq!(referrer.context_self(context), None);
+        assert!(referrer.context_self_outlives(context).is_empty());
+        assert_eq!(referrer.context_module(context), None);
+    }
+    assert_eq!(s(&referrer.impl_generics(top_level)), "< T , U >");
+    let params: Generics = parse_quote!(<T, U>);
+    let args: Vec<GenericArgument> = vec![parse_quote!(A), parse_quote!(B)];
+    let args = referrer
+        .context_generic_args(top_level, &params.params, &args)
+        .unwrap();
+    assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["A", "B"]);
 }
 
 #[test]
@@ -606,29 +674,36 @@ fn serialization_with_gaps_keeps_the_requirements() {
 #[test]
 fn ids_must_ascend() {
     let version = version();
-    for text in [
+    let ascending = "the ids of the contexts must be in ascending order";
+    let integer = "expected integer literal";
+    for (text, message) in [
         // The same id twice.
-        format!("\"{}\" 2 (A) # 0 (B)", version),
-        format!("\"{}\" 2 # 3 (A) # 3 (B)", version),
+        (format!("\"{}\" 2 (A) # 0 (B)", version), ascending),
+        (format!("\"{}\" 2 # 3 (A) # 3 (B)", version), ascending),
         // A smaller id.
-        format!("\"{}\" 2 # 3 (A) # 1 (B)", version),
-        format!("\"{}\" 2 # 3 (A) # 2 (B)", version),
+        (format!("\"{}\" 2 # 3 (A) # 1 (B)", version), ascending),
+        (format!("\"{}\" 2 # 3 (A) # 2 (B)", version), ascending),
         // Not a number.
-        format!("\"{}\" # (A)", version),
-        format!("\"{}\" # x (A)", version),
-        format!("\"{}\" # 1u8 (A)", version),
+        (format!("\"{}\" # (A)", version), integer),
+        (format!("\"{}\" # x (A)", version), integer),
+        (
+            format!("\"{}\" # 1u8 (A)", version),
+            "a context id is an integer, with no suffix or `usize`",
+        ),
         // A group is missing.
-        format!("\"{}\" 2 # 3 (A)", version),
+        (
+            format!("\"{}\" 2 # 3 (A)", version),
+            "unexpected end of input, expected parentheses",
+        ),
+        // The largest id cannot be followed by another one.
+        (
+            format!("\"{}\" # {} (A)", version, usize::MAX),
+            "the id of the context is too large",
+        ),
     ] {
-        assert!(parse_str::<Referrer>(&text).is_err(), "{}", text);
+        let err = parse_str::<Referrer>(&text).unwrap_err();
+        assert_eq!(err.to_string(), message, "{}", text);
     }
-    let message = parse_str::<Referrer>(&format!("\"{}\" 2 # 3 (A) # 1 (B)", version))
-        .unwrap_err()
-        .to_string();
-    assert!(message.contains("ascending"), "{}", message);
-    // The largest id cannot be followed by another one.
-    let text = format!("\"{}\" # {} (A)", version, usize::MAX);
-    assert!(parse_str::<Referrer>(&text).is_err());
 }
 
 /// Parses `Referrer, ContextId`, as the Referrer's macro receives them from the Leaker's.

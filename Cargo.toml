@@ -21,6 +21,7 @@ exclude = [
   "tests/diagnostic.rs",
   "tests/outlives.rs",
   "tests/prop_cross_crate",
+  "tests/spans.rs",
 ]
 
 [dependencies]

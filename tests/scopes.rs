@@ -1234,7 +1234,18 @@ fn the_format_of_the_previous_version_is_rejected() {
         let old: proc_macro2::TokenStream = format!("\"type-leak-format-{}\" (MyType)", version)
             .parse()
             .unwrap();
-        assert!(parse2::<Referrer>(old).is_err(), "format {}", version);
+        let err = parse2::<Referrer>(old).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "this Referrer was serialized by an incompatible type-leak (format {}, expected \
+                 {}): the macros which emit and parse it must use the same version of type-leak",
+                version,
+                Referrer::FORMAT_VERSION
+            ),
+            "format {}",
+            version
+        );
     }
     let current = format!("\"type-leak-format-{}\" (MyType)", Referrer::FORMAT_VERSION);
     assert!(parse_str::<Referrer>(&current).is_ok());
@@ -1243,17 +1254,21 @@ fn the_format_of_the_previous_version_is_rejected() {
 #[test]
 fn a_malformed_module_is_an_error() {
     let tag = format!("type-leak-format-{}", Referrer::FORMAT_VERSION);
-    for text in [
-        "mod { path = a } ; ()",
-        "mod { unknown = 1 } ; ()",
-        "mod { hint = 1 } ; ()",
-        "mod x ; (Rel)",
+    for (text, message) in [
+        // The information of a module is a list of `key = value`.
+        ("mod { path = a } ; ()", "expected square brackets"),
+        (
+            "mod { unknown = 1 } ; ()",
+            "expected `path`, `hint` or `parent`",
+        ),
+        ("mod { hint = 1 } ; ()", "expected string literal"),
+        // A module which is used is a number.
+        ("mod x ; (Rel)", "expected integer literal"),
     ] {
-        assert!(
-            parse_str::<Referrer>(&format!("\"{}\" {}", tag, text)).is_err(),
-            "{}",
-            text
-        );
+        let err = parse_str::<Referrer>(&format!("\"{}\" {}", tag, text))
+            .err()
+            .unwrap_or_else(|| panic!("accepted: {}", text));
+        assert_eq!(err.to_string(), message, "{}", text);
     }
     // The fields are optional, and may be in any order.
     let parsed: Referrer = parse_str(&format!(
@@ -1276,55 +1291,80 @@ fn inconsistent_module_data_is_an_error() {
         ),
         ("mod 3 ; (Rel)", "there is no module 3"),
         // A context which is not a module.
-        ("2 () mod 0 ; (Rel)", "the context 0 is not a module"),
+        (
+            "2 () mod 0 ; (Rel)",
+            "the context 0 is not a module (it is not declared as `mod { .. }`)",
+        ),
         (
             "2 < T > ; () mod 0 ; (Rel)",
-            "the context 0 is not a module",
+            "the context 0 is not a module (it is not declared as `mod { .. }`)",
         ),
         // The parent.
-        ("mod { parent = 0 } ; ()", "its own parent"),
-        ("mod { parent = 5 } ; ()", "there is no module 5"),
+        ("mod { parent = 0 } ; ()", "the module 0 is its own parent"),
+        (
+            "mod { parent = 5 } ; ()",
+            "the parent of the module 0: there is no module 5",
+        ),
         (
             "2 () mod { parent = 0 } ; ()",
-            "the context 0 is not a module",
+            "the parent of the module 1: the context 0 is not a module (it is not declared as \
+             `mod { .. }`)",
         ),
         (
             "2 mod { parent = 1 } ; () mod { parent = 0 } ; ()",
-            "nested in itself",
+            "the module 0 is nested in itself (its parents form a cycle)",
         ),
         (
             "3 mod { parent = 1 } ; () mod { parent = 2 } ; () mod { parent = 0 } ; ()",
-            "nested in itself",
+            "the module 0 is nested in itself (its parents form a cycle)",
         ),
         (
             "3 mod { } ; () mod { parent = 2 } ; () mod { parent = 1 } ; ()",
-            "nested in itself",
+            "the module 1 is nested in itself (its parents form a cycle)",
         ),
         // A key which is written twice.
         (
             "mod { path = [a], path = [b] } ; ()",
-            "`path` is written twice",
+            "`path` is written twice in the information of a module",
         ),
         (
             "mod { hint = \"a\", hint = \"b\" } ; ()",
-            "`hint` is written twice",
+            "`hint` is written twice in the information of a module",
         ),
         (
             "2 mod { } ; () mod { parent = 0, parent = 0 } ; ()",
-            "`parent` is written twice",
+            "`parent` is written twice in the information of a module",
         ),
         // What a module does not have.
-        ("< T > ; mod { } ; (Rel<T>)", "which has no generics"),
-        ("where T: Clone ; mod { } ; ()", "which has no generics"),
-        ("Self = W ; mod { } ; ()", "where `Self` has no meaning"),
-        ("Self : Tr ; mod { } ; ()", "where `Self` has no meaning"),
-        ("<'a> ; Self : 'a ; mod { } ; ()", "which has no generics"),
-        ("mod { } ; (Rel)", "which has no leaked type"),
+        (
+            "< T > ; mod { } ; (Rel<T>)",
+            "the context 0 is a module (`mod { .. }`), which has no generics",
+        ),
+        (
+            "where T: Clone ; mod { } ; ()",
+            "the context 0 is a module (`mod { .. }`), which has no generics",
+        ),
+        (
+            "Self = W ; mod { } ; ()",
+            "the context 0 is a module (`mod { .. }`), where `Self` has no meaning",
+        ),
+        (
+            "Self : Tr ; mod { } ; ()",
+            "the context 0 is a module (`mod { .. }`), where `Self` has no meaning",
+        ),
+        (
+            "<'a> ; Self : 'a ; mod { } ; ()",
+            "the context 0 is a module (`mod { .. }`), which has no generics",
+        ),
+        (
+            "mod { } ; (Rel)",
+            "the context 0 is a module (`mod { .. }`), which has no leaked type",
+        ),
     ];
     for (text, message) in cases {
         let parsed = parse_str::<Referrer>(&format!("\"{}\" {}", tag, text));
         let err = parsed.err().unwrap_or_else(|| panic!("accepted: {}", text));
-        assert!(err.to_string().contains(message), "{}: {}", text, err);
+        assert_eq!(err.to_string(), *message, "{}", text);
     }
     // The consistent ones are fine: a module of its own, nested ones in either order of the ids,
     // and the entries which depend on a module.

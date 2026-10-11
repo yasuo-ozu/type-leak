@@ -4,7 +4,7 @@
 //! crate or a Referrer's crate that does not compile, or an item that should have been rejected.
 //! Each finding is minimized here to a test of the API of `type-leak` (`Leaker`, `Referrer`,
 //! `RepeaterSlots`), with no generated crate and no `cargo` build. A test asserts what the library
-//! SHOULD produce, as a property that the current output violates.
+//! produces today: what a fix made it produce (`fixed`), or what the README documents (`limitation`).
 //!
 //! | test | finding | kind |
 //! |------|---------|------|
@@ -44,21 +44,22 @@
 //! | `f34_implied_outlives_of_self_projection_forms_recorded_as_components` | `&'x <Self as Tr<'a, T>>::A`, `&'x Self::A<'b>` and a `Self::A` that a bound equates are recorded as components | fixed |
 //! | `f35_gat_where_clause_of_self_projection_not_recorded` | `Self::G<'x>` of a generic associated type with `where Self: 'b` needs `Self: 'x`, which F34 stopped recording | fixed |
 //!
-//! The bugs that are not fixed (`bug` in the table) are `#[ignore]`d, as they fail today (a fixed
-//! one has no `#[ignore]`, and `fixed` in the table): run them with
+//! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
+//! behaviour that the README documents, or that follows from what rustc accepts). No test is
+//! `#[ignore]`d.
 //!
-//! ```text
-//! cargo test --test findings -- --ignored
-//! ```
+//! Most fixes are rejections: the Leaker returns an error for an item whose copy rustc cannot
+//! compile. The test of such an item asserts the rejection, with the exact headline of the error and
+//! its note (`assert_rejected()`, `assert_unstable()`), and not an oracle on the copy: an oracle
+//! that runs for the accepted items only (`let Ok(..) = .. else { continue }`) runs for none of
+//! them, and would pass if the rejection regressed. The oracle (what the copy of an accepted item
+//! must not have) is kept for the controls, the items that compile and stay accepted, and it is
+//! checked on a copy written by hand (`the_oracles_of_the_findings_find_a_hand_written_cycle`).
 //!
-//! and remove the `#[ignore]` of the one that a fix makes pass (the table then says `fixed`, and the
-//! test stays as a regression test). The limitations are not bugs: they pin behaviour that the
-//! README documents, or that follows from what rustc accepts, and they pass.
-//! The test of a finding says how the property test shows it (`TYPE_LEAK_PROP_FEATURES=..`), and
-//! the one-line reason of each failure is in its `#[ignore]` message. The features of the fixed
-//! findings are on by default in the property test: the Leaker now rejects what they generate (the
-//! rejections are counted), or rewrites it. The feature of F26 is off, as for the other
-//! findings that are not fixed. F22 to F24 were rejections of what compiles: a rejection is
+//! The test of a finding says how the property test shows it (`TYPE_LEAK_PROP_FEATURES=..`). The
+//! features of the fixed findings are on by default in the property test: the Leaker now rejects
+//! what they generate (the rejections are counted), or rewrites it. The feature of F26 is off, as
+//! for the other limitations. F22 to F24 were rejections of what compiles: a rejection is
 //! counted as a success by the property test, which cannot show them (nor F29, F31 and F32, which
 //! are about a toolchain, a lint, or an error in the Leaker's crate that the Leaker cannot see).
 //! The fix of F22 is checked by the property test the other way: the free functions and inherent
@@ -73,8 +74,7 @@
 //!
 //! The feature of the limitation F18 (`strict_anchors`) is off in
 //! the property test: the generator does not make what it fails on (it only decides that
-//! an item is not invoked as strict). Each test of a bug asserts that the Leaker either rejects
-//! the item or gives what the Referrer needs, and says which of the two is up to the fix.
+//! an item is not invoked as strict).
 
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
@@ -106,6 +106,138 @@ fn intern(leaker: &mut Leaker, item: &Item) -> std::result::Result<ContextId, No
 
 fn string<T: template_quote::ToTokens>(t: &T) -> String {
     quote!(#t).to_string()
+}
+
+/// Asserts that the Leaker rejected `item`, with exactly the `messages` (the headline of each error,
+/// in order: the `Display` of the error is these, one per line), and returns the error.
+///
+/// A bug input has to be rejected. A loop that skips the rejected items (`let Ok(..) = .. else {
+/// continue }`) runs its oracle on none of them, and pins nothing: it would be the same if the
+/// rejection regressed, and the oracle runs for the items that are accepted only.
+fn assert_rejected<T>(
+    item: &impl template_quote::ToTokens,
+    result: std::result::Result<T, NotInternableError>,
+    messages: &[&str],
+) -> NotInternableError {
+    let err = match result {
+        Ok(_) => panic!("`{}` is accepted, and it does not compile", string(item)),
+        Err(err) => err,
+    };
+    assert_eq!(err.to_string(), messages.join("\n"), "`{}`", string(item));
+    err
+}
+
+/// The notes of all the errors of `err`, in order.
+fn all_notes(err: &NotInternableError) -> Vec<String> {
+    err.items()
+        .flat_map(|item| item.notes.into_iter().map(|(_, note)| note))
+        .collect()
+}
+
+/// What the bound that an error of an unstable bound blames names (`Why` of `src/unstable.rs`).
+#[derive(Clone, Copy)]
+enum Blames<'a> {
+    /// A type that is leaked too.
+    Leaked,
+    /// `Self`, the self type of an impl.
+    SelfType,
+    /// `Self::A` (or `<Self as Tr>::A`), as written.
+    SelfAssoc(&'a str),
+    /// An associated type that rustc normalizes (`T::Item`), as written.
+    Projection(&'a str),
+    /// A type that is leaked too, in a bound of the impl that rustc proves to resolve `Self::A` by
+    /// the impl of the trait.
+    LeakedInImpl,
+}
+
+/// Asserts that the Leaker rejected `item` for the type `ty` (as the error writes it) in a bound or
+/// where predicate, because the bound `bound` of its generics is one that the environment of the
+/// copy cannot prove. The error has the headline, and the one note, that say what the bound
+/// `blames` (`env_cycle()` and `self_env_cycle()` of `src/analyze.rs`). `ty` is `Self` for the
+/// self type of an impl.
+fn assert_unstable<T>(
+    item: &impl template_quote::ToTokens,
+    result: std::result::Result<T, NotInternableError>,
+    ty: &str,
+    bound: &str,
+    blames: Blames,
+) -> NotInternableError {
+    // What the bound names, after "the bound `..` of its generics".
+    let names = |blames: Blames| match blames {
+        Blames::SelfType => "names `Self`, which the copy writes as the self type of the impl, a \
+                             path through the Repeater that rustc has not normalized yet in the \
+                             environment, where it must prove the bound (E0277, E0271)"
+            .to_string(),
+        Blames::SelfAssoc(path) => format!(
+            "names `{}`, which rustc normalizes to the associated type of the host in the impl of \
+             the Repeater, but not yet in the environment (E0277, E0271)",
+            path
+        ),
+        Blames::Projection(path) => format!(
+            "names `{}`, which rustc normalizes in the impl of the Repeater (an impl, a predicate \
+             of the item that equates it, or a supertrait of a bound of its generic, defines it), \
+             but not yet in the environment (E0277, E0271, E0275)",
+            path
+        ),
+        Blames::Leaked | Blames::LeakedInImpl => unreachable!(),
+    };
+    let of_self_type = ty == "Self";
+    let why = match blames {
+        Blames::Leaked if !of_self_type => format!(
+            "the bound `{}` of its generics names a type that is leaked too: the copy writes both \
+             as paths through the Repeater, and rustc cannot normalize the one in a bound or where \
+             predicate while it checks the bounds (E0277, E0275)",
+            bound
+        ),
+        Blames::Leaked => format!(
+            "`Self` is the self type of the impl, which the copy writes with its leaked types as \
+             paths through the Repeater, and the bound `{}` of their generics names a type that is \
+             leaked too, and rustc cannot normalize the one in a bound or where predicate while it \
+             checks the bounds (E0277, E0275)",
+            bound
+        ),
+        Blames::LeakedInImpl => format!(
+            "the copy for a concrete implementor resolves `{}` by the impl of the trait, which \
+             needs the bound `{}` of the impl, where the copy writes the leaked type as a path \
+             through the Repeater, and rustc cannot normalize the one in a bound or where \
+             predicate while it checks the bounds (E0277, E0275)",
+            ty, bound
+        ),
+        blames if !of_self_type => {
+            format!("the bound `{}` of its generics {}", bound, names(blames))
+        }
+        blames => format!(
+            "`Self` is the self type of the impl, which the copy writes with its leaked types as \
+             paths through the Repeater, and the bound `{}` of their generics {}",
+            bound,
+            names(blames)
+        ),
+    };
+    let (what, advice) = match blames {
+        Blames::Leaked | Blames::LeakedInImpl => (
+            "a leaked type".to_string(),
+            "Write the leaked type of the bound with an absolute path".to_string(),
+        ),
+        Blames::SelfType => (
+            "`Self`, which is a leaked type".to_string(),
+            "Write the bound without `Self`".to_string(),
+        ),
+        Blames::SelfAssoc(path) | Blames::Projection(path) => (
+            format!("`{}`", path),
+            format!("Write the bound without `{}`", path),
+        ),
+    };
+    let headline = format!(
+        "`{}` is in a bound or where predicate, and a bound of its generics names {}",
+        ty, what
+    );
+    let err = assert_rejected(item, result, &[&headline]);
+    let note = format!(
+        "{}. {}, or use `{}` outside the bounds and where predicates",
+        why, advice, ty
+    );
+    assert_eq!(all_notes(&err), [note], "`{}`", string(item));
+    err
 }
 
 /// Rewrites a copy of `item` (in the scope `context`), replacing the `ix`-th entry with `P<ix>`.
@@ -411,38 +543,56 @@ fn f02_bound_names_leaked_type_env_cycle() {
                     Wrap<T>: Sized;
             }
         ),
-        // The control: `T: Sized` names no entry.
-        parse_quote!(
-            pub trait Tr3 {
-                fn f<T: Fn(Rel)>(&self, a: Wrap<T>)
-                where
-                    T: Sized;
-            }
-        ),
     ];
-    let control = items.len() - 1;
-    for (ix, item) in items.into_iter().enumerate() {
-        let mut leaker = new_leaker();
-        let Ok(context) = intern(&mut leaker, &item) else {
-            assert_ne!(ix, control, "the control is rejected, though it compiles");
-            continue;
-        };
-        let referrer = leaker.finish();
-        let mut copy = item.clone();
-        referrer
-            .clone()
-            .visitor(context, |_, ix| parse_quote!(P<#ix>))
-            .visit_item_mut(&mut copy);
-        let mut mentions = EntryMentions::default();
-        mentions.visit_item(&copy);
-        assert!(
-            mentions.in_bounds.is_empty() || mentions.in_where.is_empty(),
-            "in the copy `{}`, the bounds {:?} and the where predicates {:?} name entries",
-            string(&copy),
-            mentions.in_bounds,
-            mentions.in_where
+    // The rejection is the fix: each is rejected, and the copy of none exists.
+    for item in &items {
+        assert_unstable(
+            item,
+            intern(&mut new_leaker(), item),
+            "Wrap < T >",
+            "T : Fn (Rel)",
+            Blames::Leaked,
         );
     }
+    // The control: `T: Sized` names no entry. It is accepted, and its copy has no bound and where
+    // predicate that mention a replacement.
+    let control: Item = parse_quote!(
+        pub trait Tr3 {
+            fn f<T: Fn(Rel)>(&self, a: Wrap<T>)
+            where
+                T: Sized;
+        }
+    );
+    let mut leaker = new_leaker();
+    let context = intern(&mut leaker, &control)
+        .unwrap_or_else(|e| panic!("the control is rejected, though it compiles: {}", e));
+    let referrer = leaker.finish();
+    let mut copy = control.clone();
+    referrer
+        .clone()
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visit_item_mut(&mut copy);
+    let mut mentions = EntryMentions::default();
+    mentions.visit_item(&copy);
+    assert!(
+        mentions.in_bounds.is_empty() || mentions.in_where.is_empty(),
+        "in the copy `{}`, the bounds {:?} and the where predicates {:?} name entries",
+        string(&copy),
+        mentions.in_bounds,
+        mentions.in_where
+    );
+    // The oracle finds a copy that has both (it is the copy of F2, written by hand).
+    let cyclic: Item = parse_quote!(
+        pub trait Tr<T: Fn(P<0usize>)> {
+            fn f(&self, a: P<1usize>)
+            where
+                P<1usize>: Sized;
+        }
+    );
+    let mut mentions = EntryMentions::default();
+    mentions.visit_item(&cyclic);
+    assert_eq!(mentions.in_bounds.len(), 1, "{:?}", mentions.in_bounds);
+    assert_eq!(mentions.in_where.len(), 1, "{:?}", mentions.in_where);
 }
 
 // ── F3 ───────────────────────────────────────────────────────────────────────
@@ -1925,6 +2075,10 @@ fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, NotI
     }
 }
 
+/// How an item of F14 ends: rejected, for the type and the bound that the error names, or (`None`)
+/// accepted.
+type Rejected<'a> = Option<(&'a str, &'a str)>;
+
 /// F14: a where predicate of a method names `Self::A`, in an impl of a trait whose own bound names
 /// a leaked type.
 ///
@@ -1958,7 +2112,7 @@ fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, NotI
 /// entries that they name are copied as written for a strict Referrer.
 #[test]
 fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
-    let items: Vec<(ItemImpl, bool)> = vec![
+    let items: Vec<(ItemImpl, bool, Rejected)> = vec![
         (
             parse_quote!(
                 impl<T> ::p::Tr<T> for u8
@@ -1974,6 +2128,7 @@ fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
                 }
             ),
             false,
+            Some(("Self :: A1", "T : Fn (Rel)")),
         ),
         // The bound written inline, the predicate on a type that is not a generic.
         (
@@ -1988,8 +2143,10 @@ fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
                 }
             ),
             false,
+            Some(("Self :: A1", "T : Fn (Rel)")),
         ),
-        // The leaked type of the bound is an optional entry, which a strict Referrer replaces.
+        // The leaked type of the bound is an optional entry, which a strict Referrer replaces, and
+        // which the Leaker accepts all the same: the copy is checked.
         (
             parse_quote!(
                 impl<T> ::p::Tr<T> for u8
@@ -2005,6 +2162,7 @@ fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
                 }
             ),
             true,
+            None,
         ),
     ];
     let controls: Vec<(ItemImpl, bool)> = vec![
@@ -2057,10 +2215,26 @@ fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
             false,
         ),
     ];
-    for (item, strict) in &items {
-        // Rejected is fine.
-        let Ok(copy) = f14_copy(item, *strict) else {
-            continue;
+    for (item, strict, rejected) in &items {
+        // Each is rejected, or its copy is checked (the oracle).
+        let copy = match rejected {
+            Some((ty, bound)) => {
+                assert_unstable(
+                    item,
+                    f14_copy(item, *strict),
+                    ty,
+                    bound,
+                    Blames::LeakedInImpl,
+                );
+                continue;
+            }
+            None => f14_copy(item, *strict).unwrap_or_else(|e| {
+                panic!(
+                    "`{}` is rejected, and it is not expected to be: {}",
+                    string(item),
+                    e
+                )
+            }),
         };
         let mut bounds = EntryMentions::default();
         bounds.visit_generics(&copy.generics);
@@ -3031,18 +3205,19 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
                 if referrer.iter().any(|entry| type_contains(self_ty, &string(entry)))
         )
     };
-    for item in &items {
-        // Rejected is fine.
-        let Ok((referrer, copy)) = f19_copy(item) else {
-            continue;
-        };
-        let found = entries_with_self_bound_in_predicates(&referrer, &copy, self_is_leaked);
-        assert!(
-            found.is_empty(),
-            "in the copy `{}`, a predicate names the entries {:?}, which have a bound that names `Self`, the replaced self type",
-            string(&copy),
-            found
-        );
+    // Each is rejected: no copy of it exists whose predicate names such an entry.
+    let blamed = [
+        ("Rel < X >", "X : Fn (Self) -> u8", Blames::SelfType),
+        (
+            "Rel < Rel2 < X > >",
+            "X : for < 'h > Fn (& 'h Self) -> & 'h Result < Self , f64 >",
+            Blames::SelfType,
+        ),
+        ("Rel < X >", "X : Fn (& Self) -> u8", Blames::SelfType),
+    ];
+    assert_eq!(items.len(), blamed.len());
+    for (item, (ty, bound, blames)) in items.iter().zip(blamed) {
+        assert_unstable(item, f19_copy(item), ty, bound, blames);
     }
     for item in &controls {
         let (referrer, copy) = f19_copy(item)
@@ -3082,15 +3257,12 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
         ),
     ];
     for item in &by_parts {
-        let err = f19_copy_with(f13_leaker(), item)
-            .err()
-            .unwrap_or_else(|| panic!("`{}` is accepted, and it does not compile", string(item)));
-        assert!(
-            err.to_string()
-                .contains("a bound of its generics names `Self`, which is a leaked type"),
-            "{}: {}",
-            string(item),
-            err
+        assert_unstable(
+            item,
+            f19_copy_with(f13_leaker(), item),
+            "Rel2 < T >",
+            "T : AsRef < Self >",
+            Blames::SelfType,
         );
     }
     let by_parts_controls: Vec<Item> = vec![
@@ -3121,14 +3293,15 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
     // with the Repeater's impls of their entries, which need the bounds of the generics that they
     // use (E0277 "expected an `Fn(Rel3<u8>)` closure, found `T`", checked with rustc stable and
     // nightly). The bound of a generic that no such type uses does not matter (F13).
-    let normalized: Vec<(ItemImpl, &str)> = vec![
+    let normalized: Vec<(ItemImpl, &str, Blames)> = vec![
         (
             parse_quote!(
                 impl<T: Fn(Rel2<u8>), V: AsRef<Self>> ::p::W<Rel<T>, T, V> {
                     fn f(&self, a: Rel3<u8>) {}
                 }
             ),
-            "`Self` is in a bound or where predicate, and a bound of its generics names a leaked type",
+            "T : Fn (Rel2 < u8 >)",
+            Blames::Leaked,
         ),
         (
             parse_quote!(
@@ -3139,7 +3312,8 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
                 {
                 }
             ),
-            "`Self` is in a bound or where predicate, and a bound of its generics names a leaked type",
+            "T : Fn (Rel2 < u8 >)",
+            Blames::Leaked,
         ),
         // The `Item` that a predicate equates is normalized too (E0277, "expected an `Fn(u8)`
         // closure, found `I`").
@@ -3147,19 +3321,17 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
             parse_quote!(
                 impl<I: Iterator<Item = u8> + Fn(I::Item), V: AsRef<Self>> ::p::W<Rel<I>, I, V> {}
             ),
-            "`Self` is in a bound or where predicate, and a bound of its generics names `I :: Item`",
+            "I : Fn (I :: Item) + Iterator < Item = u8 >",
+            Blames::Projection("I :: Item"),
         ),
     ];
-    for (item, headline) in &normalized {
-        let err = f13_leaker()
-            .intern_impl(item, true)
-            .err()
-            .unwrap_or_else(|| panic!("`{}` is accepted, and it does not compile", string(item)));
-        assert!(
-            err.to_string().contains(headline),
-            "{}: {}",
-            string(item),
-            err
+    for (item, bound, blames) in &normalized {
+        assert_unstable(
+            item,
+            f13_leaker().intern_impl(item, true),
+            "Self",
+            bound,
+            *blames,
         );
     }
 }
@@ -3230,18 +3402,14 @@ fn f20_trait_assoc_in_bound_of_entry_in_predicate() {
             Some(SelfRequirement::Bound(_))
         )
     };
-    for item in &items {
-        // Rejected is fine.
-        let Ok((referrer, copy)) = f19_copy(item) else {
-            continue;
-        };
-        let found = entries_with_self_bound_in_predicates(&referrer, &copy, bound);
-        assert!(
-            found.is_empty(),
-            "in the copy `{}`, a predicate names the entries {:?}, which have a bound that names `Self::A`",
-            string(&copy),
-            found
-        );
+    // Each is rejected: no copy of it exists whose predicate names such an entry.
+    let blamed = [
+        ("Rel < X >", "X : Fn (& Self :: A0) -> u8", Blames::SelfAssoc("Self :: A0")),
+        ("Rel < T , X >", "T : for < 'h > Fn (& 'h (X , Self :: A1 , & 'a dyn :: core :: any :: Any)) -> & 'h String", Blames::SelfAssoc("Self :: A1")),
+    ];
+    assert_eq!(items.len(), blamed.len());
+    for (item, (ty, bound, blames)) in items.iter().zip(blamed) {
+        assert_unstable(item, f19_copy(item), ty, bound, blames);
     }
     for item in &controls {
         let (referrer, copy) = f19_copy(item)
@@ -3341,29 +3509,25 @@ fn f21_iterator_item_in_bound_of_entry_in_item_binding() {
     ];
     let check = |item: &Item| {
         let (referrer, copy) = f19_copy(item)?;
-        let mut used = ReplacementsInPredicates::default();
-        used.visit_item(&copy);
-        let found: Vec<String> = used
-            .0
-            .iter()
-            .filter(|&&ix| {
-                ix < referrer.iter().count() && generics_name_item(referrer.generics(ix))
-            })
-            .map(|&ix| string(referrer.iter().nth(ix).unwrap()))
-            .collect();
+        let found = entries_naming_item(&referrer, &copy);
         Ok::<_, NotInternableError>((copy, found))
     };
-    for item in &items {
-        // Rejected is fine.
-        let Ok((copy, found)) = check(item) else {
-            continue;
-        };
-        assert!(
-            found.is_empty(),
-            "in the copy `{}`, a predicate names the entries {:?}, which have a bound that names an `Item`",
-            string(&copy),
-            found
-        );
+    // Each is rejected: no copy of it exists whose predicate names such an entry.
+    let blamed = [
+        (
+            "Result < T , I0 >",
+            "T : Fn (T :: Item) + Iterator",
+            Blames::Projection("T :: Item"),
+        ),
+        (
+            "Rel < T >",
+            "T : Fn (< T as Iterator > :: Item) + Iterator",
+            Blames::Projection("< T as Iterator > :: Item"),
+        ),
+    ];
+    assert_eq!(items.len(), blamed.len());
+    for (item, (ty, bound, blames)) in items.iter().zip(blamed) {
+        assert_unstable(item, check(item), ty, bound, blames);
     }
     for item in &controls {
         let (copy, found) = check(item)
@@ -3807,14 +3971,12 @@ fn f24_self_in_predicate_with_leaked_bound_of_unused_generic() {
         ),
     ];
     for item in &rejected {
-        let err = f19_copy_with(f13_leaker(), &Item::Impl(item.clone()))
-            .err()
-            .unwrap_or_else(|| panic!("`{}` is accepted, and it does not compile", string(item)));
-        assert!(
-            err.to_string().contains("names a leaked type"),
-            "{}: {}",
-            string(item),
-            err
+        assert_unstable(
+            item,
+            f19_copy_with(f13_leaker(), &Item::Impl(item.clone())),
+            "Self",
+            "T : Fn (Rel2 < u8 >)",
+            Blames::Leaked,
         );
     }
 }
@@ -3828,15 +3990,19 @@ fn entries_naming_item_in_predicates(
     item: &Item,
 ) -> std::result::Result<(Item, Vec<String>), NotInternableError> {
     let (referrer, copy) = f19_copy_with(f13_leaker(), item)?;
+    let found = entries_naming_item(&referrer, &copy);
+    Ok((copy, found))
+}
+
+/// The entries that a predicate of `copy` names whose context has a bound that names an `Item`.
+fn entries_naming_item(referrer: &Referrer, copy: &Item) -> Vec<String> {
     let mut used = ReplacementsInPredicates::default();
-    used.visit_item(&copy);
-    let found: Vec<String> = used
-        .0
+    used.visit_item(copy);
+    used.0
         .iter()
         .filter(|&&ix| ix < referrer.iter().count() && generics_name_item(referrer.generics(ix)))
         .map(|&ix| string(referrer.iter().nth(ix).unwrap()))
-        .collect();
-    Ok((copy, found))
+        .collect()
 }
 
 /// F25 (fixed): a supertrait fixes the `Item` that a bound names, and an entry that uses the generic
@@ -3973,9 +4139,23 @@ fn f25_supertrait_item_in_bound_of_entry_in_predicate() {
             }
         ),
     ];
-    for item in &price {
-        let err = f19_copy_with(f13_leaker(), item).err().unwrap();
-        assert!(err.to_string().contains("`T :: "), "{}", err);
+    let priced = [
+        (
+            "Rel < T >",
+            "T : :: p :: WIter2 + Fn (T :: Item)",
+            "T :: Item",
+        ),
+        ("Rel < T >", "T : :: p :: Cont + Fn (T :: Out)", "T :: Out"),
+    ];
+    assert_eq!(price.len(), priced.len());
+    for (item, (ty, bound, path)) in price.iter().zip(priced) {
+        assert_unstable(
+            item,
+            f19_copy_with(f13_leaker(), item),
+            ty,
+            bound,
+            Blames::Projection(path),
+        );
     }
     let items: Vec<Item> = vec![
         parse_quote!(
@@ -4031,16 +4211,42 @@ fn f25_supertrait_item_in_bound_of_entry_in_predicate() {
             }
         ),
     ];
-    for item in &items {
-        // Rejected is fine.
-        let Ok((copy, found)) = entries_naming_item_in_predicates(item) else {
-            continue;
-        };
-        assert!(
-            found.is_empty(),
-            "in the copy `{}`, a predicate names the entries {:?}, which have a bound that names an `Item`",
-            string(&copy),
-            found
+    // Each is rejected: no copy of it exists whose predicate names such an entry.
+    let blamed = [
+        (
+            "Rel < T >",
+            "T : :: p :: WIter + Fn (T :: Item)",
+            Blames::Projection("T :: Item"),
+        ),
+        (
+            "Rel < T >",
+            "T : :: p :: WIter + Fn (< T as Iterator > :: Item)",
+            Blames::Projection("< T as Iterator > :: Item"),
+        ),
+        (
+            "Rel < T >",
+            "T : :: p :: WIter + Fn (T :: Item)",
+            Blames::Projection("T :: Item"),
+        ),
+        (
+            "Rel < T >",
+            "T : :: p :: WIter + Fn (T :: Item)",
+            Blames::Projection("T :: Item"),
+        ),
+        (
+            "Rel < T >",
+            "T : :: p :: WIter + Fn (T :: Item)",
+            Blames::Projection("T :: Item"),
+        ),
+    ];
+    assert_eq!(items.len(), blamed.len());
+    for (item, (ty, bound, blames)) in items.iter().zip(blamed) {
+        assert_unstable(
+            item,
+            entries_naming_item_in_predicates(item),
+            ty,
+            bound,
+            blames,
         );
     }
 }
@@ -4104,8 +4310,13 @@ fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
                 Rel<T>: Default;
         }
     );
-    let err = f19_copy_with(f13_leaker(), &written).err().unwrap();
-    assert!(err.to_string().contains("`T :: Item`"), "{}", err);
+    assert_unstable(
+        &written,
+        f19_copy_with(f13_leaker(), &written),
+        "Rel < T >",
+        "T : Fn (T :: Item) + Iterator < Item = u8 >",
+        Blames::Projection("T :: Item"),
+    );
     // A struct with the same shape compiles, and cannot be told from the alias.
     let structure: Item = parse_quote!(
         pub trait Tr<T: Iterator<Item = u8>>
@@ -4205,7 +4416,13 @@ fn f27_argument_impl_trait_bound_names_leaked_type_env_cycle() {
             fn m<X: Into<Wrap<T>>>(&self, x: X);
         }
     );
-    assert!(f19_copy_with(f13_leaker(), &written).is_err());
+    assert_unstable(
+        &written,
+        f19_copy_with(f13_leaker(), &written),
+        "Wrap < T >",
+        "T : Fn (Rel0)",
+        Blames::Leaked,
+    );
     // More controls: where the bound of the `impl Trait` names no entry that uses a generic with a
     // bound that names a leaked type.
     let more: Vec<Item> = vec![
@@ -4268,34 +4485,21 @@ fn f27_argument_impl_trait_bound_names_leaked_type_env_cycle() {
             }
         ),
     ];
-    for item in &items {
-        let err = f19_copy_with(f13_leaker(), item)
-            .err()
-            .unwrap_or_else(|| panic!("`{}` is accepted, and it does not compile", string(item)));
-        assert!(
-            err.to_string()
-                .contains("is in a bound or where predicate, and a bound of its generics names"),
-            "{}: {}",
-            string(item),
-            err
-        );
-    }
-    for item in &items {
-        // Rejected is fine.
-        let Ok((_, copy)) = f19_copy_with(f13_leaker(), item) else {
-            continue;
-        };
-        let mut generics = EntryMentions::default();
-        generics.visit_item(&copy);
-        let mut impl_trait = ImplTraitMentions::default();
-        impl_trait.visit_item(&copy);
-        assert!(
-            generics.in_bounds.is_empty() || impl_trait.0.is_empty(),
-            "in the copy `{}`, the bounds {:?} and the `impl Trait` {:?} name entries",
-            string(&copy),
-            generics.in_bounds,
-            impl_trait.0
-        );
+    // Each is rejected: no copy of it exists that has both a bound of a generic and a bound of an
+    // `impl Trait` that mention replacements.
+    let blamed = [
+        ("Wrap < T >", "T : Fn (Rel0)", Blames::Leaked),
+        ("Wrap < T >", "T : Fn (Rel0)", Blames::Leaked),
+        ("Wrap < T >", "T : Fn (Rel0)", Blames::Leaked),
+        ("Wrap < T >", "T : Fn (Rel0)", Blames::Leaked),
+        ("Wrap < T >", "T : Fn (Rel0)", Blames::Leaked),
+        ("Wrap < T >", "T : Fn (Rel0)", Blames::Leaked),
+        ("Wrap < T >", "T : Fn (Rel0)", Blames::Leaked),
+        ("Wrap < T >", "T : Fn (Rel0)", Blames::Leaked),
+    ];
+    assert_eq!(items.len(), blamed.len());
+    for (item, (ty, bound, blames)) in items.iter().zip(blamed) {
+        assert_unstable(item, f19_copy_with(f13_leaker(), item), ty, bound, blames);
     }
 }
 
@@ -4454,15 +4658,25 @@ fn f28_hidden_lifetime_in_elided_signature_with_generics() {
         ),
     ];
     for item in &rejected {
-        let err = f12_copy_with(f13_leaker(), item)
-            .err()
-            .unwrap_or_else(|| panic!("{} is accepted", string(item)));
-        let note = err.note().unwrap();
-        assert!(
-            note.contains("E0106") && note.contains("hides"),
-            "{}: {}",
-            string(item),
-            note
+        let err = assert_rejected(
+            item,
+            f12_copy_with(f13_leaker(), item),
+            &["use absolute path: 'Rel < T >'"],
+        );
+        // The note says that the lifetime is hidden by a path, and how to write it.
+        assert_eq!(
+            all_notes(&err),
+            [
+                "the output `& u8` has an elided lifetime, which elision takes from the only \
+                 lifetime of the inputs, which a path hides (the Leaker does not see it), but a \
+                 leaked type in the inputs has `'a` among its generics, and the copy names it in \
+                 the arguments of its projection, so the inputs have more than one lifetime \
+                 (E0106): write the lifetime that the path hides (`Ref<'x, u8>`), and name it in \
+                 the output",
+                "it cannot be leaked as a whole because of `& u8`"
+            ],
+            "{}",
+            string(item)
         );
     }
     // A method with a receiver that is a reference takes the lifetime from it: nothing is hidden.
@@ -5444,31 +5658,233 @@ fn f33_where_predicate_names_item_that_a_predicate_in_scope_defines() {
             }
         ),
     ];
-    for item in &items {
-        // Rejected is fine.
-        let Ok((copy, found)) = entries_naming_item_in_predicates(item) else {
-            continue;
-        };
-        assert!(
-            found.is_empty(),
-            "in the copy `{}`, a predicate names the entries {:?}, whose context names an `Item`",
-            string(&copy),
-            found
+    // Each is rejected: no copy of it exists whose predicate names such an entry.
+    let blamed = [
+        (
+            "J1 < T >",
+            "R2 < [T :: Item ; 3] , B1 < T > > : Default",
+            Blames::Projection("T :: Item"),
+        ),
+        (
+            "Rel < T >",
+            "Vec < T :: Item > : Default",
+            Blames::Projection("T :: Item"),
+        ),
+        (
+            "Rel < T >",
+            "Vec < T :: Item > : Default",
+            Blames::Projection("T :: Item"),
+        ),
+        (
+            "Rel < T >",
+            "Vec < < T as Iterator > :: Item > : Default",
+            Blames::Projection("< T as Iterator > :: Item"),
+        ),
+        (
+            "Rel < T >",
+            "u8 : Into < T :: Item >",
+            Blames::Projection("T :: Item"),
+        ),
+        (
+            "Rel < T >",
+            "for < 'a > & 'a [T :: Item] : Default",
+            Blames::Projection("T :: Item"),
+        ),
+        (
+            "Rel < T >",
+            "T :: Item : Clone",
+            Blames::Projection("T :: Item"),
+        ),
+        (
+            "Rel < T >",
+            "Vec < T :: Item > : Clone",
+            Blames::Projection("T :: Item"),
+        ),
+        (
+            "Rel < T >",
+            "T :: Item : Into < T >",
+            Blames::Projection("T :: Item"),
+        ),
+        (
+            "Rel < T >",
+            "Vec < T :: Item > : Default",
+            Blames::Projection("T :: Item"),
+        ),
+    ];
+    assert_eq!(items.len(), blamed.len());
+    for (item, (ty, bound, blames)) in items.iter().zip(blamed) {
+        assert_unstable(
+            item,
+            entries_naming_item_in_predicates(item),
+            ty,
+            bound,
+            blames,
         );
     }
     for item in &accepted {
         f19_copy_with(f13_leaker(), item)
             .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
     }
+    // These are rejected (this is the price of F33): all three for the same predicate.
     for item in &price {
-        let err = f19_copy_with(f13_leaker(), item).err().unwrap_or_else(|| {
-            panic!(
-                "`{}` is accepted, but this is the price of F33",
-                string(item)
-            )
-        });
-        assert!(err.to_string().contains("`T :: Item`"), "{}", err);
+        assert_unstable(
+            item,
+            f19_copy_with(f13_leaker(), item),
+            "Rel < T >",
+            "Vec < T :: Item > : Default",
+            Blames::Projection("T :: Item"),
+        );
     }
+}
+
+// ── the oracles ──────────────────────────────────────────────────────────────
+
+/// The oracles of F2, F19 to F21, F25, F27 and F33 find the cycle that they look for.
+///
+/// The Leaker rejects every item of those findings, so no copy of one exists for the oracle to look
+/// at, and the oracle runs only for the controls (which it must find nothing in). The copy of a
+/// cycle is written by hand here, with the Referrer of an item that the Leaker accepts and that has
+/// the entry in a position: the oracle must find the entry in the predicate of the copy, and in no
+/// other place. If it found nothing in any copy, the controls would pass whatever the Leaker did.
+#[test]
+fn the_oracles_of_the_findings_find_a_hand_written_cycle() {
+    // F19: `Self` is in the bound of the entry, and the self type is leaked.
+    let control: Item = parse_quote!(
+        impl S {
+            fn m<X>(&self, a0: Rel<X>)
+            where
+                X: Fn(Self) -> u8,
+            {
+            }
+        }
+    );
+    let (referrer, _) = f19_copy(&control).unwrap();
+    let rel = referrer
+        .iter()
+        .position(|ty| string(ty) == "Rel < X >")
+        .unwrap();
+    let self_is_leaked = |referrer: &Referrer, context: ContextId| {
+        matches!(
+            referrer.context_self(context),
+            Some(SelfRequirement::Type(self_ty))
+                if referrer.iter().any(|entry| type_contains(self_ty, &string(entry)))
+        )
+    };
+    let copy: Item = parse_quote!(
+        impl S {
+            fn m<X>(&self)
+            where
+                X: Fn(Self) -> u8,
+                P<#rel>: Default,
+            {
+            }
+        }
+    );
+    assert_eq!(
+        entries_with_self_bound_in_predicates(&referrer, &copy, self_is_leaked),
+        ["Rel < X >"]
+    );
+    // In a position, the same entry is not in a predicate.
+    let copy: Item = parse_quote!(
+        impl S {
+            fn m<X>(&self, a0: P<#rel>)
+            where
+                X: Fn(Self) -> u8,
+            {
+            }
+        }
+    );
+    assert!(entries_with_self_bound_in_predicates(&referrer, &copy, self_is_leaked).is_empty());
+
+    // F20: `Self::A` is in the bound of the entry, in a trait.
+    let control: Item = parse_quote!(
+        pub trait Tr {
+            type A0;
+            fn m<X>(&self, a0: Rel<X>)
+            where
+                X: Fn(&Self::A0) -> u8;
+        }
+    );
+    let (referrer, _) = f19_copy(&control).unwrap();
+    let rel = referrer
+        .iter()
+        .position(|ty| string(ty) == "Rel < X >")
+        .unwrap();
+    let bound = |referrer: &Referrer, context: ContextId| {
+        matches!(
+            referrer.context_self(context),
+            Some(SelfRequirement::Bound(_))
+        )
+    };
+    let copy: Item = parse_quote!(
+        pub trait Tr {
+            type A0;
+            fn m<X>(&self)
+            where
+                X: Fn(&Self::A0) -> u8,
+                P<#rel>: Default;
+        }
+    );
+    assert_eq!(
+        entries_with_self_bound_in_predicates(&referrer, &copy, bound),
+        ["Rel < X >"]
+    );
+
+    // F21, F25 and F33: the bound of the entry names an `Item`.
+    let control: Item = parse_quote!(
+        pub trait Tr<T: ::p::WIter>
+        where
+            T: Fn(T::Item),
+        {
+            fn m(&self, x: Rel<T>);
+        }
+    );
+    let (referrer, _) = f19_copy_with(f13_leaker(), &control).unwrap();
+    let rel = referrer
+        .iter()
+        .position(|ty| string(ty) == "Rel < T >")
+        .unwrap();
+    let copy: Item = parse_quote!(
+        pub trait Tr<T: ::p::WIter>
+        where
+            T: Fn(T::Item),
+        {
+            fn m(&self)
+            where
+                P<#rel>: Default;
+        }
+    );
+    assert_eq!(entries_naming_item(&referrer, &copy), ["Rel < T >"]);
+    let copy: Item = parse_quote!(
+        pub trait Tr<T: ::p::WIter>
+        where
+            T: Fn(T::Item),
+        {
+            fn m(&self, x: P<#rel>);
+        }
+    );
+    assert!(entries_naming_item(&referrer, &copy).is_empty());
+
+    // F27: a bound of a generic and a bound of an `impl Trait` mention replacements.
+    let cyclic: Item = parse_quote!(
+        pub trait Tr<T: Fn(P<0usize>)> {
+            fn m(&self, x: impl Into<P<1usize>>);
+        }
+    );
+    let mut generics = EntryMentions::default();
+    generics.visit_item(&cyclic);
+    let mut impl_trait = ImplTraitMentions::default();
+    impl_trait.visit_item(&cyclic);
+    assert_eq!(generics.in_bounds.len(), 1, "{:?}", generics.in_bounds);
+    assert_eq!(impl_trait.0.len(), 1, "{:?}", impl_trait.0);
+    let control: Item = parse_quote!(
+        pub trait Tr<T: Fn(P<0usize>)> {
+            fn m(&self, x: Vec<P<1usize>>);
+        }
+    );
+    let mut impl_trait = ImplTraitMentions::default();
+    impl_trait.visit_item(&control);
+    assert!(impl_trait.0.is_empty(), "{:?}", impl_trait.0);
 }
 
 // ── F34 ──────────────────────────────────────────────────────────────────────
@@ -5548,7 +5964,7 @@ fn f33_where_predicate_names_item_that_a_predicate_in_scope_defines() {
 /// relation that the signature or the trait has with the lifetime it is given). It does not make
 /// the where clause that equates the associated type: that one is for this test.
 ///
-/// `Referrer::FORMAT_VERSION` is 7 (the contexts of these entries differ).
+/// The fix bumped `Referrer::FORMAT_VERSION` to 7 (the contexts of these entries differ); it is 8 now.
 ///
 /// The assertions, for each trait: the context of the entry has the predicate (and the ones of the
 /// context), the outlives of the components that are listed and no other, `Self: 'x` where listed,

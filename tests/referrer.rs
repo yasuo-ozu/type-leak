@@ -216,6 +216,16 @@ fn format_version_is_checked() {
         message
     );
     assert!(message.contains(&expected), "{}", message);
+    // The whole message: it ends with what to do.
+    assert_eq!(
+        message,
+        format!(
+            "this Referrer was serialized by an incompatible type-leak (format {}, expected {}): \
+             the macros which emit and parse it must use the same version of type-leak",
+            Referrer::FORMAT_VERSION + 1,
+            Referrer::FORMAT_VERSION
+        )
+    );
     // So is one of the previous format (no compatibility).
     let old = format!(
         "type-leak-format-{}",
@@ -225,13 +235,21 @@ fn format_version_is_checked() {
     // A literal which is not a tag (what a version of type-leak which had no format tag wrote:
     // its own version) is reported as such.
     let message = parse_error(quote!("0.8.0"(RelA)));
+    assert_eq!(
+        message,
+        format!(
+            "this Referrer was serialized by an incompatible type-leak (an unrecognized tag \
+             \"0.8.0\", expected {}): the macros which emit and parse it must use the same \
+             version of type-leak",
+            Referrer::FORMAT_VERSION
+        )
+    );
+    let message = parse_error(quote!("type-leak-format-"(RelA)));
     assert!(
-        message.contains("incompatible type-leak (an unrecognized tag \"0.8.0\""),
+        message.contains("an unrecognized tag \"type-leak-format-\""),
         "{}",
         message
     );
-    let message = parse_error(quote!("type-leak-format-"(RelA)));
-    assert!(message.contains("an unrecognized tag"), "{}", message);
     // The check comes first, whatever follows.
     let message = parse_error(quote!("0.0.0" 2 (RelA) (RelB)));
     assert!(message.contains("incompatible type-leak"), "{}", message);
@@ -241,15 +259,23 @@ fn format_version_is_checked() {
 fn data_without_the_format_tag_is_rejected() {
     // The data of a version without the tag does not start with a string literal at all.
     let message = parse_error(quote!((RelA)));
-    assert!(
-        message.contains(&format!(
-            "incompatible type-leak (no format tag, expected {})",
+    assert_eq!(
+        message,
+        format!(
+            "this Referrer was serialized by an incompatible type-leak (no format tag, expected \
+             {}): the macros which emit and parse it must use the same version of type-leak",
             Referrer::FORMAT_VERSION
-        )),
-        "{}",
-        message
+        )
     );
-    assert!(parse2::<Referrer>(quote!()).is_err());
+    // Nothing at all is no tag either.
+    assert_eq!(
+        parse_error(quote!()),
+        format!(
+            "this Referrer was serialized by an incompatible type-leak (no format tag, expected \
+             {}): the macros which emit and parse it must use the same version of type-leak",
+            Referrer::FORMAT_VERSION
+        )
+    );
     assert!(parse_error(quote!(2(RelA)(RelB))).contains("no format tag"));
     // The tag is accepted when it is there.
     let tag = tag();
@@ -924,17 +950,33 @@ fn malformed_associated_types_in_a_context_are_errors() {
         ok("Self : Tr ; type G < 'b > where Self : 'b ; type H where Self : 'static ; (Rel)")
             .is_ok()
     );
-    for text in [
+    let need_trait = "the associated types of a trait need `Self: Trait ;` before them";
+    let need_outlives = "an associated type needs an outlives relation in its where clause";
+    for (text, message) in [
         // The associated types are the ones of a trait: `Self` is the implementor.
-        "type G < 'b > where Self : 'b ; (Rel)",
-        "Self = S ; type G < 'b > where Self : 'b ; (Rel)",
+        ("type G < 'b > where Self : 'b ; (Rel)", need_trait),
+        (
+            "Self = S ; type G < 'b > where Self : 'b ; (Rel)",
+            need_trait,
+        ),
         // A type with no outlives is not kept.
-        "Self : Tr ; type G < 'b > ; (Rel)",
-        "Self : Tr ; type G < 'b > where Self : Clone ; (Rel)",
-        // They come before the module, and a module has no trait.
-        "Self : Tr ; mod { } ; type G < 'b > where Self : 'b ; (Rel)",
-        "type G < 'b > where Self : 'b ; mod { } ; ()",
+        ("Self : Tr ; type G < 'b > ; (Rel)", need_outlives),
+        (
+            "Self : Tr ; type G < 'b > where Self : Clone ; (Rel)",
+            need_outlives,
+        ),
+        // They come before the module, and a module has no trait. (The error "which has no trait"
+        // of a module that has associated types is not reachable: a module that has `Self : Tr ;`
+        // for them has a `Self` already, which a module does not have.)
+        (
+            "Self : Tr ; mod { } ; type G < 'b > where Self : 'b ; (Rel)",
+            "the context 0 is a module (`mod { .. }`), where `Self` has no meaning",
+        ),
+        ("type G < 'b > where Self : 'b ; mod { } ; ()", need_trait),
     ] {
-        assert!(ok(text).is_err(), "{}", text);
+        let err = ok(text)
+            .err()
+            .unwrap_or_else(|| panic!("accepted: {}", text));
+        assert_eq!(err.to_string(), message, "{}", text);
     }
 }
