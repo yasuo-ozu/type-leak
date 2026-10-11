@@ -22,11 +22,40 @@ use template_quote::{quote, ToTokens};
 /// The result of an analysis: the leaked types (the entries), ready to be emitted as Repeater
 /// impls and to be replaced in a copy.
 ///
-/// Get it from [`Leaker::finish()`](crate::Leaker::finish). In the crate that defines the item,
-/// list the entries that need a Repeater impl ([`Referrer::required()`]) and describe each impl
-/// ([`Referrer::repeater_impl()`]). A `Referrer` converts to and from tokens ([`ToTokens`] and
-/// [`Parse`], see [`Referrer::FORMAT_VERSION`]), so a macro can pass it to the macro of the crate
-/// that copies the item. There, [`Referrer::visitor()`] rewrites the copy.
+/// Get it from [`Leaker::finish()`](crate::Leaker::finish). A `Referrer` converts to and from
+/// tokens ([`ToTokens`] and [`Parse`], see [`Referrer::FORMAT_VERSION`]); both crates must use
+/// the same version of `type-leak`.
+///
+/// **In the crate that defines the item** (crate A):
+///
+/// - Emit a Repeater impl for every entry (`0..referrer.iter().count()`), not only the
+///   [`required()`](Referrer::required) ones: the crate that copies the item may use a strict
+///   Referrer ([`allow_ambiguous_crate_name(false)`](Referrer::allow_ambiguous_crate_name)), which
+///   replaces the optional entries too, and that choice is not serialized.
+/// - [`repeater_impl()`](Referrer::repeater_impl) gives the generics, the type, the first trait
+///   argument and the module of each impl (write it in that module). `ImplSelf::Param` writes it
+///   for any implementor, `ImplSelf::Marker` for a marker type; [`is_plain(ix)`](Referrer::is_plain)
+///   is true if `impl Repeater<(), ID, IX> for Marker` is enough. A const parameter that is not
+///   `usize` needs [`RepeaterSlots`](crate::RepeaterSlots).
+/// - Crate A cannot call the macro of the crate that copies the item, as it does not know its
+///   input. Export a `macro_rules!` that adds `$crate::Repeater`, the ID, the `Referrer` and the
+///   top-level [`ContextId`] to that input, and calls the proc macro that reads them back
+///   (`examples/two-macros` in the repository).
+///
+/// **In the crate that copies the item** (crate B):
+///
+/// - [`visitor(top_level, ..)`](Referrer::visitor) replaces each entry in the copy. Visit a
+///   whole item or signature, not a type cut out of another. Only the entries are replaced: the
+///   rest of the copy (e.g. `T` in `impl Tr<u8>`) is yours to write.
+/// - Build each path with [`entry_args(ix, &site)`](Referrer::entry_args):
+///   [`UseSite::identity()`](crate::UseSite::identity) where the copy declares the generics of the
+///   item itself, [`UseSite::substituting(..)`](crate::UseSite::substituting) for
+///   `impl Tr<u8> for ..`. Omitted defaults of the trait's parameters:
+///   [`complete_args()`](Referrer::complete_args).
+/// - Repeater impls for a marker type: [`Visitor::with_self()`]. Items nested in a module that
+///   name their own `Self`: [`Visitor::with_nested_self()`]. A copy that declares the generics
+///   with other bounds: [`Visitor::with_outermost_generics_as_leakers()`]
+///   ([Contexts](crate::rules#contexts)).
 ///
 /// ```
 /// # use type_leak::*;

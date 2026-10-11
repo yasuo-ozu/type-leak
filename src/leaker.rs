@@ -32,6 +32,22 @@ use template_quote::quote;
 /// what it analyzed (its top-level context), or fails with a [`NotInternableError`] that says
 /// which paths must be absolute. See the [quick start](crate#quick-start).
 ///
+/// - **A whole item**: [`intern_struct`](Leaker::intern_struct), `intern_enum`, `intern_union`,
+///   `intern_impl` and `intern_trait` take `(&item, allow_self)`; [`intern_mod`](Leaker::intern_mod)
+///   takes a module (its nested modules: [`Referrer::module_path()`]). With `allow_self = false`, a
+///   type that names `Self` is split into parts instead of being leaked whole: use it when your
+///   Repeater impls are for a marker type, which cannot name `Self`
+///   ([Self rules](crate::rules#self-rules)).
+/// - **Part of an item**: [`enter_impl`](Leaker::enter_impl), `enter_generics`, `enter_type`,
+///   `enter_trait` and `enter_mod` declare the generics and `Self` of a scope, and run a closure on
+///   its [`View`]: `view.visit_type(..)`, `visit_path_arguments(..)`, `visit_where_clause(..)`. A
+///   scope that fails forgets what it found, and the scope around it can go on
+///   ([Scopes](crate::rules#scopes)).
+/// - **Paths that are not leaked**: [`LeakerConfig`] (`allow_primitive()`, `allow_std_prelude()`,
+///   your own crates). Without `allow_std_prelude()`, `trait Tr: Clone` is an error.
+/// - **Errors**: report each offending path at its span with [`NotInternableError::items()`]. The
+///   messages and their fixes are listed in [the rules](crate::rules#errors-and-how-to-fix-them).
+///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
