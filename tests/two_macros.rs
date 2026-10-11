@@ -43,7 +43,7 @@ fn the_example_builds_and_its_wrappers_forward() {
     assert!(stdout.contains("test result: ok. 2 passed"), "{}", stdout);
 }
 
-/// `#[export_trait]` reports each path that cannot be leaked at its own span.
+/// `#[export_trait]` reports each path that cannot be leaked at its own span, with what to write.
 #[test]
 fn the_example_reports_what_cannot_be_exported() {
     let Some((success, _, stderr)) = cargo(&["check", "-p", "repo", "--features", "bad"]) else {
@@ -61,4 +61,15 @@ fn the_example_reports_what_cannot_be_exported() {
         stderr
     );
     assert!(stderr.contains("repo/lib.rs:50:16"), "{}", stderr);
+    // The help says what to write.
+    assert!(
+        stderr.contains("help: use `::core::clone::Clone` instead of `Clone`"),
+        "{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("help: write `Record` with an absolute path"),
+        "{}",
+        stderr
+    );
 }

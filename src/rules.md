@@ -5,32 +5,7 @@ documentation](crate) is the user guide: start there. It defines the terms used 
 (analysis) and *Referrer* (copy) sides, *leaked types* and *entries*, the *Repeater*, and the
 *context* of an entry ([How it works](crate#how-it-works)).
 
-# Errors and how to fix them
-
-The Leaker returns the first group itself. The `rustc` errors come from the generated code, if a rule was not met.
-
-| Message or error | Fix | Rule |
-| --- | --- | --- |
-| `use absolute path: 'Clone'` | A relative path that cannot be leaked (a trait in a bound, `MyType<'_>`, `impl Trait`): write it in full, `::core::clone::Clone`, or allow it. The notes say why. | [Contexts](#contexts) |
-| `` `Self` has no meaning here `` | Enter a scope that declares `Self` (`enter_type`, `enter_impl`, `enter_trait`). | [Self rules](#self-rules) |
-| `` `Self::A` cannot be written in the impl of the Repeater `` | Name the trait: `<Self as ::path::Trait>::A`. | [Self rules](#self-rules) |
-| `` the bound of `T` mentions a `Self` which has no name here `` | Write the bound without `Self`, or the type with an absolute path. | [Self rules](#self-rules) |
-| `` `S<T>` is in the self type of the impl, and a bound of its generics names `Self` `` | Write the self type with an absolute path, or the bounds without `Self`. | [Self rules](#self-rules) |
-| `` `Wrap<T>` has a generic whose bound mentions `Self`, which cannot be leaked `` | Write the bound without `Self`, or use `allow_self = true`. | [Self rules](#self-rules) |
-| `` `Wrap<T>` is in the default of a parameter, and names `Self` `` | Write the default without `Self`. | [Self rules](#self-rules) |
-| `` `Wrap<T>` is in a bound or where predicate, and a bound of its generics names .. `` | Write the type of the bound with an absolute path, or use the type outside predicates. | [Bounds](#bounds-that-name-leaked-types) |
-| `` `Wrap<'x>` leaves the lifetime `'x` of the method unconstrained in the copy (E0195) `` | Keep `'x` in another argument, or make the path absolute. | [Method lifetimes](#method-lifetimes) |
-| rustc E0309 | Write the bound: `T: 'a`, or `where Self: 'a`. | [Outlives bounds](#outlives-bounds) |
-| rustc E0106 | Name the lifetimes, give the method a receiver, or make the path absolute. | [Elided lifetimes](#elided-lifetimes) |
-| rustc E0581, E0582 | Keep an input that names the `for<'x>` lifetime. | [Binder lifetimes](#binder-lifetimes) |
-| rustc E0478 on `dyn Trait + 'a` | Write `&'a dyn Trait`, or make the trait path absolute. | [Trait objects](#trait-objects) |
-| rustc E0277, E0271, E0275, E0284 in a bound | The bound names a type that rustc normalizes in another form. | [Bounds](#bounds-that-name-leaked-types) |
-| a constant is read as a type | Write `{ ::my_crate::MY_CONST }`. | [Bare identifiers](#bare-identifiers-and-consts) |
-| a type is not replaced in the copy | Visit the whole item, and declare the generics as the entry has them. | [Contexts](#contexts) |
-| a type that names `Self` is not replaced in a struct, trait or impl nested in a module | Call `Visitor::with_nested_self()` and write the type of the item in the Leaker's crate. | [Self rules](#self-rules) |
-| "incompatible type-leak" when parsing | Use the same version of `type-leak` on both sides. | |
-| panic in `visitor()` or `expand()` | Pass the `ContextId` that the analysis returned for the item. | [Contexts](#contexts) |
-
+An error of the Leaker ([`NotInternableError`](crate::NotInternableError)) says what is wrong (the message), why (the notes) and what to write instead (the help, `= help: ..` in rustc's layout): see [`ErrorItem`](crate::ErrorItem). A `rustc` error in the generated code means that a rule was not met: the section of its rule has the fix (E0309: [Outlives bounds](#outlives-bounds), E0106: [Elided lifetimes](#elided-lifetimes), E0581 and E0582: [Binder lifetimes](#binder-lifetimes), E0478: [Trait objects](#trait-objects), E0277, E0271, E0275 and E0284 in a bound: [Bounds](#bounds-that-name-leaked-types), a constant read as a type: [Bare identifiers](#bare-identifiers-and-consts)).
 
 # What cannot be leaked
 
@@ -191,11 +166,12 @@ The top-level context:
 How the Referrer finds an entry:
 
 - A type is replaced if its context, computed from the generics in scope, is the context of an entry. The generics in scope are those of `context`, then those that the visited syntax declares.
-- A name that neither declares is not a generic, so it is not matched. The Referrer does not guess which generics are the Leaker's.
+- A name that neither declares is not a generic, so it is not matched. The Referrer does not guess which generics are the Leaker's. If a type of the copy is not replaced, visit the whole item (not a type cut out of it), and declare the generics as the entry has them, with the same bounds.
 - If no entry has exactly the context, an entry that has bounds on `Self` alone besides (`where Self: Sized`) is taken. A copy where `Self` is a type parameter (`Visitor::with_self()`) cannot write them.
 - An outermost item that declares exactly the generics of `context` (the copy of the item itself) does not declare them again.
 - If the copy declares them with other bounds (`impl<T: Clone> MyLeaker<T> for ..`), call `Visitor::with_outermost_generics_as_leakers()`.
 - `Referrer::expand()` knows only the generics of `context`. It does not find a type that names a generic of a method: visit the signature.
+- `Referrer::visitor()`, `expand()` and the other methods that take a `ContextId` panic if the Referrer does not have it. Pass the id that `intern_*` or the scope returned for the item.
 
 # Which types become entries
 
@@ -281,8 +257,9 @@ With `allow_self = true`:
 - A type that names `Self` is one entry, written for the implementor or the type.
 - In the impl for the implementor, `Self` is `__S`. Take the type and generics of a `Bound` entry from `Referrer::iter_with_self()` with `__S` (`Referrer::repeater_impl()` does it). `Self::Item` becomes `<__S>::Item`, and `Self: Sized` becomes `__S: Sized`.
 - The copy uses `<Self as Repeater<..>>::Type`, where `Self` is the implementor. So the impl in the other crate must provide the associated types that the type uses (`type Item = u8;`).
-- `Self::A` cannot be in an entry if `Self` is a type (an impl, a struct, an enum or a union). The Repeater impl for the type has no trait to take `A` from (E0220). So a type that names it is never leaked whole, only its parts are. That is an error where the whole type must be leaked (`Rel<Self::A>`). The same holds if a bound of the generics of an entry names it.
-- Instead, name the trait: `<Self as ::path::Trait>::A`. A type that needs no leaking is copied as written, so `Vec<Self::A>` is fine. `Self::A` in a trait is fine too, because the Repeater impl of a trait is for the implementor.
+- `Self::A` cannot be in an entry if `Self` is a type (an impl, a struct, an enum or a union). `Self::A` is shorthand that rustc resolves through the trait of the impl. The Repeater impl for the type has no such trait to take `A` from (E0220, or E0223 ambiguous associated type if the copy writes the type for `Self`). So a type that names it is never leaked whole, only its parts are. That is an error where the whole type must be leaked (`Rel<Self::A>`). The same holds if a bound of the generics of an entry names it.
+- Instead, write the trait out: `<Self as ::path::Trait>::A`. The error gives it with your tokens. In an impl of a trait it is the trait of the impl: "write `<Self as ::p::Tr>::A` instead of `Self::A` in `Rel<Self::A>`". If the path of that trait is relative (`Tr`), the help writes it `<Self as ::my_crate::Tr>::A`, with `Tr` written as an absolute path: the copy cannot resolve `Tr` either, so the path of the trait is an error of its own, as in a bound. For a struct, an enum, a union or an inherent impl the Leaker does not know the trait, and the help says `<Self as SomeTrait>::A`: name the trait that defines `A`, with its absolute path. For an item of a supertrait, name the supertrait.
+- A type that needs no leaking is copied as written, so `Vec<Self::A>` is fine. `Self::A` in a trait is fine too, because the Repeater impl of a trait is for the implementor.
 
 With `allow_self = false`:
 
@@ -521,7 +498,7 @@ fn f(x: &dyn RelTrait);          // error: elided lifetime
 fn f<'a>(x: &'a dyn RelTrait);   // good: the whole reference is leaked
 ```
 
-Instead, name the lifetime, make the trait path absolute, or write the bound: `&'a (dyn RelTrait + 'a)`.
+Instead, name the lifetime, make the trait path absolute, or write the bound: `&'a (dyn RelTrait + 'a)`. If rustc rejects a bound you wrote (E0478, for a trait that has a bound of its own), write `&'a dyn RelTrait` instead, or make the trait path absolute.
 
 # Bounds that name leaked types
 
@@ -569,7 +546,7 @@ It is an error for a type in a bound or where predicate of the item or of a meth
   - The Leaker does not choose a type of the self type as an entry for its parts if its generics have an unstable bound. `impl<T: Fn(Rel2), U> Tr<U> for ::p::W<T, Rel<U>> where Self: Clone` has the entries `Rel2` and `Rel<U>`, not `::p::W<T, Rel<U>>`, whose bound `T: Fn(Rel2)` is unstable. It is an error only for a type that must be an entry.
 - The type is a leaked type that names `Self` of a trait, in a predicate of the trait itself (its where clause, a bound of its generics or a supertrait), not in one of a method: `trait Tr where Rel<Self>: Sized`. The Repeater's impl for it is for the implementors of the trait, so proving that the host of the copy implements the trait needs the predicate, which names the type.
 
-The error names the type and the bound. Instead, write the type of the bound with an absolute path (`T: Fn(::my_crate::Rel)`), write the bound without what it names, or use the type outside of the predicates (in a field or a signature).
+The error names the type and the bound. Instead, write the type of the bound with an absolute path (`T: Fn(::my_crate::Rel)`), write the bound without what it names, or use the type outside of the predicates (in a field or a signature). The same fixes apply if rustc rejects a bound of the copy (E0277, E0271, E0275 or E0284) that the Leaker did not reject: the bound names a type that rustc normalizes in another form.
 
 Two things are not errors:
 

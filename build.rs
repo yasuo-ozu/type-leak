@@ -1,5 +1,5 @@
-//! Detects whether `proc_macro::Diagnostic` (nightly) is available, to render the note of a
-//! `NotInternableError` as a note of the diagnostic with its own span.
+//! Detects whether `proc_macro::Diagnostic` (nightly) is available, to render the notes and the help
+//! of a `NotInternableError` as those of the diagnostic with their own spans.
 
 use std::env;
 use std::path::PathBuf;
@@ -11,6 +11,7 @@ extern crate proc_macro;
 pub fn probe(span: proc_macro::Span) {
     proc_macro::Diagnostic::spanned(span, proc_macro::Level::Error, "error")
         .span_note(span, "note")
+        .span_help(span, "help")
         .emit();
 }
 "#;

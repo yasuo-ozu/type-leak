@@ -1,8 +1,9 @@
 //! Checks how rustc renders a `NotInternableError` emitted by a proc macro with its `ToTokens`
 //! implementation, by building `tests/crates/diagnostic` (which fails to compile).
 //!
-//! On nightly, the note is a note of the diagnostic with its own span and source preview; on
-//! stable, it is appended to the message.
+//! On nightly, the notes and the help are those of the diagnostic, each with its own span and
+//! source preview; on stable, they are appended to the message (`= note: ..`, then `= help: ..`, as
+//! rustc writes its own).
 //!
 //! The fixture has the errors of
 //!
@@ -36,6 +37,8 @@ struct Reported {
     at: String,
     /// The notes of the diagnostic (rustc's own, such as the origin of an error, excluded).
     notes: Vec<String>,
+    /// The helps of the diagnostic.
+    helps: Vec<String>,
 }
 
 /// The text without the whitespace at the end of each line.
@@ -62,6 +65,7 @@ fn reported(stderr: &str) -> Vec<Reported> {
         }
         let mut at = String::new();
         let mut notes = Vec::new();
+        let mut helps = Vec::new();
         while let Some(next) = lines.peek() {
             if next.starts_with("error") || next.starts_with("warning") {
                 break;
@@ -78,21 +82,29 @@ fn reported(stderr: &str) -> Vec<Reported> {
             if let Some(note) = note.filter(|n| !n.starts_with("this error originates")) {
                 notes.push(note.to_string());
             }
+            let help = next
+                .strip_prefix("= help: ")
+                .or_else(|| next.strip_prefix("help: "));
+            if let Some(help) = help {
+                helps.push(help.to_string());
+            }
         }
         errors.push(Reported {
             headline: squash(line),
             at,
             notes,
+            helps,
         });
     }
     errors
 }
 
-fn error(headline: &str, at: &str, notes: &[&str]) -> Reported {
+fn error(headline: &str, at: &str, notes: &[&str], helps: &[&str]) -> Reported {
     Reported {
         headline: squash(&format!("error: {}", headline)),
         at: at.to_string(),
         notes: notes.iter().map(|note| note.to_string()).collect(),
+        helps: helps.iter().map(|help| help.to_string()).collect(),
     }
 }
 
@@ -107,6 +119,7 @@ fn format_error(found: &str, at: &str) -> Reported {
         ),
         at,
         &[],
+        &[],
     )
 }
 
@@ -115,7 +128,7 @@ fn note_is_rendered() {
     let stderr = build_fixture();
     let expected: &[&str] = if nested::rustc_is_nightly() {
         &[
-            // The note has its own span: the first segment of the offending path.
+            // The help has its own span: the first segment of the offending path.
             "\
 error: use absolute path: 'Clone'
  --> lib.rs:2:20
@@ -123,33 +136,28 @@ error: use absolute path: 'Clone'
 2 | pub trait Prelude: Clone {}
   |                    ^^^^^
   |
-note: use `::core::clone::Clone` instead of `Clone`
+help: use `::core::clone::Clone` instead of `Clone`
  --> lib.rs:2:20
   |
 2 | pub trait Prelude: Clone {}
   |                    ^^^^^
 ",
-            // The error spans the whole bound, while the note spans `Fn`.
+            // The error spans the whole bound, while the help spans `Fn`.
             "
  --> lib.rs:5:18
   |
 5 | pub trait Bound: for<'a> Fn(&'a u8) {}
   |                  ^^^^^^^^^^^^^^^^^^
   |
-note: use `::core::ops::Fn` instead of `Fn`
+help: use `::core::ops::Fn` instead of `Fn`
  --> lib.rs:5:26
   |
 5 | pub trait Bound: for<'a> Fn(&'a u8) {}
   |                          ^^
 ",
             // Each note has its own span: why the type cannot be leaked as a whole, and the other
-            // paths inside it.
+            // paths inside it. The help comes last.
             "\
-note: use `::std::boxed::Box` instead of `Box`
- --> lib.rs:9:20
-  |
-9 |     fn f(&self, x: Box<dyn RelA + RelB<'_>>);
-  |                    ^^^
 note: it cannot be leaked as a whole because of `'_`
  --> lib.rs:9:40
   |
@@ -165,6 +173,11 @@ note: `RelB < '_ >` also depends on the type context
   |
 9 |     fn f(&self, x: Box<dyn RelA + RelB<'_>>);
   |                                   ^^^^^^^^
+help: use `::std::boxed::Box` instead of `Box`
+ --> lib.rs:9:20
+  |
+9 |     fn f(&self, x: Box<dyn RelA + RelB<'_>>);
+  |                    ^^^
 ",
         ]
     } else {
@@ -172,7 +185,7 @@ note: `RelB < '_ >` also depends on the type context
             "\
 error: use absolute path: 'Clone'
 
-         = note: use `::core::clone::Clone` instead of `Clone`
+         = help: use `::core::clone::Clone` instead of `Clone`
 
  --> lib.rs:2:20
   |
@@ -180,17 +193,18 @@ error: use absolute path: 'Clone'
   |                    ^^^^^
 ",
             "
-         = note: use `::core::ops::Fn` instead of `Fn`
+         = help: use `::core::ops::Fn` instead of `Fn`
 
  --> lib.rs:5:18
 ",
+            // The notes (why) come first, then the help (what to write).
             "\
 error: use absolute path: 'Box < dyn RelA + RelB < '_ > >'
 
-         = note: use `::std::boxed::Box` instead of `Box`
          = note: it cannot be leaked as a whole because of `'_`
          = note: `RelA` also depends on the type context
          = note: `RelB < '_ >` also depends on the type context
+         = help: use `::std::boxed::Box` instead of `Box`
 
  --> lib.rs:9:20
 ",
@@ -218,25 +232,34 @@ fn every_offending_path_is_an_error_of_its_own() {
     let stderr = build_fixture();
     let got = reported(&stderr);
 
-    let clone_note = "use `::core::clone::Clone` instead of `Clone`";
+    let clone_help = "use `::core::clone::Clone` instead of `Clone`";
     let because = "it cannot be leaked as a whole because of `'_`";
     let self_note = "`Self` has no meaning here: it is declared only by a struct, an enum, a union, an impl or a trait, not by a module or generics";
+    let self_help = "write the type instead of `Self`, or enter a scope that declares `Self` around it (`Leaker::enter_type`, `enter_impl` or `enter_trait`)";
     let expected_notes_of_multi = [
-        error("use absolute path: 'Clone'", "14:18", &[clone_note]),
+        error("use absolute path: 'Clone'", "14:18", &[], &[clone_help]),
         error(
             "use absolute path: 'Send'",
             "14:26",
+            &[],
             &["use `::core::marker::Send` instead of `Send`"],
         ),
-        error("use absolute path: 'MyType < '_ >'", "15:20", &[because]),
+        error(
+            "use absolute path: 'MyType < '_ >'",
+            "15:20",
+            &[because],
+            &["write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with `LeakerConfig::allowed_paths`"],
+        ),
         error(
             "use absolute path: 'Other < '_, :: core :: primitive :: u8 >'",
             "15:35",
             &[because],
+            &["write `Other` with an absolute path (e.g. `::my_crate::Other`), or allow it with `LeakerConfig::allowed_paths`"],
         ),
         error(
             "use absolute path: 'Sync'",
             "16:13",
+            &[],
             &["use `::core::marker::Sync` instead of `Sync`"],
         ),
     ];
@@ -254,24 +277,35 @@ fn every_offending_path_is_an_error_of_its_own() {
     // Every error of the fixture, and no other: the three single ones, the five of `Multi`, the two
     // mentions of `Self`, and the four unreadable Referrers.
     let mut expected = vec![
-        error("use absolute path: 'Clone'", "2:20", &[clone_note]),
+        error("use absolute path: 'Clone'", "2:20", &[], &[clone_help]),
         error(
             "use absolute path: 'for < 'a > Fn(& 'a u8)'",
             "5:18",
+            &[],
             &["use `::core::ops::Fn` instead of `Fn`"],
         ),
         error(
             "use absolute path: 'Box < dyn RelA + RelB < '_ > >'",
             "9:20",
             &[
-                "use `::std::boxed::Box` instead of `Box`",
                 because,
                 "`RelA` also depends on the type context",
                 "`RelB < '_ >` also depends on the type context",
             ],
+            &["use `::std::boxed::Box` instead of `Box`"],
         ),
-        error("`Self` has no meaning here", "22:29", &[self_note]),
-        error("`Self` has no meaning here", "22:38", &[self_note]),
+        error(
+            "`Self` has no meaning here",
+            "22:29",
+            &[self_note],
+            &[self_help],
+        ),
+        error(
+            "`Self` has no meaning here",
+            "22:38",
+            &[self_note],
+            &[self_help],
+        ),
         format_error("format 7", "33:1"),
         format_error("format 9", "39:1"),
         format_error("no format tag", "45:1"),

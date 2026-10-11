@@ -55,6 +55,14 @@ fn rejected(item: Item) -> (String, Option<String>) {
     (err.to_string(), err.note())
 }
 
+/// The help of the error, as `rejected()` gives the headline and the note.
+fn help_of(item: Item) -> String {
+    match leak(item) {
+        Ok(referrer) => panic!("not rejected: {:?}", entries(&referrer)),
+        Err(err) => err.help().expect("a help"),
+    }
+}
+
 const HEADLINE: &str =
     "is in a bound or where predicate, and a bound of its generics names a leaked type";
 
@@ -112,26 +120,38 @@ fn an_entry_in_a_predicate_whose_generic_has_a_leaked_bound_is_rejected() {
         ),
     ];
     for item in items {
+        let item: Item = item;
         let text = s(&item);
+        let help = help_of(item.clone());
         let (headline, note) = rejected(item);
         assert!(headline.contains(HEADLINE), "{}: {}", text, headline);
         let note = note.unwrap();
+        // The note says why, and the help says what to write.
         assert!(
-            note.contains("rustc cannot normalize") && note.contains("absolute path"),
+            note.contains("rustc cannot normalize"),
             "{}: {}",
             text,
             note
+        );
+        assert!(
+            help.starts_with("write the leaked type of the bound with an absolute path, or use `")
+                && help.ends_with("` outside the bounds and where predicates"),
+            "{}: {}",
+            text,
+            help
         );
     }
 }
 
 #[test]
 fn the_error_names_the_type_and_the_bound() {
-    let (headline, note) = rejected(parse_quote!(
+    let item: Item = parse_quote!(
         pub struct S<T: Fn(Rel)>(Wrap<T>)
         where
             Wrap<T>: Sized;
-    ));
+    );
+    let help = help_of(item.clone());
+    let (headline, note) = rejected(item);
     assert_eq!(
         headline,
         "`Wrap < T >` is in a bound or where predicate, and a bound of its generics names a leaked type"
@@ -142,10 +162,10 @@ fn the_error_names_the_type_and_the_bound() {
         "{}",
         note
     );
-    assert!(
-        note.contains("use `Wrap < T >` outside the bounds"),
-        "{}",
-        note
+    assert_eq!(
+        help,
+        "write the leaked type of the bound with an absolute path, or use `Wrap<T>` outside the \
+         bounds and where predicates"
     );
 }
 
@@ -630,7 +650,9 @@ fn a_bound_that_names_an_associated_type_that_rustc_normalizes_is_unstable() {
                 Wrap<G>: Sized;
         ),
     ] {
+        let item: Item = item;
         let text = s(&item);
+        let help = help_of(item.clone());
         let (headline, note) = unstable(item);
         assert!(
             headline.contains("a bound of its generics names `"),
@@ -639,11 +661,16 @@ fn a_bound_that_names_an_associated_type_that_rustc_normalizes_is_unstable() {
             headline
         );
         assert!(
-            note.contains("rustc normalizes in the impl of the Repeater")
-                && note.contains("Write the bound without `"),
+            note.contains("rustc normalizes in the impl of the Repeater"),
             "{}: {}",
             text,
             note
+        );
+        assert!(
+            help.starts_with("write the bound without `") && help.contains("`, or use `"),
+            "{}: {}",
+            text,
+            help
         );
     }
     // The `Item` of an iterator that nothing equates is rigid, and so is the one of a generic that
@@ -713,7 +740,7 @@ fn self_and_its_associated_types_in_a_bound_are_unstable() {
         note
     );
     // F20: the bound names `Self::A0` of a trait.
-    let (headline, note) = unstable(parse_quote!(
+    let item: Item = parse_quote!(
         pub trait Tr {
             type A0;
             fn m<X>(&self)
@@ -721,16 +748,18 @@ fn self_and_its_associated_types_in_a_bound_are_unstable() {
                 X: Fn(&Self::A0) -> u8,
                 Rel<X>: Default;
         }
-    ));
+    );
+    let help = help_of(item.clone());
+    let (headline, _note) = unstable(item);
     assert!(
         headline.ends_with("a bound of its generics names `Self :: A0`"),
         "{}",
         headline
     );
-    assert!(
-        note.contains("Write the bound without `Self :: A0`"),
-        "{}",
-        note
+    assert_eq!(
+        help,
+        "write the bound without `Self::A0`, or use `Rel<X>` outside the bounds and where \
+         predicates"
     );
     // The self type is not leaked, or the entry is in a position, or `Self` is the struct, which
     // the copy declares itself.
@@ -1161,7 +1190,7 @@ fn the_standard_traits_do_not_define_an_associated_type() {
 }
 
 /// rules.md, Bounds that name leaked types: `Self::A` in a bound of the impl is not written in the
-/// copy: "the impl of the Repeater for that type has no trait to take it from". Audit mutant
+/// copy: the headline says to write the trait out, `<Self as ::p::Tr>::A`. Audit mutant
 /// `s_selfassoc_bounds_off` (only the other error of the item remains).
 #[test]
 fn self_assoc_in_a_bound_of_an_impl_cannot_be_written_in_the_repeater() {
@@ -1175,7 +1204,8 @@ fn self_assoc_in_a_bound_of_an_impl_cannot_be_written_in_the_repeater() {
     assert_eq!(
         headlines,
         [
-            "`Self :: A` cannot be written in the impl of the Repeater",
+            "write `<Self as ::p::Tr>::A` instead of `Self::A` in a bound of the generics of \
+             `Rel<T>`: the copy cannot tell which trait `A` comes from",
             "`Self :: A` is in a bound or where predicate, and a bound of its generics names \
              `Self :: A`"
         ]

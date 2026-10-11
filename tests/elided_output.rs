@@ -67,12 +67,27 @@ fn error(item: ItemTrait) -> (String, String) {
     (err.to_string(), err.note().unwrap())
 }
 
+/// The help of the error of a trait.
+fn help(item: &ItemTrait) -> String {
+    match analyze(item) {
+        Ok(_) => panic!("{} is accepted", s(item)),
+        Err(err) => err.help().unwrap(),
+    }
+}
+
 /// The note of the error where nothing holds the signature.
 const NOTE: &str = "the output `& u8` has an elided lifetime, which elision takes from the only \
                     lifetime of the inputs, but a leaked type in the inputs has `'a` among its \
                     generics, and the copy names it in the arguments of its projection, so the \
-                    inputs have more than one lifetime (E0106): name the lifetime of the inputs \
-                    and of the output";
+                    inputs have more than one lifetime (E0106)";
+
+/// What to write for the error of `NOTE` in `Fn(..)` or a function pointer.
+const HELP: &str = "name the lifetime of the inputs and of the output, or write `Rel<T>` with an \
+                    absolute path";
+
+/// What to write for the error of `NOTE` in a method: it can have a receiver too.
+const HELP_METHOD: &str = "name the lifetime of the inputs and of the output, give the method a \
+                           receiver (`&self`), or write `Rel<T>` with an absolute path";
 
 /// The note of the error where the holder cannot be leaked.
 const NOTE_OWNED: &str = "the output `& u8` has an elided lifetime, which elision takes from the \
@@ -385,6 +400,7 @@ fn a_method_with_no_lifetime_from_its_receiver_is_an_error() {
         let (message, note) = error(item.clone());
         assert_eq!(message, "use absolute path: 'Rel < T >'", "{}", s(&item));
         assert_eq!(note, NOTE, "{}", s(&item));
+        assert_eq!(help(&item), HELP_METHOD, "{}", s(&item));
     }
     // Another output with an elided lifetime.
     for (item, output) in [
@@ -414,8 +430,8 @@ fn a_method_with_no_lifetime_from_its_receiver_is_an_error() {
         syn::Error::from(err).to_string(),
         format!(
             "use absolute path: 'Rel < T >'\n\n  = note: {}\n  = note: it cannot be leaked as a \
-             whole because of `& u8`\n",
-            NOTE
+             whole because of `& u8`\n  = help: {}\n",
+            NOTE, HELP_METHOD
         )
     );
     // A function item of a module has no receiver either.
@@ -447,6 +463,7 @@ fn a_bound_with_the_elision_is_an_error() {
         let (message, note) = error(item.clone());
         assert_eq!(message, "use absolute path: 'Rel < T >'", "{}", s(&item));
         assert_eq!(note, NOTE, "{}", s(&item));
+        assert_eq!(help(&item), HELP, "{}", s(&item));
     }
     // No lifetime in the entry, or no elision: fine.
     assert_eq!(
@@ -479,9 +496,8 @@ fn a_holder_that_cannot_be_leaked_is_an_error() {
         format!(
             "use absolute path: 'Rel < T >'\n\n  = note: {}\n  = note: it cannot be leaked as a \
              whole because of `dyn Fn (& Rel < T >) -> & u8`\n  = note: the lifetime of the trait \
-             object defaults to that of the enclosing reference or path; name it (e.g. `&'a dyn \
-             Trait` or `dyn Trait + 'a`)\n",
-            NOTE_OWNED
+             object defaults to that of the enclosing reference or path\n  = help: {}\n",
+            NOTE_OWNED, HELP
         )
     );
     // Naming it is the fix.

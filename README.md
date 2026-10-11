@@ -102,5 +102,5 @@ In real macros, crate A passes `referrer` and `top_level` to crate B as tokens (
   - [`Referrer`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html), its result: [`repeater_impl`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.repeater_impl) in crate A, [`visitor`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.visitor) and [`entry_args`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.entry_args) in crate B.
   - [`repeater_definition`](https://docs.rs/type-leak/latest/type_leak/fn.repeater_definition.html), which generates the Repeater trait.
   - [`NotInternableError`](https://docs.rs/type-leak/latest/type_leak/enum.NotInternableError.html), for reporting errors from your macro.
-- [Rules](https://docs.rs/type-leak/latest/type_leak/rules/index.html): the error messages and how to fix them, what cannot be leaked, and the exact rules.
+- [Rules](https://docs.rs/type-leak/latest/type_leak/rules/index.html): what cannot be leaked, and the exact rules. An error of the Leaker carries a `help` that says what to write instead (`ErrorItem::help`), besides the notes that say why.
 - [`examples/two-macros`](https://github.com/yasuo-ozu/type-leak/tree/main/examples/two-macros): a complete, tested pair of proc macros.

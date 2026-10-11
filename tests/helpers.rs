@@ -893,15 +893,30 @@ fn items_has_every_offending_path() {
             .collect::<Vec<_>>(),
         ["Clone", "MyBound", "MyType < '_ >"]
     );
+    // The help says what to write, the notes why.
     assert_eq!(
-        items[0].note(),
+        items[0].help_text(),
         Some("use `::core::clone::Clone` instead of `Clone`")
     );
+    assert_eq!(
+        items[1].help_text(),
+        Some(
+            "write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it \
+             with `LeakerConfig::allowed_paths`"
+        )
+    );
+    assert!(items[2]
+        .help_text()
+        .unwrap()
+        .starts_with("write `MyType` with an absolute path"));
+    assert!(items.iter().all(|item| item.help.is_some()));
+    assert_eq!(items[0].note(), None);
     assert_eq!(items[1].note(), None);
     assert!(items[2].note().unwrap().contains("because of `'_`"));
-    assert_eq!(items[0].notes.len(), 1);
+    assert_eq!(items[2].notes.len(), 1);
     // The first is what the first-error accessors tell.
-    assert_eq!(err.note().as_deref(), items[0].note());
+    assert_eq!(err.note(), None);
+    assert_eq!(err.help().as_deref(), items[0].help_text());
     let _ = err.span();
     // Display is the messages, and `syn::Error` has one error for each.
     assert_eq!(
@@ -937,6 +952,10 @@ fn items_of_self_without_meaning() {
             .note()
             .unwrap()
             .starts_with("`Self` has no meaning here: it is declared only"));
+        assert!(item
+            .help_text()
+            .unwrap()
+            .starts_with("write the type instead of `Self`, or enter a scope that declares"));
     }
 }
 

@@ -24,7 +24,7 @@
 //! normalizes it with that predicate, which names the type whose impl needs the predicate, so the
 //! impl overflows (E0275) while it proves its own predicate.
 
-use crate::util::{ident_name, unwrap_type_group};
+use crate::util::{ident_name, tidy_str, unwrap_type_group};
 use proc_macro2::TokenStream;
 use syn::visit::Visit;
 use syn::*;
@@ -79,12 +79,12 @@ impl Why {
         }
     }
 
-    /// How to write the bound, for the note of the error.
+    /// How to write the bound, for the help of the error.
     pub(crate) fn advice(&self) -> String {
         match self {
-            Why::SelfType => "Write the bound without `Self`".to_string(),
+            Why::SelfType => "write the bound without `Self`".to_string(),
             Why::SelfAssoc(path) | Why::Projection(path) => {
-                format!("Write the bound without `{}`", path)
+                format!("write the bound without `{}`", tidy_str(path))
             }
         }
     }

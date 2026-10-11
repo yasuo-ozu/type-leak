@@ -242,21 +242,21 @@ fn limit_shadowed_primitive() {
 // ── error messages ───────────────────────────────────────────────────────────
 
 /// Runs a Leaker with the default configuration (no allowed paths), returning the error message
-/// and note.
+/// and help.
 fn leak_error_default(item_trait: &ItemTrait) -> Option<(String, Option<String>)> {
     let mut leaker = Leaker::new();
     leaker
         .intern_trait(item_trait, true)
         .err()
-        .map(|e| (e.to_string(), e.note()))
+        .map(|e| (e.to_string(), e.help()))
 }
 
-fn error(message: &str, note: Option<&str>) -> Option<(String, Option<String>)> {
-    Some((message.to_string(), note.map(str::to_string)))
+fn error(message: &str, help: Option<&str>) -> Option<(String, Option<String>)> {
+    Some((message.to_string(), help.map(str::to_string)))
 }
 
 #[test]
-fn note_suggests_absolute_prelude_path() {
+fn help_suggests_absolute_prelude_path() {
     // A prelude trait in a bound, without `allow_std_prelude()`.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait {
@@ -315,7 +315,7 @@ fn note_suggests_absolute_prelude_path() {
 }
 
 #[test]
-fn note_suggests_absolute_primitive_path() {
+fn help_suggests_absolute_primitive_path() {
     // A primitive in a const expression of a bound, without `allow_primitive()`.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait: ::my_crate::Sup<{ usize::MAX }> {}
@@ -331,15 +331,21 @@ fn note_suggests_absolute_primitive_path() {
 }
 
 #[test]
-fn no_note() {
-    // Not a prelude item or a primitive.
+fn help_for_a_path_that_is_not_in_the_prelude() {
+    // Not a prelude item or a primitive: how to write the path.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait: MyBound {}
     })
     .unwrap();
     assert_eq!(
         leak_error_default(&item),
-        error("use absolute path: 'MyBound'", None)
+        error(
+            "use absolute path: 'MyBound'",
+            Some(
+                "write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it \
+                 with `LeakerConfig::allowed_paths`"
+            )
+        )
     );
 
     // A prelude name used as the second segment of a relative path.
@@ -349,13 +355,39 @@ fn no_note() {
     .unwrap();
     assert_eq!(
         leak_error_default(&item),
-        error("use absolute path: 'my_mod :: Clone'", None)
+        error(
+            "use absolute path: 'my_mod :: Clone'",
+            Some(
+                "write `my_mod::Clone` with an absolute path (e.g. `::my_crate::my_mod::Clone`), \
+                 or allow it with `LeakerConfig::allowed_paths`"
+            )
+        )
+    );
+
+    // `crate::`, `self::` and `super::` name a place in the crate: the example leaves them out.
+    let item: ItemTrait = parse2(quote! {
+        pub trait MyTrait: crate::m::Bound + super::Other {}
+    })
+    .unwrap();
+    let err = Leaker::new().intern_trait(&item, true).unwrap_err();
+    let helps: Vec<_> = err
+        .items()
+        .map(|item| item.help_text().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        helps,
+        [
+            "write `crate::m::Bound` with an absolute path (e.g. `::my_crate::m::Bound`), or \
+             allow it with `LeakerConfig::allowed_paths`",
+            "write `super::Other` with an absolute path (e.g. `::my_crate::Other`), or allow it \
+             with `LeakerConfig::allowed_paths`"
+        ]
     );
 }
 
 #[test]
-fn note_in_syn_error() {
-    // The note is rendered as a `note` of the diagnostic; without a note, the message is kept.
+fn help_in_syn_error() {
+    // The help is rendered as a `help` of the diagnostic, after the notes.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait: Clone {}
     })
@@ -364,7 +396,7 @@ fn note_in_syn_error() {
     let err: syn::Error = leaker.intern_trait(&item, true).err().unwrap().into();
     assert_eq!(
         err.to_string(),
-        "use absolute path: 'Clone'\n\n  = note: use `::core::clone::Clone` instead of `Clone`\n"
+        "use absolute path: 'Clone'\n\n  = help: use `::core::clone::Clone` instead of `Clone`\n"
     );
 
     let item: ItemTrait = parse2(quote! {
@@ -373,12 +405,16 @@ fn note_in_syn_error() {
     .unwrap();
     let mut leaker = Leaker::new();
     let err: syn::Error = leaker.intern_trait(&item, true).err().unwrap().into();
-    assert_eq!(err.to_string(), "use absolute path: 'MyBound'");
+    assert_eq!(
+        err.to_string(),
+        "use absolute path: 'MyBound'\n\n  = help: write `MyBound` with an absolute path (e.g. \
+         `::my_crate::MyBound`), or allow it with `LeakerConfig::allowed_paths`\n"
+    );
 }
 
 #[test]
 fn error_to_tokens() {
-    // The error is emitted as `compile_error!` with the note, as `syn::Error` is.
+    // The error is emitted as `compile_error!` with the help, as `syn::Error` is.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait: Clone {}
     })
@@ -388,7 +424,7 @@ fn error_to_tokens() {
     let tokens = quote!(#err).to_string();
     assert!(tokens.contains("compile_error"), "{}", tokens);
     assert!(
-        tokens.contains("= note: use `::core::clone::Clone` instead of `Clone`"),
+        tokens.contains("= help: use `::core::clone::Clone` instead of `Clone`"),
         "{}",
         tokens
     );
@@ -396,7 +432,7 @@ fn error_to_tokens() {
 }
 
 #[test]
-fn note_for_trait_bounds() {
+fn help_for_trait_bounds() {
     // The offending tokens may be a whole trait bound rather than a path.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait: for<'a> Fn(&'a u8) {}
@@ -463,19 +499,19 @@ fn all_relative_paths_are_reported() {
         err.to_string(),
         "use absolute path: 'Clone'\nuse absolute path: 'MyBound'\nuse absolute path: 'MyType < '_ >'"
     );
-    // The first error and its note.
+    // The first error and its help.
     assert_eq!(
-        err.note().as_deref(),
+        err.help().as_deref(),
         Some("use `::core::clone::Clone` instead of `Clone`")
     );
-    // Each error is a separate `syn::Error`, with its own note.
+    // Each error is a separate `syn::Error`, with its own notes and help.
     let syn_err: syn::Error = err.into();
     assert_eq!(
         syn_err.into_iter().map(|e| e.to_string()).collect::<Vec<_>>(),
         vec![
-            "use absolute path: 'Clone'\n\n  = note: use `::core::clone::Clone` instead of `Clone`\n",
-            "use absolute path: 'MyBound'",
-            "use absolute path: 'MyType < '_ >'\n\n  = note: it cannot be leaked as a whole because of `'_`\n",
+            "use absolute path: 'Clone'\n\n  = help: use `::core::clone::Clone` instead of `Clone`\n",
+            "use absolute path: 'MyBound'\n\n  = help: write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it with `LeakerConfig::allowed_paths`\n",
+            "use absolute path: 'MyType < '_ >'\n\n  = note: it cannot be leaked as a whole because of `'_`\n  = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with `LeakerConfig::allowed_paths`\n",
         ]
     );
 }
@@ -483,7 +519,7 @@ fn all_relative_paths_are_reported() {
 #[test]
 fn notes_explain_conflicts() {
     // The notes of an error tell why the path cannot be leaked as a whole, and which other paths
-    // inside it depend on the type context.
+    // inside it depend on the type context. The help tells what to write.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait {
             fn f(&self, x: Box<dyn RelA + RelB<'_>>);
@@ -491,18 +527,22 @@ fn notes_explain_conflicts() {
     })
     .unwrap();
     let err = Leaker::new().intern_trait(&item, true).err().unwrap();
-    // The suggestion of the absolute path comes first.
+    // The suggestion of the absolute path is the help.
+    assert_eq!(
+        err.help().as_deref(),
+        Some("use `::std::boxed::Box` instead of `Box`")
+    );
     assert_eq!(
         err.note().as_deref(),
-        Some("use `::std::boxed::Box` instead of `Box`")
+        Some("it cannot be leaked as a whole because of `'_`")
     );
     assert_eq!(
         syn::Error::from(err).to_string(),
         "use absolute path: 'Box < dyn RelA + RelB < '_ > >'\n\n\
-         \x20 = note: use `::std::boxed::Box` instead of `Box`\n\
          \x20 = note: it cannot be leaked as a whole because of `'_`\n\
          \x20 = note: `RelA` also depends on the type context\n\
-         \x20 = note: `RelB < '_ >` also depends on the type context\n"
+         \x20 = note: `RelB < '_ >` also depends on the type context\n\
+         \x20 = help: use `::std::boxed::Box` instead of `Box`\n"
     );
 }
 

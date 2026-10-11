@@ -1,6 +1,7 @@
 //! The error of the analysis by the [`Leaker`](crate::Leaker).
 
 use crate::analysis::CheckResult;
+use crate::util::{or_list, without_crate_prefix};
 use proc_macro2::{Span, TokenStream};
 use syn::spanned::Spanned;
 use template_quote::ToTokens;
@@ -8,17 +9,18 @@ use template_quote::ToTokens;
 /// The error returned when an item cannot be analyzed by the [`Leaker`](crate::Leaker).
 ///
 /// It lists every offending path or type. [`NotInternableError::items()`] returns one
-/// [`ErrorItem`] for each, with its span, a message and notes, so a macro can report them all.
-/// The message says `use absolute path: '..'` where the fault is that a path is relative. It is
-/// the headline of the cause where the fault is something else, such as `Self`, a bound rule or a
-/// default that names `Self` ([`CheckResult::headline`]). `Display` writes the messages, one per
+/// [`ErrorItem`] for each, with its span, a message, notes and a help, so a macro can report them
+/// all. The message says `use absolute path: '..'` where the fault is that a path is relative. It
+/// is the headline of the cause where the fault is something else, such as `Self`, a bound rule or
+/// a default that names `Self` ([`CheckResult::headline`]). `Display` writes the messages, one per
 /// line.
 ///
-/// Each error has notes: a fix if one is known (e.g. "use `::std::vec::Vec` instead of `Vec`"),
-/// the causes that stop the type from being leaked as a whole ([`CheckResult::impossible`]), and
-/// the other paths in it that depend on the context (the rest of [`CheckResult::must`]), which
-/// would be reported once the first is fixed. [`syn::Error`] and [`ToTokens`] render the notes as
-/// `note`s.
+/// Each error has a help and notes, as rustc's errors do. The help says what to write instead,
+/// with the tokens of the error (e.g. "use `::std::vec::Vec` instead of `Vec`"). The notes say
+/// why: the causes that stop the type from being leaked as a whole
+/// ([`CheckResult::impossible`]), and the other paths in it that depend on the context (the rest
+/// of [`CheckResult::must`]), which would be reported once the first is fixed. [`syn::Error`] and
+/// [`ToTokens`] render the notes as `note`s, then the help as `help`.
 ///
 /// ```
 /// # use type_leak::*;
@@ -27,7 +29,7 @@ use template_quote::ToTokens;
 /// let err = Leaker::new().intern_trait(&item, true).unwrap_err();
 /// // One error for each offending path, in order.
 /// assert_eq!(err.items().count(), 2);
-/// // As one `syn::Error` for a proc macro, with the notes appended to the messages.
+/// // As one `syn::Error` for a proc macro, with the notes and the help appended to the messages.
 /// let error: syn::Error = err.into();
 /// assert_eq!(error.into_iter().count(), 2);
 /// ```
@@ -53,8 +55,11 @@ pub enum NotInternableError {
     ///   headline is "the bound of `T` mentions a `Self` which has no name here", with a note on
     ///   why, at the type.
     /// - A type leaked as a whole that names `Self::A` where `Self` is a type (an impl, a struct,
-    ///   an enum or a union), which the Repeater's impl cannot write. The headline is "`Self::A`
-    ///   cannot be written in the impl of the Repeater".
+    ///   an enum or a union), which the Repeater's impl cannot write. The headline says what to
+    ///   write: "write `<Self as Tr>::A` instead of `Self::A` in `Wrap<Self::A>`: the copy cannot
+    ///   tell which trait `A` comes from", with the trait of the impl as written (`SomeTrait` for a
+    ///   struct, an enum, a union or an inherent impl, which have none). The help gives the path
+    ///   in full (`<Self as ::my_crate::Tr>::A` if the trait is relative).
     /// - A type leaked as a whole that names a lifetime of a method which the copy would leave
     ///   unconstrained (`Wrap<'x>` in `fn f<'x>(&self, a: Wrap<'x>) -> &'x u8`), for a method of a
     ///   trait or of an impl of a trait, not for a free function or a method of an inherent impl
@@ -84,7 +89,8 @@ pub enum NotInternableError {
     ///
     /// Each item is the tokens of a mention (`Self`, `Self::Item`, or a type macro that names
     /// it). Its span is where the error is reported, with the message "`Self` has no meaning
-    /// here". If a scope finds both kinds of errors, only [`NotInternableError::RelativePath`] is
+    /// here" and a help that says to write the type, or to enter a scope that declares `Self`. If
+    /// a scope finds both kinds of errors, only [`NotInternableError::RelativePath`] is
     /// returned. This kind is found after those are fixed.
     SelfWithoutMeaning(Vec<TokenStream>),
 }
@@ -92,8 +98,9 @@ pub enum NotInternableError {
 /// One error of a [`NotInternableError`]: an offending path, type or mention of `Self`.
 ///
 /// Get them with [`NotInternableError::items()`] to report each one, for example as a
-/// separate diagnostic of a proc macro, with its own span and notes. The first note says how to
-/// fix the error, if a fix is known.
+/// separate diagnostic of a proc macro, with its own span, notes and help. They are laid out as
+/// rustc lays out its own errors: the `message` says what is wrong, the `notes` say why, and the
+/// `help` says what to write instead, with the tokens of the error. Every error has a help.
 ///
 /// ```
 /// # use type_leak::*;
@@ -103,11 +110,73 @@ pub enum NotInternableError {
 /// let items: Vec<_> = err.items().collect();
 /// assert_eq!(items.len(), 2);
 /// assert_eq!(items[0].message, "use absolute path: 'Clone'");
-/// assert_eq!(items[0].note(), Some("use `::core::clone::Clone` instead of `Clone`"));
+/// assert_eq!(items[0].help_text(), Some("use `::core::clone::Clone` instead of `Clone`"));
 /// assert_eq!(items[1].message, "use absolute path: 'MyType < '_ >'");
 /// assert_eq!(items[1].tokens.to_string(), "MyType < '_ >");
+/// assert_eq!(items[1].note(), Some("it cannot be leaked as a whole because of `'_`"));
+/// assert_eq!(
+///     items[1].help_text(),
+///     Some("write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with \
+///           `LeakerConfig::allowed_paths`")
+/// );
 /// // The `Display` of the error is the messages, one per line.
 /// assert_eq!(err.to_string(), format!("{}\n{}", items[0].message, items[1].message));
+/// ```
+///
+/// # Reporting the error from a proc macro
+///
+/// [`syn::Error`] (`err.into()`) and [`ToTokens`] (`err.into_token_stream()`) report every item,
+/// with `= note:` lines and a `= help:` line after the message. On nightly, [`ToTokens`] emits a
+/// `Diagnostic` instead, with the notes and the help at their own spans.
+///
+/// A macro that uses [`proc-macro-error`](https://docs.rs/proc-macro-error) reports each item
+/// itself, with the notes as `note`s and the help as the `help` (the `hint` of an older version)
+/// of the error:
+///
+/// ```text
+/// for item in err.items() {
+///     let help = item.help_text().unwrap_or_default();
+///     match item.note() {
+///         Some(note) => emit_error!(item.span, "{}", item.message; note = "{}", note; help = "{}", help),
+///         None => emit_error!(item.span, "{}", item.message; help = "{}", help),
+///     }
+/// }
+/// abort_if_dirty();
+/// ```
+///
+/// or, to keep the span of every note and of the help (the first segment of a path to write in
+/// full, for example), with its `Diagnostic`:
+///
+/// ```text
+/// for item in err.items() {
+///     let mut diagnostic = Diagnostic::spanned(item.span, Level::Error, item.message);
+///     for (span, note) in item.notes {
+///         diagnostic = diagnostic.span_note(span, note);
+///     }
+///     if let Some((span, help)) = item.help {
+///         diagnostic = diagnostic.span_help(span, help);
+///     }
+///     diagnostic.emit();
+/// }
+/// ```
+///
+/// With `syn::Error` alone, the same layout is a message with the lines appended:
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let item: ItemTrait = parse_quote!(trait Tr: Clone {});
+/// let err = Leaker::new().intern_trait(&item, true).unwrap_err();
+/// let item = err.items().next().unwrap();
+/// let mut message = item.message.clone();
+/// for (_span, note) in &item.notes {
+///     message += &format!("\n  = note: {}", note);
+/// }
+/// if let Some((_span, help)) = &item.help {
+///     message += &format!("\n  = help: {}", help);
+/// }
+/// let error = syn::Error::new(item.span, message);
+/// assert!(error.to_string().ends_with("= help: use `::core::clone::Clone` instead of `Clone`"));
 /// ```
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -120,22 +189,35 @@ pub struct ErrorItem {
     /// ([`CheckResult::headline`]; "`Self` has no meaning here"), and `use absolute path: '..'`
     /// where it is.
     pub message: String,
-    /// Why, and how to fix it, each with the span it is about, the most useful first: a suggestion
-    /// of the absolute path, the causes that stop the path from being leaked as a whole, and the
-    /// other paths that depend on the type context.
+    /// Why, each with the span it is about, the most useful first: what the headline says in more
+    /// words, the causes that stop the path from being leaked as a whole, and the other paths that
+    /// depend on the type context.
     pub notes: Vec<(Span, String)>,
+    /// What to write instead, with the span it is about, as the tokens of the error say it (for
+    /// example the absolute path of a prelude name: "use `::std::vec::Vec` instead of `Vec`").
+    /// Every error has one.
+    pub help: Option<(Span, String)>,
 }
 
 impl ErrorItem {
-    /// Returns the first note, which suggests how to fix the error, if there is one.
+    /// Returns the first note, which says why, if there is one.
     pub fn note(&self) -> Option<&str> {
         self.notes.first().map(|(_, note)| note.as_str())
+    }
+
+    /// Returns the text of the help, which says what to write instead.
+    pub fn help_text(&self) -> Option<&str> {
+        self.help.as_ref().map(|(_, help)| help.as_str())
     }
 }
 
 pub(crate) const SELF_NOTE: &str =
     "`Self` has no meaning here: it is declared only by a struct, an enum, a \
                          union, an impl or a trait, not by a module or generics";
+
+pub(crate) const SELF_HELP: &str =
+    "write the type instead of `Self`, or enter a scope that declares `Self` around it \
+     (`Leaker::enter_type`, `enter_impl` or `enter_trait`)";
 
 impl NotInternableError {
     fn reports(&self) -> Vec<ErrorItem> {
@@ -149,6 +231,7 @@ impl NotInternableError {
                         span: tokens.span(),
                         message: "`Self` has no meaning here".to_string(),
                         notes: vec![(tokens.span(), SELF_NOTE.to_string())],
+                        help: Some((tokens.span(), SELF_HELP.to_string())),
                     })
                     .collect();
             }
@@ -157,13 +240,13 @@ impl NotInternableError {
             .iter()
             .filter_map(|conflict| {
                 let (tokens, others) = conflict.must.split_first()?;
-                let mut notes: Vec<_> = match &conflict.note {
-                    // The conflict is not about the path.
-                    Some(note) => Some((tokens.span(), note.clone())),
-                    None => absolute_path_note(tokens),
-                }
-                .into_iter()
-                .collect();
+                // The conflict is not about the path if it has a note.
+                let mut notes: Vec<_> = conflict
+                    .note
+                    .iter()
+                    .map(|note| (tokens.span(), note.clone()))
+                    .collect();
+                let mut default_object = false;
                 // A cause that is the path itself (e.g. a trait bound) needs no note.
                 for cause in conflict
                     .impossible
@@ -175,14 +258,23 @@ impl NotInternableError {
                         format!("it cannot be leaked as a whole because of `{}`", cause),
                     ));
                     if is_default_lifetime_object(cause) {
+                        default_object = true;
                         notes.push((
                             cause.span(),
                             "the lifetime of the trait object defaults to that of the enclosing \
-                             reference or path; name it (e.g. `&'a dyn Trait` or `dyn Trait + 'a`)"
+                             reference or path"
                                 .to_string(),
                         ));
                     }
                 }
+                let help = match &conflict.help {
+                    Some(help) => (tokens.span(), help.clone()),
+                    None => absolute_path_help(
+                        tokens,
+                        default_object,
+                        conflict.impossible.iter().any(is_self_path),
+                    ),
+                };
                 notes.extend(others.iter().map(|other| {
                     (
                         other.span(),
@@ -197,6 +289,7 @@ impl NotInternableError {
                         .clone()
                         .unwrap_or_else(|| format!("use absolute path: '{}'", tokens)),
                     notes,
+                    help: Some(help),
                 })
             })
             .collect()
@@ -204,11 +297,11 @@ impl NotInternableError {
 
     /// Returns the errors, one per offending path, type or mention of `Self`, in order.
     ///
-    /// Each has its span, a message and notes, so a proc macro can report every one instead of
-    /// only the first ([`NotInternableError::span()`], [`NotInternableError::note()`]). The
-    /// message is `use absolute path: '..'` where the fault is that a path is relative, and the
-    /// headline of the cause where it is something else. `Display` writes the messages, one per
-    /// line. Never empty.
+    /// Each has its span, a message, notes and a help, so a proc macro can report every one
+    /// instead of only the first ([`NotInternableError::span()`], [`NotInternableError::note()`],
+    /// [`NotInternableError::help()`]). The message is `use absolute path: '..'` where the fault
+    /// is that a path is relative, and the headline of the cause where it is something else.
+    /// `Display` writes the messages, one per line. Never empty.
     ///
     /// ```
     /// # use type_leak::*;
@@ -219,6 +312,7 @@ impl NotInternableError {
     ///     // Report `item.message` at `item.span`, then each note at its own span.
     ///     let _ = (&item.message, item.span);
     ///     for (_span, _note) in &item.notes {}
+    ///     if let Some((_span, _help)) = &item.help {}
     /// }
     /// let messages: Vec<String> = err.items().map(|item| item.message).collect();
     /// assert_eq!(messages, ["use absolute path: 'Clone'", "use absolute path: 'MyType < '_ >'"]);
@@ -234,11 +328,32 @@ impl NotInternableError {
             .map_or_else(Span::call_site, |report| report.span)
     }
 
-    /// Returns the note of the first error, which suggests how to fix it.
+    /// Returns the first note of the first error, which says why.
+    ///
+    /// For `SelfWithoutMeaning` it tells which items declare `Self`. A conflict about the path
+    /// itself has none unless a cause stops it from being leaked as a whole.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemStruct = parse_quote!(struct S { a: MyType<'_> });
+    /// let err = Leaker::new().intern_struct(&item, true).err().unwrap();
+    /// assert_eq!(err.to_string(), "use absolute path: 'MyType < '_ >'");
+    /// assert_eq!(
+    ///     err.note().as_deref(),
+    ///     Some("it cannot be leaked as a whole because of `'_`")
+    /// );
+    /// ```
+    pub fn note(&self) -> Option<String> {
+        let report = self.reports().into_iter().next()?;
+        report.notes.into_iter().next().map(|(_, note)| note)
+    }
+
+    /// Returns the help of the first error, which says what to write instead.
     ///
     /// For `RelativePath` it is the absolute path to use instead of the first segment, if that is a
-    /// prelude item or a primitive type. For `SelfWithoutMeaning` it tells which items declare
-    /// `Self`.
+    /// prelude item or a primitive type, and else how to write the path. For
+    /// `SelfWithoutMeaning` it tells which scopes declare `Self`.
     ///
     /// ```
     /// # use type_leak::*;
@@ -247,13 +362,13 @@ impl NotInternableError {
     /// let err = Leaker::new().intern_trait(&item, true).err().unwrap();
     /// assert_eq!(err.to_string(), "use absolute path: 'Clone'");
     /// assert_eq!(
-    ///     err.note().as_deref(),
+    ///     err.help().as_deref(),
     ///     Some("use `::core::clone::Clone` instead of `Clone`")
     /// );
     /// ```
-    pub fn note(&self) -> Option<String> {
+    pub fn help(&self) -> Option<String> {
         let report = self.reports().into_iter().next()?;
-        report.notes.into_iter().next().map(|(_, note)| note)
+        report.help.map(|(_, help)| help)
     }
 }
 
@@ -279,8 +394,8 @@ fn offending_path(tokens: &TokenStream) -> Option<syn::Path> {
     })
 }
 
-fn absolute_path_note(tokens: &TokenStream) -> Option<(Span, String)> {
-    let path = offending_path(tokens)?;
+/// The absolute path of a prelude item or a primitive type that `path` starts with.
+fn prelude_help(path: &syn::Path) -> Option<(Span, String)> {
     if path.leading_colon.is_some() {
         return None;
     }
@@ -295,6 +410,95 @@ fn absolute_path_note(tokens: &TokenStream) -> Option<(Span, String)> {
                 format!("use `{}` instead of `{}`", absolute, name),
             )
         })
+}
+
+/// What to write for the path `tokens` that depends on the context, when the conflict has nothing
+/// more to say: the absolute path of a prelude item, else how to write the path in full.
+/// `default_object`: a trait object takes its lifetime from the reference or path around it.
+/// `denied_self`: a `Self` that is denied (`allow_self = false`) is among the causes.
+fn absolute_path_help(
+    tokens: &TokenStream,
+    default_object: bool,
+    denied_self: bool,
+) -> (Span, String) {
+    let path = offending_path(tokens);
+    // The help is about the name of the path: its first segment.
+    let span = path
+        .as_ref()
+        .and_then(|path| path.segments.first())
+        .map_or_else(|| tokens.span(), |seg| seg.ident.span());
+    let mut options = Vec::new();
+    match path.as_ref().and_then(prelude_help) {
+        Some((_, help)) => options.push(help),
+        None => match &path {
+            Some(path)
+                if path
+                    .segments
+                    .first()
+                    .map_or(false, |seg| seg.ident == "Self") =>
+            {
+                options.push("write the type instead of `Self`".to_string());
+            }
+            Some(path) if path.leading_colon.is_none() => {
+                let (name, example) = path_names(path);
+                options.push(format!(
+                    "write `{}` with an absolute path (e.g. `{}`)",
+                    name, example
+                ));
+                options.push("allow it with `LeakerConfig::allowed_paths`".to_string());
+            }
+            Some(path) => {
+                let (name, _) = path_names(path);
+                options.push(format!(
+                    "write `{}` where it is not leaked, or allow it with \
+                     `LeakerConfig::allowed_paths`",
+                    name
+                ));
+            }
+            None => options.push(format!(
+                "write the paths in `{}` as absolute paths",
+                crate::util::tidy(tokens)
+            )),
+        },
+    }
+    if denied_self {
+        options.push("analyze the item with `allow_self = true`".to_string());
+    }
+    if default_object {
+        options.push(
+            "name the lifetime of the trait object (e.g. `&'a dyn Trait` or `dyn Trait + 'a`)"
+                .to_string(),
+        );
+    }
+    (span, or_list(options))
+}
+
+/// The path as it is written, without its arguments, and an example of its absolute form.
+fn path_names(path: &syn::Path) -> (String, String) {
+    let names = |path: &syn::Path| {
+        path.segments
+            .iter()
+            .map(|seg| seg.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::")
+    };
+    let name = format!(
+        "{}{}",
+        if path.leading_colon.is_some() {
+            "::"
+        } else {
+            ""
+        },
+        names(path)
+    );
+    // `crate::m::X` and `super::m::X` are `m::X` in the crate.
+    let example = format!("::my_crate::{}", names(&without_crate_prefix(path)));
+    (name, example)
+}
+
+/// `true` if `cause` is `Self` or a path that starts with it.
+fn is_self_path(cause: &TokenStream) -> bool {
+    matches!(cause.clone().into_iter().next(), Some(proc_macro2::TokenTree::Ident(ident)) if ident == "Self")
 }
 
 /// The messages of the errors, one per line.
@@ -328,10 +532,13 @@ impl NotInternableError {
             .into_iter()
             .map(|report| {
                 let mut message = report.message;
-                if !report.notes.is_empty() {
+                if !report.notes.is_empty() || report.help.is_some() {
                     message.push('\n');
                     for (_, note) in report.notes {
                         message.push_str(&format!("\n  = note: {}", note));
+                    }
+                    if let Some((_, help)) = report.help {
+                        message.push_str(&format!("\n  = help: {}", help));
                     }
                     message.push('\n');
                 }
@@ -345,12 +552,12 @@ impl NotInternableError {
     }
 }
 
-/// Emits the errors as `compile_error!` invocations, with the notes rendered as for [`syn::Error`].
-/// A proc macro can report them with `Err(e) => e.into_token_stream().into()`.
+/// Emits the errors as `compile_error!` invocations, with the notes and the help rendered as for
+/// [`syn::Error`]. A proc macro can report them with `Err(e) => e.into_token_stream().into()`.
 ///
 /// On nightly, when `proc_macro::Diagnostic` is available inside a proc macro, the errors are
-/// emitted as diagnostics instead, with notes at their own spans (e.g. the first segment of the
-/// offending path), and no tokens are produced.
+/// emitted as diagnostics instead, with notes and help at their own spans (e.g. the first segment
+/// of the offending path), and no tokens are produced.
 impl ToTokens for NotInternableError {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         // Only compiled on nightly, so the MSRV does not apply.
@@ -384,6 +591,9 @@ impl NotInternableError {
             );
             for (span, note) in report.notes {
                 diagnostic = diagnostic.span_note(unwrap_span(span), note);
+            }
+            if let Some((span, help)) = report.help {
+                diagnostic = diagnostic.span_help(unwrap_span(span), help);
             }
             diagnostic.emit();
         }

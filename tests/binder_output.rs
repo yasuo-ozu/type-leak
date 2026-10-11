@@ -101,6 +101,10 @@ const NOTE: &str = "`'x` is declared by a `for<..>` binder and used in its outpu
                     using it cannot be leaked: the copy would have `'x` only in a projection, \
                     which does not constrain it (E0581, E0582)";
 
+/// What to write, for the error of `NOTE`: keep an input, or leak nothing.
+const HELP: &str = "keep an input that names `'x` as written (for example `&'x u8`), or write \
+                    `Rel<'x>` with an absolute path";
+
 /// The note of an error in a type holding the binder, which cannot be leaked as a whole.
 const NOTE_OWNED: &str = "`'x` is declared by a `for<..>` binder and used in its output (a return \
                           type or an associated type binding), and no input keeps it as written, \
@@ -199,8 +203,8 @@ fn a_bound_whose_output_mentions_the_lifetime_is_an_error() {
         syn::Error::from(err).to_string(),
         format!(
             "use absolute path: 'Rel < 'x >'\n\n  = note: {}\n  = note: it cannot be leaked as a \
-             whole because of `'x`\n",
-            NOTE
+             whole because of `'x`\n  = help: {}\n",
+            NOTE, HELP
         )
     );
     // The same type is not an error where the output does not mention the lifetime.
@@ -387,9 +391,8 @@ fn the_type_holding_the_binder_which_cannot_be_leaked_is_an_error() {
         format!(
             "use absolute path: 'Rel < 'x >'\n\n  = note: {}\n  = note: it cannot be leaked as a \
              whole because of `dyn :: core :: fmt :: Debug`\n  = note: the lifetime of the trait \
-             object defaults to that of the enclosing reference or path; name it (e.g. `&'a dyn \
-             Trait` or `dyn Trait + 'a`)\n",
-            NOTE_OWNED
+             object defaults to that of the enclosing reference or path\n  = help: {}\n",
+            NOTE_OWNED, HELP
         )
     );
     // `impl Trait` cannot be leaked at all.

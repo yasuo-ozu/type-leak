@@ -25,7 +25,8 @@ use template_quote::quote;
 /// - Both: a conflict (`MyType<'_>`). Unless `is_own`, the parts can be leaked instead.
 ///
 /// `Self` where it has no meaning (in a module, or in generics that no struct, enum, union, impl or
-/// trait encloses) is an `impossible` cause, with the mention of `Self` as written and a `note`.
+/// trait encloses) is an `impossible` cause, with the mention of `Self` as written, a `note` and a
+/// `help`.
 /// A scope fails on it, so it can be neither leaked nor copied. See [Self rules](crate::rules#self-rules).
 ///
 /// ```
@@ -74,8 +75,12 @@ pub struct CheckResult {
     /// it is copied as written. See [External crates](crate::rules#external-crates).
     pub optional: bool,
     /// Explains the conflict if the causes do not (why `Self` cannot be leaked, or has no
-    /// meaning). Reported first.
+    /// meaning). Reported first. It says why, and `help` says what to write instead.
     pub note: Option<String>,
+    /// What to write instead, with the tokens as written (for example "replace `Self::A` with
+    /// `<Self as ::path::Tr>::A`"). If it is `None`, [`NotInternableError`] suggests the absolute
+    /// path of the first of `must`. See [`ErrorItem::help`](crate::ErrorItem::help).
+    pub help: Option<String>,
     /// The headline of the error, if the fault is not that the path of the type is relative.
     /// [`NotInternableError`] shows it as the message of the error. If it is `None`, the message
     /// is `use absolute path: '..'`: the fault is the path, and `note` says why it cannot be

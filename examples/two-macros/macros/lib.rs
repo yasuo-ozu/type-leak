@@ -110,13 +110,17 @@ pub fn export_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
-/// Reports every offending path of the trait at its own span, with the notes.
+/// Reports every offending path of the trait at its own span, with the notes (why) and the help
+/// (what to write instead).
 fn report(error: &NotInternableError) -> TokenStream2 {
     let mut errors: Option<syn::Error> = None;
     for item in error.items() {
         let mut message = item.message.clone();
         for (_span, note) in &item.notes {
             message += &format!("\n  note: {}", note);
+        }
+        if let Some((_span, help)) = &item.help {
+            message += &format!("\n  help: {}", help);
         }
         let error = syn::Error::new(item.span, message);
         match &mut errors {

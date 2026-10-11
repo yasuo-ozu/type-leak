@@ -315,6 +315,55 @@ pub(crate) fn trait_object_of(ty: &Type) -> Option<&TypeTraitObject> {
     }
 }
 
+/// Prints tokens of a path or a type as one writes them (`<Self as Tr>::A`, `Wrap<Rel<T>>`), not with
+/// the spaces that a token stream has. For the messages that suggest what to write. Other
+/// tokens may lose a space (`a < b` is `a<b`).
+pub(crate) fn tidy(tokens: &TokenStream) -> String {
+    tidy_str(&tokens.to_string())
+}
+
+/// Like [`tidy()`] for the text of tokens.
+pub(crate) fn tidy_str(text: &str) -> String {
+    let mut text = text.to_string();
+    for (from, to) in [
+        (" :: ", "::"),
+        (":: ", "::"),
+        (" ::", "::"),
+        (" <", "<"),
+        ("< ", "<"),
+        (" >", ">"),
+        ("& ", "&"),
+        (" ,", ","),
+    ] {
+        text = text.replace(from, to);
+    }
+    text
+}
+
+/// The path without the segments that name a place in the crate (`crate`, `self`, `super`), for
+/// the example of the absolute path in a message. At least one segment stays.
+pub(crate) fn without_crate_prefix(path: &Path) -> Path {
+    let skip = path
+        .segments
+        .iter()
+        .take_while(|seg| seg.ident == "crate" || seg.ident == "self" || seg.ident == "super")
+        .count()
+        .min(path.segments.len().saturating_sub(1));
+    Path {
+        leading_colon: None,
+        segments: path.segments.iter().skip(skip).cloned().collect(),
+    }
+}
+
+/// Joins the ways to fix an error: `a`, `a, or b`, `a, b, or c`.
+pub(crate) fn or_list(options: Vec<String>) -> String {
+    match options.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [init @ .., last] => format!("{}, or {}", init.join(", "), last),
+    }
+}
+
 /// Finds the mentions of `Self`: a path starting with it (`Self`, `Self::X`, the self type of
 /// `<Self as ..>`), or the name in the tokens of a macro. `::p::Self` is not one.
 #[derive(Default)]

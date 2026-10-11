@@ -1,16 +1,16 @@
-//! The absolute paths that the note of an error suggests (`ABSOLUTE_PATHS` of `src/error.rs`).
+//! The absolute paths that the help of an error suggests (`ABSOLUTE_PATHS` of `src/error.rs`).
 //!
 //! A relative path that cannot be leaked (a bound, a const expression, a type with an elided
 //! lifetime) is an error with the headline `use absolute path: '..'`, and for a name of the
-//! standard prelude or a primitive type, a note that says what to write: ``use `::std::vec::Vec`
-//! instead of `Vec` ``. The note is the fix that a user copies, so each of the 54 names has to give
+//! standard prelude or a primitive type, a help that says what to write: ``use `::std::vec::Vec`
+//! instead of `Vec` ``. The help is the fix that a user copies, so each of the 54 names has to give
 //! the right path, and the path has to be valid.
 //!
 //! The table is written once, by the macro `absolute_paths!`, which makes both what the tests
 //! compare with (the bare name and the absolute path as a string) and the code that uses the
 //! path, as a type, a trait bound or a value: a path with a typo fails to compile, instead of
 //! being suggested to a user. The table of the library cannot be read by the tests (it is
-//! private), so the first test asserts the note of each name, and fails for a name whose path
+//! private), so the first test asserts the help of each name, and fails for a name whose path
 //! differs from the one here.
 
 use syn::*;
@@ -20,7 +20,7 @@ use type_leak::*;
 /// is what the name is: `ty` (a type), `trait` (a bound), or `value` (a function or a constructor).
 macro_rules! absolute_paths {
     ($($name:ident = $($seg:ident)::+, $kind:ident [$($rest:tt)*];)*) => {
-        /// The bare names, and the absolute path of each as the note writes it.
+        /// The bare names, and the absolute path of each as the help writes it.
         fn table() -> Vec<(&'static str, String)> {
             vec![$((
                 stringify!($name),
@@ -135,11 +135,11 @@ fn forms(name: &str) -> Vec<(&'static str, String, String)> {
 }
 
 #[test]
-fn a_bare_name_gets_the_note_with_its_absolute_path() {
+fn a_bare_name_gets_the_help_with_its_absolute_path() {
     let table = table();
     assert_eq!(table.len(), 54);
     for (name, absolute) in &table {
-        let note = format!("use `{}` instead of `{}`", absolute, name);
+        let help = format!("use `{}` instead of `{}`", absolute, name);
         for (form, source, message) in forms(name) {
             let item: ItemTrait = parse_str(&source).unwrap();
             let err = Leaker::new()
@@ -150,13 +150,21 @@ fn a_bare_name_gets_the_note_with_its_absolute_path() {
             let items: Vec<_> = err.items().collect();
             assert_eq!(items.len(), 1, "{}", context);
             assert_eq!(items[0].message, message, "{}", context);
-            // It is the first note of the error, and `NotInternableError::note()`.
-            assert_eq!(items[0].note(), Some(note.as_str()), "{}", context);
-            assert_eq!(err.note(), Some(note.clone()), "{}", context);
-            // And it is in the `syn::Error`, which stable Rust gets: the notes follow the headline.
-            let rendered = syn::Error::from(err).to_string();
+            // It is the help of the error, and `NotInternableError::help()`. It is no note: the
+            // notes say why.
+            assert_eq!(items[0].help_text(), Some(help.as_str()), "{}", context);
+            assert_eq!(err.help(), Some(help.clone()), "{}", context);
             assert!(
-                rendered.starts_with(&format!("{}\n\n  = note: {}\n", message, note)),
+                items[0].notes.iter().all(|(_, note)| *note != help),
+                "{}",
+                context
+            );
+            // And it is in the `syn::Error`, which stable Rust gets: the notes follow the headline,
+            // then the help.
+            let rendered = syn::Error::from(err).to_string();
+            assert!(rendered.starts_with(&message), "{}: {}", context, rendered);
+            assert!(
+                rendered.ends_with(&format!("\n  = help: {}\n", help)),
                 "{}: {}",
                 context,
                 rendered

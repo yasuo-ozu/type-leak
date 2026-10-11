@@ -2,7 +2,7 @@
 
 use crate::util::{
     canonical_bounds, generic_param_mentions_self, generic_param_name, ident_name, self_in_param,
-    self_in_predicate, token_names, type_mentions_self, unwrap_type_group,
+    self_in_predicate, tidy, token_names, type_mentions_self, unwrap_type_group,
     where_predicate_mentions_self, ReplaceSelf, SelfMentions,
 };
 use proc_macro2::{Literal, TokenStream};
@@ -571,6 +571,8 @@ pub(crate) struct UnnameableSelf {
     pub(crate) headline: String,
     /// Tells why, and where `Self` is something else.
     pub(crate) note: String,
+    /// Tells what to write instead of the bound, as the start of a sentence.
+    pub(crate) help: String,
 }
 
 impl Context {
@@ -1223,6 +1225,7 @@ fn for_self_of<T: WrittenForSelf>(
                 node.what(),
                 quote!(#path)
             ),
+            help: format!("write {} without `Self`", node.what()),
         }),
         SelfRequirement::Type(ty) => match mentions.associated {
             Some(cause) => Err(UnnameableSelf {
@@ -1238,6 +1241,7 @@ fn for_self_of<T: WrittenForSelf>(
                     cause,
                     quote!(#ty)
                 ),
+                help: format!("write {} without `{}`", node.what(), tidy(&cause)),
                 cause,
             }),
             None => Ok(node.clone().rewrite(&mut ReplaceSelf { self_ty: ty })),

@@ -1,6 +1,6 @@
 //! The spans of the errors: a macro reports each error at the tokens that cause it.
 //!
-//! `NotInternableError::span()`, `ErrorItem::span` and the spans of the notes are where a proc
+//! `NotInternableError::span()`, `ErrorItem::span` and the spans of the notes and the help are where a proc
 //! macro puts its diagnostic, so a wrong one points the user at the wrong place, and nothing else
 //! shows it: the messages are the same. These tests parse the code from a string with
 //! `syn::parse_str()`, so that every token has a line and a column, and compare the span of an
@@ -27,8 +27,8 @@ fn spans_parsed_from_a_string_have_a_location() {
     assert_eq!((span.end().line, span.end().column), (2, 7));
 }
 
-/// The errors are at the path that is relative, and the notes at the first segment of the path
-/// (the suggestion) and at the cause.
+/// The errors are at the path that is relative, the help at the first segment of the path (the
+/// suggestion), and the notes at the causes.
 #[test]
 fn the_span_of_a_relative_path_is_the_path() {
     let source = "trait Tr {\n    fn f(&self, a: MyType<'_>, b: Vec<&'_ u8>);\n}";
@@ -43,27 +43,28 @@ fn the_span_of_a_relative_path_is_the_path() {
     assert_span_at(items[1].span, source, "Vec<&'_ u8>", 0);
     // `NotInternableError::span()` is that of the first one.
     assert_span_at(err.span(), source, "MyType<'_>", 0);
-    // The note of the first one: no absolute path to suggest, so the cause comes first, at the
-    // lifetime that stops the type from being leaked as a whole.
+    // The first one: the note is the cause, at the lifetime that stops the type from being leaked
+    // as a whole, and the help is at the name of the path, not at the whole type.
     assert_eq!(items[0].notes.len(), 1);
     assert_eq!(
         items[0].notes[0].1,
         "it cannot be leaked as a whole because of `'_`"
     );
     assert_span_at(items[0].notes[0].0, source, "'_", 0);
-    // The note of the second one: the absolute path of `Vec` is at the first segment of the path,
-    // not the whole type, and the cause is at the lifetime of the reference.
-    assert_eq!(items[1].notes.len(), 2);
+    let (span, help) = items[0].help.clone().unwrap();
+    assert!(help.starts_with("write `MyType` with an absolute path"), "{}", help);
+    assert_span_at(span, source, "MyType", 0);
+    // The second one: the absolute path of `Vec` is the help, at the first segment of the path,
+    // not the whole type, and the cause is the note, at the lifetime of the reference.
+    assert_eq!(items[1].notes.len(), 1);
     assert_eq!(
         items[1].notes[0].1,
-        "use `::std::vec::Vec` instead of `Vec`"
-    );
-    assert_span_at(items[1].notes[0].0, source, "Vec", 0);
-    assert_eq!(
-        items[1].notes[1].1,
         "it cannot be leaked as a whole because of `'_`"
     );
-    assert_span_at(items[1].notes[1].0, source, "'_", 1);
+    assert_span_at(items[1].notes[0].0, source, "'_", 1);
+    let (span, help) = items[1].help.clone().unwrap();
+    assert_eq!(help, "use `::std::vec::Vec` instead of `Vec`");
+    assert_span_at(span, source, "Vec", 0);
 }
 
 /// The span of an error in a bound is that of the path of the trait.
@@ -75,9 +76,9 @@ fn the_span_of_a_relative_trait_is_the_bound() {
     let items: Vec<_> = err.items().collect();
     assert_eq!(items.len(), 2, "{}", err);
     assert_span_at(items[0].span, source, "Clone", 0);
-    assert_span_at(items[0].notes[0].0, source, "Clone", 0);
+    assert_span_at(items[0].help.as_ref().unwrap().0, source, "Clone", 0);
     assert_span_at(items[1].span, source, "ToString", 0);
-    assert_span_at(items[1].notes[0].0, source, "ToString", 0);
+    assert_span_at(items[1].help.as_ref().unwrap().0, source, "ToString", 0);
     assert_span_at(err.span(), source, "Clone", 0);
 }
 
@@ -96,9 +97,10 @@ fn the_span_of_self_without_meaning_is_each_mention() {
     for (item, (needle, nth)) in items.iter().zip(expected) {
         assert_eq!(item.message, "`Self` has no meaning here");
         assert_span_at(item.span, source, needle, nth);
-        // The note is about the same tokens.
+        // The note and the help are about the same tokens.
         assert_eq!(item.notes.len(), 1);
         assert_span_at(item.notes[0].0, source, needle, nth);
+        assert_span_at(item.help.as_ref().unwrap().0, source, needle, nth);
     }
     assert_span_at(err.span(), source, "Self", 0);
     // In a type that the View visits, in a module.

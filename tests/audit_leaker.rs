@@ -171,8 +171,18 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
     assert!(err.contains("use absolute path: 'RelTr'"), "{}", err);
     assert!(
         err.contains(
-            "the lifetime of the trait object defaults to that of the enclosing reference or \
-             path; name it (e.g. `&'a dyn Trait` or `dyn Trait + 'a`)"
+            "= note: the lifetime of the trait object defaults to that of the enclosing \
+             reference or path\n"
+        ),
+        "{}",
+        err
+    );
+    // The help says how to name it, among the other fixes.
+    assert!(
+        err.contains(
+            "= help: write `RelTr` with an absolute path (e.g. `::my_crate::RelTr`), allow it \
+             with `LeakerConfig::allowed_paths`, or name the lifetime of the trait object (e.g. \
+             `&'a dyn Trait` or `dyn Trait + 'a`)\n"
         ),
         "{}",
         err

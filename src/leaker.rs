@@ -45,8 +45,9 @@ use template_quote::quote;
 ///   ([Scopes](crate::rules#scopes)).
 /// - **Paths that are not leaked**: [`LeakerConfig`] (`allow_primitive()`, `allow_std_prelude()`,
 ///   your own crates). Without `allow_std_prelude()`, `trait Tr: Clone` is an error.
-/// - **Errors**: report each offending path at its span with [`NotInternableError::items()`]. The
-///   messages and their fixes are listed in [the rules](crate::rules#errors-and-how-to-fix-them).
+/// - **Errors**: report each offending path at its span with [`NotInternableError::items()`]. Each
+///   [`ErrorItem`](crate::ErrorItem) says what is wrong (`message`), why (`notes`) and what to write instead
+///   (`help`), as rustc does. The rules of each error are in [the rules](crate::rules).
 ///
 /// ```
 /// # use type_leak::*;

@@ -9,7 +9,7 @@ use crate::context::{
     SelfRequirement, UnnameableSelf,
 };
 use crate::encode::is_const_param_ty;
-use crate::error::{NotInternableError, SELF_NOTE};
+use crate::error::{NotInternableError, SELF_HELP, SELF_NOTE};
 use crate::graph::is_whole_reference;
 #[cfg(doc)]
 use crate::leaker::Leaker;
@@ -17,8 +17,9 @@ use crate::unstable::{bindings, Cause, Projections, Unstable, Why};
 use crate::util::{
     first_associated_self_in_generics, first_self_in_generics, first_self_in_type,
     generic_param_mentions_self, generic_param_name, has_lifetime_bound, ident_name,
-    is_primitive_name, selves_in_generics, token_names, trait_object_of, unwrap_type_group,
-    where_predicate_mentions_self, without_defaults, AllowedPaths,
+    is_primitive_name, or_list, selves_in_generics, tidy, token_names, trait_object_of,
+    unwrap_type_group, where_predicate_mentions_self, without_crate_prefix, without_defaults,
+    AllowedPaths,
 };
 use crate::view::View;
 use proc_macro2::TokenStream;
@@ -41,12 +42,12 @@ struct Frame {
     soft_depth: usize,
     /// A cause is a relative path, so the type means something else in another module.
     relative: bool,
-    /// A type not leaked alone because of a binder lifetime: its holder's depth and the lifetime
+    /// A type not leaked alone because of a binder lifetime: its holder's depth and the advice
     /// (see [`Binder`]).
-    binder: Option<(usize, Lifetime)>,
+    binder: Option<(usize, Advice)>,
     /// A type not leaked alone because of an elided output lifetime: its holder's depth and the
-    /// note (see [`Elision`]).
-    elision: Option<(usize, String)>,
+    /// advice (see [`Elision`]).
+    elision: Option<(usize, Advice)>,
     unconstrained: Option<Lifetime>,
     /// The first `Self::A` in the type, where `Self` is a type: the Repeater's impl cannot write it,
     /// so a type that names it is not leaked whole.
@@ -72,6 +73,21 @@ impl Frame {
             assoc_self: None,
             effects: Vec::new(),
         }
+    }
+}
+
+/// Why a type cannot be leaked and what to write instead: the `note` and the `help` of a conflict.
+#[derive(Clone)]
+struct Advice {
+    note: String,
+    help: String,
+}
+
+impl Advice {
+    /// Puts them in `conflict`.
+    fn give(self, conflict: &mut CheckResult) {
+        conflict.note = Some(self.note);
+        conflict.help = Some(self.help);
     }
 }
 
@@ -501,6 +517,7 @@ struct ScopeMark {
     item_depth: usize,
     self_ty: Option<SelfRequirement>,
     self_written: bool,
+    self_trait: Option<ImplTrait>,
     self_depth: usize,
     allow_self: bool,
     self_type_walk: Option<bool>,
@@ -581,6 +598,9 @@ pub(crate) struct AnalyzeVisitor {
     self_ty: Option<SelfRequirement>,
     /// `self_ty` is the self type of an impl, which the copy writes (see [`DeclaredSelf`]).
     self_written: bool,
+    /// The trait that the impl declaring `Self` implements, if it is an impl of a trait: what a
+    /// `Self::A` is written through (see [`AssocSelf`]).
+    self_trait: Option<ImplTrait>,
     /// The number of scopes when the scope that declares `Self` is the innermost: 0 if there is no
     /// `Self`. The predicates of the item that declares `Self` are visited then, not those of its
     /// methods.
@@ -698,6 +718,7 @@ impl AnalyzeVisitor {
                 .collect(),
             self_ty: None,
             self_written: false,
+            self_trait: None,
             self_depth: 0,
             root_declares_self: false,
             self_type_walk: None,
@@ -766,6 +787,7 @@ impl AnalyzeVisitor {
             impossible: self.impossibles[impossible_start..].to_vec(),
             optional: false,
             note: None,
+            help: None,
             headline: None,
         }
     }
@@ -1042,6 +1064,7 @@ impl AnalyzeVisitor {
             item_depth: self.item_depth,
             self_ty: self.self_ty.clone(),
             self_written: self.self_written,
+            self_trait: self.self_trait.clone(),
             self_depth: self.self_depth,
             allow_self: self.allow_self,
             self_type_walk: self.self_type_walk,
@@ -1069,6 +1092,7 @@ impl AnalyzeVisitor {
                 });
                 self.self_ty = None;
                 self.self_written = false;
+                self.self_trait = None;
                 self.self_depth = 0;
                 self.allow_self = true;
                 mark.module = Some(id);
@@ -1081,6 +1105,7 @@ impl AnalyzeVisitor {
                 if let Some(declared) = declares {
                     self.self_ty = Some(declared.requirement.clone());
                     self.self_written = declared.written;
+                    self.self_trait = trait_path.as_deref().map(|path| self.impl_trait(path));
                     self.allow_self = declared.allow_self;
                 }
                 let gats = declares
@@ -1116,6 +1141,7 @@ impl AnalyzeVisitor {
         self.item_depth = mark.item_depth;
         self.self_ty = mark.self_ty;
         self.self_written = mark.self_written;
+        self.self_trait = mark.self_trait;
         self.self_depth = mark.self_depth;
         self.allow_self = mark.allow_self;
         self.self_type_walk = mark.self_type_walk;
@@ -1308,6 +1334,7 @@ impl AnalyzeVisitor {
 
     /// Returns the context of `ty` at `depth` if it can be leaked whole for its own path, else the
     /// conflict (its path should be absolute).
+    #[allow(clippy::result_large_err)]
     fn own_context(
         &self,
         ty: &Type,
@@ -1317,27 +1344,34 @@ impl AnalyzeVisitor {
         if self.impossibles.len() > inner.impossible_start {
             let mut conflict =
                 self.conflict_causes(inner.must_start, inner.impossible_start, depth);
-            conflict.note = inner
+            let advice = inner
                 .binder
                 .as_ref()
                 .filter(|(owner, _)| *owner == depth)
-                .map(|(_, lifetime)| binder_note(lifetime, true))
+                .map(|(_, advice)| advice.clone())
                 .or_else(|| {
-                    let (_, note) = inner
+                    let (_, advice) = inner
                         .elision
                         .as_ref()
                         .filter(|(owner, _)| *owner == depth)?;
-                    Some(note.clone())
+                    Some(advice.clone())
                 });
+            if let Some(advice) = advice {
+                advice.give(&mut conflict);
+            }
             if let (None, Some(lifetime)) = (&conflict.note, &inner.unconstrained) {
                 conflict.note = Some(unconstrained_note(lifetime, true));
+                conflict.help = unconstrained_help(&conflict, lifetime, true);
                 conflict.headline = unconstrained_headline(&conflict, lifetime);
             }
-            if let (Some(cause), Some(SelfRequirement::Type(self_ty))) =
+            if let (Some(cause), Some(SelfRequirement::Type(_))) =
                 (&inner.assoc_self, &self.self_ty)
             {
-                conflict.note = Some(assoc_self_note(cause, self_ty));
-                conflict.headline = Some(assoc_self_headline(cause));
+                AssocSelf::new(cause.clone(), self.self_trait.clone()).give(
+                    &mut conflict,
+                    ty,
+                    false,
+                );
             }
             return Err(conflict);
         }
@@ -1350,6 +1384,10 @@ impl AnalyzeVisitor {
                 is_own: true,
                 optional: false,
                 note: Some("a default of a parameter cannot depend on `Self`".to_string()),
+                help: Some(format!(
+                    "write the default without `Self`: name the type instead of `Self` in `{}`",
+                    tidy(&quote!(#ty))
+                )),
                 // The fault is not that the path is relative: the first cause is `Self`.
                 headline: Some(format!(
                     "`{}` is in the default of a parameter, and names `Self`",
@@ -1366,6 +1404,11 @@ impl AnalyzeVisitor {
                     is_own: true,
                     optional: false,
                     note: Some(unnameable.note),
+                    help: Some(format!(
+                        "{}, or write `{}` with an absolute path, so that it is not leaked",
+                        unnameable.help,
+                        tidy(&quote!(#ty))
+                    )),
                     headline: Some(unnameable.headline),
                 })
             }
@@ -1373,12 +1416,18 @@ impl AnalyzeVisitor {
         match self.self_in_bounds(&context) {
             Some(self_path) => Err(CheckResult {
                 must: vec![quote!(#ty)],
-                impossible: vec![self_path],
+                impossible: vec![self_path.clone()],
                 is_own: true,
                 optional: false,
                 note: Some(
                     "the bounds of its generics mention `Self`, which cannot be leaked".to_string(),
                 ),
+                help: Some(format!(
+                    "write the bound of the generics of `{}` without `{}`, or analyze the item \
+                     with `allow_self = true`",
+                    tidy(&quote!(#ty)),
+                    tidy(&self_path)
+                )),
                 // The fault is the bound, not the path of the type that uses it.
                 headline: Some(format!(
                     "`{}` has a generic whose bound mentions `Self`, which cannot be leaked",
@@ -1397,10 +1446,8 @@ impl AnalyzeVisitor {
     /// `A` from. (The impl for the implementor of a trait can write it: `__S::A`.)
     fn associated_self_in_bounds(&self, context: &Context) -> Option<AssocSelf> {
         match context.self_ty() {
-            Some(SelfRequirement::Type(self_ty)) => {
-                first_associated_self_in_generics(context.generics())
-                    .map(|cause| AssocSelf::new(cause, self_ty))
-            }
+            Some(SelfRequirement::Type(_)) => first_associated_self_in_generics(context.generics())
+                .map(|cause| AssocSelf::new(cause, self.self_trait.clone())),
             _ => None,
         }
     }
@@ -1414,6 +1461,7 @@ impl AnalyzeVisitor {
             && self.own_context(ty, depth, inner).is_ok()
     }
 
+    #[allow(clippy::result_large_err)]
     fn decide(&mut self, ty: &Type, depth: usize, ambiguous: bool, mut inner: Frame) {
         // `Self` (or `Self::A`) that the copy writes as a type with lifetimes, in the inputs of a
         // signature whose output relies on elision: `Self` is no entry, so it is the type holding
@@ -1423,8 +1471,8 @@ impl AnalyzeVisitor {
         if let Some((elision, added)) = self.self_elision_broken(ty) {
             if elision.owner > 0 {
                 self.musts.push((elision.owner, quote!(#ty), false));
-                let note = self_elision_note(&added, &elision, true);
-                inner.elision = Some((elision.owner, note));
+                let advice = self_elision_advice(&added, &elision, true, self.allow_self);
+                inner.elision = Some((elision.owner, advice));
                 inner.min_depth = inner.min_depth.min(elision.owner);
                 return self.decide_as_owner(elision.owner, inner);
             }
@@ -1433,7 +1481,7 @@ impl AnalyzeVisitor {
             let mut conflict =
                 self.conflict_causes(inner.must_start, inner.impossible_start, depth);
             conflict.impossible.insert(0, elision.output.clone());
-            conflict.note = Some(self_elision_note(&added, &elision, false));
+            self_elision_advice(&added, &elision, false, self.allow_self).give(&mut conflict);
             self_conflict = Some(conflict);
         }
         if inner.min_depth != depth && self.is_ambiguous_owner(ty, depth, &inner) {
@@ -1455,13 +1503,13 @@ impl AnalyzeVisitor {
         };
         if let Some((lifetime, owner)) = binder {
             if owner > 0 {
-                inner.binder = Some((owner, lifetime));
+                inner.binder = Some((owner, binder_advice(&lifetime, ty, true)));
                 return self.decide_as_owner(owner, inner);
             }
             let mut conflict =
                 self.conflict_causes(inner.must_start, inner.impossible_start, depth);
             conflict.impossible.insert(0, quote!(#lifetime));
-            conflict.note = Some(binder_note(&lifetime, false));
+            binder_advice(&lifetime, ty, false).give(&mut conflict);
             own = Some(Err(conflict));
         }
         // The same for a type that adds lifetimes to the inputs of a signature whose output relies
@@ -1473,14 +1521,14 @@ impl AnalyzeVisitor {
         };
         if let Some((elision, added)) = broken {
             if elision.owner > 0 {
-                let note = elision_note(&added, &elision, true);
-                inner.elision = Some((elision.owner, note));
+                let advice = elision_advice(&added, &elision, ty, true);
+                inner.elision = Some((elision.owner, advice));
                 return self.decide_as_owner(elision.owner, inner);
             }
             let mut conflict =
                 self.conflict_causes(inner.must_start, inner.impossible_start, depth);
             conflict.impossible.insert(0, elision.output.clone());
-            conflict.note = Some(elision_note(&added, &elision, false));
+            elision_advice(&added, &elision, ty, false).give(&mut conflict);
             own = Some(Err(conflict));
         }
         if let Some(Ok(_)) = &own {
@@ -1723,6 +1771,12 @@ impl AnalyzeVisitor {
                     "`{}` names `Self` in a bound or where predicate of its trait",
                     quote!(#ty)
                 ));
+                // The type names `Self`, so an absolute path is no fix.
+                error.help = Some(format!(
+                    "write the predicate of the trait without `{0}`, or use `{0}` outside the \
+                     predicates of the trait (in a method, a field or a signature)",
+                    tidy(&quote!(#ty))
+                ));
                 Some(error)
             }
         }
@@ -1798,11 +1852,11 @@ impl AnalyzeVisitor {
             impossible: Vec::new(),
             is_own: true,
             optional: false,
-            note: Some(format!(
-                "{}. Write the leaked type of the bound with an absolute path, or use `{}` outside \
+            note: Some(why),
+            help: Some(format!(
+                "write the leaked type of the bound with an absolute path, or use `{}` outside \
                  the bounds and where predicates",
-                why,
-                quote!(#ty)
+                tidy(&quote!(#ty))
             )),
             headline: Some(format!(
                 "`{}` is in a bound or where predicate, and a bound of its generics names a leaked \
@@ -1824,11 +1878,11 @@ impl AnalyzeVisitor {
             impossible: Vec::new(),
             is_own: true,
             optional: false,
-            note: Some(format!(
-                "{}. {}, or use `{}` outside the bounds and where predicates",
-                why,
+            note: Some(why),
+            help: Some(format!(
+                "{}, or use `{}` outside the bounds and where predicates",
                 named.advice(),
-                quote!(#ty)
+                tidy(&quote!(#ty))
             )),
             headline: Some(format!(
                 "`{}` is in a bound or where predicate, and a bound of its generics names {}",
@@ -2112,6 +2166,7 @@ impl AnalyzeVisitor {
             is_own: true,
             optional: false,
             note: None,
+            help: None,
             headline: None,
         }));
     }
@@ -2124,6 +2179,8 @@ impl AnalyzeVisitor {
             self.visit_attribute(attr);
         }
         let outer = self.self_type_walk.replace(false);
+        let trait_ = i.trait_.as_ref().map(|(_, path, _)| self.impl_trait(path));
+        let outer_trait = std::mem::replace(&mut self.self_trait, trait_);
         self.visit_generics(&i.generics);
         if let Some((_, path, _)) = &i.trait_ {
             self.visit_path(path);
@@ -2140,6 +2197,7 @@ impl AnalyzeVisitor {
         if self.self_type_walk == Some(true) {
             self.block_unstable_self_types(start, end);
         }
+        self.self_trait = outer_trait;
         self.self_type_walk = outer;
     }
 
@@ -2219,6 +2277,14 @@ impl AnalyzeVisitor {
             true
         } else {
             false
+        }
+    }
+
+    /// The trait `path` of an impl, for the messages that name it.
+    fn impl_trait(&self, path: &Path) -> ImplTrait {
+        ImplTrait {
+            path: path.clone(),
+            absolute: self.is_context_free(path),
         }
     }
 
@@ -2391,6 +2457,7 @@ impl AnalyzeVisitor {
         let declares = self_ty.is_some();
         let outer = std::mem::replace(&mut self.self_ty, self_ty);
         let outer_written = std::mem::replace(&mut self.self_written, written);
+        let outer_trait = self.self_trait.take();
         let outer_depth = self.self_depth;
         self.with_item_generics_of(generics, gats, |visitor| {
             visitor.self_depth = if declares { visitor.scopes.len() } else { 0 };
@@ -2398,6 +2465,7 @@ impl AnalyzeVisitor {
         });
         self.self_ty = outer;
         self.self_written = outer_written;
+        self.self_trait = outer_trait;
         self.self_depth = outer_depth;
         self.allow_self = allow_self;
     }
@@ -2579,6 +2647,7 @@ impl AnalyzeVisitor {
                     let mut conflict = conflict.clone();
                     conflict.impossible.insert(0, quote!(#lifetime));
                     conflict.note = Some(unconstrained_note(lifetime, false));
+                    conflict.help = unconstrained_help(&conflict, lifetime, false);
                     conflict.headline = unconstrained_headline(&conflict, lifetime);
                     conflicts.push(conflict);
                 }
@@ -3002,6 +3071,7 @@ impl AnalyzeVisitor {
                 result.impossible.extend(without_meaning.iter().cloned());
                 result.optional = false;
                 result.note.get_or_insert_with(|| SELF_NOTE.to_string());
+                result.help.get_or_insert_with(|| SELF_HELP.to_string());
             }
             result
         }));
@@ -3701,46 +3771,121 @@ impl<'ast> Visit<'ast> for Lifetimes {
     }
 }
 
+/// The trait that an impl implements, as written.
+#[derive(Clone)]
+struct ImplTrait {
+    path: Path,
+    /// The path does not depend on the context (see [`AnalyzeVisitor::is_context_free()`]), so the
+    /// copy can name the trait with it.
+    absolute: bool,
+}
+
 /// A `Self::A` that the Repeater's impl for the type `Self` cannot write (see
 /// [`AnalyzeVisitor::associated_self_in_bounds()`]).
 struct AssocSelf {
+    /// The path, `Self::A` or longer.
     cause: TokenStream,
-    self_ty: Type,
+    /// The trait of the impl that `Self` is the self type of, if it is an impl of a trait (not a
+    /// struct, an enum, a union or an inherent impl).
+    trait_: Option<ImplTrait>,
 }
 
 impl AssocSelf {
-    fn new(cause: TokenStream, self_ty: &Type) -> Self {
-        Self {
-            cause,
-            self_ty: self_ty.clone(),
-        }
+    fn new(cause: TokenStream, trait_: Option<ImplTrait>) -> Self {
+        Self { cause, trait_ }
     }
 
     /// The conflict of the type `ty` leaked whole, with the generics that name it.
     fn of(self, ty: &Type) -> CheckResult {
-        CheckResult {
+        let mut conflict = CheckResult {
             must: vec![quote!(#ty)],
             impossible: vec![self.cause.clone()],
             is_own: true,
             optional: false,
-            note: Some(assoc_self_note(&self.cause, &self.self_ty)),
-            headline: Some(assoc_self_headline(&self.cause)),
-        }
+            note: None,
+            help: None,
+            headline: None,
+        };
+        self.give(&mut conflict, ty, true);
+        conflict
+    }
+
+    /// Puts the headline, the note and the help in `conflict`, the conflict of `ty`. `in_bounds`:
+    /// the path is in a bound of the generics of `ty`, not in `ty`.
+    fn give(self, conflict: &mut CheckResult, ty: &Type, in_bounds: bool) {
+        // The paths as a user writes them: without the spaces of a token stream.
+        let cause = tidy(&self.cause);
+        let path = syn::parse2::<Path>(self.cause.clone()).ok();
+        let item = path
+            .as_ref()
+            .and_then(|path| path.segments.iter().nth(1))
+            .map_or_else(|| cause.clone(), |seg| seg.ident.to_string());
+        let qualified = |trait_: &str| match &path {
+            Some(path) => {
+                let rest = Path {
+                    leading_colon: None,
+                    segments: path.segments.iter().skip(1).cloned().collect(),
+                };
+                format!("<Self as {}>::{}", trait_, tidy(&quote!(#rest)))
+            }
+            None => format!("<Self as {}>::..", trait_),
+        };
+        let ty = tidy(&quote!(#ty));
+        let place = if in_bounds {
+            format!(" in a bound of the generics of `{}`", ty)
+        } else if ty != cause {
+            format!(" in `{}`", ty)
+        } else {
+            String::new()
+        };
+        // What the headline suggests, what the help replaces it with, why, and what else to do.
+        let (suggested, replacement, why, how) = match &self.trait_ {
+            Some(trait_) => {
+                let written = &trait_.path;
+                let written_text = tidy(&quote!(#written));
+                let (replacement, how) = if trait_.absolute {
+                    (qualified(&written_text), String::new())
+                } else {
+                    (
+                        qualified(&absolute_example(written)),
+                        format!(", with `{}` written as an absolute path", written_text),
+                    )
+                };
+                (
+                    qualified(&written_text),
+                    replacement,
+                    format!("the trait of this impl (`{}`)", written_text),
+                    how,
+                )
+            }
+            None => (
+                qualified("SomeTrait"),
+                qualified("SomeTrait"),
+                "a trait that this type implements".to_string(),
+                format!(
+                    ", naming the trait that defines `{}` with its absolute path",
+                    item
+                ),
+            ),
+        };
+        conflict.headline = Some(format!(
+            "write `{}` instead of `{}`{}: the copy cannot tell which trait `{}` comes from",
+            suggested, cause, place, item
+        ));
+        conflict.note = Some(format!(
+            "`{}` is shorthand that rustc resolves through {}. In the copy it is written in an \
+             impl of the Repeater, which has no such trait (E0220, or E0223 ambiguous associated \
+             type), so the trait must be written out. `Self` itself is fine",
+            cause, why
+        ));
+        conflict.help = Some(format!("replace `{}` with `{}`{}", cause, replacement, how));
     }
 }
 
-fn assoc_self_headline(cause: &TokenStream) -> String {
-    format!("`{}` cannot be written in the impl of the Repeater", cause)
-}
-
-fn assoc_self_note(cause: &TokenStream, self_ty: &Type) -> String {
-    format!(
-        "`{}` is an associated item of `Self`, which is the type `{}` here, and the impl of the \
-         Repeater for that type has no trait to take it from: name the trait with its absolute \
-         path (`<Self as ::path::Trait>::..`)",
-        cause,
-        quote!(#self_ty)
-    )
+/// An absolute path for the example of a relative one: `Tr` is `::my_crate::Tr`.
+fn absolute_example(path: &Path) -> String {
+    let rest = without_crate_prefix(path);
+    format!("::my_crate::{}", tidy(&quote!(#rest)))
 }
 
 /// Cuts the entries of the self type of an impl for which `conflict` returns the conflict (see
@@ -3886,6 +4031,11 @@ fn self_type_conflict(pending: &PendingType, declared: &Generics) -> Option<Chec
             shown
         )
     };
+    let help = format!(
+        "write `{}` with an absolute path, or the bound of its generics without `{}`",
+        tidy(&quote!(#ty)),
+        tidy(&cause)
+    );
     Some(CheckResult {
         must: vec![quote!(#ty)],
         impossible: vec![cause],
@@ -3893,10 +4043,10 @@ fn self_type_conflict(pending: &PendingType, declared: &Generics) -> Option<Chec
         optional: false,
         note: Some(format!(
             "{}. The copy writes `{}` as a path through the Repeater, whose impl is for `Self`, \
-             so the Referrer has no type to write for `Self`: it is the one being replaced. Write \
-             the self type with an absolute path, or the bounds of its generics without `Self`",
+             so the Referrer has no type to write for `Self`: it is the one being replaced",
             what, shown
         )),
+        help: Some(help),
         headline: Some(format!(
             "`{}` is in the self type of the impl, and a bound of its generics names `Self`",
             shown
@@ -3940,6 +4090,26 @@ fn unconstrained_headline(conflict: &CheckResult, lifetime: &Lifetime) -> Option
     ))
 }
 
+/// What to write instead, for the conflict that `unconstrained_note()` explains. `object`: the
+/// type is a trait object that defaults to the lifetime.
+fn unconstrained_help(conflict: &CheckResult, lifetime: &Lifetime, object: bool) -> Option<String> {
+    let cause = conflict.must.first()?;
+    let mut options = vec![
+        format!(
+            "keep `{0}` in another argument of the method (for example `&{0} self`)",
+            lifetime
+        ),
+        format!("write `{}` with an absolute path", tidy(cause)),
+    ];
+    if object {
+        options.push(format!(
+            "write the bound of the trait object (`dyn Trait + {}`)",
+            lifetime
+        ));
+    }
+    Some(or_list(options))
+}
+
 /// `object`: the type is a trait object that defaults to the lifetime, else it names it.
 fn unconstrained_note(lifetime: &Lifetime, object: bool) -> String {
     format!(
@@ -3956,9 +4126,10 @@ fn unconstrained_note(lifetime: &Lifetime, object: bool) -> String {
     )
 }
 
-/// `owned`: the type holding the binder would be leaked instead.
-fn binder_note(lifetime: &Lifetime, owned: bool) -> String {
-    format!(
+/// The advice for a type `ty` that uses the `for<..>` lifetime `lifetime` of an output that no
+/// input keeps. `owned`: the type holding the binder would be leaked instead.
+fn binder_advice(lifetime: &Lifetime, ty: &Type, owned: bool) -> Advice {
+    let note = format!(
         "`{}` is declared by a `for<..>` binder and used in its output (a return type or an \
          associated type binding), and no input keeps it as written, so a type using it cannot be \
          leaked{}: the copy would have `{}` only in a projection, which does not constrain it \
@@ -3970,7 +4141,15 @@ fn binder_note(lifetime: &Lifetime, owned: bool) -> String {
             ""
         },
         lifetime
-    )
+    );
+    let help = or_list(vec![
+        format!(
+            "keep an input that names `{0}` as written (for example `&{0} u8`)",
+            lifetime
+        ),
+        format!("write `{}` with an absolute path", tidy(&quote!(#ty))),
+    ]);
+    Advice { note, help }
 }
 
 /// Where the elided lifetime of the output comes from, as the notes say it.
@@ -3982,22 +4161,35 @@ fn elision_source(elision: &Elision) -> &'static str {
     }
 }
 
-/// What to do to the signature where the copy cannot keep its elision: the lifetimes are named.
-fn elision_advice(elision: &Elision) -> &'static str {
-    if elision.hidden {
-        ": write the lifetime that the path hides (`Ref<'x, u8>`), and name it in the output"
+/// What to write where the copy cannot keep the elision of the signature: the lifetimes are named
+/// (or the method gets a receiver), or the leaked type `absolute` is written with an absolute path.
+fn elision_options(elision: &Elision, absolute: Option<&Type>) -> Vec<String> {
+    let mut options = vec![if elision.hidden {
+        "write the lifetime that the path hides (`Ref<'x, u8>`), and name it in the output"
+            .to_string()
     } else {
-        ": name the lifetime of the inputs and of the output"
+        "name the lifetime of the inputs and of the output".to_string()
+    }];
+    if !elision.binder {
+        options.push("give the method a receiver (`&self`)".to_string());
     }
+    if let Some(ty) = absolute {
+        options.push(format!(
+            "write `{}` with an absolute path",
+            tidy(&quote!(#ty))
+        ));
+    }
+    options
 }
 
-/// `owned`: the type holding the signature would be leaked instead.
-fn elision_note(added: &[Lifetime], elision: &Elision, owned: bool) -> String {
+/// The advice for the leaked type `ty`, which adds `added` lifetimes to the inputs of a signature
+/// whose output relies on elision. `owned`: the type holding the signature would be leaked instead.
+fn elision_advice(added: &[Lifetime], elision: &Elision, ty: &Type, owned: bool) -> Advice {
     let added: Vec<String> = added
         .iter()
         .map(|lifetime| format!("`{}`", lifetime))
         .collect();
-    format!(
+    let note = format!(
         "the output `{}` has an elided lifetime, which elision takes from {}, but a leaked type in \
          the inputs has {} among its generics, and the copy names {} in the arguments of its \
          projection, so the inputs have more than one lifetime (E0106){}",
@@ -4009,19 +4201,28 @@ fn elision_note(added: &[Lifetime], elision: &Elision, owned: bool) -> String {
             ", so a type using them cannot be leaked alone, and the type holding the signature \
              would be leaked as a whole instead"
         } else {
-            elision_advice(elision)
+            ""
         }
-    )
+    );
+    Advice {
+        note,
+        help: or_list(elision_options(elision, Some(ty))),
+    }
 }
 
-/// The note of a signature whose elision the copy breaks by writing a type with `added` lifetimes
-/// for `Self`.
-fn self_elision_note(added: &[Lifetime], elision: &Elision, owned: bool) -> String {
+/// The advice for a signature whose elision the copy breaks by writing a type with `added`
+/// lifetimes for `Self`.
+fn self_elision_advice(
+    added: &[Lifetime],
+    elision: &Elision,
+    owned: bool,
+    allow_self: bool,
+) -> Advice {
     let added: Vec<String> = added
         .iter()
         .map(|lifetime| format!("`{}`", lifetime))
         .collect();
-    format!(
+    let note = format!(
         "the output `{}` has an elided lifetime, which elision takes from {}, but `Self` in the \
          inputs is a type that has {} among its generics, and the copy writes that type for `Self` \
          (`Visitor::with_self()`), so the inputs have more than one lifetime (E0106){}",
@@ -4031,9 +4232,18 @@ fn self_elision_note(added: &[Lifetime], elision: &Elision, owned: bool) -> Stri
         if owned {
             ", so the type holding the signature would be leaked as a whole instead"
         } else {
-            elision_advice(elision)
+            ""
         }
-    )
+    );
+    let mut options = elision_options(elision, None);
+    // With `allow_self = true`, the holder keeps `Self` as written, if it can be leaked.
+    if !allow_self {
+        options.push("analyze the item with `allow_self = true`".to_string());
+    }
+    Advice {
+        note,
+        help: or_list(options),
+    }
 }
 
 fn output_lifetimes(

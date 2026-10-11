@@ -439,6 +439,13 @@ fn check_self_has_no_meaning_in_generics_and_modules() {
         assert_eq!(strings(&own.impossible), ["Self"]);
         let note = own.note.expect("a note");
         assert!(note.starts_with("`Self` has no meaning here"), "{}", note);
+        // And the help tells what to write.
+        let help = own.help.expect("a help");
+        assert!(
+            help.starts_with("write the type instead of `Self`, or enter a scope"),
+            "{}",
+            help
+        );
         assert_eq!(strings(&assoc.impossible), ["Self :: Item"]);
         assert!(assoc.note.is_some());
         // A type that holds it is a conflict if it is a cause itself, and its parts can be leaked
@@ -613,6 +620,8 @@ fn check_reports_the_conflict_a_scope_reports() {
     assert!(forbidden.is_own);
     let note = forbidden.note.clone().expect("a note");
     assert!(note.contains("mention `Self`"), "{}", note);
+    let help = forbidden.help.clone().expect("a help");
+    assert!(help.contains("`allow_self = true`"), "{}", help);
     // It is what the scope reports for the same type.
     let err = leaker
         .enter_type(&item.ident, &item.generics, false, |view| {
@@ -628,6 +637,7 @@ fn check_reports_the_conflict_a_scope_reports() {
                 strings(&forbidden.impossible)
             );
             assert_eq!(conflicts[0].note, forbidden.note);
+            assert_eq!(conflicts[0].help, forbidden.help);
         }
         other => panic!("{:?}", other),
     }

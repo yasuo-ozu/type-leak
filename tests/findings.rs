@@ -135,6 +135,29 @@ fn all_notes(err: &NotInternableError) -> Vec<String> {
         .collect()
 }
 
+/// The helps of all the errors of `err`, in order.
+fn all_helps(err: &NotInternableError) -> Vec<String> {
+    err.items()
+        .filter_map(|item| item.help.map(|(_, help)| help))
+        .collect()
+}
+
+/// Tokens as a help writes them: `Wrap < T >` is `Wrap<T>`, and `Self :: A` is `Self::A`.
+fn plain(text: &str) -> String {
+    [
+        (" :: ", "::"),
+        (":: ", "::"),
+        (" ::", "::"),
+        (" <", "<"),
+        ("< ", "<"),
+        (" >", ">"),
+        ("& ", "&"),
+        (" ,", ","),
+    ]
+    .iter()
+    .fold(text.to_string(), |text, (from, to)| text.replace(from, to))
+}
+
 /// What the bound that an error of an unstable bound blames names (`Why` of `src/unstable.rs`).
 #[derive(Clone, Copy)]
 enum Blames<'a> {
@@ -217,15 +240,15 @@ fn assert_unstable<T>(
     let (what, advice) = match blames {
         Blames::Leaked | Blames::LeakedInImpl => (
             "a leaked type".to_string(),
-            "Write the leaked type of the bound with an absolute path".to_string(),
+            "write the leaked type of the bound with an absolute path".to_string(),
         ),
         Blames::SelfType => (
             "`Self`, which is a leaked type".to_string(),
-            "Write the bound without `Self`".to_string(),
+            "write the bound without `Self`".to_string(),
         ),
         Blames::SelfAssoc(path) | Blames::Projection(path) => (
             format!("`{}`", path),
-            format!("Write the bound without `{}`", path),
+            format!("write the bound without `{}`", plain(path)),
         ),
     };
     let headline = format!(
@@ -233,11 +256,14 @@ fn assert_unstable<T>(
         ty, what
     );
     let err = assert_rejected(item, result, &[&headline]);
-    let note = format!(
-        "{}. {}, or use `{}` outside the bounds and where predicates",
-        why, advice, ty
+    // The note says why, and the help what to write.
+    assert_eq!(all_notes(&err), [why], "`{}`", string(item));
+    let help = format!(
+        "{}, or use `{}` outside the bounds and where predicates",
+        advice,
+        plain(ty)
     );
-    assert_eq!(all_notes(&err), [note], "`{}`", string(item));
+    assert_eq!(all_helps(&err), [help], "`{}`", string(item));
     err
 }
 
@@ -827,9 +853,15 @@ fn f06_impl_assoc_type_of_self_in_repeater() {
         ),
         Err(err) => err,
     };
+    // The headline says what to write, with the trait of the impl.
     assert_eq!(
         err.to_string(),
-        "`Self :: A` cannot be written in the impl of the Repeater"
+        "write `<Self as ::leaker::m::Tr>::A` instead of `Self::A` in `Rel<Self::A>`: the copy \
+         cannot tell which trait `A` comes from"
+    );
+    assert_eq!(
+        err.help().as_deref(),
+        Some("replace `Self::A` with `<Self as ::leaker::m::Tr>::A`")
     );
 
     // A bound of the generics of the entry that names it.
@@ -839,7 +871,17 @@ fn f06_impl_assoc_type_of_self_in_repeater() {
             fn f(&self, x: Rel<T>) {}
         }
     };
-    assert!(new_leaker().intern_impl(&item, true).is_err());
+    let err = new_leaker().intern_impl(&item, true).unwrap_err();
+    let messages: Vec<String> = err.items().map(|item| item.message).collect();
+    assert_eq!(
+        messages[..2],
+        [
+            "write `<Self as ::leaker::m::Tr>::A` instead of `Self::A` in a bound of the \
+             generics of `W<T>`: the copy cannot tell which trait `A` comes from",
+            "write `<Self as ::leaker::m::Tr>::A` instead of `Self::A` in a bound of the \
+             generics of `Rel<T>`: the copy cannot tell which trait `A` comes from"
+        ]
+    );
 
     // Accepted: not in an entry, or the trait is named, or in a trait.
     let impls: Vec<ItemImpl> = vec![
@@ -4664,7 +4706,7 @@ fn f28_hidden_lifetime_in_elided_signature_with_generics() {
             f12_copy_with(f13_leaker(), item),
             &["use absolute path: 'Rel < T >'"],
         );
-        // The note says that the lifetime is hidden by a path, and how to write it.
+        // The note says that the lifetime is hidden by a path, and the help how to write it.
         assert_eq!(
             all_notes(&err),
             [
@@ -4672,12 +4714,22 @@ fn f28_hidden_lifetime_in_elided_signature_with_generics() {
                  lifetime of the inputs, which a path hides (the Leaker does not see it), but a \
                  leaked type in the inputs has `'a` among its generics, and the copy names it in \
                  the arguments of its projection, so the inputs have more than one lifetime \
-                 (E0106): write the lifetime that the path hides (`Ref<'x, u8>`), and name it in \
-                 the output",
+                 (E0106)",
                 "it cannot be leaked as a whole because of `& u8`"
             ],
             "{}",
             string(item)
+        );
+        let helps = all_helps(&err);
+        assert_eq!(helps.len(), 1, "{}", string(item));
+        assert!(
+            helps[0].starts_with(
+                "write the lifetime that the path hides (`Ref<'x, u8>`), and name it in the \
+                 output, "
+            ) && helps[0].ends_with("or write `Rel<T>` with an absolute path"),
+            "{}: {}",
+            string(item),
+            helps[0]
         );
     }
     // A method with a receiver that is a reference takes the lifetime from it: nothing is hidden.
