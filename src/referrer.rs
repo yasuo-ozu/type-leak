@@ -654,7 +654,8 @@ impl Referrer {
     /// - A struct, enum, union, trait or impl nested in the copy has a `Self` of its own, as in the
     ///   Leaker. A type there that uses a generic of `context` whose bound names `Self` has it
     ///   rewritten for the `Self` of `context` ([Self rules](crate::rules#self-rules)). So the copy must
-    ///   nest the same items as the scopes of the Leaker.
+    ///   nest the same items as the scopes of the Leaker. The entries that depend on the own `Self` of
+    ///   such an item are found only if you call [`Visitor::with_nested_self()`], which writes them.
     ///
     /// Visit the whole item, not a type cut out of another.
     ///
@@ -696,6 +697,7 @@ impl Referrer {
         Visitor {
             referrer: self,
             type_fn: Rc::new(RefCell::new(type_fn)),
+            nested_fn: None,
             self_requirement,
             scopes: vec![scope],
             outermost_as_leakers: false,
@@ -703,6 +705,8 @@ impl Referrer {
             // The items of a module are nested items.
             item_depth: usize::from(in_module),
             own_self: false,
+            nested: None,
+            mod_path: Vec::new(),
             defaults_without_self: false,
             module,
         }
@@ -875,6 +879,55 @@ impl<'a, F: FnMut(Type, usize, &[GenericArgument]) -> Type> syn::fold::Fold for 
     }
 }
 
+/// A struct, enum, union, trait or impl nested in the visited syntax, which has a `Self` of its own.
+///
+/// [`Visitor::with_nested_self()`] gives it to the closure that writes the replacement of an entry
+/// that depends on that `Self`. It is the item the visitor is in, and the same `Self` that the
+/// Leaker gave the item when it analyzed it ([Self rules](crate::rules#self-rules)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NestedSelf {
+    /// What `Self` is in the item, as [`Referrer::context_self()`] tells for the entries: the
+    /// item itself with its own generics as arguments (`S<T>`, [`SelfRequirement::Type`]) for a
+    /// struct, enum or union, the trait (`Tr<T>`, [`SelfRequirement::Bound`]) for a trait, and the
+    /// self type as written (before the visitor replaces anything in it) for an impl.
+    pub requirement: SelfRequirement,
+    /// The name of the struct, enum, union or trait. It is `None` for an impl.
+    pub ident: Option<Ident>,
+    /// The `mod` items between the module of the context and the item, outermost first. They are
+    /// those of the copy.
+    pub modules: Vec<Ident>,
+}
+
+/// What a nested item declares, to give it its own `Self`.
+struct Declares {
+    requirement: SelfRequirement,
+    ident: Option<Ident>,
+}
+
+impl Declares {
+    fn of_item(ident: &Ident, generics: &Generics) -> Self {
+        Self {
+            requirement: SelfRequirement::of_item(ident, generics),
+            ident: Some(ident.clone()),
+        }
+    }
+
+    fn of_trait(ident: &Ident, generics: &Generics) -> Self {
+        Self {
+            requirement: SelfRequirement::of_trait(ident, generics),
+            ident: Some(ident.clone()),
+        }
+    }
+
+    fn of_impl(self_ty: &Type) -> Self {
+        Self {
+            requirement: SelfRequirement::Type(self_ty.clone()),
+            ident: None,
+        }
+    }
+}
+
 /// Replaces the leaked types in a copy. Get it with [`Referrer::visitor()`].
 ///
 /// It implements `syn::visit_mut::VisitMut`. It tracks the generics in scope: those of the
@@ -889,10 +942,19 @@ impl<'a, F: FnMut(Type, usize, &[GenericArgument]) -> Type> syn::fold::Fold for 
 /// are visited as items of it ([Modules](crate::rules#modules)). Items and imports declared in a block
 /// hide the leaked types that name them there. Those declared in a module, or in a `File`, hide
 /// the entries of no module that name them.
+///
+/// The visitor keeps the layers of the Leaker's scopes: the context first, then, for each struct,
+/// enum, union, trait or impl nested in the visited syntax, a layer with the `Self` of that item
+/// (it hides the one around). A nested item has no replacement for its own `Self` unless
+/// [`Visitor::with_nested_self()`] says how to write it.
+///
+/// `G` is the closure of [`Visitor::with_nested_self()`]; none by default.
 #[derive(Debug)]
-pub struct Visitor<F> {
+pub struct Visitor<F, G = fn(&NestedSelf, Type, usize) -> Type> {
     referrer: Referrer,
     type_fn: Rc<RefCell<F>>,
+    /// Writes the replacement of an entry that depends on the own `Self` of a nested item.
+    nested_fn: Option<Rc<RefCell<G>>>,
     /// What `Self` means here: in the context, or in the nested item that declares it. Each scope
     /// in `scopes` keeps the one in force where it was declared.
     self_requirement: Option<SelfRequirement>,
@@ -904,30 +966,41 @@ pub struct Visitor<F> {
     /// In a nested struct, enum, union, trait or impl, which declare their own `Self`. A function,
     /// type alias, trait alias, const or static keeps the `Self` around, as in the Leaker.
     own_self: bool,
+    /// The nested item that `own_self` is about, for the closure of `nested_fn`.
+    nested: Option<Rc<NestedSelf>>,
+    /// The `mod` items entered since the module of the context.
+    mod_path: Vec<Ident>,
     /// While the generics of a scope that this visit declares are visited: the defaults of their
     /// parameters have no `Self`, as in the Leaker (see `Visitor::visit_type_param_mut()`).
     defaults_without_self: bool,
     module: ModulePos,
 }
 
-impl<F> Clone for Visitor<F> {
+impl<F, G> Clone for Visitor<F, G> {
     fn clone(&self) -> Self {
         Self {
             referrer: self.referrer.clone(),
             type_fn: self.type_fn.clone(),
+            nested_fn: self.nested_fn.clone(),
             self_requirement: self.self_requirement.clone(),
             scopes: self.scopes.clone(),
             outermost_as_leakers: self.outermost_as_leakers,
             self_ty: self.self_ty.clone(),
             item_depth: self.item_depth,
             own_self: self.own_self,
+            nested: self.nested.clone(),
+            mod_path: self.mod_path.clone(),
             defaults_without_self: self.defaults_without_self,
             module: self.module,
         }
     }
 }
 
-impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
+impl<F, G> Visitor<F, G>
+where
+    F: FnMut(Type, usize) -> Type,
+    G: FnMut(&NestedSelf, Type, usize) -> Type,
+{
     /// Treats the generics of the outermost item visited as those of the context.
     ///
     /// Use it if the copy declares the generics of the scope again, with other bounds. A type that
@@ -974,8 +1047,9 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
     /// Leaked types are still found by their original tokens, and `type_fn` gets them with `Self`
     /// replaced. `Self` is replaced in the other types too, but not in what `type_fn` returns, nor
     /// in receivers (`&self`) or expressions. In a nested struct, enum, union, trait or impl, `Self`
-    /// means something else: it is not replaced, and no leaked type that names it is found.
-    /// The outermost item, or the signature if only that is visited, is not nested.
+    /// means something else: it is not replaced. A leaked type that names it is found only with
+    /// [`Visitor::with_nested_self()`]. The outermost item, or the signature if only that is
+    /// visited, is not nested.
     ///
     /// A `self_ty` with lifetimes (`::p::S<'a>`) gives more input lifetimes to a function pointer
     /// or `Fn(..)` that names `Self` in its inputs and has an elided lifetime in its output
@@ -1005,6 +1079,92 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
     pub fn with_self(mut self, self_ty: Type) -> Self {
         self.self_ty = Some(self_ty);
         self
+    }
+
+    /// Writes the entries that depend on the own `Self` of a nested item with `nested_fn`.
+    ///
+    /// A struct, enum, union, trait or impl nested in the visited syntax (an item of a module or of
+    /// a `File`, or one in a function body) has a `Self` of its own. The Leaker records the entries
+    /// that depend on it: those that name it (`Rel2<Self>` in `struct S<T> { c: Vec<Rel2<Self>> }`),
+    /// and those that use a generic with a bound that names it (`Rel<T>` with `T: ::p::Tr<Self>`).
+    /// The visitor keeps a layer for the item with that `Self`, as the Leaker has it, so it
+    /// computes the same contexts and finds those entries ([Self
+    /// rules](crate::rules#self-rules)).
+    ///
+    /// It calls `nested_fn(nested, leaked, ix)` for them instead of `type_fn`, because only the macro
+    /// knows what to write for the `Self` of the item. The Repeater impl of such an entry is for the
+    /// Leaker's own type (`impl<T> Repeater<(T,), ID, 3> for S<T>`, in the module of the Leaker's
+    /// crate), which the copy cannot name as `Self`: it declares a `S` of its own. `nested` is the
+    /// item ([`NestedSelf`]): from its name, its [`modules`](NestedSelf::modules) and the path of
+    /// the module of the context in the Leaker's crate, the macro writes the type. The usual result
+    /// is `<#self_ty as Repeater<#args, ID, #ix>>::Type`, with `args` from
+    /// [`Referrer::entry_args()`] at a [`UseSite`](crate::UseSite) that has
+    /// [`with_self(self_ty)`](crate::UseSite::with_self), so that a `Self: 'a` of the entry is
+    /// encoded as the impl encodes it. For a nested trait, `Self` is a type that implements the
+    /// Leaker's trait (a host in the copy). `leaked` is the type of the entry, as it is in the
+    /// item, with its `Self`.
+    ///
+    /// Only the layer of the item the visitor is in counts: an entry of the `Self` of the context, or
+    /// of the scope around that the nested item hides, is not found there. The entries that do not
+    /// depend on a `Self`, and all the entries outside nested items, go to `type_fn`.
+    ///
+    /// Without this, the visitor does not find the entries that depend on the own `Self` of a
+    /// nested item, whatever `type_fn` is. The copy keeps their types as written (`Rel2<Self>`), which
+    /// its crate cannot resolve. The `Self` of an item that the visitor is not in a nested position
+    /// of (the outermost item visited, or the signature if only that is visited) is the `Self` of
+    /// the context, and `type_fn` writes it.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// # use syn::visit_mut::VisitMut;
+    /// // In the module `m` of the crate `leaker`.
+    /// let item: ItemStruct = parse_quote!(struct S<T> { a: Rel<T>, b: Rel2<Self>, });
+    /// let mut leaker = Leaker::new();
+    /// let (module, ()) = leaker
+    ///     .enter_mod("m", [item.ident.clone()], |view| {
+    ///         view.visit_item(&Item::Struct(item.clone()))
+    ///     })
+    ///     .unwrap();
+    /// let referrer = leaker.finish();
+    ///
+    /// // The copy is in another crate. `Self` of the Leaker's `S<T>` is `::leaker::m::S<T>` there.
+    /// let mut file = File { shebang: None, attrs: vec![], items: vec![Item::Struct(item)] };
+    /// referrer
+    ///     .clone()
+    ///     .visitor(module, |_, ix| parse_quote!(<() as Repeater<#ix>>::Type))
+    ///     .with_nested_self(|nested, _leaked, ix| {
+    ///         let ident = nested.ident.as_ref().unwrap();
+    ///         parse_quote!(<::leaker::m::#ident<T> as Repeater<#ix>>::Type)
+    ///     })
+    ///     .visit_file_mut(&mut file);
+    /// let expected: File = parse_quote! {
+    ///     struct S<T> {
+    ///         a: <() as Repeater<0usize>>::Type,
+    ///         b: <::leaker::m::S<T> as Repeater<1usize>>::Type,
+    ///     }
+    /// };
+    /// assert_eq!(file, expected);
+    /// ```
+    pub fn with_nested_self<N: FnMut(&NestedSelf, Type, usize) -> Type>(
+        self,
+        nested_fn: N,
+    ) -> Visitor<F, N> {
+        Visitor {
+            referrer: self.referrer,
+            type_fn: self.type_fn,
+            nested_fn: Some(Rc::new(RefCell::new(nested_fn))),
+            self_requirement: self.self_requirement,
+            scopes: self.scopes,
+            outermost_as_leakers: self.outermost_as_leakers,
+            self_ty: self.self_ty,
+            item_depth: self.item_depth,
+            own_self: self.own_self,
+            nested: self.nested,
+            mod_path: self.mod_path,
+            defaults_without_self: self.defaults_without_self,
+            module: self.module,
+        }
     }
 
     // For a module, only entries with no module are hidden: the others are keyed by their module.
@@ -1075,18 +1235,25 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
         &mut self,
         attrs: &mut [Attribute],
         generics: &mut Generics,
-        declares: Option<SelfRequirement>,
+        declares: Option<Declares>,
         item: bool,
     ) -> Self {
         self.visit_attrs(attrs);
         let mut visitor = self.clone();
         visitor.item_depth += 1;
         // Only an item nested in the visited syntax that declares `Self` has one of its own: the
-        // Leaker keeps the `Self` around for a function, a type alias or a trait alias.
+        // Leaker keeps the `Self` around for a function, a type alias or a trait alias. The layer
+        // of the item is the Leaker's: its `Self` is allowed whatever `allow_self` the scope
+        // around has (`AnalyzeVisitor::with_item_of()`), so entries that name it exist.
         if self.item_depth > 0 {
             if let Some(declared) = declares {
                 visitor.own_self = true;
-                visitor.self_requirement = Some(declared);
+                visitor.nested = Some(Rc::new(NestedSelf {
+                    requirement: declared.requirement.clone(),
+                    ident: declared.ident,
+                    modules: self.mod_path.clone(),
+                }));
+                visitor.self_requirement = Some(declared.requirement);
             }
         }
         // Declare before visiting: every parameter is in scope of each other's bounds. The
@@ -1120,16 +1287,39 @@ impl<F: FnMut(Type, usize) -> Type> Visitor<F> {
     }
 }
 
-impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
+impl<F, G> VisitMut for Visitor<F, G>
+where
+    F: FnMut(Type, usize) -> Type,
+    G: FnMut(&NestedSelf, Type, usize) -> Type,
+{
     fn visit_type_mut(&mut self, i: &mut Type) {
-        let (self_ty, no_self) = (self.self_requirement.as_ref(), self.own_self);
-        *i = self.referrer.expand_with(
+        // In a nested item, the entries that name its own `Self` are found, and written by
+        // `nested_fn`; with none, `Self` hides the one around and nothing that names it is found.
+        let nested = match (&self.nested, &self.nested_fn) {
+            (Some(nested), Some(nested_fn)) if self.own_self => Some((nested, nested_fn)),
+            _ => None,
+        };
+        let self_ty = self.self_requirement.as_ref();
+        let own_self = self.own_self;
+        let no_self = own_self && nested.is_none();
+        let referrer = &self.referrer;
+        let mut type_fn = self.type_fn.borrow_mut();
+        let replace = |ty: Type, ix: usize| -> Type {
+            match nested {
+                Some((nested, nested_fn)) if referrer.entry_context(ix).self_ty().is_some() => {
+                    let mut nested_fn = nested_fn.borrow_mut();
+                    (*nested_fn)(nested, ty, ix)
+                }
+                _ => (*type_fn)(ty, ix),
+            }
+        };
+        *i = referrer.expand_with(
             Matching::Scope { self_ty, no_self },
             self.module,
             &mut self.scopes,
-            self.self_ty.as_ref().filter(|_| !no_self),
+            self.self_ty.as_ref().filter(|_| !own_self),
             i.clone(),
-            &mut *self.type_fn.borrow_mut(),
+            replace,
         );
     }
     fn visit_receiver_mut(&mut self, i: &mut Receiver) {
@@ -1186,19 +1376,19 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         }
     }
     fn visit_item_struct_mut(&mut self, i: &mut ItemStruct) {
-        let declares = SelfRequirement::of_item(&i.ident, &i.generics);
+        let declares = Declares::of_item(&i.ident, &i.generics);
         self.enter(&mut i.attrs, &mut i.generics, Some(declares), true)
             .visit_fields_mut(&mut i.fields);
     }
     fn visit_item_enum_mut(&mut self, i: &mut ItemEnum) {
-        let declares = SelfRequirement::of_item(&i.ident, &i.generics);
+        let declares = Declares::of_item(&i.ident, &i.generics);
         let mut visitor = self.enter(&mut i.attrs, &mut i.generics, Some(declares), true);
         for variant in i.variants.iter_mut() {
             visitor.visit_variant_mut(variant);
         }
     }
     fn visit_item_trait_mut(&mut self, i: &mut ItemTrait) {
-        let declares = SelfRequirement::of_trait(&i.ident, &i.generics);
+        let declares = Declares::of_trait(&i.ident, &i.generics);
         let gats = Gat::of_items(&i.items);
         let depth = self.scopes.len();
         let mut visitor = self.enter(&mut i.attrs, &mut i.generics, Some(declares), true);
@@ -1224,7 +1414,7 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         }
     }
     fn visit_item_union_mut(&mut self, i: &mut ItemUnion) {
-        let declares = SelfRequirement::of_item(&i.ident, &i.generics);
+        let declares = Declares::of_item(&i.ident, &i.generics);
         self.enter(&mut i.attrs, &mut i.generics, Some(declares), true)
             .visit_fields_named_mut(&mut i.fields);
     }
@@ -1236,7 +1426,7 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         self.enter_signature(&mut [], i, true);
     }
     fn visit_item_impl_mut(&mut self, i: &mut ItemImpl) {
-        let declares = SelfRequirement::Type((*i.self_ty).clone());
+        let declares = Declares::of_impl(&i.self_ty);
         let mut visitor = self.enter(&mut i.attrs, &mut i.generics, Some(declares), true);
         if let Some((_, path, _)) = &mut i.trait_ {
             visitor.visit_path_mut(path);
@@ -1259,9 +1449,11 @@ impl<F: FnMut(Type, usize) -> Type> VisitMut for Visitor<F> {
         if let Some((_, items)) = &mut i.content {
             let mut visitor = self.clone();
             visitor.module = self.referrer.module_in(self.module, &i.ident);
+            visitor.mod_path.push(i.ident.clone());
             // A module has no generics: it only makes its items nested. `Self` has no meaning in it.
             visitor.item_depth += 1;
             visitor.self_requirement = None;
+            visitor.nested = None;
             visitor.shadow_items(items.iter(), true);
             for item in items.iter_mut() {
                 visitor.visit_item_mut(item);

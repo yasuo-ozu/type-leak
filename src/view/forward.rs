@@ -29,7 +29,9 @@ impl View<'_> {
     /// ([`Leaker::intern_mod()`](crate::Leaker::intern_mod)). Its generics are local, and the
     /// generics around stay in scope. To analyze an item with its own generics as the root, use
     /// an `intern_*` method instead. A struct, enum, union, trait or impl declares its own `Self`,
-    /// which may be interned whatever `allow_self` the scope around has.
+    /// which may be interned whatever `allow_self` the scope around has. The copy's
+    /// [`Visitor`](crate::Visitor) finds the entries that name it with
+    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self).
     pub fn visit_item(&mut self, item: &Item) {
         Visit::visit_item(&mut *self.visitor, item)
     }

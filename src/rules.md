@@ -270,6 +270,16 @@ Bounds written for another `Self`:
 - Where `Self` is the same, nothing is rewritten. The exception is the default of a type parameter of a scope: it has no `Self`, so the bounds around it are rewritten for the `Self` that declared them (or fail), whatever `Self` the scope has. `Referrer::visitor(context, ..)` does the same for the defaults of the scopes it visits.
 - A nested function, type alias, trait alias, const or static has no `Self` of its own, in the Leaker and in the Referrer.
 
+The own `Self` of a nested item:
+
+- A struct, enum, union, trait or impl that `View::visit_item()` or `intern_mod()` visits has a `Self` of its own, and the Leaker records the entries that depend on it, whatever `allow_self` the scope around has (`Rel2<Self>` in `struct S<T> { c: Vec<Rel2<Self>> }`, or `Rel<T>` where a bound of `T` names `Self`). The `Self` of the scope around is hidden in the item.
+- The Repeater impl of such an entry is for the Leaker's own type (`impl<T> Repeater<(T,), ID, IX> for S<T>`, in the module of the Leaker's crate). The copy declares a `S` of its own, so it cannot name that type as `Self`.
+- So `Visitor::with_nested_self(|nested, leaked, ix| ..)` writes the replacement of these entries. `nested` (`NestedSelf`) is the item: what `Self` is (`Referrer::context_self()` of the entries), its name, and the `mod` items around it. The macro knows where the item is in the Leaker's crate, and writes `<ITS_TYPE as Repeater<ARGS, ID, IX>>::Type`. `ARGS` is `Referrer::entry_args()` at a `UseSite` with `with_self(ITS_TYPE)`. For a nested trait, `Self` is the type that implements the Leaker's trait (a host).
+- The visitor finds these entries the way the Leaker did: it keeps a layer for each nested item, with the `Self` of the item, and computes the same contexts. An entry of the `Self` of the context, or of a scope around that the nested item hides, is not found in it.
+- Without `with_nested_self()` they are not found, whatever `type_fn` is, and the copy keeps `Rel2<Self>`. It does not compile in the other crate.
+- A nested item allows its `Self` even if the scope around has `allow_self = false`. The scope's own `Self` is denied as usual, so no entry names it, and the visitor finds none.
+- The copy must nest the items as the Leaker did. For a scope that is not a module (`enter_generics()`, `enter_type()`..), an item is nested in a function body of the copy; the outermost item of the copy is the scope itself.
+
 `Self: 'a`:
 
 - It is encoded by the `*_with_self()` encoders, with `Referrer::context_self_outlives()`. The impl does not declare it. See [Outlives bounds](#outlives-bounds).

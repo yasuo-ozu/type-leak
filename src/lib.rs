@@ -37,6 +37,6 @@ pub use crate::encode::{
 pub use crate::error::{ErrorItem, NotInternableError};
 pub use crate::helpers::{ImplSelf, RepeaterImpl, UseSite};
 pub use crate::leaker::Leaker;
-pub use crate::referrer::{Referrer, Visitor};
+pub use crate::referrer::{NestedSelf, Referrer, Visitor};
 pub use crate::repeater::{repeater_definition, RepeaterSlots};
 pub use crate::view::View;

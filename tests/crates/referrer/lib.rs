@@ -145,4 +145,8 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9052!(path = ::type_leak_test_leaker::kinds);
     // A trait implemented for an unsized type: `dyn Host9053`.
     type_leak_test_leaker::__tl_prop_9053!(path = ::type_leak_test_leaker::kinds, dyn_host);
+    // Items nested in a module that name their own `Self`.
+    type_leak_test_leaker::__tl_prop_9061!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9062!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9063!(path = ::type_leak_test_leaker::kinds);
 }

@@ -43,7 +43,7 @@
 //! | `f33_where_predicate_names_item_that_a_predicate_in_scope_defines` | a where predicate of an entry's context names an `Item` that a predicate of a method equates to a leaked type | fixed |
 //! | `f34_implied_outlives_of_self_projection_forms_recorded_as_components` | `&'x <Self as Tr<'a, T>>::A`, `&'x Self::A<'b>` and a `Self::A` that a bound equates are recorded as components | fixed |
 //! | `f35_gat_where_clause_of_self_projection_not_recorded` | `Self::G<'x>` of a generic associated type with `where Self: 'b` needs `Self: 'x`, which F34 stopped recording | fixed |
-//! | `f36_nested_item_self_entry_not_rewritten` | an entry that names the own `Self` of a struct, enum, union or trait nested in a module is recorded, and the Visitor never rewrites it | bug |
+//! | `f36_nested_item_self_entry_not_rewritten` | an entry that names the own `Self` of a struct, enum, union, trait or impl nested in a module is recorded, and the Visitor never rewrote it: `Visitor::with_nested_self()` | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that rules.md documents, or that follows from what rustc accepts). No test is
@@ -6725,84 +6725,565 @@ fn f35_gat_where_clause_of_self_projection_not_recorded() {
     }
 }
 
+/// What `Visitor::with_nested_self()` was called with: the `Self` of the nested item, its name and
+/// the `mod` items around it, one line for each call.
+type NestedCalls = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+/// A visitor for the copy in the scope `context`, with `with_nested_self()`: the ordinary entries
+/// become `P<ix>`, and those that depend on the own `Self` of a nested item `N<ix>`. The calls of
+/// the closure are recorded.
+fn nested_visitor(referrer: &Referrer, context: ContextId) -> (impl VisitMut, NestedCalls) {
+    let calls = NestedCalls::default();
+    let log = calls.clone();
+    let visitor = referrer
+        .clone()
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .with_nested_self(move |nested, _, ix| {
+            let requirement = match &nested.requirement {
+                SelfRequirement::Type(ty) => format!("Self = {}", string(ty)),
+                SelfRequirement::Bound(path) => format!("Self: {}", string(path)),
+                _ => unreachable!(),
+            };
+            let ident = nested
+                .ident
+                .as_ref()
+                .map_or("-".to_string(), |ident| ident.to_string());
+            let modules: Vec<String> = nested.modules.iter().map(|m| m.to_string()).collect();
+            log.borrow_mut().push(format!(
+                "{} / {} / {}",
+                requirement,
+                ident,
+                modules.join("::")
+            ));
+            parse_quote!(N<#ix>)
+        });
+    (visitor, calls)
+}
+
+fn file_of(items: Vec<Item>) -> File {
+    File {
+        shebang: None,
+        attrs: Vec::new(),
+        items,
+    }
+}
+
+fn names(declared: &[&str]) -> Vec<Ident> {
+    declared
+        .iter()
+        .map(|name| Ident::new(name, proc_macro2::Span::call_site()))
+        .collect()
+}
+
+/// Where the nested item is analyzed, and where its copy is.
+#[derive(Clone, Copy, Debug)]
+enum Nest {
+    /// `enter_mod("m", [name], |view| view.visit_item(&item))`, the copy is a `File`.
+    EnterMod,
+    /// `intern_mod(mod m { item })`, the copy is a `File` of the items of `m`.
+    InternMod,
+    /// `intern_mod(mod m { mod n { item } })`, the copy is a `File` with `mod n { item }`.
+    InternModNested,
+    /// `enter_generics(<>, |view| view.visit_item(&item))`, which is not in a module: the copy is
+    /// in the body of a method, where an item nested in a scope that is no module is.
+    EnterGenerics,
+}
+
+const NESTS: [Nest; 4] = [
+    Nest::EnterMod,
+    Nest::InternMod,
+    Nest::InternModNested,
+    Nest::EnterGenerics,
+];
+
+/// Analyzes `item` nested as `nest` says, rewrites the copy with `nested_visitor()`, and returns
+/// the rewritten item, the entries and the calls of `with_nested_self()`.
+fn nested_copy(nest: Nest, item: &Item, declared: &[&str]) -> (Item, Referrer, Vec<String>) {
+    let mut leaker = new_leaker();
+    let context = match nest {
+        Nest::EnterMod => {
+            leaker
+                .enter_mod("m", names(declared), |view| view.visit_item(item))
+                .unwrap()
+                .0
+        }
+        Nest::InternMod => leaker.intern_mod(&parse_quote!(mod m { #item })).unwrap(),
+        Nest::InternModNested => leaker
+            .intern_mod(&parse_quote!(mod m { mod n { #item } }))
+            .unwrap(),
+        Nest::EnterGenerics => {
+            leaker
+                .enter_generics(&Generics::default(), |view| view.visit_item(item))
+                .unwrap()
+                .0
+        }
+    };
+    let referrer = leaker.finish();
+    let (mut visitor, calls) = nested_visitor(&referrer, context);
+    let copy = match nest {
+        Nest::EnterMod | Nest::InternMod => {
+            let mut file = file_of(vec![item.clone()]);
+            visitor.visit_file_mut(&mut file);
+            file.items.remove(0)
+        }
+        Nest::InternModNested => {
+            let mut file = file_of(vec![parse_quote!(mod n { #item })]);
+            visitor.visit_file_mut(&mut file);
+            match file.items.remove(0) {
+                Item::Mod(ItemMod {
+                    content: Some((_, mut items)),
+                    ..
+                }) => items.remove(0),
+                other => panic!("`{}` is no module", string(&other)),
+            }
+        }
+        Nest::EnterGenerics => {
+            let mut host: ItemImpl = parse_quote!(impl Host { fn m() { #item } });
+            visitor.visit_item_impl_mut(&mut host);
+            match host.items.remove(0) {
+                ImplItem::Fn(ImplItemFn { mut block, .. }) => match block.stmts.remove(0) {
+                    Stmt::Item(item) => item,
+                    other => panic!("`{}` is no item", string(&other)),
+                },
+                other => panic!("`{}` is no method", string(&other)),
+            }
+        }
+    };
+    let calls = calls.take();
+    (copy, referrer, calls)
+}
+
 /// F36: an entry that names the own `Self` of an item nested in a scope (a struct, an enum, a union,
 /// a trait or an impl that `View::visit_item()` or `intern_mod()` visits) is recorded, but the
-/// Visitor never finds it in the copy.
+/// Visitor never found it in the copy.
 ///
 /// The Leaker gives the nested item a `Self` of its own (`Rel2<Self>` is the entry of the struct's
-/// context, `SelfRequirement::Type(S<T>)`), whatever `allow_self` the scope around has, and the
-/// rules.md says that the Referrer takes the `Self` of a nested item from the item it visits and
-/// computes the same contexts. `Referrer::find()` skips every entry that names `Self` while the
-/// Visitor is in a nested item (`no_self`, meant for the `Self` of the scope around, which the
-/// nested item hides), so the entry of the item's own `Self` is skipped as well: the copy keeps
-/// `Rel2<Self>`, and the Referrer's crate cannot resolve `Rel2` (E0412, E0425, E0433). The entry that
-/// does not name `Self` (`Rel<T>`) is rewritten. The copy cannot write the replacement by hand
-/// either, as the Repeater's impl for the nested struct is for the Leaker's `S<T>`, which only the
-/// macro knows the path of (`with_self()` does not replace the `Self` of a nested item).
+/// context, `SelfRequirement::Type(S<T>)`), whatever `allow_self` the scope around has. The Visitor
+/// skipped every entry that names `Self` while it was in a nested item (`no_self` of
+/// `Referrer::find()`, meant for the `Self` of the scope around, which the nested item hides), so
+/// the entry of the item's own `Self` was skipped as well: the copy kept `Rel2<Self>`, and the
+/// Referrer's crate could not resolve `Rel2` (E0412, E0425, E0433). The entry that does not name
+/// `Self` (`Rel<T>`) was rewritten. The copy cannot write the replacement by hand either, as the
+/// Repeater's impl for the nested struct is for the Leaker's `S<T>`, which only the macro knows the
+/// path of (`with_self()` does not replace the `Self` of a nested item).
 ///
-/// The property test shows it with `TYPE_LEAK_PROP_FEATURES=nested_self`: a struct, an enum, a
-/// union or a trait analyzed nested in `enter_mod` that names its own `Self` (seed 1, 24 cases: nine
-/// failures in the Referrer's crate, `cannot find type `R1` in this scope`, `cannot find trait
-/// `Tr0_1``, and E0308 where a position of the copy names the copy's own `Self`). The generator
-/// does not make it by default, as it is not fixed.
+/// The fix: the Visitor keeps a layer for each nested struct, enum, union, trait and impl, with the
+/// `Self` the Leaker gave it, so it computes the same contexts and finds the entry.
+/// `Visitor::with_nested_self(|nested, leaked, ix| ..)` writes its replacement, as it is the macro
+/// that knows the path of the nested item in the Leaker's crate: the closure gets the item
+/// (`NestedSelf`: what `Self` is, the name and the modules around). Without it the entries are left
+/// as before (the next test).
+///
+/// The test runs a struct, an enum, a union, a trait and an impl through `enter_mod`, `intern_mod`
+/// (also a module nested in the module), and `enter_generics` (the item is in a method body of the
+/// copy). The other tests of the finding: an outer `Self` that the nested item hides, `allow_self =
+/// false` around, and an item inside an item.
+///
+/// The property test shows it with `TYPE_LEAK_PROP_FEATURES=nested_self`, which is on by default
+/// (before the fix, seed 1 with 24 cases failed nine times in the Referrer's crate: `cannot find
+/// type `R1` in this scope`, `cannot find trait `Tr0_1``, and E0308 where a position of the copy
+/// names the copy's own `Self`).
 #[test]
-#[ignore = "bug (F36): the Visitor does not rewrite an entry that names the own `Self` of a nested item"]
 fn f36_nested_item_self_entry_not_rewritten() {
-    let items: Vec<(Item, &str)> = vec![
-        (
-            parse_quote!(
+    struct Case {
+        item: Item,
+        declared: &'static [&'static str],
+        /// The `Self` the nested item has and its name, in the line recorded for the closure.
+        nested: &'static str,
+        /// The copy, with `P<ix>` and `N<ix>`: the indices of the entries `Rel < T >` and
+        /// `Rel2 < Self >`.
+        expected: fn(usize, usize) -> Item,
+    }
+    let cases = vec![
+        Case {
+            item: parse_quote!(
                 struct S<T> {
                     b: Rel<T>,
                     c: Vec<Rel2<Self>>,
                 }
             ),
-            "Rel2 <",
-        ),
-        (
-            parse_quote!(
-                enum E {
+            declared: &["S"],
+            nested: "Self = S < T > / S",
+            expected: |p, n| {
+                parse_quote!(
+                    struct S<T> {
+                        b: P<#p>,
+                        c: Vec<N<#n>>,
+                    }
+                )
+            },
+        },
+        Case {
+            item: parse_quote!(
+                enum E<T> {
                     A(Vec<Rel2<Self>>),
+                    B { b: Rel<T> },
                 }
             ),
-            "Rel2 <",
-        ),
-        (
-            parse_quote!(
+            declared: &["E"],
+            nested: "Self = E < T > / E",
+            expected: |p, n| {
+                parse_quote!(
+                    enum E<T> {
+                        A(Vec<N<#n>>),
+                        B { b: P<#p> },
+                    }
+                )
+            },
+        },
+        Case {
+            item: parse_quote!(
+                union U<T> {
+                    a: ::core::mem::ManuallyDrop<Vec<Rel2<Self>>>,
+                    b: ::core::mem::ManuallyDrop<Rel<T>>,
+                }
+            ),
+            declared: &["U"],
+            nested: "Self = U < T > / U",
+            expected: |p, n| {
+                parse_quote!(
+                    union U<T> {
+                        a: ::core::mem::ManuallyDrop<Vec<N<#n>>>,
+                        b: ::core::mem::ManuallyDrop<P<#p>>,
+                    }
+                )
+            },
+        },
+        Case {
+            item: parse_quote!(
+                trait Tr<T> {
+                    fn f(&self, x: Rel<T>) -> Vec<Rel2<Self>>;
+                }
+            ),
+            declared: &["Tr"],
+            nested: "Self: Tr < T > / Tr",
+            expected: |p, n| {
+                parse_quote!(
+                    trait Tr<T> {
+                        fn f(&self, x: P<#p>) -> Vec<N<#n>>;
+                    }
+                )
+            },
+        },
+        Case {
+            item: parse_quote!(
+                impl<T> ::p::W for ::p::S<T> {
+                    fn f(x: Rel<T>) -> Vec<Rel2<Self>> {
+                        loop {}
+                    }
+                }
+            ),
+            declared: &[],
+            nested: "Self = :: p :: S < T > / -",
+            expected: |p, n| {
+                parse_quote!(
+                    impl<T> ::p::W for ::p::S<T> {
+                        fn f(x: P<#p>) -> Vec<N<#n>> {
+                            loop {}
+                        }
+                    }
+                )
+            },
+        },
+    ];
+    for case in &cases {
+        for nest in NESTS {
+            let (copy, referrer, calls) = nested_copy(nest, &case.item, case.declared);
+            let (p, n) = (
+                entry(&referrer, "Rel < T >"),
+                entry(&referrer, "Rel2 < Self >"),
+            );
+            let what = format!("`{}` in {:?}", string(&case.item), nest);
+            assert_eq!(string(&copy), string(&(case.expected)(p, n)), "{}", what);
+            // The closure is called for the entry that names the own `Self`, and only for it.
+            let modules = match nest {
+                Nest::InternModNested => "n",
+                _ => "",
+            };
+            assert_eq!(
+                calls,
+                [format!("{} / {}", case.nested, modules)],
+                "{}",
+                what
+            );
+        }
+    }
+}
+
+/// F36: without `Visitor::with_nested_self()`, the entries that name the own `Self` of a nested item
+/// are left as written, and the others are rewritten, as they were before the fix: the visitor does
+/// not know what to write for a `Self` that is not its own.
+#[test]
+fn f36_without_with_nested_self_the_entry_of_the_own_self_is_left() {
+    let item: Item = parse_quote!(
+        struct S<T> {
+            b: Rel<T>,
+            c: Vec<Rel2<Self>>,
+        }
+    );
+    let mut leaker = new_leaker();
+    let (context, ()) = leaker
+        .enter_mod("m", names(&["S"]), |view| view.visit_item(&item))
+        .unwrap();
+    let referrer = leaker.finish();
+    let p = entry(&referrer, "Rel < T >");
+    let mut file = file_of(vec![item]);
+    referrer
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visit_file_mut(&mut file);
+    let expected: Item = parse_quote!(
+        struct S<T> {
+            b: P<#p>,
+            c: Vec<Rel2<Self>>,
+        }
+    );
+    assert_eq!(string(&file.items[0]), string(&expected));
+}
+
+/// The index of the entry `Rel2 < Self >` whose `Self` is the type `self_ty`.
+fn rel2_of(referrer: &Referrer, self_ty: &str) -> usize {
+    let found: Vec<usize> = (0..referrer.iter().count())
+        .filter(|&ix| {
+            string(&referrer.iter().nth(ix).unwrap()) == "Rel2 < Self >"
+                && matches!(referrer.context_self(referrer.context(ix)),
+                    Some(SelfRequirement::Type(ty)) if string(ty) == self_ty)
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "the entries of `Self` = {}", self_ty);
+    found[0]
+}
+
+/// F36: the `Self` of the nested item hides the one around. The entry of the outer `Self` is
+/// written by `type_fn`, the one of the nested item's by `nested_fn`, and an item the Leaker did not
+/// analyze, which has yet another `Self`, keeps `Rel2<Self>`: no entry has its context.
+#[test]
+fn f36_the_own_self_hides_the_one_around() {
+    let nested: Item = parse_quote!(
+        struct V {
+            c: Vec<Rel2<Self>>,
+        }
+    );
+    let mut leaker = new_leaker();
+    let (_, context) = leaker
+        .enter_mod("m", names(&[]), |view| {
+            view.enter_impl(&Generics::default(), &parse_quote!(::p::W), true, |view| {
+                view.visit_type(&parse_quote!(Rel2<Self>));
+                view.visit_item(&nested);
+            })
+            .unwrap()
+            .0
+        })
+        .unwrap();
+    let referrer = leaker.finish();
+    // `Rel2<Self>` of the impl (`Self` = `::p::W`) and of `V` (`Self` = `V`): two entries.
+    let (outer, inner) = (rel2_of(&referrer, ":: p :: W"), rel2_of(&referrer, "V"));
+    let mut copy: ItemImpl = parse_quote!(
+        impl ::p::W {
+            fn f(x: Rel2<Self>) {
+                struct V {
+                    c: Vec<Rel2<Self>>,
+                }
+                struct Other {
+                    c: Vec<Rel2<Self>>,
+                }
+            }
+        }
+    );
+    let (mut visitor, calls) = nested_visitor(&referrer, context);
+    visitor.visit_item_impl_mut(&mut copy);
+    let expected: ItemImpl = parse_quote!(
+        impl ::p::W {
+            fn f(x: P<#outer>) {
+                struct V {
+                    c: Vec<N<#inner>>,
+                }
+                struct Other {
+                    c: Vec<Rel2<Self>>,
+                }
+            }
+        }
+    );
+    assert_eq!(string(&copy), string(&expected));
+    assert_eq!(calls.take(), ["Self = V / V / "]);
+}
+
+/// F36: a nested item has its own `Self` whatever `allow_self` the scope around has. With
+/// `allow_self = false` the scope itself has no `Self` to leak (`Rel2<Self>` is rejected, and an
+/// error rolls the scope back), so no entry names it and the Visitor finds none; the item nested
+/// in it has one, and its entry is rewritten.
+#[test]
+fn f36_allow_self_false_around_a_nested_item() {
+    let generics: Generics = parse_quote!(<T>);
+    let ident = Ident::new("S", proc_macro2::Span::call_site());
+    let nested: Item = parse_quote!(
+        struct V {
+            b: Rel<T>,
+            c: Vec<Rel2<Self>>,
+        }
+    );
+    // The scope's own `Self` is denied.
+    let mut leaker = new_leaker();
+    let err = leaker
+        .enter_type(&ident, &generics, false, |view| {
+            view.visit_type(&parse_quote!(Rel3<Self>))
+        })
+        .unwrap_err();
+    assert_eq!(err.to_string(), "use absolute path: 'Rel3 < Self >'");
+    // The item nested in it is not.
+    let mut leaker = new_leaker();
+    let (context, ()) = leaker
+        .enter_type(&ident, &generics, false, |view| {
+            view.visit_type(&parse_quote!(Vec<Self>));
+            view.visit_item(&nested);
+        })
+        .unwrap();
+    let referrer = leaker.finish();
+    // `Vec<Self>` is copied as written (the copy's `Self`): no entry names the scope's `Self`.
+    assert!(referrer
+        .iter()
+        .all(|ty| string(ty) != "Self" && string(ty) != "Vec < Self >"));
+    let (p, n) = (entry(&referrer, "Rel < T >"), rel2_of(&referrer, "V"));
+    let mut copy: ItemImpl = parse_quote!(
+        impl<T> Foo for S<T> {
+            fn m(x: Vec<Self>) {
+                struct V {
+                    b: Rel<T>,
+                    c: Vec<Rel2<Self>>,
+                }
+            }
+        }
+    );
+    let (mut visitor, calls) = nested_visitor(&referrer, context);
+    visitor.visit_item_impl_mut(&mut copy);
+    let expected: ItemImpl = parse_quote!(
+        impl<T> Foo for S<T> {
+            fn m(x: Vec<Self>) {
+                struct V {
+                    b: P<#p>,
+                    c: Vec<N<#n>>,
+                }
+            }
+        }
+    );
+    assert_eq!(string(&copy), string(&expected));
+    assert_eq!(calls.take(), ["Self = V / V / "]);
+}
+
+/// F36: an item inside an item. Two structs with the same name, `S<T>`, one in a module and one in
+/// a module of it, and a trait in the inner one. They have the same `Self`, in two modules: the
+/// entries are keyed by the module, so each copy gets its own, and the layers do not leak into each
+/// other (the module found by name has no `Self`, and the item in it has its own).
+#[test]
+fn f36_an_item_inside_an_item() {
+    let outer: ItemMod = parse_quote!(
+        mod a {
+            struct S<T> {
+                a: Rel<T>,
+                b: Vec<Rel2<Self>>,
+            }
+            mod b {
+                struct S<T> {
+                    a: Rel<T>,
+                    b: Vec<Rel2<Self>>,
+                }
                 trait Tr {
                     fn f(&self) -> Vec<Rel2<Self>>;
                 }
+            }
+        }
+    );
+    let mut leaker = new_leaker();
+    let context = leaker.intern_mod(&outer).unwrap();
+    let referrer = leaker.finish();
+    // `Rel<T>` in each module, `Rel2<Self>` for each of the three items: five entries.
+    assert_eq!(referrer.iter().count(), 5);
+    let mut file = file_of(outer.content.clone().unwrap().1);
+    let (mut visitor, calls) = nested_visitor(&referrer, context);
+    visitor.visit_file_mut(&mut file);
+    let text = string(&file);
+    assert!(!text.contains("Rel"), "{}", text);
+    assert_eq!(text.matches("N <").count(), 3, "{}", text);
+    assert_eq!(
+        calls.take(),
+        [
+            "Self = S < T > / S / ",
+            "Self = S < T > / S / b",
+            "Self: Tr / Tr / b"
+        ]
+    );
+    // The two `Rel2<Self>` of the structs are two entries (one for each module).
+    let mut found: Vec<usize> = Vec::new();
+    for item in file.items.iter().chain(match &file.items[1] {
+        Item::Mod(ItemMod {
+            content: Some((_, items)),
+            ..
+        }) => items.iter(),
+        other => panic!("`{}` is no module", string(other)),
+    }) {
+        if let Item::Struct(ItemStruct { fields, .. }) = item {
+            let text = string(fields);
+            let ix: usize = text
+                .split("N < ")
+                .nth(1)
+                .and_then(|rest| rest.split("usize").next())
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or_else(|| panic!("no N in {}", text));
+            found.push(ix);
+        }
+    }
+    assert_eq!(found.len(), 2);
+    assert_ne!(found[0], found[1]);
+}
+
+/// F36: an entry that does not name `Self` but has a bound of its generics that does (`Rel<T>` with
+/// `T: ::p::Tr<Self>`), one that needs `Self: 'a`, and one in a trait with a generic associated type,
+/// have the own `Self` of the nested item in their context too: `nested_fn` writes them.
+#[test]
+fn f36_a_bound_or_an_outlives_that_names_the_own_self() {
+    let cases: Vec<(Item, &str, &str)> = vec![
+        (
+            parse_quote!(
+                struct S<T: ::p::Tr<Self>> {
+                    b: Rel<T>,
+                }
             ),
-            "Rel2 <",
+            "S",
+            "struct S<T: ::p::Tr<Self>> { b: N<0usize>, }",
+        ),
+        (
+            parse_quote!(
+                struct S<'a, T: 'a> {
+                    b: &'a Rel<T>,
+                    c: &'a Vec<Rel2<Self>>,
+                }
+            ),
+            "S",
+            "struct S<'a, T: 'a> { b: &'a P<0usize>, c: &'a Vec<N<1usize>>, }",
+        ),
+        (
+            parse_quote!(
+                trait Tr<'a, T> {
+                    type G<'b>
+                    where
+                        Self: 'b;
+                    fn f(&self, x: &'a Rel<T>, y: Self::G<'a>) -> Vec<Rel2<Self::G<'a>>>;
+                }
+            ),
+            "Tr",
+            "trait Tr<'a, T> { type G<'b> where Self: 'b; fn f(&self, x: &'a P<0usize>, y: Self::G<'a>) -> Vec<N<1usize>>; }",
         ),
     ];
-    for (item, leaked) in items {
-        let name = match &item {
-            Item::Struct(i) => i.ident.clone(),
-            Item::Enum(i) => i.ident.clone(),
-            Item::Trait(i) => i.ident.clone(),
-            _ => unreachable!(),
-        };
+    for (item, name, expected) in cases {
         let mut leaker = new_leaker();
         let (context, ()) = leaker
-            .enter_mod("m", [name], |view| view.visit_item(&item))
+            .enter_mod("m", names(&[name]), |view| view.visit_item(&item))
             .unwrap();
         let referrer = leaker.finish();
-        assert!(referrer.iter().any(|entry| string(entry).contains(leaked)));
-        // The module's items are declared together, as those of a file.
-        let mut file = File {
-            shebang: None,
-            attrs: Vec::new(),
-            items: vec![item.clone()],
-        };
-        referrer
-            .visitor(context, |_, ix| parse_quote!(P<#ix>))
-            .visit_file_mut(&mut file);
-        let copy = string(&file);
-        assert!(
-            !copy.contains(leaked),
-            "`{}`: the entry that names `Self` is not replaced in the copy: {}",
-            string(&item),
-            copy
-        );
+        let (mut visitor, calls) = nested_visitor(&referrer, context);
+        let mut file = file_of(vec![item.clone()]);
+        visitor.visit_file_mut(&mut file);
+        let expected: Item = syn::parse_str(expected).unwrap();
+        assert_eq!(string(&file.items[0]), string(&expected));
+        assert_eq!(calls.take().len(), 1, "`{}`", string(&item));
     }
 }

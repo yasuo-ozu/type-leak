@@ -223,9 +223,10 @@ pub struct Features {
     pub gat_where_clause: bool,
     /// `Self` in a struct, an enum, a union or a trait analyzed as an item nested in `enter_mod`
     /// (`View::visit_item()`, like the items of `intern_mod()`): the entry that names the item's
-    /// own `Self` is recorded, but the Visitor never finds it in the nested item (`no_self` of
-    /// `Referrer::find()`), so the copy keeps the leaked type (`Rel<Self>`), which the Referrer's
-    /// crate cannot resolve. Off by default (F36): such an item names no `Self`.
+    /// own `Self` is recorded, and the Visitor finds it in the nested item and writes it with
+    /// `Visitor::with_nested_self()` (F36: fixed, on by default). Before the fix the Visitor never
+    /// found it, so the copy kept the leaked type (`Rel<Self>`), which the Referrer's crate cannot
+    /// resolve. Off, such an item names no `Self`.
     pub nested_self: bool,
 }
 
@@ -258,6 +259,7 @@ impl Features {
             item_predicate_cycle: true,
             self_projection_outlives: true,
             gat_where_clause: true,
+            nested_self: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {

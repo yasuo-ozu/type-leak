@@ -139,6 +139,7 @@ The Leaker returns the first group itself. The `rustc` errors come from the gene
 | rustc E0277, E0271, E0275, E0284 in a bound | The bound names a type that rustc normalizes in another form. | [Bounds] |
 | a constant is read as a type | Write `{ ::my_crate::MY_CONST }`. | [Bare identifiers] |
 | a type is not replaced in the copy | Visit the whole item, and declare the generics as the entry has them. | [Contexts] |
+| a type that names `Self` is not replaced in a struct, trait or impl nested in a module | Call `Visitor::with_nested_self()` and write the type of the item in the Leaker's crate. | [Self rules] |
 | "incompatible type-leak" when parsing | Use the same version of `type-leak` on both sides. | |
 | panic in `visitor()` or `expand()` | Pass the `ContextId` that the analysis returned for the item. | [Contexts] |
 

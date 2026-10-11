@@ -1053,4 +1053,38 @@ pub mod kinds {
         fn rel(&self) -> Rel;
         fn pair(&self, x: Pair<Rel, Wrap<Self>>) -> Rel;
     }
+
+    // Items nested in a module (`scope = "mod"`: `enter_mod(..)` and `View::visit_item()`, as the
+    // items of `intern_mod()` are). The item has a `Self` of its own, and the types that name it
+    // are relative (`Wrap<Self>`), so the Repeater's impl of such an entry is for the item itself,
+    // here. The copy cannot name that type as `Self`: `Visitor::with_nested_self()` gives the macro
+    // the item to write it with.
+
+    /// A struct that names its own `Self` in relative types, next to ones that do not.
+    #[prop_leak(id = 9061, allow_self = true, scope = "mod")]
+    pub struct Links<T> {
+        pub rel: Rel,
+        pub wrapped: Wrap<T>,
+        pub me: Wrap<Self>,
+        pub pair: Pair<Rel, Wrap<Self>>,
+        pub next: Option<Box<Wrap<Self>>>,
+    }
+
+    /// An enum, with `Self` in the generics of a variant that a bound names too.
+    #[prop_leak(id = 9062, allow_self = true, scope = "mod")]
+    pub enum Step<T> {
+        Rel(Rel),
+        Wrapped(Wrap<T>),
+        Me(Wrap<Self>),
+        Pair { pair: Pair<Wrap<Self>, T> },
+        Nothing,
+    }
+
+    /// A trait: `Self` is the implementor, and the Referrer's crate implements the trait for a host.
+    #[prop_leak(id = 9063, allow_self = true, scope = "mod")]
+    pub trait Walk<T> {
+        fn me(&self) -> Wrap<Self>;
+        fn rel(&self, x: Pair<Rel, T>) -> Wrap<T>;
+        fn pair(&self, x: Pair<Rel, Wrap<Self>>) -> Rel;
+    }
 }

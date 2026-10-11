@@ -413,6 +413,22 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9053, __tl_report_9053!()),
             ok("trait", 4, 6, 6),
         ),
+        // items nested in a module, which name their own `Self`
+        (
+            9061,
+            reported(9061, __tl_report_9061!()),
+            ok("struct", 5, 5, 5),
+        ),
+        (
+            9062,
+            reported(9062, __tl_report_9062!()),
+            ok("enum", 4, 4, 4),
+        ),
+        (
+            9063,
+            reported(9063, __tl_report_9063!()),
+            ok("trait", 5, 5, 5),
+        ),
     ];
     for (id, got, expected) in table {
         assert_eq!(got, expected, "item {}", id);
@@ -499,6 +515,71 @@ fn copies_of_items_hold_the_original_types() {
     assert_eq!((holds.pair.1, holds.local.0), (6, 11));
     same(&holds.rel, &rel);
     assert_eq!(r::nested::deeper::Deep(rel).0, rel);
+}
+
+/// A struct, an enum and a trait nested in a module name their own `Self` in relative types
+/// (`Wrap<Self>`), and the copy holds the Leaker's: `Visitor::with_nested_self()` writes
+/// `<::type_leak_test_leaker::kinds::Links<T> as Repeater<..>>::Type` for the `Self` of the struct,
+/// which the copy's own `Links` could not stand for (the Repeater's impl is for the Leaker's one).
+/// The Referrer's crate compares each position with a witness of the original when it compiles; here
+/// the fields go in and out of the Leaker's types, which `same()` and the assignments check.
+#[test]
+fn items_nested_in_a_module_name_their_own_self() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_referrer::kinds as r;
+
+    // The struct: `Wrap<Self>` is `Wrap<l::Links<u8>>`, not `Wrap<r::Links<u8>>`.
+    let rel = l::Rel(5);
+    let copy = r::Links::<u8> {
+        rel,
+        wrapped: l::Wrap(PhantomData),
+        me: l::Wrap::<l::Links<u8>>(PhantomData),
+        pair: l::Pair(rel, l::Wrap::<l::Links<u8>>(PhantomData)),
+        next: Some(Box::new(l::Wrap::<l::Links<u8>>(PhantomData))),
+    };
+    same(&copy.me, &l::Wrap::<l::Links<u8>>(PhantomData));
+    same(&copy.rel, &rel);
+    let original = l::Links::<u8> {
+        rel: copy.rel,
+        wrapped: copy.wrapped,
+        me: copy.me,
+        pair: copy.pair,
+        next: copy.next,
+    };
+    assert_eq!(original.pair.0, rel);
+    assert!(original.next.is_some());
+
+    // The enum.
+    let steps = [
+        r::Step::<u8>::Rel(rel),
+        r::Step::Wrapped(l::Wrap(PhantomData)),
+        r::Step::Me(l::Wrap::<l::Step<u8>>(PhantomData)),
+        r::Step::Pair {
+            pair: l::Pair(l::Wrap::<l::Step<u8>>(PhantomData), 3),
+        },
+        r::Step::Nothing,
+    ];
+    let seen: Vec<_> = steps
+        .iter()
+        .map(|step| match step {
+            r::Step::Rel(x) => x.0 as usize,
+            r::Step::Wrapped(_) => 100,
+            r::Step::Me(_) => 200,
+            r::Step::Pair { pair } => pair.1 as usize,
+            r::Step::Nothing => 300,
+        })
+        .collect();
+    assert_eq!(seen, vec![5, 100, 200, 3, 300]);
+
+    // The trait: the host implements the Leaker's trait with the signatures of the copy, whose
+    // `Wrap<Self>` is the Leaker's `Wrap<Host9063>`.
+    fn implemented_for<T: l::Walk<u8>>() {}
+    implemented_for::<r::Host9063>();
+    let host = r::Host9063;
+    fn me<T: l::Walk<u8> + ?Sized>(_: &T) -> l::Wrap<T> {
+        l::Wrap(PhantomData)
+    }
+    same(&me(&host), &l::Wrap::<r::Host9063>(PhantomData));
 }
 
 /// A trait is implemented for an unsized type (`dyn Host`) in the Referrer's crate, with the

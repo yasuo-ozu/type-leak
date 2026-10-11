@@ -125,7 +125,8 @@ fn ident(name: &str) -> Ident {
 ///
 /// - `mod`: a struct, an enum, a union or a trait, as a nested item of `enter_mod(..)`
 ///   (`View::visit_item()`), the module declaring its name. Its context is the module's, its
-///   generics are local, and it has a `Self` of its own.
+///   generics are local, and it has a `Self` of its own, whose entries the copy's visitor writes
+///   with `Visitor::with_nested_self()` (`Projector::project_nested()`).
 /// - `generics`: a struct, an enum or a union with no `Self`, in `enter_generics(..)`.
 /// - `trait`: a trait without a generic associated type, in `enter_trait(..)`.
 /// - `impl`: an impl in `enter_impl(..)`, where only the self type and the arguments of the trait
@@ -379,10 +380,18 @@ fn collect_item(
     };
     let fields_of =
         |fields: &Fields| -> Vec<Type> { fields.iter().map(|f| f.ty.clone()).collect() };
+    // The `Self` of a struct, an enum or a union: the type itself, or, for the copy of a nested one,
+    // the Leaker's type, which the copy's `Self` stays different from (`host_arg()`).
+    let adt_ty = |ident: &Ident, generics: &Generics| -> Type {
+        match host {
+            Some((ty, _)) => ty.clone(),
+            None => type_with_params(ident, generics),
+        }
+    };
     match item {
         Item::Struct(i) => {
             let sub = with_self.then(|| SelfSub {
-                ty: type_with_params(&i.ident, &i.generics),
+                ty: adt_ty(&i.ident, &i.generics),
                 trait_ref: None,
                 bound: false,
             });
@@ -395,7 +404,7 @@ fn collect_item(
         }
         Item::Enum(i) => {
             let sub = with_self.then(|| SelfSub {
-                ty: type_with_params(&i.ident, &i.generics),
+                ty: adt_ty(&i.ident, &i.generics),
                 trait_ref: None,
                 bound: false,
             });
@@ -410,7 +419,7 @@ fn collect_item(
         }
         Item::Union(i) => {
             let sub = with_self.then(|| SelfSub {
-                ty: type_with_params(&i.ident, &i.generics),
+                ty: adt_ty(&i.ident, &i.generics),
                 trait_ref: None,
                 bound: false,
             });
@@ -966,6 +975,44 @@ impl Projector<'_> {
                 .ok_or_else(|| Error::new(Span::call_site(), "test macro: no type for Self"))?,
             _ => parse_quote!(()),
         };
+        self.project_with(ix, self_ty)
+    }
+
+    /// The path through the Repeater of an entry that depends on the own `Self` of a nested item
+    /// (`Visitor::with_nested_self()`). `base` is the module of the Leaker's crate that the
+    /// Visitor's context is in. The Repeater's impl is for the Leaker's own type, which the copy
+    /// cannot name as `Self`: a struct, an enum or a union is `base::<modules>::Name<args>`, and a
+    /// trait is the host. An impl would need its self type written out in the Leaker's crate,
+    /// which the generator does not make.
+    fn project_nested(&self, nested: &NestedSelf, base: &Path, ix: usize) -> Result<Type> {
+        let self_ty: Type = match &nested.requirement {
+            SelfRequirement::Bound(_) => self
+                .bound_self
+                .clone()
+                .ok_or_else(|| Error::new(Span::call_site(), "test macro: no host for Self"))?,
+            SelfRequirement::Type(Type::Path(TypePath { qself: None, path }))
+                if nested.ident.is_some() =>
+            {
+                let mut full = base.clone();
+                full.segments
+                    .extend(nested.modules.iter().cloned().map(PathSegment::from));
+                full.segments.extend(path.segments.iter().cloned());
+                Type::Path(TypePath {
+                    qself: None,
+                    path: full,
+                })
+            }
+            _ => {
+                return Err(Error::new(
+                    Span::call_site(),
+                    "test macro: no type for the Self of a nested impl",
+                ))
+            }
+        };
+        self.project_with(ix, self_ty)
+    }
+
+    fn project_with(&self, ix: usize, self_ty: Type) -> Result<Type> {
         let slots = RepeaterSlots::new(self.repeater.clone());
         let site =
             UseSite::substituting(&self.root_params, &self.root_args).with_self(self_ty.clone());
@@ -1064,12 +1111,30 @@ fn rewrite(
     let error = std::cell::RefCell::new(None);
     let mut rewritten = item.clone();
     {
-        let mut visitor = referrer.clone().visitor(context, |_, ix| {
-            projector.project(ix).unwrap_or_else(|e| {
-                *error.borrow_mut() = Some(e);
-                parse_quote!(())
+        // The module of the Leaker's crate that the context is in: the module of the item, or the
+        // analyzed module itself.
+        let mut base = leaker_path.clone();
+        if let Item::Mod(m) = item {
+            base.segments.push(m.ident.clone().into());
+        }
+        let mut visitor = referrer
+            .clone()
+            .visitor(context, |_, ix| {
+                projector.project(ix).unwrap_or_else(|e| {
+                    *error.borrow_mut() = Some(e);
+                    parse_quote!(())
+                })
             })
-        });
+            // A struct, an enum, a union or a trait nested in the module (the item of a scope
+            // `mod`) has a `Self` of its own, whose entries the visitor finds.
+            .with_nested_self(|nested, _, ix| {
+                projector
+                    .project_nested(nested, &base, ix)
+                    .unwrap_or_else(|e| {
+                        *error.borrow_mut() = Some(e);
+                        parse_quote!(())
+                    })
+            });
         // The item of a scope `mod` is a nested item, which has a `Self` of its own.
         if let (Some(self_ty), false) = (self_ty, args.scope == "mod") {
             visitor = visitor.with_self(self_ty);
@@ -1142,11 +1207,26 @@ fn const_value(ty: &Type) -> Expr {
     parse_quote!(0)
 }
 
-fn host_arg(rewritten: &Rewritten, leaker_path: &Path) -> Option<Host> {
-    rewritten
-        .host
-        .as_ref()
-        .map(|host| (host_type(host, rewritten.dyn_host), leaker_path.clone()))
+/// The host of a trait. For a struct, an enum or a union nested in the module (scope `mod`) it is
+/// the Leaker's type: the visitor leaves a `Self` that is not in an entry (`Vec<Self>` as a field),
+/// which is the copy's own type, and the check writes the Leaker's for it, as the witness does.
+/// The copy of a struct that is not nested has its `Self` replaced (`Visitor::with_self()`).
+fn host_arg(rewritten: &Rewritten, args: &Args, leaker_path: &Path) -> Option<Host> {
+    if let Some(host) = &rewritten.host {
+        return Some((host_type(host, rewritten.dyn_host), leaker_path.clone()));
+    }
+    if args.scope != "mod" {
+        return None;
+    }
+    let (ident, generics) = match &rewritten.item {
+        Item::Struct(i) => (&i.ident, &i.generics),
+        Item::Enum(i) => (&i.ident, &i.generics),
+        Item::Union(i) => (&i.ident, &i.generics),
+        _ => return None,
+    };
+    let params = identity_args(generics);
+    let ty: Type = parse_quote!(#leaker_path::#ident<#(#params),*>);
+    Some((ty, leaker_path.clone()))
 }
 
 /// An implementation of the Leaker's trait for the host, with the signatures of the copy.
@@ -1360,7 +1440,7 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream) -> Result<TokenStream> 
     let dummy: Path = parse_quote!(::__dummy);
     let report = match rewrite(&referrer, context, &original, &args, &dummy, false) {
         Ok(rewritten) => {
-            let host = host_arg(&rewritten, &dummy);
+            let host = host_arg(&rewritten, &args, &dummy);
             let rewritten_positions = comparable(&rewritten.item, &original, &args, host.as_ref());
             format!(
                 "{}|{}|ok|entries={} positions={} checked={}",
@@ -1517,7 +1597,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
 
     // The checks call the witnesses by the path of the module of the item, in the Leaker's crate
     // (the position of an item of a module starts with its name).
-    let host = host_arg(&rewritten, &path);
+    let host = host_arg(&rewritten, &args, &path);
     let mut checks = TokenStream::new();
     for (j, pos) in comparable(&rewritten.item, &item, &args, host.as_ref()) {
         checks.extend(check_fn(
@@ -1532,8 +1612,15 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     let body = match &mut copy {
         Item::Trait(t) => {
             let host = rewritten.host.as_ref().unwrap();
+            // The module of a scope `mod` declares the trait: its signatures name it as written
+            // (`<Self as Tr<N>>::A`).
+            let name = &t.ident;
+            let import = (args.scope == "mod").then(|| quote!(use #path::#name;));
             match &item {
-                Item::Trait(original) => host_impl(t, original, host, dyn_host, &path),
+                Item::Trait(original) => {
+                    let host_impl = host_impl(t, original, host, dyn_host, &path);
+                    quote!(#import #host_impl)
+                }
                 _ => unreachable!(),
             }
         }
