@@ -46,6 +46,9 @@ pub(crate) struct Args {
     prelude: bool,
     /// Allowed crates (`::std`).
     allow: Vec<Path>,
+    /// How the item is analyzed: `""` by the `intern_*` method of its kind, or by a scope (see
+    /// [`analyze()`]): `"mod"`, `"generics"`, `"trait"` or `"impl"`.
+    scope: String,
 }
 
 impl Parse for Args {
@@ -55,6 +58,7 @@ impl Parse for Args {
             allow_self: true,
             prelude: false,
             allow: Vec::new(),
+            scope: String::new(),
         };
         for kv in Punctuated::<MetaNameValue, Token![,]>::parse_terminated(input)? {
             let key = kv
@@ -70,6 +74,7 @@ impl Parse for Args {
                 ("id", Lit::Int(i)) => args.id = i.base10_parse()?,
                 ("allow_self", Lit::Bool(b)) => args.allow_self = b.value,
                 ("prelude", Lit::Bool(b)) => args.prelude = b.value,
+                ("scope", Lit::Str(s)) => args.scope = s.value(),
                 ("allow", Lit::Str(s)) => {
                     for path in s.value().split(',').filter(|p| !p.trim().is_empty()) {
                         args.allow.push(parse_str(path.trim())?);
@@ -85,13 +90,14 @@ impl Parse for Args {
 impl Args {
     fn tokens(&self) -> TokenStream {
         let (id, allow_self, prelude) = (self.id, self.allow_self, self.prelude);
+        let scope = &self.scope;
         let allow = self
             .allow
             .iter()
             .map(|p| quote!(#p).to_string().replace(' ', ""))
             .collect::<Vec<_>>()
             .join(",");
-        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, allow = #allow)
+        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow)
     }
 }
 
@@ -113,6 +119,18 @@ fn ident(name: &str) -> Ident {
 }
 
 /// Analyzes `item` like a macro of a downstream crate would.
+///
+/// By the `intern_*` method of its kind, or, with `scope`, through the scopes and the `View` that
+/// a macro with other needs uses:
+///
+/// - `mod`: a struct, an enum, a union or a trait, as a nested item of `enter_mod(..)`
+///   (`View::visit_item()`), the module declaring its name. Its context is the module's, its
+///   generics are local, and it has a `Self` of its own.
+/// - `generics`: a struct, an enum or a union with no `Self`, in `enter_generics(..)`.
+/// - `trait`: a trait without a generic associated type, in `enter_trait(..)`.
+/// - `impl`: an impl in `enter_impl(..)`, where only the self type and the arguments of the trait
+///   are visited (the shape of a macro that resolves the trait by its name). The generics and the
+///   items of the impl are not analyzed, and not compared.
 fn analyze(
     item: &Item,
     args: &Args,
@@ -125,13 +143,65 @@ fn analyze(
     config.allowed_paths.extend(args.allow.iter().cloned());
     let mut leaker = Leaker::from_config(config);
     let allow_self = args.allow_self;
-    let context = match item {
-        Item::Struct(i) => leaker.intern_struct(i, allow_self)?,
-        Item::Enum(i) => leaker.intern_enum(i, allow_self)?,
-        Item::Union(i) => leaker.intern_union(i, allow_self)?,
-        Item::Trait(i) => leaker.intern_trait(i, allow_self)?,
-        Item::Impl(i) => leaker.intern_impl(i, allow_self)?,
-        Item::Mod(i) => leaker.intern_mod(i)?,
+    let context = match (args.scope.as_str(), item) {
+        ("mod", Item::Struct(_) | Item::Enum(_) | Item::Union(_) | Item::Trait(_)) => {
+            let name = match item {
+                Item::Struct(i) => i.ident.clone(),
+                Item::Enum(i) => i.ident.clone(),
+                Item::Union(i) => i.ident.clone(),
+                Item::Trait(i) => i.ident.clone(),
+                _ => unreachable!(),
+            };
+            leaker
+                .enter_mod(format!("prop{}", args.id), [name], |view| {
+                    view.visit_item(item)
+                })?
+                .0
+        }
+        ("generics", Item::Struct(i)) => {
+            leaker
+                .enter_generics(&i.generics, |view| {
+                    syn::visit::visit_item_struct(view, i)
+                })?
+                .0
+        }
+        ("generics", Item::Enum(i)) => {
+            leaker
+                .enter_generics(&i.generics, |view| syn::visit::visit_item_enum(view, i))?
+                .0
+        }
+        ("generics", Item::Union(i)) => {
+            leaker
+                .enter_generics(&i.generics, |view| {
+                    syn::visit::visit_item_union(view, i)
+                })?
+                .0
+        }
+        ("trait", Item::Trait(i)) => {
+            leaker
+                .enter_trait(&i.ident, &i.generics, allow_self, |view| {
+                    syn::visit::visit_item_trait(view, i)
+                })?
+                .0
+        }
+        ("impl", Item::Impl(i)) => {
+            leaker
+                .enter_impl(&i.generics, &i.self_ty, allow_self, |view| {
+                    view.visit_type(&i.self_ty);
+                    if let Some((_, path, _)) = &i.trait_ {
+                        for seg in &path.segments {
+                            view.visit_path_arguments(&seg.arguments);
+                        }
+                    }
+                })?
+                .0
+        }
+        ("", Item::Struct(i)) => leaker.intern_struct(i, allow_self)?,
+        ("", Item::Enum(i)) => leaker.intern_enum(i, allow_self)?,
+        ("", Item::Union(i)) => leaker.intern_union(i, allow_self)?,
+        ("", Item::Trait(i)) => leaker.intern_trait(i, allow_self)?,
+        ("", Item::Impl(i)) => leaker.intern_impl(i, allow_self)?,
+        ("", Item::Mod(i)) => leaker.intern_mod(i)?,
         _ => panic!("unsupported item"),
     };
     let assertions = leaker.assertions();
@@ -228,9 +298,66 @@ pub(crate) struct Position {
 /// of the trait in the Leaker's crate.
 type Host = (Type, Path);
 
-fn collect_positions(item: &Item, host: Option<&Host>) -> Vec<Position> {
+/// `scope`: how the item is analyzed (`Args::scope`). With `impl`, only the fragments the scope
+/// visits are positions: the self type and the arguments of the trait.
+fn collect_positions(item: &Item, host: Option<&Host>, scope: &str) -> Vec<Position> {
     let mut out = Vec::new();
-    collect_item(item, &mut Vec::new(), &mut out, true, host);
+    collect_item(item, &mut Vec::new(), &mut out, true, host, scope == "impl");
+    out
+}
+
+/// The defaults of the type parameters of `generics`, each with the generics before it: a default
+/// is analyzed with the parameters before it, and the where predicates that name only those (the
+/// context of its entries has them, so the Repeater's impl needs them) and not `Self`.
+fn default_positions(generics: &Generics) -> Vec<(Generics, Type)> {
+    fn name(param: &GenericParam) -> String {
+        match param {
+            GenericParam::Type(t) => t.ident.to_string(),
+            GenericParam::Const(c) => c.ident.to_string(),
+            GenericParam::Lifetime(l) => l.lifetime.to_string(),
+        }
+    }
+    let mut out = Vec::new();
+    for (i, param) in generics.params.iter().enumerate() {
+        if let GenericParam::Type(TypeParam {
+            default: Some(default),
+            ..
+        }) = param
+        {
+            // A default has no `Self`: the predicates that name it are not in its context either.
+            let later: HashSet<String> = generics
+                .params
+                .iter()
+                .skip(i)
+                .map(name)
+                .chain(std::iter::once("Self".to_string()))
+                .collect();
+            let mentions_later = |predicate: &WherePredicate| {
+                let text = quote!(#predicate).to_string();
+                later.iter().any(|name| {
+                    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .any(|word| word == name)
+                })
+            };
+            let predicates: Punctuated<WherePredicate, Token![,]> = generics
+                .where_clause
+                .iter()
+                .flat_map(|wc| wc.predicates.iter())
+                .filter(|p| !mentions_later(p))
+                .cloned()
+                .collect();
+            let before = Generics {
+                lt_token: Some(Default::default()),
+                params: generics.params.iter().take(i).cloned().collect(),
+                gt_token: Some(Default::default()),
+                where_clause: (!predicates.is_empty()).then(|| WhereClause {
+                    where_token: Default::default(),
+                    predicates,
+                }),
+            };
+            out.push((before, default.clone()));
+        }
+    }
     out
 }
 
@@ -240,6 +367,7 @@ fn collect_item(
     out: &mut Vec<Position>,
     with_self: bool,
     host: Option<&Host>,
+    fragments_only: bool,
 ) {
     let mut push = |layers: &[&Generics], sub: &Option<SelfSub>, ty: &Type| {
         out.push(Position {
@@ -258,6 +386,9 @@ fn collect_item(
                 trait_ref: None,
                 bound: false,
             });
+            for (before, ty) in default_positions(&i.generics) {
+                push(&[&before], &None, &ty);
+            }
             for ty in fields_of(&i.fields) {
                 push(&[&i.generics], &sub, &ty);
             }
@@ -268,6 +399,9 @@ fn collect_item(
                 trait_ref: None,
                 bound: false,
             });
+            for (before, ty) in default_positions(&i.generics) {
+                push(&[&before], &None, &ty);
+            }
             for variant in &i.variants {
                 for ty in fields_of(&variant.fields) {
                     push(&[&i.generics], &sub, &ty);
@@ -280,6 +414,9 @@ fn collect_item(
                 trait_ref: None,
                 bound: false,
             });
+            for (before, ty) in default_positions(&i.generics) {
+                push(&[&before], &None, &ty);
+            }
             for field in &i.fields.named {
                 push(&[&i.generics], &sub, &field.ty);
             }
@@ -300,6 +437,9 @@ fn collect_item(
                     },
                 }
             });
+            for (before, ty) in default_positions(&i.generics) {
+                push(&[&before], &None, &ty);
+            }
             for trait_item in &i.items {
                 match trait_item {
                     TraitItem::Fn(f) => {
@@ -337,6 +477,9 @@ fn collect_item(
                     }
                 }
             }
+            if fragments_only {
+                return;
+            }
             for impl_item in &i.items {
                 match impl_item {
                     ImplItem::Fn(f) => {
@@ -362,7 +505,7 @@ fn collect_item(
             if let Some((_, items)) = &m.content {
                 mods.push(m.ident.clone());
                 for item in items {
-                    collect_item(item, mods, out, false, host);
+                    collect_item(item, mods, out, false, host, fragments_only);
                 }
                 mods.pop();
             }
@@ -397,11 +540,27 @@ fn merge_generics(layers: &[Generics]) -> Generics {
             }
         }
     }
+    // A function cannot have a default for a parameter.
+    let without_default = |param: &GenericParam| -> GenericParam {
+        let mut param = param.clone();
+        match &mut param {
+            GenericParam::Type(t) => {
+                t.eq_token = None;
+                t.default = None;
+            }
+            GenericParam::Const(c) => {
+                c.eq_token = None;
+                c.default = None;
+            }
+            GenericParam::Lifetime(_) => (),
+        }
+        param
+    };
     let mut predicates: Punctuated<WherePredicate, Token![,]> = Punctuated::new();
     for layer in layers {
         for param in &layer.params {
             if !matches!(param, GenericParam::Lifetime(_)) {
-                params.push(param.clone());
+                params.push(without_default(param));
             }
         }
         if let Some(wc) = &layer.where_clause {
@@ -911,10 +1070,20 @@ fn rewrite(
                 parse_quote!(())
             })
         });
-        if let Some(self_ty) = self_ty {
+        // The item of a scope `mod` is a nested item, which has a `Self` of its own.
+        if let (Some(self_ty), false) = (self_ty, args.scope == "mod") {
             visitor = visitor.with_self(self_ty);
         }
         match &mut rewritten {
+            other if args.scope == "mod" => {
+                let mut file = File {
+                    shebang: None,
+                    attrs: Vec::new(),
+                    items: vec![std::mem::replace(other, Item::Verbatim(TokenStream::new()))],
+                };
+                visitor.visit_file_mut(&mut file);
+                *other = file.items.remove(0);
+            }
             Item::Mod(m) => {
                 if let Some((_, items)) = &mut m.content {
                     // The items of a module are declared together, as those of a file.
@@ -1045,8 +1214,8 @@ fn comparable(
     host: Option<&Host>,
 ) -> Vec<(usize, Position)> {
     let in_module = matches!(copy, Item::Mod(_));
-    let original = collect_positions(item, None);
-    let copied = collect_positions(copy, host);
+    let original = collect_positions(item, None, &args.scope);
+    let copied = collect_positions(copy, host, &args.scope);
     assert_eq!(original.len(), copied.len(), "test macro: positions differ");
     copied
         .into_iter()
@@ -1179,7 +1348,7 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream) -> Result<TokenStream> 
     };
 
     let impls = repeater_impls(&referrer, id)?;
-    let positions = collect_positions(&original, None);
+    let positions = collect_positions(&original, None, &args.scope);
     let witnesses: Vec<(Vec<Ident>, TokenStream)> = positions
         .iter()
         .enumerate()

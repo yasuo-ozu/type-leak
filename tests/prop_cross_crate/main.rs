@@ -3,9 +3,9 @@
 //! Each case is a generated Leaker's crate (a module of relative types, and random modules,
 //! structs, enums, unions, traits and impls with `#[prop_leak]` on them, see `gen.rs`) and a
 //! generated Referrer's crate that invokes the macro exported for each item. The macros are those
-//! of `tests/crates/macro/prop.rs`, which analyze the item with the matching `intern_*`, emit the
-//! Repeater's implementations, and, in the Referrer's crate, rewrite a copy of the item with
-//! `Referrer::visitor(context, ..)`.
+//! of `tests/crates/macro/prop.rs`, which analyze the item with the matching `intern_*` (or, for
+//! some, through a scope: see below), emit the Repeater's implementations, and, in the Referrer's
+//! crate, rewrite a copy of the item with `Referrer::visitor(context, ..)`.
 //!
 //! The property: if the Leaker accepts an item (it may reject it, which is counted), the Referrer's
 //! crate compiles, and every type position of the rewritten copy is exactly the original type.
@@ -23,11 +23,51 @@
 //! The Leaker's crate must compile by itself: if it does not, it is built again without
 //! `type-leak` (`prop_leak_noop`) to tell a bug of the generator from the macro's output.
 //!
+//! # A run that tests nothing fails
+//!
+//! A rejection counts as a success of the property, so the test could pass while checking nothing.
+//! It does not:
+//!
+//! - The watchdog. A crate that is not a case (the helper crate `tests/crates/macro`, `type-leak`,
+//!   a build script) failing to build, or cargo failing without a compile error, fails the run
+//!   (`build_problem()`), and so does a case that built no executable or no Referrer's library
+//!   without an error saying why, a binary that fails or prints a line that is not a report, and
+//!   an item with no report (`missing_artifacts()`). None of them is read as "rejected".
+//! - The acceptance floor. The Leaker must accept at least a share of the items analyzed of each
+//!   kind (struct, enum, union, trait, inherent impl, trait impl, module) and of each scope they
+//!   are analyzed through, and the total accepted must not be 0 (`Floors`, `FLOORS`: they come
+//!   from the rates measured over several seeds, and the failure says which kind is below its
+//!   floor and why its items were rejected). A kind with fewer than `TYPE_LEAK_PROP_MIN_SAMPLES`
+//!   items is not checked. At least `TYPE_LEAK_PROP_MIN_CHECKED` percent of the type positions of
+//!   the accepted items must have been compared with their witness.
+//!
+//! The generator keeps the shapes that the Leaker rejects (a predicate that names a leaked type
+//! that uses a generic, an `impl Trait` argument, ...) in a share of the items (`gen::Gen::cyclic`),
+//! so that most items are accepted: an item is rejected with its first such shape, and a module
+//! with the first of its dozen items.
+//!
+//! What the macro analyzes besides `intern_*`: a fifth of the structs, enums and unions are
+//! analyzed nested in `enter_mod` (`View::visit_item`, its generics are local) or in
+//! `enter_generics` (no `Self`), a tenth of the traits nested in `enter_mod`, another tenth with
+//! `enter_trait`, and a third of the impls whose generics name no leaked type with `enter_impl`,
+//! where only the self type and the arguments of the trait are visited (the shape of a macro that
+//! resolves the trait by its name), and only those are compared. What it cannot express: the
+//! impls in `enter_mod` (the rewritten self type is the `Self` of the entries, which the nested
+//! contexts do not give), `enter_trait` for a trait with a generic associated type (the scope does
+//! not know its items), and `Self` in a nested item (see `nested_self` below).
+//!
 //! Environment variables:
 //!
 //! - `TYPE_LEAK_PROP_CASES` (default 24): the number of cases.
 //! - `TYPE_LEAK_PROP_SEED` (default 1): the seed of the generator.
 //! - `TYPE_LEAK_PROP_ITEMS` (default 8): the most items in a module.
+//! - `TYPE_LEAK_PROP_MIN_ACCEPT`: the acceptance floors, in percent. A number sets every kind and
+//!   scope, `name=number` one of them, read in order: `0` turns the floors off (the total accepted
+//!   must still be positive), `40,mod=10,enter_impl=70` is 40% but 10% for modules and 70% for
+//!   `enter_impl`. The names are the kinds of the table of the summary and the scopes `enter_mod`,
+//!   `enter_generics`, `enter_trait` and `enter_impl`.
+//! - `TYPE_LEAK_PROP_MIN_SAMPLES` (default 12): the fewest items of a kind for its floor to count.
+//! - `TYPE_LEAK_PROP_MIN_CHECKED` (default 30): the least percentage of type positions compared.
 //! - `TYPE_LEAK_PROP_FEATURES`: a comma-separated list of constructs that `type-leak` is known to
 //!   fail on (see `gen::Features`). The generator avoids them by default, so that the test passes
 //!   on the current library, and a new failure is a new finding. With one of `inferred_outlives`,
@@ -41,12 +81,14 @@
 //!   `trait_assoc_bound_cycle` (F20), `iterator_item_cycle` (F21), `supertrait_item` (F25),
 //!   `impl_trait_args` (F27), `hidden_lifetimes` (F28), `projection_outlives` (F30),
 //!   `item_predicate_cycle` (F33), `self_projection_outlives` (F34) and `gat_where_clause` (F35) are
-//!   fixed findings: they are
+//!   fixed findings, each in a share of the items (`gen::Gen::cyclic`): they are
 //!   on by default (the Leaker encodes or rewrites them, records what they need, or rejects and
 //!   counts what it cannot copy, and the Referrer names the lifetime of an elided signature where
 //!   `Self` adds lifetimes to it). `alias_item` (F26, a limitation) is a known failure that the
 //!   generator does not make by default: with it, or `all`, the test fails with the reproduction
-//!   of that finding (E0277).
+//!   of that finding (E0277). `nested_self` (F36) is another: a struct, an enum, a union or a trait
+//!   analyzed nested in `enter_mod` that names its own `Self` (the Visitor never rewrites an entry
+//!   that names it, so the copy keeps `Rel<Self>`, which the Referrer's crate cannot resolve).
 //!   The other findings of `tests/findings.rs` (F22 to F24: the Leaker rejected
 //!   what compiles, F29, F31, F32) are not features: a rejection is counted as success, and the
 //!   test cannot show a toolchain or a lint.
@@ -64,10 +106,10 @@
 mod gen;
 mod json;
 
-use gen::{generate, Case, Features, KINDS};
+use gen::{generate, Case, Features, KINDS, SCOPES};
 use json::Json;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
@@ -211,6 +253,8 @@ struct Build {
     success: bool,
     diags: Vec<Diag>,
     executables: HashMap<String, PathBuf>,
+    /// The targets that cargo built (or found fresh), by name.
+    artifacts: HashSet<String>,
     /// What cargo printed to stderr.
     stderr: String,
 }
@@ -245,6 +289,7 @@ fn cargo_build(ws: &Path, target: &Path) -> Build {
         success: output.status.success(),
         diags: Vec::new(),
         executables: HashMap::new(),
+        artifacts: HashSet::new(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     };
     for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -282,13 +327,13 @@ fn cargo_build(ws: &Path, target: &Path) -> Build {
                 });
             }
             Some("compiler-artifact") => {
-                if let (Some(name), Some(exe)) = (
-                    json.path("target.name").and_then(Json::str),
-                    json.get("executable").and_then(Json::str),
-                ) {
-                    build
-                        .executables
-                        .insert(name.to_string(), PathBuf::from(exe));
+                if let Some(name) = json.path("target.name").and_then(Json::str) {
+                    build.artifacts.insert(name.to_string());
+                    if let Some(exe) = json.get("executable").and_then(Json::str) {
+                        build
+                            .executables
+                            .insert(name.to_string(), PathBuf::from(exe));
+                    }
                 }
             }
             _ => (),
@@ -379,6 +424,405 @@ fn reason_head(detail: &str) -> String {
         None => detail.chars().take(60).collect(),
     }
 }
+// ---------------------------------------------------------------------------------------------
+// The watchdog: a run that tested nothing must not pass.
+// ---------------------------------------------------------------------------------------------
+
+/// The packages of the generated cases.
+fn case_packages(cases: usize) -> HashSet<String> {
+    (0..cases)
+        .flat_map(|i| [leaker_name(i), referrer_name(i)])
+        .collect()
+}
+
+/// Why a build tells nothing about the cases, or `None`. A failure of the helper crate
+/// (`tests/crates/macro`), of `type-leak`, or of cargo itself is not a finding of a case, and a
+/// case that no crate of it was built for would count as "rejected" or "nothing to check".
+fn build_problem(build: &Build, known: &HashSet<String>) -> Option<String> {
+    if !build.success && build.diags.is_empty() {
+        return Some(format!(
+            "cargo failed without a compile error:\n{}",
+            excerpt(&build.stderr, 60)
+        ));
+    }
+    let helper: Vec<&Diag> = build
+        .diags
+        .iter()
+        .filter(|d| !known.contains(&d.package))
+        .collect();
+    if helper.is_empty() {
+        return None;
+    }
+    let mut message = String::from(
+        "a crate that is not a generated case fails to build (the helper crate \
+         `tests/crates/macro`, `type-leak`, or a build script): nothing was tested, and this is \
+         not a finding of the property.\n",
+    );
+    for diag in helper.iter().take(3) {
+        write!(
+            message,
+            "\n--- package `{}`:\n{}\n",
+            diag.package,
+            excerpt(&diag.rendered, 30)
+        )
+        .unwrap();
+    }
+    Some(message)
+}
+
+/// What the build left of the case `i` when none of its crates reported an error: the Leaker's
+/// executable and the Referrer's library. A missing one is reported, not counted as a rejection.
+fn missing_artifacts(build: &Build, i: usize, leaker_ok: bool) -> Vec<String> {
+    let mut missing = Vec::new();
+    if !build.executables.contains_key(&leaker_name(i)) {
+        missing.push(format!(
+            "no executable was built for `{}`, so the macros reported nothing",
+            leaker_name(i)
+        ));
+    }
+    if leaker_ok && !build.artifacts.contains(&referrer_name(i)) {
+        missing.push(format!(
+            "`{}` was not built, and reported no error",
+            referrer_name(i)
+        ));
+    }
+    missing
+}
+
+// ---------------------------------------------------------------------------------------------
+// The statistics and the acceptance floor.
+// ---------------------------------------------------------------------------------------------
+
+/// What the macros reported over all the cases.
+#[derive(Default)]
+struct Stats {
+    /// The items generated, by kind (a module counts what it holds too).
+    generated: BTreeMap<&'static str, usize>,
+    accepted: BTreeMap<&'static str, usize>,
+    rejected: BTreeMap<&'static str, usize>,
+    /// The same by the scope an item was analyzed through (`gen::SCOPES`, by the name of the API).
+    scope_accepted: BTreeMap<&'static str, usize>,
+    scope_rejected: BTreeMap<&'static str, usize>,
+    /// The reason of each rejection, by kind.
+    reasons: BTreeMap<(&'static str, String), usize>,
+    analyzed: usize,
+    entries: usize,
+    positions: usize,
+    checked: usize,
+}
+
+fn kind_of(name: &str) -> &'static str {
+    KINDS.iter().find(|k| **k == name).copied().unwrap_or("?")
+}
+
+impl Stats {
+    fn collect(cases: &[Case], reports: &BTreeMap<(usize, usize), Report>) -> Stats {
+        let mut stats = Stats::default();
+        for (case_index, case) in cases.iter().enumerate() {
+            for item in &case.items {
+                for kind in &item.contents {
+                    *stats.generated.entry(kind).or_default() += 1;
+                }
+                if item.kind == "mod" {
+                    *stats.generated.entry("mod").or_default() += 1;
+                }
+                if let Some(report) = reports.get(&(case_index, item.id)) {
+                    stats.analyzed += 1;
+                    let kind = kind_of(&report.kind);
+                    if let Some((_, api)) = SCOPES.iter().find(|(scope, _)| *scope == item.scope) {
+                        let counts = if report.accepted {
+                            &mut stats.scope_accepted
+                        } else {
+                            *stats
+                                .reasons
+                                .entry((api, reason_head(&report.detail)))
+                                .or_default() += 1;
+                            &mut stats.scope_rejected
+                        };
+                        *counts.entry(api).or_default() += 1;
+                    }
+                    if report.accepted {
+                        *stats.accepted.entry(kind).or_default() += 1;
+                        stats.positions += report.positions;
+                        stats.checked += report.checked;
+                        stats.entries += report.entries;
+                    } else {
+                        *stats.rejected.entry(kind).or_default() += 1;
+                        *stats
+                            .reasons
+                            .entry((kind, reason_head(&report.detail)))
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
+        stats
+    }
+
+    /// The items accepted of a kind, or analyzed through a scope (the name of its API).
+    fn accepted_of(&self, name: &str) -> usize {
+        self.accepted.get(name).copied().unwrap_or(0)
+            + self.scope_accepted.get(name).copied().unwrap_or(0)
+    }
+
+    fn rejected_of(&self, name: &str) -> usize {
+        self.rejected.get(name).copied().unwrap_or(0)
+            + self.scope_rejected.get(name).copied().unwrap_or(0)
+    }
+
+    fn total_accepted(&self) -> usize {
+        self.accepted.values().sum()
+    }
+
+    /// The reasons of the rejections of a kind, most frequent first.
+    fn reasons_of(&self, kind: &str) -> Vec<(&str, usize)> {
+        let mut reasons: Vec<(&str, usize)> = self
+            .reasons
+            .iter()
+            .filter(|((k, _), _)| *k == kind)
+            .map(|((_, reason), n)| (reason.as_str(), *n))
+            .collect();
+        reasons.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        reasons
+    }
+}
+
+/// The least share of the analyzed items of each kind that the Leaker must accept, in percent.
+///
+/// A test that counts a rejection as a success passes when the Leaker rejects everything, or when
+/// the generator makes shapes that cannot be leaked (before the floors, 93% of the modules and
+/// 60% of the traits were rejected, and a macro that failed every `intern_*` still printed `ok`).
+/// These floors fail the run then. Measured over the seeds 1 to 12 at 60 cases, the accepted share
+/// was, per kind, lowest and mean: struct 93/95, enum 92/95, union 90/95, trait 71/74, inherent
+/// impl 83/89, trait impl 71/80, module 65/74, and per scope `enter_mod` 89/91, `enter_generics`
+/// 90/94, `enter_trait` 66/74, `enter_impl` 100/100. A floor is about a quarter below the lowest,
+/// so that a different seed or a short run (24 cases has a third of the items) does not trip it,
+/// but the old generator (module 10%, trait 39%, inherent and trait impl 41%) does.
+/// `TYPE_LEAK_PROP_MIN_ACCEPT` overrides them.
+const FLOORS: &[(&str, f64)] = &[
+    ("struct", 75.0),
+    ("enum", 75.0),
+    ("union", 70.0),
+    ("trait", 50.0),
+    ("impl-inherent", 60.0),
+    ("impl-trait", 50.0),
+    ("mod", 40.0),
+    // The items analyzed through a scope (`gen::SCOPES`), by the name of its API.
+    ("enter_mod", 70.0),
+    ("enter_generics", 70.0),
+    ("enter_trait", 40.0),
+    ("enter_impl", 70.0),
+];
+
+/// The fewest analyzed items of a kind for its floor to count (a short run has too few of the
+/// rare kinds to say anything about their rate): `TYPE_LEAK_PROP_MIN_SAMPLES`.
+const MIN_SAMPLES: usize = 12;
+
+/// The least share of the type positions of the accepted items whose rewritten type was compared
+/// with the original (the rest has an elided lifetime, `impl Trait`, or a name the module
+/// declares), in percent: `TYPE_LEAK_PROP_MIN_CHECKED`. Without it the oracle could silently
+/// check nothing. Measured: 48% to 53% over the seeds 1 to 12 at 60 cases (the accepted modules
+/// have many positions that name what the module declares).
+const MIN_CHECKED: f64 = 30.0;
+
+#[derive(Debug, PartialEq)]
+struct Floors {
+    by_kind: BTreeMap<&'static str, f64>,
+    min_samples: usize,
+    min_checked: f64,
+}
+
+impl Floors {
+    /// `spec`: the value of `TYPE_LEAK_PROP_MIN_ACCEPT`, a comma-separated list read in order of
+    /// `N` (every kind) and `kind=N`: `"0"` turns the floors off, `"30,mod=5"` is 30% but 5% for
+    /// a module.
+    fn parse(spec: &str, min_samples: usize, min_checked: f64) -> Result<Floors, String> {
+        let mut by_kind: BTreeMap<&'static str, f64> = FLOORS.iter().copied().collect();
+        for token in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let (kind, value) = match token.split_once('=') {
+                Some((kind, value)) => (Some(kind.trim()), value.trim()),
+                None => (None, token),
+            };
+            let value: f64 = value
+                .parse()
+                .map_err(|_| format!("`{}` is not a percentage", token))?;
+            if !(0.0..=100.0).contains(&value) {
+                return Err(format!("`{}` is not between 0 and 100", token));
+            }
+            match kind {
+                None => {
+                    for floor in by_kind.values_mut() {
+                        *floor = value;
+                    }
+                }
+                Some(kind) => match by_kind.keys().find(|k| **k == kind).copied() {
+                    Some(kind) => {
+                        by_kind.insert(kind, value);
+                    }
+                    None => {
+                        return Err(format!(
+                            "`{}`: no kind or scope `{}` (they are {:?})",
+                            token,
+                            kind,
+                            by_kind.keys().collect::<Vec<_>>()
+                        ))
+                    }
+                },
+            }
+        }
+        Ok(Floors {
+            by_kind,
+            min_samples,
+            min_checked,
+        })
+    }
+
+    fn from_env() -> Floors {
+        let spec = std::env::var("TYPE_LEAK_PROP_MIN_ACCEPT").unwrap_or_default();
+        Floors::parse(
+            &spec,
+            env_or("TYPE_LEAK_PROP_MIN_SAMPLES", MIN_SAMPLES),
+            env_or("TYPE_LEAK_PROP_MIN_CHECKED", MIN_CHECKED),
+        )
+        .unwrap_or_else(|e| panic!("TYPE_LEAK_PROP_MIN_ACCEPT: {}", e))
+    }
+
+    /// Why the statistics are too poor for the run to count as a test, one line each.
+    fn problems(&self, stats: &Stats) -> Vec<String> {
+        let mut problems = Vec::new();
+        let all_off = self.by_kind.values().all(|f| *f == 0.0);
+        if stats.analyzed == 0 {
+            problems.push(
+                "no macro was applied to any item (`analyzed` is 0): the run tested nothing"
+                    .to_string(),
+            );
+        } else if stats.total_accepted() == 0 {
+            problems.push(format!(
+                "the Leaker accepted none of the {} items analyzed (a macro that fails every \
+                 `intern_*` would pass otherwise: a rejection counts as a success)",
+                stats.analyzed
+            ));
+        }
+        if all_off {
+            return problems;
+        }
+        for kind in KINDS.iter().chain(SCOPES.iter().map(|(_, api)| api)) {
+            let (a, r) = (stats.accepted_of(kind), stats.rejected_of(kind));
+            let floor = self.by_kind.get(kind).copied().unwrap_or(0.0);
+            if a + r < self.min_samples || floor == 0.0 {
+                continue;
+            }
+            let rate = 100.0 * a as f64 / (a + r) as f64;
+            if rate < floor {
+                let reasons: Vec<String> = stats
+                    .reasons_of(kind)
+                    .iter()
+                    .take(3)
+                    .map(|(reason, n)| format!("{}x {}", n, reason))
+                    .collect();
+                problems.push(format!(
+                    "{}: {} of {} analyzed items accepted ({:.0}%), below the floor of {:.0}%; \
+                     the generator makes shapes that cannot be leaked, or the Leaker rejects \
+                     too much. Most frequent rejections: {}",
+                    kind,
+                    a,
+                    a + r,
+                    rate,
+                    floor,
+                    reasons.join("; ")
+                ));
+            }
+        }
+        if stats.total_accepted() > 0 && self.min_checked > 0.0 {
+            let share = if stats.positions == 0 {
+                0.0
+            } else {
+                100.0 * stats.checked as f64 / stats.positions as f64
+            };
+            if share < self.min_checked {
+                problems.push(format!(
+                    "only {} of {} type positions of the accepted items have a witness \
+                     ({:.0}%), below {:.0}%: the oracle checks (almost) nothing",
+                    stats.checked, stats.positions, share, self.min_checked
+                ));
+            }
+        }
+        problems
+    }
+}
+
+fn summarize(stats: &Stats, floors: &Floors, seed: u64, n: usize, features: Features) -> String {
+    let mut s = format!(
+        "type-leak property test: seed {}, {} cases, features {:?}\n",
+        seed, n, features
+    );
+    let total: usize = stats.generated.values().sum();
+    writeln!(
+        s,
+        "  generated items: {} (nested items of a module included)",
+        total
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "  {:<14} {:>9} {:>9} {:>9} {:>9} {:>6}",
+        "kind", "generated", "accepted", "rejected", "accepted%", "floor"
+    )
+    .unwrap();
+    for kind in KINDS
+        .iter()
+        .chain(["fn", "alias"].iter())
+        .chain(SCOPES.iter().map(|(_, api)| api))
+    {
+        // An item analyzed through a scope is of a kind too: `generated` counts kinds only.
+        let g = if SCOPES.iter().any(|(_, api)| api == kind) {
+            stats.accepted_of(kind) + stats.rejected_of(kind)
+        } else {
+            stats.generated.get(kind).copied().unwrap_or(0)
+        };
+        if g == 0 {
+            continue;
+        }
+        let (a, r) = (stats.accepted_of(kind), stats.rejected_of(kind));
+        let rate = if a + r > 0 {
+            format!("{:.0}%", 100.0 * a as f64 / (a + r) as f64)
+        } else {
+            "-".into()
+        };
+        let floor = match floors.by_kind.get(kind) {
+            Some(f) if *f == 0.0 => "off".into(),
+            Some(f) if a + r >= floors.min_samples => format!("{:.0}%", f),
+            Some(_) => "n/a".into(),
+            None => "-".into(),
+        };
+        writeln!(
+            s,
+            "  {:<14} {:>9} {:>9} {:>9} {:>9} {:>6}",
+            kind, g, a, r, rate, floor
+        )
+        .unwrap();
+    }
+    writeln!(
+        s,
+        "  analyzed (macros applied): {}; entries: {}; type positions: {}, witnesses checked: {} ({} skipped: elided lifetimes, or names declared in a module)",
+        stats.analyzed,
+        stats.entries,
+        stats.positions,
+        stats.checked,
+        stats.positions - stats.checked
+    )
+    .unwrap();
+    for kind in KINDS.iter().chain(SCOPES.iter().map(|(_, api)| api)) {
+        for (reason, n) in stats.reasons_of(kind).iter().take(3) {
+            writeln!(s, "  rejected {:>4}x {:<13} {}", n, kind, reason).unwrap();
+        }
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------------------------
+// The test.
+// ---------------------------------------------------------------------------------------------
 
 #[test]
 #[ignore = "slow, builds generated crates; run with `cargo test --test prop_cross_crate -- --ignored`"]
@@ -387,6 +831,7 @@ fn random_items_leak_across_crates() {
     let seed: u64 = env_or("TYPE_LEAK_PROP_SEED", 1);
     let items_per_module: usize = env_or("TYPE_LEAK_PROP_ITEMS", 8);
     let features = Features::parse(&std::env::var("TYPE_LEAK_PROP_FEATURES").unwrap_or_default());
+    let floors = Floors::from_env();
     let generated: Vec<Case> = (0..cases)
         .map(|i| generate(case_seed(seed, i), i, items_per_module, features))
         .collect();
@@ -398,17 +843,20 @@ fn random_items_leak_across_crates() {
     write_workspace(&ws, &list, Mode::Real);
     let build = cargo_build(&ws, &target);
 
-    let mut failures: Vec<Failure> = Vec::new();
-    if !build.success && build.diags.is_empty() {
+    // The watchdog: the helper crate or cargo failing is not a finding, and not a rejection.
+    let known = case_packages(cases);
+    if let Some(problem) = build_problem(&build, &known) {
         panic!(
-            "cargo failed without a compile error (seed {}):\n{}",
-            seed,
-            excerpt(&build.stderr, 60)
+            "type-leak property test: the build is broken (seed {}, {} cases):\n{}",
+            seed, cases, problem
         );
     }
 
+    let mut failures: Vec<Failure> = Vec::new();
+
     // The errors of each crate. The Referrer's crate is built only if the Leaker's compiles.
     let mut leaker_failed: Vec<usize> = Vec::new();
+    let mut unbuilt: Vec<usize> = Vec::new();
     for (i, case) in generated.iter().enumerate() {
         let leaker = leaker_name(i);
         let referrer = referrer_name(i);
@@ -419,7 +867,9 @@ fn random_items_leak_across_crates() {
             continue;
         }
         let referrer_file = format!("{}/src/lib.rs", referrer_dir(i));
+        let mut referrer_failed = false;
         for diag in build.diags.iter().filter(|d| d.package == referrer) {
+            referrer_failed = true;
             // The item whose macro invocation the error is in.
             let line = diag
                 .lines
@@ -447,6 +897,19 @@ fn random_items_leak_across_crates() {
                 text: diag.rendered.clone(),
             });
         }
+        // Neither crate reported an error: both must have been built.
+        if !referrer_failed {
+            let missing = missing_artifacts(&build, i, true);
+            if !missing.is_empty() {
+                unbuilt.push(i);
+                failures.push(Failure {
+                    case: i,
+                    item: None,
+                    class: "WATCHDOG: a crate of the case was not built, and no error says why",
+                    text: missing.join("\n"),
+                });
+            }
+        }
     }
 
     // A Leaker's crate that does not compile: is it the generator or the macro?
@@ -455,6 +918,12 @@ fn random_items_leak_across_crates() {
         let list: Vec<(usize, &Case)> = leaker_failed.iter().map(|&i| (i, &generated[i])).collect();
         write_workspace(&id_ws, &list, Mode::Identity);
         let identity = cargo_build(&id_ws, &target);
+        if let Some(problem) = build_problem(&identity, &known) {
+            panic!(
+                "type-leak property test: the build without `type-leak` is broken (seed {}, {} cases):\n{}",
+                seed, cases, problem
+            );
+        }
         for &i in &leaker_failed {
             let name = leaker_name(i);
             let own: Vec<&Diag> = identity
@@ -488,51 +957,98 @@ fn random_items_leak_across_crates() {
         }
     }
 
-    // What the macros reported.
+    // What the macros reported. Every item must have a report: a missing one is a failure, not a
+    // rejection.
     let mut reports: BTreeMap<(usize, usize), Report> = BTreeMap::new();
     for (i, case) in generated.iter().enumerate() {
-        if leaker_failed.contains(&i) {
+        if leaker_failed.contains(&i) || unbuilt.contains(&i) {
             continue;
         }
         let Some(exe) = build.executables.get(&leaker_name(i)) else {
             continue;
         };
         let output = Command::new(exe).output().unwrap();
+        if !output.status.success() {
+            failures.push(Failure {
+                case: i,
+                item: None,
+                class: "WATCHDOG: the binary that prints the reports fails",
+                text: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+            continue;
+        }
         for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if let Some((id, report)) = parse_report(line) {
-                if report.accepted && report.detail.starts_with("rewrite-error") {
-                    failures.push(Failure {
-                        case: i,
-                        item: Some(id),
-                        class: "the rewrite of an accepted item fails",
-                        text: report.detail.clone(),
-                    });
+            match parse_report(line) {
+                Some((id, report)) => {
+                    if report.accepted && report.detail.starts_with("rewrite-error") {
+                        failures.push(Failure {
+                            case: i,
+                            item: Some(id),
+                            class: "the rewrite of an accepted item fails",
+                            text: report.detail.clone(),
+                        });
+                    }
+                    reports.insert((i, id), report);
                 }
-                reports.insert((i, id), report);
+                None => failures.push(Failure {
+                    case: i,
+                    item: None,
+                    class: "WATCHDOG: a report line cannot be read",
+                    text: line.to_string(),
+                }),
             }
         }
-        assert_eq!(
-            reports.keys().filter(|(c, _)| *c == i).count(),
-            case.items.len(),
-            "a report is missing in case {}",
-            i
+        let missing: Vec<String> = case
+            .items
+            .iter()
+            .filter(|item| !reports.contains_key(&(i, item.id)))
+            .map(|item| item.id.to_string())
+            .collect();
+        if !missing.is_empty() {
+            failures.push(Failure {
+                case: i,
+                item: None,
+                class: "WATCHDOG: the macros of some items reported nothing",
+                text: format!("items {}", missing.join(", ")),
+            });
+        }
+    }
+
+    if !build.success && failures.is_empty() {
+        panic!(
+            "cargo failed, and no failure of a case says why (seed {}):\n{}",
+            seed,
+            excerpt(&build.stderr, 60)
         );
     }
 
-    let summary = summarize(&generated, &reports, seed, cases, features);
+    let stats = Stats::collect(&generated, &reports);
+    let summary = summarize(&stats, &floors, seed, cases, features);
     eprintln!("{}", summary);
+    let floor_problems = floors.problems(&stats);
 
-    if !failures.is_empty() {
+    if !failures.is_empty() || !floor_problems.is_empty() {
         let mut message = format!(
-            "type-leak property failed (TYPE_LEAK_PROP_SEED={} TYPE_LEAK_PROP_CASES={} TYPE_LEAK_PROP_ITEMS={} TYPE_LEAK_PROP_FEATURES={:?}):\n{} failure(s).\nSources: {}\n\n{}\n",
+            "type-leak property failed (TYPE_LEAK_PROP_SEED={} TYPE_LEAK_PROP_CASES={} TYPE_LEAK_PROP_ITEMS={} TYPE_LEAK_PROP_FEATURES={:?}):\n{} failure(s), {} acceptance problem(s).\nSources: {}\n\n{}\n",
             seed,
             cases,
             items_per_module,
             std::env::var("TYPE_LEAK_PROP_FEATURES").unwrap_or_default(),
             failures.len(),
+            floor_problems.len(),
             ws.display(),
             summary
         );
+        if !floor_problems.is_empty() {
+            message.push_str(
+                "\nACCEPTANCE: the run passes only if the Leaker accepts enough of what is \
+                 generated (TYPE_LEAK_PROP_MIN_ACCEPT, TYPE_LEAK_PROP_MIN_SAMPLES and \
+                 TYPE_LEAK_PROP_MIN_CHECKED change the floors; see the docs of this test):\n",
+            );
+            for problem in &floor_problems {
+                writeln!(message, "  - {}", problem).unwrap();
+            }
+        }
         for failure in failures.iter().take(6) {
             let case = &generated[failure.case];
             write!(
@@ -568,7 +1084,9 @@ fn random_items_leak_across_crates() {
             }
             writeln!(message, "{}", excerpt(&failure.text, 40)).unwrap();
         }
-        message.push_str("\nall failures:\n");
+        if !failures.is_empty() {
+            message.push_str("\nall failures:\n");
+        }
         for failure in &failures {
             let head = failure.text.lines().next().unwrap_or("");
             writeln!(
@@ -585,91 +1103,167 @@ fn random_items_leak_across_crates() {
     }
 }
 
-fn summarize(
-    cases: &[Case],
-    reports: &BTreeMap<(usize, usize), Report>,
-    seed: u64,
-    n: usize,
-    features: Features,
-) -> String {
-    let mut generated: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut accepted: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut rejected: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
-    let (mut positions, mut checked, mut entries) = (0, 0, 0);
-    let mut analyzed = 0;
-    for (case_index, case) in cases.iter().enumerate() {
-        for item in &case.items {
-            for kind in &item.contents {
-                *generated.entry(kind).or_default() += 1;
-            }
-            if item.kind == "mod" {
-                *generated.entry("mod").or_default() += 1;
-            }
-            if let Some(report) = reports.get(&(case_index, item.id)) {
-                analyzed += 1;
-                let kind = KINDS
-                    .iter()
-                    .find(|k| **k == report.kind)
-                    .copied()
-                    .unwrap_or("?");
-                if report.accepted {
-                    *accepted.entry(kind).or_default() += 1;
-                    positions += report.positions;
-                    checked += report.checked;
-                    entries += report.entries;
-                } else {
-                    *rejected.entry(kind).or_default() += 1;
-                    *reasons.entry(reason_head(&report.detail)).or_default() += 1;
-                }
-            }
+// ---------------------------------------------------------------------------------------------
+// Tests of the checks themselves (fast; they run with `cargo test` too).
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod checks {
+    use super::*;
+
+    fn build(success: bool, packages: &[&str]) -> Build {
+        Build {
+            success,
+            diags: packages
+                .iter()
+                .map(|p| Diag {
+                    package: p.to_string(),
+                    rendered: "error: boom".into(),
+                    lines: Vec::new(),
+                })
+                .collect(),
+            executables: HashMap::new(),
+            artifacts: HashSet::new(),
+            stderr: "cargo said".into(),
         }
     }
-    let mut s = format!(
-        "type-leak property test: seed {}, {} cases, features {:?}\n",
-        seed, n, features
-    );
-    let total: usize = generated.values().sum();
-    writeln!(
-        s,
-        "  generated items: {} (nested items of a module included)",
-        total
-    )
-    .unwrap();
-    writeln!(
-        s,
-        "  {:<14} {:>9} {:>9} {:>9} {:>8}",
-        "kind", "generated", "accepted", "rejected", "rate"
-    )
-    .unwrap();
-    for kind in KINDS.iter().chain(["fn", "alias"].iter()) {
-        let g = generated.get(kind).copied().unwrap_or(0);
-        if g == 0 {
-            continue;
+
+    /// `n` reports of `kind`: `accepted` of them accepted (a case with one item each).
+    fn stats_of(kinds: &[(&str, usize, usize)]) -> Stats {
+        let mut stats = Stats::default();
+        for (kind, accepted, rejected) in kinds {
+            let kind = kind_of(kind);
+            for _ in 0..*accepted {
+                stats.analyzed += 1;
+                *stats.accepted.entry(kind).or_default() += 1;
+                stats.positions += 4;
+                stats.checked += 4;
+            }
+            for _ in 0..*rejected {
+                stats.analyzed += 1;
+                *stats.rejected.entry(kind).or_default() += 1;
+                *stats.reasons.entry((kind, "no".into())).or_default() += 1;
+            }
         }
-        let a = accepted.get(kind).copied().unwrap_or(0);
-        let r = rejected.get(kind).copied().unwrap_or(0);
-        let rate = if a + r > 0 {
-            format!("{:.0}%", 100.0 * r as f64 / (a + r) as f64)
-        } else {
-            "-".into()
-        };
-        writeln!(s, "  {:<14} {:>9} {:>9} {:>9} {:>8}", kind, g, a, r, rate).unwrap();
+        stats
     }
-    writeln!(
-        s,
-        "  analyzed (macros applied): {}; entries: {}; type positions: {}, witnesses checked: {} ({} skipped: elided lifetimes, or names declared in a module)",
-        analyzed,
-        entries,
-        positions,
-        checked,
-        positions - checked
-    )
-    .unwrap();
-    let mut reasons: Vec<(String, usize)> = reasons.into_iter().collect();
-    reasons.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-    for (reason, n) in reasons.iter().take(10) {
-        writeln!(s, "  rejected {:>3}x: {}", n, reason).unwrap();
+
+    fn defaults() -> Floors {
+        Floors::parse("", MIN_SAMPLES, MIN_CHECKED).unwrap()
     }
-    s
+
+    #[test]
+    fn a_broken_helper_crate_is_not_a_finding_and_not_a_rejection() {
+        let known = case_packages(2);
+        // The macro crate does not compile: no crate of any case is built, and no case reports.
+        let problem = build_problem(&build(false, &["type_leak_test_macro"]), &known).unwrap();
+        assert!(problem.contains("type_leak_test_macro"), "{}", problem);
+        assert!(problem.contains("nothing was tested"), "{}", problem);
+        // Cargo itself fails.
+        let problem = build_problem(&build(false, &[]), &known).unwrap();
+        assert!(problem.contains("without a compile error"), "{}", problem);
+        // The errors of the cases are the findings of the test, not of the watchdog.
+        assert!(build_problem(&build(false, &["tlp_l_001", "tlp_r_000"]), &known).is_none());
+        assert!(build_problem(&build(true, &[]), &known).is_none());
+    }
+
+    #[test]
+    fn a_case_with_nothing_built_is_reported() {
+        let mut b = build(true, &[]);
+        assert_eq!(missing_artifacts(&b, 3, true).len(), 2);
+        b.executables.insert(leaker_name(3), PathBuf::from("/x"));
+        assert_eq!(missing_artifacts(&b, 3, true).len(), 1);
+        b.artifacts.insert(referrer_name(3));
+        assert!(missing_artifacts(&b, 3, true).is_empty());
+    }
+
+    #[test]
+    fn the_floors_fail_a_run_that_accepts_nothing() {
+        // Every `intern_*` fails: all rejected.
+        let all_rejected = stats_of(&[("struct", 0, 40), ("trait", 0, 40), ("mod", 0, 20)]);
+        let problems = defaults().problems(&all_rejected);
+        assert!(
+            problems.iter().any(|p| p.contains("accepted none")),
+            "{:?}",
+            problems
+        );
+        assert!(
+            problems.iter().any(|p| p.starts_with("struct:")),
+            "{:?}",
+            problems
+        );
+        // Nothing analyzed at all.
+        let problems = defaults().problems(&Stats::default());
+        assert!(
+            problems.iter().any(|p| p.contains("tested nothing")),
+            "{:?}",
+            problems
+        );
+        // Turned off per kind, the total still has to be positive.
+        let off = Floors::parse("0", MIN_SAMPLES, MIN_CHECKED).unwrap();
+        assert_eq!(off.problems(&all_rejected).len(), 1);
+        assert!(off.problems(&stats_of(&[("struct", 1, 40)])).is_empty());
+    }
+
+    #[test]
+    fn a_kind_below_its_floor_fails_when_it_has_enough_samples() {
+        let rich = stats_of(&[("struct", 90, 10), ("mod", 1, 30)]);
+        let problems = defaults().problems(&rich);
+        assert_eq!(problems.len(), 1, "{:?}", problems);
+        assert!(problems[0].starts_with("mod:"), "{:?}", problems);
+        // Too few samples of the kind: not counted.
+        let poor = stats_of(&[("struct", 90, 10), ("mod", 0, MIN_SAMPLES - 1)]);
+        assert!(defaults().problems(&poor).is_empty());
+        // The floor is a minimum, not a bound on the rate.
+        let ok = stats_of(&[("struct", 100, 0), ("mod", 4, 6)]);
+        assert!(defaults().problems(&ok).is_empty());
+    }
+
+    #[test]
+    fn the_floors_are_overridden_by_the_environment_format() {
+        let floors = Floors::parse("30, mod=5", 7, 55.0).unwrap();
+        assert_eq!(floors.by_kind["struct"], 30.0);
+        assert_eq!(floors.by_kind["mod"], 5.0);
+        assert_eq!((floors.min_samples, floors.min_checked), (7, 55.0));
+        let floors = Floors::parse("mod=90", MIN_SAMPLES, MIN_CHECKED).unwrap();
+        assert_eq!(floors.by_kind["mod"], 90.0);
+        let default_of = |kind: &str| FLOORS.iter().find(|(k, _)| *k == kind).unwrap().1;
+        assert_eq!(floors.by_kind["struct"], default_of("struct"));
+        assert_eq!(floors.by_kind["trait"], default_of("trait"));
+        // A scope's floor too.
+        let floors = Floors::parse("enter_impl=1", MIN_SAMPLES, MIN_CHECKED).unwrap();
+        assert_eq!(floors.by_kind["enter_impl"], 1.0);
+        assert!(Floors::parse("fn=5", 1, 1.0).is_err());
+        assert!(Floors::parse("150", 1, 1.0).is_err());
+        assert!(Floors::parse("a", 1, 1.0).is_err());
+    }
+
+    #[test]
+    fn an_oracle_that_checks_nothing_fails() {
+        let mut stats = stats_of(&[("struct", 90, 10)]);
+        stats.checked = 0;
+        let problems = defaults().problems(&stats);
+        assert!(
+            problems.iter().any(|p| p.contains("witness")),
+            "{:?}",
+            problems
+        );
+        let mut stats = stats_of(&[("struct", 90, 10)]);
+        stats.checked = stats.positions / 5;
+        assert_eq!(defaults().problems(&stats).len(), 1);
+        stats.checked = stats.positions * 9 / 10;
+        assert!(defaults().problems(&stats).is_empty());
+    }
+
+    #[test]
+    fn reports_are_read_back() {
+        let (id, r) = parse_report("7|struct|ok|entries=2 positions=5 checked=4").unwrap();
+        assert_eq!(
+            (id, r.accepted, r.entries, r.positions, r.checked),
+            (7, true, 2, 5, 4)
+        );
+        let (id, r) = parse_report("8|mod|rej|use absolute path: 'X'").unwrap();
+        assert_eq!((id, r.accepted), (8, false));
+        assert!(parse_report("nonsense").is_none());
+    }
 }

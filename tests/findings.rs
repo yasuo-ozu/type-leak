@@ -43,6 +43,7 @@
 //! | `f33_where_predicate_names_item_that_a_predicate_in_scope_defines` | a where predicate of an entry's context names an `Item` that a predicate of a method equates to a leaked type | fixed |
 //! | `f34_implied_outlives_of_self_projection_forms_recorded_as_components` | `&'x <Self as Tr<'a, T>>::A`, `&'x Self::A<'b>` and a `Self::A` that a bound equates are recorded as components | fixed |
 //! | `f35_gat_where_clause_of_self_projection_not_recorded` | `Self::G<'x>` of a generic associated type with `where Self: 'b` needs `Self: 'x`, which F34 stopped recording | fixed |
+//! | `f36_nested_item_self_entry_not_rewritten` | an entry that names the own `Self` of a struct, enum, union or trait nested in a module is recorded, and the Visitor never rewrites it | bug |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that the README documents, or that follows from what rustc accepts). No test is
@@ -6721,5 +6722,87 @@ fn f35_gat_where_clause_of_self_projection_not_recorded() {
                 );
             }
         }
+    }
+}
+
+/// F36: an entry that names the own `Self` of an item nested in a scope (a struct, an enum, a union,
+/// a trait or an impl that `View::visit_item()` or `intern_mod()` visits) is recorded, but the
+/// Visitor never finds it in the copy.
+///
+/// The Leaker gives the nested item a `Self` of its own (`Rel2<Self>` is the entry of the struct's
+/// context, `SelfRequirement::Type(S<T>)`), whatever `allow_self` the scope around has, and the
+/// README says that the Referrer takes the `Self` of a nested item from the item it visits and
+/// computes the same contexts. `Referrer::find()` skips every entry that names `Self` while the
+/// Visitor is in a nested item (`no_self`, meant for the `Self` of the scope around, which the
+/// nested item hides), so the entry of the item's own `Self` is skipped as well: the copy keeps
+/// `Rel2<Self>`, and the Referrer's crate cannot resolve `Rel2` (E0412, E0425, E0433). The entry that
+/// does not name `Self` (`Rel<T>`) is rewritten. The copy cannot write the replacement by hand
+/// either, as the Repeater's impl for the nested struct is for the Leaker's `S<T>`, which only the
+/// macro knows the path of (`with_self()` does not replace the `Self` of a nested item).
+///
+/// The property test shows it with `TYPE_LEAK_PROP_FEATURES=nested_self`: a struct, an enum, a
+/// union or a trait analyzed nested in `enter_mod` that names its own `Self` (seed 1, 24 cases: nine
+/// failures in the Referrer's crate, `cannot find type `R1` in this scope`, `cannot find trait
+/// `Tr0_1``, and E0308 where a position of the copy names the copy's own `Self`). The generator
+/// does not make it by default, as it is not fixed.
+#[test]
+#[ignore = "bug (F36): the Visitor does not rewrite an entry that names the own `Self` of a nested item"]
+fn f36_nested_item_self_entry_not_rewritten() {
+    let items: Vec<(Item, &str)> = vec![
+        (
+            parse_quote!(
+                struct S<T> {
+                    b: Rel<T>,
+                    c: Vec<Rel2<Self>>,
+                }
+            ),
+            "Rel2 <",
+        ),
+        (
+            parse_quote!(
+                enum E {
+                    A(Vec<Rel2<Self>>),
+                }
+            ),
+            "Rel2 <",
+        ),
+        (
+            parse_quote!(
+                trait Tr {
+                    fn f(&self) -> Vec<Rel2<Self>>;
+                }
+            ),
+            "Rel2 <",
+        ),
+    ];
+    for (item, leaked) in items {
+        let name = match &item {
+            Item::Struct(i) => i.ident.clone(),
+            Item::Enum(i) => i.ident.clone(),
+            Item::Trait(i) => i.ident.clone(),
+            _ => unreachable!(),
+        };
+        let mut leaker = new_leaker();
+        let (context, ()) = leaker
+            .enter_mod("m", [name], |view| view.visit_item(&item))
+            .unwrap();
+        let referrer = leaker.finish();
+        assert!(referrer.iter().any(|entry| string(entry).contains(leaked)));
+        // The module's items are declared together, as those of a file.
+        let mut file = File {
+            shebang: None,
+            attrs: Vec::new(),
+            items: vec![item.clone()],
+        };
+        referrer
+            .visitor(context, |_, ix| parse_quote!(P<#ix>))
+            .visit_file_mut(&mut file);
+        let copy = string(&file);
+        assert!(
+            !copy.contains(leaked),
+            "`{}`: the entry that names `Self` is not replaced in the copy: {}",
+            string(&item),
+            copy
+        );
     }
 }
