@@ -852,3 +852,118 @@ fn an_entry_context_is_a_scope_too() {
         assert_eq!(s(&rewritten), s(&parse_quote!(P<#ix>) as &Type));
     }
 }
+
+// ── the shapes a downstream macro visits ─────────────────────────────────────────────────────
+
+/// A trait with supertraits, associated types with bounds and a default, and a method, all naming
+/// leaked types.
+fn trait_with_bounds() -> ItemTrait {
+    parse_quote! {
+        pub trait Tr<T>: ::p::Sup<Rel> + ::p::Sup2<Rel2<T>> {
+            type A: ::p::Bound<Rel3>;
+            type B<'x>: ::p::Bound<Rel4<T>> = Rel5;
+            fn f(&self, x: Rel6) -> Rel7<T>;
+        }
+    }
+}
+
+/// README, Helpers for macro authors: a macro rewrites the trait it leaked (`visit_item_trait_mut`
+/// visits the generics, the supertraits and the items), or goes through the parts itself (as
+/// newer-type does: the bounds of the supertraits, the associated types, the signatures of the
+/// methods), and gets the same copy. Audit mutants `D3` (the bounds of an associated type are not
+/// visited) and `D4` (the supertraits of a visited `ItemTrait` are not).
+#[test]
+fn a_trait_is_rewritten_whole_and_part_by_part() {
+    let tr = trait_with_bounds();
+    let mut leaker = Leaker::new();
+    let context = leaker.intern_trait(&tr, true).unwrap();
+    let referrer = leaker.finish();
+    // The entries, by context and tokens: those without generics, then those with `<T>`.
+    assert_eq!(
+        referrer.iter().map(s).collect::<Vec<_>>(),
+        [
+            "Rel",
+            "Rel3",
+            "Rel5",
+            "Rel6",
+            "Rel2 < T >",
+            "Rel4 < T >",
+            "Rel7 < T >"
+        ]
+    );
+    let expected: ItemTrait = parse_quote! {
+        pub trait Tr<T>: ::p::Sup<P<0>> + ::p::Sup2<P<4>> {
+            type A: ::p::Bound<P<1>>;
+            type B<'x>: ::p::Bound<P<5>> = P<2>;
+            fn f(&self, x: P<3>) -> P<6>;
+        }
+    };
+    let mut whole = tr.clone();
+    referrer
+        .clone()
+        .visitor(context, replace)
+        .visit_item_trait_mut(&mut whole);
+    assert_eq!(s(&whole), s(&expected));
+
+    // Part by part: the supertraits, the associated types and the signatures, as a macro that
+    // keeps the trait and replaces what it chooses to does.
+    let mut parts = tr.clone();
+    let mut visitor = referrer.clone().visitor(context, replace);
+    for bound in parts.supertraits.iter_mut() {
+        visitor.visit_type_param_bound_mut(bound);
+    }
+    for item in parts.items.iter_mut() {
+        match item {
+            TraitItem::Fn(item) => visitor.visit_signature_mut(&mut item.sig),
+            TraitItem::Type(item) => visitor.visit_trait_item_type_mut(item),
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(s(&parts), s(&expected));
+}
+
+/// README, Helpers for macro authors: a signature visited by itself is a nested item: its generics
+/// are its own, unless `with_outermost_generics_as_leakers()` says they are the context's. So the
+/// method `f<T: Clone>` has a `T` of its own, and `Wrap<T>` is not the entry of the trait's `T`,
+/// while with the flag it is. Audit mutant `D5` (`visit_signature_mut` treated as no item).
+#[test]
+fn a_signature_visited_by_itself_is_a_nested_item() {
+    let tr: ItemTrait = parse_quote! {
+        trait Tr<T> {
+            fn f(&self) -> Wrap<T>;
+            fn g<const B: bool>(&self) -> Wrap2<B>;
+        }
+    };
+    let mut leaker = Leaker::new();
+    let context = leaker.intern_trait(&tr, true).unwrap();
+    let referrer = leaker.finish();
+    for (sig, expected, as_leakers) in [
+        // A `T` of the method with a bound is not the trait's `T`.
+        (
+            "fn f<T: ::core::clone::Clone>(&self) -> Wrap<T>",
+            "fn f<T: ::core::clone::Clone>(&self) -> Wrap<T>",
+            false,
+        ),
+        // Unless the visitor takes the generics of the outermost item as the context's.
+        (
+            "fn f<T: ::core::clone::Clone>(&self) -> Wrap<T>",
+            "fn f<T: ::core::clone::Clone>(&self) -> P<0>",
+            true,
+        ),
+        // The generics of a method that the trait does not have are declared.
+        (
+            "fn g<const B: bool>(&self) -> Wrap2<B>",
+            "fn g<const B: bool>(&self) -> P<1>",
+            false,
+        ),
+    ] {
+        let mut sig: Signature = parse_str(sig).unwrap();
+        let expected: Signature = parse_str(expected).unwrap();
+        let mut visitor = referrer.clone().visitor(context, replace);
+        if as_leakers {
+            visitor = visitor.with_outermost_generics_as_leakers();
+        }
+        visitor.visit_signature_mut(&mut sig);
+        assert_eq!(s(&sig), s(&expected));
+    }
+}

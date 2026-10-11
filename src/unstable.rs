@@ -34,16 +34,33 @@ use template_quote::quote;
 pub(crate) struct Unstable {
     /// The bound: a parameter with its bounds, or a where predicate.
     pub(crate) bound: TokenStream,
-    pub(crate) why: Why,
+    pub(crate) why: Cause,
 }
 
-impl Unstable {
+/// Why the environment cannot prove a bound.
+pub(crate) enum Cause {
+    /// It names a leaked type. The errors for it are written where the cycle is found (see
+    /// [`AnalyzeVisitor::env_cycle()`](crate::analyze::AnalyzeVisitor)).
+    Leaked,
+    /// It names `Self`, `Self::A` or an associated type that rustc normalizes.
+    Named(Why),
+}
+
+/// What an unstable bound that names no leaked type names.
+pub(crate) enum Why {
+    /// It names `Self`, the self type of an impl, and the copy writes that as a path through the
+    /// Repeater.
+    SelfType,
+    /// It names `Self::A`, shown as written.
+    SelfAssoc(String),
+    /// It names a projection that rustc normalizes, shown as written.
+    Projection(String),
+}
+
+impl Why {
     /// Tells why the environment cannot prove the bound, as the end of a sentence about it.
     pub(crate) fn explain(&self) -> String {
-        match &self.why {
-            Why::Leaked => "names a leaked type, which the copy writes as a path through the \
-                            Repeater, and rustc cannot normalize it in the environment (E0277, E0275)"
-                .to_string(),
+        match self {
             Why::SelfType => "names `Self`, which the copy writes as the self type of the \
                               impl, a path through the Repeater that rustc has not normalized yet in \
                               the environment, where it must prove the bound (E0277, E0271)"
@@ -61,25 +78,10 @@ impl Unstable {
             ),
         }
     }
-}
 
-pub(crate) enum Why {
-    /// It names a leaked type.
-    Leaked,
-    /// It names `Self`, the self type of an impl, and the copy writes that as a path through the
-    /// Repeater.
-    SelfType,
-    /// It names `Self::A`, shown as written.
-    SelfAssoc(String),
-    /// It names a projection that rustc normalizes, shown as written.
-    Projection(String),
-}
-
-impl Why {
     /// How to write the bound, for the note of the error.
     pub(crate) fn advice(&self) -> String {
         match self {
-            Why::Leaked => "Write the leaked type of the bound with an absolute path".to_string(),
             Why::SelfType => "Write the bound without `Self`".to_string(),
             Why::SelfAssoc(path) | Why::Projection(path) => {
                 format!("Write the bound without `{}`", path)
@@ -90,7 +92,6 @@ impl Why {
     /// What the bound names, for the headline of the error.
     pub(crate) fn names(&self) -> String {
         match self {
-            Why::Leaked => "a leaked type".to_string(),
             Why::SelfType => "`Self`, which is a leaked type".to_string(),
             Why::SelfAssoc(path) | Why::Projection(path) => format!("`{}`", path),
         }

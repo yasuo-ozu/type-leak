@@ -245,6 +245,59 @@ fn a_holder_inside_a_signature_is_the_entry_for_the_one_around() {
     );
 }
 
+/// README, Elided lifetimes: "a function pointer or `Fn(..)` inside an input has its own
+/// signature". The same holds for one in the OUTPUT of the sugar: its elided lifetimes are its
+/// own and do not count for the outer one, whose only lifetime is that of `&`. So `Rel<T>` is
+/// leaked alone, whatever the signature in the output elides. Audit mutant
+/// `e_output_barefn_not_own` (a bare function pointer in the output counts for the outer
+/// signature, and the whole object is leaked).
+#[test]
+fn an_inner_signature_in_the_output_has_its_own_elision() {
+    for output in [
+        // A function pointer, an `Fn(..)`, and one with a binder in the inputs.
+        "fn(&u8) -> &u8",
+        "Box<dyn Fn(&u8) -> &u8>",
+        "for<'y> fn(&'y u8) -> &'y u8",
+        // In a tuple with another type, and behind a reference.
+        "(u8, fn(&u8) -> &u8)",
+        "Box<fn(&u8) -> &u8>",
+    ] {
+        let tr: ItemTrait = parse_str(&format!(
+            "trait Tr<'a, T: 'a> {{ fn f(&self, x: Box<dyn Fn(&Rel<T>) -> {}>); }}",
+            output
+        ))
+        .unwrap();
+        assert_eq!(
+            leaked(tr),
+            [e("Rel < T >", "< 'a , T : 'a >")],
+            "{}",
+            output
+        );
+    }
+    // An inner signature in the inputs that names its lifetimes is its own too: `Rel<T>` is leaked
+    // alone. Without the names, the inner one is the holder of `Rel<T>`, and adds `'a` to the
+    // inputs of the one around, which is the entry in turn (see the test above).
+    assert_eq!(
+        leaked(parse_quote! {
+            trait Tr<'a, T: 'a> {
+                fn f(&self, x: Box<dyn Fn(for<'y> fn(&'y Rel<T>) -> &'y u8, &u8) -> &u8>);
+            }
+        }),
+        [e("Rel < T >", "< 'a , T : 'a >")]
+    );
+    assert_eq!(
+        leaked(parse_quote! {
+            trait Tr<'a, T: 'a> {
+                fn f(&self, x: Box<dyn Fn(fn(&Rel<T>) -> &u8, &u8) -> &u8>);
+            }
+        }),
+        [e(
+            "dyn Fn (fn (& Rel < T >) -> & u8 , & u8) -> & u8",
+            "< 'a , T : 'a >"
+        )]
+    );
+}
+
 #[test]
 fn a_type_with_no_lifetime_is_leaked_alone() {
     // No lifetime among the generics of the entry, so the copy has only the elided one.

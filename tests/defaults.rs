@@ -126,6 +126,41 @@ fn test_default_requirements() {
     }
 }
 
+/// README, Walkthrough notes: a default is analyzed with the parameters before it, and cannot
+/// name a later one. A where predicate that names the later parameter `U` (`T: Conv<U>`) is not
+/// in the context of the default `Rel<T>`, which has `T` alone. Audit mutant
+/// `default_root_all_params` (the default is analyzed with all the parameters as its root).
+#[test]
+fn test_default_is_analyzed_with_the_parameters_before_it() {
+    let tr: ItemTrait = parse_quote! {
+        trait Tr<T, U = Rel<T>> where T: ::p::Conv<U> { fn f(&self); }
+    };
+    let referrer = referrer(&tr);
+    assert_eq!(
+        referrer
+            .iter_with_generics()
+            .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
+            .collect::<Vec<_>>(),
+        [("Rel < T >".to_string(), "< T >".to_string())]
+    );
+    // The predicate is on `U`, a parameter the default of `V` has, and names `V` itself, which it
+    // has not: it is left out of the context of the default.
+    let tr: ItemTrait = parse_quote! {
+        trait Tr<T, U = Rel<T>, V = Rel2<U>> where U: ::p::Conv<V> { fn f(&self); }
+    };
+    let referrer = referrer_of(&tr);
+    assert_eq!(
+        referrer
+            .iter_with_generics()
+            .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
+            .collect::<Vec<_>>(),
+        [
+            ("Rel < T >".to_string(), "< T >".to_string()),
+            ("Rel2 < U >".to_string(), "< U >".to_string()),
+        ]
+    );
+}
+
 #[test]
 fn test_default_is_shared_with_the_items() {
     // `Rel<T>` in the default of `U` and in a method is the same type with the same requirements.

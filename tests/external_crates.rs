@@ -73,6 +73,41 @@ fn entry(ty: &str, must: bool, names: &[&str]) -> (String, bool, Vec<String>) {
     (ty.to_string(), must, crates(names))
 }
 
+/// README, External crates: an entry that names `Self` where the self type is an external type
+/// (`::ext::W`) requires that crate: the entry `Rel<Self>` is replaced by a Referrer that has
+/// `::ext` too, as `Self` is `::ext::W` there. Audit mutant `x_crates_self_off` (the crates of the
+/// self type are not counted for an entry that names `Self`).
+#[test]
+fn an_entry_that_names_self_requires_the_crates_of_the_self_type() {
+    let item: ItemImpl = parse_quote!(
+        impl ::p::Tr for ::ext::W {
+            fn f(&self, x: Rel<Self>) {}
+        }
+    );
+    let mut analyzer = leaker();
+    analyzer.intern_impl(&item, true).unwrap();
+    let referrer = analyzer.finish();
+    assert_eq!(
+        entries(&referrer),
+        vec![
+            entry("Rel<Self>", true, &["ext"]),
+            entry("::ext::W", false, &["ext"])
+        ]
+    );
+    // Without `Self` in the entry, no crate is needed.
+    let item: ItemImpl = parse_quote!(
+        impl ::p::Tr for ::ext::W {
+            fn f(&self, x: Rel) {}
+        }
+    );
+    let mut analyzer = leaker();
+    analyzer.intern_impl(&item, true).unwrap();
+    assert_eq!(
+        entries(&analyzer.finish()),
+        vec![entry("Rel", true, &[]), entry("::ext::W", false, &["ext"])]
+    );
+}
+
 #[test]
 fn absolute_types_are_optional_entries_by_default() {
     // Old: nothing was leaked by default (`allow_external_crates` was `true`), and the type was

@@ -764,6 +764,59 @@ fn a_bound_which_is_not_a_lifetime_parameter_stays_a_predicate() {
     );
 }
 
+/// README, Outlives bounds: "only a bound by a lifetime parameter moves into
+/// `context_self_outlives()`; ... a bound under `for<..>` ... stay where predicates". The bound is
+/// by the parameter `'a` here, but under a binder, so it stays a predicate. Audit mutant
+/// `o_written_self_forall_moves` (a written `Self: 'a` under a binder moves).
+#[test]
+fn a_bound_by_a_lifetime_parameter_under_a_binder_stays_a_predicate() {
+    // Written in the where clause of the trait, and in the one of the method; the path with a
+    // lifetime implies nothing, so `Self: 'a` is only there if it is written.
+    for item in [
+        parse_quote! {
+            trait Tr<'a> where for<'x> Self: 'a { fn f(&self, x: Rel<'a, Self>); }
+        },
+        parse_quote! {
+            trait Tr<'a> { fn f(&self, x: Rel<'a, Self>) where for<'x> Self: 'a; }
+        },
+    ] {
+        let item: ItemTrait = item;
+        let referrer = of_trait(item.clone());
+        assert_eq!(
+            declared(&referrer, 0),
+            "< 'a > where for < 'x > Self : 'a",
+            "{}",
+            s(&item)
+        );
+        assert!(
+            referrer
+                .context_self_outlives(referrer.context(0))
+                .is_empty(),
+            "{}",
+            s(&item)
+        );
+    }
+    // The control: without the binder the bound moves.
+    let referrer = of_trait(parse_quote! {
+        trait Tr<'a> where Self: 'a { fn f(&self, x: Rel<'a, Self>); }
+    });
+    assert_eq!(declared(&referrer, 0), "< 'a >");
+    assert_eq!(
+        referrer.context_self_outlives(referrer.context(0)),
+        lifetimes(&["'a"])
+    );
+    // The reference implies `Self: 'a` whatever else is written, and the written predicate under
+    // the binder stays too.
+    let referrer = of_trait(parse_quote! {
+        trait Tr<'a> where for<'x> Self: 'a { fn f(&self, x: &'a Rel<Self>); }
+    });
+    assert_eq!(declared(&referrer, 0), "< 'a > where for < 'x > Self : 'a");
+    assert_eq!(
+        referrer.context_self_outlives(referrer.context(0)),
+        lifetimes(&["'a"])
+    );
+}
+
 #[test]
 fn a_written_bound_is_encoded_and_never_declared() {
     let referrer = of_trait(parse_quote! {

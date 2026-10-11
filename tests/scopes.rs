@@ -7,7 +7,9 @@ use common::{enter_function, visit_function};
 use syn::visit::Visit;
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{ContextId, Leaker, NotInternableError, Referrer, SelfRequirement, View};
+use type_leak::{
+    ContextId, Leaker, LeakerConfig, NotInternableError, Referrer, SelfRequirement, View,
+};
 
 fn s(x: &impl ToTokens) -> String {
     quote!(#x).to_string()
@@ -505,15 +507,28 @@ fn allow_self_decides_whether_self_may_be_interned() {
     );
 }
 
+/// The headlines of the errors of a call.
+fn headlines<T>(result: std::result::Result<T, NotInternableError>) -> Vec<String> {
+    result
+        .err()
+        .expect("an error")
+        .items()
+        .map(|item| item.message)
+        .collect()
+}
+
 #[test]
 fn allow_self_applies_to_the_whole_items() {
+    // With `allow_self == false`, `Self` is not leaked: the type that names it is an error, with
+    // the path to write instead (`use absolute path`), and not another error.
+    let denied = ["use absolute path: 'Rel < Self >'"];
     let item: ItemImpl = parse_quote! {
         impl<T> ::p::Tr for ::p::W<T> {
             fn f(&self) -> Rel<Self> { loop {} }
         }
     };
     assert!(Leaker::new().intern_impl(&item, true).is_ok());
-    assert!(Leaker::new().intern_impl(&item, false).is_err());
+    assert_eq!(headlines(Leaker::new().intern_impl(&item, false)), denied);
     let item: ItemStruct = parse_quote!(
         struct S<T> {
             a: Rel<Self>,
@@ -521,7 +536,7 @@ fn allow_self_applies_to_the_whole_items() {
         }
     );
     assert!(Leaker::new().intern_struct(&item, true).is_ok());
-    assert!(Leaker::new().intern_struct(&item, false).is_err());
+    assert_eq!(headlines(Leaker::new().intern_struct(&item, false)), denied);
     let item: ItemEnum = parse_quote!(
         enum E<T> {
             A(Rel<Self>),
@@ -529,10 +544,20 @@ fn allow_self_applies_to_the_whole_items() {
         }
     );
     assert!(Leaker::new().intern_enum(&item, true).is_ok());
-    assert!(Leaker::new().intern_enum(&item, false).is_err());
+    assert_eq!(headlines(Leaker::new().intern_enum(&item, false)), denied);
     let item: ItemUnion = parse_quote!(union U { a: Rel<Self> });
     assert!(Leaker::new().intern_union(&item, true).is_ok());
-    assert!(Leaker::new().intern_union(&item, false).is_err());
+    assert_eq!(headlines(Leaker::new().intern_union(&item, false)), denied);
+    // `Self` in the default of a const parameter (an expression) is `Self` too. Audit mutant
+    // `s_allowself_expr` (an expression is never a denied `Self`).
+    let item: ItemStruct = parse_quote!(
+        pub struct S<const N: usize = { Self::K }>(u8);
+    );
+    assert!(Leaker::new().intern_struct(&item, true).is_ok());
+    assert_eq!(
+        headlines(Leaker::new().intern_struct(&item, false)),
+        ["use absolute path: 'Self :: K'"]
+    );
 }
 
 // ── nested scopes ────────────────────────────────────────────────────────────────────────────
@@ -837,6 +862,97 @@ fn the_error_is_returned_once() {
     assert_eq!(first, id(0));
     let referrer = leaker.finish();
     assert_eq!(entries(&referrer), [e("RelU < U >", "< U >")]);
+}
+
+/// A Leaker that allows the primitive types and the names of the standard prelude.
+fn leaker_with_std() -> Leaker {
+    let mut config = LeakerConfig::new();
+    config.allow_primitive().allow_std_prelude();
+    Leaker::from_config(config)
+}
+
+/// README, Scopes: a scope is all-or-nothing. The top-level contexts of the scopes that
+/// succeeded inside a scope that fails are rolled back with it, so the Referrer has the context
+/// of the outermost scope only. Audit mutant `rb_leave_top_levels`.
+#[test]
+fn a_failed_scope_drops_the_top_levels_of_its_inner_scopes() {
+    let mut leaker = Leaker::new();
+    leaker
+        .enter_generics(&parse_quote!(<T>), |view| {
+            let failed = view.enter_generics(&parse_quote!(<U>), |view| {
+                view.enter_generics(&parse_quote!(<V>), |view| {
+                    view.visit_type(&parse_quote!(Rel<V>))
+                })
+                .unwrap();
+                view.enter_generics(&parse_quote!(<V2>), |view| {
+                    view.visit_type(&parse_quote!(Rel<V2>))
+                })
+                .unwrap();
+                view.visit_type(&parse_quote!(Rel2<'_>));
+            });
+            assert!(failed.is_err());
+        })
+        .unwrap();
+    let referrer = leaker.finish();
+    // Only the outermost top-level context is there; the ids of the failed scope are gone.
+    assert_eq!(referrer.contexts().count(), 1);
+    assert!(referrer.is_empty());
+}
+
+/// README, Scopes: what a failed inner scope found (a cycle of `Self` in its bounds) is rolled back
+/// with it: it does not make the scope around it fail. Audit mutant `rb_leave_env_errors`.
+#[test]
+fn a_failed_inner_scope_leaves_no_cycle_in_the_outer_one() {
+    let inner = |view: &mut View<'_>| {
+        // `Self` is the self type `W<V>`, which the copy writes through the Repeater because of
+        // `Rel`, and the bound `V: Fn(Rel)` names it: a cycle of the inner scope.
+        view.enter_impl(
+            &parse_quote!(<V: Fn(Rel)>),
+            &parse_quote!(W<V>),
+            true,
+            |view| {
+                view.visit_where_clause(&parse_quote!(where Self: Sized));
+            },
+        )
+    };
+    let mut leaker = leaker_with_std();
+    let result = leaker.enter_generics(&parse_quote!(<T>), |view| {
+        assert!(inner(view).is_err());
+    });
+    assert!(result.is_ok(), "{}", result.err().unwrap());
+    // The same scope on its own fails, so the outer one would have failed with it.
+    let mut leaker = leaker_with_std();
+    assert!(leaker
+        .enter_generics(&Generics::default(), |view| inner(view).map(|_| ()))
+        .unwrap()
+        .1
+        .is_err());
+}
+
+/// README, Scopes: the decision that an entry of an external crate is not optional (it is in a
+/// bound that would make a cycle) belongs to the scope that made it; a failed inner scope leaves
+/// no such decision in the outer one. Audit mutant `rb_leave_not_optional`.
+#[test]
+fn a_failed_inner_scope_leaves_the_optional_entries() {
+    let mut leaker = leaker_with_std();
+    leaker
+        .enter_generics(&parse_quote!(<T: Fn(Rel)>), |view| {
+            let failed = view.enter_generics(&parse_quote!(<T: Fn(Rel)>), |view| {
+                view.visit_where_clause(&parse_quote!(where ::ext::W<T>: Sized));
+                view.visit_type(&parse_quote!(Rel2<'_>));
+            });
+            assert!(failed.is_err());
+            // The type of the external crate is an optional entry here, as it is outside the
+            // bounds of the failed scope.
+            view.visit_type(&parse_quote!(::ext::W<T>));
+        })
+        .unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(
+        referrer.iter().map(s).collect::<Vec<_>>(),
+        [":: ext :: W < T >"]
+    );
+    assert!(!referrer.must(0));
 }
 
 #[test]

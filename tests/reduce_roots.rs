@@ -798,6 +798,41 @@ fn test_reduce_roots_trait_object_with_its_own_lifetime() {
     }
 }
 
+/// README, Trait objects: "a written lifetime bound changes this ... with a local lifetime the
+/// trait object alone is leaked with its bound". The reference around it has an elided lifetime
+/// (`&(dyn RelTr + 'a)`), which is no obstacle once the object names its own bound, while
+/// `&dyn RelTr` is an error. Audit mutant `t_dyn_elided_bounded_error` (a trait object under an
+/// elided reference is an error even with a bound).
+#[test]
+fn test_reduce_roots_trait_object_with_a_bound_under_an_elided_reference() {
+    // A lifetime of the trait, of the method, `'static`, and a mutable reference.
+    for (item, expected) in [
+        (
+            parse_quote! { trait Tr<'a> { fn f(&self, x: &(dyn RelTr + 'a)); } },
+            entry(parse_quote!(dyn RelTr + 'a), "< 'a >"),
+        ),
+        (
+            parse_quote! { trait Tr { fn f<'b>(&self, x: &(dyn RelTr + 'b)); } },
+            entry(parse_quote!(dyn RelTr + 'b), "< 'b >"),
+        ),
+        (
+            parse_quote! { trait Tr<'a> { fn f(&self, x: &mut (dyn RelTr + 'a)); } },
+            entry(parse_quote!(dyn RelTr + 'a), "< 'a >"),
+        ),
+        (
+            parse_quote! { trait Tr { fn f(&self, x: &(dyn RelTr + 'static)); } },
+            entry(parse_quote!(dyn RelTr + 'static), ""),
+        ),
+    ] {
+        let item: ItemTrait = item;
+        assert_eq!(leaked_trait(&item), [expected], "{}", printed(item.clone()));
+    }
+    // Without the bound the object takes the lifetime of the elided reference, which the Leaker
+    // cannot name: an error.
+    let err = error_of(&parse_quote! { trait Tr { fn f(&self, x: &dyn RelTr); } });
+    assert!(err.contains("use absolute path: 'RelTr'"), "{}", err);
+}
+
 /// A trait whose method `f` declares the lifetime `'b` and takes `ty`.
 fn local_trait(ty: &Type) -> ItemTrait {
     parse_quote! { trait Tr { fn f<'b>(&self, x: #ty); } }
@@ -1315,6 +1350,43 @@ fn test_reduce_roots_reference_with_a_lifetime_the_copy_would_leave_unconstraine
     leaker.intern_impl(&item, true).unwrap();
     // The self type and the reference.
     assert_eq!(leaker.finish().iter().count(), 2);
+}
+
+/// README, Method lifetimes: an external type that the Leaker does not allow keeps the method
+/// lifetime `'b` (the Referrer leaves it as written unless it replaces it), so the method is not
+/// an error (E0195) although `Wrap<'b>`, which is leaked as a whole, names `'b` as well. A
+/// reference to a trait object of such a type keeps it too. Audit mutant `m_careful_on` (the
+/// careful rule for trait objects applied to the external type).
+#[test]
+fn test_reduce_roots_external_type_keeping_a_method_lifetime_is_no_e0195() {
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            fn f<'b>(&self, a: ::ext::W<'b>, b: Wrap<'b>) -> &'b ::core::primitive::u8;
+        }
+    };
+    assert_eq!(
+        leaked_trait(&item),
+        [entry(parse_quote!(Wrap<'b>), "< 'b >")]
+    );
+    assert_eq!(
+        optional_trait(&item),
+        [entry(parse_quote!(::ext::W<'b>), "< 'b >")]
+    );
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            fn f<'b>(&self, a: &'b dyn ::ext::Tr, b: Wrap<'b>) -> &'b ::core::primitive::u8;
+        }
+    };
+    assert_eq!(
+        leaked_trait(&item),
+        [entry(parse_quote!(Wrap<'b>), "< 'b >")]
+    );
+    assert_eq!(optional_trait(&item), Vec::<(String, String)>::new());
+    // Nothing keeps `'b` here, so the method is an error: the control.
+    let err = error_of(&parse_quote! {
+        trait Tr { fn f<'b>(&self, b: Wrap<'b>) -> &'b ::core::primitive::u8; }
+    });
+    assert!(err.contains("E0195"), "{}", err);
 }
 
 #[test]

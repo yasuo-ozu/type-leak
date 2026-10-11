@@ -144,6 +144,135 @@ fn equal_requirements_are_shared_and_different_ones_are_not() {
     assert_eq!(referrer.iter().count(), 2);
 }
 
+/// README, Contexts: "equal declarations give equal contexts": the bounds of a lifetime parameter
+/// are sorted, and a where predicate on a lifetime (`where 'b: 'a`) is the bound of the lifetime
+/// (`'b: 'a`), as it is for a type parameter. Audit mutants `ctx_lifetime_bounds_unsorted` and
+/// `ctx_where_lifetime_not_moved`.
+#[test]
+fn equal_lifetime_bounds_give_equal_contexts() {
+    let leak = |generics: &[&str]| {
+        let mut leaker = Leaker::new();
+        for generics in generics {
+            let item: ItemStruct =
+                parse_str(&format!("struct S{} {{ a: Wrap<'a, 'b, 'c> }}", generics)).unwrap();
+            leaker.intern_struct(&item, true).unwrap();
+        }
+        leaker.finish()
+    };
+    // The order of the bounds of a lifetime.
+    let referrer = leak(&["<'a, 'b, 'c: 'a + 'b>", "<'a, 'b, 'c: 'b + 'a>"]);
+    assert_eq!(referrer.iter().count(), 1);
+    assert_eq!(referrer.contexts().count(), 1);
+    assert_eq!(s(referrer.generics(0)), "< 'a , 'b , 'c : 'a + 'b >");
+    // A where predicate on a lifetime is its bound.
+    let referrer = leak(&["<'a, 'b: 'a, 'c>", "<'a, 'b, 'c> where 'b: 'a"]);
+    assert_eq!(referrer.iter().count(), 1);
+    assert_eq!(s(referrer.generics(0)), "< 'a , 'b : 'a , 'c >");
+    assert!(referrer.generics(0).where_clause.is_none());
+    // Different bounds are different contexts.
+    let referrer = leak(&["<'a, 'b: 'a, 'c>", "<'a, 'b, 'c: 'a>"]);
+    assert_eq!(referrer.iter().count(), 2);
+}
+
+/// README, Contexts: the output of the `Fn(..)` sugar is parenthesized only where a `+` would join
+/// it (`Fn() -> (&dyn A) + B`), and however the source wrote it: equal declarations give equal
+/// contexts. Audit mutants `fn_output_paren_always` and `fn_output_unparen_dropped`.
+#[test]
+fn the_output_of_the_fn_sugar_is_parenthesized_only_where_needed() {
+    let leak = |bounds: &[&str]| {
+        let mut leaker = Leaker::new();
+        for bound in bounds {
+            let item: ItemStruct =
+                parse_str(&format!("struct S<F: {}> {{ a: Wrap<F> }}", bound)).unwrap();
+            leaker.intern_struct(&item, true).unwrap();
+        }
+        leaker.finish()
+    };
+    // Alone, with the parentheses of the source or without: no parentheses, one context. Its
+    // entries are `Wrap<F>` and the trait object in the bound, which is the same type twice.
+    let referrer = leak(&[
+        "::core::ops::Fn() -> &'static dyn ::p::A",
+        "::core::ops::Fn() -> (&'static dyn ::p::A)",
+    ]);
+    assert_eq!(referrer.iter().count(), 2);
+    assert_eq!(
+        s(referrer.generics(0)),
+        "< F : :: core :: ops :: Fn () -> & 'static dyn :: p :: A >"
+    );
+    // Before another bound the parentheses are needed, and kept.
+    let referrer = leak(&[
+        "::core::ops::Fn() -> (&'static dyn ::p::A) + ::zzz::Z",
+        "::zzz::Z + ::core::ops::Fn() -> &'static (dyn ::p::A)",
+    ]);
+    assert_eq!(
+        s(referrer.generics(0)),
+        "< F : :: core :: ops :: Fn () -> (& 'static dyn :: p :: A) + :: zzz :: Z >"
+    );
+}
+
+/// README, Contexts: the generic associated types of the trait that `intern_trait()` analyzes
+/// (with outlives bounds) are part of its top-level context, so two traits that differ only in
+/// them have two contexts. Audit mutant `ctx_gats_not_in_identity`.
+#[test]
+fn the_gats_are_part_of_the_identity_of_the_top_level_context() {
+    let mut leaker = Leaker::new();
+    let with_gat = leaker
+        .intern_trait(
+            &parse_quote!(
+                trait Tr {
+                    type G<'b>
+                    where
+                        Self: 'b;
+                    fn f(&self) -> Rel<Self>;
+                }
+            ),
+            true,
+        )
+        .unwrap();
+    let without = leaker
+        .intern_trait(
+            &parse_quote!(
+                trait Tr {
+                    fn f(&self) -> Rel<Self>;
+                }
+            ),
+            true,
+        )
+        .unwrap();
+    let other_bound = leaker
+        .intern_trait(
+            &parse_quote!(
+                trait Tr {
+                    type G<'b>
+                    where
+                        Self: 'b + 'static;
+                    fn f(&self) -> Rel<Self>;
+                }
+            ),
+            true,
+        )
+        .unwrap();
+    let again = leaker
+        .intern_trait(
+            &parse_quote!(
+                trait Tr {
+                    type G<'b>
+                    where
+                        Self: 'b;
+                    fn f(&self) -> Rel<Self>;
+                }
+            ),
+            true,
+        )
+        .unwrap();
+    assert_ne!(with_gat, without);
+    assert_ne!(with_gat, other_bound);
+    assert_ne!(without, other_bound);
+    // The same GAT is the same context.
+    assert_eq!(with_gat, again);
+    assert_eq!(leaker.finish().contexts().count(), 3);
+}
+
 #[test]
 fn only_the_generics_used_are_required() {
     let referrer = leak_trait(parse_quote! {
@@ -781,8 +910,35 @@ fn a_call_as_self_is_not_parsed() {
 
 #[test]
 fn node_numbers_follow_the_first_appearance() {
-    // `Rel2` appears first, and then `Wrap<T>`, so the context of `Rel2` is 0 although the types
-    // are sorted by tokens.
+    // The contexts are numbered in the order they first appear: `Zed<U>` (the generics `<U>`),
+    // `Abc<T>` (`<T>`), and then `Mid` (no generics), and the entries are listed by context. The
+    // order of the tokens (`Abc < T >`, `Mid`, `Zed < U >`) is none of the numbering, so a
+    // numbering by tokens or in reverse is told from the first appearance.
+    let referrer = leak_trait(parse_quote! {
+        trait X<T, U> {
+            fn f(&self) -> Zed<U>;
+            fn g(&self) -> Abc<T>;
+            fn h(&self) -> Mid;
+        }
+    });
+    assert_eq!(
+        referrer.iter().map(s).collect::<Vec<_>>(),
+        ["Zed < U >", "Abc < T >", "Mid"]
+    );
+    assert_eq!(
+        (0..3)
+            .map(|ix| referrer.context(ix).index())
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert_eq!(
+        (0..3)
+            .map(|ix| s(referrer.generics(ix)))
+            .collect::<Vec<_>>(),
+        ["< U >", "< T >", ""]
+    );
+    // Entries of the same context are sorted by tokens: `Rel2` appears first, and `Rel1` is
+    // before it in the list.
     let referrer = leak_trait(parse_quote! {
         trait X<T> {
             fn f(&self) -> Rel2;

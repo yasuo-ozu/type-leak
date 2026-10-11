@@ -126,8 +126,13 @@ fn test_check_self_no_internable() {
     assert!(Leaker::new().intern_struct(&item, false).is_ok());
 }
 
+/// README, External crates: a path that starts with `crate` is leaked, unless the allowed paths
+/// have `crate` (`LeakerConfig::allow_crate()`). A real `$crate` token (which a `macro_rules!`
+/// expansion gives to a proc macro) cannot be made outside one, so the `$crate` paths are pinned
+/// by the fixture crate (`DollarCrate` in `tests/crates/leaker`, with `check_leak!`, and
+/// `cross_crate::dollar_crate_paths`).
 #[test]
-fn test_check_allows_dollar_crate() {
+fn test_check_allows_crate_paths_only_if_allowed() {
     let mut leaker = Leaker::new();
     leaker.allowed_paths.push(parse_quote!(crate));
 
@@ -142,6 +147,16 @@ fn test_check_allows_dollar_crate() {
     leaker.intern_trait(&item, true).unwrap();
     leaker.reduce_roots();
     assert!(leaker.finish().is_empty());
+
+    // Without it the same paths are leaked (here in bounds, which cannot be leaked): the allowed
+    // `crate` is what lets them through.
+    let err = Leaker::new().intern_trait(&item, true).unwrap_err();
+    let message = Error::from(err).to_string();
+    assert!(
+        message.contains("use absolute path: 'crate :: error :: Error'"),
+        "{}",
+        message
+    );
 }
 
 #[test]

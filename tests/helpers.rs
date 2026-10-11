@@ -267,6 +267,72 @@ fn is_plain_is_what_an_impl_for_a_marker_needs_nothing_for() {
     }
 }
 
+/// The sumtype shape: `Leaker::new()` (no allowed path) and `intern_trait(.., false)` on a trait
+/// whose only entries are the absolute types of external crates, which are optional. `iter()`
+/// counts them, `is_plain()` is true for each, and an impl of the Repeater for a marker is the
+/// plain one (no generics, no `Self`, no module), with the entry as the type. A relative type or
+/// `Self` makes the call fail and the macro throws the Leaker away.
+#[test]
+fn a_trait_with_only_optional_external_types_has_plain_entries_for_a_marker() {
+    let item: ItemTrait = parse_quote! {
+        pub trait Reader {
+            fn read(&mut self, buf: &mut [::core::primitive::u8])
+                -> ::std::io::Result<::core::primitive::usize>;
+            fn cause(&self) -> ::core::option::Option<&(dyn ::std::error::Error + 'static)>;
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result;
+        }
+    };
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, false).unwrap();
+    let referrer = leaker.finish();
+    // `iter()` counts the optional entries, `required()` and `has_required()` do not.
+    assert!(!referrer.is_empty());
+    assert!(!referrer.has_required());
+    assert_eq!(referrer.required().count(), 0);
+    assert_eq!(
+        referrer.iter().map(s).collect::<Vec<_>>(),
+        [
+            ":: std :: io :: Result < :: core :: primitive :: usize >",
+            "dyn :: std :: error :: Error + 'static"
+        ]
+    );
+    let marker: Type = parse_quote!(__Marker);
+    for (ix, ty) in referrer.iter().enumerate() {
+        assert!(!referrer.must(ix));
+        assert!(referrer.is_plain(ix), "{}", s(ty));
+        assert!(referrer.context_module(referrer.context(ix)).is_none());
+        assert!(referrer.context_self(referrer.context(ix)).is_none());
+        assert!(referrer.generics(ix).params.is_empty());
+        // The impl for the marker, which is what the macro emits (`type Type = #ty`).
+        let r = referrer
+            .repeater_impl_with(ix, ImplSelf::Marker(&marker), |value, param| {
+                slots().encode_const(value, &param.ty)
+            })
+            .unwrap();
+        assert!(r.generics.params.is_empty());
+        assert_eq!(s(&r.args), "()");
+        assert_eq!(s(&r.self_ty), "__Marker");
+        assert_eq!(s(&r.ty), s(ty));
+    }
+    // A relative type is a required entry, which the macro does not emit; a type it cannot leak
+    // is an error, and the macro throws the Leaker away then.
+    let item: ItemTrait = parse_quote! { pub trait Tr { fn f(&self) -> Rel; } };
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, false).unwrap();
+    let referrer = leaker.finish();
+    assert!(referrer.has_required() && referrer.must(0));
+    let item: ItemTrait = parse_quote! { pub trait Tr { fn f(&self) -> Rel<'_>; } };
+    assert!(Leaker::new().intern_trait(&item, false).is_err());
+    // `Self` is not leaked with `allow_self == false`: an absolute type that names it is left as
+    // written, and is no entry for the macro to skip.
+    let item: ItemTrait = parse_quote! {
+        pub trait Tr { fn f(&self) -> ::std::vec::Vec<Self>; }
+    };
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, false).unwrap();
+    assert!(leaker.finish().is_empty());
+}
+
 // ── repeater_impl ────────────────────────────────────────────────────────────────────────────
 
 /// What a macro wrote by hand: the generics of the impl with the parameter for `Self`, the type

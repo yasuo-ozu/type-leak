@@ -946,18 +946,6 @@ impl PartialEq for Context {
 
 impl Eq for Context {}
 
-impl PartialOrd for Context {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Context {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.render().cmp(&other.render())
-    }
-}
-
 impl std::hash::Hash for Context {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.render().hash(state)

@@ -956,3 +956,228 @@ fn an_optional_entry_that_an_unstable_bound_makes_cyclic_is_copied_as_written() 
     assert_eq!(types(&referrer), ["Rel < X >", ":: ext :: S"]);
     assert!(referrer.must(0) && !referrer.must(1));
 }
+
+/// README, Bounds that name leaked types: `<Self as ::p::Tr>::A0` in a bound names the associated
+/// type of the host, which rustc normalizes in the impl of the Repeater but not yet in the
+/// environment, as `Self::A0` does. The qualified path is as unstable as the other. Audit mutant
+/// `b_selfassoc_qself_off`.
+#[test]
+fn a_qualified_associated_type_of_self_in_a_bound_is_unstable() {
+    for (written, shown) in [
+        ("Self::A0", "Self :: A0"),
+        ("<Self as ::p::Tr>::A0", "< Self as :: p :: Tr > :: A0"),
+    ] {
+        let item: Item = parse_str(&format!(
+            "pub trait Tr {{ type A0; fn m<X>(&self) where X: Fn(&{}) -> u8, Rel<X>: Default; }}",
+            written
+        ))
+        .unwrap();
+        let (headline, note) = unstable(item);
+        assert_eq!(
+            headline,
+            format!(
+                "`Rel < X >` is in a bound or where predicate, and a bound of its generics names \
+                 `{}`",
+                shown
+            )
+        );
+        assert!(
+            note.contains(
+                "rustc normalizes to the associated type of the host in the impl of the Repeater"
+            ),
+            "{}",
+            note
+        );
+    }
+}
+
+/// README, Bounds that name leaked types / Self rules: a predicate on a type that is not a
+/// generic and names `Self` alone (`Vec<Self>: Clone`, `Self: Clone`) is proved by an impl, so it
+/// is no unstable bound: an entry that names `Self` stays accepted, and `Self` stays an entry
+/// (here the self type of the impl). Audit mutants `b_selftype_pred_on_env` and
+/// `b_needsenv_self_bound_only`.
+#[test]
+fn bare_self_predicates_stay_accepted() {
+    for item in [
+        parse_quote!(
+            impl S
+            where
+                Vec<Self>: Clone,
+                Rel<Self>: Sized,
+            {
+            }
+        ),
+        parse_quote!(
+            impl S
+            where
+                Self: Clone,
+                Rel<Self>: Sized,
+            {
+            }
+        ),
+    ] {
+        let item: Item = item;
+        let text = s(&item);
+        let referrer = leak(item).unwrap_or_else(|e| panic!("{}: {}", text, e));
+        assert_eq!(types(&referrer), ["Rel < Self >", "S"], "{}", text);
+        assert!(referrer.must(0) && referrer.must(1), "{}", text);
+    }
+}
+
+/// README, Bounds that name leaked types: a predicate on a type that is not a generic
+/// (`Vec<Self::A>: AsRef<Self::A>`) is proved by an impl and names no unstable bound as far as
+/// `Self::A` goes, so an entry in a bound of a method of the trait is accepted. Audit mutant
+/// `b_nonparam_pred_bounds_count`.
+#[test]
+fn a_predicate_on_a_non_generic_type_with_self_assoc_is_no_unstable_bound() {
+    let referrer = leak(parse_quote!(
+        pub trait Tr
+        where
+            Vec<Self::A>: AsRef<Self::A>,
+        {
+            type A;
+            fn m<X: Into<Rel<Self>>>(&self);
+        }
+    ))
+    .unwrap();
+    assert_eq!(types(&referrer), ["Rel < Self >"]);
+    assert!(referrer.must(0));
+}
+
+/// README, Bounds that name leaked types: the self type of an impl is an optional entry (it is a
+/// type of an external crate), but not where a predicate names `Self` and a bound of its generic
+/// names a leaked type: the Referrer's replacement of it would make a cycle. Here the self type
+/// `::ext::W<T>` has `T: Fn(Rel)` and `Self: Clone` is written: the only entry is `Rel`. Audit
+/// mutant `b_not_optional_in_self_type_off` (which adds the optional `::ext::W<T>`).
+#[test]
+fn an_optional_self_type_is_no_entry_where_self_is_in_a_predicate() {
+    let referrer = leak(parse_quote!(
+        impl<T: Fn(Rel)> ::p::Tr for ::ext::W<T> where Self: Clone {}
+    ))
+    .unwrap();
+    assert_eq!(types(&referrer), ["Rel"]);
+}
+
+/// README, Bounds that name leaked types: a generic whose bounds are all traits of the standard
+/// library, and none defines `Item`, keeps `T::Item` rigid: the name of each trait of the list
+/// (`STD_TRAITS`) is one, and the bound `Fn(T::Item) -> u8` next to it is stable. A trait of the
+/// analyzed code, or a path of another crate, may define the `Item` by a supertrait, so the bound
+/// is unstable. Audit mutants `std_without_<name>` (one per name; also `b_std_without_*`).
+#[test]
+fn the_standard_traits_do_not_define_an_associated_type() {
+    let names = [
+        "Sized",
+        "Send",
+        "Sync",
+        "Unpin",
+        "Copy",
+        "Clone",
+        "Drop",
+        "Eq",
+        "PartialEq",
+        "Ord",
+        "PartialOrd",
+        "Default",
+        "Debug",
+        "Display",
+        "Hash",
+        "AsRef",
+        "AsMut",
+        "Into",
+        "From",
+        "TryFrom",
+        "TryInto",
+        "ToString",
+        "ToOwned",
+        "Borrow",
+        "BorrowMut",
+        "Fn",
+        "FnMut",
+        "FnOnce",
+        "Iterator",
+        "IntoIterator",
+        "DoubleEndedIterator",
+        "ExactSizeIterator",
+        "FusedIterator",
+        "Extend",
+        "FromIterator",
+        "Deref",
+        "DerefMut",
+        "Add",
+        "Sub",
+        "Mul",
+        "Div",
+        "Rem",
+        "Neg",
+        "Not",
+        "Index",
+        "IndexMut",
+        "FromStr",
+        "Future",
+        "IntoFuture",
+        "Any",
+    ];
+    for name in names {
+        let item: Item = parse_str(&format!(
+            "pub trait Tr<T: {} + Fn(T::Item) -> u8> {{ fn m(&self) where Rel<T>: Default; }}",
+            name
+        ))
+        .unwrap();
+        // The relative names are allowed paths, as the prelude's are in `leaker()`.
+        let mut leaker = leaker();
+        leaker.allowed_paths.push(parse_str(name).unwrap());
+        match &item {
+            Item::Trait(item) => leaker.intern_trait(item, true),
+            _ => unreachable!(),
+        }
+        .unwrap_or_else(|e| panic!("{}: {}", name, e));
+        assert_eq!(types(&leaker.finish()), ["Rel < T >"], "{}", name);
+    }
+    // The absolute path of a trait of the standard library is one too.
+    let referrer = leak(parse_quote!(
+        pub trait Tr<T: ::core::marker::Sized + Fn(T::Item) -> u8> {
+            fn m(&self)
+            where
+                Rel<T>: Default;
+        }
+    ))
+    .unwrap();
+    assert_eq!(types(&referrer), ["Rel < T >"]);
+    // A trait that is not, as a bare name or as a path, may define it.
+    for name in ["MyTrait", "::p::Tr", "p::Tr"] {
+        let item: Item = parse_str(&format!(
+            "pub trait Tr<T: {} + Fn(T::Item) -> u8> {{ fn m(&self) where Rel<T>: Default; }}",
+            name
+        ))
+        .unwrap();
+        let (headline, _) = rejected(item);
+        assert!(
+            headline.contains("names `T :: Item`"),
+            "{}: {}",
+            name,
+            headline
+        );
+    }
+}
+
+/// README, Bounds that name leaked types: `Self::A` in a bound of the impl is not written in the
+/// copy: "the impl of the Repeater for that type has no trait to take it from". Audit mutant
+/// `s_selfassoc_bounds_off` (only the other error of the item remains).
+#[test]
+fn self_assoc_in_a_bound_of_an_impl_cannot_be_written_in_the_repeater() {
+    let item: Item = parse_quote!(
+        impl<T: AsRef<Self::A>> ::p::Tr for ::p::S<T> {
+            fn f(&self, x: Rel<T>) {}
+        }
+    );
+    let err = leak(item).err().unwrap();
+    let headlines: Vec<String> = err.items().map(|item| item.message).collect();
+    assert_eq!(
+        headlines,
+        [
+            "`Self :: A` cannot be written in the impl of the Repeater",
+            "`Self :: A` is in a bound or where predicate, and a bound of its generics names \
+             `Self :: A`"
+        ]
+    );
+}

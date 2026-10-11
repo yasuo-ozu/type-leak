@@ -1006,3 +1006,329 @@ fn the_context_is_the_module_and_a_mod_item_is_nested_in_it() {
         .to_string()
     );
 }
+
+// ── `Referrer::visitor()`: the lookup of the module ─────────────────────────────────────────
+
+/// `item` as it is printed.
+fn shown(item: Item) -> String {
+    quote!(#item).to_string()
+}
+
+/// Rewrites `item`, a copy in the scope `context`, replacing the `ix`-th entry with `P<ix>`.
+fn rewrite_in(referrer: &type_leak::Referrer, context: ContextId, mut item: Item) -> String {
+    referrer
+        .clone()
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visit_item_mut(&mut item);
+    quote!(#item).to_string()
+}
+
+/// README, Modules: a `mod` item is a module nested in the context and is found by its name, but
+/// only the modules the Leaker saw: a module nested in a module that the Leaker did not see (its
+/// parent is another one) matches only the entries with no module. Audit mutants
+/// `vis_module_in_unknown_outside` and `vis_module_in_elsewhere_stays`.
+#[test]
+fn a_module_nested_in_an_unseen_module_is_not_found_by_its_name() {
+    let mut leaker = Leaker::new();
+    let (context, ()) = leaker
+        .enter_generics(&Generics::default(), |view| {
+            view.visit_item(&parse_quote!(
+                mod inner {
+                    pub struct C(Rel);
+                }
+            ));
+        })
+        .unwrap();
+    let referrer = leaker.finish();
+    // The module `inner` is seen: its `Rel` is replaced.
+    let seen = rewrite_in(
+        &referrer,
+        context,
+        parse_quote!(
+            mod inner {
+                pub struct C(Rel);
+            }
+        ),
+    );
+    assert!(seen.contains("P <"), "{}", seen);
+    // Nested in `other`, which the Leaker did not see, it is another module.
+    for item in [
+        parse_quote!(
+            mod other {
+                mod inner {
+                    pub struct C(Rel);
+                }
+            }
+        ),
+        parse_quote!(
+            mod other {
+                mod mid {
+                    mod inner {
+                        pub struct C(Rel);
+                    }
+                }
+            }
+        ),
+    ] {
+        let item: Item = item;
+        let unseen = rewrite_in(&referrer, context, item.clone());
+        assert!(!unseen.contains("P <"), "{}", unseen);
+        assert_eq!(unseen, shown(item.clone()));
+    }
+}
+
+/// README, Modules: an entry of the module is preferred to an entry with no module for the same
+/// type. Audit mutants `vis_rank_module_last` and `vis_rank_nomodule_equal`.
+#[test]
+fn the_entry_of_the_module_is_preferred_to_the_one_with_no_module() {
+    let mut leaker = Leaker::new();
+    // `Rel` with no module is the first entry, and the one of the module `m` is the second.
+    let top = leaker
+        .intern_struct(
+            &parse_quote!(
+                struct A {
+                    x: Rel,
+                }
+            ),
+            true,
+        )
+        .unwrap();
+    let module = leaker
+        .intern_mod(&parse_quote!(
+            mod m {
+                pub struct B(Rel);
+            }
+        ))
+        .unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(referrer.iter().count(), 2);
+    assert_eq!(referrer.context_module(referrer.context(0)), None);
+    assert_eq!(referrer.context_module(referrer.context(1)), Some(module));
+    // The copy of `m` takes its own entry.
+    assert_eq!(
+        rewrite_in(
+            &referrer,
+            module,
+            parse_quote!(
+                pub struct B(Rel);
+            )
+        ),
+        shown(parse_quote!(
+            pub struct B(P<1usize>);
+        ))
+    );
+    // A copy with no module around takes the other.
+    assert_eq!(
+        rewrite_in(
+            &referrer,
+            top,
+            parse_quote!(
+                struct A {
+                    x: Rel,
+                }
+            )
+        ),
+        shown(parse_quote!(
+            struct A {
+                x: P<0usize>,
+            }
+        ))
+    );
+    // The same with the module analyzed first.
+    let mut leaker = Leaker::new();
+    let module = leaker
+        .intern_mod(&parse_quote!(
+            mod m {
+                pub struct B(Rel);
+            }
+        ))
+        .unwrap();
+    let top = leaker
+        .intern_struct(
+            &parse_quote!(
+                struct A {
+                    x: Rel,
+                }
+            ),
+            true,
+        )
+        .unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(
+        rewrite_in(
+            &referrer,
+            top,
+            parse_quote!(
+                struct A {
+                    x: Rel,
+                }
+            )
+        ),
+        shown(parse_quote!(
+            struct A {
+                x: P<1usize>,
+            }
+        ))
+    );
+    assert_eq!(
+        rewrite_in(
+            &referrer,
+            module,
+            parse_quote!(
+                pub struct B(Rel);
+            )
+        ),
+        shown(parse_quote!(
+            pub struct B(P<0usize>);
+        ))
+    );
+}
+
+/// README, Modules: the items of a module are nested items, so their generics are local even if
+/// the visitor is told that the outermost generics are those of the context
+/// (`with_outermost_generics_as_leakers()`). Audit mutants `vis_item_depth_module`,
+/// `vis_mod_item_not_nested` and `vis_mod_item_self_kept`.
+#[test]
+fn the_items_of_a_module_are_nested_items() {
+    // The context is the module itself.
+    let mut leaker = Leaker::new();
+    let module = leaker
+        .intern_mod(&parse_quote!(
+            mod m {
+                pub struct S<T>(Wrap<T>);
+            }
+        ))
+        .unwrap();
+    let referrer = leaker.finish();
+    let mut item: Item = parse_quote!(
+        pub struct S<T>(Wrap<T>);
+    );
+    referrer
+        .clone()
+        .visitor(module, |_, ix| parse_quote!(P<#ix>))
+        .with_outermost_generics_as_leakers()
+        .visit_item_mut(&mut item);
+    assert_eq!(
+        quote!(#item).to_string(),
+        shown(parse_quote!(
+            pub struct S<T>(P<0usize>);
+        ))
+    );
+    // The context is a scope around a `mod` item.
+    let mut leaker = Leaker::new();
+    let (context, ()) = leaker
+        .enter_generics(&Generics::default(), |view| {
+            view.visit_item(&parse_quote!(
+                mod m {
+                    pub struct S<T>(Wrap<T>);
+                }
+            ));
+        })
+        .unwrap();
+    let referrer = leaker.finish();
+    let mut item: Item = parse_quote!(
+        mod m {
+            pub struct S<T>(Wrap<T>);
+        }
+    );
+    referrer
+        .clone()
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .with_outermost_generics_as_leakers()
+        .visit_item_mut(&mut item);
+    assert_eq!(
+        quote!(#item).to_string(),
+        shown(parse_quote!(
+            mod m {
+                pub struct S<T>(P<0usize>);
+            }
+        ))
+    );
+}
+
+/// README, Modules: an item declared in a block hides the entry of a module that names it, as it
+/// does outside a module. Audit mutant `vis_shadow_retain_module_flag`.
+#[test]
+fn a_block_item_hides_the_entry_of_a_module() {
+    let mut leaker = Leaker::new();
+    let module = leaker
+        .intern_mod(&parse_quote!(
+            mod m {
+                pub fn f(a: Rel) {}
+            }
+        ))
+        .unwrap();
+    let referrer = leaker.finish();
+    let out = rewrite_in(
+        &referrer,
+        module,
+        parse_quote!(
+            pub fn f(a: Rel) {
+                struct Rel;
+                let b: Rel = Rel;
+            }
+        ),
+    );
+    // `a` is replaced, `b` is the local struct.
+    assert_eq!(
+        out,
+        shown(parse_quote!(
+            pub fn f(a: P<0usize>) {
+                struct Rel;
+                let b: Rel = Rel;
+            }
+        ))
+    );
+}
+
+/// README, Modules / Self rules: `Self` has no meaning in a `mod` item, even inside the scope of a
+/// trait that declares it, so the entry that names the `Self` of the trait is not found in it.
+/// Audit mutant `vis_mod_item_self_kept` (the `Self` of the scope around stays in a `mod` item).
+#[test]
+fn self_has_no_meaning_in_a_mod_item_of_a_scope_which_declares_it() {
+    let mut leaker = Leaker::new();
+    let context = leaker
+        .intern_trait(
+            &parse_quote!(
+                trait Tr {
+                    fn f(&self) -> Rel<Self>;
+                }
+            ),
+            true,
+        )
+        .unwrap();
+    let referrer = leaker.finish();
+    // The trait itself declares `Self`, and the entry is found.
+    let expected: Item = parse_quote!(
+        trait Tr {
+            fn f(&self) -> P<0usize>;
+        }
+    );
+    assert_eq!(
+        rewrite_in(
+            &referrer,
+            context,
+            parse_quote!(
+                trait Tr {
+                    fn f(&self) -> Rel<Self>;
+                }
+            )
+        ),
+        quote!(#expected).to_string()
+    );
+    // In a module it is not the `Self` of the trait: nothing is replaced.
+    for src in [
+        "mod inner { type X = Rel<Self>; }",
+        "mod inner { const C: Option<Rel<Self>> = None; }",
+        "mod inner { fn g() -> Rel<Self> { loop {} } }",
+        "mod inner { static S: Rel<Self> = loop {}; }",
+    ] {
+        let item: Item = parse_str(src).unwrap();
+        assert_eq!(
+            rewrite_in(&referrer, context, item.clone()),
+            quote!(#item).to_string(),
+            "{}",
+            src
+        );
+    }
+}

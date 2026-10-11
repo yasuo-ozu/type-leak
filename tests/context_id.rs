@@ -228,6 +228,18 @@ fn a_failed_call_does_not_take_ids() {
     // `Wrap<U>` of a failed call would take the id 1 (and the generics of the call as well).
     let bad: ItemStruct = parse_quote! { struct B<U> { y: Wrap<U>, z: RelB<'_> } };
     assert!(leaker.intern_struct(&bad, true).is_err());
+    // A scope which completes inside a failed call has taken its id by the time the call fails
+    // (the ids are assigned when a nested scope is left): the rollback of the call gives it back.
+    // The generics `<W>` are not those of the call that follows, so a stale context would shift
+    // its id.
+    let failed = leaker.enter_generics(&parse_quote!(<U>), |view| {
+        view.enter_generics(&parse_quote!(<W>), |view| {
+            view.visit_type(&parse_quote!(Wrap<W>))
+        })
+        .unwrap();
+        view.visit_type(&parse_quote!(RelB<'_>));
+    });
+    assert!(failed.is_err());
     let c: ItemStruct = parse_quote! { struct C<V> { y: Wrap<V> } };
     let top_level = leaker.intern_struct(&c, true).unwrap();
     assert_eq!(top_level, id(1));

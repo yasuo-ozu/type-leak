@@ -291,6 +291,17 @@ fn test_contexts() {
     // A failed call adds nothing.
     let bad: ItemStruct = parse_quote! { struct S { a: RelB<'_> } };
     assert!(leaker.intern_struct(&bad, true).is_err());
+    // Also if a scope that completed inside it had taken an id (they are assigned when a nested
+    // scope is left): the rollback of the call gives it back.
+    assert!(leaker
+        .enter_generics(&parse_quote!(<V>), |view| {
+            view.enter_generics(&parse_quote!(<W>), |view| {
+                view.visit_type(&parse_quote!(Wrap<W>))
+            })
+            .unwrap();
+            view.visit_type(&parse_quote!(RelB<'_>));
+        })
+        .is_err());
     let context1 = leaker.intern_struct(&item1, true).unwrap();
     let referrer = leaker.finish();
     // `RelA` uses no generics, so it is shared by the calls, but `Wrap<T>` and `Wrap<U>` are not.
@@ -560,6 +571,8 @@ fn test_iter_with_self() {
             fn d(&self) -> Rel4;
             fn e<T: ::core::cmp::PartialEq<Self>>(&self) -> Wrap2<T>;
             fn g(&self) -> Rel5<m!(Self, [u8; 1])>;
+            const N: usize;
+            fn h(&self, a: Rel6<[u8; Self::N]>);
         }
     });
     let marker: Type = parse_quote!(__S);
@@ -587,6 +600,8 @@ fn test_iter_with_self() {
     find(parse_quote!(Rel3<<__S as ::p::Tr>::X>));
     find(parse_quote!(Rel4));
     find(parse_quote!(Rel5<m!(__S, [u8; 1])>));
+    // `Self` in an array length (an expression) is replaced too. Audit mutant `s_expr_assoc_off`.
+    find(parse_quote!(Rel6<[u8; <__S>::N]>));
     // A local bound is rewritten.
     let (ty, generics) = find(parse_quote!(Wrap2<T>));
     assert_eq!(ty, is_str(parse_quote!(Wrap2<T>)));
@@ -739,6 +754,63 @@ fn test_visitor_with_self_names_the_elided_lifetime() {
     assert_eq!(
         rewrite_with_self(&tr, host.clone(), sig.clone()),
         quote!(#sig).to_string().replace("Self", "Host < 'h >")
+    );
+}
+
+/// README, Elided lifetimes: `Visitor::with_self()` names the elided lifetime with a fresh
+/// `for<'__tl_e0>` binder. A binder that the function pointer has already gets the fresh lifetime
+/// added to it (audit mutant `en_existing_binder_off`), the fresh name avoids the names of that
+/// binder (`en_fresh_binder_off`), and the `Fn(..)` sugar inside an input keeps its own elision
+/// (`en_name_fnsugar_not_own`).
+#[test]
+fn test_visitor_with_self_binder_and_nested_elision() {
+    let tr: ItemTrait = parse_quote! { trait Tr { fn f(&self); } };
+    let host: Type = parse_quote!(Host<'h>);
+    let check = |sig: Signature, expected: Signature| {
+        assert_eq!(
+            rewrite_with_self(&tr, host.clone(), sig),
+            quote!(#expected).to_string()
+        );
+    };
+    // The binder that the function pointer has: the elided lifetime joins its lifetimes.
+    check(
+        parse_quote!(fn f(&self, x: for<'y> fn(&Self) -> &u8)),
+        parse_quote!(fn f(&self, x: for<'y, '__tl_e0> fn(&'__tl_e0 Host<'h>) -> &'__tl_e0 u8)),
+    );
+    // The same for the sugar of a bound.
+    check(
+        parse_quote!(fn f<F>(&self, f: F) where F: for<'y> Fn(&Self) -> Option<&u8>),
+        parse_quote!(
+            fn f<F>(&self, f: F)
+            where F: for<'y, '__tl_e0> Fn(&'__tl_e0 Host<'h>) -> Option<&'__tl_e0 u8>
+        ),
+    );
+    // The name is not one of the binder: the next one is taken.
+    check(
+        parse_quote!(fn f(&self, x: for<'__tl_e0> fn(&Self) -> &u8)),
+        parse_quote!(
+            fn f(&self, x: for<'__tl_e0, '__tl_e1> fn(&'__tl_e1 Host<'h>) -> &'__tl_e1 u8)
+        ),
+    );
+    check(
+        parse_quote!(fn f(&self, x: for<'__tl_e0, '__tl_e1> fn(&Self) -> &u8)),
+        parse_quote!(
+            fn f(&self, x: for<'__tl_e0, '__tl_e1, '__tl_e2> fn(&'__tl_e2 Host<'h>) -> &'__tl_e2 u8)
+        ),
+    );
+    // The sugar inside an input has its own elision: its `&u8` is not named, the function
+    // pointer around it is.
+    check(
+        parse_quote!(fn f(&self, x: fn(&(Self, Box<dyn Fn(&u8)>)) -> &u8)),
+        parse_quote!(
+            fn f(&self, x: for<'__tl_e0> fn(&'__tl_e0 (Host<'h>, Box<dyn Fn(&u8)>)) -> &'__tl_e0 u8)
+        ),
+    );
+    check(
+        parse_quote!(fn f(&self, x: fn(&(Self, fn(&u8) -> &u8)) -> &u8)),
+        parse_quote!(
+            fn f(&self, x: for<'__tl_e0> fn(&'__tl_e0 (Host<'h>, fn(&u8) -> &u8)) -> &'__tl_e0 u8)
+        ),
     );
 }
 

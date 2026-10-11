@@ -606,3 +606,34 @@ fn a_type_that_is_leaked_alone_is_no_cause_of_the_conflict_around_it() {
         ]
     );
 }
+
+/// README, Bare identifiers and consts: a type with an expression that cannot be leaked as a whole
+/// (a closure in an array length) is an error naming the closure, not an entry: a closure cannot
+/// be written in the impl of the Repeater. Audit mutant `c_expr_closure_impossible` (the closure
+/// is no obstacle, and the array type is an entry).
+#[test]
+fn a_closure_in_an_array_length_cannot_be_leaked_as_a_whole() {
+    let item: ItemTrait = parse_quote! {
+        pub trait Tr { fn f(&self, x: [u8; { let c = |a: u8| a; 3 }]); }
+    };
+    let mut leaker = Leaker::from_config(leaker_config());
+    let err = leaker.intern_trait(&item, true).unwrap_err();
+    let items: Vec<_> = err.items().collect();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].message, "use absolute path: 'a'");
+    assert_eq!(
+        items[0]
+            .notes
+            .iter()
+            .map(|(_, note)| note.as_str())
+            .collect::<Vec<_>>(),
+        ["it cannot be leaked as a whole because of `| a : u8 | a`"]
+    );
+    // Without the closure the array type is an entry.
+    let item: ItemTrait = parse_quote! {
+        pub trait Tr { fn f(&self, x: [u8; { let c = 3; c }]); }
+    };
+    let mut leaker = Leaker::from_config(leaker_config());
+    leaker.intern_trait(&item, true).unwrap();
+    assert_eq!(leaker.finish().iter().count(), 1);
+}

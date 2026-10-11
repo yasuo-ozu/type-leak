@@ -31,12 +31,6 @@ impl ToTokens for TypeKey {
     }
 }
 
-impl parse::Parse for TypeKey {
-    fn parse(input: parse::ParseStream) -> Result<Self> {
-        Ok(Self { ty: input.parse()? })
-    }
-}
-
 impl PartialEq for TypeKey {
     fn eq(&self, other: &Self) -> bool {
         self.tokens() == other.tokens()
@@ -45,6 +39,7 @@ impl PartialEq for TypeKey {
 
 impl Eq for TypeKey {}
 
+// `Ord` is required by safegraph (`IndexKey`), which this crate never calls it through.
 impl PartialOrd for TypeKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -76,6 +71,7 @@ pub(crate) struct NodeKey {
     pub(crate) ty: TypeKey,
 }
 
+// Required by safegraph (the keys of a graph are `Display`), and never called by this crate.
 impl std::fmt::Display for NodeKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.context, self.ty)

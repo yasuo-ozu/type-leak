@@ -130,6 +130,34 @@ fn the_requirement_goes_down_through_the_components_it_goes_through_in_rustc() {
     );
 }
 
+/// README, Outlives bounds: `impl Trait` does not pass the lifetime on, as an associated type path
+/// does not (the type behind it is opaque to the signature), while a trait object does. Audit
+/// mutant `o_impl_trait_passes` (`impl Trait` treated as a path that passes the lifetime on).
+#[test]
+fn impl_trait_does_not_pass_the_lifetime_on() {
+    // The reference, around an argument-position `impl Trait`: `Rel2<T>` in its binding is no
+    // `T: 'a`.
+    for construct in [
+        "&'a (impl ::core::iter::Iterator<Item = {X}>)",
+        "&'a mut (impl ::core::iter::Iterator<Item = {X}>)",
+        "&'a (::std::vec::Vec<u8>, impl ::core::iter::Iterator<Item = {X}>)",
+    ] {
+        assert_eq!(rel2_in("<'a, T>", construct), ["< T >"], "{}", construct);
+    }
+    // The same with a trait object, which does pass it on.
+    assert_eq!(
+        rel2_in("<'a, T>", "&'a (dyn ::core::iter::Iterator<Item = {X}>)"),
+        ["< 'a , T : 'a >"]
+    );
+    // And the trait of the generics (`trait Tr<'a, T>`) says the same.
+    let tr: ItemTrait = parse_quote! {
+        trait Tr<'a, T> {
+            fn f(&self, x: &'a (impl ::core::iter::Iterator<Item = Rel2<T>>));
+        }
+    };
+    assert_eq!(contexts_of(&referrer_of(&tr), "Rel2 < T >"), ["< T >"]);
+}
+
 #[test]
 fn every_lifetime_around_the_type_bounds_it() {
     // Both lifetimes of `&'a &'b X`, in the canonical order.

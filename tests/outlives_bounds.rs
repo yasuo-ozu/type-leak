@@ -238,6 +238,132 @@ fn a_trait_object_requires_its_arguments_to_outlive_too() {
     );
 }
 
+/// The leaked types of a trait with the generics each uses, and the lifetimes `Self` must outlive
+/// in the context of each (`Referrer::context_self_outlives()`).
+fn with_self_outlives(referrer: &Referrer) -> Vec<(String, String, Vec<String>)> {
+    referrer
+        .iter_with_generics()
+        .enumerate()
+        .map(|(ix, (ty, generics))| {
+            (
+                s(ty),
+                s(&quote!(#generics #{&generics.where_clause})),
+                referrer
+                    .context_self_outlives(referrer.context(ix))
+                    .iter()
+                    .map(s)
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// README, Outlives bounds (generic associated types): only the GATs of the trait that
+/// `intern_trait()` analyzes are read. `<Self as ::p::Other>::G<'x>` names the GAT of another
+/// trait, which the Leaker cannot see: only the predicate that the reference records is there, and
+/// no `Self: 'x`, which the `where Self: 'b` of this trait's own `G` would give. Audit mutant
+/// `g_other_trait_recorded` (the trait of the qualified path is not compared).
+#[test]
+fn the_gat_of_another_trait_records_the_predicate_only() {
+    let own = |path: &str| {
+        let item: ItemTrait = parse_str(&format!(
+            "trait Tr {{ type G<'b> where Self: 'b; \
+             fn m<'x>(&'x self, a: Rel<&'x {}<'x>>); }}",
+            path
+        ))
+        .unwrap();
+        let mut leaker = Leaker::new();
+        leaker.intern_trait(&item, true).unwrap();
+        with_self_outlives(&leaker.finish())
+    };
+    // Its own trait, by the path or by the qualified path: `Self: 'x`, as `G` says.
+    for (path, shown) in [
+        ("Self::G", "Self :: G"),
+        ("<Self as Tr>::G", "< Self as Tr > :: G"),
+    ] {
+        assert_eq!(
+            own(path),
+            [(
+                format!("Rel < & 'x {} < 'x > >", shown),
+                format!("< 'x > where {} < 'x > : 'x", shown),
+                vec!["'x".to_string()]
+            )],
+            "{}",
+            path
+        );
+    }
+    // Another trait's: the predicate only.
+    assert_eq!(
+        own("<Self as ::p::Other>::G"),
+        [(
+            "Rel < & 'x < Self as :: p :: Other > :: G < 'x > >".to_string(),
+            "< 'x > where < Self as :: p :: Other > :: G < 'x > : 'x".to_string(),
+            Vec::<String>::new()
+        )]
+    );
+}
+
+/// README, Outlives bounds: the GATs of the trait that `intern_trait()` analyzes are read, also
+/// when the trait is nested in a module that `intern_mod()` analyzes. Audit mutant
+/// `g_nested_trait_gats` (the GATs of a trait in a module are dropped).
+#[test]
+fn the_gats_of_a_trait_in_a_module_are_read() {
+    let item: ItemMod = parse_quote! {
+        mod m {
+            pub trait Tr {
+                type G<'b> where Self: 'b;
+                fn m<'x>(&'x self, a: Rel<&'x Self::G<'x>>);
+            }
+        }
+    };
+    let mut leaker = Leaker::new();
+    leaker.intern_mod(&item).unwrap();
+    assert_eq!(
+        with_self_outlives(&leaker.finish()),
+        [(
+            "Rel < & 'x Self :: G < 'x > >".to_string(),
+            "< 'x > where Self :: G < 'x > : 'x".to_string(),
+            vec!["'x".to_string()]
+        )]
+    );
+}
+
+/// README, Outlives bounds: the value of an associated type or GAT (`type A<'a, T> = Ref<'a,
+/// Rel2<T>>;`) is analyzed like a type written anywhere else. A path with a lifetime argument
+/// records no bound for what is inside it, so the copy fails like the original without `T: 'a`,
+/// and the bound that is written (`type A<'a, T: 'a>`) is the one of the entry.
+#[test]
+fn the_value_of_an_associated_type_is_analyzed_like_the_original() {
+    // Not written: nothing is guessed for `Rel2<T>` and the path.
+    assert_eq!(
+        leaked(parse_quote! { trait Tr { type A<'a, T> = ::p::Ref<'a, Rel2<T>>; } }),
+        [
+            e("Rel2 < T >", "< T >"),
+            e(":: p :: Ref < 'a , Rel2 < T > >", "< 'a , T >"),
+        ]
+    );
+    // Written, as the README says to: both have it.
+    assert_eq!(
+        leaked(parse_quote! { trait Tr { type A<'a, T: 'a> = ::p::Ref<'a, Rel2<T>>; } }),
+        [
+            e("Rel2 < T >", "< 'a , T : 'a >"),
+            e(":: p :: Ref < 'a , Rel2 < T > >", "< 'a , T : 'a >"),
+        ]
+    );
+    // A relative path is leaked as a whole.
+    assert_eq!(
+        leaked(parse_quote! { trait Tr { type A<'a, T: 'a> = Ref<'a, Rel2<T>>; } }),
+        [e("Ref < 'a , Rel2 < T > >", "< 'a , T : 'a >")]
+    );
+    // The bounds of the type are read too, with the reference they write.
+    assert_eq!(
+        leaked(parse_quote! {
+            trait Tr { type A<'a, T: 'a>: ::core::convert::Into<&'a Rel2<T>>; }
+        }),
+        [e("Rel2 < T >", "< 'a , T : 'a >")]
+    );
+}
+
 #[test]
 fn binder_lifetimes_are_not_generics() {
     // `'x` is declared by the binder, which the Repeater's implementation cannot refer to: `T:

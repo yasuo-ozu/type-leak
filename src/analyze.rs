@@ -13,7 +13,7 @@ use crate::error::{NotInternableError, SELF_NOTE};
 use crate::graph::is_whole_reference;
 #[cfg(doc)]
 use crate::leaker::Leaker;
-use crate::unstable::{bindings, Projections, Unstable, Why};
+use crate::unstable::{bindings, Cause, Projections, Unstable, Why};
 use crate::util::{
     first_associated_self_in_generics, first_self_in_generics, first_self_in_type,
     generic_param_mentions_self, generic_param_name, has_lifetime_bound, ident_name,
@@ -1695,17 +1695,17 @@ impl AnalyzeVisitor {
         match self.env_unstable_bound(context, false) {
             Some(unstable) => {
                 let why = match &unstable.why {
-                    Why::Leaked => format!(
+                    Cause::Leaked => format!(
                         "the bound `{}` of its generics names a type that is leaked too: the copy \
                          writes both as paths through the Repeater, and rustc cannot normalize the \
                          one in a bound or where predicate while it checks the bounds (E0277, \
                          E0275)",
                         unstable.bound
                     ),
-                    _ => format!(
+                    Cause::Named(named) => format!(
                         "the bound `{}` of its generics {}",
                         unstable.bound,
-                        unstable.explain()
+                        named.explain()
                     ),
                 };
                 Some(self.unstable_error(ty, &unstable, why))
@@ -1741,7 +1741,7 @@ impl AnalyzeVisitor {
             None => (self.impl_unstable_bound(projection)?, "the impl"),
         };
         let why = match (&unstable.why, projection) {
-            (Why::Leaked, true) => format!(
+            (Cause::Leaked, true) => format!(
                 "the copy for a concrete implementor resolves `{}` by the impl of the trait, \
                  which needs the bound `{}` of {}, where the copy writes the leaked type \
                  as a path through the Repeater, and rustc cannot normalize the one in a bound or \
@@ -1750,26 +1750,26 @@ impl AnalyzeVisitor {
                 unstable.bound,
                 owner
             ),
-            (Why::Leaked, false) => format!(
+            (Cause::Leaked, false) => format!(
                 "`Self` is the self type of the impl, which the copy writes with its leaked types \
                  as paths through the Repeater, and the bound `{}` of their generics names a type \
                  that is leaked too, and rustc cannot normalize the one in a bound or where \
                  predicate while it checks the bounds (E0277, E0275)",
                 unstable.bound
             ),
-            (_, true) => format!(
+            (Cause::Named(named), true) => format!(
                 "the copy for a concrete implementor resolves `{}` by the impl of the trait, \
                  which needs the bound `{}` of {}, which {}",
                 quote!(#ty),
                 unstable.bound,
                 owner,
-                unstable.explain()
+                named.explain()
             ),
-            (_, false) => format!(
+            (Cause::Named(named), false) => format!(
                 "`Self` is the self type of the impl, which the copy writes with its leaked types \
                  as paths through the Repeater, and the bound `{}` of their generics {}",
                 unstable.bound,
-                unstable.explain()
+                named.explain()
             ),
         };
         Some(self.unstable_error(ty, &unstable, why))
@@ -1815,9 +1815,10 @@ impl AnalyzeVisitor {
     /// The error for `ty`, which is in a predicate and needs `unstable`: like `cycle_error()`, with
     /// the headline and the advice of what the bound names.
     fn unstable_error(&self, ty: &Type, unstable: &Unstable, why: String) -> CheckResult {
-        if matches!(unstable.why, Why::Leaked) {
-            return self.cycle_error(ty, why);
-        }
+        let named = match &unstable.why {
+            Cause::Leaked => return self.cycle_error(ty, why),
+            Cause::Named(named) => named,
+        };
         CheckResult {
             must: vec![quote!(#ty)],
             impossible: Vec::new(),
@@ -1826,13 +1827,13 @@ impl AnalyzeVisitor {
             note: Some(format!(
                 "{}. {}, or use `{}` outside the bounds and where predicates",
                 why,
-                unstable.why.advice(),
+                named.advice(),
                 quote!(#ty)
             )),
             headline: Some(format!(
                 "`{}` is in a bound or where predicate, and a bound of its generics names {}",
                 quote!(#ty),
-                unstable.why.names()
+                named.names()
             )),
         }
     }
@@ -1976,7 +1977,7 @@ impl AnalyzeVisitor {
         if let Some(bound) = self.env_leaked_bound(context, optional) {
             return Some(Unstable {
                 bound,
-                why: Why::Leaked,
+                why: Cause::Leaked,
             });
         }
         if self.env_depth == 0 || !self.check_env {
@@ -2011,7 +2012,10 @@ impl AnalyzeVisitor {
                 }
                 None => return None,
             };
-            Some(Unstable { bound, why })
+            Some(Unstable {
+                bound,
+                why: Cause::Named(why),
+            })
         };
         for param in &generics.params {
             if let GenericParam::Type(type_param) = param {
@@ -2073,7 +2077,7 @@ impl AnalyzeVisitor {
         let keys = self.probe(context, |probe| {
             probe.visit_generics(context.generics());
             // The bound that names `Self` is unstable for the self type that the copy writes.
-            if let (Why::SelfType, Some(SelfRequirement::Type(ty))) =
+            if let (Cause::Named(Why::SelfType), Some(SelfRequirement::Type(ty))) =
                 (&unstable.why, context.self_ty())
             {
                 probe.visit_type(ty);

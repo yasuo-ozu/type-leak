@@ -306,7 +306,8 @@ fn from_config_and_the_items_accumulate() {
     );
     let a = leaker.intern_struct(&first, true).unwrap();
     let b = leaker.intern_trait(&second, true).unwrap();
-    // A failed call takes no id.
+    // A failed call takes no id, also if a scope that completed inside it had taken one (the ids
+    // are assigned when a nested scope is left).
     assert!(leaker
         .intern_struct(
             &parse_quote!(
@@ -317,12 +318,39 @@ fn from_config_and_the_items_accumulate() {
             true
         )
         .is_err());
+    assert!(leaker
+        .enter_generics(&parse_quote!(<U>), |view| {
+            view.enter_generics(&parse_quote!(<W>), |view| {
+                view.visit_type(&parse_quote!(Wrap<W>))
+            })
+            .unwrap();
+            view.visit_type(&parse_quote!(Rel3<'_>));
+        })
+        .is_err());
     let c = leaker.intern_enum(&third, true).unwrap();
+    // The failed calls left no context, so the next generics take the next id (the generics `<W>`
+    // of the scope that completed in a failed call are not among the contexts).
+    let d = leaker
+        .intern_struct(
+            &parse_quote!(
+                struct D<V> {
+                    x: Wrap<V>,
+                }
+            ),
+            true,
+        )
+        .unwrap();
+    assert_eq!(d, id(2));
     let referrer = leaker.finish();
     // `Rel` is leaked once, in the context of no generics, which is that of `E`.
     assert_eq!(
         entries(&referrer),
-        ["Rel |  | -", "Rel2 |  | -", "Wrap < T > | < T > | -",]
+        [
+            "Rel |  | -",
+            "Rel2 |  | -",
+            "Wrap < T > | < T > | -",
+            "Wrap < V > | < V > | -"
+        ]
     );
     assert_eq!(a, id(1));
     // The same generics are the same context, whichever item they are the generics of.

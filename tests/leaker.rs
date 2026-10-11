@@ -5,7 +5,7 @@ mod common;
 use std::collections::BTreeSet;
 use syn::*;
 use template_quote::quote;
-use type_leak::Leaker;
+use type_leak::{Leaker, LeakerConfig};
 
 #[test]
 fn test_leaker() {
@@ -34,14 +34,28 @@ fn test_leaker() {
         .map(|s| s.to_string())
         .collect::<BTreeSet<_>>()
     );
-    let mut f = |_, _| parse_quote!(::path::to::Implementor);
-    assert_ne!(
+    // `expand()` replaces a leaked type by what the callback returns for its index, and nothing
+    // else (the entries are sorted by tokens: the tuple, `MyType1`, `MyType4`).
+    let mut f = |_, ix: usize| -> Type {
+        let ix = syn::Index::from(ix);
+        parse_quote!(::path::to::Implementor<#ix>)
+    };
+    assert_eq!(
         quote!(#{referrer.expand(context, parse_quote!(MyType1),  &mut f)}).to_string(),
-        quote!(MyType1).to_string()
+        quote!(::path::to::Implementor<1>).to_string()
     );
-    assert_ne!(
+    assert_eq!(
         quote!(#{referrer.expand(context, parse_quote!((MyType2 , MyType3 < MyType1 > , MyType4 , MyType5)),  &mut f)}).to_string(),
-        quote!((MyType2 , MyType3 < MyType1 > , MyType4 , MyType5)).to_string()
+        quote!(::path::to::Implementor<0>).to_string()
+    );
+    assert_eq!(
+        quote!(#{referrer.expand(context, parse_quote!(MyType4),  &mut f)}).to_string(),
+        quote!(::path::to::Implementor<2>).to_string()
+    );
+    // A type that is not leaked is left as it is.
+    assert_eq!(
+        quote!(#{referrer.expand(context, parse_quote!(Other),  &mut f)}).to_string(),
+        quote!(Other).to_string()
     );
 }
 
@@ -95,6 +109,117 @@ fn test_leaker_construction() {
             true
         )
         .is_err());
+}
+
+/// The number of entries of `struct S(<ty>);` with the Leaker `leaker` (`ty` is a path written
+/// the relative way, which is leaked unless it is allowed).
+fn entries_of_a_field(leaker: Leaker, ty: &str) -> usize {
+    let item: ItemStruct = parse_str(&format!("struct S({});", ty)).unwrap();
+    let mut leaker = leaker;
+    leaker.intern_struct(&item, true).unwrap();
+    leaker.finish().iter().count()
+}
+
+/// README, Walkthrough notes: `LeakerConfig::allow_primitive()` allows the primitive types, and
+/// `allow_std_prelude()` the names of the standard prelude: a relative path with such a name is not
+/// leaked, while `Leaker::new()` allows no path and leaks it. Audit mutants `cfg_primitive_f64`,
+/// `cfg_primitive_f32`, `cfg_primitive_i128`, `cfg_prelude_drop`, `cfg_prelude_fromiter`,
+/// `cfg_prelude_toowned` and `cfg_prelude_ord`.
+#[test]
+fn test_config_allows_the_documented_names() {
+    let primitives = [
+        "bool", "char", "str", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32",
+        "i64", "i128", "isize", "f32", "f64",
+    ];
+    let prelude = [
+        "Box",
+        "String",
+        "Vec",
+        "Option",
+        "Result",
+        "Copy",
+        "Send",
+        "Sized",
+        "Sync",
+        "Unpin",
+        "Drop",
+        "Fn",
+        "FnMut",
+        "FnOnce",
+        "Clone",
+        "PartialEq",
+        "PartialOrd",
+        "Eq",
+        "Ord",
+        "AsRef",
+        "AsMut",
+        "Into",
+        "From",
+        "Default",
+        "Iterator",
+        "IntoIterator",
+        "Extend",
+        "FromIterator",
+        "ToOwned",
+        "ToString",
+    ];
+    let mut only_primitives = LeakerConfig::new();
+    only_primitives.allow_primitive();
+    let mut only_prelude = LeakerConfig::new();
+    only_prelude.allow_std_prelude();
+    for name in primitives.iter().chain(prelude.iter()) {
+        // Nothing is allowed by default.
+        assert_eq!(entries_of_a_field(Leaker::new(), name), 1, "{}", name);
+        // Each list allows its names, and not the other list's.
+        let (own, other) = if primitives.contains(name) {
+            (&only_primitives, &only_prelude)
+        } else {
+            (&only_prelude, &only_primitives)
+        };
+        assert_eq!(
+            entries_of_a_field(Leaker::from_config(own.clone()), name),
+            0,
+            "{}",
+            name
+        );
+        assert_eq!(
+            entries_of_a_field(Leaker::from_config(other.clone()), name),
+            1,
+            "{}",
+            name
+        );
+    }
+    // The function `drop` is a name of the prelude too (here in an array length).
+    let item: ItemStruct = parse_quote!(
+        struct S([::core::primitive::u8; drop]);
+    );
+    let entries = |config: LeakerConfig| {
+        let mut leaker = Leaker::from_config(config);
+        leaker.intern_struct(&item, true).unwrap();
+        leaker.finish().iter().count()
+    };
+    assert_eq!(entries(LeakerConfig::new()), 1);
+    assert_eq!(entries(only_primitives.clone()), 1);
+    assert_eq!(entries(only_prelude.clone()), 0);
+    // `allow_crate()` allows the paths that start with `crate`, and the lists add up.
+    let item: ItemStruct = parse_quote!(
+        struct S(crate::A, u8, Vec<crate::B>);
+    );
+    let mut all = LeakerConfig::new();
+    all.allow_primitive().allow_std_prelude().allow_crate();
+    let mut leaker = Leaker::from_config(all);
+    leaker.intern_struct(&item, true).unwrap();
+    assert!(leaker.finish().is_empty());
+    let mut leaker = Leaker::from_config(only_prelude);
+    leaker.intern_struct(&item, true).unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(
+        referrer
+            .iter()
+            .map(|ty| quote!(#ty).to_string())
+            .collect::<Vec<_>>(),
+        ["crate :: A", "crate :: B", "u8"]
+    );
 }
 
 #[test]
@@ -219,7 +344,7 @@ fn test_finish_reduces_and_accumulates() {
 fn test_finish_order_is_deterministic() {
     // The leaked types (and so their indices) are the same in every run, whatever the order.
     let item: ItemStruct = parse_quote! {
-        struct S { e: E, c: C, a: A, d: D, b: B, a2: A }
+        struct S { e: E, c: C, a: A, d: D, b: B, a2: A, t: (T2, A, T3) }
     };
     let finish = || -> Vec<String> {
         {
@@ -232,13 +357,58 @@ fn test_finish_order_is_deterministic() {
         .collect()
     };
     let first = finish();
-    assert_eq!(
-        first.iter().cloned().collect::<BTreeSet<_>>(),
-        strings(&["A", "B", "C", "D", "E"])
-    );
+    // The entries are sorted by context, and then by tokens, whatever the order they appear in
+    // (the run-to-run comparison below cannot tell a sorted list from one in the order of a hash
+    // map that happens to repeat). The tuple is kept whole (one entry instead of `T2` and `T3`),
+    // next to `A`, which it contains: they are one component of the graph, and the entries of a
+    // component are not in the order of the others without the sort. Audit mutant
+    // `sort_kept_off`.
+    assert_eq!(first, ["(T2 , A , T3)", "A", "B", "C", "D", "E"]);
     for _ in 0..8 {
         assert_eq!(finish(), first);
     }
+    // Two contexts: `Y<T>` has the generics `<T>` (the context 1), and comes after the types with
+    // none (the context 0), although its tokens are between theirs. The optional entries (of an
+    // external crate) come after the required ones, sorted the same way by the contexts of the
+    // result: `::ext::W<T>` was the first optional entry, but its context is the second one of
+    // the Referrer, as the required `Y<T>` made it. Audit mutant `sort_optional_off`.
+    let item: ItemStruct = parse_quote! {
+        struct S<T> {
+            z: Z,
+            y: Y<T>,
+            a: A,
+            w: ::ext::W<T>,
+            v: ::ext::V,
+            o: ::ext::O,
+            n: ::ext::N,
+            x: X<T>,
+        }
+    };
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&item, true).unwrap();
+    let referrer = leaker.finish();
+    let listed: Vec<(String, bool, usize)> = (0..referrer.iter().count())
+        .map(|ix| {
+            (
+                quote!(#{referrer.iter().nth(ix).unwrap()}).to_string(),
+                referrer.must(ix),
+                referrer.context(ix).index(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("A".to_string(), true, 0),
+            ("Z".to_string(), true, 0),
+            ("X < T >".to_string(), true, 1),
+            ("Y < T >".to_string(), true, 1),
+            (":: ext :: N".to_string(), false, 0),
+            (":: ext :: O".to_string(), false, 0),
+            (":: ext :: V".to_string(), false, 0),
+            (":: ext :: W < T >".to_string(), false, 1),
+        ]
+    );
 }
 
 #[test]
