@@ -26,29 +26,19 @@ use template_quote::quote;
 /// Finds the types of an item that depend on where they are written, and collects them in a
 /// [`Referrer`].
 ///
-/// This is the first step of copying an item into another crate. Analyze a whole item with an
-/// `intern_*` method, or only some fragments of it in a scope (`enter_*`). Then call
-/// [`Leaker::finish()`] to get the [`Referrer`]. Each analysis method returns the [`ContextId`] of
-/// what it analyzed (its top-level context), or fails with a [`NotInternableError`] that says
-/// which paths must be absolute. See the [quick start](crate#quick-start).
+/// Analyze a whole item with an `intern_*` method, or parts of one in a scope with an `enter_*`
+/// method, then call [`Leaker::finish()`]. Each analysis returns the top-level [`ContextId`] of
+/// what it analyzed (keep it for [`Referrer::visitor()`]), or a [`NotInternableError`]. See the
+/// [quick start](crate#quick-start).
 ///
 /// - **A whole item**: [`intern_struct`](Leaker::intern_struct), `intern_enum`, `intern_union`,
-///   `intern_impl` and `intern_trait` take `(&item, allow_self)`; [`intern_mod`](Leaker::intern_mod)
-///   takes a module (its nested modules: [`Referrer::module_path()`]). With `allow_self = false`, a
-///   type that names `Self` is split into parts instead of being leaked whole: use it when your
-///   Repeater impls are for a marker type, which cannot name `Self`
-///   ([`allow_self`](Leaker::intern_struct)).
+///   `intern_impl`, `intern_trait` and [`intern_mod`](Leaker::intern_mod).
 /// - **Part of an item**: [`enter_impl`](Leaker::enter_impl), `enter_generics`, `enter_type`,
-///   `enter_trait` and `enter_mod` declare the generics and `Self` of a scope, and run a closure on
-///   its [`View`]: `view.visit_type(..)`, `visit_path_arguments(..)`, `visit_where_clause(..)`. A
-///   scope that fails forgets what it found, and the scope around it can go on
-///   ([`enter_generics`](Leaker::enter_generics)).
-/// - **Paths that are not leaked**: [`LeakerConfig`] (`allow_primitive()`, `allow_std_prelude()`,
-///   your own crates). Without `allow_std_prelude()`, `trait Tr: Clone` is an error.
-/// - **Errors**: report each offending path at its span with [`NotInternableError::items()`]. Each
-///   [`ErrorItem`](crate::ErrorItem) says what is wrong (`message`), why (`notes`) and what to write instead
-///   (`help`), as rustc does. The rules that the errors enforce are in [What the Leaker
-///   checks](#what-the-leaker-checks).
+///   `enter_trait` and `enter_mod` run a closure on a [`View`] of a scope whose generics and `Self`
+///   you declare.
+/// - **Paths to trust as written** (primitives, the prelude, your crates): [`LeakerConfig`].
+/// - **Errors**: [`NotInternableError::items()`] gives each offending path with what is wrong
+///   (`message`), why (`notes`) and what to write instead (`help`).
 ///
 /// ```
 /// # use type_leak::*;
@@ -67,42 +57,34 @@ use template_quote::quote;
 ///
 /// # Limitations
 ///
-/// The Leaker reads only the item you give it, not the definitions of the paths it names. So some
-/// code needs a hint, or another form. Each limit links to its rule, and the error of the Leaker
-/// says what to write instead (`help`).
+/// The Leaker reads only the item you give it, not the definitions of the paths it names. Where
+/// that matters, it rejects the item, and the error's `help` says what to write instead:
 ///
-/// - A relative path with an elided lifetime (`MyType<'_>`), `impl Trait`, a trait or a value in a
-///   bound cannot be leaked: write an absolute path, which means the same in every crate
-///   ([`ContextId`]).
-/// - A path with a lifetime argument records no `T: 'a`: write the bound ([Outlives
-///   bounds](#outlives-bounds)).
-/// - An output that relies on elision or names a `for<'x>` lifetime needs an input that keeps it
-///   ([Elided lifetimes](#elided-lifetimes), [Binder lifetimes](#binder-lifetimes)).
-/// - A `dyn Trait` without a lifetime bound is never leaked alone ([Trait
-///   objects](#trait-objects)).
-/// - A method lifetime that only a leaked type mentions breaks a trait impl ([Method
-///   lifetimes](#method-lifetimes)).
-/// - A leaked type in a bound or where predicate fails if rustc cannot prove the bounds of its
-///   generics ([Bounds that name leaked types](#bounds-that-name-leaked-types)).
-/// - `Self::A` cannot be in an entry if `Self` is a type, and some bounds that name `Self` cannot
-///   be written ([`allow_self`](Leaker::intern_struct)).
-/// - A bare identifier argument may be a const and may have to be treated as a type ([Bare
-///   identifiers and consts](#bare-identifiers-and-consts)).
-/// - An absolute path of another crate is trusted only if both sides have that crate
+/// - `MyType<'_>`, `impl Trait`, and a relative trait or value in a bound: write an absolute path.
+/// - A path whose definition needs `T: 'a`: write the bound ([Outlives bounds](#outlives-bounds)).
+/// - An output lifetime that only a leaked type would keep ([Binder lifetimes](#binder-lifetimes),
+///   [Elided lifetimes](#elided-lifetimes), [Method lifetimes](#method-lifetimes)).
+/// - A `dyn Trait` without a lifetime bound ([Trait objects](#trait-objects)).
+/// - A leaked type in a bound or where predicate ([Bounds that name leaked
+///   types](#bounds-that-name-leaked-types)).
+/// - `Self::A` where `Self` is a type, and bounds that name `Self`
+///   ([`allow_self`](Leaker::intern_struct)).
+/// - A bare identifier that may be a const ([Bare identifiers and
+///   consts](#bare-identifiers-and-consts)).
+/// - An absolute path of another crate, trusted only if both crates have it
 ///   ([`allowed_paths`](Leaker::allowed_paths)).
-/// - A shadowed primitive name (`type u8 = i32;`) breaks the copy: emit [`Leaker::assertions()`]
-///   to check.
+/// - A shadowed primitive name (`type u8 = i32;`): emit [`Leaker::assertions()`] to catch it.
 ///
 /// # What the Leaker checks
 ///
-/// The Leaker rejects what `rustc` would reject in the copy. A `rustc` error in the generated code
-/// means that a rule below was not met, or that the Leaker could not see it:
+/// Each check rejects code whose copy rustc would reject. If a copy still fails to compile, the
+/// rustc error points to the check:
 ///
-/// | `rustc` error in the copy | Rule |
+/// | `rustc` error in the copy | Check |
 /// | --- | --- |
 /// | E0309 | [Outlives bounds](#outlives-bounds) |
-/// | E0106 | [Elided lifetimes](#elided-lifetimes) |
 /// | E0581, E0582 | [Binder lifetimes](#binder-lifetimes) |
+/// | E0106 | [Elided lifetimes](#elided-lifetimes) |
 /// | E0478 | [Trait objects](#trait-objects) |
 /// | E0195 | [Method lifetimes](#method-lifetimes) |
 /// | E0277, E0271, E0275, E0284 in a bound | [Bounds](#bounds-that-name-leaked-types) |
@@ -111,239 +93,99 @@ use template_quote::quote;
 ///
 /// ## Outlives bounds
 ///
-/// A reference `&'a X` is valid only if `X: 'a`, so an entry under a reference needs that bound in
-/// its Repeater impl (E0309 without it). The Leaker records the bound, and the encoded arguments
-/// carry it (`T: 'a` as `&'a T`: see
-/// [`encode_generics_params_to_ty()`](crate::encode_generics_params_to_ty)). But it cannot read the
-/// definition of a path, so a path with a lifetime argument records nothing, even if its definition
-/// needs `T: 'a`: a guessed bound would make the copy stricter than the original for a path that
-/// needs none. Write the bound, in the copy too, or the entry is not found. A struct that holds a
-/// leaked type under such a path writes it as well (`struct F<'a, T: 'a>(Ref<'a, Rel2<T>>)`).
+/// An entry under `&'a` needs `T: 'a` in its Repeater impl (E0309). The Leaker records the bounds
+/// it sees, but not those that the definition of a path needs, so write them:
 ///
 /// ```ignore
-/// fn f<'a, T>(x: Rel<'a, T>);      // rejected: `struct Rel<'a, T>(&'a T)` needs `T: 'a`
+/// fn f<'a, T>(x: Rel<'a, T>);      // fails if `struct Rel<'a, T>(&'a T)`: it needs `T: 'a`
 /// fn f<'a, T: 'a>(x: Rel<'a, T>);  // good
 /// ```
 ///
-/// - The lifetimes around a type count: `Rel2<T>` in `&'a Vec<Rel2<T>>` is an entry with the
-///   generics `<'a, T: 'a>`, and the same type under another lifetime is another entry. A
-///   reference, tuple, array, slice, pointer, path argument, function pointer or trait object
-///   passes the lifetime on, and an associated type path, `impl Trait` and an array length do not.
-///   Only a lifetime parameter counts: `'static`, `'_` and the lifetime of a `for<..>` binder are
-///   never recorded.
-/// - rustc infers `T: 'a` for the original `struct F<'a, T>(&'a Vec<Rel2<T>>)`, but not for a copy
-///   that uses `<S as Repeater<..>>::Type` (E0309). So give [`Referrer::expand()`] and
-///   [`Referrer::visitor()`] the whole type or item, not a type cut out of another.
-/// - `&'a Self::A` and `&'a T::A` record the where predicate `Self::A: 'a` or `T::A: 'a`, and no
-///   `Self: 'a` or `T: 'a`: the original gets only the predicate from its signature, and a stricter
-///   copy is rejected (E0309, E0491). If a bound in scope equates the associated type
-///   (`T: Iterator<Item = X>`), the Leaker records what `X` mentions instead. A supertrait that
-///   equates it is not seen: write `T: 'a` on the trait.
-/// - `Self: 'a` and the generic associated types of a trait: see
-///   [`Referrer::context_self_outlives()`] and [`Leaker::intern_trait()`].
+/// rustc infers such bounds for the original but not for the copy, so give
+/// [`Referrer::visitor()`] the whole item, not a type cut out of another. For `Self: 'a` and
+/// associated types, see [`Referrer::context_self_outlives()`] and [`Leaker::intern_trait()`].
 ///
 /// ## Binder lifetimes
 ///
-/// The lifetimes of a `for<..>` binder are generics of the types inside it: `Rel<'x>` in
-/// `for<'x> fn(Rel<'x>)` is leaked with `<'x>`. The copy fails if the output (a return type, the
-/// output of `Fn(A) -> R`, or an associated type binding such as `Iterator<Item = R>`) names `'x`
-/// and no input keeps `'x` as written, because rustc does not count a lifetime that appears only in
-/// an associated type path as constrained (E0581 for a function pointer, E0582 for `Fn`). An input
-/// that keeps `'x` is an *anchor*. With no anchor, the Leaker leaks the whole function pointer or
-/// trait object, which is an error if it cannot: in a bound, in a where predicate, under an elided
-/// reference ([Elided lifetimes](#elided-lifetimes)), or in `impl for<'x> Fn(..)`.
+/// If the output of a `for<'x> ..` signature names `'x`, an input must keep `'x` as written
+/// (E0581, E0582). A leaked type does not keep it, so the whole function pointer or trait object is
+/// leaked instead, which is an error in a bound:
 ///
 /// ```ignore
-/// F: for<'x> Fn(Rel<'x>) -> &'x u8                // error: no anchor
-/// F: for<'x> Fn(&'x u8, Rel<'x>) -> &'x u8        // good: `&'x u8` anchors `'x`
+/// F: for<'x> Fn(Rel<'x>) -> &'x u8                // error: only `Rel<'x>` names `'x`
+/// F: for<'x> Fn(&'x u8, Rel<'x>) -> &'x u8        // good: `&'x u8` keeps `'x`
 /// F: for<'x> Fn(::my_crate::Rel<'x>) -> &'x u8    // good: nothing is leaked
 /// ```
 ///
-/// Keep an anchor, or make the path absolute.
-///
-/// - Anchors are found as rustc sees them: an associated type path (`<T as Tr<'x>>::A`), an array
-///   length, `impl Trait` and a type macro do not anchor, and the rest of a type does, however deep
-///   (`Box<dyn Iterator<Item = &'x u8>>`). A type that is leaked as a whole keeps no anchor, nor
-///   does an external type that the Leaker does not allow, since the Referrer may replace it.
-///   `::core` and allowed paths are assumed to be a struct, an enum or a union, so allow only
-///   crates without a type alias that drops a lifetime.
-/// - Only the associated type bindings and the output of the bound itself are the output of a
-///   bound: `T: for<'x> Tr<u8, Output = &'x u8>` is rejected.
-///
 /// ## Elided lifetimes
 ///
-/// An elided lifetime in the output of a signature is the only lifetime of its inputs: the one of
-/// `&Rel<T>` in `Fn(&Rel<T>) -> &u8`. A leaked type that has lifetimes among its generics names
-/// them in the arguments of its projection (`<S as Repeater<(&'a (), T, &'a T), ..>>::Type`), so
-/// the inputs of the copy have more lifetimes, and rustc cannot tell which one the output has
-/// (E0106). This affects the output of `Fn(..) -> R`, of a function pointer, and of a method with
-/// no reference receiver (`&self`, `self: &Self` and `self: Pin<&mut Self>` are not affected). The
-/// Leaker leaks the whole function pointer or trait object instead, with its elision as written.
-/// That is an error where it cannot: in a bound, in `impl Fn(..)`, in a method, and in a trait
-/// object under an elided reference.
+/// An elided output lifetime comes from the only lifetime of the inputs. A leaked type with
+/// lifetimes adds more in the copy, so rustc cannot tell which one the output has (E0106). The
+/// Leaker then leaks the whole function pointer or trait object, which is an error in a bound, in
+/// `impl Fn(..)`, under an elided reference, and in a method without a reference receiver:
 ///
 /// ```ignore
-/// fn f(&self, x: Box<dyn Fn(&Rel<T>) -> &u8>);    // good: the object is leaked, with `'a, T`
-/// fn f(&self, x: &'a dyn Fn(&Rel<T>) -> &u8);     // good: the whole reference is leaked
+/// fn f(&self, x: Box<dyn Fn(&Rel<T>) -> &u8>);    // good: the trait object is leaked whole
 /// fn f(&self, x: &dyn Fn(&Rel<T>) -> &u8);        // error: elided reference
-/// fn g(x: &Rel<T>) -> &u8;                        // error: no receiver
-/// fn g<'x>(x: &'x Rel<T>) -> &'x u8;              // good
-/// F: Fn(&Rel<T>) -> &u8                           // error: a bound
+/// fn g<'x>(x: &'x Rel<T>) -> &'x u8;              // good: the lifetimes are named
 /// F: for<'x> Fn(&'x Rel<T>) -> &'x u8             // good
-/// fn f(&self, x: fn(Ref<u8>, Rel<T>) -> &u8);     // good: leaked whole, `Ref` hides a lifetime
-/// F: Fn(Ref<u8>, Rel<T>) -> &u8                   // error: a bound, and `Ref` hides a lifetime
-/// F: Fn(Ref<'_, u8>, Rel<T>) -> &u8               // error: a bound
-/// struct S<'a> { f: fn(&Self) -> &u8, g: &'a u8 } // good: the Referrer names the lifetime
-/// struct S<'a, F: Fn(&Self) -> &u8>(&'a F);       // good: the same
 /// ```
 ///
-/// Name the lifetimes of the inputs and of the output, give the method a receiver, or make the path
-/// absolute.
-///
-/// - Nothing is added if the inputs keep the lifetimes the entry has (`Fn(&'a Rel<T>) -> &u8`), or
-///   if the output does not rely on elision (`Fn(&Rel<T>) -> Rel<T>`).
-/// - A function pointer or `Fn(..)` inside an input has its own signature: its lifetimes do not
-///   count for the one around, and the whole inner one is the entry if it adds lifetimes to the
-///   outer one. That is how rustc 1.64 and later count. Older ones also count the lifetimes that
-///   the inner one does not bind, so the copy of
-///   `Fn(&Box<dyn for<'x> Fn(&'x Rel<T>) -> &'x u8>) -> &u8` does not compile there.
-/// - A lifetime that a path hides (`Ref<u8>` for `Ref<'a, u8>`) is not seen. In the inputs it is
-///   taken as the lifetime that elision gives: write `Ref<'_, u8>` for the same result, which the
-///   Referrer can then name. A hidden lifetime in the output is not seen at all, so write
-///   `Ref<'_, u8>` there.
-/// - A function that is itself the analyzed item has no signature to the Leaker, which sees only
-///   the types you visit: write the lifetimes out.
-/// - `Self` in the inputs: see [`Visitor::with_self()`](crate::Visitor::with_self).
+/// A path that hides a lifetime (`Ref<u8>` for `Ref<'a, u8>`) is not seen: write `Ref<'_, u8>`.
 ///
 /// ## Trait objects
 ///
-/// A `dyn Trait` without a lifetime bound gets its bound from its surroundings. Behind `&'a`, it is
-/// the lifetime of the reference, or the bound of the trait if it has one. As an argument of a
-/// path, it is a bound written in the definition (`Ref<'a, T: ?Sized + 'a>`; a bound that rustc
-/// only infers from a field does not count), and else `'static`. The Leaker cannot see these
-/// definitions, so it never leaks such a trait object alone.
-///
-/// - If the trait object must be leaked itself (a relative trait, or a bare identifier that may be
-///   a const), the whole reference or path is leaked, with the lifetime among its generics. For a
-///   path, `'a` must be its only lifetime argument. Otherwise the trait object stays in the copy,
-///   and what is inside it is leaked (`Rel` of `&'a dyn ::path::Tr<Item = Rel>`).
-/// - A lifetime bound you write changes this. With a lifetime of the Leaker, the whole reference is
-///   leaked. With a local lifetime, the trait object alone is leaked with its bound.
-/// - These are errors: an elided lifetime (`&dyn RelTrait`, `Ref<'_, dyn RelTrait>`), several
-///   lifetime arguments, and a trait object in a bound or where predicate
-///   (`T: ::path::Tr<'a, dyn RelTrait>`). `Wrap<'static, dyn RelTrait>` and
-///   `Ref<'a, Box<dyn RelTrait>>` are fine.
+/// A `dyn Trait` without a lifetime bound takes its bound from where it is written, which the
+/// Leaker cannot see. So it is never leaked alone: the reference or path around it is.
 ///
 /// ```ignore
 /// fn f(x: &dyn RelTrait);          // error: elided lifetime
 /// fn f<'a>(x: &'a dyn RelTrait);   // good: the whole reference is leaked
 /// ```
 ///
-/// Name the lifetime, make the trait path absolute, or write the bound: `&'a (dyn RelTrait + 'a)`.
-/// Writing the default out is rejected by rustc (E0478) for a trait with a bound of its own: write
-/// `&'a dyn RelTrait` then, or make the trait path absolute.
+/// Writing the bound (`&'a (dyn RelTrait + 'a)`) also works, except for a trait with a bound of
+/// its own (E0478).
 ///
 /// ## Method lifetimes
 ///
-/// A leaked type may name a lifetime `'b` of a method: a path (`Wrap<'b>`), or a trait object that
-/// takes `'b` from the reference around it (`&'b dyn RelTrait`). In the trait, `'b` is late-bound.
-/// In the copy, only `<Self as Repeater<..>>::Type` holds it, which does not constrain it, so rustc
-/// makes it early-bound and rejects the copy because the two differ (E0195). That affects a method
-/// of a trait and of an impl of a trait. A free function and a method of an inherent impl have no
-/// signature to differ from, and the Leaker reports nothing for them. It reports an error if a type
-/// that is leaked as a whole names `'b`, the return type names `'b` and no bound does, and some
-/// argument constrains `'b` in the original, but none does in the copy.
+/// A method lifetime `'b` that only a leaked type mentions is late-bound in a trait but early-bound
+/// in the copy, which rustc rejects (E0195). This affects methods of traits and trait impls, if the
+/// return type names `'b`:
 ///
 /// ```ignore
-/// fn f<'b>(&self, x: &'b dyn RelTrait) -> &'b u8;           // error
-/// fn f<'b>(&self, x: Wrap<'b>) -> &'b u8;                   // error: `Wrap` is relative
-/// fn f<'b>(&'b self, x: &'b dyn RelTrait) -> &'b u8;        // good: `&'b self` keeps `'b`
-/// fn f<'b>(&self, x: &'b dyn RelTrait, y: &'b u8) -> &'b u8; // good: `y` keeps `'b`
-/// fn f<'b>(&self, x: Wrap<'b>, y: &'b u8) -> &'b u8;        // good: `y` keeps `'b`
+/// fn f<'b>(&self, x: Wrap<'b>) -> &'b u8;              // error
+/// fn f<'b>(&'b self, x: Wrap<'b>) -> &'b u8;           // good: `&'b self` keeps `'b`
+/// fn f<'b>(&self, x: Wrap<'b>, y: &'b u8) -> &'b u8;   // good: `y` keeps `'b`
 /// ```
-///
-/// Keep `'b` anchored, make the path absolute (`::my_crate::Wrap<'b>`), or write the bound
-/// (`&'b (dyn RelTrait + 'b)`).
-///
-/// - A bound on `'b` (`'c: 'b`, `T: 'b`, `where Self: 'b`) makes it early-bound in both, so it is
-///   fine. So is a function whose only mention of `'b` is the return type. A lifetime of the
-///   Leaker and one of the outermost function are not affected.
-/// - An argument keeps `'b` if it is the receiver (`&'b self`), or holds it in a type that is not
-///   leaked, however deep (`Option<&'b str>`, also an external type that the Leaker does not
-///   allow). An associated type path (`T::A<'b>`) and an array length do not hold it. A reference
-///   to a trait object that takes `'b` from the reference keeps it only if the trait object is
-///   certainly not leaked: `&'b dyn ::core::fmt::Debug`, or a trait of an allowed crate, but not a
-///   relative trait.
 ///
 /// ## Bounds that name leaked types
 ///
-/// A bound is rewritten like any other type: `T: Fn(Rel)` becomes
-/// `T: Fn(<() as Repeater<..>>::Type)`. rustc builds the environment of the item from its
-/// predicates and normalizes the path there, while the bounds are not normalized yet. The impl of
-/// the Repeater for `Wrap<T>` needs `T: Fn(Rel)`, and the environment has
-/// `T: Fn(<() as Repeater<..>>::Type)`, which rustc cannot prove (E0277, E0271, E0275 or E0284).
-/// The copy cannot have the original bound, so the Leaker reports an error for a leaked type in a
-/// predicate (also the bounds of an `impl Trait` argument) that uses a generic with an *unstable*
-/// bound. A type in a field or in a signature is fine.
+/// rustc builds the environment of an item from its bounds before it normalizes the Repeater paths
+/// in them. So a leaked type in a bound or where predicate fails if its Repeater impl needs a bound
+/// that the environment has only in its rewritten form (E0277, E0271, E0275, E0284). A type in a
+/// field or a signature is fine:
 ///
 /// ```ignore
 /// struct S<T: Fn(Rel)>(Wrap<T>) where Wrap<T>: Sized;  // error: `Wrap<T>` in a predicate
 /// struct S<T: Fn(Rel)>(Wrap<T>);                       // good
-/// struct S<T: Fn(Rel)>(Wrap<T>) where T: Sized;        // good
 /// ```
 ///
-/// A bound is unstable if the environment has it in another form than the impl needs. That is so if
-/// it names a leaked type; `Self`, if that is the leaked self type of an impl; `Self::A`; or an
-/// associated type that rustc normalizes (the `Item` of a generic that an `Iterator<Item = ..>`
-/// bound in scope equates, the `Output` of `Fn(..)`, a projection of a type that an impl defines).
-/// A supertrait may fix an `Item`, which the Leaker cannot read, so a projection of a generic that
-/// has a bound of a trait outside the standard library counts as normalized: `T: Tr + Fn(T::Out)`
-/// is rejected although it would compile. In a where predicate that is not a bound of a generic
-/// (`Vec<T::Item>: Default`), only the last kind counts.
-///
-/// The error is for a type in a bound or where predicate of the item or of a method that is:
-///
-/// - a leaked type that uses a generic with an unstable bound (a predicate on another type than a
-///   generic, `Vec<Rel2<T>>: Clone`, is proved by an impl and is fine);
-/// - `Self::A`, when a bound of the generics of the trait (in an impl: of the impl) is unstable;
-/// - `Self`, in an impl whose self type is leaked, when a bound of a generic of a type in the self
-///   type is unstable: `impl<T: Fn(Rel2), V: AsRef<Self>> ::p::W<Rel<T>, T, V>` is an error, and
-///   `impl<T: Fn(Rel2), U, V: AsRef<Self>> ::p::W<T, Rel<U>, V>` is fine;
-/// - a leaked type that names `Self` of a trait, in a predicate of the trait itself:
-///   `trait Tr where Rel<Self>: Sized`.
-///
-/// Not errors: a type that is an entry only because its parts need it, when that makes a cycle (its
-/// parts are the entries), and an optional entry ([`Leaker::allowed_paths`]), which is copied as
-/// written.
-///
-/// Write the type of the bound with an absolute path (`T: Fn(::my_crate::Rel)`), write the bound
-/// without what it names, or use the type outside of the predicates.
+/// The same holds for a bound that names `Self`, `Self::A`, or an associated type that rustc
+/// normalizes (such as the `Item` of an `Iterator<Item = ..>` bound in scope). The Leaker cannot
+/// read supertraits, so a projection of a generic bounded by a trait outside the standard library
+/// also counts, even where it would compile.
 ///
 /// ## Bare identifiers and consts
 ///
-/// A bare identifier argument (`MY_CONST` in `::path::MyType<MY_CONST>`) parses as a type, so it
-/// may be a type or a const, and its position decides. A const cannot be an entry on its own, so
-/// the type that holds it is leaked as a whole. If that is impossible, the identifier is leaked as
-/// a type, and the copy fails to compile if it is a const. That happens when the type has an elided
-/// lifetime or `impl Trait`, when its path is declared in the module of
-/// [`intern_mod()`](Leaker::intern_mod), and in a trait bound such as
-/// `T: ::path::MyTrait<MY_CONST>`. An identifier in a tuple, an array or a binding (`Item = X`) is
-/// a type.
+/// A bare identifier argument (`MyType<MY_CONST>`) may be a type or a const. The Leaker leaks the
+/// type that holds it as a whole; where it cannot (an elided lifetime, a trait bound, a module of
+/// [`intern_mod()`](Leaker::intern_mod)), it treats the identifier as a type, and the copy fails
+/// if it is a const:
 ///
 /// ```ignore
-/// fn f(x: ::path::MyType<'_, MY_CONST>);       // error: treated as a type
+/// fn f(x: ::path::MyType<'_, MY_CONST>);              // error: treated as a type
 /// fn f(x: ::path::MyType<{ ::my_crate::MY_CONST }>);  // good: not leaked
 /// ```
-///
-/// Write the const in braces with an absolute path.
-///
-/// - A relative const in a trait bound is rejected, because a const cannot be recovered from an
-///   associated type without `generic_const_exprs`. A type in an expression
-///   (`[u8; size_of::<MyType>()]`) is not leaked alone: the type that holds it is.
-/// - The type of a const parameter must be a primitive type, or a path that does not depend on the
-///   context, such as an absolute path to an alias. [`RepeaterSlots`](crate::RepeaterSlots) cannot
-///   encode an alias. Primitive names (`u8` in `const N: u8`) are copied as they are: see
-///   [`Leaker::assertions()`].
 #[derive(Default)]
 pub struct Leaker {
     /// Paths that are left as written instead of being leaked, such as `::serde`.
