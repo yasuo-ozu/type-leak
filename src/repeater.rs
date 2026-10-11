@@ -24,15 +24,25 @@ const REPEATER_SLOTS: &[(&str, &str, &str)] = &[
     ("isize", "ISIZE", "0"),
 ];
 
-/// Returns the definition of the Repeater trait, to define once in your crate. It supports const
-/// generics of any primitive type.
+/// Returns the definition of the Repeater trait, the one trait that both crates see. It supports
+/// const generics of any primitive type.
 ///
-/// Besides `T`, `ID` and `NTH`, it has a defaulted const slot per primitive type: `BOOL`, `CHAR`,
-/// `U8`, `U16`, `U32`, `U128`, `I8`, `I16`, `I32`, `I64`, `I128` and `ISIZE`.
+/// Define it once, at the root of the crate that writes the Repeater impls (the crate that
+/// exports the item). It must be a trait of that crate, because the impls are for any `Self`,
+/// which the orphan rule allows only for a local trait. So it is not in the crate of the
+/// proc macros (which exports only macros), and the crate that copies the item names it through
+/// the crate that defines it. Emit it from a macro, e.g. a function-like proc macro
+/// `define_repeater!()` whose body is `quote!(#definition)`.
+///
+/// `T` is the encoding of the generics of an entry, `ID` the Leaker (the trait that was analyzed)
+/// and `NTH` the entry. Besides them, the trait has a defaulted const slot per primitive type:
+/// `BOOL`, `CHAR`, `U8`, `U16`, `U32`, `U128`, `I8`, `I16`, `I32`, `I64`, `I128` and `ISIZE`.
 /// [`RepeaterSlots`] encodes const values into them, and `Repeater<T, ID, NTH>` still works.
-/// Without the slots, it works if every const parameter is `usize` or `u64`.
-/// Emit it once in the user crate, e.g. from a macro. It needs Rust 1.59 and the 2018 edition.
-/// See [Const generics](crate::rules#const-generics).
+/// Without the slots, it works if every const parameter is `usize` or `u64`. In that case you
+/// can write the trait by hand instead:
+/// `pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> { type Type: ?Sized; }`.
+/// The generated trait needs Rust 1.59 and the 2018 edition. See [Const
+/// generics](crate::rules#const-generics).
 ///
 /// ```
 /// # use type_leak::*;
@@ -41,6 +51,9 @@ const REPEATER_SLOTS: &[(&str, &str, &str)] = &[
 /// // `T`, `ID`, `NTH` and a slot for each primitive const type.
 /// assert_eq!(def.generics.params.len(), 3 + 12);
 /// assert_eq!(def.ident, "Repeater");
+/// // The trait is an `ItemTrait`: write it with `ToTokens`.
+/// # use template_quote::ToTokens;
+/// assert!(def.to_token_stream().to_string().starts_with("pub trait Repeater <"));
 /// ```
 pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
     let slots = REPEATER_SLOTS
@@ -89,13 +102,26 @@ pub struct RepeaterSlots {
 }
 
 impl RepeaterSlots {
-    /// Uses the Repeater at `repeater`, defined by [`repeater_definition()`].
+    /// Creates the encoder for the Repeater at the path `repeater`, the trait that
+    /// [`repeater_definition()`] defines in your crate.
     pub fn new(repeater: Path) -> Self {
         Self { repeater }
     }
 
     /// Encodes the const `value` of type `ty`. Fails with [`EncodeError::UnsupportedConstType`] if
     /// `ty` is not a primitive type.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
+    /// // The `bool` value goes into the slot of the Repeater for `bool`.
+    /// let ty = slots.encode_const(&parse_quote!(true), &parse_quote!(bool)).unwrap();
+    /// assert_eq!(ty, parse_quote!(*const dyn crate::Repeater<(), 0, 0, true, Type = ()>));
+    /// // `usize` needs no slot: it is an array length.
+    /// let ty = slots.encode_const(&parse_quote!(3), &parse_quote!(usize)).unwrap();
+    /// assert_eq!(ty, parse_quote!([(); 3]));
+    /// ```
     pub fn encode_const(&self, value: &Expr, ty: &Type) -> std::result::Result<Type, EncodeError> {
         let prim = const_param_primitive(ty)
             .ok_or_else(|| EncodeError::UnsupportedConstType(Box::new(ty.clone())))?;

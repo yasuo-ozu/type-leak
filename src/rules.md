@@ -1,7 +1,9 @@
 The exact rules of the analysis, one section for each topic.
 
 Each section gives the rules, a short example, and what to write instead. The [crate
-documentation](crate) is the user guide: start there.
+documentation](crate) is the user guide: start there. It defines the terms used here: the *Leaker*
+(analysis) and *Referrer* (copy) sides, *leaked types* and *entries*, the *Repeater*, and the
+*context* of an entry ([How it works](crate#how-it-works)).
 
 # Encoding of the generics
 
@@ -202,7 +204,7 @@ Entries of a module:
 
 - An entry is keyed by its module in these cases. Its path is relative. It names an item that the module declares (`crate::base::B1<R0>` with `R0` declared in the module: `crate::base::B1` cannot be leaked alone). A path in what `Self` means, or in a bound of its generics, is neither absolute nor starts with `crate::` or `$crate::`. It is a type macro.
 - Other entries are shared by all modules.
-- Emit the Repeater impl of a keyed entry inside its module. `Referrer::context_module()` tells which module it is.
+- Emit the Repeater impl of a keyed entry inside its module. `Referrer::context_module()` (`RepeaterImpl::module`) tells which module it is. For `intern_mod()`, follow `Referrer::module_path()` through the `mod` items you analyzed to find it. A module that `enter_mod()` made is the one you entered.
 - `Referrer::module_path()` gives the path of a module relative to the module of `intern_mod()` (`[]` for that module). A module found by `visit_item()` has such a path. A module entered by `enter_mod()` has no path, only its hint (`Referrer::module_hint()`).
 - The impl is in the Leaker's module. So an entry that names a declared item (`R0` above) names the Leaker's item, not the one that the copy of the module declares again.
 
@@ -596,7 +598,7 @@ An absolute path such as `::serde::Wrap<(Rel,)>` names a crate by name only. It 
 `Referrer::allow_ambiguous_crate_name()` is the Referrer's choice. It is not serialized.
 
 - `true` (the default): the optional entry is left as written, and the types in it are looked up as usual (`Rel` is replaced). Use it when both sides are built from the same dependency graph. A crate of the same name with another version or origin is taken for the same one, and the copy then fails or means another type.
-- `false`: the optional entry is replaced like a required one, through the Repeater. An absolute type that contains a relative one (`::serde::Wrap<(Rel,)>`) is replaced as a whole. Use it if the other crate may have other dependencies than the Leaker's. The impl of an optional entry is needed only if some Referrer replaces it.
+- `false`: the optional entry is replaced like a required one, through the Repeater. An absolute type that contains a relative one (`::serde::Wrap<(Rel,)>`) is replaced as a whole. Use it if the other crate may have other dependencies than the Leaker's. The impl of an optional entry is needed only if some Referrer replaces it. The flag is not serialized, so the crate that writes the impls cannot know: it writes the impls of all the entries (`Referrer::iter()`), not only of `Referrer::required()`, or a strict Referrer in another crate replaces a type that has no impl (E0277).
 
 ```rust,ignore
 fn f(x: ::serde::Wrap<(Rel,)>);  // `Rel` is an entry. The whole type is an optional entry.

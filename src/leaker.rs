@@ -90,6 +90,22 @@ impl Leaker {
     /// allowed by [`LeakerConfig::allow_primitive()`]. That is wrong if an item shadows the name
     /// (`type u8 = i32;`). Emit the result in the Leaker's type context: it fails to compile
     /// ("mismatched types") if a name is shadowed, and is empty if no primitive name was copied.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let mut leaker = Leaker::new();
+    /// leaker.intern_struct(&parse_quote!(struct S<const N: u8> { a: Rel }), true).unwrap();
+    /// // `u8` is copied as written, so `assertions()` checks that `u8` is the primitive type.
+    /// // Write the tokens next to the item, in the crate that defines it.
+    /// let assertions = leaker.assertions();
+    /// assert!(assertions.to_string().contains("__type_leak_assert_u8_is_primitive"));
+    ///
+    /// // No primitive name was copied here: there is nothing to check.
+    /// let mut leaker = Leaker::new();
+    /// leaker.intern_struct(&parse_quote!(struct S { a: Rel }), true).unwrap();
+    /// assert!(leaker.assertions().is_empty());
+    /// ```
     pub fn assertions(&self) -> TokenStream {
         if self.assumed_primitives.is_empty() {
             return TokenStream::new();
@@ -114,6 +130,23 @@ impl Leaker {
     /// written for the struct. Without it, such a type is split into parts, and that is an error
     /// where it cannot be ([Self rules](crate::rules#self-rules)). This is [`Leaker::enter_type()`] with
     /// the item visited.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemStruct = parse_quote!(struct S<T> { a: Wrap<T>, b: Rel<Self> });
+    ///
+    /// // `Rel<Self>` is an entry, which the Repeater impl writes for `S<T>`.
+    /// let mut leaker = Leaker::new();
+    /// let top_level = leaker.intern_struct(&item, true).unwrap();
+    /// let referrer = leaker.finish();
+    /// assert_eq!(referrer.iter().count(), 2);
+    /// assert!(matches!(referrer.context_self(top_level), Some(SelfRequirement::Type(_))));
+    ///
+    /// // Without `allow_self`, `Rel<Self>` is split into parts, and `Rel` cannot be leaked alone.
+    /// let err = Leaker::new().intern_struct(&item, false).unwrap_err();
+    /// assert_eq!(err.to_string(), "use absolute path: 'Rel < Self >'");
+    /// ```
     pub fn intern_struct(&mut self, item: &ItemStruct, allow_self: bool) -> Res<ContextId> {
         self.enter_type(&item.ident, &item.generics, allow_self, |view| {
             syn::visit::visit_item_struct(view, item)
@@ -124,6 +157,16 @@ impl Leaker {
     /// Analyzes an enum and returns its top-level context.
     ///
     /// It is [`Leaker::intern_struct()`] for an enum, with the same `Self` and `allow_self`.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemEnum = parse_quote!(enum E<T> { A(Wrap<T>), B { next: Option<Rel2<Self>> } });
+    /// let mut leaker = Leaker::new();
+    /// leaker.intern_enum(&item, true).unwrap();
+    /// // `Option` is a path of the prelude, which is not allowed here: it is leaked too.
+    /// assert_eq!(leaker.finish().iter().count(), 2);
+    /// ```
     pub fn intern_enum(&mut self, item: &ItemEnum, allow_self: bool) -> Res<ContextId> {
         self.enter_type(&item.ident, &item.generics, allow_self, |view| {
             syn::visit::visit_item_enum(view, item)
@@ -134,6 +177,20 @@ impl Leaker {
     /// Analyzes a union and returns its top-level context.
     ///
     /// It is [`Leaker::intern_struct()`] for a union, with the same `Self` and `allow_self`.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemUnion = parse_quote!(union U<T: ::core::marker::Copy> { a: Wrap<T>, b: Rel });
+    /// let mut leaker = Leaker::new();
+    /// leaker.intern_union(&item, true).unwrap();
+    /// assert_eq!(leaker.finish().iter().count(), 2);
+    ///
+    /// // A relative trait in a bound cannot be leaked: write it in full, or allow it
+    /// // (`LeakerConfig::allow_std_prelude()`).
+    /// let item: ItemUnion = parse_quote!(union U<T: Copy> { a: Wrap<T> });
+    /// assert!(Leaker::new().intern_union(&item, true).is_err());
+    /// ```
     pub fn intern_union(&mut self, item: &ItemUnion, allow_self: bool) -> Res<ContextId> {
         self.enter_type(&item.ident, &item.generics, allow_self, |view| {
             syn::visit::visit_item_union(view, item)
@@ -151,6 +208,29 @@ impl Leaker {
     /// The trait path must not depend on the context. An entry in the self type must not depend on
     /// `Self` through a bound of the generics ([Self rules](crate::rules#self-rules)). `allow_self` is as
     /// for [`Leaker::intern_struct()`]. This is [`Leaker::enter_impl()`] with the item visited.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemImpl = parse_quote! {
+    ///     impl<T> ::path::MyTrait<Rel<T>> for ::path::Host<T> {
+    ///         type Out = Wrap<T>;
+    ///         fn f(&self) -> Rel2 { Skipped::new() } // the body is not analyzed
+    ///         fn g(&self) -> Rel3<Self> { todo!() }
+    ///     }
+    /// };
+    /// let mut leaker = Leaker::new();
+    /// let top_level = leaker.intern_impl(&item, true).unwrap();
+    /// let referrer = leaker.finish();
+    /// // `Rel<T>`, `Wrap<T>`, `Rel2` and `Rel3<Self>` (`::path::Host<T>` names another crate: it is
+    /// // optional).
+    /// assert_eq!(referrer.required().count(), 4);
+    /// // `Rel3<Self>` names `Self`, which is the self type of the impl, as written.
+    /// match referrer.context_self(top_level) {
+    ///     Some(SelfRequirement::Type(ty)) => assert_eq!(*ty, parse_quote!(::path::Host<T>)),
+    ///     _ => unreachable!(),
+    /// }
+    /// ```
     pub fn intern_impl(&mut self, item: &ItemImpl, allow_self: bool) -> Res<ContextId> {
         // The scope checks the path of the trait, and the walk analyzes its arguments.
         let trait_path = item.trait_.as_ref().map(|(_, path, _)| path);
@@ -215,6 +295,33 @@ impl Leaker {
     /// module are copied with it, so they are not leaked. Nested modules get ids as in
     /// [`Leaker::enter_mod()`], and their paths are recorded ([`Referrer::module_path()`]). See
     /// [Modules](crate::rules#modules).
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemMod = parse_quote! {
+    ///     mod m {
+    ///         struct Local;
+    ///         struct S { a: Local, b: Outside }
+    ///         mod inner { struct T { c: Outside2 } }
+    ///     }
+    /// };
+    /// let mut leaker = Leaker::new();
+    /// let module = leaker.intern_mod(&item).unwrap();
+    /// let referrer = leaker.finish();
+    /// // `Local` is declared in the module, so it is copied with it. `Outside` and `Outside2` are
+    /// // not: their relative paths mean something only in the module they are written in.
+    /// assert_eq!(referrer.iter().count(), 2);
+    /// let path = |id| -> Vec<String> {
+    ///     referrer.module_path(id).unwrap().iter().map(|ident| ident.to_string()).collect()
+    /// };
+    /// // The path of a module is relative to the one analyzed: `[]` for `m`, `[inner]` for the other.
+    /// assert!(path(module).is_empty());
+    /// let modules: Vec<_> = (0..2).map(|ix| referrer.context_module(referrer.context(ix)).unwrap()).collect();
+    /// assert_eq!(path(modules[0]), Vec::<String>::new());
+    /// assert_eq!(path(modules[1]), ["inner"]);
+    /// // The Repeater impl of an entry is written in its module (`RepeaterImpl::module`).
+    /// ```
     pub fn intern_mod(&mut self, item: &ItemMod) -> Res<ContextId> {
         let names = match &item.content {
             Some((_, items)) => declared_names(items),
@@ -237,6 +344,23 @@ impl Leaker {
     /// counter, so they are unique, and equal calls give equal ids. `Self` has no meaning directly
     /// in `f`. Errors and rollback are as in [`Leaker::enter_generics()`]. See
     /// [Modules](crate::rules#modules).
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemStruct = parse_quote!(struct S { a: Local, b: Outside });
+    /// let mut leaker = Leaker::new();
+    /// // The module declares `S` and `Local`; `f` visits the item as one of its items.
+    /// let (module, ()) = leaker
+    ///     .enter_mod("my_module", [item.ident.clone(), parse_quote!(Local)], |view| {
+    ///         view.visit_item(&Item::Struct(item.clone()));
+    ///     })
+    ///     .unwrap();
+    /// let referrer = leaker.finish();
+    /// // Only `Outside` is an entry. The hint is for debugging.
+    /// assert_eq!(referrer.iter().count(), 1);
+    /// assert_eq!(referrer.module_hint(module), Some("my_module"));
+    /// ```
     pub fn enter_mod<R>(
         &mut self,
         hint: impl Display,
@@ -289,6 +413,24 @@ impl Leaker {
     /// in `f`. `Self` is `ident` with the parameters as arguments ([`SelfRequirement::Type`]).
     /// `allow_self` is as for [`Leaker::intern_struct()`]. Context, errors and rollback are as in
     /// [`Leaker::enter_generics()`], but `generics` may name `Self`.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// // Analyze two of the fields of a struct.
+    /// let item: ItemStruct = parse_quote!(struct S<T> { a: Wrap<T>, b: Rel<Self>, c: Skipped });
+    /// let mut leaker = Leaker::new();
+    /// let (top_level, ()) = leaker
+    ///     .enter_type(&item.ident, &item.generics, true, |view| {
+    ///         for field in item.fields.iter().take(2) {
+    ///             view.visit_type(&field.ty);
+    ///         }
+    ///     })
+    ///     .unwrap();
+    /// let referrer = leaker.finish();
+    /// assert_eq!(referrer.iter().count(), 2); // not `Skipped`
+    /// assert!(matches!(referrer.context_self(top_level), Some(SelfRequirement::Type(_))));
+    /// ```
     pub fn enter_type<R>(
         &mut self,
         ident: &Ident,
@@ -346,6 +488,27 @@ impl Leaker {
     /// The items of the trait are not known here. So a projection that names a generic associated
     /// type of the trait gets none of its outlives bounds: use [`Leaker::intern_trait()`], or
     /// write the bound.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// use syn::visit::Visit;
+    /// // Analyze one method of a trait: the signature, with the generics of the trait.
+    /// let item: ItemTrait = parse_quote! {
+    ///     trait Tr<T> { fn f(&self, t: T) -> Wrap<T>; fn g(&self) -> Skipped; }
+    /// };
+    /// let mut leaker = Leaker::new();
+    /// let (top_level, ()) = leaker
+    ///     .enter_trait(&item.ident, &item.generics, true, |view| {
+    ///         if let TraitItem::Fn(method) = &item.items[0] {
+    ///             view.visit_signature(&method.sig);
+    ///         }
+    ///     })
+    ///     .unwrap();
+    /// let referrer = leaker.finish();
+    /// assert_eq!(referrer.iter().count(), 1); // `Wrap<T>`
+    /// assert!(matches!(referrer.context_self(top_level), None | Some(SelfRequirement::Bound(_))));
+    /// ```
     pub fn enter_trait<R>(
         &mut self,
         ident: &Ident,
@@ -364,6 +527,21 @@ impl Leaker {
     /// optional entries are numbered last, in the order of the entries. The Referrer keeps the ids
     /// the scopes returned: the top-level contexts, the contexts of the entries, and their modules
     /// with their parents. It calls [`Leaker::reduce_roots()`] if needed.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemTrait = parse_quote!(trait Tr { fn f(&self) -> ::foo::X; fn g(&self) -> Rel; });
+    /// let mut leaker = Leaker::new();
+    /// leaker.intern_trait(&item, true).unwrap();
+    /// let referrer = leaker.finish();
+    /// // `Rel` is required: every copy replaces it. `::foo::X` is optional: it names another
+    /// // crate, which a copy may have or not (`Referrer::allow_ambiguous_crate_name()`).
+    /// // The required entries come first.
+    /// let entries: Vec<&Type> = referrer.iter().collect();
+    /// assert_eq!(entries, [&parse_quote!(Rel), &parse_quote!(::foo::X)]);
+    /// assert!(referrer.must(0) && !referrer.must(1));
+    /// ```
     pub fn finish(mut self) -> Referrer {
         self.reduce_roots();
         let (required, optional) = self.reachable_types.take().unwrap_or_default();

@@ -129,6 +129,29 @@ impl Scope {
 
 /// What `Self` means in a context (`Referrer::context_self()`). The Repeater impl of an entry that
 /// names `Self` is written for the type described here. See [Self rules](crate::rules#self-rules).
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let mut leaker = Leaker::new();
+/// let in_struct = leaker
+///     .intern_struct(&parse_quote!(struct S<T> { a: Rel<Self> }), true)
+///     .unwrap();
+/// let in_trait = leaker
+///     .intern_trait(&parse_quote!(trait Tr<T> { fn f(&self) -> Rel<Self>; }), true)
+///     .unwrap();
+/// let referrer = leaker.finish();
+/// // In a struct, `Self` is the struct with its own generics as arguments.
+/// match referrer.context_self(in_struct) {
+///     Some(SelfRequirement::Type(ty)) => assert_eq!(*ty, parse_quote!(S<T>)),
+///     _ => unreachable!(),
+/// }
+/// // In a trait, `Self` is any type that implements the trait.
+/// match referrer.context_self(in_trait) {
+///     Some(SelfRequirement::Bound(path)) => assert_eq!(*path, parse_quote!(Tr<T>)),
+///     _ => unreachable!(),
+/// }
+/// ```
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum SelfRequirement {
@@ -952,17 +975,34 @@ impl std::hash::Hash for Context {
     }
 }
 
-/// Names a [context](crate::rules#contexts), as [`Referrer::context()`](crate::Referrer::context) returns
-/// it for an entry.
+/// Identifies a [context](crate::rules#contexts): what gives a leaked type its meaning, which is
+/// the generics it uses, what `Self` is, and the module it is written in.
 ///
-/// A scope returns the id of its top-level context. Ids count from 0 in order of first appearance
-/// and are never renumbered, so the Referrer may skip some. Entries with the same generics, `Self`
-/// and module share an id. `ToTokens` writes it as an integer literal, and `Parse` reads one with
-/// or without `usize`.
+/// Every analysis method of the [`Leaker`](crate::Leaker) returns the id of the top-level context
+/// of what it analyzed (keep it: [`Referrer::visitor()`](crate::Referrer::visitor) needs it), and
+/// [`Referrer::context()`](crate::Referrer::context) returns the id of the context of an entry.
+/// Ids count from 0 in order of first appearance and are never renumbered, so the Referrer may
+/// skip some. Entries with the same generics, `Self` and module share an id. `ToTokens` writes it
+/// as an integer literal, and `Parse` reads one with or without `usize`.
 ///
 /// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let item: ItemStruct = parse_quote!(struct S<T> { a: Wrap<T>, b: Rel });
+/// let mut leaker = Leaker::new();
+/// let top_level = leaker.intern_struct(&item, true).unwrap();
+/// let referrer = leaker.finish();
+/// // `Wrap<T>` uses the generics of the struct, as the top-level context has them.
+/// // `Rel` uses no generic, so its context is another one.
+/// let wrap = referrer.iter().position(|ty| *ty == parse_quote!(Wrap<T>)).unwrap();
+/// let rel = referrer.iter().position(|ty| *ty == parse_quote!(Rel)).unwrap();
+/// assert_eq!(referrer.context(wrap), top_level);
+/// assert_ne!(referrer.context(rel), top_level);
+///
+/// // It is written as an integer literal, so it travels with the Referrer in a macro call.
 /// # use template_quote::ToTokens;
-/// let id: type_leak::ContextId = type_leak::syn::parse_str("3usize").unwrap();
+/// let id: ContextId = parse_str("3usize").unwrap();
+/// assert_eq!(id.index(), 3);
 /// assert_eq!(id.to_token_stream().to_string(), "3");
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

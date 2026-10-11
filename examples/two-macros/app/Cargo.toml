@@ -1,0 +1,13 @@
+[package]
+name = "app"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Crate B of the two-macro example of type-leak: it implements the trait of `repo`"
+
+[lib]
+path = "lib.rs"
+
+# `repo` re-exports its macros: this crate needs no other dependency.
+[dependencies]
+repo = { path = "../repo" }

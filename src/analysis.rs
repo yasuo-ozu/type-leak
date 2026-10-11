@@ -27,6 +27,31 @@ use template_quote::quote;
 /// `Self` where it has no meaning (in a module, or in generics that no struct, enum, union, impl or
 /// trait encloses) is an `impossible` cause, with the mention of `Self` as written and a `note`.
 /// A scope fails on it, so it can be neither leaked nor copied. See [Self rules](crate::rules#self-rules).
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let mut leaker = Leaker::new();
+/// let (_, results) = leaker
+///     .enter_generics(&Generics::default(), |view| {
+///         [
+///             view.check(&parse_quote!(::core::option::Option<::core::primitive::u8>)),
+///             view.check(&parse_quote!(Rel)),            // a relative path
+///             view.check(&parse_quote!(impl ::path::Trait)), // cannot be leaked
+///             view.check(&parse_quote!(Rel<'_>)),        // must be leaked, and cannot be
+///         ]
+///     })
+///     .unwrap();
+/// // Nothing depends on the context in `Option<u8>` of the standard library: copy it as it is.
+/// assert!(results[0].must.is_empty() && results[0].impossible.is_empty());
+/// // Leak `Rel`: `is_own` says that it is the path of the type itself.
+/// assert_eq!(results[1].must.len(), 1);
+/// assert!(results[1].is_own);
+/// // `impl Trait` can be neither leaked nor needs to be.
+/// assert!(results[2].must.is_empty() && !results[2].impossible.is_empty());
+/// // `Rel<'_>` is a conflict: the macro reports it (`NotInternableError` does).
+/// assert!(!results[3].must.is_empty() && !results[3].impossible.is_empty());
+/// ```
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct CheckResult {

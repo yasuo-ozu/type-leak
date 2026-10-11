@@ -30,13 +30,13 @@ A name in Rust means something only where it is written. If a macro copies `fn g
                                             +-- the path resolves through the impl
 ```
 
-- **Leaker**: the item whose types are copied, and the `Leaker` value that analyzes it.
-- **Referrer**: the result of `Leaker::finish()`. It holds the *entries* and travels to crate B as tokens, where it rewrites copies.
-- **Leaked type**: a type whose meaning depends on where it is written: a relative path (`MyType`), `Self`, or a type that uses a generic of the item (`MyWrap<T>`). An *entry* is a leaked type with its own Repeater impl. The Leaker keeps as few as it can: if `Rel` is an entry, `Vec<Rel>` needs none.
-- **Repeater**: the one trait both crates see. `impl Repeater<ARGS, ID, NTH> for .. { type Type = ..; }` turns the index `NTH` of an entry back into its type. `ID` identifies the Leaker (use a number that is unique for each analyzed item, such as a hash of its path), and `ARGS` encodes the generics the entry uses.
+- **Leaker**: the `Leaker` value that analyzes the item, in crate A.
+- **Leaked type**: a type whose meaning depends on where it is written: a relative path (`MyType`), `Self`, or a type that uses a generic of the item (`MyWrap<T>`). An *entry* is a leaked type with its own Repeater impl. The Leaker keeps as few as it can: if `Rel` is an entry, `Vec<(Rel,)>` needs none (but `Vec<Rel>` does: a bare `Rel` may be a const, see [Bare identifiers]).
+- **Referrer**: the result of `Leaker::finish()`. It holds the entries and travels to crate B as tokens, where it rewrites copies.
+- **Repeater**: the one trait both crates see. `impl Repeater<ARGS, ID, NTH> for .. { type Type = ..; }` turns the index `NTH` of an entry back into its type. `ID` identifies the Leaker: a number that is unique for each analyzed item (a proc macro does not know the path of the item, so hash the name of its crate and of the item), and `ARGS` encodes the generics the entry uses.
 - **Context**: what gives an entry its meaning: the generics it uses, what `Self` is, the module. A `ContextId` names one. The id returned for an item is its *top-level* context.
 
-Define the Repeater once in your crate (`repeater_definition()` generates it):
+Define the Repeater once, at the root of crate A (the crate that writes the impls). Crate A implements it for any `Self`, which the orphan rule (E0210) allows only for a trait of the crate itself: so it is not in the crate of your proc macros, which can export only macros, and not in a third crate. The simplest definition works if the const parameters are `usize` or `u64` (`repeater_definition()` generates one with slots for any primitive type):
 
 ```rust,ignore
 pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> { type Type: ?Sized; }
@@ -88,7 +88,9 @@ let expected: ItemImpl = parse_quote! {
 assert_eq!(impls[0], expected);
 
 // 3. Copy `f` into `impl MyLeaker<u8> for ..`. Each leaked type becomes a path through the
-// Repeater. `top_level` tells the visitor the generics, `Self` and module of the copy.
+// Repeater, with the generics of the type as this impl gives them (`site`). `top_level` tells the
+// visitor the generics, `Self` and module of the copy. The visitor replaces leaked types only: the
+// rest of the signature (`t: T`) is yours to write for `u8`.
 let trait_args: Vec<GenericArgument> = vec![parse_quote!(u8)];
 let site = UseSite::substituting(&item.generics.params, &trait_args);
 let mut sig: Signature = parse_quote!(fn f(&self, t: T) -> MyWrap<T>);
@@ -104,18 +106,27 @@ let expected: Signature =
 assert_eq!(sig, expected);
 ```
 
-In a real macro, `Referrer` and `ContextId` convert to and from tokens (`ToTokens`, `Parse`). Crate A writes `#referrer, #top_level` into the call of crate B's macro, and crate B parses them back. Both crates must use the same version of `type-leak`.
+In a real macro, `Referrer` and `ContextId` convert to and from tokens (`ToTokens`, `Parse`). Both crates must use the same version of `type-leak`.
+
+# Two macros, end to end
+
+[`examples/two-macros`](https://github.com/yasuo-ozu/type-leak/tree/main/examples/two-macros) is a complete setup, built and tested with this crate: `#[export_trait]` in crate A analyzes a trait (a type in a sibling module, a generic wrapper, `Self`) and `#[forward(..)]` in crate B implements it for a wrapper. What the quick start does not show:
+
+- **Crate A cannot call crate B's macro**: it does not know B's input. So `#[export_trait]` writes a `macro_rules!` that B calls. It adds `$crate::Repeater`, the id, `#referrer`, `#top_level` and the item to B's input, and calls a proc macro that parses them back.
+- **Emit the impls of all the entries** (`0..referrer.iter().count()`), not only of `required()`. Crate B may use a strict Referrer, which replaces the optional entries too, and the flag is not serialized.
+- **The copy is yours to write**: the visitor replaces leaked types only. For `impl MyTrait<u8> for ..`, write `u8` for `T` in the rest of the signature yourself.
+- **Report each error at its span** with `NotInternableError::items()`. `cargo check --features bad` in the `repo` crate shows it.
 
 # Common tasks
 
 Each item named here has examples in the [API docs](https://docs.rs/type-leak/latest/type_leak/).
 
-- **Analyze an item.** [`Leaker::intern_struct`][intern] (also `intern_enum`, `intern_union`, `intern_impl`, `intern_trait`) takes `(&item, allow_self)`, and `intern_mod` takes the module. It returns the top-level `ContextId` or a `NotInternableError`. Keep the id: `Referrer::visitor()` needs it. With `allow_self = false`, a type that names `Self` is split into parts instead of leaked whole: use it if your Repeater impls are for a marker type, which cannot name `Self` ([Self rules]).
+- **Analyze an item.** [`Leaker::intern_struct`][intern] (also `intern_enum`, `intern_union`, `intern_impl`, `intern_trait`) takes `(&item, allow_self)`, and `intern_mod` takes the module (see `Referrer::module_path()` for the nested modules). It returns the top-level `ContextId` or a `NotInternableError`. Keep the id: `Referrer::visitor()` needs it. With `allow_self = false`, a type that names `Self` is split into parts instead of leaked whole: use it if your Repeater impls are for a marker type, which cannot name `Self` ([Self rules]).
 - **Analyze part of an item.** [`Leaker::enter_impl`][enter] (also `enter_generics`, `enter_type`, `enter_trait`, `enter_mod`) runs a closure on a `View` of a scope whose generics and `Self` you declare: `view.visit_type(..)`, `visit_path_arguments(..)`, `visit_where_clause(..)`. A scope that fails forgets what it found, and the scope around it can go on ([Scopes]).
-- **Emit the Repeater impls.** For each of `Referrer::required()`, [`Referrer::repeater_impl`][impl] gives the generics, the type, the first trait argument and the module of the impl. `ImplSelf::Param` writes it for any implementor (or for `Self`), `ImplSelf::Marker` for a marker type. `Referrer::is_plain(ix)` is true if `impl Repeater<(), ID, IX> for Marker` is enough. A const parameter that is not `usize` needs `repeater_definition()` and `RepeaterSlots` ([Const generics]).
-- **Rewrite a copy.** [`Referrer::visitor`][visitor] returns a `VisitMut` for the copy. Get the arguments of each path from `Referrer::entry_args(ix, &UseSite)`: `UseSite::identity()` where the copy declares the generics of the item itself, `UseSite::substituting(..)` for `impl MyLeaker<u8> for ..`. Visit a whole item or signature, not a type cut out of another. Omitted defaults of the trait's parameters: `Referrer::complete_args()`. Repeater impls for a marker type: `Visitor::with_self()`. If the copy declares the generics with other bounds, call `Visitor::with_outermost_generics_as_leakers()` ([Contexts]).
+- **Emit the Repeater impls.** For each entry (`Referrer::iter()`; `required()` is the minimum for a non-strict Referrer), [`Referrer::repeater_impl`][impl] gives the generics, the type, the first trait argument and the module of the impl (write it in that module). `ImplSelf::Param` writes it for any implementor (or for `Self`), `ImplSelf::Marker` for a marker type. `Referrer::is_plain(ix)` is true if `impl Repeater<(), ID, IX> for Marker` is enough. A const parameter that is not `usize` needs `repeater_definition()` and `RepeaterSlots` ([Const generics]).
+- **Rewrite a copy.** [`Referrer::visitor`][visitor] returns a `VisitMut` for the copy. Get the arguments of each path from `Referrer::entry_args(ix, &UseSite)`: `UseSite::identity()` where the copy declares the generics of the item itself, `UseSite::substituting(..)` for `impl MyLeaker<u8> for ..`. Visit a whole item or signature, not a type cut out of another. Omitted defaults of the trait's parameters: `Referrer::complete_args()`. Repeater impls for a marker type: `Visitor::with_self()`. Copying a module with structs that name their own `Self`: `Visitor::with_nested_self()`. If the copy declares the generics with other bounds, call `Visitor::with_outermost_generics_as_leakers()` ([Contexts]).
 - **Report errors.** [`NotInternableError::items`][items] gives one `ErrorItem` (span, message, notes) per offending path. The error also converts into a `syn::Error`, and its `ToTokens` writes `compile_error!` (or nightly diagnostics).
-- **Configure.** [`LeakerConfig`][config] lists paths that are not leaked: `allow_primitive()`, `allow_std_prelude()`, your own crates. `Referrer::allow_ambiguous_crate_name(false)` makes the Referrer strict about absolute paths of other crates ([External crates]).
+- **Configure.** [`LeakerConfig`][config] lists paths that are not leaked: `allow_primitive()`, `allow_std_prelude()` (without it, `trait Tr: Clone` is an error), your own crates. `Referrer::allow_ambiguous_crate_name(false)` makes the Referrer strict about absolute paths of other crates ([External crates]).
 
 # Errors and how to fix them
 
@@ -123,7 +134,7 @@ The Leaker returns the first group itself. The `rustc` errors come from the gene
 
 | Message or error | Fix | Rule |
 | --- | --- | --- |
-| `use absolute path: 'MyType'` | Write the path in full: `::my_crate::MyType`, `::std::vec::Vec`. The notes say why. | [Contexts] |
+| `use absolute path: 'Clone'` | A relative path that cannot be leaked (a trait in a bound, `MyType<'_>`, `impl Trait`): write it in full, `::core::clone::Clone`, or allow it. The notes say why. | [Contexts] |
 | `` `Self` has no meaning here `` | Enter a scope that declares `Self` (`enter_type`, `enter_impl`, `enter_trait`). | [Self rules] |
 | `` `Self::A` cannot be written in the impl of the Repeater `` | Name the trait: `<Self as ::path::Trait>::A`. | [Self rules] |
 | `` the bound of `T` mentions a `Self` which has no name here `` | Write the bound without `Self`, or the type with an absolute path. | [Self rules] |
@@ -187,7 +198,7 @@ cargo +1.56 build --lib
 
 # Application
 
-[sumtype](https://crates.io/crates/sumtype), [flat_enum](https://crates.io/crates/flat_enum), [parametrized](https://crates.io/crates/parametrized)
+Proc-macro crates that use `type-leak`: [sumtype](https://crates.io/crates/sumtype), [flat_enum](https://crates.io/crates/flat_enum), [parametrized](https://crates.io/crates/parametrized).
 
 [rules]: https://docs.rs/type-leak/latest/type_leak/rules/index.html
 [Contexts]: https://docs.rs/type-leak/latest/type_leak/rules/index.html#contexts

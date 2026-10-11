@@ -1,0 +1,16 @@
+[package]
+name = "repo-macros"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "The proc macros of the two-macro example of type-leak"
+
+[lib]
+path = "lib.rs"
+proc-macro = true
+
+[dependencies]
+type-leak = { path = "../../.." }
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "visit-mut"] }

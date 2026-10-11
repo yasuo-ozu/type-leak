@@ -1,0 +1,16 @@
+[package]
+name = "repo"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Crate A of the two-macro example of type-leak: it defines a trait and exports it"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+repo-macros = { path = "../macros" }
+
+[features]
+# Adds a trait that cannot be exported, to see the errors of `#[export_trait]`.
+bad = []

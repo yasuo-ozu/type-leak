@@ -1,0 +1,6 @@
+# The two-macro setup of `type-leak`, end to end: `repo` defines a trait and exports it with
+# `#[export_trait]`, and `app` implements it for a wrapper with `#[forward(..)]`. Both macros are in
+# `repo-macros`. `tests/two_macros.rs` builds and tests this workspace.
+[workspace]
+members = ["macros", "repo", "app"]
+resolver = "2"

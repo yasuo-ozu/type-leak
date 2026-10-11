@@ -55,6 +55,24 @@ impl LeakerConfig {
     }
 
     /// Allows the names of the standard prelude (`Vec`, `Option`, `Clone`, ...).
+    ///
+    /// Without it, a relative `Clone` in `trait Tr: Clone` is an error, and `Vec<T>` is leaked
+    /// whole. You promise that the copy does not shadow the names.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemTrait = parse_quote!(trait Tr: Clone { fn f(&self) -> Vec<Rel>; });
+    /// assert!(Leaker::new().intern_trait(&item, true).is_err());
+    ///
+    /// let mut config = LeakerConfig::new();
+    /// config.allow_std_prelude();
+    /// let mut leaker = Leaker::from_config(config);
+    /// leaker.intern_trait(&item, true).unwrap();
+    /// // `Clone` and `Vec` are left as written. The only entry is `Vec<Rel>`: a bare `Rel` may be
+    /// // a const, so the type that holds it is leaked whole.
+    /// assert_eq!(leaker.finish().iter().count(), 1);
+    /// ```
     pub fn allow_std_prelude(&mut self) -> &mut Self {
         self.allowed_paths.extend([
             parse_quote!(Box),
@@ -93,6 +111,25 @@ impl LeakerConfig {
     }
 
     /// Allows paths that start with `crate`.
+    ///
+    /// Use it only if the copy is in the same crate as the item: `crate::Foo` names another type
+    /// in another crate.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemStruct = parse_quote!(struct S { a: crate::Foo });
+    /// // `crate::Foo` is leaked by default...
+    /// let mut leaker = Leaker::new();
+    /// leaker.intern_struct(&item, true).unwrap();
+    /// assert_eq!(leaker.finish().iter().count(), 1);
+    /// // ...and left as written if the copy is in the same crate.
+    /// let mut config = LeakerConfig::new();
+    /// config.allow_crate();
+    /// let mut leaker = Leaker::from_config(config);
+    /// leaker.intern_struct(&item, true).unwrap();
+    /// assert!(leaker.finish().is_empty());
+    /// ```
     pub fn allow_crate(&mut self) -> &mut Self {
         self.allowed_paths.push(parse_quote!(crate));
         self

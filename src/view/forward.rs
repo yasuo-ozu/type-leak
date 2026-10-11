@@ -32,11 +32,41 @@ impl View<'_> {
     /// which may be interned whatever `allow_self` the scope around has. The copy's
     /// [`Visitor`](crate::Visitor) finds the entries that name it with
     /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self).
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let mut leaker = Leaker::new();
+    /// leaker
+    ///     .enter_generics(&parse_quote!(<T>), |view| {
+    ///         // `T` is a generic of the scope, and `U` is local to the struct. Each type is an
+    ///         // entry with the generics it uses.
+    ///         view.visit_item(&parse_quote!(struct Inner<U> { a: Rel<U>, b: Wrap<T> }));
+    ///     })
+    ///     .unwrap();
+    /// let referrer = leaker.finish();
+    /// assert_eq!(referrer.iter().count(), 2);
+    /// assert_eq!(referrer.generics(0).params.len(), 1);
+    /// assert_eq!(referrer.generics(1).params.len(), 1);
+    /// ```
     pub fn visit_item(&mut self, item: &Item) {
         Visit::visit_item(&mut *self.visitor, item)
     }
 
     /// Analyzes a type, with the generics, `Self` and module of the scope.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let mut leaker = Leaker::new();
+    /// leaker
+    ///     .enter_generics(&parse_quote!(<T>), |view| {
+    ///         view.visit_type(&parse_quote!(::core::option::Option<Wrap<T>>));
+    ///     })
+    ///     .unwrap();
+    /// // `Option<..>` is a path of the standard library, which is the same in every crate.
+    /// assert_eq!(leaker.finish().iter().collect::<Vec<_>>(), [&parse_quote!(Wrap<T>)]);
+    /// ```
     pub fn visit_type(&mut self, ty: &Type) {
         Visit::visit_type(&mut *self.visitor, ty)
     }
@@ -61,10 +91,9 @@ impl View<'_> {
     }
 }
 
-/// Forwards only the methods the analysis overrides, so walking the view walks the analysis.
-///
-/// The default walk of the other methods reaches the forwarded ones through the view. The test
-/// below keeps this list in sync with the overrides of the analysis.
+// Forwards only the methods the analysis overrides, so walking the view walks the analysis. The
+// default walk of the other methods reaches the forwarded ones through the view. The test below
+// keeps this list in sync with the overrides of the analysis.
 impl<'ast> Visit<'ast> for View<'_> {
     forward! {
         visit_angle_bracketed_generic_arguments: AngleBracketedGenericArguments,

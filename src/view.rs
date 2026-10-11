@@ -61,6 +61,32 @@ mod forward;
 ///     .unwrap();
 /// assert_eq!(leaker.finish().iter().count(), 3);
 /// ```
+///
+/// Each `visit_*` method analyzes one kind of syntax, with the generics, `Self` and module of the
+/// scope:
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let mut generics: Generics = parse_quote!(<T: ::p::Bound<Rel1>>);
+/// generics.where_clause = Some(parse_quote!(where T: ::p::Other<Rel2>));
+/// let mut leaker = Leaker::new();
+/// leaker
+///     .enter_generics(&generics, |view| {
+///         view.visit_type(&parse_quote!(Wrap<T>)); // a type
+///         let arguments = PathArguments::AngleBracketed(parse_quote!(<Rel3>));
+///         view.visit_path_arguments(&arguments); // the arguments of a path resolved elsewhere
+///         if let Some(GenericParam::Type(param)) = generics.params.first() {
+///             for bound in &param.bounds {
+///                 view.visit_type_param_bound(bound); // a bound
+///             }
+///         }
+///         view.visit_where_clause(generics.where_clause.as_ref().unwrap()); // a where clause
+///     })
+///     .unwrap();
+/// // `Wrap<T>`, `Rel3`, `Rel1` and `Rel2`.
+/// assert_eq!(leaker.finish().iter().count(), 4);
+/// ```
 pub struct View<'v> {
     visitor: &'v mut AnalyzeVisitor,
 }
@@ -98,7 +124,8 @@ impl<'v> View<'v> {
         self.visitor.check(ty)
     }
 
-    /// Like [`Leaker::enter_mod()`](crate::Leaker::enter_mod), nested in the module around if any.
+    /// Opens a module scope inside this one, like [`Leaker::enter_mod()`](crate::Leaker::enter_mod),
+    /// nested in the module around if any.
     pub fn enter_mod<R>(
         &mut self,
         hint: impl Display,
@@ -108,7 +135,9 @@ impl<'v> View<'v> {
         Scopes::enter_mod(self, hint, declared, f)
     }
 
-    /// Like [`Leaker::enter_generics()`](crate::Leaker::enter_generics), with local generics.
+    /// Opens a scope that declares more generics, like
+    /// [`Leaker::enter_generics()`](crate::Leaker::enter_generics). The generics around stay in
+    /// scope, and these are local.
     pub fn enter_generics<R>(
         &mut self,
         generics: &Generics,
@@ -117,7 +146,8 @@ impl<'v> View<'v> {
         Scopes::enter_generics(self, generics, f)
     }
 
-    /// Like [`Leaker::enter_type()`](crate::Leaker::enter_type).
+    /// Opens a scope for the parts of a struct, an enum or a union inside this one, like
+    /// [`Leaker::enter_type()`](crate::Leaker::enter_type). The generics around stay in scope.
     pub fn enter_type<R>(
         &mut self,
         ident: &Ident,
@@ -128,7 +158,8 @@ impl<'v> View<'v> {
         Scopes::enter_type(self, ident, generics, allow_self, f)
     }
 
-    /// Like [`Leaker::enter_impl()`](crate::Leaker::enter_impl).
+    /// Opens a scope for the parts of an impl inside this one, like
+    /// [`Leaker::enter_impl()`](crate::Leaker::enter_impl). The generics around stay in scope.
     pub fn enter_impl<R>(
         &mut self,
         generics: &Generics,
@@ -139,7 +170,8 @@ impl<'v> View<'v> {
         Scopes::enter_impl(self, generics, self_ty, allow_self, f)
     }
 
-    /// Like [`Leaker::enter_trait()`](crate::Leaker::enter_trait).
+    /// Opens a scope for the parts of a trait inside this one, like
+    /// [`Leaker::enter_trait()`](crate::Leaker::enter_trait). The generics around stay in scope.
     pub fn enter_trait<R>(
         &mut self,
         ident: &Ident,
