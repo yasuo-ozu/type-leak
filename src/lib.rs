@@ -1,4 +1,6 @@
 #![doc = include_str!("../README.md")]
+#![doc(html_logo_url = "https://raw.githubusercontent.com/yasuo-ozu/type-leak/main/logo.png")]
+#![doc(html_favicon_url = "https://raw.githubusercontent.com/yasuo-ozu/type-leak/main/logo.png")]
 #![cfg_attr(type_leak_diagnostic, feature(proc_macro_diagnostic))]
 
 #[cfg(type_leak_diagnostic)]
