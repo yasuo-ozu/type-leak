@@ -160,6 +160,18 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9061!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9062!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9063!(path = ::type_leak_test_leaker::kinds);
+    // Items nested in a module whose generics have a bound that names their own `Self`: the copy
+    // has the bound for its own type. 9115 names `Self` in a field too, and expands to nothing.
+    type_leak_test_leaker::__tl_prop_9111!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9112!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9113!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9114!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9115!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9116!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9117!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9118!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9119!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9120!(path = ::type_leak_test_leaker::kinds);
     // The scopes that share names: every entry has the generics of its own scope.
     type_leak_test_leaker::__tl_prop_9071!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9072!(path = ::type_leak_test_leaker::kinds);

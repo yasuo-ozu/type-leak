@@ -78,11 +78,13 @@ pub enum NotInternableError {
     ///   in the default of a parameter, and names `Self`".
     /// - A type that uses a generic whose bound mentions a `Self` that cannot be leaked. The
     ///   headline is "`Wrap<T>` has a generic whose bound mentions `Self`, which cannot be
-    ///   leaked". That is the `Self` that `allow_self = false` denies, and the `Self` of a
+    ///   leaked". That is the `Self` that `allow_self = false` denies. It is also the `Self` of a
     ///   struct, an enum or a union that [`View::visit_item()`](crate::View::visit_item) visits,
-    ///   in a bound that the environment proves (`T: AsRef<Self>`): the copy declares a type of
-    ///   its own, so the bound holds for that, and the Repeater's impl of the type needs it for
-    ///   the Leaker's. Analyze such an item with its own `intern_*` call.
+    ///   for a type that names it too (`Wrap<Self, T>` with `T: AsRef<Self>`): the Repeater's impl
+    ///   of the type is for the Leaker's own type, and the copy declares a type of its own, which
+    ///   has the bound for itself. A type that does not name it (`Wrap<T>`) is fine: its impl is
+    ///   for any type that the bound holds for ([`SelfRequirement::Any`](crate::SelfRequirement)).
+    ///   Write the type without `Self`, or analyze the item with its own `intern_*` call.
     /// - A type in a bound or where predicate that the copy cannot write through the Repeater,
     ///   because rustc cannot prove a bound of its generics that names a leaked type
     ///   ([Bounds that name leaked types](crate::Leaker#bounds-that-name-leaked-types)). The

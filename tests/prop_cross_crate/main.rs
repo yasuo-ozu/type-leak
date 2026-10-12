@@ -131,8 +131,9 @@
 //!   `impl_trait_args` (F27), `hidden_lifetimes` (F28), `projection_outlives` (F30),
 //!   `item_predicate_cycle` (F33), `self_projection_outlives` (F34), `gat_where_clause` (F35),
 //!   `nested_self` (F36: a struct, an enum, a union or a trait analyzed nested in `enter_mod` that
-//!   names its own `Self`, which the Visitor writes with `with_nested_self()`; F37: one whose bound
-//!   of a generic names that `Self` is rejected),
+//!   names its own `Self`, which the Visitor writes with `with_nested_self()`; F37: an entry that
+//!   does not name it, and uses a generic whose bound does, is for any type, and the macro passes
+//!   the copy's own type; one that names it too is rejected),
 //!   `path_named_like_generic` (`self::U` next to a generic `U`), `declared_named_like_generic` (a
 //!   module that declares `X`, and `crate::base::B1<X>` in `fn f<X>`) and
 //!   `bare_const_in_absolute_path` (a bare `ILEN` next to a leaked argument in a

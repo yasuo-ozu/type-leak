@@ -431,12 +431,14 @@ fn check_impl_pieces(
         Some(SelfRequirement::Type(_)) => (),
         _ => match implementor_param(&mut got) {
             Some(GenericParam::Type(t)) if t.ident == *self_param => {
-                let bounded_by_trait = matches!(
-                    referrer.context_self(context),
-                    Some(SelfRequirement::Bound(_))
-                );
-                // `?Sized`, and the trait of a `Self` that is bound by it.
-                if t.bounds.len() != 1 + usize::from(bounded_by_trait) {
+                // `?Sized`, and the trait of a `Self` that is bound by it. Any type that the
+                // bounds hold for is a `Sized` one (a struct, an enum or a union): no bound.
+                let expected = match referrer.context_self(context) {
+                    Some(SelfRequirement::Bound(_)) => 2,
+                    Some(SelfRequirement::Any) => 0,
+                    _ => 1,
+                };
+                if t.bounds.len() != expected {
                     return Err(helpers_disagree(format!(
                         "the parameter of the implementor of the entry {} has the bounds `{}`",
                         ix,
@@ -1199,7 +1201,13 @@ impl Projector<'_> {
     /// cannot name as `Self`: a struct, an enum or a union is `base::<modules>::Name<args>`, and a
     /// trait is the host. An impl would need its self type written out in the Leaker's crate,
     /// which the generator does not make.
+    ///
+    /// An entry whose type does not name `Self`, and whose bounds do (`SelfRequirement::Any`), has
+    /// an impl for any type that the bounds hold for: the copy passes its own type, `Self`.
     fn project_nested(&self, nested: &NestedSelf, base: &Path, ix: usize) -> Result<Type> {
+        if let Some(SelfRequirement::Any) = self.referrer.context_self(self.referrer.context(ix)) {
+            return self.project_with(ix, parse_quote!(Self));
+        }
         let self_ty: Type = match &nested.requirement {
             SelfRequirement::Bound(_) => self
                 .bound_self

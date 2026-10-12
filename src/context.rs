@@ -155,7 +155,7 @@ impl Scope {
 /// }
 /// ```
 ///
-/// The two forms of impl, for `Rel<Self>`:
+/// The three forms of impl, for `Rel<Self>`, and for `Rel<T>` with `T: AsRef<Self>`:
 ///
 /// ```ignore
 /// // `Rel<Self>` in `trait MyLeaker<T, U>`: for the implementors of the trait
@@ -165,6 +165,11 @@ impl Scope {
 /// // `Rel<Self>` in `struct MyStruct<T>`: for the type
 /// impl<T> path::Repeater<(T,), 42, 3> for MyStruct<T> {
 ///     type Type = path::Rel<Self>;
+/// }
+/// // `Rel<T>` in `struct MyStruct<T: AsRef<Self>>` nested in a module: for any type that the
+/// // bound holds for, which the copy's own `MyStruct<T>` is
+/// impl<T: AsRef<__S>, __S> path::Repeater<(T,), 42, 4> for __S {
+///     type Type = path::Rel<T>;
 /// }
 /// ```
 #[derive(Clone, Debug)]
@@ -181,6 +186,25 @@ pub enum SelfRequirement {
     Bound(Path),
     /// `Self` is this type: a struct, enum, union or the self type of an impl, e.g. `MyStruct<T>`.
     Type(Type),
+    /// `Self` is any type that the bounds of the generics hold for, and the type of the entry
+    /// does not name it. Only the bounds do: `Rel<T>` with `T: AsRef<Self>`.
+    ///
+    /// It is the context of such an entry of a struct, an enum or a union nested in the analyzed
+    /// syntax ([`View::visit_item()`](crate::View::visit_item), the items of
+    /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod)). The copy declares a type of its own
+    /// there, with the same bound for it (`T: AsRef<Self>`, the copy's `MyStruct<T>`), so the
+    /// copy writes the path through the Repeater with its own type as the implementor
+    /// (`<Self as Repeater<..>>::Type`), and not with the Leaker's, which has not the bound.
+    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self) says when.
+    ///
+    /// In the impl, `Self` is a type parameter (`__S`) that replaces `Self` in the bounds, as
+    /// [`Referrer::repeater_impl()`](crate::Referrer::repeater_impl) does with
+    /// [`ImplSelf::Param`](crate::ImplSelf::Param), and it has no bound of its own. In particular
+    /// it is `Sized`, as the `Self` of a struct, an enum or a union is, and the bounds may need it
+    /// (`(Self, u8)`, `Vec<Self>`); a struct with an unsized last field is not supported. It is
+    /// not an option for [`ImplSelf::Marker`](crate::ImplSelf::Marker): a marker is not what the
+    /// copy has the bound for ([`EncodeError::NeedsSelf`](crate::EncodeError::NeedsSelf)).
+    Any,
 }
 
 impl SelfRequirement {
@@ -198,6 +222,7 @@ impl SelfRequirement {
         match self {
             Self::Bound(path) => token_names(quote!(#path), names),
             Self::Type(ty) => token_names(quote!(#ty), names),
+            Self::Any => (),
         }
     }
 
@@ -205,6 +230,7 @@ impl SelfRequirement {
         match self {
             Self::Bound(path) => format!(" Self: {}", quote!(#path)),
             Self::Type(ty) => format!(" Self = {}", quote!(#ty)),
+            Self::Any => " Self any".to_string(),
         }
     }
 }
@@ -690,6 +716,12 @@ impl Context {
     /// mention of a generic there and does not ask for a context at all, so the Referrer must not
     /// find one either. `enclosing` lifetimes become generics even if `ty` does not name them.
     ///
+    /// `nested_type`: `self_req` is the `Self` of a struct, an enum or a union nested in the
+    /// analyzed syntax, which the copy declares as a type of its own. A `ty` that does not name
+    /// `Self`, but has generics with a bound that does, is then for any type
+    /// ([`SelfRequirement::Any`]), and does not need the generics that `Self` has as arguments:
+    /// the impl is not for the type that `Self` is.
+    ///
     /// `self_req` is what `Self` means where `ty` is written. The bounds and where predicates of a
     /// generic are written for the `Self` of the scope that declares it. If that is not `self_req`
     /// (a nested impl, struct or trait has a `Self` of its own), the bounds that mention `Self` are
@@ -702,11 +734,14 @@ impl Context {
         ty: &Type,
         scopes: &[Scope],
         self_req: Option<&SelfRequirement>,
+        nested_type: bool,
         enclosing: &Enclosing,
     ) -> std::result::Result<Self, UnnameableSelf> {
         let mut names = HashSet::new();
         type_names(ty, &mut names);
         let mut mentions_self = type_mentions_self(ty);
+        let free_self =
+            nested_type && !mentions_self && matches!(self_req, Some(SelfRequirement::Type(_)));
         let mut self_names = HashSet::new();
         if let Some(self_req) = self_req {
             self_req.names(&mut self_names);
@@ -844,11 +879,14 @@ impl Context {
             }
             if found_self && !mentions_self {
                 mentions_self = true;
-                work.extend(
-                    self_names
-                        .iter()
-                        .map(|name| (scopes.len() - 1, name.clone())),
-                );
+                // The impl for any type has no use for the generics of the type that `Self` is.
+                if !free_self {
+                    work.extend(
+                        self_names
+                            .iter()
+                            .map(|name| (scopes.len() - 1, name.clone())),
+                    );
+                }
             }
         }
         let mut params: Vec<GenericParam> = params.into_values().collect();
@@ -900,8 +938,11 @@ impl Context {
                 predicates: predicates.into_iter().collect(),
             });
         }
-        let mut context = Self::new(generics, self_req.filter(|_| mentions_self).cloned())
-            .with_self_outlives(self_outlives);
+        let self_ty = match self_req.filter(|_| mentions_self) {
+            Some(_) if free_self => Some(SelfRequirement::Any),
+            self_req => self_req.cloned(),
+        };
+        let mut context = Self::new(generics, self_ty).with_self_outlives(self_outlives);
         context.substituted = substituted;
         Ok(context)
     }
@@ -1058,7 +1099,9 @@ impl std::hash::Hash for Context {
 ///
 /// - The generics are only those the type uses: the generics the type names, the generics that
 ///   the bounds of those generics name, and, if the type names `Self`, the generics in the
-///   description of `Self`.
+///   description of `Self`. (A bound that names the `Self` of a struct, an enum or a union nested
+///   in the analyzed syntax does not bring them: the entry is for any type,
+///   [`SelfRequirement::Any`].)
 /// - A where predicate on one generic (`U: Into<T>`) is a bound of that generic, as if it was
 ///   written inline on `U`. It is in the context of what uses `U`, not of what uses `T`. A where
 ///   predicate on another type (`Vec<T>: Clone`) belongs to each generic it names.
@@ -1295,6 +1338,16 @@ fn for_self_of<T: WrittenForSelf>(
 ) -> std::result::Result<T, UnnameableSelf> {
     let mentions = node.self_mentions();
     match outer {
+        // No scope declares an `Any` `Self`: it is the context of an entry.
+        SelfRequirement::Any => Err(UnnameableSelf {
+            cause: mentions.first.unwrap_or_else(|| quote!(Self)),
+            headline: format!("{} mentions a `Self` which has no name here", node.what()),
+            note: format!(
+                "{} mentions a `Self` of no type, which has no name here",
+                node.what()
+            ),
+            help: format!("write {} without `Self`", node.what()),
+        }),
         SelfRequirement::Bound(path) => Err(UnnameableSelf {
             cause: mentions.first.unwrap_or_else(|| quote!(Self)),
             headline: format!("{} mentions a `Self` which has no name here", node.what()),

@@ -57,8 +57,11 @@ pub enum ImplSelf<'a> {
     /// The impl is for any type if the entry does not name `Self`. If the
     /// [`context_self()`](Referrer::context_self) of the entry is [`SelfRequirement::Bound`], the
     /// parameter has the bound of the trait (`__S: ?Sized + Tr<T>`) and replaces `Self`, as
-    /// [`Referrer::iter_with_self()`] does. If it is [`SelfRequirement::Type`], the impl is for
-    /// that type, with `Self` as written, and no parameter is declared.
+    /// [`Referrer::iter_with_self()`] does. If it is [`SelfRequirement::Any`], the parameter
+    /// replaces `Self` in the bounds, and has no bound of its own, not even `?Sized`: the `Self`
+    /// is a struct, an enum or a union, which is `Sized` (`__S`, so that `(Self, u8)` in a bound
+    /// is well-formed). If it is [`SelfRequirement::Type`], the impl is for that type, with `Self`
+    /// as written, and no parameter is declared.
     Param(&'a Ident),
     /// This type, usually a marker of the user crate (`impl .. for crate::Marker`).
     ///
@@ -111,9 +114,9 @@ pub struct RepeaterImpl {
     /// These are the generics of the entry without the lifetime bounds that
     /// [`args`](RepeaterImpl::args) encodes ([`Referrer::impl_generics()`]), with `Self` replaced
     /// where it is a parameter. For [`ImplSelf::Param`] they end with the parameter itself (`__S:
-    /// ?Sized`, and the bound of the trait for [`SelfRequirement::Bound`]), unless the impl is for
-    /// a type. A first where predicate that rustc would read as generics of the `where`
-    /// (`<__S>::A: Clone`) is parenthesized.
+    /// ?Sized`, and the bound of the trait for [`SelfRequirement::Bound`]; `__S` alone for
+    /// [`SelfRequirement::Any`]), unless the impl is for a type. A first where predicate that
+    /// rustc would read as generics of the `where` (`<__S>::A: Clone`) is parenthesized.
     pub generics: Generics,
     /// The type that the impl is for.
     pub self_ty: Type,
@@ -425,6 +428,13 @@ impl Referrer {
                     Some(ident),
                     Some(path),
                 ),
+                // Any type that the bounds hold for: the parameter has no bound of its own.
+                (Some(SelfRequirement::Any), ImplSelf::Param(ident)) => (
+                    parse_quote!(#ident),
+                    parse_quote!(#ident),
+                    Some(ident),
+                    None,
+                ),
                 (None, ImplSelf::Param(ident)) => (
                     parse_quote!(#ident),
                     parse_quote!(#ident),
@@ -436,7 +446,7 @@ impl Referrer {
         let generics = self.context_generics(context);
         let (ty, generics) = match self.context_self(context) {
             // The implementor is a parameter, where `Self` of the trait is not available.
-            Some(SelfRequirement::Bound(_)) => {
+            Some(SelfRequirement::Bound(_) | SelfRequirement::Any) => {
                 let mut folder = ReplaceSelf {
                     self_ty: &self_in_impl,
                 };
@@ -457,10 +467,15 @@ impl Referrer {
         )?;
         let mut declared = without_encoded_bounds(&generics);
         if let Some(ident) = param {
-            declared.params.push(match bound {
-                Some(path) => parse_quote!(#ident: ?::core::marker::Sized + #path),
-                None => parse_quote!(#ident: ?::core::marker::Sized),
-            });
+            declared
+                .params
+                .push(match (bound, self.context_self(context)) {
+                    (Some(path), _) => parse_quote!(#ident: ?::core::marker::Sized + #path),
+                    // The `Self` of a struct, an enum or a union is a `Sized` type, and the bounds
+                    // may need it (`(Self, u8)`, `Vec<Self>`).
+                    (None, Some(SelfRequirement::Any)) => parse_quote!(#ident),
+                    (None, _) => parse_quote!(#ident: ?::core::marker::Sized),
+                });
         }
         parenthesize_leading_qualified_path(&mut declared);
         Ok(RepeaterImpl {

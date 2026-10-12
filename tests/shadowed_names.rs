@@ -727,19 +727,17 @@ fn assert_like_bare(actual: &Outcome, bare: &Outcome, prefix: &str, what: &str) 
 /// The repro of the property test (seed 4, case 75): an enum whose where predicate names `Self`
 /// and a type of the module, and whose field uses the generic of that predicate. Nested in a module,
 /// the copy declares an enum of its own: the bound holds for it, and the Repeater's impl of the
-/// field's type needs it for the Leaker's enum (E0277 in the Referrer's crate). The Leaker rejects
-/// it, and it makes no difference how the type of the module is spelled (`self::Rl` was thought to
-/// slip past a check that the bare `Rl` did not: the bare spelling failed in the same way).
+/// field's type used to be for the Leaker's enum, which has not the bound in the copy's crate
+/// (E0277 in the Referrer's crate). It was rejected for that, whatever the spelling of the type of
+/// the module (`self::Rl` was thought to slip past a check that the bare `Rl` did not: the bare
+/// spelling failed in the same way). The entry is for any type now (`SelfRequirement::Any`), and
+/// the copy passes its own: accepted with every spelling.
 #[test]
-fn a_nested_enum_whose_bound_names_self_is_rejected_with_every_spelling_of_a_type_of_the_module() {
+fn a_nested_enum_whose_bound_names_self_is_accepted_with_every_spelling_of_a_type_of_the_module() {
     let source = "pub enum E<'a, T: ::core::marker::Send + 'a, const V: usize = 3>
         where T: ::core::convert::AsRef<::std::collections::BTreeMap<(Self, Self), {Rl}<'a>>>
         { V0(&'a super::base::B2<T, ::core::result::Result<u32, u16>>), V1 }";
-    same_outcome_with_every_prefix(
-        source,
-        Scope::Mod,
-        Expect::Rejected("has a generic whose bound mentions `Self`"),
-    );
+    same_outcome_with_every_prefix(source, Scope::Mod, Expect::Accepted);
     // Analyzed as the item itself, `Self` is written as the Leaker's type: accepted.
     same_outcome_with_every_prefix(source, Scope::Intern, Expect::Accepted);
 }
@@ -813,10 +811,18 @@ fn a_bound_that_names_self_is_decided_with_every_spelling() {
     );
     // A struct, an enum: `Self` in the bound of a generic that an entry of a field uses. As the
     // item itself, the Referrer writes `Self` as the Leaker's type, so it is fine. Nested in a
-    // module, the copy has a `Self` of its own: rejected.
+    // module, the copy has a `Self` of its own: an entry that does not name `Self` is for any type,
+    // and the copy passes its own; one that names it too is for the Leaker's type, which the bound
+    // does not hold for in the copy: rejected.
     for source in [
         "pub struct S<T: AsRef<Self>>({Wrap}<T>);",
         "pub struct S<T>({Wrap}<T>) where T: AsRef<(Self, {Rl}<'static>)>;",
+    ] {
+        same_outcome_with_every_prefix(source, Scope::Mod, Expect::Accepted);
+        same_outcome_with_every_prefix(source, Scope::Intern, Expect::Accepted);
+    }
+    for source in [
+        "pub struct S<T: AsRef<Self>>({Wrap}<Self>, {Wrap}<T>);",
         "pub enum E<T> where T: AsRef<Self> { A({Wrap}<Self>), B(T) }",
     ] {
         same_outcome_with_every_prefix(

@@ -1175,6 +1175,80 @@ pub mod kinds {
         fn pair(&self, x: Pair<Rel, Wrap<Self>>) -> Rel;
     }
 
+    // Items nested in a module whose generics have a bound that names their own `Self` (`T:
+    // AsRef<Self>`), and whose fields use the generic (`Wrap<T>`, which does not name `Self`). The
+    // copy declares a type of its own, which has the bound for itself, so the Repeater's impl of
+    // the entry is for any type that the bound holds for, and `Visitor::with_nested_self()` lets
+    // the copy pass its own type (`SelfRequirement::Any`).
+
+    /// The bound is on the parameter.
+    #[prop_leak(id = 9111, allow_self = true, scope = "mod", prelude = true)]
+    pub struct Owned<T: AsRef<Self>> {
+        pub rel: Rel,
+        pub wrapped: Wrap<T>,
+        pub pair: Pair<Rel, T>,
+    }
+
+    /// The bound is a where predicate, and names `Self` among other types.
+    #[prop_leak(id = 9112, allow_self = true, scope = "mod")]
+    pub struct Tagged<T>(pub Wrap<T>, pub u8)
+    where
+        T: ::core::convert::AsRef<(Self, u8)>;
+
+    /// The report of the property test: an enum with a lifetime, a const parameter with a default,
+    /// and a bound that names `Self` twice and a relative type (`Lt<'a, Rel>`).
+    #[prop_leak(id = 9113, allow_self = true, scope = "mod")]
+    pub enum Reported<'a, T: ::core::marker::Send + 'a, const V: usize = 3>
+    where
+        T: ::core::convert::AsRef<::std::collections::BTreeMap<(Self, Self), self::Lt<'a, Rel>>>,
+    {
+        V0(&'a super::base::B2<T, ::core::result::Result<u32, u16>>),
+        V1,
+    }
+
+    /// A union.
+    #[prop_leak(id = 9114, allow_self = true, scope = "mod")]
+    pub union Overlaid<T: ::core::marker::Copy + ::core::convert::AsRef<Self>> {
+        pub wrapped: Wrap<T>,
+        pub rel: Rel,
+    }
+
+    /// A type that names `Self` and has a generic with a bound that names it: it is for the
+    /// Leaker's type, which the bound does not hold for in the copy. The Leaker rejects it (the
+    /// macro expands to nothing); `Wrap<T>`, which does not name `Self`, is the supported case.
+    #[prop_leak(id = 9115, allow_self = true, scope = "mod", prelude = true)]
+    pub struct Both<T: AsRef<Self>> {
+        pub me: Wrap<Self>,
+        pub wrapped: Wrap<T>,
+    }
+
+    /// The entry is in a bound of another generic (`U: Into<Wrap<T>>`), where the copy's `Self` is
+    /// the type being declared.
+    #[prop_leak(id = 9116, allow_self = true, scope = "mod", prelude = true)]
+    pub struct Chain<T: AsRef<Self>, U: Into<Wrap<T>>>(pub T, pub U);
+
+    /// The entry is in a where predicate.
+    #[prop_leak(id = 9117, allow_self = true, scope = "mod", prelude = true)]
+    pub struct InPredicate<T: AsRef<Self>>(pub T)
+    where
+        Wrap<T>: Sized;
+
+    /// The entry has a lifetime, which the bound `T: 'a` keeps.
+    #[prop_leak(id = 9118, allow_self = true, scope = "mod", prelude = true)]
+    pub struct Outlives<'a, T: AsRef<Self> + 'a>(pub &'a Wrap<T>, pub T);
+
+    /// `Self: 'a` is written, so the arguments of the Repeater encode `&'a Self`: the copy's own.
+    #[prop_leak(id = 9119, allow_self = true, scope = "mod", prelude = true)]
+    pub struct SelfOutlived<'a, T: AsRef<Self>>(pub &'a Wrap<T>, pub T)
+    where
+        Self: 'a;
+
+    /// A predicate on `Self` alone is in the context of the entry too.
+    #[prop_leak(id = 9120, allow_self = true, scope = "mod", prelude = true)]
+    pub struct SelfSized<T: AsRef<Self>>(pub Wrap<T>, pub T)
+    where
+        Self: Sized;
+
     // The scopes of an item that share names, from the findings of a downstream crate
     // (`announce`, tests/downstream_findings.rs): the Repeater's impl of every entry has the
     // generics, bounds and where clause of the scope the entry is written in, and no others.

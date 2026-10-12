@@ -471,6 +471,64 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9063, __tl_report_9063!()),
             ok("trait", 5, 5, 5),
         ),
+        // structs, an enum and a union nested in a module, with a bound that names their own
+        // `Self` (`T: AsRef<Self>`), also in the where clause: the entry that does not name `Self`
+        // is for any type, and the copy passes its own; one that names it too is rejected
+        (
+            9111,
+            reported(9111, __tl_report_9111!()),
+            ok("struct", 3, 3, 3),
+        ),
+        (
+            9112,
+            reported(9112, __tl_report_9112!()),
+            ok("struct", 1, 2, 2),
+        ),
+        (
+            9113,
+            reported(9113, __tl_report_9113!()),
+            ok("enum", 2, 1, 1),
+        ),
+        (
+            9114,
+            reported(9114, __tl_report_9114!()),
+            ok("union", 2, 2, 2),
+        ),
+        (
+            9115,
+            reported(9115, __tl_report_9115!()),
+            rejected(
+                "struct",
+                "`Wrap<Self>`hasagenericwhoseboundmentions`Self`,whichcannotbeleaked",
+            ),
+        ),
+        // the entry is in a bound of another generic, in a where predicate, keeps a lifetime, and
+        // is for a `Self` that is outlived or bounded by `Sized`
+        (
+            9116,
+            reported(9116, __tl_report_9116!()),
+            ok("struct", 1, 2, 2),
+        ),
+        (
+            9117,
+            reported(9117, __tl_report_9117!()),
+            ok("struct", 1, 1, 1),
+        ),
+        (
+            9118,
+            reported(9118, __tl_report_9118!()),
+            ok("struct", 1, 2, 2),
+        ),
+        (
+            9119,
+            reported(9119, __tl_report_9119!()),
+            ok("struct", 1, 2, 2),
+        ),
+        (
+            9120,
+            reported(9120, __tl_report_9120!()),
+            ok("struct", 1, 2, 2),
+        ),
         // scopes that share names (the findings of a downstream crate): methods that declare the
         // same generic with different bounds, a generic named like a relative type, a path ending
         // with the name of a generic, a type and a const parameter of one name; a bound that names
@@ -682,6 +740,86 @@ fn items_nested_in_a_module_name_their_own_self() {
         l::Wrap(PhantomData)
     }
     same(&me(&host), &l::Wrap::<r::Host9063>(PhantomData));
+}
+
+/// A struct, an enum and a union nested in a module, whose generic has a bound that names their
+/// own `Self` (`T: AsRef<Self>`, `where T: AsRef<(Self, u8)>`), use the generic in a relative type
+/// (`Wrap<T>`) that does not name `Self`. The copy declares a type of its own, which has the bound
+/// for itself, so `Visitor::with_nested_self()` lets the macro write `<Self as Repeater<..>>::Type`:
+/// the Repeater's impl of the entry is for any type that the bound holds for. The field is the
+/// Leaker's `Wrap<T>`; had the macro passed the Leaker's type, the bound would not hold for it
+/// (E0277). The Referrer's crate compiles only if rustc accepts the copy and the witnesses.
+#[test]
+fn nested_types_with_a_bound_on_their_own_self_keep_the_original_field_types() {
+    use std::collections::BTreeMap;
+    use type_leak_test_leaker::base::B2;
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_referrer::kinds as r;
+
+    // The struct, with the bound on the parameter. The bound holds for the copy's own `Owned`.
+    struct Owner;
+    impl AsRef<r::Owned<Owner>> for Owner {
+        fn as_ref(&self) -> &r::Owned<Owner> {
+            unimplemented!()
+        }
+    }
+    let rel = l::Rel(5);
+    let copy = r::Owned::<Owner> {
+        rel,
+        wrapped: l::Wrap(PhantomData),
+        pair: l::Pair(rel, Owner),
+    };
+    same(&copy.rel, &rel);
+    same(&copy.wrapped, &l::Wrap::<Owner>(PhantomData));
+    same(&copy.pair.0, &rel);
+    assert_eq!(copy.pair.0, rel);
+
+    // The where predicate, with `Self` in a tuple.
+    struct Tag;
+    impl AsRef<(r::Tagged<Tag>, u8)> for Tag {
+        fn as_ref(&self) -> &(r::Tagged<Tag>, u8) {
+            unimplemented!()
+        }
+    }
+    let tagged = r::Tagged::<Tag>(l::Wrap(PhantomData), 7);
+    same(&tagged.0, &l::Wrap::<Tag>(PhantomData));
+    assert_eq!(tagged.1, 7);
+
+    // The enum of the property test: a lifetime, a const parameter, `Self` twice in a bound that
+    // also names a relative type (`Lt<'a, Rel>`, which the copy writes through the Repeater too).
+    struct Owner3;
+    type Key = r::Reported<'static, Owner3, 3>;
+    impl AsRef<BTreeMap<(Key, Key), l::Lt<'static, l::Rel>>> for Owner3 {
+        fn as_ref(&self) -> &BTreeMap<(Key, Key), l::Lt<'static, l::Rel>> {
+            unimplemented!()
+        }
+    }
+    static PAIR: B2<Owner3, Result<u32, u16>> = B2(Owner3, Ok(9));
+    let steps: [Key; 2] = [r::Reported::V0(&PAIR), r::Reported::V1];
+    match &steps[0] {
+        r::Reported::V0(held) => {
+            same::<B2<Owner3, Result<u32, u16>>>(held, &PAIR);
+            assert_eq!(held.1, Ok(9));
+        }
+        r::Reported::V1 => unreachable!(),
+    }
+    assert!(matches!(steps[1], r::Reported::V1));
+
+    // The union.
+    #[derive(Clone, Copy)]
+    struct Owner4;
+    impl AsRef<r::Overlaid<Owner4>> for Owner4 {
+        fn as_ref(&self) -> &r::Overlaid<Owner4> {
+            unimplemented!()
+        }
+    }
+    let overlaid = r::Overlaid::<Owner4> {
+        wrapped: l::Wrap(PhantomData),
+    };
+    same(
+        unsafe { &overlaid.wrapped },
+        &l::Wrap::<Owner4>(PhantomData),
+    );
 }
 
 /// The scopes of an item that share names (the findings A, 1, 2, 3, 4 and 7 of a downstream crate,

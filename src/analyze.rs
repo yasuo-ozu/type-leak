@@ -616,6 +616,7 @@ struct Walk {
     signatures: usize,
     probe: Option<HashSet<usize>>,
     in_default: Option<bool>,
+    in_nested_default: bool,
     expr_owner: Option<usize>,
     in_receiver: bool,
     enclosing: Enclosing,
@@ -668,7 +669,8 @@ pub(crate) struct AnalyzeVisitor {
     self_written: bool,
     /// `self_ty` is the `Self` of a struct, an enum or a union nested in the analyzed syntax (an
     /// item of a module, or `View::visit_item()`): the copy declares a type of its own there, so
-    /// its `Self` is not the Leaker's type that the Repeater's impls are for (see
+    /// its `Self` is not the Leaker's type that the Repeater's impls are for. A type that does not
+    /// name `Self` but has a bound that does is for any type (`SelfRequirement::Any`, see
     /// [`AnalyzeVisitor::self_in_bounds()`]). The `Self` of a scope (`intern_struct()`,
     /// `enter_type()`) is the outermost item's, which the Visitor writes as the Leaker's type.
     self_nested: bool,
@@ -688,6 +690,10 @@ pub(crate) struct AnalyzeVisitor {
     /// The type is the default of a parameter, which cannot mention `Self`. It holds whether the
     /// declaring scope gives `Self` a meaning. `self_ty` is `None` meanwhile.
     in_default: Option<bool>,
+    /// The type is the default of a parameter of a struct, an enum or a union nested in the
+    /// analyzed syntax (`self_nested`): its copy cannot write `Self` there (E0735), so it cannot
+    /// pass its own type for an entry that is for any type.
+    in_nested_default: bool,
     modules: Vec<ModuleFrame>,
     /// The causes that depend on the context: the depth of the type that has it, the path, and
     /// whether an entry that is leaked alone has it (so it is no conflict of the type around: see
@@ -800,6 +806,7 @@ impl AnalyzeVisitor {
             root_declares_self: false,
             self_type_walk: None,
             in_default: None,
+            in_nested_default: false,
             modules: Vec::new(),
             musts: Vec::new(),
             impossibles: Impossibles::default(),
@@ -992,7 +999,15 @@ impl AnalyzeVisitor {
             || inner.mentions_self
             || inner.local_scope < self.scopes.len()
         {
-            Context::of(ty, &self.scopes, self.self_ty.as_ref(), &self.enclosing)?
+            // A type that does not name the `Self` of a nested struct, enum or union, but has a
+            // bound that does, is for any type that the bound holds for (the copy's own).
+            Context::of(
+                ty,
+                &self.scopes,
+                self.self_ty.as_ref(),
+                self.self_nested,
+                &self.enclosing,
+            )?
         } else {
             Context::none()
         };
@@ -1031,17 +1046,25 @@ impl AnalyzeVisitor {
     /// Returns the first mention of `Self` in the generics of `context`, if `Self` may not be
     /// leaked. A written `Self: 'a` counts: it is encoded as `&'a Self`, which needs `Self` too.
     ///
-    /// The `Self` of a struct, an enum or a union nested in the analyzed syntax (`self_nested`)
-    /// may be leaked, but not through a bound that the environment must prove. The Repeater's impl
-    /// of a type that depends on it is for the Leaker's own type and needs the bound for that
-    /// type (`T: AsRef<::p::m::S<T>>`), whereas the copy declares a type of its own, and has the
-    /// bound for it (`T: AsRef<Self>`, the copy's `S<T>`), so the Referrer's crate cannot prove
-    /// it (E0277). It makes no difference where the generic is bounded: `S<T: AsRef<Self>>`, `where
-    /// T: AsRef<(Self, Rel)>`. A predicate on another type, which an impl proves (`Self: Sized`,
-    /// `Vec<Self>: Clone`), and `Self: 'a` are fine.
+    /// The `Self` of a struct, an enum or a union nested in the analyzed syntax (`self_nested`) is
+    /// the copy's own type there, which is not the Leaker's. A type that does not name it, but has
+    /// a bound that does (`Rel<T>` with `T: AsRef<Self>`), is for any type that the bound holds
+    /// for ([`SelfRequirement::Any`]), and the copy passes its own: that is fine. A type that
+    /// names it too (`Rel2<Self, T>`) is for the Leaker's type, which the bound that the
+    /// environment proves (`T: AsRef<Self>`, `where T: AsRef<(Self, Rel)>`) does not hold for in
+    /// the copy, whose own type has it (E0277), and the impl cannot be for any type: what the
+    /// type needs of `Self` to be well-formed is not known. A predicate on another type, which an
+    /// impl proves (`Self: Sized`, `Vec<Self>: Clone`), and `Self: 'a` are fine.
     fn self_in_bounds(&self, context: &Context) -> Option<TokenStream> {
         if self.self_nested {
-            return self_in_environment_bounds(context);
+            return match context.self_ty() {
+                // The copy cannot write `Self` in a default (E0735).
+                Some(SelfRequirement::Any) if self.in_nested_default => {
+                    first_self_in_generics(context.generics())
+                }
+                Some(SelfRequirement::Any) => None,
+                _ => self_in_environment_bounds(context),
+            };
         }
         if self.allow_self {
             return None;
@@ -1269,6 +1292,7 @@ impl AnalyzeVisitor {
             signatures: self.signatures.len(),
             probe: self.probe.clone(),
             in_default: self.in_default,
+            in_nested_default: self.in_nested_default,
             expr_owner: self.expr_owner,
             in_receiver: self.in_receiver,
             enclosing: self.enclosing.clone(),
@@ -1309,6 +1333,7 @@ impl AnalyzeVisitor {
         self.signatures.truncate(walk.signatures);
         self.probe = walk.probe;
         self.in_default = walk.in_default;
+        self.in_nested_default = walk.in_nested_default;
         self.expr_owner = walk.expr_owner;
         self.in_receiver = walk.in_receiver;
         self.enclosing = walk.enclosing;
@@ -1518,21 +1543,46 @@ impl AnalyzeVisitor {
             }
         };
         match self.self_in_bounds(&context) {
-            Some(self_path) if self.self_nested => Err(CheckResult {
+            Some(self_path) if self.in_nested_default => Err(CheckResult {
                 must: vec![quote!(#ty)],
                 impossible: vec![self_path.clone()],
                 is_own: true,
                 optional: false,
                 note: Some(
                     "the bounds of its generics mention the `Self` of an item nested in the \
-                     analyzed syntax: its copy declares a type of its own, so the bound holds \
-                     for that, and the Repeater's impl of this type needs it for the Leaker's \
-                     type (E0277)"
+                     analyzed syntax, and the type is the default of a parameter: the copy \
+                     declares a type of its own, and cannot write `Self` in a default (E0735), \
+                     so it cannot pass it"
                         .to_string(),
                 ),
                 help: Some(format!(
-                    "write the bound of the generics of `{}` without `{}`, or analyze the item \
-                     with its own `intern_*` call, which writes its `Self` as the Leaker's type",
+                    "write the bound of the generics of `{}` without `{}`, or write the default \
+                     with an absolute path",
+                    tidy(&quote!(#ty)),
+                    tidy(&self_path)
+                )),
+                headline: Some(format!(
+                    "`{}` is in the default of a parameter, and a bound of its generics names \
+                     `Self`",
+                    quote!(#ty)
+                )),
+            }),
+            Some(self_path) if self.self_nested => Err(CheckResult {
+                must: vec![quote!(#ty)],
+                impossible: vec![self_path.clone()],
+                is_own: true,
+                optional: false,
+                note: Some(
+                    "it names the `Self` of an item nested in the analyzed syntax, and so do the \
+                     bounds of its generics: the Repeater's impl of this type is for the \
+                     Leaker's type, but the copy declares a type of its own, which has the bound \
+                     for itself (E0277)"
+                        .to_string(),
+                ),
+                help: Some(format!(
+                    "write the bound of the generics of `{}` without `{}`, write the type \
+                     without `Self`, or analyze the item with its own `intern_*` call, which \
+                     writes its `Self` as the Leaker's type",
                     tidy(&quote!(#ty)),
                     tidy(&self_path)
                 )),
@@ -1574,8 +1624,10 @@ impl AnalyzeVisitor {
     /// `A` from. (The impl for the implementor of a trait can write it: `__S::A`.)
     fn associated_self_in_bounds(&self, context: &Context) -> Option<AssocSelf> {
         match context.self_ty() {
-            Some(SelfRequirement::Type(_)) => first_associated_self_in_generics(context.generics())
-                .map(|cause| AssocSelf::new(cause, self.self_trait.clone())),
+            Some(SelfRequirement::Type(_) | SelfRequirement::Any) => {
+                first_associated_self_in_generics(context.generics())
+                    .map(|cause| AssocSelf::new(cause, self.self_trait.clone()))
+            }
             _ => None,
         }
     }
@@ -3493,7 +3545,19 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
             i.default = None;
             return syn::visit::visit_type_param(self, &i);
         }
-        syn::visit::visit_type_param(self, i)
+        match &i.default {
+            // The default of a nested struct, enum or union is visited with its `Self`.
+            Some(default) if self.self_nested => {
+                let mut without = i.clone();
+                without.eq_token = None;
+                without.default = None;
+                syn::visit::visit_type_param(self, &without);
+                let outer = std::mem::replace(&mut self.in_nested_default, true);
+                self.visit_type(default);
+                self.in_nested_default = outer;
+            }
+            _ => syn::visit::visit_type_param(self, i),
+        }
     }
 
     fn visit_trait_item_fn(&mut self, i: &TraitItemFn) {
