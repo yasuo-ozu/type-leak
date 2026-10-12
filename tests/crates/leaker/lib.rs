@@ -1047,6 +1047,39 @@ pub mod kinds {
         }
     }
 
+    /// A bare identifier that is a const, in a path of another crate that names `Local`, which the
+    /// module declares (the copy declares it again, so the path is not leaked as a whole). `LEN2`
+    /// is imported with an absolute path, which declares it: it is copied as written, and the
+    /// copy compiles. `Rel` is leaked as usual.
+    #[prop_leak(id = 9101)]
+    pub mod declared_const {
+        use super::Rel;
+        use ::type_leak_test_leaker::kinds::LEN as LEN2;
+
+        pub struct Local(pub u8);
+        pub struct Holds {
+            pub rel: Rel,
+            pub len: ::type_leak_test_leaker::kinds::CW<Local, LEN2>,
+        }
+        pub mod deeper {
+            use super::super::LEN as LEN3;
+            pub struct Deep(pub ::type_leak_test_leaker::kinds::CW<u8, LEN3>);
+        }
+    }
+
+    /// The same, with `LEN4` imported from outside the module (`use super::LEN`): the Leaker cannot
+    /// leak the path that holds it, and it would leak `LEN4` as a type, which fails for a const, so
+    /// it rejects the module (the macro expands to nothing).
+    #[prop_leak(id = 9102)]
+    pub mod imported_const {
+        use super::LEN as LEN4;
+
+        pub struct Local(pub u8);
+        pub struct Holds {
+            pub len: ::type_leak_test_leaker::kinds::CW<Local, LEN4>,
+        }
+    }
+
     // Traits.
 
     /// `Self` is denied for the trait (`sumtype`'s way), and it does not name `Self`.

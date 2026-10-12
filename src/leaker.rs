@@ -165,16 +165,22 @@ use template_quote::quote;
 ///
 /// - an elided lifetime or reference in the holder (`MyType<'_, MY_CONST>`, `&dyn Tr<MY_CONST>`),
 /// - `impl Trait` in the holder,
-/// - a name that a module of [`intern_mod()`](Leaker::intern_mod) declares in the holder,
+/// - the path of the holder, if it is a name that a module of [`intern_mod()`](Leaker::intern_mod)
+///   declares (`Local<MY_CONST>`: the copy declares `Local` again, and the module's own type takes
+///   a type, as a rule),
 /// - a trait bound, a supertrait or the trait of an impl (`T: Tr<MY_CONST>`), which has no type
 ///   to leak.
 ///
 /// Any other cause is an error, with the identifier as its cause: `Self` where it is denied
 /// ([`allow_self`](Leaker::intern_struct)) or `Self::A` of a type, the default of a parameter that
 /// names `Self`, a bound of a generic that names `Self`, a method lifetime that the copy would leave
-/// unconstrained ([Method lifetimes](#method-lifetimes)), and an expression that cannot be leaked.
+/// unconstrained ([Method lifetimes](#method-lifetimes)), an expression that cannot be leaked, and
+/// a name that a module declares beside the identifier in the path of another crate
+/// (`Other<Local, MY_CONST>`: the copy declares `Local` again, so the path is not leaked as a
+/// whole, and the Leaker knows nothing of the parameters of `Other`).
 /// Write the identifier so that it is not leaked: an absolute path, which a const needs in braces,
-/// or a name in [`allowed_paths`](Leaker::allowed_paths).
+/// a name in [`allowed_paths`](Leaker::allowed_paths), or, in a module, a name that the module
+/// declares (a declaration, or `use` with an absolute path), which is copied as written.
 ///
 /// ```ignore
 /// fn f(x: ::path::MyType<MY_CONST>);                  // good: the path is leaked
@@ -182,6 +188,9 @@ use template_quote::quote;
 /// fn f(x: ::path::MyType<{ ::my_crate::MY_CONST }>);  // good: not leaked
 /// struct S(::path::MyType<[Self], MY_CONST>);         // error if `Self` is denied
 /// struct S(::path::MyType<[Self], { ::my_crate::MY_CONST }>);  // good
+/// // In a module that declares `Local`:
+/// struct S(Local<MY_CONST>);                          // the identifier is leaked as a type
+/// struct S(::path::MyType<Local, MY_CONST>);          // error: `MY_CONST` may be a const
 /// ```
 #[derive(Default)]
 pub struct Leaker {

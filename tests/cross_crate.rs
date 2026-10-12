@@ -397,6 +397,22 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9041, __tl_report_9041!()),
             ok("mod", 4, 6, 5),
         ),
+        // a bare identifier that is a const, in a module, beside a name that the module declares: an
+        // absolute `use` declares it, so it is copied as written; one imported from outside is
+        // rejected
+        (
+            9101,
+            reported(9101, __tl_report_9101!()),
+            ok("mod", 2, 4, 3),
+        ),
+        (
+            9102,
+            reported(9102, __tl_report_9102!()),
+            rejected(
+                "mod",
+                "`LEN4`maybeaconst,andthetypethatholdsitcannotbeleakedasawhole",
+            ),
+        ),
         // traits: `Self` denied and not named, denied and named, and an unsized implementor
         (
             9051,

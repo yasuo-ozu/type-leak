@@ -139,6 +139,11 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9033!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9034!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9041!(path = ::type_leak_test_leaker::kinds);
+    // A bare identifier that is a const, in a module: beside a name that the module declares, an
+    // absolute `use` declares it (the copy keeps it), and a relative one is rejected (it expands to
+    // nothing).
+    type_leak_test_leaker::__tl_prop_9101!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9102!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9051!(path = ::type_leak_test_leaker::kinds);
     // The rejected ones expand to nothing.
     type_leak_test_leaker::__tl_prop_9003!(path = ::type_leak_test_leaker::kinds);

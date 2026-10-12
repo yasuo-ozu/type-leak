@@ -43,6 +43,12 @@ struct Frame {
     mentions_root: bool,
     mentions_self: bool,
     module_item: bool,
+    /// The first path in the type that names an item of the module (`module_item` is set by it).
+    module_path: Option<TokenStream>,
+    /// The bare identifiers that are arguments of the path being visited (the type, or the trait of
+    /// a bound in it), as text: the arguments that may be consts, apart from those that bubbled up
+    /// from a type inside.
+    bare_args: Vec<String>,
     soft_depth: usize,
     /// A cause is a relative path, so the type means something else in another module.
     relative: bool,
@@ -69,6 +75,8 @@ impl Frame {
             mentions_root: false,
             mentions_self: false,
             module_item: false,
+            module_path: None,
+            bare_args: Vec::new(),
             soft_depth: usize::MAX,
             relative: false,
             binder: None,
@@ -88,7 +96,9 @@ impl Frame {
 /// Any other cause is hard (`push()`, so a new cause is hard unless it is made soft): `Self` where
 /// it is denied, `Self::A`, a method lifetime that the copy would leave unconstrained, an
 /// expression that cannot be leaked. A type that holds a bare identifier and cannot be leaked
-/// because of a hard cause is an error (see [`AnalyzeVisitor::bare_conflict()`]).
+/// because of a hard cause is an error (see [`AnalyzeVisitor::bare_conflict()`]). So is a path of
+/// another crate that holds one beside an item of the module, which is no cause in this list
+/// ([`AnalyzeVisitor::bare_beside_module_item()`]).
 #[derive(Default)]
 struct Impossibles {
     causes: Vec<TokenStream>,
@@ -1378,6 +1388,9 @@ impl AnalyzeVisitor {
         self.frame.mentions_root |= inner.mentions_root;
         self.frame.mentions_self |= inner.mentions_self;
         self.frame.module_item |= inner.module_item;
+        if self.frame.module_path.is_none() {
+            self.frame.module_path = inner.module_path.clone();
+        }
         self.frame.relative |= inner.relative;
         if self.frame.assoc_self.is_none() {
             self.frame.assoc_self = inner.assoc_self.clone();
@@ -1520,11 +1533,87 @@ impl AnalyzeVisitor {
     }
 
     /// Returns `true` if a bare identifier argument in `ty` may be a const, so `ty` is to be leaked
-    /// whole. Not so for a type referring to an item of the module, a group or parentheses.
+    /// whole. Not so for a type referring to an item of the module (the identifier is leaked as a
+    /// type, or it is an error if the item is beside it: see
+    /// [`AnalyzeVisitor::bare_beside_module_item()`]), a group or parentheses.
     fn holds_bare_ident(&self, ty: &Type, inner: &Frame) -> bool {
         !inner.module_item
             && !matches!(ty, Type::Group(_) | Type::Paren(_))
             && has_ambiguous(&inner.effects)
+    }
+
+    /// Returns `true` if the path of `ty`, or the trait of a bound in it (`dyn Tr<..>`), names an
+    /// item of the module: `Local<MY_CONST>`, as opposed to `Other<Local, MY_CONST>`.
+    fn names_module_head(&self, ty: &Type) -> bool {
+        let item = |path: &Path| {
+            !self.starts_with_generic(path)
+                && !self.allowed.is_context_free_path(path)
+                && self.is_module_path(path)
+        };
+        match ty {
+            Type::Path(TypePath { path, .. }) => item(path),
+            Type::TraitObject(TypeTraitObject { bounds, .. })
+            | Type::ImplTrait(TypeImplTrait { bounds, .. }) => bounds
+                .iter()
+                .any(|bound| matches!(bound, TypeParamBound::Trait(bound) if item(&bound.path))),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if `ty` is a path whose parameters are known to be types: the std prelude
+    /// (`Option<..>`, if allowed) and the paths of `::core`, `::std` and `::alloc`
+    /// (`::core::result::Result<..>`), except for `array` (`IntoIter<T, N>`) and `simd`.
+    fn takes_only_types(&self, ty: &Type) -> bool {
+        let path = match ty {
+            Type::Path(TypePath { qself: None, path }) => path,
+            _ => return false,
+        };
+        let names: Vec<String> = path
+            .segments
+            .iter()
+            .map(|seg| ident_name(&seg.ident))
+            .collect();
+        match (
+            path.leading_colon.is_some(),
+            names.first().map(String::as_str),
+        ) {
+            (true, Some("core" | "std" | "alloc")) => {
+                !names.iter().any(|name| name == "array" || name == "simd")
+            }
+            (false, Some("Box" | "Vec" | "Option" | "Result")) => {
+                names.len() == 1 && self.allowed.is_context_free_path(path)
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns the bare identifiers that may be consts, which `ty` has as arguments of its path,
+    /// if it also names an item of the module that is not its own path (`Other<Local, MY_CONST>`).
+    ///
+    /// `ty` is not leaked whole then, as the copy declares the item again, so the identifiers
+    /// would be leaked as types, which fails if one is a const. Unlike `Local<MY_CONST>`: there the
+    /// module declares the path of the holder, and its parameter is a type, as a rule. Here the
+    /// path is another crate's, whose parameters are not known, so it is an error (see
+    /// [Bare identifiers and consts](crate::Leaker#bare-identifiers-and-consts)), unless it is a
+    /// path of the standard library, which takes types only ([`AnalyzeVisitor::takes_only_types()`]).
+    /// The identifiers of a type inside (`Other<Local<MY_CONST>>`) are not told: their holder is
+    /// decided apart.
+    fn bare_beside_module_item(&self, ty: &Type, inner: &Frame) -> Option<Vec<Type>> {
+        if !inner.module_item
+            || matches!(ty, Type::Group(_) | Type::Paren(_))
+            || self.names_module_head(ty)
+            || self.takes_only_types(ty)
+        {
+            return None;
+        }
+        let idents: Vec<Type> = ambiguous_types(&inner.effects)
+            .into_iter()
+            .filter(|ident| {
+                let text = quote!(#{unwrap_type_group(ident)}).to_string();
+                inner.bare_args.contains(&text)
+            })
+            .collect();
+        Some(idents).filter(|idents| !idents.is_empty())
     }
 
     /// Returns `true` if a bare identifier argument in `ty` may be a const, and `ty` can be leaked
@@ -1628,28 +1717,67 @@ impl AnalyzeVisitor {
             self_conflict = Some(conflict);
         }
         // A bare identifier argument may be a const, so the type holding it is leaked whole if it
-        // can be. If it cannot because of an elided lifetime or `impl Trait`, the identifier is
-        // leaked as a type (the copy fails if it is a const). Else there is no sound way: it is a
-        // conflict, the identifier being the cause.
+        // can be. If it cannot because of an elided lifetime or `impl Trait`, or because its path
+        // is an item of the module, the identifier is leaked as a type (the copy fails if it is a
+        // const). Else there is no sound way: it is a conflict, the identifier being the cause.
         let mut bare = None;
-        if inner.min_depth != depth && self.holds_bare_ident(ty, &inner) {
-            match self.own_context(ty, depth, &inner) {
-                Ok(_) => {
-                    self.own_causes(inner.must_start, depth);
-                    inner.min_depth = depth;
+        // A path of another crate that names an item of the module beside the identifier is never
+        // leaked whole (the copy declares the item again): it is a conflict, whatever else stops
+        // it. Its parameters are not known, so the identifier is not assumed to be a type, as it is
+        // for the module's own type.
+        let mut beside = None;
+        if inner.min_depth != depth {
+            if let Some(idents) = self.bare_beside_module_item(ty, &inner) {
+                beside = inner.module_path.clone();
+                bare = Some(idents);
+                self.own_causes(inner.must_start, depth);
+                inner.min_depth = depth;
+            } else if self.holds_bare_ident(ty, &inner) {
+                match self.own_context(ty, depth, &inner) {
+                    Ok(_) => {
+                        self.own_causes(inner.must_start, depth);
+                        inner.min_depth = depth;
+                    }
+                    Err(_) if self.has_hard_cause(&inner) => {
+                        bare = Some(ambiguous_types(&inner.effects));
+                        self.own_causes(inner.must_start, depth);
+                        inner.min_depth = depth;
+                    }
+                    Err(_) => (),
                 }
-                Err(_) if self.has_hard_cause(&inner) => {
-                    bare = Some(ambiguous_types(&inner.effects));
-                    self.own_causes(inner.must_start, depth);
-                    inner.min_depth = depth;
-                }
-                Err(_) => (),
             }
         }
         // A type leaked whole for its own path cannot use a binder lifetime of the output: the type
         // holding the binder is leaked instead, or it is a conflict (in a bound).
         let mut own = (inner.min_depth == depth).then(|| self.own_context(ty, depth, &inner));
         if let Some(conflict) = self_conflict {
+            own = Some(Err(conflict));
+        }
+        if let Some(path) = beside {
+            let mut conflict = match own.take() {
+                Some(Err(conflict)) => conflict,
+                _ => self.conflict_causes(inner.must_start, inner.impossible_start, depth),
+            };
+            if conflict.note.is_none() {
+                conflict.note = Some(format!(
+                    "the type names `{}`, which the module declares and the copy declares again, \
+                     so it is not leaked as a whole",
+                    tidy(&path)
+                ));
+            }
+            // A name that the module declares is not leaked: the way out that only a module has.
+            if conflict.help.is_none() {
+                let name = bare
+                    .as_ref()
+                    .and_then(|idents| idents.first())
+                    .map(|ident| tidy(&quote!(#ident)))
+                    .unwrap_or_default();
+                conflict.help = Some(format!(
+                    "import `{0}` with an absolute `use` (`use ::my_crate::{0};`), or allow it \
+                     with `LeakerConfig::allowed_paths`",
+                    name
+                ));
+            }
             own = Some(Err(conflict));
         }
         if let (Some(idents), Some(Err(conflict))) = (&bare, &own) {
@@ -3726,6 +3854,14 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
                 self.check_self_has_meaning(quote!(#i));
             }
             self.frame.module_item |= in_module;
+            if in_module && self.frame.module_path.is_none() {
+                // Without the arguments: `super::RC`, not `super::RC<u8, 3>`.
+                let mut name = i.clone();
+                for seg in name.segments.iter_mut() {
+                    seg.arguments = PathArguments::None;
+                }
+                self.frame.module_path = Some(quote!(#name));
+            }
         }
         if free && !starts_with_generic {
             // An allowed primitive name is copied as it is. It may be shadowed (`type u16 = i32;`),
@@ -3862,6 +3998,11 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
                 }
                 // syn parses a bare identifier that may be a const as a type (see `ambiguous_arg`).
                 self.ambiguous_arg = is_bare_ident(ty);
+                if self.ambiguous_arg {
+                    self.frame
+                        .bare_args
+                        .push(quote!(#{unwrap_type_group(ty)}).to_string());
+                }
             }
             self.visit_generic_argument(arg);
         }

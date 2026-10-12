@@ -6,8 +6,14 @@
 //! `Leaker` docs.
 //!
 //! - The identifier is leaked as a type only where there is no other way, and the docs say so: an
-//!   elided lifetime or reference in the holder, `impl Trait`, a path the module of `intern_mod`
-//!   declares, and a trait bound (which has no type to leak): `soft_causes_leak_the_identifier`.
+//!   elided lifetime or reference in the holder, `impl Trait`, a holder whose path the module of
+//!   `intern_mod` declares (`Local<ILEN>`), and a trait bound (which has no type to leak):
+//!   `soft_causes_leak_the_identifier`.
+//! - A holder with the path of another crate that names an item of the module beside the
+//!   identifier (`::l::W<Local, ILEN>`) is not leaked whole, as the copy declares `Local` again,
+//!   and the parameters of `W` are not known: an error, unless the module declares `ILEN` too
+//!   (`a_bare_identifier_beside_a_name_the_module_declares_is_not_leaked_as_a_type`, and the
+//!   tests after it).
 //! - For any other cause (`Self` where it is denied, `Self::A`, the default of a parameter, a bound
 //!   that names `Self`, a method lifetime that the copy would leave unconstrained, an expression):
 //!   an error, with the identifier as its cause: `hard_causes_are_errors` pins the text.
@@ -15,9 +21,10 @@
 //! - Every place with every cause, checked for the property that the identifier is an entry on its
 //!   own only for a soft cause: `the_identifier_is_leaked_alone_only_for_a_soft_cause`.
 //!
-//! The Referrer's crate of `tests/cross_crate.rs` (`kinds`, ids 9081 to 9084) compiles the copies:
-//! the path that holds a const (also with `Self` in it) is an entry as a whole, a rejected one
-//! expands to nothing, and the identifier that is a type is leaked alone where it is a soft cause.
+//! The Referrer's crate of `tests/cross_crate.rs` (`kinds`, ids 9081 to 9084, and 9101 and 9102
+//! for a module) compiles the copies: the path that holds a const (also with `Self` in it) is an
+//! entry as a whole, a rejected one expands to nothing, and the identifier that is a type is leaked
+//! alone where it is a soft cause.
 
 use syn::*;
 use template_quote::quote;
@@ -857,4 +864,375 @@ fn the_identifier_is_leaked_alone_only_for_a_soft_cause() {
     }
     // The test checks something: soft causes leak it, and some places and causes reject.
     assert!(leaked > 100 && rejected > 100, "{} {}", leaked, rejected);
+}
+
+// ---------------------------------------------------------------------------------------------
+// A name that the module declares, beside the identifier.
+// ---------------------------------------------------------------------------------------------
+
+/// The module of the property test that found the bug, reduced: `RC` and `R0` are declared in the
+/// module analyzed, the place is in a module nested in it (or in it), and `ILEN` is a constant
+/// that `ilen` declares or imports. `$RC`, `$R0` and `$Tr0` are written as the place needs them
+/// (`super::RC` in the nested module), and `$H` is the holder of `ILEN`.
+fn module_with(nested: bool, ilen: &str, place: &str, holder: &str) -> Item {
+    let (open, close, up) = if nested {
+        ("pub mod n0 {", "}", "super::")
+    } else {
+        ("", "", "")
+    };
+    let place = place
+        .replace("$H", holder)
+        .replace("$RC", &format!("{}RC", up))
+        .replace("$R0", &format!("{}R0", up))
+        .replace("$Tr0", &format!("{}Tr0", up));
+    let source = format!(
+        "pub mod mm0 {{
+            pub struct RC<T: ?Sized, const N: usize>(::core::marker::PhantomData<*const T>);
+            pub struct R0;
+            pub trait Tr0 {{}}
+            {open}
+                {ilen}
+                {place}
+            {close}
+        }}",
+        open = open,
+        close = close,
+        ilen = ilen,
+        place = place,
+    );
+    syn::parse_str(&source).unwrap_or_else(|err| panic!("{}: {}", source, err))
+}
+
+/// The config of the tests of modules: primitives and the prelude (`Vec`, `Box`, ..) are copied.
+fn module_config() -> LeakerConfig {
+    let mut config = LeakerConfig::new();
+    config.allow_primitive().allow_std_prelude();
+    config
+}
+
+fn analyze_module(item: &Item) -> std::result::Result<Referrer, NotInternableError> {
+    analyze_with(Leaker::from_config(module_config()), item, true)
+}
+
+/// `ILEN` imported from outside the module (not declared by it), nested or not.
+fn imported(nested: bool) -> &'static str {
+    if nested {
+        "use super::super::base::BLEN as ILEN;"
+    } else {
+        "use super::base::BLEN as ILEN;"
+    }
+}
+
+/// The error for `name` beside `module_item`, a name that the module declares.
+fn beside_module_item(name: &str, module_item: &str) -> Shown {
+    error(
+        name,
+        &[&format!(
+            "the type names `{}`, which the module declares and the copy declares again, so it \
+             is not leaked as a whole",
+            module_item
+        )],
+        &format!(
+            "{0}, import `{1}` with an absolute `use` (`use ::my_crate::{1};`), or {2}",
+            absolute(name),
+            name,
+            ALLOW
+        ),
+    )
+}
+
+/// The shape of the report (a trait method in a nested module, with a const generic of the method):
+/// the holder of `ILEN` is a path of another crate that names `super::RC` too, which the module
+/// declares. The copy declares `RC` again, so the holder is not leaked as a whole, and `ILEN` was
+/// leaked alone as a type (`type Type = ILEN;`), which does not compile if it is a const.
+#[test]
+fn a_bare_identifier_beside_a_name_the_module_declares_is_not_leaked_as_a_type() {
+    let place = "pub trait Tr<T> { fn m<const M: usize>(&self, a0: $H); }";
+    let holder = "::l::BC<$RC<*mut crate::base::B0, M>, ILEN>";
+    for (nested, name) in [(true, "super::RC"), (false, "RC")] {
+        let item = module_with(nested, imported(nested), place, holder);
+        let err = analyze_module(&item).err().unwrap();
+        assert_eq!(
+            shown(&err),
+            [beside_module_item("ILEN", name)],
+            "{}",
+            nested
+        );
+    }
+    // The exact text, as the macro shows it.
+    let item = module_with(true, imported(true), place, holder);
+    let err = analyze_module(&item).err().unwrap();
+    assert_eq!(
+        syn::Error::from(err).to_string(),
+        "`ILEN` may be a const, and the type that holds it cannot be leaked as a whole\n\
+         \n\
+         \x20 = note: the type names `super::RC`, which the module declares and the copy \
+         declares again, so it is not leaked as a whole\n\
+         \x20 = help: write `ILEN` with an absolute path (`::my_crate::ILEN`, or \
+         `{ ::my_crate::ILEN }` for a const), import `ILEN` with an absolute `use` \
+         (`use ::my_crate::ILEN;`), or allow it with `LeakerConfig::allowed_paths`\n"
+    );
+}
+
+/// The identifier is declared by the module, or imported with an absolute path (which declares it),
+/// or written so that it is not leaked: it is copied as written (it resolves in the copy), whatever
+/// else the holder names.
+#[test]
+fn a_name_the_module_declares_beside_the_identifier_is_no_cause_if_the_identifier_is_declared() {
+    let place = "pub trait Tr<T> { fn m<const M: usize>(&self, a0: $H); }";
+    for nested in [true, false] {
+        for ilen in [
+            // Declared by the module.
+            "pub const ILEN: usize = 2;",
+            // Imported with an absolute path.
+            "use ::l::base::BLEN as ILEN;",
+        ] {
+            for holder in [
+                "::l::BC<$RC<u8, 3>, ILEN>",
+                "::l::BC<ILEN, $RC<u8, 3>>",
+                "::l::BC<$R0, ILEN>",
+                "::l::BC<Vec<$R0>, ILEN>",
+                "::l::BC<$RC<[u8; M], M>, ILEN>",
+            ] {
+                let item = module_with(nested, ilen, place, holder);
+                let referrer = analyze_module(&item)
+                    .unwrap_or_else(|err| panic!("{}, {}, {}: {}", nested, ilen, holder, err));
+                assert!(
+                    entries(&referrer).is_empty(),
+                    "{}, {}, {}: {:?}",
+                    nested,
+                    ilen,
+                    holder,
+                    entries(&referrer)
+                );
+            }
+        }
+        // Written with an absolute path, in braces or not.
+        for ilen in ["::l::base::BLEN", "{ ::l::base::BLEN }"] {
+            let holder = format!("::l::BC<$RC<u8, 3>, {}>", ilen);
+            let item = module_with(nested, imported(nested), place, &holder);
+            let referrer = analyze_module(&item).unwrap();
+            assert!(entries(&referrer).is_empty(), "{}", ilen);
+        }
+    }
+    // Allowed by the config: left as written, so it is no cause either.
+    let item = module_with(true, imported(true), place, "::l::BC<$RC<u8, 3>, ILEN>");
+    let mut config = module_config();
+    config.allowed_paths.push(parse_quote!(ILEN));
+    let referrer = analyze_with(Leaker::from_config(config), &item, true).unwrap();
+    assert!(entries(&referrer).is_empty());
+}
+
+/// The module declares the path of the holder itself (`RC<u8, ILEN>`): the identifier is leaked
+/// alone as a type, the soft cause that the docs name (the module's own type takes a type here, as
+/// a rule), also from the holders of that holder.
+#[test]
+fn a_name_the_module_declares_as_the_path_of_the_holder_still_leaks_the_identifier() {
+    let place = "pub trait Tr<T> { fn m<const M: usize>(&self, a0: $H); }";
+    for nested in [true, false] {
+        for holder in [
+            "$RC<u8, ILEN>",
+            "$RC<[u8; M], ILEN>",
+            "Box<$RC<u8, ILEN>>",
+            "Vec<$RC<u8, ILEN>>",
+            "(u8, $RC<u8, ILEN>)",
+            "&'static $RC<u8, ILEN>",
+            // The path of the holder is the module's, whatever the holder names beside it.
+            "$RC<$R0, ILEN>",
+            "::l::BC<u8, $RC<u8, ILEN>>",
+            "::l::BC<$R0, $RC<u8, ILEN>>",
+            "::l::BC<$RC<u8, ILEN>, M>",
+            "Box<dyn $Tr0>",
+        ] {
+            let item = module_with(nested, imported(nested), place, holder);
+            let referrer = analyze_module(&item)
+                .unwrap_or_else(|err| panic!("{}, {}: {}", nested, holder, err));
+            let leaked = entries(&referrer);
+            if holder.contains("ILEN") {
+                assert_eq!(leaked, ["ILEN"], "{}, {}", nested, holder);
+            } else {
+                assert!(leaked.is_empty(), "{}, {}: {:?}", nested, holder, leaked);
+            }
+        }
+    }
+}
+
+/// The standard library takes types only (but for `array::IntoIter`), so `Result<Local, Error>` is
+/// no error: `Error` is imported from outside the module, and it is leaked alone as a type.
+#[test]
+fn a_standard_path_beside_a_name_the_module_declares_leaks_the_identifier() {
+    for (holder, leaked) in [
+        ("Result<Local, Error>", true),
+        ("Result<Error, Vec<Local>>", true),
+        ("::core::result::Result<Local, Error>", true),
+        ("::std::collections::HashMap<Local, Error>", true),
+        ("::core::array::IntoIter<Local, Error>", false),
+        ("::std::array::IntoIter<Local, Error>", false),
+        ("::l::Result<Local, Error>", false),
+    ] {
+        let source = format!(
+            "mod m {{
+                use super::Error;
+                pub struct Local;
+                pub struct S(pub {});
+            }}",
+            holder
+        );
+        let item: Item = syn::parse_str(&source).unwrap();
+        match analyze_module(&item) {
+            Ok(referrer) => {
+                assert!(leaked, "{}: {:?}", holder, entries(&referrer));
+                assert_eq!(entries(&referrer), ["Error"], "{}", holder);
+            }
+            Err(err) => {
+                assert!(!leaked, "{}: {}", holder, err);
+                assert_eq!(
+                    shown(&err),
+                    [beside_module_item("Error", "Local")],
+                    "{}",
+                    holder
+                );
+            }
+        }
+    }
+}
+
+/// Every place of the module with every holder: the identifier is an entry on its own only where
+/// the module declares the path of its holder (or the path is the standard library's), an error
+/// where the holder names a name of the module beside it, and part of an entry otherwise. Nested
+/// or not, for each place.
+#[test]
+fn in_a_module_the_identifier_is_leaked_alone_only_for_a_path_the_module_declares() {
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Holder {
+        /// The identifier is leaked alone as a type: the module declares the path of the holder, or
+        /// it is a path of the standard library, which takes types only.
+        Alone,
+        /// A path of another crate that names an item of the module.
+        Beside,
+        /// A path of another crate.
+        Outside,
+    }
+    let holders = [
+        ("$RC<u8, ILEN>", Holder::Alone),
+        ("Box<$RC<$R0, ILEN>>", Holder::Alone),
+        ("Result<$R0, ILEN>", Holder::Alone),
+        ("Result<ILEN, $RC<u8, 3>>", Holder::Alone),
+        ("Option<ILEN>", Holder::Outside),
+        ("::core::result::Result<$R0, ILEN>", Holder::Alone),
+        ("::std::collections::HashMap<Vec<$R0>, ILEN>", Holder::Alone),
+        ("::core::array::IntoIter<$R0, ILEN>", Holder::Beside),
+        ("::core::simd::Simd<$R0, ILEN>", Holder::Beside),
+        ("::l::BC<u8, ILEN>", Holder::Outside),
+        ("::l::BC<Vec<u8>, ILEN>", Holder::Outside),
+        ("::l::BC<(u8, u8), ILEN>", Holder::Outside),
+        ("::l::BC<M, ILEN>", Holder::Outside),
+        ("::l::BC<$RC<u8, 3>, ILEN>", Holder::Beside),
+        ("::l::BC<ILEN, $RC<u8, 3>>", Holder::Beside),
+        ("::l::BC<$R0, ILEN>", Holder::Beside),
+        ("::l::BC<Vec<$R0>, ILEN>", Holder::Beside),
+        ("::l::BC<&'static [$R0], ILEN>", Holder::Beside),
+        ("::l::BC<(u8, $R0), ILEN>", Holder::Beside),
+        ("::l::BC<fn($R0), ILEN>", Holder::Beside),
+        ("::l::BC<[$R0; 2], ILEN>", Holder::Beside),
+        ("::l::BC<<$R0 as ::l::Tr>::Out, ILEN>", Holder::Beside),
+        ("::l::BC<dyn $Tr0, ILEN>", Holder::Beside),
+        ("Vec<::l::BC<$R0, ILEN>>", Holder::Beside),
+        ("::l::BC<$R0, ILEN, ILEN>", Holder::Beside),
+        ("::l::BC<$RC<u8, ILEN>, ILEN>", Holder::Beside),
+        ("::l::BC<crate::base::B0, $R0, ILEN>", Holder::Beside),
+    ];
+    let places = [
+        "pub trait Tr<T> { fn m<const M: usize>(&self, a0: $H); }",
+        "pub trait Tr<T> { fn m<const M: usize>(&self) -> $H; }",
+        "pub struct S<const M: usize> { pub a: $H }",
+        "pub enum E<const M: usize> { A($H), B }",
+        "pub union U<const M: usize> { pub a: ::core::mem::ManuallyDrop<$H> }",
+        "pub fn f<const M: usize>(x: $H) {}",
+        "pub type A<const M: usize> = $H;",
+        "pub struct S2<const M: usize>(pub Option<$H>);",
+        "pub struct S3<const M: usize>(pub [$H; 2]);",
+        "pub struct S4<const M: usize>(pub fn($H) -> u8);",
+    ];
+    let (mut alone, mut rejected, mut whole) = (0, 0, 0);
+    for place in places {
+        for (holder, kind) in holders {
+            for nested in [true, false] {
+                let item = module_with(nested, imported(nested), place, holder);
+                let seen = format!("{} in {} (nested = {})", holder, place, nested);
+                match (kind, analyze_module(&item)) {
+                    (Holder::Beside, Err(err)) => {
+                        let items = shown(&err);
+                        assert!(!items.is_empty(), "{}", seen);
+                        for item in &items {
+                            assert_eq!(item.message, headline("ILEN"), "{}", seen);
+                            assert!(
+                                item.notes[0].starts_with("the type names `"),
+                                "{}: {:?}",
+                                seen,
+                                item.notes
+                            );
+                        }
+                        rejected += 1;
+                    }
+                    (Holder::Beside, Ok(referrer)) => {
+                        panic!("accepted: {}: {:?}", seen, entries(&referrer))
+                    }
+                    (_, Err(err)) => panic!("{}: {}", seen, err),
+                    (kind, Ok(referrer)) => {
+                        let leaked = entries(&referrer);
+                        let is_alone = leaked.iter().any(|entry| entry == "ILEN");
+                        assert_eq!(is_alone, kind == Holder::Alone, "{}: {:?}", seen, leaked);
+                        if is_alone {
+                            alone += 1;
+                        } else {
+                            whole += 1;
+                            assert!(
+                                leaked.iter().any(|entry| entry.contains("ILEN")),
+                                "{}: {:?}",
+                                seen,
+                                leaked
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // The test checks something: every kind of outcome happened many times.
+    assert!(
+        alone > 20 && rejected > 100 && whole > 40,
+        "{} {} {}",
+        alone,
+        rejected,
+        whole
+    );
+}
+
+/// `enter_mod` declares the names itself: the names it lists are declared, and the rest is not.
+#[test]
+fn a_name_that_enter_mod_declares_beside_the_identifier_is_an_error_too() {
+    let item: Item = parse_quote! {
+        pub struct S {
+            pub a: ::l::BC<Local, ILEN>,
+        }
+    };
+    let analyze_in = |declared: &[&str]| {
+        let declared: Vec<Ident> = declared
+            .iter()
+            .map(|name| Ident::new(name, proc_macro2::Span::call_site()))
+            .collect();
+        let mut leaker = Leaker::from_config(module_config());
+        let result = leaker.enter_mod("m", declared, |view| view.visit_item(&item));
+        result.map(|_| leaker.finish())
+    };
+    // `Local` is declared: `BC<Local, ILEN>` names it beside the identifier.
+    let err = analyze_in(&["Local"]).err().unwrap();
+    assert_eq!(shown(&err), [beside_module_item("ILEN", "Local")]);
+    // `ILEN` is declared too: it is copied as written.
+    let referrer = analyze_in(&["Local", "ILEN"]).unwrap();
+    assert!(entries(&referrer).is_empty());
+    // `Local` is not declared: it is a relative path, and the path that holds it is an entry.
+    let referrer = analyze_in(&[]).unwrap();
+    assert_eq!(entries(&referrer), [":: l :: BC < Local , ILEN >"]);
 }
