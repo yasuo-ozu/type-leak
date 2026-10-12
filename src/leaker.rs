@@ -31,15 +31,6 @@ use template_quote::quote;
 /// analyzed (keep it for [`Referrer::visitor()`]), or a [`NotInternableError`]. See the [quick
 /// start](crate#quick-start).
 ///
-/// - **A whole item**: [`intern_struct`](Leaker::intern_struct), `intern_enum`, `intern_union`,
-///   `intern_impl`, `intern_trait` and [`intern_mod`](Leaker::intern_mod).
-/// - **Part of an item**: [`enter_generics`](Leaker::enter_generics), `enter_impl`, `enter_type`,
-///   `enter_trait` and `enter_mod` run a closure on a [`View`] of a scope whose generics and `Self`
-///   you declare.
-/// - **Paths to trust as written** (primitives, the prelude, your crates): [`LeakerConfig`].
-/// - **Errors**: [`NotInternableError::items()`] gives each offending path with what is wrong
-///   (`message`), why (`notes`) and what to write instead (`help`).
-///
 /// ```
 /// # use {syn::*, type_leak::*};
 /// let item: ItemTrait = parse_quote! {
