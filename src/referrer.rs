@@ -5,7 +5,7 @@ use crate::elided::{name_elided_in_bare_fn, name_elided_in_bound};
 use crate::encode::{complete_generics_args, param_as_arg, without_encoded_bounds, EncodeError};
 use crate::graph::TypeKey;
 use crate::util::{
-    first_self_in_generics, generic_param_name, mentions_names, parenthesize_bounded,
+    first_self_in_generics, generic_param_name, ident_name, mentions_names, parenthesize_bounded,
     type_mentions_self, ReplaceSelf,
 };
 use proc_macro2::{Literal, Punct, Spacing, Span, TokenStream};
@@ -879,8 +879,10 @@ impl Referrer {
     ///   module itself. If the Leaker saw no such module, it counts as a module no entry depends
     ///   on, so only entries with no module match in it.
     /// - To rewrite a copy of a whole module, visit its items, or a `File` of them. A `File` hides
-    ///   the entries of no module that name what it declares, as a module does. Items visited one
-    ///   by one do not know their siblings.
+    ///   the entries of no module that name what it declares, as a module does, unless the name is
+    ///   a generic of the entry (`crate::base::B1<X>` in `fn f<X>`, in a module that declares
+    ///   `X`: the generic hides the item where the entry is written). Items visited one by one do
+    ///   not know their siblings.
     /// - A context with no module (`intern_trait()`, `enter_generics()`) matches only entries with
     ///   no module. A `mod` item there is a module found with no module around it, which is found
     ///   by its name.
@@ -1521,7 +1523,24 @@ where
         let contexts = &self.referrer.contexts;
         self.referrer.map.retain(|key, entries| {
             if mentions_names(&key.ty, names.clone(), Vec::new()) {
-                entries.retain(|&ix| module && context_map[&contexts[ix]].module().is_some());
+                entries.retain(|&ix| {
+                    let context = &context_map[&contexts[ix]];
+                    if module && context.module().is_some() {
+                        return true;
+                    }
+                    // A generic of the entry's context is the name in the type wherever the entry is
+                    // found, and it hides the item of the same name there (the Leaker does not
+                    // take it for the item either: `starts_with_generic()`).
+                    let items = names.iter().filter(|name| {
+                        let name = ident_name(name);
+                        !context
+                            .generics()
+                            .params
+                            .iter()
+                            .any(|param| generic_param_name(param) == name)
+                    });
+                    !mentions_names(&key.ty, items.cloned().collect(), Vec::new())
+                });
             }
             !entries.is_empty()
         });
@@ -1857,8 +1876,11 @@ impl Referrer {
     // carries its generic associated types with outlives (`type G<'b> where Self: 'b ;`), and the
     // context of an entry that names one has what its where clause requires (`Self: 'x`), as the
     // Referrer computes it for a copy. 9: the Referrer computes the context of a type from the
-    // first segment of a relative path only, so `inner::U` next to a generic `U` is found.
-    pub const FORMAT_VERSION: u32 = 9;
+    // first segment of a relative path only, so `inner::U` next to a generic `U` is found. 10: the
+    // Referrer finds an entry of no module that names a generic of its context also where the copy
+    // declares an item of the same name (`crate::base::B1<X>` next to `fn f<X>` in a module that
+    // declares `X`).
+    pub const FORMAT_VERSION: u32 = 10;
 }
 
 /// Parses a [`Referrer`] written by its [`ToTokens`] implementation.

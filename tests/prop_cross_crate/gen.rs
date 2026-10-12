@@ -257,16 +257,16 @@ pub struct Features {
     /// resolve. Off, such an item names no `Self`.
     pub nested_self: bool,
     /// A relative type with several segments whose last segment is the name of a generic in scope
-    /// (`self::U` next to a generic `U`). The Leaker leaks it, and the Visitor does not replace it:
-    /// it takes the path for the generic, so the Referrer's crate keeps `self::U`, which it does
-    /// not have (E0425). A known failure, off by default: the generator does not write the `self::`
-    /// path of the types it names like a generic (`SHADOW_NAMES`).
+    /// (`self::U` next to a generic `U`). The Visitor used to take the path for the generic, so the
+    /// Referrer's crate kept `self::U` (E0425); fixed (the context of a type is computed from the
+    /// first segment of a relative path only). A known failure, off by default: a `self::` path in a
+    /// where predicate of the type that names `Self` is not taken for a bound cycle (E0277 in the
+    /// Referrer's crate).
     pub path_named_like_generic: bool,
     /// A module analyzed as a whole that declares a type with the name of a generic in scope
-    /// (`mod m { struct X; fn f<X>(a: crate::base::B1<X>) {} }`). The Leaker takes the generic for
-    /// the declared type, and the entry `crate::base::B1<X>`, which it keys by the module, is not
-    /// replaced by the Visitor (the Referrer's crate keeps `crate::base`, E0433). A known failure,
-    /// off by default: the modules analyzed as a whole do not declare the types of `SHADOW_NAMES`.
+    /// (`mod m { struct X; fn f<X>(a: crate::base::B1<X>) {} }`). The Visitor used to hide the
+    /// entry `crate::base::B1<X>` because the module declares `X`, so the Referrer's crate kept
+    /// `crate::base` (E0433); fixed (a generic of the entry hides the declared item), on by default.
     pub declared_named_like_generic: bool,
     /// A bare identifier that may be a const as an argument of a path of another crate, next to an
     /// argument that is leaked (`::l::BC<Rel<T>, ILEN>`, `::l::W<[Self], ILEN>` with `allow_self =
@@ -306,6 +306,7 @@ impl Features {
             self_projection_outlives: true,
             gat_where_clause: true,
             nested_self: true,
+            declared_named_like_generic: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {

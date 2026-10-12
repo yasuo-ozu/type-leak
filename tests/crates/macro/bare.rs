@@ -310,7 +310,8 @@ fn summary(referrer: &Referrer, only_relaxed_sized: bool) -> Vec<String> {
 
 /// The messages of an error, in the text of `bare_text()`, sorted. The headline of a type in a
 /// bound that names what it depends on says which of the bounds it found first, which depends on
-/// the order the bounds are in: the message stops before it.
+/// the order the bounds are in: the message stops before it. So does the `Self::A` that a bound
+/// of the generics names (the first one in the order of their text): only where it is is kept.
 fn messages(error: &NotInternableError) -> Vec<String> {
     let mut messages: Vec<String> = error
         .items()
@@ -318,6 +319,12 @@ fn messages(error: &NotInternableError) -> Vec<String> {
             let mut text = bare_text(&item.message);
             if let Some(at) = text.find(",andaboundofitsgenericsnames") {
                 text.truncate(at);
+            }
+            if let Some(at) = text.find("inaboundofthegenericsof") {
+                if text.starts_with("write`<Selfas") {
+                    let end = text.find(":thecopycannottell").unwrap_or(text.len());
+                    text = format!("write`<Selfas..>::..`{}", &text[at..end]);
+                }
             }
             text
         })

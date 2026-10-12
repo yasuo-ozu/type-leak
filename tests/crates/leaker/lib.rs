@@ -14,6 +14,16 @@ extern crate self as type_leak_test_leaker;
 // The Repeater, with const slots to encode const generics of any primitive type.
 type_leak_test_macro::define_repeater!(pub Repeater);
 
+/// A type of the root of the crate named like a generic (`crate::U`, `kinds::PathsLikeGeneric`).
+pub struct U(pub u8);
+
+/// Types in a module that the Referrer's crate does not have, so `crate::base::B1<X>` left as
+/// written there would not compile (`kinds::declared_like_generic`).
+pub mod base {
+    pub struct B1<A: ?Sized>(pub core::marker::PhantomData<A>);
+    pub struct B2<A, B>(pub A, pub B);
+}
+
 /// Defines a leaked trait using `$crate` paths, which are real tokens since this is a
 /// `macro_rules!`: they resolve to this crate, also from the Referrer's crate.
 macro_rules! define_dollar_crate_trait {
@@ -1195,4 +1205,43 @@ pub mod kinds {
     pub struct Binder<F>(pub F)
     where
         F: for<'b> Fn(Lt<'b, u8>);
+
+    // Names that a generic shares with a path or with an item the module declares (the findings of
+    // the property test, tests/shadowed_names.rs).
+
+    /// A type named like a generic: `self::U` is this one, and `crate::U` the one at the root of
+    /// the crate (`crate::U`).
+    pub struct U(pub u8);
+
+    /// The paths `self::U` and `crate::U` end with the name of the generic `U`: they are relative
+    /// types, which the Referrer's crate cannot name, not the generic.
+    #[prop_leak(id = 9091, allow_self = false, prelude = true)]
+    pub struct PathsLikeGeneric<U> {
+        pub generic: U,
+        pub here: self::U,
+        pub root: crate::U,
+        pub wrapped: Wrap<self::U>,
+        pub both: Pair<crate::U, U>,
+    }
+
+    /// The same in the methods of a trait: the generic is the method's or the trait's.
+    #[prop_leak(id = 9092, allow_self = false, prelude = true)]
+    pub trait PathsLikeGenericTrait<T> {
+        fn here<U>(&self, x: U, y: self::U) -> crate::U;
+        fn wrapped<U>(&self, x: Wrap<U>) -> Wrap<self::U>;
+        fn trait_generic(&self, x: T, y: self::U) -> Pair<crate::U, T>;
+    }
+
+    /// A module that declares `X`, next to a struct whose generic is named `X`: `B1<X>` of the
+    /// generic is an entry of no module (a type of another module of this crate), and the one of
+    /// the declared `X` is an entry of the module. Both are written `crate::base::B1<X>`.
+    #[prop_leak(id = 9093)]
+    pub mod declared_like_generic {
+        pub struct X(pub u8);
+        pub struct Generic<X>(pub crate::base::B1<X>, pub crate::base::B2<X, u8>);
+        pub struct Declared(pub crate::base::B1<X>);
+        pub mod inner {
+            pub struct Deeper<X>(pub crate::base::B1<X>);
+        }
+    }
 }

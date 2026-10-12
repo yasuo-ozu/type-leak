@@ -498,6 +498,23 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9077, __tl_report_9077!()),
             ok("struct", 1, 1, 1),
         ),
+        // paths that end with the name of a generic (`self::U`, `crate::U`), in a struct and in a
+        // trait, and a module that declares `X` next to a struct whose generic is `X`
+        (
+            9091,
+            reported(9091, __tl_report_9091!()),
+            ok("struct", 4, 5, 5),
+        ),
+        (
+            9092,
+            reported(9092, __tl_report_9092!()),
+            ok("trait", 5, 8, 8),
+        ),
+        (
+            9093,
+            reported(9093, __tl_report_9093!()),
+            ok("mod", 3, 5, 5),
+        ),
     ];
     for (id, got, expected) in table {
         assert_eq!(got, expected, "item {}", id);
@@ -701,6 +718,62 @@ fn scopes_that_share_names_keep_their_own_generics() {
     let copy = r::Binder(|lt: l::Lt<'_, u8>| seen.set(*lt.0));
     (copy.0)(l::Lt(&n));
     assert_eq!(seen.get(), 5);
+}
+
+/// Names that a generic shares with a path or with a declared item (`tests/shadowed_names.rs`): the
+/// Referrer's crate compiles only if the visitor replaced `self::U` and `crate::U` next to a generic
+/// `U` (9091, 9092; neither type exists there), and `crate::base::B1<X>` of a generic `X` in a
+/// module that declares an `X` (9093; the Referrer's crate has no `base`).
+#[test]
+fn names_shared_with_a_generic_keep_the_original_types() {
+    use type_leak_test_leaker as l;
+    use type_leak_test_referrer::kinds as r;
+
+    // 9091
+    let copy = r::PathsLikeGeneric::<u8> {
+        generic: 1,
+        here: l::kinds::U(2),
+        root: l::U(3),
+        wrapped: l::kinds::Wrap(PhantomData),
+        both: l::kinds::Pair(l::U(4), 5),
+    };
+    assert_eq!(
+        (
+            copy.generic,
+            copy.here.0,
+            copy.root.0,
+            copy.both.0 .0,
+            copy.both.1
+        ),
+        (1, 2, 3, 4, 5)
+    );
+    same(&copy.wrapped, &l::kinds::Wrap::<l::kinds::U>(PhantomData));
+
+    // 9092: a host implements the trait with the signatures of the copy.
+    type H = r::Host9092;
+    fn implemented_for<T: l::kinds::PathsLikeGenericTrait<u8>>() {}
+    implemented_for::<H>();
+    let _: fn(&H, u16, l::kinds::U) -> l::U =
+        <H as l::kinds::PathsLikeGenericTrait<u8>>::here::<u16>;
+    let _: fn(&H, l::kinds::Wrap<u16>) -> l::kinds::Wrap<l::kinds::U> =
+        <H as l::kinds::PathsLikeGenericTrait<u8>>::wrapped::<u16>;
+    let _: fn(&H, u8, l::kinds::U) -> l::kinds::Pair<l::U, u8> =
+        <H as l::kinds::PathsLikeGenericTrait<u8>>::trait_generic;
+
+    // 9093: the generic `X` of the copy is the parameter of the Leaker's `B1<X>`; the declared `X`
+    // is the Leaker's.
+    use r::declared_like_generic as m;
+    let generic = m::Generic::<u8>(l::base::B1(PhantomData), l::base::B2(1u8, 2u8));
+    same(&generic.0, &l::base::B1::<u8>(PhantomData));
+    assert_eq!((generic.1 .0, generic.1 .1), (1, 2));
+    let declared = m::Declared(l::base::B1(PhantomData));
+    same(
+        &declared.0,
+        &l::base::B1::<l::kinds::declared_like_generic::X>(PhantomData),
+    );
+    let deeper = m::inner::Deeper::<u16>(l::base::B1(PhantomData));
+    same(&deeper.0, &l::base::B1::<u16>(PhantomData));
+    assert_eq!(m::X(7).0, 7);
 }
 
 /// A trait is implemented for an unsized type (`dyn Host`) in the Referrer's crate, with the
