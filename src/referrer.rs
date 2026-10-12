@@ -1396,9 +1396,11 @@ where
     /// A struct, enum, union, trait or impl nested in the visited syntax (an item of a module or of
     /// a `File`, or one in a function body) has a `Self` of its own. The Leaker records the entries
     /// that depend on it: those that name it (`Rel2<Self>` in `struct S<T> { c: Vec<Rel2<Self>> }`),
-    /// and those that use a generic with a bound that names it (`Rel<T>` with `T: ::p::Tr<Self>`).
-    /// The visitor keeps a layer for the item with that `Self`, as the Leaker has it, so it
-    /// computes the same contexts and finds those entries.
+    /// and, in a trait, those that use a generic with a bound that names it (`Rel<T>` with `T:
+    /// ::p::Tr<Self>`). The Leaker rejects the latter in a struct, an enum and a union: the bound
+    /// holds for the `Self` of the copy, which is a type of its own, and the Repeater's impl of the
+    /// entry needs it for the Leaker's type. The visitor keeps a layer for the item with that
+    /// `Self`, as the Leaker has it, so it computes the same contexts and finds those entries.
     ///
     /// It calls `nested_fn(nested, leaked, ix)` for them instead of `type_fn`, because only the macro
     /// knows what to write for the `Self` of the item. The Repeater impl of such an entry is for the

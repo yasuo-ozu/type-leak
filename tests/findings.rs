@@ -45,6 +45,7 @@
 //! | `f34_implied_outlives_of_self_projection_forms_recorded_as_components` | `&'x <Self as Tr<'a, T>>::A`, `&'x Self::A<'b>` and a `Self::A` that a bound equates are recorded as components | fixed |
 //! | `f35_gat_where_clause_of_self_projection_not_recorded` | `Self::G<'x>` of a generic associated type with `where Self: 'b` needs `Self: 'x`, which F34 stopped recording | fixed |
 //! | `f36_nested_item_self_entry_not_rewritten` | an entry that names the own `Self` of a struct, enum, union, trait or impl nested in a module is recorded, and the Visitor never rewrote it: `Visitor::with_nested_self()` | fixed |
+//! | `f37_nested_type_with_a_bound_that_names_its_own_self_is_rejected` | an entry that uses a generic whose bound names the own `Self` of a struct, enum or union nested in a module: the bound holds for the copy's type, the Repeater's impl needs it for the Leaker's | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that the docs of `Leaker` document, or that follows from what rustc accepts). No test
@@ -7299,19 +7300,20 @@ fn f36_an_item_inside_an_item() {
 }
 
 /// F36: an entry that does not name `Self` but has a bound of its generics that does (`Rel<T>` with
-/// `T: ::p::Tr<Self>`), one that needs `Self: 'a`, and one in a trait with a generic associated type,
-/// have the own `Self` of the nested item in their context too: `nested_fn` writes them.
+/// `T: ::p::Tr<Self>`) in a trait, one that needs `Self: 'a`, and one in a trait with a generic
+/// associated type, have the own `Self` of the nested item in their context too: `nested_fn`
+/// writes them. (In a struct, an enum or a union the first is rejected: F37.)
 #[test]
 fn f36_a_bound_or_an_outlives_that_names_the_own_self() {
     let cases: Vec<(Item, &str, &str)> = vec![
         (
             parse_quote!(
-                struct S<T: ::p::Tr<Self>> {
-                    b: Rel<T>,
+                trait Tr<T: ::p::Tr<Self>> {
+                    fn f(&self, x: Rel<T>);
                 }
             ),
-            "S",
-            "struct S<T: ::p::Tr<Self>> { b: N<0usize>, }",
+            "Tr",
+            "trait Tr<T: ::p::Tr<Self>> { fn f(&self, x: N<0usize>); }",
         ),
         (
             parse_quote!(
@@ -7348,5 +7350,210 @@ fn f36_a_bound_or_an_outlives_that_names_the_own_self() {
         let expected: Item = syn::parse_str(expected).unwrap();
         assert_eq!(string(&file.items[0]), string(&expected));
         assert_eq!(calls.take().len(), 1, "`{}`", string(&item));
+    }
+}
+
+/// Analyzes `item` nested as `nest` says, and returns the Leaker with the result.
+fn nested_analysis(
+    nest: Nest,
+    item: &Item,
+    declared: &[&str],
+) -> (Leaker, std::result::Result<ContextId, NotInternableError>) {
+    let mut leaker = new_leaker();
+    let result = match nest {
+        Nest::EnterMod => leaker
+            .enter_mod("m", names(declared), |view| view.visit_item(item))
+            .map(|(context, ())| context),
+        Nest::InternMod => leaker.intern_mod(&parse_quote!(mod m { #item })),
+        Nest::InternModNested => leaker.intern_mod(&parse_quote!(mod m { mod n { #item } })),
+        Nest::EnterGenerics => leaker
+            .enter_generics(&Generics::default(), |view| view.visit_item(item))
+            .map(|(context, ())| context),
+    };
+    (leaker, result)
+}
+
+/// F37 (fixed): a struct, an enum or a union nested in a scope, whose generic has a bound that
+/// names its `Self` (`S<T: AsRef<Self>>`, `where T: AsRef<(Self, Rl)>`), and a field that uses the
+/// generic, was accepted, and the Referrer's crate did not compile (E0277: `the trait bound
+/// `T: AsRef<tlp_l_075::m0::E0_1<'_, T, V>>` is not satisfied`, required for the Leaker's `E0_1` to
+/// implement `Repeater<..>`).
+///
+/// The copy of a nested item is a type of its own (`Self` is the copy's `S<T>`), whereas the
+/// Repeater's impl of the entry is for the Leaker's `S<T>` and needs the bound for that type, which
+/// the environment of the copy (`T: AsRef<Self>`, for the copy's) does not have. The type that the
+/// field uses is the cause, not the path of the bound: `Rl<'a>`, `self::Rl<'a>`, `crate::Rl<'a>`
+/// and the others in the where predicate of the report make no difference (it was first thought that
+/// the `self::` spelling slipped past a check of the bare one; `tests/shadowed_names.rs` has the
+/// spellings). The item analyzed as itself (`intern_*`, `enter_type`..) is fine: the Visitor writes
+/// its `Self` as the Leaker's type (`with_self()`), which has the bound.
+///
+/// The fix: the `Self` of a nested struct, enum or union may be leaked, but not through a bound
+/// that the environment must prove (`AnalyzeVisitor::self_in_bounds()`): the type that uses such
+/// a generic has "a generic whose bound mentions `Self`, which cannot be leaked", like with
+/// `allow_self = false`. Bounds that an impl proves (`Self: Sized`, `Vec<Self>: Clone`), `Self: 'a`,
+/// and a generic that the entry does not use, are fine, and so is a trait (F36).
+///
+/// The property test shows it with `TYPE_LEAK_PROP_FEATURES=nested_self` (on by default): seed 4,
+/// 120 cases, with `path_named_like_generic`, case 75, item 0 (`scope = "mod"`).
+#[test]
+fn f37_nested_type_with_a_bound_that_names_its_own_self_is_rejected() {
+    const HEADLINE: &str = "has a generic whose bound mentions `Self`, which cannot be leaked";
+    let rejected: Vec<(Item, &str, &str)> = vec![
+        (
+            parse_quote!(
+                pub struct S<T: ::core::convert::AsRef<Self>> {
+                    b: Rel<T>,
+                }
+            ),
+            "S",
+            "Rel < T >",
+        ),
+        (
+            parse_quote!(
+                pub struct S<T>(Rel<T>)
+                where
+                    T: ::core::convert::AsRef<(Self, u8)>;
+            ),
+            "S",
+            "Rel < T >",
+        ),
+        // The entry names `Self`, and the bound of the generics of `Self` names it.
+        (
+            parse_quote!(
+                pub enum E<T: ::core::convert::AsRef<Self>> {
+                    A(Rel<Self>),
+                    B(T),
+                }
+            ),
+            "E",
+            "Rel < Self >",
+        ),
+        (
+            parse_quote!(
+                pub union U<T: ::core::marker::Copy + ::core::convert::AsRef<Self>> {
+                    a: ::core::mem::ManuallyDrop<Rel<T>>,
+                }
+            ),
+            "U",
+            "Rel < T >",
+        ),
+        // The report of the property test.
+        (
+            parse_quote!(
+                pub enum E0_1<'a, T: ::core::marker::Send + 'a, const V: usize = 3>
+                where
+                    T: ::core::convert::AsRef<
+                        ::std::collections::BTreeMap<(Self, Self), self::Rl<'a>>,
+                    >,
+                {
+                    V0(&'a super::base::B2<T, ::core::result::Result<u32, u16>>),
+                    V1,
+                }
+            ),
+            "E0_1",
+            "super :: base :: B2 < T , :: core :: result :: Result < u32 , u16 > >",
+        ),
+    ];
+    for (item, name, ty) in &rejected {
+        for nest in NESTS {
+            let (_, result) = nested_analysis(nest, item, &[name]);
+            let err = assert_rejected(item, result, &[&format!("`{}` {}", ty, HEADLINE)]);
+            let notes = all_notes(&err);
+            assert_eq!(
+                notes[0],
+                "the bounds of its generics mention the `Self` of an item nested in the analyzed \
+                 syntax: its copy declares a type of its own, so the bound holds for that, and \
+                 the Repeater's impl of this type needs it for the Leaker's type (E0277)",
+                "{:?} `{}`",
+                nest,
+                string(item)
+            );
+            let helps = all_helps(&err);
+            assert_eq!(helps.len(), 1, "{:?} `{}`", nest, string(item));
+            assert!(
+                helps[0]
+                    .contains("without `Self`, or analyze the item with its own `intern_*` call"),
+                "{}",
+                helps[0]
+            );
+        }
+    }
+    // As the item itself, `Self` is written as the Leaker's type, and the Repeater's impl has the
+    // bound for it: accepted, with the entry.
+    for (item, _, _) in &rejected {
+        let mut leaker = new_leaker();
+        match item {
+            Item::Struct(item) => leaker.intern_struct(item, true).map(|_| ()),
+            Item::Enum(item) => leaker.intern_enum(item, true).map(|_| ()),
+            Item::Union(item) => leaker.intern_union(item, true).map(|_| ()),
+            _ => unreachable!(),
+        }
+        .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), e));
+        assert!(leaker.finish().required().count() > 0, "`{}`", string(item));
+    }
+}
+
+/// F37, the controls: a nested struct, enum or union that names `Self` in no bound that the
+/// environment proves, and the other nested items, are accepted in every nest.
+#[test]
+fn f37_nested_items_that_compile_stay_accepted() {
+    let accepted: Vec<(Item, &str)> = vec![
+        // `Self` in a field, no bound that names it.
+        (
+            parse_quote!(
+                pub struct S<T: Clone>(Rel<Self>, T);
+            ),
+            "S",
+        ),
+        // A bound on `Self`, or on a type that an impl proves.
+        (
+            parse_quote!(
+                pub struct S<T>(Rel<Self>, T)
+                where
+                    Self: Sized;
+            ),
+            "S",
+        ),
+        (
+            parse_quote!(
+                pub struct S<T>(Rel<T>, Vec<Self>)
+                where
+                    Vec<Self>: Clone;
+            ),
+            "S",
+        ),
+        // The generic whose bound names `Self` is not used by the entry.
+        (
+            parse_quote!(
+                pub struct S<T: ::core::convert::AsRef<Self>, U>(Rel<U>, T);
+            ),
+            "S",
+        ),
+        // `Self: 'a` is encoded by the Repeater's impl of the Leaker's type.
+        (
+            parse_quote!(
+                pub struct S<'a, T: 'a>(&'a Rel<Self>, &'a T);
+            ),
+            "S",
+        ),
+        // A trait: its `Self` is the implementor, which the copy's impl for a host writes.
+        (
+            parse_quote!(
+                pub trait Tr<T: ::core::convert::AsRef<Self>> {
+                    fn f(&self) -> Rel<T>;
+                }
+            ),
+            "Tr",
+        ),
+    ];
+    for (item, name) in &accepted {
+        for nest in NESTS {
+            let (leaker, result) = nested_analysis(nest, item, &[name]);
+            if let Err(err) = result {
+                panic!("{:?} `{}` is rejected: {}", nest, string(item), err);
+            }
+            assert!(leaker.finish().iter().count() > 0, "`{}`", string(item));
+        }
     }
 }

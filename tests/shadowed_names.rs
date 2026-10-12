@@ -551,3 +551,318 @@ fn a_declared_name_still_hides_the_entries_that_do_not_name_a_generic() {
         text(&file)
     );
 }
+
+// ── a prefix does not change what the Leaker decides ─────────────────────────────────────────
+
+/// The spellings of a path to a type of the module (`Rl<'a>`). `self::Rl` and the others name the
+/// same item as the bare `Rl` does, so the Leaker must make the same entries from them, and give the
+/// same errors, notes and help, apart from the prefix in the text.
+const PREFIXES: &[&str] = &["", "self::", "crate::", "super::", "self::inner::"];
+
+/// What the Leaker decided about an item, with the prefix taken out of every text.
+#[derive(Clone, Debug, PartialEq)]
+enum Outcome {
+    /// The entries: the type, whether it is required and its generics, and whether each has a module.
+    Accepted {
+        entries: Vec<(String, bool, String)>,
+        modules: Vec<bool>,
+    },
+    Rejected {
+        headline: String,
+        note: Option<String>,
+        help: Option<String>,
+    },
+}
+
+/// `text` without spaces and without the prefixes of the paths.
+fn unprefixed(text: &str) -> String {
+    let mut text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    for prefix in ["self::inner::", "self::", "crate::", "super::"] {
+        text = text.replace(prefix, "");
+    }
+    text
+}
+
+/// Analyzes `item` in `scope` (`declared`: the names the module declares, with `Scope::Mod`).
+fn outcome(item: &Item, scope: Scope, declared: &[&str]) -> Outcome {
+    let mut leaker = Leaker::from_config(config());
+    let name = match item {
+        Item::Struct(i) => i.ident.clone(),
+        Item::Enum(i) => i.ident.clone(),
+        Item::Trait(i) => i.ident.clone(),
+        _ => parse_quote!(Impl),
+    };
+    let result = match (scope, item) {
+        (Scope::Intern, Item::Struct(i)) => leaker.intern_struct(i, true),
+        (Scope::Intern, Item::Enum(i)) => leaker.intern_enum(i, true),
+        (Scope::Intern, Item::Trait(i)) => leaker.intern_trait(i, true),
+        (Scope::Intern, Item::Impl(i)) => leaker.intern_impl(i, true),
+        (Scope::Mod, _) => {
+            let names: Vec<Ident> = std::iter::once(name)
+                .chain(declared.iter().map(|d| parse_str::<Ident>(d).unwrap()))
+                .collect();
+            leaker
+                .enter_mod("m", names, |view| view.visit_item(item))
+                .map(|(context, ())| context)
+        }
+        (Scope::Generics, Item::Struct(i)) => leaker
+            .enter_generics(&i.generics, |view| syn::visit::visit_item_struct(view, i))
+            .map(|(context, ())| context),
+        (Scope::Generics, Item::Enum(i)) => leaker
+            .enter_generics(&i.generics, |view| syn::visit::visit_item_enum(view, i))
+            .map(|(context, ())| context),
+        (Scope::Generics, Item::Trait(i)) => leaker
+            .enter_trait(&i.ident, &i.generics, true, |view| {
+                syn::visit::visit_item_trait(view, i)
+            })
+            .map(|(context, ())| context),
+        _ => unreachable!(),
+    };
+    match result {
+        Ok(_) => {
+            let referrer = leaker.finish();
+            Outcome::Accepted {
+                entries: referrer
+                    .iter_with_generics()
+                    .enumerate()
+                    .map(|(ix, (ty, generics))| {
+                        (
+                            unprefixed(&text(ty)),
+                            referrer.must(ix),
+                            unprefixed(&format!(
+                                "{} {}",
+                                text(&generics),
+                                text(&generics.where_clause)
+                            )),
+                        )
+                    })
+                    .collect(),
+                modules: (0..referrer.iter().count())
+                    .map(|ix| referrer.context_module(referrer.context(ix)).is_some())
+                    .collect(),
+            }
+        }
+        Err(error) => Outcome::Rejected {
+            headline: unprefixed(&error.to_string()),
+            note: error.note().map(|note| unprefixed(&note)),
+            help: error.help().map(|help| unprefixed(&help)),
+        },
+    }
+}
+
+/// The item `source` with `{Rl}` and `{Wrap}` spelled with `prefix`.
+fn spelled(source: &str, prefix: &str) -> Item {
+    let source = source
+        .replace("{Rl}", &format!("{}Rl", prefix))
+        .replace("{Wrap}", &format!("{}Wrap", prefix));
+    parse_str(&source).unwrap_or_else(|e| panic!("{}: {}", source, e))
+}
+
+/// What the bare spelling must give.
+#[derive(Clone, Copy, Debug)]
+enum Expect {
+    Accepted,
+    /// Rejected, with a headline that contains this.
+    Rejected(&'static str),
+}
+
+/// Checks that each prefixed spelling of `source` gives the outcome of the bare one in `scope`, and
+/// that the bare one is `expect`ed (so that the test cannot pass by comparing rejections that it
+/// did not look at).
+fn same_outcome_with_every_prefix(source: &str, scope: Scope, expect: Expect) {
+    let bare = outcome(&spelled(source, ""), scope, &[]);
+    match (&bare, expect) {
+        (Outcome::Accepted { entries, .. }, Expect::Accepted) => {
+            assert!(!entries.is_empty(), "{:?} {}: no entry", scope, source)
+        }
+        (Outcome::Rejected { headline, .. }, Expect::Rejected(part)) => assert!(
+            headline.contains(&unprefixed(part)),
+            "{:?} {}: {}",
+            scope,
+            source,
+            headline
+        ),
+        _ => panic!(
+            "{:?} {}: expected {:?}, got {:?}",
+            scope, source, expect, bare
+        ),
+    }
+    for prefix in &PREFIXES[1..] {
+        let actual = outcome(&spelled(source, prefix), scope, &[]);
+        assert_like_bare(&actual, &bare, prefix, &format!("{:?} {}", scope, source));
+    }
+}
+
+/// Asserts that `actual`, the outcome of the spelling with `prefix`, is that of the bare one. A path
+/// of `crate::` is the same in every module, so its entry has no module unless the context is
+/// bound to the module otherwise (the nested `Self` is a type of the module): its Repeater impl
+/// need not be written in the module where the bare name resolves. The others are relative to the
+/// module, as the bare name is.
+fn assert_like_bare(actual: &Outcome, bare: &Outcome, prefix: &str, what: &str) {
+    match (actual, bare) {
+        (
+            Outcome::Accepted { entries, modules },
+            Outcome::Accepted {
+                entries: bare_entries,
+                modules: bare_modules,
+            },
+        ) if prefix == "crate::" => {
+            assert_eq!(entries, bare_entries, "`{}` {}", prefix, what);
+            assert!(
+                modules
+                    .iter()
+                    .zip(bare_modules)
+                    .all(|(m, bare)| *bare || !*m),
+                "`{}` {}: {:?} is more bound to the module than {:?}",
+                prefix,
+                what,
+                modules,
+                bare_modules
+            );
+        }
+        _ => assert_eq!(actual, bare, "`{}` {}", prefix, what),
+    }
+}
+
+/// The repro of the property test (seed 4, case 75): an enum whose where predicate names `Self`
+/// and a type of the module, and whose field uses the generic of that predicate. Nested in a module,
+/// the copy declares an enum of its own: the bound holds for it, and the Repeater's impl of the
+/// field's type needs it for the Leaker's enum (E0277 in the Referrer's crate). The Leaker rejects
+/// it, and it makes no difference how the type of the module is spelled (`self::Rl` was thought to
+/// slip past a check that the bare `Rl` did not: the bare spelling failed in the same way).
+#[test]
+fn a_nested_enum_whose_bound_names_self_is_rejected_with_every_spelling_of_a_type_of_the_module() {
+    let source = "pub enum E<'a, T: ::core::marker::Send + 'a, const V: usize = 3>
+        where T: ::core::convert::AsRef<::std::collections::BTreeMap<(Self, Self), {Rl}<'a>>>
+        { V0(&'a super::base::B2<T, ::core::result::Result<u32, u16>>), V1 }";
+    same_outcome_with_every_prefix(
+        source,
+        Scope::Mod,
+        Expect::Rejected("has a generic whose bound mentions `Self`"),
+    );
+    // Analyzed as the item itself, `Self` is written as the Leaker's type: accepted.
+    same_outcome_with_every_prefix(source, Scope::Intern, Expect::Accepted);
+}
+
+/// The bounds that name a leaked type, with the path spelled every way. These rejections and the
+/// items that are accepted are those of `tests/bound_cycles.rs`.
+#[test]
+fn a_bound_that_names_a_leaked_type_is_decided_with_every_spelling() {
+    const BOUND_CYCLE: &str = "is in a bound or where predicate";
+    for scope in [Scope::Intern, Scope::Mod, Scope::Generics] {
+        // `{Wrap}<T>` is in a predicate, and `T` has a bound that names `{Rl}`.
+        for source in [
+            "pub struct S<T: Fn({Rl})>({Wrap}<T>) where {Wrap}<T>: Sized;",
+            "pub struct S<T: Fn({Rl}), U: Into<{Wrap}<T>>>(T, U);",
+            "pub struct S<T: Into<{Wrap}<T>>>(T);",
+            "pub struct S<T: AsRef<{Rl}>>({Wrap}<T>) where {Wrap}<T>: Sized;",
+        ] {
+            same_outcome_with_every_prefix(source, scope, Expect::Rejected(BOUND_CYCLE));
+        }
+        // In a field, the same types are fine.
+        same_outcome_with_every_prefix(
+            "pub struct S<T: Fn({Rl})>({Wrap}<T>);",
+            scope,
+            Expect::Accepted,
+        );
+        same_outcome_with_every_prefix(
+            "pub struct S<T: Iterator<Item = {Rl}>>({Wrap}<T>);",
+            scope,
+            Expect::Accepted,
+        );
+        // In a method of a trait.
+        same_outcome_with_every_prefix(
+            "pub trait Tr { fn f<T: Fn({Rl})>(&self, a: {Wrap}<T>) where {Wrap}<T>: Sized; }",
+            scope,
+            Expect::Rejected(BOUND_CYCLE),
+        );
+        same_outcome_with_every_prefix(
+            "pub trait Tr { fn f<T: Fn({Rl})>(&self, a: {Wrap}<T>); }",
+            scope,
+            Expect::Accepted,
+        );
+    }
+}
+
+/// `Self` in a bound or a predicate, with the path spelled every way.
+#[test]
+fn a_bound_that_names_self_is_decided_with_every_spelling() {
+    // A trait: `{Rl}<Self>` is in a predicate of the trait, and its impl is for the implementors.
+    for scope in [Scope::Intern, Scope::Generics] {
+        same_outcome_with_every_prefix(
+            "pub trait Tr<T> where {Rl}<Self>: Sized {}",
+            scope,
+            Expect::Rejected("names `Self` in a bound or where predicate of its trait"),
+        );
+        same_outcome_with_every_prefix(
+            "pub trait Tr<T: AsRef<{Rl}<Self>>> {}",
+            scope,
+            Expect::Rejected("is in a bound or where predicate"),
+        );
+        same_outcome_with_every_prefix(
+            "pub trait Tr<T> { fn f(&self) where {Rl}<Self>: Sized; }",
+            scope,
+            Expect::Accepted,
+        );
+    }
+    // A method of an impl: the self type is leaked, and the bound of `X` names `Self`.
+    same_outcome_with_every_prefix(
+        "impl S { fn m<X>(&self) where X: Fn(Self) -> u8, {Rl}<X>: Default {} }",
+        Scope::Intern,
+        Expect::Rejected("is in a bound or where predicate"),
+    );
+    // A struct, an enum: `Self` in the bound of a generic that an entry of a field uses. As the
+    // item itself, the Referrer writes `Self` as the Leaker's type, so it is fine. Nested in a
+    // module, the copy has a `Self` of its own: rejected.
+    for source in [
+        "pub struct S<T: AsRef<Self>>({Wrap}<T>);",
+        "pub struct S<T>({Wrap}<T>) where T: AsRef<(Self, {Rl}<'static>)>;",
+        "pub enum E<T> where T: AsRef<Self> { A({Wrap}<Self>), B(T) }",
+    ] {
+        same_outcome_with_every_prefix(
+            source,
+            Scope::Mod,
+            Expect::Rejected("has a generic whose bound mentions `Self`"),
+        );
+        same_outcome_with_every_prefix(source, Scope::Intern, Expect::Accepted);
+    }
+    // Not so if `Self` is not in a bound that the environment proves (`Self: Sized`, `Vec<Self>:
+    // Clone`), if the entry does not use the generic, or if `Self` is only outlived.
+    for source in [
+        "pub struct S<T>({Wrap}<Self>, T) where Self: Sized;",
+        "pub struct S<T>({Wrap}<T>, Vec<Self>) where Vec<Self>: Clone;",
+        "pub struct S<T: AsRef<Self>, U>({Wrap}<U>, T);",
+        "pub struct S<'a, T: 'a>(&'a {Wrap}<Self>, &'a T);",
+    ] {
+        for scope in [Scope::Intern, Scope::Mod] {
+            same_outcome_with_every_prefix(source, scope, Expect::Accepted);
+        }
+    }
+}
+
+/// A type that the module declares is not an entry, spelled bare or with `self::`. Another module's
+/// type with the same name (`crate::Rl`, `super::Rl`) is one.
+#[test]
+fn a_declared_type_is_neutral_bare_and_with_self() {
+    let source = "pub enum E<'a, T: 'a> { A({Rl}<'a>, &'a T), B }";
+    let bare = outcome(&spelled(source, ""), Scope::Mod, &["Rl"]);
+    assert_eq!(
+        bare,
+        Outcome::Accepted {
+            entries: Vec::new(),
+            modules: Vec::new()
+        },
+        "declared: no entry"
+    );
+    assert_eq!(
+        outcome(&spelled(source, "self::"), Scope::Mod, &["Rl"]),
+        bare
+    );
+    // Not declared: an entry for each spelling, the same but for the prefix.
+    let bare = outcome(&spelled(source, ""), Scope::Mod, &[]);
+    assert!(matches!(&bare, Outcome::Accepted { entries, .. } if entries.len() == 1));
+    for prefix in &PREFIXES[1..] {
+        let actual = outcome(&spelled(source, prefix), Scope::Mod, &[]);
+        assert_like_bare(&actual, &bare, prefix, source);
+    }
+}

@@ -78,7 +78,11 @@ pub enum NotInternableError {
     ///   in the default of a parameter, and names `Self`".
     /// - A type that uses a generic whose bound mentions a `Self` that cannot be leaked. The
     ///   headline is "`Wrap<T>` has a generic whose bound mentions `Self`, which cannot be
-    ///   leaked".
+    ///   leaked". That is the `Self` that `allow_self = false` denies, and the `Self` of a
+    ///   struct, an enum or a union that [`View::visit_item()`](crate::View::visit_item) visits,
+    ///   in a bound that the environment proves (`T: AsRef<Self>`): the copy declares a type of
+    ///   its own, so the bound holds for that, and the Repeater's impl of the type needs it for
+    ///   the Leaker's. Analyze such an item with its own `intern_*` call.
     /// - A type in a bound or where predicate that the copy cannot write through the Repeater,
     ///   because rustc cannot prove a bound of its generics that names a leaked type
     ///   ([Bounds that name leaked types](crate::Leaker#bounds-that-name-leaked-types)). The

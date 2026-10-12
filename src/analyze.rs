@@ -19,9 +19,9 @@ use crate::unstable::{bindings, Cause, Projections, Unstable, Why};
 use crate::util::{
     first_associated_self_in_generics, first_self_in_generics, first_self_in_type,
     generic_param_mentions_self, generic_param_name, has_lifetime_bound, ident_name,
-    is_primitive_name, or_list, selves_in_generics, tidy, token_names, trait_object_of,
-    unwrap_type_group, where_predicate_mentions_self, without_crate_prefix, without_defaults,
-    AllowedPaths,
+    is_primitive_name, or_list, self_in_param, self_in_predicate, selves_in_generics, tidy,
+    token_names, trait_object_of, unwrap_type_group, where_predicate_mentions_self,
+    without_crate_prefix, without_defaults, AllowedPaths,
 };
 use crate::view::View;
 use proc_macro2::TokenStream;
@@ -584,6 +584,7 @@ struct ScopeMark {
     item_depth: usize,
     self_ty: Option<SelfRequirement>,
     self_written: bool,
+    self_nested: bool,
     self_trait: Option<ImplTrait>,
     self_depth: usize,
     allow_self: bool,
@@ -665,6 +666,12 @@ pub(crate) struct AnalyzeVisitor {
     self_ty: Option<SelfRequirement>,
     /// `self_ty` is the self type of an impl, which the copy writes (see [`DeclaredSelf`]).
     self_written: bool,
+    /// `self_ty` is the `Self` of a struct, an enum or a union nested in the analyzed syntax (an
+    /// item of a module, or `View::visit_item()`): the copy declares a type of its own there, so
+    /// its `Self` is not the Leaker's type that the Repeater's impls are for (see
+    /// [`AnalyzeVisitor::self_in_bounds()`]). The `Self` of a scope (`intern_struct()`,
+    /// `enter_type()`) is the outermost item's, which the Visitor writes as the Leaker's type.
+    self_nested: bool,
     /// The trait that the impl declaring `Self` implements, if it is an impl of a trait: what a
     /// `Self::A` is written through (see [`AssocSelf`]).
     self_trait: Option<ImplTrait>,
@@ -787,6 +794,7 @@ impl AnalyzeVisitor {
                 .collect(),
             self_ty: None,
             self_written: false,
+            self_nested: false,
             self_trait: None,
             self_depth: 0,
             root_declares_self: false,
@@ -1022,7 +1030,19 @@ impl AnalyzeVisitor {
 
     /// Returns the first mention of `Self` in the generics of `context`, if `Self` may not be
     /// leaked. A written `Self: 'a` counts: it is encoded as `&'a Self`, which needs `Self` too.
+    ///
+    /// The `Self` of a struct, an enum or a union nested in the analyzed syntax (`self_nested`)
+    /// may be leaked, but not through a bound that the environment must prove. The Repeater's impl
+    /// of a type that depends on it is for the Leaker's own type and needs the bound for that
+    /// type (`T: AsRef<::p::m::S<T>>`), whereas the copy declares a type of its own, and has the
+    /// bound for it (`T: AsRef<Self>`, the copy's `S<T>`), so the Referrer's crate cannot prove
+    /// it (E0277). It makes no difference where the generic is bounded: `S<T: AsRef<Self>>`, `where
+    /// T: AsRef<(Self, Rel)>`. A predicate on another type, which an impl proves (`Self: Sized`,
+    /// `Vec<Self>: Clone`), and `Self: 'a` are fine.
     fn self_in_bounds(&self, context: &Context) -> Option<TokenStream> {
+        if self.self_nested {
+            return self_in_environment_bounds(context);
+        }
         if self.allow_self {
             return None;
         }
@@ -1141,6 +1161,7 @@ impl AnalyzeVisitor {
             item_depth: self.item_depth,
             self_ty: self.self_ty.clone(),
             self_written: self.self_written,
+            self_nested: self.self_nested,
             self_trait: self.self_trait.clone(),
             self_depth: self.self_depth,
             allow_self: self.allow_self,
@@ -1169,6 +1190,7 @@ impl AnalyzeVisitor {
                 });
                 self.self_ty = None;
                 self.self_written = false;
+                self.self_nested = false;
                 self.self_trait = None;
                 self.self_depth = 0;
                 self.allow_self = true;
@@ -1182,6 +1204,7 @@ impl AnalyzeVisitor {
                 if let Some(declared) = declares {
                     self.self_ty = Some(declared.requirement.clone());
                     self.self_written = declared.written;
+                    self.self_nested = false;
                     self.self_trait = trait_path.as_deref().map(|path| self.impl_trait(path));
                     self.allow_self = declared.allow_self;
                 }
@@ -1218,6 +1241,7 @@ impl AnalyzeVisitor {
         self.item_depth = mark.item_depth;
         self.self_ty = mark.self_ty;
         self.self_written = mark.self_written;
+        self.self_nested = mark.self_nested;
         self.self_trait = mark.self_trait;
         self.self_depth = mark.self_depth;
         self.allow_self = mark.allow_self;
@@ -1494,6 +1518,30 @@ impl AnalyzeVisitor {
             }
         };
         match self.self_in_bounds(&context) {
+            Some(self_path) if self.self_nested => Err(CheckResult {
+                must: vec![quote!(#ty)],
+                impossible: vec![self_path.clone()],
+                is_own: true,
+                optional: false,
+                note: Some(
+                    "the bounds of its generics mention the `Self` of an item nested in the \
+                     analyzed syntax: its copy declares a type of its own, so the bound holds \
+                     for that, and the Repeater's impl of this type needs it for the Leaker's \
+                     type (E0277)"
+                        .to_string(),
+                ),
+                help: Some(format!(
+                    "write the bound of the generics of `{}` without `{}`, or analyze the item \
+                     with its own `intern_*` call, which writes its `Self` as the Leaker's type",
+                    tidy(&quote!(#ty)),
+                    tidy(&self_path)
+                )),
+                // The fault is the bound, not the path of the type that uses it.
+                headline: Some(format!(
+                    "`{}` has a generic whose bound mentions `Self`, which cannot be leaked",
+                    quote!(#ty)
+                )),
+            }),
             Some(self_path) => Err(CheckResult {
                 must: vec![quote!(#ty)],
                 impossible: vec![self_path.clone()],
@@ -2751,8 +2799,11 @@ impl AnalyzeVisitor {
             self.allow_self = true;
         }
         let declares = self_ty.is_some();
+        let nested_type =
+            self.item_depth > 0 && !written && matches!(self_ty, Some(SelfRequirement::Type(_)));
         let outer = std::mem::replace(&mut self.self_ty, self_ty);
         let outer_written = std::mem::replace(&mut self.self_written, written);
+        let outer_nested = std::mem::replace(&mut self.self_nested, nested_type);
         let outer_trait = self.self_trait.take();
         let outer_depth = self.self_depth;
         self.with_item_generics_of(generics, gats, |visitor| {
@@ -2761,6 +2812,7 @@ impl AnalyzeVisitor {
         });
         self.self_ty = outer;
         self.self_written = outer_written;
+        self.self_nested = outer_nested;
         self.self_trait = outer_trait;
         self.self_depth = outer_depth;
         self.allow_self = allow_self;
@@ -3299,6 +3351,29 @@ fn needs_environment(predicate: &WherePredicate, context: &Context) -> bool {
         ),
         None => false,
     }
+}
+
+/// Returns the first mention of `Self` in a bound of a generic of `context`, or in a where
+/// predicate that the environment must prove (see [`needs_environment()`]).
+fn self_in_environment_bounds(context: &Context) -> Option<TokenStream> {
+    let generics = context.generics();
+    for param in &generics.params {
+        if let GenericParam::Type(param) = param {
+            // The default is no bound.
+            let mut bounds = param.clone();
+            bounds.eq_token = None;
+            bounds.default = None;
+            if let Some(first) = self_in_param(&GenericParam::Type(bounds)).first {
+                return Some(first);
+            }
+        }
+    }
+    generics
+        .where_clause
+        .iter()
+        .flat_map(|where_clause| &where_clause.predicates)
+        .filter(|predicate| needs_environment(predicate, context))
+        .find_map(|predicate| self_in_predicate(predicate).first)
 }
 
 /// Returns the types, with their contexts, that are optional entries in `effects`.

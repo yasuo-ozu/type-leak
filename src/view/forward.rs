@@ -35,6 +35,13 @@ impl View<'_> {
     /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self). A function, type alias,
     /// trait alias, const or static has no `Self` of its own: it keeps the one around.
     ///
+    /// The copy of a nested struct, enum or union declares a type of its own, so a type that uses a
+    /// generic with a bound that names its `Self` (`struct S<T: AsRef<Self>>(Rel<T>);`) is an error:
+    /// the Repeater's impl of the type needs the bound for the Leaker's `S<T>`, and the copy has it
+    /// for its own. The headline is "`Rel<T>` has a generic whose bound mentions `Self`, which
+    /// cannot be leaked". Write the bound without `Self`, or analyze the item with an `intern_*`
+    /// method, where the Visitor writes `Self` as the Leaker's type.
+    ///
     /// The bounds of a generic are written for the `Self` of the scope that declares it. A type in
     /// a nested item that uses the generic gets them rewritten for the `Self` of that item, and its
     /// entry does not depend on the other one: `T: ::p::Tr<Self>` of `struct S<T: ::p::Tr<Self>>`
