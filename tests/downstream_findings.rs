@@ -690,6 +690,30 @@ fn twelve_a_relaxed_bound_is_copied_as_written() {
     );
 }
 
+/// 12: in a module, a bare `?Sized` does not tie the context of an entry to the module, as a
+/// relative path would: the entries are the same as with `?::core::marker::Sized`.
+#[test]
+fn twelve_a_bare_relaxed_bound_does_not_make_an_entry_of_the_module() {
+    let modules = |item: syn::Item| {
+        let mut leaker = Leaker::new();
+        leaker
+            .enter_mod("m", [], |view| view.visit_item(&item))
+            .unwrap();
+        let referrer = leaker.finish();
+        (0..referrer.iter().count())
+            .map(|ix| referrer.context_module(referrer.context(ix)).is_some())
+            .collect::<Vec<_>>()
+    };
+    let bare = modules(parse_quote! {
+        enum E<T: ?Sized + ::core::fmt::Debug> { A(::p::W<T>) }
+    });
+    let full = modules(parse_quote! {
+        enum E<T: ?::core::marker::Sized + ::core::fmt::Debug> { A(::p::W<T>) }
+    });
+    assert_eq!(bare, [false]);
+    assert_eq!(bare, full);
+}
+
 /// 12: a relaxed bound on anything but `Sized` is no relaxation (rustc rejects it), and the plain
 /// `Sized` is a relative trait, which is rejected as `Clone` is. The headline names the path, not the
 /// `?`.

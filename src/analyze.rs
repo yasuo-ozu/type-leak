@@ -4081,6 +4081,12 @@ impl<'ast, F: Fn(&Path) -> bool> Visit<'ast> for AnyPath<F> {
         self.found |= (self.pred)(i);
         syn::visit::visit_path(self, i)
     }
+    fn visit_trait_bound(&mut self, i: &'ast TraitBound) {
+        // A bare `?Sized` is the language's relaxed bound, which no module can change.
+        if !is_relaxed_sized(i) {
+            syn::visit::visit_trait_bound(self, i)
+        }
+    }
     fn visit_macro(&mut self, i: &'ast Macro) {
         if self.macros {
             self.found = true;
