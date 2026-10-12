@@ -46,6 +46,7 @@
 //! | `f35_gat_where_clause_of_self_projection_not_recorded` | `Self::G<'x>` of a generic associated type with `where Self: 'b` needs `Self: 'x`, which F34 stopped recording | fixed |
 //! | `f36_nested_item_self_entry_not_rewritten` | an entry that names the own `Self` of a struct, enum, union, trait or impl nested in a module is recorded, and the Visitor never rewrote it: `Visitor::with_nested_self()` | fixed |
 //! | `f37_nested_type_with_a_bound_that_names_its_own_self_is_supported` | an entry that uses a generic whose bound names the own `Self` of a struct, enum or union nested in a module: the bound holds for the copy's type, the Repeater's impl needed it for the Leaker's; the impl is for any type now, and the copy passes its own (`SelfRequirement::Any`) | fixed |
+//! | `f38_an_absolute_type_that_names_the_own_self_is_copied_as_written` | an absolute type that names the own `Self` of a struct, enum or union nested in a module (`::std::boxed::Box<Self>`) was an optional entry: a strict Referrer replaced it with the Leaker's type, and a trusting one left the copy's own; it is no entry now, and both copy it as written | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that the docs of `Leaker` document, or that follows from what rustc accepts). No test
@@ -6863,6 +6864,17 @@ const NESTS: [Nest; 4] = [
 /// Analyzes `item` nested as `nest` says, rewrites the copy with `nested_visitor()`, and returns
 /// the rewritten item, the entries and the calls of `with_nested_self()`.
 fn nested_copy(nest: Nest, item: &Item, declared: &[&str]) -> (Item, Referrer, Vec<String>) {
+    nested_copy_as(nest, item, declared, false)
+}
+
+/// Like `nested_copy()`, for a Referrer that replaces the optional entries too if `strict`
+/// (`allow_ambiguous_crate_name(false)`).
+fn nested_copy_as(
+    nest: Nest,
+    item: &Item,
+    declared: &[&str],
+    strict: bool,
+) -> (Item, Referrer, Vec<String>) {
     let mut leaker = new_leaker();
     let context = match nest {
         Nest::EnterMod => {
@@ -6882,7 +6894,7 @@ fn nested_copy(nest: Nest, item: &Item, declared: &[&str]) -> (Item, Referrer, V
                 .0
         }
     };
-    let referrer = leaker.finish();
+    let referrer = leaker.finish().allow_ambiguous_crate_name(!strict);
     let (mut visitor, calls) = nested_visitor(&referrer, context);
     let copy = match nest {
         Nest::EnterMod | Nest::InternMod => {
@@ -6942,6 +6954,9 @@ fn nested_copy(nest: Nest, item: &Item, declared: &[&str]) -> (Item, Referrer, V
 /// (also a module nested in the module), and `enter_generics` (the item is in a method body of the
 /// copy). The other tests of the finding: an outer `Self` that the nested item hides, `allow_self =
 /// false` around, and an item inside an item.
+///
+/// The entries are the types that must be leaked (relative paths). An absolute type that names the
+/// `Self` of a struct, an enum or a union is none, and keeps the copy's `Self` (F38).
 ///
 /// The property test shows it with `TYPE_LEAK_PROP_FEATURES=nested_self`, which is on by default
 /// (before the fix, seed 1 with 24 cases failed nine times in the Referrer's crate: `cannot find
@@ -7673,7 +7688,8 @@ fn f37_a_default_cannot_pass_the_own_type() {
 /// any type: it is for the Leaker's (what `Self` is in the type is what the Leaker saw, and what
 /// the type needs of it to be well-formed is not known), and the bound that the copy proves is for
 /// its own type. As the item itself (`intern_*`), `Self` is written as the Leaker's type, which
-/// has the bound: accepted.
+/// has the bound: accepted. Written with an absolute path (the help says so) the type is no
+/// entry, and the copy has it as written, with its own `Self`: accepted (F38).
 #[test]
 fn f37_a_type_that_names_self_with_a_bound_that_names_it_is_rejected() {
     const HEADLINE: &str = "has a generic whose bound mentions `Self`, which cannot be leaked";
@@ -7694,10 +7710,12 @@ fn f37_a_type_that_names_self_with_a_bound_that_names_it_is_rejected() {
             );
             let helps = all_helps(&err);
             assert_eq!(helps.len(), 1, "{:?} `{}`", nest, string(item));
+            // The ways out: the F38 fix (an absolute path) is one.
             assert!(
                 helps[0].contains(
-                    "without `Self`, write the type without `Self`, or analyze the item with \
-                     its own `intern_*` call"
+                    "without `Self`, write the type without `Self`, write the type with an \
+                     absolute path (it is copied as written, and its `Self` is the copy's own), \
+                     or analyze the item with its own `intern_*` call"
                 ),
                 "{}",
                 helps[0]
@@ -7791,5 +7809,610 @@ fn f37_nested_items_that_compile_stay_accepted() {
             }
             assert!(leaker.finish().iter().count() > 0, "`{}`", string(item));
         }
+    }
+}
+
+// ── F38 ──────────────────────────────────────────────────────────────────────
+
+/// The entries of `referrer` as text without spaces, `?` first for an optional one.
+fn f38_entries(referrer: &Referrer) -> Vec<String> {
+    (0..referrer.iter().count())
+        .map(|ix| {
+            let ty = string(referrer.iter().nth(ix).unwrap()).replace(' ', "");
+            format!("{}{}", if referrer.must(ix) { "" } else { "?" }, ty)
+        })
+        .collect()
+}
+
+/// F38 (fixed): an absolute type that names the own `Self` of a struct, an enum or a union nested in
+/// a scope (`View::visit_item()`, the items of `intern_mod()`) was recorded as an optional entry
+/// (`SelfRequirement::Type`, `must` is `false`), and the copy of a Referrer that replaces the
+/// optional entries (`allow_ambiguous_crate_name(false)`, a strict one) was not the copy of one
+/// that does not.
+///
+/// The type is `::std::boxed::Box<Self>`, `::p::Rel2<Self, T>`: it resolves the same in the copy
+/// (`::std` and `::p` are crates, which only the choice of the Referrer makes optional), and its
+/// only link to the item is `Self`. The copy declares a type of its own, so `Self` in a type
+/// copied as written is that type. A trusting Referrer left the type as written (the copy's
+/// `Self`), and a strict one replaced it with `<Leaker's S as Repeater<..>>::Type`, which holds the
+/// Leaker's `S` for `Self`: `struct Node { next: ::std::boxed::Box<Self> }` was not recursive in the
+/// strict copy (`Box<leaker::Node>`), and `::p::Rel2<Self, T>` meant two different types in the
+/// same item according to a bound that names `Self` (with `T: AsRef<Self>` the Leaker records no
+/// entry, as it cannot make an impl that is for the Leaker's type: the bound holds for the copy's).
+///
+/// The fix: such a type is no entry. It is copied as written by both, with `Self` the copy's own,
+/// with or without the bound. Only the types that must be leaked use the type that the macro
+/// writes for `Self` (`with_nested_self()`, the Leaker's by convention): the relative ones
+/// (`Rel<Self>`, `inner::W<Self>`, `crate::W<Self>`). What in an absolute type must be leaked on
+/// its own still is (`Rel<T>` in `::p::Rel2<Self, Rel<T>>`), and so is an absolute type that does
+/// not name `Self` (`::c::W<T>`, an optional entry). The result is also the way out that the
+/// error of F37 suggests for `Rel2<Self, T>` with a bound that names `Self`: write the path
+/// absolute.
+///
+/// The type is no entry as a whole either where the graph finds one entry for it cheaper than
+/// one for each of its parts (`::c::Both<::d::X, ::d::Y, Self>`, `::c::Both<Rel<u8>, Rel3<u8>,
+/// Self>`): the graph used to pick it, with the Leaker's `Self`, depending on the number of the
+/// parts. A reference with a lifetime is leaked whole with what it holds, as ever.
+///
+/// The property test shows it with `TYPE_LEAK_PROP_FEATURES=nested_self` (on by default), for the
+/// items invoked as `strict`: the macro checks that no optional entry of an item nested in a
+/// module names its own `Self` (case 11 of seed 4 with 60 cases, case 40 of seed 16, ... had
+/// `Result<BTreeMap<fn(i32) -> Self, ..>, Box<dyn Fn(..)>>` as the optional entry, with two
+/// parts that are optional entries too).
+#[test]
+fn f38_an_absolute_type_that_names_the_own_self_is_copied_as_written() {
+    struct Case {
+        item: Item,
+        name: &'static str,
+        /// The entries: `?` for an optional one.
+        entries: &'static [&'static str],
+        /// The copy, as a trusting and as a strict Referrer write it (`P<ix>` for an entry that is
+        /// found by `type_fn`, `N<ix>` by `with_nested_self()`).
+        expected: fn(&Referrer, bool) -> Item,
+    }
+    let cases = vec![
+        // The report: a recursive type through a box.
+        Case {
+            item: parse_quote!(
+                pub struct Node {
+                    next: ::std::boxed::Box<Self>,
+                }
+            ),
+            name: "Node",
+            entries: &[],
+            expected: |_, _| {
+                parse_quote!(
+                    pub struct Node {
+                        next: ::std::boxed::Box<Self>,
+                    }
+                )
+            },
+        },
+        // `::c::W<T>` does not name `Self`: an optional entry, as before.
+        Case {
+            item: parse_quote!(
+                pub struct Node<T> {
+                    a: ::c::W<T>,
+                    b: ::c::Rel2<Self, T>,
+                    c: Vec<::c::Rel2<Self, T>>,
+                }
+            ),
+            name: "Node",
+            entries: &["?::c::W<T>"],
+            expected: |referrer, strict| {
+                let a = entry(referrer, ":: c :: W < T >");
+                if strict {
+                    parse_quote!(
+                        pub struct Node<T> {
+                            a: P<#a>,
+                            b: ::c::Rel2<Self, T>,
+                            c: Vec<::c::Rel2<Self, T>>,
+                        }
+                    )
+                } else {
+                    parse_quote!(
+                        pub struct Node<T> {
+                            a: ::c::W<T>,
+                            b: ::c::Rel2<Self, T>,
+                            c: Vec<::c::Rel2<Self, T>>,
+                        }
+                    )
+                }
+            },
+        },
+        // The same with a bound that names `Self`: as before, no entry (and no change).
+        Case {
+            item: parse_quote!(
+                pub struct S<T: ::core::convert::AsRef<Self>> {
+                    b: ::c::Rel2<Self, T>,
+                }
+            ),
+            name: "S",
+            entries: &[],
+            expected: |_, _| {
+                parse_quote!(
+                    pub struct S<T: ::core::convert::AsRef<Self>> {
+                        b: ::c::Rel2<Self, T>,
+                    }
+                )
+            },
+        },
+        // Without it.
+        Case {
+            item: parse_quote!(
+                pub struct S<T> {
+                    b: ::c::Rel2<Self, T>,
+                }
+            ),
+            name: "S",
+            entries: &[],
+            expected: |_, _| {
+                parse_quote!(
+                    pub struct S<T> {
+                        b: ::c::Rel2<Self, T>,
+                    }
+                )
+            },
+        },
+        // The entries that do not name `Self` are as before: `Rel<T>` is required, and `::c::W<T>`
+        // is optional; with the bound, both are for any type that it holds for (`Any`), and the
+        // copy passes its own.
+        Case {
+            item: parse_quote!(
+                pub struct S<T: ::core::convert::AsRef<Self>> {
+                    a: ::c::Rel2<Self, T>,
+                    b: Rel<T>,
+                    c: ::c::W<T>,
+                }
+            ),
+            name: "S",
+            entries: &["Rel<T>", "?::c::W<T>"],
+            expected: |referrer, strict| {
+                let (b, c) = (
+                    entry(referrer, "Rel < T >"),
+                    entry(referrer, ":: c :: W < T >"),
+                );
+                if strict {
+                    parse_quote!(
+                        pub struct S<T: ::core::convert::AsRef<Self>> {
+                            a: ::c::Rel2<Self, T>,
+                            b: N<#b>,
+                            c: N<#c>,
+                        }
+                    )
+                } else {
+                    parse_quote!(
+                        pub struct S<T: ::core::convert::AsRef<Self>> {
+                            a: ::c::Rel2<Self, T>,
+                            b: N<#b>,
+                            c: ::c::W<T>,
+                        }
+                    )
+                }
+            },
+        },
+        Case {
+            item: parse_quote!(
+                pub struct S<T> {
+                    a: ::c::Rel2<Self, T>,
+                    b: Rel<T>,
+                    c: ::c::W<T>,
+                }
+            ),
+            name: "S",
+            entries: &["Rel<T>", "?::c::W<T>"],
+            expected: |referrer, strict| {
+                let (b, c) = (
+                    entry(referrer, "Rel < T >"),
+                    entry(referrer, ":: c :: W < T >"),
+                );
+                if strict {
+                    parse_quote!(
+                        pub struct S<T> {
+                            a: ::c::Rel2<Self, T>,
+                            b: P<#b>,
+                            c: P<#c>,
+                        }
+                    )
+                } else {
+                    parse_quote!(
+                        pub struct S<T> {
+                            a: ::c::Rel2<Self, T>,
+                            b: P<#b>,
+                            c: ::c::W<T>,
+                        }
+                    )
+                }
+            },
+        },
+        // A part that must be leaked is an entry, in the type that is copied as written.
+        Case {
+            item: parse_quote!(
+                pub struct S<T> {
+                    b: ::c::Rel2<Self, Rel<T>>,
+                }
+            ),
+            name: "S",
+            entries: &["Rel<T>"],
+            expected: |referrer, _| {
+                let b = entry(referrer, "Rel < T >");
+                parse_quote!(
+                    pub struct S<T> {
+                        b: ::c::Rel2<Self, P<#b>>,
+                    }
+                )
+            },
+        },
+        // The graph used to pick the whole type as the entry when it saves entries (one for it, two
+        // for its parts), and with it `Self` of the Leaker. The parts are the entries now, in the
+        // optional ones and in the required ones.
+        Case {
+            item: parse_quote!(
+                pub struct S {
+                    f: ::c::Both<::d::X, ::d::Y, Self>,
+                }
+            ),
+            name: "S",
+            entries: &["?::d::X", "?::d::Y"],
+            expected: |referrer, strict| {
+                let (x, y) = (entry(referrer, ":: d :: X"), entry(referrer, ":: d :: Y"));
+                if strict {
+                    parse_quote!(
+                        pub struct S {
+                            f: ::c::Both<P<#x>, P<#y>, Self>,
+                        }
+                    )
+                } else {
+                    parse_quote!(
+                        pub struct S {
+                            f: ::c::Both<::d::X, ::d::Y, Self>,
+                        }
+                    )
+                }
+            },
+        },
+        Case {
+            item: parse_quote!(
+                pub struct S {
+                    f: ::c::Both<Rel<u8>, Rel3<u8>, Self>,
+                }
+            ),
+            name: "S",
+            entries: &["Rel<u8>", "Rel3<u8>"],
+            expected: |referrer, _| {
+                let (rel, rel3) = (
+                    entry(referrer, "Rel < u8 >"),
+                    entry(referrer, "Rel3 < u8 >"),
+                );
+                parse_quote!(
+                    pub struct S {
+                        f: ::c::Both<P<#rel>, P<#rel3>, Self>,
+                    }
+                )
+            },
+        },
+        // A reference with a lifetime is leaked whole with what it holds, so it is the entry, and
+        // `Self` in it is the type that the macro writes, strict or not.
+        Case {
+            item: parse_quote!(
+                pub struct S {
+                    f: &'static ::c::Both<Rel<u8>, Rel3<u8>, Self>,
+                }
+            ),
+            name: "S",
+            entries: &["&'static::c::Both<Rel<u8>,Rel3<u8>,Self>"],
+            expected: |referrer, _| {
+                let f = entry(
+                    referrer,
+                    "& 'static :: c :: Both < Rel < u8 > , Rel3 < u8 > , Self >",
+                );
+                parse_quote!(
+                    pub struct S {
+                        f: N<#f>,
+                    }
+                )
+            },
+        },
+        // An enum and a union.
+        Case {
+            item: parse_quote!(
+                pub enum E<T> {
+                    A(::c::W<Self>),
+                    B(::c::W<T>),
+                }
+            ),
+            name: "E",
+            entries: &["?::c::W<T>"],
+            expected: |referrer, strict| {
+                let b = entry(referrer, ":: c :: W < T >");
+                if strict {
+                    parse_quote!(
+                        pub enum E<T> {
+                            A(::c::W<Self>),
+                            B(P<#b>),
+                        }
+                    )
+                } else {
+                    parse_quote!(
+                        pub enum E<T> {
+                            A(::c::W<Self>),
+                            B(::c::W<T>),
+                        }
+                    )
+                }
+            },
+        },
+        Case {
+            item: parse_quote!(
+                pub union U<T> {
+                    a: ::core::mem::ManuallyDrop<::c::W<Self>>,
+                    b: ::core::mem::ManuallyDrop<::c::W<T>>,
+                }
+            ),
+            name: "U",
+            entries: &["?::c::W<T>"],
+            expected: |referrer, strict| {
+                let b = entry(referrer, ":: c :: W < T >");
+                if strict {
+                    parse_quote!(
+                        pub union U<T> {
+                            a: ::core::mem::ManuallyDrop<::c::W<Self>>,
+                            b: ::core::mem::ManuallyDrop<P<#b>>,
+                        }
+                    )
+                } else {
+                    parse_quote!(
+                        pub union U<T> {
+                            a: ::core::mem::ManuallyDrop<::c::W<Self>>,
+                            b: ::core::mem::ManuallyDrop<::c::W<T>>,
+                        }
+                    )
+                }
+            },
+        },
+        // The ways out that F37 suggests for the relative types that name `Self` and a bound that
+        // names it: the absolute path is accepted, and copied as written.
+        Case {
+            item: parse_quote!(
+                pub enum E<T: ::core::convert::AsRef<Self>> {
+                    A(::c::Rel<Self>),
+                    B(T),
+                }
+            ),
+            name: "E",
+            entries: &[],
+            expected: |_, _| {
+                parse_quote!(
+                    pub enum E<T: ::core::convert::AsRef<Self>> {
+                        A(::c::Rel<Self>),
+                        B(T),
+                    }
+                )
+            },
+        },
+        Case {
+            item: parse_quote!(
+                pub struct S<T>(Vec<::c::Rel2<Self>>, T)
+                where
+                    T: ::core::convert::AsRef<(Self, u8)>;
+            ),
+            name: "S",
+            entries: &[],
+            expected: |_, _| {
+                parse_quote!(
+                    pub struct S<T>(Vec<::c::Rel2<Self>>, T)
+                    where
+                        T: ::core::convert::AsRef<(Self, u8)>;
+                )
+            },
+        },
+    ];
+    for case in &cases {
+        for nest in NESTS {
+            let what = format!("`{}` in {:?}", string(&case.item), nest);
+            let (trusting, referrer, _) = nested_copy_as(nest, &case.item, &[case.name], false);
+            let (strict, _, _) = nested_copy_as(nest, &case.item, &[case.name], true);
+            let expected: Vec<String> = case.entries.iter().map(|e| e.replace(' ', "")).collect();
+            assert_eq!(f38_entries(&referrer), expected, "{}", what);
+            assert_eq!(
+                string(&trusting),
+                string(&(case.expected)(&referrer, false)),
+                "trusting: {}",
+                what
+            );
+            assert_eq!(
+                string(&strict),
+                string(&(case.expected)(&referrer, true)),
+                "strict: {}",
+                what
+            );
+        }
+    }
+}
+
+/// F38: `::p::Rel2<Self, T>` is the same with and without a bound that names `Self`: the Leaker
+/// records nothing for it, and the copy is the item as written, strict or not. The relative type
+/// with the bound stays rejected (F37), and its help says that the absolute path is a way out.
+#[test]
+fn f38_the_bound_that_names_self_makes_no_difference() {
+    let with_bound: Item = parse_quote!(
+        pub struct S<T: ::core::convert::AsRef<Self>> {
+            b: ::p::Rel2<Self, T>,
+        }
+    );
+    let without: Item = parse_quote!(
+        pub struct S<T> {
+            b: ::p::Rel2<Self, T>,
+        }
+    );
+    for nest in NESTS {
+        for strict in [false, true] {
+            let what = format!("{:?}, strict {}", nest, strict);
+            let (copy_with, referrer_with, calls_with) =
+                nested_copy_as(nest, &with_bound, &["S"], strict);
+            let (copy_without, referrer_without, calls_without) =
+                nested_copy_as(nest, &without, &["S"], strict);
+            assert_eq!(referrer_with.iter().count(), 0, "{}", what);
+            assert_eq!(referrer_without.iter().count(), 0, "{}", what);
+            assert!(
+                calls_with.is_empty() && calls_without.is_empty(),
+                "{}",
+                what
+            );
+            assert_eq!(string(&copy_with), string(&with_bound), "{}", what);
+            assert_eq!(string(&copy_without), string(&without), "{}", what);
+        }
+    }
+    let relative: Item = parse_quote!(
+        pub struct S<T: ::core::convert::AsRef<Self>> {
+            b: Rel2<Self, T>,
+        }
+    );
+    for nest in NESTS {
+        let (_, result) = nested_analysis(nest, &relative, &["S"]);
+        let err = assert_rejected(
+            &relative,
+            result,
+            &["`Rel2 < Self , T >` has a generic whose bound mentions `Self`, which cannot be leaked"],
+        );
+        assert!(
+            all_helps(&err)[0].contains("write the type with an absolute path"),
+            "{:?}",
+            all_helps(&err)
+        );
+    }
+}
+
+/// F38, the controls: the types that must be leaked and name the own `Self` are entries, written
+/// by `with_nested_self()` for a trusting and for a strict Referrer, and the item analyzed as
+/// itself (`intern_*`), a nested trait and a nested impl are as before: their optional entries
+/// that name `Self` stay, and a strict Referrer replaces them.
+#[test]
+fn f38_the_relative_types_and_the_other_items_are_unchanged() {
+    // Relative types that name `Self` are entries: the copy holds what the macro writes. The
+    // absolute one beside them is not.
+    let item: Item = parse_quote!(
+        pub struct S<T> {
+            a: Rel<Self>,
+            b: inner::W<Self>,
+            c: crate::W<Self>,
+            d: ::c::W<Self>,
+            e: ::c::W<(Self, Rel2<Self>)>,
+        }
+    );
+    for nest in NESTS {
+        for strict in [false, true] {
+            let what = format!("{:?}, strict {}", nest, strict);
+            let (copy, referrer, calls) = nested_copy_as(nest, &item, &["S"], strict);
+            assert_eq!(
+                f38_entries(&referrer),
+                [
+                    "Rel<Self>",
+                    "Rel2<Self>",
+                    "crate::W<Self>",
+                    "inner::W<Self>"
+                ],
+                "{}",
+                what
+            );
+            for ix in 0..referrer.iter().count() {
+                assert!(
+                    matches!(
+                        referrer.context_self(referrer.context(ix)),
+                        Some(SelfRequirement::Type(_))
+                    ),
+                    "{}",
+                    what
+                );
+            }
+            let (a, b, c, rel2) = (
+                entry(&referrer, "Rel < Self >"),
+                entry(&referrer, "inner :: W < Self >"),
+                entry(&referrer, "crate :: W < Self >"),
+                entry(&referrer, "Rel2 < Self >"),
+            );
+            let expected: Item = parse_quote!(
+                pub struct S<T> {
+                    a: N<#a>,
+                    b: N<#b>,
+                    c: N<#c>,
+                    d: ::c::W<Self>,
+                    e: ::c::W<(Self, N<#rel2>)>,
+                }
+            );
+            assert_eq!(string(&copy), string(&expected), "{}", what);
+            assert_eq!(calls.len(), 4, "{}", what);
+        }
+    }
+
+    // The item analyzed as itself: `Self` is the Leaker's type in the copy (`with_self()`), so the
+    // optional entry that names it is as before.
+    let node: ItemStruct = parse_quote!(
+        pub struct Node {
+            next: ::std::boxed::Box<Self>,
+        }
+    );
+    let mut leaker = new_leaker();
+    leaker.intern_struct(&node, true).unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(f38_entries(&referrer), ["?::std::boxed::Box<Self>"]);
+    assert!(matches!(
+        referrer.context_self(referrer.context(0)),
+        Some(SelfRequirement::Type(_))
+    ));
+
+    // A nested trait: `Self` is the implementor, for which the macro writes a type: the optional
+    // entry stays, and a strict Referrer replaces it.
+    let tr: Item = parse_quote!(
+        pub trait Tr {
+            fn f(&self) -> ::c::W<Self>;
+        }
+    );
+    for nest in NESTS {
+        let (trusting, referrer, calls) = nested_copy_as(nest, &tr, &["Tr"], false);
+        let (strict, _, calls_strict) = nested_copy_as(nest, &tr, &["Tr"], true);
+        assert_eq!(f38_entries(&referrer), ["?::c::W<Self>"], "{:?}", nest);
+        assert!(
+            matches!(
+                referrer.context_self(referrer.context(0)),
+                Some(SelfRequirement::Bound(_))
+            ),
+            "{:?}",
+            nest
+        );
+        assert_eq!(string(&trusting), string(&tr), "{:?}", nest);
+        assert!(calls.is_empty(), "{:?}", nest);
+        let expected: Item = parse_quote!(
+            pub trait Tr {
+                fn f(&self) -> N<0usize>;
+            }
+        );
+        assert_eq!(string(&strict), string(&expected), "{:?}", nest);
+        assert_eq!(calls_strict.len(), 1, "{:?}", nest);
+    }
+
+    // A nested impl: `Self` is the self type as written, the same in the copy; the entry stays.
+    let imp: Item = parse_quote!(
+        impl<T> ::p::W for ::p::S<T> {
+            fn f() -> ::c::W<Self> {
+                loop {}
+            }
+        }
+    );
+    for nest in NESTS {
+        let (_, referrer, _) = nested_copy_as(nest, &imp, &[], false);
+        let ix = entry(&referrer, ":: c :: W < Self >");
+        assert!(!referrer.must(ix), "{:?}", nest);
+        assert!(
+            matches!(
+                referrer.context_self(referrer.context(ix)),
+                Some(SelfRequirement::Type(_))
+            ),
+            "{:?}",
+            nest
+        );
+        let (strict, _, calls) = nested_copy_as(nest, &imp, &[], true);
+        assert!(!string(&strict).contains("W < Self >"), "{:?}", nest);
+        assert_eq!(calls.len(), 1, "{:?}", nest);
     }
 }

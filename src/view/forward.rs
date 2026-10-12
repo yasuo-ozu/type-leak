@@ -35,16 +35,22 @@ impl View<'_> {
     /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self). A function, type alias,
     /// trait alias, const or static has no `Self` of its own: it keeps the one around.
     ///
-    /// The copy of a nested struct, enum or union declares a type of its own. A type that uses a
-    /// generic with a bound that names its `Self`, and does not name `Self` itself
+    /// The copy of a nested struct, enum or union declares a type of its own, so `Self` in a type
+    /// that is copied as written is the copy's own type, and only a type that is leaked is written
+    /// by the macro, by convention with the Leaker's type. An absolute type that names `Self`
+    /// (`::path::Wrap<Self>`, `::std::boxed::Box<Self>`) is copied as written: it is no entry, not
+    /// even an optional one, whether a Referrer replaces the optional entries or not. A relative
+    /// type that names it (`Wrap<Self>`) is leaked, and the macro writes the Leaker's type. A type
+    /// that uses a generic with a bound that names its `Self`, and does not name `Self` itself
     /// (`struct S<T: AsRef<Self>>(Rel<T>);`), is for any type that the bound holds for
     /// ([`SelfRequirement::Any`](crate::SelfRequirement)): the copy has the bound for its own
     /// type, and writes `<Self as Repeater<..>>::Type` for `Rel<T>`. A type that names `Self` too
     /// (`Rel2<Self, T>`) is an error: the Repeater's impl of the type is for the Leaker's `S<T>`,
     /// which has not the bound in the copy's crate. The headline is "`Rel2<Self, T>` has a generic
     /// whose bound mentions `Self`, which cannot be leaked". Write the type, or the bound, without
-    /// `Self`, or analyze the item with an `intern_*` method, where the Visitor writes `Self` as
-    /// the Leaker's type.
+    /// `Self`, write the type with an absolute path (`::path::Rel2<Self, T>` is copied as written,
+    /// and its `Self` is the copy's own), or analyze the item with an `intern_*` method, where the
+    /// Visitor writes `Self` as the Leaker's type.
     ///
     /// The bounds of a generic are written for the `Self` of the scope that declares it. A type in
     /// a nested item that uses the generic gets them rewritten for the `Self` of that item, and its

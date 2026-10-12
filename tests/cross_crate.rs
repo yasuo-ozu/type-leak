@@ -529,6 +529,28 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9120, __tl_report_9120!()),
             ok("struct", 1, 2, 2),
         ),
+        // an absolute type that names their own `Self` is no entry (the copy has it as written);
+        // the relative types beside it are
+        (
+            9121,
+            reported(9121, __tl_report_9121!()),
+            ok("struct", 2, 3, 3),
+        ),
+        (
+            9122,
+            reported(9122, __tl_report_9122!()),
+            ok("struct", 1, 2, 2),
+        ),
+        (
+            9123,
+            reported(9123, __tl_report_9123!()),
+            ok("struct", 2, 3, 3),
+        ),
+        (
+            9124,
+            reported(9124, __tl_report_9124!()),
+            ok("enum", 2, 3, 3),
+        ),
         // scopes that share names (the findings of a downstream crate): methods that declare the
         // same generic with different bounds, a generic named like a relative type, a path ending
         // with the name of a generic, a type and a const parameter of one name; a bound that names
@@ -820,6 +842,84 @@ fn nested_types_with_a_bound_on_their_own_self_keep_the_original_field_types() {
         unsafe { &overlaid.wrapped },
         &l::Wrap::<Owner4>(PhantomData),
     );
+}
+
+/// An absolute type that names the own `Self` of a struct or an enum nested in a module
+/// (`Option<::std::boxed::Box<Self>>`, `::type_leak_test_leaker::kinds::Pair<PhantomData<Self>, T>`)
+/// is no entry: the copy has it as written, and `Self` in it is the copy's own type, whether the
+/// Referrer replaces the optional entries (`strict`) or not. Before, a strict Referrer replaced it
+/// with the Leaker's type, and a recursive type was no longer recursive: `List { next:
+/// Option<Box<leaker::List>> }`. The relative types beside it (`Rel`, `Wrap<T>`) are entries, and
+/// replaced. The Referrer's crate compiles only if the copies, which each position is compared
+/// with a witness of the original for, hold what the witnesses say; here the fields go in and out
+/// of the copy's own types, which `same()` and the assignments check.
+#[test]
+fn an_absolute_type_that_names_the_own_self_is_the_copys_in_a_strict_copy() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_referrer::kinds as r;
+
+    // A recursive type (strict): the box holds the copy's `List`.
+    let rel = l::Rel(1);
+    let list = r::List {
+        next: Some(Box::new(r::List { next: None, rel })),
+        rel,
+    };
+    same::<Option<Box<r::List>>>(&list.next, &None);
+    same(&list.rel, &rel);
+    assert_eq!(list.next.as_ref().map(|next| next.rel), Some(rel));
+
+    // The bound holds for the copy's own type, not the Leaker's `Pathed<Owner>`, which `Owner`
+    // has no `AsRef` for. The pair holds the copy's type for `Self` (strict), and so does the
+    // one of a Referrer that trusts the names of the crates.
+    struct Owner;
+    impl AsRef<r::Pathed<Owner>> for Owner {
+        fn as_ref(&self) -> &r::Pathed<Owner> {
+            unimplemented!()
+        }
+    }
+    let pathed = r::Pathed::<Owner> {
+        path: l::Pair(PhantomData::<r::Pathed<Owner>>, Owner),
+        wrapped: l::Wrap(PhantomData),
+        rel,
+    };
+    same(&pathed.path.0, &PhantomData::<r::Pathed<Owner>>);
+    same(&pathed.wrapped, &l::Wrap::<Owner>(PhantomData));
+    same(&pathed.rel, &rel);
+    struct Owner2;
+    impl AsRef<r::PathedTrusting<Owner2>> for Owner2 {
+        fn as_ref(&self) -> &r::PathedTrusting<Owner2> {
+            unimplemented!()
+        }
+    }
+    let trusting = r::PathedTrusting::<Owner2> {
+        path: l::Pair(PhantomData::<r::PathedTrusting<Owner2>>, Owner2),
+        wrapped: l::Wrap(PhantomData),
+        rel,
+    };
+    same(&trusting.path.0, &PhantomData::<r::PathedTrusting<Owner2>>);
+
+    // The enum (strict): the vector holds boxes of the copy's `Tree`.
+    let tree = r::Tree::<u8>::Branch(vec![
+        Box::new(r::Tree::Leaf(rel)),
+        Box::new(r::Tree::Tagged(l::Pair(
+            PhantomData::<r::Tree<u8>>,
+            l::Wrap(PhantomData),
+        ))),
+    ]);
+    match &tree {
+        r::Tree::Branch(children) => {
+            same::<Vec<Box<r::Tree<u8>>>>(children, &Vec::new());
+            assert_eq!(children.len(), 2);
+            match &*children[1] {
+                r::Tree::Tagged(pair) => {
+                    same(&pair.0, &PhantomData::<r::Tree<u8>>);
+                    same(&pair.1, &l::Wrap::<u8>(PhantomData));
+                }
+                _ => unreachable!(),
+            }
+        }
+        _ => unreachable!(),
+    }
 }
 
 /// The scopes of an item that share names (the findings A, 1, 2, 3, 4 and 7 of a downstream crate,

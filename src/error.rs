@@ -84,7 +84,9 @@ pub enum NotInternableError {
     ///   of the type is for the Leaker's own type, and the copy declares a type of its own, which
     ///   has the bound for itself. A type that does not name it (`Wrap<T>`) is fine: its impl is
     ///   for any type that the bound holds for ([`SelfRequirement::Any`](crate::SelfRequirement)).
-    ///   Write the type without `Self`, or analyze the item with its own `intern_*` call.
+    ///   So is an absolute type that names it (`::path::Wrap<Self, T>`): it is copied as written,
+    ///   and its `Self` is the copy's own. Write the type without `Self` or with an absolute path,
+    ///   or analyze the item with its own `intern_*` call.
     /// - A type in a bound or where predicate that the copy cannot write through the Repeater,
     ///   because rustc cannot prove a bound of its generics that names a leaked type
     ///   ([Bounds that name leaked types](crate::Leaker#bounds-that-name-leaked-types)). The

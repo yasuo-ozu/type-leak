@@ -172,6 +172,11 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9118!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9119!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9120!(path = ::type_leak_test_leaker::kinds);
+    // An absolute type that names their own `Self` is copied as written, by a strict Referrer too.
+    type_leak_test_leaker::__tl_prop_9121!(path = ::type_leak_test_leaker::kinds, strict);
+    type_leak_test_leaker::__tl_prop_9122!(path = ::type_leak_test_leaker::kinds, strict);
+    type_leak_test_leaker::__tl_prop_9123!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9124!(path = ::type_leak_test_leaker::kinds, strict);
     // The scopes that share names: every entry has the generics of its own scope.
     type_leak_test_leaker::__tl_prop_9071!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9072!(path = ::type_leak_test_leaker::kinds);

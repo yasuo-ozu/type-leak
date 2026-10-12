@@ -254,7 +254,8 @@ pub struct Features {
     /// own `Self` is recorded, and the Visitor finds it in the nested item and writes it with
     /// `Visitor::with_nested_self()` (F36: fixed, on by default). Before the fix the Visitor never
     /// found it, so the copy kept the leaked type (`Rel<Self>`), which the Referrer's crate cannot
-    /// resolve. Off, such an item names no `Self`.
+    /// resolve. Off, such an item names no `Self`. F38 (fixed, on by default): an absolute type
+    /// that names it is no entry, so the strict items copy it as written.
     pub nested_self: bool,
     /// A relative type with several segments whose last segment is the name of a generic in scope
     /// (`self::U` next to a generic `U`). The Visitor used to take the path for the generic, so the

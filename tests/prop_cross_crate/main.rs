@@ -133,7 +133,9 @@
 //!   `nested_self` (F36: a struct, an enum, a union or a trait analyzed nested in `enter_mod` that
 //!   names its own `Self`, which the Visitor writes with `with_nested_self()`; F37: an entry that
 //!   does not name it, and uses a generic whose bound does, is for any type, and the macro passes
-//!   the copy's own type; one that names it too is rejected),
+//!   the copy's own type; one that names it too is rejected; F38: an absolute type that names it
+//!   is no entry, so a strict Referrer copies it as written, with the copy's own `Self`, as a
+//!   trusting one does: the macro checks that no optional entry of such an item names `Self`),
 //!   `path_named_like_generic` (`self::U` next to a generic `U`), `declared_named_like_generic` (a
 //!   module that declares `X`, and `crate::base::B1<X>` in `fn f<X>`) and
 //!   `bare_const_in_absolute_path` (a bare `ILEN` next to a leaked argument in a

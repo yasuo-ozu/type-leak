@@ -206,6 +206,11 @@ pub struct Leaker {
     /// ([`Referrer::allow_ambiguous_crate_name()`]). `::core::..` and `$crate::..` are never
     /// optional, and `::std` and `::alloc` are like any other crate unless allowed.
     /// [`Referrer::external_crates_require()`] lists the crates an entry names.
+    ///
+    /// Not so for an absolute type that names the `Self` of a struct, an enum or a union nested in
+    /// the analyzed syntax (`::serde::Wrap<Self>` in [`View::visit_item()`]): it is copied as
+    /// written whatever the Referrer chooses, so that its `Self` is the copy's own type (see
+    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self)).
     pub allowed_paths: Vec<Path>,
     /// The types that depend on the context (the required entries).
     types: TypeGraph,

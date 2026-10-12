@@ -304,6 +304,34 @@ fn repeater_impls(referrer: &Referrer, id: u64, strict: bool) -> Result<(Impls, 
     Ok((impls, skipped))
 }
 
+/// A struct, an enum or a union nested in a module (scope `mod`) has a `Self` of its own: only a
+/// type that must be leaked has it in its context (`SelfRequirement::Type`). An optional entry that
+/// names it (an absolute type, `::p::W<Self>`) would be replaced by a strict Referrer with the
+/// Leaker's type, where a trusting one copies the copy's own `Self`, and the check cannot tell: it
+/// writes the Leaker's type for every `Self` of the copy (`host_arg()`). So it is checked here.
+fn check_nested_self_is_required(referrer: &Referrer, item: &Item, args: &Args) -> Result<()> {
+    if args.scope != "mod" || !matches!(item, Item::Struct(_) | Item::Enum(_) | Item::Union(_)) {
+        return Ok(());
+    }
+    for ix in 0..referrer.iter().count() {
+        let nested_type = matches!(
+            referrer.context_self(referrer.context(ix)),
+            Some(SelfRequirement::Type(_))
+        );
+        if !referrer.must(ix) && nested_type {
+            let ty = referrer.iter().nth(ix).unwrap();
+            return Err(Error::new(
+                Span::call_site(),
+                format!(
+                    "NESTED SELF OPTIONAL: the optional entry `{}` of an item nested in a module names its own `Self`: a strict Referrer would replace it with the Leaker's type, where the copy's `Self` is its own",
+                    quote!(#ty)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn helpers_disagree(what: String) -> Error {
     Error::new(
         Span::call_site(),
@@ -1431,9 +1459,12 @@ fn const_value(ty: &Type) -> Expr {
 }
 
 /// The host of a trait. For a struct, an enum or a union nested in the module (scope `mod`) it is
-/// the Leaker's type: the visitor leaves a `Self` that is not in an entry (`Vec<Self>` as a field),
-/// which is the copy's own type, and the check writes the Leaker's for it, as the witness does.
-/// The copy of a struct that is not nested has its `Self` replaced (`Visitor::with_self()`).
+/// the Leaker's type: the visitor leaves a `Self` that is not in an entry (`Vec<Self>` as a field,
+/// or in an absolute type, `::p::W<Self>`, which no Referrer replaces: F38), which is the copy's
+/// own type, and the check writes the Leaker's for it, as the witness does. (So the check cannot
+/// tell the copy's `Self` from the Leaker's; `check_nested_self_is_required()` and the fixtures of
+/// `tests/cross_crate.rs` do.) The copy of a struct that is not nested has its `Self` replaced
+/// (`Visitor::with_self()`).
 fn host_arg(rewritten: &Rewritten, args: &Args, leaker_path: &Path) -> Option<Host> {
     if let Some(host) = &rewritten.host {
         return Some((host_type(host, rewritten.dyn_host), leaker_path.clone()));
@@ -1746,6 +1777,7 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream) -> Result<TokenStream> 
         }
     };
 
+    check_nested_self_is_required(&referrer, &original, &args)?;
     let (impls, skipped) = repeater_impls(&referrer, id, args.strict.unwrap_or(true))?;
     let positions = collect_positions(&original, None, &args.scope);
     let witnesses: Vec<(Vec<Ident>, TokenStream)> = positions

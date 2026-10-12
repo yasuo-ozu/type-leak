@@ -1249,6 +1249,44 @@ pub mod kinds {
     where
         Self: Sized;
 
+    // Items nested in a module that name their own `Self` in an absolute type of a crate that both
+    // crates have (`::type_leak_test_leaker`, `::std`). Such a type is no entry: it is copied as
+    // written, and `Self` in it is the copy's own type, also for a Referrer that replaces the
+    // optional entries (`strict`). The relative types beside it are entries.
+
+    /// A bound that names `Self`, an absolute type that names it too, and a relative type that uses
+    /// the generic (`Wrap<T>`, for any type that the bound holds for). The Referrer replaces the
+    /// optional entries.
+    #[prop_leak(id = 9121, allow_self = true, scope = "mod", prelude = true, strict = true)]
+    pub struct Pathed<T: AsRef<Self>> {
+        pub path: ::type_leak_test_leaker::kinds::Pair<::core::marker::PhantomData<Self>, T>,
+        pub wrapped: Wrap<T>,
+        pub rel: Rel,
+    }
+
+    /// A recursive type: `Self` in a box.
+    #[prop_leak(id = 9122, allow_self = true, scope = "mod", prelude = true, strict = true)]
+    pub struct List {
+        pub next: Option<::std::boxed::Box<Self>>,
+        pub rel: Rel,
+    }
+
+    /// The same as `Pathed`, for a Referrer that trusts the names of the crates.
+    #[prop_leak(id = 9123, allow_self = true, scope = "mod", prelude = true, strict = false)]
+    pub struct PathedTrusting<T: AsRef<Self>> {
+        pub path: ::type_leak_test_leaker::kinds::Pair<::core::marker::PhantomData<Self>, T>,
+        pub wrapped: Wrap<T>,
+        pub rel: Rel,
+    }
+
+    /// An enum, strict, with `Self` in a box in a vector, and in a pair next to a relative type.
+    #[prop_leak(id = 9124, allow_self = true, scope = "mod", prelude = true, strict = true)]
+    pub enum Tree<T> {
+        Leaf(Rel),
+        Branch(Vec<::std::boxed::Box<Self>>),
+        Tagged(::type_leak_test_leaker::kinds::Pair<::core::marker::PhantomData<Self>, Wrap<T>>),
+    }
+
     // The scopes of an item that share names, from the findings of a downstream crate
     // (`announce`, tests/downstream_findings.rs): the Repeater's impl of every entry has the
     // generics, bounds and where clause of the scope the entry is written in, and no others.

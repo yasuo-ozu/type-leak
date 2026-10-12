@@ -185,6 +185,14 @@ pub enum SelfRequirement {
     /// crate must provide the associated types that the type uses (`type Item = u8;`).
     Bound(Path),
     /// `Self` is this type: a struct, enum, union or the self type of an impl, e.g. `MyStruct<T>`.
+    ///
+    /// In a struct, an enum or a union nested in the analyzed syntax
+    /// ([`View::visit_item()`](crate::View::visit_item), the items of
+    /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod)), only a type that must be leaked has
+    /// this context (`Rel2<Self>`, a relative path). An absolute type that names `Self`
+    /// (`::path::Wrap<Self>`) has none: it is copied as written, and its `Self` is the copy's own
+    /// type, which is not the Leaker's. See
+    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self).
     Type(Type),
     /// `Self` is any type that the bounds of the generics hold for, and the type of the entry
     /// does not name it. Only the bounds do: `Rel<T>` with `T: AsRef<Self>`.

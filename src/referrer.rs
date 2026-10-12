@@ -283,6 +283,11 @@ impl Referrer {
     ///   absolute type that contains a relative one (`::serde::Wrap<(Rel,)>`) is replaced as a
     ///   whole. Use it if the Referrer's crate may have other dependencies than the Leaker's.
     ///
+    /// One absolute type is no optional entry whatever this says: the one that names the `Self` of
+    /// a struct, an enum or a union nested in the analyzed syntax (`::serde::Wrap<Self>`). Its
+    /// copy declares a type of its own, so `Self` in a type that is copied as written is that
+    /// type, and a replacement would hold the Leaker's. See [`Visitor::with_nested_self()`].
+    ///
     /// The flag is not serialized, so the crate that emits the Repeater impls cannot know it: it
     /// writes the impls of all the entries ([`Referrer::iter()`]), the optional ones too, or a
     /// strict Referrer replaces a type that has no impl (E0277).
@@ -1130,6 +1135,11 @@ impl<'a, F: FnMut(Type, usize, &[GenericArgument]) -> Type> syn::fold::Fold for 
 /// that depends on that `Self`. It is the item the visitor is in, and the same `Self` that the
 /// Leaker gave the item when it analyzed it ([`View::visit_item()`](crate::View::visit_item)).
 ///
+/// The closure is called for the types that are leaked only. A type that is copied as written
+/// keeps its `Self`, which is the copy's own type in a struct, an enum or a union (for example an
+/// absolute type, `::p::Rel2<Self, T>`, which is no entry): what you write for the Leaker's type
+/// is for the entries.
+///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
@@ -1407,11 +1417,31 @@ where
     ///
     /// A struct, enum, union, trait or impl nested in the visited syntax (an item of a module or of
     /// a `File`, or one in a function body) has a `Self` of its own. The Leaker records the entries
-    /// that depend on it: those that name it (`Rel2<Self>` in `struct S<T> { c: Vec<Rel2<Self>> }`),
-    /// and those that use a generic with a bound that names it (`Rel<T>` with `T: ::p::Tr<Self>`;
-    /// not together with naming it, in a struct, an enum and a union: see below). The visitor keeps
-    /// a layer for the item with that `Self`, as the Leaker has it, so it computes the same contexts
-    /// and finds those entries.
+    /// that depend on it: those that must be leaked and name it (`Rel2<Self>` in `struct S<T> {
+    /// c: Vec<Rel2<Self>> }`), and those that use a generic with a bound that names it (`Rel<T>`
+    /// with `T: ::p::Tr<Self>`; not together with naming it, in a struct, an enum and a union: see
+    /// below). The visitor keeps a layer for the item with that `Self`, as the Leaker has it, so it
+    /// computes the same contexts and finds those entries.
+    ///
+    /// **`Self` in the copy.** A type that is copied as written keeps its `Self`, and in the copy
+    /// of a nested struct, enum or union that is the copy's own type, whatever the Referrer is.
+    /// Only a type that is leaked uses the type you write for it: by convention the Leaker's own
+    /// type, as below. So an absolute type that names `Self` and would be copied as written anyway
+    /// (`::p::Rel2<Self, T>`, `::std::boxed::Box<Self>`) is no entry in a struct, an enum or a
+    /// union, not even an optional one: a Referrer that replaces the optional entries
+    /// ([`Referrer::allow_ambiguous_crate_name(false)`](Referrer::allow_ambiguous_crate_name))
+    /// copies it as written too, as one that does not. (Replaced, it would hold the Leaker's type
+    /// for `Self` where the others hold the copy's, and `struct Node { next:
+    /// ::std::boxed::Box<Self> }` would not be recursive.) What in it must be leaked on its own
+    /// still is (`Rel<T>` in `::p::Rel2<Self, Rel<T>>`), each part an entry, also where one entry
+    /// for the whole type would do (`::p::Both<Rel<u8>, Rel2<u8>, Self>`); only a reference with
+    /// a lifetime is leaked whole with what it holds, as ever. Its crate is resolved in the crate
+    /// of the copy, as for a Referrer that trusts the names of the crates: a copy in a crate
+    /// without the Leaker's dependency cannot name it, so write the type with a path that both
+    /// crates have. A nested trait and a nested impl are not affected: the `Self` of an impl is
+    /// its self type as written, the same in the copy, and that of a trait is the implementor, for
+    /// which you write the type ([`SelfRequirement::Bound`]), so a strict Referrer replaces an
+    /// optional entry that names either as before.
     ///
     /// It calls `nested_fn(nested, leaked, ix)` for them instead of `type_fn`, because only the macro
     /// knows what to write for the `Self` of the item. `nested` is the item ([`NestedSelf`]).
@@ -1424,11 +1454,14 @@ where
     /// its `Self`.
     ///
     /// - [`SelfRequirement::Type`]: the type of the entry names the `Self` of a struct, an enum, a
-    ///   union or an impl. The Repeater impl is for the Leaker's own type (`impl<T> Repeater<(T,),
-    ///   ID, 3> for S<T>`, in the module of the Leaker's crate), which the copy cannot name as
-    ///   `Self`: it declares a `S` of its own. From the name of the item, its
+    ///   union or an impl, and must be leaked (a relative path: `Rel2<Self>`, `crate::W<Self>`).
+    ///   The Repeater impl is for the Leaker's own type (`impl<T> Repeater<(T,), ID, 3> for
+    ///   S<T>`, in the module of the Leaker's crate), which the copy cannot name as `Self`: it
+    ///   declares a `S` of its own. From the name of the item, its
     ///   [`modules`](NestedSelf::modules) and the path of the module of the context in the Leaker's
-    ///   crate, the macro writes that type.
+    ///   crate, the macro writes that type. (An absolute type that names `Self` is no entry in a
+    ///   struct, an enum or a union, see above. An impl needs no such type: its `Self` is the self
+    ///   type as written, the same in the copy.)
     /// - [`SelfRequirement::Bound`]: the same in a trait. `Self` is a type that implements the
     ///   Leaker's trait (a host in the copy).
     /// - [`SelfRequirement::Any`]: the type of the entry does not name `Self`, and a bound of a
@@ -1543,6 +1576,46 @@ where
     /// let expected: File = parse_quote! {
     ///     struct S<T: ::core::convert::AsRef<Self>> {
     ///         a: <Self as Repeater<(T,), 7u64, 0usize>>::Type,
+    ///     }
+    /// };
+    /// assert_eq!(file, expected);
+    /// ```
+    ///
+    /// An absolute type that names `Self` is copied as written, with the copy's own `Self`, also
+    /// by a Referrer that replaces the optional entries. The relative one is leaked, and
+    /// `nested_fn` writes the Leaker's type for it:
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// # use syn::visit_mut::VisitMut;
+    /// let item: ItemStruct = parse_quote! {
+    ///     struct Node<T> {
+    ///         next: ::std::boxed::Box<Self>, // the copy's `Node<T>`: no entry
+    ///         other: ::p::Wrap<T>,           // an optional entry: it does not name `Self`
+    ///         leaked: Rel<Self>,             // an entry: the macro writes the type
+    ///     }
+    /// };
+    /// let mut leaker = Leaker::new();
+    /// let (module, ()) = leaker
+    ///     .enter_mod("m", [item.ident.clone()], |view| {
+    ///         view.visit_item(&Item::Struct(item.clone()))
+    ///     })
+    ///     .unwrap();
+    /// let referrer = leaker.finish().allow_ambiguous_crate_name(false); // strict
+    /// assert_eq!(referrer.iter().count(), 2); // `Rel<Self>`, then `::p::Wrap<T>` (optional)
+    ///
+    /// let mut file = File { shebang: None, attrs: vec![], items: vec![Item::Struct(item)] };
+    /// referrer
+    ///     .clone()
+    ///     .visitor(module, |_leaked, ix| parse_quote!(Entry<#ix>))
+    ///     .with_nested_self(|_nested, _leaked, ix| parse_quote!(LeakersType<#ix>))
+    ///     .visit_file_mut(&mut file);
+    /// let expected: File = parse_quote! {
+    ///     struct Node<T> {
+    ///         next: ::std::boxed::Box<Self>,
+    ///         other: Entry<1usize>,
+    ///         leaked: LeakersType<0usize>,
     ///     }
     /// };
     /// assert_eq!(file, expected);
@@ -1976,8 +2049,10 @@ impl Referrer {
     // declares an item of the same name (`crate::base::B1<X>` next to `fn f<X>` in a module that
     // declares `X`). 11: the context of an entry that does not name the `Self` of a struct, an
     // enum or a union nested in the analyzed syntax, but has a bound that does, is `Self ;` (any
-    // type), and the Referrer finds it only in the item that declares that `Self`.
-    pub const FORMAT_VERSION: u32 = 11;
+    // type), and the Referrer finds it only in the item that declares that `Self`. 12: an absolute
+    // type that names the `Self` of such an item is no optional entry any more (it is copied as
+    // written, so its `Self` is the copy's own), and a strict Referrer replaces less.
+    pub const FORMAT_VERSION: u32 = 12;
 }
 
 /// Parses a [`Referrer`] written by its [`ToTokens`] implementation.

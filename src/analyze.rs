@@ -671,8 +671,10 @@ pub(crate) struct AnalyzeVisitor {
     /// item of a module, or `View::visit_item()`): the copy declares a type of its own there, so
     /// its `Self` is not the Leaker's type that the Repeater's impls are for. A type that does not
     /// name `Self` but has a bound that does is for any type (`SelfRequirement::Any`, see
-    /// [`AnalyzeVisitor::self_in_bounds()`]). The `Self` of a scope (`intern_struct()`,
-    /// `enter_type()`) is the outermost item's, which the Visitor writes as the Leaker's type.
+    /// [`AnalyzeVisitor::self_in_bounds()`]). An absolute type that names `Self` is not an
+    /// optional entry (see [`AnalyzeVisitor::names_nested_self()`]): it is copied as written, so
+    /// its `Self` is the copy's own. The `Self` of a scope (`intern_struct()`, `enter_type()`) is
+    /// the outermost item's, which the Visitor writes as the Leaker's type.
     self_nested: bool,
     /// The trait that the impl declaring `Self` implements, if it is an impl of a trait: what a
     /// `Self::A` is written through (see [`AssocSelf`]).
@@ -1041,6 +1043,14 @@ impl AnalyzeVisitor {
             _ => (),
         }
         finder.found
+    }
+
+    /// Returns `true` if `context` is that of a type that names the `Self` of a struct, an enum or
+    /// a union nested in the analyzed syntax (`self_nested`): the copy's own type, not the
+    /// Leaker's. (A type that does not name it, but has a bound that does, is for any type,
+    /// [`SelfRequirement::Any`].)
+    fn names_nested_self(&self, context: &Context) -> bool {
+        self.self_nested && matches!(context.self_ty(), Some(SelfRequirement::Type(_)))
     }
 
     /// Returns the first mention of `Self` in the generics of `context`, if `Self` may not be
@@ -1581,8 +1591,9 @@ impl AnalyzeVisitor {
                 ),
                 help: Some(format!(
                     "write the bound of the generics of `{}` without `{}`, write the type \
-                     without `Self`, or analyze the item with its own `intern_*` call, which \
-                     writes its `Self` as the Leaker's type",
+                     without `Self`, write the type with an absolute path (it is copied as \
+                     written, and its `Self` is the copy's own), or analyze the item with its \
+                     own `intern_*` call, which writes its `Self` as the Leaker's type",
                     tidy(&quote!(#ty)),
                     tidy(&self_path)
                 )),
@@ -1962,6 +1973,15 @@ impl AnalyzeVisitor {
                 self.not_optional.push((context, quote!(#ty).to_string()));
                 None
             }
+            // An absolute type that names the `Self` of a nested struct, enum or union
+            // (`::std::boxed::Box<Self>`, `::p::Rel2<Self, T>`) is not an optional entry: it is
+            // copied as written, and so `Self` in it is the copy's own type, for a Referrer that
+            // replaces the optional entries as well as for one that does not. As an entry it would
+            // be for the Leaker's type, which the copy cannot name as `Self`. What in it must be
+            // leaked on its own still is (`Rel<T>` in `::p::Rel2<Self, Rel<T>>`), and it is not
+            // replaced as a whole either when that costs fewer entries (`no_entry` and
+            // `no_optional_entry` below).
+            Some(context) if self.names_nested_self(&context) => None,
             optional => optional,
         };
         self.absorb(&inner);
@@ -2087,11 +2107,16 @@ impl AnalyzeVisitor {
                     self.not_optional_in_bounds(&context);
                 }
                 let has_optional = optional.is_some() || has_optional(&effects);
-                let no_entry = has_must && self.env_blocked(&context, false);
+                // A type that names the `Self` of a nested struct, enum or union, and is copied as
+                // written but for its parts, is not an entry for them either, whatever the graph
+                // finds cheaper: `Self` in it is the copy's own, not the type of an entry.
+                let nested_self = self.names_nested_self(&context);
+                let no_entry = has_must && (nested_self || self.env_blocked(&context, false));
                 if has_must && !no_entry {
                     self.not_optional_in_bounds(&context);
                 }
-                let no_optional_entry = has_optional && self.env_blocked(&context, true);
+                let no_optional_entry =
+                    has_optional && (nested_self || self.env_blocked(&context, true));
                 // A reference that is an entry is one as a whole, so its parts cannot stand for
                 // it. If it cannot be an entry, the optional entries in it are not either.
                 if no_optional_entry && is_whole_reference(ty) {
