@@ -270,9 +270,9 @@ pub struct Features {
     pub declared_named_like_generic: bool,
     /// A bare identifier that may be a const as an argument of a path of another crate, next to an
     /// argument that is leaked (`::l::BC<Rel<T>, ILEN>`, `::l::W<[Self], ILEN>` with `allow_self =
-    /// false`): the Leaker cannot leak the path as a whole, and leaks the identifier alone as a
-    /// type (`type Type = ILEN`, E0573). A known failure, off by default: the generator braces the
-    /// constant (`{ ILEN }`) in the arguments of such a path.
+    /// false`, `::l::BC<super::RC<..>, ILEN>` in a module that declares `RC`): the Leaker used to
+    /// leak the identifier alone as a type (`type Type = ILEN`, E0573); fixed (it is rejected), on
+    /// by default. Off, the generator braces the constant (`{ ILEN }`) in such a path.
     pub bare_const_in_absolute_path: bool,
 }
 
@@ -307,6 +307,7 @@ impl Features {
             gat_where_clause: true,
             nested_self: true,
             declared_named_like_generic: true,
+            bare_const_in_absolute_path: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {

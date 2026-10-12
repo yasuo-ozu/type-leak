@@ -133,13 +133,13 @@
 //!   `nested_self` (F36: a struct, an enum, a union or a trait analyzed nested in `enter_mod` that
 //!   names its own `Self`, which the Visitor writes with `with_nested_self()`) and
 //!   `declared_named_like_generic` (a module that declares `X`, and `crate::base::B1<X>` in
-//!   `fn f<X>`) are fixed findings,
+//!   `fn f<X>`) and `bare_const_in_absolute_path` (a bare `ILEN` next to a leaked argument in a
+//!   path of another crate, which was leaked alone as a type: E0573) are fixed findings,
 //!   each in a share of the items (`gen::Gen::cyclic`): they are on by default (the Leaker encodes
 //!   or rewrites them, records what they need, or rejects and counts what it cannot copy, and the
 //!   Referrer names the lifetime of an elided signature where `Self` adds lifetimes to it). `alias_item` (F26, a limitation) is a known failure that the
 //!   generator does not make by default: with it, or `all`, the test fails with the reproduction
-//!   of that finding (E0277). So are `bare_const_in_absolute_path` (a bare `ILEN` next to a leaked
-//!   argument in a path of another crate is leaked alone as a type: E0573) and
+//!   of that finding (E0277). So is
 //!   `path_named_like_generic` (`self::Rl<'a>` in a where predicate that names `Self` is not taken
 //!   for a bound cycle: E0277). The other findings of `tests/findings.rs` (F22 to F24: the Leaker
 //!   rejected what compiles, F29, F31, F32) are not features: a rejection is counted as success, and
