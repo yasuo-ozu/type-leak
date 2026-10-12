@@ -100,6 +100,27 @@ enum ModulePos {
     Elsewhere,
 }
 
+/// How the visitor looks up the default of a type parameter, while it visits the generics of an
+/// item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Defaults {
+    /// Not in such generics: a type is looked up as anywhere.
+    Plain,
+    /// With no `Self`. That is how the Leaker analyzes the default of the generics of a scope that
+    /// it enters (`enter_*`, `intern_*`: alone, with the parameters before it), whatever `Self`
+    /// the scope declares, and a default cannot name `Self` in a struct, an enum or a union.
+    WithoutSelf,
+    /// The generics of a trait nested in the visited syntax, while they are visited. The Leaker
+    /// has either analyzed the default of such a trait with the `Self` of the trait
+    /// ([`View::visit_item()`](crate::View::visit_item), the items of
+    /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod)), or, if the macro entered the trait
+    /// with [`Leaker::enter_trait()`](crate::Leaker::enter_trait), without it.
+    OwnTrait,
+    /// Visiting a default of `OwnTrait`: an entry analyzed without `Self` is preferred, else the
+    /// one of the trait's `Self` (written by `Visitor::with_nested_self()`).
+    OwnTraitDefault,
+}
+
 /// How [`Referrer::find()`] compares the context of a type with those of the entries.
 #[derive(Clone, Copy)]
 enum Matching<'a> {
@@ -112,6 +133,9 @@ enum Matching<'a> {
         /// so a type that does not name it but has a bound that does is for any type
         /// ([`SelfRequirement::Any`]).
         nested_type: bool,
+        /// The type is the default of a parameter of a nested trait, whose entry is the one
+        /// analyzed without `Self` if there is one (see [`Defaults::OwnTrait`]).
+        alone: bool,
     },
     /// The scope is that of the parameters before a defaulted one: the entry must use only them.
     Default,
@@ -226,15 +250,27 @@ impl Referrer {
             Matching::Scope {
                 self_ty,
                 nested_type,
+                alone,
                 ..
             } => {
+                let entry = entry.without_module();
+                if alone {
+                    let mut scopes = scopes.to_vec();
+                    if let Some(last) = scopes.last_mut() {
+                        last.set_self(None);
+                    }
+                    let alone = Context::of(ty, &scopes, None, false, enclosing);
+                    if alone.map_or(false, |context| context == entry) {
+                        return Some(0);
+                    }
+                }
                 // A bound that has no name here (see `Context::of()`) is in no entry.
                 let context = Context::of(ty, scopes, self_ty, nested_type, enclosing).ok()?;
-                let entry = entry.without_module();
+                let after = usize::from(alone);
                 if context == entry {
-                    Some(0)
+                    Some(after)
                 } else if context.is_entry_with_extra_self_predicates(&entry) {
-                    Some(1)
+                    Some(after + 1)
                 } else {
                     None
                 }
@@ -956,7 +992,7 @@ impl Referrer {
             own_self: false,
             nested: None,
             mod_path: Vec::new(),
-            defaults_without_self: false,
+            defaults: Defaults::Plain,
             module,
         }
     }
@@ -996,6 +1032,7 @@ impl Referrer {
                 self_ty: self_requirement.as_ref(),
                 no_self: false,
                 nested_type: false,
+                alone: false,
             },
             module,
             &mut vec![scope],
@@ -1284,9 +1321,9 @@ pub struct Visitor<F, G = fn(&NestedSelf, Type, usize) -> Type> {
     nested: Option<Rc<NestedSelf>>,
     /// The `mod` items entered since the module of the context.
     mod_path: Vec<Ident>,
-    /// While the generics of a scope that this visit declares are visited: the defaults of their
-    /// parameters have no `Self`, as in the Leaker (see `Visitor::visit_type_param_mut()`).
-    defaults_without_self: bool,
+    /// While the generics of a scope that this visit declares are visited: how the defaults of
+    /// their parameters are looked up (see `Visitor::visit_type_param_mut()`).
+    defaults: Defaults,
     module: ModulePos,
 }
 
@@ -1304,7 +1341,7 @@ impl<F, G> Clone for Visitor<F, G> {
             own_self: self.own_self,
             nested: self.nested.clone(),
             mod_path: self.mod_path.clone(),
-            defaults_without_self: self.defaults_without_self,
+            defaults: self.defaults,
             module: self.module,
         }
     }
@@ -1365,6 +1402,13 @@ where
     /// is not replaced. A leaked type that names it is found only with
     /// [`Visitor::with_nested_self()`]. The outermost item, or the signature if only that is
     /// visited, is not nested.
+    ///
+    /// The default of a parameter of the outermost item (`trait Tr<T: AsRef<Self>, U = Rel<T>>`) is
+    /// analyzed without `Self`, and is looked up so: a leaked type in it is found whatever the
+    /// scope's `Self` is, and goes to `type_fn`. If a bound of the parameters before it names
+    /// `Self` (`T: AsRef<Self>`), the entry is for any type that the bound holds for, with `Self`
+    /// in the bound as the type of the impl, so `type_fn` picks the implementor: the host, which
+    /// has the bound (`T: AsRef<Host>` in the copy that this replaces `Self` in).
     ///
     /// A `self_ty` with lifetimes (`::p::S<'a>`) gives more input lifetimes to a function pointer
     /// or `Fn(..)` that names `Self` in its inputs and has an elided lifetime in its output
@@ -1463,7 +1507,19 @@ where
     ///   struct, an enum or a union, see above. An impl needs no such type: its `Self` is the self
     ///   type as written, the same in the copy.)
     /// - [`SelfRequirement::Bound`]: the same in a trait. `Self` is a type that implements the
-    ///   Leaker's trait (a host in the copy).
+    ///   Leaker's trait (a host in the copy). That holds for the default of a parameter of the
+    ///   trait too (`trait Tr<T: AsRef<Self>, U = Rel<T>>`: `Rel<T>` is for the implementors,
+    ///   because the bound of `T` names `Self`), which `nested_fn` writes like any entry of the
+    ///   trait, `U = <Host as Repeater<..>>::Type`. Rust forbids `Self` in the default of a struct,
+    ///   an enum or a union (E0735), but the host is a concrete type. The arguments of the
+    ///   Repeater are those of the bound `Self: Tr<T, U>`, the defaulted parameter among them, and
+    ///   a declaration cannot name that parameter in its own default (E0128): pass a type for it
+    ///   at the [`UseSite`](crate::UseSite) (`UseSite::substituting()`) that the host implements
+    ///   the trait for. Without `with_nested_self()` the entry is left as written, as the same
+    ///   entry in a method is. If the macro entered the trait itself
+    ///   ([`Leaker::enter_trait()`](crate::Leaker::enter_trait)), its default was analyzed without
+    ///   `Self`, and its entry goes to `type_fn`: the visitor looks the default up that way
+    ///   first.
     /// - [`SelfRequirement::Any`]: the type of the entry does not name `Self`, and a bound of a
     ///   generic that it uses does (`Rel<T>` with `T: AsRef<Self>`, in a struct, an enum or a
     ///   union). The Repeater impl is for any type that the bound holds for (`impl<T:
@@ -1471,8 +1527,8 @@ where
     ///   own, which has the bound for itself: pass that, `Self` (it is what
     ///   `UseSite::identity()` has). The Leaker's type does not have the bound in the copy's crate
     ///   (E0277). The leaked type is the same either way, as it does not name `Self`. The Leaker
-    ///   rejects an entry whose type names `Self` too, and one in the default of a parameter,
-    ///   where the copy cannot write `Self` (E0735).
+    ///   rejects an entry whose type names `Self` too, and one in the default of a parameter of
+    ///   such an item, where the copy cannot write `Self` (E0735).
     ///
     /// Only the layer of the item the visitor is in counts: an entry of the `Self` of the context, or
     /// of the scope around that the nested item hides, is not found there. The entries that do not
@@ -1636,7 +1692,7 @@ where
             own_self: self.own_self,
             nested: self.nested,
             mod_path: self.mod_path,
-            defaults_without_self: self.defaults_without_self,
+            defaults: self.defaults,
             module: self.module,
         }
     }
@@ -1736,8 +1792,10 @@ where
         // Leaker keeps the `Self` around for a function, a type alias or a trait alias. The layer
         // of the item is the Leaker's: its `Self` is allowed whatever `allow_self` the scope
         // around has (`AnalyzeVisitor::with_item_of()`), so entries that name it exist.
+        let mut own_trait = false;
         if self.item_depth > 0 {
             if let Some(declared) = declares {
+                own_trait = matches!(declared.requirement, SelfRequirement::Bound(_));
                 visitor.own_self = true;
                 visitor.nested = Some(Rc::new(NestedSelf {
                     requirement: declared.requirement.clone(),
@@ -1757,9 +1815,16 @@ where
             let declared_for = visitor.self_requirement.clone();
             visitor.scopes.push(Scope::new(generics, declared_for));
         }
-        visitor.defaults_without_self = declared;
+        // The Leaker analyzes the defaults of a scope without `Self`, and those of a trait nested
+        // in the visited syntax with its own (`U = Rel<T>` with `T: AsRef<Self>` is an entry of
+        // the trait's `Self`, written as any entry of it), see `Defaults`.
+        visitor.defaults = if own_trait {
+            Defaults::OwnTrait
+        } else {
+            Defaults::WithoutSelf
+        };
         visitor.visit_generics_mut(generics);
-        visitor.defaults_without_self = false;
+        visitor.defaults = Defaults::Plain;
         visitor
     }
 
@@ -1814,6 +1879,7 @@ where
                 self_ty,
                 no_self,
                 nested_type,
+                alone: self.defaults == Defaults::OwnTraitDefault,
             },
             self.module,
             &mut self.scopes,
@@ -1848,10 +1914,27 @@ where
         self.scopes.truncate(depth);
     }
     fn visit_type_param_mut(&mut self, i: &mut TypeParam) {
-        if !self.defaults_without_self {
+        if matches!(self.defaults, Defaults::Plain | Defaults::OwnTraitDefault) {
             return syn::visit_mut::visit_type_param_mut(self, i);
         }
-        // The Leaker analyzes the default of a parameter of a nested scope without `Self`: it
+        if self.defaults == Defaults::OwnTrait {
+            // The default of a trait nested in the visited syntax: the Leaker has analyzed it with
+            // the `Self` of the trait (`View::visit_item()`), unless the macro entered the trait
+            // itself (`Leaker::enter_trait()`), which analyzes it without. An entry of either is
+            // found, the one without `Self` first (it is what `complete_args()` uses, and it does
+            // not name the parameters after the default), and the other is written like any entry
+            // of the trait's `Self`: `Visitor::with_nested_self()`, or left as written without it.
+            let default = i.default.take();
+            syn::visit_mut::visit_type_param_mut(self, i);
+            i.default = default;
+            if let Some(default) = &mut i.default {
+                self.defaults = Defaults::OwnTraitDefault;
+                self.visit_type_mut(default);
+                self.defaults = Defaults::OwnTrait;
+            }
+            return;
+        }
+        // The Leaker analyzes the default of a parameter of a scope without `Self`: it
         // cannot depend on it, so the bounds of the scopes around that mention `Self` are
         // rewritten for the `Self` they were written for, also where the nested scope has the same
         // one. The scope itself is declared without `Self` for its default.
@@ -2051,8 +2134,11 @@ impl Referrer {
     // enum or a union nested in the analyzed syntax, but has a bound that does, is `Self ;` (any
     // type), and the Referrer finds it only in the item that declares that `Self`. 12: an absolute
     // type that names the `Self` of such an item is no optional entry any more (it is copied as
-    // written, so its `Self` is the copy's own), and a strict Referrer replaces less.
-    pub const FORMAT_VERSION: u32 = 12;
+    // written, so its `Self` is the copy's own), and a strict Referrer replaces less. 13: the
+    // default of a parameter of a trait nested in the analyzed syntax is looked up with the
+    // trait's `Self` too, and written by `Visitor::with_nested_self()` (`U = Rel<T>` with `T:
+    // AsRef<Self>`), and that of the item itself without `Self`, as the Leaker analyzes it.
+    pub const FORMAT_VERSION: u32 = 13;
 }
 
 /// Parses a [`Referrer`] written by its [`ToTokens`] implementation.

@@ -1287,6 +1287,40 @@ pub mod kinds {
         Tagged(::type_leak_test_leaker::kinds::Pair<::core::marker::PhantomData<Self>, Wrap<T>>),
     }
 
+    // Traits nested in a module whose generic has a bound that names their own `Self` (`T:
+    // AsRef<Self>`), and whose parameter defaults use it (`U = Defd<T>`). `Self` is the
+    // implementor, so the entry is for the implementors of the trait (`Self: Tr<T, U>`), and the
+    // Visitor writes it like any entry of the trait: `with_nested_self()` (it used to leave the
+    // default as written, `Defd<T>`, which the Referrer's crate cannot resolve). A parameter
+    // default exists only in a declaration, so the Referrer's crate declares the copy
+    // (`redeclare`), and checks that its defaults are the types of the original.
+
+    /// Types that the Referrer's crate does not import: a default that it keeps as written does not
+    /// resolve there (E0412).
+    pub struct Defd<T: ?Sized>(pub PhantomData<T>);
+    pub struct Defd2<A, B>(pub A, pub B);
+
+    /// One default: the host implements the trait for any `U`, and the default passes `()`.
+    #[prop_leak(id = 9131, allow_self = true, scope = "mod", prelude = true, redeclare = true)]
+    pub trait SelfDefault<T: AsRef<Self>, U = Defd<T>> {
+        fn get(&self, t: T, u: U);
+    }
+
+    /// Two defaults (the second has an entry of its own, `Defd2<Rel, T>`), for a Referrer that
+    /// replaces the optional entries. (A method of the copy cannot name an entry: the declaration
+    /// has `T: AsRef<Self>`, and the path through the host needs `T: AsRef<Host>`.)
+    #[prop_leak(
+        id = 9132,
+        allow_self = true,
+        scope = "mod",
+        prelude = true,
+        strict = true,
+        redeclare = true
+    )]
+    pub trait SelfDefaults<T: AsRef<Self>, U = Defd<T>, V = Defd2<Rel, T>> {
+        fn get(&self, t: T, u: U, v: V);
+    }
+
     // The scopes of an item that share names, from the findings of a downstream crate
     // (`announce`, tests/downstream_findings.rs): the Repeater's impl of every entry has the
     // generics, bounds and where clause of the scope the entry is written in, and no others.

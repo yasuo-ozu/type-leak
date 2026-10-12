@@ -551,6 +551,17 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9124, __tl_report_9124!()),
             ok("enum", 2, 3, 3),
         ),
+        // the defaults of a nested trait whose generic has a bound that names its `Self`
+        (
+            9131,
+            reported(9131, __tl_report_9131!()),
+            ok("trait", 1, 3, 3),
+        ),
+        (
+            9132,
+            reported(9132, __tl_report_9132!()),
+            ok("trait", 2, 5, 5),
+        ),
         // scopes that share names (the findings of a downstream crate): methods that declare the
         // same generic with different bounds, a generic named like a relative type, a path ending
         // with the name of a generic, a type and a const parameter of one name; a bound that names
@@ -920,6 +931,92 @@ fn an_absolute_type_that_names_the_own_self_is_the_copys_in_a_strict_copy() {
         }
         _ => unreachable!(),
     }
+}
+
+/// The default of a parameter of a trait nested in a module, when a generic has a bound that names
+/// the trait's own `Self` (`trait SelfDefault<T: AsRef<Self>, U = Defd<T>>`). The entry `Defd<T>` is
+/// for the implementors of the trait, and the Visitor left the default as written (`Defd<T>`, a
+/// relative path that the Referrer's crate cannot resolve). A default exists only in a declaration,
+/// so the Referrer's crate declares the copy (`SelfDefaultCopy`), with the default written through
+/// the host, a type that implements the Leaker's trait: `<Host as Repeater<(T, ()), ID, 0>>::Type`.
+/// The default cannot pass the defaulted parameter (`(T, U)`) to the Repeater, which names itself
+/// (E0128), so it passes `()`: the host implements the Leaker's trait for any `U`.
+///
+/// An impl of the copy that leaves the parameter out takes the default, and its method has the
+/// type of the original, `Defd<Owner>`: rustc compares the signature with the trait's (E0053), so
+/// the default is exactly that type. The macro compares it with a witness as well (the position of
+/// the default).
+#[test]
+fn the_default_of_a_nested_trait_that_names_its_self_is_written_through_the_host() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_referrer::kinds as r;
+
+    // The bound holds for the implementor of the copy (`T: AsRef<Self>`), and the default is written
+    // for the host, which implements the Leaker's trait for the types that have the bound for it:
+    // `Owner` has it for the host, and for each implementor here.
+    struct Owner;
+    macro_rules! implementors {
+        ($($name:ident)*) => {$(
+            struct $name;
+            impl AsRef<$name> for Owner {
+                fn as_ref(&self) -> &$name {
+                    unimplemented!()
+                }
+            }
+        )*};
+    }
+    implementors!(Defaulted Given Two TwoFirst TwoGiven);
+    impl AsRef<r::Host9131> for Owner {
+        fn as_ref(&self) -> &r::Host9131 {
+            unimplemented!()
+        }
+    }
+    impl AsRef<r::Host9132> for Owner {
+        fn as_ref(&self) -> &r::Host9132 {
+            unimplemented!()
+        }
+    }
+    // `U` is the default: `Defd<Owner>`.
+    impl r::SelfDefaultCopy<Owner> for Defaulted {
+        fn get(&self, _t: Owner, u: l::Defd<Owner>) {
+            same(&u, &l::Defd::<Owner>(PhantomData));
+        }
+    }
+    // The default is replaced when it is given, too.
+    impl r::SelfDefaultCopy<Owner, u8> for Given {
+        fn get(&self, _t: Owner, u: u8) {
+            assert_eq!(u, 7);
+        }
+    }
+    r::SelfDefaultCopy::<Owner>::get(&Defaulted, Owner, l::Defd(PhantomData));
+    r::SelfDefaultCopy::<Owner, u8>::get(&Given, Owner, 7);
+
+    // Two defaults (strict), the second with an entry of its own: `Defd2<Rel, Owner>`.
+    impl r::SelfDefaultsCopy<Owner> for Two {
+        fn get(&self, _t: Owner, u: l::Defd<Owner>, v: l::Defd2<l::Rel, Owner>) {
+            same(&u, &l::Defd::<Owner>(PhantomData));
+            same(&v, &l::Defd2(l::Rel(0), Owner));
+        }
+    }
+    impl r::SelfDefaultsCopy<Owner, u8> for TwoFirst {
+        fn get(&self, _t: Owner, u: u8, v: l::Defd2<l::Rel, Owner>) {
+            assert_eq!(u, 1);
+            same(&v, &l::Defd2(l::Rel(0), Owner));
+        }
+    }
+    impl r::SelfDefaultsCopy<Owner, u8, u16> for TwoGiven {
+        fn get(&self, _t: Owner, u: u8, v: u16) {
+            assert_eq!((u, v), (1, 2));
+        }
+    }
+    r::SelfDefaultsCopy::<Owner>::get(
+        &Two,
+        Owner,
+        l::Defd(PhantomData),
+        l::Defd2(l::Rel(5), Owner),
+    );
+    r::SelfDefaultsCopy::<Owner, u8>::get(&TwoFirst, Owner, 1, l::Defd2(l::Rel(5), Owner));
+    r::SelfDefaultsCopy::<Owner, u8, u16>::get(&TwoGiven, Owner, 1, 2);
 }
 
 /// The scopes of an item that share names (the findings A, 1, 2, 3, 4 and 7 of a downstream crate,

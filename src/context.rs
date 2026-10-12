@@ -183,6 +183,11 @@ pub enum SelfRequirement {
     /// `Self::Item` becomes `<__S>::Item`, and `Self: Sized` becomes `__S: Sized`. The copy uses
     /// `<Self as Repeater<..>>::Type`, where `Self` is the implementor, so the impl in the other
     /// crate must provide the associated types that the type uses (`type Item = u8;`).
+    ///
+    /// The default of a parameter of a trait nested in the analyzed syntax can have it
+    /// (`trait Tr<T: AsRef<Self>, U = Rel<T>>`): the entry names the parameter it is the default
+    /// of, as `Self: Tr<T, U>` does. See
+    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self).
     Bound(Path),
     /// `Self` is this type: a struct, enum, union or the self type of an impl, e.g. `MyStruct<T>`.
     ///

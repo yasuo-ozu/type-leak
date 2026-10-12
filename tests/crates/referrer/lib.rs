@@ -177,6 +177,10 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9122!(path = ::type_leak_test_leaker::kinds, strict);
     type_leak_test_leaker::__tl_prop_9123!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9124!(path = ::type_leak_test_leaker::kinds, strict);
+    // The defaults of a nested trait whose generic has a bound that names its `Self`: the copy is
+    // declared here, with the defaults written through the host.
+    type_leak_test_leaker::__tl_prop_9131!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9132!(path = ::type_leak_test_leaker::kinds, strict);
     // The scopes that share names: every entry has the generics of its own scope.
     type_leak_test_leaker::__tl_prop_9071!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9072!(path = ::type_leak_test_leaker::kinds);

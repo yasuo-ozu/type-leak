@@ -62,6 +62,11 @@ pub(crate) struct Args {
     /// whatever the prelude (the `?` applies to the real `Sized` only), `false` if it is a relative
     /// path like any other bare name of the prelude (`gen::BARE_RELAXED_SIZED_ALWAYS_OK`).
     relaxed_sized: bool,
+    /// A trait: the Referrer's crate declares the rewritten trait too (`<Name>Copy`), not only an
+    /// impl of the Leaker's trait for the host. Its parameter defaults are rewritten for a
+    /// declaration, which cannot name the defaulted parameter itself (E0128): see
+    /// [`rewrite_defaults()`].
+    redeclare: bool,
 }
 
 impl Parse for Args {
@@ -75,6 +80,7 @@ impl Parse for Args {
             strict: None,
             primitive: true,
             relaxed_sized: false,
+            redeclare: false,
         };
         for kv in Punctuated::<MetaNameValue, Token![,]>::parse_terminated(input)? {
             let key = kv
@@ -94,6 +100,7 @@ impl Parse for Args {
                 ("strict", Lit::Bool(b)) => args.strict = Some(b.value),
                 ("primitive", Lit::Bool(b)) => args.primitive = b.value,
                 ("relaxed_sized", Lit::Bool(b)) => args.relaxed_sized = b.value,
+                ("redeclare", Lit::Bool(b)) => args.redeclare = b.value,
                 ("allow", Lit::Str(s)) => {
                     for path in s.value().split(',').filter(|p| !p.trim().is_empty()) {
                         args.allow.push(parse_str(path.trim())?);
@@ -110,6 +117,7 @@ impl Args {
     fn tokens(&self) -> TokenStream {
         let (id, allow_self, prelude) = (self.id, self.allow_self, self.prelude);
         let (primitive, relaxed_sized) = (self.primitive, self.relaxed_sized);
+        let redeclare = self.redeclare;
         let strict = self.strict.map(|strict| quote!(strict = #strict,));
         let scope = &self.scope;
         let allow = self
@@ -118,7 +126,7 @@ impl Args {
             .map(|p| quote!(#p).to_string().replace(' ', ""))
             .collect::<Vec<_>>()
             .join(",");
-        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict primitive = #primitive, relaxed_sized = #relaxed_sized)
+        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict primitive = #primitive, relaxed_sized = #relaxed_sized, redeclare = #redeclare)
     }
 }
 
@@ -679,7 +687,13 @@ fn collect_item(
                 }
             });
             for (before, ty) in default_positions(&i.generics) {
-                push(&[&before], &None, &ty);
+                // A bound that names `Self` (`T: AsRef<Self>`, `where T: AsRef<Self>`) is for the
+                // implementor, as in a method: the position is generic over it, with the trait's
+                // generics (the bound on the implementor names the defaulted parameter too).
+                match (names_self(&i.generics), &sub) {
+                    (true, Some(_)) => push(&[&i.generics], &sub, &ty),
+                    _ => push(&[&before], &None, &ty),
+                }
             }
             for trait_item in &i.items {
                 match trait_item {
@@ -753,6 +767,19 @@ fn collect_item(
         }
         _ => (),
     }
+}
+
+/// Whether `generics` name `Self`.
+fn names_self(generics: &Generics) -> bool {
+    fn has_self(tokens: TokenStream) -> bool {
+        tokens.into_iter().any(|tree| match tree {
+            proc_macro2::TokenTree::Ident(ident) => ident == "Self",
+            proc_macro2::TokenTree::Group(group) => has_self(group.stream()),
+            _ => false,
+        })
+    }
+    let where_clause = &generics.where_clause;
+    has_self(quote!(#generics #where_clause))
 }
 
 /// The types of a signature besides the receiver: the parameters, then the return type.
@@ -1418,11 +1445,108 @@ fn rewrite(
     if let Some(e) = error.into_inner() {
         return Err(e);
     }
+    if let (true, Item::Trait(original), Item::Trait(copy)) = (args.redeclare, item, &mut rewritten)
+    {
+        if args.scope != "mod" {
+            return Err(Error::new(
+                Span::call_site(),
+                "test macro: `redeclare` is for the traits of a scope `mod`",
+            ));
+        }
+        let mut base = leaker_path.clone();
+        if let Item::Mod(m) = item {
+            base.segments.push(m.ident.clone().into());
+        }
+        rewrite_defaults(referrer, context, original, copy, &projector, &base)?;
+    }
     Ok(Rewritten {
         item: rewritten,
         host,
         dyn_host,
     })
+}
+
+/// Rewrites the defaults of the type parameters of a trait for a declaration (`Args::redeclare`).
+///
+/// The Repeater's arguments of an entry that names the `Self` of the trait are the generics of
+/// `Self: Tr<T, U>` too, the defaulted parameter among them. A default that passes `U` names the
+/// parameter that it is the default of (E0128), so the copy passes `()` for the defaulted
+/// parameters, and the host implements the Leaker's trait for any type of them. The result is the
+/// same type: the entry does not depend on them.
+fn rewrite_defaults(
+    referrer: &Referrer,
+    context: ContextId,
+    original: &ItemTrait,
+    copy: &mut ItemTrait,
+    projector: &Projector<'_>,
+    base: &Path,
+) -> Result<()> {
+    let first = original.generics.params.iter().position(
+        |param| matches!(param, GenericParam::Type(TypeParam { default: Some(_), .. })),
+    );
+    let first = match first {
+        Some(first) => first,
+        None => return Ok(()),
+    };
+    let mut root_args = projector.root_args.clone();
+    for (arg, param) in root_args
+        .iter_mut()
+        .zip(&original.generics.params)
+        .skip(first)
+    {
+        if matches!(param, GenericParam::Type(_)) {
+            *arg = GenericArgument::Type(parse_quote!(()));
+        }
+    }
+    let placeholder = Projector {
+        referrer,
+        repeater: projector.repeater.clone(),
+        id: projector.id,
+        root_params: projector.root_params.clone(),
+        root_args,
+        bound_self: projector.bound_self.clone(),
+        type_self: projector.type_self.clone(),
+    };
+    // The generics only: the same scope, and so the same entries, with no item to rewrite.
+    let mut shell = original.clone();
+    shell.items.clear();
+    shell.supertraits.clear();
+    let error = std::cell::RefCell::new(None);
+    let mut file = File {
+        shebang: None,
+        attrs: Vec::new(),
+        items: vec![Item::Trait(shell)],
+    };
+    referrer
+        .clone()
+        .visitor(context, |_, ix| {
+            placeholder.project(ix).unwrap_or_else(|e| {
+                *error.borrow_mut() = Some(e);
+                parse_quote!(())
+            })
+        })
+        .with_nested_self(|nested, _, ix| {
+            placeholder
+                .project_nested(nested, base, ix)
+                .unwrap_or_else(|e| {
+                    *error.borrow_mut() = Some(e);
+                    parse_quote!(())
+                })
+        })
+        .visit_file_mut(&mut file);
+    if let Some(e) = error.into_inner() {
+        return Err(e);
+    }
+    let shell = match file.items.remove(0) {
+        Item::Trait(shell) => shell,
+        _ => unreachable!(),
+    };
+    for (param, rewritten) in copy.generics.params.iter_mut().zip(shell.generics.params) {
+        if let (GenericParam::Type(param), GenericParam::Type(rewritten)) = (param, rewritten) {
+            param.default = rewritten.default;
+        }
+    }
+    Ok(())
 }
 
 /// Drops the imports of names the Leaker leaks: a copy of a module in another crate cannot resolve
@@ -1987,7 +2111,14 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
             match &item {
                 Item::Trait(original) => {
                     let host_impl = host_impl(t, original, host, dyn_host, &path);
-                    quote!(#import #host_impl)
+                    // The Referrer's crate declares the copy, which has the defaults of the
+                    // parameters rewritten (`rewrite_defaults()`).
+                    let declared = args.redeclare.then(|| {
+                        let mut declared = t.clone();
+                        declared.ident = ident(&format!("{}Copy", t.ident));
+                        quote!(#[allow(dead_code)] #declared)
+                    });
+                    quote!(#import #host_impl #declared)
                 }
                 _ => unreachable!(),
             }

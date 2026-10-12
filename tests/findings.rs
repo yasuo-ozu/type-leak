@@ -47,6 +47,7 @@
 //! | `f36_nested_item_self_entry_not_rewritten` | an entry that names the own `Self` of a struct, enum, union, trait or impl nested in a module is recorded, and the Visitor never rewrote it: `Visitor::with_nested_self()` | fixed |
 //! | `f37_nested_type_with_a_bound_that_names_its_own_self_is_supported` | an entry that uses a generic whose bound names the own `Self` of a struct, enum or union nested in a module: the bound holds for the copy's type, the Repeater's impl needed it for the Leaker's; the impl is for any type now, and the copy passes its own (`SelfRequirement::Any`) | fixed |
 //! | `f38_an_absolute_type_that_names_the_own_self_is_copied_as_written` | an absolute type that names the own `Self` of a struct, enum or union nested in a module (`::std::boxed::Box<Self>`) was an optional entry: a strict Referrer replaced it with the Leaker's type, and a trusting one left the copy's own; it is no entry now, and both copy it as written | fixed |
+//! | `f39_the_default_of_a_nested_trait_that_needs_its_self_is_written_through_the_host` | the default of a parameter of a trait (`U = Rel<T>` with `T: AsRef<Self>`) has an entry for the trait's `Self`, and the Visitor left it as written: it is looked up with the trait's own `Self` too, and written by `with_nested_self()`; the default of the trait itself is looked up without `Self`, as it is analyzed | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that the docs of `Leaker` document, or that follows from what rustc accepts). No test
@@ -6875,6 +6876,18 @@ fn nested_copy_as(
     declared: &[&str],
     strict: bool,
 ) -> (Item, Referrer, Vec<String>) {
+    nested_copy_with(nest, item, declared, strict, true)
+}
+
+/// Like `nested_copy_as()`; with `nested` false the visitor has no `with_nested_self()` (the macro
+/// gives no host), and every entry goes to the ordinary closure.
+fn nested_copy_with(
+    nest: Nest,
+    item: &Item,
+    declared: &[&str],
+    strict: bool,
+    nested: bool,
+) -> (Item, Referrer, Vec<String>) {
     let mut leaker = new_leaker();
     let context = match nest {
         Nest::EnterMod => {
@@ -6895,7 +6908,15 @@ fn nested_copy_as(
         }
     };
     let referrer = leaker.finish().allow_ambiguous_crate_name(!strict);
-    let (mut visitor, calls) = nested_visitor(&referrer, context);
+    let (mut visitor, calls): (Box<dyn VisitMut>, NestedCalls) = if nested {
+        let (visitor, calls) = nested_visitor(&referrer, context);
+        (Box::new(visitor), calls)
+    } else {
+        let visitor = referrer
+            .clone()
+            .visitor(context, |_, ix| parse_quote!(P<#ix>));
+        (Box::new(visitor), NestedCalls::default())
+    };
     let copy = match nest {
         Nest::EnterMod | Nest::InternMod => {
             let mut file = file_of(vec![item.clone()]);
@@ -8414,5 +8435,379 @@ fn f38_the_relative_types_and_the_other_items_are_unchanged() {
         let (strict, _, calls) = nested_copy_as(nest, &imp, &[], true);
         assert!(!string(&strict).contains("W < Self >"), "{:?}", nest);
         assert_eq!(calls.len(), 1, "{:?}", nest);
+    }
+}
+
+// ── F39 ──────────────────────────────────────────────────────────────────────
+
+/// F39 (fixed): the default of a parameter of a trait, when an entry in it needs the trait's `Self`
+/// (`trait Tr<T: AsRef<Self>, U = Rel<T>>`: `Rel<T>` is for the implementors of the trait, because
+/// the bound of `T` names `Self`), was left as written by the Visitor, whereas the Leaker recorded
+/// it as a required entry (`SelfRequirement::Bound`). The copy kept the relative `Rel<T>`, which
+/// the Referrer's crate cannot resolve. The same type in a method (`fn f(&self, u: Rel<T>)`) was
+/// replaced, by `Visitor::with_nested_self()`.
+///
+/// The cause: the Visitor looked up the default of a parameter without `Self`, as the Leaker
+/// analyzes the default of the generics of a scope that it enters (`enter_*`, `intern_*`:
+/// `AnalyzeVisitor::analyze_default_inline()`), and as the default of a struct, an enum or a union
+/// has to be (a default cannot name `Self` there: E0735). The Leaker analyzes the default of a trait
+/// that `View::visit_item()` (and so `intern_mod()`) visits with the trait's own `Self`: a trait may
+/// name `Self` in a default (`Rhs = Self`). So the contexts were not the same, and the entry was not
+/// found.
+///
+/// The fix: the default of a trait nested in the visited syntax is looked up without `Self`
+/// first (the entry of a scope that the macro entered with `Leaker::enter_trait()`), then with the
+/// trait's own, and written by `Visitor::with_nested_self()`, which tells the entry by
+/// `Referrer::context_self()`. Without a host (`with_nested_self()` not called) the entry is left
+/// as written, as the same entry in a method is. A struct, an enum and a union are as before
+/// (`f37_a_default_cannot_pass_the_own_type`).
+///
+/// The Repeater's arguments of such an entry include the defaulted parameter, as the bound
+/// `Self: Tr<T, U>` of the implementor names it: a declaration cannot pass it to its own default
+/// (E0128), so the macro passes a type for it that the host implements the trait for (the fixtures
+/// 9131 and 9132 of `tests/cross_crate.rs`, which compile in the Referrer's crate).
+///
+/// The property test hardly generates the shape: a default is generated for a trailing parameter
+/// that no bound or predicate names, and the types of the earlier ones are bounded by predicates
+/// that name `Self` only now and then. In its runs of this fix (seeds 1 to 24 of 60 cases, and seed
+/// 4 of 120) 2 of the 2170 traits with a default name `Self` in the header, and neither has a type
+/// default that uses a parameter with such a bound. The cross-crate fixtures 9131 and 9132 are
+/// the oracle.
+#[test]
+fn f39_the_default_of_a_nested_trait_that_needs_its_self_is_written_through_the_host() {
+    let item: Item = parse_quote!(
+        pub trait Tr<T: ::core::convert::AsRef<Self>, U = Rel<T>> {
+            fn f(&self, u: U);
+        }
+    );
+    for nest in NESTS {
+        for strict in [false, true] {
+            let what = format!("{:?}, strict {}", nest, strict);
+            let (copy, referrer, calls) = nested_copy_as(nest, &item, &["Tr"], strict);
+            // The Leaker: one required entry, for the implementors of the trait. It is not a
+            // `Self` of a struct (`Any`), and it names the parameter that it is the default of.
+            assert_eq!(referrer.iter().count(), 1, "{}", what);
+            assert!(referrer.must(0), "{}", what);
+            match referrer.context_self(referrer.context(0)) {
+                Some(SelfRequirement::Bound(path)) => {
+                    assert_eq!(string(path), "Tr < T , U >", "{}", what)
+                }
+                other => panic!("{}: {:?}", what, other),
+            }
+            assert_eq!(
+                string(referrer.context_generics(referrer.context(0))),
+                "< T : :: core :: convert :: AsRef < Self > , U >",
+                "{}",
+                what
+            );
+            // The copy: the default is written for the trait's own `Self`.
+            let expected: Item = parse_quote!(
+                pub trait Tr<T: ::core::convert::AsRef<Self>, U = N<0usize>> {
+                    fn f(&self, u: U);
+                }
+            );
+            assert_eq!(string(&copy), string(&expected), "{}", what);
+            assert_eq!(calls.len(), 1, "{}: {:?}", what, calls);
+            assert!(
+                calls[0].starts_with("Self: Tr < T , U > / Tr / "),
+                "{}: {:?}",
+                what,
+                calls
+            );
+        }
+    }
+
+    // As reported: `enter_mod`, a closure for the host and one for the others.
+    let mut leaker = new_leaker();
+    let (context, ()) = leaker
+        .enter_mod("m", names(&["Tr"]), |view| view.visit_item(&item))
+        .unwrap();
+    let referrer = leaker.finish();
+    let mut file = file_of(vec![item.clone()]);
+    referrer
+        .clone()
+        .visitor(context, |_, ix| parse_quote!(<() as Repeater<#ix>>::Type))
+        .with_nested_self(|_, _, ix| parse_quote!(<Host as Repeater<#ix>>::Type))
+        .visit_file_mut(&mut file);
+    let expected: Item = parse_quote!(
+        pub trait Tr<T: ::core::convert::AsRef<Self>, U = <Host as Repeater<0usize>>::Type> {
+            fn f(&self, u: U);
+        }
+    );
+    assert_eq!(string(&file.items[0]), string(&expected));
+    // The Repeater's arguments of the entry include `U` (the argument of `Self: Tr<T, U>`), which
+    // a declaration cannot pass to the default of `U`.
+    let args = referrer.entry_args(0, &UseSite::identity()).unwrap();
+    assert_eq!(string(&args), "(T , U)");
+
+    // Without a host (no `with_nested_self()`), the entry is left as written, as the same entry
+    // is in a method signature of the same context.
+    let method: Item = parse_quote!(
+        pub trait Tr<T: ::core::convert::AsRef<Self>> {
+            fn f(&self, u: Rel<T>);
+        }
+    );
+    for nest in NESTS {
+        let (copy, referrer, calls) = nested_copy_with(nest, &item, &["Tr"], false, false);
+        assert_eq!(referrer.iter().count(), 1, "{:?}", nest);
+        assert_eq!(string(&copy), string(&item), "{:?}", nest);
+        assert!(calls.is_empty(), "{:?}", nest);
+        let (copy, _, _) = nested_copy_with(nest, &method, &["Tr"], false, false);
+        assert_eq!(string(&copy), string(&method), "{:?}", nest);
+    }
+}
+
+/// F39, the controls: a nested trait whose default does not need its `Self` is replaced by the
+/// ordinary closure as before, and a method that does by `with_nested_self()` as before. Nothing in
+/// a trait is for any type (`SelfRequirement::Any` is for a struct, an enum or a union), and an
+/// associated type or a constant that uses the generic is replaced like the default.
+#[test]
+fn f39_the_other_traits_are_unchanged() {
+    // The item, and its copy with `P` for the ordinary closure and `N` for the nested one.
+    let cases: Vec<(Item, Item)> = vec![
+        (
+            parse_quote!(
+                pub trait Tr<T, U = Rel<T>> {
+                    fn f(&self, u: U);
+                }
+            ),
+            parse_quote!(
+                pub trait Tr<T, U = P<0usize>> {
+                    fn f(&self, u: U);
+                }
+            ),
+        ),
+        (
+            parse_quote!(
+                pub trait Tr<T: Clone, U = Rel<T>> {
+                    fn f(&self, u: U);
+                }
+            ),
+            parse_quote!(
+                pub trait Tr<T: Clone, U = P<0usize>> {
+                    fn f(&self, u: U);
+                }
+            ),
+        ),
+        // The bound names `Self`, and the default does not use the generic.
+        (
+            parse_quote!(
+                pub trait Tr<T: ::core::convert::AsRef<Self>, U = Rel> {
+                    fn f(&self, t: T, u: U);
+                }
+            ),
+            parse_quote!(
+                pub trait Tr<T: ::core::convert::AsRef<Self>, U = P<0usize>> {
+                    fn f(&self, t: T, u: U);
+                }
+            ),
+        ),
+        // The same entry in a method: written for the trait's `Self`.
+        (
+            parse_quote!(
+                pub trait Tr<T: ::core::convert::AsRef<Self>> {
+                    fn f(&self, u: Rel<T>);
+                }
+            ),
+            parse_quote!(
+                pub trait Tr<T: ::core::convert::AsRef<Self>> {
+                    fn f(&self, u: N<0usize>);
+                }
+            ),
+        ),
+        // An associated type and a constant keep the `Self` of the trait.
+        (
+            parse_quote!(
+                pub trait Tr<T: ::core::convert::AsRef<Self>> {
+                    type A = Rel<T>;
+                    const C: Rel2<T>;
+                }
+            ),
+            parse_quote!(
+                pub trait Tr<T: ::core::convert::AsRef<Self>> {
+                    type A = N<0usize>;
+                    const C: N<1usize>;
+                }
+            ),
+        ),
+    ];
+    for (item, expected) in &cases {
+        for nest in NESTS {
+            let what = format!("{:?} `{}`", nest, string(item));
+            let (copy, referrer, _) = nested_copy(nest, item, &["Tr"]);
+            assert_eq!(string(&copy), string(expected), "{}", what);
+            for ix in 0..referrer.iter().count() {
+                assert!(referrer.must(ix), "{}", what);
+                assert!(
+                    !matches!(
+                        referrer.context_self(referrer.context(ix)),
+                        Some(SelfRequirement::Any)
+                    ),
+                    "{}",
+                    what
+                );
+            }
+        }
+    }
+}
+
+/// How a trait analyzed as the item itself is analyzed.
+#[derive(Clone, Copy, Debug)]
+enum Root {
+    /// `intern_trait()`.
+    InternTrait,
+    /// `enter_trait()` and a walk of the item, as a macro that enters the scope itself does.
+    EnterTrait,
+}
+
+const ROOTS: [Root; 2] = [Root::InternTrait, Root::EnterTrait];
+
+fn root_analysis(root: Root, item: &ItemTrait) -> (Referrer, ContextId) {
+    let mut leaker = new_leaker();
+    let context = match root {
+        Root::InternTrait => leaker.intern_trait(item, true).unwrap(),
+        Root::EnterTrait => {
+            leaker
+                .enter_trait(&item.ident, &item.generics, true, |view| {
+                    syn::visit::visit_item_trait(view, item)
+                })
+                .unwrap()
+                .0
+        }
+    };
+    (leaker.finish(), context)
+}
+
+/// The entries of `referrer` of the type `ty`, with what `Self` means in their context.
+fn entries_of(referrer: &Referrer, ty: &str) -> Vec<(usize, bool)> {
+    (0..referrer.iter().count())
+        .filter(|&ix| string(referrer.iter().nth(ix).unwrap()) == ty)
+        .map(|ix| (ix, referrer.context_self(referrer.context(ix)).is_some()))
+        .collect()
+}
+
+/// F39: a trait analyzed as the item itself (`intern_trait()`, or `enter_trait()` and a walk of the
+/// item) and copied with `with_self(host)`. The default is analyzed alone (without `Self`, with the
+/// parameters before it): its entry is for any type that the bound holds for (`Rel<T>` with `T:
+/// AsRef<Self>`, where `Self` in the bound is the type of the impl), so the macro picks the
+/// implementor, and the Visitor hands the entry to the ordinary closure, whose result is not
+/// substituted again. It used to look the default up with the `Self` of the scope as well, and
+/// skipped the entry when another entry of the trait (`Rel2<Self>`) gave the scope a `Self`, so
+/// the copy kept `Rel<T>`. (The walk of the item in `enter_trait()` analyzes the default a second
+/// time, as a nested item, so the Leaker records an entry for the trait's `Self` too: the Visitor
+/// prefers the one analyzed alone.)
+#[test]
+fn f39_the_default_of_the_trait_itself_is_looked_up_without_self() {
+    let host: Type = parse_quote!(Host);
+    let item: ItemTrait = parse_quote!(
+        pub trait Tr<T: ::core::convert::AsRef<Self>, U = Rel<T>> {
+            fn f(&self, u: U) -> Rel2<Self>;
+        }
+    );
+    for root in ROOTS {
+        let what = format!("{:?}", root);
+        let (referrer, context) = root_analysis(root, &item);
+        // The entry analyzed alone has no `Self`; its generics have the bound.
+        let alone: Vec<usize> = entries_of(&referrer, "Rel < T >")
+            .into_iter()
+            .filter(|(_, has_self)| !has_self)
+            .map(|(ix, _)| ix)
+            .collect();
+        assert_eq!(alone.len(), 1, "{}", what);
+        let (default, rel2) = (alone[0], entry(&referrer, "Rel2 < Self >"));
+        assert!(referrer.must(default), "{}", what);
+        assert_eq!(
+            string(referrer.context_generics(referrer.context(default))),
+            "< T : :: core :: convert :: AsRef < Self > >",
+            "{}",
+            what
+        );
+        let mut copy = item.clone();
+        referrer
+            .clone()
+            .visitor(context, |_, ix| parse_quote!(P<#ix>))
+            .with_self(host.clone())
+            .visit_item_trait_mut(&mut copy);
+        let expected: ItemTrait = parse_quote!(
+            pub trait Tr<T: ::core::convert::AsRef<Host>, U = P<#default>> {
+                fn f(&self, u: U) -> P<#rel2>;
+            }
+        );
+        assert_eq!(string(&copy), string(&expected), "{}", what);
+    }
+
+    // Only the default: the scope has no `Self`.
+    let item: ItemTrait = parse_quote!(
+        pub trait Tr<T: ::core::convert::AsRef<Self>, U = Rel<T>> {
+            fn f(&self, u: U);
+        }
+    );
+    for root in ROOTS {
+        let what = format!("{:?}", root);
+        let (referrer, context) = root_analysis(root, &item);
+        let default = entries_of(&referrer, "Rel < T >")
+            .into_iter()
+            .find(|(_, has_self)| !has_self)
+            .unwrap_or_else(|| panic!("{}: no entry", what))
+            .0;
+        let mut copy = item.clone();
+        referrer
+            .clone()
+            .visitor(context, |_, ix| parse_quote!(P<#ix>))
+            .with_self(host.clone())
+            .visit_item_trait_mut(&mut copy);
+        let expected: ItemTrait = parse_quote!(
+            pub trait Tr<T: ::core::convert::AsRef<Host>, U = P<#default>> {
+                fn f(&self, u: U);
+            }
+        );
+        assert_eq!(string(&copy), string(&expected), "{}", what);
+    }
+
+    // The same type in the default and in a method: the method's entry is for the trait's `Self`,
+    // the default's is not.
+    let item: ItemTrait = parse_quote!(
+        pub trait Tr<T: ::core::convert::AsRef<Self>, U = Rel<T>> {
+            fn f(&self, u: Rel<T>);
+        }
+    );
+    for root in ROOTS {
+        let what = format!("{:?}", root);
+        let (referrer, context) = root_analysis(root, &item);
+        let entries = entries_of(&referrer, "Rel < T >");
+        let default = entries.iter().find(|(_, has_self)| !has_self).unwrap().0;
+        let method = entries.iter().find(|(_, has_self)| *has_self).unwrap().0;
+        let mut copy = item.clone();
+        referrer
+            .clone()
+            .visitor(context, |_, ix| parse_quote!(P<#ix>))
+            .with_self(host.clone())
+            .visit_item_trait_mut(&mut copy);
+        let expected: ItemTrait = parse_quote!(
+            pub trait Tr<T: ::core::convert::AsRef<Host>, U = P<#default>> {
+                fn f(&self, u: P<#method>);
+            }
+        );
+        assert_eq!(string(&copy), string(&expected), "{}", what);
+    }
+}
+
+/// F39, unchanged: a struct, an enum or a union nested in a scope still rejects the same entry (its
+/// copy would have to write `Self` in the default, E0735), whereas the item itself accepts it.
+#[test]
+fn f39_a_nested_struct_still_rejects_the_default() {
+    let item: Item = parse_quote!(
+        pub struct S<T: ::core::convert::AsRef<Self>, U = Rel<T>>(pub T, pub U);
+    );
+    for nest in NESTS {
+        let (_, result) = nested_analysis(nest, &item, &["S"]);
+        assert_rejected(
+            &item,
+            result,
+            &["`Rel < T >` is in the default of a parameter, and a bound of its generics names `Self`"],
+        );
+    }
+    if let Item::Struct(item) = &item {
+        new_leaker().intern_struct(item, true).unwrap();
     }
 }
