@@ -1856,8 +1856,9 @@ impl Referrer {
     // projection of `Self` records `Self: 'a` any more. 8: the top-level context of a trait scope
     // carries its generic associated types with outlives (`type G<'b> where Self: 'b ;`), and the
     // context of an entry that names one has what its where clause requires (`Self: 'x`), as the
-    // Referrer computes it for a copy.
-    pub const FORMAT_VERSION: u32 = 8;
+    // Referrer computes it for a copy. 9: the Referrer computes the context of a type from the
+    // first segment of a relative path only, so `inner::U` next to a generic `U` is found.
+    pub const FORMAT_VERSION: u32 = 9;
 }
 
 /// Parses a [`Referrer`] written by its [`ToTokens`] implementation.

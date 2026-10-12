@@ -50,6 +50,9 @@ use template_quote::quote;
 /// rejects these (the error's `help` says what to write instead):
 ///
 /// - `MyType<'_>`, `impl Trait`, and a relative trait or value in a bound: write an absolute path.
+///   (`T: ?Sized` is left as written: rustc allows `?` only on the language's `Sized`. A bound
+///   `Sized`, as in `Self: Sized`, is a relative trait like `Clone`:
+///   [`allow_std_prelude()`](LeakerConfig::allow_std_prelude).)
 /// - A path whose definition needs `T: 'a` ([Outlives bounds](#outlives-bounds)).
 /// - An output lifetime that only a leaked type would keep ([Binder](#binder-lifetimes),
 ///   [Elided](#elided-lifetimes) and [Method](#method-lifetimes) lifetimes).
@@ -61,6 +64,10 @@ use template_quote::quote;
 /// - An absolute path of another crate, trusted only if both crates have it
 ///   ([`allowed_paths`](Leaker::allowed_paths)).
 /// - A shadowed primitive name (`type u8 = i32;`): emit [`Leaker::assertions()`] to catch it.
+/// - A value: the default of an associated const, the value of a const or static, and the body of a
+///   function are not analyzed, so a relative path in them (`const N: usize = size_of::<Rel>();`)
+///   breaks the copy and the Leaker does not tell. [`LeakerConfig::check_values()`] rejects them.
+///   An enum discriminant and an array length are always analyzed.
 ///
 /// # What the Leaker checks
 ///
@@ -187,6 +194,8 @@ pub struct Leaker {
     /// too.
     top_levels: BTreeSet<ContextId>,
     assumed_primitives: Vec<Ident>,
+    /// Whether the values of an item are read ([`LeakerConfig::check_values()`]).
+    check_values: bool,
 }
 
 impl Leaker {
@@ -199,6 +208,7 @@ impl Leaker {
     pub fn from_config(config: LeakerConfig) -> Self {
         Self {
             allowed_paths: config.allowed_paths,
+            check_values: config.check_values,
             ..Self::default()
         }
     }
@@ -306,7 +316,8 @@ impl Leaker {
     ///
     /// `Self` is the self type ([`SelfRequirement::Type`]), and `allow_self` is as for
     /// [`intern_struct()`](Leaker::intern_struct). Function bodies and const values are not
-    /// analyzed, and the trait path must not depend on the context.
+    /// analyzed unless [`LeakerConfig::check_values()`] is on, and the trait path must not depend
+    /// on the context.
     ///
     /// An entry in the self type must not depend on `Self`, because the copy writes the self type
     /// for `Self`. It does if a bound of the impl names `Self` and the entry uses that generic
@@ -378,8 +389,9 @@ impl Leaker {
     /// Analyzes a module and returns its [`ContextId`].
     ///
     /// Every item in it is a nested item, so its generics are local, and `Self` has no meaning in
-    /// it. Function bodies and const values are not analyzed. The names declared in the module are
-    /// copied with it, not leaked (the rules of `declared` in [`enter_mod()`](Leaker::enter_mod)).
+    /// it. Function bodies and const values are not analyzed unless [`LeakerConfig::check_values()`]
+    /// is on. The names declared in the module are copied with it, not leaked (the rules of
+    /// `declared` in [`enter_mod()`](Leaker::enter_mod)).
     /// [`Referrer::module_path()`] gives the path of a nested module, and
     /// [`Referrer::context_module()`] the module of an entry. Two calls return two modules: rewrite
     /// the copy of each with its own id ([`Referrer::visitor()`]).
@@ -685,7 +697,8 @@ impl Scopes for Leaker {
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> Res<(ContextId, R)> {
         let root = spec.declared_generics();
-        let mut visitor = AnalyzeVisitor::new(AllowedPaths::new(&self.allowed_paths), &root);
+        let mut visitor = AnalyzeVisitor::new(AllowedPaths::new(&self.allowed_paths), &root)
+            .reading_values(self.check_values);
         let mark = self.contexts.len();
         // The visitor owns the table of contexts while it analyzes, so the swap is the only step
         // before `catch_unwind`: no allocation, no user code. Whatever happens next (a result, an

@@ -1087,4 +1087,68 @@ pub mod kinds {
         fn rel(&self, x: Pair<Rel, T>) -> Wrap<T>;
         fn pair(&self, x: Pair<Rel, Wrap<Self>>) -> Rel;
     }
+
+    // The scopes of an item that share names, from the findings of a downstream crate
+    // (`announce`, tests/downstream_findings.rs): the Repeater's impl of every entry has the
+    // generics, bounds and where clause of the scope the entry is written in, and no others.
+
+    /// A type that is well-formed only for `T: Clone`.
+    pub struct Cloned<T: Clone>(pub T);
+
+    /// A type with a const parameter.
+    pub struct Arr<const N: usize>;
+
+    /// A type whose name a method generic can have too.
+    pub struct Local(pub u8);
+
+    pub mod inner {
+        /// A type whose name a generic can have too, written with a path.
+        pub struct U(pub u8);
+    }
+
+    /// Two methods declare the generic `X` with different bounds (the entries `Cloned<X>` and
+    /// `Wrap<X>`); a method generic is named like the relative type `Local` (its `Local` is no
+    /// entry, the one in the return type of the other method is); a path ends with the name of a
+    /// generic of a method (`inner::U` next to `<U>`); and two methods declare `N` as a type and as
+    /// a const.
+    #[prop_leak(id = 9071, allow_self = false, prelude = true)]
+    pub trait SameNames {
+        fn with_bound<X: Clone>(&self, x: Cloned<X>) -> Cloned<X>;
+        fn without_bound<X>(&self, x: Wrap<X>) -> Wrap<X>;
+        fn generic_local<Local>(&self, x: Local) -> Local;
+        fn type_local(&self) -> Local;
+        fn segment<U>(&self, x: Wrap<U>) -> inner::U;
+        fn type_n<N>(&self, x: Wrap<N>) -> Wrap<N>;
+        fn const_n<const N: usize>(&self, x: Arr<N>) -> Arr<N>;
+    }
+
+    /// A bound that names a parameter the entry `Wrap<T>` does not use (`V`).
+    #[prop_leak(id = 9072, allow_self = false, prelude = true)]
+    pub struct ForeignBound<T: Into<V>, V>(pub Wrap<T>, pub V);
+
+    /// The same in a trait: the bound of a method generic names the trait's `T`.
+    #[prop_leak(id = 9073, allow_self = false, prelude = true)]
+    pub trait ForeignBoundTrait<T> {
+        fn convert<U: Into<T>>(&self, x: Wrap<U>) -> Wrap<U>;
+    }
+
+    /// `T: 'a`, a bound that names a lifetime the entry does not use.
+    #[prop_leak(id = 9074, allow_self = false, prelude = true)]
+    pub struct OutlivesBound<'a, T: 'a>(pub Wrap<T>, pub &'a u8);
+
+    /// A where clause on the parameter that the entry `Cloned<T>` needs.
+    #[prop_leak(id = 9075, allow_self = false, prelude = true)]
+    pub struct WhereBound<T>(pub Cloned<T>)
+    where
+        T: Clone;
+
+    /// A cyclic bound: the Leaker rejects it.
+    #[prop_leak(id = 9076, allow_self = false, prelude = true)]
+    pub struct CyclicBound<T: From<Wrap<T>>>(pub T);
+
+    /// A `for<'b>` binder whose lifetime only the entry `Lt<'b, u8>` names: the impl declares it.
+    #[prop_leak(id = 9077, allow_self = false, prelude = true)]
+    pub struct Binder<F>(pub F)
+    where
+        F: for<'b> Fn(Lt<'b, u8>);
 }

@@ -23,12 +23,75 @@ pub struct LeakerConfig {
     /// tells what happens to an absolute path that is not allowed. Allow only crates that are the
     /// same on both sides.
     pub allowed_paths: Vec<Path>,
+    /// Set by [`LeakerConfig::check_values()`].
+    pub(crate) check_values: bool,
 }
 
 impl LeakerConfig {
-    /// Creates a configuration that allows no path.
+    /// Creates a configuration that allows no path and does not check values.
     pub fn new() -> Self {
         Default::default()
+    }
+
+    /// Makes the [`Leaker`](crate::Leaker) read the values of an item too, and reject a relative
+    /// path in them.
+    ///
+    /// The copy writes a value as it is: it cannot go through the Repeater, which carries types.
+    /// So a path in a value that depends on where it is written breaks the copy, and the Leaker
+    /// does not tell unless this option is on. It then reads:
+    ///
+    /// - the default value of an associated const of a trait, and the value of an associated const
+    ///   of an impl;
+    /// - the value of a const or static item (of a module, or nested);
+    /// - the body of a function: a default method of a trait, a method of an impl, a function item.
+    ///
+    /// An enum discriminant and an array length are read with or without the option: a relative
+    /// path in a discriminant is an error, and a type in it or in a length is leaked, as ever.
+    ///
+    /// A path in a value is rejected unless it means the same wherever it is written: it is
+    /// absolute or starts with `$crate`, it is allowed ([`allowed_paths`](LeakerConfig::allowed_paths),
+    /// also the names of [`allow_primitive()`](LeakerConfig::allow_primitive) and
+    /// [`allow_std_prelude()`](LeakerConfig::allow_std_prelude): `Some` and `None` are not among
+    /// them, write `::core::option::Option::Some`), it starts with a generic or `Self` in scope,
+    /// or with a name that the value itself declares (a `let` binding, a closure or function
+    /// parameter, a `match`, `if let` or `for` pattern, an item or a `use` in a block). The name
+    /// of the item that holds the value is relative like any other. (A name in a pattern is a
+    /// binding unless it starts with a capital letter, as the lint `non_snake_case` expects: then
+    /// it is a path to a constant, a unit struct or a variant.) A type in a value
+    /// (`size_of::<Rel>()`, `let x: Rel`) is rejected too: it is not leaked, since the copy writes
+    /// a value as it is. Attributes (`#[allow(..)]`, `#[derive(..)]`) are not read, in a value or
+    /// anywhere else in the item.
+    ///
+    /// The path of a macro call is checked like any other (`::std::println!`, not `println!`), and
+    /// its arguments are read as expressions, and the names a format string captures (`"{x}"`) as
+    /// paths. A macro whose arguments are not expressions (`cfg!`, `stringify!` and `matches!` are
+    /// the exceptions), a `macro_rules!`, a glob import and syntax that `syn` does not parse are
+    /// rejected, since the Leaker cannot see what they name.
+    ///
+    /// The error is the one of a relative path, and its note says which value it is in:
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemTrait = parse_quote! {
+    ///     trait Tr { const N: usize = ::core::mem::size_of::<inner::Local>(); }
+    /// };
+    /// // Without the option the value is not read: the copy breaks without an error.
+    /// assert!(Leaker::new().intern_trait(&item, true).is_ok());
+    ///
+    /// let mut config = LeakerConfig::new();
+    /// config.check_values();
+    /// let err = Leaker::from_config(config).intern_trait(&item, true).unwrap_err();
+    /// let error = err.items().next().unwrap();
+    /// assert_eq!(error.message, "use absolute path: 'inner :: Local'");
+    /// assert_eq!(
+    ///     error.note(),
+    ///     Some("it is in the default value of `N`, which the copy writes as it is")
+    /// );
+    /// ```
+    pub fn check_values(&mut self) -> &mut Self {
+        self.check_values = true;
+        self
     }
 
     /// Allows the primitive types (`u8`, `bool`, `str`, ...).
@@ -59,6 +122,22 @@ impl LeakerConfig {
     ///
     /// Without it, a relative `Clone` in `trait Tr: Clone` is an error, and `Vec<T>` is leaked
     /// whole. You promise that the copy does not shadow the names.
+    ///
+    /// `Sized` is one of them, as a bound (`where Self: Sized`): a trait named `Sized` in the copy
+    /// would be the one required. The relaxed bound `?Sized` needs no option, since rustc accepts
+    /// `?` only on the language's `Sized` (a local trait of that name makes it an error, or before
+    /// Rust 1.86 a warning that ignores it): it is left as written in a bound of a generic, a
+    /// where predicate, a supertrait, an associated type and `impl Trait`.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let relaxed: ItemTrait = parse_quote!(trait Tr<T: ?Sized> { fn f(&self, t: &T); });
+    /// assert!(Leaker::new().intern_trait(&relaxed, true).is_ok());
+    /// let required: ItemTrait = parse_quote!(trait Tr { fn f(&self) where Self: Sized; });
+    /// let err = Leaker::new().intern_trait(&required, true).unwrap_err();
+    /// assert_eq!(err.to_string(), "use absolute path: 'Sized'");
+    /// ```
     ///
     /// ```
     /// # use type_leak::*;

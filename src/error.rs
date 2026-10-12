@@ -50,6 +50,13 @@ pub enum NotInternableError {
     ///   lifetimes](crate::Leaker#binder-lifetimes)), and `Rel<T>` in `F: Fn(&Rel<T>) -> &u8` where
     ///   `Rel<T>` has lifetimes among its generics ([Elided
     ///   lifetimes](crate::Leaker#elided-lifetimes)).
+    /// - A relative path in a value, with [`LeakerConfig::check_values()`](crate::LeakerConfig::check_values): the default of an
+    ///   associated const, the value of a const or a static, the body of a function. It has the
+    ///   headline `use absolute path: '..'`, and the note says which value it is in ("it is in the
+    ///   default value of `N`, which the copy writes as it is"). A value is copied as written, so
+    ///   nothing can be leaked there. What the Leaker cannot read (a macro whose arguments are not
+    ///   expressions, a `macro_rules!`, a glob import) has the headline "cannot analyze .. in the
+    ///   body of ..".
     /// - A type with a generic whose bound names the `Self` of a trait (or `Self::X`), where
     ///   `Self` is something else, so the bound cannot be written
     ///   ([`View::visit_item()`](crate::View::visit_item)). The fault is that bound, not the path

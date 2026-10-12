@@ -149,4 +149,13 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9061!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9062!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9063!(path = ::type_leak_test_leaker::kinds);
+    // The scopes that share names: every entry has the generics of its own scope.
+    type_leak_test_leaker::__tl_prop_9071!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9072!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9073!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9074!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9075!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9077!(path = ::type_leak_test_leaker::kinds);
+    // The cyclic bound is rejected: it expands to nothing.
+    type_leak_test_leaker::__tl_prop_9076!(path = ::type_leak_test_leaker::kinds);
 }

@@ -96,7 +96,10 @@ pub struct CheckResult {
     /// - a type in the default of a parameter that names `Self`;
     /// - the bound rules, and `Self::A` where `Self` is a type;
     /// - a lifetime of a method that the copy would leave unconstrained (E0195): the fault is the
-    ///   lifetime.
+    ///   lifetime;
+    /// - syntax in a value that the Leaker cannot read, with
+    ///   [`LeakerConfig::check_values()`](crate::LeakerConfig::check_values) ("cannot analyze .. in
+    ///   the body of ..").
     pub headline: Option<String>,
 }
 

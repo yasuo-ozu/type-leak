@@ -4,6 +4,8 @@ use crate::analysis::{
     has_ambiguous, has_optional, names_self, primitive_effects, scope_error, CheckResult, Effect,
     PendingType,
 };
+#[cfg(doc)]
+use crate::config::LeakerConfig;
 use crate::context::{
     binder_lifetimes, Context, ContextId, Contexts, Enclosing, Gat, ModuleInfo, Scope,
     SelfRequirement, UnnameableSelf,
@@ -30,6 +32,8 @@ use std::rc::Rc;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
+
+mod values;
 
 struct Frame {
     must_start: usize,
@@ -661,6 +665,8 @@ pub(crate) struct AnalyzeVisitor {
     /// The cycles that `Self` makes (see [`AnalyzeVisitor::env_cycle()`]). Kept apart from the
     /// effects, like `self_errors`.
     env_errors: Vec<CheckResult>,
+    /// The values of an item are read too (see [`LeakerConfig::check_values()`]).
+    check_values: bool,
 }
 
 /// A method signature being visited (see `AnalyzeVisitor::signatures`).
@@ -743,7 +749,15 @@ impl AnalyzeVisitor {
             check_env: true,
             not_optional: Vec::new(),
             env_errors: Vec::new(),
+            check_values: false,
         }
+    }
+
+    /// Makes the visitor read the values of the items it visits, or not (see
+    /// [`LeakerConfig::check_values()`]).
+    pub(crate) fn reading_values(mut self, check_values: bool) -> Self {
+        self.check_values = check_values;
+        self
     }
 
     /// Exchanges the table of contexts with `other`, which cannot fail. The outermost scope of the
@@ -2509,6 +2523,16 @@ impl AnalyzeVisitor {
         });
     }
 
+    /// Visits the signature of a method as `visit_signature()` does, then runs `body` in the scope
+    /// of its generics.
+    fn method_signature(&mut self, sig: &Signature, body: impl FnOnce(&mut Self)) {
+        let compared = !self.inherent_impl;
+        self.with_signature(sig, false, compared, |visitor| {
+            syn::visit::visit_signature(visitor, sig);
+            body(visitor)
+        })
+    }
+
     /// Visits the output of a function pointer or of `Fn(..)`. It has its own elision: the
     /// signature around does not count its lifetimes.
     fn in_output(&mut self, output: &ReturnType) {
@@ -3116,20 +3140,22 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
     }
 
     fn visit_trait_item_fn(&mut self, i: &TraitItemFn) {
-        let mut i = i.clone();
-        i.default = None;
-        i.semi_token = Some(Default::default());
-        syn::visit::visit_trait_item_fn(self, &i)
+        for attr in &i.attrs {
+            self.visit_attribute(attr);
+        }
+        // The default body is read only with `LeakerConfig::check_values()`.
+        self.method_signature(&i.sig, |visitor| {
+            if let Some(block) = &i.default {
+                visitor.check_body(&i.sig, block, true);
+            }
+        })
     }
 
     /// The signature of a method: its generics are local, and it is checked for E0195 unless the
     /// method is that of an inherent impl. A function item declares its own generics instead
     /// (`visit_item_fn()`).
     fn visit_signature(&mut self, i: &Signature) {
-        let compared = !self.inherent_impl;
-        self.with_signature(i, false, compared, |visitor| {
-            syn::visit::visit_signature(visitor, i)
-        })
+        self.method_signature(i, |_| ())
     }
 
     fn visit_trait_item_type(&mut self, i: &TraitItemType) {
@@ -3161,16 +3187,21 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
     }
 
     fn visit_trait_item_const(&mut self, i: &TraitItemConst) {
-        let mut i = i.clone();
-        i.default = None;
+        let mut stripped = i.clone();
+        stripped.default = None;
         self.with_local_generics(&i.generics, |visitor| {
-            syn::visit::visit_trait_item_const(visitor, &i)
+            syn::visit::visit_trait_item_const(visitor, &stripped);
+            if let Some((_, expr)) = &i.default {
+                visitor.check_value(&i.ident, true, expr);
+            }
         });
     }
 
     fn visit_impl_item_fn(&mut self, i: &ImplItemFn) {
         self.visit_head(&i.attrs, &i.vis);
-        self.visit_signature(&i.sig);
+        self.method_signature(&i.sig, |visitor| {
+            visitor.check_body(&i.sig, &i.block, false)
+        })
     }
 
     fn visit_impl_item_type(&mut self, i: &ImplItemType) {
@@ -3184,6 +3215,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
             visitor.visit_head(&i.attrs, &i.vis);
             visitor.visit_generics(&i.generics);
             visitor.visit_type(&i.ty);
+            visitor.check_value(&i.ident, false, &i.expr);
         });
     }
 
@@ -3191,11 +3223,13 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
         self.visit_head(&i.attrs, &i.vis);
         self.visit_generics(&i.generics);
         self.visit_type(&i.ty);
+        self.check_value(&i.ident, false, &i.expr);
     }
 
     fn visit_item_static(&mut self, i: &ItemStatic) {
         self.visit_head(&i.attrs, &i.vis);
         self.visit_type(&i.ty);
+        self.check_value(&i.ident, false, &i.expr);
     }
 
     fn visit_item_struct(&mut self, i: &ItemStruct) {
@@ -3237,6 +3271,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
         self.with_signature(&i.sig, true, false, |visitor| {
             visitor.visit_head(&i.attrs, &i.vis);
             syn::visit::visit_signature(visitor, &i.sig);
+            visitor.check_body(&i.sig, &i.block, false);
         });
     }
 
@@ -3479,8 +3514,16 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
     }
 
     fn visit_trait_bound(&mut self, i: &TraitBound) {
-        // A trait bound with a relative path cannot be leaked.
-        if self.type_depth == 0 && self.check_bound_path(&i.path, quote!(#i)) {
+        // A bare `?Sized` is the language's `Sized`, whatever the context: rustc accepts a `?`
+        // bound only on `Sized` (since 1.86 it is an error for another trait, before it is a warning
+        // and the bound is ignored), so a local trait named `Sized` cannot change what it means.
+        // It is copied as written.
+        if is_relaxed_sized(i) {
+            return;
+        }
+        // A trait bound with a relative path cannot be leaked. The error is about the path, not
+        // the modifier (`Rel`, not `? Rel`).
+        if self.type_depth == 0 && self.check_bound_path(&i.path, quote!(#{without_modifier(i)})) {
             return;
         }
         let group = bound_group(i.lifetimes.as_ref(), i, None);
@@ -4377,6 +4420,24 @@ impl<'ast> Visit<'ast> for OutputLifetimes {
 
 fn declares(lifetimes: Option<&BoundLifetimes>, wanted: &Lifetime) -> bool {
     binder_lifetimes(lifetimes).any(|lifetime| lifetime == *wanted)
+}
+
+/// Returns `true` if `bound` is a bare `?Sized`: the language's relaxed bound.
+fn is_relaxed_sized(bound: &TraitBound) -> bool {
+    matches!(bound.modifier, TraitBoundModifier::Maybe(_))
+        && bound.lifetimes.is_none()
+        && bound.path.leading_colon.is_none()
+        && bound.path.segments.len() == 1
+        && matches!(bound.path.segments.first(), Some(seg)
+            if seg.ident == "Sized" && seg.arguments.is_none())
+}
+
+/// `bound` without the `?` of a relaxed bound, as an error names it.
+fn without_modifier(bound: &TraitBound) -> TraitBound {
+    TraitBound {
+        modifier: TraitBoundModifier::None,
+        ..bound.clone()
+    }
 }
 
 fn self_segment(path: &Path) -> Option<&PathSegment> {

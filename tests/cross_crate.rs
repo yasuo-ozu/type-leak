@@ -429,6 +429,49 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9063, __tl_report_9063!()),
             ok("trait", 5, 5, 5),
         ),
+        // scopes that share names (the findings of a downstream crate): methods that declare the
+        // same generic with different bounds, a generic named like a relative type, a path ending
+        // with the name of a generic, a type and a const parameter of one name; a bound that names
+        // a parameter or a lifetime the entry does not use; a where clause; a cyclic bound; a
+        // `for<'b>` binder
+        (
+            9071,
+            reported(9071, __tl_report_9071!()),
+            ok("trait", 7, 13, 13),
+        ),
+        (
+            9072,
+            reported(9072, __tl_report_9072!()),
+            ok("struct", 1, 2, 2),
+        ),
+        (
+            9073,
+            reported(9073, __tl_report_9073!()),
+            ok("trait", 1, 2, 2),
+        ),
+        (
+            9074,
+            reported(9074, __tl_report_9074!()),
+            ok("struct", 1, 2, 2),
+        ),
+        (
+            9075,
+            reported(9075, __tl_report_9075!()),
+            ok("struct", 1, 1, 1),
+        ),
+        (
+            9076,
+            reported(9076, __tl_report_9076!()),
+            rejected(
+                "struct",
+                "`Wrap<T>`isinaboundorwherepredicate,andaboundofitsgenericsnamesaleakedtype",
+            ),
+        ),
+        (
+            9077,
+            reported(9077, __tl_report_9077!()),
+            ok("struct", 1, 1, 1),
+        ),
     ];
     for (id, got, expected) in table {
         assert_eq!(got, expected, "item {}", id);
@@ -580,6 +623,58 @@ fn items_nested_in_a_module_name_their_own_self() {
         l::Wrap(PhantomData)
     }
     same(&me(&host), &l::Wrap::<r::Host9063>(PhantomData));
+}
+
+/// The scopes of an item that share names (the findings A, 1, 2, 3, 4 and 7 of a downstream crate,
+/// `tests/downstream_findings.rs`): the Repeater's impl of each entry has the generics of its own
+/// scope, so the Referrer's crate compiles, and the signatures of the copy have the original types
+/// (a function pointer of each method, with the original types, is the method of the copy).
+#[test]
+fn scopes_that_share_names_keep_their_own_generics() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_referrer::kinds as r;
+
+    // 9071: `with_bound<X: Clone>` and `without_bound<X>` share the name `X`; `generic_local<Local>`
+    // has a generic named like the type `Local` that `type_local` returns; `segment<U>` returns
+    // `inner::U`, which is no generic; `type_n<N>` and `const_n<const N: usize>` share `N`.
+    type H = r::Host9071;
+    fn implemented_for<T: l::SameNames>() {}
+    implemented_for::<H>();
+    let _: fn(&H, l::Cloned<u8>) -> l::Cloned<u8> = <H as l::SameNames>::with_bound::<u8>;
+    let _: fn(&H, l::Wrap<String>) -> l::Wrap<String> =
+        <H as l::SameNames>::without_bound::<String>;
+    let _: fn(&H, l::Local) -> l::Local = <H as l::SameNames>::generic_local::<l::Local>;
+    let _: fn(&H, u8) -> u8 = <H as l::SameNames>::generic_local::<u8>;
+    let _: fn(&H) -> l::Local = <H as l::SameNames>::type_local;
+    let _: fn(&H, l::Wrap<u8>) -> l::inner::U = <H as l::SameNames>::segment::<u8>;
+    let _: fn(&H, l::Wrap<u8>) -> l::Wrap<u8> = <H as l::SameNames>::type_n::<u8>;
+    let _: fn(&H, l::Arr<3>) -> l::Arr<3> = <H as l::SameNames>::const_n::<3>;
+
+    // 9072: the bound of `T` names `V`.
+    let copy = r::ForeignBound::<u8, u32>(l::Wrap(PhantomData), 3);
+    same(&copy.0, &l::Wrap::<u8>(PhantomData));
+    assert_eq!(copy.1, 3);
+    // 9073: the bound of a method generic names the parameter of the trait.
+    fn convert_of<T>() -> fn(&r::Host9073, l::Wrap<u8>) -> l::Wrap<u8>
+    where
+        u8: Into<T>,
+    {
+        <r::Host9073 as l::ForeignBoundTrait<T>>::convert::<u8>
+    }
+    let _ = convert_of::<u32>();
+    // 9074: `T: 'a`.
+    let n = 5u8;
+    let copy = r::OutlivesBound::<u8>(l::Wrap(PhantomData), &n);
+    same(&copy.0, &l::Wrap::<u8>(PhantomData));
+    assert_eq!(*copy.1, 5);
+    // 9075: the where clause of the item.
+    let copy = r::WhereBound::<u8>(l::Cloned(1));
+    same(&copy.0, &l::Cloned(1u8));
+    // 9077: a binder lifetime that only the entry names.
+    let seen = std::cell::Cell::new(0u8);
+    let copy = r::Binder(|lt: l::Lt<'_, u8>| seen.set(*lt.0));
+    (copy.0)(l::Lt(&n));
+    assert_eq!(seen.get(), 5);
 }
 
 /// A trait is implemented for an unsized type (`dyn Host`) in the Referrer's crate, with the

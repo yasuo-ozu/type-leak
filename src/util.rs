@@ -65,6 +65,73 @@ pub(crate) fn is_primitive_name(ident: &Ident) -> bool {
         .any(|(name, absolute)| ident == name && absolute.starts_with("::core::primitive::"))
 }
 
+/// Collects the names by which `ty` can refer to a generic of the scopes it is written in: the
+/// first segment of each relative path, the lifetimes, and the names in the tokens that are not
+/// parsed (a macro, syntax that `syn` leaves verbatim).
+///
+/// A later segment (`U` in `inner::U`), the name of an associated type binding (`Item` in
+/// `Iterator<Item = u8>`) and the name of a function pointer argument name an item, not a
+/// generic. The Leaker finds the generics a type mentions the same way (`AnalyzeVisitor`
+/// records a mention at `starts_with_generic()`), so the context of the type it chooses is the
+/// one that the Referrer computes by this function: a segment named like a generic must not add
+/// the generic to the context (`inner::U` in `fn f<U>(&self) -> inner::U`).
+pub(crate) fn type_names(ty: &Type, names: &mut HashSet<String>) {
+    struct Names<'a>(&'a mut HashSet<String>);
+    impl Names<'_> {
+        fn tokens(&mut self, tokens: &TokenStream) {
+            token_names(tokens.clone(), self.0);
+        }
+    }
+    impl<'ast> Visit<'ast> for Names<'_> {
+        fn visit_path(&mut self, i: &'ast Path) {
+            if i.leading_colon.is_none() {
+                if let Some(seg) = i.segments.first() {
+                    self.0.insert(ident_name(&seg.ident));
+                }
+            }
+            syn::visit::visit_path(self, i)
+        }
+        fn visit_lifetime(&mut self, i: &'ast Lifetime) {
+            self.0.insert(i.to_string());
+        }
+        fn visit_macro(&mut self, i: &'ast Macro) {
+            self.tokens(&i.tokens);
+            syn::visit::visit_macro(self, i)
+        }
+        fn visit_type(&mut self, i: &'ast Type) {
+            match i {
+                Type::Verbatim(tokens) => self.tokens(tokens),
+                _ => syn::visit::visit_type(self, i),
+            }
+        }
+        fn visit_expr(&mut self, i: &'ast Expr) {
+            match i {
+                Expr::Verbatim(tokens) => self.tokens(tokens),
+                _ => syn::visit::visit_expr(self, i),
+            }
+        }
+        fn visit_pat(&mut self, i: &'ast Pat) {
+            match i {
+                Pat::Verbatim(tokens) => self.tokens(tokens),
+                _ => syn::visit::visit_pat(self, i),
+            }
+        }
+        fn visit_type_param_bound(&mut self, i: &'ast TypeParamBound) {
+            match i {
+                TypeParamBound::Verbatim(tokens) => self.tokens(tokens),
+                _ => syn::visit::visit_type_param_bound(self, i),
+            }
+        }
+        fn visit_item(&mut self, i: &'ast Item) {
+            match i {
+                Item::Verbatim(tokens) => self.tokens(tokens),
+                _ => syn::visit::visit_item(self, i),
+            }
+        }
+    }
+    Names(names).visit_type(ty)
+}
+
 /// Returns `true` if `ty` refers to `idents` (as the first segment of a relative path) or
 /// `lifetimes`.
 pub(crate) fn mentions_names(ty: &Type, idents: Vec<Ident>, lifetimes: Vec<Lifetime>) -> bool {

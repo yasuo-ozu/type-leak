@@ -2,7 +2,7 @@
 
 use crate::util::{
     canonical_bounds, generic_param_mentions_self, generic_param_name, ident_name, self_in_param,
-    self_in_predicate, tidy, token_names, type_mentions_self, unwrap_type_group,
+    self_in_predicate, tidy, token_names, type_mentions_self, type_names, unwrap_type_group,
     where_predicate_mentions_self, ReplaceSelf, SelfMentions,
 };
 use proc_macro2::{Literal, TokenStream};
@@ -684,8 +684,11 @@ impl Context {
     }
 
     /// Returns the context of `ty` in `scopes` (outermost first). Names match by name only, which
-    /// is harmless: the Referrer computes the same. `enclosing` lifetimes become generics even if
-    /// `ty` does not name them.
+    /// is harmless: the Referrer computes the same. But a type has to name a generic by a name
+    /// that can mean it (the first segment of a path, a lifetime: see [`type_names()`]), not by the
+    /// name of an item that happens to be the same (`U` in `inner::U`): the Leaker finds no
+    /// mention of a generic there and does not ask for a context at all, so the Referrer must not
+    /// find one either. `enclosing` lifetimes become generics even if `ty` does not name them.
     ///
     /// `self_req` is what `Self` means where `ty` is written. The bounds and where predicates of a
     /// generic are written for the `Self` of the scope that declares it. If that is not `self_req`
@@ -702,7 +705,7 @@ impl Context {
         enclosing: &Enclosing,
     ) -> std::result::Result<Self, UnnameableSelf> {
         let mut names = HashSet::new();
-        token_names(quote!(#ty), &mut names);
+        type_names(ty, &mut names);
         let mut mentions_self = type_mentions_self(ty);
         let mut self_names = HashSet::new();
         if let Some(self_req) = self_req {
