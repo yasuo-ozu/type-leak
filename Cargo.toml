@@ -25,6 +25,7 @@ exclude = [
   "tests/spans.rs",
   "tests/trusting.rs",
   "logo.png",
+  "CLAUDE.md",
   "tests/two_macros.rs",
 ]
 
