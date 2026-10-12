@@ -68,7 +68,9 @@ pub struct CheckResult {
     /// `true` if the first of `must` is the type's own path (`MyType` in `MyType<'_>`), so the type
     /// must be leaked whole. `false` if `must` is empty or only its parts are causes
     /// (`::path::Wrap<MyType, '_>`). A bare identifier argument counts as a cause of the type
-    /// holding it. See [Bare identifiers and consts](crate::Leaker#bare-identifiers-and-consts).
+    /// holding it, and a conflict if that type cannot be leaked (`::path::Wrap<MyType, Self>` where
+    /// `Self` is denied). See [Bare identifiers and
+    /// consts](crate::Leaker#bare-identifiers-and-consts).
     pub is_own: bool,
     /// `true` if the type is an optional entry: it has no cause of its own, and its own path names
     /// an external crate (`::path::X`, `::path::Wrap<(MyType,)>`), which the Referrer may not
@@ -112,7 +114,8 @@ pub(crate) struct PendingType {
     pub(crate) optional: bool,
     pub(crate) has_optional: bool,
     pub(crate) context: Context,
-    /// A bare identifier argument that may be a const. Its parent is leaked whole if possible.
+    /// A bare identifier argument that may be a const. Its parent is leaked whole if possible; if
+    /// it cannot be because of a hard cause (see `Impossibles`), it is a conflict.
     pub(crate) ambiguous: bool,
     /// It cannot be an entry, but its components can: the copy would be cyclic. Like
     /// `no_optional_entry` for the optional entries.
@@ -278,6 +281,34 @@ pub(crate) fn has_ambiguous(effects: &[Effect]) -> bool {
         }
         _ => false,
     })
+}
+
+/// Returns the bare identifiers among `effects` that may be consts: those of `has_ambiguous()`.
+pub(crate) fn ambiguous_types(effects: &[Effect]) -> Vec<Type> {
+    let mut found = Vec::new();
+    for effect in effects {
+        if let Effect::Type(pending) = effect {
+            if pending.ambiguous {
+                found.push(pending.ty.clone());
+            } else if matches!(pending.ty, Type::Group(_)) {
+                found.extend(ambiguous_types(&pending.components));
+            }
+        }
+    }
+    found
+}
+
+/// Returns the errors among `effects` and in the parts of the types in it.
+pub(crate) fn error_effects(effects: Vec<Effect>) -> Vec<Effect> {
+    let mut found = Vec::new();
+    for effect in effects {
+        match effect {
+            Effect::Error(_) => found.push(effect),
+            Effect::Type(pending) => found.extend(error_effects(pending.components)),
+            Effect::Primitive(_) => (),
+        }
+    }
+    found
 }
 
 pub(crate) fn primitive_effects(effects: Vec<Effect>) -> Vec<Effect> {

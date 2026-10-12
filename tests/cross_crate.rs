@@ -413,6 +413,32 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9053, __tl_report_9053!()),
             ok("trait", 4, 6, 6),
         ),
+        // a bare identifier that is a const (`LEN`): the path that holds it is an entry as a whole,
+        // also with `Self` in it; with `Self` denied the Leaker rejects it, as the const would not
+        // be a type; a bare identifier that is a type is leaked alone where the path cannot be
+        (
+            9081,
+            reported(9081, __tl_report_9081!()),
+            ok("struct", 2, 2, 2),
+        ),
+        (
+            9082,
+            reported(9082, __tl_report_9082!()),
+            rejected(
+                "struct",
+                "`LEN`maybeaconst,andthetypethatholdsitcannotbeleakedasawhole",
+            ),
+        ),
+        (
+            9083,
+            reported(9083, __tl_report_9083!()),
+            ok("trait", 3, 3, 3),
+        ),
+        (
+            9084,
+            reported(9084, __tl_report_9084!()),
+            ok("trait", 1, 5, 1),
+        ),
         // items nested in a module, which name their own `Self`
         (
             9061,

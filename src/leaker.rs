@@ -157,14 +157,31 @@ use template_quote::quote;
 ///
 /// ## Bare identifiers and consts
 ///
-/// A bare identifier argument (`MyType<MY_CONST>`) may be a type or a const. The Leaker leaks the
-/// type that holds it as a whole; where it cannot (an elided lifetime, a trait bound, a module of
-/// [`intern_mod()`](Leaker::intern_mod)), it treats the identifier as a type, and the copy fails if
-/// it is a const:
+/// A bare identifier argument (`MyType<MY_CONST>`) may be a type or a const, and the Leaker cannot
+/// tell which. It leaks the type that holds it as a whole, which is right for both. If it cannot,
+/// leaking the identifier alone is right only for a type: a const read as a type fails in the copy
+/// (rustc: E0573 in the Repeater's impl, E0747 in the copy). The Leaker does so only where there
+/// is no other way, and the copy fails if it is a const:
+///
+/// - an elided lifetime or reference in the holder (`MyType<'_, MY_CONST>`, `&dyn Tr<MY_CONST>`),
+/// - `impl Trait` in the holder,
+/// - a name that a module of [`intern_mod()`](Leaker::intern_mod) declares in the holder,
+/// - a trait bound, a supertrait or the trait of an impl (`T: Tr<MY_CONST>`), which has no type
+///   to leak.
+///
+/// Any other cause is an error, with the identifier as its cause: `Self` where it is denied
+/// ([`allow_self`](Leaker::intern_struct)) or `Self::A` of a type, the default of a parameter that
+/// names `Self`, a bound of a generic that names `Self`, a method lifetime that the copy would leave
+/// unconstrained ([Method lifetimes](#method-lifetimes)), and an expression that cannot be leaked.
+/// Write the identifier so that it is not leaked: an absolute path, which a const needs in braces,
+/// or a name in [`allowed_paths`](Leaker::allowed_paths).
 ///
 /// ```ignore
+/// fn f(x: ::path::MyType<MY_CONST>);                  // good: the path is leaked
 /// fn f(x: ::path::MyType<'_, MY_CONST>);              // error: treated as a type
 /// fn f(x: ::path::MyType<{ ::my_crate::MY_CONST }>);  // good: not leaked
+/// struct S(::path::MyType<[Self], MY_CONST>);         // error if `Self` is denied
+/// struct S(::path::MyType<[Self], { ::my_crate::MY_CONST }>);  // good
 /// ```
 #[derive(Default)]
 pub struct Leaker {

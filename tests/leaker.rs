@@ -620,10 +620,24 @@ fn test_receivers() {
         ),
         Err("use absolute path: 'Rel < Self >'".to_string())
     );
+    // `Rel` may be a const, and the path cannot be leaked as a whole because of `Self`: it is not
+    // leaked as a type (see `tests/bare_const.rs`).
     assert_eq!(
         leak(
             quote!(
                 fn f(self: ::k::W<Rel, Self>);
+            ),
+            false
+        ),
+        Err(
+            "`Rel` may be a const, and the type that holds it cannot be leaked as a whole"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        leak(
+            quote!(
+                fn f(self: ::k::W<(Rel,), Self>);
             ),
             false
         ),
@@ -757,11 +771,19 @@ fn test_self_ty_cannot_be_interned() {
     }
 
     // `Rel` as an argument may be a const, so the path is interned as a whole if it can be (with
-    // `Self` allowed), and otherwise `Rel` is leaked as a type.
+    // `Self` allowed), and otherwise it is an error: `Rel` is not leaked as a type (see
+    // `tests/bare_const.rs`).
     let sig = quote!(
         fn f(&self) -> ::k::W<Rel, Self>;
     );
-    assert_eq!(leak(sig.clone(), false).unwrap(), set(&["Rel"]));
+    let err = leak(sig.clone(), false).unwrap_err().to_string();
+    assert!(
+        err.starts_with(
+            "`Rel` may be a const, and the type that holds it cannot be leaked as a whole"
+        ),
+        "{}",
+        err
+    );
     assert_eq!(leak(sig, true).unwrap(), set(&[":: k :: W < Rel , Self >"]));
 
     // The type of an external crate with `Self` in it is an optional entry (which the Referrer

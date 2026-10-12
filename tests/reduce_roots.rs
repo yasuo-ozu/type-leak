@@ -1705,7 +1705,9 @@ fn test_reduce_roots_bare_identifier_argument() {
 #[test]
 fn test_reduce_roots_bare_identifier_is_a_type_if_the_path_cannot_be_interned() {
     // The path cannot be interned, so the identifier is leaked alone, as a type, like any other
-    // (and not as an error).
+    // (and not as an error). Only for these causes: an elided lifetime or reference, `impl Trait`,
+    // and a trait bound (which has no type to leak). For any other (`Self`, a method lifetime that
+    // the copy would leave unconstrained, ..) it is an error: see `tests/bare_const.rs`.
     for item in [
         // An elided lifetime.
         parse_quote! { trait Tr { fn c(&self) -> ::p::W<'_, SIZE>; } },
@@ -1714,8 +1716,6 @@ fn test_reduce_roots_bare_identifier_is_a_type_if_the_path_cannot_be_interned() 
         parse_quote! { trait Tr { fn c(&self, x: ::p::W<SIZE, impl ::p::Tr>); } },
         // Another impossible cause in the path.
         parse_quote! { trait Tr { fn c(&self, x: ::p::W<SIZE, &()>); } },
-        // The default of a parameter cannot depend on `Self`.
-        parse_quote! { trait Tr<X = ::p::W<Self, SIZE>> {} },
         // A trait bound is not a type.
         parse_quote! { trait Tr: ::p::Sup<SIZE> {} },
         parse_quote! { trait Tr { fn f<T: ::p::Sup<SIZE>>(&self); } },
@@ -1751,7 +1751,8 @@ fn test_reduce_roots_bare_identifier_is_a_type_if_the_path_cannot_be_interned() 
     assert_eq!(result.must.len(), 1);
     assert_eq!(result.must[0].to_string(), "SIZE");
 
-    // The same if the bounds of the generics mention `Self`, which cannot be leaked.
+    // Not if the bounds of the generics mention `Self`, which cannot be leaked: `SIZE` may be a
+    // const, so it is an error (and the path is interned if it can be).
     let item: ItemTrait = parse_quote! {
         trait Tr<T: ::p::Bound<Self>> { fn c(&self, x: ::p::W<T, SIZE>); }
     };
@@ -1765,16 +1766,26 @@ fn test_reduce_roots_bare_identifier_is_a_type_if_the_path_cannot_be_interned() 
             ),
             allow_self,
         )
-        .unwrap();
-        leaker
-            .finish()
-            .iter()
-            .map(|ty| ty_string(ty.clone()))
-            .collect::<Vec<_>>()
+        .map(|_| {
+            leaker
+                .finish()
+                .iter()
+                .map(|ty| ty_string(ty.clone()))
+                .collect::<Vec<_>>()
+        })
+        .map_err(|err| err.to_string())
     };
-    assert_eq!(leaked(false), [ty_string(parse_quote!(SIZE))]);
-    // And the path is interned if it can be.
-    assert_eq!(leaked(true), [ty_string(parse_quote!(::p::W<T, SIZE>))]);
+    assert_eq!(
+        leaked(false),
+        Err(
+            "`SIZE` may be a const, and the type that holds it cannot be leaked as a whole"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        leaked(true),
+        Ok(vec![ty_string(parse_quote!(::p::W<T, SIZE>))])
+    );
 }
 
 #[test]

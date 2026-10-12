@@ -154,6 +154,109 @@ const ROWS: &[Row] = &[
              `LeakerConfig::allowed_paths`, or analyze the item with `allow_self = true`",
         )],
     },
+    // ── a bare identifier that may be a const ────────────────────────────────────────────────
+    Row {
+        kind: "a bare identifier that may be a const, in a path that names `Self`, which is denied",
+        error: || {
+            let item: ItemStruct = parse_quote!(
+                struct S {
+                    a: ::p::W<[Self], LEN>,
+                }
+            );
+            allowing().intern_struct(&item, false).unwrap_err()
+        },
+        items: &[(
+            "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
+            "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
+             const), allow it with `LeakerConfig::allowed_paths`, or analyze the item with \
+             `allow_self = true`",
+        )],
+    },
+    Row {
+        kind: "a bare identifier that may be a const, in a path that names `Self::A`",
+        error: || {
+            let item: ItemStruct = parse_quote!(
+                struct S {
+                    a: ::p::W<Self::A, LEN>,
+                }
+            );
+            allowing().intern_struct(&item, true).unwrap_err()
+        },
+        items: &[(
+            "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
+            "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
+             const), or replace `Self::A` with `<Self as SomeTrait>::A`, naming the trait that \
+             defines `A` with its absolute path",
+        )],
+    },
+    Row {
+        kind: "a bare identifier that may be a const, in the default of a parameter that names \
+               `Self`",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr<T = ::p::W<Self, LEN>> {}
+            );
+            allowing().intern_trait(&item, true).unwrap_err()
+        },
+        items: &[(
+            "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
+            "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
+             const), or write the default without `Self`: name the type instead of `Self` in \
+             `::p::W<Self, LEN>`",
+        )],
+    },
+    Row {
+        kind: "a bare identifier that may be a const, in a path whose bound names `Self`",
+        error: || {
+            let item: ItemStruct = parse_quote!(
+                struct S<T: ::core::convert::AsRef<Self>> {
+                    a: ::p::W<T, LEN>,
+                }
+            );
+            allowing().intern_struct(&item, false).unwrap_err()
+        },
+        items: &[(
+            "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
+            "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
+             const), write the bound of the generics of `::p::W<T, LEN>` without `Self`, or \
+             analyze the item with `allow_self = true`",
+        )],
+    },
+    Row {
+        kind: "a bare identifier that may be a const, in a type that leaves a method lifetime \
+               unconstrained",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr {
+                    fn f<'b>(&self, y: &'b dyn ::core::convert::AsRef<LEN>) -> &'b u8;
+                }
+            );
+            allowing().intern_trait(&item, true).unwrap_err()
+        },
+        items: &[(
+            "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
+            "keep `'b` in another argument of the method (for example `&'b self`), write `LEN` \
+             with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a const), or \
+             write the bound of the trait object (`dyn Trait + 'b`)",
+        )],
+    },
+    Row {
+        kind: "a bare identifier that may be a const, in a path with an expression that cannot be \
+               leaked",
+        error: || {
+            let item: ItemStruct = parse_quote!(
+                struct S {
+                    a: ::p::W<{ ::p::m!() }, LEN>,
+                }
+            );
+            allowing().intern_struct(&item, true).unwrap_err()
+        },
+        items: &[(
+            "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
+            "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
+             const), or allow it with `LeakerConfig::allowed_paths`",
+        )],
+    },
     // ── `Self` ───────────────────────────────────────────────────────────────────────────────
     Row {
         kind: "`Self` where no scope declares it",

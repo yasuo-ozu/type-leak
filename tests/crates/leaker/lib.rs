@@ -874,6 +874,14 @@ pub mod kinds {
 
     pub struct Lt<'a, T>(pub &'a T);
 
+    /// A const, and a path that takes one as an argument: `CW<A, LEN>` holds a bare identifier
+    /// that is a const (which `syn` parses as a type), so the path is leaked as a whole.
+    pub const LEN: usize = 3;
+
+    pub struct CW<A: ?Sized, const N: usize>(pub PhantomData<A>);
+
+    pub trait Sink<A: ?Sized> {}
+
     pub trait Mark<A> {
         type Out;
         fn mark(&self, a: A) -> Self::Out;
@@ -1052,6 +1060,42 @@ pub mod kinds {
         fn borrowed<'a>(&'a self, x: &'a Self) -> Wrap<&'a Self>;
         fn rel(&self) -> Rel;
         fn pair(&self, x: Pair<Rel, Wrap<Self>>) -> Rel;
+    }
+
+    // A bare identifier that is a const (`LEN`).
+
+    /// `Self` is allowed: the path that holds the const is an entry as a whole (`CW<[Self], LEN>`),
+    /// so the const is never read as a type, whatever the path holds beside it.
+    #[prop_leak(id = 9081, allow_self = true)]
+    pub struct ConstSelf {
+        pub me: ::type_leak_test_leaker::kinds::CW<[Self], LEN>,
+        pub rel: ::type_leak_test_leaker::kinds::CW<Rel, LEN>,
+    }
+
+    /// `Self` is denied, and the path that holds the const names it: it cannot be leaked as a
+    /// whole, and the const must not be leaked alone as a type (it would not compile): the Leaker
+    /// rejects it.
+    #[prop_leak(id = 9082, allow_self = false)]
+    pub struct ConstSelfDenied {
+        pub me: ::type_leak_test_leaker::kinds::CW<[Self], LEN>,
+    }
+
+    /// A trait: `Self` is the implementor, and `CW<Self, LEN>` is an entry for its implementors.
+    #[prop_leak(id = 9083, allow_self = true)]
+    pub trait ConstTrait {
+        fn me(&self) -> ::type_leak_test_leaker::kinds::CW<Self, LEN>;
+        fn rel(&self, x: ::type_leak_test_leaker::kinds::CW<Rel, LEN>) -> Rel;
+    }
+
+    /// A bare identifier that is a type, where the path that holds it cannot be leaked (an elided
+    /// lifetime, `impl Trait`, a trait object under an elided reference, a trait bound): it is
+    /// leaked alone as a type, which works for a type.
+    #[prop_leak(id = 9084, allow_self = false)]
+    pub trait SoftIdent {
+        fn by_dyn(&self, x: &dyn ::type_leak_test_leaker::kinds::Sink<Rel>);
+        fn by_impl(&self, x: impl ::type_leak_test_leaker::kinds::Sink<Rel>);
+        fn by_elided(&self, x: &u8) -> ::type_leak_test_leaker::kinds::Lt<'_, Rel>;
+        fn by_bound<T: ::type_leak_test_leaker::kinds::Sink<Rel>>(&self, x: T);
     }
 
     // Items nested in a module (`scope = "mod"`: `enter_mod(..)` and `View::visit_item()`, as the

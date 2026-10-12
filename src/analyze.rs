@@ -1,8 +1,8 @@
 //! The analysis of items and types by the [`Leaker`].
 
 use crate::analysis::{
-    has_ambiguous, has_optional, names_self, primitive_effects, scope_error, CheckResult, Effect,
-    PendingType,
+    ambiguous_types, error_effects, has_ambiguous, has_optional, names_self, primitive_effects,
+    scope_error, CheckResult, Effect, PendingType,
 };
 #[cfg(doc)]
 use crate::config::LeakerConfig;
@@ -77,6 +77,59 @@ impl Frame {
             assoc_self: None,
             effects: Vec::new(),
         }
+    }
+}
+
+/// The causes that stop a type from being leaked whole, in order of appearance.
+///
+/// Each is soft or hard. A soft cause is one under which a bare identifier argument that may be a
+/// const is leaked as a type, and the copy fails if it is a const (the docs say so): an elided
+/// lifetime or reference (and a trait object that takes its lifetime from it) and `impl Trait`.
+/// Any other cause is hard (`push()`, so a new cause is hard unless it is made soft): `Self` where
+/// it is denied, `Self::A`, a method lifetime that the copy would leave unconstrained, an
+/// expression that cannot be leaked. A type that holds a bare identifier and cannot be leaked
+/// because of a hard cause is an error (see [`AnalyzeVisitor::bare_conflict()`]).
+#[derive(Default)]
+struct Impossibles {
+    causes: Vec<TokenStream>,
+    hard: Vec<bool>,
+}
+
+impl Impossibles {
+    fn len(&self) -> usize {
+        self.causes.len()
+    }
+
+    /// Pushes a hard cause (the default: a bare identifier is an error under it).
+    fn push(&mut self, cause: TokenStream) {
+        self.causes.push(cause);
+        self.hard.push(true);
+    }
+
+    /// Pushes a soft cause.
+    fn push_soft(&mut self, cause: TokenStream) {
+        self.causes.push(cause);
+        self.hard.push(false);
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.causes.truncate(len);
+        self.hard.truncate(len);
+    }
+
+    fn remove(&mut self, at: usize) {
+        self.causes.remove(at);
+        self.hard.remove(at);
+    }
+
+    /// The causes from `start` on.
+    fn since(&self, start: usize) -> &[TokenStream] {
+        &self.causes[start..]
+    }
+
+    /// Returns `true` if one of the causes from `start` on is hard.
+    fn any_hard_since(&self, start: usize) -> bool {
+        self.hard[start..].iter().any(|&hard| hard)
     }
 }
 
@@ -623,7 +676,7 @@ pub(crate) struct AnalyzeVisitor {
     /// whether an entry that is leaked alone has it (so it is no conflict of the type around: see
     /// [`AnalyzeVisitor::conflict_causes()`]).
     musts: Vec<(usize, TokenStream, bool)>,
-    impossibles: Vec<TokenStream>,
+    impossibles: Impossibles,
     frame: Frame,
     type_depth: usize,
     item_depth: usize,
@@ -731,7 +784,7 @@ impl AnalyzeVisitor {
             in_default: None,
             modules: Vec::new(),
             musts: Vec::new(),
-            impossibles: Vec::new(),
+            impossibles: Impossibles::default(),
             frame: Frame::new(0, 0),
             type_depth: 0,
             item_depth: 0,
@@ -798,7 +851,7 @@ impl AnalyzeVisitor {
         CheckResult {
             is_own: must.first().map_or(false, |(d, _, _)| *d == depth),
             must: must.into_iter().map(|(_, m, _)| m.clone()).collect(),
-            impossible: self.impossibles[impossible_start..].to_vec(),
+            impossible: self.impossibles.since(impossible_start).to_vec(),
             optional: false,
             note: None,
             help: None,
@@ -874,7 +927,7 @@ impl AnalyzeVisitor {
         if let Some(positions) = self.bound_elided.last_mut() {
             positions.push(self.impossibles.len());
         }
-        self.impossibles.push(tokens);
+        self.impossibles.push_soft(tokens);
     }
 
     /// Runs `f`, which visits a function pointer or `Fn(..)`: the elided lifetimes in it are its
@@ -1466,13 +1519,89 @@ impl AnalyzeVisitor {
         }
     }
 
-    /// Returns `true` if a bare identifier argument in `ty` may be a const, so `ty` is leaked
+    /// Returns `true` if a bare identifier argument in `ty` may be a const, so `ty` is to be leaked
     /// whole. Not so for a type referring to an item of the module, a group or parentheses.
-    fn is_ambiguous_owner(&self, ty: &Type, depth: usize, inner: &Frame) -> bool {
+    fn holds_bare_ident(&self, ty: &Type, inner: &Frame) -> bool {
         !inner.module_item
             && !matches!(ty, Type::Group(_) | Type::Paren(_))
             && has_ambiguous(&inner.effects)
-            && self.own_context(ty, depth, inner).is_ok()
+    }
+
+    /// Returns `true` if a bare identifier argument in `ty` may be a const, and `ty` can be leaked
+    /// whole.
+    fn is_ambiguous_owner(&self, ty: &Type, depth: usize, inner: &Frame) -> bool {
+        self.holds_bare_ident(ty, inner) && self.own_context(ty, depth, inner).is_ok()
+    }
+
+    /// Returns `true` if `ty`, which cannot be leaked whole, cannot be so for a cause other than
+    /// those under which a bare identifier argument is leaked as a type (see [`Impossibles`]): a
+    /// hard cause, or one that is none of the impossible ones (`Self` in the bounds of a generic
+    /// that `ty` uses, `Self` in a default).
+    fn has_hard_cause(&self, inner: &Frame) -> bool {
+        self.impossibles.len() <= inner.impossible_start
+            || self.impossibles.any_hard_since(inner.impossible_start)
+    }
+
+    /// Returns the conflict of a type that holds the bare identifiers `idents`, which may be
+    /// consts, and cannot be leaked whole (`conflict`). The identifiers would be leaked as types
+    /// instead, and the copy fails if one is a const, so it is an error: the type holding it must
+    /// be leaked whole, and the advice says what a const needs (an absolute path in braces). See
+    /// [Bare identifiers and consts](crate::Leaker#bare-identifiers-and-consts).
+    fn bare_conflict(&self, mut conflict: CheckResult, ty: &Type, idents: &[Type]) -> CheckResult {
+        let names: Vec<TokenStream> = idents.iter().map(|ident| quote!(#ident)).collect();
+        let name = names.first().map(tidy).unwrap_or_default();
+        // The type itself is no cause (a default that names `Self` says so in its note), and a
+        // cause that is found twice (`Self::A`, denied and not resolvable) is told once.
+        let holder = quote!(#ty).to_string();
+        let mut seen = HashSet::new();
+        conflict
+            .impossible
+            .retain(|cause| cause.to_string() != holder && seen.insert(cause.to_string()));
+        let absolute = format!(
+            "write `{0}` with an absolute path (`::my_crate::{0}`, or `{{ ::my_crate::{0} }}` for a \
+             const)",
+            name
+        );
+        let denied_self = !self.allow_self
+            && conflict.impossible.iter().any(|cause| {
+                matches!(cause.clone().into_iter().next(),
+                    Some(proc_macro2::TokenTree::Ident(ident)) if ident == "Self")
+            });
+        conflict.help = Some(match conflict.help.take() {
+            // The advice of the cause may name the path already: a const needs braces.
+            Some(help) => {
+                let plain = format!("write `{}` with an absolute path", name);
+                if help.contains(&plain) {
+                    help.replacen(&plain, &absolute, 1)
+                } else if help.contains(", or ") {
+                    // It lists the options already: ours comes first.
+                    format!("{}, {}", absolute, help)
+                } else {
+                    let mut options = vec![absolute, help];
+                    if denied_self {
+                        options.push("analyze the item with `allow_self = true`".to_string());
+                    }
+                    or_list(options)
+                }
+            }
+            None => {
+                let mut options = vec![
+                    absolute,
+                    "allow it with `LeakerConfig::allowed_paths`".to_string(),
+                ];
+                if denied_self {
+                    options.push("analyze the item with `allow_self = true`".to_string());
+                }
+                or_list(options)
+            }
+        });
+        conflict.headline = Some(format!(
+            "`{}` may be a const, and the type that holds it cannot be leaked as a whole",
+            name
+        ));
+        conflict.must = names;
+        conflict.is_own = true;
+        conflict
     }
 
     #[allow(clippy::result_large_err)]
@@ -1498,9 +1627,24 @@ impl AnalyzeVisitor {
             self_elision_advice(&added, &elision, false, self.allow_self).give(&mut conflict);
             self_conflict = Some(conflict);
         }
-        if inner.min_depth != depth && self.is_ambiguous_owner(ty, depth, &inner) {
-            self.own_causes(inner.must_start, depth);
-            inner.min_depth = depth;
+        // A bare identifier argument may be a const, so the type holding it is leaked whole if it
+        // can be. If it cannot because of an elided lifetime or `impl Trait`, the identifier is
+        // leaked as a type (the copy fails if it is a const). Else there is no sound way: it is a
+        // conflict, the identifier being the cause.
+        let mut bare = None;
+        if inner.min_depth != depth && self.holds_bare_ident(ty, &inner) {
+            match self.own_context(ty, depth, &inner) {
+                Ok(_) => {
+                    self.own_causes(inner.must_start, depth);
+                    inner.min_depth = depth;
+                }
+                Err(_) if self.has_hard_cause(&inner) => {
+                    bare = Some(ambiguous_types(&inner.effects));
+                    self.own_causes(inner.must_start, depth);
+                    inner.min_depth = depth;
+                }
+                Err(_) => (),
+            }
         }
         // A type leaked whole for its own path cannot use a binder lifetime of the output: the type
         // holding the binder is leaked instead, or it is a conflict (in a bound).
@@ -1508,6 +1652,10 @@ impl AnalyzeVisitor {
         if let Some(conflict) = self_conflict {
             own = Some(Err(conflict));
         }
+        if let (Some(idents), Some(Err(conflict))) = (&bare, &own) {
+            own = Some(Err(self.bare_conflict(conflict.clone(), ty, idents)));
+        }
+        let bare = bare.is_some();
         if let (Some(_), Some(probe)) = (&own, &mut self.probe) {
             probe.insert(ty as *const Type as usize);
         }
@@ -1655,7 +1803,13 @@ impl AnalyzeVisitor {
                     ..PendingType::new(ty, context, Vec::new())
                 }
             }
-            Some(Err(conflict)) => return self.frame.effects.push(Effect::Error(conflict)),
+            Some(Err(conflict)) => {
+                // The errors of the parts are real as well, if the cause of the type is one of them.
+                if bare {
+                    self.frame.effects.extend(error_effects(effects));
+                }
+                return self.frame.effects.push(Effect::Error(conflict));
+            }
             None if has_impossible => {
                 if has_must || has_optional(&effects) {
                     // Not leaked whole (elided lifetime, `impl Trait`), but its parts can be.
@@ -3365,7 +3519,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
                 syn::visit::visit_type(self, i)
             }
             Type::TraitObject(object) if elided_ref && !has_lifetime_bound(object) => {
-                self.impossibles.push(quote!(#i));
+                self.impossibles.push_soft(quote!(#i));
                 syn::visit::visit_type(self, i)
             }
             Type::TraitObject(object) if unconstrained.is_some() && !has_lifetime_bound(object) => {
@@ -3376,7 +3530,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
                 syn::visit::visit_type(self, i)
             }
             Type::ImplTrait(_) | Type::Verbatim(_) => {
-                self.impossibles.push(quote!(#i));
+                self.impossibles.push_soft(quote!(#i));
                 // `x: impl Tr<Wrap<T>>` is `x: X` with `X: Tr<Wrap<T>>`: the bounds of the
                 // `impl Trait` of an argument are predicates of the item, as those of a generic
                 // are. Not those of a return type, which rustc proves where the body is.

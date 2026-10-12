@@ -1126,7 +1126,7 @@ pub mod m {
     }
     // One which is a cause itself may be leaked as a whole, so it does not (conservative): a
     // relative trait, or a bare identifier which may be a const (`y` is then not leaked as a whole,
-    // the identifier alone is, but `x` is left with nothing which keeps `'b`).
+    // but `x` is left with nothing which keeps `'b`: see `LocalNotKeptByConst`).
     check_leak! {
         { error: "`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)\n`RelTr2` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)" }
         { }
@@ -1134,8 +1134,11 @@ pub mod m {
             fn f<'b>(&self, x: &'b dyn RelTr, y: &'b dyn RelTr2) -> &'b u8;
         }
     }
+    // `y` cannot be leaked as a whole (that would leave `'b` unconstrained), and its bare
+    // identifier may be a const, which fails to compile if it is leaked alone as a type: so the
+    // identifier is an error too, not a type.
     check_leak! {
-        { error: "`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)" }
+        { error: "`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)\n`SIZE` may be a const, and the type that holds it cannot be leaked as a whole" }
         { }
         trait LocalNotKeptByConst {
             fn f<'b>(&self, x: &'b dyn RelTr, y: &'b dyn ::core::convert::AsRef<SIZE>) -> &'b u8;
