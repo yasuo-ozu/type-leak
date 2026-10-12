@@ -259,9 +259,7 @@ pub struct Features {
     /// A relative type with several segments whose last segment is the name of a generic in scope
     /// (`self::U` next to a generic `U`). The Visitor used to take the path for the generic, so the
     /// Referrer's crate kept `self::U` (E0425); fixed (the context of a type is computed from the
-    /// first segment of a relative path only). A known failure, off by default: a `self::` path in a
-    /// where predicate of the type that names `Self` is not taken for a bound cycle (E0277 in the
-    /// Referrer's crate).
+    /// first segment of a relative path only), on by default.
     pub path_named_like_generic: bool,
     /// A module analyzed as a whole that declares a type with the name of a generic in scope
     /// (`mod m { struct X; fn f<X>(a: crate::base::B1<X>) {} }`). The Visitor used to hide the
@@ -306,6 +304,7 @@ impl Features {
             self_projection_outlives: true,
             gat_where_clause: true,
             nested_self: true,
+            path_named_like_generic: true,
             declared_named_like_generic: true,
             bare_const_in_absolute_path: true,
             ..Features::default()
@@ -435,6 +434,10 @@ pub const TAG_CONST_DEFAULT: &str = "const_default";
 pub const TAG_METHOD_LIFETIME: &str = "method_lifetime";
 pub const TAG_SELF_IN_BOUNDS: &str = "self_in_bounds";
 pub const TAG_SELF_DENIED: &str = "self_denied";
+/// Not put by the generator: the harness gives it to a module analyzed whole and an item analyzed
+/// in `enter_mod` (`main.rs`), where a path of another crate can hold a name that the module
+/// declares beside a bare name (`::l::B2<I0, R0>`), which the Leaker rejects.
+pub const TAG_MODULE_SCOPE: &str = "module_scope";
 
 /// An item with a macro on it, which the Referrer invokes.
 #[derive(Clone)]

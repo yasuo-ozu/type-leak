@@ -131,17 +131,17 @@
 //!   `impl_trait_args` (F27), `hidden_lifetimes` (F28), `projection_outlives` (F30),
 //!   `item_predicate_cycle` (F33), `self_projection_outlives` (F34), `gat_where_clause` (F35),
 //!   `nested_self` (F36: a struct, an enum, a union or a trait analyzed nested in `enter_mod` that
-//!   names its own `Self`, which the Visitor writes with `with_nested_self()`) and
-//!   `declared_named_like_generic` (a module that declares `X`, and `crate::base::B1<X>` in
-//!   `fn f<X>`) and `bare_const_in_absolute_path` (a bare `ILEN` next to a leaked argument in a
+//!   names its own `Self`, which the Visitor writes with `with_nested_self()`; F37: one whose bound
+//!   of a generic names that `Self` is rejected),
+//!   `path_named_like_generic` (`self::U` next to a generic `U`), `declared_named_like_generic` (a
+//!   module that declares `X`, and `crate::base::B1<X>` in `fn f<X>`) and
+//!   `bare_const_in_absolute_path` (a bare `ILEN` next to a leaked argument in a
 //!   path of another crate, which was leaked alone as a type: E0573) are fixed findings,
 //!   each in a share of the items (`gen::Gen::cyclic`): they are on by default (the Leaker encodes
 //!   or rewrites them, records what they need, or rejects and counts what it cannot copy, and the
 //!   Referrer names the lifetime of an elided signature where `Self` adds lifetimes to it). `alias_item` (F26, a limitation) is a known failure that the
 //!   generator does not make by default: with it, or `all`, the test fails with the reproduction
-//!   of that finding (E0277). So is
-//!   `path_named_like_generic` (`self::Rl<'a>` in a where predicate that names `Self` is not taken
-//!   for a bound cycle: E0277). The other findings of `tests/findings.rs` (F22 to F24: the Leaker
+//!   of that finding (E0277). The other findings of `tests/findings.rs` (F22 to F24: the Leaker
 //!   rejected what compiles, F29, F31, F32) are not features: a rejection is counted as success, and
 //!   the test cannot show a toolchain or a lint.
 //!
@@ -605,7 +605,12 @@ fn family(error: &Rejection) -> Option<Family> {
     // it may be a const, so it is not leaked alone. The note says why the holder cannot be leaked,
     // a reason that is an error of the item too.
     if message.contains("may be a const, and the type that holds it cannot be leaked as a whole") {
-        let tags: &[&str] = if error.note.contains("because of `'") {
+        let tags: &[&str] = if error
+            .note
+            .contains("which the module declares and the copy declares again")
+        {
+            &[gen::TAG_MODULE_SCOPE]
+        } else if error.note.contains("because of `'") {
             &[gen::TAG_METHOD_LIFETIME, gen::TAG_BINDER_NO_ANCHOR]
         } else {
             &[
@@ -1376,7 +1381,11 @@ fn random_items_leak_across_crates() {
             .iter()
             .find(|item| item.id == *id)
             .unwrap();
-        for problem in unexplained(&item.tags, report) {
+        let mut tags = item.tags.clone();
+        if item.kind == "mod" || item.scope == "mod" {
+            tags.insert(gen::TAG_MODULE_SCOPE.to_string());
+        }
+        for problem in unexplained(&tags, report) {
             failures.push(Failure {
                 case: *i,
                 item: Some(*id),
