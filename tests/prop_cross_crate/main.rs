@@ -7,13 +7,17 @@
 //! some, through a scope: see below), emit the Repeater's implementations, and, in the Referrer's
 //! crate, rewrite a copy of the item with `Referrer::visitor(context, ..)`.
 //!
-//! The property: if the Leaker accepts an item (it may reject it, which is counted), the Referrer's
-//! crate compiles, and every type position of the rewritten copy is exactly the original type.
+//! The property: if the Leaker accepts an item (it may reject it, which is counted, and every
+//! rejection must be explained: see below), the Referrer's crate compiles, and every type position
+//! of the rewritten copy is exactly the original type.
 //! The latter is checked with a witness for each position: the Leaker's crate defines
-//! `pub fn w_k<generics>() -> PhantomData<OriginalType>`, and the Referrer's crate has
-//! `fn chk_k<generics>() -> PhantomData<RewrittenType> { leaker::w_k::<..>() }`, with the same
+//! `pub fn w_k<generics>() -> PhantomData<*mut OriginalType>`, and the Referrer's crate has
+//! `fn chk_k<generics>() -> PhantomData<*mut RewrittenType> { leaker::w_k::<..>() }`, with the same
 //! generics (the rewritten type is the result, as a parameter of a method is, so that the bounds
 //! implied by its well-formedness, such as `T: 'a` for `&'a T`, are assumed as in a real copy).
+//! `*mut` makes the types invariant: with a bare `PhantomData<T>`, which is covariant, a
+//! rewritten type with a shorter lifetime in a covariant position (`&'a u8` for `&'static u8`) would
+//! pass for the original, and it must be the same type, lifetimes included.
 //! `Self` is what it is at the position (the struct, enum or union, the self type of an impl, or
 //! the host type that implements a trait in the Referrer's crate); a position with an elided
 //! lifetime has no witness, and in a copy of a module neither has a type that names what the module
@@ -46,6 +50,47 @@
 //! so that most items are accepted: an item is rejected with its first such shape, and a module
 //! with the first of its dozen items.
 //!
+//! # Every rejection is explained
+//!
+//! A rejection counts as a success of the property, so a Leaker that rejected what it should accept
+//! would pass. So every error of every rejection must be one of the reasons that the test knows
+//! (`family()`: a leaked type in a bound or where predicate that rustc cannot normalize, a bare
+//! trait of the prelude where the Leaker does not allow the prelude, `Self::A` where `Self` is a
+//! type, the lifetime of a binder that no input keeps, a relative constant that cannot be leaked,
+//! ...), and the item must have a shape that gives it: the generator tags each item with the
+//! shapes it has (`gen::Item::tags`: `bound_cycle`, `self_assoc`, `binder_no_anchor`, `bare:Fn`,
+//! ...). A reason outside the list fails the run ("NOT A KNOWN REASON") with the item and the
+//! message, and so does a known one on an item that has no tag for it ("NO SHAPE THAT GIVES IT").
+//! Either is a defect of `type-leak`, or a limitation to put in the list with its shape.
+//! `TYPE_LEAK_PROP_REJECTIONS=1` prints each rejection with the tags of its item.
+//!
+//! # Bare and absolute spellings
+//!
+//! Bounds, where clauses, supertraits and trait objects name `Sized`, `?Sized`, `Send`, `Sync`,
+//! `Unpin`, `Copy`, `Clone`, `Default`, `Fn`, `FnMut`, `FnOnce`, `Into`, `From`, `AsRef`, `Iterator`,
+//! `PartialEq`, `Eq`, `PartialOrd` and `Ord` sometimes bare and sometimes in full
+//! (`::core::marker::Sized`), whether the Leaker allows the names of the prelude or not. With it,
+//! the macro analyzes the item with the traits written in full too (its twin), and the two must
+//! give the same entries, generics and errors; without it, a bare trait in a bound must be
+//! rejected as a relative path (`tests/crates/macro/bare.rs`). A bare `?Sized` is the exception (`?`
+//! applies to the real `Sized`): the Leaker accepts it without the prelude, which
+//! `gen::BARE_RELAXED_SIZED_ALWAYS_OK` says.
+//!
+//! # What the Referrer needs
+//!
+//! The macro writes the Repeater's impls of the required entries only (`Referrer::required()`) for
+//! an item that the Referrer invokes as trusting, as a downstream crate does, and of all the
+//! entries for one it invokes as `strict` (a quarter of the items, `gen::Item::strict`, that the
+//! macro is told). A trusting Referrer that replaced an optional entry fails to compile.
+//!
+//! # Other checks of the macro
+//!
+//! - The helpers agree: `repeater_impl()` declares `impl_generics()` of the context of its entry
+//!   and the parameter of the implementor, `generics()`, `iter_with_generics()`, `required()` and
+//!   `must()` say the same, and `required()` comes first (`HELPERS DISAGREE`).
+//! - A fifth of the cases do not allow the primitive types: `u8` is an entry then, and the copy
+//!   keeps none in a type position (`PRIMITIVE KEPT`).
+//!
 //! What the macro analyzes besides `intern_*`: a fifth of the structs, enums and unions are
 //! analyzed nested in `enter_mod` (`View::visit_item`, its generics are local) or in
 //! `enter_generics` (no `Self`), a tenth of the traits nested in `enter_mod`, another tenth with
@@ -71,6 +116,7 @@
 //!   `enter_generics`, `enter_trait` and `enter_impl`.
 //! - `TYPE_LEAK_PROP_MIN_SAMPLES` (default 12): the fewest items of a kind for its floor to count.
 //! - `TYPE_LEAK_PROP_MIN_CHECKED` (default 30): the least percentage of type positions compared.
+//! - `TYPE_LEAK_PROP_REJECTIONS`: if set, the rejections are printed with the tags of their items.
 //! - `TYPE_LEAK_PROP_FEATURES`: a comma-separated list of constructs that `type-leak` is known to
 //!   fail on (see `gen::Features`). The generator avoids them by default, so that the test passes
 //!   on the current library, and a new failure is a new finding. With one of `inferred_outlives`,
@@ -90,7 +136,11 @@
 //!   or rewrites them, records what they need, or rejects and counts what it cannot copy, and the
 //!   Referrer names the lifetime of an elided signature where `Self` adds lifetimes to it). `alias_item` (F26, a limitation) is a known failure that the
 //!   generator does not make by default: with it, or `all`, the test fails with the reproduction
-//!   of that finding (E0277). The other findings of `tests/findings.rs` (F22 to F24: the Leaker
+//!   of that finding (E0277). So are `bare_const_in_absolute_path` (a bare `ILEN` next to a leaked
+//!   argument in a path of another crate is leaked alone as a type: E0573), `path_named_like_generic` (a path `self::U` next to a generic
+//!   `U` is leaked, and the Visitor does not replace it) and `declared_named_like_generic` (a
+//!   module analyzed as a whole that declares a type with the name of a generic in scope, and a
+//!   crate-relative path that names the generic: the Leaker takes it for the declared type). The other findings of `tests/findings.rs` (F22 to F24: the Leaker
 //!   rejected what compiles, F29, F31, F32) are not features: a rejection is counted as success, and
 //!   the test cannot show a toolchain or a lint.
 //!
@@ -215,9 +265,9 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode) {
         for item in &case.items {
             writeln!(
                 main,
-                "    println!(\"{{}}\", {}::__tl_report_{}!());",
-                leaker_name(*i),
-                item.id
+                "    println!(\"{{}}\\u{{1e}}{{}}\", {l}::__tl_report_{id}!(), {l}::__tl_errors_{id}!());",
+                l = leaker_name(*i),
+                id = item.id
             )
             .unwrap();
         }
@@ -351,19 +401,38 @@ struct Failure {
     text: String,
 }
 
+/// One error of a rejection (`NotInternableError::items()`): the message, the tokens it is about
+/// and its first note.
+#[derive(Debug, Default, Clone)]
+struct Rejection {
+    message: String,
+    tokens: String,
+    note: String,
+}
+
 /// What a macro reported for an item.
 #[derive(Debug, Default, Clone)]
 struct Report {
     kind: String,
     accepted: bool,
-    /// The reason of the rejection, or the error of the rewrite.
+    /// The reason of the rejection (the messages of its errors, on one line), or the error of the
+    /// rewrite.
     detail: String,
+    /// The errors of the rejection.
+    rejections: Vec<Rejection>,
     positions: usize,
     checked: usize,
     entries: usize,
+    /// The optional entries whose Repeater impl the macro did not write (the Referrer is
+    /// trusting).
+    skipped: usize,
+    /// The item has bare traits of the prelude and was compared with its twin.
+    twin: bool,
 }
 
 fn parse_report(line: &str) -> Option<(usize, Report)> {
+    // The errors of a rejection follow the report.
+    let (line, errors) = line.split_once('\u{1e}').unwrap_or((line, ""));
     let mut parts = line.splitn(4, '|');
     let id = parts.next()?.parse().ok()?;
     let kind = parts.next()?.to_string();
@@ -380,6 +449,8 @@ fn parse_report(line: &str) -> Option<(usize, Report)> {
                 Some(("entries", n)) => report.entries = n.parse().unwrap_or(0),
                 Some(("positions", n)) => report.positions = n.parse().unwrap_or(0),
                 Some(("checked", n)) => report.checked = n.parse().unwrap_or(0),
+                Some(("skipped", n)) => report.skipped = n.parse().unwrap_or(0),
+                Some(("twin", n)) => report.twin = n == "1",
                 Some(("rewrite-error", _)) => report.detail = rest.to_string(),
                 _ => (),
             }
@@ -388,7 +459,24 @@ fn parse_report(line: &str) -> Option<(usize, Report)> {
             report.detail = rest[at..].to_string();
         }
     } else {
-        report.detail = rest.to_string();
+        report.rejections = errors
+            .split('\u{1d}')
+            .filter(|error| !error.is_empty())
+            .map(|error| {
+                let mut fields = error.splitn(3, '\u{1f}');
+                Rejection {
+                    message: fields.next().unwrap_or("").to_string(),
+                    tokens: fields.next().unwrap_or("").to_string(),
+                    note: fields.next().unwrap_or("").to_string(),
+                }
+            })
+            .collect();
+        report.detail = report
+            .rejections
+            .iter()
+            .map(|r| r.message.as_str())
+            .collect::<Vec<_>>()
+            .join(" ; ");
     }
     Some((id, report))
 }
@@ -425,6 +513,227 @@ fn reason_head(detail: &str) -> String {
         None => detail.chars().take(60).collect(),
     }
 }
+// ---------------------------------------------------------------------------------------------
+// Every rejection is explained.
+// ---------------------------------------------------------------------------------------------
+
+/// The traits of the prelude that the generator spells bare in bounds (`gen::absolute_trait()`),
+/// the names of the tags `bare:<Name>`.
+const BARE_TRAITS: &[&str] = &[
+    "Sized",
+    "Send",
+    "Sync",
+    "Unpin",
+    "Copy",
+    "Clone",
+    "Default",
+    "Fn",
+    "FnMut",
+    "FnOnce",
+    "Into",
+    "From",
+    "AsRef",
+    "Iterator",
+    "PartialEq",
+    "PartialOrd",
+    "Eq",
+    "Ord",
+];
+
+/// A reason for which `type-leak` may reject an item: what it is, and the shapes of an item (its
+/// tags, see `gen::Item::tags`) of which the item needs one to justify it.
+#[derive(Debug, PartialEq)]
+struct Family {
+    name: &'static str,
+    tags: Vec<String>,
+}
+
+fn family_of(name: &'static str, tags: &[&str]) -> Option<Family> {
+    Some(Family {
+        name,
+        tags: tags.iter().map(|tag| tag.to_string()).collect(),
+    })
+}
+
+/// The reason of a rejection among the ones that the generator knows (the allow-list), or `None`.
+///
+/// A rejection counts as a success of the property, so one must not hide a defect: each error of
+/// it is one of these, and the generator has put its shape on the item (`family().tags`). A new
+/// reason fails the run with the item and the message, to be judged: a limitation to list, or a
+/// defect.
+fn family(error: &Rejection) -> Option<Family> {
+    let message = error.message.as_str();
+    if message.contains("names `Self` in a bound or where predicate") {
+        return family_of(
+            "a leaked type that names `Self` in a bound or where predicate of its trait",
+            &[gen::TAG_BOUND_CYCLE, gen::TAG_SELF_IN_BOUNDS],
+        );
+    }
+    if message.contains("is in a bound or where predicate") {
+        return family_of(
+            "a leaked type in a bound or where predicate that rustc cannot normalize",
+            &[gen::TAG_BOUND_CYCLE],
+        );
+    }
+    if message.contains("is in the self type of the impl") {
+        return family_of(
+            "a type in the self type of an impl whose context depends on `Self` through a bound",
+            &[gen::TAG_SELF_IN_BOUNDS, gen::TAG_BOUND_CYCLE],
+        );
+    }
+    if message.contains("has a generic whose bound mentions `Self`") {
+        return family_of(
+            "a type that uses a generic whose bound mentions a `Self` that cannot be leaked",
+            &[
+                gen::TAG_BOUND_CYCLE,
+                gen::TAG_SELF_IN_BOUNDS,
+                gen::TAG_SELF_DENIED,
+            ],
+        );
+    }
+    if message.starts_with("write `<Self as ") {
+        return family_of("`Self::A` where `Self` is a type", &[gen::TAG_SELF_ASSOC]);
+    }
+    if message.contains("leaves the lifetime") {
+        return family_of(
+            "a lifetime of a method that only a leaked type keeps (E0195)",
+            &[gen::TAG_METHOD_LIFETIME],
+        );
+    }
+    // A bare name (`u32`, `T`, `R0`) as an argument of a type that cannot be leaked as a whole:
+    // it may be a const, so it is not leaked alone. The note says why the holder cannot be leaked,
+    // a reason that is an error of the item too.
+    if message.contains("may be a const, and the type that holds it cannot be leaked as a whole") {
+        let tags: &[&str] = if error.note.contains("because of `'") {
+            &[gen::TAG_METHOD_LIFETIME, gen::TAG_BINDER_NO_ANCHOR]
+        } else {
+            &[
+                gen::TAG_SELF_ASSOC,
+                gen::TAG_SELF_DENIED,
+                gen::TAG_SELF_IN_BOUNDS,
+                gen::TAG_BOUND_CYCLE,
+            ]
+        };
+        return family_of(
+            "a bare name that may be a const, in a type that cannot be leaked as a whole",
+            tags,
+        );
+    }
+    if !message.starts_with("use absolute path: '") {
+        return None;
+    }
+    // The tokens of the path: a bound with a binder starts with it (`for<'h>Fn(..)`).
+    let text: String = error.tokens.replace(char::is_whitespace, "");
+    let bound = match text.strip_prefix("for<") {
+        Some(rest) => rest.split_once('>').map_or(rest, |(_, rest)| rest),
+        None => text.as_str(),
+    };
+    // A path can be several reasons at once (a bare `Fn` bound with a binder, a type with `Self`
+    // and a binder): the shapes that the item has for any of them explain it.
+    let mut reasons: Vec<(&'static str, Vec<String>)> = Vec::new();
+    for name in BARE_TRAITS {
+        for spelled in [name.to_string(), format!("?{}", name)] {
+            let is_it = bound.strip_prefix(spelled.as_str()).map_or(false, |rest| {
+                !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+            });
+            if is_it {
+                reasons.push((
+                    "a bare trait of the prelude, where the Leaker does not allow the prelude",
+                    vec![format!("bare:{}", spelled)],
+                ));
+            }
+        }
+    }
+    // `Rl<'h5>`: a type of the module that names a lifetime of a binder (not the `for<'h5>` of one).
+    if text.match_indices("<'h").any(|(at, _)| {
+        !text[..at].ends_with("for") && text[at + 3..].starts_with(|c: char| c.is_ascii_digit())
+    }) {
+        reasons.push((
+            "a type that names the lifetime of a binder that no input keeps",
+            vec![gen::TAG_BINDER_NO_ANCHOR.to_string()],
+        ));
+    }
+    // A path that names a lifetime of a method (`it cannot be leaked as a whole because of 'x`), and
+    // that cannot be split either (a part of it must be leaked on its own, as a primitive type
+    // that is not allowed, or a trait object takes the lifetime of the reference around it).
+    if error
+        .note
+        .starts_with("it cannot be leaked as a whole because of `'")
+    {
+        reasons.push((
+            "a path that names a lifetime of a method or a binder and cannot be split",
+            vec![
+                gen::TAG_METHOD_LIFETIME.to_string(),
+                gen::TAG_BINDER_NO_ANCHOR.to_string(),
+            ],
+        ));
+    }
+    // `Self::A0`, `Tr<'a, T>::A0`, `Tr<'a>::G<'c>`: an associated type of the trait.
+    let assoc = text
+        .match_indices("::A")
+        .any(|(at, _)| text[at + 3..].starts_with(|c: char| c.is_ascii_digit()))
+        || text.contains("::G<");
+    if assoc {
+        reasons.push((
+            "`Self::A` where `Self` is a type",
+            vec![gen::TAG_SELF_ASSOC.to_string()],
+        ));
+    }
+    // A type that names `Self`, where `allow_self` is false.
+    if text.contains("Self") {
+        reasons.push((
+            "a type that names `Self`, which the item does not allow",
+            vec![
+                gen::TAG_SELF_ASSOC.to_string(),
+                gen::TAG_SELF_DENIED.to_string(),
+            ],
+        ));
+    }
+    // `RLEN`, `crate::base::BLEN`: a constant, a value, which is not leaked: in the default of a
+    // parameter, or in the length of an array of a type that is split into parts because it
+    // names the `Self` that the item does not allow.
+    if text.ends_with("LEN") {
+        reasons.push((
+            "a relative constant that is not leaked as a whole",
+            vec![
+                gen::TAG_CONST_DEFAULT.to_string(),
+                gen::TAG_SELF_DENIED.to_string(),
+            ],
+        ));
+    }
+    let name = reasons.first()?.0;
+    let mut tags: Vec<String> = reasons.into_iter().flat_map(|(_, tags)| tags).collect();
+    tags.sort();
+    tags.dedup();
+    Some(Family { name, tags })
+}
+
+/// What is wrong with the way a rejection is explained, one line for each error: it is not one of
+/// the reasons that are known, or the item has no shape that gives it.
+fn unexplained(tags: &std::collections::BTreeSet<String>, report: &Report) -> Vec<String> {
+    if report.rejections.is_empty() {
+        return vec!["the report of the rejection has no error".to_string()];
+    }
+    let mut problems = Vec::new();
+    for error in &report.rejections {
+        match family(error) {
+            None => problems.push(format!(
+                "NOT A KNOWN REASON: {} [tokens: {}] [note: {}]",
+                error.message, error.tokens, error.note
+            )),
+            Some(family) => {
+                if !family.tags.iter().any(|tag| tags.contains(tag)) {
+                    problems.push(format!(
+                        "NO SHAPE THAT GIVES IT: {} [tokens: {}]: {}, and the item has none of the tags {:?} (its tags are {:?})",
+                        error.message, error.tokens, family.name, family.tags, tags
+                    ));
+                }
+            }
+        }
+    }
+    problems
+}
+
 // ---------------------------------------------------------------------------------------------
 // The watchdog: a run that tested nothing must not pass.
 // ---------------------------------------------------------------------------------------------
@@ -510,6 +819,17 @@ struct Stats {
     entries: usize,
     positions: usize,
     checked: usize,
+    /// The Repeater impls of optional entries that were not written, for the items invoked as
+    /// trusting.
+    skipped: usize,
+    /// The items with a bare trait of the prelude that were compared with their twin (the
+    /// prelude is allowed), and the rejections for a bare trait (it is not).
+    twins: usize,
+    bare_rejected: usize,
+    /// The items analyzed where the Leaker does not allow the primitive types.
+    primitive_off: usize,
+    /// The rejections by their reason (`family()`).
+    families: BTreeMap<&'static str, usize>,
 }
 
 fn kind_of(name: &str) -> &'static str {
@@ -529,6 +849,19 @@ impl Stats {
                 }
                 if let Some(report) = reports.get(&(case_index, item.id)) {
                     stats.analyzed += 1;
+                    if !case.config.primitive {
+                        stats.primitive_off += 1;
+                    }
+                    stats.skipped += report.skipped;
+                    stats.twins += usize::from(report.twin);
+                    for error in &report.rejections {
+                        if let Some(family) = family(error) {
+                            *stats.families.entry(family.name).or_default() += 1;
+                            if family.name.starts_with("a bare trait") {
+                                stats.bare_rejected += 1;
+                            }
+                        }
+                    }
                     let kind = kind_of(&report.kind);
                     if let Some((_, api)) = SCOPES.iter().find(|(scope, _)| *scope == item.scope) {
                         let counts = if report.accepted {
@@ -813,6 +1146,15 @@ fn summarize(stats: &Stats, floors: &Floors, seed: u64, n: usize, features: Feat
         stats.positions - stats.checked
     )
     .unwrap();
+    writeln!(
+        s,
+        "  bare traits of the prelude: {} items compared with their twin, {} errors of rejections; optional entries without an impl (trusting items): {}; items without allow_primitive: {}",
+        stats.twins, stats.bare_rejected, stats.skipped, stats.primitive_off
+    )
+    .unwrap();
+    for (name, n) in &stats.families {
+        writeln!(s, "  explained rejection errors: {:>4}x {}", n, name).unwrap();
+    }
     for kind in KINDS.iter().chain(SCOPES.iter().map(|(_, api)| api)) {
         for (reason, n) in stats.reasons_of(kind).iter().take(3) {
             writeln!(s, "  rejected {:>4}x {:<13} {}", n, kind, reason).unwrap();
@@ -1023,6 +1365,44 @@ fn random_items_leak_across_crates() {
         );
     }
 
+    // Every rejection has a reason that is known, and an item that has its shape.
+    for ((i, id), report) in &reports {
+        if report.accepted {
+            continue;
+        }
+        let item = generated[*i]
+            .items
+            .iter()
+            .find(|item| item.id == *id)
+            .unwrap();
+        for problem in unexplained(&item.tags, report) {
+            failures.push(Failure {
+                case: *i,
+                item: Some(*id),
+                class: "UNEXPLAINED REJECTION: type-leak rejects an item for a reason the generator does not explain",
+                text: problem,
+            });
+        }
+    }
+    if std::env::var_os("TYPE_LEAK_PROP_REJECTIONS").is_some() {
+        for ((i, id), report) in &reports {
+            if report.accepted {
+                continue;
+            }
+            let item = generated[*i]
+                .items
+                .iter()
+                .find(|item| item.id == *id)
+                .unwrap();
+            eprintln!(
+                "REJECTED case {} item {} ({}, scope {:?}, prelude {}, tags {:?}):",
+                i, id, item.kind, item.scope, generated[*i].config.prelude, item.tags
+            );
+            for r in &report.rejections {
+                eprintln!("    {} || {} || {}", r.message, r.tokens, r.note);
+            }
+        }
+    }
     let stats = Stats::collect(&generated, &reports);
     let summary = summarize(&stats, &floors, seed, cases, features);
     eprintln!("{}", summary);
@@ -1254,6 +1634,211 @@ mod checks {
         assert_eq!(defaults().problems(&stats).len(), 1);
         stats.checked = stats.positions * 9 / 10;
         assert!(defaults().problems(&stats).is_empty());
+    }
+
+    fn rejection(message: &str, tokens: &str) -> Rejection {
+        Rejection {
+            message: message.to_string(),
+            tokens: tokens.to_string(),
+            note: String::new(),
+        }
+    }
+
+    fn tags(names: &[&str]) -> std::collections::BTreeSet<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn rejections_are_classified_into_the_known_reasons() {
+        let tags_of =
+            |message: &str, tokens: &str| family(&rejection(message, tokens)).map(|f| f.tags);
+        // A bare trait of the prelude: its name is the tag, with the binder and the `?` left out.
+        assert_eq!(
+            tags_of("use absolute path: 'Clone'", "Clone"),
+            Some(vec!["bare:Clone".to_string()])
+        );
+        assert_eq!(
+            tags_of("use absolute path: '? Sized'", "? Sized"),
+            Some(vec!["bare:?Sized".to_string()])
+        );
+        assert_eq!(
+            tags_of(
+                "use absolute path: 'for < 'h3 > Fn(& 'h3 u8) -> & 'h3 u8'",
+                "for < 'h3 > Fn(& 'h3 u8) -> & 'h3 u8"
+            ),
+            Some(vec!["bare:Fn".to_string()])
+        );
+        // A path can be several reasons at once: the shapes of any of them explain it.
+        let tags = tags_of(
+            "use absolute path: 'Into < Self :: A0 >'",
+            "Into < Self :: A0 >",
+        )
+        .unwrap();
+        assert!(tags.contains(&"bare:Into".to_string()), "{:?}", tags);
+        assert!(
+            tags.contains(&gen::TAG_SELF_ASSOC.to_string()),
+            "{:?}",
+            tags
+        );
+        // The binder of a bound is not a type that names one.
+        let tags = tags_of(
+            "use absolute path: 'for < 'h1 > Fn(& 'h1 u8) -> & 'h1 u8'",
+            "for < 'h1 > Fn(& 'h1 u8) -> & 'h1 u8",
+        )
+        .unwrap();
+        assert!(
+            !tags.contains(&gen::TAG_BINDER_NO_ANCHOR.to_string()),
+            "{:?}",
+            tags
+        );
+        // The name of another trait is not the name of the prelude's (`Fn` of `FnMut`, `Fnord`).
+        assert_eq!(
+            tags_of("use absolute path: 'Fnord'", "Fnord"),
+            None,
+            "a relative path that is not a trait of the prelude is not explained"
+        );
+        assert_eq!(
+            tags_of("use absolute path: 'FnMut(u8)'", "FnMut(u8)"),
+            Some(vec!["bare:FnMut".to_string()])
+        );
+        // The other reasons.
+        assert_eq!(
+            tags_of("use absolute path: 'Rl < 'h5 >'", "Rl < 'h5 >"),
+            Some(vec![gen::TAG_BINDER_NO_ANCHOR.to_string()])
+        );
+        assert_eq!(
+            tags_of(
+                "use absolute path: 'Tr1_1 < 'a > :: A0'",
+                "Tr1_1 < 'a > :: A0"
+            ),
+            Some(vec![gen::TAG_SELF_ASSOC.to_string()])
+        );
+        assert_eq!(
+            tags_of(
+                "write `<Self as ::k::Tr>::A0` instead of `Self::A0` in `Wrap<Self::A0>`: the copy cannot tell",
+                "Wrap<Self::A0>"
+            ),
+            Some(vec![gen::TAG_SELF_ASSOC.to_string()])
+        );
+        assert_eq!(
+            tags_of(
+                "`Wrap < T >` is in a bound or where predicate, and a bound of its generics names a leaked type",
+                "Wrap < T >"
+            ),
+            Some(vec![gen::TAG_BOUND_CYCLE.to_string()])
+        );
+        assert_eq!(
+            tags_of(
+                "use absolute path: 'crate :: base :: BLEN'",
+                "crate :: base :: BLEN"
+            )
+            .map(|tags| tags.contains(&gen::TAG_CONST_DEFAULT.to_string())),
+            Some(true)
+        );
+        // A reason nobody listed.
+        assert_eq!(tags_of("`Self` has no meaning here", "Self"), None);
+        assert_eq!(tags_of("use absolute path: 'Strange'", "Strange"), None);
+    }
+
+    #[test]
+    fn a_rejection_needs_a_reason_that_is_known_and_a_shape_that_gives_it() {
+        let report = |errors: Vec<Rejection>| Report {
+            kind: "trait".into(),
+            rejections: errors,
+            ..Default::default()
+        };
+        let bare = report(vec![rejection("use absolute path: 'Default'", "Default")]);
+        // The item has the shape: explained.
+        assert!(unexplained(&tags(&["bare:Default"]), &bare).is_empty());
+        // The item has none (it spells another trait bare, or none), so something else rejected it.
+        let problems = unexplained(&tags(&["bare:Clone", "bound_cycle"]), &bare);
+        assert_eq!(problems.len(), 1, "{:?}", problems);
+        assert!(
+            problems[0].starts_with("NO SHAPE THAT GIVES IT"),
+            "{:?}",
+            problems
+        );
+        // A bare `?Sized` is explained by its own tag, which the generator does not put on when
+        // `gen::BARE_RELAXED_SIZED_ALWAYS_OK` is set.
+        let sized = report(vec![rejection("use absolute path: '? Sized'", "? Sized")]);
+        assert!(unexplained(&tags(&["bare:Sized"]), &sized).len() == 1);
+        assert!(unexplained(&tags(&["bare:?Sized"]), &sized).is_empty());
+        // A reason that is not in the list.
+        let unknown = report(vec![rejection("`Self` has no meaning here", "Self")]);
+        let problems = unexplained(&tags(&["bound_cycle"]), &unknown);
+        assert!(
+            problems[0].starts_with("NOT A KNOWN REASON"),
+            "{:?}",
+            problems
+        );
+        // Every error counts: one that is explained does not explain the other.
+        let two = report(vec![
+            rejection("use absolute path: 'Default'", "Default"),
+            rejection("`Self` has no meaning here", "Self"),
+        ]);
+        assert_eq!(unexplained(&tags(&["bare:Default"]), &two).len(), 1);
+        // A rejection with no error (the report was not read) is not explained either.
+        assert_eq!(unexplained(&tags(&[]), &report(Vec::new())).len(), 1);
+    }
+
+    #[test]
+    fn the_errors_of_a_rejection_are_read_back_from_the_report() {
+        let line = "8|trait|rej|use absolute path: 'Clone' use absolute path: 'Default'\u{1e}\
+                    use absolute path: 'Clone'\u{1f}Clone\u{1f}\u{1d}\
+                    use absolute path: 'Default'\u{1f}Default\u{1f}the note";
+        let (id, report) = parse_report(line).unwrap();
+        assert_eq!((id, report.accepted), (8, false));
+        assert_eq!(report.rejections.len(), 2);
+        assert_eq!(report.rejections[1].tokens, "Default");
+        assert_eq!(report.rejections[1].note, "the note");
+        // An accepted item has no errors, and says what the macro wrote.
+        let (_, report) =
+            parse_report("3|struct|ok|entries=2 positions=5 checked=4 skipped=1 twin=1\u{1e}")
+                .unwrap();
+        assert!(report.accepted && report.rejections.is_empty());
+        assert_eq!((report.skipped, report.twin), (1, true));
+    }
+
+    #[test]
+    fn the_generated_cases_say_what_the_macro_needs() {
+        let mut bare_sized = 0;
+        let mut strict = 0;
+        for seed in 0..12 {
+            let case = generate(seed, 0, 6, Features::parse(""));
+            for item in &case.items {
+                let attr = case
+                    .leaker
+                    .lines()
+                    .find(|line| line.contains(&format!("(id = {},", item.id)))
+                    .unwrap_or_else(|| panic!("no attribute for item {}", item.id));
+                assert!(
+                    attr.contains(&format!("strict = {},", item.strict)),
+                    "{} {}",
+                    attr,
+                    item.strict
+                );
+                assert!(attr.contains(&format!("primitive = {},", case.config.primitive)));
+                assert!(attr.contains(&format!(
+                    "relaxed_sized = {})",
+                    gen::BARE_RELAXED_SIZED_ALWAYS_OK
+                )));
+                strict += usize::from(item.strict);
+                // A bare trait without the prelude gets its tag: a bare `?Sized` unless it is accepted.
+                if item.tags.contains("bare:?Sized") {
+                    assert!(!case.config.prelude && !gen::BARE_RELAXED_SIZED_ALWAYS_OK);
+                    bare_sized += 1;
+                }
+                if case.config.prelude {
+                    assert!(
+                        !item.tags.iter().any(|tag| tag.starts_with("bare:")),
+                        "{:?}",
+                        item.tags
+                    );
+                }
+            }
+        }
+        assert!(strict > 0, "no item is strict in 12 cases");
+        let _ = bare_sized;
     }
 
     #[test]

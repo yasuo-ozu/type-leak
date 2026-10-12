@@ -37,6 +37,20 @@
 //! Scopes: the macro analyzes some items through `enter_mod`, `enter_generics`, `enter_trait` or
 //! `enter_impl` instead of the `intern_*` of their kind (`Item::scope`, `SCOPES`).
 //!
+//! Spellings: the traits of the prelude in bounds (`Sized`, `?Sized`, `Send`, `Fn`, `Into`,
+//! `AsRef`, ...) are bare or in full, and a type parameter has a marker trait or a comparison as a
+//! bound (`Gen::trait_path()`, `Gen::bare_percent`).
+//!
+//! Names: every module declares types with the names of generics (`T`, `U`, `X`, `SHADOW_NAMES`), a
+//! relative type next to a generic of the same name in a sibling scope; a const parameter takes the
+//! name of a type parameter that a sibling scope declares (`V`, `Y`); a type parameter's bound
+//! names another parameter (`T: Into<V>`); a path with the lifetime of a binder (`Rl<'h>`) is in
+//! `for<'h> Fn(..)` bounds, function pointers and trait objects, with an input that keeps the
+//! lifetime or without one.
+//!
+//! Settings: the Leaker does not allow the primitive types in a fifth of the cases
+//! (`Config::primitive`), and each item says whether the Referrer invokes it as strict.
+//!
 //! Not generated: type macros (the test macro's witness cannot return a type that a macro
 //! expands to), const expressions with types in them, and unsized or `dyn` implementors.
 //!
@@ -56,6 +70,20 @@ use std::hash::Hasher;
 // ---------------------------------------------------------------------------------------------
 // Configuration and results.
 // ---------------------------------------------------------------------------------------------
+
+/// Whether a bare `?Sized` is accepted whatever the configuration says about the names of the
+/// prelude.
+///
+/// `?` applies to the real `Sized` only, so `T: ?Sized` is no more context-dependent than
+/// `T: ?::core::marker::Sized`. `type-leak` at fb11f41 does not know it: it takes the bare `Sized`
+/// of `?Sized` for a relative path like any other bare name of the prelude, and rejects it unless
+/// `LeakerConfig::allow_std_prelude()` is on. The Leaker accepts a bare `?Sized` always (`?` applies
+/// to the real `Sized` only), so it is `true`; it is the only place that says so. It reaches
+/// three places: the generator (a bare `?Sized` is an expected rejection without the prelude only
+/// if it is `false`: the tag `bare:?Sized`), the macro (`relaxed_sized` argument of `prop_leak`:
+/// the item with a bare `?Sized` must then equal its twin with the full path, prelude or not) and
+/// the harness (`main.rs`: a "use absolute path: '? Sized'" is justified only by that tag).
+pub const BARE_RELAXED_SIZED_ALWAYS_OK: bool = true;
 
 /// The kinds the statistics count.
 pub const KINDS: &[&str] = &[
@@ -228,6 +256,24 @@ pub struct Features {
     /// found it, so the copy kept the leaked type (`Rel<Self>`), which the Referrer's crate cannot
     /// resolve. Off, such an item names no `Self`.
     pub nested_self: bool,
+    /// A relative type with several segments whose last segment is the name of a generic in scope
+    /// (`self::U` next to a generic `U`). The Leaker leaks it, and the Visitor does not replace it:
+    /// it takes the path for the generic, so the Referrer's crate keeps `self::U`, which it does
+    /// not have (E0425). A known failure, off by default: the generator does not write the `self::`
+    /// path of the types it names like a generic (`SHADOW_NAMES`).
+    pub path_named_like_generic: bool,
+    /// A module analyzed as a whole that declares a type with the name of a generic in scope
+    /// (`mod m { struct X; fn f<X>(a: crate::base::B1<X>) {} }`). The Leaker takes the generic for
+    /// the declared type, and the entry `crate::base::B1<X>`, which it keys by the module, is not
+    /// replaced by the Visitor (the Referrer's crate keeps `crate::base`, E0433). A known failure,
+    /// off by default: the modules analyzed as a whole do not declare the types of `SHADOW_NAMES`.
+    pub declared_named_like_generic: bool,
+    /// A bare identifier that may be a const as an argument of a path of another crate, next to an
+    /// argument that is leaked (`::l::BC<Rel<T>, ILEN>`, `::l::W<[Self], ILEN>` with `allow_self =
+    /// false`): the Leaker cannot leak the path as a whole, and leaks the identifier alone as a
+    /// type (`type Type = ILEN`, E0573). A known failure, off by default: the generator braces the
+    /// constant (`{ ILEN }`) in the arguments of such a path.
+    pub bare_const_in_absolute_path: bool,
 }
 
 impl Features {
@@ -293,6 +339,9 @@ impl Features {
                     features.self_projection_outlives = true;
                     features.gat_where_clause = true;
                     features.nested_self = true;
+                    features.path_named_like_generic = true;
+                    features.declared_named_like_generic = true;
+                    features.bare_const_in_absolute_path = true;
                 }
                 "inferred_outlives" => features.inferred_outlives = true,
                 "impl_assoc_self" => features.impl_assoc_self = true,
@@ -320,6 +369,9 @@ impl Features {
                 "self_projection_outlives" => features.self_projection_outlives = true,
                 "gat_where_clause" => features.gat_where_clause = true,
                 "nested_self" => features.nested_self = true,
+                "path_named_like_generic" => features.path_named_like_generic = true,
+                "declared_named_like_generic" => features.declared_named_like_generic = true,
+                "bare_const_in_absolute_path" => features.bare_const_in_absolute_path = true,
                 "unsized_params" => features.unsized_params = true,
                 "bound_cycles" => features.bound_cycles = true,
                 other => panic!("unknown feature `{}`", other),
@@ -340,6 +392,9 @@ pub struct Config {
     pub allow_std: bool,
     /// The Leaker allows its own crate.
     pub allow_crate: bool,
+    /// The Leaker allows the primitive types (`LeakerConfig::allow_primitive()`). Without it, `u8`
+    /// is a relative path like any other: each is an entry of the item.
+    pub primitive: bool,
 }
 
 impl Config {
@@ -354,6 +409,30 @@ impl Config {
         allow.join(",")
     }
 }
+
+/// The tags: the shapes of an item that make `type-leak` reject it, which the generator puts on the
+/// items that have one (`Item::tags`). The harness fails a rejection that no tag of the item
+/// justifies (`main.rs`, `family()`).
+///
+/// - `bound_cycle`: a bound or where predicate that may name a leaked type that uses a generic (the
+///   item is one of the `CYCLIC_*` shares), or a bound of a generic that names `Self`.
+/// - `self_assoc`: `Self::A` or `<Self as Tr>::A` is in the text of the item.
+/// - `binder_no_anchor`: a bound, function pointer or trait object `for<'h> Fn(A, Rl<'h>) -> &'h R`,
+///   where no input keeps `'h` (the bound is always rejected, the others where they are split).
+/// - `const_default`: a relative constant (`{ RLEN }`) is the default of a const parameter.
+/// - `method_lifetime`: a lifetime of a method is named by a path (not by a reference).
+/// - `self_in_bounds`: a predicate names `Self` (`Self: 'x`, `Self: Sized`).
+/// - `self_denied`: the item is analyzed with `allow_self = false` and names `Self`.
+/// - `bare:<Name>`: the prelude trait `Name` is spelled bare (`bare:?Sized` for `?Sized`), and the
+///   Leaker does not allow the names of the prelude (a bare `?Sized` only if
+///   `BARE_RELAXED_SIZED_ALWAYS_OK` is `false`).
+pub const TAG_BOUND_CYCLE: &str = "bound_cycle";
+pub const TAG_SELF_ASSOC: &str = "self_assoc";
+pub const TAG_BINDER_NO_ANCHOR: &str = "binder_no_anchor";
+pub const TAG_CONST_DEFAULT: &str = "const_default";
+pub const TAG_METHOD_LIFETIME: &str = "method_lifetime";
+pub const TAG_SELF_IN_BOUNDS: &str = "self_in_bounds";
+pub const TAG_SELF_DENIED: &str = "self_denied";
 
 /// An item with a macro on it, which the Referrer invokes.
 #[derive(Clone)]
@@ -370,6 +449,10 @@ pub struct Item {
     pub scope: &'static str,
     /// The kinds of the items in it (for a module), and the item itself otherwise.
     pub contents: Vec<&'static str>,
+    /// The shapes in it that justify a rejection of `type-leak` (`bound_cycle`, `bare:Sized`, ...),
+    /// of the module and of all the items in it for a module. A rejection that none of them
+    /// explains fails the run: see `main.rs`.
+    pub tags: BTreeSet<String>,
     /// Its source, with the attribute.
     pub source: String,
 }
@@ -407,6 +490,11 @@ const CYCLIC_MODULE_PERCENT: u32 = 15;
 /// The share of the structs, enums, unions and traits that have parameters with defaults, if one
 /// can.
 const DEFAULT_PERCENT: u32 = 35;
+/// The share of the cases whose Leaker does not allow the primitive types.
+const PRIMITIVE_OFF_PERCENT: u32 = 20;
+/// The share of the traits and of the inherent impls that have sibling methods whose generics are
+/// named alike (`Gen::clash_methods()`).
+const CLASH_PERCENT: u32 = 20;
 const CYCLIC_ITEM_IN_MODULE_PERCENT: u32 = 30;
 
 // ---------------------------------------------------------------------------------------------
@@ -523,6 +611,26 @@ struct Scope {
     /// those whose `Item` it equates to a type (`T: Iterator<Item = Rel>`) (`iterator_item_cycle`).
     names_item: Vec<String>,
     binds_item: Vec<String>,
+    /// Names of generics that are not in `tys` and `consts` yet, but already mean the generic where
+    /// a type is named: those after a parameter in the default of its (`struct S<A = U, U = u8>`).
+    reserved: Vec<String>,
+    /// The types are those of a method (its parameters, its result, its where clause).
+    method: bool,
+}
+
+impl Scope {
+    /// Whether `name`, the name of a type that a module declares, cannot be used where the scope
+    /// is: it means a generic of the scope, or it is a name of the generics of a method (`X`) and
+    /// the type is not in a method. The witness and the check of a position have one function
+    /// whose generics are those of the item and of the method together: a type of the item that
+    /// had the name of a generic of one of its methods would mean the generic there.
+    fn shadowed(&self, name: &str) -> bool {
+        is_shadow_name(name)
+            && (self.tys.iter().any(|t| t.name == name)
+                || self.consts.iter().any(|(n, _)| n == name)
+                || self.reserved.iter().any(|n| n == name)
+                || (name == METHOD_SHADOW_NAME && !self.method))
+    }
 }
 
 /// What a type to generate must be.
@@ -706,8 +814,9 @@ struct ModEnv {
     consts: Vec<String>,
 }
 
-/// The types every module declares (`prefix` is `R`) and the `base` module has (`B`).
-fn types_template(p: &str) -> String {
+/// The types every module declares (`prefix` is `R`) and the `base` module has (`B`). `sized` is
+/// how `?Sized` is spelled: `?::core::marker::Sized`, or `?Sized`.
+fn types_template(p: &str, sized: &str) -> String {
     let mut s = String::new();
     let phantom = "::core::marker::PhantomData";
     s += &format!("#[derive(Debug, Clone, Copy, Default, PartialEq)] pub struct {p}0;\n");
@@ -749,8 +858,70 @@ fn types_template(p: &str) -> String {
     s += &format!("pub trait {p}T1<T: ?::core::marker::Sized> {{}}\n");
     s += &format!("pub trait {p}T2 {{ type Out; }}\n");
     s += &format!("pub const {p}LEN: usize = 2;\n");
-    s
+    s.replace("?::core::marker::Sized", sized)
 }
+
+/// Whether `name`, a type of the module environment, is one that a module declares (`R0`, `self::R1`,
+/// `U`, ...) and not one it imports or names by a path of another module.
+fn is_declared(name: &str) -> bool {
+    name.starts_with('R')
+        || name.starts_with("self::R")
+        || name.starts_with("super::R")
+        || is_shadow_name(name)
+        || name.strip_prefix("self::").map_or(false, is_shadow_name)
+}
+
+/// The types that every module declares with the name of a generic parameter (`T`, `U`: the
+/// parameters of an item, `X`: of a method). Where a generic of that name is in scope, the name is
+/// the generic's, and the type cannot be named (`shadowed()`); where none is, it is a relative
+/// type, which must not be taken for the generic of a sibling scope.
+const SHADOW_NAMES: &[&str] = &["T", "U", "X"];
+
+/// The one of `SHADOW_NAMES` that a method declares as a generic: its type is named only in methods.
+const METHOD_SHADOW_NAME: &str = "X";
+
+fn is_shadow_name(name: &str) -> bool {
+    SHADOW_NAMES.contains(&name)
+}
+
+/// The full path of a trait of the prelude that the generator spells bare in bounds.
+fn absolute_trait(name: &str) -> &'static str {
+    match name {
+        "Sized" => "::core::marker::Sized",
+        "Send" => "::core::marker::Send",
+        "Sync" => "::core::marker::Sync",
+        "Unpin" => "::core::marker::Unpin",
+        "Copy" => "::core::marker::Copy",
+        "Clone" => "::core::clone::Clone",
+        "Default" => "::core::default::Default",
+        "Fn" => "::core::ops::Fn",
+        "FnMut" => "::core::ops::FnMut",
+        "FnOnce" => "::core::ops::FnOnce",
+        "Into" => "::core::convert::Into",
+        "From" => "::core::convert::From",
+        "AsRef" => "::core::convert::AsRef",
+        "Iterator" => "::core::iter::Iterator",
+        "PartialEq" => "::core::cmp::PartialEq",
+        "PartialOrd" => "::core::cmp::PartialOrd",
+        "Eq" => "::core::cmp::Eq",
+        "Ord" => "::core::cmp::Ord",
+        other => panic!("generator: `{}` is not a prelude trait it writes", other),
+    }
+}
+
+/// The marker traits (and comparisons) that a type parameter may have as a bound, each of which a
+/// type with no more than its own bounds satisfies once the impls copy the generics. `Copy` needs
+/// a `Sized` parameter.
+const MARKER_BOUNDS: &[&str] = &[
+    "Send",
+    "Sync",
+    "Unpin",
+    "Copy",
+    "PartialEq",
+    "Eq",
+    "PartialOrd",
+    "Ord",
+];
 
 // ---------------------------------------------------------------------------------------------
 // Generics.
@@ -773,6 +944,9 @@ struct Skeleton {
     bounded: Vec<(String, &'static str)>,
     /// A where predicate names a lifetime and an external type (`Risk::cycle`).
     risk_cycle: bool,
+    /// The tags of the struct, enum, union or trait that has these generics (`Item::tags`): an
+    /// impl of it has its generics, predicates and methods, so its shapes.
+    tags: BTreeSet<String>,
     /// The defaults of the trailing type and const parameters, by name (`T = Vec<u8>`, `const N:
     /// usize = 3`). Only the declaration of a struct, enum, union or trait writes them
     /// (`params_decl()`): an impl or a function cannot.
@@ -897,6 +1071,8 @@ struct TraitInfo {
     sk: Skeleton,
     supers: Bounds,
     assoc: Vec<(String, Bounds)>,
+    /// The trait has a marker supertrait (`Send`): an impl would need a self type that has it.
+    marker_super: bool,
     /// The trait declares `type G<'g>;`.
     gat: bool,
     /// ... with the where clause `where Self: 'g, Self: 'c` (`gat_where_clause`).
@@ -965,6 +1141,22 @@ pub struct Gen {
     cyclic_module: bool,
     /// The scope of the item that was generated last (`Item::scope`).
     last_scope: &'static str,
+    /// The tags of the item (or of the module analyzed as a whole) being generated.
+    tags: BTreeSet<String>,
+    /// The share (percent) of the prelude traits in the bounds of the item being generated that
+    /// are written bare (`Sized`, `Fn(..)`, `Into<..>`, ...) instead of in full. It is the item's:
+    /// with the prelude off the bare names are rejected, so few items have any (`bare_trait()`).
+    bare_percent: u32,
+    /// The item being generated is invoked as strict if it can be (`strict_ok()`).
+    want_strict: bool,
+    /// Whether the attribute of the item generated last says `strict`.
+    last_strict: bool,
+    /// The self types of the impls of the traits with associated types in the crate: `Self::A0`
+    /// is ambiguous (E0223) for a type that two such traits are implemented for, even if they are
+    /// in different modules.
+    assoc_self_types: Vec<String>,
+    /// A default of a parameter is being generated.
+    in_default: bool,
 }
 
 const PRIMS: &[&str] = &[
@@ -980,6 +1172,7 @@ impl Gen {
             prelude: false,
             allow_std: false,
             allow_crate: false,
+            primitive: true,
         };
         let mut g = Gen {
             rng,
@@ -1004,10 +1197,17 @@ impl Gen {
             cyclic: false,
             cyclic_module: false,
             last_scope: "",
+            tags: BTreeSet::new(),
+            bare_percent: 0,
+            want_strict: false,
+            last_strict: false,
+            assoc_self_types: Vec::new(),
+            in_default: false,
         };
         g.cfg.prelude = g.chance(50);
         g.cfg.allow_std = g.chance(35);
         g.cfg.allow_crate = g.chance(30);
+        g.cfg.primitive = !g.chance(PRIMITIVE_OFF_PERCENT);
         g
     }
 
@@ -1045,6 +1245,27 @@ impl Gen {
         format!("'h{}", self.next_binder)
     }
 
+    /// A type of the module that names the lifetime `h` of a binder (`Rl<'h>`), sometimes.
+    fn binder_path(&mut self, h: &str) -> Option<String> {
+        let env = self.env.clone();
+        self.binder_path_in(&env, h)
+    }
+
+    /// The same with the types of `env`. The relative ones: an absolute path is not what is tested.
+    fn binder_path_in(&mut self, env: &ModEnv, h: &str) -> Option<String> {
+        let heads: Vec<String> = env
+            .heads
+            .iter()
+            .filter(|head| head.shape == Shape::LOnly && !head.name.starts_with("::"))
+            .filter(|head| !(self.module_mode && is_declared(&head.name)))
+            .map(|head| head.name.clone())
+            .collect();
+        if heads.is_empty() || !self.chance(40) {
+            return None;
+        }
+        Some(format!("{}<{}>", self.pick(&heads), h))
+    }
+
     fn name(&mut self, prefix: &str) -> String {
         self.next_name += 1;
         format!("{}{}_{}", prefix, self.cur_id, self.next_name)
@@ -1061,20 +1282,77 @@ impl Gen {
         chosen && (!self.abs_only || self.cfg.prelude)
     }
 
-    fn clone_path(&mut self) -> String {
-        if self.bare() {
-            "Clone".into()
+    /// The share of bare prelude traits in the bounds of a new item (see `Gen::bare_percent`).
+    ///
+    /// With the prelude allowed a bare name is as good as the full path, and the macro checks that
+    /// (`bare.rs`): many items have some. Without it the item is rejected, so few do.
+    fn item_bare_percent(&mut self) -> u32 {
+        if self.cfg.prelude {
+            if self.chance(55) {
+                50
+            } else {
+                0
+            }
+        } else if self.chance(8) {
+            40
         } else {
-            "::core::clone::Clone".into()
+            0
         }
     }
 
-    fn default_path(&mut self) -> String {
-        if self.bare() {
-            "Default".into()
+    /// The same for a module analyzed as a whole, where one bare name rejects the module.
+    fn module_bare_percent(&mut self) -> u32 {
+        if self.cfg.prelude {
+            50
+        } else if self.chance(10) {
+            35
         } else {
-            "::core::default::Default".into()
+            0
         }
+    }
+
+    /// A trait of the prelude in a bound, a where clause, a supertrait or a trait object, bare
+    /// (`Into`) or in full (`::core::convert::Into`). Bare without the prelude is a relative path
+    /// that the Leaker rejects, and the tag `bare:<name>` says so.
+    fn trait_path(&mut self, name: &'static str) -> String {
+        if self.bare_percent > 0 && self.chance(self.bare_percent) {
+            if !self.cfg.prelude {
+                self.tags.insert(format!("bare:{}", name));
+            }
+            name.to_string()
+        } else {
+            absolute_trait(name).to_string()
+        }
+    }
+
+    /// `?Sized`, bare or in full (`?::core::marker::Sized`). A bare one is a relative path without
+    /// the prelude, unless `BARE_RELAXED_SIZED_ALWAYS_OK`.
+    fn maybe_sized(&mut self) -> String {
+        if self.bare_percent > 0 && self.chance(self.bare_percent) {
+            if !self.cfg.prelude && !BARE_RELAXED_SIZED_ALWAYS_OK {
+                self.tags.insert("bare:?Sized".to_string());
+            }
+            "?Sized".to_string()
+        } else {
+            "?::core::marker::Sized".to_string()
+        }
+    }
+
+    /// `Fn`, mostly, or `FnMut` or `FnOnce`.
+    fn fn_family(&mut self) -> &'static str {
+        match self.below(10) {
+            0 => "FnMut",
+            1 => "FnOnce",
+            _ => "Fn",
+        }
+    }
+
+    fn clone_path(&mut self) -> String {
+        self.trait_path("Clone")
+    }
+
+    fn default_path(&mut self) -> String {
+        self.trait_path("Default")
     }
 
     fn bound_texts(&mut self, b: Bounds) -> Vec<String> {
@@ -1112,7 +1390,7 @@ impl Gen {
                         }))
                     }
                 }
-                35..=54 => self.head_unit(),
+                35..=54 => self.head_unit(sc),
                 55..=79 => self.param(sc, c),
                 80..=99 => self.self_ty(sc, c),
                 _ => None,
@@ -1124,12 +1402,12 @@ impl Gen {
         Ty::new("u8")
     }
 
-    fn head_unit(&mut self) -> Option<Ty> {
+    fn head_unit(&mut self, sc: &Scope) -> Option<Ty> {
         let units: Vec<String> = self
             .env
             .heads
             .iter()
-            .filter(|h| h.shape == Shape::Unit)
+            .filter(|h| h.shape == Shape::Unit && !sc.shadowed(&h.name))
             .map(|h| h.name.clone())
             .collect();
         if units.is_empty() {
@@ -1155,10 +1433,9 @@ impl Gen {
         if p.iter && c.bounds.is_none() && !self.no_assoc_paths && self.chance(40) {
             let text = if self.chance(50) {
                 format!("{}::Item", p.name)
-            } else if self.bare() {
-                format!("<{} as Iterator>::Item", p.name)
             } else {
-                format!("<{} as ::core::iter::Iterator>::Item", p.name)
+                let iterator = self.trait_path("Iterator");
+                format!("<{} as {}>::Item", p.name, iterator)
             };
             let mut ty = Ty::new(text).no_infer();
             ty.tys.insert(p.name);
@@ -1277,7 +1554,11 @@ impl Gen {
         }
         if !self.env.consts.is_empty() && self.chance(20) {
             let consts = self.env.consts.clone();
-            return self.pick(&consts).clone();
+            let constant = self.pick(&consts).clone();
+            if self.in_default && !constant.starts_with("::") {
+                self.tags.insert(TAG_CONST_DEFAULT.to_string());
+            }
+            return constant;
         }
         self.pick(&["2", "3", "0", "1"]).to_string()
     }
@@ -1402,12 +1683,22 @@ impl Gen {
         if c.closed || c.no_params || c.no_lifetimes || pool.is_empty() || self.chance(15) {
             "'static".to_string()
         } else {
-            (*self.pick(&pool)).clone()
+            let lifetime = (*self.pick(&pool)).clone();
+            if !for_ref && sc.ref_only.contains(&lifetime) {
+                self.tags.insert(TAG_METHOD_LIFETIME.to_string());
+            }
+            lifetime
         }
     }
 
     /// A type of the standard library that hides a lifetime in its path (`hidden_lifetimes`).
     fn hidden_path(&mut self) -> &'static str {
+        // Without the primitive types allowed, `u8` is a relative path: `Iter<u8>` is leaked as
+        // an entry, and its hidden lifetime is the one that "is not seen" (the docs of the Leaker
+        // say to write `Iter<'_, u8>`).
+        if !self.cfg.primitive {
+            return "::core::str::Chars";
+        }
         self.pick(&["::core::str::Chars", "::core::slice::Iter<u8>"])
     }
 
@@ -1416,6 +1707,9 @@ impl Gen {
             return None;
         }
         let head = self.pick(&self.env.heads.clone()).clone();
+        if sc.shadowed(&head.name) {
+            return None;
+        }
         let inner = Con {
             sized: false,
             bounds: Bounds::default(),
@@ -1597,23 +1891,33 @@ impl Gen {
         let mut parts: Vec<Ty> = Vec::new();
         let (text, hr) = if self.chance(40) {
             // `for<'h> fn(&'h A, B) -> &'h R`: an input keeps `'h`.
-            let a = self.ty(sc, Con::unsized_ok().with_scope(c), depth + 1);
             let h = self.binder();
-            let mut args = vec![format!("&{} {}", h, paren(&a.text))];
-            parts.push(a);
-            // A type of the module with the lifetime of the binder: `Rl<'h>`.
-            if self.chance(40) {
-                let heads: Vec<String> = self
-                    .env
-                    .heads
-                    .iter()
-                    .filter(|head| head.shape == Shape::LOnly)
-                    .map(|head| head.name.clone())
-                    .collect();
-                if !heads.is_empty() {
-                    args.push(format!("{}<{}>", self.pick(&heads), h));
-                }
+            // A type of the module with the lifetime of the binder: `Rl<'h>`. Some have no input
+            // that keeps the lifetime (`for<'h> fn(A, Rl<'h>) -> &'h R`): the Leaker leaks the whole
+            // function pointer then.
+            let rl = self.binder_path(&h);
+            let unanchored = rl.is_some() && self.chance(30);
+            if unanchored {
+                // Leaked as a whole it is fine, but where the Leaker must split it (it names a
+                // lifetime of the method too) it is the error of a binder that no input keeps.
+                self.tags.insert(TAG_BINDER_NO_ANCHOR.to_string());
             }
+            let a = self.ty(
+                sc,
+                if unanchored {
+                    Con::sized().with_scope(c)
+                } else {
+                    Con::unsized_ok().with_scope(c)
+                },
+                depth + 1,
+            );
+            let mut args = vec![if unanchored {
+                a.text.clone()
+            } else {
+                format!("&{} {}", h, paren(&a.text))
+            }];
+            parts.push(a);
+            args.extend(rl);
             for _ in 0..n {
                 let t = self.ty(sc, arg, depth + 1);
                 args.push(t.text.clone());
@@ -1712,11 +2016,7 @@ impl Gen {
             2 | 3 => "dyn ::core::fmt::Debug".to_string(),
             4 | 5 => {
                 let f = *self.pick(&["Fn", "FnMut", "FnOnce"]);
-                let path = if self.cfg.prelude && self.bare() {
-                    f.to_string()
-                } else {
-                    format!("::core::ops::{}", f)
-                };
+                let path = self.trait_path(f);
                 let a = self.ty(sc, closed, depth + 1);
                 let r = self.ty(sc, closed, depth + 1);
                 let text = format!("dyn {}({}) -> {}", path, a.text, ret_paren(&r.text));
@@ -1725,11 +2025,7 @@ impl Gen {
                 text
             }
             6 => {
-                let path = if self.bare() {
-                    "Iterator"
-                } else {
-                    "::core::iter::Iterator"
-                };
+                let path = self.trait_path("Iterator");
                 let a = self.ty(sc, closed, depth + 1);
                 let text = format!("dyn {}<Item = {}>", path, a.text);
                 parts.push(a);
@@ -1740,9 +2036,21 @@ impl Gen {
                 let h = self.binder();
                 let a = self.ty(sc, closed, depth + 1);
                 let r = self.ty(sc, closed, depth + 1);
+                let fn_path = self.trait_path("Fn");
+                // The type of the module that names the binder's lifetime (`Rl<'h>`) next to the
+                // input that keeps it, or, with none, the whole object is leaked.
+                let rl = self.binder_path(&h);
+                let input = match &rl {
+                    Some(_) if self.chance(30) => {
+                        self.tags.insert(TAG_BINDER_NO_ANCHOR.to_string());
+                        a.text.clone()
+                    }
+                    _ => format!("&{h} {}", paren(&a.text)),
+                };
                 let text = format!(
-                    "dyn for<{h}> ::core::ops::Fn(&{h} {}) -> &{h} {}",
-                    paren(&a.text),
+                    "dyn for<{h}> {fn_path}({}{}) -> &{h} {}",
+                    input,
+                    rl.map_or(String::new(), |rl| format!(", {}", rl)),
                     ret_paren(&paren(&r.text))
                 );
                 parts.push(a);
@@ -1775,8 +2083,10 @@ impl Gen {
                 } else {
                     format!("&{}", paren(&a.text))
                 };
+                let fn_path = self.trait_path("Fn");
                 let text = format!(
-                    "dyn ::core::ops::Fn({}) -> &{}",
+                    "dyn {}({}) -> &{}",
+                    fn_path,
                     input,
                     ret_paren(&paren(&r.text))
                 );
@@ -1786,7 +2096,8 @@ impl Gen {
             }
         };
         let text = if self.chance(12) && !text.contains("Any") {
-            format!("{} + ::core::marker::Send", text)
+            let send = self.trait_path("Send");
+            format!("{} + {}", text, send)
         } else {
             text
         };
@@ -1835,6 +2146,10 @@ impl Gen {
                 };
                 if !outlives(sc, &obj, &lt, false, false) {
                     return None;
+                }
+                // The object takes the lifetime of the reference: a path that names it too.
+                if sc.ref_only.contains(&lt) {
+                    self.tags.insert(TAG_METHOD_LIFETIME.to_string());
                 }
                 let text = match &lt_bound {
                     Some(b) => format!("&{} ({})", lt, with_bound(&obj.text, b)),
@@ -1924,9 +2239,18 @@ impl Gen {
             }
             let mut bound_texts = Vec::new();
             if !sized {
-                bound_texts.push("?::core::marker::Sized".to_string());
+                bound_texts.push(self.maybe_sized());
+            } else if self.chance(7) {
+                bound_texts.push(self.trait_path("Sized"));
             }
             bound_texts.extend(self.bound_texts(bounds));
+            // A marker trait or a comparison (`Send`, `Copy`, `Ord`, ...), bare or in full.
+            if self.chance(14) {
+                let marker = *self.pick(MARKER_BOUNDS);
+                if sized || marker != "Copy" {
+                    bound_texts.push(self.trait_path(marker));
+                }
+            }
             let mut outlives_list = Vec::new();
             for l in &all_lts {
                 if self.chance(45) {
@@ -1947,11 +2271,7 @@ impl Gen {
                 });
             let mut fixed_item = 0;
             if iter {
-                let iterator = if self.bare() {
-                    "Iterator".to_string()
-                } else {
-                    "::core::iter::Iterator".to_string()
-                };
+                let iterator = self.trait_path("Iterator");
                 // `supertrait_item` and `alias_item` ask for an `Item` that is fixed.
                 if self.features.supertrait_item && self.chance(50) {
                     bound_texts.push(format!("::{}::base::BItem", self.cfg.krate));
@@ -1973,7 +2293,21 @@ impl Gen {
                 fixed_item,
             });
         }
+        // A const parameter may have the name of a type parameter that a sibling scope declares
+        // (`V` for an item, `Y` for a method), when no type parameter of this scope has it: the
+        // two kinds are different parameters, as the scopes are siblings. (Not a name that a
+        // module declares as a type, `SHADOW_NAMES`: a bare `T` in the arguments of a path would
+        // be that type, not the const.)
+        let alt = if n_ty < tys.len() {
+            tys.last().copied()
+        } else {
+            None
+        };
         for name in consts.iter().take(n_const) {
+            let name = match alt {
+                Some(alt) if self.chance(35) => alt,
+                _ => name,
+            };
             let ty = match self.below(100) {
                 0..=59 => "usize",
                 60..=74 => "bool",
@@ -1982,6 +2316,20 @@ impl Gen {
                 _ => "char",
             };
             sk.consts.push((name.to_string(), ty));
+        }
+        // A bound that names another parameter (`T: Into<V>`, `V` declared after or before it): a
+        // leaked type that uses `T` needs `V` in its generics too (`inline_into`).
+        if sk.tys.len() >= 2 && self.chance(20) {
+            let n = sk.tys.len();
+            let a = self.below(n);
+            let b = (a + 1 + self.below(n - 1)) % n;
+            if sk.tys[a].sized && sk.tys[b].sized {
+                let into = self.trait_path("Into");
+                let target = sk.tys[b].name.clone();
+                sk.tys[a].bound_texts.push(format!("{}<{}>", into, target));
+                let name = sk.tys[a].name.clone();
+                sk.bounded.push((name, "into"));
+            }
         }
         sk
     }
@@ -2027,9 +2375,7 @@ impl Gen {
             self.env.consts.retain(|c| crate_ok && c.starts_with("::"));
         }
         if self.module_mode {
-            let declared = |name: &str| {
-                name.starts_with('R') || name.starts_with("self::R") || name.starts_with("super::R")
-            };
+            let declared = is_declared;
             self.env.heads.retain(|h| !declared(&h.name));
             self.env.theads.retain(|h| !declared(&h.name));
             self.env.consts.retain(|c| !declared(c));
@@ -2046,15 +2392,15 @@ impl Gen {
             {
                 let p = self.pick(&sized_params).clone();
                 let (a, _) = self.pick(&sc.assoc).clone();
-                sk.preds
-                    .push(format!("{}: ::core::convert::Into<Self::{}>", p.name, a));
+                let into = self.trait_path("Into");
+                sk.preds.push(format!("{}: {}<Self::{}>", p.name, into, a));
+                self.tags.insert(TAG_BOUND_CYCLE.to_string());
                 continue;
             }
-            let kinds = if self.features.strict_cycles { 9 } else { 8 };
-            let pred = match self.below(kinds) {
+            let pred = match self.below(11) {
                 // `strict_cycles` asks for an optional entry in a predicate that names a
                 // lifetime: `T: Fn(&'a ::krate::base::B2<T, ::krate::base::B0>) -> u8`.
-                8 => {
+                8 if self.features.strict_cycles => {
                     let mut candidates: Vec<(TyParam, String)> = Vec::new();
                     for p in &sized_params {
                         for l in p.outlives.iter().filter(|l| *l != "'static") {
@@ -2070,10 +2416,30 @@ impl Gen {
                     }
                     bounded.push((p.name.clone(), "fn"));
                     let krate = self.cfg.krate.clone();
+                    let fn_path = self.trait_path("Fn");
                     format!(
-                        "{}: ::core::ops::Fn(&{} ::{}::base::B2<{}, ::{}::base::B0>) -> u8",
-                        p.name, lt, krate, p.name, krate
+                        "{}: {}(&{} ::{}::base::B2<{}, ::{}::base::B0>) -> u8",
+                        p.name, fn_path, lt, krate, p.name, krate
                     )
+                }
+                // A marker trait or a comparison on a parameter, bare or in full.
+                9 if !sc.tys.is_empty() => {
+                    let p = self.pick(&sc.tys).clone();
+                    let marker = *self.pick(MARKER_BOUNDS);
+                    if marker == "Copy" && !p.sized {
+                        continue;
+                    }
+                    format!("{}: {}", p.name, self.trait_path(marker))
+                }
+                // `T: From<A>`: a parameter has one, as it has one `Into`.
+                10 if !sized_params.is_empty() => {
+                    let p = self.pick(&sized_params).clone();
+                    if bounded.contains(&(p.name.clone(), "from")) {
+                        continue;
+                    }
+                    bounded.push((p.name.clone(), "from"));
+                    let a = self.ty(sc, sized, 1);
+                    format!("{}: {}<{}>", p.name, self.trait_path("From"), a.text)
                 }
                 0 if !sc.tys.is_empty() => {
                     let p = self.pick(&sc.tys).clone();
@@ -2095,12 +2461,12 @@ impl Gen {
                     }
                     bounded.push((p.name.clone(), "into"));
                     let a = self.ty(sc, sized, 1);
-                    format!("{}: ::core::convert::Into<{}>", p.name, a.text)
+                    format!("{}: {}<{}>", p.name, self.trait_path("Into"), a.text)
                 }
                 2 if !sc.tys.is_empty() => {
                     let p = self.pick(&sc.tys).clone();
                     let a = self.ty(sc, unsized_ok, 1);
-                    format!("{}: ::core::convert::AsRef<{}>", p.name, a.text)
+                    format!("{}: {}<{}>", p.name, self.trait_path("AsRef"), a.text)
                 }
                 3 if !sized_params.is_empty() => {
                     let p = self.pick(&sized_params).clone();
@@ -2118,7 +2484,12 @@ impl Gen {
                     let a = self.ty(sc, sized, 1);
                     self.no_self = outer_self;
                     self.no_assoc_paths = outer;
-                    format!("{}: ::core::iter::Iterator<Item = {}>", p.name, a.text)
+                    format!(
+                        "{}: {}<Item = {}>",
+                        p.name,
+                        self.trait_path("Iterator"),
+                        a.text
+                    )
                 }
                 4 if !sized_params.is_empty() => {
                     let p = self.pick(&sized_params).clone();
@@ -2133,7 +2504,14 @@ impl Gen {
                     } else {
                         ret_paren(&r.text)
                     };
-                    format!("{}: ::core::ops::Fn({}) -> {}", p.name, a.text, r)
+                    let family = self.fn_family();
+                    format!(
+                        "{}: {}({}) -> {}",
+                        p.name,
+                        self.trait_path(family),
+                        a.text,
+                        r
+                    )
                 }
                 5 if !sized_params.is_empty() => {
                     let h = self.binder();
@@ -2150,12 +2528,39 @@ impl Gen {
                     } else {
                         ret_paren(&r)
                     };
-                    format!(
-                        "{}: for<{h}> ::core::ops::Fn(&{h} {}) -> &{h} {}",
-                        p.name,
-                        paren(&a.text),
-                        r
-                    )
+                    let family = self.fn_family();
+                    let fn_path = self.trait_path(family);
+                    // `Rl<'h>`: a type of the module that names the binder's lifetime. With an
+                    // input that keeps it (`&'h A`) the bound is fine; without one it is the
+                    // binder lifetime that only a leaked type would keep, which the Leaker
+                    // rejects (E0581). The `Rl` is a relative type of the module, so both are
+                    // generated from the types the module has (`saved_env`, `preds()` filters the
+                    // environment of the bound).
+                    let rl = self.binder_path_in(&saved_env, &h);
+                    match (rl, self.below(100)) {
+                        (Some(rl), 0..=24) => {
+                            self.tags.insert(TAG_BINDER_NO_ANCHOR.to_string());
+                            format!(
+                                "{}: for<{h}> {}({}, {}) -> &{h} {}",
+                                p.name, fn_path, a.text, rl, r
+                            )
+                        }
+                        (Some(rl), 25..=49) => format!(
+                            "{}: for<{h}> {}(&{h} {}, {}) -> &{h} {}",
+                            p.name,
+                            fn_path,
+                            paren(&a.text),
+                            rl,
+                            r
+                        ),
+                        _ => format!(
+                            "{}: for<{h}> {}(&{h} {}) -> &{h} {}",
+                            p.name,
+                            fn_path,
+                            paren(&a.text),
+                            r
+                        ),
+                    }
                 }
                 6 => {
                     // A type with bounds it has: `Vec<T>: Debug`.
@@ -2205,14 +2610,13 @@ impl Gen {
                     bounded.push((x.clone(), "fn"));
                     bounded.push((x.clone(), "iter"));
                     let head = self.pick(&heads).clone();
+                    let (fn_path, iterator) = (self.trait_path("Fn"), self.trait_path("Iterator"));
                     sk.preds.push(format!(
-                        "{}: ::core::ops::Fn(<{} as ::core::iter::Iterator>::Item) -> u8",
-                        x, x
+                        "{}: {}(<{} as {}>::Item) -> u8",
+                        x, fn_path, x, iterator
                     ));
-                    sk.preds.push(format!(
-                        "{}: ::core::iter::Iterator<Item = ({}<{}>, u8)>",
-                        x, head, x
-                    ));
+                    sk.preds
+                        .push(format!("{}: {}<Item = ({}<{}>, u8)>", x, iterator, head, x));
                 }
             }
         } else {
@@ -2250,14 +2654,16 @@ impl Gen {
             let draw = state.finish();
             if level == Level::Item && !iters.is_empty() && draw % 100 < 40 {
                 let x = &iters[(draw / 100) as usize % iters.len()].name;
-                let item = format!("<{} as ::core::iter::Iterator>::Item", x);
-                let default = "::core::default::Default";
+                let iterator = self.trait_path("Iterator");
+                let item = format!("<{} as {}>::Item", x, iterator);
+                let default = self.trait_path("Default");
                 let pred = match (draw / 1000) % 4 {
                     0 => format!("::core::option::Option<{}>: {}", item, default),
                     1 => format!("::core::marker::PhantomData<{}>: {}", item, default),
-                    2 => format!("{}: ::core::marker::Sized", item),
+                    2 => format!("{}: {}", item, self.trait_path("Sized")),
                     _ => format!("::core::option::Option<({}, u8)>: {}", item, default),
                 };
+                self.tags.insert(TAG_BOUND_CYCLE.to_string());
                 sk.preds.push(pred);
             } else if level == Level::Method && self.cyclic && draw % 100 < 70 {
                 let heads: Vec<String> = self
@@ -2280,10 +2686,9 @@ impl Gen {
                         .clone();
                     let head = &heads[(draw / 1000) as usize % heads.len()];
                     bounded.push((x.clone(), "iter"));
-                    sk.preds.push(format!(
-                        "{}: ::core::iter::Iterator<Item = ({}<{}>, u8)>",
-                        x, head, x
-                    ));
+                    let iterator = self.trait_path("Iterator");
+                    sk.preds
+                        .push(format!("{}: {}<Item = ({}<{}>, u8)>", x, iterator, head, x));
                 }
             }
         } else {
@@ -2316,21 +2721,31 @@ impl Gen {
                 if !bounded.contains(&(x.name.clone(), "fn")) {
                     bounded.push((x.name.clone(), "fn"));
                     let head = self.pick(&heads).clone();
+                    let iterator = self.trait_path("Iterator");
                     let item = if x.fixed_item == 2 {
                         format!("::{}::base::BIt<{}>", self.cfg.krate, x.name)
                     } else {
-                        format!("<{} as ::core::iter::Iterator>::Item", x.name)
+                        format!("<{} as {}>::Item", x.name, iterator)
                     };
+                    let (fn_path, default) = (self.trait_path("Fn"), self.trait_path("Default"));
                     sk.preds
-                        .push(format!("{}: ::core::ops::Fn({}) -> u8", x.name, item));
-                    sk.preds
-                        .push(format!("{}<{}>: ::core::default::Default", head, x.name));
+                        .push(format!("{}: {}({}) -> u8", x.name, fn_path, item));
+                    sk.preds.push(format!("{}<{}>: {}", head, x.name, default));
                 }
             }
         }
         sk.bounded = bounded;
         self.env = saved_env;
         self.abs_only = saved_abs;
+        // A predicate that names `Self` in a bound (`T: AsRef<Option<Self>>`).
+        if sk.preds.iter().any(|p| names_self_in_bound(p)) {
+            self.tags.insert(TAG_SELF_IN_BOUNDS.to_string());
+        }
+        // Where the Leaker does not allow the primitive types, `u8` in a bound is a leaked type, and
+        // the types of the predicates that use the generics it bounds are in a cycle with it.
+        if !self.cfg.primitive && sk.preds.iter().any(|p| names_primitive(p)) {
+            self.tags.insert(TAG_BOUND_CYCLE.to_string());
+        }
     }
 
     /// Gives defaults to the trailing parameters of the generics of a struct, enum, union or
@@ -2360,8 +2775,17 @@ impl Gen {
                     || t.iter
                     || t.fixed_item != 0
                     || sk.bounded.iter().any(|(n, _)| n == name)
+                    || !t
+                        .bound_texts
+                        .iter()
+                        .all(|b| b.starts_with('\'') || b.starts_with("?"))
             };
-            !constrained && !sk.preds.iter().any(|p| has_word(p, name))
+            !constrained
+                && !sk.preds.iter().any(|p| has_word(p, name))
+                && !sk
+                    .tys
+                    .iter()
+                    .any(|t| t.bound_texts.iter().any(|b| has_word(b, name)))
         };
         let mut start = order.len();
         while start > 0 && free(sk, order[start - 1]) {
@@ -2373,6 +2797,7 @@ impl Gen {
         }
         let first = order.len() - self.range(1, candidates);
         let saved = std::mem::replace(&mut self.no_assoc_paths, true);
+        self.in_default = true;
         for &(is_const, i) in &order[first..] {
             if is_const {
                 let (name, ty) = sk.consts[i].clone();
@@ -2385,7 +2810,12 @@ impl Gen {
                     self.pick(&earlier).clone()
                 } else if ty == "usize" && !self.env.consts.is_empty() && self.chance(25) {
                     let consts = self.env.consts.clone();
-                    format!("{{ {} }}", self.pick(&consts))
+                    let constant = self.pick(&consts).clone();
+                    // A value in a const expression cannot be leaked: a relative one is rejected.
+                    if !constant.starts_with("::") {
+                        self.tags.insert(TAG_CONST_DEFAULT.to_string());
+                    }
+                    format!("{{ {} }}", constant)
                 } else {
                     self.const_literal(ty)
                 };
@@ -2397,7 +2827,12 @@ impl Gen {
                     tys: sk.tys[..i].to_vec(),
                     ..Default::default()
                 };
-                let sc = before.scope(&Scope::default());
+                let mut sc = before.scope(&Scope::default());
+                sc.reserved = sk.tys[i..]
+                    .iter()
+                    .map(|t| t.name.clone())
+                    .chain(sk.consts.iter().map(|(n, _)| n.clone()))
+                    .collect();
                 let declared = sk.tys[i].outlives.clone();
                 let mut text = None;
                 for attempt in 0..4 {
@@ -2424,6 +2859,7 @@ impl Gen {
                     .push((sk.tys[i].name.clone(), text.unwrap_or_else(|| "u8".into())));
             }
         }
+        self.in_default = false;
         self.no_assoc_paths = saved;
     }
 
@@ -2436,7 +2872,8 @@ impl Gen {
     /// and consts"): only a path of `base` is written with it.
     fn const_arg(&mut self, head: &str, len: &str, params: &[(String, &'static str)]) -> String {
         let braced = braced_path(len, params);
-        let bare_ok = !self.module_mode || head.contains("base::");
+        let bare_ok = (!self.module_mode || head.contains("base::"))
+            && (!head.starts_with("::") || self.features.bare_const_in_absolute_path);
         if braced != len && !len.contains("::") && bare_ok && self.chance(65) {
             len.to_string()
         } else {
@@ -2594,10 +3031,45 @@ impl Gen {
         self.ty(&inner, Con::sized(), 0)
     }
 
+    /// Methods whose generics are named alike, which are sibling scopes: `fn m<Y>(&self, a0: R1<Y>)`
+    /// next to `fn n<const Y: usize>(&self, a0: RC<u8, { Y }>)` (a type and a const parameter of
+    /// the same name), and `fn m<X>(&self, a0: R1<X>)` next to `fn n(&self, a0: R1<X>)`, where the
+    /// module declares a type `X` (a type named like a generic of a sibling).
+    fn clash_methods(&mut self) -> Vec<String> {
+        let heads = |g: &Gen, shape: Shape| -> Vec<String> {
+            g.env
+                .heads
+                .iter()
+                .filter(|h| h.shape == shape && !is_shadow_name(&h.name))
+                .map(|h| h.name.clone())
+                .collect()
+        };
+        let (t1, tc) = (heads(self, Shape::T1), heads(self, Shape::TC));
+        let mut methods = Vec::new();
+        if !t1.is_empty() && !tc.is_empty() {
+            let (a, b) = (self.pick(&t1).clone(), self.pick(&tc).clone());
+            let (n1, n2) = (self.name("m"), self.name("m"));
+            methods.push(format!("fn {}<Y>(&self, a0: {}<Y>)", n1, a));
+            methods.push(format!(
+                "fn {}<const Y: usize>(&self, a0: {}<u8, {{ Y }}>)",
+                n2, b
+            ));
+        }
+        let declares_x = self.env.heads.iter().any(|h| h.name == METHOD_SHADOW_NAME);
+        if !t1.is_empty() && declares_x {
+            let a = self.pick(&t1).clone();
+            let (n1, n2) = (self.name("m"), self.name("m"));
+            methods.push(format!("fn {}<X>(&self, a0: {}<X>)", n1, a));
+            methods.push(format!("fn {}(&self, a0: {}<X>)", n2, a));
+        }
+        methods
+    }
+
     /// The signature of a method with its where clause. `in_trait` is a method of a trait.
     fn method_sig(&mut self, outer: &Scope, name: &str, in_trait: bool) -> String {
         let sk = self.skeleton(Level::Method, outer, Bounds::default());
         let mut sc = sk.scope(outer);
+        sc.method = true;
         sc.ref_only.extend(sk.lifetimes.iter().cloned());
         sc.method_paths = self.features.method_lifetime_paths || !in_trait;
         // The receiver.
@@ -2646,6 +3118,7 @@ impl Gen {
         {
             let l = sk.lifetimes[sk.lifetimes.len() - 1].clone();
             pre_preds.push(format!("Self: {}", l));
+            self.tags.insert(TAG_SELF_IN_BOUNDS.to_string());
             sc.self_written.push(l.clone());
             sc.self_outlives.push(l);
         }
@@ -2763,10 +3236,11 @@ impl Gen {
                 };
                 let head = self.pick(&heads).clone();
                 sk.bounded.push((x.clone(), "fn"));
+                let fn_path = self.trait_path("Fn");
                 sk.preds
-                    .push(format!("{}: ::core::ops::Fn(&{}) -> u8", x, named));
-                sk.preds
-                    .push(format!("{}<{}>: ::core::default::Default", head, x));
+                    .push(format!("{}: {}(&{}) -> u8", x, fn_path, named));
+                let default = self.trait_path("Default");
+                sk.preds.push(format!("{}<{}>: {}", head, x, default));
             }
         }
         // `impl_trait_args` asks for an argument `impl Into<Rel<X>>` where `X` has a bound that
@@ -2782,15 +3256,14 @@ impl Gen {
             // In a module analyzed as a whole, a bound of an entry that names an item of the module
             // is the limitation F10, as in `preds()`.
             let module_mode = self.module_mode;
-            let declared = |name: &str| {
-                name.starts_with('R') || name.starts_with("self::R") || name.starts_with("super::R")
-            };
+            let declared = is_declared;
             let relative = |shape: Shape| -> Vec<String> {
                 self.env
                     .heads
                     .iter()
                     .filter(|head| head.shape == shape && !head.name.starts_with("::"))
                     .filter(|head| !(module_mode && declared(&head.name)))
+                    .filter(|head| !is_shadow_name(&head.name))
                     .map(|head| head.name.clone())
                     .collect()
             };
@@ -2801,13 +3274,16 @@ impl Gen {
                 let unit = self.pick(&units).clone();
                 let head = self.pick(&heads).clone();
                 sk.bounded.push((x.clone(), "fn"));
-                sk.preds
-                    .push(format!("{}: ::core::ops::Fn({}) -> u8", x, unit));
-                params.push(format!("ai: impl ::core::convert::Into<{}<{}>>", head, x));
+                let fn_path = self.trait_path("Fn");
+                sk.preds.push(format!("{}: {}({}) -> u8", x, fn_path, unit));
+                let into = self.trait_path("Into");
+                params.push(format!("ai: impl {}<{}<{}>>", into, head, x));
             }
         }
         if self_sized && outer.self_kind == SelfKind::MaybeUnsized {
-            sk.preds.push("Self: ::core::marker::Sized".to_string());
+            let sized = self.trait_path("Sized");
+            sk.preds.push(format!("Self: {}", sized));
+            self.tags.insert(TAG_SELF_IN_BOUNDS.to_string());
         }
         let sig = format!(
             "fn {}{}({}){}{}",
@@ -2971,6 +3447,18 @@ fn prune(sk: &Skeleton, ty: &Ty) -> Skeleton {
         .filter(|(n, _)| ty.consts.contains(n))
         .cloned()
         .collect();
+    // A bound that names a parameter that goes (`T: Into<V>`) goes too: the parameter is not
+    // constrained by the self type of an impl (E0207) and not used by an alias (E0091).
+    let dropped: Vec<String> = sk
+        .tys
+        .iter()
+        .map(|t| t.name.clone())
+        .filter(|name| !out.tys.iter().any(|t| &t.name == name))
+        .collect();
+    for t in &mut out.tys {
+        t.bound_texts
+            .retain(|b| !dropped.iter().any(|name| has_word(b, name)));
+    }
     out
 }
 
@@ -2990,22 +3478,30 @@ impl Gen {
         id
     }
 
-    fn attr(&self, id: usize, allow_self: bool, scope: &str) -> String {
+    fn attr(&self, id: usize, allow_self: bool, scope: &str, strict: bool) -> String {
         format!(
-            "#[{}(id = {}, allow_self = {}, prelude = {}, scope = \"{}\", allow = \"{}\")]\n",
+            "#[{}(id = {}, allow_self = {}, prelude = {}, scope = \"{}\", allow = \"{}\", \
+             strict = {}, primitive = {}, relaxed_sized = {})]\n",
             ATTR,
             id,
             allow_self,
             self.cfg.prelude,
             scope,
-            self.cfg.allow_arg()
+            self.cfg.allow_arg(),
+            strict,
+            self.cfg.primitive,
+            BARE_RELAXED_SIZED_ALWAYS_OK
         )
     }
 
-    /// The attribute of an item that is analyzed through `scope` (`""` for none).
+    /// The attribute of an item that is analyzed through `scope` (`""` for none). It says whether
+    /// the Referrer invokes the item as strict: the macro then writes the Repeater's impls of all
+    /// the entries, and of the required ones only otherwise.
     fn attr_with(&mut self, ann: Option<(usize, bool)>, scope: &'static str) -> String {
         self.last_scope = scope;
-        ann.map_or(String::new(), |(id, a)| self.attr(id, a, scope))
+        let strict = self.want_strict && self.strict_ok();
+        self.last_strict = strict;
+        ann.map_or(String::new(), |(id, a)| self.attr(id, a, scope, strict))
     }
 
     /// The names of the types available in the module `path`, and the `use`s that import some.
@@ -3062,6 +3558,21 @@ impl Gen {
                     env.theads.push(THead {
                         name,
                         shape: *shape,
+                    });
+                }
+            }
+        }
+        // The types named like the generics of an item or of a method, which the module declares.
+        if !self.module_mode || self.features.declared_named_like_generic {
+            for name in SHADOW_NAMES {
+                env.heads.push(Head {
+                    name: name.to_string(),
+                    shape: Shape::Unit,
+                });
+                if self.features.path_named_like_generic && self.chance(25) {
+                    env.heads.push(Head {
+                        name: format!("self::{}", name),
+                        shape: Shape::Unit,
                     });
                 }
             }
@@ -3251,6 +3762,7 @@ impl Gen {
         };
         let _ = kw;
         sk.risk_cycle = self.risk.cycle;
+        sk.tags = self.tags.clone();
         self.adts.push((name, sk));
         format!("{}{}\n", attr, text)
     }
@@ -3280,7 +3792,14 @@ impl Gen {
         let mut super_texts = self.bound_texts(supers);
         let explicit_sized = self.chance(8);
         if explicit_sized {
-            super_texts.push("::core::marker::Sized".to_string());
+            super_texts.push(self.trait_path("Sized"));
+        }
+        // A marker supertrait (`Send`, `Sync`, `Unpin`): the Referrer's host type has them, but an
+        // impl of the trait in the Leaker's crate would need the self type to have them too.
+        let marker_super = self.chance(12);
+        if marker_super {
+            let marker = *self.pick(&["Send", "Sync", "Unpin"]);
+            super_texts.push(self.trait_path(marker));
         }
         let self_sized = supers.clone || supers.default || explicit_sized;
         // Associated types.
@@ -3294,7 +3813,10 @@ impl Gen {
             };
             let mut texts = self.bound_texts(b);
             if self.chance(20) {
-                texts.push("::core::convert::Into<u32>".to_string());
+                texts.push(format!("{}<u32>", self.trait_path("Into")));
+                if !self.cfg.primitive {
+                    self.tags.insert(TAG_BOUND_CYCLE.to_string());
+                }
             }
             let n = format!("A{}", i);
             assoc_texts.push(if texts.is_empty() {
@@ -3372,6 +3894,9 @@ impl Gen {
             let m = self.name("m");
             methods.push(self.method_sig(&method_scope, &m, true));
         }
+        if self.chance(CLASH_PERCENT) {
+            methods.extend(self.clash_methods());
+        }
         if gat {
             let outer = self.pick(&sk.lifetimes).clone();
             sk.lifetimes.push("'c".to_string());
@@ -3445,6 +3970,7 @@ impl Gen {
             let params: Vec<String> = sk.tys.iter().map(|t| t.name.clone()).collect();
             sk.preds.iter().any(|p| names_leakable(p, &params))
         };
+        sk.tags = self.tags.clone();
         self.traits.push(TraitInfo {
             name,
             sk,
@@ -3453,6 +3979,7 @@ impl Gen {
             gat,
             gat_where,
             consts,
+            marker_super,
             uses_assoc_self: body.iter().any(|item| item.contains("Self::")),
             self_assoc_in_pred,
             preds_leakable,
@@ -3478,6 +4005,7 @@ impl Gen {
     ) -> Option<String> {
         let candidates: Vec<usize> = (0..self.traits.len())
             .filter(|&i| !self.traits[i].implemented)
+            .filter(|&i| !self.traits[i].marker_super)
             .filter(|&i| !self.traits[i].uses_assoc_self || self.features.impl_assoc_self)
             // `Self: 'x` (or the lifetime of a receiver) holds of the type of an impl only if it
             // is the function pointer that `fn_pointer_self` gives it, which has no parameter: a
@@ -3528,6 +4056,7 @@ impl Gen {
         let idx = *self.pick(&candidates);
         self.traits[idx].implemented = true;
         let tr = self.traits[idx].clone();
+        self.tags.extend(tr.sk.tags.iter().cloned());
         // The impl has the where clause and the methods of the trait.
         self.risk.cycle |= tr.risk.cycle;
         self.risk.anchor |= tr.risk.anchor;
@@ -3601,9 +4130,26 @@ impl Gen {
             self_ty = Ty::new("u8");
         }
         self.no_self = saved_no_self;
+        // An impl of a trait with associated types has a self type that no other one in the crate
+        // has (`[u8; 9]`, `[u8; 10]`, ...), or `Self::A0` is ambiguous.
+        let mut self_base = self_ty.text.clone();
+        if !tr.assoc.is_empty() {
+            let text = match &extra {
+                Some(e) => format!("({}, {})", self_base, e),
+                None => self_base.clone(),
+            };
+            if self.assoc_self_types.contains(&text) {
+                self_base = format!("[u8; {}]", 9 + self.assoc_self_types.len());
+            }
+            let text = match &extra {
+                Some(e) => format!("({}, {})", self_base, e),
+                None => self_base.clone(),
+            };
+            self.assoc_self_types.push(text);
+        }
         let self_text = match &extra {
-            Some(e) => format!("({}, {})", self_ty.text, e),
-            None => self_ty.text.clone(),
+            Some(e) => format!("({}, {})", self_base, e),
+            None => self_base,
         };
         self.self_prob = saved_prob;
 
@@ -3661,7 +4207,14 @@ impl Gen {
             .chain(self.env.theads.iter().map(|h| &h.name))
             .chain(self.env.consts.iter())
             .filter(|name| !name.starts_with("::"))
-            .any(|name| generics.contains(name.as_str()));
+            // (`T` is a word of any generics: whether it is the type or a parameter is not told.)
+            .any(|name| {
+                if is_shadow_name(name) {
+                    has_word(generics, name)
+                } else {
+                    generics.contains(name.as_str())
+                }
+            });
         if annotated && !relative && !generics.contains("Self") && self.chance(35) {
             "impl"
         } else {
@@ -3690,6 +4243,7 @@ impl Gen {
         let (sk, self_text) = if !adts.is_empty() && self.chance(55) {
             // An ADT of this module, with the generics it declares.
             let (name, sk) = self.pick(&adts).clone();
+            self.tags.extend(sk.tags.iter().cloned());
             self.risk.cycle |= sk.risk_cycle;
             let text = format!("{}{}", name, sk.args());
             (sk, text)
@@ -3711,7 +4265,9 @@ impl Gen {
             let saved_heads = self.env.heads.clone();
             let saved_consts = self.env.consts.clone();
             if own_only {
-                self.env.heads.retain(|h| h.name.starts_with('R'));
+                self.env
+                    .heads
+                    .retain(|h| h.name.starts_with('R') || is_shadow_name(&h.name));
                 // A constant of another module (`crate::base::BLEN`, `ILEN`) makes the whole self
                 // type an entry, which the copy replaces by a projection: an inherent impl on it
                 // is E0118 (a limitation, F11).
@@ -3751,6 +4307,11 @@ impl Gen {
                     .replace("(&'y self)", "(&self)");
             }
             body.push(format!("pub {} {{ loop {{}} }}", sig));
+        }
+        if self.chance(CLASH_PERCENT) {
+            for method in self.clash_methods() {
+                body.push(format!("pub {} {{ loop {{}} }}", method));
+            }
         }
         if self.chance(35) {
             let t = self.ty(&sc, Con::unsized_ok().indirect(), 1);
@@ -3806,6 +4367,9 @@ impl Gen {
         self.last_scope = "";
         if ann.is_some() {
             self.risk = Risk::default();
+            self.tags.clear();
+            self.want_strict = self.chance(25);
+            self.bare_percent = self.item_bare_percent();
         }
         // A quarter of the items may have predicates that name a leaked type with generics, and
         // those of a module analyzed as a whole only in some modules: a module is rejected with
@@ -3816,6 +4380,9 @@ impl Gen {
             (true, false) => 0,
         };
         self.cyclic = self.chance(cyclic_percent);
+        if self.cyclic && self.features.bound_cycles {
+            self.tags.insert(TAG_BOUND_CYCLE.to_string());
+        }
         let pick = self.below(100);
         let (kind, text): (&'static str, String) = match pick {
             0..=21 => ("struct", self.gen_adt(AdtKind::Struct, ann)),
@@ -3839,17 +4406,22 @@ impl Gen {
             }
             _ => ("struct", self.gen_adt(AdtKind::Struct, ann)),
         };
+        if text.contains("Self::") || text.contains("<Self as ") {
+            self.tags.insert(TAG_SELF_ASSOC.to_string());
+        }
+        if !allow_self && has_word(&text, "Self") {
+            self.tags.insert(TAG_SELF_DENIED.to_string());
+        }
         if let Some(id) = ann_id {
-            let want_strict = self.chance(25);
-            let strict = want_strict && self.strict_ok();
             self.items.push(Item {
                 id,
                 kind,
                 module: path.to_vec(),
-                strict,
+                strict: self.last_strict,
                 allow_self,
                 scope: self.last_scope,
                 contents: vec![kind],
+                tags: self.tags.clone(),
                 source: text.clone(),
             });
         } else {
@@ -3872,7 +4444,24 @@ impl Gen {
         let saved_adts = std::mem::take(&mut self.adts);
         let mut text = String::new();
         text += &uses;
-        text += &types_template("R");
+        // A module analyzed as a whole has the `?Sized` of its types in its bounds, bare or not.
+        let sized = if whole && self.bare_percent > 0 && self.chance(70) {
+            if !self.cfg.prelude && !BARE_RELAXED_SIZED_ALWAYS_OK {
+                self.tags.insert("bare:?Sized".to_string());
+            }
+            "?Sized"
+        } else {
+            "?::core::marker::Sized"
+        };
+        text += &types_template("R", sized);
+        if !whole || self.features.declared_named_like_generic {
+            for name in SHADOW_NAMES {
+                text += &format!(
+                    "#[derive(Debug, Clone, Copy, Default, PartialEq)] pub struct {};\n",
+                    name
+                );
+            }
+        }
         for _ in 0..items {
             text += &self.gen_one(path, whole);
         }
@@ -3900,7 +4489,7 @@ pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Feat
     lib += &format!("extern crate self as {};\n", krate);
     lib += "#[doc(hidden)]\npub use type_leak_test_macro as __macro;\n";
     lib += "type_leak_test_macro::define_repeater!(pub Repeater);\n";
-    let mut base = types_template("B");
+    let mut base = types_template("B", "?::core::marker::Sized");
     // The supertrait that fixes the `Item` of an iterator, and an alias of its projection
     // (`supertrait_item`, `alias_item`).
     if g.features.supertrait_item {
@@ -3930,18 +4519,21 @@ pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Feat
         g.cyclic_module = g.chance(CYCLIC_MODULE_PERCENT);
         g.contents.clear();
         g.risk = Risk::default();
+        g.tags.clear();
+        g.want_strict = g.chance(25);
+        g.bare_percent = g.module_bare_percent();
         let n = g.range(4, items_per_module);
         let nested = usize::from(g.chance(60));
         let body = g.gen_module_body(std::slice::from_ref(&name), true, n, nested);
         g.no_self = false;
         g.module_mode = false;
         g.cyclic_module = false;
-        let attr = g.attr(id, true, "");
+        let strict = g.want_strict && g.strict_ok();
+        let attr = g.attr(id, true, "", strict);
         let module = format!("{}pub mod {} {{\n{}\n}}\n", attr, name, body);
         lib += &module;
-        let want_strict = g.chance(25);
-        let strict = want_strict && g.strict_ok();
         let contents = std::mem::take(&mut g.contents);
+        let tags = std::mem::take(&mut g.tags);
         g.items.push(Item {
             id,
             kind: "mod",
@@ -3950,6 +4542,7 @@ pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Feat
             allow_self: true,
             scope: "",
             contents,
+            tags,
             source: module,
         });
     }
@@ -4008,6 +4601,15 @@ fn names_leakable(pred: &str, params: &[String]) -> bool {
         "marker",
         "Sized",
         "Send",
+        "Sync",
+        "Unpin",
+        "Copy",
+        "PartialEq",
+        "PartialOrd",
+        "Eq",
+        "Ord",
+        "From",
+        "cmp",
         "PhantomData",
         "option",
         "Option",
@@ -4069,6 +4671,7 @@ fn names_item(pred: &str, x: &str) -> bool {
 /// Whether the predicate `pred` equates the `Item` of the parameter `x` to a type.
 fn binds_item(pred: &str, x: &str) -> bool {
     pred.starts_with(&format!("{}: ::core::iter::Iterator<Item = ", x))
+        || pred.starts_with(&format!("{}: Iterator<Item = ", x))
 }
 
 /// Whether the where clause of `tr` names the `Item` of an iterator that a predicate of the trait or
@@ -4079,11 +4682,21 @@ fn item_bound_in_trait(tr: &TraitInfo) -> bool {
         tr.sk.preds.iter().any(|p| names_item(p, x))
             && (t.fixed_item != 0
                 || tr.sk.preds.iter().any(|p| binds_item(p, x))
-                || tr
-                    .methods
-                    .iter()
-                    .any(|m| m.contains(&format!("{}: ::core::iter::Iterator<Item = ", x))))
+                || tr.methods.iter().any(|m| {
+                    m.contains(&format!("{}: ::core::iter::Iterator<Item = ", x))
+                        || m.contains(&format!("{}: Iterator<Item = ", x))
+                }))
     })
+}
+
+/// Whether `text` names a primitive type.
+fn names_primitive(text: &str) -> bool {
+    [
+        "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+        "f32", "f64", "bool", "char", "str",
+    ]
+    .iter()
+    .any(|name| has_word(text, name))
 }
 
 /// Whether `text` has `name` as a word (an identifier).

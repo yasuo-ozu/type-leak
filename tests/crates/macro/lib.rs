@@ -31,6 +31,7 @@
 //! leaker::m::MyTrait!(impl<const B: bool> MyTrait<B> for Wrapper<B> => 0);
 //! ```
 
+mod bare;
 mod prop;
 mod scope;
 

@@ -8,8 +8,9 @@
 //! - the item itself,
 //! - the Repeater's implementation of each entry, next to the item (inside the module the entry is
 //!   keyed by, for a module),
-//! - a witness `pub fn __tl_w_17_<j><generics>() -> PhantomData<OriginalType>` for each type
-//!   position `j` of the item (a field, a parameter, a return type, ...), and
+//! - a witness `pub fn __tl_w_17_<j><generics>() -> PhantomData<*mut OriginalType>` for each type
+//!   position `j` of the item (a field, a parameter, a return type, ...; the `*mut` makes the types
+//!   invariant, so that a check compares them for equality and not as subtypes), and
 //! - the exported `macro_rules! __tl_prop_17`, which carries the serialized `Referrer`, the
 //!   `ContextId` and the item, and `__tl_report_17`, a report of the analysis.
 //!
@@ -19,7 +20,7 @@
 //!
 //! - the copy, for a struct, an enum, a union and a module,
 //! - an implementation of the trait for a host type, with the rewritten signatures, for a trait,
-//! - `fn __tl_chk_17_<j><generics>() -> PhantomData<RewrittenType> { path::__tl_w_17_<j>::<..>() }`
+//! - `fn __tl_chk_17_<j><generics>() -> PhantomData<*mut RewrittenType> { path::__tl_w_17_<j>::<..>() }`
 //!   for each type position, which compiles only if the rewritten type is exactly the original.
 //!
 //! The `Self` of a position is the type itself (a struct, an enum or a union), the self type (an
@@ -49,6 +50,18 @@ pub(crate) struct Args {
     /// How the item is analyzed: `""` by the `intern_*` method of its kind, or by a scope (see
     /// [`analyze()`]): `"mod"`, `"generics"`, `"trait"` or `"impl"`.
     scope: String,
+    /// The Referrer replaces the optional entries too (`allow_ambiguous_crate_name(false)`), so it
+    /// needs the Repeater's impl of every entry. A trusting Referrer needs those of the required
+    /// entries only, and that is all this macro emits then, as a downstream crate does. Not said:
+    /// the impls of all the entries, for any Referrer; the Referrer's invocation says which it is
+    /// (`strict`), and the two must agree if it is said.
+    strict: Option<bool>,
+    /// The Leaker allows the primitive types (`LeakerConfig::allow_primitive()`).
+    primitive: bool,
+    /// The expectation about a bare `?Sized` without the prelude: `true` if the Leaker accepts it
+    /// whatever the prelude (the `?` applies to the real `Sized` only), `false` if it is a relative
+    /// path like any other bare name of the prelude (`gen::BARE_RELAXED_SIZED_ALWAYS_OK`).
+    relaxed_sized: bool,
 }
 
 impl Parse for Args {
@@ -59,6 +72,9 @@ impl Parse for Args {
             prelude: false,
             allow: Vec::new(),
             scope: String::new(),
+            strict: None,
+            primitive: true,
+            relaxed_sized: false,
         };
         for kv in Punctuated::<MetaNameValue, Token![,]>::parse_terminated(input)? {
             let key = kv
@@ -75,6 +91,9 @@ impl Parse for Args {
                 ("allow_self", Lit::Bool(b)) => args.allow_self = b.value,
                 ("prelude", Lit::Bool(b)) => args.prelude = b.value,
                 ("scope", Lit::Str(s)) => args.scope = s.value(),
+                ("strict", Lit::Bool(b)) => args.strict = Some(b.value),
+                ("primitive", Lit::Bool(b)) => args.primitive = b.value,
+                ("relaxed_sized", Lit::Bool(b)) => args.relaxed_sized = b.value,
                 ("allow", Lit::Str(s)) => {
                     for path in s.value().split(',').filter(|p| !p.trim().is_empty()) {
                         args.allow.push(parse_str(path.trim())?);
@@ -90,6 +109,8 @@ impl Parse for Args {
 impl Args {
     fn tokens(&self) -> TokenStream {
         let (id, allow_self, prelude) = (self.id, self.allow_self, self.prelude);
+        let (primitive, relaxed_sized) = (self.primitive, self.relaxed_sized);
+        let strict = self.strict.map(|strict| quote!(strict = #strict,));
         let scope = &self.scope;
         let allow = self
             .allow
@@ -97,7 +118,7 @@ impl Args {
             .map(|p| quote!(#p).to_string().replace(' ', ""))
             .collect::<Vec<_>>()
             .join(",");
-        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow)
+        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict primitive = #primitive, relaxed_sized = #relaxed_sized)
     }
 }
 
@@ -137,7 +158,9 @@ fn analyze(
     args: &Args,
 ) -> std::result::Result<(Referrer, ContextId, TokenStream), NotInternableError> {
     let mut config = LeakerConfig::new();
-    config.allow_primitive();
+    if args.primitive {
+        config.allow_primitive();
+    }
     if args.prelude {
         config.allow_std_prelude();
     }
@@ -161,9 +184,7 @@ fn analyze(
         }
         ("generics", Item::Struct(i)) => {
             leaker
-                .enter_generics(&i.generics, |view| {
-                    syn::visit::visit_item_struct(view, i)
-                })?
+                .enter_generics(&i.generics, |view| syn::visit::visit_item_struct(view, i))?
                 .0
         }
         ("generics", Item::Enum(i)) => {
@@ -173,9 +194,7 @@ fn analyze(
         }
         ("generics", Item::Union(i)) => {
             leaker
-                .enter_generics(&i.generics, |view| {
-                    syn::visit::visit_item_union(view, i)
-                })?
+                .enter_generics(&i.generics, |view| syn::visit::visit_item_union(view, i))?
                 .0
         }
         ("trait", Item::Trait(i)) => {
@@ -237,14 +256,23 @@ fn type_with_params(name: &Ident, generics: &Generics) -> Type {
 // The Leaker's side: Repeater implementations.
 // ---------------------------------------------------------------------------------------------
 
+/// The impls with the path of the module each is written in.
+type Impls = Vec<(Vec<Ident>, TokenStream)>;
+
 /// The Repeater's implementation of each entry with the path of the module it is keyed by,
 /// relative to the analyzed module (`[]` for it and for the entries of no module).
-fn repeater_impls(referrer: &Referrer, id: u64) -> Result<Vec<(Vec<Ident>, TokenStream)>> {
+///
+/// An item that a trusting Referrer copies (`strict` is `false`) gets the implementations of the
+/// required entries only, as a downstream crate writes them (`Referrer::required()`): a Referrer
+/// that replaced an optional entry anyway fails to compile. A strict one gets all the entries.
+fn repeater_impls(referrer: &Referrer, id: u64, strict: bool) -> Result<(Impls, usize)> {
     let repeater: Path = parse_quote!(crate::Repeater);
     let slots = RepeaterSlots::new(repeater.clone());
     // For `Self` bounded by the trait, the implementation is for `__S` (the implementor).
     let self_param = ident("__S");
+    check_entry_helpers(referrer)?;
     let mut impls = Vec::new();
+    let mut skipped = 0;
     for ix in 0..referrer.iter().count() {
         crate::check_plain(referrer, ix, &slots)?;
         let r = referrer
@@ -252,6 +280,11 @@ fn repeater_impls(referrer: &Referrer, id: u64) -> Result<Vec<(Vec<Ident>, Token
                 slots.encode_const(value, &param.ty)
             })
             .map_err(Error::from)?;
+        check_impl_pieces(referrer, ix, &r, &self_param)?;
+        if !strict && !referrer.must(ix) {
+            skipped += 1;
+            continue;
+        }
         let module = r
             .module
             .and_then(|m| referrer.module_path(m))
@@ -268,7 +301,176 @@ fn repeater_impls(referrer: &Referrer, id: u64) -> Result<Vec<(Vec<Ident>, Token
             },
         ));
     }
-    Ok(impls)
+    Ok((impls, skipped))
+}
+
+fn helpers_disagree(what: String) -> Error {
+    Error::new(
+        Span::call_site(),
+        format!(
+            "HELPERS DISAGREE (the helpers of the Referrer are inconsistent): {}",
+            what
+        ),
+    )
+}
+
+/// The generics as text: the parameters and the where clause.
+fn generics_text(generics: &Generics) -> String {
+    let (params, where_clause) = (&generics.params, &generics.where_clause);
+    quote!(#params ; #where_clause).to_string()
+}
+
+/// The entries and their helpers agree: `required()` is the entries with `must()`, and they are the
+/// first ones; `generics(ix)` is the generics of the context of the entry, as
+/// `iter_with_generics()` has them, and the context is one of `contexts()`.
+fn check_entry_helpers(referrer: &Referrer) -> Result<()> {
+    let n = referrer.iter().count();
+    let musts: Vec<usize> = (0..n).filter(|&ix| referrer.must(ix)).collect();
+    let required: Vec<usize> = referrer.required().map(|(ix, _)| ix).collect();
+    if musts != required {
+        return Err(helpers_disagree(format!(
+            "`must()` holds for {:?} and `required()` has {:?}",
+            musts, required
+        )));
+    }
+    if musts != (0..musts.len()).collect::<Vec<_>>() {
+        return Err(helpers_disagree(format!(
+            "the required entries {:?} are not the first {} ones",
+            musts,
+            musts.len()
+        )));
+    }
+    if referrer.has_required() != !musts.is_empty() {
+        return Err(helpers_disagree(
+            "`has_required()` and `required()` differ".to_string(),
+        ));
+    }
+    if referrer.is_empty() != (n == 0) {
+        return Err(helpers_disagree(
+            "`is_empty()` and `iter()` differ".to_string(),
+        ));
+    }
+    for (ix, ty) in referrer.required() {
+        if referrer.iter().nth(ix) != Some(ty) {
+            return Err(helpers_disagree(format!(
+                "`required()` has another type than `iter()` at {}",
+                ix
+            )));
+        }
+    }
+    let contexts: Vec<ContextId> = referrer.contexts().collect();
+    let mut with_generics = referrer.iter_with_generics();
+    for (ix, ty) in referrer.iter().enumerate() {
+        let context = referrer.context(ix);
+        if !contexts.contains(&context) {
+            return Err(helpers_disagree(format!(
+                "the context of the entry {} is not in `contexts()`",
+                ix
+            )));
+        }
+        if generics_text(referrer.generics(ix)) != generics_text(referrer.context_generics(context))
+        {
+            return Err(helpers_disagree(format!(
+                "`generics({})` is not the `context_generics()` of its context",
+                ix
+            )));
+        }
+        match with_generics.next() {
+            Some((other, generics))
+                if other == ty
+                    && generics_text(generics) == generics_text(referrer.generics(ix)) => {}
+            _ => {
+                return Err(helpers_disagree(format!(
+                    "`iter_with_generics()` differs from `iter()` and `generics()` at {}",
+                    ix
+                )))
+            }
+        }
+    }
+    if with_generics.next().is_some() {
+        return Err(helpers_disagree(
+            "`iter_with_generics()` has more entries than `iter()`".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Normalizes the text of generics that the impl of an entry declares, or that
+/// `Referrer::impl_generics()` returns, so that the two can be compared: the implementor `__S`
+/// replaces `Self` (and `<__S>::A` is `Self::A`), and the parentheses that rustc needs around a
+/// first qualified path are dropped.
+fn impl_text(text: &str, self_param: &Ident) -> String {
+    text.replace(char::is_whitespace, "")
+        .replace(&self_param.to_string(), "Self")
+        .replace("<Self>::", "Self::")
+        .replace(['(', ')'], "")
+}
+
+/// Takes the last parameter off the generics. (They are collected again, so that no comma is left
+/// after the parameter before it.)
+fn implementor_param(generics: &mut Generics) -> Option<GenericParam> {
+    let mut params: Vec<GenericParam> = generics.params.iter().cloned().collect();
+    let last = params.pop();
+    generics.params = params.into_iter().collect();
+    last
+}
+
+/// The generics of the impl of an entry are `Referrer::impl_generics()` of its context, with the
+/// parameter of the implementor added (`__S: ?Sized`, and the trait for a `Self` that a trait
+/// bounds) unless the impl is for a type; its module is the context's.
+fn check_impl_pieces(
+    referrer: &Referrer,
+    ix: usize,
+    r: &RepeaterImpl,
+    self_param: &Ident,
+) -> Result<()> {
+    let context = referrer.context(ix);
+    let declared = referrer.impl_generics(context);
+    let mut got = r.generics.clone();
+    match referrer.context_self(context) {
+        Some(SelfRequirement::Type(_)) => (),
+        _ => match implementor_param(&mut got) {
+            Some(GenericParam::Type(t)) if t.ident == *self_param => {
+                let bounded_by_trait = matches!(
+                    referrer.context_self(context),
+                    Some(SelfRequirement::Bound(_))
+                );
+                // `?Sized`, and the trait of a `Self` that is bound by it.
+                if t.bounds.len() != 1 + usize::from(bounded_by_trait) {
+                    return Err(helpers_disagree(format!(
+                        "the parameter of the implementor of the entry {} has the bounds `{}`",
+                        ix,
+                        quote!(#t)
+                    )));
+                }
+            }
+            other => {
+                return Err(helpers_disagree(format!(
+                    "the impl of the entry {} does not end with the parameter `{}`: {}",
+                    ix,
+                    self_param,
+                    quote!(#other)
+                )))
+            }
+        },
+    }
+    if impl_text(&generics_text(&got), self_param)
+        != impl_text(&generics_text(&declared), self_param)
+    {
+        return Err(helpers_disagree(format!(
+            "the impl of the entry {} declares `{}` and `impl_generics()` is `{}`",
+            ix,
+            generics_text(&got),
+            generics_text(&declared)
+        )));
+    }
+    if r.module != referrer.context_module(context) {
+        return Err(helpers_disagree(format!(
+            "the impl of the entry {} has another module than `context_module()`",
+            ix
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -708,12 +910,25 @@ pub(crate) fn witness_fn(id: u64, j: usize, pos: &Position) -> TokenStream {
     let name = witness_name(id, j);
     let params = &generics.params;
     let where_clause = &generics.where_clause;
+    let invariant = invariant_in(ty);
     quote! {
         #[allow(non_snake_case, dead_code)]
-        pub fn #name<#params>() -> ::core::marker::PhantomData<#ty> #where_clause {
+        pub fn #name<#params>() -> ::core::marker::PhantomData<#invariant> #where_clause {
             ::core::marker::PhantomData
         }
     }
+}
+
+/// `*mut ty`: invariant in `ty`. `PhantomData<ty>` is covariant, so a Referrer's type with a
+/// shorter lifetime (`&'a u8` for `&'static u8`, `dyn X + 'a` for `+ 'static`) in a covariant
+/// position would pass for the original type. With `*mut`, the witness and the check compare the
+/// types for equality, lifetimes included: each fails if the other's type is not the same.
+pub(crate) fn invariant_in(mut ty: Type) -> Type {
+    // `*mut dyn A + B` is ambiguous.
+    if matches!(&ty, Type::TraitObject(object) if object.bounds.len() > 1) {
+        parenthesized(&mut ty);
+    }
+    parse_quote!(*mut #ty)
 }
 
 /// Finds the paths that are relative: they mean something else in another crate.
@@ -1282,6 +1497,59 @@ fn host_impl(
     }
 }
 
+/// Without `LeakerConfig::allow_primitive()`, `u8` is a relative path like any other (a module may
+/// declare its own `u8`): the type that has it is an entry, and the copy replaces it. A copy that
+/// keeps a primitive in a type position copies a name that means something else in the Referrer's
+/// crate, whatever it is equal to there.
+fn check_primitives_replaced(
+    copy: &Item,
+    original: &Item,
+    args: &Args,
+    host: Option<&Host>,
+) -> Result<()> {
+    if args.primitive {
+        return Ok(());
+    }
+    const PRIMITIVES: &[&str] = &[
+        "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+        "f32", "f64", "bool", "char", "str",
+    ];
+    /// A primitive type written as a path of one segment (not `str` of `::core::str::Chars`).
+    struct Primitive(Option<String>);
+    impl<'ast> Visit<'ast> for Primitive {
+        fn visit_type_path(&mut self, i: &'ast TypePath) {
+            if i.qself.is_none() && i.path.leading_colon.is_none() && i.path.segments.len() == 1 {
+                let ident = i.path.segments[0].ident.to_string();
+                if PRIMITIVES.contains(&ident.as_str()) {
+                    self.0 = Some(ident);
+                }
+            }
+            syn::visit::visit_type_path(self, i)
+        }
+    }
+    let original = collect_positions(original, None, &args.scope);
+    let copied = collect_positions(copy, host, &args.scope);
+    for (orig, pos) in original.iter().zip(&copied) {
+        if has_no_witness(orig) {
+            continue;
+        }
+        let ty = &pos.ty;
+        let text = quote!(#ty).to_string();
+        let mut found = Primitive(None);
+        found.visit_type(ty);
+        if let Some(name) = found.0 {
+            return Err(Error::new(
+                Span::call_site(),
+                format!(
+                    "PRIMITIVE KEPT: the copy keeps `{}` in the type `{}`, which the Leaker does not allow (primitive = false) and so leaks",
+                    name, text
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The type positions of the copy that can be checked, with their index.
 ///
 /// `item` is the original, and `copy` the rewritten item. A position with an elided lifetime has no
@@ -1333,7 +1601,13 @@ fn comparable(
         .collect()
 }
 
-pub(crate) fn check_fn(id: u64, j: usize, pos: &Position, target: &Path, host: Option<&Type>) -> TokenStream {
+pub(crate) fn check_fn(
+    id: u64,
+    j: usize,
+    pos: &Position,
+    target: &Path,
+    host: Option<&Type>,
+) -> TokenStream {
     let mut generics = merge_generics(&pos.layers);
     let mut ty = pos.ty.clone();
     if let Some(sub) = &pos.self_sub {
@@ -1366,7 +1640,9 @@ pub(crate) fn check_fn(id: u64, j: usize, pos: &Position, target: &Path, host: O
     path.segments
         .extend(pos.mods.iter().cloned().map(PathSegment::from));
     // The type is the result: like the parameter of a method, it gives the implied bounds (`T: 'a`
-    // for `&'a T`) that the original relies on.
+    // for `&'a T`) that the original relies on. It is under a `*mut` as the witness has it
+    // (`invariant_in()`), so the two types must be equal, not only one a subtype of the other.
+    let ty = invariant_in(ty);
     quote! {
         #[allow(non_snake_case, dead_code)]
         fn #name<#params>() -> ::core::marker::PhantomData<#ty> #where_clause {
@@ -1400,6 +1676,25 @@ fn dollar() -> Punct {
     Punct::new('$', Spacing::Alone)
 }
 
+/// The errors of a rejection (`__tl_errors_<id>!`, after the report): each is its message, the
+/// tokens it is about and its first note, which `\u{1f}` separates, and `\u{1d}` separates the
+/// errors.
+fn rejection_text(error: &NotInternableError) -> String {
+    let clean = |text: &str| -> String { text.replace(['\n', '|', '\u{1f}', '\u{1d}'], " ") };
+    error
+        .items()
+        .map(|item| {
+            format!(
+                "{}\u{1f}{}\u{1f}{}",
+                clean(&item.message),
+                clean(&item.tokens.to_string()),
+                clean(item.note().unwrap_or(""))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1d}")
+}
+
 /// `#[prop_leak(..)]`
 pub(crate) fn leak(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
     let args: Args = parse2(attr)?;
@@ -1407,14 +1702,27 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream) -> Result<TokenStream> 
     let id = args.id;
     let kind = kind_name(&original);
     let report_name = ident(&format!("__tl_report_{}", id));
+    let errors_name = ident(&format!("__tl_errors_{}", id));
     let mac_name = ident(&format!("__tl_prop_{}", id));
     let dollar = dollar();
-    let (referrer, context, assertions) = match analyze(&original, &args) {
+    let analysis = analyze(&original, &args);
+    // The bare spelling of a trait of the prelude: its twin in full gives the same entries if the
+    // names of the prelude are allowed, and it is a relative path if they are not.
+    let twin = crate::bare::check(
+        &original,
+        args.scope == "impl",
+        args.prelude,
+        args.relaxed_sized,
+        &analysis,
+        |twin| analyze(twin, &args),
+    )?;
+    let (referrer, context, assertions) = match analysis {
         Ok(result) => result,
         Err(e) => {
             // The item is not leaked: the Leaker's crate still has it.
             let reason = e.to_string().replace(['\n', '|'], " ");
             let report = format!("{}|{}|rej|{}", id, kind, reason);
+            let errors = rejection_text(&e);
             return Ok(quote! {
                 #original
                 #[doc(hidden)]
@@ -1422,12 +1730,15 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream) -> Result<TokenStream> 
                 macro_rules! #report_name { () => { #report }; }
                 #[doc(hidden)]
                 #[macro_export]
+                macro_rules! #errors_name { () => { #errors }; }
+                #[doc(hidden)]
+                #[macro_export]
                 macro_rules! #mac_name { (#dollar(#dollar t:tt)*) => {}; }
             });
         }
     };
 
-    let impls = repeater_impls(&referrer, id)?;
+    let (impls, skipped) = repeater_impls(&referrer, id, args.strict.unwrap_or(true))?;
     let positions = collect_positions(&original, None, &args.scope);
     let witnesses: Vec<(Vec<Ident>, TokenStream)> = positions
         .iter()
@@ -1438,17 +1749,25 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream) -> Result<TokenStream> 
 
     // Count what the Referrer will check, by rewriting a copy here too.
     let dummy: Path = parse_quote!(::__dummy);
-    let report = match rewrite(&referrer, context, &original, &args, &dummy, false) {
+    let counted = if args.strict == Some(true) {
+        referrer.clone().allow_ambiguous_crate_name(false)
+    } else {
+        referrer.clone()
+    };
+    let report = match rewrite(&counted, context, &original, &args, &dummy, false) {
         Ok(rewritten) => {
             let host = host_arg(&rewritten, &args, &dummy);
+            check_primitives_replaced(&rewritten.item, &original, &args, host.as_ref())?;
             let rewritten_positions = comparable(&rewritten.item, &original, &args, host.as_ref());
             format!(
-                "{}|{}|ok|entries={} positions={} checked={}",
+                "{}|{}|ok|entries={} positions={} checked={} skipped={} twin={}",
                 id,
                 kind,
                 referrer.iter().count(),
                 positions.len(),
-                rewritten_positions.len()
+                rewritten_positions.len(),
+                skipped,
+                u8::from(twin)
             )
         }
         Err(e) => format!(
@@ -1496,6 +1815,9 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream) -> Result<TokenStream> 
         #[doc(hidden)]
         #[macro_export]
         macro_rules! #report_name { () => { #report }; }
+        #[doc(hidden)]
+        #[macro_export]
+        macro_rules! #errors_name { () => { "" }; }
         #[doc(hidden)]
         #[macro_export]
         macro_rules! #mac_name {
@@ -1587,6 +1909,12 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         dyn_host,
     } = parse2(input)?;
     // `strict` makes the Referrer replace the optional entries as well.
+    if args.strict.is_some_and(|said| said != strict) {
+        return Err(Error::new(
+            Span::call_site(),
+            "test macro: the item is invoked with another `strict` than the one it was analyzed for",
+        ));
+    }
     let referrer = if strict {
         referrer.allow_ambiguous_crate_name(false)
     } else {
