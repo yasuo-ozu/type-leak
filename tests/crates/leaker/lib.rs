@@ -1249,6 +1249,39 @@ pub mod kinds {
     where
         Self: Sized;
 
+    // The entry for any type is the last field of a struct, or a field of an enum. The Repeater's
+    // impl is `?Sized` where the bounds do not need `Self: Sized`: with `Sized`, rustc before 1.70
+    // cannot prove that the copy is `Sized` (E0275, `Last<T>: Sized` needs the impl, which needs
+    // the type to be `Sized`), which shows on those toolchains only.
+
+    /// The bound is `AsRef<Self>`: the impl is `?Sized`, the entry is the last field.
+    #[prop_leak(id = 9125, allow_self = true, scope = "mod")]
+    pub struct Last<T: ::core::convert::AsRef<Self>> {
+        pub rel: Rel,
+        pub wrapped: Wrap<T>,
+    }
+
+    /// An enum: its variants are checked as fields (on rustc 1.56 too).
+    #[prop_leak(id = 9126, allow_self = true, scope = "mod")]
+    pub enum Alternative<T: ::core::convert::AsRef<Self>> {
+        Plain(u8),
+        Wrapped(Wrap<T>),
+    }
+
+    /// `Self` is behind a `Box`, and the argument of `Borrow`: still `?Sized`.
+    #[prop_leak(id = 9127, allow_self = true, scope = "mod")]
+    pub struct Pointed<
+        T: ::core::convert::AsRef<::std::boxed::Box<Self>> + ::core::borrow::Borrow<Self>,
+    >(pub u8, pub Wrap<T>);
+
+    /// `Self` in a tuple: the impl keeps `Sized` (the tuple needs it), the entry is not the last
+    /// field.
+    #[prop_leak(id = 9128, allow_self = true, scope = "mod")]
+    pub struct Tupled<T: ::core::convert::AsRef<(Self, u8)>> {
+        pub wrapped: Wrap<T>,
+        pub tag: u8,
+    }
+
     // Items nested in a module that name their own `Self` in an absolute type of a crate that both
     // crates have (`::type_leak_test_leaker`, `::std`). Such a type is no entry: it is copied as
     // written, and `Self` in it is the copy's own type, also for a Referrer that replaces the

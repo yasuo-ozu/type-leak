@@ -168,7 +168,7 @@ impl Scope {
 /// }
 /// // `Rel<T>` in `struct MyStruct<T: AsRef<Self>>` nested in a module: for any type that the
 /// // bound holds for, which the copy's own `MyStruct<T>` is
-/// impl<T: AsRef<__S>, __S> path::Repeater<(T,), 42, 4> for __S {
+/// impl<T: AsRef<__S>, __S: ?Sized> path::Repeater<(T,), 42, 4> for __S {
 ///     type Type = path::Rel<T>;
 /// }
 /// ```
@@ -212,11 +212,27 @@ pub enum SelfRequirement {
     ///
     /// In the impl, `Self` is a type parameter (`__S`) that replaces `Self` in the bounds, as
     /// [`Referrer::repeater_impl()`](crate::Referrer::repeater_impl) does with
-    /// [`ImplSelf::Param`](crate::ImplSelf::Param), and it has no bound of its own. In particular
-    /// it is `Sized`, as the `Self` of a struct, an enum or a union is, and the bounds may need it
-    /// (`(Self, u8)`, `Vec<Self>`); a struct with an unsized last field is not supported. It is
-    /// not an option for [`ImplSelf::Marker`](crate::ImplSelf::Marker): a marker is not what the
-    /// copy has the bound for ([`EncodeError::NeedsSelf`](crate::EncodeError::NeedsSelf)).
+    /// [`ImplSelf::Param`](crate::ImplSelf::Param), and it has no trait bound of its own. It is
+    /// `?Sized`, unless a bound may need it `Sized`, as the `Self` of a struct, an enum or a union
+    /// is: `(Self, u8)`, `Vec<Self>`, `[Self]`, `Tr<Self>` for a trait of the user, an associated
+    /// type, an argument of an `Fn`. A bound needs none where `Self` is the whole argument of a
+    /// trait or type of `core` or `std` with a `?Sized` parameter (`AsRef<Self>`, `AsMut`,
+    /// `Borrow`, `BorrowMut`, `PartialEq`, `PartialOrd`, `Box`, `Rc`, `Arc`, `PhantomData`), or is
+    /// behind a reference or a pointer. A struct with an unsized last field is not supported.
+    /// It is not an option for [`ImplSelf::Marker`](crate::ImplSelf::Marker): a marker is not what
+    /// the copy has the bound for ([`EncodeError::NeedsSelf`](crate::EncodeError::NeedsSelf)).
+    ///
+    /// # rustc before 1.70
+    ///
+    /// If the impl keeps `Sized`, rustc 1.56 to 1.66 (1.67 to 1.69 untested) fails with E0275
+    /// ("overflow evaluating the requirement `S<T>: Sized`") for a struct whose last field is the
+    /// path through the impl (`<Self as Repeater<..>>::Type`), and for an enum on 1.56: the type
+    /// needs the impl to be `Sized`, and the impl needs the type to be. Newer compilers prove it.
+    /// The ways out are to put the field first (not the last one of a struct), to add `where Self:
+    /// Sized` to the item, to write the type with an absolute path that both crates resolve (a
+    /// Referrer that trusts the names of the crates copies it as written, see
+    /// [`Referrer::allow_ambiguous_crate_name()`](crate::Referrer::allow_ambiguous_crate_name)),
+    /// or to use a bound that needs no `Sized`, where the impl is `?Sized`.
     Any,
 }
 

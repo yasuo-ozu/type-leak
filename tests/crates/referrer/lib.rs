@@ -172,6 +172,12 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9118!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9119!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9120!(path = ::type_leak_test_leaker::kinds);
+    // The entry is the last field of a struct, or a field of an enum: the impl is `?Sized` unless
+    // a bound needs `Self: Sized` (9128).
+    type_leak_test_leaker::__tl_prop_9125!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9126!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9127!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9128!(path = ::type_leak_test_leaker::kinds);
     // An absolute type that names their own `Self` is copied as written, by a strict Referrer too.
     type_leak_test_leaker::__tl_prop_9121!(path = ::type_leak_test_leaker::kinds, strict);
     type_leak_test_leaker::__tl_prop_9122!(path = ::type_leak_test_leaker::kinds, strict);

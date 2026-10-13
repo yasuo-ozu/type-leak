@@ -529,6 +529,29 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9120, __tl_report_9120!()),
             ok("struct", 1, 2, 2),
         ),
+        // the entry for any type is the last field of a struct or a field of an enum, with a bound
+        // that needs no `Sized` (9125 to 9127) or that does (9128): the Repeater's impl is
+        // `?Sized` in the first case only
+        (
+            9125,
+            reported(9125, __tl_report_9125!()),
+            ok("struct", 2, 2, 2),
+        ),
+        (
+            9126,
+            reported(9126, __tl_report_9126!()),
+            ok("enum", 1, 2, 2),
+        ),
+        (
+            9127,
+            reported(9127, __tl_report_9127!()),
+            ok("struct", 1, 2, 2),
+        ),
+        (
+            9128,
+            reported(9128, __tl_report_9128!()),
+            ok("struct", 1, 2, 2),
+        ),
         // an absolute type that names their own `Self` is no entry (the copy has it as written);
         // the relative types beside it are
         (

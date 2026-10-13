@@ -7521,8 +7521,8 @@ fn f37_rejected() -> Vec<(Item, &'static str, &'static str)> {
 /// The fix: the `Self` in the bounds of the generics is the `Self` of the item that declares them.
 /// The type of the entry does not name it, so it does not depend on which type it is, and the entry
 /// is for any type that the bound holds for (`SelfRequirement::Any`): the Repeater's impl is `impl<T:
-/// AsRef<__S>, __S> Repeater<(T,), ID, 0> for __S { type Type = Rel<T>; }`, and the copy passes
-/// its own type (`<Self as Repeater<(T,), ID, 0>>::Type`), for which it has the bound. The leaked
+/// AsRef<__S>, __S: ?Sized> Repeater<(T,), ID, 0> for __S { type Type = Rel<T>; }`, and the copy
+/// passes its own type (`<Self as Repeater<(T,), ID, 0>>::Type`), for which it has the bound. The leaked
 /// type `Rel<T>` is the Leaker's. The item analyzed as itself (`intern_*`) is as before: its impl
 /// is for the Leaker's type.
 ///
@@ -7554,11 +7554,19 @@ fn f37_nested_type_with_a_bound_that_names_its_own_self_is_supported() {
                 what
             );
             // Its impl is for a type parameter with no bound of its own (`Self` is a struct, an
-            // enum or a union), and the parameter replaces `Self` in the bound.
+            // enum or a union), and the parameter replaces `Self` in the bound. It is `Sized`
+            // where a bound needs it (`(Self, u8)`), else `?Sized`: see
+            // `f37_the_impl_is_sized_only_where_the_bounds_need_it`.
             let r = referrer.repeater_impl(ix, ImplSelf::Param(&param)).unwrap();
             assert_eq!(r.self_ty, parse_quote!(__S), "{}", what);
             let last = r.generics.params.last().unwrap();
-            assert_eq!(last, &parse_quote!(__S), "{}", what);
+            let needs_sized = string(item).contains("(Self");
+            let expected: GenericParam = if needs_sized {
+                parse_quote!(__S)
+            } else {
+                parse_quote!(__S: ?::core::marker::Sized)
+            };
+            assert_eq!(last, &expected, "{}", what);
             let generics = string(&r.generics);
             assert!(!generics.contains("Self"), "{}: {}", what, generics);
             assert!(generics.contains("__S"), "{}: {}", what, generics);
@@ -7586,6 +7594,219 @@ fn f37_nested_type_with_a_bound_that_names_its_own_self_is_supported() {
             );
         }
     }
+}
+
+/// F37: the Repeater's impl of an entry that is for any type (`SelfRequirement::Any`) declares its
+/// parameter `__S` with `?Sized` unless a bound needs it `Sized`. The copy of a struct whose last
+/// field is the path through the impl (`struct S<T: AsRef<Self>> { a: u8, b: <Self as
+/// Repeater<..>>::Type }`) is E0275 on rustc 1.56 to 1.66 ("overflow evaluating the requirement
+/// `S<T>: Sized`") if the impl needs `__S: Sized`: the type needs the impl, which needs the type to
+/// be `Sized`. (In an enum too on 1.56.) The impl is well-formed without `Sized` if every `__S` of
+/// the bounds is a whole type argument of a std trait or type with a `?Sized` parameter
+/// (`AsRef<__S>`, `Box<__S>`), or behind a reference or a pointer. Any other use may need `Sized`
+/// (a tuple element, a slice, a type or trait of the user, an associated type), and keeps it: on
+/// rustc before 1.70, an item with such a bound and the entry in its last field is still E0275, and
+/// the ways out are the entry in another field, `where Self: Sized` on the item, or an absolute
+/// path for the type of the entry (copied as written, by a Referrer that trusts the names of the
+/// crates). The cross-crate test has these shapes (9111, 9125 to 9128); the bug itself shows
+/// on a rustc before 1.70 only.
+#[test]
+fn f37_the_impl_is_sized_only_where_the_bounds_need_it() {
+    // Every `Self` in the bounds is a whole argument of a trait or type with a `?Sized` parameter,
+    // or behind a reference or a pointer.
+    let unsized_ok: Vec<Item> = vec![
+        parse_quote!(
+            pub struct S<T: ::core::convert::AsRef<Self>> {
+                a: u8,
+                b: Rel<T>,
+            }
+        ),
+        parse_quote!(
+            pub struct S<T: AsRef<Self>> {
+                a: u8,
+                b: Rel<T>,
+            }
+        ),
+        parse_quote!(
+            pub struct S<T>(u8, Rel<T>)
+            where
+                T: ::core::convert::AsMut<Self>;
+        ),
+        parse_quote!(
+            pub struct S<T: ::core::borrow::Borrow<Self> + ::core::borrow::BorrowMut<Self>>(
+                u8,
+                Rel<T>,
+            );
+        ),
+        parse_quote!(
+            pub struct S<T: PartialEq<Self> + ::core::cmp::PartialOrd<Self>>(u8, Rel<T>);
+        ),
+        parse_quote!(
+            pub enum S<T: ::core::convert::AsRef<Box<Self>>> {
+                A(u8),
+                B(Rel<T>),
+            }
+        ),
+        parse_quote!(
+            pub enum S<T: ::core::convert::AsRef<::std::rc::Rc<Self>>> {
+                A(u8),
+                B(Rel<T>),
+            }
+        ),
+        parse_quote!(
+            pub struct S<T: ::core::convert::AsRef<::std::sync::Arc<Self>>>(u8, Rel<T>);
+        ),
+        parse_quote!(
+            pub struct S<T: ::core::convert::AsRef<::core::marker::PhantomData<Self>>>(u8, Rel<T>);
+        ),
+        parse_quote!(
+            pub struct S<T: ::core::convert::AsRef<*const Self> + ::core::convert::AsRef<*mut Self>>(
+                u8,
+                Rel<T>,
+            );
+        ),
+        parse_quote!(
+            pub struct S<T: ::core::convert::AsRef<&'static Self>>(u8, Rel<T>);
+        ),
+        // The bound of another generic, and a predicate on `Self` that is not `Sized`.
+        parse_quote!(
+            pub struct S<T: ::core::convert::AsRef<Self>, U: ::core::borrow::Borrow<Self>>(
+                u8,
+                Rel<T>,
+                U,
+            )
+            where
+                Self: 'static;
+        ),
+        parse_quote!(
+            pub union S<T: ::core::marker::Copy + ::core::convert::AsRef<Self>> {
+                a: ::core::mem::ManuallyDrop<Rel<T>>,
+                b: u8,
+            }
+        ),
+    ];
+    // Some use of `Self` may need `Sized`: it stays.
+    let sized: Vec<Item> = vec![
+        parse_quote!(
+            pub struct S<T: ::core::convert::AsRef<(Self, u8)>> {
+                a: u8,
+                b: Rel<T>,
+            }
+        ),
+        parse_quote!(
+            pub struct S<T: ::core::convert::AsRef<(u8, Self)>> {
+                a: u8,
+                b: Rel<T>,
+            }
+        ),
+        parse_quote!(
+            pub struct S<T>(u8, Rel<T>)
+            where
+                T: ::core::convert::AsRef<Vec<Self>>;
+        ),
+        parse_quote!(
+            pub struct S<T: ::core::convert::AsRef<Option<Self>>>(u8, Rel<T>);
+        ),
+        parse_quote!(
+            pub struct S<T: ::core::convert::AsRef<[Self]>>(u8, Rel<T>);
+        ),
+        parse_quote!(
+            pub struct S<T: ::core::convert::AsRef<[Self; 2]>>(u8, Rel<T>);
+        ),
+        parse_quote!(
+            pub struct S<T: ::core::iter::Iterator<Item = Self>>(u8, Rel<T>);
+        ),
+        parse_quote!(
+            pub struct S<T: ::core::ops::Fn(Self)>(u8, Rel<T>);
+        ),
+        // A trait of the user: its parameter is `Sized`.
+        parse_quote!(
+            pub struct S<T: ::p::Tr<Self>>(u8, Rel<T>);
+        ),
+        // A trait of std whose parameter is `Sized`.
+        parse_quote!(
+            pub struct S<T: ::core::convert::From<Self>>(u8, Rel<T>);
+        ),
+        // A bound that needs `Sized` next to one that does not.
+        parse_quote!(
+            pub struct S<T: ::core::convert::AsRef<Self> + ::core::convert::AsRef<(Self, u8)>>(
+                u8,
+                Rel<T>,
+            );
+        ),
+        // `Self` is `Sized` by a predicate.
+        parse_quote!(
+            pub struct S<T: ::core::convert::AsRef<Self>>(u8, Rel<T>)
+            where
+                Self: ::core::marker::Sized;
+        ),
+    ];
+    let param: Ident = parse_quote!(__S);
+    let unsized_param: GenericParam = parse_quote!(__S: ?::core::marker::Sized);
+    let sized_param: GenericParam = parse_quote!(__S);
+    for (items, expected, what) in [
+        (&unsized_ok, &unsized_param, "?Sized"),
+        (&sized, &sized_param, "Sized"),
+    ] {
+        for item in items {
+            for nest in NESTS {
+                let (leaker, result) = nested_analysis(nest, item, &["S"]);
+                if let Err(err) = result {
+                    panic!("{:?} `{}` is rejected: {}", nest, string(item), err);
+                }
+                let referrer = leaker.finish();
+                let ix = referrer
+                    .iter()
+                    .position(|t| string(t) == "Rel < T >")
+                    .unwrap_or_else(|| panic!("{:?} `{}`: no entry", nest, string(item)));
+                assert!(
+                    matches!(
+                        referrer.context_self(referrer.context(ix)),
+                        Some(SelfRequirement::Any)
+                    ),
+                    "{:?} `{}`",
+                    nest,
+                    string(item)
+                );
+                let r = referrer.repeater_impl(ix, ImplSelf::Param(&param)).unwrap();
+                assert_eq!(
+                    r.generics.params.last().unwrap(),
+                    expected,
+                    "{} expected, {:?} `{}`: {}",
+                    what,
+                    nest,
+                    string(item),
+                    string(&r.generics)
+                );
+            }
+        }
+    }
+    // The impl as a whole.
+    let item: Item = parse_quote!(
+        pub struct S<T: ::core::convert::AsRef<Self>> {
+            a: u8,
+            b: Rel<T>,
+        }
+    );
+    let (leaker, result) = nested_analysis(Nest::EnterMod, &item, &["S"]);
+    result.unwrap();
+    let referrer = leaker.finish();
+    let r = referrer.repeater_impl(0, ImplSelf::Param(&param)).unwrap();
+    let (impl_generics, _, where_clause) = r.generics.split_for_impl();
+    let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+    let imp: ItemImpl = parse_quote! {
+        impl #impl_generics crate::Repeater<#args, 7u64, 0usize> for #self_ty #where_clause {
+            type Type = #ty;
+        }
+    };
+    let expected: ItemImpl = parse_quote! {
+        impl<T: ::core::convert::AsRef<__S>, __S: ?::core::marker::Sized>
+            crate::Repeater<(T,), 7u64, 0usize> for __S
+        {
+            type Type = Rel<T>;
+        }
+    };
+    assert_eq!(imp, expected);
 }
 
 /// F37: the copy of such an item. The Visitor finds the entry in the copy of the nested item and

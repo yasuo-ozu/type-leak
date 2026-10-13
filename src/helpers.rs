@@ -58,10 +58,16 @@ pub enum ImplSelf<'a> {
     /// [`context_self()`](Referrer::context_self) of the entry is [`SelfRequirement::Bound`], the
     /// parameter has the bound of the trait (`__S: ?Sized + Tr<T>`) and replaces `Self`, as
     /// [`Referrer::iter_with_self()`] does. If it is [`SelfRequirement::Any`], the parameter
-    /// replaces `Self` in the bounds, and has no bound of its own, not even `?Sized`: the `Self`
-    /// is a struct, an enum or a union, which is `Sized` (`__S`, so that `(Self, u8)` in a bound
-    /// is well-formed). If it is [`SelfRequirement::Type`], the impl is for that type, with `Self`
-    /// as written, and no parameter is declared.
+    /// replaces `Self` in the bounds, and has no bound of its own. The `Self` is a struct, an enum
+    /// or a union, which is `Sized`, and a bound may need it (`(Self, u8)`, `Vec<Self>`): then the
+    /// parameter is `__S`, `Sized` as any. Else it is `?Sized`, as for the others (`__S:
+    /// ?Sized`): rustc before 1.70 cannot prove that a struct is `Sized` if its last field is the
+    /// path through an impl that needs `__S: Sized` (E0275). The bounds do not need it if every
+    /// `Self` is the whole argument of a trait or type of `core` or `std` with a `?Sized`
+    /// parameter (`AsRef<Self>`, `Borrow<Self>`, `PartialEq<Self>`, `Box<Self>`), or is behind a
+    /// reference or a pointer; anything else keeps `Sized`. See [`SelfRequirement::Any`]. If it is
+    /// [`SelfRequirement::Type`], the impl is for that type, with `Self` as written, and no
+    /// parameter is declared.
     Param(&'a Ident),
     /// This type, usually a marker of the user crate (`impl .. for crate::Marker`).
     ///
@@ -114,8 +120,8 @@ pub struct RepeaterImpl {
     /// These are the generics of the entry without the lifetime bounds that
     /// [`args`](RepeaterImpl::args) encodes ([`Referrer::impl_generics()`]), with `Self` replaced
     /// where it is a parameter. For [`ImplSelf::Param`] they end with the parameter itself (`__S:
-    /// ?Sized`, and the bound of the trait for [`SelfRequirement::Bound`]; `__S` alone for
-    /// [`SelfRequirement::Any`]), unless the impl is for a type. A first where predicate that
+    /// ?Sized`, and the bound of the trait for [`SelfRequirement::Bound`]; `__S` alone or `__S:
+    /// ?Sized` for [`SelfRequirement::Any`]), unless the impl is for a type. A first where predicate that
     /// rustc would read as generics of the `where` (`<__S>::A: Clone`) is parenthesized.
     pub generics: Generics,
     /// The type that the impl is for.
@@ -467,15 +473,18 @@ impl Referrer {
         )?;
         let mut declared = without_encoded_bounds(&generics);
         if let Some(ident) = param {
-            declared
-                .params
-                .push(match (bound, self.context_self(context)) {
-                    (Some(path), _) => parse_quote!(#ident: ?::core::marker::Sized + #path),
-                    // The `Self` of a struct, an enum or a union is a `Sized` type, and the bounds
-                    // may need it (`(Self, u8)`, `Vec<Self>`).
-                    (None, Some(SelfRequirement::Any)) => parse_quote!(#ident),
-                    (None, _) => parse_quote!(#ident: ?::core::marker::Sized),
-                });
+            // The `Self` of a struct, an enum or a union is a `Sized` type, and the bounds may need
+            // it (`(Self, u8)`, `Vec<Self>`), so the parameter of `SelfRequirement::Any` is
+            // `Sized` where they do. Else it is `?Sized`: rustc before 1.70 cannot prove `S<T>:
+            // Sized` for the copy of a struct whose last field is the path through this impl, if
+            // the impl needs `__S: Sized` (E0275: the type needs the impl, which needs the type).
+            let sized = matches!(self.context_self(context), Some(SelfRequirement::Any))
+                && needs_sized(&declared, ident);
+            declared.params.push(match (bound, sized) {
+                (Some(path), _) => parse_quote!(#ident: ?::core::marker::Sized + #path),
+                (None, true) => parse_quote!(#ident),
+                (None, false) => parse_quote!(#ident: ?::core::marker::Sized),
+            });
         }
         parenthesize_leading_qualified_path(&mut declared);
         Ok(RepeaterImpl {
@@ -485,6 +494,136 @@ impl Referrer {
             ty,
             module: self.context_module(context),
         })
+    }
+}
+
+/// Returns `true` if the impl may need `param: Sized`, and `false` if it is well-formed without.
+///
+/// `declared` are the generics of the impl without `param`, in which `param` replaced `Self`. They
+/// need no `Sized` if every use of `param` is
+///
+/// - a type argument of its own, directly, of a path that accepts an unsized one
+///   ([`accepts_unsized_argument()`]: `AsRef<__S>`, `Box<__S>`),
+/// - behind a reference or a raw pointer (`&'a __S`, `*const __S`), or
+/// - the type of a predicate that does not say `Sized` (`__S: 'a`).
+///
+/// Any other use may need it: a tuple element (`(__S, u8)`), the element of an array or a slice,
+/// the argument of a type or a trait of the user (`Vec<__S>`, `Tr<__S>`), an associated type
+/// (`Iterator<Item = __S>`, `<__S>::A`), the argument of an `Fn` bound, a macro. So this errs on
+/// the side of `Sized`.
+fn needs_sized(declared: &Generics, param: &Ident) -> bool {
+    use syn::visit::Visit;
+    struct Uses<'a> {
+        param: &'a Ident,
+        needs_sized: bool,
+    }
+    impl Uses<'_> {
+        fn is_param(&self, ty: &Type) -> bool {
+            match ty {
+                Type::Path(TypePath { qself: None, path }) => path.is_ident(self.param),
+                Type::Paren(TypeParen { elem, .. }) => self.is_param(elem),
+                Type::Group(TypeGroup { elem, .. }) => self.is_param(elem),
+                _ => false,
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Uses<'_> {
+        // The uses that need `Sized` are those that are not skipped below.
+        fn visit_ident(&mut self, ident: &'ast Ident) {
+            if ident == self.param {
+                self.needs_sized = true;
+            }
+        }
+        // Tokens that are not parsed: any `Self` is out of reach.
+        fn visit_macro(&mut self, _: &'ast Macro) {
+            self.needs_sized = true;
+        }
+        fn visit_type_reference(&mut self, node: &'ast TypeReference) {
+            if !self.is_param(&node.elem) {
+                syn::visit::visit_type_reference(self, node);
+            }
+        }
+        fn visit_type_ptr(&mut self, node: &'ast TypePtr) {
+            if !self.is_param(&node.elem) {
+                syn::visit::visit_type_ptr(self, node);
+            }
+        }
+        fn visit_path(&mut self, path: &'ast Path) {
+            if !accepts_unsized_argument(path) {
+                return syn::visit::visit_path(self, path);
+            }
+            for segment in &path.segments {
+                match &segment.arguments {
+                    PathArguments::AngleBracketed(arguments) => {
+                        for argument in &arguments.args {
+                            match argument {
+                                GenericArgument::Type(ty) if self.is_param(ty) => (),
+                                argument => self.visit_generic_argument(argument),
+                            }
+                        }
+                    }
+                    arguments => self.visit_path_arguments(arguments),
+                }
+            }
+        }
+        fn visit_predicate_type(&mut self, node: &'ast PredicateType) {
+            if !self.is_param(&node.bounded_ty) {
+                return syn::visit::visit_predicate_type(self, node);
+            }
+            for bound in &node.bounds {
+                match bound {
+                    // `__S: Sized`
+                    TypeParamBound::Trait(TraitBound {
+                        modifier: TraitBoundModifier::None,
+                        path,
+                        ..
+                    }) if path.segments.last().map_or(false, |s| s.ident == "Sized") => {
+                        self.needs_sized = true
+                    }
+                    bound => self.visit_type_param_bound(bound),
+                }
+            }
+        }
+    }
+    let mut uses = Uses {
+        param,
+        needs_sized: false,
+    };
+    uses.visit_generics(declared);
+    uses.needs_sized
+}
+
+/// Returns `true` if `path` is a trait or a type of `core`, `std` or `alloc` whose type parameter
+/// is `?Sized`: `AsRef<__S>` is well-formed with `__S: ?Sized`.
+///
+/// It is written with an absolute path (`::core::convert::AsRef`), or with the name of the prelude
+/// (`AsRef`, `Box`), which is taken for what it names there: the Leaker accepts it only if the
+/// prelude is allowed. A module that declares an item of the same name is not told apart (the impl
+/// would then not compile in the Leaker's crate).
+fn accepts_unsized_argument(path: &Path) -> bool {
+    // (the crates, the module, the items): `::core::convert::AsRef`, `::std::convert::AsRef`..
+    const ABSOLUTE: &[(&[&str], &str, &[&str])] = &[
+        (&["core", "std"], "convert", &["AsRef", "AsMut"]),
+        (
+            &["core", "std", "alloc"],
+            "borrow",
+            &["Borrow", "BorrowMut"],
+        ),
+        (&["core", "std"], "cmp", &["PartialEq", "PartialOrd"]),
+        (&["core", "std"], "marker", &["PhantomData"]),
+        (&["std", "alloc"], "boxed", &["Box"]),
+        (&["std", "alloc"], "rc", &["Rc"]),
+        (&["std", "alloc"], "sync", &["Arc"]),
+    ];
+    const PRELUDE: &[&str] = &["AsRef", "AsMut", "PartialEq", "PartialOrd", "Box"];
+    let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    let names: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    match (path.leading_colon.is_some(), &names[..]) {
+        (false, [name]) => PRELUDE.contains(name),
+        (true, [root, module, item]) => ABSOLUTE
+            .iter()
+            .any(|(roots, m, items)| roots.contains(root) && m == module && items.contains(item)),
+        _ => false,
     }
 }
 

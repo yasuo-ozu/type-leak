@@ -479,13 +479,14 @@ fn check_impl_pieces(
         _ => match implementor_param(&mut got) {
             Some(GenericParam::Type(t)) if t.ident == *self_param => {
                 // `?Sized`, and the trait of a `Self` that is bound by it. Any type that the
-                // bounds hold for is a `Sized` one (a struct, an enum or a union): no bound.
+                // bounds hold for is a `Sized` one (a struct, an enum or a union), so it has no
+                // bound if a bound of the generics needs it `Sized`, and `?Sized` if not.
                 let expected = match referrer.context_self(context) {
-                    Some(SelfRequirement::Bound(_)) => 2,
-                    Some(SelfRequirement::Any) => 0,
-                    _ => 1,
+                    Some(SelfRequirement::Bound(_)) => 2..=2,
+                    Some(SelfRequirement::Any) => 0..=1,
+                    _ => 1..=1,
                 };
-                if t.bounds.len() != expected {
+                if !expected.contains(&t.bounds.len()) {
                     return Err(helpers_disagree(format!(
                         "the parameter of the implementor of the entry {} has the bounds `{}`",
                         ix,

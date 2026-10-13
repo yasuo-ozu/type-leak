@@ -1534,12 +1534,16 @@ where
     /// - [`SelfRequirement::Any`]: the type of the entry does not name `Self`, and a bound of a
     ///   generic that it uses does (`Rel<T>` with `T: AsRef<Self>`, in a struct, an enum or a
     ///   union). The Repeater impl is for any type that the bound holds for (`impl<T:
-    ///   AsRef<__S>, __S> Repeater<(T,), ID, 3> for __S`), and the copy declares a type of its
+    ///   AsRef<__S>, __S: ?Sized> Repeater<(T,), ID, 3> for __S`), and the copy declares a type of its
     ///   own, which has the bound for itself: pass that, `Self` (it is what
     ///   `UseSite::identity()` has). The Leaker's type does not have the bound in the copy's crate
     ///   (E0277). The leaked type is the same either way, as it does not name `Self`. The Leaker
     ///   rejects an entry whose type names `Self` too, and one in the default of a parameter of
-    ///   such an item, where the copy cannot write `Self` (E0735).
+    ///   such an item, where the copy cannot write `Self` (E0735). The impl is `?Sized` unless a
+    ///   bound needs `Self: Sized` (`(Self, u8)`): on rustc before 1.70, an impl that needs it
+    ///   makes the copy of a struct E0275 where the entry is its last field (an enum on 1.56
+    ///   too). Put the field first, add `where Self: Sized` to the item, or write the type with an
+    ///   absolute path (see [`SelfRequirement::Any`]).
     ///
     /// Only the layer of the item the visitor is in counts: an entry of the `Self` of the context, or
     /// of the scope around that the nested item hides, is not found there. The entries that do not
@@ -1619,7 +1623,7 @@ where
     ///     impl #generics Repeater<#args, 7u64, 0usize> for __S { type Type = #ty; }
     /// };
     /// let expected: ItemImpl = parse_quote! {
-    ///     impl<T: ::core::convert::AsRef<__S>, __S> Repeater<(T,), 7u64, 0usize> for __S {
+    ///     impl<T: ::core::convert::AsRef<__S>, __S: ?::core::marker::Sized> Repeater<(T,), 7u64, 0usize> for __S {
     ///         type Type = Rel<T>;
     ///     }
     /// };
