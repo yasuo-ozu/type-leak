@@ -374,7 +374,9 @@ impl Referrer {
     /// the smaller indices. See [`Leaker::allowed_paths`](crate::Leaker::allowed_paths) for the
     /// paths that are not optional entries.
     ///
-    /// Only types are optional entries. An absolute path in a bound, a value, the type of a const
+    /// Only types are optional entries. An absolute path in a bound, in an expression of a value
+    /// (a type in a type position of a value is an entry with
+    /// [`LeakerConfig::check_values()`](crate::LeakerConfig::check_values)), the type of a const
     /// parameter, the type of a receiver (`self: ::std::boxed::Box<Self>`) and a type that cannot
     /// be leaked (`::serde::Wrap<'_>`) is copied as written, which is not an error. An optional
     /// type inside a required one is not an entry. One that contains required ones is, and they are
@@ -1293,6 +1295,15 @@ impl Declares {
 /// are visited as items of it (see [`Referrer::visitor()`]). Items and imports declared in a block
 /// hide the leaked types that name them there. Those declared in a module, or in a `File`, hide
 /// the entries of no module that name them.
+///
+/// The values of the visited items are visited as the rest is: the default of an associated const,
+/// the value of a const or static, the body of a function. A type there is replaced if it is an
+/// entry, in the generics in scope where it stands: the target of a cast, the type of a `let`, the
+/// parameters and output of a closure, the generic arguments of a path and of a method call, and
+/// the self type of a qualified path (`<Rel as Tr>::f()` becomes `<<..>::Type as Tr>::f()`). The
+/// Leaker has such entries only with
+/// [`LeakerConfig::check_values()`](crate::LeakerConfig::check_values), which also rejects what
+/// the visitor cannot replace: a path that is not a type, and the tokens of a macro.
 ///
 /// The visitor keeps the layers of the Leaker's scopes: the context first, then, for each struct,
 /// enum, union, trait or impl nested in the visited syntax, a layer with the `Self` of that item

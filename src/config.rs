@@ -33,12 +33,13 @@ impl LeakerConfig {
         Default::default()
     }
 
-    /// Makes the [`Leaker`](crate::Leaker) read the values of an item too, and reject a relative
-    /// path in them.
+    /// Makes the [`Leaker`](crate::Leaker) read the values of an item too: it leaks the types in
+    /// them and rejects a relative path that is not a type.
     ///
-    /// The copy writes a value as it is: it cannot go through the Repeater, which carries types.
-    /// So a path in a value that depends on where it is written breaks the copy, and the Leaker
-    /// does not tell unless this option is on. It then reads:
+    /// The copy writes a value as it is: an expression cannot go through the Repeater, which
+    /// carries types. A type in it can, since the [`Visitor`](crate::Visitor) replaces a type where
+    /// it stands. Without this option a value is not read, so a relative path in it, a type or
+    /// not, breaks the copy and the Leaker does not tell. With it, the Leaker reads:
     ///
     /// - the default value of an associated const of a trait, and the value of an associated const
     ///   of an impl;
@@ -48,8 +49,25 @@ impl LeakerConfig {
     /// An enum discriminant and an array length are read with or without the option: a relative
     /// path in a discriminant is an error, and a type in it or in a length is leaked, as ever.
     ///
-    /// A path in a value is rejected unless it means the same wherever it is written: it is
-    /// absolute or starts with `$crate`, it is allowed ([`allowed_paths`](LeakerConfig::allowed_paths),
+    /// **A type in a type position is leaked.** The positions are the ones that the visitor
+    /// replaces a type in: the target of a cast (`x as Rel`), the type of a `let` (`let x: Rel`),
+    /// the parameters and the output of a closure, the generic arguments of a path and of a method
+    /// call (`size_of::<Rel>()`, `Vec::<Rel>::new()`, `x.f::<Rel>()`), and the self type of a
+    /// qualified path (`<Rel as ::core::default::Default>::default()`, not the trait). The type is
+    /// analyzed as any type of the item is, with the generics of the item and of the method, and
+    /// `Self`, in scope: the rules for `Self`, for lifetimes and for what a type can be written
+    /// with are the same. It is an entry if its path is relative, a required one, and an optional
+    /// one if only a path of another crate makes it so
+    /// ([`allowed_paths`](crate::Leaker::allowed_paths)), as a type of a signature is. So the
+    /// macro emits the impl of the Repeater for it as for the others, and
+    /// [`Referrer::required()`](crate::Referrer::required) lists it. A bare identifier argument
+    /// (`size_of::<Rel>()`) is read as a type, as in an enum discriminant: if it is a const
+    /// (`f::<N>()`), the copy fails, so write the const in braces with an absolute path. A type
+    /// with `_` (`let v: Vec<_>`) is not leaked whole, and a relative path that holds one is
+    /// rejected; the parts of it are leaked.
+    ///
+    /// **A path that is not a type is rejected** unless it means the same wherever it is written:
+    /// it is absolute or starts with `$crate`, it is allowed ([`allowed_paths`](LeakerConfig::allowed_paths),
     /// also the names of [`allow_primitive()`](LeakerConfig::allow_primitive) and
     /// [`allow_std_prelude()`](LeakerConfig::allow_std_prelude): `Some` and `None` are not among
     /// them, write `::core::option::Option::Some`), it starts with a generic or `Self` in scope,
@@ -57,10 +75,24 @@ impl LeakerConfig {
     /// parameter, a `match`, `if let` or `for` pattern, an item or a `use` in a block). The name
     /// of the item that holds the value is relative like any other. (A name in a pattern is a
     /// binding unless it starts with a capital letter, as the lint `non_snake_case` expects: then
-    /// it is a path to a constant, a unit struct or a variant.) A type in a value
-    /// (`size_of::<Rel>()`, `let x: Rel`) is rejected too: it is not leaked, since the copy writes
-    /// a value as it is. Attributes (`#[allow(..)]`, `#[derive(..)]`) are not read, in a value or
-    /// anywhere else in the item.
+    /// it is a path to a constant, a unit struct or a variant.) Such are a function, a constant, a
+    /// struct literal, a variant (`inner::f()`, `Rel::new()`, `Rel { .. }`) and the trait of a
+    /// qualified path (`<u8 as Rel>::f()`).
+    ///
+    /// Three kinds of type are read, not leaked, and a relative path in them is rejected as
+    /// above:
+    ///
+    /// - a type that names something the value declares: an item, a `use`, a generic or a lifetime
+    ///   of an item in a block, a lifetime of a closure. The copy writes the declaration with the
+    ///   value, which the Repeater cannot refer to. (Such a type with no relative path is fine:
+    ///   `let x: Local` for a `struct Local` of the block.)
+    /// - a type in the arguments of a macro (`::core::assert_eq!(size_of::<Rel>(), 4)`): the
+    ///   visitor does not rewrite the tokens of a macro. The path of the macro and its arguments
+    ///   are read as paths and expressions (below).
+    /// - a type in an item that the value declares (a nested `struct`, `fn` or `impl`).
+    ///
+    /// Attributes (`#[allow(..)]`, `#[derive(..)]`) are not read, in a value or anywhere else in
+    /// the item.
     ///
     /// The path of a macro call is checked like any other (`::std::println!`, not `println!`), and
     /// its arguments are read as expressions, and the names a format string captures (`"{x}"`) as
@@ -73,17 +105,39 @@ impl LeakerConfig {
     /// ```
     /// # use type_leak::*;
     /// # use syn::*;
+    /// # use syn::visit_mut::VisitMut;
     /// let item: ItemTrait = parse_quote! {
     ///     trait Tr { const N: usize = ::core::mem::size_of::<inner::Local>(); }
     /// };
     /// // Without the option the value is not read: the copy breaks without an error.
-    /// assert!(Leaker::new().intern_trait(&item, true).is_ok());
-    ///
     /// let mut config = LeakerConfig::new();
+    /// config.allow_primitive();
+    /// let mut leaker = Leaker::from_config(config.clone());
+    /// leaker.intern_trait(&item, true).unwrap();
+    /// assert!(leaker.finish().is_empty());
+    ///
+    /// // With it the type is an entry, which the visitor replaces in the copy of the value.
     /// config.check_values();
+    /// let mut leaker = Leaker::from_config(config.clone());
+    /// let context = leaker.intern_trait(&item, true).unwrap();
+    /// let referrer = leaker.finish();
+    /// assert_eq!(referrer.required().count(), 1);
+    /// let mut copy = item.clone();
+    /// referrer
+    ///     .visitor(context, |_, ix| parse_quote!(<() as Repeater<#ix>>::Type))
+    ///     .visit_item_trait_mut(&mut copy);
+    /// let expected: ItemTrait = parse_quote! {
+    ///     trait Tr {
+    ///         const N: usize = ::core::mem::size_of::<<() as Repeater<0usize>>::Type>();
+    ///     }
+    /// };
+    /// assert_eq!(copy, expected);
+    ///
+    /// // A path that is not a type cannot be replaced.
+    /// let item: ItemTrait = parse_quote!(trait Tr { const N: usize = inner::N; });
     /// let err = Leaker::from_config(config).intern_trait(&item, true).unwrap_err();
     /// let error = err.items().next().unwrap();
-    /// assert_eq!(error.message, "use absolute path: 'inner :: Local'");
+    /// assert_eq!(error.message, "use absolute path: 'inner :: N'");
     /// assert_eq!(
     ///     error.note(),
     ///     Some("it is in the default value of `N`, which the copy writes as it is")

@@ -30,8 +30,10 @@
 //! The same shapes are copied across crates in `tests/crates/leaker` (`kinds`, the ids 9071 and
 //! after), where the Repeater impls and the copies are compiled: `tests/cross_crate.rs`.
 //!
-//! The last tests are the findings 12 and 14: a bare `?Sized` and the values of an item.
+//! The last tests are the findings 12 and 14: a bare `?Sized` and the values of an item (a type in
+//! a value is carried since F40 of `tests/findings.rs`, a path that is no type is rejected).
 
+use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
@@ -844,18 +846,41 @@ fn help_for(path: &str) -> String {
     )
 }
 
-/// 14: with `check_values()`, the relative type in the default of an associated const is rejected,
-/// with the value it is in.
+/// 14: with `check_values()`, the relative type in the default of an associated const is carried:
+/// it is an entry, which the Visitor replaces (F40 of `tests/findings.rs`, and the fixtures 9141 and
+/// 9142 of `tests/cross_crate.rs`, whose copy compiles). It was rejected, with the value it is in,
+/// like the paths that are no types still are.
+#[test]
+fn fourteen_a_type_in_an_associated_const_default_is_carried() {
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            const N: usize = ::core::mem::size_of::<inner::Local>();
+        }
+    };
+    let mut leaker = Leaker::from_config(values_config());
+    let context = leaker.intern_trait(&item, true).unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(
+        referrer.iter().map(text).collect::<Vec<_>>(),
+        ["inner :: Local"]
+    );
+    assert!(referrer.must(0));
+    let mut copy = item.clone();
+    referrer
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visit_item_trait_mut(&mut copy);
+    let expected: ItemTrait = parse_quote! {
+        trait Tr {
+            const N: usize = ::core::mem::size_of::<P<0usize>>();
+        }
+    };
+    assert_eq!(text(&copy), text(&expected));
+}
+
+/// 14: with `check_values()`, a relative path in the default of an associated const that is no
+/// type is rejected, with the value it is in.
 #[test]
 fn fourteen_a_relative_path_in_an_associated_const_default_is_rejected() {
-    assert_eq!(
-        value_errors("trait Tr { const N: usize = ::core::mem::size_of::<inner::Local>(); }"),
-        vec![(
-            "use absolute path: 'inner :: Local'".to_string(),
-            "it is in the default value of `N`, which the copy writes as it is".to_string(),
-            help_for("inner::Local"),
-        )]
-    );
     // A value path, and a constructor.
     assert_eq!(
         value_errors("trait Tr { const N: usize = inner::X; const M: Wrap = Wrap::new(); }"),
@@ -874,17 +899,16 @@ fn fourteen_a_relative_path_in_an_associated_const_default_is_rejected() {
     );
 }
 
-/// 14: the default body of a method is read too.
+/// 14: the default body of a method is read too: a type in it is carried, a path that is no type
+/// is rejected.
 #[test]
 fn fourteen_a_relative_path_in_a_default_method_body_is_rejected() {
     assert_eq!(
-        value_errors(
-            "trait Tr { fn f(&self) -> usize { ::core::mem::size_of::<inner::Local>() } }"
-        ),
+        value_errors("trait Tr { fn f(&self) -> usize { inner::helper() + ::core::mem::size_of::<inner::Local>() } }"),
         vec![(
-            "use absolute path: 'inner :: Local'".to_string(),
+            "use absolute path: 'inner :: helper'".to_string(),
             "it is in the default body of `f`, which the copy writes as it is".to_string(),
-            help_for("inner::Local"),
+            help_for("inner::helper"),
         )]
     );
     // The error names the macro in its own way.

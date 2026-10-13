@@ -65,9 +65,11 @@ use template_quote::quote;
 ///   ([`allowed_paths`](Leaker::allowed_paths)).
 /// - A shadowed primitive name (`type u8 = i32;`): emit [`Leaker::assertions()`] to catch it.
 /// - A value: the default of an associated const, the value of a const or static, and the body of a
-///   function are not analyzed, so a relative path in them (`const N: usize = size_of::<Rel>();`)
-///   breaks the copy and the Leaker does not tell. [`LeakerConfig::check_values()`] rejects them.
-///   An enum discriminant and an array length are always analyzed.
+///   function are not analyzed, so a relative path in them (`const N: usize = inner::N;`, or a
+///   type: `size_of::<inner::Rel>()`) breaks the copy and the Leaker does not tell.
+///   [`LeakerConfig::check_values()`] reads them: it rejects a path that is not a type, and leaks a
+///   type in a type position (a cast, a `let`, a closure, a turbofish, a qualified path), which the
+///   [`Visitor`](crate::Visitor) replaces. An enum discriminant and an array length are always analyzed.
 ///
 /// # What the Leaker checks
 ///

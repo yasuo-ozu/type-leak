@@ -1423,4 +1423,87 @@ pub mod kinds {
             pub struct Deeper<X>(pub crate::base::B1<X>);
         }
     }
+
+    // The types in the values of an item (`LeakerConfig::check_values()`, `values = true`): the
+    // default of an associated const, a default method, the const, static and function of a
+    // module. The Leaker leaks the type in a cast, a `let`, a closure, a turbofish and a qualified
+    // path, and the copy replaces it. The Referrer's crate names none of these types, so it
+    // compiles only if every one is replaced; the tests compare what the two crates compute.
+
+    /// Types that neither the Referrer's crate nor its `kinds` imports.
+    pub mod vals {
+        /// Seven bytes: the size of it is the value of the const of the copy, whichever crate it is in.
+        #[derive(Debug, Clone, Copy, PartialEq, Default)]
+        pub struct Local(pub [u8; 7]);
+
+        impl Local {
+            pub const BYTES: usize = 7;
+
+            pub fn count(&self) -> usize {
+                self.0.len()
+            }
+        }
+
+        /// A type alias to cast to.
+        pub type Count = usize;
+
+        /// A generic type: the entries that use a generic of a method, or of the trait.
+        #[derive(Debug, Clone, Copy, PartialEq, Default)]
+        pub struct Holder<T>(pub T);
+    }
+
+    /// The values of a trait: a const that sizes a relative type, a const that sizes a relative
+    /// type in an array, and default methods that name a relative type in a `let`, a turbofish, a
+    /// qualified path, a closure, a cast, with and without the generics of the trait and of the
+    /// method. The Referrer's crate declares the copy (`ValueTypesCopy`).
+    #[prop_leak(
+        id = 9141,
+        allow_self = true,
+        scope = "mod",
+        prelude = true,
+        redeclare = true,
+        values = true
+    )]
+    pub trait ValueTypes<T: Default> {
+        const N: usize = ::core::mem::size_of::<vals::Local>();
+        const M: usize = ::core::mem::size_of::<[vals::Local; 3]>();
+
+        fn size(&self) -> usize {
+            let x: vals::Local = ::core::default::Default::default();
+            let v = Vec::<vals::Local>::new();
+            let y = <vals::Local as ::core::default::Default>::default();
+            x.count() + v.len() + y.count() + <vals::Local>::BYTES
+        }
+
+        fn closure(&self) -> usize {
+            let c = |a: vals::Local, b: vals::Count| -> usize { a.count() + b };
+            c(::core::default::Default::default(), 1u8 as vals::Count)
+        }
+
+        fn generic<U: Default>(&self, _u: U) -> usize {
+            let h: vals::Holder<U> = ::core::default::Default::default();
+            let k: vals::Holder<(T, U)> = ::core::default::Default::default();
+            ::core::mem::size_of_val(&h)
+                + ::core::mem::size_of_val(&k) * 100
+                + ::core::mem::size_of::<vals::Holder<T>>() * 10_000
+        }
+    }
+
+    /// The values of a module: a const, a static and a function that read a type the module does
+    /// not declare, and one it does (copied with it).
+    #[prop_leak(id = 9142, prelude = true, values = true)]
+    pub mod values_in_module {
+        pub struct Declared(pub u8);
+
+        pub const SIZE: usize = ::core::mem::size_of::<Declared>()
+            + ::core::mem::size_of::<crate::kinds::vals::Local>();
+
+        pub static TAG: usize = ::core::mem::size_of::<crate::kinds::vals::Holder<u16>>();
+
+        pub fn total() -> usize {
+            let a: crate::kinds::vals::Local = ::core::default::Default::default();
+            let b: Declared = Declared(1);
+            a.count() + b.0 as usize + <crate::kinds::vals::Local>::BYTES
+        }
+    }
 }

@@ -67,6 +67,12 @@ pub(crate) struct Args {
     /// declaration, which cannot name the defaulted parameter itself (E0128): see
     /// [`rewrite_defaults()`].
     redeclare: bool,
+    /// The Leaker reads the values of the item (`LeakerConfig::check_values()`): the default of an
+    /// associated const, the value of a const or static, the body of a function. A type in a type
+    /// position of a value is an entry, and the copy replaces it. The witnesses compare the types
+    /// of the signatures only; the copy of a value compiles in the Referrer's crate only if every
+    /// type in it that the crate cannot name is replaced, and the tests compare what it computes.
+    values: bool,
 }
 
 impl Parse for Args {
@@ -81,6 +87,7 @@ impl Parse for Args {
             primitive: true,
             relaxed_sized: false,
             redeclare: false,
+            values: false,
         };
         for kv in Punctuated::<MetaNameValue, Token![,]>::parse_terminated(input)? {
             let key = kv
@@ -101,6 +108,7 @@ impl Parse for Args {
                 ("primitive", Lit::Bool(b)) => args.primitive = b.value,
                 ("relaxed_sized", Lit::Bool(b)) => args.relaxed_sized = b.value,
                 ("redeclare", Lit::Bool(b)) => args.redeclare = b.value,
+                ("values", Lit::Bool(b)) => args.values = b.value,
                 ("allow", Lit::Str(s)) => {
                     for path in s.value().split(',').filter(|p| !p.trim().is_empty()) {
                         args.allow.push(parse_str(path.trim())?);
@@ -117,7 +125,7 @@ impl Args {
     fn tokens(&self) -> TokenStream {
         let (id, allow_self, prelude) = (self.id, self.allow_self, self.prelude);
         let (primitive, relaxed_sized) = (self.primitive, self.relaxed_sized);
-        let redeclare = self.redeclare;
+        let (redeclare, values) = (self.redeclare, self.values);
         let strict = self.strict.map(|strict| quote!(strict = #strict,));
         let scope = &self.scope;
         let allow = self
@@ -126,7 +134,7 @@ impl Args {
             .map(|p| quote!(#p).to_string().replace(' ', ""))
             .collect::<Vec<_>>()
             .join(",");
-        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict primitive = #primitive, relaxed_sized = #relaxed_sized, redeclare = #redeclare)
+        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict primitive = #primitive, relaxed_sized = #relaxed_sized, redeclare = #redeclare, values = #values)
     }
 }
 
@@ -171,6 +179,9 @@ fn analyze(
     }
     if args.prelude {
         config.allow_std_prelude();
+    }
+    if args.values {
+        config.check_values();
     }
     config.allowed_paths.extend(args.allow.iter().cloned());
     let mut leaker = Leaker::from_config(config);

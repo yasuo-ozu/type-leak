@@ -562,6 +562,18 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9132, __tl_report_9132!()),
             ok("trait", 2, 5, 5),
         ),
+        // the types in the values of an item (`check_values()`): the consts and the default
+        // methods of a trait, and the const, the static and the function of a module
+        (
+            9141,
+            reported(9141, __tl_report_9141!()),
+            ok("trait", 5, 6, 6),
+        ),
+        (
+            9142,
+            reported(9142, __tl_report_9142!()),
+            ok("mod", 2, 3, 3),
+        ),
         // scopes that share names (the findings of a downstream crate): methods that declare the
         // same generic with different bounds, a generic named like a relative type, a path ending
         // with the name of a generic, a type and a const parameter of one name; a bound that names
@@ -1017,6 +1029,59 @@ fn the_default_of_a_nested_trait_that_names_its_self_is_written_through_the_host
     );
     r::SelfDefaultsCopy::<Owner, u8>::get(&TwoFirst, Owner, 1, l::Defd2(l::Rel(5), Owner));
     r::SelfDefaultsCopy::<Owner, u8, u16>::get(&TwoGiven, Owner, 1, 2);
+}
+
+/// The types in the values of an item, with `LeakerConfig::check_values()` (F40 of
+/// `tests/findings.rs`, the finding 14 of a downstream crate): `trait ValueTypes { const N: usize =
+/// size_of::<vals::Local>(); .. }`. The Referrer's crate declares the copy (`ValueTypesCopy`), and
+/// names none of the types of the defaults, so it compiles only if every one of them is replaced
+/// by a path through the Repeater (a `let`, a turbofish, a qualified path, a closure, a cast, a
+/// type in an array, the generics of the method and of the trait). The two traits compute the same.
+#[test]
+fn the_types_in_the_values_of_a_trait_are_carried() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_referrer::kinds as r;
+
+    struct Original;
+    impl l::ValueTypes<u16> for Original {}
+    struct Copy;
+    impl r::ValueTypesCopy<u16> for Copy {}
+
+    // The const: seven bytes, and three of them in an array.
+    assert_eq!(<Original as l::ValueTypes<u16>>::N, 7);
+    assert_eq!(<Copy as r::ValueTypesCopy<u16>>::N, 7);
+    assert_eq!(<Original as l::ValueTypes<u16>>::M, 21);
+    assert_eq!(<Copy as r::ValueTypesCopy<u16>>::M, 21);
+
+    // The default methods: `7 + 0 + 7 + 7`, the closure `7 + 1`, and the sizes of the generics
+    // (`u16` is the trait's `T`, `u8` the method's `U`).
+    assert_eq!(l::ValueTypes::<u16>::size(&Original), 21);
+    assert_eq!(r::ValueTypesCopy::<u16>::size(&Copy), 21);
+    assert_eq!(l::ValueTypes::<u16>::closure(&Original), 8);
+    assert_eq!(r::ValueTypesCopy::<u16>::closure(&Copy), 8);
+    let original = l::ValueTypes::<u16>::generic(&Original, 1u8);
+    let copy = r::ValueTypesCopy::<u16>::generic(&Copy, 1u8);
+    assert_eq!(original, 1 + 4 * 100 + 2 * 10_000);
+    assert_eq!(copy, original);
+    let original = l::ValueTypes::<u16>::generic(&Original, 1u64);
+    assert_eq!(original, 8 + 16 * 100 + 2 * 10_000);
+    assert_eq!(r::ValueTypesCopy::<u16>::generic(&Copy, 1u64), original);
+}
+
+/// The same for the const, the static and the function of a module. The module declares `Declared`,
+/// which the copy declares again (`size_of::<Declared>()` is its own); the type that it does not
+/// declare is replaced.
+#[test]
+fn the_types_in_the_values_of_a_module_are_carried() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_referrer::kinds as r;
+
+    assert_eq!(l::values_in_module::SIZE, 1 + 7);
+    assert_eq!(r::values_in_module::SIZE, l::values_in_module::SIZE);
+    assert_eq!(l::values_in_module::TAG, 2);
+    assert_eq!(r::values_in_module::TAG, l::values_in_module::TAG);
+    assert_eq!(l::values_in_module::total(), 7 + 1 + 7);
+    assert_eq!(r::values_in_module::total(), l::values_in_module::total());
 }
 
 /// The scopes of an item that share names (the findings A, 1, 2, 3, 4 and 7 of a downstream crate,

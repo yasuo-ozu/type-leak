@@ -54,9 +54,10 @@ pub enum NotInternableError {
     ///   associated const, the value of a const or a static, the body of a function. It has the
     ///   headline `use absolute path: '..'`, and the note says which value it is in ("it is in the
     ///   default value of `N`, which the copy writes as it is"). A value is copied as written, so
-    ///   nothing can be leaked there. What the Leaker cannot read (a macro whose arguments are not
-    ///   expressions, a `macro_rules!`, a glob import) has the headline "cannot analyze .. in the
-    ///   body of ..".
+    ///   nothing but a type in a type position can be leaked there (a cast, a `let`, a closure, a
+    ///   turbofish, a qualified path: a relative one there is an entry, not an error). What the
+    ///   Leaker cannot read (a macro whose arguments are not expressions, a `macro_rules!`, a glob
+    ///   import) has the headline "cannot analyze .. in the body of ..".
     /// - A type with a generic whose bound names the `Self` of a trait (or `Self::X`), where
     ///   `Self` is something else, so the bound cannot be written
     ///   ([`View::visit_item()`](crate::View::visit_item)). The fault is that bound, not the path

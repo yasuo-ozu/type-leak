@@ -48,6 +48,7 @@
 //! | `f37_nested_type_with_a_bound_that_names_its_own_self_is_supported` | an entry that uses a generic whose bound names the own `Self` of a struct, enum or union nested in a module: the bound holds for the copy's type, the Repeater's impl needed it for the Leaker's; the impl is for any type now, and the copy passes its own (`SelfRequirement::Any`) | fixed |
 //! | `f38_an_absolute_type_that_names_the_own_self_is_copied_as_written` | an absolute type that names the own `Self` of a struct, enum or union nested in a module (`::std::boxed::Box<Self>`) was an optional entry: a strict Referrer replaced it with the Leaker's type, and a trusting one left the copy's own; it is no entry now, and both copy it as written | fixed |
 //! | `f39_the_default_of_a_nested_trait_that_needs_its_self_is_written_through_the_host` | the default of a parameter of a trait (`U = Rel<T>` with `T: AsRef<Self>`) has an entry for the trait's `Self`, and the Visitor left it as written: it is looked up with the trait's own `Self` too, and written by `with_nested_self()`; the default of the trait itself is looked up without `Self`, as it is analyzed | fixed |
+//! | `f40_a_type_in_the_default_of_an_associated_const_is_carried` | a type in a value (the default of an associated const, a function body) was never carried, so the copy kept a relative path: with `LeakerConfig::check_values()` a type in a type position of a value (a cast, a `let`, a closure, a turbofish, a qualified path) is an entry, which the Visitor replaces; a path that is not a type stays rejected | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that the docs of `Leaker` document, or that follows from what rustc accepts). No test
@@ -8810,4 +8811,654 @@ fn f39_a_nested_struct_still_rejects_the_default() {
     if let Item::Struct(item) = &item {
         new_leaker().intern_struct(item, true).unwrap();
     }
+}
+
+// ── F40 ──────────────────────────────────────────────────────────────────────
+
+/// A Leaker that reads the values (`LeakerConfig::check_values()`), as the downstream crate of F40
+/// has it: primitive types and the names of the standard prelude are allowed.
+fn values_config() -> LeakerConfig {
+    let mut config = LeakerConfig::new();
+    config.allow_primitive().allow_std_prelude().check_values();
+    config
+}
+
+fn values_leaker() -> Leaker {
+    Leaker::from_config(values_config())
+}
+
+/// Analyzes the trait `source` with the option, and returns its Referrer and its context.
+fn f40_trait(source: &str) -> (ItemTrait, Referrer, ContextId) {
+    let item: ItemTrait = parse_str(source).unwrap_or_else(|e| panic!("{}: {}", source, e));
+    let mut leaker = values_leaker();
+    let context = leaker
+        .intern_trait(&item, true)
+        .unwrap_or_else(|e| panic!("{}: {}", source, e));
+    (item, leaker.finish(), context)
+}
+
+/// The copy of `item` in the scope `context`, with the `ix`-th entry replaced by `P<ix>`.
+fn f40_copy(referrer: &Referrer, context: ContextId, item: &ItemTrait) -> String {
+    rewrite(referrer, context, Item::Trait(item.clone()))
+}
+
+/// The messages and the notes of the errors the option gives to the trait `source`.
+fn f40_errors(source: &str) -> Vec<(String, String)> {
+    let item: ItemTrait = parse_str(source).unwrap_or_else(|e| panic!("{}: {}", source, e));
+    match values_leaker().intern_trait(&item, true) {
+        Ok(_) => panic!("`{}` is accepted", source),
+        Err(err) => err
+            .items()
+            .map(|item| {
+                let note = item.note().unwrap_or("").to_string();
+                (item.message, note)
+            })
+            .collect(),
+    }
+}
+
+/// F40 (fixed): a type in a value was never carried. In
+/// `trait Tr { const N: usize = ::core::mem::size_of::<inner::Local>(); }` the Leaker found no
+/// entry for `inner::Local`, so the copy of the default, which the Visitor writes as it is, kept a
+/// relative path that does not resolve in the Referrer's crate (E0433). Reported by the downstream
+/// crate `announce` (its finding 14, `types_in_associated_const_defaults_are_not_read`).
+///
+/// The values are not read unless `LeakerConfig::check_values()` is on, which is unchanged (the
+/// first part of the test): a patch release does not reject what it accepted. With the option the
+/// check rejected every relative path in a value, a type as well (`use absolute path:
+/// 'inner :: Local'`). The copy cannot write a path of an expression through the Repeater, but it
+/// can write a type: the Visitor replaces a type where it stands, in an expression as in a
+/// signature (it does so for the type in an enum discriminant and an array length, which are
+/// always read).
+///
+/// The fix: with the option, a type in a *type position* of a value is analyzed like any type of
+/// the item, with the generics and `Self` in scope, and becomes an entry. The Visitor needed no
+/// change for it: the default `VisitMut` walk reaches the same positions, in the scopes of the
+/// signature that the Leaker analyzes them in. The cross-crate fixtures 9141 and 9142 of
+/// `tests/cross_crate.rs` compile the copy.
+/// `FORMAT_VERSION` is unchanged: the serialized form and the meaning of an entry are the same,
+/// and an entry of a value is found like any other.
+///
+/// The property test does not use the option, so it does not show F40.
+#[test]
+fn f40_a_type_in_the_default_of_an_associated_const_is_carried() {
+    let source = "trait Tr { const N: usize = ::core::mem::size_of::<inner::Local>(); }";
+    let item: ItemTrait = parse_str(source).unwrap();
+
+    // Not read without the option: no entry, no error, as before.
+    let mut leaker = new_leaker();
+    leaker.intern_trait(&item, true).unwrap();
+    assert!(leaker.finish().is_empty());
+
+    // Read with it: the type is a required entry.
+    let (item, referrer, context) = f40_trait(source);
+    assert_eq!(
+        referrer.iter().map(string).collect::<Vec<_>>(),
+        ["inner :: Local"]
+    );
+    assert!(referrer.must(0));
+    assert_eq!(referrer.required().count(), 1);
+    assert_eq!(string(referrer.context_generics(referrer.context(0))), "");
+    assert!(referrer.context_self(referrer.context(0)).is_none());
+    // The Visitor replaces it where it stands in the default.
+    let expected: ItemTrait = parse_quote!(
+        trait Tr {
+            const N: usize = ::core::mem::size_of::<P<0usize>>();
+        }
+    );
+    assert_eq!(f40_copy(&referrer, context, &item), string(&expected));
+
+    // The Repeater's impl is written like the one of an entry of a signature.
+    let r = referrer
+        .repeater_impl(0, ImplSelf::Marker(&parse_quote!(())))
+        .unwrap();
+    assert_eq!(string(&r.ty), "inner :: Local");
+
+    // A type is replaced, a path that is not a type is still rejected.
+    assert_eq!(
+        f40_errors("trait Tr { const N: usize = inner::X; }"),
+        [(
+            "use absolute path: 'inner :: X'".to_string(),
+            "it is in the default value of `N`, which the copy writes as it is".to_string()
+        )]
+    );
+}
+
+/// F40: the default body of a method, and the body of a method of an impl, are read the same way,
+/// in the generics of the method.
+#[test]
+fn f40_a_type_in_a_default_body_is_carried_in_the_generics_of_the_method() {
+    let source = "trait Tr<T: ::core::default::Default> {
+        fn f<U: ::core::default::Default>(&self) -> usize {
+            let a: inner::Local = ::core::unimplemented!();
+            let b: inner::Wrap<U> = ::core::unimplemented!();
+            let c: inner::Wrap<T> = ::core::unimplemented!();
+            let d: inner::Wrap<Self> = ::core::unimplemented!();
+            ::core::mem::size_of::<inner::Wrap<U>>()
+        }
+    }";
+    let (item, referrer, context) = f40_trait(source);
+    let generics =
+        |ty: &str| string(referrer.context_generics(referrer.context(entry(&referrer, ty))));
+    // The context of an entry is the generics it uses, and their bounds, as in a signature.
+    assert_eq!(generics("inner :: Local"), "");
+    assert_eq!(
+        generics("inner :: Wrap < U >"),
+        "< U : :: core :: default :: Default >"
+    );
+    assert_eq!(
+        generics("inner :: Wrap < T >"),
+        "< T : :: core :: default :: Default >"
+    );
+    // `Self` is the implementor of the trait.
+    let with_self = referrer.context(entry(&referrer, "inner :: Wrap < Self >"));
+    assert!(matches!(
+        referrer.context_self(with_self),
+        Some(SelfRequirement::Bound(_))
+    ));
+    assert_eq!(referrer.iter().count(), 4);
+    assert!((0..4).all(|ix| referrer.must(ix)));
+    // Every one is replaced where it stands. (`inner::Wrap<U>` twice, by one entry.)
+    let ix = |ty: &str| entry(&referrer, ty);
+    let expected: ItemTrait = parse_str(
+        &"trait Tr<T: ::core::default::Default> {
+            fn f<U: ::core::default::Default>(&self) -> usize {
+                let a: @0 = ::core::unimplemented!();
+                let b: @1 = ::core::unimplemented!();
+                let c: @2 = ::core::unimplemented!();
+                let d: @3 = ::core::unimplemented!();
+                ::core::mem::size_of::<@1>()
+            }
+        }"
+        .replace("@0", &format!("P<{}usize>", ix("inner :: Local")))
+        .replace("@1", &format!("P<{}usize>", ix("inner :: Wrap < U >")))
+        .replace("@2", &format!("P<{}usize>", ix("inner :: Wrap < T >")))
+        .replace("@3", &format!("P<{}usize>", ix("inner :: Wrap < Self >"))),
+    )
+    .unwrap();
+    assert_eq!(f40_copy(&referrer, context, &item), string(&expected));
+
+    // The same in an impl: the body of a method, the value of a const, the generics of the impl.
+    let item: ItemImpl = parse_quote! {
+        impl<T: ::core::default::Default> ::p::Tr<T> for ::p::S<T> {
+            const N: usize = ::core::mem::size_of::<inner::Local>();
+            fn f(&self) -> usize {
+                let w: inner::Wrap<T> = ::core::unimplemented!();
+                ::core::mem::size_of::<inner::Wrap<Self>>()
+            }
+        }
+    };
+    let mut leaker = values_leaker();
+    let context = leaker.intern_impl(&item, true).unwrap();
+    let referrer = leaker.finish();
+    let required: Vec<String> = referrer.required().map(|(_, ty)| string(ty)).collect();
+    assert_eq!(
+        required,
+        [
+            "inner :: Local",
+            "inner :: Wrap < T >",
+            "inner :: Wrap < Self >"
+        ]
+    );
+    let mut copy = item.clone();
+    referrer
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visit_item_impl_mut(&mut copy);
+    let expected: ItemImpl = parse_quote! {
+        impl<T: ::core::default::Default> ::p::Tr<T> for ::p::S<T> {
+            const N: usize = ::core::mem::size_of::<P<0usize>>();
+            fn f(&self) -> usize {
+                let w: P<1usize> = ::core::unimplemented!();
+                ::core::mem::size_of::<P<2usize>>()
+            }
+        }
+    };
+    assert_eq!(string(&copy), string(&expected));
+}
+
+/// F40: each type position that the Visitor walks is read: a cast, a `let`, a closure, the
+/// arguments of a path, of a method call, of a struct literal and of a pattern, the self type and
+/// the trait arguments of a qualified path, and a type in a type, a block, a branch, an array
+/// length.
+#[test]
+fn f40_every_type_position_of_a_value_is_replaced() {
+    // The body, the entries in order of the `@k`, and the body the copy must have.
+    let table: &[(&str, &[&str], &str)] = &[
+        ("let _ = p as inner::C;", &["inner :: C"], "let _ = p as @0;"),
+        (
+            "let _: inner::A = ::core::unimplemented!();",
+            &["inner :: A"],
+            "let _: @0 = ::core::unimplemented!();",
+        ),
+        (
+            "let c = |a: inner::A, b: u8| -> inner::B { ::core::unimplemented!() }; let _ = c;",
+            &["inner :: A", "inner :: B"],
+            "let c = |a: @0, b: u8| -> @1 { ::core::unimplemented!() }; let _ = c;",
+        ),
+        (
+            "let _ = ::core::mem::size_of::<inner::Local>();",
+            &["inner :: Local"],
+            "let _ = ::core::mem::size_of::<@0>();",
+        ),
+        (
+            "let _ = Vec::<Local>::new();",
+            &["Local"],
+            "let _ = Vec::<@0>::new();",
+        ),
+        (
+            "let _ = ::core::iter::empty().collect::<Vec<inner::A>>();",
+            &["inner :: A"],
+            "let _ = ::core::iter::empty().collect::<Vec<@0>>();",
+        ),
+        (
+            "let _ = <inner::A>::new(); let _ = <inner::B as ::core::default::Default>::default();",
+            &["inner :: A", "inner :: B"],
+            "let _ = <@0>::new(); let _ = <@1 as ::core::default::Default>::default();",
+        ),
+        (
+            "let _ = <u8 as ::p::Tr<inner::A>>::f();",
+            &["inner :: A"],
+            "let _ = <u8 as ::p::Tr<@0>>::f();",
+        ),
+        (
+            "let y = ::core::unimplemented!(); let _ = ::p::S::<inner::A> { x: 1 }; let ::p::S::<inner::B> { x } = y;",
+            &["inner :: A", "inner :: B"],
+            "let y = ::core::unimplemented!(); let _ = ::p::S::<@0> { x: 1 }; let ::p::S::<@1> { x } = y;",
+        ),
+        (
+            "let _: ::core::option::Option<(inner::A, &inner::B)> = ::core::unimplemented!();",
+            &["inner :: A", "inner :: B"],
+            "let _: ::core::option::Option<(@0, &@1)> = ::core::unimplemented!();",
+        ),
+        (
+            "let _: [inner::A; 2] = ::core::unimplemented!();",
+            &["inner :: A"],
+            "let _: [@0; 2] = ::core::unimplemented!();",
+        ),
+        (
+            "let _ = [0u8; ::core::mem::size_of::<inner::A>()];",
+            &["inner :: A"],
+            "let _ = [0u8; ::core::mem::size_of::<@0>()];",
+        ),
+        (
+            "if p > 0 { let _: inner::A = ::core::unimplemented!(); } else { match p { 0 => { let _ = p as inner::B; } _ => {} } }",
+            &["inner :: A", "inner :: B"],
+            "if p > 0 { let _: @0 = ::core::unimplemented!(); } else { match p { 0 => { let _ = p as @1; } _ => {} } }",
+        ),
+        (
+            "let _: Box<dyn inner::Tr> = ::core::unimplemented!();",
+            &["dyn inner :: Tr"],
+            "let _: Box<@0> = ::core::unimplemented!();",
+        ),
+    ];
+    for (body, entries, copy) in table {
+        let source = format!("trait Tr<T> {{ fn f<U>(&self, p: u8) {{ {} }} }}", body);
+        let (item, referrer, context) = f40_trait(&source);
+        let found: Vec<String> = referrer.iter().map(string).collect();
+        let mut sorted = found.clone();
+        sorted.sort();
+        let mut wanted: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
+        wanted.sort();
+        assert_eq!(sorted, wanted, "{}", body);
+        assert!(referrer.required().count() == found.len(), "{}", body);
+        let mut text = copy.to_string();
+        for (k, ty) in entries.iter().enumerate() {
+            text = text.replace(
+                &format!("@{}", k),
+                &format!("P<{}usize>", entry(&referrer, ty)),
+            );
+        }
+        let expected: ItemTrait = parse_str(&format!(
+            "trait Tr<T> {{ fn f<U>(&self, p: u8) {{ {} }} }}",
+            text
+        ))
+        .unwrap();
+        assert_eq!(
+            f40_copy(&referrer, context, &item),
+            string(&expected),
+            "{}",
+            body
+        );
+    }
+}
+
+/// F40, the optional entries: an absolute type of another crate that holds the relative one. A
+/// Referrer that trusts the names of the crates replaces the relative type only; a strict one
+/// replaces the whole type. Both as for a type of a signature.
+#[test]
+fn f40_an_absolute_type_of_a_value_is_an_optional_entry() {
+    let source =
+        "trait Tr { fn f(&self) { let _: ::p::Wrap<inner::Local> = ::core::unimplemented!(); } }";
+    let (item, referrer, context) = f40_trait(source);
+    assert_eq!(
+        referrer
+            .iter()
+            .enumerate()
+            .map(|(ix, ty)| format!("{}{}", if referrer.must(ix) { "" } else { "?" }, string(ty)))
+            .collect::<Vec<_>>(),
+        ["inner :: Local", "?:: p :: Wrap < inner :: Local >"]
+    );
+    assert_eq!(referrer.external_crates_require(1), ["p"]);
+    let trusting = f40_copy(&referrer, context, &item);
+    let expected: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(&self) {
+                let _: ::p::Wrap<P<0usize>> = ::core::unimplemented!();
+            }
+        }
+    );
+    assert_eq!(trusting, string(&expected));
+    let strict = referrer.allow_ambiguous_crate_name(false);
+    let expected: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(&self) {
+                let _: P<1usize> = ::core::unimplemented!();
+            }
+        }
+    );
+    assert_eq!(f40_copy(&strict, context, &item), string(&expected));
+}
+
+/// F40, the module: the const, the static and the functions of a module are read with the names
+/// the module declares. What the module declares is copied with it, not leaked.
+#[test]
+fn f40_the_values_of_a_module() {
+    let item: ItemMod = parse_quote! {
+        mod m {
+            pub struct Declared(pub u8);
+            pub const SIZE: usize = ::core::mem::size_of::<Declared>() + ::core::mem::size_of::<inner::Local>();
+            pub static OTHER: usize = ::core::mem::size_of::<inner::Other>();
+            pub fn f() -> usize {
+                let x: inner::Local = ::core::unimplemented!();
+                let y: Declared = ::core::unimplemented!();
+                ::core::mem::size_of::<::p::W<inner::Local>>()
+            }
+        }
+    };
+    let mut leaker = values_leaker();
+    let module = leaker.intern_mod(&item).unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(
+        referrer
+            .iter()
+            .enumerate()
+            .map(|(ix, ty)| format!("{}{}", if referrer.must(ix) { "" } else { "?" }, string(ty)))
+            .collect::<Vec<_>>(),
+        [
+            "inner :: Local",
+            "inner :: Other",
+            "?:: p :: W < inner :: Local >"
+        ]
+    );
+    // The entries are those of the module, which the copy is in.
+    for ix in 0..3 {
+        assert_eq!(referrer.context_module(referrer.context(ix)), Some(module));
+    }
+    let mut file = file_of(item.content.clone().unwrap().1);
+    referrer
+        .visitor(module, |_, ix| parse_quote!(P<#ix>))
+        .visit_file_mut(&mut file);
+    let expected: File = parse_quote! {
+        pub struct Declared(pub u8);
+        pub const SIZE: usize = ::core::mem::size_of::<Declared>() + ::core::mem::size_of::<P<0usize>>();
+        pub static OTHER: usize = ::core::mem::size_of::<P<1usize>>();
+        pub fn f() -> usize {
+            let x: P<0usize> = ::core::unimplemented!();
+            let y: Declared = ::core::unimplemented!();
+            ::core::mem::size_of::<::p::W<P<0usize>>>()
+        }
+    };
+    assert_eq!(string(&file), string(&expected));
+}
+
+/// F40, the nested trait: the `Self` of a trait nested in a scope is its own, and an entry of a
+/// value that names it is written by `Visitor::with_nested_self()`, as one of a signature is.
+#[test]
+fn f40_a_nested_trait_writes_the_entry_that_names_its_self() {
+    let item: Item = parse_quote!(
+        pub trait Tr {
+            const N: usize = ::core::mem::size_of::<inner::Local>();
+            fn f(&self) -> usize {
+                let w: inner::Wrap<Self> = ::core::unimplemented!();
+                ::core::mem::size_of::<inner::Local>()
+            }
+        }
+    );
+    for nest in [Nest::EnterMod, Nest::InternMod] {
+        let mut leaker = values_leaker();
+        let context = match nest {
+            Nest::EnterMod => {
+                leaker
+                    .enter_mod("m", names(&["Tr"]), |view| view.visit_item(&item))
+                    .unwrap()
+                    .0
+            }
+            _ => leaker.intern_mod(&parse_quote!(mod m { #item })).unwrap(),
+        };
+        let referrer = leaker.finish();
+        let (mut visitor, calls) = nested_visitor(&referrer, context);
+        let mut file = file_of(vec![item.clone()]);
+        visitor.visit_file_mut(&mut file);
+        let local = entry(&referrer, "inner :: Local");
+        let wrap = entry(&referrer, "inner :: Wrap < Self >");
+        let expected: Item = parse_str(
+            &"pub trait Tr {
+                const N: usize = ::core::mem::size_of::<P<@0>>();
+                fn f(&self) -> usize {
+                    let w: N<@1> = ::core::unimplemented!();
+                    ::core::mem::size_of::<P<@0>>()
+                }
+            }"
+            .replace("@0", &format!("{}usize", local))
+            .replace("@1", &format!("{}usize", wrap)),
+        )
+        .unwrap();
+        assert_eq!(string(&file.items[0]), string(&expected), "{:?}", nest);
+        assert_eq!(calls.take(), ["Self: Tr / Tr / "], "{:?}", nest);
+    }
+}
+
+/// F40, the controls: what the Leaker still rejects, and why. A path that is not a type, a type
+/// that names what the value declares, the tokens of a macro and an item nested in a body are
+/// not leaked. The type of a signature and the types that need no entry are as ever.
+#[test]
+fn f40_what_is_not_a_type_position_stays_rejected() {
+    let rejected = |path: &str| format!("use absolute path: '{}'", path);
+    let value = "it is in the default body of `f`, which the copy writes as it is";
+    // Not a type: a function, an associated function, a struct literal, a variant, a constant,
+    // the trait of a qualified path.
+    for (body, path) in [
+        ("let _ = inner::f();", "inner :: f"),
+        ("let _ = Local::new();", "Local :: new"),
+        ("let _ = Local { a: 1 };", "Local"),
+        ("let _ = inner::E::V;", "inner :: E :: V"),
+        ("let _ = inner::X + 1;", "inner :: X"),
+        ("let _ = <u8 as inner::Tr>::f();", "inner :: Tr"),
+        (
+            "let _ = Wrap2::<inner::A>::new();",
+            "Wrap2 :: < inner :: A > :: new",
+        ),
+    ] {
+        let source = format!("trait Tr {{ fn f(&self) {{ {} }} }}", body);
+        assert_eq!(
+            f40_errors(&source),
+            [(rejected(path), value.to_string())],
+            "{}",
+            body
+        );
+    }
+    // A type that names something the value declares is read, not leaked: the relative path in
+    // it is rejected, and the note says why. Without one it is fine, and leaks nothing.
+    let declared = format!(
+        "{}; the type names `Loc`, which the value declares, so it is not leaked",
+        value
+    );
+    assert_eq!(
+        f40_errors("trait Tr { fn f(&self) { struct Loc; let _: ::p::Pair<Loc, inner::A> = ::core::unimplemented!(); } }"),
+        [(rejected("inner :: A"), declared.clone())]
+    );
+    assert_eq!(
+        f40_errors("trait Tr { fn f(&self) { use ::p::Loc; let _: ::p::Pair<Loc, inner::A> = ::core::unimplemented!(); } }"),
+        [(rejected("inner :: A"), declared)]
+    );
+    assert_eq!(
+        f40_errors("trait Tr { fn f(&self) { let _ = for<'a> |x: &'a inner::A| x; } }"),
+        [(
+            rejected("inner :: A"),
+            format!(
+                "{}; the type names `'a`, which the value declares, so it is not leaked",
+                value
+            )
+        )]
+    );
+    for body in [
+        "struct Loc; let _: Loc = ::core::unimplemented!();",
+        "struct Loc; let _: ::p::Pair<Loc, u8> = ::core::unimplemented!();",
+        "fn id<V>(v: V) -> V { let w: V = v; w } let _ = id(1);",
+        "struct Loc<'a>(&'a u8); let _: Loc<'_> = ::core::unimplemented!();",
+    ] {
+        let source = format!("trait Tr {{ fn f(&self) {{ {} }} }}", body);
+        let (_, referrer, _) = f40_trait(&source);
+        assert!(referrer.is_empty(), "{}", body);
+    }
+    // The tokens of a macro are not walked by the Visitor.
+    assert_eq!(
+        f40_errors("trait Tr { fn f(&self) { ::core::assert_eq!(::core::mem::size_of::<inner::A>(), 4); } }"),
+        [(rejected("inner :: A"), value.to_string())]
+    );
+    // The types of an item that the body declares are the item's, not the body's.
+    assert_eq!(
+        f40_errors("trait Tr { fn f(&self) { fn g<V>() { let _: inner::Wrap<V> = ::core::unimplemented!(); } } }"),
+        [(rejected("inner :: Wrap < V >"), value.to_string())]
+    );
+    assert_eq!(
+        f40_errors("trait Tr { fn f(&self) { struct L(inner::A); } }"),
+        [(rejected("inner :: A"), value.to_string())]
+    );
+    // `_` is inferred where it is written, so no impl of the Repeater can hold it.
+    let (_, referrer, _) = f40_trait(
+        "trait Tr { fn f(&self, p: u8) { let _: Vec<_> = ::core::unimplemented!(); let _: ::p::Wrap<_> = ::core::unimplemented!(); let _ = p as _; } }",
+    );
+    assert!(referrer.is_empty());
+    let (_, referrer, _) = f40_trait(
+        "trait Tr { fn f(&self) { let _: ::p::Wrap<inner::A, _> = ::core::unimplemented!(); } }",
+    );
+    assert_eq!(
+        referrer.iter().map(string).collect::<Vec<_>>(),
+        ["inner :: A"]
+    );
+    let errors =
+        f40_errors("trait Tr { fn f(&self) { let _: Rel<_> = ::core::unimplemented!(); } }");
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, rejected("Rel < _ >"));
+    assert_eq!(errors[0].1, "it cannot be leaked as a whole because of `_`");
+    // A lifetime that is elided: the type that has it is not leaked whole, as in a signature.
+    let errors =
+        f40_errors("trait Tr { fn f(&self) { let _: Rel<'_> = ::core::unimplemented!(); } }");
+    assert_eq!(errors[0].0, rejected("Rel < '_ >"));
+    let (_, referrer, _) =
+        f40_trait("trait Tr { fn f(&self) { let _: &inner::A = ::core::unimplemented!(); } }");
+    assert_eq!(
+        referrer.iter().map(string).collect::<Vec<_>>(),
+        ["inner :: A"]
+    );
+    // `Self` where it is denied: the same rules as elsewhere.
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(&self) {
+                let _: inner::A<Self> = ::core::unimplemented!();
+            }
+        }
+    );
+    assert!(values_leaker().intern_trait(&item, true).is_ok());
+    let err = values_leaker().intern_trait(&item, false).unwrap_err();
+    assert_eq!(
+        err.items().next().unwrap().message,
+        rejected("inner :: A < Self >")
+    );
+    // Without a trait: `Self` has no meaning in a function of a module.
+    let item: ItemMod = parse_quote!(
+        mod m {
+            pub fn f() {
+                let _: inner::A<Self> = ::core::unimplemented!();
+            }
+        }
+    );
+    assert!(matches!(
+        values_leaker().intern_mod(&item),
+        Err(NotInternableError::SelfWithoutMeaning(_))
+    ));
+}
+
+/// F40: the lifetime of a method in a type of its body. The body is no input of the signature, so
+/// a type that names the lifetime does not make the copy leave it unconstrained (E0195, which
+/// `Leaker::intern_trait` checks for the types of the signature), and the entry is found in the
+/// body as in the signature.
+#[test]
+fn f40_a_lifetime_of_the_method_in_a_type_of_its_body() {
+    let source = "trait Tr {
+        fn f<'a>(&self, x: &'a u8) -> &'a u8 {
+            let w: inner::Lt<'a> = ::core::unimplemented!();
+            let r: &'a inner::A = ::core::unimplemented!();
+            x
+        }
+    }";
+    let (item, referrer, context) = f40_trait(source);
+    assert_eq!(referrer.iter().count(), 2);
+    let (lt, a) = (
+        entry(&referrer, "inner :: Lt < 'a >"),
+        entry(&referrer, "inner :: A"),
+    );
+    // `'a` is a lifetime of the method: the entry is for it.
+    assert_eq!(
+        string(referrer.context_generics(referrer.context(lt))),
+        "< 'a >"
+    );
+    assert_eq!(string(referrer.context_generics(referrer.context(a))), "");
+    let expected: ItemTrait = parse_str(
+        &"trait Tr {
+            fn f<'a>(&self, x: &'a u8) -> &'a u8 {
+                let w: P<@0> = ::core::unimplemented!();
+                let r: &'a P<@1> = ::core::unimplemented!();
+                x
+            }
+        }"
+        .replace("@0", &format!("{}usize", lt))
+        .replace("@1", &format!("{}usize", a)),
+    )
+    .unwrap();
+    assert_eq!(f40_copy(&referrer, context, &item), string(&expected));
+}
+
+/// F40: the scopes of the macro that analyzes a function itself (`enter_generics()` and
+/// `View::visit_item()`) read its body too, with the generics of the scope.
+#[test]
+fn f40_a_function_visited_through_a_scope() {
+    let item: Item = parse_quote! {
+        fn f<T: ::core::default::Default>() -> usize {
+            let x: inner::Wrap<T> = ::core::unimplemented!();
+            ::core::mem::size_of::<inner::Local>()
+        }
+    };
+    let mut leaker = values_leaker();
+    let (context, ()) = leaker
+        .enter_generics(&parse_quote!(<>), |view| view.visit_item(&item))
+        .unwrap();
+    let referrer = leaker.finish();
+    let mut found: Vec<String> = referrer.iter().map(string).collect();
+    found.sort();
+    assert_eq!(found, ["inner :: Local", "inner :: Wrap < T >"]);
+    let wrap = entry(&referrer, "inner :: Wrap < T >");
+    let local = entry(&referrer, "inner :: Local");
+    let expected: Item = parse_str(
+        &"fn f<T: ::core::default::Default>() -> usize {
+            let x: P<@0> = ::core::unimplemented!();
+            ::core::mem::size_of::<P<@1>>()
+        }"
+        .replace("@0", &format!("{}usize", wrap))
+        .replace("@1", &format!("{}usize", local)),
+    )
+    .unwrap();
+    // The copy is the function of a body, nested in the scope: its generics are its own.
+    assert_eq!(rewrite(&referrer, context, item), string(&expected));
 }

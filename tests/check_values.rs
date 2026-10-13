@@ -1,6 +1,9 @@
 //! `LeakerConfig::check_values()`: the Leaker reads the values of an item (the default of an
 //! associated const, the value of a const or a static, the body of a function), and rejects a path
-//! that depends on where it is written. It leaks nothing there: a value is copied as written.
+//! that depends on where it is written. A value is copied as written, so it leaks nothing but the
+//! types in a type position (a cast, a `let`, a closure, a turbofish, a qualified path), which the
+//! Visitor replaces: see `types_in_type_positions_are_leaked()` and, for the copy,
+//! `tests/findings.rs` (F40).
 //!
 //! The check must not reject what means the same everywhere, so it follows the scopes of a body:
 //! bindings, parameters, closure parameters, patterns, and the items and `use` declarations of a
@@ -139,27 +142,13 @@ fn a_relative_path_is_rejected_wherever_it_is() {
         ("rel();", "rel"),
         ("let _ = Rel::new();", "Rel :: new"),
         ("let _ = size_of::<u8>();", "size_of :: < u8 >"),
-        (
-            "let _ = ::core::mem::size_of::<inner::Local>();",
-            "inner :: Local",
-        ),
-        ("let _: Rel2 = Default::default();", "Rel2"),
-        ("let _ = Vec::<Rel>::new();", "Rel"),
-        (
-            "let v: ::std::vec::Vec<Rel> = ::std::vec::Vec::new(); let _ = v;",
-            "Rel",
-        ),
-        ("let _ = p as Rel;", "Rel"),
-        (
-            "let _ = <Rel as ::core::default::Default>::default();",
-            "Rel",
-        ),
         ("let _ = <u8 as Rel>::f();", "Rel"),
+        // the arguments of a path whose own path is relative are not read
+        ("let _ = Vec2::<Rel>::new();", "Vec2 :: < Rel > :: new"),
         ("let _ = Rel { a: 1 };", "Rel"),
         ("let Rel { a } = x; let _ = a;", "Rel"),
         ("let _ = || Rel::new();", "Rel :: new"),
         ("let _ = [Rel::new()];", "Rel :: new"),
-        ("let _ = Self::g(self).h::<Rel>();", "Rel"),
         ("let _ = crate::f();", "crate :: f"),
         ("let _ = super::f();", "super :: f"),
         ("let _ = self::f();", "self :: f"),
@@ -174,6 +163,62 @@ fn a_relative_path_is_rejected_wherever_it_is() {
             body,
             got
         );
+    }
+}
+
+/// The entries of a trait whose method `f` has the body `body` (see `body_messages()`).
+fn body_entries(body: &str) -> Vec<String> {
+    let source = format!(
+        "trait Tr<T: ::core::default::Default, const N: usize> {{
+            fn g(&self) {{}}
+            fn f<U: ::core::default::Default>(&self, p: u8) {{ {} }}
+        }}",
+        body
+    );
+    let item: ItemTrait = parse_str(&source).unwrap_or_else(|e| panic!("{}: {}", source, e));
+    let mut leaker = Leaker::from_config(config());
+    if let Err(err) = leaker.intern_trait(&item, true) {
+        panic!("{}: {}", body, err);
+    }
+    let referrer = leaker.finish();
+    let mut entries: Vec<String> = referrer.iter().map(|ty| quote!(#ty).to_string()).collect();
+    entries.sort();
+    entries
+}
+
+/// A type in a type position of a value is an entry, not an error: the cases that
+/// `a_relative_path_is_rejected_wherever_it_is()` used to hold (F40 of `tests/findings.rs`).
+#[test]
+fn types_in_type_positions_are_leaked() {
+    for (body, entries) in [
+        (
+            "let _ = ::core::mem::size_of::<inner::Local>();",
+            vec!["inner :: Local"],
+        ),
+        (
+            "let _: Rel2 = ::core::default::Default::default();",
+            vec!["Rel2"],
+        ),
+        // a bare identifier is read as a type, as in an enum discriminant
+        ("let _ = Vec::<Rel>::new();", vec!["Rel"]),
+        ("let _ = Self::g(self).h::<Rel>();", vec!["Rel"]),
+        (
+            "let v: ::std::vec::Vec<Rel> = ::std::vec::Vec::new(); let _ = v;",
+            vec![":: std :: vec :: Vec < Rel >"],
+        ),
+        ("let _ = p as Rel;", vec!["Rel"]),
+        (
+            "let _ = <Rel as ::core::default::Default>::default();",
+            vec!["Rel"],
+        ),
+        // the generics in scope make the context of the entry, and need no entry of their own
+        (
+            "let _: inner::Wrap<(T, U, [u8; N])> = ::core::unimplemented!();",
+            vec!["inner :: Wrap < (T , U , [u8 ; N]) >"],
+        ),
+        ("let _: Vec<(T, U)> = ::core::unimplemented!();", vec![]),
+    ] {
+        assert_eq!(body_entries(body), entries, "{}", body);
     }
 }
 
@@ -193,29 +238,44 @@ fn the_std_prelude_and_the_primitives_are_allowed_only_if_asked() {
     let source = "trait Tr { fn f(&self, p: u8) -> Vec<u8> { let v: Vec<u8> = Vec::new(); v } }";
     // Allowed by both options.
     assert_eq!(messages_of(config(), source), Vec::<String>::new());
-    // Not by none: the primitives and the prelude are relative names, as in a type.
+    // Not by none: the primitives and the prelude are relative names, as in a type. The path
+    // `Vec::new` is rejected; the type `Vec<u8>` of the `let` is leaked, as the one of the
+    // signature is.
     let mut none = LeakerConfig::new();
     none.check_values();
     assert_eq!(
-        messages_of(none, source),
-        [
-            "use absolute path: 'Vec :: new'",
-            "use absolute path: 'Vec < u8 >'"
-        ]
+        messages_of(none.clone(), source),
+        ["use absolute path: 'Vec :: new'"]
     );
+    let entries = |config: LeakerConfig, source: &str| -> Vec<String> {
+        let item: ItemTrait = parse_str(source).unwrap();
+        let mut leaker = Leaker::from_config(config);
+        leaker.intern_trait(&item, true).unwrap();
+        let mut entries: Vec<String> = leaker
+            .finish()
+            .iter()
+            .map(|ty| quote!(#ty).to_string())
+            .collect();
+        entries.sort();
+        entries
+    };
+    let types = "trait Tr { fn f(&self, p: u8) -> Vec<u8> { let v: Vec<u8> = ::core::unimplemented!(); v } }";
+    assert_eq!(entries(none, types), ["Vec < u8 >", "u8"]);
     // Each option allows its own names: `Vec` or `u8`.
     let mut only_primitive = LeakerConfig::new();
     only_primitive.allow_primitive().check_values();
     assert_eq!(
-        messages_of(only_primitive, source),
-        [
-            "use absolute path: 'Vec :: new'",
-            "use absolute path: 'Vec < u8 >'"
-        ]
+        messages_of(only_primitive.clone(), source),
+        ["use absolute path: 'Vec :: new'"]
     );
+    assert_eq!(entries(only_primitive, types), ["Vec < u8 >"]);
     let mut only_prelude = LeakerConfig::new();
     only_prelude.allow_std_prelude().check_values();
-    assert_eq!(messages_of(only_prelude, source), rejected("u8"));
+    assert_eq!(
+        messages_of(only_prelude.clone(), source),
+        Vec::<String>::new()
+    );
+    assert_eq!(entries(only_prelude, types), ["Vec < u8 >", "u8"]);
 }
 
 /// The trait's own name is a relative path, like any other name of the module of the item.
@@ -460,10 +520,6 @@ fn an_associated_const_default_is_read() {
         ("trait Tr { const A: usize = inner::X; }", "inner :: X"),
         ("trait Tr { const A: Rel = Rel::new(); }", "Rel :: new"),
         ("trait Tr { const A: usize = <u8 as Rel>::N; }", "Rel"),
-        (
-            "trait Tr { const A: usize = ::core::mem::size_of::<Rel>(); }",
-            "Rel",
-        ),
         (
             "trait Tr { const A: usize = { let x = 1; x + rel() }; }",
             "rel",

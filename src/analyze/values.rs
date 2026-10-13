@@ -1,23 +1,43 @@
 //! The check of the values of an item, for [`LeakerConfig::check_values()`]: the default of an
 //! associated const, the value of a const or a static, and the body of a function.
 //!
-//! The copy writes a value as it is, since it cannot go through the Repeater. So the check does
-//! not leak anything: it rejects every path that depends on where it is written, with the error of
-//! a relative path. It must not reject what is not relative, so it follows the scopes of a body:
-//! a `let` binding, the parameter of a function or a closure, the names of a pattern, and the items
+//! The copy writes a value as it is, since an expression cannot go through the Repeater. So the
+//! check rejects every path of the value that depends on where it is written, with the error of a
+//! relative path. It must not reject what is not relative, so it follows the scopes of a body: a
+//! `let` binding, the parameter of a function or a closure, the names of a pattern, and the items
 //! and `use` declarations of a block are local, and so are the generics and `Self` in scope.
 //!
-//! What it cannot see it rejects, because it would otherwise accept a path it never read: the
-//! arguments of a macro which are not expressions, a `macro_rules!`, a glob import, and syntax that
-//! `syn` leaves unparsed.
+//! A type is not an expression: the Referrer's visitor rewrites it where it stands, through the
+//! Repeater. So a type in a *type position* of a value is analyzed as any type of the item is,
+//! with the generics and `Self` in scope, and it becomes an entry if it names a relative path (or
+//! an optional one, for a path of another crate). The type positions are the ones the visitor
+//! walks as types: the target of an `as` cast, the type of a `let` and of the parameters and the
+//! output of a closure, the generic arguments of a path and of a method call (the turbofish), and
+//! the self type of a qualified path (`<Ty as Trait>::f`, not the trait). A bare identifier there
+//! (`size_of::<Local>()`) is read as a type, as in an enum discriminant.
+//!
+//! What stays rejected, as a relative path:
+//!
+//! - a path that is not a type position: a function, a constant, a struct literal or an enum
+//!   variant (`inner::f()`, `Local::new()`, `Local { .. }`), the trait of a qualified path;
+//! - a type that names something the value declares (an item, a `use`, a generic or a lifetime of
+//!   an item in a block): the copy writes the value with its declaration, so it cannot be leaked,
+//!   and a relative path beside it is rejected as in any other place of the value;
+//! - a type in the arguments of a macro, which the visitor does not rewrite, and a type in an item
+//!   that a block declares.
+//!
+//! What the check cannot see it rejects, because it would otherwise accept a path it never read:
+//! the arguments of a macro which are not expressions, a `macro_rules!`, a glob import, and syntax
+//! that `syn` leaves unparsed.
 
 use super::{self_segment, AnalyzeVisitor};
 use crate::analysis::{CheckResult, Effect};
 #[cfg(doc)]
 use crate::config::LeakerConfig;
-use crate::util::{ident_name, is_primitive_name, tidy};
+use crate::util::{ident_name, is_primitive_name, tidy, token_names};
 use proc_macro2::TokenStream;
 use std::collections::HashSet;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
@@ -78,6 +98,12 @@ struct ValueWalk<'a> {
     /// The first scope whose bindings are seen. An item in a block sees the items around it, but not
     /// the bindings.
     barrier: usize,
+    /// Greater than 0 where the walk reads a type itself instead of leaking it: in an item that a
+    /// block declares, in the arguments of a macro (the visitor does not rewrite tokens), and in
+    /// a type that names something the value declares.
+    reads: usize,
+    /// While such a type is read: the name it has that the value declares.
+    declared_name: Option<String>,
 }
 
 impl<'a> ValueWalk<'a> {
@@ -87,6 +113,8 @@ impl<'a> ValueWalk<'a> {
             what,
             scopes: vec![Names::default()],
             barrier: 0,
+            reads: 0,
+            declared_name: None,
         }
     }
 
@@ -100,6 +128,20 @@ impl<'a> ValueWalk<'a> {
 
     fn declare(&mut self, ident: &Ident) {
         self.scope().items.insert(ident_name(ident));
+    }
+
+    /// Declares a name that is not an identifier: a lifetime (`'a`).
+    fn declare_name(&mut self, name: String) {
+        self.scope().items.insert(name);
+    }
+
+    /// Returns `true` if the value declares `name` (an item, a generic, a lifetime or a binding),
+    /// wherever it appears: in a path, a lifetime or the tokens of a macro.
+    fn declares(&self, name: &str) -> bool {
+        self.scopes.iter().any(|scope| scope.items.contains(name))
+            || self.scopes[self.barrier..]
+                .iter()
+                .any(|scope| scope.bindings.contains(name))
     }
 
     /// Runs `f` in a new scope.
@@ -169,7 +211,13 @@ impl<'a> ValueWalk<'a> {
     /// Rejects the relative path `tokens`, with `help` for what to write if it has to say more
     /// than the absolute path.
     fn relative(&mut self, tokens: TokenStream, help: Option<String>) {
-        let note = format!("it is in {}, which the copy writes as it is", self.what);
+        let mut note = format!("it is in {}, which the copy writes as it is", self.what);
+        if let Some(name) = &self.declared_name {
+            note.push_str(&format!(
+                "; the type names `{}`, which the value declares, so it is not leaked",
+                name
+            ));
+        }
         self.error(CheckResult {
             must: vec![tokens.clone()],
             impossible: vec![tokens],
@@ -237,6 +285,44 @@ impl<'a> ValueWalk<'a> {
         }
     }
 
+    /// Handles a type in a type position of the value: it is leaked as any type of the item is,
+    /// unless it names something the value declares or holds syntax that `syn` leaves unparsed.
+    /// Then it is read here, and a relative path in it is rejected.
+    fn type_position(&mut self, ty: &Type) {
+        let mut scan = Scan {
+            walk: self,
+            declared: None,
+            unreadable: false,
+        };
+        scan.visit_type(ty);
+        let (declared, unreadable) = (scan.declared, scan.unreadable);
+        // A value inside a type (the length of an array) is part of that type, which is leaked
+        // whole or not at all: its types are not entries of their own.
+        let inside_type = self.visitor.type_depth > 0;
+        if declared.is_none() && !unreadable && !inside_type {
+            return self.leak(ty);
+        }
+        let outer = std::mem::replace(&mut self.declared_name, declared);
+        self.reads += 1;
+        self.visit_type(ty);
+        self.reads -= 1;
+        self.declared_name = outer;
+    }
+
+    /// Analyzes `ty` as a type of the item, where the visitor is.
+    ///
+    /// The signature around does not apply to a type in its body, whatever lifetime it names: the
+    /// types of the body are no input of the signature, so they do not decide which of its
+    /// lifetimes the copy leaves unconstrained (E0195).
+    fn leak(&mut self, ty: &Type) {
+        let signatures = std::mem::take(&mut self.visitor.signatures);
+        let outcome = catch_unwind(AssertUnwindSafe(|| self.visitor.visit_type(ty)));
+        self.visitor.signatures = signatures;
+        if let Err(payload) = outcome {
+            resume_unwind(payload);
+        }
+    }
+
     /// Checks a path that is a name alone, as a `use` root, a macro argument or a pattern.
     fn check_name(&mut self, ident: &Ident) {
         let path = Path::from(ident.clone());
@@ -296,13 +382,21 @@ impl<'a> ValueWalk<'a> {
         }
     }
 
-    /// Checks a macro call: the path, then the arguments, which are read as expressions.
+    /// Checks a macro call: the path, then the arguments, which are read as expressions. A type in
+    /// them is read, not leaked: the visitor does not rewrite the tokens of a macro.
     fn macro_call(&mut self, mac: &Macro) {
         let path = &mac.path;
         if !self.is_known(path) {
             let help = macro_help(path);
             return self.relative(quote!(#path !), Some(help));
         }
+        self.reads += 1;
+        self.macro_arguments_of(mac);
+        self.reads -= 1;
+    }
+
+    fn macro_arguments_of(&mut self, mac: &Macro) {
+        let path = &mac.path;
         let tokens = &mac.tokens;
         // These name no item in their arguments (`cfg!(unix)`, `stringify!(a b)`).
         if is_std_macro(path, &["cfg", "stringify"]) {
@@ -389,6 +483,9 @@ impl<'ast> Visit<'ast> for ValueWalk<'_> {
     }
 
     fn visit_type(&mut self, i: &'ast Type) {
+        if self.reads == 0 {
+            return self.type_position(i);
+        }
         match i {
             Type::Verbatim(tokens) => self.cannot_read(tokens.clone(), "syn does not parse it"),
             _ => syn::visit::visit_type(self, i),
@@ -434,7 +531,7 @@ impl<'ast> Visit<'ast> for ValueWalk<'_> {
             match param {
                 GenericParam::Type(param) => self.declare(&param.ident),
                 GenericParam::Const(param) => self.declare(&param.ident),
-                GenericParam::Lifetime(_) => (),
+                GenericParam::Lifetime(param) => self.declare_name(param.lifetime.to_string()),
             }
         }
         syn::visit::visit_generics(self, i)
@@ -468,6 +565,8 @@ impl<'ast> Visit<'ast> for ValueWalk<'_> {
     fn visit_item(&mut self, i: &'ast Item) {
         // The item sees the items around it, and the generics of its own, not the bindings.
         let outer = std::mem::replace(&mut self.barrier, self.scopes.len());
+        // The types of an item that a block declares are read, not leaked.
+        self.reads += 1;
         self.scoped(|walk| match i {
             Item::Use(item) => {
                 if has_glob(&item.tree) {
@@ -485,6 +584,7 @@ impl<'ast> Visit<'ast> for ValueWalk<'_> {
             Item::Verbatim(tokens) => walk.cannot_read(tokens.clone(), "syn does not parse it"),
             _ => syn::visit::visit_item(walk, i),
         });
+        self.reads -= 1;
         self.barrier = outer;
     }
 
@@ -507,6 +607,12 @@ impl<'ast> Visit<'ast> for ValueWalk<'_> {
 
     fn visit_expr_closure(&mut self, i: &'ast ExprClosure) {
         self.scoped(|walk| {
+            // `for<'a> |x: &'a u8| ..` declares a lifetime that only the closure knows.
+            for param in i.lifetimes.iter().flat_map(|binder| &binder.lifetimes) {
+                if let GenericParam::Lifetime(param) = param {
+                    walk.declare_name(param.lifetime.to_string());
+                }
+            }
             for input in &i.inputs {
                 walk.visit_pat(input);
             }
@@ -555,6 +661,82 @@ impl<'ast> Visit<'ast> for ValueWalk<'_> {
             walk.visit_pat(&i.pat);
             walk.visit_block(&i.body);
         })
+    }
+}
+
+/// What a type of a value names that decides how it is read: a name the value declares, and syntax
+/// that `syn` leaves unparsed.
+struct Scan<'w, 'a> {
+    walk: &'w ValueWalk<'a>,
+    /// The first name that the value declares (an item, a generic or a lifetime of an item in a
+    /// block, a `use`).
+    declared: Option<String>,
+    unreadable: bool,
+}
+
+impl Scan<'_, '_> {
+    fn name(&mut self, name: &str) {
+        if self.declared.is_none() && self.walk.declares(name) {
+            self.declared = Some(name.to_string());
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for Scan<'_, '_> {
+    fn visit_path(&mut self, i: &'ast Path) {
+        if self.declared.is_none() && self.walk.is_local(i) {
+            self.declared = i.segments.first().map(|seg| ident_name(&seg.ident));
+        }
+        syn::visit::visit_path(self, i)
+    }
+
+    fn visit_lifetime(&mut self, i: &'ast Lifetime) {
+        self.name(&i.to_string());
+    }
+
+    /// A type macro, or a macro in a length: the names in its tokens are not told apart.
+    fn visit_macro(&mut self, i: &'ast Macro) {
+        let mut names = HashSet::new();
+        token_names(i.tokens.clone(), &mut names);
+        let mut names: Vec<String> = names.into_iter().collect();
+        names.sort();
+        for name in names {
+            self.name(&name);
+        }
+        syn::visit::visit_macro(self, i)
+    }
+
+    fn visit_type(&mut self, i: &'ast Type) {
+        match i {
+            Type::Verbatim(_) => self.unreadable = true,
+            _ => syn::visit::visit_type(self, i),
+        }
+    }
+
+    fn visit_type_param_bound(&mut self, i: &'ast TypeParamBound) {
+        match i {
+            TypeParamBound::Verbatim(_) => self.unreadable = true,
+            _ => syn::visit::visit_type_param_bound(self, i),
+        }
+    }
+
+    fn visit_expr(&mut self, i: &'ast Expr) {
+        match i {
+            Expr::Verbatim(_) => self.unreadable = true,
+            _ => syn::visit::visit_expr(self, i),
+        }
+    }
+
+    fn visit_pat(&mut self, i: &'ast Pat) {
+        match i {
+            Pat::Verbatim(_) => self.unreadable = true,
+            _ => syn::visit::visit_pat(self, i),
+        }
+    }
+
+    /// An item in the length of an array declares names this scan does not follow.
+    fn visit_item(&mut self, _: &'ast Item) {
+        self.unreadable = true;
     }
 }
 

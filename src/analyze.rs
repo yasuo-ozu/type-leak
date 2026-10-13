@@ -3821,6 +3821,13 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
                 self.frame.unconstrained = unconstrained;
                 syn::visit::visit_type(self, i)
             }
+            // `_` (a type of a value: `let v: Vec<_>`) is inferred where it is written, and no impl
+            // of the Repeater can write it: a type that holds it is not leaked whole, and if it must
+            // be, it is a conflict.
+            Type::Infer(_) => {
+                self.impossibles.push(quote!(#i));
+                syn::visit::visit_type(self, i)
+            }
             Type::ImplTrait(_) | Type::Verbatim(_) => {
                 self.impossibles.push_soft(quote!(#i));
                 // `x: impl Tr<Wrap<T>>` is `x: X` with `X: Tr<Wrap<T>>`: the bounds of the
