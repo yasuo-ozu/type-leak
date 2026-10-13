@@ -2,7 +2,7 @@
 name = "type-leak"
 description = "Enable sharing type context beyond crate boundary"
 authors = ["Yasuo Ozu <yasuo@ozu.email>"]
-version = "0.8.2"
+version = "0.8.3"
 edition = "2018"
 rust-version = "1.56"
 repository = "https://github.com/yasuo-ozu/type-leak"
