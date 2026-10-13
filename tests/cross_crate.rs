@@ -585,6 +585,50 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9132, __tl_report_9132!()),
             ok("trait", 2, 5, 5),
         ),
+        // the default of a parameter of a struct and an enum nested in a module, when a bound of
+        // an earlier parameter names their `Self`: the entry has no `Self`
+        (
+            9151,
+            reported(9151, __tl_report_9151!()),
+            ok("struct", 1, 3, 3),
+        ),
+        (
+            9152,
+            reported(9152, __tl_report_9152!()),
+            ok("enum", 1, 3, 3),
+        ),
+        (
+            9153,
+            reported(9153, __tl_report_9153!()),
+            ok("struct", 2, 4, 4),
+        ),
+        (
+            9154,
+            reported(9154, __tl_report_9154!()),
+            ok("struct", 2, 5, 5),
+        ),
+        // a type that names their `Self` too (`nested_self_entries`): for any type, with `Self` in
+        // the type; and the control without a bound that names `Self`
+        (
+            9161,
+            reported(9161, __tl_report_9161!()),
+            ok("struct", 2, 2, 2),
+        ),
+        (
+            9162,
+            reported(9162, __tl_report_9162!()),
+            ok("enum", 2, 3, 3),
+        ),
+        (
+            9163,
+            reported(9163, __tl_report_9163!()),
+            ok("struct", 2, 3, 3),
+        ),
+        (
+            9164,
+            reported(9164, __tl_report_9164!()),
+            ok("struct", 2, 2, 2),
+        ),
         // the types in the values of an item (`check_values()`): the consts and the default
         // methods of a trait, and the const, the static and the function of a module
         (
@@ -1052,6 +1096,167 @@ fn the_default_of_a_nested_trait_that_names_its_self_is_written_through_the_host
     );
     r::SelfDefaultsCopy::<Owner, u8>::get(&TwoFirst, Owner, 1, l::Defd2(l::Rel(5), Owner));
     r::SelfDefaultsCopy::<Owner, u8, u16>::get(&TwoGiven, Owner, 1, 2);
+}
+
+/// The default of a parameter of a struct and an enum nested in a module, when a generic has a bound
+/// that names their own `Self` (`struct S<T: Clone + AsRef<Self>, U = Defd<T>>`; F41 of
+/// `tests/findings.rs`). The Leaker used to reject it. The copy cannot write `Self` in a default
+/// (E0735), so the entry `Defd<T>` has no `Self` and none of the bounds that name it: the Repeater's
+/// impl is `impl<T: Clone, __S: ?Sized> Repeater<(T,), ..> for __S` and the copy declares an ordinary
+/// default through it, `U = <() as Repeater<(T,), ..>>::Type`. rustc checks a default that uses a
+/// generic where it is used, so the default must be the type of the original there: an impl of
+/// the copy for `S<Owner>` is for `S<Owner, Defd<Owner>>`, and a function over the one is a function
+/// over the other.
+#[test]
+fn the_default_of_a_nested_struct_whose_bound_names_its_self_is_the_original_type() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_referrer::kinds as r;
+
+    #[derive(Clone)]
+    struct Owner;
+    // The bound holds for the copy's own types, with the default and with a given argument.
+    impl AsRef<r::SelfBoundDefault<Owner>> for Owner {
+        fn as_ref(&self) -> &r::SelfBoundDefault<Owner> {
+            unimplemented!()
+        }
+    }
+    #[derive(Clone)]
+    struct Given;
+    impl AsRef<r::SelfBoundDefault<Given, u8>> for Given {
+        fn as_ref(&self) -> &r::SelfBoundDefault<Given, u8> {
+            unimplemented!()
+        }
+    }
+    impl AsRef<r::SelfBoundDefaultEnum<Owner>> for Owner {
+        fn as_ref(&self) -> &r::SelfBoundDefaultEnum<Owner> {
+            unimplemented!()
+        }
+    }
+    impl AsRef<r::DefaultAndField<Owner>> for Owner {
+        fn as_ref(&self) -> &r::DefaultAndField<Owner> {
+            unimplemented!()
+        }
+    }
+    impl AsRef<r::TwoDefaults<Owner>> for Owner {
+        fn as_ref(&self) -> &r::TwoDefaults<Owner> {
+            unimplemented!()
+        }
+    }
+
+    // The omitted argument is the Leaker's `Defd<Owner>`: a function over the copy with the default
+    // is one over the copy with the type written, in both directions.
+    fn default_is_explicit(
+        f: fn(r::SelfBoundDefault<Owner>),
+    ) -> fn(r::SelfBoundDefault<Owner, l::Defd<Owner>>) {
+        f
+    }
+    fn explicit_is_default(
+        f: fn(r::SelfBoundDefault<Owner, l::Defd<Owner>>),
+    ) -> fn(r::SelfBoundDefault<Owner>) {
+        f
+    }
+    fn copy(_: r::SelfBoundDefault<Owner>) {}
+    default_is_explicit(copy)(r::SelfBoundDefault(Owner, l::Defd(PhantomData)));
+    explicit_is_default(copy)(r::SelfBoundDefault(Owner, l::Defd(PhantomData)));
+    // A given argument replaces the default.
+    let given: r::SelfBoundDefault<Given, u8> = r::SelfBoundDefault(Given, 7);
+    assert_eq!(given.1, 7);
+
+    // The enum.
+    fn enum_default_is_explicit(
+        f: fn(r::SelfBoundDefaultEnum<Owner>),
+    ) -> fn(r::SelfBoundDefaultEnum<Owner, l::Defd<Owner>>) {
+        f
+    }
+    fn copy_enum(e: r::SelfBoundDefaultEnum<Owner>) {
+        match e {
+            r::SelfBoundDefaultEnum::Plain(_) => (),
+            r::SelfBoundDefaultEnum::Defaulted(wrapped) => same(&wrapped, &l::Defd(PhantomData)),
+        }
+    }
+    enum_default_is_explicit(copy_enum)(r::SelfBoundDefaultEnum::Defaulted(l::Defd(PhantomData)));
+
+    // The default and a field of the same type: the field is the entry for any type, where the
+    // copy passes its own type, and it is `Defd<Owner>` as the default is.
+    let both = r::DefaultAndField::<Owner>(Owner, l::Defd(PhantomData), l::Defd(PhantomData));
+    same(&both.1, &both.2);
+    same(&both.2, &l::Defd::<Owner>(PhantomData));
+
+    // Two defaults, the second names the first: `V = Defd2<Rel, U>` with `U = Defd<T>`.
+    let two = r::TwoDefaults::<Owner>(
+        Owner,
+        l::Defd(PhantomData),
+        l::Defd2(l::Rel(3), l::Defd(PhantomData)),
+    );
+    same(&two.1, &l::Defd::<Owner>(PhantomData));
+    same(&two.2, &l::Defd2(l::Rel(3), l::Defd::<Owner>(PhantomData)));
+}
+
+/// A type that names the own `Self` of a struct, an enum or a union nested in a module, in an item
+/// whose generic has a bound that names it too (`struct S<T: AsRef<Self>> { link: Link<Self, T> }`),
+/// with `LeakerConfig::nested_self_entries()` (F42 of `tests/findings.rs`). The entry is for any
+/// type that the bound holds for, and the copy passes its own type as the implementor: the field is
+/// `Link<S<T>, T>` with the copy's `S`, as in the original. Without a bound that names `Self`
+/// (`Unbound`), the entry is for the Leaker's type as before, so the field holds the Leaker's.
+#[test]
+fn a_type_that_names_the_own_self_with_a_bound_that_names_it_is_the_copys_own() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_referrer::kinds as r;
+
+    let rel = l::Rel(1);
+    // The struct: the first argument of the field is the copy's own type.
+    struct Owner;
+    impl AsRef<r::Linked<Owner>> for Owner {
+        fn as_ref(&self) -> &r::Linked<Owner> {
+            unimplemented!()
+        }
+    }
+    let linked = r::Linked::<Owner> {
+        link: l::Link(PhantomData, Owner),
+        rel,
+    };
+    same(
+        &linked.link,
+        &l::Link::<r::Linked<Owner>, Owner>(PhantomData, Owner),
+    );
+    same(&linked.rel, &rel);
+
+    // The enum: `Link<Self, Rel>` is `Link<Variant<Owner2>, Rel>`, and `T` is not in the impl.
+    struct Owner2;
+    impl AsRef<r::Variant<Owner2>> for Owner2 {
+        fn as_ref(&self) -> &r::Variant<Owner2> {
+            unimplemented!()
+        }
+    }
+    let variant = r::Variant::<Owner2>::Me(l::Link(PhantomData, rel));
+    match &variant {
+        r::Variant::Me(link) => same(
+            link,
+            &l::Link::<r::Variant<Owner2>, l::Rel>(PhantomData, rel),
+        ),
+        _ => unreachable!(),
+    }
+
+    // The bound names `Self` among other types (`(Self, u8)`): the vector holds the copy's type.
+    struct Owner3;
+    impl AsRef<(r::Tuple<Owner3>, u8)> for Owner3 {
+        fn as_ref(&self) -> &(r::Tuple<Owner3>, u8) {
+            unimplemented!()
+        }
+    }
+    let tuple = r::Tuple::<Owner3>(vec![l::Link(PhantomData, 1)], Owner3, rel);
+    same::<Vec<l::Link<r::Tuple<Owner3>, u8>>>(&tuple.0, &Vec::new());
+
+    // No bound names `Self`: the entry is for the Leaker's type, so the field holds the Leaker's
+    // `Unbound`, not the copy's.
+    let unbound = r::Unbound::<u8> {
+        link: l::Link(PhantomData, 0),
+        rel,
+    };
+    same(
+        &unbound.link,
+        &l::Link::<l::Unbound<u8>, u8>(PhantomData, 0),
+    );
 }
 
 /// The types in the values of an item, with `LeakerConfig::check_values()` (F40 of

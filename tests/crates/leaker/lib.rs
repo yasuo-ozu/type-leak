@@ -884,6 +884,10 @@ pub mod kinds {
 
     pub struct Lt<'a, T>(pub &'a T);
 
+    /// A pair whose first type is behind a pointer, so that `Link<Self, T>` is no recursive type.
+    #[derive(Debug)]
+    pub struct Link<A: ?Sized, B>(pub PhantomData<*const A>, pub B);
+
     /// A const, and a path that takes one as an argument: `CW<A, LEN>` holds a bare identifier
     /// that is a const (which `syn` parses as a type), so the path is leaked as a whole.
     pub const LEN: usize = 3;
@@ -1352,6 +1356,77 @@ pub mod kinds {
     )]
     pub trait SelfDefaults<T: AsRef<Self>, U = Defd<T>, V = Defd2<Rel, T>> {
         fn get(&self, t: T, u: U, v: V);
+    }
+
+    // Items nested in a module whose generics have a bound that names their own `Self` (`T:
+    // AsRef<Self>`), and whose parameter defaults use the generic (`U = Defd<T>`, a type that the
+    // Referrer's crate does not import). The copy cannot write `Self` in a default (E0735), so the
+    // entry in a default is analyzed without `Self` and without the bounds that name it: the
+    // Repeater's impl is for any type, with the other bounds (`T: Clone`), and the copy writes an
+    // ordinary default through it. rustc checks a default that uses a generic where it is used, so
+    // the default is the type of the original there.
+
+    /// The bound names `Self` next to one that does not (`Clone`, which stays in the impl).
+    #[prop_leak(id = 9151, allow_self = true, scope = "mod", prelude = true)]
+    pub struct SelfBoundDefault<T: Clone + AsRef<Self>, U = Defd<T>>(pub T, pub U);
+
+    /// An enum, the bound in a where predicate.
+    #[prop_leak(id = 9152, allow_self = true, scope = "mod", prelude = true)]
+    pub enum SelfBoundDefaultEnum<T, U = Defd<T>>
+    where
+        T: Clone + AsRef<Self>,
+    {
+        Plain(T),
+        Defaulted(U),
+    }
+
+    /// The default and a field have the same type: the default is an entry without `Self`, and the
+    /// field one for any type (the copy passes its own).
+    #[prop_leak(id = 9153, allow_self = true, scope = "mod", prelude = true)]
+    pub struct DefaultAndField<T: AsRef<Self>, U = Defd<T>>(pub T, pub U, pub Defd<T>);
+
+    /// Two defaults, the second names the first.
+    #[prop_leak(id = 9154, allow_self = true, scope = "mod", prelude = true)]
+    pub struct TwoDefaults<T: AsRef<Self>, U = Defd<T>, V = Defd2<Rel, U>>(pub T, pub U, pub V);
+
+    // Items nested in a module whose generics have a bound that names their own `Self`, and a type
+    // that names it too (`LeakerConfig::nested_self_entries()`, `nested_self_entries = true`). The
+    // entry is for any type that the bound holds for, with `Self` as the implementor in the type
+    // too, and the copy passes its own: the field is `Link<MyStruct<T>, T>`, as in the original.
+    // The Repeater's impl keeps `Sized` (the leaked type may need it). An entry whose bound is
+    // not on `Self` is for the Leaker's type, as without the option. (The same struct without
+    // the option is 9115, which the Leaker rejects.)
+
+    /// The bound is on the parameter. The entry is not the last field: rustc before 1.70 cannot
+    /// prove that the copy is `Sized` otherwise (E0275).
+    #[prop_leak(id = 9161, allow_self = true, scope = "mod", prelude = true, nested_self_entries = true)]
+    pub struct Linked<T: AsRef<Self>> {
+        pub link: Link<Self, T>,
+        pub rel: Rel,
+    }
+
+    /// An enum, with `where Self: Sized` for rustc 1.56, and an entry that does not use the generic.
+    #[prop_leak(id = 9162, allow_self = true, scope = "mod", prelude = true, nested_self_entries = true)]
+    pub enum Variant<T: AsRef<Self>>
+    where
+        Self: Sized,
+    {
+        Plain(Rel),
+        Me(Link<Self, Rel>),
+        Held(T),
+    }
+
+    /// The bound is a where predicate that names `Self` among other types.
+    #[prop_leak(id = 9163, allow_self = true, scope = "mod", prelude = true, nested_self_entries = true)]
+    pub struct Tuple<T>(pub Vec<Link<Self, u8>>, pub T, pub Rel)
+    where
+        T: AsRef<(Self, u8)>;
+
+    /// No bound names `Self`: the entry is for the Leaker's type, as without the option.
+    #[prop_leak(id = 9164, allow_self = true, scope = "mod", prelude = true, nested_self_entries = true)]
+    pub struct Unbound<T: Clone> {
+        pub link: Link<Self, T>,
+        pub rel: Rel,
     }
 
     // The scopes of an item that share names, from the findings of a downstream crate

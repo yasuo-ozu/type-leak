@@ -20,8 +20,8 @@ use crate::util::{
     first_associated_self_in_generics, first_self_in_generics, first_self_in_type,
     generic_param_mentions_self, generic_param_name, has_lifetime_bound, ident_name,
     is_primitive_name, or_list, self_in_param, self_in_predicate, selves_in_generics, tidy,
-    token_names, trait_object_of, unwrap_type_group, where_predicate_mentions_self,
-    without_crate_prefix, without_defaults, AllowedPaths,
+    token_names, trait_object_of, type_mentions_self, unwrap_type_group,
+    where_predicate_mentions_self, without_crate_prefix, without_defaults, AllowedPaths,
 };
 use crate::view::View;
 use proc_macro2::TokenStream;
@@ -693,7 +693,9 @@ pub(crate) struct AnalyzeVisitor {
     /// item of a module, or `View::visit_item()`): the copy declares a type of its own there, so
     /// its `Self` is not the Leaker's type that the Repeater's impls are for. A type that does not
     /// name `Self` but has a bound that does is for any type (`SelfRequirement::Any`, see
-    /// [`AnalyzeVisitor::self_in_bounds()`]). An absolute type that names `Self` is not an
+    /// [`AnalyzeVisitor::self_in_bounds()`]), and so is one that names it with such a bound if
+    /// `nested_self_entries` is set. The default of a parameter has no entry for `Self` (see
+    /// `in_nested_default`). An absolute type that names `Self` is not an
     /// optional entry (see [`AnalyzeVisitor::names_nested_self()`]): it is copied as written, so
     /// its `Self` is the copy's own. The `Self` of a scope (`intern_struct()`, `enter_type()`) is
     /// the outermost item's, which the Visitor writes as the Leaker's type.
@@ -716,7 +718,10 @@ pub(crate) struct AnalyzeVisitor {
     in_default: Option<bool>,
     /// The type is the default of a parameter of a struct, an enum or a union nested in the
     /// analyzed syntax (`self_nested`): its copy cannot write `Self` there (E0735), so it cannot
-    /// pass its own type for an entry that is for any type.
+    /// pass its own type for an entry that is for any type. The entry of a type that does not
+    /// name `Self` is then analyzed without `Self` and without the bounds of the generics that
+    /// name it (see [`AnalyzeVisitor::context_of_as()`]), and one that names it is an error if a
+    /// bound does too.
     in_nested_default: bool,
     modules: Vec<ModuleFrame>,
     /// The causes that depend on the context: the depth of the type that has it, the path, and
@@ -767,6 +772,10 @@ pub(crate) struct AnalyzeVisitor {
     env_errors: Vec<CheckResult>,
     /// The values of an item are read too (see [`LeakerConfig::check_values()`]).
     check_values: bool,
+    /// An entry whose type names the `Self` of a struct, an enum or a union nested in the analyzed
+    /// syntax, and a bound of whose generics does, is for any type (see
+    /// [`LeakerConfig::nested_self_entries()`]).
+    nested_self_entries: bool,
 }
 
 /// A method signature being visited (see `AnalyzeVisitor::signatures`).
@@ -850,6 +859,7 @@ impl AnalyzeVisitor {
             not_optional: Vec::new(),
             env_errors: Vec::new(),
             check_values: false,
+            nested_self_entries: false,
         }
     }
 
@@ -857,6 +867,14 @@ impl AnalyzeVisitor {
     /// [`LeakerConfig::check_values()`]).
     pub(crate) fn reading_values(mut self, check_values: bool) -> Self {
         self.check_values = check_values;
+        self
+    }
+
+    /// Accepts an entry whose type names the `Self` of a nested struct, enum or union together with
+    /// a bound that does, as an entry for any type (see
+    /// [`LeakerConfig::nested_self_entries()`]), or not.
+    pub(crate) fn with_nested_self_entries(mut self, nested_self_entries: bool) -> Self {
+        self.nested_self_entries = nested_self_entries;
         self
     }
 
@@ -1017,19 +1035,58 @@ impl AnalyzeVisitor {
 
     /// Returns the context of `ty`, or why it cannot be written (see [`Context::of()`]).
     fn context_of(&self, ty: &Type, inner: &Frame) -> std::result::Result<Context, UnnameableSelf> {
+        self.context_of_as(ty, inner, false)
+    }
+
+    /// Like `context_of()`. `any`: the entry is for any type although `ty` names the `Self` of a
+    /// nested struct, enum or union (see [`Context::of_any()`]).
+    fn context_of_as(
+        &self,
+        ty: &Type,
+        inner: &Frame,
+        any: bool,
+    ) -> std::result::Result<Context, UnnameableSelf> {
         let context = if inner.mentions_root
             || inner.mentions_self
             || inner.local_scope < self.scopes.len()
         {
-            // A type that does not name the `Self` of a nested struct, enum or union, but has a
-            // bound that does, is for any type that the bound holds for (the copy's own).
-            Context::of(
-                ty,
-                &self.scopes,
-                self.self_ty.as_ref(),
-                self.self_nested,
-                &self.enclosing,
-            )?
+            if self.in_nested_default && !type_mentions_self(ty) {
+                // The copy of a nested struct, enum or union cannot write `Self` in the default of
+                // a parameter (E0735), so it cannot pass its own type for an entry that is for any
+                // type. The type does not name `Self`, so the entry has none, and the bounds of the
+                // generics that name it are not its business: the copy's own type proves them
+                // where it is used, and the impl is for any type.
+                let scopes: Vec<Scope> = self
+                    .scopes
+                    .iter()
+                    .map(|scope| {
+                        let mut scope = scope.clone();
+                        if scope.self_ty().is_some() && scope.self_ty() == self.self_ty.as_ref() {
+                            scope.without_self();
+                        }
+                        scope
+                    })
+                    .collect();
+                Context::of(ty, &scopes, None, false, &self.enclosing)?
+            } else if any {
+                Context::of_any(
+                    ty,
+                    &self.scopes,
+                    self.self_ty.as_ref(),
+                    self.self_nested,
+                    &self.enclosing,
+                )?
+            } else {
+                // A type that does not name the `Self` of a nested struct, enum or union, but has
+                // a bound that does, is for any type that the bound holds for (the copy's own).
+                Context::of(
+                    ty,
+                    &self.scopes,
+                    self.self_ty.as_ref(),
+                    self.self_nested,
+                    &self.enclosing,
+                )?
+            }
         } else {
             Context::none()
         };
@@ -1065,12 +1122,19 @@ impl AnalyzeVisitor {
         finder.found
     }
 
-    /// Returns `true` if `context` is that of a type that names the `Self` of a struct, an enum or
-    /// a union nested in the analyzed syntax (`self_nested`): the copy's own type, not the
-    /// Leaker's. (A type that does not name it, but has a bound that does, is for any type,
-    /// [`SelfRequirement::Any`].)
-    fn names_nested_self(&self, context: &Context) -> bool {
-        self.self_nested && matches!(context.self_ty(), Some(SelfRequirement::Type(_)))
+    /// Returns `true` if `ty`, with `context`, names the `Self` of a struct, an enum or a union
+    /// nested in the analyzed syntax (`self_nested`): the copy's own type, not the Leaker's. (A
+    /// type that does not name it, but has a bound that does, is for any type,
+    /// [`SelfRequirement::Any`]. So is one that names it with such a bound, if
+    /// `nested_self_entries` is set: that is an entry to be leaked, and an absolute type of that
+    /// kind is still copied as written.)
+    fn names_nested_self(&self, ty: &Type, context: &Context) -> bool {
+        self.self_nested
+            && match context.self_ty() {
+                Some(SelfRequirement::Type(_)) => true,
+                Some(SelfRequirement::Any) => type_mentions_self(ty),
+                _ => false,
+            }
     }
 
     /// Returns the first mention of `Self` in the generics of `context`, if `Self` may not be
@@ -1082,16 +1146,14 @@ impl AnalyzeVisitor {
     /// for ([`SelfRequirement::Any`]), and the copy passes its own: that is fine. A type that
     /// names it too (`Rel2<Self, T>`) is for the Leaker's type, which the bound that the
     /// environment proves (`T: AsRef<Self>`, `where T: AsRef<(Self, Rel)>`) does not hold for in
-    /// the copy, whose own type has it (E0277), and the impl cannot be for any type: what the
-    /// type needs of `Self` to be well-formed is not known. A predicate on another type, which an
-    /// impl proves (`Self: Sized`, `Vec<Self>: Clone`), and `Self: 'a` are fine.
+    /// the copy, whose own type has it (E0277), and the impl cannot be for any type unless the
+    /// Leaker is configured to accept the risk: what the type needs of `Self` to be well-formed is
+    /// not known ([`LeakerConfig::nested_self_entries()`]; see `own_context()`). A predicate on
+    /// another type, which an impl proves (`Self: Sized`, `Vec<Self>: Clone`), and `Self: 'a` are
+    /// fine.
     fn self_in_bounds(&self, context: &Context) -> Option<TokenStream> {
         if self.self_nested {
             return match context.self_ty() {
-                // The copy cannot write `Self` in a default (E0735).
-                Some(SelfRequirement::Any) if self.in_nested_default => {
-                    first_self_in_generics(context.generics())
-                }
                 Some(SelfRequirement::Any) => None,
                 _ => self_in_environment_bounds(context),
             };
@@ -1595,28 +1657,38 @@ impl AnalyzeVisitor {
                 })
             }
         };
-        match self.self_in_bounds(&context) {
+        let self_in_bounds = self.self_in_bounds(&context);
+        // With the option, an entry that names the `Self` of a nested struct, enum or union and has
+        // a bound that does is for any type, and the copy passes its own: the type keeps `Self`.
+        // Not in a default, where the copy cannot write `Self` (E0735).
+        if self_in_bounds.is_some()
+            && self.self_nested
+            && self.nested_self_entries
+            && !self.in_nested_default
+        {
+            if let Ok(any) = self.context_of_as(ty, inner, true) {
+                return match self.associated_self_in_bounds(&any) {
+                    Some(conflict) => Err(conflict.of(ty)),
+                    None => Ok(any),
+                };
+            }
+        }
+        match self_in_bounds {
             Some(self_path) if self.in_nested_default => Err(CheckResult {
                 must: vec![quote!(#ty)],
                 impossible: vec![self_path.clone()],
                 is_own: true,
                 optional: false,
                 note: Some(
-                    "the bounds of its generics mention the `Self` of an item nested in the \
-                     analyzed syntax, and the type is the default of a parameter: the copy \
-                     declares a type of its own, and cannot write `Self` in a default (E0735), \
-                     so it cannot pass it"
+                    "it names `Self`, which a struct, an enum or a union cannot write in the \
+                     default of a parameter (E0735), and the bounds of its generics mention the \
+                     `Self` of an item nested in the analyzed syntax too"
                         .to_string(),
                 ),
-                help: Some(format!(
-                    "write the bound of the generics of `{}` without `{}`, or write the default \
-                     with an absolute path",
-                    tidy(&quote!(#ty)),
-                    tidy(&self_path)
-                )),
+                help: Some("write the default without `Self`".to_string()),
                 headline: Some(format!(
-                    "`{}` is in the default of a parameter, and a bound of its generics names \
-                     `Self`",
+                    "`{}` is in the default of a parameter, and it and a bound of its generics \
+                     name `Self`",
                     quote!(#ty)
                 )),
             }),
@@ -1635,8 +1707,9 @@ impl AnalyzeVisitor {
                 help: Some(format!(
                     "write the bound of the generics of `{}` without `{}`, write the type \
                      without `Self`, write the type with an absolute path (it is copied as \
-                     written, and its `Self` is the copy's own), or analyze the item with its \
-                     own `intern_*` call, which writes its `Self` as the Leaker's type",
+                     written, and its `Self` is the copy's own), analyze the item with its own \
+                     `intern_*` call, which writes its `Self` as the Leaker's type, or accept \
+                     the entry for any type with `LeakerConfig::nested_self_entries()`",
                     tidy(&quote!(#ty)),
                     tidy(&self_path)
                 )),
@@ -2024,7 +2097,7 @@ impl AnalyzeVisitor {
             // leaked on its own still is (`Rel<T>` in `::p::Rel2<Self, Rel<T>>`), and it is not
             // replaced as a whole either when that costs fewer entries (`no_entry` and
             // `no_optional_entry` below).
-            Some(context) if self.names_nested_self(&context) => None,
+            Some(context) if self.names_nested_self(ty, &context) => None,
             optional => optional,
         };
         self.absorb(&inner);
@@ -2153,7 +2226,7 @@ impl AnalyzeVisitor {
                 // A type that names the `Self` of a nested struct, enum or union, and is copied as
                 // written but for its parts, is not an entry for them either, whatever the graph
                 // finds cheaper: `Self` in it is the copy's own, not the type of an entry.
-                let nested_self = self.names_nested_self(&context);
+                let nested_self = self.names_nested_self(ty, &context);
                 let no_entry = has_must && (nested_self || self.env_blocked(&context, false));
                 if has_must && !no_entry {
                     self.not_optional_in_bounds(&context);

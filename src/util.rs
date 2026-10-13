@@ -491,6 +491,37 @@ pub(crate) fn where_predicate_mentions_self(predicate: &WherePredicate) -> bool 
     !finder.found.is_empty()
 }
 
+pub(crate) fn bound_mentions_self(bound: &TypeParamBound) -> bool {
+    let mut finder = SelfFinder::default();
+    finder.visit_type_param_bound(bound);
+    !finder.found.is_empty()
+}
+
+/// Returns `predicate` without the bounds that mention `Self`, or `None` if nothing is left: a
+/// predicate on a type that mentions `Self` (`Self: Sized`, `Vec<Self>: Clone`) goes whole.
+pub(crate) fn without_self_bounds(predicate: &WherePredicate) -> Option<WherePredicate> {
+    match predicate {
+        WherePredicate::Type(predicate) => {
+            if type_mentions_self(&predicate.bounded_ty) {
+                return None;
+            }
+            let bounds: Punctuated<TypeParamBound, Token![+]> = predicate
+                .bounds
+                .iter()
+                .filter(|bound| !bound_mentions_self(bound))
+                .cloned()
+                .collect();
+            (!bounds.is_empty()).then(|| {
+                WherePredicate::Type(PredicateType {
+                    bounds,
+                    ..predicate.clone()
+                })
+            })
+        }
+        other => Some(other.clone()).filter(|predicate| !where_predicate_mentions_self(predicate)),
+    }
+}
+
 /// The mentions of `Self` in a generic parameter or a where predicate.
 pub(crate) struct SelfMentions {
     pub(crate) first: Option<TokenStream>,

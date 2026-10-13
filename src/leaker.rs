@@ -229,6 +229,9 @@ pub struct Leaker {
     assumed_primitives: Vec<Ident>,
     /// Whether the values of an item are read ([`LeakerConfig::check_values()`]).
     check_values: bool,
+    /// Whether an entry that names the `Self` of a nested struct, enum or union together with a
+    /// bound that does is accepted ([`LeakerConfig::nested_self_entries()`]).
+    nested_self_entries: bool,
 }
 
 impl Leaker {
@@ -242,6 +245,7 @@ impl Leaker {
         Self {
             allowed_paths: config.allowed_paths,
             check_values: config.check_values,
+            nested_self_entries: config.nested_self_entries,
             ..Self::default()
         }
     }
@@ -731,7 +735,8 @@ impl Scopes for Leaker {
     ) -> Res<(ContextId, R)> {
         let root = spec.declared_generics();
         let mut visitor = AnalyzeVisitor::new(AllowedPaths::new(&self.allowed_paths), &root)
-            .reading_values(self.check_values);
+            .reading_values(self.check_values)
+            .with_nested_self_entries(self.nested_self_entries);
         let mark = self.contexts.len();
         // The visitor owns the table of contexts while it analyzes, so the swap is the only step
         // before `catch_unwind`: no allocation, no user code. Whatever happens next (a result, an

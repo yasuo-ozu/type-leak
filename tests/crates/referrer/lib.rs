@@ -183,6 +183,18 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9122!(path = ::type_leak_test_leaker::kinds, strict);
     type_leak_test_leaker::__tl_prop_9123!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9124!(path = ::type_leak_test_leaker::kinds, strict);
+    // The defaults of a struct and an enum nested in a module, whose generic has a bound that names
+    // their `Self`: the entry has no `Self`, and the copy writes the default through the Repeater.
+    type_leak_test_leaker::__tl_prop_9151!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9152!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9153!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9154!(path = ::type_leak_test_leaker::kinds);
+    // A type that names the `Self` of such an item too, with `nested_self_entries`: for any type,
+    // and the copy passes its own.
+    type_leak_test_leaker::__tl_prop_9161!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9162!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9163!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9164!(path = ::type_leak_test_leaker::kinds);
     // The defaults of a nested trait whose generic has a bound that names its `Self`: the copy is
     // declared here, with the defaults written through the host.
     type_leak_test_leaker::__tl_prop_9131!(path = ::type_leak_test_leaker::kinds);

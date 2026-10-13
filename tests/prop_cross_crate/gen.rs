@@ -45,6 +45,13 @@
 //! default is looked up without `Self`. The traits carry the tags `shape:self_default`,
 //! `shape:plain_default` and `shape:redeclared`, which the statistics count and no rejection needs.
 //!
+//! Structs, enums and unions with a generic whose bound names their own `Self` and a default that
+//! uses it (`Features::self_bound_adts`, F41): `struct S<T: Clone + AsRef<Self>, U = Rel<T>>`, nested
+//! in `enter_mod` (`Gen::gen_self_bound_adt()`). With `Features::nested_self_entries` (F42) the
+//! attribute asks for `LeakerConfig::nested_self_entries()` (all the items nested in `enter_mod`),
+//! and some have a field that names `Self` in a relative type (`Rel2<Self, T>`), which is for any
+//! type that the bound holds for.
+//!
 //! Scopes: the macro analyzes some items through `enter_mod`, `enter_generics`, `enter_trait` or
 //! `enter_impl` instead of the `intern_*` of their kind (`Item::scope`, `SCOPES`).
 //!
@@ -295,6 +302,22 @@ pub struct Features {
     /// the Visitor left the default as written, which the Referrer's crate cannot resolve. Off,
     /// no trait has the shape (the defaults of the other traits are as before).
     pub trait_self_defaults: bool,
+    /// A struct, an enum or a union nested in `enter_mod` with a generic whose bound names its own
+    /// `Self` (`T: Clone + AsRef<Self>`, also in a where predicate) and parameters whose defaults
+    /// use it (`U = Rel<T>`). The copy cannot write `Self` in a default (E0735), so the entry in the
+    /// default has no `Self` and none of the bounds that name it; the Leaker used to reject the
+    /// item (F41: fixed, on by default). A field of the same type is an entry for any type, which the
+    /// copy passes its own type for (F37).
+    pub self_bound_adts: bool,
+    /// The Leaker is configured with `LeakerConfig::nested_self_entries()` for the items nested in
+    /// `enter_mod` (`nested_self_entries = true` in the attribute), and the structs, enums and unions
+    /// of `self_bound_adts` have a field that names their `Self` in a relative type (`Rel2<Self, T>`
+    /// with `T: AsRef<Self>`), which the Leaker rejects without the option (F42: on by default). The
+    /// option is an opt-in of the Leaker, with risks that the generator's types do not have (a bound
+    /// on the parameter of the leaked type that receives `Self`; rustc before 1.70 and the last
+    /// field). It is on for every item nested in `enter_mod`, so the items that name `Self` in a
+    /// field and have a bound that does are built, not rejected.
+    pub nested_self_entries: bool,
 }
 
 impl Features {
@@ -331,6 +354,8 @@ impl Features {
             declared_named_like_generic: true,
             bare_const_in_absolute_path: true,
             trait_self_defaults: true,
+            self_bound_adts: true,
+            nested_self_entries: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -368,6 +393,8 @@ impl Features {
                     features.declared_named_like_generic = true;
                     features.bare_const_in_absolute_path = true;
                     features.trait_self_defaults = true;
+                    features.self_bound_adts = true;
+                    features.nested_self_entries = true;
                 }
                 "inferred_outlives" => features.inferred_outlives = true,
                 "impl_assoc_self" => features.impl_assoc_self = true,
@@ -399,6 +426,8 @@ impl Features {
                 "declared_named_like_generic" => features.declared_named_like_generic = true,
                 "bare_const_in_absolute_path" => features.bare_const_in_absolute_path = true,
                 "trait_self_defaults" => features.trait_self_defaults = true,
+                "self_bound_adts" => features.self_bound_adts = true,
+                "nested_self_entries" => features.nested_self_entries = true,
                 "unsized_params" => features.unsized_params = true,
                 "bound_cycles" => features.bound_cycles = true,
                 other => panic!("unknown feature `{}`", other),
@@ -472,6 +501,13 @@ pub const TAG_MODULE_SCOPE: &str = "module_scope";
 pub const TAG_SELF_DEFAULT: &str = "shape:self_default";
 pub const TAG_PLAIN_DEFAULT: &str = "shape:plain_default";
 pub const TAG_REDECLARED: &str = "shape:redeclared";
+/// The shapes of `self_bound_adts` (F41, F42), which explain no rejection, and the Leaker must accept
+/// (`main.rs`, `unexplained()`): `shape:self_bound_adt`:
+/// a struct, enum or union nested in `enter_mod` whose bound names its `Self` and whose default uses
+/// the generic; `shape:self_bound_type`: a field also names `Self` in a relative type, which needs
+/// `nested_self_entries`.
+pub const TAG_SELF_BOUND_ADT: &str = "shape:self_bound_adt";
+pub const TAG_SELF_BOUND_TYPE: &str = "shape:self_bound_type";
 
 /// An item with a macro on it, which the Referrer invokes.
 #[derive(Clone)]
@@ -544,6 +580,9 @@ const SELF_DEFAULT_NAMES_SELF_PERCENT: u32 = 70;
 /// those the share that the Referrer's crate declares again (`redeclare`).
 const SELF_DEFAULT_NESTED_PERCENT: u32 = 45;
 const SELF_DEFAULT_REDECLARE_PERCENT: u32 = 60;
+/// The share of the structs, enums and unions analyzed one by one that have the shape of
+/// `self_bound_adts`.
+const SELF_BOUND_ADT_PERCENT: u32 = 10;
 
 // ---------------------------------------------------------------------------------------------
 // The model: bounds, types, the generics in scope.
@@ -3525,6 +3564,16 @@ struct SelfDefault {
     redeclare: bool,
 }
 
+/// The shape of a struct, an enum or a union of `self_bound_adts` (F41, F42):
+/// `Gen::self_bound_adt_shape()`.
+#[derive(Clone, Copy)]
+struct SelfBoundAdt {
+    /// The bound is a where predicate; else it is written in the parameter.
+    in_where: bool,
+    /// A field names `Self` in a relative type (`Rel2<Self, T>`): `nested_self_entries`.
+    names_self_in_type: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AdtKind {
     Struct,
@@ -3544,7 +3593,7 @@ impl Gen {
     fn attr(&self, id: usize, allow_self: bool, scope: &str, strict: bool) -> String {
         format!(
             "#[{}(id = {}, allow_self = {}, prelude = {}, scope = \"{}\", allow = \"{}\", \
-             {}strict = {}, primitive = {}, relaxed_sized = {})]\n",
+             {}{}strict = {}, primitive = {}, relaxed_sized = {})]\n",
             ATTR,
             id,
             allow_self,
@@ -3553,6 +3602,11 @@ impl Gen {
             self.cfg.allow_arg(),
             if self.redeclare {
                 "redeclare = true, "
+            } else {
+                ""
+            },
+            if scope == "mod" && self.features.nested_self_entries {
+                "nested_self_entries = true, "
             } else {
                 ""
             },
@@ -3675,6 +3729,9 @@ impl Gen {
     }
 
     fn gen_adt(&mut self, kind: AdtKind, ann: Option<(usize, bool)>) -> String {
+        if let Some(shape) = self.self_bound_adt_shape(ann) {
+            return self.gen_self_bound_adt(kind, ann, shape);
+        }
         let (prefix, kw) = match kind {
             AdtKind::Struct => ("S", "struct"),
             AdtKind::Enum => ("E", "enum"),
@@ -3833,6 +3890,204 @@ impl Gen {
         sk.tags = self.tags.clone();
         self.adts.push((name, sk));
         format!("{}{}\n", attr, text)
+    }
+
+    /// Whether the struct, enum or union about to be generated has the shape of `self_bound_adts` (F41,
+    /// F42), and which. Decided by the hash of the state, which draws nothing, as
+    /// `Gen::self_default_shape()` does. Only the items that the macro is applied to have it, and
+    /// they are nested in `enter_mod` (`nested_self`), which gives them a `Self` of their own.
+    fn self_bound_adt_shape(&self, ann: Option<(usize, bool)>) -> Option<SelfBoundAdt> {
+        ann?;
+        if !self.features.self_bound_adts || !self.features.nested_self || self.module_mode {
+            return None;
+        }
+        let mut state = self.rng.clone();
+        state.write(b"self_bound_adts");
+        let draw = state.finish();
+        if draw % 100 >= u64::from(SELF_BOUND_ADT_PERCENT) {
+            return None;
+        }
+        let percent = |n: u64, limit: u32| (draw / n) % 100 < u64::from(limit);
+        Some(SelfBoundAdt {
+            in_where: percent(100, 40),
+            names_self_in_type: self.features.nested_self_entries && percent(10_000, 60),
+        })
+    }
+
+    /// A struct, an enum or a union nested in `enter_mod` whose first parameter has a bound that
+    /// names its own `Self` (`T: Clone + AsRef<Self>`, or `AsRef<(Self, ())>`, `AsRef<Option<Self>>`;
+    /// in the parameter or in a where predicate), and whose trailing parameters have defaults that
+    /// use it (`U = Rel<T>`, `W = Rel2<T, U>`): `self_bound_adts`, F41. A field has the type of the
+    /// default too (an entry for any type, F37), and, with `nested_self_entries`, one names `Self`
+    /// in a relative type (`Rel2<Self, T>`, F42). The generics have no lifetime or const parameter,
+    /// and the item has no impl: the unit tests of `tests/findings.rs` cover them.
+    fn gen_self_bound_adt(
+        &mut self,
+        kind: AdtKind,
+        ann: Option<(usize, bool)>,
+        shape: SelfBoundAdt,
+    ) -> String {
+        let (prefix, kw) = match kind {
+            AdtKind::Struct => ("S", "struct"),
+            AdtKind::Enum => ("E", "enum"),
+            AdtKind::Union => ("U", "union"),
+        };
+        let name = self.name(prefix);
+        // The bound of the first parameter, and a bound of its own that names no `Self`.
+        let as_ref = self.trait_path("AsRef");
+        let bound = match self.below(3) {
+            0 => format!("{}<Self>", as_ref),
+            1 => format!("{}<(Self, ())>", as_ref),
+            _ => format!("{}<::core::option::Option<Self>>", as_ref),
+        };
+        let bounds = if self.chance(40) {
+            *self.pick(&[
+                Bounds::only_clone(),
+                Bounds::only_debug(),
+                Bounds::only_default(),
+            ])
+        } else {
+            Bounds::default()
+        };
+        let mut bound_texts = self.bound_texts(bounds);
+        let mut sk = Skeleton::default();
+        if shape.in_where {
+            sk.preds.push(format!("T: {}", bound));
+        } else {
+            bound_texts.push(bound);
+        }
+        let param = |name: &str, bounds: Bounds, bound_texts: Vec<String>| TyParam {
+            name: name.to_string(),
+            sized: true,
+            bounds,
+            bound_texts,
+            outlives: Vec::new(),
+            iter: false,
+            fixed_item: 0,
+        };
+        sk.tys.push(param("T", bounds, bound_texts));
+        let n_default = self.range(1, 2);
+        let defaulted = ["U", "W"];
+        for tyname in defaulted.iter().take(n_default) {
+            sk.tys.push(param(tyname, Bounds::default(), Vec::new()));
+        }
+        // The types of the module with one and two type arguments, that are not shadowed by `T`, `U`
+        // or `W`, and are written by a path that the Leaker leaks (not `::krate::base::B1`).
+        let heads = |g: &Gen, shape: Shape| -> Vec<String> {
+            g.env
+                .heads
+                .iter()
+                .filter(|h| h.shape == shape && !h.name.starts_with("::"))
+                .filter(|h| !is_shadow_name(&h.name))
+                .map(|h| h.name.clone())
+                .collect()
+        };
+        let (t1, t2) = (heads(self, Shape::T1), heads(self, Shape::T2));
+        if t1.is_empty() || t2.is_empty() {
+            // The module declares them all: unreachable, but a type with no entry is harmless.
+            return self.gen_self_bound_adt_fallback(kind, ann);
+        }
+        // The first default always names `T`, which has the bound; the second names the first.
+        let first = format!("{}<T>", self.pick(&t1));
+        sk.defaults.push(("U".to_string(), first.clone()));
+        if n_default == 2 {
+            let second = if self.chance(50) {
+                format!("{}<U>", self.pick(&t1))
+            } else {
+                format!("{}<T, U>", self.pick(&t2))
+            };
+            sk.defaults.push(("W".to_string(), second));
+        }
+        // The fields: every parameter, a field of the type of the default (an entry for any type),
+        // the type that names `Self` (F42), and one that is copied as written.
+        let mut fields: Vec<String> = sk.tys.iter().map(|t| t.name.clone()).collect();
+        if self.chance(60) {
+            fields.push(first);
+        }
+        if shape.names_self_in_type {
+            let ty = if self.chance(50) {
+                format!("{}<Self>", self.pick(&t1))
+            } else {
+                format!("{}<Self, T>", self.pick(&t2))
+            };
+            fields.push(if self.chance(40) {
+                format!("::core::option::Option<{}>", ty)
+            } else {
+                ty
+            });
+            self.tags.insert(TAG_SELF_BOUND_TYPE.to_string());
+        }
+        if self.chance(30) {
+            fields.push("::core::marker::PhantomData<*const Self>".to_string());
+        }
+        // No tag explains a rejection but the bare traits of the prelude (`bare:Clone`, where the
+        // Leaker does not allow the prelude): the Leaker must accept the item (`main.rs`,
+        // `unexplained()`).
+        self.tags.insert(TAG_SELF_BOUND_ADT.to_string());
+        let attr = self.attr_with(ann, "mod");
+        let (params, wc) = (sk.params_decl(), sk.where_clause());
+        let text = match kind {
+            AdtKind::Union => {
+                let body: Vec<String> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| format!("pub f{}: ::core::mem::ManuallyDrop<{}>", i, t))
+                    .collect();
+                format!(
+                    "pub union {}{}{} {{ {} }}",
+                    name,
+                    params,
+                    wc,
+                    body.join(", ")
+                )
+            }
+            AdtKind::Struct if self.chance(50) => {
+                let body: Vec<String> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| format!("pub f{}: {}", i, t))
+                    .collect();
+                format!(
+                    "pub struct {}{}{} {{ {} }}",
+                    name,
+                    params,
+                    wc,
+                    body.join(", ")
+                )
+            }
+            AdtKind::Struct => {
+                let body: Vec<String> = fields.iter().map(|t| format!("pub {}", t)).collect();
+                format!("pub struct {}{}({}){};", name, params, body.join(", "), wc)
+            }
+            AdtKind::Enum => {
+                let variants: Vec<String> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| format!("V{}({})", i, t))
+                    .collect();
+                format!(
+                    "pub enum {}{}{} {{ {} }}",
+                    name,
+                    params,
+                    wc,
+                    variants.join(", ")
+                )
+            }
+        };
+        let _ = kw;
+        format!("{}{}\n", attr, text)
+    }
+
+    /// The item of `gen_self_bound_adt()` in a module that declares no type with one and two
+    /// parameters: a plain unit struct.
+    fn gen_self_bound_adt_fallback(
+        &mut self,
+        _kind: AdtKind,
+        ann: Option<(usize, bool)>,
+    ) -> String {
+        let name = self.name("S");
+        let attr = self.attr_with(ann, "mod");
+        format!("{}pub struct {};\n", attr, name)
     }
 
     /// Whether the trait about to be generated has the shape of `trait_self_defaults` (F39), and

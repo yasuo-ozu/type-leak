@@ -73,6 +73,9 @@ pub(crate) struct Args {
     /// of the signatures only; the copy of a value compiles in the Referrer's crate only if every
     /// type in it that the crate cannot name is replaced, and the tests compare what it computes.
     values: bool,
+    /// The Leaker accepts an entry that names the own `Self` of a nested item together with a bound
+    /// that does (`LeakerConfig::nested_self_entries()`).
+    nested_self_entries: bool,
 }
 
 impl Parse for Args {
@@ -88,6 +91,7 @@ impl Parse for Args {
             relaxed_sized: false,
             redeclare: false,
             values: false,
+            nested_self_entries: false,
         };
         for kv in Punctuated::<MetaNameValue, Token![,]>::parse_terminated(input)? {
             let key = kv
@@ -109,6 +113,7 @@ impl Parse for Args {
                 ("relaxed_sized", Lit::Bool(b)) => args.relaxed_sized = b.value,
                 ("redeclare", Lit::Bool(b)) => args.redeclare = b.value,
                 ("values", Lit::Bool(b)) => args.values = b.value,
+                ("nested_self_entries", Lit::Bool(b)) => args.nested_self_entries = b.value,
                 ("allow", Lit::Str(s)) => {
                     for path in s.value().split(',').filter(|p| !p.trim().is_empty()) {
                         args.allow.push(parse_str(path.trim())?);
@@ -126,6 +131,7 @@ impl Args {
         let (id, allow_self, prelude) = (self.id, self.allow_self, self.prelude);
         let (primitive, relaxed_sized) = (self.primitive, self.relaxed_sized);
         let (redeclare, values) = (self.redeclare, self.values);
+        let nested_self_entries = self.nested_self_entries;
         let strict = self.strict.map(|strict| quote!(strict = #strict,));
         let scope = &self.scope;
         let allow = self
@@ -134,7 +140,7 @@ impl Args {
             .map(|p| quote!(#p).to_string().replace(' ', ""))
             .collect::<Vec<_>>()
             .join(",");
-        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict primitive = #primitive, relaxed_sized = #relaxed_sized, redeclare = #redeclare, values = #values)
+        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict primitive = #primitive, relaxed_sized = #relaxed_sized, redeclare = #redeclare, values = #values, nested_self_entries = #nested_self_entries)
     }
 }
 
@@ -182,6 +188,9 @@ fn analyze(
     }
     if args.values {
         config.check_values();
+    }
+    if args.nested_self_entries {
+        config.nested_self_entries();
     }
     config.allowed_paths.extend(args.allow.iter().cloned());
     let mut leaker = Leaker::from_config(config);
@@ -559,9 +568,32 @@ fn collect_positions(item: &Item, host: Option<&Host>, scope: &str) -> Vec<Posit
     out
 }
 
+/// Whether the tokens name `Self`.
+fn tokens_name_self(tokens: TokenStream) -> bool {
+    tokens.into_iter().any(|tree| match tree {
+        proc_macro2::TokenTree::Ident(ident) => ident == "Self",
+        proc_macro2::TokenTree::Group(group) => tokens_name_self(group.stream()),
+        _ => false,
+    })
+}
+
+/// The bounds of `bounds` that do not name `Self`.
+fn bounds_without_self(
+    bounds: &Punctuated<TypeParamBound, Token![+]>,
+) -> Punctuated<TypeParamBound, Token![+]> {
+    bounds
+        .iter()
+        .filter(|bound| !tokens_name_self(quote!(#bound)))
+        .cloned()
+        .collect()
+}
+
 /// The defaults of the type parameters of `generics`, each with the generics before it: a default
 /// is analyzed with the parameters before it, and the where predicates that name only those (the
-/// context of its entries has them, so the Repeater's impl needs them) and not `Self`.
+/// context of its entries has them, so the Repeater's impl needs them). The bounds that name `Self`
+/// are left out: a default has no `Self`, and for a struct, an enum or a union nested in a module
+/// the Leaker leaves them out of the context of an entry in a default (the copy cannot write `Self`
+/// there), where the others stay.
 fn default_positions(generics: &Generics) -> Vec<(Generics, Type)> {
     fn name(param: &GenericParam) -> String {
         match param {
@@ -583,7 +615,6 @@ fn default_positions(generics: &Generics) -> Vec<(Generics, Type)> {
                 .iter()
                 .skip(i)
                 .map(name)
-                .chain(std::iter::once("Self".to_string()))
                 .collect();
             let mentions_later = |predicate: &WherePredicate| {
                 let text = quote!(#predicate).to_string();
@@ -597,11 +628,29 @@ fn default_positions(generics: &Generics) -> Vec<(Generics, Type)> {
                 .iter()
                 .flat_map(|wc| wc.predicates.iter())
                 .filter(|p| !mentions_later(p))
-                .cloned()
+                .filter_map(|p| match p {
+                    WherePredicate::Type(p) => {
+                        let bounded = &p.bounded_ty;
+                        let bounds = bounds_without_self(&p.bounds);
+                        (!tokens_name_self(quote!(#bounded)) && !bounds.is_empty()).then(|| {
+                            WherePredicate::Type(PredicateType {
+                                bounds,
+                                ..p.clone()
+                            })
+                        })
+                    }
+                    other => Some(other.clone()),
+                })
                 .collect();
+            let params = generics.params.iter().take(i).cloned().map(|mut param| {
+                if let GenericParam::Type(t) = &mut param {
+                    t.bounds = bounds_without_self(&t.bounds);
+                }
+                param
+            });
             let before = Generics {
                 lt_token: Some(Default::default()),
-                params: generics.params.iter().take(i).cloned().collect(),
+                params: params.collect(),
                 gt_token: Some(Default::default()),
                 where_clause: (!predicates.is_empty()).then(|| WhereClause {
                     where_token: Default::default(),

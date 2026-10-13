@@ -264,8 +264,16 @@ impl Referrer {
                         return Some(0);
                     }
                 }
-                // A bound that has no name here (see `Context::of()`) is in no entry.
-                let context = Context::of(ty, scopes, self_ty, nested_type, enclosing).ok()?;
+                // A bound that has no name here (see `Context::of()`) is in no entry. An entry for
+                // any type has the `Self` of a nested struct, enum or union as the implementor,
+                // also where its type names it (`LeakerConfig::nested_self_entries()`).
+                let any = nested_type && matches!(entry.self_ty(), Some(SelfRequirement::Any));
+                let context = if any {
+                    Context::of_any(ty, scopes, self_ty, nested_type, enclosing)
+                } else {
+                    Context::of(ty, scopes, self_ty, nested_type, enclosing)
+                }
+                .ok()?;
                 let after = usize::from(alone);
                 if context == entry {
                     Some(after)
@@ -590,7 +598,9 @@ impl Referrer {
     /// ([`SelfRequirement::Bound`]), for the type ([`SelfRequirement::Type`]), or, if only a bound
     /// names the `Self` of a struct, an enum or a union nested in the analyzed syntax, for any type
     /// that the bound holds for ([`SelfRequirement::Any`]: the copy passes its own type, see
-    /// [`Visitor::with_nested_self()`]). If it is `None`, the impl is for any type.
+    /// [`Visitor::with_nested_self()`]). That holds for an entry that names `Self` too, if
+    /// [`LeakerConfig::nested_self_entries()`](crate::LeakerConfig::nested_self_entries) is set. If
+    /// it is `None`, the impl is for any type.
     ///
     /// For a top-level context, it is what the scope declares, but only if an entry names `Self`,
     /// or has a bound of the scope's generics rewritten for it (a nested scope has a `Self` of its
@@ -1538,12 +1548,18 @@ where
     ///   own, which has the bound for itself: pass that, `Self` (it is what
     ///   `UseSite::identity()` has). The Leaker's type does not have the bound in the copy's crate
     ///   (E0277). The leaked type is the same either way, as it does not name `Self`. The Leaker
-    ///   rejects an entry whose type names `Self` too, and one in the default of a parameter of
-    ///   such an item, where the copy cannot write `Self` (E0735). The impl is `?Sized` unless a
-    ///   bound needs `Self: Sized` (`(Self, u8)`): on rustc before 1.70, an impl that needs it
-    ///   makes the copy of a struct E0275 where the entry is its last field (an enum on 1.56
-    ///   too). Put the field first, add `where Self: Sized` to the item, or write the type with an
-    ///   absolute path (see [`SelfRequirement::Any`]).
+    ///   rejects an entry whose type names `Self` too, unless it is configured with
+    ///   [`LeakerConfig::nested_self_entries()`](crate::LeakerConfig::nested_self_entries): the
+    ///   entry is then for any type as well (`impl<T: AsRef<__S>, __S> Repeater<(T,), ID, 4> for
+    ///   __S { type Type = Rel2<__S, T>; }`), and the copy passes its own type in the same way, so
+    ///   that the field is `Rel2<Self, T>` of the copy. The default of a parameter of such an item
+    ///   is not an entry of the item's `Self`: the copy cannot write `Self` there (E0735), and
+    ///   the entry (`U = Rel<T>`) is analyzed without it and without the bounds of the generics
+    ///   that name it, so it goes to `type_fn`. The impl is `?Sized` unless a bound or the type
+    ///   needs `Self: Sized` (`(Self, u8)`, `Rel2<Self, T>`): on rustc before 1.70, an impl that
+    ///   needs it makes the copy of a struct E0275 where the entry is its last field (an enum on
+    ///   1.56 too). Put the field first, add `where Self: Sized` to the item, or write the type
+    ///   with an absolute path (see [`SelfRequirement::Any`]).
     ///
     /// Only the layer of the item the visitor is in counts: an entry of the `Self` of the context, or
     /// of the scope around that the nested item hides, is not found there. The entries that do not
@@ -1952,16 +1968,28 @@ where
         // The Leaker analyzes the default of a parameter of a scope without `Self`: it
         // cannot depend on it, so the bounds of the scopes around that mention `Self` are
         // rewritten for the `Self` they were written for, also where the nested scope has the same
-        // one. The scope itself is declared without `Self` for its default.
+        // one. The scope itself is declared without `Self` for its default. A struct, an enum or
+        // a union nested in the visited syntax has none of its own bounds that mention its `Self`
+        // either: its copy cannot write `Self` in the default (E0735), so the entries in it do not
+        // depend on what the copy's own type proves (`T: AsRef<Self>`).
         let default = i.default.take();
         syn::visit_mut::visit_type_param_mut(self, i);
         i.default = default;
         if let Some(default) = &mut i.default {
+            let nested_type = self.own_self
+                && matches!(&self.nested, Some(nested)
+                    if nested.ident.is_some() && matches!(nested.requirement, SelfRequirement::Type(_)));
             let self_requirement = self.self_requirement.take();
-            let own = self.scopes.last_mut().map(|scope| scope.replace_self(None));
+            let own = self.scopes.last().cloned();
+            if let Some(scope) = self.scopes.last_mut() {
+                scope.replace_self(None);
+                if nested_type {
+                    scope.without_self();
+                }
+            }
             self.visit_type_mut(default);
             if let (Some(scope), Some(own)) = (self.scopes.last_mut(), own) {
-                scope.replace_self(own);
+                *scope = own;
             }
             self.self_requirement = self_requirement;
         }
@@ -2152,8 +2180,14 @@ impl Referrer {
     // written, so its `Self` is the copy's own), and a strict Referrer replaces less. 13: the
     // default of a parameter of a trait nested in the analyzed syntax is looked up with the
     // trait's `Self` too, and written by `Visitor::with_nested_self()` (`U = Rel<T>` with `T:
-    // AsRef<Self>`), and that of the item itself without `Self`, as the Leaker analyzes it.
-    pub const FORMAT_VERSION: u32 = 13;
+    // AsRef<Self>`), and that of the item itself without `Self`, as the Leaker analyzes it. 14: the
+    // context of an entry in the default of a parameter of a struct, an enum or a union nested in
+    // the analyzed syntax has no bound of the generics that names the item's `Self` (`U =
+    // Wrap<T>` with `T: Clone + AsRef<Self>` is `T: Clone`, any type), which the Referrer
+    // computes for a copy, so the entries of 13 are not found the same way; and an entry that is
+    // for any type may name `Self` in its type (`LeakerConfig::nested_self_entries()`), which
+    // the Referrer finds too.
+    pub const FORMAT_VERSION: u32 = 14;
 }
 
 /// Parses a [`Referrer`] written by its [`ToTokens`] implementation.

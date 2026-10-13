@@ -1,9 +1,10 @@
 //! The context of a leaked type: its generics, what `Self` means, and its module.
 
 use crate::util::{
-    canonical_bounds, generic_param_mentions_self, generic_param_name, ident_name, self_in_param,
-    self_in_predicate, tidy, token_names, type_mentions_self, type_names, unwrap_type_group,
-    where_predicate_mentions_self, ReplaceSelf, SelfMentions,
+    bound_mentions_self, canonical_bounds, generic_param_mentions_self, generic_param_name,
+    ident_name, self_in_param, self_in_predicate, tidy, token_names, type_mentions_self,
+    type_names, unwrap_type_group, where_predicate_mentions_self, without_self_bounds, ReplaceSelf,
+    SelfMentions,
 };
 use proc_macro2::{Literal, TokenStream};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -89,6 +90,28 @@ impl Scope {
         std::mem::replace(&mut self.self_ty, self_ty)
     }
 
+    /// Drops the bounds and where predicates that mention `Self`, and `Self` itself: what the
+    /// default of a parameter of a struct, an enum or a union has, whose entries do not depend on
+    /// the bounds that its copy proves for its own type.
+    pub(crate) fn without_self(&mut self) {
+        for param in &mut self.params {
+            if let GenericParam::Type(param) = param {
+                param.bounds = param
+                    .bounds
+                    .iter()
+                    .filter(|bound| !bound_mentions_self(bound))
+                    .cloned()
+                    .collect();
+            }
+        }
+        self.predicates = self
+            .predicates
+            .iter()
+            .filter_map(without_self_bounds)
+            .collect();
+        self.self_ty = None;
+    }
+
     /// Returns `true` if the generics are the same, whatever `Self` meant where they were declared.
     pub(crate) fn same_generics(&self, other: &Scope) -> bool {
         self.params == other.params
@@ -171,6 +194,11 @@ impl Scope {
 /// impl<T: AsRef<__S>, __S: ?Sized> path::Repeater<(T,), 42, 4> for __S {
 ///     type Type = path::Rel<T>;
 /// }
+/// // `Rel2<Self, T>` in the same struct, with `LeakerConfig::nested_self_entries()`: `Self` is
+/// // the parameter in the type too
+/// impl<T: AsRef<__S>, __S> path::Repeater<(T,), 42, 5> for __S {
+///     type Type = path::Rel2<__S, T>;
+/// }
 /// ```
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -200,7 +228,11 @@ pub enum SelfRequirement {
     /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self).
     Type(Type),
     /// `Self` is any type that the bounds of the generics hold for, and the type of the entry
-    /// does not name it. Only the bounds do: `Rel<T>` with `T: AsRef<Self>`.
+    /// does not name it. Only the bounds do: `Rel<T>` with `T: AsRef<Self>`. (With
+    /// [`LeakerConfig::nested_self_entries()`](crate::LeakerConfig::nested_self_entries) the
+    /// type may name it too: `Rel2<Self, T>` with that bound. The impl has the type parameter in
+    /// its place, `type Type = Rel2<__S, T>`, and the copy passes its own type as the
+    /// implementor, so the field is `Rel2<MyStruct<T>, T>` as the original.)
     ///
     /// It is the context of such an entry of a struct, an enum or a union nested in the analyzed
     /// syntax ([`View::visit_item()`](crate::View::visit_item), the items of
@@ -208,13 +240,17 @@ pub enum SelfRequirement {
     /// there, with the same bound for it (`T: AsRef<Self>`, the copy's `MyStruct<T>`), so the
     /// copy writes the path through the Repeater with its own type as the implementor
     /// (`<Self as Repeater<..>>::Type`), and not with the Leaker's, which has not the bound.
-    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self) says when.
+    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self) says when. The default
+    /// of a parameter is not one of them: the copy cannot write `Self` there (E0735), so the
+    /// entries in it have no `Self` and none of the bounds that name it (`U = Rel<T>` with `T:
+    /// Clone + AsRef<Self>` is the entry `Rel<T>` with `T: Clone`).
     ///
     /// In the impl, `Self` is a type parameter (`__S`) that replaces `Self` in the bounds, as
     /// [`Referrer::repeater_impl()`](crate::Referrer::repeater_impl) does with
     /// [`ImplSelf::Param`](crate::ImplSelf::Param), and it has no trait bound of its own. It is
-    /// `?Sized`, unless a bound may need it `Sized`, as the `Self` of a struct, an enum or a union
-    /// is: `(Self, u8)`, `Vec<Self>`, `[Self]`, `Tr<Self>` for a trait of the user, an associated
+    /// `?Sized`, unless a bound or the type of the entry may need it `Sized`, as the `Self` of a
+    /// struct, an enum or a union is: `(Self, u8)`, `Vec<Self>`, `[Self]`, `Tr<Self>` for a trait
+    /// of the user (so `Rel2<Self, T>`, whose declaration the Leaker cannot see), an associated
     /// type, an argument of an `Fn`. A bound needs none where `Self` is the whole argument of a
     /// trait or type of `core` or `std` with a `?Sized` parameter (`AsRef<Self>`, `AsMut`,
     /// `Borrow`, `BorrowMut`, `PartialEq`, `PartialOrd`, `Box`, `Rc`, `Arc`, `PhantomData`), or is
@@ -766,16 +802,44 @@ impl Context {
         nested_type: bool,
         enclosing: &Enclosing,
     ) -> std::result::Result<Self, UnnameableSelf> {
+        Self::compute(ty, scopes, self_req, nested_type, false, enclosing)
+    }
+
+    /// Like [`Context::of()`], for an entry of a struct, an enum or a union nested in the analyzed
+    /// syntax (`nested_type`) that is for any type although its type names `Self`
+    /// ([`LeakerConfig::nested_self_entries()`](crate::LeakerConfig::nested_self_entries)): `Self`
+    /// in the type and in the bounds is the implementor of the impl, and the impl does not need the
+    /// generics that `Self` has as arguments. Not so with `nested_type` unset, or a `Self` that is
+    /// not a type. It is `of()` for a type that does not name `Self`.
+    pub(crate) fn of_any(
+        ty: &Type,
+        scopes: &[Scope],
+        self_req: Option<&SelfRequirement>,
+        nested_type: bool,
+        enclosing: &Enclosing,
+    ) -> std::result::Result<Self, UnnameableSelf> {
+        Self::compute(ty, scopes, self_req, nested_type, true, enclosing)
+    }
+
+    fn compute(
+        ty: &Type,
+        scopes: &[Scope],
+        self_req: Option<&SelfRequirement>,
+        nested_type: bool,
+        any: bool,
+        enclosing: &Enclosing,
+    ) -> std::result::Result<Self, UnnameableSelf> {
         let mut names = HashSet::new();
         type_names(ty, &mut names);
         let mut mentions_self = type_mentions_self(ty);
-        let free_self =
-            nested_type && !mentions_self && matches!(self_req, Some(SelfRequirement::Type(_)));
+        let free_self = nested_type
+            && (any || !mentions_self)
+            && matches!(self_req, Some(SelfRequirement::Type(_)));
         let mut self_names = HashSet::new();
         if let Some(self_req) = self_req {
             self_req.names(&mut self_names);
         }
-        if mentions_self {
+        if mentions_self && !free_self {
             names.extend(self_names.iter().cloned());
         }
         let mut work: Vec<(usize, String)> = names

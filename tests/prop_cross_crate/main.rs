@@ -113,7 +113,7 @@
 //! implementor for an entry whose bound names `Self`). Of the nested ones, 60% are declared again in
 //! the Referrer's crate (`redeclare`, `Args::redeclare` of `tests/crates/macro/prop.rs`), which
 //! cannot pass the defaulted parameter to its own default (E0128), and then have a method that
-//! names the parameters only. The statistics count them apart ("traits with defaults").
+//! names the parameters only. The statistics count them apart ("defaults and `Self`").
 //!
 //! Environment variables:
 //!
@@ -152,6 +152,11 @@
 //!   Visitor left the default as written, and analyzed as the item itself, where it looks the
 //!   default up without `Self`; with the control whose bound names no `Self`; the traits are
 //!   counted in the statistics: no shape explains a rejection, so none has a tag in `family()`),
+//!   `self_bound_adts` (F41: a struct, an enum or a union nested in `enter_mod` with a generic
+//!   whose bound names its own `Self` and a default that uses it; the Leaker must accept it, which
+//!   `unexplained()` checks) and `nested_self_entries` (F42: the macro asks for
+//!   `LeakerConfig::nested_self_entries()` for the items nested in `enter_mod`, and those of
+//!   `self_bound_adts` have a field that names `Self` in a relative type),
 //!   `path_named_like_generic` (`self::U` next to a generic `U`), `declared_named_like_generic` (a
 //!   module that declares `X`, and `crate::base::B1<X>` in `fn f<X>`) and
 //!   `bare_const_in_absolute_path` (a bare `ILEN` next to a leaked argument in a
@@ -740,8 +745,24 @@ fn unexplained(tags: &std::collections::BTreeSet<String>, report: &Report) -> Ve
         return vec!["the report of the rejection has no error".to_string()];
     }
     let mut problems = Vec::new();
+    // The shapes of `self_bound_adts` (F41, F42) are accepted: no reason explains a rejection but a
+    // bare trait of the prelude, where the Leaker does not allow the prelude.
+    let must_accept = tags.contains(gen::TAG_SELF_BOUND_ADT);
     for error in &report.rejections {
-        match family(error) {
+        let family = family(error);
+        if must_accept
+            && !family
+                .as_ref()
+                .map_or(false, |f| f.name.starts_with("a bare trait"))
+        {
+            problems.push(format!(
+                "SHOULD BE ACCEPTED: a struct, enum or union with a bound that names its `Self` \
+                 and a default that uses the generic: {} [tokens: {}]",
+                error.message, error.tokens
+            ));
+            continue;
+        }
+        match family {
             None => problems.push(format!(
                 "NOT A KNOWN REASON: {} [tokens: {}] [note: {}]",
                 error.message, error.tokens, error.note
@@ -866,6 +887,9 @@ const SELF_DEFAULT_SHAPES: &[(&str, &str)] = &[
     (gen::TAG_SELF_DEFAULT, "default needs Self"),
     (gen::TAG_PLAIN_DEFAULT, "control, no Self"),
     (gen::TAG_REDECLARED, "declared again"),
+    // The structs, enums and unions of `self_bound_adts` (F41, F42).
+    (gen::TAG_SELF_BOUND_ADT, "adt default, Self"),
+    (gen::TAG_SELF_BOUND_TYPE, "adt type names Self"),
 ];
 
 /// The traits of one shape of `trait_self_defaults` that the macro was applied to: how many the
@@ -1214,7 +1238,7 @@ fn summarize(stats: &Stats, floors: &Floors, seed: u64, n: usize, features: Feat
         if let Some(count) = stats.self_defaults.get(tag) {
             writeln!(
                 s,
-                "  traits with defaults (trait_self_defaults) {:<18} {:>4} analyzed, {:>4} accepted; nested in enter_mod: {:>4} analyzed, {:>4} accepted",
+                "  defaults and `Self` (trait_self_defaults, self_bound_adts) {:<19} {:>4} analyzed, {:>4} accepted; nested in enter_mod: {:>4} analyzed, {:>4} accepted",
                 what, count.analyzed, count.accepted, count.nested_analyzed, count.nested_accepted
             )
             .unwrap();
@@ -1933,6 +1957,84 @@ mod checks {
             plain_default
         );
         let _ = bare_sized;
+    }
+
+    /// The structs, enums and unions of `self_bound_adts` (F41, F42) are generated, nested in
+    /// `enter_mod`, and the Leaker must accept them: no reason explains their rejection.
+    #[test]
+    fn the_adts_with_a_bound_that_names_their_self_are_generated() {
+        let count = |features: Features, tag: &str| -> (usize, usize) {
+            let (mut found, mut types) = (0, 0);
+            for seed in 0..12 {
+                let case = generate(seed, 0, 6, features);
+                for item in &case.items {
+                    if item.tags.contains(gen::TAG_SELF_BOUND_ADT) {
+                        assert!(
+                            matches!(item.kind, "struct" | "enum" | "union") && item.scope == "mod",
+                            "{} {}",
+                            item.kind,
+                            item.scope
+                        );
+                        found += 1;
+                        types += usize::from(item.tags.contains(tag));
+                        let attr = case
+                            .leaker
+                            .lines()
+                            .find(|line| line.contains(&format!("(id = {},", item.id)));
+                        assert_eq!(
+                            attr.map_or(false, |a| a.contains("nested_self_entries = true,")),
+                            features.nested_self_entries
+                        );
+                    }
+                }
+            }
+            (found, types)
+        };
+        let without = Features {
+            nested_self_entries: false,
+            ..Features::parse("")
+        };
+        let (found, types) = count(without, gen::TAG_SELF_BOUND_TYPE);
+        assert!(
+            found > 0,
+            "no struct, enum or union of `self_bound_adts` in 12 cases"
+        );
+        assert_eq!(
+            types, 0,
+            "the type that names `Self` needs `nested_self_entries`"
+        );
+        let (found, types) = count(Features::parse(""), gen::TAG_SELF_BOUND_TYPE);
+        assert!(
+            found > 0 && types > 0,
+            "{} items, {} that name `Self`",
+            found,
+            types
+        );
+        // Nothing explains a rejection of these.
+        let rejected = Report {
+            kind: "struct".into(),
+            rejections: vec![rejection(
+                "`Wrap < T >` has a generic whose bound mentions `Self`, which cannot be leaked",
+                "Wrap < T >",
+            )],
+            ..Default::default()
+        };
+        let problems = unexplained(
+            &tags(&[gen::TAG_SELF_BOUND_ADT, "self_in_bounds"]),
+            &rejected,
+        );
+        assert!(
+            problems[0].starts_with("SHOULD BE ACCEPTED"),
+            "{:?}",
+            problems
+        );
+        // A bare trait of the prelude is a reason, where the Leaker does not allow the prelude.
+        let bare = Report {
+            kind: "struct".into(),
+            rejections: vec![rejection("use absolute path: 'Clone'", "Clone")],
+            ..Default::default()
+        };
+        assert!(unexplained(&tags(&[gen::TAG_SELF_BOUND_ADT, "bare:Clone"]), &bare).is_empty());
     }
 
     #[test]

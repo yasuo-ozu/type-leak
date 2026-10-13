@@ -479,7 +479,7 @@ impl Referrer {
             // Sized` for the copy of a struct whose last field is the path through this impl, if
             // the impl needs `__S: Sized` (E0275: the type needs the impl, which needs the type).
             let sized = matches!(self.context_self(context), Some(SelfRequirement::Any))
-                && needs_sized(&declared, ident);
+                && needs_sized(&declared, &ty, ident);
             declared.params.push(match (bound, sized) {
                 (Some(path), _) => parse_quote!(#ident: ?::core::marker::Sized + #path),
                 (None, true) => parse_quote!(#ident),
@@ -499,8 +499,11 @@ impl Referrer {
 
 /// Returns `true` if the impl may need `param: Sized`, and `false` if it is well-formed without.
 ///
-/// `declared` are the generics of the impl without `param`, in which `param` replaced `Self`. They
-/// need no `Sized` if every use of `param` is
+/// `declared` are the generics of the impl without `param`, in which `param` replaced `Self`, and
+/// `ty` is the type of the impl. A type that names `Self` (`Rel2<Self, T>`, with
+/// [`LeakerConfig::nested_self_entries()`](crate::LeakerConfig::nested_self_entries)) needs it as
+/// the bounds do: `Rel2<__S, T>` is well-formed for `__S: Sized` only, unless the declaration of
+/// `Rel2` relaxes it, which the Leaker cannot see. They need no `Sized` if every use of `param` is
 ///
 /// - a type argument of its own, directly, of a path that accepts an unsized one
 ///   ([`accepts_unsized_argument()`]: `AsRef<__S>`, `Box<__S>`),
@@ -511,7 +514,7 @@ impl Referrer {
 /// the argument of a type or a trait of the user (`Vec<__S>`, `Tr<__S>`), an associated type
 /// (`Iterator<Item = __S>`, `<__S>::A`), the argument of an `Fn` bound, a macro. So this errs on
 /// the side of `Sized`.
-fn needs_sized(declared: &Generics, param: &Ident) -> bool {
+fn needs_sized(declared: &Generics, ty: &Type, param: &Ident) -> bool {
     use syn::visit::Visit;
     struct Uses<'a> {
         param: &'a Ident,
@@ -590,6 +593,7 @@ fn needs_sized(declared: &Generics, param: &Ident) -> bool {
         needs_sized: false,
     };
     uses.visit_generics(declared);
+    uses.visit_type(ty);
     uses.needs_sized
 }
 

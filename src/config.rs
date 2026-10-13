@@ -25,6 +25,8 @@ pub struct LeakerConfig {
     pub allowed_paths: Vec<Path>,
     /// Set by [`LeakerConfig::check_values()`].
     pub(crate) check_values: bool,
+    /// Set by [`LeakerConfig::nested_self_entries()`].
+    pub(crate) nested_self_entries: bool,
 }
 
 impl LeakerConfig {
@@ -145,6 +147,83 @@ impl LeakerConfig {
     /// ```
     pub fn check_values(&mut self) -> &mut Self {
         self.check_values = true;
+        self
+    }
+
+    /// Accepts a type that names the `Self` of a struct, an enum or a union nested in the analyzed
+    /// syntax ([`View::visit_item()`](crate::View::visit_item), the items of
+    /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod)) when a bound of the generics it uses
+    /// names that `Self` too: `Rel2<Self, T>` in `struct S<T: AsRef<Self>>`. You promise the two
+    /// things below.
+    ///
+    /// Without the option such an entry is an error. The copy declares a type of its own (`Self`
+    /// is the copy's `S<T>`), so the bound `T: AsRef<Self>` is proved there for the copy's type,
+    /// and the Repeater's impl for the Leaker's `S<T>` would need it for another (E0277). With the
+    /// option the entry is for any type that the bound holds for
+    /// ([`SelfRequirement::Any`](crate::SelfRequirement::Any)), and the type keeps `Self` as the
+    /// parameter of the impl: `impl<T: AsRef<__S>, __S> Repeater<(T,), ..> for __S { type Type =
+    /// Rel2<__S, T>; }`. The copy passes its own type as the implementor and writes the field as
+    /// `<Self as Repeater<(T,), ..>>::Type`, which is `Rel2<S<T>, T>`, the type of the original.
+    /// Only the entries that the option changes are the ones that are errors without it: a type
+    /// that names `Self` and has no bound that does (`Rel2<Self, T>` in `struct S<T: Clone>`) is
+    /// for the Leaker's type as before, which also accepts a leaked type with a bound on the
+    /// parameter that receives `Self`.
+    ///
+    /// A default of a parameter is not changed: the copy cannot write `Self` there (E0735).
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: Item = parse_quote! {
+    ///     pub struct S<T: ::core::convert::AsRef<Self>> { pub b: Rel2<Self, T> }
+    /// };
+    /// let nested = |leaker: &mut Leaker| {
+    ///     leaker.enter_mod("m", [parse_quote!(S)], |view| view.visit_item(&item)).map(|(id, ())| id)
+    /// };
+    /// // Without the option it is an error: the bound and the type name `Self`.
+    /// assert!(nested(&mut Leaker::new()).is_err());
+    ///
+    /// let mut config = LeakerConfig::new();
+    /// config.nested_self_entries();
+    /// let mut leaker = Leaker::from_config(config);
+    /// nested(&mut leaker).unwrap();
+    /// let referrer = leaker.finish();
+    /// // The entry is for any type that the bound holds for, with `Self` as its implementor.
+    /// assert!(matches!(
+    ///     referrer.context_self(referrer.context(0)),
+    ///     Some(SelfRequirement::Any)
+    /// ));
+    /// let param: Ident = parse_quote!(__S);
+    /// let r = referrer.repeater_impl(0, ImplSelf::Param(&param)).unwrap();
+    /// let (generics, args, ty) = (&r.generics, &r.args, &r.ty);
+    /// let imp: ItemImpl = parse_quote! {
+    ///     impl #generics Repeater<#args, 7u64, 0usize> for __S { type Type = #ty; }
+    /// };
+    /// let expected: ItemImpl = parse_quote! {
+    ///     impl<T: ::core::convert::AsRef<__S>, __S> Repeater<(T,), 7u64, 0usize> for __S {
+    ///         type Type = Rel2<__S, T>;
+    ///     }
+    /// };
+    /// assert_eq!(imp, expected);
+    /// ```
+    ///
+    /// **Risks**
+    ///
+    /// - If the declaration of the leaked type has a trait bound on the parameter that receives
+    ///   `Self` (`struct Rel2<A: Clone, B>`), the impl in the Leaker's crate fails (E0277: `__S:
+    ///   Clone` is not satisfied), and no copy could satisfy it anyway: the copy is generated
+    ///   before its impls are known, and the parameter is any type. The Leaker cannot see the
+    ///   declaration of a relative path. A way out is an absolute path for the type (it is copied
+    ///   as written, and its `Self` is the copy's own), or the analysis of the item with its own
+    ///   `intern_*` call. Without the option such an entry is rejected, so this is a failure at
+    ///   build time, in the Leaker's crate.
+    /// - rustc before 1.70 (tested on 1.56 to 1.66) fails with E0275 (overflow evaluating the
+    ///   requirement `S<T>: Sized`) when the copy's field is the last field of a struct: the type
+    ///   needs the impl to be `Sized`, and the impl, whose `__S` stays `Sized` since `Rel2<__S,
+    ///   T>` needs it, needs the type to be (see [`SelfRequirement::Any`](crate::SelfRequirement::Any)).
+    ///   Put the field first, or add `where Self: Sized` to the item.
+    pub fn nested_self_entries(&mut self) -> &mut Self {
+        self.nested_self_entries = true;
         self
     }
 
