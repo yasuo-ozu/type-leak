@@ -935,26 +935,28 @@ impl Stats {
 /// A test that counts a rejection as a success passes when the Leaker rejects everything, or when
 /// the generator makes shapes that cannot be leaked (before the floors, 93% of the modules and
 /// 60% of the traits were rejected, and a macro that failed every `intern_*` still printed `ok`).
-/// These floors fail the run then. Measured over the seeds 1 to 12 at 60 cases, the accepted share
-/// was, per kind, lowest and mean: struct 93/95, enum 92/95, union 90/95, trait 71/74, inherent
-/// impl 83/89, trait impl 71/80, module 65/74, and per scope `enter_mod` 89/91, `enter_generics`
-/// 90/94, `enter_trait` 66/74, `enter_impl` 100/100. A floor is about a quarter below the lowest,
-/// so that a different seed or a short run (24 cases has a third of the items) does not trip it,
-/// but the old generator (module 10%, trait 39%, inherent and trait impl 41%) does.
+/// These floors fail the run then. Measured over the seeds 1 to 16 at 24 and at 60 cases, the
+/// accepted share was, per kind, lowest and pooled: struct 90/95, enum 90/94, union 85/92, trait
+/// 70/75, inherent impl 79/85, trait impl 59/73, module 74/78, and per scope `enter_mod` 81/88,
+/// `enter_generics` 87/94, `enter_trait` 57/79, `enter_impl` 100/100 (the seeds 17 to 32 at 24
+/// cases: module down to 65, of 34). A floor is about 10 points below the lowest (more for the
+/// rare kinds, whose rate varies most), so that a different seed or a short run does not trip it,
+/// but a regression of a kind or the old generator (module 10%, trait 39%, inherent and trait impl
+/// 41%) does.
 /// `TYPE_LEAK_PROP_MIN_ACCEPT` overrides them.
 const FLOORS: &[(&str, f64)] = &[
-    ("struct", 75.0),
-    ("enum", 75.0),
-    ("union", 70.0),
-    ("trait", 50.0),
-    ("impl-inherent", 60.0),
+    ("struct", 80.0),
+    ("enum", 80.0),
+    ("union", 75.0),
+    ("trait", 60.0),
+    ("impl-inherent", 70.0),
     ("impl-trait", 50.0),
-    ("mod", 40.0),
+    ("mod", 55.0),
     // The items analyzed through a scope (`gen::SCOPES`), by the name of its API.
     ("enter_mod", 70.0),
-    ("enter_generics", 70.0),
-    ("enter_trait", 40.0),
-    ("enter_impl", 70.0),
+    ("enter_generics", 75.0),
+    ("enter_trait", 45.0),
+    ("enter_impl", 90.0),
 ];
 
 /// The fewest analyzed items of a kind for its floor to count (a short run has too few of the
