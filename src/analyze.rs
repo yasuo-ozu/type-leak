@@ -582,6 +582,7 @@ struct ScopeMark {
     scopes: usize,
     modules: usize,
     item_depth: usize,
+    alone_defaults: usize,
     self_ty: Option<SelfRequirement>,
     self_written: bool,
     self_nested: bool,
@@ -593,6 +594,26 @@ struct ScopeMark {
     not_optional: usize,
     env_errors: usize,
     module: Option<ContextId>,
+}
+
+/// The defaults of the type parameters that a scope analyzes alone: without `Self`, with the
+/// parameters before them (`AnalyzeVisitor::finish()` for the outermost scope,
+/// `AnalyzeVisitor::end_scope()` for a nested one). The walk of the item that the scope is for
+/// reaches the parameters again and must not analyze their defaults a second time: that would
+/// record the entry twice, also with the `Self` of the scope (a trait may name it in a default).
+struct AloneDefaults {
+    /// `scopes.len()` and `item_depth` while the walk is directly in the scope: not in a method
+    /// or in a nested item, whose generics are other parameters.
+    scopes: usize,
+    item_depth: usize,
+    /// The parameters of the scope's generics that have a default. Empty for a module, which
+    /// declares no parameter, so that the walk in it does not take a parameter of the scope around
+    /// for one of its own.
+    idents: Vec<Ident>,
+    /// What the scope declares (`Self` and its generics), if it is the scope of an item: the item
+    /// that is nested in the scope with the same generics and `Self` is the item itself, visited
+    /// again (see `AnalyzeVisitor::visit_item_trait()`).
+    declared: Option<(SelfRequirement, Generics)>,
 }
 
 /// What [`AnalyzeVisitor::check()`] puts back as it found it. The visit replaces the frame of the
@@ -661,7 +682,8 @@ pub(crate) struct AnalyzeVisitor {
     bound_elided: Vec<Vec<usize>>,
     /// While a binder is probed: the addresses of the types found to be leaked whole.
     probe: Option<HashSet<usize>>,
-    root_defaulted: Vec<Ident>,
+    /// The scopes entered, innermost last, and the defaults that each analyzes alone.
+    alone_defaults: Vec<AloneDefaults>,
     /// What `Self` means here, if anything. It has none directly in a module, or in generics that
     /// no item declaring it encloses, so mentioning it there is an error.
     self_ty: Option<SelfRequirement>,
@@ -797,9 +819,7 @@ impl AnalyzeVisitor {
             signature: None,
             bound_elided: Vec::new(),
             probe: None,
-            root_defaulted: defaulted(generics)
-                .map(|(_, ident, _)| ident.clone())
-                .collect(),
+            alone_defaults: Vec::new(),
             self_ty: None,
             self_written: false,
             self_nested: false,
@@ -1192,6 +1212,7 @@ impl AnalyzeVisitor {
             scopes: self.scopes.len(),
             modules: self.modules.len(),
             item_depth: self.item_depth,
+            alone_defaults: self.alone_defaults.len(),
             self_ty: self.self_ty.clone(),
             self_written: self.self_written,
             self_nested: self.self_nested,
@@ -1265,6 +1286,27 @@ impl AnalyzeVisitor {
             }
         }
         self.item_depth = self.item_depth.max(1);
+        let alone = match spec {
+            ScopeSpec::Module { .. } => AloneDefaults {
+                scopes: self.scopes.len(),
+                item_depth: self.item_depth,
+                idents: Vec::new(),
+                declared: None,
+            },
+            ScopeSpec::Generics {
+                generics, declares, ..
+            } => AloneDefaults {
+                scopes: self.scopes.len(),
+                item_depth: self.item_depth,
+                idents: defaulted(generics)
+                    .map(|(_, ident, _)| ident.clone())
+                    .collect(),
+                declared: declares
+                    .as_ref()
+                    .map(|declared| (declared.requirement.clone(), generics.clone())),
+            },
+        };
+        self.alone_defaults.push(alone);
         mark
     }
 
@@ -1272,6 +1314,7 @@ impl AnalyzeVisitor {
         self.scopes.truncate(mark.scopes);
         self.modules.truncate(mark.modules);
         self.item_depth = mark.item_depth;
+        self.alone_defaults.truncate(mark.alone_defaults);
         self.self_ty = mark.self_ty;
         self.self_written = mark.self_written;
         self.self_nested = mark.self_nested;
@@ -2817,6 +2860,33 @@ impl AnalyzeVisitor {
             })
     }
 
+    /// Whether the default of the parameter `ident`, which the walk is visiting, was analyzed
+    /// alone by the scope that it is directly in (see [`AloneDefaults`]).
+    fn is_alone_default(&self, ident: &Ident) -> bool {
+        self.alone_defaults.last().map_or(false, |alone| {
+            alone.scopes == self.scopes.len()
+                && alone.item_depth == self.item_depth
+                && alone.idents.contains(ident)
+        })
+    }
+
+    /// The parameters with a default, if the scope that the walk is directly in was entered for
+    /// the item that declares `Self` as `self_ty` with `generics`: the walk is about to visit that
+    /// item again, as a nested item.
+    fn own_alone_defaults(
+        &self,
+        self_ty: &SelfRequirement,
+        generics: &Generics,
+    ) -> Option<Vec<Ident>> {
+        let alone = self.alone_defaults.last()?;
+        let (declared_self, declared) = alone.declared.as_ref()?;
+        (alone.scopes == self.scopes.len()
+            && alone.item_depth == self.item_depth
+            && declared_self == self_ty
+            && declared == generics)
+            .then(|| alone.idents.clone())
+    }
+
     fn with_scope(&mut self, scope: Scope, f: impl FnOnce(&mut Self)) {
         self.scopes.push(scope);
         f(self);
@@ -3560,11 +3630,7 @@ impl AnalyzeVisitor {
 
 impl<'ast> Visit<'ast> for AnalyzeVisitor {
     fn visit_type_param(&mut self, i: &TypeParam) {
-        let is_root_default = i.default.is_some()
-            && self.item_depth <= 1
-            && self.scopes.len() == 1
-            && self.root_defaulted.contains(&i.ident);
-        if is_root_default {
+        if i.default.is_some() && self.is_alone_default(&i.ident) {
             let mut i = i.clone();
             i.eq_token = None;
             i.default = None;
@@ -3702,8 +3768,23 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
     fn visit_item_trait(&mut self, i: &ItemTrait) {
         let self_ty = SelfRequirement::of_trait(&i.ident, &i.generics);
         let gats = Gat::of_items(&i.items);
+        // The trait that the scope around was entered for (`Leaker::enter_trait()` with its ident
+        // and generics, and then `View::visit_item()` of the item): the scope has analyzed its
+        // defaults alone, which is what a copy of the trait itself looks up first.
+        let alone = self.own_alone_defaults(&self_ty, &i.generics);
         self.with_item_of(&i.generics, Some(self_ty), false, gats, |visitor| {
-            syn::visit::visit_item_trait(visitor, i)
+            if let Some(idents) = alone {
+                visitor.alone_defaults.push(AloneDefaults {
+                    scopes: visitor.scopes.len(),
+                    item_depth: visitor.item_depth,
+                    idents,
+                    declared: None,
+                });
+                syn::visit::visit_item_trait(visitor, i);
+                visitor.alone_defaults.pop();
+            } else {
+                syn::visit::visit_item_trait(visitor, i)
+            }
         });
     }
 

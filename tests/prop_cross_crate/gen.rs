@@ -34,6 +34,17 @@
 //! identifier is also written bare as an argument (`R2C<T, RLEN>`: it parses as a type that may be
 //! a const), except in the paths a module analyzed as a whole declares.
 //!
+//! Defaults of traits (`Features::trait_self_defaults`, F39): a fifth of the traits analyzed one by
+//! one are made for their defaults (`Gen::gen_self_default_trait()`): `trait Tr<T: AsRef<Self>, U =
+//! Rel<T>>`, a parameter with a bound that names the trait's own `Self` (written in the parameter or
+//! in a where predicate) and trailing parameters whose defaults name it. The control has a bound
+//! that names no `Self` (`T: Clone`). A trait of that shape is nested in `enter_mod` in 45% of the
+//! cases, where the Visitor writes the default through the host (`with_nested_self()`); then
+//! 60% are declared again in the Referrer's crate (`redeclare = true` in the attribute), with a body
+//! that names no entry. The others are analyzed by `intern_trait` or `enter_trait`, where the
+//! default is looked up without `Self`. The traits carry the tags `shape:self_default`,
+//! `shape:plain_default` and `shape:redeclared`, which the statistics count and no rejection needs.
+//!
 //! Scopes: the macro analyzes some items through `enter_mod`, `enter_generics`, `enter_trait` or
 //! `enter_impl` instead of the `intern_*` of their kind (`Item::scope`, `SCOPES`).
 //!
@@ -273,6 +284,17 @@ pub struct Features {
     /// leak the identifier alone as a type (`type Type = ILEN`, E0573); fixed (it is rejected), on
     /// by default. Off, the generator braces the constant (`{ ILEN }`) in such a path.
     pub bare_const_in_absolute_path: bool,
+    /// A trait whose type parameters have defaults that use a generic whose bound names the
+    /// trait's own `Self` (`trait Tr<T: AsRef<Self>, U = Rel<T>>`; F39, fixed: on by default), and
+    /// the control, where the bound names no `Self` (`T: Clone`). The entry of such a default is
+    /// for the implementors of the trait, which the Visitor writes through the host
+    /// (`with_nested_self()`) for a trait nested in `enter_mod`, and finds without `Self` for a
+    /// trait analyzed as the item itself (`intern_trait`, `enter_trait`). A trait nested in
+    /// `enter_mod` is often declared again in the Referrer's crate (`redeclare`), whose
+    /// declaration cannot pass the defaulted parameter to its own default (E0128). Before the fix
+    /// the Visitor left the default as written, which the Referrer's crate cannot resolve. Off,
+    /// no trait has the shape (the defaults of the other traits are as before).
+    pub trait_self_defaults: bool,
 }
 
 impl Features {
@@ -308,6 +330,7 @@ impl Features {
             path_named_like_generic: true,
             declared_named_like_generic: true,
             bare_const_in_absolute_path: true,
+            trait_self_defaults: true,
             ..Features::default()
         };
         for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
@@ -344,6 +367,7 @@ impl Features {
                     features.path_named_like_generic = true;
                     features.declared_named_like_generic = true;
                     features.bare_const_in_absolute_path = true;
+                    features.trait_self_defaults = true;
                 }
                 "inferred_outlives" => features.inferred_outlives = true,
                 "impl_assoc_self" => features.impl_assoc_self = true,
@@ -374,6 +398,7 @@ impl Features {
                 "path_named_like_generic" => features.path_named_like_generic = true,
                 "declared_named_like_generic" => features.declared_named_like_generic = true,
                 "bare_const_in_absolute_path" => features.bare_const_in_absolute_path = true,
+                "trait_self_defaults" => features.trait_self_defaults = true,
                 "unsized_params" => features.unsized_params = true,
                 "bound_cycles" => features.bound_cycles = true,
                 other => panic!("unknown feature `{}`", other),
@@ -439,6 +464,14 @@ pub const TAG_SELF_DENIED: &str = "self_denied";
 /// in `enter_mod` (`main.rs`), where a path of another crate can hold a name that the module
 /// declares beside a bare name (`::l::B2<I0, R0>`), which the Leaker rejects.
 pub const TAG_MODULE_SCOPE: &str = "module_scope";
+/// The shapes of `trait_self_defaults` (F39), which explain no rejection (`family()` lists none of
+/// them): the statistics count the traits that have them. `shape:self_default`: a parameter has a
+/// bound that names the trait's `Self` and a later one has a default; `shape:plain_default`: the
+/// control, the same but the bound names no `Self`; `shape:redeclared`: the Referrer's crate
+/// declares the trait again (`redeclare`).
+pub const TAG_SELF_DEFAULT: &str = "shape:self_default";
+pub const TAG_PLAIN_DEFAULT: &str = "shape:plain_default";
+pub const TAG_REDECLARED: &str = "shape:redeclared";
 
 /// An item with a macro on it, which the Referrer invokes.
 #[derive(Clone)]
@@ -502,6 +535,15 @@ const PRIMITIVE_OFF_PERCENT: u32 = 20;
 /// named alike (`Gen::clash_methods()`).
 const CLASH_PERCENT: u32 = 20;
 const CYCLIC_ITEM_IN_MODULE_PERCENT: u32 = 30;
+/// The share of the traits analyzed one by one that have the shape of `trait_self_defaults`: a
+/// parameter with a bound and later ones with defaults that use it.
+const SELF_DEFAULT_PERCENT: u32 = 20;
+/// Of those, the share whose bound names `Self` (the rest is the control: `T: Clone`, or no bound).
+const SELF_DEFAULT_NAMES_SELF_PERCENT: u32 = 70;
+/// ... the share nested in `enter_mod` (the Visitor writes the default through the host), and of
+/// those the share that the Referrer's crate declares again (`redeclare`).
+const SELF_DEFAULT_NESTED_PERCENT: u32 = 45;
+const SELF_DEFAULT_REDECLARE_PERCENT: u32 = 60;
 
 // ---------------------------------------------------------------------------------------------
 // The model: bounds, types, the generics in scope.
@@ -1163,6 +1205,9 @@ pub struct Gen {
     assoc_self_types: Vec<String>,
     /// A default of a parameter is being generated.
     in_default: bool,
+    /// The attribute of the item being generated says `redeclare = true`: the Referrer's crate
+    /// declares the trait again (`trait_self_defaults`).
+    redeclare: bool,
 }
 
 const PRIMS: &[&str] = &[
@@ -1209,6 +1254,7 @@ impl Gen {
             last_strict: false,
             assoc_self_types: Vec::new(),
             in_default: false,
+            redeclare: false,
         };
         g.cfg.prelude = g.chance(50);
         g.cfg.allow_std = g.chance(35);
@@ -3468,6 +3514,17 @@ fn prune(sk: &Skeleton, ty: &Ty) -> Skeleton {
     out
 }
 
+/// The shape of a trait of `trait_self_defaults` (F39): `Gen::self_default_shape()`.
+#[derive(Clone, Copy)]
+struct SelfDefault {
+    /// A parameter has a bound that names the trait's `Self`; else the control.
+    names_self: bool,
+    /// The trait is analyzed nested in `enter_mod`.
+    nested: bool,
+    /// The Referrer's crate declares the trait again (`redeclare`): only for a nested trait.
+    redeclare: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AdtKind {
     Struct,
@@ -3487,13 +3544,18 @@ impl Gen {
     fn attr(&self, id: usize, allow_self: bool, scope: &str, strict: bool) -> String {
         format!(
             "#[{}(id = {}, allow_self = {}, prelude = {}, scope = \"{}\", allow = \"{}\", \
-             strict = {}, primitive = {}, relaxed_sized = {})]\n",
+             {}strict = {}, primitive = {}, relaxed_sized = {})]\n",
             ATTR,
             id,
             allow_self,
             self.cfg.prelude,
             scope,
             self.cfg.allow_arg(),
+            if self.redeclare {
+                "redeclare = true, "
+            } else {
+                ""
+            },
             strict,
             self.cfg.primitive,
             BARE_RELAXED_SIZED_ALWAYS_OK
@@ -3773,7 +3835,240 @@ impl Gen {
         format!("{}{}\n", attr, text)
     }
 
+    /// Whether the trait about to be generated has the shape of `trait_self_defaults` (F39), and
+    /// which. Decided by the hash of the state, which draws nothing: the other choices are the same
+    /// as without the feature, and a trait that does not have the shape is made as before.
+    ///
+    /// Only the items that the macro is applied to have it (a module analyzed as a whole names no
+    /// `Self`), and a parameter bound that names `Self` needs an item that may: a nested trait has
+    /// a `Self` of its own whatever `allow_self` says, the others are rejected with `allow_self =
+    /// false`, so those are the control.
+    fn self_default_shape(&self, ann: Option<(usize, bool)>) -> Option<SelfDefault> {
+        let (_, allow_self) = ann?;
+        if !self.features.trait_self_defaults || self.module_mode {
+            return None;
+        }
+        let mut state = self.rng.clone();
+        state.write(b"trait_self_defaults");
+        let draw = state.finish();
+        if draw % 100 >= u64::from(SELF_DEFAULT_PERCENT) {
+            return None;
+        }
+        let percent = |n: u64, limit: u32| (draw / n) % 100 < u64::from(limit);
+        let nested = self.features.nested_self && percent(100, SELF_DEFAULT_NESTED_PERCENT);
+        Some(SelfDefault {
+            names_self: (allow_self || nested) && percent(10_000, SELF_DEFAULT_NAMES_SELF_PERCENT),
+            nested,
+            redeclare: nested && percent(1_000_000, SELF_DEFAULT_REDECLARE_PERCENT),
+        })
+    }
+
+    /// A trait whose parameter defaults use a parameter with a bound (`trait Tr<T: AsRef<Self>, U
+    /// = Rel<T>>`), and the control, where the bound names no `Self` (`trait Tr<T: Clone, U =
+    /// Rel<T>>`): `trait_self_defaults`, F39.
+    ///
+    /// The leading parameters (one or two) have no default, the first has the bound, and one or two
+    /// trailing parameters have a default that names the leading ones (`Rel<T>`, `Rel2<T, U>`, a
+    /// closed type, or any type the generator makes), the first of them always `Head<T>` if the
+    /// bound names `Self`. The bound is written in the parameter or in a where predicate.
+    ///
+    /// The body is a few methods, or, for a trait that the Referrer's crate declares again
+    /// (`redeclare`), one method that names the parameters only: the declaration has `T:
+    /// AsRef<Self>`, and the type of an entry that names `T` is written through the host, which has
+    /// the impl of the Repeater for `T: AsRef<Host>` (E0277 in the declaration). The defaults of
+    /// that trait name the leading parameters only, because the declaration passes `()` for a
+    /// defaulted one (E0128) and the copy of the default must be the original. The trait is not
+    /// implemented by the other items of the module.
+    fn gen_self_default_trait(&mut self, ann: Option<(usize, bool)>, shape: SelfDefault) -> String {
+        let name = self.name("Tr");
+        let allow_self = ann.map_or(true, |(_, a)| a);
+        let saved_prob = self.self_prob;
+        if !allow_self {
+            self.self_prob = 6;
+        }
+        let saved_no_self = self.no_self;
+        if shape.redeclare {
+            self.no_self = true;
+        }
+        let names = ["T", "U", "V"];
+        let n_lead = if self.chance(30) { 2 } else { 1 };
+        let n_default = self.range(1, 3 - n_lead);
+        let param = |name: &str, bounds: Bounds, bound_texts: Vec<String>| TyParam {
+            name: name.to_string(),
+            sized: true,
+            bounds,
+            bound_texts,
+            outlives: Vec::new(),
+            iter: false,
+            fixed_item: 0,
+        };
+        let mut sk = Skeleton::default();
+        for (i, tyname) in names.iter().take(n_lead).enumerate() {
+            if i == 0 && shape.names_self {
+                let bound = format!("{}<Self>", self.trait_path("AsRef"));
+                if self.chance(35) {
+                    sk.preds.push(format!("{}: {}", tyname, bound));
+                    sk.tys.push(param(tyname, Bounds::default(), Vec::new()));
+                } else {
+                    sk.tys.push(param(tyname, Bounds::default(), vec![bound]));
+                }
+            } else if self.chance(50) {
+                let bounds = *self.pick(&[
+                    Bounds::only_clone(),
+                    Bounds::only_debug(),
+                    Bounds::only_default(),
+                ]);
+                let texts = self.bound_texts(bounds);
+                sk.tys.push(param(tyname, bounds, texts));
+            } else {
+                sk.tys.push(param(tyname, Bounds::default(), Vec::new()));
+            }
+        }
+        for tyname in names.iter().skip(n_lead).take(n_default) {
+            sk.tys.push(param(tyname, Bounds::default(), Vec::new()));
+        }
+        // The defaults.
+        let saved_assoc = std::mem::replace(&mut self.no_assoc_paths, true);
+        self.in_default = true;
+        for i in n_lead..sk.tys.len() {
+            // A default names the parameters before it, but a trait that is declared again passes
+            // `()` for the defaulted ones, so only the leading ones.
+            let usable = if shape.redeclare { n_lead } else { i };
+            let params: Vec<String> = sk.tys[..usable].iter().map(|t| t.name.clone()).collect();
+            let any = self.chance(15);
+            let heads = |g: &Gen, shape: Shape| -> Vec<String> {
+                g.env
+                    .heads
+                    .iter()
+                    .filter(|h| h.shape == shape && (any || !h.name.starts_with("::")))
+                    .filter(|h| !is_shadow_name(&h.name))
+                    .map(|h| h.name.clone())
+                    .collect()
+            };
+            let (t0, t1, t2) = (
+                heads(self, Shape::Unit),
+                heads(self, Shape::T1),
+                heads(self, Shape::T2),
+            );
+            let first = shape.names_self && i == n_lead;
+            let form = if first { 0 } else { self.below(100) };
+            let mut text = match form {
+                0..=59 if !t1.is_empty() => {
+                    // The parameter with the bound, mostly.
+                    let used = if first || self.chance(70) {
+                        params[0].clone()
+                    } else {
+                        self.pick(&params).clone()
+                    };
+                    format!("{}<{}>", self.pick(&t1), used)
+                }
+                60..=79 if !t2.is_empty() => {
+                    let (a, b) = (self.pick(&params).clone(), self.pick(&params).clone());
+                    format!("{}<{}, {}>", self.pick(&t2), a, b)
+                }
+                80..=89 if !t0.is_empty() => self.pick(&t0).clone(),
+                _ => String::new(),
+            };
+            if text.is_empty() {
+                // Any type the generator makes, with the parameters before the default.
+                let before = Skeleton {
+                    tys: sk.tys[..usable].to_vec(),
+                    ..Default::default()
+                };
+                let mut sc = before.scope(&Scope::default());
+                sc.reserved = sk.tys[usable..].iter().map(|t| t.name.clone()).collect();
+                text = "u8".to_string();
+                for attempt in 0..3 {
+                    let con = Con {
+                        closed: attempt >= 1,
+                        no_lifetimes: true,
+                        ..Con::sized()
+                    };
+                    let ty = self.ty(&sc, con, 1);
+                    if !ty.uses_self {
+                        text = ty.text;
+                        break;
+                    }
+                }
+            }
+            sk.defaults.push((sk.tys[i].name.clone(), text));
+        }
+        self.in_default = false;
+        self.no_assoc_paths = saved_assoc;
+
+        let base = Scope {
+            self_kind: SelfKind::Unsized,
+            trait_ref: format!("{}{}", name, sk.args()),
+            ..Default::default()
+        };
+        let sc = sk.scope(&base);
+        let mut methods: Vec<String> = Vec::new();
+        let by_value = |g: &mut Gen, sk: &Skeleton| -> String {
+            let params: Vec<String> = sk
+                .tys
+                .iter()
+                .enumerate()
+                .map(|(i, t)| format!("a{}: {}", i, t.name))
+                .collect();
+            let m = g.name("m");
+            format!("fn {}(&self, {})", m, params.join(", "))
+        };
+        if shape.redeclare {
+            methods.push(by_value(self, &sk));
+        } else {
+            let method_scope = Scope {
+                self_kind: SelfKind::MaybeUnsized,
+                ..sc
+            };
+            if self.chance(50) {
+                methods.push(by_value(self, &sk));
+            }
+            for _ in 0..self.range(0, 2) {
+                let m = self.name("m");
+                methods.push(self.method_sig(&method_scope, &m, true));
+            }
+        }
+        self.self_prob = saved_prob;
+        self.no_self = saved_no_self;
+
+        self.tags.insert(
+            if shape.names_self {
+                TAG_SELF_DEFAULT
+            } else {
+                TAG_PLAIN_DEFAULT
+            }
+            .to_string(),
+        );
+        if shape.redeclare {
+            self.tags.insert(TAG_REDECLARED.to_string());
+        }
+        // Nested in `enter_mod` (it has a `Self` of its own), or analyzed as the item itself: by
+        // `intern_trait`, mostly, and by `enter_trait`.
+        let scope: &'static str = if shape.nested {
+            "mod"
+        } else if self.chance(25) {
+            "trait"
+        } else {
+            ""
+        };
+        self.redeclare = shape.redeclare;
+        let attr = self.attr_with(ann, scope);
+        self.redeclare = false;
+        let body: Vec<String> = methods.iter().map(|m| format!("{};", m)).collect();
+        format!(
+            "{}pub trait {}{}{} {{\n{}\n}}\n",
+            attr,
+            name,
+            sk.params_decl(),
+            sk.where_clause(),
+            body.join("\n")
+        )
+    }
+
     fn gen_trait(&mut self, ann: Option<(usize, bool)>) -> String {
+        if let Some(shape) = self.self_default_shape(ann) {
+            return self.gen_self_default_trait(ann, shape);
+        }
         let name = self.name("Tr");
         let allow_self = ann.map_or(true, |(_, a)| a);
         let saved_prob = self.self_prob;

@@ -104,6 +104,17 @@
 //! writes its entries with `Visitor::with_nested_self()`, and the check writes the Leaker's type
 //! for a `Self` that no entry has.
 //!
+//! A fifth of the traits analyzed one by one have parameters with defaults that use a parameter with
+//! a bound (`trait Tr<T: AsRef<Self>, U = Rel<T>>`, `trait_self_defaults` below, F39). The bound
+//! names the trait's `Self` in seven of ten, and the rest is the control (`T: Clone`). Those
+//! traits are nested in `enter_mod` in 45% (the Visitor writes the default through the host,
+//! `with_nested_self()`), and analyzed as the item itself by `intern_trait` or `enter_trait`
+//! otherwise (the Visitor finds the default without `Self`, and the macro picks the host as the
+//! implementor for an entry whose bound names `Self`). Of the nested ones, 60% are declared again in
+//! the Referrer's crate (`redeclare`, `Args::redeclare` of `tests/crates/macro/prop.rs`), which
+//! cannot pass the defaulted parameter to its own default (E0128), and then have a method that
+//! names the parameters only. The statistics count them apart ("traits with defaults").
+//!
 //! Environment variables:
 //!
 //! - `TYPE_LEAK_PROP_CASES` (default 24): the number of cases.
@@ -136,6 +147,11 @@
 //!   the copy's own type; one that names it too is rejected; F38: an absolute type that names it
 //!   is no entry, so a strict Referrer copies it as written, with the copy's own `Self`, as a
 //!   trusting one does: the macro checks that no optional entry of such an item names `Self`),
+//!   `trait_self_defaults` (F39: a trait whose parameter defaults use a generic whose bound names
+//!   the trait's `Self`, `trait Tr<T: AsRef<Self>, U = Rel<T>>`, nested in `enter_mod`, where the
+//!   Visitor left the default as written, and analyzed as the item itself, where it looks the
+//!   default up without `Self`; with the control whose bound names no `Self`; the traits are
+//!   counted in the statistics: no shape explains a rejection, so none has a tag in `family()`),
 //!   `path_named_like_generic` (`self::U` next to a generic `U`), `declared_named_like_generic` (a
 //!   module that declares `X`, and `crate::base::B1<X>` in `fn f<X>`) and
 //!   `bare_const_in_absolute_path` (a bare `ILEN` next to a leaked argument in a
@@ -839,6 +855,27 @@ struct Stats {
     primitive_off: usize,
     /// The rejections by their reason (`family()`).
     families: BTreeMap<&'static str, usize>,
+    /// The traits of `trait_self_defaults` (F39), by shape (`SELF_DEFAULT_SHAPES`).
+    self_defaults: BTreeMap<&'static str, SelfDefaultCount>,
+}
+
+/// The shapes of `trait_self_defaults` that the statistics count, with what each is: a trait
+/// with a bound that names its `Self` and a later parameter with a default that uses it, the
+/// control with a bound that does not, and the traits that the Referrer's crate declares again.
+const SELF_DEFAULT_SHAPES: &[(&str, &str)] = &[
+    (gen::TAG_SELF_DEFAULT, "default needs Self"),
+    (gen::TAG_PLAIN_DEFAULT, "control, no Self"),
+    (gen::TAG_REDECLARED, "declared again"),
+];
+
+/// The traits of one shape of `trait_self_defaults` that the macro was applied to: how many the
+/// Leaker accepted, and the same for those analyzed nested in `enter_mod`.
+#[derive(Default)]
+struct SelfDefaultCount {
+    analyzed: usize,
+    accepted: usize,
+    nested_analyzed: usize,
+    nested_accepted: usize,
 }
 
 fn kind_of(name: &str) -> &'static str {
@@ -863,6 +900,16 @@ impl Stats {
                     }
                     stats.skipped += report.skipped;
                     stats.twins += usize::from(report.twin);
+                    for (tag, _) in SELF_DEFAULT_SHAPES {
+                        if item.tags.contains(*tag) {
+                            let count = stats.self_defaults.entry(tag).or_default();
+                            let nested = item.scope == "mod";
+                            count.analyzed += 1;
+                            count.accepted += usize::from(report.accepted);
+                            count.nested_analyzed += usize::from(nested);
+                            count.nested_accepted += usize::from(nested && report.accepted);
+                        }
+                    }
                     for error in &report.rejections {
                         if let Some(family) = family(error) {
                             *stats.families.entry(family.name).or_default() += 1;
@@ -1163,6 +1210,16 @@ fn summarize(stats: &Stats, floors: &Floors, seed: u64, n: usize, features: Feat
         stats.twins, stats.bare_rejected, stats.skipped, stats.primitive_off
     )
     .unwrap();
+    for (tag, what) in SELF_DEFAULT_SHAPES {
+        if let Some(count) = stats.self_defaults.get(tag) {
+            writeln!(
+                s,
+                "  traits with defaults (trait_self_defaults) {:<18} {:>4} analyzed, {:>4} accepted; nested in enter_mod: {:>4} analyzed, {:>4} accepted",
+                what, count.analyzed, count.accepted, count.nested_analyzed, count.nested_accepted
+            )
+            .unwrap();
+        }
+    }
     for (name, n) in &stats.families {
         writeln!(s, "  explained rejection errors: {:>4}x {}", n, name).unwrap();
     }
@@ -1818,6 +1875,8 @@ mod checks {
     fn the_generated_cases_say_what_the_macro_needs() {
         let mut bare_sized = 0;
         let mut strict = 0;
+        // The traits of `trait_self_defaults` (F39): needing `Self` and nested, and declared again.
+        let (mut nested_self_default, mut redeclared, mut plain_default) = (0, 0, 0);
         for seed in 0..12 {
             let case = generate(seed, 0, 6, Features::parse(""));
             for item in &case.items {
@@ -1838,6 +1897,18 @@ mod checks {
                     gen::BARE_RELAXED_SIZED_ALWAYS_OK
                 )));
                 strict += usize::from(item.strict);
+                // `redeclare` is for a trait nested in `enter_mod`, and only for that.
+                let redeclare = item.tags.contains(gen::TAG_REDECLARED);
+                assert_eq!(attr.contains("redeclare = true,"), redeclare, "{}", attr);
+                if redeclare {
+                    assert!(item.kind == "trait" && item.scope == "mod", "{}", attr);
+                    redeclared += 1;
+                }
+                if item.tags.contains(gen::TAG_SELF_DEFAULT) {
+                    assert!(item.kind == "trait", "{}", attr);
+                    nested_self_default += usize::from(item.scope == "mod");
+                }
+                plain_default += usize::from(item.tags.contains(gen::TAG_PLAIN_DEFAULT));
                 // A bare trait without the prelude gets its tag: a bare `?Sized` unless it is accepted.
                 if item.tags.contains("bare:?Sized") {
                     assert!(!case.config.prelude && !gen::BARE_RELAXED_SIZED_ALWAYS_OK);
@@ -1853,6 +1924,14 @@ mod checks {
             }
         }
         assert!(strict > 0, "no item is strict in 12 cases");
+        assert!(
+            nested_self_default > 0 && redeclared > 0 && plain_default > 0,
+            "the traits of `trait_self_defaults` are not generated in 12 cases: {} nested that \
+             need Self, {} declared again, {} controls",
+            nested_self_default,
+            redeclared,
+            plain_default
+        );
         let _ = bare_sized;
     }
 

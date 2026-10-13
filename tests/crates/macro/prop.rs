@@ -1256,6 +1256,15 @@ impl Projector<'_> {
                 .type_self
                 .clone()
                 .ok_or_else(|| Error::new(Span::call_site(), "test macro: no type for Self"))?,
+            // The default of a parameter of a trait analyzed as the item itself, whose generics
+            // have a bound that names `Self` (`trait Tr<T: AsRef<Self>, U = Rel<T>>`): the
+            // Leaker analyzed it without `Self`, and the entry is for any type that the bound holds
+            // for. The implementor is the host, which has it (`T: AsRef<Host>`), not `()`.
+            _ if self.bound_self.is_some()
+                && names_self(self.referrer.context_generics(context)) =>
+            {
+                self.bound_self.clone().unwrap()
+            }
             _ => parse_quote!(()),
         };
         self.project_with(ix, self_ty)

@@ -8468,12 +8468,18 @@ fn f38_the_relative_types_and_the_other_items_are_unchanged() {
 /// (E0128), so the macro passes a type for it that the host implements the trait for (the fixtures
 /// 9131 and 9132 of `tests/cross_crate.rs`, which compile in the Referrer's crate).
 ///
-/// The property test hardly generates the shape: a default is generated for a trailing parameter
-/// that no bound or predicate names, and the types of the earlier ones are bounded by predicates
-/// that name `Self` only now and then. In its runs of this fix (seeds 1 to 24 of 60 cases, and seed
-/// 4 of 120) 2 of the 2170 traits with a default name `Self` in the header, and neither has a type
-/// default that uses a parameter with such a bound. The cross-crate fixtures 9131 and 9132 are
-/// the oracle.
+/// The property test generates the shape with the feature `trait_self_defaults` (on by default):
+/// a fifth of the traits analyzed one by one have a parameter with a bound that names `Self` and
+/// trailing parameters whose defaults use it, and the control where the bound names none; the
+/// nested ones (45%) are often declared again in the Referrer's crate (`redeclare`), as the
+/// cross-crate fixtures 9131 and 9132 are. Before the feature it hardly appeared (a default is
+/// generated for a trailing parameter that no bound or predicate names, and the earlier parameters
+/// are bounded by predicates that name `Self` only now and then: in the runs of this fix, seeds 1
+/// to 24 of 60 cases and seed 4 of 120, 2 of the 2170 traits with a default named `Self` in the
+/// header, and neither had a type default that uses a parameter with such a bound). Against the
+/// library of the commit before the fix, the generated Referrer's crates do not compile (24
+/// cases of seed 1: 10 of them, "cannot find type `R1`", E0425 and E0433: the default is left as
+/// written).
 #[test]
 fn f39_the_default_of_a_nested_trait_that_needs_its_self_is_written_through_the_host() {
     let item: Item = parse_quote!(
@@ -8659,9 +8665,19 @@ enum Root {
     InternTrait,
     /// `enter_trait()` and a walk of the item, as a macro that enters the scope itself does.
     EnterTrait,
+    /// `enter_trait()` and `view.visit_item(&item)`: the item is visited again, as a nested item.
+    EnterTraitItem,
+    /// A scope of a view inside `enter_generics()` (a nested `enter_trait()`) and a walk of the
+    /// item.
+    NestedEnterTrait,
 }
 
-const ROOTS: [Root; 2] = [Root::InternTrait, Root::EnterTrait];
+const ROOTS: [Root; 4] = [
+    Root::InternTrait,
+    Root::EnterTrait,
+    Root::EnterTraitItem,
+    Root::NestedEnterTrait,
+];
 
 fn root_analysis(root: Root, item: &ItemTrait) -> (Referrer, ContextId) {
     let mut leaker = new_leaker();
@@ -8674,6 +8690,27 @@ fn root_analysis(root: Root, item: &ItemTrait) -> (Referrer, ContextId) {
                 })
                 .unwrap()
                 .0
+        }
+        Root::EnterTraitItem => {
+            let nested = Item::Trait(item.clone());
+            leaker
+                .enter_trait(&item.ident, &item.generics, true, |view| {
+                    view.visit_item(&nested)
+                })
+                .unwrap()
+                .0
+        }
+        Root::NestedEnterTrait => {
+            leaker
+                .enter_generics(&Generics::default(), |view| {
+                    view.enter_trait(&item.ident, &item.generics, true, |view| {
+                        syn::visit::visit_item_trait(view, item)
+                    })
+                    .unwrap()
+                    .0
+                })
+                .unwrap()
+                .1
         }
     };
     (leaker.finish(), context)
@@ -8694,9 +8731,9 @@ fn entries_of(referrer: &Referrer, ty: &str) -> Vec<(usize, bool)> {
 /// implementor, and the Visitor hands the entry to the ordinary closure, whose result is not
 /// substituted again. It used to look the default up with the `Self` of the scope as well, and
 /// skipped the entry when another entry of the trait (`Rel2<Self>`) gave the scope a `Self`, so
-/// the copy kept `Rel<T>`. (The walk of the item in `enter_trait()` analyzes the default a second
-/// time, as a nested item, so the Leaker records an entry for the trait's `Self` too: the Visitor
-/// prefers the one analyzed alone.)
+/// the copy kept `Rel<T>`. The item is also analyzed as `enter_trait()` and `view.visit_item()`,
+/// and with a scope of a view (`View::enter_trait()`), for which the Leaker used to record the
+/// default twice (`f39_the_default_of_a_trait_is_recorded_once`): the roots here are the same.
 #[test]
 fn f39_the_default_of_the_trait_itself_is_looked_up_without_self() {
     let host: Type = parse_quote!(Host);
@@ -8791,6 +8828,127 @@ fn f39_the_default_of_the_trait_itself_is_looked_up_without_self() {
         );
         assert_eq!(string(&copy), string(&expected), "{}", what);
     }
+}
+
+/// F39: the default of a parameter of a trait is recorded once. A scope that declares generics
+/// analyzes the default of each parameter alone (without `Self`, with the parameters before it),
+/// as `intern_trait()` does for the trait itself, and the walk of the trait must not analyze it
+/// again. It did when the walk was not in the outermost scope, where the parameters were skipped
+/// (`root_defaulted`): in `View::enter_trait()`, and in `view.visit_item(&item)` after
+/// `enter_trait()` for the same trait, a nested item that declares its generics again. The default
+/// was then also an entry of the nested trait, for its own `Self` (`Self: Tr<T, U>`, with `U` in
+/// the generics of the context). It was harmless, as the Visitor prefers the entry analyzed alone
+/// (`f39_the_default_of_the_trait_itself_is_looked_up_without_self`), but it was a second entry in
+/// the Referrer and a second impl of the Repeater. (A trait that `enter_mod()` and `visit_item()`
+/// or `intern_mod()` visit is analyzed once, as a nested item: its default is the entry for the
+/// trait's `Self`, see
+/// `f39_the_default_of_a_nested_trait_that_needs_its_self_is_written_through_the_host`.)
+#[test]
+fn f39_the_default_of_a_trait_is_recorded_once() {
+    let item: ItemTrait = parse_quote!(
+        pub trait Tr<T: ::core::convert::AsRef<Self>, U = Rel<T>> {
+            fn f(&self, u: U);
+        }
+    );
+    for root in ROOTS {
+        let (referrer, _) = root_analysis(root, &item);
+        assert_eq!(referrer.iter().count(), 1, "{:?}", root);
+        // The entry is the one analyzed alone: no `Self`, and the generics before `U`.
+        assert_eq!(
+            entries_of(&referrer, "Rel < T >"),
+            [(0, false)],
+            "{:?}",
+            root
+        );
+        assert_eq!(
+            string(referrer.context_generics(referrer.context(0))),
+            "< T : :: core :: convert :: AsRef < Self > >",
+            "{:?}",
+            root
+        );
+    }
+
+    // The other entries of the trait are recorded once too. The same type in a method is an entry
+    // of the trait's `Self`, next to the default's (the default is analyzed alone).
+    let item: ItemTrait = parse_quote!(
+        pub trait Tr<T: ::core::convert::AsRef<Self>, U = Rel<T>> {
+            fn f(&self, u: U, v: Rel<T>) -> Rel2<Self>;
+        }
+    );
+    for root in ROOTS {
+        let (referrer, _) = root_analysis(root, &item);
+        let what = format!("{:?}", root);
+        let rel = entries_of(&referrer, "Rel < T >");
+        assert_eq!(rel.len(), 2, "{}: {:?}", what, rel);
+        assert_eq!(
+            rel.iter().filter(|(_, has_self)| !has_self).count(),
+            1,
+            "{}: {:?}",
+            what,
+            rel
+        );
+        assert_eq!(entries_of(&referrer, "Rel2 < Self >").len(), 1, "{}", what);
+        assert_eq!(referrer.iter().count(), 3, "{}", what);
+    }
+
+    // A default whose type does not depend on `Self`: one entry for the scope and the walk.
+    let item: ItemTrait = parse_quote!(
+        pub trait Tr<T, U = Rel<T>> {
+            fn f(&self, u: U);
+        }
+    );
+    for root in ROOTS {
+        let (referrer, _) = root_analysis(root, &item);
+        assert_eq!(referrer.iter().count(), 1, "{:?}", root);
+    }
+
+    // A trait nested in the scope that is not the one it was entered for is analyzed in full: its
+    // default is another type, and an entry of its own.
+    let item: ItemTrait = parse_quote!(
+        pub trait Tr<T: ::core::convert::AsRef<Self>, U = Rel<T>> {
+            fn f(&self, u: U);
+        }
+    );
+    let other: Item = parse_quote!(
+        pub trait Tr<T: ::core::convert::AsRef<Self>, U = Rel2<T>> {
+            fn f(&self, u: U);
+        }
+    );
+    let mut leaker = new_leaker();
+    leaker
+        .enter_trait(&item.ident, &item.generics, true, |view| {
+            view.visit_item(&other)
+        })
+        .unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(referrer.iter().count(), 2);
+    let rel = entries_of(&referrer, "Rel < T >");
+    assert!(matches!(rel[..], [(_, false)]), "{:?}", rel);
+    let rel2 = entries_of(&referrer, "Rel2 < T >");
+    assert!(matches!(rel2[..], [(_, true)]), "{:?}", rel2);
+
+    // As a nested item of a module (`enter_mod()`, `intern_mod()`), the default is the entry for
+    // the trait's `Self`, once.
+    let mut leaker = new_leaker();
+    let nested = Item::Trait(item.clone());
+    leaker
+        .enter_mod("m", names(&["Tr"]), |view| view.visit_item(&nested))
+        .unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(referrer.iter().count(), 1);
+    assert_eq!(entries_of(&referrer, "Rel < T >"), [(0, true)]);
+    let module: ItemMod = parse_quote!(
+        mod m {
+            pub trait Tr<T: ::core::convert::AsRef<Self>, U = Rel<T>> {
+                fn f(&self, u: U);
+            }
+        }
+    );
+    let mut leaker = new_leaker();
+    leaker.intern_mod(&module).unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(referrer.iter().count(), 1);
+    assert_eq!(entries_of(&referrer, "Rel < T >"), [(0, true)]);
 }
 
 /// F39, unchanged: a struct, an enum or a union nested in a scope still rejects the same entry (its
