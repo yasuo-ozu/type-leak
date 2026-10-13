@@ -230,7 +230,11 @@ pub struct Features {
     pub supertrait_item: bool,
     /// The same with the `Item` fixed by a bound (`T: Iterator<Item = u8>`) and the bound naming it
     /// through a type alias of the Leaker's crate (`T: Fn(::krate::base::BIt<T>) -> u8`), which the
-    /// Leaker takes for a struct (F26: a limitation, off by default).
+    /// Leaker takes for a struct: the Repeater's impl of the entry carried the bound, and rustc
+    /// could not prove it in the environment of the copy (F26, fixed: on by default, the context
+    /// of an entry leaves out a bound of a generic that names the generic, if another bound of it
+    /// fixes an associated type). A trait with such a bound has no method predicate that names
+    /// `Self::A`: rustc cannot prove the impl of the trait there, whatever `type-leak` does.
     pub alias_item: bool,
     /// An argument-position `impl Trait` whose bound names an entry that uses a generic with a bound
     /// that names a leaked type (`X: Fn(Rel0) -> u8`, `a: impl Into<Rel1<X>>`): the Leaker treats it
@@ -344,6 +348,7 @@ impl Features {
             iterator_item_cycle: true,
             hidden_lifetimes: true,
             supertrait_item: true,
+            alias_item: true,
             impl_trait_args: true,
             projection_outlives: true,
             item_predicate_cycle: true,
@@ -2807,9 +2812,13 @@ impl Gen {
                 .filter(|head| head.shape == Shape::T1)
                 .map(|head| head.name.clone())
                 .collect();
+            // A predicate that names `Self::A` next to the alias bound is no impl (see
+            // `method_sig()`).
+            let names_assoc = sk.preds.iter().any(|p| p.contains("Self::"));
             if !fixed.is_empty() && !heads.is_empty() && self.cyclic && self.chance(60) {
                 let x = self.pick(&fixed).clone();
-                if !bounded.contains(&(x.name.clone(), "fn")) {
+                if !(x.fixed_item == 2 && names_assoc) && !bounded.contains(&(x.name.clone(), "fn"))
+                {
                     bounded.push((x.name.clone(), "fn"));
                     let head = self.pick(&heads).clone();
                     let iterator = self.trait_path("Iterator");
@@ -3285,10 +3294,28 @@ impl Gen {
         sk.preds = pre_preds;
         self.preds(Level::Method, &sc, &mut sk, 2);
         let generic_names: Vec<String> = sc.tys.iter().map(|t| t.name.clone()).collect();
+        // A bound of the trait that names the `Item` of an iterator through an alias
+        // (`alias_item`, `T: Fn(BIt<T>) -> u8`) is not normalized in the environment of a method
+        // whose predicate names `Self::A`: rustc proves the impl of the trait there, so no
+        // generic impl of the trait exists (E0277 with no `type-leak` at all: `trait Tr<U:
+        // Iterator<Item = u8>> where U: Fn(WIt<U>) -> u8 { type A: Clone; fn m(&self) where
+        // Self::A: Clone; }` and `impl<U: Iterator<Item = u8>> Tr<U> for Host where U:
+        // Fn(WIt<U>) -> u8`; the same with `X: Into<Self::A>`, and not with `Self::A` in a
+        // position, nor with a struct instead of the alias), and the Leaker cannot see through
+        // the alias to reject the trait. So a method of such a trait has no predicate that names
+        // `Self::A`.
+        let alias_bound = sc
+            .tys
+            .iter()
+            .any(|t| t.fixed_item == 2 && sc.names_item.contains(&t.name))
+            || sk.preds.iter().any(|p| p.contains("::base::BIt<"));
+        if alias_bound {
+            sk.preds.retain(|p| !p.contains("Self::"));
+        }
         let (allowed, can_name) = if in_trait {
             (
                 self.features.trait_assoc_bound_cycle,
-                !sc.assoc.is_empty() && !self.no_self,
+                !sc.assoc.is_empty() && !self.no_self && !alias_bound,
             )
         } else {
             (

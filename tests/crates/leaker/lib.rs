@@ -896,6 +896,15 @@ pub mod kinds {
 
     pub trait Sink<A: ?Sized> {}
 
+    /// A type alias that hides a projection (F26), a struct of the same shape, a trait whose
+    /// supertrait fixes an `Item` (F25), and one with an associated type of its own.
+    pub type WIt<T> = <T as Iterator>::Item;
+    pub struct WFoo<T>(pub PhantomData<T>);
+    pub trait WIter: Iterator<Item = u8> {}
+    pub trait Cont {
+        type Out;
+    }
+
     pub trait Mark<A> {
         type Out;
         fn mark(&self, a: A) -> Self::Out;
@@ -1427,6 +1436,149 @@ pub mod kinds {
     pub struct Unbound<T: Clone> {
         pub link: Link<Self, T>,
         pub rel: Rel,
+    }
+
+    // A bound of a generic that names the generic, next to a bound of it that fixes an associated
+    // type (F26, F25, F2): the Repeater's impl of an entry that uses the generic leaves it out,
+    // and the copy, which has it in its environment as written, proves the impl (rustc cannot
+    // normalize `WIt<T>` to `u8` in the environment while it proves the bound of the impl, E0277).
+
+    /// The `Item` is fixed by a bound, and a bound of the generic names it through an alias that
+    /// the Leaker cannot tell from a struct.
+    #[prop_leak(id = 9171, allow_self = false, prelude = true)]
+    pub trait AliasItem<T: Iterator<Item = u8>>
+    where
+        T: Fn(::type_leak_test_leaker::kinds::WIt<T>),
+    {
+        fn m(&self)
+        where
+            Wrap<T>: Default;
+    }
+
+    /// The same for a strict Referrer, which replaces the alias too: its entry has no cycle.
+    #[prop_leak(id = 9172, allow_self = false, prelude = true, strict = true)]
+    pub trait AliasItemStrict<T: Iterator<Item = u8>>
+    where
+        T: Fn(::type_leak_test_leaker::kinds::WIt<T>),
+    {
+        fn m(&self)
+        where
+            Wrap<T>: Default;
+    }
+
+    /// The projection written (the Leaker rejected it before).
+    #[prop_leak(id = 9173, allow_self = false, prelude = true)]
+    pub trait WrittenItem<T: Iterator<Item = u8>>
+    where
+        T: Fn(<T as Iterator>::Item),
+    {
+        fn m(&self)
+        where
+            Wrap<T>: Default;
+    }
+
+    /// A struct instead of the alias: it compiled before, and the Leaker cannot tell.
+    #[prop_leak(id = 9174, allow_self = false, prelude = true)]
+    pub trait StructItem<T: Iterator<Item = u8>>
+    where
+        T: Fn(::type_leak_test_leaker::kinds::WFoo<T>),
+    {
+        fn m(&self)
+        where
+            Wrap<T>: Default;
+    }
+
+    /// The `Item` is fixed by a supertrait of a bound (F25), in the where clause of the trait and
+    /// in the generics of a method.
+    #[prop_leak(id = 9175, allow_self = false, prelude = true)]
+    pub trait SuperItem<T: ::type_leak_test_leaker::kinds::WIter>
+    where
+        T: Fn(T::Item),
+    {
+        fn m(&self)
+        where
+            Wrap<T>: Default;
+        fn n<U: ::type_leak_test_leaker::kinds::WIter + Fn(U::Item)>(&self)
+        where
+            Wrap<(Rel, U)>: Default;
+    }
+
+    /// A trait with an associated type of its own, which the Leaker cannot tell from `WIter`.
+    #[prop_leak(id = 9176, allow_self = false, prelude = true)]
+    pub trait OwnAssoc<T: ::type_leak_test_leaker::kinds::Cont>
+    where
+        T: Fn(T::Out),
+    {
+        fn m(&self)
+        where
+            Wrap<T>: Default;
+    }
+
+    /// A struct with the predicates, and a field.
+    #[prop_leak(id = 9177, allow_self = false, prelude = true)]
+    pub struct AliasStruct<T: Iterator<Item = u8>>(pub PhantomData<Wrap<T>>)
+    where
+        T: Fn(::type_leak_test_leaker::kinds::WIt<T>),
+        Wrap<T>: Default;
+
+    /// The bound that names the leaked type is the one that is left out (F2): the entry would be
+    /// in a cycle with itself otherwise.
+    #[prop_leak(id = 9178, allow_self = false, prelude = true)]
+    pub struct IntoEntry<T: Iterator<Item = u8> + Into<Wrap<T>>>(pub T);
+
+    /// The impl of F19: `Self` in a bound is the self type, which has the entry `Wrap<I>` (and
+    /// `Pair` is allowed, so the self type is no entry as a whole).
+    #[prop_leak(
+        id = 9179,
+        allow_self = true,
+        prelude = true,
+        allow = "::type_leak_test_leaker::kinds::Pair"
+    )]
+    impl<I: Iterator<Item = u8> + Fn(I::Item), V: AsRef<Self>>
+        ::type_leak_test_leaker::kinds::Pair<Wrap<I>, V>
+    {
+        pub fn m(&self, _a: Wrap<I>) {}
+    }
+
+    /// A type that the Leaker knows is declared with the bounds that it keeps whole: the self type
+    /// of an impl (the entry `Bounded<T>` is well-formed only with `T: Fn(WIt<T>)`), and `Self` of
+    /// a struct (the entry `Wrap<Self>`), though the entries that do not name them (`Wrap<T>`)
+    /// leave the bound out.
+    pub struct Bounded<T: Iterator<Item = u8>>(pub T)
+    where
+        T: Fn(::type_leak_test_leaker::kinds::WIt<T>);
+
+    #[prop_leak(id = 9182, allow_self = true, prelude = true)]
+    impl<T: Iterator<Item = u8>> Bounded<T>
+    where
+        T: Fn(::type_leak_test_leaker::kinds::WIt<T>),
+    {
+        pub fn m(&self, _x: Wrap<T>) {}
+    }
+
+    #[prop_leak(id = 9183, allow_self = true, prelude = true)]
+    pub struct SelfBounded<T: Iterator<Item = u8>>(pub T, pub Wrap<Self>, pub Wrap<T>)
+    where
+        T: Fn(::type_leak_test_leaker::kinds::WIt<T>);
+
+    /// Control: nothing fixes the `Item`, so the bound stays in the impl of the entry.
+    #[prop_leak(id = 9180, allow_self = false, prelude = true)]
+    pub trait RigidItem<T: Iterator>
+    where
+        T: Fn(T::Item),
+    {
+        fn m(&self)
+        where
+            Wrap<T>: Default;
+    }
+
+    /// Control: a bound of another generic that names a fixed `Item` is not left out (the rule is
+    /// about the generic that the bound names itself), and the Leaker rejects it.
+    #[prop_leak(id = 9181, allow_self = false, prelude = true)]
+    pub trait OtherGeneric<T: Iterator<Item = u8>, U: Fn(T::Item)> {
+        fn m(&self)
+        where
+            Wrap<U>: Default;
     }
 
     // The scopes of an item that share names, from the findings of a downstream crate

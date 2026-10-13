@@ -150,12 +150,38 @@ use template_quote::quote;
 /// fine. The same holds for a bound that names `Self`, `Self::A` or an associated type that rustc
 /// normalizes (such as the `Item` of an `Iterator<Item = ..>` bound in scope), and for a projection
 /// of a generic bounded by a trait outside the standard library: supertraits are not read, so it
-/// counts even where it would compile.
+/// counts even where it would compile. (Not so where the bound is of the generic itself and
+/// another bound of it fixes an associated type: the bound is left out, see below.)
 ///
 /// ```ignore
 /// struct S<T: Fn(Rel)>(Wrap<T>) where Wrap<T>: Sized;  // error: `Wrap<T>` in a predicate
 /// struct S<T: Fn(Rel)>(Wrap<T>);                       // good
 /// ```
+///
+/// A bound of a generic `T` that names `T` itself in the arguments of its path (`T: Fn(Wrap<T>)`,
+/// `T: PartialEq<<T as Iterator>::Item>`, also as a where predicate of the scope that declares `T`)
+/// is left out of the context of the entries that use `T`, so the Repeater's impl of the entry does
+/// not carry it, if another bound of `T` fixes an associated type: an equation (`T: Iterator<Item
+/// = u8>`, `T: Tr<A = X>`), or a bound of a trait that is not one of the standard library, whose
+/// supertrait may equate one (`T: ::p::WIter`). It matters because rustc proves the bounds of the
+/// impl whenever the copy names the entry in a predicate, in an environment in which it has not
+/// normalized the bounds yet, and cannot normalize `T: Fn(<T as Iterator>::Item)` with the
+/// equation first (E0277 "expected an `Fn(u8)` closure, found `T`"): an alias that hides the
+/// projection (`type It<T> = <T as Iterator>::Item;`) looks like a struct to the Leaker, so the
+/// bound is left out whatever it names. The bounds that are equations (even if they name `T`:
+/// `T: Iterator<Item = Wrap<T>>`), the bounds of other generics (`U: Fn(T::Item)`: the Leaker still
+/// rejects it where it is written as a projection, and does not see an alias), a bound of a
+/// predicate of an inner scope (a method's where clause) and the other bounds of `T` stay. So do
+/// all the bounds in the context of an entry that depends on `Self` as a type or an implementor
+/// (the self type of the item, `Self::A` of its trait), and of one that writes out the self type of
+/// the item (`impl<T: Iterator<Item = u8> + Fn(T::Item)> S<T>` with the entry `S<T>`): the Leaker
+/// knows that such a type is well-formed only with the bounds that its item declares.
+///
+/// The leaked type must not need a bound that is left out: with `struct Rel<T: Fn(Alias<T>)>(T);`
+/// and `T: Iterator<Item = u8> + Fn(Alias<T>)`, the Repeater's impl of `Rel<T>` has only `T:
+/// Iterator<Item = u8>`, and rustc rejects it in the crate of the Leaker (E0277). The Leaker cannot
+/// see the declaration of the type, so it does not tell. Write the type without the bound, or the
+/// bound without the generic (`T: Fn(u8)`).
 ///
 /// ## Bare identifiers and consts
 ///

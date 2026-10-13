@@ -139,7 +139,7 @@
 //!   `impl_pred_leaked` (F14), `self_elision` (F15, F23), `implied_outlives` (F16),
 //!   `strict_cycles` (F17, about the strict items too), `impl_self_bound_cycle` (F19),
 //!   `trait_assoc_bound_cycle` (F20), `iterator_item_cycle` (F21), `supertrait_item` (F25),
-//!   `impl_trait_args` (F27), `hidden_lifetimes` (F28), `projection_outlives` (F30),
+//!   `alias_item` (F26), `impl_trait_args` (F27), `hidden_lifetimes` (F28), `projection_outlives` (F30),
 //!   `item_predicate_cycle` (F33), `self_projection_outlives` (F34), `gat_where_clause` (F35),
 //!   `nested_self` (F36: a struct, an enum, a union or a trait analyzed nested in `enter_mod` that
 //!   names its own `Self`, which the Visitor writes with `with_nested_self()`; F37: an entry that
@@ -163,11 +163,10 @@
 //!   path of another crate, which was leaked alone as a type: E0573) are fixed findings,
 //!   each in a share of the items (`gen::Gen::cyclic`): they are on by default (the Leaker encodes
 //!   or rewrites them, records what they need, or rejects and counts what it cannot copy, and the
-//!   Referrer names the lifetime of an elided signature where `Self` adds lifetimes to it). `alias_item` (F26, a limitation) is a known failure that the
-//!   generator does not make by default: with it, or `all`, the test fails with the reproduction
-//!   of that finding (E0277). The other findings of `tests/findings.rs` (F22 to F24: the Leaker
-//!   rejected what compiles, F29, F31, F32) are not features: a rejection is counted as success, and
-//!   the test cannot show a toolchain or a lint.
+//!   Referrer names the lifetime of an elided signature where `Self` adds lifetimes to it). The
+//!   other findings of `tests/findings.rs` (F22 to F24: the Leaker rejected what compiles, F29,
+//!   F31, F32) are not features: a rejection is counted as success, and the test cannot show a
+//!   toolchain or a lint.
 //!
 //! The test is ignored by default: it is slow, as it builds the generated crates. Run it with
 //!

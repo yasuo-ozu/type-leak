@@ -195,6 +195,23 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9162!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9163!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9164!(path = ::type_leak_test_leaker::kinds);
+    // A bound of a generic that names it, next to one that fixes an associated type: left out of
+    // the Repeater's impls of the entries. 9172 is invoked as strict (it replaces the alias too).
+    type_leak_test_leaker::__tl_prop_9171!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9172!(path = ::type_leak_test_leaker::kinds, strict);
+    type_leak_test_leaker::__tl_prop_9173!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9174!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9175!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9176!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9177!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9178!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9179!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9180!(path = ::type_leak_test_leaker::kinds);
+    // The self type of an impl and `Self` of a struct keep the bounds of their item.
+    type_leak_test_leaker::__tl_prop_9182!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9183!(path = ::type_leak_test_leaker::kinds);
+    // The bound of another generic is not left out: the Leaker rejects it (it expands to nothing).
+    type_leak_test_leaker::__tl_prop_9181!(path = ::type_leak_test_leaker::kinds);
     // The defaults of a nested trait whose generic has a bound that names its `Self`: the copy is
     // declared here, with the defaults written through the host.
     type_leak_test_leaker::__tl_prop_9131!(path = ::type_leak_test_leaker::kinds);

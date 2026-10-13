@@ -629,6 +629,80 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9164, __tl_report_9164!()),
             ok("struct", 2, 2, 2),
         ),
+        // a bound of a generic that names it, next to a bound that fixes an associated type, is left
+        // out of the Repeater's impls of the entries: through an alias that hides the projection
+        // (also for a strict Referrer, which replaces the alias too), written, through a struct, a
+        // supertrait or an associated type of a trait, in a struct, for the bound that names the
+        // leaked type itself, and for the impl of F19; a rigid `Item` keeps the bound
+        // (9180); a bound of another generic is not left out, and the Leaker rejects it (9181)
+        (
+            9171,
+            reported(9171, __tl_report_9171!()),
+            ok("trait", 2, 0, 0),
+        ),
+        (
+            9172,
+            reported(9172, __tl_report_9172!()),
+            ok("trait", 2, 0, 0),
+        ),
+        (
+            9173,
+            reported(9173, __tl_report_9173!()),
+            ok("trait", 1, 0, 0),
+        ),
+        (
+            9174,
+            reported(9174, __tl_report_9174!()),
+            ok("trait", 2, 0, 0),
+        ),
+        (
+            9175,
+            reported(9175, __tl_report_9175!()),
+            ok("trait", 2, 0, 0),
+        ),
+        (
+            9176,
+            reported(9176, __tl_report_9176!()),
+            ok("trait", 1, 0, 0),
+        ),
+        (
+            9177,
+            reported(9177, __tl_report_9177!()),
+            ok("struct", 3, 1, 1),
+        ),
+        (
+            9178,
+            reported(9178, __tl_report_9178!()),
+            ok("struct", 1, 1, 1),
+        ),
+        (
+            9179,
+            reported(9179, __tl_report_9179!()),
+            ok("impl-inherent", 1, 2, 2),
+        ),
+        (
+            9180,
+            reported(9180, __tl_report_9180!()),
+            ok("trait", 1, 0, 0),
+        ),
+        (
+            9182,
+            reported(9182, __tl_report_9182!()),
+            ok("impl-inherent", 3, 2, 2),
+        ),
+        (
+            9183,
+            reported(9183, __tl_report_9183!()),
+            ok("struct", 3, 3, 3),
+        ),
+        (
+            9181,
+            reported(9181, __tl_report_9181!()),
+            rejected(
+                "trait",
+                "`Wrap<U>`isinaboundorwherepredicate,andaboundofitsgenericsnames`T::Item`",
+            ),
+        ),
         // the types in the values of an item (`check_values()`): the consts and the default
         // methods of a trait, and the const, the static and the function of a module
         (

@@ -601,19 +601,6 @@ fn a_bound_that_names_an_associated_type_that_rustc_normalizes_is_unstable() {
     // The `Item` is equated, so rustc normalizes it as it proves the impl of the Repeater for
     // `Wrap<T>` (`T: Fn(u8)`), and the environment has it as written (`T: Fn(T::Item)`).
     for item in [
-        // By the bound of the same generic.
-        parse_quote!(
-            impl<T: Iterator<Item = u8>> S<T>
-            where
-                T: Fn(T::Item),
-            {
-                fn m(&self)
-                where
-                    Wrap<T>: Sized,
-                {
-                }
-            }
-        ),
         // By a predicate of a method, which is not in the context of the entry (F21).
         parse_quote!(
             impl<T: Iterator> S<T>
@@ -674,7 +661,9 @@ fn a_bound_that_names_an_associated_type_that_rustc_normalizes_is_unstable() {
         );
     }
     // The `Item` of an iterator that nothing equates is rigid, and so is the one of a generic that
-    // the type does not use.
+    // the type does not use. The `Item` that a bound of the same generic equates is not rigid, but
+    // the context of the entry leaves out `T: Fn(T::Item)` then: the Repeater's impl has `T:
+    // Iterator<Item = u8>` only (F26, `tests/findings.rs`).
     for item in [
         parse_quote!(
             impl<T: Iterator> S<T>
@@ -709,12 +698,52 @@ fn a_bound_that_names_an_associated_type_that_rustc_normalizes_is_unstable() {
                 fn m(&self, a: Wrap<T>) {}
             }
         ),
+        // By the bound of the same generic.
+        parse_quote!(
+            impl<T: Iterator<Item = u8>> S<T>
+            where
+                T: Fn(T::Item),
+            {
+                fn m(&self)
+                where
+                    Wrap<T>: Sized,
+                {
+                }
+            }
+        ),
     ] {
         let text = s(&item);
         if let Err(err) = leak(item) {
             panic!("{} is rejected: {}", text, err);
         }
     }
+    let referrer = leak(parse_quote!(
+        impl<T: Iterator<Item = u8>> S<T>
+        where
+            T: Fn(T::Item),
+        {
+            fn m(&self)
+            where
+                Wrap<T>: Sized,
+            {
+            }
+        }
+    ))
+    .unwrap();
+    assert_eq!(
+        entries(&referrer),
+        [
+            // The self type is declared with the bounds of the item: it keeps them.
+            (
+                "S < T >".to_string(),
+                "< T : Fn (T :: Item) + Iterator < Item = u8 > >".to_string()
+            ),
+            (
+                "Wrap < T >".to_string(),
+                "< T : Iterator < Item = u8 > >".to_string()
+            ),
+        ]
+    );
 }
 
 #[test]
@@ -1172,19 +1201,55 @@ fn the_standard_traits_do_not_define_an_associated_type() {
     ))
     .unwrap();
     assert_eq!(types(&referrer), ["Rel < T >"]);
-    // A trait that is not, as a bare name or as a path, may define it.
+    // A trait that is not, as a bare name or as a path, may define it. The bound `Fn(T::Item) ->
+    // u8` that names it is left out of the context of the entry (F26), so the item is accepted.
     for name in ["MyTrait", "::p::Tr", "p::Tr"] {
         let item: Item = parse_str(&format!(
             "pub trait Tr<T: {} + Fn(T::Item) -> u8> {{ fn m(&self) where Rel<T>: Default; }}",
             name
         ))
         .unwrap();
-        let (headline, _) = rejected(item);
+        let mut leaker = leaker();
+        for allowed in ["MyTrait", "p::Tr", "::p"] {
+            leaker.allowed_paths.push(parse_str(allowed).unwrap());
+        }
+        match &item {
+            Item::Trait(item) => leaker.intern_trait(item, true),
+            _ => unreachable!(),
+        }
+        .unwrap_or_else(|e| panic!("{}: {}", name, e));
+        let referrer = leaker.finish();
+        assert_eq!(
+            entries(&referrer),
+            [(
+                "Rel < T >".to_string(),
+                s(&parse_str::<Generics>(&format!("<T: {}>", name)).unwrap())
+            )],
+            "{}",
+            name
+        );
+    }
+    // The bound of another generic that names the `Item` is not left out, and it is unstable.
+    for name in ["MyTrait", "::p::Tr", "p::Tr"] {
+        let item: Item = parse_str(&format!(
+            "pub trait Tr<T: {}, U: Fn(T::Item) -> u8> {{ fn m(&self) where Rel<U>: Default; }}",
+            name
+        ))
+        .unwrap();
+        let mut leaker = leaker();
+        for allowed in ["MyTrait", "p::Tr", "::p"] {
+            leaker.allowed_paths.push(parse_str(allowed).unwrap());
+        }
+        let err = match &item {
+            Item::Trait(item) => leaker.intern_trait(item, true),
+            _ => unreachable!(),
+        }
+        .unwrap_err();
         assert!(
-            headline.contains("names `T :: Item`"),
+            err.to_string().contains("names `T :: Item`"),
             "{}: {}",
             name,
-            headline
+            err
         );
     }
 }

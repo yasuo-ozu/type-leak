@@ -2564,6 +2564,11 @@ impl AnalyzeVisitor {
     /// the impl that rustc selects for a type in a predicate (see [`crate::unstable`]): one that
     /// names a leaked type (`env_leaked_bound()`), or `Self` if the copy writes the self type as a
     /// leaked one, `Self::A`, or an associated type that rustc normalizes.
+    ///
+    /// The generics of `context` are those the Repeater's impl has: the context has left out the
+    /// bounds of a generic that name it, if another bound of it fixes an associated type
+    /// (`Context::of()`, F26), so those are not looked at: the impl does not carry them, and the
+    /// environment of the copy needs nothing normalized to prove it.
     fn env_unstable_bound(&self, context: &Context, optional: bool) -> Option<Unstable> {
         if let Some(bound) = self.env_leaked_bound(context, optional) {
             return Some(Unstable {

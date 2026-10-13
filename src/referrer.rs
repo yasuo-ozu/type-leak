@@ -2186,8 +2186,11 @@ impl Referrer {
     // Wrap<T>` with `T: Clone + AsRef<Self>` is `T: Clone`, any type), which the Referrer
     // computes for a copy, so the entries of 13 are not found the same way; and an entry that is
     // for any type may name `Self` in its type (`LeakerConfig::nested_self_entries()`), which
-    // the Referrer finds too.
-    pub const FORMAT_VERSION: u32 = 14;
+    // the Referrer finds too. 15: the context of an entry leaves out a bound of a generic that
+    // names the generic in the arguments of its path (`T: Fn(Alias<T>)`), if another bound of it
+    // fixes an associated type (`T: Iterator<Item = u8>`), which the Referrer computes for a copy,
+    // so the entries of 14 are not found the same way.
+    pub const FORMAT_VERSION: u32 = 15;
 }
 
 /// Parses a [`Referrer`] written by its [`ToTokens`] implementation.

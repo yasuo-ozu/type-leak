@@ -17,6 +17,13 @@
 //!   Iterator<Item = u8>`), which the Leaker cannot read, so `T::Item` of a generic with such a
 //!   bound counts too.
 //!
+//! The context of a leaked type leaves out some of these bounds before they are looked at: a bound
+//! of a generic `T` that names `T` in the arguments of its path, if another bound of `T` fixes an
+//! associated type (`T: Iterator<Item = u8> + Fn(T::Item)`, also behind an alias that hides the
+//! projection), is not a bound of the Repeater's impl (see the context module,
+//! `left_out_bounds()`), so it is not unstable. The `T::Item` that a bound of another generic names
+//! (`U: Fn(T::Item)`), and one that an equation of a method defines, still are.
+//!
 //! A where predicate that is not a bound of a generic (`Vec<T::Item>: Default`, `u8:
 //! Into<T::Item>`) is proved by an impl, so it names no unstable bound as far as a leaked type,
 //! `Self` or an associated type of an impl goes. It is not so for the `T::Item` that a predicate in
@@ -332,7 +339,7 @@ const STD_TRAITS: &[&str] = &[
 /// Returns `true` if `path` is a trait of the standard library: an absolute path in `::core`,
 /// `::std` or `::alloc`, or a bare name of `STD_TRAITS`. Another path may be a trait of the analyzed
 /// code, or of a crate that the Leaker cannot read.
-fn is_std_trait(path: &Path) -> bool {
+pub(crate) fn is_std_trait(path: &Path) -> bool {
     let first = match path.segments.first() {
         Some(first) => ident_name(&first.ident),
         None => return false,

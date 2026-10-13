@@ -1,10 +1,11 @@
 //! The context of a leaked type: its generics, what `Self` means, and its module.
 
+use crate::unstable::is_std_trait;
 use crate::util::{
     bound_mentions_self, canonical_bounds, generic_param_mentions_self, generic_param_name,
-    ident_name, self_in_param, self_in_predicate, tidy, token_names, type_mentions_self,
-    type_names, unwrap_type_group, where_predicate_mentions_self, without_self_bounds, ReplaceSelf,
-    SelfMentions,
+    ident_name, self_in_param, self_in_predicate, tidy, token_names, type_contains,
+    type_mentions_self, type_names, unwrap_type_group, where_predicate_mentions_self,
+    without_self_bounds, ReplaceSelf, SelfMentions,
 };
 use proc_macro2::{Literal, TokenStream};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -821,6 +822,13 @@ impl Context {
         Self::compute(ty, scopes, self_req, nested_type, true, enclosing)
     }
 
+    /// Leaves out the bounds of the generics that the Repeater's impl cannot carry (see
+    /// [`LeftOut`]), except for a context that depends on `Self` as a type or an implementor, and
+    /// for a type that writes out the self type of its scope: the self type of an item, or the
+    /// associated type of its trait, is well-formed only with the bounds that the item declares,
+    /// which the impl needs whole (`struct S<T: Iterator<Item = u8> + Fn(T::Item)>` and the entry
+    /// `Wrap<S<T>>`, or `impl<T: Iterator<Item = u8> + Fn(T::Item)> S<T>` and the entry `S<T>`:
+    /// E0277 in the Leaker's crate otherwise).
     fn compute(
         ty: &Type,
         scopes: &[Scope],
@@ -828,6 +836,43 @@ impl Context {
         nested_type: bool,
         any: bool,
         enclosing: &Enclosing,
+    ) -> std::result::Result<Self, UnnameableSelf> {
+        let context = Self::compute_with(ty, scopes, self_req, nested_type, any, enclosing, true)?;
+        // The self type of an impl, a struct, an enum or a union, written out (`impl<T: Fn(T::Item)>
+        // S<T> { .. }` with the entry `S<T>`), is declared with the bounds of the item.
+        let names_self_type = matches!(self_req, Some(SelfRequirement::Type(self_ty))
+            if type_contains(ty, self_ty));
+        let depends_on_self = matches!(
+            context.self_ty(),
+            Some(SelfRequirement::Type(_)) | Some(SelfRequirement::Bound(_))
+        );
+        if !(names_self_type || depends_on_self) {
+            return Ok(context);
+        }
+        let mut whole =
+            Self::compute_with(ty, scopes, self_req, nested_type, any, enclosing, false)?;
+        // The Referrer knows the self type of the scope only if the top-level context records it:
+        // it does if the context depends on it (`substituted`, see `names_self()`), which it does
+        // when keeping the bounds makes a difference.
+        if names_self_type && whole != context {
+            if let Some(self_req) = self_req {
+                if !whole.substituted.contains(self_req) {
+                    whole.substituted.push(self_req.clone());
+                }
+            }
+        }
+        Ok(whole)
+    }
+
+    /// Like `compute()`; `leave_out` says whether it leaves out the bounds of [`LeftOut`].
+    fn compute_with(
+        ty: &Type,
+        scopes: &[Scope],
+        self_req: Option<&SelfRequirement>,
+        nested_type: bool,
+        any: bool,
+        enclosing: &Enclosing,
+        leave_out: bool,
     ) -> std::result::Result<Self, UnnameableSelf> {
         let mut names = HashSet::new();
         type_names(ty, &mut names);
@@ -881,6 +926,7 @@ impl Context {
                 .filter(|outer| Some(*outer) != self_req)
         };
         let mut substituted: Vec<SelfRequirement> = Vec::new();
+        let mut left_out = LeftOut::new(leave_out);
         loop {
             let (from, name) = match work.pop() {
                 Some(item) => item,
@@ -928,6 +974,17 @@ impl Context {
             // The bounds are written for the `Self` of the scope, which may not be this one.
             let outer = foreign(ix);
             let mut param = scopes[ix].params[pos].clone();
+            if let GenericParam::Type(param) = &mut param {
+                let left_out = left_out.of(scopes, ix, &name);
+                if !left_out.is_empty() {
+                    param.bounds = param
+                        .bounds
+                        .iter()
+                        .filter(|bound| !left_out.contains(&bound_text(bound)))
+                        .cloned()
+                        .collect();
+                }
+            }
             if let Some(outer) = outer.filter(|_| generic_param_mentions_self(&param)) {
                 param = for_self_of(outer, &param)?;
                 if !substituted.contains(outer) {
@@ -943,6 +1000,11 @@ impl Context {
                 if predicates.contains_key(&(ix, k)) {
                     continue;
                 }
+                // The bounds of a generic that the context leaves out are not its predicates.
+                let predicate = &match left_out.without(scopes, ix, predicate) {
+                    Some(predicate) => predicate,
+                    None => continue,
+                };
                 let mut names = HashSet::new();
                 token_names(quote!(#predicate), &mut names);
                 // A predicate on a generic of the scope is a bound of it, as `canonicalize()` makes
@@ -1198,6 +1260,13 @@ impl std::hash::Hash for Context {
 /// - A where predicate on one generic (`U: Into<T>`) is a bound of that generic, as if it was
 ///   written inline on `U`. It is in the context of what uses `U`, not of what uses `T`. A where
 ///   predicate on another type (`Vec<T>: Clone`) belongs to each generic it names.
+/// - A bound of a generic that names the generic itself in the arguments of its path (`T:
+///   Fn(Alias<T>)`) is left out, if another bound of it fixes an associated type (`T:
+///   Iterator<Item = u8>`, or a trait that is not one of the standard library): rustc cannot prove
+///   it in the Repeater's impl where the copy names the entry in a predicate. Not so if the entry
+///   depends on `Self` as a type or an implementor, or writes out the self type of its scope. See
+///   [Bounds that name leaked types](crate::Leaker#bounds-that-name-leaked-types), which says what
+///   can go wrong.
 ///
 /// # When two contexts are equal
 ///
@@ -1387,6 +1456,185 @@ fn bounded_generic(predicate: &WherePredicate) -> Option<String> {
         WherePredicate::Lifetime(PredicateLifetime { lifetime, .. }) => Some(lifetime.to_string()),
         _ => None,
     }
+}
+
+/// The bounds that a context leaves out, by the scope and the type parameter that they bound.
+///
+/// The Repeater's impl of an entry carries the bounds of the generics that its type uses, and rustc
+/// has to prove them whenever the copy names the entry in a predicate of an item (`fn m(&self)
+/// where <() as Repeater<(T,), ..>>::Type: Default`), in the environment of the item, in which the
+/// bounds are not normalized yet. A bound of `T` that names `T` through a projection that another
+/// bound of `T` fixes (`T: Iterator<Item = u8> + Fn(<T as Iterator>::Item)`: the impl needs `T:
+/// Fn(u8)`, the environment has `T: Fn(<T as Iterator>::Item)`) is not proved then (E0277
+/// "expected an `Fn(u8)` closure, found `T`"), and neither is one that hides the projection behind
+/// a type alias (`T: Fn(Alias<T>)`), which the Leaker cannot tell from a struct. The impl does not
+/// need that bound to name the entry, so the context leaves out such a bound, the Leaker and the
+/// Referrer alike (see [`left_out_bounds()`]), unless the context depends on `Self` as a type or an
+/// implementor (see `Context::compute()`).
+struct LeftOut {
+    /// Whether it leaves anything out.
+    enabled: bool,
+    cache: HashMap<(usize, String), HashSet<String>>,
+}
+
+impl LeftOut {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            cache: HashMap::new(),
+        }
+    }
+
+    /// The texts of the bounds of the type parameter `name` of `scopes[ix]` that the context
+    /// leaves out. Empty if `scopes[ix]` declares no such parameter.
+    fn of(&mut self, scopes: &[Scope], ix: usize, name: &str) -> &HashSet<String> {
+        let enabled = self.enabled;
+        self.cache.entry((ix, name.to_string())).or_insert_with(|| {
+            if enabled {
+                left_out_bounds(&scopes[ix], name)
+            } else {
+                HashSet::new()
+            }
+        })
+    }
+
+    /// `predicate` of `scopes[ix]` without the bounds of the generic it bounds that the context
+    /// leaves out: `None` if nothing is left.
+    fn without(
+        &mut self,
+        scopes: &[Scope],
+        ix: usize,
+        predicate: &WherePredicate,
+    ) -> Option<WherePredicate> {
+        let (bounded, predicate_type) = match predicate {
+            WherePredicate::Type(predicate_type) => (
+                bounded_ident(&predicate_type.bounded_ty).filter(|name| scopes[ix].declares(name)),
+                predicate_type,
+            ),
+            _ => return Some(predicate.clone()),
+        };
+        let left_out = match bounded {
+            Some(name) => self.of(scopes, ix, &name),
+            None => return Some(predicate.clone()),
+        };
+        if left_out.is_empty() {
+            return Some(predicate.clone());
+        }
+        let bounds: Punctuated<TypeParamBound, Token![+]> = predicate_type
+            .bounds
+            .iter()
+            .filter(|bound| !left_out.contains(&bound_text(bound)))
+            .cloned()
+            .collect();
+        if bounds.is_empty() {
+            return None;
+        }
+        Some(WherePredicate::Type(PredicateType {
+            bounds,
+            ..predicate_type.clone()
+        }))
+    }
+}
+
+fn bound_text(bound: &TypeParamBound) -> String {
+    quote!(#bound).to_string()
+}
+
+/// The name of the generic that a where predicate's bounded type is, if it is a bare name.
+fn bounded_ident(ty: &Type) -> Option<String> {
+    match unwrap_type_group(ty) {
+        Type::Path(TypePath { qself: None, path }) => path.get_ident().map(ident_name),
+        _ => None,
+    }
+}
+
+/// Returns `true` if `bound` is a trait bound with an equation of an associated type
+/// (`Iterator<Item = u8>`).
+fn binds_assoc(bound: &TypeParamBound) -> bool {
+    match bound {
+        TypeParamBound::Trait(bound) => matches!(
+            bound.path.segments.last().map(|seg| &seg.arguments),
+            Some(PathArguments::AngleBracketed(args))
+                if args.args.iter().any(|arg| matches!(arg, GenericArgument::AssocType(_)))
+        ),
+        _ => false,
+    }
+}
+
+/// Returns `true` if `bound` is a trait bound with the name `name` in the arguments of its path
+/// (`Fn(Wrap<T>)`, `Tr<<T as Iterator>::Item>`, `PartialEq<Wrap<T>>`).
+fn arguments_mention(bound: &TypeParamBound, name: &str) -> bool {
+    match bound {
+        TypeParamBound::Trait(bound) => {
+            let mut names = HashSet::new();
+            for seg in &bound.path.segments {
+                let arguments = &seg.arguments;
+                token_names(quote!(#arguments), &mut names);
+            }
+            names.contains(name)
+        }
+        _ => false,
+    }
+}
+
+/// Returns `true` if the trait of `bound` is not one of the standard library, so a supertrait of
+/// it may equate an associated type that the Leaker cannot read (`trait Tr: Iterator<Item = u8>`).
+fn may_define_assoc(bound: &TypeParamBound) -> bool {
+    match bound {
+        TypeParamBound::Trait(bound) => !is_std_trait(&bound.path),
+        _ => false,
+    }
+}
+
+/// Returns the texts of the bounds of the type parameter `name` of `scope` that its context leaves
+/// out: the bounds that name `name` in the arguments of their path (`T: Fn(X<T>)`, `T:
+/// Tr<<T as Iterator>::Item>`, `T: PartialEq<Wrap<T>>`, as a bound or a where predicate of the
+/// scope), if another bound of `name` fixes an associated type: an equation (`T: Iterator<Item =
+/// u8>`, `T: Tr<A = X>`), or a trait that is not one of the standard library and does not name
+/// `name` (`T: ::p::WIter`, which may have a supertrait that equates an `Item`).
+///
+/// A bound that is an equation stays, even if it names `name` (`T: Iterator<Item = Wrap<T>>`), as
+/// does every other bound. The rule is about `name` alone: a bound of `T` that names another
+/// generic `U` through a projection that `U: Iterator<Item = u8>` fixes (`T: Fn(<U as
+/// Iterator>::Item)`) stays, as does a bound of `T` in an inner scope (a method's where clause).
+///
+/// The type that is leaked may need the bound that is left out (`struct Rel<T: Fn(X<T>)>`), which
+/// the Leaker cannot see: the Repeater's impl is then rejected by rustc in the crate of the Leaker
+/// (E0277). See [`Leaker`](crate::Leaker#bounds-that-name-leaked-types).
+fn left_out_bounds(scope: &Scope, name: &str) -> HashSet<String> {
+    let mut bounds: Vec<&TypeParamBound> = Vec::new();
+    for param in scope.params() {
+        match param {
+            GenericParam::Type(param) if ident_name(&param.ident) == name => {
+                bounds.extend(param.bounds.iter())
+            }
+            _ => (),
+        }
+    }
+    if bounds.is_empty() && !scope.declares(name) {
+        return HashSet::new();
+    }
+    for predicate in scope.predicates() {
+        match predicate {
+            WherePredicate::Type(predicate)
+                if bounded_ident(&predicate.bounded_ty).as_deref() == Some(name) =>
+            {
+                bounds.extend(predicate.bounds.iter())
+            }
+            _ => (),
+        }
+    }
+    let fixes = bounds.iter().any(|bound| {
+        binds_assoc(bound) || (may_define_assoc(bound) && !arguments_mention(bound, name))
+    });
+    if !fixes {
+        return HashSet::new();
+    }
+    bounds
+        .into_iter()
+        .filter(|bound| !binds_assoc(bound) && arguments_mention(bound, name))
+        .map(bound_text)
+        .collect()
 }
 
 /// A generic parameter or a where predicate, written for the `Self` of the scope that declares it.

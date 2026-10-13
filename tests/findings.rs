@@ -34,7 +34,7 @@
 //! | `f23_self_in_elided_signature_where_referrer_can_rewrite` | `Self` in an elided signature is rejected in a bound and with `allow_self = false`, where the Referrer could write `for<'e>` | fixed |
 //! | `f24_self_in_predicate_with_leaked_bound_of_unused_generic` | a bare `Self` in a predicate is rejected for a leaked bound of a generic that no entry of the self type uses | fixed |
 //! | `f25_supertrait_item_in_bound_of_entry_in_predicate` | a supertrait fixes the `Item` that a bound of an entry's generic names | fixed |
-//! | `f26_alias_hides_projection_in_bound_of_entry_in_predicate` | a type alias hides the projection that such a bound names | limitation |
+//! | `f26_alias_hides_projection_in_bound_of_entry_in_predicate` | a type alias hides the projection that such a bound names: the context of an entry leaves out a bound of a generic that names it, if another bound of it fixes an associated type | fixed |
 //! | `f27_argument_impl_trait_bound_names_leaked_type_env_cycle` | the bound of an argument-position `impl Trait` names an entry whose generic has a leaked bound | fixed |
 //! | `f28_hidden_lifetime_in_elided_signature_with_generics` | a path hides the one lifetime of an elided signature, next to an entry that adds lifetimes | fixed |
 //! | `f29_entry_hides_lifetime` | an entry (a relative path) hides a lifetime: its Repeater impl does not compile | limitation |
@@ -66,8 +66,7 @@
 //!
 //! The test of a finding says how the property test shows it (`TYPE_LEAK_PROP_FEATURES=..`). The
 //! features of the fixed findings are on by default in the property test: the Leaker now rejects
-//! what they generate (the rejections are counted), or rewrites it. The feature of F26 is off, as
-//! for the other limitations. F22 to F24 were rejections of what compiles: a rejection is
+//! what they generate (the rejections are counted), or rewrites it. F22 to F24 were rejections of what compiles: a rejection is
 //! counted as a success by the property test, which cannot show them (nor F29, F31 and F32, which
 //! are about a toolchain, a lint, or an error in the Leaker's crate that the Leaker cannot see).
 //! The fix of F22 is checked by the property test the other way: the free functions and inherent
@@ -3335,6 +3334,12 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
         parse_quote!(
             impl<T: AsRef<Self>, U> ::p::Tr<Rel2<U>> for ::p::W<T, U, Rel<U>> where Rel3<U>: Default {}
         ),
+        // The `Item` that a bound equates is normalized when the copy proves the Repeater's impl
+        // of `Rel<I>` for `Self` (E0277, "expected an `Fn(u8)` closure, found `I`"), unless the
+        // context of the entry leaves out `I: Fn(I::Item)` (F26): it compiles.
+        parse_quote!(
+            impl<I: Iterator<Item = u8> + Fn(I::Item), V: AsRef<Self>> ::p::W<Rel<I>, I, V> {}
+        ),
     ];
     for item in &by_parts_controls {
         let (referrer, copy) = f19_copy_with(f13_leaker(), item)
@@ -3370,15 +3375,6 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
             ),
             "T : Fn (Rel2 < u8 >)",
             Blames::Leaked,
-        ),
-        // The `Item` that a predicate equates is normalized too (E0277, "expected an `Fn(u8)`
-        // closure, found `I`").
-        (
-            parse_quote!(
-                impl<I: Iterator<Item = u8> + Fn(I::Item), V: AsRef<Self>> ::p::W<Rel<I>, I, V> {}
-            ),
-            "I : Fn (I :: Item) + Iterator < Item = u8 >",
-            Blames::Projection("I :: Item"),
         ),
     ];
     for (item, bound, blames) in &normalized {
@@ -4084,8 +4080,8 @@ fn entries_naming_item(referrer: &Referrer, copy: &Item) -> Vec<String> {
 /// the environment is built). A supertrait that does not fix the `Item` (`trait WIter2: Iterator
 /// {}`), and a trait with an associated type of its own (`trait Cont { type Out; }`, `T:
 /// Fn(T::Out)`) compile as well (checked with rustc, stable and nightly, as the first), but the
-/// Leaker cannot tell them from `WIter`: rejecting them is the price. A supertrait that equates
-/// the associated type of its own supertrait (`trait Sub: Cont<Out = u8>`) fails as `WIter` does.
+/// Leaker cannot tell them from `WIter`. A supertrait that equates the associated type of its own
+/// supertrait (`trait Sub: Cont<Out = u8>`) fails as `WIter` does.
 ///
 /// The property test shows it with `TYPE_LEAK_PROP_FEATURES=supertrait_item` (on by default since
 /// the fix; before it, seeds 1, 2 and 3 of 60 cases failed with E0277 "expected an `FnOnce(u8)`
@@ -4094,12 +4090,21 @@ fn entries_naming_item(referrer: &Referrer, copy: &Item) -> Vec<String> {
 /// The assertion is that of F21: if the Leaker accepts the item, no entry that a predicate of the
 /// copy names has a bound of its context that names an `Item`.
 ///
-/// Fixed by the first alternative of the issue, rejecting: a projection (`T::Item`, `<T as
-/// Iterator>::Item`) of a generic that has a bound of a trait that is not one of the standard library
-/// (`unstable.rs`, `bindings()`: `T: ::p::WIter`, `T: Tr`, also in a where predicate or an
-/// enclosing item) counts as an associated type that rustc normalizes, as one that a bound equates.
-/// A bound of the standard library (`Iterator`, `Clone`, `Fn(..)`, a path in `::core`, `::std` or
-/// `::alloc`) does not.
+/// First fixed by rejecting: a projection (`T::Item`, `<T as Iterator>::Item`) of a generic that
+/// has a bound of a trait that is not one of the standard library (`unstable.rs`, `bindings()`:
+/// `T: ::p::WIter`, `T: Tr`, also in a where predicate or an enclosing item) counts as an
+/// associated type that rustc normalizes, as one that a bound equates. A bound of the standard
+/// library (`Iterator`, `Clone`, `Fn(..)`, a path in `::core`, `::std` or `::alloc`) does not. The
+/// price was that the supertrait that does not fix the `Item` and the trait with an associated
+/// type of its own were rejected too.
+///
+/// Fixed for good by F26: the context of the entry leaves out `T: Fn(T::Item)`, because another
+/// bound of `T` (`::p::WIter`, a trait that is not one of the standard library) may fix an
+/// associated type, so the Repeater's impl has `T: ::p::WIter` only, and the copy compiles (all
+/// the items below were built as the fixtures 9175 and 9176 of `tests/cross_crate.rs`, and the
+/// price is no price any more). The projection that stays rejected is that of another generic
+/// (`U: Fn(T::Item)` next to `T: ::p::WIter`), and the one whose equation is in a predicate of
+/// a method (F21), which are not in the context of the entry.
 #[test]
 fn f25_supertrait_item_in_bound_of_entry_in_predicate() {
     // The controls: rigid `Item`, and the entry in a position.
@@ -4172,48 +4177,49 @@ fn f25_supertrait_item_in_bound_of_entry_in_predicate() {
         f19_copy_with(f13_leaker(), item)
             .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
     }
-    // The price: the supertrait does not fix the `Item`, or the trait has an associated type of its
-    // own, and the copy compiles as well, but the Leaker cannot tell.
-    let price: Vec<Item> = vec![
-        parse_quote!(
-            pub trait Tr<T: ::p::WIter2>
-            where
-                T: Fn(T::Item),
-            {
-                fn m(&self)
-                where
-                    Rel<T>: Default;
-            }
-        ),
-        parse_quote!(
-            pub trait Tr<T: ::p::Cont>
-            where
-                T: Fn(T::Out),
-            {
-                fn m(&self)
-                where
-                    Rel<T>: Default;
-            }
-        ),
-    ];
-    let priced = [
+    // What the Leaker rejected before F26 (the price): the supertrait does not fix the `Item`, or
+    // the trait has an associated type of its own. The copy compiles, and so it does with the bound
+    // left out of the context of the entry.
+    let formerly_priced: Vec<(Item, &str)> = vec![
         (
-            "Rel < T >",
-            "T : :: p :: WIter2 + Fn (T :: Item)",
-            "T :: Item",
+            parse_quote!(
+                pub trait Tr<T: ::p::WIter2>
+                where
+                    T: Fn(T::Item),
+                {
+                    fn m(&self)
+                    where
+                        Rel<T>: Default;
+                }
+            ),
+            "< T : :: p :: WIter2 >",
         ),
-        ("Rel < T >", "T : :: p :: Cont + Fn (T :: Out)", "T :: Out"),
+        (
+            parse_quote!(
+                pub trait Tr<T: ::p::Cont>
+                where
+                    T: Fn(T::Out),
+                {
+                    fn m(&self)
+                    where
+                        Rel<T>: Default;
+                }
+            ),
+            "< T : :: p :: Cont >",
+        ),
     ];
-    assert_eq!(price.len(), priced.len());
-    for (item, (ty, bound, path)) in price.iter().zip(priced) {
-        assert_unstable(
-            item,
-            f19_copy_with(f13_leaker(), item),
-            ty,
-            bound,
-            Blames::Projection(path),
+    for (item, generics) in &formerly_priced {
+        let (referrer, copy) = f19_copy_with(f13_leaker(), item)
+            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        assert_eq!(
+            generics_text(referrer.generics(entry(&referrer, "Rel < T >"))),
+            *generics
         );
+        assert!(has_replacement_in_predicate(&copy), "{}", string(&copy));
     }
+    // Each is accepted: the entry that a predicate of the copy names has the bound `T: ::p::WIter`
+    // only, so no bound of its context names an `Item`. (The parameters are compared: the
+    // predicate of a method that names a generic of the method is in the context too.)
     let items: Vec<Item> = vec![
         parse_quote!(
             pub trait Tr<T: ::p::WIter>
@@ -4268,69 +4274,145 @@ fn f25_supertrait_item_in_bound_of_entry_in_predicate() {
             }
         ),
     ];
-    // Each is rejected: no copy of it exists whose predicate names such an entry.
-    let blamed = [
-        (
-            "Rel < T >",
-            "T : :: p :: WIter + Fn (T :: Item)",
-            Blames::Projection("T :: Item"),
-        ),
-        (
-            "Rel < T >",
-            "T : :: p :: WIter + Fn (< T as Iterator > :: Item)",
-            Blames::Projection("< T as Iterator > :: Item"),
-        ),
-        (
-            "Rel < T >",
-            "T : :: p :: WIter + Fn (T :: Item)",
-            Blames::Projection("T :: Item"),
-        ),
-        (
-            "Rel < T >",
-            "T : :: p :: WIter + Fn (T :: Item)",
-            Blames::Projection("T :: Item"),
-        ),
-        (
-            "Rel < T >",
-            "T : :: p :: WIter + Fn (T :: Item)",
-            Blames::Projection("T :: Item"),
-        ),
-    ];
-    assert_eq!(items.len(), blamed.len());
-    for (item, (ty, bound, blames)) in items.iter().zip(blamed) {
-        assert_unstable(
-            item,
-            entries_naming_item_in_predicates(item),
-            ty,
-            bound,
-            blames,
+    for item in &items {
+        let (copy, found) = entries_naming_item_in_predicates(item)
+            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        assert!(found.is_empty(), "{}", string(&copy));
+        assert!(has_replacement_in_predicate(&copy), "{}", string(&copy));
+        let (referrer, _) = f19_copy_with(f13_leaker(), item).unwrap();
+        assert_eq!(
+            string(referrer.generics(entry(&referrer, "Rel < T >"))),
+            "< T : :: p :: WIter >",
+            "{}",
+            string(item)
         );
     }
+    // The projection of another generic is not left out: the bound of `U` is not a bound of `T`.
+    let other: Item = parse_quote!(
+        pub trait Tr<T: ::p::WIter, U: Fn(T::Item)> {
+            fn m(&self)
+            where
+                Rel<U>: Default;
+        }
+    );
+    assert_unstable(
+        &other,
+        entries_naming_item_in_predicates(&other),
+        "Rel < U >",
+        "U : Fn (T :: Item)",
+        Blames::Projection("T :: Item"),
+    );
 }
 
-/// F26 (limitation): a type alias hides the projection that a bound names.
+/// The generics of an entry with their where clause, as the Repeater's impl has them.
+fn generics_text(generics: &Generics) -> String {
+    let where_clause = &generics.where_clause;
+    string(&quote!(#generics #where_clause))
+}
+
+/// The Repeater's impl of the entry `ix`, for the implementor `__S` (what a macro writes).
+fn repeater_impl_text(referrer: &Referrer, ix: usize) -> String {
+    let param: Ident = parse_quote!(__S);
+    let r = referrer
+        .repeater_impl(ix, ImplSelf::Param(&param))
+        .unwrap_or_else(|e| panic!("{}", e));
+    let repeater: Path = parse_quote!(crate::Repeater);
+    let (impl_generics, _, where_clause) = r.generics.split_for_impl();
+    let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
+    let impl_: ItemImpl = parse_quote! {
+        impl #impl_generics #repeater<#args, 0u64, 0usize> for #self_ty #where_clause {
+            type Type = #ty;
+        }
+    };
+    string(&impl_)
+}
+
+/// F26 (fixed): a type alias hides the projection that a bound names.
 ///
 /// Trigger: `trait Tr<T: Iterator<Item = u8>> where T: Fn(::p::WIt<T>) { fn m(&self) where Rel<T>:
 /// Default; }` with `type WIt<T> = <T as Iterator>::Item;` in the Leaker's crate. It is F21 and F25
-/// with the `Item` written through an alias. With the projection written (`T: Fn(T::Item)`) the
-/// Leaker rejects the item; with the alias it accepts it, and the copy is E0277 "expected an `Fn(u8)`
-/// closure, found `T`" as in F25 (checked with rustc, stable 1.98.1 and nightly 1.100.0, with the
-/// Leaker's crate and the Referrer's with the impl of the trait for a host type). `T: Iterator` with
-/// no equation compiles with the alias, as it does with the path (the alias is the projection of a
-/// rigid type).
+/// with the `Item` written through an alias: the Leaker saw no projection and accepted the item,
+/// and the copy is E0277 "expected an `Fn(u8)` closure, found `T`" (checked with rustc, stable
+/// 1.98.1, nightly 1.100.0 with and without `-Znext-solver`, 1.70 and 1.56, with the Leaker's crate
+/// and the Referrer's with the impl of the trait for a host type). With the projection written
+/// (`T: Fn(T::Item)`) the Leaker rejected the item.
 ///
-/// The property test shows it with `TYPE_LEAK_PROP_FEATURES=alias_item` (off by default: it is a
-/// limitation; seeds 1, 2 and 3 of 60 cases fail with the same E0277 as F25).
+/// The cause is in the impl of the Repeater, not in the alias. The impl of the entry `Rel<T>` has
+/// every bound of `T` in its context, `T: Fn(::p::WIt<T>)` too, and rustc has to prove that where
+/// clause whenever the copy writes `<() as Repeater<(T,), ..>>::Type: Default` in the where
+/// clause of a method, in the environment of the method, which it builds first. It proves `T:
+/// Fn(WIt<T>)` there normalized (`T: Fn(u8)`), with the equation `T: Iterator<Item = u8>`, and
+/// cannot use the equation to normalize the environment it is building (a limitation of rustc, the
+/// same with `-Znext-solver`). The environment has the bound as written. With an impl that does not
+/// carry the bound, everything compiles:
 ///
-/// No correct behaviour is possible: the Leaker sees `::p::WIt<T>` as a path with `T` as its
-/// argument, which a struct `::p::WFoo<T>` is as well, and
-/// `T: Iterator<Item = u8> + Fn(::p::WFoo<T>)` with `Rel<T>: Default` compiles (checked: the same
-/// impl copy). Rejecting every path that names `T` in the bounds of a generic that an equation
-/// fixes, where an entry that uses it is in a predicate, would reject what compiles. The `Leaker`
-/// docs say that a `::core` or allowed path is assumed to be a struct, an enum or a union (an alias
-/// that drops a lifetime, or hides a projection, is not seen), so allow only crates without such
-/// aliases, or write the projection. The test pins the acceptance, and that the written projection
-/// is the one that is found.
+/// ```text
+/// impl<T: Iterator<Item = u8>, __S: ?Sized> Repeater<(T,), 0, 0> for __S { type Type = Rel<T>; }
+/// trait C<T: Iterator<Item = u8>> where T: Fn(::p::WIt<T>) {
+///     fn m(&self) where <() as ::p::Repeater<(T,), 0, 0>>::Type: Default;
+/// }
+/// ```
+///
+/// (the same with `T: Fn(<T as Iterator>::Item)`, F25's written projection, and with `T:
+/// Fn(::p::WFoo<T>)`, a real struct, which compiled before). With the bound in the impl, the alias
+/// and the written projection fail, and the struct compiles. The Leaker cannot tell an alias from a
+/// struct (`::p::WIt<T>` is a path with `T` as its argument, as `::p::WFoo<T>` is), so it could
+/// not reject the alias without rejecting the struct.
+///
+/// Fixed in the context of the entry (`Context::of()`, and so in the Referrer too): it leaves out a
+/// bound of a generic `T` that names `T` in the arguments of its path (`T: Fn(X<T>)`, `T:
+/// Tr<<T as Iterator>::Item>`, `T: PartialEq<Wrap<T>>`, as a bound or as a where predicate `T: ..`
+/// of the scope that declares `T`), if another bound of `T` fixes an associated type: an equation
+/// (`T: Iterator<Item = u8>`, `T: Tr<A = X>`), or a trait that is not one of the standard library
+/// and does not name `T` itself (`T: ::p::WIter`; the Leaker does not read its supertraits, see
+/// F25). A bound that is an equation stays, even if it names `T`, and so does every other bound.
+///
+/// The rule is about `T` alone. A bound of another generic that names `T`'s `Item` (`U:
+/// Fn(T::Item)`) stays, and the Leaker rejects it where it is written as a projection (F21, F25).
+/// Behind an alias (`U: Fn(::p::WIt<T>)`) the Leaker does not see it, and it fails the same way
+/// (checked with rustc: `impl<U: Iterator<Item = u8>, T: Fn(WIt<U>), __S: ?Sized> Repeater<(T, U),
+/// ..>` and the copy `trait C<U: Iterator<Item = u8>, T: Fn(WIt<U>)> { fn m(&self) where <() as
+/// Repeater<(T, U), ..>>::Type: Default; }` are E0277). That stays a limitation: the property test
+/// does not make it (its alias bounds the iterator itself), and widening the rule to any generic
+/// that a bound names (`T: Into<U>` with `U: Iterator<Item = u8>`) would leave out bounds that have
+/// nothing to do with a projection. The bound of an inner scope (a where clause of a method) is not
+/// in the context of an entry of the generic of the trait at all.
+///
+/// Not a finding of the Leaker: the same limitation of rustc makes a trait with such a bound
+/// unimplementable by a generic impl, whatever `type-leak` does. `trait Tr<U: Iterator<Item = u8>>
+/// where U: Fn(WIt<U>) -> u8 { type A: Clone; fn m(&self) where Self::A: Clone; }` and `impl<U:
+/// Iterator<Item = u8>> Tr<U> for Host where U: Fn(WIt<U>) -> u8` is E0277 "expected an `Fn(u8)`
+/// closure, found `U`" in the impl (checked with rustc alone, stable 1.98.1 and 1.56): the method's
+/// predicate names `Self::A`, rustc normalizes it with the impl, and proves the impl's where clause
+/// `U: Fn(u8)` against the environment's `U: Fn(WIt<U>)`. The same with `X: Into<Self::A>`, not with
+/// `Self::A` in a position, nor with `WFoo<U>` (a struct) for the alias. The Leaker rejects the
+/// projection written (`Self::A` in a predicate, and a bound of the generics that names `T::Item`:
+/// `impl_unstable_bound()`), and cannot see the alias; the property test (seed 24 of 24 cases, case
+/// 9) found it through the impl for a host type that its macro writes, so the generator makes no
+/// method predicate that names `Self::A` in a trait that has such a bound.
+///
+/// The risk: a leaked type that needs the bound that is left out (`struct Rel<T: Fn(X<T>)>`, or a
+/// type that names `<T as Tr<Wrap<T>>>::A`) does not compile in the Repeater's impl: E0277 in the
+/// Leaker's crate, which the Leaker cannot see. The `Leaker` docs say so. It is not a risk where
+/// the Leaker knows the declaration: the entry that depends on `Self` as a type (the self type of
+/// the item, `Wrap2<Self>` in `struct S<T: Iterator<Item = u8> + Fn(T::Item)>`) or as an
+/// implementor (`Self::A` of a trait), and the entry that writes out the self type of the scope
+/// (`impl<T: Iterator<Item = u8> + Fn(T::Item)> S<T>` with the entry `S<T>`, whose top-level
+/// context then records `Self` for the Referrer, as it does for a bound rewritten for it), keep
+/// every bound, because the type is well-formed only with the bounds that its item declares (the
+/// property test showed it: seeds 1 and 2 were E0277 in the Leaker's crate for a struct, an enum, a
+/// union, an impl and a trait, with the fixtures 9182 and 9183 of `tests/cross_crate.rs`).
+///
+/// The property test shows it with `TYPE_LEAK_PROP_FEATURES=alias_item` (on by default since the
+/// fix; before it, seeds 1, 2 and 3 of 60 cases failed with the same E0277 as F25).
+///
+/// What this lifts: the shapes of F25 (the price is no price any more), the written projection
+/// (`T: Iterator<Item = u8> + Fn(T::Item)`), and a bound that names a leaked type next to an
+/// equation (`T: Iterator<Item = u8> + Into<Wrap<T>>`, F2, whose only cause was the bound in the
+/// impl of its own entry). What stays rejected: the equation in a predicate of a method (F21, `T:
+/// Iterator` in the context, so `T: Fn(T::Item)` is kept), `U: Fn(T::Item)` with the equation on
+/// `T`, a bound that names a leaked type with no equation, and every bound that names `Self`,
+/// `Self::A` or a projection that an impl defines.
 #[test]
 fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
     let alias: Item = parse_quote!(
@@ -4345,48 +4427,314 @@ fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
     );
     let (referrer, copy) = f19_copy_with(f13_leaker(), &alias).unwrap();
     let ix = entry(&referrer, "Rel < T >");
-    let generics = string(referrer.generics(ix));
-    assert!(
-        generics.contains("Fn (:: p :: WIt < T >)"),
-        "the context of the entry has the alias as written: {}",
-        generics
+    // The context leaves out `T: Fn(::p::WIt<T>)`: the Repeater's impl has `T: Iterator<Item = u8>`
+    // only, and the copy is as written, with the entry in the predicate.
+    assert_eq!(
+        generics_text(referrer.generics(ix)),
+        "< T : Iterator < Item = u8 > >"
     );
-    assert!(
-        !generics_name_item(referrer.generics(ix)),
-        "the Leaker finds no `Item` in {}",
-        generics
+    assert_eq!(
+        repeater_impl_text(&referrer, ix),
+        "impl < T : Iterator < Item = u8 > , __S : ? :: core :: marker :: Sized > crate :: \
+         Repeater < (T ,) , 0u64 , 0usize > for __S { type Type = Rel < T > ; }"
     );
     assert!(has_replacement_in_predicate(&copy), "{}", string(&copy));
-    // The projection written, which it finds.
-    let written: Item = parse_quote!(
+    assert_eq!(
+        string(&copy),
+        "pub trait Tr < T : Iterator < Item = u8 > > where T : Fn (:: p :: WIt < T >) , { fn m (& \
+         self) where P < 0usize > : Default ; }"
+    );
+    // The same for the projection written (the Leaker rejected it), the equation in a where
+    // predicate, a struct (it compiled before), and a method's generic.
+    let same: Vec<Item> = vec![
+        parse_quote!(
+            pub trait Tr<T: Iterator<Item = u8>>
+            where
+                T: Fn(T::Item),
+            {
+                fn m(&self)
+                where
+                    Rel<T>: Default;
+            }
+        ),
+        parse_quote!(
+            pub trait Tr<T: Iterator<Item = u8>>
+            where
+                T: Fn(<T as Iterator>::Item),
+            {
+                fn m(&self)
+                where
+                    Rel<T>: Default;
+            }
+        ),
+        parse_quote!(
+            pub trait Tr<T>
+            where
+                T: Iterator<Item = u8>,
+                T: Fn(::p::WIt<T>),
+            {
+                fn m(&self)
+                where
+                    Rel<T>: Default;
+            }
+        ),
+        parse_quote!(
+            pub trait Tr<T: Iterator<Item = u8>>
+            where
+                T: Fn(::p::WFoo<T>),
+            {
+                fn m(&self)
+                where
+                    Rel<T>: Default;
+            }
+        ),
+        // A bound of a trait whose arguments name `T`, and a projection as an argument.
+        parse_quote!(
+            pub trait Tr<T: Iterator<Item = u8> + PartialEq<::p::WFoo<T>>> {
+                fn m(&self)
+                where
+                    Rel<T>: Default;
+            }
+        ),
+        parse_quote!(
+            pub trait Tr<T: Iterator<Item = u8> + Into<<T as Iterator>::Item>> {
+                fn m(&self)
+                where
+                    Rel<T>: Default;
+            }
+        ),
+        // The method's generic.
+        parse_quote!(
+            pub trait Tr {
+                fn m<T: Iterator<Item = u8> + Fn(::p::WIt<T>)>(&self)
+                where
+                    Rel<T>: Default;
+            }
+        ),
+    ];
+    for item in &same {
+        let (referrer, copy) = f19_copy_with(f13_leaker(), item)
+            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        assert!(has_replacement_in_predicate(&copy), "{}", string(&copy));
+        assert_eq!(
+            string(referrer.generics(entry(&referrer, "Rel < T >"))),
+            "< T : Iterator < Item = u8 > >",
+            "{}",
+            string(item)
+        );
+    }
+    // The controls: no equation of the associated type, so the bound stays (`T::Item` is rigid,
+    // and so is the alias of it, which compiles); a bound that does not name `T`; the bound that
+    // is the equation, even if it names `T`; and a bound of a trait that names `T` itself does not
+    // fix an associated type for the other bound (it is a bound of the trait that is not one of the
+    // standard library, but it names `T`).
+    let kept: Vec<(Item, &str)> = vec![
+        (
+            parse_quote!(
+                pub trait Tr<T: Iterator>
+                where
+                    T: Fn(::p::WIt<T>),
+                {
+                    fn m(&self)
+                    where
+                        Rel<T>: Default;
+                }
+            ),
+            "< T : Fn (:: p :: WIt < T >) + Iterator >",
+        ),
+        (
+            parse_quote!(
+                pub trait Tr<T: Iterator<Item = u8> + Fn(u8)> {
+                    fn m(&self)
+                    where
+                        Rel<T>: Default;
+                }
+            ),
+            "< T : Fn (u8) + Iterator < Item = u8 > >",
+        ),
+        (
+            parse_quote!(
+                pub trait Tr<T: Iterator<Item = Option<T>> + Fn(::p::WIt<T>)> {
+                    fn m(&self, a: Rel<T>);
+                }
+            ),
+            "< T : Iterator < Item = Option < T > > >",
+        ),
+        (
+            parse_quote!(
+                pub trait Tr<T: ::p::Tr<::p::WFoo<T>> + Fn(::p::WIt<T>)> {
+                    fn m(&self)
+                    where
+                        Rel<T>: Default;
+                }
+            ),
+            "< T : :: p :: Tr < :: p :: WFoo < T > > + Fn (:: p :: WIt < T >) >",
+        ),
+    ];
+    for (item, generics) in &kept {
+        let (referrer, _) = f19_copy_with(f13_leaker(), item)
+            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        assert_eq!(
+            string(referrer.generics(entry(&referrer, "Rel < T >"))),
+            *generics,
+            "{}",
+            string(item)
+        );
+    }
+    // The self type of the item, or the associated type of its trait, is well-formed only with the
+    // bounds that the item declares, which the Repeater's impl needs whole: the context of an
+    // entry that depends on `Self` as a type or an implementor keeps them (the property test, seed
+    // 1: `struct S<T: Iterator<Item = u8> + Fn(T::Item)>` with the entry `Wrap2<S<T>>` was E0277 in
+    // the Leaker's crate).
+    let self_type: ItemStruct = parse_quote!(
+        pub struct S<T: Iterator<Item = u8>>(pub Wrap2<Self>)
+        where
+            T: Fn(::p::WIt<T>);
+    );
+    let mut leaker = f13_leaker();
+    leaker.intern_struct(&self_type, true).unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(
+        generics_text(referrer.generics(entry(&referrer, "Wrap2 < Self >"))),
+        "< T : Fn (:: p :: WIt < T >) + Iterator < Item = u8 > >"
+    );
+    // The self type of an impl, written out, is declared with the bounds of the item. The top-level
+    // context records the self type then, which the Referrer needs to find the entry.
+    let impl_self: ItemImpl = parse_quote!(
+        impl<T: Iterator<Item = u8>> S<T>
+        where
+            T: Fn(::p::WIt<T>),
+        {
+            fn m(&self, x: Rel<T>) {}
+        }
+    );
+    let mut leaker = f13_leaker();
+    let context = leaker.intern_impl(&impl_self, true).unwrap();
+    let referrer = leaker.finish();
+    assert_eq!(
+        generics_text(referrer.generics(entry(&referrer, "S < T >"))),
+        "< T : Fn (:: p :: WIt < T >) + Iterator < Item = u8 > >"
+    );
+    assert_eq!(
+        generics_text(referrer.generics(entry(&referrer, "Rel < T >"))),
+        "< T : Iterator < Item = u8 > >"
+    );
+    assert_eq!(
+        referrer.context_self(context),
+        Some(&SelfRequirement::Type(parse_quote!(S<T>)))
+    );
+    let assoc: Item = parse_quote!(
         pub trait Tr<T: Iterator<Item = u8>>
+        where
+            T: Fn(::p::WIt<T>),
+        {
+            type A;
+            fn m(&self, x: Rel<Self::A>);
+        }
+    );
+    let (referrer, _) = f19_copy_with(f13_leaker(), &assoc).unwrap();
+    assert_eq!(
+        generics_text(referrer.generics(entry(&referrer, "Rel < Self :: A >"))),
+        "< T : Fn (:: p :: WIt < T >) + Iterator < Item = u8 > >"
+    );
+    // The equation of a method is not in the context of the entry (F21), so the bound stays and
+    // the Leaker rejects it where it is written, as before.
+    let method_equation: Item = parse_quote!(
+        pub trait Tr<T: Iterator>
         where
             T: Fn(T::Item),
         {
             fn m(&self)
             where
-                Rel<T>: Default;
+                T: Iterator<Item = Rel<T>>;
         }
     );
     assert_unstable(
-        &written,
-        f19_copy_with(f13_leaker(), &written),
+        &method_equation,
+        entries_naming_item_in_predicates(&method_equation),
         "Rel < T >",
-        "T : Fn (T :: Item) + Iterator < Item = u8 >",
+        "T : Fn (T :: Item) + Iterator",
         Blames::Projection("T :: Item"),
     );
-    // A struct with the same shape compiles, and cannot be told from the alias.
-    let structure: Item = parse_quote!(
-        pub trait Tr<T: Iterator<Item = u8>>
-        where
-            T: Fn(::p::WFoo<T>),
-        {
+    // The bound of another generic that names the fixed `Item` stays, and the Leaker rejects it.
+    let other: Item = parse_quote!(
+        pub trait Tr<T: Iterator<Item = u8>, U: Fn(T::Item)> {
             fn m(&self)
             where
-                Rel<T>: Default;
+                Rel<U>: Default;
         }
     );
-    f19_copy_with(f13_leaker(), &structure).unwrap();
+    assert_unstable(
+        &other,
+        entries_naming_item_in_predicates(&other),
+        "Rel < U >",
+        "U : Fn (T :: Item)",
+        Blames::Projection("T :: Item"),
+    );
+    // `Self::A` in a predicate of a method of a trait whose bound names the `Item` is no impl for
+    // rustc itself (see above): the Leaker rejects the projection written, and does not see the
+    // alias (it takes it for a struct, with which the impl compiles).
+    let written_self_assoc: Item = parse_quote!(
+        pub trait Tr<T: Iterator<Item = u8>>
+        where
+            T: Fn(T::Item),
+        {
+            type A: Clone;
+            fn m(&self)
+            where
+                Self::A: Clone;
+        }
+    );
+    let err = assert_rejected(
+        &written_self_assoc,
+        f19_copy_with(f13_leaker(), &written_self_assoc),
+        &["`Self :: A` is in a bound or where predicate, and a bound of its generics names `T :: Item`"],
+    );
+    assert!(
+        all_notes(&err)[0].starts_with(
+            "the copy for a concrete implementor resolves `Self :: A` by the impl of the trait, \
+             which needs the bound `T : Fn (T :: Item) + Iterator < Item = u8 >` of its generics"
+        ),
+        "{:?}",
+        all_notes(&err)
+    );
+    let aliased_self_assoc: Item = parse_quote!(
+        pub trait Tr<T: Iterator<Item = u8>>
+        where
+            T: Fn(::p::WIt<T>),
+        {
+            type A: Clone;
+            fn m(&self)
+            where
+                Self::A: Clone;
+        }
+    );
+    f19_copy_with(f13_leaker(), &aliased_self_assoc).unwrap();
+    // A bound that names the leaked type of its own entry: with the equation, it is left out of
+    // the context of that entry (F2, and nothing is left to be a cycle); without it, it is the
+    // cycle that F2 rejects.
+    let leaked_with_equation: Item = parse_quote!(
+        pub trait Tr<T: Iterator<Item = u8> + Into<Rel<T>>> {
+            fn m(&self);
+        }
+    );
+    let (referrer, _) = f19_copy_with(f13_leaker(), &leaked_with_equation).unwrap();
+    assert_eq!(
+        generics_text(referrer.generics(entry(&referrer, "Rel < T >"))),
+        "< T : Iterator < Item = u8 > >"
+    );
+    let leaked: Item = parse_quote!(
+        pub trait Tr<T: Into<Rel<T>>> {
+            fn m(&self);
+        }
+    );
+    assert_unstable(
+        &leaked,
+        f19_copy_with(f13_leaker(), &leaked),
+        "Rel < T >",
+        "T : Into < Rel < T > >",
+        Blames::Leaked,
+    );
 }
 
 /// Whether a where predicate of the copy names a replacement `P<ix>`.
@@ -5899,9 +6247,10 @@ fn the_oracles_of_the_findings_find_a_hand_written_cycle() {
         ["Rel < X >"]
     );
 
-    // F21, F25 and F33: the bound of the entry names an `Item`.
+    // F21, F25 and F33: the bound of the entry names an `Item`. (Not with `T: ::p::WIter`: since F26
+    // the context of the entry leaves out `T: Fn(T::Item)` then.)
     let control: Item = parse_quote!(
-        pub trait Tr<T: ::p::WIter>
+        pub trait Tr<T: Iterator>
         where
             T: Fn(T::Item),
         {
@@ -5914,7 +6263,7 @@ fn the_oracles_of_the_findings_find_a_hand_written_cycle() {
         .position(|ty| string(ty) == "Rel < T >")
         .unwrap();
     let copy: Item = parse_quote!(
-        pub trait Tr<T: ::p::WIter>
+        pub trait Tr<T: Iterator>
         where
             T: Fn(T::Item),
         {
@@ -5925,7 +6274,7 @@ fn the_oracles_of_the_findings_find_a_hand_written_cycle() {
     );
     assert_eq!(entries_naming_item(&referrer, &copy), ["Rel < T >"]);
     let copy: Item = parse_quote!(
-        pub trait Tr<T: ::p::WIter>
+        pub trait Tr<T: Iterator>
         where
             T: Fn(T::Item),
         {

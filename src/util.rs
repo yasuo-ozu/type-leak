@@ -65,6 +65,34 @@ pub(crate) fn is_primitive_name(ident: &Ident) -> bool {
         .any(|(name, absolute)| ident == name && absolute.starts_with("::core::primitive::"))
 }
 
+/// Returns `true` if `ty` is `part` or has it as a component, compared as written.
+pub(crate) fn type_contains(ty: &Type, part: &Type) -> bool {
+    struct Contains {
+        part: String,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Contains {
+        fn visit_type(&mut self, i: &'ast Type) {
+            if self.found {
+                return;
+            }
+            let ty = unwrap_type_group(i);
+            if quote!(#ty).to_string() == self.part {
+                self.found = true;
+                return;
+            }
+            syn::visit::visit_type(self, i)
+        }
+    }
+    let part = unwrap_type_group(part);
+    let mut contains = Contains {
+        part: quote!(#part).to_string(),
+        found: false,
+    };
+    contains.visit_type(ty);
+    contains.found
+}
+
 /// Collects the names by which `ty` can refer to a generic of the scopes it is written in: the
 /// first segment of each relative path, the lifetimes, and the names in the tokens that are not
 /// parsed (a macro, syntax that `syn` leaves verbatim).
