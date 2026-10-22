@@ -10,6 +10,20 @@ use syn::visit::Visit;
 use syn::*;
 use template_quote::{quote, ToTokens};
 
+/// The cause of an error about `bound`, without the `?` of a relaxed bound: its trait path, or the
+/// bound as written if it has a binder (`for<'a> Fn(&'a u8)`) or parentheses, which no node of the
+/// syntax holds.
+pub(crate) fn bound_cause(bound: &TraitBound) -> Cause {
+    if bound.lifetimes.is_none() && bound.paren_token.is_none() {
+        return Cause::Trait(bound.path.clone());
+    }
+    let bound = TraitBound {
+        modifier: TraitBoundModifier::None,
+        ..bound.clone()
+    };
+    Cause::Unreadable(quote!(#bound))
+}
+
 /// Returns `true` if `path` starts with `prefix`, comparing identifiers. Both have a leading `::`
 /// or neither.
 pub(crate) fn path_starts_with(path: &Path, prefix: &Path) -> bool {

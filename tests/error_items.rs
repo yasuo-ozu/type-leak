@@ -16,18 +16,38 @@ use template_quote::ToTokens;
 use type_leak::*;
 
 /// The config of the triggers with `::p` allowed (the crate of the property test).
-fn allowing() -> Leaker {
+fn allowing_config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
     config.allow_primitive().allow_std_prelude();
     config.allowed_paths.push(parse_quote!(::p));
+    config
+}
+
+fn allowing() -> Leaker {
+    Leaker::from_config(allowing_config())
+}
+
+/// The config of the triggers that read the values of the items too.
+fn reading_values_config() -> LeakerConfig {
+    let mut config = LeakerConfig::new();
+    config.allow_primitive().allow_std_prelude().check_values();
+    config
+}
+
+/// A Leaker of `config` that accepts the conflicts with the causes `allowed`.
+fn accepting(mut config: LeakerConfig, allowed: &[Cause]) -> Leaker {
+    for cause in allowed {
+        config.allow(cause.clone());
+    }
     Leaker::from_config(config)
 }
 
-/// A Leaker that reads the values of the items too.
-fn reading_values() -> Leaker {
-    let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude().check_values();
-    Leaker::from_config(config)
+/// An analysis of an item that goes wrong, with the causes `allowed` accepted.
+type Trigger = fn(&[Cause]) -> std::result::Result<(), Vec<ErrorItem>>;
+
+/// The errors of a trigger that accepts nothing.
+fn errors(trigger: Trigger) -> Vec<ErrorItem> {
+    trigger(&[]).unwrap_err()
 }
 
 fn id(name: &str) -> Ident {
@@ -75,32 +95,45 @@ fn help_of(item: &ErrorItem) -> Option<(String, String)> {
         .map(|(at, help)| (at.to_string(), help.clone()))
 }
 
+/// The analysis of a trait with these items. `check_values` reads the values too.
+fn trait_result(
+    source: &str,
+    check_values: bool,
+    allowed: &[Cause],
+) -> std::result::Result<(), Vec<ErrorItem>> {
+    let item: ItemTrait = parse_str(source).unwrap();
+    let config = if check_values {
+        reading_values_config()
+    } else {
+        allowing_config()
+    };
+    accepting(config, allowed)
+        .intern_trait(&item, true)
+        .map(|_| ())
+}
+
 /// The errors that a trait with these items gives. `check_values` reads the values too.
 fn trait_errors(source: &str, check_values: bool) -> Vec<ErrorItem> {
-    let item: ItemTrait = parse_str(source).unwrap();
-    let mut leaker = if check_values {
-        reading_values()
-    } else {
-        allowing()
-    };
-    leaker.intern_trait(&item, true).unwrap_err()
+    trait_result(source, check_values, &[]).unwrap_err()
 }
 
 // ── the triggers: an item for each reason ────────────────────────────────────────────────────
 
 /// A trait in a bound and a type with an elided lifetime.
-fn relative_path() -> Vec<ErrorItem> {
+fn relative_path(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
     let item: ItemTrait = parse_quote!(
         trait Tr: Clone {
             fn f(&self, a: MyType<'_>);
         }
     );
-    Leaker::new().intern_trait(&item, true).unwrap_err()
+    accepting(LeakerConfig::new(), allowed)
+        .intern_trait(&item, true)
+        .map(|_| ())
 }
 
 #[test]
 fn reason_relative_path() {
-    let items = relative_path();
+    let items = errors(relative_path);
     assert_eq!(items.len(), 2);
     assert_item(&items[0], Reason::RelativePath, "trait", "Clone");
     assert_item(&items[1], Reason::RelativePath, "type", "MyType < '_ >");
@@ -108,18 +141,18 @@ fn reason_relative_path() {
 }
 
 /// `Self` where no scope declares it.
-fn self_without_meaning() -> Vec<ErrorItem> {
-    allowing()
+fn self_without_meaning(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+    accepting(allowing_config(), allowed)
         .enter_generics(&Generics::default(), |view| {
             view.visit_type(&parse_quote!(Rel<Self>));
             view.visit_type(&parse_quote!(Wrap<Self::Item>));
         })
-        .unwrap_err()
+        .map(|_| ())
 }
 
 #[test]
 fn reason_self_without_meaning() {
-    let items = self_without_meaning();
+    let items = errors(self_without_meaning);
     assert_eq!(items.len(), 2);
     assert_item(&items[0], Reason::SelfWithoutMeaning, "type", "Self");
     assert_item(
@@ -138,16 +171,17 @@ fn reason_self_without_meaning() {
 }
 
 /// Syntax that the Leaker cannot read in a body, read with `check_values()`.
-fn unreadable() -> Vec<ErrorItem> {
-    trait_errors(
+fn unreadable(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+    trait_result(
         "trait Tr { fn f(&self) { macro_rules! m { () => {} } ::p::mac!(a b c); } }",
         true,
+        allowed,
     )
 }
 
 #[test]
 fn reason_unreadable() {
-    let items = unreadable();
+    let items = errors(unreadable);
     assert_eq!(items.len(), 2);
     assert_item(
         &items[0],
@@ -168,18 +202,20 @@ fn reason_unreadable() {
 }
 
 /// A bare identifier that may be a const, in a path that names `Self`, which is denied.
-fn maybe_const() -> Vec<ErrorItem> {
+fn maybe_const(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
     let item: ItemStruct = parse_quote!(
         struct S {
             a: ::p::W<[Self], LEN>,
         }
     );
-    allowing().intern_struct(&item, false).unwrap_err()
+    accepting(allowing_config(), allowed)
+        .intern_struct(&item, false)
+        .map(|_| ())
 }
 
 #[test]
 fn reason_maybe_const() {
-    let items = maybe_const();
+    let items = errors(maybe_const);
     assert_eq!(items.len(), 1);
     // The bare identifier is the cause.
     assert_item(&items[0], Reason::MaybeConst, "type", "LEN");
@@ -190,16 +226,17 @@ fn reason_maybe_const() {
 }
 
 /// A lifetime of a method that the copy would leave unconstrained.
-fn unconstrained_lifetime() -> Vec<ErrorItem> {
-    trait_errors(
+fn unconstrained_lifetime(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+    trait_result(
         "trait Tr { fn f<'b>(&self, x: Wrap<'b>) -> &'b u8; }",
         false,
+        allowed,
     )
 }
 
 #[test]
 fn reason_unconstrained_lifetime() {
-    let items = unconstrained_lifetime();
+    let items = errors(unconstrained_lifetime);
     assert_eq!(items.len(), 1);
     assert_item(
         &items[0],
@@ -215,19 +252,21 @@ fn reason_unconstrained_lifetime() {
 }
 
 /// `Self::A` in an impl of a trait, where the Repeater's impl cannot write it.
-fn self_projection() -> Vec<ErrorItem> {
+fn self_projection(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
     let item: ItemImpl = parse_quote!(
         impl ::p::Tr for u8 {
             type A = u8;
             fn f(&self, x: Wrap<Self::A>) {}
         }
     );
-    allowing().intern_impl(&item, true).unwrap_err()
+    accepting(allowing_config(), allowed)
+        .intern_impl(&item, true)
+        .map(|_| ())
 }
 
 #[test]
 fn reason_self_projection() {
-    let items = self_projection();
+    let items = errors(self_projection);
     assert_eq!(items.len(), 1);
     assert_item(
         &items[0],
@@ -245,8 +284,8 @@ fn reason_self_projection() {
 }
 
 /// A bound of an outer trait that names its `Self`, for a type in an item nested in it.
-fn unnameable_self() -> Vec<ErrorItem> {
-    allowing()
+fn unnameable_self(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+    accepting(allowing_config(), allowed)
         .enter_trait(&id("Tr"), &parse_quote!(<T: AsRef<Self>>), true, |view| {
             view.visit_item(&parse_quote!(
                 impl ::p::W for X {
@@ -254,12 +293,12 @@ fn unnameable_self() -> Vec<ErrorItem> {
                 }
             ))
         })
-        .unwrap_err()
+        .map(|_| ())
 }
 
 #[test]
 fn reason_unnameable_self() {
-    let items = unnameable_self();
+    let items = errors(unnameable_self);
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::UnnameableSelf, "type", "Rel < T >");
     assert_eq!(
@@ -269,13 +308,13 @@ fn reason_unnameable_self() {
 }
 
 /// `Self` in the default of a parameter.
-fn self_in_default() -> Vec<ErrorItem> {
-    trait_errors("trait Tr<T: Default = Wrap<Self>> {}", false)
+fn self_in_default(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+    trait_result("trait Tr<T: Default = Wrap<Self>> {}", false, allowed)
 }
 
 #[test]
 fn reason_self_in_default() {
-    let items = self_in_default();
+    let items = errors(self_in_default);
     assert_eq!(items.len(), 1);
     // The cause is the whole default, the note is at the `Self` in it.
     assert_item(&items[0], Reason::SelfInDefault, "type", "Wrap < Self >");
@@ -287,36 +326,38 @@ fn reason_self_in_default() {
 }
 
 /// A generic whose bound mentions a `Self` that is denied.
-fn denied_self_in_bounds() -> Vec<ErrorItem> {
+fn denied_self_in_bounds(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
     let item: ItemTrait = parse_quote!(
         trait Tr {
             fn f<T: ::core::cmp::PartialEq<Self>>(&self, x: Wrap<T>);
         }
     );
-    allowing().intern_trait(&item, false).unwrap_err()
+    accepting(allowing_config(), allowed)
+        .intern_trait(&item, false)
+        .map(|_| ())
 }
 
 #[test]
 fn reason_denied_self_in_bounds() {
-    let items = denied_self_in_bounds();
+    let items = errors(denied_self_in_bounds);
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::DeniedSelfInBounds, "type", "Wrap < T >");
 }
 
 /// A type that names the `Self` of a nested struct, with a generic whose bound names it too.
-fn nested_self_in_bounds() -> Vec<ErrorItem> {
-    allowing()
+fn nested_self_in_bounds(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+    accepting(allowing_config(), allowed)
         .enter_mod("m", [id("S")], |view| {
             view.visit_item(&parse_quote!(
                 struct S<T: ::core::convert::AsRef<Self>>(Rel2<Self, T>);
             ))
         })
-        .unwrap_err()
+        .map(|_| ())
 }
 
 #[test]
 fn reason_nested_self_in_bounds() {
-    let items = nested_self_in_bounds();
+    let items = errors(nested_self_in_bounds);
     assert_eq!(items.len(), 1);
     assert_item(
         &items[0],
@@ -327,7 +368,7 @@ fn reason_nested_self_in_bounds() {
 }
 
 /// A leaked type in a predicate whose generic has a leaked bound.
-fn unprovable_bound() -> Vec<ErrorItem> {
+fn unprovable_bound(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
     let item: ItemTrait = parse_quote!(
         trait Tr<T: Fn(Rel)>
         where
@@ -335,18 +376,20 @@ fn unprovable_bound() -> Vec<ErrorItem> {
         {
         }
     );
-    allowing().intern_trait(&item, true).unwrap_err()
+    accepting(allowing_config(), allowed)
+        .intern_trait(&item, true)
+        .map(|_| ())
 }
 
 #[test]
 fn reason_unprovable_bound() {
-    let items = unprovable_bound();
+    let items = errors(unprovable_bound);
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::UnprovableBound, "type", "Wrap < T >");
 }
 
 /// A type that names `Self` in a predicate of its trait.
-fn self_in_trait_predicate() -> Vec<ErrorItem> {
+fn self_in_trait_predicate(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
     let item: ItemTrait = parse_quote!(
         trait Tr
         where
@@ -354,12 +397,14 @@ fn self_in_trait_predicate() -> Vec<ErrorItem> {
         {
         }
     );
-    allowing().intern_trait(&item, true).unwrap_err()
+    accepting(allowing_config(), allowed)
+        .intern_trait(&item, true)
+        .map(|_| ())
 }
 
 #[test]
 fn reason_self_in_trait_predicate() {
-    let items = self_in_trait_predicate();
+    let items = errors(self_in_trait_predicate);
     assert_eq!(items.len(), 1);
     assert_item(
         &items[0],
@@ -370,16 +415,18 @@ fn reason_self_in_trait_predicate() {
 }
 
 /// The self type of an impl whose bound names `Self`.
-fn self_in_impl_self_type() -> Vec<ErrorItem> {
+fn self_in_impl_self_type(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
     let item: ItemImpl = parse_quote!(
         impl<T> S<T> where T: AsRef<Option<Self>> {}
     );
-    allowing().intern_impl(&item, true).unwrap_err()
+    accepting(allowing_config(), allowed)
+        .intern_impl(&item, true)
+        .map(|_| ())
 }
 
 #[test]
 fn reason_self_in_impl_self_type() {
-    let items = self_in_impl_self_type();
+    let items = errors(self_in_impl_self_type);
     assert_eq!(items.len(), 2);
     assert_item(&items[0], Reason::SelfInImplSelfType, "type", "S < T >");
     // The bound is an error of its own: rustc cannot prove it while it checks the bounds.
@@ -389,18 +436,32 @@ fn reason_self_in_impl_self_type() {
 // ── the other kinds of cause ─────────────────────────────────────────────────────────────────
 
 /// A path in a const expression (the default of a const parameter) and a path in a value.
-fn values() -> Vec<ErrorItem> {
-    let mut errors = trait_errors("trait Tr<const N: usize = SIZE> {}", false);
-    errors.extend(trait_errors(
-        "trait Tr { fn f(&self) { let _ = inner::N; let _ = Rel::<u8>::f(); } }",
-        true,
-    ));
-    errors
+fn values(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+    let mut errors = Vec::new();
+    errors.extend(
+        trait_result("trait Tr<const N: usize = SIZE> {}", false, allowed)
+            .err()
+            .unwrap_or_default(),
+    );
+    errors.extend(
+        trait_result(
+            "trait Tr { fn f(&self) { let _ = inner::N; let _ = Rel::<u8>::f(); } }",
+            true,
+            allowed,
+        )
+        .err()
+        .unwrap_or_default(),
+    );
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 #[test]
 fn the_cause_of_a_path_in_a_value_is_a_value() {
-    let items = values();
+    let items = errors(values);
     assert_eq!(items.len(), 3);
     assert_item(&items[0], Reason::RelativePath, "expr", "SIZE");
     assert_item(&items[1], Reason::RelativePath, "expr", "inner :: N");
@@ -413,16 +474,17 @@ fn the_cause_of_a_path_in_a_value_is_a_value() {
 }
 
 /// The path of a macro in a value, and the trait of a qualified path.
-fn macros_and_qualified_traits() -> Vec<ErrorItem> {
-    trait_errors(
+fn macros_and_qualified_traits(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+    trait_result(
         "trait Tr { fn f(&self) { mac!(1); let _ = <u8 as Rel>::f(); } }",
         true,
+        allowed,
     )
 }
 
 #[test]
 fn the_cause_of_a_macro_is_its_path_and_that_of_a_qualified_trait_is_a_trait() {
-    let items = macros_and_qualified_traits();
+    let items = errors(macros_and_qualified_traits);
     assert_eq!(items.len(), 2);
     assert_item(&items[0], Reason::RelativePath, "macro", "mac !");
     assert!(matches!(&items[0].cause, Cause::Macro(path) if path.is_ident("mac")));
@@ -431,11 +493,13 @@ fn the_cause_of_a_macro_is_its_path_and_that_of_a_qualified_trait_is_a_trait() {
 }
 
 /// A lifetime that no scope declares, in the supertrait of a trait where `Self` is denied.
-fn lifetime() -> Vec<ErrorItem> {
+fn lifetime(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
     let item: ItemTrait = parse_quote!(
         trait Tr: ::p::Sup<&'a Self> {}
     );
-    allowing().intern_trait(&item, false).unwrap_err()
+    accepting(allowing_config(), allowed)
+        .intern_trait(&item, false)
+        .map(|_| ())
 }
 
 #[test]
@@ -644,7 +708,7 @@ fn a_bound_in_parentheses_is_unreadable() {
 #[test]
 fn a_lifetime_is_a_lifetime() {
     // `'a` is not declared by any scope: the error is reported at it, as it always was.
-    let items = lifetime();
+    let items = errors(lifetime);
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::RelativePath, "lifetime", "'a");
     assert!(matches!(&items[0].cause, Cause::Lifetime(lifetime) if lifetime.ident == "a"));
@@ -679,25 +743,33 @@ fn the_path_of_a_qualified_type_is_unreadable() {
 // ── the serialized form ──────────────────────────────────────────────────────────────────────
 
 /// Every error above, by the name of the trigger, and the errors of the other kinds of cause.
-fn every_error() -> Vec<(&'static str, Vec<ErrorItem>)> {
+fn every_trigger() -> Vec<(&'static str, Trigger)> {
     vec![
-        ("relative_path", relative_path()),
-        ("self_without_meaning", self_without_meaning()),
-        ("unreadable", unreadable()),
-        ("maybe_const", maybe_const()),
-        ("unconstrained_lifetime", unconstrained_lifetime()),
-        ("self_projection", self_projection()),
-        ("unnameable_self", unnameable_self()),
-        ("self_in_default", self_in_default()),
-        ("denied_self_in_bounds", denied_self_in_bounds()),
-        ("nested_self_in_bounds", nested_self_in_bounds()),
-        ("unprovable_bound", unprovable_bound()),
-        ("self_in_trait_predicate", self_in_trait_predicate()),
-        ("self_in_impl_self_type", self_in_impl_self_type()),
-        ("values", values()),
-        ("macros", macros_and_qualified_traits()),
-        ("lifetime", lifetime()),
+        ("relative_path", relative_path),
+        ("self_without_meaning", self_without_meaning),
+        ("unreadable", unreadable),
+        ("maybe_const", maybe_const),
+        ("unconstrained_lifetime", unconstrained_lifetime),
+        ("self_projection", self_projection),
+        ("unnameable_self", unnameable_self),
+        ("self_in_default", self_in_default),
+        ("denied_self_in_bounds", denied_self_in_bounds),
+        ("nested_self_in_bounds", nested_self_in_bounds),
+        ("unprovable_bound", unprovable_bound),
+        ("self_in_trait_predicate", self_in_trait_predicate),
+        ("self_in_impl_self_type", self_in_impl_self_type),
+        ("values", values),
+        ("macros", macros_and_qualified_traits),
+        ("lifetime", lifetime),
     ]
+}
+
+/// The errors of every trigger.
+fn every_error() -> Vec<(&'static str, Vec<ErrorItem>)> {
+    every_trigger()
+        .into_iter()
+        .map(|(name, trigger)| (name, errors(trigger)))
+        .collect()
 }
 
 /// Reads the items that were written one after the other.
@@ -780,7 +852,7 @@ fn every_error_is_written_and_read_back() {
 
 #[test]
 fn the_serialized_form_is_one_brace_group_for_each_item() {
-    let items = relative_path();
+    let items = errors(relative_path);
     // The tokens of the cause, of the notes and of the help are written as they are, the message,
     // the notes and the help as string literals.
     assert_eq!(
@@ -935,7 +1007,7 @@ fn an_unknown_kind_or_reason_is_named() {
 
 #[test]
 fn an_item_has_a_message_notes_and_help_and_is_an_error() {
-    let items = relative_path();
+    let items = errors(relative_path);
     let item = &items[1];
     assert_eq!(item.to_string(), item.message);
     assert_eq!(
@@ -965,7 +1037,7 @@ fn an_item_has_a_message_notes_and_help_and_is_an_error() {
 
 #[test]
 fn to_compile_error_is_the_error_of_syn() {
-    let items = relative_path();
+    let items = errors(relative_path);
     for item in &items {
         let tokens = item.to_compile_error();
         let expected = syn::Error::from(item.clone()).to_compile_error();
@@ -981,7 +1053,7 @@ fn to_compile_error_is_the_error_of_syn() {
 
 #[test]
 fn to_syn_error_combines_the_items_in_order() {
-    let items = relative_path();
+    let items = errors(relative_path);
     let combined = to_syn_error(&items);
     let errors: Vec<String> = combined.into_iter().map(|e| e.to_string()).collect();
     assert_eq!(errors.len(), 2);
@@ -1002,7 +1074,7 @@ fn to_syn_error_combines_the_items_in_order() {
 
 #[test]
 fn the_span_of_an_item_is_that_of_its_cause() {
-    let items = self_without_meaning();
+    let items = errors(self_without_meaning);
     for item in &items {
         // Outside a proc macro the spans are all the call site: they are equal.
         assert_eq!(
@@ -1017,5 +1089,54 @@ fn the_span_of_an_item_is_that_of_its_cause() {
                     .span()
             )
         );
+    }
+}
+
+// ── accepting the causes ─────────────────────────────────────────────────────────────────────
+
+/// The messages of the errors, for a failure to say what is left.
+fn messages(items: &[ErrorItem]) -> Vec<&str> {
+    items.iter().map(|item| item.message.as_str()).collect()
+}
+
+#[test]
+fn allowing_the_causes_of_the_errors_of_each_reason_accepts_the_item() {
+    let mut reasons = Vec::new();
+    for (name, trigger) in every_trigger() {
+        let items = errors(trigger);
+        reasons.extend(items.iter().map(|item| item.reason));
+        let causes: Vec<Cause> = items.iter().map(|item| item.cause.clone()).collect();
+        if let Err(left) = trigger(&causes) {
+            panic!("{}: {:?} are left", name, messages(&left));
+        }
+        // Each cause is needed: without it, its errors, and only they, are reported.
+        for cause in &causes {
+            let others: Vec<Cause> = causes.iter().filter(|c| *c != cause).cloned().collect();
+            let left = trigger(&others).unwrap_err();
+            let expected: Vec<&str> = items
+                .iter()
+                .filter(|item| item.cause == *cause)
+                .map(|item| item.message.as_str())
+                .collect();
+            assert_eq!(messages(&left), expected, "{}: {}", name, text(cause));
+        }
+    }
+    // The triggers have every reason.
+    for reason in [
+        Reason::RelativePath,
+        Reason::SelfWithoutMeaning,
+        Reason::Unreadable,
+        Reason::MaybeConst,
+        Reason::UnconstrainedLifetime,
+        Reason::SelfProjection,
+        Reason::UnnameableSelf,
+        Reason::SelfInDefault,
+        Reason::DeniedSelfInBounds,
+        Reason::NestedSelfInBounds,
+        Reason::UnprovableBound,
+        Reason::SelfInTraitPredicate,
+        Reason::SelfInImplSelfType,
+    ] {
+        assert!(reasons.contains(&reason), "{:?}", reason);
     }
 }

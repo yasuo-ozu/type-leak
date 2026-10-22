@@ -1119,7 +1119,21 @@ pub fn prop_leak(
     attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    match prop::leak(attr.into(), item.into()) {
+    match prop::leak(attr.into(), item.into(), false) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Like `prop_leak`, but an item that the Leaker rejects is analyzed again with
+/// `LeakerConfig::allow(cause)` for the cause of every error, and the result is emitted as that of
+/// an accepted item: `TYPE_LEAK_PROP_ACCEPT`. See `prop::leak()`.
+#[proc_macro_attribute]
+pub fn prop_leak_accept(
+    attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    match prop::leak(attr.into(), item.into(), true) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }

@@ -243,10 +243,17 @@ fn squash(text: &str) -> String {
 fn same<T>(_: &T, _: &T) {}
 
 /// What a `#[prop_leak]` macro reported: `<id>|<kind>|ok|entries=E positions=P checked=C`, or
-/// `<id>|<kind>|rej|<message>`.
+/// `<id>|<kind>|rej|<message>`. A `#[prop_leak_accept]` macro reports `acc` for an item that the
+/// Leaker rejected and accepted with `LeakerConfig::allow()` of the causes of its errors.
 #[derive(Debug, PartialEq)]
 enum Reported {
     Ok {
+        kind: &'static str,
+        entries: usize,
+        positions: usize,
+        checked: usize,
+    },
+    Allowed {
         kind: &'static str,
         entries: usize,
         positions: usize,
@@ -295,7 +302,7 @@ fn reported(id: u32, text: &'static str) -> Reported {
     if status == "rej" {
         return rejected(kind, &squash(rest));
     }
-    assert_eq!(status, "ok", "{}", text);
+    assert!(status == "ok" || status == "acc", "{}", text);
     let number = |key: &str| -> usize {
         rest.split(' ')
             .find_map(|word| word.strip_prefix(key))
@@ -303,12 +310,26 @@ fn reported(id: u32, text: &'static str) -> Reported {
             .parse()
             .unwrap()
     };
-    ok(
+    let (entries, positions, checked) =
+        (number("entries="), number("positions="), number("checked="));
+    if status == "acc" {
+        return Reported::Allowed {
+            kind,
+            entries,
+            positions,
+            checked,
+        };
+    }
+    ok(kind, entries, positions, checked)
+}
+
+fn allowed(kind: &'static str, entries: usize, positions: usize, checked: usize) -> Reported {
+    Reported::Allowed {
         kind,
-        number("entries="),
-        number("positions="),
-        number("checked="),
-    )
+        entries,
+        positions,
+        checked,
+    }
 }
 
 /// A struct, an enum, a union, an impl, a module and a trait are each analyzed by the matching
@@ -1513,6 +1534,137 @@ fn a_trait_with_an_unsized_implementor() {
     impl Host9053 for Local {}
     let dynamic: &dyn Host9053 = &Local;
     same(&me(dynamic), &Wrap::<dyn Host9053>(PhantomData));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Conflicts accepted with `LeakerConfig::allow()` (`#[prop_leak_accept]`).
+// ---------------------------------------------------------------------------------------------
+
+/// The Leaker rejects an item whose part cannot be leaked, and accepts it when the cause of the
+/// error is allowed: that part is copied as written, whole, and the rest is leaked as usual. The
+/// Referrer's crate names what the copy names (`accepted`, in `tests/crates/referrer`), and
+/// implements the traits for hosts, or declares the copy, so it compiles only if the part resolves
+/// to the same item and everything else is replaced. The Leaker's own tests (`tests/allow.rs`) read
+/// the entries; these are about the copy.
+#[test]
+fn accepted_conflicts_are_copied_as_written() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::accepted as r;
+
+    // The reports: `acc`, the entries (the part that conflicts has none), and the errors of the
+    // first analysis (the `Reason`, then the kind of the cause).
+    let table = [
+        // (a) `Held<'b>` leaves the lifetime of the method unconstrained (E0195 in the host's
+        // impl): copied as written. Nothing is leaked (`u8` is allowed). Both types are compared.
+        (
+            9184,
+            reported(9184, __tl_report_9184!()),
+            allowed("trait", 0, 2, 2),
+        ),
+        // (b) the parameter of `f` has an elided lifetime in the generics of a path, and `g`'s
+        // `dyn PlainTr` is an entry (and the optional one of the path around it). Only `g`'s
+        // parameter is compared (`f`'s has an elided lifetime, which a witness cannot name).
+        (
+            9185,
+            reported(9185, __tl_report_9185!()),
+            allowed("trait", 2, 2, 1),
+        ),
+        // (c) `Wrap<Self>`, where `Self` has no meaning, is copied as written; `Rel` is the entry.
+        (
+            9186,
+            reported(9186, __tl_report_9186!()),
+            allowed("struct", 1, 2, 2),
+        ),
+        // (d) the same trait object in `f` and `g`: in `f` it is in the part that is copied as
+        // written (the path with the elided lifetime), in `g` it is the entry. The Visitor finds
+        // the entry by its tokens and its context, and must leave the part alone.
+        (
+            9187,
+            reported(9187, __tl_report_9187!()),
+            allowed("trait", 2, 2, 1),
+        ),
+        // (e) `Wrap<Y>` is an entry in `a1`, and in the bound of `ai` it is in the part that is
+        // copied as written (`impl Into<Wrap<Y>>`): the same tokens and context.
+        (
+            9188,
+            reported(9188, __tl_report_9188!()),
+            allowed("trait", 2, 2, 1),
+        ),
+        // (f) the same as (d), with a relative type beside the trait object in the path of `f`: it
+        // is an entry, and replaced, whereas the Referrer's crate does not name it.
+        (
+            9189,
+            reported(9189, __tl_report_9189!()),
+            allowed("trait", 3, 2, 1),
+        ),
+    ];
+    for (id, got, expected) in table {
+        assert_eq!(got, expected, "{}", id);
+    }
+
+    // The errors that were allowed.
+    let errors = |text: &'static str| -> Vec<(String, String, String)> {
+        text.split('\u{1d}')
+            .map(|error| {
+                let fields: Vec<&str> = error.split('\u{1f}').collect();
+                let tokens = fields[1].split_whitespace().collect::<String>();
+                (fields[3].to_string(), fields[4].to_string(), tokens)
+            })
+            .collect()
+    };
+    let error = |reason: &str, cause: &str, tokens: &str| {
+        (reason.to_string(), cause.to_string(), tokens.to_string())
+    };
+    assert_eq!(
+        errors(__tl_errors_9184!()),
+        [error("UnconstrainedLifetime", "Type", "Held<'b>")]
+    );
+    assert_eq!(
+        errors(__tl_errors_9185!()),
+        [error("RelativePath", "Trait", "ElidedTr")]
+    );
+    assert_eq!(
+        errors(__tl_errors_9186!()),
+        [error("SelfWithoutMeaning", "Type", "Self")]
+    );
+    assert_eq!(
+        errors(__tl_errors_9187!()),
+        [error("RelativePath", "Trait", "SharedTr")]
+    );
+    assert_eq!(
+        errors(__tl_errors_9188!()),
+        [error("UnprovableBound", "Type", "Wrap<Y>")]
+    );
+    assert_eq!(
+        errors(__tl_errors_9189!()),
+        [error("RelativePath", "Trait", "SharedTr")]
+    );
+
+    // (a) The host implements the trait, with `Held<'b>` in the signature as written.
+    fn held_input<T: l::HeldInput>() {}
+    held_input::<r::Host9184>();
+    // (b) `f` keeps its elided lifetime and its trait object, and `g` takes the entry, which is
+    // `dyn PlainTr`.
+    fn elided_and_plain<T: l::ElidedAndPlain>() {}
+    elided_and_plain::<r::Host9185>();
+    // (d) `f` keeps its elided lifetime and its trait object as written, whatever `g` has.
+    fn elided_and_bare<T: l::ElidedAndBare>() {}
+    elided_and_bare::<r::Host9187>();
+    // (e) `ai` keeps `impl Into<Wrap<Y>>`, and `a1` and the bound have the entries.
+    fn entry_and_bound<T: l::EntryAndBound>() {}
+    entry_and_bound::<r::Host9188>();
+    // (f) `f` keeps `dyn SharedTr`, and the relative type beside it is an entry, like `g`'s.
+    fn elided_with_sibling<T: l::ElidedWithSibling>() {}
+    elided_with_sibling::<r::Host9189>();
+    // (c) The copy holds the original types: `Self` is replaced by the Visitor with the Leaker's
+    // type, as it is for any struct with `allow_self = true`.
+    let copy = r::NoSelfMeaning {
+        rel: l::Rel(2),
+        me: l::Wrap(PhantomData),
+    };
+    same(&copy.rel, &l::Rel(0));
+    same(&copy.me, &l::Wrap::<l::NoSelfMeaning>(PhantomData));
 }
 
 // ---------------------------------------------------------------------------------------------

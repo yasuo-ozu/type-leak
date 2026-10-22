@@ -234,3 +234,19 @@ pub mod kinds {
     // The cyclic bound is rejected: it expands to nothing.
     type_leak_test_leaker::__tl_prop_9076!(path = ::type_leak_test_leaker::kinds);
 }
+
+/// Items that the Leaker rejects and accepts with `LeakerConfig::allow()` of the causes of their
+/// errors: the part that conflicts is copied as written, so this module names what the copies name
+/// (`Held`, `ElidedTr`, `SharedTr`, `Wrap`) and invokes them with `accept`. Everything else is
+/// replaced as usual.
+pub mod accepted {
+    #[allow(unused_imports)]
+    use type_leak_test_leaker::kinds::{ElidedTr, Held, SharedTr, Wrap};
+
+    type_leak_test_leaker::__tl_prop_9184!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9185!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9186!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9187!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9188!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9189!(path = ::type_leak_test_leaker::kinds, accept);
+}

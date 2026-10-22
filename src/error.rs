@@ -6,7 +6,8 @@
 
 use crate::analysis::CheckResult;
 use crate::util::{or_list, without_crate_prefix};
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
+use std::hash::{Hash, Hasher};
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
@@ -32,7 +33,13 @@ use template_quote::{quote, ToTokens};
 /// type is a [`Cause::Expr`], a macro call there is a [`Cause::Macro`], and a lifetime is a
 /// [`Cause::Lifetime`]. What is none of them is a [`Cause::Unreadable`].
 ///
-/// Two causes are equal if they are of the same kind and are the same syntax, whatever their spans.
+/// Two causes are equal if they are of the same kind and are the same syntax, whatever their spans
+/// and the spacing of their punctuation: the tokens are compared, a group by its delimiter, an
+/// identifier by its name, a punctuation by its character and a literal by its text, so `: :` equals
+/// `::` and `* ;` equals `*;`, and a group without delimiters (what a macro leaves around a
+/// fragment) is no token. So a cause that is written by hand (`Cause::Trait(parse_quote!(RelTr))`)
+/// is equal to the one an error has, and [`LeakerConfig::allow()`](crate::LeakerConfig::allow)
+/// takes it to accept the conflict that the error reports.
 ///
 /// ```
 /// # use type_leak::*;
@@ -87,8 +94,9 @@ pub enum Cause {
 }
 
 impl Cause {
-    /// The word that names the kind in the serialized form of an [`ErrorItem`].
-    fn kind(&self) -> &'static str {
+    /// The word that names the kind in the serialized form of an [`ErrorItem`] and of an
+    /// [`Allowed`](crate::Allowed).
+    pub(crate) fn kind(&self) -> &'static str {
         match self {
             Cause::Type(_) => "type",
             Cause::Trait(_) => "trait",
@@ -165,7 +173,7 @@ impl Cause {
     }
 
     /// Reads the cause of the kind `kind` from all of `input`.
-    fn parse(kind: &Ident, input: ParseStream) -> syn::Result<Self> {
+    pub(crate) fn parse(kind: &Ident, input: ParseStream) -> syn::Result<Self> {
         let cause = match kind.to_string().as_str() {
             "type" => Cause::Type(input.parse()?),
             "trait" => {
@@ -243,16 +251,72 @@ impl ToTokens for Cause {
     }
 }
 
+/// A token of a cause without its span and its spacing: what two causes are compared by.
+#[derive(PartialEq, Eq, Hash)]
+enum Token {
+    /// The start of a group, with its opening delimiter.
+    Open(char),
+    /// The end of the group.
+    Close,
+    Ident(String),
+    Punct(char),
+    Literal(String),
+}
+
+impl Token {
+    /// Appends the tokens of `stream`. A group without delimiters (what a macro leaves around a
+    /// fragment) is no token: its content is.
+    fn collect(stream: TokenStream, tokens: &mut Vec<Token>) {
+        for tree in stream {
+            match tree {
+                TokenTree::Group(group) => {
+                    let open = match group.delimiter() {
+                        Delimiter::Parenthesis => '(',
+                        Delimiter::Brace => '{',
+                        Delimiter::Bracket => '[',
+                        Delimiter::None => {
+                            Token::collect(group.stream(), tokens);
+                            continue;
+                        }
+                    };
+                    tokens.push(Token::Open(open));
+                    Token::collect(group.stream(), tokens);
+                    tokens.push(Token::Close);
+                }
+                TokenTree::Ident(ident) => tokens.push(Token::Ident(ident.to_string())),
+                TokenTree::Punct(punct) => tokens.push(Token::Punct(punct.as_char())),
+                TokenTree::Literal(literal) => tokens.push(Token::Literal(literal.to_string())),
+            }
+        }
+    }
+}
+
+impl Cause {
+    /// The tokens of the cause, apart from their spans and their spacing.
+    fn canonical(&self) -> Vec<Token> {
+        let mut tokens = Vec::new();
+        Token::collect(self.to_token_stream(), &mut tokens);
+        tokens
+    }
+}
+
 /// Two causes are equal if they are of the same kind and have the same tokens, whatever their
-/// spans.
+/// spans and the spacing of their punctuation.
 impl PartialEq for Cause {
     fn eq(&self, other: &Self) -> bool {
-        self.kind() == other.kind()
-            && self.to_token_stream().to_string() == other.to_token_stream().to_string()
+        self.kind() == other.kind() && self.canonical() == other.canonical()
     }
 }
 
 impl Eq for Cause {}
+
+/// Hashes the kind and the tokens as `eq()` compares them, so equal causes hash alike.
+impl Hash for Cause {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.kind().hash(state);
+        self.canonical().hash(state);
+    }
+}
 
 /// Why a part of an item cannot be interned: the rule that it breaks.
 ///
@@ -565,7 +629,8 @@ impl Reason {
 pub struct ErrorItem {
     /// The part of the item that cannot be interned, as written: usually the whole type, trait
     /// path or value, else the part of it that depends on the context. The error is reported at it
-    /// ([`ErrorItem::span()`]).
+    /// ([`ErrorItem::span()`]). Passing it to [`LeakerConfig::allow()`](crate::LeakerConfig::allow)
+    /// accepts the conflict, so that the analysis does not report it.
     pub cause: Cause,
     /// Why it cannot be interned.
     pub reason: Reason,

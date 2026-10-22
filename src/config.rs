@@ -1,9 +1,17 @@
 //! Configuration of the [`Leaker`](crate::Leaker).
 
+use crate::error::Cause;
+#[cfg(doc)]
+use crate::error::{ErrorItem, Reason};
+#[cfg(doc)]
+use crate::referrer::{Allowed, Referrer};
+#[cfg(doc)]
+use crate::view::View;
 use syn::*;
 
-/// The paths that a [`Leaker`](crate::Leaker) leaves as written instead of leaking them. Pass it
-/// to [`Leaker::from_config()`](crate::Leaker::from_config).
+/// The paths that a [`Leaker`](crate::Leaker) leaves as written instead of leaking them, and the
+/// conflicts that it accepts ([`LeakerConfig::allow()`]). Pass it to
+/// [`Leaker::from_config()`](crate::Leaker::from_config).
 ///
 /// ```
 /// # use type_leak::*;
@@ -27,6 +35,8 @@ pub struct LeakerConfig {
     pub(crate) check_values: bool,
     /// Set by [`LeakerConfig::nested_self_entries()`].
     pub(crate) nested_self_entries: bool,
+    /// Set by [`LeakerConfig::allow()`].
+    pub(crate) allowed_causes: Vec<Cause>,
 }
 
 impl LeakerConfig {
@@ -224,6 +234,182 @@ impl LeakerConfig {
     ///   Put the field first, or add `where Self: Sized` to the item.
     pub fn nested_self_entries(&mut self) -> &mut Self {
         self.nested_self_entries = true;
+        self
+    }
+
+    /// Accepts a conflict: the analysis does not report the error whose [`cause`](ErrorItem::cause)
+    /// equals `cause` (the same kind and the same tokens, whatever the spans). The part that
+    /// conflicts is copied as written, whole, as the error says it must be, and nothing in it is
+    /// leaked: a relative path in it stays as it is. You promise that it can be written as it is in
+    /// the copy; if it cannot, the copy fails to build, in the crate of the copy.
+    ///
+    /// The cause is looked up only where a conflict is turned into an error. A place that is no
+    /// conflict never looks at it, so the option changes nothing else. It is not a second
+    /// [`allowed_paths`](LeakerConfig::allowed_paths): that makes a name context-free everywhere,
+    /// and this accepts the copy at the conflicts the name causes. Every conflict with the same
+    /// cause is accepted. If no error is left, the analysis succeeds: a scope that held only
+    /// accepted conflicts is not rolled back, and its other entries stay.
+    ///
+    /// The [`Referrer`] keeps the causes that accepted a conflict and the parts that were copied as
+    /// written ([`Referrer::allowed()`], [`Allowed`]), and its [`Visitor`](crate::Visitor) leaves
+    /// each part as written. It would find an entry inside the part otherwise, by its tokens and
+    /// its context, as it does everywhere: the `dyn RelTr` of `f` below is the entry of `g`.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// # use syn::visit_mut::VisitMut;
+    /// let item: ItemImpl = parse_quote! {
+    ///     impl ::p::S {
+    ///         fn f(_: ::p::W<'_, dyn RelTr>) {}  // the lifetime is elided, and `RelTr` is relative
+    ///         fn g(_: ::p::X<dyn RelTr>) {}      // fine: `dyn RelTr` is leaked
+    ///     }
+    /// };
+    /// // The entries of an item, with whether each is required.
+    /// let entries = |config: LeakerConfig, item: &ItemImpl| {
+    ///     let mut leaker = Leaker::from_config(config);
+    ///     leaker.intern_impl(item, true).map(|_| {
+    ///         let referrer = leaker.finish();
+    ///         let entries: Vec<_> = referrer.iter().cloned().enumerate().collect();
+    ///         entries.into_iter().map(|(ix, ty)| (ty, referrer.must(ix))).collect::<Vec<_>>()
+    ///     })
+    /// };
+    ///
+    /// // The error is about the trait, which is smaller than the type `W<'_, dyn RelTr>` it is in.
+    /// let errors = Leaker::new().intern_impl(&item, true).unwrap_err();
+    /// assert_eq!(errors.len(), 1);
+    /// assert_eq!(errors[0].cause, Cause::Trait(parse_quote!(RelTr)));
+    ///
+    /// // Accept it: `f` is copied as written, and the entries are those of `g` alone, which still
+    /// // leaks `dyn RelTr` (required).
+    /// let mut config = LeakerConfig::new();
+    /// config.allow(errors[0].cause.clone());
+    /// let accepted = entries(config, &item).unwrap();
+    /// let g_only: ItemImpl = parse_quote!(impl ::p::S { fn g(_: ::p::X<dyn RelTr>) {} });
+    /// assert_eq!(accepted, entries(LeakerConfig::new(), &g_only).unwrap());
+    /// assert!(accepted.contains(&(parse_quote!(dyn RelTr), true)));
+    ///
+    /// // `allowed_paths` makes `RelTr` context-free in `g` too, which loses its entry.
+    /// let mut config = LeakerConfig::new();
+    /// config.allowed_paths.push(parse_quote!(RelTr));
+    /// let entries = entries(config, &item).unwrap();
+    /// assert!(!entries.iter().any(|(ty, _)| *ty == parse_quote!(dyn RelTr)));
+    ///
+    /// // The Referrer lists the cause that accepted the conflict, and the part of `f` that is copied
+    /// // as written. Its visitor leaves `f` as it is and replaces the `dyn RelTr` of `g`.
+    /// let mut config = LeakerConfig::new();
+    /// config.allow(errors[0].cause.clone());
+    /// let mut leaker = Leaker::from_config(config);
+    /// let context = leaker.intern_impl(&item, true).unwrap();
+    /// let referrer = leaker.finish();
+    /// assert_eq!(referrer.allowed().len(), 2);
+    /// assert_eq!(referrer.allowed()[0], Allowed::Cause(Cause::Trait(parse_quote!(RelTr))));
+    /// assert!(matches!(
+    ///     &referrer.allowed()[1],
+    ///     Allowed::Part { part: Cause::Type(ty), .. } if *ty == parse_quote!(dyn RelTr)
+    /// ));
+    /// let mut copy = item.clone();
+    /// referrer
+    ///     .visitor(context, |_, ix| parse_quote!(<S as Repeater<(), 7, #ix>>::Type))
+    ///     .visit_item_impl_mut(&mut copy);
+    /// let expected: ItemImpl = parse_quote! {
+    ///     impl ::p::S {
+    ///         fn f(_: ::p::W<'_, dyn RelTr>) {}
+    ///         fn g(_: ::p::X<<S as Repeater<(), 7, 0usize>>::Type>) {}
+    ///     }
+    /// };
+    /// assert_eq!(copy, expected);
+    ///
+    /// // A cause of another kind, or with other tokens, accepts nothing.
+    /// let mut config = LeakerConfig::new();
+    /// config.allow(Cause::Type(parse_quote!(RelTr)));
+    /// config.allow(Cause::Trait(parse_quote!(OtherTr)));
+    /// assert!(Leaker::from_config(config).intern_impl(&item, true).is_err());
+    /// ```
+    ///
+    /// The cause may be smaller than the part that is copied. In `[u8; { let c = |a: u8| a; 3 }]`
+    /// the closure stops the array from being leaked, the error is about `u8` (`a` is a note of it),
+    /// and accepting `u8` copies the array whole: `a` is never reached.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let item: ItemImpl = parse_quote! {
+    ///     impl ::p::S {
+    ///         fn f(_: [u8; { let c = |a: u8| a; 3 }]) {}
+    ///         fn g(_: ::p::V<u8>) {}
+    ///     }
+    /// };
+    /// let errors = Leaker::new().intern_impl(&item, true).unwrap_err();
+    /// assert_eq!(errors.len(), 1);
+    /// assert_eq!(errors[0].cause, Cause::Type(parse_quote!(u8)));
+    ///
+    /// let mut config = LeakerConfig::new();
+    /// config.allow(Cause::Type(parse_quote!(u8)));
+    /// let mut leaker = Leaker::from_config(config);
+    /// leaker.intern_impl(&item, true).unwrap();
+    /// // `g` leaks `::p::V<u8>` as it does without the array, and nothing is leaked for `a`.
+    /// let referrer = leaker.finish();
+    /// let required: Vec<_> = referrer.required().map(|(_, ty)| ty).collect();
+    /// assert_eq!(required, [&parse_quote!(::p::V<u8>)]);
+    /// ```
+    ///
+    /// The mentions of `Self` that have no meaning ([`Reason::SelfWithoutMeaning`]) are reported
+    /// only if no other error is, so accepting the others makes them appear. The outermost type
+    /// that would be an entry and names one, or has a bound in its context that does, is copied as
+    /// written too, whole: the impl of the Repeater would read that `Self` as its implementor. So
+    /// is a type that leaves a lifetime of its method unconstrained
+    /// ([`Reason::UnconstrainedLifetime`]). [`View::check()`] reports causes, not errors, and
+    /// ignores the option.
+    ///
+    /// **What accepting does not make compile**
+    ///
+    /// - `Self::A`, or `Self` as a type, in a bound or where predicate when a bound in its context
+    ///   names a leaked type ([`Reason::UnprovableBound`]). Only the cause is copied as written:
+    ///   the bound stays leaked, so the copy still fails with E0277 until the type of the bound is
+    ///   written with an absolute path or allowed with
+    ///   [`allowed_paths`](LeakerConfig::allowed_paths). It is the same in an impl (`impl<T:
+    ///   Into<R0>> Tr<T> for S1` with `where Y: Into<Self::A1>` in a method, or `impl<T: Into<R0>>
+    ///   S1<T>` with `where Y: Fn(&Self) -> u8` and `allow_self = false`). A predicate on a type
+    ///   that is no path of `Self` (`X: Into<R1<T>>`) is fine: accepted, it is copied as written,
+    ///   and no longer goes through the Repeater.
+    ///
+    ///   ```
+    ///   # use type_leak::*;
+    ///   # use syn::*;
+    ///   let item: ItemTrait = parse_quote! {
+    ///       trait Tr<T> where T: Into<R0> {
+    ///           type A0;
+    ///           fn m<X>(&self) -> X where X: Into<Self::A0>;
+    ///       }
+    ///   };
+    ///   let mut config = LeakerConfig::new();
+    ///   config.allow_std_prelude();
+    ///   let errors = Leaker::from_config(config.clone()).intern_trait(&item, true).unwrap_err();
+    ///   assert_eq!(errors[0].reason, Reason::UnprovableBound);
+    ///   assert_eq!(errors[0].cause, Cause::Type(parse_quote!(Self::A0)));
+    ///
+    ///   // Accepted, `Self::A0` is copied as written, and `R0` in the bound is still an entry.
+    ///   config.allow(errors[0].cause.clone());
+    ///   let mut leaker = Leaker::from_config(config);
+    ///   leaker.intern_trait(&item, true).unwrap();
+    ///   let referrer = leaker.finish();
+    ///   let required: Vec<_> = referrer.required().map(|(_, ty)| ty).collect();
+    ///   assert_eq!(required, [&parse_quote!(R0)]);
+    ///   ```
+    /// - A trait with a generic whose bound names an associated type that another bound fixes
+    ///   (`T: Iterator<Item = (R0, u8)> + Fn(<T as Iterator>::Item) -> u8`, also through an alias
+    ///   of the projection), and a method predicate that names `Self::A`: rustc cannot implement it
+    ///   with a generic impl at all, even with nothing leaked (E0277 "expected an `Fn((R0, u8))`
+    ///   closure, found `T`" in the impl), so no copy compiles, whatever is accepted. See [Bounds
+    ///   that name leaked types](crate::Leaker#bounds-that-name-leaked-types).
+    /// - [`Visitor::with_self()`](crate::Visitor::with_self) replaces `Self` inside an accepted part
+    ///   too, which can change the elision of a lifetime. With `allow_self = false` and `Self`
+    ///   accepted, `struct S<'a>(PhantomData<&'a ()>, fn(::core::slice::Iter<u8>, *mut Self) ->
+    ///   &u32)` is copied with `Self` replaced by `S<'a>`: the function pointer then has two input
+    ///   lifetimes, and the elided output fails (E0106).
+    pub fn allow(&mut self, cause: Cause) -> &mut Self {
+        self.allowed_causes.push(cause);
         self
     }
 

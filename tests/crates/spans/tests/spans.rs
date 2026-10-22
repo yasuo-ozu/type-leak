@@ -238,3 +238,35 @@ fn a_serialized_error_keeps_its_spans() {
         );
     }
 }
+
+/// A cause is the same whatever its spans: the one that is written elsewhere (other lines and
+/// columns) accepts the conflict (`LeakerConfig::allow()`), and a config with it is equal to one
+/// with the cause of the error, and hashes the same.
+#[test]
+fn an_accepted_cause_is_the_same_whatever_its_spans() {
+    use std::hash::{Hash, Hasher};
+    let source = "impl ::p::S {\n    fn f(_: ::p::W<'_, dyn RelTr>) {}\n}";
+    let item: ItemImpl = parse_str(source).unwrap();
+    let errors = Leaker::new().intern_impl(&item, true).unwrap_err();
+    assert_eq!(errors.len(), 1, "{}", messages(&errors));
+    assert_span_at(errors[0].span(), source, "RelTr", 0);
+    let elsewhere: Path = parse_str("\n\n      RelTr").unwrap();
+    assert_ne!(
+        places(&elsewhere.to_token_stream()),
+        places(&errors[0].cause.to_token_stream())
+    );
+    let mut config = LeakerConfig::new();
+    config.allow(Cause::Trait(elsewhere));
+    Leaker::from_config(config.clone())
+        .intern_impl(&item, true)
+        .unwrap();
+    let mut made = LeakerConfig::new();
+    made.allow(errors[0].cause.clone());
+    assert_eq!(config, made);
+    let hash = |config: &LeakerConfig| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        config.hash(&mut hasher);
+        hasher.finish()
+    };
+    assert_eq!(hash(&config), hash(&made));
+}

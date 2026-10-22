@@ -31,7 +31,7 @@
 //! that `syn` leaves unparsed.
 
 use super::{self_segment, AnalyzeVisitor};
-use crate::analysis::{CheckResult, Effect};
+use crate::analysis::{CheckResult, Effect, Part};
 #[cfg(doc)]
 use crate::config::LeakerConfig;
 use crate::error::{Cause, Reason};
@@ -215,6 +215,19 @@ impl<'a> ValueWalk<'a> {
     /// Rejects the relative path `cause`, with `help` for what to write if it has to say more than
     /// the absolute path.
     fn relative(&mut self, cause: Cause, help: Option<String>) {
+        self.relative_part(cause, help, None)
+    }
+
+    /// Rejects the relative path `path` of a value, which is copied as written, with the types in
+    /// its arguments: the Referrer leaves them so (see [`Part`]).
+    fn relative_path(&mut self, path: &Path) {
+        let cause = Cause::expr_path(path);
+        let part = self.visitor.node_part(cause.clone(), path);
+        self.relative_part(cause, None, part)
+    }
+
+    /// Like `relative()`, for a node that the Referrer leaves as written: `part`.
+    fn relative_part(&mut self, cause: Cause, help: Option<String>, part: Option<Part>) {
         // The error names a macro in its own way, with its `!`, whereas the path of a macro in a
         // type is shown by its path alone.
         let headline = match &cause {
@@ -238,6 +251,7 @@ impl<'a> ValueWalk<'a> {
             headline,
             cause: None,
             reason: Reason::RelativePath,
+            part,
         });
     }
 
@@ -252,6 +266,7 @@ impl<'a> ValueWalk<'a> {
             headline: Some(format!("cannot analyze `{}` in {}", shown, self.what)),
             cause: None,
             reason: Reason::Unreadable,
+            part: None,
             must: vec![Cause::Unreadable(tokens.clone())],
             impossible: vec![Cause::Unreadable(tokens)],
             is_own: true,
@@ -473,7 +488,7 @@ impl<'ast> Visit<'ast> for ValueWalk<'_> {
         if self.is_known(i) {
             syn::visit::visit_path(self, i)
         } else {
-            self.relative(Cause::expr_path(i), None)
+            self.relative_path(i)
         }
     }
 

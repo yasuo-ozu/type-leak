@@ -1,15 +1,16 @@
 //! The [`Leaker`], which finds the types depending on the type context.
 
-use crate::analysis::{drop_optional, names_self, Analysis};
+use crate::analysis::{drop_optional, names_self, Analysis, PartItem};
 use crate::analyze::{
     declared_names, AnalyzeVisitor, Finished, ModuleNames, Res, ScopeSpec, Scopes,
 };
 use crate::config::LeakerConfig;
 use crate::context::{Context, ContextId, Contexts, Gat, SelfRequirement};
+use crate::error::Cause;
 #[cfg(doc)]
 use crate::error::{ErrorItem, Reason};
 use crate::graph::{is_whole_reference, NodeKey, TypeGraph};
-use crate::referrer::Referrer;
+use crate::referrer::{Allowed, Referrer};
 use crate::util::{ident_name, AllowedPaths};
 use crate::view::View;
 use proc_macro2::{Span, TokenStream};
@@ -47,7 +48,9 @@ use template_quote::quote;
 /// # Limitations
 ///
 /// The Leaker reads only the item you give it, not the definitions of the paths it names, so it
-/// rejects these (the error's `help` says what to write instead):
+/// rejects these (the error's `help` says what to write instead; [`LeakerConfig::allow()`] accepts
+/// a conflict, which is then copied as written, and the [`Referrer`] lists that part,
+/// [`Referrer::allowed()`], to leave it so):
 ///
 /// - `MyType<'_>`, `impl Trait`, and a relative trait or value in a bound: write an absolute path.
 ///   (`T: ?Sized` is left as written: rustc allows `?` only on the language's `Sized`. A bound
@@ -258,6 +261,14 @@ pub struct Leaker {
     /// Whether an entry that names the `Self` of a nested struct, enum or union together with a
     /// bound that does is accepted ([`LeakerConfig::nested_self_entries()`]).
     nested_self_entries: bool,
+    /// The causes of the conflicts that are accepted ([`LeakerConfig::allow()`]).
+    allowed_causes: Vec<Cause>,
+    /// The causes among them that accepted a conflict in a scope that succeeded, in order of first
+    /// acceptance: the [`Allowed::Cause`] items of the [`Referrer`].
+    accepted: Vec<Cause>,
+    /// The parts of the items that are copied as written, as the scopes that succeeded left them
+    /// (the [`Allowed::Part`] items).
+    parts: Vec<PartItem>,
 }
 
 impl Leaker {
@@ -266,12 +277,14 @@ impl Leaker {
         Self::default()
     }
 
-    /// Creates a [`Leaker`] that leaves the paths allowed by `config` as written.
+    /// Creates a [`Leaker`] that leaves the paths allowed by `config` as written, and does not
+    /// report the conflicts that it accepts ([`LeakerConfig::allow()`]).
     pub fn from_config(config: LeakerConfig) -> Self {
         Self {
             allowed_paths: config.allowed_paths,
             check_values: config.check_values,
             nested_self_entries: config.nested_self_entries,
+            allowed_causes: config.allowed_causes,
             ..Self::default()
         }
     }
@@ -654,7 +667,9 @@ impl Leaker {
         Scopes::enter_trait(self, ident, generics, allow_self, f)
     }
 
-    /// Ends the analysis and returns the [`Referrer`] with the entries found.
+    /// Ends the analysis and returns the [`Referrer`] with the entries found, and the conflicts that
+    /// were accepted ([`LeakerConfig::allow()`]) with the parts that are copied as written
+    /// ([`Referrer::allowed()`]).
     ///
     /// The result is deterministic: required entries come first, then optional ones
     /// ([`Referrer::must()`]), each sorted by context (in order of first appearance) and tokens. So
@@ -683,6 +698,13 @@ impl Leaker {
             .iter()
             .map(|&id| (id, context_of(id)))
             .collect();
+        // The parts are looked up by their contexts too.
+        for item in &self.parts {
+            let anchor = item.within.iter().map(|(_, id)| *id);
+            for id in std::iter::once(item.context).chain(anchor) {
+                context_map.entry(id).or_insert_with(|| context_of(id));
+            }
+        }
         let mut entries = Vec::new();
         let keys = required.into_iter().map(|key| (key, true));
         for (key, must) in keys.chain(optional.into_iter().map(|key| (key, false))) {
@@ -711,7 +733,16 @@ impl Leaker {
                 }
             }
         }
-        Referrer::new(entries, context_map, modules)
+        // The causes first, then the parts.
+        let allowed = (self.accepted.into_iter().map(Allowed::Cause)).chain(
+            self.parts.into_iter().map(|item| Allowed::Part {
+                part: item.part,
+                context: item.context,
+                in_predicate: item.in_predicate,
+                within: item.within,
+            }),
+        );
+        Referrer::new(entries, context_map, modules, allowed.collect())
     }
 
     /// Chooses the fewest entries from which every leaked type can be built.
@@ -762,7 +793,8 @@ impl Scopes for Leaker {
         let root = spec.declared_generics();
         let mut visitor = AnalyzeVisitor::new(AllowedPaths::new(&self.allowed_paths), &root)
             .reading_values(self.check_values)
-            .with_nested_self_entries(self.nested_self_entries);
+            .with_nested_self_entries(self.nested_self_entries)
+            .with_allowed_causes(&self.allowed_causes);
         let mark = self.contexts.len();
         // The visitor owns the table of contexts while it analyzes, so the swap is the only step
         // before `catch_unwind`: no allocation, no user code. Whatever happens next (a result, an
@@ -791,6 +823,7 @@ impl Scopes for Leaker {
             top_levels,
             module,
             not_optional,
+            accepted,
         } = finished;
         drop_optional(&mut effects, &not_optional.into_iter().collect());
         let mut analysis = Analysis::default();
@@ -800,6 +833,16 @@ impl Scopes for Leaker {
         for ident in analysis.primitives {
             if !self.assumed_primitives.contains(&ident) {
                 self.assumed_primitives.push(ident);
+            }
+        }
+        for cause in accepted {
+            if !self.accepted.contains(&cause) {
+                self.accepted.push(cause);
+            }
+        }
+        for part in analysis.parts {
+            if !self.parts.contains(&part) {
+                self.parts.push(part);
             }
         }
         if !(analysis.types.is_empty() && analysis.optional.is_empty()) {

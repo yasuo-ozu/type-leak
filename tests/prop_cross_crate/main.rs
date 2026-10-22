@@ -64,6 +64,79 @@
 //! Either is a defect of `type-leak`, or a limitation to put in the list with its shape.
 //! `TYPE_LEAK_PROP_REJECTIONS=1` prints each rejection with the tags of its item.
 //!
+//! # Accepting the rejections (`TYPE_LEAK_PROP_ACCEPT`)
+//!
+//! `LeakerConfig::allow(cause)` accepts a conflict: the part of the item that conflicts is copied as
+//! written, whole, with nothing in it leaked, and the analysis keeps the correction it makes (the
+//! scope is not rolled back). The corrections of the rejections were compiled by nobody, as an error
+//! always rolled back. With `TYPE_LEAK_PROP_ACCEPT=1` the test compiles them:
+//!
+//! 1. The macro (`prop_leak_accept`) analyzes an item as always. If the Leaker rejects it, it
+//!    analyzes it again with the same configuration and `allow(cause)` for the `cause` of every
+//!    error. The errors of the first analysis are what the rejection is: `family()` explains each
+//!    as always ("NOT A KNOWN REASON", "NO SHAPE THAT GIVES IT"). If the second analysis still
+//!    fails, the run fails ("ACCEPT FAILED", with the errors of both): it is the first analysis
+//!    with the errors filtered out, and it must succeed.
+//! 2. The result is emitted and checked like an accepted item: the Repeater's impls, the
+//!    witnesses, the macro for the Referrer's crate, the copy rewritten by `Referrer::visitor`, and
+//!    the witness checks. Its status in the report is `acc`. The acceptance floors and the table
+//!    are those of the first analysis, where it counts as rejected; the summary has a line for
+//!    the items accepted by `allow()`, with the `Reason` and the kind of cause of the errors that
+//!    were allowed. A compile failure of such an item is reported with the class "ACCEPT: ..." and
+//!    the errors that were allowed. Which crate fails tells where: the Leaker's crate (a Repeater's
+//!    impl or the item: the entries or the impls are wrong) or the Referrer's (the copy, or a
+//!    witness check: the part that was copied as written cannot be written there, or an entry
+//!    that should not be one is replaced).
+//! 3. The twin of an item with a bare trait of the prelude (see below) is compared at the first
+//!    analysis only. `PRIMITIVE KEPT` does not apply to an item accepted by `allow()`: the part
+//!    that is copied as written may hold a primitive type that the Leaker does not allow.
+//!
+//! The parts that are copied as written name things of the Leaker's crate by the paths they have
+//! there (`R0`, `self::R1`, `super::R1`, `super::base::B1`, `crate::base::B1`, an import `I1`),
+//! and `allow()` is a promise that they can be written as they are in the copy. So that this does
+//! not fail for a reason of no interest, and does not weaken the property for the other items, the
+//! copies of the items accepted by `allow()` are made in a Referrer's crate of their own
+//! (`tlp_a_NNN`, `gen::accept_referrer()`), and the ordinary Referrer's crate expands them to
+//! nothing (`Args::accepted`, the `accept` flag of the invocation). The crate of their own has the
+//! modules of the Leaker's crate that the items are in, in the same place of the module tree, with
+//! the same imports and a glob import of the Leaker's module (so `R0`, `I1`, `self::` and
+//! `super::` mean what they mean in the Leaker's crate), and `base` at its root, the glob import
+//! of the Leaker's (so `crate::base::B1` and `super::base::B1` do). The ordinary Referrer's crate
+//! has none of them, so that the copy of an ordinary item that keeps a relative path by mistake
+//! does not compile there, as before. A separate crate and not a module of the ordinary one,
+//! because `crate::base` is the root of the crate: `base` there would let such a copy resolve.
+//! A copy of a module analyzed as a whole keeps its imports in the crate of their own. (For an item
+//! accepted by `allow()` the test cannot tell a relative path that the Leaker should have leaked
+//! and did not from one it copied as written: both resolve. The witnesses still compare the types.)
+//!
+//! # The copies that do not compile are explained
+//!
+//! A copy of an item accepted by `allow()` may not build, for the shapes that the docs of
+//! `LeakerConfig::allow()` list ("What accepting does not make compile"), and the test explains each
+//! failure the way it explains a rejection (`accept_families()`, `unexplained_accept()`): the
+//! diagnostic is one of the listed failures, if its error code (`E0277`, `E0106`), the errors that
+//! were allowed (their `Reason` and the kind and tokens of their cause) and the shapes of the item
+//! (its tags) say so. The failure is counted and is no failure of the run. Anything else fails
+//! the run: "ACCEPT: NOT A KNOWN FAILURE" for a diagnostic that no listed failure explains, and
+//! "ACCEPT: NO SHAPE THAT GIVES IT" for a listed one on an item that has not the shape. Either is a
+//! defect, or a limitation to list in the docs of `allow()` and here, with its shape.
+//!
+//! - (i) `Self::A`, or `Self` as a type, in a predicate whose context has a bound that names a
+//!   leaked type: `UnprovableBound`, E0277. Only the cause is copied as written, and the bound stays
+//!   leaked. The item has a predicate that names `Self` (`self_in_predicate`) and a bound that names
+//!   a leaked type (`bound_cycle`).
+//! - (ii) The same cause in a trait with a generic whose bound names an associated type that
+//!   another bound fixes (`T: Iterator<Item = ..> + Fn(<T as Iterator>::Item) -> u8`): E0277 too,
+//!   but rustc cannot implement such a trait with a generic impl at all. The item has the alias
+//!   bound (`alias_bound`).
+//! - (iii) `Self` with `allow_self = false` (`RelativePath`) in a function pointer whose elided
+//!   output takes the lifetime of an input that a path hides: `Visitor::with_self()` replaces
+//!   `Self` inside the accepted part, which changes the elision (E0106). The item denies `Self`
+//!   (`self_denied`) and has the function pointer (`hidden_self`).
+//!
+//! The summary counts them by class. The generator avoids none of these shapes: the rejected ones
+//! (`gen::Gen::cyclic`) have them.
+//!
 //! # Bare and absolute spellings
 //!
 //! Bounds, where clauses, supertraits and trait objects name `Sized`, `?Sized`, `Send`, `Sync`,
@@ -127,7 +200,11 @@
 //!   `enter_generics`, `enter_trait` and `enter_impl`.
 //! - `TYPE_LEAK_PROP_MIN_SAMPLES` (default 12): the fewest items of a kind for its floor to count.
 //! - `TYPE_LEAK_PROP_MIN_CHECKED` (default 30): the least percentage of type positions compared.
-//! - `TYPE_LEAK_PROP_REJECTIONS`: if set, the rejections are printed with the tags of their items.
+//! - `TYPE_LEAK_PROP_REJECTIONS`: if set, the rejections are printed with the tags of their items,
+//!   and with the `Reason` and the kind of the cause of each error.
+//! - `TYPE_LEAK_PROP_ACCEPT`: if set (and not `0`), the Leaker accepts the items it rejects by
+//!   `LeakerConfig::allow(cause)` of the cause of every error, and the test compiles the result: see
+//!   "Accepting the rejections". The workspace is `ws-<seed>-<cases>-accept`.
 //! - `TYPE_LEAK_PROP_FEATURES`: a comma-separated list of constructs that `type-leak` is known to
 //!   fail on (see `gen::Features`). The generator avoids them by default, so that the test passes
 //!   on the current library, and a new failure is a new finding. With one of `inferred_outlives`,
@@ -227,10 +304,22 @@ fn referrer_name(i: usize) -> String {
     format!("tlp_r_{:03}", i)
 }
 
+/// The second Referrer's crate of `TYPE_LEAK_PROP_ACCEPT`.
+fn accept_dir(i: usize) -> String {
+    format!("c{:03}_a", i)
+}
+
+fn accept_name(i: usize) -> String {
+    format!("tlp_a_{:03}", i)
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     /// With `type-leak`, and the Referrer's crate.
     Real,
+    /// `Real`, and an item that the Leaker rejects is accepted by `allow()` of the causes of its
+    /// errors (`prop_leak_accept`), and copied in the second Referrer's crate.
+    Accept,
     /// Without it, to check the generator.
     Identity,
 }
@@ -243,8 +332,11 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode) {
         .iter()
         .flat_map(|(i, _)| {
             let mut dirs = vec![format!("\"{}\"", leaker_dir(*i))];
-            if mode == Mode::Real {
+            if mode != Mode::Identity {
                 dirs.push(format!("\"{}\"", referrer_dir(*i)));
+            }
+            if mode == Mode::Accept {
+                dirs.push(format!("\"{}\"", accept_dir(*i)));
             }
             dirs
         })
@@ -278,6 +370,7 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode) {
         .unwrap();
         let attr = match mode {
             Mode::Real => "crate::__macro::prop_leak",
+            Mode::Accept => "crate::__macro::prop_leak_accept",
             Mode::Identity => "crate::__macro::prop_leak_noop",
         };
         std::fs::write(dir.join("src/lib.rs"), case.leaker.replace(gen::ATTR, attr)).unwrap();
@@ -312,13 +405,37 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode) {
         )
         .unwrap();
         std::fs::write(dir.join("src/lib.rs"), &case.referrer).unwrap();
+
+        if mode == Mode::Accept {
+            let dir = ws.join(accept_dir(*i));
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
+                     [dependencies]\n{} = {{ path = \"../{}\" }}\n",
+                    accept_name(*i),
+                    leaker_name(*i),
+                    leaker_dir(*i)
+                ),
+            )
+            .unwrap();
+            std::fs::write(dir.join("src/lib.rs"), &case.accept_referrer).unwrap();
+        }
     }
 }
+
+/// The class of the diagnostics of the copy of an item accepted by `allow()`, which
+/// `accept_families()` explains if they are the failures that the docs of `allow()` list.
+const ACCEPT_COPY: &str =
+    "ACCEPT: the copy of an item accepted by allow() does not compile in the Referrer's crate";
 
 /// A diagnostic of the build.
 struct Diag {
     /// The crate.
     package: String,
+    /// The error code of rustc (`E0277`), or empty.
+    code: String,
     rendered: String,
     /// The `(file, line)` of its spans and of where the macros of each were invoked.
     lines: Vec<(String, u64)>,
@@ -393,6 +510,11 @@ fn cargo_build(ws: &Path, target: &Path) -> Build {
                         .and_then(Json::str)
                         .unwrap_or("")
                         .to_string(),
+                    code: message
+                        .path("code.code")
+                        .and_then(Json::str)
+                        .unwrap_or("")
+                        .to_string(),
                     rendered: message
                         .get("rendered")
                         .and_then(Json::str)
@@ -422,28 +544,45 @@ struct Failure {
     case: usize,
     item: Option<usize>,
     class: &'static str,
+    /// The error code of rustc, if the failure is a diagnostic of the copy of an item accepted by
+    /// `allow()`, which `accept_families()` explains.
+    code: String,
     text: String,
 }
 
-/// One error of a rejection (an `ErrorItem`): the message, the tokens it is about
-/// and its first note.
+/// One error of a rejection (an `ErrorItem`): the message, the tokens it is about, its first note,
+/// its `Reason` (the name of the variant) and the kind of its cause (the name of the variant).
 #[derive(Debug, Default, Clone)]
 struct Rejection {
     message: String,
     tokens: String,
     note: String,
+    reason: String,
+    kind: String,
 }
 
 /// What a macro reported for an item.
 #[derive(Debug, Default, Clone)]
 struct Report {
     kind: String,
+    /// The Leaker accepted the item at the first analysis.
     accepted: bool,
+    /// `TYPE_LEAK_PROP_ACCEPT`: the Leaker rejected the item, and accepted it when the cause of
+    /// every error was allowed (`acc`). It is not `accepted`: the floors count it as rejected.
+    allowed: bool,
+    /// `TYPE_LEAK_PROP_ACCEPT`: the Leaker rejected the item, and rejected it still when the cause
+    /// of every error was allowed (`accfail`): `remaining` are the errors of the second analysis.
+    accept_failed: bool,
     /// The reason of the rejection (the messages of its errors, on one line), or the error of the
     /// rewrite.
     detail: String,
-    /// The errors of the rejection.
+    /// The errors of the rejection: those of the first analysis, whatever the second one did.
     rejections: Vec<Rejection>,
+    /// The errors of the second analysis, if it failed (`accept_failed`).
+    remaining: Vec<Rejection>,
+    /// What the macro could not rewrite in the copy of an item it accepted (`accepted` or
+    /// `allowed`).
+    rewrite_error: Option<String>,
     positions: usize,
     checked: usize,
     entries: usize,
@@ -454,20 +593,43 @@ struct Report {
     twin: bool,
 }
 
+/// The errors of a rejection, as `prop::rejection_text()` writes them.
+fn parse_rejections(errors: &str) -> Vec<Rejection> {
+    errors
+        .split('\u{1d}')
+        .filter(|error| !error.is_empty())
+        .map(|error| {
+            let mut fields = error.splitn(5, '\u{1f}');
+            let mut next = || fields.next().unwrap_or("").to_string();
+            Rejection {
+                message: next(),
+                tokens: next(),
+                note: next(),
+                reason: next(),
+                kind: next(),
+            }
+        })
+        .collect()
+}
+
 fn parse_report(line: &str) -> Option<(usize, Report)> {
-    // The errors of a rejection follow the report.
+    // The errors of a rejection follow the report, and the errors of the second analysis of an
+    // `accfail` the errors of the first.
     let (line, errors) = line.split_once('\u{1e}').unwrap_or((line, ""));
+    let (errors, remaining) = errors.split_once('\u{1c}').unwrap_or((errors, ""));
     let mut parts = line.splitn(4, '|');
     let id = parts.next()?.parse().ok()?;
     let kind = parts.next()?.to_string();
-    let accepted = parts.next()? == "ok";
+    let status = parts.next()?;
     let rest = parts.next().unwrap_or("");
     let mut report = Report {
         kind,
-        accepted,
+        accepted: status == "ok",
+        allowed: status == "acc",
+        accept_failed: status == "accfail",
         ..Default::default()
     };
-    if accepted {
+    if report.accepted || report.allowed {
         for word in rest.split(' ') {
             match word.split_once('=') {
                 Some(("entries", n)) => report.entries = n.parse().unwrap_or(0),
@@ -475,26 +637,17 @@ fn parse_report(line: &str) -> Option<(usize, Report)> {
                 Some(("checked", n)) => report.checked = n.parse().unwrap_or(0),
                 Some(("skipped", n)) => report.skipped = n.parse().unwrap_or(0),
                 Some(("twin", n)) => report.twin = n == "1",
-                Some(("rewrite-error", _)) => report.detail = rest.to_string(),
                 _ => (),
             }
         }
         if let Some(at) = rest.find("rewrite-error=") {
+            report.rewrite_error = Some(rest[at..].to_string());
             report.detail = rest[at..].to_string();
         }
-    } else {
-        report.rejections = errors
-            .split('\u{1d}')
-            .filter(|error| !error.is_empty())
-            .map(|error| {
-                let mut fields = error.splitn(3, '\u{1f}');
-                Rejection {
-                    message: fields.next().unwrap_or("").to_string(),
-                    tokens: fields.next().unwrap_or("").to_string(),
-                    note: fields.next().unwrap_or("").to_string(),
-                }
-            })
-            .collect();
+    }
+    if !report.accepted {
+        report.rejections = parse_rejections(errors);
+        report.remaining = parse_rejections(remaining);
         report.detail = report
             .rejections
             .iter()
@@ -513,6 +666,38 @@ fn excerpt(text: &str, max: usize) -> String {
         write!(out, "\n... ({} more lines)", lines.len() - max).unwrap();
     }
     out
+}
+
+/// The errors of a rejection, one per line: the `Reason`, the kind of the cause, the message, the
+/// tokens it is about.
+fn describe(errors: &[Rejection]) -> String {
+    errors
+        .iter()
+        .map(|r| {
+            format!(
+                "  {} ({}): {} [tokens: {}]",
+                r.reason, r.kind, r.message, r.tokens
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The line of the Leaker's `lib.rs` where the attribute of each item is, with the item's id.
+fn attr_lines(case: &Case) -> Vec<(usize, usize)> {
+    case.items
+        .iter()
+        .filter_map(|item| {
+            let call = format!("(id = {},", item.id);
+            let at = case.leaker.lines().position(|line| line.contains(&call))?;
+            Some((at + 1, item.id))
+        })
+        .collect()
+}
+
+/// `TYPE_LEAK_PROP_ACCEPT` is set (and is not `0`).
+fn accept_mode() -> bool {
+    std::env::var("TYPE_LEAK_PROP_ACCEPT").map_or(false, |value| !matches!(value.trim(), "" | "0"))
 }
 
 /// A short reason of a rejection, for the statistics.
@@ -780,13 +965,155 @@ fn unexplained(tags: &std::collections::BTreeSet<String>, report: &Report) -> Ve
 }
 
 // ---------------------------------------------------------------------------------------------
+// Every failure of an accepted copy is explained (`TYPE_LEAK_PROP_ACCEPT`).
+// ---------------------------------------------------------------------------------------------
+
+/// A failure of the copy of an item accepted by `allow()` that the docs of `LeakerConfig::allow()`
+/// list ("What accepting does not make compile"): which one, what it is, and the shapes an item
+/// needs to have it (`tags`: the item needs one tag of each list).
+#[derive(Debug, PartialEq)]
+struct AcceptFamily {
+    /// The number of the shape in the docs: `(i)`, `(ii)` or `(iii)`.
+    class: &'static str,
+    name: &'static str,
+    tags: Vec<Vec<String>>,
+}
+
+fn accept_family(class: &'static str, name: &'static str, tags: &[&[&str]]) -> AcceptFamily {
+    AcceptFamily {
+        class,
+        name,
+        tags: tags
+            .iter()
+            .map(|any| any.iter().map(|tag| tag.to_string()).collect())
+            .collect(),
+    }
+}
+
+/// The failures that explain a diagnostic of the copy of an item accepted by `allow()`: the error
+/// code of rustc, and the errors that were allowed (their `Reason`, and the kind and the tokens of
+/// their cause). The generator has put the shapes on the item (`tags`).
+///
+/// - (i) `Self::A`, or `Self` as a type, in a predicate whose context has a bound that names a
+///   leaked type (`UnprovableBound`, the cause is the type): E0277. Only the cause is copied as
+///   written, and the bound stays leaked. The item has a predicate that names `Self`
+///   (`self_in_predicate`) and a bound that names a leaked type (`bound_cycle`).
+/// - (ii) The same cause with an alias bound (`T: Fn(<T as Iterator>::Item) -> u8` next to a bound
+///   that fixes the `Item`): E0277 too, but rustc cannot implement the trait with a generic impl at
+///   all, so nothing makes it compile. The item has the alias bound (`alias_bound`).
+/// - (iii) `Self` with `allow_self = false` (`RelativePath`, the cause is `Self`) in a function
+///   pointer whose elided output takes the lifetime of an input that a path hides:
+///   `Visitor::with_self()` replaces `Self` by a type with lifetimes inside the accepted part, and
+///   the elision fails (E0106). The item denies `Self` (`self_denied`) and has the function pointer
+///   (`hidden_self`).
+///
+/// Anything else is a defect, or a new limitation to list in the docs of `allow()` and here, with
+/// its shape.
+fn accept_families(code: &str, allowed: &[Rejection]) -> Vec<AcceptFamily> {
+    let cause = |reason: &str, matches: &dyn Fn(&str) -> bool| {
+        allowed.iter().any(|error| {
+            let tokens: String = error.tokens.replace(char::is_whitespace, "");
+            error.reason == reason && error.kind == "Type" && matches(&tokens)
+        })
+    };
+    let self_assoc = cause("UnprovableBound", &|t| t.starts_with("Self::"));
+    let self_type = cause("UnprovableBound", &|t| t == "Self");
+    let mut families = Vec::new();
+    match code {
+        "E0277" if self_assoc || self_type => {
+            if self_assoc {
+                families.push(accept_family(
+                    "(ii)",
+                    "`Self::A` in a predicate of a trait with an alias bound, which no impl can have",
+                    &[&[gen::TAG_ALIAS_BOUND]],
+                ));
+            }
+            families.push(accept_family(
+                "(i)",
+                "`Self::A` or `Self` in a predicate whose context has a bound that names a leaked type",
+                &[&[gen::TAG_SELF_IN_PREDICATE], &[gen::TAG_BOUND_CYCLE]],
+            ));
+        }
+        "E0106" if cause("RelativePath", &|t| t == "Self") => {
+            families.push(accept_family(
+                "(iii)",
+                "`Self` accepted in a function pointer whose elided output takes the lifetime of a hidden one, and `with_self()` replaces it",
+                &[&[gen::TAG_SELF_DENIED], &[gen::TAG_HIDDEN_SELF]],
+            ));
+        }
+        _ => (),
+    }
+    families
+}
+
+/// The errors that were allowed, on one line.
+fn describe_allowed(allowed: &[Rejection]) -> String {
+    allowed
+        .iter()
+        .map(|r| format!("{} ({}) [tokens: {}]", r.reason, r.kind, r.tokens))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// What is wrong with the way the failures of the copy of an item accepted by `allow()` are
+/// explained, one line each, or the class of the first failure if all are: `codes` are the error
+/// codes of the diagnostics of rustc for the item. A diagnostic that is not a failure the docs list
+/// ("NOT A KNOWN FAILURE"), or that the item has no shape for ("NO SHAPE THAT GIVES IT"), is a
+/// defect or a limitation to list.
+fn unexplained_accept(
+    tags: &std::collections::BTreeSet<String>,
+    codes: &[&str],
+    report: &Report,
+) -> Result<&'static str, Vec<String>> {
+    let mut problems = Vec::new();
+    let mut class = "";
+    for code in codes {
+        let families = accept_families(code, &report.rejections);
+        if families.is_empty() {
+            problems.push(format!(
+                "NOT A KNOWN FAILURE: {} on an item accepted by allow() for these errors: {}",
+                code,
+                describe_allowed(&report.rejections)
+            ));
+            continue;
+        }
+        let has_shape = |family: &AcceptFamily| {
+            family
+                .tags
+                .iter()
+                .all(|any| any.iter().any(|tag| tags.contains(tag)))
+        };
+        match families.iter().find(|family| has_shape(family)) {
+            Some(family) => class = if class.is_empty() { family.class } else { class },
+            None => problems.push(format!(
+                "NO SHAPE THAT GIVES IT: {} on an item accepted by allow() for these errors: {}; it is {}, and the item has none of the tags in {:?} (its tags are {:?})",
+                code,
+                describe_allowed(&report.rejections),
+                families
+                    .iter()
+                    .map(|family| format!("{} {}", family.class, family.name))
+                    .collect::<Vec<_>>()
+                    .join(" or "),
+                families.iter().map(|family| &family.tags).collect::<Vec<_>>(),
+                tags
+            )),
+        }
+    }
+    if problems.is_empty() {
+        Ok(class)
+    } else {
+        Err(problems)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The watchdog: a run that tested nothing must not pass.
 // ---------------------------------------------------------------------------------------------
 
 /// The packages of the generated cases.
 fn case_packages(cases: usize) -> HashSet<String> {
     (0..cases)
-        .flat_map(|i| [leaker_name(i), referrer_name(i)])
+        .flat_map(|i| [leaker_name(i), referrer_name(i), accept_name(i)])
         .collect()
 }
 
@@ -826,8 +1153,9 @@ fn build_problem(build: &Build, known: &HashSet<String>) -> Option<String> {
 }
 
 /// What the build left of the case `i` when none of its crates reported an error: the Leaker's
-/// executable and the Referrer's library. A missing one is reported, not counted as a rejection.
-fn missing_artifacts(build: &Build, i: usize, leaker_ok: bool) -> Vec<String> {
+/// executable and the Referrer's library (and, with `accept`, the library of the second Referrer's
+/// crate of `TYPE_LEAK_PROP_ACCEPT`). A missing one is reported, not counted as a rejection.
+fn missing_artifacts(build: &Build, i: usize, leaker_ok: bool, accept: bool) -> Vec<String> {
     let mut missing = Vec::new();
     if !build.executables.contains_key(&leaker_name(i)) {
         missing.push(format!(
@@ -839,6 +1167,12 @@ fn missing_artifacts(build: &Build, i: usize, leaker_ok: bool) -> Vec<String> {
         missing.push(format!(
             "`{}` was not built, and reported no error",
             referrer_name(i)
+        ));
+    }
+    if leaker_ok && accept && !build.artifacts.contains(&accept_name(i)) {
+        missing.push(format!(
+            "`{}` was not built, and reported no error",
+            accept_name(i)
         ));
     }
     missing
@@ -877,6 +1211,20 @@ struct Stats {
     families: BTreeMap<&'static str, usize>,
     /// The traits of `trait_self_defaults` (F39), by shape (`SELF_DEFAULT_SHAPES`).
     self_defaults: BTreeMap<&'static str, SelfDefaultCount>,
+    /// `TYPE_LEAK_PROP_ACCEPT`: the items rejected at the first analysis that the second one
+    /// accepted (`allow()` of the cause of every error), by kind, with what the macro wrote for
+    /// them, and the ones it rejected again. They are in `rejected` too: the floors are those of the
+    /// first analysis.
+    allowed: BTreeMap<&'static str, usize>,
+    allowed_entries: usize,
+    allowed_positions: usize,
+    allowed_checked: usize,
+    accept_failed: usize,
+    /// The items accepted by `allow()` whose copy does not compile for a failure that the docs of
+    /// `allow()` list (`accept_families()`), by its class (`(i)`, `(ii)`, `(iii)`).
+    documented: BTreeMap<&'static str, usize>,
+    /// The errors that were allowed, by `Reason` and the kind of the cause.
+    allowed_errors: BTreeMap<(String, String), usize>,
 }
 
 /// The shapes of `trait_self_defaults` that the statistics count, with what each is: a trait
@@ -966,6 +1314,19 @@ impl Stats {
                             .entry((kind, reason_head(&report.detail)))
                             .or_default() += 1;
                     }
+                    if report.allowed {
+                        *stats.allowed.entry(kind).or_default() += 1;
+                        stats.allowed_entries += report.entries;
+                        stats.allowed_positions += report.positions;
+                        stats.allowed_checked += report.checked;
+                        for error in &report.rejections {
+                            *stats
+                                .allowed_errors
+                                .entry((error.reason.clone(), error.kind.clone()))
+                                .or_default() += 1;
+                        }
+                    }
+                    stats.accept_failed += usize::from(report.accept_failed);
                 }
             }
         }
@@ -1246,6 +1607,47 @@ fn summarize(stats: &Stats, floors: &Floors, seed: u64, n: usize, features: Feat
     for (name, n) in &stats.families {
         writeln!(s, "  explained rejection errors: {:>4}x {}", n, name).unwrap();
     }
+    let allowed: usize = stats.allowed.values().sum();
+    if allowed + stats.accept_failed > 0 {
+        let by_kind: Vec<String> = stats
+            .allowed
+            .iter()
+            .map(|(kind, n)| format!("{} {}", n, kind))
+            .collect();
+        writeln!(
+            s,
+            "  accept mode (TYPE_LEAK_PROP_ACCEPT): {} items rejected at the first analysis were accepted by allow() of the causes of their errors ({}), {} still rejected (ACCEPT FAILED); entries: {}; type positions: {}, witnesses checked: {}",
+            allowed,
+            by_kind.join(", "),
+            stats.accept_failed,
+            stats.allowed_entries,
+            stats.allowed_positions,
+            stats.allowed_checked
+        )
+        .unwrap();
+        for ((reason, kind), n) in &stats.allowed_errors {
+            writeln!(
+                s,
+                "  allowed errors: {:>4}x {} (cause: {})",
+                n, reason, kind
+            )
+            .unwrap();
+        }
+        let documented: usize = stats.documented.values().sum();
+        let by_class: Vec<String> = stats
+            .documented
+            .iter()
+            .map(|(class, n)| format!("{} {}", n, class))
+            .collect();
+        writeln!(
+            s,
+            "  accepted copies that do not compile for a failure the docs of allow() list: {} of {} ({})",
+            documented,
+            allowed,
+            by_class.join(", ")
+        )
+        .unwrap();
+    }
     for kind in KINDS.iter().chain(SCOPES.iter().map(|(_, api)| api)) {
         for (reason, n) in stats.reasons_of(kind).iter().take(3) {
             writeln!(s, "  rejected {:>4}x {:<13} {}", n, kind, reason).unwrap();
@@ -1272,9 +1674,15 @@ fn random_items_leak_across_crates() {
 
     let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("prop");
     let target = base.join("target");
-    let ws = base.join(format!("ws-{}-{}", seed, cases));
+    let accept = accept_mode();
+    let ws = base.join(format!(
+        "ws-{}-{}{}",
+        seed,
+        cases,
+        if accept { "-accept" } else { "" }
+    ));
     let list: Vec<(usize, &Case)> = generated.iter().enumerate().collect();
-    write_workspace(&ws, &list, Mode::Real);
+    write_workspace(&ws, &list, if accept { Mode::Accept } else { Mode::Real });
     let build = cargo_build(&ws, &target);
 
     // The watchdog: the helper crate or cargo failing is not a finding, and not a rejection.
@@ -1300,43 +1708,59 @@ fn random_items_leak_across_crates() {
             leaker_failed.push(i);
             continue;
         }
-        let referrer_file = format!("{}/src/lib.rs", referrer_dir(i));
+        // The Referrer's crate, and, in the accept mode, the second one (it copies only the items
+        // that the Leaker accepted by `allow()`, and so every error in it is about one of them).
         let mut referrer_failed = false;
-        for diag in build.diags.iter().filter(|d| d.package == referrer) {
-            referrer_failed = true;
-            // The item whose macro invocation the error is in.
-            let line = diag
-                .lines
-                .iter()
-                .find(|(file, _)| *file == referrer_file)
-                .map(|(_, line)| *line as usize);
-            let item = line.and_then(|line| {
-                case.referrer_lines
+        for (package, dir, lines, class) in [
+            (
+                referrer.clone(),
+                referrer_dir(i),
+                &case.referrer_lines,
+                "the Referrer's crate does not compile",
+            ),
+            (
+                accept_name(i),
+                accept_dir(i),
+                &case.accept_lines,
+                ACCEPT_COPY,
+            ),
+        ] {
+            let file = format!("{}/src/lib.rs", dir);
+            for diag in build.diags.iter().filter(|d| d.package == package) {
+                referrer_failed = true;
+                // The item whose macro invocation the error is in.
+                let line = diag
+                    .lines
                     .iter()
-                    .find(|(l, _)| *l == line)
-                    .map(|(_, id)| *id)
-            });
-            // The same error is often reported several times.
-            if failures.iter().any(|f| {
-                f.case == i
-                    && f.item == item
-                    && f.text.lines().next() == diag.rendered.lines().next()
-            }) {
-                continue;
+                    .find(|(f, _)| *f == file)
+                    .map(|(_, line)| *line as usize);
+                let item =
+                    line.and_then(|line| lines.iter().find(|(l, _)| *l == line).map(|(_, id)| *id));
+                // The same error is often reported several times.
+                if failures.iter().any(|f| {
+                    f.case == i
+                        && f.item == item
+                        && f.class == class
+                        && f.text.lines().next() == diag.rendered.lines().next()
+                }) {
+                    continue;
+                }
+                failures.push(Failure {
+                    code: diag.code.clone(),
+                    case: i,
+                    item,
+                    class,
+                    text: diag.rendered.clone(),
+                });
             }
-            failures.push(Failure {
-                case: i,
-                item,
-                class: "the Referrer's crate does not compile",
-                text: diag.rendered.clone(),
-            });
         }
-        // Neither crate reported an error: both must have been built.
+        // Neither crate reported an error: all must have been built.
         if !referrer_failed {
-            let missing = missing_artifacts(&build, i, true);
+            let missing = missing_artifacts(&build, i, true, accept);
             if !missing.is_empty() {
                 unbuilt.push(i);
                 failures.push(Failure {
+                    code: String::new(),
                     case: i,
                     item: None,
                     class: "WATCHDOG: a crate of the case was not built, and no error says why",
@@ -1358,6 +1782,15 @@ fn random_items_leak_across_crates() {
                 seed, cases, problem
             );
         }
+        // In the accept mode, does it compile when no item is accepted by `allow()`? If it does,
+        // the output of an item that is accepted by it is what does not.
+        let ordinary = if accept {
+            let ordinary_ws = base.join(format!("ws-{}-{}-ordinary", seed, cases));
+            write_workspace(&ordinary_ws, &list, Mode::Real);
+            Some(cargo_build(&ordinary_ws, &target))
+        } else {
+            None
+        };
         for &i in &leaker_failed {
             let name = leaker_name(i);
             let own: Vec<&Diag> = identity
@@ -1365,9 +1798,16 @@ fn random_items_leak_across_crates() {
                 .iter()
                 .filter(|d| d.package == name)
                 .collect();
+            let by_accept = ordinary
+                .as_ref()
+                .map_or(false, |b| !b.diags.iter().any(|d| d.package == name));
             let (class, diags) = if own.is_empty() {
                 (
-                    "the Leaker's crate does not compile with the output of the macro",
+                    if by_accept {
+                        "ACCEPT: the Leaker's crate does not compile with the output of an item accepted by allow()"
+                    } else {
+                        "the Leaker's crate does not compile with the output of the macro"
+                    },
                     build
                         .diags
                         .iter()
@@ -1380,10 +1820,24 @@ fn random_items_leak_across_crates() {
                     own,
                 )
             };
+            // The item whose attribute the error is in, if the diagnostic says.
+            let file = format!("{}/src/lib.rs", leaker_dir(i));
+            let attributes = attr_lines(&generated[i]);
             for diag in diags {
+                let item = diag
+                    .lines
+                    .iter()
+                    .filter(|(f, _)| *f == file)
+                    .find_map(|(_, line)| {
+                        attributes
+                            .iter()
+                            .find(|(l, _)| *l == *line as usize)
+                            .map(|(_, id)| *id)
+                    });
                 failures.push(Failure {
+                    code: String::new(),
                     case: i,
-                    item: None,
+                    item,
                     class,
                     text: diag.rendered.clone(),
                 });
@@ -1404,6 +1858,7 @@ fn random_items_leak_across_crates() {
         let output = Command::new(exe).output().unwrap();
         if !output.status.success() {
             failures.push(Failure {
+                code: String::new(),
                 case: i,
                 item: None,
                 class: "WATCHDOG: the binary that prints the reports fails",
@@ -1414,17 +1869,36 @@ fn random_items_leak_across_crates() {
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             match parse_report(line) {
                 Some((id, report)) => {
-                    if report.accepted && report.detail.starts_with("rewrite-error") {
+                    if let Some(error) = &report.rewrite_error {
                         failures.push(Failure {
+                            code: String::new(),
                             case: i,
                             item: Some(id),
-                            class: "the rewrite of an accepted item fails",
-                            text: report.detail.clone(),
+                            class: if report.allowed {
+                                "ACCEPT: the rewrite of an item accepted by allow() fails"
+                            } else {
+                                "the rewrite of an accepted item fails"
+                            },
+                            text: error.clone(),
+                        });
+                    }
+                    if report.accept_failed {
+                        failures.push(Failure {
+                            code: String::new(),
+                            case: i,
+                            item: Some(id),
+                            class: "ACCEPT FAILED: the Leaker rejects the item again when the cause of every error is allowed",
+                            text: format!(
+                                "the errors of the first analysis:\n{}\nthe errors that remain:\n{}",
+                                describe(&report.rejections),
+                                describe(&report.remaining)
+                            ),
                         });
                     }
                     reports.insert((i, id), report);
                 }
                 None => failures.push(Failure {
+                    code: String::new(),
                     case: i,
                     item: None,
                     class: "WATCHDOG: a report line cannot be read",
@@ -1440,6 +1914,7 @@ fn random_items_leak_across_crates() {
             .collect();
         if !missing.is_empty() {
             failures.push(Failure {
+                code: String::new(),
                 case: i,
                 item: None,
                 class: "WATCHDOG: the macros of some items reported nothing",
@@ -1448,7 +1923,85 @@ fn random_items_leak_across_crates() {
         }
     }
 
-    if !build.success && failures.is_empty() {
+    // The diagnostics of the copy of an item accepted by `allow()` are failures that the docs of
+    // `LeakerConfig::allow()` list, or defects: each must be one of them, and the item must have the
+    // shape that gives it (`accept_families()`). The documented ones are counted and are no failure.
+    let mut documented: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let (copies, mut failures): (Vec<Failure>, Vec<Failure>) = failures
+        .into_iter()
+        .partition(|failure| failure.class == ACCEPT_COPY);
+    let mut by_item: BTreeMap<(usize, Option<usize>), Vec<Failure>> = BTreeMap::new();
+    for failure in copies {
+        by_item
+            .entry((failure.case, failure.item))
+            .or_default()
+            .push(failure);
+    }
+    for ((case, id), group) in by_item {
+        let report = id
+            .and_then(|id| reports.get(&(case, id)))
+            .filter(|report| report.allowed);
+        let item = id.and_then(|id| generated[case].items.iter().find(|item| item.id == id));
+        let verdict = match (report, item) {
+            (Some(report), Some(item)) => {
+                let mut tags = item.tags.clone();
+                if item.kind == "mod" || item.scope == "mod" {
+                    tags.insert(gen::TAG_MODULE_SCOPE.to_string());
+                }
+                let codes: Vec<&str> = group.iter().map(|f| f.code.as_str()).collect();
+                unexplained_accept(&tags, &codes, report)
+            }
+            _ => Err(vec![
+                "NOT A KNOWN FAILURE: the diagnostic names no item that was accepted by allow()"
+                    .to_string(),
+            ]),
+        };
+        match verdict {
+            Ok(class) => *documented.entry(class).or_default() += 1,
+            Err(problems) => {
+                for problem in problems {
+                    let class = if problem.starts_with("NO SHAPE") {
+                        "ACCEPT: NO SHAPE THAT GIVES IT: a failure of an accepted copy that the docs of allow() list, on an item that has not the shape"
+                    } else {
+                        "ACCEPT: NOT A KNOWN FAILURE: the copy of an item accepted by allow() does not compile for a reason that the docs of allow() do not list"
+                    };
+                    failures.push(Failure {
+                        case,
+                        item: id,
+                        class,
+                        code: String::new(),
+                        text: format!(
+                            "{}\n\n{}",
+                            problem,
+                            group
+                                .iter()
+                                .map(|f| f.text.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    // The failure of an item that was accepted by `allow()` says what was allowed.
+    for failure in &mut failures {
+        let report = failure
+            .item
+            .and_then(|id| reports.get(&(failure.case, id)))
+            .filter(|report| report.allowed);
+        if let Some(report) = report {
+            failure.text = format!(
+                "{}\n\nthe item was rejected with these errors, and accepted by allow() of their causes:\n{}",
+                failure.text,
+                describe(&report.rejections)
+            );
+        }
+    }
+
+    // The documented failures of the copies of accepted items make the build fail too.
+    if !build.success && failures.is_empty() && documented.is_empty() {
         panic!(
             "cargo failed, and no failure of a case says why (seed {}):\n{}",
             seed,
@@ -1472,6 +2025,7 @@ fn random_items_leak_across_crates() {
         }
         for problem in unexplained(&tags, report) {
             failures.push(Failure {
+                code: String::new(),
                 case: *i,
                 item: Some(*id),
                 class: "UNEXPLAINED REJECTION: type-leak rejects an item for a reason the generator does not explain",
@@ -1490,15 +2044,31 @@ fn random_items_leak_across_crates() {
                 .find(|item| item.id == *id)
                 .unwrap();
             eprintln!(
-                "REJECTED case {} item {} ({}, scope {:?}, prelude {}, tags {:?}):",
-                i, id, item.kind, item.scope, generated[*i].config.prelude, item.tags
+                "REJECTED{} case {} item {} ({}, scope {:?}, prelude {}, tags {:?}):",
+                if report.allowed {
+                    " (accepted by allow())"
+                } else if report.accept_failed {
+                    " (ACCEPT FAILED)"
+                } else {
+                    ""
+                },
+                i,
+                id,
+                item.kind,
+                item.scope,
+                generated[*i].config.prelude,
+                item.tags
             );
             for r in &report.rejections {
-                eprintln!("    {} || {} || {}", r.message, r.tokens, r.note);
+                eprintln!(
+                    "    {} || {} || {} || {} ({})",
+                    r.message, r.tokens, r.note, r.reason, r.kind
+                );
             }
         }
     }
-    let stats = Stats::collect(&generated, &reports);
+    let mut stats = Stats::collect(&generated, &reports);
+    stats.documented = documented;
     let summary = summarize(&stats, &floors, seed, cases, features);
     eprintln!("{}", summary);
     let floor_problems = floors.problems(&stats);
@@ -1594,6 +2164,7 @@ mod checks {
                 .iter()
                 .map(|p| Diag {
                     package: p.to_string(),
+                    code: String::new(),
                     rendered: "error: boom".into(),
                     lines: Vec::new(),
                 })
@@ -1646,11 +2217,15 @@ mod checks {
     #[test]
     fn a_case_with_nothing_built_is_reported() {
         let mut b = build(true, &[]);
-        assert_eq!(missing_artifacts(&b, 3, true).len(), 2);
+        assert_eq!(missing_artifacts(&b, 3, true, false).len(), 2);
         b.executables.insert(leaker_name(3), PathBuf::from("/x"));
-        assert_eq!(missing_artifacts(&b, 3, true).len(), 1);
+        assert_eq!(missing_artifacts(&b, 3, true, false).len(), 1);
         b.artifacts.insert(referrer_name(3));
-        assert!(missing_artifacts(&b, 3, true).is_empty());
+        assert!(missing_artifacts(&b, 3, true, false).is_empty());
+        // The second Referrer's crate of the accept mode is built too.
+        assert_eq!(missing_artifacts(&b, 3, true, true).len(), 1);
+        b.artifacts.insert(accept_name(3));
+        assert!(missing_artifacts(&b, 3, true, true).is_empty());
     }
 
     #[test]
@@ -1735,7 +2310,7 @@ mod checks {
         Rejection {
             message: message.to_string(),
             tokens: tokens.to_string(),
-            note: String::new(),
+            ..Default::default()
         }
     }
 
@@ -2034,6 +2609,246 @@ mod checks {
             ..Default::default()
         };
         assert!(unexplained(&tags(&[gen::TAG_SELF_BOUND_ADT, "bare:Clone"]), &bare).is_empty());
+    }
+
+    /// The reports of the accept mode: `acc` is not accepted at the first analysis, and has the
+    /// errors of the first analysis and what the macro wrote; `accfail` has the errors of the
+    /// second analysis too.
+    #[test]
+    fn the_reports_of_the_accept_mode_are_read_back() {
+        let first = "use absolute path: 'Rel'\u{1f}Rel\u{1f}a note\u{1f}RelativePath\u{1f}Type";
+        let line = format!(
+            "5|trait|acc|entries=3 positions=7 checked=2 skipped=1 twin=0\u{1e}{}",
+            first
+        );
+        let (id, report) = parse_report(&line).unwrap();
+        assert_eq!(id, 5);
+        assert!(!report.accepted && report.allowed && !report.accept_failed);
+        assert_eq!(
+            (report.entries, report.positions, report.checked),
+            (3, 7, 2)
+        );
+        assert_eq!(report.rejections.len(), 1);
+        assert_eq!(report.rejections[0].tokens, "Rel");
+        assert_eq!(report.rejections[0].reason, "RelativePath");
+        assert_eq!(report.rejections[0].kind, "Type");
+        assert!(report.remaining.is_empty() && report.rewrite_error.is_none());
+        // The reason of the rejection is the messages, as for a rejected item.
+        assert_eq!(report.detail, "use absolute path: 'Rel'");
+        // The rewrite of the copy failed.
+        let (_, report) =
+            parse_report("5|trait|acc|entries=3 positions=7 rewrite-error=no host\u{1e}").unwrap();
+        assert_eq!(
+            report.rewrite_error.as_deref(),
+            Some("rewrite-error=no host")
+        );
+        // The second analysis failed.
+        let line = format!(
+            "6|struct|accfail|use absolute path: 'Rel'\u{1e}{}\u{1c}`Self` has no meaning here\u{1f}Self\u{1f}\u{1f}SelfWithoutMeaning\u{1f}Type",
+            first
+        );
+        let (_, report) = parse_report(&line).unwrap();
+        assert!(!report.accepted && !report.allowed && report.accept_failed);
+        assert_eq!(report.rejections.len(), 1);
+        assert_eq!(report.remaining.len(), 1);
+        assert_eq!(report.remaining[0].reason, "SelfWithoutMeaning");
+        // A rejection, as before.
+        let (_, report) =
+            parse_report("7|mod|rej|x\u{1e}use absolute path: 'X'\u{1f}X\u{1f}").unwrap();
+        assert!(!report.accepted && !report.allowed && !report.accept_failed);
+        assert_eq!(report.rejections[0].reason, "");
+    }
+
+    /// The second Referrer's crate of the accept mode invokes each item once, in the module it is
+    /// in (the same place of the module tree as in the Leaker's crate), with the same imports.
+    #[test]
+    fn the_crate_of_the_accepted_items_mirrors_the_modules_of_the_items() {
+        let mut nested = 0;
+        for seed in 0..12 {
+            let case = generate(seed, 0, 6, Features::parse(""));
+            let text = &case.accept_referrer;
+            assert!(
+                text.contains("pub mod base { pub use ::tlp_l_000::base::*; }"),
+                "{}",
+                text
+            );
+            assert_eq!(case.accept_lines.len(), case.items.len());
+            for item in &case.items {
+                let call = format!("::__tl_prop_{}!(", item.id);
+                let lines: Vec<(usize, &str)> = text
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| line.contains(&call))
+                    .collect();
+                assert_eq!(lines.len(), 1, "{}", text);
+                let (at, line) = lines[0];
+                assert!(line.ends_with(", accept);"), "{}", line);
+                assert_eq!(line.contains(", strict"), item.strict, "{}", line);
+                assert!(case.accept_lines.contains(&(at + 1, item.id)));
+                // The path is the module, and the invocation is in that module: the modules above
+                // it are open (`pub mod`) and not closed again before it.
+                let path = format!(
+                    "::tlp_l_000{}",
+                    item.module
+                        .iter()
+                        .map(|m| format!("::{}", m))
+                        .collect::<String>()
+                );
+                assert!(line.contains(&format!("(path = {}", path)), "{}", line);
+                let mut open: Vec<&str> = Vec::new();
+                for before in text.lines().take(at) {
+                    if let Some(name) = before
+                        .strip_prefix("pub mod ")
+                        .and_then(|r| r.strip_suffix(" {"))
+                    {
+                        open.push(name);
+                    } else if before == "}" {
+                        open.pop();
+                    }
+                }
+                // A module analyzed as a whole declares itself at the root.
+                let expected: Vec<&str> = item.module.iter().map(String::as_str).collect();
+                assert_eq!(open, expected, "{}", line);
+                nested += usize::from(item.module.len() > 1);
+            }
+        }
+        assert!(nested > 0, "no item in a nested module in 12 cases");
+    }
+
+    fn allowed(reason: &str, tokens: &str) -> Rejection {
+        Rejection {
+            tokens: tokens.to_string(),
+            reason: reason.to_string(),
+            kind: "Type".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn allowed_report(errors: Vec<Rejection>) -> Report {
+        Report {
+            kind: "trait".into(),
+            allowed: true,
+            rejections: errors,
+            ..Default::default()
+        }
+    }
+
+    /// The failures of the copy of an item accepted by `allow()` are the ones that the docs of
+    /// `LeakerConfig::allow()` list, on an item that has the shape.
+    #[test]
+    fn a_failure_of_an_accepted_copy_needs_a_documented_class_and_a_shape() {
+        let unprovable_assoc = allowed_report(vec![allowed("UnprovableBound", "Self :: A0")]);
+        let unprovable_self = allowed_report(vec![allowed("UnprovableBound", "Self")]);
+        let denied_self = allowed_report(vec![allowed("RelativePath", "Self")]);
+        let classify = |tags_of: &[&str], codes: &[&str], report: &Report| {
+            unexplained_accept(&tags(tags_of), codes, report)
+        };
+        // (i): a predicate that names `Self`, and a bound that names a leaked type.
+        assert_eq!(
+            classify(
+                &["bound_cycle", "self_in_predicate"],
+                &["E0277"],
+                &unprovable_assoc
+            ),
+            Ok("(i)")
+        );
+        assert_eq!(
+            classify(
+                &["bound_cycle", "self_in_predicate"],
+                &["E0277"],
+                &unprovable_self
+            ),
+            Ok("(i)")
+        );
+        // The shape is missing: the item has no such predicate, or no such bound.
+        for missing in [&["bound_cycle"][..], &["self_in_predicate"][..]] {
+            let problems = classify(missing, &["E0277"], &unprovable_self).unwrap_err();
+            assert!(
+                problems[0].starts_with("NO SHAPE THAT GIVES IT"),
+                "{:?}",
+                problems
+            );
+        }
+        // (ii): the alias bound explains `Self::A`, but not `Self`.
+        assert_eq!(
+            classify(&["alias_bound"], &["E0277", "E0277"], &unprovable_assoc),
+            Ok("(ii)")
+        );
+        assert!(classify(&["alias_bound"], &["E0277"], &unprovable_self).is_err());
+        // (iii): `Self` denied, in a function pointer that hides a lifetime.
+        assert_eq!(
+            classify(&["self_denied", "hidden_self"], &["E0106"], &denied_self),
+            Ok("(iii)")
+        );
+        assert!(
+            classify(&["self_denied"], &["E0106"], &denied_self).unwrap_err()[0]
+                .starts_with("NO SHAPE THAT GIVES IT")
+        );
+        // Anything else is not a known failure: the lifetime that E0195 was about, another code, an
+        // error that was not allowed, every diagnostic of the item counts.
+        let all = &[
+            "bound_cycle",
+            "self_in_predicate",
+            "alias_bound",
+            "self_denied",
+            "hidden_self",
+        ];
+        let unconstrained = allowed_report(vec![allowed("UnconstrainedLifetime", "Wrap < 'b >")]);
+        for (codes, report) in [
+            (&["E0195"][..], &unconstrained),
+            (&["E0308"][..], &unprovable_assoc),
+            (&["E0277"][..], &denied_self),
+            (&["E0277"][..], &allowed_report(Vec::new())),
+            (&["E0277", "E0425"][..], &unprovable_assoc),
+        ] {
+            let problems = classify(all, codes, report).unwrap_err();
+            assert!(
+                problems
+                    .iter()
+                    .all(|p| p.starts_with("NOT A KNOWN FAILURE")),
+                "{:?}",
+                problems
+            );
+        }
+    }
+
+    #[test]
+    fn a_predicate_that_names_self_is_found_in_a_where_clause() {
+        let found = gen::names_self_in_where;
+        assert!(found("fn m<X>() where X: Into<Self::A> { loop {} }"));
+        assert!(found("fn m<X>(&self) where X: Fn(&Self) -> u8;"));
+        // An array type in the clause has a `;` in it, and the predicate after it counts.
+        assert!(found(
+            "fn m<U>() where U: From<([u16; 1], u8)>, U: Fn(&Self) -> u8, B<U>: Default { loop {} }"
+        ));
+        // The predicates on `Self` itself do not, nor does a `Self` outside a where clause.
+        assert!(!found("fn m(&self) where Self: Sized, Self: 'x;"));
+        assert!(!found(
+            "fn m(&self, x: Wrap<Self>) -> Self::A where X: Clone;"
+        ));
+        assert!(!found(
+            "struct S<T>(T) where T: Clone; impl S<u8> { fn m(&self) -> Self { loop {} } }"
+        ));
+    }
+
+    #[test]
+    fn the_shapes_of_the_failures_of_accepted_copies_are_generated() {
+        let mut found = std::collections::BTreeSet::new();
+        for seed in 0..40 {
+            let case = generate(seed, 0, 6, Features::parse(""));
+            for item in &case.items {
+                for tag in [
+                    gen::TAG_SELF_IN_PREDICATE,
+                    gen::TAG_ALIAS_BOUND,
+                    gen::TAG_HIDDEN_SELF,
+                ] {
+                    if item.tags.contains(tag) {
+                        found.insert(tag);
+                    }
+                }
+            }
+        }
+        assert_eq!(found.len(), 3, "{:?}", found);
     }
 
     #[test]
