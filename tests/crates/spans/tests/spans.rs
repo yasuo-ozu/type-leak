@@ -44,8 +44,11 @@ fn spans_parsed_from_a_string_have_a_location() {
 fn the_span_of_a_relative_path_is_the_path() {
     let source = "trait Tr {\n    fn f(&self, a: MyType<'_>, b: Vec<&'_ u8>);\n}";
     let item: ItemTrait = parse_str(source).unwrap();
-    let items = Leaker::new().intern_trait(&item, true).unwrap_err();
-    assert_eq!(items.len(), 2, "{}", messages(&items));
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let items = result.errors();
+    assert_eq!(items.len(), 2, "{}", messages(items));
     // The error is at the whole type, in the order of the source.
     assert_eq!(items[0].message, "use absolute path: 'MyType < '_ >'");
     assert_span_at(items[0].span(), source, "MyType<'_>", 0);
@@ -84,8 +87,11 @@ fn the_span_of_a_relative_path_is_the_path() {
 fn the_span_of_a_relative_trait_is_the_bound() {
     let source = "trait Tr: Clone {\n    fn f<T: ToString>(&self, t: T);\n}";
     let item: ItemTrait = parse_str(source).unwrap();
-    let items = Leaker::new().intern_trait(&item, true).unwrap_err();
-    assert_eq!(items.len(), 2, "{}", messages(&items));
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let items = result.errors();
+    assert_eq!(items.len(), 2, "{}", messages(items));
     assert_span_at(items[0].span(), source, "Clone", 0);
     assert_span_at(items[0].help.as_ref().unwrap().0.span(), source, "Clone", 0);
     assert_span_at(items[1].span(), source, "ToString", 0);
@@ -102,13 +108,14 @@ fn the_span_of_a_relative_trait_is_the_bound() {
 fn the_span_of_self_without_meaning_is_each_mention() {
     let source = "struct S<T: ::p::Tr<Self>, U: ::p::Tr<Self::X>>(T, U) where Self: 'static;";
     let item: ItemStruct = parse_str(source).unwrap();
-    let items = Leaker::new()
-        .enter_generics(&item.generics, |_| ())
-        .unwrap_err();
+    let mut leaker = Leaker::new();
+    leaker.enter_generics(&item.generics, |_| ());
+    let result = leaker.result();
+    let items = result.errors();
     assert!(items
         .iter()
         .all(|item| item.reason == Reason::SelfWithoutMeaning));
-    assert_eq!(items.len(), 3, "{}", messages(&items));
+    assert_eq!(items.len(), 3, "{}", messages(items));
     let expected = [("Self", 0), ("Self::X", 0), ("Self", 2)];
     for (item, (needle, nth)) in items.iter().zip(expected) {
         assert_eq!(item.message, "`Self` has no meaning here");
@@ -121,9 +128,10 @@ fn the_span_of_self_without_meaning_is_each_mention() {
     // In a type that the View visits, in a module.
     let source = "Wrap<Self>";
     let ty: Type = parse_str(source).unwrap();
-    let items = Leaker::new()
-        .enter_mod("m", [], |view| view.visit_type(&ty))
-        .unwrap_err();
+    let mut leaker = Leaker::new();
+    leaker.enter_mod("m", [], |view| view.visit_type(&ty));
+    let result = leaker.result();
+    let items = result.errors();
     assert_span_at(items[0].span(), source, "Self", 0);
 }
 
@@ -132,10 +140,13 @@ fn the_span_of_self_without_meaning_is_each_mention() {
 fn the_syn_error_has_the_span_of_each_item() {
     let source = "trait Tr {\n    fn f(&self, a: MyType<'_>, b: Vec<&'_ u8>);\n}";
     let item: ItemTrait = parse_str(source).unwrap();
-    let items = Leaker::new().intern_trait(&item, true).unwrap_err();
-    let errors: Vec<syn::Error> = to_syn_error(&items).into_iter().collect();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let items = result.errors();
+    let errors: Vec<syn::Error> = to_syn_error(items).into_iter().collect();
     assert_eq!(errors.len(), 2);
-    for (error, item) in errors.iter().zip(&items) {
+    for (error, item) in errors.iter().zip(items) {
         let (start, end) = (error.span().start(), error.span().end());
         assert_eq!((start, end), (item.span().start(), item.span().end()));
     }
@@ -150,11 +161,12 @@ fn the_span_of_a_conflict_of_a_type_in_a_bound_is_the_type() {
     let item: ItemTrait = parse_str(source).unwrap();
     let mut config = LeakerConfig::new();
     config.allow_primitive().allow_std_prelude();
-    let items = Leaker::from_config(config)
-        .intern_trait(&item, true)
-        .unwrap_err();
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let items = result.errors();
     assert_eq!(
-        messages(&items),
+        messages(items),
         "`Wrap < T >` is in a bound or where predicate, and a bound of its generics names a leaked \
          type"
     );
@@ -197,13 +209,16 @@ fn a_serialized_error_keeps_its_spans() {
     let source =
         "trait Tr: Clone {\n    fn f(&self, a: MyType<'_>, b: Box<dyn RelA + RelB<'_>>);\n}";
     let item: ItemTrait = parse_str(source).unwrap();
-    let items = Leaker::new().intern_trait(&item, true).unwrap_err();
-    assert_eq!(items.len(), 3, "{}", messages(&items));
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let items = result.errors();
+    assert_eq!(items.len(), 3, "{}", messages(items));
     let tokens: proc_macro2::TokenStream =
         items.iter().map(|item| item.to_token_stream()).collect();
     let parsed = parse_items(tokens);
     assert_eq!(parsed.len(), items.len());
-    for (parsed, item) in parsed.iter().zip(&items) {
+    for (parsed, item) in parsed.iter().zip(items) {
         assert_eq!(parsed.message, item.message);
         assert_eq!(parsed.reason, item.reason);
         assert_eq!(
@@ -227,7 +242,7 @@ fn a_serialized_error_keeps_its_spans() {
     assert_span_at(parsed[2].span(), source, "Box<dyn RelA + RelB<'_>>", 0);
     assert_span_at(parsed[2].help.as_ref().unwrap().0.span(), source, "Box", 0);
     assert_span_at(parsed[2].notes[1].0.span(), source, "RelA", 0);
-    let direct: Vec<_> = to_syn_error(&items).into_iter().collect();
+    let direct: Vec<_> = to_syn_error(items).into_iter().collect();
     let again: Vec<_> = to_syn_error(&parsed).into_iter().collect();
     assert_eq!(direct.len(), again.len());
     for (direct, again) in direct.iter().zip(&again) {
@@ -240,33 +255,41 @@ fn a_serialized_error_keeps_its_spans() {
 }
 
 /// A cause is the same whatever its spans: the one that is written elsewhere (other lines and
-/// columns) accepts the conflict (`LeakerConfig::allow()`), and a config with it is equal to one
-/// with the cause of the error, and hashes the same.
+/// columns) drops the error (`LeakerResult::allow()`), is equal to the cause of the error, and
+/// hashes the same.
 #[test]
 fn an_accepted_cause_is_the_same_whatever_its_spans() {
     use std::hash::{Hash, Hasher};
     let source = "impl ::p::S {\n    fn f(_: ::p::W<'_, dyn RelTr>) {}\n}";
     let item: ItemImpl = parse_str(source).unwrap();
-    let errors = Leaker::new().intern_impl(&item, true).unwrap_err();
-    assert_eq!(errors.len(), 1, "{}", messages(&errors));
+    let mut leaker = Leaker::new();
+    leaker.intern_impl(&item, true);
+    let result = leaker.result();
+    let errors = result.errors();
+    assert_eq!(errors.len(), 1, "{}", messages(errors));
     assert_span_at(errors[0].span(), source, "RelTr", 0);
     let elsewhere: Path = parse_str("\n\n      RelTr").unwrap();
     assert_ne!(
         places(&elsewhere.to_token_stream()),
         places(&errors[0].cause.to_token_stream())
     );
-    let mut config = LeakerConfig::new();
-    config.allow(Cause::Trait(elsewhere));
-    Leaker::from_config(config.clone())
-        .intern_impl(&item, true)
-        .unwrap();
-    let mut made = LeakerConfig::new();
-    made.allow(errors[0].cause.clone());
-    assert_eq!(config, made);
-    let hash = |config: &LeakerConfig| {
+    let cause = Cause::Trait(elsewhere);
+    assert_eq!(cause, errors[0].cause);
+    let hash = |cause: &Cause| {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        config.hash(&mut hasher);
+        cause.hash(&mut hasher);
         hasher.finish()
     };
-    assert_eq!(hash(&config), hash(&made));
+    assert_eq!(hash(&cause), hash(&errors[0].cause));
+    let mut allowed = result.clone();
+    assert!(allowed.allow(cause).errors().is_empty());
+    // Another cause drops nothing.
+    let mut other = result.clone();
+    assert_eq!(
+        other
+            .allow(Cause::Trait(parse_quote!(Other)))
+            .errors()
+            .len(),
+        1
+    );
 }

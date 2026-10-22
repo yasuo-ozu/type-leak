@@ -244,7 +244,7 @@ fn same<T>(_: &T, _: &T) {}
 
 /// What a `#[prop_leak]` macro reported: `<id>|<kind>|ok|entries=E positions=P checked=C`, or
 /// `<id>|<kind>|rej|<message>`. A `#[prop_leak_accept]` macro reports `acc` for an item that the
-/// Leaker rejected and accepted with `LeakerConfig::allow()` of the causes of its errors.
+/// Leaker rejected and accepted with `LeakerResult::allow()` of the causes of its errors.
 #[derive(Debug, PartialEq)]
 enum Reported {
     Ok {
@@ -1537,7 +1537,7 @@ fn a_trait_with_an_unsized_implementor() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Conflicts accepted with `LeakerConfig::allow()` (`#[prop_leak_accept]`).
+// Conflicts accepted with `LeakerResult::allow()` (`#[prop_leak_accept]`).
 // ---------------------------------------------------------------------------------------------
 
 /// The Leaker rejects an item whose part cannot be leaked, and accepts it when the cause of the

@@ -3,15 +3,18 @@
 //! is what `enter_generics()` does, plus what the item declares (`Self`, and whether it may be
 //! interned, or the module). The expected values below were taken from the scopes before they were
 //! composed that way, so they pin what has not changed: the ids (the same contexts, and no other
-//! one), the entries, the rollback of the call as one unit, the panics and what `Self` and
-//! `allow_self` mean.
+//! one), the entries, the panics and what `Self` and `allow_self` mean. A scope that finds errors
+//! keeps its corrected result, and its errors are recorded once, in place, in the list of the
+//! outermost call (`Leaker::result()`).
 
 mod common;
 
 use common::visit_function;
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{ContextId, ErrorItem, Leaker, Reason, Referrer, SelfRequirement, View};
+use type_leak::{
+    Cause, ContextId, ErrorItem, Leaker, LeakerResult, Reason, Referrer, SelfRequirement, View,
+};
 
 fn s(x: &impl ToTokens) -> String {
     quote!(#x).to_string()
@@ -68,23 +71,6 @@ fn caught(f: impl FnOnce()) {
     assert!(result.is_err());
 }
 
-/// What a closure returned, as a string (the outcome of a nested call, if it is one).
-trait Show {
-    fn show(&self) -> String;
-}
-
-impl Show for () {
-    fn show(&self) -> String {
-        String::new()
-    }
-}
-
-impl Show for String {
-    fn show(&self) -> String {
-        format!(" [{}]", self)
-    }
-}
-
 /// The messages of `errors`, one on each line.
 fn messages(errors: &[ErrorItem]) -> String {
     errors
@@ -94,25 +80,24 @@ fn messages(errors: &[ErrorItem]) -> String {
         .join("\n")
 }
 
-/// What a call returned, as a string.
-fn outcome<R: Show>(result: std::result::Result<(ContextId, R), Vec<ErrorItem>>) -> String {
-    match result {
-        Ok((_, inner)) => format!("ok{}", inner.show()),
-        Err(err)
-            if !err.is_empty()
-                && err
-                    .iter()
-                    .all(|item| item.reason == Reason::SelfWithoutMeaning) =>
-        {
-            format!(
-                "Self without meaning: {}",
-                err.iter()
-                    .map(|item| item.cause.to_token_stream().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }
-        Err(err) => messages(&err).replace('\n', " / "),
+/// The errors of a call, as a string: `ok` if there are none.
+fn outcome(errors: &[ErrorItem]) -> String {
+    if errors.is_empty() {
+        "ok".to_string()
+    } else if errors
+        .iter()
+        .all(|item| item.reason == Reason::SelfWithoutMeaning)
+    {
+        format!(
+            "Self without meaning: {}",
+            errors
+                .iter()
+                .map(|item| item.cause.to_token_stream().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    } else {
+        messages(errors).replace('\n', " / ")
     }
 }
 
@@ -180,9 +165,9 @@ fn root_item(kind: &str) -> String {
         view.visit_where_clause(&parse_quote!(where T: ::p::Tr2<Rel5>));
         7
     };
-    let (id, value) = enter!(leaker, kind, &generics, true, body).unwrap();
+    let (id, value) = enter!(leaker, kind, &generics, true, body);
     assert_eq!(value, 7);
-    dump(&leaker.finish(), &[("top", id)])
+    dump(&leaker.result().finish().unwrap(), &[("top", id)])
 }
 
 #[test]
@@ -238,79 +223,58 @@ fn nested_ids() -> String {
     let mut leaker = Leaker::new();
     let s_ident = ident("S");
     let mut ids = Vec::new();
-    let (top, ()) = leaker
-        .enter_generics(&parse_quote!(<X>), |view| {
-            let generics: Generics = parse_quote!(<U>);
-            let (a, ()) = view
-                .enter_type(&s_ident, &generics, true, |view| {
-                    view.visit_type(&parse_quote!(Rel<Self, U>))
-                })
-                .unwrap();
-            // The same generics, but another `Self`, which an entry names: another context. (`d`
-            // below has no entry that names `Self`, so its context is that of the generics.)
-            let (b, ()) = view
-                .enter_type(&ident("E"), &generics, true, |view| {
-                    view.visit_type(&parse_quote!(Rel<Self, U>))
-                })
-                .unwrap();
-            let (c, ()) = view
-                .enter_type(&ident("Un"), &parse_quote!(<'a>), false, |view| {
-                    view.visit_type(&parse_quote!(Rel2<&'a ()>))
-                })
-                .unwrap();
-            let (m, inner) = view
-                .enter_mod("m", [ident("S")], |view| {
-                    view.visit_type(&parse_quote!(S<Rel3>));
-                    view.enter_type(&ident("S2"), &parse_quote!(<V>), true, |view| {
-                        view.visit_type(&parse_quote!(Rel4<Self, V>))
-                    })
-                    .unwrap()
-                    .0
-                })
-                .unwrap();
-            let (m2, ()) = view
-                .enter_mod("m2", [], |view| view.visit_type(&parse_quote!(Rel3)))
-                .unwrap();
-            // After the modules, the same generics are still the same context.
-            let (d, ()) = view.enter_type(&s_ident, &generics, true, |_| ()).unwrap();
-            let (e, ()) = view
-                .enter_impl(&generics, &parse_quote!(::p::Wrap<U>), true, |view| {
-                    view.visit_type(&parse_quote!(Rel6<Self, U>))
-                })
-                .unwrap();
-            let (f, ()) = view
-                .enter_trait(&ident("Tr"), &generics, false, |view| {
-                    view.visit_type(&parse_quote!(Rel7<U>));
-                    // A trait inside a module inside a trait.
-                    view.enter_mod("m4", [], |view| {
-                        view.enter_trait(&ident("Tr2"), &parse_quote!(<W>), true, |view| {
-                            view.visit_type(&parse_quote!(Rel8<Self, W>))
-                        })
-                        .unwrap();
-                    })
-                    .unwrap();
-                })
-                .unwrap();
-            // A module has no generics of its own: the ones around stay in scope.
-            let (m3, ()) = view
-                .enter_mod("m3", [], |view| view.visit_type(&parse_quote!(Rel5<X>)))
-                .unwrap();
-            ids.extend([
-                ("a", a),
-                ("b", b),
-                ("c", c),
-                ("m", m),
-                ("inner", inner),
-                ("m2", m2),
-                ("d", d),
-                ("e", e),
-                ("f", f),
-                ("m3", m3),
-            ]);
-        })
-        .unwrap();
+    let (top, ()) = leaker.enter_generics(&parse_quote!(<X>), |view| {
+        let generics: Generics = parse_quote!(<U>);
+        let (a, ()) = view.enter_type(&s_ident, &generics, true, |view| {
+            view.visit_type(&parse_quote!(Rel<Self, U>))
+        });
+        // The same generics, but another `Self`, which an entry names: another context. (`d`
+        // below has no entry that names `Self`, so its context is that of the generics.)
+        let (b, ()) = view.enter_type(&ident("E"), &generics, true, |view| {
+            view.visit_type(&parse_quote!(Rel<Self, U>))
+        });
+        let (c, ()) = view.enter_type(&ident("Un"), &parse_quote!(<'a>), false, |view| {
+            view.visit_type(&parse_quote!(Rel2<&'a ()>))
+        });
+        let (m, inner) = view.enter_mod("m", [ident("S")], |view| {
+            view.visit_type(&parse_quote!(S<Rel3>));
+            view.enter_type(&ident("S2"), &parse_quote!(<V>), true, |view| {
+                view.visit_type(&parse_quote!(Rel4<Self, V>))
+            })
+            .0
+        });
+        let (m2, ()) = view.enter_mod("m2", [], |view| view.visit_type(&parse_quote!(Rel3)));
+        // After the modules, the same generics are still the same context.
+        let (d, ()) = view.enter_type(&s_ident, &generics, true, |_| ());
+        let (e, ()) = view.enter_impl(&generics, &parse_quote!(::p::Wrap<U>), true, |view| {
+            view.visit_type(&parse_quote!(Rel6<Self, U>))
+        });
+        let (f, ()) = view.enter_trait(&ident("Tr"), &generics, false, |view| {
+            view.visit_type(&parse_quote!(Rel7<U>));
+            // A trait inside a module inside a trait.
+            view.enter_mod("m4", [], |view| {
+                view.enter_trait(&ident("Tr2"), &parse_quote!(<W>), true, |view| {
+                    view.visit_type(&parse_quote!(Rel8<Self, W>))
+                });
+            });
+        });
+        // A module has no generics of its own: the ones around stay in scope.
+        let (m3, ()) = view.enter_mod("m3", [], |view| view.visit_type(&parse_quote!(Rel5<X>)));
+        ids.extend([
+            ("a", a),
+            ("b", b),
+            ("c", c),
+            ("m", m),
+            ("inner", inner),
+            ("m2", m2),
+            ("d", d),
+            ("e", e),
+            ("f", f),
+            ("m3", m3),
+        ]);
+    });
     ids.push(("top", top));
-    dump(&leaker.finish(), &ids)
+    dump(&leaker.result().finish().unwrap(), &ids)
 }
 
 const NESTED_IDS: &str = r#"
@@ -358,74 +322,107 @@ fn nested_scopes_of_items_and_modules_take_the_same_ids() {
     pin("nested_ids", &nested_ids(), NESTED_IDS);
 }
 
-// ── a scope which fails is rolled back as one unit ───────────────────────────────────────────
+// ── a scope which fails keeps its corrected result ───────────────────────────────────────────
 
 /// The generics of a scope whose default is not internable (an error found when the scope is left).
 fn bad_generics() -> Generics {
     parse_quote!(<A, B = Bad<'_, A>>)
 }
 
+/// Accepts the causes of the errors of the scope which fails in `failing()`.
+fn accept_failing(result: &mut LeakerResult) {
+    result
+        .allow(Cause::Type(parse_quote!(Bad1<'_>)))
+        .allow(Cause::Type(parse_quote!(Bad<'_, A>)))
+        // A module declares no `Self`.
+        .allow(Cause::Type(parse_quote!(Self)));
+}
+
 /// Enters a module with a scope around which succeeds, one which does not if `fail` (`kind` is the
-/// scope), and one which succeeds. Returns the errors of the one which fails, and what is left.
-fn failing(kind: &str, fail: bool) -> (String, String) {
+/// scope), and one which succeeds. Returns the result, and the ids `outer`, `first` and `last`.
+fn failing(kind: &str, fail: bool) -> (LeakerResult, [(&'static str, ContextId); 3]) {
     let mut leaker = Leaker::new();
-    let mut failure = String::new();
-    let (outer, (first, last)) = leaker
-        .enter_mod("outer", [], |view| {
-            view.visit_type(&parse_quote!(Rel));
-            let (first, ()) = view
-                .enter_type(&ident("F"), &parse_quote!(<A>), true, |view| {
-                    view.visit_type(&parse_quote!(RelA<Self, A>));
-                })
-                .unwrap();
-            if fail {
-                // A module, which takes an id, a scope which succeeds, a type which does not, and
-                // the generics, whose default does not either (a module has no generics: only the
-                // type fails it).
-                let body = |view: &mut View| {
-                    view.visit_type(&parse_quote!(RelU<Self, A>));
-                    view.enter_mod("lost", [], |view| view.visit_type(&parse_quote!(RelM)))
-                        .unwrap();
-                    view.enter_type(&ident("Lost"), &parse_quote!(<W>), true, |_| ())
-                        .unwrap();
-                    view.visit_type(&parse_quote!(Bad1<'_>));
-                };
-                let result = enter!(view, kind, &bad_generics(), true, body);
-                failure = messages(&result.unwrap_err());
-            }
-            let (last, ()) = view
-                .enter_type(&ident("L"), &parse_quote!(<C>), true, |view| {
-                    view.visit_type(&parse_quote!(RelC<Self, C>));
-                    view.enter_mod("kept", [], |view| view.visit_type(&parse_quote!(RelK)))
-                        .unwrap();
-                })
-                .unwrap();
-            (first, last)
-        })
-        .unwrap();
-    let dumped = dump(
-        &leaker.finish(),
-        &[("outer", outer), ("first", first), ("last", last)],
-    );
-    (failure, dumped)
+    let (outer, (first, last)) = leaker.enter_mod("outer", [], |view| {
+        view.visit_type(&parse_quote!(Rel));
+        let (first, ()) = view.enter_type(&ident("F"), &parse_quote!(<A>), true, |view| {
+            view.visit_type(&parse_quote!(RelA<Self, A>));
+        });
+        if fail {
+            // A module, which takes an id, a scope which succeeds, a type which does not, and
+            // the generics, whose default does not either (a module has no generics: only the
+            // type fails it).
+            let body = |view: &mut View| {
+                view.visit_type(&parse_quote!(RelU<Self, A>));
+                view.enter_mod("lost", [], |view| view.visit_type(&parse_quote!(RelM)));
+                view.enter_type(&ident("Lost"), &parse_quote!(<W>), true, |_| ());
+                view.visit_type(&parse_quote!(Bad1<'_>));
+            };
+            enter!(view, kind, &bad_generics(), true, body);
+        }
+        let (last, ()) = view.enter_type(&ident("L"), &parse_quote!(<C>), true, |view| {
+            view.visit_type(&parse_quote!(RelC<Self, C>));
+            view.enter_mod("kept", [], |view| view.visit_type(&parse_quote!(RelK)));
+        });
+        (first, last)
+    });
+    (
+        leaker.result(),
+        [("outer", outer), ("first", first), ("last", last)],
+    )
 }
 
 #[test]
-fn a_failing_scope_of_an_item_or_a_module_is_rolled_back_whole() {
-    let (_, ok) = failing("struct", false);
+fn a_failing_scope_of_an_item_or_a_module_keeps_its_corrected_result() {
+    let (result, ids) = failing("struct", false);
+    assert!(result.errors().is_empty());
+    let ok = dump(&result.finish().unwrap(), &ids);
     pin("failing ok", &ok, FAILING_OK);
     let mut errors = Vec::new();
+    let mut kept = String::new();
     for kind in KINDS {
-        let (failure, left) = failing(kind, true);
-        // What is left is what there is without the scope which failed, with the ids it took (the
-        // module, the contexts of the types and of the generics) not taken.
-        assert_eq!(left, ok, "{}", kind);
-        errors.push(failure);
+        let (result, ids) = failing(kind, true);
+        let left = dump(&result.clone().into_referrer(), &ids);
+        if kind == "struct" {
+            kept = left.clone();
+        }
+        // The scope keeps what it recorded, and the ids it took (the module, the contexts of the
+        // types and of the generics). It is more than there is without the scope. Accepting the
+        // causes of its errors afterwards drops them and changes nothing else.
+        let mut accepted = result.clone();
+        accept_failing(&mut accepted);
+        assert!(accepted.errors().is_empty(), "{}", kind);
+        assert_eq!(dump(&accepted.into_referrer(), &ids), left, "{}", kind);
+        assert_ne!(left, ok, "{}", kind);
+        errors.push(messages(result.errors()));
     }
     // The errors are returned once: the type, and the default of the generics (a module has no
     // generics).
     pin("failing errors", &errors.join("\n--\n"), FAILING_ERRORS);
+    pin("failing kept", &kept, FAILING_KEPT);
 }
+
+const FAILING_KEPT: &str = r#"
+id outer = 0
+id first = 1
+id last = 6
+context 0:  ; - ; in module - is module Some("outer") None
+context 1: < A > ; Self = F < A > ; in module 0
+context 2:  ; - ; in module - is module Some("lost") None
+context 3: < W > ; - ; in module 0
+context 4: < A , B > ; Self = S < A , B > ; in module 0
+context 5:  ; - ; in module - is module Some("kept") None
+context 6: < C > ; Self = L < C > ; in module 0
+context 7:  ; - ; in module 0
+context 8:  ; - ; in module 2
+context 9: < A > ; - ; in module 0
+context 10:  ; - ; in module 5
+entry 0: RelA < Self , A > in 1
+entry 1: RelU < Self , A > in 4
+entry 2: RelC < Self , C > in 6
+entry 3: Rel in 7
+entry 4: RelM in 8
+entry 5: RelK in 10
+"#;
 
 const FAILING_OK: &str = r#"
 id outer = 0
@@ -458,53 +455,59 @@ use absolute path: 'Bad < '_ , A >'
 use absolute path: 'Bad1 < '_ >'
 use absolute path: 'Bad < '_ , A >'
 --
+`Self` has no meaning here
 use absolute path: 'Bad1 < '_ >'
 "#;
 
-/// A failing outermost scope leaves no trace: the ids and the Referrer are those of the Leaker
-/// without it.
+/// A failing outermost scope keeps its corrected result: the ids and the Referrer are the same
+/// whatever is accepted afterwards. The errors of the calls are in one list, in the order of the
+/// calls.
 #[test]
-fn a_failing_outermost_scope_leaves_no_trace() {
-    let reference = {
-        let mut leaker = Leaker::new();
-        leaker.enter_mod("kept", [], |_| ()).unwrap();
-        leaker.finish().to_token_stream().to_string()
-    };
+fn a_failing_outermost_scope_keeps_its_corrected_result() {
     let mut leaker = Leaker::new();
-    let mut errors = Vec::new();
+    let mut ids = Vec::new();
     for kind in KINDS {
         let body = |view: &mut View| {
-            view.visit_type(&parse_quote!(RelLost<Self, A>));
-            view.enter_mod("lost", [], |view| view.visit_type(&parse_quote!(RelM)))
-                .unwrap();
+            view.visit_type(&parse_quote!(RelKept<Self, A>));
+            view.enter_mod("inner", [], |view| view.visit_type(&parse_quote!(RelM)));
             view.visit_type(&parse_quote!(Bad1<'_>));
         };
-        let result = enter!(leaker, kind, &bad_generics(), true, body);
-        errors.push(messages(&result.unwrap_err()));
+        ids.push(enter!(leaker, kind, &bad_generics(), true, body).0.index());
     }
-    // The module which is entered after them is the first one.
-    let (module, ()) = leaker.enter_mod("kept", [], |_| ()).unwrap();
-    assert_eq!(module.index(), 0);
-    assert_eq!(leaker.finish().to_token_stream().to_string(), reference);
-    pin("outermost errors", &errors.join("\n--\n"), OUTERMOST_ERRORS);
+    // The module which is entered after them is the one after theirs.
+    let (module, ()) = leaker.enter_mod("later", [], |_| ());
+    let result = leaker.result();
+    let tokens = result.clone().into_referrer().to_token_stream().to_string();
+    // Accepting the causes drops the errors only.
+    let mut accepted = result.clone();
+    accept_failing(&mut accepted);
+    assert!(accepted.errors().is_empty());
+    assert_eq!(
+        accepted.into_referrer().to_token_stream().to_string(),
+        tokens
+    );
+    // The ids and the module are those of the corrected results, whatever is accepted afterwards.
+    assert_eq!(ids, [1, 1, 1, 10, 13, 15]);
+    assert_eq!(module.index(), 19);
+    pin(
+        "outermost errors",
+        &messages(result.errors()),
+        OUTERMOST_ERRORS,
+    );
 }
 
 const OUTERMOST_ERRORS: &str = r#"
 use absolute path: 'Bad1 < '_ >'
 use absolute path: 'Bad < '_ , A >'
---
 use absolute path: 'Bad1 < '_ >'
 use absolute path: 'Bad < '_ , A >'
---
 use absolute path: 'Bad1 < '_ >'
 use absolute path: 'Bad < '_ , A >'
---
 use absolute path: 'Bad1 < '_ >'
 use absolute path: 'Bad < '_ , A >'
---
 use absolute path: 'Bad1 < '_ >'
 use absolute path: 'Bad < '_ , A >'
---
+`Self` has no meaning here
 use absolute path: 'Bad1 < '_ >'
 "#;
 
@@ -514,25 +517,37 @@ use absolute path: 'Bad1 < '_ >'
 fn a_panic_in_an_outermost_scope_leaves_no_trace() {
     let reference = {
         let mut leaker = Leaker::new();
-        leaker.enter_mod("kept", [], |_| ()).unwrap();
-        leaker.finish().to_token_stream().to_string()
+        leaker.enter_mod("kept", [], |_| ());
+        leaker
+            .result()
+            .finish()
+            .unwrap()
+            .to_token_stream()
+            .to_string()
     };
     let mut leaker = Leaker::new();
     for kind in KINDS {
         caught(|| {
             let body = |view: &mut View| {
                 view.visit_type(&parse_quote!(RelLost<Self, T>));
-                view.enter_mod("lost", [], |_| ()).unwrap();
-                view.enter_type(&ident("Lost"), &parse_quote!(<W>), true, |_| ())
-                    .unwrap();
+                view.enter_mod("lost", [], |_| ());
+                view.enter_type(&ident("Lost"), &parse_quote!(<W>), true, |_| ());
                 panic!("a closure panics");
             };
             let _ = enter!(leaker, kind, &parse_quote!(<T>), true, body);
         });
     }
-    let (module, ()) = leaker.enter_mod("kept", [], |_| ()).unwrap();
+    let (module, ()) = leaker.enter_mod("kept", [], |_| ());
     assert_eq!(module.index(), 0);
-    assert_eq!(leaker.finish().to_token_stream().to_string(), reference);
+    assert_eq!(
+        leaker
+            .result()
+            .finish()
+            .unwrap()
+            .to_token_stream()
+            .to_string(),
+        reference
+    );
 }
 
 /// A scope of kind `kind` which panics (if `panic`) in a scope of the kind `outer` (which is not
@@ -545,8 +560,7 @@ fn panicking(outer: &str, kind: &str, panic: bool, mention_self: bool) -> String
             caught(|| {
                 let body = |view: &mut View| {
                     view.visit_type(&parse_quote!(RelU<Self, U>));
-                    view.enter_mod("lost", [parse_quote!(Lost)], |_| ())
-                        .unwrap();
+                    view.enter_mod("lost", [parse_quote!(Lost)], |_| ());
                     view.visit_type(&parse_quote!(Bad<'_>));
                     panic!("a closure panics");
                 };
@@ -560,15 +574,22 @@ fn panicking(outer: &str, kind: &str, panic: bool, mention_self: bool) -> String
             view.visit_type(&parse_quote!(Wrap2<Self>));
         }
         view.enter_mod("kept", [], |view| view.visit_type(&parse_quote!(RelK)))
-            .unwrap()
             .0
     };
-    match enter!(leaker, outer, &parse_quote!(<T>), false, body) {
-        Ok((top, module)) => {
-            let referrer = leaker.finish();
-            dump(&referrer, &[("top", top), ("module", module)])
-        }
-        Err(err) => outcome(Err::<(ContextId, ()), _>(err)),
+    let (top, module) = enter!(leaker, outer, &parse_quote!(<T>), false, body);
+    let result = leaker.result();
+    let errors = result.errors().to_vec();
+    let dumped = dump(&result.into_referrer(), &[("top", top), ("module", module)]);
+    if errors.is_empty() {
+        dumped
+    } else {
+        // The scope keeps the corrected result. Its context is the one of the scope around, which
+        // is not the same for every kind: the entries are.
+        let entries: Vec<&str> = dumped
+            .lines()
+            .filter(|line| line.starts_with("entry "))
+            .collect();
+        format!("{}\n--\n{}", messages(&errors), entries.join("\n"))
     }
 }
 
@@ -622,6 +643,10 @@ entry 2: RelK in 3
 "#;
 const PANICKING_SELF: &str = r#"
 use absolute path: 'Wrap2 < Self >'
+--
+entry 0: Rel < T > in 1
+entry 1: Wrap < U , Lost > in 2
+entry 2: RelK in 4
 "#;
 
 // ── the generics are declared once ───────────────────────────────────────────────────────────
@@ -647,62 +672,64 @@ fn a_scope_of_an_item_or_a_module_adds_no_scope_of_its_own() {
     let b: Generics = parse_quote!(<'b>);
     let none = Generics::default();
     let mut lines = Vec::new();
-    let mut check = |name: String, run: &dyn Fn(&mut Leaker) -> String| {
+    let mut check = |name: String, run: &dyn Fn(&mut Leaker)| {
         let mut leaker = Leaker::new();
-        let result = run(&mut leaker);
-        let count = leaker.finish().iter().count();
-        lines.push(format!("{}: {} ({})", name, result, count));
+        run(&mut leaker);
+        let result = leaker.result();
+        let outcome = outcome(result.errors());
+        let count = result.into_referrer().iter().count();
+        lines.push(format!("{}: {} ({})", name, outcome, count));
     };
     for kind in ["struct", "impl", "trait"] {
         check(format!("{} of the generics", kind), &|l| {
-            outcome(enter!(l, kind, &b, true, |v| as_item(v, &sig)))
+            enter!(l, kind, &b, true, |v| as_item(v, &sig));
         });
         check(format!("{} of others", kind), &|l| {
-            outcome(enter!(l, kind, &none, true, |v| nested(v, &sig)))
+            enter!(l, kind, &none, true, |v| nested(v, &sig));
         });
         check(format!("{}, mod", kind), &|l| {
-            outcome(enter!(l, kind, &b, true, |v| {
-                v.enter_mod("m", [], |v| as_item(v, &sig)).unwrap();
-            }))
+            enter!(l, kind, &b, true, |v| {
+                v.enter_mod("m", [], |v| as_item(v, &sig));
+            });
         });
         check(format!("generics, {} of the generics", kind), &|l| {
-            outcome(l.enter_generics(&b, |v| {
-                outcome(enter!(v, kind, &b, true, |v| nested(v, &sig)))
-            }))
+            l.enter_generics(&b, |v| {
+                enter!(v, kind, &b, true, |v| nested(v, &sig));
+            });
         });
         check(format!("mod, {} of the generics", kind), &|l| {
-            outcome(l.enter_mod("m", [], |v| {
-                outcome(enter!(v, kind, &b, true, |v| nested(v, &sig)))
-            }))
+            l.enter_mod("m", [], |v| {
+                enter!(v, kind, &b, true, |v| nested(v, &sig));
+            });
         });
         check(format!("{}, {}, mod", kind, kind), &|l| {
-            outcome(enter!(l, kind, &b, true, |v| {
-                outcome(enter!(v, kind, &b, true, |v| {
-                    outcome(v.enter_mod("m", [], |v| nested(v, &sig)))
-                }))
-            }))
+            enter!(l, kind, &b, true, |v| {
+                enter!(v, kind, &b, true, |v| {
+                    v.enter_mod("m", [], |v| nested(v, &sig));
+                });
+            });
         });
     }
     check("mod".to_string(), &|l| {
-        outcome(l.enter_mod("m", [], |v| nested(v, &sig)))
+        l.enter_mod("m", [], |v| nested(v, &sig));
     });
     check("mod, no generics".to_string(), &|l| {
-        outcome(l.enter_mod("m", [], |v| as_item(v, &plain)))
+        l.enter_mod("m", [], |v| as_item(v, &plain));
     });
     check("generics, mod".to_string(), &|l| {
-        outcome(l.enter_generics(&b, |v| {
-            v.enter_mod("m", [], |v| as_item(v, &sig)).unwrap();
-        }))
+        l.enter_generics(&b, |v| {
+            v.enter_mod("m", [], |v| as_item(v, &sig));
+        });
     });
     check("mod, mod, no generics".to_string(), &|l| {
-        outcome(l.enter_mod("m", [], |v| {
-            v.enter_mod("n", [], |v| as_item(v, &plain)).unwrap();
-        }))
+        l.enter_mod("m", [], |v| {
+            v.enter_mod("n", [], |v| as_item(v, &plain));
+        });
     });
     check("mod, generics".to_string(), &|l| {
-        outcome(l.enter_mod("m", [], |v| {
-            outcome(v.enter_generics(&b, |v| nested(v, &sig)))
-        }))
+        l.enter_mod("m", [], |v| {
+            v.enter_generics(&b, |v| nested(v, &sig));
+        });
     });
     pin("signatures", &lines.join("\n"), SIGNATURES);
 }
@@ -711,26 +738,26 @@ const SIGNATURES: &str = r#"
 struct of the generics: ok (1)
 struct of others: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
 struct, mod: ok (1)
-generics, struct of the generics: ok [`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)] (0)
-mod, struct of the generics: ok [`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)] (0)
-struct, struct, mod: ok [ok [`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)]] (0)
+generics, struct of the generics: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
+mod, struct of the generics: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
+struct, struct, mod: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
 impl of the generics: ok (1)
 impl of others: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
 impl, mod: ok (1)
-generics, impl of the generics: ok [`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)] (0)
-mod, impl of the generics: ok [`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)] (0)
-impl, impl, mod: ok [ok [`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)]] (0)
+generics, impl of the generics: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
+mod, impl of the generics: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
+impl, impl, mod: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
 trait of the generics: ok (1)
 trait of others: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
 trait, mod: ok (1)
-generics, trait of the generics: ok [`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)] (0)
-mod, trait of the generics: ok [`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)] (0)
-trait, trait, mod: ok [ok [`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)]] (0)
+generics, trait of the generics: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
+mod, trait of the generics: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
+trait, trait, mod: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
 mod: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
 mod, no generics: ok (2)
 generics, mod: ok (1)
 mod, mod, no generics: ok (2)
-mod, generics: ok [`RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)] (0)
+mod, generics: `RelTr` leaves the lifetime `'b` of the method unconstrained in the copy (E0195) (0)
 "#;
 
 // ── `Self` ───────────────────────────────────────────────────────────────────────────────────
@@ -738,11 +765,13 @@ mod, generics: ok [`RelTr` leaves the lifetime `'b` of the method unconstrained 
 #[test]
 fn self_in_the_generics_of_a_scope() {
     let mut lines = Vec::new();
-    let mut check = |name: String, run: &dyn Fn(&mut Leaker) -> String| {
+    let mut check = |name: String, run: &dyn Fn(&mut Leaker)| {
         let mut leaker = Leaker::new();
-        let result = run(&mut leaker);
-        let count = leaker.finish().iter().count();
-        lines.push(format!("{}: {} ({})", name, result, count));
+        run(&mut leaker);
+        let result = leaker.result();
+        let outcome = outcome(result.errors());
+        let count = result.into_referrer().iter().count();
+        lines.push(format!("{}: {} ({})", name, outcome, count));
     };
     let none = Generics::default();
     let mut bound: Generics = parse_quote!(<'a, T: ::p::Tr<Self>>);
@@ -750,91 +779,93 @@ fn self_in_the_generics_of_a_scope() {
     let default: Generics = parse_quote!(<T = Rel<Self>>);
     // It is not where nothing declares it.
     check("generics bound".to_string(), &|l| {
-        outcome(l.enter_generics(&bound, |_| ()))
+        l.enter_generics(&bound, |_| ());
     });
     check("generics default".to_string(), &|l| {
-        outcome(l.enter_generics(&default, |_| ()))
+        l.enter_generics(&default, |_| ());
     });
     check("mod".to_string(), &|l| {
-        outcome(l.enter_mod("m", [], |v| v.visit_type(&parse_quote!(Rel<Self>))))
+        l.enter_mod("m", [], |v| v.visit_type(&parse_quote!(Rel<Self>)));
     });
     check("mod, generics".to_string(), &|l| {
-        outcome(l.enter_mod("m", [], |v| outcome(v.enter_generics(&bound, |_| ()))))
+        l.enter_mod("m", [], |v| {
+            v.enter_generics(&bound, |_| ());
+        });
     });
     for kind in ["struct", "impl", "trait"] {
         // `Self` is declared by the item: it may be in its generics.
         check(format!("{} bound", kind), &|l| {
-            outcome(enter!(l, kind, &bound, true, |_| ()))
+            enter!(l, kind, &bound, true, |_| ());
         });
         check(format!("{} bound, not allowed", kind), &|l| {
-            outcome(enter!(l, kind, &bound, false, |_| ()))
+            enter!(l, kind, &bound, false, |_| ());
         });
         check(format!("{} default", kind), &|l| {
-            outcome(enter!(l, kind, &default, true, |_| ()))
+            enter!(l, kind, &default, true, |_| ());
         });
         check(format!("mod, {}", kind), &|l| {
-            outcome(l.enter_mod("m", [], |v| {
-                outcome(enter!(v, kind, &bound, true, |v| {
+            l.enter_mod("m", [], |v| {
+                enter!(v, kind, &bound, true, |v| {
                     v.visit_type(&parse_quote!(Rel<Self>))
-                }))
-            }))
+                });
+            });
         });
         // In a scope nested in one which declares it, it is what it is there.
         check(format!("{}, generics", kind), &|l| {
-            outcome(enter!(l, kind, &none, true, |v| {
-                outcome(v.enter_generics(&bound, |v| v.visit_type(&parse_quote!(Rel<Self>))))
-            }))
+            enter!(l, kind, &none, true, |v| {
+                v.enter_generics(&bound, |v| v.visit_type(&parse_quote!(Rel<Self>)));
+            });
         });
         check(format!("{}, mod, generics", kind), &|l| {
-            outcome(enter!(l, kind, &none, true, |v| {
-                outcome(v.enter_mod("m", [], |v| outcome(v.enter_generics(&bound, |_| ()))))
-            }))
+            enter!(l, kind, &none, true, |v| {
+                v.enter_mod("m", [], |v| {
+                    v.enter_generics(&bound, |_| ());
+                });
+            });
         });
         // What the scope around says of `allow_self` is restored, and a module or an item sets its
         // own.
         check(format!("{} not allowed", kind), &|l| {
-            outcome(enter!(l, kind, &none, false, |v| {
+            enter!(l, kind, &none, false, |v| {
                 v.visit_type(&parse_quote!(Rel<Self>))
-            }))
+            });
         });
         check(format!("{} not allowed, {} allowed", kind, kind), &|l| {
-            outcome(enter!(l, kind, &none, false, |v| {
+            enter!(l, kind, &none, false, |v| {
                 enter!(v, kind, &none, true, |v| {
                     v.visit_type(&parse_quote!(Rel<Self>))
-                })
-                .unwrap();
-                outcome(enter!(v, kind, &none, false, |v| {
+                });
+                enter!(v, kind, &none, false, |v| {
                     v.visit_type(&parse_quote!(Rel2<Self>))
-                }))
-            }))
+                });
+            });
         });
         check(format!("{} not allowed, then", kind), &|l| {
-            outcome(enter!(l, kind, &none, false, |v| {
-                enter!(v, kind, &none, true, |_| ()).unwrap();
-                v.enter_mod("m", [], |_| ()).unwrap();
+            enter!(l, kind, &none, false, |v| {
+                enter!(v, kind, &none, true, |_| ());
+                v.enter_mod("m", [], |_| ());
                 v.visit_type(&parse_quote!(Rel<Self>))
-            }))
+            });
         });
         check(format!("{} not allowed, mod, item", kind), &|l| {
-            outcome(enter!(l, kind, &none, false, |v| {
+            enter!(l, kind, &none, false, |v| {
                 v.enter_mod("m", [], |v| {
                     v.visit_item(&parse_quote!(
                         struct S {
                             a: Rel<Self>,
                         }
                     ));
-                })
-                .unwrap();
-            }))
+                });
+            });
         });
         check(format!("{} not allowed, item", kind), &|l| {
-            outcome(enter!(l, kind, &none, false, |v| {
+            enter!(l, kind, &none, false, |v| {
                 v.visit_item(&parse_quote!(
                     struct S {
                         a: Rel<Self>,
                     }
                 ));
-            }))
+            });
         });
     }
     pin("self", &lines.join("\n"), SELF);
@@ -844,37 +875,37 @@ const SELF: &str = r#"
 generics bound: Self without meaning: Self, Self (0)
 generics default: Self without meaning: Self (0)
 mod: Self without meaning: Self (0)
-mod, generics: ok [Self without meaning: Self, Self] (0)
+mod, generics: Self without meaning: Self, Self (0)
 struct bound: ok (0)
 struct bound, not allowed: ok (0)
 struct default: `Rel < Self >` is in the default of a parameter, and names `Self` (0)
-mod, struct: ok [ok] (1)
-struct, generics: ok [ok] (1)
-struct, mod, generics: ok [ok [Self without meaning: Self, Self]] (0)
+mod, struct: ok (1)
+struct, generics: ok (1)
+struct, mod, generics: Self without meaning: Self, Self (0)
 struct not allowed: use absolute path: 'Rel < Self >' (0)
-struct not allowed, struct allowed: ok [use absolute path: 'Rel2 < Self >'] (1)
+struct not allowed, struct allowed: use absolute path: 'Rel2 < Self >' (1)
 struct not allowed, then: use absolute path: 'Rel < Self >' (0)
 struct not allowed, mod, item: ok (1)
 struct not allowed, item: ok (1)
 impl bound: ok (0)
 impl bound, not allowed: ok (0)
 impl default: `Rel < Self >` is in the default of a parameter, and names `Self` (0)
-mod, impl: ok [ok] (1)
-impl, generics: ok [ok] (1)
-impl, mod, generics: ok [ok [Self without meaning: Self, Self]] (0)
+mod, impl: ok (1)
+impl, generics: ok (1)
+impl, mod, generics: Self without meaning: Self, Self (0)
 impl not allowed: use absolute path: 'Rel < Self >' (0)
-impl not allowed, impl allowed: ok [use absolute path: 'Rel2 < Self >'] (1)
+impl not allowed, impl allowed: use absolute path: 'Rel2 < Self >' (1)
 impl not allowed, then: use absolute path: 'Rel < Self >' (0)
 impl not allowed, mod, item: ok (1)
 impl not allowed, item: ok (1)
 trait bound: ok (0)
 trait bound, not allowed: ok (0)
 trait default: `Rel < Self >` is in the default of a parameter, and names `Self` (0)
-mod, trait: ok [ok] (1)
-trait, generics: ok [ok] (1)
-trait, mod, generics: ok [ok [Self without meaning: Self, Self]] (0)
+mod, trait: ok (1)
+trait, generics: ok (1)
+trait, mod, generics: Self without meaning: Self, Self (0)
 trait not allowed: use absolute path: 'Rel < Self >' (0)
-trait not allowed, trait allowed: ok [use absolute path: 'Rel2 < Self >'] (1)
+trait not allowed, trait allowed: use absolute path: 'Rel2 < Self >' (1)
 trait not allowed, then: use absolute path: 'Rel < Self >' (0)
 trait not allowed, mod, item: ok (1)
 trait not allowed, item: ok (1)

@@ -16,9 +16,8 @@ use template_quote::quote;
 /// that forbid it.
 ///
 /// The causes are, for example, a relative path (`must`) and an elided lifetime (`impossible`).
-/// Each is the [`Cause`] of the syntax that it is: a path in a type or a trait is a `Type` or a
-/// `Trait`, a path in an expression an `Expr`, a lifetime a `Lifetime`. The first of `must` is the
-/// cause of the [`ErrorItem`] that reports the conflict.
+/// Each is a [`Cause`] of the kind of syntax it is. The first of `must` is the cause of the
+/// [`ErrorItem`] that reports the conflict.
 ///
 /// - Both empty: copy the type as it is.
 /// - Only `must`: leak the type, or only its parts unless `is_own` (`MyType`,
@@ -29,13 +28,12 @@ use template_quote::quote;
 /// `Self` where it has no meaning (in a module, or in generics that no struct, enum, union, impl or
 /// trait encloses) is an `impossible` cause, with the mention of `Self` as written, a `note` and a
 /// `help`.
-/// A scope fails on it, so it can be neither leaked nor copied. See
-/// [`Leaker::enter_generics()`](crate::Leaker::enter_generics).
+/// A scope reports it as an error ([`Reason::SelfWithoutMeaning`]) and copies the type that names
+/// it as written, so it is no entry.
 ///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
-/// # use template_quote::ToTokens;
 /// let mut leaker = Leaker::new();
 /// let (_, results) = leaker
 ///     .enter_generics(&Generics::default(), |view| {
@@ -45,8 +43,7 @@ use template_quote::quote;
 ///             view.check(&parse_quote!(impl ::path::Trait)), // cannot be leaked
 ///             view.check(&parse_quote!(Rel<'_>)),        // must be leaked, and cannot be
 ///         ]
-///     })
-///     .unwrap();
+///     });
 /// // Nothing depends on the context in `Option<u8>` of the standard library: copy it as it is.
 /// assert!(results[0].must.is_empty() && results[0].impossible.is_empty());
 /// // Leak `Rel`: `is_own` says that it is the path of the type itself.
@@ -54,11 +51,9 @@ use template_quote::quote;
 /// assert!(results[1].is_own);
 /// // `impl Trait` can be neither leaked nor needs to be.
 /// assert!(results[2].must.is_empty() && !results[2].impossible.is_empty());
-/// // `Rel<'_>` is a conflict: the macro reports it (the errors of the Leaker do). Its path is
-/// // the cause that depends on the context, and the lifetime the one that cannot be leaked.
+/// // `Rel<'_>` is a conflict: its path depends on the context, and its lifetime cannot be leaked.
 /// assert!(!results[3].must.is_empty() && !results[3].impossible.is_empty());
 /// assert!(matches!(&results[3].must[0], Cause::Type(_)));
-/// assert_eq!(results[3].must[0].to_token_stream().to_string(), "Rel < '_ >");
 /// assert!(matches!(&results[3].impossible[0], Cause::Lifetime(_)));
 /// ```
 #[derive(Clone, Debug)]
@@ -91,10 +86,9 @@ pub struct CheckResult {
     /// `<Self as ::path::Tr>::A`"). If it is `None`, the [`ErrorItem`] suggests the absolute path
     /// of the first of `must`. See [`ErrorItem::help`](crate::ErrorItem::help).
     pub help: Option<String>,
-    /// The headline of the error, if the fault is not that the path of the type is relative.
-    /// The [`ErrorItem`] shows it as its message. If it is `None`, the message is `use absolute
-    /// path: '..'`: the fault is the path, and `note` says why it cannot be leaked as a whole
-    /// (`MyType<'_>`, E0106).
+    /// The headline of the error, if the fault is not that the path of the type is relative. It is
+    /// the message of the [`ErrorItem`]; if it is `None`, the message is `use absolute path: '..'`
+    /// and `note` says why the path cannot be leaked as a whole (`MyType<'_>`, E0106).
     ///
     /// It is set when the fault is something else than a path:
     ///
@@ -110,51 +104,51 @@ pub struct CheckResult {
     ///   [`LeakerConfig::check_values()`](crate::LeakerConfig::check_values) ("cannot analyze .. in
     ///   the body of ..").
     pub headline: Option<String>,
-    /// The cause of the [`ErrorItem`] if it is not the first of `must`: the default of a parameter
-    /// that names `Self` is reported whole, with the note at the `Self` in it (the first of
-    /// `must`). `None` for any other result.
+    /// The cause of the [`ErrorItem`] if it is not the first of `must` (the default of a parameter
+    /// that names `Self` is reported whole, with the note at the `Self` in it).
     pub(crate) cause: Option<Cause>,
-    /// Why it is a conflict: the [`Reason`] that goes with `headline` (`RelativePath` if there is
-    /// none).
+    /// The [`Reason`] that goes with `headline` (`RelativePath` if there is none).
     pub(crate) reason: Reason,
-    /// The part that the conflict leaves as written, if the Referrer has to know it (see
-    /// [`Part`]).
+    /// The part that the conflict leaves as written, if the Referrer has to know it.
     pub(crate) part: Option<Part>,
+    /// The number of mentions of `Self` without meaning found when this conflict was recorded, to
+    /// report them among the conflicts in the order found ([`scope_error()`]).
+    pub(crate) seen: usize,
 }
 
-/// A part of the item that the Leaker copies as written, whole, which the Referrer must leave so:
-/// the type of an accepted conflict or of a silent correction, a bound whose trait path conflicts,
-/// a path of a value that conflicts. It becomes an
-/// [`Allowed::Part`](crate::Allowed::Part) when the effect that holds it is applied.
+/// A part of the item that the Leaker copies as written, whole, which the Referrer must leave so.
+/// It becomes a [`PartItem`] when its effect is applied.
 #[derive(Clone, Debug)]
 pub(crate) struct Part {
-    /// The part: a [`Cause::Type`], or the cause of the bound ([`Cause::Trait`], or
-    /// [`Cause::Unreadable`] for a bound with a binder) or the path of a value ([`Cause::Expr`]).
+    /// The part: a [`Cause::Type`], the cause of a bound, or the path of a value.
     pub(crate) cause: Cause,
     /// The context that an entry of it would have.
     pub(crate) context: Context,
-    /// It is in a bound or where predicate of the item (`AnalyzeVisitor::env_depth > 0`).
+    /// In a bound or where predicate of the item (`AnalyzeVisitor::env_depth > 0`).
     pub(crate) in_predicate: bool,
-    /// The innermost type around it that owns the cause of the conflict (the type that holds the
-    /// `'_`, the elided `&` or the `impl Trait`), with its context: the Referrer leaves the part
-    /// as written only inside it. `None` if there is none (see [`anchor_parts()`]).
+    /// The innermost type around it that owns the cause of the conflict, with its context
+    /// ([`anchor_parts()`]); the part is left as written only inside it.
     pub(crate) within: Option<(Type, Context)>,
 }
 
-/// A part as the Leaker keeps it once its contexts are interned: an
-/// [`Allowed::Part`](crate::Allowed::Part).
-#[derive(Clone, Debug, PartialEq)]
+/// A part that the Referrer leaves as written, with its contexts interned. Serialized as `KIND (
+/// CAUSE ) CONTEXT [predicate] [in ( TYPE ) CONTEXT]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PartItem {
+    /// A [`Cause::Type`], the cause of a bound, or the path of a value.
     pub(crate) part: Cause,
+    /// The context that an entry of it would have.
     pub(crate) context: ContextId,
+    /// In a bound or where predicate of the item.
     pub(crate) in_predicate: bool,
+    /// The type that owns the cause of the conflict, with its context: the part is left as written
+    /// only inside it.
     pub(crate) within: Option<(Type, ContextId)>,
 }
 
 pub(crate) struct PendingType {
     pub(crate) ty: Type,
-    /// The address of the type in the syntax visited, which `ty` is a copy of: what ties the type to
-    /// a record that is made by address (`SignatureWalk::leaked`).
+    /// The address of the type in the visited syntax, which `ty` is a copy of.
     pub(crate) origin: usize,
     pub(crate) is_must_intern: bool,
     /// A candidate for the graph of the required entries: it or a part is a cause.
@@ -170,10 +164,10 @@ pub(crate) struct PendingType {
     /// `no_optional_entry` for the optional entries.
     pub(crate) no_entry: bool,
     pub(crate) no_optional_entry: bool,
-    /// The type names a `Self` that has no meaning here, or a bound of its context does (see
-    /// [`correct_unmeant_self()`]).
+    /// The type names a `Self` without meaning, or a bound of its context does
+    /// ([`correct_unmeant_self()`]).
     pub(crate) unmeant_self: bool,
-    /// The type is in a bound or where predicate of the item (`AnalyzeVisitor::env_depth > 0`).
+    /// The type is in a bound or where predicate of the item.
     pub(crate) in_predicate: bool,
     pub(crate) components: Vec<Effect>,
 }
@@ -209,9 +203,8 @@ impl PendingType {
 }
 
 impl CheckResult {
-    /// The correction of a part that is copied as written, whole, for a fault that another error
-    /// tells (a `Self` without meaning, a lifetime that the copy leaves unconstrained). It has no
-    /// cause that depends on the context, so `report()` gives no error for it.
+    /// The correction of a part copied as written, whole, for a fault that another error tells. It
+    /// has no cause that depends on the context, so `report()` gives no error for it.
     pub(crate) fn corrected() -> Self {
         Self {
             must: Vec::new(),
@@ -224,6 +217,7 @@ impl CheckResult {
             cause: None,
             reason: Reason::RelativePath,
             part: None,
+            seen: 0,
         }
     }
 }
@@ -240,7 +234,7 @@ pub(crate) struct Analysis {
     /// In the contexts of `Leaker::optional_contexts`.
     pub(crate) optional: TypeGraph,
     pub(crate) primitives: Vec<Ident>,
-    /// The parts that the Referrer leaves as written, in order and distinct (see [`Part`]).
+    /// The parts that the Referrer leaves as written, in order and distinct.
     pub(crate) parts: Vec<PartItem>,
 }
 
@@ -314,76 +308,53 @@ impl Analysis {
     }
 }
 
-/// Returns the errors of a scope: the conflicts among `effects` and `conflicts`, or else the
-/// mentions of `Self` without meaning. A conflict whose cause is among `allowed` is accepted
-/// ([`LeakerConfig::allow()`](crate::LeakerConfig::allow)): it is no error, and its correction (the
-/// `Effect::Error`, which stands for the whole type) stays. If no error is left, the scope is not
-/// rolled back.
+/// Returns the errors of an analysis in the order found: the conflicts among `effects`, then the
+/// cycles in `conflicts`, with the mentions of `Self` without meaning placed by
+/// [`CheckResult::seen`].
 pub(crate) fn scope_error(
     effects: &[Effect],
     self_errors: &[Cause],
     conflicts: &[CheckResult],
-    allowed: &[Cause],
-) -> Option<Vec<ErrorItem>> {
+) -> Vec<ErrorItem> {
     let mut errors = Vec::new();
     collect_errors(effects, &mut errors);
     errors.extend(conflicts.iter().cloned());
+    // The mentions, with the number of the mentions before each.
+    let mut mentions = self_errors
+        .iter()
+        .enumerate()
+        .map(|(index, cause)| (index, self_without_meaning(cause)))
+        .peekable();
+    let mut items: Vec<ErrorItem> = Vec::new();
     // A conflict without a cause that depends on the context is no error: `report()` gives none.
-    let items: Vec<ErrorItem> = errors
+    for (conflict, item) in errors
         .iter()
-        .filter_map(report)
-        .filter(|item| !allowed.contains(&item.cause))
-        .collect();
-    if !items.is_empty() {
-        return Some(items);
+        .filter_map(|conflict| Some((conflict, report(conflict)?)))
+    {
+        while let Some((_, mention)) = mentions.next_if(|(index, _)| *index < conflict.seen) {
+            items.push(mention);
+        }
+        items.push(item);
     }
-    // The mentions of `Self` are reported only if no other error is left.
-    let items: Vec<ErrorItem> = self_errors
-        .iter()
-        .filter(|cause| !allowed.contains(cause))
-        .map(self_without_meaning)
-        .collect();
-    if items.is_empty() {
-        None
-    } else {
-        Some(items)
-    }
+    items.extend(mentions.map(|(_, mention)| mention));
+    items
 }
 
-/// Returns the causes among `allowed` that accepted a conflict among `effects`, `conflicts` and
-/// `self_errors` (see [`scope_error()`]), in the order in which they are found, each once. It is
-/// called for a scope that succeeded, so every conflict that is left is accepted.
-pub(crate) fn accepted_causes(
-    effects: &[Effect],
-    self_errors: &[Cause],
-    conflicts: &[CheckResult],
-    allowed: &[Cause],
-) -> Vec<Cause> {
-    let mut errors = Vec::new();
-    collect_errors(effects, &mut errors);
-    errors.extend(conflicts.iter().cloned());
-    let causes = errors
-        .iter()
-        .filter_map(report)
-        .map(|item| item.cause)
-        .chain(self_errors.iter().cloned());
-    let mut accepted: Vec<Cause> = Vec::new();
-    for cause in causes {
-        // The cause as it was given to `LeakerConfig::allow()`.
-        if let Some(given) = allowed.iter().find(|given| **given == cause) {
-            if !accepted.contains(given) {
-                accepted.push(given.clone());
-            }
+/// Counts `by` more mentions of `Self` without meaning before the conflicts in `effects` (see
+/// [`CheckResult::seen`]).
+pub(crate) fn shift_seen(effects: &mut [Effect], by: usize) {
+    for effect in effects {
+        match effect {
+            Effect::Error(error) => error.seen += by,
+            Effect::Type(pending) => shift_seen(&mut pending.components, by),
+            Effect::Primitive(_) => (),
         }
     }
-    accepted
 }
 
 /// Copies as written, whole, the types among `effects` (outermost first) that `corrected` picks:
-/// each becomes an `Effect::Error` that reports nothing, so no entry stands for it or for anything
-/// in it. The conflicts in it stay, so that no error changes, and so do the primitive names, which
-/// the copy assumes. The Referrer must leave the type as written too, so the error holds it as its
-/// part.
+/// each becomes an `Effect::Error` that reports nothing and holds the type as its part. The
+/// conflicts and the primitive names in it stay.
 pub(crate) fn correct_effects(
     effects: Vec<Effect>,
     corrected: &dyn Fn(&PendingType) -> bool,
@@ -418,10 +389,8 @@ pub(crate) fn has_error(effects: &[Effect]) -> bool {
     })
 }
 
-/// Gives the parts among `effects` and in the parts of the types in it, which have no anchor yet,
-/// `ty` in `context` as their anchor: `ty` owns the cause of the conflict they are for, and the
-/// Referrer leaves them as written only inside it. Types that were visited first are inside it
-/// and have an anchor already if one of their own owns a cause: the innermost wins.
+/// Gives the parts among `effects` that have no anchor yet `ty` in `context` as their anchor: the
+/// innermost type that owns the cause wins, as types visited first are inside it.
 pub(crate) fn anchor_parts(effects: &mut [Effect], ty: &Type, context: &Context) {
     for effect in effects {
         match effect {
@@ -436,8 +405,7 @@ pub(crate) fn anchor_parts(effects: &mut [Effect], ty: &Type, context: &Context)
     }
 }
 
-/// Pushes the errors and the primitive names among `effects` and in the parts of the types in it.
-/// The errors lose their parts: they are in a part that is copied as written already.
+/// Pushes the errors and the primitive names among `effects`; the errors lose their parts.
 fn keep_conflicts(effects: Vec<Effect>, found: &mut Vec<Effect>) {
     for effect in effects {
         match effect {
@@ -451,12 +419,9 @@ fn keep_conflicts(effects: Vec<Effect>, found: &mut Vec<Effect>) {
     }
 }
 
-/// Corrects the entries that cannot be written in an impl of the Repeater because they name a
-/// `Self` that has no meaning, or a bound of their context does: the impl would read it as its own
-/// implementor. The outermost type that would be an entry, required or optional, and names it is
-/// copied as written instead, whole. That is a correction of a scope that has the error
-/// ([`Reason::SelfWithoutMeaning`]), which rolls it back unless the cause is accepted
-/// ([`LeakerConfig::allow()`](crate::LeakerConfig::allow)), so no analysis that succeeds changes.
+/// Copies as written, whole, the outermost type that would be an entry and names a `Self` without
+/// meaning, or has a bound in its context that does: the impl of the Repeater would read that
+/// `Self` as its implementor ([`Reason::SelfWithoutMeaning`]).
 pub(crate) fn correct_unmeant_self(effects: Vec<Effect>) -> Vec<Effect> {
     correct_effects(effects, &|pending| {
         pending.unmeant_self && (pending.in_graph || pending.has_optional)
@@ -532,8 +497,8 @@ pub(crate) fn ambiguous_types(effects: &[Effect]) -> Vec<Type> {
     found
 }
 
-/// Returns the errors among `effects` and in the parts of the types in it. They lose their parts:
-/// the caller copies the type that holds them as written, whole.
+/// Returns the errors among `effects`, without their parts: the caller copies the type that holds
+/// them as written.
 pub(crate) fn error_effects(effects: Vec<Effect>) -> Vec<Effect> {
     let mut found = Vec::new();
     for effect in effects {

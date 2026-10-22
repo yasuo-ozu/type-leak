@@ -11,6 +11,7 @@
 //! The errors are reported at the same places after the round trip: see `tests/diagnostic.rs` (a
 //! macro that does it, and rustc) and `tests/crates/spans` (the lines and the columns).
 
+use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::ToTokens;
 use type_leak::*;
@@ -34,20 +35,18 @@ fn reading_values_config() -> LeakerConfig {
     config
 }
 
-/// A Leaker of `config` that accepts the conflicts with the causes `allowed`.
-fn accepting(mut config: LeakerConfig, allowed: &[Cause]) -> Leaker {
-    for cause in allowed {
-        config.allow(cause.clone());
-    }
-    Leaker::from_config(config)
+/// An analysis of an item that goes wrong.
+type Trigger = fn() -> LeakerResult;
+
+/// Runs `analyze` on `leaker` and returns its result.
+fn run<R>(mut leaker: Leaker, analyze: impl FnOnce(&mut Leaker) -> R) -> LeakerResult {
+    analyze(&mut leaker);
+    leaker.result()
 }
 
-/// An analysis of an item that goes wrong, with the causes `allowed` accepted.
-type Trigger = fn(&[Cause]) -> std::result::Result<(), Vec<ErrorItem>>;
-
-/// The errors of a trigger that accepts nothing.
+/// The errors of a trigger.
 fn errors(trigger: Trigger) -> Vec<ErrorItem> {
-    trigger(&[]).unwrap_err()
+    trigger().errors().to_vec()
 }
 
 fn id(name: &str) -> Ident {
@@ -96,39 +95,35 @@ fn help_of(item: &ErrorItem) -> Option<(String, String)> {
 }
 
 /// The analysis of a trait with these items. `check_values` reads the values too.
-fn trait_result(
-    source: &str,
-    check_values: bool,
-    allowed: &[Cause],
-) -> std::result::Result<(), Vec<ErrorItem>> {
+fn trait_result(source: &str, check_values: bool) -> LeakerResult {
     let item: ItemTrait = parse_str(source).unwrap();
     let config = if check_values {
         reading_values_config()
     } else {
         allowing_config()
     };
-    accepting(config, allowed)
-        .intern_trait(&item, true)
-        .map(|_| ())
+    run(Leaker::from_config(config), |leaker| {
+        leaker.intern_trait(&item, true)
+    })
 }
 
 /// The errors that a trait with these items gives. `check_values` reads the values too.
 fn trait_errors(source: &str, check_values: bool) -> Vec<ErrorItem> {
-    trait_result(source, check_values, &[]).unwrap_err()
+    trait_result(source, check_values).errors().to_vec()
 }
 
 // ── the triggers: an item for each reason ────────────────────────────────────────────────────
 
 /// A trait in a bound and a type with an elided lifetime.
-fn relative_path(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+fn relative_path() -> LeakerResult {
     let item: ItemTrait = parse_quote!(
         trait Tr: Clone {
             fn f(&self, a: MyType<'_>);
         }
     );
-    accepting(LeakerConfig::new(), allowed)
-        .intern_trait(&item, true)
-        .map(|_| ())
+    run(Leaker::from_config(LeakerConfig::new()), |leaker| {
+        leaker.intern_trait(&item, true)
+    })
 }
 
 #[test]
@@ -141,13 +136,13 @@ fn reason_relative_path() {
 }
 
 /// `Self` where no scope declares it.
-fn self_without_meaning(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
-    accepting(allowing_config(), allowed)
-        .enter_generics(&Generics::default(), |view| {
+fn self_without_meaning() -> LeakerResult {
+    run(Leaker::from_config(allowing_config()), |leaker| {
+        leaker.enter_generics(&Generics::default(), |view| {
             view.visit_type(&parse_quote!(Rel<Self>));
             view.visit_type(&parse_quote!(Wrap<Self::Item>));
         })
-        .map(|_| ())
+    })
 }
 
 #[test]
@@ -171,11 +166,10 @@ fn reason_self_without_meaning() {
 }
 
 /// Syntax that the Leaker cannot read in a body, read with `check_values()`.
-fn unreadable(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+fn unreadable() -> LeakerResult {
     trait_result(
         "trait Tr { fn f(&self) { macro_rules! m { () => {} } ::p::mac!(a b c); } }",
         true,
-        allowed,
     )
 }
 
@@ -202,15 +196,15 @@ fn reason_unreadable() {
 }
 
 /// A bare identifier that may be a const, in a path that names `Self`, which is denied.
-fn maybe_const(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+fn maybe_const() -> LeakerResult {
     let item: ItemStruct = parse_quote!(
         struct S {
             a: ::p::W<[Self], LEN>,
         }
     );
-    accepting(allowing_config(), allowed)
-        .intern_struct(&item, false)
-        .map(|_| ())
+    run(Leaker::from_config(allowing_config()), |leaker| {
+        leaker.intern_struct(&item, false)
+    })
 }
 
 #[test]
@@ -226,11 +220,10 @@ fn reason_maybe_const() {
 }
 
 /// A lifetime of a method that the copy would leave unconstrained.
-fn unconstrained_lifetime(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+fn unconstrained_lifetime() -> LeakerResult {
     trait_result(
         "trait Tr { fn f<'b>(&self, x: Wrap<'b>) -> &'b u8; }",
         false,
-        allowed,
     )
 }
 
@@ -252,16 +245,16 @@ fn reason_unconstrained_lifetime() {
 }
 
 /// `Self::A` in an impl of a trait, where the Repeater's impl cannot write it.
-fn self_projection(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+fn self_projection() -> LeakerResult {
     let item: ItemImpl = parse_quote!(
         impl ::p::Tr for u8 {
             type A = u8;
             fn f(&self, x: Wrap<Self::A>) {}
         }
     );
-    accepting(allowing_config(), allowed)
-        .intern_impl(&item, true)
-        .map(|_| ())
+    run(Leaker::from_config(allowing_config()), |leaker| {
+        leaker.intern_impl(&item, true)
+    })
 }
 
 #[test]
@@ -284,16 +277,16 @@ fn reason_self_projection() {
 }
 
 /// A bound of an outer trait that names its `Self`, for a type in an item nested in it.
-fn unnameable_self(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
-    accepting(allowing_config(), allowed)
-        .enter_trait(&id("Tr"), &parse_quote!(<T: AsRef<Self>>), true, |view| {
+fn unnameable_self() -> LeakerResult {
+    run(Leaker::from_config(allowing_config()), |leaker| {
+        leaker.enter_trait(&id("Tr"), &parse_quote!(<T: AsRef<Self>>), true, |view| {
             view.visit_item(&parse_quote!(
                 impl ::p::W for X {
                     fn f(&self, x: Rel<T>) {}
                 }
             ))
         })
-        .map(|_| ())
+    })
 }
 
 #[test]
@@ -308,8 +301,8 @@ fn reason_unnameable_self() {
 }
 
 /// `Self` in the default of a parameter.
-fn self_in_default(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
-    trait_result("trait Tr<T: Default = Wrap<Self>> {}", false, allowed)
+fn self_in_default() -> LeakerResult {
+    trait_result("trait Tr<T: Default = Wrap<Self>> {}", false)
 }
 
 #[test]
@@ -326,15 +319,15 @@ fn reason_self_in_default() {
 }
 
 /// A generic whose bound mentions a `Self` that is denied.
-fn denied_self_in_bounds(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+fn denied_self_in_bounds() -> LeakerResult {
     let item: ItemTrait = parse_quote!(
         trait Tr {
             fn f<T: ::core::cmp::PartialEq<Self>>(&self, x: Wrap<T>);
         }
     );
-    accepting(allowing_config(), allowed)
-        .intern_trait(&item, false)
-        .map(|_| ())
+    run(Leaker::from_config(allowing_config()), |leaker| {
+        leaker.intern_trait(&item, false)
+    })
 }
 
 #[test]
@@ -345,14 +338,14 @@ fn reason_denied_self_in_bounds() {
 }
 
 /// A type that names the `Self` of a nested struct, with a generic whose bound names it too.
-fn nested_self_in_bounds(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
-    accepting(allowing_config(), allowed)
-        .enter_mod("m", [id("S")], |view| {
+fn nested_self_in_bounds() -> LeakerResult {
+    run(Leaker::from_config(allowing_config()), |leaker| {
+        leaker.enter_mod("m", [id("S")], |view| {
             view.visit_item(&parse_quote!(
                 struct S<T: ::core::convert::AsRef<Self>>(Rel2<Self, T>);
             ))
         })
-        .map(|_| ())
+    })
 }
 
 #[test]
@@ -368,7 +361,7 @@ fn reason_nested_self_in_bounds() {
 }
 
 /// A leaked type in a predicate whose generic has a leaked bound.
-fn unprovable_bound(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+fn unprovable_bound() -> LeakerResult {
     let item: ItemTrait = parse_quote!(
         trait Tr<T: Fn(Rel)>
         where
@@ -376,9 +369,9 @@ fn unprovable_bound(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>
         {
         }
     );
-    accepting(allowing_config(), allowed)
-        .intern_trait(&item, true)
-        .map(|_| ())
+    run(Leaker::from_config(allowing_config()), |leaker| {
+        leaker.intern_trait(&item, true)
+    })
 }
 
 #[test]
@@ -389,7 +382,7 @@ fn reason_unprovable_bound() {
 }
 
 /// A type that names `Self` in a predicate of its trait.
-fn self_in_trait_predicate(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+fn self_in_trait_predicate() -> LeakerResult {
     let item: ItemTrait = parse_quote!(
         trait Tr
         where
@@ -397,9 +390,9 @@ fn self_in_trait_predicate(allowed: &[Cause]) -> std::result::Result<(), Vec<Err
         {
         }
     );
-    accepting(allowing_config(), allowed)
-        .intern_trait(&item, true)
-        .map(|_| ())
+    run(Leaker::from_config(allowing_config()), |leaker| {
+        leaker.intern_trait(&item, true)
+    })
 }
 
 #[test]
@@ -415,13 +408,13 @@ fn reason_self_in_trait_predicate() {
 }
 
 /// The self type of an impl whose bound names `Self`.
-fn self_in_impl_self_type(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+fn self_in_impl_self_type() -> LeakerResult {
     let item: ItemImpl = parse_quote!(
         impl<T> S<T> where T: AsRef<Option<Self>> {}
     );
-    accepting(allowing_config(), allowed)
-        .intern_impl(&item, true)
-        .map(|_| ())
+    run(Leaker::from_config(allowing_config()), |leaker| {
+        leaker.intern_impl(&item, true)
+    })
 }
 
 #[test]
@@ -436,27 +429,11 @@ fn reason_self_in_impl_self_type() {
 // ── the other kinds of cause ─────────────────────────────────────────────────────────────────
 
 /// A path in a const expression (the default of a const parameter) and a path in a value.
-fn values(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
-    let mut errors = Vec::new();
-    errors.extend(
-        trait_result("trait Tr<const N: usize = SIZE> {}", false, allowed)
-            .err()
-            .unwrap_or_default(),
-    );
-    errors.extend(
-        trait_result(
-            "trait Tr { fn f(&self) { let _ = inner::N; let _ = Rel::<u8>::f(); } }",
-            true,
-            allowed,
-        )
-        .err()
-        .unwrap_or_default(),
-    );
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
+fn values() -> LeakerResult {
+    trait_result(
+        "trait Tr<const N: usize = SIZE> { fn f(&self) { let _ = inner::N; let _ = Rel::<u8>::f(); } }",
+        true,
+    )
 }
 
 #[test]
@@ -474,11 +451,10 @@ fn the_cause_of_a_path_in_a_value_is_a_value() {
 }
 
 /// The path of a macro in a value, and the trait of a qualified path.
-fn macros_and_qualified_traits(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+fn macros_and_qualified_traits() -> LeakerResult {
     trait_result(
         "trait Tr { fn f(&self) { mac!(1); let _ = <u8 as Rel>::f(); } }",
         true,
-        allowed,
     )
 }
 
@@ -493,13 +469,13 @@ fn the_cause_of_a_macro_is_its_path_and_that_of_a_qualified_trait_is_a_trait() {
 }
 
 /// A lifetime that no scope declares, in the supertrait of a trait where `Self` is denied.
-fn lifetime(allowed: &[Cause]) -> std::result::Result<(), Vec<ErrorItem>> {
+fn lifetime() -> LeakerResult {
     let item: ItemTrait = parse_quote!(
         trait Tr: ::p::Sup<&'a Self> {}
     );
-    accepting(allowing_config(), allowed)
-        .intern_trait(&item, false)
-        .map(|_| ())
+    run(Leaker::from_config(allowing_config()), |leaker| {
+        leaker.intern_trait(&item, false)
+    })
 }
 
 #[test]
@@ -514,10 +490,9 @@ fn the_cause_of_a_bound_is_the_trait() {
 // ── the kind of the cause is that of the syntax node which holds the part reported ──────────
 
 /// The errors that a type gives in the generics `<T>`, where `Self` has no meaning.
-fn type_errors(leaker: &mut Leaker, ty: Type) -> Vec<ErrorItem> {
-    leaker
-        .enter_generics(&parse_quote!(<T>), |view| view.visit_type(&ty))
-        .unwrap_err()
+fn type_errors(mut leaker: Leaker, ty: Type) -> Vec<ErrorItem> {
+    leaker.enter_generics(&parse_quote!(<T>), |view| view.visit_type(&ty));
+    leaker.result().errors().to_vec()
 }
 
 /// The note of an item at `at`, if it has one there.
@@ -532,7 +507,7 @@ fn note_at<'a>(item: &'a ErrorItem, at: &str) -> Option<&'a str> {
 fn the_trait_of_a_dyn_type_is_a_trait() {
     // The error is reported at the trait, which is the path of a bound of the `dyn` type: the cause
     // is a trait, not a type. The note is at the `dyn` type as a whole.
-    let items = type_errors(&mut allowing(), parse_quote!(::p::W<'_, dyn RelTr>));
+    let items = type_errors(allowing(), parse_quote!(::p::W<'_, dyn RelTr>));
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::RelativePath, "trait", "RelTr");
     assert!(matches!(&items[0].cause, Cause::Trait(path) if path.is_ident("RelTr")));
@@ -546,14 +521,17 @@ fn the_trait_of_a_dyn_type_is_a_trait() {
             fn f<'b>(&self, x: &'b dyn RelTr) -> &'b ();
         }
     );
-    let items = allowing().intern_trait(&item, true).unwrap_err();
+    let mut leaker = allowing();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let items = result.errors();
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::UnconstrainedLifetime, "trait", "RelTr");
 }
 
 #[test]
 fn the_trait_of_an_impl_type_is_a_trait() {
-    let items = type_errors(&mut allowing(), parse_quote!(impl MyTrait));
+    let items = type_errors(allowing(), parse_quote!(impl MyTrait));
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::RelativePath, "trait", "MyTrait");
     assert_eq!(
@@ -565,7 +543,7 @@ fn the_trait_of_an_impl_type_is_a_trait() {
 #[test]
 fn a_path_in_a_closure_in_an_array_length_is_a_value() {
     let items = type_errors(
-        &mut allowing(),
+        allowing(),
         parse_quote!(
             [u8; {
                 let c = |a: u8| a;
@@ -580,7 +558,7 @@ fn a_path_in_a_closure_in_an_array_length_is_a_value() {
 
 #[test]
 fn a_macro_call_in_an_array_length_is_a_macro() {
-    let items = type_errors(&mut allowing(), parse_quote!([u8; two!()]));
+    let items = type_errors(allowing(), parse_quote!([u8; two!()]));
     assert_eq!(items.len(), 1);
     // The error is reported at the path, and the cause writes the call with its `!`.
     assert_item(&items[0], Reason::RelativePath, "macro", "two !");
@@ -592,7 +570,10 @@ fn a_macro_call_in_an_array_length_is_a_macro() {
             f: ::p::Wrap<::p::m!(Self)>,
         }
     );
-    let items = allowing().intern_struct(&item, false).unwrap_err();
+    let mut leaker = allowing();
+    leaker.intern_struct(&item, false);
+    let result = leaker.result();
+    let items = result.errors();
     assert_eq!(items.len(), 1);
     assert_item(
         &items[0],
@@ -615,7 +596,10 @@ fn a_type_in_a_turbofish_in_an_array_length_is_a_type() {
             );
         }
     );
-    let items = allowing().intern_trait(&item, true).unwrap_err();
+    let mut leaker = allowing();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let items = result.errors();
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::RelativePath, "type", "Big");
 }
@@ -629,15 +613,19 @@ fn a_relative_type_in_an_absolute_holder_that_cannot_be_leaked_is_a_type() {
             fn f<'b>(&self, x: &'b dyn ::p::Tr<Rel>) -> &'b ();
         }
     );
-    let items = allowing().intern_trait(&item, true).unwrap_err();
+    let mut leaker = allowing();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let items = result.errors();
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::MaybeConst, "type", "Rel");
     // A bare identifier among the arguments of a holder that `Self` stops from being leaked.
-    let items = allowing()
-        .enter_type(&id("S"), &Generics::default(), false, |view| {
-            view.visit_type(&parse_quote!(::l::W<[Self], ILEN>))
-        })
-        .unwrap_err();
+    let mut leaker = allowing();
+    leaker.enter_type(&id("S"), &Generics::default(), false, |view| {
+        view.visit_type(&parse_quote!(::l::W<[Self], ILEN>))
+    });
+    let result = leaker.result();
+    let items = result.errors();
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::MaybeConst, "type", "ILEN");
     assert_eq!(
@@ -661,7 +649,10 @@ fn the_part_reported_may_be_smaller_than_the_type_that_cannot_be_leaked() {
             );
         }
     );
-    let items = Leaker::new().intern_trait(&item, true).unwrap_err();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let items = result.errors();
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::RelativePath, "type", "u8");
     assert_eq!(
@@ -669,7 +660,10 @@ fn the_part_reported_may_be_smaller_than_the_type_that_cannot_be_leaked() {
         Some("`a` also depends on the type context")
     );
     // Where `u8` is allowed, `a` is the first.
-    let items = allowing().intern_trait(&item, true).unwrap_err();
+    let mut leaker = allowing();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let items = result.errors();
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::RelativePath, "expr", "a");
     assert_eq!(note_at(&items[0], "a"), None);
@@ -685,7 +679,10 @@ fn a_bound_with_a_binder_is_unreadable() {
         {
         }
     );
-    let items = Leaker::new().intern_trait(&item, true).unwrap_err();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let items = result.errors();
     assert_eq!(items.len(), 1);
     assert_item(
         &items[0],
@@ -700,7 +697,10 @@ fn a_bound_in_parentheses_is_unreadable() {
     let item: ItemTrait = parse_quote!(
         trait Tr: (Clone) {}
     );
-    let items = Leaker::new().intern_trait(&item, true).unwrap_err();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let items = result.errors();
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::RelativePath, "unreadable", "(Clone)");
 }
@@ -718,11 +718,12 @@ fn a_lifetime_is_a_lifetime() {
 fn the_path_of_a_qualified_type_is_unreadable() {
     // `Tr<u8>::X` is the trait with the name that follows the `>`: a path that is no node, and not
     // a type (`syn` has the `qself` and the path apart).
-    let items = Leaker::new()
-        .enter_impl(&Generics::default(), &parse_quote!(B), false, |view| {
-            view.visit_type(&parse_quote!(<Self as super::Tr<u8>>::X))
-        })
-        .unwrap_err();
+    let mut leaker = Leaker::new();
+    leaker.enter_impl(&Generics::default(), &parse_quote!(B), false, |view| {
+        view.visit_type(&parse_quote!(<Self as super::Tr<u8>>::X))
+    });
+    let result = leaker.result();
+    let items = result.errors();
     assert_eq!(items.len(), 1);
     assert_item(
         &items[0],
@@ -730,7 +731,7 @@ fn the_path_of_a_qualified_type_is_unreadable() {
         "unreadable",
         "super :: Tr < u8 > :: X",
     );
-    let items = type_errors(&mut allowing(), parse_quote!(<T as RelTrait<'_>>::Ty));
+    let items = type_errors(allowing(), parse_quote!(<T as RelTrait<'_>>::Ty));
     assert_eq!(items.len(), 1);
     assert_item(
         &items[0],
@@ -1099,6 +1100,15 @@ fn messages(items: &[ErrorItem]) -> Vec<&str> {
     items.iter().map(|item| item.message.as_str()).collect()
 }
 
+/// The result of a trigger with these causes allowed.
+fn allowing_causes(trigger: Trigger, causes: &[Cause]) -> LeakerResult {
+    let mut result = trigger();
+    for cause in causes {
+        result.allow(cause.clone());
+    }
+    result
+}
+
 #[test]
 fn allowing_the_causes_of_the_errors_of_each_reason_accepts_the_item() {
     let mut reasons = Vec::new();
@@ -1106,19 +1116,26 @@ fn allowing_the_causes_of_the_errors_of_each_reason_accepts_the_item() {
         let items = errors(trigger);
         reasons.extend(items.iter().map(|item| item.reason));
         let causes: Vec<Cause> = items.iter().map(|item| item.cause.clone()).collect();
-        if let Err(left) = trigger(&causes) {
-            panic!("{}: {:?} are left", name, messages(&left));
+        let result = allowing_causes(trigger, &causes);
+        if !result.errors().is_empty() {
+            panic!("{}: {:?} are left", name, messages(result.errors()));
         }
         // Each cause is needed: without it, its errors, and only they, are reported.
         for cause in &causes {
             let others: Vec<Cause> = causes.iter().filter(|c| *c != cause).cloned().collect();
-            let left = trigger(&others).unwrap_err();
+            let result = allowing_causes(trigger, &others);
             let expected: Vec<&str> = items
                 .iter()
                 .filter(|item| item.cause == *cause)
                 .map(|item| item.message.as_str())
                 .collect();
-            assert_eq!(messages(&left), expected, "{}: {}", name, text(cause));
+            assert_eq!(
+                messages(result.errors()),
+                expected,
+                "{}: {}",
+                name,
+                text(cause)
+            );
         }
     }
     // The triggers have every reason.
@@ -1139,4 +1156,140 @@ fn allowing_the_causes_of_the_errors_of_each_reason_accepts_the_item() {
     ] {
         assert!(reasons.contains(&reason), "{:?}", reason);
     }
+}
+
+// ── recovery ─────────────────────────────────────────────────────────────────────────────────
+
+/// The causes of the errors, to give to `LeakerResult::allow()`.
+fn causes_of(errors: &[ErrorItem]) -> Vec<Cause> {
+    errors.iter().map(|error| error.cause.clone()).collect()
+}
+
+/// Asserts that two Referrers are the same, as values and as tokens.
+#[track_caller]
+fn assert_same_referrer(recovered: &Referrer, allowed: &Referrer, what: &str) {
+    assert_eq!(recovered, allowed, "{}", what);
+    assert_eq!(
+        recovered.to_token_stream().to_string(),
+        allowed.to_token_stream().to_string(),
+        "{}",
+        what
+    );
+}
+
+#[test]
+fn allowing_the_causes_of_every_trigger_leaves_the_recovered_referrer() {
+    let mut recovered_some = 0;
+    for (name, trigger) in every_trigger() {
+        let result = trigger();
+        let causes = causes_of(result.errors());
+        assert!(!causes.is_empty(), "{}", name);
+        let referrer = result.clone().into_referrer();
+        // The same analysis with the causes allowed reports nothing, and has the same entries and
+        // parts: allowing drops errors only.
+        let allowed = allowing_causes(trigger, &causes);
+        assert!(allowed.errors().is_empty(), "{}", name);
+        assert_same_referrer(&referrer, &allowed.into_referrer(), name);
+        // And it is a Referrer like any other: it round-trips.
+        let parsed: Referrer = parse2(referrer.to_token_stream()).unwrap();
+        assert_eq!(parsed, referrer, "{}", name);
+        recovered_some += 1;
+    }
+    assert_eq!(recovered_some, every_trigger().len());
+}
+
+#[test]
+fn recovery_keeps_the_entries_that_do_not_conflict() {
+    let item: ItemStruct = parse_quote!(
+        struct S {
+            a: Rel,
+            b: ::p::W<'_, dyn RelTr>,
+        }
+    );
+    let mut leaker = allowing();
+    let id = leaker.intern_struct(&item, true);
+    let mut result = leaker.result();
+    assert_eq!(result.errors().len(), 1);
+    assert_eq!(result.errors()[0].cause, Cause::Trait(parse_quote!(RelTr)));
+    let referrer = result.clone().into_referrer();
+    // `Rel` is an entry, and `dyn RelTr` is copied as written: a part, not an entry.
+    let entries: Vec<String> = referrer.iter().map(text_of).collect();
+    assert_eq!(entries, ["Rel"]);
+    assert!(
+        referrer
+            .to_token_stream()
+            .to_string()
+            .contains("[type (dyn RelTr) "),
+        "{}",
+        referrer.to_token_stream()
+    );
+    let mut copy = item.clone();
+    referrer
+        .clone()
+        .visitor(id, |_, ix| parse_quote!(Entry<#ix>))
+        .visit_item_struct_mut(&mut copy);
+    let expected: ItemStruct = parse_quote!(
+        struct S {
+            a: Entry<0usize>,
+            b: ::p::W<'_, dyn RelTr>,
+        }
+    );
+    assert_eq!(copy, expected);
+    // Allowing the cause drops the error and leaves the Referrer.
+    result.allow(Cause::Trait(parse_quote!(RelTr)));
+    assert_same_referrer(&referrer, &result.finish().unwrap(), "S");
+}
+
+/// The tokens of a type, as text.
+fn text_of(ty: &impl ToTokens) -> String {
+    ty.to_token_stream().to_string()
+}
+
+#[test]
+fn the_errors_of_self_are_reported_with_the_others() {
+    // `Self` has no meaning in generics: the mention is told with the conflict, in the order in
+    // which the syntax has them, and both are recovered from.
+    let item: ItemStruct = parse_quote!(
+        struct S {
+            rel: ::p::W<'_, dyn RelTr>,
+            me: Wrap<Self>,
+        }
+    );
+    let analyze = || {
+        let mut leaker = allowing();
+        leaker.enter_generics(&Generics::default(), |view| {
+            syn::visit::visit_item_struct(view, &item)
+        });
+        leaker.result()
+    };
+    let result = analyze();
+    let errors = result.errors().to_vec();
+    assert_eq!(
+        errors
+            .iter()
+            .map(|error| (error.reason, text(&error.cause)))
+            .collect::<Vec<_>>(),
+        [
+            (Reason::RelativePath, "RelTr".to_string()),
+            (Reason::SelfWithoutMeaning, "Self".to_string())
+        ]
+    );
+    let referrer = result.clone().into_referrer();
+    // The conflict is copied as written, and so is the type that names `Self`: no entry is left.
+    assert_eq!(referrer.iter().count(), 0);
+    let mut allowed = analyze();
+    for cause in causes_of(&errors) {
+        allowed.allow(cause);
+    }
+    assert!(allowed.errors().is_empty());
+    assert_same_referrer(&referrer, &allowed.into_referrer(), "Self");
+    // Allowing the conflict leaves the mention, and the other way round.
+    let mut left = analyze();
+    left.allow(errors[0].cause.clone());
+    assert_eq!(left.errors().len(), 1);
+    assert_eq!(left.errors()[0].reason, Reason::SelfWithoutMeaning);
+    let mut left = analyze();
+    left.allow(errors[1].cause.clone());
+    assert_eq!(left.errors().len(), 1);
+    assert_eq!(left.errors()[0].reason, Reason::RelativePath);
 }

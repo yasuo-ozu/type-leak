@@ -35,8 +35,8 @@ fn params_error(generics: &str) -> EncodeError {
 fn needs_self_error(source: &str) -> EncodeError {
     let item: ItemTrait = parse_str(source).unwrap();
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     let wrap = referrer
         .iter()
         .position(|ty| template_quote::quote!(#ty).to_string() == "Wrap < T , Self >")
@@ -141,7 +141,10 @@ fn both_errors_are_std_errors() {
     let item: ItemTrait = parse_quote!(
         trait Tr: Clone {}
     );
-    let err = Leaker::new().intern_trait(&item, true).unwrap_err();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let err = result.errors();
     let err = err[0].clone();
     is_error(&err);
     let boxed: Box<dyn std::error::Error> = Box::new(err.clone());

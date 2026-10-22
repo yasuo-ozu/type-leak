@@ -1,9 +1,9 @@
 //! The analysis of items and types by the [`Leaker`].
 
 use crate::analysis::{
-    accepted_causes, ambiguous_types, anchor_parts, correct_effects, correct_unmeant_self,
-    error_effects, has_ambiguous, has_error, has_optional, names_self, primitive_effects,
-    scope_error, CheckResult, Effect, Part, PendingType,
+    ambiguous_types, anchor_parts, correct_effects, correct_unmeant_self, error_effects,
+    has_ambiguous, has_error, has_optional, names_self, primitive_effects, scope_error, shift_seen,
+    CheckResult, Effect, Part, PendingType,
 };
 #[cfg(doc)]
 use crate::config::LeakerConfig;
@@ -39,8 +39,8 @@ mod values;
 struct Frame {
     must_start: usize,
     impossible_start: usize,
-    /// The length of `AnalyzeVisitor::self_errors` when the frame started: a longer one means that
-    /// the type names a `Self` without meaning.
+    /// The length of `AnalyzeVisitor::self_errors` when the frame started: a longer one means a
+    /// `Self` without meaning.
     self_start: usize,
     min_depth: usize,
     local_scope: usize,
@@ -108,7 +108,7 @@ impl Frame {
 struct Impossibles {
     causes: Vec<Cause>,
     hard: Vec<bool>,
-    /// The depth of the type being visited when each cause was pushed (`AnalyzeVisitor::type_depth`).
+    /// The type depth (`AnalyzeVisitor::type_depth`) when each cause was pushed.
     depths: Vec<usize>,
     /// The depth of the type being visited now.
     at: usize,
@@ -453,8 +453,6 @@ impl ScopeSpec {
     }
 }
 
-pub(crate) type Res<T> = std::result::Result<T, Vec<ErrorItem>>;
-
 /// Where a scope is entered: the Leaker (outermost) or a [`View`] (nested). The public `enter_*`
 /// methods build the [`ScopeSpec`] here and differ only in `enter_spec()`.
 pub(crate) trait Scopes {
@@ -462,14 +460,14 @@ pub(crate) trait Scopes {
         &mut self,
         spec: ScopeSpec,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)>;
+    ) -> (ContextId, R);
 
     fn enter_mod<R>(
         &mut self,
         hint: impl Display,
         declared: impl IntoIterator<Item = Ident>,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         let names = ModuleNames {
             names: declared
                 .into_iter()
@@ -492,7 +490,7 @@ pub(crate) trait Scopes {
         &mut self,
         generics: &Generics,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         let generics = generics.clone();
         self.enter_spec(
             ScopeSpec::Generics {
@@ -510,7 +508,7 @@ pub(crate) trait Scopes {
         declares: DeclaredSelf,
         trait_path: Option<&Path>,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         let spec = ScopeSpec::Generics {
             generics: generics.clone(),
             declares: Some(Box::new(declares)),
@@ -525,7 +523,7 @@ pub(crate) trait Scopes {
         generics: &Generics,
         allow_self: bool,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         let declares = DeclaredSelf {
             requirement: SelfRequirement::of_item(ident, generics),
             allow_self,
@@ -541,7 +539,7 @@ pub(crate) trait Scopes {
         self_ty: &Type,
         allow_self: bool,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         self.enter_impl_of(generics, self_ty, None, allow_self, f)
     }
 
@@ -554,7 +552,7 @@ pub(crate) trait Scopes {
         trait_path: Option<&Path>,
         allow_self: bool,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         let declares = DeclaredSelf {
             requirement: SelfRequirement::Type(self_ty.clone()),
             allow_self,
@@ -570,7 +568,7 @@ pub(crate) trait Scopes {
         generics: &Generics,
         allow_self: bool,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         self.enter_trait_of(ident, generics, Vec::new(), allow_self, f)
     }
 
@@ -582,7 +580,7 @@ pub(crate) trait Scopes {
         gats: Vec<Gat>,
         allow_self: bool,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         let declares = DeclaredSelf {
             requirement: SelfRequirement::of_trait(ident, generics),
             allow_self,
@@ -675,9 +673,6 @@ pub(crate) struct Finished {
     /// The types, with their contexts, that cannot be optional entries (see
     /// [`AnalyzeVisitor::env_cycle()`]).
     pub(crate) not_optional: Vec<(Context, String)>,
-    /// The causes given to [`LeakerConfig::allow()`] that accepted a conflict which is left, in
-    /// the order in which they are found, each once.
-    pub(crate) accepted: Vec<Cause>,
 }
 
 pub(crate) struct AnalyzeVisitor {
@@ -798,18 +793,13 @@ pub(crate) struct AnalyzeVisitor {
     /// syntax, and a bound of whose generics does, is for any type (see
     /// [`LeakerConfig::nested_self_entries()`]).
     nested_self_entries: bool,
-    /// The causes of the conflicts that are accepted, not reported (see
-    /// [`LeakerConfig::allow()`]). Only `scope_error()` reads them: a throwaway visitor never ends
-    /// a scope, so it has none.
-    allowed_causes: Vec<Cause>,
 }
 
 /// A method signature being visited (see `AnalyzeVisitor::signatures`).
 struct SignatureWalk {
     /// The index in `scopes` of its generics.
     at: usize,
-    /// The number of effects of the frame when the walk started: the types of the signature are the
-    /// effects from there on.
+    /// The number of effects of the frame when the walk started: the signature's types come after.
     effects: usize,
     /// Its lifetimes.
     declared: Vec<Lifetime>,
@@ -889,7 +879,6 @@ impl AnalyzeVisitor {
             env_errors: Vec::new(),
             check_values: false,
             nested_self_entries: false,
-            allowed_causes: Vec::new(),
         }
     }
 
@@ -905,13 +894,6 @@ impl AnalyzeVisitor {
     /// [`LeakerConfig::nested_self_entries()`]), or not.
     pub(crate) fn with_nested_self_entries(mut self, nested_self_entries: bool) -> Self {
         self.nested_self_entries = nested_self_entries;
-        self
-    }
-
-    /// Accepts the conflicts whose cause is one of `causes`: they are not reported as errors, and
-    /// the scopes that hold them are not rolled back (see [`LeakerConfig::allow()`]).
-    pub(crate) fn with_allowed_causes(mut self, causes: &[Cause]) -> Self {
-        self.allowed_causes = causes.to_vec();
         self
     }
 
@@ -960,15 +942,14 @@ impl AnalyzeVisitor {
             headline: None,
             cause: None,
             reason: Reason::RelativePath,
+            seen: 0,
             part: None,
         }
     }
 
-    /// Like [`AnalyzeVisitor::causes()`] for a conflict of a type at `depth`, which cannot be
-    /// leaked whole. A path in a type inside it that is leaked alone (an entry) is no cause of
-    /// the conflict, and it is no error once the first cause is fixed: `u8` in `<Self as
-    /// Tr<u8>>::X`, where `Self` is what cannot be leaked. Only the paths that the type has to be
-    /// rid of are listed, so the notes name those.
+    /// Like [`AnalyzeVisitor::causes()`] for a conflict of a type at `depth` that cannot be leaked
+    /// whole. A path in it that is leaked alone is no cause, and no error once the first cause is
+    /// fixed (`u8` in `<Self as Tr<u8>>::X`).
     fn conflict_causes(
         &self,
         must_start: usize,
@@ -1268,10 +1249,10 @@ impl AnalyzeVisitor {
         }
     }
 
-    /// Finishes the outermost scope. Defaults of type parameters are analyzed alone, with the
-    /// parameters before them, and may not leak `Self`. On an error the caller rolls back the
-    /// contexts recorded since the start.
-    pub(crate) fn finish(&mut self, generics: &Generics) -> Res<Finished> {
+    /// Finishes the outermost scope and returns what it found, with the errors if any. Defaults of
+    /// type parameters are analyzed alone, with the parameters before them, and may not leak
+    /// `Self`. On an error the result is kept: the part is copied as written.
+    pub(crate) fn finish(&mut self, generics: &Generics) -> (Finished, Vec<ErrorItem>) {
         let mut effects = std::mem::take(&mut self.frame.effects);
         for (index, _, default) in defaulted(generics) {
             let root = without_defaults(generics, index);
@@ -1281,41 +1262,31 @@ impl AnalyzeVisitor {
                 &root,
                 self.root_declares_self,
             );
+            // The mentions and the conflicts of the default come after those found so far.
+            let mut found = found;
+            shift_seen(&mut found, self.self_errors.len());
             effects.extend(found);
             self.self_errors.extend(self_errors);
         }
         if !self.self_errors.is_empty() {
             effects = correct_unmeant_self(effects);
         }
-        if let Some(error) = scope_error(
-            &effects,
-            &self.self_errors,
-            &self.env_errors,
-            &self.allowed_causes,
-        ) {
-            return Err(error);
-        }
-        let accepted = accepted_causes(
-            &effects,
-            &self.self_errors,
-            &self.env_errors,
-            &self.allowed_causes,
-        );
-        // The types that an accepted cycle left without an entry are parts too: the Referrer
-        // leaves them as written.
+        let errors = scope_error(&effects, &self.self_errors, &self.env_errors);
+        // The types that a cycle left without an entry are parts too: the Referrer leaves them as
+        // written.
         effects.extend(
             std::mem::take(&mut self.env_errors)
                 .into_iter()
                 .filter(|error| error.part.is_some())
                 .map(|error| Effect::Error(Box::new(error))),
         );
-        Ok(Finished {
+        let finished = Finished {
             effects,
             top_levels: std::mem::take(&mut self.top_levels),
             module: self.modules.first().map(|module| module.id),
             not_optional: std::mem::take(&mut self.not_optional),
-            accepted,
-        })
+        };
+        (finished, errors)
     }
 
     /// Starts the outermost scope, entering it if it is a module.
@@ -1331,7 +1302,7 @@ impl AnalyzeVisitor {
     }
 
     /// Marks what a scope or a check records, to roll it back with
-    /// [`AnalyzeVisitor::leave_scope()`].
+    /// [`AnalyzeVisitor::roll_back()`].
     fn mark(&self) -> ScopeMark {
         ScopeMark {
             effects: self.frame.effects.len(),
@@ -1439,27 +1410,32 @@ impl AnalyzeVisitor {
         mark
     }
 
-    fn leave_scope(&mut self, mark: ScopeMark, rollback: bool) {
+    /// Leaves a scope: what it declared (the generics, `Self`, the modules) is gone, and what it
+    /// recorded stays. [`AnalyzeVisitor::roll_back()`] removes that.
+    fn leave_scope(&mut self, mark: &ScopeMark) {
         self.scopes.truncate(mark.scopes);
         self.modules.truncate(mark.modules);
         self.item_depth = mark.item_depth;
         self.alone_defaults.truncate(mark.alone_defaults);
-        self.self_ty = mark.self_ty;
+        self.self_ty = mark.self_ty.clone();
         self.self_written = mark.self_written;
         self.self_nested = mark.self_nested;
-        self.self_trait = mark.self_trait;
+        self.self_trait = mark.self_trait.clone();
         self.self_depth = mark.self_depth;
         self.allow_self = mark.allow_self;
         self.self_type_walk = mark.self_type_walk;
         self.inherent_impl = mark.inherent_impl;
-        if rollback {
-            self.frame.effects.truncate(mark.effects);
-            self.self_errors.truncate(mark.self_errors);
-            self.contexts.truncate(mark.contexts);
-            self.top_levels.truncate(mark.top_levels);
-            self.not_optional.truncate(mark.not_optional);
-            self.env_errors.truncate(mark.env_errors);
-        }
+    }
+
+    /// Removes what a scope or a check recorded since `mark`: a check, and a scope whose closure
+    /// panicked.
+    fn roll_back(&mut self, mark: &ScopeMark) {
+        self.frame.effects.truncate(mark.effects);
+        self.self_errors.truncate(mark.self_errors);
+        self.contexts.truncate(mark.contexts);
+        self.top_levels.truncate(mark.top_levels);
+        self.not_optional.truncate(mark.not_optional);
+        self.env_errors.truncate(mark.env_errors);
     }
 
     /// Starts a check: sets the frame of the scope aside for the visit to use a new one.
@@ -1504,7 +1480,8 @@ impl AnalyzeVisitor {
             walk,
         } = checkpoint;
         self.frame = frame;
-        self.leave_scope(mark, true);
+        self.leave_scope(&mark);
+        self.roll_back(&mark);
         self.musts.truncate(musts);
         self.truncate_impossibles(impossibles);
         self.type_depth = walk.type_depth;
@@ -1528,26 +1505,19 @@ impl AnalyzeVisitor {
         self.inherits = walk.inherits;
     }
 
-    /// Leaves a nested scope and returns its top-level context. It is all-or-nothing: on an error,
-    /// everything recorded since it was entered is rolled back, and its errors are returned.
-    fn end_scope(&mut self, mark: ScopeMark, spec: &ScopeSpec) -> Res<ContextId> {
+    /// Leaves a nested scope and returns its top-level context. The scope keeps what it recorded,
+    /// and the outermost one reports the errors, in the order found.
+    fn end_scope(&mut self, mark: ScopeMark, spec: &ScopeSpec) -> ContextId {
         if let ScopeSpec::Generics { generics, .. } = spec {
             for (index, _, default) in defaulted(generics) {
                 self.analyze_default_inline(default, &without_defaults(generics, index));
             }
         }
-        // The entries that name a `Self` without meaning are copied whole instead. The scope has
-        // that error, so it is rolled back unless the cause is accepted.
+        // The entries that name a `Self` without meaning are copied whole instead.
         if !self.self_errors.is_empty() {
             let found = self.frame.effects.split_off(mark.effects);
             self.frame.effects.extend(correct_unmeant_self(found));
         }
-        let error = scope_error(
-            &self.frame.effects[mark.effects..],
-            &self.self_errors[mark.self_errors..],
-            &self.env_errors[mark.env_errors..],
-            &self.allowed_causes,
-        );
         let module = mark.module;
         // A scope that declares nothing keeps the `Self` around, so take it before leaving. It is
         // part of the top-level context only if an entry names it, or has a bound rewritten for
@@ -1564,10 +1534,7 @@ impl AnalyzeVisitor {
                 .find(|scope| scope.self_ty() == Some(declared) && !scope.gats().is_empty())
                 .map_or_else(Vec::new, |scope| scope.gats().to_vec())
         });
-        self.leave_scope(mark, error.is_some());
-        if let Some(error) = error {
-            return Err(error);
-        }
+        self.leave_scope(&mark);
         let top_level = module.unwrap_or_else(|| {
             // The scope is in the module around it, if any.
             let around = self.modules.last().map(|module| module.id);
@@ -1575,7 +1542,7 @@ impl AnalyzeVisitor {
             self.contexts.intern(context.with_module(around))
         });
         self.top_levels.push(top_level);
-        Ok(top_level)
+        top_level
     }
 
     fn analyze_default_inline(&mut self, ty: &Type, before: &Generics) {
@@ -1604,10 +1571,9 @@ impl AnalyzeVisitor {
         self.in_default.unwrap_or_else(|| self.self_ty.is_some())
     }
 
-    /// Returns `true` if the type whose frame is `inner`, which is an entry in `context`, names a
-    /// `Self` that has no meaning here, or a bound of `context` does. The impl of the Repeater for
-    /// it would read that `Self` as its own implementor: `correct_unmeant_self()` copies it as
-    /// written instead if the error is accepted.
+    /// Returns `true` if the type whose frame is `inner`, an entry in `context`, names a `Self`
+    /// without meaning, or a bound of `context` does: the impl of the Repeater would read it as its
+    /// implementor (see `correct_unmeant_self()`).
     fn names_unmeant_self(&self, inner: &Frame, context: &Context) -> bool {
         self.self_errors.len() > inner.self_start
             || (!self.self_has_meaning() && !selves_in_generics(context.generics()).is_empty())
@@ -1730,6 +1696,7 @@ impl AnalyzeVisitor {
                 // The default as a whole is what to change, the note is at the `Self` in it.
                 cause: Some(Cause::Type(ty.clone())),
                 reason: Reason::SelfInDefault,
+                seen: 0,
                 part: None,
             });
         }
@@ -1750,6 +1717,7 @@ impl AnalyzeVisitor {
                     headline: Some(unnameable.headline),
                     cause: None,
                     reason: Reason::UnnameableSelf,
+                    seen: 0,
                     part: None,
                 })
             }
@@ -1790,6 +1758,7 @@ impl AnalyzeVisitor {
                 )),
                 cause: None,
                 reason: Reason::SelfInDefault,
+                seen: 0,
                 part: None,
             }),
             Some(self_path) if self.self_nested => Err(CheckResult {
@@ -1820,6 +1789,7 @@ impl AnalyzeVisitor {
                 )),
                 cause: None,
                 reason: Reason::NestedSelfInBounds,
+                seen: 0,
                 part: None,
             }),
             Some(self_path) => Err(CheckResult {
@@ -1843,6 +1813,7 @@ impl AnalyzeVisitor {
                 )),
                 cause: None,
                 reason: Reason::DeniedSelfInBounds,
+                seen: 0,
                 part: None,
             }),
             None => match self.associated_self_in_bounds(&context) {
@@ -2250,7 +2221,8 @@ impl AnalyzeVisitor {
                         for needed in &needs {
                             if let Some(conflict) = self.self_env_cycle(ty, needed) {
                                 // The type is left without an entry, and copied as written.
-                                let conflict = self.with_part(conflict, ty, context);
+                                let mut conflict = self.with_part(conflict, ty, context);
+                                conflict.seen = self.self_errors.len();
                                 return self.env_errors.push(conflict);
                             }
                         }
@@ -2275,7 +2247,7 @@ impl AnalyzeVisitor {
             Some(Ok(context)) => {
                 if let Some(conflict) = self.env_cycle(ty, &context) {
                     let conflict = self.with_part(conflict, ty, context);
-                    return self.frame.effects.push(Effect::Error(Box::new(conflict)));
+                    return self.push_error(conflict);
                 }
                 self.not_optional_in_bounds(&context);
                 PendingType {
@@ -2296,7 +2268,7 @@ impl AnalyzeVisitor {
                     Ok(context) => self.with_part(conflict, ty, context),
                     Err(_) => conflict,
                 };
-                return self.frame.effects.push(Effect::Error(Box::new(conflict)));
+                return self.push_error(conflict);
             }
             None if has_impossible => {
                 if has_must || has_optional(&effects) {
@@ -2343,7 +2315,7 @@ impl AnalyzeVisitor {
                 if leaked_whole {
                     if let Some(conflict) = self.env_cycle(ty, &context) {
                         let conflict = self.with_part(conflict, ty, context);
-                        return self.frame.effects.push(Effect::Error(Box::new(conflict)));
+                        return self.push_error(conflict);
                     }
                     self.not_optional_in_bounds(&context);
                 }
@@ -2384,13 +2356,9 @@ impl AnalyzeVisitor {
         self.frame.effects.push(Effect::Type(Box::new(pending)));
     }
 
-    /// Pushes `effects`, those of the parts of `ty` at `depth`, which is not leaked whole because of
-    /// a cause (an elided lifetime, `impl Trait`). If the cause is its own, the parts among them
-    /// (a conflict that was accepted, or a correction) are copied as written inside `ty` only: it
-    /// is their anchor. Else the Referrer could not tell the `dyn RelTr` of `::p::Elided<'_, dyn
-    /// RelTr>`, which is copied as written, from that of `::p::Bare<dyn RelTr>`, an entry. `ty`
-    /// itself and the types beside the parts are as they were: entries, if they are. A type whose
-    /// context cannot be written is found nowhere, so it is no anchor.
+    /// Pushes `effects`, those of the parts of `ty` at `depth`, which an own cause (an elided
+    /// lifetime, `impl Trait`) stops from being leaked whole. The parts among them are copied as
+    /// written inside `ty` only: it is their anchor, unless its context cannot be written.
     fn push_parts(&mut self, ty: &Type, depth: usize, inner: &Frame, mut effects: Vec<Effect>) {
         if self.impossibles.own_since(inner.impossible_start, depth) && has_error(&effects) {
             if let Ok(context) = self.context_of(ty, inner) {
@@ -2400,8 +2368,8 @@ impl AnalyzeVisitor {
         self.frame.effects.extend(effects);
     }
 
-    /// Gives `conflict`, which is about `ty` in `context`, the part that the Referrer leaves as
-    /// written: the type is copied whole, so nothing in it is an entry (see [`Part`]).
+    /// Gives `conflict`, about `ty` in `context`, the part that the Referrer leaves as written: the
+    /// whole type (see [`Part`]).
     fn with_part(&self, mut conflict: CheckResult, ty: &Type, context: Context) -> CheckResult {
         conflict.part = Some(Part {
             cause: Cause::Type(ty.clone()),
@@ -2412,11 +2380,9 @@ impl AnalyzeVisitor {
         conflict
     }
 
-    /// Returns the part for a node that is copied as written, whole, though types are in it: a
-    /// bound whose trait path conflicts (`Rel<R0>` in `T: Rel<R0>`), or a path of a value that does
-    /// (`Cause::Expr`). `path` is the path of the node, which stands for it when the context is
-    /// computed: the generics it names and their bounds, as a type's are. The path is relative, so
-    /// in a module it is the module's. `None` if the context cannot be written.
+    /// Returns the part for a node copied as written, whole, though types are in it: a bound whose
+    /// trait path conflicts (`Rel<R0>` in `T: Rel<R0>`), or a path of a value. `path` stands for it
+    /// as a type, to compute the context. `None` if the context cannot be written.
     fn node_part(&self, cause: Cause, path: &Path) -> Option<Part> {
         let ty = Type::Path(TypePath {
             qself: None,
@@ -2588,6 +2554,7 @@ impl AnalyzeVisitor {
             )),
             cause: None,
             reason: Reason::UnprovableBound,
+            seen: 0,
             part: None,
         }
     }
@@ -2617,6 +2584,7 @@ impl AnalyzeVisitor {
             )),
             cause: None,
             reason: Reason::UnprovableBound,
+            seen: 0,
             part: None,
         }
     }
@@ -2893,11 +2861,10 @@ impl AnalyzeVisitor {
         }
     }
 
-    /// Records the conflict of a relative path, `cause` as written, which cannot be leaked as a
-    /// whole because of `impossible`. `part` is the node that is copied as written, if the
-    /// Referrer has to leave it so.
+    /// Records the conflict of a relative path `cause`, which cannot be leaked as a whole because
+    /// of `impossible`. `part`: the node copied as written, if the Referrer has to leave it so.
     fn relative_path(&mut self, cause: Cause, impossible: Cause, part: Option<Part>) {
-        self.frame.effects.push(Effect::Error(Box::new(CheckResult {
+        self.push_error(CheckResult {
             must: vec![cause],
             impossible: vec![impossible],
             is_own: true,
@@ -2907,8 +2874,16 @@ impl AnalyzeVisitor {
             headline: None,
             cause: None,
             reason: Reason::RelativePath,
+            seen: 0,
             part,
-        })));
+        });
+    }
+
+    /// Records the conflict as an effect, with the number of mentions of `Self` without meaning
+    /// found so far (see [`CheckResult::seen`]).
+    fn push_error(&mut self, mut conflict: CheckResult) {
+        conflict.seen = self.self_errors.len();
+        self.frame.effects.push(Effect::Error(Box::new(conflict)));
     }
 
     /// Walks the parts of an impl as `syn::visit::visit_item_impl()` does, with the self type
@@ -2998,19 +2973,19 @@ impl AnalyzeVisitor {
     /// an outer scope that names its own `Self` is written for the type that scope knows.
     fn cut_self_cycles(&mut self, start: usize, generics: &Generics) {
         let mut not_optional = Vec::new();
+        let seen = self.self_errors.len();
         cut_conflicts(
             &mut self.frame.effects[start..],
             &|pending| self_type_conflict(pending, generics),
+            seen,
             &mut not_optional,
         );
         self.not_optional.extend(not_optional);
     }
 
     /// Records an error if a trait path depends on the context or starts with `Self` without a
-    /// meaning. Returns `true` if so. `cause` is what the error is reported at: the path, or the
-    /// bound if it has more than a path (see [`bound_cause()`]). `whole`: the caller copies the
-    /// bound as written, whole, if it returns `true`, so the Referrer must leave it so (a relative
-    /// path; a `Self` without meaning is not a conflict of the bound).
+    /// meaning. Returns `true` if so. `cause` is what the error is reported at ([`bound_cause()`]).
+    /// `whole`: the caller copies the bound as written, so a relative path is a part, not a `Self`.
     fn check_bound_path(&mut self, path: &Path, cause: Cause, whole: bool) -> bool {
         if self_segment(path).is_some() && self.self_ty.is_none() {
             // The mention of `Self` is the error; the bound is copied as written, whole.
@@ -3465,9 +3440,9 @@ impl AnalyzeVisitor {
             }
         }
         // The type is the entry that the conflict is about, chosen before the conflict was found:
-        // it is copied as written whole instead, as a trait object is (see `own_context()`), if the
-        // error is accepted. The scope is rolled back otherwise. Only the types of this signature
-        // are looked at: an address of the syntax can be one of a type that is gone.
+        // it is copied as written whole instead, as a trait object is (see `own_context()`). Only
+        // the types of this signature are looked at: an address of the syntax can be one of a type
+        // that is gone.
         if !corrected.is_empty() {
             let found = self
                 .frame
@@ -3479,11 +3454,13 @@ impl AnalyzeVisitor {
                     corrected.contains(&pending.origin)
                 }));
         }
-        self.frame.effects.extend(
-            conflicts
-                .into_iter()
-                .map(|conflict| Effect::Error(Box::new(conflict))),
-        );
+        let seen = self.self_errors.len();
+        self.frame
+            .effects
+            .extend(conflicts.into_iter().map(|mut conflict| {
+                conflict.seen = seen;
+                Effect::Error(Box::new(conflict))
+            }));
     }
 
     /// Returns the lifetimes of `sig` that the copy would leave unconstrained, making them
@@ -3938,13 +3915,14 @@ impl AnalyzeVisitor {
         &mut self,
         spec: ScopeSpec,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         let mark = self.enter_scope(&spec, false);
         // The closure may panic and the scope around may catch it: leave the scope as if it failed.
         match catch_unwind(AssertUnwindSafe(|| f(&mut View::new(self)))) {
-            Ok(result) => self.end_scope(mark, &spec).map(|context| (context, result)),
+            Ok(result) => (self.end_scope(mark, &spec), result),
             Err(payload) => {
-                self.leave_scope(mark, true);
+                self.leave_scope(&mark);
+                self.roll_back(&mark);
                 resume_unwind(payload)
             }
         }
@@ -3959,8 +3937,7 @@ enum PathOf {
     Value,
     /// The path of a macro call.
     Macro,
-    /// The path of a qualified type (`Tr<u8>::X` in `<Self as Tr<u8>>::X`), which no node of the
-    /// syntax holds.
+    /// The path of a qualified type (`Tr<u8>::X` in `<Self as Tr<u8>>::X`), which no node holds.
     Qualified,
 }
 
@@ -4036,8 +4013,8 @@ impl AnalyzeVisitor {
         syn::visit::visit_path(self, i)
     }
 
-    /// Visits the path of the expression `i` as `syn::visit::visit_expr_path()` does, with the path
-    /// told to be that of a value.
+    /// Visits the path of the expression `i` as `syn::visit::visit_expr_path()` does, as a value's
+    /// path.
     fn walk_expr_path(&mut self, i: &ExprPath) {
         for attr in &i.attrs {
             self.visit_attribute(attr);
@@ -4799,6 +4776,7 @@ impl AssocSelf {
             headline: None,
             cause: None,
             reason: Reason::SelfProjection,
+            seen: 0,
             part: None,
         };
         self.give(&mut conflict, ty, true);
@@ -4892,6 +4870,7 @@ fn absolute_example(path: &Path) -> String {
 fn cut_conflicts(
     effects: &mut [Effect],
     conflict: &dyn Fn(&PendingType) -> Option<CheckResult>,
+    seen: usize,
     not_optional: &mut Vec<(Context, String)>,
 ) {
     for effect in effects.iter_mut() {
@@ -4904,6 +4883,7 @@ fn cut_conflicts(
             if pending.in_graph && (pending.is_must_intern || whole) {
                 // The type is copied as written instead.
                 error.part = Some(pending.part());
+                error.seen = seen;
                 *effect = Effect::Error(Box::new(error));
                 continue;
             }
@@ -4919,7 +4899,7 @@ fn cut_conflicts(
                 pending.optional = false;
             }
         }
-        cut_conflicts(&mut pending.components, conflict, not_optional);
+        cut_conflicts(&mut pending.components, conflict, seen, not_optional);
     }
 }
 
@@ -5051,6 +5031,7 @@ fn self_type_conflict(pending: &PendingType, declared: &Generics) -> Option<Chec
         )),
         cause: None,
         reason: Reason::SelfInImplSelfType,
+        seen: 0,
         part: None,
     })
 }

@@ -55,8 +55,8 @@ let item: ItemTrait = parse_quote! {
 
 // Crate A, step 1: analyze the trait.
 let mut leaker = Leaker::new();
-let top_level = leaker.intern_trait(&item, true).unwrap();
-let referrer = leaker.finish();
+let top_level = leaker.intern_trait(&item, true);
+let referrer = leaker.result().finish().unwrap();
 
 // Crate A, step 2: one Repeater impl per entry (`42` is the ID).
 let self_param: Ident = parse_quote!(__S);
@@ -93,14 +93,17 @@ assert_eq!(
 
 Only the entries are rewritten: `t: T` is left for you to write as `u8`.
 
+If the item has a part that cannot be leaked (`MyType<'_>`), the `Leaker` copies the part as written, goes on and records an error: `finish()` is then `Err` with the errors, and `into_referrer()` is still the `Referrer` of the rest. Report the errors with `ErrorItem::to_compile_error()` and go on with the output, or give up.
+
 In real macros, crate A passes `referrer` and `top_level` to crate B as tokens (`ToTokens` / `Parse`), usually through a `macro_rules!` it exports. [`examples/two-macros`](https://github.com/yasuo-ozu/type-leak/tree/main/examples/two-macros) is a complete, tested setup.
 
 # Learn more
 
 - [API docs](https://docs.rs/type-leak/latest/type_leak/): every item has examples. Start with:
   - [`Leaker`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html), which analyzes an item: [`intern_trait`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#method.intern_trait) and the other `intern_*` methods for a whole item, [`enter_impl`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#method.enter_impl) and the other `enter_*` methods for parts of one.
+  - [`LeakerResult`](https://docs.rs/type-leak/latest/type_leak/struct.LeakerResult.html), what `Leaker::result()` returns: the `Referrer` and the errors.
   - [`Referrer`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html), its result: [`repeater_impl`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.repeater_impl) in crate A, [`visitor`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.visitor) and [`entry_args`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.entry_args) in crate B.
   - [`repeater_definition`](https://docs.rs/type-leak/latest/type_leak/fn.repeater_definition.html), which generates the Repeater trait.
-  - [`ErrorItem`](https://docs.rs/type-leak/latest/type_leak/struct.ErrorItem.html), the error of the `Leaker`, for reporting errors from your macro (`to_compile_error()`).
+  - [`ErrorItem`](https://docs.rs/type-leak/latest/type_leak/struct.ErrorItem.html), the error of the `Leaker`, for reporting errors from your macro (`to_compile_error()`). The `Leaker` [recovers from errors](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#errors-and-recovery): it records them and goes on.
 - [Limitations of the `Leaker`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#limitations): what cannot be leaked, and [what the Leaker checks](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#what-the-leaker-checks). An error of the Leaker carries a `help` that says what to write instead (`ErrorItem::help`).
 - [`examples/two-macros`](https://github.com/yasuo-ozu/type-leak/tree/main/examples/two-macros): a complete, tested pair of proc macros.

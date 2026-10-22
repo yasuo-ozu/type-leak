@@ -17,24 +17,41 @@ fn config() -> LeakerConfig {
     LeakerConfig::new()
 }
 
-fn leak_trait_with(config: LeakerConfig, item: &ItemTrait) -> std::result::Result<Leaker, String> {
+/// The Referrer of `item`, or the text of its errors.
+fn leak_trait_with(
+    config: LeakerConfig,
+    item: &ItemTrait,
+) -> std::result::Result<Referrer, String> {
     let mut leaker = Leaker::from_config(config);
+    leaker.intern_trait(item, true);
     leaker
-        .intern_trait(item, true)
-        .map_err(|e| to_syn_error(&e).to_string())?;
-    Ok(leaker)
+        .result()
+        .finish()
+        .map_err(|e| to_syn_error(&e).to_string())
 }
 
 fn leak_trait(item: ItemTrait) -> Referrer {
-    leak_trait_with(config(), &item).unwrap().finish()
+    leak_trait_with(config(), &item).unwrap()
 }
 
-fn leak_module_with(config: LeakerConfig, item: &ItemMod) -> std::result::Result<Leaker, String> {
+/// The compile-time checks that the analysis of `item` asks for (`Leaker::assertions()`); it has
+/// no error.
+fn assertions_of(config: LeakerConfig, item: &ItemTrait) -> String {
     let mut leaker = Leaker::from_config(config);
+    leaker.intern_trait(item, true);
+    let assertions = leaker.assertions().to_string();
+    leaker.result().finish().unwrap();
+    assertions
+}
+
+/// The Referrer of the module `item`, or the text of its errors.
+fn leak_module_with(config: LeakerConfig, item: &ItemMod) -> std::result::Result<Referrer, String> {
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_mod(item);
     leaker
-        .intern_mod(item)
-        .map_err(|e| to_syn_error(&e).to_string())?;
-    Ok(leaker)
+        .result()
+        .finish()
+        .map_err(|e| to_syn_error(&e).to_string())
 }
 
 /// The required leaked types with their generics (and where clause). The optional entries (the
@@ -289,8 +306,7 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
         allowed,
         &parse_quote! { trait Tr { fn f<'a>(&self, x: &'a dyn RelTr, y: &'a dyn ::p::Tr) -> &'a (); } },
     )
-    .unwrap()
-    .finish();
+    .unwrap();
     assert_eq!(entries(&referrer), [e("& 'a dyn RelTr", "< 'a >")]);
     // The default of a `Box` is `'static`, so the trait object is interned alone.
     let referrer = leak_trait(parse_quote! {
@@ -348,7 +364,7 @@ fn module_key_follows_module_relative_requirements() {
             pub mod b { pub struct S(::p::W<'x, Self>); }
         }
     };
-    let referrer = leak_module_with(config(), &m).unwrap().finish();
+    let referrer = leak_module_with(config(), &m).unwrap();
     assert_eq!(referrer.iter().count(), 2);
     assert_eq!(
         modules(&referrer),
@@ -361,7 +377,7 @@ fn module_key_follows_module_relative_requirements() {
             pub mod b { pub trait L {} pub struct S<T: L>(::p::W<'x, T>); }
         }
     };
-    let referrer = leak_module_with(config(), &m).unwrap().finish();
+    let referrer = leak_module_with(config(), &m).unwrap();
     assert_eq!(
         entries(&referrer),
         [
@@ -380,7 +396,7 @@ fn module_key_follows_module_relative_requirements() {
             pub mod b { pub struct S<T: ::p::L>(::p::W<'x, T>); }
         }
     };
-    let referrer = leak_module_with(config(), &m).unwrap().finish();
+    let referrer = leak_module_with(config(), &m).unwrap();
     assert_eq!(referrer.iter().count(), 1);
     assert_eq!(modules(&referrer), [None]);
 }
@@ -410,7 +426,7 @@ fn impl_trait_path_is_checked_like_a_bound() {
             impl ::p::Tr<Rel2> for S {}
         }
     };
-    let referrer = leak_module_with(config(), &m).unwrap().finish();
+    let referrer = leak_module_with(config(), &m).unwrap();
     assert_eq!(entries(&referrer), [e("Rel", ""), e("Rel2", "")]);
 }
 
@@ -430,7 +446,7 @@ fn relative_use_is_not_portable_in_nested_modules() {
             );
         }
     };
-    let referrer = leak_module_with(config(), &m).unwrap().finish();
+    let referrer = leak_module_with(config(), &m).unwrap();
     assert_eq!(
         entries(&referrer),
         [e("inner :: Missing", ""), e("inner :: Rel", "")]
@@ -448,14 +464,14 @@ fn type_macros() {
     let item: ItemStruct = parse_quote! {
         struct S { f: ::p::Wrap<::p::m!(Self)> }
     };
-    assert!(Leaker::from_config(config())
-        .intern_struct(&item, true)
-        .is_ok());
-    let err = Leaker::from_config(config())
-        .intern_struct(&item, false)
-        .err()
-        .map(|e| to_syn_error(&e).to_string())
-        .unwrap();
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_struct(&item, true);
+    assert!(leaker.result().finish().is_ok());
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_struct(&item, false);
+    let result = leaker.result();
+    assert!(!result.errors().is_empty());
+    let err = to_syn_error(result.errors()).to_string();
     assert!(err.contains("because of `Self`"), "{}", err);
     // In a module, a macro is expanded where it is written, whatever its path is.
     let m: ItemMod = parse_quote! {
@@ -464,7 +480,7 @@ fn type_macros() {
             pub mod b { pub struct S(::p::m!(x)); }
         }
     };
-    let referrer = leak_module_with(config(), &m).unwrap().finish();
+    let referrer = leak_module_with(config(), &m).unwrap();
     assert_eq!(
         modules(&referrer),
         [Some(vec!["a".to_string()]), Some(vec!["b".to_string()])]
@@ -475,28 +491,34 @@ fn type_macros() {
 fn primitives_are_assumed_when_the_type_is_copied() {
     let mut config = config();
     config.allow_primitive();
-    let leaker = leak_trait_with(
+    let assertions = assertions_of(
         config.clone(),
         &parse_quote! { trait Tr { fn f(&self) -> &u8; } },
-    )
-    .unwrap();
+    );
+    assert!(assertions.contains("__type_leak_assert_u8_is_primitive"));
+    let assertions = assertions_of(
+        config.clone(),
+        &parse_quote! { trait Tr { fn f(&self) -> impl ::p::Into<u16>; } },
+    );
+    assert!(assertions.contains("__type_leak_assert_u16_is_primitive"));
+    // The analysis recovers from an error, so what it found is recorded: `u8` is copied.
+    let mut leaker = Leaker::from_config(config);
+    let item: ItemTrait = parse_quote! { trait Tr: Clone { fn f(&self) -> u8; } };
+    leaker.intern_trait(&item, true);
     assert!(leaker
         .assertions()
         .to_string()
         .contains("__type_leak_assert_u8_is_primitive"));
-    let leaker = leak_trait_with(
-        config.clone(),
-        &parse_quote! { trait Tr { fn f(&self) -> impl ::p::Into<u16>; } },
-    )
-    .unwrap();
-    assert!(leaker
-        .assertions()
-        .to_string()
-        .contains("__type_leak_assert_u16_is_primitive"));
-    // Nothing is recorded on an error.
-    let mut leaker = Leaker::from_config(config);
-    let item: ItemTrait = parse_quote! { trait Tr: Clone { fn f(&self) -> u8; } };
-    assert!(leaker.intern_trait(&item, true).is_err());
+    assert!(leaker.result().finish().is_err());
+    // But not on a panic.
+    let mut leaker = Leaker::new();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = leaker.enter_generics(&Generics::default(), |view| {
+            view.visit_type(&parse_quote!(Vec<u8>));
+            panic!("a closure panics");
+        });
+    }));
+    assert!(result.is_err());
     assert!(leaker.assertions().is_empty());
 }
 
@@ -513,7 +535,7 @@ fn raw_identifiers_are_compared_by_name() {
     let m: ItemMod = parse_quote! {
         mod m { pub struct S<r#T>(Rel<T>); }
     };
-    let referrer = leak_module_with(config(), &m).unwrap().finish();
+    let referrer = leak_module_with(config(), &m).unwrap();
     assert_eq!(entries(&referrer), [e("Rel < T >", "< r#T >")]);
 }
 
@@ -526,17 +548,17 @@ fn qualified_self_through_generics() {
     // `check()` in the trait agrees, where `Self` is the implementor.
     let generics: Generics = parse_quote!(<T>);
     let mut leaker = Leaker::new();
-    let (_, results) = leaker
-        .enter_trait(&parse_quote!(Tr), &generics, true, |view| {
-            let mut check = |ty: Type| view.check(&ty);
-            [
-                check(parse_quote!(<T>::X)),
-                check(parse_quote!(<Self>::X)),
-                check(parse_quote!(<Rel>::X)),
-                check(parse_quote!(<U>::X)),
-            ]
-        })
-        .unwrap();
+    let (_, results) = leaker.enter_trait(&parse_quote!(Tr), &generics, true, |view| {
+        let mut check = |ty: Type| view.check(&ty);
+        [
+            check(parse_quote!(<T>::X)),
+            check(parse_quote!(<Self>::X)),
+            check(parse_quote!(<Rel>::X)),
+            check(parse_quote!(<U>::X)),
+        ]
+    });
+    // A check records no error.
+    assert!(leaker.result().errors().is_empty());
     let [through_param, through_self, relative, undeclared] = results;
     assert!(through_param.must.is_empty() && through_param.impossible.is_empty());
     assert!(through_self.must.is_empty() && through_self.impossible.is_empty());

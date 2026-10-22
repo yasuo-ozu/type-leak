@@ -235,7 +235,7 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9076!(path = ::type_leak_test_leaker::kinds);
 }
 
-/// Items that the Leaker rejects and accepts with `LeakerConfig::allow()` of the causes of their
+/// Items that the Leaker rejects and accepts with `LeakerResult::allow()` of the causes of their
 /// errors: the part that conflicts is copied as written, so this module names what the copies name
 /// (`Held`, `ElidedTr`, `SharedTr`, `Wrap`) and invokes them with `accept`. Everything else is
 /// replaced as usual.

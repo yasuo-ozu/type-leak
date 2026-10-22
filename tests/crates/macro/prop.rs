@@ -27,10 +27,11 @@
 //! impl) or the host type (a trait). A module cannot name `Self`, so its items do not.
 //!
 //! With `#[prop_leak_accept]` (`TYPE_LEAK_PROP_ACCEPT`, see `tests/prop_cross_crate/main.rs`), an item
-//! that the Leaker rejects is analyzed again with `LeakerConfig::allow(cause)` for the cause of every
-//! error, and the result is emitted as that of an accepted item (the report says `acc`, and the errors
-//! of the first analysis). Its copy is made in the Referrer's crate of the accepted items only
-//! (`accept` in the invocation, [`apply()`]), where the parts that it keeps as written resolve.
+//! that the Leaker rejects is emitted as an accepted item with the recovered Referrer
+//! (`LeakerResult::into_referrer()`: the report says `acc`, and has the errors) if
+//! `LeakerResult::allow(cause)` for the cause of every error drops every error. Its copy is made in
+//! the Referrer's crate of the accepted items only (`accept` in the invocation, [`apply()`]), where
+//! the parts that it keeps as written resolve.
 
 use proc_macro2::{Punct, Spacing, Span, TokenStream};
 use std::collections::HashSet;
@@ -82,10 +83,10 @@ pub(crate) struct Args {
     /// The Leaker accepts an entry that names the own `Self` of a nested item together with a bound
     /// that does (`LeakerConfig::nested_self_entries()`).
     nested_self_entries: bool,
-    /// Not an argument of the attribute: set by [`leak()`] when the item is accepted only by
-    /// `LeakerConfig::allow()` of the cause of every error of its first analysis (`prop_leak_accept`,
-    /// `TYPE_LEAK_PROP_ACCEPT`). The Referrer copies such an item in the crate of its own that
-    /// `tests/prop_cross_crate` makes for them (`accept`, [`apply()`]), and in no other.
+    /// Not an argument of the attribute: set by [`leak()`] when the item has errors and is accepted
+    /// with the recovered Referrer (`prop_leak_accept`, `TYPE_LEAK_PROP_ACCEPT`). The Referrer copies
+    /// such an item in the crate of its own that `tests/prop_cross_crate` makes for them (`accept`,
+    /// [`apply()`]), and in no other.
     accepted: bool,
 }
 
@@ -188,19 +189,8 @@ fn ident(name: &str) -> Ident {
 /// - `impl`: an impl in `enter_impl(..)`, where only the self type and the arguments of the trait
 ///   are visited (the shape of a macro that resolves the trait by its name). The generics and the
 ///   items of the impl are not analyzed, and not compared.
-///
-/// `allowed` are the causes the configuration accepts (`LeakerConfig::allow()`): none for the
-/// analysis of an item, the cause of every error of the first analysis for the second one of
-/// `TYPE_LEAK_PROP_ACCEPT` ([`leak()`]).
-fn analyze(
-    item: &Item,
-    args: &Args,
-    allowed: &[Cause],
-) -> std::result::Result<(Referrer, ContextId, TokenStream), Vec<ErrorItem>> {
+fn analyze(item: &Item, args: &Args) -> (LeakerResult, ContextId, TokenStream) {
     let mut config = LeakerConfig::new();
-    for cause in allowed {
-        config.allow(cause.clone());
-    }
     if args.primitive {
         config.allow_primitive();
     }
@@ -228,29 +218,29 @@ fn analyze(
             leaker
                 .enter_mod(format!("prop{}", args.id), [name], |view| {
                     view.visit_item(item)
-                })?
+                })
                 .0
         }
         ("generics", Item::Struct(i)) => {
             leaker
-                .enter_generics(&i.generics, |view| syn::visit::visit_item_struct(view, i))?
+                .enter_generics(&i.generics, |view| syn::visit::visit_item_struct(view, i))
                 .0
         }
         ("generics", Item::Enum(i)) => {
             leaker
-                .enter_generics(&i.generics, |view| syn::visit::visit_item_enum(view, i))?
+                .enter_generics(&i.generics, |view| syn::visit::visit_item_enum(view, i))
                 .0
         }
         ("generics", Item::Union(i)) => {
             leaker
-                .enter_generics(&i.generics, |view| syn::visit::visit_item_union(view, i))?
+                .enter_generics(&i.generics, |view| syn::visit::visit_item_union(view, i))
                 .0
         }
         ("trait", Item::Trait(i)) => {
             leaker
                 .enter_trait(&i.ident, &i.generics, allow_self, |view| {
                     syn::visit::visit_item_trait(view, i)
-                })?
+                })
                 .0
         }
         ("impl", Item::Impl(i)) => {
@@ -262,19 +252,28 @@ fn analyze(
                             view.visit_path_arguments(&seg.arguments);
                         }
                     }
-                })?
+                })
                 .0
         }
-        ("", Item::Struct(i)) => leaker.intern_struct(i, allow_self)?,
-        ("", Item::Enum(i)) => leaker.intern_enum(i, allow_self)?,
-        ("", Item::Union(i)) => leaker.intern_union(i, allow_self)?,
-        ("", Item::Trait(i)) => leaker.intern_trait(i, allow_self)?,
-        ("", Item::Impl(i)) => leaker.intern_impl(i, allow_self)?,
-        ("", Item::Mod(i)) => leaker.intern_mod(i)?,
+        ("", Item::Struct(i)) => leaker.intern_struct(i, allow_self),
+        ("", Item::Enum(i)) => leaker.intern_enum(i, allow_self),
+        ("", Item::Union(i)) => leaker.intern_union(i, allow_self),
+        ("", Item::Trait(i)) => leaker.intern_trait(i, allow_self),
+        ("", Item::Impl(i)) => leaker.intern_impl(i, allow_self),
+        ("", Item::Mod(i)) => leaker.intern_mod(i),
         _ => panic!("unsupported item"),
     };
     let assertions = leaker.assertions();
-    Ok((leaker.finish(), context, assertions))
+    (leaker.result(), context, assertions)
+}
+
+/// The analysis of `item` as [`crate::bare::check()`] compares them: the Referrer if no error remains,
+/// else the errors.
+fn analysis(item: &Item, args: &Args) -> crate::bare::Analysis {
+    let (result, context, assertions) = analyze(item, args);
+    result
+        .finish()
+        .map(|referrer| (referrer, context, assertions))
 }
 
 pub(crate) fn identity_args(generics: &Generics) -> Vec<GenericArgument> {
@@ -1954,13 +1953,12 @@ fn rejection_text(errors: &[ErrorItem]) -> String {
 
 /// `#[prop_leak(..)]`, and, with `accept`, `#[prop_leak_accept(..)]` (`TYPE_LEAK_PROP_ACCEPT`).
 ///
-/// With `accept`, an item that the Leaker rejects is analyzed again with the same configuration and
-/// `LeakerConfig::allow(cause)` for the cause of every error of the first analysis. The errors of
-/// the first one are what the report says (and what `family()` of the harness explains); the result
-/// of the second one is emitted as that of an accepted item (the Repeater's impls, the witnesses,
-/// the macro of the Referrer, which copies the part that conflicts as written), with the status
-/// `acc`. If the second analysis fails too, the status is `accfail` and the remaining errors follow
-/// the first ones: it must not happen (the same analysis, the errors filtered).
+/// With `accept`, an item that the Leaker rejects is emitted with the recovered Referrer
+/// (`LeakerResult::into_referrer()`) as an accepted item (the Repeater's impls, the witnesses, the
+/// macro of the Referrer, which copies the part that conflicts as written), with the status `acc`,
+/// if `LeakerResult::allow(cause)` for the cause of every error drops every error (else `accfail`,
+/// and the remaining errors follow the first ones: it must not happen). The errors are what the
+/// report says (and what `family()` of the harness explains).
 pub(crate) fn leak(attr: TokenStream, item: TokenStream, accept: bool) -> Result<TokenStream> {
     let mut args: Args = parse2(attr)?;
     let original: Item = parse2(item)?;
@@ -1970,54 +1968,40 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, accept: bool) -> Result
     let errors_name = ident(&format!("__tl_errors_{}", id));
     let mac_name = ident(&format!("__tl_prop_{}", id));
     let dollar = dollar();
-    let analysis = analyze(&original, &args, &[]);
+    let (result, context, assertions) = analyze(&original, &args);
     // The bare spelling of a trait of the prelude: its twin in full gives the same entries if the
-    // names of the prelude are allowed, and it is a relative path if they are not. (The first
-    // analysis only: the twin of an item that is accepted by `allow()` is not analyzed again.)
+    // names of the prelude are allowed, and it is a relative path if they are not.
+    let first = result
+        .clone()
+        .finish()
+        .map(|referrer| (referrer, context, assertions.clone()));
     let twin = crate::bare::check(
         &original,
         args.scope == "impl",
         args.prelude,
         args.relaxed_sized,
-        &analysis,
-        |twin| analyze(twin, &args, &[]),
+        &first,
+        |twin| analysis(twin, &args),
     )?;
-    // The errors of the first analysis (none if it succeeded), and, if the second one failed, its
-    // errors.
-    let mut errors: Vec<ErrorItem> = Vec::new();
-    let mut remaining: Option<Vec<ErrorItem>> = None;
-    let result = match analysis {
-        Ok(result) => Some(result),
-        Err(first) if accept => {
-            let causes: Vec<Cause> = first.iter().map(|error| error.cause.clone()).collect();
-            errors = first;
-            match analyze(&original, &args, &causes) {
-                Ok(result) => {
-                    args.accepted = true;
-                    Some(result)
-                }
-                Err(rest) => {
-                    remaining = Some(rest);
-                    None
-                }
-            }
+    // The errors of the analysis (none if it succeeded).
+    let errors: Vec<ErrorItem> = result.errors().to_vec();
+    if !errors.is_empty() {
+        // With `accept`, the cause of every error is allowed, which must drop every error: the
+        // Referrer is the recovered one either way.
+        let mut allowed = result.clone();
+        for error in &errors {
+            allowed.allow(error.cause.clone());
         }
-        Err(first) => {
-            errors = first;
-            None
-        }
-    };
-    let (referrer, context, assertions) = match result {
-        Some(result) => result,
-        None => {
+        let remaining = allowed.errors().to_vec();
+        if !accept || !remaining.is_empty() {
             // The item is not leaked: the Leaker's crate still has it.
-            let status = if remaining.is_some() { "accfail" } else { "rej" };
+            let status = if accept { "accfail" } else { "rej" };
             let reason = crate::messages(&errors).replace(['\n', '|'], " ");
             let report = format!("{}|{}|{}|{}", id, kind, status, reason);
             let mut errors = rejection_text(&errors);
-            if let Some(rest) = &remaining {
+            if accept {
                 errors.push('\u{1c}');
-                errors.push_str(&rejection_text(rest));
+                errors.push_str(&rejection_text(&remaining));
             }
             return Ok(quote! {
                 #original
@@ -2032,7 +2016,10 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, accept: bool) -> Result
                 macro_rules! #mac_name { (#dollar(#dollar t:tt)*) => {}; }
             });
         }
-    };
+        args.accepted = true;
+    }
+    // The recovered Referrer: the parts that conflict are copied as written.
+    let referrer = result.into_referrer();
 
     check_nested_self_is_required(&referrer, &original, &args)?;
     let (impls, skipped) = repeater_impls(&referrer, id, args.strict.unwrap_or(true))?;

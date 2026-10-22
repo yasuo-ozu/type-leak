@@ -142,12 +142,13 @@ fn a_bare_name_gets_the_help_with_its_absolute_path() {
         let help = format!("use `{}` instead of `{}`", absolute, name);
         for (form, source, message) in forms(name) {
             let item: ItemTrait = parse_str(&source).unwrap();
-            let err = Leaker::new()
-                .intern_trait(&item, true)
-                .err()
-                .unwrap_or_else(|| panic!("`{}` is accepted: {}", name, source));
+            let mut leaker = Leaker::new();
+            leaker.intern_trait(&item, true);
+            let result = leaker.result();
+            let err = result.errors();
+            assert!(!err.is_empty(), "`{}` is accepted: {}", name, source);
             let context = format!("{} as a {}: {}", name, form, source);
-            let items = &err;
+            let items = err;
             assert_eq!(items.len(), 1, "{}", context);
             assert_eq!(items[0].message, message, "{}", context);
             // It is the help of the error, and of the first one. It is no note: the notes say
@@ -161,7 +162,7 @@ fn a_bare_name_gets_the_help_with_its_absolute_path() {
             );
             // And it is in the `syn::Error`, which stable Rust gets: the notes follow the headline,
             // then the help.
-            let rendered = to_syn_error(&err).to_string();
+            let rendered = to_syn_error(err).to_string();
             assert!(rendered.starts_with(&message), "{}: {}", context, rendered);
             assert!(
                 rendered.ends_with(&format!("\n  = help: {}\n", help)),

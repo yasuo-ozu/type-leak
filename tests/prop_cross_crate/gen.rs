@@ -513,8 +513,8 @@ pub const TAG_REDECLARED: &str = "shape:redeclared";
 /// `nested_self_entries`.
 pub const TAG_SELF_BOUND_ADT: &str = "shape:self_bound_adt";
 pub const TAG_SELF_BOUND_TYPE: &str = "shape:self_bound_type";
-/// The shapes that the items accepted by `LeakerConfig::allow()` fail on (`TYPE_LEAK_PROP_ACCEPT`,
-/// `main.rs`, `accept_families()`; the docs of `LeakerConfig::allow()` list them). They explain no
+/// The shapes that the items accepted by `LeakerResult::allow()` fail on (`TYPE_LEAK_PROP_ACCEPT`,
+/// `main.rs`, `accept_families()`; the docs of `LeakerResult::allow()` list them). They explain no
 /// rejection:
 ///
 /// - `self_in_predicate`: a where predicate of the item names `Self` or `Self::A`
@@ -562,7 +562,7 @@ pub struct Case {
     /// The line of the Referrer's `lib.rs` where each item is invoked.
     pub referrer_lines: Vec<(usize, usize)>,
     /// The `lib.rs` of the second Referrer's crate of `TYPE_LEAK_PROP_ACCEPT`, which copies the
-    /// items that the Leaker accepts only by `LeakerConfig::allow()` (see [`accept_referrer()`]).
+    /// items that the Leaker accepts only by `LeakerResult::allow()` (see [`accept_referrer()`]).
     pub accept_referrer: String,
     /// The line of `accept_referrer` where each item is invoked.
     pub accept_lines: Vec<(usize, usize)>,
@@ -5201,7 +5201,7 @@ pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Feat
 }
 
 /// The `lib.rs` of the second Referrer's crate of `TYPE_LEAK_PROP_ACCEPT` (the crate `tlp_a_NNN`),
-/// which copies the items that the Leaker accepts only by `LeakerConfig::allow(cause)` of the
+/// which copies the items that the Leaker accepts only by `LeakerResult::allow(cause)` of the
 /// causes of its errors, and the line where each item is invoked.
 ///
 /// The copy keeps the part that conflicts as written, whole: the paths in it are those the item has

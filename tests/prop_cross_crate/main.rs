@@ -66,17 +66,18 @@
 //!
 //! # Accepting the rejections (`TYPE_LEAK_PROP_ACCEPT`)
 //!
-//! `LeakerConfig::allow(cause)` accepts a conflict: the part of the item that conflicts is copied as
-//! written, whole, with nothing in it leaked, and the analysis keeps the correction it makes (the
-//! scope is not rolled back). The corrections of the rejections were compiled by nobody, as an error
-//! always rolled back. With `TYPE_LEAK_PROP_ACCEPT=1` the test compiles them:
+//! The Leaker copies the part of the item that conflicts as written, whole, with nothing in it
+//! leaked, and goes on: the recovered Referrer (`LeakerResult::into_referrer()`) has the
+//! correction it makes, and `LeakerResult::allow(cause)` accepts the conflict by dropping its
+//! error. This test did not compile those corrections. With `TYPE_LEAK_PROP_ACCEPT=1` it compiles
+//! them, by accepting the causes of the errors:
 //!
 //! 1. The macro (`prop_leak_accept`) analyzes an item as always. If the Leaker rejects it, it
-//!    analyzes it again with the same configuration and `allow(cause)` for the `cause` of every
-//!    error. The errors of the first analysis are what the rejection is: `family()` explains each
-//!    as always ("NOT A KNOWN REASON", "NO SHAPE THAT GIVES IT"). If the second analysis still
-//!    fails, the run fails ("ACCEPT FAILED", with the errors of both): it is the first analysis
-//!    with the errors filtered out, and it must succeed.
+//!    allows the `cause` of every error, which must drop every error, and takes the recovered
+//!    Referrer. The errors are what the rejection is: `family()` explains each as always ("NOT A
+//!    KNOWN REASON", "NO SHAPE THAT GIVES IT"). If an error remains, the run fails ("ACCEPT
+//!    FAILED", with the errors and those that remain): allowing the causes of all the errors
+//!    must leave none.
 //! 2. The result is emitted and checked like an accepted item: the Repeater's impls, the
 //!    witnesses, the macro for the Referrer's crate, the copy rewritten by `Referrer::visitor`, and
 //!    the witness checks. Its status in the report is `acc`. The acceptance floors and the table
@@ -112,7 +113,7 @@
 //! # The copies that do not compile are explained
 //!
 //! A copy of an item accepted by `allow()` may not build, for the shapes that the docs of
-//! `LeakerConfig::allow()` list ("What accepting does not make compile"), and the test explains each
+//! `LeakerResult::allow()` list ("What accepting does not make compile"), and the test explains each
 //! failure the way it explains a rejection (`accept_families()`, `unexplained_accept()`): the
 //! diagnostic is one of the listed failures, if its error code (`E0277`, `E0106`), the errors that
 //! were allowed (their `Reason` and the kind and tokens of their cause) and the shapes of the item
@@ -203,7 +204,7 @@
 //! - `TYPE_LEAK_PROP_REJECTIONS`: if set, the rejections are printed with the tags of their items,
 //!   and with the `Reason` and the kind of the cause of each error.
 //! - `TYPE_LEAK_PROP_ACCEPT`: if set (and not `0`), the Leaker accepts the items it rejects by
-//!   `LeakerConfig::allow(cause)` of the cause of every error, and the test compiles the result: see
+//!   `LeakerResult::allow(cause)` of the cause of every error, and the test compiles the result: see
 //!   "Accepting the rejections". The workspace is `ws-<seed>-<cases>-accept`.
 //! - `TYPE_LEAK_PROP_FEATURES`: a comma-separated list of constructs that `type-leak` is known to
 //!   fail on (see `gen::Features`). The generator avoids them by default, so that the test passes
@@ -567,18 +568,18 @@ struct Report {
     kind: String,
     /// The Leaker accepted the item at the first analysis.
     accepted: bool,
-    /// `TYPE_LEAK_PROP_ACCEPT`: the Leaker rejected the item, and accepted it when the cause of
-    /// every error was allowed (`acc`). It is not `accepted`: the floors count it as rejected.
+    /// `TYPE_LEAK_PROP_ACCEPT`: the Leaker rejected the item, and allowing the cause of every error
+    /// dropped every error (`acc`). It is not `accepted`: the floors count it as rejected.
     allowed: bool,
-    /// `TYPE_LEAK_PROP_ACCEPT`: the Leaker rejected the item, and rejected it still when the cause
-    /// of every error was allowed (`accfail`): `remaining` are the errors of the second analysis.
+    /// `TYPE_LEAK_PROP_ACCEPT`: the Leaker rejected the item, and an error remained when the cause
+    /// of every error was allowed (`accfail`): `remaining` are the errors that remained.
     accept_failed: bool,
     /// The reason of the rejection (the messages of its errors, on one line), or the error of the
     /// rewrite.
     detail: String,
-    /// The errors of the rejection: those of the first analysis, whatever the second one did.
+    /// The errors of the rejection, whatever was allowed.
     rejections: Vec<Rejection>,
-    /// The errors of the second analysis, if it failed (`accept_failed`).
+    /// The errors that remained when the causes were allowed (`accept_failed`).
     remaining: Vec<Rejection>,
     /// What the macro could not rewrite in the copy of an item it accepted (`accepted` or
     /// `allowed`).
@@ -613,8 +614,8 @@ fn parse_rejections(errors: &str) -> Vec<Rejection> {
 }
 
 fn parse_report(line: &str) -> Option<(usize, Report)> {
-    // The errors of a rejection follow the report, and the errors of the second analysis of an
-    // `accfail` the errors of the first.
+    // The errors of a rejection follow the report, and the errors that remained of an `accfail`
+    // the errors of the rejection.
     let (line, errors) = line.split_once('\u{1e}').unwrap_or((line, ""));
     let (errors, remaining) = errors.split_once('\u{1c}').unwrap_or((errors, ""));
     let mut parts = line.splitn(4, '|');
@@ -968,7 +969,7 @@ fn unexplained(tags: &std::collections::BTreeSet<String>, report: &Report) -> Ve
 // Every failure of an accepted copy is explained (`TYPE_LEAK_PROP_ACCEPT`).
 // ---------------------------------------------------------------------------------------------
 
-/// A failure of the copy of an item accepted by `allow()` that the docs of `LeakerConfig::allow()`
+/// A failure of the copy of an item accepted by `allow()` that the docs of `LeakerResult::allow()`
 /// list ("What accepting does not make compile"): which one, what it is, and the shapes an item
 /// needs to have it (`tags`: the item needs one tag of each list).
 #[derive(Debug, PartialEq)]
@@ -1887,9 +1888,9 @@ fn random_items_leak_across_crates() {
                             code: String::new(),
                             case: i,
                             item: Some(id),
-                            class: "ACCEPT FAILED: the Leaker rejects the item again when the cause of every error is allowed",
+                            class: "ACCEPT FAILED: an error remains when the cause of every error is allowed",
                             text: format!(
-                                "the errors of the first analysis:\n{}\nthe errors that remain:\n{}",
+                                "the errors:\n{}\nthe errors that remain:\n{}",
                                 describe(&report.rejections),
                                 describe(&report.remaining)
                             ),
@@ -1924,7 +1925,7 @@ fn random_items_leak_across_crates() {
     }
 
     // The diagnostics of the copy of an item accepted by `allow()` are failures that the docs of
-    // `LeakerConfig::allow()` list, or defects: each must be one of them, and the item must have the
+    // `LeakerResult::allow()` list, or defects: each must be one of them, and the item must have the
     // shape that gives it (`accept_families()`). The documented ones are counted and are no failure.
     let mut documented: BTreeMap<&'static str, usize> = BTreeMap::new();
     let (copies, mut failures): (Vec<Failure>, Vec<Failure>) = failures
@@ -2611,9 +2612,8 @@ mod checks {
         assert!(unexplained(&tags(&[gen::TAG_SELF_BOUND_ADT, "bare:Clone"]), &bare).is_empty());
     }
 
-    /// The reports of the accept mode: `acc` is not accepted at the first analysis, and has the
-    /// errors of the first analysis and what the macro wrote; `accfail` has the errors of the
-    /// second analysis too.
+    /// The reports of the accept mode: `acc` is not accepted as it is, and has the errors and what
+    /// the macro wrote; `accfail` has the errors that remain too.
     #[test]
     fn the_reports_of_the_accept_mode_are_read_back() {
         let first = "use absolute path: 'Rel'\u{1f}Rel\u{1f}a note\u{1f}RelativePath\u{1f}Type";
@@ -2734,7 +2734,7 @@ mod checks {
     }
 
     /// The failures of the copy of an item accepted by `allow()` are the ones that the docs of
-    /// `LeakerConfig::allow()` list, on an item that has the shape.
+    /// `LeakerResult::allow()` list, on an item that has the shape.
     #[test]
     fn a_failure_of_an_accepted_copy_needs_a_documented_class_and_a_shape() {
         let unprovable_assoc = allowed_report(vec![allowed("UnprovableBound", "Self :: A0")]);

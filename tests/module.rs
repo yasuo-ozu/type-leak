@@ -37,8 +37,8 @@ fn module() -> ItemMod {
 #[test]
 fn intern_mod_leaks_with_local_generics() {
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&module()).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_mod(&module());
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         referrer
             .iter_with_generics()
@@ -59,8 +59,8 @@ fn intern_mod_leaks_with_local_generics() {
 #[test]
 fn intern_mod_referrer_rewrites_a_copy() {
     let mut leaker = Leaker::new();
-    let context = leaker.intern_mod(&module()).unwrap();
-    let referrer = leaker.finish();
+    let context = leaker.intern_mod(&module());
+    let referrer = leaker.result().finish().unwrap();
     let mut item = module();
     visit_items(
         referrer.clone().visitor(context, |ty, ix| {
@@ -90,7 +90,11 @@ fn intern_mod_errors_and_bodies() {
     let m: ItemMod = parse_quote! {
         mod m { pub struct S<T: Clone>(T); }
     };
-    assert!(Leaker::new().intern_mod(&m).is_err());
+    let mut leaker = Leaker::new();
+    leaker.intern_mod(&m);
+    let result = leaker.result();
+    assert_eq!(result.errors().len(), 1);
+    assert!(result.finish().is_err());
 
     // Function bodies are ignored.
     let m: ItemMod = parse_quote! {
@@ -99,8 +103,8 @@ fn intern_mod_errors_and_bodies() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&m).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_mod(&m);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         referrer
             .iter()
@@ -115,8 +119,8 @@ fn intern_mod_errors_and_bodies() {
     );
     assert!({
         let mut leaker = Leaker::new();
-        leaker.intern_mod(&m).unwrap();
-        leaker.finish()
+        leaker.intern_mod(&m);
+        leaker.result().finish().unwrap()
     }
     .is_empty());
 }
@@ -127,8 +131,8 @@ fn referrer_with_prelude(m: &ItemMod) -> (type_leak::Referrer, ContextId) {
     let mut config = type_leak::LeakerConfig::new();
     config.allow_primitive().allow_std_prelude();
     let mut leaker = Leaker::from_config(config);
-    let context = leaker.intern_mod(m).unwrap();
-    (leaker.finish(), context)
+    let context = leaker.intern_mod(m);
+    (leaker.result().finish().unwrap(), context)
 }
 
 fn leaked(m: &ItemMod) -> Vec<String> {
@@ -198,8 +202,8 @@ fn intern_mod_generics_shadow_module_items() {
     // `S` in `A` is the generic parameter. Local generics are interned with the types depending
     // on them (see `Referrer::generics()`), but `Wrap<S>` is relative either way.
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&m).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_mod(&m);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         referrer
             .iter_with_generics()
@@ -299,8 +303,8 @@ fn modules_of(referrer: &type_leak::Referrer) -> Vec<String> {
 #[test]
 fn same_tokens_in_different_modules_are_different_entries() {
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_mod(&nested_module()).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_mod(&nested_module());
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(modules_of(&referrer), ["Rel@self", "Rel@inner"]);
     // The module has no generics, and its top-level context is in no module. The contexts are
     // those of the two modules and of the two entries.
@@ -320,8 +324,8 @@ fn deep_module_path() {
         mod m { pub mod a { pub mod b { pub struct S<T> { x: Wrap<T> } } } }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&m).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_mod(&m);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(modules_of(&referrer), ["Wrap < T >@a::b"]);
     assert_eq!(
         referrer.module_path(referrer.context_module(referrer.context(0)).unwrap()),
@@ -339,8 +343,8 @@ fn types_not_depending_on_the_module_are_shared() {
     };
     // `::foo::X` is an optional entry, which does not depend on a module.
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&m).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_mod(&m);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(modules_of(&referrer), [":: foo :: X@"]);
     // The context of `::foo::X`, and the module analyzed.
     assert_eq!(referrer.contexts().count(), 2);
@@ -354,8 +358,8 @@ fn types_not_depending_on_the_module_are_shared() {
     assert_eq!(
         modules_of(&{
             let mut leaker = Leaker::new();
-            leaker.intern_mod(&m).unwrap();
-            leaker.finish()
+            leaker.intern_mod(&m);
+            leaker.result().finish().unwrap()
         }),
         ["& 'static Rel@inner", ":: foo :: X@"]
     );
@@ -364,8 +368,8 @@ fn types_not_depending_on_the_module_are_shared() {
 #[test]
 fn referrer_rewrites_each_module_to_its_own_entry() {
     let mut leaker = Leaker::new();
-    let context = leaker.intern_mod(&nested_module()).unwrap();
-    let referrer = leaker.finish();
+    let context = leaker.intern_mod(&nested_module());
+    let referrer = leaker.result().finish().unwrap();
     let mut item = nested_module();
     visit_items(
         referrer.visitor(context, |_, ix| parse_str(&format!("P{}", ix)).unwrap()),
@@ -386,8 +390,8 @@ fn referrer_rewrites_each_module_to_its_own_entry() {
 #[test]
 fn referrer_visits_a_copy_in_a_module() {
     let mut leaker = Leaker::new();
-    let root = leaker.intern_mod(&nested_module()).unwrap();
-    let referrer = leaker.finish();
+    let root = leaker.intern_mod(&nested_module());
+    let referrer = leaker.result().finish().unwrap();
     let inner = referrer.context_module(referrer.context(1)).unwrap();
     let copy = |module: ContextId| {
         let mut visitor = referrer
@@ -416,8 +420,8 @@ fn referrer_visits_a_copy_in_a_module() {
         }
     );
     let mut leaker = Leaker::new();
-    let root = leaker.intern_mod(&m).unwrap();
-    let referrer = leaker.finish();
+    let root = leaker.intern_mod(&m);
+    let referrer = leaker.result().finish().unwrap();
     let inner = referrer.context_module(referrer.context(0)).unwrap();
     let visit = |module: ContextId| {
         let mut item: ItemStruct = parse_quote!(
@@ -461,8 +465,8 @@ fn referrer_tracks_the_modules_it_enters() {
         }
     );
     let mut leaker = Leaker::new();
-    let root = leaker.intern_mod(&m).unwrap();
-    let referrer = leaker.finish();
+    let root = leaker.intern_mod(&m);
+    let referrer = leaker.result().finish().unwrap();
     let rewrite = |_: Type, _| -> Type { parse_quote!(P) };
     let unchanged: ItemMod = parse_quote!(
         mod inner {
@@ -542,8 +546,8 @@ fn serialization_with_modules() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&m).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_mod(&m);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         modules_of(&referrer),
         ["Rel@self", "Rel@a::b", "Wrap < T >@a::b"]
@@ -576,8 +580,8 @@ fn serialization_with_modules() {
     );
     let tokens = {
         let mut leaker = Leaker::new();
-        leaker.intern_struct(&simple, true).unwrap();
-        leaker.finish()
+        leaker.intern_struct(&simple, true);
+        leaker.result().finish().unwrap()
     }
     .to_token_stream();
     assert_eq!(tokens.to_string(), format!("\"{}\" (Rel , Rel2)", version));
@@ -593,10 +597,10 @@ fn root_relative_type_does_not_match_in_a_nested_module() {
         }
     );
     let mut leaker = Leaker::new();
-    let root = leaker.intern_mod(&m).unwrap();
+    let root = leaker.intern_mod(&m);
     // A module which no entry depends on: it is a context of the Referrer, but it has no entry.
-    let (other, ()) = leaker.enter_mod("other", [], |_| ()).unwrap();
-    let referrer = leaker.finish();
+    let (other, ()) = leaker.enter_mod("other", [], |_| ());
+    let referrer = leaker.result().finish().unwrap();
     let copy = |module: ContextId| {
         let mut visitor = referrer.clone().visitor(module, |_, _| parse_quote!(P));
         let mut item: ItemStruct = parse_quote!(
@@ -661,8 +665,8 @@ fn a_context_which_is_not_known_panics() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&m).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_mod(&m);
+    let referrer = leaker.result().finish().unwrap();
     let unknown: ContextId = parse_str("99").unwrap();
     let _ = referrer.visitor(unknown, |_, _| parse_quote!(P));
 }
@@ -697,12 +701,10 @@ fn a_module_found_with_no_module_around_has_its_name_as_path() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker
-        .enter_generics(&Generics::default(), |view| {
-            view.visit_item(&Item::Mod(inner.clone()))
-        })
-        .unwrap();
-    let referrer = leaker.finish();
+    leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_item(&Item::Mod(inner.clone()))
+    });
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
     assert_eq!(path_of(&referrer, 0), ["inner"]);
     assert_eq!(path_of(&referrer, 1), ["inner", "deep"]);
@@ -721,19 +723,17 @@ fn a_module_found_with_no_module_around_has_its_name_as_path() {
     // Entered by `enter_mod()` (which has no path), the path of the module found in it starts at
     // it, and the modules in that one start with it.
     let mut leaker = Leaker::new();
-    leaker
-        .enter_mod("outer", [], |view| {
-            view.visit_item(&Item::Mod(inner.clone()))
-        })
-        .unwrap();
-    let referrer = leaker.finish();
+    leaker.enter_mod("outer", [], |view| {
+        view.visit_item(&Item::Mod(inner.clone()))
+    });
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(path_of(&referrer, 0), ["inner"]);
     assert_eq!(path_of(&referrer, 1), ["inner", "deep"]);
     // The one `intern_mod()` analyzes has the empty path, and the ones in it are relative to it.
     let outer: ItemMod = parse_quote!(mod outer { #inner });
     let mut leaker = Leaker::new();
-    let top = leaker.intern_mod(&outer).unwrap();
-    let referrer = leaker.finish();
+    let top = leaker.intern_mod(&outer);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.module_path(top), Some(&[][..]));
     assert_eq!(path_of(&referrer, 0), ["inner"]);
     assert_eq!(path_of(&referrer, 1), ["inner", "deep"]);
@@ -751,12 +751,10 @@ fn a_visitor_finds_the_roots_found_with_no_module_around_by_their_names() {
         }
     );
     let mut leaker = Leaker::new();
-    let (scope, ()) = leaker
-        .enter_generics(&Generics::default(), |view| {
-            view.visit_item(&Item::Mod(inner.clone()))
-        })
-        .unwrap();
-    let referrer = leaker.finish();
+    let (scope, ()) = leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_item(&Item::Mod(inner.clone()))
+    });
+    let referrer = leaker.result().finish().unwrap();
     let rewrite = |item: &ItemMod, module: ContextId| {
         let mut item = item.clone();
         referrer
@@ -788,13 +786,11 @@ fn a_visitor_finds_the_roots_found_with_no_module_around_by_their_names() {
         }
     );
     let mut leaker = Leaker::new();
-    let (scope, ()) = leaker
-        .enter_generics(&Generics::default(), |view| {
-            view.visit_item(&Item::Mod(inner.clone()));
-            view.visit_item(&Item::Mod(other.clone()));
-        })
-        .unwrap();
-    let referrer = leaker.finish();
+    let (scope, ()) = leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_item(&Item::Mod(inner.clone()));
+        view.visit_item(&Item::Mod(other.clone()));
+    });
+    let referrer = leaker.result().finish().unwrap();
     let ids: Vec<ContextId> = (0..2)
         .map(|ix| referrer.context_module(referrer.context(ix)).unwrap())
         .collect();
@@ -859,10 +855,10 @@ fn a_copy_of_the_second_module_is_rewritten_with_its_id() {
         }
     );
     let mut leaker = Leaker::new();
-    let a = leaker.intern_mod(&m1).unwrap();
-    let b = leaker.intern_mod(&m2).unwrap();
+    let a = leaker.intern_mod(&m1);
+    let b = leaker.intern_mod(&m2);
     assert_ne!(a, b);
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
     let index = |module: ContextId| {
         (0..2)
@@ -924,8 +920,8 @@ fn the_context_is_the_module_and_a_mod_item_is_nested_in_it() {
         }
     );
     let mut leaker = Leaker::new();
-    let root = leaker.intern_mod(&m).unwrap();
-    let referrer = leaker.finish();
+    let root = leaker.intern_mod(&m);
+    let referrer = leaker.result().finish().unwrap();
     let inner = referrer.context_module(referrer.context(1)).unwrap();
     let rewritten = quote!(
         mod m {
@@ -1030,16 +1026,14 @@ fn rewrite_in(referrer: &type_leak::Referrer, context: ContextId, mut item: Item
 #[test]
 fn a_module_nested_in_an_unseen_module_is_not_found_by_its_name() {
     let mut leaker = Leaker::new();
-    let (context, ()) = leaker
-        .enter_generics(&Generics::default(), |view| {
-            view.visit_item(&parse_quote!(
-                mod inner {
-                    pub struct C(Rel);
-                }
-            ));
-        })
-        .unwrap();
-    let referrer = leaker.finish();
+    let (context, ()) = leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_item(&parse_quote!(
+            mod inner {
+                pub struct C(Rel);
+            }
+        ));
+    });
+    let referrer = leaker.result().finish().unwrap();
     // The module `inner` is seen: its `Rel` is replaced.
     let seen = rewrite_in(
         &referrer,
@@ -1083,24 +1077,20 @@ fn a_module_nested_in_an_unseen_module_is_not_found_by_its_name() {
 fn the_entry_of_the_module_is_preferred_to_the_one_with_no_module() {
     let mut leaker = Leaker::new();
     // `Rel` with no module is the first entry, and the one of the module `m` is the second.
-    let top = leaker
-        .intern_struct(
-            &parse_quote!(
-                struct A {
-                    x: Rel,
-                }
-            ),
-            true,
-        )
-        .unwrap();
-    let module = leaker
-        .intern_mod(&parse_quote!(
-            mod m {
-                pub struct B(Rel);
+    let top = leaker.intern_struct(
+        &parse_quote!(
+            struct A {
+                x: Rel,
             }
-        ))
-        .unwrap();
-    let referrer = leaker.finish();
+        ),
+        true,
+    );
+    let module = leaker.intern_mod(&parse_quote!(
+        mod m {
+            pub struct B(Rel);
+        }
+    ));
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
     assert_eq!(referrer.context_module(referrer.context(0)), None);
     assert_eq!(referrer.context_module(referrer.context(1)), Some(module));
@@ -1136,24 +1126,20 @@ fn the_entry_of_the_module_is_preferred_to_the_one_with_no_module() {
     );
     // The same with the module analyzed first.
     let mut leaker = Leaker::new();
-    let module = leaker
-        .intern_mod(&parse_quote!(
-            mod m {
-                pub struct B(Rel);
+    let module = leaker.intern_mod(&parse_quote!(
+        mod m {
+            pub struct B(Rel);
+        }
+    ));
+    let top = leaker.intern_struct(
+        &parse_quote!(
+            struct A {
+                x: Rel,
             }
-        ))
-        .unwrap();
-    let top = leaker
-        .intern_struct(
-            &parse_quote!(
-                struct A {
-                    x: Rel,
-                }
-            ),
-            true,
-        )
-        .unwrap();
-    let referrer = leaker.finish();
+        ),
+        true,
+    );
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         rewrite_in(
             &referrer,
@@ -1192,14 +1178,12 @@ fn the_entry_of_the_module_is_preferred_to_the_one_with_no_module() {
 fn the_items_of_a_module_are_nested_items() {
     // The context is the module itself.
     let mut leaker = Leaker::new();
-    let module = leaker
-        .intern_mod(&parse_quote!(
-            mod m {
-                pub struct S<T>(Wrap<T>);
-            }
-        ))
-        .unwrap();
-    let referrer = leaker.finish();
+    let module = leaker.intern_mod(&parse_quote!(
+        mod m {
+            pub struct S<T>(Wrap<T>);
+        }
+    ));
+    let referrer = leaker.result().finish().unwrap();
     let mut item: Item = parse_quote!(
         pub struct S<T>(Wrap<T>);
     );
@@ -1216,16 +1200,14 @@ fn the_items_of_a_module_are_nested_items() {
     );
     // The context is a scope around a `mod` item.
     let mut leaker = Leaker::new();
-    let (context, ()) = leaker
-        .enter_generics(&Generics::default(), |view| {
-            view.visit_item(&parse_quote!(
-                mod m {
-                    pub struct S<T>(Wrap<T>);
-                }
-            ));
-        })
-        .unwrap();
-    let referrer = leaker.finish();
+    let (context, ()) = leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_item(&parse_quote!(
+            mod m {
+                pub struct S<T>(Wrap<T>);
+            }
+        ));
+    });
+    let referrer = leaker.result().finish().unwrap();
     let mut item: Item = parse_quote!(
         mod m {
             pub struct S<T>(Wrap<T>);
@@ -1251,14 +1233,12 @@ fn the_items_of_a_module_are_nested_items() {
 #[test]
 fn a_block_item_hides_the_entry_of_a_module() {
     let mut leaker = Leaker::new();
-    let module = leaker
-        .intern_mod(&parse_quote!(
-            mod m {
-                pub fn f(a: Rel) {}
-            }
-        ))
-        .unwrap();
-    let referrer = leaker.finish();
+    let module = leaker.intern_mod(&parse_quote!(
+        mod m {
+            pub fn f(a: Rel) {}
+        }
+    ));
+    let referrer = leaker.result().finish().unwrap();
     let out = rewrite_in(
         &referrer,
         module,
@@ -1288,17 +1268,15 @@ fn a_block_item_hides_the_entry_of_a_module() {
 #[test]
 fn self_has_no_meaning_in_a_mod_item_of_a_scope_which_declares_it() {
     let mut leaker = Leaker::new();
-    let context = leaker
-        .intern_trait(
-            &parse_quote!(
-                trait Tr {
-                    fn f(&self) -> Rel<Self>;
-                }
-            ),
-            true,
-        )
-        .unwrap();
-    let referrer = leaker.finish();
+    let context = leaker.intern_trait(
+        &parse_quote!(
+            trait Tr {
+                fn f(&self) -> Rel<Self>;
+            }
+        ),
+        true,
+    );
+    let referrer = leaker.result().finish().unwrap();
     // The trait itself declares `Self`, and the entry is found.
     let expected: Item = parse_quote!(
         trait Tr {

@@ -52,8 +52,8 @@ fn analyze_with(
         Item::Trait(item) => leaker.intern_trait(item, allow_self),
         Item::Mod(item) => leaker.intern_mod(item),
         _ => panic!("not an item to analyze"),
-    }?;
-    Ok(leaker.finish())
+    };
+    leaker.result().finish()
 }
 
 fn analyze(item: &Item, allow_self: bool) -> std::result::Result<Referrer, Vec<ErrorItem>> {
@@ -568,11 +568,9 @@ fn every_identifier_is_told() {
 fn check_agrees() {
     let mut leaker = Leaker::new();
     let ty: Type = parse_quote!(::l::W<[Self], ILEN>);
-    let (_, result) = leaker
-        .enter_type(&parse_quote!(S), &Generics::default(), false, |view| {
-            view.check(&ty)
-        })
-        .unwrap();
+    let (_, result) = leaker.enter_type(&parse_quote!(S), &Generics::default(), false, |view| {
+        view.check(&ty)
+    });
     assert!(result.is_own);
     assert_eq!(
         result
@@ -592,19 +590,18 @@ fn check_agrees() {
     );
     assert_eq!(result.headline.as_deref(), Some(headline("ILEN").as_str()));
     // With `Self` allowed it is leaked.
-    let (_, result) = leaker
-        .enter_type(&parse_quote!(S), &Generics::default(), true, |view| {
-            view.check(&ty)
-        })
-        .unwrap();
+    let (_, result) = leaker.enter_type(&parse_quote!(S), &Generics::default(), true, |view| {
+        view.check(&ty)
+    });
     assert!(result.is_own && result.impossible.is_empty());
     // And `visit_type()` of a scope fails with the error.
-    let err = Leaker::new()
-        .enter_type(&parse_quote!(S), &Generics::default(), false, |view| {
-            view.visit_type(&ty)
-        })
-        .unwrap_err();
-    assert_eq!(shown(&err), [self_denied("ILEN", "Self")]);
+    let mut leaker = Leaker::new();
+    leaker.enter_type(&parse_quote!(S), &Generics::default(), false, |view| {
+        view.visit_type(&ty)
+    });
+    let result = leaker.result();
+    let err = result.errors();
+    assert_eq!(shown(err), [self_denied("ILEN", "Self")]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1239,8 +1236,8 @@ fn a_name_that_enter_mod_declares_beside_the_identifier_is_an_error_too() {
             .map(|name| Ident::new(name, proc_macro2::Span::call_site()))
             .collect();
         let mut leaker = Leaker::from_config(module_config());
-        let result = leaker.enter_mod("m", declared, |view| view.visit_item(&item));
-        result.map(|_| leaker.finish())
+        leaker.enter_mod("m", declared, |view| view.visit_item(&item));
+        leaker.result().finish()
     };
     // `Local` is declared: `BC<Local, ILEN>` names it beside the identifier.
     let err = analyze_in(&["Local"]).err().unwrap();

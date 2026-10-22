@@ -67,8 +67,8 @@ fn analyze_in(
     mut leaker: Leaker,
     item: &ItemTrait,
 ) -> std::result::Result<(Referrer, ContextId), Vec<ErrorItem>> {
-    let context = leaker.intern_trait(item, true)?;
-    Ok((leaker.finish(), context))
+    let context = leaker.intern_trait(item, true);
+    Ok((leaker.result().finish()?, context))
 }
 
 /// The leaked types of a trait with the generics each uses.
@@ -270,8 +270,8 @@ fn the_type_holding_the_binder_is_leaked_as_a_whole() {
     // The fields of a struct.
     let item: ItemStruct = parse_quote! { struct S { f: for<'x> fn(Rel<'x>) -> &'x u8 } };
     let mut leaker = leaker();
-    leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         referrer.iter().map(s).collect::<Vec<_>>(),
         ["for < 'x > fn (Rel < 'x >) -> & 'x u8"]

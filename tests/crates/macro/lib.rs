@@ -219,7 +219,9 @@ pub fn leak_strict(
 ) -> proc_macro::TokenStream {
     let serialized = attr.to_string() == "serialized";
     let item_trait = parse_macro_input!(item as ItemTrait);
-    match Leaker::new().intern_trait(&item_trait, true) {
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item_trait, true);
+    match leaker.result().finish() {
         Ok(_) => quote!(#item_trait).into(),
         Err(e) => report_errors(&e, serialized),
     }
@@ -236,7 +238,8 @@ pub fn leak_generics(
 ) -> proc_macro::TokenStream {
     let serialized = attr.to_string() == "serialized";
     let item_trait = parse_macro_input!(item as ItemTrait);
-    let result = Leaker::new().enter_generics(&item_trait.generics, |view| {
+    let mut leaker = Leaker::new();
+    leaker.enter_generics(&item_trait.generics, |view| {
         for trait_item in &item_trait.items {
             if let TraitItem::Fn(method) = trait_item {
                 for input in &method.sig.inputs {
@@ -250,7 +253,7 @@ pub fn leak_generics(
             }
         }
     });
-    match result {
+    match leaker.result().finish() {
         Ok(_) => quote!(#item_trait).into(),
         Err(e) => report_errors(&e, serialized),
     }
@@ -276,11 +279,11 @@ pub fn leak_tagged(
     };
     let item_trait = parse_macro_input!(item as ItemTrait);
     let mut leaker = Leaker::new();
-    let context = match leaker.intern_trait(&item_trait, true) {
-        Ok(context) => context,
+    let context = leaker.intern_trait(&item_trait, true);
+    let referrer = match leaker.result().finish() {
+        Ok(referrer) => referrer,
         Err(e) => return report(&e).into(),
     };
-    let referrer = leaker.finish();
     let mut tokens: Vec<TokenTree> = quote!(#referrer).into_iter().collect();
     // The first token of a Referrer is its tag, `"type-leak:<version>"` or the like.
     let current: LitStr = match parse2(tokens[0].clone().into()) {
@@ -434,15 +437,14 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         config.allowed_paths.extend(allowed);
         config
     });
-    let result = match &item {
+    match &item {
         Item::Trait(item) => leaker.intern_trait(item, true),
         Item::Struct(item) => leaker.intern_struct(item, true),
         Item::Mod(item) => leaker.intern_mod(item),
         _ => return quote!(compile_error!("unsupported item");).into(),
     };
-    let got: std::result::Result<Vec<String>, String> = match result {
-        Ok(_) => {
-            let referrer = leaker.finish();
+    let got: std::result::Result<Vec<String>, String> = match leaker.result().finish() {
+        Ok(referrer) => {
             let mut types: Vec<String> = referrer
                 .iter()
                 .enumerate()
@@ -488,13 +490,14 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
         config.allowed_paths.extend(args.allow.clone());
         config
     });
-    let context = leaker
-        .intern_trait(&item_trait, true)
-        .map_err(|errors| to_syn_error(&errors))?;
+    let context = leaker.intern_trait(&item_trait, true);
     // Compile-time checks of the Leaker's assumptions (e.g. that `u8` is not shadowed).
     let assertions = leaker.assertions();
     leaker.reduce_roots();
-    let referrer = leaker.finish();
+    let referrer = leaker
+        .result()
+        .finish()
+        .map_err(|errors| to_syn_error(&errors))?;
 
     let LeakArgs {
         helper,
@@ -1125,9 +1128,9 @@ pub fn prop_leak(
     }
 }
 
-/// Like `prop_leak`, but an item that the Leaker rejects is analyzed again with
-/// `LeakerConfig::allow(cause)` for the cause of every error, and the result is emitted as that of
-/// an accepted item: `TYPE_LEAK_PROP_ACCEPT`. See `prop::leak()`.
+/// Like `prop_leak`, but an item that the Leaker rejects is emitted with its recovered Referrer as
+/// an accepted item, if `LeakerResult::allow(cause)` for the cause of every error drops every
+/// error: `TYPE_LEAK_PROP_ACCEPT`. See `prop::leak()`.
 #[proc_macro_attribute]
 pub fn prop_leak_accept(
     attr: proc_macro::TokenStream,

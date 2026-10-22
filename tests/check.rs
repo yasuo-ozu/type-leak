@@ -30,7 +30,6 @@ fn test_check() {
         let ident = &test_struct.ident;
         leaker
             .enter_type(ident, generics, true, |view| view.check(&ty))
-            .unwrap()
             .1
     };
     assert_eq!(kind(&check(parse_quote!(T1))), "Neutral");
@@ -89,6 +88,8 @@ fn test_check() {
         kind(&check(parse_quote!(::core::fmt::Formatter<'_>))),
         "MustNotIntern"
     ); // relative path
+       // A check records nothing: the scopes found no error.
+    assert!(leaker.result().errors().is_empty());
 }
 
 #[test]
@@ -103,7 +104,6 @@ fn test_check_self_no_internable() {
         .enter_type(&test_struct.ident, &test_struct.generics, true, |view| {
             view.check(&parse_quote!(Self))
         })
-        .unwrap()
         .1;
     assert_eq!(kind(&result), "Neutral");
 
@@ -115,8 +115,14 @@ fn test_check_self_no_internable() {
             b: T1,
         }
     );
-    assert!(Leaker::new().intern_struct(&item, true).is_ok());
-    assert!(Leaker::new().intern_struct(&item, false).is_err());
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&item, true);
+    let result = leaker.result();
+    assert!(result.finish().is_ok());
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&item, false);
+    let result = leaker.result();
+    assert!(result.finish().is_err());
     // The types which do not mention it are not affected.
     let item: ItemStruct = parse_quote!(
         pub struct MyStruct<T1> {
@@ -124,7 +130,10 @@ fn test_check_self_no_internable() {
             b: Self,
         }
     );
-    assert!(Leaker::new().intern_struct(&item, false).is_ok());
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&item, false);
+    let result = leaker.result();
+    assert!(result.finish().is_ok());
 }
 
 /// `LeakerConfig::allow_crate()`: a path that starts with `crate` is leaked, unless the allowed
@@ -145,14 +154,17 @@ fn test_check_allows_crate_paths_only_if_allowed() {
             ) -> ::core::result::Result<Self, Self::Error>;
         }
     );
-    leaker.intern_trait(&item, true).unwrap();
+    leaker.intern_trait(&item, true);
     leaker.reduce_roots();
-    assert!(leaker.finish().is_empty());
+    assert!(leaker.result().finish().unwrap().is_empty());
 
     // Without it the same paths are leaked (here in bounds, which cannot be leaked): the allowed
     // `crate` is what lets them through.
-    let err = Leaker::new().intern_trait(&item, true).unwrap_err();
-    let message = to_syn_error(&err).to_string();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let err = result.errors();
+    let message = to_syn_error(err).to_string();
     assert!(
         message.contains("use absolute path: 'crate :: error :: Error'"),
         "{}",
@@ -259,10 +271,12 @@ fn test_check_allowed_paths_with_generic_args() {
             fn g<I: Iterator<Item = RelType>>(&self, i: I);
         }
     };
-    leaker.intern_trait(&item, true).unwrap();
+    leaker.intern_trait(&item, true);
     leaker.reduce_roots();
     let leaked: std::collections::BTreeSet<String> = leaker
+        .result()
         .finish()
+        .unwrap()
         .iter()
         .map(|t| template_quote::quote!(#t).to_string())
         .collect();
@@ -418,17 +432,15 @@ fn check_in_a_module_does_not_report_the_names_it_declares() {
     assert_eq!(kind(&outside), "MustIntern");
     assert_eq!(strings(&outside.must), ["Local"]);
     // In the module that declares it, it is not: the copy has the module's items too.
-    let (_, results) = leaker
-        .enter_mod("m", [parse_quote!(Local)], |view| {
-            [
-                check_ty(view, parse_quote!(Local)),
-                check_ty(view, parse_quote!(self::Local)),
-                check_ty(view, parse_quote!(::p::W<(Local,)>)),
-                check_ty(view, parse_quote!(Other)),
-                check_ty(view, parse_quote!(super::Local)),
-            ]
-        })
-        .unwrap();
+    let (_, results) = leaker.enter_mod("m", [parse_quote!(Local)], |view| {
+        [
+            check_ty(view, parse_quote!(Local)),
+            check_ty(view, parse_quote!(self::Local)),
+            check_ty(view, parse_quote!(::p::W<(Local,)>)),
+            check_ty(view, parse_quote!(Other)),
+            check_ty(view, parse_quote!(super::Local)),
+        ]
+    });
     let kinds: Vec<_> = results.iter().map(kind).collect();
     assert_eq!(
         kinds,
@@ -437,18 +449,15 @@ fn check_in_a_module_does_not_report_the_names_it_declares() {
     assert_eq!(strings(&results[3].must), ["Other"]);
     assert_eq!(strings(&results[4].must), ["super :: Local"]);
     // A module declares only its own names: not the ones of the module around.
-    let (_, inner) = leaker
-        .enter_mod("m", [parse_quote!(Local)], |view| {
-            view.enter_mod("n", [parse_quote!(Deeper)], |view| {
-                [
-                    check_ty(view, parse_quote!(Deeper)),
-                    check_ty(view, parse_quote!(Local)),
-                ]
-            })
-            .unwrap()
-            .1
+    let (_, inner) = leaker.enter_mod("m", [parse_quote!(Local)], |view| {
+        view.enter_mod("n", [parse_quote!(Deeper)], |view| {
+            [
+                check_ty(view, parse_quote!(Deeper)),
+                check_ty(view, parse_quote!(Local)),
+            ]
         })
-        .unwrap();
+        .1
+    });
     assert_eq!(kind(&inner[0]), "Neutral");
     assert_eq!(kind(&inner[1]), "MustIntern");
 }
@@ -469,7 +478,6 @@ fn check_self_in_a_struct_scope() {
                     check_ty(view, parse_quote!(T)),
                 ]
             })
-            .unwrap()
             .1
     };
     // `Self` can be leaked: it is not a cause, and `Rel` is the cause of `Rel<Self>`.
@@ -493,6 +501,8 @@ fn check_self_in_a_struct_scope() {
     assert_eq!(kind(&in_path), "Conflict");
     assert!(!in_path.is_own);
     assert_eq!(kind(&plain), "Neutral");
+    // A check records nothing: the scopes found no error.
+    assert!(leaker.result().errors().is_empty());
 }
 
 #[test]
@@ -508,8 +518,8 @@ fn check_self_has_no_meaning_in_generics_and_modules() {
             check_ty(view, parse_quote!(())),
         ]
     };
-    let (_, in_generics) = leaker.enter_generics(&generics, checks).unwrap();
-    let (_, in_module) = leaker.enter_mod("m", [], checks).unwrap();
+    let (_, in_generics) = leaker.enter_generics(&generics, checks);
+    let (_, in_module) = leaker.enter_mod("m", [], checks);
     for results in [in_generics, in_module] {
         let [own, assoc, in_rel, in_path, plain] = results;
         // It is an impossible cause, as written, and the note tells why.
@@ -541,18 +551,14 @@ fn check_self_has_no_meaning_in_generics_and_modules() {
     let item: ItemStruct = parse_quote!(
         struct S<T>(T);
     );
-    let (_, results) = leaker
-        .enter_type(&item.ident, &item.generics, true, |view| {
-            view.enter_generics(&parse_quote!(<'a>), checks).unwrap().1
-        })
-        .unwrap();
+    let (_, results) = leaker.enter_type(&item.ident, &item.generics, true, |view| {
+        view.enter_generics(&parse_quote!(<'a>), checks).1
+    });
     assert_eq!(kind(&results[0]), "Neutral");
     assert_eq!(kind(&results[4]), "Neutral");
-    let (_, results) = leaker
-        .enter_type(&item.ident, &item.generics, true, |view| {
-            view.enter_mod("m", [], checks).unwrap().1
-        })
-        .unwrap();
+    let (_, results) = leaker.enter_type(&item.ident, &item.generics, true, |view| {
+        view.enter_mod("m", [], checks).1
+    });
     assert_eq!(kind(&results[0]), "MustNotIntern");
 }
 
@@ -560,27 +566,24 @@ fn check_self_has_no_meaning_in_generics_and_modules() {
 fn check_is_not_the_error_of_the_scope() {
     let mut leaker = Leaker::new();
     // `check()` finds `Self` without leaving the error a visit leaves.
-    let result = leaker.enter_generics(&Generics::default(), |view| {
+    let (_, found) = leaker.enter_generics(&Generics::default(), |view| {
         view.check(&parse_quote!(Self)).impossible.len()
     });
-    assert_eq!(result.unwrap().1, 1);
-    let result = leaker.enter_generics(&Generics::default(), |view| {
+    assert_eq!(found, 1);
+    leaker.enter_generics(&Generics::default(), |view| {
         view.check(&parse_quote!(Self));
         view.visit_type(&parse_quote!(Self));
         view.check(&parse_quote!(Self));
     });
-    match result {
-        Err(errors) => {
-            assert_eq!(errors.len(), 1);
-            assert_eq!(errors[0].reason, Reason::SelfWithoutMeaning);
-        }
-        other => panic!("{:?}", other.map(|_| ())),
-    }
     // Neither does the conflict of a type leave one.
-    let result = leaker.enter_generics(&Generics::default(), |view| {
+    let (_, found) = leaker.enter_generics(&Generics::default(), |view| {
         view.check(&parse_quote!(MyType<'_>)).impossible.len()
     });
-    assert_eq!(result.unwrap().1, 1);
+    assert_eq!(found, 1);
+    // The errors of the Leaker are that of the visit only: no check left one.
+    let result = leaker.result();
+    assert_eq!(result.errors().len(), 1);
+    assert_eq!(result.errors()[0].reason, Reason::SelfWithoutMeaning);
 }
 
 #[test]
@@ -618,14 +621,12 @@ fn check_tells_an_optional_entry_of_an_external_crate() {
     // The names of the module are not copied by the Referrer, so a type using one is not leaked
     // alone, and its path is not an optional entry either.
     let mut leaker = Leaker::new();
-    let (_, results) = leaker
-        .enter_mod("m", [parse_quote!(Local)], |view| {
-            [
-                check_ty(view, parse_quote!(::foo::W<(Local,)>)),
-                check_ty(view, parse_quote!(::foo::W<(Other,)>)),
-            ]
-        })
-        .unwrap();
+    let (_, results) = leaker.enter_mod("m", [parse_quote!(Local)], |view| {
+        [
+            check_ty(view, parse_quote!(::foo::W<(Local,)>)),
+            check_ty(view, parse_quote!(::foo::W<(Other,)>)),
+        ]
+    });
     assert!(results[0].must.is_empty() && !results[0].optional);
     assert_eq!(strings(&results[1].must), ["Other"]);
     assert!(results[1].optional);
@@ -641,28 +642,24 @@ fn check_tells_an_optional_entry_of_an_external_crate() {
 #[test]
 fn check_sees_the_generics_of_the_scopes_around() {
     let mut leaker = Leaker::new();
-    let (_, (outer, inner)) = leaker
-        .enter_generics(&parse_quote!(<T>), |view| {
-            let outer = [
-                check_ty(view, parse_quote!(Wrap<T>)),
+    let (_, (outer, inner)) = leaker.enter_generics(&parse_quote!(<T>), |view| {
+        let outer = [
+            check_ty(view, parse_quote!(Wrap<T>)),
+            check_ty(view, parse_quote!((T, U))),
+            check_ty(view, parse_quote!(&'a ())),
+        ];
+        let (_, inner) = view.enter_generics(&parse_quote!(<'a, U>), |view| {
+            [
                 check_ty(view, parse_quote!((T, U))),
                 check_ty(view, parse_quote!(&'a ())),
-            ];
-            let (_, inner) = view
-                .enter_generics(&parse_quote!(<'a, U>), |view| {
-                    [
-                        check_ty(view, parse_quote!((T, U))),
-                        check_ty(view, parse_quote!(&'a ())),
-                        check_ty(view, parse_quote!(::p::W<'a, T, U>)),
-                        check_ty(view, parse_quote!((T, V))),
-                    ]
-                })
-                .unwrap();
-            // Back in the scope around, which does not know what the nested one declared.
-            assert_eq!(kind(&check_ty(view, parse_quote!(U))), "MustIntern");
-            (outer, inner)
-        })
-        .unwrap();
+                check_ty(view, parse_quote!(::p::W<'a, T, U>)),
+                check_ty(view, parse_quote!((T, V))),
+            ]
+        });
+        // Back in the scope around, which does not know what the nested one declared.
+        assert_eq!(kind(&check_ty(view, parse_quote!(U))), "MustIntern");
+        (outer, inner)
+    });
     // `T` is a generic of the scope, and `U` and `'a` are not yet.
     assert_eq!(kind(&outer[0]), "MustIntern");
     assert_eq!(strings(&outer[0].must), ["Wrap < T >"]);
@@ -673,6 +670,8 @@ fn check_sees_the_generics_of_the_scopes_around() {
     assert_eq!(kind(&inner[1]), "Neutral");
     assert_eq!(kind(&inner[2]), "Neutral");
     assert_eq!(strings(&inner[3].must), ["V"]);
+    // A check records nothing: the scopes found no error.
+    assert!(leaker.result().errors().is_empty());
 }
 
 #[test]
@@ -689,7 +688,6 @@ fn check_reports_the_conflict_a_scope_reports() {
             .enter_type(&item.ident, &item.generics, allow_self, |view| {
                 view.check(&ty)
             })
-            .unwrap()
             .1
     };
     let allowed = check(true);
@@ -704,11 +702,11 @@ fn check_reports_the_conflict_a_scope_reports() {
     let help = forbidden.help.clone().expect("a help");
     assert!(help.contains("`allow_self = true`"), "{}", help);
     // It is what the scope reports for the same type.
-    let err = leaker
-        .enter_type(&item.ident, &item.generics, false, |view| {
-            view.visit_type(&ty)
-        })
-        .unwrap_err();
+    leaker.enter_type(&item.ident, &item.generics, false, |view| {
+        view.visit_type(&ty)
+    });
+    let result = leaker.result();
+    let err = result.errors();
     assert_eq!(err.len(), 1);
     let item = &err[0];
     assert_eq!(item.reason, Reason::DeniedSelfInBounds);
@@ -775,46 +773,36 @@ fn analyze(checked: bool) -> (Vec<ContextId>, Referrer) {
     );
     let mut leaker = Leaker::new();
     let mut ids = Vec::new();
-    let (id, ()) = leaker
-        .enter_generics(&item.generics, |view| {
+    let (id, ()) = leaker.enter_generics(&item.generics, |view| {
+        checks(view);
+        view.visit_type(&parse_quote!(Rel<T>));
+        checks(view);
+        view.visit_type(&parse_quote!(::foo::W<(Rel2<T>,)>));
+        let (id, ()) = view.enter_mod("m", [parse_quote!(Local)], |view| {
             checks(view);
-            view.visit_type(&parse_quote!(Rel<T>));
+            view.visit_type(&parse_quote!(Rel3));
             checks(view);
-            view.visit_type(&parse_quote!(::foo::W<(Rel2<T>,)>));
-            let (id, ()) = view
-                .enter_mod("m", [parse_quote!(Local)], |view| {
-                    checks(view);
-                    view.visit_type(&parse_quote!(Rel3));
-                    checks(view);
-                })
-                .unwrap();
-            ids.push(id);
-            let (id, ()) = view
-                .enter_type(&item.ident, &item.generics, true, |view| {
-                    checks(view);
-                    view.visit_type(&parse_quote!(Rel4<Self>));
-                })
-                .unwrap();
-            ids.push(id);
+        });
+        ids.push(id);
+        let (id, ()) = view.enter_type(&item.ident, &item.generics, true, |view| {
             checks(view);
-        })
-        .unwrap();
+            view.visit_type(&parse_quote!(Rel4<Self>));
+        });
+        ids.push(id);
+        checks(view);
+    });
     ids.push(id);
     // The scopes after it get the ids that the ones before left free.
-    let (id, ()) = leaker
-        .enter_mod("n", [], |view| {
-            checks(view);
-            view.visit_type(&parse_quote!(Rel5));
-        })
-        .unwrap();
+    let (id, ()) = leaker.enter_mod("n", [], |view| {
+        checks(view);
+        view.visit_type(&parse_quote!(Rel5));
+    });
     ids.push(id);
-    let (id, ()) = leaker
-        .enter_generics(&parse_quote!(<U>), |view| {
-            view.visit_type(&parse_quote!(Rel6<U>))
-        })
-        .unwrap();
+    let (id, ()) = leaker.enter_generics(&parse_quote!(<U>), |view| {
+        view.visit_type(&parse_quote!(Rel6<U>))
+    });
     ids.push(id);
-    (ids, leaker.finish())
+    (ids, leaker.result().finish().unwrap())
 }
 
 #[test]
@@ -830,17 +818,13 @@ fn check_records_nothing() {
 fn a_check_alone_leaves_an_empty_leaker() {
     let mut leaker = Leaker::new();
     let types = recording_types();
-    let (id, ()) = leaker
-        .enter_generics(&parse_quote!(<T>), |view| {
-            for ty in &types {
-                view.check(ty);
-            }
-        })
-        .unwrap();
-    let (other_id, ()) = Leaker::new()
-        .enter_generics(&parse_quote!(<T>), |_| ())
-        .unwrap();
+    let (id, ()) = leaker.enter_generics(&parse_quote!(<T>), |view| {
+        for ty in &types {
+            view.check(ty);
+        }
+    });
+    let (other_id, ()) = Leaker::new().enter_generics(&parse_quote!(<T>), |_| ());
     assert_eq!(id, other_id);
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     assert!(referrer.is_empty());
 }

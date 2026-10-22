@@ -169,10 +169,10 @@ impl ScopeInput {
                 &self.item.self_ty,
                 self.allow_self,
                 visit,
-            )?,
-            Scope::Generics => leaker.enter_generics(&self.item.generics, visit)?,
+            ),
+            Scope::Generics => leaker.enter_generics(&self.item.generics, visit),
         };
-        Ok((leaker.finish(), context))
+        Ok((leaker.result().finish()?, context))
     }
 
     fn pairs(&self) -> TokenStream {

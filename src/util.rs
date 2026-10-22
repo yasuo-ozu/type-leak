@@ -10,9 +10,8 @@ use syn::visit::Visit;
 use syn::*;
 use template_quote::{quote, ToTokens};
 
-/// The cause of an error about `bound`, without the `?` of a relaxed bound: its trait path, or the
-/// bound as written if it has a binder (`for<'a> Fn(&'a u8)`) or parentheses, which no node of the
-/// syntax holds.
+/// The cause of an error about `bound`: its trait path, or the bound as written (without `?`) if it
+/// has a binder or parentheses, which no node of the syntax holds.
 pub(crate) fn bound_cause(bound: &TraitBound) -> Cause {
     if bound.lifetimes.is_none() && bound.paren_token.is_none() {
         return Cause::Trait(bound.path.clone());
@@ -60,7 +59,8 @@ impl AllowedPaths {
             || self.is_allowed_path(path)
     }
 
-    fn is_allowed_path(&self, path: &Path) -> bool {
+    /// Returns `true` if `path` starts with an allowed path.
+    pub(crate) fn is_allowed_path(&self, path: &Path) -> bool {
         self.0.iter().any(|allowed| path_starts_with(path, allowed))
     }
 
@@ -71,6 +71,58 @@ impl AllowedPaths {
             && !matches!(path.segments.first(), Some(seg) if seg.ident == "core")
             && !self.is_allowed_path(path)
     }
+}
+
+/// The names of the standard prelude that `LeakerConfig::allow_std_prelude()` and
+/// `LeakerResult::allow_prelude()` allow.
+pub(crate) fn std_prelude_paths() -> Vec<Path> {
+    const NAMES: [&str; 31] = [
+        "Box",
+        "String",
+        "Vec",
+        "Option",
+        "Result",
+        "Copy",
+        "Send",
+        "Sized",
+        "Sync",
+        "Unpin",
+        "Drop",
+        "Fn",
+        "FnMut",
+        "FnOnce",
+        "Clone",
+        "PartialEq",
+        "PartialOrd",
+        "Eq",
+        "Ord",
+        "AsRef",
+        "AsMut",
+        "Into",
+        "From",
+        "Default",
+        "Iterator",
+        "IntoIterator",
+        "Extend",
+        "FromIterator",
+        "ToOwned",
+        "ToString",
+        "drop",
+    ];
+    NAMES.iter().map(|name| crate_path(name)).collect()
+}
+
+/// The crates that `LeakerResult::allow_std_crates()` allows.
+pub(crate) fn std_crate_paths() -> Vec<Path> {
+    ["std", "core", "alloc"]
+        .iter()
+        .map(|name| crate_path(name))
+        .collect()
+}
+
+/// The path of one segment, `name`.
+fn crate_path(name: &str) -> Path {
+    Path::from(Ident::new(name, proc_macro2::Span::call_site()))
 }
 
 pub(crate) fn is_primitive_name(ident: &Ident) -> bool {
@@ -493,8 +545,8 @@ impl SelfFinder {
         }
     }
 
-    /// Records `path` if it starts with `Self`, as the syntax `cause` makes of it, and goes on with
-    /// its arguments.
+    /// Records `path` if it starts with `Self`, as the syntax `cause` makes of it, then visits its
+    /// arguments.
     fn path<'ast>(&mut self, path: &'ast Path, cause: fn(&Path) -> Cause) {
         if path.leading_colon.is_none()
             && path.segments.first().map_or(false, |s| s.ident == "Self")
@@ -509,8 +561,7 @@ impl SelfFinder {
 }
 
 impl<'ast> Visit<'ast> for SelfFinder {
-    /// A path that is none of the following: a value (in a pattern, a struct literal or an
-    /// expression).
+    /// A path that is none of the following: a value (a pattern, a struct literal, an expression).
     fn visit_path(&mut self, i: &'ast Path) {
         self.path(i, Cause::expr_path)
     }

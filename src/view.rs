@@ -1,7 +1,7 @@
 //! The [`View`], which a scope of the [`Leaker`](crate::Leaker) gives to its closure.
 
 use crate::analysis::CheckResult;
-use crate::analyze::{AnalyzeVisitor, Res, ScopeSpec, Scopes};
+use crate::analyze::{AnalyzeVisitor, ScopeSpec, Scopes};
 use crate::context::ContextId;
 use std::fmt::Display;
 use syn::*;
@@ -17,8 +17,9 @@ mod forward;
 /// nested scope: its generics are local generics, and the generics around stay in scope. A scope
 /// sees what its nested scopes find as if it was written in it. `Self` is what the scope declares.
 /// It has no meaning in `enter_generics()` and `enter_mod()`, so naming it there is an error, and
-/// an item visited with `visit_item()` has a `Self` of its own. The ids, errors and rollback of a
-/// scope are those of [`Leaker::enter_generics()`](crate::Leaker::enter_generics).
+/// an item visited with `visit_item()` has a `Self` of its own. A nested scope returns the id and
+/// the result like [`Leaker::enter_generics()`](crate::Leaker::enter_generics), but no errors:
+/// the outermost call records them ([`Leaker::result()`](crate::Leaker::result)).
 ///
 /// `View` also implements [`Visit`](syn::visit::Visit), so a walk with the `syn::visit` functions
 /// analyzes an item: `syn::visit::visit_item_struct(view, &item)` does what
@@ -62,9 +63,8 @@ mod forward;
 ///         if let Some(where_clause) = &sig.generics.where_clause {
 ///             view.visit_where_clause(where_clause);
 ///         }
-///     })
-///     .unwrap();
-/// assert_eq!(leaker.finish().iter().count(), 3);
+///     });
+/// assert_eq!(leaker.result().finish().unwrap().iter().count(), 3);
 /// ```
 ///
 /// Each `visit_*` method analyzes one kind of syntax, with the generics, `Self` and module of the
@@ -87,10 +87,9 @@ mod forward;
 ///             }
 ///         }
 ///         view.visit_where_clause(generics.where_clause.as_ref().unwrap()); // a where clause
-///     })
-///     .unwrap();
+///     });
 /// // `Wrap<T>`, `Rel3`, `Rel1` and `Rel2`.
-/// assert_eq!(leaker.finish().iter().count(), 4);
+/// assert_eq!(leaker.result().finish().unwrap().iter().count(), 4);
 /// ```
 pub struct View<'v> {
     visitor: &'v mut AnalyzeVisitor,
@@ -107,11 +106,9 @@ impl<'v> View<'v> {
     /// It finds what [`View::visit_type()`] finds in `ty` here: with the generics of all the scopes
     /// around, `Self` and its `allow_self`, and the module with the names it declares (they are not
     /// causes). An absolute path of an external crate is not a cause, so `::foo::W<(Rel,)>` has
-    /// only `Rel`, and `optional`. `Self` where it has no meaning is an impossible cause. Each
-    /// cause is a [`Cause`](crate::Cause) of the kind of syntax it is (a type, the trait of a
-    /// bound, an expression, a macro, a lifetime). The Leaker is as if `check()` was not called: no
-    /// entry, context, error or module remains. (It takes `&mut self` only because it borrows the
-    /// analysis and puts it back.)
+    /// only `Rel`, and `optional`. `Self` where it has no meaning is an impossible cause. The
+    /// Leaker is as if `check()` was not called: no entry, context, error or module remains. (It
+    /// takes `&mut self` only because it borrows the analysis and puts it back.)
     ///
     /// ```
     /// # use type_leak::*;
@@ -121,11 +118,10 @@ impl<'v> View<'v> {
     /// let (_, result) = leaker
     ///     .enter_generics(&generics, |view| {
     ///         view.check(&parse_quote!(::foo::W<T, (Rel,)>))
-    ///     })
-    ///     .unwrap();
+    ///     });
     /// assert_eq!(result.must.len(), 1); // `Rel`
     /// assert!(!result.is_own && result.optional);
-    /// assert_eq!(leaker.finish().iter().count(), 0);
+    /// assert_eq!(leaker.result().finish().unwrap().iter().count(), 0);
     /// ```
     pub fn check(&mut self, ty: &Type) -> CheckResult {
         self.visitor.check(ty)
@@ -138,7 +134,7 @@ impl<'v> View<'v> {
         hint: impl Display,
         declared: impl IntoIterator<Item = Ident>,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         Scopes::enter_mod(self, hint, declared, f)
     }
 
@@ -149,7 +145,7 @@ impl<'v> View<'v> {
         &mut self,
         generics: &Generics,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         Scopes::enter_generics(self, generics, f)
     }
 
@@ -161,7 +157,7 @@ impl<'v> View<'v> {
         generics: &Generics,
         allow_self: bool,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         Scopes::enter_type(self, ident, generics, allow_self, f)
     }
 
@@ -173,7 +169,7 @@ impl<'v> View<'v> {
         self_ty: &Type,
         allow_self: bool,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         Scopes::enter_impl(self, generics, self_ty, allow_self, f)
     }
 
@@ -185,7 +181,7 @@ impl<'v> View<'v> {
         generics: &Generics,
         allow_self: bool,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         Scopes::enter_trait(self, ident, generics, allow_self, f)
     }
 }
@@ -195,7 +191,7 @@ impl Scopes for View<'_> {
         &mut self,
         spec: ScopeSpec,
         f: impl FnOnce(&mut View<'_>) -> R,
-    ) -> Res<(ContextId, R)> {
+    ) -> (ContextId, R) {
         self.visitor.enter(spec, f)
     }
 }

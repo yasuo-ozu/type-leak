@@ -63,11 +63,11 @@ pub fn export_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // 1. Analyze the trait. The `ContextId` names the scope of its generics and `Self`: crate B
     //    needs it to rewrite a copy. `true` lets a type that names `Self` be leaked whole.
     let mut leaker = Leaker::new();
-    let top_level = match leaker.intern_trait(&item_trait, true) {
-        Ok(top_level) => top_level,
-        Err(error) => return report(&error).into(),
+    let top_level = leaker.intern_trait(&item_trait, true);
+    let referrer = match leaker.result().finish() {
+        Ok(referrer) => referrer,
+        Err(errors) => return report(&errors).into(),
     };
-    let referrer = leaker.finish();
 
     // 2. One Repeater impl for each entry, written next to the trait, where the relative paths of
     //    the entries mean what they mean in the trait.

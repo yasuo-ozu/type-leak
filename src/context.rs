@@ -162,12 +162,10 @@ impl Scope {
 /// # use syn::*;
 /// let mut leaker = Leaker::new();
 /// let in_struct = leaker
-///     .intern_struct(&parse_quote!(struct S<T> { a: Rel<Self> }), true)
-///     .unwrap();
+///     .intern_struct(&parse_quote!(struct S<T> { a: Rel<Self> }), true);
 /// let in_trait = leaker
-///     .intern_trait(&parse_quote!(trait Tr<T> { fn f(&self) -> Rel<Self>; }), true)
-///     .unwrap();
-/// let referrer = leaker.finish();
+///     .intern_trait(&parse_quote!(trait Tr<T> { fn f(&self) -> Rel<Self>; }), true);
+/// let referrer = leaker.result().finish().unwrap();
 /// // In a struct, `Self` is the struct with its own generics as arguments.
 /// match referrer.context_self(in_struct) {
 ///     Some(SelfRequirement::Type(ty)) => assert_eq!(*ty, parse_quote!(S<T>)),
@@ -1206,7 +1204,7 @@ impl std::hash::Hash for Context {
 /// of what it analyzed (keep it: [`Referrer::visitor()`](crate::Referrer::visitor) needs it), and
 /// [`Referrer::context()`](crate::Referrer::context) returns the id of the context of an entry.
 /// Ids count from 0 in order of first appearance and are never renumbered (except for the contexts
-/// of a scope that fails and is rolled back), so the Referrer may skip some. Entries with the same
+/// of a scope that panics and is rolled back), so the Referrer may skip some. Entries with the same
 /// generics, `Self` and module share an id. `ToTokens` writes it as an integer literal, and `Parse`
 /// reads one with or without `usize`.
 ///
@@ -1215,8 +1213,8 @@ impl std::hash::Hash for Context {
 /// # use syn::*;
 /// let item: ItemStruct = parse_quote!(struct S<T> { a: Wrap<T>, b: Rel });
 /// let mut leaker = Leaker::new();
-/// let top_level = leaker.intern_struct(&item, true).unwrap();
-/// let referrer = leaker.finish();
+/// let top_level = leaker.intern_struct(&item, true);
+/// let referrer = leaker.result().finish().unwrap();
 /// // `Wrap<T>` uses the generics of the struct, as the top-level context has them.
 /// // `Rel` uses no generic, so its context is another one.
 /// let wrap = referrer.iter().position(|ty| *ty == parse_quote!(Wrap<T>)).unwrap();
@@ -1245,8 +1243,8 @@ impl std::hash::Hash for Context {
 ///     }
 /// };
 /// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&item, true).unwrap();
-/// let referrer = leaker.finish();
+/// leaker.intern_trait(&item, true);
+/// let referrer = leaker.result().finish().unwrap();
 /// // `Rel` uses no generic. `Wrap<T>` uses `T`. `Wrap<U>` uses `U` and, through the bound
 /// // `U: Into<T>`, `T`.
 /// let used: Vec<usize> = (0..3).map(|ix| referrer.generics(ix).params.len()).collect();

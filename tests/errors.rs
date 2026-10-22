@@ -46,18 +46,29 @@ fn leaker_config() -> LeakerConfig {
     config
 }
 
+/// The errors that `leaker` has after `analyze` ran on it (`Leaker::result()`).
+fn errors_of<R>(mut leaker: Leaker, analyze: impl FnOnce(&mut Leaker) -> R) -> Vec<ErrorItem> {
+    analyze(&mut leaker);
+    leaker.result().errors().to_vec()
+}
+
+/// Like [`errors_of()`], for a test that expects an error.
+fn expect_errors<R>(leaker: Leaker, analyze: impl FnOnce(&mut Leaker) -> R) -> Vec<ErrorItem> {
+    let errors = errors_of(leaker, analyze);
+    assert!(!errors.is_empty(), "accepted");
+    errors
+}
+
 /// Runs a Leaker on `item_trait`, returning the leaked types or the error message.
 fn leak_trait(item_trait: &ItemTrait) -> std::result::Result<BTreeSet<String>, String> {
     let mut leaker = Leaker::from_config(leaker_config());
-    leaker
-        .intern_trait(item_trait, true)
-        .map_err(|e| messages(&e))?;
+    leaker.intern_trait(item_trait, true);
     leaker.reduce_roots();
-    Ok(leaker
+    let referrer = leaker
+        .result()
         .finish()
-        .iter()
-        .map(|t| quote!(#t).to_string())
-        .collect())
+        .map_err(|errors| messages(&errors))?;
+    Ok(referrer.iter().map(|t| quote!(#t).to_string()).collect())
 }
 
 fn ty_string(ty: &Type) -> String {
@@ -255,7 +266,7 @@ fn limit_shadowed_primitive() {
     assert_eq!(leak_trait(&item), Ok(BTreeSet::new()));
 
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true).unwrap();
+    leaker.intern_trait(&item, true);
     let expected = quote! {
         #[allow(dead_code, non_snake_case)]
         const _: () = {
@@ -267,6 +278,7 @@ fn limit_shadowed_primitive() {
         parse2(expected).unwrap(),
     );
     assert_eq!(quote!(#actual).to_string(), quote!(#expected).to_string());
+    assert!(leaker.result().errors().is_empty());
 }
 
 // ── error messages ───────────────────────────────────────────────────────────
@@ -274,11 +286,13 @@ fn limit_shadowed_primitive() {
 /// Runs a Leaker with the default configuration (no allowed paths), returning the error message
 /// and help.
 fn leak_error_default(item_trait: &ItemTrait) -> Option<(String, Option<String>)> {
-    let mut leaker = Leaker::new();
-    leaker
-        .intern_trait(item_trait, true)
-        .err()
-        .map(|e| (messages(&e), e[0].help_text().map(str::to_string)))
+    let e = errors_of(Leaker::new(), |leaker| {
+        leaker.intern_trait(item_trait, true)
+    });
+    if e.is_empty() {
+        return None;
+    }
+    Some((messages(&e), e[0].help_text().map(str::to_string)))
 }
 
 fn error(message: &str, help: Option<&str>) -> Option<(String, Option<String>)> {
@@ -399,7 +413,10 @@ fn help_for_a_path_that_is_not_in_the_prelude() {
         pub trait MyTrait: crate::m::Bound + super::Other {}
     })
     .unwrap();
-    let err = Leaker::new().intern_trait(&item, true).unwrap_err();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let err = result.errors();
     let helps: Vec<_> = err
         .iter()
         .map(|item| item.help_text().unwrap().to_string())
@@ -422,8 +439,9 @@ fn help_in_syn_error() {
         pub trait MyTrait: Clone {}
     })
     .unwrap();
-    let mut leaker = Leaker::new();
-    let err = to_syn_error(&leaker.intern_trait(&item, true).err().unwrap());
+    let err = to_syn_error(&expect_errors(Leaker::new(), |leaker| {
+        leaker.intern_trait(&item, true)
+    }));
     assert_eq!(
         err.to_string(),
         "use absolute path: 'Clone'\n\n  = help: use `::core::clone::Clone` instead of `Clone`\n"
@@ -433,8 +451,9 @@ fn help_in_syn_error() {
         pub trait MyTrait: MyBound {}
     })
     .unwrap();
-    let mut leaker = Leaker::new();
-    let err = to_syn_error(&leaker.intern_trait(&item, true).err().unwrap());
+    let err = to_syn_error(&expect_errors(Leaker::new(), |leaker| {
+        leaker.intern_trait(&item, true)
+    }));
     assert_eq!(
         err.to_string(),
         "use absolute path: 'MyBound'\n\n  = help: write `MyBound` with an absolute path (e.g. \
@@ -449,8 +468,7 @@ fn error_to_compile_error() {
         pub trait MyTrait: Clone {}
     })
     .unwrap();
-    let mut leaker = Leaker::new();
-    let err = leaker.intern_trait(&item, true).err().unwrap();
+    let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true));
     let tokens = err[0].to_compile_error().to_string();
     assert!(tokens.contains("compile_error"), "{}", tokens);
     assert!(
@@ -502,8 +520,7 @@ fn all_relative_paths_are_reported() {
         }
     })
     .unwrap();
-    let mut leaker = Leaker::new();
-    let err = leaker.intern_trait(&item, true).err().unwrap();
+    let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true));
     assert!(err.iter().all(|item| item.reason == Reason::RelativePath));
     // The cause of each is the whole bound or type that is a conflict (a trait is its own path:
     // it needs no note), and what stops the type from being leaked as a whole is a note.
@@ -559,7 +576,7 @@ fn notes_explain_conflicts() {
         }
     })
     .unwrap();
-    let err = Leaker::new().intern_trait(&item, true).err().unwrap();
+    let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true));
     // The suggestion of the absolute path is the help.
     assert_eq!(
         err[0].help_text(),
@@ -590,7 +607,7 @@ fn a_conflict_that_is_not_about_the_path_has_a_headline_of_its_own() {
         }
     })
     .unwrap();
-    let err = Leaker::new().intern_trait(&item, true).err().unwrap();
+    let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true));
     assert_eq!(
         messages(&err),
         "`Wrap < 'b >` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)\n\
@@ -615,7 +632,7 @@ fn a_conflict_that_is_not_about_the_path_has_a_headline_of_its_own() {
         }
     })
     .unwrap();
-    let err = Leaker::new().intern_trait(&item, false).err().unwrap();
+    let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item, false));
     assert_eq!(
         messages(&err),
         "`Wrap < T >` has a generic whose bound mentions `Self`, which cannot be leaked"
@@ -633,7 +650,7 @@ fn a_conflict_that_is_not_about_the_path_has_a_headline_of_its_own() {
         }
     })
     .unwrap();
-    let err = Leaker::new().intern_trait(&item, true).err().unwrap();
+    let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true));
     assert_eq!(messages(&err), "use absolute path: 'MyType < '_ >'");
     assert_eq!(err[0].reason, Reason::RelativePath);
 }
@@ -645,12 +662,11 @@ fn a_type_that_is_leaked_alone_is_no_cause_of_the_conflict_around_it() {
     // happens to the type that holds it: it is no error once `Tr` is absolute, so the notes do not
     // name it.
     let leak = |ty: Type| {
-        Leaker::new()
-            .enter_impl(&Generics::default(), &parse_quote!(B), false, |view| {
+        expect_errors(Leaker::new(), |leaker| {
+            leaker.enter_impl(&Generics::default(), &parse_quote!(B), false, |view| {
                 view.visit_type(&ty)
             })
-            .err()
-            .unwrap()
+        })
     };
     let err = leak(parse_quote!(<Self as super::Tr<u8>>::X));
     let items = &err;
@@ -695,7 +711,9 @@ fn a_closure_in_an_array_length_cannot_be_leaked_as_a_whole() {
         pub trait Tr { fn f(&self, x: [u8; { let c = |a: u8| a; 3 }]); }
     };
     let mut leaker = Leaker::from_config(leaker_config());
-    let err = leaker.intern_trait(&item, true).unwrap_err();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let err = result.errors();
     let items = &err;
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].message, "use absolute path: 'a'");
@@ -712,6 +730,6 @@ fn a_closure_in_an_array_length_cannot_be_leaked_as_a_whole() {
         pub trait Tr { fn f(&self, x: [u8; { let c = 3; c }]); }
     };
     let mut leaker = Leaker::from_config(leaker_config());
-    leaker.intern_trait(&item, true).unwrap();
-    assert_eq!(leaker.finish().iter().count(), 1);
+    leaker.intern_trait(&item, true);
+    assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
 }

@@ -1767,7 +1767,7 @@ pub mod kinds {
         }
     }
 
-    // Conflicts that the Leaker rejects, accepted with `LeakerConfig::allow()` of their causes
+    // Conflicts that the Leaker rejects, accepted with `LeakerResult::allow()` of their causes
     // (`prop_leak_accept`): the part that conflicts is copied as written, whole, and the rest is
     // leaked as usual. The Referrer's crate invokes them with `accept`, in a module that names the
     // types and the trait that the copies keep as written (`accepted`).

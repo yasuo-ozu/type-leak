@@ -48,8 +48,8 @@ fn intern_struct() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),
         [
@@ -78,8 +78,8 @@ fn intern_enum() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_enum(&item, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_enum(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),
         [
@@ -96,7 +96,10 @@ fn intern_enum() {
     assert_eq!(top_level, referrer.context(3));
     assert!(referrer.has_self());
     // Without `Self` it is an error to leak `Rel2<Self>`, and the others are not.
-    assert!(Leaker::new().intern_enum(&item, false).is_err());
+    let mut leaker = Leaker::new();
+    leaker.intern_enum(&item, false);
+    let result = leaker.result();
+    assert!(result.finish().is_err());
 }
 
 #[test]
@@ -108,8 +111,8 @@ fn intern_union() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_union(&item, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_union(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(entries(&referrer), ["MyType |  | -"]);
     assert_eq!(ids(&referrer), [0]);
     assert_eq!(top_level.index(), 1);
@@ -118,9 +121,10 @@ fn intern_union() {
         "< T : :: core :: marker :: Copy >"
     );
     // A bound must use an absolute path, as for the others.
-    assert!(Leaker::new()
-        .intern_union(&parse_quote!(union U<T: Copy> { a: T }), true)
-        .is_err());
+    let mut leaker = Leaker::new();
+    leaker.intern_union(&parse_quote!(union U<T: Copy> { a: T }), true);
+    let result = leaker.result();
+    assert!(result.finish().is_err());
 }
 
 #[test]
@@ -133,8 +137,8 @@ fn intern_trait() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&item, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),
         [
@@ -150,22 +154,24 @@ fn intern_trait() {
     assert_eq!(top_level, referrer.context(0));
     assert_eq!(s(referrer.context_generics(top_level)), "< T , U >");
     // The relative bounds and the relative supertraits are errors.
-    assert!(Leaker::new()
-        .intern_trait(
-            &parse_quote!(
-                trait Tr: Relative {}
-            ),
-            true
-        )
-        .is_err());
-    assert!(Leaker::new()
-        .intern_trait(
-            &parse_quote!(
-                trait Tr: ::path::Absolute {}
-            ),
-            true
-        )
-        .is_ok());
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(
+        &parse_quote!(
+            trait Tr: Relative {}
+        ),
+        true,
+    );
+    let result = leaker.result();
+    assert!(result.finish().is_err());
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(
+        &parse_quote!(
+            trait Tr: ::path::Absolute {}
+        ),
+        true,
+    );
+    let result = leaker.result();
+    assert!(result.finish().is_ok());
 }
 
 #[test]
@@ -179,8 +185,8 @@ fn intern_impl() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_impl(&item, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_impl(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     // The self type, the trait with its arguments and the signatures are analyzed, and the bodies
     // are not.
     assert_eq!(
@@ -206,8 +212,8 @@ fn intern_impl() {
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_impl(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_impl(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),
         [
@@ -220,7 +226,10 @@ fn intern_impl() {
     let item: ItemImpl = parse_quote!(
         impl Relative for ::path::W {}
     );
-    let err = Leaker::new().intern_impl(&item, true).err().unwrap();
+    let mut leaker = Leaker::new();
+    leaker.intern_impl(&item, true);
+    let result = leaker.result();
+    let err = result.errors();
     assert_eq!(err.len(), 1);
     assert_eq!(err[0].message, "use absolute path: 'Relative'");
 }
@@ -241,8 +250,8 @@ fn intern_mod() {
         }
     );
     let mut leaker = Leaker::new();
-    let module = leaker.intern_mod(&item).unwrap();
-    let referrer = leaker.finish();
+    let module = leaker.intern_mod(&item);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),
         [
@@ -271,12 +280,10 @@ fn intern_mod() {
     assert_eq!(referrer.context_module(module), None);
     // A module without a content has nothing to analyze.
     let mut leaker = Leaker::new();
-    let module = leaker
-        .intern_mod(&parse_quote!(
-            mod m;
-        ))
-        .unwrap();
-    let referrer = leaker.finish();
+    let module = leaker.intern_mod(&parse_quote!(
+        mod m;
+    ));
+    let referrer = leaker.result().finish().unwrap();
     assert!(referrer.is_empty());
     assert_eq!(referrer.module_path(module), Some(&[][..]));
 }
@@ -305,44 +312,20 @@ fn from_config_and_the_items_accumulate() {
             B(Rel2),
         }
     );
-    let a = leaker.intern_struct(&first, true).unwrap();
-    let b = leaker.intern_trait(&second, true).unwrap();
-    // A failed call takes no id, also if a scope that completed inside it had taken one (the ids
-    // are assigned when a nested scope is left).
-    assert!(leaker
-        .intern_struct(
-            &parse_quote!(
-                struct Bad {
-                    x: Rel3<'_>,
-                }
-            ),
-            true
-        )
-        .is_err());
-    assert!(leaker
-        .enter_generics(&parse_quote!(<U>), |view| {
-            view.enter_generics(&parse_quote!(<W>), |view| {
-                view.visit_type(&parse_quote!(Wrap<W>))
-            })
-            .unwrap();
-            view.visit_type(&parse_quote!(Rel3<'_>));
-        })
-        .is_err());
-    let c = leaker.intern_enum(&third, true).unwrap();
-    // The failed calls left no context, so the next generics take the next id (the generics `<W>`
-    // of the scope that completed in a failed call are not among the contexts).
-    let d = leaker
-        .intern_struct(
-            &parse_quote!(
-                struct D<V> {
-                    x: Wrap<V>,
-                }
-            ),
-            true,
-        )
-        .unwrap();
+    let a = leaker.intern_struct(&first, true);
+    let b = leaker.intern_trait(&second, true);
+    let c = leaker.intern_enum(&third, true);
+    // The next generics take the next id.
+    let d = leaker.intern_struct(
+        &parse_quote!(
+            struct D<V> {
+                x: Wrap<V>,
+            }
+        ),
+        true,
+    );
     assert_eq!(d, id(2));
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     // `Rel` is leaked once, in the context of no generics, which is that of `E`.
     assert_eq!(
         entries(&referrer),
@@ -364,9 +347,12 @@ fn from_config_and_the_items_accumulate() {
     let mut leaker = Leaker::from_config(LeakerConfig::new());
     assert!(leaker.allowed_paths.is_empty());
     leaker.allowed_paths.push(parse_quote!(Vec));
-    leaker.intern_struct(&first, true).unwrap();
+    leaker.intern_struct(&first, true);
     // `Vec` is allowed, and `u8` is not (it is a relative path, as it is not a configured one).
-    assert_eq!(entries(&leaker.finish()), ["(Rel , u8) |  | -"]);
+    assert_eq!(
+        entries(&leaker.result().finish().unwrap()),
+        ["(Rel , u8) |  | -"]
+    );
 }
 
 fn id(n: usize) -> ContextId {

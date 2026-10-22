@@ -50,8 +50,8 @@ fn messages(errors: &[ErrorItem]) -> String {
 
 fn analyze(item: &ItemTrait) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     let mut leaker = leaker();
-    leaker.intern_trait(item, true)?;
-    Ok(leaker.finish())
+    leaker.intern_trait(item, true);
+    leaker.result().finish()
 }
 
 /// The leaked types of a trait with the generics each uses.
@@ -207,8 +207,8 @@ fn the_holder_is_leaked_as_a_whole() {
         struct S<'a, T: 'a> { f: fn(&Rel<T>) -> &u8, g: Box<dyn Fn(&Rel<T>) -> &u8>, h: &'a Rel<T> }
     };
     let mut leaker = leaker();
-    leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     let mut found: Vec<String> = referrer.iter().map(s).collect();
     found.sort();
     assert_eq!(
@@ -446,14 +446,16 @@ fn a_method_with_no_lifetime_from_its_receiver_is_an_error() {
     // A function item of a module has no receiver either.
     let item: ItemMod =
         parse_quote! { mod m { pub fn g<'a, T: 'a>(x: &Rel<T>) -> &u8 { loop {} } } };
-    let err = leaker().intern_mod(&item).err().unwrap();
-    assert_eq!(err[0].note(), Some(NOTE));
+    let mut module_leaker = leaker();
+    module_leaker.intern_mod(&item);
+    assert_eq!(module_leaker.result().errors()[0].note(), Some(NOTE));
     // And an impl.
     let item: ItemImpl = parse_quote! {
         impl<'a, T: 'a> ::p::Tr<'a, T> for u8 { fn g(x: &Rel<T>) -> &u8 { loop {} } }
     };
-    let err = leaker().intern_impl(&item, true).err().unwrap();
-    assert_eq!(err[0].note(), Some(NOTE));
+    let mut impl_leaker = leaker();
+    impl_leaker.intern_impl(&item, true);
+    assert_eq!(impl_leaker.result().errors()[0].note(), Some(NOTE));
 }
 
 #[test]
@@ -600,8 +602,8 @@ fn the_copy_is_rewritten_to_the_holder() {
         }
     };
     let mut leaker = leaker();
-    let context = leaker.intern_trait(&item, true).unwrap();
-    let referrer = leaker.finish();
+    let context = leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     // The entries are ordered by context and then by their tokens.
     assert_eq!(
         referrer.iter().map(s).collect::<Vec<_>>(),
@@ -631,16 +633,20 @@ fn a_view_walks_the_signature_like_the_leaker() {
     let sig: Signature = parse_quote!(fn g(x: &Rel<T>) -> &u8);
     let generics: Generics = parse_quote!(<'a, T: 'a>);
     let mut leaker = leaker();
-    let result = leaker.enter_generics(&generics, |view| view.visit_signature(&sig));
-    assert_eq!(result.err().unwrap()[0].note(), Some(NOTE));
+    leaker.enter_generics(&generics, |view| view.visit_signature(&sig));
+    assert_eq!(leaker.result().errors()[0].note(), Some(NOTE));
     // And the sugar and the function pointers in a type visited alone.
     let ty: Type = parse_quote!(Box<dyn Fn(&Rel<T>) -> &u8>);
     let mut leaker = self::leaker();
-    leaker
-        .enter_generics(&generics, |view| view.visit_type(&ty))
-        .unwrap();
+    leaker.enter_generics(&generics, |view| view.visit_type(&ty));
     assert_eq!(
-        leaker.finish().iter().map(s).collect::<Vec<_>>(),
+        leaker
+            .result()
+            .finish()
+            .unwrap()
+            .iter()
+            .map(s)
+            .collect::<Vec<_>>(),
         ["dyn Fn (& Rel < T >) -> & u8"]
     );
 }

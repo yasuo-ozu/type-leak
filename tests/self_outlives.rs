@@ -35,8 +35,8 @@ fn s(x: &impl template_quote::ToTokens) -> String {
 fn of_trait(item: ItemTrait) -> Referrer {
     {
         let mut leaker = Leaker::new();
-        leaker.intern_trait(&item, true).unwrap();
-        leaker.finish()
+        leaker.intern_trait(&item, true);
+        leaker.result().finish().unwrap()
     }
 }
 
@@ -231,8 +231,8 @@ fn the_context_of_a_struct_has_it_too() {
     // `SelfRequirement::Type`: `Self` is the struct, with its parameters.
     let item: ItemStruct = parse_quote! { struct MyStruct<'a, T> { f: &'a Rel<Self> } };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     let context = referrer.context(0);
     match referrer.context_self(context) {
         Some(SelfRequirement::Type(ty)) => assert_eq!(s(ty), "MyStruct < 'a , T >"),
@@ -471,8 +471,8 @@ fn the_referrer_finds_the_entries_with_the_lifetimes_declared_where_the_copy_is(
     ] {
         let tr: ItemTrait = tr;
         let mut leaker = Leaker::new();
-        let top_level = leaker.intern_trait(&tr, true).unwrap();
-        let referrer = leaker.finish();
+        let top_level = leaker.intern_trait(&tr, true);
+        let referrer = leaker.result().finish().unwrap();
         // The copy of each method is rewritten, with the lifetimes declared there or not (`'t` is
         // a generic of the trait, which the signature does not declare).
         let mut copy = tr.clone();
@@ -513,10 +513,10 @@ fn a_written_bound_is_the_same_as_an_implied_one() {
         trait Tr { fn f<'a>(&'a self) -> &'a Rel<Self> where Self: ::core::marker::Sized; }
     };
     let mut leaker = Leaker::new();
-    let first = leaker.intern_trait(&written, true).unwrap();
-    let second = leaker.intern_trait(&implied, true).unwrap();
+    let first = leaker.intern_trait(&written, true);
+    let second = leaker.intern_trait(&implied, true);
     assert_eq!(first, second);
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
     let context = referrer.context(0);
     assert_eq!(referrer.context_self_outlives(context), lifetimes(&["'a"]));
@@ -560,9 +560,9 @@ fn a_written_bound_is_the_same_as_an_implied_one() {
     );
     let mut leaker = Leaker::new();
     for item in [&written_path, &implied] {
-        leaker.intern_trait(item, true).unwrap();
+        leaker.intern_trait(item, true);
     }
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
     assert_eq!(referrer.context(0), referrer.context(1));
 
@@ -932,8 +932,8 @@ fn the_referrer_finds_an_entry_with_a_written_bound() {
     ] {
         let tr: ItemTrait = tr;
         let mut leaker = Leaker::new();
-        let top_level = leaker.intern_trait(&tr, true).unwrap();
-        let referrer = leaker.finish();
+        let top_level = leaker.intern_trait(&tr, true);
+        let referrer = leaker.result().finish().unwrap();
         assert_eq!(referrer.iter().count(), 1, "{}", s(&tr));
         for how in ["declared", "leakers"] {
             assert_eq!(
@@ -973,8 +973,8 @@ fn the_referrer_finds_an_entry_with_a_written_bound() {
         trait Tr { fn f<'z, 'a>(&self, x: &'a Rel<Self>) where Self: ::core::marker::Sized, Self: 'z; }
     };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&other, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_trait(&other, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         referrer.context_self_outlives(referrer.context(0)),
         lifetimes(&["'a", "'z"])
@@ -986,8 +986,8 @@ fn the_referrer_finds_an_entry_with_a_written_bound() {
         trait Tr { fn f<'a>(&self, x: &'a Rel<Self>) where Self: ::core::marker::Sized; }
     };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&implied, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_trait(&implied, true);
+    let referrer = leaker.result().finish().unwrap();
     for how in ["declared", "leakers"] {
         assert_eq!(found(&other, &referrer, top_level, how), 0, "{}", how);
     }
@@ -996,8 +996,8 @@ fn the_referrer_finds_an_entry_with_a_written_bound() {
         trait Tr { fn f<'z, 'a>(&self, x: Rel<'a, Self>) where Self: ::core::marker::Sized, Self: 'z; }
     };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&path, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_trait(&path, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         referrer.context_self_outlives(referrer.context(0)),
         lifetimes(&["'z"])
@@ -1014,7 +1014,8 @@ fn a_written_bound_still_needs_self_to_be_leakable() {
     // the same as when the predicate was one of the bounds of the generics which mention `Self`).
     let leak = |items: proc_macro2::TokenStream| {
         let mut leaker = Leaker::new();
-        common::intern_fns(&mut leaker, &Generics::default(), items, false)
+        common::intern_fns(&mut leaker, &Generics::default(), items, false);
+        leaker.result().finish()
     };
     let err = leak(quote! { fn f<'a, T>(&self, x: Rel<'a, T>) where Self: 'a; })
         .err()

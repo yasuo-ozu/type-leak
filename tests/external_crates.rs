@@ -32,10 +32,6 @@ fn leaker_allowing(allowed: &[&str]) -> Leaker {
     Leaker::from_config(config)
 }
 
-fn leak_trait(leaker: &mut Leaker, item: &ItemTrait) -> std::result::Result<(), Vec<ErrorItem>> {
-    leaker.intern_trait(item, true).map(|_| ())
-}
-
 /// Prints tokens without whitespace, to compare them with the source.
 fn squash(tokens: impl template_quote::ToTokens) -> String {
     tokens.to_token_stream().to_string().replace(' ', "")
@@ -58,8 +54,8 @@ fn entries(referrer: &Referrer) -> Vec<(String, bool, Vec<String>)> {
 
 fn entries_of(item: ItemTrait) -> Vec<(String, bool, Vec<String>)> {
     let mut leaker = leaker();
-    leak_trait(&mut leaker, &item).unwrap();
-    entries(&leaker.finish())
+    leaker.intern_trait(&item, true);
+    entries(&leaker.result().finish().unwrap())
 }
 
 fn crates(names: &[&str]) -> Vec<String> {
@@ -82,8 +78,8 @@ fn an_entry_that_names_self_requires_the_crates_of_the_self_type() {
         }
     );
     let mut analyzer = leaker();
-    analyzer.intern_impl(&item, true).unwrap();
-    let referrer = analyzer.finish();
+    analyzer.intern_impl(&item, true);
+    let referrer = analyzer.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),
         vec![
@@ -98,9 +94,9 @@ fn an_entry_that_names_self_requires_the_crates_of_the_self_type() {
         }
     );
     let mut analyzer = leaker();
-    analyzer.intern_impl(&item, true).unwrap();
+    analyzer.intern_impl(&item, true);
     assert_eq!(
-        entries(&analyzer.finish()),
+        entries(&analyzer.result().finish().unwrap()),
         vec![entry("Rel", true, &[]), entry("::ext::W", false, &["ext"])]
     );
 }
@@ -237,8 +233,11 @@ fn std_and_alloc_are_nodes() {
         }
     );
     let mut leaker = leaker_allowing(&["std", "alloc"]);
-    leak_trait(&mut leaker, &item).unwrap();
-    assert_eq!(entries(&leaker.finish()), vec![entry("Rel", true, &[])]);
+    leaker.intern_trait(&item, true);
+    assert_eq!(
+        entries(&leaker.result().finish().unwrap()),
+        vec![entry("Rel", true, &[])]
+    );
 }
 
 #[test]
@@ -251,9 +250,9 @@ fn allowed_absolute_path_is_never_a_node() {
             fn f(&self, a: ::foo::X, b: ::foo::inner::W<(Rel,)>, c: ::foobar::Y, d: foo::Z);
         }
     };
-    leak_trait(&mut leaker, &item).unwrap();
+    leaker.intern_trait(&item, true);
     assert_eq!(
-        entries(&leaker.finish()),
+        entries(&leaker.result().finish().unwrap()),
         vec![
             entry("Rel", true, &[]),
             entry("foo::Z", true, &[]),
@@ -269,9 +268,9 @@ fn allowed_absolute_path_is_never_a_node() {
             fn f(&self, a: my::X, b: ::my::Y);
         }
     };
-    leak_trait(&mut leaker, &item).unwrap();
+    leaker.intern_trait(&item, true);
     assert_eq!(
-        entries(&leaker.finish()),
+        entries(&leaker.result().finish().unwrap()),
         vec![entry("::my::Y", false, &["my"])]
     );
     // The more specific path may be allowed alone.
@@ -283,9 +282,9 @@ fn allowed_absolute_path_is_never_a_node() {
             fn f(&self, a: ::foo::inner::X, b: ::foo::Y);
         }
     };
-    leak_trait(&mut leaker, &item).unwrap();
+    leaker.intern_trait(&item, true);
     assert_eq!(
-        entries(&leaker.finish()),
+        entries(&leaker.result().finish().unwrap()),
         vec![entry("::foo::Y", false, &["foo"])]
     );
     // `check()` of the same.
@@ -441,7 +440,10 @@ fn a_type_which_cannot_be_leaked_is_not_an_error() {
             fn f(&self) -> Rel<'_>;
         }
     );
-    let err = leak_trait(&mut leaker(), &item).err().unwrap();
+    let mut leaker = leaker();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let err = result.errors();
     assert_eq!(err.len(), 1);
     assert_eq!(err[0].message, "use absolute path: 'Rel < '_ >'");
 }
@@ -450,11 +452,11 @@ fn a_type_which_cannot_be_leaked_is_not_an_error() {
 /// the required entries of the default Leaker must be.
 fn required_entries_match_allowed_leaker(item: ItemTrait, allowed: &[&str]) {
     let mut leaker = leaker();
-    leak_trait(&mut leaker, &item).unwrap();
-    let default = leaker.finish();
+    leaker.intern_trait(&item, true);
+    let default = leaker.result().finish().unwrap();
     let mut leaker = leaker_allowing(allowed);
-    leak_trait(&mut leaker, &item).unwrap();
-    let reference = leaker.finish();
+    leaker.intern_trait(&item, true);
+    let reference = leaker.result().finish().unwrap();
     // The required entries come first, and are exactly those which allowing the crates leaves, in
     // the same order, contexts included.
     let required: Vec<usize> = (0..default.iter().count())
@@ -545,8 +547,8 @@ fn referrer_with_foo() -> (Referrer, ContextId) {
         }
     };
     let mut leaker = leaker();
-    let context = leaker.intern_trait(&item, true).unwrap();
-    (leaker.finish(), context)
+    let context = leaker.intern_trait(&item, true);
+    (leaker.result().finish().unwrap(), context)
 }
 
 fn expand(referrer: &Referrer, context: ContextId, ty: Type) -> String {
@@ -607,8 +609,8 @@ fn referrer_replaces_optional_entries_without_ambiguous_crate_names() {
         }
     );
     let mut leaker = leaker();
-    let context = leaker.intern_trait(&item, true).unwrap();
-    let referrer = leaker.finish();
+    let context = leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     let ix_rel = referrer
         .iter()
         .position(|t| squash(quote!(#t)) == "Rel")
@@ -667,8 +669,8 @@ fn referrer_serialization_round_trip() {
         }
     };
     let mut leaker = leaker();
-    let context = leaker.intern_trait(&item, true).unwrap();
-    let referrer = leaker.finish();
+    let context = leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     let before = entries(&referrer);
     assert!(before.iter().any(|e| !e.1 && !e.2.is_empty()));
     assert!(before.iter().any(|e| e.1));
@@ -711,8 +713,8 @@ fn referrer_round_trip_keeps_the_indices() {
         }
     };
     let mut leaker = leaker();
-    leak_trait(&mut leaker, &item).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     let before = entries(&referrer);
     let musts: Vec<bool> = before.iter().map(|e| e.1).collect();
     assert!(musts.iter().any(|m| !m));
@@ -752,8 +754,8 @@ fn raw_identifier_crates_are_stored_unraw_and_serialized_back() {
         }
     };
     let mut leaker = leaker();
-    leak_trait(&mut leaker, &item).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),
         [
@@ -768,9 +770,9 @@ fn raw_identifier_crates_are_stored_unraw_and_serialized_back() {
     assert_eq!(parse2::<Referrer>(tokens).unwrap(), referrer);
     // Allowed by the Leaker, the crate is not a node, by its name (without `r#`).
     let mut leaker = leaker_allowing(&["r#async"]);
-    leak_trait(&mut leaker, &item).unwrap();
+    leaker.intern_trait(&item, true);
     assert_eq!(
-        entries(&leaker.finish()),
+        entries(&leaker.result().finish().unwrap()),
         [
             entry("::plain::Z", false, &["plain"]),
             entry("::r#fn::Y", false, &["fn"]),

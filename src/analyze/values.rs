@@ -206,10 +206,7 @@ impl<'a> ValueWalk<'a> {
     }
 
     fn error(&mut self, error: CheckResult) {
-        self.visitor
-            .frame
-            .effects
-            .push(Effect::Error(Box::new(error)));
+        self.visitor.push_error(error);
     }
 
     /// Rejects the relative path `cause`, with `help` for what to write if it has to say more than
@@ -218,8 +215,8 @@ impl<'a> ValueWalk<'a> {
         self.relative_part(cause, help, None)
     }
 
-    /// Rejects the relative path `path` of a value, which is copied as written, with the types in
-    /// its arguments: the Referrer leaves them so (see [`Part`]).
+    /// Rejects the relative path `path` of a value, copied as written with the types in its
+    /// arguments (see [`Part`]).
     fn relative_path(&mut self, path: &Path) {
         let cause = Cause::expr_path(path);
         let part = self.visitor.node_part(cause.clone(), path);
@@ -251,6 +248,7 @@ impl<'a> ValueWalk<'a> {
             headline,
             cause: None,
             reason: Reason::RelativePath,
+            seen: 0,
             part,
         });
     }
@@ -266,6 +264,7 @@ impl<'a> ValueWalk<'a> {
             headline: Some(format!("cannot analyze `{}` in {}", shown, self.what)),
             cause: None,
             reason: Reason::Unreadable,
+            seen: 0,
             part: None,
             must: vec![Cause::Unreadable(tokens.clone())],
             impossible: vec![Cause::Unreadable(tokens)],
