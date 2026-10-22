@@ -5,7 +5,7 @@ mod common;
 use std::collections::BTreeSet;
 use syn::*;
 use template_quote::quote;
-use type_leak::{Leaker, LeakerConfig};
+use type_leak::{to_syn_error, ErrorItem, Leaker, LeakerConfig};
 
 #[test]
 fn test_leaker() {
@@ -243,13 +243,22 @@ fn test_intern() {
 
 // ── regressions ──────────────────────────────────────────────────────────────
 
+/// The messages of the errors, one per line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn leak_struct(item: &ItemStruct) -> Result<BTreeSet<String>> {
     let mut config = type_leak::LeakerConfig::new();
     config.allow_primitive().allow_std_prelude();
     let mut leaker = Leaker::from_config(config);
     leaker
         .intern_struct(item, true)
-        .map_err(|e| Error::new(e.span(), e))?;
+        .map_err(|e| Error::new(e[0].span(), messages(&e)))?;
     Ok(leaker
         .finish()
         .iter()
@@ -263,7 +272,7 @@ fn leak_trait(item: &ItemTrait) -> Result<BTreeSet<String>> {
     let mut leaker = Leaker::from_config(config);
     leaker
         .intern_trait(item, true)
-        .map_err(|e| Error::new(e.span(), e))?;
+        .map_err(|e| Error::new(e[0].span(), messages(&e)))?;
     Ok(leaker
         .finish()
         .iter()
@@ -569,7 +578,7 @@ fn test_receivers() {
      -> std::result::Result<BTreeSet<String>, String> {
         let mut leaker = Leaker::new();
         common::intern_fns(&mut leaker, &parse_quote!(<'a>), sig, allow_self)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| messages(&e))?;
         Ok(leaker
             .finish()
             .iter()
@@ -718,7 +727,7 @@ fn test_self_ty_cannot_be_interned() {
      -> std::result::Result<BTreeSet<String>, syn::Error> {
         let mut leaker = Leaker::new();
         common::intern_fns(&mut leaker, &Generics::default(), sig, allow_self)
-            .map_err(syn::Error::from)?;
+            .map_err(|e| to_syn_error(&e))?;
         // The required entries (the optional ones are those of external crates, below).
         let referrer = leaker.finish();
         Ok(referrer

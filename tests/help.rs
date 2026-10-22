@@ -6,10 +6,11 @@
 //! text:
 //!
 //! - `every_kind_of_error_has_a_help` is a table with one row per kind of error (the rows are the
-//!   kinds of error of `NotInternableError`): the headline and the exact help of each error of the
-//!   row;
+//!   kinds of error of the Leaker, see `Reason`): the headline and the exact help of each error of
+//!   the row;
 //! - `a_help_is_rendered_after_the_notes` asserts how the stable layout (`syn::Error`, which
-//!   `ToTokens` renders as `compile_error!`) shows it, as `= help: ..` after the `= note: ..`s.
+//!   `ErrorItem::to_compile_error()` renders as `compile_error!`) shows it, as `= help: ..` after
+//!   the `= note: ..`s.
 //!
 //! The nightly layout (a `help` of the `Diagnostic`, with its own span) is in `tests/diagnostic.rs`.
 
@@ -31,7 +32,7 @@ fn id(name: &str) -> Ident {
 /// One row: the kind of error, how to make it, and the headline and help of each of its errors.
 struct Row {
     kind: &'static str,
-    error: fn() -> NotInternableError,
+    error: fn() -> Vec<ErrorItem>,
     items: &'static [(&'static str, &'static str)],
 }
 
@@ -643,7 +644,7 @@ const ROWS: &[Row] = &[
 fn every_kind_of_error_has_a_help() {
     for row in ROWS {
         let err = (row.error)();
-        let items: Vec<ErrorItem> = err.items().collect();
+        let items = &err;
         let got: Vec<(String, String)> = items
             .iter()
             .map(|item| {
@@ -659,7 +660,7 @@ fn every_kind_of_error_has_a_help() {
             .map(|(message, help)| (message.to_string(), help.to_string()))
             .collect();
         assert_eq!(got, expected, "{}", row.kind);
-        for item in &items {
+        for item in items {
             let (_, help) = item.help.as_ref().expect(row.kind);
             // The help says what to write, the notes why: it is none of them, and not the headline.
             assert!(!help.is_empty(), "{}", row.kind);
@@ -679,7 +680,7 @@ fn every_kind_of_error_has_a_help() {
             );
         }
         // The first error's help is what the accessors of the error tell.
-        assert_eq!(err.help().as_deref(), items[0].help_text(), "{}", row.kind);
+        assert_eq!(err[0].help_text(), items[0].help_text(), "{}", row.kind);
     }
 }
 
@@ -687,10 +688,10 @@ fn every_kind_of_error_has_a_help() {
 fn a_help_is_rendered_after_the_notes() {
     for row in ROWS {
         let err = (row.error)();
-        let items: Vec<ErrorItem> = err.items().collect();
-        let errors: Vec<syn::Error> = syn::Error::from(err.clone()).into_iter().collect();
+        let items = &err;
+        let errors: Vec<syn::Error> = to_syn_error(&err).into_iter().collect();
         assert_eq!(errors.len(), items.len(), "{}", row.kind);
-        for (error, item) in errors.iter().zip(&items) {
+        for (error, item) in errors.iter().zip(items) {
             let rendered = error.to_string();
             let help = item.help_text().unwrap();
             // The headline, a blank line, the notes (`= note: ..`), the help (`= help: ..`).
@@ -702,11 +703,12 @@ fn a_help_is_rendered_after_the_notes() {
             expected += &format!("  = help: {}\n", help);
             assert_eq!(rendered, expected, "{}", row.kind);
         }
-        // And `ToTokens` renders the same errors, as `compile_error!`s.
-        let tokens = {
-            use template_quote::quote;
-            quote!(#err).to_string()
-        };
+        // And `to_compile_error()` renders the same errors, as `compile_error!`s.
+        let tokens = err
+            .iter()
+            .map(ErrorItem::to_compile_error)
+            .collect::<proc_macro2::TokenStream>()
+            .to_string();
         assert_eq!(
             tokens.matches("compile_error").count(),
             items.len(),
@@ -714,7 +716,7 @@ fn a_help_is_rendered_after_the_notes() {
             row.kind,
             tokens
         );
-        for item in &items {
+        for item in items {
             assert!(
                 tokens.contains(&format!("= help: {}", item.help_text().unwrap())),
                 "{}: {}",
@@ -730,7 +732,7 @@ fn a_help_is_rendered_after_the_notes() {
 fn a_note_that_is_not_about_the_fix_has_no_advice() {
     for row in ROWS {
         let err = (row.error)();
-        for item in err.items() {
+        for item in &err {
             for (_, note) in &item.notes {
                 assert!(
                     !note.contains("Write the")

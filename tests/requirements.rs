@@ -7,7 +7,7 @@ use syn::punctuated::Punctuated;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{ContextId, EncodeError, Leaker, Referrer, SelfRequirement, Visitor};
+use type_leak::{ContextId, EncodeError, Leaker, Reason, Referrer, SelfRequirement, Visitor};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -541,20 +541,15 @@ fn self_in_the_bounds_of_the_generics() {
     )
     .err()
     .unwrap();
-    assert!(matches!(
-        err,
-        type_leak::NotInternableError::RelativePath(_)
-    ));
+    assert!(!err.is_empty());
+    assert!(err
+        .iter()
+        .all(|item| item.reason != Reason::SelfWithoutMeaning));
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
-    assert!(err
-        .to_string()
-        .lines()
-        .next()
-        .unwrap()
-        .contains("Wrap < T >"));
+    assert!(err[0].message.contains("Wrap < T >"));
     // Nothing is added by a failed call.
     assert!(leaker.finish().is_empty());
 

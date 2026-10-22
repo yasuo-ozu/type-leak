@@ -425,7 +425,7 @@ struct Failure {
     text: String,
 }
 
-/// One error of a rejection (`NotInternableError::items()`): the message, the tokens it is about
+/// One error of a rejection (an `ErrorItem`): the message, the tokens it is about
 /// and its first note.
 #[derive(Debug, Default, Clone)]
 struct Rejection {

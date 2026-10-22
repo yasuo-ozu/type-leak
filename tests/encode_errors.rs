@@ -137,11 +137,12 @@ fn both_errors_are_std_errors() {
         let result: std::result::Result<(), Box<dyn std::error::Error>> = (|| Err(err.clone())?)();
         assert_eq!(result.unwrap_err().to_string(), text);
     }
-    // `NotInternableError`, which is the error of the Leaker.
+    // `ErrorItem`, one of the errors of the Leaker (it returns a `Vec` of them).
     let item: ItemTrait = parse_quote!(
         trait Tr: Clone {}
     );
     let err = Leaker::new().intern_trait(&item, true).unwrap_err();
+    let err = err[0].clone();
     is_error(&err);
     let boxed: Box<dyn std::error::Error> = Box::new(err.clone());
     assert_eq!(boxed.to_string(), "use absolute path: 'Clone'");

@@ -32,16 +32,13 @@ fn leaker_allowing(allowed: &[&str]) -> Leaker {
     Leaker::from_config(config)
 }
 
-fn leak_trait(
-    leaker: &mut Leaker,
-    item: &ItemTrait,
-) -> std::result::Result<(), NotInternableError> {
+fn leak_trait(leaker: &mut Leaker, item: &ItemTrait) -> std::result::Result<(), Vec<ErrorItem>> {
     leaker.intern_trait(item, true).map(|_| ())
 }
 
 /// Prints tokens without whitespace, to compare them with the source.
-fn squash(tokens: impl ToString) -> String {
-    tokens.to_string().replace(' ', "")
+fn squash(tokens: impl template_quote::ToTokens) -> String {
+    tokens.to_token_stream().to_string().replace(' ', "")
 }
 
 /// Returns the leaked types with `must` and the required crates.
@@ -445,7 +442,8 @@ fn a_type_which_cannot_be_leaked_is_not_an_error() {
         }
     );
     let err = leak_trait(&mut leaker(), &item).err().unwrap();
-    assert_eq!(err.to_string(), "use absolute path: 'Rel < '_ >'");
+    assert_eq!(err.len(), 1);
+    assert_eq!(err[0].message, "use absolute path: 'Rel < '_ >'");
 }
 
 /// Entries of the same item with all the crates allowed (a Leaker with no external crates), as

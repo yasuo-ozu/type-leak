@@ -37,7 +37,7 @@ fn messages_of(config: LeakerConfig, source: &str) -> Vec<String> {
     let item: ItemTrait = parse_str(source).unwrap_or_else(|e| panic!("{}: {}", source, e));
     match Leaker::from_config(config).intern_trait(&item, true) {
         Ok(_) => Vec::new(),
-        Err(err) => err.items().map(|item| item.message).collect(),
+        Err(err) => err.into_iter().map(|item| item.message).collect(),
     }
 }
 
@@ -178,7 +178,7 @@ fn body_entries(body: &str) -> Vec<String> {
     let item: ItemTrait = parse_str(&source).unwrap_or_else(|e| panic!("{}: {}", source, e));
     let mut leaker = Leaker::from_config(config());
     if let Err(err) = leaker.intern_trait(&item, true) {
-        panic!("{}: {}", body, err);
+        panic!("{}: {}", body, to_syn_error(&err));
     }
     let referrer = leaker.finish();
     let mut entries: Vec<String> = referrer.iter().map(|ty| quote!(#ty).to_string()).collect();
@@ -306,7 +306,7 @@ fn the_names_of_the_2021_prelude_are_relative_in_a_value() {
         .intern_trait(&item, true)
         .unwrap_err();
     assert_eq!(
-        err.help().as_deref(),
+        err[0].help_text(),
         Some("use `::core::option::Option::Some` instead of `Some`")
     );
     // An allowed path is accepted.
@@ -371,7 +371,7 @@ fn a_relative_macro_path_says_what_to_write() {
     let err = Leaker::from_config(config())
         .intern_trait(&item, true)
         .unwrap_err();
-    let items: Vec<_> = err.items().collect();
+    let items = &err;
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].message, "use absolute path: 'println !'");
     assert_eq!(
@@ -390,7 +390,7 @@ fn a_relative_macro_path_says_what_to_write() {
         .intern_trait(&item, true)
         .unwrap_err();
     assert_eq!(
-        err.help().as_deref(),
+        err[0].help_text(),
         Some(
             "write `my_mac!` with an absolute path (e.g. `::my_crate::my_mac!`), or allow it with \
              `LeakerConfig::allowed_paths`"
@@ -480,14 +480,14 @@ fn what_the_leaker_cannot_read_is_rejected() {
         .intern_trait(&item, true)
         .unwrap_err();
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some(
             "the arguments of the macro are not expressions. The Leaker must see every path in \
              the default body of `f`, which the copy writes as it is"
         )
     );
     assert_eq!(
-        err.help().as_deref(),
+        err[0].help_text(),
         Some(
             "write it with syntax the Leaker can read (paths and expressions), or move it out of \
              the item"
@@ -542,7 +542,7 @@ fn the_note_says_which_value() {
             _ => unreachable!(),
         }
         .unwrap_err();
-        err.items()
+        err.iter()
             .map(|item| item.note().unwrap().to_string())
             .collect()
     };
@@ -607,7 +607,7 @@ fn a_module_is_read_with_its_declared_names() {
         }
     };
     let err = Leaker::from_config(config()).intern_mod(&item).unwrap_err();
-    let messages: Vec<String> = err.items().map(|item| item.message).collect();
+    let messages: Vec<String> = err.into_iter().map(|item| item.message).collect();
     assert_eq!(messages, ["use absolute path: 'Other :: N'"]);
 }
 
@@ -632,7 +632,7 @@ fn an_impl_is_read() {
     let err = Leaker::from_config(config())
         .intern_impl(&item, true)
         .unwrap_err();
-    let messages: Vec<String> = err.items().map(|item| item.message).collect();
+    let messages: Vec<String> = err.into_iter().map(|item| item.message).collect();
     assert_eq!(
         messages,
         [
@@ -666,7 +666,7 @@ fn a_nested_item_is_read_through_the_view() {
     });
     let messages: Vec<String> = result
         .unwrap_err()
-        .items()
+        .into_iter()
         .map(|item| item.message)
         .collect();
     assert_eq!(messages, ["use absolute path: 'Rel :: f :: < T , V >'"]);
@@ -708,7 +708,10 @@ fn self_without_meaning_in_a_value() {
     );
     let err = Leaker::from_config(config()).intern_mod(&item).unwrap_err();
     assert!(
-        matches!(err, NotInternableError::SelfWithoutMeaning(_)),
+        !err.is_empty()
+            && err
+                .iter()
+                .all(|item| item.reason == Reason::SelfWithoutMeaning),
         "{:?}",
         err
     );

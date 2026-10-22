@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
-use type_leak::Leaker;
+use type_leak::{to_syn_error, ErrorItem, Leaker};
 
 #[test]
 fn test_reduce_roots_empty_leaker() {
@@ -391,12 +391,21 @@ fn optional_trait(item: &ItemTrait) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The messages of the errors, one per line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The error of the analysis of a trait.
 fn error_of(item: &ItemTrait) -> String {
     let err = Leaker::new()
         .intern_trait(item, true)
         .expect_err("expected an error");
-    syn::Error::from(err).to_string()
+    to_syn_error(&err).to_string()
 }
 
 /// Rewrites a trait with each leaked type replaced by `P<index>`, like the Referrer's copy.
@@ -1033,7 +1042,7 @@ fn test_reduce_roots_path_with_a_lifetime_the_copy_would_leave_unconstrained() {
             view.visit_impl_item_fn(&parse_quote!(#sig { loop {} }))
         })
         .unwrap_err();
-    assert!(syn::Error::from(err).to_string().contains("E0195"));
+    assert!(to_syn_error(&err).to_string().contains("E0195"));
     let sig = &item.sig;
     let of_trait: ItemImpl = parse_quote! { impl ::p::Tr for ::p::W { #sig { loop {} } } };
     let err = Leaker::new()
@@ -1041,7 +1050,7 @@ fn test_reduce_roots_path_with_a_lifetime_the_copy_would_leave_unconstrained() {
             view.visit_item(&Item::Impl(of_trait.clone()))
         })
         .unwrap_err();
-    assert!(syn::Error::from(err).to_string().contains("E0195"));
+    assert!(to_syn_error(&err).to_string().contains("E0195"));
     let inherent: ItemImpl = parse_quote! { impl ::p::W { #sig { loop {} } } };
     let mut leaker = Leaker::new();
     leaker
@@ -1337,7 +1346,7 @@ fn test_reduce_roots_reference_with_a_lifetime_the_copy_would_leave_unconstraine
             view.visit_impl_item_fn(&parse_quote!(#sig { loop {} }))
         })
         .unwrap_err();
-    assert!(syn::Error::from(err).to_string().contains("E0195"));
+    assert!(to_syn_error(&err).to_string().contains("E0195"));
     let item: ItemMod = parse_quote! {
         mod m { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } }
     };
@@ -1749,7 +1758,7 @@ fn test_reduce_roots_bare_identifier_is_a_type_if_the_path_cannot_be_interned() 
     assert!(!result.is_own);
     assert_eq!(result.impossible.len(), 1);
     assert_eq!(result.must.len(), 1);
-    assert_eq!(result.must[0].to_string(), "SIZE");
+    assert_eq!(quote!(#{&result.must[0]}).to_string(), "SIZE");
 
     // Not if the bounds of the generics mention `Self`, which cannot be leaked: `SIZE` may be a
     // const, so it is an error (and the path is interned if it can be).
@@ -1773,7 +1782,7 @@ fn test_reduce_roots_bare_identifier_is_a_type_if_the_path_cannot_be_interned() 
                 .map(|ty| ty_string(ty.clone()))
                 .collect::<Vec<_>>()
         })
-        .map_err(|err| err.to_string())
+        .map_err(|err| messages(&err))
     };
     assert_eq!(
         leaked(false),

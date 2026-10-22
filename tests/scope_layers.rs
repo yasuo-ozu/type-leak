@@ -11,7 +11,7 @@ mod common;
 use common::visit_function;
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{ContextId, Leaker, NotInternableError, Referrer, SelfRequirement, View};
+use type_leak::{ContextId, ErrorItem, Leaker, Reason, Referrer, SelfRequirement, View};
 
 fn s(x: &impl ToTokens) -> String {
     quote!(#x).to_string()
@@ -85,19 +85,34 @@ impl Show for String {
     }
 }
 
+/// The messages of `errors`, one on each line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// What a call returned, as a string.
-fn outcome<R: Show>(result: std::result::Result<(ContextId, R), NotInternableError>) -> String {
+fn outcome<R: Show>(result: std::result::Result<(ContextId, R), Vec<ErrorItem>>) -> String {
     match result {
         Ok((_, inner)) => format!("ok{}", inner.show()),
-        Err(NotInternableError::SelfWithoutMeaning(selves)) => format!(
-            "Self without meaning: {}",
-            selves
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Err(err) => err.to_string().replace('\n', " / "),
+        Err(err)
+            if !err.is_empty()
+                && err
+                    .iter()
+                    .all(|item| item.reason == Reason::SelfWithoutMeaning) =>
+        {
+            format!(
+                "Self without meaning: {}",
+                err.iter()
+                    .map(|item| item.cause.to_token_stream().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        Err(err) => messages(&err).replace('\n', " / "),
     }
 }
 
@@ -376,7 +391,7 @@ fn failing(kind: &str, fail: bool) -> (String, String) {
                     view.visit_type(&parse_quote!(Bad1<'_>));
                 };
                 let result = enter!(view, kind, &bad_generics(), true, body);
-                failure = result.unwrap_err().to_string();
+                failure = messages(&result.unwrap_err());
             }
             let (last, ()) = view
                 .enter_type(&ident("L"), &parse_quote!(<C>), true, |view| {
@@ -465,7 +480,7 @@ fn a_failing_outermost_scope_leaves_no_trace() {
             view.visit_type(&parse_quote!(Bad1<'_>));
         };
         let result = enter!(leaker, kind, &bad_generics(), true, body);
-        errors.push(result.unwrap_err().to_string());
+        errors.push(messages(&result.unwrap_err()));
     }
     // The module which is entered after them is the first one.
     let (module, ()) = leaker.enter_mod("kept", [], |_| ()).unwrap();

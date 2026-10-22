@@ -20,7 +20,7 @@
 //! leaked.
 
 use syn::*;
-use template_quote::quote;
+use template_quote::{quote, ToTokens};
 use type_leak::*;
 
 /// The config of the property test, with `::p` allowed.
@@ -52,11 +52,11 @@ impl Shown {
 }
 
 /// What an error says: for each of its errors, the headline, the tokens, the notes and the help.
-fn shown(err: &NotInternableError) -> Vec<Shown> {
-    err.items()
+fn shown(err: &[ErrorItem]) -> Vec<Shown> {
+    err.iter()
         .map(|item| Shown {
             message: item.message.clone(),
-            tokens: item.tokens.to_string(),
+            tokens: item.cause.to_token_stream().to_string(),
             notes: item.notes.iter().map(|(_, note)| note.clone()).collect(),
             help: item
                 .help_text()
@@ -66,7 +66,16 @@ fn shown(err: &NotInternableError) -> Vec<Shown> {
         .collect()
 }
 
-fn error(item: &ItemImpl) -> NotInternableError {
+/// The messages of the errors, one per line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn error(item: &ItemImpl) -> Vec<ErrorItem> {
     leaker()
         .intern_impl(item, true)
         .err()
@@ -381,7 +390,7 @@ fn the_self_type_of_an_impl_is_named_in_the_note() {
     );
     let err = error(&item);
     assert_eq!(
-        err.to_string(),
+        messages(&err),
         "`S < T >` is in the self type of the impl, and a bound of its generics names `Self`\n\
          `Self` is in a bound or where predicate, and a bound of its generics names `Self`, \
          which is a leaked type"
@@ -422,7 +431,7 @@ fn the_self_type_of_an_impl_is_named_in_the_note() {
     );
     let err = error(&item);
     let shown = shown(&err);
-    assert_eq!(shown.len(), 2, "{}", err);
+    assert_eq!(shown.len(), 2, "{}", messages(&err));
     assert_eq!(
         shown[0],
         Shown::new(

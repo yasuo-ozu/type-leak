@@ -1,5 +1,6 @@
 //! The context of a leaked type: its generics, what `Self` means, and its module.
 
+use crate::error::Cause;
 use crate::unstable::is_std_trait;
 use crate::util::{
     bound_mentions_self, canonical_bounds, generic_param_mentions_self, generic_param_name,
@@ -679,7 +680,7 @@ pub(crate) struct Context {
 #[derive(Clone, Debug)]
 pub(crate) struct UnnameableSelf {
     /// The mention of `Self` that cannot be written.
-    pub(crate) cause: TokenStream,
+    pub(crate) cause: Box<Cause>,
     /// Tells what is wrong, as the headline of the error: the problem is the bound, not the path
     /// of the type that uses it.
     pub(crate) headline: String,
@@ -1681,7 +1682,7 @@ fn for_self_of<T: WrittenForSelf>(
     match outer {
         // No scope declares an `Any` `Self`: it is the context of an entry.
         SelfRequirement::Any => Err(UnnameableSelf {
-            cause: mentions.first.unwrap_or_else(|| quote!(Self)),
+            cause: Box::new(mentions.first.unwrap_or_else(Cause::self_type)),
             headline: format!("{} mentions a `Self` which has no name here", node.what()),
             note: format!(
                 "{} mentions a `Self` of no type, which has no name here",
@@ -1690,7 +1691,7 @@ fn for_self_of<T: WrittenForSelf>(
             help: format!("write {} without `Self`", node.what()),
         }),
         SelfRequirement::Bound(path) => Err(UnnameableSelf {
-            cause: mentions.first.unwrap_or_else(|| quote!(Self)),
+            cause: Box::new(mentions.first.unwrap_or_else(Cause::self_type)),
             headline: format!("{} mentions a `Self` which has no name here", node.what()),
             note: format!(
                 "{} mentions the `Self` of the trait `{}`, which has no name here: `Self` is \
@@ -1705,17 +1706,17 @@ fn for_self_of<T: WrittenForSelf>(
                 headline: format!(
                     "{} mentions `{}`, which has no name here",
                     node.what(),
-                    cause
+                    cause.shown()
                 ),
                 note: format!(
                     "{} mentions `{}`, an associated item of the `Self` of `{}`, which has no \
                      name here: `Self` is something else in the item around",
                     node.what(),
-                    cause,
+                    cause.shown(),
                     quote!(#ty)
                 ),
-                help: format!("write {} without `{}`", node.what(), tidy(&cause)),
-                cause,
+                help: format!("write {} without `{}`", node.what(), tidy(&cause.shown())),
+                cause: Box::new(cause),
             }),
             None => Ok(node.clone().rewrite(&mut ReplaceSelf { self_ty: ty })),
         },

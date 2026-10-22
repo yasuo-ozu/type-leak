@@ -539,7 +539,7 @@ fn test_has_self() {
             item.parse().unwrap(),
             false,
         )?;
-        Ok::<_, type_leak::NotInternableError>(leaker.finish())
+        Ok::<_, Vec<type_leak::ErrorItem>>(leaker.finish())
     };
     assert!(leak("fn f(&self, x: Rel<Self>) -> Rel2;").is_err());
     let referrer = leak("fn f(&self, x: Rel) -> Rel2;").unwrap();
@@ -550,12 +550,13 @@ fn test_has_self() {
     let err = leak("fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> Wrap<T>;")
         .err()
         .unwrap();
+    assert_eq!(err.len(), 1);
     assert_eq!(
-        err.to_string(),
+        err[0].message,
         "`Wrap < T >` has a generic whose bound mentions `Self`, which cannot be leaked"
     );
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
     assert!(leak("fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> Rel;").is_ok());

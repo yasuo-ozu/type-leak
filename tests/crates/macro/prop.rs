@@ -34,7 +34,7 @@ use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 use syn::*;
-use template_quote::quote;
+use template_quote::{quote, ToTokens};
 use type_leak::*;
 
 /// Arguments of `#[prop_leak(..)]`.
@@ -178,7 +178,7 @@ fn ident(name: &str) -> Ident {
 fn analyze(
     item: &Item,
     args: &Args,
-) -> std::result::Result<(Referrer, ContextId, TokenStream), NotInternableError> {
+) -> std::result::Result<(Referrer, ContextId, TokenStream), Vec<ErrorItem>> {
     let mut config = LeakerConfig::new();
     if args.primitive {
         config.allow_primitive();
@@ -1912,15 +1912,15 @@ fn dollar() -> Punct {
 /// The errors of a rejection (`__tl_errors_<id>!`, after the report): each is its message, the
 /// tokens it is about and its first note, which `\u{1f}` separates, and `\u{1d}` separates the
 /// errors.
-fn rejection_text(error: &NotInternableError) -> String {
+fn rejection_text(errors: &[ErrorItem]) -> String {
     let clean = |text: &str| -> String { text.replace(['\n', '|', '\u{1f}', '\u{1d}'], " ") };
-    error
-        .items()
+    errors
+        .iter()
         .map(|item| {
             format!(
                 "{}\u{1f}{}\u{1f}{}",
                 clean(&item.message),
-                clean(&item.tokens.to_string()),
+                clean(&item.cause.to_token_stream().to_string()),
                 clean(item.note().unwrap_or(""))
             )
         })
@@ -1953,7 +1953,7 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream) -> Result<TokenStream> 
         Ok(result) => result,
         Err(e) => {
             // The item is not leaked: the Leaker's crate still has it.
-            let reason = e.to_string().replace(['\n', '|'], " ");
+            let reason = crate::messages(&e).replace(['\n', '|'], " ");
             let report = format!("{}|{}|rej|{}", id, kind, reason);
             let errors = rejection_text(&e);
             return Ok(quote! {

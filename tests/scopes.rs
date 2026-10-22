@@ -8,11 +8,44 @@ use syn::visit::Visit;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
-    ContextId, Leaker, LeakerConfig, NotInternableError, Referrer, SelfRequirement, View,
+    ContextId, ErrorItem, Leaker, LeakerConfig, Reason, Referrer, SelfRequirement, View,
 };
 
 fn s(x: &impl ToTokens) -> String {
     quote!(#x).to_string()
+}
+
+/// The messages of `errors`, one on each line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Checks that `errors` has the conflicts of paths, not only those of `Self` without a meaning.
+fn assert_relative_path(errors: &[ErrorItem]) {
+    assert!(!errors.is_empty());
+    assert!(
+        errors
+            .iter()
+            .all(|item| item.reason != Reason::SelfWithoutMeaning),
+        "{:?}",
+        errors
+    );
+}
+
+/// Checks that `errors` has only the mentions of `Self` where it has no meaning.
+fn assert_self_without_meaning(errors: &[ErrorItem]) {
+    assert!(!errors.is_empty());
+    assert!(
+        errors
+            .iter()
+            .all(|item| item.reason == Reason::SelfWithoutMeaning),
+        "{:?}",
+        errors
+    );
 }
 
 fn id(n: usize) -> ContextId {
@@ -297,7 +330,7 @@ fn a_relative_trait_in_a_bound_is_an_error() {
         view.visit_type_param_bound(&parse_quote!(Relative));
     });
     let err = result.err().unwrap();
-    assert_eq!(err.to_string(), "use absolute path: 'Relative'");
+    assert_eq!(messages(&err), "use absolute path: 'Relative'");
     // Nothing is left of a failed scope.
     assert!(leaker.finish().is_empty());
 }
@@ -337,17 +370,20 @@ fn self_has_no_meaning_in_a_module_or_generics() {
         .enter_generics(&parse_quote!(<T>), |view| view.visit_type(&ty))
         .err()
         .unwrap();
-    assert_eq!(err.to_string(), "`Self` has no meaning here");
+    assert_eq!(messages(&err), "`Self` has no meaning here");
     assert!(
-        err.note().unwrap().contains("`Self` has no meaning here"),
+        err[0]
+            .note()
+            .unwrap()
+            .contains("`Self` has no meaning here"),
         "{:?}",
-        err.note()
+        err[0].note()
     );
     let err = leaker
         .enter_mod("m", [], |view| view.visit_type(&ty))
         .err()
         .unwrap();
-    assert_eq!(err.to_string(), "`Self` has no meaning here");
+    assert_eq!(messages(&err), "`Self` has no meaning here");
     // Not even where it would not be leaked, or in a bound.
     for ty in [
         parse_quote!(Self),
@@ -375,7 +411,7 @@ fn self_has_no_meaning_in_a_module_or_generics() {
         }
     );
     let err = Leaker::new().intern_mod(&m).err().unwrap();
-    assert_eq!(err.to_string(), "`Self` has no meaning here");
+    assert_eq!(messages(&err), "`Self` has no meaning here");
     let m: ItemMod = parse_quote!(
         mod m {
             pub fn f() -> Rel<Self> {
@@ -445,11 +481,9 @@ fn allow_self_decides_whether_self_may_be_interned() {
         });
         assert_eq!(result.is_ok(), allow_self);
         if let Err(err) = result {
-            assert!(err
-                .to_string()
-                .starts_with("use absolute path: 'Rel < Self >'"));
+            assert!(messages(&err).starts_with("use absolute path: 'Rel < Self >'"));
             assert_eq!(
-                err.note().as_deref(),
+                err[0].note(),
                 Some("it cannot be leaked as a whole because of `Self`")
             );
         }
@@ -502,17 +536,17 @@ fn allow_self_decides_whether_self_may_be_interned() {
         .err()
         .unwrap();
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
 }
 
 /// The headlines of the errors of a call.
-fn headlines<T>(result: std::result::Result<T, NotInternableError>) -> Vec<String> {
+fn headlines<T>(result: std::result::Result<T, Vec<ErrorItem>>) -> Vec<String> {
     result
         .err()
         .expect("an error")
-        .items()
+        .into_iter()
         .map(|item| item.message)
         .collect()
 }
@@ -713,7 +747,7 @@ struct Run {
     first: ContextId,
     last: ContextId,
     referrer: Referrer,
-    failure: Option<NotInternableError>,
+    failure: Option<Vec<ErrorItem>>,
 }
 
 /// Enters a scope with `<A>`, which has a scope with `<B>` that succeeds, one with `<U>` which
@@ -768,7 +802,7 @@ fn a_failing_scope_is_rolled_back_and_the_outer_one_goes_on() {
     assert!(ok.failure.is_none());
     // The errors of the scope are all returned, with the spans (here, those of the paths).
     let err = failed.failure.unwrap();
-    let message = err.to_string();
+    let message = messages(&err);
     assert_eq!(message.lines().count(), 2, "{}", message);
     assert!(message.contains("Bad1"), "{}", message);
     assert!(message.contains("Bad2"), "{}", message);
@@ -812,7 +846,7 @@ fn the_error_is_returned_once() {
     });
     let (_, inner) = result.unwrap();
     let err = inner.err().unwrap();
-    assert_eq!(err.to_string().lines().count(), 1);
+    assert_eq!(messages(&err).lines().count(), 1);
     assert_eq!(leaker.finish().iter().count(), 1);
 
     // If the closure ignores it, the outer scope has no error either.
@@ -835,8 +869,8 @@ fn the_error_is_returned_once() {
         view.visit_type(&parse_quote!(Bad2<'_>));
     });
     let err = result.err().unwrap();
-    assert_eq!(err.to_string().lines().count(), 1);
-    assert!(err.to_string().contains("Bad2"));
+    assert_eq!(messages(&err).lines().count(), 1);
+    assert!(messages(&err).contains("Bad2"));
 
     // A scope which succeeds inside one which fails is rolled back with it, with its context.
     let mut leaker = Leaker::new();
@@ -920,7 +954,7 @@ fn a_failed_inner_scope_leaves_no_cycle_in_the_outer_one() {
     let result = leaker.enter_generics(&parse_quote!(<T>), |view| {
         assert!(inner(view).is_err());
     });
-    assert!(result.is_ok(), "{}", result.err().unwrap());
+    assert!(result.is_ok(), "{}", messages(&result.err().unwrap()));
     // The same scope on its own fails, so the outer one would have failed with it.
     let mut leaker = leaker_with_std();
     assert!(leaker
@@ -1664,10 +1698,7 @@ fn a_panic_caught_in_a_nested_scope_restores_what_the_scope_declares() {
         // `allow_self` of the outer scope is the one in effect, and `Self` is `O`.
         view.visit_type(&parse_quote!(Rel2<Self>));
     });
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .starts_with("use absolute path: 'Rel2 < Self >'"));
+    assert!(messages(&result.unwrap_err()).starts_with("use absolute path: 'Rel2 < Self >'"));
     let mut leaker = Leaker::new();
     leaker
         .enter_type(&ident("O"), &Generics::default(), true, |view| {
@@ -1693,10 +1724,14 @@ fn a_panic_caught_in_a_nested_scope_restores_what_the_scope_declares() {
         view.visit_type(&parse_quote!(Rel<Self>));
     });
     // The errors are those of the outer scope: `Bad<'_>` of the scope which panicked is not one.
-    match result.unwrap_err() {
-        NotInternableError::SelfWithoutMeaning(selves) => assert_eq!(selves.len(), 1),
-        other => panic!("{:?}", other),
-    }
+    let err = result.unwrap_err();
+    assert!(
+        err.iter()
+            .all(|item| item.reason == Reason::SelfWithoutMeaning),
+        "{:?}",
+        err
+    );
+    assert_eq!(err.len(), 1);
 }
 
 #[test]
@@ -1942,14 +1977,17 @@ fn a_nested_panic_not_caught_in_an_outermost_scope_ends_at_the_leaker_with_its_c
 
 // ── `Self` in the generics of a scope ────────────────────────────────────────────────────────
 
-/// The mentions of `Self` which `NotInternableError::SelfWithoutMeaning` has, as tokens.
-fn selves_of(err: NotInternableError) -> Vec<String> {
-    match err {
-        NotInternableError::SelfWithoutMeaning(selves) => {
-            selves.iter().map(|s| s.to_string()).collect()
-        }
-        other => panic!("{:?}", other),
-    }
+/// The mentions of `Self` which the errors of `Reason::SelfWithoutMeaning` have, as tokens.
+fn selves_of(err: Vec<ErrorItem>) -> Vec<String> {
+    assert!(
+        err.iter()
+            .all(|item| item.reason == Reason::SelfWithoutMeaning),
+        "{:?}",
+        err
+    );
+    err.iter()
+        .map(|item| item.cause.to_token_stream().to_string())
+        .collect()
 }
 
 #[test]
@@ -1978,7 +2016,7 @@ fn self_in_the_generics_of_a_scope_which_has_none_is_an_error() {
         let text = s(generics);
         // On the Leaker, with nothing visited.
         let err = Leaker::new().enter_generics(generics, |_| ()).unwrap_err();
-        assert_eq!(err.to_string(), "`Self` has no meaning here", "{}", text);
+        assert_eq!(messages(&err), "`Self` has no meaning here", "{}", text);
         assert_eq!(selves_of(err), [mention.to_string()], "{}", text);
         // In a scope nested in one which has no `Self` either (the module, and the generics).
         let nested = Leaker::new()
@@ -2048,7 +2086,7 @@ fn self_in_the_generics_of_a_scope_which_has_none_is_an_error() {
         )
         .unwrap_err();
     assert_eq!(selves_of(err.clone()), ["Self", "Self :: X", "Self"]);
-    assert_eq!(err.to_string().lines().count(), 3);
+    assert_eq!(messages(&err).lines().count(), 3);
     // It is the same for the generics of the View, and the outer scope does not report it again.
     let mut leaker = Leaker::new();
     let (_, inner) = leaker
@@ -2070,13 +2108,13 @@ fn self_in_a_default_where_a_scope_declares_it_is_the_conflict_of_the_default() 
         .enter_type(&ident("S"), &generics, true, |_| ())
         .unwrap_err();
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some("a default of a parameter cannot depend on `Self`")
     );
-    assert!(matches!(err, NotInternableError::RelativePath(_)));
+    assert_relative_path(&err);
     let err = Leaker::new().enter_generics(&generics, |_| ()).unwrap_err();
-    assert!(matches!(err, NotInternableError::SelfWithoutMeaning(_)));
-    assert_eq!(err.to_string(), "`Self` has no meaning here");
+    assert_self_without_meaning(&err);
+    assert_eq!(messages(&err), "`Self` has no meaning here");
     // Also in a scope nested in one which declares it, and in the default of its own.
     let err = Leaker::new()
         .enter_type(&ident("S"), &Generics::default(), true, |view| {
@@ -2085,7 +2123,7 @@ fn self_in_a_default_where_a_scope_declares_it_is_the_conflict_of_the_default() 
         .unwrap()
         .1
         .unwrap_err();
-    assert!(matches!(err, NotInternableError::RelativePath(_)));
+    assert_relative_path(&err);
     let err = Leaker::new()
         .enter_mod("m", [], |view| {
             view.enter_generics(&generics, |_| ()).map(|_| ())
@@ -2093,7 +2131,7 @@ fn self_in_a_default_where_a_scope_declares_it_is_the_conflict_of_the_default() 
         .unwrap()
         .1
         .unwrap_err();
-    assert!(matches!(err, NotInternableError::SelfWithoutMeaning(_)));
+    assert_self_without_meaning(&err);
 }
 
 // ── `allow_self` of a nested item ────────────────────────────────────────────────────────────
@@ -2145,7 +2183,7 @@ fn a_nested_item_has_a_self_of_its_own_whatever_the_scope_around_says() {
                 })
                 .unwrap();
             })
-            .unwrap_or_else(|err| panic!("{}: {}", text, err));
+            .unwrap_or_else(|err| panic!("{}: {}", text, messages(&err)));
         let referrer = leaker.finish();
         // (Each module is another one, so the type is an entry in each of them.)
         assert!(
@@ -2267,11 +2305,9 @@ fn allow_self_applies_to_traits() {
     assert_eq!(self_of(&referrer, 0), "Self: Tr < T >");
     // `Rel<Self>` cannot be leaked without `Self`, as for a struct.
     let err = Leaker::new().intern_trait(&item, false).unwrap_err();
-    assert!(err
-        .to_string()
-        .starts_with("use absolute path: 'Rel < Self >'"));
+    assert!(messages(&err).starts_with("use absolute path: 'Rel < Self >'"));
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some("it cannot be leaked as a whole because of `Self`")
     );
     // What can be decomposed is, and the receivers are not affected.
@@ -2295,7 +2331,7 @@ fn allow_self_applies_to_traits() {
     assert!(Leaker::new().intern_trait(&item, true).is_ok());
     let err = Leaker::new().intern_trait(&item, false).unwrap_err();
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
     // The same for the scope of the Leaker and of the View.
@@ -2387,7 +2423,7 @@ fn the_generics_of_a_method_are_local_and_checked_for_e0195() {
         };
         let err = result.unwrap_err();
         assert!(
-            syn::Error::from(err).to_string().contains("E0195"),
+            type_leak::to_syn_error(&err).to_string().contains("E0195"),
             "{}",
             scope
         );
@@ -2460,13 +2496,13 @@ fn visit_signature_is_visit_item_of_a_nested_function() {
     let err = Leaker::new()
         .enter_generics(&Generics::default(), |view| view.visit_signature(&bad))
         .unwrap_err();
-    assert_eq!(err.to_string(), "use absolute path: 'Relative'");
+    assert_eq!(messages(&err), "use absolute path: 'Relative'");
     // The receiver is `Self`, which the scope has to declare.
     let method: Signature = parse_quote!(fn f(&self) -> Rel);
     let err = Leaker::new()
         .enter_generics(&Generics::default(), |view| view.visit_signature(&method))
         .unwrap_err();
-    assert!(matches!(err, NotInternableError::SelfWithoutMeaning(_)));
+    assert_self_without_meaning(&err);
     let mut leaker = Leaker::new();
     leaker
         .enter_trait(&ident("Tr"), &Generics::default(), true, |view| {
@@ -2495,11 +2531,10 @@ fn the_signature_of_a_foreign_function_declares_nothing() {
     );
 }
 
-// ── `NotInternableError::SelfWithoutMeaning` ─────────────────────────────────────────────────
+// ── `Reason::SelfWithoutMeaning` ─────────────────────────────────────────────────────────────
 
 #[test]
 fn self_without_meaning_is_an_error_of_its_own() {
-    use template_quote::ToTokens;
     let err = Leaker::new()
         .enter_generics(&Generics::default(), |view| {
             view.visit_type(&parse_quote!(Rel<Self>));
@@ -2509,23 +2544,26 @@ fn self_without_meaning_is_an_error_of_its_own() {
     assert_eq!(selves_of(err.clone()), ["Self", "Self :: Item"]);
     // One error per mention, which says what is wrong, and why.
     assert_eq!(
-        err.to_string(),
+        messages(&err),
         "`Self` has no meaning here\n`Self` has no meaning here"
     );
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some(
             "`Self` has no meaning here: it is declared only by a struct, an enum, a union, an impl \
              or a trait, not by a module or generics"
         )
     );
-    let converted = syn::Error::from(err.clone());
+    let converted = type_leak::to_syn_error(&err);
     assert_eq!(converted.into_iter().count(), 2);
     assert_eq!(
-        err.to_token_stream().to_string(),
-        syn::Error::from(err.clone()).to_compile_error().to_string()
+        err.iter()
+            .map(ErrorItem::to_compile_error)
+            .collect::<proc_macro2::TokenStream>()
+            .to_string(),
+        type_leak::to_syn_error(&err).to_compile_error().to_string()
     );
-    let _ = err.span();
+    let _ = err[0].span();
     // A scope which has both kinds of errors returns the conflicts of the paths: the others are
     // found after they are fixed.
     let err = Leaker::new()
@@ -2534,14 +2572,14 @@ fn self_without_meaning_is_an_error_of_its_own() {
             view.visit_type(&parse_quote!(Bad<'_>));
         })
         .unwrap_err();
-    assert!(matches!(err, NotInternableError::RelativePath(_)));
-    assert!(err.to_string().contains("Bad"));
+    assert_relative_path(&err);
+    assert!(messages(&err).contains("Bad"));
     let err = Leaker::new()
         .enter_generics(&Generics::default(), |view| {
             view.visit_type(&parse_quote!(Rel<Self>));
         })
         .unwrap_err();
-    assert!(matches!(err, NotInternableError::SelfWithoutMeaning(_)));
+    assert_self_without_meaning(&err);
 }
 
 // ── the root of a trait bound ────────────────────────────────────────────────────────────────
@@ -2612,7 +2650,7 @@ fn visit_type_param_bound_checks_the_root_of_a_trait_bound() {
             .unwrap_err();
         // The error is about the path of the trait, at the root.
         assert_eq!(
-            err.to_string(),
+            messages(&err),
             format!("use absolute path: '{}'", s(&path)),
             "{}",
             s(&path)
@@ -2625,15 +2663,13 @@ fn visit_type_param_bound_checks_the_root_of_a_trait_bound() {
             view.visit_type_param_bound(&parse_quote!(Self::X))
         })
         .unwrap_err();
-    assert!(matches!(err, NotInternableError::SelfWithoutMeaning(_)));
+    assert_self_without_meaning(&err);
     let err = Leaker::new()
         .enter_trait(&ident("Tr"), &Generics::default(), true, |view| {
             view.visit_type_param_bound(&parse_quote!(Self::X))
         })
         .unwrap_err();
-    assert!(err
-        .to_string()
-        .starts_with("use absolute path: 'Self :: X'"));
+    assert!(messages(&err).starts_with("use absolute path: 'Self :: X'"));
 }
 
 #[test]
@@ -2641,7 +2677,7 @@ fn an_impl_checks_the_path_of_its_trait_on_entering_the_scope() {
     // The path of the trait of an impl is checked in the same way.
     let item: ItemImpl = parse_quote!(impl Tr for W {});
     let err = Leaker::new().intern_impl(&item, true).unwrap_err();
-    assert_eq!(err.to_string(), "use absolute path: 'Tr'");
+    assert_eq!(messages(&err), "use absolute path: 'Tr'");
     let item: ItemImpl = parse_quote!(impl ::p::Tr for W {});
     assert!(Leaker::new().intern_impl(&item, true).is_ok());
     // The check comes first, before what is visited of the impl, and the arguments of the trait
@@ -2653,7 +2689,7 @@ fn an_impl_checks_the_path_of_its_trait_on_entering_the_scope() {
     );
     let err = Leaker::new().intern_impl(&item, true).unwrap_err();
     assert_eq!(
-        err.to_string(),
+        messages(&err),
         "use absolute path: 'm :: Tr < Rel >'\nuse absolute path: 'Rel3'\n\
          use absolute path: 'Rel4 < '_ >'"
     );
@@ -2670,7 +2706,7 @@ fn an_impl_checks_the_path_of_its_trait_on_entering_the_scope() {
             view.visit_type_param_bound(&parse_quote!(#trait_path))
         })
         .unwrap_err();
-    assert_eq!(err.to_string(), "use absolute path: 'Tr < Rel >'");
+    assert_eq!(messages(&err), "use absolute path: 'Tr < Rel >'");
     // The same path visited as `Visit::visit_path()` is not checked.
     let mut leaker = Leaker::new();
     leaker

@@ -837,7 +837,7 @@ pub mod scoped {
         where ::std::vec::Vec<T>: ::core::clone::Clone {}
     }
 
-    // The errors of the analysis (`NotInternableError::items()`), reported through a macro:
+    // The errors of the analysis (`Vec<ErrorItem>`), reported through a macro:
     // several offending paths (a lifetime that is elided in a path), each with its span and notes.
     scope_errors! {
         name = SCOPE_ERRORS_MULTI,

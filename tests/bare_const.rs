@@ -27,7 +27,7 @@
 //! alone where it is a soft cause.
 
 use syn::*;
-use template_quote::quote;
+use template_quote::{quote, ToTokens};
 use type_leak::*;
 
 /// Parses the tokens of an item.
@@ -43,7 +43,7 @@ fn analyze_with(
     mut leaker: Leaker,
     item: &Item,
     allow_self: bool,
-) -> std::result::Result<Referrer, NotInternableError> {
+) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     match item {
         Item::Struct(item) => leaker.intern_struct(item, allow_self),
         Item::Enum(item) => leaker.intern_enum(item, allow_self),
@@ -56,7 +56,7 @@ fn analyze_with(
     Ok(leaker.finish())
 }
 
-fn analyze(item: &Item, allow_self: bool) -> std::result::Result<Referrer, NotInternableError> {
+fn analyze(item: &Item, allow_self: bool) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     let mut config = LeakerConfig::new();
     config.allow_primitive();
     analyze_with(Leaker::from_config(config), item, allow_self)
@@ -70,6 +70,15 @@ fn entries(referrer: &Referrer) -> Vec<String> {
         .collect()
 }
 
+/// The messages of the errors, one per line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// What an error says: for each of its errors, the headline, the tokens, the notes and the help.
 #[derive(Debug, PartialEq, Eq)]
 struct Shown {
@@ -79,11 +88,11 @@ struct Shown {
     help: String,
 }
 
-fn shown(err: &NotInternableError) -> Vec<Shown> {
-    err.items()
+fn shown(err: &[ErrorItem]) -> Vec<Shown> {
+    err.iter()
         .map(|item| Shown {
             message: item.message.clone(),
-            tokens: item.tokens.to_string(),
+            tokens: item.cause.to_token_stream().to_string(),
             notes: item.notes.iter().map(|(_, note)| note.clone()).collect(),
             help: item
                 .help_text()
@@ -152,10 +161,15 @@ fn a_bare_identifier_beside_a_denied_self_is_not_leaked_as_a_type() {
         }
     );
     let err = analyze(&item, false).err().unwrap();
-    assert_eq!(shown(&err), [self_denied("ILEN", "Self")], "{}", err);
+    assert_eq!(
+        shown(&err),
+        [self_denied("ILEN", "Self")],
+        "{}",
+        messages(&err)
+    );
     // The exact text, as the macro shows it.
     assert_eq!(
-        syn::Error::from(err).to_string(),
+        to_syn_error(&err).to_string(),
         "`ILEN` may be a const, and the type that holds it cannot be leaked as a whole\n\
          \n\
          \x20 = note: it cannot be leaked as a whole because of `Self`\n\
@@ -304,8 +318,8 @@ fn a_denied_self_in_the_holder_is_an_error_for_every_kind_of_item() {
             quote!(#item)
         );
         // Where `Self` can be leaked, the path that holds `ILEN` is the entry.
-        let referrer =
-            analyze(&item, true).unwrap_or_else(|err| panic!("{}: {}", quote!(#item), err));
+        let referrer = analyze(&item, true)
+            .unwrap_or_else(|err| panic!("{}: {}", quote!(#item), messages(&err)));
         let leaked = entries(&referrer);
         assert!(
             leaked.len() == 1 && leaked[0] != "ILEN" && leaked[0].contains("ILEN"),
@@ -564,7 +578,7 @@ fn check_agrees() {
         result
             .must
             .iter()
-            .map(|cause| cause.to_string())
+            .map(|cause| cause.to_token_stream().to_string())
             .collect::<Vec<_>>(),
         ["ILEN"]
     );
@@ -572,7 +586,7 @@ fn check_agrees() {
         result
             .impossible
             .iter()
-            .map(|cause| cause.to_string())
+            .map(|cause| cause.to_token_stream().to_string())
             .collect::<Vec<_>>(),
         ["Self"]
     );
@@ -665,7 +679,7 @@ fn soft_causes_leak_the_identifier() {
     for item in items {
         for allow_self in [true, false] {
             let referrer = analyze(&item, allow_self)
-                .unwrap_or_else(|err| panic!("{}: {}", quote!(#item), err));
+                .unwrap_or_else(|err| panic!("{}: {}", quote!(#item), messages(&err)));
             assert_eq!(
                 entries(&referrer),
                 ["ILEN"],
@@ -763,7 +777,8 @@ fn unchanged_cases() {
                 a: #ty,
             }
         );
-        let referrer = analyze(&item, false).unwrap_or_else(|err| panic!("{}: {}", ty, err));
+        let referrer =
+            analyze(&item, false).unwrap_or_else(|err| panic!("{}: {}", ty, messages(&err)));
         assert_eq!(entries(&referrer), ["ILEN"], "{}", ty);
     }
 }
@@ -910,7 +925,7 @@ fn module_config() -> LeakerConfig {
     config
 }
 
-fn analyze_module(item: &Item) -> std::result::Result<Referrer, NotInternableError> {
+fn analyze_module(item: &Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     analyze_with(Leaker::from_config(module_config()), item, true)
 }
 
@@ -963,7 +978,7 @@ fn a_bare_identifier_beside_a_name_the_module_declares_is_not_leaked_as_a_type()
     let item = module_with(true, imported(true), place, holder);
     let err = analyze_module(&item).err().unwrap();
     assert_eq!(
-        syn::Error::from(err).to_string(),
+        to_syn_error(&err).to_string(),
         "`ILEN` may be a const, and the type that holds it cannot be leaked as a whole\n\
          \n\
          \x20 = note: the type names `super::RC`, which the module declares and the copy \
@@ -995,8 +1010,9 @@ fn a_name_the_module_declares_beside_the_identifier_is_no_cause_if_the_identifie
                 "::l::BC<$RC<[u8; M], M>, ILEN>",
             ] {
                 let item = module_with(nested, ilen, place, holder);
-                let referrer = analyze_module(&item)
-                    .unwrap_or_else(|err| panic!("{}, {}, {}: {}", nested, ilen, holder, err));
+                let referrer = analyze_module(&item).unwrap_or_else(|err| {
+                    panic!("{}, {}, {}: {}", nested, ilen, holder, messages(&err))
+                });
                 assert!(
                     entries(&referrer).is_empty(),
                     "{}, {}, {}: {:?}",
@@ -1046,7 +1062,7 @@ fn a_name_the_module_declares_as_the_path_of_the_holder_still_leaks_the_identifi
         ] {
             let item = module_with(nested, imported(nested), place, holder);
             let referrer = analyze_module(&item)
-                .unwrap_or_else(|err| panic!("{}, {}: {}", nested, holder, err));
+                .unwrap_or_else(|err| panic!("{}, {}: {}", nested, holder, messages(&err)));
             let leaked = entries(&referrer);
             if holder.contains("ILEN") {
                 assert_eq!(leaked, ["ILEN"], "{}, {}", nested, holder);
@@ -1085,7 +1101,7 @@ fn a_standard_path_beside_a_name_the_module_declares_leaks_the_identifier() {
                 assert_eq!(entries(&referrer), ["Error"], "{}", holder);
             }
             Err(err) => {
-                assert!(!leaked, "{}: {}", holder, err);
+                assert!(!leaked, "{}: {}", holder, messages(&err));
                 assert_eq!(
                     shown(&err),
                     [beside_module_item("Error", "Local")],
@@ -1178,7 +1194,7 @@ fn in_a_module_the_identifier_is_leaked_alone_only_for_a_path_the_module_declare
                     (Holder::Beside, Ok(referrer)) => {
                         panic!("accepted: {}: {:?}", seen, entries(&referrer))
                     }
-                    (_, Err(err)) => panic!("{}: {}", seen, err),
+                    (_, Err(err)) => panic!("{}: {}", seen, messages(&err)),
                     (kind, Ok(referrer)) => {
                         let leaked = entries(&referrer);
                         let is_alone = leaked.iter().any(|entry| entry == "ILEN");

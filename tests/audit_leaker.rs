@@ -7,7 +7,7 @@ mod common;
 use common::check_in;
 use syn::*;
 use template_quote::quote;
-use type_leak::{Leaker, LeakerConfig, Referrer, SelfRequirement};
+use type_leak::{to_syn_error, Leaker, LeakerConfig, Referrer, SelfRequirement};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
@@ -21,7 +21,7 @@ fn leak_trait_with(config: LeakerConfig, item: &ItemTrait) -> std::result::Resul
     let mut leaker = Leaker::from_config(config);
     leaker
         .intern_trait(item, true)
-        .map_err(|e| syn::Error::from(e).to_string())?;
+        .map_err(|e| to_syn_error(&e).to_string())?;
     Ok(leaker)
 }
 
@@ -33,7 +33,7 @@ fn leak_module_with(config: LeakerConfig, item: &ItemMod) -> std::result::Result
     let mut leaker = Leaker::from_config(config);
     leaker
         .intern_mod(item)
-        .map_err(|e| syn::Error::from(e).to_string())?;
+        .map_err(|e| to_syn_error(&e).to_string())?;
     Ok(leaker)
 }
 
@@ -454,7 +454,7 @@ fn type_macros() {
     let err = Leaker::from_config(config())
         .intern_struct(&item, false)
         .err()
-        .map(|e| syn::Error::from(e).to_string())
+        .map(|e| to_syn_error(&e).to_string())
         .unwrap();
     assert!(err.contains("because of `Self`"), "{}", err);
     // In a module, a macro is expanded where it is written, whatever its path is.

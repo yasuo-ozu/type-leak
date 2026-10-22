@@ -107,9 +107,11 @@ impl<'v> View<'v> {
     /// It finds what [`View::visit_type()`] finds in `ty` here: with the generics of all the scopes
     /// around, `Self` and its `allow_self`, and the module with the names it declares (they are not
     /// causes). An absolute path of an external crate is not a cause, so `::foo::W<(Rel,)>` has
-    /// only `Rel`, and `optional`. `Self` where it has no meaning is an impossible cause. The
-    /// Leaker is as if `check()` was not called: no entry, context, error or module remains. (It
-    /// takes `&mut self` only because it borrows the analysis and puts it back.)
+    /// only `Rel`, and `optional`. `Self` where it has no meaning is an impossible cause. Each
+    /// cause is a [`Cause`](crate::Cause) of the kind of syntax it is (a type, the trait of a
+    /// bound, an expression, a macro, a lifetime). The Leaker is as if `check()` was not called: no
+    /// entry, context, error or module remains. (It takes `&mut self` only because it borrows the
+    /// analysis and puts it back.)
     ///
     /// ```
     /// # use type_leak::*;

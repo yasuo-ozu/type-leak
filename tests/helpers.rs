@@ -1,6 +1,7 @@
 //! Tests for the helpers for macro authors: `Referrer::required()` and `Referrer::is_plain()`,
 //! the description of the Repeater impl of an entry (`Referrer::repeater_impl()`), the arguments of
-//! an entry at a use site (`Referrer::entry_args()`), and the items of a `NotInternableError`.
+//! an entry at a use site (`Referrer::entry_args()`), and the items of the errors of the analysis
+//! (`Vec<ErrorItem>`).
 //!
 //! The impl and the arguments are compared with what a macro wrote by hand before the helpers
 //! (`iter_with_self()` + `without_encoded_bounds()` + the encoders, and `generic_args()` + the
@@ -16,6 +17,15 @@ fn s<T: ToTokens>(t: &T) -> String {
 
 fn t(ty: Type) -> String {
     s(&ty)
+}
+
+/// The messages of the errors, one per line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn slots() -> RepeaterSlots {
@@ -40,7 +50,7 @@ fn analyze(item: &Item) -> (Referrer, ContextId) {
         Item::Mod(i) => leaker.intern_mod(i),
         _ => panic!("unsupported item"),
     }
-    .unwrap_or_else(|e| panic!("{}: {}", s(item), e));
+    .unwrap_or_else(|e| panic!("{}: {}", s(item), messages(&e)));
     (leaker.finish(), context)
 }
 
@@ -863,7 +873,7 @@ fn entry_args_to_ty_has_no_closure() {
     ));
 }
 
-// ── NotInternableError::items() ──────────────────────────────────────────────────────────────
+// ── The items of the errors ──────────────────────────────────────────────────────────────────
 
 #[test]
 fn items_has_every_offending_path() {
@@ -873,7 +883,7 @@ fn items_has_every_offending_path() {
         }
     };
     let err = Leaker::new().intern_trait(&item, true).unwrap_err();
-    let items: Vec<ErrorItem> = err.items().collect();
+    let items = &err;
     assert_eq!(items.len(), 3);
     assert_eq!(
         items
@@ -889,7 +899,7 @@ fn items_has_every_offending_path() {
     assert_eq!(
         items
             .iter()
-            .map(|item| item.tokens.to_string())
+            .map(|item| item.cause.to_token_stream().to_string())
             .collect::<Vec<_>>(),
         ["Clone", "MyBound", "MyType < '_ >"]
     );
@@ -915,19 +925,19 @@ fn items_has_every_offending_path() {
     assert!(items[2].note().unwrap().contains("because of `'_`"));
     assert_eq!(items[2].notes.len(), 1);
     // The first is what the first-error accessors tell.
-    assert_eq!(err.note(), None);
-    assert_eq!(err.help().as_deref(), items[0].help_text());
-    let _ = err.span();
-    // Display is the messages, and `syn::Error` has one error for each.
+    assert_eq!(err[0].note(), None);
+    assert_eq!(err[0].help_text(), items[0].help_text());
+    let _ = err[0].span();
+    // The messages are what the headlines say, and `syn::Error` has one error for each.
     assert_eq!(
-        err.to_string(),
+        messages(&err),
         items
             .iter()
             .map(|item| item.message.clone())
             .collect::<Vec<_>>()
             .join("\n")
     );
-    assert_eq!(syn::Error::from(err).into_iter().count(), items.len());
+    assert_eq!(to_syn_error(&err).into_iter().count(), items.len());
 }
 
 #[test]
@@ -938,15 +948,15 @@ fn items_of_self_without_meaning() {
             view.visit_type(&parse_quote!(Wrap<Self::Item>));
         })
         .unwrap_err();
-    let items: Vec<ErrorItem> = err.items().collect();
+    let items = &err;
     assert_eq!(
         items
             .iter()
-            .map(|item| item.tokens.to_string())
+            .map(|item| item.cause.to_token_stream().to_string())
             .collect::<Vec<_>>(),
         ["Self", "Self :: Item"]
     );
-    for item in &items {
+    for item in items {
         assert_eq!(item.message, "`Self` has no meaning here");
         assert!(item
             .note()
@@ -961,16 +971,15 @@ fn items_of_self_without_meaning() {
 
 #[test]
 fn display_uses_the_headline_of_the_cause() {
-    // A cause that is not that a path is relative has its own headline, in `Display`, in
-    // `items()`, in `syn::Error` and in the first line of the tokens.
-    fn check(err: NotInternableError, headline: &str) {
-        assert_eq!(err.to_string(), headline);
-        assert_eq!(err.items().next().unwrap().message, headline);
-        assert!(syn::Error::from(err.clone())
-            .to_string()
-            .starts_with(headline));
+    // A cause that is not that a path is relative has its own headline, in the messages, in the
+    // first error, in `syn::Error` and in the first line of the tokens.
+    fn check(err: Vec<ErrorItem>, headline: &str) {
+        assert_eq!(messages(&err), headline);
+        assert_eq!(err[0].message, headline);
+        assert!(to_syn_error(&err).to_string().starts_with(headline));
     }
-    // A default that names `Self`: it was "use absolute path: 'Self'".
+    // A default that names `Self`: it was "use absolute path: 'Self'". The cause is the whole type
+    // of the default, and the note is at the `Self` in it.
     let err = Leaker::new()
         .intern_trait(
             &parse_quote!(
@@ -979,7 +988,8 @@ fn display_uses_the_headline_of_the_cause() {
             true,
         )
         .unwrap_err();
-    assert_eq!(err.items().next().unwrap().tokens.to_string(), "Self");
+    assert_eq!(err[0].cause.to_token_stream().to_string(), "Rel < Self >");
+    assert_eq!(err[0].notes[0].0.to_string(), "Self");
     check(
         err,
         "`Rel < Self >` is in the default of a parameter, and names `Self`",

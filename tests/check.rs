@@ -4,7 +4,8 @@ mod common;
 
 use common::check_in;
 use syn::*;
-use type_leak::{CheckResult, ContextId, Leaker, NotInternableError, Referrer, View};
+use template_quote::ToTokens;
+use type_leak::{to_syn_error, Cause, CheckResult, ContextId, Leaker, Reason, Referrer, View};
 
 /// Classifies a `CheckResult` (as the variants of the former `CheckResult` enum).
 fn kind(result: &CheckResult) -> &'static str {
@@ -151,7 +152,7 @@ fn test_check_allows_crate_paths_only_if_allowed() {
     // Without it the same paths are leaked (here in bounds, which cannot be leaked): the allowed
     // `crate` is what lets them through.
     let err = Leaker::new().intern_trait(&item, true).unwrap_err();
-    let message = Error::from(err).to_string();
+    let message = to_syn_error(&err).to_string();
     assert!(
         message.contains("use absolute path: 'crate :: error :: Error'"),
         "{}",
@@ -272,8 +273,11 @@ fn test_check_allowed_paths_with_generic_args() {
 fn test_check_conflict() {
     let generics: Generics = parse_quote!(<T>);
     let mut leaker = Leaker::new();
-    let strings = |tokens: Vec<proc_macro2::TokenStream>| -> Vec<String> {
-        tokens.iter().map(|t| t.to_string()).collect()
+    let strings = |causes: Vec<Cause>| -> Vec<String> {
+        causes
+            .iter()
+            .map(|cause| cause.to_token_stream().to_string())
+            .collect()
     };
     let mut conflict = |ty: Type| {
         let c = check_in(&mut leaker, &ty, &generics);
@@ -323,8 +327,82 @@ fn test_check_conflict() {
     );
 }
 
-fn strings(tokens: &[proc_macro2::TokenStream]) -> Vec<String> {
-    tokens.iter().map(|t| t.to_string()).collect()
+/// The kind of each cause and its tokens, as text.
+fn kinds(causes: &[Cause]) -> Vec<(&'static str, String)> {
+    causes
+        .iter()
+        .map(|cause| {
+            let kind = match cause {
+                Cause::Type(_) => "type",
+                Cause::Trait(_) => "trait",
+                Cause::Expr(_) => "expr",
+                Cause::Macro(_) => "macro",
+                Cause::Lifetime(_) => "lifetime",
+                Cause::Unreadable(_) => "unreadable",
+                other => panic!("{:?}", other),
+            };
+            (kind, cause.to_token_stream().to_string())
+        })
+        .collect()
+}
+
+/// The causes of `must` and `impossible` are the syntax that they are: a path in a type is a type,
+/// the path of a bound a trait, a path in an expression an expression, the path of a macro call a
+/// macro, and a lifetime a lifetime. The first of `must` is the cause of the error.
+#[test]
+fn the_causes_of_a_check_have_the_kind_of_their_syntax() {
+    let generics: Generics = parse_quote!(<T>);
+    let check = |ty: Type| check_in(&mut Leaker::new(), &ty, &generics);
+    let own = |kind, text: &str| (kind, text.to_string());
+
+    let result = check(parse_quote!(MyType<'_>));
+    assert_eq!(kinds(&result.must), [own("type", "MyType < '_ >")]);
+    assert_eq!(kinds(&result.impossible), [own("lifetime", "'_")]);
+
+    // The trait of a `dyn` type is a trait, and the type that cannot be leaked is a type (under the
+    // elided lifetime, that is a lifetime).
+    let result = check(parse_quote!(::p::W<'_, dyn RelTr>));
+    assert_eq!(kinds(&result.must), [own("trait", "RelTr")]);
+    assert_eq!(
+        kinds(&result.impossible),
+        [own("lifetime", "'_"), own("type", "dyn RelTr")]
+    );
+
+    // The closure stops the array from being leaked, and the paths in it are causes of their own:
+    // `u8` a type, `a` an expression.
+    let result = check(parse_quote!(
+        [u8; {
+            let c = |a: u8| a;
+            3
+        }]
+    ));
+    assert_eq!(kinds(&result.must), [own("type", "u8"), own("expr", "a")]);
+    assert_eq!(kinds(&result.impossible), [own("expr", "| a : u8 | a")]);
+    assert!(matches!(&result.must[1], Cause::Expr(Expr::Path(_))));
+    assert!(matches!(
+        &result.impossible[0],
+        Cause::Expr(Expr::Closure(_))
+    ));
+
+    // A macro call is a macro in `must` (its path, written with the `!`) and an expression, with
+    // its arguments, in `impossible`.
+    let result = check(parse_quote!([u8; two!()]));
+    assert_eq!(kinds(&result.must), [own("macro", "two !")]);
+    assert_eq!(kinds(&result.impossible), [own("expr", "two ! ()")]);
+
+    // A path in a qualified type is no node of the syntax.
+    let result = check(parse_quote!(<T as RelTrait<'_>>::Ty));
+    assert_eq!(
+        kinds(&result.must),
+        [own("unreadable", "RelTrait < '_ > :: Ty")]
+    );
+}
+
+fn strings(causes: &[Cause]) -> Vec<String> {
+    causes
+        .iter()
+        .map(|cause| cause.to_token_stream().to_string())
+        .collect()
 }
 
 fn check_ty(view: &mut View<'_>, ty: Type) -> CheckResult {
@@ -492,7 +570,10 @@ fn check_is_not_the_error_of_the_scope() {
         view.check(&parse_quote!(Self));
     });
     match result {
-        Err(NotInternableError::SelfWithoutMeaning(selves)) => assert_eq!(selves.len(), 1),
+        Err(errors) => {
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].reason, Reason::SelfWithoutMeaning);
+        }
         other => panic!("{:?}", other.map(|_| ())),
     }
     // Neither does the conflict of a type leave one.
@@ -628,19 +709,28 @@ fn check_reports_the_conflict_a_scope_reports() {
             view.visit_type(&ty)
         })
         .unwrap_err();
-    match err {
-        NotInternableError::RelativePath(conflicts) => {
-            assert_eq!(conflicts.len(), 1);
-            assert_eq!(strings(&conflicts[0].must), strings(&forbidden.must));
-            assert_eq!(
-                strings(&conflicts[0].impossible),
-                strings(&forbidden.impossible)
-            );
-            assert_eq!(conflicts[0].note, forbidden.note);
-            assert_eq!(conflicts[0].help, forbidden.help);
-        }
-        other => panic!("{:?}", other),
-    }
+    assert_eq!(err.len(), 1);
+    let item = &err[0];
+    assert_eq!(item.reason, Reason::DeniedSelfInBounds);
+    // The error is reported at the first of `must`, with the causes of `impossible` as notes, after
+    // the note of the conflict, and the help of the conflict.
+    assert_eq!(
+        item.cause.to_token_stream().to_string(),
+        forbidden.must[0].to_token_stream().to_string()
+    );
+    assert_eq!(
+        item.notes[0].0.to_string(),
+        forbidden.must[0].to_token_stream().to_string()
+    );
+    assert_eq!(Some(&item.notes[0].1), forbidden.note.as_ref());
+    assert_eq!(
+        item.notes[1..]
+            .iter()
+            .map(|(at, _)| at.to_string())
+            .collect::<Vec<_>>(),
+        strings(&forbidden.impossible)
+    );
+    assert_eq!(item.help_text(), forbidden.help.as_deref());
 }
 
 /// Types that a visit would record in some way: entries, optional entries, conflicts, errors for

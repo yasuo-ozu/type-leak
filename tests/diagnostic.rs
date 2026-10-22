@@ -1,5 +1,8 @@
-//! Checks how rustc renders a `NotInternableError` emitted by a proc macro with its `ToTokens`
-//! implementation, by building `tests/crates/diagnostic` (which fails to compile).
+//! Checks how rustc renders the errors of the Leaker (`ErrorItem`) emitted by a proc macro with
+//! `ErrorItem::to_compile_error()`, by building `tests/crates/diagnostic` (which fails to compile).
+//! The first items of `tests/crates/diagnostic_serialized` are the same, but the macro writes its
+//! errors as tokens, reads them back and then reports them: rustc renders them in the same way, at
+//! the same places.
 //!
 //! On nightly, the notes and the help are those of the diagnostic, each with its own span and
 //! source preview; on stable, they are appended to the message (`= note: ..`, then `= help: ..`, as
@@ -327,4 +330,58 @@ fn every_offending_path_is_an_error_of_its_own() {
         "{}",
         stderr
     );
+}
+
+/// The diagnostics of the output of rustc for the first `lines` lines of the source, as text, in
+/// order. What differs in the two fixtures is left out: the note that names the macro, and the
+/// summary of cargo.
+fn diagnostics_up_to(stderr: &str, lines: usize) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in stderr.lines().map(str::trim_end) {
+        if line.starts_with("error") || line.starts_with("warning") {
+            found.extend(current.take().map(|block| block.join("\n")));
+            if !line.starts_with("error: could not compile") {
+                current = Some(Vec::new());
+            }
+        }
+        if let Some(block) = &mut current {
+            if !line.contains("this error originates") {
+                block.push(line);
+            }
+        }
+    }
+    found.extend(current.map(|block| block.join("\n")));
+    // The place of a diagnostic is the first `--> lib.rs:<line>:` in it.
+    found
+        .into_iter()
+        .filter(|block| {
+            block
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("--> lib.rs:"))
+                .and_then(|place| place.split(':').next()?.parse::<usize>().ok())
+                .map_or(false, |line| line <= lines)
+        })
+        .collect()
+}
+
+/// The errors that a macro writes as tokens, reads back and reports are reported as those it
+/// reports directly: the tokens of the cause, of the notes and of the help keep their spans, so
+/// rustc points at the same places, with the same text.
+#[test]
+fn serialized_errors_are_reported_at_the_same_places() {
+    let direct = diagnostics_up_to(&build_fixture(), 23);
+    let built = nested::cargo("diagnostic_serialized", &["check"], &[]);
+    assert!(!built.success, "{}", built.stderr);
+    let serialized = diagnostics_up_to(&built.stderr, 23);
+    // The three items with one error, the five of `Multi`, and the two mentions of `Self`.
+    assert_eq!(direct.len(), 10, "{}", direct.join("\n"));
+    assert_eq!(serialized, direct);
+    // And no other error: the fixture is the first lines of the other.
+    let errors = built
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("error") && !line.starts_with("error: could not compile"))
+        .count();
+    assert_eq!(errors, direct.len(), "{}", built.stderr);
 }

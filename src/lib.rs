@@ -33,7 +33,7 @@ pub use crate::encode::{
     encode_generics_params_to_ty_with, encode_generics_params_to_ty_with_self,
     without_encoded_bounds, EncodeError,
 };
-pub use crate::error::{ErrorItem, NotInternableError};
+pub use crate::error::{to_syn_error, Cause, ErrorItem, Reason};
 pub use crate::helpers::{ImplSelf, RepeaterImpl, UseSite};
 pub use crate::leaker::Leaker;
 pub use crate::referrer::{NestedSelf, Referrer, Visitor};

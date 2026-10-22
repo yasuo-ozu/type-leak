@@ -7,10 +7,19 @@
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{ContextId, Leaker, NotInternableError, Referrer, SelfRequirement};
+use type_leak::{ContextId, ErrorItem, Leaker, Reason, Referrer, SelfRequirement};
 
 fn s(x: &impl ToTokens) -> String {
     quote!(#x).to_string()
+}
+
+/// The messages of `errors`, one on each line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn ident(name: &str) -> Ident {
@@ -194,20 +203,23 @@ fn the_self_of_a_trait_has_no_name() {
         })
         .unwrap();
     let err = inner.unwrap_err();
-    assert!(matches!(err, NotInternableError::RelativePath(_)));
+    assert!(!err.is_empty());
+    assert!(err
+        .iter()
+        .all(|item| item.reason != Reason::SelfWithoutMeaning));
     assert_eq!(
-        err.to_string(),
+        messages(&err),
         "the bound of `T` mentions a `Self` which has no name here"
     );
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some(
             "the bound of `T` mentions the `Self` of the trait `Tr < T >`, which has no name \
              here: `Self` is something else in the item around"
         )
     );
     // The mention of `Self` is a cause too.
-    let message = syn::Error::from(err).to_string();
+    let message = type_leak::to_syn_error(&err).to_string();
     assert!(message.contains("it cannot be leaked as a whole because of `Self`"));
     // The scope around goes on, with nothing recorded.
     assert_eq!(leaker.finish().iter().count(), 0);
@@ -244,8 +256,8 @@ fn the_self_of_a_trait_has_no_name() {
         let err = Leaker::new()
             .enter_trait(&ident("Tr"), &generics, true, |v| v.visit_item(&item))
             .unwrap_err();
-        assert_eq!(err.to_string(), headline, "{}", s(&item));
-        let note = err.note().unwrap();
+        assert_eq!(messages(&err), headline, "{}", s(&item));
+        let note = err[0].note().unwrap();
         assert!(
             note.contains("the `Self` of the trait `Tr < T >`"),
             "{}",
@@ -295,21 +307,24 @@ fn an_unnameable_self_is_reported_for_the_bound_not_the_path() {
     assert!(relative.headline.is_none());
 
     let err = inner.unwrap_err();
-    assert!(matches!(err, NotInternableError::RelativePath(_)));
+    assert!(!err.is_empty());
+    assert!(err
+        .iter()
+        .all(|item| item.reason != Reason::SelfWithoutMeaning));
     assert_eq!(
-        err.to_string(),
+        messages(&err),
         "the bound of `T` mentions a `Self` which has no name here\n\
          use absolute path: 'Other < '_ >'"
     );
     // The first error comes first, with the note which tells why, and the cause.
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some(
             "the bound of `T` mentions the `Self` of the trait `Tr < T >`, which has no name \
              here: `Self` is something else in the item around"
         )
     );
-    let message = syn::Error::from(err).to_string();
+    let message = type_leak::to_syn_error(&err).to_string();
     assert!(
         message.starts_with(
             "the bound of `T` mentions a `Self` which has no name here\n\n  \
@@ -343,11 +358,11 @@ fn an_associated_item_of_self_has_no_name() {
         .unwrap();
     let err = inner.unwrap_err();
     assert_eq!(
-        err.to_string(),
+        messages(&err),
         "the bound of `T` mentions `Self :: X`, which has no name here"
     );
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some(
             "the bound of `T` mentions `Self :: X`, an associated item of the `Self` of `S < T >`, \
              which has no name here: `Self` is something else in the item around"
@@ -693,14 +708,18 @@ fn a_default_with_an_outer_bound_on_the_self_of_a_trait_is_an_error() {
         })
         .unwrap();
     let err = inner.unwrap_err();
-    assert!(matches!(err, NotInternableError::RelativePath(_)));
-    assert_eq!(err.to_string(), headline);
+    assert!(!err.is_empty());
+    assert!(err
+        .iter()
+        .all(|item| item.reason != Reason::SelfWithoutMeaning));
+    assert_eq!(messages(&err), headline);
     assert!(
-        err.note()
+        err[0]
+            .note()
             .unwrap()
             .contains("the `Self` of the trait `Tr < T >`"),
         "{:?}",
-        err.note()
+        err[0].note()
     );
     assert_eq!(leaker.finish().iter().count(), 0);
     // A scope that declares no `Self` keeps the one of the trait, but a default has none.
@@ -711,7 +730,7 @@ fn a_default_with_an_outer_bound_on_the_self_of_a_trait_is_an_error() {
                 .map(|_| ())
         })
         .unwrap();
-    assert_eq!(inner.unwrap_err().to_string(), headline);
+    assert_eq!(messages(&inner.unwrap_err()), headline);
 }
 
 // ── the Referrer ─────────────────────────────────────────────────────────────────────────────

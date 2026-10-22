@@ -147,6 +147,7 @@ impl<'ast> Visit<'ast> for View<'_> {
         visit_item_type: ItemType,
         visit_item_union: ItemUnion,
         visit_lifetime: Lifetime,
+        visit_macro: Macro,
         visit_parenthesized_generic_arguments: ParenthesizedGenericArguments,
         visit_path: Path,
         visit_predicate_type: PredicateType,

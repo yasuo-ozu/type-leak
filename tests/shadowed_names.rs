@@ -108,7 +108,7 @@ fn analyze_item(leaker: &mut Leaker, item: &Item) -> std::result::Result<Context
         Item::Impl(i) => leaker.intern_impl(i, true),
         _ => unreachable!(),
     }
-    .map_err(|e| e.to_string())
+    .map_err(|e| messages(&e))
 }
 
 /// How an item is analyzed: by its `intern_*` method, or through the scope of a macro.
@@ -136,17 +136,17 @@ fn round_trip(source: &str, scope: Scope) {
         (Scope::Mod, _) => leaker
             .enter_mod("m", [name], |view| view.visit_item(&item))
             .map(|(context, ())| context)
-            .map_err(|e| e.to_string()),
+            .map_err(|e| messages(&e)),
         (Scope::Generics, Item::Struct(i)) => leaker
             .enter_generics(&i.generics, |view| syn::visit::visit_item_struct(view, i))
             .map(|(context, ())| context)
-            .map_err(|e| e.to_string()),
+            .map_err(|e| messages(&e)),
         (Scope::Generics, Item::Trait(i)) => leaker
             .enter_trait(&i.ident, &i.generics, true, |view| {
                 syn::visit::visit_item_trait(view, i)
             })
             .map(|(context, ())| context)
-            .map_err(|e| e.to_string()),
+            .map_err(|e| messages(&e)),
         _ => unreachable!(),
     };
     let context = analyzed.unwrap_or_else(|e| panic!("{:?} {}: {}", scope, source, e));
@@ -357,7 +357,7 @@ fn module_copy(source: &str) -> (Referrer, File, BTreeSet<usize>) {
     let mut leaker = Leaker::from_config(config());
     let context = leaker
         .intern_mod(&item)
-        .unwrap_or_else(|e| panic!("{}: {}", source, e));
+        .unwrap_or_else(|e| panic!("{}: {}", source, messages(&e)));
     let referrer = through_tokens(leaker.finish());
     let mut file = File {
         shebang: None,
@@ -583,6 +583,15 @@ fn unprefixed(text: &str) -> String {
     text
 }
 
+/// The messages of `errors`, one on each line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Analyzes `item` in `scope` (`declared`: the names the module declares, with `Scope::Mod`).
 fn outcome(item: &Item, scope: Scope, declared: &[&str]) -> Outcome {
     let mut leaker = Leaker::from_config(config());
@@ -643,9 +652,9 @@ fn outcome(item: &Item, scope: Scope, declared: &[&str]) -> Outcome {
             }
         }
         Err(error) => Outcome::Rejected {
-            headline: unprefixed(&error.to_string()),
-            note: error.note().map(|note| unprefixed(&note)),
-            help: error.help().map(|help| unprefixed(&help)),
+            headline: unprefixed(&messages(&error)),
+            note: error[0].note().map(unprefixed),
+            help: error[0].help_text().map(unprefixed),
         },
     }
 }

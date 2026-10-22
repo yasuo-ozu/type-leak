@@ -1,6 +1,6 @@
 //! Helpers for inspecting paths and types.
 
-use crate::error::ABSOLUTE_PATHS;
+use crate::error::{Cause, ABSOLUTE_PATHS};
 use proc_macro2::TokenStream;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -463,9 +463,10 @@ pub(crate) fn or_list(options: Vec<String>) -> String {
 /// `<Self as ..>`), or the name in the tokens of a macro. `::p::Self` is not one.
 #[derive(Default)]
 struct SelfFinder {
-    found: Vec<TokenStream>,
+    /// The mentions, as the syntax they are: a type, the trait of a bound or a value.
+    found: Vec<Cause>,
     /// The paths of `found` with an item after `Self` (`Self::X`).
-    associated: Vec<TokenStream>,
+    associated: Vec<Cause>,
 }
 
 impl SelfFinder {
@@ -474,20 +475,43 @@ impl SelfFinder {
         let mut names = HashSet::new();
         token_names(tokens, &mut names);
         if names.contains("Self") {
-            self.found.push(quote!(Self));
+            self.found.push(Cause::self_type());
         }
+    }
+
+    /// Records `path` if it starts with `Self`, as the syntax `cause` makes of it, and goes on with
+    /// its arguments.
+    fn path<'ast>(&mut self, path: &'ast Path, cause: fn(&Path) -> Cause) {
+        if path.leading_colon.is_none()
+            && path.segments.first().map_or(false, |s| s.ident == "Self")
+        {
+            self.found.push(cause(path));
+            if path.segments.len() > 1 {
+                self.associated.push(cause(path));
+            }
+        }
+        syn::visit::visit_path(self, path)
     }
 }
 
 impl<'ast> Visit<'ast> for SelfFinder {
+    /// A path that is none of the following: a value (in a pattern, a struct literal or an
+    /// expression).
     fn visit_path(&mut self, i: &'ast Path) {
-        if i.leading_colon.is_none() && i.segments.first().map_or(false, |s| s.ident == "Self") {
-            self.found.push(quote!(#i));
-            if i.segments.len() > 1 {
-                self.associated.push(quote!(#i));
-            }
+        self.path(i, Cause::expr_path)
+    }
+    fn visit_type_path(&mut self, i: &'ast TypePath) {
+        if let Some(qself) = &i.qself {
+            self.visit_qself(qself);
         }
-        syn::visit::visit_path(self, i)
+        self.path(&i.path, Cause::type_path)
+    }
+    fn visit_trait_bound(&mut self, i: &'ast TraitBound) {
+        self.visit_trait_bound_modifier(&i.modifier);
+        if let Some(lifetimes) = &i.lifetimes {
+            self.visit_bound_lifetimes(lifetimes);
+        }
+        self.path(&i.path, |path| Cause::Trait(path.clone()))
     }
     fn visit_macro(&mut self, i: &'ast Macro) {
         self.scan(i.tokens.clone());
@@ -552,16 +576,16 @@ pub(crate) fn without_self_bounds(predicate: &WherePredicate) -> Option<WherePre
 
 /// The mentions of `Self` in a generic parameter or a where predicate.
 pub(crate) struct SelfMentions {
-    pub(crate) first: Option<TokenStream>,
+    pub(crate) first: Option<Cause>,
     /// The first `Self::X`, an associated item of `Self`.
-    pub(crate) associated: Option<TokenStream>,
+    pub(crate) associated: Option<Cause>,
 }
 
 impl From<SelfFinder> for SelfMentions {
     fn from(finder: SelfFinder) -> Self {
         Self {
-            first: finder.found.into_iter().next(),
-            associated: finder.associated.into_iter().next(),
+            first: finder.found.first().cloned(),
+            associated: finder.associated.first().cloned(),
         }
     }
 }
@@ -578,25 +602,25 @@ pub(crate) fn self_in_predicate(predicate: &WherePredicate) -> SelfMentions {
     finder.into()
 }
 
-pub(crate) fn first_self_in_generics(generics: &Generics) -> Option<TokenStream> {
+pub(crate) fn first_self_in_generics(generics: &Generics) -> Option<Cause> {
     selves_in_generics(generics).into_iter().next()
 }
 
 /// Returns the mentions of `Self` in the bounds, defaults and where predicates of `generics`.
-pub(crate) fn selves_in_generics(generics: &Generics) -> Vec<TokenStream> {
+pub(crate) fn selves_in_generics(generics: &Generics) -> Vec<Cause> {
     let mut finder = SelfFinder::default();
     finder.visit_generics(generics);
     finder.found
 }
 
-pub(crate) fn first_self_in_type(ty: &Type) -> Option<TokenStream> {
+pub(crate) fn first_self_in_type(ty: &Type) -> Option<Cause> {
     let mut finder = SelfFinder::default();
     finder.visit_type(ty);
     finder.found.into_iter().next()
 }
 
 /// Returns the first `Self::X` in the bounds, defaults and where predicates of `generics`.
-pub(crate) fn first_associated_self_in_generics(generics: &Generics) -> Option<TokenStream> {
+pub(crate) fn first_associated_self_in_generics(generics: &Generics) -> Option<Cause> {
     let mut finder = SelfFinder::default();
     finder.visit_generics(generics);
     finder.associated.into_iter().next()

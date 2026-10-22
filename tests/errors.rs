@@ -1,14 +1,44 @@
 //! Tests for how `type-leak` reports inputs it cannot handle.
 //!
 //! - `limit_*`: inputs which cannot be leaked on stable Rust. `type-leak` must reject them with
-//!   [`NotInternableError`].
+//!   [`ErrorItem`]s.
 //! - `limit_*`, recording behavior: inputs which cannot be handled exactly without name resolution
 //!   (e.g. shadowed primitive names), and how they are detected.
 
 use std::collections::BTreeSet;
 use syn::*;
-use template_quote::quote;
+use template_quote::{quote, ToTokens};
 use type_leak::*;
+
+/// The messages of the errors, one per line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The word that names the kind of a cause.
+fn kind(cause: &Cause) -> &'static str {
+    match cause {
+        Cause::Type(_) => "type",
+        Cause::Trait(_) => "trait",
+        Cause::Expr(_) => "expr",
+        Cause::Macro(_) => "macro",
+        Cause::Lifetime(_) => "lifetime",
+        Cause::Unreadable(_) => "unreadable",
+        other => panic!("{:?}", other),
+    }
+}
+
+/// The notes of an item, as the text of the tokens they are about and the note.
+fn notes_of(item: &ErrorItem) -> Vec<(String, String)> {
+    item.notes
+        .iter()
+        .map(|(at, note)| (at.to_string(), note.clone()))
+        .collect()
+}
 
 fn leaker_config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
@@ -21,7 +51,7 @@ fn leak_trait(item_trait: &ItemTrait) -> std::result::Result<BTreeSet<String>, S
     let mut leaker = Leaker::from_config(leaker_config());
     leaker
         .intern_trait(item_trait, true)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| messages(&e))?;
     leaker.reduce_roots();
     Ok(leaker
         .finish()
@@ -248,7 +278,7 @@ fn leak_error_default(item_trait: &ItemTrait) -> Option<(String, Option<String>)
     leaker
         .intern_trait(item_trait, true)
         .err()
-        .map(|e| (e.to_string(), e.help()))
+        .map(|e| (messages(&e), e[0].help_text().map(str::to_string)))
 }
 
 fn error(message: &str, help: Option<&str>) -> Option<(String, Option<String>)> {
@@ -371,7 +401,7 @@ fn help_for_a_path_that_is_not_in_the_prelude() {
     .unwrap();
     let err = Leaker::new().intern_trait(&item, true).unwrap_err();
     let helps: Vec<_> = err
-        .items()
+        .iter()
         .map(|item| item.help_text().unwrap().to_string())
         .collect();
     assert_eq!(
@@ -393,7 +423,7 @@ fn help_in_syn_error() {
     })
     .unwrap();
     let mut leaker = Leaker::new();
-    let err: syn::Error = leaker.intern_trait(&item, true).err().unwrap().into();
+    let err = to_syn_error(&leaker.intern_trait(&item, true).err().unwrap());
     assert_eq!(
         err.to_string(),
         "use absolute path: 'Clone'\n\n  = help: use `::core::clone::Clone` instead of `Clone`\n"
@@ -404,7 +434,7 @@ fn help_in_syn_error() {
     })
     .unwrap();
     let mut leaker = Leaker::new();
-    let err: syn::Error = leaker.intern_trait(&item, true).err().unwrap().into();
+    let err = to_syn_error(&leaker.intern_trait(&item, true).err().unwrap());
     assert_eq!(
         err.to_string(),
         "use absolute path: 'MyBound'\n\n  = help: write `MyBound` with an absolute path (e.g. \
@@ -413,7 +443,7 @@ fn help_in_syn_error() {
 }
 
 #[test]
-fn error_to_tokens() {
+fn error_to_compile_error() {
     // The error is emitted as `compile_error!` with the help, as `syn::Error` is.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait: Clone {}
@@ -421,14 +451,19 @@ fn error_to_tokens() {
     .unwrap();
     let mut leaker = Leaker::new();
     let err = leaker.intern_trait(&item, true).err().unwrap();
-    let tokens = quote!(#err).to_string();
+    let tokens = err[0].to_compile_error().to_string();
     assert!(tokens.contains("compile_error"), "{}", tokens);
     assert!(
         tokens.contains("= help: use `::core::clone::Clone` instead of `Clone`"),
         "{}",
         tokens
     );
-    assert_eq!(tokens, syn::Error::from(err).to_compile_error().to_string());
+    assert_eq!(
+        tokens,
+        syn::Error::from(err[0].clone())
+            .to_compile_error()
+            .to_string()
+    );
 }
 
 #[test]
@@ -460,7 +495,7 @@ fn help_for_trait_bounds() {
 
 #[test]
 fn all_relative_paths_are_reported() {
-    // Every relative path which cannot be leaked is reported at once, each as a conflict.
+    // Every relative path which cannot be leaked is reported at once, each as an error.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait: Clone + MyBound {
             fn f(&self, x: MyType<'_>);
@@ -469,43 +504,41 @@ fn all_relative_paths_are_reported() {
     .unwrap();
     let mut leaker = Leaker::new();
     let err = leaker.intern_trait(&item, true).err().unwrap();
-    let conflicts = match &err {
-        NotInternableError::RelativePath(conflicts) => conflicts,
-        _ => panic!("{:?}", err),
-    };
-    let strings = |tokens: &Vec<proc_macro2::TokenStream>| -> Vec<String> {
-        tokens.iter().map(|t| t.to_string()).collect()
-    };
+    assert!(err.iter().all(|item| item.reason == Reason::RelativePath));
+    // The cause of each is the whole bound or type that is a conflict (a trait is its own path:
+    // it needs no note), and what stops the type from being leaked as a whole is a note.
     assert_eq!(
-        conflicts
-            .iter()
-            .map(|c| (strings(&c.must), strings(&c.impossible), c.is_own))
+        err.iter()
+            .map(|item| (
+                kind(&item.cause),
+                item.cause.to_token_stream().to_string(),
+                notes_of(item)
+            ))
             .collect::<Vec<_>>(),
         vec![
-            (vec!["Clone".to_string()], vec!["Clone".to_string()], true),
+            ("trait", "Clone".to_string(), vec![]),
+            ("trait", "MyBound".to_string(), vec![]),
             (
-                vec!["MyBound".to_string()],
-                vec!["MyBound".to_string()],
-                true
-            ),
-            (
-                vec!["MyType < '_ >".to_string()],
-                vec!["'_".to_string()],
-                true
+                "type",
+                "MyType < '_ >".to_string(),
+                vec![(
+                    "'_".to_string(),
+                    "it cannot be leaked as a whole because of `'_`".to_string()
+                )]
             ),
         ]
     );
     assert_eq!(
-        err.to_string(),
+        messages(&err),
         "use absolute path: 'Clone'\nuse absolute path: 'MyBound'\nuse absolute path: 'MyType < '_ >'"
     );
     // The first error and its help.
     assert_eq!(
-        err.help().as_deref(),
+        err[0].help_text(),
         Some("use `::core::clone::Clone` instead of `Clone`")
     );
     // Each error is a separate `syn::Error`, with its own notes and help.
-    let syn_err: syn::Error = err.into();
+    let syn_err = to_syn_error(&err);
     assert_eq!(
         syn_err.into_iter().map(|e| e.to_string()).collect::<Vec<_>>(),
         vec![
@@ -529,15 +562,15 @@ fn notes_explain_conflicts() {
     let err = Leaker::new().intern_trait(&item, true).err().unwrap();
     // The suggestion of the absolute path is the help.
     assert_eq!(
-        err.help().as_deref(),
+        err[0].help_text(),
         Some("use `::std::boxed::Box` instead of `Box`")
     );
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some("it cannot be leaked as a whole because of `'_`")
     );
     assert_eq!(
-        syn::Error::from(err).to_string(),
+        to_syn_error(&err).to_string(),
         "use absolute path: 'Box < dyn RelA + RelB < '_ > >'\n\n\
          \x20 = note: it cannot be leaked as a whole because of `'_`\n\
          \x20 = note: `RelA` also depends on the type context\n\
@@ -559,12 +592,15 @@ fn a_conflict_that_is_not_about_the_path_has_a_headline_of_its_own() {
     .unwrap();
     let err = Leaker::new().intern_trait(&item, true).err().unwrap();
     assert_eq!(
-        err.to_string(),
+        messages(&err),
         "`Wrap < 'b >` leaves the lifetime `'b` of the method unconstrained in the copy (E0195)\n\
          `RelTrait` leaves the lifetime `'c` of the method unconstrained in the copy (E0195)"
     );
+    assert!(err
+        .iter()
+        .all(|item| item.reason == Reason::UnconstrainedLifetime));
     // The note says why.
-    let items: Vec<_> = err.items().collect();
+    let items = &err;
     assert!(items[0].note().unwrap().starts_with("it names `'b`"));
     assert!(items[1]
         .note()
@@ -581,11 +617,12 @@ fn a_conflict_that_is_not_about_the_path_has_a_headline_of_its_own() {
     .unwrap();
     let err = Leaker::new().intern_trait(&item, false).err().unwrap();
     assert_eq!(
-        err.to_string(),
+        messages(&err),
         "`Wrap < T >` has a generic whose bound mentions `Self`, which cannot be leaked"
     );
+    assert_eq!(err[0].reason, Reason::DeniedSelfInBounds);
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
 
@@ -597,7 +634,8 @@ fn a_conflict_that_is_not_about_the_path_has_a_headline_of_its_own() {
     })
     .unwrap();
     let err = Leaker::new().intern_trait(&item, true).err().unwrap();
-    assert_eq!(err.to_string(), "use absolute path: 'MyType < '_ >'");
+    assert_eq!(messages(&err), "use absolute path: 'MyType < '_ >'");
+    assert_eq!(err[0].reason, Reason::RelativePath);
 }
 
 #[test]
@@ -615,7 +653,7 @@ fn a_type_that_is_leaked_alone_is_no_cause_of_the_conflict_around_it() {
             .unwrap()
     };
     let err = leak(parse_quote!(<Self as super::Tr<u8>>::X));
-    let items: Vec<_> = err.items().collect();
+    let items = &err;
     assert_eq!(items.len(), 1);
     assert_eq!(
         items[0].message,
@@ -632,7 +670,7 @@ fn a_type_that_is_leaked_alone_is_no_cause_of_the_conflict_around_it() {
     // The paths that are no entry on their own are still listed: the type around `u8` is leaked
     // whole (`Rel`, relative), and what it holds cannot be (`Tr`, with `Self`).
     let err = leak(parse_quote!(Rel<<Self as Tr<u8>>::X>));
-    let items: Vec<_> = err.items().collect();
+    let items = &err;
     assert_eq!(items.len(), 1);
     assert_eq!(
         items[0]
@@ -658,7 +696,7 @@ fn a_closure_in_an_array_length_cannot_be_leaked_as_a_whole() {
     };
     let mut leaker = Leaker::from_config(leaker_config());
     let err = leaker.intern_trait(&item, true).unwrap_err();
-    let items: Vec<_> = err.items().collect();
+    let items = &err;
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].message, "use absolute path: 'a'");
     assert_eq!(

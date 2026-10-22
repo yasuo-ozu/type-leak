@@ -101,7 +101,7 @@ fn new_leaker() -> Leaker {
 }
 
 /// Analyzes `item` with `intern_*`.
-fn intern(leaker: &mut Leaker, item: &Item) -> std::result::Result<ContextId, NotInternableError> {
+fn intern(leaker: &mut Leaker, item: &Item) -> std::result::Result<ContextId, Vec<ErrorItem>> {
     match item {
         Item::Struct(item) => leaker.intern_struct(item, true),
         Item::Trait(item) => leaker.intern_trait(item, true),
@@ -116,35 +116,49 @@ fn string<T: template_quote::ToTokens>(t: &T) -> String {
 }
 
 /// Asserts that the Leaker rejected `item`, with exactly the `messages` (the headline of each error,
-/// in order: the `Display` of the error is these, one per line), and returns the error.
+/// in order, joined with a line break by `joined_messages()`), and returns the errors.
 ///
 /// A bug input has to be rejected. A loop that skips the rejected items (`let Ok(..) = .. else {
 /// continue }`) runs its oracle on none of them, and pins nothing: it would be the same if the
 /// rejection regressed, and the oracle runs for the items that are accepted only.
 fn assert_rejected<T>(
     item: &impl template_quote::ToTokens,
-    result: std::result::Result<T, NotInternableError>,
+    result: std::result::Result<T, Vec<ErrorItem>>,
     messages: &[&str],
-) -> NotInternableError {
+) -> Vec<ErrorItem> {
     let err = match result {
         Ok(_) => panic!("`{}` is accepted, and it does not compile", string(item)),
         Err(err) => err,
     };
-    assert_eq!(err.to_string(), messages.join("\n"), "`{}`", string(item));
+    assert_eq!(
+        joined_messages(&err),
+        messages.join("\n"),
+        "`{}`",
+        string(item)
+    );
     err
 }
 
+/// The messages of `errors`, one per line.
+fn joined_messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The notes of all the errors of `err`, in order.
-fn all_notes(err: &NotInternableError) -> Vec<String> {
-    err.items()
-        .flat_map(|item| item.notes.into_iter().map(|(_, note)| note))
+fn all_notes(err: &[ErrorItem]) -> Vec<String> {
+    err.iter()
+        .flat_map(|item| item.notes.iter().map(|(_, note)| note.clone()))
         .collect()
 }
 
 /// The helps of all the errors of `err`, in order.
-fn all_helps(err: &NotInternableError) -> Vec<String> {
-    err.items()
-        .filter_map(|item| item.help.map(|(_, help)| help))
+fn all_helps(err: &[ErrorItem]) -> Vec<String> {
+    err.iter()
+        .filter_map(|item| item.help.as_ref().map(|(_, help)| help.clone()))
         .collect()
 }
 
@@ -187,11 +201,11 @@ enum Blames<'a> {
 /// self type of an impl.
 fn assert_unstable<T>(
     item: &impl template_quote::ToTokens,
-    result: std::result::Result<T, NotInternableError>,
+    result: std::result::Result<T, Vec<ErrorItem>>,
     ty: &str,
     bound: &str,
     blames: Blames,
-) -> NotInternableError {
+) -> Vec<ErrorItem> {
     // What the bound names, after "the bound `..` of its generics".
     let names = |blames: Blames| match blames {
         Blames::SelfType => "names `Self`, which the copy writes as the self type of the impl, a \
@@ -598,8 +612,12 @@ fn f02_bound_names_leaked_type_env_cycle() {
         }
     );
     let mut leaker = new_leaker();
-    let context = intern(&mut leaker, &control)
-        .unwrap_or_else(|e| panic!("the control is rejected, though it compiles: {}", e));
+    let context = intern(&mut leaker, &control).unwrap_or_else(|e| {
+        panic!(
+            "the control is rejected, though it compiles: {}",
+            joined_messages(&e)
+        )
+    });
     let referrer = leaker.finish();
     let mut copy = control.clone();
     referrer
@@ -837,7 +855,7 @@ fn f05_inferred_outlives_of_self_type() {
 /// The context says that `Self` is `u8`, and nothing says which trait `A` belongs to. Found by the
 /// property test with `TYPE_LEAK_PROP_FEATURES=impl_assoc_self`.
 ///
-/// The assertion: the Leaker rejects the impl with a `NotInternableError` (also if only a bound of
+/// The assertion: the Leaker rejects the impl with a `Vec<ErrorItem>` (also if only a bound of
 /// the generics of the entry names `Self::A`), and says so in the headline. A type that names
 /// `Self::A` is never leaked whole, so where it holds no path that must be leaked
 /// (`Vec<Self::A>`) it is copied as written and works, and where it does (`fn(Rel) -> Self::A`)
@@ -862,12 +880,12 @@ fn f06_impl_assoc_type_of_self_in_repeater() {
     };
     // The headline says what to write, with the trait of the impl.
     assert_eq!(
-        err.to_string(),
+        joined_messages(&err),
         "write `<Self as ::leaker::m::Tr>::A` instead of `Self::A` in `Rel<Self::A>`: the copy \
          cannot tell which trait `A` comes from"
     );
     assert_eq!(
-        err.help().as_deref(),
+        err[0].help_text(),
         Some("replace `Self::A` with `<Self as ::leaker::m::Tr>::A`")
     );
 
@@ -879,7 +897,7 @@ fn f06_impl_assoc_type_of_self_in_repeater() {
         }
     };
     let err = new_leaker().intern_impl(&item, true).unwrap_err();
-    let messages: Vec<String> = err.items().map(|item| item.message).collect();
+    let messages: Vec<&str> = err.iter().map(|item| item.message.as_str()).collect();
     assert_eq!(
         messages[..2],
         [
@@ -940,7 +958,7 @@ fn f06_impl_assoc_type_of_self_in_repeater() {
 /// reports an error for a trait object leaked as a whole, and the same holds for a leaked path.
 /// Found by the property test with `TYPE_LEAK_PROP_FEATURES=method_lifetime_paths`.
 ///
-/// The assertion: the Leaker rejects those traits with a `NotInternableError` that has the E0195
+/// The assertion: the Leaker rejects those traits with a `Vec<ErrorItem>` that has the E0195
 /// note: a type leaked whole holds `'x` in the copy, and no other input constrains it as written.
 /// `a: &'x u8` keeps `'x`, so that trait is accepted (the control), as are the other exemptions: the
 /// receiver keeps it, a type that is not leaked keeps it (`Option<&'x str>`, a function pointer),
@@ -973,7 +991,7 @@ fn f07_method_lifetime_in_leaked_path() {
     ];
     for item in rejected {
         let err = new_leaker().intern_trait(&item, true).unwrap_err();
-        let note = err.note().unwrap();
+        let note = err[0].note().unwrap();
         assert!(
             note.contains("`'x`") && note.contains("(E0195)"),
             "`{}`: {}",
@@ -1553,7 +1571,7 @@ impl<'ast> Visit<'ast> for Signatures {
 
 /// The entries of `item` and its copy, made as a macro does: each entry is replaced by the
 /// projection of the Repeater, with the arguments of the entry encoded by `RepeaterSlots`.
-fn f12_copy(item: &ItemTrait) -> std::result::Result<(Vec<String>, ItemTrait), NotInternableError> {
+fn f12_copy(item: &ItemTrait) -> std::result::Result<(Vec<String>, ItemTrait), Vec<ErrorItem>> {
     f12_copy_with(new_leaker(), item)
 }
 
@@ -1561,7 +1579,7 @@ fn f12_copy(item: &ItemTrait) -> std::result::Result<(Vec<String>, ItemTrait), N
 fn f12_copy_with(
     mut leaker: Leaker,
     item: &ItemTrait,
-) -> std::result::Result<(Vec<String>, ItemTrait), NotInternableError> {
+) -> std::result::Result<(Vec<String>, ItemTrait), Vec<ErrorItem>> {
     let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     let context = leaker.intern_trait(item, true)?;
     let referrer = leaker.finish();
@@ -1694,7 +1712,7 @@ fn f12_elided_lifetime_in_fn_sugar_with_generics() {
         let err = f12_copy(&item)
             .err()
             .unwrap_or_else(|| panic!("{} is accepted", string(&item)));
-        let note = err.note().unwrap();
+        let note = err[0].note().unwrap();
         assert!(note.contains("E0106"), "{}: {}", string(&item), note);
     }
 }
@@ -1973,7 +1991,7 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
             Err(err) => err,
         };
         let headline = "is in the self type of the impl, and a bound of its generics names `Self`";
-        let (shown, note) = (err.to_string(), err.note().unwrap());
+        let (shown, note) = (joined_messages(&err), err[0].note().unwrap());
         assert!(shown.contains(headline), "{}: {}", string(item), shown);
         assert!(
             note.contains("has no type to write for `Self`"),
@@ -1987,7 +2005,7 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
         let module: ItemMod = parse_quote!(mod m { #item });
         let err = f13_leaker().intern_mod(&module).err();
         assert!(
-            err.map_or(false, |err| err.to_string().contains(headline)),
+            err.map_or(false, |err| joined_messages(&err).contains(headline)),
             "{}",
             string(item)
         );
@@ -1998,7 +2016,7 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
         assert!(
             outcome
                 .err()
-                .map_or(false, |err| err.to_string().contains(headline)),
+                .map_or(false, |err| joined_messages(&err).contains(headline)),
             "{}",
             string(item)
         );
@@ -2010,14 +2028,13 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
         impl<'a, T: AsRef<Self>> ::p::Tr for ::p::W<&'a (Rel2, T)> {}
     );
     let err = f13_leaker().intern_impl(&item, true).err();
-    assert!(err.map_or(false, |err| err
-        .to_string()
+    assert!(err.map_or(false, |err| joined_messages(&err)
         .contains("`& 'a (Rel2 , T)` is in the self type of the impl")));
     for item in copied.iter().chain(&controls) {
         let mut leaker = f13_leaker();
         let context = leaker
             .intern_impl(item, true)
-            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), e));
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), joined_messages(&e)));
         let referrer = leaker.finish();
         assert!(
             self_referential_entries(&referrer).is_empty(),
@@ -2106,7 +2123,7 @@ impl<'ast> Visit<'ast> for SelfProjectionsInPredicates {
 
 /// The copy of `item` that a macro makes (the entries replaced by `P<ix>`), with a strict Referrer
 /// or not, and whether the Leaker accepts `item`.
-fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, NotInternableError> {
+fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, Vec<ErrorItem>> {
     let mut config = LeakerConfig::new();
     config.allow_primitive().allow_std_prelude();
     config.allowed_paths.push(parse_quote!(::p));
@@ -2284,7 +2301,7 @@ fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
                 panic!(
                     "`{}` is rejected, and it is not expected to be: {}",
                     string(item),
-                    e
+                    joined_messages(&e)
                 )
             }),
         };
@@ -2303,8 +2320,13 @@ fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
         );
     }
     for (item, strict) in &controls {
-        let copy = f14_copy(item, *strict)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        let copy = f14_copy(item, *strict).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
         let mut projections = SelfProjectionsInPredicates::default();
         projections.visit_item_impl(&copy);
         let mut bounds = EntryMentions::default();
@@ -2326,7 +2348,7 @@ fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
 fn f15_copy(
     item: &Item,
     allow_self: bool,
-) -> std::result::Result<(Vec<String>, Item), NotInternableError> {
+) -> std::result::Result<(Vec<String>, Item), Vec<ErrorItem>> {
     let (ident, generics) = match item {
         Item::Struct(i) => (&i.ident, &i.generics),
         Item::Enum(i) => (&i.ident, &i.generics),
@@ -2440,7 +2462,7 @@ fn f15_self_rewritten_in_elided_signature() {
                     "`{}` is rejected (allow_self = {}): {}",
                     string(&item),
                     allow_self,
-                    e
+                    joined_messages(&e)
                 )
             });
             assert!(entries.is_empty(), "{}: {:?}", string(&item), entries);
@@ -2487,7 +2509,7 @@ fn f15_self_rewritten_in_elided_signature() {
         let err = f15_copy(&item, false)
             .err()
             .unwrap_or_else(|| panic!("{} is accepted", string(&item)));
-        let note = err.note().unwrap();
+        let note = err[0].note().unwrap();
         assert!(note.contains("E0106"), "{}: {}", string(&item), note);
     }
     // An entry that adds lifetimes to the inputs makes the signature the holder, as in F12: here
@@ -2574,8 +2596,13 @@ fn f15_self_rewritten_in_elided_signature() {
         ),
     ] {
         let item: Item = item;
-        let (entries, copy) = f15_copy(&item, true)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(&item), e));
+        let (entries, copy) = f15_copy(&item, true).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(&item),
+                joined_messages(&e)
+            )
+        });
         let mut signatures = Signatures::default();
         signatures.visit_item(&copy);
         assert!(
@@ -2605,7 +2632,7 @@ fn f15_self_rewritten_in_elided_signature() {
         let err = f15_copy(&item, true)
             .err()
             .unwrap_or_else(|| panic!("{} is accepted", string(&item)));
-        let note = err.note().unwrap();
+        let note = err[0].note().unwrap();
         assert!(note.contains("E0106"), "{}: {}", string(&item), note);
     }
     // The copy of an impl keeps `Self`, and so does that of a trait, whose `Self::A` is written
@@ -2787,7 +2814,7 @@ fn f16_implied_outlives_of_self_projection_lost() {
         let mut leaker = new_leaker();
         let context = leaker
             .intern_trait(item, true)
-            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), e));
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), joined_messages(&e)));
         let referrer = leaker.finish();
         let mut checked = 0;
         for ix in 0..referrer.iter().count() {
@@ -2993,7 +3020,7 @@ fn f17_optional_entry_in_own_context() {
         let mut leaker = new_leaker();
         leaker
             .intern_struct(item, true)
-            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), e));
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), joined_messages(&e)));
         let referrer = leaker.finish();
         assert!(
             entries_in_own_context(&referrer).is_empty(),
@@ -3114,7 +3141,7 @@ impl<'ast> Visit<'ast> for ReplacementsInPredicates {
 }
 
 /// The copy of `item` that a macro makes: the entries replaced by `P<ix>`.
-fn f19_copy(item: &Item) -> std::result::Result<(Referrer, Item), NotInternableError> {
+fn f19_copy(item: &Item) -> std::result::Result<(Referrer, Item), Vec<ErrorItem>> {
     f19_copy_with(new_leaker(), item)
 }
 
@@ -3123,7 +3150,7 @@ fn f19_copy(item: &Item) -> std::result::Result<(Referrer, Item), NotInternableE
 fn f19_copy_with(
     mut leaker: Leaker,
     item: &Item,
-) -> std::result::Result<(Referrer, Item), NotInternableError> {
+) -> std::result::Result<(Referrer, Item), Vec<ErrorItem>> {
     let context = match item {
         Item::Impl(i) => leaker.intern_impl(i, true)?,
         Item::Trait(i) => leaker.intern_trait(i, true)?,
@@ -3275,8 +3302,13 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
         assert_unstable(item, f19_copy(item), ty, bound, blames);
     }
     for item in &controls {
-        let (referrer, copy) = f19_copy(item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        let (referrer, copy) = f19_copy(item).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
         assert!(
             entries_with_self_bound_in_predicates(&referrer, &copy, self_is_leaked).is_empty(),
             "{}",
@@ -3342,8 +3374,13 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
         ),
     ];
     for item in &by_parts_controls {
-        let (referrer, copy) = f19_copy_with(f13_leaker(), item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        let (referrer, copy) = f19_copy_with(f13_leaker(), item).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
         assert!(
             entries_with_self_bound_in_predicates(&referrer, &copy, self_is_leaked).is_empty(),
             "{}",
@@ -3464,8 +3501,13 @@ fn f20_trait_assoc_in_bound_of_entry_in_predicate() {
         assert_unstable(item, f19_copy(item), ty, bound, blames);
     }
     for item in &controls {
-        let (referrer, copy) = f19_copy(item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        let (referrer, copy) = f19_copy(item).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
         assert!(
             entries_with_self_bound_in_predicates(&referrer, &copy, bound).is_empty(),
             "{}",
@@ -3562,7 +3604,7 @@ fn f21_iterator_item_in_bound_of_entry_in_item_binding() {
     let check = |item: &Item| {
         let (referrer, copy) = f19_copy(item)?;
         let found = entries_naming_item(&referrer, &copy);
-        Ok::<_, NotInternableError>((copy, found))
+        Ok::<_, Vec<ErrorItem>>((copy, found))
     };
     // Each is rejected: no copy of it exists whose predicate names such an entry.
     let blamed = [
@@ -3582,8 +3624,13 @@ fn f21_iterator_item_in_bound_of_entry_in_item_binding() {
         assert_unstable(item, check(item), ty, bound, blames);
     }
     for item in &controls {
-        let (copy, found) = check(item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        let (copy, found) = check(item).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
         assert!(found.is_empty(), "{}", string(&copy));
     }
 }
@@ -3665,7 +3712,7 @@ fn f22_method_lifetime_in_free_function_and_inherent_method() {
     ));
     for item in &rejected {
         let err = intern(&mut f13_leaker(), item).unwrap_err();
-        let note = err.note().unwrap();
+        let note = err[0].note().unwrap();
         assert!(
             note.contains("(E0195)"),
             "`{}` is rejected, but not for E0195: {}",
@@ -3724,8 +3771,8 @@ fn f22_method_lifetime_in_free_function_and_inherent_method() {
             panic!(
                 "`{}` is rejected, and its copy compiles: {}\n{}",
                 string(item),
-                err,
-                err.note().unwrap_or_default()
+                joined_messages(&err),
+                err[0].note().unwrap_or_default()
             );
         }
     }
@@ -3750,15 +3797,14 @@ fn f22_method_lifetime_in_free_function_and_inherent_method() {
         f13_leaker().enter_mod("m", [], |view| view.visit_item(&Item::Impl(item.clone())))
     };
     nested(&inherent).unwrap();
-    assert!(nested(&of_trait)
-        .unwrap_err()
+    assert!(nested(&of_trait).unwrap_err()[0]
         .note()
         .unwrap()
         .contains("(E0195)"));
     let err = f13_leaker()
         .enter_generics(&Generics::default(), |view| view.visit_signature(&method))
         .unwrap_err();
-    assert!(err.note().unwrap().contains("(E0195)"));
+    assert!(err[0].note().unwrap().contains("(E0195)"));
 }
 
 // ── F23 ──────────────────────────────────────────────────────────────────────
@@ -3901,8 +3947,8 @@ fn f23_self_in_elided_signature_where_referrer_can_rewrite() {
                 "`{}` is rejected (allow_self = {}), and its copy compiles with `for<'e>`: {}\n{}",
                 string(item),
                 allow_self,
-                e,
-                e.note().unwrap_or_default()
+                joined_messages(&e),
+                e[0].note().unwrap_or_default()
             )
         });
         assert!(entries.is_empty(), "{}: {:?}", string(item), entries);
@@ -4003,8 +4049,8 @@ fn f24_self_in_predicate_with_leaked_bound_of_unused_generic() {
                 panic!(
                     "`{}` is rejected, and it compiles with the parts as entries: {}\n{}",
                     string(item),
-                    e,
-                    e.note().unwrap_or_default()
+                    joined_messages(&e),
+                    e[0].note().unwrap_or_default()
                 )
             });
         let mut entries: Vec<String> = referrer.iter().map(string).collect();
@@ -4041,7 +4087,7 @@ fn f24_self_in_predicate_with_leaked_bound_of_unused_generic() {
 /// (the oracle of F21).
 fn entries_naming_item_in_predicates(
     item: &Item,
-) -> std::result::Result<(Item, Vec<String>), NotInternableError> {
+) -> std::result::Result<(Item, Vec<String>), Vec<ErrorItem>> {
     let (referrer, copy) = f19_copy_with(f13_leaker(), item)?;
     let found = entries_naming_item(&referrer, &copy);
     Ok((copy, found))
@@ -4128,8 +4174,13 @@ fn f25_supertrait_item_in_bound_of_entry_in_predicate() {
         ),
     ];
     for item in &accepted {
-        f19_copy_with(f13_leaker(), item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        f19_copy_with(f13_leaker(), item).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
     }
     // More controls: every bound of the generic is a trait of the standard library (compiled with
     // rustc too), and a trait with a supertrait is no bound of the generic that the `Item` names.
@@ -4174,8 +4225,13 @@ fn f25_supertrait_item_in_bound_of_entry_in_predicate() {
         ),
     ];
     for item in &std_bounds {
-        f19_copy_with(f13_leaker(), item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        f19_copy_with(f13_leaker(), item).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
     }
     // What the Leaker rejected before F26 (the price): the supertrait does not fix the `Item`, or
     // the trait has an associated type of its own. The copy compiles, and so it does with the bound
@@ -4209,8 +4265,13 @@ fn f25_supertrait_item_in_bound_of_entry_in_predicate() {
         ),
     ];
     for (item, generics) in &formerly_priced {
-        let (referrer, copy) = f19_copy_with(f13_leaker(), item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        let (referrer, copy) = f19_copy_with(f13_leaker(), item).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
         assert_eq!(
             generics_text(referrer.generics(entry(&referrer, "Rel < T >"))),
             *generics
@@ -4275,8 +4336,13 @@ fn f25_supertrait_item_in_bound_of_entry_in_predicate() {
         ),
     ];
     for item in &items {
-        let (copy, found) = entries_naming_item_in_predicates(item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        let (copy, found) = entries_naming_item_in_predicates(item).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
         assert!(found.is_empty(), "{}", string(&copy));
         assert!(has_replacement_in_predicate(&copy), "{}", string(&copy));
         let (referrer, _) = f19_copy_with(f13_leaker(), item).unwrap();
@@ -4513,8 +4579,13 @@ fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
         ),
     ];
     for item in &same {
-        let (referrer, copy) = f19_copy_with(f13_leaker(), item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        let (referrer, copy) = f19_copy_with(f13_leaker(), item).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
         assert!(has_replacement_in_predicate(&copy), "{}", string(&copy));
         assert_eq!(
             string(referrer.generics(entry(&referrer, "Rel < T >"))),
@@ -4572,8 +4643,13 @@ fn f26_alias_hides_projection_in_bound_of_entry_in_predicate() {
         ),
     ];
     for (item, generics) in &kept {
-        let (referrer, _) = f19_copy_with(f13_leaker(), item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        let (referrer, _) = f19_copy_with(f13_leaker(), item).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
         assert_eq!(
             string(referrer.generics(entry(&referrer, "Rel < T >"))),
             *generics,
@@ -4813,8 +4889,13 @@ fn f27_argument_impl_trait_bound_names_leaked_type_env_cycle() {
         ),
     ];
     for item in &controls {
-        f19_copy_with(f13_leaker(), item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        f19_copy_with(f13_leaker(), item).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
     }
     // The same with a generic written, which the Leaker rejects.
     let written: Item = parse_quote!(
@@ -4844,8 +4925,13 @@ fn f27_argument_impl_trait_bound_names_leaked_type_env_cycle() {
         ),
     ];
     for item in &more {
-        f19_copy_with(f13_leaker(), item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        f19_copy_with(f13_leaker(), item).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
     }
     let items: Vec<Item> = vec![
         parse_quote!(
@@ -4987,8 +5073,13 @@ fn f28_hidden_lifetime_in_elided_signature_with_generics() {
         ),
     ];
     for (item, holder) in &controls {
-        let (entries, _) = f12_copy_with(f13_leaker(), item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        let (entries, _) = f12_copy_with(f13_leaker(), item).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
         assert_eq!(entries, [*holder], "{}", string(item));
     }
     // The holder is leaked whole: its signature keeps the hidden lifetime where it is written.
@@ -5028,7 +5119,7 @@ fn f28_hidden_lifetime_in_elided_signature_with_generics() {
     ];
     for (item, holder) in &items {
         let (entries, copy) = f12_copy_with(f13_leaker(), item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), e));
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), joined_messages(&e)));
         assert_eq!(entries, [*holder], "{}", string(item));
         let mut signatures = Signatures::default();
         signatures.visit_item_trait(&copy);
@@ -5155,9 +5246,9 @@ fn f29_entry_hides_lifetime() {
         )
         .unwrap_err();
     assert!(
-        err.note().unwrap().contains("because of `'_`"),
+        err[0].note().unwrap().contains("because of `'_`"),
         "{}",
-        err.note().unwrap()
+        err[0].note().unwrap()
     );
 }
 
@@ -5424,7 +5515,7 @@ fn f30_implied_outlives_of_generic_projection_recorded_as_component() {
         let mut leaker = new_leaker();
         let context = leaker
             .intern_trait(item, true)
-            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), e));
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), joined_messages(&e)));
         let referrer = leaker.finish();
         let (predicates, generics) = context_of(&referrer, needle);
         assert_eq!(
@@ -6139,8 +6230,13 @@ fn f33_where_predicate_names_item_that_a_predicate_in_scope_defines() {
         );
     }
     for item in &accepted {
-        f19_copy_with(f13_leaker(), item)
-            .unwrap_or_else(|e| panic!("`{}` is rejected, and it compiles: {}", string(item), e));
+        f19_copy_with(f13_leaker(), item).unwrap_or_else(|e| {
+            panic!(
+                "`{}` is rejected, and it compiles: {}",
+                string(item),
+                joined_messages(&e)
+            )
+        });
     }
     // These are rejected (this is the price of F33): all three for the same predicate.
     for item in &price {
@@ -6633,7 +6729,7 @@ fn f34_implied_outlives_of_self_projection_forms_recorded_as_components() {
         let mut leaker = new_leaker();
         let context = leaker
             .intern_trait(item, true)
-            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), e));
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), joined_messages(&e)));
         let referrer = leaker.finish();
         let ix = referrer
             .iter()
@@ -7033,7 +7129,7 @@ fn f35_gat_where_clause_of_self_projection_not_recorded() {
         let mut leaker = new_leaker();
         let context = leaker
             .intern_trait(item, true)
-            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), e));
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), joined_messages(&e)));
         let referrer = leaker.finish();
         let ix = referrer
             .iter()
@@ -7591,7 +7687,7 @@ fn f36_allow_self_false_around_a_nested_item() {
             view.visit_type(&parse_quote!(Rel3<Self>))
         })
         .unwrap_err();
-    assert_eq!(err.to_string(), "use absolute path: 'Rel3 < Self >'");
+    assert_eq!(joined_messages(&err), "use absolute path: 'Rel3 < Self >'");
     // The item nested in it is not.
     let mut leaker = new_leaker();
     let (context, ()) = leaker
@@ -7766,7 +7862,7 @@ fn nested_analysis(
     nest: Nest,
     item: &Item,
     declared: &[&str],
-) -> (Leaker, std::result::Result<ContextId, NotInternableError>) {
+) -> (Leaker, std::result::Result<ContextId, Vec<ErrorItem>>) {
     nested_analysis_in(new_leaker(), nest, item, declared)
 }
 
@@ -7776,7 +7872,7 @@ fn nested_analysis_in(
     nest: Nest,
     item: &Item,
     declared: &[&str],
-) -> (Leaker, std::result::Result<ContextId, NotInternableError>) {
+) -> (Leaker, std::result::Result<ContextId, Vec<ErrorItem>>) {
     let result = match nest {
         Nest::EnterMod => leaker
             .enter_mod("m", names(declared), |view| view.visit_item(item))
@@ -7907,7 +8003,7 @@ fn f37_nested_type_with_a_bound_that_names_its_own_self_is_supported() {
             let what = format!("{:?} `{}`", nest, string(item));
             let (leaker, result) = nested_analysis(nest, item, &[name]);
             if let Err(err) = result {
-                panic!("{} is rejected: {}", what, err);
+                panic!("{} is rejected: {}", what, joined_messages(&err));
             }
             let referrer = leaker.finish();
             // The entry is for any type that the bound holds for.
@@ -8123,7 +8219,12 @@ fn f37_the_impl_is_sized_only_where_the_bounds_need_it() {
             for nest in NESTS {
                 let (leaker, result) = nested_analysis(nest, item, &["S"]);
                 if let Err(err) = result {
-                    panic!("{:?} `{}` is rejected: {}", nest, string(item), err);
+                    panic!(
+                        "{:?} `{}` is rejected: {}",
+                        nest,
+                        string(item),
+                        joined_messages(&err)
+                    );
                 }
                 let referrer = leaker.finish();
                 let ix = referrer
@@ -8287,7 +8388,7 @@ fn f37_a_default_that_names_self_with_a_bound_that_names_it_is_rejected() {
     );
     for nest in NESTS {
         let (leaker, result) = nested_analysis(nest, &item, &["S"]);
-        result.unwrap_or_else(|e| panic!("{:?}: {}", nest, e));
+        result.unwrap_or_else(|e| panic!("{:?}: {}", nest, joined_messages(&e)));
         let referrer = leaker.finish();
         assert_eq!(referrer.iter().count(), 2, "{:?}", nest);
         assert!(
@@ -8350,7 +8451,7 @@ fn f37_a_type_that_names_self_with_a_bound_that_names_it_is_rejected() {
             Item::Union(item) => leaker.intern_union(item, true).map(|_| ()),
             _ => unreachable!(),
         }
-        .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), e));
+        .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), joined_messages(&e)));
         let referrer = leaker.finish();
         assert!(referrer.required().count() > 0, "`{}`", string(item));
         for ix in 0..referrer.iter().count() {
@@ -8423,7 +8524,12 @@ fn f37_nested_items_that_compile_stay_accepted() {
         for nest in NESTS {
             let (leaker, result) = nested_analysis(nest, item, &[name]);
             if let Err(err) = result {
-                panic!("{:?} `{}` is rejected: {}", nest, string(item), err);
+                panic!(
+                    "{:?} `{}` is rejected: {}",
+                    nest,
+                    string(item),
+                    joined_messages(&err)
+                );
             }
             assert!(leaker.finish().iter().count() > 0, "`{}`", string(item));
         }
@@ -9558,7 +9664,7 @@ fn f39_a_nested_struct_has_no_self_in_the_entry_of_the_default() {
     );
     for nest in NESTS {
         let (leaker, result) = nested_analysis(nest, &item, &["S"]);
-        result.unwrap_or_else(|e| panic!("{:?}: {}", nest, e));
+        result.unwrap_or_else(|e| panic!("{:?}: {}", nest, joined_messages(&e)));
         let referrer = leaker.finish();
         assert_eq!(
             entries_of(&referrer, "Rel < T >"),
@@ -9607,7 +9713,7 @@ fn f40_trait(source: &str) -> (ItemTrait, Referrer, ContextId) {
     let mut leaker = values_leaker();
     let context = leaker
         .intern_trait(&item, true)
-        .unwrap_or_else(|e| panic!("{}: {}", source, e));
+        .unwrap_or_else(|e| panic!("{}: {}", source, joined_messages(&e)));
     (item, leaker.finish(), context)
 }
 
@@ -9622,10 +9728,10 @@ fn f40_errors(source: &str) -> Vec<(String, String)> {
     match values_leaker().intern_trait(&item, true) {
         Ok(_) => panic!("`{}` is accepted", source),
         Err(err) => err
-            .items()
+            .iter()
             .map(|item| {
                 let note = item.note().unwrap_or("").to_string();
-                (item.message, note)
+                (item.message.clone(), note)
             })
             .collect(),
     }
@@ -10146,10 +10252,7 @@ fn f40_what_is_not_a_type_position_stays_rejected() {
     );
     assert!(values_leaker().intern_trait(&item, true).is_ok());
     let err = values_leaker().intern_trait(&item, false).unwrap_err();
-    assert_eq!(
-        err.items().next().unwrap().message,
-        rejected("inner :: A < Self >")
-    );
+    assert_eq!(err[0].message, rejected("inner :: A < Self >"));
     // Without a trait: `Self` has no meaning in a function of a module.
     let item: ItemMod = parse_quote!(
         mod m {
@@ -10158,10 +10261,11 @@ fn f40_what_is_not_a_type_position_stays_rejected() {
             }
         }
     );
-    assert!(matches!(
-        values_leaker().intern_mod(&item),
-        Err(NotInternableError::SelfWithoutMeaning(_))
-    ));
+    let err = values_leaker().intern_mod(&item).unwrap_err();
+    assert!(!err.is_empty());
+    assert!(err
+        .iter()
+        .all(|item| item.reason == Reason::SelfWithoutMeaning));
 }
 
 /// F40: the lifetime of a method in a type of its body. The body is no input of the signature, so
@@ -10358,7 +10462,7 @@ fn f41_a_default_that_needs_self_only_through_a_bound_is_accepted() {
         for nest in NESTS {
             let what = format!("{:?} `{}`", nest, string(item));
             let (leaker, result) = nested_analysis(nest, item, &[name]);
-            result.unwrap_or_else(|e| panic!("{} is rejected: {}", what, e));
+            result.unwrap_or_else(|e| panic!("{} is rejected: {}", what, joined_messages(&e)));
             let referrer = leaker.finish();
             assert_eq!(referrer.iter().count(), 1, "{}", what);
             assert!(referrer.must(0), "{}", what);
@@ -10718,7 +10822,7 @@ fn f42_the_option_accepts_a_type_that_names_self_with_a_bound_that_names_it() {
         for nest in NESTS {
             let what = format!("{:?} `{}`", nest, string(item));
             let (leaker, result) = nested_analysis_in(nested_self_leaker(), nest, item, &[name]);
-            result.unwrap_or_else(|e| panic!("{} is rejected: {}", what, e));
+            result.unwrap_or_else(|e| panic!("{} is rejected: {}", what, joined_messages(&e)));
             let referrer = leaker.finish();
             let ix = referrer
                 .iter()

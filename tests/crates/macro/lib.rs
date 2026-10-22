@@ -42,7 +42,7 @@ use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
 use syn::*;
-use template_quote::quote;
+use template_quote::{quote, ToTokens};
 use type_leak::*;
 
 /// Arguments of `#[leak(..)]`.
@@ -175,29 +175,66 @@ pub(crate) fn check_plain(referrer: &Referrer, ix: usize, slots: &RepeaterSlots)
     ))
 }
 
-/// Analyzes a trait without allowing any relative path, reporting a `NotInternableError` with
-/// its `ToTokens` implementation (for tests/diagnostic.rs).
+/// The errors of the Leaker, reported with `ErrorItem::to_compile_error()` (a `Diagnostic` on
+/// nightly), one by one.
+pub(crate) fn report(errors: &[ErrorItem]) -> TokenStream {
+    errors.iter().map(ErrorItem::to_compile_error).collect()
+}
+
+/// The messages of the errors of the Leaker, one per line.
+pub(crate) fn messages(errors: &[ErrorItem]) -> String {
+    let messages: Vec<&str> = errors.iter().map(|item| item.message.as_str()).collect();
+    messages.join("\n")
+}
+
+/// Reports the errors of the Leaker as `report()` does, or, with `serialized`, after they were
+/// written as tokens (their `ToTokens`) and read back (their `Parse`) through a
+/// `proc_macro::TokenStream`, as a macro does that hands its errors to another one (the attribute
+/// of `leak_strict` and `leak_generics`: `#[leak_strict(serialized)]`).
+fn report_errors(errors: &[ErrorItem], serialized: bool) -> proc_macro::TokenStream {
+    if !serialized {
+        return report(errors).into();
+    }
+    let written: TokenStream = errors.iter().map(ToTokens::to_token_stream).collect();
+    let read = |input: ParseStream| -> Result<Vec<ErrorItem>> {
+        let mut items = Vec::new();
+        while !input.is_empty() {
+            items.push(input.parse()?);
+        }
+        Ok(items)
+    };
+    match syn::parse::Parser::parse(read, proc_macro::TokenStream::from(written)) {
+        Ok(items) => report(&items).into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Analyzes a trait without allowing any relative path, reporting the errors with
+/// `ErrorItem::to_compile_error()` (for tests/diagnostic.rs). `#[leak_strict(serialized)]` reports
+/// them after the serialization (`report_errors()`).
 #[proc_macro_attribute]
 pub fn leak_strict(
-    _attr: proc_macro::TokenStream,
+    attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
+    let serialized = attr.to_string() == "serialized";
     let item_trait = parse_macro_input!(item as ItemTrait);
     match Leaker::new().intern_trait(&item_trait, true) {
         Ok(_) => quote!(#item_trait).into(),
-        Err(e) => quote!(#e).into(),
+        Err(e) => report_errors(&e, serialized),
     }
 }
 
 /// Like `leak_strict`, but enters only the generics of the trait (`Leaker::enter_generics()`), where
-/// `Self` has no meaning, and visits the types of its methods: a mention of `Self` is a
-/// `NotInternableError::SelfWithoutMeaning`, reported with its `ToTokens` implementation (for
-/// tests/diagnostic.rs).
+/// `Self` has no meaning, and visits the types of its methods: a mention of `Self` is an error
+/// with the reason `SelfWithoutMeaning`, reported with `ErrorItem::to_compile_error()` (for
+/// tests/diagnostic.rs). `#[leak_generics(serialized)]` reports them after the serialization.
 #[proc_macro_attribute]
 pub fn leak_generics(
-    _attr: proc_macro::TokenStream,
+    attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
+    let serialized = attr.to_string() == "serialized";
     let item_trait = parse_macro_input!(item as ItemTrait);
     let result = Leaker::new().enter_generics(&item_trait.generics, |view| {
         for trait_item in &item_trait.items {
@@ -215,7 +252,7 @@ pub fn leak_generics(
     });
     match result {
         Ok(_) => quote!(#item_trait).into(),
-        Err(e) => quote!(#e).into(),
+        Err(e) => report_errors(&e, serialized),
     }
 }
 
@@ -241,7 +278,7 @@ pub fn leak_tagged(
     let mut leaker = Leaker::new();
     let context = match leaker.intern_trait(&item_trait, true) {
         Ok(context) => context,
-        Err(e) => return quote!(#e).into(),
+        Err(e) => return report(&e).into(),
     };
     let referrer = leaker.finish();
     let mut tokens: Vec<TokenTree> = quote!(#referrer).into_iter().collect();
@@ -414,7 +451,7 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
             types.sort();
             Ok(types)
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(messages(&e)),
     };
     let expected = match expected {
         Ok(mut types) => {
@@ -453,7 +490,7 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     });
     let context = leaker
         .intern_trait(&item_trait, true)
-        .map_err(Error::from)?;
+        .map_err(|errors| to_syn_error(&errors))?;
     // Compile-time checks of the Leaker's assumptions (e.g. that `u8` is not shadowed).
     let assertions = leaker.assertions();
     leaker.reduce_roots();
@@ -1053,8 +1090,8 @@ pub fn scope_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     }
 }
 
-/// Like `scope_leak!`, for an analysis which fails: emits the errors of
-/// `NotInternableError::items()` as a const, see `scope.rs`.
+/// Like `scope_leak!`, for an analysis which fails: emits the errors (`Vec<ErrorItem>`) as a const,
+/// see `scope.rs`.
 #[proc_macro]
 pub fn scope_errors(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     match scope::errors(input.into()) {

@@ -105,9 +105,12 @@ fn forms(name: &str) -> Vec<Form> {
 fn analyze(config: LeakerConfig, source: &str) -> std::result::Result<Vec<String>, String> {
     let item: ItemTrait = parse_str(source).unwrap();
     let mut leaker = Leaker::from_config(config);
-    leaker
-        .intern_trait(&item, true)
-        .map_err(|err| err.to_string())?;
+    leaker.intern_trait(&item, true).map_err(|err| {
+        err.iter()
+            .map(|item| item.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
     Ok(leaker
         .finish()
         .iter()

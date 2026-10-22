@@ -1685,9 +1685,9 @@ fn the_scope_api_writes_the_impls_that_are_needed() {
     // the crate of the optional entry.)
 }
 
-/// `NotInternableError::items()` through a macro: one item for each offending path, in order, with
-/// its message, the tokens, the source text at its span and the notes with theirs. The macro
-/// reported them as a const, and as many `compile_error!`s.
+/// The errors of the Leaker (`Vec<ErrorItem>`) through a macro: one item for each offending path,
+/// in order, with its message, the tokens, the source text at its span and the notes with theirs.
+/// The macro reported them as a const, and as many `compile_error!`s.
 #[test]
 fn errors_are_reported_item_by_item_through_a_macro() {
     use type_leak_test_leaker::scoped::*;

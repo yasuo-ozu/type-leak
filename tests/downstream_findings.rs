@@ -42,6 +42,15 @@ fn text<T: ToTokens>(t: &T) -> String {
     quote!(#t).to_string()
 }
 
+/// The messages of `errors`, one per line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
     config.allow_primitive().allow_std_prelude();
@@ -468,8 +477,11 @@ fn six_a_cyclic_bound_is_rejected_with_a_clear_error() {
     let err = Leaker::from_config(config())
         .intern_struct(&item, true)
         .unwrap_err();
-    assert!(matches!(err, NotInternableError::RelativePath(_)));
-    let items: Vec<_> = err.items().collect();
+    assert!(!err.is_empty());
+    assert!(err
+        .iter()
+        .all(|item| item.reason != Reason::SelfWithoutMeaning));
+    let items = &err;
     assert_eq!(items.len(), 1);
     assert_eq!(
         items[0].message,
@@ -520,13 +532,13 @@ fn seven_a_binder_lifetime_is_declared_by_the_impl() {
         .intern_struct(&item, true)
         .unwrap_err();
     assert_eq!(
-        err.to_string(),
+        messages(&err),
         "use absolute path: 'inner :: LocalL < 'b >'"
     );
     assert!(
-        err.note().unwrap().contains("`for<..>` binder"),
+        err[0].note().unwrap().contains("`for<..>` binder"),
         "{:?}",
-        err.note()
+        err[0].note()
     );
 }
 
@@ -543,7 +555,7 @@ fn found_by_visitor(source: &str) -> (usize, std::collections::BTreeSet<usize>) 
         Item::Trait(i) => leaker.intern_trait(i, true),
         _ => unreachable!(),
     }
-    .unwrap_or_else(|e| panic!("{}: {}", source, e));
+    .unwrap_or_else(|e| panic!("{}: {}", source, messages(&e)));
     let referrer = leaker.finish();
     let count = referrer.iter().count();
     let found = RefCell::new(std::collections::BTreeSet::new());
@@ -626,7 +638,7 @@ fn default_entries(source: &str) -> std::result::Result<usize, Vec<String>> {
     };
     match result {
         Ok(_) => Ok(leaker.finish().iter().count()),
-        Err(err) => Err(err.items().map(|item| item.message).collect()),
+        Err(err) => Err(err.iter().map(|item| item.message.clone()).collect()),
     }
 }
 
@@ -748,7 +760,7 @@ fn twelve_the_headline_names_the_path_not_the_modifier() {
     ] {
         let item: ItemTrait = parse_str(source).unwrap();
         let err = Leaker::new().intern_trait(&item, true).unwrap_err();
-        let items: Vec<_> = err.items().collect();
+        let items = &err;
         assert_eq!(items.len(), 1, "{}", source);
         assert_eq!(items[0].message, "use absolute path: 'Sized'", "{}", source);
         assert_eq!(
@@ -826,7 +838,7 @@ fn value_errors(source: &str) -> Vec<(String, String, String)> {
     let err = Leaker::from_config(values_config())
         .intern_trait(&item, true)
         .unwrap_err();
-    err.items()
+    err.iter()
         .map(|item| {
             (
                 item.message.clone(),
@@ -931,7 +943,7 @@ fn fourteen_a_discriminant_is_always_read() {
         let err = Leaker::from_config(config.clone())
             .intern_enum(&item, true)
             .unwrap_err();
-        let items: Vec<_> = err.items().collect();
+        let items = &err;
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].message, "use absolute path: 'inner :: X'");
         assert_eq!(items[0].help_text(), Some(help_for("inner::X").as_str()));

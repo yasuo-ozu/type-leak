@@ -187,12 +187,13 @@ fn test_default_cannot_depend_on_self() {
         trait Tr<T, U = Rel<Self>> {}
     );
     let err = Leaker::new().intern_trait(&tr, true).err().unwrap();
+    assert_eq!(err.len(), 1);
     assert_eq!(
-        err.to_string(),
+        err[0].message,
         "`Rel < Self >` is in the default of a parameter, and names `Self`"
     );
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some("a default of a parameter cannot depend on `Self`")
     );
     // Nothing is leaked in `::p::W<Self>` or `Self`, which are copied, and in `(Rel, Self)` only

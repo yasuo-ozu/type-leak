@@ -221,7 +221,8 @@ fn intern_impl() {
         impl Relative for ::path::W {}
     );
     let err = Leaker::new().intern_impl(&item, true).err().unwrap();
-    assert_eq!(err.to_string(), "use absolute path: 'Relative'");
+    assert_eq!(err.len(), 1);
+    assert_eq!(err[0].message, "use absolute path: 'Relative'");
 }
 
 #[test]

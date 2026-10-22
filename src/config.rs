@@ -138,7 +138,7 @@ impl LeakerConfig {
     /// // A path that is not a type cannot be replaced.
     /// let item: ItemTrait = parse_quote!(trait Tr { const N: usize = inner::N; });
     /// let err = Leaker::from_config(config).intern_trait(&item, true).unwrap_err();
-    /// let error = err.items().next().unwrap();
+    /// let error = &err[0];
     /// assert_eq!(error.message, "use absolute path: 'inner :: N'");
     /// assert_eq!(
     ///     error.note(),
@@ -269,7 +269,7 @@ impl LeakerConfig {
     /// assert!(Leaker::new().intern_trait(&relaxed, true).is_ok());
     /// let required: ItemTrait = parse_quote!(trait Tr { fn f(&self) where Self: Sized; });
     /// let err = Leaker::new().intern_trait(&required, true).unwrap_err();
-    /// assert_eq!(err.to_string(), "use absolute path: 'Sized'");
+    /// assert_eq!(err[0].message, "use absolute path: 'Sized'");
     /// ```
     ///
     /// ```

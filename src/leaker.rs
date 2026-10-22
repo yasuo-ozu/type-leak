@@ -7,7 +7,7 @@ use crate::analyze::{
 use crate::config::LeakerConfig;
 use crate::context::{Context, ContextId, Contexts, Gat, SelfRequirement};
 #[cfg(doc)]
-use crate::error::NotInternableError;
+use crate::error::{ErrorItem, Reason};
 use crate::graph::{is_whole_reference, NodeKey, TypeGraph};
 use crate::referrer::Referrer;
 use crate::util::{ident_name, AllowedPaths};
@@ -28,8 +28,8 @@ use template_quote::quote;
 ///
 /// Analyze a whole item with an `intern_*` method, or parts of one in a scope with an `enter_*`
 /// method, then call [`Leaker::finish()`]. Each returns the top-level [`ContextId`] of what it
-/// analyzed (keep it for [`Referrer::visitor()`]), or a [`NotInternableError`]. See the [quick
-/// start](crate#quick-start).
+/// analyzed (keep it for [`Referrer::visitor()`]), or the `Vec` of [`ErrorItem`]s that tell what
+/// cannot be interned. See the [quick start](crate#quick-start).
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
@@ -528,7 +528,7 @@ impl Leaker {
     ///
     /// The generics themselves are not analyzed: visit their bounds in `f` with
     /// [`View::visit_type_param_bound()`] and [`View::visit_where_clause()`]. `Self` is not
-    /// declared, so naming it is an error ([`NotInternableError::SelfWithoutMeaning`]). Scopes with
+    /// declared, so naming it is an error ([`Reason::SelfWithoutMeaning`]). Scopes with
     /// equal contexts return equal ids ([`ContextId`]).
     ///
     /// Every scope, and so every `intern_*` method, is all-or-nothing. If the syntax visited in `f`

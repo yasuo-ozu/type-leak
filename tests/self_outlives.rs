@@ -1020,7 +1020,7 @@ fn a_written_bound_still_needs_self_to_be_leakable() {
         .err()
         .unwrap();
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
     // Without it, or with a bound which the type does not mention, it is fine (nothing in the

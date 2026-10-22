@@ -2,7 +2,7 @@ use proc_macro2::TokenStream;
 use std::collections::BTreeSet;
 use syn::*;
 use template_quote::quote;
-use type_leak::{CheckResult, ContextId, Leaker, NotInternableError, View};
+use type_leak::{CheckResult, ContextId, ErrorItem, Leaker, View};
 
 /// Converts the required types of a `Referrer` (see `Referrer::must()`) to a `BTreeSet<String>`
 /// for order-independent comparison. The optional ones, which only the paths of external crates
@@ -26,7 +26,7 @@ pub fn intern_fns(
     generics: &Generics,
     items: TokenStream,
     allow_self: bool,
-) -> std::result::Result<ContextId, NotInternableError> {
+) -> std::result::Result<ContextId, Vec<ErrorItem>> {
     let where_clause = &generics.where_clause;
     let item: ItemTrait = parse_quote!(trait Tr #generics #where_clause { #items });
     leaker.intern_trait(&item, allow_self)
@@ -55,7 +55,7 @@ pub fn visit_function(view: &mut View<'_>, sig: &Signature) {
 pub fn enter_function(
     leaker: &mut Leaker,
     sig: &Signature,
-) -> std::result::Result<(ContextId, ()), NotInternableError> {
+) -> std::result::Result<(ContextId, ()), Vec<ErrorItem>> {
     leaker.enter_generics(&sig.generics, |view| visit_function(view, sig))
 }
 

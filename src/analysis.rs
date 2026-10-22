@@ -2,13 +2,12 @@
 //! visiting it, which the [`Analysis`] turns into the graphs of the entries.
 
 use crate::context::{Context, Contexts, SelfRequirement};
-use crate::error::NotInternableError;
+use crate::error::{report, self_without_meaning, Cause, ErrorItem, Reason};
 use crate::graph::{NodeKey, TypeGraph};
 #[cfg(doc)]
 use crate::leaker::Leaker;
 #[cfg(doc)]
 use crate::view::View;
-use proc_macro2::TokenStream;
 use std::collections::HashSet;
 use syn::{Ident, Type};
 use template_quote::quote;
@@ -17,6 +16,9 @@ use template_quote::quote;
 /// that forbid it.
 ///
 /// The causes are, for example, a relative path (`must`) and an elided lifetime (`impossible`).
+/// Each is the [`Cause`] of the syntax that it is: a path in a type or a trait is a `Type` or a
+/// `Trait`, a path in an expression an `Expr`, a lifetime a `Lifetime`. The first of `must` is the
+/// cause of the [`ErrorItem`] that reports the conflict.
 ///
 /// - Both empty: copy the type as it is.
 /// - Only `must`: leak the type, or only its parts unless `is_own` (`MyType`,
@@ -33,6 +35,7 @@ use template_quote::quote;
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
+/// # use template_quote::ToTokens;
 /// let mut leaker = Leaker::new();
 /// let (_, results) = leaker
 ///     .enter_generics(&Generics::default(), |view| {
@@ -51,8 +54,12 @@ use template_quote::quote;
 /// assert!(results[1].is_own);
 /// // `impl Trait` can be neither leaked nor needs to be.
 /// assert!(results[2].must.is_empty() && !results[2].impossible.is_empty());
-/// // `Rel<'_>` is a conflict: the macro reports it (`NotInternableError` does).
+/// // `Rel<'_>` is a conflict: the macro reports it (the errors of the Leaker do). Its path is
+/// // the cause that depends on the context, and the lifetime the one that cannot be leaked.
 /// assert!(!results[3].must.is_empty() && !results[3].impossible.is_empty());
+/// assert!(matches!(&results[3].must[0], Cause::Type(_)));
+/// assert_eq!(results[3].must[0].to_token_stream().to_string(), "Rel < '_ >");
+/// assert!(matches!(&results[3].impossible[0], Cause::Lifetime(_)));
 /// ```
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -61,10 +68,10 @@ pub struct CheckResult {
     /// then in order of appearance. In a conflict, a path in a type inside the type that is leaked
     /// alone is not listed: it is no error once the others are fixed (`u8` in `<Self as
     /// Tr<u8>>::X`, which cannot be leaked whole because of `Self`).
-    pub must: Vec<TokenStream>,
+    pub must: Vec<Cause>,
     /// Causes that cannot be leaked (an elided lifetime, `impl Trait`), in order of appearance,
     /// then the mentions of `Self` that have no meaning.
-    pub impossible: Vec<TokenStream>,
+    pub impossible: Vec<Cause>,
     /// `true` if the first of `must` is the type's own path (`MyType` in `MyType<'_>`), so the type
     /// must be leaked whole. `false` if `must` is empty or only its parts are causes
     /// (`::path::Wrap<MyType, '_>`). A bare identifier argument counts as a cause of the type
@@ -81,13 +88,13 @@ pub struct CheckResult {
     /// meaning). Reported first. It says why, and `help` says what to write instead.
     pub note: Option<String>,
     /// What to write instead, with the tokens as written (for example "replace `Self::A` with
-    /// `<Self as ::path::Tr>::A`"). If it is `None`, [`NotInternableError`] suggests the absolute
-    /// path of the first of `must`. See [`ErrorItem::help`](crate::ErrorItem::help).
+    /// `<Self as ::path::Tr>::A`"). If it is `None`, the [`ErrorItem`] suggests the absolute path
+    /// of the first of `must`. See [`ErrorItem::help`](crate::ErrorItem::help).
     pub help: Option<String>,
     /// The headline of the error, if the fault is not that the path of the type is relative.
-    /// [`NotInternableError`] shows it as the message of the error. If it is `None`, the message
-    /// is `use absolute path: '..'`: the fault is the path, and `note` says why it cannot be
-    /// leaked as a whole (`MyType<'_>`, E0106).
+    /// The [`ErrorItem`] shows it as its message. If it is `None`, the message is `use absolute
+    /// path: '..'`: the fault is the path, and `note` says why it cannot be leaked as a whole
+    /// (`MyType<'_>`, E0106).
     ///
     /// It is set when the fault is something else than a path:
     ///
@@ -103,6 +110,13 @@ pub struct CheckResult {
     ///   [`LeakerConfig::check_values()`](crate::LeakerConfig::check_values) ("cannot analyze .. in
     ///   the body of ..").
     pub headline: Option<String>,
+    /// The cause of the [`ErrorItem`] if it is not the first of `must`: the default of a parameter
+    /// that names `Self` is reported whole, with the note at the `Self` in it (the first of
+    /// `must`). `None` for any other result.
+    pub(crate) cause: Option<Cause>,
+    /// Why it is a conflict: the [`Reason`] that goes with `headline` (`RelativePath` if there is
+    /// none).
+    pub(crate) reason: Reason,
 }
 
 pub(crate) struct PendingType {
@@ -143,7 +157,7 @@ impl PendingType {
 
 pub(crate) enum Effect {
     Type(Box<PendingType>),
-    Error(CheckResult),
+    Error(Box<CheckResult>),
     Primitive(Ident),
 }
 
@@ -210,20 +224,22 @@ impl Analysis {
     }
 }
 
-/// Returns the error of a scope: the conflicts among `effects` and `conflicts`, or else the
+/// Returns the errors of a scope: the conflicts among `effects` and `conflicts`, or else the
 /// mentions of `Self` without meaning.
 pub(crate) fn scope_error(
     effects: &[Effect],
-    self_errors: &[TokenStream],
+    self_errors: &[Cause],
     conflicts: &[CheckResult],
-) -> Option<NotInternableError> {
+) -> Option<Vec<ErrorItem>> {
     let mut errors = Vec::new();
     collect_errors(effects, &mut errors);
     errors.extend(conflicts.iter().cloned());
-    if !errors.is_empty() {
-        Some(NotInternableError::RelativePath(errors))
+    // A conflict without a cause that depends on the context is no error: `report()` gives none.
+    let items: Vec<ErrorItem> = errors.iter().filter_map(report).collect();
+    if !items.is_empty() {
+        Some(items)
     } else if !self_errors.is_empty() {
-        Some(NotInternableError::SelfWithoutMeaning(self_errors.to_vec()))
+        Some(self_errors.iter().map(self_without_meaning).collect())
     } else {
         None
     }
@@ -232,7 +248,7 @@ pub(crate) fn scope_error(
 fn collect_errors(effects: &[Effect], errors: &mut Vec<CheckResult>) {
     for effect in effects {
         match effect {
-            Effect::Error(error) => errors.push(error.clone()),
+            Effect::Error(error) => errors.push((**error).clone()),
             Effect::Type(pending) => collect_errors(&pending.components, errors),
             Effect::Primitive(_) => (),
         }

@@ -10,10 +10,19 @@
 
 use syn::*;
 use template_quote::quote;
-use type_leak::{Leaker, LeakerConfig, NotInternableError, Referrer};
+use type_leak::{ErrorItem, Leaker, LeakerConfig, Referrer};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
+}
+
+/// The messages of the errors, one per line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn leaker() -> Leaker {
@@ -23,7 +32,7 @@ fn leaker() -> Leaker {
 }
 
 /// Analyzes `item` with the matching `intern_*`.
-fn leak(item: Item) -> std::result::Result<Referrer, NotInternableError> {
+fn leak(item: Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     let mut leaker = leaker();
     match &item {
         Item::Struct(item) => leaker.intern_struct(item, true),
@@ -52,14 +61,14 @@ fn rejected(item: Item) -> (String, Option<String>) {
         Ok(referrer) => panic!("not rejected: {:?}", entries(&referrer)),
         Err(err) => err,
     };
-    (err.to_string(), err.note())
+    (messages(&err), err[0].note().map(str::to_string))
 }
 
 /// The help of the error, as `rejected()` gives the headline and the note.
 fn help_of(item: Item) -> String {
     match leak(item) {
         Ok(referrer) => panic!("not rejected: {:?}", entries(&referrer)),
-        Err(err) => err.help().expect("a help"),
+        Err(err) => err[0].help_text().expect("a help").to_string(),
     }
 }
 
@@ -221,7 +230,7 @@ fn what_needs_no_environment_is_accepted() {
     for item in items {
         let text = s(&item);
         if let Err(err) = leak(item) {
-            panic!("{} is rejected: {}", text, err);
+            panic!("{} is rejected: {}", text, messages(&err));
         }
     }
 }
@@ -552,7 +561,7 @@ fn self_in_a_predicate_of_an_impl_is_rejected_if_its_self_type_is_leaked_with_a_
     ] {
         let text = s(&item);
         if let Err(err) = leak(item) {
-            panic!("{} is rejected: {}", text, err);
+            panic!("{} is rejected: {}", text, messages(&err));
         }
     }
 }
@@ -571,7 +580,7 @@ fn the_cycle_of_self_is_an_error_where_self_cannot_be_leaked() {
         }
     );
     let err = leaker().intern_impl(&item, false).unwrap_err();
-    assert!(err.to_string().contains(HEADLINE), "{}", err);
+    assert!(messages(&err).contains(HEADLINE), "{}", messages(&err));
 }
 
 #[test]
@@ -714,7 +723,7 @@ fn a_bound_that_names_an_associated_type_that_rustc_normalizes_is_unstable() {
     ] {
         let text = s(&item);
         if let Err(err) = leak(item) {
-            panic!("{} is rejected: {}", text, err);
+            panic!("{} is rejected: {}", text, messages(&err));
         }
     }
     let referrer = leak(parse_quote!(
@@ -820,7 +829,7 @@ fn self_and_its_associated_types_in_a_bound_are_unstable() {
     ] {
         let text = s(&item);
         if let Err(err) = leak(item) {
-            panic!("{} is rejected: {}", text, err);
+            panic!("{} is rejected: {}", text, messages(&err));
         }
     }
 }
@@ -899,7 +908,7 @@ fn self_a_in_a_predicate_of_an_impl_is_unstable_with_a_leaked_bound_of_the_impl(
     ] {
         let text = s(&item);
         if let Err(err) = leak(item) {
-            panic!("{} is rejected: {}", text, err);
+            panic!("{} is rejected: {}", text, messages(&err));
         }
     }
 }
@@ -1076,7 +1085,7 @@ fn bare_self_predicates_stay_accepted() {
     ] {
         let item: Item = item;
         let text = s(&item);
-        let referrer = leak(item).unwrap_or_else(|e| panic!("{}: {}", text, e));
+        let referrer = leak(item).unwrap_or_else(|e| panic!("{}: {}", text, messages(&e)));
         assert_eq!(types(&referrer), ["Rel < Self >", "S"], "{}", text);
         assert!(referrer.must(0) && referrer.must(1), "{}", text);
     }
@@ -1188,7 +1197,7 @@ fn the_standard_traits_do_not_define_an_associated_type() {
             Item::Trait(item) => leaker.intern_trait(item, true),
             _ => unreachable!(),
         }
-        .unwrap_or_else(|e| panic!("{}: {}", name, e));
+        .unwrap_or_else(|e| panic!("{}: {}", name, messages(&e)));
         assert_eq!(types(&leaker.finish()), ["Rel < T >"], "{}", name);
     }
     // The absolute path of a trait of the standard library is one too.
@@ -1217,7 +1226,7 @@ fn the_standard_traits_do_not_define_an_associated_type() {
             Item::Trait(item) => leaker.intern_trait(item, true),
             _ => unreachable!(),
         }
-        .unwrap_or_else(|e| panic!("{}: {}", name, e));
+        .unwrap_or_else(|e| panic!("{}: {}", name, messages(&e)));
         let referrer = leaker.finish();
         assert_eq!(
             entries(&referrer),
@@ -1246,10 +1255,10 @@ fn the_standard_traits_do_not_define_an_associated_type() {
         }
         .unwrap_err();
         assert!(
-            err.to_string().contains("names `T :: Item`"),
+            messages(&err).contains("names `T :: Item`"),
             "{}: {}",
             name,
-            err
+            messages(&err)
         );
     }
 }
@@ -1265,7 +1274,7 @@ fn self_assoc_in_a_bound_of_an_impl_cannot_be_written_in_the_repeater() {
         }
     );
     let err = leak(item).err().unwrap();
-    let headlines: Vec<String> = err.items().map(|item| item.message).collect();
+    let headlines: Vec<String> = err.into_iter().map(|item| item.message).collect();
     assert_eq!(
         headlines,
         [
