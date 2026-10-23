@@ -1667,6 +1667,94 @@ fn accepted_conflicts_are_copied_as_written() {
     same(&copy.me, &l::Wrap::<l::NoSelfMeaning>(PhantomData));
 }
 
+/// The Leaker's macro passes its errors on (`#[prop_leak_result]`: the serialized `LeakerResult`),
+/// and the Referrer's macro, in the crate `accepted` of `tests/crates/referrer`, drops them by what
+/// they are: `allow(prelude)` (9190), `allow(std_crates)` (9191), and the causes written out,
+/// `allow(trait PlainTr, type Held<'_>)` (9192). If one remained, the macro would report it and the
+/// crate would not build (`tests/diagnostic.rs` has that); so it is enough to see that the crate
+/// exists and that the copy keeps the parts as written, with every other type replaced and checked.
+#[test]
+fn errors_the_referrers_macro_allows_are_copied_as_written() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::accepted as r;
+
+    // The reports of the Leaker's macro: the same entries as if it had accepted the errors (the
+    // parts that conflict have none). Every type position is compared with its original, but the
+    // one of 9192 that has an elided lifetime (`Held<'_>`), which a witness cannot name.
+    let table = [
+        (
+            9190,
+            reported(9190, __tl_report_9190!()),
+            allowed("trait", 2, 4, 4),
+        ),
+        (
+            9191,
+            reported(9191, __tl_report_9191!()),
+            allowed("trait", 2, 4, 4),
+        ),
+        (
+            9192,
+            reported(9192, __tl_report_9192!()),
+            allowed("trait", 2, 4, 3),
+        ),
+    ];
+    for (id, got, expected) in table {
+        assert_eq!(got, expected, "{}", id);
+    }
+
+    // The errors of the Leaker's analysis: every one has the reason `RelativePath`.
+    let errors = |text: &'static str| -> Vec<(String, String, String)> {
+        text.split('\u{1d}')
+            .map(|error| {
+                let fields: Vec<&str> = error.split('\u{1f}').collect();
+                let tokens = fields[1].split_whitespace().collect::<String>();
+                (fields[3].to_string(), fields[4].to_string(), tokens)
+            })
+            .collect()
+    };
+    let relative = |cause: &str, tokens: &[&str]| -> Vec<(String, String, String)> {
+        tokens
+            .iter()
+            .map(|tokens| {
+                (
+                    "RelativePath".to_string(),
+                    cause.to_string(),
+                    tokens.to_string(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        errors(__tl_errors_9190!()),
+        relative("Trait", &["Clone", "Clone", "Clone"])
+    );
+    assert_eq!(
+        errors(__tl_errors_9191!()),
+        relative("Trait", &["core::fmt::Debug", "std::fmt::Display"])
+    );
+    let mut explicit = relative("Trait", &["PlainTr", "PlainTr"]);
+    explicit.insert(
+        1,
+        (
+            "RelativePath".to_string(),
+            "Type".to_string(),
+            "Held<'_>".to_string(),
+        ),
+    );
+    assert_eq!(errors(__tl_errors_9192!()), explicit);
+
+    // The hosts implement the Leaker's traits, whose signatures hold the original types.
+    fn prelude_bounds<T: l::PreludeBounds<u8>>() {}
+    prelude_bounds::<r::Host9190>();
+    fn std_bounds<T: l::StdBounds<u8>>() {}
+    std_bounds::<r::Host9191>();
+    struct Plain;
+    impl l::PlainTr for Plain {}
+    fn explicit_causes<T: l::PlainTr, H: l::ExplicitCauses<T>>() {}
+    explicit_causes::<Plain, r::Host9192>();
+}
+
 // ---------------------------------------------------------------------------------------------
 // A strict Referrer, in a crate without the dependency of an optional entry.
 // ---------------------------------------------------------------------------------------------

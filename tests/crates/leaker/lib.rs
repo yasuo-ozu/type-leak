@@ -861,7 +861,7 @@ pub mod scoped {
 /// `__tl_report_<id>!` says what the Leaker found (tests/cross_crate.rs).
 pub mod kinds {
     use core::marker::PhantomData;
-    use type_leak_test_macro::{prop_leak, prop_leak_accept};
+    use type_leak_test_macro::{prop_leak, prop_leak_accept, prop_leak_result};
 
     #[derive(Debug, Clone, Copy, PartialEq, Default)]
     pub struct Rel(pub u8);
@@ -1851,5 +1851,47 @@ pub mod kinds {
         fn m<Y: Clone>(&self, a1: Wrap<Y>, ai: impl Into<Wrap<Y>>)
         where
             Y: Fn(Rel) -> u8;
+    }
+
+    // Errors that the Leaker does not decide on (`prop_leak_result`): its macro carries them with the
+    // Referrer, and the Referrer's macro allows some (`allow(..)`), reports the others, and copies
+    // the item either way. The Leaker does not allow the prelude, so a relative `Clone` or
+    // `core::fmt::Debug` in a bound is an error (`RelativePath`, the cause is the trait). 9190 to 9192
+    // are copied in the Referrer's crate (`accepted`); 9193 in `tests/crates/diagnostic_result`.
+
+    /// `Clone` as the bound of the trait's generic, as a supertrait and in the bound of a method:
+    /// three errors, all dropped by `allow(prelude)`. The copy keeps the three as written.
+    #[prop_leak_result(id = 9190, allow_self = true)]
+    pub trait PreludeBounds<T: Clone>: Clone {
+        fn rel(&self, t: T) -> Rel;
+        fn dup<U: Clone>(&self, u: U) -> Pair<Wrap<T>, Wrap<U>>;
+    }
+
+    /// A path headed by `core` or `std` with no leading `::`, in a bound of the trait's generic and in
+    /// a where predicate: two errors, dropped by `allow(std_crates)` and not by `allow(prelude)`.
+    #[prop_leak_result(id = 9191, allow_self = true)]
+    pub trait StdBounds<T: core::fmt::Debug> {
+        fn rel(&self, t: T) -> Rel;
+        fn show<U>(&self, u: Wrap<U>) -> Rel
+        where
+            U: std::fmt::Display;
+    }
+
+    /// A trait of the module in a bound, twice, and a type of the module with an elided lifetime:
+    /// two causes (`PlainTr`, `Held<'_>`), allowed by writing them, `allow(trait PlainTr, type
+    /// Held<'_>)`.
+    #[prop_leak_result(id = 9192, allow_self = true)]
+    pub trait ExplicitCauses<T: PlainTr> {
+        fn held(&self, x: Held<'_>) -> Rel;
+        fn plain<U: PlainTr>(&self, u: U) -> Wrap<T>;
+    }
+
+    /// Three errors, of which the Referrer's macro allows one (`allow(prelude)`: the `Clone`) and
+    /// reports two: `core::fmt::Debug` (not the prelude) and `Held<'_>` (not allowed at all). The
+    /// copy is made either way.
+    #[prop_leak_result(id = 9193, allow_self = true)]
+    pub trait Denied<T: Clone> {
+        fn held(&self, x: Held<'_>) -> Rel;
+        fn show<U: core::fmt::Debug>(&self, u: Wrap<U>) -> Wrap<T>;
     }
 }

@@ -1122,7 +1122,7 @@ pub fn prop_leak(
     attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    match prop::leak(attr.into(), item.into(), false) {
+    match prop::leak(attr.into(), item.into(), prop::Mode::Plain) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -1136,7 +1136,23 @@ pub fn prop_leak_accept(
     attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    match prop::leak(attr.into(), item.into(), true) {
+    match prop::leak(attr.into(), item.into(), prop::Mode::Accept) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Like `prop_leak_accept`, but the Leaker leaves the errors to the Referrer: an item that has some
+/// is emitted as an accepted item whose macro carries the `LeakerResult` (the Referrer, then the
+/// errors, as tokens). `__prop_apply!` drops the errors that its invocation allows
+/// (`allow(prelude, std_crates, trait Path, type Ty)`), reports the others with
+/// `ErrorItem::to_compile_error()`, and copies the item with the recovered Referrer. See `prop.rs`.
+#[proc_macro_attribute]
+pub fn prop_leak_result(
+    attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    match prop::leak(attr.into(), item.into(), prop::Mode::Result) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }

@@ -32,6 +32,12 @@
 //! `LeakerResult::allow(cause)` for the cause of every error drops every error. Its copy is made in
 //! the Referrer's crate of the accepted items only (`accept` in the invocation, [`apply()`]), where
 //! the parts that it keeps as written resolve.
+//!
+//! With `#[prop_leak_result]` the Leaker does not decide: an item with errors is emitted with its
+//! `LeakerResult` (the Referrer, then the errors, as tokens). The Referrer's invocation says what
+//! it allows (`allow(prelude, std_crates, trait Path, type Ty)`: `LeakerResult::allow_prelude()`,
+//! `allow_std_crates()`, `allow(cause)`), [`apply()`] reports every error that remains with
+//! `ErrorItem::to_compile_error()`, and copies the item with the recovered Referrer either way.
 
 use proc_macro2::{Punct, Spacing, Span, TokenStream};
 use std::collections::HashSet;
@@ -1951,6 +1957,17 @@ fn rejection_text(errors: &[ErrorItem]) -> String {
         .join("\u{1d}")
 }
 
+/// What [`leak()`] does with an item that the Leaker rejects.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Mode {
+    /// `#[prop_leak]`: the item is not leaked (`rej`).
+    Plain,
+    /// `#[prop_leak_accept]`: accepted if `allow()` of every cause drops every error.
+    Accept,
+    /// `#[prop_leak_result]`: accepted with its errors, which the Referrer's macro allows or reports.
+    Result,
+}
+
 /// `#[prop_leak(..)]`, and, with `accept`, `#[prop_leak_accept(..)]` (`TYPE_LEAK_PROP_ACCEPT`).
 ///
 /// With `accept`, an item that the Leaker rejects is emitted with the recovered Referrer
@@ -1959,7 +1976,11 @@ fn rejection_text(errors: &[ErrorItem]) -> String {
 /// if `LeakerResult::allow(cause)` for the cause of every error drops every error (else `accfail`,
 /// and the remaining errors follow the first ones: it must not happen). The errors are what the
 /// report says (and what `family()` of the harness explains).
-pub(crate) fn leak(attr: TokenStream, item: TokenStream, accept: bool) -> Result<TokenStream> {
+///
+/// With `Mode::Result` the same item is emitted whatever the errors, and the macro of the Referrer
+/// carries the `LeakerResult` with them in place of the Referrer.
+pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<TokenStream> {
+    let accept = mode != Mode::Plain;
     let mut args: Args = parse2(attr)?;
     let original: Item = parse2(item)?;
     let id = args.id;
@@ -1993,7 +2014,7 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, accept: bool) -> Result
             allowed.allow(error.cause.clone());
         }
         let remaining = allowed.errors().to_vec();
-        if !accept || !remaining.is_empty() {
+        if mode != Mode::Result && (!accept || !remaining.is_empty()) {
             // The item is not leaked: the Leaker's crate still has it.
             let status = if accept { "accfail" } else { "rej" };
             let reason = crate::messages(&errors).replace(['\n', '|'], " ");
@@ -2018,8 +2039,11 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, accept: bool) -> Result
         }
         args.accepted = true;
     }
+    // What the macro of the Referrer carries: the result with its errors, or the Referrer.
+    let carried = (mode == Mode::Result).then(|| result.to_token_stream());
     // The recovered Referrer: the parts that conflict are copied as written.
     let referrer = result.into_referrer();
+    let carried = carried.unwrap_or_else(|| referrer.to_token_stream());
 
     check_nested_self_is_required(&referrer, &original, &args)?;
     let (impls, skipped) = repeater_impls(&referrer, id, args.strict.unwrap_or(true))?;
@@ -2115,7 +2139,7 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, accept: bool) -> Result
         macro_rules! #mac_name {
             (#dollar(#dollar t:tt)*) => {
                 #dollar crate::__macro::__prop_apply! {
-                    { #referrer , #context }
+                    { #carried , #context }
                     { #args_tokens }
                     { #original }
                     #dollar(#dollar t)*
@@ -2125,9 +2149,41 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, accept: bool) -> Result
     })
 }
 
+/// What the Referrer's invocation allows of the errors it got (`allow(prelude, std_crates, trait
+/// Path, type Ty)`).
+enum Allow {
+    /// `LeakerResult::allow_prelude()`
+    Prelude,
+    /// `LeakerResult::allow_std_crates()`
+    StdCrates,
+    /// `LeakerResult::allow(cause)`: `trait Path` is a `Cause::Trait`, `type Ty` a `Cause::Type`.
+    Cause(Cause),
+}
+
+impl Parse for Allow {
+    fn parse(input: ParseStream) -> Result<Self> {
+        if input.parse::<Option<Token![trait]>>()?.is_some() {
+            return Ok(Allow::Cause(Cause::Trait(input.parse()?)));
+        }
+        if input.parse::<Option<Token![type]>>()?.is_some() {
+            return Ok(Allow::Cause(Cause::Type(input.parse()?)));
+        }
+        let word: Ident = input.parse()?;
+        match word.to_string().as_str() {
+            "prelude" => Ok(Allow::Prelude),
+            "std_crates" => Ok(Allow::StdCrates),
+            _ => Err(Error::new(
+                word.span(),
+                "expected `prelude`, `std_crates`, `trait <path>` or `type <type>`",
+            )),
+        }
+    }
+}
+
 /// Input of `__prop_apply!`.
 struct ApplyInput {
-    referrer: Referrer,
+    /// A Referrer without errors reads as a result too.
+    result: LeakerResult,
     context: ContextId,
     args: Args,
     item: Item,
@@ -2140,6 +2196,8 @@ struct ApplyInput {
     /// where the names that such an item copies as written resolve as in the Leaker's crate: the
     /// copy is made there and not in the other crate, see [`apply()`].
     accept: bool,
+    /// What the invocation allows of the errors of the result.
+    allow: Vec<Allow>,
 }
 
 fn braced_parse<T: Parse>(input: ParseStream) -> Result<T> {
@@ -2150,12 +2208,12 @@ fn braced_parse<T: Parse>(input: ParseStream) -> Result<T> {
 
 impl Parse for ApplyInput {
     fn parse(input: ParseStream) -> Result<Self> {
-        let (referrer, context) = {
+        let (result, context) = {
             let content;
             braced!(content in input);
-            let referrer = content.parse()?;
+            let result = content.parse()?;
             content.parse::<Token![,]>()?;
-            (referrer, content.parse()?)
+            (result, content.parse()?)
         };
         let args = braced_parse(input)?;
         let item = braced_parse(input)?;
@@ -2166,24 +2224,30 @@ impl Parse for ApplyInput {
         input.parse::<Token![=]>()?;
         let path = Path::parse_mod_style(input)?;
         // Flags after the path: `strict`, `dyn_host` (the trait is implemented for `dyn Host`,
-        // an unsized type, instead of a unit struct) and `accept`.
+        // an unsized type, instead of a unit struct), `accept` and `allow(..)`.
         let (mut strict, mut dyn_host, mut accept) = (false, false, false);
+        let mut allow = Vec::new();
         while input.parse::<Option<Token![,]>>()?.is_some() {
             let keyword: Ident = input.parse()?;
             match keyword.to_string().as_str() {
                 "strict" => strict = true,
                 "dyn_host" => dyn_host = true,
                 "accept" => accept = true,
+                "allow" => {
+                    let content;
+                    parenthesized!(content in input);
+                    allow.extend(Punctuated::<Allow, Token![,]>::parse_terminated(&content)?);
+                }
                 _ => {
                     return Err(Error::new(
                         keyword.span(),
-                        "expected `strict`, `dyn_host` or `accept`",
+                        "expected `strict`, `dyn_host`, `accept` or `allow(..)`",
                     ))
                 }
             }
         }
         Ok(Self {
-            referrer,
+            result,
             context,
             args,
             item,
@@ -2191,6 +2255,7 @@ impl Parse for ApplyInput {
             strict,
             dyn_host,
             accept,
+            allow,
         })
     }
 }
@@ -2206,9 +2271,13 @@ impl Parse for ApplyInput {
 /// the crate of those items has the modules for (`gen::Case::accept_referrer`). The other crate
 /// has none of them: the copy of an ordinary item that kept such a path would not compile there.
 /// The imports of a copied module stay, as the part that is copied as written may name them.
+///
+/// The errors of the result (`#[prop_leak_result]`) that `allow(..)` of the invocation does not drop
+/// are reported here, in the Referrer's crate, and the copy is made with the recovered Referrer
+/// either way.
 pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     let ApplyInput {
-        referrer,
+        mut result,
         context,
         args,
         item,
@@ -2216,10 +2285,20 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         strict,
         dyn_host,
         accept,
+        allow,
     } = parse2(input)?;
     if args.accepted != accept {
         return Ok(TokenStream::new());
     }
+    for allowed in allow {
+        match allowed {
+            Allow::Prelude => result.allow_prelude(),
+            Allow::StdCrates => result.allow_std_crates(),
+            Allow::Cause(cause) => result.allow(cause),
+        };
+    }
+    let errors = crate::report(result.errors());
+    let referrer = result.into_referrer();
     // `strict` makes the Referrer replace the optional entries as well.
     if args.strict.is_some_and(|said| said != strict) {
         return Err(Error::new(
@@ -2281,6 +2360,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         other => quote!(#other),
     };
     Ok(quote! {
+        #errors
         #body
         #checks
     })

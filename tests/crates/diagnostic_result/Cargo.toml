@@ -1,0 +1,15 @@
+[package]
+name = "type-leak-test-diagnostic-result"
+version = "0.0.0"
+edition = "2018"
+publish = false
+description = "A Referrer's crate that reports the errors it does not allow, for tests/diagnostic.rs"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+type-leak-test-leaker = { path = "../leaker" }
+
+# Built on its own by tests/diagnostic.rs.
+[workspace]
