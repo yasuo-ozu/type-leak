@@ -55,6 +55,8 @@
 //! | `f44_a_part_that_names_self_is_found_when_no_entry_does` | a part whose context names `Self` was never found when no entry named it: the top-level context of the scope left `Self` out | fixed |
 //! | `f45_a_part_in_a_nested_item_is_left_without_with_nested_self` | a part in an item nested in a scope was replaced by a visitor without `with_nested_self()` | fixed |
 //! | `f46_the_help_for_a_relative_std_path_suggests_the_crate_itself` | the help for a relative path that starts with `core`, `std` or `alloc` suggested `::my_crate::core::fmt::Debug` | fixed |
+//! | `f47_self_in_an_outlives_predicate_keeps_the_bounds_of_the_description_of_self_only` | `Self: 'x` made the context of an entry keep the bounds that F26 leaves out: E0277 in the copy | fixed |
+//! | `f48_a_type_corrected_for_a_signature_is_left_only_in_a_signature_like_it` | a type copied as written for the signature it is in (E0195, E0106) was left so in every other item and signature of its context | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that the docs of `Leaker` document, or that follows from what rustc accepts). No test
@@ -4675,14 +4677,17 @@ fn repeater_impl_text(referrer: &Referrer, ix: usize) -> String {
 /// The risk: a leaked type that needs the bound that is left out (`struct Rel<T: Fn(X<T>)>`, or a
 /// type that names `<T as Tr<Wrap<T>>>::A`) does not compile in the Repeater's impl: E0277 in the
 /// Leaker's crate, which the Leaker cannot see. The `Leaker` docs say so. It is not a risk where
-/// the Leaker knows the declaration: the entry that depends on `Self` as a type (the self type of
-/// the item, `Wrap2<Self>` in `struct S<T: Iterator<Item = u8> + Fn(T::Item)>`) or as an
-/// implementor (`Self::A` of a trait), and the entry that writes out the self type of the scope
-/// (`impl<T: Iterator<Item = u8> + Fn(T::Item)> S<T>` with the entry `S<T>`, whose top-level
-/// context then records `Self` for the Referrer, as it does for a bound rewritten for it), keep
-/// every bound, because the type is well-formed only with the bounds that its item declares (the
-/// property test showed it: seeds 1 and 2 were E0277 in the Leaker's crate for a struct, an enum, a
-/// union, an impl and a trait, with the fixtures 9182 and 9183 of `tests/cross_crate.rs`).
+/// the Leaker knows the declaration: the entry that names `Self` (the self type of the item,
+/// `Wrap2<Self>` in `struct S<T: Iterator<Item = u8> + Fn(T::Item)>`, or `Self::A` of a trait), and
+/// the entry that writes out the self type of the scope (`impl<T: Iterator<Item = u8> +
+/// Fn(T::Item)> S<T>` with the entry `S<T>`, whose top-level context then records `Self` for the
+/// Referrer, as it does for a bound rewritten for it), keep every bound, because the type is
+/// well-formed only with the bounds that its item declares (the property test showed it: seeds 1
+/// and 2 were E0277 in the Leaker's crate for a struct, an enum, a union, an impl and a trait, with
+/// the fixtures 9182 and 9183 of `tests/cross_crate.rs`). An entry that depends on `Self` only
+/// through a bound or an outlives predicate (`Self: 'x` of a method) keeps whole the bounds of the
+/// generics that the description of `Self` names (`impl<T: ..> S<T>`, `Tr<T>`), and trims the
+/// others: see F47.
 ///
 /// The property test shows it with `TYPE_LEAK_PROP_FEATURES=alias_item` (on by default since the
 /// fix; before it, seeds 1, 2 and 3 of 60 cases failed with the same E0277 as F25).
@@ -11582,7 +11587,7 @@ fn f43_an_unwritable_part_is_serialized_and_read_back() {
         ("type (R) nothing", "expected a context or `unwritable`"),
         (
             "type (R) unwritable nope",
-            "expected `predicate`, `in` or `,`",
+            "expected `sig`, `predicate`, `in` or `,`",
         ),
         ("type (R) unwritable in (&R)", "expected integer literal"),
         (
@@ -11591,7 +11596,7 @@ fn f43_an_unwritable_part_is_serialized_and_read_back() {
         ),
         (
             "type (R) unwritable unwritable",
-            "expected `predicate`, `in` or `,`",
+            "expected `sig`, `predicate`, `in` or `,`",
         ),
     ] {
         let error = read(parts)
@@ -11910,5 +11915,385 @@ fn f46_the_help_for_a_relative_std_path_suggests_the_crate_itself() {
         ),
     ] {
         assert_eq!(help_of(item), [help(path, example)], "{}", path);
+    }
+}
+
+// ── F47 ──────────────────────────────────────────────────────────────────────
+
+/// F47 (fixed): `Self: 'x` made the context of an entry keep the bounds that F26 leaves out.
+///
+/// Trigger: `trait Tr { fn m<'x, Y: 'x + Iterator<Item = u8>>(&self) where Self: 'x, Y:
+/// Fn(::p::WIt<Y>) -> u8, Rel<Y>: Default; }`. The entry `Rel<Y>` does not name `Self`, but `Y: 'x`
+/// pulls in `Self: 'x`, so its context depended on `Self`, and `Context::compute()` kept every
+/// bound of every generic, `Y: Fn(WIt<Y>)` too: E0277 "expected an `Fn(u8)` closure, found `Y`" in
+/// the copy (F26). The same for an impl (`Self` is its self type).
+///
+/// Now an entry that names `Self` (`Rel<Self::A, Y>`), or writes out the self type, keeps every
+/// bound, and one that depends on `Self` only through a bound or an outlives predicate keeps whole
+/// the bounds of the generics that the description of `Self` names (`impl<T: ..> S<T>`, `Tr<T>`)
+/// and leaves out the others. The serialized contexts of such items changed (format 16).
+///
+/// The cross-crate fixtures are 9200 (trait) and 9201 (impl of a trait) in `tests/cross_crate.rs`.
+#[test]
+fn f47_self_in_an_outlives_predicate_keeps_the_bounds_of_the_description_of_self_only() {
+    let leaked = |item: &Item| -> (Referrer, Item) {
+        let mut leaker = f13_leaker();
+        let context = match item {
+            Item::Impl(i) => leaker.intern_impl(i, true),
+            Item::Trait(i) => leaker.intern_trait(i, true),
+            _ => panic!("unsupported item"),
+        };
+        let referrer = leaker.result().finish().unwrap();
+        let mut copy = item.clone();
+        referrer
+            .clone()
+            .visitor(context, |_, ix| parse_quote!(P<#ix>))
+            .visit_item_mut(&mut copy);
+        (referrer, copy)
+    };
+    // `Self: 'x` only: `Y: Fn(WIt<Y>)` is left out, in a trait and in an impl.
+    let outlives: Vec<(Item, SelfRequirement)> = vec![
+        (
+            parse_quote!(
+                pub trait Tr {
+                    fn m<'x, Y: 'x + Iterator<Item = u8>>(&self)
+                    where
+                        Self: 'x,
+                        Y: Fn(::p::WIt<Y>) -> u8,
+                        Rel<Y>: Default;
+                }
+            ),
+            SelfRequirement::Bound(parse_quote!(Tr)),
+        ),
+        (
+            parse_quote!(
+                impl<'a> ::p::Tr<'a> for ::p::W {
+                    fn m<'x, Y: 'x + Iterator<Item = u8>>(&'x self) -> u8
+                    where
+                        Self: 'x,
+                        Y: Fn(::p::WIt<Y>) -> u8,
+                        Rel<Y>: Default,
+                    {
+                        loop {}
+                    }
+                }
+            ),
+            SelfRequirement::Type(parse_quote!(::p::W)),
+        ),
+    ];
+    for (item, self_req) in &outlives {
+        let (referrer, copy) = leaked(item);
+        let ix = entry(&referrer, "Rel < Y >");
+        assert_eq!(
+            generics_text(referrer.generics(ix)),
+            "< 'x , Y : 'x + Iterator < Item = u8 > > where Rel < Y > : Default",
+            "{}",
+            string(item)
+        );
+        assert_eq!(referrer.context_self(referrer.context(ix)), Some(self_req));
+        assert!(has_replacement_in_predicate(&copy), "{}", string(&copy));
+        // The context is written and read back.
+        let again: Referrer = parse2(quote!(#referrer)).unwrap();
+        assert_eq!(again, referrer);
+        assert_eq!(
+            generics_text(again.generics(ix)),
+            generics_text(referrer.generics(ix))
+        );
+    }
+    // The generic that the description of `Self` names keeps every bound (`Tr<T>`, `S<T>`), a
+    // generic of the method does not.
+    let described: Vec<Item> = vec![
+        parse_quote!(
+            pub trait Tr<T: Iterator<Item = u8>>
+            where
+                T: Fn(::p::WIt<T>),
+            {
+                fn m<'x, Y: 'x + Iterator<Item = u8>>(&'x self)
+                where
+                    Self: 'x,
+                    Y: Fn(::p::WIt<Y>) -> u8,
+                    Rel<T, Y>: Default;
+            }
+        ),
+        parse_quote!(
+            impl<T: Iterator<Item = u8> + Fn(::p::WIt<T>)> ::p::S<T> {
+                fn m<'x, Y: 'x + Iterator<Item = u8>>(&'x self)
+                where
+                    Self: 'x,
+                    Y: Fn(::p::WIt<Y>) -> u8,
+                    Rel<T, Y>: Default,
+                {
+                }
+            }
+        ),
+    ];
+    for item in &described {
+        let (referrer, copy) = leaked(item);
+        assert_eq!(
+            string(referrer.generics(entry(&referrer, "Rel < T , Y >"))),
+            "< 'x , T : Fn (:: p :: WIt < T >) + Iterator < Item = u8 > , Y : 'x + Iterator < \
+             Item = u8 > >",
+            "{}",
+            string(item)
+        );
+        assert!(has_replacement_in_predicate(&copy), "{}", string(&copy));
+    }
+    // An entry that names `Self` keeps every bound, also those of the generics of the method.
+    let names_self: Item = parse_quote!(
+        pub trait Tr {
+            type A;
+            fn m<Y: Iterator<Item = u8> + Fn(::p::WIt<Y>)>(&self, x: Rel<Self::A, Y>);
+        }
+    );
+    let (referrer, _) = leaked(&names_self);
+    assert_eq!(
+        string(referrer.generics(entry(&referrer, "Rel < Self :: A , Y >"))),
+        "< Y : Fn (:: p :: WIt < Y >) + Iterator < Item = u8 > >"
+    );
+}
+
+// ── F48 ──────────────────────────────────────────────────────────────────────
+
+/// The items of F48 in one Leaker, with the errors that remain and their top-level contexts.
+fn f48_leak(items: &[Item]) -> (Referrer, Vec<ContextId>, Vec<Reason>) {
+    let mut leaker = Leaker::from_config(std_config());
+    let contexts = items.iter().map(|item| intern(&mut leaker, item)).collect();
+    let result = leaker.result();
+    let reasons = result.errors().iter().map(|e| e.reason).collect();
+    (result.into_referrer(), contexts, reasons)
+}
+
+/// The copies of `items`, each with the entries replaced by `P<ix>`.
+fn f48_copies(referrer: &Referrer, contexts: &[ContextId], items: &[Item]) -> Vec<String> {
+    items
+        .iter()
+        .zip(contexts)
+        .map(|(item, context)| {
+            let mut copy = item.clone();
+            referrer
+                .clone()
+                .visitor(*context, |_, ix| parse_quote!(P<#ix>))
+                .visit_item_mut(&mut copy);
+            string(&copy)
+        })
+        .collect()
+}
+
+/// F48 (fixed): a type copied as written for the signature it is in was left so everywhere.
+///
+/// Trigger, E0195: `fn f<'x>(&self, a: Wrap<'x>) -> &'x u8` in a trait: `Wrap<'x>` is the only
+/// input that names `'x`, and leaked it would leave it unconstrained, so the Leaker reports it
+/// (`UnconstrainedLifetime`) and, once `allow()`ed, copies it as written. The part had no anchor:
+/// the Referrer left every `Wrap<'x>` of that context as written, `g<'x>(&self, a: Wrap<'x>)` and
+/// the field of `struct S<'x>` in the same Leaker too, where the Referrer's crate may not name
+/// `Wrap` (E0412). E0106, the same: `fn f(x: &u8, y: Wrap<T>) -> &u8` in `trait Tr<'a, T: 'a>`,
+/// where the projection of `Wrap<T>` names `'a` and the elided output sees two lifetimes.
+///
+/// The part carries a mark that the Referrer computes at each signature (`SignatureFacts`):
+/// `sig ('x)` (the method lifetimes of the type that the output names and no bound does) and `sig
+/// (elided)` (the signature relies on elision, and the type adds lifetimes to it). It is left as
+/// written only in the arguments of a signature that has the same fault: not in another item, in
+/// the output, in a bound, or where no signature is visited (`Referrer::expand()`). The entries,
+/// their contexts and the other parts are as before (format 16).
+///
+/// A limit: another input that keeps the lifetime as written (`&'x self`) makes the Leaker keep
+/// the entry, and the Referrer cannot tell: the signature has the same mark there.
+///
+/// The cross-crate fixtures are 9202 and 9203 (`tests/cross_crate.rs`).
+#[test]
+fn f48_a_type_corrected_for_a_signature_is_left_only_in_a_signature_like_it() {
+    // E0195. `Tr::f` and `Tr2::f` output the lifetime, `Tr3::f` does not, and `Tr4::f` names it in
+    // the output as an entry too.
+    let items: Vec<Item> = vec![
+        parse_quote!(
+            trait Tr {
+                fn f<'x>(&self, a: Wrap<'x>) -> &'x u8;
+                fn g<'x>(&self, a: Wrap<'x>);
+            }
+        ),
+        parse_quote!(
+            struct S<'x> {
+                w: Wrap<'x>,
+            }
+        ),
+        parse_quote!(
+            trait Tr2 {
+                fn f<'x>(&self, a: Wrap<'x>) -> &'x u8;
+            }
+        ),
+        parse_quote!(
+            trait Tr3 {
+                fn f<'x>(&self, a: Wrap<'x>);
+            }
+        ),
+        parse_quote!(
+            trait Tr4 {
+                fn f<'x>(&self, a: Wrap<'x>) -> Wrap<'x>;
+            }
+        ),
+    ];
+    let (referrer, contexts, reasons) = f48_leak(&items);
+    assert_eq!(reasons, [Reason::UnconstrainedLifetime; 3]);
+    assert_eq!(parts_of(&referrer), ["type (Wrap < 'x >) 0 sig ('x)"]);
+    assert_eq!(
+        f48_copies(&referrer, &contexts, &items),
+        [
+            "trait Tr { fn f < 'x > (& self , a : Wrap < 'x >) -> & 'x u8 ; fn g < 'x > (& self , a : P < 0usize >) ; }",
+            "struct S < 'x > { w : P < 0usize > , }",
+            "trait Tr2 { fn f < 'x > (& self , a : Wrap < 'x >) -> & 'x u8 ; }",
+            "trait Tr3 { fn f < 'x > (& self , a : P < 0usize >) ; }",
+            "trait Tr4 { fn f < 'x > (& self , a : Wrap < 'x >) -> P < 0usize > ; }",
+        ]
+    );
+    // Without the mark, the part is left everywhere: the field of `S` and `g` too.
+    let unmarked: Referrer = parse_str(&string(&referrer).replace(" sig ('x)", "")).unwrap();
+    assert_eq!(parts_of(&unmarked), ["type (Wrap < 'x >) 0"]);
+    let copies = f48_copies(&unmarked, &contexts, &items);
+    assert_eq!(copies[1], "struct S < 'x > { w : Wrap < 'x > , }");
+    assert!(copies[0].contains("fn g < 'x > (& self , a : Wrap < 'x >)"));
+
+    // E0106. `f` has no receiver and an elided output, and `Wrap<T>` adds `'a` to its one input
+    // lifetime. `g` and `k` have a receiver that gives its lifetime to the output, and `h` has no
+    // output.
+    let items: Vec<Item> = vec![
+        parse_quote!(
+            trait Tr<'a, T: 'a> {
+                fn f(x: &u8, y: Wrap<T>) -> &u8;
+                fn g(&self, y: Wrap<T>);
+                fn h(y: Wrap<T>);
+                fn k(&self, y: Wrap<T>) -> &u8;
+            }
+        ),
+        parse_quote!(
+            struct S<'a, T: 'a>(::core::marker::PhantomData<&'a T>, Wrap<T>);
+        ),
+    ];
+    let (referrer, contexts, reasons) = f48_leak(&items);
+    assert_eq!(reasons, [Reason::RelativePath]);
+    assert_eq!(parts_of(&referrer), ["type (Wrap < T >) 0 sig (elided)"]);
+    assert_eq!(
+        f48_copies(&referrer, &contexts, &items),
+        [
+            "trait Tr < 'a , T : 'a > { fn f (x : & u8 , y : Wrap < T >) -> & u8 ; fn g (& self , y : P < 0usize >) ; fn h (y : P < 0usize >) ; fn k (& self , y : P < 0usize >) -> & u8 ; }",
+            "struct S < 'a , T : 'a > (:: core :: marker :: PhantomData < & 'a T > , P < 0usize >) ;",
+        ]
+    );
+}
+
+/// F48: where the visitor leaves a marked part, and where it does not.
+#[test]
+fn f48_a_marked_part_is_left_in_the_arguments_of_a_signature_only() {
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f<'x>(&self, a: Wrap<'x>) -> &'x u8;
+        }
+    );
+    let mut leaker = Leaker::from_config(std_config());
+    let context = leaker.intern_trait(&item, true);
+    // Another item gives the type an entry, so there is something to replace it with.
+    let struct_context = leaker.intern_struct(
+        &parse_quote!(
+            struct S<'x>(Wrap<'x>);
+        ),
+        true,
+    );
+    let referrer = leaker.result().into_referrer();
+    let replace = |_: Type, ix: usize| -> Type { parse_quote!(P<#ix>) };
+    let ty: Type = parse_quote!(Wrap<'x>);
+    let sig: Signature = parse_quote!(fn f<'x>(&self, a: Wrap<'x>) -> &'x u8);
+    let other: Signature = parse_quote!(fn f<'x>(&self, a: Wrap<'x>));
+
+    // In the arguments of the signature that has the fault: as written.
+    let mut copy = sig.clone();
+    referrer
+        .clone()
+        .visitor(context, replace)
+        .visit_signature_mut(&mut copy);
+    assert_eq!(string(&copy), string(&sig));
+    // In a signature without it, in the output, and in no signature: replaced.
+    let mut copy = other.clone();
+    referrer
+        .clone()
+        .visitor(context, replace)
+        .visit_signature_mut(&mut copy);
+    assert_eq!(string(&copy), "fn f < 'x > (& self , a : P < 0usize >)");
+    let mut copy: Signature = parse_quote!(fn f<'x>(&self, a: Wrap<'x>) -> Wrap<'x>);
+    referrer
+        .clone()
+        .visitor(context, replace)
+        .visit_signature_mut(&mut copy);
+    assert_eq!(
+        string(&copy),
+        "fn f < 'x > (& self , a : Wrap < 'x >) -> P < 0usize >"
+    );
+    let mut copy = ty.clone();
+    referrer
+        .clone()
+        .visitor(struct_context, replace)
+        .visit_type_mut(&mut copy);
+    assert_eq!(string(&copy), "P < 0usize >");
+    assert_eq!(
+        string(&referrer.expand(struct_context, ty, replace)),
+        "P < 0usize >"
+    );
+}
+
+/// F48: the mark is written after the context, and the parser reads what the serializer writes.
+#[test]
+fn f48_a_mark_is_serialized_and_read_back() {
+    let tag = format!("\"type-leak-format-{}\"", Referrer::FORMAT_VERSION);
+    let read = |parts: &str| -> std::result::Result<Referrer, String> {
+        parse_str::<Referrer>(&format!("{} [{}] 2 (Rel) < 'x , 'y > ; ()", tag, parts))
+            .map_err(|e| e.to_string())
+    };
+    for parts in [
+        "type (R<'x>) 0 sig ('x)",
+        "type (R<'x, 'y>) 1 sig ('x, 'y) predicate",
+        "type (R<T>) 0 sig (elided) in (Wrap<R<T>>) 1",
+        "type (R<T>) unwritable sig (elided) predicate in (Wrap<R<T>>) 0",
+        "type (R<'x>) 0, type (R<'x>) 0 sig ('x), type (R) 1 sig (elided)",
+    ] {
+        let referrer = read(parts).unwrap_or_else(|e| panic!("{}: {}", parts, e));
+        let written = parts_of(&referrer);
+        let again: Referrer = parse2(quote!(#referrer)).unwrap();
+        assert_eq!(again, referrer, "{}", parts);
+        assert_eq!(parts_of(&again), written, "{}", parts);
+        assert_eq!(
+            written.join(" , ").replace(' ', ""),
+            parts.replace(' ', ""),
+            "{}",
+            parts
+        );
+    }
+    // A part with a mark is not the part without.
+    assert_ne!(
+        read("type (R<'x>) 0 sig ('x)").unwrap(),
+        read("type (R<'x>) 0").unwrap()
+    );
+    for (parts, message) in [
+        ("type (R) 0 sig", "expected parentheses"),
+        ("type (R) 0 sig ()", "expected lifetime"),
+        ("type (R) 0 sig (nope)", "expected `elided` or lifetimes"),
+        (
+            "type (R) 0 sig (elided, 'x)",
+            "expected `elided` or lifetimes",
+        ),
+        ("type (R) 0 sig ('x,)", "expected lifetime"),
+        ("type (R) 0 sig ('x, 'x)", "the lifetime is written twice"),
+        ("type (R) 0 sig ('x 'y)", "expected `,`"),
+        (
+            "type (R) 0 sig ('x) sig ('x)",
+            "expected `predicate`, `in` or `,`",
+        ),
+        ("type (R) 0 predicate sig ('x)", "expected `,`"),
+        (
+            "type (R) 0 nope",
+            "expected `sig`, `predicate`, `in` or `,`",
+        ),
+    ] {
+        let error = read(parts)
+            .err()
+            .unwrap_or_else(|| panic!("read: {}", parts));
+        assert!(error.contains(message), "{}: {}", parts, error);
     }
 }

@@ -1,6 +1,6 @@
 //! The [`Referrer`], which rewrites copies of the analyzed items.
 
-use crate::analysis::PartItem;
+use crate::analysis::{PartItem, SignatureFacts, SignatureMark};
 use crate::context::{Context, ContextId, Enclosing, Gat, ModuleInfo, Scope, SelfRequirement};
 use crate::elided::{name_elided_in_bare_fn, name_elided_in_bound};
 use crate::encode::{complete_generics_args, param_as_arg, without_encoded_bounds, EncodeError};
@@ -166,6 +166,8 @@ struct Lookup<'a> {
     matching: Matching<'a>,
     module: ModulePos,
     place: Place,
+    /// The signature that the visited syntax is in, for the parts that a signature made.
+    signature: Option<&'a SignatureFacts>,
 }
 
 impl Referrer {
@@ -312,10 +314,20 @@ impl Referrer {
                 context,
                 in_predicate,
                 within,
+                mark,
                 ..
             } = &self.parts[ix];
             *in_predicate == at.place.in_predicate
                 && (within.is_none() || active.contains(&ix))
+                && match (mark, at.signature) {
+                    (None, _) => true,
+                    // Made by a signature: in the arguments of one that has the same fault.
+                    (Some(mark), Some(facts)) => {
+                        at.place.in_fn_arg
+                            && facts.covers(mark, context.map(|context| self.get_context(context)))
+                    }
+                    (Some(_), None) => false,
+                }
                 && match context {
                     Some(context) => self.fits(*context, ty, at, scopes, enclosing),
                     None => Self::unwritable(at, ty, scopes, enclosing),
@@ -947,6 +959,7 @@ impl Referrer {
                     matching: Matching::Default,
                     module: ModulePos::Outside,
                     place: Place::default(),
+                    signature: None,
                 };
                 let ty = self.expand_with(
                     at,
@@ -1160,6 +1173,7 @@ impl Referrer {
             defaults: Defaults::Plain,
             module,
             place: Place::default(),
+            signature: None,
         }
     }
 
@@ -1168,7 +1182,8 @@ impl Referrer {
     /// `ty` is inside the scope `context`, as for [`Referrer::visitor()`]. Pass the whole type, not
     /// one cut out of a larger type: see [Outlives bounds](crate::Leaker#outlives-bounds). Only the
     /// generics of `context` are known, so a type that names a generic of a method is not found:
-    /// use [`Referrer::visitor()`] on the signature.
+    /// use [`Referrer::visitor()`] on the signature. For the same reason a type that the Leaker
+    /// copied as written for the signature it is in is replaced here.
     ///
     /// ```
     /// # use type_leak::*;
@@ -1204,6 +1219,7 @@ impl Referrer {
             matching,
             module,
             place: Place::default(),
+            signature: None,
         };
         self.expand_with(at, &mut vec![scope], None, ty, type_fn)
     }
@@ -1545,6 +1561,8 @@ pub struct Visitor<F, G = fn(&NestedSelf, Type, usize) -> Type> {
     module: ModulePos,
     /// Where the visited syntax is among the predicates of the item.
     place: Place,
+    /// The signature being visited (not its body), for the parts that a signature made.
+    signature: Option<Rc<SignatureFacts>>,
 }
 
 impl<F, G> Clone for Visitor<F, G> {
@@ -1564,6 +1582,7 @@ impl<F, G> Clone for Visitor<F, G> {
             defaults: self.defaults,
             module: self.module,
             place: self.place,
+            signature: self.signature.clone(),
         }
     }
 }
@@ -1923,6 +1942,7 @@ where
             defaults: self.defaults,
             module: self.module,
             place: self.place,
+            signature: self.signature,
         }
     }
 
@@ -2009,6 +2029,7 @@ where
             },
             module: self.module,
             place: self.place,
+            signature: self.signature.as_deref(),
         };
         self.referrer.is_part(
             &cause(),
@@ -2094,6 +2115,7 @@ where
         visitor
     }
 
+    /// Visits the signature and returns the visitor for its body.
     fn enter_signature(
         &mut self,
         attrs: &mut [Attribute],
@@ -2101,10 +2123,12 @@ where
         item: bool,
     ) -> Self {
         let mut visitor = self.enter(attrs, &mut sig.generics, None, item);
+        visitor.signature = Some(Rc::new(SignatureFacts::of(sig)));
         for input in sig.inputs.iter_mut() {
             visitor.visit_fn_arg_mut(input);
         }
         visitor.visit_return_type_mut(&mut sig.output);
+        visitor.signature = None;
         visitor
     }
 }
@@ -2149,6 +2173,7 @@ where
             },
             module: self.module,
             place: self.place,
+            signature: self.signature.as_deref(),
         };
         *i = referrer.expand_with(
             at,
@@ -2458,9 +2483,16 @@ impl Referrer {
     // names the generic in the arguments of its path (`T: Fn(Alias<T>)`), if another bound of it
     // fixes an associated type (`T: Iterator<Item = u8>`), which the Referrer computes for a copy,
     // so the entries of 14 are not found the same way. 16: the Referrer carries the parts that the
-    // Leaker copies as written, after the tag (`[KIND (CAUSE) CONTEXT [predicate] [in (TYPE)
-    // CONTEXT], ..]`, `unwritable` for a context that cannot be written), and the visitor leaves
-    // each as written: no entry is looked up in it.
+    // Leaker copies as written, after the tag (`[KIND (CAUSE) CONTEXT [sig (MARK)] [predicate]
+    // [in (TYPE) CONTEXT], ..]`, `unwritable` for a context that cannot be written), and the
+    // visitor leaves each as written: no entry is looked up in it. A part that a signature made
+    // has a mark (`sig ('x)`: the method lifetimes of the type that the output names and no bound
+    // does, E0195; `sig (elided)`: the signature relies on elision, E0106) and is left only in the
+    // arguments of a signature that has the same fault, which the Referrer computes at each. Also
+    // in 16: the context of an entry that depends on `Self` only through a bound or an outlives
+    // predicate (`Self: 'x`) keeps whole the bounds of the generics that the description of `Self`
+    // names (`Tr<T>`) and leaves out those of the others (15 kept all), which the Referrer
+    // computes for a copy.
     pub const FORMAT_VERSION: u32 = 16;
 }
 
@@ -2707,9 +2739,10 @@ impl Parse for Referrer {
     }
 }
 
-/// Reads a part written by its [`ToTokens`] implementation: `KIND ( CAUSE ) CONTEXT [predicate] [in
-/// ( TYPE ) CONTEXT]`, with the `KIND ( CAUSE )` of an [`ErrorItem`](crate::ErrorItem), and
-/// `unwritable` for a `CONTEXT` that cannot be written.
+/// Reads a part written by its [`ToTokens`] implementation: `KIND ( CAUSE ) CONTEXT [sig ( MARK
+/// )] [predicate] [in ( TYPE ) CONTEXT]`, with the `KIND ( CAUSE )` of an
+/// [`ErrorItem`](crate::ErrorItem), `unwritable` for a `CONTEXT` that cannot be written, and a
+/// `MARK` that is `elided` or lifetimes (`'x , 'y`).
 impl Parse for PartItem {
     fn parse(input: parse::ParseStream) -> Result<Self> {
         let kind = input.call(Ident::parse_any)?;
@@ -2728,13 +2761,29 @@ impl Parse for PartItem {
         } else {
             Some(input.parse()?)
         };
+        let mut mark = None;
         let mut in_predicate = false;
         if input.peek(Ident) {
-            let word: Ident = input.parse()?;
-            if word != "predicate" {
-                return Err(Error::new(word.span(), "expected `predicate`, `in` or `,`"));
+            let mut word: Ident = input.parse()?;
+            if word == "sig" {
+                let content;
+                parenthesized!(content in input);
+                mark = Some(content.parse()?);
+                if input.peek(Ident) {
+                    word = input.parse()?;
+                    if word != "predicate" {
+                        return Err(Error::new(word.span(), "expected `predicate`, `in` or `,`"));
+                    }
+                    in_predicate = true;
+                }
+            } else if word == "predicate" {
+                in_predicate = true;
+            } else {
+                return Err(Error::new(
+                    word.span(),
+                    "expected `sig`, `predicate`, `in` or `,`",
+                ));
             }
-            in_predicate = true;
         }
         // The anchor: the type that owns the cause of the conflict, in its context.
         let mut within = None;
@@ -2748,6 +2797,7 @@ impl Parse for PartItem {
             context,
             in_predicate,
             within,
+            mark,
         })
     }
 }
@@ -2760,6 +2810,7 @@ impl ToTokens for PartItem {
             context,
             in_predicate,
             within,
+            mark,
         } = self;
         let kind = Ident::new(part.kind(), Span::call_site());
         let context = match context {
@@ -2767,11 +2818,49 @@ impl ToTokens for PartItem {
             None => quote!(unwritable),
         };
         tokens.extend(quote! {
-            #kind (#part) #context #(if *in_predicate) { predicate }
+            #kind (#part) #context
+            #(if let Some(mark) = mark) { sig (#mark) }
+            #(if *in_predicate) { predicate }
             #(if let Some((anchor, anchor_context)) = within) {
                 in (#anchor) #anchor_context
             }
         });
+    }
+}
+
+/// Reads `elided`, or lifetimes separated by commas, with none twice.
+impl Parse for SignatureMark {
+    fn parse(input: parse::ParseStream) -> Result<Self> {
+        if input.peek(Ident) {
+            let word: Ident = input.parse()?;
+            if word != "elided" || !input.is_empty() {
+                return Err(Error::new(word.span(), "expected `elided` or lifetimes"));
+            }
+            return Ok(Self::Elided);
+        }
+        let mut lifetimes: Vec<Lifetime> = Vec::new();
+        loop {
+            let lifetime: Lifetime = input.parse()?;
+            if lifetimes.contains(&lifetime) {
+                return Err(Error::new(lifetime.span(), "the lifetime is written twice"));
+            }
+            lifetimes.push(lifetime);
+            if input.is_empty() {
+                return Ok(Self::Unconstrained(lifetimes));
+            }
+            input.parse::<Token![,]>()?;
+        }
+    }
+}
+
+impl ToTokens for SignatureMark {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        match self {
+            Self::Elided => tokens.extend(quote!(elided)),
+            Self::Unconstrained(lifetimes) => {
+                tokens.extend(quote!(#(for lifetime in lifetimes), { #lifetime }))
+            }
+        }
     }
 }
 
@@ -2852,8 +2941,9 @@ impl ToTokens for Referrer {
         // `# id` only after a gap in the ids. `()` if no entry. `?`: optional. `@[..]`: crates named.
         // parts: `[ part, .. ]`, only if there is one, as `PartItem` writes it: the `KIND ( CAUSE )`
         // of an `ErrorItem`, a context of the groups (`unwritable` if it cannot be written),
-        // `predicate` in a bound, and `in ( Type ) context` for the type that owns the cause (the
-        // anchor). A bracket cannot start a context group, so it needs no marker.
+        // `sig ( 'x , .. )` or `sig ( elided )` for the signature that made it, `predicate` in a
+        // bound, and `in ( Type ) context` for the type that owns the cause (the anchor). A bracket
+        // cannot start a context group, so it needs no marker.
         let tag = format!("{}{}", FORMAT_TAG_PREFIX, Self::FORMAT_VERSION);
         let n_contexts = self.context_map.len();
         tokens.extend(quote! {

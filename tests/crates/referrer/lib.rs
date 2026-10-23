@@ -212,6 +212,9 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9183!(path = ::type_leak_test_leaker::kinds);
     // The bound of another generic is not left out: the Leaker rejects it (it expands to nothing).
     type_leak_test_leaker::__tl_prop_9181!(path = ::type_leak_test_leaker::kinds);
+    // `Self: 'x` is no reason to keep the bound that is left out (F47).
+    type_leak_test_leaker::__tl_prop_9200!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9201!(path = ::type_leak_test_leaker::kinds);
     // The defaults of a nested trait whose generic has a bound that names its `Self`: the copy is
     // declared here, with the defaults written through the host.
     type_leak_test_leaker::__tl_prop_9131!(path = ::type_leak_test_leaker::kinds);
@@ -280,4 +283,16 @@ pub mod accepted {
     type_leak_test_leaker::__tl_prop_9197!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__tl_prop_9198!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__nested_apply_9199!(path = ::type_leak_test_leaker::kinds);
+
+    // The traits of two items analyzed together: `f` keeps the type as written, `Held` and `Wrap`
+    // are named here (F48).
+    type_leak_test_leaker::__shared_apply_9202!(path = ::type_leak_test_leaker::kinds, copy(0));
+    type_leak_test_leaker::__shared_apply_9203!(path = ::type_leak_test_leaker::kinds, copy(0));
+}
+
+/// The structs of the two items analyzed together: this module names neither `Held` nor `Wrap`
+/// (E0412 if a copy kept them), the entry is written through the Repeater (F48).
+pub mod unnamed {
+    type_leak_test_leaker::__shared_apply_9202!(path = ::type_leak_test_leaker::kinds, copy(1));
+    type_leak_test_leaker::__shared_apply_9203!(path = ::type_leak_test_leaker::kinds, copy(1));
 }

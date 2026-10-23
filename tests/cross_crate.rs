@@ -724,6 +724,18 @@ fn every_item_kind_is_leaked_across_crates() {
                 "`Wrap<U>`isinaboundorwherepredicate,andaboundofitsgenericsnames`T::Item`",
             ),
         ),
+        // `Self: 'x` brings `Self` into the context of an entry that does not name it: the bound
+        // that is left out stays out, for a trait and for an impl (F47)
+        (
+            9200,
+            reported(9200, __tl_report_9200!()),
+            ok("trait", 2, 0, 0),
+        ),
+        (
+            9201,
+            reported(9201, __tl_report_9201!()),
+            ok("impl-trait", 3, 2, 2),
+        ),
         // the types in the values of an item (`check_values()`): the consts and the default
         // methods of a trait, and the const, the static and the function of a module
         (
@@ -2129,4 +2141,38 @@ fn a_part_with_no_context_is_left_as_written() {
              9199u64, 0usize>>::Type>"
         )
     );
+}
+
+/// F48, fixtures 9202 (E0195) and 9203 (E0106): two items analyzed together, a trait and a struct.
+/// The method that has the fault keeps the type as written, where the module that copies the trait
+/// names it (`accepted`); the other methods and the struct, copied in a module that names neither
+/// `Held` nor `Wrap` (`unnamed`), have the entry.
+#[test]
+fn a_type_copied_as_written_for_a_signature_is_left_in_a_signature_like_it_only() {
+    use std::marker::PhantomData;
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::{accepted, unnamed};
+
+    assert_eq!(
+        __shared_report_9202!(),
+        "9202|entries=1|errors=UnconstrainedLifetime"
+    );
+    assert_eq!(
+        __shared_report_9203!(),
+        "9203|entries=2|errors=RelativePath"
+    );
+
+    // The copies of the traits are implementations of the Leaker's: rustc compares the signatures.
+    fn held<T: l::HeldInTwoMethods>() {}
+    held::<accepted::Host9202x0>();
+    fn elided<T: l::ElidedInOneMethod<'static, u8>>() {}
+    elided::<accepted::Host9203x0>();
+
+    // The fields of the structs are the original types.
+    let n = 5;
+    let copy = unnamed::HeldHolder { held: l::Held(&n) };
+    same(&copy.held, &l::Held(&n));
+    let copy = unnamed::ElidedHolder::<u8>(PhantomData, l::Wrap(PhantomData));
+    same(&copy.1, &l::Wrap::<u8>(PhantomData));
 }

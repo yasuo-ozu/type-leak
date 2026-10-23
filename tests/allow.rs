@@ -2002,7 +2002,7 @@ fn the_parts_are_checked_when_they_are_read() {
         ("[type (R)] (Rel)", "expected integer literal"),
         (
             "[type (R) 0 nope] (Rel)",
-            "expected `predicate`, `in` or `,`",
+            "expected `sig`, `predicate`, `in` or `,`",
         ),
         (
             "[type (R) 3] (Rel)",

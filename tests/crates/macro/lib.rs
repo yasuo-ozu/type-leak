@@ -35,6 +35,7 @@ mod bare;
 mod nested;
 mod prop;
 mod scope;
+mod shared;
 
 use proc_macro2::{Punct, Spacing, Span, TokenStream, TokenTree};
 use std::collections::HashMap;
@@ -1129,6 +1130,26 @@ pub fn nested_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 #[proc_macro]
 pub fn __nested_apply(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     match nested::apply(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Analyzes several items with one Leaker, and exports the macro that copies each of them alone in
+/// another crate: see `shared.rs`.
+#[proc_macro]
+pub fn shared_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match shared::leak(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// The Referrer's side of `shared_leak!`, invoked through the `macro_rules!` that it exports.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __shared_apply(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match shared::apply(input.into()) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }

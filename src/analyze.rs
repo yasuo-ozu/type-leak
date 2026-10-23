@@ -3,7 +3,7 @@
 use crate::analysis::{
     ambiguous_types, anchor_parts, correct_effects, correct_unmeant_self, error_effects,
     has_ambiguous, has_error, has_optional, names_self, part_names_self, primitive_effects,
-    scope_error, shift_seen, CheckResult, Effect, Part, PendingType,
+    scope_error, shift_seen, CheckResult, Effect, Part, PendingType, SignatureFacts, SignatureMark,
 };
 #[cfg(doc)]
 use crate::config::LeakerConfig;
@@ -217,8 +217,8 @@ enum BinderInput<'a> {
 /// the copy of a struct, an enum or a union writes as the type itself, but there the Referrer names
 /// the lifetime where it can (see [`AnalyzeVisitor::self_elision_broken()`]). See [Elided
 /// lifetimes](crate::Leaker#elided-lifetimes).
-#[derive(Clone)]
-struct Elision {
+#[derive(Clone, Debug)]
+pub(crate) struct Elision {
     /// The depth of the type holding the signature, leaked whole instead (0 for a method or a
     /// bound, which no type holds).
     owner: usize,
@@ -278,7 +278,7 @@ impl Elision {
 
     /// Returns what `Elision::of()` gives for the signature of a method. A receiver that is a
     /// reference gives its lifetime to the output, whatever the inputs have.
-    fn of_signature(sig: &Signature) -> Option<Self> {
+    pub(crate) fn of_signature(sig: &Signature) -> Option<Self> {
         let mut inputs: Vec<&Type> = Vec::new();
         for input in &sig.inputs {
             match input {
@@ -297,7 +297,7 @@ impl Elision {
     }
 
     /// Returns the lifetimes that the copy of a type with `context` adds to the inputs.
-    fn added(&self, context: &Context) -> Vec<Lifetime> {
+    pub(crate) fn added(&self, context: &Context) -> Vec<Lifetime> {
         let mut added: Vec<Lifetime> = Vec::new();
         let lifetimes = context
             .generics()
@@ -2126,6 +2126,9 @@ impl AnalyzeVisitor {
             Some(Ok(context)) => self.elision_broken(context),
             _ => None,
         };
+        // The signature of a method is what makes the type a part: the Referrer leaves it only in
+        // a signature that relies on elision as well.
+        let mut mark = None;
         if let Some((elision, added)) = broken {
             if elision.owner > 0 {
                 let advice = elision_advice(&added, &elision, ty, true);
@@ -2137,6 +2140,7 @@ impl AnalyzeVisitor {
             conflict.impossible.insert(0, elision.output.clone());
             elision_advice(&added, &elision, ty, false).give(&mut conflict);
             own = Some(Err(conflict));
+            mark = (!elision.binder).then(|| SignatureMark::Elided);
         }
         if let Some(Ok(_)) = &own {
             self.record_leaked(ty, depth, &inner);
@@ -2269,7 +2273,10 @@ impl AnalyzeVisitor {
                 // The type is copied as written: the Referrer leaves it so. One whose context
                 // cannot be written has none, and is found where the Referrer cannot write it.
                 let context = self.context_of(ty, &inner).ok();
-                let conflict = self.with_part(conflict, ty, context);
+                let mut conflict = self.with_part(conflict, ty, context);
+                if let Some(part) = conflict.part.as_mut() {
+                    part.mark = mark;
+                }
                 return self.push_error(conflict);
             }
             None if has_impossible => {
@@ -2383,6 +2390,7 @@ impl AnalyzeVisitor {
             context,
             in_predicate: self.env_depth > 0,
             within: None,
+            mark: None,
         });
         conflict
     }
@@ -2412,6 +2420,7 @@ impl AnalyzeVisitor {
             context,
             in_predicate: self.env_depth > 0,
             within: None,
+            mark: None,
         }
     }
 
@@ -3380,15 +3389,11 @@ impl AnalyzeVisitor {
             ),
             _ => return,
         };
-        let (output, bounded) = output_and_bounded(sig);
+        let facts = SignatureFacts::of(sig);
         let mut conflicts = Vec::new();
         // The types that the conflicts are about, by address.
         let mut corrected: HashSet<usize> = HashSet::new();
-        for param in sig.generics.lifetimes() {
-            let lifetime = &param.lifetime;
-            if !output.0.contains(lifetime) || bounded.0.contains(lifetime) {
-                continue;
-            }
+        for lifetime in facts.unconstrained() {
             // The occurrences that constrain the lifetime as written. An external type that the
             // Leaker does not allow stays as written unless the Referrer replaces it, so it counts.
             let used = self.scan_inputs(sig, lifetime, false);
@@ -3430,7 +3435,7 @@ impl AnalyzeVisitor {
         // The type is the entry that the conflict is about, chosen before the conflict was found:
         // it is copied as written whole instead, as a trait object is (see `own_context()`). Only
         // the types of this signature are looked at: an address of the syntax can be one of a type
-        // that is gone.
+        // that is gone. The Referrer leaves it so in a signature like this one only.
         if !corrected.is_empty() {
             let found = self
                 .frame
@@ -3439,7 +3444,12 @@ impl AnalyzeVisitor {
             self.frame
                 .effects
                 .extend(correct_effects(found, &|pending| {
-                    corrected.contains(&pending.origin)
+                    if !corrected.contains(&pending.origin) {
+                        return None;
+                    }
+                    let mut part = pending.part();
+                    part.mark = Some(facts.unconstrained_mark(&leaked[&pending.origin].0));
+                    Some(part)
                 }));
         }
         let seen = self.self_errors.len();
@@ -5133,6 +5143,17 @@ fn output_and_bounded(sig: &Signature) -> (Lifetimes, Lifetimes) {
         bounded.visit_where_clause(where_clause);
     }
     (output, bounded)
+}
+
+/// The lifetimes of the method `sig` that its output names and no bound does: where only types
+/// leaked whole hold them in the inputs, the copy leaves them unconstrained (E0195).
+pub(crate) fn unconstrained_in_output(sig: &Signature) -> Vec<Lifetime> {
+    let (output, bounded) = output_and_bounded(sig);
+    sig.generics
+        .lifetimes()
+        .map(|param| param.lifetime.clone())
+        .filter(|lifetime| output.0.contains(lifetime) && !bounded.0.contains(lifetime))
+        .collect()
 }
 
 /// The headline of the conflict that `unconstrained_note()` explains: the fault is that the copy

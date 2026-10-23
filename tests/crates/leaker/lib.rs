@@ -1581,6 +1581,44 @@ pub mod kinds {
             Wrap<U>: Default;
     }
 
+    // `Self: 'x` brings `Self` into the context of an entry that does not name it (F47): the bound
+    // of the method's generic that F26 leaves out stays out, as the entry does not need it.
+
+    /// `Y: 'x` pulls `Self: 'x` into the context of `Wrap<Y>`.
+    #[prop_leak(id = 9200, allow_self = true, prelude = true)]
+    pub trait SelfOutlives {
+        fn m<'x, Y: 'x + Iterator<Item = u8>>(&self)
+        where
+            Self: 'x,
+            Y: Fn(::type_leak_test_leaker::kinds::WIt<Y>) -> u8,
+            Wrap<Y>: Default;
+    }
+
+    /// The same for an impl of a trait: `Self` is its self type.
+    pub trait SelfOutlivesTr<'a> {
+        fn m<'x, Y: 'x + Iterator<Item = u8>>(&'x self) -> u8
+        where
+            Self: 'x,
+            Y: Fn(::type_leak_test_leaker::kinds::WIt<Y>) -> u8,
+            ::type_leak_test_leaker::kinds::Wrap<Y>: Default;
+    }
+
+    pub struct SelfOutlivesHost;
+
+    #[prop_leak(id = 9201, allow_self = true, prelude = true)]
+    impl<'a> ::type_leak_test_leaker::kinds::SelfOutlivesTr<'a>
+        for ::type_leak_test_leaker::kinds::SelfOutlivesHost
+    {
+        fn m<'x, Y: 'x + Iterator<Item = u8>>(&'x self) -> u8
+        where
+            Self: 'x,
+            Y: Fn(::type_leak_test_leaker::kinds::WIt<Y>) -> u8,
+            Wrap<Y>: Default,
+        {
+            loop {}
+        }
+    }
+
     // The scopes of an item that share names, from the findings of a downstream crate
     // (`announce`, tests/downstream_findings.rs): the Repeater's impl of every entry has the
     // generics, bounds and where clause of the scope the entry is written in, and no others.
@@ -1851,6 +1889,40 @@ pub mod kinds {
         fn m<Y: Clone>(&self, a1: Wrap<Y>, ai: impl Into<Wrap<Y>>)
         where
             Y: Fn(Rel) -> u8;
+    }
+
+    // Items analyzed together, whose conflicts are accepted: a part that a signature made is copied
+    // as written in a signature like it only (F48). The Referrer's crate copies each item alone,
+    // `accepted` where it names `Held` and `Wrap`, `unnamed` where it names nothing.
+
+    // E0195: `Held<'b>` is the only input of `f` that names `'b`, which its output names too. `g`
+    // has no output, and `HeldHolder` is another item, where `Held<'b>` is an entry.
+    type_leak_test_macro::shared_leak! {
+        id = 9202;
+        items [
+            pub trait HeldInTwoMethods {
+                fn f<'b>(&self, x: Held<'b>) -> &'b u8;
+                fn g<'b>(&self, x: Held<'b>);
+            }
+            pub struct HeldHolder<'b> {
+                pub held: Held<'b>,
+            }
+        ];
+    }
+
+    // E0106: the entry `Wrap<T>` adds `'a` to the one lifetime of the inputs of `f`, whose output
+    // is elided (`T: 'a` is in its context). `g` and `k` have a receiver, `h` has no output.
+    type_leak_test_macro::shared_leak! {
+        id = 9203;
+        items [
+            pub trait ElidedInOneMethod<'a, T: 'a> {
+                fn f(x: &u8, y: Wrap<T>) -> &u8;
+                fn g(&self, y: Wrap<T>);
+                fn h(y: Wrap<T>);
+                fn k(&self, y: Wrap<T>) -> &u8;
+            }
+            pub struct ElidedHolder<'a, T: 'a>(pub PhantomData<&'a T>, pub Wrap<T>);
+        ];
     }
 
     // Errors that the Leaker does not decide on (`prop_leak_result`): its macro carries them with the

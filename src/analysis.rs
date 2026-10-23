@@ -1,6 +1,7 @@
 //! What the analysis of the [`Leaker`] found: the [`CheckResult`] of a type, and the effects of
 //! visiting it, which the [`Analysis`] turns into the graphs of the entries.
 
+use crate::analyze::{unconstrained_in_output, Elision};
 use crate::context::{Context, ContextId, Contexts, SelfRequirement};
 use crate::error::{report, self_without_meaning, Cause, ErrorItem, Reason};
 use crate::graph::{NodeKey, TypeGraph};
@@ -9,7 +10,7 @@ use crate::leaker::Leaker;
 #[cfg(doc)]
 use crate::view::View;
 use std::collections::HashSet;
-use syn::{Ident, Type};
+use syn::{Ident, Lifetime, Signature, Type};
 use template_quote::quote;
 
 /// What [`View::check()`] found in a type: the causes that force it to be leaked, and the causes
@@ -130,10 +131,13 @@ pub(crate) struct Part {
     /// The innermost type around it that owns the cause of the conflict, with its context
     /// ([`anchor_parts()`]); the part is left as written only inside it.
     pub(crate) within: Option<(Type, Context)>,
+    /// The signature that made it a part, if one did.
+    pub(crate) mark: Option<SignatureMark>,
 }
 
 /// A part that the Referrer leaves as written, with its contexts interned. Serialized as `KIND (
-/// CAUSE ) CONTEXT [predicate] [in ( TYPE ) CONTEXT]`, with `unwritable` for a `CONTEXT` of `None`.
+/// CAUSE ) CONTEXT [sig ( MARK )] [predicate] [in ( TYPE ) CONTEXT]`, with `unwritable` for a
+/// `CONTEXT` of `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PartItem {
     /// A [`Cause::Type`], the cause of a bound, or the path of a value.
@@ -146,6 +150,68 @@ pub(crate) struct PartItem {
     /// The type that owns the cause of the conflict, with its context: the part is left as written
     /// only inside it.
     pub(crate) within: Option<(Type, ContextId)>,
+    /// The part is left as written only in the arguments of a signature that this covers.
+    pub(crate) mark: Option<SignatureMark>,
+}
+
+/// What a signature must have for a part to be copied as written in it: the fault that the
+/// signature gives the type (see [`SignatureFacts`]). Serialized as `sig ( 'x , .. )` and `sig (
+/// elided )`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SignatureMark {
+    /// The method lifetimes of the type that the output names and no bound does (E0195): the copy
+    /// would leave them unconstrained.
+    Unconstrained(Vec<Lifetime>),
+    /// The output relies on elision, and the type adds lifetimes to the inputs (E0106).
+    Elided,
+}
+
+/// The facts about a signature that a [`SignatureMark`] is about. It is computed from the
+/// signature alone, by the Leaker where it makes a part and by the Referrer at each signature it
+/// visits.
+#[derive(Debug)]
+pub(crate) struct SignatureFacts {
+    unconstrained: Vec<Lifetime>,
+    elision: Option<Elision>,
+}
+
+impl SignatureFacts {
+    pub(crate) fn of(sig: &Signature) -> Self {
+        Self {
+            unconstrained: unconstrained_in_output(sig),
+            elision: Elision::of_signature(sig),
+        }
+    }
+
+    /// The method lifetimes that the output names and no bound does.
+    pub(crate) fn unconstrained(&self) -> &[Lifetime] {
+        &self.unconstrained
+    }
+
+    /// The mark of a type that names the lifetimes `named`: those that the output names and no
+    /// bound does.
+    pub(crate) fn unconstrained_mark(&self, named: &[Lifetime]) -> SignatureMark {
+        SignatureMark::Unconstrained(
+            self.unconstrained
+                .iter()
+                .filter(|lifetime| named.contains(lifetime))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// Returns `true` if the part with `mark` and `context` is copied as written in the arguments
+    /// of this signature: it has the same fault here.
+    pub(crate) fn covers(&self, mark: &SignatureMark, context: Option<&Context>) -> bool {
+        match mark {
+            SignatureMark::Unconstrained(lifetimes) => lifetimes
+                .iter()
+                .all(|lifetime| self.unconstrained.contains(lifetime)),
+            SignatureMark::Elided => self.elision.as_ref().map_or(false, |elision| {
+                context.map_or(true, |context| !elision.added(context).is_empty())
+            }),
+        }
+    }
 }
 
 pub(crate) struct PendingType {
@@ -200,6 +266,7 @@ impl PendingType {
             context: Some(self.context.clone()),
             in_predicate: self.in_predicate,
             within: None,
+            mark: None,
         }
     }
 }
@@ -276,6 +343,7 @@ impl Analysis {
                             within: part.within.as_ref().map(|(ty, context)| {
                                 (ty.clone(), contexts.intern(context.clone()))
                             }),
+                            mark: part.mark.clone(),
                         };
                         if !self.parts.contains(&item) {
                             self.parts.push(item);
@@ -357,28 +425,30 @@ pub(crate) fn shift_seen(effects: &mut [Effect], by: usize) {
     }
 }
 
-/// Copies as written, whole, the types among `effects` (outermost first) that `corrected` picks:
-/// each becomes an `Effect::Error` that reports nothing and holds the type as its part. The
+/// Copies as written, whole, the types among `effects` (outermost first) that `corrected` gives a
+/// part: each becomes an `Effect::Error` that reports nothing and holds the type as its part. The
 /// conflicts and the primitive names in it stay.
 pub(crate) fn correct_effects(
     effects: Vec<Effect>,
-    corrected: &dyn Fn(&PendingType) -> bool,
+    corrected: &dyn Fn(&PendingType) -> Option<Part>,
 ) -> Vec<Effect> {
     let mut found = Vec::new();
     for effect in effects {
         match effect {
-            Effect::Type(pending) if corrected(&pending) => {
-                let mut error = CheckResult::corrected();
-                error.part = Some(pending.part());
-                found.push(Effect::Error(Box::new(error)));
-                let PendingType { components, .. } = *pending;
-                keep_conflicts(components, &mut found);
-            }
-            Effect::Type(mut pending) => {
-                let components = std::mem::take(&mut pending.components);
-                pending.components = correct_effects(components, corrected);
-                found.push(Effect::Type(pending));
-            }
+            Effect::Type(mut pending) => match corrected(&pending) {
+                Some(part) => {
+                    let mut error = CheckResult::corrected();
+                    error.part = Some(part);
+                    found.push(Effect::Error(Box::new(error)));
+                    let PendingType { components, .. } = *pending;
+                    keep_conflicts(components, &mut found);
+                }
+                None => {
+                    let components = std::mem::take(&mut pending.components);
+                    pending.components = correct_effects(components, corrected);
+                    found.push(Effect::Type(pending));
+                }
+            },
             other => found.push(other),
         }
     }
@@ -429,7 +499,7 @@ fn keep_conflicts(effects: Vec<Effect>, found: &mut Vec<Effect>) {
 /// `Self` as its implementor ([`Reason::SelfWithoutMeaning`]).
 pub(crate) fn correct_unmeant_self(effects: Vec<Effect>) -> Vec<Effect> {
     correct_effects(effects, &|pending| {
-        pending.unmeant_self && (pending.in_graph || pending.has_optional)
+        (pending.unmeant_self && (pending.in_graph || pending.has_optional)).then(|| pending.part())
     })
 }
 

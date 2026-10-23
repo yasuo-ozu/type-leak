@@ -822,12 +822,14 @@ impl Context {
     }
 
     /// Leaves out the bounds of the generics that the Repeater's impl cannot carry (see
-    /// [`LeftOut`]), except for a context that depends on `Self` as a type or an implementor, and
-    /// for a type that writes out the self type of its scope: the self type of an item, or the
-    /// associated type of its trait, is well-formed only with the bounds that the item declares,
-    /// which the impl needs whole (`struct S<T: Iterator<Item = u8> + Fn(T::Item)>` and the entry
-    /// `Wrap<S<T>>`, or `impl<T: Iterator<Item = u8> + Fn(T::Item)> S<T>` and the entry `S<T>`:
-    /// E0277 in the Leaker's crate otherwise).
+    /// [`LeftOut`]), except for a type that names `Self` or writes out the self type of its scope:
+    /// the self type of an item, or the associated type of its trait, is well-formed only with the
+    /// bounds that the item declares, which the impl needs whole (`struct S<T: Fn(T::Item) +
+    /// Iterator<Item = u8>>` and the entry `Wrap<S<T>>`, or `impl<T: Fn(T::Item) + Iterator<Item =
+    /// u8>> S<T>` and the entry `S<T>`: E0277 in the Leaker's crate otherwise). A type that
+    /// depends on `Self` only through a bound or an outlives predicate (`Self: 'x`) keeps whole
+    /// the bounds of the generics that the description of `Self` names (`impl<T: ..> S<T>`,
+    /// `Tr<T>`), and no others.
     fn compute(
         ty: &Type,
         scopes: &[Scope],
@@ -836,7 +838,15 @@ impl Context {
         any: bool,
         enclosing: &Enclosing,
     ) -> std::result::Result<Self, UnnameableSelf> {
-        let context = Self::compute_with(ty, scopes, self_req, nested_type, any, enclosing, true)?;
+        let context = Self::compute_with(
+            ty,
+            scopes,
+            self_req,
+            nested_type,
+            any,
+            enclosing,
+            &Whole::Nothing,
+        )?;
         // The self type of an impl, a struct, an enum or a union, written out (`impl<T: Fn(T::Item)>
         // S<T> { .. }` with the entry `S<T>`), is declared with the bounds of the item.
         let names_self_type = matches!(self_req, Some(SelfRequirement::Type(self_ty))
@@ -848,8 +858,17 @@ impl Context {
         if !(names_self_type || depends_on_self) {
             return Ok(context);
         }
+        let keep = if names_self_type || type_mentions_self(ty) {
+            Whole::Everything
+        } else {
+            let mut names = HashSet::new();
+            if let Some(self_req) = self_req {
+                self_req.names(&mut names);
+            }
+            Whole::Named(names)
+        };
         let mut whole =
-            Self::compute_with(ty, scopes, self_req, nested_type, any, enclosing, false)?;
+            Self::compute_with(ty, scopes, self_req, nested_type, any, enclosing, &keep)?;
         // The Referrer knows the self type of the scope only if the top-level context records it:
         // it does if the context depends on it (`substituted`, see `names_self()`), which it does
         // when keeping the bounds makes a difference.
@@ -863,7 +882,7 @@ impl Context {
         Ok(whole)
     }
 
-    /// Like `compute()`; `leave_out` says whether it leaves out the bounds of [`LeftOut`].
+    /// Like `compute()`; `whole` says which generics keep the bounds that [`LeftOut`] leaves out.
     fn compute_with(
         ty: &Type,
         scopes: &[Scope],
@@ -871,7 +890,7 @@ impl Context {
         nested_type: bool,
         any: bool,
         enclosing: &Enclosing,
-        leave_out: bool,
+        whole: &Whole,
     ) -> std::result::Result<Self, UnnameableSelf> {
         let mut names = HashSet::new();
         type_names(ty, &mut names);
@@ -925,7 +944,7 @@ impl Context {
                 .filter(|outer| Some(*outer) != self_req)
         };
         let mut substituted: Vec<SelfRequirement> = Vec::new();
-        let mut left_out = LeftOut::new(leave_out);
+        let mut left_out = LeftOut::new(whole.clone());
         loop {
             let (from, name) = match work.pop() {
                 Some(item) => item,
@@ -1468,18 +1487,36 @@ fn bounded_generic(predicate: &WherePredicate) -> Option<String> {
 /// "expected an `Fn(u8)` closure, found `T`"), and neither is one that hides the projection behind
 /// a type alias (`T: Fn(Alias<T>)`), which the Leaker cannot tell from a struct. The impl does not
 /// need that bound to name the entry, so the context leaves out such a bound, the Leaker and the
-/// Referrer alike (see [`left_out_bounds()`]), unless the context depends on `Self` as a type or an
-/// implementor (see `Context::compute()`).
+/// Referrer alike (see [`left_out_bounds()`]), except for the generics that [`Whole`] keeps (see
+/// `Context::compute()`).
 struct LeftOut {
-    /// Whether it leaves anything out.
-    enabled: bool,
+    whole: Whole,
     cache: HashMap<(usize, String), HashSet<String>>,
 }
 
+/// The generics of a context that keep every bound.
+#[derive(Clone)]
+enum Whole {
+    Nothing,
+    /// The generics with these names.
+    Named(HashSet<String>),
+    Everything,
+}
+
+impl Whole {
+    fn keeps(&self, name: &str) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Named(names) => names.contains(name),
+            Self::Everything => true,
+        }
+    }
+}
+
 impl LeftOut {
-    fn new(enabled: bool) -> Self {
+    fn new(whole: Whole) -> Self {
         Self {
-            enabled,
+            whole,
             cache: HashMap::new(),
         }
     }
@@ -1487,12 +1524,12 @@ impl LeftOut {
     /// The texts of the bounds of the type parameter `name` of `scopes[ix]` that the context
     /// leaves out. Empty if `scopes[ix]` declares no such parameter.
     fn of(&mut self, scopes: &[Scope], ix: usize, name: &str) -> &HashSet<String> {
-        let enabled = self.enabled;
+        let kept = self.whole.keeps(name);
         self.cache.entry((ix, name.to_string())).or_insert_with(|| {
-            if enabled {
-                left_out_bounds(&scopes[ix], name)
-            } else {
+            if kept {
                 HashSet::new()
+            } else {
+                left_out_bounds(&scopes[ix], name)
             }
         })
     }

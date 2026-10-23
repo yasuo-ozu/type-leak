@@ -201,10 +201,12 @@ use template_quote::{quote, ToTokens};
 /// `T: Iterator<Item = Wrap<T>>`), the bounds of other generics (`U: Fn(T::Item)`: the Leaker still
 /// rejects it where it is written as a projection, and does not see an alias), a bound of a
 /// predicate of an inner scope (a method's where clause) and the other bounds of `T` stay. So do
-/// all the bounds in the context of an entry that depends on `Self` as a type or an implementor
-/// (the self type of the item, `Self::A` of its trait), and of one that writes out the self type of
-/// the item (`impl<T: Iterator<Item = u8> + Fn(T::Item)> S<T>` with the entry `S<T>`): the Leaker
-/// knows that such a type is well-formed only with the bounds that its item declares.
+/// all the bounds in the context of an entry that names `Self` (the self type of the item,
+/// `Self::A` of its trait), and of one that writes out the self type of the item (`impl<T:
+/// Iterator<Item = u8> + Fn(T::Item)> S<T>` with the entry `S<T>`): the Leaker knows that such a
+/// type is well-formed only with the bounds that its item declares. An entry that depends on `Self`
+/// only through a bound or an outlives predicate (`Self: 'x`) keeps whole the bounds of the
+/// generics that the description of `Self` names (`impl<T: ..> S<T>`, `Tr<T>`), and no others.
 ///
 /// The leaked type must not need a bound that is left out: with `struct Rel<T: Fn(Alias<T>)>(T);`
 /// and `T: Iterator<Item = u8> + Fn(Alias<T>)`, the Repeater's impl of `Rel<T>` has only `T:
@@ -813,7 +815,9 @@ impl LeakerResult {
     ///
     /// You promise that the part can be written as it is in the copy; if not, the copy fails to
     /// build, in the crate of the copy. The cause may be smaller than the part that is copied: in
-    /// `[u8; { let c = |a: u8| a; 3 }]` the error is about `u8`, and the array is copied whole.
+    /// `[u8; { let c = |a: u8| a; 3 }]` the error is about `u8`, and the array is copied whole. A
+    /// part that the signature of a method made ([`Reason::UnconstrainedLifetime`], an elided
+    /// output) is copied as written in the arguments of a signature with the same fault only.
     ///
     /// ```
     /// # use {syn::*, type_leak::*};
