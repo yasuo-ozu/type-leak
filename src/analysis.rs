@@ -1,7 +1,7 @@
 //! What the analysis of the [`Leaker`] found: the [`CheckResult`] of a type, and the effects of
 //! visiting it, which the [`Analysis`] turns into the graphs of the entries.
 
-use crate::analyze::{unconstrained_in_output, Elision};
+use crate::analyze::{input_type, unconstrained_in_output, Elision};
 use crate::context::{Context, ContextId, Contexts, SelfRequirement};
 use crate::error::{report, self_without_meaning, Cause, ErrorItem, Reason};
 use crate::graph::{NodeKey, TypeGraph};
@@ -10,7 +10,7 @@ use crate::leaker::Leaker;
 #[cfg(doc)]
 use crate::view::View;
 use std::collections::HashSet;
-use syn::{Ident, Lifetime, Signature, Type};
+use syn::{FnArg, Ident, Lifetime, Signature, Type};
 use template_quote::quote;
 
 /// What [`View::check()`] found in a type: the causes that force it to be leaked, and the causes
@@ -180,6 +180,18 @@ impl SignatureFacts {
         Self {
             unconstrained: unconstrained_in_output(sig),
             elision: Elision::of_signature(sig),
+        }
+    }
+
+    /// The facts for the types in `input`, an argument of the signature: elision counts the
+    /// lifetimes of each apart ([`Elision::for_input()`]).
+    pub(crate) fn for_input(&self, input: &FnArg) -> Self {
+        Self {
+            unconstrained: self.unconstrained.clone(),
+            elision: self
+                .elision
+                .as_ref()
+                .map(|elision| elision.for_input(input_type(input))),
         }
     }
 

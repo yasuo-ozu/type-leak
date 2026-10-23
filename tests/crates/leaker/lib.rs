@@ -1925,6 +1925,23 @@ pub mod kinds {
         ];
     }
 
+    // E0106: the lifetime `'a` that `x` keeps is in the projection of the entry `Wrap<T>` in `y`
+    // too, and rustc counts the lifetimes of each input apart (F49). `g` has the type in the input
+    // that keeps `'a`, `h` names `'a` in the output, and `k` has a receiver.
+    type_leak_test_macro::shared_leak! {
+        id = 9204;
+        items [
+            #[allow(unknown_lints, mismatched_lifetime_syntaxes)]
+            pub trait KeptInOtherInput<'a, T: 'a> {
+                fn f(x: &'a u8, y: Wrap<T>) -> &u8;
+                fn g(x: (&'a u8, Wrap<T>)) -> &u8;
+                fn h(x: &'a u8, y: Wrap<T>) -> &'a u8;
+                fn k(&self, x: &'a u8, y: Wrap<T>) -> &u8;
+            }
+            pub struct KeptHolder<'a, T: 'a>(pub PhantomData<&'a T>, pub Wrap<T>);
+        ];
+    }
+
     // Errors that the Leaker does not decide on (`prop_leak_result`): its macro carries them with the
     // Referrer, and the Referrer's macro allows some (`allow(..)`), reports the others, and copies
     // the item either way. The Leaker does not allow the prelude, so a relative `Clone` or

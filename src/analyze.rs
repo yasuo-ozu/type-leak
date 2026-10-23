@@ -215,8 +215,9 @@ enum BinderInput<'a> {
 /// elision fails (E0106). Such a type is not leaked alone: the type holding the signature is leaked
 /// as a whole instead if it can be, and it is an error otherwise. The same holds for `Self`, which
 /// the copy of a struct, an enum or a union writes as the type itself, but there the Referrer names
-/// the lifetime where it can (see [`AnalyzeVisitor::self_elision_broken()`]). See [Elided
-/// lifetimes](crate::Leaker#elided-lifetimes).
+/// the lifetime where it can (see [`AnalyzeVisitor::self_elision_broken()`]). rustc counts the
+/// lifetimes of each input apart, so the one that another input keeps (`x: &'a u8, y: Rel<T>` with
+/// `T: 'a`) is one more (F49). See [Elided lifetimes](crate::Leaker#elided-lifetimes).
 #[derive(Clone, Debug)]
 pub(crate) struct Elision {
     /// The depth of the type holding the signature, leaked whole instead (0 for a method or a
@@ -232,6 +233,8 @@ pub(crate) struct Elision {
     /// name with a `for<'e>` binder where `Visitor::with_self()` adds lifetimes to its inputs (see
     /// [`AnalyzeVisitor::self_elision_broken()`]). A method has none.
     binder: bool,
+    /// The input being visited names `kept` ([`Elision::for_input()`]).
+    in_kept: bool,
     /// The output, which has the elided lifetime.
     output: Cause,
 }
@@ -272,8 +275,24 @@ impl Elision {
             kept,
             hidden,
             binder,
+            in_kept: false,
             output: Cause::Type((**output).clone()),
         })
+    }
+
+    /// Returns this for the types in `input`, an input of the signature. rustc counts the
+    /// lifetimes of each input apart (F49), so `kept` in the copy of a type in another input is one
+    /// more.
+    pub(crate) fn for_input(&self, input: &Type) -> Self {
+        let mut lifetimes = InputLifetimes::default();
+        lifetimes.visit_type(input);
+        Self {
+            in_kept: self
+                .kept
+                .as_ref()
+                .map_or(false, |kept| lifetimes.named.contains(kept)),
+            ..self.clone()
+        }
     }
 
     /// Returns what `Elision::of()` gives for the signature of a method. A receiver that is a
@@ -296,7 +315,8 @@ impl Elision {
         Self::of(0, false, inputs, &sig.output)
     }
 
-    /// Returns the lifetimes that the copy of a type with `context` adds to the inputs.
+    /// Returns the lifetimes that the copy of a type with `context` adds to the input it is in
+    /// ([`Elision::for_input()`]): those it names, not `kept` in the input that names it.
     pub(crate) fn added(&self, context: &Context) -> Vec<Lifetime> {
         let mut added: Vec<Lifetime> = Vec::new();
         let lifetimes = context
@@ -305,7 +325,8 @@ impl Elision {
             .map(|param| &param.lifetime)
             .chain(context.self_outlives());
         for lifetime in lifetimes {
-            if Some(lifetime) != self.kept.as_ref() && !added.contains(lifetime) {
+            let kept = self.in_kept && Some(lifetime) == self.kept.as_ref();
+            if !kept && !added.contains(lifetime) {
                 added.push(lifetime.clone());
             }
         }
@@ -328,6 +349,14 @@ impl Elision {
             }
         }
         added
+    }
+}
+
+/// The type of an argument of a signature (of a receiver, the type it stands for).
+pub(crate) fn input_type(input: &FnArg) -> &Type {
+    match input {
+        FnArg::Receiver(receiver) => &receiver.ty,
+        FnArg::Typed(arg) => &arg.ty,
     }
 }
 
@@ -4148,7 +4177,8 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
     }
 
     fn visit_fn_arg(&mut self, i: &FnArg) {
-        self.elisions.push(self.signature.clone());
+        let elision = self.signature.as_ref().map(|e| e.for_input(input_type(i)));
+        self.elisions.push(elision);
         let outer = std::mem::replace(&mut self.in_fn_arg, true);
         syn::visit::visit_fn_arg(self, i);
         self.in_fn_arg = outer;
@@ -4447,11 +4477,12 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
                 if let Some(abi) = &i.abi {
                     v.visit_abi(abi);
                 }
-                v.elisions.push(elision.clone());
                 for arg in &i.inputs {
+                    v.elisions
+                        .push(elision.as_ref().map(|e| e.for_input(&arg.ty)));
                     v.visit_bare_fn_arg(arg);
+                    v.elisions.pop();
                 }
-                v.elisions.pop();
                 if let Some(variadic) = &i.variadic {
                     v.visit_bare_variadic(variadic);
                 }
@@ -4463,11 +4494,12 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
     fn visit_parenthesized_generic_arguments(&mut self, i: &ParenthesizedGenericArguments) {
         let elision = Elision::of(self.type_depth, true, &i.inputs, &i.output);
         self.with_bound_elided(|visitor| {
-            visitor.elisions.push(elision);
             for input in &i.inputs {
+                let elision = elision.as_ref().map(|e| e.for_input(input));
+                visitor.elisions.push(elision);
                 visitor.visit_type(input);
+                visitor.elisions.pop();
             }
-            visitor.elisions.pop();
             visitor.in_output(&i.output);
         })
     }
@@ -5263,6 +5295,11 @@ fn elision_options(elision: &Elision, absolute: Option<&Type>) -> Vec<String> {
 /// The advice for the leaked type `ty`, which adds `added` lifetimes to the inputs of a signature
 /// whose output relies on elision. `owned`: the type holding the signature would be leaked instead.
 fn elision_advice(added: &[Lifetime], elision: &Elision, ty: &Type, owned: bool) -> Advice {
+    // The lifetime that another input keeps is one more: rustc counts them for each input apart.
+    let kept = elision
+        .kept
+        .as_ref()
+        .map_or(false, |kept| added.contains(kept));
     let added: Vec<String> = added
         .iter()
         .map(|lifetime| format!("`{}`", lifetime))
@@ -5270,11 +5307,16 @@ fn elision_advice(added: &[Lifetime], elision: &Elision, ty: &Type, owned: bool)
     let note = format!(
         "the output `{}` has an elided lifetime, which elision takes from {}, but a leaked type in \
          the inputs has {} among its generics, and the copy names {} in the arguments of its \
-         projection, so the inputs have more than one lifetime (E0106){}",
+         projection, so the inputs have more than one lifetime{} (E0106){}",
         elision.output.shown(),
         elision_source(elision),
         added.join(", "),
         if added.len() == 1 { "it" } else { "them" },
+        if kept {
+            ", as rustc counts the lifetimes of each input apart"
+        } else {
+            ""
+        },
         if owned {
             ", so a type using them cannot be leaked alone, and the type holding the signature \
              would be leaked as a whole instead"

@@ -2176,3 +2176,26 @@ fn a_type_copied_as_written_for_a_signature_is_left_in_a_signature_like_it_only(
     let copy = unnamed::ElidedHolder::<u8>(PhantomData, l::Wrap(PhantomData));
     same(&copy.1, &l::Wrap::<u8>(PhantomData));
 }
+
+/// F49, fixture 9204 (E0106): a lifetime that another input keeps. `f` keeps the entry `Wrap<T>` as
+/// written, where `'a` is also in `x`; `g`, `h` and `k` and the struct have the entry (the struct is
+/// copied in the module that names neither `Held` nor `Wrap`).
+#[test]
+fn a_lifetime_that_another_input_keeps_breaks_the_elision_of_the_copy() {
+    use std::marker::PhantomData;
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::{accepted, unnamed};
+
+    assert_eq!(
+        __shared_report_9204!(),
+        "9204|entries=2|errors=RelativePath"
+    );
+
+    // The copy of the trait is an implementation of the Leaker's: rustc compares the signatures.
+    fn kept<T: l::KeptInOtherInput<'static, u8>>() {}
+    kept::<accepted::Host9204x0>();
+
+    let copy = unnamed::KeptHolder::<u8>(PhantomData, l::Wrap(PhantomData));
+    same(&copy.1, &l::Wrap::<u8>(PhantomData));
+}

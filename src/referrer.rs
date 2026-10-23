@@ -2123,10 +2123,12 @@ where
         item: bool,
     ) -> Self {
         let mut visitor = self.enter(attrs, &mut sig.generics, None, item);
-        visitor.signature = Some(Rc::new(SignatureFacts::of(sig)));
+        let facts = SignatureFacts::of(sig);
         for input in sig.inputs.iter_mut() {
+            visitor.signature = Some(Rc::new(facts.for_input(input)));
             visitor.visit_fn_arg_mut(input);
         }
+        visitor.signature = Some(Rc::new(facts));
         visitor.visit_return_type_mut(&mut sig.output);
         visitor.signature = None;
         visitor

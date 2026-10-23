@@ -139,12 +139,14 @@ use template_quote::{quote, ToTokens};
 /// An elided output lifetime comes from the only input lifetime, and a leaked type adds more. So
 /// the whole function pointer or trait object is leaked, which is an error in a bound, in `impl
 /// Fn(..)`, under an elided reference, and in a method without a reference receiver. A hidden
-/// lifetime (`Ref<u8>`) is not seen: write `Ref<'_, u8>`.
+/// lifetime (`Ref<u8>`) is not seen: write `Ref<'_, u8>`. rustc counts the lifetimes of each input
+/// apart, so a leaked type adds one even if another input has it.
 ///
 /// ```ignore
 /// fn f(&self, x: Box<dyn Fn(&Rel<T>) -> &u8>);  // good: the trait object is leaked whole
 /// fn f(&self, x: &dyn Fn(&Rel<T>) -> &u8);      // error: elided reference
 /// fn g<'x>(x: &'x Rel<T>) -> &'x u8;            // good: the lifetimes are named
+/// fn g(x: &'a u8, y: Rel<T>) -> &u8;            // error: `Rel<T>` names `'a` too (`T: 'a`)
 /// ```
 ///
 /// ## Trait objects

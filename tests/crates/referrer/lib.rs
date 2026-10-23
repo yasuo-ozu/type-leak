@@ -288,6 +288,7 @@ pub mod accepted {
     // are named here (F48).
     type_leak_test_leaker::__shared_apply_9202!(path = ::type_leak_test_leaker::kinds, copy(0));
     type_leak_test_leaker::__shared_apply_9203!(path = ::type_leak_test_leaker::kinds, copy(0));
+    type_leak_test_leaker::__shared_apply_9204!(path = ::type_leak_test_leaker::kinds, copy(0));
 }
 
 /// The structs of the two items analyzed together: this module names neither `Held` nor `Wrap`
@@ -295,4 +296,5 @@ pub mod accepted {
 pub mod unnamed {
     type_leak_test_leaker::__shared_apply_9202!(path = ::type_leak_test_leaker::kinds, copy(1));
     type_leak_test_leaker::__shared_apply_9203!(path = ::type_leak_test_leaker::kinds, copy(1));
+    type_leak_test_leaker::__shared_apply_9204!(path = ::type_leak_test_leaker::kinds, copy(1));
 }

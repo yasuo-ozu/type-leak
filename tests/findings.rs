@@ -57,6 +57,7 @@
 //! | `f46_the_help_for_a_relative_std_path_suggests_the_crate_itself` | the help for a relative path that starts with `core`, `std` or `alloc` suggested `::my_crate::core::fmt::Debug` | fixed |
 //! | `f47_self_in_an_outlives_predicate_keeps_the_bounds_of_the_description_of_self_only` | `Self: 'x` made the context of an entry keep the bounds that F26 leaves out: E0277 in the copy | fixed |
 //! | `f48_a_type_corrected_for_a_signature_is_left_only_in_a_signature_like_it` | a type copied as written for the signature it is in (E0195, E0106) was left so in every other item and signature of its context | fixed |
+//! | `f49_a_lifetime_that_another_input_keeps_breaks_elision` | the E0106 check left out the lifetime that the inputs keep, but rustc counts the lifetimes of each input apart: a leaked type in another input that names it breaks the elision | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that the docs of `Leaker` document, or that follows from what rustc accepts). No test
@@ -12296,4 +12297,166 @@ fn f48_a_mark_is_serialized_and_read_back() {
             .unwrap_or_else(|| panic!("read: {}", parts));
         assert!(error.contains(message), "{}: {}", parts, error);
     }
+}
+
+// ── F49 ──────────────────────────────────────────────────────────────────────
+
+/// F49 (fixed): the E0106 check ignored a lifetime that another input keeps.
+///
+/// Trigger: `fn m(x: &'a u8, y: Wrap<T>) -> &u8` in `trait Tr<'a, T: 'a>`. The one lifetime of the
+/// inputs is `'a`, and the copy of `Wrap<T>` names `'a` in the arguments of its projection (`T:
+/// 'a` is in its context). `Elision::added()` left out the lifetimes that the inputs keep, but
+/// rustc counts the lifetimes of each input apart: with `'a` in `x` and in the projection in `y`,
+/// two inputs have a lifetime and the copy fails with E0106.
+///
+/// What rustc does (stable 1.99.0 and nightly 1.101.0, the same on 1.56.1, 1.70.0 and 1.85.0 for the
+/// cases below): the elided output is valid only if exactly one input has any lifetime (named,
+/// `'static`, elided, or hidden by a path), and that input has exactly one distinct lifetime.
+/// `x: &'a u8, y: Foo<'a>`, `x: Foo<'a>, y: Foo<'a>`, `x: &'a u8, y: Foo<'static>` and `x:
+/// Foo2<'a, 'b>` fail; `x: Foo2<'a, 'a>` and `x: &'a Foo<'a>` do not. The same holds for a
+/// projection `<X as R<(&'a (),)>>::Type`. A receiver that is a reference gives its lifetime to
+/// the output whatever the others have (`self: Box<Self>` is an input like another), and `Fn(..)`
+/// and a function pointer count their own inputs.
+///
+/// Fix: the type in an input that does not name the lifetime the inputs keep adds it too
+/// (`Elision::for_input()`, per input of a method, a function pointer and `Fn(..)`; the Referrer
+/// counts per argument as well: `SignatureFacts::for_input()`). The type is copied as written and
+/// reported, as for F48 (`sig (elided)`), or the function pointer is leaked whole. The type in the
+/// input that names it (`x: &'a Wrap<T>`, `x: (&'a u8, Wrap<T>)`) adds nothing.
+///
+/// The cross-crate fixture is 9204 (`tests/cross_crate.rs`).
+#[test]
+fn f49_a_lifetime_that_another_input_keeps_breaks_elision() {
+    // `f` and `g` are broken, in either order. The others are controls: `Wrap<T>` is the entry.
+    let item: ItemTrait = parse_quote!(
+        trait Tr<'a, T: 'a> {
+            fn f(x: &'a u8, y: Wrap<T>) -> &u8;
+            fn g(y: Wrap<T>, x: &'a u8) -> &u8;
+            fn h(x: &'a Wrap<T>) -> &u8;
+            fn i(x: (&'a u8, Wrap<T>)) -> &u8;
+            fn j(x: &'a u8, y: Wrap<T>) -> &'a u8;
+            fn k(&self, x: &'a u8, y: Wrap<T>) -> &u8;
+            fn l(x: &'a u8, y: Wrap<T>);
+            fn m(x: &'a u8, y: Wrap<u8>) -> &u8;
+        }
+    );
+    let item = Item::Trait(item);
+    let (referrer, contexts, reasons) = f48_leak(std::slice::from_ref(&item));
+    assert_eq!(reasons, [Reason::RelativePath; 2]);
+    assert_eq!(parts_of(&referrer), ["type (Wrap < T >) 0 sig (elided)"]);
+    let copies = f48_copies(&referrer, &contexts, std::slice::from_ref(&item));
+    assert_eq!(
+        copies,
+        [
+            "trait Tr < 'a , T : 'a > { fn f (x : & 'a u8 , y : Wrap < T >) -> & u8 ; \
+          fn g (y : Wrap < T > , x : & 'a u8) -> & u8 ; \
+          fn h (x : P < 0usize >) -> & u8 ; \
+          fn i (x : (& 'a u8 , P < 1usize >)) -> & u8 ; \
+          fn j (x : & 'a u8 , y : P < 1usize >) -> & 'a u8 ; \
+          fn k (& self , x : & 'a u8 , y : P < 1usize >) -> & u8 ; \
+          fn l (x : & 'a u8 , y : P < 1usize >) ; \
+          fn m (x : & 'a u8 , y : P < 2usize >) -> & u8 ; }"
+        ]
+    );
+    // Before the fix there was no error and no part: `f` and `g` had the entry, whose projection
+    // names `'a`.
+    let before = f48_copies(
+        &without_parts(&referrer),
+        &contexts,
+        std::slice::from_ref(&item),
+    );
+    assert!(before[0].contains("fn f (x : & 'a u8 , y : P < 1usize >) -> & u8 ;"));
+    assert!(before[0].contains("fn g (y : P < 1usize > , x : & 'a u8) -> & u8 ;"));
+
+    // The error says that rustc counts the lifetimes of each input, and what to write.
+    let err = assert_rejected(
+        &item,
+        analyze_in(new_leaker(), &item),
+        &["use absolute path: 'Wrap < T >'"; 2],
+    );
+    let note = "the output `& u8` has an elided lifetime, which elision takes from the only \
+                lifetime of the inputs, but a leaked type in the inputs has `'a` among its \
+                generics, and the copy names it in the arguments of its projection, so the inputs \
+                have more than one lifetime, as rustc counts the lifetimes of each input apart \
+                (E0106)";
+    let whole = "it cannot be leaked as a whole because of `& u8`";
+    assert_eq!(all_notes(&err), [note, whole, note, whole]);
+    let help = "name the lifetime of the inputs and of the output, give the method a receiver \
+                (`&self`), or write `Wrap<T>` with an absolute path";
+    assert_eq!(all_helps(&err), [help, help]);
+
+    // The same lifetime is not a second one if the input that has it has the type: that input has
+    // one lifetime. Without the type in another input, the entries are as the controls above.
+    let controls: ItemTrait = parse_quote!(
+        trait Tr<'a, T: 'a> {
+            fn h(x: &'a Wrap<T>) -> &u8;
+            fn i(x: (&'a u8, Wrap<T>)) -> &u8;
+            fn j(x: &'a u8, y: Wrap<T>) -> &'a u8;
+            fn k(&self, x: &'a u8, y: Wrap<T>) -> &u8;
+            fn l(x: &'a u8, y: Wrap<T>);
+            fn m(x: &'a u8, y: Wrap<u8>) -> &u8;
+        }
+    );
+    let (_, referrer) = analyze_in(new_leaker(), &Item::Trait(controls)).unwrap();
+    assert!(parts_of(&referrer).is_empty());
+    let entries: Vec<String> = referrer.iter().map(string).collect();
+    assert_eq!(entries, ["& 'a Wrap < T >", "Wrap < T >", "Wrap < u8 >"]);
+}
+
+/// F49: a function pointer and `Fn(..)` count the lifetimes of each input as well. A function
+/// pointer in a field is leaked whole, so are the arguments of `Fn(..)` in `dyn Fn(..)`, and a
+/// bound is an error.
+#[test]
+fn f49_a_function_pointer_and_fn_sugar_count_each_input() {
+    let items: Vec<Item> = vec![
+        parse_quote!(
+            struct S<'a, T: 'a> {
+                f: fn(&'a u8, Wrap<T>) -> &u8,
+                g: fn(&'a Wrap<T>) -> &u8,
+                h: fn((&'a u8, Wrap<T>)) -> &u8,
+                i: fn(&'a u8, Wrap<T>) -> &'a u8,
+            }
+        ),
+        parse_quote!(
+            trait Tr<'a, T: 'a> {
+                fn m(&self, f: Box<dyn Fn(&'a u8, Wrap<T>) -> &u8>);
+                fn n(&self, f: Box<dyn Fn(&'a u8, Wrap<T>) -> &'a u8>);
+            }
+        ),
+    ];
+    let (referrer, contexts, reasons) = f48_leak(&items);
+    assert!(reasons.is_empty());
+    let entries: Vec<String> = referrer.iter().map(string).collect();
+    assert_eq!(
+        entries,
+        [
+            "& 'a Wrap < T >",
+            "Wrap < T >",
+            "dyn Fn (& 'a u8 , Wrap < T >) -> & u8",
+            "fn (& 'a u8 , Wrap < T >) -> & u8",
+        ]
+    );
+    assert_eq!(
+        f48_copies(&referrer, &contexts, &items),
+        [
+            "struct S < 'a , T : 'a > { f : P < 3usize > , g : fn (P < 0usize >) -> & u8 , \
+             h : fn ((& 'a u8 , P < 1usize >)) -> & u8 , i : fn (& 'a u8 , P < 1usize >) -> & 'a u8 , }",
+            "trait Tr < 'a , T : 'a > { fn m (& self , f : Box < P < 2usize > >) ; \
+             fn n (& self , f : Box < dyn Fn (& 'a u8 , P < 1usize >) -> & 'a u8 >) ; }",
+        ]
+    );
+    // In a bound nothing can hold the signature: the error, with the type as written.
+    let bound: ItemTrait = parse_quote!(
+        trait Tr<'a, T: 'a> {
+            fn m<F: Fn(&'a u8, Wrap<T>) -> &u8>(&self, f: F);
+        }
+    );
+    let err = assert_rejected(
+        &bound,
+        analyze_in(new_leaker(), &Item::Trait(bound.clone())),
+        &["use absolute path: 'Wrap < T >'"],
+    );
+    assert!(
+        all_notes(&err)[0].ends_with("as rustc counts the lifetimes of each input apart (E0106)")
+    );
 }
