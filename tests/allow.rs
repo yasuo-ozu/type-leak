@@ -14,7 +14,7 @@
 //!   without meaning, or whose bounds do (in a type, a bound, a default, a module, a value), and a
 //!   type that leaves a lifetime of its method unconstrained, are copied whole and have no entry.
 //! - What accepting does not make compile (`Self` in a predicate beside a leaked bound).
-//! - `allow_prelude()` and `allow_std_crates()`, `finish()` and `into_referrer()`.
+//! - `allow_std_crates()`, `finish()` and `into_referrer()`.
 //! - The list of errors of a Leaker: several calls, nested scopes, a panic.
 //! - The parts that the Referrer carries (the last section): the visitor leaves a part as written
 //!   (also beside an entry with the same tokens) and looks up no entry in it, and the serialization.
@@ -1029,7 +1029,7 @@ fn check_reports_the_causes_and_records_no_error() {
     assert!(result.finish().unwrap().is_empty());
 }
 
-// ── `allow_prelude()` and `allow_std_crates()` ───────────────────────────────────────────────
+// ── `allow_std_crates()` ─────────────────────────────────────────────────────────────────────
 
 /// Errors whose causes are paths: a prelude name (`Clone`, `Vec<Rel<'_>>`), the paths of the
 /// standard crates (`std`, `core`, `alloc`), an absolute path (whose cause is the `Rel<'_>` in it)
@@ -1063,41 +1063,10 @@ fn causes(result: &LeakerResult) -> Vec<String> {
 }
 
 #[test]
-fn allow_prelude_drops_the_causes_that_start_with_a_prelude_name() {
-    let mut result = result_of_paths();
-    assert_eq!(
-        causes(&result),
-        [
-            "Clone",
-            "Vec < Rel < '_ > >",
-            "std :: vec :: Vec < Rel < '_ > >",
-            "core :: option :: Option < Rel < '_ > >",
-            "alloc :: boxed :: Box < Rel < '_ > >",
-            "Rel < '_ >",
-            "MyType < '_ >"
-        ]
-    );
-    let referrer = result.clone().into_referrer();
-    // `Clone` and `Vec<..>`; the paths of the standard crates are not in the prelude.
-    result.allow_prelude();
-    assert_eq!(
-        causes(&result),
-        [
-            "std :: vec :: Vec < Rel < '_ > >",
-            "core :: option :: Option < Rel < '_ > >",
-            "alloc :: boxed :: Box < Rel < '_ > >",
-            "Rel < '_ >",
-            "MyType < '_ >"
-        ]
-    );
-    assert_eq!(result.into_referrer(), referrer);
-}
-
-#[test]
 fn allow_std_crates_drops_the_causes_that_start_with_std_core_or_alloc() {
     let mut result = result_of_paths();
     let referrer = result.clone().into_referrer();
-    // `Vec<..>` is a prelude name, not a path of a crate.
+    // `Clone` and `Vec<..>` are prelude names, not paths of a crate.
     result.allow_std_crates();
     assert_eq!(
         causes(&result),
@@ -1107,47 +1076,26 @@ fn allow_std_crates_drops_the_causes_that_start_with_std_core_or_alloc() {
 }
 
 #[test]
-fn the_filters_chain_and_drop_each_what_it_matches() {
+fn allow_std_crates_chains_with_allow() {
     let mut result = result_of_paths();
     let referrer = result.clone().into_referrer();
-    result.allow_prelude().allow_std_crates();
-    assert_eq!(causes(&result), ["Rel < '_ >", "MyType < '_ >"]);
-    // Chained with `allow()`.
+    result.allow_std_crates();
+    assert_eq!(
+        causes(&result),
+        ["Clone", "Vec < Rel < '_ > >", "Rel < '_ >", "MyType < '_ >"]
+    );
     result
+        .allow(Cause::Trait(parse_quote!(Clone)))
+        .allow(Cause::Type(parse_quote!(Vec<Rel<'_>>)))
         .allow(Cause::Type(parse_quote!(Rel<'_>)))
         .allow(Cause::Type(parse_quote!(MyType<'_>)));
     assert!(result.errors().is_empty());
     assert_eq!(result.finish().unwrap(), referrer);
 }
 
-/// `fn c(&self, x: Vec<Rel<'_>>)` has the cause `Vec<Rel<'_>>` without
-/// `LeakerConfig::allow_std_prelude()`, which `allow_prelude()` drops because of `Vec`. With the
-/// option the error is about `Rel<'_>`, and stays.
-#[test]
-fn allow_prelude_is_coarser_than_the_config_option() {
-    let item: ItemTrait = parse_quote!(
-        trait Tr {
-            fn c(&self, x: Vec<Rel<'_>>);
-        }
-    );
-    let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
-    let mut result = leaker.result();
-    assert_eq!(causes(&result), ["Vec < Rel < '_ > >"]);
-    assert!(result.allow_prelude().errors().is_empty());
-
-    let mut config = LeakerConfig::new();
-    config.allow_std_prelude();
-    let mut leaker = Leaker::from_config(config);
-    leaker.intern_trait(&item, true);
-    let mut result = leaker.result();
-    assert_eq!(causes(&result), ["Rel < '_ >"]);
-    assert_eq!(result.allow_prelude().errors().len(), 1);
-}
-
 /// The path of a cause is that of a type, a trait, a macro or a value; the others have none.
 #[test]
-fn the_filters_read_the_path_of_a_trait_a_macro_and_a_value() {
+fn allow_std_crates_reads_the_path_of_a_trait_a_macro_and_a_value() {
     let item: ItemTrait = parse_quote!(
         trait Tr {
             fn f(&self) {
@@ -1172,17 +1120,19 @@ fn the_filters_read_the_path_of_a_trait_a_macro_and_a_value() {
     left.allow_std_crates();
     // Only `inner::make` is left: the macro and the value of `core` are dropped.
     assert_eq!(causes(&left), ["inner :: make"]);
+    // `allow(cause)` drops each of them, whatever its kind.
     let mut left = analyze();
-    left.allow_prelude();
-    assert_eq!(causes(&left).len(), result.errors().len());
+    for error in result.errors() {
+        left.allow(error.cause.clone());
+    }
+    assert!(left.errors().is_empty());
 }
 
-/// A cause with no path is never dropped: `Self`, which is no name of the lists, an unreadable
-/// syntax, a closure.
+/// A cause with no path is never dropped: `Self`, an unreadable syntax, a closure.
 #[test]
 fn a_cause_without_a_path_is_never_dropped() {
     let mut result = without_self(&[parse_quote!(Rel<Self>)]);
-    result.allow_prelude().allow_std_crates();
+    result.allow_std_crates();
     assert_eq!(result.errors().len(), 1);
 
     let item: ItemTrait = parse_quote!(
@@ -1200,7 +1150,7 @@ fn a_cause_without_a_path_is_never_dropped() {
     leaker.intern_trait(&item, true);
     let mut result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    result.allow_prelude().allow_std_crates();
+    result.allow_std_crates();
     assert_eq!(result.errors().len(), 1);
 }
 

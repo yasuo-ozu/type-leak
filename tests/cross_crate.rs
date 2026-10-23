@@ -1669,7 +1669,7 @@ fn accepted_conflicts_are_copied_as_written() {
 
 /// The Leaker's macro passes its errors on (`#[prop_leak_result]`: the serialized `LeakerResult`),
 /// and the Referrer's macro, in the crate `accepted` of `tests/crates/referrer`, drops them by what
-/// they are: `allow(prelude)` (9190), `allow(std_crates)` (9191), and the causes written out,
+/// they are: `allow(trait Clone)` (9190), `allow(std_crates)` (9191), and the causes written out,
 /// `allow(trait PlainTr, type Held<'_>)` (9192). If one remained, the macro would report it and the
 /// crate would not build (`tests/diagnostic.rs` has that); so it is enough to see that the crate
 /// exists and that the copy keeps the parts as written, with every other type replaced and checked.

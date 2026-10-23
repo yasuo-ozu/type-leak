@@ -73,8 +73,7 @@ impl AllowedPaths {
     }
 }
 
-/// The names of the standard prelude that `LeakerConfig::allow_std_prelude()` and
-/// `LeakerResult::allow_prelude()` allow.
+/// The names of the standard prelude that `LeakerConfig::allow_std_prelude()` allows.
 pub(crate) fn std_prelude_paths() -> Vec<Path> {
     const NAMES: [&str; 31] = [
         "Box",

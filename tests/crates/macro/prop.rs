@@ -35,8 +35,8 @@
 //!
 //! With `#[prop_leak_result]` the Leaker does not decide: an item with errors is emitted with its
 //! `LeakerResult` (the Referrer, then the errors, as tokens). The Referrer's invocation says what
-//! it allows (`allow(prelude, std_crates, trait Path, type Ty)`: `LeakerResult::allow_prelude()`,
-//! `allow_std_crates()`, `allow(cause)`), [`apply()`] reports every error that remains with
+//! it allows (`allow(std_crates, trait Path, type Ty)`: `LeakerResult::allow_std_crates()`,
+//! `allow(cause)`), [`apply()`] reports every error that remains with
 //! `ErrorItem::to_compile_error()`, and copies the item with the recovered Referrer either way.
 
 use proc_macro2::{Punct, Spacing, Span, TokenStream};
@@ -2159,11 +2159,9 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
     })
 }
 
-/// What the Referrer's invocation allows of the errors it got (`allow(prelude, std_crates, trait
-/// Path, type Ty)`).
+/// What the Referrer's invocation allows of the errors it got (`allow(std_crates, trait Path, type
+/// Ty)`).
 enum Allow {
-    /// `LeakerResult::allow_prelude()`
-    Prelude,
     /// `LeakerResult::allow_std_crates()`
     StdCrates,
     /// `LeakerResult::allow(cause)`: `trait Path` is a `Cause::Trait`, `type Ty` a `Cause::Type`.
@@ -2180,11 +2178,10 @@ impl Parse for Allow {
         }
         let word: Ident = input.parse()?;
         match word.to_string().as_str() {
-            "prelude" => Ok(Allow::Prelude),
             "std_crates" => Ok(Allow::StdCrates),
             _ => Err(Error::new(
                 word.span(),
-                "expected `prelude`, `std_crates`, `trait <path>` or `type <type>`",
+                "expected `std_crates`, `trait <path>` or `type <type>`",
             )),
         }
     }
@@ -2302,7 +2299,6 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     }
     for allowed in allow {
         match allowed {
-            Allow::Prelude => result.allow_prelude(),
             Allow::StdCrates => result.allow_std_crates(),
             Allow::Cause(cause) => result.allow(cause),
         };

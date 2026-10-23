@@ -421,9 +421,9 @@ fn position_in_leaker(marker: &str, needle: &str) -> String {
 }
 
 /// The errors of the item `Denied` (`id = 9193` in the Leaker's crate) that the invocation does not
-/// allow are reported in the Referrer's crate, and the one it allows (`Clone`, with `allow(prelude)`)
-/// is not: `core::fmt::Debug` is not the prelude, and `Held<'_>` is no path at all. They are at the
-/// invocation, as rustc has it for the spans of a macro of another crate.
+/// allow are reported in the Referrer's crate, and the one it allows (`Clone`, with `allow(trait
+/// Clone)`) is not: `core::fmt::Debug` and `Held<'_>` are. They are at the invocation, as rustc has
+/// it for the spans of a macro of another crate.
 #[test]
 fn errors_the_referrers_macro_does_not_allow_are_reported_in_its_crate() {
     let built = nested::cargo("diagnostic_result", &["check"], &[]);

@@ -1860,7 +1860,8 @@ pub mod kinds {
     // are copied in the Referrer's crate (`accepted`); 9193 in `tests/crates/diagnostic_result`.
 
     /// `Clone` as the bound of the trait's generic, as a supertrait and in the bound of a method:
-    /// three errors, all dropped by `allow(prelude)`. The copy keeps the three as written.
+    /// three errors with one cause, dropped by `allow(trait Clone)`. The copy keeps the three as
+    /// written.
     #[prop_leak_result(id = 9190, allow_self = true)]
     pub trait PreludeBounds<T: Clone>: Clone {
         fn rel(&self, t: T) -> Rel;
@@ -1868,7 +1869,7 @@ pub mod kinds {
     }
 
     /// A path headed by `core` or `std` with no leading `::`, in a bound of the trait's generic and in
-    /// a where predicate: two errors, dropped by `allow(std_crates)` and not by `allow(prelude)`.
+    /// a where predicate: two errors, dropped by `allow(std_crates)`.
     #[prop_leak_result(id = 9191, allow_self = true)]
     pub trait StdBounds<T: core::fmt::Debug> {
         fn rel(&self, t: T) -> Rel;
@@ -1886,9 +1887,8 @@ pub mod kinds {
         fn plain<U: PlainTr>(&self, u: U) -> Wrap<T>;
     }
 
-    /// Three errors, of which the Referrer's macro allows one (`allow(prelude)`: the `Clone`) and
-    /// reports two: `core::fmt::Debug` (not the prelude) and `Held<'_>` (not allowed at all). The
-    /// copy is made either way.
+    /// Three errors, of which the Referrer's macro allows one (`allow(trait Clone)`) and reports
+    /// two: `core::fmt::Debug` and `Held<'_>`. The copy is made either way.
     #[prop_leak_result(id = 9193, allow_self = true)]
     pub trait Denied<T: Clone> {
         fn held(&self, x: Held<'_>) -> Rel;

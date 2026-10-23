@@ -9,7 +9,7 @@ use crate::error::Reason;
 use crate::error::{Cause, ErrorItem};
 use crate::graph::{is_whole_reference, NodeKey, TypeGraph};
 use crate::referrer::Referrer;
-use crate::util::{ident_name, std_crate_paths, std_prelude_paths, AllowedPaths};
+use crate::util::{ident_name, std_crate_paths, AllowedPaths};
 use crate::view::View;
 use proc_macro2::{Span, TokenStream};
 use safegraph::algo::max_flow::edmonds_karp_with_flows;
@@ -853,36 +853,11 @@ impl LeakerResult {
         self
     }
 
-    /// Drops the remaining errors whose cause is a path that starts with a name of the standard
-    /// prelude (`Vec`, `Option`, `Clone`, ..: those of [`LeakerConfig::allow_std_prelude()`]).
+    /// Drops the remaining errors whose cause is a path (a type, a trait, a macro or a value) that
+    /// starts with `std`, `core` or `alloc`, such as `core::fmt::Debug`.
     ///
-    /// It is coarser than that option, by design. Without the option, `fn c(&self, x: Vec<Rel<'_>>)`
-    /// has the cause `Vec<Rel<'_>>`, which this drops because of `Vec`; with the option, the error
-    /// is about `Rel<'_>` and stays. Only a cause with a path can be dropped (not a reference, a
-    /// `dyn`, an array, a tuple or a lifetime). The promise is that of
-    /// [`allow()`](LeakerResult::allow).
-    ///
-    /// ```
-    /// # use {syn::*, type_leak::*};
-    /// let item: ItemTrait = parse_quote!(trait Tr { fn c(&self, x: Vec<Rel<'_>>); });
-    /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&item, true);
-    /// let mut result = leaker.result();
-    /// assert!(result.allow_prelude().errors().is_empty()); // the cause is `Vec<Rel<'_>>`
-    ///
-    /// let mut config = LeakerConfig::new();
-    /// config.allow_std_prelude();
-    /// let mut leaker = Leaker::from_config(config);
-    /// leaker.intern_trait(&item, true);
-    /// let mut result = leaker.result();
-    /// assert_eq!(result.allow_prelude().errors().len(), 1); // the cause is `Rel<'_>`
-    /// ```
-    pub fn allow_prelude(&mut self) -> &mut Self {
-        self.allow_paths(&std_prelude_paths())
-    }
-
-    /// Drops the remaining errors whose cause is a path that starts with `std`, `core` or `alloc`,
-    /// like [`allow_prelude()`](LeakerResult::allow_prelude) for the paths of those crates.
+    /// A cause with no path (a reference, a `dyn`, an array, a tuple, a lifetime) is never dropped.
+    /// The promise is that of [`allow()`](LeakerResult::allow).
     pub fn allow_std_crates(&mut self) -> &mut Self {
         self.allow_paths(&std_crate_paths())
     }
@@ -921,21 +896,20 @@ impl LeakerResult {
 /// Writes the [`LeakerResult`] as tokens: the [`Referrer`] as it writes itself, then one brace group
 /// for each remaining error ([`ErrorItem`]), in the order of [`errors()`](LeakerResult::errors).
 ///
-/// A Leaker's macro can emit the result and let the Referrer's macro decide what to allow, for
-/// example [`allow_prelude()`](LeakerResult::allow_prelude) where the copy's crate does not shadow
-/// those names, and report what remains.
+/// A Leaker's macro can emit the result and let the Referrer's macro decide what to allow and report
+/// what remains.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
 /// # use template_quote::ToTokens;
-/// let item: ItemTrait = parse_quote!(trait Tr { fn c(&self, x: Vec<Rel<'_>>); });
+/// let item: ItemTrait = parse_quote!(trait Tr: core::fmt::Debug { fn c(&self) -> Rel; });
 /// let mut leaker = Leaker::new();
 /// leaker.intern_trait(&item, true);
 /// let tokens = leaker.result().to_token_stream();
 ///
 /// let mut result: LeakerResult = parse2(tokens).unwrap();
 /// assert_eq!(result.errors().len(), 1);
-/// assert!(result.allow_prelude().errors().is_empty());
+/// assert!(result.allow_std_crates().errors().is_empty());
 /// ```
 impl ToTokens for LeakerResult {
     fn to_tokens(&self, tokens: &mut TokenStream) {

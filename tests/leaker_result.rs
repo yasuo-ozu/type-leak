@@ -17,12 +17,12 @@ use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
 
-/// A trait and a struct that go wrong in several ways: a trait in a bound, a type with an elided
-/// lifetime, a path of the prelude with one, a trait object, and a trait in an argument. There are
-/// entries, a required one and an optional one.
+/// A trait and a struct that go wrong in several ways: a trait in a bound, a path of the standard
+/// library in a bound, a type with an elided lifetime, a path of the prelude with one, a trait
+/// object, and a trait in an argument. There are entries, a required one and an optional one.
 fn with_errors() -> LeakerResult {
     let tr: ItemTrait = parse_quote!(
-        trait Tr<T>: Clone {
+        trait Tr<T>: Clone + core::fmt::Debug {
             fn f(&self, a: MyType<'_>, b: Vec<Rel<'_>>, c: Box<dyn RelA + RelB<'_>>) -> Wrap<T>;
             fn g(&self, x: ::foo::X) -> Rel;
         }
@@ -142,9 +142,9 @@ fn a_result_with_errors_is_written_and_read_back() {
     );
 }
 
-/// `allow(cause)`, `allow_prelude()` and `allow_std_crates()` drop the same errors after the trip as
-/// before it, each step and all of them, and so does writing the rest again. Accepting every cause
-/// leaves a Referrer that `finish()` returns, equal to the original.
+/// `allow(cause)` and `allow_std_crates()` drop the same errors after the trip as before it, each
+/// step and all of them, and so does writing the rest again. Accepting every cause leaves a Referrer
+/// that `finish()` returns, equal to the original.
 #[test]
 fn allowing_after_the_round_trip_drops_the_same_errors() {
     let result = with_errors();
@@ -160,15 +160,12 @@ fn allowing_after_the_round_trip_drops_the_same_errors() {
         assert_eq!(describe_all(&after), describe_all(&before));
     }
     let (mut before, mut after) = (result.clone(), read_back.clone());
-    before.allow_prelude();
-    after.allow_prelude();
-    // `Clone`, `Vec<Rel<'_>>` and `Box<dyn ..>` start with names of the prelude, `MyType<'_>` and
-    // `dyn RelTr` do not.
-    let remaining: Vec<String> = before.errors().iter().map(|e| text(&e.cause)).collect();
-    assert_eq!(remaining, ["MyType < '_ >", "RelTr"]);
-    assert_eq!(describe_all(&after), describe_all(&before));
     before.allow_std_crates();
     after.allow_std_crates();
+    // `core::fmt::Debug` is the only cause that starts with the name of a crate of the library.
+    let remaining: Vec<String> = before.errors().iter().map(|e| text(&e.cause)).collect();
+    assert_eq!(remaining.len(), result.errors().len() - 1);
+    assert!(!remaining.contains(&"core :: fmt :: Debug".to_string()));
     assert_eq!(describe_all(&after), describe_all(&before));
 
     // What remains is written and read again, with the same Referrer.

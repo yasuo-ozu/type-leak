@@ -261,7 +261,7 @@ pub mod accepted {
     type_leak_test_leaker::__tl_prop_9190!(
         path = ::type_leak_test_leaker::kinds,
         accept,
-        allow(prelude)
+        allow(trait Clone)
     );
     type_leak_test_leaker::__tl_prop_9191!(
         path = ::type_leak_test_leaker::kinds,
