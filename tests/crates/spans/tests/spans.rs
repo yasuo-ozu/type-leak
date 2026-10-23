@@ -254,6 +254,42 @@ fn a_serialized_error_keeps_its_spans() {
     }
 }
 
+/// The same through a `LeakerResult`: the cause of each error is where the source has the offending
+/// tokens after the trip, and the errors are read back in order.
+#[test]
+fn a_serialized_leaker_result_keeps_its_spans() {
+    let source =
+        "trait Tr: Clone {\n    fn f(&self, a: MyType<'_>, b: Box<dyn RelA + RelB<'_>>);\n}";
+    let item: ItemTrait = parse_str(source).unwrap();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    assert_eq!(result.errors().len(), 3, "{}", messages(result.errors()));
+    let read: LeakerResult = parse2(result.to_token_stream()).unwrap();
+    assert_eq!(read.errors().len(), 3);
+    for (read, item) in read.errors().iter().zip(result.errors()) {
+        assert_eq!(read.message, item.message);
+        assert_eq!(
+            places(&read.cause.to_token_stream()),
+            places(&item.cause.to_token_stream())
+        );
+    }
+    assert_span_at(read.errors()[0].span(), source, "Clone", 0);
+    assert_span_at(read.errors()[1].span(), source, "MyType<'_>", 0);
+    assert_span_at(
+        read.errors()[2].span(),
+        source,
+        "Box<dyn RelA + RelB<'_>>",
+        0,
+    );
+    assert_span_at(
+        read.errors()[2].help.as_ref().unwrap().0.span(),
+        source,
+        "Box",
+        0,
+    );
+}
+
 /// A cause is the same whatever its spans: the one that is written elsewhere (other lines and
 /// columns) drops the error (`LeakerResult::allow()`), is equal to the cause of the error, and
 /// hashes the same.

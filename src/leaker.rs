@@ -19,9 +19,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::result::Result;
+use syn::parse::{Parse, ParseStream};
 use syn::visit::Visit;
 use syn::*;
-use template_quote::quote;
+use template_quote::{quote, ToTokens};
 
 /// Finds the types of an item that depend on where they are written, and collects them in a
 /// [`Referrer`].
@@ -794,6 +795,8 @@ impl Leaker {
 /// never change the Referrer, which has every rejected part copied as written either way. Take the
 /// Referrer with [`finish()`](LeakerResult::finish) if no error remains, or with
 /// [`into_referrer()`](LeakerResult::into_referrer) whatever remains.
+///
+/// [`ToTokens`] and [`Parse`] pass it to another macro, which can then decide what to allow.
 #[derive(Clone, Debug)]
 pub struct LeakerResult {
     referrer: Referrer,
@@ -908,6 +911,51 @@ impl LeakerResult {
         } else {
             Err(self.errors)
         }
+    }
+}
+
+/// Writes the [`LeakerResult`] as tokens: the [`Referrer`] as it writes itself, then one brace group
+/// for each remaining error ([`ErrorItem`]), in the order of [`errors()`](LeakerResult::errors).
+///
+/// A Leaker's macro can emit the result and let the Referrer's macro decide what to allow, for
+/// example [`allow_prelude()`](LeakerResult::allow_prelude) where the copy's crate does not shadow
+/// those names, and report what remains.
+///
+/// ```
+/// # use {syn::*, type_leak::*};
+/// # use template_quote::ToTokens;
+/// let item: ItemTrait = parse_quote!(trait Tr { fn c(&self, x: Vec<Rel<'_>>); });
+/// let mut leaker = Leaker::new();
+/// leaker.intern_trait(&item, true);
+/// let tokens = leaker.result().to_token_stream();
+///
+/// let mut result: LeakerResult = parse2(tokens).unwrap();
+/// assert_eq!(result.errors().len(), 1);
+/// assert!(result.allow_prelude().errors().is_empty());
+/// ```
+impl ToTokens for LeakerResult {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        self.referrer.to_tokens(tokens);
+        for error in &self.errors {
+            error.to_tokens(tokens);
+        }
+    }
+}
+
+/// Reads a [`LeakerResult`] written by its [`ToTokens`] implementation: a [`Referrer`], then the
+/// brace groups that follow it, one [`ErrorItem`] each.
+///
+/// The tokens after the last error are not consumed, but a brace group is read as an error. Fails
+/// as the [`Referrer`] does (a missing or different format tag), and on an error that does not
+/// parse.
+impl Parse for LeakerResult {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let referrer = input.parse()?;
+        let mut errors = Vec::new();
+        while input.peek(token::Brace) {
+            errors.push(input.parse()?);
+        }
+        Ok(LeakerResult { referrer, errors })
     }
 }
 
