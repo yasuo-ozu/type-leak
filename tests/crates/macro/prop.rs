@@ -89,6 +89,10 @@ pub(crate) struct Args {
     /// The Leaker accepts an entry that names the own `Self` of a nested item together with a bound
     /// that does (`LeakerConfig::nested_self_entries()`).
     nested_self_entries: bool,
+    /// The Referrer's visitor is not given `Visitor::with_nested_self()`: a macro that has no entry
+    /// to write for the own `Self` of a nested item does not need it, and the parts of the item
+    /// must be left as written all the same.
+    no_nested_self: bool,
     /// Not an argument of the attribute: set by [`leak()`] when the item has errors and is accepted
     /// with the recovered Referrer (`prop_leak_accept`, `TYPE_LEAK_PROP_ACCEPT`). The Referrer copies
     /// such an item in the crate of its own that `tests/prop_cross_crate` makes for them (`accept`,
@@ -110,6 +114,7 @@ impl Parse for Args {
             redeclare: false,
             values: false,
             nested_self_entries: false,
+            no_nested_self: false,
             accepted: false,
         };
         for kv in Punctuated::<MetaNameValue, Token![,]>::parse_terminated(input)? {
@@ -133,6 +138,7 @@ impl Parse for Args {
                 ("redeclare", Lit::Bool(b)) => args.redeclare = b.value,
                 ("values", Lit::Bool(b)) => args.values = b.value,
                 ("nested_self_entries", Lit::Bool(b)) => args.nested_self_entries = b.value,
+                ("no_nested_self", Lit::Bool(b)) => args.no_nested_self = b.value,
                 ("accepted", Lit::Bool(b)) => args.accepted = b.value,
                 ("allow", Lit::Str(s)) => {
                     for path in s.value().split(',').filter(|p| !p.trim().is_empty()) {
@@ -152,6 +158,7 @@ impl Args {
         let (primitive, relaxed_sized) = (self.primitive, self.relaxed_sized);
         let (redeclare, values) = (self.redeclare, self.values);
         let (nested_self_entries, accepted) = (self.nested_self_entries, self.accepted);
+        let no_nested_self = self.no_nested_self;
         let strict = self.strict.map(|strict| quote!(strict = #strict,));
         let scope = &self.scope;
         let allow = self
@@ -160,7 +167,7 @@ impl Args {
             .map(|p| quote!(#p).to_string().replace(' ', ""))
             .collect::<Vec<_>>()
             .join(",");
-        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict primitive = #primitive, relaxed_sized = #relaxed_sized, redeclare = #redeclare, values = #values, nested_self_entries = #nested_self_entries, accepted = #accepted)
+        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict primitive = #primitive, relaxed_sized = #relaxed_sized, redeclare = #redeclare, values = #values, nested_self_entries = #nested_self_entries, no_nested_self = #no_nested_self, accepted = #accepted)
     }
 }
 
@@ -1491,28 +1498,31 @@ fn rewrite(
         if let Item::Mod(m) = item {
             base.segments.push(m.ident.clone().into());
         }
-        let mut visitor = referrer
-            .clone()
-            .visitor(context, |_, ix| {
-                projector.project(ix).unwrap_or_else(|e| {
-                    *error.borrow_mut() = Some(e);
-                    parse_quote!(())
-                })
+        let visitor = referrer.clone().visitor(context, |_, ix| {
+            projector.project(ix).unwrap_or_else(|e| {
+                *error.borrow_mut() = Some(e);
+                parse_quote!(())
             })
-            // A struct, an enum, a union or a trait nested in the module (the item of a scope
-            // `mod`) has a `Self` of its own, whose entries the visitor finds.
-            .with_nested_self(|nested, _, ix| {
+        });
+        // The item of a scope `mod` is a nested item, which has a `Self` of its own.
+        let visitor = match (self_ty, args.scope == "mod") {
+            (Some(self_ty), false) => visitor.with_self(self_ty),
+            _ => visitor,
+        };
+        // A struct, an enum, a union or a trait nested in the module (the item of a scope `mod`)
+        // has a `Self` of its own, whose entries the visitor finds.
+        let mut visitor: Box<dyn VisitMut + '_> = if args.no_nested_self {
+            Box::new(visitor)
+        } else {
+            Box::new(visitor.with_nested_self(|nested, _, ix| {
                 projector
                     .project_nested(nested, &base, ix)
                     .unwrap_or_else(|e| {
                         *error.borrow_mut() = Some(e);
                         parse_quote!(())
                     })
-            });
-        // The item of a scope `mod` is a nested item, which has a `Self` of its own.
-        if let (Some(self_ty), false) = (self_ty, args.scope == "mod") {
-            visitor = visitor.with_self(self_ty);
-        }
+            }))
+        };
         match &mut rewritten {
             other if args.scope == "mod" => {
                 let mut file = File {

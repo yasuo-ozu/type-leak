@@ -122,8 +122,9 @@ pub struct CheckResult {
 pub(crate) struct Part {
     /// The part: a [`Cause::Type`], the cause of a bound, or the path of a value.
     pub(crate) cause: Cause,
-    /// The context that an entry of it would have.
-    pub(crate) context: Context,
+    /// The context that an entry of it would have, or `None` if it cannot be written here (a
+    /// bound names a `Self` that has no name: [`Reason::UnnameableSelf`]).
+    pub(crate) context: Option<Context>,
     /// In a bound or where predicate of the item (`AnalyzeVisitor::env_depth > 0`).
     pub(crate) in_predicate: bool,
     /// The innermost type around it that owns the cause of the conflict, with its context
@@ -132,13 +133,14 @@ pub(crate) struct Part {
 }
 
 /// A part that the Referrer leaves as written, with its contexts interned. Serialized as `KIND (
-/// CAUSE ) CONTEXT [predicate] [in ( TYPE ) CONTEXT]`.
+/// CAUSE ) CONTEXT [predicate] [in ( TYPE ) CONTEXT]`, with `unwritable` for a `CONTEXT` of `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PartItem {
     /// A [`Cause::Type`], the cause of a bound, or the path of a value.
     pub(crate) part: Cause,
-    /// The context that an entry of it would have.
-    pub(crate) context: ContextId,
+    /// The context that an entry of it would have. `None`: it cannot be written, so the part is
+    /// the one at a place where the Referrer cannot write its context either.
+    pub(crate) context: Option<ContextId>,
     /// In a bound or where predicate of the item.
     pub(crate) in_predicate: bool,
     /// The type that owns the cause of the conflict, with its context: the part is left as written
@@ -195,7 +197,7 @@ impl PendingType {
     pub(crate) fn part(&self) -> Part {
         Part {
             cause: Cause::Type(self.ty.clone()),
-            context: self.context.clone(),
+            context: Some(self.context.clone()),
             in_predicate: self.in_predicate,
             within: None,
         }
@@ -266,7 +268,10 @@ impl Analysis {
                     if let Some(part) = &error.part {
                         let item = PartItem {
                             part: part.cause.clone(),
-                            context: contexts.intern(part.context.clone()),
+                            context: part
+                                .context
+                                .as_ref()
+                                .map(|context| contexts.intern(context.clone())),
                             in_predicate: part.in_predicate,
                             within: part.within.as_ref().map(|(ty, context)| {
                                 (ty.clone(), contexts.intern(context.clone()))
@@ -438,17 +443,33 @@ fn collect_errors(effects: &[Effect], errors: &mut Vec<CheckResult>) {
     }
 }
 
-/// Returns `true` if a type that may become an entry names `Self`, or has bounds rewritten for the
-/// `Self` that `declared` is, so the Referrer needs to know what `Self` is to find it.
+/// Returns `true` if a type that may become an entry, or a part copied as written, names `Self` or
+/// has bounds rewritten for the `Self` that `declared` is, so the Referrer needs to know what `Self`
+/// is to find it.
 pub(crate) fn names_self(effects: &[Effect], declared: &SelfRequirement) -> bool {
     effects.iter().any(|effect| match effect {
         Effect::Type(pending) => {
-            (pending.in_graph
-                && (pending.context.self_ty().is_some() || pending.context.substitutes(declared)))
+            (pending.in_graph && depends_on_self(&pending.context, declared))
                 || names_self(&pending.components, declared)
         }
-        _ => false,
+        Effect::Error(error) => part_names_self(error, declared),
+        Effect::Primitive(_) => false,
     })
+}
+
+/// Returns `true` if the part of `error`, if any, has a context that depends on `Self`, or none
+/// because a bound names a `Self` that has no name: the Referrer finds it by that, so it needs to
+/// know what `Self` is.
+pub(crate) fn part_names_self(error: &CheckResult, declared: &SelfRequirement) -> bool {
+    error.part.as_ref().map_or(false, |part| {
+        part.context
+            .as_ref()
+            .map_or(true, |context| depends_on_self(context, declared))
+    })
+}
+
+fn depends_on_self(context: &Context, declared: &SelfRequirement) -> bool {
+    context.self_ty().is_some() || context.substitutes(declared)
 }
 
 /// Makes the types in `keys` (with their contexts) no optional entries.

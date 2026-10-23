@@ -1364,10 +1364,10 @@ fn test_reduce_roots_reference_with_a_lifetime_the_copy_would_leave_unconstraine
 }
 
 /// The `Leaker` docs, Method lifetimes: an external type that the Leaker does not allow keeps the
-/// method lifetime `'b` (the Referrer leaves it as written unless it replaces it), so the method is
-/// not an error (E0195) although `Wrap<'b>`, which is leaked as a whole, names `'b` as well. A
-/// reference to a trait object of such a type keeps it too. Audit mutant `m_careful_on` (the
-/// careful rule for trait objects applied to the external type).
+/// method lifetime `'b` (the Referrer copies it as written, as it is no optional entry), so the
+/// method is not an error (E0195) although `Wrap<'b>`, which is leaked as a whole, names `'b` as
+/// well. A reference to a trait object of such a type keeps it too. Audit mutant `m_careful_on`
+/// (the careful rule for trait objects applied to the external type).
 #[test]
 fn test_reduce_roots_external_type_keeping_a_method_lifetime_is_no_e0195() {
     let item: ItemTrait = parse_quote! {
@@ -1379,10 +1379,7 @@ fn test_reduce_roots_external_type_keeping_a_method_lifetime_is_no_e0195() {
         leaked_trait(&item),
         [entry(parse_quote!(Wrap<'b>), "< 'b >")]
     );
-    assert_eq!(
-        optional_trait(&item),
-        [entry(parse_quote!(::ext::W<'b>), "< 'b >")]
-    );
+    assert_eq!(optional_trait(&item), Vec::<(String, String)>::new());
     let item: ItemTrait = parse_quote! {
         trait Tr {
             fn f<'b>(&self, a: &'b dyn ::ext::Tr, b: Wrap<'b>) -> &'b ::core::primitive::u8;

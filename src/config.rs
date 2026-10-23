@@ -82,7 +82,9 @@ impl LeakerConfig {
     /// binding unless it starts with a capital letter, as the lint `non_snake_case` expects: then
     /// it is a path to a constant, a unit struct or a variant.) Such are a function, a constant, a
     /// struct literal, a variant (`inner::f()`, `Rel::new()`, `Rel { .. }`) and the trait of a
-    /// qualified path (`<u8 as Rel>::f()`).
+    /// qualified path (`<u8 as Rel>::f()`). If [`LeakerResult::allow()`](crate::LeakerResult::allow)
+    /// accepts such a trait, it is copied as written, and the types in it (`R1` in `<X as
+    /// inner::Tr<R1>>::f()`) are replaced like elsewhere, which is equivalent.
     ///
     /// Three kinds of type are read, not leaked, and a relative path in them is rejected as
     /// above:

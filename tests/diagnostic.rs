@@ -439,7 +439,7 @@ fn errors_the_referrers_macro_does_not_allow_are_reported_in_its_crate() {
             "use absolute path: 'core :: fmt :: Debug'",
             "11:1",
             &[],
-            &["write `core::fmt::Debug` with an absolute path (e.g. `::my_crate::core::fmt::Debug`), or allow it with `LeakerConfig::allowed_paths`"],
+            &["write `core::fmt::Debug` with an absolute path (e.g. `::core::fmt::Debug`), or allow it with `LeakerConfig::allowed_paths`"],
         ),
     ];
     let mut got = reported(&built.stderr);

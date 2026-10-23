@@ -220,7 +220,7 @@ impl<'a> ValueWalk<'a> {
     fn relative_path(&mut self, path: &Path) {
         let cause = Cause::expr_path(path);
         let part = self.visitor.node_part(cause.clone(), path);
-        self.relative_part(cause, None, part)
+        self.relative_part(cause, None, Some(part))
     }
 
     /// Like `relative()`, for a node that the Referrer leaves as written: `part`.

@@ -209,9 +209,10 @@
 //! - `TYPE_LEAK_PROP_FEATURES`: a comma-separated list of constructs that `type-leak` is known to
 //!   fail on (see `gen::Features`). The generator avoids them by default, so that the test passes
 //!   on the current library, and a new failure is a new finding. With one of `inferred_outlives`,
-//!   `impl_self_outlives`, `strict_anchors` (F18), or `all`, the test fails with the reproduction
-//!   of that finding (`tests/findings.rs` has each one as a library-level test; `strict_anchors`
-//!   is about the items that are invoked as `strict`, a quarter of them). `unsized_params`,
+//!   `impl_self_outlives`, or `all`, the test fails with the reproduction of that finding
+//!   (`tests/findings.rs` has each one as a library-level test). `strict_anchors` (F18, about the
+//!   items that are invoked as `strict`, a quarter of them) is fixed, and off by default: the items
+//!   that have it are not invoked as `strict` unless it is asked for. `unsized_params`,
 //!   `bound_cycles`, `impl_assoc_self`, `method_lifetime_paths`, `module_crate_paths`,
 //!   `bound_merge_syntax`, `fn_pointer_self`, `elided_fn_generics`, `impl_self_bounds` (F13),
 //!   `impl_pred_leaked` (F14), `self_elision` (F15, F23), `implied_outlives` (F16),

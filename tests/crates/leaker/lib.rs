@@ -1894,4 +1894,97 @@ pub mod kinds {
         fn held(&self, x: Held<'_>) -> Rel;
         fn show<U: core::fmt::Debug>(&self, u: Wrap<U>) -> Wrap<T>;
     }
+
+    // Parts that the Referrer must find to leave them as written (tests/findings.rs F18, F43 to
+    // F45). Their trait objects take their lifetime from the path around them (`ObjOf`), and the
+    // entry `dyn SharedTr` of `Bare<dyn SharedTr>` is `+ 'static`: a copy that replaced the one in a
+    // part would not be the original type (E0308 in the Referrer's crate). The paths of `ObjOf` and
+    // `Bare` are absolute, as the names of this crate: the copies of the parts resolve in the
+    // Referrer's crate.
+
+    /// A path whose third parameter has a lifetime bound: a trait object there is `+ 'a`.
+    pub struct ObjOf<'a, T: ?Sized, O: ?Sized + 'a>(pub PhantomData<(&'a (), *const T, *const O)>);
+    pub trait ObjMarker {}
+    impl<'a, S: ?Sized> ObjMarker for ObjOf<'a, S, dyn SharedTr + 'a> {}
+
+    /// `Held<'b>` is the only input of `f` that holds the lifetime of the method, and it is the
+    /// type of a crate (this one, by its own name): an optional entry, which a strict Referrer
+    /// replaces. The copy would have `'b` in no input that constrains it, early-bound where the
+    /// trait has it late-bound (E0195 in the impl of the host). The Leaker copies it as written for
+    /// every Referrer (F18), and the Referrer's crate resolves the path. `g` has it in a box, and in
+    /// the output; `Rel` is an entry beside it.
+    #[prop_leak(id = 9194, allow_self = true, prelude = true)]
+    pub trait OptionalHoldsLifetime {
+        fn f<'b>(&self, x: ::type_leak_test_leaker::kinds::Held<'b>, r: Rel) -> &'b u8;
+        fn g<'c>(
+            &self,
+            x: Box<::type_leak_test_leaker::kinds::Held<'c>>,
+        ) -> ::type_leak_test_leaker::kinds::Held<'c>;
+    }
+
+    /// `Self` is denied (`allow_self = false`), and `T: PartialEq<Self>` names it, so the type that
+    /// uses `T` is a conflict (`DeniedSelfInBounds`), copied as written, `dyn SharedTr + 'a`
+    /// included. No entry names `Self`: the top-level context of the trait has to record it for
+    /// the Visitor to find the part (F44). `g` has the entry `dyn SharedTr`, `+ 'static`.
+    #[prop_leak_accept(id = 9195, allow_self = false, prelude = true)]
+    pub trait DeniedSelfObject<'a> {
+        fn f<T: PartialEq<Self>>(
+            &self,
+            x: ::type_leak_test_leaker::kinds::ObjOf<'a, T, dyn SharedTr>,
+        );
+        fn g(&self, y: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>);
+    }
+
+    /// The where predicate of the trait names `Self` (`SelfInTraitPredicate`): the type in it is
+    /// copied as written, and the impl of the host must satisfy the predicate with the
+    /// original types (F44).
+    #[prop_leak_accept(id = 9196, allow_self = true, prelude = true)]
+    pub trait PredicateObject<'a>
+    where
+        ::type_leak_test_leaker::kinds::ObjOf<'a, Self, dyn SharedTr>:
+            ::type_leak_test_leaker::kinds::ObjMarker,
+    {
+        fn g(&self, y: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>);
+    }
+
+    /// The same for the self type of an impl, whose bound names `Self` (`SelfInImplSelfType`, and
+    /// the `Self` of the bound, `UnprovableBound`): both are copied as written (F44).
+    #[prop_leak_accept(id = 9197, allow_self = true, prelude = true)]
+    impl<'a, T: ::core::convert::AsRef<Option<Self>>>
+        ::type_leak_test_leaker::kinds::ObjOf<'a, T, dyn SharedTr>
+    {
+        pub fn g(&self, _y: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>) {}
+    }
+
+    /// A struct nested in a module (`scope = "mod"`) with a generic whose bound names its `Self`,
+    /// and a field that names it too: `NestedSelfInBounds`, copied as written. The macro writes no
+    /// entry that names the `Self` of the struct, so the visitor has no `with_nested_self()` (F45):
+    /// it must leave the part all the same. `bare` is an entry beside it.
+    #[prop_leak_accept(
+        id = 9198,
+        allow_self = true,
+        prelude = true,
+        scope = "mod",
+        no_nested_self = true
+    )]
+    pub struct NestedSelfObject<'a, T: ::core::convert::AsRef<Self>> {
+        pub obj: ::type_leak_test_leaker::kinds::ObjOf<'a, (Self, T), dyn SharedTr>,
+        pub bare: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>,
+    }
+
+    /// An impl nested in the scope of a trait (`View::enter_impl()` in `enter_trait()`), with the
+    /// generic of the trait, whose bound names the `Self` of the trait: that `Self` has no name in
+    /// the impl, so the type that uses `T` has no context (`UnnameableSelf`), and is copied as
+    /// written (F43). The Referrer's macro nests the impl in a method of the trait, as the Leaker
+    /// nested the scopes. `Bare<dyn SharedTr>` is an entry beside it.
+    pub struct NestedHost;
+    type_leak_test_macro::nested_leak! {
+        id = 9199;
+        scope trait Tr<T: ?Sized + ::core::convert::AsRef<Self>>;
+        nested impl<'a> ::type_leak_test_leaker::kinds::NestedHost;
+        types [
+            <'a, T: ?Sized> => ::type_leak_test_leaker::kinds::ObjOf<'a, T, dyn SharedTr>;
+            <> => ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>;
+        ];
+    }
 }

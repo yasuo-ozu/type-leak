@@ -197,9 +197,9 @@ pub struct Features {
     pub strict_cycles: bool,
     /// A strict Referrer replaces an optional entry that holds a lifetime of a method (`fn
     /// m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>`): the copy has `'x` in no argument that
-    /// constrains it, so it is early-bound, where it is late-bound in the trait (E0195, F18: the
-    /// `Referrer::must()` docs say that replacing a type can lose a method lifetime). Off,
-    /// the item that has it is not invoked as strict.
+    /// constrains it, so it is early-bound, where it is late-bound in the trait (E0195, F18, fixed:
+    /// the Leaker copies the type as written). Off (the default), the item that has it is not
+    /// invoked as strict.
     pub strict_anchors: bool,
     /// In an impl whose self type is leaked, a method with a bound of a generic that names `Self`
     /// (`X: Fn(&Self) -> u8`) and a leaked type in another predicate that uses the generic

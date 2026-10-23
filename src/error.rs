@@ -876,9 +876,23 @@ fn path_names(path: &syn::Path) -> (String, String) {
         },
         names(path)
     );
-    // `crate::m::X` and `super::m::X` are `m::X` in the crate.
-    let example = format!("::my_crate::{}", names(&without_crate_prefix(path)));
+    // `core::fmt::Debug` is `::core::fmt::Debug`; `crate::m::X` and `super::m::X` are `m::X` in the
+    // crate.
+    let example = if path.leading_colon.is_none() && path.segments.len() > 1 && is_std_crate(path) {
+        format!("::{}", names(path))
+    } else {
+        format!("::my_crate::{}", names(&without_crate_prefix(path)))
+    };
     (name, example)
+}
+
+/// Returns `true` if `path` starts with the name of `core`, `std` or `alloc`.
+fn is_std_crate(path: &syn::Path) -> bool {
+    path.segments.first().map_or(false, |seg| {
+        ["core", "std", "alloc"]
+            .iter()
+            .any(|name| seg.ident == name)
+    })
 }
 
 /// Absolute paths of the standard prelude items and the primitive types.

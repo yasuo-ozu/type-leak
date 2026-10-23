@@ -26,7 +26,7 @@
 //! | `f15_self_rewritten_in_elided_signature` | `with_self()` writes `Self`, with lifetimes, into `fn(&Self) -> &u8` | fixed |
 //! | `f16_implied_outlives_of_self_projection_lost` | `Self::A0: 'x` of `&'x Self::A0` is not recorded, only `Self: 'x` | fixed |
 //! | `f17_optional_entry_in_own_context` | a strict Referrer replaces an optional entry whose own context names it | fixed |
-//! | `f18_strict_referrer_replaces_anchor_of_method_lifetime` | a strict Referrer replaces the optional type that holds a method lifetime | limitation |
+//! | `f18_strict_referrer_keeps_the_optional_type_that_holds_a_method_lifetime` | a strict Referrer replaces the optional type that holds a method lifetime: it is copied as written | fixed |
 //! | `f19_impl_self_in_bound_of_entry_in_predicate` | an entry in a predicate has a bound of its context that names `Self`, in an impl whose self type is leaked | fixed |
 //! | `f20_trait_assoc_in_bound_of_entry_in_predicate` | an entry in a predicate has a bound of its context that names `Self::A`, in a trait | fixed |
 //! | `f21_iterator_item_in_bound_of_entry_in_item_binding` | an entry in `T: Iterator<Item = ..>` has a bound of its context that names the `Item` | fixed |
@@ -51,6 +51,10 @@
 //! | `f40_a_type_in_the_default_of_an_associated_const_is_carried` | a type in a value (the default of an associated const, a function body) was never carried, so the copy kept a relative path: with `LeakerConfig::check_values()` a type in a type position of a value (a cast, a `let`, a closure, a turbofish, a qualified path) is an entry, which the Visitor replaces; a path that is not a type stays rejected | fixed |
 //! | `f41_a_default_that_needs_self_only_through_a_bound_is_accepted` | the default of a parameter of a struct, enum or union nested in a module that uses a generic with a bound that names the own `Self` (`U = Wrap<T>` with `T: Clone + AsRef<Self>`) was rejected: its entry has no `Self` and none of the bounds that name it now, and the copy writes an ordinary default | fixed |
 //! | `f42_the_option_accepts_a_type_that_names_self_with_a_bound_that_names_it` | a type that names the own `Self` of such an item and a bound of the generics it uses does too (`Rel2<Self, T>` with `T: AsRef<Self>`) was rejected: with `LeakerConfig::nested_self_entries()` it is an entry for any type, with `Self` as the parameter of the impl, and the copy passes its own type | fixed (opt-in) |
+//! | `f43_a_type_whose_context_cannot_be_written_is_copied_as_written` | a type whose context cannot be written (a bound names a `Self` that has no name there) is copied as written, and the Referrer replaced the entries inside it: the part has no context (`unwritable`) | fixed |
+//! | `f44_a_part_that_names_self_is_found_when_no_entry_does` | a part whose context names `Self` was never found when no entry named it: the top-level context of the scope left `Self` out | fixed |
+//! | `f45_a_part_in_a_nested_item_is_left_without_with_nested_self` | a part in an item nested in a scope was replaced by a visitor without `with_nested_self()` | fixed |
+//! | `f46_the_help_for_a_relative_std_path_suggests_the_crate_itself` | the help for a relative path that starts with `core`, `std` or `alloc` suggested `::my_crate::core::fmt::Debug` | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that the docs of `Leaker` document, or that follows from what rustc accepts). No test
@@ -79,9 +83,9 @@
 //! F10 and F11 are errors of rustc on a copy of a module or an impl that the test macro makes
 //! (E0277, E0207). The tests pin the behaviour of the library that is the cause, not the errors.
 //!
-//! The feature of the limitation F18 (`strict_anchors`) is off in
-//! the property test: the generator does not make what it fails on (it only decides that
-//! an item is not invoked as strict).
+//! The feature of F18 (`strict_anchors`) is off in the property test by default: the generator
+//! only decides that an item with an external type that holds a method lifetime is not invoked as
+//! strict.
 
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
@@ -3074,30 +3078,34 @@ fn f17_optional_entry_in_own_context() {
 
 // ── F18 ──────────────────────────────────────────────────────────────────────
 
-/// F18 (limitation): a strict Referrer replaces the optional entry that holds a lifetime of a
-/// method, so the copy does not have it where the original did.
+/// F18 (fixed): a strict Referrer replaced the optional entry that holds a lifetime of a method, so
+/// the copy did not have it where the original did.
 ///
 /// `Leaker::allowed_paths` docs: an absolute path of a crate that the Leaker does not allow is an
 /// optional entry, which a Referrer leaves as written by default and replaces if it is strict
-/// (`allow_ambiguous_crate_name(false)`); "replacing a type can lose an anchor or a method
-/// lifetime" (`Referrer::must()`). Trigger:
+/// (`allow_ambiguous_crate_name(false)`). Trigger:
 /// `trait Tr { fn m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>; }`. In the trait, `'x` is
-/// late-bound (the argument holds it, and no bound names it). The Leaker counts the optional type
-/// as an anchor, as the default Referrer keeps it. The strict copy is
+/// late-bound (the argument holds it, and no bound names it). The Leaker counted the optional type
+/// as an anchor, as the default Referrer keeps it. The strict copy was
 /// `fn m<'x>(&self, a: P<1>) -> P<0>`: both are projections, which do not constrain `'x`, so it is
-/// early-bound, and rustc rejects the impl of the Referrer's crate, where the trait has it
+/// early-bound, and rustc rejected the impl of the Referrer's crate, where the trait has it
 /// late-bound (E0195 "lifetime parameters differ in whether they are early- or late-bound"). Found
 /// by the property test with `TYPE_LEAK_PROP_FEATURES=strict_anchors`, for the items that the
 /// generator invokes as strict (25% of them): the Leaker's analysis cannot know what the Referrer
 /// chooses.
 ///
-/// It is a limitation and not a bug: counting the optional type as an anchor is what lets the
-/// default Referrer (and a Referrer of the same dependency graph) copy the item; the other choice
-/// would reject the item for every Referrer. Instead, allow the crate (`LeakerConfig::allowed_paths`),
-/// so that the type is not an entry for any Referrer, or keep the anchor in a required type, or use
-/// a Referrer that is not strict. The test pins the two copies.
+/// The fix: the scan of the occurrences that keep a lifetime of a method (the check of F7) looks at
+/// the optional entries as the check of a binder does (`careful`). If the only occurrences in the
+/// inputs that keep the lifetime, outside the types leaked whole, are inside optional entries, those
+/// entries are no optional entries (`not_optional`, as `env_blocked()` does), so every Referrer
+/// copies them as written and the lifetime stays constrained. No error: the crate of the type has
+/// to resolve in the Referrer's crate, as for any absolute path that is copied as written (which
+/// is also what the help of `UnconstrainedLifetime`, "write it with an absolute path", asks for: it
+/// now works for a strict Referrer too). Another input that keeps the lifetime (`&'x u8`, `&'x
+/// self`) leaves the entry as it was. The cross-crate fixture is 9194 (`tests/cross_crate.rs`), in a
+/// Referrer's crate that is invoked as `strict`.
 #[test]
-fn f18_strict_referrer_replaces_anchor_of_method_lifetime() {
+fn f18_strict_referrer_keeps_the_optional_type_that_holds_a_method_lifetime() {
     let item: ItemTrait = parse_quote!(
         pub trait Tr {
             fn m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>;
@@ -3132,14 +3140,176 @@ fn f18_strict_referrer_replaces_anchor_of_method_lifetime() {
     let mut config = LeakerConfig::new();
     config.allow_primitive().allow_std_prelude();
 
-    // The default Referrer keeps the optional type, which holds `'x`.
-    assert_eq!(held(&copy_of(config.clone(), false)), ["'x"]);
-    // The strict one replaces it: nothing of the arguments holds `'x`.
-    assert_eq!(held(&copy_of(config.clone(), true)), Vec::<String>::new());
+    // Every Referrer keeps the optional type, which holds `'x`; `Rel<'x>` is replaced.
+    let expected: ItemTrait = parse_quote!(
+        pub trait Tr {
+            fn m<'x>(&self, a: ::ext::W<&'x u8>) -> P<0usize>;
+        }
+    );
+    for strict in [false, true] {
+        let copy = copy_of(config.clone(), strict);
+        assert_eq!(held(&copy), ["'x"], "strict {}", strict);
+        assert_eq!(string(&copy), string(&expected), "strict {}", strict);
+    }
     // With the crate allowed it is not an entry, for either.
     config.allowed_paths.push(parse_quote!(::ext));
     assert_eq!(held(&copy_of(config.clone(), false)), ["'x"]);
     assert_eq!(held(&copy_of(config, true)), ["'x"]);
+}
+
+/// F18: the shapes. Each is an item, the optional entries it keeps (`?` first), and the copy of a
+/// strict Referrer (`P<ix>` for an entry).
+#[test]
+fn f18_the_optional_entries_that_hold_a_method_lifetime_are_copied_as_written() {
+    let cases: Vec<(Item, &[&str], &str)> = vec![
+        // The type is the only input that holds `'x`: also behind a box, in a tuple, and in the
+        // output too (the same type, in the same context).
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(&self, a: ::ext::W<'x>) -> &'x u8;
+                }
+            ),
+            &[],
+            "trait Tr { fn m < 'x > (& self , a : :: ext :: W < 'x >) -> & 'x u8 ; }",
+        ),
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(&self, a: Box<::ext::W<'x>>) -> &'x u8;
+                }
+            ),
+            &[],
+            "trait Tr { fn m < 'x > (& self , a : Box < :: ext :: W < 'x > >) -> & 'x u8 ; }",
+        ),
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(&self, a: (::ext::W<'x>, u8)) -> &'x u8;
+                }
+            ),
+            &[],
+            "trait Tr { fn m < 'x > (& self , a : (:: ext :: W < 'x > , u8)) -> & 'x u8 ; }",
+        ),
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(&self, a: ::ext::W<'x>) -> ::ext::W<'x>;
+                }
+            ),
+            &[],
+            "trait Tr { fn m < 'x > (& self , a : :: ext :: W < 'x >) -> :: ext :: W < 'x > ; }",
+        ),
+        // Two optional types hold it: both are kept. A type beside them that holds no lifetime of
+        // the method stays optional.
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(&self, a: ::ext::W<'x>, b: ::ext2::V<'x>, c: ::ext::Y<u8>) -> &'x u8;
+                }
+            ),
+            &["?::ext::Y<u8>"],
+            "trait Tr { fn m < 'x > (& self , a : :: ext :: W < 'x > , b : :: ext2 :: V < 'x > , c : P < 0usize >) -> & 'x u8 ; }",
+        ),
+        // A type leaked whole holds it too, and does not keep it in the copy.
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(&self, a: ::ext::W<'x>, b: Rel<'x>) -> &'x u8;
+                }
+            ),
+            &[],
+            "trait Tr { fn m < 'x > (& self , a : :: ext :: W < 'x > , b : P < 0usize >) -> & 'x u8 ; }",
+        ),
+        // The method of an impl of a trait is compared with the trait's, as a trait's is.
+        (
+            parse_quote!(
+                impl ::p::Tr for ::p::X {
+                    fn m<'x>(&self, a: ::ext::W<'x>) -> &'x u8 {
+                        loop {}
+                    }
+                }
+            ),
+            &["?::p::X"],
+            "impl :: p :: Tr for P < 0usize > { fn m < 'x > (& self , a : :: ext :: W < 'x >) -> & 'x u8 { loop { } } }",
+        ),
+        // Controls: another input keeps `'x` as written, the receiver or a reference, so the type
+        // is an optional entry as ever.
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(&self, a: ::ext::W<'x>, b: &'x u8) -> &'x u8;
+                }
+            ),
+            &["?::ext::W<'x>"],
+            "trait Tr { fn m < 'x > (& self , a : P < 0usize > , b : & 'x u8) -> & 'x u8 ; }",
+        ),
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(&'x self, a: ::ext::W<'x>) -> &'x u8;
+                }
+            ),
+            &["?::ext::W<'x>"],
+            "trait Tr { fn m < 'x > (& 'x self , a : P < 0usize >) -> & 'x u8 ; }",
+        ),
+        // The output does not name it, or it is a lifetime of the trait: nothing to keep.
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(&self, a: ::ext::W<'x>) -> u8;
+                }
+            ),
+            &["?::ext::W<'x>"],
+            "trait Tr { fn m < 'x > (& self , a : P < 0usize >) -> u8 ; }",
+        ),
+        (
+            parse_quote!(
+                trait Tr<'x> {
+                    fn m(&self, a: ::ext::W<'x>) -> &'x u8;
+                }
+            ),
+            &["?::ext::W<'x>"],
+            "trait Tr < 'x > { fn m (& self , a : P < 0usize >) -> & 'x u8 ; }",
+        ),
+        // A method of an inherent impl has no signature to be compared with (F22).
+        (
+            parse_quote!(
+                impl ::p::X {
+                    fn m<'x>(&self, a: ::ext::W<'x>) -> &'x u8 {
+                        loop {}
+                    }
+                }
+            ),
+            &["?::p::X", "?::ext::W<'x>"],
+            "impl P < 0usize > { fn m < 'x > (& self , a : P < 1usize >) -> & 'x u8 { loop { } } }",
+        ),
+    ];
+    for (item, optional, expected) in &cases {
+        let what = string(item);
+        let mut leaker = new_leaker();
+        let context = intern(&mut leaker, item);
+        let referrer = leaker
+            .result()
+            .finish()
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", what, joined_messages(&e)))
+            .allow_ambiguous_crate_name(false);
+        let entries: Vec<String> = (0..referrer.iter().count())
+            .filter(|&ix| !referrer.must(ix))
+            .map(|ix| {
+                let ty = string(referrer.iter().nth(ix).unwrap()).replace(' ', "");
+                format!("?{}", ty)
+            })
+            .collect();
+        let optional: Vec<String> = optional.iter().map(|ty| ty.to_string()).collect();
+        assert_eq!(entries, optional, "`{}`", what);
+        assert_eq!(
+            rewrite(&referrer, context, item.clone()),
+            *expected,
+            "`{}`",
+            what
+        );
+    }
 }
 
 // ── F19 and F20 ──────────────────────────────────────────────────────────────
@@ -7390,12 +7560,26 @@ fn nested_copy_with(
 
 /// Like `nested_copy_with()`, analyzed by `leaker`.
 fn nested_copy_in(
+    leaker: Leaker,
+    nest: Nest,
+    item: &Item,
+    declared: &[&str],
+    strict: bool,
+    nested: bool,
+) -> (Item, Referrer, Vec<String>) {
+    nested_copy_recovering(leaker, nest, item, declared, strict, nested, false)
+}
+
+/// Like `nested_copy_in()`; with `recover` the errors of the Leaker do not fail the copy:
+/// the part that conflicts is copied as written (`LeakerResult::into_referrer()`).
+fn nested_copy_recovering(
     mut leaker: Leaker,
     nest: Nest,
     item: &Item,
     declared: &[&str],
     strict: bool,
     nested: bool,
+    recover: bool,
 ) -> (Item, Referrer, Vec<String>) {
     let context = match nest {
         Nest::EnterMod => {
@@ -7411,11 +7595,13 @@ fn nested_copy_in(
                 .0
         }
     };
-    let referrer = leaker
-        .result()
-        .finish()
-        .unwrap()
-        .allow_ambiguous_crate_name(!strict);
+    let result = leaker.result();
+    let referrer = if recover {
+        result.into_referrer()
+    } else {
+        result.finish().unwrap()
+    }
+    .allow_ambiguous_crate_name(!strict);
     let (mut visitor, calls): (Box<dyn VisitMut>, NestedCalls) = if nested {
         let (visitor, calls) = nested_visitor(&referrer, context);
         (Box::new(visitor), calls)
@@ -11099,5 +11285,630 @@ fn f42_the_controls_are_unchanged() {
     for nest in NESTS {
         let result = nested_analysis_in(nested_self_leaker(), nest, &item, &["S"]);
         assert!(result.finish().is_err(), "{:?}", nest);
+    }
+}
+
+// ── F43 ──────────────────────────────────────────────────────────────────────
+
+/// The parts that the Referrer carries, as it serializes them after the format tag: one string for
+/// each (`KIND (CAUSE) CONTEXT [predicate] [in (TYPE) CONTEXT]`).
+fn parts_of(referrer: &Referrer) -> Vec<String> {
+    use proc_macro2::{Delimiter, TokenStream, TokenTree};
+    let mut tokens = template_quote::ToTokens::to_token_stream(referrer)
+        .into_iter()
+        .skip(1);
+    let list = match tokens.next() {
+        Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Bracket => group.stream(),
+        _ => return Vec::new(),
+    };
+    let (mut parts, mut current) = (Vec::new(), TokenStream::new());
+    for token in list {
+        match &token {
+            TokenTree::Punct(punct) if punct.as_char() == ',' => {
+                parts.push(std::mem::take(&mut current).to_string());
+            }
+            _ => current.extend([token]),
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current.to_string());
+    }
+    parts
+}
+
+/// The Referrer without the parts it carries: what the visitor did before the parts were known.
+fn without_parts(referrer: &Referrer) -> Referrer {
+    use proc_macro2::{Delimiter, TokenTree};
+    let tokens: Vec<TokenTree> = template_quote::ToTokens::to_token_stream(referrer)
+        .into_iter()
+        .filter(
+            |token| !matches!(token, TokenTree::Group(g) if g.delimiter() == Delimiter::Bracket),
+        )
+        .collect();
+    parse2(tokens.into_iter().collect()).unwrap()
+}
+
+/// The config of `new_leaker()`.
+fn std_config() -> LeakerConfig {
+    let mut config = LeakerConfig::new();
+    config.allow_primitive().allow_std_prelude();
+    config
+}
+
+/// The scope of F43: the trait `Tr<T: AsRef<Self>>` (a bound of `T` names the `Self` of the trait),
+/// with `direct` visited in it as types, and `nested` an item nested in it
+/// (`View::visit_item()`), which has a `Self` of its own.
+fn f43_analyze(config: LeakerConfig, direct: &[Type], nested: &Item) -> (LeakerResult, ContextId) {
+    let mut leaker = Leaker::from_config(config);
+    let generics: Generics = parse_quote!(<T: AsRef<Self>>);
+    let (context, ()) = leaker.enter_trait(&parse_quote!(Tr), &generics, true, |view| {
+        for ty in direct {
+            view.visit_type(ty);
+        }
+        view.visit_item(nested);
+    });
+    (leaker.result(), context)
+}
+
+/// The copy of the scope of F43: the trait, with `direct` as the arguments of a method, and the
+/// nested item in the body of another (the copy nests the items as the Leaker did).
+fn f43_copy(
+    referrer: &Referrer,
+    context: ContextId,
+    direct: &[Type],
+    nested: &Item,
+    with_nested_self: bool,
+) -> String {
+    let inputs = direct.iter().enumerate().map(|(i, ty)| {
+        let name = Ident::new(&format!("x{}", i), proc_macro2::Span::call_site());
+        quote!(#name: #ty)
+    });
+    let mut copy: ItemTrait = parse_quote!(trait Tr<T: AsRef<Self>> {
+        fn direct(&self, #(#inputs),*);
+        fn nested() { #nested }
+    });
+    let visitor = referrer
+        .clone()
+        .visitor(context, |_, ix| parse_quote!(P<#ix>));
+    if with_nested_self {
+        visitor
+            .with_nested_self(|_, _, ix| parse_quote!(N<#ix>))
+            .visit_item_trait_mut(&mut copy);
+    } else {
+        let mut visitor = visitor;
+        visitor.visit_item_trait_mut(&mut copy);
+    }
+    string(&copy)
+}
+
+/// F43 (fixed): the Leaker copies as written a type whose context cannot be written
+/// ([`Reason::UnnameableSelf`]), and the Referrer did not know it, so the visitor replaced the
+/// types inside it.
+///
+/// Trigger: a scope that declares a `Self` (`enter_trait(Tr<T: AsRef<Self>>)`) and an item nested in
+/// it that has a `Self` of its own (`view.visit_item(impl ::p::W for X { fn f(&self, x: Rel<T,
+/// Other>) {} .. })`). The bound of `T` names the `Self` of the trait, which has no name in the
+/// impl, so `Rel<T, Other>` has no context: it is a conflict, copied as written, whole. The part
+/// was recorded only if its context could be written (`AnalyzeVisitor::node_part()` and the
+/// conflicts of `decide()` dropped it), so it was left out. The comment of `decide()` said that
+/// such a type "is found nowhere", which is false: the visitor finds it by its tokens, and
+/// replaced the entries inside it that are entries elsewhere (`Other` of `g`). That breaks the
+/// copy where the entry is position-sensitive: `::p::W<'a, T, dyn RelTr>` has `dyn RelTr + 'a`
+/// (the default of the trait object comes from the path around it), and the entry `dyn RelTr` of
+/// `Bare<dyn RelTr>` is `+ 'static` (E0308 "lifetime mismatch" in the Referrer's crate).
+///
+/// The fix: the part has no context (`PartItem::context` is `None`, serialized as `unwritable`
+/// where the number of the context would be, before `predicate` and `in (..)`), and the visitor
+/// finds it where it cannot write the context either: the same tokens, the same place in a
+/// predicate or not, and the same anchor. The same tokens where the context can be written are an
+/// entry as before (`Rel<T, Other>` of the method of the trait itself). The top-level context
+/// records the `Self` of the scope, or the visitor would write the bound of `T` there too.
+///
+/// The cross-crate fixture is 9199 (`tests/cross_crate.rs`).
+#[test]
+fn f43_a_type_whose_context_cannot_be_written_is_copied_as_written() {
+    let nested: Item = parse_quote!(
+        impl ::p::W for X {
+            fn f(&self, x: Rel<T, Other>) {}
+            fn g(&self, y: Other) {}
+        }
+    );
+    // The same tokens where the context can be written: in the trait itself.
+    let direct: Vec<Type> = vec![parse_quote!(Rel<T, Other>)];
+    let (result, context) = f43_analyze(std_config(), &direct, &nested);
+    assert_eq!(
+        joined_messages(result.errors()),
+        "the bound of `T` mentions a `Self` which has no name here"
+    );
+    assert_eq!(result.errors()[0].reason, Reason::UnnameableSelf);
+    let referrer = result.into_referrer();
+    assert_eq!(parts_of(&referrer), ["type (Rel < T , Other >) unwritable"]);
+    let (other, outer) = (
+        entry(&referrer, "Other"),
+        entry(&referrer, "Rel < T , Other >"),
+    );
+    // The part is left as written; `Other` is an entry in `g`, and `Rel<T, Other>` of the trait
+    // (a context that can be written) is one as ever.
+    let expected = format!(
+        "trait Tr < T : AsRef < Self > > {{ fn direct (& self , x0 : P < {outer}usize >) ; fn nested () {{ impl :: p :: W for P < {x}usize > {{ fn f (& self , x : Rel < T , Other >) {{ }} fn g (& self , y : P < {other}usize >) {{ }} }} }} }}",
+        outer = outer,
+        other = other,
+        x = entry(&referrer, "X"),
+    );
+    assert_eq!(
+        f43_copy(&referrer, context, &direct, &nested, false),
+        expected
+    );
+    // The top-level context has the `Self` of the scope: that is how the visitor can tell that
+    // the context of the nested type has none.
+    assert!(referrer.context_self(context).is_some());
+    // Without the part, the visitor replaced `Other` inside it.
+    let before = without_parts(&referrer);
+    assert_eq!(
+        f43_copy(&before, context, &direct, &nested, false),
+        expected.replace(
+            "x : Rel < T , Other >",
+            &format!("x : Rel < T , P < {}usize > >", other)
+        )
+    );
+    // It is written and read back.
+    let again: Referrer = parse2(quote!(#referrer)).unwrap();
+    assert_eq!(again, referrer);
+    assert_eq!(parts_of(&again), parts_of(&referrer));
+}
+
+/// F43: a trait object in a path that gives it a lifetime. The part is `::p::W<'a, T, dyn RelTr>`;
+/// `dyn RelTr` is an entry beside it, in `::p::Bare<dyn RelTr>`, with another lifetime, and a
+/// strict Referrer replaces that path too, as an optional entry.
+#[test]
+fn f43_the_entry_inside_the_part_is_not_replaced() {
+    let nested: Item = parse_quote!(
+        impl<'a> ::p::W for X {
+            fn f(&self, x: ::p::W<'a, T, dyn RelTr>) {}
+            fn g(&self, y: ::p::Bare<dyn RelTr>) {}
+        }
+    );
+    let (result, context) = f43_analyze(std_config(), &[], &nested);
+    assert_eq!(result.errors().len(), 1);
+    assert_eq!(result.errors()[0].reason, Reason::UnnameableSelf);
+    let referrer = result.into_referrer();
+    assert_eq!(
+        parts_of(&referrer),
+        ["type (:: p :: W < 'a , T , dyn RelTr >) unwritable"]
+    );
+    let (object, x) = (entry(&referrer, "dyn RelTr"), entry(&referrer, "X"));
+    let bare = entry(&referrer, ":: p :: Bare < dyn RelTr >");
+    assert!(referrer.must(object) && !referrer.must(bare));
+    for (strict, g) in [
+        (false, format!(":: p :: Bare < P < {}usize > >", object)),
+        (true, format!("P < {}usize >", bare)),
+    ] {
+        let referrer = referrer.clone().allow_ambiguous_crate_name(!strict);
+        let expected = format!(
+            "trait Tr < T : AsRef < Self > > {{ fn direct (& self ,) ; fn nested () {{ impl < 'a > :: p :: W for P < {}usize > {{ fn f (& self , x : :: p :: W < 'a , T , dyn RelTr >) {{ }} fn g (& self , y : {}) {{ }} }} }} }}",
+            x, g
+        );
+        assert_eq!(
+            f43_copy(&referrer, context, &[], &nested, false),
+            expected,
+            "strict {}",
+            strict
+        );
+    }
+}
+
+/// F43: the same for a bound whose trait path conflicts (`Rel<T, Other>` in `U: RelTrait<T,
+/// Other>`, a node that is no type) and for the path of a value (`inner::make::<T, Other>()`, with
+/// `check_values()`): their contexts cannot be written either.
+#[test]
+fn f43_a_bound_and_a_value_whose_context_cannot_be_written_are_copied_as_written() {
+    let nested: Item = parse_quote!(
+        impl<U: RelTrait<T, Other>> ::p::W for ::p::Host {
+            fn f(&self, y: Other) -> usize {
+                inner::make::<T, Other>()
+            }
+        }
+    );
+    let mut config = std_config();
+    config.check_values();
+    let (result, context) = f43_analyze(config, &[], &nested);
+    assert!(result
+        .errors()
+        .iter()
+        .all(|error| error.reason == Reason::RelativePath));
+    assert_eq!(result.errors().len(), 2);
+    let referrer = result.into_referrer();
+    assert_eq!(
+        parts_of(&referrer),
+        [
+            "trait (RelTrait < T , Other >) unwritable predicate",
+            "expr (inner :: make :: < T , Other >) unwritable"
+        ]
+    );
+    let other = entry(&referrer, "Other");
+    let expected = format!(
+        "trait Tr < T : AsRef < Self > > {{ fn direct (& self ,) ; fn nested () {{ impl < U : RelTrait < T , Other > > :: p :: W for :: p :: Host {{ fn f (& self , y : P < {}usize >) -> usize {{ inner :: make :: < T , Other > () }} }} }} }}",
+        other
+    );
+    assert_eq!(f43_copy(&referrer, context, &[], &nested, false), expected);
+    // Without the parts the bound and the path were rewritten.
+    let before = f43_copy(&without_parts(&referrer), context, &[], &nested, false);
+    let entry = format!("P < {}usize >", other);
+    assert_eq!(
+        before,
+        expected
+            .replace(
+                "RelTrait < T , Other >",
+                &format!("RelTrait < T , {} >", entry)
+            )
+            .replace(
+                "make :: < T , Other >",
+                &format!("make :: < T , {} >", entry)
+            )
+    );
+}
+
+/// F43: the serialized part. `unwritable` stands where the number of the context would be, before
+/// `predicate` and `in (..)`, and the parser reads what the serializer writes (and only that).
+#[test]
+fn f43_an_unwritable_part_is_serialized_and_read_back() {
+    let tag = format!("\"type-leak-format-{}\"", Referrer::FORMAT_VERSION);
+    let read = |parts: &str| -> std::result::Result<Referrer, String> {
+        parse_str::<Referrer>(&format!("{} [{}] 2 (Rel) < T > ; ()", tag, parts))
+            .map_err(|e| e.to_string())
+    };
+    for parts in [
+        "type (R<T>) unwritable",
+        "trait (RelTr<T>) unwritable predicate",
+        "type (R<T>) unwritable in (Wrap<R<T>>) 1",
+        "type (R<T>) unwritable predicate in (Wrap<R<T>>) 0",
+        "expr (f::<T>) unwritable, type (R) 1, type (R<T>) 0 predicate",
+    ] {
+        let referrer = read(parts).unwrap_or_else(|e| panic!("{}: {}", parts, e));
+        let written = parts_of(&referrer);
+        // What is written is read back to the same Referrer, and written again as it was.
+        let again: Referrer = parse2(quote!(#referrer)).unwrap();
+        assert_eq!(again, referrer, "{}", parts);
+        assert_eq!(parts_of(&again), written, "{}", parts);
+        assert_eq!(
+            written.join(" , ").replace(' ', ""),
+            parts.replace(' ', ""),
+            "{}",
+            parts
+        );
+    }
+    for (parts, message) in [
+        ("type (R)", "expected integer literal"),
+        ("type (R) nothing", "expected a context or `unwritable`"),
+        (
+            "type (R) unwritable nope",
+            "expected `predicate`, `in` or `,`",
+        ),
+        ("type (R) unwritable in (&R)", "expected integer literal"),
+        (
+            "type (R) unwritable in (&R) 5",
+            "the context 5 of a part is not one of the contexts",
+        ),
+        (
+            "type (R) unwritable unwritable",
+            "expected `predicate`, `in` or `,`",
+        ),
+    ] {
+        let error = read(parts)
+            .err()
+            .unwrap_or_else(|| panic!("read: {}", parts));
+        assert!(error.contains(message), "{}: {}", parts, error);
+    }
+}
+
+// ── F44 ──────────────────────────────────────────────────────────────────────
+
+/// The Leaker of F44: `::p` is allowed (the types of the items are relative, `::core::..` is
+/// absolute), and the prelude and the primitives.
+fn f44_config() -> LeakerConfig {
+    let mut config = std_config();
+    config.allowed_paths.push(parse_quote!(::p));
+    config
+}
+
+/// The copy of the trait, once with `Self`, once with `with_self(Host)`.
+fn f44_copies(referrer: &Referrer, context: ContextId, item: &ItemTrait) -> [String; 2] {
+    let plain = {
+        let mut copy = item.clone();
+        referrer
+            .clone()
+            .visitor(context, |_, ix| parse_quote!(P<#ix>))
+            .visit_item_trait_mut(&mut copy);
+        string(&copy)
+    };
+    let hosted = {
+        let mut copy = item.clone();
+        referrer
+            .clone()
+            .visitor(context, |_, ix| parse_quote!(P<#ix>))
+            .with_self(parse_quote!(Host))
+            .visit_item_trait_mut(&mut copy);
+        string(&copy)
+    };
+    [plain, hosted]
+}
+
+/// F44 (fixed): a part whose context names `Self` was never found when the top-level context of
+/// the scope left `Self` out, so the visitor replaced the types inside it.
+///
+/// Trigger: a conflict about `Self` that the Leaker copies as written, in a scope that declares
+/// `Self`: `DeniedSelfInBounds` (`allow_self = false`, `fn f<T: PartialEq<Self>>(&self, x: Wrap<T,
+/// Other>)`), `SelfInTraitPredicate` (`trait Tr where Rel<Self, Other>: Sized`), and
+/// `SelfInImplSelfType` with the `UnprovableBound` part that goes with it (`impl<T> S<T, Other>
+/// where T: AsRef<Option<Self>>`). No entry names `Self`, so the top-level context of the scope
+/// had none (`names_self()` counted the types that may be entries only), and the visitor, whose
+/// scope then had none, computed the context of the part without `Self`: it never was the part's.
+/// The part was not left as written, and the types in it that are entries elsewhere were replaced
+/// (`Other`). That breaks the copy where the entry is position-sensitive (`dyn Tr` under a path
+/// with a lifetime parameter: E0308 in the Referrer's crate).
+///
+/// The fix: `names_self()` counts a part copied as written whose context depends on `Self` too, so
+/// the top-level context has it (`Referrer::context_self()`), and the visitor finds the part.
+/// Cross-crate fixtures 9195 to 9197 (`tests/cross_crate.rs`).
+#[test]
+fn f44_a_part_that_names_self_is_found_when_no_entry_does() {
+    // DeniedSelfInBounds, SelfInTraitPredicate; the entry beside is `Other`, in `g`.
+    let items: [(ItemTrait, bool, &str, Reason, &str); 2] = [
+        (
+            parse_quote!(
+                trait Tr {
+                    fn f<T: ::core::cmp::PartialEq<Self>>(&self, x: Wrap<T, Other>);
+                    fn g(&self, y: Other);
+                }
+            ),
+            false,
+            "type (Wrap < T , Other >)",
+            Reason::DeniedSelfInBounds,
+            "trait Tr { fn f < T : :: core :: cmp :: PartialEq < SELF > > (& self , x : Wrap < T , Other >) ; fn g (& self , y : P < 0usize >) ; }",
+        ),
+        (
+            parse_quote!(
+                trait Tr
+                where
+                    Rel<Self, Other>: Sized,
+                {
+                    fn g(&self, y: Other);
+                }
+            ),
+            true,
+            "type (Rel < Self , Other >)",
+            Reason::SelfInTraitPredicate,
+            "trait Tr where Rel < SELF , Other > : Sized , { fn g (& self , y : P < 0usize >) ; }",
+        ),
+    ];
+    for (item, allow_self, part, reason, expected) in &items {
+        let what = string(item);
+        let mut leaker = Leaker::from_config(f44_config());
+        let context = leaker.intern_trait(item, *allow_self);
+        let result = leaker.result();
+        assert_eq!(result.errors().len(), 1, "{}", what);
+        assert_eq!(result.errors()[0].reason, *reason, "{}", what);
+        let referrer = result.into_referrer();
+        // The top-level context has the `Self` of the trait.
+        assert!(
+            matches!(
+                referrer.context_self(context),
+                Some(SelfRequirement::Bound(_))
+            ),
+            "{}",
+            what
+        );
+        let parts = parts_of(&referrer);
+        assert_eq!(parts.len(), 1, "{}", what);
+        assert!(parts[0].starts_with(part), "{}: {}", what, parts[0]);
+        // The part is as written, with `Self` or the host; the entry beside it is replaced.
+        let [plain, hosted] = f44_copies(&referrer, context, item);
+        assert_eq!(plain, expected.replace("SELF", "Self"), "{}", what);
+        assert_eq!(hosted, expected.replace("SELF", "Host"), "{}", what);
+        // It is written and read back.
+        let again: Referrer = parse2(quote!(#referrer)).unwrap();
+        assert_eq!(again, referrer, "{}", what);
+    }
+}
+
+/// F44: `SelfInImplSelfType`. The self type of the impl is a part, and so is the `Self` of its
+/// bound (`UnprovableBound`, in a predicate): both are left as written, and the entry in a
+/// method is replaced.
+#[test]
+fn f44_the_self_type_of_an_impl_is_found_when_no_entry_names_self() {
+    let item: ItemImpl = parse_quote!(
+        impl<T> S<T, Other>
+        where
+            T: AsRef<Option<Self>>,
+        {
+            fn g(&self, y: Other) {}
+        }
+    );
+    let mut leaker = Leaker::from_config(f44_config());
+    let context = leaker.intern_impl(&item, true);
+    let result = leaker.result();
+    assert_eq!(
+        result.errors().iter().map(|e| e.reason).collect::<Vec<_>>(),
+        [Reason::SelfInImplSelfType, Reason::UnprovableBound]
+    );
+    let referrer = result.into_referrer();
+    assert!(matches!(
+        referrer.context_self(context),
+        Some(SelfRequirement::Type(_))
+    ));
+    assert_eq!(parts_of(&referrer).len(), 2);
+    let mut copy = item.clone();
+    referrer
+        .clone()
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visit_item_impl_mut(&mut copy);
+    let expected: ItemImpl = parse_quote!(
+        impl<T> S<T, Other>
+        where
+            T: AsRef<Option<Self>>,
+        {
+            fn g(&self, y: P<0usize>) {}
+        }
+    );
+    assert_eq!(string(&copy), string(&expected));
+}
+
+// ── F45 ──────────────────────────────────────────────────────────────────────
+
+/// F45 (fixed): a part in an item nested in a scope was not found by a visitor without
+/// `Visitor::with_nested_self()`, so the types inside it were replaced.
+///
+/// Trigger: a conflict about the `Self` of a nested item that the Leaker copies as written:
+/// `NestedSelfInBounds` (`struct S<T: AsRef<Self>> { a: Rel2<Self, T, Other> }`) and
+/// `SelfInTraitPredicate` (`trait Tr where Rel<Self, Other>: Sized`), with an entry beside it that
+/// is an entry in the part too (`Other`). The part's context has `Self`, and a visitor that is not given
+/// `with_nested_self()` looks nothing up that names the `Self` of a nested item (`no_self`: `Self`
+/// means something else there than in the entries, which only that closure can write). The part
+/// is not an entry to replace, but a copy to protect, and the rule hid it: `fits()` was false
+/// whenever `no_self` was set and the context of the part had `Self`, so `Other` in it was replaced
+/// (`Rel2<Self, T, P<0>>`), where a visitor with the closure left it. A part matches whatever
+/// `no_self` says, in `Folder::lookup()` and `Visitor::is_part_node()`. (The default of a
+/// parameter of a nested struct that names `Self`, `SelfInDefault`, is looked up without `Self`, so
+/// its part is not found with the closure either: not this finding.)
+///
+/// The cross-crate fixture is 9198 (`tests/cross_crate.rs`).
+#[test]
+fn f45_a_part_in_a_nested_item_is_left_without_with_nested_self() {
+    let items: Vec<(Item, &str, &str)> = vec![
+        (
+            parse_quote!(
+                pub struct S<T: ::core::convert::AsRef<Self>> {
+                    pub a: Rel2<Self, T, Other>,
+                    pub b: Other,
+                }
+            ),
+            "S",
+            "pub struct S < T : :: core :: convert :: AsRef < Self > > { pub a : Rel2 < Self , T , Other > , pub b : P < 0usize > , }",
+        ),
+        (
+            parse_quote!(
+                pub trait Tr
+                where
+                    Rel<Self, Other>: Sized,
+                {
+                    fn g(&self, y: Other);
+                }
+            ),
+            "Tr",
+            "pub trait Tr where Rel < Self , Other > : Sized , { fn g (& self , y : P < 0usize >) ; }",
+        ),
+        // The same for a bound whose trait path conflicts, which is a node and no type.
+        (
+            parse_quote!(
+                pub trait Tr<T: ::core::convert::AsRef<Self>> {
+                    fn m<U: RelTrait<T, Other>>(&self, u: U);
+                    fn g(&self, y: Other);
+                }
+            ),
+            "Tr",
+            "pub trait Tr < T : :: core :: convert :: AsRef < Self > > { fn m < U : RelTrait < T , Other > > (& self , u : U) ; fn g (& self , y : P < 0usize >) ; }",
+        ),
+    ];
+    for (item, name, expected) in &items {
+        for nest in NESTS {
+            for nested in [false, true] {
+                let what = format!("{:?} `{}`, with_nested_self {}", nest, string(item), nested);
+                let (copy, referrer, calls) =
+                    nested_copy_recovering(new_leaker(), nest, item, &[name], false, nested, true);
+                assert_eq!(string(&copy), *expected, "{}", what);
+                // The part is no entry, so the closure of `with_nested_self()` is not called.
+                assert!(calls.is_empty(), "{}: {:?}", what, calls);
+                assert_eq!(parts_of(&referrer).len(), 1, "{}", what);
+            }
+        }
+    }
+}
+
+// ── F46 ──────────────────────────────────────────────────────────────────────
+
+/// F46 (fixed): the help for a relative path that starts with `core`, `std` or `alloc` (`core::fmt::
+/// Debug` without the leading `::`) said "write `core::fmt::Debug` with an absolute path (e.g.
+/// `::my_crate::core::fmt::Debug`)": it is the crate itself that is meant, so the example is the
+/// path with the colons (`::core::fmt::Debug`). Any other relative path keeps the example in the
+/// crate of the Leaker, also one that has the name in a later segment (`m::core::X`).
+///
+/// The cross-crate fixture is the item `Denied` (9193) of `tests/crates/diagnostic_result`, whose
+/// error `tests/diagnostic.rs` checks.
+#[test]
+fn f46_the_help_for_a_relative_std_path_suggests_the_crate_itself() {
+    let help_of = |item: Item| -> Vec<String> {
+        let mut leaker = Leaker::new();
+        match &item {
+            Item::Trait(item) => leaker.intern_trait(item, true),
+            Item::Struct(item) => leaker.intern_struct(item, true),
+            _ => unreachable!(),
+        };
+        let result = leaker.result();
+        all_helps(result.errors())
+    };
+    let help = |path: &str, example: &str| {
+        format!(
+            "write `{}` with an absolute path (e.g. `{}`), or allow it with \
+             `LeakerConfig::allowed_paths`",
+            path, example
+        )
+    };
+    for (item, path, example) in [
+        // A bound, and a type; the three crates.
+        (
+            parse_quote!(
+                trait Tr: core::fmt::Debug {}
+            ),
+            "core::fmt::Debug",
+            "::core::fmt::Debug",
+        ),
+        (
+            parse_quote!(
+                trait Tr: std::fmt::Display {}
+            ),
+            "std::fmt::Display",
+            "::std::fmt::Display",
+        ),
+        (
+            parse_quote!(
+                trait Tr: alloc::fmt::Write {}
+            ),
+            "alloc::fmt::Write",
+            "::alloc::fmt::Write",
+        ),
+        (
+            parse_quote!(
+                struct S {
+                    a: std::cell::Ref<'_, u8>,
+                }
+            ),
+            "std::cell::Ref",
+            "::std::cell::Ref",
+        ),
+        // The crate of the Leaker: a name later in the path, a path of the crate, and a name
+        // that is not one of the three.
+        (
+            parse_quote!(
+                trait Tr: m::core::Bound {}
+            ),
+            "m::core::Bound",
+            "::my_crate::m::core::Bound",
+        ),
+        (
+            parse_quote!(
+                trait Tr: crate::core::Bound {}
+            ),
+            "crate::core::Bound",
+            "::my_crate::core::Bound",
+        ),
+        (
+            parse_quote!(
+                trait Tr: stdx::Bound {}
+            ),
+            "stdx::Bound",
+            "::my_crate::stdx::Bound",
+        ),
+    ] {
+        assert_eq!(help_of(item), [help(path, example)], "{}", path);
     }
 }

@@ -32,6 +32,7 @@
 //! ```
 
 mod bare;
+mod nested;
 mod prop;
 mod scope;
 
@@ -1108,6 +1109,26 @@ pub fn scope_errors(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 #[proc_macro]
 pub fn __scope_apply(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     match scope::apply(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Analyzes types in an impl nested in the scope of a trait, and exports the macro that copies them
+/// in another crate: see `nested.rs`.
+#[proc_macro]
+pub fn nested_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match nested::leak(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// The Referrer's side of `nested_leak!`, invoked through the `macro_rules!` that it exports.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __nested_apply(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match nested::apply(input.into()) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }

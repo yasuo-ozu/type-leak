@@ -2,8 +2,8 @@
 
 use crate::analysis::{
     ambiguous_types, anchor_parts, correct_effects, correct_unmeant_self, error_effects,
-    has_ambiguous, has_error, has_optional, names_self, primitive_effects, scope_error, shift_seen,
-    CheckResult, Effect, Part, PendingType,
+    has_ambiguous, has_error, has_optional, names_self, part_names_self, primitive_effects,
+    scope_error, shift_seen, CheckResult, Effect, Part, PendingType,
 };
 #[cfg(doc)]
 use crate::config::LeakerConfig;
@@ -194,6 +194,8 @@ struct OutputUse {
     /// An external type that the Leaker does not allow, which the Referrer may replace, holds no
     /// occurrence. Else the occurrences are those that rustc sees as constraining.
     careful: bool,
+    /// With `careful`: the types that the scan did not enter, by address.
+    stopped: Vec<usize>,
 }
 
 struct BinderGroup<'a> {
@@ -1520,12 +1522,14 @@ impl AnalyzeVisitor {
         }
         let module = mark.module;
         // A scope that declares nothing keeps the `Self` around, so take it before leaving. It is
-        // part of the top-level context only if an entry names it, or has a bound rewritten for
-        // it: nothing else depends on it.
-        let scope_self = self
-            .self_ty
-            .clone()
-            .filter(|declared| names_self(&self.frame.effects[mark.effects..], declared));
+        // part of the top-level context only if an entry or a part copied as written names it, or
+        // has a bound rewritten for it: nothing else depends on it.
+        let scope_self = self.self_ty.clone().filter(|declared| {
+            names_self(&self.frame.effects[mark.effects..], declared)
+                || self.env_errors[mark.env_errors..]
+                    .iter()
+                    .any(|error| part_names_self(error, declared))
+        });
         // The generic associated types of that `Self`, which an entry that names them depends on.
         let scope_gats = scope_self.as_ref().map_or_else(Vec::new, |declared| {
             self.scopes
@@ -2221,7 +2225,7 @@ impl AnalyzeVisitor {
                         for needed in &needs {
                             if let Some(conflict) = self.self_env_cycle(ty, needed) {
                                 // The type is left without an entry, and copied as written.
-                                let mut conflict = self.with_part(conflict, ty, context);
+                                let mut conflict = self.with_part(conflict, ty, Some(context));
                                 conflict.seen = self.self_errors.len();
                                 return self.env_errors.push(conflict);
                             }
@@ -2246,7 +2250,7 @@ impl AnalyzeVisitor {
         let mut pending = match own {
             Some(Ok(context)) => {
                 if let Some(conflict) = self.env_cycle(ty, &context) {
-                    let conflict = self.with_part(conflict, ty, context);
+                    let conflict = self.with_part(conflict, ty, Some(context));
                     return self.push_error(conflict);
                 }
                 self.not_optional_in_bounds(&context);
@@ -2262,12 +2266,10 @@ impl AnalyzeVisitor {
                 if bare {
                     self.frame.effects.extend(error_effects(effects));
                 }
-                // The type is copied as written: the Referrer leaves it so, if it can tell where it
-                // is (a type whose context cannot be written is found nowhere).
-                let conflict = match self.context_of(ty, &inner) {
-                    Ok(context) => self.with_part(conflict, ty, context),
-                    Err(_) => conflict,
-                };
+                // The type is copied as written: the Referrer leaves it so. One whose context
+                // cannot be written has none, and is found where the Referrer cannot write it.
+                let context = self.context_of(ty, &inner).ok();
+                let conflict = self.with_part(conflict, ty, context);
                 return self.push_error(conflict);
             }
             None if has_impossible => {
@@ -2314,7 +2316,7 @@ impl AnalyzeVisitor {
                 let leaked_whole = has_must && is_whole_reference(ty);
                 if leaked_whole {
                     if let Some(conflict) = self.env_cycle(ty, &context) {
-                        let conflict = self.with_part(conflict, ty, context);
+                        let conflict = self.with_part(conflict, ty, Some(context));
                         return self.push_error(conflict);
                     }
                     self.not_optional_in_bounds(&context);
@@ -2368,9 +2370,14 @@ impl AnalyzeVisitor {
         self.frame.effects.extend(effects);
     }
 
-    /// Gives `conflict`, about `ty` in `context`, the part that the Referrer leaves as written: the
-    /// whole type (see [`Part`]).
-    fn with_part(&self, mut conflict: CheckResult, ty: &Type, context: Context) -> CheckResult {
+    /// Gives `conflict`, about `ty` in `context` (`None`: it cannot be written), the part that the
+    /// Referrer leaves as written: the whole type (see [`Part`]).
+    fn with_part(
+        &self,
+        mut conflict: CheckResult,
+        ty: &Type,
+        context: Option<Context>,
+    ) -> CheckResult {
         conflict.part = Some(Part {
             cause: Cause::Type(ty.clone()),
             context,
@@ -2382,8 +2389,8 @@ impl AnalyzeVisitor {
 
     /// Returns the part for a node copied as written, whole, though types are in it: a bound whose
     /// trait path conflicts (`Rel<R0>` in `T: Rel<R0>`), or a path of a value. `path` stands for it
-    /// as a type, to compute the context. `None` if the context cannot be written.
-    fn node_part(&self, cause: Cause, path: &Path) -> Option<Part> {
+    /// as a type, to compute the context, which is `None` if it cannot be written.
+    fn node_part(&self, cause: Cause, path: &Path) -> Part {
         let ty = Type::Path(TypePath {
             qself: None,
             path: path.clone(),
@@ -2395,17 +2402,17 @@ impl AnalyzeVisitor {
             self.self_nested,
             &Enclosing::default(),
         )
-        .ok()?;
-        let context = match self.modules.last() {
+        .ok()
+        .map(|context| match self.modules.last() {
             Some(module) => context.with_module(Some(module.id)),
             None => context,
-        };
-        Some(Part {
+        });
+        Part {
             cause,
             context,
             in_predicate: self.env_depth > 0,
             within: None,
-        })
+        }
     }
 
     /// Returns the conflict if `ty`, leaked whole in `context`, would make a cycle in the copy: it
@@ -2989,11 +2996,7 @@ impl AnalyzeVisitor {
     fn check_bound_path(&mut self, path: &Path, cause: Cause, whole: bool) -> bool {
         if self_segment(path).is_some() && self.self_ty.is_none() {
             // The mention of `Self` is the error; the bound is copied as written, whole.
-            let part = if whole {
-                self.node_part(cause.clone(), path)
-            } else {
-                None
-            };
+            let part = whole.then(|| self.node_part(cause.clone(), path));
             if let Some(part) = part {
                 let mut corrected = CheckResult::corrected();
                 corrected.part = Some(part);
@@ -3002,11 +3005,7 @@ impl AnalyzeVisitor {
             self.self_errors.push(cause);
             true
         } else if !self.is_context_free(path) {
-            let part = if whole {
-                self.node_part(cause.clone(), path)
-            } else {
-                None
-            };
+            let part = whole.then(|| self.node_part(cause.clone(), path));
             self.relative_path(cause.clone(), cause, part);
             true
         } else {
@@ -3373,10 +3372,12 @@ impl AnalyzeVisitor {
     /// projection, which does not constrain it. An input that keeps it, such as `&'x u8`, is no
     /// type leaked whole, nor is one inside it.
     fn check_leaked_lifetimes(&mut self, sig: &Signature) {
-        let (leaked, start) = match self.signatures.last_mut() {
-            Some(walk) if !walk.leaked.is_empty() => {
-                (std::mem::take(&mut walk.leaked), walk.effects)
-            }
+        let (leaked, start, risky) = match self.signatures.last_mut() {
+            Some(walk) if !walk.leaked.is_empty() || !walk.risky.is_empty() => (
+                std::mem::take(&mut walk.leaked),
+                walk.effects,
+                walk.risky.clone(),
+            ),
             _ => return,
         };
         let (output, bounded) = output_and_bounded(sig);
@@ -3390,23 +3391,7 @@ impl AnalyzeVisitor {
             }
             // The occurrences that constrain the lifetime as written. An external type that the
             // Leaker does not allow stays as written unless the Referrer replaces it, so it counts.
-            let mut used = OutputUse {
-                lifetime: lifetime.clone(),
-                anchors: Vec::new(),
-                chain: Vec::new(),
-                careful: false,
-            };
-            for input in &sig.inputs {
-                match input {
-                    FnArg::Receiver(receiver) => {
-                        if receiver.lifetime() == Some(lifetime) {
-                            used.anchors.push(Vec::new());
-                        }
-                        self.scan_anchors(&receiver.ty, &mut used)
-                    }
-                    FnArg::Typed(arg) => self.scan_anchors(&arg.ty, &mut used),
-                }
-            }
+            let used = self.scan_inputs(sig, lifetime, false);
             // The original constrains it, and in the copy only types leaked whole hold it: the
             // first on the way to each occurrence is what to report.
             let mut culprits: Vec<usize> = Vec::new();
@@ -3420,6 +3405,9 @@ impl AnalyzeVisitor {
                         }
                     }
                 }
+            }
+            if risky.contains(lifetime) {
+                self.keep_optional_anchors(sig, lifetime, &used, &leaked, start);
             }
             for ty in culprits {
                 let (named, conflict) = &leaked[&ty];
@@ -3461,6 +3449,63 @@ impl AnalyzeVisitor {
                 conflict.seen = seen;
                 Effect::Error(Box::new(conflict))
             }));
+    }
+
+    /// Scans the inputs of `sig` for the occurrences of `lifetime` (see
+    /// [`AnalyzeVisitor::scan_anchors()`]).
+    fn scan_inputs(&self, sig: &Signature, lifetime: &Lifetime, careful: bool) -> OutputUse {
+        let mut used = OutputUse {
+            lifetime: lifetime.clone(),
+            anchors: Vec::new(),
+            chain: Vec::new(),
+            careful,
+            stopped: Vec::new(),
+        };
+        for input in &sig.inputs {
+            match input {
+                FnArg::Receiver(receiver) => {
+                    if receiver.lifetime() == Some(lifetime) {
+                        used.anchors.push(Vec::new());
+                    }
+                    self.scan_anchors(&receiver.ty, &mut used)
+                }
+                FnArg::Typed(arg) => self.scan_anchors(&arg.ty, &mut used),
+            }
+        }
+        used
+    }
+
+    /// Makes the optional entries that hold `lifetime` no optional entries, if only they keep it
+    /// constrained in the copy: a strict Referrer would leave it in a projection only (E0195, F18).
+    /// `used` has the occurrences as written; the types leaked whole hold none in the copy.
+    fn keep_optional_anchors(
+        &mut self,
+        sig: &Signature,
+        lifetime: &Lifetime,
+        used: &OutputUse,
+        leaked: &HashMap<usize, (Vec<Lifetime>, CheckResult)>,
+        start: usize,
+    ) {
+        let kept = |anchor: &&Vec<usize>| anchor.iter().all(|ty| !leaked.contains_key(ty));
+        let careful = self.scan_inputs(sig, lifetime, true);
+        if careful.anchors.iter().any(|anchor| kept(&anchor)) {
+            return;
+        }
+        let softs: HashSet<usize> = used
+            .anchors
+            .iter()
+            .filter(kept)
+            .flatten()
+            .copied()
+            .filter(|ty| careful.stopped.contains(ty))
+            .collect();
+        if softs.is_empty() {
+            return;
+        }
+        let start = start.min(self.frame.effects.len());
+        let mut found = Vec::new();
+        block_optional(&mut self.frame.effects[start..], &softs, &mut found);
+        self.not_optional.extend(found);
     }
 
     /// Returns the lifetimes of `sig` that the copy would leave unconstrained, making them
@@ -3609,6 +3654,7 @@ impl AnalyzeVisitor {
                     anchors: Vec::new(),
                     chain: Vec::new(),
                     careful: true,
+                    stopped: Vec::new(),
                 };
                 if self.probe.is_none() {
                     for input in &group.inputs {
@@ -3632,12 +3678,13 @@ impl AnalyzeVisitor {
     /// if no type on its chain is leaked whole. When in doubt it does not. See [Binder
     /// lifetimes](crate::Leaker#binder-lifetimes).
     fn scan_anchors(&self, ty: &Type, used: &mut OutputUse) {
-        used.chain.push(ty as *const Type as usize);
+        let address = ty as *const Type as usize;
+        if used.careful && self.is_soft_type(ty) {
+            used.stopped.push(address);
+            return;
+        }
+        used.chain.push(address);
         match ty {
-            // A reference to an external trait object is leaked whole if it is: the Referrer may
-            // replace it.
-            Type::Reference(reference)
-                if used.careful && self.is_external_object(&reference.elem) => {}
             Type::Reference(reference) => {
                 if reference.lifetime.as_ref() == Some(&used.lifetime) {
                     used.anchors.push(used.chain.clone());
@@ -3648,21 +3695,13 @@ impl AnalyzeVisitor {
             | Type::Slice(TypeSlice { elem, .. })
             | Type::Paren(TypeParen { elem, .. })
             | Type::Group(TypeGroup { elem, .. }) => self.scan_anchors(elem, used),
-            // An array whose length names an external crate may be replaced as a whole.
-            Type::Array(array) if used.careful && self.names_external_crate_in_expr(&array.len) => {
-            }
             Type::Array(array) => self.scan_anchors(&array.elem, used),
             Type::Tuple(tuple) => {
                 for elem in &tuple.elems {
                     self.scan_anchors(elem, used);
                 }
             }
-            Type::Path(TypePath { qself: None, path })
-                if !self.is_projection(path)
-                    && !(used.careful
-                        && (self.allowed.is_soft_path(path)
-                            || self.holds_external_object(path))) =>
-            {
+            Type::Path(TypePath { qself: None, path }) if !self.is_projection(path) => {
                 if let Some(seg) = path.segments.last() {
                     self.scan_arguments(&seg.arguments, used);
                 }
@@ -3673,7 +3712,7 @@ impl AnalyzeVisitor {
                 }
                 self.scan_output(&f.output, used);
             }
-            Type::TraitObject(object) if !(used.careful && self.names_external_crate(object)) => {
+            Type::TraitObject(object) => {
                 for bound in &object.bounds {
                     match bound {
                         TypeParamBound::Trait(bound)
@@ -3693,6 +3732,22 @@ impl AnalyzeVisitor {
             _ => (),
         }
         used.chain.pop();
+    }
+
+    /// Returns `true` if the Referrer may replace `ty` as an optional entry, so a careful scan
+    /// finds no anchor in it (a path of an external crate, an external trait object, an array
+    /// whose length names a crate, or a reference to such an object).
+    fn is_soft_type(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Reference(reference) => self.is_external_object(&reference.elem),
+            Type::Array(array) => self.names_external_crate_in_expr(&array.len),
+            Type::Path(TypePath { qself: None, path }) => {
+                !self.is_projection(path)
+                    && (self.allowed.is_soft_path(path) || self.holds_external_object(path))
+            }
+            Type::TraitObject(object) => self.names_external_crate(object),
+            _ => false,
+        }
     }
 
     fn scan_arguments(&self, arguments: &PathArguments, used: &mut OutputUse) {
@@ -4646,7 +4701,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
         } else {
             // A path with a qualified self type is not told from the paths of the Visitor's.
             let part = match i.qself {
-                None => self.node_part(Cause::expr_path(&i.path), &i.path),
+                None => Some(self.node_part(Cause::expr_path(&i.path), &i.path)),
                 Some(_) => None,
             };
             self.relative_path(Cause::path_expr(i), Cause::path_expr(i), part);
@@ -4860,6 +4915,25 @@ impl AssocSelf {
 fn absolute_example(path: &Path) -> String {
     let rest = without_crate_prefix(path);
     format!("::my_crate::{}", tidy(&quote!(#rest)))
+}
+
+/// Makes the optional entries among `effects` whose type is one of `origins` (by address) no
+/// optional entries, and adds their keys to `found` ([`drop_optional()`]).
+fn block_optional(
+    effects: &mut [Effect],
+    origins: &HashSet<usize>,
+    found: &mut Vec<(Context, String)>,
+) {
+    for effect in effects {
+        if let Effect::Type(pending) = effect {
+            if pending.optional && origins.contains(&pending.origin) {
+                let ty = &pending.ty;
+                found.push((pending.context.clone(), quote!(#ty).to_string()));
+                pending.optional = false;
+            }
+            block_optional(&mut pending.components, origins, found);
+        }
+    }
 }
 
 /// Cuts the entries of the self type of an impl for which `conflict` returns the conflict (see

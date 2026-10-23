@@ -233,6 +233,9 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9093!(path = ::type_leak_test_leaker::kinds);
     // The cyclic bound is rejected: it expands to nothing.
     type_leak_test_leaker::__tl_prop_9076!(path = ::type_leak_test_leaker::kinds);
+    // An optional entry that holds a method lifetime is copied as written, by a strict Referrer too
+    // (F18): the path of this crate resolves here.
+    type_leak_test_leaker::__tl_prop_9194!(path = ::type_leak_test_leaker::kinds, strict);
 }
 
 /// Items that the Leaker rejects and accepts with `LeakerResult::allow()` of the causes of their
@@ -249,7 +252,6 @@ pub mod accepted {
     type_leak_test_leaker::__tl_prop_9187!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__tl_prop_9188!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__tl_prop_9189!(path = ::type_leak_test_leaker::kinds, accept);
-
     // Items whose macro carries the errors (`prop_leak_result`) and whose invocation says what it
     // allows: all the errors are dropped, or the crate would not compile. The copies keep `Clone`,
     // `core::fmt::Debug`, `PlainTr` and `Held<'_>` as written (the crate names the last two).
@@ -271,4 +273,11 @@ pub mod accepted {
         accept,
         allow(trait PlainTr, type Held<'_>)
     );
+
+    // Parts that name `Self` or have no context, found by the visitor (F43 to F45).
+    type_leak_test_leaker::__tl_prop_9195!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9196!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9197!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9198!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__nested_apply_9199!(path = ::type_leak_test_leaker::kinds);
 }

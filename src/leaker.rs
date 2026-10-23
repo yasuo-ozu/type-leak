@@ -168,6 +168,10 @@ use template_quote::{quote, ToTokens};
 /// fn f<'b>(&'b self, x: Wrap<'b>) -> &'b u8;    // good: `&'b self` keeps `'b`
 /// ```
 ///
+/// An absolute type of another crate that is the only one to keep `'b` (`fn f<'b>(&self, x:
+/// ::ext::V<'b>) -> &'b u8`) is no optional entry: every Referrer copies it as written, so its
+/// crate must resolve there.
+///
 /// ## Bounds that name leaked types
 ///
 /// A leaked type in a bound or where predicate fails if its Repeater impl needs a bound that the
@@ -714,7 +718,7 @@ impl Leaker {
         // The parts are looked up by their contexts too.
         for item in &self.parts {
             let anchor = item.within.iter().map(|(_, id)| *id);
-            for id in std::iter::once(item.context).chain(anchor) {
+            for id in item.context.into_iter().chain(anchor) {
                 context_map.entry(id).or_insert_with(|| context_of(id));
             }
         }

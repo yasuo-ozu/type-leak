@@ -258,7 +258,8 @@ impl Referrer {
     }
 
     /// Returns `true` if `ty` has the context `context` at `at`, in `scopes`, as an entry of that
-    /// context would be found ([`Referrer::find()`]).
+    /// context would be found ([`Referrer::find()`]). `Self` that means something else here
+    /// (`no_self`) does not matter: a part is protected, not replaced.
     fn fits(
         &self,
         context: ContextId,
@@ -267,11 +268,7 @@ impl Referrer {
         scopes: &[Scope],
         enclosing: &Enclosing,
     ) -> bool {
-        let no_self = matches!(at.matching, Matching::Scope { no_self: true, .. });
         let found = self.get_context(context);
-        if no_self && (found.self_ty().is_some() || type_mentions_self(ty)) {
-            return false;
-        }
         let in_module = match (at.module, found.module()) {
             (ModulePos::In(module), Some(found)) => found == module,
             (_, Some(_)) => false,
@@ -280,9 +277,23 @@ impl Referrer {
         in_module && Self::matches(at.matching, ty, scopes, enclosing, found).is_some()
     }
 
+    /// Returns `true` if the context of `ty` cannot be written at `at`, in `scopes` (see
+    /// [`Context::of()`]): where the Leaker recorded a part with no context.
+    fn unwritable(at: Lookup, ty: &Type, scopes: &[Scope], enclosing: &Enclosing) -> bool {
+        match at.matching {
+            Matching::Scope {
+                self_ty,
+                nested_type,
+                ..
+            } => Context::of(ty, scopes, self_ty, nested_type, enclosing).is_err(),
+            Matching::Default => false,
+        }
+    }
+
     /// Returns `true` if `cause`, which `ty` stands for, is a part: a part has the same tokens, is
-    /// in a predicate as `at` says, and has the context that `ty` has in `scopes`. A part with an
-    /// anchor counts only if its anchor is one of the `active` ones ([`Referrer::anchors()`]).
+    /// in a predicate as `at` says, and has the context that `ty` has in `scopes` (none, if `ty`
+    /// has none there). A part with an anchor counts only if its anchor is one of the `active` ones
+    /// ([`Referrer::anchors()`]).
     fn is_part(
         &self,
         cause: &Cause,
@@ -305,7 +316,10 @@ impl Referrer {
             } = &self.parts[ix];
             *in_predicate == at.place.in_predicate
                 && (within.is_none() || active.contains(&ix))
-                && self.fits(*context, ty, at, scopes, enclosing)
+                && match context {
+                    Some(context) => self.fits(*context, ty, at, scopes, enclosing),
+                    None => Self::unwritable(at, ty, scopes, enclosing),
+                }
         })
     }
 
@@ -518,8 +532,9 @@ impl Referrer {
     /// be leaked (`::serde::Wrap<'_>`) is copied as written, which is not an error. An optional
     /// type inside a required one is not an entry. One that contains required ones is, and they are
     /// entries of their own. The required entries are those of a Leaker that allows every crate.
-    /// Replacing a type can lose an anchor or a method lifetime, so the required entries may differ
-    /// in that case.
+    /// A type that alone keeps a method lifetime (`::foo::V<'b>` in `fn f<'b>(&self, x:
+    /// ::foo::V<'b>) -> &'b u8`) is copied as written too, or replacing it would lose the lifetime
+    /// (E0195).
     ///
     /// ```
     /// # use type_leak::*;
@@ -1066,9 +1081,11 @@ impl Referrer {
     ///   [`Visitor::with_nested_self()`], which writes them.
     /// - A part that the Leaker copied as written ([recovery](crate::Leaker#errors-and-recovery)) is
     ///   left as written, whole, and no entry is looked up in it, though the same tokens can be an
-    ///   entry elsewhere. It is found by its tokens, its context and whether it is in a predicate,
-    ///   and, with an anchor (`within`), only inside a type that matches the anchor. `Self` in a
-    ///   part is still replaced if you call [`Visitor::with_self()`].
+    ///   entry elsewhere. It is found by its tokens, its context (or none: a bound names a `Self`
+    ///   that has no name there) and whether it is in a predicate, and, with an anchor (`within`),
+    ///   only inside a type that matches the anchor, also in a nested item without
+    ///   [`Visitor::with_nested_self()`]. `Self` in a part is still replaced if you call
+    ///   [`Visitor::with_self()`].
     ///
     /// In a copy of a module ([`Leaker::intern_mod()`](crate::Leaker::intern_mod),
     /// [`Leaker::enter_mod()`](crate::Leaker::enter_mod)):
@@ -2442,7 +2459,8 @@ impl Referrer {
     // fixes an associated type (`T: Iterator<Item = u8>`), which the Referrer computes for a copy,
     // so the entries of 14 are not found the same way. 16: the Referrer carries the parts that the
     // Leaker copies as written, after the tag (`[KIND (CAUSE) CONTEXT [predicate] [in (TYPE)
-    // CONTEXT], ..]`), and the visitor leaves each as written: no entry is looked up in it.
+    // CONTEXT], ..]`, `unwritable` for a context that cannot be written), and the visitor leaves
+    // each as written: no entry is looked up in it.
     pub const FORMAT_VERSION: u32 = 16;
 }
 
@@ -2486,7 +2504,7 @@ impl Parse for Referrer {
             while !list.is_empty() {
                 let span = list.span();
                 let item: PartItem = list.parse()?;
-                part_contexts.push((span, item.context));
+                part_contexts.extend(item.context.map(|context| (span, context)));
                 part_contexts.extend(item.within.iter().map(|(_, anchor)| (span, *anchor)));
                 parts.push(item);
                 if !list.is_empty() {
@@ -2690,14 +2708,26 @@ impl Parse for Referrer {
 }
 
 /// Reads a part written by its [`ToTokens`] implementation: `KIND ( CAUSE ) CONTEXT [predicate] [in
-/// ( TYPE ) CONTEXT]`, with the `KIND ( CAUSE )` of an [`ErrorItem`](crate::ErrorItem).
+/// ( TYPE ) CONTEXT]`, with the `KIND ( CAUSE )` of an [`ErrorItem`](crate::ErrorItem), and
+/// `unwritable` for a `CONTEXT` that cannot be written.
 impl Parse for PartItem {
     fn parse(input: parse::ParseStream) -> Result<Self> {
         let kind = input.call(Ident::parse_any)?;
         let cause;
         parenthesized!(cause in input);
         let part = Cause::parse(&kind, &cause)?;
-        let context = input.parse()?;
+        let context = if input.peek(Ident) {
+            let word: Ident = input.parse()?;
+            if word != "unwritable" {
+                return Err(Error::new(
+                    word.span(),
+                    "expected a context or `unwritable`",
+                ));
+            }
+            None
+        } else {
+            Some(input.parse()?)
+        };
         let mut in_predicate = false;
         if input.peek(Ident) {
             let word: Ident = input.parse()?;
@@ -2732,6 +2762,10 @@ impl ToTokens for PartItem {
             within,
         } = self;
         let kind = Ident::new(part.kind(), Span::call_site());
+        let context = match context {
+            Some(context) => quote!(#context),
+            None => quote!(unwritable),
+        };
         tokens.extend(quote! {
             #kind (#part) #context #(if *in_predicate) { predicate }
             #(if let Some((anchor, anchor_context)) = within) {
@@ -2817,9 +2851,9 @@ impl ToTokens for Referrer {
         // [mod 3 ; | mod { path = [a], hint = "h", parent = 1 } ;] ( [?] [@[crate, ..]] Type, .. )
         // `# id` only after a gap in the ids. `()` if no entry. `?`: optional. `@[..]`: crates named.
         // parts: `[ part, .. ]`, only if there is one, as `PartItem` writes it: the `KIND ( CAUSE )`
-        // of an `ErrorItem`, a context of the groups, `predicate` in a bound, and `in ( Type )
-        // context` for the type that owns the cause (the anchor). A bracket cannot start a context
-        // group, so it needs no marker.
+        // of an `ErrorItem`, a context of the groups (`unwritable` if it cannot be written),
+        // `predicate` in a bound, and `in ( Type ) context` for the type that owns the cause (the
+        // anchor). A bracket cannot start a context group, so it needs no marker.
         let tag = format!("{}{}", FORMAT_TAG_PREFIX, Self::FORMAT_VERSION);
         let n_contexts = self.context_map.len();
         tokens.extend(quote! {

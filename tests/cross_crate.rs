@@ -1998,3 +1998,135 @@ fn errors_are_reported_item_by_item_through_a_macro() {
     }
     assert_eq!(SCOPE_ERRORS_SELF_WITHOUT_MEANING_COMPILE_ERRORS, 2);
 }
+
+// ---------------------------------------------------------------------------------------------
+// The parts and the optional entries that the Visitor must tell apart (tests/findings.rs F18, F43
+// to F45).
+// ---------------------------------------------------------------------------------------------
+
+/// F18, fixture 9194: `Held<'b>` is the only input of `f` that holds the method lifetime, written
+/// with an absolute path of the Leaker's crate: an optional entry. A strict Referrer used to replace
+/// it, and the impl of the host had `'b` early-bound where the trait has it late-bound (E0195, in
+/// `tests/crates/referrer`, where it is invoked as `strict`). The Leaker keeps it as written now,
+/// for every Referrer: the only entry is `Rel`.
+#[test]
+fn an_optional_entry_that_holds_a_method_lifetime_is_copied_as_written() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::kinds as r;
+
+    assert_eq!(reported(9194, __tl_report_9194!()), ok("trait", 1, 5, 5));
+    fn holds_lifetime<T: l::OptionalHoldsLifetime>() {}
+    holds_lifetime::<r::Host9194>();
+}
+
+/// F44 and F45, fixtures 9195 to 9198: parts that the Visitor must leave as written, with a trait
+/// object inside whose lifetime comes from the path around it (`dyn SharedTr + 'a`), and the entry
+/// `dyn SharedTr` (`+ 'static`) elsewhere in the same item. The copy compiles in the Referrer's
+/// crate only if the part is not rewritten. The conflicts are about `Self`: denied and named by a
+/// bound (9195), named by a predicate of the trait (9196), named by the bound of an impl whose self
+/// type holds the generic (9197), and named by the bound of a struct nested in a module (9198,
+/// copied by a visitor without `with_nested_self()`).
+#[test]
+fn parts_that_name_self_are_left_as_written() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::accepted as r;
+
+    let table = [
+        (
+            9195,
+            reported(9195, __tl_report_9195!()),
+            allowed("trait", 2, 2, 2),
+        ),
+        (
+            9196,
+            reported(9196, __tl_report_9196!()),
+            allowed("trait", 2, 1, 1),
+        ),
+        (
+            9197,
+            reported(9197, __tl_report_9197!()),
+            allowed("impl-inherent", 2, 2, 2),
+        ),
+        (
+            9198,
+            reported(9198, __tl_report_9198!()),
+            allowed("struct", 2, 2, 2),
+        ),
+    ];
+    for (id, got, expected) in table {
+        assert_eq!(got, expected, "{}", id);
+    }
+
+    // The errors that were allowed: the reason, the kind of the cause and its tokens.
+    let errors = |text: &'static str| -> Vec<(String, String, String)> {
+        text.split('\u{1d}')
+            .map(|error| {
+                let fields: Vec<&str> = error.split('\u{1f}').collect();
+                let tokens = fields[1].split_whitespace().collect::<String>();
+                (fields[3].to_string(), fields[4].to_string(), tokens)
+            })
+            .collect()
+    };
+    let error = |reason: &str, cause: &str, tokens: &str| {
+        (reason.to_string(), cause.to_string(), tokens.to_string())
+    };
+    let obj = "::type_leak_test_leaker::kinds::ObjOf<'a,T,dynSharedTr>";
+    assert_eq!(
+        errors(__tl_errors_9195!()),
+        [error("DeniedSelfInBounds", "Type", obj)]
+    );
+    assert_eq!(
+        errors(__tl_errors_9196!()),
+        [error(
+            "SelfInTraitPredicate",
+            "Type",
+            "::type_leak_test_leaker::kinds::ObjOf<'a,Self,dynSharedTr>"
+        )]
+    );
+    assert_eq!(
+        errors(__tl_errors_9197!()),
+        [
+            error("SelfInImplSelfType", "Type", obj),
+            error("UnprovableBound", "Type", "Self")
+        ]
+    );
+    assert_eq!(
+        errors(__tl_errors_9198!()),
+        [error(
+            "NestedSelfInBounds",
+            "Type",
+            "::type_leak_test_leaker::kinds::ObjOf<'a,(Self,T),dynSharedTr>"
+        )]
+    );
+
+    // The hosts implement the traits, with `ObjOf<'a, .., dyn SharedTr + 'a>` in the signature as
+    // written, and the entry in `g`.
+    fn denied<T: l::DeniedSelfObject<'static>>() {}
+    denied::<r::Host9195>();
+    fn predicate<T: l::PredicateObject<'static>>() {}
+    predicate::<r::Host9196>();
+}
+
+/// F43, fixture 9199: the impl nested in the scope of a trait, whose generic has a bound that names
+/// the `Self` of the trait, has a type with no context. It is copied as written, and the entry
+/// `dyn SharedTr` of the other type is replaced.
+#[test]
+fn a_part_with_no_context_is_left_as_written() {
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::accepted as r;
+
+    assert_eq!(
+        __nested_report_9199!(),
+        "9199|entries=2|errors=UnnameableSelf"
+    );
+    assert_eq!(
+        squash(r::NESTED_9199_TYPES),
+        squash(
+            "::type_leak_test_leaker::kinds::ObjOf<'a, T, dyn SharedTr> ;; \
+             ::type_leak_test_leaker::kinds::Bare<<() as ::type_leak_test_leaker::Repeater<(), \
+             9199u64, 0usize>>::Type>"
+        )
+    );
+}
