@@ -45,6 +45,11 @@ impl AllowedPaths {
         Self(Rc::from(paths))
     }
 
+    /// The allowed paths and `more`.
+    pub(crate) fn with(&self, more: &[Path]) -> Self {
+        Self(self.0.iter().chain(more).cloned().collect())
+    }
+
     /// Returns `true` if `path` is absolute, starts with `$crate`, or starts with an allowed path.
     /// A type with an absolute path may still be an optional entry (see `is_soft_path()`).
     pub(crate) fn is_context_free_path(&self, path: &Path) -> bool {

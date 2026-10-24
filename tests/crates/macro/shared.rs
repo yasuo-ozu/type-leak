@@ -86,9 +86,7 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     }
     let mut result = leaker.result();
     let errors: Vec<ErrorItem> = result.errors().to_vec();
-    for error in &errors {
-        result.allow(error.cause.clone());
-    }
+    crate::allow_every_cause(&mut result);
     if let Some(error) = result.errors().first() {
         return Err(Error::new(Span::call_site(), &error.message));
     }

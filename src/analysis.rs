@@ -121,6 +121,9 @@ pub struct CheckResult {
     /// The relative paths that the conflict depends on, without their arguments, in the order of
     /// `must` ([`ErrorItem::paths`]).
     pub(crate) paths: Vec<Path>,
+    /// What the analysis finds inside the part if `paths` are allowed ([`ErrorItem::nested`]).
+    /// Only a conflict with a part has some.
+    pub(crate) nested: Vec<ErrorItem>,
 }
 
 /// Where in an item the analysis was when it found an error: what
@@ -329,6 +332,7 @@ impl CheckResult {
             seen: 0,
             place: Place::default(),
             paths: Vec::new(),
+            nested: Vec::new(),
         }
     }
 }
@@ -462,6 +466,18 @@ pub(crate) fn shift_seen(effects: &mut [Effect], by: usize) {
         match effect {
             Effect::Error(error) => error.seen += by,
             Effect::Type(pending) => shift_seen(&mut pending.components, by),
+            Effect::Primitive(_) => (),
+        }
+    }
+}
+
+/// Takes `by` off the count of mentions of `Self` that the conflicts in `effects` have seen: the
+/// reverse of [`shift_seen()`], for what a probe found after `by` mentions.
+pub(crate) fn unshift_seen(effects: &mut [Effect], by: usize) {
+    for effect in effects {
+        match effect {
+            Effect::Error(error) => error.seen = error.seen.saturating_sub(by),
+            Effect::Type(pending) => unshift_seen(&mut pending.components, by),
             Effect::Primitive(_) => (),
         }
     }

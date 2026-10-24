@@ -463,16 +463,18 @@ impl Reason {
 ///
 /// ```text
 /// { KIND ( CAUSE ) REASON "message" [ ( TOKENS ) "note" , .. ] [ ( TOKENS ) "help" ]
-///   [ value ] [ default ] [ paths [ PATH , .. ] ] }
+///   [ value ] [ default ] [ paths [ PATH , .. ] ] [ nested [ ITEM , .. ] ] }
 /// KIND   := type | trait | expr | macro | lifetime | unreadable
 /// REASON := the name of the variant of Reason (RelativePath, ..)
+/// ITEM   := an item as above, brace group included
 /// ```
 ///
 /// - The help is absent if the item has none. The list of notes may be empty (`[]`), and a trailing
 ///   comma is accepted.
-/// - `value`, `default` and `paths` (a list of paths without arguments) follow the help, each only
-///   if set ([`in_value`](ErrorItem::in_value), [`in_default`](ErrorItem::in_default)) or not empty
-///   ([`paths`](ErrorItem::paths)).
+/// - `value`, `default`, `paths` (a list of paths without arguments) and `nested` (a list of items)
+///   follow the help, each only if set ([`in_value`](ErrorItem::in_value),
+///   [`in_default`](ErrorItem::in_default)) or not empty ([`paths`](ErrorItem::paths),
+///   [`nested`](ErrorItem::nested)).
 /// - `CAUSE` is the cause as written, read by its kind: a `macro` has a `!` after its path, and an
 ///   `expr` that is a path with arguments is read as a type has it (`Rel<u8>`). It must be the
 ///   whole content of its parentheses.
@@ -511,6 +513,10 @@ pub struct ErrorItem {
     /// without meaning, unreadable syntax) may have none. A path rule drops the error if it has
     /// some and each starts with an allowed path; if only some do, it removes them from the error.
     pub paths: Vec<Path>,
+    /// What is wrong inside the part if its [`paths`](ErrorItem::paths) are allowed. They take the
+    /// place of this error when a rule of `allow*()` drops it, as the part is then copied as written.
+    /// Each has its own `paths` and `nested`. They are not reported.
+    pub nested: Vec<ErrorItem>,
 }
 
 impl ErrorItem {
@@ -666,6 +672,7 @@ impl Parse for ErrorItem {
             None
         };
         let (mut in_value, mut in_default, mut paths) = (false, false, Vec::new());
+        let mut nested = Vec::new();
         while !item.is_empty() {
             let word = item.call(Ident::parse_any)?;
             match word.to_string().as_str() {
@@ -680,6 +687,16 @@ impl Parse for ErrorItem {
                     )?
                     .into_iter()
                     .collect();
+                }
+                "nested" => {
+                    let list;
+                    bracketed!(list in item);
+                    while !list.is_empty() {
+                        nested.push(list.parse()?);
+                        if !list.is_empty() {
+                            list.parse::<Token![,]>()?;
+                        }
+                    }
                 }
                 _ => {
                     return Err(syn::Error::new(
@@ -698,6 +715,7 @@ impl Parse for ErrorItem {
             in_value,
             in_default,
             paths,
+            nested,
         })
     }
 }
@@ -727,8 +745,12 @@ impl ToTokens for ErrorItem {
             let paths = &self.paths;
             quote!(paths [#(for path in paths), { #path }])
         });
+        let nested = (!self.nested.is_empty()).then(|| {
+            let nested = &self.nested;
+            quote!(nested [#(for item in nested), { #item }])
+        });
         tokens.extend(quote!({
-            #kind (#cause) #reason #message [#(for note in &notes), { #note }] #help #value #default #paths
+            #kind (#cause) #reason #message [#(for note in &notes), { #note }] #help #value #default #paths #nested
         }));
     }
 }
@@ -753,6 +775,7 @@ pub(crate) fn self_without_meaning(mention: &SelfMention) -> ErrorItem {
         in_value: mention.place.value,
         in_default: mention.place.default,
         paths: Vec::new(),
+        nested: Vec::new(),
     }
 }
 
@@ -814,6 +837,7 @@ pub(crate) fn report(conflict: &CheckResult) -> Option<ErrorItem> {
         in_value: conflict.place.value,
         in_default: conflict.place.default,
         paths: conflict.paths.clone(),
+        nested: conflict.nested.clone(),
     })
 }
 

@@ -11,6 +11,9 @@
 //! The spans of the errors that are read back are checked by `tests/crates/spans`
 //! (`a_serialized_leaker_result_keeps_its_spans`).
 
+mod common;
+
+use common::allow_every_cause;
 use proc_macro2::{Literal, TokenStream, TokenTree};
 use syn::parse::Parser;
 use syn::*;
@@ -178,9 +181,7 @@ fn allowing_after_the_round_trip_drops_the_same_errors() {
     assert_eq!(rest.into_referrer(), referrer);
 
     let mut all = read_back;
-    for cause in causes {
-        all.allow(cause);
-    }
+    allow_every_cause(&mut all);
     assert!(all.errors().is_empty());
     assert_eq!(all.finish().unwrap(), referrer);
 }

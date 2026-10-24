@@ -240,7 +240,19 @@ impl<'a> ValueWalk<'a> {
     fn relative_path(&mut self, path: &Path) {
         let cause = Cause::expr_path(path);
         let part = self.visitor.node_part(cause.clone(), path);
-        self.relative_part(cause, None, Some(part))
+        self.relative_part(cause, None, Some(part));
+        // What is wrong in the arguments of the path if it were allowed: they are written as they
+        // are with it, and the walk reads them again.
+        if let Some(mut conflict) = self.visitor.pop_error() {
+            if let Some(probe) = self.visitor.begin_probe(&conflict) {
+                self.visit_path(path);
+                conflict.nested = self.visitor.end_probe(probe);
+            }
+            self.visitor
+                .frame
+                .effects
+                .push(Effect::Error(Box::new(conflict)));
+        }
     }
 
     /// Like `relative()`, for a node that the Referrer leaves as written: `part`.
@@ -274,6 +286,7 @@ impl<'a> ValueWalk<'a> {
             part,
             place: Place::default(),
             paths,
+            nested: Vec::new(),
         });
     }
 
@@ -292,6 +305,7 @@ impl<'a> ValueWalk<'a> {
             part: None,
             place: Place::default(),
             paths: Vec::new(),
+            nested: Vec::new(),
             must: vec![Cause::Unreadable(tokens.clone())],
             impossible: vec![Cause::Unreadable(tokens)],
             is_own: true,

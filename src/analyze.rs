@@ -3,8 +3,8 @@
 use crate::analysis::{
     ambiguous_types, anchor_parts, correct_effects, correct_unmeant_self, error_effects,
     has_ambiguous, has_error, has_optional, names_self, part_names_self, primitive_effects,
-    scope_error, shift_seen, CheckResult, Effect, Part, PendingType, Place, SelfMention,
-    SignatureFacts, SignatureMark,
+    scope_error, shift_seen, unshift_seen, CheckResult, Effect, Part, PendingType, Place,
+    SelfMention, SignatureFacts, SignatureMark,
 };
 #[cfg(doc)]
 use crate::config::LeakerConfig;
@@ -688,6 +688,25 @@ struct Checkpoint {
     walk: Walk,
 }
 
+/// What a probe for nested errors puts back when it ends ([`AnalyzeVisitor::begin_probe()`]).
+struct Probe {
+    allowed: AllowedPaths,
+    checkpoint: Checkpoint,
+    probing: bool,
+    /// The mentions of `Self` and the cycles that the visitor had when the probe began.
+    selves: usize,
+    cycles: usize,
+}
+
+/// What `AnalyzeVisitor::visit_type()` finds set when it starts, and takes: a visit of the same
+/// type starts from it again ([`AnalyzeVisitor::revisit()`]).
+struct TypeEntry {
+    elided_ref: bool,
+    unconstrained: Option<Lifetime>,
+    ambiguous: bool,
+    inherits: Option<Inherits>,
+}
+
 /// The state of the walk of a type, which is back to what it was when the walk ends.
 struct Walk {
     type_depth: usize,
@@ -746,6 +765,9 @@ pub(crate) struct AnalyzeVisitor {
     bound_elided: Vec<Vec<usize>>,
     /// While a binder is probed: the addresses of the types found to be leaked whole.
     probe: Option<HashSet<usize>>,
+    /// A probe for nested errors is running ([`AnalyzeVisitor::begin_probe()`]): it records nothing
+    /// that outlives it.
+    probing: bool,
     /// The scopes entered, innermost last, and the defaults that each analyzes alone.
     alone_defaults: Vec<AloneDefaults>,
     /// What `Self` means here, if anything. It has none directly in a module, or in generics that
@@ -899,6 +921,7 @@ impl AnalyzeVisitor {
             signature: None,
             bound_elided: Vec::new(),
             probe: None,
+            probing: false,
             alone_defaults: Vec::new(),
             self_ty: None,
             self_written: false,
@@ -1001,6 +1024,7 @@ impl AnalyzeVisitor {
             part: None,
             place: Place::default(),
             paths: Vec::new(),
+            nested: Vec::new(),
         }
     }
 
@@ -1611,6 +1635,144 @@ impl AnalyzeVisitor {
         self.in_param_default = walk.in_param_default;
     }
 
+    /// Starts a probe for the errors inside the part that `conflict` copies as written
+    /// ([`ErrorItem::nested`]): the paths it depends on are allowed from now on, and what the visit
+    /// records goes into a new frame. Returns `None` if there is nothing to probe: no part, no
+    /// cause, or no path that is not allowed (each probe allows at least one more, which ends the
+    /// nesting). The caller visits the syntax of the part again where the visitor is, then calls
+    /// [`AnalyzeVisitor::end_probe()`].
+    fn begin_probe(&mut self, conflict: &CheckResult) -> Option<Probe> {
+        let open = conflict.part.is_some()
+            && !conflict.must.is_empty()
+            && conflict
+                .paths
+                .iter()
+                .any(|path| !self.allowed.is_allowed_path(path));
+        if !open {
+            return None;
+        }
+        let more = self.allowed.with(&conflict.paths);
+        let allowed = std::mem::replace(&mut self.allowed, more);
+        let checkpoint = self.checkpoint();
+        Some(Probe {
+            allowed,
+            checkpoint,
+            probing: std::mem::replace(&mut self.probing, true),
+            selves: self.self_errors.len(),
+            cycles: self.env_errors.len(),
+        })
+    }
+
+    /// Ends a probe, and returns the errors it found. Nothing it recorded stays.
+    fn end_probe(&mut self, probe: Probe) -> Vec<ErrorItem> {
+        let Probe {
+            allowed,
+            checkpoint,
+            probing,
+            selves,
+            cycles,
+        } = probe;
+        let mut effects = std::mem::take(&mut self.frame.effects);
+        let mentions = self.self_errors.split_off(selves);
+        let conflicts: Vec<CheckResult> = self
+            .env_errors
+            .split_off(cycles)
+            .into_iter()
+            .map(|mut conflict| {
+                conflict.seen = conflict.seen.saturating_sub(selves);
+                conflict
+            })
+            .collect();
+        unshift_seen(&mut effects, selves);
+        let nested = scope_error(&effects, &mentions, &conflicts);
+        self.restore(checkpoint);
+        self.allowed = allowed;
+        self.probing = probing;
+        nested
+    }
+
+    /// The errors that `visit` finds if the paths of `conflict`, which copies a part as written,
+    /// are allowed ([`ErrorItem::nested`]). `visit` visits the part again, where the visitor is.
+    fn nested_errors(
+        &mut self,
+        conflict: &CheckResult,
+        visit: impl FnOnce(&mut Self),
+    ) -> Vec<ErrorItem> {
+        match self.begin_probe(conflict) {
+            Some(probe) => {
+                visit(self);
+                self.end_probe(probe)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Takes the error that the visit just recorded, if it is the last effect.
+    fn pop_error(&mut self) -> Option<CheckResult> {
+        match self.frame.effects.pop() {
+            Some(Effect::Error(error)) => Some(*error),
+            Some(other) => {
+                self.frame.effects.push(other);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Gives the error that the visit just recorded, if it is the last effect and copies a part as
+    /// written, its nested errors: `visit` visits that part again.
+    fn nest_last(&mut self, visit: impl FnOnce(&mut Self)) {
+        if let Some(mut conflict) = self.pop_error() {
+            conflict.nested = self.nested_errors(&conflict, visit);
+            self.frame.effects.push(Effect::Error(Box::new(conflict)));
+        }
+    }
+
+    /// Visits `ty` again, where `visit_type()` was when it started with `entry`: the visit is
+    /// at the end of `decide()`, which has the same state but for what the visit takes.
+    fn revisit(&mut self, ty: &Type, entry: &TypeEntry) {
+        self.type_depth -= 1;
+        self.impossibles.at = self.type_depth;
+        self.elided_ref = entry.elided_ref;
+        self.unconstrained_ref = entry.unconstrained.clone();
+        self.ambiguous_arg = entry.ambiguous;
+        self.inherits = entry.inherits;
+        self.visit_type(ty);
+    }
+
+    /// Gives `conflict`, about the type `ty` copied as written, its nested errors.
+    fn nested_in_type(
+        &mut self,
+        mut conflict: CheckResult,
+        ty: &Type,
+        entry: &TypeEntry,
+    ) -> CheckResult {
+        conflict.nested = self.nested_errors(&conflict, |visitor| visitor.revisit(ty, entry));
+        conflict
+    }
+
+    /// Gives the errors among `effects` that `cut_conflicts()` made, copying a type of the self type
+    /// of an impl as written, their nested errors. The type is visited at the start of the walk of
+    /// the impl, as the state of the type inside the self type is gone.
+    fn nest_self_type_conflicts(&mut self, effects: &mut [Effect]) {
+        for effect in effects {
+            match effect {
+                Effect::Error(error) if error.reason == Reason::SelfInImplSelfType => {
+                    let ty = match &error.part {
+                        Some(Part {
+                            cause: Cause::Type(ty),
+                            ..
+                        }) => ty.clone(),
+                        _ => continue,
+                    };
+                    error.nested = self.nested_errors(error, |visitor| visitor.visit_type(&ty));
+                }
+                Effect::Type(pending) => self.nest_self_type_conflicts(&mut pending.components),
+                _ => (),
+            }
+        }
+    }
+
     /// Leaves a nested scope and returns its top-level context. The scope keeps what it recorded,
     /// and the outermost one reports the errors, in the order found.
     fn end_scope(&mut self, mark: ScopeMark, spec: &ScopeSpec) -> ContextId {
@@ -1811,6 +1973,7 @@ impl AnalyzeVisitor {
                 part: None,
                 place: Place::default(),
                 paths: self.paths_since(inner.must_start),
+                nested: Vec::new(),
             });
         }
         let context = match self.context_of(ty, inner) {
@@ -1834,6 +1997,7 @@ impl AnalyzeVisitor {
                     part: None,
                     place: Place::default(),
                     paths: self.paths_since(inner.must_start),
+                    nested: Vec::new(),
                 })
             }
         };
@@ -1877,6 +2041,7 @@ impl AnalyzeVisitor {
                 part: None,
                 place: Place::default(),
                 paths: self.paths_since(inner.must_start),
+                nested: Vec::new(),
             }),
             Some(self_path) if self.self_nested => Err(CheckResult {
                 must: vec![Cause::Type(ty.clone())],
@@ -1910,6 +2075,7 @@ impl AnalyzeVisitor {
                 part: None,
                 place: Place::default(),
                 paths: self.paths_since(inner.must_start),
+                nested: Vec::new(),
             }),
             Some(self_path) => Err(CheckResult {
                 must: vec![Cause::Type(ty.clone())],
@@ -1936,6 +2102,7 @@ impl AnalyzeVisitor {
                 part: None,
                 place: Place::default(),
                 paths: self.paths_since(inner.must_start),
+                nested: Vec::new(),
             }),
             None => match self.associated_self_in_bounds(&context) {
                 Some(conflict) => Err(conflict.of(ty, self.paths_since(inner.must_start))),
@@ -2126,7 +2293,7 @@ impl AnalyzeVisitor {
     }
 
     #[allow(clippy::result_large_err)]
-    fn decide(&mut self, ty: &Type, depth: usize, ambiguous: bool, mut inner: Frame) {
+    fn decide(&mut self, ty: &Type, depth: usize, entry: &TypeEntry, mut inner: Frame) {
         // `Self` (or `Self::A`) that the copy writes as a type with lifetimes, in the inputs of a
         // signature whose output relies on elision: `Self` is no entry, so it is the type holding
         // the signature that is leaked whole instead, or a conflict (in a bound or a method). Like
@@ -2360,6 +2527,7 @@ impl AnalyzeVisitor {
                                 conflict.seen = self.self_errors.len();
                                 conflict.place = self.place();
                                 conflict.paths = self.paths_since(inner.must_start);
+                                let conflict = self.nested_in_type(conflict, ty, entry);
                                 return self.env_errors.push(conflict);
                             }
                         }
@@ -2385,13 +2553,14 @@ impl AnalyzeVisitor {
                 if let Some(conflict) = self.env_cycle(ty, &context) {
                     let mut conflict = self.with_part(conflict, ty, Some(context));
                     conflict.paths = self.paths_since(inner.must_start);
+                    let conflict = self.nested_in_type(conflict, ty, entry);
                     return self.push_error(conflict);
                 }
                 self.not_optional_in_bounds(&context);
                 PendingType {
                     is_must_intern: true,
                     in_graph: true,
-                    ambiguous: ambiguous && context.is_empty(),
+                    ambiguous: entry.ambiguous && context.is_empty(),
                     ..PendingType::new(ty, context, Vec::new())
                 }
             }
@@ -2407,6 +2576,7 @@ impl AnalyzeVisitor {
                 if let Some(part) = conflict.part.as_mut() {
                     part.mark = mark;
                 }
+                let conflict = self.nested_in_type(conflict, ty, entry);
                 return self.push_error(conflict);
             }
             None if has_impossible => {
@@ -2455,6 +2625,7 @@ impl AnalyzeVisitor {
                     if let Some(conflict) = self.env_cycle(ty, &context) {
                         let mut conflict = self.with_part(conflict, ty, Some(context));
                         conflict.paths = self.paths_since(inner.must_start);
+                        let conflict = self.nested_in_type(conflict, ty, entry);
                         return self.push_error(conflict);
                     }
                     self.not_optional_in_bounds(&context);
@@ -2706,6 +2877,7 @@ impl AnalyzeVisitor {
             part: None,
             place: Place::default(),
             paths: Vec::new(),
+            nested: Vec::new(),
         }
     }
 
@@ -2738,6 +2910,7 @@ impl AnalyzeVisitor {
             part: None,
             place: Place::default(),
             paths: Vec::new(),
+            nested: Vec::new(),
         }
     }
 
@@ -3038,6 +3211,7 @@ impl AnalyzeVisitor {
             part,
             place: Place::default(),
             paths,
+            nested: Vec::new(),
         });
     }
 
@@ -3158,6 +3332,9 @@ impl AnalyzeVisitor {
             &mut not_optional,
         );
         self.not_optional.extend(not_optional);
+        let mut found = self.frame.effects.split_off(start);
+        self.nest_self_type_conflicts(&mut found);
+        self.frame.effects.extend(found);
     }
 
     /// Records an error if a trait path depends on the context or starts with `Self` without a
@@ -3515,8 +3692,9 @@ impl AnalyzeVisitor {
     /// Notes that `ty` is leaked whole, if it names a lifetime of the signature being visited:
     /// `check_leaked_lifetimes()` needs it. `inner` and `depth` are those of its decision.
     fn record_leaked(&mut self, ty: &Type, depth: usize, inner: &Frame) {
-        // The probe of a binder walks its types again for real.
-        if self.probe.is_some() {
+        // The probe of a binder walks its types again for real, and a probe for nested errors
+        // walks them again to see, which must leave nothing keyed by their address.
+        if self.probe.is_some() || self.probing {
             return;
         }
         let walk = match self.signatures.last() {
@@ -4484,6 +4662,12 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
         let unconstrained = self.unconstrained_ref.take();
         let ambiguous = std::mem::take(&mut self.ambiguous_arg);
         let inherits = self.inherits.take();
+        let entry = TypeEntry {
+            elided_ref,
+            unconstrained: unconstrained.clone(),
+            ambiguous,
+            inherits,
+        };
         self.type_depth += 1;
         self.impossibles.at = self.type_depth;
         let enclosing = self.enclosing.clone();
@@ -4601,7 +4785,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
                     self.decide_through(inner)
                 }
             }
-            (None, None) => self.decide(i, self.type_depth, ambiguous, inner),
+            (None, None) => self.decide(i, self.type_depth, &entry, inner),
         }
         self.type_depth -= 1;
         self.impossibles.at = self.type_depth;
@@ -4717,6 +4901,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
         // A trait bound with a relative path cannot be leaked. The error is about the path, not
         // the modifier (`Rel`, not `? Rel`).
         if self.type_depth == 0 && self.check_bound_path(&i.path, bound_cause(i), true) {
+            self.nest_last(|visitor| visitor.visit_trait_bound(i));
             return;
         }
         let group = bound_group(i.lifetimes.as_ref(), i, None);
@@ -4912,6 +5097,7 @@ impl<'ast> Visit<'ast> for AnalyzeVisitor {
             };
             let paths = self.relative_paths_in(|finder| finder.visit_path(&i.path));
             self.relative_path(Cause::path_expr(i), Cause::path_expr(i), part, paths);
+            self.nest_last(|visitor| visitor.visit_expr_path(i));
         }
     }
 }
@@ -5103,6 +5289,7 @@ impl AssocSelf {
             part: None,
             place: Place::default(),
             paths,
+            nested: Vec::new(),
         };
         self.give(&mut conflict, ty, true);
         conflict
@@ -5381,6 +5568,7 @@ fn self_type_conflict(pending: &PendingType, declared: &Generics) -> Option<Chec
         part: None,
         place: Place::default(),
         paths: pending.paths.clone(),
+        nested: Vec::new(),
     })
 }
 

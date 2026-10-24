@@ -147,7 +147,8 @@
 //!
 //! - after the result: the item is analyzed without the prelude (the primitive types allowed), the
 //!   result is given `allow_prelude()`, then `allow(cause)` for the cause of each error that remains
-//!   (the failures of those are those of the accepted copies above), and its Referrer copies the item
+//!   until none does (the nested errors of an error that was dropped come up: `ErrorItem::nested`;
+//!   the failures of those are those of the accepted copies above), and its Referrer copies the item
 //!   (`__tl_stagecopy_<id>!`, the crate `tlp_s_NNN`);
 //! - after the config: the item is analyzed with a config that allows the prelude (the primitive types
 //!   allowed), the causes of the errors that remain are allowed, and its Referrer copies the item
@@ -168,10 +169,11 @@
 //!   copy fail (a prelude type stays leaked in a bound, and `Self::A` is unprovable);
 //! - `SHARED`: no listed failure explains it, but the copy after the config fails too, so the rule
 //!   after the analysis is not what makes it fail. Not a failure of the run, and printed with what
-//!   explains the copy after the config. The failures seen are (C): the config reports `Self::A0`,
-//!   and its copy fails as listed; the result reports nothing, because a relative bound is copied
-//!   whole (`tests/allow_stages.rs`), its copy fails the same way, and no listed failure matches the
-//!   errors that were allowed;
+//!   explains the copy after the config. Before the nested errors the failures seen were (C): the
+//!   config reports `Self::A0`, and its copy fails as listed; the result reported nothing, because
+//!   a relative bound is copied whole and not looked into (`tests/allow_stages.rs`), its copy failed
+//!   the same way, and no listed failure matched the errors that were allowed. The result reports
+//!   it now, as an error nested in the bound, and the failure is one of the listed ones;
 //! - `NEW`: only the copy after the result fails, for a reason that the docs of `allow()` do not
 //!   list. It fails the run, and is a finding about the path rule after the analysis ("STAGES: NEW
 //!   FAILURE", with the item and the diagnostic).

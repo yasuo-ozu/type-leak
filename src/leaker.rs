@@ -795,7 +795,9 @@ impl Leaker {
 /// rules of the same methods of [`LeakerConfig`], and never change the Referrer, which has every
 /// rejected part copied as written either way. A path rule drops an error only if every relative
 /// path of it ([`ErrorItem::paths`]) is allowed, and removes the paths it allows from the others:
-/// `Vec<Rel<'_>>` stays after `allow_prelude()`, where a config reports `Rel<'_>`.
+/// `Vec<Rel<'_>>` stays after `allow_prelude()`, where a config reports `Rel<'_>`. The
+/// [nested errors](ErrorItem::nested) of an error that is dropped come up in its place, whichever
+/// rule dropped it, and the same rules filter them: allow the causes until `errors()` is empty.
 ///
 /// A path rule here only approximates the same rule on a [`LeakerConfig`]: it judges an analysis
 /// made without the rule. So it can leave more errors than the config would, or in rare cases fewer

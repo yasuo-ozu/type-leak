@@ -2085,8 +2085,9 @@ pub(crate) enum Mode {
 /// With `accept`, an item that the Leaker rejects is emitted with the recovered Referrer
 /// (`LeakerResult::into_referrer()`) as an accepted item (the Repeater's impls, the witnesses, the
 /// macro of the Referrer, which copies the part that conflicts as written), with the status `acc`,
-/// if `LeakerResult::allow(cause)` for the cause of every error drops every error (else `accfail`,
-/// and the remaining errors follow the first ones: it must not happen). The errors are what the
+/// if `LeakerResult::allow(cause)` for the cause of every error, and then of the nested errors that
+/// come up, drops every error ([`crate::allow_every_cause()`]; else `accfail`, and the remaining
+/// errors follow the first ones: it cannot happen). The errors are what the
 /// report says (and what `family()` of the harness explains).
 ///
 /// With `Mode::Result` the same item is emitted whatever the errors, and the macro of the Referrer
@@ -2143,9 +2144,7 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
         // With `accept`, the cause of every error is allowed, which must drop every error: the
         // Referrer is the recovered one either way.
         let mut allowed = result.clone();
-        for error in &errors {
-            allowed.allow(error.cause.clone());
-        }
+        crate::allow_every_cause(&mut allowed);
         let remaining = allowed.errors().to_vec();
         if mode != Mode::Result && (!accept || !remaining.is_empty()) {
             // The item is not leaked: the Leaker's crate still has it.
@@ -2401,11 +2400,10 @@ fn stage_copy(original: &Item, args: &Args, side: Side) -> StageCopy {
     if side == Side::Result {
         result.allow_prelude();
     }
-    // The errors that the rule does not drop are allowed by their causes.
+    // The errors that the rule does not drop are allowed by their causes, and so are those that
+    // come up from inside them.
     let errors: Vec<ErrorItem> = result.errors().to_vec();
-    for error in &errors {
-        result.allow(error.cause.clone());
-    }
+    crate::allow_every_cause(&mut result);
     let remaining = result.errors().to_vec();
     let noop = quote! {
         #[doc(hidden)]

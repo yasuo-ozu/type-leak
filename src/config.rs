@@ -241,7 +241,8 @@ impl LeakerConfig {
     }
 
     /// Accepts the errors with an equal cause (the same kind and tokens, spans ignored): the part
-    /// is copied as written. See [`LeakerResult::allow()`](crate::LeakerResult::allow).
+    /// is copied as written. See [`LeakerResult::allow()`](crate::LeakerResult::allow). An error that
+    /// any `allow*()` accepts has its [nested errors](crate::ErrorItem::nested) reported in its place.
     pub fn allow(&mut self, cause: Cause) -> &mut Self {
         self.allow.cause(cause);
         self

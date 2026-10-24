@@ -76,13 +76,31 @@ impl Allow {
             || (!error.paths.is_empty() && error.paths.iter().all(|path| self.allows_path(path)))
     }
 
-    /// Drops the errors that the rules accept. An error that stays loses the paths that the rules
-    /// allow, so that rules given one after the other add up as they do in one set (and in the
-    /// serialization of the error, which carries its paths).
+    /// Drops the errors that the rules accept, and puts their nested errors in their place
+    /// ([`ErrorItem::nested`]): the part is copied as written, so what is wrong inside it is real
+    /// whichever rule accepted it. The nested errors are filtered the same way, down to the last.
+    /// An error that stays loses the paths that the rules allow, so that rules given one after the
+    /// other add up as they do in one set (and in the serialization of the error, which carries its
+    /// paths); its nested errors are filtered too, for when it is dropped later.
     pub(crate) fn filter(&self, errors: &mut Vec<ErrorItem>) {
-        errors.retain(|error| !self.accepts(error));
-        for error in errors.iter_mut() {
+        let mut kept = Vec::new();
+        for error in std::mem::take(errors) {
+            self.keep(error, &mut kept);
+        }
+        *errors = kept;
+    }
+
+    /// Pushes `error` to `kept` if the rules do not accept it, else its nested errors that they do
+    /// not accept.
+    fn keep(&self, mut error: ErrorItem, kept: &mut Vec<ErrorItem>) {
+        if self.accepts(&error) {
+            for nested in error.nested {
+                self.keep(nested, kept);
+            }
+        } else {
             error.paths.retain(|path| !self.allows_path(path));
+            self.filter(&mut error.nested);
+            kept.push(error);
         }
     }
 }

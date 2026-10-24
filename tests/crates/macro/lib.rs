@@ -177,6 +177,17 @@ pub(crate) fn check_plain(referrer: &Referrer, ix: usize, slots: &RepeaterSlots)
     ))
 }
 
+/// Allows the cause of every error that remains, until none does: an error that is dropped puts its
+/// nested errors in its place (`ErrorItem::nested`), which have causes of their own.
+pub(crate) fn allow_every_cause(result: &mut LeakerResult) {
+    while !result.errors().is_empty() {
+        let causes: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
+        for cause in causes {
+            result.allow(cause);
+        }
+    }
+}
+
 /// The errors of the Leaker, reported with `ErrorItem::to_compile_error()` (a `Diagnostic` on
 /// nightly), one by one.
 pub(crate) fn report(errors: &[ErrorItem]) -> TokenStream {

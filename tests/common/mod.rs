@@ -64,6 +64,22 @@ pub fn check_in(leaker: &mut Leaker, ty: &Type, generics: &Generics) -> CheckRes
     leaker.enter_generics(generics, |view| view.check(ty)).1
 }
 
+/// Allows the cause of every error that remains, until none does, and returns how many rounds it took.
+/// Dropping an error puts its nested errors in its place ([`type_leak::ErrorItem::nested`]), whose
+/// causes are not those of the errors that were there, so one round may not be enough.
+#[allow(dead_code)]
+pub fn allow_every_cause(result: &mut LeakerResult) -> usize {
+    let mut rounds = 0;
+    while !result.errors().is_empty() {
+        let causes: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
+        for cause in causes {
+            result.allow(cause);
+        }
+        rounds += 1;
+    }
+    rounds
+}
+
 /// One of the `allow*()` operations that `LeakerConfig` and `LeakerResult` share, so that a test can
 /// give the same rule to either.
 #[allow(dead_code)]

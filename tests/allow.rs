@@ -23,6 +23,9 @@
 //! (`allowing_the_causes_of_the_errors_of_each_reason_accepts_the_item`), and a cause with spans
 //! of its own by `tests/crates/spans`.
 
+mod common;
+
+use common::allow_every_cause;
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -650,10 +653,7 @@ fn a_value_with_a_self_without_meaning_is_copied_whole() {
         .errors()
         .iter()
         .all(|error| error.reason == Reason::SelfWithoutMeaning));
-    let causes: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
-    for cause in causes {
-        result.allow(cause);
-    }
+    allow_every_cause(&mut result);
     assert_eq!(
         listed(&result.finish().unwrap()),
         [("Rel2".to_string(), true)]
@@ -1165,9 +1165,7 @@ fn allow_std_crates_reads_the_path_of_a_trait_a_macro_and_a_value() {
     assert_eq!(causes(&left), ["inner :: make"]);
     // `allow(cause)` drops each of them, whatever its kind.
     let mut left = analyze();
-    for error in result.errors() {
-        left.allow(error.cause.clone());
-    }
+    allow_every_cause(&mut left);
     assert!(left.errors().is_empty());
 }
 

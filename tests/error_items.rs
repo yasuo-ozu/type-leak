@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::Rule;
+use common::{allow_every_cause, Rule};
 use std::cell::RefCell;
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -1197,11 +1197,15 @@ fn allowing_the_causes_of_the_errors_of_each_reason_accepts_the_item() {
         let items = errors(trigger);
         reasons.extend(items.iter().map(|item| item.reason));
         let causes: Vec<Cause> = items.iter().map(|item| item.cause.clone()).collect();
-        let result = allowing_causes(trigger, &causes);
+        let mut result = allowing_causes(trigger, &causes);
+        // What a dropped error has nested comes up, and its cause is allowed in turn.
+        allow_every_cause(&mut result);
         if !result.errors().is_empty() {
             panic!("{}: {:?} are left", name, messages(result.errors()));
         }
-        // Each cause is needed: without it, its errors, and only they, are reported.
+        // Each cause is needed: without it, its errors, and only they, are reported. (No error of a
+        // trigger has nested errors, which would come up in place of an error that is dropped.)
+        assert!(items.iter().all(|item| item.nested.is_empty()), "{}", name);
         for cause in &causes {
             let others: Vec<Cause> = causes.iter().filter(|c| *c != cause).cloned().collect();
             let result = allowing_causes(trigger, &others);
@@ -1346,7 +1350,8 @@ fn allowing_the_causes_of_every_trigger_leaves_the_recovered_referrer() {
         let referrer = result.clone().into_referrer();
         // The same analysis with the causes allowed reports nothing, and has the same entries and
         // parts: allowing drops errors only.
-        let allowed = allowing_causes(trigger, &causes);
+        let mut allowed = allowing_causes(trigger, &causes);
+        allow_every_cause(&mut allowed);
         assert!(allowed.errors().is_empty(), "{}", name);
         assert_same_referrer(&referrer, &allowed.into_referrer(), name);
         // And it is a Referrer like any other: it round-trips.
