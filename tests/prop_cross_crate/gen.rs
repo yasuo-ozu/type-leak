@@ -325,10 +325,12 @@ pub struct Features {
 }
 
 /// `TYPE_LEAK_PROP_FEATURES` has `allow_stages`: the macro compares the errors that remain with
-/// `LeakerConfig::allow_prelude()` and with `LeakerResult::allow_prelude()` for every item
-/// (`stages = true` in the attribute, which only asks it to report both counts), and the harness
-/// prints how many items differ. Off by default, so that the tables do not change. It is no field
-/// of `Features`, whose `Debug` is in the tables, and not part of `all`.
+/// `LeakerConfig::allow_prelude()` and with `LeakerResult::allow_prelude()` for every item and
+/// makes the copy of each (`stages = true` in the attribute, which only asks it to report both
+/// counts and to write the copies), and the harness prints how many items differ and builds the
+/// copies (`main.rs`: "The copies after the analysis without the prelude"). Off by default, so that
+/// the tables do not change. It is no field of `Features`, whose `Debug` is in the tables, and not
+/// part of `all`.
 pub fn allow_stages() -> bool {
     std::env::var("TYPE_LEAK_PROP_FEATURES").map_or(false, |list| {
         list.split(',').any(|name| name.trim() == "allow_stages")
@@ -579,6 +581,17 @@ pub struct Case {
     pub accept_referrer: String,
     /// The line of `accept_referrer` where each item is invoked.
     pub accept_lines: Vec<(usize, usize)>,
+    /// The `lib.rs` of the Referrer's crate of `TYPE_LEAK_PROP_FEATURES=allow_stages`, which copies
+    /// each item as the macro of the Leaker analyzed it without the prelude, and gave its result
+    /// `allow_prelude()` and the causes of the errors that remain (see [`accept_referrer()`]).
+    pub stage_referrer: String,
+    /// The line of `stage_referrer` where each item is invoked.
+    pub stage_lines: Vec<(usize, usize)>,
+    /// The `lib.rs` of the Referrer's crate of the copies that `allow_stages` compares them with: the
+    /// analysis of a config that allows the prelude, and the causes of its errors allowed.
+    pub base_referrer: String,
+    /// The line of `base_referrer` where each item is invoked.
+    pub base_lines: Vec<(usize, usize)>,
 }
 
 pub const ATTR: &str = "@ATTR@";
@@ -5206,7 +5219,12 @@ pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Feat
         );
         referrer_lines.push((line, item.id));
     }
-    let (accept_referrer, accept_lines) = accept_referrer(&krate, &g.mod_uses, &items);
+    let (stage_referrer, stage_lines) =
+        accept_referrer(&krate, &g.mod_uses, &items, "__tl_stagecopy_");
+    let (base_referrer, base_lines) =
+        accept_referrer(&krate, &g.mod_uses, &items, "__tl_stagebase_");
+    let (accept_referrer, accept_lines) =
+        accept_referrer(&krate, &g.mod_uses, &items, "__tl_prop_");
     Case {
         config: g.cfg.clone(),
         leaker: lib,
@@ -5215,6 +5233,10 @@ pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Feat
         referrer_lines,
         accept_referrer,
         accept_lines,
+        stage_referrer,
+        stage_lines,
+        base_referrer,
+        base_lines,
     }
 }
 
@@ -5235,19 +5257,27 @@ pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Feat
 /// It is a crate of its own, not a module of the other Referrer's crate, because `crate::base` is
 /// the root of the crate that has the copy: `base` at the root of the other crate would let an
 /// ordinary item that keeps a relative path by mistake resolve it, and that crate must not have one.
+///
+/// `macro_prefix` is the start of the name of the macro of each item (`__tl_prop_`), and the crates of
+/// `TYPE_LEAK_PROP_FEATURES=allow_stages` invoke `__tl_stagecopy_` and `__tl_stagebase_` instead. The crate declares no
+/// name of the standard prelude, so that they mean what they mean in the prelude: the globs import
+/// what the Leaker's modules declare, and `shadowed_prelude_names()` of the harness checks that none of
+/// it has such a name.
 fn accept_referrer(
     krate: &str,
     mod_uses: &[(Vec<String>, String)],
     items: &[Item],
+    macro_prefix: &str,
 ) -> (String, Vec<(usize, usize)>) {
-    fn invocation(krate: &str, item: &Item, path: &[String]) -> String {
+    fn invocation(krate: &str, item: &Item, path: &[String], macro_prefix: &str) -> String {
         let mut module = format!("::{}", krate);
         for m in path {
             module += &format!("::{}", m);
         }
         format!(
-            "::{}::__tl_prop_{}!(path = {}{}, accept);\n",
+            "::{}::{}{}!(path = {}{}, accept);\n",
             krate,
+            macro_prefix,
             item.id,
             module,
             if item.strict { ", strict" } else { "" }
@@ -5258,6 +5288,7 @@ fn accept_referrer(
         path: &[String],
         mod_uses: &[(Vec<String>, String)],
         items: &[Item],
+        macro_prefix: &str,
         out: &mut String,
     ) {
         if let Some((_, uses)) = mod_uses.iter().find(|(p, _)| p == path) {
@@ -5265,14 +5296,14 @@ fn accept_referrer(
         }
         *out += &format!("pub use ::{}::{}::*;\n", krate, path.join("::"));
         for item in items.iter().filter(|i| i.kind != "mod" && i.module == path) {
-            *out += &invocation(krate, item, path);
+            *out += &invocation(krate, item, path, macro_prefix);
         }
         for (sub, _) in mod_uses
             .iter()
             .filter(|(p, _)| p.len() == path.len() + 1 && p.starts_with(path))
         {
             *out += &format!("pub mod {} {{\n", sub.last().unwrap());
-            module(krate, sub, mod_uses, items, out);
+            module(krate, sub, mod_uses, items, macro_prefix, out);
             *out += "}\n";
         }
     }
@@ -5280,17 +5311,17 @@ fn accept_referrer(
     text += &format!("pub mod base {{ pub use ::{}::base::*; }}\n", krate);
     for (path, _) in mod_uses.iter().filter(|(p, _)| p.len() == 1) {
         text += &format!("pub mod {} {{\n", path[0]);
-        module(krate, path, mod_uses, items, &mut text);
+        module(krate, path, mod_uses, items, macro_prefix, &mut text);
         text += "}\n";
     }
     // A module analyzed as a whole declares itself, at the root.
     for item in items.iter().filter(|i| i.kind == "mod") {
-        text += &invocation(krate, item, &[]);
+        text += &invocation(krate, item, &[], macro_prefix);
     }
     let lines = items
         .iter()
         .filter_map(|item| {
-            let call = format!("::__tl_prop_{}!(", item.id);
+            let call = format!("::{}{}!(", macro_prefix, item.id);
             let at = text.lines().position(|line| line.contains(&call))?;
             Some((at + 1, item.id))
         })

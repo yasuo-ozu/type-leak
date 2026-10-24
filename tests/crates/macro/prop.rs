@@ -33,6 +33,13 @@
 //! the Referrer's crate of the accepted items only (`accept` in the invocation, [`apply()`]), where
 //! the parts that it keeps as written resolve.
 //!
+//! With `stages = true` in the attribute (`TYPE_LEAK_PROP_FEATURES=allow_stages`) the macro also
+//! makes two copies of the item, which the Referrer's crates of `allow_stages` build
+//! ([`stage_copy()`]): after the analysis without the prelude, whose result is given
+//! `LeakerResult::allow_prelude()` and then `allow(cause)` for the causes of the errors that
+//! remain, and after the analysis of a config that allows the prelude. Their Repeater's impls have
+//! an `ID` of their own ([`Args::repeater_id()`]).
+//!
 //! With `#[prop_leak_result]` the Leaker does not decide: an item with errors is emitted with its
 //! `LeakerResult` (the Referrer, then the errors, as tokens). The Referrer's invocation says what
 //! it allows (`allow(std_crates, trait Path, type Ty)`: `LeakerResult::allow_std_crates()`,
@@ -101,6 +108,11 @@ pub(crate) struct Args {
     /// such an item in the crate of its own that `tests/prop_cross_crate` makes for them (`accept`,
     /// [`apply()`]), and in no other.
     accepted: bool,
+    /// Not an argument of the attribute: `0`, or the [`Side`] (`1`, `2`) of the arguments of the copy
+    /// that [`stage_copy()`] makes (`TYPE_LEAK_PROP_FEATURES=allow_stages`). Its Repeater's impls have
+    /// another `ID` ([`Args::repeater_id()`]), so that they do not clash with those of the ordinary
+    /// analysis and with each other.
+    stage: u8,
 }
 
 impl Parse for Args {
@@ -120,6 +132,7 @@ impl Parse for Args {
             no_nested_self: false,
             stages: false,
             accepted: false,
+            stage: 0,
         };
         for kv in Punctuated::<MetaNameValue, Token![,]>::parse_terminated(input)? {
             let key = kv
@@ -145,6 +158,7 @@ impl Parse for Args {
                 ("no_nested_self", Lit::Bool(b)) => args.no_nested_self = b.value,
                 ("stages", Lit::Bool(b)) => args.stages = b.value,
                 ("accepted", Lit::Bool(b)) => args.accepted = b.value,
+                ("stage", Lit::Int(i)) => args.stage = i.base10_parse()?,
                 ("allow", Lit::Str(s)) => {
                     for path in s.value().split(',').filter(|p| !p.trim().is_empty()) {
                         args.allow.push(parse_str(path.trim())?);
@@ -164,7 +178,7 @@ impl Args {
         let (redeclare, values) = (self.redeclare, self.values);
         let (nested_self_entries, accepted) = (self.nested_self_entries, self.accepted);
         let no_nested_self = self.no_nested_self;
-        let stages = self.stages;
+        let (stages, stage) = (self.stages, self.stage);
         let strict = self.strict.map(|strict| quote!(strict = #strict,));
         let scope = &self.scope;
         let allow = self
@@ -173,7 +187,49 @@ impl Args {
             .map(|p| quote!(#p).to_string().replace(' ', ""))
             .collect::<Vec<_>>()
             .join(",");
-        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict primitive = #primitive, relaxed_sized = #relaxed_sized, redeclare = #redeclare, values = #values, nested_self_entries = #nested_self_entries, no_nested_self = #no_nested_self, stages = #stages, accepted = #accepted)
+        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict primitive = #primitive, relaxed_sized = #relaxed_sized, redeclare = #redeclare, values = #values, nested_self_entries = #nested_self_entries, no_nested_self = #no_nested_self, stages = #stages, accepted = #accepted, stage = #stage)
+    }
+
+    /// The `ID` of the Repeater's impls of the entries: the item's, and for the copy of
+    /// `allow_stages` the item's with a number of the side in the bits that no item has.
+    fn repeater_id(&self) -> u64 {
+        self.id | (u64::from(self.stage) << 40)
+    }
+}
+
+/// Which analysis a copy of `TYPE_LEAK_PROP_FEATURES=allow_stages` is made after: the impls of its
+/// entries and those of the ordinary analysis of the same item are written next to each other in
+/// the Leaker's crate, each with an `ID` of its own.
+#[derive(Clone, Copy, PartialEq)]
+enum Side {
+    /// The analysis without the prelude, whose result is given `allow_prelude()`.
+    Result,
+    /// The analysis of a config that allows the prelude. Its copy is what the copy of `Result` is
+    /// compared with: if the one that fails is only `Result`'s, the path rule after the analysis is
+    /// what makes it fail.
+    Config,
+}
+
+impl Side {
+    fn number(self) -> u8 {
+        match self {
+            Side::Result => 1,
+            Side::Config => 2,
+        }
+    }
+
+    /// The names of the macro of the Referrer's crate of the copies of the side and of its report:
+    /// `__tl_stagecopy_<id>!` and `__tl_stagebase_<id>!` (`gen::Case::stage_referrer`,
+    /// `gen::Case::base_referrer`).
+    fn names(self, id: u64) -> (Ident, Ident) {
+        let name = match self {
+            Side::Result => "stagecopy",
+            Side::Config => "stagebase",
+        };
+        (
+            ident(&format!("__tl_{}_{}", name, id)),
+            ident(&format!("__tl_{}_report_{}", name, id)),
+        )
     }
 }
 
@@ -1494,7 +1550,7 @@ fn rewrite(
     let mut projector = Projector {
         referrer,
         repeater,
-        id: args.id,
+        id: args.repeater_id(),
         root_params: generics.map(|g| g.params.clone()).unwrap_or_default(),
         root_args: generics.map(identity_args).unwrap_or_default(),
         bound_self: None,
@@ -2046,7 +2102,8 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
     let mac_name = ident(&format!("__tl_prop_{}", id));
     let dollar = dollar();
     let (result, context, assertions) = analyze(&original, &args);
-    // `allow_stages`: what the two stages leave (nothing is emitted otherwise).
+    // `allow_stages`: what the two stages leave, and the copy of the second (nothing is emitted
+    // otherwise).
     let stages_macro = if args.stages {
         let name = ident(&format!("__tl_stages_{}", id));
         let text = stages(&original, &args);
@@ -2057,6 +2114,14 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
         }
     } else {
         TokenStream::new()
+    };
+    let stage_copies: Vec<StageCopy> = if args.stages {
+        vec![
+            stage_copy(&original, &args, Side::Result),
+            stage_copy(&original, &args, Side::Config),
+        ]
+    } else {
+        Vec::new()
     };
     // The bare spelling of a trait of the prelude: its twin in full gives the same entries if the
     // names of the prelude are allowed, and it is a relative path if they are not.
@@ -2092,8 +2157,30 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
                 errors.push('\u{1c}');
                 errors.push_str(&rejection_text(&remaining));
             }
+            // The copy of `allow_stages` is made all the same, and compares with the witnesses,
+            // which the item has no other output for.
+            let (head, tail, stage_macros) = if stage_copies.is_empty() {
+                (quote!(#original), TokenStream::new(), TokenStream::new())
+            } else {
+                let (mut impls, mut assertions, mut macros) =
+                    (Vec::new(), TokenStream::new(), TokenStream::new());
+                for stage in stage_copies {
+                    impls.extend(stage.impls);
+                    assertions.extend(stage.assertions);
+                    macros.extend(stage.macros);
+                }
+                let (head, tail) = place(
+                    &original,
+                    impls,
+                    &assertions,
+                    witnesses_of(&original, &args),
+                )?;
+                (head, tail, macros)
+            };
             return Ok(quote! {
-                #original
+                #head
+                #tail
+                #stage_macros
                 #stages_macro
                 #[doc(hidden)]
                 #[macro_export]
@@ -2114,59 +2201,71 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
     let referrer = result.into_referrer();
     let carried = carried.unwrap_or_else(|| referrer.to_token_stream());
 
-    check_nested_self_is_required(&referrer, &original, &args)?;
-    let (impls, skipped) = repeater_impls(&referrer, id, args.strict.unwrap_or(true))?;
-    let positions = collect_positions(&original, None, &args.scope);
-    let witnesses: Vec<(Vec<Ident>, TokenStream)> = positions
+    let status = if args.accepted { "acc" } else { "ok" };
+    let errors = rejection_text(&errors);
+    // Count what the Referrer will check, by rewriting a copy here too.
+    let counted = count_copy(&referrer, context, &original, &args, status, twin)?;
+    let mut impls = counted.impls;
+    let report = counted.report;
+    let witnesses = witnesses_of(&original, &args);
+    let mut assertions = assertions;
+    let mut stage_macros = TokenStream::new();
+    for stage in stage_copies {
+        impls.extend(stage.impls);
+        assertions.extend(stage.assertions);
+        stage_macros.extend(stage.macros);
+    }
+
+    let (head, tail) = place(&original, impls, &assertions, witnesses)?;
+    let args_tokens = args.tokens();
+    Ok(quote! {
+        #head
+        #tail
+        #stage_macros
+        #stages_macro
+        #[doc(hidden)]
+        #[macro_export]
+        macro_rules! #report_name { () => { #report }; }
+        #[doc(hidden)]
+        #[macro_export]
+        macro_rules! #errors_name { () => { #errors }; }
+        #[doc(hidden)]
+        #[macro_export]
+        macro_rules! #mac_name {
+            (#dollar(#dollar t:tt)*) => {
+                #dollar crate::__macro::__prop_apply! {
+                    { #carried , #context }
+                    { #args_tokens }
+                    { #original }
+                    #dollar(#dollar t)*
+                }
+            };
+        }
+    })
+}
+
+/// The witnesses of the type positions of `original`, each with the path of the module it is written
+/// in.
+fn witnesses_of(original: &Item, args: &Args) -> Vec<(Vec<Ident>, TokenStream)> {
+    collect_positions(original, None, &args.scope)
         .iter()
         .enumerate()
         .filter(|(_, pos)| !has_no_witness(pos))
-        .map(|(j, pos)| (pos.mods.clone(), witness_fn(id, j, pos)))
-        .collect();
+        .map(|(j, pos)| (pos.mods.clone(), witness_fn(args.id, j, pos)))
+        .collect()
+}
 
-    // Count what the Referrer will check, by rewriting a copy here too.
-    let status = if args.accepted { "acc" } else { "ok" };
-    let errors = rejection_text(&errors);
-    let dummy: Path = parse_quote!(::__dummy);
-    let counted = if args.strict == Some(true) {
-        referrer.clone().allow_ambiguous_crate_name(false)
-    } else {
-        referrer.clone()
-    };
-    let report = match rewrite(&counted, context, &original, &args, &dummy, false) {
-        Ok(rewritten) => {
-            let host = host_arg(&rewritten, &args, &dummy);
-            // The copy of an item accepted by `allow()` keeps the part that conflicts as written, and
-            // so a primitive in it that the Leaker does not allow.
-            if !args.accepted {
-                check_primitives_replaced(&rewritten.item, &original, &args, host.as_ref())?;
-            }
-            let rewritten_positions = comparable(&rewritten.item, &original, &args, host.as_ref());
-            format!(
-                "{}|{}|{}|entries={} positions={} checked={} skipped={} twin={}",
-                id,
-                kind,
-                status,
-                referrer.iter().count(),
-                positions.len(),
-                rewritten_positions.len(),
-                skipped,
-                u8::from(twin)
-            )
-        }
-        Err(e) => format!(
-            "{}|{}|{}|entries={} positions={} rewrite-error={}",
-            id,
-            kind,
-            status,
-            referrer.iter().count(),
-            positions.len(),
-            e.to_string().replace(['\n', '|'], " ")
-        ),
-    };
-
+/// The item and what is written next to it, as the tokens before the item and the tokens after it:
+/// the Repeater's impls (in the module each is keyed by, for a module), the assertions and the
+/// witnesses (in the module they are of).
+fn place(
+    original: &Item,
+    impls: Impls,
+    assertions: &TokenStream,
+    witnesses: Vec<(Vec<Ident>, TokenStream)>,
+) -> Result<(TokenStream, TokenStream)> {
     let mut emitted = original.clone();
-    let (head, tail): (TokenStream, TokenStream) = match &mut emitted {
+    Ok(match &mut emitted {
         Item::Mod(m) => {
             // The Repeater's implementations and the witnesses go into the modules they belong
             // to. The module's own name is the first of the path of a position.
@@ -2192,31 +2291,194 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
                 quote!(#assertions #(#impls)* #(#witnesses)*),
             )
         }
-    };
-    let args_tokens = args.tokens();
-    Ok(quote! {
-        #head
-        #tail
-        #stages_macro
-        #[doc(hidden)]
-        #[macro_export]
-        macro_rules! #report_name { () => { #report }; }
-        #[doc(hidden)]
-        #[macro_export]
-        macro_rules! #errors_name { () => { #errors }; }
-        #[doc(hidden)]
-        #[macro_export]
-        macro_rules! #mac_name {
-            (#dollar(#dollar t:tt)*) => {
-                #dollar crate::__macro::__prop_apply! {
-                    { #carried , #context }
-                    { #args_tokens }
-                    { #original }
-                    #dollar(#dollar t)*
-                }
-            };
-        }
     })
+}
+
+/// What the macro writes for the copy that a Referrer makes of `original` with `referrer`: the
+/// Repeater's impls of its entries, and the report of what the macro counted.
+struct Counted {
+    impls: Impls,
+    report: String,
+}
+
+/// Counts what the Referrer will check of the copy of `original` by rewriting a copy here too: the
+/// entries, the type positions, those that a witness compares (`status` is `ok`, or `acc` for an
+/// item accepted by `allow()`). Fails if the item has a shape that the macro cannot write.
+fn count_copy(
+    referrer: &Referrer,
+    context: ContextId,
+    original: &Item,
+    args: &Args,
+    status: &str,
+    twin: bool,
+) -> Result<Counted> {
+    let (id, kind) = (args.id, kind_name(original));
+    check_nested_self_is_required(referrer, original, args)?;
+    let (impls, skipped) =
+        repeater_impls(referrer, args.repeater_id(), args.strict.unwrap_or(true))?;
+    let positions = collect_positions(original, None, &args.scope);
+    let dummy: Path = parse_quote!(::__dummy);
+    let counted = if args.strict == Some(true) {
+        referrer.clone().allow_ambiguous_crate_name(false)
+    } else {
+        referrer.clone()
+    };
+    let report = match rewrite(&counted, context, original, args, &dummy, false) {
+        Ok(rewritten) => {
+            let host = host_arg(&rewritten, args, &dummy);
+            // The copy of an item accepted by `allow()` keeps the part that conflicts as written, and
+            // so a primitive in it that the Leaker does not allow.
+            if !args.accepted {
+                check_primitives_replaced(&rewritten.item, original, args, host.as_ref())?;
+            }
+            let rewritten_positions = comparable(&rewritten.item, original, args, host.as_ref());
+            format!(
+                "{}|{}|{}|entries={} positions={} checked={} skipped={} twin={}",
+                id,
+                kind,
+                status,
+                referrer.iter().count(),
+                positions.len(),
+                rewritten_positions.len(),
+                skipped,
+                u8::from(twin)
+            )
+        }
+        Err(e) => format!(
+            "{}|{}|{}|entries={} positions={} rewrite-error={}",
+            id,
+            kind,
+            status,
+            referrer.iter().count(),
+            positions.len(),
+            e.to_string().replace(['\n', '|'], " ")
+        ),
+    };
+    Ok(Counted { impls, report })
+}
+
+/// What `TYPE_LEAK_PROP_FEATURES=allow_stages` adds to the output of an item for each [`Side`]: the
+/// copy that a macro makes
+///
+/// - `Side::Result`: when it analyzes the item without the prelude (the primitive types allowed, as in
+///   [`stages()`]), gives `LeakerResult::allow_prelude()` to the result, and allows the cause of
+///   every error that remains, as `prop_leak_accept` does;
+/// - `Side::Config`: when it analyzes the item with a config that allows the prelude (and the
+///   primitive types), and allows the cause of every error that remains.
+struct StageCopy {
+    /// The Repeater's impls of its entries, with an `ID` of their own ([`Args::repeater_id()`]).
+    impls: Impls,
+    /// The assertions of its analysis.
+    assertions: TokenStream,
+    /// `__tl_stagecopy_report_<id>!`, the report in the form of `__tl_report_<id>!` and the errors
+    /// that were allowed after it, and `__tl_stagecopy_<id>!`, the macro that the Referrer's crate
+    /// of the stage copies invokes (`gen::Case::stage_referrer`): it expands to nothing in the other
+    /// crates, as the macro of an item accepted by `allow()` does. The names are those of
+    /// [`Side::names()`].
+    macros: TokenStream,
+}
+
+/// The copy of `allow_stages` of `original` on a side: see [`StageCopy`].
+///
+/// The copy is made in the crate of its own, where the names of the prelude mean the prelude: that is
+/// what allowing them is a promise of, and the generated crates declare no name of the prelude
+/// (`tests/prop_cross_crate` checks it). The copy keeps the parts that conflict as written, the ones
+/// that `allow_prelude()` drops and those that the cause allowed, so the Referrer's crate must
+/// resolve them: it is the crate of the items accepted by `allow()`.
+///
+/// The status of its report is `ok` if the analysis leaves no error, `acc` if the causes of the
+/// errors were allowed (and dropped them all), and `accfail` if an error remains (the macro emits no
+/// copy then). A macro error of the copy is no error of the Leaker's crate: it is a `rewrite-error`
+/// of the report.
+fn stage_copy(original: &Item, args: &Args, side: Side) -> StageCopy {
+    let (id, kind) = (args.id, kind_name(original));
+    let (mac_name, report_name) = side.names(id);
+    let dollar = dollar();
+    let mut analysis_args = args.clone();
+    analysis_args.prelude = side == Side::Config;
+    analysis_args.primitive = true;
+    let (mut result, context, assertions) = analyze(original, &analysis_args);
+    if side == Side::Result {
+        result.allow_prelude();
+    }
+    // The errors that the rule does not drop are allowed by their causes.
+    let errors: Vec<ErrorItem> = result.errors().to_vec();
+    for error in &errors {
+        result.allow(error.cause.clone());
+    }
+    let remaining = result.errors().to_vec();
+    let noop = quote! {
+        #[doc(hidden)]
+        #[macro_export]
+        macro_rules! #mac_name { (#dollar(#dollar t:tt)*) => {}; }
+    };
+    let report_macro = |report: String, errors: String| {
+        let text = format!("{}\u{1e}{}", report, errors);
+        quote! {
+            #[doc(hidden)]
+            #[macro_export]
+            macro_rules! #report_name { () => { #text }; }
+        }
+    };
+    let nothing = |report: String, errors: String| StageCopy {
+        impls: Vec::new(),
+        assertions: TokenStream::new(),
+        macros: {
+            let report = report_macro(report, errors);
+            quote!(#report #noop)
+        },
+    };
+    if !remaining.is_empty() {
+        let reason = crate::messages(&remaining).replace(['\n', '|'], " ");
+        let mut text = rejection_text(&errors);
+        text.push('\u{1c}');
+        text.push_str(&rejection_text(&remaining));
+        return nothing(format!("{}|{}|accfail|{}", id, kind, reason), text);
+    }
+    let status = if errors.is_empty() { "ok" } else { "acc" };
+    // The Referrer's crate of the stage copies: the arguments of the macro say so.
+    let mut copy_args = analysis_args;
+    copy_args.prelude = true;
+    copy_args.stages = false;
+    copy_args.stage = side.number();
+    copy_args.accepted = true;
+    let referrer = result.into_referrer();
+    let text = rejection_text(&errors);
+    let counted = match count_copy(&referrer, context, original, &copy_args, status, false) {
+        Ok(counted) => counted,
+        Err(e) => {
+            let report = format!(
+                "{}|{}|{}|entries={} positions=0 rewrite-error={}",
+                id,
+                kind,
+                status,
+                referrer.iter().count(),
+                e.to_string().replace(['\n', '|'], " ")
+            );
+            return nothing(report, text);
+        }
+    };
+    let (carried, args_tokens) = (referrer.to_token_stream(), copy_args.tokens());
+    let report = report_macro(counted.report, text);
+    StageCopy {
+        impls: counted.impls,
+        assertions,
+        macros: quote! {
+            #report
+            #[doc(hidden)]
+            #[macro_export]
+            macro_rules! #mac_name {
+                (#dollar(#dollar t:tt)*) => {
+                    #dollar crate::__macro::__prop_apply! {
+                        { #carried , #context }
+                        { #args_tokens }
+                        { #original }
+                        #dollar(#dollar t)*
+                    }
+                };
+            }
+        },
+    }
 }
 
 /// What the Referrer's invocation allows of the errors it got (`allow(std_crates, trait Path, type

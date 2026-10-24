@@ -12,6 +12,10 @@
 //!   after the analysis (`Vec<Rel<'_>>` where the config reports `Rel<'_>`), the Referrer may keep
 //!   entries that the config does not make (`Vec<u8>`), and an error can remain that the config does
 //!   not have (the last test).
+//!
+//! The property test builds the copies after the result and after the config
+//! (`TYPE_LEAK_PROP_FEATURES=allow_stages`, `tests/prop_cross_crate/main.rs`): what the tests below
+//! say of the copies was found with it.
 
 mod common;
 
@@ -400,7 +404,13 @@ fn an_error_can_remain_after_the_analysis_that_the_config_does_not_have() {
 
 /// The result is the analysis without the option, whose errors it filters. The property test
 /// (`TYPE_LEAK_PROP_FEATURES=allow_stages`) counts them: 27 of 1255 items of seed 1 leave another
-/// number of errors, for the three reasons below.
+/// number of errors, for the three reasons below. It also builds the copies. The one after the
+/// result fails to build where the one after the config builds for (B): `Self::A` is unprovable
+/// (E0277, the documented limitation of `LeakerResult::allow()`). And it can fail with no error
+/// reported at all, when (B) meets (C): in `trait Tr<T: ::p::BT1<String>> { type A0; fn m<X>(&self)
+/// where X: Into<Self::A0>; }` the relative `String` stays an entry (the config leaves it as
+/// written), the relative `Into<Self::A0>` is copied whole and its `Self::A0` is not looked into, so
+/// `allow_prelude()` leaves nothing, and the host does not satisfy `T: BT1<String>` (E0277).
 #[test]
 fn a_bound_with_a_relative_path_in_its_arguments_is_copied_whole_and_stays_an_error() {
     // (A) With the prelude allowed, `Fn` is context-free and `R0` is leaked as an entry. Without
@@ -459,6 +469,7 @@ fn a_prelude_type_that_stays_leaked_makes_a_projection_unprovable_after_the_anal
 fn an_error_inside_a_bound_that_the_analysis_copied_whole_is_not_found_after_it() {
     // (C) The relative `Fn(&Self::A0) -> u8` is copied whole, so what is in it is not analyzed:
     // the config, where `Fn` is context-free, finds that `Self::A0` is unprovable beside `I1<T>`.
+    // Neither copy builds, though: both fail with E0275, so the missing error is no gain.
     let item: ItemTrait = parse_quote!(
         trait Tr<T: Fn(&Self::A0) -> u8> {
             type A0;
@@ -476,4 +487,54 @@ fn an_error_inside_a_bound_that_the_analysis_copied_whole_is_not_found_after_it(
     );
     assert_eq!(causes(&before), ["I1 < T >", "Self :: A0"]);
     assert_eq!(causes(&after), ["I1 < T >"]);
+}
+
+#[test]
+fn an_entry_that_the_config_does_not_make_and_a_bound_copied_whole_leave_no_error_and_a_copy_that_fails(
+) {
+    // (D) (B) meets (C), and the result reports nothing. The crate `::p` is allowed. The config
+    // allows `String` and `Into`, so `::p::BT1<String>` is context-free and `Self::A0` is provable.
+    // Without them `String` is a relative name, which `allow_prelude()` drops the error of and
+    // leaves as an entry. A bound that names a leaked type makes `Self::A0` unprovable in a
+    // predicate, but `Into<Self::A0>` is relative and copied whole, so nothing looks into it. The
+    // copy fails to build in the Referrer's crate (E0277: `T: BT1<String>` is not satisfied by the
+    // host of the trait), which no error warns of; the property test builds it.
+    let item: ItemTrait = parse_quote!(
+        trait Tr<T: ::p::BT1<String>> {
+            type A0;
+            fn m<X>(&self)
+            where
+                X: Into<Self::A0>;
+        }
+    );
+    let (before, after) = stages(
+        &item,
+        |c| {
+            c.allow_primitive().allow_path(parse_quote!(::p));
+        },
+        Rule::Prelude,
+    );
+    assert!(before.errors().is_empty());
+    assert!(after.errors().is_empty());
+    assert!(entries(&before).is_empty());
+    assert_eq!(entries(&after), ["String"]);
+    // With an absolute `Into` the result does report it (B).
+    let item: ItemTrait = parse_quote!(
+        trait Tr<T: ::p::BT1<String>> {
+            type A0;
+            fn m<X>(&self)
+            where
+                X: ::core::convert::Into<Self::A0>;
+        }
+    );
+    let (before, after) = stages(
+        &item,
+        |c| {
+            c.allow_primitive().allow_path(parse_quote!(::p));
+        },
+        Rule::Prelude,
+    );
+    assert!(before.errors().is_empty());
+    assert_eq!(causes(&after), ["Self :: A0"]);
+    assert_eq!(after.errors()[0].reason, Reason::UnprovableBound);
 }

@@ -795,10 +795,14 @@ impl Leaker {
 /// rules of the same methods of [`LeakerConfig`], and never change the Referrer, which has every
 /// rejected part copied as written either way. A path rule drops an error only if every relative
 /// path of it ([`ErrorItem::paths`]) is allowed, and removes the paths it allows from the others:
-/// `Vec<Rel<'_>>` stays after `allow_prelude()`, where a config reports `Rel<'_>`, and the Referrer
-/// may keep entries that the config would not make. The result is the analysis without the option,
-/// so the number of errors can differ from a config's, in either direction (a relative bound is
-/// copied whole and not looked into).
+/// `Vec<Rel<'_>>` stays after `allow_prelude()`, where a config reports `Rel<'_>`.
+///
+/// A path rule here only approximates the same rule on a [`LeakerConfig`]: it judges an analysis
+/// made without the rule. So it can leave more errors than the config would, or in rare cases fewer
+/// (a relative bound is copied whole and not looked into), and the entries that the config would
+/// leave as written stay entries, which can make a copy fail to build where the config's builds.
+/// Give a path rule to the config when you can.
+///
 /// Take the Referrer with [`finish()`](LeakerResult::finish) if no error remains, or with
 /// [`into_referrer()`](LeakerResult::into_referrer) whatever remains.
 ///
