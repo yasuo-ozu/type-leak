@@ -20,8 +20,8 @@ use type_leak::*;
 /// The config of the rows with `::p` allowed (the crate of the property test).
 fn allowing() -> Leaker {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
-    config.allowed_paths.push(parse_quote!(::p));
+    config.allow_primitive().allow_prelude();
+    config.allow_path(parse_quote!(::p));
     Leaker::from_config(config)
 }
 
@@ -81,7 +81,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "use absolute path: 'MyBound'",
             "write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it \
-             with `LeakerConfig::allowed_paths`",
+             with `LeakerConfig::allow_path()`",
         )],
     },
     Row {
@@ -95,7 +95,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "use absolute path: 'crate :: m :: Bound'",
             "write `crate::m::Bound` with an absolute path (e.g. `::my_crate::m::Bound`), or \
-             allow it with `LeakerConfig::allowed_paths`",
+             allow it with `LeakerConfig::allow_path()`",
         )],
     },
     Row {
@@ -111,7 +111,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "use absolute path: 'MyType < '_ >'",
             "write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with \
-             `LeakerConfig::allowed_paths`",
+             `LeakerConfig::allow_path()`",
         )],
     },
     Row {
@@ -125,7 +125,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "use absolute path: 'Idx'",
             "write `Idx` with an absolute path (e.g. `::my_crate::Idx`), or allow it with \
-             `LeakerConfig::allowed_paths`",
+             `LeakerConfig::allow_path()`",
         )],
     },
     Row {
@@ -141,7 +141,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "use absolute path: 'RelTr'",
             "write `RelTr` with an absolute path (e.g. `::my_crate::RelTr`), allow it with \
-             `LeakerConfig::allowed_paths`, or name the lifetime of the trait object (e.g. \
+             `LeakerConfig::allow_path()`, or name the lifetime of the trait object (e.g. \
              `&'a dyn Trait` or `dyn Trait + 'a`)",
         )],
     },
@@ -158,7 +158,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "use absolute path: 'Rel < Self >'",
             "write `Rel` with an absolute path (e.g. `::my_crate::Rel`), allow it with \
-             `LeakerConfig::allowed_paths`, or analyze the item with `allow_self = true`",
+             `LeakerConfig::allow_path()`, or analyze the item with `allow_self = true`",
         )],
     },
     // ── a bare identifier that may be a const ────────────────────────────────────────────────
@@ -175,7 +175,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
             "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
-             const), allow it with `LeakerConfig::allowed_paths`, or analyze the item with \
+             const), allow it with `LeakerConfig::allow_path()`, or analyze the item with \
              `allow_self = true`",
         )],
     },
@@ -261,7 +261,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
             "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
-             const), or allow it with `LeakerConfig::allowed_paths`",
+             const), or allow it with `LeakerConfig::allow_path()`",
         )],
     },
     // ── `Self` ───────────────────────────────────────────────────────────────────────────────
@@ -312,7 +312,7 @@ const ROWS: &[Row] = &[
             (
                 "use absolute path: 'Tr'",
                 "write `Tr` with an absolute path (e.g. `::my_crate::Tr`), or allow it with \
-                 `LeakerConfig::allowed_paths`",
+                 `LeakerConfig::allow_path()`",
             ),
             (
                 "write `<Self as Tr>::A` instead of `Self::A` in `Wrap<Self::A>`: the copy \

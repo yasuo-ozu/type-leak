@@ -69,14 +69,18 @@ fn describe(item: &ErrorItem) -> String {
         .help
         .as_ref()
         .map(|(at, help)| format!("({}) {}", at, help));
+    let paths: Vec<String> = item.paths.iter().map(text).collect();
     format!(
-        "{:?} {} | {:?} | {} | {:?} | {:?}",
+        "{:?} {} | {:?} | {} | {:?} | {:?} | value {} default {} paths {:?}",
         std::mem::discriminant(&item.cause),
         item.cause.to_token_stream(),
         item.reason,
         item.message,
         notes,
-        help
+        help,
+        item.in_value,
+        item.in_default,
+        paths
     )
 }
 
@@ -179,6 +183,83 @@ fn allowing_after_the_round_trip_drops_the_same_errors() {
     }
     assert!(all.errors().is_empty());
     assert_eq!(all.finish().unwrap(), referrer);
+}
+
+/// The path, value and default rules (`LeakerResult::allow_path()` and the others) give the same
+/// errors on the other side of the trip. A path rule leaves the paths it does not allow in the
+/// error, which is serialized with them, so rules given in two macros add up as they do in one.
+#[test]
+fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() {
+    let item: ItemTrait = parse_quote!(
+        trait Tr<U = Rel<'_>>: core::fmt::Debug {
+            const N: usize = inner::N;
+            fn f(&self, a: Vec<Rel2<'_>>, b: my::W<'_, Rel3>) {
+                let _ = inner::f();
+            }
+        }
+    );
+    let mut config = LeakerConfig::new();
+    config.allow_primitive().check_values();
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    assert!(result.errors().iter().any(|e| e.in_value && e.in_default));
+    assert!(result.errors().iter().any(|e| e.paths.len() > 1));
+    let read_back = read(result.to_token_stream()).unwrap();
+    assert_eq!(describe_all(&read_back), describe_all(&result));
+
+    type Rule = fn(&mut LeakerResult);
+    let rules: [(&str, Rule); 7] = [
+        ("path", |r| {
+            r.allow_path(parse_quote!(my));
+        }),
+        ("prelude", |r| {
+            r.allow_prelude();
+        }),
+        ("std crates", |r| {
+            r.allow_std_crates();
+        }),
+        ("crate", |r| {
+            r.allow_crate();
+        }),
+        ("primitive", |r| {
+            r.allow_primitive();
+        }),
+        ("values", |r| {
+            r.allow_values();
+        }),
+        ("default", |r| {
+            r.allow_default();
+        }),
+    ];
+    let mut dropped_something = 0;
+    for (name, rule) in rules {
+        let (mut before, mut after) = (result.clone(), read_back.clone());
+        rule(&mut before);
+        rule(&mut after);
+        assert_eq!(describe_all(&after), describe_all(&before), "{}", name);
+        if before.errors().len() < result.errors().len()
+            || describe_all(&before) != describe_all(&result)
+        {
+            dropped_something += 1;
+        }
+        // The rest is written and read again, and a second rule on the other side of that trip
+        // gives what both rules give on one side.
+        for (second_name, second) in rules {
+            let mut together = before.clone();
+            second(&mut together);
+            let mut trip = read(before.to_token_stream()).unwrap();
+            second(&mut trip);
+            assert_eq!(
+                describe_all(&trip),
+                describe_all(&together),
+                "{} then {}",
+                name,
+                second_name
+            );
+        }
+    }
+    assert!(dropped_something >= 3);
 }
 
 /// The tokens after the result are left for the caller: an ident and a `;` after the errors, and

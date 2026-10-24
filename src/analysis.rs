@@ -10,7 +10,7 @@ use crate::leaker::Leaker;
 #[cfg(doc)]
 use crate::view::View;
 use std::collections::HashSet;
-use syn::{FnArg, Ident, Lifetime, Signature, Type};
+use syn::{FnArg, Ident, Lifetime, Path, Signature, Type};
 use template_quote::quote;
 
 /// What [`View::check()`] found in a type: the causes that force it to be leaked, and the causes
@@ -78,7 +78,7 @@ pub struct CheckResult {
     /// `true` if the type is an optional entry: it has no cause of its own, and its own path names
     /// an external crate (`::path::X`, `::path::Wrap<(MyType,)>`), which the Referrer may not
     /// share. `must` holds only its parts, if any. A type with an impossible cause is not one, as
-    /// it is copied as written. See [`Leaker::allowed_paths`](crate::Leaker::allowed_paths).
+    /// it is copied as written. See [`LeakerConfig::allow_path()`](crate::LeakerConfig::allow_path).
     pub optional: bool,
     /// Explains the conflict if the causes do not (why `Self` cannot be leaked, or has no
     /// meaning). Reported first. It says why, and `help` says what to write instead.
@@ -115,6 +115,31 @@ pub struct CheckResult {
     /// The number of mentions of `Self` without meaning found when this conflict was recorded, to
     /// report them among the conflicts in the order found ([`scope_error()`]).
     pub(crate) seen: usize,
+    /// Where the conflict was found: in a value, in a default ([`ErrorItem::in_value`],
+    /// [`ErrorItem::in_default`]). Set where it is recorded as an error.
+    pub(crate) place: Place,
+    /// The relative paths that the conflict depends on, without their arguments, in the order of
+    /// `must` ([`ErrorItem::paths`]).
+    pub(crate) paths: Vec<Path>,
+}
+
+/// Where in an item the analysis was when it found an error: what
+/// [`LeakerConfig::allow_values()`](crate::LeakerConfig::allow_values) and
+/// [`LeakerConfig::allow_default()`](crate::LeakerConfig::allow_default) accept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Place {
+    /// While a value is read (`LeakerConfig::check_values()`), including trait default values and
+    /// bodies.
+    pub(crate) value: bool,
+    /// In the default of a generic parameter, a trait default body or an associated const default.
+    pub(crate) default: bool,
+}
+
+/// A mention of `Self` that has no meaning where it is written ([`Reason::SelfWithoutMeaning`]).
+#[derive(Clone, Debug)]
+pub(crate) struct SelfMention {
+    pub(crate) cause: Cause,
+    pub(crate) place: Place,
 }
 
 /// A part of the item that the Leaker copies as written, whole, which the Referrer must leave so.
@@ -249,6 +274,8 @@ pub(crate) struct PendingType {
     pub(crate) unmeant_self: bool,
     /// The type is in a bound or where predicate of the item.
     pub(crate) in_predicate: bool,
+    /// The relative paths the type depends on, if it is an entry ([`CheckResult::paths`]).
+    pub(crate) paths: Vec<Path>,
     pub(crate) components: Vec<Effect>,
 }
 
@@ -267,6 +294,7 @@ impl PendingType {
             no_optional_entry: false,
             unmeant_self: false,
             in_predicate: false,
+            paths: Vec::new(),
             components,
         }
     }
@@ -299,6 +327,8 @@ impl CheckResult {
             reason: Reason::RelativePath,
             part: None,
             seen: 0,
+            place: Place::default(),
+            paths: Vec::new(),
         }
     }
 }
@@ -398,7 +428,7 @@ impl Analysis {
 /// [`CheckResult::seen`].
 pub(crate) fn scope_error(
     effects: &[Effect],
-    self_errors: &[Cause],
+    self_errors: &[SelfMention],
     conflicts: &[CheckResult],
 ) -> Vec<ErrorItem> {
     let mut errors = Vec::new();
@@ -408,7 +438,7 @@ pub(crate) fn scope_error(
     let mut mentions = self_errors
         .iter()
         .enumerate()
-        .map(|(index, cause)| (index, self_without_meaning(cause)))
+        .map(|(index, mention)| (index, self_without_meaning(mention)))
         .peekable();
     let mut items: Vec<ErrorItem> = Vec::new();
     // A conflict without a cause that depends on the context is no error: `report()` gives none.

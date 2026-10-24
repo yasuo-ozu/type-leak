@@ -160,7 +160,7 @@ fn the_span_of_a_conflict_of_a_type_in_a_bound_is_the_type() {
     let source = "trait Tr<T: Fn(Rel)> {\n    fn f(&self, a: Wrap<T>)\n    where\n        Wrap<T>: Sized;\n}";
     let item: ItemTrait = parse_str(source).unwrap();
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     let mut leaker = Leaker::from_config(config);
     leaker.intern_trait(&item, true);
     let result = leaker.result();

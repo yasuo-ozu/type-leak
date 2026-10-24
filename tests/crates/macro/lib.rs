@@ -436,7 +436,9 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let mut leaker = Leaker::from_config({
         let mut config = LeakerConfig::new();
         config.allow_primitive();
-        config.allowed_paths.extend(allowed);
+        for path in allowed {
+            config.allow_path(path);
+        }
         config
     });
     match &item {
@@ -488,8 +490,10 @@ pub fn leak(
 fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let mut leaker = Leaker::from_config({
         let mut config = LeakerConfig::new();
-        config.allow_primitive().allow_std_prelude();
-        config.allowed_paths.extend(args.allow.clone());
+        config.allow_primitive().allow_prelude();
+        if let Some(path) = args.allow.clone() {
+            config.allow_path(path);
+        }
         config
     });
     let context = leaker.intern_trait(&item_trait, true);

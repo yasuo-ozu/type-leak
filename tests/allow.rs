@@ -174,7 +174,7 @@ fn the_entries_are_those_of_the_item_without_the_conflict() {
 fn allowed_paths_would_change_more() {
     // The trait made context-free everywhere: `g` loses its required entry too.
     let mut config = LeakerConfig::new();
-    config.allowed_paths.push(parse_quote!(RelTr));
+    config.allow_path(parse_quote!(RelTr));
     let mut leaker = Leaker::from_config(config);
     leaker.intern_impl(&f_and_g(), true);
     let referrer = leaker.result().finish().unwrap();
@@ -821,7 +821,7 @@ fn every_type_that_leaves_the_lifetime_unconstrained_is_copied_whole() {
 /// A configuration that knows the standard prelude (`Into`) and the primitive types.
 fn std_config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
-    config.allow_std_prelude().allow_primitive();
+    config.allow_prelude().allow_primitive();
     config
 }
 
@@ -1038,9 +1038,9 @@ fn paths() -> ItemTrait {
     parse_quote!(
         trait Tr: Clone {
             fn c(&self, x: Vec<Rel<'_>>);
-            fn s(&self, x: std::vec::Vec<Rel<'_>>);
-            fn o(&self, x: core::option::Option<Rel<'_>>);
-            fn b(&self, x: alloc::boxed::Box<Rel<'_>>);
+            fn s(&self, x: std::fmt::Formatter<'_>);
+            fn o(&self, x: core::cell::Ref<'_, ::core::primitive::u8>);
+            fn b(&self, x: alloc::borrow::Cow<'_, ::core::primitive::str>);
             fn a(&self, x: ::std::vec::Vec<Rel<'_>>);
             fn m(&self, x: MyType<'_>);
         }
@@ -1091,6 +1091,49 @@ fn allow_std_crates_chains_with_allow() {
         .allow(Cause::Type(parse_quote!(MyType<'_>)));
     assert!(result.errors().is_empty());
     assert_eq!(result.finish().unwrap(), referrer);
+}
+
+/// A path rule drops an error only if every relative path of it is allowed: `std::vec::Vec<Rel<'_>>`
+/// has `Rel` too. The config makes `std::vec::Vec` context-free and reports `Rel<'_>` instead.
+#[test]
+fn allow_std_crates_needs_every_relative_path_of_the_cause() {
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn s(&self, x: std::vec::Vec<Rel<'_>>);
+            fn t(&self, x: std::fmt::Formatter<'_>);
+        }
+    );
+    let analyze = |config: LeakerConfig| {
+        let mut leaker = Leaker::from_config(config);
+        leaker.intern_trait(&item, true);
+        leaker.result()
+    };
+    let mut result = analyze(LeakerConfig::new());
+    assert_eq!(
+        causes(&result),
+        [
+            "std :: vec :: Vec < Rel < '_ > >",
+            "std :: fmt :: Formatter < '_ >"
+        ]
+    );
+    let paths: Vec<Vec<String>> = result
+        .errors()
+        .iter()
+        .map(|error| error.paths.iter().map(|p| quote!(#p).to_string()).collect())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            vec!["std :: vec :: Vec", "Rel"],
+            vec!["std :: fmt :: Formatter"]
+        ]
+    );
+    result.allow_std_crates();
+    assert_eq!(causes(&result), ["std :: vec :: Vec < Rel < '_ > >"]);
+    // The config reports the part that is not allowed.
+    let mut config = LeakerConfig::new();
+    config.allow_std_crates();
+    assert_eq!(causes(&analyze(config)), ["Rel < '_ >"]);
 }
 
 /// The path of a cause is that of a type, a trait, a macro or a value; the others have none.

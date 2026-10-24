@@ -129,7 +129,7 @@ fn intern_mod_errors_and_bodies() {
 /// standard prelude, and returns the module context too.
 fn referrer_with_prelude(m: &ItemMod) -> (type_leak::Referrer, ContextId) {
     let mut config = type_leak::LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     let mut leaker = Leaker::from_config(config);
     let context = leaker.intern_mod(m);
     (leaker.result().finish().unwrap(), context)

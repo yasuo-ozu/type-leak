@@ -95,7 +95,7 @@ use std::hash::Hasher;
 /// `?` applies to the real `Sized` only, so `T: ?Sized` is no more context-dependent than
 /// `T: ?::core::marker::Sized`. `type-leak` at fb11f41 does not know it: it takes the bare `Sized`
 /// of `?Sized` for a relative path like any other bare name of the prelude, and rejects it unless
-/// `LeakerConfig::allow_std_prelude()` is on. The Leaker accepts a bare `?Sized` always (`?` applies
+/// `LeakerConfig::allow_prelude()` is on. The Leaker accepts a bare `?Sized` always (`?` applies
 /// to the real `Sized` only), so it is `true`; it is the only place that says so. It reaches
 /// three places: the generator (a bare `?Sized` is an expected rejection without the prelude only
 /// if it is `false`: the tag `bare:?Sized`), the macro (`relaxed_sized` argument of `prop_leak`:
@@ -324,6 +324,17 @@ pub struct Features {
     pub nested_self_entries: bool,
 }
 
+/// `TYPE_LEAK_PROP_FEATURES` has `allow_stages`: the macro compares the errors that remain with
+/// `LeakerConfig::allow_prelude()` and with `LeakerResult::allow_prelude()` for every item
+/// (`stages = true` in the attribute, which only asks it to report both counts), and the harness
+/// prints how many items differ. Off by default, so that the tables do not change. It is no field
+/// of `Features`, whose `Debug` is in the tables, and not part of `all`.
+pub fn allow_stages() -> bool {
+    std::env::var("TYPE_LEAK_PROP_FEATURES").map_or(false, |list| {
+        list.split(',').any(|name| name.trim() == "allow_stages")
+    })
+}
+
 impl Features {
     /// The features of the findings that are fixed are on by default, and `list` adds the known
     /// failures.
@@ -433,6 +444,8 @@ impl Features {
                 "trait_self_defaults" => features.trait_self_defaults = true,
                 "self_bound_adts" => features.self_bound_adts = true,
                 "nested_self_entries" => features.nested_self_entries = true,
+                // Read by `allow_stages()`: it is no feature of the generator.
+                "allow_stages" => (),
                 "unsized_params" => features.unsized_params = true,
                 "bound_cycles" => features.bound_cycles = true,
                 other => panic!("unknown feature `{}`", other),
@@ -3652,7 +3665,7 @@ impl Gen {
     fn attr(&self, id: usize, allow_self: bool, scope: &str, strict: bool) -> String {
         format!(
             "#[{}(id = {}, allow_self = {}, prelude = {}, scope = \"{}\", allow = \"{}\", \
-             {}{}strict = {}, primitive = {}, relaxed_sized = {})]\n",
+             {}{}{}strict = {}, primitive = {}, relaxed_sized = {})]\n",
             ATTR,
             id,
             allow_self,
@@ -3666,6 +3679,11 @@ impl Gen {
             },
             if scope == "mod" && self.features.nested_self_entries {
                 "nested_self_entries = true, "
+            } else {
+                ""
+            },
+            if allow_stages() {
+                "stages = true, "
             } else {
                 ""
             },

@@ -293,7 +293,7 @@ fn from_config_and_the_items_accumulate() {
     // A Leaker with a configuration analyzes the items like one without it, and the contexts of
     // the items are numbered in the order they appear.
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     let mut leaker = Leaker::from_config(config);
     let first: ItemStruct = parse_quote!(
         struct A<T> {
@@ -344,9 +344,9 @@ fn from_config_and_the_items_accumulate() {
     assert_eq!(s(referrer.context_generics(b)), "< T >");
     assert!(referrer.context_generics(c).params.is_empty());
     // `from_config()` is what `new()` is with the allowed paths.
-    let mut leaker = Leaker::from_config(LeakerConfig::new());
-    assert!(leaker.allowed_paths.is_empty());
-    leaker.allowed_paths.push(parse_quote!(Vec));
+    let mut config = LeakerConfig::new();
+    config.allow_path(parse_quote!(Vec));
+    let mut leaker = Leaker::from_config(config);
     leaker.intern_struct(&first, true);
     // `Vec` is allowed, and `u8` is not (it is a relative path, as it is not a configured one).
     assert_eq!(

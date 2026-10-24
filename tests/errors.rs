@@ -301,7 +301,7 @@ fn error(message: &str, help: Option<&str>) -> Option<(String, Option<String>)> 
 
 #[test]
 fn help_suggests_absolute_prelude_path() {
-    // A prelude trait in a bound, without `allow_std_prelude()`.
+    // A prelude trait in a bound, without `allow_prelude()`.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait {
             fn f<T: Iterator<Item = u8>>(&self, t: T);
@@ -387,7 +387,7 @@ fn help_for_a_path_that_is_not_in_the_prelude() {
             "use absolute path: 'MyBound'",
             Some(
                 "write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it \
-                 with `LeakerConfig::allowed_paths`"
+                 with `LeakerConfig::allow_path()`"
             )
         )
     );
@@ -403,7 +403,7 @@ fn help_for_a_path_that_is_not_in_the_prelude() {
             "use absolute path: 'my_mod :: Clone'",
             Some(
                 "write `my_mod::Clone` with an absolute path (e.g. `::my_crate::my_mod::Clone`), \
-                 or allow it with `LeakerConfig::allowed_paths`"
+                 or allow it with `LeakerConfig::allow_path()`"
             )
         )
     );
@@ -425,9 +425,9 @@ fn help_for_a_path_that_is_not_in_the_prelude() {
         helps,
         [
             "write `crate::m::Bound` with an absolute path (e.g. `::my_crate::m::Bound`), or \
-             allow it with `LeakerConfig::allowed_paths`",
+             allow it with `LeakerConfig::allow_path()`",
             "write `super::Other` with an absolute path (e.g. `::my_crate::Other`), or allow it \
-             with `LeakerConfig::allowed_paths`"
+             with `LeakerConfig::allow_path()`"
         ]
     );
 }
@@ -457,7 +457,7 @@ fn help_in_syn_error() {
     assert_eq!(
         err.to_string(),
         "use absolute path: 'MyBound'\n\n  = help: write `MyBound` with an absolute path (e.g. \
-         `::my_crate::MyBound`), or allow it with `LeakerConfig::allowed_paths`\n"
+         `::my_crate::MyBound`), or allow it with `LeakerConfig::allow_path()`\n"
     );
 }
 
@@ -560,8 +560,8 @@ fn all_relative_paths_are_reported() {
         syn_err.into_iter().map(|e| e.to_string()).collect::<Vec<_>>(),
         vec![
             "use absolute path: 'Clone'\n\n  = help: use `::core::clone::Clone` instead of `Clone`\n",
-            "use absolute path: 'MyBound'\n\n  = help: write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it with `LeakerConfig::allowed_paths`\n",
-            "use absolute path: 'MyType < '_ >'\n\n  = note: it cannot be leaked as a whole because of `'_`\n  = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with `LeakerConfig::allowed_paths`\n",
+            "use absolute path: 'MyBound'\n\n  = help: write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it with `LeakerConfig::allow_path()`\n",
+            "use absolute path: 'MyType < '_ >'\n\n  = note: it cannot be leaked as a whole because of `'_`\n  = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with `LeakerConfig::allow_path()`\n",
         ]
     );
 }

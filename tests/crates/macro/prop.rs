@@ -93,6 +93,9 @@ pub(crate) struct Args {
     /// to write for the own `Self` of a nested item does not need it, and the parts of the item
     /// must be left as written all the same.
     no_nested_self: bool,
+    /// `TYPE_LEAK_PROP_FEATURES=allow_stages`: the macro also tells how many errors remain with
+    /// `LeakerConfig::allow_prelude()` and with `LeakerResult::allow_prelude()` ([`stages()`]).
+    stages: bool,
     /// Not an argument of the attribute: set by [`leak()`] when the item has errors and is accepted
     /// with the recovered Referrer (`prop_leak_accept`, `TYPE_LEAK_PROP_ACCEPT`). The Referrer copies
     /// such an item in the crate of its own that `tests/prop_cross_crate` makes for them (`accept`,
@@ -115,6 +118,7 @@ impl Parse for Args {
             values: false,
             nested_self_entries: false,
             no_nested_self: false,
+            stages: false,
             accepted: false,
         };
         for kv in Punctuated::<MetaNameValue, Token![,]>::parse_terminated(input)? {
@@ -139,6 +143,7 @@ impl Parse for Args {
                 ("values", Lit::Bool(b)) => args.values = b.value,
                 ("nested_self_entries", Lit::Bool(b)) => args.nested_self_entries = b.value,
                 ("no_nested_self", Lit::Bool(b)) => args.no_nested_self = b.value,
+                ("stages", Lit::Bool(b)) => args.stages = b.value,
                 ("accepted", Lit::Bool(b)) => args.accepted = b.value,
                 ("allow", Lit::Str(s)) => {
                     for path in s.value().split(',').filter(|p| !p.trim().is_empty()) {
@@ -159,6 +164,7 @@ impl Args {
         let (redeclare, values) = (self.redeclare, self.values);
         let (nested_self_entries, accepted) = (self.nested_self_entries, self.accepted);
         let no_nested_self = self.no_nested_self;
+        let stages = self.stages;
         let strict = self.strict.map(|strict| quote!(strict = #strict,));
         let scope = &self.scope;
         let allow = self
@@ -167,7 +173,7 @@ impl Args {
             .map(|p| quote!(#p).to_string().replace(' ', ""))
             .collect::<Vec<_>>()
             .join(",");
-        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict primitive = #primitive, relaxed_sized = #relaxed_sized, redeclare = #redeclare, values = #values, nested_self_entries = #nested_self_entries, no_nested_self = #no_nested_self, accepted = #accepted)
+        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict primitive = #primitive, relaxed_sized = #relaxed_sized, redeclare = #redeclare, values = #values, nested_self_entries = #nested_self_entries, no_nested_self = #no_nested_self, stages = #stages, accepted = #accepted)
     }
 }
 
@@ -208,7 +214,7 @@ fn analyze(item: &Item, args: &Args) -> (LeakerResult, ContextId, TokenStream) {
         config.allow_primitive();
     }
     if args.prelude {
-        config.allow_std_prelude();
+        config.allow_prelude();
     }
     if args.values {
         config.check_values();
@@ -216,7 +222,9 @@ fn analyze(item: &Item, args: &Args) -> (LeakerResult, ContextId, TokenStream) {
     if args.nested_self_entries {
         config.nested_self_entries();
     }
-    config.allowed_paths.extend(args.allow.iter().cloned());
+    for path in &args.allow {
+        config.allow_path(path.clone());
+    }
     let mut leaker = Leaker::from_config(config);
     let allow_self = args.allow_self;
     let context = match (args.scope.as_str(), item) {
@@ -278,6 +286,44 @@ fn analyze(item: &Item, args: &Args) -> (LeakerResult, ContextId, TokenStream) {
     };
     let assertions = leaker.assertions();
     (leaker.result(), context, assertions)
+}
+
+/// The errors that remain with `allow_prelude()` given to the config (`before`) and given to the
+/// result of the analysis without it (`after`), with the primitive types allowed, for
+/// `TYPE_LEAK_PROP_FEATURES=allow_stages`: the
+/// number of errors of the analysis without the prelude, `before` and `after`, then the causes of
+/// `before` and of `after`, separated by `\u{1f}`. The two numbers should be equal.
+fn stages(item: &Item, args: &Args) -> String {
+    let causes = |result: &LeakerResult| -> String {
+        let text = |error: &ErrorItem| error.cause.to_token_stream().to_string();
+        let joined = result
+            .errors()
+            .iter()
+            .map(text)
+            .collect::<Vec<_>>()
+            .join(" ; ");
+        joined.replace(['\n', '|', '\u{1f}', '\u{1d}', '\u{1e}'], " ")
+    };
+    // The primitive types are allowed, so that the prelude is the only path rule that differs: with
+    // `u8` relative, `Into<u8>` is an error with a relative path that `allow_prelude()` leaves.
+    let mut plain_args = args.clone();
+    plain_args.prelude = false;
+    plain_args.primitive = true;
+    let mut prelude_args = args.clone();
+    prelude_args.prelude = true;
+    prelude_args.primitive = true;
+    let (plain, _, _) = analyze(item, &plain_args);
+    let (before, _, _) = analyze(item, &prelude_args);
+    let mut after = plain.clone();
+    after.allow_prelude();
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        plain.errors().len(),
+        before.errors().len(),
+        after.errors().len(),
+        causes(&before),
+        causes(&after)
+    )
 }
 
 /// The analysis of `item` as [`crate::bare::check()`] compares them: the Referrer if no error remains,
@@ -2000,6 +2046,18 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
     let mac_name = ident(&format!("__tl_prop_{}", id));
     let dollar = dollar();
     let (result, context, assertions) = analyze(&original, &args);
+    // `allow_stages`: what the two stages leave (nothing is emitted otherwise).
+    let stages_macro = if args.stages {
+        let name = ident(&format!("__tl_stages_{}", id));
+        let text = stages(&original, &args);
+        quote! {
+            #[doc(hidden)]
+            #[macro_export]
+            macro_rules! #name { () => { #text }; }
+        }
+    } else {
+        TokenStream::new()
+    };
     // The bare spelling of a trait of the prelude: its twin in full gives the same entries if the
     // names of the prelude are allowed, and it is a relative path if they are not.
     let first = result
@@ -2036,6 +2094,7 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
             }
             return Ok(quote! {
                 #original
+                #stages_macro
                 #[doc(hidden)]
                 #[macro_export]
                 macro_rules! #report_name { () => { #report }; }
@@ -2138,6 +2197,7 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
     Ok(quote! {
         #head
         #tail
+        #stages_macro
         #[doc(hidden)]
         #[macro_export]
         macro_rules! #report_name { () => { #report }; }

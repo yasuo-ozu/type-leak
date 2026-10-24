@@ -1,19 +1,25 @@
 //! Configuration of the [`Leaker`](crate::Leaker).
 
-use crate::util::std_prelude_paths;
+use crate::allow::Allow;
+use crate::error::Cause;
 #[cfg(doc)]
 use crate::view::View;
 use syn::*;
 
-/// The paths that a [`Leaker`](crate::Leaker) leaves as written instead of leaking them, and its
-/// options. Pass it to [`Leaker::from_config()`](crate::Leaker::from_config).
+/// What a [`Leaker`](crate::Leaker) reads, leaves as written and accepts. Pass it to
+/// [`Leaker::from_config()`](crate::Leaker::from_config).
+///
+/// The `allow*` methods are those of [`LeakerResult`](crate::LeakerResult), and accept the same
+/// errors: `from_config(config.allow_prelude())` and `from_config(config).result().allow_prelude()`
+/// both drop them. Here the path rules also make the paths context-free during the analysis, so
+/// they are not leaked at all; on a result they only drop the errors.
 ///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
 /// let mut config = LeakerConfig::new();
-/// config.allow_primitive().allow_std_prelude();
-/// config.allowed_paths.push(parse_quote!(::serde)); // you promise it is the same crate on both sides
+/// config.allow_primitive().allow_prelude();
+/// config.allow_path(parse_quote!(::serde)); // you promise it is the same crate on both sides
 /// let mut leaker = Leaker::from_config(config);
 /// // `Vec` and `u8` are allowed, so only `MyType` is leaked.
 /// let item: ItemStruct = parse_quote!(struct S { a: Vec<u8>, b: MyType });
@@ -22,10 +28,8 @@ use syn::*;
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LeakerConfig {
-    /// The allowed paths. See [`Leaker::allowed_paths`](crate::Leaker::allowed_paths), which also
-    /// tells what happens to an absolute path that is not allowed. Allow only crates that are the
-    /// same on both sides.
-    pub allowed_paths: Vec<Path>,
+    /// Set by the `allow*()` methods.
+    pub(crate) allow: Allow,
     /// Set by [`LeakerConfig::check_values()`].
     pub(crate) check_values: bool,
     /// Set by [`LeakerConfig::nested_self_entries()`].
@@ -33,7 +37,7 @@ pub struct LeakerConfig {
 }
 
 impl LeakerConfig {
-    /// Creates a configuration that allows no path and does not check values.
+    /// Creates a configuration that allows nothing and does not check values.
     pub fn new() -> Self {
         Default::default()
     }
@@ -63,7 +67,7 @@ impl LeakerConfig {
     /// `Self`, in scope: the rules for `Self`, for lifetimes and for what a type can be written
     /// with are the same. It is an entry if its path is relative, a required one, and an optional
     /// one if only a path of another crate makes it so
-    /// ([`allowed_paths`](crate::Leaker::allowed_paths)), as a type of a signature is. So the
+    /// ([`allow_path()`](LeakerConfig::allow_path)), as a type of a signature is. So the
     /// macro emits the impl of the Repeater for it as for the others, and
     /// [`Referrer::required()`](crate::Referrer::required) lists it. A bare identifier argument
     /// (`size_of::<Rel>()`) is read as a type, as in an enum discriminant: if it is a const
@@ -72,9 +76,9 @@ impl LeakerConfig {
     /// rejected; the parts of it are leaked.
     ///
     /// **A path that is not a type is rejected** unless it means the same wherever it is written:
-    /// it is absolute or starts with `$crate`, it is allowed ([`allowed_paths`](LeakerConfig::allowed_paths),
+    /// it is absolute or starts with `$crate`, it is allowed ([`allow_path()`](LeakerConfig::allow_path),
     /// also the names of [`allow_primitive()`](LeakerConfig::allow_primitive) and
-    /// [`allow_std_prelude()`](LeakerConfig::allow_std_prelude): `Some` and `None` are not among
+    /// [`allow_prelude()`](LeakerConfig::allow_prelude): `Some` and `None` are not among
     /// them, write `::core::option::Option::Some`), it starts with a generic or `Self` in scope,
     /// or with a name that the value itself declares (a `let` binding, a closure or function
     /// parameter, a `match`, `if let` or `for` pattern, an item or a `use` in a block). The name
@@ -236,27 +240,43 @@ impl LeakerConfig {
         self
     }
 
+    /// Accepts the errors with an equal cause (the same kind and tokens, spans ignored): the part
+    /// is copied as written. See [`LeakerResult::allow()`](crate::LeakerResult::allow).
+    pub fn allow(&mut self, cause: Cause) -> &mut Self {
+        self.allow.cause(cause);
+        self
+    }
+
+    /// Leaves the paths that start with `path` as written instead of leaking them, such as
+    /// `::serde`.
+    ///
+    /// A path matches if it starts with `path` and both have a leading `::` or neither:
+    /// `parse_quote!(::serde)` allows `::serde::..` and not `serde::..`. Its generic arguments are
+    /// still analyzed. You promise that an allowed crate is the same on both sides.
+    ///
+    /// Another absolute path, such as `::serde::Wrap<(Rel,)>`, may name a different crate in the
+    /// copy, which the Leaker cannot tell. So it is leaked as an *optional entry*
+    /// ([`Referrer::must()`](crate::Referrer::must) is `false`), and the Referrer chooses whether a
+    /// copy replaces it ([`Referrer::allow_ambiguous_crate_name()`](crate::Referrer::allow_ambiguous_crate_name)).
+    /// `::core::..` and `$crate::..` are never optional, and `::std` and `::alloc` are like any
+    /// other crate unless allowed.
+    /// [`Referrer::external_crates_require()`](crate::Referrer::external_crates_require) lists the
+    /// crates an entry names.
+    ///
+    /// Not so for an absolute type that names the `Self` of a struct, an enum or a union nested in
+    /// the analyzed syntax (`::serde::Wrap<Self>` in [`View::visit_item()`]): it is copied as
+    /// written whatever the Referrer chooses, so that its `Self` is the copy's own type (see
+    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self)).
+    ///
+    /// On a [`LeakerResult`](crate::LeakerResult) an absolute path changes nothing: the entries stay.
+    pub fn allow_path(&mut self, path: Path) -> &mut Self {
+        self.allow.path(path);
+        self
+    }
+
     /// Allows the primitive types (`u8`, `bool`, `str`, ...).
     pub fn allow_primitive(&mut self) -> &mut Self {
-        self.allowed_paths.extend([
-            parse_quote!(bool),
-            parse_quote!(char),
-            parse_quote!(str),
-            parse_quote!(u8),
-            parse_quote!(u16),
-            parse_quote!(u32),
-            parse_quote!(u64),
-            parse_quote!(u128),
-            parse_quote!(usize),
-            parse_quote!(i8),
-            parse_quote!(i16),
-            parse_quote!(i32),
-            parse_quote!(i64),
-            parse_quote!(i128),
-            parse_quote!(isize),
-            parse_quote!(f32),
-            parse_quote!(f64),
-        ]);
+        self.allow.primitive();
         self
     }
 
@@ -293,15 +313,23 @@ impl LeakerConfig {
     /// assert!(leaker.result().finish().is_err());
     ///
     /// let mut config = LeakerConfig::new();
-    /// config.allow_std_prelude();
+    /// config.allow_prelude();
     /// let mut leaker = Leaker::from_config(config);
     /// leaker.intern_trait(&item, true);
     /// // `Clone` and `Vec` are left as written. The only entry is `Vec<Rel>`: a bare `Rel` may be
     /// // a const, so the type that holds it is leaked whole.
     /// assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
     /// ```
-    pub fn allow_std_prelude(&mut self) -> &mut Self {
-        self.allowed_paths.extend(std_prelude_paths());
+    pub fn allow_prelude(&mut self) -> &mut Self {
+        self.allow.prelude();
+        self
+    }
+
+    /// Allows the relative paths that start with `std`, `core` or `alloc`.
+    ///
+    /// A path with a leading `::` is not one of them, and is context-free in any case.
+    pub fn allow_std_crates(&mut self) -> &mut Self {
+        self.allow.std_crates();
         self
     }
 
@@ -326,7 +354,22 @@ impl LeakerConfig {
     /// assert!(leaker.result().finish().unwrap().is_empty());
     /// ```
     pub fn allow_crate(&mut self) -> &mut Self {
-        self.allowed_paths.push(parse_quote!(crate));
+        self.allow.crate_root();
+        self
+    }
+
+    /// Accepts the errors found in a value: a const or static value, the body of a function, a
+    /// trait's default value or body. It has an effect with [`check_values()`](LeakerConfig::check_values)
+    /// only.
+    pub fn allow_values(&mut self) -> &mut Self {
+        self.allow.values();
+        self
+    }
+
+    /// Accepts the errors found in a default: a default body or an associated const default of a
+    /// trait, and the default of a generic parameter (`U = Rel<'_>`, `T = Wrap<Self>`).
+    pub fn allow_default(&mut self) -> &mut Self {
+        self.allow.defaults();
         self
     }
 }

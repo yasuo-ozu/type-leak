@@ -34,7 +34,7 @@ fn slots() -> RepeaterSlots {
 
 fn config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     config
 }
 
@@ -919,7 +919,7 @@ fn items_has_every_offending_path() {
         items[1].help_text(),
         Some(
             "write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it \
-             with `LeakerConfig::allowed_paths`"
+             with `LeakerConfig::allow_path()`"
         )
     );
     assert!(items[2]

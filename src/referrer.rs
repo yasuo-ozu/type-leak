@@ -534,7 +534,7 @@ impl Referrer {
     /// An entry is optional if only its own path is an absolute path that names an external crate.
     /// [`Referrer::allow_ambiguous_crate_name()`] then decides whether it is replaced. Other
     /// entries are required and always replaced, and need a Repeater impl. Required entries have
-    /// the smaller indices. See [`Leaker::allowed_paths`](crate::Leaker::allowed_paths) for the
+    /// the smaller indices. See [`LeakerConfig::allow_path()`](crate::LeakerConfig::allow_path) for the
     /// paths that are not optional entries.
     ///
     /// Only types are optional entries. An absolute path in a bound, in an expression of a value

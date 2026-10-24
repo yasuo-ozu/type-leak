@@ -26,8 +26,16 @@ fn messages(errors: &[ErrorItem]) -> String {
 }
 
 fn leaker() -> Leaker {
+    leaker_allowing(&[])
+}
+
+/// Like `leaker()`, with the paths `allowed` too.
+fn leaker_allowing(allowed: &[&str]) -> Leaker {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
+    for path in allowed {
+        config.allow_path(parse_str(path).unwrap());
+    }
     Leaker::from_config(config)
 }
 
@@ -1185,8 +1193,7 @@ fn the_standard_traits_do_not_define_an_associated_type() {
         ))
         .unwrap();
         // The relative names are allowed paths, as the prelude's are in `leaker()`.
-        let mut leaker = leaker();
-        leaker.allowed_paths.push(parse_str(name).unwrap());
+        let mut leaker = leaker_allowing(&[name]);
         match &item {
             Item::Trait(item) => leaker.intern_trait(item, true),
             _ => unreachable!(),
@@ -1215,10 +1222,7 @@ fn the_standard_traits_do_not_define_an_associated_type() {
             name
         ))
         .unwrap();
-        let mut leaker = leaker();
-        for allowed in ["MyTrait", "p::Tr", "::p"] {
-            leaker.allowed_paths.push(parse_str(allowed).unwrap());
-        }
+        let mut leaker = leaker_allowing(&["MyTrait", "p::Tr", "::p"]);
         match &item {
             Item::Trait(item) => leaker.intern_trait(item, true),
             _ => unreachable!(),
@@ -1244,10 +1248,7 @@ fn the_standard_traits_do_not_define_an_associated_type() {
             name
         ))
         .unwrap();
-        let mut leaker = leaker();
-        for allowed in ["MyTrait", "p::Tr", "::p"] {
-            leaker.allowed_paths.push(parse_str(allowed).unwrap());
-        }
+        let mut leaker = leaker_allowing(&["MyTrait", "p::Tr", "::p"]);
         match &item {
             Item::Trait(item) => leaker.intern_trait(item, true),
             _ => unreachable!(),

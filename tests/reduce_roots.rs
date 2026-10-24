@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, ErrorItem, Leaker};
+use type_leak::{to_syn_error, ErrorItem, Leaker, LeakerConfig};
 
 #[test]
 fn test_reduce_roots_empty_leaker() {
@@ -252,8 +252,9 @@ fn test_reduce_roots_prefers_inner_type_on_a_tie() {
 fn test_reduce_roots_allowed_path_is_neutral() {
     // A type under an explicitly allowed path prefix is neutral → empty.
     let item: ItemStruct = parse_quote! { struct S { a: some_mod::SomeType } };
-    let mut leaker = Leaker::new();
-    leaker.allowed_paths.push(parse_quote!(some_mod));
+    let mut config = LeakerConfig::new();
+    config.allow_path(parse_quote!(some_mod));
+    let mut leaker = Leaker::from_config(config);
     leaker.intern_struct(&item, true);
     leaker.reduce_roots();
     assert!(leaker.result().finish().unwrap().is_empty());

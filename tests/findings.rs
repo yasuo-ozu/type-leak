@@ -103,7 +103,7 @@ use type_leak::*;
 /// allowed.
 fn new_leaker() -> Leaker {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     Leaker::from_config(config)
 }
 
@@ -1810,8 +1810,8 @@ fn self_referential_entries(referrer: &Referrer) -> Vec<String> {
 /// The Leaker of F13: `::p` is allowed.
 fn f13_leaker() -> Leaker {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
-    config.allowed_paths.push(parse_quote!(::p));
+    config.allow_primitive().allow_prelude();
+    config.allow_path(parse_quote!(::p));
     Leaker::from_config(config)
 }
 
@@ -2174,8 +2174,8 @@ impl<'ast> Visit<'ast> for SelfProjectionsInPredicates {
 /// or not, and whether the Leaker accepts `item`.
 fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, Vec<ErrorItem>> {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
-    config.allowed_paths.push(parse_quote!(::p));
+    config.allow_primitive().allow_prelude();
+    config.allow_path(parse_quote!(::p));
     let mut leaker = Leaker::from_config(config);
     let context = leaker.intern_impl(item, true);
     let mut referrer = leaker.result().finish()?;
@@ -3084,7 +3084,7 @@ fn f17_optional_entry_in_own_context() {
 /// F18 (fixed): a strict Referrer replaced the optional entry that holds a lifetime of a method, so
 /// the copy did not have it where the original did.
 ///
-/// `Leaker::allowed_paths` docs: an absolute path of a crate that the Leaker does not allow is an
+/// `LeakerConfig::allow_path()` docs: an absolute path of a crate that the Leaker does not allow is an
 /// optional entry, which a Referrer leaves as written by default and replaces if it is strict
 /// (`allow_ambiguous_crate_name(false)`). Trigger:
 /// `trait Tr { fn m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>; }`. In the trait, `'x` is
@@ -3141,7 +3141,7 @@ fn f18_strict_referrer_keeps_the_optional_type_that_holds_a_method_lifetime() {
         copy
     };
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
 
     // Every Referrer keeps the optional type, which holds `'x`; `Rel<'x>` is replaced.
     let expected: ItemTrait = parse_quote!(
@@ -3155,7 +3155,7 @@ fn f18_strict_referrer_keeps_the_optional_type_that_holds_a_method_lifetime() {
         assert_eq!(string(&copy), string(&expected), "strict {}", strict);
     }
     // With the crate allowed it is not an entry, for either.
-    config.allowed_paths.push(parse_quote!(::ext));
+    config.allow_path(parse_quote!(::ext));
     assert_eq!(held(&copy_of(config.clone(), false)), ["'x"]);
     assert_eq!(held(&copy_of(config, true)), ["'x"]);
 }
@@ -8590,7 +8590,7 @@ fn f37_a_default_that_names_self_with_a_bound_that_names_it_is_rejected() {
         pub struct S<T: ::core::convert::AsRef<Self>, U = Rel2<Self, T>>(pub T, pub U);
     );
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     let mut with_option = config.clone();
     with_option.nested_self_entries();
     for config in [config, with_option] {
@@ -9920,7 +9920,7 @@ fn f39_a_nested_struct_has_no_self_in_the_entry_of_the_default() {
 /// has it: primitive types and the names of the standard prelude are allowed.
 fn values_config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude().check_values();
+    config.allow_primitive().allow_prelude().check_values();
     config
 }
 
@@ -10879,7 +10879,7 @@ fn f41_the_controls_are_unchanged() {
             let mut with_option = LeakerConfig::new();
             with_option
                 .allow_primitive()
-                .allow_std_prelude()
+                .allow_prelude()
                 .nested_self_entries();
             let option = nested_analysis_in(Leaker::from_config(with_option), nest, item, &[name]);
             assert_eq!(
@@ -10914,7 +10914,7 @@ fn nested_self_leaker() -> Leaker {
     let mut config = LeakerConfig::new();
     config
         .allow_primitive()
-        .allow_std_prelude()
+        .allow_prelude()
         .nested_self_entries();
     Leaker::from_config(config)
 }
@@ -11337,7 +11337,7 @@ fn without_parts(referrer: &Referrer) -> Referrer {
 /// The config of `new_leaker()`.
 fn std_config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     config
 }
 
@@ -11613,7 +11613,7 @@ fn f43_an_unwritable_part_is_serialized_and_read_back() {
 /// absolute), and the prelude and the primitives.
 fn f44_config() -> LeakerConfig {
     let mut config = std_config();
-    config.allowed_paths.push(parse_quote!(::p));
+    config.allow_path(parse_quote!(::p));
     config
 }
 
@@ -11855,7 +11855,7 @@ fn f46_the_help_for_a_relative_std_path_suggests_the_crate_itself() {
     let help = |path: &str, example: &str| {
         format!(
             "write `{}` with an absolute path (e.g. `{}`), or allow it with \
-             `LeakerConfig::allowed_paths`",
+             `LeakerConfig::allow_path()`",
             path, example
         )
     };

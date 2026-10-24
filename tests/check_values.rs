@@ -16,7 +16,7 @@ use type_leak::*;
 
 fn config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude().check_values();
+    config.allow_primitive().allow_prelude().check_values();
     config
 }
 
@@ -277,7 +277,7 @@ fn the_std_prelude_and_the_primitives_are_allowed_only_if_asked() {
     );
     assert_eq!(entries(only_primitive, types), ["Vec < u8 >"]);
     let mut only_prelude = LeakerConfig::new();
-    only_prelude.allow_std_prelude().check_values();
+    only_prelude.allow_prelude().check_values();
     assert_eq!(
         messages_of(only_prelude.clone(), source),
         Vec::<String>::new()
@@ -299,7 +299,7 @@ fn the_name_of_the_item_itself_is_relative() {
 
 #[test]
 fn the_names_of_the_2021_prelude_are_relative_in_a_value() {
-    // Like in a type: a crate of the 2018 edition has no `Some` (see `allow_std_prelude`).
+    // Like in a type: a crate of the 2018 edition has no `Some` (see `allow_prelude`).
     let got = body_messages("let _ = Some(p);");
     assert_eq!(got, rejected("Some"));
     let item: ItemTrait = parse_quote!(
@@ -319,7 +319,7 @@ fn the_names_of_the_2021_prelude_are_relative_in_a_value() {
     );
     // An allowed path is accepted.
     let mut config = config();
-    config.allowed_paths.push(parse_quote!(Some));
+    config.allow_path(parse_quote!(Some));
     let mut leaker = Leaker::from_config(config);
     leaker.intern_trait(&item, true);
     let result = leaker.result();
@@ -405,7 +405,7 @@ fn a_relative_macro_path_says_what_to_write() {
         err[0].help_text(),
         Some(
             "write `my_mac!` with an absolute path (e.g. `::my_crate::my_mac!`), or allow it with \
-             `LeakerConfig::allowed_paths`"
+             `LeakerConfig::allow_path()`"
         )
     );
 }
@@ -778,7 +778,7 @@ fn the_types_are_leaked_as_ever() {
             .collect()
     };
     let mut without = LeakerConfig::new();
-    without.allow_primitive().allow_std_prelude();
+    without.allow_primitive().allow_prelude();
     assert_eq!(entries(config()), entries(without));
     let mut found = entries(config());
     found.sort();
@@ -833,7 +833,7 @@ fn ordinary_bodies_are_accepted() {
     // names: allow them one by one.
     for name in ["Ok", "Some", "None", "vec"] {
         let ident = Ident::new(name, proc_macro2::Span::call_site());
-        config.allowed_paths.push(parse_quote!(#ident));
+        config.allow_path(parse_quote!(#ident));
     }
     let mut leaker = Leaker::from_config(config);
     leaker.intern_trait(&item, true);

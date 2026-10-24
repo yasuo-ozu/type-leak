@@ -35,7 +35,7 @@ pub(crate) fn path_starts_with(path: &Path, prefix: &Path) -> bool {
             .all(|(prefix_seg, seg)| prefix_seg.ident == seg.ident)
 }
 
-/// The paths a Leaker treats as context-free: a copy of its `allowed_paths` taken when an analysis
+/// The paths a Leaker treats as context-free: a copy of its allowed paths taken when an analysis
 /// starts, shared by the throwaway visitors of that analysis.
 #[derive(Clone)]
 pub(crate) struct AllowedPaths(Rc<[Path]>);
@@ -73,7 +73,16 @@ impl AllowedPaths {
     }
 }
 
-/// The names of the standard prelude that `LeakerConfig::allow_std_prelude()` allows.
+/// The primitive type names that `allow_primitive()` allows.
+pub(crate) fn primitive_paths() -> Vec<Path> {
+    const NAMES: [&str; 17] = [
+        "bool", "char", "str", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32",
+        "i64", "i128", "isize", "f32", "f64",
+    ];
+    NAMES.iter().map(|name| crate_path(name)).collect()
+}
+
+/// The names of the standard prelude that `allow_prelude()` allows.
 pub(crate) fn std_prelude_paths() -> Vec<Path> {
     const NAMES: [&str; 31] = [
         "Box",
@@ -111,7 +120,7 @@ pub(crate) fn std_prelude_paths() -> Vec<Path> {
     NAMES.iter().map(|name| crate_path(name)).collect()
 }
 
-/// The crates that `LeakerResult::allow_std_crates()` allows.
+/// The crates that `allow_std_crates()` allows.
 pub(crate) fn std_crate_paths() -> Vec<Path> {
     ["std", "core", "alloc"]
         .iter()

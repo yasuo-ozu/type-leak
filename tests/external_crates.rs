@@ -1,5 +1,5 @@
 //! Tests for the types with the absolute path of an external crate (`::foo::X`), which are optional
-//! entries of the Referrer: the Leaker's `allowed_paths`, `Referrer::must()`,
+//! entries of the Referrer: `LeakerConfig::allow_path()`, `Referrer::must()`,
 //! `Referrer::external_crates_require()` and `Referrer::allow_ambiguous_crate_name()`.
 
 mod common;
@@ -27,7 +27,7 @@ fn leaker_allowing(allowed: &[&str]) -> Leaker {
     config.allow_primitive();
     for name in allowed {
         let ident: Ident = parse_str(name).unwrap();
-        config.allowed_paths.push(parse_quote!(::#ident));
+        config.allow_path(parse_quote!(::#ident));
     }
     Leaker::from_config(config)
 }
@@ -261,7 +261,7 @@ fn allowed_absolute_path_is_never_a_node() {
     );
     // An allowed relative path allows the relative paths only: an absolute one is a node.
     let mut config = LeakerConfig::new();
-    config.allowed_paths.push(parse_quote!(my));
+    config.allow_path(parse_quote!(my));
     let mut leaker = Leaker::from_config(config);
     let item: ItemTrait = parse_quote! {
         trait T {
@@ -275,7 +275,7 @@ fn allowed_absolute_path_is_never_a_node() {
     );
     // The more specific path may be allowed alone.
     let mut config = LeakerConfig::new();
-    config.allowed_paths.push(parse_quote!(::foo::inner));
+    config.allow_path(parse_quote!(::foo::inner));
     let mut leaker = Leaker::from_config(config);
     let item: ItemTrait = parse_quote! {
         trait T {
@@ -290,7 +290,7 @@ fn allowed_absolute_path_is_never_a_node() {
     // `check()` of the same.
     let ty: Type = parse_quote!(::foo::W<(Rel,)>);
     let mut config = LeakerConfig::new();
-    config.allowed_paths.push(parse_quote!(::foo));
+    config.allow_path(parse_quote!(::foo));
     let result = check_in(&mut Leaker::from_config(config), &ty, &Generics::default());
     assert_eq!(
         result.must.iter().map(squash).collect::<Vec<_>>(),

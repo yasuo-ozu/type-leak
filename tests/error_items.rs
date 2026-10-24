@@ -11,27 +11,60 @@
 //! The errors are reported at the same places after the round trip: see `tests/diagnostic.rs` (a
 //! macro that does it, and rustc) and `tests/crates/spans` (the lines and the columns).
 
+mod common;
+
+use common::Rule;
+use std::cell::RefCell;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::ToTokens;
 use type_leak::*;
 
+thread_local! {
+    /// The rules that `configured()` adds to the config of a trigger: the config stage of the
+    /// tests that compare it with the result stage. Empty in the thread of any other test.
+    static RULES: RefCell<Vec<Rule>> = RefCell::new(Vec::new());
+}
+
+/// `config`, with the rules of `with_rules()`.
+fn configured(mut config: LeakerConfig) -> LeakerConfig {
+    RULES.with(|rules| {
+        for rule in rules.borrow().iter() {
+            rule.on_config(&mut config);
+        }
+    });
+    config
+}
+
+/// The Leaker of the triggers: `Leaker::from_config(config)` with the rules of `with_rules()`.
+fn leaker_from(config: LeakerConfig) -> Leaker {
+    Leaker::from_config(configured(config))
+}
+
+/// Runs `f` with `rules` added to the config of the triggers.
+fn with_rules<R>(rules: &[Rule], f: impl FnOnce() -> R) -> R {
+    RULES.with(|set| *set.borrow_mut() = rules.to_vec());
+    let result = f();
+    RULES.with(|set| set.borrow_mut().clear());
+    result
+}
+
 /// The config of the triggers with `::p` allowed (the crate of the property test).
 fn allowing_config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
-    config.allowed_paths.push(parse_quote!(::p));
+    config.allow_primitive().allow_prelude();
+    config.allow_path(parse_quote!(::p));
     config
 }
 
 fn allowing() -> Leaker {
-    Leaker::from_config(allowing_config())
+    leaker_from(allowing_config())
 }
 
 /// The config of the triggers that read the values of the items too.
 fn reading_values_config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude().check_values();
+    config.allow_primitive().allow_prelude().check_values();
     config
 }
 
@@ -102,7 +135,7 @@ fn trait_result(source: &str, check_values: bool) -> LeakerResult {
     } else {
         allowing_config()
     };
-    run(Leaker::from_config(config), |leaker| {
+    run(leaker_from(config), |leaker| {
         leaker.intern_trait(&item, true)
     })
 }
@@ -121,7 +154,7 @@ fn relative_path() -> LeakerResult {
             fn f(&self, a: MyType<'_>);
         }
     );
-    run(Leaker::from_config(LeakerConfig::new()), |leaker| {
+    run(leaker_from(LeakerConfig::new()), |leaker| {
         leaker.intern_trait(&item, true)
     })
 }
@@ -137,7 +170,7 @@ fn reason_relative_path() {
 
 /// `Self` where no scope declares it.
 fn self_without_meaning() -> LeakerResult {
-    run(Leaker::from_config(allowing_config()), |leaker| {
+    run(leaker_from(allowing_config()), |leaker| {
         leaker.enter_generics(&Generics::default(), |view| {
             view.visit_type(&parse_quote!(Rel<Self>));
             view.visit_type(&parse_quote!(Wrap<Self::Item>));
@@ -202,7 +235,7 @@ fn maybe_const() -> LeakerResult {
             a: ::p::W<[Self], LEN>,
         }
     );
-    run(Leaker::from_config(allowing_config()), |leaker| {
+    run(leaker_from(allowing_config()), |leaker| {
         leaker.intern_struct(&item, false)
     })
 }
@@ -252,7 +285,7 @@ fn self_projection() -> LeakerResult {
             fn f(&self, x: Wrap<Self::A>) {}
         }
     );
-    run(Leaker::from_config(allowing_config()), |leaker| {
+    run(leaker_from(allowing_config()), |leaker| {
         leaker.intern_impl(&item, true)
     })
 }
@@ -278,7 +311,7 @@ fn reason_self_projection() {
 
 /// A bound of an outer trait that names its `Self`, for a type in an item nested in it.
 fn unnameable_self() -> LeakerResult {
-    run(Leaker::from_config(allowing_config()), |leaker| {
+    run(leaker_from(allowing_config()), |leaker| {
         leaker.enter_trait(&id("Tr"), &parse_quote!(<T: AsRef<Self>>), true, |view| {
             view.visit_item(&parse_quote!(
                 impl ::p::W for X {
@@ -325,7 +358,7 @@ fn denied_self_in_bounds() -> LeakerResult {
             fn f<T: ::core::cmp::PartialEq<Self>>(&self, x: Wrap<T>);
         }
     );
-    run(Leaker::from_config(allowing_config()), |leaker| {
+    run(leaker_from(allowing_config()), |leaker| {
         leaker.intern_trait(&item, false)
     })
 }
@@ -339,7 +372,7 @@ fn reason_denied_self_in_bounds() {
 
 /// A type that names the `Self` of a nested struct, with a generic whose bound names it too.
 fn nested_self_in_bounds() -> LeakerResult {
-    run(Leaker::from_config(allowing_config()), |leaker| {
+    run(leaker_from(allowing_config()), |leaker| {
         leaker.enter_mod("m", [id("S")], |view| {
             view.visit_item(&parse_quote!(
                 struct S<T: ::core::convert::AsRef<Self>>(Rel2<Self, T>);
@@ -369,7 +402,7 @@ fn unprovable_bound() -> LeakerResult {
         {
         }
     );
-    run(Leaker::from_config(allowing_config()), |leaker| {
+    run(leaker_from(allowing_config()), |leaker| {
         leaker.intern_trait(&item, true)
     })
 }
@@ -390,7 +423,7 @@ fn self_in_trait_predicate() -> LeakerResult {
         {
         }
     );
-    run(Leaker::from_config(allowing_config()), |leaker| {
+    run(leaker_from(allowing_config()), |leaker| {
         leaker.intern_trait(&item, true)
     })
 }
@@ -412,7 +445,7 @@ fn self_in_impl_self_type() -> LeakerResult {
     let item: ItemImpl = parse_quote!(
         impl<T> S<T> where T: AsRef<Option<Self>> {}
     );
-    run(Leaker::from_config(allowing_config()), |leaker| {
+    run(leaker_from(allowing_config()), |leaker| {
         leaker.intern_impl(&item, true)
     })
 }
@@ -473,7 +506,7 @@ fn lifetime() -> LeakerResult {
     let item: ItemTrait = parse_quote!(
         trait Tr: ::p::Sup<&'a Self> {}
     );
-    run(Leaker::from_config(allowing_config()), |leaker| {
+    run(leaker_from(allowing_config()), |leaker| {
         leaker.intern_trait(&item, false)
     })
 }
@@ -795,6 +828,9 @@ fn assert_same(read: &ErrorItem, item: &ErrorItem) {
     assert_eq!(read.message, item.message);
     assert_eq!(notes_of(read), notes_of(item), "{}", item.message);
     assert_eq!(help_of(read), help_of(item), "{}", item.message);
+    assert_eq!(read.in_value, item.in_value, "{}", item.message);
+    assert_eq!(read.in_default, item.in_default, "{}", item.message);
+    assert_eq!(read.paths, item.paths, "{}", item.message);
 }
 
 #[test]
@@ -861,7 +897,7 @@ fn the_serialized_form_is_one_brace_group_for_each_item() {
         "{ type (MyType < '_ >) RelativePath \"use absolute path: 'MyType < '_ >'\" \
          [('_) \"it cannot be leaked as a whole because of `'_`\"] \
          (MyType) \"write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it \
-         with `LeakerConfig::allowed_paths`\" }"
+         with `LeakerConfig::allow_path()`\" paths [MyType] }"
     );
     // A serialization is not a report: it is no `compile_error!`.
     let all: proc_macro2::TokenStream = items.iter().map(ToTokens::to_token_stream).collect();
@@ -900,6 +936,51 @@ fn the_help_is_optional_and_so_are_the_notes() {
     .unwrap();
     assert_eq!(two.len(), 2);
     assert_item(&two[1], Reason::Unreadable, "trait", "B");
+}
+
+#[test]
+fn the_place_and_the_paths_follow_the_help_and_are_written_only_if_set() {
+    // Neither is written for an error that has no place and no path.
+    let plain = parse_item(r#"{ type ( A ) RelativePath "m" [] ( B ) "h" }"#).unwrap();
+    assert!(!plain.in_value && !plain.in_default && plain.paths.is_empty());
+    assert_eq!(
+        plain.to_token_stream().to_string(),
+        r#"{ type (A) RelativePath "m" [] (B) "h" }"#
+    );
+    // After the help, or after the notes if there is none, in this order.
+    let placed = parse_item(
+        r#"{ type ( A ) RelativePath "m" [] ( B ) "h" value default paths [ a :: b , :: c , Self , crate :: d ] }"#,
+    )
+    .unwrap();
+    assert!(placed.in_value && placed.in_default);
+    let paths: Vec<String> = placed.paths.iter().map(text_of).collect();
+    assert_eq!(paths, ["a :: b", ":: c", "Self", "crate :: d"]);
+    assert_eq!(
+        placed.to_token_stream().to_string(),
+        r#"{ type (A) RelativePath "m" [] (B) "h" value default paths [a :: b , :: c , Self , crate :: d] }"#
+    );
+    let only_default = parse_item(r#"{ type ( A ) RelativePath "m" [] default }"#).unwrap();
+    assert!(!only_default.in_value && only_default.in_default && only_default.help.is_none());
+    assert_eq!(
+        only_default.to_token_stream().to_string(),
+        r#"{ type (A) RelativePath "m" [] default }"#
+    );
+    // Empty paths are the same as none, in any order of the words.
+    let empty = parse_item(r#"{ type ( A ) RelativePath "m" [] paths [] default value }"#).unwrap();
+    assert!(empty.in_value && empty.in_default && empty.paths.is_empty());
+    assert_eq!(
+        empty.to_token_stream().to_string(),
+        r#"{ type (A) RelativePath "m" [] value default }"#
+    );
+    // A word that is none of them, or a path with arguments, is refused.
+    let error = parse_item(r#"{ type ( A ) RelativePath "m" [] values }"#).unwrap_err();
+    assert!(
+        error.to_string().contains("unknown field `values`"),
+        "{}",
+        error
+    );
+    assert!(parse_item(r#"{ type ( A ) RelativePath "m" [] paths [ a < b > ] }"#).is_err());
+    assert!(parse_item(r#"{ type ( A ) RelativePath "m" [] paths a }"#).is_err());
 }
 
 #[test]
@@ -1019,7 +1100,7 @@ fn an_item_has_a_message_notes_and_help_and_is_an_error() {
         item.help_text(),
         Some(
             "write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with \
-             `LeakerConfig::allowed_paths`"
+             `LeakerConfig::allow_path()`"
         )
     );
     // It is a `std::error::Error`, and `From<ErrorItem>` is the `syn::Error` of the layout of
@@ -1032,7 +1113,7 @@ fn an_item_has_a_message_notes_and_help_and_is_an_error() {
         "use absolute path: 'MyType < '_ >'\n\n\
          \x20 = note: it cannot be leaked as a whole because of `'_`\n\
          \x20 = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it \
-         with `LeakerConfig::allowed_paths`\n"
+         with `LeakerConfig::allow_path()`\n"
     );
 }
 
@@ -1156,6 +1237,84 @@ fn allowing_the_causes_of_the_errors_of_each_reason_accepts_the_item() {
     ] {
         assert!(reasons.contains(&reason), "{:?}", reason);
     }
+}
+
+// ── the same rules before and after the analysis ────────────────────────────────────────────
+
+/// The errors of a result, as the tokens that serialize them.
+fn serialized(result: &LeakerResult) -> Vec<String> {
+    result
+        .errors()
+        .iter()
+        .map(|error| error.to_token_stream().to_string())
+        .collect()
+}
+
+/// Asserts that the rules give the same errors and an equal Referrer given to the config of a
+/// trigger and given to its result.
+#[track_caller]
+fn assert_stages_agree(name: &str, trigger: Trigger, rules: &[Rule]) -> usize {
+    let before = with_rules(rules, trigger);
+    let mut after = trigger();
+    let dropped = after.errors().len();
+    for rule in rules {
+        rule.on_result(&mut after);
+    }
+    let dropped = dropped - after.errors().len();
+    assert_eq!(serialized(&before), serialized(&after), "{}", name);
+    let (before, after) = (before.into_referrer(), after.into_referrer());
+    assert_same_referrer(&before, &after, name);
+    dropped
+}
+
+#[test]
+fn the_cause_value_and_default_rules_give_the_same_result_before_and_after_the_analysis() {
+    let (mut by_cause, mut by_value, mut by_default) = (0, 0, 0);
+    for (name, trigger) in every_trigger() {
+        let causes = causes_of(trigger().errors());
+        for cause in &causes {
+            by_cause += assert_stages_agree(name, trigger, &[Rule::Cause(cause.clone())]);
+        }
+        let all: Vec<Rule> = causes.iter().cloned().map(Rule::Cause).collect();
+        by_cause += assert_stages_agree(name, trigger, &all);
+        by_value += assert_stages_agree(name, trigger, &[Rule::Values]);
+        by_default += assert_stages_agree(name, trigger, &[Rule::Default]);
+        let everything = [all, vec![Rule::Values, Rule::Default]].concat();
+        assert_stages_agree(name, trigger, &everything);
+    }
+    // The test drops something with each kind of rule.
+    assert!(by_cause > 0 && by_value > 0 && by_default > 0);
+}
+
+#[test]
+fn a_path_rule_leaves_the_errors_that_have_a_path_it_does_not_allow() {
+    // The paths of the errors of the triggers: a rule drops an error only if each is allowed.
+    for (name, trigger) in every_trigger() {
+        for error in trigger().errors() {
+            let paths: Vec<String> = error.paths.iter().map(text_of).collect();
+            // A path is relative: no leading `::`, no `Self`, no `$crate`.
+            for path in &error.paths {
+                assert!(path.leading_colon.is_none(), "{}: {:?}", name, paths);
+                assert!(path.segments.iter().all(|seg| seg.arguments.is_empty()));
+                assert_ne!(text_of(path), "Self", "{}: {:?}", name, paths);
+            }
+        }
+    }
+    // An error of `Self` without meaning or of a lifetime has no path to allow.
+    for error in self_without_meaning()
+        .errors()
+        .iter()
+        .chain(lifetime().errors())
+    {
+        assert!(error.paths.is_empty(), "{}", error.message);
+    }
+    // Allowing the first path of an error that has several leaves it.
+    let result = relative_path();
+    let mut left = result.clone();
+    left.allow_path(parse_quote!(MyType));
+    assert_eq!(left.errors().len(), 1);
+    assert_eq!(left.errors()[0].reason, Reason::RelativePath);
+    assert_eq!(text(&left.errors()[0].cause), "Clone");
 }
 
 // ── recovery ─────────────────────────────────────────────────────────────────────────────────

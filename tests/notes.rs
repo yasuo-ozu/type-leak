@@ -26,8 +26,8 @@ use type_leak::*;
 /// The config of the property test, with `::p` allowed.
 fn leaker() -> Leaker {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
-    config.allowed_paths.push(parse_quote!(::p));
+    config.allow_primitive().allow_prelude();
+    config.allow_path(parse_quote!(::p));
     Leaker::from_config(config)
 }
 

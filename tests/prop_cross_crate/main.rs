@@ -246,6 +246,12 @@
 //!   other findings of `tests/findings.rs` (F22 to F24: the Leaker rejected what compiles, F29,
 //!   F31, F32) are not features: a rejection is counted as success, and the test cannot show a
 //!   toolchain or a lint.
+//!   `allow_stages` is no feature of the generator: it makes every macro also count the errors that
+//!   remain with `LeakerConfig::allow_prelude()` and with `LeakerResult::allow_prelude()` (the
+//!   primitive types allowed), and the summary says how many items differ (`Stages`). The rule is
+//!   the same at both stages, but a result cannot make a path context-free, so it can leave another
+//!   number of errors (`tests/allow_stages.rs` has the three reasons). Off by default, so the tables
+//!   are unchanged; it fails nothing.
 //!
 //! The test is ignored by default: it is slow, as it builds the generated crates. Run it with
 //!
@@ -260,7 +266,7 @@
 mod gen;
 mod json;
 
-use gen::{generate, Case, Features, KINDS, SCOPES};
+use gen::{allow_stages, generate, Case, Features, KINDS, SCOPES};
 use json::Json;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -389,6 +395,15 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode) {
                 id = item.id
             )
             .unwrap();
+            if allow_stages() {
+                writeln!(
+                    main,
+                    "    println!(\"stages|{id}|{{}}\", {l}::__tl_stages_{id}!());",
+                    l = leaker_name(*i),
+                    id = item.id
+                )
+                .unwrap();
+            }
         }
         main.push_str("}\n");
         std::fs::write(dir.join("src/main.rs"), main).unwrap();
@@ -695,6 +710,83 @@ fn attr_lines(case: &Case) -> Vec<(usize, usize)> {
             Some((at + 1, item.id))
         })
         .collect()
+}
+
+/// What the macro of an item counted with `TYPE_LEAK_PROP_FEATURES=allow_stages`: the errors of the
+/// analysis without the prelude, those that remain when `LeakerConfig::allow_prelude()` is given to
+/// the config (`before`), and when `LeakerResult::allow_prelude()` is given to the result (`after`).
+/// The rule is the same, so the numbers should be equal; a path rule cannot do it exactly (see
+/// `tests/allow_stages.rs`), and the difference is a finding, printed with the causes.
+#[derive(Debug)]
+struct Stages {
+    case: usize,
+    item: usize,
+    plain: usize,
+    before: usize,
+    after: usize,
+    before_causes: String,
+    after_causes: String,
+}
+
+impl Stages {
+    /// `ID|PLAIN\u{1f}BEFORE\u{1f}AFTER\u{1f}BEFORE_CAUSES\u{1f}AFTER_CAUSES`.
+    fn parse(case: usize, row: &str) -> Option<Self> {
+        let (item, fields) = row.split_once('|')?;
+        let mut fields = fields.split('\u{1f}');
+        let mut count = || fields.next()?.parse().ok();
+        let (plain, before, after) = (count()?, count()?, count()?);
+        Some(Stages {
+            case,
+            item: item.parse().ok()?,
+            plain,
+            before,
+            after,
+            before_causes: fields.next()?.to_string(),
+            after_causes: fields.next()?.to_string(),
+        })
+    }
+
+    /// The lines of the summary: how many items have the same number of errors at both stages, and
+    /// each that differs, with its causes.
+    fn summarize(stages: &[Stages], generated: &[Case], ws: &Path) -> String {
+        let mut s = String::new();
+        let differ: Vec<&Stages> = stages.iter().filter(|s| s.before != s.after).collect();
+        let with_errors = stages.iter().filter(|s| s.plain > 0).count();
+        writeln!(
+            s,
+            "  allow_stages (TYPE_LEAK_PROP_FEATURES): {} items compared, {} of them have errors without the prelude; config allow_prelude() and result allow_prelude() leave the same number of errors in {}, a different one in {}; errors: {} without the prelude, {} with it in the config, {} after it in the result",
+            stages.len(),
+            with_errors,
+            stages.len() - differ.len(),
+            differ.len(),
+            stages.iter().map(|s| s.plain).sum::<usize>(),
+            stages.iter().map(|s| s.before).sum::<usize>(),
+            stages.iter().map(|s| s.after).sum::<usize>()
+        )
+        .unwrap();
+        for stage in differ {
+            let kind = generated[stage.case]
+                .items
+                .iter()
+                .find(|item| item.id == stage.item)
+                .map_or("?", |item| item.kind);
+            writeln!(
+                s,
+                "  allow_stages DIFFERS: case {} item {} ({}): {} errors without the prelude, {} in the config, {} in the result\n    config: {}\n    result: {}\n    sources: {}",
+                stage.case,
+                stage.item,
+                kind,
+                stage.plain,
+                stage.before,
+                stage.after,
+                stage.before_causes,
+                stage.after_causes,
+                ws.join(leaker_dir(stage.case)).join("src/lib.rs").display()
+            )
+            .unwrap();
+        }
+        s
+    }
 }
 
 /// `TYPE_LEAK_PROP_ACCEPT` is set (and is not `0`).
@@ -1850,6 +1942,7 @@ fn random_items_leak_across_crates() {
     // What the macros reported. Every item must have a report: a missing one is a failure, not a
     // rejection.
     let mut reports: BTreeMap<(usize, usize), Report> = BTreeMap::new();
+    let mut stages: Vec<Stages> = Vec::new();
     for (i, case) in generated.iter().enumerate() {
         if leaker_failed.contains(&i) || unbuilt.contains(&i) {
             continue;
@@ -1869,6 +1962,20 @@ fn random_items_leak_across_crates() {
             continue;
         }
         for line in String::from_utf8_lossy(&output.stdout).lines() {
+            // `allow_stages`: what the macro of an item counted (see `Stages`).
+            if let Some(row) = line.strip_prefix("stages|") {
+                match Stages::parse(i, row) {
+                    Some(stage) => stages.push(stage),
+                    None => failures.push(Failure {
+                        code: String::new(),
+                        case: i,
+                        item: None,
+                        class: "WATCHDOG: a line of allow_stages cannot be read",
+                        text: line.to_string(),
+                    }),
+                }
+                continue;
+            }
             match parse_report(line) {
                 Some((id, report)) => {
                     if let Some(error) = &report.rewrite_error {
@@ -2071,7 +2178,10 @@ fn random_items_leak_across_crates() {
     }
     let mut stats = Stats::collect(&generated, &reports);
     stats.documented = documented;
-    let summary = summarize(&stats, &floors, seed, cases, features);
+    let mut summary = summarize(&stats, &floors, seed, cases, features);
+    if allow_stages() {
+        summary.push_str(&Stages::summarize(&stages, &generated, &ws));
+    }
     eprintln!("{}", summary);
     let floor_problems = floors.problems(&stats);
 

@@ -1,11 +1,13 @@
-//! Tests for `View::check()` and `Leaker::allowed_paths`.
+//! Tests for `View::check()` and the paths that `LeakerConfig::allow_path()` allows.
 
 mod common;
 
 use common::check_in;
 use syn::*;
 use template_quote::ToTokens;
-use type_leak::{to_syn_error, Cause, CheckResult, ContextId, Leaker, Reason, Referrer, View};
+use type_leak::{
+    to_syn_error, Cause, CheckResult, ContextId, Leaker, LeakerConfig, Reason, Referrer, View,
+};
 
 /// Classifies a `CheckResult` (as the variants of the former `CheckResult` enum).
 fn kind(result: &CheckResult) -> &'static str {
@@ -143,8 +145,9 @@ fn test_check_self_no_internable() {
 /// `cross_crate::dollar_crate_paths`).
 #[test]
 fn test_check_allows_crate_paths_only_if_allowed() {
-    let mut leaker = Leaker::new();
-    leaker.allowed_paths.push(parse_quote!(crate));
+    let mut config = LeakerConfig::new();
+    config.allow_crate();
+    let mut leaker = Leaker::from_config(config);
 
     let item: ItemTrait = parse_quote!(
         pub trait Parse<Atom>: ::core::marker::Sized {
@@ -175,9 +178,9 @@ fn test_check_allows_crate_paths_only_if_allowed() {
 #[test]
 fn test_check_allowed_paths() {
     let generics: Generics = parse_quote!(<'l1, const N1: usize, T1>);
-    let mut leaker = Leaker::new();
-
-    leaker.allowed_paths.push(parse_quote!(some::path));
+    let mut config = LeakerConfig::new();
+    config.allow_path(parse_quote!(some::path));
+    let mut leaker = Leaker::from_config(config.clone());
 
     assert_eq!(
         kind(&check_in(&mut leaker, &parse_quote!(some::path), &generics)),
@@ -200,7 +203,8 @@ fn test_check_allowed_paths() {
         "MustIntern"
     );
 
-    leaker.allowed_paths.push(parse_quote!(::abs::path));
+    config.allow_path(parse_quote!(::abs::path));
+    let mut leaker = Leaker::from_config(config);
     assert_eq!(
         kind(&check_in(
             &mut leaker,
@@ -221,11 +225,9 @@ fn test_check_allowed_paths() {
 
 #[test]
 fn test_check_allowed_paths_with_generic_args() {
-    use type_leak::LeakerConfig;
-
     let generics: Generics = parse_quote!(<T1>);
     let mut config = LeakerConfig::new();
-    config.allow_std_prelude().allow_primitive();
+    config.allow_prelude().allow_primitive();
     let mut leaker = Leaker::from_config(config);
 
     // An allowed path with generic arguments is still allowed.
@@ -263,7 +265,7 @@ fn test_check_allowed_paths_with_generic_args() {
     // Trait bounds with generic arguments on allowed paths are accepted, and relative types in
     // them are leaked.
     let mut config = LeakerConfig::new();
-    config.allow_std_prelude().allow_primitive();
+    config.allow_prelude().allow_primitive();
     let mut leaker = Leaker::from_config(config);
     let item: ItemTrait = parse_quote! {
         trait MyTrait: Into<u8> {
@@ -614,7 +616,9 @@ fn check_tells_an_optional_entry_of_an_external_crate() {
         assert!(!check_in(&mut leaker, &ty, &generics).optional, "{:?}", ty);
     }
     // Not if the Leaker allows the crate.
-    leaker.allowed_paths.push(parse_quote!(::foo));
+    let mut config = LeakerConfig::new();
+    config.allow_path(parse_quote!(::foo));
+    let mut leaker = Leaker::from_config(config);
     let result = check_in(&mut leaker, &parse_quote!(::foo::X), &generics);
     assert_eq!(kind(&result), "Neutral");
     assert!(!result.optional);
