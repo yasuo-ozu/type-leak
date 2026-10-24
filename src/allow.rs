@@ -3,7 +3,9 @@
 
 use crate::error::{Cause, ErrorItem};
 use crate::util::{path_starts_with, primitive_paths, std_crate_paths, std_prelude_paths};
+use proc_macro2::TokenStream;
 use syn::Path;
+use template_quote::ToTokens;
 
 /// Rules that accept errors. An error is accepted when any rule applies:
 ///
@@ -82,25 +84,103 @@ impl Allow {
     /// An error that stays loses the paths that the rules allow, so that rules given one after the
     /// other add up as they do in one set (and in the serialization of the error, which carries its
     /// paths); its nested errors are filtered too, for when it is dropped later.
+    ///
+    /// A nested error that comes up is skipped if it is identical but for its spans to an error that
+    /// stays, before it or after it ([`same()`]). Errors that did not come up, and errors that come
+    /// up, are never merged with each other.
     pub(crate) fn filter(&self, errors: &mut Vec<ErrorItem>) {
-        let mut kept = Vec::new();
-        for error in std::mem::take(errors) {
-            self.keep(error, &mut kept);
+        // The errors that stay, and for each group that comes up the number of those before it.
+        let mut stays = Vec::new();
+        let mut ups = Vec::new();
+        for mut error in std::mem::take(errors) {
+            if self.accepts(&error) {
+                ups.push((stays.len(), error.nested));
+            } else {
+                self.trim(&mut error);
+                stays.push(error);
+            }
         }
-        *errors = kept;
+        let mut came_up = Vec::new();
+        for (before, nested) in ups {
+            for error in nested {
+                self.raise(error, before, &stays, &mut came_up);
+            }
+        }
+        // Back in the order of the input: what came up goes where its outer error was.
+        let mut came_up = came_up.into_iter().peekable();
+        for (ix, error) in stays.into_iter().enumerate() {
+            while let Some((_, up)) = came_up.next_if(|(before, _)| *before <= ix) {
+                errors.push(up);
+            }
+            errors.push(error);
+        }
+        errors.extend(came_up.map(|(_, up)| up));
     }
 
-    /// Pushes `error` to `kept` if the rules do not accept it, else its nested errors that they do
-    /// not accept.
-    fn keep(&self, mut error: ErrorItem, kept: &mut Vec<ErrorItem>) {
+    /// Removes from `error`, which stays, the paths that the rules allow, and filters its nested
+    /// errors.
+    fn trim(&self, error: &mut ErrorItem) {
+        error.paths.retain(|path| !self.allows_path(path));
+        self.filter(&mut error.nested);
+    }
+
+    /// Puts `error`, which came up, in `came_up` after `before` errors that stay if the rules do not
+    /// accept it and it is not `same()` as one of `stays`, else its nested errors that they do not
+    /// accept.
+    fn raise(
+        &self,
+        mut error: ErrorItem,
+        before: usize,
+        stays: &[ErrorItem],
+        came_up: &mut Vec<(usize, ErrorItem)>,
+    ) {
         if self.accepts(&error) {
             for nested in error.nested {
-                self.keep(nested, kept);
+                self.raise(nested, before, stays, came_up);
             }
         } else {
-            error.paths.retain(|path| !self.allows_path(path));
-            self.filter(&mut error.nested);
-            kept.push(error);
+            // Trimmed like the errors that stay, so that what is compared is what would be listed.
+            self.trim(&mut error);
+            if !stays.iter().any(|other| same(other, &error)) {
+                came_up.push((before, error));
+            }
         }
     }
+}
+
+/// Returns `true` if the errors are identical but for their spans, which cannot be compared
+/// reliably: the same cause ([`Cause`] equality), reason, message, place, paths, notes, help and
+/// nested errors, the tokens compared as text. So that a skipped error is never one that a rule
+/// would treat differently from the one it equals.
+fn same(left: &ErrorItem, right: &ErrorItem) -> bool {
+    fn text(tokens: &impl ToTokens) -> String {
+        tokens.to_token_stream().to_string()
+    }
+    fn note(left: &(TokenStream, String), right: &(TokenStream, String)) -> bool {
+        left.1 == right.1 && text(&left.0) == text(&right.0)
+    }
+    left.cause == right.cause
+        && left.reason == right.reason
+        && left.message == right.message
+        && left.in_value == right.in_value
+        && left.in_default == right.in_default
+        && left.paths.len() == right.paths.len()
+        && left
+            .paths
+            .iter()
+            .zip(&right.paths)
+            .all(|(l, r)| text(l) == text(r))
+        && left.notes.len() == right.notes.len()
+        && left.notes.iter().zip(&right.notes).all(|(l, r)| note(l, r))
+        && match (&left.help, &right.help) {
+            (Some(left), Some(right)) => note(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+        && left.nested.len() == right.nested.len()
+        && left
+            .nested
+            .iter()
+            .zip(&right.nested)
+            .all(|(l, r)| same(l, r))
 }

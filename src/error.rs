@@ -515,7 +515,8 @@ pub struct ErrorItem {
     pub paths: Vec<Path>,
     /// What is wrong inside the part if its [`paths`](ErrorItem::paths) are allowed. They take the
     /// place of this error when a rule of `allow*()` drops it, as the part is then copied as written.
-    /// Each has its own `paths` and `nested`. They are not reported.
+    /// Each has its own `paths` and `nested`. They are not reported. One that comes up is skipped if
+    /// an error that stays is identical to it, but for the spans.
     pub nested: Vec<ErrorItem>,
 }
 

@@ -10,6 +10,8 @@
 //! - every rule brings it up, on a config and on a result alike, and the rules add up;
 //! - a part with nothing wrong inside has none, and neither does `Vec<Rel<'_>>`;
 //! - the nesting is recursive, in the analysis (a value) and in what the rules do with it;
+//! - a nested error that comes up is skipped if an error that stays is identical to it but for the
+//!   spans, and the errors that did not come up (or that come up) are never merged with each other;
 //! - the serialization writes `nested [..]` only if it is not empty, and reporting never shows it.
 
 mod common;
@@ -307,14 +309,11 @@ fn a_type_that_cannot_be_leaked_has_what_is_wrong_inside_it_nested() {
     );
     assert_eq!(paths(&result.errors()[0]), ["Rel"]);
     // The config that allows `Rel` has the second error and not the first: the nested error is the
-    // second one of the result, which comes up when the first is dropped, so there are two with the
-    // result and one with the config.
+    // second one of the result, which comes up when the first is dropped and is skipped, as the
+    // second is identical to it. So the result has one, as the config.
     let mut result_after = result.clone();
     result_after.allow_path(parse_quote!(Rel));
-    assert_eq!(
-        shape(result_after.errors()),
-        "Self :: A0 [UnprovableBound], Self :: A0 [UnprovableBound]"
-    );
+    assert_eq!(shape(result_after.errors()), "Self :: A0 [UnprovableBound]");
     let mut config = LeakerConfig::new();
     config.allow_path(parse_quote!(Rel));
     assert_eq!(
@@ -473,6 +472,258 @@ fn a_rule_filters_the_nested_errors_of_an_error_that_stays() {
         shape(first.errors()),
         "B1 [RelativePath] { C1 [UnprovableBound] }, E1 [RelativePath]"
     );
+}
+
+// ── identical errors ────────────────────────────────────────────────────────────────────────
+
+/// A result with the errors `errors`, written by hand in the serialization.
+fn with_errors(errors: &str) -> LeakerResult {
+    let referrer = Leaker::new().result().to_token_stream();
+    parse2(quote_all(referrer, errors.parse().unwrap())).unwrap()
+}
+
+/// The error `cause` (a type), `UnprovableBound`, with the message `m`, the note `(a) "n"` and the help.
+fn plain(cause: &str) -> String {
+    format!(r#"{{ type ( {cause} ) UnprovableBound "m" [ ( a ) "n" ] ( h ) "help" }}"#)
+}
+
+/// A relative path `P` that holds the nested errors `nested`.
+fn outer(cause: &str, nested: &[&str]) -> String {
+    format!(
+        r#"{{ type ( {cause} ) RelativePath "o" [] paths [ P ] nested [ {} ] }}"#,
+        nested.join(" , ")
+    )
+}
+
+#[test]
+fn a_nested_error_that_the_analysis_also_reports_beside_it_is_listed_once() {
+    // `Self::A0` is nested in `Rel<Self::A0>` and found beside it as well (the second of the result).
+    let item: ItemTrait = parse_quote!(
+        trait Tr<T: ::p::BT1<String>> {
+            type A0;
+            fn m<X>(&self)
+            where
+                X: ::p::Tr<Rel<Self::A0>>;
+        }
+    );
+    let rel = Cause::Type(parse_quote!(Rel<Self::A0>));
+    let result = analyze(&item, LeakerConfig::new());
+    assert_eq!(
+        shape(result.errors()),
+        "Rel < Self :: A0 > [UnprovableBound] { Self :: A0 [UnprovableBound] }, \
+         Self :: A0 [UnprovableBound]"
+    );
+    let sibling = result.errors()[1].to_token_stream().to_string();
+    // After the analysis, whichever rule drops the first error: the sibling is the only one left.
+    let mut by_cause = result.clone();
+    by_cause.allow(rel.clone());
+    let mut by_path = result.clone();
+    by_path.allow_path(parse_quote!(Rel));
+    for result in [&by_cause, &by_path] {
+        assert_eq!(shape(result.errors()), "Self :: A0 [UnprovableBound]");
+        assert_eq!(result.errors()[0].to_token_stream().to_string(), sibling);
+    }
+    // With the rule on the config: the same.
+    let mut config = LeakerConfig::new();
+    config.allow(rel);
+    let by_config = analyze(&item, config);
+    assert_eq!(shape(by_config.errors()), "Self :: A0 [UnprovableBound]");
+    assert_eq!(by_config.errors()[0].to_token_stream().to_string(), sibling);
+    // Allowing the cause that is left drops it, and nothing comes up again.
+    assert_eq!(allow_every_cause(&mut by_cause.clone()), 1);
+}
+
+#[test]
+fn the_errors_that_did_not_come_up_are_never_merged() {
+    // The analysis reports two identical errors side by side: both stay, with a rule that drops
+    // nothing and with one that drops something else.
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn m(&self, a: Wrap<'_>, b: Wrap<'_>);
+        }
+    );
+    let result = analyze(&item, LeakerConfig::new());
+    assert_eq!(result.errors().len(), 2);
+    assert_eq!(text(&result.errors()[0]), text(&result.errors()[1]));
+    let mut other = result.clone();
+    other
+        .allow_prelude()
+        .allow(Cause::Type(parse_quote!(Other)));
+    assert_eq!(other.errors().len(), 2);
+    // One of them and a nested error that is identical to them: the nested one is skipped, the two
+    // that did not come up are kept (the analysis: `Self::A0` beside `Rel<Self::A0>`, twice).
+    let item: ItemTrait = parse_quote!(
+        trait Tr<T: ::p::BT1<String>> {
+            type A0;
+            fn m<X, Y>(&self)
+            where
+                X: ::p::Tr<Self::A0>,
+                Y: ::p::Tr<Rel<Self::A0>>;
+        }
+    );
+    let mut result = analyze(&item, LeakerConfig::new());
+    assert_eq!(
+        shape(result.errors()),
+        "Rel < Self :: A0 > [UnprovableBound] { Self :: A0 [UnprovableBound] }, \
+         Self :: A0 [UnprovableBound], Self :: A0 [UnprovableBound]"
+    );
+    result.allow_path(parse_quote!(Rel));
+    assert_eq!(
+        shape(result.errors()),
+        "Self :: A0 [UnprovableBound], Self :: A0 [UnprovableBound]"
+    );
+    // By hand: the pair stays as it is, whatever is nested.
+    let s = plain("S");
+    let mut result = with_errors(&format!("{s} {s} {}", outer("O", &[&s])));
+    assert_eq!(result.errors().len(), 3);
+    result.allow_path(parse_quote!(P));
+    assert_eq!(
+        shape(result.errors()),
+        "S [UnprovableBound], S [UnprovableBound]"
+    );
+    let mut result = with_errors(&format!("{s} {s}"));
+    result.allow_path(parse_quote!(P));
+    assert_eq!(result.errors().len(), 2);
+}
+
+#[test]
+fn a_nested_error_identical_to_one_before_or_after_its_outer_error_is_skipped() {
+    let (s, t) = (plain("S"), plain("T"));
+    let first = |nested: &[&str]| outer("O", nested);
+    // The sibling before the outer error.
+    let mut result = with_errors(&format!("{s} {}", first(&[&s])));
+    result.allow_path(parse_quote!(P));
+    assert_eq!(shape(result.errors()), "S [UnprovableBound]");
+    // The sibling after it.
+    let mut result = with_errors(&format!("{} {s}", first(&[&s])));
+    result.allow_path(parse_quote!(P));
+    assert_eq!(shape(result.errors()), "S [UnprovableBound]");
+    // The order is kept: what comes up takes the place of its outer error, and what is skipped
+    // leaves the sibling where it was.
+    let mut result = with_errors(&format!(
+        "{} {} {} {t} {s}",
+        plain("A"),
+        first(&[&s, &plain("B"), &t]),
+        plain("C"),
+    ));
+    result.allow_path(parse_quote!(P));
+    assert_eq!(
+        shape(result.errors()),
+        "A [UnprovableBound], B [UnprovableBound], C [UnprovableBound], T [UnprovableBound], \
+         S [UnprovableBound]"
+    );
+    // Identical errors that come up are both kept, whether they come from one outer error or from
+    // two: only an error that stays skips them (`T` is the sibling that follows).
+    let mut result = with_errors(&first(&[&s, &s]));
+    result.allow_path(parse_quote!(P));
+    assert_eq!(
+        shape(result.errors()),
+        "S [UnprovableBound], S [UnprovableBound]"
+    );
+    let mut result = with_errors(&format!("{} {}", first(&[&s]), outer("O2", &[&s])));
+    result.allow_path(parse_quote!(P));
+    assert_eq!(
+        shape(result.errors()),
+        "S [UnprovableBound], S [UnprovableBound]"
+    );
+    let mut result = with_errors(&format!(
+        "{} {} {t}",
+        first(&[&s, &t]),
+        outer("O2", &[&s, &plain("U")])
+    ));
+    result.allow_path(parse_quote!(P));
+    assert_eq!(
+        shape(result.errors()),
+        "S [UnprovableBound], S [UnprovableBound], U [UnprovableBound], T [UnprovableBound]"
+    );
+    // Down the levels: what comes up from an error that comes up and is dropped too is compared
+    // with a sibling that follows the outer error.
+    let inner = outer("M", &[&s]);
+    let mut result = with_errors(&format!("{} {s}", first(&[&inner])));
+    result.allow_path(parse_quote!(P));
+    assert_eq!(shape(result.errors()), "S [UnprovableBound]");
+    // Only what stays in the list is compared, not what a dropped error would have brought up: an
+    // error that stays, with the same nested error, does not hide one that comes up.
+    let stays =
+        r#"{ type ( K ) RelativePath "o" [] paths [ Q ] nested [ NESTED ] }"#.replace("NESTED", &s);
+    let mut result = with_errors(&format!("{stays} {}", first(&[&s])));
+    result.allow_path(parse_quote!(P));
+    assert_eq!(
+        shape(result.errors()),
+        "K [RelativePath] { S [UnprovableBound] }, S [UnprovableBound]"
+    );
+}
+
+#[test]
+fn a_nested_error_that_differs_in_what_it_says_is_kept() {
+    let same = plain("S");
+    let differ = |other: String| {
+        let mut result = with_errors(&format!("{} {}", outer("O", &[&other]), same));
+        result.allow_path(parse_quote!(P));
+        result.errors().len()
+    };
+    assert_eq!(differ(plain("S")), 1);
+    // The note text, the tokens of the note, another note, the message, the help text and tokens,
+    // the reason and the cause.
+    for other in [
+        same.replace(r#""n""#, r#""n2""#),
+        same.replace("( a )", "( b )"),
+        same.replace(r#""n" ]"#, r#""n" , ( a ) "n" ]"#),
+        same.replace(r#""m""#, r#""m2""#),
+        same.replace(r#""help""#, r#""help2""#),
+        same.replace("( h )", "( g )"),
+        same.replace("UnprovableBound", "Unreadable"),
+        same.replace("type ( S )", "trait ( S )"),
+        same.replace("type ( S )", "type ( S2 )"),
+        same.replace(r#"[ ( a ) "n" ] ( h ) "help""#, "[]"),
+    ] {
+        assert_eq!(differ(other.clone()), 2, "{}", other);
+    }
+    // The first of them, as the output of a result: the nested error is the one that comes up first.
+    let mut result = with_errors(&format!(
+        "{} {same}",
+        outer("O", &[&same.replace(r#""n""#, r#""n2""#)])
+    ));
+    result.allow_path(parse_quote!(P));
+    assert_eq!(result.errors()[0].note(), Some("n2"));
+    assert_eq!(result.errors()[1].note(), Some("n"));
+    // The place, the paths and the nested errors are compared as well. The paths after the rule
+    // trimmed them: `P` is allowed, so `paths [ P ]` is no path.
+    let tail = |tail: &str| same.replace(" }", &format!(" {tail} }}"));
+    assert_eq!(differ(tail("paths [ P ]")), 1);
+    for other in [
+        tail("value"),
+        tail("default"),
+        tail("paths [ Z ]"),
+        tail("paths [ P , Z ]"),
+        tail(&format!("nested [ {} ]", plain("X"))),
+    ] {
+        assert_eq!(differ(other.clone()), 2, "{}", other);
+    }
+    // The same place, paths and nested errors: skipped. Nested errors are compared down to the last.
+    let (with_x, with_y) = (
+        tail(&format!("paths [ Z ] nested [ {} ]", plain("X"))),
+        tail(&format!("paths [ Z ] nested [ {} ]", plain("Y"))),
+    );
+    for (stays, up, kept) in [
+        (&with_x, &with_x, 1),
+        (&with_x, &with_y, 2),
+        (&tail("value paths [ Z ]"), &tail("paths [ Z ] value"), 1),
+    ] {
+        let mut result = with_errors(&format!("{} {}", outer("O", &[up]), stays));
+        result.allow_path(parse_quote!(P));
+        assert_eq!(result.errors().len(), kept, "{} / {}", up, stays);
+    }
+    let deep_x = tail(&format!(
+        "nested [ {} ]",
+        plain("X").replace(" }", &format!(" nested [ {} ] }}", plain("Z")))
+    ));
+    let deep_y = deep_x.replacen("( Z )", "( W )", 1);
+    for (other, kept) in [(&deep_x, 1), (&deep_y, 2)] {
+        let mut result = with_errors(&format!("{} {}", outer("O", &[other]), deep_x));
+        result.allow_path(parse_quote!(P));
+        assert_eq!(result.errors().len(), kept, "{}", other);
+    }
 }
 
 // ── serialization and reporting ─────────────────────────────────────────────────────────────
