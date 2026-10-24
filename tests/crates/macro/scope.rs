@@ -29,7 +29,7 @@
 //! - `pub const SCOPE_<id>_SELF/_TRAIT/_TYPES: &str`, the tokens of the rewritten self type, trait
 //!   path and type arguments.
 //!
-//! `scope_errors!` runs the same analysis and reports the `NotInternableError::items()` of it in a
+//! `scope_errors!` runs the same analysis and reports the errors (`Vec<ErrorItem>`) of it in a
 //! `pub const`.
 
 use crate::prop::{check_fn, witness_fn, Position, SelfSub};
@@ -38,7 +38,7 @@ use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
 use syn::*;
-use template_quote::quote;
+use template_quote::{quote, ToTokens};
 use type_leak::*;
 
 /// Which scope the analysis enters.
@@ -149,13 +149,13 @@ impl ScopeInput {
     }
 
     /// The analysis, as `coinduction` does it: a scope, in which the arguments are visited.
-    fn analyze(&self) -> std::result::Result<(Referrer, ContextId), NotInternableError> {
+    fn analyze(&self) -> std::result::Result<(Referrer, ContextId), Vec<ErrorItem>> {
         let mut config = LeakerConfig::new();
         if self.primitive {
             config.allow_primitive();
         }
         if self.prelude {
-            config.allow_std_prelude();
+            config.allow_prelude();
         }
         let mut leaker = Leaker::from_config(config);
         let visit = |view: &mut View<'_>| {
@@ -169,10 +169,10 @@ impl ScopeInput {
                 &self.item.self_ty,
                 self.allow_self,
                 visit,
-            )?,
-            Scope::Generics => leaker.enter_generics(&self.item.generics, visit)?,
+            ),
+            Scope::Generics => leaker.enter_generics(&self.item.generics, visit),
         };
-        Ok((leaker.finish(), context))
+        Ok((leaker.result().finish()?, context))
     }
 
     fn pairs(&self) -> TokenStream {
@@ -204,7 +204,7 @@ fn position(item: &ItemImpl, self_ty: &Type, ty: Type) -> Position {
 /// `scope_leak!`, the Leaker's side.
 pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let input: ScopeInput = parse2(input)?;
-    let (referrer, context) = input.analyze().map_err(Error::from)?;
+    let (referrer, context) = input.analyze().map_err(|errors| to_syn_error(&errors))?;
     let ScopeInput {
         id, marker, item, ..
     } = &input;
@@ -303,7 +303,7 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
 
 /// `scope_errors!`: the same analysis, which must fail; emits `pub const NAME: &[(&str, &str,
 /// &[(&str, &str)])]`, the message and the source text of the span of every
-/// `NotInternableError::items()`, with its notes (the note and the source text of its span).
+/// error, with its notes (the note and the source text of its span).
 pub(crate) fn errors(input: TokenStream) -> Result<TokenStream> {
     let input: ScopeInput = parse2(input)?;
     let name = input
@@ -320,19 +320,19 @@ pub(crate) fn errors(input: TokenStream) -> Result<TokenStream> {
         Err(err) => err,
     };
     let mut rows = TokenStream::new();
-    for item in err.items() {
+    for item in &err {
         let message = &item.message;
-        let source = item.span.source_text().unwrap_or_default();
-        let tokens = item.tokens.to_string();
+        let source = item.span().source_text().unwrap_or_default();
+        let tokens = item.cause.to_token_stream().to_string();
         let mut notes = TokenStream::new();
-        for (span, note) in &item.notes {
-            let at = span.source_text().unwrap_or_default();
+        for (tokens, note) in &item.notes {
+            let at = tokens.span().source_text().unwrap_or_default();
             notes.extend(quote!((#note, #at),));
         }
         rows.extend(quote!((#message, #tokens, #source, &[#notes]),));
     }
     // The error is also what a macro reports as `compile_error!`s: one for each item.
-    let rendered = syn::Error::from(err.clone());
+    let rendered = to_syn_error(&err);
     let n_compile_errors = rendered.into_iter().count();
     let (names, count) = (ident(&format!("{}_COMPILE_ERRORS", name)), n_compile_errors);
     Ok(quote! {

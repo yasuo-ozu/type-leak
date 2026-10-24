@@ -142,18 +142,19 @@ fn a_bare_name_gets_the_help_with_its_absolute_path() {
         let help = format!("use `{}` instead of `{}`", absolute, name);
         for (form, source, message) in forms(name) {
             let item: ItemTrait = parse_str(&source).unwrap();
-            let err = Leaker::new()
-                .intern_trait(&item, true)
-                .err()
-                .unwrap_or_else(|| panic!("`{}` is accepted: {}", name, source));
+            let mut leaker = Leaker::new();
+            leaker.intern_trait(&item, true);
+            let result = leaker.result();
+            let err = result.errors();
+            assert!(!err.is_empty(), "`{}` is accepted: {}", name, source);
             let context = format!("{} as a {}: {}", name, form, source);
-            let items: Vec<_> = err.items().collect();
+            let items = err;
             assert_eq!(items.len(), 1, "{}", context);
             assert_eq!(items[0].message, message, "{}", context);
-            // It is the help of the error, and `NotInternableError::help()`. It is no note: the
-            // notes say why.
+            // It is the help of the error, and of the first one. It is no note: the notes say
+            // why.
             assert_eq!(items[0].help_text(), Some(help.as_str()), "{}", context);
-            assert_eq!(err.help(), Some(help.clone()), "{}", context);
+            assert_eq!(err[0].help_text(), Some(help.as_str()), "{}", context);
             assert!(
                 items[0].notes.iter().all(|(_, note)| *note != help),
                 "{}",
@@ -161,7 +162,7 @@ fn a_bare_name_gets_the_help_with_its_absolute_path() {
             );
             // And it is in the `syn::Error`, which stable Rust gets: the notes follow the headline,
             // then the help.
-            let rendered = syn::Error::from(err).to_string();
+            let rendered = to_syn_error(err).to_string();
             assert!(rendered.starts_with(&message), "{}: {}", context, rendered);
             assert!(
                 rendered.ends_with(&format!("\n  = help: {}\n", help)),

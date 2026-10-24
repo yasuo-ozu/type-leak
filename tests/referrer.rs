@@ -171,8 +171,8 @@ fn test_grouped_types_are_found() {
         struct S { a: #grouped, b: RelA }
     };
     let mut leaker = type_leak::Leaker::new();
-    let context = leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    let context = leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
     assert_eq!(
         rewrite_with(referrer, context, Item::Struct(item)),
@@ -191,8 +191,8 @@ fn parse_error(tokens: proc_macro2::TokenStream) -> String {
 fn format_version_round_trip() {
     let item: ItemStruct = parse_quote! { struct S<T> { a: RelA, b: Wrap<T> } };
     let mut leaker = type_leak::Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     let tokens = quote!(#referrer);
     // The tag is the first token, a string literal.
     let first = tokens.clone().into_iter().next().unwrap().to_string();
@@ -287,23 +287,9 @@ fn test_contexts() {
     let mut leaker = type_leak::Leaker::new();
     let item0: ItemStruct = parse_quote! { struct S<T> { a: RelA, b: Wrap<T> } };
     let item1: ItemStruct = parse_quote! { struct S<U> { a: RelA, b: Wrap<U> } };
-    let context0 = leaker.intern_struct(&item0, true).unwrap();
-    // A failed call adds nothing.
-    let bad: ItemStruct = parse_quote! { struct S { a: RelB<'_> } };
-    assert!(leaker.intern_struct(&bad, true).is_err());
-    // Also if a scope that completed inside it had taken an id (they are assigned when a nested
-    // scope is left): the rollback of the call gives it back.
-    assert!(leaker
-        .enter_generics(&parse_quote!(<V>), |view| {
-            view.enter_generics(&parse_quote!(<W>), |view| {
-                view.visit_type(&parse_quote!(Wrap<W>))
-            })
-            .unwrap();
-            view.visit_type(&parse_quote!(RelB<'_>));
-        })
-        .is_err());
-    let context1 = leaker.intern_struct(&item1, true).unwrap();
-    let referrer = leaker.finish();
+    let context0 = leaker.intern_struct(&item0, true);
+    let context1 = leaker.intern_struct(&item1, true);
+    let referrer = leaker.result().finish().unwrap();
     // `RelA` uses no generics, so it is shared by the calls, but `Wrap<T>` and `Wrap<U>` are not.
     assert_eq!(
         referrer
@@ -355,11 +341,11 @@ fn test_contexts() {
     // A generic that no scope declares is not assumed to be the Leaker's: both are found only in a
     // scope which declares both (here, a third scope of the same Leaker).
     let mut both = type_leak::Leaker::new();
-    both.intern_struct(&item0, true).unwrap();
-    both.intern_struct(&item1, true).unwrap();
-    let (context, ()) = both.enter_generics(&parse_quote!(<T, U>), |_| ()).unwrap();
+    both.intern_struct(&item0, true);
+    both.intern_struct(&item1, true);
+    let (context, ()) = both.enter_generics(&parse_quote!(<T, U>), |_| ());
     assert_eq!(
-        rewrite_with(both.finish(), context, item.clone()),
+        rewrite_with(both.result().finish().unwrap(), context, item.clone()),
         expected(parse_quote! { struct X { a: P<0usize>, b: P<2usize>, c: P<1usize> } })
     );
     let expected_ty: Type = parse_quote!(::p::Q<P<0usize>>);
@@ -373,9 +359,9 @@ fn test_contexts() {
     // The contexts are those of the types, not of the calls: a call without types adds none.
     let mut leaker = type_leak::Leaker::new();
     let empty: ItemStruct = parse_quote! { struct S; };
-    leaker.intern_struct(&empty, true).unwrap();
-    leaker.intern_struct(&item0, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(&empty, true);
+    leaker.intern_struct(&item0, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.context(0).index(), 0);
     assert_eq!(referrer.contexts().count(), 2);
     assert_eq!(
@@ -385,7 +371,7 @@ fn test_contexts() {
     let parsed: Referrer = parse2(quote!(#referrer)).unwrap();
     assert_eq!(parsed, referrer);
     // Without any type, there is a context for the types which use nothing.
-    let referrer = type_leak::Leaker::new().finish();
+    let referrer = type_leak::Leaker::new().result().finish().unwrap();
     assert_eq!(referrer.contexts().count(), 1);
     assert_eq!(quote!(#referrer).to_string(), format!("\"{}\" ()", tag()));
 }
@@ -417,9 +403,9 @@ fn test_referrer_followed_by_tokens() {
     for items in [vec![&item_a], vec![&item_a, &item_b]] {
         let mut leaker = type_leak::Leaker::new();
         for item in items {
-            leaker.intern_struct(item, true).unwrap();
+            leaker.intern_struct(item, true);
         }
-        let referrer = leaker.finish();
+        let referrer = leaker.result().finish().unwrap();
         let parsed: Embedded = parse2(quote!(#referrer, (after))).unwrap();
         assert_eq!(parsed.0, referrer);
         assert_eq!(parsed.1, "after");
@@ -436,8 +422,8 @@ fn test_outermost_generics_as_leakers() {
         }
     };
     let mut leaker = type_leak::Leaker::new();
-    let context = leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    let context = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     let rewrite = |item: &Item, outermost_as_leakers: bool| {
         let mut item = item.clone();
         let mut visitor = referrer
@@ -497,8 +483,8 @@ fn test_outermost_generics_as_leakers() {
 /// The Referrer of the trait, and its top-level context: the scope of its copies.
 fn referrer_of(tr: ItemTrait) -> (Referrer, ContextId) {
     let mut leaker = type_leak::Leaker::new();
-    let context = leaker.intern_trait(&tr, true).unwrap();
-    (leaker.finish(), context)
+    let context = leaker.intern_trait(&tr, true);
+    (leaker.result().finish().unwrap(), context)
 }
 
 #[test]
@@ -538,8 +524,8 @@ fn test_has_self() {
             &Generics::default(),
             item.parse().unwrap(),
             false,
-        )?;
-        Ok::<_, type_leak::NotInternableError>(leaker.finish())
+        );
+        leaker.result().finish()
     };
     assert!(leak("fn f(&self, x: Rel<Self>) -> Rel2;").is_err());
     let referrer = leak("fn f(&self, x: Rel) -> Rel2;").unwrap();
@@ -550,12 +536,13 @@ fn test_has_self() {
     let err = leak("fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> Wrap<T>;")
         .err()
         .unwrap();
+    assert_eq!(err.len(), 1);
     assert_eq!(
-        err.to_string(),
+        err[0].message,
         "`Wrap < T >` has a generic whose bound mentions `Self`, which cannot be leaked"
     );
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
     assert!(leak("fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> Rel;").is_ok());
@@ -887,8 +874,8 @@ fn test_module_items_do_not_shadow_submodules() {
         }
     };
     let mut leaker = type_leak::Leaker::new();
-    let context = leaker.intern_mod(&m).unwrap();
-    let referrer = leaker.finish();
+    let context = leaker.intern_mod(&m);
+    let referrer = leaker.result().finish().unwrap();
     // Only the `Rel` of `m::inner` is leaked (in its context, which is keyed by the module
     // `inner`, and the module analyzed is another, as the one which contains it).
     assert_eq!(referrer.contexts().count(), 3);
@@ -960,8 +947,8 @@ fn the_associated_types_of_a_trait_with_outlives_are_in_its_top_level_context() 
         }
     );
     let mut leaker = type_leak::Leaker::new();
-    let context = leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    let context = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     let text = quote!(#referrer).to_string();
     // Only the outlives are kept (`U: Clone` is for the method to write), and a type with none
     // (`H`) is not.
@@ -996,15 +983,13 @@ fn the_associated_types_of_a_trait_with_outlives_are_in_its_top_level_context() 
     // only.
     use syn::visit::Visit;
     let mut leaker = type_leak::Leaker::new();
-    leaker
-        .enter_trait(&parse_quote!(Tr), &tr.generics, true, |view| {
-            let TraitItem::Fn(method) = &tr.items[2] else {
-                panic!()
-            };
-            view.visit_signature(&method.sig);
-        })
-        .unwrap();
-    let referrer = leaker.finish();
+    leaker.enter_trait(&parse_quote!(Tr), &tr.generics, true, |view| {
+        let TraitItem::Fn(method) = &tr.items[2] else {
+            panic!()
+        };
+        view.visit_signature(&method.sig);
+    });
+    let referrer = leaker.result().finish().unwrap();
     let text = quote!(#referrer).to_string();
     assert!(!text.contains("Self : 'x"), "{}", text);
     assert!(!text.contains("type G"), "{}", text);

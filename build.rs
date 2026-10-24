@@ -1,5 +1,5 @@
 //! Detects whether `proc_macro::Diagnostic` (nightly) is available, to render the notes and the help
-//! of a `NotInternableError` as those of the diagnostic with their own spans.
+//! of an `ErrorItem` as those of the diagnostic with their own spans.
 
 use std::env;
 use std::path::PathBuf;

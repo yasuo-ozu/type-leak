@@ -20,8 +20,8 @@ fn s(x: &impl template_quote::ToTokens) -> String {
 /// The leaked types of a trait with the generics each uses (and the where clause).
 fn leaked(item: ItemTrait) -> Vec<(String, String)> {
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     entries(&referrer)
 }
 
@@ -273,8 +273,8 @@ fn the_gat_of_another_trait_records_the_predicate_only() {
         ))
         .unwrap();
         let mut leaker = Leaker::new();
-        leaker.intern_trait(&item, true).unwrap();
-        with_self_outlives(&leaker.finish())
+        leaker.intern_trait(&item, true);
+        with_self_outlives(&leaker.result().finish().unwrap())
     };
     // Its own trait, by the path or by the qualified path: `Self: 'x`, as `G` says.
     for (path, shown) in [
@@ -317,9 +317,9 @@ fn the_gats_of_a_trait_in_a_module_are_read() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&item).unwrap();
+    leaker.intern_mod(&item);
     assert_eq!(
-        with_self_outlives(&leaker.finish()),
+        with_self_outlives(&leaker.result().finish().unwrap()),
         [(
             "Rel < & 'x Self :: G < 'x > >".to_string(),
             "< 'x > where Self :: G < 'x > : 'x".to_string(),
@@ -429,8 +429,8 @@ fn bounds_are_part_of_the_context() {
     // generics as they are written), although it uses all of them: the reference implies `T: 'a`.
     let tr: ItemTrait = parse_quote! { trait Tr<'a, T> { fn f(&self, x: &'a Rel<T>); } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_ne!(referrer.context(0), top_level);
     assert_eq!(s(referrer.context_generics(top_level)), "< 'a , T >");
     assert_eq!(
@@ -440,8 +440,8 @@ fn bounds_are_part_of_the_context() {
     // A path with the lifetime implies none, so the context is the top-level one.
     let tr: ItemTrait = parse_quote! { trait Tr<'a, T> { fn f(&self, x: Rel<'a, T>); } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.context(0), top_level);
     assert_eq!(
         s(referrer.context_generics(referrer.context(0))),
@@ -450,14 +450,14 @@ fn bounds_are_part_of_the_context() {
     // A struct with the bound written is the same context as the type.
     let st: ItemStruct = parse_quote! { struct S<'a, T: 'a>(Rel<'a, T>); };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&st, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_struct(&st, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.context(0), top_level);
     // Without it, the context is that of the generics as they are as well: the path implies none.
     let st: ItemStruct = parse_quote! { struct S<'a, T>(Rel<'a, T>); };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&st, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_struct(&st, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.context(0), top_level);
     assert_eq!(
         s(referrer.context_generics(referrer.context(0))),
@@ -468,8 +468,8 @@ fn bounds_are_part_of_the_context() {
     let b: ItemTrait = parse_quote! { trait Tr { fn f<'a, T>(&self, x: Rel<'a, T>) where T: 'a; } };
     let contexts = |item: &ItemTrait| -> Vec<ContextId> {
         let mut leaker = Leaker::new();
-        leaker.intern_trait(item, true).unwrap();
-        let referrer = leaker.finish();
+        leaker.intern_trait(item, true);
+        let referrer = leaker.result().finish().unwrap();
         vec![referrer.context(0)]
     };
     assert_eq!(contexts(&a), contexts(&b));
@@ -483,9 +483,9 @@ fn bounds_are_part_of_the_context() {
         trait Tr { fn f<'a, T>(&self, x: &'a Rel<T>); }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&written, true).unwrap();
-    leaker.intern_trait(&implied, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_trait(&written, true);
+    leaker.intern_trait(&implied, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
     assert_eq!(
         s(referrer.context_generics(referrer.context(0))),
@@ -514,8 +514,8 @@ fn the_referrer_finds_the_entries_with_the_generics_it_sees_declared() {
     ] {
         let tr: ItemTrait = tr;
         let mut leaker = Leaker::new();
-        let context = leaker.intern_trait(&tr, true).unwrap();
-        let referrer = leaker.finish();
+        let context = leaker.intern_trait(&tr, true);
+        let referrer = leaker.result().finish().unwrap();
         let rewrite = |visitor: &mut dyn syn::visit_mut::VisitMut| {
             let mut copy = tr.clone();
             visitor.visit_item_trait_mut(&mut copy);
@@ -538,8 +538,8 @@ fn the_referrer_finds_the_entries_with_the_generics_it_sees_declared() {
     // which the entry has) is not rewritten, as it refers to other generics.
     let tr: ItemTrait = parse_quote! { trait Tr { fn f<'a, T: 'a>(&self, x: Rel<'a, T>); } };
     let mut leaker = Leaker::new();
-    let context = leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    let context = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     let mut sig: Signature = parse_quote!(fn f<'a, T: ::core::clone::Clone>(x: Rel<'a, T>));
     syn::visit_mut::VisitMut::visit_signature_mut(
         &mut referrer
@@ -559,8 +559,8 @@ fn the_referrer_finds_the_entries_with_the_generics_it_sees_declared() {
     // entry's, and one with another bound is not.
     let tr: ItemTrait = parse_quote! { trait Tr { fn f<'a, T>(&self, x: &'a Rel<T>); } };
     let mut leaker = Leaker::new();
-    let context = leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    let context = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     let mut sig: Signature = parse_quote!(fn f<'a, T>(x: &'a Rel<T>));
     syn::visit_mut::VisitMut::visit_signature_mut(
         &mut referrer
@@ -585,8 +585,8 @@ fn the_bounds_survive_serialization() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     let tokens = referrer.to_token_stream();
     assert!(tokens.to_string().contains("'a : 'b"), "{}", tokens);
     let parsed: Referrer = parse2(tokens).unwrap();
@@ -598,8 +598,8 @@ fn the_bounds_survive_serialization() {
 /// (`impl_generics()`), and those the trait arguments encode (`context_generics()`).
 fn impl_and_context(item: ItemTrait) -> (String, String) {
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     let context = referrer.context(0);
     let with_where = |g: &Generics| s(&quote!(#g #{&g.where_clause}));
     (
@@ -699,8 +699,8 @@ fn impl_generics_drop_the_encoded_bounds() {
     // The generics of the top-level context are the call's (no bound is implied there).
     let tr: ItemTrait = parse_quote! { trait Tr<'a, T> { fn f(&self, x: &'a Rel<T>); } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(s(&referrer.impl_generics(top_level)), "< 'a , T >");
     // The context generics are not changed.
     assert_eq!(

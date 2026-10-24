@@ -1,5 +1,8 @@
-//! Checks how rustc renders a `NotInternableError` emitted by a proc macro with its `ToTokens`
-//! implementation, by building `tests/crates/diagnostic` (which fails to compile).
+//! Checks how rustc renders the errors of the Leaker (`ErrorItem`) emitted by a proc macro with
+//! `ErrorItem::to_compile_error()`, by building `tests/crates/diagnostic` (which fails to compile).
+//! The first items of `tests/crates/diagnostic_serialized` are the same, but the macro writes its
+//! errors as tokens, reads them back and then reports them: rustc renders them in the same way, at
+//! the same places.
 //!
 //! On nightly, the notes and the help are those of the diagnostic, each with its own span and
 //! source preview; on stable, they are appended to the message (`= note: ..`, then `= help: ..`, as
@@ -15,6 +18,11 @@
 //!   `type-leak` (`Tag*`), whatever it carries as the format tag.
 //!
 //! The build must report exactly these errors, and no other.
+//!
+//! `tests/crates/diagnostic_result` is a Referrer's crate whose macro got the errors of the Leaker's
+//! macro in another crate (the serialized `LeakerResult`), allowed some, and reports the others. By
+//! default rustc points an error at the invocation, as it does for every span inside a macro of
+//! another crate; on nightly with `-Zmacro-backtrace` it points at the cause, in the Leaker's crate.
 
 use type_leak::Referrer;
 
@@ -248,13 +256,13 @@ fn every_offending_path_is_an_error_of_its_own() {
             "use absolute path: 'MyType < '_ >'",
             "15:20",
             &[because],
-            &["write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with `LeakerConfig::allowed_paths`"],
+            &["write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with `LeakerConfig::allow_path()`"],
         ),
         error(
             "use absolute path: 'Other < '_, :: core :: primitive :: u8 >'",
             "15:35",
             &[because],
-            &["write `Other` with an absolute path (e.g. `::my_crate::Other`), or allow it with `LeakerConfig::allowed_paths`"],
+            &["write `Other` with an absolute path (e.g. `::my_crate::Other`), or allow it with `LeakerConfig::allow_path()`"],
         ),
         error(
             "use absolute path: 'Sync'",
@@ -327,4 +335,168 @@ fn every_offending_path_is_an_error_of_its_own() {
         "{}",
         stderr
     );
+}
+
+/// The diagnostics of the output of rustc for the first `lines` lines of the source, as text, in
+/// order. What differs in the two fixtures is left out: the note that names the macro, and the
+/// summary of cargo.
+fn diagnostics_up_to(stderr: &str, lines: usize) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in stderr.lines().map(str::trim_end) {
+        if line.starts_with("error") || line.starts_with("warning") {
+            found.extend(current.take().map(|block| block.join("\n")));
+            if !line.starts_with("error: could not compile") {
+                current = Some(Vec::new());
+            }
+        }
+        if let Some(block) = &mut current {
+            if !line.contains("this error originates") {
+                block.push(line);
+            }
+        }
+    }
+    found.extend(current.map(|block| block.join("\n")));
+    // The place of a diagnostic is the first `--> lib.rs:<line>:` in it.
+    found
+        .into_iter()
+        .filter(|block| {
+            block
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("--> lib.rs:"))
+                .and_then(|place| place.split(':').next()?.parse::<usize>().ok())
+                .map_or(false, |line| line <= lines)
+        })
+        .collect()
+}
+
+/// The errors that a macro writes as tokens, reads back and reports are reported as those it
+/// reports directly: the tokens of the cause, of the notes and of the help keep their spans, so
+/// rustc points at the same places, with the same text.
+#[test]
+fn serialized_errors_are_reported_at_the_same_places() {
+    let direct = diagnostics_up_to(&build_fixture(), 23);
+    let built = nested::cargo("diagnostic_serialized", &["check"], &[]);
+    assert!(!built.success, "{}", built.stderr);
+    let serialized = diagnostics_up_to(&built.stderr, 23);
+    // The three items with one error, the five of `Multi`, and the two mentions of `Self`.
+    assert_eq!(direct.len(), 10, "{}", direct.join("\n"));
+    assert_eq!(serialized, direct);
+    // And no other error: the fixture is the first lines of the other.
+    let errors = built
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("error") && !line.starts_with("error: could not compile"))
+        .count();
+    assert_eq!(errors, direct.len(), "{}", built.stderr);
+}
+
+/// The first position of each error of the output of rustc: `path:line:column` of its first `-->`.
+fn first_positions(stderr: &str) -> Vec<String> {
+    let mut positions = Vec::new();
+    let mut waiting = false;
+    for line in stderr.lines() {
+        if line.starts_with("error") {
+            waiting = !line.starts_with("error: could not compile");
+        } else if let Some(position) = line.trim().strip_prefix("--> ").filter(|_| waiting) {
+            positions.push(position.to_string());
+            waiting = false;
+        }
+    }
+    positions
+}
+
+/// `line:column` of the first `needle` after the first `marker` in the source of the Leaker's crate.
+fn position_in_leaker(marker: &str, needle: &str) -> String {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/crates/leaker/lib.rs"
+    ))
+    .unwrap();
+    let start = source.find(marker).unwrap();
+    let at = start + source[start..].find(needle).unwrap();
+    let line = source[..at].matches('\n').count() + 1;
+    let column = source[..at].rsplit('\n').next().unwrap().chars().count() + 1;
+    format!("{}:{}", line, column)
+}
+
+/// The errors of the item `Denied` (`id = 9193` in the Leaker's crate) that the invocation does not
+/// allow are reported in the Referrer's crate, and the one it allows (`Clone`, with `allow(trait
+/// Clone)`) is not: `core::fmt::Debug` and `Held<'_>` are. They are at the invocation, as rustc has
+/// it for the spans of a macro of another crate.
+#[test]
+fn errors_the_referrers_macro_does_not_allow_are_reported_in_its_crate() {
+    let built = nested::cargo("diagnostic_result", &["check"], &[]);
+    assert!(!built.success, "{}", built.stderr);
+    let mut expected = vec![
+        error(
+            "use absolute path: 'Held < '_ >'",
+            "11:1",
+            &["it cannot be leaked as a whole because of `'_`"],
+            &["write `Held` with an absolute path (e.g. `::my_crate::Held`), or allow it with `LeakerConfig::allow_path()`"],
+        ),
+        error(
+            "use absolute path: 'core :: fmt :: Debug'",
+            "11:1",
+            &[],
+            &["write `core::fmt::Debug` with an absolute path (e.g. `::core::fmt::Debug`), or allow it with `LeakerConfig::allow_path()`"],
+        ),
+    ];
+    let mut got = reported(&built.stderr);
+    got.sort();
+    expected.sort();
+    assert_eq!(got, expected, "{}", built.stderr);
+    assert!(
+        built.stderr.contains("due to 2 previous errors"),
+        "{}",
+        built.stderr
+    );
+}
+
+/// With `-Zmacro-backtrace` (nightly) the spans are not moved to the invocation: the errors are at
+/// the causes in the Leaker's crate, which the serialization and the `macro_rules!` of the other
+/// crate kept. Stable has no such flag; the test above is what it can check.
+#[test]
+fn the_spans_of_the_causes_survive_the_trip_between_the_crates() {
+    if !nested::rustc_is_nightly() {
+        return;
+    }
+    let built = nested::cargo_rustc("diagnostic_result", &[], &["-Zmacro-backtrace"]);
+    assert!(!built.success, "{}", built.stderr);
+    let leaker = "/tests/crates/leaker/lib.rs";
+    let expected = [
+        position_in_leaker("id = 9193", "Held<'_>"),
+        position_in_leaker("id = 9193", "core::fmt::Debug"),
+    ];
+    let got: Vec<String> = first_positions(&built.stderr)
+        .iter()
+        .map(|position| {
+            let (path, rest) = position.split_once(leaker).expect(position);
+            assert!(path.starts_with('/'), "{}", position);
+            rest.trim_start_matches(':').to_string()
+        })
+        .collect();
+    assert_eq!(got, expected, "{}", built.stderr);
+}
+
+/// The copy is made when an error remains, with the recovered Referrer: the host of `Denied` and
+/// its impl are in the expansion, with the two parts that conflict as written. (rustc stops after
+/// the expansion that reported an error, so nothing but the expansion shows it; `-Zunpretty` is
+/// nightly's.)
+#[test]
+fn the_copy_is_made_when_an_error_remains() {
+    if !nested::rustc_is_nightly() {
+        return;
+    }
+    let built = nested::cargo_rustc("diagnostic_result", &[], &["-Zunpretty=expanded"]);
+    assert!(!built.success, "{}", built.stderr);
+    let expanded = squash(&built.stdout);
+    for part in [
+        "pubstructHost9193;",
+        "impl<T:Clone>::type_leak_test_leaker::kinds::Denied<T>forHost9193{",
+        "fnheld(&self,x:Held<'_>)->",
+        "fnshow<U:core::fmt::Debug>(&self,",
+    ] {
+        assert!(expanded.contains(part), "{} in:\n{}", part, built.stdout);
+    }
 }

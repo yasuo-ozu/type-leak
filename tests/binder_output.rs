@@ -25,7 +25,7 @@ use common::check_in;
 use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::quote;
-use type_leak::{ContextId, Leaker, LeakerConfig, NotInternableError, Referrer};
+use type_leak::{to_syn_error, Cause, ContextId, ErrorItem, Leaker, LeakerConfig, Referrer};
 
 /// A Leaker which allows `::p`, standing for an external crate which the Referrer's crate is known
 /// to have as the Leaker's: its types may be an anchor. The types of the other external crates may
@@ -36,8 +36,10 @@ fn leaker() -> Leaker {
 
 fn leaker_with(allowed: &[Path]) -> Leaker {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
-    config.allowed_paths.extend(allowed.iter().cloned());
+    config.allow_primitive().allow_prelude();
+    for path in allowed {
+        config.allow_path(path.clone());
+    }
     Leaker::from_config(config)
 }
 
@@ -45,14 +47,20 @@ fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
 }
 
-fn analyze(item: &ItemTrait) -> std::result::Result<Referrer, NotInternableError> {
+/// The messages of the errors, one per line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn analyze(item: &ItemTrait) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     analyze_with(leaker(), item)
 }
 
-fn analyze_with(
-    leaker: Leaker,
-    item: &ItemTrait,
-) -> std::result::Result<Referrer, NotInternableError> {
+fn analyze_with(leaker: Leaker, item: &ItemTrait) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     analyze_in(leaker, item).map(|(referrer, _)| referrer)
 }
 
@@ -60,9 +68,9 @@ fn analyze_with(
 fn analyze_in(
     mut leaker: Leaker,
     item: &ItemTrait,
-) -> std::result::Result<(Referrer, ContextId), NotInternableError> {
-    let context = leaker.intern_trait(item, true)?;
-    Ok((leaker.finish(), context))
+) -> std::result::Result<(Referrer, ContextId), Vec<ErrorItem>> {
+    let context = leaker.intern_trait(item, true);
+    Ok((leaker.result().finish()?, context))
 }
 
 /// The leaked types of a trait with the generics each uses.
@@ -73,8 +81,7 @@ fn leaked(item: ItemTrait) -> Vec<(String, String)> {
 /// The leaked types of a trait with the generics each uses, by the given Leaker. An optional entry
 /// (see `Referrer::must()`) is preceded by `?`.
 fn leaked_by(leaker: Leaker, item: ItemTrait) -> Vec<(String, String)> {
-    let referrer =
-        analyze_with(leaker, &item).unwrap_or_else(|e| panic!("{}", syn::Error::from(e)));
+    let referrer = analyze_with(leaker, &item).unwrap_or_else(|e| panic!("{}", to_syn_error(&e)));
     referrer
         .iter_with_generics()
         .enumerate()
@@ -92,7 +99,7 @@ fn e(ty: &str, generics: &str) -> (String, String) {
 /// The message and the first note of the error of a trait.
 fn error(item: ItemTrait) -> (String, Option<String>) {
     let err = analyze(&item).expect_err("expected an error");
-    (err.to_string(), err.note())
+    (messages(&err), err[0].note().map(str::to_string))
 }
 
 /// The note of an error in a bound or a predicate, where there is no type holding the binder.
@@ -200,7 +207,7 @@ fn a_bound_whose_output_mentions_the_lifetime_is_an_error() {
     .err()
     .unwrap();
     assert_eq!(
-        syn::Error::from(err).to_string(),
+        to_syn_error(&err).to_string(),
         format!(
             "use absolute path: 'Rel < 'x >'\n\n  = note: {}\n  = note: it cannot be leaked as a \
              whole because of `'x`\n  = help: {}\n",
@@ -265,8 +272,8 @@ fn the_type_holding_the_binder_is_leaked_as_a_whole() {
     // The fields of a struct.
     let item: ItemStruct = parse_quote! { struct S { f: for<'x> fn(Rel<'x>) -> &'x u8 } };
     let mut leaker = leaker();
-    leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         referrer.iter().map(s).collect::<Vec<_>>(),
         ["for < 'x > fn (Rel < 'x >) -> & 'x u8"]
@@ -387,7 +394,7 @@ fn the_type_holding_the_binder_which_cannot_be_leaked_is_an_error() {
     .err()
     .unwrap();
     assert_eq!(
-        syn::Error::from(err).to_string(),
+        to_syn_error(&err).to_string(),
         format!(
             "use absolute path: 'Rel < 'x >'\n\n  = note: {}\n  = note: it cannot be leaked as a \
              whole because of `dyn :: core :: fmt :: Debug`\n  = note: the lifetime of the trait \
@@ -453,8 +460,11 @@ fn the_type_holding_the_binder_which_cannot_be_leaked_is_an_error() {
 fn check_tells_the_type_holding_the_binder_is_interned() {
     let mut leaker = leaker();
     let mut check = |ty: Type| check_in(&mut leaker, &ty, &Generics::default());
-    let tokens = |tokens: &[proc_macro2::TokenStream]| -> Vec<String> {
-        tokens.iter().map(|t| t.to_string()).collect()
+    let tokens = |causes: &[Cause]| -> Vec<String> {
+        causes
+            .iter()
+            .map(|cause| quote!(#cause).to_string())
+            .collect()
     };
     // `Rel<'x>` alone is leaked (as a component), unless the return type mentions `'x`.
     let result = check(parse_quote!(for<'x> fn(Rel<'x>)));
@@ -1167,8 +1177,11 @@ fn the_anchor_is_checked_for_each_binder() {
 fn check_tells_the_anchored_type_is_interned_alone() {
     let mut leaker = leaker();
     let mut check = |ty: Type| check_in(&mut leaker, &ty, &Generics::default());
-    let tokens = |tokens: &[proc_macro2::TokenStream]| -> Vec<String> {
-        tokens.iter().map(|t| t.to_string()).collect()
+    let tokens = |causes: &[Cause]| -> Vec<String> {
+        causes
+            .iter()
+            .map(|cause| quote!(#cause).to_string())
+            .collect()
     };
     // `Rel<'x>` stays a component of the function pointer, which is not interned.
     let result = check(parse_quote!(for<'x> fn(&'x u8) -> Rel<'x>));
@@ -1232,7 +1245,7 @@ fn external_crate_types_do_not_anchor_the_lifetime() {
         let (_, note) = error_by(leaker_allowing_nothing(), item.clone());
         assert_eq!(note.as_deref(), Some(NOTE), "{}", s(&item));
     }
-    // It is an anchor where the crate is allowed (an absolute path in `allowed_paths`).
+    // It is an anchor where the crate is allowed (an absolute path given to `allow_path()`).
     assert_eq!(
         leaked_by(leaker_allowing_other(), item.clone()),
         [e("Parser < 'x >", "< 'x >")]
@@ -1376,7 +1389,7 @@ fn the_types_which_stay_as_written_still_anchor_the_lifetime() {
             }
         };
         let referrer = analyze_with(leaker_allowing_nothing(), &item)
-            .unwrap_or_else(|e| panic!("{}: {}", input, syn::Error::from(e)));
+            .unwrap_or_else(|e| panic!("{}: {}", input, to_syn_error(&e)));
         // `Parser<'x>` is leaked alone (twice: in each binder, which are the same entry), and the
         // external types are optional entries with `'x` among their generics, if they use it.
         let required: Vec<String> = referrer
@@ -1581,5 +1594,5 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
 
 fn error_by(leaker: Leaker, item: ItemTrait) -> (String, Option<String>) {
     let err = analyze_with(leaker, &item).expect_err("expected an error");
-    (err.to_string(), err.note())
+    (messages(&err), err[0].note().map(str::to_string))
 }

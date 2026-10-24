@@ -10,28 +10,45 @@
 
 use syn::*;
 use template_quote::quote;
-use type_leak::{Leaker, LeakerConfig, NotInternableError, Referrer};
+use type_leak::{ErrorItem, Leaker, LeakerConfig, Referrer};
 
 fn s(x: &impl template_quote::ToTokens) -> String {
     quote!(#x).to_string()
 }
 
+/// The messages of the errors, one per line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn leaker() -> Leaker {
+    leaker_allowing(&[])
+}
+
+/// Like `leaker()`, with the paths `allowed` too.
+fn leaker_allowing(allowed: &[&str]) -> Leaker {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
+    for path in allowed {
+        config.allow_path(parse_str(path).unwrap());
+    }
     Leaker::from_config(config)
 }
 
 /// Analyzes `item` with the matching `intern_*`.
-fn leak(item: Item) -> std::result::Result<Referrer, NotInternableError> {
+fn leak(item: Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     let mut leaker = leaker();
     match &item {
         Item::Struct(item) => leaker.intern_struct(item, true),
         Item::Trait(item) => leaker.intern_trait(item, true),
         Item::Impl(item) => leaker.intern_impl(item, true),
         _ => panic!("unsupported item"),
-    }?;
-    Ok(leaker.finish())
+    };
+    leaker.result().finish()
 }
 
 /// The leaked types, required then optional, with their generics.
@@ -52,14 +69,14 @@ fn rejected(item: Item) -> (String, Option<String>) {
         Ok(referrer) => panic!("not rejected: {:?}", entries(&referrer)),
         Err(err) => err,
     };
-    (err.to_string(), err.note())
+    (messages(&err), err[0].note().map(str::to_string))
 }
 
 /// The help of the error, as `rejected()` gives the headline and the note.
 fn help_of(item: Item) -> String {
     match leak(item) {
         Ok(referrer) => panic!("not rejected: {:?}", entries(&referrer)),
-        Err(err) => err.help().expect("a help"),
+        Err(err) => err[0].help_text().expect("a help").to_string(),
     }
 }
 
@@ -221,7 +238,7 @@ fn what_needs_no_environment_is_accepted() {
     for item in items {
         let text = s(&item);
         if let Err(err) = leak(item) {
-            panic!("{} is rejected: {}", text, err);
+            panic!("{} is rejected: {}", text, messages(&err));
         }
     }
 }
@@ -319,38 +336,38 @@ fn an_optional_entry_in_a_cycle_is_copied_as_written() {
     // `::ext::Wrap<T>` may be replaced by the Referrer, but then its path through the Repeater
     // would make a cycle with the bound that names it: it is copied as written, which is no error.
     let mut leaker = ext_leaker();
-    leaker
-        .intern_struct(
-            &parse_quote!(
-                pub struct S<T: Into<::ext::Wrap<T>>>(T);
-            ),
-            true,
-        )
-        .unwrap();
-    assert_eq!(types(&leaker.finish()), Vec::<String>::new());
+    leaker.intern_struct(
+        &parse_quote!(
+            pub struct S<T: Into<::ext::Wrap<T>>>(T);
+        ),
+        true,
+    );
+    assert_eq!(
+        types(&leaker.result().finish().unwrap()),
+        Vec::<String>::new()
+    );
     // That holds where the type is also out of the bounds: the Referrer finds an entry by the type
     // and its context, wherever it is.
     let mut leaker = ext_leaker();
-    leaker
-        .intern_struct(
-            &parse_quote!(
-                pub struct S<T: Into<::ext::Wrap<T>>>(T, ::ext::Wrap<T>);
-            ),
-            true,
-        )
-        .unwrap();
-    assert_eq!(types(&leaker.finish()), Vec::<String>::new());
+    leaker.intern_struct(
+        &parse_quote!(
+            pub struct S<T: Into<::ext::Wrap<T>>>(T, ::ext::Wrap<T>);
+        ),
+        true,
+    );
+    assert_eq!(
+        types(&leaker.result().finish().unwrap()),
+        Vec::<String>::new()
+    );
     // Without the bound, it is an optional entry as ever.
     let mut leaker = ext_leaker();
-    leaker
-        .intern_struct(
-            &parse_quote!(
-                pub struct S<T: Clone>(T, ::ext::Wrap<T>);
-            ),
-            true,
-        )
-        .unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(
+        &parse_quote!(
+            pub struct S<T: Clone>(T, ::ext::Wrap<T>);
+        ),
+        true,
+    );
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(types(&referrer), [":: ext :: Wrap < T >"]);
     assert!(!referrer.must(0));
 }
@@ -361,29 +378,25 @@ fn an_optional_entry_in_the_bound_of_a_generic_that_a_predicate_uses() {
     // through the Repeater, where the impl of `Wrap<T>` needs it as written: it is copied as
     // written instead, which is no error.
     let mut leaker = ext_leaker();
-    leaker
-        .intern_struct(
-            &parse_quote!(
-                pub struct S<T: Fn(::ext::X)>(T)
-                where
-                    Wrap<T>: Sized;
-            ),
-            true,
-        )
-        .unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(
+        &parse_quote!(
+            pub struct S<T: Fn(::ext::X)>(T)
+            where
+                Wrap<T>: Sized;
+        ),
+        true,
+    );
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(types(&referrer), ["Wrap < T >"]);
     // Without the predicate, it is an optional entry.
     let mut leaker = ext_leaker();
-    leaker
-        .intern_struct(
-            &parse_quote!(
-                pub struct S<T: Fn(::ext::X)>(T);
-            ),
-            true,
-        )
-        .unwrap();
-    assert_eq!(types(&leaker.finish()), [":: ext :: X"]);
+    leaker.intern_struct(
+        &parse_quote!(
+            pub struct S<T: Fn(::ext::X)>(T);
+        ),
+        true,
+    );
+    assert_eq!(types(&leaker.result().finish().unwrap()), [":: ext :: X"]);
 }
 
 #[test]
@@ -552,7 +565,7 @@ fn self_in_a_predicate_of_an_impl_is_rejected_if_its_self_type_is_leaked_with_a_
     ] {
         let text = s(&item);
         if let Err(err) = leak(item) {
-            panic!("{} is rejected: {}", text, err);
+            panic!("{} is rejected: {}", text, messages(&err));
         }
     }
 }
@@ -570,24 +583,28 @@ fn the_cycle_of_self_is_an_error_where_self_cannot_be_leaked() {
             }
         }
     );
-    let err = leaker().intern_impl(&item, false).unwrap_err();
-    assert!(err.to_string().contains(HEADLINE), "{}", err);
+    let mut leaker = leaker();
+    leaker.intern_impl(&item, false);
+    let result = leaker.result();
+    let err = result.errors();
+    assert!(messages(err).contains(HEADLINE), "{}", messages(err));
 }
 
 #[test]
 fn a_scope_that_fails_leaves_no_trace_of_its_cycle() {
     let mut leaker = leaker();
     let generics: Generics = parse_quote!(<T: Fn(Rel)>);
-    let result = leaker.enter_generics(&generics, |view| {
+    leaker.enter_generics(&generics, |view| {
         view.visit_where_clause(&parse_quote!(where Wrap<T>: Sized));
     });
-    assert!(result.is_err());
     // The next scope is not affected.
-    let result = leaker.enter_generics(&generics, |view| {
+    leaker.enter_generics(&generics, |view| {
         view.visit_type(&parse_quote!(Wrap<T>));
     });
-    assert!(result.is_ok());
-    assert_eq!(types(&leaker.finish()), ["Wrap < T >"]);
+    // The first scope has the only error, and the entry is that of the second.
+    let result = leaker.result();
+    assert_eq!(result.errors().len(), 1);
+    assert_eq!(types(&result.into_referrer()), ["Wrap < T >"]);
 }
 
 /// The headline and the note of an error, as `rejected()` gives them.
@@ -714,7 +731,7 @@ fn a_bound_that_names_an_associated_type_that_rustc_normalizes_is_unstable() {
     ] {
         let text = s(&item);
         if let Err(err) = leak(item) {
-            panic!("{} is rejected: {}", text, err);
+            panic!("{} is rejected: {}", text, messages(&err));
         }
     }
     let referrer = leak(parse_quote!(
@@ -820,7 +837,7 @@ fn self_and_its_associated_types_in_a_bound_are_unstable() {
     ] {
         let text = s(&item);
         if let Err(err) = leak(item) {
-            panic!("{} is rejected: {}", text, err);
+            panic!("{} is rejected: {}", text, messages(&err));
         }
     }
 }
@@ -899,7 +916,7 @@ fn self_a_in_a_predicate_of_an_impl_is_unstable_with_a_leaked_bound_of_the_impl(
     ] {
         let text = s(&item);
         if let Err(err) = leak(item) {
-            panic!("{} is rejected: {}", text, err);
+            panic!("{} is rejected: {}", text, messages(&err));
         }
     }
 }
@@ -909,108 +926,102 @@ fn an_optional_entry_that_an_unstable_bound_makes_cyclic_is_copied_as_written() 
     // F17: `&'a ::ext::W<T, ::ext::B0>` is in a predicate that names `'a`, so it is in its own
     // context. It is leaked as a whole, so its parts cannot stand for it either.
     let mut leaker = ext_leaker();
-    leaker
-        .intern_struct(
-            &parse_quote!(
-                pub struct S<'a, T: 'a>
-                where
-                    T: Fn(&'a ::ext::W<T, ::ext::B0>) -> u8,
-                {
-                    f0: u8,
-                }
-            ),
-            true,
-        )
-        .unwrap();
-    assert_eq!(types(&leaker.finish()), Vec::<String>::new());
+    leaker.intern_struct(
+        &parse_quote!(
+            pub struct S<'a, T: 'a>
+            where
+                T: Fn(&'a ::ext::W<T, ::ext::B0>) -> u8,
+            {
+                f0: u8,
+            }
+        ),
+        true,
+    );
+    assert_eq!(
+        types(&leaker.result().finish().unwrap()),
+        Vec::<String>::new()
+    );
     // Without the lifetime, it is not in its own context, and `B0` is an optional entry.
     let mut leaker = ext_leaker();
-    leaker
-        .intern_struct(
-            &parse_quote!(
-                pub struct S<'a, T: 'a>
-                where
-                    T: Fn(::ext::W<T, ::ext::B0>) -> u8,
-                {
-                    f0: &'a T,
-                }
-            ),
-            true,
-        )
-        .unwrap();
-    assert_eq!(types(&leaker.finish()), [":: ext :: B0"]);
+    leaker.intern_struct(
+        &parse_quote!(
+            pub struct S<'a, T: 'a>
+            where
+                T: Fn(::ext::W<T, ::ext::B0>) -> u8,
+            {
+                f0: &'a T,
+            }
+        ),
+        true,
+    );
+    assert_eq!(types(&leaker.result().finish().unwrap()), [":: ext :: B0"]);
     // An optional entry in a predicate, with a bound of its context that names an `Item` that is
     // equated, or `Self::A`.
     let mut leaker = ext_leaker();
-    leaker
-        .intern_impl(
-            &parse_quote!(
-                impl<T: Iterator> S<T>
+    leaker.intern_impl(
+        &parse_quote!(
+            impl<T: Iterator> S<T>
+            where
+                T: Fn(T::Item),
+            {
+                fn m(&self)
                 where
-                    T: Fn(T::Item),
+                    T: Iterator<Item = ::ext::W<T>>,
                 {
-                    fn m(&self)
-                    where
-                        T: Iterator<Item = ::ext::W<T>>,
-                    {
-                    }
                 }
-            ),
-            true,
-        )
-        .unwrap();
-    assert_eq!(types(&leaker.finish()), ["S < T >"]);
+            }
+        ),
+        true,
+    );
+    assert_eq!(types(&leaker.result().finish().unwrap()), ["S < T >"]);
     let mut leaker = ext_leaker();
-    leaker
-        .intern_trait(
-            &parse_quote!(
-                pub trait Tr {
-                    type A0;
-                    fn m<X>(&self)
-                    where
-                        X: Fn(&Self::A0) -> u8,
-                        ::ext::Rel<X>: Default;
-                }
-            ),
-            true,
-        )
-        .unwrap();
-    assert_eq!(types(&leaker.finish()), Vec::<String>::new());
+    leaker.intern_trait(
+        &parse_quote!(
+            pub trait Tr {
+                type A0;
+                fn m<X>(&self)
+                where
+                    X: Fn(&Self::A0) -> u8,
+                    ::ext::Rel<X>: Default;
+            }
+        ),
+        true,
+    );
+    assert_eq!(
+        types(&leaker.result().finish().unwrap()),
+        Vec::<String>::new()
+    );
     // The optional types of a self type that a bound of an entry names (`Self`).
     let mut leaker = ext_leaker();
-    leaker
-        .intern_impl(
-            &parse_quote!(
-                impl ::ext::S {
-                    fn m<X>(&self)
-                    where
-                        X: Fn(Self) -> u8,
-                        Rel<X>: Default,
-                    {
-                    }
+    leaker.intern_impl(
+        &parse_quote!(
+            impl ::ext::S {
+                fn m<X>(&self)
+                where
+                    X: Fn(Self) -> u8,
+                    Rel<X>: Default,
+                {
                 }
-            ),
-            true,
-        )
-        .unwrap();
-    assert_eq!(types(&leaker.finish()), ["Rel < X >"]);
+            }
+        ),
+        true,
+    );
+    assert_eq!(types(&leaker.result().finish().unwrap()), ["Rel < X >"]);
     // Without a predicate that names the entry, the self type is an optional entry as ever.
     let mut leaker = ext_leaker();
-    leaker
-        .intern_impl(
-            &parse_quote!(
-                impl ::ext::S {
-                    fn m<X>(&self, a: Rel<X>)
-                    where
-                        X: Fn(Self) -> u8,
-                    {
-                    }
+    leaker.intern_impl(
+        &parse_quote!(
+            impl ::ext::S {
+                fn m<X>(&self, a: Rel<X>)
+                where
+                    X: Fn(Self) -> u8,
+                {
                 }
-            ),
-            true,
-        )
-        .unwrap();
-    let referrer = leaker.finish();
+            }
+        ),
+        true,
+    );
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(types(&referrer), ["Rel < X >", ":: ext :: S"]);
     assert!(referrer.must(0) && !referrer.must(1));
 }
@@ -1076,7 +1087,7 @@ fn bare_self_predicates_stay_accepted() {
     ] {
         let item: Item = item;
         let text = s(&item);
-        let referrer = leak(item).unwrap_or_else(|e| panic!("{}: {}", text, e));
+        let referrer = leak(item).unwrap_or_else(|e| panic!("{}: {}", text, messages(&e)));
         assert_eq!(types(&referrer), ["Rel < Self >", "S"], "{}", text);
         assert!(referrer.must(0) && referrer.must(1), "{}", text);
     }
@@ -1182,14 +1193,16 @@ fn the_standard_traits_do_not_define_an_associated_type() {
         ))
         .unwrap();
         // The relative names are allowed paths, as the prelude's are in `leaker()`.
-        let mut leaker = leaker();
-        leaker.allowed_paths.push(parse_str(name).unwrap());
+        let mut leaker = leaker_allowing(&[name]);
         match &item {
             Item::Trait(item) => leaker.intern_trait(item, true),
             _ => unreachable!(),
-        }
-        .unwrap_or_else(|e| panic!("{}: {}", name, e));
-        assert_eq!(types(&leaker.finish()), ["Rel < T >"], "{}", name);
+        };
+        let referrer = leaker
+            .result()
+            .finish()
+            .unwrap_or_else(|e| panic!("{}: {}", name, messages(&e)));
+        assert_eq!(types(&referrer), ["Rel < T >"], "{}", name);
     }
     // The absolute path of a trait of the standard library is one too.
     let referrer = leak(parse_quote!(
@@ -1209,16 +1222,15 @@ fn the_standard_traits_do_not_define_an_associated_type() {
             name
         ))
         .unwrap();
-        let mut leaker = leaker();
-        for allowed in ["MyTrait", "p::Tr", "::p"] {
-            leaker.allowed_paths.push(parse_str(allowed).unwrap());
-        }
+        let mut leaker = leaker_allowing(&["MyTrait", "p::Tr", "::p"]);
         match &item {
             Item::Trait(item) => leaker.intern_trait(item, true),
             _ => unreachable!(),
-        }
-        .unwrap_or_else(|e| panic!("{}: {}", name, e));
-        let referrer = leaker.finish();
+        };
+        let referrer = leaker
+            .result()
+            .finish()
+            .unwrap_or_else(|e| panic!("{}: {}", name, messages(&e)));
         assert_eq!(
             entries(&referrer),
             [(
@@ -1236,20 +1248,18 @@ fn the_standard_traits_do_not_define_an_associated_type() {
             name
         ))
         .unwrap();
-        let mut leaker = leaker();
-        for allowed in ["MyTrait", "p::Tr", "::p"] {
-            leaker.allowed_paths.push(parse_str(allowed).unwrap());
-        }
-        let err = match &item {
+        let mut leaker = leaker_allowing(&["MyTrait", "p::Tr", "::p"]);
+        match &item {
             Item::Trait(item) => leaker.intern_trait(item, true),
             _ => unreachable!(),
-        }
-        .unwrap_err();
+        };
+        let result = leaker.result();
+        let err = result.errors();
         assert!(
-            err.to_string().contains("names `T :: Item`"),
+            messages(err).contains("names `T :: Item`"),
             "{}: {}",
             name,
-            err
+            messages(err)
         );
     }
 }
@@ -1265,7 +1275,7 @@ fn self_assoc_in_a_bound_of_an_impl_cannot_be_written_in_the_repeater() {
         }
     );
     let err = leak(item).err().unwrap();
-    let headlines: Vec<String> = err.items().map(|item| item.message).collect();
+    let headlines: Vec<String> = err.into_iter().map(|item| item.message).collect();
     assert_eq!(
         headlines,
         [

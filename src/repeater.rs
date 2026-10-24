@@ -128,8 +128,8 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
 ///     }
 /// };
 /// let mut leaker = Leaker::new();
-/// let top_level = leaker.intern_trait(&item, false).unwrap();
-/// let referrer = leaker.finish();
+/// let top_level = leaker.intern_trait(&item, false);
+/// let referrer = leaker.result().finish().unwrap();
 /// assert_eq!(referrer.iter().count(), 2);
 /// assert_eq!(referrer.context_generics(top_level).params.len(), 1);
 ///

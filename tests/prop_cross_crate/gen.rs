@@ -95,7 +95,7 @@ use std::hash::Hasher;
 /// `?` applies to the real `Sized` only, so `T: ?Sized` is no more context-dependent than
 /// `T: ?::core::marker::Sized`. `type-leak` at fb11f41 does not know it: it takes the bare `Sized`
 /// of `?Sized` for a relative path like any other bare name of the prelude, and rejects it unless
-/// `LeakerConfig::allow_std_prelude()` is on. The Leaker accepts a bare `?Sized` always (`?` applies
+/// `LeakerConfig::allow_prelude()` is on. The Leaker accepts a bare `?Sized` always (`?` applies
 /// to the real `Sized` only), so it is `true`; it is the only place that says so. It reaches
 /// three places: the generator (a bare `?Sized` is an expected rejection without the prelude only
 /// if it is `false`: the tag `bare:?Sized`), the macro (`relaxed_sized` argument of `prop_leak`:
@@ -197,9 +197,9 @@ pub struct Features {
     pub strict_cycles: bool,
     /// A strict Referrer replaces an optional entry that holds a lifetime of a method (`fn
     /// m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>`): the copy has `'x` in no argument that
-    /// constrains it, so it is early-bound, where it is late-bound in the trait (E0195, F18: the
-    /// `Referrer::must()` docs say that replacing a type can lose a method lifetime). Off,
-    /// the item that has it is not invoked as strict.
+    /// constrains it, so it is early-bound, where it is late-bound in the trait (E0195, F18, fixed:
+    /// the Leaker copies the type as written). Off (the default), the item that has it is not
+    /// invoked as strict.
     pub strict_anchors: bool,
     /// In an impl whose self type is leaked, a method with a bound of a generic that names `Self`
     /// (`X: Fn(&Self) -> u8`) and a leaked type in another predicate that uses the generic
@@ -324,6 +324,19 @@ pub struct Features {
     pub nested_self_entries: bool,
 }
 
+/// `TYPE_LEAK_PROP_FEATURES` has `allow_stages`: the macro compares the errors that remain with
+/// `LeakerConfig::allow_prelude()` and with `LeakerResult::allow_prelude()` for every item and
+/// makes the copy of each (`stages = true` in the attribute, which only asks it to report both
+/// counts and to write the copies), and the harness prints how many items differ and builds the
+/// copies (`main.rs`: "The copies after the analysis without the prelude"). Off by default, so that
+/// the tables do not change. It is no field of `Features`, whose `Debug` is in the tables, and not
+/// part of `all`.
+pub fn allow_stages() -> bool {
+    std::env::var("TYPE_LEAK_PROP_FEATURES").map_or(false, |list| {
+        list.split(',').any(|name| name.trim() == "allow_stages")
+    })
+}
+
 impl Features {
     /// The features of the findings that are fixed are on by default, and `list` adds the known
     /// failures.
@@ -433,6 +446,8 @@ impl Features {
                 "trait_self_defaults" => features.trait_self_defaults = true,
                 "self_bound_adts" => features.self_bound_adts = true,
                 "nested_self_entries" => features.nested_self_entries = true,
+                // Read by `allow_stages()`: it is no feature of the generator.
+                "allow_stages" => (),
                 "unsized_params" => features.unsized_params = true,
                 "bound_cycles" => features.bound_cycles = true,
                 other => panic!("unknown feature `{}`", other),
@@ -513,6 +528,21 @@ pub const TAG_REDECLARED: &str = "shape:redeclared";
 /// `nested_self_entries`.
 pub const TAG_SELF_BOUND_ADT: &str = "shape:self_bound_adt";
 pub const TAG_SELF_BOUND_TYPE: &str = "shape:self_bound_type";
+/// The shapes that the items accepted by `LeakerResult::allow()` fail on (`TYPE_LEAK_PROP_ACCEPT`,
+/// `main.rs`, `accept_families()`; the docs of `LeakerResult::allow()` list them). They explain no
+/// rejection:
+///
+/// - `self_in_predicate`: a where predicate of the item names `Self` or `Self::A`
+///   (`where X: Into<Self::A>`, `where Y: Fn(&Self) -> u8`), which `bound_cycle` (a bound of the
+///   generics that names a leaked type) makes unprovable;
+/// - `alias_bound`: a bound of an iterator names its `Item` (`T: Fn(<T as Iterator>::Item) -> u8`,
+///   also through the alias `BIt<T>`) next to a bound or a supertrait that fixes it, which no impl of
+///   a trait can have next to a method predicate that names `Self::A`;
+/// - `hidden_self`: a function pointer or `Fn(..)` whose output has an elided lifetime and whose
+///   inputs name `Self` and a path that hides a lifetime (`fn(Chars, Self) -> &u8`).
+pub const TAG_SELF_IN_PREDICATE: &str = "self_in_predicate";
+pub const TAG_ALIAS_BOUND: &str = "alias_bound";
+pub const TAG_HIDDEN_SELF: &str = "hidden_self";
 
 /// An item with a macro on it, which the Referrer invokes.
 #[derive(Clone)]
@@ -546,6 +576,22 @@ pub struct Case {
     pub items: Vec<Item>,
     /// The line of the Referrer's `lib.rs` where each item is invoked.
     pub referrer_lines: Vec<(usize, usize)>,
+    /// The `lib.rs` of the second Referrer's crate of `TYPE_LEAK_PROP_ACCEPT`, which copies the
+    /// items that the Leaker accepts only by `LeakerResult::allow()` (see [`accept_referrer()`]).
+    pub accept_referrer: String,
+    /// The line of `accept_referrer` where each item is invoked.
+    pub accept_lines: Vec<(usize, usize)>,
+    /// The `lib.rs` of the Referrer's crate of `TYPE_LEAK_PROP_FEATURES=allow_stages`, which copies
+    /// each item as the macro of the Leaker analyzed it without the prelude, and gave its result
+    /// `allow_prelude()` and the causes of the errors that remain (see [`accept_referrer()`]).
+    pub stage_referrer: String,
+    /// The line of `stage_referrer` where each item is invoked.
+    pub stage_lines: Vec<(usize, usize)>,
+    /// The `lib.rs` of the Referrer's crate of the copies that `allow_stages` compares them with: the
+    /// analysis of a config that allows the prelude, and the causes of its errors allowed.
+    pub base_referrer: String,
+    /// The line of `base_referrer` where each item is invoked.
+    pub base_lines: Vec<(usize, usize)>,
 }
 
 pub const ATTR: &str = "@ATTR@";
@@ -1252,6 +1298,9 @@ pub struct Gen {
     /// The attribute of the item being generated says `redeclare = true`: the Referrer's crate
     /// declares the trait again (`trait_self_defaults`).
     redeclare: bool,
+    /// The `use`s of each module whose items are analyzed one by one, by its path (the imports that
+    /// the names `I1`, `J1`, `ILEN` come from), for `accept_referrer()`. They draw no random number.
+    mod_uses: Vec<(Vec<String>, String)>,
 }
 
 const PRIMS: &[&str] = &[
@@ -1299,6 +1348,7 @@ impl Gen {
             assoc_self_types: Vec::new(),
             in_default: false,
             redeclare: false,
+            mod_uses: Vec::new(),
         };
         g.cfg.prelude = g.chance(50);
         g.cfg.allow_std = g.chance(35);
@@ -1974,6 +2024,9 @@ impl Gen {
                 && (self.features.self_elision || !a.adds_lts)
             {
                 self.elided_self |= a.uses_self;
+                if hidden && a.uses_self {
+                    self.tags.insert(TAG_HIDDEN_SELF.to_string());
+                }
                 let input = if hidden {
                     format!("{}, {}", self.hidden_path(), a.text)
                 } else {
@@ -2174,6 +2227,9 @@ impl Gen {
                     return self.dyn_bare(sc, depth, false);
                 }
                 self.elided_self |= a.uses_self;
+                if hidden && a.uses_self {
+                    self.tags.insert(TAG_HIDDEN_SELF.to_string());
+                }
                 let input = if hidden {
                     format!("{}, {}", self.hidden_path(), a.text)
                 } else {
@@ -2705,6 +2761,7 @@ impl Gen {
                 {
                     bounded.push((x.clone(), "fn"));
                     bounded.push((x.clone(), "iter"));
+                    self.tags.insert(TAG_ALIAS_BOUND.to_string());
                     let head = self.pick(&heads).clone();
                     let (fn_path, iterator) = (self.trait_path("Fn"), self.trait_path("Iterator"));
                     sk.preds.push(format!(
@@ -2820,6 +2877,7 @@ impl Gen {
                 if !(x.fixed_item == 2 && names_assoc) && !bounded.contains(&(x.name.clone(), "fn"))
                 {
                     bounded.push((x.name.clone(), "fn"));
+                    self.tags.insert(TAG_ALIAS_BOUND.to_string());
                     let head = self.pick(&heads).clone();
                     let iterator = self.trait_path("Iterator");
                     let item = if x.fixed_item == 2 {
@@ -3620,7 +3678,7 @@ impl Gen {
     fn attr(&self, id: usize, allow_self: bool, scope: &str, strict: bool) -> String {
         format!(
             "#[{}(id = {}, allow_self = {}, prelude = {}, scope = \"{}\", allow = \"{}\", \
-             {}{}strict = {}, primitive = {}, relaxed_sized = {})]\n",
+             {}{}{}strict = {}, primitive = {}, relaxed_sized = {})]\n",
             ATTR,
             id,
             allow_self,
@@ -3634,6 +3692,11 @@ impl Gen {
             },
             if scope == "mod" && self.features.nested_self_entries {
                 "nested_self_entries = true, "
+            } else {
+                ""
+            },
+            if allow_stages() {
+                "stages = true, "
             } else {
                 ""
             },
@@ -4995,6 +5058,9 @@ impl Gen {
         if !allow_self && has_word(&text, "Self") {
             self.tags.insert(TAG_SELF_DENIED.to_string());
         }
+        if names_self_in_where(&text) {
+            self.tags.insert(TAG_SELF_IN_PREDICATE.to_string());
+        }
         if let Some(id) = ann_id {
             self.items.push(Item {
                 id,
@@ -5022,6 +5088,9 @@ impl Gen {
         nested: usize,
     ) -> String {
         let (env, uses) = self.build_env(path);
+        if !whole {
+            self.mod_uses.push((path.to_vec(), uses.clone()));
+        }
         let saved_env = std::mem::replace(&mut self.env, env);
         let saved_traits = std::mem::take(&mut self.traits);
         let saved_adts = std::mem::take(&mut self.adts);
@@ -5150,13 +5219,114 @@ pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Feat
         );
         referrer_lines.push((line, item.id));
     }
+    let (stage_referrer, stage_lines) =
+        accept_referrer(&krate, &g.mod_uses, &items, "__tl_stagecopy_");
+    let (base_referrer, base_lines) =
+        accept_referrer(&krate, &g.mod_uses, &items, "__tl_stagebase_");
+    let (accept_referrer, accept_lines) =
+        accept_referrer(&krate, &g.mod_uses, &items, "__tl_prop_");
     Case {
         config: g.cfg.clone(),
         leaker: lib,
         referrer,
         items,
         referrer_lines,
+        accept_referrer,
+        accept_lines,
+        stage_referrer,
+        stage_lines,
+        base_referrer,
+        base_lines,
     }
+}
+
+/// The `lib.rs` of the second Referrer's crate of `TYPE_LEAK_PROP_ACCEPT` (the crate `tlp_a_NNN`),
+/// which copies the items that the Leaker accepts only by `LeakerResult::allow(cause)` of the
+/// causes of its errors, and the line where each item is invoked.
+///
+/// The copy keeps the part that conflicts as written, whole: the paths in it are those the item has
+/// in the Leaker's crate (`R0`, `self::R1`, `super::R1`, `super::base::B1`, `crate::base::B1`, an
+/// import `I1` or `J1`), and it is up to the user of `allow()` that they resolve to the same items
+/// in the crate of the copy. This crate makes them: the module of the Leaker's crate that the item
+/// is in is declared again with the same `use`s and a glob import of the Leaker's module, in the same
+/// place of the module tree (so that `super::` and `self::` mean the same), and the root has `base`,
+/// the glob import of the Leaker's `base` (so that `crate::base::B1` means the same). The items are
+/// copied in the module they are invoked in, as they are in the Leaker's crate (a module analyzed
+/// as a whole declares itself at the root).
+///
+/// It is a crate of its own, not a module of the other Referrer's crate, because `crate::base` is
+/// the root of the crate that has the copy: `base` at the root of the other crate would let an
+/// ordinary item that keeps a relative path by mistake resolve it, and that crate must not have one.
+///
+/// `macro_prefix` is the start of the name of the macro of each item (`__tl_prop_`), and the crates of
+/// `TYPE_LEAK_PROP_FEATURES=allow_stages` invoke `__tl_stagecopy_` and `__tl_stagebase_` instead. The crate declares no
+/// name of the standard prelude, so that they mean what they mean in the prelude: the globs import
+/// what the Leaker's modules declare, and `shadowed_prelude_names()` of the harness checks that none of
+/// it has such a name.
+fn accept_referrer(
+    krate: &str,
+    mod_uses: &[(Vec<String>, String)],
+    items: &[Item],
+    macro_prefix: &str,
+) -> (String, Vec<(usize, usize)>) {
+    fn invocation(krate: &str, item: &Item, path: &[String], macro_prefix: &str) -> String {
+        let mut module = format!("::{}", krate);
+        for m in path {
+            module += &format!("::{}", m);
+        }
+        format!(
+            "::{}::{}{}!(path = {}{}, accept);\n",
+            krate,
+            macro_prefix,
+            item.id,
+            module,
+            if item.strict { ", strict" } else { "" }
+        )
+    }
+    fn module(
+        krate: &str,
+        path: &[String],
+        mod_uses: &[(Vec<String>, String)],
+        items: &[Item],
+        macro_prefix: &str,
+        out: &mut String,
+    ) {
+        if let Some((_, uses)) = mod_uses.iter().find(|(p, _)| p == path) {
+            *out += uses;
+        }
+        *out += &format!("pub use ::{}::{}::*;\n", krate, path.join("::"));
+        for item in items.iter().filter(|i| i.kind != "mod" && i.module == path) {
+            *out += &invocation(krate, item, path, macro_prefix);
+        }
+        for (sub, _) in mod_uses
+            .iter()
+            .filter(|(p, _)| p.len() == path.len() + 1 && p.starts_with(path))
+        {
+            *out += &format!("pub mod {} {{\n", sub.last().unwrap());
+            module(krate, sub, mod_uses, items, macro_prefix, out);
+            *out += "}\n";
+        }
+    }
+    let mut text = String::from("#![allow(warnings)]\n");
+    text += &format!("pub mod base {{ pub use ::{}::base::*; }}\n", krate);
+    for (path, _) in mod_uses.iter().filter(|(p, _)| p.len() == 1) {
+        text += &format!("pub mod {} {{\n", path[0]);
+        module(krate, path, mod_uses, items, macro_prefix, &mut text);
+        text += "}\n";
+    }
+    // A module analyzed as a whole declares itself, at the root.
+    for item in items.iter().filter(|i| i.kind == "mod") {
+        text += &invocation(krate, item, &[], macro_prefix);
+    }
+    let lines = items
+        .iter()
+        .filter_map(|item| {
+            let call = format!("::{}{}!(", macro_prefix, item.id);
+            let at = text.lines().position(|line| line.contains(&call))?;
+            Some((at + 1, item.id))
+        })
+        .collect();
+    (text, lines)
 }
 
 /// Whether the where predicate `pred` may name a type that the Leaker leaks: a name that is not
@@ -5286,6 +5456,58 @@ fn names_primitive(text: &str) -> bool {
 fn has_word(text: &str, name: &str) -> bool {
     text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .any(|word| word == name)
+}
+
+/// Whether a predicate of a where clause of the text (from `where` up to the `{` or the `;` that
+/// ends the item) names `Self` or `Self::A`, other than the ones on `Self` itself (`Self: Sized`,
+/// `Self: 'x`).
+pub fn names_self_in_where(text: &str) -> bool {
+    text.match_indices("where ").any(|(at, _)| {
+        let clause = where_clause(&text[at + "where ".len()..]);
+        split_predicates(clause)
+            .iter()
+            .any(|pred| !pred.trim_start().starts_with("Self:") && has_word(pred, "Self"))
+    })
+}
+
+/// The where clause at the start of `text`: up to the first `{` or `;` that is not in brackets (an
+/// array type has a `;` in it).
+fn where_clause(text: &str) -> &str {
+    let mut depth = 0i32;
+    let mut previous = ' ';
+    for (at, c) in text.char_indices() {
+        match c {
+            '(' | '[' | '<' => depth += 1,
+            ')' | ']' => depth -= 1,
+            '>' if previous != '-' => depth -= 1,
+            '{' | ';' if depth <= 0 => return &text[..at],
+            _ => (),
+        }
+        previous = c;
+    }
+    text
+}
+
+/// The predicates of a where clause: the text split at the commas that are not in brackets.
+fn split_predicates(clause: &str) -> Vec<&str> {
+    let (mut depth, mut start) = (0i32, 0);
+    let mut out = Vec::new();
+    let mut previous = ' ';
+    for (at, c) in clause.char_indices() {
+        match c {
+            '(' | '[' | '<' => depth += 1,
+            ')' | ']' => depth -= 1,
+            '>' if previous != '-' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&clause[start..at]);
+                start = at + 1;
+            }
+            _ => (),
+        }
+        previous = c;
+    }
+    out.push(&clause[start..]);
+    out
 }
 
 /// Drops the predicates that use a generic whose bound names `Self` (`X: Fn(&Self) -> u8`): the

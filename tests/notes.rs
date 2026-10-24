@@ -20,14 +20,14 @@
 //! leaked.
 
 use syn::*;
-use template_quote::quote;
+use template_quote::{quote, ToTokens};
 use type_leak::*;
 
 /// The config of the property test, with `::p` allowed.
 fn leaker() -> Leaker {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
-    config.allowed_paths.push(parse_quote!(::p));
+    config.allow_primitive().allow_prelude();
+    config.allow_path(parse_quote!(::p));
     Leaker::from_config(config)
 }
 
@@ -52,11 +52,11 @@ impl Shown {
 }
 
 /// What an error says: for each of its errors, the headline, the tokens, the notes and the help.
-fn shown(err: &NotInternableError) -> Vec<Shown> {
-    err.items()
+fn shown(err: &[ErrorItem]) -> Vec<Shown> {
+    err.iter()
         .map(|item| Shown {
             message: item.message.clone(),
-            tokens: item.tokens.to_string(),
+            tokens: item.cause.to_token_stream().to_string(),
             notes: item.notes.iter().map(|(_, note)| note.clone()).collect(),
             help: item
                 .help_text()
@@ -66,11 +66,25 @@ fn shown(err: &NotInternableError) -> Vec<Shown> {
         .collect()
 }
 
-fn error(item: &ItemImpl) -> NotInternableError {
-    leaker()
-        .intern_impl(item, true)
-        .err()
-        .unwrap_or_else(|| panic!("accepted: {}", quote!(#item)))
+/// The messages of the errors, one per line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The errors that `leaker` has after `analyze` ran on it (`Leaker::result()`).
+fn errors_of<R>(mut leaker: Leaker, analyze: impl FnOnce(&mut Leaker) -> R) -> Vec<ErrorItem> {
+    analyze(&mut leaker);
+    leaker.result().errors().to_vec()
+}
+
+fn error(item: &ItemImpl) -> Vec<ErrorItem> {
+    let errors = errors_of(leaker(), |leaker| leaker.intern_impl(item, true));
+    assert!(!errors.is_empty(), "accepted: {}", quote!(#item));
+    errors
 }
 
 /// The note that says why `Self::A` is written out. `through`: what rustc resolves it through.
@@ -198,8 +212,11 @@ fn a_relative_trait_of_the_impl_is_written_as_an_absolute_path() {
             }
         }
     );
-    let err = leaker().intern_mod(&item).unwrap_err();
-    let items = shown(&err);
+    let mut leaker = leaker();
+    leaker.intern_mod(&item);
+    let result = leaker.result();
+    let err = result.errors();
+    let items = shown(err);
     assert_eq!(items.len(), 1, "{:?}", items);
     assert_eq!(items[0].help, "replace `Self::A` with `<Self as Tr>::A`");
 }
@@ -225,7 +242,7 @@ fn an_associated_item_of_self_in_a_type_has_no_trait_to_name() {
         struct S<T>(T, Rel<Self::A>);
     );
     assert_eq!(
-        shown(&leaker().intern_struct(&item, true).unwrap_err()),
+        shown(&errors_of(leaker(), |leaker| leaker.intern_struct(&item, true))),
         expected
     );
     let item: ItemEnum = parse_quote!(
@@ -234,7 +251,7 @@ fn an_associated_item_of_self_in_a_type_has_no_trait_to_name() {
         }
     );
     assert_eq!(
-        shown(&leaker().intern_enum(&item, true).unwrap_err()),
+        shown(&errors_of(leaker(), |leaker| leaker.intern_enum(&item, true))),
         expected
     );
     let item: ItemUnion = parse_quote!(
@@ -244,7 +261,7 @@ fn an_associated_item_of_self_in_a_type_has_no_trait_to_name() {
         }
     );
     assert_eq!(
-        shown(&leaker().intern_union(&item, true).unwrap_err()),
+        shown(&errors_of(leaker(), |leaker| leaker.intern_union(&item, true))),
         expected
     );
     // An inherent impl.
@@ -255,16 +272,15 @@ fn an_associated_item_of_self_in_a_type_has_no_trait_to_name() {
     );
     assert_eq!(shown(&error(&item)), expected);
     // An impl whose parts are visited by a scope: it does not know the trait.
-    let (_, ()) = leaker()
-        .enter_impl(&Generics::default(), &parse_quote!(S), true, |view| {
-            let err = view
-                .enter_generics(&Generics::default(), |view| {
-                    view.visit_type(&parse_quote!(Rel<Self::A>))
-                })
-                .unwrap_err();
-            assert_eq!(shown(&err), expected);
+    let outer = errors_of(leaker(), |leaker| {
+        leaker.enter_impl(&Generics::default(), &parse_quote!(S), true, |view| {
+            view.enter_generics(&Generics::default(), |view| {
+                view.visit_type(&parse_quote!(Rel<Self::A>))
+            })
         })
-        .unwrap();
+    });
+    // The error of the inner scope is in the list of the call, once.
+    assert_eq!(shown(&outer), expected);
 }
 
 /// A bound of the generics of the entry that names `Self::A`: the headline says where it is.
@@ -297,8 +313,11 @@ fn an_associated_item_of_self_in_a_bound_names_the_generics() {
     let item: ItemStruct = parse_quote!(
         struct S<T: ::p::Tr<Self::A>>(Rel<T>);
     );
-    let err = leaker().intern_struct(&item, true).unwrap_err();
-    let items = shown(&err);
+    let mut leaker = leaker();
+    leaker.intern_struct(&item, true);
+    let result = leaker.result();
+    let err = result.errors();
+    let items = shown(err);
     assert!(!items.is_empty());
     assert_eq!(
         items[0].message,
@@ -381,7 +400,7 @@ fn the_self_type_of_an_impl_is_named_in_the_note() {
     );
     let err = error(&item);
     assert_eq!(
-        err.to_string(),
+        messages(&err),
         "`S < T >` is in the self type of the impl, and a bound of its generics names `Self`\n\
          `Self` is in a bound or where predicate, and a bound of its generics names `Self`, \
          which is a leaked type"
@@ -422,7 +441,7 @@ fn the_self_type_of_an_impl_is_named_in_the_note() {
     );
     let err = error(&item);
     let shown = shown(&err);
-    assert_eq!(shown.len(), 2, "{}", err);
+    assert_eq!(shown.len(), 2, "{}", messages(&err));
     assert_eq!(
         shown[0],
         Shown::new(
@@ -466,9 +485,12 @@ fn the_note_of_a_hidden_lifetime_says_where_the_holder_is_not_leaked() {
             fn f(&self, x: impl Fn(::p::WRef<u8>, Rel<T>) -> &u8);
         }
     );
-    let err = leaker().intern_trait(&item, true).unwrap_err();
+    let mut leaker = leaker();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let err = result.errors();
     assert_eq!(
-        shown(&err),
+        shown(err),
         [Shown::new(
             "use absolute path: 'Rel < T >'",
             "Rel < T >",
