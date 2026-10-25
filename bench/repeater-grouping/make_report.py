@@ -25,13 +25,19 @@ for path in sorted(glob.glob(os.path.join(results, "*.jsonl"))):
     name = os.path.basename(path)[:-6]
     if name.startswith(("M-", "F-", "V-", "passes-")):
         continue
+    if name.endswith("-sizes"):  # size-only passes: bench.py --sizes
+        text = run("report.py", path, "--sizes")
+        with open(os.path.join(out_dir, name + ".txt"), "w") as f:
+            f.write("# %s\n%s\n" % (name, text))
+        print("wrote", name + ".txt")
+        continue
     cpu = run("report.py", path, "--full")
     ins = run("report.py", path, "--metric", "ginstr")
     with open(os.path.join(out_dir, name + ".txt"), "w") as f:
         f.write("# %s\n\n## CPU seconds / wall seconds (user+sys of cargo and children; median over the reps)\n%s\n\n"
                 "## User-space instructions, billions (median)\n%s\n" % (name, cpu, ins))
     print("wrote", name + ".txt")
-for what in ("nsweep", "corpus", "complexity", "toolchains", "fillers", "scaling", "defaults", "versions", "msrv", "passes"):
+for what in ("nsweep", "corpus", "complexity", "toolchains", "fillers", "scaling", "defaults", "versions", "msrv", "passes", "sizes"):
     text = run("summaries.py", what)
     if text.strip():
         with open(os.path.join(out_dir, what + ".txt"), "w") as f:

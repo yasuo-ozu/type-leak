@@ -85,6 +85,9 @@ python3 report.py results/Q-stable.jsonl
 python3 gen.py --out /tmp/x --variant multi4 --E 1000 --C 100 --cx three
 python3 measure.py /tmp/x --tc stable
 
+# artifact sizes (.rlib / .rmeta) of one grid, no timing: results/N-stable-sizes.jsonl
+./run_sizes.sh stable "N"
+
 # the runs of this README
 ./run_full.sh                              # about 2 h on an idle machine; ends with python3 make_report.py
 ```
@@ -96,14 +99,14 @@ reported. The spread (max/min over the repetitions) was 1.01-1.16 in the main ta
 | file | what it does |
 |---|---|
 | `gen.py` | generator: `--variant base\|ctl\|multiK\|multiKd --E --C --cx --dist uniform\|skew\|corpus --uses sig,impl,wit --ids per-ctx\|shared --unsized` |
-| `bench.py` | grids N D B W X S U I M V Z F Q (list at the top of the file): generates, measures, appends one JSON line per sample to `results/<grid>-<tc>.jsonl`; resumable |
-| `measure.py` | clean `cargo build` and `cargo check` of the Leaker, then of the Referrer: CPU (user+sys of the children), wall, instructions |
+| `bench.py` | grids N D B W X S U I M V Z F Q (list at the top of the file): generates, measures, appends one JSON line per sample to `results/<grid>-<tc>.jsonl`; resumable. `--sizes`: a size-only pass (artifact sizes, no timing) |
+| `measure.py` | clean `cargo build` and `cargo check` of the Leaker, then of the Referrer: CPU (user+sys of the children), wall, instructions, and the size of the `.rlib` / `.rmeta` |
 | `perfcount.py` | instruction counter and `BENCH_CPUS` pinning |
 | `passes.py` | `-Ztime-passes` of one crate, best of N (uses `RUSTC_BOOTSTRAP=1` on stable) |
 | `errdemo.py`, `run_errdemo.sh` | wrong Repeater impls and uses, compiled per encoding (`report/errdemo.txt`) |
 | `report.py` | tables of one results file; `make_report.py` writes all of them and the summaries of `summaries.py` into `report/` |
 | `corpus_hist.py`, `run_corpus.sh`, `prop-hist-logging.patch` | entries per context of the property-test corpus (below) |
-| `run_grids.sh`, `run_toolchains.sh`, `run_passes.sh`, `run_full.sh` | the drivers |
+| `run_grids.sh`, `run_toolchains.sh`, `run_passes.sh`, `run_sizes.sh`, `run_full.sh` | the drivers |
 
 `work/`, `results/`, `logs/` and `errdemo/` are created here and ignored by git.
 
@@ -412,6 +415,66 @@ Leaker, against 0% (K=4) and a loss (larger K) without defaults.
 - On 1.56 (E=1000, 10 per context) the `base` Leaker spends 1.30 s in coherence and 0.91 s in `wf_checking`
   of 2.35 s; multi4 takes 0.31 s in all, multi16 0.13 s. The `base` Referrer spends 0.98 s of 1.56 s in `wf_checking`.
 
+### Artifact size
+
+`cargo build` leaves an `.rlib` per crate, `cargo check` an `.rmeta`. Both were measured for the Leaker (L) and
+the Referrer (R), once per crate (`./run_sizes.sh`, `bench.py --sizes`; nothing is timed). Grids N D B X S,
+rustc 1.99. No executable is built or measured: both crates are libraries.
+
+- The sizes are deterministic. Two builds of 22 crates, in other directories, gave the same bytes (sha1 of the four artifacts).
+  The artifacts hold the absolute source path, so the pass maps the workspace to `/ws`. Without it (`--no-remap`)
+  a file is about 2 bytes larger per character of the path (256 B for a 129-character path).
+- The Leaker's `.rlib` is its metadata plus two members of about 650 bytes (an almost empty object file and the link
+  data), so it is 2.2 KB larger than the `.rmeta` and has no code. The change from grouping is the same for both.
+- The Referrer's size does not depend on grouping: over the 126 multiK crates of the n sweep its `.rlib` differs
+  from `base` by at most 3.8 KB (0.095%, at n=50 with K=5) and its `.rmeta` by at most 3.9 KB; in the corpus-like
+  crates by at most 0.03%. The Repeater projections make it larger than with `ctl` (`.rlib` at n=1: 3209 KiB
+  against 4901 KiB for `base`), and grouping does not change that.
+- The Referrer's `.rlib` is 13-24% larger than its `.rmeta` (the build metadata also holds the MIR of generic fns).
+
+Leaker `.rlib`, change against `base` (E=1000 within 1%, three generics). `base` is 2430 KiB at n=1, 1890 at n=2,
+1724 at n=4, 1625 at n=10, 1572 at n=50 (`ctl` 1071, 768, 566, 475, 426):
+
+| K | n=1 | n=2 | n=3 | n=4 | n=5 | n=6 | n=7 | n=8 | n=9 | n=10 | n=12 | n=16 | n=24 | n=50 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2 | +4% | -22% | -13% | -24% | -19% | -25% | -21% | -26% | -22% | -26% | -26% | -26% | -27% | -33% |
+| 3 | +9% | -19% | -37% | -21% | -29% | -40% | -27% | -37% | -41% | -36% | -41% | -39% | -42% | -42% |
+| 4 | +13% | -16% | -29% | -43% | -26% | -38% | -42% | -45% | -39% | -42% | -46% | -47% | -47% | -46% |
+| 5 | +18% | -13% | -27% | -41% | -47% | -29% | -40% | -43% | -47% | -49% | -44% | -44% | -49% | -50% |
+| 6 | +22% | -11% | -26% | -40% | -46% | -49% | -38% | -42% | -44% | -47% | -51% | -49% | -51% | -51% |
+| 8 | +31% | -5% | -21% | -30% | -42% | -47% | -50% | -52% | -42% | -45% | -48% | -53% | -54% | -52% |
+| 12 | +49% | +6% | -13% | -24% | -37% | -42% | -46% | -49% | -51% | -52% | -55% | -50% | -56% | -54% |
+| 16 | +84% | +28% | -5% | -18% | -26% | -38% | -43% | -46% | -48% | -50% | -52% | -56% | -53% | -54% |
+| 32 | +157% | +75% | +38% | +7% | -5% | -14% | -20% | -25% | -29% | -39% | -44% | -50% | -55% | -56% |
+
+**Size break-even n.** The smallest measured n from which the Leaker `.rlib` of `multiK` is never larger than
+`base`'s, and in parentheses where the interpolated curve crosses 0. The `.rmeta` gives the same n.
+
+| K | 2 | 3 | 4 | 5 | 6 | 8 | 12 | 16 | 32 |
+|---|---|---|---|---|---|---|---|---|---|
+| `.rlib` | n>=2 (1.2) | n>=2 (1.3) | n>=2 (1.5) | n>=2 (1.6) | n>=2 (1.7) | n>=2 (1.9) | n>=3 (2.3) | n>=3 (2.8) | n>=5 (4.6) |
+
+This is the same as for the time (K=2..8 from n=2, K=12 and 16 from n=3, K=32 from n=4..6), a little earlier for
+K=16 and 32. The size at n=1 grows by +4% (K=2) to +157% (K=32).
+
+An entry impl is about 1.4 KB in the Leaker's `.rlib` (`three`; 0.8 KB with `none`, 1.3 KB with `lt`). A filler
+`type TypeJ = ();` is about 110 bytes (`none` 109, `three` 111, `lt` 111), 0.08-0.14 of an impl. The size is not
+strictly linear in K: it jumps by a further 0.2-0.4 MB at some K (K=6 to 7 for `none`, K=12 to 16 for `three`;
+not investigated). `report/sizes.txt` has the sizes in bytes for K = 1..8, 12, 16, 32.
+
+Corpus-like crates, mean change of the Leaker `.rlib` over the three draws (the Referrer `.rlib` changes by
+less than 0.03% in every cell). Base L / R in KiB in brackets.
+
+| E | K=2 | K=3 | K=4 | K=5 | K=6 | K=8 | K=12 | K=16 | K=32 |
+|---|---|---|---|---|---|---|---|---|---|
+| 50 (120 / 173) | -5% | -4% | -4% | -3% | -1% | +2% | +15% | +27% | +71% |
+| 200 (363 / 791) | -6% | -6% | -4% | -2% | +1% | +6% | +18% | +39% | +93% |
+| 1000 (1569 / 3962) | -9% | -9% | -7% | -5% | -2% | +5% | +18% | +46% | +105% |
+
+With 10 entries per context the Leaker `.rlib` of `K=4` is 35-42% smaller than `base`'s for every kind of context
+(`none` -35%, `one` -37%, `three` -42%, `lt` -41%), and at E=10000 K=4 gives -38%, K=16 -51% (`base` 15.0 MiB).
+`report/N-stable-sizes.txt` and the other `*-sizes.txt` have every table in KiB with the four artifacts.
+
 ### MSRV
 
 `ctl`, `base` and `multi1..8, 12, 16, 32` (13 variants) pass `cargo +1.56 check` for both crates, on two
@@ -463,6 +526,7 @@ K=12 and 16 from n=3 (L+R) or n=3..4 (L), K=32 from n=4..5 (L+R) or n=6 (L). At 
 - **Robust choice: K=4.** It never loses for n >= 2 (-14% L at n=2, -34% at n=4), costs +23% in the Leaker
   (+7% L+R) on a singleton context, is within 3 points of the best on the corpus and within 3-6 points of the
   best on large crates. K=3 is a little better on the corpus (-5% at E=1000), K=8..16 a little better on large items.
+- The artifacts follow the time (see "Artifact size"): K=4 gives a 42% smaller Leaker `.rlib` at n=10 and +13% at n=1; the Referrer's size does not change.
 - Nightly with defaults would remove the trade-off: K=16 or 32 and no singleton penalty (-23% on corpus-like
   crates, -46% at n=10). Without defaults the filler cost is what limits K.
 

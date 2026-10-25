@@ -8,7 +8,9 @@ Variants whose generated crates are byte-identical are measured once (their `key
 For each rep, for each configuration, the variants are shuffled and measured one after the other,
 so that a change of the machine's load hits all the variants of a configuration alike.
 One line of JSON per sample is appended to --out as soon as it is measured; a rerun skips the
-samples already there.
+samples already there. `--sizes` is a size-only pass: it builds each distinct variant once, in parallel
+(`--jobs`), and records only the artifact sizes (.rlib after a build, .rmeta after a check) and their
+sha1 to results/<grid>-<tc>-sizes.jsonl. Nothing is timed.
 
 Grids (see grids()), all with variants ctl, base and multiK unless said otherwise:
   N  entries per context n = 1..50 at E=1000 (K = 2..32)   D  corpus-like E = 50, 200, 1000 (3 seeds each)
@@ -23,7 +25,7 @@ import argparse, hashlib, json, os, random, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from measure import measure  # noqa: E402
+from measure import measure, measure_sizes  # noqa: E402
 
 KS = [2, 3, 4, 5, 6, 8, 12, 16, 32]
 MK = ["multi%d" % k for k in KS]
@@ -94,6 +96,33 @@ def gen(c, variant, root):
     return d, h.hexdigest()[:10], meta
 
 
+def size_pass(a, cfgs, plan, env_extra):
+    """Builds each distinct variant of each configuration once and records the artifact sizes (deterministic)."""
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    done = set()
+    if os.path.exists(a.out):
+        done = {(r["cfg"], r["key"]) for r in map(json.loads, open(a.out))}
+    jobs = [(c["name"], key, vs) for c in cfgs for key, vs in plan[c["name"]].items() if (c["name"], key) not in done]
+    lock = threading.Lock()
+
+    def one(job):
+        name, key, vs = job
+        v, d, meta = vs[0]
+        res = measure_sizes(d, a.tc, env_extra, remap=not a.no_remap)
+        rec = dict(grid=a.grid, cfg=name, key=key, variants=[x[0] for x in vs], tc=a.tc, meta=meta, **res)
+        with lock:
+            with open(a.out, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            bad = [k for k, x in res.items() if x["rc"] or x["size"] is None]
+            print("%s %-24s %s%s" % (name, ",".join(x[0] for x in vs)[:24],
+                                     " ".join("%s=%s" % (k.replace("_leaker", "L").replace("_referrer", "R"), x["size"])
+                                              for k, x in res.items()), " FAILED " + str(bad) if bad else ""), flush=True)
+
+    with ThreadPoolExecutor(max_workers=a.jobs) as ex:
+        list(ex.map(one, jobs))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--grid", required=True)
@@ -106,9 +135,13 @@ def main():
     ap.add_argument("--phases", default="build,check")
     ap.add_argument("--env", default="", help="KEY=VAL,.. extra environment for cargo")
     ap.add_argument("--tag", default="", help="stored in each sample")
+    ap.add_argument("--sizes", action="store_true",
+                    help="size-only pass: build each distinct variant once, no timing, write results/<grid>-<tc>-sizes.jsonl")
+    ap.add_argument("--jobs", type=int, default=4, help="parallel builds of the size-only pass")
+    ap.add_argument("--no-remap", action="store_true", help="size-only pass: do not map the workspace path to /ws")
     a = ap.parse_args()
     if not a.out:
-        a.out = os.path.join(HERE, "results", "%s-%s.jsonl" % (a.grid, a.tc))
+        a.out = os.path.join(HERE, "results", "%s-%s%s.jsonl" % (a.grid, a.tc, "-sizes" if a.sizes else ""))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     cfgs = [c for c in grids()[a.grid] if a.only in c["name"]]
     if a.variants:
@@ -130,6 +163,9 @@ def main():
             keys.setdefault(key, []).append((v, d, meta))
         plan[c["name"]] = keys
         print("%s: %d variants, %d distinct" % (c["name"], len(c["variants"]), len(keys)), flush=True)
+    if a.sizes:
+        size_pass(a, cfgs, plan, env_extra)
+        return
     for rep in range(a.reps):
         for c in cfgs:
             keys = list(plan[c["name"]].items())

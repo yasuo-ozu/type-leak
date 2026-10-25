@@ -7,5 +7,6 @@ cd "$R"
 ./run_grids.sh stable "N D B X S U I W" 5   # n sweep, corpus-like, complexity, filler cost, scaling, uses, shared ID, stable column of W
 ./run_toolchains.sh 5                       # other rustc versions, version scan, MSRV, nightly defaults
 ./run_passes.sh
+./run_sizes.sh stable "N D B X S"   # artifact sizes (no timing)
 ./run_errdemo.sh
 python3 make_report.py

@@ -2,7 +2,8 @@
 """report.py: markdown tables from results/*.jsonl (the samples of bench.py).
 
   report.py results/A-stable.jsonl [--full] [--metric cpu|ginstr]
-Per configuration: one row per variant with the median over the repetitions.
+  report.py results/N-stable-sizes.jsonl --sizes
+Per configuration: one row per variant with the median over the repetitions (or, with --sizes, the artifact sizes).
 """
 import argparse, collections, json, statistics, sys
 
@@ -102,6 +103,34 @@ def table(cfg, vs, metric, full):
     return "\n".join(lines)
 
 
+def size_stats(rows):
+    """{cfg: {variant: {meta, key, Lr, Rr, Lm, Rm}}}: .rlib (build) and .rmeta (check) bytes of the Leaker and the Referrer."""
+    out = collections.OrderedDict()
+    for r in rows:
+        c = out.setdefault(r["cfg"], collections.OrderedDict())
+        for v in r["variants"]:
+            c[v] = dict(meta=dict(r["meta"], variant=v), key=r["key"], Lr=r["build_leaker"]["size"],
+                        Rr=r["build_referrer"]["size"], Lm=r["check_leaker"]["size"], Rm=r["check_referrer"]["size"])
+    return out
+
+
+def table_sizes(vs):
+    """KiB and the change against base of the four artifacts."""
+    base = vs.get("base")
+    hdr = ["variant", "impls", "L .rlib", "R .rlib", "L .rmeta", "R .rmeta"]
+    lines = ["| " + " | ".join(hdr) + " |", "|" + "|".join(["---"] * len(hdr)) + "|"]
+    for v in sorted(vs, key=vorder):
+        e = vs[v]
+        cells = [v, str(e["meta"]["impls"])]
+        for k in ("Lr", "Rr", "Lm", "Rm"):
+            cell = "%.1f" % (e[k] / 1024.0)
+            if base and v != "base":
+                cell += " (%+.1f%%)" % (100.0 * (e[k] / base[k] - 1))
+            cells.append(cell)
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
 def has_instr(vs):
     return all(e[ph]["ginstr"] for e in vs.values() for ph in PH if ph in e)
 
@@ -136,7 +165,15 @@ def main():
     ap.add_argument("files", nargs="+")
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--metric", default="cpu")
+    ap.add_argument("--sizes", action="store_true", help="the files are size-only passes (bench.py --sizes)")
     a = ap.parse_args()
+    if a.sizes:
+        for cfg, vs in size_stats(load(a.files)).items():
+            m = next(iter(vs.values()))["meta"]
+            print("\n### %s  (E=%d, C=%d, cx=%s, unsized=%d)\n" % (cfg, m["E"], m["C"], m["cx"], m["n_unsized"]))
+            print("sizes in KiB (1024 bytes) of the .rlib (build) and the .rmeta (check); change against base\n")
+            print(table_sizes(vs))
+        return
     st = stats(load(a.files))
     for cfg, vs in st.items():
         some = next(iter(vs.values()))
