@@ -1,0 +1,6 @@
+M-1.56.jsonl: `cargo +1.56 check`, exit codes of the Leaker and the Referrer crate (0 = builds)
+
+M-E1000-n10: 13 variants, 0 fail
+  ctl base multi1 multi2 multi3 multi4 multi5 multi6 multi7 multi8 multi12 multi16 multi32
+M-corpus-E200: 13 variants, 0 fail
+  ctl base multi1 multi2 multi3 multi4 multi5 multi6 multi7 multi8 multi12 multi16 multi32

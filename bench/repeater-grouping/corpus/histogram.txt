@@ -1,0 +1,63 @@
+
+entries per ContextId (per item): 6027 groups, 10258 entries, mean 1.70, median 1, max 24
+  size      groups  %groups    entries   %entries
+  1           4238    70.3%       4238      41.3%
+  2            896    14.9%       1792      17.5%
+  3            410     6.8%       1230      12.0%
+  4            189     3.1%        756       7.4%
+  5-8          219     3.6%       1283      12.5%
+  9-16          67     1.1%        803       7.8%
+  17-32          8     0.1%        156       1.5%
+  33-64          0     0.0%          0       0.0%
+  65+            0     0.0%          0       0.0%
+  K=2 : 7546 impls instead of 10258 (73.6%)
+  K=4 : 6437 impls instead of 10258 (62.8%)
+  K=8 : 6110 impls instead of 10258 (59.6%)
+  K=16: 6035 impls instead of 10258 (58.8%)
+  K=32: 6027 impls instead of 10258 (58.8%)
+
+entries per impl header+args (per item; same ID): 5663 groups, 10258 entries, mean 1.81, median 1, max 40
+  size      groups  %groups    entries   %entries
+  1           3991    70.5%       3991      38.9%
+  2            805    14.2%       1610      15.7%
+  3            341     6.0%       1023      10.0%
+  4            187     3.3%        748       7.3%
+  5-8          244     4.3%       1446      14.1%
+  9-16          66     1.2%        728       7.1%
+  17-32         25     0.4%        569       5.5%
+  33-64          4     0.1%        143       1.4%
+  65+            0     0.0%          0       0.0%
+  K=2 : 7397 impls instead of 10258 (72.1%)
+  K=4 : 6212 impls instead of 10258 (60.6%)
+  K=8 : 5804 impls instead of 10258 (56.6%)
+  K=16: 5696 impls instead of 10258 (55.5%)
+  K=32: 5667 impls instead of 10258 (55.2%)
+
+entries per impl header+args (per crate; ID ignored): 2775 groups, 10258 entries, mean 3.70, median 1, max 138
+  size      groups  %groups    entries   %entries
+  1           1928    69.5%       1928      18.8%
+  2            437    15.7%        874       8.5%
+  3            141     5.1%        423       4.1%
+  4             55     2.0%        220       2.1%
+  5-8           34     1.2%        211       2.1%
+  9-16          24     0.9%        324       3.2%
+  17-32         79     2.8%       1981      19.3%
+  33-64         54     1.9%       2242      21.9%
+  65+           23     0.8%       2055      20.0%
+  K=2 : 6221 impls instead of 10258 (60.6%)
+  K=4 : 4347 impls instead of 10258 (42.4%)
+  K=8 : 3497 impls instead of 10258 (34.1%)
+  K=16: 3089 impls instead of 10258 (30.1%)
+  K=32: 2883 impls instead of 10258 (28.1%)
+
+per Leaker crate (one case, 181 crates): E median 49, mean 57, max 197; items(ids) median 15; contexts(ids x ContextId) median 32; distinct headers median 29
+entry kinds (rough): {'other': 9587, 'dyn': 487, 'str/slice': 184}
+contexts by shape (impl header + args groups, per item): total 5663
+   no-generics=True lifetime=False bounds=False: 2366 (41.8%)
+   no-generics=False lifetime=False bounds=True: 1068 (18.9%)
+   no-generics=False lifetime=True bounds=False: 842 (14.9%)
+   no-generics=False lifetime=False bounds=False: 793 (14.0%)
+   no-generics=False lifetime=True bounds=True: 594 (10.5%)
+
+per item: 2863 items, entries median 2, mean 3.6, p90 7, p99 21, max 46; contexts median 2, mean 2.11, max 14
+items with >= 9 entries: 207, their contexts: 1162, 66% hold one entry

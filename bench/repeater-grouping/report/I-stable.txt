@@ -1,0 +1,51 @@
+# I-stable
+
+## CPU seconds / wall seconds (user+sys of cargo and children; median over the reps)
+
+### I-E1000-n10  (E=1000, C=100, cx=three, unsized=128, n reps=5, load 1..1)
+
+cells: CPU s / wall s, median over reps; totals: CPU s (vs base)
+
+| variant | impls | assoc/impl | L build | R build | L check | R check | build L+R | check L+R | spread (max/min) of build L+R |
+|---|---|---|---|---|---|---|---|---|---|
+| base | 1000 | 1 | 0.20 / 0.20 | 0.42 / 0.42 | 0.20 / 0.20 | 0.39 / 0.40 | 0.62 (+0%) | 0.59 (+0%) | 1.17 (n=5) |
+| multi4 | 300 | 4 | 0.14 / 0.14 | 0.41 / 0.41 | 0.14 / 0.14 | 0.37 / 0.38 | 0.54 (-12%) | 0.51 (-14%) | 1.04 (n=5) |
+| multi8 | 200 | 8 | 0.14 / 0.14 | 0.40 / 0.40 | 0.13 / 0.13 | 0.38 / 0.38 | 0.54 (-12%) | 0.51 (-14%) | 1.02 (n=5) |
+| multi16 | 100 | 16 | 0.13 / 0.13 | 0.40 / 0.40 | 0.12 / 0.13 | 0.37 / 0.37 | 0.53 (-14%) | 0.50 (-16%) | 1.03 (n=5) |
+
+### I-E5000-n10  (E=5000, C=500, cx=three, unsized=610, n reps=5, load 1..1)
+
+cells: CPU s / wall s, median over reps; totals: CPU s (vs base)
+
+| variant | impls | assoc/impl | L build | R build | L check | R check | build L+R | check L+R | spread (max/min) of build L+R |
+|---|---|---|---|---|---|---|---|---|---|
+| base | 5000 | 1 | 1.43 / 1.43 | 2.45 / 2.46 | 1.44 / 1.45 | 2.29 / 2.30 | 3.88 (+0%) | 3.72 (+0%) | 1.01 (n=5) |
+| multi4 | 1500 | 4 | 0.63 / 0.63 | 2.06 / 2.07 | 0.63 / 0.63 | 1.91 / 1.92 | 2.70 (-31%) | 2.54 (-32%) | 1.02 (n=5) |
+| multi8 | 1000 | 8 | 0.60 / 0.60 | 2.05 / 2.06 | 0.59 / 0.60 | 1.90 / 1.90 | 2.63 (-32%) | 2.49 (-33%) | 1.01 (n=5) |
+| multi16 | 500 | 16 | 0.49 / 0.49 | 2.03 / 2.04 | 0.49 / 0.49 | 1.85 / 1.86 | 2.53 (-35%) | 2.35 (-37%) | 1.01 (n=5) |
+
+
+## User-space instructions, billions (median)
+
+### I-E1000-n10  (E=1000, C=100, cx=three, unsized=128, n reps=5, load 1..1)
+
+cells: billions of user-space instructions (median); % vs base for check builds
+
+| variant | L build | R build | L check | R check | L+R build | L+R check | L % | R % | L+R % |
+|---|---|---|---|---|---|---|---|---|---|
+| base | 1.79 | 3.11 | 1.79 | 2.96 | 4.90 | 4.75 | +0% | +0% | +0% |
+| multi4 | 0.99 | 2.85 | 0.99 | 2.71 | 3.85 | 3.70 | -45% | -9% | -22% |
+| multi8 | 0.96 | 2.84 | 0.95 | 2.69 | 3.79 | 3.64 | -47% | -9% | -23% |
+| multi16 | 0.86 | 2.83 | 0.86 | 2.68 | 3.69 | 3.54 | -52% | -10% | -26% |
+
+### I-E5000-n10  (E=5000, C=500, cx=three, unsized=610, n reps=5, load 1..1)
+
+cells: billions of user-space instructions (median); % vs base for check builds
+
+| variant | L build | R build | L check | R check | L+R build | L+R check | L % | R % | L+R % |
+|---|---|---|---|---|---|---|---|---|---|
+| base | 19.95 | 20.12 | 19.94 | 19.38 | 40.07 | 39.33 | +0% | +0% | +0% |
+| multi4 | 6.45 | 14.04 | 6.45 | 13.31 | 20.49 | 19.76 | -68% | -31% | -50% |
+| multi8 | 5.73 | 13.70 | 5.73 | 12.97 | 19.43 | 18.69 | -71% | -33% | -52% |
+| multi16 | 4.28 | 13.49 | 4.28 | 12.76 | 17.77 | 17.03 | -79% | -34% | -57% |
+
