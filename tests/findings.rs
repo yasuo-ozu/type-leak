@@ -58,6 +58,9 @@
 //! | `f47_self_in_an_outlives_predicate_keeps_the_bounds_of_the_description_of_self_only` | `Self: 'x` made the context of an entry keep the bounds that F26 leaves out: E0277 in the copy | fixed |
 //! | `f48_a_type_corrected_for_a_signature_is_left_only_in_a_signature_like_it` | a type copied as written for the signature it is in (E0195, E0106) was left so in every other item and signature of its context | fixed |
 //! | `f49_a_lifetime_that_another_input_keeps_breaks_elision` | the E0106 check left out the lifetime that the inputs keep, but rustc counts the lifetimes of each input apart: a leaked type in another input that names it breaks the elision | fixed |
+//! | `f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_error` | the paths of the error of a value path left out the relative types in its arguments: a path rule after the analysis dropped the error, and the copy wrote them as they were | fixed |
+//! | `f51_a_nested_item_with_a_bound_that_names_a_leaked_type_is_rejected` | `enter_mod` with `nested_self_entries()` accepted `S<T: AsRef<Rel<Self>>>` beside an entry that uses `T`, which `intern_struct()` rejects: E0277 in the copy | fixed |
+//! | `f52_an_unrelated_error_does_not_make_an_optional_entry_of_the_predicate` | a part copied as written with `Self::A` in a predicate made no optional entry of the types in the bounds of its context a part too, so a strict Referrer replaced them (E0277) | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that the docs of `Leaker` document, or that follows from what rustc accepts). No test
@@ -12459,4 +12462,359 @@ fn f49_a_function_pointer_and_fn_sugar_count_each_input() {
     assert!(
         all_notes(&err)[0].ends_with("as rustc counts the lifetimes of each input apart (E0106)")
     );
+}
+
+// ── F50 ──────────────────────────────────────────────────────────────────────
+
+/// The analysis of `item` with `check_values()` and the primitive types allowed.
+fn f50_analyze(item: &ItemTrait, configure: impl Fn(&mut LeakerConfig)) -> LeakerResult {
+    let mut config = LeakerConfig::new();
+    config.check_values().allow_primitive();
+    configure(&mut config);
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_trait(item, true);
+    leaker.result()
+}
+
+/// The paths of the error `at` of `result`, as text.
+fn f50_paths(result: &LeakerResult, at: usize) -> Vec<String> {
+    result.errors()[at].paths.iter().map(string).collect()
+}
+
+/// F50 (fixed): the paths of the error of a path of a value left out the relative types in its
+/// arguments.
+///
+/// Trigger: `core::mem::size_of::<*const Rel>()` in a default method, with `check_values()`.
+/// Cause: the error of a relative path of a value (`ValueWalk::relative_part()`) had its own path
+/// alone (`core::mem::size_of`), where the error of a type or a bound has all the relative paths in
+/// it. The whole path is copied as written, `Rel` too, but a path rule after the analysis
+/// (`allow_std_crates()`) dropped the error: `Rel` stayed relative in a copy that no crate can
+/// resolve, whereas the config that allows the crates leaks it (the entry `Rel`). The same for
+/// `Vec::<Rel>::new()` with `allow_prelude()` and `crate::base::bg::<*const R0>()` with
+/// `allow_crate()`.
+///
+/// Fix: the paths of the error have the relative paths of the arguments, at any depth (not a
+/// generic, `Self`, or a name the value declares). The probe for the nested errors allows them
+/// with the path, so the arguments are nothing wrong inside it (`tests/nested_errors.rs`).
+///
+/// The cross-crate fixture is 9205 (`stages = true`: the copy after the rule is made in a crate that
+/// does not name `Rel` only if the rule left no error), checked in `tests/cross_crate.rs`.
+#[test]
+fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_error() {
+    // The value, the rule (`std`, `crate` or `prelude`) given to the result and to the config, the
+    // paths of the error, the paths the rule leaves, and the entries of the config that has the rule.
+    struct Case {
+        item: ItemTrait,
+        rule: &'static str,
+        paths: &'static [&'static str],
+        left: &'static [&'static str],
+        entries: &'static [&'static str],
+    }
+    let case = |item, rule, paths, left, entries| Case {
+        item,
+        rule,
+        paths,
+        left,
+        entries,
+    };
+    let cases = vec![
+        case(
+            parse_quote!(
+                trait Tr {
+                    fn f(&self) {
+                        let _ = core::mem::size_of::<*const Rel>();
+                    }
+                }
+            ),
+            "std",
+            &["core :: mem :: size_of", "Rel"],
+            &["Rel"],
+            &["Rel"],
+        ),
+        case(
+            parse_quote!(
+                trait Tr {
+                    fn f(&self) {
+                        crate::base::bg::<*const R0>();
+                    }
+                }
+            ),
+            "crate",
+            &["crate :: base :: bg", "R0"],
+            &["R0"],
+            &["R0"],
+        ),
+        // Deeper: the paths of the arguments of the arguments.
+        case(
+            parse_quote!(
+                trait Tr {
+                    fn f(&self) {
+                        let _ = Vec::<Option<Rel>>::new();
+                    }
+                }
+            ),
+            "prelude",
+            &["Vec :: new", "Option", "Rel"],
+            &["Rel"],
+            &["Option < Rel >"],
+        ),
+        // The default of an associated const.
+        case(
+            parse_quote!(
+                trait Tr {
+                    const C: usize = core::mem::size_of::<*const Rel>();
+                }
+            ),
+            "std",
+            &["core :: mem :: size_of", "Rel"],
+            &["Rel"],
+            &["Rel"],
+        ),
+        // The trait of a qualified path.
+        case(
+            parse_quote!(
+                trait Tr {
+                    fn f(&self) {
+                        let _ = <u8 as core::convert::From<Rel>>::from;
+                    }
+                }
+            ),
+            "std",
+            &["core :: convert :: From", "Rel"],
+            &["Rel"],
+            &["Rel"],
+        ),
+    ];
+    for Case {
+        item,
+        rule,
+        paths,
+        left,
+        entries,
+    } in cases
+    {
+        let what = string(&item);
+        let result = f50_analyze(&item, |_| ());
+        assert_eq!(result.errors().len(), 1, "{}", what);
+        assert_eq!(f50_paths(&result, 0), paths, "{}", what);
+        // The rule leaves the error, with the paths it does not allow.
+        let mut after = result.clone();
+        match rule {
+            "std" => after.allow_std_crates(),
+            "crate" => after.allow_crate(),
+            _ => after.allow_prelude(),
+        };
+        assert_eq!(after.errors().len(), 1, "{}", what);
+        assert_eq!(f50_paths(&after, 0), left, "{}", what);
+        // The config that has the rule leaks the types in the arguments: no error, and the entries.
+        let config = f50_analyze(&item, |config| {
+            match rule {
+                "std" => config.allow_std_crates(),
+                "crate" => config.allow_crate(),
+                _ => config.allow_prelude(),
+            };
+        });
+        assert!(config.errors().is_empty(), "{}", what);
+        let referrer = config.into_referrer();
+        let found: Vec<String> = referrer.iter().map(string).collect();
+        assert_eq!(found, entries, "{}", what);
+        // Allowing them too drops the error, and nothing is left inside the part.
+        let mut all = after.clone();
+        for path in left {
+            all.allow_path(syn::parse_str(path).unwrap());
+        }
+        assert!(all.errors().is_empty(), "{}", what);
+    }
+
+    // Not paths of the error: a generic, and what the value declares.
+    for item in [
+        parse_quote!(
+            trait Tr {
+                fn f<T>(&self) {
+                    let _ = core::mem::size_of::<*const T>();
+                }
+            }
+        ),
+        parse_quote!(
+            trait Tr {
+                fn f(&self) {
+                    struct L;
+                    let _ = core::mem::size_of::<*const L>();
+                }
+            }
+        ),
+    ] {
+        let result = f50_analyze(&item, |_| ());
+        assert_eq!(
+            f50_paths(&result, 0),
+            ["core :: mem :: size_of"],
+            "{}",
+            string(&item)
+        );
+    }
+}
+
+// ── F51 ──────────────────────────────────────────────────────────────────────
+
+/// F51 (fixed): `enter_mod` with `nested_self_entries()` accepted a bound that names a leaked type
+/// that names `Self`, which `intern_struct()` rejects.
+///
+/// Trigger: `struct S<T: Clone + AsRef<R1<Self>>> { f0: T, f1: R1<(Self, T)> }`. The entry
+/// `R1<Self>` is in a bound, and `intern_struct()` reports it (`UnprovableBound`): the context of
+/// the entry `R1<(Self, T)>` has the bound, and the copy has only its rewritten form in the
+/// environment. Nested, the entry `R1<Self>` is for any type and its context has no generic (`T`
+/// is not in the type), so the check of the bounds of its context found none; the copy failed (E0277
+/// `T: AsRef<R1<S<T>>>`, for the entry in the last field).
+///
+/// Fix: an entry in a predicate that is for any type because it names `Self` is checked with the
+/// context of the type of `Self`, as `intern_*` has it (`nested_self_cycle()`). Like
+/// `intern_struct()`, it rejects the item also when no entry uses `T`.
+///
+/// The cross-crate fixture is 9206 (`tests/cross_crate.rs`).
+#[test]
+fn f51_a_nested_item_with_a_bound_that_names_a_leaked_type_is_rejected() {
+    let items: Vec<(Item, &str)> = vec![
+        (
+            parse_quote!(
+                pub struct S<T: Clone + AsRef<R1<Self>>> {
+                    pub f0: T,
+                    pub f1: R1<(Self, T)>,
+                }
+            ),
+            "S",
+        ),
+        // A where predicate, and no entry that uses `T`.
+        (
+            parse_quote!(
+                pub struct S<T>(pub T)
+                where
+                    T: AsRef<R1<Self>>;
+            ),
+            "S",
+        ),
+        (
+            parse_quote!(
+                pub enum E<T: AsRef<R1<Self>>> {
+                    A(T, R1<(Self, T)>),
+                }
+            ),
+            "E",
+        ),
+    ];
+    let message = "`R1 < Self >` is in a bound or where predicate, and a bound of its generics \
+                   names a leaked type";
+    for (item, name) in &items {
+        for nest in NESTS {
+            let what = format!("{:?} `{}`", nest, string(item));
+            let result = nested_analysis_in(nested_self_leaker(), nest, item, &[name]);
+            let errors = result.errors();
+            assert_eq!(errors.len(), 1, "{}", what);
+            assert_eq!(errors[0].reason, Reason::UnprovableBound, "{}", what);
+            assert_eq!(errors[0].message, message, "{}", what);
+        }
+    }
+    // `intern_struct()` reports the same.
+    let item: ItemStruct = parse_quote!(
+        pub struct S<T: Clone + AsRef<R1<Self>>> {
+            pub f0: T,
+            pub f1: R1<(Self, T)>,
+        }
+    );
+    let mut leaker = nested_self_leaker();
+    leaker.intern_struct(&item, true);
+    let direct = leaker.result();
+    assert_eq!(direct.errors().len(), 1);
+    assert_eq!(direct.errors()[0].message, message);
+
+    // Controls: a bound that names `Self` without a leaked type is accepted, as F42 says.
+    let item: Item = parse_quote!(
+        pub struct S<T: Clone + AsRef<Self>> {
+            pub f0: T,
+            pub f1: R1<(Self, T)>,
+        }
+    );
+    for nest in NESTS {
+        let referrer = nested_analysis_in(nested_self_leaker(), nest, &item, &["S"])
+            .finish()
+            .unwrap_or_else(|e| panic!("{:?}: {}", nest, joined_messages(&e)));
+        let entries: Vec<String> = referrer.iter().map(string).collect();
+        assert_eq!(entries, ["R1 < (Self , T) >"], "{:?}", nest);
+    }
+}
+
+// ── F52 ──────────────────────────────────────────────────────────────────────
+
+/// The entries of `referrer` as text, `?` before an optional one.
+fn f52_entries(referrer: &Referrer) -> Vec<String> {
+    referrer
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| format!("{}{}", if referrer.must(ix) { "" } else { "?" }, string(ty)))
+        .collect()
+}
+
+/// F52 (fixed): an unrelated error made the optional entries of the predicates of a trait entries.
+///
+/// Trigger: `trait Tr<T> where T: Fn(&::l::B2<T, ::l::B0>) -> u8 { type A0; fn m<Y>(&self) where
+/// Y: RelTr<Self::A0>; }`, with a strict Referrer. `::l::B0` is an optional entry (a crate that the
+/// Leaker does not allow). `Self::A0` in a predicate is resolved by the impl of the host with the
+/// bounds of the generics as they are, so the optional entries in them stay as written
+/// (`not_optional_in_bounds()`, F2, F17): beside `Y: Into<Self::A0>` there is no entry. But the
+/// bound of `RelTr<Self::A0>` is an error (`RelTr` is relative) and is copied as written whole, and
+/// the visit that made the entries stay did not run in it: the strict Referrer replaced `::l::B0`
+/// and the host impl failed (E0277 "expected an `Fn(&B2<T, B0>)` closure, found `T`").
+///
+/// Fix: the probe that looks inside the part keeps what the `Self` and `Self::A` in it make not
+/// optional (`AnalyzeVisitor::probe_kept`). Limit: a part with no relative path to probe for (an
+/// error of a lifetime, say) does not.
+///
+/// The cross-crate fixture is 9207 (`strict`, `tests/cross_crate.rs`).
+#[test]
+fn f52_an_unrelated_error_does_not_make_an_optional_entry_of_the_predicate() {
+    let item = |method: &str| -> ItemTrait {
+        let method: proc_macro2::TokenStream = method.parse().unwrap();
+        parse_quote!(
+            pub trait Tr<T>
+            where
+                T: ::core::ops::Fn(&::ext::B2<T, ::ext::B0>) -> u8,
+            {
+                type A0;
+                #method
+            }
+        )
+    };
+    let entries = |method: &str| -> (usize, Vec<String>) {
+        let mut leaker = new_leaker();
+        leaker.intern_trait(&item(method), true);
+        let result = leaker.result();
+        (result.errors().len(), f52_entries(&result.into_referrer()))
+    };
+    // The error is `RelTr<Self::A0>`, and `Self::A0` in it is resolved by the host: no entry.
+    assert_eq!(
+        entries("fn m<Y>(&self) where Y: RelTr<Self::A0>;"),
+        (1, vec![])
+    );
+    // The same without the error.
+    assert_eq!(
+        entries("fn m<Y>(&self) where Y: ::core::convert::Into<Self::A0>;"),
+        (0, vec![])
+    );
+    // Controls: nothing resolves `Self::A0`, the host has the predicate as it is in the trait and
+    // the optional entry is one.
+    assert_eq!(
+        entries("fn m<Y>(&self) where Y: RelTr<u8>;"),
+        (1, vec!["?:: ext :: B0".to_string()])
+    );
+    assert_eq!(entries(""), (0, vec!["?:: ext :: B0".to_string()]));
+    // The path of the part allowed in the config: it is not an error, and `Self::A0` is visited.
+    let mut config = LeakerConfig::new();
+    config
+        .allow_primitive()
+        .allow_prelude()
+        .allow_path(parse_quote!(RelTr));
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_trait(&item("fn m<Y>(&self) where Y: RelTr<Self::A0>;"), true);
+    let result = leaker.result();
+    assert!(result.errors().is_empty());
+    assert!(f52_entries(&result.into_referrer()).is_empty());
 }

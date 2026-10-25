@@ -1148,8 +1148,9 @@ fn allow_std_crates_reads_the_path_of_a_trait_a_macro_and_a_value() {
             }
         }
     );
+    // `u8` in the arguments of the value is a path of it, which a rule has to allow too (F50).
     let mut config = LeakerConfig::new();
-    config.check_values();
+    config.check_values().allow_primitive();
     let analyze = || {
         let mut leaker = Leaker::from_config(config.clone());
         leaker.intern_trait(&item, true);

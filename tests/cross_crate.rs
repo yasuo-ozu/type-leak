@@ -2199,3 +2199,77 @@ fn a_lifetime_that_another_input_keeps_breaks_the_elision_of_the_copy() {
     let copy = unnamed::KeptHolder::<u8>(PhantomData, l::Wrap(PhantomData));
     same(&copy.1, &l::Wrap::<u8>(PhantomData));
 }
+
+/// F50, fixture 9205 (`stages = true`): `core::mem::size_of::<*const Rel>()` in a default method.
+/// `allow_std_crates()` given to the result after the analysis leaves the error, whose path is
+/// `Rel` now: the copy is made in a module that names it (`stage_copies`), and in no crate that does
+/// not (`clean`, where the macro makes the copy only if the rule left no error: it would write
+/// `Rel` as written, E0412). The config that allows the crates leaks `Rel` and has no error.
+#[test]
+fn a_rule_after_the_analysis_keeps_the_error_for_a_relative_type_in_the_arguments_of_a_value() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::stage_copies as r;
+
+    // What the stages leave: the rule matters, one error without it, none in the config (`Rel` is
+    // an entry), one after it in the result (the path of the value); not the same errors, not the
+    // same Referrer.
+    let fields: Vec<&str> = __tl_stages_std_9205!().split('\u{1f}').collect();
+    assert_eq!(fields[..4], ["1", "1", "0", "1"]);
+    assert_eq!(fields[4], "");
+    assert_eq!(squash(fields[5]), "core::mem::size_of::<*constRel>");
+    assert_eq!(fields[6..], ["0", "0"]);
+
+    // The copy after the rule is one with the causes allowed, which is not a clean one.
+    let report = __tl_st_std_res_report_9205!();
+    let status: Vec<&str> = report
+        .split('\u{1e}')
+        .next()
+        .unwrap()
+        .splitn(4, '|')
+        .collect();
+    assert_eq!(status[..3], ["9205", "trait", "acc"]);
+
+    // The copy is an implementation of the Leaker's trait, and its default method is the original.
+    fn implements<T: l::ValuePathArguments>() {}
+    implements::<r::Host9205>();
+    struct Copy;
+    impl r::ValuePathArgumentsCopy for Copy {}
+    use r::ValuePathArgumentsCopy;
+    assert_eq!(Copy.size(), core::mem::size_of::<*const l::Rel>());
+}
+
+/// F51, fixture 9206: a nested struct whose bound names a leaked type that names `Self`, analyzed
+/// with `nested_self_entries()`, is rejected, as `intern_struct()` rejects it. The Referrer's
+/// macro expands to nothing (`kinds`, like the other rejected items).
+#[test]
+fn a_nested_item_with_a_bound_that_names_a_leaked_type_is_rejected() {
+    use type_leak_test_leaker::*;
+    assert_eq!(
+        reported(9206, __tl_report_9206!()),
+        rejected(
+            "struct",
+            "`Wrap<Self>`isinaboundorwherepredicate,andaboundofitsgenericsnamesaleakedtype"
+        )
+    );
+}
+
+/// F52, fixture 9207: the optional entries in the where predicate of a trait stay as written beside
+/// an unrelated error whose part copies `Self::A0` as written, as they do without the error. The
+/// strict Referrer (`accepted`) has no entry for them, and the host implements the trait.
+#[test]
+fn optional_entries_in_a_predicate_stay_as_written_beside_an_unrelated_error() {
+    use type_leak_test_leaker::*;
+    assert_eq!(
+        reported(9207, __tl_report_9207!()),
+        allowed("trait", 0, 0, 0)
+    );
+    // The one error is the unrelated one, accepted by its cause: the bound copied as written.
+    let errors: Vec<Vec<&str>> = __tl_errors_9207!()
+        .split('\u{1d}')
+        .map(|error| error.split('\u{1f}').collect())
+        .collect();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0][3..5], ["RelativePath", "Trait"]);
+    assert_eq!(squash(errors[0][1]), "GenTr<Self::A0>");
+}

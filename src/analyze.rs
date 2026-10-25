@@ -696,6 +696,8 @@ struct Probe {
     /// The mentions of `Self` and the cycles that the visitor had when the probe began.
     selves: usize,
     cycles: usize,
+    /// The length of `probe_kept` when the probe began.
+    kept: usize,
 }
 
 /// What `AnalyzeVisitor::visit_type()` finds set when it starts, and takes: a visit of the same
@@ -766,8 +768,14 @@ pub(crate) struct AnalyzeVisitor {
     /// While a binder is probed: the addresses of the types found to be leaked whole.
     probe: Option<HashSet<usize>>,
     /// A probe for nested errors is running ([`AnalyzeVisitor::begin_probe()`]): it records nothing
-    /// that outlives it.
+    /// that outlives it, but for `probe_kept`.
     probing: bool,
+    /// The types, with the contexts they are in, that a running probe found to be no optional
+    /// entries because of `Self` or `Self::A` in a predicate of the part it visits. The part is
+    /// copied as written, and rustc resolves them there with the bounds of the generics as they
+    /// are: the types that those bounds name stay as written too, wherever the error comes from.
+    /// The end of the probe gives them to the visitor ([`AnalyzeVisitor::end_probe()`]).
+    probe_kept: Vec<(Context, String)>,
     /// The scopes entered, innermost last, and the defaults that each analyzes alone.
     alone_defaults: Vec<AloneDefaults>,
     /// What `Self` means here, if anything. It has none directly in a module, or in generics that
@@ -922,6 +930,7 @@ impl AnalyzeVisitor {
             bound_elided: Vec::new(),
             probe: None,
             probing: false,
+            probe_kept: Vec::new(),
             alone_defaults: Vec::new(),
             self_ty: None,
             self_written: false,
@@ -1660,10 +1669,12 @@ impl AnalyzeVisitor {
             probing: std::mem::replace(&mut self.probing, true),
             selves: self.self_errors.len(),
             cycles: self.env_errors.len(),
+            kept: self.probe_kept.len(),
         })
     }
 
-    /// Ends a probe, and returns the errors it found. Nothing it recorded stays.
+    /// Ends a probe, and returns the errors it found. Nothing it recorded stays, but the types that
+    /// `Self` or `Self::A` in the part keeps as written (`probe_kept`).
     fn end_probe(&mut self, probe: Probe) -> Vec<ErrorItem> {
         let Probe {
             allowed,
@@ -1671,6 +1682,7 @@ impl AnalyzeVisitor {
             probing,
             selves,
             cycles,
+            kept,
         } = probe;
         let mut effects = std::mem::take(&mut self.frame.effects);
         let mentions = self.self_errors.split_off(selves);
@@ -1685,9 +1697,15 @@ impl AnalyzeVisitor {
             .collect();
         unshift_seen(&mut effects, selves);
         let nested = scope_error(&effects, &mentions, &conflicts);
+        let kept = self.probe_kept.split_off(kept);
         self.restore(checkpoint);
         self.allowed = allowed;
         self.probing = probing;
+        // What the part needs stays, though what the probe recorded is gone.
+        self.not_optional.extend(kept.iter().cloned());
+        if self.probing {
+            self.probe_kept.extend(kept);
+        }
         nested
     }
 
@@ -2531,6 +2549,7 @@ impl AnalyzeVisitor {
                                 return self.env_errors.push(conflict);
                             }
                         }
+                        let kept = self.not_optional.len();
                         if projection {
                             self.not_optional_in_bounds(&context);
                         } else {
@@ -2541,16 +2560,22 @@ impl AnalyzeVisitor {
                         if let Some(impl_context) = self.impl_context(projection) {
                             self.not_optional_in_bounds(&impl_context);
                         }
+                        self.keep_in_probe(kept);
                     }
                     if !projection {
+                        let kept = self.not_optional.len();
                         self.not_optional_in_self_type(&context);
+                        self.keep_in_probe(kept);
                     }
                 }
             }
         }
         let mut pending = match own {
             Some(Ok(context)) => {
-                if let Some(conflict) = self.env_cycle(ty, &context) {
+                let cycle = self
+                    .env_cycle(ty, &context)
+                    .or_else(|| self.nested_self_cycle(ty, &context, &inner));
+                if let Some(conflict) = cycle {
                     let mut conflict = self.with_part(conflict, ty, Some(context));
                     conflict.paths = self.paths_since(inner.must_start);
                     let conflict = self.nested_in_type(conflict, ty, entry);
@@ -2788,6 +2813,29 @@ impl AnalyzeVisitor {
                 Some(error)
             }
         }
+    }
+
+    /// Like `env_cycle()` for an entry in a predicate that names the `Self` of a nested struct, enum
+    /// or union and is for any type (`LeakerConfig::nested_self_entries()`). Its impl leaves out the
+    /// generics the type does not use, so `context` does not have a bound that names a leaked type
+    /// (`T: AsRef<Rel<Self>>`), but the impl of an entry that uses the generic has it, and the copy
+    /// has only the rewritten form in its environment (E0277, `Rel<(Self, T)>` beside it). So the
+    /// type is judged with the generics that `Self` names, as `intern_*` judges it, which writes
+    /// `Self` as the Leaker's type.
+    fn nested_self_cycle(
+        &self,
+        ty: &Type,
+        context: &Context,
+        inner: &Frame,
+    ) -> Option<CheckResult> {
+        if !(self.nested_self_entries && self.self_nested)
+            || !matches!(context.self_ty(), Some(SelfRequirement::Any))
+            || !type_mentions_self(ty)
+        {
+            return None;
+        }
+        let plain = self.context_of(ty, inner).ok()?;
+        self.env_cycle(ty, &plain)
     }
 
     /// Like `env_cycle()` for `Self::A` and for `Self` of an impl: they need the bounds of the
@@ -3166,6 +3214,15 @@ impl AnalyzeVisitor {
             optional_keys(&probe.frame.effects)
         });
         self.not_optional.extend(keys);
+    }
+
+    /// Called after `Self` or `Self::A` in a predicate made `not_optional[start..]`: while a probe
+    /// visits a part copied as written, it is the part that depends on them (`probe_kept`).
+    fn keep_in_probe(&mut self, start: usize) {
+        if self.probing {
+            self.probe_kept
+                .extend(self.not_optional[start..].iter().cloned());
+        }
     }
 
     /// Like `not_optional_in_bounds()` for the optional entries of the self type of an impl (in

@@ -2076,4 +2076,68 @@ pub mod kinds {
             <> => ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>;
         ];
     }
+
+    // F50 to F52 (`tests/findings.rs`): what a rule after the analysis, a nested item and an
+    // unrelated error used to get wrong. Each fails to build on the code before its fix.
+
+    /// F50, 9205: the path of the value is relative (`core::mem::size_of`, no leading `::`), and
+    /// `Rel` is in its arguments. `allow_std_crates()` after the analysis drops the path, and the
+    /// copy writes it with `Rel` as written: a crate that does not name `Rel` cannot build it. The
+    /// error must stay until `Rel` is allowed too (`stages = true`: the macro makes the copy after
+    /// each rule, in a crate of the Referrer that invokes it `clean`, and gets it only if the rule
+    /// left no error).
+    #[prop_leak_accept(
+        id = 9205,
+        allow_self = true,
+        scope = "mod",
+        prelude = true,
+        redeclare = true,
+        values = true,
+        stages = true
+    )]
+    pub trait ValuePathArguments {
+        fn size(&self) -> usize {
+            core::mem::size_of::<*const Rel>()
+        }
+    }
+
+    /// F51, 9206: `Wrap<Self>` in the bound of `T` is a leaked type, beside the entry `Link<Self,
+    /// T>` that uses `T` and so carries the bound. The copy writes the bound as a path through the
+    /// Repeater, and rustc cannot prove the bound of the impl of the entry in the environment
+    /// that has the rewritten form (E0277, for the entry in the last field: rustc proves the type
+    /// is `Sized` there). `intern_struct()` rejects it (`UnprovableBound`); the nested item with
+    /// `nested_self_entries` has to as well.
+    #[prop_leak(
+        id = 9206,
+        allow_self = true,
+        scope = "mod",
+        prelude = true,
+        nested_self_entries = true
+    )]
+    pub struct LeakedInBound<T: AsRef<Wrap<Self>>> {
+        pub rel: Rel,
+        pub link: Link<Self, T>,
+    }
+
+    /// A relative trait that takes a type: an unrelated error in a method of `OptionalNextToError`.
+    pub trait GenTr<A: ?Sized> {}
+
+    /// F52, 9207: the type of this crate by its own name (`Wrap<(T, Wrap<u8>)>`, `Wrap<u8>`) is an
+    /// optional entry, which a strict Referrer replaces. The where predicate of the trait names both
+    /// in an `Fn`, and `Y: GenTr<Self::A0>` is copied as written (`GenTr` is relative): its `Self::A0`
+    /// is resolved by the impl of the host, whose predicate must be the one of the trait. So the
+    /// optional entries in the predicate stay as written, as they do beside `Y: Into<Self::A0>`
+    /// (E0277 "expected an `Fn(&Wrap<..>)` closure, found `T`" otherwise).
+    #[prop_leak_accept(id = 9207, allow_self = true, prelude = true, strict = true)]
+    pub trait OptionalNextToError<T>
+    where
+        T: ::core::ops::Fn(
+            &::type_leak_test_leaker::kinds::Wrap<(T, ::type_leak_test_leaker::kinds::Wrap<u8>)>,
+        ) -> u8,
+    {
+        type A0;
+        fn m<Y>(&self)
+        where
+            Y: GenTr<Self::A0>;
+    }
 }

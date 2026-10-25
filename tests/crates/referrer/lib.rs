@@ -195,6 +195,9 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9162!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9163!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9164!(path = ::type_leak_test_leaker::kinds);
+    // A bound that names a leaked type that names the `Self` of the nested struct is rejected, as
+    // `intern_struct()` rejects it (F51): it expands to nothing.
+    type_leak_test_leaker::__tl_prop_9206!(path = ::type_leak_test_leaker::kinds);
     // A bound of a generic that names it, next to one that fixes an associated type: left out of
     // the Repeater's impls of the entries. 9172 is invoked as strict (it replaces the alias too).
     type_leak_test_leaker::__tl_prop_9171!(path = ::type_leak_test_leaker::kinds);
@@ -260,6 +263,13 @@ pub mod accepted {
     // `core::fmt::Debug`, `PlainTr` and `Held<'_>` as written (the crate names the last two).
     #[allow(unused_imports)]
     use type_leak_test_leaker::kinds::PlainTr;
+    // An optional entry in the predicate of a trait, next to an unrelated error that copies a part
+    // with `Self::A0` as written (F52). A strict Referrer, which the crate does not depend on `ext`
+    // for: the types are of the Leaker's crate, which it depends on.
+    #[allow(unused_imports)]
+    use type_leak_test_leaker::kinds::GenTr;
+
+    type_leak_test_leaker::__tl_prop_9207!(path = ::type_leak_test_leaker::kinds, strict, accept);
 
     type_leak_test_leaker::__tl_prop_9190!(
         path = ::type_leak_test_leaker::kinds,
@@ -297,4 +307,22 @@ pub mod unnamed {
     type_leak_test_leaker::__shared_apply_9202!(path = ::type_leak_test_leaker::kinds, copy(1));
     type_leak_test_leaker::__shared_apply_9203!(path = ::type_leak_test_leaker::kinds, copy(1));
     type_leak_test_leaker::__shared_apply_9204!(path = ::type_leak_test_leaker::kinds, copy(1));
+}
+
+/// The copies that `stages = true` makes after `allow_std_crates()` given to the result (F50): the
+/// Leaker's `ValuePathArguments` has `core::mem::size_of::<*const Rel>()` in a default method. This
+/// module names `Rel`, so the copy that keeps the path as written (the error stays, and its cause is
+/// allowed) builds here.
+pub mod stage_copies {
+    #[allow(unused_imports)]
+    use type_leak_test_leaker::kinds::Rel;
+
+    type_leak_test_leaker::__tl_st_std_res_9205!(path = ::type_leak_test_leaker::kinds, accept);
+}
+
+/// A crate of no name of the Leaker's (`clean`): the macro makes the copy only if the rule left no
+/// error. If the rule dropped the path with `Rel` in its arguments, the copy would write `Rel`
+/// here, where nothing names it (E0412).
+pub mod clean {
+    type_leak_test_leaker::__tl_st_std_res_9205!(clean path = ::type_leak_test_leaker::kinds, accept);
 }

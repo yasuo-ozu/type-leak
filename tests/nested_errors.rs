@@ -9,7 +9,8 @@
 //! - the reduced case of `tests/allow_stages.rs` (D): `X: Into<Self::A0>` has `Self::A0` nested;
 //! - every rule brings it up, on a config and on a result alike, and the rules add up;
 //! - a part with nothing wrong inside has none, and neither does `Vec<Rel<'_>>`;
-//! - the nesting is recursive, in the analysis (a value) and in what the rules do with it;
+//! - the nesting is recursive in what the rules do with it; the analysis makes one level (a probe
+//!   allows the paths of the part, and the arguments of the path of a value are among them);
 //! - a nested error that comes up is skipped if an error that stays is identical to it but for the
 //!   spans, and the errors that did not come up (or that come up) are never merged with each other;
 //! - the serialization writes `nested [..]` only if it is not empty, and reporting never shows it.
@@ -229,13 +230,16 @@ fn the_cause_value_and_default_rules_are_the_same_before_and_after_the_analysis(
         shape(result.errors()),
         "Into < Self :: A0 > [RelativePath] { Self :: A0 [UnprovableBound] }"
     );
+    // The path of the value is copied whole, `Rel` in its arguments with it: `Rel` is a path of its
+    // error (F50), and allowed in the probe, so `Rel<'_>` is nothing wrong inside it.
     let mut result = analyze(&item, base);
+    assert_eq!(paths(&result.errors()[1]), ["inner :: f", "Rel"]);
+    assert!(result.errors()[1].nested.is_empty());
     result.allow(Cause::Expr(parse_quote!(inner::f::<Rel<'_>>)));
     assert_eq!(
         shape(result.errors()),
-        "Into < Self :: A0 > [RelativePath] { Self :: A0 [UnprovableBound] }, Rel < '_ > [RelativePath]"
+        "Into < Self :: A0 > [RelativePath] { Self :: A0 [UnprovableBound] }"
     );
-    assert!(result.errors()[1].in_value);
 }
 
 #[test]
@@ -323,10 +327,10 @@ fn a_type_that_cannot_be_leaked_has_what_is_wrong_inside_it_nested() {
 }
 
 #[test]
-fn the_nesting_is_recursive_in_the_analysis() {
-    // The path of a value is copied whole with the types in its arguments. Its error has only its
-    // own path (`inner::f`), so allowing that finds `Rel<'_>`, a type that conflicts, and the
-    // analysis of that one is a probe inside the first.
+fn the_arguments_of_a_value_path_are_paths_of_its_error() {
+    // The path of a value is copied whole with the types in its arguments (F50), so the relative
+    // paths in them are paths of its error, and the probe allows them with the path itself: the
+    // arguments are written as they are, and nothing in them is wrong for being relative.
     let item: ItemTrait = parse_quote!(
         trait Tr {
             fn d(&self) {
@@ -339,30 +343,26 @@ fn the_nesting_is_recursive_in_the_analysis() {
     let result = analyze(&item, config);
     assert_eq!(result.errors().len(), 1);
     let error = &result.errors()[0];
-    assert_eq!(paths(error), ["inner :: f"]);
+    assert_eq!(paths(error), ["inner :: f", "Rel", "Wrap", "Rel2"]);
     assert!(error.in_value);
-    assert_eq!(
-        shape(&error.nested),
-        "Rel < '_ > [RelativePath], Wrap < Rel2 < '_ > > [RelativePath]"
-    );
-    // Each nested error has its own paths and its own place.
-    assert_eq!(paths(&error.nested[0]), ["Rel"]);
-    assert_eq!(paths(&error.nested[1]), ["Wrap", "Rel2"]);
-    assert!(error.nested.iter().all(|nested| nested.in_value));
-    // The rules go down one level at a time: dropping the path brings up both, and a path rule that
-    // allows only `Rel` drops the first of them with it.
+    assert!(error.nested.is_empty());
+    // The rules take the paths off one by one, and the error goes with the last.
     let mut result = result;
     result.allow_path(parse_quote!(inner));
+    assert_eq!(paths(&result.errors()[0]), ["Rel", "Wrap", "Rel2"]);
+    result.allow_path(parse_quote!(Rel));
+    assert_eq!(paths(&result.errors()[0]), ["Wrap", "Rel2"]);
+    result.allow_path(parse_quote!(Wrap));
+    result.allow_path(parse_quote!(Rel2));
+    assert!(result.errors().is_empty());
+    // The config that allows the path leaks the types in the arguments, which conflict; the rule
+    // after the analysis keeps the error until they are allowed too.
+    let mut config = LeakerConfig::new();
+    config.check_values().allow_path(parse_quote!(inner));
     assert_eq!(
-        shape(result.errors()),
+        shape(analyze(&item, config).errors()),
         "Rel < '_ > [RelativePath], Wrap < Rel2 < '_ > > [RelativePath]"
     );
-    result.allow_path(parse_quote!(Rel));
-    assert_eq!(
-        shape(result.errors()),
-        "Wrap < Rel2 < '_ > > [RelativePath]"
-    );
-    assert_eq!(paths(&result.errors()[0]), ["Wrap", "Rel2"]);
 }
 
 /// A result with three levels of nesting, written by hand: the analysis does not make one (a probe

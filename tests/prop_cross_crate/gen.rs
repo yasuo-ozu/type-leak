@@ -5270,15 +5270,7 @@ impl Gen {
         // Not in a module analyzed as a whole: a relative path with an argument that the module
         // declares (`std::boxed::Box<R0>`) is an entry that names the Leaker's `R0`, where the copy
         // declares its own. The generator avoids that for every relative path (`is_declared()`).
-        //
-        // Nor in the structs and traits whose bounds name their `Self` (`self_bound_adts`,
-        // `trait_self_defaults`): `AsRef<Option<Self>>` with `Option` relative is a leaked type in a
-        // bound, which the Leaker accepts when it analyzes the item nested in `enter_mod` while an
-        // entry uses the parameter (E0277 in the copy, a finding of `TYPE_LEAK_PROP_FEATURES=relative_std`).
-        let self_bounds = [TAG_SELF_BOUND_ADT, TAG_SELF_DEFAULT, TAG_PLAIN_DEFAULT]
-            .iter()
-            .any(|tag| self.tags.contains(*tag));
-        if !self.flags.relative_std || self.module_mode || self_bounds {
+        if !self.flags.relative_std || self.module_mode {
             return text.to_string();
         }
         let (head, tail) = match text.find('\n') {

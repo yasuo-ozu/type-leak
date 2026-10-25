@@ -220,6 +220,10 @@ impl LeakerConfig {
     /// assert_eq!(imp, expected);
     /// ```
     ///
+    /// A bound of the generic that names a leaked type that names `Self` (`T: AsRef<Rel<Self>>`) is
+    /// an error ([`Reason::UnprovableBound`](crate::Reason::UnprovableBound)) all the same, as it is
+    /// when the item is analyzed with its own `intern_*` call.
+    ///
     /// **Risks**
     ///
     /// - If the declaration of the leaked type has a trait bound on the parameter that receives

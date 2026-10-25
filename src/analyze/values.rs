@@ -236,13 +236,13 @@ impl<'a> ValueWalk<'a> {
     }
 
     /// Rejects the relative path `path` of a value, copied as written with the types in its
-    /// arguments (see [`Part`]).
+    /// arguments (see [`Part`]), whose relative paths are paths of the error too.
     fn relative_path(&mut self, path: &Path) {
         let cause = Cause::expr_path(path);
         let part = self.visitor.node_part(cause.clone(), path);
         self.relative_part(cause, None, Some(part));
-        // What is wrong in the arguments of the path if it were allowed: they are written as they
-        // are with it, and the walk reads them again.
+        // What is wrong in the arguments of the path if it were allowed, with the paths in them: they
+        // are written as they are with it, and the walk reads them again.
         if let Some(mut conflict) = self.visitor.pop_error() {
             if let Some(probe) = self.visitor.begin_probe(&conflict) {
                 self.visit_path(path);
@@ -271,7 +271,19 @@ impl<'a> ValueWalk<'a> {
             ));
         }
         // The path is relative: the walk knows no generic, no `Self` and no name of the value by it.
-        let paths = cause.as_path().map(without_arguments).into_iter().collect();
+        // It is copied as written with its arguments, so the relative paths in them are written too.
+        let paths = match cause.as_path() {
+            Some(path) => {
+                let mut paths = vec![without_arguments(path)];
+                ArgumentPaths {
+                    walk: self,
+                    found: &mut paths,
+                }
+                .visit_path(path);
+                paths
+            }
+            None => Vec::new(),
+        };
         self.error(CheckResult {
             must: vec![cause.clone()],
             impossible: vec![cause],
@@ -729,6 +741,26 @@ impl<'ast> Visit<'ast> for ValueWalk<'_> {
             walk.visit_pat(&i.pat);
             walk.visit_block(&i.body);
         })
+    }
+}
+
+/// Collects the relative paths in a path of a value and in its arguments, without their arguments,
+/// each once: those that mean something else wherever they are written, and that the value does
+/// not declare ([`CheckResult::paths`]). `found` has the path itself.
+struct ArgumentPaths<'w, 'a> {
+    walk: &'w ValueWalk<'a>,
+    found: &'w mut Vec<Path>,
+}
+
+impl<'ast> Visit<'ast> for ArgumentPaths<'_, '_> {
+    fn visit_path(&mut self, i: &'ast Path) {
+        if self.walk.visitor.is_relative_path(i) && !self.walk.is_local(i) {
+            let path = without_arguments(i);
+            if !self.found.contains(&path) {
+                self.found.push(path);
+            }
+        }
+        syn::visit::visit_path(self, i)
     }
 }
 
