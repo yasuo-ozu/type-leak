@@ -1,0 +1,25 @@
+--- a/tests/crates/macro/prop.rs
++++ b/tests/crates/macro/prop.rs
+@@ -533,6 +533,22 @@
+             .unwrap_or_default();
+         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
+         let (args, self_ty, ty) = (&r.args, &r.self_ty, &r.ty);
++        if let Ok(path) = std::env::var("TYPE_LEAK_HIST_FILE") {
++            use std::io::Write;
++            let key = quote!(#impl_generics | #args | #self_ty | #where_clause).to_string();
++            let line = format!(
++                "{}\t{}\t{}\t{:?}\t{}\t{}\n",
++                std::env::var("CARGO_PKG_NAME").unwrap_or_default(),
++                id,
++                ix,
++                referrer.context(ix),
++                key.replace('\t', " ").replace('\n', " "),
++                quote!(#ty).to_string().replace('\t', " ").replace('\n', " ")
++            );
++            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
++                let _ = f.write_all(line.as_bytes());
++            }
++        }
+         impls.push((
+             module,
+             quote! {

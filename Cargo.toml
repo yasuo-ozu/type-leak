@@ -15,7 +15,9 @@ categories = [
 license = "MIT"
 # The cross-crate, diagnostic, outlives and property tests depend on the test crates under
 # tests/crates, which are not published, and the test of the two-macro example on examples/.
+# bench/ holds the scripts and the results of the Repeater-grouping benchmark.
 exclude = [
+  "bench",
   "examples",
   "tests/crates",
   "tests/cross_crate.rs",
