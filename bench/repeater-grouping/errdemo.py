@@ -7,7 +7,6 @@ Entries of the context `<T: Clone>`: 0 `W<T>`, 1 `Bnd<T>` (needs T: Copy, so it 
 import os, shutil, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "errdemo")
-IDX = "18446744073709551615u64"
 ENT = ["W<T>", "Bnd<T>", "N"]
 POOL = "pub struct W<T>(pub T); pub struct Bnd<T: Copy>(pub T); pub struct N;"
 CTX = "T: Clone"
@@ -16,40 +15,18 @@ def leaker(variant, entries):
     if variant == "base":
         tr = "pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> { type Type: ?Sized; }"
         impls = ["impl<T: Clone, __S: ?Sized> Repeater<(T,), 1u64, %dusize> for __S { type Type = %s; }" % (i, "crate::" + e) for i, e in enumerate(entries)]
-    elif variant == "multi4":
-        tr = "pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> { type Type0: ?Sized; type Type1: ?Sized; type Type2: ?Sized; type Type3: ?Sized; }"
-        ts = ["crate::" + e for e in entries] + ["()"] * (4 - len(entries))
+    else:  # multiK
+        k = int(variant[len("multi"):])
+        tr = "pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> { %s }" % " ".join(
+            "type Type%d: ?Sized;" % j for j in range(k))
+        ts = ["crate::" + e for e in entries] + ["()"] * (k - len(entries))
         impls = ["impl<T: Clone, __S: ?Sized> Repeater<(T,), 1u64, 0usize> for __S { %s }" % " ".join("type Type%d = %s;" % (j, t) for j, t in enumerate(ts))]
-    else:
-        tr = "pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> { type Type: ?Sized; }"
-        ptys = ["*const crate::" + e for e in entries]
-        if variant == "tup4":
-            tup = "(%s)" % ", ".join(ptys)
-            names = ["A%d" % i for i in range(len(entries))]
-            impls = ["impl<T: Clone, __S: ?Sized> Repeater<(T,), 1u64, 0usize> for __S { type Type = %s; }" % tup]
-            for j in range(len(entries)):
-                impls.append("impl<%s> Repeater<(), %s, %dusize> for (%s) { type Type = %s; }" % (
-                    ", ".join(n + ": ?Sized" for n in names), IDX, j, ", ".join("*const " + n for n in names), names[j]))
-        else:  # nest4
-            tup = "()"
-            for p in reversed(ptys):
-                tup = "(%s, %s)" % (p, tup)
-            impls = ["impl<T: Clone, __S: ?Sized> Repeater<(T,), 1u64, 0usize> for __S { type Type = %s; }" % tup]
-            for j in range(len(entries)):
-                names = ["A%d" % i for i in range(j + 1)]
-                t = "R"
-                for n in reversed(names):
-                    t = "(*const %s, %s)" % (n, t)
-                impls.append("impl<%s, R> Repeater<(), %s, %dusize> for %s { type Type = %s; }" % (
-                    ", ".join(n + ": ?Sized" for n in names), IDX, j, t, names[j]))
     return "%s\n%s\n%s\n" % (tr, POOL, "\n".join(impls))
 
 def use(variant, j, nth_override=None):
     if variant == "base":
         return "<() as ::leaker::Repeater<(T,), 1u64, %dusize>>::Type" % (j if nth_override is None else nth_override)
-    if variant == "multi4":
-        return "<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type%d" % j
-    return "<<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type as ::leaker::Repeater<(), %s, %dusize>>::Type" % (IDX, j)
+    return "<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type%d" % j
 
 def write(name, lk, rf):
     d = os.path.join(OUT, name)
@@ -61,7 +38,7 @@ def write(name, lk, rf):
     open(d + "/leaker/src/lib.rs", "w").write(lk)
     open(d + "/referrer/src/lib.rs", "w").write(rf)
 
-for v in ("base", "multi4", "tup4", "nest4"):
+for v in ("base", "multi4", "multi8"):
     # S1: the leaked type of entry 1 is not well-formed in the context (Leaker side)
     write("S1-" + v, leaker(v, ENT), "")
     good = leaker(v, [ENT[0], "N", "W<T>"])  # entries 0 `W<T>`, 1 `N`, 2 `W<T>`
@@ -72,8 +49,6 @@ for v in ("base", "multi4", "tup4", "nest4"):
     # S4: a use of an entry that does not exist
     if v == "base":
         u = use(v, 0, nth_override=9)
-    elif v == "multi4":
-        u = "<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type7"
-    else:
-        u = use(v, 7)
+    else:  # one past the last type of the trait
+        u = "<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type%d" % (int(v[len("multi"):]) + 3)
     write("S4-" + v, good, "pub fn f<T: Clone>(x: %s) {}\n" % u)

@@ -16,6 +16,10 @@ LINE = re.compile(r"time:\s+([\d.]+);\s+rss:.*?\t(\S+)\s*$")
 def timed(d, crate, tc, build_dep):
     env = dict(os.environ, CARGO_INCREMENTAL="0", RUSTC_BOOTSTRAP="1", CARGO_TERM_COLOR="never")
     shutil.rmtree(os.path.join(d, "target"), ignore_errors=True)
+    try:  # an old cargo cannot read the lockfile format of a newer one
+        os.remove(os.path.join(d, "Cargo.lock"))
+    except OSError:
+        pass
     if build_dep:
         subprocess.run(["cargo", "+" + tc, "build", "--offline", "-q", "-p", "leaker"], cwd=d, env=env, check=True)
     p = subprocess.run(["cargo", "+" + tc, "rustc", "--offline", "-q", "-p", crate, "--lib", "--",

@@ -31,13 +31,12 @@ for path in sorted(glob.glob(os.path.join(results, "*.jsonl"))):
         f.write("# %s\n\n## CPU seconds / wall seconds (user+sys of cargo and children; median over the reps)\n%s\n\n"
                 "## User-space instructions, billions (median)\n%s\n" % (name, cpu, ins))
     print("wrote", name + ".txt")
-for what, fname in (("matrix", "matrix-A-stable.txt"), ("toolchains", "toolchains.txt"), ("versions", "versions.txt"),
-                    ("msrv", "msrv.txt"), ("passes", "passes.txt")):
+for what in ("nsweep", "corpus", "complexity", "toolchains", "fillers", "scaling", "defaults", "versions", "msrv", "passes"):
     text = run("summaries.py", what)
     if text.strip():
-        with open(os.path.join(out_dir, fname), "w") as f:
+        with open(os.path.join(out_dir, what + ".txt"), "w") as f:
             f.write(text)
-        print("wrote", fname)
+        print("wrote", what + ".txt")
 log = os.path.join(HERE, "logs", "errdemo.log")
 if os.path.exists(log):
     shutil.copy(log, os.path.join(out_dir, "errdemo.txt"))

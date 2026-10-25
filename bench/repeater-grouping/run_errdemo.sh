@@ -5,7 +5,7 @@
 set -u
 R=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$R" && mkdir -p logs && python3 errdemo.py
-for s in S1 S2 S3 S4; do for v in base multi4 tup4 nest4; do
+for s in S1 S2 S3 S4; do for v in base multi4 multi8; do
   echo "=================== $s $v"
   (cd "$R/errdemo/$s-$v" && rm -rf target && ${TASKSET:-} cargo +stable check --offline -q --color never 2>&1 | head -"${1:-40}")
 done; done > logs/errdemo.log

@@ -49,9 +49,9 @@ def stats(rows):
 
 def vorder(v):
     import re
-    m = re.match(r"^([a-z]+)(\d*)(p?)(r?)$", v)
-    kind = ["ctl", "base", "multi", "tup", "nest"].index(m.group(1))
-    return (kind, int(m.group(2) or 0), m.group(3), m.group(4))
+    m = re.match(r"^([a-z]+)(\d*)(d?)$", v)
+    kind = ["ctl", "base", "multi"].index(m.group(1))
+    return (kind, m.group(3), int(m.group(2) or 0))
 
 
 def fmt(x, nd=2):
@@ -62,7 +62,7 @@ def table(cfg, vs, metric, full):
     base = vs.get("base")
     names = sorted(vs, key=vorder)
     lines = []
-    hdr = ["variant", "impls", "idx", "assoc", "L build", "R build", "L check", "R check",
+    hdr = ["variant", "impls", "assoc/impl", "L build", "R build", "L check", "R check",
            "build L+R", "check L+R"]
     if full:
         hdr += ["spread (max/min) of build L+R"]
@@ -83,7 +83,7 @@ def table(cfg, vs, metric, full):
         else:
             seen[e["key"]] = v
         cells[0] = v + note
-        cells += [str(meta["impls"]), str(meta["index_impls"]), str(meta["assoc_per_impl"])]
+        cells += [str(meta["impls"]), str(meta["assoc_per_impl"])]
         for ph in PH:
             cpu = med(e[ph]["cpu"])
             wall = med(e[ph]["wall"])

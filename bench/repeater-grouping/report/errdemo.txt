@@ -36,11 +36,11 @@ help: consider further restricting type parameter `T` with trait `Copy`
 
 For more information about this error, try `rustc --explain E0277`.
 error: could not compile `leaker` (lib) due to 1 previous error
-=================== S1 tup4
+=================== S1 multi8
 error[E0277]: the trait bound `T: Copy` is not satisfied
- --> leaker/src/lib.rs:3:108
+ --> leaker/src/lib.rs:3:107
   |
-3 | ... Type = (*const crate::W<T>, *const crate::Bnd<T>, *const crate::N); }
+3 | ...e Type0 = crate::W<T>; type Type1 = crate::Bnd<T>; type Type2 = crate::N; type Type3 = (); type Type4 = (); type Type5 = (); type ...
   |                                        ^^^^^^^^^^^^^ the trait `Copy` is not implemented for `T`
   |
 note: required by a bound in `Bnd`
@@ -50,26 +50,7 @@ note: required by a bound in `Bnd`
   |                                           ^^^^ required by this bound in `Bnd`
 help: consider further restricting type parameter `T` with trait `Copy`
   |
-3 | impl<T: Clone + std::marker::Copy, __S: ?Sized> Repeater<(T,), 1u64, 0usize> for __S { type Type = (*const crate::W<T>, *const crate::Bnd<T>, *const crate::N); }
-  |               +++++++++++++++++++
-
-For more information about this error, try `rustc --explain E0277`.
-error: could not compile `leaker` (lib) due to 1 previous error
-=================== S1 nest4
-error[E0277]: the trait bound `T: Copy` is not satisfied
- --> leaker/src/lib.rs:3:109
-  |
-3 | ...Type = (*const crate::W<T>, (*const crate::Bnd<T>, (*const crate::N, ()))); }
-  |                                        ^^^^^^^^^^^^^ the trait `Copy` is not implemented for `T`
-  |
-note: required by a bound in `Bnd`
- --> leaker/src/lib.rs:2:43
-  |
-2 | pub struct W<T>(pub T); pub struct Bnd<T: Copy>(pub T); pub struct N;
-  |                                           ^^^^ required by this bound in `Bnd`
-help: consider further restricting type parameter `T` with trait `Copy`
-  |
-3 | impl<T: Clone + std::marker::Copy, __S: ?Sized> Repeater<(T,), 1u64, 0usize> for __S { type Type = (*const crate::W<T>, (*const crate::Bnd<T>, (*const crate::N, ()))); }
+3 | impl<T: Clone + std::marker::Copy, __S: ?Sized> Repeater<(T,), 1u64, 0usize> for __S { type Type0 = crate::W<T>; type Type1 = crate::Bnd<T>; type Type2 = crate::N; type Type3 = (); type Type4 = (); type Type5 = (); type Type6 = (); type Type7 = (); }
   |               +++++++++++++++++++
 
 For more information about this error, try `rustc --explain E0277`.
@@ -104,60 +85,21 @@ help: consider restricting type parameter `T` with trait `Clone`
 
 For more information about this error, try `rustc --explain E0277`.
 error: could not compile `referrer` (lib) due to 1 previous error
-=================== S2 tup4
-error[E0277]: the trait bound `T: Clone` is not satisfied
- --> referrer/src/lib.rs:1:17
-  |
-1 | pub fn f<T>(x: <<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type as ::leaker::Repeater<(), 18446744073709551615u64, 0usize>>::Typ...
-  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `T`
-  |
-  = note: required for `()` to implement `Repeater<(T,), 1, 0>`
-help: consider restricting type parameter `T` with trait `Clone`
-  |
-1 | pub fn f<T: std::clone::Clone>(x: <<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type as ::leaker::Repeater<(), 18446744073709551615u64, 0usize>>::Type) {}
-  |           +++++++++++++++++++
-
+=================== S2 multi8
 error[E0277]: the trait bound `T: Clone` is not satisfied
  --> referrer/src/lib.rs:1:16
   |
-1 | ...>(x: <<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type as ::leaker::Repeater<(), 18446744073709551615u64, 0usize>>::Type) {}
-  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `T`
+1 | pub fn f<T>(x: <() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type0) {}
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `T`
   |
   = note: required for `()` to implement `Repeater<(T,), 1, 0>`
 help: consider restricting type parameter `T` with trait `Clone`
   |
-1 | pub fn f<T: std::clone::Clone>(x: <<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type as ::leaker::Repeater<(), 18446744073709551615u64, 0usize>>::Type) {}
+1 | pub fn f<T: std::clone::Clone>(x: <() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type0) {}
   |           +++++++++++++++++++
 
 For more information about this error, try `rustc --explain E0277`.
-error: could not compile `referrer` (lib) due to 2 previous errors
-=================== S2 nest4
-error[E0277]: the trait bound `T: Clone` is not satisfied
- --> referrer/src/lib.rs:1:17
-  |
-1 | pub fn f<T>(x: <<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type as ::leaker::Repeater<(), 18446744073709551615u64, 0usize>>::Typ...
-  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `T`
-  |
-  = note: required for `()` to implement `Repeater<(T,), 1, 0>`
-help: consider restricting type parameter `T` with trait `Clone`
-  |
-1 | pub fn f<T: std::clone::Clone>(x: <<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type as ::leaker::Repeater<(), 18446744073709551615u64, 0usize>>::Type) {}
-  |           +++++++++++++++++++
-
-error[E0277]: the trait bound `T: Clone` is not satisfied
- --> referrer/src/lib.rs:1:16
-  |
-1 | ...>(x: <<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type as ::leaker::Repeater<(), 18446744073709551615u64, 0usize>>::Type) {}
-  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `T`
-  |
-  = note: required for `()` to implement `Repeater<(T,), 1, 0>`
-help: consider restricting type parameter `T` with trait `Clone`
-  |
-1 | pub fn f<T: std::clone::Clone>(x: <<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type as ::leaker::Repeater<(), 18446744073709551615u64, 0usize>>::Type) {}
-  |           +++++++++++++++++++
-
-For more information about this error, try `rustc --explain E0277`.
-error: could not compile `referrer` (lib) due to 2 previous errors
+error: could not compile `referrer` (lib) due to 1 previous error
 =================== S3 base
 error[E0308]: mismatched types
  --> referrer/src/lib.rs:1:97
@@ -186,28 +128,14 @@ error[E0308]: mismatched types
 
 For more information about this error, try `rustc --explain E0308`.
 error: could not compile `referrer` (lib) due to 1 previous error
-=================== S3 tup4
+=================== S3 multi8
 error[E0308]: mismatched types
- --> referrer/src/lib.rs:1:164
+ --> referrer/src/lib.rs:1:98
   |
-1 | ...44073709551615u64, 1usize>>::Type) -> ::leaker::W<T> { x }
-  |                                          --------------   ^ expected `W<T>`, found `N`
-  |                                          |
-  |                                          expected `W<T>` because of return type
-  |
-  = note: expected struct `W<T>`
-             found struct `N`
-
-For more information about this error, try `rustc --explain E0308`.
-error: could not compile `referrer` (lib) due to 1 previous error
-=================== S3 nest4
-error[E0308]: mismatched types
- --> referrer/src/lib.rs:1:164
-  |
-1 | ...44073709551615u64, 1usize>>::Type) -> ::leaker::W<T> { x }
-  |                                          --------------   ^ expected `W<T>`, found `N`
-  |                                          |
-  |                                          expected `W<T>` because of return type
+1 | pub fn w<T: Clone>(x: <() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type1) -> ::leaker::W<T> { x }
+  |                                                                                 --------------   ^ expected `W<T>`, found `N`
+  |                                                                                 |
+  |                                                                                 expected `W<T>` because of return type
   |
   = note: expected struct `W<T>`
              found struct `N`
@@ -243,41 +171,23 @@ help: an associated type with a similar name exists
 
 For more information about this error, try `rustc --explain E0576`.
 error: could not compile `referrer` (lib) due to 1 previous error
-=================== S4 tup4
-error[E0277]: the trait bound `(*const W<T>, *const N, *const W<T>): Repeater<(), u64::MAX, 7>` is not satisfied
- --> referrer/src/lib.rs:1:23
+=================== S4 multi8
+error[E0576]: cannot find associated type `Type11` in trait `::leaker::Repeater`
+ --> referrer/src/lib.rs:1:71
   |
-1 | ...>(x: <<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type as ::leaker::Repeater<(), 18446744073709551615u64, 7usize>>::Type) {}
-  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Repeater<(), u64::MAX, 7>` is not implemented for `(*const W<T>, *const N, *const W<T>)`
+1 | pub fn f<T: Clone>(x: <() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type11) {}
+  |                                                                       ^^^^^^
   |
-help: `(*const A0, *const A1, *const A2)` implements trait `Repeater<T, ID, NTH>`
- --> leaker/src/lib.rs:4:1
+ ::: leaker/src/lib.rs:1:86
   |
-4 | impl<A0: ?Sized, A1: ?Sized, A2: ?Sized> Repeater<(), 18446744073709551615u64, 0usize> for (*const A0, *const A1, *const A2) { type T...
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Repeater<(), u64::MAX, 0>`
-5 | impl<A0: ?Sized, A1: ?Sized, A2: ?Sized> Repeater<(), 18446744073709551615u64, 1usize> for (*const A0, *const A1, *const A2) { type T...
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Repeater<(), u64::MAX, 1>`
-6 | impl<A0: ?Sized, A1: ?Sized, A2: ?Sized> Repeater<(), 18446744073709551615u64, 2usize> for (*const A0, *const A1, *const A2) { type T...
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Repeater<(), u64::MAX, 2>`
+1 | ...usize> { type Type0: ?Sized; type Type1: ?Sized; type Type2: ?Sized; type Type3: ?Sized; type Type4: ?Sized; type Type5: ?Sized; t...
+  |                                 ------------------ similarly named associated type `Type1` defined here
+  |
+help: an associated type with a similar name exists
+  |
+1 - pub fn f<T: Clone>(x: <() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type11) {}
+1 + pub fn f<T: Clone>(x: <() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type1) {}
+  |
 
-For more information about this error, try `rustc --explain E0277`.
-error: could not compile `referrer` (lib) due to 1 previous error
-=================== S4 nest4
-error[E0277]: the trait bound `(*const W<T>, (*const N, (*const W<T>, ()))): Repeater<(), u64::MAX, 7>` is not satisfied
- --> referrer/src/lib.rs:1:23
-  |
-1 | ...>(x: <<() as ::leaker::Repeater<(T,), 1u64, 0usize>>::Type as ::leaker::Repeater<(), 18446744073709551615u64, 7usize>>::Type) {}
-  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Repeater<(), u64::MAX, 7>` is not implemented for `(*const W<T>, (*const N, (*const W<T>, ())))`
-  |
-help: the following other types implement trait `Repeater<T, ID, NTH>`
- --> leaker/src/lib.rs:4:1
-  |
-4 | impl<A0: ?Sized, R> Repeater<(), 18446744073709551615u64, 0usize> for (*const A0, R) { type Type = A0; }
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `(*const A0, R)` implements `Repeater<(), u64::MAX, 0>`
-5 | impl<A0: ?Sized, A1: ?Sized, R> Repeater<(), 18446744073709551615u64, 1usize> for (*const A0, (*const A1, R)) { type Type = A1; }
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `(*const A0, (*const A1, R))` implements `Repeater<(), u64::MAX, 1>`
-6 | impl<A0: ?Sized, A1: ?Sized, A2: ?Sized, R> Repeater<(), 18446744073709551615u64, 2usize> for (*const A0, (*const A1, (*const A2, R))) { ...
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `(*const A0, (*const A1, (*const A2, R)))` implements `Repeater<(), u64::MAX, 2>`
-
-For more information about this error, try `rustc --explain E0277`.
+For more information about this error, try `rustc --explain E0576`.
 error: could not compile `referrer` (lib) due to 1 previous error

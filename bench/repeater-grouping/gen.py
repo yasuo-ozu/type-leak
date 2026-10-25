@@ -2,7 +2,7 @@
 """Generates a Leaker crate and a Referrer crate for one Repeater encoding variant.
 
 Usage:
-  gen.py --out DIR --variant base|multiK|tupK|tupKp|nestK [--E 1000 --C 100 --cx three --seed 1 ...]
+  gen.py --out DIR --variant base|ctl|multiK|multiKd [--E 1000 --C 100 --cx three --seed 1 ...]
 
 The set of entries (their types, contexts and order) depends only on
 (E, C or --sizes, cx, seed, unsized fraction), never on the variant, so that all variants of a
@@ -10,19 +10,16 @@ configuration encode the same entries.
 
 Variants
   base      one impl per entry, `type Type = Ty;`
-  multiK    the Repeater has K associated types Type0..Type{K-1}; one impl carries up to K entries of
-            one context, the unused types are `()`.
-  tupK      `type Type = (*const T0, *const T1, ..)` for up to K entries of one context; the use site
-            indexes it with `<.. as Repeater<(), IDX, j>>::Type`, with one indexing impl per
-            (arity, index) pair that is used, emitted once in the Leaker's crate. The elements are
-            wrapped in `*const` so that unsized entries (and entries whose Sizedness the Leaker
-            cannot know) can be elements; the indexing impl strips the pointer.
-  tupKp     like tupK, with the arity padded up to a power of two (`*const ()` fillers), so
-            the arities in use are 1, 2, 4, .. and the indexing impls are few.
-  nestK     nested pairs `(*const T0, (*const T1, (.., ())))`: the indexing impl of index j works for
-            any length, so K impls are emitted in all.
-  A group of one entry in tup/nest is written directly (`type Type = Ty`), as the baseline does
-  (`--no-direct1` turns that off).
+  ctl       control without any Repeater: no impls, the Referrer writes the original types
+  multiK    the Repeater has K associated types Type0..Type{K-1} (all `?Sized`); one impl carries up to K
+            entries of one context; the impl must define all K types (associated type defaults are
+            unstable), so the unused ones are `()`. K=1 is `base` with the type named Type0.
+  multiKd   NIGHTLY ONLY, an experiment: like multiK, but the trait gives every type the default `()`
+            (`#![feature(associated_type_defaults)]`), so an impl defines only the types it needs.
+            It shows what defaults would bring; it cannot be used on stable.
+
+Earlier versions also had tuple encodings (`type Type = (T0, T1, ..)` plus indexing impls). They were
+dropped: the second projection made the Referrer's crate 20-90% slower on stable.
 """
 import argparse
 import os
@@ -30,8 +27,6 @@ import random
 import sys
 
 NN = 12  # number of types in each family of the pool
-IDX = "18446744073709551615u64"  # reserved ID of the indexing impls
-IDX_PTR = "18446744073709551614u64"
 
 
 class Cx:
@@ -178,52 +173,30 @@ def impl_header(cx, trait_args):
     return "impl<%s> Repeater<%s> for __S" % (gparams(gs), trait_args)
 
 
-def groups_of(ents, K, pad_pow2=False):
-    """Chunks the entries of one context into groups of at most K."""
-    return [ents[i: i + K] for i in range(0, len(ents), K)]
-
-
-def next_pow2(n):
-    p = 1
-    while p < n:
-        p *= 2
-    return p
-
-
 class Plan:
-    """What a variant writes for the entries: impls and the use-site type of each entry."""
+    """What a variant writes for the entries: the impls and the use-site type of each entry."""
 
-    def __init__(self, variant, ctxs, direct1=True, shared_ids=False):
+    def __init__(self, variant, ctxs, shared_ids=False):
         self.variant = variant
         self.ctxs = ctxs
-        self.impls = []  # (text)
-        self.use = {}  # (ctx index, entry index) -> function(M, x_prefix) -> type text at use site
-        self.index_impls = []
-        self.assoc_per_impl = []
-        self.nimpls_entries = 0
-        self.arities = set()
-        self.kind = "base"
-        self.K = 1
-        self.direct1 = direct1
+        self.impls = []
+        self.uses = {}  # (context index, entry index) -> use-site type, `{X}` stands for the host
         self.shared_ids = shared_ids
         self.parse(variant)
 
     def parse(self, v):
         import re
-        m = re.match(r"^(base|ctl|multi|tup|nest)(\d*)(p?)(r?)$", v)
-        if not m:
-            raise SystemExit("bad variant " + v)
+        m = re.match(r"^(base|ctl|multi)(\d*)(d?)$", v)
+        if not m or (m.group(1) == "multi") != bool(m.group(2)) or (m.group(3) and m.group(1) != "multi"):
+            raise SystemExit("bad variant %r: base, ctl, multiK or multiKd" % v)
         self.kind = m.group(1)
         self.K = int(m.group(2)) if m.group(2) else 1
-        self.pad = m.group(3) == "p"
-        self.raw = m.group(4) == "r"
+        self.defaults = m.group(3) == "d"
 
     def build(self, M_leak):
         """M_leak is the module prefix in the Leaker (`crate::m::`)."""
         kind, K = self.kind, self.K
         impls = []
-        used_arities = set()
-        max_nest = 0
         uses = {}
         nth_run = 0
         last_len = 0
@@ -245,127 +218,39 @@ class Plan:
                     uses[(ci, ei)] = ("<%s as Repeater<%s, %du64, %dusize>>::Type" % ("{X}", enc, ID, ei + off))
                 continue
             gi = 0
-            if self.raw and kind in ("tup", "nest"):
-                # raw elements (no `*const`): the unsized entries are ungrouped
-                sized = [i for i, (t, u) in enumerate(ents) if not u]
-                uns = [i for i, (t, u) in enumerate(ents) if u]
-                groups = [sized[k: k + K] for k in range(0, len(sized), K)] + [[i] for i in uns]
-                for g in groups:
-                    tys = [ents[i][0].replace("{M}", M_leak) for i in g]
-                    hdr = impl_header(cx, "%s, %du64, %dusize" % (enc, ID, gi + off))
-                    if len(g) == 1:
-                        impls.append("%s { type Type = %s; }" % (hdr, tys[0]))
-                        uses[(ci, g[0])] = "<{X} as Repeater<%s, %du64, %dusize>>::Type" % (enc, ID, gi + off)
-                    else:
-                        n = len(g)
-                        if kind == "tup":
-                            tup = "(%s)" % ", ".join(tys)
-                            used_arities.add(n)
-                        else:
-                            tup = "()"
-                            for p in reversed(tys):
-                                tup = "(%s, %s)" % (p, tup)
-                            max_nest = max(max_nest, n)
-                        impls.append("%s { type Type = %s; }" % (hdr, tup))
-                        for j, i in enumerate(g):
-                            uses[(ci, i)] = (
-                                "<<{X} as Repeater<%s, %du64, %dusize>>::Type as Repeater<(), %s, %dusize>>::Type"
-                                % (enc, ID, gi + off, IDX, j)
-                            )
-                    gi += 1
-                continue
             for start in range(0, len(ents), K):
                 chunk = ents[start: start + K]
                 tys = [t.replace("{M}", M_leak) for t, _ in chunk]
-                if kind == "multi":
-                    body = "".join(
-                        "type Type%d = %s; " % (j, tys[j] if j < len(tys) else "()") for j in range(K)
-                    )
-                    impls.append("%s { %s}" % (impl_header(cx, "%s, %du64, %dusize" % (enc, ID, gi + off)), body))
-                    for j in range(len(chunk)):
-                        uses[(ci, start + j)] = "<{X} as Repeater<%s, %du64, %dusize>>::Type%d" % (enc, ID, gi + off, j)
-                else:
-                    if len(chunk) == 1 and self.direct1:
-                        impls.append(
-                            "%s { type Type = %s; }" % (impl_header(cx, "%s, %du64, %dusize" % (enc, ID, gi + off)), tys[0])
-                        )
-                        uses[(ci, start)] = "<{X} as Repeater<%s, %du64, %dusize>>::Type" % (enc, ID, gi + off)
-                    else:
-                        n = len(chunk)
-                        if self.pad:
-                            n = next_pow2(n)
-                        ptys = ["*const %s" % t for t in tys] + ["*const ()"] * (n - len(tys))
-                        if kind == "tup":
-                            tup = "(%s,)" % ", ".join(ptys) if n == 1 else "(%s)" % ", ".join(ptys)
-                            used_arities.add(n)
-                        else:
-                            tup = "()"
-                            for p in reversed(ptys):
-                                tup = "(%s, %s)" % (p, tup)
-                            max_nest = max(max_nest, len(chunk))
-                        impls.append(
-                            "%s { type Type = %s; }" % (impl_header(cx, "%s, %du64, %dusize" % (enc, ID, gi + off)), tup)
-                        )
-                        for j in range(len(chunk)):
-                            uses[(ci, start + j)] = (
-                                "<<{X} as Repeater<%s, %du64, %dusize>>::Type as Repeater<(), %s, %dusize>>::Type"
-                                % (enc, ID, gi + off, IDX, j)
-                            )
+                n_defined = len(tys) if self.defaults else K
+                body = "".join(
+                    "type Type%d = %s; " % (j, tys[j] if j < len(tys) else "()") for j in range(n_defined)
+                )
+                impls.append("%s { %s}" % (impl_header(cx, "%s, %du64, %dusize" % (enc, ID, gi + off)), body))
+                for j in range(len(chunk)):
+                    uses[(ci, start + j)] = "<{X} as Repeater<%s, %du64, %dusize>>::Type%d" % (enc, ID, gi + off, j)
                 gi += 1
         self.impls = impls
-        self.index_impls = []
-        if kind == "tup" and self.raw:
-            for n in sorted(used_arities):
-                names = ["A%d" % i for i in range(n)]
-                for j in range(n):
-                    self.index_impls.append(
-                        "impl<%s> Repeater<(), %s, %dusize> for (%s) { type Type = %s; }"
-                        % (", ".join(names), IDX, j, ", ".join(names), names[j])
-                    )
-        elif kind == "nest" and self.raw:
-            for j in range(max_nest):
-                names = ["A%d" % i for i in range(j + 1)]
-                tup = "R"
-                for a in reversed(names):
-                    tup = "(%s, %s)" % (a, tup)
-                self.index_impls.append(
-                    "impl<%s, R> Repeater<(), %s, %dusize> for %s { type Type = %s; }"
-                    % (", ".join(names), IDX, j, tup, names[j])
-                )
-        elif kind == "tup":
-            for n in sorted(used_arities):
-                names = ["A%d" % i for i in range(n)]
-                tup = "(%s,)" % ", ".join("*const " + a for a in names) if n == 1 else "(%s)" % ", ".join("*const " + a for a in names)
-                for j in range(n):
-                    self.index_impls.append(
-                        "impl<%s> Repeater<(), %s, %dusize> for %s { type Type = %s; }"
-                        % (", ".join(a + ": ?Sized" for a in names), IDX, j, tup, names[j])
-                    )
-        elif kind == "nest":
-            for j in range(max_nest):
-                names = ["A%d" % i for i in range(j + 1)]
-                tup = "R"
-                for a in reversed(names):
-                    tup = "(*const %s, %s)" % (a, tup)
-                self.index_impls.append(
-                    "impl<%s, R> Repeater<(), %s, %dusize> for %s { type Type = %s; }"
-                    % (", ".join(a + ": ?Sized" for a in names), IDX, j, tup, names[j])
-                )
         self.uses = uses
-        self.used_arities = sorted(used_arities)
-        self.max_nest = max_nest
 
     def counts(self):
+        multi = self.kind == "multi"
         return dict(
             impls=len(self.impls),
-            index_impls=len(self.index_impls),
-            assoc_per_impl=self.K if self.kind == "multi" else 1,
+            assoc_per_impl=self.K if multi else 1,
+            assoc_defined=(sum(self.impl_types(i) for i in self.impls) if multi else len(self.impls)),
         )
 
+    @staticmethod
+    def impl_types(impl):
+        return impl.count(" type Type")
 
-def repeater_def(variant_kind, K):
-    if variant_kind == "multi":
-        types = " ".join("type Type%d: ?Sized;" % j for j in range(K))
+
+def repeater_def(kind, K, defaults=False):
+    if kind == "multi":
+        if defaults:
+            types = " ".join("type Type%d: ?Sized = ();" % j for j in range(K))
+        else:
+            types = " ".join("type Type%d: ?Sized;" % j for j in range(K))
     else:
         types = "type Type: ?Sized;"
     return "pub trait Repeater<T: ?Sized, const ID: u64, const NTH: usize> { %s }" % types
@@ -381,14 +266,16 @@ def sig_fn(name, cx, ty_in, ty_out, is_unsized):
 
 def write_crates(args, outdir):
     ctxs = make_entries(args)
-    plan = Plan(args.variant, ctxs, direct1=not args.no_direct1, shared_ids=(args.ids == "shared"))
+    plan = Plan(args.variant, ctxs, shared_ids=(args.ids == "shared"))
     plan.build("crate::m::")
     uses_on = set(args.uses.split(","))
 
     # ---- the Leaker's crate
     L = []
     L.append("#![allow(warnings)]")
-    L.append(repeater_def(plan.kind, plan.K))
+    if plan.defaults:
+        L.append("#![feature(associated_type_defaults)]")
+    L.append(repeater_def(plan.kind, plan.K, plan.defaults))
     L.append(pool())
     # the traits declared in the Leaker's crate whose methods take and return the entries
     if "impl" in uses_on:
@@ -403,7 +290,6 @@ def write_crates(args, outdir):
                     L.append("    fn m%d(&self, x: %s) -> %s;" % (ei, t, t))
             L.append("}")
     L.extend(plan.impls)
-    L.extend(plan.index_impls)
     lk = "\n".join(L) + "\n"
 
     # ---- the Referrer's crate
@@ -457,7 +343,6 @@ def write_crates(args, outdir):
         unsized=args.unsized, uses=args.uses, dist=args.dist,
         n_unsized=sum(1 for _, e in ctxs for _, u in e if u),
         **plan.counts(),
-        arities=plan.used_arities, max_nest=plan.max_nest,
     )
     import json
     with open(os.path.join(outdir, "meta.json"), "w") as f:
@@ -477,7 +362,6 @@ def main():
     ap.add_argument("--dist", default="uniform", choices=["uniform", "skew", "corpus"])
     ap.add_argument("--sizes", default="", help="explicit comma list of entries per context")
     ap.add_argument("--uses", default="sig,impl,wit")
-    ap.add_argument("--no-direct1", action="store_true")
     ap.add_argument("--ids", default="per-ctx", choices=["per-ctx", "shared"],
                     help="per-ctx: each context is an item with its own ID; shared: one ID, NTH counts over all contexts")
     args = ap.parse_args()
