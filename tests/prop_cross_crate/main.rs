@@ -125,7 +125,8 @@
 //! - (i) `Self::A`, or `Self` as a type, in a predicate whose context has a bound that names a
 //!   leaked type: `UnprovableBound`, E0277. Only the cause is copied as written, and the bound stays
 //!   leaked. The item has a predicate that names `Self` (`self_in_predicate`) and a bound that names
-//!   a leaked type (`bound_cycle`).
+//!   a leaked type (`bound_cycle`, or a path of `std` that the Leaker does not allow:
+//!   `relative_std`).
 //! - (ii) The same cause in a trait with a generic whose bound names an associated type that
 //!   another bound fixes (`T: Iterator<Item = ..> + Fn(<T as Iterator>::Item) -> u8`): E0277 too,
 //!   but rustc cannot implement such a trait with a generic impl at all. The item has the alias
@@ -138,50 +139,65 @@
 //! The summary counts them by class. The generator avoids none of these shapes: the rejected ones
 //! (`gen::Gen::cyclic`) have them.
 //!
-//! # The copies after the analysis without the prelude (`TYPE_LEAK_PROP_FEATURES=allow_stages`)
+//! # The copies after the analysis without a rule (`TYPE_LEAK_PROP_FEATURES=allow_stages`)
 //!
-//! `LeakerResult::allow_prelude()` and `LeakerConfig::allow_prelude()` are one rule, but the result
-//! judges an analysis made without it, so it can leave other errors and other entries (see
-//! `tests/allow_stages.rs`). With `allow_stages` the macro of each item also makes two copies, and
-//! the test builds them, to see whether the difference is more than a number:
+//! `LeakerConfig::allow_X()` and `LeakerResult::allow_X()` are one rule, but the result judges an
+//! analysis made without it, so for a path rule it can leave other errors and other entries (see
+//! `tests/allow_stages.rs`). With `allow_stages` the macro of each item takes each rule of
+//! `gen::rules()` in turn and makes two copies, and the test builds them, to see whether the
+//! difference is more than a number:
 //!
-//! - after the result: the item is analyzed without the prelude (the primitive types allowed), the
-//!   result is given `allow_prelude()`, then `allow(cause)` for the cause of each error that remains
-//!   until none does (the nested errors of an error that was dropped come up: `ErrorItem::nested`;
-//!   the failures of those are those of the accepted copies above), and its Referrer copies the item
-//!   (`__tl_stagecopy_<id>!`, the crate `tlp_s_NNN`);
-//! - after the config: the item is analyzed with a config that allows the prelude (the primitive types
-//!   allowed), the causes of the errors that remain are allowed, and its Referrer copies the item
-//!   (`__tl_stagebase_<id>!`, the crate `tlp_b_NNN`).
+//! - after the result: the item is analyzed without the rule (the primitive types and the names of
+//!   the prelude allowed, but for the rule `prelude`), the result is given the rule, then
+//!   `allow(cause)` for the cause of each error that remains until none does (the nested errors of
+//!   an error that was dropped come up: `ErrorItem::nested`; the failures of those are those of the
+//!   accepted copies above), and its Referrer copies the item (`__tl_st_<rule>_res_<id>!`);
+//! - after the config: the item is analyzed with a config that has the rule, the causes of the
+//!   errors that remain are allowed, and its Referrer copies the item (`__tl_st_<rule>_cfg_<id>!`).
 //!
-//! The Repeater's impls of the two are written next to those of the ordinary analysis with an `ID` of
-//! their own (`Args::repeater_id()`), the witnesses are the ordinary ones (written for a rejected item
-//! too), and both crates are built like the crate of the accepted items (`gen::accept_referrer()`:
-//! the modules of the Leaker's crate, their imports and a glob import), where the names of the
-//! prelude mean the prelude: nothing generated declares one (`shadowed_prelude_names()`), which is
-//! what allowing them promises. As there, a relative path that the copy keeps by mistake resolves, so
-//! the test cannot tell it from one that is kept as written.
+//! The rules are `prelude` (`allow_prelude()`, every item), `crate` (`allow_crate()`), `path`
+//! (`allow_path(super::base)`: the module `base` as the modules at depth 1 name it), `std`
+//! (`allow_std_crates()`, with `relative_std`), `values` (`allow_values()`, with `values`) and
+//! `default` (`allow_default()`). A rule is made for the items where it matters: it drops or trims an
+//! error of the analysis without it, or the config finds other errors or another Referrer than the
+//! result. `values` and `default` are cause and place rules: the config and the result must give
+//! identical errors and an equal Referrer (`STAGES DIFFER` fails the run).
+//!
+//! The Repeater's impls of the copies are written next to those of the ordinary analysis with an `ID`
+//! of their own (`Args::repeater_id()`), the witnesses are the ordinary ones (written for a rejected
+//! item too), and each copy is built in two crates:
+//!
+//! - **with globs** (`tlp_<rule>_<side>_glob_NNN`), like the crate of the accepted items
+//!   (`gen::accept_referrer()`: the modules of the Leaker's crate, their imports and a glob import)
+//!   where the names of the prelude mean the prelude: nothing generated declares one
+//!   (`shadowed_prelude_names()`), which is what allowing them promises. A relative path that the
+//!   copy keeps by mistake resolves there, so the test cannot tell it from one that is kept as
+//!   written;
+//! - **clean** (`tlp_<rule>_<side>_clean_NNN`, `gen::clean_referrer()`), for the items that the rule
+//!   leaves no error in (`ok`), invoked with `clean` first. The copy is laid out as in the ordinary
+//!   Referrer's crate and none of the Leaker's names resolve but the ones that the rule allows, which
+//!   the crate makes resolve as the user promised: `base` for `crate::base`, `alloc` for `alloc::`, the
+//!   modules of the Leaker with `RLEN` and `ILEN` for the paths of values and defaults. A relative
+//!   type that the rule allowed to drop with an error but that the copy kept as written fails to
+//!   compile there. (Remove `pub mod base` from the crate of the rule `crate` and it does.)
 //!
 //! A copy after the result that does not compile is one of
 //!
-//! - a failure of the docs of `allow()` ((i), (ii), (iii): `accept_families()`), counted by class;
-//!   when the copy after the config compiles, it is the path rule after the analysis that makes the
-//!   copy fail (a prelude type stays leaked in a bound, and `Self::A` is unprovable);
+//! - a failure of the docs of `allow()` ((i), (ii), (iii): `accept_families()`, explained by the
+//!   errors of the analysis without the rule), counted by class; when the copy after the config
+//!   compiles, it is the rule after the analysis that makes the copy fail;
 //! - `SHARED`: no listed failure explains it, but the copy after the config fails too, so the rule
 //!   after the analysis is not what makes it fail. Not a failure of the run, and printed with what
-//!   explains the copy after the config. Before the nested errors the failures seen were (C): the
-//!   config reports `Self::A0`, and its copy fails as listed; the result reported nothing, because
-//!   a relative bound is copied whole and not looked into (`tests/allow_stages.rs`), its copy failed
-//!   the same way, and no listed failure matched the errors that were allowed. The result reports
-//!   it now, as an error nested in the bound, and the failure is one of the listed ones;
+//!   explains the copy after the config;
 //! - `NEW`: only the copy after the result fails, for a reason that the docs of `allow()` do not
-//!   list. It fails the run, and is a finding about the path rule after the analysis ("STAGES: NEW
-//!   FAILURE", with the item and the diagnostic).
+//!   list. It fails the run ("STAGES: NEW FAILURE", with the item and the diagnostic). The same for a
+//!   clean copy that fails while the clean copy after the config compiles ("STAGES CLEAN: NEW
+//!   FAILURE"); there is no documented class for it.
 //!
-//! The summary has the counts: items compared, copies built after the result and after the config,
-//! the failures by kind, and for each item whose number of errors differs its causes and what became
-//! of its copy. `STAGES FAILED` is the failure of an error that remains when every cause is allowed,
-//! as `ACCEPT FAILED` is.
+//! The summary has, for each rule, the counts: items compared, items where the rule matters, copies
+//! built after the result and after the config, with globs and clean, the failures by kind, and for
+//! each item whose number of errors differs its causes and what became of its copy. `STAGES FAILED`
+//! is the failure of an error that remains when every cause is allowed, as `ACCEPT FAILED` is.
 //!
 //! # Bare and absolute spellings
 //!
@@ -291,13 +307,18 @@
 //!   other findings of `tests/findings.rs` (F22 to F24: the Leaker rejected what compiles, F29,
 //!   F31, F32) are not features: a rejection is counted as success, and the test cannot show a
 //!   toolchain or a lint.
-//!   `allow_stages` is no feature of the generator: it makes every macro also count the errors that
-//!   remain with `LeakerConfig::allow_prelude()` and with `LeakerResult::allow_prelude()` (the
-//!   primitive types allowed), and the summary says how many items differ (`Stages`). The rule is
-//!   the same at both stages, but a result cannot make a path context-free, so it can leave another
-//!   number of errors (`tests/allow_stages.rs` has the three reasons). It also builds the copies of
-//!   both: see "The copies after the analysis without the prelude" below (the workspace is
-//!   `ws-<seed>-<cases>-stages`). Off by default, so the tables are unchanged.
+//!   `allow_stages`, `relative_std` and `values` are no feature of the generator (`gen::Features` is in
+//!   the tables, and they are off by default, so the tables do not change):
+//!   `allow_stages` makes every macro compare the rules of "The copies after the analysis without a
+//!   rule" and builds their copies (the workspace is `ws-<seed>-<cases>-stages`); `relative_std`
+//!   writes about a third of the paths of `std` and `core` of the items analyzed one by one without
+//!   the leading `::` (some `alloc::`), which the Leaker allows (`allow = "std,core,alloc"`) but for
+//!   the rule `std`, and `extern crate alloc;` is in every crate; `values` gives the items values
+//!   (`gen::Flags::values`): bodies of functions, methods and default methods, the values of
+//!   constants and statics, the defaults of associated constants and of const parameters, with
+//!   the types of the Leaker's crate in a `let`, a turbofish and a cast, which the Leaker leaks with
+//!   `check_values()` and the witnesses check (`Args::bodies`), and in a share of them a relative path
+//!   of a value (`crate::base::bf()`, `RLEN`), which it rejects (the tag `value_path`).
 //!
 //! The test is ignored by default: it is slow, as it builds the generated crates. Run it with
 //!
@@ -312,7 +333,7 @@
 mod gen;
 mod json;
 
-use gen::{allow_stages, generate, Case, Features, KINDS, SCOPES};
+use gen::{allow_stages, generate, generate_with, Case, Features, Flags, KINDS, SCOPES};
 use json::Json;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -367,22 +388,41 @@ fn accept_name(i: usize) -> String {
     format!("tlp_a_{:03}", i)
 }
 
-/// The Referrer's crate of `TYPE_LEAK_PROP_FEATURES=allow_stages`.
-fn stage_dir(i: usize) -> String {
-    format!("c{:03}_s", i)
+/// What names a Referrer's crate of `TYPE_LEAK_PROP_FEATURES=allow_stages`: the rule, the side
+/// (`res` or `cfg`) and the layout (`glob` or `clean`), see `gen::StageCrate`.
+fn stage_suffix(stage: &gen::StageCrate) -> String {
+    format!(
+        "{}_{}_{}",
+        stage.rule,
+        stage.side,
+        if stage.clean { "clean" } else { "glob" }
+    )
 }
 
-fn stage_name(i: usize) -> String {
-    format!("tlp_s_{:03}", i)
+fn stage_dir(i: usize, stage: &gen::StageCrate) -> String {
+    format!("c{:03}_{}", i, stage_suffix(stage))
 }
 
-/// The Referrer's crate of the copies that the copies of `allow_stages` are compared with.
-fn base_dir(i: usize) -> String {
-    format!("c{:03}_b", i)
+fn stage_name(i: usize, stage: &gen::StageCrate) -> String {
+    format!("tlp_{}_{:03}", stage_suffix(stage), i)
 }
 
-fn base_name(i: usize) -> String {
-    format!("tlp_b_{:03}", i)
+/// Which crate of `allow_stages` a failure is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct StageKey {
+    rule: &'static str,
+    side: &'static str,
+    clean: bool,
+}
+
+impl From<&gen::StageCrate> for StageKey {
+    fn from(stage: &gen::StageCrate) -> Self {
+        StageKey {
+            rule: stage.rule,
+            side: stage.side,
+            clean: stage.clean,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -397,15 +437,15 @@ enum Mode {
 }
 
 /// Writes the workspace of the cases (the indexes are those of the case list). With `stages` (the
-/// feature `allow_stages`) the Leaker's macros also make the copy of the analysis without the prelude,
-/// the binary reports it, and each case has the Referrer's crate that builds it; without it the
+/// feature `allow_stages`) the Leaker's macros also make the copies of each rule, the binary reports
+/// them, and each case has the Referrer's crates that build them (`Case::stages`); without it the
 /// attribute of the items says `stages = false`.
 fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode, stages: bool) {
     let _ = std::fs::remove_dir_all(ws);
     std::fs::create_dir_all(ws).unwrap();
     let members: Vec<String> = cases
         .iter()
-        .flat_map(|(i, _)| {
+        .flat_map(|(i, case)| {
             let mut dirs = vec![format!("\"{}\"", leaker_dir(*i))];
             if mode != Mode::Identity {
                 dirs.push(format!("\"{}\"", referrer_dir(*i)));
@@ -414,8 +454,9 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode, stages: bool
                 dirs.push(format!("\"{}\"", accept_dir(*i)));
             }
             if mode != Mode::Identity && stages {
-                dirs.push(format!("\"{}\"", stage_dir(*i)));
-                dirs.push(format!("\"{}\"", base_dir(*i)));
+                for stage in &case.stages {
+                    dirs.push(format!("\"{}\"", stage_dir(*i, stage)));
+                }
             }
             dirs
         })
@@ -473,21 +514,23 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode, stages: bool
             )
             .unwrap();
             if stages {
-                writeln!(
-                    main,
-                    "    println!(\"stages|{id}|{{}}\", {l}::__tl_stages_{id}!());",
-                    l = leaker_name(*i),
-                    id = item.id
-                )
-                .unwrap();
-                for name in ["stagecopy", "stagebase"] {
+                for rule in gen::rules() {
                     writeln!(
                         main,
-                        "    println!(\"{name}|{{}}\", {l}::__tl_{name}_report_{id}!());",
+                        "    println!(\"stages|{rule}|{id}|{{}}\", {l}::__tl_stages_{rule}_{id}!());",
                         l = leaker_name(*i),
                         id = item.id
                     )
                     .unwrap();
+                    for side in ["res", "cfg"] {
+                        writeln!(
+                            main,
+                            "    println!(\"stage|{rule}|{side}|{{}}\", {l}::__tl_st_{rule}_{side}_report_{id}!());",
+                            l = leaker_name(*i),
+                            id = item.id
+                        )
+                        .unwrap();
+                    }
                 }
             }
         }
@@ -527,24 +570,21 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode, stages: bool
         }
 
         if stages {
-            for (dir, name, lib) in [
-                (stage_dir(*i), stage_name(*i), &case.stage_referrer),
-                (base_dir(*i), base_name(*i), &case.base_referrer),
-            ] {
-                let dir = ws.join(dir);
+            for stage in &case.stages {
+                let dir = ws.join(stage_dir(*i, stage));
                 std::fs::create_dir_all(dir.join("src")).unwrap();
                 std::fs::write(
                     dir.join("Cargo.toml"),
                     format!(
                         "[package]\nname = \"{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
                          [dependencies]\n{} = {{ path = \"../{}\" }}\n",
-                        name,
+                        stage_name(*i, stage),
                         leaker_name(*i),
                         leaker_dir(*i)
                     ),
                 )
                 .unwrap();
-                std::fs::write(dir.join("src/lib.rs"), lib).unwrap();
+                std::fs::write(dir.join("src/lib.rs"), &stage.lib).unwrap();
             }
         }
     }
@@ -555,17 +595,12 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode, stages: bool
 const ACCEPT_COPY: &str =
     "ACCEPT: the copy of an item accepted by allow() does not compile in the Referrer's crate";
 
-/// The class of the diagnostics of the copy of `allow_stages` (the analysis without the prelude, the
-/// result with `allow_prelude()` and the causes of the errors that remain), which is built in the
-/// Referrer's crate of the stage copies.
+/// The class of the diagnostics of a copy of `allow_stages` (the analysis without the rule, the
+/// result with the rule and the causes of the errors that remain; or the analysis of a config that
+/// has the rule), which is built in a Referrer's crate of the stage copies (`Failure::stage` says
+/// which).
 const STAGE_COPY: &str =
-    "STAGES: the copy made after the analysis without the prelude does not compile in the Referrer's crate";
-
-/// The class of the diagnostics of the copy that `allow_stages` compares the copy of the result with
-/// (the analysis of a config that allows the prelude, the causes of its errors allowed). It fails
-/// nothing: it tells which failures of the stage copies the path rule after the analysis causes.
-const STAGE_BASE_COPY: &str =
-    "STAGES BASE: the copy made after the analysis of a config that allows the prelude does not compile";
+    "STAGES: the copy made after the analysis without the rule, or after the config's, does not compile in the Referrer's crate";
 
 /// A diagnostic of the build.
 struct Diag {
@@ -676,6 +711,16 @@ fn cargo_build(ws: &Path, target: &Path) -> Build {
     build
 }
 
+/// A Referrer's crate of a case: its package, its directory, the line of each item that it invokes,
+/// the class of its diagnostics, and the crate of `allow_stages` it is (`Failure::stage`).
+type BuiltCrate<'a> = (
+    String,
+    String,
+    &'a Vec<(usize, usize)>,
+    &'static str,
+    Option<StageKey>,
+);
+
 #[derive(Debug)]
 struct Failure {
     case: usize,
@@ -685,6 +730,8 @@ struct Failure {
     /// `allow()`, which `accept_families()` explains.
     code: String,
     text: String,
+    /// The crate of `allow_stages` the diagnostic is in (`STAGE_COPY`).
+    stage: Option<StageKey>,
 }
 
 /// One error of a rejection (an `ErrorItem`): the message, the tokens it is about, its first note,
@@ -728,6 +775,10 @@ struct Report {
     skipped: usize,
     /// The item has bare traits of the prelude and was compared with its twin.
     twin: bool,
+    /// `allow_stages`: the rule does not matter for the item, and the macro made no copy (`skip`).
+    skip: bool,
+    /// `allow_stages`: the errors of the analysis without the rule, which the rule drops or leaves.
+    plain: Vec<Rejection>,
 }
 
 /// The errors of a rejection, as `prop::rejection_text()` writes them.
@@ -751,8 +802,10 @@ fn parse_rejections(errors: &str) -> Vec<Rejection> {
 
 fn parse_report(line: &str) -> Option<(usize, Report)> {
     // The errors of a rejection follow the report, and the errors that remained of an `accfail`
-    // the errors of the rejection.
+    // the errors of the rejection. The copy of `allow_stages` has the errors of the analysis without
+    // the rule at the end.
     let (line, errors) = line.split_once('\u{1e}').unwrap_or((line, ""));
+    let (errors, plain) = errors.split_once('\u{1b}').unwrap_or((errors, ""));
     let (errors, remaining) = errors.split_once('\u{1c}').unwrap_or((errors, ""));
     let mut parts = line.splitn(4, '|');
     let id = parts.next()?.parse().ok()?;
@@ -764,6 +817,7 @@ fn parse_report(line: &str) -> Option<(usize, Report)> {
         accepted: status == "ok",
         allowed: status == "acc",
         accept_failed: status == "accfail",
+        skip: status == "skip",
         ..Default::default()
     };
     if report.accepted || report.allowed {
@@ -782,6 +836,7 @@ fn parse_report(line: &str) -> Option<(usize, Report)> {
             report.detail = rest[at..].to_string();
         }
     }
+    report.plain = parse_rejections(plain);
     if !report.accepted {
         report.rejections = parse_rejections(errors);
         report.remaining = parse_rejections(remaining);
@@ -832,27 +887,40 @@ fn attr_lines(case: &Case) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// What the macro of an item counted with `TYPE_LEAK_PROP_FEATURES=allow_stages`: the errors of the
-/// analysis without the prelude, those that remain when `LeakerConfig::allow_prelude()` is given to
-/// the config (`before`), and when `LeakerResult::allow_prelude()` is given to the result (`after`).
-/// The rule is the same, so the numbers should be equal; a path rule cannot do it exactly (see
-/// `tests/allow_stages.rs`), and the difference is a finding, printed with the causes.
+/// What the macro of an item counted for a rule with `TYPE_LEAK_PROP_FEATURES=allow_stages`
+/// (`__tl_stages_<rule>_<id>!`, see `rule_stage()` of `prop.rs`): the errors of the analysis without
+/// the rule, those that remain when the rule is given to the config (`before`), and when it is given
+/// to the result (`after`). The path rules cannot be exact (see `tests/allow_stages.rs`), and the
+/// difference is a finding, printed with the causes. The cause and place rules (`values`, `default`)
+/// are: the config and the result give the same errors and an equal Referrer, or the run fails.
 #[derive(Debug)]
 struct Stages {
     case: usize,
     item: usize,
+    /// The rule drops or trims an error of the analysis without it (always for the rule `prelude`).
+    matters: bool,
     plain: usize,
     before: usize,
     after: usize,
     before_causes: String,
     after_causes: String,
+    /// The config and the result give the same errors (their text) and an equal Referrer.
+    same_errors: bool,
+    same_referrer: bool,
 }
 
-/// What the Referrer's crates of the stage copies made of them, for `Stages::summarize()`: the reports
-/// of the macros of the copy of each item, the documented failures of the copies that do not compile
-/// by class, and the verdict of each (`explain_copies()`), and the same for the copies of the config's
-/// analysis that they are compared with.
+/// The rules whose config and result give the same errors and Referrer.
+fn exact_rule(rule: &str) -> bool {
+    matches!(rule, "values" | "default")
+}
+
+/// What the Referrer's crates of the stage copies made of one rule, for `Stages::summarize()`: the
+/// reports of the macros of the copy of each item after the result and after the config, the
+/// documented failures of the copies that do not compile by class, and the verdict of each
+/// (`explain_copies()`), and the same for the copies of the config's analysis that they are compared
+/// with, and for the clean crates.
 struct StageCopies<'a> {
+    rule: &'static str,
     reports: &'a BTreeMap<(usize, usize), Report>,
     documented: &'a BTreeMap<&'static str, usize>,
     verdicts: &'a BTreeMap<(usize, usize), &'static str>,
@@ -862,6 +930,10 @@ struct StageCopies<'a> {
     base_failed: &'a BTreeSet<(usize, usize)>,
     /// What explains each failure of those: its class, or `NEW` if no listed failure does.
     base_verdicts: &'a BTreeMap<(usize, usize), &'static str>,
+    /// The items whose clean copy does not compile, after the result and after the config, and the
+    /// verdict of the first: `SHARED` (the clean copy after the config fails too) or `NEW`.
+    clean_failed: &'a [BTreeSet<(usize, usize)>; 2],
+    clean_verdicts: &'a BTreeMap<(usize, usize), &'static str>,
 }
 
 /// What a report says of a copy that was made: the status, and what the macro counted.
@@ -936,6 +1008,9 @@ impl StageCopies<'_> {
             }
             (ok, acc, failed, errors, entries, positions, checked)
         };
+        let matters = |reports: &BTreeMap<(usize, usize), Report>| -> usize {
+            reports.values().filter(|report| !report.skip).count()
+        };
         let (ok, acc, failed, errors, entries, positions, checked) = count(self.reports);
         let built = self
             .reports
@@ -944,8 +1019,8 @@ impl StageCopies<'_> {
             .count();
         writeln!(
             s,
-            "  allow_stages copies after the result: {} of {} built in the Referrer's crates ({} with no error left by allow_prelude(), {} with the causes of those allowed, {} still rejected, {} not made by the macro); entries: {}, type positions: {}, witnesses checked: {}",
-            built, self.reports.len(), ok, acc, failed, errors, entries, positions, checked
+            "  allow_stages [{}] copies after the result: {} of {} built in the Referrer's crates ({} with no error left by the rule, {} with the causes of those allowed, {} still rejected, {} not made by the macro); entries: {}, type positions: {}, witnesses checked: {}",
+            self.rule, built, matters(self.reports), ok, acc, failed, errors, entries, positions, checked
         )
         .unwrap();
         let (ok, acc, failed, errors, entries, _, _) = count(self.base_reports);
@@ -956,9 +1031,10 @@ impl StageCopies<'_> {
             .count();
         writeln!(
             s,
-            "  allow_stages copies after the config: {} of {} built ({} with no error, {} with the causes of the errors allowed, {} still rejected, {} not made by the macro); entries: {}; {} of them do not compile",
+            "  allow_stages [{}] copies after the config: {} of {} built ({} with no error, {} with the causes of the errors allowed, {} still rejected, {} not made by the macro); entries: {}; {} of them do not compile",
+            self.rule,
             base_built,
-            self.base_reports.len(),
+            matters(self.base_reports),
             ok,
             acc,
             failed,
@@ -982,7 +1058,8 @@ impl StageCopies<'_> {
         }
         writeln!(
             s,
-            "  allow_stages copies after the result that do not compile: {} of {} ({} documented in the docs of allow(): {}; {} not listed and failing the config's copy too (SHARED); {} new)",
+            "  allow_stages [{}] copies after the result that do not compile: {} of {} ({} documented in the docs of allow(): {}; {} not listed and failing the config's copy too (SHARED); {} new)",
+            self.rule,
             self.verdicts.len(),
             built,
             self.documented.values().sum::<usize>(),
@@ -998,31 +1075,58 @@ impl StageCopies<'_> {
         for ((class, base), n) in rows {
             writeln!(s, "    {:>3}x {:<6} {}", n, class, base).unwrap();
         }
+        // The clean crates copy the items that no error is left in, after the result and after the
+        // config (the status `ok`), with none of the Leaker's names.
+        let clean_made = |reports: &BTreeMap<(usize, usize), Report>| -> usize {
+            reports
+                .values()
+                .filter(|report| report.accepted && report.rewrite_error.is_none())
+                .count()
+        };
+        writeln!(
+            s,
+            "  allow_stages [{}] clean copies (the rule leaves no error, none of the Leaker's names): {} built after the result, {} do not compile ({} SHARED with the clean copy after the config, {} new); {} built after the config, {} do not compile",
+            self.rule,
+            clean_made(self.reports),
+            self.clean_failed[0].len(),
+            self.clean_verdicts.values().filter(|v| **v == "SHARED").count(),
+            self.clean_verdicts.values().filter(|v| **v == "NEW").count(),
+            clean_made(self.base_reports),
+            self.clean_failed[1].len()
+        )
+        .unwrap();
         s
     }
 }
 
 impl Stages {
-    /// `ID|PLAIN\u{1f}BEFORE\u{1f}AFTER\u{1f}BEFORE_CAUSES\u{1f}AFTER_CAUSES`.
+    /// `MATTERS\u{1f}PLAIN\u{1f}BEFORE\u{1f}AFTER\u{1f}BEFORE_CAUSES\u{1f}AFTER_CAUSES\u{1f}SAME_ERRORS\u{1f}SAME_REFERRER`
+    /// after the id of the item.
     fn parse(case: usize, row: &str) -> Option<Self> {
         let (item, fields) = row.split_once('|')?;
         let mut fields = fields.split('\u{1f}');
+        let flag = |text: Option<&str>| text.map(|text| text == "1");
+        let matters = flag(fields.next())?;
         let mut count = || fields.next()?.parse().ok();
         let (plain, before, after) = (count()?, count()?, count()?);
         Some(Stages {
             case,
             item: item.parse().ok()?,
+            matters,
             plain,
             before,
             after,
             before_causes: fields.next()?.to_string(),
             after_causes: fields.next()?.to_string(),
+            same_errors: flag(fields.next())?,
+            same_referrer: flag(fields.next())?,
         })
     }
 
-    /// The lines of the summary: how many items have the same number of errors at both stages, and
-    /// each that differs, with its causes and what became of its copy.
+    /// The lines of the summary of a rule: how many items have the same number of errors at both
+    /// stages, and each that differs, with its causes and what became of its copy.
     fn summarize(
+        rule: &str,
         stages: &[Stages],
         generated: &[Case],
         ws: &Path,
@@ -1031,10 +1135,13 @@ impl Stages {
         let mut s = String::new();
         let differ: Vec<&Stages> = stages.iter().filter(|s| s.before != s.after).collect();
         let with_errors = stages.iter().filter(|s| s.plain > 0).count();
+        let mattering = stages.iter().filter(|s| s.matters).count();
         writeln!(
             s,
-            "  allow_stages (TYPE_LEAK_PROP_FEATURES): {} items compared, {} of them have errors without the prelude; config allow_prelude() and result allow_prelude() leave the same number of errors in {}, a different one in {}; errors: {} without the prelude, {} with it in the config, {} after it in the result",
+            "  allow_stages [{}] (TYPE_LEAK_PROP_FEATURES): {} items compared, {} where the rule matters, {} of them have errors without it; config and result leave the same number of errors in {}, a different one in {}; errors: {} without the rule, {} with it in the config, {} after it in the result",
+            rule,
             stages.len(),
+            mattering,
             with_errors,
             stages.len() - differ.len(),
             differ.len(),
@@ -1043,6 +1150,20 @@ impl Stages {
             stages.iter().map(|s| s.after).sum::<usize>()
         )
         .unwrap();
+        if exact_rule(rule) {
+            let apart = stages
+                .iter()
+                .filter(|s| !s.same_errors || !s.same_referrer)
+                .count();
+            writeln!(
+                s,
+                "  allow_stages [{}] config and result give identical errors and an equal Referrer in {} items, differ in {}",
+                rule,
+                stages.len() - apart,
+                apart
+            )
+            .unwrap();
+        }
         s += &copies.summarize();
         // Of the items that differ: those where the result leaves more errors than the config and
         // those where it leaves fewer, and how many of their copies compile.
@@ -1061,7 +1182,8 @@ impl Stages {
                 .count();
             writeln!(
                 s,
-                "  allow_stages: the result leaves {} errors than the config in {} items, the copy after the result compiles in {} of them, and the copy after the config in {}",
+                "  allow_stages [{}]: the result leaves {} errors than the config in {} items, the copy after the result compiles in {} of them, and the copy after the config in {}",
+                rule,
                 what,
                 of_kind.len(),
                 compiled,
@@ -1077,7 +1199,8 @@ impl Stages {
                 .map_or("?", |item| item.kind);
             writeln!(
                 s,
-                "  allow_stages DIFFERS: case {} item {} ({}): {} errors without the prelude, {} in the config, {} in the result\n    config: {}\n    result: {}\n    copy: {}\n    sources: {}",
+                "  allow_stages [{}] DIFFERS: case {} item {} ({}): {} errors without the rule, {} in the config, {} in the result\n    config: {}\n    result: {}\n    copy: {}\n    sources: {}",
+                rule,
                 stage.case,
                 stage.item,
                 kind,
@@ -1092,6 +1215,199 @@ impl Stages {
             .unwrap();
         }
         s
+    }
+}
+
+/// What the harness gathers for one rule of `allow_stages`: what the macros counted of each item, and
+/// their reports of the copies after the result (`0`) and after the config (`1`).
+#[derive(Default)]
+struct RuleRun {
+    stages: Vec<Stages>,
+    reports: [BTreeMap<(usize, usize), Report>; 2],
+}
+
+/// The verdicts on the copies of one rule, from the diagnostics of the Referrer's crates
+/// (`RuleResult::judge()`).
+#[derive(Default)]
+struct RuleResult {
+    /// The copies after the result that do not compile for a failure the docs of `allow()` list,
+    /// by class.
+    documented: BTreeMap<&'static str, usize>,
+    /// The class of the failure of each item whose copy after the result does not compile: a listed
+    /// one, `SHARED` (the copy after the config fails too), or `NEW`.
+    verdicts: BTreeMap<(usize, usize), &'static str>,
+    /// The items whose copy after the config is not built or does not compile, and what explains it.
+    base_failed: BTreeSet<(usize, usize)>,
+    base_verdicts: BTreeMap<(usize, usize), &'static str>,
+    /// The items whose clean copy does not compile, after the result and after the config, and the
+    /// verdict of the first: `SHARED` or `NEW`.
+    clean_failed: [BTreeSet<(usize, usize)>; 2],
+    clean_verdicts: BTreeMap<(usize, usize), &'static str>,
+}
+
+impl RuleResult {
+    /// Nothing failed to compile.
+    fn is_empty(&self) -> bool {
+        self.verdicts.is_empty()
+            && self.base_failed.is_empty()
+            && self.clean_failed.iter().all(BTreeSet::is_empty)
+    }
+
+    /// Judges the diagnostics of the crates of `rule` (taken out of `diags`): the copies that do not
+    /// compile are explained (`explain_copies()`), those after the config are the controls, and the
+    /// failures that are defects are returned: a failure of the copy after the result that the docs
+    /// of `allow()` do not list while the copy after the config compiles, a clean copy that does not
+    /// compile while the clean copy after the config does, and a rule that is exact
+    /// (`exact_rule()`) whose config and result differ.
+    fn judge(
+        rule: &'static str,
+        run: &RuleRun,
+        diags: &mut Vec<Failure>,
+        generated: &[Case],
+    ) -> (RuleResult, Vec<Failure>) {
+        let mut result = RuleResult::default();
+        let mut problems = Vec::new();
+        let mut take = |side: &str, clean: bool| -> Vec<Failure> {
+            let (mine, rest): (Vec<Failure>, Vec<Failure>) =
+                std::mem::take(diags).into_iter().partition(|failure| {
+                    failure.stage.map_or(false, |k| {
+                        k.rule == rule && k.side == side && k.clean == clean
+                    })
+                });
+            *diags = rest;
+            mine
+        };
+        let (cfg_glob, res_glob) = (take("cfg", false), take("res", false));
+        let (cfg_clean, res_clean) = (take("cfg", true), take("res", true));
+
+        // The copies that the copies after the result are compared with: those that are not built, or
+        // that do not compile, are the items whose failure the rule after the analysis does not cause.
+        let mut base_named = Vec::new();
+        for failure in cfg_glob {
+            match failure.item {
+                Some(id) => {
+                    result.base_failed.insert((failure.case, id));
+                    base_named.push(failure);
+                }
+                None => problems.push(Failure {
+                    class: "STAGES BASE: a diagnostic of the copy of the config's analysis names no item",
+                    ..failure
+                }),
+            }
+        }
+        for ((case, id), report) in &run.reports[1] {
+            if !report.skip
+                && (!(report.accepted || report.allowed) || report.rewrite_error.is_some())
+            {
+                result.base_failed.insert((*case, *id));
+            }
+        }
+        // They are explained like the others, but a failure that is not listed fails nothing: it is a
+        // limitation of `allow()` after the config's analysis, which the copies after the result are
+        // not about.
+        let (_, _, base_verdicts) = explain_copies(
+            base_named,
+            &run.reports[1],
+            generated,
+            &STAGE_CLASSES,
+            &BTreeSet::new(),
+            true,
+        );
+        result.base_verdicts = base_verdicts;
+        let (documented, stage_problems, verdicts) = explain_copies(
+            res_glob,
+            &run.reports[0],
+            generated,
+            &STAGE_CLASSES,
+            &result.base_failed,
+            true,
+        );
+        result.documented = documented;
+        result.verdicts = verdicts;
+        problems.extend(stage_problems);
+
+        // The clean crates: a copy that does not compile although the rule left no error is a failure
+        // of the rule, unless the clean copy after the config fails too (SHARED).
+        for failure in cfg_clean {
+            match failure.item {
+                Some(id) => {
+                    result.clean_failed[1].insert((failure.case, id));
+                }
+                None => problems.push(Failure {
+                    class: "STAGES CLEAN: a diagnostic of the clean copy of the config's analysis names no item",
+                    ..failure
+                }),
+            }
+        }
+        let mut by_item: BTreeMap<(usize, Option<usize>), Vec<Failure>> = BTreeMap::new();
+        for failure in res_clean {
+            by_item
+                .entry((failure.case, failure.item))
+                .or_default()
+                .push(failure);
+        }
+        for ((case, id), group) in by_item {
+            let texts = group
+                .iter()
+                .map(|f| f.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let Some(id) = id else {
+                problems.push(Failure {
+                    class: "STAGES CLEAN: a diagnostic of the clean copy names no item",
+                    text: texts,
+                    ..group.into_iter().next().unwrap()
+                });
+                continue;
+            };
+            result.clean_failed[0].insert((case, id));
+            if result.clean_failed[1].contains(&(case, id)) {
+                result.clean_verdicts.insert((case, id), "SHARED");
+                continue;
+            }
+            result.clean_verdicts.insert((case, id), "NEW");
+            let config = match run.reports[1].get(&(case, id)) {
+                Some(report) if report.accepted && report.rewrite_error.is_none() => {
+                    "the clean copy after the config compiles"
+                }
+                Some(report) if report.skip => "the rule does not matter after the config",
+                Some(_) => "no clean copy was made after the config: the rule left errors there",
+                None => "the macro reported nothing of the copy after the config",
+            };
+            problems.push(Failure {
+                case,
+                item: Some(id),
+                class: CLEAN_NEW,
+                code: String::new(),
+                text: format!("{}\n\n{}", config, texts),
+                stage: group[0].stage,
+            });
+        }
+
+        if exact_rule(rule) {
+            for stage in &run.stages {
+                if stage.before != stage.after || !stage.same_errors || !stage.same_referrer {
+                    problems.push(Failure {
+                        case: stage.case,
+                        item: Some(stage.item),
+                        class: "STAGES DIFFER: the config and the result give other errors or another Referrer, for a rule that is a cause or a place",
+                        code: String::new(),
+                        text: format!(
+                            "rule {}: {} errors in the config, {} in the result; the same errors: {}; an equal Referrer: {}\n    config: {}\n    result: {}",
+                            rule,
+                            stage.before,
+                            stage.after,
+                            stage.same_errors,
+                            stage.same_referrer,
+                            stage.before_causes,
+                            stage.after_causes
+                        ),
+                        stage: None,
+                    });
+                }
+            }
+        }
+        (result, problems)
     }
 }
 
@@ -1303,6 +1619,14 @@ fn family(error: &Rejection) -> Option<Family> {
             ],
         ));
     }
+    // A relative path in a value (`crate::base::bf`, `RLEN`), which the Leaker reads with
+    // `check_values()` and copies as written: the note says which value (`values`).
+    if error.note.contains("which the copy writes as it is") {
+        reasons.push((
+            "a relative path in a value, which the copy writes as it is",
+            vec![gen::TAG_VALUE_PATH.to_string()],
+        ));
+    }
     // `RLEN`, `crate::base::BLEN`: a constant, a value, which is not leaked: in the default of a
     // parameter, or in the length of an array of a type that is split into parts because it
     // names the `Self` that the item does not allow.
@@ -1397,7 +1721,7 @@ fn accept_family(class: &'static str, name: &'static str, tags: &[&[&str]]) -> A
 /// - (i) `Self::A`, or `Self` as a type, in a predicate whose context has a bound that names a
 ///   leaked type (`UnprovableBound`, the cause is the type): E0277. Only the cause is copied as
 ///   written, and the bound stays leaked. The item has a predicate that names `Self`
-///   (`self_in_predicate`) and a bound that names a leaked type (`bound_cycle`).
+///   (`self_in_predicate`) and a bound that names a leaked type (`bound_cycle`, or `relative_std`).
 /// - (ii) The same cause with an alias bound (`T: Fn(<T as Iterator>::Item) -> u8` next to a bound
 ///   that fixes the `Item`): E0277 too, but rustc cannot implement the trait with a generic impl at
 ///   all, so nothing makes it compile. The item has the alias bound (`alias_bound`).
@@ -1428,10 +1752,15 @@ fn accept_families(code: &str, allowed: &[Rejection]) -> Vec<AcceptFamily> {
                     &[&[gen::TAG_ALIAS_BOUND]],
                 ));
             }
+            // The leaked type of the bound may be a path of `std` that the Leaker does not allow
+            // (`relative_std`).
             families.push(accept_family(
                 "(i)",
                 "`Self::A` or `Self` in a predicate whose context has a bound that names a leaked type",
-                &[&[gen::TAG_SELF_IN_PREDICATE], &[gen::TAG_BOUND_CYCLE]],
+                &[
+                    &[gen::TAG_SELF_IN_PREDICATE],
+                    &[gen::TAG_BOUND_CYCLE, gen::TAG_RELATIVE_STD],
+                ],
             ));
         }
         "E0106" if cause("RelativePath", &|t| t == "Self") => {
@@ -1523,10 +1852,15 @@ const ACCEPT_CLASSES: CopyClasses = CopyClasses {
 };
 
 const STAGE_CLASSES: CopyClasses = CopyClasses {
-    unknown: "STAGES: NEW FAILURE: the copy made after the analysis without the prelude does not compile, the copy of the config's analysis does, and no failure that the docs of allow() list explains it",
+    unknown: "STAGES: NEW FAILURE: the copy made after the analysis without the rule does not compile, the copy of the config's analysis does, and no failure that the docs of allow() list explains it",
     no_shape: "STAGES: NO SHAPE THAT GIVES IT: a failure of a stage copy that the docs of allow() list, on an item that has not the shape, and the copy of the config's analysis compiles",
-    none: "the diagnostic names no item for which the cause of an error that allow_prelude() leaves was allowed, and the copy of the config's analysis compiles",
+    none: "the diagnostic names no item for which the cause of an error that the rule leaves was allowed, and the copy of the config's analysis compiles",
 };
+
+/// A clean copy (the rule left no error, the crate has none of the Leaker's names but the allowed
+/// ones) that does not compile while the clean copy of the config's analysis does: the promise of the
+/// rule after the analysis does not hold, a part kept as written names more than the rule allows.
+const CLEAN_NEW: &str = "STAGES CLEAN: NEW FAILURE: the copy made after the analysis without the rule does not compile in the clean crate although the rule left no error, and the clean copy of the config's analysis compiles or was not made";
 
 /// Explains the diagnostics of the copies that a macro made of items for which causes were allowed
 /// (`failures` are the diagnostics of the Referrer's crate of those, `reports` what the macros
@@ -1543,6 +1877,7 @@ fn explain_copies(
     generated: &[Case],
     classes: &CopyClasses,
     shared: &BTreeSet<(usize, usize)>,
+    stage: bool,
 ) -> (
     BTreeMap<&'static str, usize>,
     Vec<Failure>,
@@ -1559,9 +1894,15 @@ fn explain_copies(
             .push(failure);
     }
     for ((case, id), group) in by_item {
-        let report = id
-            .and_then(|id| reports.get(&(case, id)))
-            .filter(|report| report.allowed);
+        // The copy of `allow_stages` is explained by the errors of the analysis without the rule, the
+        // ones the rule dropped as well as those that remain.
+        let report = id.and_then(|id| reports.get(&(case, id))).filter(|report| {
+            if stage {
+                report.allowed || report.accepted
+            } else {
+                report.allowed
+            }
+        });
         let item = id.and_then(|id| generated[case].items.iter().find(|item| item.id == id));
         let verdict = match (report, item) {
             (Some(report), Some(item)) => {
@@ -1570,7 +1911,18 @@ fn explain_copies(
                     tags.insert(gen::TAG_MODULE_SCOPE.to_string());
                 }
                 let codes: Vec<&str> = group.iter().map(|f| f.code.as_str()).collect();
-                unexplained_accept(&tags, &codes, report)
+                if stage {
+                    // (The errors that came up when the rule dropped one are in the second list only.)
+                    let mut errors = report.plain.clone();
+                    errors.extend(report.rejections.iter().cloned());
+                    let explained = Report {
+                        rejections: errors,
+                        ..report.clone()
+                    };
+                    unexplained_accept(&tags, &codes, &explained)
+                } else {
+                    unexplained_accept(&tags, &codes, report)
+                }
             }
             _ => Err(vec![format!("NOT A KNOWN FAILURE: {}", classes.none)]),
         };
@@ -1595,6 +1947,7 @@ fn explain_copies(
                         classes.unknown
                     };
                     failures.push(Failure {
+                        stage: None,
                         case,
                         item: id,
                         class,
@@ -1764,16 +2117,14 @@ fn shadowed_prelude_names(source: &str) -> Vec<&'static str> {
 // ---------------------------------------------------------------------------------------------
 
 /// The packages of the generated cases.
-fn case_packages(cases: usize) -> HashSet<String> {
-    (0..cases)
-        .flat_map(|i| {
-            [
-                leaker_name(i),
-                referrer_name(i),
-                accept_name(i),
-                stage_name(i),
-                base_name(i),
-            ]
+fn case_packages(cases: &[Case]) -> HashSet<String> {
+    cases
+        .iter()
+        .enumerate()
+        .flat_map(|(i, case)| {
+            let mut names = vec![leaker_name(i), referrer_name(i), accept_name(i)];
+            names.extend(case.stages.iter().map(|stage| stage_name(i, stage)));
+            names
         })
         .collect()
 }
@@ -1822,7 +2173,7 @@ fn missing_artifacts(
     i: usize,
     leaker_ok: bool,
     accept: bool,
-    stages: bool,
+    stages: &[gen::StageCrate],
 ) -> Vec<String> {
     let mut missing = Vec::new();
     if !build.executables.contains_key(&leaker_name(i)) {
@@ -1843,8 +2194,9 @@ fn missing_artifacts(
             accept_name(i)
         ));
     }
-    for name in [stage_name(i), base_name(i)] {
-        if leaker_ok && stages && !build.artifacts.contains(&name) {
+    for stage in stages {
+        let name = stage_name(i, stage);
+        if leaker_ok && !build.artifacts.contains(&name) {
             missing.push(format!("`{}` was not built, and reported no error", name));
         }
     }
@@ -2220,7 +2572,7 @@ fn summarize(stats: &Stats, floors: &Floors, seed: u64, n: usize, features: Feat
     .unwrap();
     for kind in KINDS
         .iter()
-        .chain(["fn", "alias"].iter())
+        .chain(["fn", "alias", "const", "static"].iter())
         .chain(SCOPES.iter().map(|(_, api)| api))
     {
         // An item analyzed through a scope is of a kind too: `generated` counts kinds only.
@@ -2366,7 +2718,7 @@ fn random_items_leak_across_crates() {
     let build = cargo_build(&ws, &target);
 
     // The watchdog: the helper crate or cargo failing is not a finding, and not a rejection.
-    let known = case_packages(cases);
+    let known = case_packages(&generated);
     if let Some(problem) = build_problem(&build, &known) {
         panic!(
             "type-leak property test: the build is broken (seed {}, {} cases):\n{}",
@@ -2390,24 +2742,36 @@ fn random_items_leak_across_crates() {
         }
         // The Referrer's crate, and, in the accept mode, the second one (it copies only the items
         // that the Leaker accepted by `allow()`, and so every error in it is about one of them),
-        // and with `allow_stages` the one of the copies made after the analysis without the prelude.
+        // and with `allow_stages` the one of the copies made after the analysis without a rule.
         let mut referrer_failed = false;
-        for (package, dir, lines, class) in [
+        let mut crates: Vec<BuiltCrate> = vec![
             (
                 referrer.clone(),
                 referrer_dir(i),
                 &case.referrer_lines,
                 "the Referrer's crate does not compile",
+                None,
             ),
             (
                 accept_name(i),
                 accept_dir(i),
                 &case.accept_lines,
                 ACCEPT_COPY,
+                None,
             ),
-            (stage_name(i), stage_dir(i), &case.stage_lines, STAGE_COPY),
-            (base_name(i), base_dir(i), &case.base_lines, STAGE_BASE_COPY),
-        ] {
+        ];
+        if stages_on {
+            for stage in &case.stages {
+                crates.push((
+                    stage_name(i, stage),
+                    stage_dir(i, stage),
+                    &stage.lines,
+                    STAGE_COPY,
+                    Some(StageKey::from(stage)),
+                ));
+            }
+        }
+        for (package, dir, lines, class, key) in crates {
             let file = format!("{}/src/lib.rs", dir);
             for diag in build.diags.iter().filter(|d| d.package == package) {
                 referrer_failed = true;
@@ -2424,11 +2788,13 @@ fn random_items_leak_across_crates() {
                     f.case == i
                         && f.item == item
                         && f.class == class
+                        && f.stage == key
                         && f.text.lines().next() == diag.rendered.lines().next()
                 }) {
                     continue;
                 }
                 failures.push(Failure {
+                    stage: key,
                     code: diag.code.clone(),
                     case: i,
                     item,
@@ -2439,10 +2805,17 @@ fn random_items_leak_across_crates() {
         }
         // Neither crate reported an error: all must have been built.
         if !referrer_failed {
-            let missing = missing_artifacts(&build, i, true, accept, stages_on);
+            let missing = missing_artifacts(
+                &build,
+                i,
+                true,
+                accept,
+                if stages_on { &case.stages } else { &[] },
+            );
             if !missing.is_empty() {
                 unbuilt.push(i);
                 failures.push(Failure {
+                    stage: None,
                     code: String::new(),
                     case: i,
                     item: None,
@@ -2488,7 +2861,7 @@ fn random_items_leak_across_crates() {
             let (class, diags) = if own.is_empty() {
                 (
                     if by_accept && !accept {
-                        "STAGES: the Leaker's crate does not compile with the output of the copy made after the analysis without the prelude"
+                        "STAGES: the Leaker's crate does not compile with the output of the copy made after the analysis without a rule"
                     } else if by_accept {
                         "ACCEPT: the Leaker's crate does not compile with the output of an item accepted by allow()"
                     } else {
@@ -2521,6 +2894,7 @@ fn random_items_leak_across_crates() {
                             .map(|(_, id)| *id)
                     });
                 failures.push(Failure {
+                    stage: None,
                     code: String::new(),
                     case: i,
                     item,
@@ -2534,12 +2908,14 @@ fn random_items_leak_across_crates() {
     // What the macros reported. Every item must have a report: a missing one is a failure, not a
     // rejection.
     let mut reports: BTreeMap<(usize, usize), Report> = BTreeMap::new();
-    let mut stages: Vec<Stages> = Vec::new();
-    // `allow_stages`: what the macro of each item reported of the copy made after the analysis
-    // without the prelude.
-    let mut stage_reports: BTreeMap<(usize, usize), Report> = BTreeMap::new();
-    // ... and of the copy that it is compared with: the analysis of a config that allows the prelude.
-    let mut base_reports: BTreeMap<(usize, usize), Report> = BTreeMap::new();
+    // `allow_stages`: for each rule what the macro of each item counted, and reported of the copies
+    // made after the result (the analysis without the rule, then the rule) and after the config.
+    let mut runs: BTreeMap<&'static str, RuleRun> = BTreeMap::new();
+    if stages_on {
+        for rule in gen::rules() {
+            runs.insert(rule, RuleRun::default());
+        }
+    }
     for (i, case) in generated.iter().enumerate() {
         if leaker_failed.contains(&i) || unbuilt.contains(&i) {
             continue;
@@ -2550,6 +2926,7 @@ fn random_items_leak_across_crates() {
         let output = Command::new(exe).output().unwrap();
         if !output.status.success() {
             failures.push(Failure {
+                stage: None,
                 code: String::new(),
                 case: i,
                 item: None,
@@ -2559,11 +2936,15 @@ fn random_items_leak_across_crates() {
             continue;
         }
         for line in String::from_utf8_lossy(&output.stdout).lines() {
-            // `allow_stages`: what the macro of an item counted (see `Stages`).
+            // `allow_stages`: what the macro of an item counted for a rule (see `Stages`).
             if let Some(row) = line.strip_prefix("stages|") {
-                match Stages::parse(i, row) {
-                    Some(stage) => stages.push(stage),
+                let parsed = row
+                    .split_once('|')
+                    .and_then(|(rule, row)| Some((runs.get_mut(rule)?, Stages::parse(i, row)?)));
+                match parsed {
+                    Some((run, stage)) => run.stages.push(stage),
                     None => failures.push(Failure {
+                        stage: None,
                         code: String::new(),
                         case: i,
                         item: None,
@@ -2573,51 +2954,47 @@ fn random_items_leak_across_crates() {
                 }
                 continue;
             }
-            // The copy of the config's analysis: it is what the copy of the result is compared with, so
-            // that a macro that cannot make it, or an error that remains, fails nothing.
-            if let Some(row) = line.strip_prefix("stagebase|") {
-                match parse_report(row) {
-                    Some((id, report)) => {
-                        base_reports.insert((i, id), report);
+            // The copy after the result is what the copy after the config is compared with, so that a
+            // macro that cannot make the second, or an error that remains, fails nothing.
+            if let Some(row) = line.strip_prefix("stage|") {
+                let parsed = row.split_once('|').and_then(|(rule, row)| {
+                    let (side, row) = row.split_once('|')?;
+                    let side = ["res", "cfg"].iter().position(|word| *word == side)?;
+                    let (id, report) = parse_report(row)?;
+                    Some((runs.get_mut(rule)?, side, id, report))
+                });
+                match parsed {
+                    Some((run, side, id, report)) => {
+                        if side == 0 {
+                            if let Some(error) = &report.rewrite_error {
+                                failures.push(Failure {
+                                    stage: None,
+                                    code: String::new(),
+                                    case: i,
+                                    item: Some(id),
+                                    class: "STAGES: the macro cannot make the copy made after the analysis without the rule",
+                                    text: error.clone(),
+                                });
+                            }
+                            if report.accept_failed {
+                                failures.push(Failure {
+                                    stage: None,
+                                    code: String::new(),
+                                    case: i,
+                                    item: Some(id),
+                                    class: "STAGES FAILED: an error remains when the cause of every error that the rule leaves is allowed",
+                                    text: format!(
+                                        "the errors that the rule leaves:\n{}\nthe errors that remain:\n{}",
+                                        describe(&report.rejections),
+                                        describe(&report.remaining)
+                                    ),
+                                });
+                            }
+                        }
+                        run.reports[side].insert((i, id), report);
                     }
                     None => failures.push(Failure {
-                        code: String::new(),
-                        case: i,
-                        item: None,
-                        class: "WATCHDOG: a line of the copy of allow_stages cannot be read",
-                        text: line.to_string(),
-                    }),
-                }
-                continue;
-            }
-            if let Some(row) = line.strip_prefix("stagecopy|") {
-                match parse_report(row) {
-                    Some((id, report)) => {
-                        if let Some(error) = &report.rewrite_error {
-                            failures.push(Failure {
-                                code: String::new(),
-                                case: i,
-                                item: Some(id),
-                                class: "STAGES: the macro cannot make the copy made after the analysis without the prelude",
-                                text: error.clone(),
-                            });
-                        }
-                        if report.accept_failed {
-                            failures.push(Failure {
-                                code: String::new(),
-                                case: i,
-                                item: Some(id),
-                                class: "STAGES FAILED: an error remains when the cause of every error that allow_prelude() leaves is allowed",
-                                text: format!(
-                                    "the errors that allow_prelude() leaves:\n{}\nthe errors that remain:\n{}",
-                                    describe(&report.rejections),
-                                    describe(&report.remaining)
-                                ),
-                            });
-                        }
-                        stage_reports.insert((i, id), report);
-                    }
-                    None => failures.push(Failure {
+                        stage: None,
                         code: String::new(),
                         case: i,
                         item: None,
@@ -2631,6 +3008,7 @@ fn random_items_leak_across_crates() {
                 Some((id, report)) => {
                     if let Some(error) = &report.rewrite_error {
                         failures.push(Failure {
+                            stage: None,
                             code: String::new(),
                             case: i,
                             item: Some(id),
@@ -2644,6 +3022,7 @@ fn random_items_leak_across_crates() {
                     }
                     if report.accept_failed {
                         failures.push(Failure {
+                            stage: None,
                             code: String::new(),
                             case: i,
                             item: Some(id),
@@ -2658,6 +3037,7 @@ fn random_items_leak_across_crates() {
                     reports.insert((i, id), report);
                 }
                 None => failures.push(Failure {
+                    stage: None,
                     code: String::new(),
                     case: i,
                     item: None,
@@ -2674,6 +3054,7 @@ fn random_items_leak_across_crates() {
             .collect();
         if !missing.is_empty() {
             failures.push(Failure {
+                stage: None,
                 code: String::new(),
                 case: i,
                 item: None,
@@ -2681,23 +3062,25 @@ fn random_items_leak_across_crates() {
                 text: format!("items {}", missing.join(", ")),
             });
         }
-        if stages_on {
+        for (rule, run) in &runs {
             let missing: Vec<String> = case
                 .items
                 .iter()
                 .filter(|item| {
-                    !stage_reports.contains_key(&(i, item.id))
-                        || !base_reports.contains_key(&(i, item.id))
+                    !run.reports[0].contains_key(&(i, item.id))
+                        || !run.reports[1].contains_key(&(i, item.id))
+                        || !run.stages.iter().any(|s| s.case == i && s.item == item.id)
                 })
                 .map(|item| item.id.to_string())
                 .collect();
             if !missing.is_empty() {
                 failures.push(Failure {
+                    stage: None,
                     code: String::new(),
                     case: i,
                     item: None,
                     class: "WATCHDOG: the macros of some items reported nothing of the copy of allow_stages",
-                    text: format!("items {}", missing.join(", ")),
+                    text: format!("rule {}: items {}", rule, missing.join(", ")),
                 });
             }
         }
@@ -2709,6 +3092,7 @@ fn random_items_leak_across_crates() {
             let shadowed = shadowed_prelude_names(&case.leaker);
             if !shadowed.is_empty() {
                 failures.push(Failure {
+                    stage: None,
                     code: String::new(),
                     case: i,
                     item: None,
@@ -2727,60 +3111,24 @@ fn random_items_leak_across_crates() {
     let (copies, failures): (Vec<Failure>, Vec<Failure>) = failures
         .into_iter()
         .partition(|failure| failure.class == ACCEPT_COPY);
-    let (stage_copies, failures): (Vec<Failure>, Vec<Failure>) = failures
+    let (mut stage_diags, mut failures): (Vec<Failure>, Vec<Failure>) = failures
         .into_iter()
         .partition(|failure| failure.class == STAGE_COPY);
-    let (base_copies, mut failures): (Vec<Failure>, Vec<Failure>) = failures
-        .into_iter()
-        .partition(|failure| failure.class == STAGE_BASE_COPY);
     let (documented, accept_problems, _) = explain_copies(
         copies,
         &reports,
         &generated,
         &ACCEPT_CLASSES,
         &BTreeSet::new(),
+        false,
     );
     failures.extend(accept_problems);
-    // The copies that the stage copies are compared with: those that are not built, or that do not
-    // compile, are the items whose failure the path rule after the analysis does not cause.
-    let mut base_failed: BTreeSet<(usize, usize)> = BTreeSet::new();
-    let mut base_named = Vec::new();
-    for failure in base_copies {
-        match failure.item {
-            Some(id) => {
-                base_failed.insert((failure.case, id));
-                base_named.push(failure);
-            }
-            None => failures.push(Failure {
-                class:
-                    "STAGES BASE: a diagnostic of the copy of the config's analysis names no item",
-                ..failure
-            }),
-        }
+    let mut results: BTreeMap<&'static str, RuleResult> = BTreeMap::new();
+    for (&rule, run) in &runs {
+        let (result, problems) = RuleResult::judge(rule, run, &mut stage_diags, &generated);
+        failures.extend(problems);
+        results.insert(rule, result);
     }
-    for ((case, id), report) in &base_reports {
-        if !(report.accepted || report.allowed) || report.rewrite_error.is_some() {
-            base_failed.insert((*case, *id));
-        }
-    }
-    // They are explained like the others, but a failure that is not listed fails nothing: it is a
-    // limitation of `allow()` after the config's analysis, which the copies after the result are not
-    // about.
-    let (_, _, base_verdicts) = explain_copies(
-        base_named,
-        &base_reports,
-        &generated,
-        &STAGE_CLASSES,
-        &BTreeSet::new(),
-    );
-    let (stage_documented, stage_problems, stage_verdicts) = explain_copies(
-        stage_copies,
-        &stage_reports,
-        &generated,
-        &STAGE_CLASSES,
-        &base_failed,
-    );
-    failures.extend(stage_problems);
 
     // The failure of an item that was accepted by `allow()` says what was allowed.
     for failure in &mut failures {
@@ -2801,8 +3149,7 @@ fn random_items_leak_across_crates() {
     if !build.success
         && failures.is_empty()
         && documented.is_empty()
-        && stage_verdicts.is_empty()
-        && base_failed.is_empty()
+        && results.values().all(RuleResult::is_empty)
     {
         panic!(
             "cargo failed, and no failure of a case says why (seed {}):\n{}",
@@ -2827,6 +3174,7 @@ fn random_items_leak_across_crates() {
         }
         for problem in unexplained(&tags, report) {
             failures.push(Failure {
+                stage: None,
                 code: String::new(),
                 case: *i,
                 item: Some(*id),
@@ -2872,16 +3220,26 @@ fn random_items_leak_across_crates() {
     let mut stats = Stats::collect(&generated, &reports);
     stats.documented = documented;
     let mut summary = summarize(&stats, &floors, seed, cases, features);
-    if stages_on {
+    for (rule, run) in &runs {
+        let result = &results[rule];
         let copies = StageCopies {
-            reports: &stage_reports,
-            documented: &stage_documented,
-            verdicts: &stage_verdicts,
-            base_reports: &base_reports,
-            base_failed: &base_failed,
-            base_verdicts: &base_verdicts,
+            rule,
+            reports: &run.reports[0],
+            documented: &result.documented,
+            verdicts: &result.verdicts,
+            base_reports: &run.reports[1],
+            base_failed: &result.base_failed,
+            base_verdicts: &result.base_verdicts,
+            clean_failed: &result.clean_failed,
+            clean_verdicts: &result.clean_verdicts,
         };
-        summary.push_str(&Stages::summarize(&stages, &generated, &ws, &copies));
+        summary.push_str(&Stages::summarize(
+            rule,
+            &run.stages,
+            &generated,
+            &ws,
+            &copies,
+        ));
     }
     eprintln!("{}", summary);
     let floor_problems = floors.problems(&stats);
@@ -2912,10 +3270,20 @@ fn random_items_leak_across_crates() {
             let case = &generated[failure.case];
             write!(
                 message,
-                "\n=== case {} (case seed {}), {}\n",
+                "\n=== case {} (case seed {}), {}{}\n",
                 failure.case,
                 case_seed(seed, failure.case),
-                failure.class
+                failure.class,
+                failure.stage.map_or(String::new(), |key| format!(
+                    " [allow_stages: rule {}, copy after the {}, crate {}]",
+                    key.rule,
+                    if key.side == "res" {
+                        "result"
+                    } else {
+                        "config"
+                    },
+                    if key.clean { "clean" } else { "with globs" }
+                ))
             )
             .unwrap();
             writeln!(
@@ -2950,10 +3318,16 @@ fn random_items_leak_across_crates() {
             let head = failure.text.lines().next().unwrap_or("");
             writeln!(
                 message,
-                "  case {} item {:?} [{}]: {}",
+                "  case {} item {:?} [{}]{}: {}",
                 failure.case,
                 failure.item,
                 failure.class.chars().take(24).collect::<String>(),
+                failure.stage.map_or(String::new(), |key| format!(
+                    " ({} {} {})",
+                    key.rule,
+                    key.side,
+                    if key.clean { "clean" } else { "glob" }
+                )),
                 head.chars().take(150).collect::<String>()
             )
             .unwrap();
@@ -3014,7 +3388,10 @@ mod checks {
 
     #[test]
     fn a_broken_helper_crate_is_not_a_finding_and_not_a_rejection() {
-        let known = case_packages(2);
+        let cases: Vec<Case> = (0..2)
+            .map(|i| generate_with(i, i as usize, 6, Features::parse(""), Flags::default()))
+            .collect();
+        let known = case_packages(&cases);
         // The macro crate does not compile: no crate of any case is built, and no case reports.
         let problem = build_problem(&build(false, &["type_leak_test_macro"]), &known).unwrap();
         assert!(problem.contains("type_leak_test_macro"), "{}", problem);
@@ -3030,21 +3407,30 @@ mod checks {
     #[test]
     fn a_case_with_nothing_built_is_reported() {
         let mut b = build(true, &[]);
-        assert_eq!(missing_artifacts(&b, 3, true, false, false).len(), 2);
+        assert_eq!(missing_artifacts(&b, 3, true, false, &[]).len(), 2);
         b.executables.insert(leaker_name(3), PathBuf::from("/x"));
-        assert_eq!(missing_artifacts(&b, 3, true, false, false).len(), 1);
+        assert_eq!(missing_artifacts(&b, 3, true, false, &[]).len(), 1);
         b.artifacts.insert(referrer_name(3));
-        assert!(missing_artifacts(&b, 3, true, false, false).is_empty());
+        assert!(missing_artifacts(&b, 3, true, false, &[]).is_empty());
         // The second Referrer's crate of the accept mode is built too.
-        assert_eq!(missing_artifacts(&b, 3, true, true, false).len(), 1);
+        assert_eq!(missing_artifacts(&b, 3, true, true, &[]).len(), 1);
         b.artifacts.insert(accept_name(3));
-        assert!(missing_artifacts(&b, 3, true, true, false).is_empty());
-        // And those of `allow_stages`.
-        assert_eq!(missing_artifacts(&b, 3, true, true, true).len(), 2);
-        b.artifacts.insert(stage_name(3));
-        assert_eq!(missing_artifacts(&b, 3, true, true, true).len(), 1);
-        b.artifacts.insert(base_name(3));
-        assert!(missing_artifacts(&b, 3, true, true, true).is_empty());
+        assert!(missing_artifacts(&b, 3, true, true, &[]).is_empty());
+        // And those of `allow_stages`: each rule has four, glob and clean after the result and the
+        // config.
+        let case = generate_with(3, 3, 6, Features::parse(""), Flags::default());
+        let stages = &case.stages;
+        assert_eq!(stages.len(), 4 * Flags::default().rules().len());
+        assert_eq!(
+            missing_artifacts(&b, 3, true, true, stages).len(),
+            stages.len()
+        );
+        for stage in stages {
+            b.artifacts.insert(stage_name(3, stage));
+        }
+        assert!(missing_artifacts(&b, 3, true, true, stages).is_empty());
+        // The leaker's crate that does not compile builds none of them.
+        assert!(missing_artifacts(&b, 3, false, true, stages).is_empty());
     }
 
     #[test]
@@ -3295,7 +3681,7 @@ mod checks {
         // The traits of `trait_self_defaults` (F39): needing `Self` and nested, and declared again.
         let (mut nested_self_default, mut redeclared, mut plain_default) = (0, 0, 0);
         for seed in 0..12 {
-            let case = generate(seed, 0, 6, Features::parse(""));
+            let case = generate_with(seed, 0, 6, Features::parse(""), Flags::default());
             for item in &case.items {
                 let attr = case
                     .leaker
@@ -3359,7 +3745,7 @@ mod checks {
         let count = |features: Features, tag: &str| -> (usize, usize) {
             let (mut found, mut types) = (0, 0);
             for seed in 0..12 {
-                let case = generate(seed, 0, 6, features);
+                let case = generate_with(seed, 0, 6, features, Flags::default());
                 for item in &case.items {
                     if item.tags.contains(gen::TAG_SELF_BOUND_ADT) {
                         assert!(
@@ -3483,7 +3869,7 @@ mod checks {
     fn the_crate_of_the_accepted_items_mirrors_the_modules_of_the_items() {
         let mut nested = 0;
         for seed in 0..12 {
-            let case = generate(seed, 0, 6, Features::parse(""));
+            let case = generate_with(seed, 0, 6, Features::parse(""), Flags::default());
             let text = &case.accept_referrer;
             assert!(
                 text.contains("pub mod base { pub use ::tlp_l_000::base::*; }"),
@@ -3533,33 +3919,47 @@ mod checks {
         assert!(nested > 0, "no item in a nested module in 12 cases");
     }
 
-    /// The crates of `allow_stages` invoke each item once, as the crate of the accepted items does,
-    /// with the macro of their own, and nothing generated shadows a name of the prelude, which the
-    /// copies of `allow_stages` rely on.
+    /// The crates of `allow_stages` invoke each item once, as the crate of the accepted items does
+    /// (the glob ones) or at the root (the clean ones), with the macro of their own, and nothing
+    /// generated shadows a name of the prelude, which the copies of `allow_stages` rely on.
     #[test]
     fn the_crates_of_the_stage_copies_mirror_the_accepted_ones_and_the_prelude_is_not_shadowed() {
         for seed in 0..12 {
-            let case = generate(seed, 0, 6, Features::parse(""));
+            let case = generate_with(seed, 0, 6, Features::parse(""), Flags::default());
             assert!(
                 shadowed_prelude_names(&case.leaker).is_empty(),
                 "{:?}",
                 shadowed_prelude_names(&case.leaker)
             );
-            for (prefix, text, lines) in [
-                ("__tl_stagecopy_", &case.stage_referrer, &case.stage_lines),
-                ("__tl_stagebase_", &case.base_referrer, &case.base_lines),
-            ] {
-                assert_eq!(lines.len(), case.items.len());
+            for stage in &case.stages {
+                let prefix = format!("__tl_st_{}_{}_", stage.rule, stage.side);
+                assert_eq!(stage.lines.len(), case.items.len());
                 for item in &case.items {
                     let call = format!("::{}{}!(", prefix, item.id);
-                    let invoked: Vec<&str> =
-                        text.lines().filter(|line| line.contains(&call)).collect();
-                    assert_eq!(invoked.len(), 1, "{}", text);
+                    let invoked: Vec<&str> = stage
+                        .lib
+                        .lines()
+                        .filter(|line| line.contains(&call))
+                        .collect();
+                    assert_eq!(invoked.len(), 1, "{}", stage.lib);
                     assert!(invoked[0].ends_with(", accept);"), "{}", invoked[0]);
+                    // The clean crates say so first, in the invocation.
+                    assert_eq!(invoked[0].contains("(clean path = "), stage.clean);
                 }
-                // Only the macros differ: the modules and imports are those of the accepted items.
-                let accepted = case.accept_referrer.replace("__tl_prop_", prefix);
-                assert_eq!(&accepted, text);
+                if !stage.clean {
+                    // Only the macros differ: the modules and imports are those of the accepted items.
+                    let accepted = case.accept_referrer.replace("__tl_prop_", &prefix);
+                    assert_eq!(accepted, stage.lib);
+                } else {
+                    // None of the Leaker's names but the ones the rule allows: no glob import, `base`
+                    // where `crate::base` or `super::base` is allowed, and the modules where the paths
+                    // are relative to the module.
+                    assert!(stage.lib.matches("::*;").count() <= 1, "{}", stage.lib);
+                    let base = matches!(stage.rule, "crate" | "path" | "values" | "default");
+                    assert_eq!(stage.lib.contains("pub mod base {"), base, "{}", stage.lib);
+                    let modules = matches!(stage.rule, "path" | "values" | "default");
+                    assert_eq!(stage.lib.contains("pub mod m0 {"), modules, "{}", stage.lib);
+                }
             }
         }
     }
@@ -3721,7 +4121,7 @@ mod checks {
     fn the_shapes_of_the_failures_of_accepted_copies_are_generated() {
         let mut found = std::collections::BTreeSet::new();
         for seed in 0..40 {
-            let case = generate(seed, 0, 6, Features::parse(""));
+            let case = generate_with(seed, 0, 6, Features::parse(""), Flags::default());
             for item in &case.items {
                 for tag in [
                     gen::TAG_SELF_IN_PREDICATE,
@@ -3735,6 +4135,105 @@ mod checks {
             }
         }
         assert_eq!(found.len(), 3, "{:?}", found);
+    }
+
+    #[test]
+    fn the_flags_of_the_generator_are_off_by_default_and_name_their_rules() {
+        let default = Flags::default();
+        assert_eq!(default.rules(), ["prelude", "crate", "path", "default"]);
+        let all = Flags {
+            allow_stages: true,
+            relative_std: true,
+            values: true,
+        };
+        assert_eq!(
+            all.rules(),
+            ["prelude", "crate", "path", "std", "values", "default"]
+        );
+        // Without them the generated crates have no value, no relative path of `std`, no `alloc`.
+        for seed in 0..6 {
+            let case = generate_with(seed, 0, 6, Features::parse(""), default);
+            for text in [&case.leaker, &case.referrer, &case.accept_referrer] {
+                assert!(!text.contains("extern crate alloc;"), "{}", text);
+            }
+            assert!(!case.leaker.contains("bodies = true"));
+            assert!(!case.leaker.contains("fn bf()"));
+            assert!(!case.leaker.contains("\"std,core,alloc\""));
+        }
+    }
+
+    #[test]
+    fn the_values_and_the_paths_of_std_are_generated_with_their_flags() {
+        let flags = Flags {
+            allow_stages: true,
+            relative_std: true,
+            values: true,
+        };
+        let (mut bodies, mut relative, mut paths, mut alloc) = (0, 0, 0, 0);
+        for seed in 0..12 {
+            let case = generate_with(seed, 0, 6, Features::parse(""), flags);
+            // The Leaker's crate and the Referrer's have `alloc`, and the items have the arguments.
+            assert!(case.leaker.contains("extern crate alloc;"));
+            assert!(case.referrer.contains("extern crate alloc;"));
+            assert!(case.leaker.contains("pub const fn bf() -> usize"));
+            assert!(case
+                .leaker
+                .contains("pub const fn bg<T: ?Sized>() -> usize"));
+            bodies += case.leaker.matches("bodies = true").count();
+            relative += case.leaker.matches(" core::").count();
+            paths += case
+                .items
+                .iter()
+                .filter(|item| item.tags.contains(gen::TAG_VALUE_PATH))
+                .count();
+            alloc += case.leaker.matches(" alloc::").count();
+            // A value that the Leaker reads says so, and an item that has one also is checked as its
+            // signatures are.
+            for line in case
+                .leaker
+                .lines()
+                .filter(|line| line.contains("values = true"))
+            {
+                assert!(line.contains("bodies = true"), "{}", line);
+            }
+            // All the rules, in a crate with globs and a clean one, after the result and the config.
+            assert_eq!(case.stages.len(), 4 * flags.rules().len());
+        }
+        assert!(bodies > 0 && relative > 0 && paths > 0 && alloc > 0);
+    }
+
+    /// `relativize_std()` only drops the leading `::` of `std` and `core` (and says `alloc` where
+    /// `alloc` has the item), leaves the attribute, a path that hides a lifetime and an item with
+    /// bounds that name its `Self` alone, and does nothing in a module analyzed as a whole.
+    #[test]
+    fn the_paths_of_std_are_relativized_where_they_are_safe() {
+        let flags = Flags {
+            relative_std: true,
+            ..Flags::default()
+        };
+        let text = "#[@ATTR@(id = 1, allow = \"::std,std\")]\n\
+                    pub struct S(::std::vec::Vec<::core::marker::PhantomData<u8>>, <::core::option::Option<u8>>, \
+                    fn(::core::str::Chars) -> &u8, ::std::collections::BTreeMap<u8, ::std::sync::Arc<u8>>);\n";
+        // The normal form: relative, and `alloc` as `std`.
+        let normal = |text: &str| {
+            text.replace("::std::", "std::")
+                .replace("::core::", "core::")
+                .replace("alloc::", "std::")
+        };
+        let (mut relative, mut alloc) = (0, 0);
+        for seed in 0..40 {
+            let mut g = gen::Gen::new(seed, "tlp_l_000".into(), Features::parse(""), flags);
+            let out = g.relativize_std(text);
+            assert_eq!(normal(&out), normal(text), "{}", out);
+            assert!(out.starts_with(text.lines().next().unwrap()));
+            assert!(out.contains("fn(::core::str::Chars) -> &u8"), "{}", out);
+            relative += out.matches("core::").count() - out.matches("::core::").count();
+            alloc += out.matches("alloc::").count();
+        }
+        assert!(relative > 0 && alloc > 0);
+        // Not asked for: unchanged.
+        let mut g = gen::Gen::new(1, "tlp_l_000".into(), Features::parse(""), Flags::default());
+        assert_eq!(g.relativize_std(text), text);
     }
 
     #[test]
