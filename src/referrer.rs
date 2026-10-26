@@ -43,12 +43,13 @@ use template_quote::{quote, ToTokens};
 /// | list the entries | [`iter()`](Referrer::iter), [`required()`](Referrer::required), [`must()`](Referrer::must) |
 /// | emit the Repeater impls | [`repeater_impl()`](Referrer::repeater_impl), [`is_plain()`](Referrer::is_plain), [`module_path()`](Referrer::module_path) |
 /// | rewrite a copy | [`visitor()`](Referrer::visitor), [`expand()`](Referrer::expand), [`entry_args()`](Referrer::entry_args), [`complete_args()`](Referrer::complete_args) |
-/// | change how a copy is rewritten | [`allow_ambiguous_crate_name()`](Referrer::allow_ambiguous_crate_name), [`Visitor::with_self()`], [`Visitor::with_nested_self()`], [`Visitor::with_outermost_generics_as_leakers()`] |
+/// | change how a copy is rewritten | [`LeakerResult::allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name), [`Visitor::with_self()`], [`Visitor::with_nested_self()`], [`Visitor::with_outermost_generics_as_leakers()`] |
 /// | look at the generics, `Self` and module of an entry | [`context()`](Referrer::context), [`context_generics()`](Referrer::context_generics), [`context_self()`](Referrer::context_self), [`context_module()`](Referrer::context_module) |
 ///
 /// Emit an impl for every entry, not only the [`required()`](Referrer::required) ones: crate B
-/// may make the `Referrer` strict ([`allow_ambiguous_crate_name(false)`](Referrer::allow_ambiguous_crate_name)),
-/// and then it replaces the other entries too.
+/// may make the `Referrer` strict
+/// ([`allow_ambiguous_crate_name(false)`](crate::LeakerResult::allow_ambiguous_crate_name)), and then it
+/// replaces the other entries too.
 ///
 /// Passing a `Referrer` from crate A to crate B as tokens:
 ///
@@ -470,45 +471,6 @@ impl Referrer {
         )
     }
 
-    /// Chooses whether the absolute paths of other crates (the optional entries) are left as
-    /// written (`true`, the default) or replaced (`false`, a strict Referrer).
-    ///
-    /// Required entries are always replaced. Crates are matched by name only, so:
-    ///
-    /// - `true`: the optional entry is left as written, and the types in it are looked up as usual
-    ///   (`Rel` in `::serde::Wrap<(Rel,)>` is replaced). Use it when both sides are built from the
-    ///   same dependency graph. A crate of the same name with another version or origin is taken
-    ///   for the same one, and the copy then fails or means another type.
-    /// - `false`: the optional entry is replaced like a required one, through the Repeater. An
-    ///   absolute type that contains a relative one (`::serde::Wrap<(Rel,)>`) is replaced as a
-    ///   whole. Use it if the Referrer's crate may have other dependencies than the Leaker's.
-    ///
-    /// One absolute type is no optional entry whatever this says: the one that names the `Self` of
-    /// a struct, an enum or a union nested in the analyzed syntax (`::serde::Wrap<Self>`). Its
-    /// copy declares a type of its own, so `Self` in a type that is copied as written is that
-    /// type, and a replacement would hold the Leaker's. See [`Visitor::with_nested_self()`].
-    ///
-    /// The flag is not serialized, so the crate that emits the Repeater impls cannot know it: it
-    /// writes the impls of all the entries ([`Referrer::iter()`]), the optional ones too, or a
-    /// strict Referrer replaces a type that has no impl (E0277).
-    ///
-    /// ```
-    /// # use type_leak::*;
-    /// # use syn::*;
-    /// let mut leaker = Leaker::new();
-    /// let context = leaker.intern_struct(&parse_quote!(struct S { a: ::foo::X }), true);
-    /// let referrer = leaker.result().finish().unwrap();
-    /// let ty: Type = parse_quote!(::foo::X);
-    /// let replaced: Type = parse_quote!(Replaced);
-    /// assert_eq!(referrer.expand(context, ty.clone(), |_, _| replaced.clone()), ty);
-    /// let referrer = referrer.allow_ambiguous_crate_name(false);
-    /// assert_eq!(referrer.expand(context, ty.clone(), |_, _| replaced.clone()), replaced);
-    /// ```
-    pub fn allow_ambiguous_crate_name(mut self, allow: bool) -> Self {
-        self.allow_ambiguous_crate_name = allow;
-        self
-    }
-
     /// Returns the sorted, distinct names of the external crates that the `ix`-th entry names.
     ///
     /// A crate is named by the first segment of an absolute path in the type, its generics or its
@@ -532,10 +494,11 @@ impl Referrer {
     /// Returns `true` if the `ix`-th entry is required, and `false` if it is optional.
     ///
     /// An entry is optional if only its own path is an absolute path that names an external crate.
-    /// [`Referrer::allow_ambiguous_crate_name()`] then decides whether it is replaced. Other
-    /// entries are required and always replaced, and need a Repeater impl. Required entries have
-    /// the smaller indices. See [`LeakerConfig::allow_path()`](crate::LeakerConfig::allow_path) for the
-    /// paths that are not optional entries.
+    /// [`LeakerResult::allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)
+    /// then decides whether it is replaced. Other entries are required and always replaced, and
+    /// need a Repeater impl. Required entries have the smaller indices. See
+    /// [`LeakerConfig::allow_path()`](crate::LeakerConfig::allow_path) for the paths that are not
+    /// optional entries.
     ///
     /// Only types are optional entries. An absolute path in a bound, in an expression of a value
     /// (a type in a type position of a value is an entry with
@@ -566,7 +529,8 @@ impl Referrer {
     ///
     /// These are the entries that every Referrer replaces, so each needs a Repeater impl. The
     /// others are optional entries (absolute paths of other crates, left as written by a
-    /// non-strict Referrer: see [`Referrer::allow_ambiguous_crate_name()`]), which
+    /// non-strict Referrer: see
+    /// [`LeakerResult::allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)), which
     /// [`Referrer::iter()`] and [`Referrer::is_empty()`] include. An optional entry needs an impl
     /// only if a strict Referrer replaces it: a crate that exports an item to crates it does not
     /// know writes the impls of all the entries ([`Referrer::iter()`]), not only of these.
@@ -624,7 +588,8 @@ impl Referrer {
     /// It includes the optional entries (absolute paths of other crates, left as written by a
     /// non-strict Referrer): use [`Referrer::required()`] for the entries that every Referrer
     /// replaces. A crate that exports an item writes the impls of all the entries, so that a
-    /// strict Referrer in another crate finds them ([`Referrer::allow_ambiguous_crate_name()`]).
+    /// strict Referrer in another crate finds them
+    /// ([`LeakerResult::allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)).
     ///
     /// A plain impl for any type is right only for an entry for which [`Referrer::is_plain()`]
     /// holds. Otherwise use [`Referrer::iter_with_generics()`], [`Referrer::iter_with_self()`] or
@@ -1713,7 +1678,7 @@ where
     /// type, as below. So an absolute type that names `Self` and would be copied as written anyway
     /// (`::p::Rel2<Self, T>`, `::std::boxed::Box<Self>`) is no entry in a struct, an enum or a
     /// union, not even an optional one: a Referrer that replaces the optional entries
-    /// ([`Referrer::allow_ambiguous_crate_name(false)`](Referrer::allow_ambiguous_crate_name))
+    /// ([`allow_ambiguous_crate_name(false)`](crate::LeakerResult::allow_ambiguous_crate_name))
     /// copies it as written too, as one that does not. (Replaced, it would hold the Leaker's type
     /// for `Self` where the others hold the copy's, and `struct Node { next:
     /// ::std::boxed::Box<Self> }` would not be recursive.) What in it must be leaked on its own
@@ -1905,7 +1870,9 @@ where
     ///     .enter_mod("m", [item.ident.clone()], |view| {
     ///         view.visit_item(&Item::Struct(item.clone()))
     ///     });
-    /// let referrer = leaker.result().finish().unwrap().allow_ambiguous_crate_name(false); // strict
+    /// let mut result = leaker.result();
+    /// result.allow_ambiguous_crate_name(false); // strict
+    /// let referrer = result.finish().unwrap();
     /// assert_eq!(referrer.iter().count(), 2); // `Rel<Self>`, then `::p::Wrap<T>` (optional)
     ///
     /// let mut file = File { shebang: None, attrs: vec![], items: vec![Item::Struct(item)] };

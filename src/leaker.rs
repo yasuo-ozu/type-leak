@@ -909,6 +909,45 @@ impl LeakerResult {
         self.drop_accepted(Allow::defaults)
     }
 
+    /// Chooses whether the optional entries (absolute paths of other crates) are left as written
+    /// (`true`, the default) or replaced through the Repeater (`false`, a strict Referrer).
+    ///
+    /// Required entries are always replaced. Crates are matched by name only.
+    ///
+    /// - `true`: the optional entry is left as written, and the types in it are looked up as usual
+    ///   (`Rel` in `::serde::Wrap<(Rel,)>` is replaced). Use it when both sides are built from the
+    ///   same dependency graph: a crate of the same name with another version or origin is taken for
+    ///   the same one.
+    /// - `false`: the optional entry is replaced like a required one, as a whole. Use it if the
+    ///   Referrer's crate may have other dependencies than the Leaker's.
+    ///
+    /// An absolute type that names the `Self` of a struct, an enum or a union nested in the
+    /// analyzed syntax (`::serde::Wrap<Self>`) is no optional entry whatever this says. See
+    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self).
+    ///
+    /// The flag is not serialized, so the crate that emits the Repeater impls cannot know it: it
+    /// writes the impls of all the entries ([`Referrer::iter()`]), the optional ones too. A
+    /// serialized [`Referrer`] parses as a `LeakerResult` with no errors (if no brace group follows
+    /// it), so a macro that receives a Referrer chooses with this method too.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let mut leaker = Leaker::new();
+    /// let context = leaker.intern_struct(&parse_quote!(struct S { a: ::foo::X }), true);
+    /// let mut result = leaker.result();
+    /// let ty: Type = parse_quote!(::foo::X);
+    /// let replaced: Type = parse_quote!(Replaced);
+    /// let referrer = result.clone().finish().unwrap();
+    /// assert_eq!(referrer.expand(context, ty.clone(), |_, _| replaced.clone()), ty);
+    /// let referrer = result.allow_ambiguous_crate_name(false).clone().finish().unwrap();
+    /// assert_eq!(referrer.expand(context, ty.clone(), |_, _| replaced.clone()), replaced);
+    /// ```
+    pub fn allow_ambiguous_crate_name(&mut self, allow: bool) -> &mut Self {
+        self.referrer.allow_ambiguous_crate_name = allow;
+        self
+    }
+
     /// Returns the errors that remain, in the order found.
     pub fn errors(&self) -> &[ErrorItem] {
         &self.errors

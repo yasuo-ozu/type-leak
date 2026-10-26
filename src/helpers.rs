@@ -327,7 +327,8 @@ impl Referrer {
     /// It fails with [`EncodeError::NeedsSelf`] for [`ImplSelf::Marker`] if the entry names
     /// `Self`, and with [`EncodeError::UnsupportedConstType`] for a const parameter that is not
     /// `usize`. Write the impls of all the entries ([`Referrer::iter()`]): the optional entries need
-    /// one if some Referrer is strict ([`Referrer::allow_ambiguous_crate_name()`]).
+    /// one if some Referrer is strict
+    /// ([`LeakerResult::allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)).
     ///
     /// ```
     /// # use type_leak::*;

@@ -342,7 +342,7 @@ pub(crate) fn errors(input: TokenStream) -> Result<TokenStream> {
 }
 
 struct ApplyInput {
-    referrer: Referrer,
+    result: LeakerResult,
     context: ContextId,
     scope: ScopeInput,
     path: Path,
@@ -351,12 +351,12 @@ struct ApplyInput {
 
 impl Parse for ApplyInput {
     fn parse(input: ParseStream) -> Result<Self> {
-        let (referrer, context) = {
+        let (result, context) = {
             let content;
             braced!(content in input);
-            let referrer = content.parse()?;
+            let result = content.parse()?;
             content.parse::<Token![,]>()?;
-            (referrer, content.parse()?)
+            (result, content.parse()?)
         };
         let scope = {
             let content;
@@ -377,7 +377,7 @@ impl Parse for ApplyInput {
             true
         };
         Ok(Self {
-            referrer,
+            result,
             context,
             scope,
             path,
@@ -404,17 +404,16 @@ impl VisitMut for Absolutize<'_> {
 /// `__scope_apply!`, the Referrer's side.
 pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     let ApplyInput {
-        referrer,
+        mut result,
         context,
         scope,
         path,
         strict,
     } = parse2(input)?;
-    let referrer = if strict {
-        referrer.allow_ambiguous_crate_name(false)
-    } else {
-        referrer
-    };
+    if strict {
+        result.allow_ambiguous_crate_name(false);
+    }
+    let referrer = result.into_referrer();
     let krate = path
         .segments
         .first()

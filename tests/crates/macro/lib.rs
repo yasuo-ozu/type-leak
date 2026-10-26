@@ -639,28 +639,30 @@ fn braced_parse<T: Parse>(input: ParseStream) -> Result<T> {
 impl Parse for Input {
     fn parse(input: ParseStream) -> Result<Self> {
         let item_trait = braced_parse(input)?;
-        let (referrer, context) = {
+        let (mut result, context): (LeakerResult, ContextId) = {
             let content;
             braced!(content in input);
-            let referrer = content.parse()?;
+            let result = content.parse()?;
             content.parse::<Token![,]>()?;
-            (referrer, content.parse()?)
+            (result, content.parse()?)
         };
-        let header = Header {
-            item_trait,
-            referrer,
-            context,
-            id: braced_parse(input)?,
-            repeater: braced_parse::<Path>(input)?,
-            module: braced_parse::<Path>(input)?,
-        };
+        let id = braced_parse(input)?;
+        let repeater = braced_parse::<Path>(input)?;
+        let module = braced_parse::<Path>(input)?;
         // `strict` makes the Referrer replace the optional entries as well (it does not trust the
-        // names of the crates, see `Referrer::allow_ambiguous_crate_name()`).
-        let mut header = header;
+        // names of the crates, see `LeakerResult::allow_ambiguous_crate_name()`).
         if input.peek(Ident) && input.fork().parse::<Ident>()? == "strict" {
             input.parse::<Ident>()?;
-            header.referrer = header.referrer.allow_ambiguous_crate_name(false);
+            result.allow_ambiguous_crate_name(false);
         }
+        let header = Header {
+            item_trait,
+            referrer: result.into_referrer(),
+            context,
+            id,
+            repeater,
+            module,
+        };
         if input.peek(Ident) && !input.peek(Token![impl]) {
             let keyword: Ident = input.parse()?;
             if keyword != "copy" && keyword != "show" {

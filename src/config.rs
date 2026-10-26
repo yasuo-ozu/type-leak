@@ -262,7 +262,8 @@ impl LeakerConfig {
     /// Another absolute path, such as `::serde::Wrap<(Rel,)>`, may name a different crate in the
     /// copy, which the Leaker cannot tell. So it is leaked as an *optional entry*
     /// ([`Referrer::must()`](crate::Referrer::must) is `false`), and the Referrer chooses whether a
-    /// copy replaces it ([`Referrer::allow_ambiguous_crate_name()`](crate::Referrer::allow_ambiguous_crate_name)).
+    /// copy replaces it
+    /// ([`LeakerResult::allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)).
     /// `::core::..` and `$crate::..` are never optional, and `::std` and `::alloc` are like any
     /// other crate unless allowed.
     /// [`Referrer::external_crates_require()`](crate::Referrer::external_crates_require) lists the

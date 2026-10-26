@@ -267,7 +267,7 @@ pub enum SelfRequirement {
     /// The ways out are to put the field first (not the last one of a struct), to add `where Self:
     /// Sized` to the item, to write the type with an absolute path that both crates resolve (a
     /// Referrer that trusts the names of the crates copies it as written, see
-    /// [`Referrer::allow_ambiguous_crate_name()`](crate::Referrer::allow_ambiguous_crate_name)),
+    /// [`LeakerResult::allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)),
     /// or to use a bound that needs no `Sized`, where the impl is `?Sized`.
     Any,
 }

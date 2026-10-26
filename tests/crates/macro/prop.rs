@@ -2352,13 +2352,13 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
     // What the macro of the Referrer carries: the result with its errors, or the Referrer.
     let carried = (mode == Mode::Result).then(|| result.to_token_stream());
     // The recovered Referrer: the parts that conflict are copied as written.
-    let referrer = result.into_referrer();
+    let referrer = result.clone().into_referrer();
     let carried = carried.unwrap_or_else(|| referrer.to_token_stream());
 
     let status = if args.accepted { "acc" } else { "ok" };
     let errors = rejection_text(&errors);
     // Count what the Referrer will check, by rewriting a copy here too.
-    let counted = count_copy(&referrer, context, &original, &args, status, twin)?;
+    let counted = count_copy(&result, context, &original, &args, status, twin)?;
     let mut impls = counted.impls;
     let report = counted.report;
     let witnesses = witnesses_of(&original, &args);
@@ -2448,7 +2448,7 @@ fn place(
     })
 }
 
-/// What the macro writes for the copy that a Referrer makes of `original` with `referrer`: the
+/// What the macro writes for the copy that a Referrer makes of `original` with `result`: the
 /// Repeater's impls of its entries, and the report of what the macro counted.
 struct Counted {
     impls: Impls,
@@ -2459,24 +2459,25 @@ struct Counted {
 /// entries, the type positions, those that a witness compares (`status` is `ok`, or `acc` for an
 /// item accepted by `allow()`). Fails if the item has a shape that the macro cannot write.
 fn count_copy(
-    referrer: &Referrer,
+    result: &LeakerResult,
     context: ContextId,
     original: &Item,
     args: &Args,
     status: &str,
     twin: bool,
 ) -> Result<Counted> {
+    let referrer = &result.clone().into_referrer();
     let (id, kind) = (args.id, kind_name(original));
     check_nested_self_is_required(referrer, original, args)?;
     let (impls, skipped) =
         repeater_impls(referrer, args.repeater_id(), args.strict.unwrap_or(true))?;
     let positions = collect_positions(original, None, args);
     let dummy: Path = parse_quote!(::__dummy);
-    let counted = if args.strict == Some(true) {
-        referrer.clone().allow_ambiguous_crate_name(false)
-    } else {
-        referrer.clone()
-    };
+    let mut counted = result.clone();
+    if args.strict == Some(true) {
+        counted.allow_ambiguous_crate_name(false);
+    }
+    let counted = counted.into_referrer();
     let report = match rewrite(&counted, context, original, args, &dummy, false) {
         Ok(rewritten) => {
             let host = host_arg(&rewritten, args, &dummy);
@@ -2702,9 +2703,9 @@ fn stage_copy(
     copy_args.stages = false;
     copy_args.stage = rule.number(side);
     copy_args.accepted = true;
-    let referrer = result.into_referrer();
+    let referrer = result.clone().into_referrer();
     let text = rejection_text(&errors);
-    let counted = match count_copy(&referrer, context, original, &copy_args, status, false) {
+    let counted = match count_copy(&result, context, original, &copy_args, status, false) {
         Ok(counted) => counted,
         Err(e) => {
             let report = format!(
@@ -2912,7 +2913,6 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         };
     }
     let errors = crate::report(result.errors());
-    let referrer = result.into_referrer();
     // `strict` makes the Referrer replace the optional entries as well.
     if args.strict.is_some_and(|said| said != strict) {
         return Err(Error::new(
@@ -2920,11 +2920,10 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
             "test macro: the item is invoked with another `strict` than the one it was analyzed for",
         ));
     }
-    let referrer = if strict {
-        referrer.allow_ambiguous_crate_name(false)
-    } else {
-        referrer
-    };
+    if strict {
+        result.allow_ambiguous_crate_name(false);
+    }
+    let referrer = result.into_referrer();
     let rewritten = rewrite(&referrer, context, &item, &args, &path, dyn_host)?;
     let id = args.id;
 

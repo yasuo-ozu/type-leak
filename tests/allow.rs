@@ -1447,7 +1447,8 @@ fn the_referrer_carries_the_part_that_is_copied_and_the_entries_beside_it() {
 #[test]
 fn the_visitor_leaves_a_part_as_written_and_replaces_the_entry_with_the_same_tokens() {
     let item = elided_and_bare();
-    let (referrer, context) = referrer_of(LeakerConfig::new(), &item);
+    let (result, context) = leak_trait(LeakerConfig::new(), &item);
+    let referrer = result.clone().into_referrer();
     // `f` as written, `g` through the entry `dyn RelTr`.
     let expected: ItemTrait = parse_quote!(
         trait Fg {
@@ -1457,7 +1458,9 @@ fn the_visitor_leaves_a_part_as_written_and_replaces_the_entry_with_the_same_tok
     );
     assert_eq!(rewritten(&referrer, context, &item), expected);
     // A strict Referrer replaces the optional entry as a whole.
-    let strict = referrer.allow_ambiguous_crate_name(false);
+    let mut strict = result;
+    strict.allow_ambiguous_crate_name(false);
+    let strict = strict.into_referrer();
     let expected: ItemTrait = parse_quote!(
         trait Fg {
             fn f(&self, x: ::p::Elided<'_, dyn RelTr>);

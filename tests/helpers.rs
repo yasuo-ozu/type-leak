@@ -141,7 +141,8 @@ fn required_entries_come_first_and_skip_the_optional_ones() {
     );
     let mut leaker = Leaker::from_config(config());
     leaker.intern_struct(&item, true);
-    let referrer = leaker.result().finish().unwrap();
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     let all: Vec<String> = referrer.iter().map(s).collect();
     assert_eq!(all.len(), 4, "{:?}", all);
     assert!(!referrer.is_empty());
@@ -165,7 +166,9 @@ fn required_entries_come_first_and_skip_the_optional_ones() {
     }
     assert!(referrer.has_required());
     // Not affected by how the Referrer treats the optional entries.
-    let strict = referrer.clone().allow_ambiguous_crate_name(false);
+    let mut strict = result;
+    strict.allow_ambiguous_crate_name(false);
+    let strict = strict.finish().unwrap();
     assert_eq!(
         strict.required().map(|(ix, _)| ix).collect::<Vec<_>>(),
         [0, 1]

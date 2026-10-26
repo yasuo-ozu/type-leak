@@ -245,7 +245,7 @@ fn test_defaults_of_several_calls_are_shared() {
     leaker.intern_trait(&bad, true);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    let referrer = result.into_referrer();
+    let referrer = result.clone().into_referrer();
     // The types use no generics, so they are in one context, whichever call found them, and the
     // generics of the calls (without the defaults) are two other contexts. The default of `U`,
     // the type of an external crate, is an optional entry (after the required ones), which uses
@@ -276,7 +276,9 @@ fn test_defaults_of_several_calls_are_shared() {
         ["u8", ":: std :: vec :: Vec < u8 >"]
     );
     // A Referrer which does not trust the names of the crates replaces the default by the entry.
-    let strict = referrer.allow_ambiguous_crate_name(false);
+    let mut strict = result;
+    strict.allow_ambiguous_crate_name(false);
+    let strict = strict.into_referrer();
     let mut replaced = Vec::new();
     let completed = strict
         .complete_args(

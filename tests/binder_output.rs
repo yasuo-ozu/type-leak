@@ -1540,11 +1540,15 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
             fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, &'x u8, Parser<'x>) -> &'x u8);
         }
     };
-    let (referrer, context) = analyze_in(leaker_allowing_nothing(), &item).unwrap();
+    let mut leaker = leaker_allowing_nothing();
+    let context = leaker.intern_trait(&item, true);
+    let result = leaker.result();
     let mut kept = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer
+        &mut result
             .clone()
+            .finish()
+            .unwrap()
             .visitor(context, |_, ix| parse_quote!(P<#ix>)),
         &mut kept,
     );
@@ -1557,9 +1561,12 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     // The Referrer which replaces them: the type is replaced (with its entry), and `&'x u8`
     // anchors `'x`, so the copy is valid.
     let mut replaced = item.clone();
+    let mut strict = result;
+    strict.allow_ambiguous_crate_name(false);
     syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer
-            .allow_ambiguous_crate_name(false)
+        &mut strict
+            .finish()
+            .unwrap()
             .visitor(context, |_, ix| parse_quote!(P<#ix>)),
         &mut replaced,
     );
@@ -1575,13 +1582,17 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
             fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, Parser<'x>) -> &'x u8);
         }
     };
-    let (referrer, context) = analyze_in(leaker_allowing_nothing(), &item).unwrap();
+    let mut leaker = leaker_allowing_nothing();
+    let context = leaker.intern_trait(&item, true);
+    let result = leaker.result();
     for allow in [true, false] {
         let mut copy = item.clone();
+        let mut result = result.clone();
+        result.allow_ambiguous_crate_name(allow);
         syn::visit_mut::VisitMut::visit_item_trait_mut(
-            &mut referrer
-                .clone()
-                .allow_ambiguous_crate_name(allow)
+            &mut result
+                .finish()
+                .unwrap()
                 .visitor(context, |_, ix| parse_quote!(P<#ix>)),
             &mut copy,
         );

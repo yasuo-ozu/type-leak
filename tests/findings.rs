@@ -2084,8 +2084,9 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
     for item in copied.iter().chain(&controls) {
         let mut leaker = f13_leaker();
         let context = leaker.intern_impl(item, true);
-        let referrer = leaker
-            .result()
+        let mut result = leaker.result();
+        let referrer = result
+            .clone()
             .finish()
             .unwrap_or_else(|e| panic!("`{}` is rejected: {}", string(item), joined_messages(&e)));
         assert!(
@@ -2095,8 +2096,10 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
         );
         // A strict Referrer replaces the optional entries too, but not those in the self type.
         let mut copy = Item::Impl(item.clone());
-        referrer
-            .allow_ambiguous_crate_name(false)
+        result.allow_ambiguous_crate_name(false);
+        result
+            .finish()
+            .unwrap()
             .visitor(context, |_, ix| parse_quote!(P<#ix>))
             .visit_item_mut(&mut copy);
         if let Item::Impl(copy) = copy {
@@ -2117,14 +2120,17 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
     );
     let mut leaker = f13_leaker();
     let context = leaker.intern_impl(&item, true);
-    let referrer = leaker.result().finish().unwrap();
+    let mut result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     assert_eq!(
         referrer.iter().map(|t| string(&t)).collect::<Vec<_>>(),
         [":: ext :: S < T >"]
     );
     let mut copy = Item::Impl(item);
-    referrer
-        .allow_ambiguous_crate_name(false)
+    result.allow_ambiguous_crate_name(false);
+    result
+        .finish()
+        .unwrap()
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
         .visit_item_mut(&mut copy);
     let copy = match copy {
@@ -2181,10 +2187,11 @@ fn f14_copy(item: &ItemImpl, strict: bool) -> std::result::Result<ItemImpl, Vec<
     config.allow_path(parse_quote!(::p));
     let mut leaker = Leaker::from_config(config);
     let context = leaker.intern_impl(item, true);
-    let mut referrer = leaker.result().finish()?;
+    let mut result = leaker.result();
     if strict {
-        referrer = referrer.allow_ambiguous_crate_name(false);
+        result.allow_ambiguous_crate_name(false);
     }
+    let referrer = result.finish()?;
     let mut copy = Item::Impl(item.clone());
     referrer
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
@@ -3133,10 +3140,11 @@ fn f18_strict_referrer_keeps_the_optional_type_that_holds_a_method_lifetime() {
     let copy_of = |config: LeakerConfig, strict: bool| {
         let mut leaker = Leaker::from_config(config);
         let context = leaker.intern_trait(&item, true);
-        let mut referrer = leaker.result().finish().unwrap();
+        let mut result = leaker.result();
         if strict {
-            referrer = referrer.allow_ambiguous_crate_name(false);
+            result.allow_ambiguous_crate_name(false);
         }
+        let referrer = result.finish().unwrap();
         let mut copy = item.clone();
         referrer
             .visitor(context, |_, ix| parse_quote!(P<#ix>))
@@ -3295,11 +3303,11 @@ fn f18_the_optional_entries_that_hold_a_method_lifetime_are_copied_as_written() 
         let what = string(item);
         let mut leaker = new_leaker();
         let context = intern(&mut leaker, item);
-        let referrer = leaker
-            .result()
+        let mut result = leaker.result();
+        result.allow_ambiguous_crate_name(false);
+        let referrer = result
             .finish()
-            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", what, joined_messages(&e)))
-            .allow_ambiguous_crate_name(false);
+            .unwrap_or_else(|e| panic!("`{}` is rejected: {}", what, joined_messages(&e)));
         let entries: Vec<String> = (0..referrer.iter().count())
             .filter(|&ix| !referrer.must(ix))
             .map(|ix| {
@@ -7604,13 +7612,13 @@ fn nested_copy_recovering(
                 .0
         }
     };
-    let result = leaker.result();
+    let mut result = leaker.result();
+    result.allow_ambiguous_crate_name(!strict);
     let referrer = if recover {
         result.into_referrer()
     } else {
         result.finish().unwrap()
-    }
-    .allow_ambiguous_crate_name(!strict);
+    };
     let (mut visitor, calls): (Box<dyn VisitMut>, NestedCalls) = if nested {
         let (visitor, calls) = nested_visitor(&referrer, context);
         (Box::new(visitor), calls)
@@ -9931,13 +9939,18 @@ fn values_leaker() -> Leaker {
     Leaker::from_config(values_config())
 }
 
-/// Analyzes the trait `source` with the option, and returns its Referrer and its context.
-fn f40_trait(source: &str) -> (ItemTrait, Referrer, ContextId) {
+/// Analyzes the trait `source` with the option, and returns its result and its context.
+fn f40_result(source: &str) -> (ItemTrait, LeakerResult, ContextId) {
     let item: ItemTrait = parse_str(source).unwrap_or_else(|e| panic!("{}: {}", source, e));
     let mut leaker = values_leaker();
     let context = leaker.intern_trait(&item, true);
-    let referrer = leaker
-        .result()
+    (item, leaker.result(), context)
+}
+
+/// Analyzes the trait `source` with the option, and returns its Referrer and its context.
+fn f40_trait(source: &str) -> (ItemTrait, Referrer, ContextId) {
+    let (item, result, context) = f40_result(source);
+    let referrer = result
         .finish()
         .unwrap_or_else(|e| panic!("{}: {}", source, joined_messages(&e)));
     (item, referrer, context)
@@ -10235,7 +10248,8 @@ fn f40_every_type_position_of_a_value_is_replaced() {
 fn f40_an_absolute_type_of_a_value_is_an_optional_entry() {
     let source =
         "trait Tr { fn f(&self) { let _: ::p::Wrap<inner::Local> = ::core::unimplemented!(); } }";
-    let (item, referrer, context) = f40_trait(source);
+    let (item, result, context) = f40_result(source);
+    let referrer = result.clone().finish().unwrap();
     assert_eq!(
         referrer
             .iter()
@@ -10254,7 +10268,9 @@ fn f40_an_absolute_type_of_a_value_is_an_optional_entry() {
         }
     );
     assert_eq!(trusting, string(&expected));
-    let strict = referrer.allow_ambiguous_crate_name(false);
+    let mut strict = result;
+    strict.allow_ambiguous_crate_name(false);
+    let strict = strict.finish().unwrap();
     let expected: ItemTrait = parse_quote!(
         trait Tr {
             fn f(&self) {
@@ -11480,7 +11496,7 @@ fn f43_the_entry_inside_the_part_is_not_replaced() {
     let (result, context) = f43_analyze(std_config(), &[], &nested);
     assert_eq!(result.errors().len(), 1);
     assert_eq!(result.errors()[0].reason, Reason::UnnameableSelf);
-    let referrer = result.into_referrer();
+    let referrer = result.clone().into_referrer();
     assert_eq!(
         parts_of(&referrer),
         ["type (:: p :: W < 'a , T , dyn RelTr >) unwritable"]
@@ -11492,7 +11508,9 @@ fn f43_the_entry_inside_the_part_is_not_replaced() {
         (false, format!(":: p :: Bare < P < {}usize > >", object)),
         (true, format!("P < {}usize >", bare)),
     ] {
-        let referrer = referrer.clone().allow_ambiguous_crate_name(!strict);
+        let mut result = result.clone();
+        result.allow_ambiguous_crate_name(!strict);
+        let referrer = result.into_referrer();
         let expected = format!(
             "trait Tr < T : AsRef < Self > > {{ fn direct (& self ,) ; fn nested () {{ impl < 'a > :: p :: W for P < {}usize > {{ fn f (& self , x : :: p :: W < 'a , T , dyn RelTr >) {{ }} fn g (& self , y : {}) {{ }} }} }} }}",
             x, g
