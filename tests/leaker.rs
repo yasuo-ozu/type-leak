@@ -129,8 +129,8 @@ fn entries_of_a_field(leaker: Leaker, ty: &str) -> usize {
 /// The docs of `LeakerConfig`: `allow_primitive()` allows the primitive types, and
 /// `allow_prelude()` the names of the standard prelude: a relative path with such a name is not
 /// leaked, while `Leaker::new()` allows no path and leaks it. Audit mutants `cfg_primitive_f64`,
-/// `cfg_primitive_f32`, `cfg_primitive_i128`, `cfg_prelude_drop`, `cfg_prelude_fromiter`,
-/// `cfg_prelude_toowned` and `cfg_prelude_ord`.
+/// `cfg_primitive_f32`, `cfg_primitive_i128`, `cfg_prelude_drop`, `cfg_prelude_toowned` and
+/// `cfg_prelude_ord`.
 #[test]
 fn test_config_allows_the_documented_names() {
     let primitives = [
@@ -165,7 +165,12 @@ fn test_config_allows_the_documented_names() {
         "Iterator",
         "IntoIterator",
         "Extend",
-        "FromIterator",
+        "DoubleEndedIterator",
+        "ExactSizeIterator",
+        "Some",
+        "None",
+        "Ok",
+        "Err",
         "ToOwned",
         "ToString",
     ];

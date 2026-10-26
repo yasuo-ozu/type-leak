@@ -347,7 +347,7 @@ fn reason_self_in_default() {
     assert_eq!(items[0].notes[0].0.to_string(), "Self");
     assert_eq!(
         items[0].message,
-        "`Wrap < Self >` is in the default of a parameter, and names `Self`"
+        "`Wrap<Self>` is in the default of a parameter, and names `Self`"
     );
 }
 

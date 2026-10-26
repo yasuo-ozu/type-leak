@@ -329,3 +329,156 @@ fn an_accepted_cause_is_the_same_whatever_its_spans() {
         1
     );
 }
+
+/// The line and the column where each token of `tokens` starts and ends, the groups included.
+fn token_places(tokens: proc_macro2::TokenStream) -> Vec<(String, (usize, usize), (usize, usize))> {
+    use proc_macro2::TokenTree;
+    let mut places = Vec::new();
+    for tree in tokens {
+        let span = tree.span();
+        places.push((
+            tree.to_string(),
+            (span.start().line, span.start().column),
+            (span.end().line, span.end().column),
+        ));
+        if let TokenTree::Group(group) = tree {
+            places.extend(token_places(group.stream()));
+        }
+    }
+    places
+}
+
+/// Asserts that every token of `tokens` is in `source`, on its first line, and spans some of it. A
+/// token of `Span::call_site()` is not: it is the empty span at the start of the first line here,
+/// and the whole attribute in a proc macro.
+fn assert_in_source(tokens: proc_macro2::TokenStream, source: &str) {
+    for (token, start, end) in token_places(tokens) {
+        assert!(
+            start.0 == 1 && end.0 == 1 && start.1 < end.1 && end.1 <= source.chars().count(),
+            "`{}` at {:?}..{:?} is not in {:?}",
+            token,
+            start,
+            end,
+            source
+        );
+    }
+}
+
+/// The error of the first macro cause of the item `source`, with the macro `two!()` in an array
+/// length. `u8` is allowed, so `two` is the first error.
+fn macro_error(source: &str) -> ErrorItem {
+    let item: ItemStruct = parse_str(source).unwrap();
+    let mut config = LeakerConfig::new();
+    config.allow_primitive();
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_struct(&item, true);
+    let result = leaker.result();
+    assert_eq!(result.errors().len(), 1, "{}", messages(result.errors()));
+    result.errors()[0].clone()
+}
+
+/// The `!` of a macro cause has the span of the last name of its path (the call site before), so
+/// every token of the cause is in the item and the error is reported there, not at the attribute.
+#[test]
+fn the_bang_of_a_macro_cause_is_at_the_name_of_the_macro() {
+    let source = "struct S([u8; two!()]);";
+    let error = macro_error(source);
+    assert!(matches!(error.cause, Cause::Macro(_)));
+    let tokens = error.cause.to_token_stream();
+    assert_in_source(tokens.clone(), source);
+    // `two` and the `!` have the span of `two`.
+    let places = token_places(tokens);
+    assert_eq!(places.len(), 2);
+    assert_eq!(places[0].0, "two");
+    assert_eq!(places[1].0, "!");
+    assert_eq!(places[0].1, places[1].1);
+    assert_eq!(places[0].2, places[1].2);
+    assert_span_at(error.span(), source, "two", 0);
+    // A path of several segments: the last name.
+    let source = "struct S([u8; p::m::two!()]);";
+    let error = macro_error(source);
+    assert_in_source(error.cause.to_token_stream(), source);
+    let places = token_places(error.cause.to_token_stream());
+    assert_eq!(places.last().unwrap().0, "!");
+    let (start, end) = location_of(source, "two", 0);
+    assert_eq!(
+        places.last().unwrap().1,
+        (start.line, start.column),
+        "{:?}",
+        places
+    );
+    assert_eq!(places.last().unwrap().2, (end.line, end.column));
+    assert_eq!(error.span().end(), end);
+    assert_eq!(error.span().start(), location_of(source, "p::m::two", 0).0);
+}
+
+/// Every way to report the error of a macro cause is at the name of the macro: `span()`,
+/// `syn::Error` (`From` and `to_syn_error()`), `to_compile_error()`, the notes and the help.
+#[test]
+fn an_error_of_a_macro_cause_is_reported_at_the_name_of_the_macro() {
+    let source = "struct S([u8; two!()]);";
+    let error = macro_error(source);
+    let (start, end) = location_of(source, "two", 0);
+    // `ErrorItem::span()`.
+    assert_eq!((error.span().start(), error.span().end()), (start, end));
+    // `From<ErrorItem> for syn::Error`, and `to_syn_error()`.
+    let converted: syn::Error = error.clone().into();
+    assert_eq!((converted.span().start(), converted.span().end()), (start, end));
+    let combined = to_syn_error(std::slice::from_ref(&error));
+    assert_eq!((combined.span().start(), combined.span().end()), (start, end));
+    // `compile_error!` of `to_compile_error()`: every token of it is in the source.
+    assert_in_source(error.to_compile_error(), source);
+    // The note is at the call (`two!()`) and the help at the name of the macro.
+    assert_eq!(error.notes.len(), 1);
+    assert_in_source(error.notes[0].0.clone(), source);
+    assert_span_at(error.notes[0].0.span(), source, "two!()", 0);
+    let (at, _) = error.help.as_ref().unwrap();
+    assert_in_source(at.clone(), source);
+    assert_span_at(at.span(), source, "two", 0);
+    // Written for another macro to read, and read back: the same places.
+    let read = parse_items(error.to_token_stream());
+    assert_eq!(read.len(), 1);
+    assert_span_at(read[0].span(), source, "two", 0);
+    assert_in_source(read[0].cause.to_token_stream(), source);
+    assert_eq!(read[0].cause, error.cause);
+}
+
+/// The macro cause of a value (`check_values()`), and of a mention of `Self` that has no meaning
+/// (`Self::m!()`), has no token at the call site either.
+#[test]
+fn a_macro_cause_of_a_value_and_of_self_is_in_the_item() {
+    let source = "trait Tr {\n    fn f(&self) -> u8 {\n        two!() + 1\n    }\n}";
+    let item: ItemTrait = parse_str(source).unwrap();
+    let mut config = LeakerConfig::new();
+    config.allow_primitive().check_values();
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let items = result.errors();
+    assert_eq!(items.len(), 1, "{}", messages(items));
+    assert!(matches!(items[0].cause, Cause::Macro(_)));
+    assert_span_at(items[0].span(), source, "two", 0);
+    for (token, start, end) in token_places(items[0].cause.to_token_stream()) {
+        assert_eq!((start.0, end.0), (3, 3), "{}", token);
+    }
+    // `Self` where a module gives it no meaning, in the path of a macro.
+    let source = "Wrap<[u8; Self::two!()]>";
+    let ty: Type = parse_str(source).unwrap();
+    let mut leaker = Leaker::new();
+    leaker.enter_mod("m", [], |view| view.visit_type(&ty));
+    let result = leaker.result();
+    let selfs: Vec<&ErrorItem> = result
+        .errors()
+        .iter()
+        .filter(|item| item.reason == Reason::SelfWithoutMeaning)
+        .collect();
+    assert!(!selfs.is_empty(), "{}", messages(result.errors()));
+    assert!(selfs.iter().any(|item| matches!(item.cause, Cause::Macro(_))));
+    for item in selfs {
+        assert_in_source(item.cause.to_token_stream(), source);
+        assert_in_source(item.to_compile_error(), source);
+        for (at, _) in item.notes.iter().chain(item.help.iter()) {
+            assert_in_source(at.clone(), source);
+        }
+    }
+}

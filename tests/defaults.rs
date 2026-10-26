@@ -193,7 +193,7 @@ fn test_default_cannot_depend_on_self() {
     assert_eq!(err.len(), 1);
     assert_eq!(
         err[0].message,
-        "`Rel < Self >` is in the default of a parameter, and names `Self`"
+        "`Rel<Self>` is in the default of a parameter, and names `Self`"
     );
     assert_eq!(
         err[0].note(),

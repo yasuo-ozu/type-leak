@@ -30,8 +30,12 @@
 //! The same shapes are copied across crates in `tests/crates/leaker` (`kinds`, the ids 9071 and
 //! after), where the Repeater impls and the copies are compiled: `tests/cross_crate.rs`.
 //!
-//! The last tests are the findings 12 and 14: a bare `?Sized` and the values of an item (a type in
-//! a value is carried since F40 of `tests/findings.rs`, a path that is no type is rejected).
+//! Then come the findings 12 and 14: a bare `?Sized` and the values of an item (a type in a value
+//! is carried since F40 of `tests/findings.rs`, a path that is no type is rejected).
+//!
+//! The last tests are the four issues that announce found when it ported to the error-recovery
+//! branch (1 to 4 of `ISSUES-from-announce.md`, named `issue_one_`, ..): what an error shows to the
+//! user, not the entries.
 
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -983,4 +987,338 @@ fn fourteen_an_array_length_is_always_read() {
             ["[u8 ; :: core :: mem :: size_of :: < inner :: Local > ()]"]
         );
     }
+}
+
+// ── issues of the error-recovery branch ──────────────────────────────────────────────────────
+
+/// Issue 1: the `!` of `Cause::Macro` was written with the span of the call site, so `new_spanned()`
+/// on `two!` in `[u8; two!()]` spanned from the path to the attribute of the proc macro. It has the
+/// span of the last name of the path now, so every token of a cause is in the item. The spans are
+/// tested in `tests/crates/spans/tests/spans.rs` (`proc-macro2` needs `span-locations` for that;
+/// `tests/spans.rs` runs them). Here: the cause is still `two !`, and it is read back as written.
+#[test]
+fn issue_one_a_macro_cause_is_written_with_its_bang() {
+    let item: ItemStruct = parse_quote!(
+        struct S([u8; two!()]);
+    );
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_struct(&item, true);
+    let result = leaker.result();
+    let errors = result.errors();
+    assert_eq!(errors.len(), 1, "{}", messages(errors));
+    assert_eq!(errors[0].message, "use absolute path: 'two'");
+    assert!(matches!(&errors[0].cause, Cause::Macro(path) if text(path) == "two"));
+    assert_eq!(text(&errors[0].cause), "two !");
+    // Written for another macro and read back.
+    let read: ErrorItem = parse2(errors[0].to_token_stream()).unwrap();
+    assert_eq!(read.cause, errors[0].cause);
+    assert_eq!(text(&read.cause), "two !");
+}
+
+/// Issue 2: `struct S<T = ty!(Self)>(T);` had the help "write the default without `Self`: name the
+/// type instead of `Self` in `ty ! (Self)`", so a tool that prints "message: help" on one line had
+/// two colons, and the headline and the help printed the macro call with the spaces of a token
+/// stream. The help is "name the type instead of `Self` in `ty!(Self)`" now, and `tidy` joins a
+/// macro call.
+#[test]
+fn issue_two_the_help_of_a_default_that_names_self_has_no_colon_of_its_own() {
+    let item: ItemStruct = parse_quote!(
+        struct S<T = ty!(Self)>(T);
+    );
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_struct(&item, true);
+    let result = leaker.result();
+    let errors = result.errors();
+    assert_eq!(errors.len(), 1, "{}", messages(errors));
+    assert_eq!(errors[0].reason, Reason::SelfInDefault);
+    assert_eq!(
+        errors[0].message,
+        "`ty!(Self)` is in the default of a parameter, and names `Self`"
+    );
+    assert_eq!(
+        errors[0].help_text(),
+        Some("name the type instead of `Self` in `ty!(Self)`")
+    );
+    // On one line: one colon.
+    let line = format!("{}: {}", errors[0].message, errors[0].help_text().unwrap());
+    assert_eq!(line.matches(':').count(), 1, "{}", line);
+}
+
+/// Issue 2: the macro call is joined (`m!(..)`, `m![..]`, `m!{..}`) after a name, in every message
+/// that prints tokens as one writes them, and an unrelated `!` keeps its space.
+#[test]
+fn issue_two_a_macro_call_is_printed_as_one_writes_it() {
+    for (default, shown) in [
+        ("ty!(Self)", "ty!(Self)"),
+        ("ty![Self]", "ty![Self]"),
+        ("ty!{Self}", "ty!{ Self }"),
+        ("::p::ty!(Self)", "::p::ty!(Self)"),
+    ] {
+        let item: ItemStruct = parse_str(&format!("struct S<T = {}>(T);", default)).unwrap();
+        let mut leaker = Leaker::from_config(config());
+        leaker.intern_struct(&item, true);
+        let result = leaker.result();
+        let errors = result.errors();
+        assert_eq!(errors.len(), 1, "{}: {}", default, messages(errors));
+        assert_eq!(
+            errors[0].message,
+            format!(
+                "`{}` is in the default of a parameter, and names `Self`",
+                shown
+            )
+        );
+        assert_eq!(
+            errors[0].help_text(),
+            Some(format!("name the type instead of `Self` in `{}`", shown).as_str())
+        );
+    }
+    // In the message of a value that cannot be read.
+    let mut config = values_config();
+    config.allow_path(parse_quote!(::p));
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(&self) {
+                ::p::mac!(a b c);
+            }
+        }
+    );
+    let mut leaker = Leaker::from_config(config.clone());
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    assert_eq!(
+        result.errors()[0].message,
+        "cannot analyze `::p::mac!(a b c)` in the default body of `f`"
+    );
+    // The `!` of `macro_rules!` and a negation is no macro call.
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(&self) {
+                macro_rules! m {
+                    () => {
+                        !(a)
+                    };
+                }
+            }
+        }
+    );
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let message = &result.errors()[0].message;
+    assert!(message.contains("macro_rules ! m"), "{}", message);
+}
+
+/// The words of `help` outside the code in backticks.
+fn prose(help: &str) -> String {
+    help.split('`').step_by(2).collect()
+}
+
+/// Issue 2: no help is a lead clause, a colon and an instruction. This covers the helps of the
+/// table of `tests/help.rs` (`every_kind_of_error_has_a_help` checks it for every row) and those of
+/// the examples here: the headline and the help join with one colon.
+#[test]
+fn issue_two_a_help_has_no_colon_in_its_words() {
+    let examples = [
+        "struct S<T = ty!(Self)>(T);",
+        "struct S<T = Rel<Self>>(T);",
+        "struct S<const N: usize = { Rel::N }>;",
+        "struct S<T: ::p::Tr<Self> = ::p::W<Self, LEN>>(T);",
+    ];
+    let mut checked = 0;
+    for source in examples {
+        let item: ItemStruct = parse_str(source).unwrap();
+        let mut leaker = Leaker::from_config(config());
+        leaker.intern_struct(&item, true);
+        let result = leaker.result();
+        for error in result.errors() {
+            let help = error.help_text().unwrap();
+            assert!(!prose(help).contains(':'), "{}: {}", source, help);
+            checked += 1;
+        }
+    }
+    assert!(checked >= 3, "{}", checked);
+}
+
+/// Issue 3: `allow_prelude()` did not accept `Some`, `None`, `Ok`, `Err`, `DoubleEndedIterator` and
+/// `ExactSizeIterator`, which every edition has in its prelude, although the help knew some of
+/// them; `FromIterator`, which only the 2021 edition has, was accepted. It accepts the names of the
+/// prelude of every edition (2015 to 2024, rustc 1.56) now.
+#[test]
+fn issue_three_allow_prelude_accepts_the_names_of_every_edition() {
+    let item: ItemTrait = parse_quote!(
+        trait T {
+            const X: Option<u8> = None;
+            fn f(&self) -> Result<u8, ()> {
+                Ok(0)
+            }
+            fn g<I: DoubleEndedIterator + ExactSizeIterator>(i: I);
+            fn h(&self) {
+                drop(1)
+            }
+            fn i(&self) -> Option<u8> {
+                match Some(1u8) {
+                    Some(v) => Some(v),
+                    None => None,
+                }
+            }
+            fn j(&self) -> Result<u8, u8> {
+                Err(1)
+            }
+        }
+    );
+    let mut leaker = Leaker::from_config(values_config());
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    assert_eq!(messages(result.errors()), "");
+    // Without `allow_prelude()`, they are relative paths.
+    let mut config = LeakerConfig::new();
+    config.allow_primitive().check_values();
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let shown = messages(result.errors());
+    for name in [
+        "None",
+        "Ok",
+        "DoubleEndedIterator",
+        "ExactSizeIterator",
+        "drop",
+        "Some",
+        "Err",
+    ] {
+        assert!(
+            shown.contains(&format!("use absolute path: '{}", name)),
+            "{}: {}",
+            name,
+            shown
+        );
+    }
+}
+
+/// Issue 3: the names that a later prelude added are refused, with the absolute path as the help:
+/// 2021 (`TryFrom`, `TryInto`, `FromIterator`), 2024 (`Future`, `IntoFuture`), rustc 1.80
+/// (`size_of`, `size_of_val`, `align_of`, `align_of_val`).
+#[test]
+fn issue_three_the_names_of_a_later_prelude_are_refused_with_their_absolute_paths() {
+    for (name, path) in [
+        ("TryFrom", "::core::convert::TryFrom"),
+        ("TryInto", "::core::convert::TryInto"),
+        ("FromIterator", "::core::iter::FromIterator"),
+        ("Future", "::core::future::Future"),
+        ("IntoFuture", "::core::future::IntoFuture"),
+        ("size_of", "::core::mem::size_of"),
+        ("size_of_val", "::core::mem::size_of_val"),
+        ("align_of", "::core::mem::align_of"),
+        ("align_of_val", "::core::mem::align_of_val"),
+    ] {
+        let item: ItemTrait = parse_str(&format!("trait Tr: {} {{}}", name)).unwrap();
+        let mut leaker = Leaker::from_config(config());
+        leaker.intern_trait(&item, true);
+        let result = leaker.result();
+        let errors = result.errors();
+        assert_eq!(errors.len(), 1, "{}", name);
+        assert_eq!(errors[0].message, format!("use absolute path: '{}'", name));
+        assert_eq!(
+            errors[0].help_text(),
+            Some(format!("use `{}` instead of `{}`", path, name).as_str())
+        );
+    }
+}
+
+/// Issue 3: the help for the traits `DoubleEndedIterator` and `ExactSizeIterator` was "e.g.
+/// `::my_crate::DoubleEndedIterator`".
+#[test]
+fn issue_three_the_help_knows_the_traits_of_the_prelude_it_allows() {
+    for (name, path) in [
+        ("DoubleEndedIterator", "::core::iter::DoubleEndedIterator"),
+        ("ExactSizeIterator", "::core::iter::ExactSizeIterator"),
+    ] {
+        let item: ItemTrait = parse_str(&format!("trait Tr: {} {{}}", name)).unwrap();
+        let mut leaker = Leaker::new();
+        leaker.intern_trait(&item, true);
+        let result = leaker.result();
+        assert_eq!(
+            result.errors()[0].help_text(),
+            Some(format!("use `{}` instead of `{}`", path, name).as_str())
+        );
+    }
+}
+
+/// Issue 4: the notes of an error are the note of the reason, the causes that stop the type from
+/// being leaked as a whole, and the other causes that cannot be leaked either. A relative path that
+/// would be leaked once the cause is fixed is in `paths`, not in the notes: the doc of `notes` said
+/// that the notes include the other paths "which would be reported once the first is fixed". For
+/// `struct S<T: Base<Local>>(T);` there is no note, and `Local` becomes an entry when `Base` is
+/// absolute.
+#[test]
+fn issue_four_a_path_that_would_be_leaked_is_in_the_paths_and_not_in_the_notes() {
+    let paths = |item: &ErrorItem| -> Vec<String> { item.paths.iter().map(text).collect() };
+    let item: ItemStruct = parse_quote!(
+        struct S<T: Base<Local>>(T);
+    );
+    let mut crate_only = LeakerConfig::new();
+    crate_only.allow_crate();
+    let mut leaker = Leaker::from_config(crate_only.clone());
+    leaker.intern_struct(&item, true);
+    let result = leaker.result();
+    let errors = result.errors();
+    assert_eq!(errors.len(), 1, "{}", messages(errors));
+    assert_eq!(text(&errors[0].cause), "Base < Local >");
+    assert_eq!(errors[0].reason, Reason::RelativePath);
+    assert!(errors[0].notes.is_empty());
+    assert_eq!(paths(&errors[0]), ["Base", "Local"]);
+    // With `Base` absolute, `Local` is an entry and no error.
+    let item: ItemStruct = parse_quote!(
+        struct S<T: ::p::Base<Local>>(T);
+    );
+    let mut leaker = Leaker::from_config(crate_only);
+    leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(referrer.iter().map(text).collect::<Vec<_>>(), ["Local"]);
+    // A cause that cannot be leaked either is a note: `RelA` and `RelB<'_>` in a `dyn` that the
+    // lifetime keeps from being leaked as a whole. The paths have them all.
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(&self, x: Box<dyn RelA + RelB<'_>>);
+        }
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let errors = result.errors();
+    assert_eq!(errors.len(), 1, "{}", messages(errors));
+    let notes: Vec<&str> = errors[0]
+        .notes
+        .iter()
+        .map(|(_, note)| note.as_str())
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            "it cannot be leaked as a whole because of `'_`",
+            "`RelA` also depends on the type context",
+            "`RelB < '_ >` also depends on the type context",
+        ]
+    );
+    assert_eq!(paths(&errors[0]), ["Box", "RelA", "RelB"]);
+    // The note of the reason comes first, then the causes.
+    let item: ItemStruct = parse_quote!(
+        struct S<T = Rel<Self>>(T);
+    );
+    let mut leaker = Leaker::from_config(config());
+    leaker.intern_struct(&item, true);
+    let result = leaker.result();
+    let notes: Vec<&str> = result.errors()[0]
+        .notes
+        .iter()
+        .map(|(_, note)| note.as_str())
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            "a default of a parameter cannot depend on `Self`",
+            "it cannot be leaked as a whole because of `Rel < Self >`"
+        ]
+    );
+    assert_eq!(paths(&result.errors()[0]), ["Rel"]);
 }

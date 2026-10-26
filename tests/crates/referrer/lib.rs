@@ -226,6 +226,8 @@ pub mod kinds {
     // type in a value that this crate cannot name is replaced.
     type_leak_test_leaker::__tl_prop_9141!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9142!(path = ::type_leak_test_leaker::kinds);
+    // The names of the prelude of every edition in the values and the bounds (issue 3).
+    type_leak_test_leaker::__tl_prop_9208!(path = ::type_leak_test_leaker::kinds);
     // The scopes that share names: every entry has the generics of its own scope.
     type_leak_test_leaker::__tl_prop_9071!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9072!(path = ::type_leak_test_leaker::kinds);

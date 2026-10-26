@@ -208,8 +208,7 @@ const ROWS: &[Row] = &[
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
             "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
-             const), or write the default without `Self`: name the type instead of `Self` in \
-             `::p::W<Self, LEN>`",
+             const), or name the type instead of `Self` in `::p::W<Self, LEN>`",
         )],
     },
     Row {
@@ -387,8 +386,8 @@ const ROWS: &[Row] = &[
             errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
-            "`Wrap < Self >` is in the default of a parameter, and names `Self`",
-            "write the default without `Self`: name the type instead of `Self` in `Wrap<Self>`",
+            "`Wrap<Self>` is in the default of a parameter, and names `Self`",
+            "name the type instead of `Self` in `Wrap<Self>`",
         )],
     },
     Row {
@@ -680,6 +679,14 @@ fn every_kind_of_error_has_a_help() {
             // It starts like a sentence of rustc's help: in lower case, and with no full stop.
             assert!(
                 help.starts_with(|c: char| c.is_lowercase()) && !help.ends_with('.'),
+                "{}: {}",
+                row.kind,
+                help
+            );
+            // It has no colon of its own outside the code in backticks (a lead clause, a colon and
+            // the instruction): a tool that prints "message: help" on one line would show two.
+            assert!(
+                help.split('`').step_by(2).all(|words| !words.contains(':')),
                 "{}: {}",
                 row.kind,
                 help

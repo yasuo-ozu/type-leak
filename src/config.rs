@@ -78,8 +78,8 @@ impl LeakerConfig {
     /// **A path that is not a type is rejected** unless it means the same wherever it is written:
     /// it is absolute or starts with `$crate`, it is allowed ([`allow_path()`](LeakerConfig::allow_path),
     /// also the names of [`allow_primitive()`](LeakerConfig::allow_primitive) and
-    /// [`allow_prelude()`](LeakerConfig::allow_prelude): `Some` and `None` are not among
-    /// them, write `::core::option::Option::Some`), it starts with a generic or `Self` in scope,
+    /// [`allow_prelude()`](LeakerConfig::allow_prelude): `Some`, `None`, `Ok`, `Err` and `drop` are
+    /// among them, `TryFrom` is not), it starts with a generic or `Self` in scope,
     /// or with a name that the value itself declares (a `let` binding, a closure or function
     /// parameter, a `match`, `if let` or `for` pattern, an item or a `use` in a block). The name
     /// of the item that holds the value is relative like any other. (A name in a pattern is a
@@ -290,6 +290,12 @@ impl LeakerConfig {
     ///
     /// Without it, a relative `Clone` in `trait Tr: Clone` is an error, and `Vec<T>` is leaked
     /// whole. You promise that the copy does not shadow the names.
+    ///
+    /// The names are those of the prelude of every edition, as of Rust 1.56 (`Some`, `None`, `Ok`,
+    /// `Err`, `drop`, `DoubleEndedIterator`, ...). A name that a later prelude added is left out,
+    /// as the copy may be in an earlier edition or built by an older rustc: `TryFrom`, `TryInto`,
+    /// `FromIterator`, `Future`, `IntoFuture`, `size_of`, `size_of_val`, `align_of` and
+    /// `align_of_val`. The help gives their absolute paths.
     ///
     /// `Sized` is one of them, as a bound (`where Self: Sized`): a trait named `Sized` in the copy
     /// would be the one required. The relaxed bound `?Sized` needs no option, since rustc accepts

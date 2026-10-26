@@ -297,33 +297,71 @@ fn the_name_of_the_item_itself_is_relative() {
     );
 }
 
+/// `Some`, `None`, `Ok` and `Err` are in the prelude of every edition, as `drop` is: `allow_prelude()`
+/// allows them in an expression and a pattern, and without it they are relative paths.
 #[test]
-fn the_names_of_the_2021_prelude_are_relative_in_a_value() {
-    // Like in a type: a crate of the 2018 edition has no `Some` (see `allow_prelude`).
-    let got = body_messages("let _ = Some(p);");
-    assert_eq!(got, rejected("Some"));
-    let item: ItemTrait = parse_quote!(
-        trait Tr {
-            fn f(&self) {
-                let _ = Some(1u8);
-            }
-        }
-    );
-    let mut leaker = Leaker::from_config(config());
-    leaker.intern_trait(&item, true);
-    let result = leaker.result();
-    let err = result.errors();
-    assert_eq!(
-        err[0].help_text(),
-        Some("use `::core::option::Option::Some` instead of `Some`")
-    );
-    // An allowed path is accepted.
-    let mut config = config();
-    config.allow_path(parse_quote!(Some));
-    let mut leaker = Leaker::from_config(config);
-    leaker.intern_trait(&item, true);
-    let result = leaker.result();
-    assert!(result.finish().is_ok());
+fn the_variants_of_the_prelude_are_allowed_in_a_value() {
+    for body in [
+        "let _ = Some(p);",
+        "let _ = None::<u8>;",
+        "let _: Result<u8, u8> = Ok(p);",
+        "let _ = Err::<u8, u8>(p);",
+        "match Some(p) { Some(v) => { let _ = v; } None => {} }",
+        "match Ok::<u8, u8>(p) { Ok(v) | Err(v) => { let _ = v; } }",
+        "if let Some(x) = Some(p) { let _ = x; } else { drop(p); }",
+        "let _ = Option::Some(p);",
+    ] {
+        assert_eq!(body_messages(body), Vec::<String>::new(), "{}", body);
+    }
+    let mut none = LeakerConfig::new();
+    none.check_values();
+    for (path, body) in [
+        ("Some", "let _ = Some(1u8);"),
+        ("None :: < u8 >", "let _ = None::<u8>;"),
+        ("Ok :: < u8 , u8 >", "let _ = Ok::<u8, u8>(1);"),
+        ("Err :: < u8 , u8 >", "let _ = Err::<u8, u8>(1);"),
+    ] {
+        let source = format!("trait Tr {{ fn f(&self) {{ {} }} }}", body);
+        let got = messages_of(none.clone(), &source);
+        assert_eq!(got, rejected(path), "{}", body);
+    }
+}
+
+#[test]
+fn the_names_of_a_later_prelude_are_relative_in_a_value() {
+    // Like in a type: a crate of an earlier edition has no `TryFrom` (see `allow_prelude`), and
+    // `size_of` is in the prelude only since rustc 1.80.
+    for (body, path, first, absolute) in [
+        (
+            "let _: u32 = TryFrom::try_from(p).unwrap();",
+            "TryFrom :: try_from",
+            "TryFrom",
+            "::core::convert::TryFrom",
+        ),
+        (
+            "let _ = size_of::<u8>();",
+            "size_of :: < u8 >",
+            "size_of",
+            "::core::mem::size_of",
+        ),
+    ] {
+        assert_eq!(body_messages(body), rejected(path), "{}", body);
+        let item: ItemTrait =
+            parse_str(&format!("trait Tr {{ fn f(&self, p: u8) {{ {} }} }}", body)).unwrap();
+        let mut leaker = Leaker::from_config(config());
+        leaker.intern_trait(&item, true);
+        let result = leaker.result();
+        assert_eq!(
+            result.errors()[0].help_text(),
+            Some(format!("use `{}` instead of `{}`", absolute, first).as_str())
+        );
+        // An allowed path is accepted.
+        let mut config = config();
+        config.allow_path(parse_str(first).unwrap());
+        let mut leaker = Leaker::from_config(config);
+        leaker.intern_trait(&item, true);
+        assert!(leaker.result().finish().is_ok(), "{}", body);
+    }
 }
 
 #[test]
@@ -468,7 +506,7 @@ fn what_the_leaker_cannot_read_is_rejected() {
     for (body, headline) in [
         (
             "::p::mac!(a b c);",
-            "cannot analyze `::p::mac ! (a b c)` in the default body of `f`",
+            "cannot analyze `::p::mac!(a b c)` in the default body of `f`",
         ),
         (
             "macro_rules! m { () => {} }",

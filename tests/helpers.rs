@@ -1004,7 +1004,7 @@ fn display_uses_the_headline_of_the_cause() {
     assert_eq!(err[0].notes[0].0.to_string(), "Self");
     check(
         err,
-        "`Rel < Self >` is in the default of a parameter, and names `Self`",
+        "`Rel<Self>` is in the default of a parameter, and names `Self`",
     );
     // `Self` where a generic has a bound that names a `Self` which has no name here.
     let mut leaker = Leaker::new();

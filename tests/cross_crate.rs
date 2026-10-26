@@ -2273,3 +2273,41 @@ fn optional_entries_in_a_predicate_stay_as_written_beside_an_unrelated_error() {
     assert_eq!(errors[0][3..5], ["RelativePath", "Trait"]);
     assert_eq!(squash(errors[0][1]), "GenTr<Self::A0>");
 }
+
+/// Issue 3 of `tests/downstream_findings.rs`, fixture 9208: `None`, `Some`, `Ok` and `Err` in the
+/// values of a trait and `DoubleEndedIterator + ExactSizeIterator` in a bound are names of the
+/// prelude of every edition, so `allow_prelude()` accepts them (it rejected the trait before: the
+/// Referrer's crate had no `PreludeNamesCopy`, which also fails to build the test). The copy writes
+/// them as they are, replaces the relative type of the values, and computes what the original does.
+#[test]
+fn the_names_of_the_prelude_of_every_edition_are_accepted_in_a_trait() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::kinds as r;
+
+    assert_eq!(
+        reported(9208, __tl_report_9208!()),
+        ok("trait", 1, 7, 7),
+        "{}",
+        __tl_report_9208!()
+    );
+
+    struct Original;
+    impl l::PreludeNames for Original {}
+    struct Copy;
+    impl r::PreludeNamesCopy for Copy {}
+
+    assert_eq!(<Original as l::PreludeNames>::NOTHING, None);
+    assert_eq!(<Copy as r::PreludeNamesCopy>::NOTHING, None);
+    for n in [0u8, 1] {
+        let original = l::PreludeNames::pick(&Original, n);
+        assert_eq!(original.is_some(), n > 0);
+        assert_eq!(r::PreludeNamesCopy::pick(&Copy, n), original);
+        let original = l::PreludeNames::check(&Original, n);
+        assert_eq!(original.is_ok(), n > 0);
+        assert_eq!(r::PreludeNamesCopy::check(&Copy, n), original);
+    }
+    let items = [1u8, 2, 3];
+    assert_eq!(l::PreludeNames::count(&Original, items.iter()), 6);
+    assert_eq!(r::PreludeNamesCopy::count(&Copy, items.iter()), 6);
+}

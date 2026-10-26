@@ -5,7 +5,7 @@
 //! on ([recovery](crate::Leaker#errors-and-recovery)).
 
 use crate::analysis::{CheckResult, SelfMention};
-use crate::util::{or_list, without_crate_prefix};
+use crate::util::{or_list, without_crate_prefix, KNOWN_NAMES};
 use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use std::hash::{Hash, Hasher};
 use syn::ext::IdentExt;
@@ -56,8 +56,8 @@ pub enum Cause {
     /// An expression that cannot be leaked is one too (the closure of `[u8; { let c = |a: u8| a; 3
     /// }]`, `two!()` in `[u8; two!()]`); a path inside it is its own cause (`a` in the closure).
     Expr(Expr),
-    /// The path of a macro call, written with its `!` (`two!` in `[u8; two!()]`). A macro that is a
-    /// type is a [`Cause::Type`].
+    /// The path of a macro call, written with its `!` (`two!` in `[u8; two!()]`), which has the span
+    /// of the last name of the path. A macro that is a type is a [`Cause::Type`].
     Macro(Path),
     /// A lifetime: an elided one (`'_`), one of a method, one that no scope declares (`'a`).
     Lifetime(Lifetime),
@@ -202,7 +202,8 @@ impl Cause {
     }
 }
 
-/// Writes the syntax as it was written, with its spans. A [`Cause::Macro`] has its `!`.
+/// Writes the syntax as it was written, with its spans. A [`Cause::Macro`] has its `!`, at the span
+/// of the last name of its path, so that no token is at the call site.
 impl ToTokens for Cause {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         match self {
@@ -217,7 +218,14 @@ impl ToTokens for Cause {
                 path.path.to_tokens(tokens);
             }
             Cause::Expr(expr) => expr.to_tokens(tokens),
-            Cause::Macro(path) => tokens.extend(quote!(#path !)),
+            Cause::Macro(path) => {
+                path.to_tokens(tokens);
+                let span = path
+                    .segments
+                    .last()
+                    .map_or_else(Span::call_site, |seg| seg.ident.span());
+                token::Not(span).to_tokens(tokens);
+            }
             Cause::Lifetime(lifetime) => lifetime.to_tokens(tokens),
             Cause::Unreadable(unreadable) => unreadable.to_tokens(tokens),
         }
@@ -491,9 +499,13 @@ pub struct ErrorItem {
     /// What is wrong: `use absolute path: '..'` where the path is relative, else the headline of
     /// the reason ([`CheckResult::headline`]; "`Self` has no meaning here").
     pub message: String,
-    /// Why, each with the tokens it is about, the most useful first: the causes that stop the type
-    /// from being leaked as a whole, and the other paths in it that depend on the context, which
-    /// would be reported once the first is fixed.
+    /// Why, each with the tokens it is about, the most useful first: the note of the reason, if the
+    /// fault is not the path itself, the causes that stop the type from being leaked as a whole,
+    /// and the other causes in it that depend on the context and cannot be leaked either (`RelA` in
+    /// `Box<dyn RelA + RelB<'_>>`).
+    ///
+    /// A relative path that would be leaked once the cause is fixed is no note (`Local` in
+    /// `Base<Local>`): [`paths`](ErrorItem::paths) has every relative path of the cause.
     pub notes: Vec<(TokenStream, String)>,
     /// What to write instead, with the tokens it is about (for example "use `::std::vec::Vec`
     /// instead of `Vec`"). Every error has one.
@@ -876,10 +888,10 @@ fn prelude_help(path: &syn::Path) -> Option<String> {
         return None;
     }
     let name = path.segments.iter().next()?.ident.to_string();
-    ABSOLUTE_PATHS
+    KNOWN_NAMES
         .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(name, absolute)| format!("use `{}` instead of `{}`", absolute, name))
+        .find(|(n, _, _)| *n == name)
+        .map(|(name, absolute, _)| format!("use `{}` instead of `{}`", absolute, name))
 }
 
 /// The help for the path of `cause`: the absolute path of a prelude item, else how to write the
@@ -979,62 +991,3 @@ fn is_std_crate(path: &syn::Path) -> bool {
             .any(|name| seg.ident == name)
     })
 }
-
-/// Absolute paths of the standard prelude items and the primitive types.
-pub(crate) const ABSOLUTE_PATHS: &[(&str, &str)] = &[
-    ("Box", "::std::boxed::Box"),
-    ("String", "::std::string::String"),
-    ("Vec", "::std::vec::Vec"),
-    ("Option", "::core::option::Option"),
-    ("Result", "::core::result::Result"),
-    ("Copy", "::core::marker::Copy"),
-    ("Send", "::core::marker::Send"),
-    ("Sized", "::core::marker::Sized"),
-    ("Sync", "::core::marker::Sync"),
-    ("Unpin", "::core::marker::Unpin"),
-    ("Drop", "::core::ops::Drop"),
-    ("Fn", "::core::ops::Fn"),
-    ("FnMut", "::core::ops::FnMut"),
-    ("FnOnce", "::core::ops::FnOnce"),
-    ("Clone", "::core::clone::Clone"),
-    ("PartialEq", "::core::cmp::PartialEq"),
-    ("PartialOrd", "::core::cmp::PartialOrd"),
-    ("Eq", "::core::cmp::Eq"),
-    ("Ord", "::core::cmp::Ord"),
-    ("AsRef", "::core::convert::AsRef"),
-    ("AsMut", "::core::convert::AsMut"),
-    ("Into", "::core::convert::Into"),
-    ("From", "::core::convert::From"),
-    ("Default", "::core::default::Default"),
-    ("Iterator", "::core::iter::Iterator"),
-    ("IntoIterator", "::core::iter::IntoIterator"),
-    ("Extend", "::core::iter::Extend"),
-    ("FromIterator", "::core::iter::FromIterator"),
-    ("ToOwned", "::std::borrow::ToOwned"),
-    ("ToString", "::std::string::ToString"),
-    ("drop", "::core::mem::drop"),
-    // In the prelude of the 2021 edition.
-    ("TryFrom", "::core::convert::TryFrom"),
-    ("TryInto", "::core::convert::TryInto"),
-    ("Some", "::core::option::Option::Some"),
-    ("None", "::core::option::Option::None"),
-    ("Ok", "::core::result::Result::Ok"),
-    ("Err", "::core::result::Result::Err"),
-    ("bool", "::core::primitive::bool"),
-    ("char", "::core::primitive::char"),
-    ("str", "::core::primitive::str"),
-    ("u8", "::core::primitive::u8"),
-    ("u16", "::core::primitive::u16"),
-    ("u32", "::core::primitive::u32"),
-    ("u64", "::core::primitive::u64"),
-    ("u128", "::core::primitive::u128"),
-    ("usize", "::core::primitive::usize"),
-    ("i8", "::core::primitive::i8"),
-    ("i16", "::core::primitive::i16"),
-    ("i32", "::core::primitive::i32"),
-    ("i64", "::core::primitive::i64"),
-    ("i128", "::core::primitive::i128"),
-    ("isize", "::core::primitive::isize"),
-    ("f32", "::core::primitive::f32"),
-    ("f64", "::core::primitive::f64"),
-];
