@@ -26,8 +26,8 @@ use syn::*;
 ///     trait Tr<T> { fn f(&self) -> Wrap<T>; fn g(&self) -> Wrap2<Self>; }
 /// };
 /// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&tr, true).unwrap();
-/// let referrer = leaker.finish();
+/// leaker.intern_trait(&tr, true);
+/// let referrer = leaker.result().finish().unwrap();
 /// let wrap = referrer.iter().position(|ty| *ty == parse_quote!(Wrap<T>)).unwrap();
 /// let wrap2 = referrer.iter().position(|ty| *ty == parse_quote!(Wrap2<Self>)).unwrap();
 ///
@@ -86,8 +86,8 @@ pub enum ImplSelf<'a> {
 /// # use syn::*;
 /// let item: ItemMod = parse_quote!(mod m { mod inner { struct S { a: Outside } } });
 /// let mut leaker = Leaker::new();
-/// leaker.intern_mod(&item).unwrap();
-/// let referrer = leaker.finish();
+/// leaker.intern_mod(&item);
+/// let referrer = leaker.result().finish().unwrap();
 ///
 /// let param: Ident = parse_quote!(__S);
 /// let r = referrer.repeater_impl(0, ImplSelf::Param(&param)).unwrap();
@@ -150,8 +150,8 @@ pub struct RepeaterImpl {
 /// # use syn::*;
 /// let tr: ItemTrait = parse_quote!(trait Tr<'a, T: 'a> { fn f(&self, x: &'a Wrap<T>); });
 /// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&tr, true).unwrap();
-/// let referrer = leaker.finish();
+/// leaker.intern_trait(&tr, true);
+/// let referrer = leaker.result().finish().unwrap();
 ///
 /// // `impl<'a, T: 'a> Tr<'a, T> for ..` declares the generics: each is passed by its own name.
 /// let args = referrer.entry_args(0, &UseSite::identity()).unwrap();
@@ -217,8 +217,8 @@ impl UseSite {
     /// # use syn::*;
     /// let tr: ItemTrait = parse_quote!(trait Tr<'a> { fn f(&self, x: &'a Wrap<Self>); });
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true).unwrap();
-    /// let referrer = leaker.finish();
+    /// leaker.intern_trait(&tr, true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// // The entry `&'a Wrap<Self>` needs `Self: 'a`, which the arguments encode as `&'a Self`.
     /// let args = referrer.entry_args(0, &UseSite::identity()).unwrap();
     /// assert_eq!(args, parse_quote!((&'a (), &'a Self)));
@@ -255,8 +255,8 @@ impl Referrer {
     ///     trait Tr<'a, T: 'a, const N: usize> { fn f(&self, x: &'a Wrap<T, N>) -> Rel; }
     /// };
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true).unwrap();
-    /// let referrer = leaker.finish();
+    /// leaker.intern_trait(&tr, true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// let ix = referrer.iter().position(|ty| *ty == parse_quote!(&'a Wrap<T, N>)).unwrap();
     ///
     /// // In the scope of the trait, as in a default method: every generic by its own name.
@@ -287,8 +287,8 @@ impl Referrer {
     /// # use syn::*;
     /// let tr: ItemTrait = parse_quote! { trait Tr<const B: bool> { fn f(&self) -> Wrap<B>; } };
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true).unwrap();
-    /// let referrer = leaker.finish();
+    /// leaker.intern_trait(&tr, true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     /// let trait_args: Vec<GenericArgument> = vec![parse_quote!(true)];
     /// let args = referrer
@@ -327,7 +327,8 @@ impl Referrer {
     /// It fails with [`EncodeError::NeedsSelf`] for [`ImplSelf::Marker`] if the entry names
     /// `Self`, and with [`EncodeError::UnsupportedConstType`] for a const parameter that is not
     /// `usize`. Write the impls of all the entries ([`Referrer::iter()`]): the optional entries need
-    /// one if some Referrer is strict ([`Referrer::allow_ambiguous_crate_name()`]).
+    /// one if some Referrer is strict
+    /// ([`LeakerResult::allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)).
     ///
     /// ```
     /// # use type_leak::*;
@@ -340,8 +341,8 @@ impl Referrer {
     ///     }
     /// };
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true).unwrap();
-    /// let referrer = leaker.finish();
+    /// leaker.intern_trait(&tr, true);
+    /// let referrer = leaker.result().finish().unwrap();
     ///
     /// let self_param: Ident = parse_quote!(__S);
     /// let repeater: Path = parse_quote!(crate::Repeater);
@@ -393,8 +394,8 @@ impl Referrer {
     /// # use syn::*;
     /// let tr: ItemTrait = parse_quote! { trait Tr<const B: bool> { fn f(&self) -> Wrap<B>; } };
     /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&tr, true).unwrap();
-    /// let referrer = leaker.finish();
+    /// leaker.intern_trait(&tr, true);
+    /// let referrer = leaker.result().finish().unwrap();
     /// let param: Ident = parse_quote!(__S);
     /// // `const B: bool` is not `usize`: `repeater_impl()` fails...
     /// let err = referrer.repeater_impl(0, ImplSelf::Param(&param)).unwrap_err();

@@ -1,14 +1,14 @@
 //! Tests for `ContextId`: the ids of the contexts are assigned by the Leaker when the requirements
 //! first appear, the top-level context of a call (the id of its generics) is returned by
 //! `Leaker::enter_generics()` and its relatives, and the ids are not renumbered by
-//! `Leaker::finish()`, so the Referrer may have gaps.
+//! `Leaker::result()`, so the Referrer may have gaps.
 
 use proc_macro2::{TokenStream, TokenTree};
 use std::collections::BTreeSet;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
-use type_leak::{ContextId, Leaker, Referrer, SelfRequirement};
+use type_leak::{Cause, ContextId, Leaker, LeakerResult, Referrer, SelfRequirement};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn version() -> String {
@@ -39,8 +39,8 @@ fn leaked(referrer: &Referrer) -> Vec<String> {
 fn gap_referrer() -> (Referrer, ContextId) {
     let item: ItemStruct = parse_quote! { struct S<T, U> { a: Rel0, b: (Rel1, T), c: Wrap<U> } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&item, true).unwrap();
-    (leaker.finish(), top_level)
+    let top_level = leaker.intern_struct(&item, true);
+    (leaker.result().finish().unwrap(), top_level)
 }
 
 #[test]
@@ -106,9 +106,9 @@ fn the_scopes_return_the_top_level_context() {
     // has no entry, but it is in the Referrer, with those generics.
     let tr: ItemTrait = parse_quote! { trait Tr<T> { fn f(&self) -> Rel; } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true).unwrap();
+    let top_level = leaker.intern_trait(&tr, true);
     assert_eq!(top_level, id(1));
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(leaked(&referrer), ["Rel"]);
     assert_eq!(referrer.context(0), id(0));
     assert_eq!(ids(&referrer), [0, 1]);
@@ -137,8 +137,8 @@ fn the_scopes_return_the_top_level_context() {
         }
     };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     let generics = referrer.context_generics(top_level);
     let where_clause = &generics.where_clause;
     assert_eq!(
@@ -155,9 +155,9 @@ fn top_level_context_is_shared_with_the_entries() {
     // The generics of `Wrap<T>` are those of the struct.
     let item: ItemStruct = parse_quote! { struct S<T> { a: Wrap<T> } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&item, true).unwrap();
+    let top_level = leaker.intern_struct(&item, true);
     assert_eq!(top_level, id(0));
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.context(0), top_level);
     assert_eq!(ids(&referrer), [0]);
     assert_eq!(
@@ -169,8 +169,8 @@ fn top_level_context_is_shared_with_the_entries() {
     let item: ItemStruct =
         parse_quote! { struct S<T> where T: ::core::clone::Clone { a: Rel, b: Wrap<T> } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(leaked(&referrer), ["Rel", "Wrap < T >"]);
     assert_eq!(top_level, id(1));
     assert_eq!(referrer.context(1), top_level);
@@ -180,9 +180,9 @@ fn top_level_context_is_shared_with_the_entries() {
     // Referrer is the simplest one.
     let item: ItemStruct = parse_quote! { struct S { a: A, b: B } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&item, true).unwrap();
+    let top_level = leaker.intern_struct(&item, true);
     assert_eq!(top_level, id(0));
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.context(0), top_level);
     assert_eq!(
         referrer.to_token_stream().to_string(),
@@ -193,7 +193,7 @@ fn top_level_context_is_shared_with_the_entries() {
 #[test]
 fn calls_with_the_same_generics_return_the_same_id() {
     let mut leaker = Leaker::new();
-    let mut call = |item: ItemStruct| leaker.intern_struct(&item, true).unwrap();
+    let mut call = |item: ItemStruct| leaker.intern_struct(&item, true);
     let first = call(parse_quote! { struct A<T> { x: Rel } });
     // `Rel` (the context 0) is shared, and the generics `<T>` are the context 1.
     assert_eq!(first, id(1));
@@ -215,45 +215,67 @@ fn calls_with_the_same_generics_return_the_same_id() {
     assert_eq!(call(parse_quote! { struct H { } }), id(0));
     // The names matter.
     assert_ne!(call(parse_quote! { struct I<T, V> { y: Rel } }), bounded);
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(leaked(&referrer), ["Rel", "RelB"]);
     assert_eq!(ids(&referrer), [0, 1, 2, 3, 4]);
 }
 
-#[test]
-fn a_failed_call_does_not_take_ids() {
+/// The calls of `a_failed_call_takes_the_ids_it_would_if_its_causes_were_accepted()`: the ids they
+/// return and the result.
+fn failed_calls() -> (Vec<ContextId>, LeakerResult) {
     let mut leaker = Leaker::new();
     let a: ItemStruct = parse_quote! { struct A { x: RelA } };
-    assert_eq!(leaker.intern_struct(&a, true).unwrap(), id(0));
-    // `Wrap<U>` of a failed call would take the id 1 (and the generics of the call as well).
+    let mut ids = vec![leaker.intern_struct(&a, true)];
+    // `Wrap<U>` of the failed call takes the id 1 (and the generics of the call as well).
     let bad: ItemStruct = parse_quote! { struct B<U> { y: Wrap<U>, z: RelB<'_> } };
-    assert!(leaker.intern_struct(&bad, true).is_err());
+    ids.push(leaker.intern_struct(&bad, true));
     // A scope which completes inside a failed call has taken its id by the time the call fails
-    // (the ids are assigned when a nested scope is left): the rollback of the call gives it back.
-    // The generics `<W>` are not those of the call that follows, so a stale context would shift
-    // its id.
-    let failed = leaker.enter_generics(&parse_quote!(<U>), |view| {
+    // (the ids are assigned when a nested scope is left), and keeps it.
+    let (context, ()) = leaker.enter_generics(&parse_quote!(<U>), |view| {
         view.enter_generics(&parse_quote!(<W>), |view| {
             view.visit_type(&parse_quote!(Wrap<W>))
-        })
-        .unwrap();
+        });
         view.visit_type(&parse_quote!(RelB<'_>));
     });
-    assert!(failed.is_err());
+    ids.push(context);
     let c: ItemStruct = parse_quote! { struct C<V> { y: Wrap<V> } };
-    let top_level = leaker.intern_struct(&c, true).unwrap();
-    assert_eq!(top_level, id(1));
-    let referrer = leaker.finish();
-    assert_eq!(leaked(&referrer), ["RelA", "Wrap < V >"]);
-    assert_eq!(referrer.context(1), top_level);
-    assert_eq!(ids(&referrer), [0, 1]);
-    assert_eq!(s(referrer.context_generics(top_level)), "< V >");
+    ids.push(leaker.intern_struct(&c, true));
+    (ids, leaker.result())
+}
+
+#[test]
+fn a_failed_call_takes_the_ids_it_would_if_its_causes_were_accepted() {
+    let (ids, result) = failed_calls();
+    // Both failed calls report their error, in the order of the calls.
+    let cause = Cause::Type(parse_quote!(RelB<'_>));
+    assert_eq!(result.errors().len(), 2);
+    assert!(result.errors().iter().all(|error| error.cause == cause));
+    let referrer = result.clone().into_referrer();
+    // Accepting the causes drops the errors, and neither the ids nor the Referrer change.
+    let mut accepted = result.clone();
+    accepted.allow(cause);
+    assert!(accepted.errors().is_empty());
+    let accepted_referrer = accepted.finish().unwrap();
+    assert_eq!(referrer, accepted_referrer);
+    assert_eq!(
+        referrer.to_token_stream().to_string(),
+        accepted_referrer.to_token_stream().to_string()
+    );
+    // `A` takes the id 0, `B<U>` the id 1, the generics `<U>` of the scope are the same context,
+    // and `<V>` of the call after them takes the id 3 (the generics `<W>` of the scope inside it
+    // took the id 2, which stays).
+    assert_eq!(ids, [0, 1, 1, 3].iter().map(|&n| id(n)).collect::<Vec<_>>());
+    assert_eq!(
+        leaked(&referrer),
+        ["RelA", "Wrap < U >", "Wrap < W >", "Wrap < V >"]
+    );
+    assert_eq!(s(referrer.context_generics(ids[3])), "< V >");
 }
 
 #[test]
 fn the_intern_methods_return_the_top_level_context() {
     fn check(leaker: Leaker, top_level: ContextId, expected: &[&str]) {
-        let referrer = leaker.finish();
+        let referrer = leaker.result().finish().unwrap();
         assert_eq!(leaked(&referrer), expected);
         assert!(referrer.contexts().any(|context| context == top_level));
         let used: BTreeSet<ContextId> =
@@ -262,26 +284,26 @@ fn the_intern_methods_return_the_top_level_context() {
     }
     let item: ItemStruct = parse_quote! { struct S<T> { a: Rel, b: Wrap<T> } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&item, true).unwrap();
+    let top_level = leaker.intern_struct(&item, true);
     assert_eq!(top_level, id(1));
     check(leaker, top_level, &["Rel", "Wrap < T >"]);
 
     let item: ItemEnum = parse_quote! { enum E<T> { A(Rel), B(Wrap<T>) } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_enum(&item, true).unwrap();
+    let top_level = leaker.intern_enum(&item, true);
     assert_eq!(top_level, id(1));
     check(leaker, top_level, &["Rel", "Wrap < T >"]);
 
     let item: ItemUnion = parse_quote! { union U<T: ::core::marker::Copy> { a: Rel, b: Wrap<T> } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_union(&item, true).unwrap();
+    let top_level = leaker.intern_union(&item, true);
     assert_eq!(top_level, id(1));
     check(leaker, top_level, &["Rel", "Wrap < T >"]);
 
     let item: ItemTrait =
         parse_quote! { trait Tr<T> { fn f(&self, t: T) -> Wrap<T>; fn g(&self) -> Rel; } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&item, true).unwrap();
+    let top_level = leaker.intern_trait(&item, true);
     assert_eq!(top_level, id(0));
     check(leaker, top_level, &["Wrap < T >", "Rel"]);
 
@@ -290,22 +312,27 @@ fn the_intern_methods_return_the_top_level_context() {
         mod m { pub struct S<T> { a: Wrap<T> } pub mod inner { pub struct C { a: Rel } } }
     };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_mod(&item).unwrap();
+    let top_level = leaker.intern_mod(&item);
     // The module is numbered when it is entered, and `inner` when it is found, before the types.
     assert_eq!(top_level, id(0));
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(leaked(&referrer), ["Wrap < T >", "Rel"]);
     assert_eq!(ids(&referrer), [0, 1, 2, 3]);
     assert_eq!(s(referrer.context_generics(top_level)), "");
     assert_eq!(referrer.context_module(top_level), None);
     let mut again = Leaker::new();
-    assert_eq!(again.intern_mod(&item).unwrap(), top_level);
+    assert_eq!(again.intern_mod(&item), top_level);
     check(again, top_level, &["Wrap < T >", "Rel"]);
 
-    // An error returns no id.
-    assert!(Leaker::new()
-        .intern_struct(&parse_quote! { struct S { a: RelB<'_> } }, true)
-        .is_err());
+    // A call with an error returns its id as well, and the error is in the result.
+    let mut leaker = Leaker::new();
+    let top_level = leaker.intern_struct(&parse_quote! { struct S { a: RelB<'_> } }, true);
+    let result = leaker.result();
+    assert_eq!(result.errors().len(), 1);
+    assert!(result
+        .into_referrer()
+        .contexts()
+        .any(|context| context == top_level));
 }
 
 #[test]
@@ -336,9 +363,9 @@ fn ids_of_dropped_contexts_are_gaps() {
     // The first id is not 0 if the context 0 is dropped.
     let item: ItemStruct = parse_quote! { struct S<T, U> { a: (Rel, T) } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&item, true).unwrap();
+    let top_level = leaker.intern_struct(&item, true);
     assert_eq!(top_level, id(2));
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(leaked(&referrer), ["Rel"]);
     assert_eq!(ids(&referrer), [1, 2]);
     assert_eq!(referrer.context(0), id(1));
@@ -346,9 +373,9 @@ fn ids_of_dropped_contexts_are_gaps() {
     // No type is left, but the generics of the call are in the Referrer.
     let item: ItemStruct = parse_quote! { struct S<T> { a: T } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&item, true).unwrap();
+    let top_level = leaker.intern_struct(&item, true);
     assert_eq!(top_level, id(0));
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     assert!(referrer.is_empty());
     assert_eq!(ids(&referrer), [0]);
     assert_eq!(s(referrer.context_generics(top_level)), "< T >");
@@ -358,7 +385,7 @@ fn ids_of_dropped_contexts_are_gaps() {
     );
 
     // Without any call, there is the context of the types which use no generics.
-    let referrer = Leaker::new().finish();
+    let referrer = Leaker::new().result().finish().unwrap();
     assert_eq!(ids(&referrer), [0]);
     assert_eq!(s(referrer.context_generics(id(0))), "");
 }
@@ -485,9 +512,9 @@ fn serialization_of_the_simplest_referrer_is_unchanged() {
     // One context, with the id 0: no number of groups, no id.
     let item: ItemStruct = parse_quote! { struct S { a: A, b: B } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&item, true).unwrap();
+    let top_level = leaker.intern_struct(&item, true);
     assert_eq!(top_level, id(0));
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     let tokens = referrer.to_token_stream();
     assert_eq!(tokens.to_string(), format!("\"{}\" (A , B)", version()));
     assert_eq!(parse2::<Referrer>(tokens).unwrap(), referrer);
@@ -496,8 +523,8 @@ fn serialization_of_the_simplest_referrer_is_unchanged() {
     // generics of the struct, which has no entry).
     let item: ItemStruct = parse_quote! { struct S<T, U> { a: A, b: Wrap<T>, c: Wrap<U> } };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     let tokens = referrer.to_token_stream();
     assert_eq!(
         tokens.to_string(),
@@ -509,7 +536,7 @@ fn serialization_of_the_simplest_referrer_is_unchanged() {
     assert_eq!(parse2::<Referrer>(tokens).unwrap(), referrer);
 
     // Neither has a Referrer without any context.
-    let referrer = Leaker::new().finish();
+    let referrer = Leaker::new().result().finish().unwrap();
     assert_eq!(
         referrer.to_token_stream().to_string(),
         format!("\"{}\" ()", version())
@@ -539,8 +566,8 @@ fn serialization_with_gaps() {
     // The first group may not have the id 0, and the ids after a gap are expected to follow it.
     let item: ItemStruct = parse_quote! { struct S<T, U> { a: (Rel, T) } };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     let tokens = referrer.to_token_stream();
     assert_eq!(
         tokens.to_string(),
@@ -551,8 +578,8 @@ fn serialization_with_gaps() {
     // entry in it.
     let item: ItemStruct = parse_quote! { struct S<T> { a: (Rel, T) } };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(top_level, id(0));
     assert_eq!(
         referrer.to_token_stream().to_string(),
@@ -659,8 +686,8 @@ fn serialization_with_gaps_keeps_the_requirements() {
         trait Tr<T, U> { fn f(&self) -> Rel<Self>; fn g(&self, t: T) -> (RelB, T); }
     };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     // `Rel<Self>` uses `Self`, `T` and `U` (the context 0), the tuple uses `T` (the context 1),
     // and `RelB` nothing (2). The top-level context has the generics of the trait and, as an
     // entry names `Self`, what `Self` is: it is the context 0.
@@ -747,8 +774,8 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
         }
     };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     // The generics are in the canonical form: sorted by kind and name, without defaults.
     assert_eq!(
         s(referrer.context_generics(top_level)),
@@ -823,8 +850,8 @@ fn the_top_level_generics_do_not_have_the_bounds_the_entries_imply() {
         trait Tr<'a, T, const N: usize> { fn f(&self, x: &'a Rel<T>) -> Wrap<N>; }
     };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     let ix = referrer
         .iter()
         .position(|ty| s(ty) == "& 'a Rel < T >")

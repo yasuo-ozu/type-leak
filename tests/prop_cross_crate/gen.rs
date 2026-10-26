@@ -70,7 +70,9 @@
 //! (`Config::primitive`), and each item says whether the Referrer invokes it as strict.
 //!
 //! Not generated: type macros (the test macro's witness cannot return a type that a macro
-//! expands to), const expressions with types in them, and unsized or `dyn` implementors.
+//! expands to), and unsized or `dyn` implementors. Const expressions with types in them, and the
+//! values of items, only with `Flags::values`; paths of `std` without the leading `::`, only with
+//! `Flags::relative_std` (see [`Flags`]).
 //!
 //! The grammar is built to be valid: every type is generated with what the generics in scope
 //! promise (sizedness, bounds, outlives), so the Leaker's crate compiles by itself. If it does not,
@@ -95,7 +97,7 @@ use std::hash::Hasher;
 /// `?` applies to the real `Sized` only, so `T: ?Sized` is no more context-dependent than
 /// `T: ?::core::marker::Sized`. `type-leak` at fb11f41 does not know it: it takes the bare `Sized`
 /// of `?Sized` for a relative path like any other bare name of the prelude, and rejects it unless
-/// `LeakerConfig::allow_std_prelude()` is on. The Leaker accepts a bare `?Sized` always (`?` applies
+/// `LeakerConfig::allow_prelude()` is on. The Leaker accepts a bare `?Sized` always (`?` applies
 /// to the real `Sized` only), so it is `true`; it is the only place that says so. It reaches
 /// three places: the generator (a bare `?Sized` is an expected rejection without the prelude only
 /// if it is `false`: the tag `bare:?Sized`), the macro (`relaxed_sized` argument of `prop_leak`:
@@ -197,9 +199,9 @@ pub struct Features {
     pub strict_cycles: bool,
     /// A strict Referrer replaces an optional entry that holds a lifetime of a method (`fn
     /// m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>`): the copy has `'x` in no argument that
-    /// constrains it, so it is early-bound, where it is late-bound in the trait (E0195, F18: the
-    /// `Referrer::must()` docs say that replacing a type can lose a method lifetime). Off,
-    /// the item that has it is not invoked as strict.
+    /// constrains it, so it is early-bound, where it is late-bound in the trait (E0195, F18, fixed:
+    /// the Leaker copies the type as written). Off (the default), the item that has it is not
+    /// invoked as strict.
     pub strict_anchors: bool,
     /// In an impl whose self type is leaked, a method with a bound of a generic that names `Self`
     /// (`X: Fn(&Self) -> u8`) and a leaked type in another predicate that uses the generic
@@ -324,6 +326,66 @@ pub struct Features {
     pub nested_self_entries: bool,
 }
 
+/// The constructs of the generator that `TYPE_LEAK_PROP_FEATURES` asks for besides `Features`, whose
+/// `Debug` is in the tables: they are off by default, so the tables do not change.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Flags {
+    /// `allow_stages`: for each rule of [`Flags::rules()`] the macro compares the errors that remain
+    /// with the rule given to `LeakerConfig` and to `LeakerResult` for every item and makes the copy
+    /// of each (`stages = true` in the attribute, which only asks it to report both counts and to
+    /// write the copies), and the harness prints how many items differ and builds the copies
+    /// (`main.rs`: "The copies after the analysis without a rule").
+    pub allow_stages: bool,
+    /// `relative_std`: the generated items name `std`, `core` and `alloc` without the leading `::` in
+    /// about a third of their paths (`Gen::relativize_std()`), the Leaker allows them (`allow =
+    /// "std,core,alloc"`), and the rule `std` of `allow_stages` has errors to drop.
+    pub relative_std: bool,
+    /// `values`: the generated items have values (`Gen::method_body()`, `Gen::value_const()`): the
+    /// bodies of functions, methods and default methods, the values of constants and statics, the
+    /// defaults of associated constants. They have the types of the Leaker's crate in type positions
+    /// (a `let`, a turbofish, a cast), which the Leaker leaks with `check_values()`, and some have a
+    /// relative path of a value (`crate::base::bf()`), which it rejects. There are more defaults of
+    /// const parameters that name a relative constant. The rules `values` and `default` of
+    /// `allow_stages` have errors to drop.
+    pub values: bool,
+}
+
+impl Flags {
+    pub fn from_env() -> Self {
+        let list = std::env::var("TYPE_LEAK_PROP_FEATURES").unwrap_or_default();
+        let has = |name: &str| list.split(',').any(|word| word.trim() == name);
+        Flags {
+            allow_stages: has("allow_stages"),
+            relative_std: has("relative_std"),
+            values: has("values"),
+        }
+    }
+
+    /// The rules `allow_stages` compares, by the names of the macro (`prop.rs`, `Rule::name()`).
+    /// `std` and `values` are in only if the generator makes what they are about.
+    pub fn rules(self) -> Vec<&'static str> {
+        let mut rules = vec!["prelude", "crate", "path"];
+        if self.relative_std {
+            rules.push("std");
+        }
+        if self.values {
+            rules.push("values");
+        }
+        rules.push("default");
+        rules
+    }
+}
+
+/// `TYPE_LEAK_PROP_FEATURES` has `allow_stages` (see [`Flags::allow_stages`]).
+pub fn allow_stages() -> bool {
+    Flags::from_env().allow_stages
+}
+
+/// The rules of the environment (see [`Flags::rules()`]).
+pub fn rules() -> Vec<&'static str> {
+    Flags::from_env().rules()
+}
+
 impl Features {
     /// The features of the findings that are fixed are on by default, and `list` adds the known
     /// failures.
@@ -433,6 +495,8 @@ impl Features {
                 "trait_self_defaults" => features.trait_self_defaults = true,
                 "self_bound_adts" => features.self_bound_adts = true,
                 "nested_self_entries" => features.nested_self_entries = true,
+                // Read by `Flags::from_env()`: they are no features of the generator.
+                "allow_stages" | "relative_std" | "values" => (),
                 "unsized_params" => features.unsized_params = true,
                 "bound_cycles" => features.bound_cycles = true,
                 other => panic!("unknown feature `{}`", other),
@@ -459,13 +523,16 @@ pub struct Config {
 }
 
 impl Config {
-    fn allow_arg(&self) -> String {
+    fn allow_arg(&self, flags: Flags) -> String {
         let mut allow = Vec::new();
         if self.allow_std {
             allow.push("::std".to_string());
         }
         if self.allow_crate {
             allow.push(format!("::{}", self.krate));
+        }
+        if flags.relative_std {
+            allow.extend(["std", "core", "alloc"].map(String::from));
         }
         allow.join(",")
     }
@@ -513,6 +580,28 @@ pub const TAG_REDECLARED: &str = "shape:redeclared";
 /// `nested_self_entries`.
 pub const TAG_SELF_BOUND_ADT: &str = "shape:self_bound_adt";
 pub const TAG_SELF_BOUND_TYPE: &str = "shape:self_bound_type";
+/// `value_path`: a body, a constant or a default has a relative path of a value (`crate::base::bf()`,
+/// `RLEN`), which `LeakerConfig::check_values()` rejects (`values`).
+pub const TAG_VALUE_PATH: &str = "value_path";
+/// `relative_std`: a path of `std`, `core` or `alloc` is written without the leading `::` in the item.
+/// The Leaker leaks it unless it allows them (the rule `std` of `allow_stages` does not), so in a
+/// bound it is a leaked type: the shape `bound_cycle` has for the failures of `accept_families()`.
+pub const TAG_RELATIVE_STD: &str = "relative_std";
+/// The shapes that the items accepted by `LeakerResult::allow()` fail on (`TYPE_LEAK_PROP_ACCEPT`,
+/// `main.rs`, `accept_families()`; the docs of `LeakerResult::allow()` list them). They explain no
+/// rejection:
+///
+/// - `self_in_predicate`: a where predicate of the item names `Self` or `Self::A`
+///   (`where X: Into<Self::A>`, `where Y: Fn(&Self) -> u8`), which `bound_cycle` (a bound of the
+///   generics that names a leaked type) makes unprovable;
+/// - `alias_bound`: a bound of an iterator names its `Item` (`T: Fn(<T as Iterator>::Item) -> u8`,
+///   also through the alias `BIt<T>`) next to a bound or a supertrait that fixes it, which no impl of
+///   a trait can have next to a method predicate that names `Self::A`;
+/// - `hidden_self`: a function pointer or `Fn(..)` whose output has an elided lifetime and whose
+///   inputs name `Self` and a path that hides a lifetime (`fn(Chars, Self) -> &u8`).
+pub const TAG_SELF_IN_PREDICATE: &str = "self_in_predicate";
+pub const TAG_ALIAS_BOUND: &str = "alias_bound";
+pub const TAG_HIDDEN_SELF: &str = "hidden_self";
 
 /// An item with a macro on it, which the Referrer invokes.
 #[derive(Clone)]
@@ -546,6 +635,32 @@ pub struct Case {
     pub items: Vec<Item>,
     /// The line of the Referrer's `lib.rs` where each item is invoked.
     pub referrer_lines: Vec<(usize, usize)>,
+    /// The `lib.rs` of the second Referrer's crate of `TYPE_LEAK_PROP_ACCEPT`, which copies the
+    /// items that the Leaker accepts only by `LeakerResult::allow()` (see [`accept_referrer()`]).
+    pub accept_referrer: String,
+    /// The line of `accept_referrer` where each item is invoked.
+    pub accept_lines: Vec<(usize, usize)>,
+    /// The Referrer's crates of `TYPE_LEAK_PROP_FEATURES=allow_stages` (`stage_crates()`), which the
+    /// harness writes with that feature only.
+    pub stages: Vec<StageCrate>,
+}
+
+/// A Referrer's crate of `TYPE_LEAK_PROP_FEATURES=allow_stages`: it copies each item as the macro of
+/// the Leaker analyzed it without the rule and gave its result the rule and the causes of the errors
+/// that remain (`side` `res`), or as it analyzed it with a config that has the rule (`cfg`).
+pub struct StageCrate {
+    /// The rule, as `rules()` names it.
+    pub rule: &'static str,
+    /// `res` or `cfg`.
+    pub side: &'static str,
+    /// The crate has none of the Leaker's names but the ones the rule allows, and copies the items
+    /// that the rule leaves no error in (`stage_crates()`). Else it is built like the crate of the
+    /// accepted items (`accept_referrer()`).
+    pub clean: bool,
+    /// Its `lib.rs`.
+    pub lib: String,
+    /// The line of `lib` where each item is invoked.
+    pub lines: Vec<(usize, usize)>,
 }
 
 pub const ATTR: &str = "@ATTR@";
@@ -904,6 +1019,9 @@ struct ModEnv {
     theads: Vec<THead>,
     /// Paths of constants of type `usize`.
     consts: Vec<String>,
+    /// How the module names the root of the crate's modules: `super::` for each level of the path
+    /// (`super::super::` in `m0::n0`), for `base` (`values`).
+    up: String,
 }
 
 /// The types every module declares (`prefix` is `R`) and the `base` module has (`B`). `sized` is
@@ -1188,6 +1306,7 @@ struct TraitInfo {
 }
 
 pub struct Gen {
+    flags: Flags,
     /// The state of the random numbers: each one is the hash of the seed and of what was drawn
     /// before (`finish()` does not reset a `DefaultHasher`).
     rng: DefaultHasher,
@@ -1252,6 +1371,12 @@ pub struct Gen {
     /// The attribute of the item being generated says `redeclare = true`: the Referrer's crate
     /// declares the trait again (`trait_self_defaults`).
     redeclare: bool,
+    /// The `use`s of each module whose items are analyzed one by one, by its path (the imports that
+    /// the names `I1`, `J1`, `ILEN` come from), for `accept_referrer()`. They draw no random number.
+    mod_uses: Vec<(Vec<String>, String)>,
+    /// The item (or module) being generated has a value (`Flags::values`): the attribute says
+    /// `values = true`.
+    values_used: bool,
 }
 
 const PRIMS: &[&str] = &[
@@ -1259,7 +1384,7 @@ const PRIMS: &[&str] = &[
 ];
 
 impl Gen {
-    pub fn new(seed: u64, krate: String, features: Features) -> Self {
+    pub fn new(seed: u64, krate: String, features: Features, flags: Flags) -> Self {
         let mut rng = DefaultHasher::new();
         rng.write_u64(seed);
         let cfg = Config {
@@ -1270,6 +1395,7 @@ impl Gen {
             primitive: true,
         };
         let mut g = Gen {
+            flags,
             rng,
             cfg,
             features,
@@ -1299,6 +1425,8 @@ impl Gen {
             assoc_self_types: Vec::new(),
             in_default: false,
             redeclare: false,
+            mod_uses: Vec::new(),
+            values_used: false,
         };
         g.cfg.prelude = g.chance(50);
         g.cfg.allow_std = g.chance(35);
@@ -1974,6 +2102,9 @@ impl Gen {
                 && (self.features.self_elision || !a.adds_lts)
             {
                 self.elided_self |= a.uses_self;
+                if hidden && a.uses_self {
+                    self.tags.insert(TAG_HIDDEN_SELF.to_string());
+                }
                 let input = if hidden {
                     format!("{}, {}", self.hidden_path(), a.text)
                 } else {
@@ -2174,6 +2305,9 @@ impl Gen {
                     return self.dyn_bare(sc, depth, false);
                 }
                 self.elided_self |= a.uses_self;
+                if hidden && a.uses_self {
+                    self.tags.insert(TAG_HIDDEN_SELF.to_string());
+                }
                 let input = if hidden {
                     format!("{}, {}", self.hidden_path(), a.text)
                 } else {
@@ -2705,6 +2839,7 @@ impl Gen {
                 {
                     bounded.push((x.clone(), "fn"));
                     bounded.push((x.clone(), "iter"));
+                    self.tags.insert(TAG_ALIAS_BOUND.to_string());
                     let head = self.pick(&heads).clone();
                     let (fn_path, iterator) = (self.trait_path("Fn"), self.trait_path("Iterator"));
                     sk.preds.push(format!(
@@ -2820,6 +2955,7 @@ impl Gen {
                 if !(x.fixed_item == 2 && names_assoc) && !bounded.contains(&(x.name.clone(), "fn"))
                 {
                     bounded.push((x.name.clone(), "fn"));
+                    self.tags.insert(TAG_ALIAS_BOUND.to_string());
                     let head = self.pick(&heads).clone();
                     let iterator = self.trait_path("Iterator");
                     let item = if x.fixed_item == 2 {
@@ -2857,7 +2993,10 @@ impl Gen {
     /// it, so it names those and no `Self`. A const parameter's default is a literal, or a constant
     /// (`{ RLEN }`), or an earlier const parameter.
     fn defaults(&mut self, sk: &mut Skeleton) {
-        if !self.chance(DEFAULT_PERCENT) {
+        // `values` asks for more defaults, and more of the constants among them, which are errors
+        // (not in a module analyzed as a whole, which one such error rejects).
+        let more = self.flags.values && !self.module_mode;
+        if !self.chance(if more { 60 } else { DEFAULT_PERCENT }) {
             return;
         }
         // The parameters in the order of the declaration: types, then consts.
@@ -2908,7 +3047,10 @@ impl Gen {
                     .collect();
                 let value = if !earlier.is_empty() && self.chance(30) {
                     self.pick(&earlier).clone()
-                } else if ty == "usize" && !self.env.consts.is_empty() && self.chance(25) {
+                } else if ty == "usize"
+                    && !self.env.consts.is_empty()
+                    && self.chance(if more { 60 } else { 25 })
+                {
                     let consts = self.env.consts.clone();
                     let constant = self.pick(&consts).clone();
                     // A value in a const expression cannot be leaked: a relative one is rejected.
@@ -3620,13 +3762,18 @@ impl Gen {
     fn attr(&self, id: usize, allow_self: bool, scope: &str, strict: bool) -> String {
         format!(
             "#[{}(id = {}, allow_self = {}, prelude = {}, scope = \"{}\", allow = \"{}\", \
-             {}{}strict = {}, primitive = {}, relaxed_sized = {})]\n",
+             {}{}{}{}strict = {}, primitive = {}, relaxed_sized = {})]\n",
             ATTR,
             id,
             allow_self,
             self.cfg.prelude,
             scope,
-            self.cfg.allow_arg(),
+            self.cfg.allow_arg(self.flags),
+            if self.values_used {
+                "values = true, bodies = true, "
+            } else {
+                ""
+            },
             if self.redeclare {
                 "redeclare = true, "
             } else {
@@ -3634,6 +3781,11 @@ impl Gen {
             },
             if scope == "mod" && self.features.nested_self_entries {
                 "nested_self_entries = true, "
+            } else {
+                ""
+            },
+            if self.flags.allow_stages {
+                "stages = true, "
             } else {
                 ""
             },
@@ -3657,7 +3809,10 @@ impl Gen {
     fn build_env(&mut self, path: &[String]) -> (ModEnv, String) {
         let up = "super::".repeat(path.len());
         let krate = self.cfg.krate.clone();
-        let mut env = ModEnv::default();
+        let mut env = ModEnv {
+            up: up.clone(),
+            ..ModEnv::default()
+        };
         let mut uses = String::new();
         let mut names: Vec<(String, String, Option<Shape>, Option<TShape>)> = Vec::new();
         for (suffix, shape) in SHAPES {
@@ -4455,12 +4610,27 @@ impl Gen {
                 let t = self.ty(&sc, Con::unsized_ok().indirect(), 1);
                 let decl = format!("const C{}: ::core::marker::PhantomData<{}>", i, t.text);
                 consts.push((decl.clone(), "::core::marker::PhantomData".to_string()));
-                const_texts.push(format!("{};", decl));
+                // `values`: the default names the type again (a turbofish).
+                if self.flags.values && self.chance(40) {
+                    self.values_used = true;
+                    const_texts.push(format!(
+                        "{} = ::core::marker::PhantomData::<{}>;",
+                        decl, t.text
+                    ));
+                } else {
+                    const_texts.push(format!("{};", decl));
+                }
             } else {
                 let (ty, value) = *self.pick(&[("usize", "0"), ("bool", "false"), ("u8", "1")]);
                 let decl = format!("const K{}: {}", i, ty);
                 consts.push((decl.clone(), value.to_string()));
-                const_texts.push(format!("{};", decl));
+                // `values`: the default of a constant of type `usize` has types and paths.
+                if self.flags.values && ty == "usize" && self.chance(60) {
+                    let default = self.value_const(&sc);
+                    const_texts.push(format!("{} = {};", decl, default));
+                } else {
+                    const_texts.push(format!("{};", decl));
+                }
             }
         }
         // Methods.
@@ -4514,6 +4684,14 @@ impl Gen {
                 "type G<'g>;".to_string()
             });
         }
+        // `values`: some methods have a default body.
+        let mut method_texts: Vec<String> = Vec::new();
+        for m in &methods {
+            method_texts.push(match self.default_body(&method_scope) {
+                Some(value) => format!("{} {}", m, value),
+                None => format!("{};", m),
+            });
+        }
         self.self_prob = saved_prob;
         self.no_self = saved_no_self;
 
@@ -4534,7 +4712,7 @@ impl Gen {
             .iter()
             .cloned()
             .chain(const_texts.iter().cloned())
-            .chain(methods.iter().map(|m| format!("{};", m)))
+            .chain(method_texts)
             .collect();
         let text = format!(
             "{}pub trait {}{}{}{} {{\n{}\n}}\n",
@@ -4760,7 +4938,8 @@ impl Gen {
             body.push(format!("{} = {};", decl, value));
         }
         for m in &tr.methods {
-            body.push(format!("{} {{ loop {{}} }}", m));
+            let value = self.method_body(&sc, 35);
+            body.push(format!("{} {}", m, value));
         }
         let scope = self.impl_scope(
             ann.is_some(),
@@ -4889,7 +5068,8 @@ impl Gen {
                     .replace("(&'y self,", "(&self,")
                     .replace("(&'y self)", "(&self)");
             }
-            body.push(format!("pub {} {{ loop {{}} }}", sig));
+            let value = self.method_body(&sc, 45);
+            body.push(format!("pub {} {}", sig, value));
         }
         if self.chance(CLASH_PERCENT) {
             for method in self.clash_methods() {
@@ -4924,7 +5104,230 @@ impl Gen {
     fn gen_fn(&mut self) -> String {
         let name = self.name("f");
         let sig = self.method_sig(&Scope::default(), &name, false);
-        format!("pub {} {{ loop {{}} }}\n", sig)
+        let body = self.method_body(&Scope::default(), 70);
+        format!("pub {} {}\n", sig, body)
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Values (`Flags::values`).
+    // -----------------------------------------------------------------------------------------
+
+    /// A type for a type position of a value (a `let`, a turbofish): any type of the module that the
+    /// generics of `sc` allow, with no `Self`.
+    fn value_type(&mut self, sc: &Scope) -> String {
+        let saved = (self.no_self, self.no_assoc_paths);
+        self.no_self = true;
+        self.no_assoc_paths = true;
+        // The generics of an item whose predicates may name leaked types (`bound_cycles`) are not
+        // used: the type would be in a cycle with them, as one of a signature is.
+        let con = Con {
+            no_params: self.bound_cycles(),
+            ..Con::unsized_ok().indirect()
+        };
+        let ty = self.ty(sc, con, 1);
+        self.no_self = saved.0;
+        self.no_assoc_paths = saved.1;
+        ty.text
+    }
+
+    /// An expression of type `usize` that a constant can have: a constant or a `const fn` of `base`,
+    /// by an absolute path or, if `relative`, a path that the Leaker rejects in a value
+    /// (`crate::base::BLEN`, `super::base::bf()`, `RLEN`). The path of a constant that the module
+    /// of a module analyzed as a whole declares is no error there.
+    fn value_usize(&mut self, sc: &Scope, relative: bool) -> String {
+        let krate = self.cfg.krate.clone();
+        let mut paths: Vec<String> = vec![
+            format!("::{}::base::BLEN", krate),
+            format!("::{}::base::bf()", krate),
+        ];
+        if relative {
+            let up = self.env.up.clone();
+            let mut relatives = vec![
+                "crate::base::BLEN".to_string(),
+                "crate::base::bf()".to_string(),
+            ];
+            relatives.push(format!("{}base::BLEN", up));
+            relatives.push(format!("{}base::bf()", up));
+            // The constants of the module and its import are not in a copy of an item. The generic
+            // `const fn` of `base` has a type in its turbofish, which the path of the value holds.
+            if !self.module_mode {
+                relatives.push("RLEN".to_string());
+                relatives.push("self::RLEN".to_string());
+                if self.env.consts.iter().any(|c| c == "ILEN") {
+                    relatives.push("ILEN".to_string());
+                }
+                let ty = self.value_type(sc);
+                relatives.push(format!("crate::base::bg::<*const {}>()", ty));
+                relatives.push(format!("{}base::bg::<*const {}>()", up, ty));
+            }
+            paths = relatives;
+        }
+        let path = self.pick(&paths).clone();
+        if relative {
+            self.tags.insert(TAG_VALUE_PATH.to_string());
+        }
+        path
+    }
+
+    /// The type of a cast in a value: an alias of `u8`, a relative one (`RA`, `crate::base::BA`) or an
+    /// absolute one.
+    fn value_cast_target(&mut self) -> String {
+        let krate = self.cfg.krate.clone();
+        let up = self.env.up.clone();
+        let targets = [
+            "RA".to_string(),
+            "self::RA".to_string(),
+            "crate::base::BA".to_string(),
+            format!("{}base::BA", up),
+            format!("::{}::base::BA", krate),
+            "u8".to_string(),
+        ];
+        self.pick(&targets).clone()
+    }
+
+    /// The statements of a value, which end in `loop {}` when it is a body: a `PhantomData` with a
+    /// type of the module in its annotation (the type of a `let`), `size_of` of a pointer to one (a
+    /// turbofish), a cast to an alias of `u8`, a `usize` that may be a relative path, and a `Vec`.
+    fn value_statements(&mut self, sc: &Scope) -> String {
+        self.values_used = true;
+        let mut stmts: Vec<String> = Vec::new();
+        let ty = self.value_type(sc);
+        stmts.push(format!(
+            "let _a: ::core::marker::PhantomData<*const {}> = ::core::marker::PhantomData;",
+            ty
+        ));
+        if self.chance(55) {
+            let ty = self.value_type(sc);
+            stmts.push(format!("let _b = ::core::mem::size_of::<*const {}>();", ty));
+        }
+        if self.chance(40) {
+            let target = self.value_cast_target();
+            stmts.push(format!("let _c = 1u8 as {};", target));
+        }
+        if self.chance(40) {
+            let relative = self.chance(if self.module_mode { 4 } else { 20 });
+            let path = self.value_usize(sc, relative);
+            stmts.push(format!("let _d: usize = {} + 1;", path));
+        }
+        // A path of the prelude with a type in its turbofish: relative if the Leaker does not allow
+        // the prelude (not in a module analyzed as a whole, which one such error rejects).
+        if !self.module_mode && self.chance(15) {
+            let ty = self.value_type(sc);
+            stmts.push(format!("let _e = Vec::<*const {}>::new();", ty));
+            if !self.cfg.prelude {
+                self.tags.insert(TAG_VALUE_PATH.to_string());
+            }
+        }
+        stmts.join(" ")
+    }
+
+    /// The body of a function or a method with values, in `percent` of the cases when `Flags::values`
+    /// asks for them: `{ .. loop {} }`. Else `{ loop {} }`, and no random number is drawn.
+    fn method_body(&mut self, sc: &Scope, percent: u32) -> String {
+        if !self.flags.values || !self.chance(percent) {
+            return "{ loop {} }".to_string();
+        }
+        format!("{{ {} loop {{}} }}", self.value_statements(sc))
+    }
+
+    /// The default body of a method of a trait with values (`{ .. loop {} }`), or `None` (the method
+    /// is only declared).
+    fn default_body(&mut self, sc: &Scope) -> Option<String> {
+        if !self.flags.values || !self.chance(35) {
+            return None;
+        }
+        Some(format!("{{ {} loop {{}} }}", self.value_statements(sc)))
+    }
+
+    /// The value of a constant of type `usize`: `size_of` of a pointer to a type of the module,
+    /// plus a `usize` that may be a relative path.
+    fn value_const(&mut self, sc: &Scope) -> String {
+        self.values_used = true;
+        let ty = self.value_type(sc);
+        let relative = self.chance(if self.module_mode { 4 } else { 20 });
+        let path = self.value_usize(sc, relative);
+        format!("::core::mem::size_of::<*const {}>() + {}", ty, path)
+    }
+
+    /// A constant or a static of a module analyzed as a whole, with a value (`Flags::values`).
+    fn gen_value_item(&mut self) -> String {
+        let name = self.name("KV");
+        let value = self.value_const(&Scope::default());
+        if self.chance(60) {
+            self.contents.push("const");
+            format!("pub const {}: usize = {};\n", name, value)
+        } else {
+            self.contents.push("static");
+            format!("pub static {}: usize = {};\n", name, value)
+        }
+    }
+
+    /// `relative_std`: writes the paths that start with `::std::`, `::core::` in a third of their
+    /// places without the leading `::`, and some of `::std::` as `alloc::` where `alloc` has the
+    /// item, in the items analyzed one by one. The first line of `text` is its attribute, left as it
+    /// is.
+    pub fn relativize_std(&mut self, text: &str) -> String {
+        // Not in a module analyzed as a whole: a relative path with an argument that the module
+        // declares (`std::boxed::Box<R0>`) is an entry that names the Leaker's `R0`, where the copy
+        // declares its own. The generator avoids that for every relative path (`is_declared()`).
+        if !self.flags.relative_std || self.module_mode {
+            return text.to_string();
+        }
+        let (head, tail) = match text.find('\n') {
+            Some(at) if text.starts_with("#[") => text.split_at(at),
+            _ => ("", text),
+        };
+        let mut out = String::from(head);
+        let mut rest = tail;
+        while let Some(at) = rest.find("::") {
+            let (before, here) = rest.split_at(at);
+            out += before;
+            let start_ok = before
+                .chars()
+                .next_back()
+                .map_or(true, |c| c.is_whitespace() || "(<,&*?+[{=;!".contains(c));
+            let crate_name = ["std", "core"]
+                .iter()
+                .find(|name| here[2..].starts_with(&format!("{}::", name)));
+            // `Chars` and `Iter<u8>` hide a lifetime (`hidden_path()`), which the Leaker knows only of
+            // an absolute path: as a relative one it is a type like any other, leaked alone, and the
+            // docs of the Leaker say to write `Iter<'_, u8>` (F28).
+            let hides_lifetime = crate_name.map_or(false, |name| {
+                let after = &here[2 + name.len()..];
+                after.starts_with("::str::Chars") || after.starts_with("::slice::Iter")
+            });
+            match crate_name {
+                Some(name) if start_ok && !hides_lifetime && self.chance(35) => {
+                    let after = &here[2 + name.len()..];
+                    let in_alloc = [
+                        "::vec::",
+                        "::boxed::",
+                        "::string::",
+                        "::rc::",
+                        "::sync::Arc",
+                    ]
+                    .iter()
+                    .any(|module| after.starts_with(module))
+                        || after.starts_with("::collections::BTreeMap");
+                    let name = if *name == "std" && in_alloc && self.chance(40) {
+                        "alloc"
+                    } else {
+                        name
+                    };
+                    out += name;
+                    rest = after;
+                }
+                _ => {
+                    out += "::";
+                    rest = &here[2..];
+                }
+            }
+        }
+        out += rest;
+        if out != text {
+            self.tags.insert(TAG_RELATIVE_STD.to_string());
+        }
+        out
     }
 
     /// A type alias of a module analyzed as a whole.
@@ -4951,6 +5354,7 @@ impl Gen {
         if ann.is_some() {
             self.risk = Risk::default();
             self.tags.clear();
+            self.values_used = false;
             self.want_strict = self.chance(25);
             self.bare_percent = self.item_bare_percent();
         }
@@ -4980,20 +5384,24 @@ impl Gen {
             94..=96 if whole => {
                 let text = self.gen_fn();
                 self.contents.push("fn");
-                return text;
+                return self.relativize_std(&text);
             }
             97..=99 if whole => {
                 let text = self.gen_alias();
                 self.contents.push("alias");
-                return text;
+                return self.relativize_std(&text);
             }
             _ => ("struct", self.gen_adt(AdtKind::Struct, ann)),
         };
+        let text = self.relativize_std(&text);
         if text.contains("Self::") || text.contains("<Self as ") {
             self.tags.insert(TAG_SELF_ASSOC.to_string());
         }
         if !allow_self && has_word(&text, "Self") {
             self.tags.insert(TAG_SELF_DENIED.to_string());
+        }
+        if names_self_in_where(&text) {
+            self.tags.insert(TAG_SELF_IN_PREDICATE.to_string());
         }
         if let Some(id) = ann_id {
             self.items.push(Item {
@@ -5022,6 +5430,9 @@ impl Gen {
         nested: usize,
     ) -> String {
         let (env, uses) = self.build_env(path);
+        if !whole {
+            self.mod_uses.push((path.to_vec(), uses.clone()));
+        }
         let saved_env = std::mem::replace(&mut self.env, env);
         let saved_traits = std::mem::take(&mut self.traits);
         let saved_adts = std::mem::take(&mut self.adts);
@@ -5037,6 +5448,10 @@ impl Gen {
             "?::core::marker::Sized"
         };
         text += &types_template("R", sized);
+        if self.flags.values {
+            // The target of a cast in a value (`value_cast_target()`).
+            text += "pub type RA = u8;\n";
+        }
         if !whole || self.features.declared_named_like_generic {
             for name in SHADOW_NAMES {
                 text += &format!(
@@ -5047,6 +5462,15 @@ impl Gen {
         }
         for _ in 0..items {
             text += &self.gen_one(path, whole);
+        }
+        // `values`: constants and statics with values, in a module analyzed as a whole.
+        if whole && self.flags.values {
+            for _ in 0..2 {
+                if self.chance(60) {
+                    let item = self.gen_value_item();
+                    text += &self.relativize_std(&item);
+                }
+            }
         }
         for i in 0..nested {
             let name = format!("n{}", i);
@@ -5065,14 +5489,30 @@ impl Gen {
 
 /// Generates the case `index` of the seed.
 pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Features) -> Case {
+    generate_with(seed, index, items_per_module, features, Flags::from_env())
+}
+
+/// [`generate()`] with the flags given.
+pub fn generate_with(
+    seed: u64,
+    index: usize,
+    items_per_module: usize,
+    features: Features,
+    flags: Flags,
+) -> Case {
     let krate = format!("tlp_l_{:03}", index);
-    let mut g = Gen::new(seed, krate.clone(), features);
+    let mut g = Gen::new(seed, krate.clone(), features, flags);
     let mut lib = String::new();
-    lib += "#![allow(warnings)]\n";
+    lib += &crate_header(flags);
     lib += &format!("extern crate self as {};\n", krate);
     lib += "#[doc(hidden)]\npub use type_leak_test_macro as __macro;\n";
     lib += "type_leak_test_macro::define_repeater!(pub Repeater);\n";
     let mut base = types_template("B", "?::core::marker::Sized");
+    // The cast target and the function of a value, which the paths of `values` name.
+    if flags.values {
+        base += "pub type BA = u8;\npub const fn bf() -> usize { 1 }\n";
+        base += "pub const fn bg<T: ?Sized>() -> usize { ::core::mem::size_of::<*const T>() }\n";
+    }
     // The supertrait that fixes the `Item` of an iterator, and an alias of its projection
     // (`supertrait_item`, `alias_item`).
     if g.features.supertrait_item {
@@ -5103,6 +5543,7 @@ pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Feat
         g.contents.clear();
         g.risk = Risk::default();
         g.tags.clear();
+        g.values_used = false;
         g.want_strict = g.chance(25);
         g.bare_percent = g.module_bare_percent();
         let n = g.range(4, items_per_module);
@@ -5131,7 +5572,7 @@ pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Feat
     }
 
     // The Referrer's crate invokes the macro of each item.
-    let mut referrer = String::from("#![allow(warnings)]\n");
+    let mut referrer = crate_header(flags);
     let mut referrer_lines = Vec::new();
     let mut items = g.items.clone();
     items.sort_by_key(|item| item.id);
@@ -5150,13 +5591,265 @@ pub fn generate(seed: u64, index: usize, items_per_module: usize, features: Feat
         );
         referrer_lines.push((line, item.id));
     }
+    let (accept_referrer, accept_lines) =
+        accept_referrer(&krate, &g.mod_uses, &items, "__tl_prop_", flags);
+    let stages = stage_crates(&krate, &g.mod_uses, &items, flags);
     Case {
         config: g.cfg.clone(),
         leaker: lib,
         referrer,
         items,
         referrer_lines,
+        accept_referrer,
+        accept_lines,
+        stages,
     }
+}
+
+/// The start of every generated crate: no warnings, and `alloc` (`relative_std`), which the items
+/// that the Leaker allows (`std`, `core`, `alloc`) name.
+fn crate_header(flags: Flags) -> String {
+    let mut header = String::from("#![allow(warnings)]\n");
+    if flags.relative_std {
+        header += "extern crate alloc;\n";
+    }
+    header
+}
+
+/// The Referrer's crates of `TYPE_LEAK_PROP_FEATURES=allow_stages`: for each rule (`rules()`) and
+/// each side the crate built like the crate of the accepted items (`accept_referrer()`), and the
+/// clean one (`clean_referrer()`).
+fn stage_crates(
+    krate: &str,
+    mod_uses: &[(Vec<String>, String)],
+    items: &[Item],
+    flags: Flags,
+) -> Vec<StageCrate> {
+    let mut crates = Vec::new();
+    for rule in flags.rules() {
+        for side in ["res", "cfg"] {
+            let prefix = format!("__tl_st_{}_{}_", rule, side);
+            let (lib, lines) = accept_referrer(krate, mod_uses, items, &prefix, flags);
+            crates.push(StageCrate {
+                rule,
+                side,
+                clean: false,
+                lib,
+                lines,
+            });
+            let (lib, lines) = clean_referrer(krate, mod_uses, items, &prefix, rule, flags);
+            crates.push(StageCrate {
+                rule,
+                side,
+                clean: true,
+                lib,
+                lines,
+            });
+        }
+    }
+    crates
+}
+
+/// The `lib.rs` of a clean Referrer's crate of `allow_stages` (the crate `tlp_<rule>_<side>_clean_NNN`),
+/// and the line where each item is invoked: it copies the items that the rule left no error in, and
+/// has none of the Leaker's names but the ones that the rule allows, so a type that a copy keeps as
+/// written by mistake does not resolve. It is laid out like the ordinary Referrer's crate: the
+/// copies are at the root, and an item of a module is invoked with the path of the module only for
+/// its witnesses, unless the paths that the rule allows are relative to the module (below).
+///
+/// What the rule allows is a promise that the names resolve, and the crate keeps it:
+///
+/// - `prelude`: nothing, the prelude is the prelude (`shadowed_prelude_names()` of the harness);
+/// - `std`: `extern crate alloc;` (`crate_header()`), the other two are in every crate;
+/// - `crate`: the module `base` at the root, which re-exports the Leaker's;
+/// - `path` (`super::base`): the same, and each item invoked in a module of its own, empty, in the
+///   same place of the module tree as in the Leaker's crate, so that `super::base` is the root's
+///   (the copy of a module analyzed as a whole declares itself, at the root);
+/// - `values`, `default`: the paths of a value or of a default name `base` by `crate::` or by
+///   `super::`, and the constants `RLEN` and `ILEN` of the module of the item. So the crate has the
+///   modules of `path`, and `RLEN` and the import of `ILEN` in each.
+fn clean_referrer(
+    krate: &str,
+    mod_uses: &[(Vec<String>, String)],
+    items: &[Item],
+    macro_prefix: &str,
+    rule: &str,
+    flags: Flags,
+) -> (String, Vec<(usize, usize)>) {
+    fn invocation(krate: &str, item: &Item, macro_prefix: &str) -> String {
+        let mut module = format!("::{}", krate);
+        for m in &item.module {
+            module += &format!("::{}", m);
+        }
+        format!(
+            "::{}::{}{}!(clean path = {}{}, accept);\n",
+            krate,
+            macro_prefix,
+            item.id,
+            module,
+            if item.strict { ", strict" } else { "" }
+        )
+    }
+    fn module(
+        krate: &str,
+        path: &[String],
+        mod_uses: &[(Vec<String>, String)],
+        items: &[Item],
+        macro_prefix: &str,
+        constants: bool,
+        out: &mut String,
+    ) {
+        if constants {
+            *out += "pub const RLEN: usize = 2;\n";
+            if let Some((_, uses)) = mod_uses.iter().find(|(p, _)| p == path) {
+                for line in uses.lines().filter(|line| line.ends_with(" as ILEN;")) {
+                    *out += line;
+                    *out += "\n";
+                }
+            }
+        }
+        for item in items.iter().filter(|i| i.kind != "mod" && i.module == path) {
+            *out += &invocation(krate, item, macro_prefix);
+        }
+        for (sub, _) in mod_uses
+            .iter()
+            .filter(|(p, _)| p.len() == path.len() + 1 && p.starts_with(path))
+        {
+            *out += &format!("pub mod {} {{\n", sub.last().unwrap());
+            module(krate, sub, mod_uses, items, macro_prefix, constants, out);
+            *out += "}\n";
+        }
+    }
+    let mut text = crate_header(flags);
+    let skeleton = matches!(rule, "path" | "values" | "default");
+    let constants = matches!(rule, "values" | "default");
+    match rule {
+        "crate" | "path" | "values" | "default" => {
+            text += &format!("pub mod base {{ pub use ::{}::base::*; }}\n", krate);
+        }
+        _ => (),
+    }
+    if skeleton {
+        for (path, _) in mod_uses.iter().filter(|(p, _)| p.len() == 1) {
+            text += &format!("pub mod {} {{\n", path[0]);
+            module(
+                krate,
+                path,
+                mod_uses,
+                items,
+                macro_prefix,
+                constants,
+                &mut text,
+            );
+            text += "}\n";
+        }
+        for item in items.iter().filter(|i| i.kind == "mod") {
+            text += &invocation(krate, item, macro_prefix);
+        }
+    } else {
+        for item in items {
+            text += &invocation(krate, item, macro_prefix);
+        }
+    }
+    let lines = items
+        .iter()
+        .filter_map(|item| {
+            let call = format!("::{}{}!(", macro_prefix, item.id);
+            let at = text.lines().position(|line| line.contains(&call))?;
+            Some((at + 1, item.id))
+        })
+        .collect();
+    (text, lines)
+}
+
+/// The `lib.rs` of the second Referrer's crate of `TYPE_LEAK_PROP_ACCEPT` (the crate `tlp_a_NNN`),
+/// which copies the items that the Leaker accepts only by `LeakerResult::allow(cause)` of the
+/// causes of its errors, and the line where each item is invoked.
+///
+/// The copy keeps the part that conflicts as written, whole: the paths in it are those the item has
+/// in the Leaker's crate (`R0`, `self::R1`, `super::R1`, `super::base::B1`, `crate::base::B1`, an
+/// import `I1` or `J1`), and it is up to the user of `allow()` that they resolve to the same items
+/// in the crate of the copy. This crate makes them: the module of the Leaker's crate that the item
+/// is in is declared again with the same `use`s and a glob import of the Leaker's module, in the same
+/// place of the module tree (so that `super::` and `self::` mean the same), and the root has `base`,
+/// the glob import of the Leaker's `base` (so that `crate::base::B1` means the same). The items are
+/// copied in the module they are invoked in, as they are in the Leaker's crate (a module analyzed
+/// as a whole declares itself at the root).
+///
+/// It is a crate of its own, not a module of the other Referrer's crate, because `crate::base` is
+/// the root of the crate that has the copy: `base` at the root of the other crate would let an
+/// ordinary item that keeps a relative path by mistake resolve it, and that crate must not have one.
+///
+/// `macro_prefix` is the start of the name of the macro of each item (`__tl_prop_`), and the crates of
+/// `TYPE_LEAK_PROP_FEATURES=allow_stages` invoke `__tl_st_<rule>_<side>_` instead. The crate declares
+/// no name of the standard prelude, so that they mean what they mean in the prelude: the globs import
+/// what the Leaker's modules declare, and `shadowed_prelude_names()` of the harness checks that none of
+/// it has such a name.
+fn accept_referrer(
+    krate: &str,
+    mod_uses: &[(Vec<String>, String)],
+    items: &[Item],
+    macro_prefix: &str,
+    flags: Flags,
+) -> (String, Vec<(usize, usize)>) {
+    fn invocation(krate: &str, item: &Item, path: &[String], macro_prefix: &str) -> String {
+        let mut module = format!("::{}", krate);
+        for m in path {
+            module += &format!("::{}", m);
+        }
+        format!(
+            "::{}::{}{}!(path = {}{}, accept);\n",
+            krate,
+            macro_prefix,
+            item.id,
+            module,
+            if item.strict { ", strict" } else { "" }
+        )
+    }
+    fn module(
+        krate: &str,
+        path: &[String],
+        mod_uses: &[(Vec<String>, String)],
+        items: &[Item],
+        macro_prefix: &str,
+        out: &mut String,
+    ) {
+        if let Some((_, uses)) = mod_uses.iter().find(|(p, _)| p == path) {
+            *out += uses;
+        }
+        *out += &format!("pub use ::{}::{}::*;\n", krate, path.join("::"));
+        for item in items.iter().filter(|i| i.kind != "mod" && i.module == path) {
+            *out += &invocation(krate, item, path, macro_prefix);
+        }
+        for (sub, _) in mod_uses
+            .iter()
+            .filter(|(p, _)| p.len() == path.len() + 1 && p.starts_with(path))
+        {
+            *out += &format!("pub mod {} {{\n", sub.last().unwrap());
+            module(krate, sub, mod_uses, items, macro_prefix, out);
+            *out += "}\n";
+        }
+    }
+    let mut text = crate_header(flags);
+    text += &format!("pub mod base {{ pub use ::{}::base::*; }}\n", krate);
+    for (path, _) in mod_uses.iter().filter(|(p, _)| p.len() == 1) {
+        text += &format!("pub mod {} {{\n", path[0]);
+        module(krate, path, mod_uses, items, macro_prefix, &mut text);
+        text += "}\n";
+    }
+    // A module analyzed as a whole declares itself, at the root.
+    for item in items.iter().filter(|i| i.kind == "mod") {
+        text += &invocation(krate, item, &[], macro_prefix);
+    }
+    let lines = items
+        .iter()
+        .filter_map(|item| {
+            let call = format!("::{}{}!(", macro_prefix, item.id);
+            let at = text.lines().position(|line| line.contains(&call))?;
+            Some((at + 1, item.id))
+        })
+        .collect();
+    (text, lines)
 }
 
 /// Whether the where predicate `pred` may name a type that the Leaker leaks: a name that is not
@@ -5286,6 +5979,58 @@ fn names_primitive(text: &str) -> bool {
 fn has_word(text: &str, name: &str) -> bool {
     text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .any(|word| word == name)
+}
+
+/// Whether a predicate of a where clause of the text (from `where` up to the `{` or the `;` that
+/// ends the item) names `Self` or `Self::A`, other than the ones on `Self` itself (`Self: Sized`,
+/// `Self: 'x`).
+pub fn names_self_in_where(text: &str) -> bool {
+    text.match_indices("where ").any(|(at, _)| {
+        let clause = where_clause(&text[at + "where ".len()..]);
+        split_predicates(clause)
+            .iter()
+            .any(|pred| !pred.trim_start().starts_with("Self:") && has_word(pred, "Self"))
+    })
+}
+
+/// The where clause at the start of `text`: up to the first `{` or `;` that is not in brackets (an
+/// array type has a `;` in it).
+fn where_clause(text: &str) -> &str {
+    let mut depth = 0i32;
+    let mut previous = ' ';
+    for (at, c) in text.char_indices() {
+        match c {
+            '(' | '[' | '<' => depth += 1,
+            ')' | ']' => depth -= 1,
+            '>' if previous != '-' => depth -= 1,
+            '{' | ';' if depth <= 0 => return &text[..at],
+            _ => (),
+        }
+        previous = c;
+    }
+    text
+}
+
+/// The predicates of a where clause: the text split at the commas that are not in brackets.
+fn split_predicates(clause: &str) -> Vec<&str> {
+    let (mut depth, mut start) = (0i32, 0);
+    let mut out = Vec::new();
+    let mut previous = ' ';
+    for (at, c) in clause.char_indices() {
+        match c {
+            '(' | '[' | '<' => depth += 1,
+            ')' | ']' => depth -= 1,
+            '>' if previous != '-' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&clause[start..at]);
+                start = at + 1;
+            }
+            _ => (),
+        }
+        previous = c;
+    }
+    out.push(&clause[start..]);
+    out
 }
 
 /// Drops the predicates that use a generic whose bound names `Self` (`X: Fn(&Self) -> u8`): the

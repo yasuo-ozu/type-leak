@@ -3,7 +3,7 @@ name = "type-leak-test-diagnostic"
 version = "0.0.0"
 edition = "2018"
 publish = false
-description = "Crate failing to compile with NotInternableErrors, for tests/diagnostic.rs"
+description = "Crate failing to compile with the errors of the Leaker, for tests/diagnostic.rs"
 
 [lib]
 path = "lib.rs"

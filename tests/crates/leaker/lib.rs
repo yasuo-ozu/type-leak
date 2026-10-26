@@ -837,7 +837,7 @@ pub mod scoped {
         where ::std::vec::Vec<T>: ::core::clone::Clone {}
     }
 
-    // The errors of the analysis (`NotInternableError::items()`), reported through a macro:
+    // The errors of the analysis (`Vec<ErrorItem>`), reported through a macro:
     // several offending paths (a lifetime that is elided in a path), each with its span and notes.
     scope_errors! {
         name = SCOPE_ERRORS_MULTI,
@@ -861,7 +861,7 @@ pub mod scoped {
 /// `__tl_report_<id>!` says what the Leaker found (tests/cross_crate.rs).
 pub mod kinds {
     use core::marker::PhantomData;
-    use type_leak_test_macro::prop_leak;
+    use type_leak_test_macro::{prop_leak, prop_leak_accept, prop_leak_result};
 
     #[derive(Debug, Clone, Copy, PartialEq, Default)]
     pub struct Rel(pub u8);
@@ -1581,6 +1581,44 @@ pub mod kinds {
             Wrap<U>: Default;
     }
 
+    // `Self: 'x` brings `Self` into the context of an entry that does not name it (F47): the bound
+    // of the method's generic that F26 leaves out stays out, as the entry does not need it.
+
+    /// `Y: 'x` pulls `Self: 'x` into the context of `Wrap<Y>`.
+    #[prop_leak(id = 9200, allow_self = true, prelude = true)]
+    pub trait SelfOutlives {
+        fn m<'x, Y: 'x + Iterator<Item = u8>>(&self)
+        where
+            Self: 'x,
+            Y: Fn(::type_leak_test_leaker::kinds::WIt<Y>) -> u8,
+            Wrap<Y>: Default;
+    }
+
+    /// The same for an impl of a trait: `Self` is its self type.
+    pub trait SelfOutlivesTr<'a> {
+        fn m<'x, Y: 'x + Iterator<Item = u8>>(&'x self) -> u8
+        where
+            Self: 'x,
+            Y: Fn(::type_leak_test_leaker::kinds::WIt<Y>) -> u8,
+            ::type_leak_test_leaker::kinds::Wrap<Y>: Default;
+    }
+
+    pub struct SelfOutlivesHost;
+
+    #[prop_leak(id = 9201, allow_self = true, prelude = true)]
+    impl<'a> ::type_leak_test_leaker::kinds::SelfOutlivesTr<'a>
+        for ::type_leak_test_leaker::kinds::SelfOutlivesHost
+    {
+        fn m<'x, Y: 'x + Iterator<Item = u8>>(&'x self) -> u8
+        where
+            Self: 'x,
+            Y: Fn(::type_leak_test_leaker::kinds::WIt<Y>) -> u8,
+            Wrap<Y>: Default,
+        {
+            loop {}
+        }
+    }
+
     // The scopes of an item that share names, from the findings of a downstream crate
     // (`announce`, tests/downstream_findings.rs): the Repeater's impl of every entry has the
     // generics, bounds and where clause of the scope the entry is written in, and no others.
@@ -1764,6 +1802,381 @@ pub mod kinds {
             let a: crate::kinds::vals::Local = ::core::default::Default::default();
             let b: Declared = Declared(1);
             a.count() + b.0 as usize + <crate::kinds::vals::Local>::BYTES
+        }
+    }
+
+    // Conflicts that the Leaker rejects, accepted with `LeakerResult::allow()` of their causes
+    // (`prop_leak_accept`): the part that conflicts is copied as written, whole, and the rest is
+    // leaked as usual. The Referrer's crate invokes them with `accept`, in a module that names the
+    // types and the trait that the copies keep as written (`accepted`).
+
+    /// A type of the module that has a lifetime.
+    pub struct Held<'b>(pub &'b u8);
+
+    /// The lifetime `'b` of the method is in the output, and the only input that names it is
+    /// `Held<'b>`, a path that is not a trait object. Leaked, the copy would have `'b` in no input
+    /// that constrains it (E0195 in the impl of the host), so the Leaker rejects it
+    /// (`UnconstrainedLifetime`, the cause is the type). Accepted, `Held<'b>` is copied as
+    /// written.
+    #[prop_leak_accept(id = 9184, allow_self = true, prelude = true)]
+    pub trait HeldInput {
+        fn f<'b>(&self, x: Held<'b>) -> &'b u8;
+    }
+
+    /// Two traits of the module, a type that takes a trait object with an elided lifetime in its
+    /// generics, and one that takes it without.
+    pub trait ElidedTr {}
+    pub trait PlainTr {}
+    pub struct Elided<'e, T: ?Sized + 'e>(pub PhantomData<&'e T>);
+    pub struct Bare<T: ?Sized>(pub PhantomData<T>);
+
+    /// `f` takes `Elided<'_, dyn ElidedTr>`: the trait object inherits the lifetime of its path,
+    /// which is elided and cannot be named in the impl of the Repeater, so the type cannot be
+    /// leaked, and `ElidedTr` is relative (`RelativePath`, the cause is the trait). Accepted, `f` is
+    /// copied as written. `g` takes `Bare<dyn PlainTr>`, where `dyn PlainTr` is leaked as usual, and
+    /// its entry is still replaced in the copy. (The traits differ: the Visitor finds a leaked type
+    /// by its tokens, and would replace a `dyn ElidedTr` in `f` by the entry of `g`, with another
+    /// lifetime.)
+    #[prop_leak_accept(id = 9185, allow_self = true, prelude = true)]
+    pub trait ElidedAndPlain {
+        fn f(&self, x: ::type_leak_test_leaker::kinds::Elided<'_, dyn ElidedTr>);
+        fn g(&self, x: ::type_leak_test_leaker::kinds::Bare<dyn PlainTr>);
+    }
+
+    /// A struct analyzed in `enter_generics`, where `Self` has no meaning: a type that names it is
+    /// copied as written. `rel` is leaked as usual.
+    #[prop_leak_accept(id = 9186, allow_self = true, prelude = true, scope = "generics")]
+    pub struct NoSelfMeaning {
+        pub rel: Rel,
+        pub me: Wrap<Self>,
+    }
+
+    /// The same trait object in `f` and `g`, which differ by the path that holds it. In `f` the
+    /// path has an elided lifetime, so the trait object takes it, and the type cannot be leaked:
+    /// it is copied as written, whole (`RelativePath`, the cause is the trait). In `g` the path has
+    /// none, and `dyn SharedTr` is leaked as usual. The Visitor finds a leaked type by its tokens and
+    /// its context, and the `dyn SharedTr` of `f` has both: it must leave the part as written, or
+    /// `f` would take the entry of `g`, a trait object with another lifetime (E0308 in the impl of
+    /// the host).
+    pub trait SharedTr {}
+    #[prop_leak_accept(id = 9187, allow_self = true, prelude = true)]
+    pub trait ElidedAndBare {
+        fn f(&self, x: ::type_leak_test_leaker::kinds::Elided<'_, dyn SharedTr>);
+        fn g(&self, x: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>);
+    }
+
+    /// Like `ElidedAndBare`, with a second type argument in `f` that is relative too. Only the trait
+    /// object is reported and accepted (`RelativePath`, the cause is the trait): `dyn SharedTr` in
+    /// `f` is copied as written, and `Rel` beside it is an entry like any other, so the Referrer's
+    /// crate, which does not name `Rel`, replaces it (E0412 if it were copied as written).
+    pub struct ElidedPair<'e, T: ?Sized + 'e, U>(pub PhantomData<(&'e T, U)>);
+    #[prop_leak_accept(id = 9189, allow_self = true, prelude = true)]
+    pub trait ElidedWithSibling {
+        fn f(&self, x: ::type_leak_test_leaker::kinds::ElidedPair<'_, dyn SharedTr, Rel>);
+        fn g(&self, x: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>);
+    }
+
+    /// `a1` is an entry (`Wrap<Y>`, with the bound `Y: Fn(Rel)` in its context). In `ai`, `impl
+    /// Into<Wrap<Y>>` is a generic of the method whose bound names it, and the copy would write the
+    /// entry as a path through the Repeater there, in a predicate of the method, where rustc cannot
+    /// prove the bound `Y: Fn(Rel)` of its generics: the Leaker rejects it (`UnprovableBound`, the
+    /// cause is the type). Accepted, the `impl Into<Wrap<Y>>` is copied as written, and `a1` and
+    /// the `Rel` of the where predicate are replaced. The tokens and the context of the `Wrap<Y>`
+    /// in `ai` are those of `a1`'s, so the Visitor tells them by where they are, or it would write
+    /// the path in the bound of `ai` (E0277).
+    #[prop_leak_accept(id = 9188, allow_self = true, prelude = true)]
+    pub trait EntryAndBound {
+        fn m<Y: Clone>(&self, a1: Wrap<Y>, ai: impl Into<Wrap<Y>>)
+        where
+            Y: Fn(Rel) -> u8;
+    }
+
+    // Items analyzed together, whose conflicts are accepted: a part that a signature made is copied
+    // as written in a signature like it only (F48). The Referrer's crate copies each item alone,
+    // `accepted` where it names `Held` and `Wrap`, `unnamed` where it names nothing.
+
+    // E0195: `Held<'b>` is the only input of `f` that names `'b`, which its output names too. `g`
+    // has no output, and `HeldHolder` is another item, where `Held<'b>` is an entry.
+    type_leak_test_macro::shared_leak! {
+        id = 9202;
+        items [
+            pub trait HeldInTwoMethods {
+                fn f<'b>(&self, x: Held<'b>) -> &'b u8;
+                fn g<'b>(&self, x: Held<'b>);
+            }
+            pub struct HeldHolder<'b> {
+                pub held: Held<'b>,
+            }
+        ];
+    }
+
+    // E0106: the entry `Wrap<T>` adds `'a` to the one lifetime of the inputs of `f`, whose output
+    // is elided (`T: 'a` is in its context). `g` and `k` have a receiver, `h` has no output.
+    type_leak_test_macro::shared_leak! {
+        id = 9203;
+        items [
+            pub trait ElidedInOneMethod<'a, T: 'a> {
+                fn f(x: &u8, y: Wrap<T>) -> &u8;
+                fn g(&self, y: Wrap<T>);
+                fn h(y: Wrap<T>);
+                fn k(&self, y: Wrap<T>) -> &u8;
+            }
+            pub struct ElidedHolder<'a, T: 'a>(pub PhantomData<&'a T>, pub Wrap<T>);
+        ];
+    }
+
+    // E0106: the lifetime `'a` that `x` keeps is in the projection of the entry `Wrap<T>` in `y`
+    // too, and rustc counts the lifetimes of each input apart (F49). `g` has the type in the input
+    // that keeps `'a`, `h` names `'a` in the output, and `k` has a receiver.
+    type_leak_test_macro::shared_leak! {
+        id = 9204;
+        items [
+            #[allow(unknown_lints, mismatched_lifetime_syntaxes)]
+            pub trait KeptInOtherInput<'a, T: 'a> {
+                fn f(x: &'a u8, y: Wrap<T>) -> &u8;
+                fn g(x: (&'a u8, Wrap<T>)) -> &u8;
+                fn h(x: &'a u8, y: Wrap<T>) -> &'a u8;
+                fn k(&self, x: &'a u8, y: Wrap<T>) -> &u8;
+            }
+            pub struct KeptHolder<'a, T: 'a>(pub PhantomData<&'a T>, pub Wrap<T>);
+        ];
+    }
+
+    // Errors that the Leaker does not decide on (`prop_leak_result`): its macro carries them with the
+    // Referrer, and the Referrer's macro allows some (`allow(..)`), reports the others, and copies
+    // the item either way. The Leaker does not allow the prelude, so a relative `Clone` or
+    // `core::fmt::Debug` in a bound is an error (`RelativePath`, the cause is the trait). 9190 to 9192
+    // are copied in the Referrer's crate (`accepted`); 9193 in `tests/crates/diagnostic_result`.
+
+    /// `Clone` as the bound of the trait's generic, as a supertrait and in the bound of a method:
+    /// three errors with one cause, dropped by `allow(trait Clone)`. The copy keeps the three as
+    /// written.
+    #[prop_leak_result(id = 9190, allow_self = true)]
+    pub trait PreludeBounds<T: Clone>: Clone {
+        fn rel(&self, t: T) -> Rel;
+        fn dup<U: Clone>(&self, u: U) -> Pair<Wrap<T>, Wrap<U>>;
+    }
+
+    /// A path headed by `core` or `std` with no leading `::`, in a bound of the trait's generic and in
+    /// a where predicate: two errors, dropped by `allow(std_crates)`.
+    #[prop_leak_result(id = 9191, allow_self = true)]
+    pub trait StdBounds<T: core::fmt::Debug> {
+        fn rel(&self, t: T) -> Rel;
+        fn show<U>(&self, u: Wrap<U>) -> Rel
+        where
+            U: std::fmt::Display;
+    }
+
+    /// A trait of the module in a bound, twice, and a type of the module with an elided lifetime:
+    /// two causes (`PlainTr`, `Held<'_>`), allowed by writing them, `allow(trait PlainTr, type
+    /// Held<'_>)`.
+    #[prop_leak_result(id = 9192, allow_self = true)]
+    pub trait ExplicitCauses<T: PlainTr> {
+        fn held(&self, x: Held<'_>) -> Rel;
+        fn plain<U: PlainTr>(&self, u: U) -> Wrap<T>;
+    }
+
+    /// Three errors, of which the Referrer's macro allows one (`allow(trait Clone)`) and reports
+    /// two: `core::fmt::Debug` and `Held<'_>`. The copy is made either way.
+    #[prop_leak_result(id = 9193, allow_self = true)]
+    pub trait Denied<T: Clone> {
+        fn held(&self, x: Held<'_>) -> Rel;
+        fn show<U: core::fmt::Debug>(&self, u: Wrap<U>) -> Wrap<T>;
+    }
+
+    // Parts that the Referrer must find to leave them as written (tests/findings.rs F18, F43 to
+    // F45). Their trait objects take their lifetime from the path around them (`ObjOf`), and the
+    // entry `dyn SharedTr` of `Bare<dyn SharedTr>` is `+ 'static`: a copy that replaced the one in a
+    // part would not be the original type (E0308 in the Referrer's crate). The paths of `ObjOf` and
+    // `Bare` are absolute, as the names of this crate: the copies of the parts resolve in the
+    // Referrer's crate.
+
+    /// A path whose third parameter has a lifetime bound: a trait object there is `+ 'a`.
+    pub struct ObjOf<'a, T: ?Sized, O: ?Sized + 'a>(pub PhantomData<(&'a (), *const T, *const O)>);
+    pub trait ObjMarker {}
+    impl<'a, S: ?Sized> ObjMarker for ObjOf<'a, S, dyn SharedTr + 'a> {}
+
+    /// `Held<'b>` is the only input of `f` that holds the lifetime of the method, and it is the
+    /// type of a crate (this one, by its own name): an optional entry, which a strict Referrer
+    /// replaces. The copy would have `'b` in no input that constrains it, early-bound where the
+    /// trait has it late-bound (E0195 in the impl of the host). The Leaker copies it as written for
+    /// every Referrer (F18), and the Referrer's crate resolves the path. `g` has it in a box, and in
+    /// the output; `Rel` is an entry beside it.
+    #[prop_leak(id = 9194, allow_self = true, prelude = true)]
+    pub trait OptionalHoldsLifetime {
+        fn f<'b>(&self, x: ::type_leak_test_leaker::kinds::Held<'b>, r: Rel) -> &'b u8;
+        fn g<'c>(
+            &self,
+            x: Box<::type_leak_test_leaker::kinds::Held<'c>>,
+        ) -> ::type_leak_test_leaker::kinds::Held<'c>;
+    }
+
+    /// `Self` is denied (`allow_self = false`), and `T: PartialEq<Self>` names it, so the type that
+    /// uses `T` is a conflict (`DeniedSelfInBounds`), copied as written, `dyn SharedTr + 'a`
+    /// included. No entry names `Self`: the top-level context of the trait has to record it for
+    /// the Visitor to find the part (F44). `g` has the entry `dyn SharedTr`, `+ 'static`.
+    #[prop_leak_accept(id = 9195, allow_self = false, prelude = true)]
+    pub trait DeniedSelfObject<'a> {
+        fn f<T: PartialEq<Self>>(
+            &self,
+            x: ::type_leak_test_leaker::kinds::ObjOf<'a, T, dyn SharedTr>,
+        );
+        fn g(&self, y: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>);
+    }
+
+    /// The where predicate of the trait names `Self` (`SelfInTraitPredicate`): the type in it is
+    /// copied as written, and the impl of the host must satisfy the predicate with the
+    /// original types (F44).
+    #[prop_leak_accept(id = 9196, allow_self = true, prelude = true)]
+    pub trait PredicateObject<'a>
+    where
+        ::type_leak_test_leaker::kinds::ObjOf<'a, Self, dyn SharedTr>:
+            ::type_leak_test_leaker::kinds::ObjMarker,
+    {
+        fn g(&self, y: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>);
+    }
+
+    /// The same for the self type of an impl, whose bound names `Self` (`SelfInImplSelfType`, and
+    /// the `Self` of the bound, `UnprovableBound`): both are copied as written (F44).
+    #[prop_leak_accept(id = 9197, allow_self = true, prelude = true)]
+    impl<'a, T: ::core::convert::AsRef<Option<Self>>>
+        ::type_leak_test_leaker::kinds::ObjOf<'a, T, dyn SharedTr>
+    {
+        pub fn g(&self, _y: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>) {}
+    }
+
+    /// A struct nested in a module (`scope = "mod"`) with a generic whose bound names its `Self`,
+    /// and a field that names it too: `NestedSelfInBounds`, copied as written. The macro writes no
+    /// entry that names the `Self` of the struct, so the visitor has no `with_nested_self()` (F45):
+    /// it must leave the part all the same. `bare` is an entry beside it.
+    #[prop_leak_accept(
+        id = 9198,
+        allow_self = true,
+        prelude = true,
+        scope = "mod",
+        no_nested_self = true
+    )]
+    pub struct NestedSelfObject<'a, T: ::core::convert::AsRef<Self>> {
+        pub obj: ::type_leak_test_leaker::kinds::ObjOf<'a, (Self, T), dyn SharedTr>,
+        pub bare: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>,
+    }
+
+    /// An impl nested in the scope of a trait (`View::enter_impl()` in `enter_trait()`), with the
+    /// generic of the trait, whose bound names the `Self` of the trait: that `Self` has no name in
+    /// the impl, so the type that uses `T` has no context (`UnnameableSelf`), and is copied as
+    /// written (F43). The Referrer's macro nests the impl in a method of the trait, as the Leaker
+    /// nested the scopes. `Bare<dyn SharedTr>` is an entry beside it.
+    pub struct NestedHost;
+    type_leak_test_macro::nested_leak! {
+        id = 9199;
+        scope trait Tr<T: ?Sized + ::core::convert::AsRef<Self>>;
+        nested impl<'a> ::type_leak_test_leaker::kinds::NestedHost;
+        types [
+            <'a, T: ?Sized> => ::type_leak_test_leaker::kinds::ObjOf<'a, T, dyn SharedTr>;
+            <> => ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>;
+        ];
+    }
+
+    // F50 to F52 (`tests/findings.rs`): what a rule after the analysis, a nested item and an
+    // unrelated error used to get wrong. Each fails to build on the code before its fix.
+
+    /// F50, 9205: the path of the value is relative (`core::mem::size_of`, no leading `::`), and
+    /// `Rel` is in its arguments. `allow_std_crates()` after the analysis drops the path, and the
+    /// copy writes it with `Rel` as written: a crate that does not name `Rel` cannot build it. The
+    /// error must stay until `Rel` is allowed too (`stages = true`: the macro makes the copy after
+    /// each rule, in a crate of the Referrer that invokes it `clean`, and gets it only if the rule
+    /// left no error).
+    #[prop_leak_accept(
+        id = 9205,
+        allow_self = true,
+        scope = "mod",
+        prelude = true,
+        redeclare = true,
+        values = true,
+        stages = true
+    )]
+    pub trait ValuePathArguments {
+        fn size(&self) -> usize {
+            core::mem::size_of::<*const Rel>()
+        }
+    }
+
+    /// F51, 9206: `Wrap<Self>` in the bound of `T` is a leaked type, beside the entry `Link<Self,
+    /// T>` that uses `T` and so carries the bound. The copy writes the bound as a path through the
+    /// Repeater, and rustc cannot prove the bound of the impl of the entry in the environment
+    /// that has the rewritten form (E0277, for the entry in the last field: rustc proves the type
+    /// is `Sized` there). `intern_struct()` rejects it (`UnprovableBound`); the nested item with
+    /// `nested_self_entries` has to as well.
+    #[prop_leak(
+        id = 9206,
+        allow_self = true,
+        scope = "mod",
+        prelude = true,
+        nested_self_entries = true
+    )]
+    pub struct LeakedInBound<T: AsRef<Wrap<Self>>> {
+        pub rel: Rel,
+        pub link: Link<Self, T>,
+    }
+
+    /// A relative trait that takes a type: an unrelated error in a method of `OptionalNextToError`.
+    pub trait GenTr<A: ?Sized> {}
+
+    /// F52, 9207: the type of this crate by its own name (`Wrap<(T, Wrap<u8>)>`, `Wrap<u8>`) is an
+    /// optional entry, which a strict Referrer replaces. The where predicate of the trait names both
+    /// in an `Fn`, and `Y: GenTr<Self::A0>` is copied as written (`GenTr` is relative): its `Self::A0`
+    /// is resolved by the impl of the host, whose predicate must be the one of the trait. So the
+    /// optional entries in the predicate stay as written, as they do beside `Y: Into<Self::A0>`
+    /// (E0277 "expected an `Fn(&Wrap<..>)` closure, found `T`" otherwise).
+    #[prop_leak_accept(id = 9207, allow_self = true, prelude = true, strict = true)]
+    pub trait OptionalNextToError<T>
+    where
+        T: ::core::ops::Fn(
+            &::type_leak_test_leaker::kinds::Wrap<(T, ::type_leak_test_leaker::kinds::Wrap<u8>)>,
+        ) -> u8,
+    {
+        type A0;
+        fn m<Y>(&self)
+        where
+            Y: GenTr<Self::A0>;
+    }
+
+    // Issue 3 of `tests/downstream_findings.rs`: the names `allow_prelude()` took for the prelude.
+
+    /// Issue 3, 9208: `None`, `Some`, `Ok` and `Err` in values, and `DoubleEndedIterator +
+    /// ExactSizeIterator` in a bound, are names of the prelude of every edition. `allow_prelude()`
+    /// refused them (`use absolute path: 'None'`), so the Leaker rejected the item, which the
+    /// Referrer's crate then lacks (`PreludeNamesCopy`). The copy writes them as they are; the
+    /// entries are the relative types.
+    #[prop_leak(
+        id = 9208,
+        allow_self = true,
+        scope = "mod",
+        prelude = true,
+        redeclare = true,
+        values = true,
+        bodies = true
+    )]
+    pub trait PreludeNames {
+        const NOTHING: Option<vals::Local> = None;
+
+        fn pick(&self, n: u8) -> Option<vals::Local> {
+            match n {
+                0 => None,
+                _ => Some(Default::default()),
+            }
+        }
+
+        fn check(&self, n: u8) -> Result<vals::Local, u8> {
+            if n > 0 {
+                Ok(Default::default())
+            } else {
+                Err(n)
+            }
+        }
+
+        fn count<I: DoubleEndedIterator + ExactSizeIterator>(&self, it: I) -> usize {
+            it.len() + it.rev().count()
         }
     }
 }

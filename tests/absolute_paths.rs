@@ -1,9 +1,9 @@
-//! The absolute paths that the help of an error suggests (`ABSOLUTE_PATHS` of `src/error.rs`).
+//! The absolute paths that the help of an error suggests (`KNOWN_NAMES` of `src/util.rs`).
 //!
 //! A relative path that cannot be leaked (a bound, a const expression, a type with an elided
 //! lifetime) is an error with the headline `use absolute path: '..'`, and for a name of the
 //! standard prelude or a primitive type, a help that says what to write: ``use `::std::vec::Vec`
-//! instead of `Vec` ``. The help is the fix that a user copies, so each of the 54 names has to give
+//! instead of `Vec` ``. The help is the fix that a user copies, so each of the 62 names has to give
 //! the right path, and the path has to be valid.
 //!
 //! The table is written once, by the macro `absolute_paths!`, which makes both what the tests
@@ -73,6 +73,8 @@ absolute_paths! {
     Default = core::default::Default, trait [];
     Iterator = core::iter::Iterator, trait [];
     IntoIterator = core::iter::IntoIterator, trait [];
+    DoubleEndedIterator = core::iter::DoubleEndedIterator, trait [];
+    ExactSizeIterator = core::iter::ExactSizeIterator, trait [];
     Extend = core::iter::Extend, trait [<u8>];
     FromIterator = core::iter::FromIterator, trait [<u8>];
     ToOwned = std::borrow::ToOwned, trait [];
@@ -80,6 +82,13 @@ absolute_paths! {
     drop = core::mem::drop, value [::<u8>];
     TryFrom = core::convert::TryFrom, trait [<u8>];
     TryInto = core::convert::TryInto, trait [<u8>];
+    Future = core::future::Future, trait [];
+    // From rustc 1.64.
+    IntoFuture = core::future::IntoFuture, trait [];
+    size_of = core::mem::size_of, value [::<u8>];
+    size_of_val = core::mem::size_of_val, value [::<u8>];
+    align_of = core::mem::align_of, value [::<u8>];
+    align_of_val = core::mem::align_of_val, value [::<u8>];
     Some = core::option::Option::Some, value [::<u8>];
     None = core::option::Option::None, value [::<u8>];
     Ok = core::result::Result::Ok, value [::<u8, u8>];
@@ -137,23 +146,24 @@ fn forms(name: &str) -> Vec<(&'static str, String, String)> {
 #[test]
 fn a_bare_name_gets_the_help_with_its_absolute_path() {
     let table = table();
-    assert_eq!(table.len(), 54);
+    assert_eq!(table.len(), 62);
     for (name, absolute) in &table {
         let help = format!("use `{}` instead of `{}`", absolute, name);
         for (form, source, message) in forms(name) {
             let item: ItemTrait = parse_str(&source).unwrap();
-            let err = Leaker::new()
-                .intern_trait(&item, true)
-                .err()
-                .unwrap_or_else(|| panic!("`{}` is accepted: {}", name, source));
+            let mut leaker = Leaker::new();
+            leaker.intern_trait(&item, true);
+            let result = leaker.result();
+            let err = result.errors();
+            assert!(!err.is_empty(), "`{}` is accepted: {}", name, source);
             let context = format!("{} as a {}: {}", name, form, source);
-            let items: Vec<_> = err.items().collect();
+            let items = err;
             assert_eq!(items.len(), 1, "{}", context);
             assert_eq!(items[0].message, message, "{}", context);
-            // It is the help of the error, and `NotInternableError::help()`. It is no note: the
-            // notes say why.
+            // It is the help of the error, and of the first one. It is no note: the notes say
+            // why.
             assert_eq!(items[0].help_text(), Some(help.as_str()), "{}", context);
-            assert_eq!(err.help(), Some(help.clone()), "{}", context);
+            assert_eq!(err[0].help_text(), Some(help.as_str()), "{}", context);
             assert!(
                 items[0].notes.iter().all(|(_, note)| *note != help),
                 "{}",
@@ -161,7 +171,7 @@ fn a_bare_name_gets_the_help_with_its_absolute_path() {
             );
             // And it is in the `syn::Error`, which stable Rust gets: the notes follow the headline,
             // then the help.
-            let rendered = syn::Error::from(err).to_string();
+            let rendered = to_syn_error(err).to_string();
             assert!(rendered.starts_with(&message), "{}: {}", context, rendered);
             assert!(
                 rendered.ends_with(&format!("\n  = help: {}\n", help)),

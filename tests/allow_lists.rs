@@ -1,4 +1,4 @@
-//! The names that `LeakerConfig::allow_primitive()` and `LeakerConfig::allow_std_prelude()` allow.
+//! The names that `LeakerConfig::allow_primitive()` and `LeakerConfig::allow_prelude()` allow.
 //!
 //! An allowed path is the same on both sides, so it is not leaked: a bound that names it is fine,
 //! and a type that names it has no entry. Without the option the same name is a relative path:
@@ -18,44 +18,60 @@ const PRIMITIVES: [&str; 17] = [
     "i128", "isize", "f32", "f64",
 ];
 
-/// The names that `allow_std_prelude()` allows.
-const PRELUDE: [&str; 31] = [
-    "Box",
-    "String",
-    "Vec",
-    "Option",
-    "Result",
-    "Copy",
-    "Send",
-    "Sized",
-    "Sync",
-    "Unpin",
-    "Drop",
-    "Fn",
-    "FnMut",
-    "FnOnce",
-    "Clone",
-    "PartialEq",
-    "PartialOrd",
-    "Eq",
-    "Ord",
-    "AsRef",
-    "AsMut",
-    "Into",
-    "From",
-    "Default",
-    "Iterator",
-    "IntoIterator",
-    "Extend",
-    "FromIterator",
-    "ToOwned",
-    "ToString",
-    "drop",
+/// The names that `allow_prelude()` allows, with their absolute paths: those of the prelude of
+/// every edition (rustc 1.56).
+const PRELUDE: [(&str, &str); 36] = [
+    ("Copy", "::core::marker::Copy"),
+    ("Send", "::core::marker::Send"),
+    ("Sized", "::core::marker::Sized"),
+    ("Sync", "::core::marker::Sync"),
+    ("Unpin", "::core::marker::Unpin"),
+    ("Drop", "::core::ops::Drop"),
+    ("Fn", "::core::ops::Fn"),
+    ("FnMut", "::core::ops::FnMut"),
+    ("FnOnce", "::core::ops::FnOnce"),
+    ("drop", "::core::mem::drop"),
+    ("Box", "::std::boxed::Box"),
+    ("ToOwned", "::std::borrow::ToOwned"),
+    ("Clone", "::core::clone::Clone"),
+    ("PartialEq", "::core::cmp::PartialEq"),
+    ("PartialOrd", "::core::cmp::PartialOrd"),
+    ("Eq", "::core::cmp::Eq"),
+    ("Ord", "::core::cmp::Ord"),
+    ("AsRef", "::core::convert::AsRef"),
+    ("AsMut", "::core::convert::AsMut"),
+    ("Into", "::core::convert::Into"),
+    ("From", "::core::convert::From"),
+    ("Default", "::core::default::Default"),
+    ("Iterator", "::core::iter::Iterator"),
+    ("Extend", "::core::iter::Extend"),
+    ("IntoIterator", "::core::iter::IntoIterator"),
+    ("DoubleEndedIterator", "::core::iter::DoubleEndedIterator"),
+    ("ExactSizeIterator", "::core::iter::ExactSizeIterator"),
+    ("Option", "::core::option::Option"),
+    ("Some", "::core::option::Option::Some"),
+    ("None", "::core::option::Option::None"),
+    ("Result", "::core::result::Result"),
+    ("Ok", "::core::result::Result::Ok"),
+    ("Err", "::core::result::Result::Err"),
+    ("String", "::std::string::String"),
+    ("ToString", "::std::string::ToString"),
+    ("Vec", "::std::vec::Vec"),
 ];
 
-/// The names of the prelude of the 2021 edition: the crate may be of the 2018, so they are not
-/// allowed.
-const PRELUDE_2021: [&str; 6] = ["TryFrom", "TryInto", "Some", "None", "Ok", "Err"];
+/// The names of a later prelude (2021, 2024, rustc 1.80) and their absolute paths: the crate of the
+/// copy may be of another edition or version, so no option allows them.
+const PRELUDE_LATER: [(&str, &str); 9] = [
+    ("TryFrom", "::core::convert::TryFrom"),
+    ("TryInto", "::core::convert::TryInto"),
+    ("FromIterator", "::core::iter::FromIterator"),
+    ("Future", "::core::future::Future"),
+    ("IntoFuture", "::core::future::IntoFuture"),
+    ("size_of", "::core::mem::size_of"),
+    ("size_of_val", "::core::mem::size_of_val"),
+    ("align_of", "::core::mem::align_of"),
+    ("align_of_val", "::core::mem::align_of_val"),
+];
 
 fn config(primitive: bool, prelude: bool) -> LeakerConfig {
     let mut config = LeakerConfig::new();
@@ -63,7 +79,7 @@ fn config(primitive: bool, prelude: bool) -> LeakerConfig {
         config.allow_primitive();
     }
     if prelude {
-        config.allow_std_prelude();
+        config.allow_prelude();
     }
     config
 }
@@ -105,14 +121,14 @@ fn forms(name: &str) -> Vec<Form> {
 fn analyze(config: LeakerConfig, source: &str) -> std::result::Result<Vec<String>, String> {
     let item: ItemTrait = parse_str(source).unwrap();
     let mut leaker = Leaker::from_config(config);
-    leaker
-        .intern_trait(&item, true)
-        .map_err(|err| err.to_string())?;
-    Ok(leaker
-        .finish()
-        .iter()
-        .map(|ty| quote!(#ty).to_string())
-        .collect())
+    leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().map_err(|err| {
+        err.iter()
+            .map(|item| item.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
+    Ok(referrer.iter().map(|ty| quote!(#ty).to_string()).collect())
 }
 
 /// `names` are allowed by the config `allowing`, and not by the other config, nor by none.
@@ -157,16 +173,17 @@ fn allow_primitive_allows_every_primitive_type() {
 }
 
 #[test]
-fn allow_std_prelude_allows_every_name_of_the_prelude() {
-    assert_eq!(PRELUDE.iter().collect::<BTreeSet<_>>().len(), 31);
-    check(&PRELUDE, || config(false, true), &[config(true, false)]);
+fn allow_prelude_allows_every_name_of_the_prelude() {
+    let names: Vec<&str> = PRELUDE.iter().map(|(name, _)| *name).collect();
+    assert_eq!(names.iter().collect::<BTreeSet<_>>().len(), 36);
+    check(&names, || config(false, true), &[config(true, false)]);
 }
 
 #[test]
-fn the_names_of_the_2021_prelude_are_not_allowed() {
-    // Not by either option, nor by both: an edition 2018 crate has no such name.
+fn the_names_of_a_later_prelude_are_not_allowed() {
+    // Not by either option, nor by both: a crate of an earlier edition has no such name.
     let both = || config(true, true);
-    for name in PRELUDE_2021 {
+    for (name, _) in PRELUDE_LATER {
         for form in forms(name) {
             let result = analyze(both(), &form.source);
             match (&form.headline, &form.entry) {
@@ -178,22 +195,99 @@ fn the_names_of_the_2021_prelude_are_not_allowed() {
     }
 }
 
+/// The help gives the absolute path of every name that `allow_prelude()` allows or leaves out
+/// (`DoubleEndedIterator` had "e.g. `::my_crate::DoubleEndedIterator`"), and of a primitive type.
+#[test]
+fn the_help_gives_the_absolute_path_of_every_name_of_the_prelude_and_the_primitives() {
+    let primitives = PRIMITIVES.map(|name| (name, format!("::core::primitive::{}", name)));
+    let known = PRELUDE
+        .iter()
+        .chain(PRELUDE_LATER.iter())
+        .map(|(name, path)| (*name, path.to_string()))
+        .chain(primitives);
+    for (name, path) in known {
+        let item: ItemTrait = parse_str(&format!("trait Tr: {} {{}}", name)).unwrap();
+        let mut leaker = Leaker::new();
+        leaker.intern_trait(&item, true);
+        let result = leaker.result();
+        let help = result.errors()[0].help_text();
+        assert_eq!(
+            help,
+            Some(format!("use `{}` instead of `{}`", path, name).as_str()),
+            "{}",
+            name
+        );
+    }
+}
+
 #[test]
 fn the_options_allow_those_names_and_no_others() {
-    // The config says it: the paths are the names, one segment each, in the order of the lists.
-    let paths = |config: LeakerConfig| -> Vec<String> {
-        config
-            .allowed_paths
-            .iter()
-            .map(|path| quote!(#path).to_string())
-            .collect()
+    // Another name is a relative path still, with both options.
+    for name in ["Foo", "Local", "Rel", "tryfrom"] {
+        for form in forms(name) {
+            let result = analyze(config(true, true), &form.source);
+            match (&form.headline, &form.entry) {
+                (Some(headline), _) => assert_eq!(result.err().as_ref(), Some(headline)),
+                (_, Some(entry)) => assert_eq!(result.ok(), Some(vec![entry.clone()])),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+#[test]
+fn allow_crate_and_allow_std_crates_allow_the_paths_that_start_with_their_roots() {
+    // In a supertrait and in a type: the root decides, and the rest of the path does not.
+    type Allowing = fn(&mut LeakerConfig);
+    let analyze_with = |config: Allowing, source: &str| {
+        let mut allowed = LeakerConfig::new();
+        config(&mut allowed);
+        analyze(allowed, source)
     };
-    assert_eq!(paths(config(true, false)), PRIMITIVES);
-    assert_eq!(paths(config(false, true)), PRELUDE);
-    let both = paths(config(true, true));
-    assert_eq!(both.len(), PRIMITIVES.len() + PRELUDE.len());
-    // `allow_crate()` adds `crate`.
+    let roots: [(&str, Allowing, &[&str]); 2] = [
+        (
+            "crate",
+            |config| {
+                config.allow_crate();
+            },
+            &["crate::Foo", "crate::a::b::Foo"],
+        ),
+        (
+            "std crates",
+            |config| {
+                config.allow_std_crates();
+            },
+            &["std::fmt::Debug", "core::fmt::Debug", "alloc::vec::Vec"],
+        ),
+    ];
+    for (label, config, paths) in roots {
+        for path in paths {
+            for source in [
+                format!("trait Tr: {} {{}}", path),
+                format!("trait Tr {{ fn f(&self, x: {}<()>); }}", path),
+            ] {
+                // Allowed: no error, and nothing leaked.
+                assert_eq!(analyze_with(config, &source), Ok(Vec::new()), "{}", source);
+                // Not by another root, nor by none.
+                let none = analyze_with(|_| (), &source);
+                assert!(
+                    none != Ok(Vec::new()),
+                    "{} ({}) is leaked or an error",
+                    source,
+                    label
+                );
+            }
+        }
+    }
+    // A root decides by its first segment only: `my::core::X` is not `core::X`, and the absolute
+    // `::core::X` is context-free whatever is allowed.
     let mut config = LeakerConfig::new();
-    config.allow_crate();
-    assert_eq!(paths(config), ["crate"]);
+    config.allow_std_crates().allow_crate();
+    let relative = analyze(
+        config.clone(),
+        "trait Tr { fn f(&self, x: my::core::X<()>); }",
+    );
+    assert_eq!(relative, Ok(vec!["my :: core :: X < () >".to_string()]));
+    let absolute = analyze(LeakerConfig::new(), "trait Tr: ::core::fmt::Debug {}");
+    assert_eq!(absolute, Ok(Vec::new()));
 }

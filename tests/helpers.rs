@@ -1,6 +1,7 @@
 //! Tests for the helpers for macro authors: `Referrer::required()` and `Referrer::is_plain()`,
 //! the description of the Repeater impl of an entry (`Referrer::repeater_impl()`), the arguments of
-//! an entry at a use site (`Referrer::entry_args()`), and the items of a `NotInternableError`.
+//! an entry at a use site (`Referrer::entry_args()`), and the items of the errors of the analysis
+//! (`Vec<ErrorItem>`).
 //!
 //! The impl and the arguments are compared with what a macro wrote by hand before the helpers
 //! (`iter_with_self()` + `without_encoded_bounds()` + the encoders, and `generic_args()` + the
@@ -18,13 +19,22 @@ fn t(ty: Type) -> String {
     s(&ty)
 }
 
+/// The messages of the errors, one per line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn slots() -> RepeaterSlots {
     RepeaterSlots::new(parse_quote!(crate::Repeater))
 }
 
 fn config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     config
 }
 
@@ -39,9 +49,12 @@ fn analyze(item: &Item) -> (Referrer, ContextId) {
         Item::Impl(i) => leaker.intern_impl(i, true),
         Item::Mod(i) => leaker.intern_mod(i),
         _ => panic!("unsupported item"),
-    }
-    .unwrap_or_else(|e| panic!("{}: {}", s(item), e));
-    (leaker.finish(), context)
+    };
+    let referrer = leaker
+        .result()
+        .finish()
+        .unwrap_or_else(|e| panic!("{}: {}", s(item), messages(&e)));
+    (referrer, context)
 }
 
 fn generics_of(item: &Item) -> Generics {
@@ -127,8 +140,9 @@ fn required_entries_come_first_and_skip_the_optional_ones() {
         }
     );
     let mut leaker = Leaker::from_config(config());
-    leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(&item, true);
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     let all: Vec<String> = referrer.iter().map(s).collect();
     assert_eq!(all.len(), 4, "{:?}", all);
     assert!(!referrer.is_empty());
@@ -152,7 +166,9 @@ fn required_entries_come_first_and_skip_the_optional_ones() {
     }
     assert!(referrer.has_required());
     // Not affected by how the Referrer treats the optional entries.
-    let strict = referrer.clone().allow_ambiguous_crate_name(false);
+    let mut strict = result;
+    strict.allow_ambiguous_crate_name(false);
+    let strict = strict.finish().unwrap();
     assert_eq!(
         strict.required().map(|(ix, _)| ix).collect::<Vec<_>>(),
         [0, 1]
@@ -177,8 +193,8 @@ fn a_referrer_with_only_optional_entries_has_no_required_entry() {
         }
     );
     let mut leaker = Leaker::from_config(config());
-    leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     assert!(!referrer.is_empty());
     assert_eq!(referrer.iter().count(), 1);
     assert!(!referrer.must(0));
@@ -186,17 +202,15 @@ fn a_referrer_with_only_optional_entries_has_no_required_entry() {
     assert_eq!(referrer.required().count(), 0);
     // Nothing at all.
     let mut leaker = Leaker::from_config(config());
-    leaker
-        .intern_struct(
-            &parse_quote!(
-                struct S {
-                    a: u8,
-                }
-            ),
-            true,
-        )
-        .unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(
+        &parse_quote!(
+            struct S {
+                a: u8,
+            }
+        ),
+        true,
+    );
+    let referrer = leaker.result().finish().unwrap();
     assert!(referrer.is_empty());
     assert!(!referrer.has_required());
     assert_eq!(referrer.required().count(), 0);
@@ -283,8 +297,8 @@ fn a_trait_with_only_optional_external_types_has_plain_entries_for_a_marker() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, false).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_trait(&item, false);
+    let referrer = leaker.result().finish().unwrap();
     // `iter()` counts the optional entries, `required()` and `has_required()` do not.
     assert!(!referrer.is_empty());
     assert!(!referrer.has_required());
@@ -318,19 +332,22 @@ fn a_trait_with_only_optional_external_types_has_plain_entries_for_a_marker() {
     // is an error, and the macro throws the Leaker away then.
     let item: ItemTrait = parse_quote! { pub trait Tr { fn f(&self) -> Rel; } };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, false).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_trait(&item, false);
+    let referrer = leaker.result().finish().unwrap();
     assert!(referrer.has_required() && referrer.must(0));
     let item: ItemTrait = parse_quote! { pub trait Tr { fn f(&self) -> Rel<'_>; } };
-    assert!(Leaker::new().intern_trait(&item, false).is_err());
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, false);
+    let result = leaker.result();
+    assert!(result.finish().is_err());
     // `Self` is not leaked with `allow_self == false`: an absolute type that names it is left as
     // written, and is no entry for the macro to skip.
     let item: ItemTrait = parse_quote! {
         pub trait Tr { fn f(&self) -> ::std::vec::Vec<Self>; }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, false).unwrap();
-    assert!(leaker.finish().is_empty());
+    leaker.intern_trait(&item, false);
+    assert!(leaker.result().finish().unwrap().is_empty());
 }
 
 // ── repeater_impl ────────────────────────────────────────────────────────────────────────────
@@ -863,7 +880,7 @@ fn entry_args_to_ty_has_no_closure() {
     ));
 }
 
-// ── NotInternableError::items() ──────────────────────────────────────────────────────────────
+// ── The items of the errors ──────────────────────────────────────────────────────────────────
 
 #[test]
 fn items_has_every_offending_path() {
@@ -872,8 +889,11 @@ fn items_has_every_offending_path() {
             fn f(&self, x: MyType<'_>);
         }
     };
-    let err = Leaker::new().intern_trait(&item, true).unwrap_err();
-    let items: Vec<ErrorItem> = err.items().collect();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    let err = result.errors();
+    let items = &err;
     assert_eq!(items.len(), 3);
     assert_eq!(
         items
@@ -889,7 +909,7 @@ fn items_has_every_offending_path() {
     assert_eq!(
         items
             .iter()
-            .map(|item| item.tokens.to_string())
+            .map(|item| item.cause.to_token_stream().to_string())
             .collect::<Vec<_>>(),
         ["Clone", "MyBound", "MyType < '_ >"]
     );
@@ -902,7 +922,7 @@ fn items_has_every_offending_path() {
         items[1].help_text(),
         Some(
             "write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it \
-             with `LeakerConfig::allowed_paths`"
+             with `LeakerConfig::allow_path()`"
         )
     );
     assert!(items[2]
@@ -915,38 +935,39 @@ fn items_has_every_offending_path() {
     assert!(items[2].note().unwrap().contains("because of `'_`"));
     assert_eq!(items[2].notes.len(), 1);
     // The first is what the first-error accessors tell.
-    assert_eq!(err.note(), None);
-    assert_eq!(err.help().as_deref(), items[0].help_text());
-    let _ = err.span();
-    // Display is the messages, and `syn::Error` has one error for each.
+    assert_eq!(err[0].note(), None);
+    assert_eq!(err[0].help_text(), items[0].help_text());
+    let _ = err[0].span();
+    // The messages are what the headlines say, and `syn::Error` has one error for each.
     assert_eq!(
-        err.to_string(),
+        messages(err),
         items
             .iter()
             .map(|item| item.message.clone())
             .collect::<Vec<_>>()
             .join("\n")
     );
-    assert_eq!(syn::Error::from(err).into_iter().count(), items.len());
+    assert_eq!(to_syn_error(err).into_iter().count(), items.len());
 }
 
 #[test]
 fn items_of_self_without_meaning() {
-    let err = Leaker::new()
-        .enter_generics(&Generics::default(), |view| {
-            view.visit_type(&parse_quote!(Rel<Self>));
-            view.visit_type(&parse_quote!(Wrap<Self::Item>));
-        })
-        .unwrap_err();
-    let items: Vec<ErrorItem> = err.items().collect();
+    let mut leaker = Leaker::new();
+    leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_type(&parse_quote!(Rel<Self>));
+        view.visit_type(&parse_quote!(Wrap<Self::Item>));
+    });
+    let result = leaker.result();
+    let err = result.errors();
+    let items = err;
     assert_eq!(
         items
             .iter()
-            .map(|item| item.tokens.to_string())
+            .map(|item| item.cause.to_token_stream().to_string())
             .collect::<Vec<_>>(),
         ["Self", "Self :: Item"]
     );
-    for item in &items {
+    for item in items {
         assert_eq!(item.message, "`Self` has no meaning here");
         assert!(item
             .note()
@@ -961,72 +982,75 @@ fn items_of_self_without_meaning() {
 
 #[test]
 fn display_uses_the_headline_of_the_cause() {
-    // A cause that is not that a path is relative has its own headline, in `Display`, in
-    // `items()`, in `syn::Error` and in the first line of the tokens.
-    fn check(err: NotInternableError, headline: &str) {
-        assert_eq!(err.to_string(), headline);
-        assert_eq!(err.items().next().unwrap().message, headline);
-        assert!(syn::Error::from(err.clone())
-            .to_string()
-            .starts_with(headline));
+    // A cause that is not that a path is relative has its own headline, in the messages, in the
+    // first error, in `syn::Error` and in the first line of the tokens.
+    fn check(err: &[ErrorItem], headline: &str) {
+        assert_eq!(messages(err), headline);
+        assert_eq!(err[0].message, headline);
+        assert!(to_syn_error(err).to_string().starts_with(headline));
     }
-    // A default that names `Self`: it was "use absolute path: 'Self'".
-    let err = Leaker::new()
-        .intern_trait(
-            &parse_quote!(
-                trait Tr<T, U = Rel<Self>> {}
-            ),
-            true,
-        )
-        .unwrap_err();
-    assert_eq!(err.items().next().unwrap().tokens.to_string(), "Self");
+    // A default that names `Self`: it was "use absolute path: 'Self'". The cause is the whole type
+    // of the default, and the note is at the `Self` in it.
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(
+        &parse_quote!(
+            trait Tr<T, U = Rel<Self>> {}
+        ),
+        true,
+    );
+    let result = leaker.result();
+    let err = result.errors();
+    assert_eq!(err[0].cause.to_token_stream().to_string(), "Rel < Self >");
+    assert_eq!(err[0].notes[0].0.to_string(), "Self");
     check(
         err,
-        "`Rel < Self >` is in the default of a parameter, and names `Self`",
+        "`Rel<Self>` is in the default of a parameter, and names `Self`",
     );
     // `Self` where a generic has a bound that names a `Self` which has no name here.
-    let err = Leaker::new()
-        .enter_trait(
-            &parse_quote!(Tr),
-            &parse_quote!(<T: ::p::Tr<Self>>),
-            true,
-            |view| {
-                view.enter_type(&parse_quote!(S), &Generics::default(), true, |view| {
-                    view.visit_type(&parse_quote!(Rel<T>))
-                })
-                .unwrap_err()
-            },
-        )
-        .unwrap()
-        .1;
+    let mut leaker = Leaker::new();
+    leaker.enter_trait(
+        &parse_quote!(Tr),
+        &parse_quote!(<T: ::p::Tr<Self>>),
+        true,
+        |view| {
+            view.enter_type(&parse_quote!(S), &Generics::default(), true, |view| {
+                view.visit_type(&parse_quote!(Rel<T>))
+            })
+        },
+    );
+    let result = leaker.result();
+    let err = result.errors();
     check(
         err,
         "the bound of `T` mentions a `Self` which has no name here",
     );
     // `Self` in a module.
-    let err = Leaker::new()
-        .enter_mod("m", [], |view| view.visit_type(&parse_quote!(Self)))
-        .unwrap_err();
+    let mut leaker = Leaker::new();
+    leaker.enter_mod("m", [], |view| view.visit_type(&parse_quote!(Self)));
+    let result = leaker.result();
+    let err = result.errors();
     check(err, "`Self` has no meaning here");
     // A relative path keeps "use absolute path", with the reason in the notes.
-    let err = Leaker::new()
-        .intern_trait(
-            &parse_quote!(
-                trait Tr: Rel {}
-            ),
-            true,
-        )
-        .unwrap_err();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(
+        &parse_quote!(
+            trait Tr: Rel {}
+        ),
+        true,
+    );
+    let result = leaker.result();
+    let err = result.errors();
     check(err, "use absolute path: 'Rel'");
-    let err = Leaker::new()
-        .intern_trait(
-            &parse_quote!(
-                trait Tr<'a, T: 'a> {
-                    fn g(x: &Rel<T>) -> &u8;
-                }
-            ),
-            true,
-        )
-        .unwrap_err();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(
+        &parse_quote!(
+            trait Tr<'a, T: 'a> {
+                fn g(x: &Rel<T>) -> &u8;
+            }
+        ),
+        true,
+    );
+    let result = leaker.result();
+    let err = result.errors();
     check(err, "use absolute path: 'Rel < T >'");
 }

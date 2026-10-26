@@ -33,7 +33,7 @@ fn text<T: ToTokens>(t: &T) -> String {
 
 fn config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     config
 }
 
@@ -101,14 +101,13 @@ fn replace(
     found.into_inner()
 }
 
-fn analyze_item(leaker: &mut Leaker, item: &Item) -> std::result::Result<ContextId, String> {
+fn analyze_item(leaker: &mut Leaker, item: &Item) -> ContextId {
     match item {
         Item::Struct(i) => leaker.intern_struct(i, true),
         Item::Trait(i) => leaker.intern_trait(i, true),
         Item::Impl(i) => leaker.intern_impl(i, true),
         _ => unreachable!(),
     }
-    .map_err(|e| e.to_string())
 }
 
 /// How an item is analyzed: by its `intern_*` method, or through the scope of a macro.
@@ -131,26 +130,37 @@ fn round_trip(source: &str, scope: Scope) {
         Item::Trait(i) => i.ident.clone(),
         _ => parse_quote!(Impl),
     };
-    let analyzed = match (scope, &item) {
+    let context = match (scope, &item) {
         (Scope::Intern, _) => analyze_item(&mut leaker, &item),
-        (Scope::Mod, _) => leaker
-            .enter_mod("m", [name], |view| view.visit_item(&item))
-            .map(|(context, ())| context)
-            .map_err(|e| e.to_string()),
-        (Scope::Generics, Item::Struct(i)) => leaker
-            .enter_generics(&i.generics, |view| syn::visit::visit_item_struct(view, i))
-            .map(|(context, ())| context)
-            .map_err(|e| e.to_string()),
-        (Scope::Generics, Item::Trait(i)) => leaker
-            .enter_trait(&i.ident, &i.generics, true, |view| {
-                syn::visit::visit_item_trait(view, i)
-            })
-            .map(|(context, ())| context)
-            .map_err(|e| e.to_string()),
+        (Scope::Mod, _) => {
+            leaker
+                .enter_mod("m", [name], |view| view.visit_item(&item))
+                .0
+        }
+        (Scope::Generics, Item::Struct(i)) => {
+            leaker
+                .enter_generics(&i.generics, |view| syn::visit::visit_item_struct(view, i))
+                .0
+        }
+        (Scope::Generics, Item::Trait(i)) => {
+            leaker
+                .enter_trait(&i.ident, &i.generics, true, |view| {
+                    syn::visit::visit_item_trait(view, i)
+                })
+                .0
+        }
         _ => unreachable!(),
     };
-    let context = analyzed.unwrap_or_else(|e| panic!("{:?} {}: {}", scope, source, e));
-    let referrer = through_tokens(leaker.finish());
+    let result = leaker.result();
+    let errors = result.errors();
+    assert!(
+        errors.is_empty(),
+        "{:?} {}: {}",
+        scope,
+        source,
+        messages(errors)
+    );
+    let referrer = through_tokens(result.finish().unwrap());
     assert!(!required(&referrer).is_empty(), "{:?} {}", scope, source);
     let mut copy = item.clone();
     let found = replace(&referrer, context, |visitor| match scope {
@@ -277,8 +287,8 @@ fn the_context_of_a_path_named_like_a_generic_has_only_what_the_type_names() {
     for path in ["self::U", "crate::U"] {
         let item: ItemStruct = parse_str(&format!("struct S<U>(U, {0}, {0}<U>);", path)).unwrap();
         let mut leaker = Leaker::from_config(config());
-        let context = leaker.intern_struct(&item, true).unwrap();
-        let referrer = through_tokens(leaker.finish());
+        let context = leaker.intern_struct(&item, true);
+        let referrer = through_tokens(leaker.result().finish().unwrap());
         let alone = index(&referrer, path, "", false);
         let with_generic = index(&referrer, &format!("{} < U >", path), "< U >", false);
         let mut copy = item.clone();
@@ -300,8 +310,8 @@ fn the_copy_of_an_impl_has_the_entry_of_the_path_named_like_a_generic() {
         let item: ItemImpl =
             parse_str(&format!("impl<U> S<U> {{ fn f(b: {}) {{}} }}", path)).unwrap();
         let mut leaker = Leaker::from_config(config());
-        let context = leaker.intern_impl(&item, true).unwrap();
-        let referrer = through_tokens(leaker.finish());
+        let context = leaker.intern_impl(&item, true);
+        let referrer = through_tokens(leaker.result().finish().unwrap());
         let self_ty = index(&referrer, "S < U >", "< U >", false);
         let arg = index(&referrer, path, "", false);
         let mut copy = item.clone();
@@ -326,14 +336,12 @@ fn a_path_named_like_a_generic_is_replaced_in_the_arguments_of_an_impl() {
         .unwrap();
         let (_, trait_path, _) = item.trait_.clone().unwrap();
         let mut leaker = Leaker::from_config(config());
-        let (context, ()) = leaker
-            .enter_impl(&item.generics, &item.self_ty, false, |view| {
-                for seg in &trait_path.segments {
-                    view.visit_path_arguments(&seg.arguments);
-                }
-            })
-            .unwrap();
-        let referrer = through_tokens(leaker.finish());
+        let (context, ()) = leaker.enter_impl(&item.generics, &item.self_ty, false, |view| {
+            for seg in &trait_path.segments {
+                view.visit_path_arguments(&seg.arguments);
+            }
+        });
+        let referrer = through_tokens(leaker.result().finish().unwrap());
         let mut copy = trait_path.clone();
         let found = replace(&referrer, context, |visitor| {
             visitor.visit_path_mut(&mut copy)
@@ -355,10 +363,15 @@ fn a_path_named_like_a_generic_is_replaced_in_the_arguments_of_an_impl() {
 fn module_copy(source: &str) -> (Referrer, File, BTreeSet<usize>) {
     let item: ItemMod = parse_str(source).unwrap();
     let mut leaker = Leaker::from_config(config());
-    let context = leaker
-        .intern_mod(&item)
-        .unwrap_or_else(|e| panic!("{}: {}", source, e));
-    let referrer = through_tokens(leaker.finish());
+    let context = leaker.intern_mod(&item);
+    let result = leaker.result();
+    assert!(
+        result.errors().is_empty(),
+        "{}: {}",
+        source,
+        messages(result.errors())
+    );
+    let referrer = through_tokens(result.finish().unwrap());
     let mut file = File {
         shebang: None,
         attrs: Vec::new(),
@@ -443,11 +456,11 @@ fn every_entry_that_names_a_generic_of_the_name_of_a_declared_item_is_found() {
                 let item: ItemMod = parse_str(&source).unwrap();
                 let mut leaker = Leaker::from_config(config());
                 // A rejected module (a relative path that cannot be leaked) is no case.
-                let context = match leaker.intern_mod(&item) {
-                    Ok(context) => context,
+                let context = leaker.intern_mod(&item);
+                let referrer = match leaker.result().finish() {
+                    Ok(referrer) => through_tokens(referrer),
                     Err(_) => continue,
                 };
-                let referrer = through_tokens(leaker.finish());
                 let mut file = File {
                     shebang: None,
                     attrs: Vec::new(),
@@ -478,12 +491,10 @@ fn enter_mod_declaring_the_name_of_a_generic_keeps_the_entry_of_the_generic() {
     );
     let mut leaker = Leaker::from_config(config());
     let declared: [Ident; 2] = [parse_quote!(X), item.sig.ident.clone()];
-    let (context, ()) = leaker
-        .enter_mod("m", declared, |view| {
-            view.visit_item(&Item::Fn(item.clone()))
-        })
-        .unwrap();
-    let referrer = through_tokens(leaker.finish());
+    let (context, ()) = leaker.enter_mod("m", declared, |view| {
+        view.visit_item(&Item::Fn(item.clone()))
+    });
+    let referrer = through_tokens(leaker.result().finish().unwrap());
     let entry = index(&referrer, "crate :: base :: B1 < X >", "< X >", false);
     let mut file = File {
         shebang: None,
@@ -517,8 +528,8 @@ fn a_declared_name_still_hides_the_entries_that_do_not_name_a_generic() {
         }
     );
     let mut leaker = Leaker::from_config(config());
-    let context = leaker.intern_trait(&item, true).unwrap();
-    let referrer = through_tokens(leaker.finish());
+    let context = leaker.intern_trait(&item, true);
+    let referrer = through_tokens(leaker.result().finish().unwrap());
     let items = |declare: bool| {
         let mut items = vec![Item::Trait(item.clone())];
         if declare {
@@ -583,6 +594,15 @@ fn unprefixed(text: &str) -> String {
     text
 }
 
+/// The messages of `errors`, one on each line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Analyzes `item` in `scope` (`declared`: the names the module declares, with `Scope::Mod`).
 fn outcome(item: &Item, scope: Scope, declared: &[&str]) -> Outcome {
     let mut leaker = Leaker::from_config(config());
@@ -592,60 +612,63 @@ fn outcome(item: &Item, scope: Scope, declared: &[&str]) -> Outcome {
         Item::Trait(i) => i.ident.clone(),
         _ => parse_quote!(Impl),
     };
-    let result = match (scope, item) {
-        (Scope::Intern, Item::Struct(i)) => leaker.intern_struct(i, true),
-        (Scope::Intern, Item::Enum(i)) => leaker.intern_enum(i, true),
-        (Scope::Intern, Item::Trait(i)) => leaker.intern_trait(i, true),
-        (Scope::Intern, Item::Impl(i)) => leaker.intern_impl(i, true),
+    match (scope, item) {
+        (Scope::Intern, Item::Struct(i)) => {
+            leaker.intern_struct(i, true);
+        }
+        (Scope::Intern, Item::Enum(i)) => {
+            leaker.intern_enum(i, true);
+        }
+        (Scope::Intern, Item::Trait(i)) => {
+            leaker.intern_trait(i, true);
+        }
+        (Scope::Intern, Item::Impl(i)) => {
+            leaker.intern_impl(i, true);
+        }
         (Scope::Mod, _) => {
             let names: Vec<Ident> = std::iter::once(name)
                 .chain(declared.iter().map(|d| parse_str::<Ident>(d).unwrap()))
                 .collect();
-            leaker
-                .enter_mod("m", names, |view| view.visit_item(item))
-                .map(|(context, ())| context)
+            leaker.enter_mod("m", names, |view| view.visit_item(item));
         }
-        (Scope::Generics, Item::Struct(i)) => leaker
-            .enter_generics(&i.generics, |view| syn::visit::visit_item_struct(view, i))
-            .map(|(context, ())| context),
-        (Scope::Generics, Item::Enum(i)) => leaker
-            .enter_generics(&i.generics, |view| syn::visit::visit_item_enum(view, i))
-            .map(|(context, ())| context),
-        (Scope::Generics, Item::Trait(i)) => leaker
-            .enter_trait(&i.ident, &i.generics, true, |view| {
+        (Scope::Generics, Item::Struct(i)) => {
+            leaker.enter_generics(&i.generics, |view| syn::visit::visit_item_struct(view, i));
+        }
+        (Scope::Generics, Item::Enum(i)) => {
+            leaker.enter_generics(&i.generics, |view| syn::visit::visit_item_enum(view, i));
+        }
+        (Scope::Generics, Item::Trait(i)) => {
+            leaker.enter_trait(&i.ident, &i.generics, true, |view| {
                 syn::visit::visit_item_trait(view, i)
-            })
-            .map(|(context, ())| context),
+            });
+        }
         _ => unreachable!(),
     };
-    match result {
-        Ok(_) => {
-            let referrer = leaker.finish();
-            Outcome::Accepted {
-                entries: referrer
-                    .iter_with_generics()
-                    .enumerate()
-                    .map(|(ix, (ty, generics))| {
-                        (
-                            unprefixed(&text(ty)),
-                            referrer.must(ix),
-                            unprefixed(&format!(
-                                "{} {}",
-                                text(&generics),
-                                text(&generics.where_clause)
-                            )),
-                        )
-                    })
-                    .collect(),
-                modules: (0..referrer.iter().count())
-                    .map(|ix| referrer.context_module(referrer.context(ix)).is_some())
-                    .collect(),
-            }
-        }
+    match leaker.result().finish() {
+        Ok(referrer) => Outcome::Accepted {
+            entries: referrer
+                .iter_with_generics()
+                .enumerate()
+                .map(|(ix, (ty, generics))| {
+                    (
+                        unprefixed(&text(ty)),
+                        referrer.must(ix),
+                        unprefixed(&format!(
+                            "{} {}",
+                            text(&generics),
+                            text(&generics.where_clause)
+                        )),
+                    )
+                })
+                .collect(),
+            modules: (0..referrer.iter().count())
+                .map(|ix| referrer.context_module(referrer.context(ix)).is_some())
+                .collect(),
+        },
         Err(error) => Outcome::Rejected {
-            headline: unprefixed(&error.to_string()),
-            note: error.note().map(|note| unprefixed(&note)),
-            help: error.help().map(|help| unprefixed(&help)),
+            headline: unprefixed(&messages(&error)),
+            note: error[0].note().map(unprefixed),
+            help: error[0].help_text().map(unprefixed),
         },
     }
 }

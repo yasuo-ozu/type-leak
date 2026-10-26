@@ -7,7 +7,7 @@ use syn::punctuated::Punctuated;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-use type_leak::{ContextId, EncodeError, Leaker, Referrer, SelfRequirement, Visitor};
+use type_leak::{ContextId, EncodeError, Leaker, Reason, Referrer, SelfRequirement, Visitor};
 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
@@ -28,9 +28,9 @@ fn leak_traits_in(traits: &[ItemTrait]) -> (Referrer, Vec<ContextId>) {
     let mut leaker = Leaker::new();
     let contexts = traits
         .iter()
-        .map(|item| leaker.intern_trait(item, true).unwrap())
+        .map(|item| leaker.intern_trait(item, true))
         .collect();
-    (leaker.finish(), contexts)
+    (leaker.result().finish().unwrap(), contexts)
 }
 
 fn leak_trait(item: ItemTrait) -> Referrer {
@@ -83,9 +83,9 @@ fn types_are_shared_by_calls() {
     let mut leaker = Leaker::new();
     let tops: Vec<_> = [&a, &b]
         .iter()
-        .map(|item| leaker.intern_struct(item, true).unwrap())
+        .map(|item| leaker.intern_struct(item, true))
         .collect();
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         referrer.iter().map(s).collect::<Vec<_>>(),
         ["Rel", "RelA", "RelB < u8 >"]
@@ -106,9 +106,9 @@ fn equal_requirements_are_shared_and_different_ones_are_not() {
     let leak = |items: &[ItemStruct]| {
         let mut leaker = Leaker::new();
         for item in items {
-            leaker.intern_struct(item, true).unwrap();
+            leaker.intern_struct(item, true);
         }
-        leaker.finish()
+        leaker.result().finish().unwrap()
     };
     // The same `<T>` (here with other generics unused by the type).
     let referrer = leak(&[call("<T>"), call("<T, U>"), call("<U, T>")]);
@@ -155,9 +155,9 @@ fn equal_lifetime_bounds_give_equal_contexts() {
         for generics in generics {
             let item: ItemStruct =
                 parse_str(&format!("struct S{} {{ a: Wrap<'a, 'b, 'c> }}", generics)).unwrap();
-            leaker.intern_struct(&item, true).unwrap();
+            leaker.intern_struct(&item, true);
         }
-        leaker.finish()
+        leaker.result().finish().unwrap()
     };
     // The order of the bounds of a lifetime.
     let referrer = leak(&["<'a, 'b, 'c: 'a + 'b>", "<'a, 'b, 'c: 'b + 'a>"]);
@@ -184,9 +184,9 @@ fn the_output_of_the_fn_sugar_is_parenthesized_only_where_needed() {
         for bound in bounds {
             let item: ItemStruct =
                 parse_str(&format!("struct S<F: {}> {{ a: Wrap<F> }}", bound)).unwrap();
-            leaker.intern_struct(&item, true).unwrap();
+            leaker.intern_struct(&item, true);
         }
-        leaker.finish()
+        leaker.result().finish().unwrap()
     };
     // Alone, with the parentheses of the source or without: no parentheses, one context. Its
     // entries are `Wrap<F>` and the trait object in the bound, which is the same type twice.
@@ -216,61 +216,53 @@ fn the_output_of_the_fn_sugar_is_parenthesized_only_where_needed() {
 #[test]
 fn the_gats_are_part_of_the_identity_of_the_top_level_context() {
     let mut leaker = Leaker::new();
-    let with_gat = leaker
-        .intern_trait(
-            &parse_quote!(
-                trait Tr {
-                    type G<'b>
-                    where
-                        Self: 'b;
-                    fn f(&self) -> Rel<Self>;
-                }
-            ),
-            true,
-        )
-        .unwrap();
-    let without = leaker
-        .intern_trait(
-            &parse_quote!(
-                trait Tr {
-                    fn f(&self) -> Rel<Self>;
-                }
-            ),
-            true,
-        )
-        .unwrap();
-    let other_bound = leaker
-        .intern_trait(
-            &parse_quote!(
-                trait Tr {
-                    type G<'b>
-                    where
-                        Self: 'b + 'static;
-                    fn f(&self) -> Rel<Self>;
-                }
-            ),
-            true,
-        )
-        .unwrap();
-    let again = leaker
-        .intern_trait(
-            &parse_quote!(
-                trait Tr {
-                    type G<'b>
-                    where
-                        Self: 'b;
-                    fn f(&self) -> Rel<Self>;
-                }
-            ),
-            true,
-        )
-        .unwrap();
+    let with_gat = leaker.intern_trait(
+        &parse_quote!(
+            trait Tr {
+                type G<'b>
+                where
+                    Self: 'b;
+                fn f(&self) -> Rel<Self>;
+            }
+        ),
+        true,
+    );
+    let without = leaker.intern_trait(
+        &parse_quote!(
+            trait Tr {
+                fn f(&self) -> Rel<Self>;
+            }
+        ),
+        true,
+    );
+    let other_bound = leaker.intern_trait(
+        &parse_quote!(
+            trait Tr {
+                type G<'b>
+                where
+                    Self: 'b + 'static;
+                fn f(&self) -> Rel<Self>;
+            }
+        ),
+        true,
+    );
+    let again = leaker.intern_trait(
+        &parse_quote!(
+            trait Tr {
+                type G<'b>
+                where
+                    Self: 'b;
+                fn f(&self) -> Rel<Self>;
+            }
+        ),
+        true,
+    );
     assert_ne!(with_gat, without);
     assert_ne!(with_gat, other_bound);
     assert_ne!(without, other_bound);
     // The same GAT is the same context.
     assert_eq!(with_gat, again);
-    assert_eq!(leaker.finish().contexts().count(), 3);
+    assert_eq!(leaker.result().finish().unwrap().contexts().count(), 3);
 }
 
 #[test]
@@ -457,22 +449,22 @@ fn self_of_a_struct_enum_union_and_impl() {
             b: Wrap<T>,
         }
     );
-    leaker.intern_struct(&st, true).unwrap();
+    leaker.intern_struct(&st, true);
     let en: ItemEnum = parse_quote!(
         enum E<'a, T> {
             A(Rel<Self>, &'a T),
         }
     );
-    leaker.intern_enum(&en, true).unwrap();
+    leaker.intern_enum(&en, true);
     let un: ItemUnion = parse_quote!(union U { a: Rel<Self> });
-    leaker.intern_union(&un, true).unwrap();
+    leaker.intern_union(&un, true);
     let im: ItemImpl = parse_quote! {
         impl<T> ::p::Tr for W<T> {
             fn f(&self) -> Rel<Self> { todo!() }
         }
     };
-    leaker.intern_impl(&im, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_impl(&im, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         entries(&referrer),
         [
@@ -507,8 +499,8 @@ fn self_of_a_module_is_that_of_its_items() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&m).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_mod(&m);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(selfs(&referrer), ["Self = S < T >", "Self: Tr"]);
     assert_eq!(
         entries(&referrer),
@@ -533,30 +525,25 @@ fn self_in_the_bounds_of_the_generics() {
 
     // Otherwise it cannot be, as the Repeater's implementation copies the bounds.
     let mut leaker = Leaker::new();
-    let err = common::intern_fns(
+    common::intern_fns(
         &mut leaker,
         &tr.generics,
         quote! { fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> Wrap<T>; },
         false,
-    )
-    .err()
-    .unwrap();
-    assert!(matches!(
-        err,
-        type_leak::NotInternableError::RelativePath(_)
-    ));
+    );
+    let result = leaker.result();
+    let err = result.errors();
+    assert!(!err.is_empty());
+    assert!(err
+        .iter()
+        .all(|item| item.reason != Reason::SelfWithoutMeaning));
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
-    assert!(err
-        .to_string()
-        .lines()
-        .next()
-        .unwrap()
-        .contains("Wrap < T >"));
-    // Nothing is added by a failed call.
-    assert!(leaker.finish().is_empty());
+    assert!(err[0].message.contains("Wrap < T >"));
+    // A failed call adds no entry.
+    assert!(result.into_referrer().is_empty());
 
     // A type which is not interned as a whole (it has no cause itself) is decomposed.
     let tr: ItemTrait = parse_quote! {
@@ -570,9 +557,17 @@ fn self_in_the_bounds_of_the_generics() {
         &tr.generics,
         quote! { fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> (Rel, ::core::option::Option<T>); },
         false,
-    )
-    .unwrap();
-    assert_eq!(leaker.finish().iter().map(s).collect::<Vec<_>>(), ["Rel"]);
+    );
+    assert_eq!(
+        leaker
+            .result()
+            .finish()
+            .unwrap()
+            .iter()
+            .map(s)
+            .collect::<Vec<_>>(),
+        ["Rel"]
+    );
 }
 
 #[test]
@@ -748,12 +743,12 @@ fn matching_with_the_generics_of_each_scope() {
     let mut leaker = Leaker::new();
     let contexts: Vec<ContextId> = [&a, &b]
         .iter()
-        .map(|tr| leaker.intern_trait(tr, true).unwrap())
+        .map(|tr| leaker.intern_trait(tr, true))
         .collect();
     // No entry has these generics.
     let other: Generics = parse_quote!(<T>);
-    let (other, ()) = leaker.enter_generics(&other, |_| ()).unwrap();
-    let referrer = leaker.finish();
+    let (other, ()) = leaker.enter_generics(&other, |_| ());
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
     let sig = "fn f(&self) -> Wrap<T>";
     for (context, ix) in [(contexts[0], 0usize), (contexts[1], 1)] {
@@ -768,9 +763,9 @@ fn matching_with_the_generics_of_each_scope() {
     );
     // A type which does not use the generics is found whatever they are.
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&c, true).unwrap();
-    let (other, ()) = leaker.enter_generics(&parse_quote!(<T>), |_| ()).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_trait(&c, true);
+    let (other, ()) = leaker.enter_generics(&parse_quote!(<T>), |_| ());
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         rewrite(referrer.visitor(other, placeholder), "fn f(&self) -> Rel"),
         rewritten("fn f(&self) -> P<0usize>")
@@ -798,10 +793,10 @@ fn matching_self() {
     let mut leaker = Leaker::new();
     let contexts: Vec<ContextId> = [&x, &y, &z]
         .iter()
-        .map(|tr| leaker.intern_trait(tr, true).unwrap())
+        .map(|tr| leaker.intern_trait(tr, true))
         .collect();
-    let (generics, ()) = leaker.enter_generics(&parse_quote!(<T>), |_| ()).unwrap();
-    let referrer = leaker.finish();
+    let (generics, ()) = leaker.enter_generics(&parse_quote!(<T>), |_| ());
+    let referrer = leaker.result().finish().unwrap();
     // `Rel<Self>` of X, `Rel2`, `Wrap<T>` and `Rel<Self>` of Y.
     assert_eq!(
         referrer.iter().map(s).collect::<Vec<_>>(),
@@ -852,20 +847,20 @@ fn serialization_with_self() {
             fn g(&self) -> Wrap<T>;
         }
     );
-    leaker.intern_trait(&tr, true).unwrap();
+    leaker.intern_trait(&tr, true);
     let st: ItemStruct = parse_quote!(
         struct S<T> {
             a: RelS<Self>,
         }
     );
-    leaker.intern_struct(&st, true).unwrap();
+    leaker.intern_struct(&st, true);
     let plain: ItemStruct = parse_quote!(
         struct P {
             a: RelP,
         }
     );
-    leaker.intern_struct(&plain, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(&plain, true);
+    let referrer = leaker.result().finish().unwrap();
     let tokens = quote!(#referrer);
     assert_eq!(
         tokens.to_string(),

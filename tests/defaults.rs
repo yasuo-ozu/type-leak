@@ -8,8 +8,8 @@ use type_leak::{ContextId, Leaker, Referrer};
 fn referrer(tr: &ItemTrait) -> Referrer {
     {
         let mut leaker = Leaker::new();
-        leaker.intern_trait(tr, true).unwrap();
-        leaker.finish()
+        leaker.intern_trait(tr, true);
+        leaker.result().finish().unwrap()
     }
 }
 
@@ -64,8 +64,8 @@ fn test_default_requirements() {
         }
     };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     // The contexts are the requirements of the types, numbered in the order of their first
     // appearance: nothing (`RelB`, `RelW` and `RelC`) and `Rel<T>` (the default of `U`, which uses
     // the parameters before it). The default of `V`, `(RelB, U)`, is not interned, as `RelB` is
@@ -170,8 +170,8 @@ fn test_default_is_shared_with_the_items() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
     // The entry uses `T` only, whereas the generics of the trait are `<T, U>`.
     assert_eq!(referrer.contexts().count(), 2);
@@ -186,13 +186,17 @@ fn test_default_cannot_depend_on_self() {
     let tr: ItemTrait = parse_quote!(
         trait Tr<T, U = Rel<Self>> {}
     );
-    let err = Leaker::new().intern_trait(&tr, true).err().unwrap();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&tr, true);
+    let result = leaker.result();
+    let err = result.errors();
+    assert_eq!(err.len(), 1);
     assert_eq!(
-        err.to_string(),
-        "`Rel < Self >` is in the default of a parameter, and names `Self`"
+        err[0].message,
+        "`Rel<Self>` is in the default of a parameter, and names `Self`"
     );
     assert_eq!(
-        err.note().as_deref(),
+        err[0].note(),
         Some("a default of a parameter cannot depend on `Self`")
     );
     // Nothing is leaked in `::p::W<Self>` or `Self`, which are copied, and in `(Rel, Self)` only
@@ -212,8 +216,8 @@ fn test_default_cannot_depend_on_self() {
 fn referrer_of(tr: &ItemTrait) -> Referrer {
     {
         let mut leaker = Leaker::new();
-        leaker.intern_trait(tr, true).unwrap();
-        leaker.finish()
+        leaker.intern_trait(tr, true);
+        leaker.result().finish().unwrap()
     }
 }
 
@@ -230,16 +234,18 @@ fn test_defaults_of_several_calls_are_shared() {
         }
     );
     let mut leaker = Leaker::new();
-    let top_plain = leaker.intern_struct(&plain, true).unwrap();
-    let top_tr = leaker.intern_trait(&tr, true).unwrap();
-    // A failed call adds nothing.
+    let top_plain = leaker.intern_struct(&plain, true);
+    let top_tr = leaker.intern_trait(&tr, true);
+    // A failed call adds no entry (its error is the only one).
     let bad: ItemTrait = parse_quote!(
         trait Tr<T, U = ::std::vec::Vec<T>> {
             fn f(&self) -> Rel<'_>;
         }
     );
-    assert!(leaker.intern_trait(&bad, true).is_err());
-    let referrer = leaker.finish();
+    leaker.intern_trait(&bad, true);
+    let result = leaker.result();
+    assert_eq!(result.errors().len(), 1);
+    let referrer = result.clone().into_referrer();
     // The types use no generics, so they are in one context, whichever call found them, and the
     // generics of the calls (without the defaults) are two other contexts. The default of `U`,
     // the type of an external crate, is an optional entry (after the required ones), which uses
@@ -270,7 +276,9 @@ fn test_defaults_of_several_calls_are_shared() {
         ["u8", ":: std :: vec :: Vec < u8 >"]
     );
     // A Referrer which does not trust the names of the crates replaces the default by the entry.
-    let strict = referrer.allow_ambiguous_crate_name(false);
+    let mut strict = result;
+    strict.allow_ambiguous_crate_name(false);
+    let strict = strict.into_referrer();
     let mut replaced = Vec::new();
     let completed = strict
         .complete_args(
@@ -292,7 +300,10 @@ fn test_default_const_is_kept() {
     let tr: ItemTrait = parse_quote!(
         trait Tr<T, const N: usize = MY_N> {}
     );
-    assert!(Leaker::new().intern_trait(&tr, true).is_err());
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&tr, true);
+    let result = leaker.result();
+    assert!(result.finish().is_err());
     let tr: ItemTrait = parse_quote!(
         trait Tr<T, const N: usize = 3, const M: usize = { 1 + 2 }> {}
     );

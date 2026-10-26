@@ -35,7 +35,7 @@
 //!   the macro of A, so both sides agree.
 //! - The Repeater impls are written for all the entries (`Referrer::iter()`), not only for the
 //!   required ones (`Referrer::required()`), because a Referrer in crate B may be strict
-//!   (`Referrer::allow_ambiguous_crate_name(false)`), which replaces the optional entries too.
+//!   (`LeakerResult::allow_ambiguous_crate_name(false)`), which replaces the optional entries too.
 //!   The impls of the optional entries cost nothing if no one needs them.
 
 use proc_macro::TokenStream;
@@ -49,7 +49,7 @@ use syn::{
     parse_macro_input, parse_quote, GenericArgument, GenericParam, ImplItem, ItemImpl, ItemStruct,
     ItemTrait, Path, PathArguments, Token, TraitItem, Type,
 };
-use type_leak::{ContextId, EncodeError, ImplSelf, Leaker, NotInternableError, Referrer, UseSite};
+use type_leak::{ContextId, EncodeError, ErrorItem, ImplSelf, Leaker, Referrer, UseSite};
 
 // ---------------------------------------------------------------------------------------------
 // Crate A: `#[export_trait]`
@@ -63,11 +63,11 @@ pub fn export_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // 1. Analyze the trait. The `ContextId` names the scope of its generics and `Self`: crate B
     //    needs it to rewrite a copy. `true` lets a type that names `Self` be leaked whole.
     let mut leaker = Leaker::new();
-    let top_level = match leaker.intern_trait(&item_trait, true) {
-        Ok(top_level) => top_level,
-        Err(error) => return report(&error).into(),
+    let top_level = leaker.intern_trait(&item_trait, true);
+    let referrer = match leaker.result().finish() {
+        Ok(referrer) => referrer,
+        Err(errors) => return report(&errors).into(),
     };
-    let referrer = leaker.finish();
 
     // 2. One Repeater impl for each entry, written next to the trait, where the relative paths of
     //    the entries mean what they mean in the trait.
@@ -112,17 +112,17 @@ pub fn export_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Reports every offending path of the trait at its own span, with the notes (why) and the help
 /// (what to write instead).
-fn report(error: &NotInternableError) -> TokenStream2 {
+fn report(items: &[ErrorItem]) -> TokenStream2 {
     let mut errors: Option<syn::Error> = None;
-    for item in error.items() {
+    for item in items {
         let mut message = item.message.clone();
-        for (_span, note) in &item.notes {
+        for (_at, note) in &item.notes {
             message += &format!("\n  note: {}", note);
         }
-        if let Some((_span, help)) = &item.help {
+        if let Some((_at, help)) = &item.help {
             message += &format!("\n  help: {}", help);
         }
-        let error = syn::Error::new(item.span, message);
+        let error = syn::Error::new(item.span(), message);
         match &mut errors {
             Some(errors) => errors.combine(error),
             None => errors = Some(error),

@@ -195,6 +195,9 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9162!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9163!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9164!(path = ::type_leak_test_leaker::kinds);
+    // A bound that names a leaked type that names the `Self` of the nested struct is rejected, as
+    // `intern_struct()` rejects it (F51): it expands to nothing.
+    type_leak_test_leaker::__tl_prop_9206!(path = ::type_leak_test_leaker::kinds);
     // A bound of a generic that names it, next to one that fixes an associated type: left out of
     // the Repeater's impls of the entries. 9172 is invoked as strict (it replaces the alias too).
     type_leak_test_leaker::__tl_prop_9171!(path = ::type_leak_test_leaker::kinds);
@@ -212,6 +215,9 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9183!(path = ::type_leak_test_leaker::kinds);
     // The bound of another generic is not left out: the Leaker rejects it (it expands to nothing).
     type_leak_test_leaker::__tl_prop_9181!(path = ::type_leak_test_leaker::kinds);
+    // `Self: 'x` is no reason to keep the bound that is left out (F47).
+    type_leak_test_leaker::__tl_prop_9200!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9201!(path = ::type_leak_test_leaker::kinds);
     // The defaults of a nested trait whose generic has a bound that names its `Self`: the copy is
     // declared here, with the defaults written through the host.
     type_leak_test_leaker::__tl_prop_9131!(path = ::type_leak_test_leaker::kinds);
@@ -220,6 +226,8 @@ pub mod kinds {
     // type in a value that this crate cannot name is replaced.
     type_leak_test_leaker::__tl_prop_9141!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9142!(path = ::type_leak_test_leaker::kinds);
+    // The names of the prelude of every edition in the values and the bounds (issue 3).
+    type_leak_test_leaker::__tl_prop_9208!(path = ::type_leak_test_leaker::kinds);
     // The scopes that share names: every entry has the generics of its own scope.
     type_leak_test_leaker::__tl_prop_9071!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9072!(path = ::type_leak_test_leaker::kinds);
@@ -233,4 +241,90 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9093!(path = ::type_leak_test_leaker::kinds);
     // The cyclic bound is rejected: it expands to nothing.
     type_leak_test_leaker::__tl_prop_9076!(path = ::type_leak_test_leaker::kinds);
+    // An optional entry that holds a method lifetime is copied as written, by a strict Referrer too
+    // (F18): the path of this crate resolves here.
+    type_leak_test_leaker::__tl_prop_9194!(path = ::type_leak_test_leaker::kinds, strict);
+}
+
+/// Items that the Leaker rejects and accepts with `LeakerResult::allow()` of the causes of their
+/// errors: the part that conflicts is copied as written, so this module names what the copies name
+/// (`Held`, `ElidedTr`, `SharedTr`, `Wrap`) and invokes them with `accept`. Everything else is
+/// replaced as usual.
+pub mod accepted {
+    #[allow(unused_imports)]
+    use type_leak_test_leaker::kinds::{ElidedTr, Held, SharedTr, Wrap};
+
+    type_leak_test_leaker::__tl_prop_9184!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9185!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9186!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9187!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9188!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9189!(path = ::type_leak_test_leaker::kinds, accept);
+    // Items whose macro carries the errors (`prop_leak_result`) and whose invocation says what it
+    // allows: all the errors are dropped, or the crate would not compile. The copies keep `Clone`,
+    // `core::fmt::Debug`, `PlainTr` and `Held<'_>` as written (the crate names the last two).
+    #[allow(unused_imports)]
+    use type_leak_test_leaker::kinds::PlainTr;
+    // An optional entry in the predicate of a trait, next to an unrelated error that copies a part
+    // with `Self::A0` as written (F52). A strict Referrer, which the crate does not depend on `ext`
+    // for: the types are of the Leaker's crate, which it depends on.
+    #[allow(unused_imports)]
+    use type_leak_test_leaker::kinds::GenTr;
+
+    type_leak_test_leaker::__tl_prop_9207!(path = ::type_leak_test_leaker::kinds, strict, accept);
+
+    type_leak_test_leaker::__tl_prop_9190!(
+        path = ::type_leak_test_leaker::kinds,
+        accept,
+        allow(trait Clone)
+    );
+    type_leak_test_leaker::__tl_prop_9191!(
+        path = ::type_leak_test_leaker::kinds,
+        accept,
+        allow(std_crates)
+    );
+    type_leak_test_leaker::__tl_prop_9192!(
+        path = ::type_leak_test_leaker::kinds,
+        accept,
+        allow(trait PlainTr, type Held<'_>)
+    );
+
+    // Parts that name `Self` or have no context, found by the visitor (F43 to F45).
+    type_leak_test_leaker::__tl_prop_9195!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9196!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9197!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9198!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__nested_apply_9199!(path = ::type_leak_test_leaker::kinds);
+
+    // The traits of two items analyzed together: `f` keeps the type as written, `Held` and `Wrap`
+    // are named here (F48).
+    type_leak_test_leaker::__shared_apply_9202!(path = ::type_leak_test_leaker::kinds, copy(0));
+    type_leak_test_leaker::__shared_apply_9203!(path = ::type_leak_test_leaker::kinds, copy(0));
+    type_leak_test_leaker::__shared_apply_9204!(path = ::type_leak_test_leaker::kinds, copy(0));
+}
+
+/// The structs of the two items analyzed together: this module names neither `Held` nor `Wrap`
+/// (E0412 if a copy kept them), the entry is written through the Repeater (F48).
+pub mod unnamed {
+    type_leak_test_leaker::__shared_apply_9202!(path = ::type_leak_test_leaker::kinds, copy(1));
+    type_leak_test_leaker::__shared_apply_9203!(path = ::type_leak_test_leaker::kinds, copy(1));
+    type_leak_test_leaker::__shared_apply_9204!(path = ::type_leak_test_leaker::kinds, copy(1));
+}
+
+/// The copies that `stages = true` makes after `allow_std_crates()` given to the result (F50): the
+/// Leaker's `ValuePathArguments` has `core::mem::size_of::<*const Rel>()` in a default method. This
+/// module names `Rel`, so the copy that keeps the path as written (the error stays, and its cause is
+/// allowed) builds here.
+pub mod stage_copies {
+    #[allow(unused_imports)]
+    use type_leak_test_leaker::kinds::Rel;
+
+    type_leak_test_leaker::__tl_st_std_res_9205!(path = ::type_leak_test_leaker::kinds, accept);
+}
+
+/// A crate of no name of the Leaker's (`clean`): the macro makes the copy only if the rule left no
+/// error. If the rule dropped the path with `Rel` in its arguments, the copy would write `Rel`
+/// here, where nothing names it (E0412).
+pub mod clean {
+    type_leak_test_leaker::__tl_st_std_res_9205!(clean path = ::type_leak_test_leaker::kinds, accept);
 }

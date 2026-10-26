@@ -30,10 +30,11 @@
 //! the arguments of a macro which are not expressions, a `macro_rules!`, a glob import, and syntax
 //! that `syn` leaves unparsed.
 
-use super::{self_segment, AnalyzeVisitor};
-use crate::analysis::{CheckResult, Effect};
+use super::{self_segment, without_arguments, AnalyzeVisitor};
+use crate::analysis::{CheckResult, Effect, Part, Place};
 #[cfg(doc)]
 use crate::config::LeakerConfig;
+use crate::error::{Cause, Reason};
 use crate::util::{ident_name, is_primitive_name, tidy, token_names};
 use proc_macro2::TokenStream;
 use std::collections::HashSet;
@@ -42,7 +43,7 @@ use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::*;
-use template_quote::quote;
+use template_quote::{quote, ToTokens};
 
 impl AnalyzeVisitor {
     /// Checks the value `expr` of the const or static `name`, if values are read. `default`: it is
@@ -56,7 +57,9 @@ impl AnalyzeVisitor {
             if default { "default " } else { "" },
             name
         );
+        let outer = self.reading(default);
         ValueWalk::new(self, what).visit_expr(expr);
+        self.reading_done(outer);
     }
 
     /// Checks the body `block` of the function `sig`, if values are read. `default`: it is the
@@ -70,6 +73,7 @@ impl AnalyzeVisitor {
             if default { "default " } else { "" },
             sig.ident
         );
+        let outer = self.reading(default);
         let mut walk = ValueWalk::new(self, what);
         for input in &sig.inputs {
             if let FnArg::Typed(arg) = input {
@@ -77,6 +81,23 @@ impl AnalyzeVisitor {
             }
         }
         walk.visit_block(block);
+        self.reading_done(outer);
+    }
+
+    /// Starts reading a value, the default of a trait item if `default`: the errors found until
+    /// [`AnalyzeVisitor::reading_done()`] are in a value (and in a default). Returns what to put
+    /// back.
+    fn reading(&mut self, default: bool) -> (bool, bool) {
+        (
+            std::mem::replace(&mut self.in_value, true),
+            std::mem::replace(&mut self.in_trait_default, default),
+        )
+    }
+
+    /// Ends the reading that [`AnalyzeVisitor::reading()`] started.
+    fn reading_done(&mut self, (value, default): (bool, bool)) {
+        self.in_value = value;
+        self.in_trait_default = default;
     }
 }
 
@@ -179,7 +200,7 @@ impl<'a> ValueWalk<'a> {
             return true;
         }
         if self_segment(path).is_some() {
-            self.visitor.check_self_has_meaning(quote!(#path));
+            self.visitor.check_self_has_meaning(Cause::expr_path(path));
             return true;
         }
         if self.is_local(path) || self.visitor.starts_with_generic(path) {
@@ -205,12 +226,43 @@ impl<'a> ValueWalk<'a> {
     }
 
     fn error(&mut self, error: CheckResult) {
-        self.visitor.frame.effects.push(Effect::Error(error));
+        self.visitor.push_error(error);
     }
 
-    /// Rejects the relative path `tokens`, with `help` for what to write if it has to say more
-    /// than the absolute path.
-    fn relative(&mut self, tokens: TokenStream, help: Option<String>) {
+    /// Rejects the relative path `cause`, with `help` for what to write if it has to say more than
+    /// the absolute path.
+    fn relative(&mut self, cause: Cause, help: Option<String>) {
+        self.relative_part(cause, help, None)
+    }
+
+    /// Rejects the relative path `path` of a value, copied as written with the types in its
+    /// arguments (see [`Part`]), whose relative paths are paths of the error too.
+    fn relative_path(&mut self, path: &Path) {
+        let cause = Cause::expr_path(path);
+        let part = self.visitor.node_part(cause.clone(), path);
+        self.relative_part(cause, None, Some(part));
+        // What is wrong in the arguments of the path if it were allowed, with the paths in them: they
+        // are written as they are with it, and the walk reads them again.
+        if let Some(mut conflict) = self.visitor.pop_error() {
+            if let Some(probe) = self.visitor.begin_probe(&conflict) {
+                self.visit_path(path);
+                conflict.nested = self.visitor.end_probe(probe);
+            }
+            self.visitor
+                .frame
+                .effects
+                .push(Effect::Error(Box::new(conflict)));
+        }
+    }
+
+    /// Like `relative()`, for a node that the Referrer leaves as written: `part`.
+    fn relative_part(&mut self, cause: Cause, help: Option<String>, part: Option<Part>) {
+        // The error names a macro in its own way, with its `!`, whereas the path of a macro in a
+        // type is shown by its path alone.
+        let headline = match &cause {
+            Cause::Macro(_) => Some(format!("use absolute path: '{}'", cause.to_token_stream())),
+            _ => None,
+        };
         let mut note = format!("it is in {}, which the copy writes as it is", self.what);
         if let Some(name) = &self.declared_name {
             note.push_str(&format!(
@@ -218,14 +270,35 @@ impl<'a> ValueWalk<'a> {
                 name
             ));
         }
+        // The path is relative: the walk knows no generic, no `Self` and no name of the value by it.
+        // It is copied as written with its arguments, so the relative paths in them are written too.
+        let paths = match cause.as_path() {
+            Some(path) => {
+                let mut paths = vec![without_arguments(path)];
+                ArgumentPaths {
+                    walk: self,
+                    found: &mut paths,
+                }
+                .visit_path(path);
+                paths
+            }
+            None => Vec::new(),
+        };
         self.error(CheckResult {
-            must: vec![tokens.clone()],
-            impossible: vec![tokens],
+            must: vec![cause.clone()],
+            impossible: vec![cause],
             is_own: true,
             optional: false,
             note: Some(note),
             help,
-            headline: None,
+            headline,
+            cause: None,
+            reason: Reason::RelativePath,
+            seen: 0,
+            part,
+            place: Place::default(),
+            paths,
+            nested: Vec::new(),
         });
     }
 
@@ -238,8 +311,15 @@ impl<'a> ValueWalk<'a> {
         );
         self.error(CheckResult {
             headline: Some(format!("cannot analyze `{}` in {}", shown, self.what)),
-            must: vec![tokens.clone()],
-            impossible: vec![tokens],
+            cause: None,
+            reason: Reason::Unreadable,
+            seen: 0,
+            part: None,
+            place: Place::default(),
+            paths: Vec::new(),
+            nested: Vec::new(),
+            must: vec![Cause::Unreadable(tokens.clone())],
+            impossible: vec![Cause::Unreadable(tokens)],
             is_own: true,
             optional: false,
             note: Some(note),
@@ -327,7 +407,7 @@ impl<'a> ValueWalk<'a> {
     fn check_name(&mut self, ident: &Ident) {
         let path = Path::from(ident.clone());
         if !self.is_known(&path) {
-            self.relative(quote!(#path), None);
+            self.relative(Cause::expr_path(&path), None);
         }
     }
 
@@ -354,7 +434,7 @@ impl<'a> ValueWalk<'a> {
                     self.visit_path_arguments(&seg.arguments);
                 }
             } else {
-                self.relative(quote!(#trait_path), None);
+                self.relative(Cause::Trait(trait_path), None);
             }
         }
         for seg in path.segments.iter().skip(position) {
@@ -378,7 +458,7 @@ impl<'a> ValueWalk<'a> {
         };
         let path = Path::from(ident.clone());
         if !absolute && !self.is_local(&path) && !self.visitor.is_context_free(&path) {
-            self.relative(quote!(#path), None);
+            self.relative(Cause::expr_path(&path), None);
         }
     }
 
@@ -388,7 +468,7 @@ impl<'a> ValueWalk<'a> {
         let path = &mac.path;
         if !self.is_known(path) {
             let help = macro_help(path);
-            return self.relative(quote!(#path !), Some(help));
+            return self.relative(Cause::Macro(path.clone()), Some(help));
         }
         self.reads += 1;
         self.macro_arguments_of(mac);
@@ -459,7 +539,7 @@ impl<'ast> Visit<'ast> for ValueWalk<'_> {
         if self.is_known(i) {
             syn::visit::visit_path(self, i)
         } else {
-            self.relative(quote!(#i), None)
+            self.relative_path(i)
         }
     }
 
@@ -661,6 +741,26 @@ impl<'ast> Visit<'ast> for ValueWalk<'_> {
             walk.visit_pat(&i.pat);
             walk.visit_block(&i.body);
         })
+    }
+}
+
+/// Collects the relative paths in a path of a value and in its arguments, without their arguments,
+/// each once: those that mean something else wherever they are written, and that the value does
+/// not declare ([`CheckResult::paths`]). `found` has the path itself.
+struct ArgumentPaths<'w, 'a> {
+    walk: &'w ValueWalk<'a>,
+    found: &'w mut Vec<Path>,
+}
+
+impl<'ast> Visit<'ast> for ArgumentPaths<'_, '_> {
+    fn visit_path(&mut self, i: &'ast Path) {
+        if self.walk.visitor.is_relative_path(i) && !self.walk.is_local(i) {
+            let path = without_arguments(i);
+            if !self.found.contains(&path) {
+                self.found.push(path);
+            }
+        }
+        syn::visit::visit_path(self, i)
     }
 }
 
@@ -990,7 +1090,7 @@ fn macro_help(path: &Path) -> String {
     }
     format!(
         "write `{0}!` with an absolute path (e.g. `::my_crate::{0}!`), or allow it with \
-         `LeakerConfig::allowed_paths`",
+         `LeakerConfig::allow_path()`",
         name
     )
 }

@@ -7,14 +7,14 @@ use std::collections::BTreeSet;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
-use type_leak::Leaker;
+use type_leak::{to_syn_error, ErrorItem, Leaker, LeakerConfig};
 
 #[test]
 fn test_reduce_roots_empty_leaker() {
     // A fresh Leaker with nothing interned produces an empty Referrer.
     let mut leaker = Leaker::new();
     leaker.reduce_roots();
-    assert!(leaker.finish().is_empty());
+    assert!(leaker.result().finish().unwrap().is_empty());
 }
 
 #[test]
@@ -22,9 +22,9 @@ fn test_reduce_roots_neutral_generics() {
     // All fields are the struct's own generic params → all neutral → empty.
     let item: ItemStruct = parse_quote! { struct S<T, U> { a: T, b: U } };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
+    leaker.intern_struct(&item, true);
     leaker.reduce_roots();
-    assert!(leaker.finish().is_empty());
+    assert!(leaker.result().finish().unwrap().is_empty());
 }
 
 #[test]
@@ -35,9 +35,9 @@ fn test_reduce_roots_absolute_paths_only() {
         struct S { a: ::std::string::String }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
+    leaker.intern_struct(&item, true);
     leaker.reduce_roots();
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
     assert!(!referrer.must(0));
     // `::core` is never leaked.
@@ -45,9 +45,9 @@ fn test_reduce_roots_absolute_paths_only() {
         struct S { a: ::core::option::Option<(::core::primitive::u8, ::core::primitive::bool)> }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
+    leaker.intern_struct(&item, true);
     leaker.reduce_roots();
-    assert!(leaker.finish().is_empty());
+    assert!(leaker.result().finish().unwrap().is_empty());
 }
 
 #[test]
@@ -55,7 +55,7 @@ fn test_reduce_roots_single_must_intern() {
     // A single relative-path field is a must-intern root and must be kept.
     let item: ItemStruct = parse_quote! { struct S { a: RelType } };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
+    leaker.intern_struct(&item, true);
     leaker.reduce_roots();
     let expected: Type = parse_quote!(RelType);
     assert_eq!(
@@ -69,7 +69,7 @@ fn test_reduce_roots_multiple_must_intern() {
     // Two independent must-intern roots: both survive reduction.
     let item: ItemStruct = parse_quote! { struct S { a: TypeA, b: TypeB } };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
+    leaker.intern_struct(&item, true);
     leaker.reduce_roots();
     let ta: Type = parse_quote!(TypeA);
     let tb: Type = parse_quote!(TypeB);
@@ -88,9 +88,9 @@ fn test_reduce_roots_neutral_root_without_must_intern_dropped() {
         struct S<T> { a: (T, ::std::string::String), b: (T, ::core::primitive::u8) }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
+    leaker.intern_struct(&item, true);
     leaker.reduce_roots();
-    let referrer = leaker.finish();
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(
         referrer
             .iter()
@@ -103,9 +103,9 @@ fn test_reduce_roots_neutral_root_without_must_intern_dropped() {
         struct S<T> { a: (T, ::core::string::String) }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
+    leaker.intern_struct(&item, true);
     leaker.reduce_roots();
-    assert!(leaker.finish().is_empty());
+    assert!(leaker.result().finish().unwrap().is_empty());
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn test_reduce_roots_root_covers_descendant() {
         struct S { a: (RelType, ::std::string::String) }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
+    leaker.intern_struct(&item, true);
     leaker.reduce_roots();
     let expected: Type = parse_quote!(RelType);
     let result = finish_as_strings(leaker);
@@ -129,7 +129,7 @@ fn test_reduce_roots_mixed_neutral_and_must_intern() {
     // only the must-intern root survives.
     let item: ItemStruct = parse_quote! { struct S<T> { a: T, b: RelType } };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
+    leaker.intern_struct(&item, true);
     leaker.reduce_roots();
     let expected: Type = parse_quote!(RelType);
     assert_eq!(
@@ -147,7 +147,7 @@ fn test_reduce_roots_deep_nesting() {
         struct S { a: (::std::vec::Vec<(RelInner,)>, ::std::string::String) }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
+    leaker.intern_struct(&item, true);
     leaker.reduce_roots();
     let expected: Type = parse_quote!(RelInner);
     let result = finish_as_strings(leaker);
@@ -165,7 +165,7 @@ fn test_reduce_roots_type_in_both_positions() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
+    leaker.intern_struct(&item, true);
     leaker.reduce_roots();
     let ta: Type = parse_quote!(RelType);
     assert_eq!(
@@ -176,7 +176,7 @@ fn test_reduce_roots_type_in_both_positions() {
 
 fn leaked_of(item: ItemStruct) -> Vec<String> {
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
+    leaker.intern_struct(&item, true);
     leaker.reduce_roots();
     finish_as_strings(leaker).into_iter().collect()
 }
@@ -252,11 +252,12 @@ fn test_reduce_roots_prefers_inner_type_on_a_tie() {
 fn test_reduce_roots_allowed_path_is_neutral() {
     // A type under an explicitly allowed path prefix is neutral → empty.
     let item: ItemStruct = parse_quote! { struct S { a: some_mod::SomeType } };
-    let mut leaker = Leaker::new();
-    leaker.allowed_paths.push(parse_quote!(some_mod));
-    leaker.intern_struct(&item, true).unwrap();
+    let mut config = LeakerConfig::new();
+    config.allow_path(parse_quote!(some_mod));
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_struct(&item, true);
     leaker.reduce_roots();
-    assert!(leaker.finish().is_empty());
+    assert!(leaker.result().finish().unwrap().is_empty());
 }
 
 #[test]
@@ -270,9 +271,9 @@ fn test_reduce_roots_self_assoc_type_neutral() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true).unwrap();
+    leaker.intern_trait(&item, true);
     leaker.reduce_roots();
-    assert!(leaker.finish().is_empty());
+    assert!(leaker.result().finish().unwrap().is_empty());
 }
 
 #[test]
@@ -285,9 +286,9 @@ fn test_reduce_roots_generic_assoc_type_neutral() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true).unwrap();
+    leaker.intern_trait(&item, true);
     leaker.reduce_roots();
-    assert!(leaker.finish().is_empty());
+    assert!(leaker.result().finish().unwrap().is_empty());
 }
 
 #[test]
@@ -301,8 +302,9 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
         }
     };
     let mut leaker = Leaker::new();
-    let context = leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    let context = leaker.intern_struct(&item, true);
+    let result = leaker.result();
+    let referrer = result.clone().finish().unwrap();
     // `&'static Rel` is not rebuilt around `Rel` (`Rel: 'static` is not known of the entry). The
     // two types of external crates are optional entries (old: none), after the required ones: the
     // `Vec` (one cut covers it, whatever else is in it) and the `String`.
@@ -348,9 +350,12 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
     assert_eq!(quote!(#copy).to_string(), quote!(#expected).to_string());
     // The Referrer which does not trust the names of the crates replaces them as well: the `Vec`
     // as a whole, and the `String`, with `Rel` inside the tuple.
+    let mut strict = result;
+    strict.allow_ambiguous_crate_name(false);
     syn::visit_mut::VisitMut::visit_item_struct_mut(
-        &mut referrer
-            .allow_ambiguous_crate_name(false)
+        &mut strict
+            .finish()
+            .unwrap()
             .visitor(context, |_, ix| parse_quote!(P<#ix>)),
         &mut replaced,
     );
@@ -367,8 +372,8 @@ fn test_reduce_roots_inner_entry_is_rewritten_in_the_copy() {
 /// The required leaked types of a trait, with the generics each uses.
 fn leaked_trait(item: &ItemTrait) -> Vec<(String, String)> {
     let mut leaker = Leaker::new();
-    leaker.intern_trait(item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_trait(item, true);
+    let referrer = leaker.result().finish().unwrap();
     referrer
         .iter_with_generics()
         .enumerate()
@@ -381,8 +386,8 @@ fn leaked_trait(item: &ItemTrait) -> Vec<(String, String)> {
 /// the generics each uses.
 fn optional_trait(item: &ItemTrait) -> Vec<(String, String)> {
     let mut leaker = Leaker::new();
-    leaker.intern_trait(item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_trait(item, true);
+    let referrer = leaker.result().finish().unwrap();
     referrer
         .iter_with_generics()
         .enumerate()
@@ -391,19 +396,29 @@ fn optional_trait(item: &ItemTrait) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The messages of the errors, one per line.
+fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The error of the analysis of a trait.
 fn error_of(item: &ItemTrait) -> String {
-    let err = Leaker::new()
-        .intern_trait(item, true)
-        .expect_err("expected an error");
-    syn::Error::from(err).to_string()
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(item, true);
+    let result = leaker.result();
+    assert!(!result.errors().is_empty(), "expected an error");
+    to_syn_error(result.errors()).to_string()
 }
 
 /// Rewrites a trait with each leaked type replaced by `P<index>`, like the Referrer's copy.
 fn rewritten(item: &ItemTrait) -> String {
     let mut leaker = Leaker::new();
-    let context = leaker.intern_trait(item, true).unwrap();
-    let referrer = leaker.finish();
+    let context = leaker.intern_trait(item, true);
+    let referrer = leaker.result().finish().unwrap();
     let mut copy = item.clone();
     syn::visit_mut::VisitMut::visit_item_trait_mut(
         &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
@@ -918,7 +933,9 @@ fn test_reduce_roots_trait_object_inheriting_a_local_lifetime() {
         parse_quote! { trait Tr<'a, T: ::p::Bound<'static, dyn RelTr>> {} },
     ] {
         let item: ItemTrait = item;
-        Leaker::new().intern_trait(&item, true).unwrap();
+        let mut leaker = Leaker::new();
+        leaker.intern_trait(&item, true);
+        assert!(leaker.result().errors().is_empty());
     }
     // Its components can still be leaked, as for a reference.
     let leaked = leaked_trait(&parse_quote! {
@@ -1021,49 +1038,47 @@ fn test_reduce_roots_path_with_a_lifetime_the_copy_would_leave_unconstrained() {
     // method.
     let item: ItemFn = parse_quote! { fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () { loop {} } };
     let mut leaker = Leaker::new();
-    enter_function(&mut leaker, &item.sig).unwrap();
-    assert_eq!(leaker.finish().iter().count(), 1);
+    enter_function(&mut leaker, &item.sig);
+    assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
     // As local generics it is checked in a method of a trait or of an impl of a trait (a method
     // that the walk reaches alone may be one). A function nested in a scope or in a module, and a
     // method of an inherent impl, have no signature to differ from, so the copy compiles with
     // `'b` early-bound (F22).
-    let err = Leaker::new()
-        .enter_impl(&Generics::default(), &parse_quote!(::p::W), true, |view| {
-            let sig = &item.sig;
-            view.visit_impl_item_fn(&parse_quote!(#sig { loop {} }))
-        })
-        .unwrap_err();
-    assert!(syn::Error::from(err).to_string().contains("E0195"));
+    let mut leaker = Leaker::new();
+    leaker.enter_impl(&Generics::default(), &parse_quote!(::p::W), true, |view| {
+        let sig = &item.sig;
+        view.visit_impl_item_fn(&parse_quote!(#sig { loop {} }))
+    });
+    let result = leaker.result();
+    let err = result.errors();
+    assert!(to_syn_error(err).to_string().contains("E0195"));
     let sig = &item.sig;
     let of_trait: ItemImpl = parse_quote! { impl ::p::Tr for ::p::W { #sig { loop {} } } };
-    let err = Leaker::new()
-        .enter_generics(&Generics::default(), |view| {
-            view.visit_item(&Item::Impl(of_trait.clone()))
-        })
-        .unwrap_err();
-    assert!(syn::Error::from(err).to_string().contains("E0195"));
+    let mut leaker = Leaker::new();
+    leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_item(&Item::Impl(of_trait.clone()))
+    });
+    let result = leaker.result();
+    let err = result.errors();
+    assert!(to_syn_error(err).to_string().contains("E0195"));
     let inherent: ItemImpl = parse_quote! { impl ::p::W { #sig { loop {} } } };
     let mut leaker = Leaker::new();
-    leaker
-        .enter_generics(&Generics::default(), |view| {
-            view.visit_item(&Item::Impl(inherent.clone()))
-        })
-        .unwrap();
+    leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_item(&Item::Impl(inherent.clone()))
+    });
     // The self type (an external path) and the path.
-    assert_eq!(leaker.finish().iter().count(), 2);
+    assert_eq!(leaker.result().finish().unwrap().iter().count(), 2);
     let mut leaker = Leaker::new();
-    leaker
-        .enter_generics(&Generics::default(), |view| {
-            view.visit_item(&Item::Fn(item.clone()))
-        })
-        .unwrap();
-    assert_eq!(leaker.finish().iter().count(), 1);
+    leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_item(&Item::Fn(item.clone()))
+    });
+    assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
     let item: ItemMod = parse_quote! {
         mod m { fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () { loop {} } }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&item).unwrap();
-    assert_eq!(leaker.finish().iter().count(), 1);
+    leaker.intern_mod(&item);
+    assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
 }
 
 /// The signature of the trait, for the messages.
@@ -1329,34 +1344,35 @@ fn test_reduce_roots_reference_with_a_lifetime_the_copy_would_leave_unconstraine
     // item and a function of a module are not, nor a method of an inherent impl (see paths, F22).
     let item: ItemFn = parse_quote! { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } };
     let mut leaker = Leaker::new();
-    enter_function(&mut leaker, &item.sig).unwrap();
-    assert_eq!(leaker.finish().iter().count(), 1);
-    let err = Leaker::new()
-        .enter_impl(&Generics::default(), &parse_quote!(::p::W), true, |view| {
-            let sig = &item.sig;
-            view.visit_impl_item_fn(&parse_quote!(#sig { loop {} }))
-        })
-        .unwrap_err();
-    assert!(syn::Error::from(err).to_string().contains("E0195"));
+    enter_function(&mut leaker, &item.sig);
+    assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
+    let mut leaker = Leaker::new();
+    leaker.enter_impl(&Generics::default(), &parse_quote!(::p::W), true, |view| {
+        let sig = &item.sig;
+        view.visit_impl_item_fn(&parse_quote!(#sig { loop {} }))
+    });
+    let result = leaker.result();
+    let err = result.errors();
+    assert!(to_syn_error(err).to_string().contains("E0195"));
     let item: ItemMod = parse_quote! {
         mod m { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&item).unwrap();
-    assert_eq!(leaker.finish().iter().count(), 1);
+    leaker.intern_mod(&item);
+    assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
     let item: ItemImpl =
         parse_quote! { impl ::p::W { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } } };
     let mut leaker = Leaker::new();
-    leaker.intern_impl(&item, true).unwrap();
+    leaker.intern_impl(&item, true);
     // The self type and the reference.
-    assert_eq!(leaker.finish().iter().count(), 2);
+    assert_eq!(leaker.result().finish().unwrap().iter().count(), 2);
 }
 
 /// The `Leaker` docs, Method lifetimes: an external type that the Leaker does not allow keeps the
-/// method lifetime `'b` (the Referrer leaves it as written unless it replaces it), so the method is
-/// not an error (E0195) although `Wrap<'b>`, which is leaked as a whole, names `'b` as well. A
-/// reference to a trait object of such a type keeps it too. Audit mutant `m_careful_on` (the
-/// careful rule for trait objects applied to the external type).
+/// method lifetime `'b` (the Referrer copies it as written, as it is no optional entry), so the
+/// method is not an error (E0195) although `Wrap<'b>`, which is leaked as a whole, names `'b` as
+/// well. A reference to a trait object of such a type keeps it too. Audit mutant `m_careful_on`
+/// (the careful rule for trait objects applied to the external type).
 #[test]
 fn test_reduce_roots_external_type_keeping_a_method_lifetime_is_no_e0195() {
     let item: ItemTrait = parse_quote! {
@@ -1368,10 +1384,7 @@ fn test_reduce_roots_external_type_keeping_a_method_lifetime_is_no_e0195() {
         leaked_trait(&item),
         [entry(parse_quote!(Wrap<'b>), "< 'b >")]
     );
-    assert_eq!(
-        optional_trait(&item),
-        [entry(parse_quote!(::ext::W<'b>), "< 'b >")]
-    );
+    assert_eq!(optional_trait(&item), Vec::<(String, String)>::new());
     let item: ItemTrait = parse_quote! {
         trait Tr {
             fn f<'b>(&self, a: &'b dyn ::ext::Tr, b: Wrap<'b>) -> &'b ::core::primitive::u8;
@@ -1452,8 +1465,8 @@ fn test_reduce_roots_reference_with_a_local_lifetime_is_found_in_its_scope() {
         }
     };
     let mut leaker = Leaker::new();
-    let top_level = leaker.intern_trait(&tr, true).unwrap();
-    let referrer = leaker.finish();
+    let top_level = leaker.intern_trait(&tr, true);
+    let referrer = leaker.result().finish().unwrap();
     let mut entries: Vec<(String, String)> = referrer
         .iter_with_generics()
         .map(|(ty, generics)| (ty_string(ty.clone()), quote!(#generics).to_string()))
@@ -1749,7 +1762,7 @@ fn test_reduce_roots_bare_identifier_is_a_type_if_the_path_cannot_be_interned() 
     assert!(!result.is_own);
     assert_eq!(result.impossible.len(), 1);
     assert_eq!(result.must.len(), 1);
-    assert_eq!(result.must[0].to_string(), "SIZE");
+    assert_eq!(quote!(#{&result.must[0]}).to_string(), "SIZE");
 
     // Not if the bounds of the generics mention `Self`, which cannot be leaked: `SIZE` may be a
     // const, so it is an error (and the path is interned if it can be).
@@ -1765,15 +1778,17 @@ fn test_reduce_roots_bare_identifier_is_a_type_if_the_path_cannot_be_interned() 
                 fn c(&self, x: ::p::W<T, SIZE>);
             ),
             allow_self,
-        )
-        .map(|_| {
-            leaker
-                .finish()
-                .iter()
-                .map(|ty| ty_string(ty.clone()))
-                .collect::<Vec<_>>()
-        })
-        .map_err(|err| err.to_string())
+        );
+        leaker
+            .result()
+            .finish()
+            .map(|referrer| {
+                referrer
+                    .iter()
+                    .map(|ty| ty_string(ty.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|err| messages(&err))
     };
     assert_eq!(
         leaked(false),
@@ -2121,8 +2136,8 @@ fn test_reduce_roots_large_item() {
     });
     let item: ItemStruct = syn::parse2(quote! { struct S { #(#fields),* } }).unwrap();
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), n);
     // The inner types are leaked.
     assert!(referrer
@@ -2139,8 +2154,8 @@ fn test_reduce_roots_large_item() {
     });
     let item: ItemStruct = syn::parse2(quote! { struct S { #(#fields),* } }).unwrap();
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     // The tuple (1) is cheaper than `Ri` and `Qi` (2).
     assert_eq!(referrer.iter().count(), n);
     assert!(referrer
@@ -2465,8 +2480,8 @@ fn test_reduce_roots_optional_entries() {
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true).unwrap();
-    let referrer = leaker.finish();
+    leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
     let musts: Vec<bool> = (0..referrer.iter().count())
         .map(|ix| referrer.must(ix))
         .collect();

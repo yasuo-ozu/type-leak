@@ -6,10 +6,11 @@
 //! text:
 //!
 //! - `every_kind_of_error_has_a_help` is a table with one row per kind of error (the rows are the
-//!   kinds of error of `NotInternableError`): the headline and the exact help of each error of the
-//!   row;
+//!   kinds of error of the Leaker, see `Reason`): the headline and the exact help of each error of
+//!   the row;
 //! - `a_help_is_rendered_after_the_notes` asserts how the stable layout (`syn::Error`, which
-//!   `ToTokens` renders as `compile_error!`) shows it, as `= help: ..` after the `= note: ..`s.
+//!   `ErrorItem::to_compile_error()` renders as `compile_error!`) shows it, as `= help: ..` after
+//!   the `= note: ..`s.
 //!
 //! The nightly layout (a `help` of the `Diagnostic`, with its own span) is in `tests/diagnostic.rs`.
 
@@ -19,9 +20,15 @@ use type_leak::*;
 /// The config of the rows with `::p` allowed (the crate of the property test).
 fn allowing() -> Leaker {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
-    config.allowed_paths.push(parse_quote!(::p));
+    config.allow_primitive().allow_prelude();
+    config.allow_path(parse_quote!(::p));
     Leaker::from_config(config)
+}
+
+/// The errors that `leaker` has after `analyze` ran on it (`Leaker::result()`).
+fn errors<R>(mut leaker: Leaker, analyze: impl FnOnce(&mut Leaker) -> R) -> Vec<ErrorItem> {
+    analyze(&mut leaker);
+    leaker.result().errors().to_vec()
 }
 
 fn id(name: &str) -> Ident {
@@ -31,7 +38,7 @@ fn id(name: &str) -> Ident {
 /// One row: the kind of error, how to make it, and the headline and help of each of its errors.
 struct Row {
     kind: &'static str,
-    error: fn() -> NotInternableError,
+    error: fn() -> Vec<ErrorItem>,
     items: &'static [(&'static str, &'static str)],
 }
 
@@ -43,7 +50,7 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr: Clone {}
             );
-            Leaker::new().intern_trait(&item, true).unwrap_err()
+            errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "use absolute path: 'Clone'",
@@ -56,7 +63,7 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr: ::my_crate::Sup<{ usize::MAX }> {}
             );
-            Leaker::new().intern_trait(&item, true).unwrap_err()
+            errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "use absolute path: 'usize :: MAX'",
@@ -69,12 +76,12 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr: MyBound {}
             );
-            Leaker::new().intern_trait(&item, true).unwrap_err()
+            errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "use absolute path: 'MyBound'",
             "write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`), or allow it \
-             with `LeakerConfig::allowed_paths`",
+             with `LeakerConfig::allow_path()`",
         )],
     },
     Row {
@@ -83,12 +90,12 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr: crate::m::Bound {}
             );
-            Leaker::new().intern_trait(&item, true).unwrap_err()
+            errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "use absolute path: 'crate :: m :: Bound'",
             "write `crate::m::Bound` with an absolute path (e.g. `::my_crate::m::Bound`), or \
-             allow it with `LeakerConfig::allowed_paths`",
+             allow it with `LeakerConfig::allow_path()`",
         )],
     },
     Row {
@@ -99,12 +106,12 @@ const ROWS: &[Row] = &[
                     a: MyType<'_>,
                 }
             );
-            Leaker::new().intern_struct(&item, true).unwrap_err()
+            errors(Leaker::new(), |leaker| leaker.intern_struct(&item, true))
         },
         items: &[(
             "use absolute path: 'MyType < '_ >'",
             "write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with \
-             `LeakerConfig::allowed_paths`",
+             `LeakerConfig::allow_path()`",
         )],
     },
     Row {
@@ -113,12 +120,12 @@ const ROWS: &[Row] = &[
             let item: ItemStruct = parse_quote!(
                 struct S<const N: Idx>(u8);
             );
-            Leaker::new().intern_struct(&item, true).unwrap_err()
+            errors(Leaker::new(), |leaker| leaker.intern_struct(&item, true))
         },
         items: &[(
             "use absolute path: 'Idx'",
             "write `Idx` with an absolute path (e.g. `::my_crate::Idx`), or allow it with \
-             `LeakerConfig::allowed_paths`",
+             `LeakerConfig::allow_path()`",
         )],
     },
     Row {
@@ -129,12 +136,12 @@ const ROWS: &[Row] = &[
                     fn f(&self) -> &dyn RelTr;
                 }
             );
-            allowing().intern_trait(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "use absolute path: 'RelTr'",
             "write `RelTr` with an absolute path (e.g. `::my_crate::RelTr`), allow it with \
-             `LeakerConfig::allowed_paths`, or name the lifetime of the trait object (e.g. \
+             `LeakerConfig::allow_path()`, or name the lifetime of the trait object (e.g. \
              `&'a dyn Trait` or `dyn Trait + 'a`)",
         )],
     },
@@ -146,12 +153,12 @@ const ROWS: &[Row] = &[
                     fn f(&self) -> Rel<Self>;
                 }
             );
-            allowing().intern_trait(&item, false).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, false))
         },
         items: &[(
             "use absolute path: 'Rel < Self >'",
             "write `Rel` with an absolute path (e.g. `::my_crate::Rel`), allow it with \
-             `LeakerConfig::allowed_paths`, or analyze the item with `allow_self = true`",
+             `LeakerConfig::allow_path()`, or analyze the item with `allow_self = true`",
         )],
     },
     // ── a bare identifier that may be a const ────────────────────────────────────────────────
@@ -163,12 +170,12 @@ const ROWS: &[Row] = &[
                     a: ::p::W<[Self], LEN>,
                 }
             );
-            allowing().intern_struct(&item, false).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_struct(&item, false))
         },
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
             "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
-             const), allow it with `LeakerConfig::allowed_paths`, or analyze the item with \
+             const), allow it with `LeakerConfig::allow_path()`, or analyze the item with \
              `allow_self = true`",
         )],
     },
@@ -180,7 +187,7 @@ const ROWS: &[Row] = &[
                     a: ::p::W<Self::A, LEN>,
                 }
             );
-            allowing().intern_struct(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_struct(&item, true))
         },
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
@@ -196,13 +203,12 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr<T = ::p::W<Self, LEN>> {}
             );
-            allowing().intern_trait(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
             "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
-             const), or write the default without `Self`: name the type instead of `Self` in \
-             `::p::W<Self, LEN>`",
+             const), or name the type instead of `Self` in `::p::W<Self, LEN>`",
         )],
     },
     Row {
@@ -213,7 +219,7 @@ const ROWS: &[Row] = &[
                     a: ::p::W<T, LEN>,
                 }
             );
-            allowing().intern_struct(&item, false).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_struct(&item, false))
         },
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
@@ -231,7 +237,7 @@ const ROWS: &[Row] = &[
                     fn f<'b>(&self, y: &'b dyn ::core::convert::AsRef<LEN>) -> &'b u8;
                 }
             );
-            allowing().intern_trait(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
@@ -249,23 +255,23 @@ const ROWS: &[Row] = &[
                     a: ::p::W<{ ::p::m!() }, LEN>,
                 }
             );
-            allowing().intern_struct(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_struct(&item, true))
         },
         items: &[(
             "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
             "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
-             const), or allow it with `LeakerConfig::allowed_paths`",
+             const), or allow it with `LeakerConfig::allow_path()`",
         )],
     },
     // ── `Self` ───────────────────────────────────────────────────────────────────────────────
     Row {
         kind: "`Self` where no scope declares it",
         error: || {
-            allowing()
-                .enter_generics(&Generics::default(), |view| {
+            errors(allowing(), |leaker| {
+                leaker.enter_generics(&Generics::default(), |view| {
                     view.visit_type(&parse_quote!(Rel<Self>))
                 })
-                .unwrap_err()
+            })
         },
         items: &[(
             "`Self` has no meaning here",
@@ -282,7 +288,7 @@ const ROWS: &[Row] = &[
                     fn f(&self, x: Wrap<Self::A>) {}
                 }
             );
-            allowing().intern_impl(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_impl(&item, true))
         },
         items: &[(
             "write `<Self as ::p::Tr>::A` instead of `Self::A` in `Wrap<Self::A>`: the copy \
@@ -299,13 +305,13 @@ const ROWS: &[Row] = &[
                     fn f(&self, x: Wrap<Self::A>) {}
                 }
             );
-            allowing().intern_impl(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_impl(&item, true))
         },
         items: &[
             (
                 "use absolute path: 'Tr'",
                 "write `Tr` with an absolute path (e.g. `::my_crate::Tr`), or allow it with \
-                 `LeakerConfig::allowed_paths`",
+                 `LeakerConfig::allow_path()`",
             ),
             (
                 "write `<Self as Tr>::A` instead of `Self::A` in `Wrap<Self::A>`: the copy \
@@ -321,7 +327,7 @@ const ROWS: &[Row] = &[
             let item: ItemStruct = parse_quote!(
                 struct S<T>(T, Wrap<Self::A>);
             );
-            allowing().intern_struct(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_struct(&item, true))
         },
         items: &[(
             "write `<Self as SomeTrait>::A` instead of `Self::A` in `Wrap<Self::A>`: the copy \
@@ -338,7 +344,7 @@ const ROWS: &[Row] = &[
                     fn f(&self, x: Wrap<Self::A>) {}
                 }
             );
-            allowing().intern_impl(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_impl(&item, true))
         },
         items: &[(
             "write `<Self as SomeTrait>::A` instead of `Self::A` in `Wrap<Self::A>`: the copy \
@@ -353,7 +359,7 @@ const ROWS: &[Row] = &[
             let item: ItemStruct = parse_quote!(
                 struct S<T: ::p::Tr<Self::A>>(Wrap<T>);
             );
-            allowing().intern_struct(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_struct(&item, true))
         },
         items: &[
             (
@@ -377,25 +383,25 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr<T: Default = Wrap<Self>> {}
             );
-            allowing().intern_trait(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
-            "`Wrap < Self >` is in the default of a parameter, and names `Self`",
-            "write the default without `Self`: name the type instead of `Self` in `Wrap<Self>`",
+            "`Wrap<Self>` is in the default of a parameter, and names `Self`",
+            "name the type instead of `Self` in `Wrap<Self>`",
         )],
     },
     Row {
         kind: "a bound of an outer trait that names its `Self`",
         error: || {
-            allowing()
-                .enter_trait(&id("Tr"), &parse_quote!(<T: AsRef<Self>>), true, |view| {
+            errors(allowing(), |leaker| {
+                leaker.enter_trait(&id("Tr"), &parse_quote!(<T: AsRef<Self>>), true, |view| {
                     view.visit_item(&parse_quote!(
                         impl ::p::W for X {
                             fn f(&self, x: Rel<T>) {}
                         }
                     ))
                 })
-                .unwrap_err()
+            })
         },
         items: &[(
             "the bound of `T` mentions a `Self` which has no name here",
@@ -406,15 +412,15 @@ const ROWS: &[Row] = &[
     Row {
         kind: "a bound of an outer type that names an associated item of its `Self`",
         error: || {
-            allowing()
-                .enter_type(&id("S"), &parse_quote!(<T: AsRef<Self::X>>), true, |view| {
+            errors(allowing(), |leaker| {
+                leaker.enter_type(&id("S"), &parse_quote!(<T: AsRef<Self::X>>), true, |view| {
                     view.visit_item(&parse_quote!(
                         impl ::p::W for X {
                             fn f(&self, x: Rel<T>) {}
                         }
                     ))
                 })
-                .unwrap_err()
+            })
         },
         items: &[(
             "the bound of `T` mentions `Self :: X`, which has no name here",
@@ -430,7 +436,7 @@ const ROWS: &[Row] = &[
                     fn f<T: ::core::cmp::PartialEq<Self>>(&self, x: Wrap<T>);
                 }
             );
-            allowing().intern_trait(&item, false).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, false))
         },
         items: &[(
             "`Wrap < T >` has a generic whose bound mentions `Self`, which cannot be leaked",
@@ -444,7 +450,7 @@ const ROWS: &[Row] = &[
             let item: ItemImpl = parse_quote!(
                 impl<T> S<T> where T: AsRef<Option<Self>> {}
             );
-            allowing().intern_impl(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_impl(&item, true))
         },
         items: &[
             (
@@ -471,7 +477,7 @@ const ROWS: &[Row] = &[
                 {
                 }
             );
-            allowing().intern_trait(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "`Wrap < T >` is in a bound or where predicate, and a bound of its generics names a \
@@ -492,7 +498,7 @@ const ROWS: &[Row] = &[
                         Rel<X>: Default;
                 }
             );
-            allowing().intern_trait(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "`Rel < X >` is in a bound or where predicate, and a bound of its generics names \
@@ -511,7 +517,7 @@ const ROWS: &[Row] = &[
                 {
                 }
             );
-            allowing().intern_trait(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "`Rel < Self >` names `Self` in a bound or where predicate of its trait",
@@ -529,7 +535,7 @@ const ROWS: &[Row] = &[
                     fn g<'c>(&self, x: &'c dyn RelTrait) -> &'c u8;
                 }
             );
-            allowing().intern_trait(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[
             (
@@ -555,7 +561,7 @@ const ROWS: &[Row] = &[
                     fn f<F: for<'x> Fn(Rel<'x>) -> &'x u8>(&self, f: F);
                 }
             );
-            allowing().intern_trait(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "use absolute path: 'Rel < 'x >'",
@@ -571,7 +577,7 @@ const ROWS: &[Row] = &[
                     fn g(x: &Rel<T>) -> &u8;
                 }
             );
-            allowing().intern_trait(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "use absolute path: 'Rel < T >'",
@@ -585,7 +591,7 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr<'a, T: 'a, F: Fn(&Rel<T>) -> &u8> {}
             );
-            allowing().intern_trait(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "use absolute path: 'Rel < T >'",
@@ -599,7 +605,7 @@ const ROWS: &[Row] = &[
             let item: ItemTrait = parse_quote!(
                 trait Tr<'a, T: 'a, F: Fn(::p::WRef<u8>, Rel<T>) -> &u8> {}
             );
-            allowing().intern_trait(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "use absolute path: 'Rel < T >'",
@@ -615,7 +621,7 @@ const ROWS: &[Row] = &[
                     fn f(&self, x: &dyn Fn(&Rel<T>) -> &u8);
                 }
             );
-            allowing().intern_trait(&item, true).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_trait(&item, true))
         },
         items: &[(
             "use absolute path: 'Rel < T >'",
@@ -629,7 +635,7 @@ const ROWS: &[Row] = &[
             let item: ItemStruct = parse_quote!(
                 pub struct S<'a>(fn(::core::slice::Iter<u8>, Self) -> &u8, &'a u8);
             );
-            allowing().intern_struct(&item, false).unwrap_err()
+            errors(allowing(), |leaker| leaker.intern_struct(&item, false))
         },
         items: &[(
             "use absolute path: 'Self'",
@@ -643,7 +649,7 @@ const ROWS: &[Row] = &[
 fn every_kind_of_error_has_a_help() {
     for row in ROWS {
         let err = (row.error)();
-        let items: Vec<ErrorItem> = err.items().collect();
+        let items = &err;
         let got: Vec<(String, String)> = items
             .iter()
             .map(|item| {
@@ -659,7 +665,7 @@ fn every_kind_of_error_has_a_help() {
             .map(|(message, help)| (message.to_string(), help.to_string()))
             .collect();
         assert_eq!(got, expected, "{}", row.kind);
-        for item in &items {
+        for item in items {
             let (_, help) = item.help.as_ref().expect(row.kind);
             // The help says what to write, the notes why: it is none of them, and not the headline.
             assert!(!help.is_empty(), "{}", row.kind);
@@ -677,9 +683,17 @@ fn every_kind_of_error_has_a_help() {
                 row.kind,
                 help
             );
+            // It has no colon of its own outside the code in backticks (a lead clause, a colon and
+            // the instruction): a tool that prints "message: help" on one line would show two.
+            assert!(
+                help.split('`').step_by(2).all(|words| !words.contains(':')),
+                "{}: {}",
+                row.kind,
+                help
+            );
         }
         // The first error's help is what the accessors of the error tell.
-        assert_eq!(err.help().as_deref(), items[0].help_text(), "{}", row.kind);
+        assert_eq!(err[0].help_text(), items[0].help_text(), "{}", row.kind);
     }
 }
 
@@ -687,10 +701,10 @@ fn every_kind_of_error_has_a_help() {
 fn a_help_is_rendered_after_the_notes() {
     for row in ROWS {
         let err = (row.error)();
-        let items: Vec<ErrorItem> = err.items().collect();
-        let errors: Vec<syn::Error> = syn::Error::from(err.clone()).into_iter().collect();
+        let items = &err;
+        let errors: Vec<syn::Error> = to_syn_error(&err).into_iter().collect();
         assert_eq!(errors.len(), items.len(), "{}", row.kind);
-        for (error, item) in errors.iter().zip(&items) {
+        for (error, item) in errors.iter().zip(items) {
             let rendered = error.to_string();
             let help = item.help_text().unwrap();
             // The headline, a blank line, the notes (`= note: ..`), the help (`= help: ..`).
@@ -702,11 +716,12 @@ fn a_help_is_rendered_after_the_notes() {
             expected += &format!("  = help: {}\n", help);
             assert_eq!(rendered, expected, "{}", row.kind);
         }
-        // And `ToTokens` renders the same errors, as `compile_error!`s.
-        let tokens = {
-            use template_quote::quote;
-            quote!(#err).to_string()
-        };
+        // And `to_compile_error()` renders the same errors, as `compile_error!`s.
+        let tokens = err
+            .iter()
+            .map(ErrorItem::to_compile_error)
+            .collect::<proc_macro2::TokenStream>()
+            .to_string();
         assert_eq!(
             tokens.matches("compile_error").count(),
             items.len(),
@@ -714,7 +729,7 @@ fn a_help_is_rendered_after_the_notes() {
             row.kind,
             tokens
         );
-        for item in &items {
+        for item in items {
             assert!(
                 tokens.contains(&format!("= help: {}", item.help_text().unwrap())),
                 "{}: {}",
@@ -730,7 +745,7 @@ fn a_help_is_rendered_after_the_notes() {
 fn a_note_that_is_not_about_the_fix_has_no_advice() {
     for row in ROWS {
         let err = (row.error)();
-        for item in err.items() {
+        for item in &err {
             for (_, note) in &item.notes {
                 assert!(
                     !note.contains("Write the")

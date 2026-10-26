@@ -243,10 +243,17 @@ fn squash(text: &str) -> String {
 fn same<T>(_: &T, _: &T) {}
 
 /// What a `#[prop_leak]` macro reported: `<id>|<kind>|ok|entries=E positions=P checked=C`, or
-/// `<id>|<kind>|rej|<message>`.
+/// `<id>|<kind>|rej|<message>`. A `#[prop_leak_accept]` macro reports `acc` for an item that the
+/// Leaker rejected and accepted with `LeakerResult::allow()` of the causes of its errors.
 #[derive(Debug, PartialEq)]
 enum Reported {
     Ok {
+        kind: &'static str,
+        entries: usize,
+        positions: usize,
+        checked: usize,
+    },
+    Allowed {
         kind: &'static str,
         entries: usize,
         positions: usize,
@@ -295,7 +302,7 @@ fn reported(id: u32, text: &'static str) -> Reported {
     if status == "rej" {
         return rejected(kind, &squash(rest));
     }
-    assert_eq!(status, "ok", "{}", text);
+    assert!(status == "ok" || status == "acc", "{}", text);
     let number = |key: &str| -> usize {
         rest.split(' ')
             .find_map(|word| word.strip_prefix(key))
@@ -303,12 +310,26 @@ fn reported(id: u32, text: &'static str) -> Reported {
             .parse()
             .unwrap()
     };
-    ok(
+    let (entries, positions, checked) =
+        (number("entries="), number("positions="), number("checked="));
+    if status == "acc" {
+        return Reported::Allowed {
+            kind,
+            entries,
+            positions,
+            checked,
+        };
+    }
+    ok(kind, entries, positions, checked)
+}
+
+fn allowed(kind: &'static str, entries: usize, positions: usize, checked: usize) -> Reported {
+    Reported::Allowed {
         kind,
-        number("entries="),
-        number("positions="),
-        number("checked="),
-    )
+        entries,
+        positions,
+        checked,
+    }
 }
 
 /// A struct, an enum, a union, an impl, a module and a trait are each analyzed by the matching
@@ -702,6 +723,18 @@ fn every_item_kind_is_leaked_across_crates() {
                 "trait",
                 "`Wrap<U>`isinaboundorwherepredicate,andaboundofitsgenericsnames`T::Item`",
             ),
+        ),
+        // `Self: 'x` brings `Self` into the context of an entry that does not name it: the bound
+        // that is left out stays out, for a trait and for an impl (F47)
+        (
+            9200,
+            reported(9200, __tl_report_9200!()),
+            ok("trait", 2, 0, 0),
+        ),
+        (
+            9201,
+            reported(9201, __tl_report_9201!()),
+            ok("impl-trait", 3, 2, 2),
         ),
         // the types in the values of an item (`check_values()`): the consts and the default
         // methods of a trait, and the const, the static and the function of a module
@@ -1516,6 +1549,225 @@ fn a_trait_with_an_unsized_implementor() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Conflicts accepted with `LeakerResult::allow()` (`#[prop_leak_accept]`).
+// ---------------------------------------------------------------------------------------------
+
+/// The Leaker rejects an item whose part cannot be leaked, and accepts it when the cause of the
+/// error is allowed: that part is copied as written, whole, and the rest is leaked as usual. The
+/// Referrer's crate names what the copy names (`accepted`, in `tests/crates/referrer`), and
+/// implements the traits for hosts, or declares the copy, so it compiles only if the part resolves
+/// to the same item and everything else is replaced. The Leaker's own tests (`tests/allow.rs`) read
+/// the entries; these are about the copy.
+#[test]
+fn accepted_conflicts_are_copied_as_written() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::accepted as r;
+
+    // The reports: `acc`, the entries (the part that conflicts has none), and the errors of the
+    // first analysis (the `Reason`, then the kind of the cause).
+    let table = [
+        // (a) `Held<'b>` leaves the lifetime of the method unconstrained (E0195 in the host's
+        // impl): copied as written. Nothing is leaked (`u8` is allowed). Both types are compared.
+        (
+            9184,
+            reported(9184, __tl_report_9184!()),
+            allowed("trait", 0, 2, 2),
+        ),
+        // (b) the parameter of `f` has an elided lifetime in the generics of a path, and `g`'s
+        // `dyn PlainTr` is an entry (and the optional one of the path around it). Only `g`'s
+        // parameter is compared (`f`'s has an elided lifetime, which a witness cannot name).
+        (
+            9185,
+            reported(9185, __tl_report_9185!()),
+            allowed("trait", 2, 2, 1),
+        ),
+        // (c) `Wrap<Self>`, where `Self` has no meaning, is copied as written; `Rel` is the entry.
+        (
+            9186,
+            reported(9186, __tl_report_9186!()),
+            allowed("struct", 1, 2, 2),
+        ),
+        // (d) the same trait object in `f` and `g`: in `f` it is in the part that is copied as
+        // written (the path with the elided lifetime), in `g` it is the entry. The Visitor finds
+        // the entry by its tokens and its context, and must leave the part alone.
+        (
+            9187,
+            reported(9187, __tl_report_9187!()),
+            allowed("trait", 2, 2, 1),
+        ),
+        // (e) `Wrap<Y>` is an entry in `a1`, and in the bound of `ai` it is in the part that is
+        // copied as written (`impl Into<Wrap<Y>>`): the same tokens and context.
+        (
+            9188,
+            reported(9188, __tl_report_9188!()),
+            allowed("trait", 2, 2, 1),
+        ),
+        // (f) the same as (d), with a relative type beside the trait object in the path of `f`: it
+        // is an entry, and replaced, whereas the Referrer's crate does not name it.
+        (
+            9189,
+            reported(9189, __tl_report_9189!()),
+            allowed("trait", 3, 2, 1),
+        ),
+    ];
+    for (id, got, expected) in table {
+        assert_eq!(got, expected, "{}", id);
+    }
+
+    // The errors that were allowed.
+    let errors = |text: &'static str| -> Vec<(String, String, String)> {
+        text.split('\u{1d}')
+            .map(|error| {
+                let fields: Vec<&str> = error.split('\u{1f}').collect();
+                let tokens = fields[1].split_whitespace().collect::<String>();
+                (fields[3].to_string(), fields[4].to_string(), tokens)
+            })
+            .collect()
+    };
+    let error = |reason: &str, cause: &str, tokens: &str| {
+        (reason.to_string(), cause.to_string(), tokens.to_string())
+    };
+    assert_eq!(
+        errors(__tl_errors_9184!()),
+        [error("UnconstrainedLifetime", "Type", "Held<'b>")]
+    );
+    assert_eq!(
+        errors(__tl_errors_9185!()),
+        [error("RelativePath", "Trait", "ElidedTr")]
+    );
+    assert_eq!(
+        errors(__tl_errors_9186!()),
+        [error("SelfWithoutMeaning", "Type", "Self")]
+    );
+    assert_eq!(
+        errors(__tl_errors_9187!()),
+        [error("RelativePath", "Trait", "SharedTr")]
+    );
+    assert_eq!(
+        errors(__tl_errors_9188!()),
+        [error("UnprovableBound", "Type", "Wrap<Y>")]
+    );
+    assert_eq!(
+        errors(__tl_errors_9189!()),
+        [error("RelativePath", "Trait", "SharedTr")]
+    );
+
+    // (a) The host implements the trait, with `Held<'b>` in the signature as written.
+    fn held_input<T: l::HeldInput>() {}
+    held_input::<r::Host9184>();
+    // (b) `f` keeps its elided lifetime and its trait object, and `g` takes the entry, which is
+    // `dyn PlainTr`.
+    fn elided_and_plain<T: l::ElidedAndPlain>() {}
+    elided_and_plain::<r::Host9185>();
+    // (d) `f` keeps its elided lifetime and its trait object as written, whatever `g` has.
+    fn elided_and_bare<T: l::ElidedAndBare>() {}
+    elided_and_bare::<r::Host9187>();
+    // (e) `ai` keeps `impl Into<Wrap<Y>>`, and `a1` and the bound have the entries.
+    fn entry_and_bound<T: l::EntryAndBound>() {}
+    entry_and_bound::<r::Host9188>();
+    // (f) `f` keeps `dyn SharedTr`, and the relative type beside it is an entry, like `g`'s.
+    fn elided_with_sibling<T: l::ElidedWithSibling>() {}
+    elided_with_sibling::<r::Host9189>();
+    // (c) The copy holds the original types: `Self` is replaced by the Visitor with the Leaker's
+    // type, as it is for any struct with `allow_self = true`.
+    let copy = r::NoSelfMeaning {
+        rel: l::Rel(2),
+        me: l::Wrap(PhantomData),
+    };
+    same(&copy.rel, &l::Rel(0));
+    same(&copy.me, &l::Wrap::<l::NoSelfMeaning>(PhantomData));
+}
+
+/// The Leaker's macro passes its errors on (`#[prop_leak_result]`: the serialized `LeakerResult`),
+/// and the Referrer's macro, in the crate `accepted` of `tests/crates/referrer`, drops them by what
+/// they are: `allow(trait Clone)` (9190), `allow(std_crates)` (9191), and the causes written out,
+/// `allow(trait PlainTr, type Held<'_>)` (9192). If one remained, the macro would report it and the
+/// crate would not build (`tests/diagnostic.rs` has that); so it is enough to see that the crate
+/// exists and that the copy keeps the parts as written, with every other type replaced and checked.
+#[test]
+fn errors_the_referrers_macro_allows_are_copied_as_written() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::accepted as r;
+
+    // The reports of the Leaker's macro: the same entries as if it had accepted the errors (the
+    // parts that conflict have none). Every type position is compared with its original, but the
+    // one of 9192 that has an elided lifetime (`Held<'_>`), which a witness cannot name.
+    let table = [
+        (
+            9190,
+            reported(9190, __tl_report_9190!()),
+            allowed("trait", 2, 4, 4),
+        ),
+        (
+            9191,
+            reported(9191, __tl_report_9191!()),
+            allowed("trait", 2, 4, 4),
+        ),
+        (
+            9192,
+            reported(9192, __tl_report_9192!()),
+            allowed("trait", 2, 4, 3),
+        ),
+    ];
+    for (id, got, expected) in table {
+        assert_eq!(got, expected, "{}", id);
+    }
+
+    // The errors of the Leaker's analysis: every one has the reason `RelativePath`.
+    let errors = |text: &'static str| -> Vec<(String, String, String)> {
+        text.split('\u{1d}')
+            .map(|error| {
+                let fields: Vec<&str> = error.split('\u{1f}').collect();
+                let tokens = fields[1].split_whitespace().collect::<String>();
+                (fields[3].to_string(), fields[4].to_string(), tokens)
+            })
+            .collect()
+    };
+    let relative = |cause: &str, tokens: &[&str]| -> Vec<(String, String, String)> {
+        tokens
+            .iter()
+            .map(|tokens| {
+                (
+                    "RelativePath".to_string(),
+                    cause.to_string(),
+                    tokens.to_string(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        errors(__tl_errors_9190!()),
+        relative("Trait", &["Clone", "Clone", "Clone"])
+    );
+    assert_eq!(
+        errors(__tl_errors_9191!()),
+        relative("Trait", &["core::fmt::Debug", "std::fmt::Display"])
+    );
+    let mut explicit = relative("Trait", &["PlainTr", "PlainTr"]);
+    explicit.insert(
+        1,
+        (
+            "RelativePath".to_string(),
+            "Type".to_string(),
+            "Held<'_>".to_string(),
+        ),
+    );
+    assert_eq!(errors(__tl_errors_9192!()), explicit);
+
+    // The hosts implement the Leaker's traits, whose signatures hold the original types.
+    fn prelude_bounds<T: l::PreludeBounds<u8>>() {}
+    prelude_bounds::<r::Host9190>();
+    fn std_bounds<T: l::StdBounds<u8>>() {}
+    std_bounds::<r::Host9191>();
+    struct Plain;
+    impl l::PlainTr for Plain {}
+    fn explicit_causes<T: l::PlainTr, H: l::ExplicitCauses<T>>() {}
+    explicit_causes::<Plain, r::Host9192>();
+}
+
+// ---------------------------------------------------------------------------------------------
 // A strict Referrer, in a crate without the dependency of an optional entry.
 // ---------------------------------------------------------------------------------------------
 
@@ -1685,9 +1937,9 @@ fn the_scope_api_writes_the_impls_that_are_needed() {
     // the crate of the optional entry.)
 }
 
-/// `NotInternableError::items()` through a macro: one item for each offending path, in order, with
-/// its message, the tokens, the source text at its span and the notes with theirs. The macro
-/// reported them as a const, and as many `compile_error!`s.
+/// The errors of the Leaker (`Vec<ErrorItem>`) through a macro: one item for each offending path,
+/// in order, with its message, the tokens, the source text at its span and the notes with theirs.
+/// The macro reported them as a const, and as many `compile_error!`s.
 #[test]
 fn errors_are_reported_item_by_item_through_a_macro() {
     use type_leak_test_leaker::scoped::*;
@@ -1757,4 +2009,305 @@ fn errors_are_reported_item_by_item_through_a_macro() {
         assert!(row.3[0].1.starts_with("Self"));
     }
     assert_eq!(SCOPE_ERRORS_SELF_WITHOUT_MEANING_COMPILE_ERRORS, 2);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The parts and the optional entries that the Visitor must tell apart (tests/findings.rs F18, F43
+// to F45).
+// ---------------------------------------------------------------------------------------------
+
+/// F18, fixture 9194: `Held<'b>` is the only input of `f` that holds the method lifetime, written
+/// with an absolute path of the Leaker's crate: an optional entry. A strict Referrer used to replace
+/// it, and the impl of the host had `'b` early-bound where the trait has it late-bound (E0195, in
+/// `tests/crates/referrer`, where it is invoked as `strict`). The Leaker keeps it as written now,
+/// for every Referrer: the only entry is `Rel`.
+#[test]
+fn an_optional_entry_that_holds_a_method_lifetime_is_copied_as_written() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::kinds as r;
+
+    assert_eq!(reported(9194, __tl_report_9194!()), ok("trait", 1, 5, 5));
+    fn holds_lifetime<T: l::OptionalHoldsLifetime>() {}
+    holds_lifetime::<r::Host9194>();
+}
+
+/// F44 and F45, fixtures 9195 to 9198: parts that the Visitor must leave as written, with a trait
+/// object inside whose lifetime comes from the path around it (`dyn SharedTr + 'a`), and the entry
+/// `dyn SharedTr` (`+ 'static`) elsewhere in the same item. The copy compiles in the Referrer's
+/// crate only if the part is not rewritten. The conflicts are about `Self`: denied and named by a
+/// bound (9195), named by a predicate of the trait (9196), named by the bound of an impl whose self
+/// type holds the generic (9197), and named by the bound of a struct nested in a module (9198,
+/// copied by a visitor without `with_nested_self()`).
+#[test]
+fn parts_that_name_self_are_left_as_written() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::accepted as r;
+
+    let table = [
+        (
+            9195,
+            reported(9195, __tl_report_9195!()),
+            allowed("trait", 2, 2, 2),
+        ),
+        (
+            9196,
+            reported(9196, __tl_report_9196!()),
+            allowed("trait", 2, 1, 1),
+        ),
+        (
+            9197,
+            reported(9197, __tl_report_9197!()),
+            allowed("impl-inherent", 2, 2, 2),
+        ),
+        (
+            9198,
+            reported(9198, __tl_report_9198!()),
+            allowed("struct", 2, 2, 2),
+        ),
+    ];
+    for (id, got, expected) in table {
+        assert_eq!(got, expected, "{}", id);
+    }
+
+    // The errors that were allowed: the reason, the kind of the cause and its tokens.
+    let errors = |text: &'static str| -> Vec<(String, String, String)> {
+        text.split('\u{1d}')
+            .map(|error| {
+                let fields: Vec<&str> = error.split('\u{1f}').collect();
+                let tokens = fields[1].split_whitespace().collect::<String>();
+                (fields[3].to_string(), fields[4].to_string(), tokens)
+            })
+            .collect()
+    };
+    let error = |reason: &str, cause: &str, tokens: &str| {
+        (reason.to_string(), cause.to_string(), tokens.to_string())
+    };
+    let obj = "::type_leak_test_leaker::kinds::ObjOf<'a,T,dynSharedTr>";
+    assert_eq!(
+        errors(__tl_errors_9195!()),
+        [error("DeniedSelfInBounds", "Type", obj)]
+    );
+    assert_eq!(
+        errors(__tl_errors_9196!()),
+        [error(
+            "SelfInTraitPredicate",
+            "Type",
+            "::type_leak_test_leaker::kinds::ObjOf<'a,Self,dynSharedTr>"
+        )]
+    );
+    assert_eq!(
+        errors(__tl_errors_9197!()),
+        [
+            error("SelfInImplSelfType", "Type", obj),
+            error("UnprovableBound", "Type", "Self")
+        ]
+    );
+    assert_eq!(
+        errors(__tl_errors_9198!()),
+        [error(
+            "NestedSelfInBounds",
+            "Type",
+            "::type_leak_test_leaker::kinds::ObjOf<'a,(Self,T),dynSharedTr>"
+        )]
+    );
+
+    // The hosts implement the traits, with `ObjOf<'a, .., dyn SharedTr + 'a>` in the signature as
+    // written, and the entry in `g`.
+    fn denied<T: l::DeniedSelfObject<'static>>() {}
+    denied::<r::Host9195>();
+    fn predicate<T: l::PredicateObject<'static>>() {}
+    predicate::<r::Host9196>();
+}
+
+/// F43, fixture 9199: the impl nested in the scope of a trait, whose generic has a bound that names
+/// the `Self` of the trait, has a type with no context. It is copied as written, and the entry
+/// `dyn SharedTr` of the other type is replaced.
+#[test]
+fn a_part_with_no_context_is_left_as_written() {
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::accepted as r;
+
+    assert_eq!(
+        __nested_report_9199!(),
+        "9199|entries=2|errors=UnnameableSelf"
+    );
+    assert_eq!(
+        squash(r::NESTED_9199_TYPES),
+        squash(
+            "::type_leak_test_leaker::kinds::ObjOf<'a, T, dyn SharedTr> ;; \
+             ::type_leak_test_leaker::kinds::Bare<<() as ::type_leak_test_leaker::Repeater<(), \
+             9199u64, 0usize>>::Type>"
+        )
+    );
+}
+
+/// F48, fixtures 9202 (E0195) and 9203 (E0106): two items analyzed together, a trait and a struct.
+/// The method that has the fault keeps the type as written, where the module that copies the trait
+/// names it (`accepted`); the other methods and the struct, copied in a module that names neither
+/// `Held` nor `Wrap` (`unnamed`), have the entry.
+#[test]
+fn a_type_copied_as_written_for_a_signature_is_left_in_a_signature_like_it_only() {
+    use std::marker::PhantomData;
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::{accepted, unnamed};
+
+    assert_eq!(
+        __shared_report_9202!(),
+        "9202|entries=1|errors=UnconstrainedLifetime"
+    );
+    assert_eq!(
+        __shared_report_9203!(),
+        "9203|entries=2|errors=RelativePath"
+    );
+
+    // The copies of the traits are implementations of the Leaker's: rustc compares the signatures.
+    fn held<T: l::HeldInTwoMethods>() {}
+    held::<accepted::Host9202x0>();
+    fn elided<T: l::ElidedInOneMethod<'static, u8>>() {}
+    elided::<accepted::Host9203x0>();
+
+    // The fields of the structs are the original types.
+    let n = 5;
+    let copy = unnamed::HeldHolder { held: l::Held(&n) };
+    same(&copy.held, &l::Held(&n));
+    let copy = unnamed::ElidedHolder::<u8>(PhantomData, l::Wrap(PhantomData));
+    same(&copy.1, &l::Wrap::<u8>(PhantomData));
+}
+
+/// F49, fixture 9204 (E0106): a lifetime that another input keeps. `f` keeps the entry `Wrap<T>` as
+/// written, where `'a` is also in `x`; `g`, `h` and `k` and the struct have the entry (the struct is
+/// copied in the module that names neither `Held` nor `Wrap`).
+#[test]
+fn a_lifetime_that_another_input_keeps_breaks_the_elision_of_the_copy() {
+    use std::marker::PhantomData;
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::{accepted, unnamed};
+
+    assert_eq!(
+        __shared_report_9204!(),
+        "9204|entries=2|errors=RelativePath"
+    );
+
+    // The copy of the trait is an implementation of the Leaker's: rustc compares the signatures.
+    fn kept<T: l::KeptInOtherInput<'static, u8>>() {}
+    kept::<accepted::Host9204x0>();
+
+    let copy = unnamed::KeptHolder::<u8>(PhantomData, l::Wrap(PhantomData));
+    same(&copy.1, &l::Wrap::<u8>(PhantomData));
+}
+
+/// F50, fixture 9205 (`stages = true`): `core::mem::size_of::<*const Rel>()` in a default method.
+/// `allow_std_crates()` given to the result after the analysis leaves the error, whose path is
+/// `Rel` now: the copy is made in a module that names it (`stage_copies`), and in no crate that does
+/// not (`clean`, where the macro makes the copy only if the rule left no error: it would write
+/// `Rel` as written, E0412). The config that allows the crates leaks `Rel` and has no error.
+#[test]
+fn a_rule_after_the_analysis_keeps_the_error_for_a_relative_type_in_the_arguments_of_a_value() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::stage_copies as r;
+
+    // What the stages leave: the rule matters, one error without it, none in the config (`Rel` is
+    // an entry), one after it in the result (the path of the value); not the same errors, not the
+    // same Referrer.
+    let fields: Vec<&str> = __tl_stages_std_9205!().split('\u{1f}').collect();
+    assert_eq!(fields[..4], ["1", "1", "0", "1"]);
+    assert_eq!(fields[4], "");
+    assert_eq!(squash(fields[5]), "core::mem::size_of::<*constRel>");
+    assert_eq!(fields[6..], ["0", "0"]);
+
+    // The copy after the rule is one with the causes allowed, which is not a clean one.
+    let report = __tl_st_std_res_report_9205!();
+    let status: Vec<&str> = report
+        .split('\u{1e}')
+        .next()
+        .unwrap()
+        .splitn(4, '|')
+        .collect();
+    assert_eq!(status[..3], ["9205", "trait", "acc"]);
+
+    // The copy is an implementation of the Leaker's trait, and its default method is the original.
+    fn implements<T: l::ValuePathArguments>() {}
+    implements::<r::Host9205>();
+    struct Copy;
+    impl r::ValuePathArgumentsCopy for Copy {}
+    use r::ValuePathArgumentsCopy;
+    assert_eq!(Copy.size(), core::mem::size_of::<*const l::Rel>());
+}
+
+/// F51, fixture 9206: a nested struct whose bound names a leaked type that names `Self`, analyzed
+/// with `nested_self_entries()`, is rejected, as `intern_struct()` rejects it. The Referrer's
+/// macro expands to nothing (`kinds`, like the other rejected items).
+#[test]
+fn a_nested_item_with_a_bound_that_names_a_leaked_type_is_rejected() {
+    use type_leak_test_leaker::*;
+    assert_eq!(
+        reported(9206, __tl_report_9206!()),
+        rejected(
+            "struct",
+            "`Wrap<Self>`isinaboundorwherepredicate,andaboundofitsgenericsnamesaleakedtype"
+        )
+    );
+}
+
+/// F52, fixture 9207: the optional entries in the where predicate of a trait stay as written beside
+/// an unrelated error whose part copies `Self::A0` as written, as they do without the error. The
+/// strict Referrer (`accepted`) has no entry for them, and the host implements the trait.
+#[test]
+fn optional_entries_in_a_predicate_stay_as_written_beside_an_unrelated_error() {
+    use type_leak_test_leaker::*;
+    assert_eq!(
+        reported(9207, __tl_report_9207!()),
+        allowed("trait", 0, 0, 0)
+    );
+    // The one error is the unrelated one, accepted by its cause: the bound copied as written.
+    let errors: Vec<Vec<&str>> = __tl_errors_9207!()
+        .split('\u{1d}')
+        .map(|error| error.split('\u{1f}').collect())
+        .collect();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0][3..5], ["RelativePath", "Trait"]);
+    assert_eq!(squash(errors[0][1]), "GenTr<Self::A0>");
+}
+
+/// Issue 3 of `tests/downstream_findings.rs`, fixture 9208: `None`, `Some`, `Ok` and `Err` in the
+/// values of a trait and `DoubleEndedIterator + ExactSizeIterator` in a bound are names of the
+/// prelude of every edition, so `allow_prelude()` accepts them (it rejected the trait before: the
+/// Referrer's crate had no `PreludeNamesCopy`, which also fails to build the test). The copy writes
+/// them as they are, replaces the relative type of the values, and computes what the original does.
+#[test]
+fn the_names_of_the_prelude_of_every_edition_are_accepted_in_a_trait() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::kinds as r;
+
+    assert_eq!(
+        reported(9208, __tl_report_9208!()),
+        ok("trait", 1, 7, 7),
+        "{}",
+        __tl_report_9208!()
+    );
+
+    struct Original;
+    impl l::PreludeNames for Original {}
+    struct Copy;
+    impl r::PreludeNamesCopy for Copy {}
+
+    assert_eq!(<Original as l::PreludeNames>::NOTHING, None);
+    assert_eq!(<Copy as r::PreludeNamesCopy>::NOTHING, None);
+    for n in [0u8, 1] {
+        let original = l::PreludeNames::pick(&Original, n);
+        assert_eq!(original.is_some(), n > 0);
+        assert_eq!(r::PreludeNamesCopy::pick(&Copy, n), original);
+        let original = l::PreludeNames::check(&Original, n);
+        assert_eq!(original.is_ok(), n > 0);
+        assert_eq!(r::PreludeNamesCopy::check(&Copy, n), original);
+    }
+    let items = [1u8, 2, 3];
+    assert_eq!(l::PreludeNames::count(&Original, items.iter()), 6);
+    assert_eq!(r::PreludeNamesCopy::count(&Copy, items.iter()), 6);
 }

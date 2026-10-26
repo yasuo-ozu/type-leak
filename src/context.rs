@@ -1,5 +1,6 @@
 //! The context of a leaked type: its generics, what `Self` means, and its module.
 
+use crate::error::Cause;
 use crate::unstable::is_std_trait;
 use crate::util::{
     bound_mentions_self, canonical_bounds, generic_param_mentions_self, generic_param_name,
@@ -161,12 +162,10 @@ impl Scope {
 /// # use syn::*;
 /// let mut leaker = Leaker::new();
 /// let in_struct = leaker
-///     .intern_struct(&parse_quote!(struct S<T> { a: Rel<Self> }), true)
-///     .unwrap();
+///     .intern_struct(&parse_quote!(struct S<T> { a: Rel<Self> }), true);
 /// let in_trait = leaker
-///     .intern_trait(&parse_quote!(trait Tr<T> { fn f(&self) -> Rel<Self>; }), true)
-///     .unwrap();
-/// let referrer = leaker.finish();
+///     .intern_trait(&parse_quote!(trait Tr<T> { fn f(&self) -> Rel<Self>; }), true);
+/// let referrer = leaker.result().finish().unwrap();
 /// // In a struct, `Self` is the struct with its own generics as arguments.
 /// match referrer.context_self(in_struct) {
 ///     Some(SelfRequirement::Type(ty)) => assert_eq!(*ty, parse_quote!(S<T>)),
@@ -268,7 +267,7 @@ pub enum SelfRequirement {
     /// The ways out are to put the field first (not the last one of a struct), to add `where Self:
     /// Sized` to the item, to write the type with an absolute path that both crates resolve (a
     /// Referrer that trusts the names of the crates copies it as written, see
-    /// [`Referrer::allow_ambiguous_crate_name()`](crate::Referrer::allow_ambiguous_crate_name)),
+    /// [`LeakerResult::allow_ambiguous_crate_name()`](crate::LeakerResult::allow_ambiguous_crate_name)),
     /// or to use a bound that needs no `Sized`, where the impl is `?Sized`.
     Any,
 }
@@ -679,7 +678,7 @@ pub(crate) struct Context {
 #[derive(Clone, Debug)]
 pub(crate) struct UnnameableSelf {
     /// The mention of `Self` that cannot be written.
-    pub(crate) cause: TokenStream,
+    pub(crate) cause: Box<Cause>,
     /// Tells what is wrong, as the headline of the error: the problem is the bound, not the path
     /// of the type that uses it.
     pub(crate) headline: String,
@@ -823,12 +822,14 @@ impl Context {
     }
 
     /// Leaves out the bounds of the generics that the Repeater's impl cannot carry (see
-    /// [`LeftOut`]), except for a context that depends on `Self` as a type or an implementor, and
-    /// for a type that writes out the self type of its scope: the self type of an item, or the
-    /// associated type of its trait, is well-formed only with the bounds that the item declares,
-    /// which the impl needs whole (`struct S<T: Iterator<Item = u8> + Fn(T::Item)>` and the entry
-    /// `Wrap<S<T>>`, or `impl<T: Iterator<Item = u8> + Fn(T::Item)> S<T>` and the entry `S<T>`:
-    /// E0277 in the Leaker's crate otherwise).
+    /// [`LeftOut`]), except for a type that names `Self` or writes out the self type of its scope:
+    /// the self type of an item, or the associated type of its trait, is well-formed only with the
+    /// bounds that the item declares, which the impl needs whole (`struct S<T: Fn(T::Item) +
+    /// Iterator<Item = u8>>` and the entry `Wrap<S<T>>`, or `impl<T: Fn(T::Item) + Iterator<Item =
+    /// u8>> S<T>` and the entry `S<T>`: E0277 in the Leaker's crate otherwise). A type that
+    /// depends on `Self` only through a bound or an outlives predicate (`Self: 'x`) keeps whole
+    /// the bounds of the generics that the description of `Self` names (`impl<T: ..> S<T>`,
+    /// `Tr<T>`), and no others.
     fn compute(
         ty: &Type,
         scopes: &[Scope],
@@ -837,7 +838,15 @@ impl Context {
         any: bool,
         enclosing: &Enclosing,
     ) -> std::result::Result<Self, UnnameableSelf> {
-        let context = Self::compute_with(ty, scopes, self_req, nested_type, any, enclosing, true)?;
+        let context = Self::compute_with(
+            ty,
+            scopes,
+            self_req,
+            nested_type,
+            any,
+            enclosing,
+            &Whole::Nothing,
+        )?;
         // The self type of an impl, a struct, an enum or a union, written out (`impl<T: Fn(T::Item)>
         // S<T> { .. }` with the entry `S<T>`), is declared with the bounds of the item.
         let names_self_type = matches!(self_req, Some(SelfRequirement::Type(self_ty))
@@ -849,8 +858,17 @@ impl Context {
         if !(names_self_type || depends_on_self) {
             return Ok(context);
         }
+        let keep = if names_self_type || type_mentions_self(ty) {
+            Whole::Everything
+        } else {
+            let mut names = HashSet::new();
+            if let Some(self_req) = self_req {
+                self_req.names(&mut names);
+            }
+            Whole::Named(names)
+        };
         let mut whole =
-            Self::compute_with(ty, scopes, self_req, nested_type, any, enclosing, false)?;
+            Self::compute_with(ty, scopes, self_req, nested_type, any, enclosing, &keep)?;
         // The Referrer knows the self type of the scope only if the top-level context records it:
         // it does if the context depends on it (`substituted`, see `names_self()`), which it does
         // when keeping the bounds makes a difference.
@@ -864,7 +882,7 @@ impl Context {
         Ok(whole)
     }
 
-    /// Like `compute()`; `leave_out` says whether it leaves out the bounds of [`LeftOut`].
+    /// Like `compute()`; `whole` says which generics keep the bounds that [`LeftOut`] leaves out.
     fn compute_with(
         ty: &Type,
         scopes: &[Scope],
@@ -872,7 +890,7 @@ impl Context {
         nested_type: bool,
         any: bool,
         enclosing: &Enclosing,
-        leave_out: bool,
+        whole: &Whole,
     ) -> std::result::Result<Self, UnnameableSelf> {
         let mut names = HashSet::new();
         type_names(ty, &mut names);
@@ -926,7 +944,7 @@ impl Context {
                 .filter(|outer| Some(*outer) != self_req)
         };
         let mut substituted: Vec<SelfRequirement> = Vec::new();
-        let mut left_out = LeftOut::new(leave_out);
+        let mut left_out = LeftOut::new(whole.clone());
         loop {
             let (from, name) = match work.pop() {
                 Some(item) => item,
@@ -1205,7 +1223,7 @@ impl std::hash::Hash for Context {
 /// of what it analyzed (keep it: [`Referrer::visitor()`](crate::Referrer::visitor) needs it), and
 /// [`Referrer::context()`](crate::Referrer::context) returns the id of the context of an entry.
 /// Ids count from 0 in order of first appearance and are never renumbered (except for the contexts
-/// of a scope that fails and is rolled back), so the Referrer may skip some. Entries with the same
+/// of a scope that panics and is rolled back), so the Referrer may skip some. Entries with the same
 /// generics, `Self` and module share an id. `ToTokens` writes it as an integer literal, and `Parse`
 /// reads one with or without `usize`.
 ///
@@ -1214,8 +1232,8 @@ impl std::hash::Hash for Context {
 /// # use syn::*;
 /// let item: ItemStruct = parse_quote!(struct S<T> { a: Wrap<T>, b: Rel });
 /// let mut leaker = Leaker::new();
-/// let top_level = leaker.intern_struct(&item, true).unwrap();
-/// let referrer = leaker.finish();
+/// let top_level = leaker.intern_struct(&item, true);
+/// let referrer = leaker.result().finish().unwrap();
 /// // `Wrap<T>` uses the generics of the struct, as the top-level context has them.
 /// // `Rel` uses no generic, so its context is another one.
 /// let wrap = referrer.iter().position(|ty| *ty == parse_quote!(Wrap<T>)).unwrap();
@@ -1244,8 +1262,8 @@ impl std::hash::Hash for Context {
 ///     }
 /// };
 /// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&item, true).unwrap();
-/// let referrer = leaker.finish();
+/// leaker.intern_trait(&item, true);
+/// let referrer = leaker.result().finish().unwrap();
 /// // `Rel` uses no generic. `Wrap<T>` uses `T`. `Wrap<U>` uses `U` and, through the bound
 /// // `U: Into<T>`, `T`.
 /// let used: Vec<usize> = (0..3).map(|ix| referrer.generics(ix).params.len()).collect();
@@ -1469,18 +1487,36 @@ fn bounded_generic(predicate: &WherePredicate) -> Option<String> {
 /// "expected an `Fn(u8)` closure, found `T`"), and neither is one that hides the projection behind
 /// a type alias (`T: Fn(Alias<T>)`), which the Leaker cannot tell from a struct. The impl does not
 /// need that bound to name the entry, so the context leaves out such a bound, the Leaker and the
-/// Referrer alike (see [`left_out_bounds()`]), unless the context depends on `Self` as a type or an
-/// implementor (see `Context::compute()`).
+/// Referrer alike (see [`left_out_bounds()`]), except for the generics that [`Whole`] keeps (see
+/// `Context::compute()`).
 struct LeftOut {
-    /// Whether it leaves anything out.
-    enabled: bool,
+    whole: Whole,
     cache: HashMap<(usize, String), HashSet<String>>,
 }
 
+/// The generics of a context that keep every bound.
+#[derive(Clone)]
+enum Whole {
+    Nothing,
+    /// The generics with these names.
+    Named(HashSet<String>),
+    Everything,
+}
+
+impl Whole {
+    fn keeps(&self, name: &str) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Named(names) => names.contains(name),
+            Self::Everything => true,
+        }
+    }
+}
+
 impl LeftOut {
-    fn new(enabled: bool) -> Self {
+    fn new(whole: Whole) -> Self {
         Self {
-            enabled,
+            whole,
             cache: HashMap::new(),
         }
     }
@@ -1488,12 +1524,12 @@ impl LeftOut {
     /// The texts of the bounds of the type parameter `name` of `scopes[ix]` that the context
     /// leaves out. Empty if `scopes[ix]` declares no such parameter.
     fn of(&mut self, scopes: &[Scope], ix: usize, name: &str) -> &HashSet<String> {
-        let enabled = self.enabled;
+        let kept = self.whole.keeps(name);
         self.cache.entry((ix, name.to_string())).or_insert_with(|| {
-            if enabled {
-                left_out_bounds(&scopes[ix], name)
-            } else {
+            if kept {
                 HashSet::new()
+            } else {
+                left_out_bounds(&scopes[ix], name)
             }
         })
     }
@@ -1681,7 +1717,7 @@ fn for_self_of<T: WrittenForSelf>(
     match outer {
         // No scope declares an `Any` `Self`: it is the context of an entry.
         SelfRequirement::Any => Err(UnnameableSelf {
-            cause: mentions.first.unwrap_or_else(|| quote!(Self)),
+            cause: Box::new(mentions.first.unwrap_or_else(Cause::self_type)),
             headline: format!("{} mentions a `Self` which has no name here", node.what()),
             note: format!(
                 "{} mentions a `Self` of no type, which has no name here",
@@ -1690,7 +1726,7 @@ fn for_self_of<T: WrittenForSelf>(
             help: format!("write {} without `Self`", node.what()),
         }),
         SelfRequirement::Bound(path) => Err(UnnameableSelf {
-            cause: mentions.first.unwrap_or_else(|| quote!(Self)),
+            cause: Box::new(mentions.first.unwrap_or_else(Cause::self_type)),
             headline: format!("{} mentions a `Self` which has no name here", node.what()),
             note: format!(
                 "{} mentions the `Self` of the trait `{}`, which has no name here: `Self` is \
@@ -1705,17 +1741,17 @@ fn for_self_of<T: WrittenForSelf>(
                 headline: format!(
                     "{} mentions `{}`, which has no name here",
                     node.what(),
-                    cause
+                    cause.shown()
                 ),
                 note: format!(
                     "{} mentions `{}`, an associated item of the `Self` of `{}`, which has no \
                      name here: `Self` is something else in the item around",
                     node.what(),
-                    cause,
+                    cause.shown(),
                     quote!(#ty)
                 ),
-                help: format!("write {} without `{}`", node.what(), tidy(&cause)),
-                cause,
+                help: format!("write {} without `{}`", node.what(), tidy(&cause.shown())),
+                cause: Box::new(cause),
             }),
             None => Ok(node.clone().rewrite(&mut ReplaceSelf { self_ty: ty })),
         },
