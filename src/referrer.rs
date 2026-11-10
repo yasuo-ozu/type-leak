@@ -15,7 +15,8 @@ use crate::repeater::repeater_definition;
 use crate::repeater::{check_repeater_path, repeater_path, ImplSelf, Projection, RepeaterImpl};
 use crate::util::{
     bound_cause, declared_names, generic_param_name, ident_name, mentions_names,
-    parenthesize_bounded, path_type, token_names, type_mentions_self, ReplaceSelf,
+    parenthesize_bounded, parenthesize_leading_qualified_path, path_type, token_names,
+    type_mentions_self, ReplaceSelf, Sorted,
 };
 use proc_macro2::{Literal, Punct, Spacing, Span, TokenStream};
 use std::cell::RefCell;
@@ -72,16 +73,16 @@ pub struct Referrer {
     contexts: BTreeMap<ContextId, Context>,
     /// The indices of the entries, keyed by tokens as in the Leaker, so a type in an invisible
     /// group is found too.
-    by_tokens: HashMap<TypeKey, Vec<usize>>,
+    by_tokens: Sorted<HashMap<TypeKey, Vec<usize>>>,
     /// The types and bounds copied as written that a position tells from an entry of the same
     /// tokens and context: a part is whole (nothing in it is looked up), or has an anchor or a
     /// signature mark. Serialized after the format tag.
     parts: Vec<PartItem>,
     /// The indices in `parts`, by the part.
-    parts_by_cause: HashMap<Cause, Vec<usize>>,
+    parts_by_cause: Sorted<HashMap<Cause, Vec<usize>>>,
     /// The indices in `parts` of the parts with an anchor (`within`), by the anchor, as a
     /// `Cause::Type`.
-    parts_by_anchor: HashMap<Cause, Vec<usize>>,
+    parts_by_anchor: Sorted<HashMap<Cause, Vec<usize>>>,
 }
 
 /// The maps are made from the entries and the parts (`Referrer::new()`), so they are not compared.
@@ -278,10 +279,10 @@ impl Referrer {
             entries: Vec::new(),
             removed,
             contexts,
-            by_tokens: HashMap::new(),
+            by_tokens: Sorted::default(),
             parts,
-            parts_by_cause: HashMap::new(),
-            parts_by_anchor: HashMap::new(),
+            parts_by_cause: Sorted::default(),
+            parts_by_anchor: Sorted::default(),
         };
         for (ix, item) in referrer.parts.iter().enumerate() {
             let PartItem { part, within, .. } = item;
@@ -498,7 +499,7 @@ impl Referrer {
     /// Returns the entries that items declared together with the `names` hide.
     fn hidden_by(&self, names: &[Ident]) -> Vec<usize> {
         let mut hidden = Vec::new();
-        for (key, entries) in &self.by_tokens {
+        for (key, entries) in self.by_tokens.iter() {
             if !mentions_names(&key.ty, names.to_vec(), Vec::new()) {
                 continue;
             }
@@ -823,7 +824,10 @@ impl Referrer {
             declared.lt_token.get_or_insert_with(Default::default);
             declared.gt_token.get_or_insert_with(Default::default);
         }
-        parenthesize_leading_qualified_path(&mut declared);
+        // rustc reads a first predicate on `<__S>::A` as generics of the `where`.
+        if let Some(clause) = &mut declared.where_clause {
+            parenthesize_leading_qualified_path(clause);
+        }
         Ok(RepeaterImpl {
             entry: EntryId::new(ix),
             generics: declared,
@@ -1196,29 +1200,6 @@ fn accepts_unsized_argument(path: &Path) -> bool {
     }
 }
 
-/// rustc reads `where <__S>::A: Clone` as generics of the `where` (reserved for future use), so a
-/// first predicate on `<__S>::A` is parenthesized.
-fn parenthesize_leading_qualified_path(generics: &mut Generics) {
-    let first = generics
-        .where_clause
-        .as_mut()
-        .and_then(|clause| clause.predicates.first_mut());
-    if let Some(WherePredicate::Type(PredicateType {
-        lifetimes: None,
-        bounded_ty,
-        ..
-    })) = first
-    {
-        if matches!(bounded_ty, Type::Path(TypePath { qself: Some(q), .. }) if q.as_token.is_none())
-        {
-            *bounded_ty = Type::Paren(TypeParen {
-                paren_token: Default::default(),
-                elem: Box::new(bounded_ty.clone()),
-            });
-        }
-    }
-}
-
 /// A struct, enum, union, trait or impl nested in the visited syntax, which declares its own `Self`.
 #[derive(Debug)]
 struct Nested {
@@ -1537,7 +1518,7 @@ pub struct Visitor<'r, N = fn(&SelfRequirement) -> Option<Type>> {
 #[derive(Clone, Debug)]
 struct VisitorState {
     /// The entries that the items declared in the visited syntax hide (`Visitor::shadow_items()`).
-    hidden: Rc<HashSet<usize>>,
+    hidden: Rc<Sorted<HashSet<usize>>>,
     /// The names that each container around declares (`Visitor::shadow_items()`), outermost first:
     /// `hidden` is what they hide.
     shadows: Rc<Vec<Vec<Ident>>>,
@@ -1744,7 +1725,7 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> Visitor<'r, N> {
         for names in shadows.iter().filter(|names| !names.is_empty()) {
             hidden.extend(self.referrer.hidden_by(names));
         }
-        self.state.hidden = Rc::new(hidden);
+        self.state.hidden = Rc::new(Sorted(hidden));
     }
 
     /// Returns `true` if `cause`, a bound whose trait path conflicts, is a part: it is no type.
@@ -1982,6 +1963,11 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> VisitMut for Visitor<'r, N>
         self.state.scopes.truncate(depth);
         // What replaced the bounded type (`Self`, an entry) may need parentheses there.
         parenthesize_bounded(&mut i.bounded_ty);
+    }
+    // What replaced the bounded type of the first predicate (`Self::A`) may need parentheses.
+    fn visit_where_clause_mut(&mut self, i: &mut WhereClause) {
+        syn::visit_mut::visit_where_clause_mut(self, i);
+        parenthesize_leading_qualified_path(i);
     }
     fn visit_trait_bound_mut(&mut self, i: &mut TraitBound) {
         // A bound of the generics is not in a type, which the same rewriting handles. A bound whose

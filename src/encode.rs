@@ -3,8 +3,8 @@
 use crate::elided::{fold_bare_fn, fold_bound, FreshLifetimes, Site};
 use crate::repeater::encode_slot_const;
 use crate::util::{
-    parenthesize_bounded, parenthesize_pointee, projection, projection_head, unwrap_type_group,
-    ReplaceSelf,
+    parenthesize_bounded, parenthesize_leading_qualified_path, parenthesize_pointee, projection,
+    projection_head, unwrap_type_group, ReplaceSelf, Sorted,
 };
 use proc_macro2::{Span, TokenStream, TokenTree};
 use std::borrow::Borrow;
@@ -121,9 +121,9 @@ pub(crate) fn complete_params<'a>(
         };
     }
     Ok(Substitute {
-        lifetimes,
-        others,
-        bounds: substitute.bounds,
+        lifetimes: Sorted(lifetimes),
+        others: Sorted(others),
+        bounds: Sorted(substitute.bounds),
     })
 }
 
@@ -836,7 +836,9 @@ impl syn::fold::Fold for ParamFold {
                 }
             }
         }
-        syn::fold::fold_type(self, ty)
+        // An argument may be a trait object with several bounds, which needs parentheses behind a
+        // reference or a pointer.
+        parenthesize_pointee(syn::fold::fold_type(self, ty))
     }
     fn fold_expr(&mut self, expr: Expr) -> Expr {
         match self.const_value(&expr) {
@@ -1040,11 +1042,11 @@ fn substitute_in<F: FnMut(&Ident, Kind) -> Option<GenericArgument>>(
 #[derive(Clone, Debug)]
 pub struct Substitute {
     /// For `impl Tr<'static, u8> for W` of `trait Tr<'a, K>`: `{ a: 'static }`.
-    lifetimes: HashMap<Ident, GenericArgument>,
+    lifetimes: Sorted<HashMap<Ident, GenericArgument>>,
     /// For the same impl: `{ K: u8 }`. The consts are here too.
-    others: HashMap<Ident, GenericArgument>,
+    others: Sorted<HashMap<Ident, GenericArgument>>,
     /// For `trait Tr<T: Iterator<Item = u8>>`: `{ T: Iterator }`.
-    bounds: HashMap<Ident, Path>,
+    bounds: Sorted<HashMap<Ident, Path>>,
 }
 
 impl Substitute {
@@ -1154,6 +1156,12 @@ impl VisitMut for Substitute {
     fn visit_predicate_type_mut(&mut self, predicate: &mut PredicateType) {
         syn::visit_mut::visit_predicate_type_mut(self, predicate);
         parenthesize_bounded(&mut predicate.bounded_ty);
+    }
+
+    // What replaced the bounded type of the first predicate (`T::Item`) may need parentheses.
+    fn visit_where_clause_mut(&mut self, clause: &mut WhereClause) {
+        syn::visit_mut::visit_where_clause_mut(self, clause);
+        parenthesize_leading_qualified_path(clause);
     }
 
     // The header declares the generics itself: only the items are written.

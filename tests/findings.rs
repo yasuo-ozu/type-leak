@@ -17313,3 +17313,335 @@ fn f90_the_associated_type_of_an_argument_is_written_through_a_bound_or_refused(
     let err = substitute_args(args.iter_mut(), |_: &Ident| Some(parse_quote!('a))).unwrap_err();
     assert!(matches!(err, EncodeError::UnexpectedArgument(_)));
 }
+
+// ── F91 ──────────────────────────────────────────────────────────────────────
+
+/// F91 (fixed): a copy wrote `where <Host>::A: Clone` as its first where predicate, which rustc
+/// rejects ("generic parameters on `where` clauses are reserved for future use"): it reads `where
+/// <Host>` as generics of the `where`.
+///
+/// Trigger: `fn m(&self) -> Rel where Self::A: Clone` copied by `Visitor::with_self(Host)`, which
+/// writes `Self::A` as `<Host>::A`; and `fn m(&self) -> Rel where T::Item: Clone` of `trait
+/// Tr<T: Iterator>` written for `impl<I: Iterator> Tr<I> for ..` by the `Substitute` of
+/// `Referrer::complete_args()`, which writes `T::Item` as `<I>::Item` (F74, F90). Fixture 9254
+/// shows the second one. The property test does not: its generator has no where predicate on an
+/// associated type of a parameter in this place.
+///
+/// Cause: the Repeater's impl guarded its own where clause (a first predicate on `<__S>::A`, the
+/// helper of the impl side), but the Visitor and the `Substitute` did not.
+///
+/// Fix: the Visitor and the `Substitute` parenthesize the first predicate of each where clause they
+/// write if its bounded type is a qualified path without `as` (`where (<Host>::A): Clone`), with
+/// the helper that the impl side uses (`parenthesize_leading_qualified_path()` of `util.rs`).
+/// Another predicate, a predicate with a binder (`for<'a> <Host>::A: Clone`) and a path with `as`
+/// (`<Host as Tr>::A`) are left as they are, as rustc takes them.
+#[test]
+fn f91_a_qualified_path_at_the_start_of_a_where_predicate_is_parenthesized() {
+    let projection = common::projection(parse_quote!(Repeater), 7);
+    let where_of = |imp: &ItemImpl| -> Vec<String> {
+        imp.items
+            .iter()
+            .filter_map(|item| match item {
+                ImplItem::Fn(f) => Some(string(&f.sig.generics.where_clause)),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // `Visitor::with_self()`: `Self::A` becomes `<Host>::A`.
+    for (written, expected) in [
+        (
+            "where Self::A: ::core::clone::Clone",
+            "where (< Host > :: A) : :: core :: clone :: Clone",
+        ),
+        (
+            "where Self::A: ::core::clone::Clone, u8: Copy",
+            "where (< Host > :: A) : :: core :: clone :: Clone , u8 : Copy",
+        ),
+        // Only the first predicate is read as generics of the `where`.
+        (
+            "where u8: Copy, Self::A: ::core::clone::Clone",
+            "where u8 : Copy , < Host > :: A : :: core :: clone :: Clone",
+        ),
+        (
+            "where for<'a> Self::A: Tr2<'a>",
+            "where for < 'a > < Host > :: A : Tr2 < 'a >",
+        ),
+        // A type that is not a path, a path that has its trait and a `Self` alone.
+        (
+            "where &'static Self::A: Send",
+            "where & 'static < Host > :: A : Send",
+        ),
+        (
+            "where <Self as Tr>::A: Send",
+            "where < Host as Tr > :: A : Send",
+        ),
+        ("where Self: Send", "where Host : Send"),
+    ] {
+        let item: ItemTrait = parse_quote!(
+            pub trait Tr {
+                type A;
+                fn m(&self) -> Rel;
+            }
+        );
+        let mut leaker = new_leaker();
+        let top = leaker.intern_trait(&item);
+        let referrer = leaker.result().finish().unwrap();
+        let method: ImplItemFn =
+            parse_str(&format!("fn m(&self) -> Rel {} {{ todo!() }}", written)).unwrap();
+        let mut imp: ItemImpl = parse_quote!(impl Tr for Host { type A = u8; });
+        imp.items.push(ImplItem::Fn(method));
+        referrer
+            .visitor(top, &projection)
+            .with_self(parse_quote!(Host))
+            .unwrap()
+            .visit_item_impl_mut(&mut imp);
+        assert_eq!(where_of(&imp), [expected], "{}", written);
+    }
+
+    // `Referrer::complete_args()`: `T::Item` of the trait becomes `<I>::Item`.
+    let item: ItemTrait = parse_quote!(
+        pub trait Tr<T: ::core::iter::Iterator> {
+            fn m(&self) -> Rel;
+        }
+    );
+    let mut leaker = new_leaker();
+    let top = leaker.intern_trait(&item);
+    let referrer = leaker.result().finish().unwrap();
+    let given: Vec<GenericArgument> = vec![parse_quote!(I)];
+    for (written, expected) in [
+        (
+            "where T::Item: ::core::clone::Clone",
+            "where (< I > :: Item) : :: core :: clone :: Clone",
+        ),
+        (
+            "where T::Item: ::core::clone::Clone, u8: Copy",
+            "where (< I > :: Item) : :: core :: clone :: Clone , u8 : Copy",
+        ),
+        (
+            "where u8: Copy, T::Item: ::core::clone::Clone",
+            "where u8 : Copy , < I > :: Item : :: core :: clone :: Clone",
+        ),
+        (
+            "where <T>::Item: ::core::clone::Clone",
+            "where (< I > :: Item) : :: core :: clone :: Clone",
+        ),
+        (
+            "where for<'a> T::Item: Tr2<'a>",
+            "where for < 'a > < I > :: Item : Tr2 < 'a >",
+        ),
+        // Already in parentheses, with its trait, and no associated type.
+        (
+            "where (T::Item): ::core::clone::Clone",
+            "where (< I > :: Item) : :: core :: clone :: Clone",
+        ),
+        (
+            "where <T as ::core::iter::Iterator>::Item: Send",
+            "where < I as :: core :: iter :: Iterator > :: Item : Send",
+        ),
+        ("where T: Send", "where I : Send"),
+    ] {
+        let mut sub = referrer.complete_args(top, &given, &projection).unwrap();
+        let mut method: ImplItemFn =
+            parse_str(&format!("fn m(&self) -> Rel {} {{ todo!() }}", written)).unwrap();
+        sub.visit_impl_item_fn_mut(&mut method);
+        assert_eq!(
+            string(&method.sig.generics.where_clause),
+            expected,
+            "{}",
+            written
+        );
+    }
+}
+
+// ── F92 ──────────────────────────────────────────────────────────────────────
+
+/// F92 (fixed): `complete_params()` wrote a trait object with several bounds behind a reference or a
+/// pointer without parentheses, where `substitute_args()` writes them.
+///
+/// Trigger: a trait `Tr<T: ?Sized, U = &'static T>` and an impl that gives `dyn A + Send` for `T`
+/// and leaves `U` out: the completed default was `&'static dyn A + Send`, which rustc rejects
+/// (E0178, "ambiguous `+` in a type"). `Substitute` writes the completed value as it is, so the
+/// copy had it: fixture 9255 did not build. The property test does not show it: its generator
+/// gives no trait object for a parameter whose default is a pointer to it.
+///
+/// Cause: `ParamFold::fold_type()` ended in `syn::fold::fold_type()`, where `SiteFold` calls
+/// `parenthesize_pointee()` on the result.
+///
+/// Fix: `ParamFold` does the same.
+#[test]
+fn f92_complete_args_parenthesizes_a_trait_object_with_several_bounds_behind_a_pointer() {
+    let only_t: Punctuated<GenericParam, Token![,]> = parse_quote!(T: ?Sized);
+    for (written, argument, expected) in [
+        // The trigger.
+        ("&'static T", "dyn A + Send", "& 'static (dyn A + Send)"),
+        (
+            "&'static mut T",
+            "dyn A + Send",
+            "& 'static mut (dyn A + Send)",
+        ),
+        ("*const T", "dyn A + Send", "* const (dyn A + Send)"),
+        ("*mut T", "dyn A + Send", "* mut (dyn A + Send)"),
+        (
+            "&'static T",
+            "dyn A + 'static",
+            "& 'static (dyn A + 'static)",
+        ),
+        // Inside other types.
+        (
+            "Box<&'static T>",
+            "dyn A + Send",
+            "Box < & 'static (dyn A + Send) >",
+        ),
+        (
+            "&'static &'static T",
+            "dyn A + Send",
+            "& 'static & 'static (dyn A + Send)",
+        ),
+        (
+            "(&'static T, u8)",
+            "dyn A + Send",
+            "(& 'static (dyn A + Send) , u8)",
+        ),
+        // One bound needs none, and a value that is not behind a pointer is as it is.
+        ("&'static T", "dyn A", "& 'static dyn A"),
+        ("Box<T>", "dyn A + Send", "Box < dyn A + Send >"),
+        ("T", "dyn A + Send", "dyn A + Send"),
+    ] {
+        let default: Type = parse_str(written).unwrap();
+        let params: Punctuated<GenericParam, Token![,]> = parse_quote!(T: ?Sized, U = #default);
+        let site = f59_args(&[argument]);
+        let completed = complete_args_of(&params, &site).unwrap();
+        assert_eq!(
+            string(&completed[1]),
+            expected,
+            "{} with {}",
+            written,
+            argument
+        );
+        // The same as `substitute_args()` writes for the default.
+        let substituted =
+            common::substitute_type(&default, common::answers(&only_t, &site), None).unwrap();
+        assert_eq!(
+            string(&completed[1]),
+            string(&substituted),
+            "{} with {}",
+            written,
+            argument
+        );
+    }
+}
+
+// ── F93 ──────────────────────────────────────────────────────────────────────
+
+/// F93 (fixed): the derived `Debug` of `Substitute`, `Referrer`, `LeakerResult` and `Visitor` listed
+/// the entries of a `HashMap` or a `HashSet` in the order of the map, so the text of the same value
+/// differed from run to run (and from map to map in one run: each map has its own seed).
+///
+/// Trigger: `format!("{:?}", value)` of a value built twice from the same input. `Substitute` has
+/// three maps keyed by the names of the parameters; `Referrer` has `by_tokens`, `parts_by_cause`
+/// and `parts_by_anchor`, so `LeakerResult` and `Visitor`, which print one, had it too; the Visitor
+/// also keeps the entries hidden by the items it visits in a set (`hidden`, which no public call
+/// leaves non-empty in a value that can be printed).
+///
+/// Cause: the maps are `HashMap`s and `HashSet`s, and the derive prints them as they iterate.
+///
+/// Fix: the fields are `Sorted<..>` (crate-private, in `util.rs`), which derefs to the collection,
+/// so lookups are as before, and whose `Debug` lists the entries sorted by the text of their key
+/// and value. The derives stay: the public API does not change.
+#[test]
+fn f93_the_debug_of_the_public_types_is_the_same_in_every_run() {
+    // The same value 20 times, from the same input, in this process. The names of the types that
+    // print differently are kept, to report them all.
+    let mut differ: Vec<&str> = Vec::new();
+    let mut same = |name: &'static str, print: &dyn Fn() -> String| {
+        let first = print();
+        // It has what the test is about: many keys.
+        assert!(first.matches("Ident(").count() >= 20, "{}: {}", name, first);
+        if (1..20).any(|_| print() != first) {
+            differ.push(name);
+        }
+    };
+
+    // A `Substitute` with many parameters, which have bounds (`bounds`), lifetimes, types and a
+    // const.
+    let generics: Generics = parse_quote!(
+        <'a, 'b, 'c, A: Iterator, B: Clone, C: Send, D: Sync, E: Copy, F: Sized, G, H, I,
+            const N: usize>
+    );
+    let given: Vec<GenericArgument> = f59_args(&[
+        "'static", "'static", "'static", "IA", "IB", "IC", "ID", "IE", "IF", "IG", "IH", "II", "3",
+    ]);
+    same("Substitute", &|| {
+        format!("{:?}", common::substitute_for(&generics, &given).unwrap())
+    });
+
+    // A trait with many entries and many errors (a relative trait in each bound).
+    let build = || {
+        let item: ItemTrait = parse_quote!(
+            trait Tr<'a, T> {
+                fn f<
+                    A: RelA,
+                    B: RelB,
+                    C: RelC,
+                    D: RelD,
+                    E: RelE,
+                    F: RelF,
+                    G: RelG,
+                    H: RelH,
+                    I: RelI,
+                >(
+                    &self,
+                    a: A,
+                    b: B,
+                    c: C,
+                    d: D,
+                    e: E,
+                    f: F,
+                    g: G,
+                    h: H,
+                    i: I,
+                ) -> Wrap<T>;
+                fn g(
+                    &self,
+                    a: Rel0,
+                    b: Rel1,
+                    c: Rel2,
+                    d: Rel3,
+                    e: Rel4,
+                    f: Rel5,
+                    g: Rel6,
+                    h: Rel7,
+                    i: Rel8,
+                ) -> Wrap<&'a T>;
+            }
+        );
+        let mut leaker = new_leaker();
+        let top = leaker.intern_trait(&item);
+        (leaker.result(), top)
+    };
+    same("LeakerResult", &|| {
+        let (result, _) = build();
+        assert_eq!(result.errors().len(), 9);
+        format!("{:?}", result)
+    });
+    // The Referrer of the errors that are allowed: each one is a part.
+    let allowed = || {
+        let (result, top) = build();
+        let referrer = result.allow(|_: &Cause, _: Place| true).finish().unwrap();
+        (referrer, top)
+    };
+    same("Referrer", &|| format!("{:?}", allowed().0));
+    // The Visitor prints its Referrer.
+    let projection = common::projection(parse_quote!(Repeater), 7);
+    same("Visitor", &|| {
+        let (referrer, top) = allowed();
+        format!("{:?}", referrer.visitor(top, &projection))
+    });
+
+    assert!(
+        differ.is_empty(),
+        "the Debug text of the same input differs between builds: {:?}",
+        differ
+    );
+}

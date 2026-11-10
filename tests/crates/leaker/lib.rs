@@ -544,6 +544,52 @@ pub mod s {
         }
     }
 
+    /// 9254 (F91): the first where predicate of a method is on the associated type of a parameter
+    /// of the trait (`T::Item`), for an impl that names the parameter of its own (`impl<I> ..
+    /// Proj9254<I>`). The `Substitute` wrote `where <I>::Item: Clone`, which rustc reads as
+    /// generics of the `where` ("generic parameters on `where` clauses are reserved for future
+    /// use"); it writes `where (<I>::Item): Clone` now.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::s,
+    )]
+    pub trait Proj9254<T: ::core::iter::Iterator> {
+        fn f(&self, x: Wrap<u8>, item: &T::Item) -> ::core::option::Option<T::Item>
+        where
+            T::Item: ::core::clone::Clone;
+    }
+
+    impl<T: ::core::iter::Iterator> Proj9254<T> for Inner {
+        fn f(&self, x: Wrap<u8>, item: &T::Item) -> ::core::option::Option<T::Item>
+        where
+            T::Item: ::core::clone::Clone,
+        {
+            let _ = x;
+            Some(item.clone())
+        }
+    }
+
+    /// 9255 (F92): the default of `U` is a pointer to a parameter (`&'static T`), for an impl that
+    /// gives `dyn RelTr + Send` for `T` and leaves `U` out. The Referrer's crate completes it
+    /// (`Referrer::complete_args()`) and writes it into the signature: `&'static dyn RelTr + Send`
+    /// is E0178; it is `&'static (dyn RelTr + Send)` now.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::s,
+    )]
+    pub trait Ptr9255<T: ?Sized + 'static, U = &'static T> {
+        fn f(&self, x: Wrap<u8>, u: U) -> u32;
+    }
+
+    impl<T: ?Sized + 'static> Ptr9255<T> for Inner {
+        fn f(&self, x: Wrap<u8>, u: &'static T) -> u32 {
+            let _ = (x, u);
+            9
+        }
+    }
+
     /// A trait object whose lifetime bound defaults to the lifetime of the path it is an argument
     /// of (`Ref<'a, T: 'a>`), so it must not be leaked alone (it would be `dyn RelTr + 'static`):
     /// the path is leaked as a whole if the trait object has to be (it names a relative trait),

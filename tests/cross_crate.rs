@@ -186,6 +186,28 @@ fn the_declaration_of_the_trait_completes_a_default_and_a_where_clause_at_the_us
     assert_eq!(wrapped.0.collect::<Vec<u8>>(), [1, 2]);
 }
 
+/// Fixture 9254 (F91): `Proj9254<T: Iterator>` has the where predicate `T::Item: Clone` first in a
+/// method, and the Referrer's crate implements it for a parameter `I` of its own: the copy has `where
+/// <I>::Item: Clone` before the fix, which rustc reads as generics of the `where`.
+#[test]
+fn a_where_predicate_on_a_projection_of_a_parameter_is_parenthesized_at_the_use_site() {
+    use type_leak_test_leaker::s::{Proj9254, Wrap};
+    let c = Concrete(Inner);
+    let got: Option<u8> = <Concrete as Proj9254<::std::vec::IntoIter<u8>>>::f(&c, Wrap(1), &7);
+    assert_eq!(got, Some(7));
+}
+
+/// Fixture 9255 (F92): `Ptr9255<T: ?Sized + 'static, U = &'static T>` is implemented in the Referrer's
+/// crate for `dyn RelTr + Send`, leaving `U` out. The completed default is written into the
+/// signature: `&'static dyn RelTr + Send` before the fix, which rustc rejects (E0178).
+#[test]
+fn a_completed_default_parenthesizes_a_trait_object_behind_a_pointer() {
+    use type_leak_test_leaker::s::{Ptr9255, RelImpl, RelTr, Wrap};
+    let c = Concrete(Inner);
+    let got = <Concrete as Ptr9255<dyn RelTr + Send>>::f(&c, Wrap(1), &RelImpl);
+    assert_eq!(got, 9);
+}
+
 #[test]
 fn lifetimes_trait_objects_and_projections() {
     use type_leak_test_leaker::s::{DynRoot, Out, RelImpl, Wrap, Q};

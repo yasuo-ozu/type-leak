@@ -77,6 +77,14 @@ type_leak_test_leaker::s::Proj9252!(impl Proj9252<::std::vec::IntoIter<u8>> for 
 // The same with the bound in the where clause, and a default that names a leaked type, left out.
 type_leak_test_leaker::s::Where9253!(impl Where9253<::std::vec::IntoIter<u8>> for Concrete => 0);
 
+// The first where predicate of a method is on `T::Item`, which the use site writes `<I>::Item`
+// (F91): rustc reads `where <I>::Item: ..` as generics of the `where`.
+type_leak_test_leaker::s::Proj9254!(impl<I: ::core::iter::Iterator> Proj9254<I> for Concrete => 0);
+
+// The default `&'static T` is completed for a trait object with several bounds (F92): it needs
+// parentheses behind the reference.
+type_leak_test_leaker::s::Ptr9255!(impl Ptr9255<dyn type_leak_test_leaker::s::RelTr + Send> for Concrete => 0);
+
 // A trait object inheriting the lifetime of its path, a bare identifier argument which is a const
 // and types in expressions, which are leaked as a whole. The implementors of the last are generic, where a
 // projection (as in `[u8; size_of::<<Self as Repeater<..>>::Type>()]`) is not permitted in an

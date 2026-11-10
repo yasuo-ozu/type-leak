@@ -2,12 +2,63 @@
 
 use crate::error::Cause;
 use proc_macro2::TokenStream;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::ops::{Deref, DerefMut};
 use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::{quote, ToTokens};
+
+/// A `HashMap` or a `HashSet` whose `Debug` lists the entries sorted by their text, so a value
+/// prints the same in every run (each map has its own random seed). It derefs to the collection:
+/// lookups and updates are as without it. The derives of the type that has it stay derives.
+#[derive(Clone, Default)]
+pub(crate) struct Sorted<T>(pub(crate) T);
+
+impl<T> Deref for Sorted<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for Sorted<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug, S> fmt::Debug for Sorted<HashMap<K, V, S>> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Equal texts print equal, so the order of the ones that tie does not show.
+        let mut entries: Vec<(String, &K, &V)> = self
+            .0
+            .iter()
+            .map(|(key, value)| (format!("{:?} {:?}", key, value), key, value))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        f.debug_map()
+            .entries(entries.iter().map(|(_, key, value)| (key, value)))
+            .finish()
+    }
+}
+
+impl<T: fmt::Debug, S> fmt::Debug for Sorted<HashSet<T, S>> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut items: Vec<(String, &T)> = self
+            .0
+            .iter()
+            .map(|item| (format!("{:?}", item), item))
+            .collect();
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        f.debug_set()
+            .entries(items.iter().map(|(_, item)| item))
+            .finish()
+    }
+}
 
 /// The cause of an error about `bound`: its trait path, or the bound as written (without `?`) if it
 /// has a binder or parentheses, which no node of the syntax holds.
@@ -596,6 +647,26 @@ pub(crate) fn parenthesize_bounded(ty: &mut Type) {
     };
     if ambiguous {
         parenthesize(ty);
+    }
+}
+
+/// Parenthesizes the bounded type of the first predicate of `clause` if it is a qualified path
+/// without `as` (`where (<Host>::A): Clone`).
+///
+/// rustc reads `where <Host>::A: Clone` as generics of the `where` ("reserved for future use").
+/// Only the first predicate comes right after the `where`, and a binder (`for<'a> <Host>::A`) comes
+/// first. A type that replaces `Self` or a parameter can be a path of this form: `Self::A`.
+pub(crate) fn parenthesize_leading_qualified_path(clause: &mut WhereClause) {
+    if let Some(WherePredicate::Type(PredicateType {
+        lifetimes: None,
+        bounded_ty,
+        ..
+    })) = clause.predicates.first_mut()
+    {
+        if matches!(bounded_ty, Type::Path(TypePath { qself: Some(q), .. }) if q.as_token.is_none())
+        {
+            parenthesize(bounded_ty);
+        }
     }
 }
 
