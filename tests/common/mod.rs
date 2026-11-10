@@ -40,7 +40,7 @@ pub fn intern_fns<A: Allow>(
 /// declares its generics: its inputs, its output and its where clause (see `View`). The function
 /// has no receiver.
 #[allow(dead_code)]
-pub fn visit_function<A: Allow>(view: &mut View<'_, A>, sig: &Signature) {
+pub fn visit_function<A: Allow>(view: &mut View<'_, '_, A>, sig: &Signature) {
     for input in &sig.inputs {
         if let FnArg::Typed(arg) = input {
             view.visit_type(&arg.ty);
@@ -98,30 +98,15 @@ pub fn analyze_trait<A: Allow>(item: &ItemTrait, config: A, check_values: bool) 
     leaker.result()
 }
 
-/// The causes that a rule must allow to accept `error`: each of its paths (one of unknown kind, as
-/// a type and as a trait), or its cause if it has no path.
+/// The causes that a rule must allow to accept `error`: each of its paths, or its cause if it has
+/// no path.
 #[allow(dead_code)]
 pub fn causes_to_allow(error: &ErrorItem) -> Vec<Cause> {
     if error.paths.is_empty() {
-        return vec![error.cause.clone()];
+        vec![error.cause.clone()]
+    } else {
+        error.paths.clone()
     }
-    let mut found = Vec::new();
-    for entry in &error.paths {
-        match entry {
-            Cause::Unreadable(tokens) => match parse2::<Path>(tokens.clone()) {
-                Ok(path) => {
-                    found.push(Cause::Type(Type::Path(TypePath {
-                        qself: None,
-                        path: path.clone(),
-                    })));
-                    found.push(Cause::Trait(path));
-                }
-                Err(_) => found.push(entry.clone()),
-            },
-            other => found.push(other.clone()),
-        }
-    }
-    found
 }
 
 /// The causes that accept the errors of `errors` whose cause is `cause`, by their paths or by the

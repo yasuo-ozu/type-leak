@@ -1875,7 +1875,7 @@ impl Referrer {
     // computes for a copy. And a `LeakerResult` writes its errors after the Referrer as `@ [
     // {error} .. ]`, in one bracket group, so that a brace group after it is left to the caller.
     // An error writes each of its paths with its kind (`paths [type (Rel), trait (Tr), ..]`; a path
-    // of unknown kind is `unreadable (p)`).
+    // of unknown kind is `unknown (p)`).
     // Not serialized, but both macros must agree on it: the primitive type that `ImplSelf::Bucket`
     // and `Referrer::bucket_self()` choose from the id and the index of an entry must not change
     // without a bump.

@@ -551,8 +551,8 @@ fn every_item_kind_is_leaked_across_crates() {
             ok("struct", 1, 2, 2),
         ),
         // the entry for any type is the last field of a struct or a field of an enum, with a bound
-        // that needs no `Sized` (9125 to 9127) or that does (9128): the Repeater's impl is
-        // `?Sized` in the first case only
+        // that needs no `Sized` or that does: the Repeater's impl is `?Sized` in the first case
+        // only
         (
             9125,
             reported(9125, __tl_report_9125!()),
@@ -654,8 +654,8 @@ fn every_item_kind_is_leaked_across_crates() {
         // out of the Repeater's impls of the entries: through an alias that hides the projection
         // (also for a strict Referrer, which replaces the alias too), written, through a struct, a
         // supertrait or an associated type of a trait, in a struct, for the bound that names the
-        // leaked type itself, and for the impl of F19; a rigid `Item` keeps the bound
-        // (9180); a bound of another generic is not left out, and the Leaker rejects it (9181)
+        // leaked type itself, and for the impl of F19; a rigid `Item` keeps the bound; a bound of
+        // another generic is not left out, and the Leaker rejects it
         (
             9171,
             reported(9171, __tl_report_9171!()),
@@ -1428,8 +1428,8 @@ fn scopes_that_share_names_keep_their_own_generics() {
     use type_leak_test_leaker::kinds as l;
     use type_leak_test_referrer::kinds as r;
 
-    // 9071: `with_bound<X: Clone>` and `without_bound<X>` share the name `X`; `generic_local<Local>`
-    // has a generic named like the type `Local` that `type_local` returns; `segment<U>` returns
+    // `with_bound<X: Clone>` and `without_bound<X>` share the name `X`; `generic_local<Local>` has
+    // a generic named like the type `Local` that `type_local` returns; `segment<U>` returns
     // `inner::U`, which is no generic; `type_n<N>` and `const_n<const N: usize>` share `N`.
     type H = r::Host9071;
     fn implemented_for<T: l::SameNames>() {}
@@ -1444,11 +1444,11 @@ fn scopes_that_share_names_keep_their_own_generics() {
     let _: fn(&H, l::Wrap<u8>) -> l::Wrap<u8> = <H as l::SameNames>::type_n::<u8>;
     let _: fn(&H, l::Arr<3>) -> l::Arr<3> = <H as l::SameNames>::const_n::<3>;
 
-    // 9072: the bound of `T` names `V`.
+    // The bound of `T` names `V`.
     let copy = r::ForeignBound::<u8, u32>(l::Wrap(PhantomData), 3);
     same(&copy.0, &l::Wrap::<u8>(PhantomData));
     assert_eq!(copy.1, 3);
-    // 9073: the bound of a method generic names the parameter of the trait.
+    // The bound of a method generic names the parameter of the trait.
     fn convert_of<T>() -> fn(&r::Host9073, l::Wrap<u8>) -> l::Wrap<u8>
     where
         u8: Into<T>,
@@ -1456,15 +1456,15 @@ fn scopes_that_share_names_keep_their_own_generics() {
         <r::Host9073 as l::ForeignBoundTrait<T>>::convert::<u8>
     }
     let _ = convert_of::<u32>();
-    // 9074: `T: 'a`.
+    // The bound `T: 'a`.
     let n = 5u8;
     let copy = r::OutlivesBound::<u8>(l::Wrap(PhantomData), &n);
     same(&copy.0, &l::Wrap::<u8>(PhantomData));
     assert_eq!(*copy.1, 5);
-    // 9075: the where clause of the item.
+    // The where clause of the item.
     let copy = r::WhereBound::<u8>(l::Cloned(1));
     same(&copy.0, &l::Cloned(1u8));
-    // 9077: a binder lifetime that only the entry names.
+    // A binder lifetime that only the entry names.
     let seen = std::cell::Cell::new(0u8);
     let copy = r::Binder(|lt: l::Lt<'_, u8>| seen.set(*lt.0));
     (copy.0)(l::Lt(&n));
@@ -1473,14 +1473,13 @@ fn scopes_that_share_names_keep_their_own_generics() {
 
 /// Names that a generic shares with a path or with a declared item (`tests/shadowed_names.rs`): the
 /// Referrer's crate compiles only if the visitor replaced `self::U` and `crate::U` next to a generic
-/// `U` (9091, 9092; neither type exists there), and `crate::base::B1<X>` of a generic `X` in a
-/// module that declares an `X` (9093; the Referrer's crate has no `base`).
+/// `U` (neither type exists there), and `crate::base::B1<X>` of a generic `X` in a module that
+/// declares an `X` (the Referrer's crate has no `base`).
 #[test]
 fn names_shared_with_a_generic_keep_the_original_types() {
     use type_leak_test_leaker as l;
     use type_leak_test_referrer::kinds as r;
 
-    // 9091
     let copy = r::PathsLikeGeneric::<u8> {
         generic: 1,
         here: l::kinds::U(2),
@@ -1500,7 +1499,7 @@ fn names_shared_with_a_generic_keep_the_original_types() {
     );
     same(&copy.wrapped, &l::kinds::Wrap::<l::kinds::U>(PhantomData));
 
-    // 9092: a host implements the trait with the signatures of the copy.
+    // A host implements the trait with the signatures of the copy.
     type H = r::Host9092;
     fn implemented_for<T: l::kinds::PathsLikeGenericTrait<u8>>() {}
     implemented_for::<H>();
@@ -1511,8 +1510,8 @@ fn names_shared_with_a_generic_keep_the_original_types() {
     let _: fn(&H, u8, l::kinds::U) -> l::kinds::Pair<l::U, u8> =
         <H as l::kinds::PathsLikeGenericTrait<u8>>::trait_generic;
 
-    // 9093: the generic `X` of the copy is the parameter of the Leaker's `B1<X>`; the declared `X`
-    // is the Leaker's.
+    // The generic `X` of the copy is the parameter of the Leaker's `B1<X>`; the declared `X` is the
+    // Leaker's.
     use r::declared_like_generic as m;
     let generic = m::Generic::<u8>(l::base::B1(PhantomData), l::base::B2(1u8, 2u8));
     same(&generic.0, &l::base::B1::<u8>(PhantomData));
@@ -1681,10 +1680,10 @@ fn accepted_conflicts_are_copied_as_written() {
 
 /// The Leaker's macro passes its errors on (`#[prop_leak_result]`: the serialized `LeakerResult`),
 /// and the Referrer's macro, in the crate `accepted` of `tests/crates/referrer`, drops them by what
-/// they are: `allow(trait Clone)` (9190), `allow(std_crates)` (9191), and the causes written out,
-/// `allow(trait PlainTr, type Held<'_>)` (9192). If one remained, the macro would report it and the
-/// crate would not build (`tests/diagnostic.rs` has that); so it is enough to see that the crate
-/// exists and that the copy keeps the parts as written, with every other type replaced and checked.
+/// they are: `allow(trait Clone)`, `allow(std_crates)`, and the causes written out,
+/// `allow(trait PlainTr, type Held<'_>)`. If one remained, the macro would report it and the crate
+/// would not build (`tests/diagnostic.rs` has that); so it is enough to see that the crate exists
+/// and that the copy keeps the parts as written, with every other type replaced and checked.
 #[test]
 fn errors_the_referrers_macro_allows_are_copied_as_written() {
     use type_leak_test_leaker::kinds as l;
@@ -1693,7 +1692,8 @@ fn errors_the_referrers_macro_allows_are_copied_as_written() {
 
     // The reports of the Leaker's macro: the same entries as if it had accepted the errors (the
     // parts that conflict have none). Every type position is compared with its original, but the
-    // one of 9192 that has an elided lifetime (`Held<'_>`), which a witness cannot name.
+    // one of `ExplicitCauses` that has an elided lifetime (`Held<'_>`), which a witness cannot
+    // name.
     let table = [
         (
             9190,
@@ -2016,9 +2016,9 @@ fn errors_are_reported_item_by_item_through_a_macro() {
 // to F45).
 // ---------------------------------------------------------------------------------------------
 
-/// F18, fixture 9194: `Held<'b>` is the only input of `f` that holds the method lifetime, written
-/// with an absolute path of the Leaker's crate: an optional entry. A strict Referrer used to replace
-/// it, and the impl of the host had `'b` early-bound where the trait has it late-bound (E0195, in
+/// F18: `Held<'b>` is the only input of `f` that holds the method lifetime, written with an
+/// absolute path of the Leaker's crate: an optional entry. A strict Referrer used to replace it,
+/// and the impl of the host had `'b` early-bound where the trait has it late-bound (E0195, in
 /// `tests/crates/referrer`, where it is invoked as `strict`). The Leaker keeps it as written now,
 /// for every Referrer: the only entry is `Rel`.
 #[test]
@@ -2032,13 +2032,13 @@ fn an_optional_entry_that_holds_a_method_lifetime_is_copied_as_written() {
     holds_lifetime::<r::Host9194>();
 }
 
-/// F44 and F45, fixtures 9195 to 9198: parts that the Visitor must leave as written, with a trait
-/// object inside whose lifetime comes from the path around it (`dyn SharedTr + 'a`), and the entry
-/// `dyn SharedTr` (`+ 'static`) elsewhere in the same item. The copy compiles in the Referrer's
-/// crate only if the part is not rewritten. The conflicts are about `Self`: denied and named by a
-/// bound (9195), named by a predicate of the trait (9196), named by the bound of an impl whose self
-/// type holds the generic (9197), and named by the bound of a struct nested in a module (9198,
-/// copied by a visitor without `with_nested_self()`).
+/// F44 and F45: parts that the Visitor must leave as written, with a trait object inside whose
+/// lifetime comes from the path around it (`dyn SharedTr + 'a`), and the entry `dyn SharedTr`
+/// (`+ 'static`) elsewhere in the same item. The copy compiles in the Referrer's crate only if the
+/// part is not rewritten. The conflicts are about `Self`: denied and named by a bound, named by a
+/// predicate of the trait, named by the bound of an impl whose self type holds the generic, and
+/// named by the bound of a struct nested in a module (copied by a visitor without
+/// `with_nested_self()`).
 #[test]
 fn parts_that_name_self_are_left_as_written() {
     use type_leak_test_leaker::kinds as l;
@@ -2121,9 +2121,9 @@ fn parts_that_name_self_are_left_as_written() {
     predicate::<r::Host9196>();
 }
 
-/// F43, fixture 9199: the impl nested in the scope of a trait, whose generic has a bound that names
-/// the `Self` of the trait, has a type with no context. It is copied as written, and the entry
-/// `dyn SharedTr` of the other type is replaced.
+/// F43: the impl nested in the scope of a trait, whose generic has a bound that names the `Self` of
+/// the trait, has a type with no context. It is copied as written, and the entry `dyn SharedTr` of
+/// the other type is replaced.
 #[test]
 fn a_part_with_no_context_is_left_as_written() {
     use type_leak_test_leaker::*;
@@ -2143,10 +2143,10 @@ fn a_part_with_no_context_is_left_as_written() {
     );
 }
 
-/// F48, fixtures 9202 (E0195) and 9203 (E0106): two items analyzed together, a trait and a struct.
-/// The method that has the fault keeps the type as written, where the module that copies the trait
-/// names it (`accepted`); the other methods and the struct, copied in a module that names neither
-/// `Held` nor `Wrap` (`unnamed`), have the entry.
+/// F48 (E0195 and E0106): two items analyzed together, a trait and a struct. The method that has
+/// the fault keeps the type as written, where the module that copies the trait names it
+/// (`accepted`); the other methods and the struct, copied in a module that names neither `Held` nor
+/// `Wrap` (`unnamed`), have the entry.
 #[test]
 fn a_type_copied_as_written_for_a_signature_is_left_in_a_signature_like_it_only() {
     use std::marker::PhantomData;
@@ -2177,9 +2177,9 @@ fn a_type_copied_as_written_for_a_signature_is_left_in_a_signature_like_it_only(
     same(&copy.1, &l::Wrap::<u8>(PhantomData));
 }
 
-/// F49, fixture 9204 (E0106): a lifetime that another input keeps. `f` keeps the entry `Wrap<T>` as
-/// written, where `'a` is also in `x`; `g`, `h` and `k` and the struct have the entry (the struct is
-/// copied in the module that names neither `Held` nor `Wrap`).
+/// F49 (E0106): a lifetime that another input keeps. `f` keeps the entry `Wrap<T>` as written,
+/// where `'a` is also in `x`; `g`, `h` and `k` and the struct have the entry (the struct is copied
+/// in the module that names neither `Held` nor `Wrap`).
 #[test]
 fn a_lifetime_that_another_input_keeps_breaks_the_elision_of_the_copy() {
     use std::marker::PhantomData;
@@ -2200,11 +2200,11 @@ fn a_lifetime_that_another_input_keeps_breaks_the_elision_of_the_copy() {
     same(&copy.1, &l::Wrap::<u8>(PhantomData));
 }
 
-/// F50, fixture 9205 (`stages = true`): `core::mem::size_of::<*const Rel>()` in a default method.
-/// The path of the value is written as it is and `Rel` in its arguments is an entry, so
-/// `Rules::std_crates()` given to the result after the analysis drops the only error, as the config
-/// that allows the crates has none: the copy is made in the `clean` crate too, which names no `Rel`
-/// (it would be E0412 if the copy wrote `Rel` as written).
+/// F50 (`stages = true`): `core::mem::size_of::<*const Rel>()` in a default method. The path of the
+/// value is written as it is and `Rel` in its arguments is an entry, so `Rules::std_crates()` given
+/// to the result after the analysis drops the only error, as the config that allows the crates has
+/// none: the copy is made in the `clean` crate too, which names no `Rel` (it would be E0412 if the
+/// copy wrote `Rel` as written).
 #[test]
 fn a_rule_after_the_analysis_drops_the_error_for_the_path_of_a_value_and_leaks_its_arguments() {
     use type_leak_test_leaker::kinds as l;
@@ -2239,9 +2239,9 @@ fn a_rule_after_the_analysis_drops_the_error_for_the_path_of_a_value_and_leaks_i
     assert_eq!(Copy.size(), core::mem::size_of::<*const l::Rel>());
 }
 
-/// F51, fixture 9206: a nested struct whose bound names a leaked type that names `Self`, analyzed
-/// with `nested_self_entries`, is rejected, as `intern_struct()` rejects it. The Referrer's
-/// macro expands to nothing (`kinds`, like the other rejected items).
+/// F51: a nested struct whose bound names a leaked type that names `Self`, analyzed with
+/// `nested_self_entries`, is rejected, as `intern_struct()` rejects it. The Referrer's macro
+/// expands to nothing (`kinds`, like the other rejected items).
 #[test]
 fn a_nested_item_with_a_bound_that_names_a_leaked_type_is_rejected() {
     use type_leak_test_leaker::*;
@@ -2254,9 +2254,9 @@ fn a_nested_item_with_a_bound_that_names_a_leaked_type_is_rejected() {
     );
 }
 
-/// F52, fixture 9207: the optional entries in the where predicate of a trait stay as written beside
-/// an unrelated error whose part copies `Self::A0` as written, as they do without the error. The
-/// strict Referrer (`accepted`) has no entry for them, and the host implements the trait.
+/// F52: the optional entries in the where predicate of a trait stay as written beside an unrelated
+/// error whose part copies `Self::A0` as written, as they do without the error. The strict Referrer
+/// (`accepted`) has no entry for them, and the host implements the trait.
 #[test]
 fn optional_entries_in_a_predicate_stay_as_written_beside_an_unrelated_error() {
     use type_leak_test_leaker::*;
@@ -2274,11 +2274,11 @@ fn optional_entries_in_a_predicate_stay_as_written_beside_an_unrelated_error() {
     assert_eq!(squash(errors[0][1]), "GenTr<Self::A0>");
 }
 
-/// Issue 3 of `tests/downstream_findings.rs`, fixture 9208: `None`, `Some`, `Ok` and `Err` in the
-/// values of a trait and `DoubleEndedIterator + ExactSizeIterator` in a bound are names of the
-/// prelude of every edition, so `Rules::prelude()` accepts them (it rejected the trait before: the
-/// Referrer's crate had no `PreludeNamesCopy`, which also fails to build the test). The copy writes
-/// them as they are, replaces the relative type of the values, and computes what the original does.
+/// Issue 3 of `tests/downstream_findings.rs`: `None`, `Some`, `Ok` and `Err` in the values of a
+/// trait and `DoubleEndedIterator + ExactSizeIterator` in a bound are names of the prelude of every
+/// edition, so `Rules::prelude()` accepts them (it rejected the trait before: the Referrer's crate
+/// had no `PreludeNamesCopy`, which also fails to build the test). The copy writes them as they
+/// are, replaces the relative type of the values, and computes what the original does.
 #[test]
 fn the_names_of_the_prelude_of_every_edition_are_accepted_in_a_trait() {
     use type_leak_test_leaker::kinds as l;
@@ -2312,9 +2312,9 @@ fn the_names_of_the_prelude_of_every_edition_are_accepted_in_a_trait() {
     assert_eq!(r::PreludeNamesCopy::count(&Copy, items.iter()), 6);
 }
 
-/// Fixture 9209: the impls of the entries that do not name `Self` are for a primitive type that the
-/// id and the index choose (`ImplSelf::Bucket`, which `prop_leak` uses for every item), the one that
-/// names it is for the implementor. The copy compiles only if it writes the same type.
+/// The impls of the entries that do not name `Self` are for a primitive type that the id and the
+/// index choose (`ImplSelf::Bucket`, which `prop_leak` uses for every item), the one that names it
+/// is for the implementor. The copy compiles only if it writes the same type.
 #[test]
 fn the_entries_that_do_not_name_self_are_implemented_for_a_bucket() {
     use std::any::type_name;
@@ -2328,7 +2328,7 @@ fn the_entries_that_do_not_name_self_are_implemented_for_a_bucket() {
         __tl_report_9209!()
     );
     // The entries `Defd2<Rel, u8>` and `Rel`, that no generic is used in, are for the primitive
-    // type that `Referrer::bucket_self(ix, 9209)` gives (the bucket is part of the format, so these
+    // type that `Referrer::bucket_self(ix, id)` gives (the bucket is part of the format, so these
     // do not change without a bump of `Referrer::FORMAT_VERSION`). `Wrap<Self>` has none.
     assert_eq!(
         type_name::<<u64 as Repeater<(), 9209, 1>>::Type>(),
@@ -2340,13 +2340,13 @@ fn the_entries_that_do_not_name_self_are_implemented_for_a_bucket() {
     );
 }
 
-/// Fixture 9210: the impls of the entries where `Referrer::needs_self()` is false are for a marker
-/// type of the Leaker's crate (`ImplSelf::Marker`), the entry whose generics name `Self` (the
-/// default `Defd<T>` of `trait MarkerDefault<T: AsRef<Self>, U = Defd<T>>`, `context_self()` is
-/// `None`) for the implementor, which is the host in the copy. The Referrer's crate has an impl of
-/// the copy that takes the default (`impl MarkerDefaultCopy<Owner9210> for Host9210`): it compiles
-/// only if the default is written through the host (`Owner9210: AsRef<Host9210>`), not through the
-/// marker (E0277, `Owner9210: AsRef<Marker9210>`).
+/// The impls of the entries where `Referrer::needs_self()` is false are for a marker type of the
+/// Leaker's crate (`ImplSelf::Marker`), the entry whose generics name `Self` (the default `Defd<T>`
+/// of `trait MarkerDefault<T: AsRef<Self>, U = Defd<T>>`, `context_self()` is `None`) for the
+/// implementor, which is the host in the copy. The Referrer's crate has an impl of the copy that
+/// takes the default (`impl MarkerDefaultCopy<Owner9210> for Host9210`): it compiles only if the
+/// default is written through the host (`Owner9210: AsRef<Host9210>`), not through the marker
+/// (E0277, `Owner9210: AsRef<Marker9210>`).
 #[test]
 fn a_marker_is_for_the_entries_that_do_not_need_self_and_the_host_for_the_others() {
     use std::any::type_name;
@@ -2366,11 +2366,10 @@ fn a_marker_is_for_the_entries_that_do_not_need_self_and_the_host_for_the_others
     );
 }
 
-/// F56, fixtures 9215 and 9216: the bindings in an enum discriminant (`let`, a `match` arm, a
-/// pattern, an item of the block) and in the default of a const parameter are local names, not
-/// relative paths. The Leaker rejected them, and the Referrer's crate had no copy of either (which
-/// fails to build this test). The copies write the expressions as they are and compute what the
-/// originals do.
+/// F56: the bindings in an enum discriminant (`let`, a `match` arm, a pattern, an item of the
+/// block) and in the default of a const parameter are local names, not relative paths. The Leaker
+/// rejected them, and the Referrer's crate had no copy of either (which fails to build this test).
+/// The copies write the expressions as they are and compute what the originals do.
 #[test]
 fn the_bindings_in_a_discriminant_and_in_the_default_of_a_const_parameter_are_local() {
     use type_leak_test_leaker::kinds as l;
@@ -2413,10 +2412,10 @@ fn the_bindings_in_a_discriminant_and_in_the_default_of_a_const_parameter_are_lo
     assert_eq!(copy.0, original.0);
 }
 
-/// F56, fixtures 9217 and 9218: a macro and a struct literal that are relative paths, in a
-/// discriminant and in the default of a const parameter, are rejected. The Leaker did not report
-/// them, and the copy in the Referrer's crate could not resolve `rel_two!` and `RelPoint`. The
-/// Referrer's macro expands to nothing (`kinds`, like the other rejected items).
+/// F56: a macro and a struct literal that are relative paths, in a discriminant and in the default
+/// of a const parameter, are rejected. The Leaker did not report them, and the copy in the
+/// Referrer's crate could not resolve `rel_two!` and `RelPoint`. The Referrer's macro expands to
+/// nothing (`kinds`, like the other rejected items).
 #[test]
 fn a_relative_macro_and_struct_literal_in_a_discriminant_or_a_default_are_rejected() {
     use type_leak_test_leaker::*;
@@ -2431,10 +2430,10 @@ fn a_relative_macro_and_struct_literal_in_a_discriminant_or_a_default_are_reject
     );
 }
 
-/// Flat recovery, fixtures 9219 and 9220: a type whose own path conflicts is written as it is, and
-/// the types in it are leaked as usual. `Two<T, Leaf>` is a conflict (`DeniedSelfInBounds` in a
-/// trait that denies `Self`, `SelfInImplSelfType` in an impl whose bound names it), copied with `Two`
-/// as written, and `Leaf` in it is the entry that `g` has too: the Referrer's crate replaces it
+/// Flat recovery: a type whose own path conflicts is written as it is, and the types in it are
+/// leaked as usual. `Two<T, Leaf>` is a conflict (`DeniedSelfInBounds` in a trait that denies
+/// `Self`, `SelfInImplSelfType` in an impl whose bound names it), copied with `Two` as written, and
+/// `Leaf` in it is the entry that `g` has too: the Referrer's crate replaces it
 /// (`Two<T, <..>::Type>`), and the host implements the trait of the Leaker's crate.
 #[test]
 fn a_type_whose_own_path_conflicts_is_written_as_it_is_and_the_types_in_it_are_leaked() {

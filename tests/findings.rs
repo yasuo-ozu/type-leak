@@ -3087,9 +3087,9 @@ fn f17_optional_entry_in_own_context() {
 /// copies them as written and the lifetime stays constrained. No error: the crate of the type has
 /// to resolve in the Referrer's crate, as for any absolute path that is copied as written (which
 /// is also what the help of `UnconstrainedLifetime`, "write it with an absolute path", asks for: it
-/// now works for a strict Referrer too). Another input that keeps the lifetime (`&'x u8`, `&'x
-/// self`) leaves the entry as it was. The cross-crate fixture is 9194 (`tests/cross_crate.rs`), in a
-/// Referrer's crate that is invoked as `strict`.
+/// now works for a strict Referrer too). Another input that keeps the lifetime (`&'x u8`,
+/// `&'x self`) leaves the entry as it was. There is a cross-crate fixture in
+/// `tests/cross_crate.rs`, in a Referrer's crate that is invoked as `strict`.
 #[test]
 fn f18_strict_referrer_keeps_the_optional_type_that_holds_a_method_lifetime() {
     let item: ItemTrait = parse_quote!(
@@ -4396,10 +4396,10 @@ fn entries_naming_item(referrer: &Referrer, copy: &Item) -> Vec<String> {
 /// Fixed for good by F26: the context of the entry leaves out `T: Fn(T::Item)`, because another
 /// bound of `T` (`::p::WIter`, a trait that is not one of the standard library) may fix an
 /// associated type, so the Repeater's impl has `T: ::p::WIter` only, and the copy compiles (all
-/// the items below were built as the fixtures 9175 and 9176 of `tests/cross_crate.rs`, and the
-/// price is no price any more). The projection that stays rejected is that of another generic
-/// (`U: Fn(T::Item)` next to `T: ::p::WIter`), and the one whose equation is in a predicate of
-/// a method (F21), which are not in the context of the entry.
+/// the items below were built as the cross-crate fixtures in `tests/cross_crate.rs`, and the price
+/// is no price any more). The projection that stays rejected is that of another generic
+/// (`U: Fn(T::Item)` next to `T: ::p::WIter`), and the one whose equation is in a predicate of a
+/// method (F21), which are not in the context of the entry.
 #[test]
 fn f25_supertrait_item_in_bound_of_entry_in_predicate() {
     // The controls: rigid `Item`, and the entry in a position.
@@ -4718,7 +4718,7 @@ fn repeater_impl_text(referrer: &Referrer, ix: usize) -> String {
 /// Referrer, as it does for a bound rewritten for it), keep every bound, because the type is
 /// well-formed only with the bounds that its item declares (the property test showed it: seeds 1
 /// and 2 were E0277 in the Leaker's crate for a struct, an enum, a union, an impl and a trait, with
-/// the fixtures 9182 and 9183 of `tests/cross_crate.rs`). An entry that depends on `Self` only
+/// the cross-crate fixtures in `tests/cross_crate.rs`). An entry that depends on `Self` only
 /// through a bound or an outlives predicate (`Self: 'x` of a method) keeps whole the bounds of the
 /// generics that the description of `Self` names (`impl<T: ..> S<T>`, `Tr<T>`), and trims the
 /// others: see F47.
@@ -8369,8 +8369,8 @@ fn f37_nested_type_with_a_bound_that_names_its_own_self_is_supported() {
 /// rustc before 1.70, an item with such a bound and the entry in its last field is still E0275, and
 /// the ways out are the entry in another field, `where Self: Sized` on the item, or an absolute
 /// path for the type of the entry (copied as written, by a Referrer that trusts the names of the
-/// crates). The cross-crate test has these shapes (9111, 9125 to 9128); the bug itself shows
-/// on a rustc before 1.70 only.
+/// crates). The cross-crate test has these shapes; the bug itself shows on a rustc before 1.70
+/// only.
 #[test]
 fn f37_the_impl_is_sized_only_where_the_bounds_need_it() {
     // Every `Self` in the bounds is a whole argument of a trait or type with a `?Sized` parameter,
@@ -9475,21 +9475,20 @@ fn f38_the_relative_types_and_the_other_items_are_unchanged() {
 ///
 /// The Repeater's arguments of such an entry include the defaulted parameter, as the bound
 /// `Self: Tr<T, U>` of the implementor names it: a declaration cannot pass it to its own default
-/// (E0128), so the macro passes a type for it that the host implements the trait for (the fixtures
-/// 9131 and 9132 of `tests/cross_crate.rs`, which compile in the Referrer's crate).
+/// (E0128), so the macro passes a type for it that the host implements the trait for (the
+/// cross-crate fixtures in `tests/cross_crate.rs`, which compile in the Referrer's crate).
 ///
 /// The property test generates the shape with the feature `trait_self_defaults` (on by default):
 /// a fifth of the traits analyzed one by one have a parameter with a bound that names `Self` and
 /// trailing parameters whose defaults use it, and the control where the bound names none; the
 /// nested ones (45%) are often declared again in the Referrer's crate (`redeclare`), as the
-/// cross-crate fixtures 9131 and 9132 are. Before the feature it hardly appeared (a default is
-/// generated for a trailing parameter that no bound or predicate names, and the earlier parameters
-/// are bounded by predicates that name `Self` only now and then: in the runs of this fix, seeds 1
-/// to 24 of 60 cases and seed 4 of 120, 2 of the 2170 traits with a default named `Self` in the
-/// header, and neither had a type default that uses a parameter with such a bound). Against the
-/// library of the commit before the fix, the generated Referrer's crates do not compile (24
-/// cases of seed 1: 10 of them, "cannot find type `R1`", E0425 and E0433: the default is left as
-/// written).
+/// cross-crate fixtures are. Before the feature it hardly appeared (a default is generated for a
+/// trailing parameter that no bound or predicate names, and the earlier parameters are bounded by
+/// predicates that name `Self` only now and then: in the runs of this fix, seeds 1 to 24 of 60
+/// cases and seed 4 of 120, 2 of the 2170 traits with a default named `Self` in the header, and
+/// neither had a type default that uses a parameter with such a bound). Against the library of the
+/// commit before the fix, the generated Referrer's crates do not compile (24 cases of seed 1: 10 of
+/// them, "cannot find type `R1`", E0425 and E0433: the default is left as written).
 #[test]
 fn f39_the_default_of_a_nested_trait_that_needs_its_self_is_written_through_the_host() {
     let item: Item = parse_quote!(
@@ -10059,8 +10058,8 @@ fn f40_errors(source: &str) -> Vec<(String, String)> {
 /// The fix: with the option, a type in a *type position* of a value is analyzed like any type of
 /// the item, with the generics and `Self` in scope, and becomes an entry. The Visitor needed no
 /// change for it: the default `VisitMut` walk reaches the same positions, in the scopes of the
-/// signature that the Leaker analyzes them in. The cross-crate fixtures 9141 and 9142 of
-/// `tests/cross_crate.rs` compile the copy.
+/// signature that the Leaker analyzes them in. The cross-crate fixtures in `tests/cross_crate.rs`
+/// compile the copy.
 /// `FORMAT_VERSION` is unchanged: the serialized form and the meaning of an entry are the same,
 /// and an entry of a value is found like any other.
 ///
@@ -10754,8 +10753,8 @@ fn f41_items() -> Vec<(Item, &'static str, &'static str)> {
 /// and the copy declares an ordinary default, `U = <() as Repeater<(T,), ..>>::Type`, which the
 /// ordinary closure writes (`Visitor::with_nested_self()` is for the entries that depend on the own
 /// `Self`). The Visitor computes the same context for the default of a nested struct, enum or union
-/// to find it. The cross-crate fixtures 9151 to 9154 check that the default of the copy is the type
-/// of the original where it is used (`tests/cross_crate.rs`).
+/// to find it. The cross-crate fixtures check that the default of the copy is the type of the
+/// original where it is used (`tests/cross_crate.rs`).
 ///
 /// A limit: if the declaration of `Wrap` needs a bound that follows only from a bound that is left
 /// out (`struct Wrap<A: Iterator>` with `T: Iterator<Item = Self>`, which implies `T: Iterator`),
@@ -11122,7 +11121,7 @@ fn f42_items() -> Vec<(Item, &'static str, &'static str, &'static str)> {
 /// is on by default: the macro asks for the option for every item nested in `enter_mod`, and the
 /// structs, enums and unions of `self_bound_adts` have a field that names `Self` in a relative
 /// type. (Seeds 1 to 8 at 60 cases and 17 to 20 at 24 pass; the Leaker's and the Referrer's crates
-/// compile.) The cross-crate fixtures 9161 to 9164 check the field of the copy against the original
+/// compile.) The cross-crate fixtures check the field of the copy against the original
 /// (`tests/cross_crate.rs`); on rustc 1.56 and 1.66 the entry in the last field of a struct is
 /// E0275, which `where Self: Sized` avoids: the fixtures keep it out of the last field.
 #[test]
@@ -11514,7 +11513,7 @@ fn f43_copy(
 /// entry as before (`Rel<T, Other>` of the method of the trait itself). The top-level context
 /// records the `Self` of the scope, or the visitor would write the bound of `T` there too.
 ///
-/// The cross-crate fixture is 9199 (`tests/cross_crate.rs`).
+/// There is a cross-crate fixture in `tests/cross_crate.rs`.
 #[test]
 fn f43_a_type_whose_context_cannot_be_written_is_copied_as_written() {
     let nested: Item = parse_quote!(
@@ -11733,7 +11732,7 @@ fn f44_copies(referrer: &Referrer, context: ContextId, item: &ItemTrait) -> [Str
 ///
 /// The fix: `names_self()` counts a part copied as written whose context depends on `Self` too, so
 /// the top-level context has it (`Referrer::context_self()`), and the visitor finds the part.
-/// Cross-crate fixtures 9195 to 9197 (`tests/cross_crate.rs`).
+/// The cross-crate fixtures are in `tests/cross_crate.rs`.
 #[test]
 fn f44_a_part_that_names_self_is_found_when_no_entry_does() {
     // DeniedSelfInBounds, SelfInTraitPredicate; the entry beside is `Other`, in `g`.
@@ -11861,7 +11860,7 @@ fn f44_the_self_type_of_an_impl_is_found_when_no_entry_names_self() {
 /// parameter of a nested struct that names `Self`, `SelfInDefault`, is looked up without `Self`, so
 /// its part is not found with the closure either: not this finding.)
 ///
-/// The cross-crate fixture is 9198 (`tests/cross_crate.rs`).
+/// There is a cross-crate fixture in `tests/cross_crate.rs`.
 #[test]
 fn f45_a_part_in_a_nested_item_is_left_without_with_nested_self() {
     let items: Vec<(Item, &str, &str, usize)> = vec![
@@ -11925,8 +11924,8 @@ fn f45_a_part_in_a_nested_item_is_left_without_with_nested_self() {
 /// path with the colons (`::core::fmt::Debug`). Any other relative path keeps the example in the
 /// crate of the Leaker, also one that has the name in a later segment (`m::core::X`).
 ///
-/// The cross-crate fixture is the item `Denied` (9193) of `tests/crates/diagnostic_result`, whose
-/// error `tests/diagnostic.rs` checks.
+/// The cross-crate fixture is the item `Denied` of `tests/crates/diagnostic_result`, whose error
+/// `tests/diagnostic.rs` checks.
 #[test]
 fn f46_the_help_for_a_relative_std_path_suggests_the_crate_itself() {
     let help_of = |item: Item| -> Vec<String> {
@@ -12020,7 +12019,7 @@ fn f46_the_help_for_a_relative_std_path_suggests_the_crate_itself() {
 /// the bounds of the generics that the description of `Self` names (`impl<T: ..> S<T>`, `Tr<T>`)
 /// and leaves out the others. The serialized contexts of such items changed (format 16).
 ///
-/// The cross-crate fixtures are 9200 (trait) and 9201 (impl of a trait) in `tests/cross_crate.rs`.
+/// The cross-crate fixtures, a trait and an impl of a trait, are in `tests/cross_crate.rs`.
 #[test]
 fn f47_self_in_an_outlives_predicate_keeps_the_bounds_of_the_description_of_self_only() {
     let leaked = |item: &Item| -> (Referrer, Item) {
@@ -12186,7 +12185,7 @@ fn f48_copies(referrer: &Referrer, contexts: &[ContextId], items: &[Item]) -> Ve
 /// A limit: another input that keeps the lifetime as written (`&'x self`) makes the Leaker keep
 /// the entry, and the Referrer cannot tell: the signature has the same mark there.
 ///
-/// The cross-crate fixtures are 9202 and 9203 (`tests/cross_crate.rs`).
+/// The cross-crate fixtures are in `tests/cross_crate.rs`.
 #[test]
 fn f48_a_type_corrected_for_a_signature_is_left_only_in_a_signature_like_it() {
     // E0195. `Tr::f` and `Tr2::f` output the lifetime, `Tr3::f` does not, and `Tr4::f` names it in
@@ -12414,7 +12413,7 @@ fn f48_a_mark_is_serialized_and_read_back() {
 /// reported, as for F48 (`sig (elided)`), or the function pointer is leaked whole. The type in the
 /// input that names it (`x: &'a Wrap<T>`, `x: (&'a u8, Wrap<T>)`) adds nothing.
 ///
-/// The cross-crate fixture is 9204 (`tests/cross_crate.rs`).
+/// There is a cross-crate fixture in `tests/cross_crate.rs`.
 #[test]
 fn f49_a_lifetime_that_another_input_keeps_breaks_elision() {
     // `f` and `g` are broken, in either order. The others are controls: `Wrap<T>` is the entry.
@@ -12591,8 +12590,8 @@ fn f50_paths(result: &LeakerResult, at: usize) -> Vec<String> {
 /// types in its arguments are analyzed and leaked as in any type position of a value, so the rule
 /// drops the error and the result and the config agree (`tests/flat_errors.rs`).
 ///
-/// The cross-crate fixture is 9205 (`stages = true`: the copy after the rule is made in a crate that
-/// does not name `Rel` only if the rule left no error), checked in `tests/cross_crate.rs`.
+/// There is a cross-crate fixture in `tests/cross_crate.rs` (`stages = true`: the copy after the
+/// rule is made in a crate that does not name `Rel` only if the rule left no error).
 #[test]
 fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_leaked() {
     // The value, the rule (`std`, `crate` or `prelude`) given to the result and to the config, the
@@ -12750,7 +12749,7 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_leaked() {
 /// context of the type of `Self`, as `intern_*` has it (`nested_self_cycle()`). Like
 /// `intern_struct()`, it rejects the item also when no entry uses `T`.
 ///
-/// The cross-crate fixture is 9206 (`tests/cross_crate.rs`).
+/// There is a cross-crate fixture in `tests/cross_crate.rs`.
 #[test]
 fn f51_a_nested_item_with_a_bound_that_names_a_leaked_type_is_rejected() {
     let items: Vec<(Item, &str)> = vec![
@@ -12848,7 +12847,7 @@ fn f52_entries(referrer: &Referrer) -> Vec<String> {
 /// optional (`AnalyzeVisitor::probe_kept`). Limit: a part with no relative path to probe for (an
 /// error of a lifetime, say) does not.
 ///
-/// The cross-crate fixture is 9207 (`strict`, `tests/cross_crate.rs`).
+/// There is a cross-crate fixture in `tests/cross_crate.rs` (`strict`).
 #[test]
 fn f52_an_unrelated_error_does_not_make_an_optional_entry_of_the_predicate() {
     let item = |method: &str| -> ItemTrait {
@@ -13286,9 +13285,9 @@ fn f56_read(source: &str, allow_self: bool) -> (Vec<(String, bool, bool)>, Vec<S
 /// in a value that `check_values` reads), not the whole path, and its self type is an entry; a
 /// macro with arguments that are not expressions is `Unreadable` also if its path is absolute.
 ///
-/// The cross-crate fixtures are 9215 and 9216 (the bindings are accepted, and the copy compiles in
-/// a crate that has none of the Leaker's names), 9217 and 9218 (the relative macro and struct
-/// literal are rejected: the copy did not compile), checked in `tests/cross_crate.rs`.
+/// The cross-crate fixtures in `tests/cross_crate.rs` check two cases: the bindings are accepted,
+/// and the copy compiles in a crate that has none of the Leaker's names; the relative macro and
+/// struct literal are rejected (the copy did not compile).
 #[test]
 fn f56_a_discriminant_and_the_default_of_a_const_parameter_are_read_like_a_value() {
     // The source, the causes of the errors, the entries.

@@ -5,7 +5,7 @@
 //!
 //! ```ignore
 //! shared_leak! {
-//!     id = 9202;
+//!     id = 1;
 //!     items [
 //!         pub trait Tr { fn f<'b>(&self, x: Held<'b>) -> &'b u8; fn g<'b>(&self, x: Held<'b>); }
 //!         pub struct S<'b> { pub held: Held<'b> }

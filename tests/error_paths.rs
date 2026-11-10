@@ -5,7 +5,7 @@
 //!   without generic arguments.
 //! - Only the head of what conflicts is written as it is: what is in its arguments is analyzed on
 //!   its own, so it is an entry or has an error of its own.
-//! - A path whose kind is not known (the root of a `use` in a value) is a `Cause::Unreadable`.
+//! - A path whose kind is not known (the root of a `use` in a value) is a `Cause::Unknown`.
 //! - The kinds survive the serialization of the error.
 
 use syn::parse::Parser;
@@ -28,7 +28,7 @@ fn show(cause: &Cause) -> String {
         Cause::Trait(_) => ("trait", cause.to_token_stream().to_string()),
         Cause::Expr(_) => ("expr", cause.to_token_stream().to_string()),
         Cause::Macro(_) => ("macro", cause.to_token_stream().to_string()),
-        Cause::Unreadable(tokens) => ("unreadable", tokens.to_string()),
+        Cause::Unknown(_) => ("unknown", cause.to_token_stream().to_string()),
         other => panic!("{:?}", other),
     };
     format!("{}({})", kind, text)
@@ -146,7 +146,7 @@ fn the_root_of_a_use_in_a_value_has_no_known_kind() {
     });
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    assert_eq!(paths_of(&result), [vec!["unreadable(inner)"]]);
+    assert_eq!(paths_of(&result), [vec!["unknown(inner)"]]);
 }
 
 #[test]
@@ -174,9 +174,10 @@ fn a_path_entry_with_arguments_or_that_is_no_path_is_refused() {
     let read = |source: &str| parse_str::<ErrorItem>(source);
     assert!(read(r#"{ type ( A ) RelativePath "m" [] paths [ type ( a ) ] }"#).is_ok());
     assert!(read(r#"{ type ( A ) RelativePath "m" [] paths [ type ( a < b > ) ] }"#).is_err());
-    assert!(
-        read(r#"{ type ( A ) RelativePath "m" [] paths [ unreadable ( a < b > ) ] }"#).is_err()
-    );
-    assert!(read(r#"{ type ( A ) RelativePath "m" [] paths [ unreadable ( & a ) ] }"#).is_err());
+    assert!(read(r#"{ type ( A ) RelativePath "m" [] paths [ unknown ( a ) ] }"#).is_ok());
+    assert!(read(r#"{ type ( A ) RelativePath "m" [] paths [ unknown ( a < b > ) ] }"#).is_err());
+    assert!(read(r#"{ type ( A ) RelativePath "m" [] paths [ unknown ( & a ) ] }"#).is_err());
+    // Syntax that is no path is no path of unknown kind.
+    assert!(read(r#"{ type ( A ) RelativePath "m" [] paths [ unreadable ( a ) ] }"#).is_err());
     assert!(read(r#"{ type ( A ) RelativePath "m" [] paths [ lifetime ( 'a ) ] }"#).is_err());
 }

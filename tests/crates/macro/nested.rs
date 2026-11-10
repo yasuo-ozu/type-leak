@@ -11,7 +11,7 @@
 //!
 //! ```ignore
 //! nested_leak! {
-//!     id = 9199;
+//!     id = 1;
 //!     scope trait Tr<T: ?Sized + ::core::convert::AsRef<Self>>;
 //!     nested impl<'a> ::path::Host;
 //!     types [

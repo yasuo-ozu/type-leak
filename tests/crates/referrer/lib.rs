@@ -161,11 +161,12 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9062!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9063!(path = ::type_leak_test_leaker::kinds);
     // Items nested in a module whose generics have a bound that names their own `Self`: the copy
-    // has the bound for its own type. 9115 names `Self` in a field too, and expands to nothing.
+    // has the bound for its own type.
     type_leak_test_leaker::__tl_prop_9111!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9112!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9113!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9114!(path = ::type_leak_test_leaker::kinds);
+    // This one names `Self` in a field too, and expands to nothing.
     type_leak_test_leaker::__tl_prop_9115!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9116!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9117!(path = ::type_leak_test_leaker::kinds);
@@ -173,7 +174,7 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9119!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9120!(path = ::type_leak_test_leaker::kinds);
     // The entry is the last field of a struct, or a field of an enum: the impl is `?Sized` unless
-    // a bound needs `Self: Sized` (9128).
+    // a bound needs `Self: Sized`.
     type_leak_test_leaker::__tl_prop_9125!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9126!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9127!(path = ::type_leak_test_leaker::kinds);
@@ -199,7 +200,7 @@ pub mod kinds {
     // `intern_struct()` rejects it (F51): it expands to nothing.
     type_leak_test_leaker::__tl_prop_9206!(path = ::type_leak_test_leaker::kinds);
     // A bound of a generic that names it, next to one that fixes an associated type: left out of
-    // the Repeater's impls of the entries. 9172 is invoked as strict (it replaces the alias too).
+    // the Repeater's impls of the entries. The one invoked as `strict` replaces the alias too.
     type_leak_test_leaker::__tl_prop_9171!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9172!(path = ::type_leak_test_leaker::kinds, strict);
     type_leak_test_leaker::__tl_prop_9173!(path = ::type_leak_test_leaker::kinds);
@@ -320,7 +321,7 @@ pub mod accepted {
     type_leak_test_leaker::__tl_prop_9197!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__tl_prop_9198!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__nested_apply_9199!(path = ::type_leak_test_leaker::kinds);
-    // Flat recovery: the types in what is written as it is are entries (9219, 9220).
+    // Flat recovery: the types in what is written as it is are entries.
     type_leak_test_leaker::__tl_prop_9219!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__tl_prop_9220!(path = ::type_leak_test_leaker::kinds, accept);
 

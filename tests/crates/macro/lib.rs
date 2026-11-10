@@ -198,29 +198,14 @@ pub(crate) fn starts_with(prefixes: Vec<Path>) -> impl Fn(&Cause, Place) -> bool
     }
 }
 
-/// The causes that a rule must allow to accept `error`: each of its paths (one of unknown kind, as
-/// a type and as a trait), or its cause if it has no path.
+/// The causes that a rule must allow to accept `error`: each of its paths, or its cause if it has
+/// no path.
 fn causes_to_allow(error: &ErrorItem) -> Vec<Cause> {
     if error.paths.is_empty() {
-        return vec![error.cause.clone()];
+        vec![error.cause.clone()]
+    } else {
+        error.paths.clone()
     }
-    let mut found = Vec::new();
-    for entry in &error.paths {
-        match entry {
-            Cause::Unreadable(tokens) => match parse2::<Path>(tokens.clone()) {
-                Ok(path) => {
-                    found.push(Cause::Type(Type::Path(TypePath {
-                        qself: None,
-                        path: path.clone(),
-                    })));
-                    found.push(Cause::Trait(path));
-                }
-                Err(_) => found.push(entry.clone()),
-            },
-            other => found.push(other.clone()),
-        }
-    }
-    found
 }
 
 /// Allows every error that remains: each by its paths, or by its cause if it has none. The errors

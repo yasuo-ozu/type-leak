@@ -3,7 +3,9 @@
 
 use crate::allow::Place;
 use crate::analysis::{CheckResult, SelfMention};
-use crate::util::{or_list, path_starts_with, tidy, without_crate_prefix, KNOWN_NAMES};
+use crate::util::{
+    or_list, path_starts_with, tidy, without_arguments, without_crate_prefix, KNOWN_NAMES,
+};
 use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use std::hash::{Hash, Hasher};
 use syn::ext::IdentExt;
@@ -39,10 +41,10 @@ pub enum Cause {
     Macro(Path),
     /// A lifetime: an elided one (`'_`), one of a method, or one that no scope declares.
     Lifetime(Lifetime),
+    /// A path whose kind is not known: the root of a `use`, a path in the tokens of a macro.
+    Unknown(Path),
     /// Syntax that the Leaker cannot read (`macro_rules!`, `use inner::*;`) or that no node of the
-    /// syntax holds: a bound with a binder (`for<'a> Fn(&'a u8)`) or in parentheses. In
-    /// [`ErrorItem::paths`] it is a path of unknown kind (the root of a `use`, a path in the tokens
-    /// of a macro).
+    /// syntax holds: a bound with a binder (`for<'a> Fn(&'a u8)`) or in parentheses.
     Unreadable(TokenStream),
 }
 
@@ -56,6 +58,7 @@ impl Cause {
             Cause::Expr(_) => "expr",
             Cause::Macro(_) => "macro",
             Cause::Lifetime(_) => "lifetime",
+            Cause::Unknown(_) => "unknown",
             Cause::Unreadable(_) => "unreadable",
         }
     }
@@ -96,13 +99,14 @@ impl Cause {
     }
 
     /// Returns the path of a [`Cause::Type`] that is a path without a qualified self type, of a
-    /// [`Cause::Trait`], of a [`Cause::Macro`] and of a [`Cause::Expr`] that is a path, as written
-    /// (with its generic arguments, if it has any).
+    /// [`Cause::Trait`], of a [`Cause::Macro`], of a [`Cause::Unknown`] and of a [`Cause::Expr`]
+    /// that is a path, as written (with its generic arguments, if it has any).
     pub fn path(&self) -> Option<&Path> {
         match self {
             Cause::Type(Type::Path(syn::TypePath { qself: None, path }))
             | Cause::Trait(path)
             | Cause::Macro(path)
+            | Cause::Unknown(path)
             | Cause::Expr(Expr::Path(ExprPath {
                 qself: None, path, ..
             })) => Some(path),
@@ -117,11 +121,21 @@ impl Cause {
             .map_or(false, |path| path_starts_with(path, prefix))
     }
 
-    /// The path that an entry of [`ErrorItem::paths`] is, of whatever kind.
-    pub(crate) fn entry_path(&self) -> Option<Path> {
+    /// The cause of the same kind with the generic arguments of its path removed (`Rel`, not
+    /// `Rel<u8>`): what the rule is asked and what [`ErrorItem::paths`] holds. A cause that is not
+    /// a path stays as it is.
+    pub(crate) fn bare(&self) -> Self {
         match self {
-            Cause::Unreadable(tokens) => syn::parse2(tokens.clone()).ok(),
-            other => other.path().cloned(),
+            Cause::Type(Type::Path(syn::TypePath { qself: None, path })) => {
+                Cause::type_path(&without_arguments(path))
+            }
+            Cause::Trait(path) => Cause::Trait(without_arguments(path)),
+            Cause::Macro(path) => Cause::Macro(without_arguments(path)),
+            Cause::Unknown(path) => Cause::Unknown(without_arguments(path)),
+            Cause::Expr(Expr::Path(ExprPath {
+                qself: None, path, ..
+            })) => Cause::expr_path(&without_arguments(path)),
+            other => other.clone(),
         }
     }
 
@@ -166,6 +180,7 @@ impl Cause {
                 Cause::Macro(path)
             }
             "lifetime" => Cause::Lifetime(input.parse()?),
+            "unknown" => Cause::Unknown(input.parse()?),
             "unreadable" => Cause::Unreadable(input.parse()?),
             other => {
                 return Err(syn::Error::new(
@@ -206,6 +221,7 @@ impl ToTokens for Cause {
                 token::Not(span).to_tokens(tokens);
             }
             Cause::Lifetime(lifetime) => lifetime.to_tokens(tokens),
+            Cause::Unknown(path) => path.to_tokens(tokens),
             Cause::Unreadable(unreadable) => unreadable.to_tokens(tokens),
         }
     }
@@ -428,10 +444,11 @@ pub struct ErrorItem {
     /// [`place()`](ErrorItem::place).
     pub in_default: bool,
     /// The relative paths that the copy writes as they are, each as the cause of its kind (a
-    /// [`Cause::Type`], [`Cause::Trait`], [`Cause::Expr`] or [`Cause::Macro`] that is a path) and
-    /// without its arguments: `MyType` in `MyType<'_, Rel>`. What is inside the arguments is
-    /// analyzed on its own, so it has its own errors and entries. There are several where one cause
-    /// holds several paths (`dyn A + B`). A rule drops the error if it accepts all of them.
+    /// [`Cause::Type`], [`Cause::Trait`], [`Cause::Expr`], [`Cause::Macro`] or [`Cause::Unknown`]
+    /// that is a path) and without its arguments: `MyType` in `MyType<'_, Rel>`. What is inside
+    /// the arguments is analyzed on its own, so it has its own errors and entries. There are
+    /// several where one cause holds several paths (`dyn A + B`). A rule drops the error if it
+    /// accepts all of them.
     pub paths: Vec<Cause>,
 }
 
@@ -598,7 +615,7 @@ impl Parse for ErrorItem {
                         parenthesized!(cause in list);
                         let span = cause.span();
                         let entry = Cause::parse(&kind, &cause)?;
-                        let bare = entry.entry_path().map_or(false, |path| {
+                        let bare = entry.path().map_or(false, |path| {
                             path.segments.iter().all(|seg| seg.arguments.is_none())
                         });
                         if !bare {

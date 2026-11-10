@@ -417,7 +417,7 @@ fn strings(causes: &[Cause]) -> Vec<String> {
         .collect()
 }
 
-fn check_ty(view: &mut View<'_>, ty: Type) -> CheckResult {
+fn check_ty(view: &mut View<'_, '_>, ty: Type) -> CheckResult {
     view.check(&ty)
 }
 
@@ -507,7 +507,7 @@ fn check_self_in_a_struct_scope() {
 fn check_self_has_no_meaning_in_generics_and_modules() {
     let generics: Generics = parse_quote!(<T>);
     let mut leaker = Leaker::new();
-    let checks = |view: &mut View<'_>| {
+    let checks = |view: &mut View<'_, '_>| {
         [
             check_ty(view, parse_quote!(Self)),
             check_ty(view, parse_quote!(Self::Item)),
@@ -759,7 +759,7 @@ fn recording_types() -> Vec<Type> {
 /// `recording_types()` if `checked`. Returns the ids of the scopes and the Referrer.
 fn analyze(checked: bool) -> (Vec<ContextId>, Referrer) {
     let types = recording_types();
-    let checks = |view: &mut View<'_>| {
+    let checks = |view: &mut View<'_, '_>| {
         if checked {
             for ty in &types {
                 view.check(ty);

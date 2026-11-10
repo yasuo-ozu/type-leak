@@ -166,7 +166,7 @@ impl ScopeInput {
         config: A,
     ) -> std::result::Result<(Referrer, ContextId), Vec<ErrorItem>> {
         let mut leaker = Leaker::from_config(config, Options::new());
-        let visit = |view: &mut View<'_, A>| {
+        let visit = |view: &mut View<'_, '_, A>| {
             for arguments in self.fragments() {
                 view.visit_path_arguments(arguments);
             }

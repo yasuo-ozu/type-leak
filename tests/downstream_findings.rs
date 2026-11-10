@@ -27,8 +27,8 @@
 //! copy (E0433 in the Referrer's crate). The context now takes only the names a type can mention a
 //! generic by (`the_visitor_finds_every_entry_of_the_repros`).
 //!
-//! The same shapes are copied across crates in `tests/crates/leaker` (`kinds`, the ids 9071 and
-//! after), where the Repeater impls and the copies are compiled: `tests/cross_crate.rs`.
+//! The same shapes are copied across crates in `tests/crates/leaker` (`kinds`), where the Repeater
+//! impls and the copies are compiled: `tests/cross_crate.rs`.
 //!
 //! Then come the findings 12 and 14: a bare `?Sized` and the values of an item (a type in a value
 //! is carried since F40 of `tests/findings.rs`, a path that is no type is rejected).
@@ -885,9 +885,9 @@ fn help_for(path: &str) -> String {
 }
 
 /// 14: with `check_values`, the relative type in the default of an associated const is carried:
-/// it is an entry, which the Visitor replaces (F40 of `tests/findings.rs`, and the fixtures 9141 and
-/// 9142 of `tests/cross_crate.rs`, whose copy compiles). It was rejected, with the value it is in,
-/// like the paths that are no types still are.
+/// it is an entry, which the Visitor replaces (F40 of `tests/findings.rs`, and the cross-crate
+/// fixtures in `tests/cross_crate.rs`, whose copy compiles). It was rejected, with the value it is
+/// in, like the paths that are no types still are.
 #[test]
 fn fourteen_a_type_in_an_associated_const_default_is_carried() {
     let item: ItemTrait = parse_quote! {

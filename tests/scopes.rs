@@ -990,7 +990,7 @@ fn a_failed_scope_keeps_the_top_levels_of_its_inner_scopes() {
 /// bounds) is an error of the outermost call too. Audit mutant `rb_leave_env_errors`.
 #[test]
 fn the_cycle_of_a_failed_inner_scope_is_an_error_of_the_outer_one() {
-    fn inner<A: Allow>(view: &mut View<'_, A>) {
+    fn inner<A: Allow>(view: &mut View<'_, '_, A>) {
         // `Self` is the self type `W<V>`, which the copy writes through the Repeater because of
         // `Rel`, and the bound `V: Fn(Rel)` names it: a cycle of the inner scope.
         view.enter_impl(
@@ -1911,7 +1911,7 @@ fn leaker_with_contexts() -> (Leaker, Vec<ContextId>) {
 
 /// What a scope that panics leaves behind, if the table of contexts were not rolled back: a nested
 /// module and nested generics with their own contexts.
-fn record_and_panic(view: &mut View<'_>, message: &str) {
+fn record_and_panic(view: &mut View<'_, '_>, message: &str) {
     view.visit_type(&parse_quote!(RelLost<V>));
     view.enter_mod("lost", [], |_| ());
     view.enter_generics(&parse_quote!(<X, Y>), |_| ());

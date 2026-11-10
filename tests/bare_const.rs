@@ -21,10 +21,9 @@
 //! - Every place with every cause, checked for the property that the identifier is an entry on its
 //!   own only for a soft cause: `the_identifier_is_leaked_alone_only_for_a_soft_cause`.
 //!
-//! The Referrer's crate of `tests/cross_crate.rs` (`kinds`, ids 9081 to 9084, and 9101 and 9102
-//! for a module) compiles the copies: the path that holds a const (also with `Self` in it) is an
-//! entry as a whole, a rejected one expands to nothing, and the identifier that is a type is leaked
-//! alone where it is a soft cause.
+//! The Referrer's crate of `tests/cross_crate.rs` (`kinds`, and a module) compiles the copies: the
+//! path that holds a const (also with `Self` in it) is an entry as a whole, a rejected one expands
+//! to nothing, and the identifier that is a type is leaked alone where it is a soft cause.
 
 mod common;
 

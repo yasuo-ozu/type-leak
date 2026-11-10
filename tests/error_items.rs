@@ -94,6 +94,7 @@ fn kind(cause: &Cause) -> &'static str {
         Cause::Expr(_) => "expr",
         Cause::Macro(_) => "macro",
         Cause::Lifetime(_) => "lifetime",
+        Cause::Unknown(_) => "unknown",
         Cause::Unreadable(_) => "unreadable",
         other => panic!("{:?}", other),
     }
@@ -955,7 +956,7 @@ fn the_place_and_the_paths_follow_the_help_and_are_written_only_if_set() {
     );
     // After the help, or after the notes if there is none, in this order.
     let placed = parse_item(
-        r#"{ type ( A ) RelativePath "m" [] ( B ) "h" value default paths [ type ( a :: b ) , trait ( :: c ) , expr ( Self ) , macro ( crate :: d ! ) , unreadable ( e ) ] }"#,
+        r#"{ type ( A ) RelativePath "m" [] ( B ) "h" value default paths [ type ( a :: b ) , trait ( :: c ) , expr ( Self ) , macro ( crate :: d ! ) , unknown ( e ) ] }"#,
     )
     .unwrap();
     assert!(placed.in_value && placed.in_default);
@@ -968,12 +969,12 @@ fn the_place_and_the_paths_follow_the_help_and_are_written_only_if_set() {
             Cause::Trait(_),
             Cause::Expr(_),
             Cause::Macro(_),
-            Cause::Unreadable(_)
+            Cause::Unknown(_)
         ]
     ));
     assert_eq!(
         placed.to_token_stream().to_string(),
-        r#"{ type (A) RelativePath "m" [] (B) "h" value default paths [type (a :: b) , trait (:: c) , expr (Self) , macro (crate :: d !) , unreadable (e)] }"#
+        r#"{ type (A) RelativePath "m" [] (B) "h" value default paths [type (a :: b) , trait (:: c) , expr (Self) , macro (crate :: d !) , unknown (e)] }"#
     );
     let only_default = parse_item(r#"{ type ( A ) RelativePath "m" [] default }"#).unwrap();
     assert!(!only_default.in_value && only_default.in_default && only_default.help.is_none());
@@ -1063,6 +1064,12 @@ fn every_kind_of_cause_is_read_whole() {
         "macro",
         "a :: mac !",
     );
+    assert_item(
+        &read("unknown", "a :: b").unwrap(),
+        Reason::RelativePath,
+        "unknown",
+        "a :: b",
+    );
     // Any tokens, groups included.
     assert_item(
         &read("unreadable", "any [ tokens ] { ( here ) } ;").unwrap(),
@@ -1079,6 +1086,7 @@ fn a_cause_that_is_not_the_whole_content_is_refused() {
         ("trait", "A < B > C"),
         ("macro", "mac"),
         ("macro", "mac ! x"),
+        ("unknown", "a b"),
     ] {
         let source = format!(r#"{{ {} ( {} ) RelativePath "m" [] }}"#, kind, cause);
         assert!(parse_item(&source).is_err(), "{}", source);

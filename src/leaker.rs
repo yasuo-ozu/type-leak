@@ -9,7 +9,7 @@ use crate::error::ErrorItem;
 use crate::error::Reason;
 use crate::graph::{is_whole_reference, NodeKey, TypeGraph};
 use crate::referrer::Referrer;
-use crate::util::{ident_name, AllowedPaths};
+use crate::util::ident_name;
 use crate::view::View;
 use proc_macro2::{Span, TokenStream};
 use safegraph::algo::max_flow::edmonds_karp_with_flows;
@@ -18,7 +18,6 @@ use safegraph::BTreeGraph;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::rc::Rc;
 use std::result::Result;
 use syn::parse::{Parse, ParseStream};
 use syn::visit::Visit;
@@ -56,9 +55,8 @@ use template_quote::{quote, ToTokens};
 /// relative paths in them are paths of their error: a bound or a type in a predicate of the item
 /// (a leaked type there may be unprovable), a bare identifier that may be a const, a reference, a
 /// type that holds a trait object that takes its lifetime from it. A panic in a closure rolls its
-/// scope back and records nothing. A panicking [`Allow`] is treated alike: the call is rolled back and panics,
-/// even if the closure caught the panic of the rule. [`LeakerResult::allow()`] drops the errors
-/// you accept.
+/// scope back and records nothing. A panicking [`Allow`] is treated alike: the call is rolled back and
+/// panics. [`LeakerResult::allow()`] drops the errors you accept.
 ///
 /// # Limitations
 ///
@@ -120,9 +118,26 @@ use template_quote::{quote, ToTokens};
 /// name.
 pub struct Leaker<A = ()> {
     /// What the Leaker leaves as written instead of leaking it, and the errors it does not
-    /// record. Shared with the visitors of the analysis.
-    allow: Rc<A>,
-    state: State,
+    /// record.
+    allow: A,
+    /// The types that depend on the context (the required entries).
+    types: TypeGraph,
+    /// The types the Referrer may replace (the optional entries).
+    optional_types: TypeGraph,
+    /// The result of [`Leaker::reduce_roots()`]: required, then optional. `None` if outdated.
+    reachable_types: Option<(Vec<NodeKey>, Vec<NodeKey>)>,
+    contexts: Contexts,
+    /// Numbered on their own, so that optional entries do not change the ids of required ones.
+    optional_contexts: Contexts,
+    /// The top-level contexts of the scopes (also of those with errors), which the [`Referrer`]
+    /// keeps without an entry too.
+    top_levels: BTreeSet<ContextId>,
+    assumed_primitives: Vec<Ident>,
+    options: Options,
+    /// The parts copied as written.
+    parts: Vec<PartItem>,
+    /// The errors of the outermost calls, in the order found.
+    errors: Vec<ErrorItem>,
 }
 
 /// What a [`Leaker`] reads and accepts beyond its [`Allow`] rules. Pass it to
@@ -184,29 +199,6 @@ impl Options {
     }
 }
 
-/// What a [`Leaker`] found, apart from the rules that make its type.
-#[derive(Default)]
-struct State {
-    /// The types that depend on the context (the required entries).
-    types: TypeGraph,
-    /// The types the Referrer may replace (the optional entries).
-    optional_types: TypeGraph,
-    /// The result of [`Leaker::reduce_roots()`]: required, then optional. `None` if outdated.
-    reachable_types: Option<(Vec<NodeKey>, Vec<NodeKey>)>,
-    contexts: Contexts,
-    /// Numbered on their own, so that optional entries do not change the ids of required ones.
-    optional_contexts: Contexts,
-    /// The top-level contexts of the scopes (also of those with errors), which the [`Referrer`]
-    /// keeps without an entry too.
-    top_levels: BTreeSet<ContextId>,
-    assumed_primitives: Vec<Ident>,
-    options: Options,
-    /// The parts copied as written.
-    parts: Vec<PartItem>,
-    /// The errors of the outermost calls, in the order found.
-    errors: Vec<ErrorItem>,
-}
-
 impl Leaker {
     /// Creates a [`Leaker`] that allows nothing, so every relative path is leaked.
     pub fn new() -> Self {
@@ -226,11 +218,17 @@ impl<A: Allow> Leaker<A> {
     /// See [`Options::check_values()`] and [`Options::nested_self_entries()`].
     pub fn from_config(allow: A, options: Options) -> Self {
         Self {
-            allow: Rc::new(allow),
-            state: State {
-                options,
-                ..State::default()
-            },
+            allow,
+            types: TypeGraph::default(),
+            optional_types: TypeGraph::default(),
+            reachable_types: None,
+            contexts: Contexts::default(),
+            optional_contexts: Contexts::default(),
+            top_levels: BTreeSet::new(),
+            assumed_primitives: Vec::new(),
+            options,
+            parts: Vec::new(),
+            errors: Vec::new(),
         }
     }
 
@@ -239,13 +237,13 @@ impl<A: Allow> Leaker<A> {
     /// makes copied as written. Emit it in the Leaker's crate. It is empty if none was copied.
     #[must_use]
     pub fn assertions(&self) -> TokenStream {
-        if self.state.assumed_primitives.is_empty() {
+        if self.assumed_primitives.is_empty() {
             return TokenStream::new();
         }
         quote! {
             #[allow(dead_code, non_snake_case)]
             const _: () = {
-                #(for ident in &self.state.assumed_primitives) {
+                #(for ident in &self.assumed_primitives) {
                     fn #{Ident::new(
                         &format!("__type_leak_assert_{}_is_primitive", ident),
                         Span::call_site(),
@@ -365,7 +363,7 @@ impl<A: Allow> Leaker<A> {
         &mut self,
         hint: impl Display,
         declared: impl IntoIterator<Item = Ident>,
-        f: impl FnOnce(&mut View<'_, A>) -> R,
+        f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_mod(self, hint, declared, f)
     }
@@ -377,7 +375,7 @@ impl<A: Allow> Leaker<A> {
     pub fn enter_generics<R>(
         &mut self,
         generics: &Generics,
-        f: impl FnOnce(&mut View<'_, A>) -> R,
+        f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_generics(self, generics, f)
     }
@@ -391,7 +389,7 @@ impl<A: Allow> Leaker<A> {
         ident: &Ident,
         generics: &Generics,
         allow_self: bool,
-        f: impl FnOnce(&mut View<'_, A>) -> R,
+        f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_type(self, ident, generics, allow_self, f)
     }
@@ -411,7 +409,7 @@ impl<A: Allow> Leaker<A> {
         self_ty: &Type,
         trait_: Option<&Path>,
         allow_self: bool,
-        f: impl FnOnce(&mut View<'_, A>) -> R,
+        f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_impl(self, generics, self_ty, trait_, allow_self, f)
     }
@@ -425,7 +423,7 @@ impl<A: Allow> Leaker<A> {
         ident: &Ident,
         generics: &Generics,
         allow_self: bool,
-        f: impl FnOnce(&mut View<'_, A>) -> R,
+        f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
         Scopes::enter_trait(self, ident, generics, allow_self, f)
     }
@@ -434,23 +432,13 @@ impl<A: Allow> Leaker<A> {
     /// Required entries come first, then optional ones ([`Referrer::must()`]), each sorted by
     /// context (in order of first appearance) and tokens.
     pub fn result(mut self) -> LeakerResult {
-        let errors = std::mem::take(&mut self.state.errors);
+        let errors = std::mem::take(&mut self.errors);
         LeakerResult {
-            referrer: self.state.referrer(),
+            referrer: self.referrer(),
             errors,
         }
     }
 
-    /// Chooses the fewest entries from which every leaked type can be built;
-    /// [`Leaker::result()`] calls it. `&'a Rel`, a path with a lifetime or bare-identifier argument
-    /// (`Wrap<SIZE>`), a type with a type in an expression (`[u8; size_of::<Big>()]`) and a trait
-    /// object are entries as a whole.
-    pub fn reduce_roots(&mut self) {
-        self.state.reduce_roots()
-    }
-}
-
-impl State {
     fn referrer(mut self) -> Referrer {
         self.reduce_roots();
         let (required, optional) = self.reachable_types.take().unwrap_or_default();
@@ -499,8 +487,11 @@ impl State {
         Referrer::new(entries, context_map, modules, self.parts)
     }
 
-    /// Chooses the entries ([`Leaker::reduce_roots()`]).
-    fn reduce_roots(&mut self) {
+    /// Chooses the fewest entries from which every leaked type can be built;
+    /// [`Leaker::result()`] calls it. `&'a Rel`, a path with a lifetime or bare-identifier argument
+    /// (`Wrap<SIZE>`), a type with a type in an expression (`[u8; size_of::<Big>()]`) and a trait
+    /// object are entries as a whole.
+    pub fn reduce_roots(&mut self) {
         if self.reachable_types.is_some() {
             return;
         }
@@ -660,47 +651,42 @@ impl<A: Allow> Scopes for Leaker<A> {
     fn enter_spec<R>(
         &mut self,
         spec: ScopeSpec,
-        f: impl FnOnce(&mut View<'_, A>) -> R,
+        f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
         let root = spec.declared_generics();
-        let mut visitor = AnalyzeVisitor::new(AllowedPaths::new(self.allow.clone()), &root)
-            .reading_values(self.state.options.check_values)
-            .with_nested_self_entries(self.state.options.nested_self_entries);
-        let mark = self.state.contexts.len();
+        let mut visitor = AnalyzeVisitor::new(&mut self.allow, &root)
+            .reading_values(self.options.check_values)
+            .with_nested_self_entries(self.options.nested_self_entries);
+        let mark = self.contexts.len();
         // The visitor owns the table of contexts while it analyzes, so the swap is the only step
         // before `catch_unwind`: no allocation, no user code. Whatever happens next (a result, or a
         // panic of `f`), the table is swapped back before anything else, and an unfinished
         // analysis is rolled back to `mark`.
-        visitor.swap_contexts(&mut self.state.contexts);
+        visitor.swap_contexts(&mut self.contexts);
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             visitor.start(&spec);
             let result = f(&mut View::new(&mut visitor));
-            if visitor.rule_panicked() {
-                // The closure caught the panic of a rule, which left the analysis half done:
-                // raise it again, as for a panic of the closure (rolled back below).
-                resume_unwind(Box::new("the rule panicked, and the closure caught it"));
-            }
             let (finished, mut errors) = visitor.finish(&root);
             // The errors that the rule accepts are dropped here, as `LeakerResult` drops
             // them later. It is user code too: if it panics, nothing is recorded.
-            filter(&*self.allow, &mut errors);
+            filter(visitor.rule(), &mut errors);
             (finished, errors, result)
         }));
-        visitor.swap_contexts(&mut self.state.contexts);
+        visitor.swap_contexts(&mut self.contexts);
         let (finished, errors, result) = match outcome {
             Ok(done) => done,
             Err(payload) => {
-                self.state.contexts.truncate(mark);
+                self.contexts.truncate(mark);
                 resume_unwind(payload)
             }
         };
-        let top_level = self.state.record(&spec, root, finished);
-        self.state.errors.extend(errors);
+        let top_level = self.record(&spec, root, finished);
+        self.errors.extend(errors);
         (top_level, result)
     }
 }
 
-impl State {
+impl<A: Allow> Leaker<A> {
     /// Records what the outermost scope `spec` with the generics `root` found, and returns its
     /// top-level context.
     fn record(&mut self, spec: &ScopeSpec, root: Generics, finished: Finished) -> ContextId {

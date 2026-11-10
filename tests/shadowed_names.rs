@@ -17,8 +17,8 @@
 //!   declared item does not hide where the entry is written. (Format 10 fixed it: the visitor hid
 //!   the entry, and the Referrer's crate kept `crate::base`, E0433.)
 //!
-//! The same shapes are copied across crates in `tests/crates/leaker` (`kinds`, the ids 9091 and
-//! after), where the Repeater impls and the copies are compiled: `tests/cross_crate.rs`.
+//! The same shapes are copied across crates in `tests/crates/leaker` (`kinds`), where the Repeater
+//! impls and the copies are compiled: `tests/cross_crate.rs`.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;

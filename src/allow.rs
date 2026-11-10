@@ -3,7 +3,7 @@
 //! applies it too.
 
 use crate::error::{Cause, ErrorItem};
-use crate::util::{heads_self, starts_with_known, without_arguments, Known, PathOf, STD_CRATES};
+use crate::util::{heads_self, starts_with_known, Known, STD_CRATES};
 use syn::Path;
 
 /// Where in an item a path or an error is. [`Allow::allow()`] is asked at a place; it is
@@ -27,13 +27,12 @@ pub struct Place {
 /// stages. The analysis asks it about each relative path, and about each absolute path in a type
 /// (`::core::..` and `$crate::..` excepted), as the cause of its kind: a path in a type is a
 /// [`Cause::Type`], the trait of a bound or of a qualified path a [`Cause::Trait`], a path in a
-/// value a [`Cause::Expr`], the path of a macro a [`Cause::Macro`]. A path of unknown kind (the
-/// root of a `use` in a value) is allowed if the rule allows it as a type or as a trait. The
-/// paths are bare: their generic arguments are analyzed on their own. A path that starts with
-/// `Self` or a generic in scope is never asked. An allowed path is not leaked, and you promise
-/// that it means the same in the copy (an absolute path: that the crate is the same on both
-/// sides). The rule is called on every check of a path: keep it cheap. A rule that panics rolls the
-/// analysis back.
+/// value a [`Cause::Expr`], the path of a macro a [`Cause::Macro`], a path of unknown kind (the
+/// root of a `use`, a path in the tokens of a macro) a [`Cause::Unknown`]. The paths are bare:
+/// their generic arguments are analyzed on their own. A path that starts with `Self` or a generic
+/// in scope is never asked. An allowed path is not leaked, and you promise that it means the same
+/// in the copy (an absolute path: that the crate is the same on both sides). The rule is called on
+/// every check of a path: keep it cheap. A rule that panics rolls the analysis back.
 ///
 /// After the analysis, [`LeakerResult::allow()`](crate::LeakerResult::allow) accepts an error by
 /// its [`paths`](ErrorItem::paths) if it has any (the rule must allow each, at the error's
@@ -234,25 +233,10 @@ fn is_crate_path(path: &Path) -> bool {
             .map_or(false, |seg| seg.ident == "crate")
 }
 
-/// Asks `rule` about `path`, which is the path of `of`, without the generic arguments of its
-/// segments, wherever the rule is asked: as the cause of that kind, or if the kind is not known as
-/// a type or as a trait.
-pub(crate) fn ask<A: Allow + ?Sized>(rule: &A, path: &Path, of: PathOf, place: Place) -> bool {
-    match of.entry(path) {
-        Cause::Unreadable(_) => {
-            let bare = without_arguments(path);
-            rule.allow(&Cause::type_path(&bare), place) || rule.allow(&Cause::Trait(bare), place)
-        }
-        entry => rule.allow(&entry, place),
-    }
-}
-
 /// Returns `true` if `rule` allows the entry `entry` of [`ErrorItem::paths`] at `place`. It is
 /// never asked about a path that starts with `Self`.
 fn allows_entry<A: Allow + ?Sized>(rule: &A, entry: &Cause, place: Place) -> bool {
-    entry.entry_path().map_or(false, |path| {
-        !heads_self(&path) && ask(rule, &path, PathOf::of_entry(entry), place)
-    })
+    entry.path().map_or(false, |path| !heads_self(path)) && rule.allow(entry, place)
 }
 
 /// Returns `true` if `rule` accepts `error`: if it has relative paths ([`ErrorItem::paths`]), it

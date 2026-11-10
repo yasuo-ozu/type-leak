@@ -1346,9 +1346,9 @@ pub mod kinds {
     pub struct Defd<T: ?Sized>(pub PhantomData<T>);
     pub struct Defd2<A, B>(pub A, pub B);
 
-    /// 9209: the impls of the entries that do not name `Self` (`Rel`, `Defd2<Rel, u8>`, `Defd<V>`)
-    /// are for a primitive type that the id and the index choose (`ImplSelf::Bucket`), and those
-    /// that do (`Wrap<Self>`) are for the implementor. The default `Defd<T>` is one of the first.
+    /// The impls of the entries that do not name `Self` (`Rel`, `Defd2<Rel, u8>`, `Defd<V>`) are
+    /// for a primitive type that the id and the index choose (`ImplSelf::Bucket`), and those that
+    /// do (`Wrap<Self>`) are for the implementor. The default `Defd<T>` is one of the first.
     #[prop_leak(id = 9209, allow_self = true, scope = "mod", prelude = true, redeclare = true)]
     pub trait BucketMix<T, U = Defd<T>> {
         fn plain(&self) -> Rel;
@@ -1357,16 +1357,16 @@ pub mod kinds {
         fn generic<V>(&self, v: V) -> Defd<V>;
     }
 
-    /// The marker type of 9210.
+    /// The marker type of `MarkerDefault`.
     pub struct Marker9210;
 
-    /// 9210: the impls of the entries where `Referrer::needs_self()` is false are for a marker type
-    /// of this crate (`ImplSelf::Marker`; `marker = ..`), not a primitive type. The trait is the
-    /// item itself (not nested in a module), so its default `Defd<T>` does not name `Self` while the
+    /// The impls of the entries where `Referrer::needs_self()` is false are for a marker type of
+    /// this crate (`ImplSelf::Marker`; `marker = ..`), not a primitive type. The trait is the item
+    /// itself (not nested in a module), so its default `Defd<T>` does not name `Self` while the
     /// bound of `T` does (`context_self()` is `None`): the entry is for the implementor of the
     /// trait, which is the host in the copy. For the marker it would bound `T: AsRef<Marker9210>`,
-    /// which the types that the Referrer's crate uses for `T` do not satisfy (`impl
-    /// MarkerDefaultCopy<Owner9210> for Host9210`, E0277).
+    /// which the types that the Referrer's crate uses for `T` do not satisfy
+    /// (`impl MarkerDefaultCopy<Owner9210> for Host9210`, E0277).
     #[prop_leak(
         id = 9210,
         allow_self = true,
@@ -1436,8 +1436,8 @@ pub mod kinds {
     // entry is for any type that the bound holds for, with `Self` as the implementor in the type
     // too, and the copy passes its own: the field is `Link<MyStruct<T>, T>`, as in the original.
     // The Repeater's impl keeps `Sized` (the leaked type may need it). An entry whose bound is
-    // not on `Self` is for the Leaker's type, as without the option. (The same struct without
-    // the option is 9115, which the Leaker rejects.)
+    // not on `Self` is for the Leaker's type, as without the option. (The same struct without the
+    // option is rejected by the Leaker.)
 
     /// The bound is on the parameter. The entry is not the last field: rustc before 1.70 cannot
     /// prove that the copy is `Sized` otherwise (E0275).
@@ -1978,8 +1978,9 @@ pub mod kinds {
     // Errors that the Leaker does not decide on (`prop_leak_result`): its macro carries them with the
     // Referrer, and the Referrer's macro allows some (`allow(..)`), reports the others, and copies
     // the item either way. The Leaker does not allow the prelude, so a relative `Clone` or
-    // `core::fmt::Debug` in a bound is an error (`RelativePath`, the cause is the trait). 9190 to 9192
-    // are copied in the Referrer's crate (`accepted`); 9193 in `tests/crates/diagnostic_result`.
+    // `core::fmt::Debug` in a bound is an error (`RelativePath`, the cause is the trait). The first
+    // three are copied in the Referrer's crate (`accepted`), `Denied` in
+    // `tests/crates/diagnostic_result`.
 
     /// `Clone` as the bound of the trait's generic, as a supertrait and in the bound of a method:
     /// three errors with one cause, dropped by `allow(trait Clone)`. The copy keeps the three as
@@ -2057,8 +2058,8 @@ pub mod kinds {
         fn g(&self, y: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>);
     }
 
-    /// Flat recovery (9219, 9220): a type whose own path conflicts is written as it is, and the types
-    /// in it are leaked as usual (`Leaf` in `Two<T, Leaf>`, beside the entry `Leaf` of `g`). `Two` is
+    /// Flat recovery: a type whose own path conflicts is written as it is, and the types in it are
+    /// leaked as usual (`Leaf` in `Two<T, Leaf>`, beside the entry `Leaf` of `g`). `Two` is
     /// relative, so the Referrer's crate names it. Nothing in it is a trait object that takes its
     /// lifetime from the path, so the part is not whole.
     pub struct Two<A: ?Sized, B: ?Sized>(pub PhantomData<(*const A, *const B)>);
@@ -2136,11 +2137,12 @@ pub mod kinds {
     // F50 to F52 (`tests/findings.rs`): what a rule after the analysis, a nested item and an
     // unrelated error used to get wrong. Each fails to build on the code before its fix.
 
-    /// F50, 9205: the path of the value is relative (`core::mem::size_of`, no leading `::`), and
-    /// `Rel` is in its arguments. The path is written as it is and `Rel` is an entry, so
-    /// `Rules::std_crates()` after the analysis drops the only error, and the copy builds in a crate
-    /// that does not name `Rel` (`stages = true`: the macro makes the copy after each rule, in a
-    /// crate of the Referrer that invokes it `clean`, and gets it only if the rule left no error).
+    /// F50: the path of the value is relative (`core::mem::size_of`, no leading `::`), and `Rel` is
+    /// in its arguments. The path is written as it is and `Rel` is an entry, so
+    /// `Rules::std_crates()` after the analysis drops the only error, and the copy builds in a
+    /// crate that does not name `Rel` (`stages = true`: the macro makes the copy after each rule,
+    /// in a crate of the Referrer that invokes it `clean`, and gets it only if the rule left no
+    /// error).
     #[prop_leak_accept(
         id = 9205,
         allow_self = true,
@@ -2156,11 +2158,11 @@ pub mod kinds {
         }
     }
 
-    /// F51, 9206: `Wrap<Self>` in the bound of `T` is a leaked type, beside the entry `Link<Self,
-    /// T>` that uses `T` and so carries the bound. The copy writes the bound as a path through the
-    /// Repeater, and rustc cannot prove the bound of the impl of the entry in the environment
-    /// that has the rewritten form (E0277, for the entry in the last field: rustc proves the type
-    /// is `Sized` there). `intern_struct()` rejects it (`UnprovableBound`); the nested item with
+    /// F51: `Wrap<Self>` in the bound of `T` is a leaked type, beside the entry `Link<Self, T>`
+    /// that uses `T` and so carries the bound. The copy writes the bound as a path through the
+    /// Repeater, and rustc cannot prove the bound of the impl of the entry in the environment that
+    /// has the rewritten form (E0277, for the entry in the last field: rustc proves the type is
+    /// `Sized` there). `intern_struct()` rejects it (`UnprovableBound`); the nested item with
     /// `nested_self_entries` has to as well.
     #[prop_leak(
         id = 9206,
@@ -2177,12 +2179,12 @@ pub mod kinds {
     /// A relative trait that takes a type: an unrelated error in a method of `OptionalNextToError`.
     pub trait GenTr<A: ?Sized> {}
 
-    /// F52, 9207: the type of this crate by its own name (`Wrap<(T, Wrap<u8>)>`, `Wrap<u8>`) is an
-    /// optional entry, which a strict Referrer replaces. The where predicate of the trait names both
-    /// in an `Fn`, and `Y: GenTr<Self::A0>` is copied as written (`GenTr` is relative): its `Self::A0`
-    /// is resolved by the impl of the host, whose predicate must be the one of the trait. So the
-    /// optional entries in the predicate stay as written, as they do beside `Y: Into<Self::A0>`
-    /// (E0277 "expected an `Fn(&Wrap<..>)` closure, found `T`" otherwise).
+    /// F52: the type of this crate by its own name (`Wrap<(T, Wrap<u8>)>`, `Wrap<u8>`) is an
+    /// optional entry, which a strict Referrer replaces. The where predicate of the trait names
+    /// both in an `Fn`, and `Y: GenTr<Self::A0>` is copied as written (`GenTr` is relative): its
+    /// `Self::A0` is resolved by the impl of the host, whose predicate must be the one of the
+    /// trait. So the optional entries in the predicate stay as written, as they do beside
+    /// `Y: Into<Self::A0>` (E0277 "expected an `Fn(&Wrap<..>)` closure, found `T`" otherwise).
     #[prop_leak_accept(id = 9207, allow_self = true, prelude = true, strict = true)]
     pub trait OptionalNextToError<T>
     where
@@ -2198,11 +2200,11 @@ pub mod kinds {
 
     // Issue 3 of `tests/downstream_findings.rs`: the names `Rules::prelude()` took for the prelude.
 
-    /// Issue 3, 9208: `None`, `Some`, `Ok` and `Err` in values, and `DoubleEndedIterator +
-    /// ExactSizeIterator` in a bound, are names of the prelude of every edition. `Rules::prelude()`
-    /// refused them (`use absolute path: 'None'`), so the Leaker rejected the item, which the
-    /// Referrer's crate then lacks (`PreludeNamesCopy`). The copy writes them as they are; the
-    /// entries are the relative types.
+    /// Issue 3: `None`, `Some`, `Ok` and `Err` in values, and
+    /// `DoubleEndedIterator + ExactSizeIterator` in a bound, are names of the prelude of every
+    /// edition. `Rules::prelude()` refused them (`use absolute path: 'None'`), so the Leaker
+    /// rejected the item, which the Referrer's crate then lacks (`PreludeNamesCopy`). The copy
+    /// writes them as they are; the entries are the relative types.
     #[prop_leak(
         id = 9208,
         allow_self = true,
@@ -2238,7 +2240,7 @@ pub mod kinds {
     // F56 (`tests/findings.rs`): an enum discriminant and the default of a const parameter are read
     // like a value, with or without `check_values`. Each fails to build on the code before the fix.
 
-    /// F56, 9215: the discriminants bind names (`x`, `y`, `a`, `b`, `z`, `K`): they are local, not
+    /// F56: the discriminants bind names (`x`, `y`, `a`, `b`, `z`, `K`): they are local, not
     /// relative paths. The Leaker rejected them (`use absolute path: 'x'`), so the Referrer's crate
     /// lacked `DiscriminantBindings`. The copy writes them as they are, in a crate that has none of
     /// the Leaker's names.
@@ -2251,7 +2253,7 @@ pub mod kinds {
         Item = { const K: isize = 40; K + 2 },
     }
 
-    /// F56, 9216: the default of the const parameter binds a name (`n`). It was rejected as well.
+    /// F56: the default of the const parameter binds a name (`n`). It was rejected as well.
     #[prop_leak(id = 9216, allow_self = true, scope = "mod")]
     pub struct DefaultBinding<const N: usize = { let n = 2; n * 2 }>(pub [u8; N]);
 
@@ -2262,9 +2264,9 @@ pub mod kinds {
         };
     }
 
-    /// F56, 9217: a discriminant that calls a macro of this crate (`rel_two!`) by a relative path.
-    /// The Leaker did not report it, and the copy in the Referrer's crate could not resolve the
-    /// macro. It is rejected now: the Referrer's macro expands to nothing.
+    /// F56: a discriminant that calls a macro of this crate (`rel_two!`) by a relative path. The
+    /// Leaker did not report it, and the copy in the Referrer's crate could not resolve the macro.
+    /// It is rejected now: the Referrer's macro expands to nothing.
     #[prop_leak(id = 9217, allow_self = true, scope = "mod")]
     pub enum RelativeMacroDiscriminant {
         Two = rel_two!(),
@@ -2275,7 +2277,7 @@ pub mod kinds {
         pub a: usize,
     }
 
-    /// F56, 9218: the default of a const parameter that writes a struct of this crate as a literal
+    /// F56: the default of a const parameter that writes a struct of this crate as a literal
     /// (`RelPoint { a: 1 }`). Not reported before, and the copy could not resolve `RelPoint`.
     #[prop_leak(id = 9218, allow_self = true, scope = "mod")]
     pub struct LiteralDefault<const N: usize = { RelPoint { a: 1 }.a }>(pub [u8; N]);

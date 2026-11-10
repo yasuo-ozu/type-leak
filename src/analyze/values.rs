@@ -36,7 +36,7 @@ use super::{self_segment, AnalyzeVisitor};
 use crate::allow::{Allow, Place};
 use crate::analysis::{CheckResult, Effect};
 use crate::error::{Cause, Reason};
-use crate::util::{ident_name, is_primitive_name, tidy, token_names, PathOf};
+use crate::util::{ident_name, is_primitive_name, tidy, token_names, trait_head};
 use proc_macro2::TokenStream;
 use std::collections::HashSet;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -46,7 +46,7 @@ use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
 
-impl<A: Allow> AnalyzeVisitor<A> {
+impl<A: Allow> AnalyzeVisitor<'_, A> {
     /// Checks the value `expr` of the const or static `name`, if values are read. `default`: it is
     /// the default of an associated const of a trait.
     pub(super) fn check_value(&mut self, name: &Ident, default: bool, expr: &Expr) {
@@ -121,8 +121,8 @@ struct Names {
     items: HashSet<String>,
 }
 
-struct ValueWalk<'a, A> {
-    visitor: &'a mut AnalyzeVisitor<A>,
+struct ValueWalk<'a, 'r, A> {
+    visitor: &'a mut AnalyzeVisitor<'r, A>,
     /// Where the walk is, as the notes say it: "the default value of `N`".
     what: String,
     /// Never empty. The first is the scope of the value itself.
@@ -142,8 +142,8 @@ struct ValueWalk<'a, A> {
     deny_self: bool,
 }
 
-impl<'a, A: Allow> ValueWalk<'a, A> {
-    fn new(visitor: &'a mut AnalyzeVisitor<A>, what: String) -> Self {
+impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
+    fn new(visitor: &'a mut AnalyzeVisitor<'r, A>, what: String) -> Self {
         Self {
             visitor,
             what,
@@ -208,9 +208,13 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
                     .any(|scope| scope.bindings.contains(&name)))
     }
 
-    /// Returns `true` if the path, the path of `of`, means the same wherever the value is written:
-    /// it starts with `Self`, a generic, a name the value declares, or is absolute or allowed.
-    fn is_known(&mut self, path: &Path, of: PathOf) -> bool {
+    /// Returns `true` if the path of `cause` means the same wherever the value is written: it starts
+    /// with `Self`, a generic, a name the value declares, or is absolute or allowed.
+    fn is_known(&mut self, cause: &Cause) -> bool {
+        let path = match cause.path() {
+            Some(path) => path,
+            None => return false,
+        };
         // The receiver.
         if path.leading_colon.is_none() && path.get_ident().map_or(false, |ident| ident == "self") {
             return true;
@@ -222,7 +226,7 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
         if self.is_local(path) || self.visitor.starts_with_generic(path) {
             return true;
         }
-        if !self.visitor.is_context_free(path, of) {
+        if !self.visitor.is_context_free(cause) {
             return false;
         }
         // A primitive name is copied as it is, and may be shadowed: `Leaker::assertions()`.
@@ -248,20 +252,20 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
     /// Rejects the relative path `cause`, with `help` for what to write if it has to say more than
     /// the absolute path. The copy writes the path as it is.
     fn relative(&mut self, cause: Cause, help: Option<String>) {
-        let of = PathOf::of_entry(&cause);
-        self.relative_of(cause, of, help)
+        let entry = cause.path().map(|_| cause.bare());
+        self.relative_of(cause, entry, help)
     }
 
     /// Rejects the relative path `path` of a value, copied as written: the types in its arguments
     /// are analyzed as usual.
     fn relative_path(&mut self, path: &Path) {
-        self.relative_of(Cause::expr_path(path), PathOf::Value, None);
+        self.relative(Cause::expr_path(path), None);
         syn::visit::visit_path(self, path);
     }
 
-    /// Like `relative()`. `of`: what the path of `cause` is the path of, for
+    /// Like `relative()`. `entry`: the path of `cause`, for
     /// [`ErrorItem::paths`](crate::ErrorItem::paths).
-    fn relative_of(&mut self, cause: Cause, of: PathOf, help: Option<String>) {
+    fn relative_of(&mut self, cause: Cause, entry: Option<Cause>, help: Option<String>) {
         // The error names a macro in its own way, with its `!`, whereas the path of a macro in a
         // type is shown by its path alone.
         let headline = match &cause {
@@ -276,11 +280,7 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
             ));
         }
         // The path is relative: the walk knows no generic, no `Self` and no name of the value by it.
-        let paths: Vec<Cause> = cause
-            .path()
-            .map(|path| of.entry(path))
-            .into_iter()
-            .collect();
+        let paths: Vec<Cause> = entry.into_iter().collect();
         self.error(CheckResult {
             must: vec![cause.clone()],
             impossible: vec![cause],
@@ -400,9 +400,9 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
 
     /// Checks a path that is a name alone, as a `use` root, a macro argument or a pattern.
     fn check_name(&mut self, ident: &Ident) {
-        let path = Path::from(ident.clone());
-        if !self.is_known(&path, PathOf::Value) {
-            self.relative(Cause::expr_path(&path), None);
+        let cause = Cause::expr_path(&Path::from(ident.clone()));
+        if !self.is_known(&cause) {
+            self.relative(cause, None);
         }
     }
 
@@ -420,12 +420,9 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
             0
         };
         if position > 0 {
-            let trait_path = Path {
-                leading_colon: path.leading_colon,
-                segments: path.segments.iter().take(position).cloned().collect(),
-            };
-            if !self.is_known(&trait_path, PathOf::Trait) {
-                self.relative(Cause::Trait(trait_path), None);
+            let cause = Cause::Trait(trait_head(path, position));
+            if !self.is_known(&cause) {
+                self.relative(cause, None);
             }
             for seg in path.segments.iter().take(position) {
                 self.visit_path_arguments(&seg.arguments);
@@ -451,12 +448,10 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
             }
         };
         let path = Path::from(ident.clone());
-        if !absolute
-            && !self.is_local(&path)
-            && !self.visitor.is_context_free(&path, PathOf::Unknown)
-        {
+        let root = Cause::Unknown(path.clone());
+        if !absolute && !self.is_local(&path) && !self.visitor.is_context_free(&root) {
             // What the root names (a crate, a module, a type, a trait) is not known.
-            self.relative_of(Cause::expr_path(&path), PathOf::Unknown, None);
+            self.relative_of(Cause::expr_path(&path), Some(root), None);
         }
     }
 
@@ -464,9 +459,10 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
     /// them is read, not leaked: the visitor does not rewrite the tokens of a macro.
     fn macro_call(&mut self, mac: &Macro) {
         let path = &mac.path;
-        if !self.is_known(path, PathOf::Macro) {
+        let cause = Cause::Macro(path.clone());
+        if !self.is_known(&cause) {
             let help = macro_help(path);
-            self.relative(Cause::Macro(path.clone()), Some(help));
+            self.relative(cause, Some(help));
         }
         self.reads += 1;
         self.macro_arguments_of(mac);
@@ -528,14 +524,14 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
     }
 }
 
-impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, A> {
+impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
     fn visit_attribute(&mut self, _: &'ast Attribute) {}
 
     fn visit_visibility(&mut self, _: &'ast Visibility) {}
 
     /// Any path that no other method takes is told as a value, as its error is.
     fn visit_path(&mut self, i: &'ast Path) {
-        if self.is_known(i, PathOf::Value) {
+        if self.is_known(&Cause::expr_path(i)) {
             syn::visit::visit_path(self, i)
         } else {
             self.relative_path(i)
@@ -745,15 +741,15 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, A> {
 
 /// What a type of a value names that decides how it is read: a name the value declares, and syntax
 /// that `syn` leaves unparsed.
-struct Scan<'w, 'a, A> {
-    walk: &'w ValueWalk<'a, A>,
+struct Scan<'w, 'a, 'r, A> {
+    walk: &'w ValueWalk<'a, 'r, A>,
     /// The first name that the value declares (an item, a generic or a lifetime of an item in a
     /// block, a `use`).
     declared: Option<String>,
     unreadable: bool,
 }
 
-impl<A: Allow> Scan<'_, '_, A> {
+impl<A: Allow> Scan<'_, '_, '_, A> {
     fn name(&mut self, name: &str) {
         if self.declared.is_none() && self.walk.declares(name) {
             self.declared = Some(name.to_string());
@@ -761,7 +757,7 @@ impl<A: Allow> Scan<'_, '_, A> {
     }
 }
 
-impl<'ast, A: Allow> Visit<'ast> for Scan<'_, '_, A> {
+impl<'ast, A: Allow> Visit<'ast> for Scan<'_, '_, '_, A> {
     fn visit_path(&mut self, i: &'ast Path) {
         if self.declared.is_none() && self.walk.is_local(i) {
             self.declared = i.segments.first().map(|seg| ident_name(&seg.ident));

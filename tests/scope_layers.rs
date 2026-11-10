@@ -667,8 +667,8 @@ fn a_scope_of_an_item_or_a_module_adds_no_scope_of_its_own() {
     // constrains (E0195, F22), which shows that `'b` is local.
     let sig: Signature = parse_quote!(fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b ());
     let plain: Signature = parse_quote!(fn g(x: ::p::W<dyn RelTr>));
-    let as_item = |v: &mut View<'_>, sig: &Signature| visit_function(v, sig);
-    let nested = |v: &mut View<'_>, sig: &Signature| {
+    let as_item = |v: &mut View<'_, '_>, sig: &Signature| visit_function(v, sig);
+    let nested = |v: &mut View<'_, '_>, sig: &Signature| {
         v.visit_item(&parse_quote!(
             trait Nested {
                 #sig;

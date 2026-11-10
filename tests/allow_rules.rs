@@ -625,58 +625,6 @@ fn boom(cause: &Cause, _: Place) -> bool {
 }
 
 #[test]
-fn a_rule_that_panics_in_a_caught_visit_poisons_the_call() {
-    let mut leaker = Leaker::from_config(Rules::new().or_if(boom), Options::new());
-    let generics: Generics = parse_quote!(<T>);
-    let where_clause: WhereClause = parse_quote!(where T: m::Tr<Rel2>);
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        leaker.enter_generics(&generics, |view| {
-            view.visit_type(&parse_quote!(Rel<T>));
-            // The panic is caught here: the visit stops half way.
-            let caught = catch_unwind(AssertUnwindSafe(|| {
-                view.visit_type(&parse_quote!(Wrap<Boom<T>>))
-            }));
-            assert!(caught.is_err());
-            // It would be accepted silently (and `Rel2` would be an entry) with the frames as
-            // the panic left them.
-            view.visit_where_clause(&where_clause);
-        })
-    }));
-    // The call panics, as if the closure had.
-    let payload = outcome.unwrap_err();
-    assert!(payload.downcast_ref::<&str>().is_some());
-    // Nothing of it is recorded, and the Leaker is usable.
-    leaker.enter_generics(&generics, |view| view.visit_type(&parse_quote!(Rel3<T>)));
-    let result = leaker.result();
-    assert!(result.errors().is_empty());
-    let referrer = result.finish().unwrap();
-    assert_eq!(entries(&referrer), [("Rel3 < T >".to_string(), true)]);
-}
-
-#[test]
-fn a_rule_that_panics_in_a_caught_inner_scope_poisons_the_outer_call() {
-    let mut leaker = Leaker::from_config(Rules::new().or_if(boom), Options::new());
-    let generics: Generics = parse_quote!(<T>);
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        leaker.enter_generics(&generics, |view| {
-            view.visit_type(&parse_quote!(Rel<T>));
-            let inner = catch_unwind(AssertUnwindSafe(|| {
-                view.enter_generics(&parse_quote!(<U>), |inner| {
-                    inner.visit_type(&parse_quote!(Boom<U>))
-                })
-            }));
-            assert!(inner.is_err());
-            // The scope that the panic left is not the one that is open any more.
-            view.visit_type(&parse_quote!(Rel2<T>));
-        })
-    }));
-    assert!(outcome.is_err());
-    let result = leaker.result();
-    assert!(result.errors().is_empty());
-    assert!(result.into_referrer().is_empty());
-}
-
-#[test]
 fn a_rule_that_panics_is_a_panic_of_the_closure() {
     let mut leaker = Leaker::from_config(Rules::new().or_if(boom), Options::new());
     let item: ItemStruct = parse_quote!(
@@ -728,6 +676,7 @@ fn asked_as(item: &ItemTrait, values: bool, nested: bool) -> Vec<String> {
             Cause::Trait(_) => "trait",
             Cause::Expr(_) => "expr",
             Cause::Macro(_) => "macro",
+            Cause::Unknown(_) => "unknown",
             other => panic!("{:?}", other),
         };
         let text = format!("{}({})", kind, cause.to_token_stream());
@@ -824,7 +773,7 @@ fn a_rule_for_one_kind_leaves_a_path_of_another_kind_leaked() {
 }
 
 #[test]
-fn a_path_of_unknown_kind_is_allowed_as_a_trait_or_as_a_type() {
+fn a_path_of_unknown_kind_is_asked_as_unknown_and_no_other_kind() {
     // The root of a `use` in a body is a path of unknown kind: a module, a type or a trait.
     let item: ItemTrait = parse_quote!(
         trait Tr {
@@ -835,27 +784,50 @@ fn a_path_of_unknown_kind_is_allowed_as_a_trait_or_as_a_type() {
     );
     let plain = analyze_trait(&item, Rules::new(), true);
     assert_eq!(plain.errors().len(), 1);
-    assert!(matches!(
-        plain.errors()[0].paths[..],
-        [Cause::Unreadable(_)]
-    ));
+    assert!(matches!(plain.errors()[0].paths[..], [Cause::Unknown(_)]));
+    // Each check asks once, as an unknown path, and not as a type and as a trait.
+    let seen = Rc::new(Seen::default());
+    let _ = analyze_trait(&item, Rules::new().or_if(seen.rule()), true);
+    let asked: Vec<Cause> = seen
+        .asked
+        .borrow()
+        .iter()
+        .map(|(cause, _)| cause.clone())
+        .filter(|cause| cause.starts_with(&parse_quote!(inner)))
+        .collect();
+    assert!(!asked.is_empty());
+    assert!(asked
+        .iter()
+        .all(|cause| *cause == Cause::Unknown(parse_quote!(inner))));
+    let only_unknown = |cause: &Cause, _: Place| {
+        matches!(cause, Cause::Unknown(_)) && cause.starts_with(&parse_quote!(inner))
+    };
+    // A rule for another kind does not match it.
     let only_traits = |cause: &Cause, _: Place| {
         matches!(cause, Cause::Trait(_)) && cause.starts_with(&parse_quote!(inner))
     };
     let only_types = |cause: &Cause, _: Place| {
         matches!(cause, Cause::Type(_)) && cause.starts_with(&parse_quote!(inner))
     };
-    // The error is about an expression path (`Cause::Expr`), its path has no known kind.
     let only_macros = |cause: &Cause, _: Place| {
         matches!(cause, Cause::Macro(_)) && cause.starts_with(&parse_quote!(inner))
     };
     // In the analysis.
-    assert!(analyze_trait(&item, Rules::new().or_if(only_traits), true)
+    assert!(analyze_trait(&item, Rules::new().or_if(only_unknown), true)
         .errors()
         .is_empty());
-    assert!(analyze_trait(&item, Rules::new().or_if(only_types), true)
-        .errors()
-        .is_empty());
+    assert_eq!(
+        analyze_trait(&item, Rules::new().or_if(only_traits), true)
+            .errors()
+            .len(),
+        1
+    );
+    assert_eq!(
+        analyze_trait(&item, Rules::new().or_if(only_types), true)
+            .errors()
+            .len(),
+        1
+    );
     assert_eq!(
         analyze_trait(&item, Rules::new().or_if(only_macros), true)
             .errors()
@@ -865,10 +837,54 @@ fn a_path_of_unknown_kind_is_allowed_as_a_trait_or_as_a_type() {
     // And on the result, also after a round trip through the serialization.
     let serialized: LeakerResult = parse2(plain.to_token_stream()).unwrap();
     for result in [plain.clone(), serialized] {
-        assert!(result.clone().allow(only_traits).errors().is_empty());
-        assert!(result.clone().allow(only_types).errors().is_empty());
+        assert!(result.clone().allow(only_unknown).errors().is_empty());
+        assert_eq!(result.clone().allow(only_traits).errors().len(), 1);
+        assert_eq!(result.clone().allow(only_types).errors().len(), 1);
         assert_eq!(result.allow(only_macros).errors().len(), 1);
     }
+}
+
+#[test]
+fn a_qualified_path_is_asked_as_its_trait_or_as_unknown_without_one() {
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(&self, a: <Rel as QualTr<u8>>::X, b: <Other>::Y);
+        }
+    );
+    let asked = asked_as(&item, false, false);
+    for expected in ["trait(QualTr)", "unknown(:: Y)"] {
+        assert!(
+            asked.iter().any(|a| a == expected),
+            "{}: {:?}",
+            expected,
+            asked
+        );
+    }
+    for unexpected in ["type(:: Y)", "trait(:: Y)", "unknown(QualTr)", "unknown(X)"] {
+        assert!(
+            !asked.iter().any(|a| a == unexpected),
+            "{}: {:?}",
+            unexpected,
+            asked
+        );
+    }
+}
+
+#[test]
+fn the_built_in_rules_allow_a_path_of_unknown_kind_by_its_head() {
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(&self) {
+                use core::mem;
+                use inner::Thing;
+            }
+        }
+    );
+    // `std_crates()` allows the root `core`, and the error of `inner` stays.
+    let result = analyze_trait(&item, Rules::new().std_crates(), true);
+    assert_eq!(result.errors().len(), 1);
+    assert!(matches!(result.errors()[0].paths[..], [Cause::Unknown(_)]));
+    assert!(result.errors()[0].paths[0].starts_with(&parse_quote!(inner)));
 }
 
 // ── the built-in rules ───────────────────────────────────────────────────────────────────────
