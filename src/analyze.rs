@@ -3,7 +3,7 @@
 use crate::analysis::{
     adopt, ambiguous_types, anchor_parts, as_written, block_optional, correct_effects,
     correct_unmeant_self, each_pending, each_pending_mut, error_effects, has_error,
-    has_optional_candidate, kept_lifetimes, names_self, optional_keys, part_names_self,
+    has_optional_candidate, input_type, kept_lifetimes, names_self, optional_keys, part_names_self,
     primitive_effects, primitive_names, scan_anchors, scan_inputs, scope_errors, shift_seen,
     unconstrained_in_output, Anchoring, CheckResult, Effect, Lifetimes, Origin, OutputUse, Part,
     PendingType, SelfMention, SignatureFacts, SignatureMark,
@@ -11,7 +11,7 @@ use crate::analysis::{
 use crate::context::{
     Context, ContextId, Contexts, Enclosing, Gat, Scope, SelfRequirement, UnnameableSelf,
 };
-use crate::elided::{input_type, Elision};
+use crate::elided::Elision;
 use crate::error::{report, Cause, ErrorItem, Reason, SELF_HELP, SELF_NOTE};
 #[cfg(doc)]
 use crate::leaker::Leaker;
@@ -275,6 +275,13 @@ impl ScopeSpec {
         self.declares
             .as_ref()
             .map(|declared| declared.requirement.clone())
+    }
+
+    /// The top-level context of the scope, with `scope_self` for `Self` and its `gats`.
+    pub(crate) fn top_level(&self, scope_self: Option<SelfRequirement>, gats: Vec<Gat>) -> Context {
+        Context::new(self.generics.clone(), scope_self)
+            .with_gats(gats)
+            .with_declared(self.generics.clone())
     }
 }
 
@@ -572,9 +579,9 @@ struct AloneDefaults {
     declared: Option<(SelfRequirement, Generics)>,
 }
 
-/// What [`AnalyzeVisitor::check()`] puts back as it found it. The visit replaces the frame of the
-/// scope, and appends to the causes and, for an expression with an item, to the contexts. `walk`
-/// is the state that only a visit in progress changes, which a panic would leave half-way.
+/// What [`AnalyzeVisitor::check()`] and the probe of a binder put back as they found it: the frame
+/// of the scope, which the visit replaces, and the causes. `walk` is the state that only a visit in
+/// progress changes, which a panic would leave half-way.
 struct Checkpoint {
     /// The marks of the scope.
     mark: ScopeMark,
@@ -1284,10 +1291,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 .map_or_else(Vec::new, |scope| scope.gats().to_vec())
         });
         self.leave_scope(&mark);
-        let declared = spec.generics.clone();
-        let context = Context::new(declared.clone(), scope_self)
-            .with_gats(scope_gats)
-            .with_declared(declared);
+        let context = spec.top_level(scope_self, scope_gats);
         let top_level = self.records.contexts.intern(context);
         self.records.top_levels.push(top_level);
         top_level
@@ -1602,7 +1606,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     None => self.frame.effects.extend(effects),
                 }
             }
-            None => self.pending_for_parts(ty, depth, optional, has_must, &inner, effects),
+            None => {
+                self.pending_for_parts(ty, depth, optional.is_some(), has_must, &inner, effects)
+            }
         }
     }
 
@@ -1830,13 +1836,13 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             }
             if projection {
                 self.not_optional_in_bounds(&context);
+                if let Some(impl_context) = self.impl_context() {
+                    self.not_optional_in_bounds(&impl_context);
+                }
             } else {
                 for context in self.self_type_entries(&context, true, blockable) {
                     self.not_optional_in_bounds(&context);
                 }
-            }
-            if let Some(impl_context) = self.impl_context(projection) {
-                self.not_optional_in_bounds(&impl_context);
             }
         }
         if !projection {
@@ -1891,7 +1897,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         &mut self,
         ty: &Type,
         depth: usize,
-        optional: Option<Context>,
+        optional: bool,
         has_must: bool,
         inner: &Frame,
         effects: Vec<Effect>,
@@ -1920,7 +1926,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             }
             self.not_optional_in_bounds(&context);
         }
-        let optional_candidate = optional.is_some() || has_optional_candidate(&effects);
+        let optional_candidate = optional || has_optional_candidate(&effects);
         // A type that names a nested `Self` is no entry for its parts either: `Self` in it is the
         // copy's own (`SelfScope::nested`).
         let nested_self = self.names_nested_self(ty, &context);
@@ -1937,7 +1943,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         }
         let pending = PendingType {
             required_candidate,
-            optional: optional.is_some(),
+            optional,
             optional_candidate,
             no_required_entry,
             no_optional_entry,
@@ -2179,10 +2185,11 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         let projection = is_self_projection(ty);
         let (unstable, owner) = match self.env_unstable_bound(context, false) {
             Some(unstable) => (unstable, "its generics"),
-            None => {
-                let impl_context = self.impl_context(projection)?;
+            None if projection => {
+                let impl_context = self.impl_context()?;
                 (self.env_unstable_bound(&impl_context, false)?, "the impl")
             }
+            None => return None,
         };
         let why = match (&unstable.why, projection) {
             (Instability::Leaked, true) => format!(
@@ -2219,10 +2226,10 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         Some(unstable_error(ty, &unstable, why))
     }
 
-    /// Returns the generics of the impl that declares `Self`, if `Self::A` (`projection`) is in
-    /// one of its predicates, as a context.
-    fn impl_context(&self, projection: bool) -> Option<Context> {
-        if !projection || !self.self_scope.written || self.self_scope.depth == 0 {
+    /// Returns the generics of the impl that declares `Self`, for a `Self::A` in one of its
+    /// predicates, as a context.
+    fn impl_context(&self) -> Option<Context> {
+        if !self.self_scope.written || self.self_scope.depth == 0 {
             return None;
         }
         let scope = self.scopes.get(self.self_scope.depth - 1)?;
@@ -2472,9 +2479,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             self.params(),
             self.scopes.iter().flat_map(Scope::predicates),
         );
-        if all || found.is_empty() {
-            found.extend(hidden_projection(generics, &equated));
-        }
+        found.extend(hidden_projection(generics, &equated));
         found
     }
 
@@ -3164,18 +3169,13 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         lifetimes: &BoundLifetimes,
         f: &impl Fn(&mut Self),
     ) -> HashSet<usize> {
-        let frame = self.new_frame();
-        let (musts, impossibles) = (self.musts.len(), self.impossibles.len());
-        let records = self.records.mark();
+        let checkpoint = self.checkpoint();
         self.position.binder_probe = Some(HashSet::new());
         self.with_scope(Scope::binder(lifetimes), |v| f(v));
-        self.frame = frame;
-        self.musts.truncate(musts);
-        self.truncate_impossibles(impossibles);
-        // The contexts too: what the probe interned the walk interns again, with the numbers that
-        // come next then, as if there was no probe.
-        self.records.truncate(&records);
-        self.position.binder_probe.take().unwrap_or_default()
+        let leaked = self.position.binder_probe.take().unwrap_or_default();
+        // The records too, which the walk makes again.
+        self.restore(checkpoint);
+        leaked
     }
 
     fn binder_uses(&self, groups: Vec<BinderGroup>) -> Vec<OutputUse> {
@@ -3222,7 +3222,10 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     }
 
     fn names_external_crate_in_expr(&self, expr: &Expr) -> bool {
-        let mut finder = AnyPath::new(|path| self.is_optional_path(&Cause::Unknown(path.clone())));
+        let mut finder = AnyPath {
+            pred: |path: &Path| self.is_optional_path(&Cause::Unknown(path.clone())),
+            found: false,
+        };
         finder.visit_expr(expr);
         finder.found
     }
@@ -3343,8 +3346,8 @@ impl<A: Allow> Anchoring for AnalyzeVisitor<'_, A> {
     }
 }
 
-/// What a [`View`] asks of the analysis it wraps, and the visit of a path. The view forwards the
-/// `visit_*` methods the analysis overrides to it.
+/// What a [`View`] asks of the analysis it wraps, the visit of a path, and the helpers of the
+/// `Visit` impl below. The view forwards the `visit_*` methods the analysis overrides to it.
 impl<A: Allow> AnalyzeVisitor<'_, A> {
     /// Checks `ty` where the visitor is, as [`View::check()`] does. Nothing stays recorded, also
     /// if the visit panics, which goes on ([`Checkpoint`]).
@@ -3618,10 +3621,12 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
     }
 
     fn visit_trait_item_const(&mut self, i: &TraitItemConst) {
-        let mut stripped = i.clone();
-        stripped.default = None;
         self.with_local_generics(&i.generics, |visitor| {
-            syn::visit::visit_trait_item_const(visitor, &stripped);
+            for attr in &i.attrs {
+                visitor.visit_attribute(attr);
+            }
+            visitor.visit_generics(&i.generics);
+            visitor.visit_type(&i.ty);
             if let Some((_, expr)) = &i.default {
                 visitor.check_value(&i.ident, true, expr);
             }
@@ -4231,12 +4236,6 @@ struct AnyPath<F> {
     found: bool,
 }
 
-impl<F: Fn(&Path) -> bool> AnyPath<F> {
-    fn new(pred: F) -> Self {
-        Self { pred, found: false }
-    }
-}
-
 impl<'ast, F: Fn(&Path) -> bool> Visit<'ast> for AnyPath<F> {
     fn visit_path(&mut self, i: &'ast Path) {
         self.found |= (self.pred)(i);
@@ -4447,8 +4446,8 @@ fn cut_conflicts(
             }
         };
         if let Some(mut error) = self_type_conflict(&pending, declared) {
-            let whole = is_whole_reference(&pending.ty);
-            if pending.required_candidate && (pending.required || whole) {
+            let whole_reference = is_whole_reference(&pending.ty);
+            if pending.required_candidate && (pending.required || whole_reference) {
                 // The type is copied as written instead.
                 let part = pending.part();
                 let whole = part.whole;
@@ -4468,7 +4467,7 @@ fn cut_conflicts(
             }
             pending.no_required_entry |= pending.required_candidate;
             pending.no_optional_entry |= pending.optional_candidate;
-            if pending.optional_candidate && whole {
+            if pending.optional_candidate && whole_reference {
                 // The optional entries under a reference cannot stand for it either.
                 not_optional.extend(optional_keys(&pending.components));
             }
@@ -5122,11 +5121,16 @@ fn is_bare_ident(ty: &Type) -> bool {
 // turbofish, qualified self type) is leaked as any type of the item, unless it names what the
 // value declares or is in a macro or a block item (`reads`). What the walk cannot read (macro
 // arguments that are no expressions, `macro_rules!`, a glob `use`, unparsed syntax) is rejected.
+// None of this is done in a type (an array length): there the value of a nested item is part of
+// the type, which the visitor reads like the rest of the length, whatever `check_values` says.
 
 impl<'r, A: Allow> AnalyzeVisitor<'r, A> {
     /// Checks the value `expr` of the const or static `name`, if values are read. `default`: it is
     /// the default of an associated const of a trait.
     fn check_value(&mut self, name: &Ident, default: bool, expr: &Expr) {
+        if self.position.type_depth > 0 {
+            return self.visit_expr(expr);
+        }
         self.read_value("value", name, default, |walk| walk.visit_expr(expr));
     }
 
@@ -5134,12 +5138,18 @@ impl<'r, A: Allow> AnalyzeVisitor<'r, A> {
     /// parameter default. `what` says where it is, as the notes do. `in_value` is not set: it marks
     /// only the values that `check_values` reads.
     fn read_expr(&mut self, what: String, expr: &Expr) {
+        if self.position.type_depth > 0 {
+            return self.visit_expr(expr);
+        }
         ValueWalk::new(self, what).visit_expr(expr);
     }
 
     /// Checks the body `block` of the function `sig`, if values are read. `default`: it is the
     /// default body of a method of a trait. The generics of `sig` are in scope.
     fn check_body(&mut self, sig: &Signature, block: &Block, default: bool) {
+        if self.position.type_depth > 0 {
+            return self.visit_block(block);
+        }
         self.read_value("body", &sig.ident, default, |walk| {
             for input in &sig.inputs {
                 if let FnArg::Typed(arg) = input {
@@ -5260,12 +5270,11 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
             None => return false,
         };
         let name = ident_name(&first.ident);
-        self.scopes.iter().any(|scope| scope.items.contains(&name))
-            || (path.segments.len() == 1
-                && first.arguments.is_none()
-                && self.scopes[self.barrier..]
-                    .iter()
-                    .any(|scope| scope.bindings.contains(&name)))
+        if path.segments.len() == 1 && first.arguments.is_none() {
+            self.declares(&name)
+        } else {
+            self.scopes.iter().any(|scope| scope.items.contains(&name))
+        }
     }
 
     /// Returns `true` if the path of `cause` means the same wherever the value is written: it
@@ -5369,10 +5378,7 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
         };
         scan.visit_type(ty);
         let (declared, unreadable) = (scan.declared, scan.unreadable);
-        // A value inside a type (the length of an array) is part of that type, which is leaked
-        // whole or not at all: its types are not entries of their own.
-        let inside_type = self.visitor.position.type_depth > 0;
-        if declared.is_none() && !unreadable && !inside_type {
+        if declared.is_none() && !unreadable {
             return self.leak(ty);
         }
         let outer = std::mem::replace(&mut self.declared_name, declared);

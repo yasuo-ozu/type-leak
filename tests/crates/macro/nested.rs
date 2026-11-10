@@ -244,9 +244,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         nested,
         path,
     } = parse2(input)?;
-    let referrer = result
-        .finish()
-        .map_err(|errors| crate::to_syn_error(&errors))?;
+    let referrer = result.finish().map_err(syn::Error::from)?;
     let id = nested.id;
     let krate = path
         .segments

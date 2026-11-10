@@ -8,9 +8,7 @@ use crate::context::{Context, ContextId, Contexts, Gat};
 use crate::error::ErrorItem;
 #[cfg(doc)]
 use crate::error::Reason;
-use crate::graph::{sorted_entries, NodeKey, TypeGraph, TypeKey};
-#[cfg(doc)]
-use crate::referrer::EntryId;
+use crate::graph::{NodeKey, TypeGraph, TypeKey};
 use crate::referrer::Referrer;
 use crate::result::{filter, Allow, LeakerResult};
 use crate::util::push_once;
@@ -376,8 +374,7 @@ impl<A: Allow> Leaker<A> {
         let (required, optional) = if types.is_reduced() {
             types.into_kept_entries()
         } else {
-            let (required, optional) = types.reduce();
-            (sorted_entries(required), sorted_entries(optional))
+            types.reduce()
         };
         self.resolve_links(errors, required.iter().chain(&optional));
         let contexts = self.contexts;
@@ -495,7 +492,7 @@ impl<A: Allow> Scopes for Leaker<A> {
                 resume_unwind(payload)
             }
         };
-        let top_level = self.record(&spec, root, finished);
+        let top_level = self.record(&spec, finished);
         // The ids of the errors count from the first error of this call, also those dropped.
         for error in &mut errors {
             error.link.shift(self.found);
@@ -507,9 +504,8 @@ impl<A: Allow> Scopes for Leaker<A> {
 }
 
 impl<A: Allow> Leaker<A> {
-    /// Records what the outermost scope `spec` with the generics `root` found, and returns its
-    /// top-level context.
-    fn record(&mut self, spec: &ScopeSpec, root: Generics, finished: Finished) -> ContextId {
+    /// Records what the outermost scope `spec` found, and returns its top-level context.
+    fn record(&mut self, spec: &ScopeSpec, finished: Finished) -> ContextId {
         let Finished {
             mut effects,
             top_levels,
@@ -530,9 +526,7 @@ impl<A: Allow> Leaker<A> {
         let scope_self = spec
             .declared_self()
             .filter(|declared| names_self(&effects, declared));
-        let context = Context::new(root.clone(), scope_self)
-            .with_gats(spec.declared_gats())
-            .with_declared(root);
+        let context = spec.top_level(scope_self, spec.declared_gats());
         let top_level = self.contexts.intern(context);
         self.top_levels.insert(top_level);
         self.top_levels.extend(top_levels);

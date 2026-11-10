@@ -1,4 +1,5 @@
-//! Helpers for inspecting paths and types.
+//! Helpers for paths and types and the names and `Self` in them, the text of messages (`tidy()`,
+//! `or_list()`), the prelude and primitive names (`KNOWN_NAMES`), `ReplaceSelf` and `Sorted`.
 
 use crate::error::Cause;
 use proc_macro2::{Span, TokenStream};

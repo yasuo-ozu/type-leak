@@ -650,13 +650,12 @@ fn every_item_kind_is_leaked_across_crates() {
             __tl_report_9218!(),
             rejected("struct", "useabsolutepath:'RelPoint'"),
         ),
-        // F85: a relative constant in a value in the default of a type parameter is rejected with
-        // `check_values` (the Leaker did not read it, and the copy could not resolve `REL9250`).
-        (
-            9250,
-            __tl_report_9250!(),
-            rejected("struct", "useabsolutepath:'REL9250'"),
-        ),
+        // F85, F101: a relative constant in a value in the default of a type parameter is part of the
+        // type: the array is the entry (the Leaker did not read it, and the copy could not resolve
+        // `REL9250`).
+        (9250, __tl_report_9250!(), ok("struct", 1, 2, 2)),
+        // F101: the same in the length of an array in a field, without `check_values`.
+        (9264, __tl_report_9264!(), ok("struct", 1, 1, 1)),
         // F89: the argument of a generic associated type replaces its parameter in the relations of its
         // where clause, also when it is no path (`&'x u8`) and a generic of the method has the name.
         (9251, __tl_report_9251!(), ok("trait", 1, 2, 2)),
@@ -1450,7 +1449,7 @@ fn accepted_conflicts_are_copied_as_written() {
         [error(
             "RelativePath",
             "Type",
-            "ConstHolder<LEN95,[u8;{let_f=0;3}]>"
+            "ConstHolder<LEN95,[u8;{let_f=0;3}],>"
         )]
     );
 

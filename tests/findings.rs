@@ -185,7 +185,7 @@ fn intern<A: Allow>(leaker: &mut Leaker<A>, item: &Item) -> ContextId {
 fn analyze_in<A: Allow>(
     leaker: Leaker<A>,
     item: &Item,
-) -> std::result::Result<(ContextId, Referrer), Vec<ErrorItem>> {
+) -> std::result::Result<(ContextId, Referrer), LeakerResultError> {
     analyze_result_in(leaker, item).map(|(context, result)| (context, result.finish().unwrap()))
 }
 
@@ -193,14 +193,10 @@ fn analyze_in<A: Allow>(
 fn analyze_result_in<A: Allow>(
     mut leaker: Leaker<A>,
     item: &Item,
-) -> std::result::Result<(ContextId, LeakerResult), Vec<ErrorItem>> {
+) -> std::result::Result<(ContextId, LeakerResult), LeakerResultError> {
     let context = intern(&mut leaker, item);
     let result = leaker.result();
-    if result.errors().is_empty() {
-        Ok((context, result))
-    } else {
-        Err(result.errors().to_vec())
-    }
+    result.clone().finish().map(|_| (context, result))
 }
 
 /// The errors that remain after the analysis of `leaker`.
@@ -223,9 +219,9 @@ fn ty(ty: Type) -> String {
 /// A bug input has to be rejected. A loop that skips the rejected items (`let Ok(..) = .. else {
 /// continue }`) runs its oracle on none of them, and pins nothing: it would be the same if the
 /// rejection regressed, and the oracle runs for the items that are accepted only.
-fn assert_rejected<T>(
+fn assert_rejected<T, E: std::ops::Deref<Target = [ErrorItem]>>(
     item: &impl template_quote::ToTokens,
-    result: std::result::Result<T, Vec<ErrorItem>>,
+    result: std::result::Result<T, E>,
     messages: &[&str],
 ) -> Vec<ErrorItem> {
     let err = match result {
@@ -238,20 +234,23 @@ fn assert_rejected<T>(
         "`{}`",
         string(item)
     );
-    err
+    err.to_vec()
 }
 
 /// Asserts that the Leaker accepted `item`, and returns the value: the mirror of
 /// `assert_rejected()`. The panic has the messages and the notes of the errors.
-fn assert_accepted<T>(
+fn assert_accepted<T, E: std::ops::Deref<Target = [ErrorItem]>>(
     item: &impl template_quote::ToTokens,
-    result: std::result::Result<T, Vec<ErrorItem>>,
+    result: std::result::Result<T, E>,
 ) -> T {
     assert_accepted_as(&format!("`{}`", string(item)), result)
 }
 
 /// Like `assert_accepted()`, for a case that `what` names (the item, with its scope or option).
-fn assert_accepted_as<T>(what: &str, result: std::result::Result<T, Vec<ErrorItem>>) -> T {
+fn assert_accepted_as<T, E: std::ops::Deref<Target = [ErrorItem]>>(
+    what: &str,
+    result: std::result::Result<T, E>,
+) -> T {
     result.unwrap_or_else(|err| {
         panic!(
             "{} is rejected, and it compiles: {}\n{}",
@@ -332,9 +331,9 @@ enum Blames<'a> {
 /// copy cannot prove. The error has the headline, and the one note, that say what the bound
 /// `blames` (`env_cycle()` and `self_env_cycle()` of `src/analyze/predicates.rs`). `ty` is `Self`
 /// for the self type of an impl.
-fn assert_unstable<T>(
+fn assert_unstable<T, E: std::ops::Deref<Target = [ErrorItem]>>(
     item: &impl template_quote::ToTokens,
-    result: std::result::Result<T, Vec<ErrorItem>>,
+    result: std::result::Result<T, E>,
     ty: &str,
     bound: &str,
     blames: Blames,
@@ -1587,7 +1586,7 @@ impl<'ast> Visit<'ast> for Signatures {
 
 /// The entries of `item` and its copy, made as a macro does: each entry is replaced by the
 /// projection of the Repeater, with the arguments of the entry encoded by the const slots.
-fn f12_copy(item: &ItemTrait) -> std::result::Result<(Vec<String>, ItemTrait), Vec<ErrorItem>> {
+fn f12_copy(item: &ItemTrait) -> std::result::Result<(Vec<String>, ItemTrait), LeakerResultError> {
     f12_copy_with(new_leaker(), item)
 }
 
@@ -1595,7 +1594,7 @@ fn f12_copy(item: &ItemTrait) -> std::result::Result<(Vec<String>, ItemTrait), V
 fn f12_copy_with<A: Allow>(
     mut leaker: Leaker<A>,
     item: &ItemTrait,
-) -> std::result::Result<(Vec<String>, ItemTrait), Vec<ErrorItem>> {
+) -> std::result::Result<(Vec<String>, ItemTrait), LeakerResultError> {
     let context = leaker.intern_trait(item);
     let referrer = leaker.result().finish()?;
     let mut copy = item.clone();
@@ -2124,7 +2123,7 @@ impl<'ast> Visit<'ast> for SelfProjectionsInPredicates {
 
 /// The copy of `item` that a macro makes (the entries replaced by `P<ix>`), if the Leaker accepts
 /// `item`.
-fn f14_copy(item: &ItemImpl) -> std::result::Result<ItemImpl, Vec<ErrorItem>> {
+fn f14_copy(item: &ItemImpl) -> std::result::Result<ItemImpl, LeakerResultError> {
     let mut leaker = f13_leaker();
     let context = leaker.intern_impl(item);
     let referrer = leaker.result().finish()?;
@@ -2283,7 +2282,7 @@ fn f14_impl_predicate_names_self_projection_with_leaked_bound() {
 /// The copy of a struct, an enum or a union that a macro makes with `Referrer::visitor(..)
 /// .with_self(self_ty)`, where `self_ty` is the type as the Leaker's crate names it
 /// (`::p::S<'a, T>`), and the entries of the item. Each entry is replaced by `P<ix>`.
-fn f15_copy(item: &Item) -> std::result::Result<(Vec<String>, Item), Vec<ErrorItem>> {
+fn f15_copy(item: &Item) -> std::result::Result<(Vec<String>, Item), LeakerResultError> {
     let (ident, generics) = match item {
         Item::Struct(i) => (&i.ident, &i.generics),
         Item::Enum(i) => (&i.ident, &i.generics),
@@ -3172,7 +3171,7 @@ impl<'ast> Visit<'ast> for ReplacementsInPredicates {
 }
 
 /// The copy of `item` that a macro makes: the entries replaced by `P<ix>`.
-fn f19_copy(item: &Item) -> std::result::Result<(Referrer, Item), Vec<ErrorItem>> {
+fn f19_copy(item: &Item) -> std::result::Result<(Referrer, Item), LeakerResultError> {
     f19_copy_with(new_leaker(), item)
 }
 
@@ -3181,7 +3180,7 @@ fn f19_copy(item: &Item) -> std::result::Result<(Referrer, Item), Vec<ErrorItem>
 fn f19_copy_with<A: Allow>(
     leaker: Leaker<A>,
     item: &Item,
-) -> std::result::Result<(Referrer, Item), Vec<ErrorItem>> {
+) -> std::result::Result<(Referrer, Item), LeakerResultError> {
     f19_result_with(leaker, item).map(|(_, referrer, copy)| (referrer, copy))
 }
 
@@ -3189,7 +3188,7 @@ fn f19_copy_with<A: Allow>(
 fn f19_result_with<A: Allow>(
     mut leaker: Leaker<A>,
     item: &Item,
-) -> std::result::Result<(LeakerResult, Referrer, Item), Vec<ErrorItem>> {
+) -> std::result::Result<(LeakerResult, Referrer, Item), LeakerResultError> {
     let context = intern(&mut leaker, item);
     let result = leaker.result();
     let referrer = result.clone().finish()?;
@@ -3346,7 +3345,8 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
     ];
     assert_eq!(items.len(), blamed.len());
     for (item, (ty, bound, blames, inside)) in items.iter().zip(blamed) {
-        let result = f19_copy(item).map_err(|mut errors| {
+        let result = f19_copy(item).map_err(|errors| {
+            let mut errors = errors.into_vec();
             let rest = errors.split_off(1);
             let expected: Vec<String> = inside
                 .iter()
@@ -3638,7 +3638,7 @@ fn f21_iterator_item_in_bound_of_entry_in_item_binding() {
     let check = |item: &Item| {
         let (referrer, copy) = f19_copy(item)?;
         let found = entries_naming_item(&referrer, &copy);
-        Ok::<_, Vec<ErrorItem>>((copy, found))
+        Ok::<_, LeakerResultError>((copy, found))
     };
     // Each is rejected: no copy of it exists whose predicate names such an entry.
     let blamed = [
@@ -4072,7 +4072,7 @@ fn f24_self_in_predicate_with_leaked_bound_of_unused_generic() {
 /// names an `Item` (the oracle of F21).
 fn entries_naming_item_in_predicates(
     item: &Item,
-) -> std::result::Result<(Referrer, Item, Vec<String>), Vec<ErrorItem>> {
+) -> std::result::Result<(Referrer, Item, Vec<String>), LeakerResultError> {
     let (referrer, copy) = f19_copy_with(f13_leaker(), item)?;
     let found = entries_naming_item(&referrer, &copy);
     Ok((referrer, copy, found))
@@ -16558,6 +16558,9 @@ fn f84_a_predicate_on_a_generic_in_parentheses_or_a_group_is_a_bound_of_it() {
 /// array length (`{ const C: usize = 3; let _v: Option<_> = None::<u8>; C }`) is a relative path
 /// for the visitor of a type, with or without `check_values`, in a field as in a default; it is an
 /// error only where the type cannot be an entry (`_`).
+///
+/// F101 changed what the test sees: a value in an array length is part of the type, so the array
+/// is the entry with `check_values` or not, in a default as in a field, and there is no error.
 #[test]
 fn f85_the_values_in_the_default_of_a_type_parameter_are_read_with_check_values() {
     let default: Type = parse_quote!(
@@ -16603,27 +16606,27 @@ fn f85_the_values_in_the_default_of_a_type_parameter_are_read_with_check_values(
     };
     let config = || Rules::new().primitive().prelude();
     for (name, item) in &items {
-        let in_default = *name != "field";
-        // Read: the error is in a value, and in a default for the parameters.
-        assert_eq!(
-            found(item, true, config()),
-            (vec![("rel :: N".to_string(), true, in_default)], 0),
-            "{}",
-            name
-        );
-        // Not read: the value is not looked at.
-        assert_eq!(found(item, false, config()), (vec![], 0), "{}", name);
-        // A rule that allows the values accepts it, as the rule is asked at a value.
+        // The array is the entry whatever `check_values` says (F101), and a rule that allows the
+        // values does not change it: the path is not in a value that the check reads.
+        for check_values in [true, false] {
+            assert_eq!(
+                found(item, check_values, config()),
+                (vec![], 1),
+                "{}, check_values {}",
+                name,
+                check_values
+            );
+        }
         assert_eq!(
             found(item, true, config().values()),
-            (vec![], 0),
+            (vec![], 1),
             "{}",
             name
         );
     }
     // `enter_generics()` for the generics of an item that a macro analyzes itself.
     let generics: Generics = parse_quote!(<T = #default>);
-    for (check_values, expected) in [(false, vec![]), (true, vec!["rel :: N".to_string()])] {
+    for (check_values, expected) in [(false, Vec::<String>::new()), (true, vec![])] {
         let mut leaker = Leaker::with_rule(config());
         leaker.check_values = check_values;
         leaker.enter_generics(&generics, |_| {});
@@ -17942,4 +17945,485 @@ fn f94_with_self_checks_only_the_entries_of_the_visited_self() {
     });
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(refused(&referrer, scope, &bare), None);
+}
+
+// ── F101 ─────────────────────────────────────────────────────────────────────
+
+/// F101 (fixed): an item in a block in an array length is part of the type, whatever
+/// `Leaker::check_values` says.
+///
+/// Trigger: `struct S<T>([Rel<T>; { const X: usize = rel::N; 3 }])`. The block of
+/// `[Rel<T>; { let _x = rel::N; 3 }]` is read with the type, so the whole array is the entry. The
+/// value of a nested item is a "value": with `check_values` off it was not read, so `Rel<T>` alone
+/// was the entry and the copy wrote `rel::N` unresolved in the Referrer's crate (E0425); with it on
+/// it was the error `RelativePath`, though leaking the array whole, as the `let` does, is right.
+/// The same for a `static`, a `fn`, the default of an associated const or a method of a nested
+/// trait, an enum discriminant and the default of a const parameter of a nested item.
+///
+/// Cause: `check_value()`, `check_body()` and `read_expr()` read a value with the walk of a value,
+/// which needs `check_values` (or reads it always, for a discriminant and a const default), and
+/// rejects the relative paths it finds. A type that holds one cannot be rewritten, so what is
+/// right for the type is to be an entry whole.
+///
+/// Fix: in a type (`type_depth > 0`) the visitor reads the value or the body as it reads the rest
+/// of the length. Outside a type `check_values` keeps its meaning (the second part of the test).
+///
+/// Limits: a name that the block declares is a relative path there, as for the `let` (`{ const X:
+/// usize = 3; let _y = X; 3 }` leaks the array whole); a closure, an assignment or a macro in a
+/// nested body is an impossible expression of the type, as in a `let`, so with a relative path
+/// it is an error. Cross-crate fixture 9264 (and 9250 for the default of a type parameter): the
+/// Referrer's crate did not build before the fix.
+#[test]
+fn f101_a_value_in_a_block_in_an_array_length_is_part_of_the_type() {
+    let found = |check_values: bool, array: &Type| {
+        let item: Item = parse_quote!(struct S<T>(#array););
+        let mut leaker = Leaker::with_rule(Rules::new().primitive());
+        leaker.check_values = check_values;
+        intern(&mut leaker, &item);
+        let result = leaker.result();
+        let errors: Vec<(Reason, String)> = (result.errors().iter())
+            .map(|error| (error.reason, string(&error.cause)))
+            .collect();
+        (errors, entries_text(&result.recovered(), false))
+    };
+    let whole = |array: &Type| vec![string(array).replace(' ', "")];
+    // The blocks that name `rel::N` in a value: the leaked array is the same as for the `let`.
+    let blocks: Vec<(&str, Block)> = vec![
+        (
+            "let",
+            parse_quote!({
+                let _x = rel::N;
+                3
+            }),
+        ),
+        (
+            "const",
+            parse_quote!({
+                const X: usize = rel::N;
+                3
+            }),
+        ),
+        (
+            "static",
+            parse_quote!({
+                static X: usize = rel::N;
+                3
+            }),
+        ),
+        (
+            "fn",
+            parse_quote!({
+                fn f() -> usize {
+                    rel::N
+                }
+                3
+            }),
+        ),
+        (
+            "fn with a parameter and a generic",
+            parse_quote!({
+                fn f<U>(a: U) -> usize {
+                    rel::g(a)
+                }
+                3
+            }),
+        ),
+        (
+            "default of an associated const and of a method",
+            parse_quote!({
+                trait Z {
+                    const A: usize = rel::N;
+                    fn f() -> usize {
+                        rel::N
+                    }
+                }
+                3
+            }),
+        ),
+        (
+            "inherent impl (control: `Z` made it whole)",
+            parse_quote!({
+                struct Z;
+                impl Z {
+                    const A: usize = rel::N;
+                }
+                3
+            }),
+        ),
+        (
+            "discriminant",
+            parse_quote!({
+                enum E {
+                    A = rel::N,
+                }
+                3
+            }),
+        ),
+        (
+            "default of a const parameter",
+            parse_quote!({
+                struct Z<const N: usize = { rel::N }>;
+                3
+            }),
+        ),
+        (
+            "cast to a relative type",
+            parse_quote!({
+                const X: usize = 1u8 as Alias;
+                3
+            }),
+        ),
+        (
+            "names that the block declares",
+            parse_quote!({
+                const X: usize = 3;
+                const Y: usize = X;
+                3
+            }),
+        ),
+    ];
+    let absolute: Vec<Block> = vec![
+        parse_quote!({
+            const X: usize = ::core::mem::size_of::<u8>();
+            3
+        }),
+        parse_quote!({
+            fn f() -> usize {
+                ::core::mem::size_of::<T>()
+            }
+            3
+        }),
+        parse_quote!({
+            fn f() -> usize {
+                ::core::unimplemented!()
+            }
+            3
+        }),
+    ];
+    let closures: Vec<Block> = vec![
+        parse_quote!({
+            let c = |a: u8| a;
+            3
+        }),
+        parse_quote!({
+            fn f() -> usize {
+                let c = || 1;
+                c()
+            }
+            3
+        }),
+    ];
+    for check_values in [false, true] {
+        for (name, block) in &blocks {
+            let array: Type = parse_quote!([Rel<T>; #block]);
+            assert_eq!(
+                found(check_values, &array),
+                (vec![], whole(&array)),
+                "{}, check_values {}",
+                name,
+                check_values
+            );
+        }
+        // The values that name nothing relative leave `Rel<T>` alone the entry.
+        for block in &absolute {
+            let array: Type = parse_quote!([Rel<T>; #block]);
+            assert_eq!(
+                found(check_values, &array),
+                (vec![], vec!["Rel<T>".to_string()]),
+                "{}, check_values {}",
+                string(block),
+                check_values
+            );
+        }
+        // A closure in a nested body cannot be copied by the entry, as in a `let`.
+        for block in &closures {
+            let array: Type = parse_quote!([Rel<T>; #block]);
+            let (errors, _) = found(check_values, &array);
+            assert_eq!(errors.len(), 1, "{}", string(block));
+            assert_eq!(errors[0].0, Reason::RelativePath, "{}", string(block));
+        }
+    }
+
+    // Outside a type `check_values` keeps its meaning: the default of an associated const and a
+    // default method of a trait, and the value and the body of a `const` and a `fn` that a View
+    // visits, are read with it (the error is in a value) and not without it.
+    let trait_item: Item = parse_quote!(
+        trait Tr {
+            const A: usize = rel::N;
+            fn f(&self) -> usize {
+                rel::N
+            }
+        }
+    );
+    let items: Vec<(&str, Item, usize)> = vec![
+        ("trait", trait_item, 2),
+        (
+            "const",
+            parse_quote!(
+                const X: usize = rel::N;
+            ),
+            1,
+        ),
+        (
+            "static",
+            parse_quote!(
+                static X: usize = rel::N;
+            ),
+            1,
+        ),
+        (
+            "fn",
+            parse_quote!(
+                fn f() -> usize {
+                    rel::N
+                }
+            ),
+            1,
+        ),
+    ];
+    for (name, item, count) in &items {
+        for check_values in [false, true] {
+            let mut leaker = Leaker::with_rule(Rules::new().primitive());
+            leaker.check_values = check_values;
+            match item {
+                Item::Trait(item) => {
+                    leaker.intern_trait(item);
+                }
+                _ => {
+                    leaker.enter_generics(&Generics::default(), |view| view.visit_item(item));
+                }
+            }
+            let result = leaker.result();
+            let errors: Vec<(Reason, String, bool)> = (result.errors().iter())
+                .map(|error| (error.reason, string(&error.cause), error.place.in_value))
+                .collect();
+            let expected = if check_values {
+                vec![(Reason::RelativePath, "rel :: N".to_string(), true); *count]
+            } else {
+                vec![]
+            };
+            assert_eq!(errors, expected, "{}, check_values {}", name, check_values);
+            assert_eq!(result.recovered().iter().count(), 0, "{}", name);
+        }
+    }
+}
+
+// ── F96 ──────────────────────────────────────────────────────────────────────
+
+/// F96 (fixed): a const argument that starts a statement or a match arm was written as a block that
+/// is the left operand of an operator, a cast, a call or a method call (`{ 3 + 0 } * 2`), which
+/// rustc reads as a statement that ends at the block (E0308, E0614).
+///
+/// Trigger: `complete_args()` for `trait Tr<const N: usize>` with `{ 3 + 0 }` (or `3`), then
+/// `Substitute` over `impl Tr<{ 3 + 0 }> for Host { fn len(&self) -> usize { N * 2 } }`. The tree
+/// held `Binary(Block, *, 2)`; `syn` before 2.0.67 prints it without parentheses (`{ { 3 + 0 } * 2
+/// }`), later versions add them (they need rustc 1.60, above the MSRV of the library). The same
+/// for `N.pow(2)`, `N as u64`, and for `substitute_args()` on `{ N * 2 }`.
+///
+/// Cause: a const is written as the block `{ value }` wherever the name is an expression.
+///
+/// Fix: where the substitution writes a block as the leftmost operand of an expression that starts a
+/// statement or an arm (`SiteFold::fold_stmt()` and `fold_arm()`, and `Substitute::visit_stmt_mut()`
+/// for a statement that is visited itself), the block gets parentheses (`({ 3 + 0 }) * 2`). A block
+/// that was there stays, and so does every const in another place (`let x = { 3 } * 2;`,
+/// `[u8; { 3 }]`). An arm that is visited itself is not covered: the arms of a statement are. No
+/// fixture: the macros of the test crates write signatures only, where an expression is a
+/// type-level const, and the lockfile's `syn` adds the parentheses itself.
+#[test]
+fn f96_a_const_that_starts_a_statement_or_an_arm_is_written_in_parentheses() {
+    let generics: Generics = parse_quote!(<const N: usize>);
+    let given = f59_args(&["{ 3 + 0 }"]);
+    let impl_with = |body: &str| -> ItemImpl {
+        parse_str(&format!(
+            "impl Tr<{{ 3 + 0 }}> for Host {{ fn len(&self) -> usize {{ {} }} }}",
+            body
+        ))
+        .unwrap()
+    };
+    for (written, expected) in [
+        // The trigger, and the other forms that go on from the operand.
+        ("N * 2", "({ 3 + 0 }) * 2"),
+        ("N.pow(2)", "({ 3 + 0 }).pow(2)"),
+        ("N as usize", "({ 3 + 0 }) as usize"),
+        ("N + 1 + 2", "({ 3 + 0 }) + 1 + 2"),
+        ("N[0]", "({ 3 + 0 })[0]"),
+        ("N..5", "({ 3 + 0 })..5"),
+        ("N.0.pow(2)", "({ 3 + 0 }).0.pow(2)"),
+        ("N * 2; 0", "({ 3 + 0 }) * 2; 0"),
+        ("let x = 1; N * x", "let x = 1; ({ 3 + 0 }) * x"),
+        // In a match arm, and in the statements of a nested block.
+        (
+            "match 1 { _ => N * 2, _ => 0 }",
+            "match 1 { _ => ({ 3 + 0 }) * 2, _ => 0 }",
+        ),
+        (
+            "if true { N * 2 } else { 0 }",
+            "if true { ({ 3 + 0 }) * 2 } else { 0 }",
+        ),
+        (
+            "let f = || { N * 2 }; f()",
+            "let f = || { ({ 3 + 0 }) * 2 }; f()",
+        ),
+        // A const alone, or where an expression goes on from something else, is as before.
+        ("N", "{ 3 + 0 }"),
+        ("1 + N", "1 + { 3 + 0 }"),
+        ("let x = N * 2; x", "let x = { 3 + 0 } * 2; x"),
+        ("[0u8; N].len()", "[0u8; { 3 + 0 }].len()"),
+        ("(N).pow(2)", "({ 3 + 0 }).pow(2)"),
+        ("0 + N * 2", "0 + { 3 + 0 } * 2"),
+        // A block of the item stays as it is.
+        ("{ 1 }.pow(2)", "{ 1 }.pow(2)"),
+    ] {
+        let mut substitute = common::substitute_for(&generics, &given).unwrap();
+        let mut imp = impl_with(written);
+        substitute.visit_item_impl_mut(&mut imp);
+        assert_eq!(imp, impl_with(expected), "{}", written);
+    }
+
+    // The tree of the trigger: the left operand of the tail is no block.
+    let mut substitute = common::substitute_for(&generics, &given).unwrap();
+    let mut imp = impl_with("N * 2");
+    substitute.visit_item_impl_mut(&mut imp);
+    let tail = match &imp.items[0] {
+        ImplItem::Fn(method) => method.block.stmts.last().cloned(),
+        _ => None,
+    };
+    match tail {
+        Some(Stmt::Expr(Expr::Binary(binary), None)) => {
+            assert!(
+                matches!(&*binary.left, Expr::Paren(paren) if matches!(&*paren.expr, Expr::Block(_))),
+                "{}",
+                string(&imp)
+            );
+        }
+        other => panic!("not a binary tail: {:?}", other.as_ref().map(string)),
+    }
+
+    // A statement that is visited alone.
+    let mut substitute = common::substitute_for(&generics, &given).unwrap();
+    let mut stmt: Stmt = parse_quote!(N * 2;);
+    substitute.visit_stmt_mut(&mut stmt);
+    assert_eq!(stmt, parse_quote!(({ 3 + 0 }) * 2;));
+
+    // `substitute_args()` on a constant expression with a block: its statements.
+    for (written, expected) in [
+        ("{ N * 2 }", "{ ({ 3 }) * 2 }"),
+        ("{ N.pow(2) }", "{ ({ 3 }).pow(2) }"),
+        ("{ N as u64 }", "{ ({ 3 }) as u64 }"),
+        ("{ 1 + N }", "{ 1 + { 3 } }"),
+        ("{ N }", "{ 3 }"),
+    ] {
+        let mut args = f59_args(&[written]);
+        substitute_args(args.iter_mut(), |name: &Ident| {
+            (name == "N").then(|| parse_quote!(3))
+        })
+        .unwrap();
+        assert_eq!(args, f59_args(&[expected]), "{}", written);
+    }
+}
+
+// ── F97 ──────────────────────────────────────────────────────────────────────
+
+/// F97 (fixed): the head of a path in an expression was substituted only for `Self` and in the
+/// qualified form: `T::LEN` and `T::default()` kept the parameter, which the copy does not declare
+/// (E0433), where `<T>::LEN` was written.
+///
+/// Trigger: `complete_args()` for `trait Tr<K: Default>` with `u8`, then `Substitute` over
+/// `fn make(&self) -> K { let a: K = K::default(); a }`: `let a: u8 = K::default();`.
+/// `substitute_args()` on `{ T::LEN }` with `U` for `T` kept `T::LEN`.
+///
+/// Cause: `SiteFold::fold_expr()` wrote a path of an expression only when it started with `Self`
+/// (`T::f` is no type, so `fold_type()` does not see it).
+///
+/// Fix: any first segment of a path in an expression whose answer is a type is written `<value>::f`,
+/// which rustc accepts in an expression. An answer that is no type leaves the path as written and
+/// is no error (`a::f()` is a module path, and `a` may be the name of a lifetime), except for
+/// `Self`. No fixture: see F96.
+#[test]
+fn f97_the_head_of_a_path_in_an_expression_is_substituted() {
+    // The trigger.
+    let generics: Generics = parse_quote!(<K: ::core::default::Default>);
+    let given = f59_args(&["u8"]);
+    let impl_with = |body: &str| -> ItemImpl {
+        parse_str(&format!(
+            "impl Tr<u8> for Host {{ fn make(&self) -> u8 {{ {} }} }}",
+            body
+        ))
+        .unwrap()
+    };
+    for (written, expected) in [
+        (
+            "let a: K = K::default(); a",
+            "let a: u8 = <u8>::default(); a",
+        ),
+        // `<K>::f` and `Self::f` were written before.
+        ("<K>::default()", "<u8>::default()"),
+        ("Self::default()", "Self::default()"),
+        // The rest of the path, with arguments that name the parameter.
+        ("K::default::<K>()", "<u8>::default::<u8>()"),
+        ("K::A::B", "<u8>::A::B"),
+        ("[K::default(); K::LEN]", "[<u8>::default(); <u8>::LEN]"),
+        ("K::default().max(K::MIN)", "<u8>::default().max(<u8>::MIN)"),
+        // A path that is not headed by a parameter, or has arguments on its head, stays.
+        ("std::mem::drop(1)", "std::mem::drop(1)"),
+        ("Vec::<K>::new()", "Vec::<u8>::new()"),
+        ("::K::default()", "::K::default()"),
+        ("a::f()", "a::f()"),
+    ] {
+        let mut substitute = common::substitute_for(&generics, &given).unwrap();
+        let mut imp = impl_with(written);
+        substitute.visit_item_impl_mut(&mut imp);
+        assert_eq!(imp, impl_with(expected), "{}", written);
+    }
+
+    // The same for `substitute_args()`, with `Self`, and a module that has the name of a lifetime.
+    let site = |name: &Ident| -> Option<GenericArgument> {
+        match name.to_string().as_str() {
+            "T" => Some(parse_quote!(U)),
+            "V" => Some(parse_quote!(Vec<u8>)),
+            "N" => Some(parse_quote!(3)),
+            "Self" => Some(parse_quote!(Host)),
+            "a" => Some(parse_quote!('static)),
+            _ => None,
+        }
+    };
+    for (written, expected) in [
+        ("{ T::LEN }", "{ <U>::LEN }"),
+        ("{ <T>::LEN }", "{ <U>::LEN }"),
+        ("{ Self::LEN }", "{ <Host>::LEN }"),
+        ("[u8; T::LEN]", "[u8; <U>::LEN]"),
+        ("{ T::f::<T, N>() }", "{ <U>::f::<U, 3>() }"),
+        // A type that is not an identifier is written the same.
+        ("{ V::LEN }", "{ <Vec<u8>>::LEN }"),
+        ("{ m!(T::LEN) }", "{ m!(T::LEN) }"),
+        // A lifetime answer for `a` is no answer for the module `a`; nothing is an error.
+        ("{ a::f() }", "{ a::f() }"),
+        (
+            "{ std::mem::size_of::<T>() }",
+            "{ std::mem::size_of::<U>() }",
+        ),
+        ("{ crate::LEN }", "{ crate::LEN }"),
+    ] {
+        let mut args = f59_args(&[written]);
+        substitute_args(args.iter_mut(), site).unwrap();
+        assert_eq!(args, f59_args(&[expected]), "{}", written);
+    }
+
+    // A value that is no type for a head is not an error; for `Self` it is, as it was.
+    let mut args = f59_args(&["{ T::LEN }"]);
+    substitute_args(args.iter_mut(), |name: &Ident| {
+        (name == "T").then(|| parse_quote!(3))
+    })
+    .unwrap();
+    assert_eq!(args, f59_args(&["{ T::LEN }"]));
+    let mut args = f59_args(&["{ Self::LEN }"]);
+    let err = substitute_args(args.iter_mut(), |name: &Ident| {
+        (name == "Self").then(|| parse_quote!(3))
+    })
+    .unwrap_err();
+    assert!(
+        matches!(err, EncodeError::UnexpectedArgument(_)),
+        "{:?}",
+        err
+    );
 }

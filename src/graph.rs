@@ -1,4 +1,4 @@
-//! The graph of the types found by the analysis.
+//! The graph of the types found by the analysis, and its reduction to the entries (a minimum cut).
 
 use crate::context::ContextId;
 use crate::util::is_whole_reference;
@@ -218,18 +218,10 @@ impl TypeGraph {
         self.no_entry.extend(other.no_entry);
         self.kept.extend(other.kept);
     }
-}
 
-/// Sorts entries by context and tokens: the order of the Referrer's entries.
-pub(crate) fn sorted_entries(mut entries: Vec<NodeKey>) -> Vec<NodeKey> {
-    entries.sort_by_cached_key(|key| (key.context, key.ty.tokens()));
-    entries
-}
-
-impl TypeGraph {
     /// Min vertex cut from the roots to the red types, by max flow (Edmonds-Karp, node-split). Ties
     /// go to the cut closest to the sink, so inner types win. Returns the required entries and the
-    /// optional ones.
+    /// optional ones, each sorted ([`sorted_entries()`]).
     pub(crate) fn reduce(&self) -> (Vec<NodeKey>, Vec<NodeKey>) {
         let (keys, children, parents) = self.indexed();
         let n = keys.len();
@@ -258,13 +250,13 @@ impl TypeGraph {
             })
             .collect();
         // A red type must be cut. An optional type that cannot be an entry is not red, and its
-        // parts are. A kept entry is red whatever else the graph says of it.
+        // optional or required parts are. A kept entry is red whatever else the graph says of it.
         let red: Vec<bool> = (0..n)
             .map(|i| is_required[i] || is_kept[i] || (is_optional[i] && may_cut[i]))
             .collect();
         // A type that must be an entry cannot be forbidden to be one.
         let forbidden: Vec<bool> = (0..n)
-            .map(|i| !may_cut[i] && !red[i] && !needs_parent(keys[i]))
+            .map(|i| !may_cut[i] && !red[i] && !is_whole_reference(&keys[i].ty.ty))
             .collect();
         let mut has_red = red.clone();
         spread(&mut has_red, &parents);
@@ -281,7 +273,7 @@ impl TypeGraph {
         let mut to_sink = vec![false; n];
         for i in (0..n).filter(|&i| has_red[i] && !cut[i]) {
             to_sink[i] = red[i];
-            let whole = needs_parent(keys[i]);
+            let whole = is_whole_reference(&keys[i].ty.ty);
             for &child in children[i].iter().filter(|&&child| has_red[child]) {
                 if whole {
                     // The parent is interned as a whole, like a required type.
@@ -307,7 +299,7 @@ impl TypeGraph {
 
         let entries = |kind: bool| {
             let found = chosen.iter().filter(|&&i| covers_required[i] == kind);
-            found.map(|&i| keys[i].clone()).collect()
+            sorted_entries(found.map(|&i| keys[i].clone()).collect())
         };
         (entries(true), entries(false))
     }
@@ -334,6 +326,12 @@ impl TypeGraph {
         }
         (keys, children, parents)
     }
+}
+
+/// Sorts entries by context and tokens: the order of the Referrer's entries.
+fn sorted_entries(mut entries: Vec<NodeKey>) -> Vec<NodeKey> {
+    entries.sort_by_cached_key(|key| (key.context, key.ty.tokens()));
+    entries
 }
 
 /// The flow network of [`TypeGraph::reduce()`], by the indices of the types.
@@ -414,11 +412,6 @@ fn spread(marked: &mut [bool], edges: &[Vec<usize>]) {
             }
         }
     }
-}
-
-/// See [`is_whole_reference()`].
-fn needs_parent(parent: &NodeKey) -> bool {
-    is_whole_reference(&parent.ty.ty)
 }
 
 /// Runs max flow from `source` to `sink` and returns the nodes that can still reach the sink.

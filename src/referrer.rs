@@ -125,7 +125,7 @@ impl Eq for Referrer {}
 pub struct EntryId(usize);
 
 impl EntryId {
-    pub(crate) fn new(index: usize) -> Self {
+    fn new(index: usize) -> Self {
         Self(index)
     }
 
@@ -428,7 +428,8 @@ impl Referrer {
     ///
     /// # Panics
     ///
-    /// If `context` is not a context of this Referrer, or the path of `projection` has arguments.
+    /// If `context` is not a context of this Referrer, or the path of `projection` has arguments, or
+    /// `projection` is [`Projection::unused()`] and this Referrer has an entry.
     ///
     /// ```
     /// # use type_leak::*;
@@ -461,6 +462,7 @@ impl Referrer {
     /// });
     /// ```
     pub fn visitor<'r>(&'r self, context: ContextId, projection: &'r Projection) -> Visitor<'r> {
+        projection.check_entries(!self.is_empty());
         check_repeater_path(&projection.path);
         let found = self.context(context);
         Visitor {
@@ -510,7 +512,8 @@ impl Referrer {
     /// # Panics
     ///
     /// If `context` is not a context of this Referrer, or has no generics as declared (only the
-    /// top-level context of a scope has them), or if the path of `projection` has arguments.
+    /// top-level context of a scope has them), or if the path of `projection` has arguments, or
+    /// `projection` is [`Projection::unused()`] and this Referrer has an entry.
     ///
     /// ```
     /// # use type_leak::*;
@@ -550,6 +553,7 @@ impl Referrer {
         given: impl IntoIterator<Item = &'a GenericArgument>,
         projection: &Projection,
     ) -> std::result::Result<Substitute, EncodeError> {
+        projection.check_entries(!self.is_empty());
         check_repeater_path(&projection.path);
         let found = self.context(context);
         let declared = found.declared.clone().unwrap_or_else(|| {
@@ -658,11 +662,9 @@ impl Referrer {
         }
     }
 
-    /// Returns what the part is that `ty` is, if it is one: whether it is copied whole
-    /// ([`PartItem::whole`]). A part has the same tokens, is in a predicate as `at` says, and has
-    /// the context that `ty` has in `scopes` (none, if `ty` has none there). A part with an anchor
-    /// counts only if its anchor is one of the `active` ones ([`Referrer::anchors()`]), one with no
-    /// anchor and no mark only if it is whole.
+    /// Whether `ty` is copied whole ([`PartItem::whole`]), if it is a part: one with its tokens, in
+    /// a predicate as `at` says, with its context in `scopes` (or none), and with an `active`
+    /// anchor ([`Referrer::anchors()`]), or without one a mark or `whole`.
     fn part_of(
         &self,
         cause: &Cause,
@@ -829,12 +831,13 @@ impl Referrer {
 
 // The Repeater impls of the entries.
 impl Referrer {
-    // The Repeater impls of the entries, in order (`LeakerResult::repeater_impls()`). The path is
-    // checked first, then `check_marker()`, so `NeedsSelf` goes before an error of a const.
+    /// The Repeater impls of the entries, in order (`LeakerResult::repeater_impls()`). The path is
+    /// checked first, then `check_marker()`, so `NeedsSelf` goes before an error of a const.
     pub(crate) fn repeater_impls(
         &self,
         projection: &Projection,
     ) -> std::result::Result<Vec<RepeaterImpl>, EncodeError> {
+        projection.check_entries(!self.is_empty());
         check_repeater_path(&projection.path);
         self.check_marker(&projection.impl_self)?;
         self.live()
@@ -845,9 +848,9 @@ impl Referrer {
             .collect()
     }
 
-    // `NeedsSelf` for a marker, before `repeater_impls()` builds any impl. `Projection::impl_of()`
-    // then fails only with `UnsupportedConstType`: its `Self` is a parameter, `Self` or a bucket
-    // type, and a marker meets no `self_outlives`, which only a context with a self type has.
+    /// `NeedsSelf` for a marker, before `repeater_impls()` builds any impl. `Projection::impl_of()`
+    /// then fails only with `UnsupportedConstType`: its `Self` is a parameter, `Self` or a bucket
+    /// type, and a marker meets no `self_outlives`, which only a context with a self type has.
     fn check_marker(&self, target: &ImplSelf) -> std::result::Result<(), EncodeError> {
         if !matches!(target, ImplSelf::Marker(_)) {
             return Ok(());
@@ -916,9 +919,8 @@ impl Nested {
 }
 
 /// How the folder writes an entry: `projection.of(self_ty, ..)`, with `Self` unless a host stands
-/// for it. In a nested item an entry for the item's own type (`Type`, `Bound`) is written for what
-/// `nested_self` answers for `nested`, or left as written. A failure is kept in `failed` (the
-/// first), and the entry is left as written.
+/// for it, or in a nested item what `nested_self` answers for its own `Self` (`Type`, `Bound`).
+/// Without an answer, or on a failure (the first is kept in `failed`), it is left as written.
 struct EntryProjector<'a, N> {
     projection: &'a Projection,
     self_ty: Option<&'a Type>,
@@ -1453,10 +1455,9 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> Visitor<'r, N> {
         matches!(self.state.scopes.first(), Some(first) if first.same_generics(&canonical))
     }
 
-    /// Visits the attributes, then returns a nested visitor that has visited `generics` and has
-    /// them in scope. `item` is for an item, not an associated item. `declares` is what `Self` is
-    /// in an item that declares it (a struct, an enum, a union, a trait or an impl), as the Leaker
-    /// has it. The other items keep the `Self` around.
+    /// Visits the attributes and returns a nested visitor with `generics` visited and in scope.
+    /// `item`: an item, not an associated one. `declares`: what `Self` is in a struct, an enum, a
+    /// union, a trait or an impl, as the Leaker has it; other items keep the `Self` around.
     fn enter(
         &mut self,
         attrs: &mut [Attribute],
@@ -2037,6 +2038,78 @@ fn read_parts(input: parse::ParseStream) -> Result<(Vec<PartItem>, ContextRefs)>
     Ok((parts, part_contexts))
 }
 
+/// Reads what a group has before its entries when it declares `context`.
+fn read_declaration(input: parse::ParseStream, context: ContextId) -> Result<Context> {
+    let has_generics = input.peek(Token![<]) || input.peek(Token![where]);
+    let mut generics = Generics::default();
+    if has_generics {
+        generics = input.parse()?;
+        generics.where_clause = input.parse()?;
+        input.parse::<Token![;]>()?;
+    }
+    // The generics as written, in the top-level context of a scope. They give the generics of
+    // the context, so a declaration has one of the two forms.
+    let declared_span = input.span();
+    let mut declared = None;
+    if peek_word(input, "declared") {
+        if has_generics {
+            return Err(Error::new(
+                declared_span,
+                format!(
+                    "the declaration of the context {} has both `< generics >` and \
+                     `declared < .. >`: `declared` gives the generics, so write only one",
+                    context
+                ),
+            ));
+        }
+        input.parse::<Ident>()?;
+        if !input.peek(Token![<]) {
+            return Err(input.error("expected `<` after `declared`"));
+        }
+        let mut written: Generics = input.parse()?;
+        written.where_clause = input.parse()?;
+        input.parse::<Token![;]>()?;
+        declared = Some(written);
+    }
+    // `Self: 'a + 'b ;` is told from `Self: path ;` by the lifetime.
+    let mut self_ty = None;
+    let mut self_outlives = Vec::new();
+    while input.peek(Token![Self]) {
+        input.parse::<Token![Self]>()?;
+        if input.peek(Token![;]) {
+            self_ty = Some(SelfRequirement::Any);
+        } else if input.parse::<Option<Token![:]>>()?.is_none() {
+            input.parse::<Token![=]>()?;
+            self_ty = Some(SelfRequirement::Type(input.parse()?));
+        } else if input.peek(Lifetime) {
+            self_outlives = Punctuated::<Lifetime, Token![+]>::parse_separated_nonempty(input)?
+                .into_iter()
+                .collect();
+        } else {
+            self_ty = Some(SelfRequirement::Bound(input.parse()?));
+        }
+        input.parse::<Token![;]>()?;
+    }
+    // The associated types of the trait of the scope, with the outlives they require.
+    let mut gats = Vec::new();
+    let gats_span = input.span();
+    while input.peek(Token![type]) {
+        gats.push(Gat::parse(input)?);
+    }
+    if !gats.is_empty() && !matches!(self_ty, Some(SelfRequirement::Bound(_))) {
+        return Err(Error::new(
+            gats_span,
+            "the associated types of a trait need `Self: Trait ;` before them",
+        ));
+    }
+    // As the Leaker makes it: `Context::new()` gives the canonical generics.
+    let found = match declared {
+        Some(declared) => Context::new(declared.clone(), self_ty).with_declared(declared),
+        None => Context::new(generics, self_ty),
+    };
+    Ok(found.with_self_outlives(self_outlives).with_gats(gats))
+}
+
 /// What the parser has read of the groups.
 #[derive(Default)]
 struct Reader {
@@ -2076,81 +2149,9 @@ impl Reader {
             }
             return self.read_entries(input, context);
         }
-        let declared = self.declaration(input, context)?;
+        let declared = read_declaration(input, context)?;
         self.contexts.insert(context, declared);
         self.read_entries(input, context)
-    }
-
-    /// Reads what a group has before its entries when it declares `context`.
-    fn declaration(&mut self, input: parse::ParseStream, context: ContextId) -> Result<Context> {
-        let has_generics = input.peek(Token![<]) || input.peek(Token![where]);
-        let mut generics = Generics::default();
-        if has_generics {
-            generics = input.parse()?;
-            generics.where_clause = input.parse()?;
-            input.parse::<Token![;]>()?;
-        }
-        // The generics as written, in the top-level context of a scope. They give the generics of
-        // the context, so a declaration has one of the two forms.
-        let declared_span = input.span();
-        let mut declared = None;
-        if peek_word(input, "declared") {
-            if has_generics {
-                return Err(Error::new(
-                    declared_span,
-                    format!(
-                        "the declaration of the context {} has both `< generics >` and \
-                         `declared < .. >`: `declared` gives the generics, so write only one",
-                        context
-                    ),
-                ));
-            }
-            input.parse::<Ident>()?;
-            if !input.peek(Token![<]) {
-                return Err(input.error("expected `<` after `declared`"));
-            }
-            let mut written: Generics = input.parse()?;
-            written.where_clause = input.parse()?;
-            input.parse::<Token![;]>()?;
-            declared = Some(written);
-        }
-        // `Self: 'a + 'b ;` is told from `Self: path ;` by the lifetime.
-        let mut self_ty = None;
-        let mut self_outlives = Vec::new();
-        while input.peek(Token![Self]) {
-            input.parse::<Token![Self]>()?;
-            if input.peek(Token![;]) {
-                self_ty = Some(SelfRequirement::Any);
-            } else if input.parse::<Option<Token![:]>>()?.is_none() {
-                input.parse::<Token![=]>()?;
-                self_ty = Some(SelfRequirement::Type(input.parse()?));
-            } else if input.peek(Lifetime) {
-                self_outlives = Punctuated::<Lifetime, Token![+]>::parse_separated_nonempty(input)?
-                    .into_iter()
-                    .collect();
-            } else {
-                self_ty = Some(SelfRequirement::Bound(input.parse()?));
-            }
-            input.parse::<Token![;]>()?;
-        }
-        // The associated types of the trait of the scope, with the outlives they require.
-        let mut gats = Vec::new();
-        let gats_span = input.span();
-        while input.peek(Token![type]) {
-            gats.push(Gat::parse(input)?);
-        }
-        if !gats.is_empty() && !matches!(self_ty, Some(SelfRequirement::Bound(_))) {
-            return Err(Error::new(
-                gats_span,
-                "the associated types of a trait need `Self: Trait ;` before them",
-            ));
-        }
-        // As the Leaker makes it: `Context::new()` gives the canonical generics.
-        let found = match declared {
-            Some(declared) => Context::new(declared.clone(), self_ty).with_declared(declared),
-            None => Context::new(generics, self_ty),
-        };
-        Ok(found.with_self_outlives(self_outlives).with_gats(gats))
     }
 
     /// Reads the entries `( Type , .. )` of a group of `context`.

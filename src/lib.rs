@@ -30,5 +30,5 @@ pub use crate::error::{Cause, ErrorItem, Reason};
 pub use crate::leaker::Leaker;
 pub use crate::referrer::{EntryId, Referrer, Visitor};
 pub use crate::repeater::{repeater_definition, ImplSelf, Projection, RepeaterImpl};
-pub use crate::result::{Allow, LeakerResult, Place, Rules};
+pub use crate::result::{Allow, LeakerResult, LeakerResultError, Place, Rules};
 pub use crate::view::View;

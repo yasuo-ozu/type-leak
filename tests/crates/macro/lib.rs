@@ -742,10 +742,7 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let assertions = leaker.assertions();
     leaker.reduce_roots();
     let result = leaker.result();
-    let referrer = result
-        .clone()
-        .finish()
-        .map_err(|errors| to_syn_error(&errors))?;
+    let referrer = result.clone().finish().map_err(syn::Error::from)?;
 
     let LeakArgs {
         helper,
@@ -870,7 +867,7 @@ impl Parse for Input {
         let id = braced_parse::<LitInt>(input)?.base10_parse()?;
         let repeater = braced_parse::<Path>(input)?;
         let module = braced_parse::<Path>(input)?;
-        let referrer = result.finish().map_err(|errors| to_syn_error(&errors))?;
+        let referrer = result.finish().map_err(syn::Error::from)?;
         let header = Header {
             item_trait,
             referrer,

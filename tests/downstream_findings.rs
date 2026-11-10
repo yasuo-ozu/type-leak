@@ -35,7 +35,8 @@
 //!
 //! The last tests are the four issues that announce found when it ported to the error-recovery
 //! branch (1 to 4 of `ISSUES-from-announce.md`, named `issue_one_`, ..): what an error shows to the
-//! user, not the entries.
+//! user, not the entries; and the issue 9, the error of `finish()` for `?`. The test of issue 10
+//! (`issue_ten_`) is after them: a Referrer without entries takes `Projection::unused()`.
 
 mod common;
 
@@ -1326,4 +1327,68 @@ fn issue_four_a_path_that_would_be_leaked_is_in_the_paths_and_not_in_the_notes()
         ]
     );
     assert_eq!(paths(&result.errors()[0]), ["Rel"]);
+}
+
+/// 9: `finish()` gives an error that `?` turns into one `syn::Error` (the report: it returned a
+/// `Vec<ErrorItem>`, and the orphan rule keeps `From<Vec<ErrorItem>> for syn::Error` out of the
+/// crate of the macro, so every caller mapped each item and combined them).
+#[test]
+fn issue_nine_the_errors_of_finish_make_one_syn_error_for_question_mark() {
+    fn expand(item: &ItemTrait) -> Result<Referrer> {
+        let mut leaker = Leaker::new();
+        leaker.intern_trait(item);
+        Ok(leaker.result().finish()?)
+    }
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(&self, a: MyType<'_>, b: Other<'_>);
+        }
+    );
+    let error = expand(&item).unwrap_err();
+    let items: Vec<String> = error.clone().into_iter().map(|e| e.to_string()).collect();
+    assert_eq!(items.len(), 2);
+    assert!(
+        items[0].contains("MyType") && items[1].contains("Other"),
+        "{:?}",
+        items
+    );
+    // The macro reports it as one `compile_error!` for each.
+    let tokens = error.to_compile_error().to_string();
+    assert_eq!(tokens.matches("compile_error").count(), 2, "{}", tokens);
+
+    // An item without error gives the Referrer.
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(&self, a: Rel);
+        }
+    );
+    assert!(expand(&item).is_ok());
+}
+
+/// Issue 10: announce writes a table without a Repeater for an item that has errors and no entries,
+/// and used to invent a placeholder (`Projection::new(Repeater, 0, ImplSelf::Marker(()))`) to
+/// complete the arguments of its use sites. `Projection::unused()` is that placeholder, and the
+/// methods that take a projection refuse it only where an entry needs one (the tests are in
+/// `tests/complete_args.rs`).
+#[test]
+fn issue_ten_a_referrer_without_entries_takes_an_unused_projection() {
+    use common::Recovered;
+    // `Base<Local>` is copied whole, and the item has no entry.
+    let item: ItemStruct = parse_quote!(
+        struct S<T: Base<Local>, U = u8>(T, U);
+    );
+    let mut leaker = Leaker::with_rule(Rules::new().primitive().crate_paths());
+    let context = leaker.intern_struct(&item);
+    let result = leaker.result();
+    assert_eq!(result.errors().len(), 1, "{}", messages(result.errors()));
+    assert!(result.repeater_impls(&Projection::unused()).is_ok());
+    let referrer = result.recovered();
+    assert!(referrer.is_empty());
+    let unused = Projection::unused();
+    let given: Vec<GenericArgument> = vec![parse_quote!(W)];
+    let mut substitute = referrer.complete_args(context, &given, &unused).unwrap();
+    let mut ty: Type = parse_quote!((T, U));
+    substitute.visit_type_mut(&mut ty);
+    let expected: Type = parse_quote!((W, u8));
+    assert_eq!(text(&ty), text(&expected));
 }

@@ -16,7 +16,7 @@ use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
     braced, bracketed, parenthesized, token, Expr, ExprPath, Ident, Lifetime, LitInt, LitStr, Path,
-    Token, Type,
+    PathArguments, Token, Type, TypeGroup, TypeParamBound, TypeParen, TypePath,
 };
 use template_quote::{quote, ToTokens};
 
@@ -103,7 +103,7 @@ impl Cause {
     /// that is a path, as written (with its generic arguments, if it has any).
     pub fn path(&self) -> Option<&Path> {
         match self {
-            Cause::Type(Type::Path(syn::TypePath { qself: None, path }))
+            Cause::Type(Type::Path(TypePath { qself: None, path }))
             | Cause::Trait(path)
             | Cause::Macro(path)
             | Cause::Unknown(path)
@@ -117,8 +117,15 @@ impl Cause {
     /// Returns `true` if [`path()`](Cause::path) starts with `prefix`, segment by segment by
     /// identifier. Both must have a leading `::` or neither; generic arguments are ignored.
     pub fn starts_with(&self, prefix: &Path) -> bool {
-        self.path()
-            .map_or(false, |path| path_starts_with(path, prefix))
+        self.path().map_or(false, |path| {
+            prefix.leading_colon.is_some() == path.leading_colon.is_some()
+                && prefix.segments.len() <= path.segments.len()
+                && prefix
+                    .segments
+                    .iter()
+                    .zip(path.segments.iter())
+                    .all(|(prefix_seg, seg)| prefix_seg.ident == seg.ident)
+        })
     }
 
     /// The cause of the same kind with the generic arguments of its path removed (`Rel`, not
@@ -126,7 +133,7 @@ impl Cause {
     /// a path stays as it is.
     pub(crate) fn bare(&self) -> Self {
         match self {
-            Cause::Type(Type::Path(syn::TypePath { qself: None, path })) => {
+            Cause::Type(Type::Path(TypePath { qself: None, path })) => {
                 Cause::type_path(&without_arguments(path))
             }
             Cause::Trait(path) => Cause::Trait(without_arguments(path)),
@@ -153,7 +160,7 @@ impl Cause {
                 if bare && input.peek(token::Paren) {
                     let arguments = input.parse()?;
                     if let Some(seg) = path.segments.last_mut() {
-                        seg.arguments = syn::PathArguments::Parenthesized(arguments);
+                        seg.arguments = PathArguments::Parenthesized(arguments);
                     }
                 }
                 Cause::Trait(path)
@@ -192,18 +199,6 @@ impl Cause {
             Err(input.error("unexpected token in the cause"))
         }
     }
-}
-
-/// Returns `true` if `path` starts with `prefix`, segment by segment by identifier. Both must have
-/// a leading `::` or neither; the generic arguments of the segments are ignored.
-fn path_starts_with(path: &Path, prefix: &Path) -> bool {
-    prefix.leading_colon.is_some() == path.leading_colon.is_some()
-        && prefix.segments.len() <= path.segments.len()
-        && prefix
-            .segments
-            .iter()
-            .zip(path.segments.iter())
-            .all(|(prefix_seg, seg)| prefix_seg.ident == seg.ident)
 }
 
 /// Writes the syntax as it was written, with its spans (a [`Cause::Macro`] with its `!`).
@@ -716,20 +711,18 @@ impl Parse for ErrorItem {
         };
         let (mut place, mut paths) = (Place::default(), Vec::new());
         let mut link = Link::default();
-        // The words of the link may be written once.
+        // Each word may be written once.
         let mut written: Vec<String> = Vec::new();
         while !item.is_empty() {
             let word = item.call(Ident::parse_any)?;
             let name = word.to_string();
-            if matches!(name.as_str(), "id" | "part" | "entry" | "inner") {
-                if written.contains(&name) {
-                    return Err(syn::Error::new(
-                        word.span(),
-                        format!("`{}` is written twice", name),
-                    ));
-                }
-                written.push(name.clone());
+            if written.contains(&name) {
+                return Err(syn::Error::new(
+                    word.span(),
+                    format!("`{}` is written twice", name),
+                ));
             }
+            written.push(name.clone());
             match name.as_str() {
                 "id" => link.id = Some(item.parse::<LitInt>()?.base10_parse()?),
                 "part" => link.part = Some(item.parse::<LitInt>()?.base10_parse()?),
@@ -920,20 +913,21 @@ pub(crate) fn report(conflict: &CheckResult) -> Option<ErrorItem> {
 /// path cannot be leaked (see [Trait objects](crate::Leaker#trait-objects)).
 fn is_default_lifetime_object(cause: &Cause) -> bool {
     match cause {
-        Cause::Type(syn::Type::TraitObject(object)) => !has_lifetime_bound(object),
+        Cause::Type(Type::TraitObject(object)) => !has_lifetime_bound(object),
         _ => false,
     }
 }
 
 /// Returns the offending path of `cause`: the path of a type, a trait, an expression or a macro, or
 /// the trait of a bound that a path does not hold (`for<'a> Fn(&'a u8)`, `(Clone)`).
-fn offending_path(cause: &Cause) -> Option<syn::Path> {
+fn offending_path(cause: &Cause) -> Option<Path> {
     match cause {
-        Cause::Type(syn::Type::Paren(paren)) => offending_path(&Cause::Type((*paren.elem).clone())),
-        Cause::Type(syn::Type::Group(group)) => offending_path(&Cause::Type((*group.elem).clone())),
-        Cause::Unreadable(tokens) => syn::parse2::<syn::Path>(tokens.clone()).ok().or_else(|| {
+        Cause::Type(Type::Paren(TypeParen { elem, .. }) | Type::Group(TypeGroup { elem, .. })) => {
+            offending_path(&Cause::Type((**elem).clone()))
+        }
+        Cause::Unreadable(tokens) => syn::parse2::<Path>(tokens.clone()).ok().or_else(|| {
             match syn::parse2(tokens.clone()).ok()? {
-                syn::TypeParamBound::Trait(bound) => Some(bound.path),
+                TypeParamBound::Trait(bound) => Some(bound.path),
                 _ => None,
             }
         }),
@@ -942,7 +936,7 @@ fn offending_path(cause: &Cause) -> Option<syn::Path> {
 }
 
 /// The help for the absolute path of a prelude item or a primitive type that `path` starts with.
-fn prelude_help(path: &syn::Path) -> Option<String> {
+fn prelude_help(path: &Path) -> Option<String> {
     if path.leading_colon.is_some() {
         return None;
     }

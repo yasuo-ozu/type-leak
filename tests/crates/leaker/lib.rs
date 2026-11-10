@@ -1975,7 +1975,17 @@ pub mod kinds {
     /// as a type (E0573 in the Repeater's impl). `y` is leaked as usual (F95).
     #[prop_leak_accept(id = 9256, prelude = true)]
     pub trait BareConstHolder {
-        fn f(&self, x: ConstHolder<LEN95, [u8; { let _f = || 0; 3 }]>, y: Rel);
+        fn f(
+            &self,
+            x: ConstHolder<
+                LEN95,
+                [u8; {
+                    let _f = || 0;
+                    3
+                }],
+            >,
+            y: Rel,
+        );
     }
 
     /// `a1` is an entry (`Wrap<Y>`, with the bound `Y: Fn(Rel)` in its context). In `ai`, `impl
@@ -2389,16 +2399,34 @@ pub mod kinds {
 
     /// F85: the default of `T` has a block whose constant takes its value from `REL9250`, a relative
     /// path. The Leaker did not read the values of a default, so it accepted the item, and the copy in
-    /// the Referrer's crate could not resolve `REL9250` (E0425). It is rejected now: the Referrer's
-    /// macro expands to nothing.
+    /// the Referrer's crate could not resolve `REL9250` (E0425). The array is an entry now (F101):
+    /// the block is part of the type, with `check_values` or not.
     #[allow(dead_code)]
     #[prop_leak(id = 9250, values = true)]
     pub struct ValueInDefault<
         T = [u8; {
-                const C: usize = REL9250;
+                const _: usize = REL9250;
                 3
             }],
     >(pub T);
+
+    // F101 (`tests/findings.rs`): an item in a block in an array length is part of the type. It
+    // fails to build on the code before the fix.
+
+    /// A constant of this crate, which the Referrer's crate does not have.
+    pub const REL9264: usize = 2;
+
+    /// F101: the length of the array is a block whose constant takes its value from `REL9264`, a
+    /// relative path. Without `check_values` the Leaker did not read the value, so only `Rel` was an
+    /// entry, and the copy in the Referrer's crate could not resolve `REL9264` (E0425). The array is
+    /// the entry now.
+    #[prop_leak(id = 9264)]
+    pub struct ValueInLength(
+        pub  [Rel; {
+            const _: usize = REL9264;
+            3
+        }],
+    );
 
     // F89 (`tests/findings.rs`): the arguments of a generic associated type replace its parameters
     // in the outlives relations of its where clause. It fails to build on the code before the fix.

@@ -399,9 +399,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         scope,
         path,
     } = parse2(input)?;
-    let referrer = result
-        .finish()
-        .map_err(|errors| crate::to_syn_error(&errors))?;
+    let referrer = result.finish().map_err(syn::Error::from)?;
     let krate = path
         .segments
         .first()

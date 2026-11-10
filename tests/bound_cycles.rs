@@ -12,7 +12,7 @@ mod common;
 
 use common::{entries_with_generics as entries, messages, s, starts_with, Recovered};
 use syn::*;
-use type_leak::{Allow, Cause, ErrorItem, Leaker, Place, Referrer, Rules};
+use type_leak::{Allow, Cause, Leaker, LeakerResultError, Place, Referrer, Rules};
 
 fn leaker() -> Leaker<impl Allow> {
     leaker_allowing(&[])
@@ -34,7 +34,7 @@ fn leaker_allowing(allowed: &[&str]) -> Leaker<impl Allow> {
 }
 
 /// Analyzes `item` with the matching `intern_*`.
-fn leak(item: Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
+fn leak(item: Item) -> std::result::Result<Referrer, LeakerResultError> {
     let mut leaker = leaker();
     match &item {
         Item::Struct(item) => leaker.intern_struct(item),

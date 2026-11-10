@@ -27,7 +27,7 @@ use common::{check_in, messages, s, starts_with, to_syn_error};
 use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::quote;
-use type_leak::{Allow, Cause, ContextId, ErrorItem, Leaker, Place, Referrer, Rules};
+use type_leak::{Allow, Cause, ContextId, Leaker, LeakerResultError, Place, Referrer, Rules};
 
 /// A Leaker which allows `::p`, standing for an external crate which the Referrer's crate is known
 /// to have as the Leaker's: its types may be an anchor. The types of the other external crates may
@@ -47,14 +47,14 @@ fn leaker_with(allowed: &[Path]) -> Leaker<impl Allow> {
     Leaker::with_rule(config)
 }
 
-fn analyze(item: &ItemTrait) -> std::result::Result<Referrer, Vec<ErrorItem>> {
+fn analyze(item: &ItemTrait) -> std::result::Result<Referrer, LeakerResultError> {
     analyze_with(leaker(), item)
 }
 
 fn analyze_with<A: Allow>(
     leaker: Leaker<A>,
     item: &ItemTrait,
-) -> std::result::Result<Referrer, Vec<ErrorItem>> {
+) -> std::result::Result<Referrer, LeakerResultError> {
     analyze_in(leaker, item).map(|(referrer, _)| referrer)
 }
 
@@ -62,7 +62,7 @@ fn analyze_with<A: Allow>(
 fn analyze_in<A: Allow>(
     mut leaker: Leaker<A>,
     item: &ItemTrait,
-) -> std::result::Result<(Referrer, ContextId), Vec<ErrorItem>> {
+) -> std::result::Result<(Referrer, ContextId), LeakerResultError> {
     let context = leaker.intern_trait(item);
     Ok((leaker.result().finish()?, context))
 }
@@ -1720,14 +1720,14 @@ mod elided {
 
     use super::{e, messages, s, to_syn_error};
     use syn::*;
-    use type_leak::{Allow, ErrorItem, Leaker, Referrer, Rules};
+    use type_leak::{Allow, Leaker, LeakerResultError, Referrer, Rules};
 
     fn leaker() -> Leaker<impl Allow> {
         let config = Rules::new().primitive().prelude();
         Leaker::with_rule(config)
     }
 
-    fn analyze(item: &ItemTrait) -> std::result::Result<Referrer, Vec<ErrorItem>> {
+    fn analyze(item: &ItemTrait) -> std::result::Result<Referrer, LeakerResultError> {
         let mut leaker = leaker();
         leaker.intern_trait(item);
         leaker.result().finish()

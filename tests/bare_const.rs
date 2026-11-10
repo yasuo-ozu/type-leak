@@ -38,7 +38,7 @@ macro_rules! item {
 fn analyze_with<A: Allow>(
     mut leaker: Leaker<A>,
     item: &Item,
-) -> std::result::Result<Referrer, Vec<ErrorItem>> {
+) -> std::result::Result<Referrer, LeakerResultError> {
     match item {
         Item::Struct(item) => leaker.intern_struct(item),
         Item::Enum(item) => leaker.intern_enum(item),
@@ -50,7 +50,7 @@ fn analyze_with<A: Allow>(
     leaker.result().finish()
 }
 
-fn analyze(item: &Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
+fn analyze(item: &Item) -> std::result::Result<Referrer, LeakerResultError> {
     // The absolute paths are allowed, so the types of `::l` are no entries: the entries are those
     // that depend on the context.
     let config = Rules::new().primitive().external_crates();

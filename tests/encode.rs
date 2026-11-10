@@ -547,9 +547,13 @@ fn substitute_args_asks_for_each_name_once_in_order() {
             "p::X",
             "<X as Tr>::A",
             "Wrap<[u8; Self]>",
-            "[u8; a::B]",
         ]),
         ["T", "p", "X", "u8"]
+    );
+    // The first segment of a path in an expression is asked, once, as the name of a type.
+    assert_eq!(
+        asked(&["[u8; a::B]", "{ a::f(T::LEN, ::p::q::r()) }", "&'a u8"]),
+        ["u8", "a", "T"]
     );
     // The tokens of a macro are asked for `Self` only if they name it.
     assert_eq!(asked(&["m!(T, 'a)"]), Vec::<String>::new());

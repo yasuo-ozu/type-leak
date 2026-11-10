@@ -237,25 +237,22 @@ pub(crate) fn without_encoded_bounds(generics: &Generics) -> Generics {
 fn encode_outlives_bounds(params: &[&GenericParam]) -> Vec<Type> {
     let mut elems = Vec::new();
     for param in params {
+        let referent: Type = match param {
+            GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => parse_quote!(& #lifetime ()),
+            GenericParam::Type(TypeParam { ident, .. }) => parse_quote!(#ident),
+            GenericParam::Const(_) => continue,
+        };
         for bound in lifetime_bounds(param) {
-            let outliving = match encoded_outliving(params, bound) {
-                Some(outliving) => outliving,
-                None => continue,
-            };
-            let referent: Type = match param {
-                GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
-                    parse_quote!(& #lifetime ())
-                }
-                GenericParam::Type(TypeParam { ident, .. }) => parse_quote!(#ident),
-                GenericParam::Const(_) => continue,
-            };
-            elems.push(reference(outliving, referent));
+            if let Some(outliving) = encoded_outliving(params, bound) {
+                elems.push(reference(outliving, referent.clone()));
+            }
         }
     }
     elems
 }
 
-/// `&'a __S` implies `__S: 'a` wherever it is written. A declared `__S: 'a` would fail where
+/// The elements `&'a self_ty` for each lifetime `'a` of `lifetimes` that `params` declare:
+/// `&'a __S` implies `__S: 'a` wherever it is written, where a declared `__S: 'a` would fail if
 /// nothing proves it, such as in a free function signature.
 pub(crate) fn encode_self_outlives(
     params: &[&GenericParam],
@@ -475,7 +472,7 @@ fn projected<F: Fold>(
 
 /// The name `T` and the rest of the path if `ty` is an associated type of it, `T::A..` or
 /// `<T>::A..` (`T` one identifier, with no arguments). The rest has a leading `::`, as
-/// `projection()` writes it.
+/// `after_head()` writes it.
 fn parameter_projection(ty: &TypePath) -> Option<(&Ident, Path)> {
     match &ty.qself {
         None => Some((projection_head(&ty.path)?, after_head(&ty.path))),
@@ -758,15 +755,17 @@ fn braced_const(value: &Expr) -> Expr {
 /// asked for:
 ///
 /// - a type `T`, and `T::A` or `<T>::A` (`<value>::A`, for a `Type`);
+/// - the first segment of a longer path in an expression (`T::LEN`, `T::f()`), written
+///   `<value>::LEN` for a `Type`; any other answer leaves the path as it is;
 /// - a const `N`, in an expression (`[u8; N]`, `{ N }`) or as an argument;
 /// - a lifetime `'a`, as `a`; `'static` and `'_` are never asked;
-/// - `Self`, in a type and in `Self::A` of an expression (`Self` alone in an expression is a
-///   value), and in the tokens of a macro.
+/// - `Self`, in a type and as the first segment in an expression (`Self::A`; `Self` alone in an
+///   expression is a value), and in the tokens of a macro.
 ///
 /// A type that is one identifier is asked whatever it is (`u8` and `String` too), and so is the
-/// first segment of a longer path (`std` in `std::vec::Vec`, `crate`): answer `None` for what is
-/// not a parameter. The names that the library writes (the `'__tl_s<n>` binder below) are not
-/// asked.
+/// first segment of a longer path, in a type or in an expression (`std` in `std::vec::Vec` or in
+/// `std::mem::drop(x)`, `crate`): answer `None` for what is not a parameter. The names that the
+/// library writes (the `'__tl_s<n>` binder below) are not asked.
 ///
 /// A value must fit the place of its name, or the call fails with
 /// [`EncodeError::UnexpectedArgument`] at the value and `args` stay as they are: a `Type` or a
@@ -778,8 +777,8 @@ fn braced_const(value: &Expr) -> Expr {
 /// (one identifier). For any other value the call fails with
 /// [`EncodeError::AmbiguousAssociatedType`] and `args` stay as they are: it knows no bounds, so
 /// write the trait in the copy (`<T as Iterator>::A`), where `T` is replaced as any name.
-/// ([`Substitute`] knows the bounds of the parameters, and writes it.) `Self::A` in an expression
-/// is `<value>::A` for any value.
+/// ([`Substitute`] knows the bounds of the parameters, and writes it.) `T::A` in an expression is
+/// `<value>::A` for any value.
 ///
 /// [`Substitute`] does the same for the items of an impl, lifetimes outside the types included.
 ///
@@ -953,6 +952,13 @@ impl Substitute {
         // It leaves what does not fit as it is, and never fails.
         let _ = substitute_in(answer, vec![arg], Mode::Impl(&self.bounds));
     }
+
+    /// Substitutes in `expr`, which starts a statement.
+    fn visit_leading_mut(&mut self, expr: &mut Expr) {
+        let had_block = leading_block(expr).is_some();
+        self.visit_expr_mut(expr);
+        parenthesize_new_leading_block(expr, had_block);
+    }
 }
 
 impl VisitMut for Substitute {
@@ -1065,10 +1071,13 @@ impl VisitMut for Substitute {
         }
     }
 
-    // An item in a body has its own scope: the generics of the impl are not its (E0401).
+    // An item in a body has its own scope: the generics of the impl are not its (E0401). A
+    // statement that starts with a block ends at it: a const written as one needs parentheses.
     fn visit_stmt_mut(&mut self, stmt: &mut Stmt) {
-        if !matches!(stmt, Stmt::Item(_)) {
-            syn::visit_mut::visit_stmt_mut(self, stmt);
+        match stmt {
+            Stmt::Item(_) => (),
+            Stmt::Expr(expr, _) => self.visit_leading_mut(expr),
+            _ => syn::visit_mut::visit_stmt_mut(self, stmt),
         }
     }
 }
@@ -1144,6 +1153,18 @@ impl<F: FnMut(&Ident, Kind) -> Option<GenericArgument>> SiteFold<'_, F> {
         }
     }
 
+    /// The type for `name`, the head of a path in an expression. An answer that is no type leaves
+    /// the path and is no error (a module `a` may share its name with a lifetime), except for `Self`.
+    fn head_type_for(&mut self, name: &Ident) -> Option<Type> {
+        if name == "Self" {
+            return self.type_for(name);
+        }
+        match self.answers.of(name, Kind::TypeOrConst)? {
+            GenericArgument::Type(ty) => Some(ty),
+            _ => None,
+        }
+    }
+
     /// The const for `name`, if there is an answer, written as the expression `{ value }`: a const,
     /// or a type that is one identifier (a bare const argument is parsed as a type).
     fn braced_const_for(&mut self, name: &Ident) -> Option<Expr> {
@@ -1189,6 +1210,50 @@ fn expression_name(expr: &Expr) -> Option<&Ident> {
             qself: None, path, ..
         }) => path.get_ident().filter(|ident| *ident != "Self"),
         _ => None,
+    }
+}
+
+/// The first block on the leftmost path of `expr`, if `expr` goes on from it (`{ 3 }` in `{ 3 } * 2`
+/// and in `{ 3 }.f()`).
+fn leading_block(expr: &mut Expr) -> Option<&mut Expr> {
+    let operand = match expr {
+        Expr::Binary(ExprBinary { left: operand, .. })
+        | Expr::Assign(ExprAssign { left: operand, .. })
+        | Expr::Cast(ExprCast { expr: operand, .. })
+        | Expr::Index(ExprIndex { expr: operand, .. })
+        | Expr::Try(ExprTry { expr: operand, .. })
+        | Expr::Call(ExprCall { func: operand, .. })
+        | Expr::Field(ExprField { base: operand, .. })
+        | Expr::Await(ExprAwait { base: operand, .. })
+        | Expr::MethodCall(ExprMethodCall {
+            receiver: operand, ..
+        })
+        | Expr::Range(ExprRange {
+            start: Some(operand),
+            ..
+        }) => &mut **operand,
+        _ => return None,
+    };
+    if matches!(operand, Expr::Block(_)) {
+        Some(operand)
+    } else {
+        leading_block(operand)
+    }
+}
+
+/// Writes the leading block of `expr` in parentheses (`({ 3 }) * 2`), unless it had one before the
+/// substitution: a block that the substitution wrote.
+fn parenthesize_new_leading_block(expr: &mut Expr, had_block: bool) {
+    if had_block {
+        return;
+    }
+    if let Some(block) = leading_block(expr) {
+        let inner = std::mem::replace(block, Expr::Verbatim(TokenStream::new()));
+        *block = Expr::Paren(ExprParen {
+            attrs: Vec::new(),
+            paren_token: Default::default(),
+            expr: Box::new(inner),
+        });
     }
 }
 
@@ -1255,13 +1320,13 @@ impl<F: FnMut(&Ident, Kind) -> Option<GenericArgument>> syn::fold::Fold for Site
         if let Some(value) = expression_name(&expr).and_then(|name| self.braced_const_for(name)) {
             return value;
         }
-        // `Self::A`: only `Self` is a type in an expression.
+        // `T::A`: the head of a path is a type in an expression, as `<T>::A` has one.
         if let Expr::Path(ExprPath {
             qself: None, path, ..
         }) = &expr
         {
-            if let Some(name) = projection_head(path).filter(|name| *name == "Self") {
-                if let Some(value) = self.type_for(name) {
+            if let Some(name) = projection_head(path) {
+                if let Some(value) = self.head_type_for(name) {
                     let TypePath { qself, path } =
                         projection(value, path, |rest| self.fold_path(rest));
                     return Expr::Path(ExprPath {
@@ -1273,6 +1338,25 @@ impl<F: FnMut(&Ident, Kind) -> Option<GenericArgument>> syn::fold::Fold for Site
             }
         }
         syn::fold::fold_expr(self, expr)
+    }
+    // A statement and an arm that start with a block end at it: a const written as one needs
+    // parentheses.
+    fn fold_stmt(&mut self, stmt: Stmt) -> Stmt {
+        match stmt {
+            Stmt::Expr(mut expr, semi) => {
+                let had_block = leading_block(&mut expr).is_some();
+                let mut expr = self.fold_expr(expr);
+                parenthesize_new_leading_block(&mut expr, had_block);
+                Stmt::Expr(expr, semi)
+            }
+            stmt => syn::fold::fold_stmt(self, stmt),
+        }
+    }
+    fn fold_arm(&mut self, mut arm: Arm) -> Arm {
+        let had_block = leading_block(&mut arm.body).is_some();
+        let mut arm = syn::fold::fold_arm(self, arm);
+        parenthesize_new_leading_block(&mut arm.body, had_block);
+        arm
     }
     fn fold_lifetime(&mut self, lifetime: Lifetime) -> Lifetime {
         if lifetime.ident == "static" || lifetime.ident == "_" || self.names.made(&lifetime) {

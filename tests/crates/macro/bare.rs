@@ -333,7 +333,7 @@ fn messages(error: &[ErrorItem]) -> Vec<String> {
 
 /// The result of an analysis, as `prop::analyze()` returns it.
 pub(crate) type Analysis =
-    std::result::Result<(Referrer, ContextId, proc_macro2::TokenStream), Vec<ErrorItem>>;
+    std::result::Result<(Referrer, ContextId, proc_macro2::TokenStream), LeakerResultError>;
 
 fn disagree(why: String) -> Error {
     Error::new(

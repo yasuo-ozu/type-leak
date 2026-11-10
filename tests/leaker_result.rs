@@ -8,6 +8,9 @@
 //! - The tokens after the result are not consumed (a brace group among them is no error: only an
 //!   `@` and a bracket group are read), a wrong format tag fails as the Referrer's `Parse` does,
 //!   and a malformed `@ [ .. ]` fails with a message of its own.
+//! - `finish()` gives the Referrer, or a `LeakerResultError` with the errors that remain: it reads
+//!   as a slice, is a `std::error::Error`, writes a `compile_error!` for each error as tokens (not
+//!   the serialized result), and becomes one `syn::Error` for `?`.
 //!
 //! The spans of the errors that are read back are checked by `tests/crates/spans`
 //! (`a_serialized_leaker_result_keeps_its_spans`).
@@ -572,4 +575,162 @@ fn a_malformed_error_list_is_refused() {
         describe_all(&read(result.to_token_stream()).unwrap()),
         describe_all(&result)
     );
+}
+
+/// `finish()` is `Ok` without errors, and `Err` with the errors of `errors()`, in the same order,
+/// which are never none.
+#[test]
+fn finish_gives_the_errors_of_the_result_in_order() {
+    assert!(without_errors().finish().is_ok());
+
+    let result = with_errors();
+    let expected = result.errors().to_vec();
+    assert!(expected.len() > 1);
+    let errors: LeakerResultError = result.finish().unwrap_err();
+    assert_eq!(errors.len(), expected.len());
+    assert_eq!(&*errors, &expected[..]);
+    assert_eq!(errors.clone().into_vec(), expected);
+    assert_eq!(errors, errors.clone());
+
+    // One error is enough, and the others are not made up.
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&parse_quote!(
+        struct S(MyType<'_>);
+    ));
+    let one = leaker.result().finish().unwrap_err();
+    assert_eq!(one.len(), 1);
+}
+
+/// `into_vec()`, `Deref` to a slice, and both `IntoIterator`s give the errors in order.
+#[test]
+fn the_errors_read_as_a_vec_a_slice_and_an_iterator() {
+    let expected = with_errors().errors().to_vec();
+    let errors = with_errors().finish().unwrap_err();
+
+    // `Deref`: `len()`, `[..]`, `iter()` and `&errors` as a slice.
+    fn first_of(slice: &[ErrorItem]) -> &ErrorItem {
+        &slice[0]
+    }
+    assert_eq!(errors.len(), expected.len());
+    assert!(!errors.is_empty());
+    assert_eq!(errors[0], expected[0]);
+    assert_eq!(errors[expected.len() - 1], expected[expected.len() - 1]);
+    assert_eq!(first_of(&errors), &expected[0]);
+    assert_eq!(
+        errors.iter().collect::<Vec<_>>(),
+        expected.iter().collect::<Vec<_>>()
+    );
+    assert_eq!(errors.first(), expected.first());
+
+    // `IntoIterator` for a reference.
+    let mut seen = Vec::new();
+    for error in &errors {
+        seen.push(error.clone());
+    }
+    assert_eq!(seen, expected);
+
+    // `IntoIterator` by value, and `into_vec()`.
+    assert_eq!(
+        errors.clone().into_iter().collect::<Vec<ErrorItem>>(),
+        expected
+    );
+    assert_eq!(errors.into_vec(), expected);
+}
+
+/// `Display` is the messages of the errors, one on each line.
+#[test]
+fn a_result_error_displays_the_messages_one_per_line() {
+    let errors = with_errors().finish().unwrap_err();
+    let messages: Vec<&str> = errors.iter().map(|error| error.message.as_str()).collect();
+    assert!(messages.len() > 1);
+    assert!(messages.iter().all(|message| !message.contains('\n')));
+    assert_eq!(errors.to_string(), messages.join("\n"));
+    assert_eq!(errors.to_string().lines().count(), messages.len());
+
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&parse_quote!(
+        struct S(MyType<'_>);
+    ));
+    let one = leaker.result().finish().unwrap_err();
+    assert_eq!(one.to_string(), "use absolute path: 'MyType<'_>'");
+}
+
+/// It is a `std::error::Error`: a `Box<dyn Error>`, and `?` into one, hold it.
+#[test]
+fn a_result_error_is_a_std_error() {
+    let errors = with_errors().finish().unwrap_err();
+    let boxed: Box<dyn std::error::Error> = Box::new(errors.clone());
+    assert_eq!(boxed.to_string(), errors.to_string());
+    assert_eq!(boxed.downcast_ref::<LeakerResultError>(), Some(&errors));
+    assert!(boxed.source().is_none());
+
+    fn analyze() -> std::result::Result<Referrer, Box<dyn std::error::Error>> {
+        Ok(with_errors().finish()?)
+    }
+    let boxed = analyze().unwrap_err();
+    assert_eq!(boxed.to_string(), errors.to_string());
+    assert_eq!(
+        boxed.downcast_ref::<LeakerResultError>().map(|e| e.len()),
+        Some(errors.len())
+    );
+}
+
+/// `ToTokens` writes each error's `to_compile_error()`, in order: not the serialized result, which
+/// `LeakerResult` writes.
+#[test]
+fn a_result_error_writes_the_compile_errors_as_tokens() {
+    let result = with_errors();
+    let errors = result.clone().finish().unwrap_err();
+    let mut expected = TokenStream::new();
+    for error in result.errors() {
+        expected.extend(error.to_compile_error());
+    }
+    assert_eq!(text(&errors), text(&expected));
+    assert_eq!(
+        errors
+            .to_token_stream()
+            .to_string()
+            .matches("compile_error")
+            .count(),
+        errors.len()
+    );
+    // The tokens of the result are the serialized form, which holds an `@` and no `compile_error`.
+    assert_ne!(text(&errors), text(&result));
+    assert!(!text(&result).contains("compile_error"));
+}
+
+/// `syn::Error::from` makes one error with an item for each error, in order, written as the
+/// conversion of the error does, so `?` works in a function that returns `syn::Result`.
+#[test]
+fn a_result_error_becomes_one_syn_error_with_an_item_for_each() {
+    let result = with_errors();
+    let errors = result.clone().finish().unwrap_err();
+    let expected: Vec<String> = result
+        .errors()
+        .iter()
+        .map(|error| Error::from(error.clone()).to_string())
+        .collect();
+
+    let combined = Error::from(errors);
+    let items: Vec<String> = combined
+        .clone()
+        .into_iter()
+        .map(|e| e.to_string())
+        .collect();
+    assert_eq!(items.len(), result.errors().len());
+    assert_eq!(items, expected);
+    assert_eq!(combined.into_iter().count(), result.errors().len());
+
+    fn analyze() -> Result<Referrer> {
+        Ok(with_errors().finish()?)
+    }
+    let error = analyze().unwrap_err();
+    assert_eq!(
+        error.into_iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+        expected
+    );
+
+    // `map_err(Error::from)` is the same.
+    let error = with_errors().finish().map_err(Error::from).unwrap_err();
+    assert_eq!(error.into_iter().count(), result.errors().len());
 }

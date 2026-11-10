@@ -1,5 +1,5 @@
 //! The bounds that the environment of the copy cannot prove for an impl (see
-//! [`AnalyzeVisitor::env_cycle()`](crate::analyze::AnalyzeVisitor)).
+//! [`AnalyzeVisitor::env_cycle()`](crate::analyze::AnalyzeVisitor::env_cycle)).
 //!
 //! rustc normalizes a path through the Repeater (or `Self::A`) in a predicate of an item while it
 //! builds the item's environment: the impl it selects needs its bounds there, but the environment
@@ -31,7 +31,7 @@ pub(crate) struct Unstable {
 /// Why the environment cannot prove a bound.
 pub(crate) enum Instability {
     /// It names a leaked type. The errors for it are written where the cycle is found (see
-    /// [`AnalyzeVisitor::env_cycle()`](crate::analyze::AnalyzeVisitor)).
+    /// [`AnalyzeVisitor::env_cycle()`](crate::analyze::AnalyzeVisitor::env_cycle)).
     Leaked,
     /// It names `Self`, `Self::A` or an associated type that rustc normalizes.
     Named(Why),
@@ -245,7 +245,7 @@ impl<'a, F: Fn(&str) -> bool> Projections<'a, F> {
 
     /// Like `new()`, for a where predicate that is no bound of a generic, which an impl proves:
     /// only a projection of a generic that an equation in scope defines counts.
-    pub(crate) fn equated_only(is_param: F, bindings: &'a [(String, String)]) -> Self {
+    fn equated_only(is_param: F, bindings: &'a [(String, String)]) -> Self {
         Self {
             equated_only: true,
             ..Self::new(is_param, bindings)

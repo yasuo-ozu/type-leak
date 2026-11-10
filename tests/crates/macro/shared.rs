@@ -144,9 +144,7 @@ impl Parse for Apply {
         let content;
         braced!(content in input);
         let result: LeakerResult = content.parse()?;
-        let referrer = result
-            .finish()
-            .map_err(|errors| crate::to_syn_error(&errors))?;
+        let referrer = result.finish().map_err(syn::Error::from)?;
         let content;
         braced!(content in input);
         let contexts = content

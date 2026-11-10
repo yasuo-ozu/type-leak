@@ -673,3 +673,185 @@ fn a_default_is_written_for_the_self_type_of_the_impl_of_its_entry() {
     assert_eq!(s(&completed[1]), s(&expected));
     assert_eq!(s(&impls[0].self_ty), s(&param));
 }
+
+// ── Projection::unused() ─────────────────────────────────────────────────────────────────────
+
+/// A trait with no entry (`u8` is a primitive type), its context and its result.
+fn without_entries() -> (ItemTrait, ContextId, LeakerResult) {
+    let tr: ItemTrait = parse_quote! {
+        trait Tr<'a, K: 'a, const N: usize = 3, D = u8> { fn get(&self, key: &'a K) -> [D; N]; }
+    };
+    let mut leaker = Leaker::with_rule(Rules::new().primitive());
+    let context = leaker.intern_trait(&tr);
+    let result = leaker.result();
+    assert!(result.clone().finish().unwrap().is_empty());
+    (tr, context, result)
+}
+
+/// A trait with an entry, its context and its result.
+fn with_entry() -> (ItemTrait, ContextId, LeakerResult) {
+    let tr: ItemTrait = parse_quote! {
+        trait Tr<K, D = Wrap<K>> { fn get(&self, key: K) -> D; }
+    };
+    let mut leaker = Leaker::new();
+    let context = leaker.intern_trait(&tr);
+    let result = leaker.result();
+    assert!(!result.clone().finish().unwrap().is_empty());
+    (tr, context, result)
+}
+
+/// The message of the panic of `f`, or `None` if it does not panic.
+fn panic_message(f: impl FnOnce()) -> Option<String> {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).err()?;
+    match payload.downcast_ref::<String>() {
+        Some(message) => Some(message.clone()),
+        None => Some(payload.downcast_ref::<&str>().unwrap().to_string()),
+    }
+}
+
+/// Issue 10 of announce: the Referrer of an item with no entry needs no Repeater, so a visit with
+/// an unused projection leaves the copy as it is, as one with a real projection does.
+#[test]
+fn an_unused_projection_visits_a_copy_of_a_referrer_without_entries() {
+    let (_, context, result) = without_entries();
+    let referrer = result.finish().unwrap();
+    let mut imp: ItemImpl = parse_quote! {
+        impl<'a> Tr<'a, u8> for W {
+            fn get(&self, key: &'a u8) -> [u8; 3] { let _ = Vec::<u8>::new(); todo!() }
+        }
+    };
+    let before = imp.clone();
+    referrer
+        .visitor(context, &Projection::unused())
+        .visit_item_impl_mut(&mut imp);
+    assert_eq!(s(&imp), s(&before));
+    let mut real = before.clone();
+    referrer
+        .visitor(context, &common::projection(repeater(), 3))
+        .visit_item_impl_mut(&mut real);
+    assert_eq!(s(&imp), s(&real));
+}
+
+/// Issue 10 of announce: `complete_args()` takes the arguments and fills in the defaults with an
+/// unused projection as with a real one, and fails for the same arguments.
+#[test]
+fn an_unused_projection_completes_the_arguments_of_a_use_site() {
+    let (tr, context, result) = without_entries();
+    let referrer = result.finish().unwrap();
+    let real = common::projection(repeater(), 3);
+    for (case, given) in [
+        ("the defaults", &["'x", "Foo"][..]),
+        ("a default replaced", &["'x", "Foo", "7"][..]),
+        ("every argument", &["'x", "Foo", "7", "char"][..]),
+    ] {
+        let given = arguments(given);
+        let unused = common::completed_args_for(
+            &referrer,
+            context,
+            &tr.generics,
+            &given,
+            &Projection::unused(),
+        )
+        .unwrap();
+        let expected =
+            common::completed_args_for(&referrer, context, &tr.generics, &given, &real).unwrap();
+        assert_eq!(
+            unused.iter().map(s).collect::<Vec<_>>(),
+            expected.iter().map(s).collect::<Vec<_>>(),
+            "{}",
+            case
+        );
+    }
+    // The defaults `3` and `u8` are in the signature.
+    let given = arguments(&["'x", "Foo"]);
+    let mut substitute = referrer
+        .complete_args(context, &given, &Projection::unused())
+        .unwrap();
+    let mut sig: Signature = parse_quote!(fn get(&self, key: &'a K) -> [D; N]);
+    substitute.visit_signature_mut(&mut sig);
+    let expected: Signature = parse_quote!(fn get(&self, key: &'x Foo) -> [u8; { 3 }]);
+    assert_eq!(s(&sig), s(&expected));
+    // The errors are those of the arguments.
+    let err = referrer
+        .complete_args(context, &arguments(&["'x"]), &Projection::unused())
+        .unwrap_err();
+    assert!(matches!(err, EncodeError::MissingArgument(_)), "{}", err);
+}
+
+/// Issue 10 of announce: a result with no entry has no Repeater impl to write.
+#[test]
+fn an_unused_projection_writes_no_impl_for_a_result_without_entries() {
+    let (_, _, result) = without_entries();
+    let impls = result.repeater_impls(&Projection::unused()).unwrap();
+    assert!(impls.is_empty());
+}
+
+/// Issue 10 of announce: the three methods that take a projection refuse an unused one for a
+/// Referrer with an entry, before they look at anything else.
+#[test]
+fn an_unused_projection_is_refused_for_a_referrer_with_entries() {
+    let (_, context, result) = with_entry();
+    let referrer = result.clone().finish().unwrap();
+    let unused = Projection::unused();
+    let expected = "the Referrer has entries: pass the Projection of crate A, not \
+                    Projection::unused()";
+    let (_, other, _) = without_entries();
+    for (case, message) in [
+        (
+            "visitor",
+            panic_message(|| {
+                let _ = referrer.visitor(context, &unused);
+            }),
+        ),
+        (
+            "complete_args",
+            panic_message(|| {
+                let _ = referrer.complete_args(context, &arguments(&["u8"]), &unused);
+            }),
+        ),
+        (
+            "repeater_impls",
+            panic_message(|| {
+                let _ = result.repeater_impls(&unused);
+            }),
+        ),
+        (
+            "complete_args, a context of another Referrer",
+            panic_message(|| {
+                let _ = referrer.complete_args(other, &[], &unused);
+            }),
+        ),
+    ] {
+        assert_eq!(message.as_deref(), Some(expected), "{}", case);
+    }
+}
+
+/// Issue 10 of announce: `of()` and `key()` write an entry, which an unused projection has no
+/// Repeater for. It has the placeholders in its fields, and `new()` makes a used one.
+#[test]
+fn an_unused_projection_writes_no_entry() {
+    let (_, _, result) = with_entry();
+    let referrer = result.finish().unwrap();
+    let (entry, _, context) = referrer.iter().next().unwrap();
+    let unused = Projection::unused();
+    let expected = "Projection::unused() has no Repeater to write an entry with: pass the \
+                    Projection of crate A";
+    let message = panic_message(|| {
+        let _ = unused.of(&parse_quote!(Self), context, entry);
+    });
+    assert_eq!(message.as_deref(), Some(expected), "of");
+    let message = panic_message(|| {
+        let _ = unused.key(entry);
+    });
+    assert_eq!(message.as_deref(), Some(expected), "key");
+    let placeholders = unused.clone();
+    assert_eq!(s(&placeholders.path), "Repeater");
+    assert_eq!(placeholders.id, 0);
+    assert!(matches!(placeholders.impl_self, ImplSelf::Marker(_)));
+    assert!(format!("{:?}", unused).starts_with("Projection"));
+    let used = common::projection(parse_quote!(Repeater), 0);
+    let message = panic_message(|| {
+        let _ = used.key(entry);
+    });
+    assert_eq!(message, None);
+}

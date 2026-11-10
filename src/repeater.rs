@@ -131,6 +131,8 @@ pub struct Projection {
     /// ImplSelf::Param(__S)
     /// ```
     pub impl_self: ImplSelf,
+    // Set by `Projection::unused()`: it writes no entry, so a Referrer with entries refuses it.
+    unused: bool,
 }
 
 impl Projection {
@@ -148,12 +150,89 @@ impl Projection {
             path,
             id,
             impl_self,
+            unused: false,
+        }
+    }
+
+    /// Returns a projection for an item whose Referrer has no entries.
+    ///
+    /// Use it when crate A emitted no Repeater for the item, for example to complete the arguments
+    /// of a use site ([`Referrer::complete_args()`]). The fields are placeholders: the path
+    /// `Repeater`, the id `0` and `ImplSelf::Marker(())`.
+    ///
+    /// # Panics
+    ///
+    /// [`Referrer::visitor()`], [`Referrer::complete_args()`] and
+    /// [`LeakerResult::repeater_impls()`](crate::LeakerResult::repeater_impls) panic if the
+    /// Referrer has an entry. [`of()`](Projection::of) and [`key()`](Projection::key) always
+    /// panic: they write an entry.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// # use syn::visit_mut::VisitMut;
+    /// // `u8` is a primitive type, so `Tr` has no entries.
+    /// let item: ItemTrait = parse_quote!(trait Tr<K, D = u8> { fn get(&self, key: K) -> D; });
+    /// let mut leaker = Leaker::with_rule(Rules::new().primitive());
+    /// let top_level = leaker.intern_trait(&item);
+    /// let result = leaker.result();
+    /// let referrer = result.clone().finish().unwrap();
+    /// assert!(referrer.is_empty());
+    /// let projection = Projection::unused();
+    /// assert!(result.repeater_impls(&projection).unwrap().is_empty());
+    ///
+    /// // `impl Tr<char> for W`: the default `D` is `u8`.
+    /// let given: Vec<GenericArgument> = vec![parse_quote!(char)];
+    /// let mut substitute = referrer.complete_args(top_level, &given, &projection).unwrap();
+    /// let mut sig: Signature = parse_quote!(fn get(&self, key: K) -> D);
+    /// substitute.visit_signature_mut(&mut sig);
+    /// assert_eq!(sig, parse_quote!(fn get(&self, key: char) -> u8));
+    ///
+    /// // The visitor leaves a copy as it is.
+    /// let mut imp: ItemImpl = parse_quote! {
+    ///     impl Tr<char> for W { fn get(&self, key: char) -> u8 { todo!() } }
+    /// };
+    /// let before = imp.clone();
+    /// referrer.visitor(top_level, &projection).visit_item_impl_mut(&mut imp);
+    /// assert_eq!(imp, before);
+    /// ```
+    #[must_use]
+    pub fn unused() -> Self {
+        Projection {
+            path: parse_quote!(Repeater),
+            id: 0,
+            impl_self: ImplSelf::Marker(parse_quote!(())),
+            unused: true,
+        }
+    }
+
+    // Panics if this is `Projection::unused()` and `has_entries`: the Referrer needs the
+    // projection of crate A. The methods of the Referrer call it before anything else.
+    pub(crate) fn check_entries(&self, has_entries: bool) {
+        if self.unused && has_entries {
+            panic!(
+                "the Referrer has entries: pass the Projection of crate A, not Projection::unused()"
+            );
+        }
+    }
+
+    // Panics if this is `Projection::unused()`: it has no Repeater to write an entry with.
+    fn check_used(&self) {
+        if self.unused {
+            panic!(
+                "Projection::unused() has no Repeater to write an entry with: pass the Projection \
+                 of crate A"
+            );
         }
     }
 
     /// Returns the `KEY` argument of the Repeater for `entry`: [`id`](Projection::id) in the high 64
     /// bits and the [index](EntryId::index) of `entry` in the low ones, so no two entries share a
     /// key.
+    ///
+    /// # Panics
+    ///
+    /// If the projection is [`Projection::unused()`].
     ///
     /// ```
     /// # use type_leak::*;
@@ -168,6 +247,7 @@ impl Projection {
     /// ```
     #[must_use]
     pub fn key(&self, entry: EntryId) -> u128 {
+        self.check_used();
         key_of(self.id, entry)
     }
 
@@ -196,7 +276,7 @@ impl Projection {
     ///
     /// # Panics
     ///
-    /// If [`path`](Projection::path) has arguments.
+    /// If [`path`](Projection::path) has arguments, or the projection is [`Projection::unused()`].
     ///
     /// ```
     /// # use type_leak::*;
@@ -232,6 +312,7 @@ impl Projection {
         context: &Context,
         entry: EntryId,
     ) -> std::result::Result<Type, EncodeError> {
+        self.check_used();
         check_repeater_path(&self.path);
         // The impl of an entry that needs `Self` is for what `Self` is in the copy, whatever the
         // Leaker chose; the others for a bucket or the marker.
@@ -257,7 +338,7 @@ impl Projection {
     }
 }
 
-// The `KEY` of the Repeater for the entry `entry` of the Leaker `id` (`Projection::key()`).
+/// The `KEY` of the Repeater for the entry `entry` of the Leaker `id` (`Projection::key()`).
 fn key_of(id: u64, entry: EntryId) -> u128 {
     (u128::from(id) << 64) | entry.index() as u128
 }
@@ -327,7 +408,7 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
     }
 }
 
-// Panics unless `repeater` names the trait without arguments: `Repeater`, or `Repeater<>`.
+/// Panics unless `repeater` names the trait without arguments: `Repeater`, or `Repeater<>`.
 pub(crate) fn check_repeater_path(repeater: &Path) {
     let bare = repeater
         .segments
@@ -345,9 +426,9 @@ pub(crate) fn check_repeater_path(repeater: &Path) {
     }
 }
 
-// The path of the Repeater with `args` as the arguments of its last segment (`Repeater<args>`).
-// Panics as `check_repeater_path()` does.
-pub(crate) fn repeater_path(repeater: &Path, args: impl ToTokens) -> Path {
+/// The path of the Repeater with `args` as the arguments of its last segment (`Repeater<args>`).
+/// Panics as `check_repeater_path()` does.
+fn repeater_path(repeater: &Path, args: impl ToTokens) -> Path {
     check_repeater_path(repeater);
     let mut path = repeater.clone();
     if let Some(last) = path.segments.last_mut() {
@@ -356,11 +437,9 @@ pub(crate) fn repeater_path(repeater: &Path, args: impl ToTokens) -> Path {
     parse_quote!(#path<#args>)
 }
 
-/// Encodes the const parameter `value` of type `ty` into the const slots of the Repeater at the
-/// path `repeater`: `const N: usize` is `[(); N]`, a `u128` uses `KEY`, and any other primitive
-/// type is a trait object of the Repeater with its slot filled. Fails with
-/// [`EncodeError::UnsupportedConstType`] if `ty` is not a primitive type (an alias of one is not:
-/// the slot cannot be told).
+/// Encodes the const parameter `value` of type `ty` for the Repeater at `repeater`: `[(); N]` for a
+/// `usize`, `KEY` for a `u128`, else a trait object of the Repeater with the slot of `ty` filled.
+/// Fails with [`EncodeError::UnsupportedConstType`] for a type that is no primitive, an alias too.
 pub(crate) fn encode_slot_const(
     repeater: &Path,
     value: &Ident,
@@ -424,7 +503,7 @@ pub enum ImplSelf {
 impl ImplSelf {
     /// What the impl of the entry `entry` of the Leaker `id` is for: [`ImplSelf::Bucket`] is the
     /// bucket type as a marker, or [`ImplSelf::Param`] with `param` for an entry that `needs_self`.
-    pub(crate) fn for_entry(&self, id: u64, entry: EntryId, needs_self: bool) -> Cow<'_, Self> {
+    fn for_entry(&self, id: u64, entry: EntryId, needs_self: bool) -> Cow<'_, Self> {
         match self {
             ImplSelf::Bucket { param } if needs_self => Cow::Owned(ImplSelf::Param(param.clone())),
             ImplSelf::Bucket { .. } => Cow::Owned(ImplSelf::Marker(bucket_type(id, entry.index()))),
@@ -579,9 +658,8 @@ impl From<RepeaterImpl> for ItemImpl {
 }
 
 impl Projection {
-    // The Repeater impl of `entry`, whose type is `entry_ty` and whose context is `context`:
-    // `Referrer::repeater_impls()` makes one for each entry, after `check_marker()`, so it fails
-    // only for a const of a type that has no slot.
+    /// The Repeater impl of `entry`, whose type is `entry_ty` and whose context is `context`:
+    /// `Referrer::repeater_impls()` makes one for each entry, after `check_marker()`.
     pub(crate) fn impl_of(
         &self,
         entry: EntryId,
@@ -601,7 +679,6 @@ impl Projection {
                 (Some(SelfRequirement::Type(ty)), ImplSelf::Param(_)) => {
                     (ty.clone(), parse_quote!(Self), None)
                 }
-                // `check_marker()` refused it in `repeater_impls()`.
                 (Some(_), ImplSelf::Marker(_)) => unreachable!("rejected by check_marker()"),
                 (None, ImplSelf::Marker(marker)) => (marker.clone(), marker.clone(), None),
                 (requirement, ImplSelf::Param(ident)) => {
@@ -678,10 +755,9 @@ impl Projection {
     }
 }
 
-// The name of the parameter that stands for `Self` in the impl of an entry of the type `ty` and
-// the context `context`: `ident`, unless the type, the generics of the context or its bound use
-// that name, else the first of `ident0`, `ident1`, .. that they do not (the declaration would
-// clash, E0403, or the name would be taken for that generic).
+/// The parameter that stands for `Self` in the impl of an entry of the type `ty` and the context
+/// `context`: `ident`, unless the type, the generics of the context or its bound use that name
+/// (E0403, or taken for that generic), else the first of `ident0`, `ident1`, .. that they do not.
 fn self_param(ty: &Type, context: &Context, ident: &Ident) -> Ident {
     let generics = &context.generics;
     let where_clause = &generics.where_clause;
@@ -790,12 +866,7 @@ fn needs_sized(declared: &Generics, ty: &Type, param: &Ident) -> bool {
 }
 
 /// Returns `true` if `path` is a trait or a type of `core`, `std` or `alloc` whose type parameter
-/// is `?Sized`: `AsRef<__S>` is well-formed with `__S: ?Sized`.
-///
-/// It is written with an absolute path (`::core::convert::AsRef`), or with the name of the prelude
-/// (`AsRef`, `Box`), which is taken for what it names there: the Leaker accepts it only if the
-/// prelude is allowed. A module that declares an item of the same name is not told apart (the impl
-/// would then not compile in the Leaker's crate).
+/// is `?Sized` (`AsRef<__S>` is well-formed with `__S: ?Sized`), absolute or a prelude name.
 fn accepts_unsized_argument(path: &Path) -> bool {
     // (the crates, the module, the items): `::core::convert::AsRef`, `::std::convert::AsRef`..
     const ABSOLUTE: &[(&[&str], &str, &[&str])] = &[
@@ -811,6 +882,8 @@ fn accepts_unsized_argument(path: &Path) -> bool {
         (&["std", "alloc"], "rc", &["Rc"]),
         (&["std", "alloc"], "sync", &["Arc"]),
     ];
+    // Taken for what it names in the prelude, which the Leaker accepts only if the prelude is
+    // allowed; an item of the same name in the module is not told apart.
     const PRELUDE: &[&str] = &["AsRef", "AsMut", "PartialEq", "PartialOrd", "Box"];
     let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
     let names: Vec<&str> = names.iter().map(|s| s.as_str()).collect();

@@ -498,15 +498,28 @@ impl LeakerResult {
         &self.errors
     }
 
-    /// Returns the Referrer if no error remains, else the errors that remain, in the order found.
+    /// Returns the Referrer if no error remains, else the errors that remain, in the order found,
+    /// as a [`LeakerResultError`].
     ///
     /// It is the only way to the Referrer: drop each error with [`allow()`](LeakerResult::allow)
-    /// or [`ignore()`](LeakerResult::ignore) first, and report the others.
-    pub fn finish(self) -> std::result::Result<Referrer, Vec<ErrorItem>> {
+    /// or [`ignore()`](LeakerResult::ignore) first, and report the others. In a proc macro,
+    /// `?` turns the error into a [`syn::Error`] that holds each of them.
+    ///
+    /// ```
+    /// # use {syn::*, type_leak::*};
+    /// let mut leaker = Leaker::new();
+    /// leaker.intern_struct(&parse_quote!(struct S(MyType<'_>);));
+    /// let result = leaker.result();
+    /// let expected = result.errors().to_vec();
+    ///
+    /// let errors = result.finish().unwrap_err();
+    /// assert_eq!(errors.into_vec(), expected);
+    /// ```
+    pub fn finish(self) -> std::result::Result<Referrer, LeakerResultError> {
         if self.errors.is_empty() {
             Ok(self.referrer)
         } else {
-            Err(self.errors)
+            Err(LeakerResultError(self.errors))
         }
     }
 
@@ -535,7 +548,8 @@ impl LeakerResult {
     /// # Panics
     ///
     /// If the path of `projection` has arguments (`crate::Repeater<u8>`): it names the trait alone,
-    /// or with an empty `<>`.
+    /// or with an empty `<>`. Also if `projection` is [`Projection::unused()`] and there is an
+    /// entry.
     ///
     /// ```
     /// # use type_leak::*;
@@ -651,4 +665,205 @@ fn check_links(referrer: &Referrer, errors: &[ErrorItem], spans: &[Span]) -> syn
         }
     }
     Ok(())
+}
+
+/// The errors that [`LeakerResult::finish()`] returns: at least one, in the order found.
+///
+/// It reads as a slice of [`ErrorItem`]s (`len()`, `[0]`, `iter()`), or as a `Vec` with
+/// [`into_vec()`](LeakerResultError::into_vec). It is a `std::error::Error` whose text is the
+/// messages of the errors, one per line. [`ToTokens`] writes a `compile_error!` for each error,
+/// and `From` makes one [`syn::Error`] of them, so a proc macro can use `?`.
+///
+/// ```
+/// # use {syn::*, type_leak::*};
+/// # use template_quote::ToTokens;
+/// fn analyze(item: &ItemStruct) -> Result<Referrer> {
+///     let mut leaker = Leaker::new();
+///     leaker.intern_struct(item);
+///     Ok(leaker.result().finish()?)
+/// }
+///
+/// let item = parse_quote!(struct S(MyType<'_>, Other<'_>););
+/// let error = analyze(&item).unwrap_err();
+/// // One error for each of the two types, in the order found.
+/// assert_eq!(error.into_iter().count(), 2);
+///
+/// let mut leaker = Leaker::new();
+/// leaker.intern_struct(&item);
+/// let errors = leaker.result().finish().unwrap_err();
+/// assert_eq!(errors.len(), 2);
+/// assert_eq!(errors[0].cause, Cause::Type(parse_quote!(MyType<'_>)));
+/// assert_eq!(
+///     errors.to_string(),
+///     "use absolute path: 'MyType<'_>'\nuse absolute path: 'Other<'_>'"
+/// );
+/// // `compile_error!` for each error.
+/// assert_eq!(errors.to_token_stream().to_string().matches("compile_error").count(), 2);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeakerResultError(Vec<ErrorItem>);
+
+impl LeakerResultError {
+    /// Returns the errors, in the order found. The vector is never empty.
+    ///
+    /// ```
+    /// # use {syn::*, type_leak::*};
+    /// let mut leaker = Leaker::new();
+    /// leaker.intern_struct(&parse_quote!(struct S(MyType<'_>);));
+    /// let errors: Vec<ErrorItem> = leaker.result().finish().unwrap_err().into_vec();
+    /// assert_eq!(errors.len(), 1);
+    /// ```
+    pub fn into_vec(self) -> Vec<ErrorItem> {
+        self.0
+    }
+}
+
+/// Reads the errors as a slice: `errors.len()`, `errors[0]`, `errors.iter()`, `&errors` as
+/// `&[ErrorItem]`.
+///
+/// ```
+/// # use {syn::*, type_leak::*};
+/// let mut leaker = Leaker::new();
+/// leaker.intern_struct(&parse_quote!(struct S(MyType<'_>);));
+/// let errors = leaker.result().finish().unwrap_err();
+/// let slice: &[ErrorItem] = &errors;
+/// assert_eq!(slice.len(), 1);
+/// assert_eq!(errors[0].reason, Reason::RelativePath);
+/// ```
+impl std::ops::Deref for LeakerResultError {
+    type Target = [ErrorItem];
+
+    fn deref(&self) -> &[ErrorItem] {
+        &self.0
+    }
+}
+
+/// Goes through the errors, in the order found.
+///
+/// ```
+/// # use {syn::*, type_leak::*};
+/// let mut leaker = Leaker::new();
+/// leaker.intern_struct(&parse_quote!(struct S(MyType<'_>);));
+/// let errors = leaker.result().finish().unwrap_err();
+/// let causes: Vec<Cause> = errors.into_iter().map(|error| error.cause).collect();
+/// assert_eq!(causes, [Cause::Type(parse_quote!(MyType<'_>))]);
+/// ```
+impl IntoIterator for LeakerResultError {
+    type Item = ErrorItem;
+    type IntoIter = std::vec::IntoIter<ErrorItem>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+/// Goes through the errors by reference, in the order found.
+///
+/// ```
+/// # use {syn::*, type_leak::*};
+/// let mut leaker = Leaker::new();
+/// leaker.intern_struct(&parse_quote!(struct S(MyType<'_>);));
+/// let errors = leaker.result().finish().unwrap_err();
+/// let mut count = 0;
+/// for error in &errors {
+///     assert_eq!(error.reason, Reason::RelativePath);
+///     count += 1;
+/// }
+/// assert_eq!(count, 1);
+/// ```
+impl<'a> IntoIterator for &'a LeakerResultError {
+    type Item = &'a ErrorItem;
+    type IntoIter = std::slice::Iter<'a, ErrorItem>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+/// Writes the messages of the errors, one per line.
+///
+/// ```
+/// # use {syn::*, type_leak::*};
+/// let mut leaker = Leaker::new();
+/// leaker.intern_struct(&parse_quote!(struct S(MyType<'_>, Other<'_>);));
+/// let errors = leaker.result().finish().unwrap_err();
+/// assert_eq!(
+///     errors.to_string(),
+///     "use absolute path: 'MyType<'_>'\nuse absolute path: 'Other<'_>'"
+/// );
+/// ```
+impl std::fmt::Display for LeakerResultError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (ix, error) in self.0.iter().enumerate() {
+            if ix > 0 {
+                f.write_str("\n")?;
+            }
+            std::fmt::Display::fmt(error, f)?;
+        }
+        Ok(())
+    }
+}
+
+/// Lets `finish()` go through `?` in a function that returns a `Box<dyn Error>`.
+///
+/// ```
+/// # use {syn::*, type_leak::*};
+/// fn analyze(item: &ItemStruct) -> std::result::Result<Referrer, Box<dyn std::error::Error>> {
+///     let mut leaker = Leaker::new();
+///     leaker.intern_struct(item);
+///     Ok(leaker.result().finish()?)
+/// }
+/// let error = analyze(&parse_quote!(struct S(MyType<'_>);)).unwrap_err();
+/// assert_eq!(error.to_string(), "use absolute path: 'MyType<'_>'");
+/// ```
+impl std::error::Error for LeakerResultError {}
+
+/// Writes the [`ErrorItem::to_compile_error()`] of each error, in the order found. It is pure; to
+/// report from a proc macro with a diagnostic on nightly, call [`ErrorItem::emit()`] for each
+/// error.
+///
+/// ```
+/// # use {syn::*, type_leak::*};
+/// # use template_quote::ToTokens;
+/// let mut leaker = Leaker::new();
+/// leaker.intern_struct(&parse_quote!(struct S(MyType<'_>, Other<'_>);));
+/// let errors = leaker.result().finish().unwrap_err();
+/// let written: proc_macro2::TokenStream =
+///     errors.iter().map(|error| error.to_compile_error()).collect();
+/// assert_eq!(errors.to_token_stream().to_string(), written.to_string());
+/// ```
+impl ToTokens for LeakerResultError {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        for error in &self.0 {
+            tokens.extend(error.to_compile_error());
+        }
+    }
+}
+
+/// Makes one [`syn::Error`] of the errors, with [`syn::Error::combine()`]: each error is
+/// converted as [`ErrorItem`] is, in order.
+///
+/// ```
+/// # use {syn::*, type_leak::*};
+/// let mut leaker = Leaker::new();
+/// leaker.intern_struct(&parse_quote!(struct S(MyType<'_>, Other<'_>);));
+/// let errors = leaker.result().finish().unwrap_err();
+/// let error = Error::from(errors);
+/// let messages: Vec<String> = error.into_iter().map(|error| error.to_string()).collect();
+/// assert_eq!(messages.len(), 2);
+/// assert!(messages[0].contains("MyType"));
+/// assert!(messages[1].contains("Other"));
+/// ```
+impl From<LeakerResultError> for syn::Error {
+    fn from(errors: LeakerResultError) -> Self {
+        let mut errors = errors.0.into_iter().map(syn::Error::from);
+        // `LeakerResultError` is never empty.
+        let mut combined = errors
+            .next()
+            .expect("a LeakerResultError holds at least one error");
+        for error in errors {
+            combined.combine(error);
+        }
+        combined
+    }
 }

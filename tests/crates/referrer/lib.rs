@@ -271,9 +271,11 @@ pub mod kinds {
     // The names that a block declares (`use a::b::{self}`, a `const fn`) hide the entries that
     // name them (F83).
     type_leak_test_leaker::__tl_prop_9249!(path = ::type_leak_test_leaker::kinds);
-    // The value in the default of a type parameter is read: the relative constant is rejected, and
-    // the macro expands to nothing (F85).
+    // The value in the default of a type parameter is part of the type: the array that holds the
+    // relative constant is the entry (F85, F101).
     type_leak_test_leaker::__tl_prop_9250!(path = ::type_leak_test_leaker::kinds);
+    // The same in the length of an array in a field, without `check_values` (F101).
+    type_leak_test_leaker::__tl_prop_9264!(path = ::type_leak_test_leaker::kinds);
     // The argument of a generic associated type replaces its parameter in its where clause (F89).
     type_leak_test_leaker::__tl_prop_9251!(path = ::type_leak_test_leaker::kinds);
     // The bindings of a discriminant and of the default of a const parameter are local (F56). The

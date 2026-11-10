@@ -603,14 +603,8 @@ fn generics_as_args(generics: &Generics) -> TokenStream {
     if generics.params.is_empty() {
         return TokenStream::new();
     }
-    let args = params_as_args(&generics.params);
+    let args: Vec<GenericArgument> = generics.params.iter().map(param_as_arg).collect();
     quote!(<#(#args),*>)
-}
-
-// The arguments that pass `params` on, each by its own name: `'a` is `'a`, `T` is `T`, and
-// `const N: usize` is the `Const` argument `N` (syn parses a bare `N` as a type).
-fn params_as_args(params: &Punctuated<GenericParam, Token![,]>) -> Vec<GenericArgument> {
-    params.iter().map(param_as_arg).collect()
 }
 
 /// The argument that passes `param` on by its own name.
@@ -837,7 +831,7 @@ impl Context {
     /// Like [`Context::of()`], but with `nested_type` a `ty` that names `Self` is for any type too
     /// ([`Reason::NestedSelfInBounds`](crate::Reason::NestedSelfInBounds)): `Self` is then the
     /// implementor of the impl.
-    pub(crate) fn of_any(
+    fn of_any(
         ty: &Type,
         scopes: &[Scope],
         self_req: Option<&SelfRequirement>,

@@ -1,8 +1,9 @@
 //! What the analysis of the [`Leaker`] found: the [`CheckResult`] of a type, and the effects of
-//! visiting it, which the [`Analysis`] turns into the graph of the entries.
+//! visiting it, which the [`Analysis`] turns into the graph of the entries; and the facts of a
+//! signature that the mark of a part is about ([`SignatureFacts`]).
 
 use crate::context::{Context, ContextId, Contexts, SelfRequirement};
-use crate::elided::{input_type, Elision};
+use crate::elided::Elision;
 use crate::error::{report, self_without_meaning, Cause, ErrorItem, Reason};
 use crate::graph::{NodeKey, TypeGraph};
 #[cfg(doc)]
@@ -349,6 +350,14 @@ impl SignatureFacts {
     }
 }
 
+/// The type of an argument of a signature (of a receiver, the type it stands for).
+pub(crate) fn input_type(input: &FnArg) -> &Type {
+    match input {
+        FnArg::Receiver(receiver) => &receiver.ty,
+        FnArg::Typed(arg) => &arg.ty,
+    }
+}
+
 /// What a scan for the occurrences of a lifetime ([`scan_anchors()`]) found and keeps track of.
 pub(crate) struct OutputUse {
     /// The lifetime that the scan looks for.
@@ -536,7 +545,7 @@ pub(crate) fn kept_lifetimes(
     }
 }
 
-/// The lifetimes that a visit finds, in order, also those in the tokens of a macro.
+/// The lifetimes that a visit finds, also those in the tokens of a macro.
 #[derive(Default)]
 pub(crate) struct Lifetimes(pub(crate) Vec<Lifetime>);
 
@@ -683,6 +692,11 @@ impl PendingType {
         }
     }
 
+    /// Returns `true` if the type may become an entry, of either kind.
+    fn may_be_entry(&self) -> bool {
+        self.required_candidate || self.optional_candidate
+    }
+
     /// The effects of the types in it: `inside`, then `components`.
     pub(crate) fn into_inner(self) -> Vec<Effect> {
         let mut inner = self.inside;
@@ -691,7 +705,7 @@ impl PendingType {
     }
 
     /// The type with its context, as the analysis names an optional entry.
-    pub(crate) fn optional_key(&self) -> (Context, String) {
+    fn optional_key(&self) -> (Context, String) {
         let ty = &self.ty;
         (self.context.clone(), quote!(#ty).to_string())
     }
@@ -775,9 +789,7 @@ impl Analysis {
         let mut holds_required = false;
         for effect in effects {
             match effect {
-                Effect::Type(pending)
-                    if !(pending.required_candidate || pending.optional_candidate) =>
-                {
+                Effect::Type(pending) if !pending.may_be_entry() => {
                     // Never an entry: not added, but the assumptions of its components stay.
                     holds_required |= self.apply(contexts, &pending.components, parent);
                 }
@@ -813,10 +825,9 @@ impl Analysis {
                     // The contexts are interned as an entry's is.
                     if let Some(part) = &error.part {
                         self.primitives.extend(part.primitives.iter().cloned());
-                        if !part.recorded() {
-                            continue;
+                        if part.recorded() {
+                            push_once(&mut self.parts, part.item(contexts));
                         }
-                        push_once(&mut self.parts, part.item(contexts));
                     }
                 }
                 Effect::Primitive(ident) => self.primitives.push(ident.clone()),
@@ -952,7 +963,7 @@ pub(crate) fn correct_effects(
                     found.push(Effect::Error(Box::new(error)));
                     let inner = pending.into_inner();
                     if whole {
-                        keep_conflicts(inner, &mut found);
+                        written(inner, true, &mut |pending| pending.components, &mut found);
                     } else {
                         found.extend(correct_effects(inner, corrected));
                     }
@@ -994,18 +1005,12 @@ pub(crate) fn anchor_parts(effects: &mut [Effect], ty: &Type, context: &Context)
     }
 }
 
-/// Pushes the errors and the primitive names among `effects`; the errors lose their parts.
-fn keep_conflicts(effects: Vec<Effect>, found: &mut Vec<Effect>) {
-    written(effects, true, &mut |pending| pending.components, found)
-}
-
 /// Copies as written the outermost entries that name a `Self` without meaning, or whose context
 /// has a bound that does: the Repeater's impl would read it as its implementor
 /// ([`Reason::SelfWithoutMeaning`]). The types in them that do not are leaked.
 pub(crate) fn correct_unmeant_self(effects: Vec<Effect>) -> Vec<Effect> {
     correct_effects(effects, &mut |pending| {
-        (pending.unmeant_self && (pending.required_candidate || pending.optional_candidate))
-            .then(|| pending.part())
+        (pending.unmeant_self && pending.may_be_entry()).then(|| pending.part())
     })
 }
 
@@ -1025,8 +1030,7 @@ fn collect_errors(effects: &[Effect], errors: &mut Vec<CheckResult>) {
 pub(crate) fn names_self(effects: &[Effect], declared: &SelfRequirement) -> bool {
     effects.iter().any(|effect| match effect {
         Effect::Type(pending) => {
-            ((pending.required_candidate || pending.optional_candidate)
-                && depends_on_self(&pending.context, declared))
+            (pending.may_be_entry() && depends_on_self(&pending.context, declared))
                 || names_self(&pending.components, declared)
         }
         Effect::Error(error) => part_names_self(error, declared),

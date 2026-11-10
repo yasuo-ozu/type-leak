@@ -24,14 +24,14 @@ use syn::*;
 use template_quote::ToTokens;
 
 /// A source of the lifetime that a copy binds.
-pub(crate) trait Fresh {
+trait Fresh {
     /// Returns a lifetime that nothing at the place of the signature names, and that `binder` does
     /// not declare.
     fn fresh(&mut self, binder: Option<&BoundLifetimes>) -> Lifetime;
 }
 
 /// What a copy writes for the types in the inputs of a signature, before it folds them.
-pub(crate) trait Writer: Fresh {
+trait Writer: Fresh {
     /// Returns `ty` as the copy writes it. It may be called more than once for a type.
     fn written(&mut self, ty: &Type) -> Type;
 }
@@ -100,15 +100,9 @@ impl Fresh for WrittenNames<'_> {
     }
 }
 
-/// The fresh lifetimes of the copy of a type at a use site (`substitute_args()`,
-/// `Substitute`).
-///
-/// The generics in scope there are not known, so a name is `'__tl_s<n>` for the first `n` that no
-/// lifetime in what the copy is made of (the arguments, what replaces a name) is named like
-/// ([`FreshLifetimes::reserve()`]); the prefix keeps it from the lifetimes that a macro declares
-/// and from the Visitor's (`'__tl_e<n>`). `n` counts the signatures around, so that a signature
-/// inside the binder of another gets another name (E0496), and the output is the same for the same
-/// input.
+/// The fresh lifetimes of a copy at a use site (`substitute_args()`, `Substitute`): `'__tl_s<n>`
+/// with the first `n` that nothing [reserved](FreshLifetimes::reserve) takes, counting the
+/// signatures around, so that a signature in the binder of another gets another name (E0496).
 #[derive(Default)]
 pub(crate) struct FreshLifetimes {
     taken: HashSet<String>,
@@ -244,7 +238,7 @@ impl FnSig for TraitBound {
 }
 
 /// Before the Visitor folds `sig` in `scopes`: names its elided lifetime if the host `self_ty` adds
-/// lifetimes to its inputs, and returns the elision of the original for [`after_fold()`], found
+/// lifetimes to its inputs, then returns its elision (none once named) for [`after_fold()`], read
 /// before the entries are written.
 pub(crate) fn before_fold(
     sig: &mut impl FnSig,
@@ -286,16 +280,9 @@ fn name_elided(writer: &mut impl Writer, sig: &mut impl FnSig) {
     elision.name(writer, binder, inputs, output)
 }
 
-/// A signature (a function pointer, the sugar of `Fn(..) -> R`, or a method) whose output has an
-/// elided lifetime that elision takes from the only lifetime of the inputs (which a path may hide:
-/// `Ref<u8>`, so it is the one that the inputs do not show). The copy of a type with lifetimes in
-/// the inputs names them in the arguments of its projection, so the inputs have more lifetimes and
-/// elision fails (E0106). Such a type is not leaked alone: the type holding the signature is leaked
-/// as a whole instead if it can be, and it is an error otherwise. The same holds for `Self`, which
-/// the copy of a struct, an enum or a union writes as the type itself, but there the Referrer names
-/// the lifetime where it can (see [`AnalyzeVisitor::self_elision_broken()`]). rustc counts the
-/// lifetimes of each input apart, so the one that another input keeps (`x: &'a u8, y: Rel<T>` with
-/// `T: 'a`) is one more. See [Elided lifetimes](crate::Leaker#elided-lifetimes).
+/// A signature (a function pointer, `Fn(..) -> R` or a method) whose output takes its elided
+/// lifetime from the one lifetime of the inputs, which a copy that adds lifetimes to them breaks
+/// (E0106). See [Elided lifetimes](crate::Leaker#elided-lifetimes).
 #[derive(Clone, Debug)]
 pub(crate) struct Elision {
     /// The depth of the type holding the signature, leaked whole instead (0 for a method or a
@@ -318,10 +305,9 @@ pub(crate) struct Elision {
 }
 
 impl Elision {
-    /// Returns what the copy must keep for a signature with these `inputs` and `output`, if its
-    /// output relies on elision: it has an elided lifetime, and the inputs have exactly one
-    /// lifetime (else the original is not valid, or has no elision to keep), or none that is seen,
-    /// so that a path hides it. `binder` is `true` for a function pointer or `Fn(..)`.
+    /// The elision of a signature with these `inputs` and `output`, if its output has an elided
+    /// lifetime and the inputs show exactly one lifetime, or none (a path hides it). `binder`: a
+    /// function pointer or `Fn(..)`.
     pub(crate) fn of<'a>(
         owner: usize,
         binder: bool,
@@ -367,10 +353,9 @@ impl Elision {
         }
     }
 
-    /// Returns what `Elision::of()` gives for the signature of a method. A receiver that has a
-    /// reference to `Self` gives its lifetime to the output, whatever the inputs have (`&self`,
-    /// `self: Pin<&mut Self>`). Any other receiver is left out of the count, as rustc before 1.81
-    /// does: `self: &Box<Self>` gives nothing, and its own lifetime is not one of the inputs.
+    /// `Elision::of()` for a method: none if the receiver has a reference to `Self` (`&self`),
+    /// which gives the output its lifetime. Any other receiver is left out of the count, as rustc
+    /// before 1.81 does (`self: &Box<Self>`).
     pub(crate) fn of_signature(sig: &Signature) -> Option<Self> {
         let mut inputs: Vec<&Type> = Vec::new();
         for input in &sig.inputs {
@@ -427,9 +412,8 @@ impl Elision {
 /// The copy's side of an [`Elision`]: it names the lifetime where the inputs as written do not show
 /// it alone ([`before_fold()`], [`after_fold()`]).
 impl Elision {
-    /// The inputs show their one lifetime. With none, a path hides it (`Ref<u8>`): it cannot be
-    /// named, and the Leaker leaks such a signature whole or rejects it. With more, the original is
-    /// not valid.
+    /// `Elision::of()` of a function pointer or `Fn(..)`, unless a path hides the lifetime
+    /// (`Ref<u8>`): it cannot be named, and the Leaker leaks such a signature whole or rejects it.
     fn of_copy<'a>(
         inputs: impl IntoIterator<Item = &'a Type>,
         output: &ReturnType,
@@ -500,14 +484,6 @@ impl Elision {
     }
 }
 
-/// The type of an argument of a signature (of a receiver, the type it stands for).
-pub(crate) fn input_type(input: &FnArg) -> &Type {
-    match input {
-        FnArg::Receiver(receiver) => &receiver.ty,
-        FnArg::Typed(arg) => &arg.ty,
-    }
-}
-
 /// The lifetimes of the inputs of a signature as elision counts them: each elided one is its own,
 /// the named ones count once. A function pointer or `Fn(..)` inside has its own, and so has a
 /// bound with a `for<..>` binder for the lifetimes it declares.
@@ -559,11 +535,9 @@ impl<'ast> Visit<'ast> for InputLifetimes {
     fn visit_parenthesized_generic_arguments(&mut self, _: &'ast ParenthesizedGenericArguments) {}
 }
 
-/// `true` if the type of a receiver has a reference to `Self` (`self: &Self`, `self: Pin<&mut
-/// Self>`), which rustc gives the lifetime of to the output. A reference to a type that holds
-/// `Self` (`&Box<Self>`) is not one before rustc 1.81. A reference to another type is taken for
-/// one to the type of the impl, which the signature does not name (`&S`), as the Referrer does not
-/// know it either.
+/// `true` if the type of a receiver has a reference to `Self` (`self: Pin<&mut Self>`), or to
+/// another type, taken for the type of the impl (`&S`). A reference to a type that holds `Self`
+/// (`&Box<Self>`) is not one before rustc 1.81.
 struct RefersToSelf(bool);
 
 impl<'ast> Visit<'ast> for RefersToSelf {
