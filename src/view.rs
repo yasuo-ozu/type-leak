@@ -4,7 +4,7 @@ use crate::analysis::CheckResult;
 use crate::analyze::{AnalyzeVisitor, ScopeSpec, Scopes};
 use crate::context::ContextId;
 use crate::result::Allow;
-use std::fmt::Display;
+
 use syn::*;
 
 /// The handle that a scope of the [`Leaker`](crate::Leaker) gives to its closure. Pass it the
@@ -13,9 +13,9 @@ use syn::*;
 /// The `visit_*` methods analyze one kind of syntax each, and [`View::check()`] looks at a type
 /// without recording anything. The `enter_*` methods open a nested scope: its generics are local,
 /// and the generics around stay in scope. `Self` is what the scope declares: `enter_generics()`
-/// keeps the one around, so naming it is an error only where none is (at the top, or inside
-/// `enter_mod()`). A nested scope returns the id and the result, but no errors: the outermost call
-/// records them ([`Leaker::result()`](crate::Leaker::result)).
+/// keeps the one around, so naming it is an error only where none is (at the top). A nested scope
+/// returns the id and the result, but no errors: the outermost call records them
+/// ([`Leaker::result()`](crate::Leaker::result)).
 ///
 /// `View` also implements [`Visit`](syn::visit::Visit): `syn::visit::visit_item_struct(view,
 /// &item)` does what [`Leaker::intern_struct()`](crate::Leaker::intern_struct) does. The walk
@@ -60,20 +60,10 @@ impl<'v, 'a, A: Allow> View<'v, 'a, A> {
     /// Checks whether `ty` must become an entry, and whether it can ([`CheckResult`]), without
     /// recording anything.
     ///
-    /// It finds what [`View::visit_type()`] finds in `ty` here, and leaves no entry, context,
-    /// error or module in the Leaker.
+    /// It finds what [`View::visit_type()`] finds in `ty` here, and leaves no entry, context or
+    /// error in the Leaker.
     pub fn check(&mut self, ty: &Type) -> CheckResult {
         self.visitor.check(ty)
-    }
-
-    /// Opens a module scope inside this one: [`Leaker::enter_mod()`](crate::Leaker::enter_mod).
-    pub fn enter_mod<R>(
-        &mut self,
-        hint: impl Display,
-        declared: impl IntoIterator<Item = Ident>,
-        f: impl FnOnce(&mut View<'_, '_, A>) -> R,
-    ) -> (ContextId, R) {
-        Scopes::enter_mod(self, hint, declared, f)
     }
 
     /// Opens a scope that declares more generics:
@@ -153,8 +143,7 @@ impl<A: Allow> View<'_, '_, A> {
         self.visitor.walk_item_impl(item)
     }
 
-    /// Analyzes a nested item (a struct, trait, impl, module, function, ..) like an item of a
-    /// module ([`Leaker::intern_mod()`](crate::Leaker::intern_mod)).
+    /// Analyzes a nested item (a struct, trait, impl, function, ..).
     ///
     /// Its generics are local and the generics around stay in scope; to make the generics of an
     /// item the root, use an `intern_*` method. A struct, enum, union, trait or impl declares its
@@ -174,11 +163,14 @@ impl<A: Allow> View<'_, '_, A> {
     /// A bound is rewritten for the `Self` of the nested item that uses its generic. That is an
     /// error if `Self` is the implementor of a trait, or if the bound names an associated item of
     /// `Self` (`Self::X`).
+    ///
+    /// A `mod` is not analyzed: it is an error ([`Reason::Unreadable`](crate::Reason::Unreadable)),
+    /// and nothing in it is visited. Analyze each item of the module with its own call.
     pub fn visit_item(&mut self, item: &Item) {
         syn::visit::Visit::visit_item(&mut *self.visitor, item)
     }
 
-    /// Analyzes a type, with the generics, `Self` and module of the scope.
+    /// Analyzes a type, with the generics and `Self` of the scope.
     pub fn visit_type(&mut self, ty: &Type) {
         syn::visit::Visit::visit_type(&mut *self.visitor, ty)
     }

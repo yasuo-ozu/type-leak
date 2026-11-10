@@ -52,12 +52,22 @@ fn copy_of(referrer: &Referrer, top: ContextId, item: &Item) -> Item {
     plain(copy)
 }
 
+/// Analyzes `item` with the `intern_*` of its kind. A `mod` stands for the items it holds, nested
+/// in a scope of no generics: each has its own `Self`.
 fn intern<A: Allow>(leaker: &mut Leaker<A>, item: &Item) -> ContextId {
     match item {
         Item::Struct(item) => leaker.intern_struct(item),
         Item::Trait(item) => leaker.intern_trait(item),
         Item::Impl(item) => leaker.intern_impl(item),
-        Item::Mod(item) => leaker.intern_mod(item),
+        Item::Mod(item) => {
+            leaker
+                .enter_generics(&Generics::default(), |view| {
+                    for item in &item.content.as_ref().unwrap().1 {
+                        view.visit_item(item);
+                    }
+                })
+                .0
+        }
         _ => panic!("no such item"),
     }
 }

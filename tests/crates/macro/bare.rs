@@ -290,12 +290,11 @@ fn summary(referrer: &Referrer, only_relaxed_sized: bool) -> Vec<String> {
                 Some(_) => "other".to_string(),
             };
             bare_text(&format!(
-                "{} | {} | self={} | outlives={} | module={}",
+                "{} | {} | self={} | outlives={}",
                 quote!(#ty),
                 generics,
                 self_text,
                 context.self_outlives.len(),
-                crate::in_module(context).is_some(),
             ))
         })
         .collect();
@@ -459,28 +458,36 @@ pub(crate) fn check(
 mod tests {
     use super::*;
 
-    fn referrer(item: &Item) -> Referrer {
-        let module = match item {
-            Item::Mod(m) => m,
-            _ => unreachable!("not a module"),
-        };
+    /// The Referrer of the structs, analyzed by one Leaker.
+    fn referrer(items: &[Item]) -> Referrer {
         let mut leaker = Leaker::with_rule(Rules::new().prelude());
-        leaker.intern_mod(module);
+        for item in items {
+            match item {
+                Item::Struct(item) => leaker.intern_struct(item),
+                _ => unreachable!("not a struct"),
+            };
+        }
         leaker.result().into_referrer()
     }
 
-    /// Two items of a module spell the same bound differently, so the bare module has two contexts
-    /// with the entry `Vec<U>` where its twin with the traits in full has one: the same set of lines.
+    /// Two items spell the same bound differently, so the bare items have two contexts with the
+    /// entry `Vec<U>` where their twins with the traits in full have one: the same set of lines.
     #[test]
     fn contexts_that_differ_in_spelling_give_one_line() {
-        let item: Item = parse_quote! {
-            pub mod mm {
+        let items: Vec<Item> = vec![
+            parse_quote!(
                 pub struct A<U: ::core::default::Default>(::std::vec::Vec<U>);
+            ),
+            parse_quote!(
                 pub struct B<U: Default>(::std::vec::Vec<U>);
-            }
-        };
-        let bare = summary(&referrer(&item), false);
-        let twin = summary(&referrer(&absolute_item(&item, false)), false);
+            ),
+        ];
+        let twins: Vec<Item> = items
+            .iter()
+            .map(|item| absolute_item(item, false))
+            .collect();
+        let bare = summary(&referrer(&items), false);
+        let twin = summary(&referrer(&twins), false);
         assert!(!bare.is_empty());
         assert_eq!(bare, twin);
     }

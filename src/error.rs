@@ -300,14 +300,17 @@ pub enum Reason {
     /// full (`MyType` in `MyType<'_>`, a trait in a bound), or a relative path in a value. A macro
     /// can accept a path with an [`Allow`](crate::Allow) rule.
     RelativePath,
-    /// `Self` where no scope gives it a meaning: in a module, or in generics that no struct, enum,
-    /// union, impl or trait encloses. A macro can enter such a scope
+    /// `Self` where no scope gives it a meaning: in generics that no struct, enum, union, impl or
+    /// trait encloses, or in a `mod` in a type (an array length). A macro can enter such a scope
     /// ([`Leaker::enter_type()`](crate::Leaker::enter_type), `enter_impl()`, `enter_trait()`).
     /// The error has no [`paths`](ErrorItem::paths), so a rule that allows its cause (`Self`,
     /// `Self::Item`) accepts it ([`Allow`](crate::Allow)).
     SelfWithoutMeaning,
     /// Syntax that the Leaker cannot read, with `check_values`: a macro whose arguments are not
-    /// expressions, a `macro_rules!`, a glob import, syntax that `syn` leaves unparsed.
+    /// expressions, a `macro_rules!`, a glob import, syntax that `syn` leaves unparsed. Also a
+    /// `mod` item given to [`View::visit_item()`](crate::View::visit_item) or met in an item there
+    /// (the cause is `mod name`, with no paths): the Leaker analyzes no module, and nothing in it is
+    /// leaked.
     Unreadable,
     /// A bare identifier among the arguments of a path, which may be a const, in a type that cannot
     /// be leaked whole ([Bare identifiers and consts](crate::Leaker#bare-identifiers-and-consts)).

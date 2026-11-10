@@ -301,20 +301,18 @@ fn the_gat_of_another_trait_records_the_predicate_only() {
 }
 
 /// `Leaker::intern_trait()` docs: the GATs of the trait that `intern_trait()` analyzes are read,
-/// also when the trait is nested in a module that `intern_mod()` analyzes. Audit mutant
-/// `g_nested_trait_gats` (the GATs of a trait in a module are dropped).
+/// also when the trait is nested in a scope that a View visits. Audit mutant
+/// `g_nested_trait_gats` (the GATs of a nested trait are dropped).
 #[test]
-fn the_gats_of_a_trait_in_a_module_are_read() {
-    let item: ItemMod = parse_quote! {
-        mod m {
-            pub trait Tr {
-                type G<'b> where Self: 'b;
-                fn m<'x>(&'x self, a: Rel<&'x Self::G<'x>>);
-            }
+fn the_gats_of_a_nested_trait_are_read() {
+    let item: Item = parse_quote! {
+        pub trait Tr {
+            type G<'b> where Self: 'b;
+            fn m<'x>(&'x self, a: Rel<&'x Self::G<'x>>);
         }
     };
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&item);
+    leaker.enter_generics(&Generics::default(), |view| view.visit_item(&item));
     assert_eq!(
         with_self_outlives(&leaker.result().finish().unwrap()),
         [(
@@ -2275,16 +2273,16 @@ mod self_outlives {
         assert_eq!(outlives(&parsed), outlives(&referrer));
         // Serializing again gives the same tokens.
         assert_eq!(parsed.to_token_stream().to_string(), text);
-        // The order of the clauses does not matter, and the module follows them.
+        // The order of the clauses does not matter.
         let version = tag();
         let tokens: proc_macro2::TokenStream = format!(
-            "\"{}\" 2 mod {{ path = [] }} ; () < 'a > ; Self : 'a ; Self : Tr ; mod 0 ; (Rel < 'a , Self >)",
+            "\"{}\" < 'a > ; Self : 'a ; Self : Tr ; (Rel < 'a , Self >)",
             version
         )
         .parse()
         .unwrap();
         let result: LeakerResult = parse2(tokens).unwrap();
-        let parsed = result.clone().into_referrer();
+        let parsed = result.into_referrer();
         assert_eq!(
             common::entry(&parsed, 0).self_outlives.as_slice(),
             lifetimes(&["'a"])
@@ -2293,9 +2291,6 @@ mod self_outlives {
             common::entry(&parsed, 0).self_ty.as_ref(),
             Some(SelfRequirement::Bound(_))
         ));
-        let module = common::in_module(common::entry(&parsed, 0)).unwrap();
-        assert_eq!(module.index(), 0);
-        assert_eq!(common::entry_module_path(&result, 0), Some(vec![]));
         // A Referrer serialized before the clause existed has none.
         let tokens: proc_macro2::TokenStream =
             format!("\"{}\" Self : Tr ; (Rel < Self >)", version)

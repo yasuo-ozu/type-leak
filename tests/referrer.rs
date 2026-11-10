@@ -8,7 +8,7 @@ use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
 use type_leak::{
-    Context, ContextId, EntryId, ImplSelf, Leaker, LeakerResult, ModuleScope, Projection, Referrer,
+    Context, ContextId, EntryId, ImplSelf, Leaker, LeakerResult, Projection, Referrer,
     SelfRequirement,
 };
 
@@ -449,12 +449,6 @@ fn test_referrer_followed_by_tokens() {
             a: RelP,
         }
     );
-    let module: ItemMod = parse_quote! {
-        mod m {
-            pub struct A { y: Rel }
-            pub mod a { pub mod b { pub struct C<T> { y: Rel, z: Wrap<T> } } }
-        }
-    };
     let gaps: ItemStruct = parse_quote! { struct S<T, U> { a: Rel0, b: (Rel1, T), c: Wrap<U> } };
     let shapes: Vec<(&str, Referrer)> = vec![
         (
@@ -476,12 +470,6 @@ fn test_referrer_followed_by_tokens() {
                 leaker.intern_trait(&tr);
                 leaker.intern_struct(&with_self);
                 leaker.intern_struct(&plain);
-            }),
-        ),
-        (
-            "modules",
-            leak(|leaker| {
-                leaker.intern_mod(&module);
             }),
         ),
         (
@@ -1183,40 +1171,6 @@ fn test_nested_items_define_their_own_self() {
 }
 
 #[test]
-fn test_module_items_do_not_shadow_submodules() {
-    // The items of `m` are not in scope in `m::inner`, where `Rel` is imported from the parent
-    // and keyed by that module.
-    let m: ItemMod = parse_quote! {
-        mod m {
-            pub struct Rel;
-            pub struct A { x: Rel }
-            pub mod inner { use super::Rel; pub struct C { y: Rel } }
-        }
-    };
-    let mut leaker = type_leak::Leaker::new();
-    let context = leaker.intern_mod(&m);
-    let referrer = leaker.result().finish().unwrap();
-    // Only the `Rel` of `m::inner` is leaked (in its context, which is keyed by the module
-    // `inner`, and the module analyzed is another, as the one which contains it).
-    assert_eq!(common::context_ids(&referrer).len(), 3);
-    // The copy is the items of `m`, as a file of them, visited in the context of `m`.
-    let items = m.content.unwrap().1;
-    let mut file = File {
-        shebang: None,
-        attrs: Vec::new(),
-        items,
-    };
-    common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>)).visit_file_mut(&mut file);
-    // `Rel` of `m` is declared there, and the one of `m::inner` is rewritten.
-    let expected: File = parse_quote! {
-        pub struct Rel;
-        pub struct A { x: Rel }
-        pub mod inner { use super::Rel; pub struct C { y: P<0usize> } }
-    };
-    assert_eq!(quote!(#file).to_string(), quote!(#expected).to_string());
-}
-
-#[test]
 fn the_associated_types_of_a_trait_with_outlives_are_in_its_top_level_context() {
     // The Referrer computes the context of a signature alone, with no trait around it (what a
     // macro that copies the methods does), so the top-level context of the trait carries the
@@ -1280,105 +1234,23 @@ fn the_associated_types_of_a_trait_with_outlives_are_in_its_top_level_context() 
     assert!(!text.contains("type G"), "{}", text);
 }
 
-/// What follows the tag is refused with a clear error: the information of a module and what a
-/// module is not, a context declared twice, the associated types of a trait, `Self` as a call.
+/// What follows the tag is refused with a clear error: a context declared twice, the associated
+/// types of a trait, `Self` as a call, and the module words of earlier versions of the format.
 #[test]
 fn malformed_serialized_referrers_are_errors() {
     let tag = tag();
     let parse = |text: &str| parse_str::<Referrer>(&format!("\"{}\" {}", tag, text));
-    let parse_result = |text: &str| parse_str::<LeakerResult>(&format!("\"{}\" {}", tag, text));
     let integer = "expected integer literal";
     let declared = "the context 0 is declared already: expected its entries `( .. )`";
-    let not_a_module = "the context 0 is not a module (it is not declared as `mod { .. }`)";
-    let is_a_module_without_generics =
-        "the context 0 is a module (`mod { .. }`), which has no generics";
-    let is_a_module_without_self =
-        "the context 0 is a module (`mod { .. }`), where `Self` has no meaning";
     let need_trait = "the associated types of a trait need `Self: Trait ;` before them";
     let need_outlives = "an associated type needs an outlives relation in its where clause";
     let max_id = format!("# {} (A)", usize::MAX);
-    let cycle = |module: usize| {
-        format!("the module {module} is nested in itself (its parents form a cycle)")
-    };
-    let (cycle_0, cycle_1) = (cycle(0), cycle(1));
     let cases: &[(&str, &str)] = &[
-        // The information of a module is a list of `key = value`.
-        ("mod { path = a } ; ()", "expected square brackets"),
-        (
-            "mod { unknown = 1 } ; ()",
-            "expected `path`, `hint` or `parent`",
-        ),
-        ("mod { hint = 1 } ; ()", "expected string literal"),
-        // A module which is used is a number.
-        ("mod x ; (Rel)", integer),
-        // A module which is not there.
-        (
-            "2 mod { path = [] } ; () mod 7 ; (Rel)",
-            "there is no module 7",
-        ),
-        ("mod 3 ; (Rel)", "there is no module 3"),
-        // A context which is not a module.
-        ("2 () mod 0 ; (Rel)", not_a_module),
-        ("2 < T > ; () mod 0 ; (Rel)", not_a_module),
-        // The parent.
-        ("mod { parent = 0 } ; ()", "the module 0 is its own parent"),
-        (
-            "mod { parent = 5 } ; ()",
-            "the parent of the module 0: there is no module 5",
-        ),
-        (
-            "2 () mod { parent = 0 } ; ()",
-            "the parent of the module 1: the context 0 is not a module (it is not declared as \
-             `mod { .. }`)",
-        ),
-        (
-            "2 mod { parent = 1 } ; () mod { parent = 0 } ; ()",
-            cycle_0.as_str(),
-        ),
-        (
-            "3 mod { parent = 1 } ; () mod { parent = 2 } ; () mod { parent = 0 } ; ()",
-            cycle_0.as_str(),
-        ),
-        (
-            "3 mod { } ; () mod { parent = 2 } ; () mod { parent = 1 } ; ()",
-            cycle_1.as_str(),
-        ),
-        // A key which is written twice.
-        (
-            "mod { path = [a], path = [b] } ; ()",
-            "`path` is written twice in the information of a module",
-        ),
-        (
-            "mod { hint = \"a\", hint = \"b\" } ; ()",
-            "`hint` is written twice in the information of a module",
-        ),
-        (
-            "2 mod { } ; () mod { parent = 0, parent = 0 } ; ()",
-            "`parent` is written twice in the information of a module",
-        ),
-        // What a module does not have.
-        ("< T > ; mod { } ; (Rel<T>)", is_a_module_without_generics),
-        (
-            "where T: Clone ; mod { } ; ()",
-            is_a_module_without_generics,
-        ),
-        ("Self = W ; mod { } ; ()", is_a_module_without_self),
-        ("Self : Tr ; mod { } ; ()", is_a_module_without_self),
-        (
-            "<'a> ; Self : 'a ; mod { } ; ()",
-            is_a_module_without_generics,
-        ),
-        (
-            "mod { } ; (Rel)",
-            "the context 0 is a module (`mod { .. }`), which has no leaked type",
-        ),
+        // A context is no module any more: `mod` is no word of a declaration.
+        ("mod 0 ; (Rel)", "expected parentheses"),
         // A context that is written again has its entries only.
         ("2 (A) # 0 < T > ; (B)", declared),
         ("2 (A) # 0 Self ; (B)", declared),
-        (
-            "2 mod { } ; () # 0 (A)",
-            "the context 0 is a module (`mod { .. }`), which has no leaked type",
-        ),
         // Not a number.
         ("# (A)", integer),
         ("# x (A)", integer),
@@ -1402,13 +1274,6 @@ fn malformed_serialized_referrers_are_errors() {
             "Self : Tr ; type G < 'b > where Self : Clone ; (Rel)",
             need_outlives,
         ),
-        // They come before the module, and a module has no trait: a module that has associated
-        // types has `Self : Tr ;` for them, and a module has no `Self`.
-        (
-            "Self : Tr ; mod { } ; type G < 'b > where Self : 'b ; (Rel)",
-            is_a_module_without_self,
-        ),
-        ("type G < 'b > where Self : 'b ; mod { } ; ()", need_trait),
     ];
     for (text, message) in cases {
         let err = parse(text)
@@ -1422,27 +1287,14 @@ fn malformed_serialized_referrers_are_errors() {
     let err = parse("Self = # 2 ; (Rel < Self >)").unwrap_err();
     assert!(err.to_string().starts_with("expected one of: "), "{}", err);
 
-    // The consistent ones are fine: a module of its own, nested ones in either order of the ids,
-    // the entries which depend on a module, and the associated types of a trait.
+    // The consistent ones are fine: the associated types of a trait.
     for text in [
-        "mod { path = [] } ; ()",
-        "2 mod { path = [] } ; () mod 0 ; (Rel)",
-        "3 mod { path = [] } ; () mod { path = [a] , parent = 0 } ; () mod 1 ; (Rel)",
-        "2 mod { parent = 1 } ; () mod { } ; ()",
         "Self : Tr ; type G < 'b > where Self : 'b ; (Rel)",
         "Self : Tr ; type G < 'b > where Self : 'b ; type H where Self : 'static ; (Rel)",
     ] {
         let parsed = parse(text);
         assert!(parsed.is_ok(), "{}: {:?}", text, parsed.err());
     }
-    // The fields of a module are optional, and may be in any order.
-    let parsed = parse_result(
-        "4 mod { parent = 1 , hint = \"x\" } ; () mod {} ; () mod 0 ; (A) mod 1 ; (B)",
-    )
-    .unwrap();
-    assert_eq!(common::entry_module_hint(&parsed, 0).as_deref(), Some("x"));
-    assert_eq!(common::entry_module_path(&parsed, 1), None);
-    assert_eq!(common::entry_module_hint(&parsed, 1), None);
 }
 
 /// A visitor borrows the Referrer: its closure may use the Referrer it was made from, two visitors
@@ -1489,7 +1341,7 @@ fn a_visitor_borrows_the_referrer_so_its_closure_may_use_it() {
 //
 // `Referrer::visitor(context, ..)`, on a whole item or on one type (`common::expand()`): the
 // context is the scope of the copy, and the visited syntax is inside it. The visitor takes from the
-// context the generics in scope, what `Self` means and the module.
+// context the generics in scope and what `Self` means.
 
 /// Rewrites each leaked type to `P<index>`.
 fn replace(_: Type, ix: EntryId, _: &Context) -> Type {
@@ -1497,180 +1349,9 @@ fn replace(_: Type, ix: EntryId, _: &Context) -> Type {
     parse_quote!(P<#ix>)
 }
 
-/// The items of `m`, which stay as they are.
-fn items_of(m: &ItemMod) -> Vec<Item> {
-    m.content.as_ref().unwrap().1.clone()
-}
-
-/// The module of the entry `ix`.
-fn module_of(referrer: &Referrer, ix: usize) -> ContextId {
-    common::in_module(common::entry(referrer, ix)).expect("the entry is in a module")
-}
-
-// ── modules: the visited syntax is inside the module of the context ──────────────────────────
-
-fn two_rels() -> ItemMod {
-    parse_quote!(
-        mod m {
-            struct D {
-                a: Rel,
-            }
-            mod inner {
-                use crate::x::Rel;
-                struct C {
-                    a: Rel,
-                }
-            }
-        }
-    )
-}
-
-/// The Referrer of `two_rels()` with the context of `m` and that of `inner`. `Rel` is two entries,
-/// one in each module: `inner` imports its own.
-fn two_rels_referrer() -> (Referrer, ContextId, ContextId) {
-    let mut leaker = Leaker::new();
-    let m = leaker.intern_mod(&two_rels());
-    let result = leaker.result();
-    let referrer = result.clone().finish().unwrap();
-    assert_eq!(referrer.iter().count(), 2);
-    let in_inner = (0..2).find(|&ix| module_of(&referrer, ix) != m).unwrap();
-    let inner = module_of(&referrer, in_inner);
-    assert_eq!(
-        common::entry_module_path(&result, in_inner),
-        Some(vec![parse_quote!(inner)])
-    );
-    (referrer, m, inner)
-}
-
-fn entry_in(referrer: &Referrer, module: ContextId) -> usize {
-    (0..referrer.iter().count())
-        .find(|&ix| module_of(referrer, ix) == module)
-        .unwrap()
-}
-
+/// The names that the items of a file declare hide the entries that name them.
 #[test]
-fn a_mod_item_visited_alone_is_nested_in_the_module_of_the_context() {
-    let (referrer, m, inner) = two_rels_referrer();
-    let (in_m, in_inner) = (entry_in(&referrer, m), entry_in(&referrer, inner));
-    // `inner` visited on its own, inside `m`, is `m::inner`: found by its name, so it gets its own
-    // entry and not the one of `m` (it was left as written, as the equal entries of two modules
-    // were ambiguous for a visitor that did not know its module).
-    let mut item: ItemMod = items_of(&two_rels())
-        .into_iter()
-        .find_map(|item| match item {
-            Item::Mod(item) => Some(item),
-            _ => None,
-        })
-        .unwrap();
-    common::visitor(&referrer, m, replace).visit_item_mod_mut(&mut item);
-    let expected: ItemMod = {
-        let ix = proc_macro2::Literal::usize_unsuffixed(in_inner);
-        parse_quote!(
-            mod inner {
-                use crate::x::Rel;
-                struct C {
-                    a: P<#ix>,
-                }
-            }
-        )
-    };
-    assert_eq!(s(&item), s(&expected));
-    assert_ne!(in_m, in_inner);
-}
-
-#[test]
-fn the_items_of_a_module_visited_one_by_one_are_in_it() {
-    let (referrer, m, inner) = two_rels_referrer();
-    let (in_m, in_inner) = (entry_in(&referrer, m), entry_in(&referrer, inner));
-    // Each item of `m`, with the context of `m`: the struct is in `m`, the `mod` is `m::inner`.
-    let mut items = items_of(&two_rels());
-    for item in &mut items {
-        common::visitor(&referrer, m, replace).visit_item_mut(item);
-    }
-    let (ix_m, ix_inner) = (
-        proc_macro2::Literal::usize_unsuffixed(in_m),
-        proc_macro2::Literal::usize_unsuffixed(in_inner),
-    );
-    let expected: Vec<Item> = vec![
-        parse_quote!(
-            struct D {
-                a: P<#ix_m>,
-            }
-        ),
-        parse_quote!(
-            mod inner {
-                use crate::x::Rel;
-                struct C {
-                    a: P<#ix_inner>,
-                }
-            }
-        ),
-    ];
-    assert_eq!(
-        items.iter().map(s).collect::<Vec<_>>(),
-        expected.iter().map(s).collect::<Vec<_>>()
-    );
-    // The items of `inner` visited one by one are those of `inner` with its own context.
-    let inner_items = match &items_of(&two_rels())[1] {
-        Item::Mod(item) => items_of(item),
-        _ => unreachable!(),
-    };
-    let mut copy = inner_items.clone();
-    for item in &mut copy {
-        common::visitor(&referrer, inner, replace).visit_item_mut(item);
-    }
-    assert_eq!(
-        s(&copy[1]),
-        s(&parse_quote!(
-            struct C {
-                a: P<#ix_inner>,
-            }
-        ) as &Item)
-    );
-    // And with the context of `m` they are `m::inner`'s items in `m`: they find no entry of
-    // `inner`, but the one of `m` (as the entries of no module would be found too).
-    let mut copy = inner_items;
-    for item in &mut copy {
-        common::visitor(&referrer, m, replace).visit_item_mut(item);
-    }
-    assert_eq!(
-        s(&copy[1]),
-        s(&parse_quote!(
-            struct C {
-                a: P<#ix_m>,
-            }
-        ) as &Item)
-    );
-}
-
-#[test]
-fn a_file_of_the_items_of_a_module_is_in_it() {
-    let (referrer, m, inner) = two_rels_referrer();
-    let (in_m, in_inner) = (entry_in(&referrer, m), entry_in(&referrer, inner));
-    let (ix_m, ix_inner) = (
-        proc_macro2::Literal::usize_unsuffixed(in_m),
-        proc_macro2::Literal::usize_unsuffixed(in_inner),
-    );
-    let mut file = File {
-        shebang: None,
-        attrs: Vec::new(),
-        items: items_of(&two_rels()),
-    };
-    common::visitor(&referrer, m, replace).visit_file_mut(&mut file);
-    let expected: File = parse_quote!(
-        struct D {
-            a: P<#ix_m>,
-        }
-        mod inner {
-            use crate::x::Rel;
-            struct C {
-                a: P<#ix_inner>,
-            }
-        }
-    );
-    assert_eq!(s(&file), s(&expected));
-    // The names that the items of the file declare hide the entries of no module (as in a module),
-    // and the entries of a module are kept.
+fn the_names_that_a_file_declares_hide_the_entries_that_name_them() {
     let mut leaker = Leaker::new();
     let (scope, ()) = leaker.enter_generics(&Generics::default(), |view| {
         view.visit_type(&parse_quote!(Rel));
@@ -1699,52 +1380,6 @@ fn a_file_of_the_items_of_a_module_is_in_it() {
             struct S(P<0>);
         ) as &File)
     );
-}
-
-#[test]
-fn a_scope_in_a_module_is_in_that_module() {
-    // The top-level context of a scope entered in a module records the module, so the visitor of
-    // a copy in the scope looks up the entries of the module.
-    let mut leaker = Leaker::new();
-    let (module, scope) = leaker.enter_mod("m", [], |view| {
-        view.enter_generics(&parse_quote!(<T>), |view| {
-            view.visit_type(&parse_quote!(Wrap<T>));
-            view.visit_type(&parse_quote!(Rel));
-        })
-        .0
-    });
-    let result = leaker.result();
-    let referrer = result.clone().finish().unwrap();
-    assert_ne!(module, scope);
-    // `Wrap<T>` is the entry of the scope's generics, which are in the module `m`: the module's own
-    // context. Its context is not the scope's: that one is the generics as declared, with no entry.
-    let wrap = common::types(&referrer)
-        .position(|ty| s(ty) == "Wrap < T >")
-        .unwrap();
-    assert_ne!(common::entry_id(&referrer, wrap), scope);
-    assert_eq!(
-        common::in_module(common::entry(&referrer, wrap)),
-        Some(module)
-    );
-    assert!(matches!(
-        common::entry_module(&result, wrap),
-        Some(ModuleScope::Itself { id, .. }) if id == module
-    ));
-    let mut sig: Signature = parse_quote!(fn f(x: Wrap<T>, y: Rel));
-    common::visitor(&referrer, scope, replace).visit_signature_mut(&mut sig);
-    let rewritten = s(&sig);
-    assert_eq!(rewritten.matches("P <").count(), 2, "{}", rewritten);
-    // An unrelated scope of the Leaker is in no module: the entries of `m` are not found there.
-    let mut leaker = Leaker::new();
-    let (module, ()) = leaker.enter_mod("m", [], |view| view.visit_type(&parse_quote!(Rel)));
-    let (outside, ()) =
-        leaker.enter_generics(&parse_quote!(<T>), |view| view.visit_type(&parse_quote!(T)));
-    let referrer = leaker.result().finish().unwrap();
-    let mut ty: Type = parse_quote!(Rel);
-    ty = common::expand(&referrer, outside, ty, replace);
-    assert_eq!(s(&ty), "Rel");
-    ty = common::expand(&referrer, module, parse_quote!(Rel), replace);
-    assert_eq!(s(&ty), "P < 0 >");
 }
 
 // ── `Self` comes from the context ────────────────────────────────────────────────────────────
@@ -2387,8 +2022,8 @@ fn assert_paths_of_entries(
 }
 
 /// The path that the visitor writes for an entry is made from the context of that entry (what
-/// `iter()` gives for it), with a context of its own for each entry, in a trait and in the nested
-/// items of a module.
+/// `iter()` gives for it), with a context of its own for each entry, in a trait and in nested
+/// items.
 #[test]
 fn the_path_written_for_an_entry_is_made_from_the_context_of_the_entry() {
     let projection = common::projection(parse_quote!(Repeater), 7);
@@ -2409,8 +2044,8 @@ fn the_path_written_for_an_entry_is_made_from_the_context_of_the_entry() {
         .visit_item_trait_mut(&mut copy);
     assert_paths_of_entries(&referrer, &projection, &written_paths(&copy), 3);
 
-    // The entries of the nested items of a module: two have the `Self` of their item, and the
-    // third has not. The hook returns `Self`, so the paths are the ones of `Self` in each.
+    // The entries of nested items: two have the `Self` of their item, and the third has not. The
+    // hook returns `Self`, so the paths are the ones of `Self` in each.
     let module: ItemMod = parse_quote!(
         mod m {
             pub struct A<T: ::core::convert::AsRef<Self>>(pub Wrap<T>);
@@ -2419,7 +2054,11 @@ fn the_path_written_for_an_entry_is_made_from_the_context_of_the_entry() {
         }
     );
     let mut leaker = Leaker::with_rule(type_leak::Rules::new().primitive().prelude());
-    let top = leaker.intern_mod(&module);
+    let (top, ()) = leaker.enter_generics(&Generics::default(), |view| {
+        for item in &module.content.as_ref().unwrap().1 {
+            view.visit_item(item);
+        }
+    });
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 3);
     let mut copy = module.clone();
@@ -2428,4 +2067,208 @@ fn the_path_written_for_an_entry_is_made_from_the_context_of_the_entry() {
         .with_nested_self(|_| Some(parse_quote!(Self)))
         .visit_item_mod_mut(&mut copy);
     assert_paths_of_entries(&referrer, &projection, &written_paths(&copy), 3);
+}
+
+// ── a `mod` in a copy ────────────────────────────────────────────────────────────────────────
+
+/// `item` as it is printed.
+fn shown(item: Item) -> String {
+    quote!(#item).to_string()
+}
+
+/// Rewrites `item`, a copy in the scope `context`, replacing the `ix`-th entry with `P<ix>`.
+fn rewrite_in_scope(referrer: &Referrer, context: ContextId, mut item: Item) -> String {
+    common::visitor(referrer, context, |_, ix, _| parse_quote!(P<#ix>)).visit_item_mut(&mut item);
+    quote!(#item).to_string()
+}
+
+/// `Visitor` docs: the items of a `mod` that a copy holds are nested items, so their generics are
+/// local even if the visitor is told that the outermost generics are those of the context
+/// (`with_outer_generics()`). Audit mutants `vis_item_depth_module`, `vis_mod_item_not_nested` and
+/// `vis_mod_item_self_kept`.
+#[test]
+fn the_items_of_a_mod_in_a_copy_are_nested_items() {
+    // The Leaker analyzes the struct nested in a scope; the copy holds it in a `mod`.
+    let mut leaker = Leaker::new();
+    let (context, ()) = leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_item(&parse_quote!(
+            pub struct S<T>(Wrap<T>);
+        ));
+    });
+    let referrer = leaker.result().finish().unwrap();
+    let mut item: Item = parse_quote!(
+        mod m {
+            pub struct S<T>(Wrap<T>);
+        }
+    );
+    common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>))
+        .with_outer_generics()
+        .visit_item_mut(&mut item);
+    assert_eq!(
+        shown(item),
+        shown(parse_quote!(
+            mod m {
+                pub struct S<T>(P<0usize>);
+            }
+        ))
+    );
+}
+
+/// `Visitor` docs: an item declared in a block hides the entry that names it, and the entry is
+/// replaced where nothing hides it.
+#[test]
+fn a_block_item_hides_the_entry_that_names_it() {
+    let mut leaker = Leaker::new();
+    let (scope, ()) = leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_item(&parse_quote!(
+            pub fn f(a: Rel) {}
+        ));
+    });
+    let referrer = leaker.result().finish().unwrap();
+    let out = rewrite_in_scope(
+        &referrer,
+        scope,
+        parse_quote!(
+            pub fn f(a: Rel) {
+                struct Rel;
+                let b: Rel = Rel;
+            }
+        ),
+    );
+    // `a` is replaced, `b` is the local struct.
+    assert_eq!(
+        out,
+        shown(parse_quote!(
+            pub fn f(a: P<0usize>) {
+                struct Rel;
+                let b: Rel = Rel;
+            }
+        ))
+    );
+}
+
+/// `Self` has no meaning in a `mod` item that a copy holds, even inside the scope of a trait that
+/// declares it, so the entry that names the `Self` of the trait is not found in it. Audit mutant
+/// `vis_mod_item_self_kept` (the `Self` of the scope around stays in a `mod` item).
+#[test]
+fn self_has_no_meaning_in_a_mod_item_of_a_scope_which_declares_it() {
+    let mut leaker = Leaker::new();
+    let context = leaker.intern_trait(&parse_quote!(
+        trait Tr {
+            fn f(&self) -> Rel<Self>;
+        }
+    ));
+    let referrer = leaker.result().finish().unwrap();
+    // The trait itself declares `Self`, and the entry is found.
+    let expected: Item = parse_quote!(
+        trait Tr {
+            fn f(&self) -> P<0usize>;
+        }
+    );
+    assert_eq!(
+        rewrite_in_scope(
+            &referrer,
+            context,
+            parse_quote!(
+                trait Tr {
+                    fn f(&self) -> Rel<Self>;
+                }
+            )
+        ),
+        quote!(#expected).to_string()
+    );
+    // In a `mod` it is not the `Self` of the trait: nothing is replaced.
+    for src in [
+        "mod inner { type X = Rel<Self>; }",
+        "mod inner { const C: Option<Rel<Self>> = None; }",
+        "mod inner { fn g() -> Rel<Self> { loop {} } }",
+        "mod inner { static S: Rel<Self> = loop {}; }",
+    ] {
+        let item: Item = parse_str(src).unwrap();
+        assert_eq!(
+            rewrite_in_scope(&referrer, context, item.clone()),
+            quote!(#item).to_string(),
+            "{}",
+            src
+        );
+    }
+}
+
+/// A nested item's own name hides none of its entries: the container declares it (`mod w { trait
+/// Tr .. }`), but inside the item the name is the item's own, so `R1<<Self as Tr>::A>` is replaced
+/// as in a copy of the item by itself. A declaration inside the item hides again: the local `trait
+/// Tr` of the body is another trait, so the type there that names it is left as written.
+#[test]
+fn a_nested_items_own_name_hides_none_of_its_entries() {
+    // The body names the local `Tr` in `Option<..>` (the owner's shape) and in the type of the
+    // signature, which is an entry: the Leaker reads no body, the Visitor visits it.
+    let body_types: [Type; 2] = [
+        parse_quote!(Option<<Self as Tr>::A>),
+        parse_quote!(R1<<Self as Tr>::A>),
+    ];
+    for body in body_types {
+        let tr: ItemTrait = parse_quote!(
+            pub trait Tr {
+                type A;
+                fn f(&self) -> R1<<Self as Tr>::A> {
+                    trait Tr {
+                        type A;
+                    }
+                    let x: #body = None;
+                    todo!()
+                }
+            }
+        );
+        let projection = Projection::new(
+            parse_quote!(Repeater),
+            7,
+            ImplSelf::Param(parse_quote!(__S)),
+        );
+        let key = projection.key(parse_quote!(0));
+        let expected = |output: Type| -> ItemTrait {
+            parse_quote!(
+                pub trait Tr {
+                    type A;
+                    fn f(&self) -> #output {
+                        trait Tr {
+                            type A;
+                        }
+                        let x: #body = None;
+                        todo!()
+                    }
+                }
+            )
+        };
+
+        // A nested copy: the trait nested in a scope, copied in `mod w`, whose own `Self` is the
+        // host that the closure gives.
+        let mut leaker = Leaker::new();
+        let (scope, ()) = leaker.enter_generics(&Generics::default(), |view| {
+            view.visit_item(&Item::Trait(tr.clone()))
+        });
+        let referrer = leaker.result().finish().unwrap();
+        assert_eq!(referrer.iter().count(), 1, "{}", s(&body));
+        let mut copy: ItemMod = parse_quote!(mod w { #tr });
+        referrer
+            .visitor(scope, &projection)
+            .with_nested_self(|requirement| match requirement {
+                SelfRequirement::Bound(_) => Some(parse_quote!(Host)),
+                _ => None,
+            })
+            .visit_item_mod_mut(&mut copy);
+        let inner = expected(parse_quote!(<Host as Repeater<(), #key>>::Type));
+        let expected_mod: ItemMod = parse_quote!(mod w { #inner });
+        assert_eq!(s(&copy), s(&expected_mod), "nested, {}", s(&body));
+
+        // A copy of the trait by itself: the same, with `Self`.
+        let mut leaker = Leaker::new();
+        let top = leaker.intern_trait(&tr);
+        let referrer = leaker.result().finish().unwrap();
+        let mut copy = tr.clone();
+        referrer
+            .visitor(top, &projection)
+            .visit_item_trait_mut(&mut copy);
+        let expected_top = expected(parse_quote!(<Self as Repeater<(), #key>>::Type));
+        assert_eq!(s(&copy), s(&expected_top), "top level, {}", s(&body));
+    }
 }

@@ -507,15 +507,17 @@ fn self_of_a_struct_enum_union_and_impl() {
 }
 
 #[test]
-fn self_of_a_module_is_that_of_its_items() {
-    let m: ItemMod = parse_quote! {
-        mod m {
-            pub struct S<T> { a: Rel<Self, T> }
-            pub trait Tr { fn f(&self) -> Rel2<Self>; }
-        }
-    };
+fn nested_items_have_a_self_of_their_own() {
+    let items: [Item; 2] = [
+        parse_quote! { pub struct S<T> { a: Rel<Self, T> } },
+        parse_quote! { pub trait Tr { fn f(&self) -> Rel2<Self>; } },
+    ];
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&m);
+    leaker.enter_generics(&Generics::default(), |view| {
+        for item in &items {
+            view.visit_item(item);
+        }
+    });
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(selfs(&referrer), ["Self = S < T >", "Self: Tr"]);
     assert_eq!(

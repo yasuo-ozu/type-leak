@@ -135,11 +135,11 @@ fn the_span_of_self_without_meaning_is_each_mention() {
         assert_span_at(item.notes[0].0.span(), source, needle, nth);
         assert_span_at(item.help.as_ref().unwrap().0.span(), source, needle, nth);
     }
-    // In a type that the View visits, in a module.
+    // In a type that the View visits, in a scope without generics.
     let source = "Wrap<Self>";
     let ty: Type = parse_str(source).unwrap();
     let mut leaker = Leaker::new();
-    leaker.enter_mod("m", [], |view| view.visit_type(&ty));
+    leaker.enter_generics(&Generics::default(), |view| view.visit_type(&ty));
     let result = leaker.result();
     let items = result.errors();
     assert_span_at(items[0].span(), source, "Self", 0);
@@ -481,11 +481,11 @@ fn a_macro_cause_of_a_value_and_of_self_is_in_the_item() {
     for (token, start, end) in token_places(items[0].cause.to_token_stream()) {
         assert_eq!((start.0, end.0), (3, 3), "{}", token);
     }
-    // `Self` where a module gives it no meaning, in the path of a macro.
+    // `Self` where a scope gives it no meaning, in the path of a macro.
     let source = "Wrap<[u8; Self::two!()]>";
     let ty: Type = parse_str(source).unwrap();
     let mut leaker = Leaker::new();
-    leaker.enter_mod("m", [], |view| view.visit_type(&ty));
+    leaker.enter_generics(&Generics::default(), |view| view.visit_type(&ty));
     let result = leaker.result();
     let selfs: Vec<&ErrorItem> = result
         .errors()

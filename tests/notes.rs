@@ -201,23 +201,19 @@ fn a_relative_trait_of_the_impl_is_written_as_an_absolute_path() {
             written
         );
     }
-    // An absolute path of an allowed crate, or one of the module, is named as it is.
-    let item: ItemMod = parse_quote!(
-        mod m {
-            trait Tr {}
-            impl Tr for S {
-                type A = u8;
-                fn f(&self, x: Wrap<Self::A>) {}
-            }
+    // An absolute path of an allowed crate is named as it is.
+    let item: ItemImpl = parse_quote!(
+        impl ::p::Tr for ::p::S {
+            type A = u8;
+            fn f(&self, x: Wrap<Self::A>) {}
         }
     );
-    let mut leaker = leaker();
-    leaker.intern_mod(&item);
-    let result = leaker.result();
-    let err = result.errors();
-    let items = shown(err);
+    let items = shown(&error(&item));
     assert_eq!(items.len(), 1, "{:?}", items);
-    assert_eq!(items[0].help, "replace `Self::A` with `<Self as Tr>::A`");
+    assert_eq!(
+        items[0].help,
+        "replace `Self::A` with `<Self as ::p::Tr>::A`"
+    );
 }
 
 /// A struct, an enum or a union has no trait, and neither has an inherent impl: the help tells to

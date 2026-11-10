@@ -1,12 +1,12 @@
 //! Regression tests for the analysis of the `Leaker`: the requirements of the leaked types, the
-//! module keys, the causes found in trait objects, impls, macros and qualified paths, and the
-//! assumptions about primitive types.
+//! causes found in trait objects, impls, macros and qualified paths, and the assumptions about
+//! primitive types.
 
 mod common;
 
 use common::{check_in, entries_with_generics as entries, s, starts_with, to_syn_error};
 use syn::*;
-use type_leak::{Allow, Leaker, LeakerResult, Referrer, Rules, SelfRequirement};
+use type_leak::{Allow, Leaker, Referrer, Rules, SelfRequirement};
 
 fn config() -> Rules {
     Rules::new()
@@ -34,42 +34,6 @@ fn assertions_of<A: Allow>(config: A, item: &ItemTrait) -> String {
     let assertions = leaker.assertions().to_string();
     leaker.result().finish().unwrap();
     assertions
-}
-
-/// The result of the analysis of the module `item` (it has no error), or the text of its errors.
-fn leak_module_result_with<A: Allow>(
-    config: A,
-    item: &ItemMod,
-) -> std::result::Result<LeakerResult, String> {
-    let mut leaker = Leaker::with_rule(config);
-    leaker.intern_mod(item);
-    let result = leaker.result();
-    if result.errors().is_empty() {
-        Ok(result)
-    } else {
-        Err(to_syn_error(result.errors()).to_string())
-    }
-}
-
-/// The Referrer of the module `item`, or the text of its errors.
-fn leak_module_with<A: Allow>(config: A, item: &ItemMod) -> std::result::Result<Referrer, String> {
-    leak_module_result_with(config, item).map(LeakerResult::into_referrer)
-}
-
-/// The path of the module of each entry (see `Referrer::module_path()`).
-fn modules(result: &LeakerResult) -> Vec<Option<Vec<String>>> {
-    let referrer = &result.clone().into_referrer();
-    (0..referrer.iter().count())
-        .map(|ix| {
-            common::in_module(common::entry(referrer, ix)).map(|_| {
-                common::entry_module_path(result, ix)
-                    .unwrap()
-                    .iter()
-                    .map(|i| i.to_string())
-                    .collect()
-            })
-        })
-        .collect()
 }
 
 fn e(ty: &str, generics: &str) -> (String, String) {
@@ -343,106 +307,34 @@ fn references_imply_outlives_bounds() {
 }
 
 #[test]
-fn module_key_follows_module_relative_requirements() {
-    // The meaning of `Self` is module-relative, although the type itself is not.
-    let m: ItemMod = parse_quote! {
-        mod m {
-            pub mod a { pub struct S(::p::W<'x, Self>); }
-            pub mod b { pub struct S(::p::W<'x, Self>); }
-        }
-    };
-    let result = leak_module_result_with(config(), &m).unwrap();
-    let referrer = result.clone().into_referrer();
-    assert_eq!(referrer.iter().count(), 2);
-    assert_eq!(
-        modules(&result),
-        [Some(vec!["a".to_string()]), Some(vec!["b".to_string()])]
-    );
-    // The bounds of the generics are.
-    let m: ItemMod = parse_quote! {
-        mod m {
-            pub mod a { pub trait L {} pub struct S<T: L>(::p::W<'x, T>); }
-            pub mod b { pub trait L {} pub struct S<T: L>(::p::W<'x, T>); }
-        }
-    };
-    let result = leak_module_result_with(config(), &m).unwrap();
-    let referrer = result.clone().into_referrer();
-    assert_eq!(
-        entries(&referrer),
-        [
-            e(":: p :: W < 'x , T >", "< T : L >"),
-            e(":: p :: W < 'x , T >", "< T : L >")
-        ]
-    );
-    assert_eq!(
-        modules(&result),
-        [Some(vec!["a".to_string()]), Some(vec!["b".to_string()])]
-    );
-    // A type which depends on no module is not keyed.
-    let m: ItemMod = parse_quote! {
-        mod m {
-            pub mod a { pub struct S<T: ::p::L>(::p::W<'x, T>); }
-            pub mod b { pub struct S<T: ::p::L>(::p::W<'x, T>); }
-        }
-    };
-    let result = leak_module_result_with(config(), &m).unwrap();
-    let referrer = result.clone().into_referrer();
-    assert_eq!(referrer.iter().count(), 1);
-    assert_eq!(modules(&result), [None]);
-}
-
-#[test]
 fn impl_trait_path_is_checked_like_a_bound() {
-    let m: ItemMod = parse_quote! {
-        mod m { pub struct S; impl Tr for S {} }
+    let leak = |items: &[ItemImpl]| {
+        let mut leaker = Leaker::with_rule(config());
+        for item in items {
+            leaker.intern_impl(item);
+        }
+        leaker
+            .result()
+            .finish()
+            .map_err(|e| to_syn_error(&e).to_string())
     };
-    let err = leak_module_with(config(), &m).err().unwrap();
+    let err = leak(&[parse_quote! { impl Tr for () {} }]).err().unwrap();
     assert!(err.contains("use absolute path: 'Tr'"), "{}", err);
-    let m: ItemMod = parse_quote! {
-        mod m { pub struct S; impl Clone for S {} }
-    };
-    let err = leak_module_with(config(), &m).err().unwrap();
+    let err = leak(&[parse_quote! { impl Clone for () {} }])
+        .err()
+        .unwrap();
     assert!(
         err.contains("use `::core::clone::Clone` instead of `Clone`"),
         "{}",
         err
     );
-    // A trait of the module, or an absolute path, is fine, and its arguments are analyzed.
-    let m: ItemMod = parse_quote! {
-        mod m {
-            pub struct S;
-            pub trait Tr<T> {}
-            impl Tr<Rel> for S {}
-            impl ::p::Tr<Rel2> for S {}
-        }
-    };
-    let referrer = leak_module_with(config(), &m).unwrap();
+    // An absolute path is fine, and its arguments are analyzed.
+    let referrer = leak(&[
+        parse_quote! { impl ::p::Tr<Rel> for () {} },
+        parse_quote! { impl ::p::Tr<Rel2> for () {} },
+    ])
+    .unwrap();
     assert_eq!(entries(&referrer), [e("Rel", ""), e("Rel2", "")]);
-}
-
-#[test]
-fn relative_use_is_not_portable_in_nested_modules() {
-    let m: ItemMod = parse_quote! {
-        mod m {
-            pub mod inner {
-                pub use super::super::Rel;
-                pub use ::p::Abs;
-                pub struct Item;
-                pub mod deeper { pub struct Deep; }
-            }
-            pub struct S(
-                inner::Rel, inner::Abs, inner::Item, inner::deeper::Deep, inner::Missing,
-                self::inner::Item,
-            );
-        }
-    };
-    let result = leak_module_result_with(config(), &m).unwrap();
-    let referrer = result.clone().into_referrer();
-    assert_eq!(
-        entries(&referrer),
-        [e("inner :: Missing", ""), e("inner :: Rel", "")]
-    );
-    assert_eq!(modules(&result), [Some(vec![]), Some(vec![])]);
 }
 
 #[test]
@@ -458,18 +350,6 @@ fn type_macros() {
     let mut leaker = Leaker::with_rule(config());
     leaker.intern_struct(&item);
     assert!(leaker.result().finish().is_ok());
-    // In a module, a macro is expanded where it is written, whatever its path is.
-    let m: ItemMod = parse_quote! {
-        mod m {
-            pub mod a { pub struct S(::p::m!(x)); }
-            pub mod b { pub struct S(::p::m!(x)); }
-        }
-    };
-    let result = leak_module_result_with(config(), &m).unwrap();
-    assert_eq!(
-        modules(&result),
-        [Some(vec!["a".to_string()]), Some(vec!["b".to_string()])]
-    );
 }
 
 #[test]
@@ -513,10 +393,12 @@ fn raw_identifiers_are_compared_by_name() {
         trait Tr<T> { fn f(&self) -> Rel<r#T>; }
     });
     assert_eq!(entries(&referrer), [e("Rel < r#T >", "< T >")]);
-    let m: ItemMod = parse_quote! {
-        mod m { pub struct S<r#T>(Rel<T>); }
+    let item: ItemStruct = parse_quote! {
+        pub struct S<r#T>(Rel<T>);
     };
-    let referrer = leak_module_with(config(), &m).unwrap();
+    let mut leaker = Leaker::with_rule(config());
+    leaker.intern_struct(&item);
+    let referrer = leaker.result().finish().unwrap();
     assert_eq!(entries(&referrer), [e("Rel < T >", "< r#T >")]);
 }
 

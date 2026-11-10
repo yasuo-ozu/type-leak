@@ -1,9 +1,9 @@
 //! The definition of the Repeater trait, encoding generics into its const slots, and the pieces of
 //! its impls ([`RepeaterImpl`], [`ImplSelf`]).
 
+use crate::context::Context;
 #[cfg(doc)]
 use crate::context::SelfRequirement;
-use crate::context::{Context, ModuleScope};
 use crate::encode::{const_param_primitive, encode_entry_args, EncodeError};
 #[cfg(doc)]
 use crate::referrer::Referrer;
@@ -377,8 +377,7 @@ pub enum ImplSelf {
 /// [`ToTokens`] writes the whole impl, `impl #generics #path for #self_ty { type Type = #ty; }`,
 /// with the `KEY` as the last argument of [`path`](RepeaterImpl::path). The `KEY` is
 /// [`Projection::key(entry)`](Projection::key) of the [`Projection`] given to `repeater_impls()`,
-/// so the caller adds nothing. It does not write [`entry`](RepeaterImpl::entry) or
-/// [`module`](RepeaterImpl::module): place the impl in the module, if it is `Some`.
+/// so the caller adds nothing. It does not write [`entry`](RepeaterImpl::entry).
 ///
 /// ```
 /// # use type_leak::*;
@@ -444,19 +443,6 @@ pub struct RepeaterImpl {
     pub path: Path,
     /// The leaked type, which is the `Type` of the impl.
     pub ty: Type,
-    /// The module in which to write the impl, if the entry is in one.
-    ///
-    /// It is the [`ModuleScope::Itself`] of that module, which tells where the module is. It is
-    /// `None` if the entry is in no module.
-    ///
-    /// ```ignore
-    /// // In crate a, analyzed with `intern_mod()`: the entry `Rel`.
-    /// pub mod outer { pub mod inner { pub struct S { a: Rel } } }
-    ///
-    /// // `module` of the impl of `Rel`, which is in `inner` (context 1):
-    /// Some(Itself { id: 1, path: Some([inner]), hint: None, parent: Some(0) })
-    /// ```
-    pub module: Option<ModuleScope>,
     /// The [`id`](Projection::id) of the [`Projection`] given to `repeater_impls()`: the high bits
     /// of the `KEY`.
     pub(crate) id: u64,
@@ -466,8 +452,7 @@ pub struct RepeaterImpl {
 ///
 /// `path_with_key` is [`path`](RepeaterImpl::path) with the `KEY` ([`Projection::key()`]) added as
 /// its last argument, for the [`Projection`] given to
-/// [`repeater_impls()`](crate::LeakerResult::repeater_impls). The impl is not wrapped in
-/// [`module`](RepeaterImpl::module).
+/// [`repeater_impls()`](crate::LeakerResult::repeater_impls).
 impl ToTokens for RepeaterImpl {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let imp: ItemImpl = self.clone().into();
@@ -491,8 +476,7 @@ impl RepeaterImpl {
     }
 }
 
-/// The impl as an [`ItemImpl`], with the `KEY` and not in [`module`](RepeaterImpl::module).
-/// [`ToTokens`] writes this.
+/// The impl as an [`ItemImpl`], with the `KEY`. [`ToTokens`] writes this.
 ///
 /// ```
 /// # use type_leak::*;

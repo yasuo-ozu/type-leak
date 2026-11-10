@@ -17,8 +17,8 @@ type_leak_test_macro::define_repeater!(pub Repeater);
 /// A type of the root of the crate named like a generic (`crate::U`, `kinds::PathsLikeGeneric`).
 pub struct U(pub u8);
 
-/// Types in a module that the Referrer's crate does not have, so `crate::base::B1<X>` left as
-/// written there would not compile (`kinds::declared_like_generic`).
+/// Types in a module that the Referrer's crate does not have, so `super::base::B2<..>` left as
+/// written there would not compile.
 pub mod base {
     pub struct B1<A: ?Sized>(pub core::marker::PhantomData<A>);
     pub struct B2<A, B>(pub A, pub B);
@@ -783,16 +783,6 @@ macro_rules! check_dollar_crate {
             { }
             trait C2 { fn g(&self) -> ::core::option::Option<Rel>; }
         }
-        // Modules: `use $crate::..` is portable.
-        check_leak! {
-            { Rel }
-            { }
-            mod mm {
-                use $crate::m::Portable;
-                pub struct S { a: Portable, b: Rel }
-            }
-        }
-
         // A relative path next to it is still an error.
         check_leak! {
             { error: "use absolute path: 'RelTrait'" }
@@ -1140,60 +1130,6 @@ pub mod kinds {
         }
     }
 
-    // Modules.
-
-    /// A module: what it declares (`Local`) is copied with it and is not leaked, the types it gets
-    /// from outside (`super::Rel`) are, and a nested module is analyzed too.
-    #[prop_leak(id = 9041)]
-    pub mod nested {
-        use super::{Pair, Rel, Wrap};
-
-        pub struct Local(pub u8);
-        pub struct Holds<T> {
-            pub rel: Rel,
-            pub wrapped: Wrap<T>,
-            pub pair: Pair<Rel, T>,
-            pub local: Local,
-        }
-        pub mod deeper {
-            use super::super::Rel;
-            pub struct Deep(pub Rel);
-        }
-    }
-
-    /// A bare identifier that is a const, in a path of another crate that names `Local`, which the
-    /// module declares (the copy declares it again, so the path is not leaked as a whole). `LEN2`
-    /// is imported with an absolute path, which declares it: it is copied as written, and the
-    /// copy compiles. `Rel` is leaked as usual.
-    #[prop_leak(id = 9101)]
-    pub mod declared_const {
-        use super::Rel;
-        use ::type_leak_test_leaker::kinds::LEN as LEN2;
-
-        pub struct Local(pub u8);
-        pub struct Holds {
-            pub rel: Rel,
-            pub len: ::type_leak_test_leaker::kinds::CW<Local, LEN2>,
-        }
-        pub mod deeper {
-            use super::super::LEN as LEN3;
-            pub struct Deep(pub ::type_leak_test_leaker::kinds::CW<u8, LEN3>);
-        }
-    }
-
-    /// The same, with `LEN4` imported from outside the module (`use super::LEN`): the Leaker cannot
-    /// leak the path that holds it, and it would leak `LEN4` as a type, which fails for a const, so
-    /// it rejects the module (the macro expands to nothing).
-    #[prop_leak(id = 9102)]
-    pub mod imported_const {
-        use super::LEN as LEN4;
-
-        pub struct Local(pub u8);
-        pub struct Holds {
-            pub len: ::type_leak_test_leaker::kinds::CW<Local, LEN4>,
-        }
-    }
-
     // Traits.
 
     /// A trait that does not name `Self` (`sumtype`'s way).
@@ -1241,14 +1177,14 @@ pub mod kinds {
         fn by_bound<T: ::type_leak_test_leaker::kinds::Sink<Rel>>(&self, x: T);
     }
 
-    // Items nested in a module (`scope = "mod"`: `enter_mod(..)` and `View::visit_item()`, as the
-    // items of `intern_mod()` are). The item has a `Self` of its own, and the types that name it
+    // Nested items (`scope = "nested"`: `View::visit_item()` in `enter_generics()` with no
+    // generics). The item has a `Self` of its own, and the types that name it
     // are relative (`Wrap<Self>`), so the Repeater's impl of such an entry is for the item itself,
     // here. The copy cannot name that type as `Self`: the visitor writes `Self`, and the test macro
     // gives the Leaker's type for it to `Visitor::with_nested_self()` (`nested_self()` in `prop.rs`).
 
     /// A struct that names its own `Self` in relative types, next to ones that do not.
-    #[prop_leak(id = 9061, scope = "mod")]
+    #[prop_leak(id = 9061, scope = "nested")]
     pub struct Links<T> {
         pub rel: Rel,
         pub wrapped: Wrap<T>,
@@ -1258,7 +1194,7 @@ pub mod kinds {
     }
 
     /// An enum, with `Self` in the generics of a variant that a bound names too.
-    #[prop_leak(id = 9062, scope = "mod")]
+    #[prop_leak(id = 9062, scope = "nested")]
     pub enum Step<T> {
         Rel(Rel),
         Wrapped(Wrap<T>),
@@ -1268,7 +1204,7 @@ pub mod kinds {
     }
 
     /// A trait: `Self` is the implementor, and the Referrer's crate implements the trait for a host.
-    #[prop_leak(id = 9063, scope = "mod")]
+    #[prop_leak(id = 9063, scope = "nested")]
     pub trait Walk<T> {
         fn me(&self) -> Wrap<Self>;
         fn rel(&self, x: Pair<Rel, T>) -> Wrap<T>;
@@ -1282,7 +1218,7 @@ pub mod kinds {
     // type, `Self` (`SelfRequirement::Any`).
 
     /// The bound is on the parameter.
-    #[prop_leak(id = 9111, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9111, scope = "nested", prelude = true)]
     pub struct Owned<T: AsRef<Self>> {
         pub rel: Rel,
         pub wrapped: Wrap<T>,
@@ -1290,14 +1226,14 @@ pub mod kinds {
     }
 
     /// The bound is a where predicate, and names `Self` among other types.
-    #[prop_leak(id = 9112, scope = "mod")]
+    #[prop_leak(id = 9112, scope = "nested")]
     pub struct Tagged<T>(pub Wrap<T>, pub u8)
     where
         T: ::core::convert::AsRef<(Self, u8)>;
 
     /// The report of the property test: an enum with a lifetime, a const parameter with a default,
     /// and a bound that names `Self` twice and a relative type (`Lt<'a, Rel>`).
-    #[prop_leak(id = 9113, scope = "mod")]
+    #[prop_leak(id = 9113, scope = "nested")]
     pub enum Reported<'a, T: ::core::marker::Send + 'a, const V: usize = 3>
     where
         T: ::core::convert::AsRef<::std::collections::BTreeMap<(Self, Self), self::Lt<'a, Rel>>>,
@@ -1307,7 +1243,7 @@ pub mod kinds {
     }
 
     /// A union.
-    #[prop_leak(id = 9114, scope = "mod")]
+    #[prop_leak(id = 9114, scope = "nested")]
     pub union Overlaid<T: ::core::marker::Copy + ::core::convert::AsRef<Self>> {
         pub wrapped: Wrap<T>,
         pub rel: Rel,
@@ -1316,7 +1252,7 @@ pub mod kinds {
     /// A type that names `Self` and has a generic with a bound that names it: it is for the
     /// Leaker's type, which the bound does not hold for in the copy. The Leaker rejects it (the
     /// macro expands to nothing); `Wrap<T>`, which does not name `Self`, is the supported case.
-    #[prop_leak(id = 9115, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9115, scope = "nested", prelude = true)]
     pub struct Both<T: AsRef<Self>> {
         pub me: Wrap<Self>,
         pub wrapped: Wrap<T>,
@@ -1324,27 +1260,27 @@ pub mod kinds {
 
     /// The entry is in a bound of another generic (`U: Into<Wrap<T>>`), where the copy's `Self` is
     /// the type being declared.
-    #[prop_leak(id = 9116, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9116, scope = "nested", prelude = true)]
     pub struct Chain<T: AsRef<Self>, U: Into<Wrap<T>>>(pub T, pub U);
 
     /// The entry is in a where predicate.
-    #[prop_leak(id = 9117, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9117, scope = "nested", prelude = true)]
     pub struct InPredicate<T: AsRef<Self>>(pub T)
     where
         Wrap<T>: Sized;
 
     /// The entry has a lifetime, which the bound `T: 'a` keeps.
-    #[prop_leak(id = 9118, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9118, scope = "nested", prelude = true)]
     pub struct Outlives<'a, T: AsRef<Self> + 'a>(pub &'a Wrap<T>, pub T);
 
     /// `Self: 'a` is written, so the arguments of the Repeater encode `&'a Self`: the copy's own.
-    #[prop_leak(id = 9119, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9119, scope = "nested", prelude = true)]
     pub struct SelfOutlived<'a, T: AsRef<Self>>(pub &'a Wrap<T>, pub T)
     where
         Self: 'a;
 
     /// A predicate on `Self` alone is in the context of the entry too.
-    #[prop_leak(id = 9120, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9120, scope = "nested", prelude = true)]
     pub struct SelfSized<T: AsRef<Self>>(pub Wrap<T>, pub T)
     where
         Self: Sized;
@@ -1355,28 +1291,28 @@ pub mod kinds {
     // the type to be `Sized`), which shows on those toolchains only.
 
     /// The bound is `AsRef<Self>`: the impl is `?Sized`, the entry is the last field.
-    #[prop_leak(id = 9125, scope = "mod")]
+    #[prop_leak(id = 9125, scope = "nested")]
     pub struct Last<T: ::core::convert::AsRef<Self>> {
         pub rel: Rel,
         pub wrapped: Wrap<T>,
     }
 
     /// An enum: its variants are checked as fields (on rustc 1.56 too).
-    #[prop_leak(id = 9126, scope = "mod")]
+    #[prop_leak(id = 9126, scope = "nested")]
     pub enum Alternative<T: ::core::convert::AsRef<Self>> {
         Plain(u8),
         Wrapped(Wrap<T>),
     }
 
     /// `Self` is behind a `Box`, and the argument of `Borrow`: still `?Sized`.
-    #[prop_leak(id = 9127, scope = "mod")]
+    #[prop_leak(id = 9127, scope = "nested")]
     pub struct Pointed<
         T: ::core::convert::AsRef<::std::boxed::Box<Self>> + ::core::borrow::Borrow<Self>,
     >(pub u8, pub Wrap<T>);
 
     /// `Self` in a tuple: the impl keeps `Sized` (the tuple needs it), the entry is not the last
     /// field.
-    #[prop_leak(id = 9128, scope = "mod")]
+    #[prop_leak(id = 9128, scope = "nested")]
     pub struct Tupled<T: ::core::convert::AsRef<(Self, u8)>> {
         pub wrapped: Wrap<T>,
         pub tag: u8,
@@ -1389,7 +1325,7 @@ pub mod kinds {
 
     /// A bound that names `Self`, an absolute type that names it too, and a relative type that uses
     /// the generic (`Wrap<T>`, for any type that the bound holds for).
-    #[prop_leak(id = 9121, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9121, scope = "nested", prelude = true)]
     pub struct Pathed<T: AsRef<Self>> {
         pub path: ::type_leak_test_leaker::kinds::Pair<::core::marker::PhantomData<Self>, T>,
         pub wrapped: Wrap<T>,
@@ -1397,14 +1333,14 @@ pub mod kinds {
     }
 
     /// A recursive type: `Self` in a box.
-    #[prop_leak(id = 9122, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9122, scope = "nested", prelude = true)]
     pub struct List {
         pub next: Option<::std::boxed::Box<Self>>,
         pub rel: Rel,
     }
 
     /// An enum with `Self` in a box in a vector, and in a pair next to a relative type.
-    #[prop_leak(id = 9124, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9124, scope = "nested", prelude = true)]
     pub enum Tree<T> {
         Leaf(Rel),
         Branch(Vec<::std::boxed::Box<Self>>),
@@ -1428,7 +1364,7 @@ pub mod kinds {
     /// The impls of the entries that do not name `Self` (`Rel`, `Defd2<Rel, u8>`, `Defd<V>`) are
     /// for a primitive type that the id and the index choose (`ImplSelf::Bucket`), and those that
     /// do (`Wrap<Self>`) are for the implementor. The default `Defd<T>` is one of the first.
-    #[prop_leak(id = 9209, scope = "mod", prelude = true, redeclare = true)]
+    #[prop_leak(id = 9209, scope = "nested", prelude = true, redeclare = true)]
     pub trait BucketMix<T, U = Defd<T>> {
         fn plain(&self) -> Rel;
         fn plain_pair(&self) -> Defd2<Rel, u8>;
@@ -1461,7 +1397,7 @@ pub mod kinds {
     }
 
     /// One default, written for the host: `T: AsRef<Host>` holds for the types that it is used with.
-    #[prop_leak(id = 9131, scope = "mod", prelude = true, redeclare = true)]
+    #[prop_leak(id = 9131, scope = "nested", prelude = true, redeclare = true)]
     pub trait SelfDefault<T: AsRef<Self>, U = Defd<T>> {
         fn get(&self, t: T, u: U);
     }
@@ -1469,7 +1405,7 @@ pub mod kinds {
     /// Two defaults (the second has an entry of its own, `Defd2<Rel, T>`), for a Referrer that
     /// replaces the optional entries. (A method of the copy cannot name an entry: the declaration
     /// has `T: AsRef<Self>`, and the path through the host needs `T: AsRef<Host>`.)
-    #[prop_leak(id = 9132, scope = "mod", prelude = true, redeclare = true)]
+    #[prop_leak(id = 9132, scope = "nested", prelude = true, redeclare = true)]
     pub trait SelfDefaults<T: AsRef<Self>, U = Defd<T>, V = Defd2<Rel, T>> {
         fn get(&self, t: T, u: U, v: V);
     }
@@ -1483,11 +1419,11 @@ pub mod kinds {
     // the default is the type of the original there.
 
     /// The bound names `Self` next to one that does not (`Clone`, which stays in the impl).
-    #[prop_leak(id = 9151, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9151, scope = "nested", prelude = true)]
     pub struct SelfBoundDefault<T: Clone + AsRef<Self>, U = Defd<T>>(pub T, pub U);
 
     /// An enum, the bound in a where predicate.
-    #[prop_leak(id = 9152, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9152, scope = "nested", prelude = true)]
     pub enum SelfBoundDefaultEnum<T, U = Defd<T>>
     where
         T: Clone + AsRef<Self>,
@@ -1498,11 +1434,11 @@ pub mod kinds {
 
     /// The default and a field have the same type: the default is an entry without `Self`, and the
     /// field one for any type (the copy passes its own).
-    #[prop_leak(id = 9153, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9153, scope = "nested", prelude = true)]
     pub struct DefaultAndField<T: AsRef<Self>, U = Defd<T>>(pub T, pub U, pub Defd<T>);
 
     /// Two defaults, the second names the first.
-    #[prop_leak(id = 9154, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9154, scope = "nested", prelude = true)]
     pub struct TwoDefaults<T: AsRef<Self>, U = Defd<T>, V = Defd2<Rel, U>>(pub T, pub U, pub V);
 
     // Items nested in a module whose generics have a bound that names their own `Self`, and a type
@@ -1516,14 +1452,24 @@ pub mod kinds {
 
     /// The bound is on the parameter. The entry is not the last field: rustc before 1.70 cannot
     /// prove that the copy is `Sized` otherwise (E0275).
-    #[prop_leak(id = 9161, scope = "mod", prelude = true, nested_self_entries = true)]
+    #[prop_leak(
+        id = 9161,
+        scope = "nested",
+        prelude = true,
+        nested_self_entries = true
+    )]
     pub struct Linked<T: AsRef<Self>> {
         pub link: Link<Self, T>,
         pub rel: Rel,
     }
 
     /// An enum, with `where Self: Sized` for rustc 1.56, and an entry that does not use the generic.
-    #[prop_leak(id = 9162, scope = "mod", prelude = true, nested_self_entries = true)]
+    #[prop_leak(
+        id = 9162,
+        scope = "nested",
+        prelude = true,
+        nested_self_entries = true
+    )]
     pub enum Variant<T: AsRef<Self>>
     where
         Self: Sized,
@@ -1534,13 +1480,23 @@ pub mod kinds {
     }
 
     /// The bound is a where predicate that names `Self` among other types.
-    #[prop_leak(id = 9163, scope = "mod", prelude = true, nested_self_entries = true)]
+    #[prop_leak(
+        id = 9163,
+        scope = "nested",
+        prelude = true,
+        nested_self_entries = true
+    )]
     pub struct Tuple<T>(pub Vec<Link<Self, u8>>, pub T, pub Rel)
     where
         T: AsRef<(Self, u8)>;
 
     /// No bound names `Self`: there is no risk, and the entry is for the Leaker's type.
-    #[prop_leak(id = 9164, scope = "mod", prelude = true, nested_self_entries = true)]
+    #[prop_leak(
+        id = 9164,
+        scope = "nested",
+        prelude = true,
+        nested_self_entries = true
+    )]
     pub struct Unbound<T: Clone> {
         pub link: Link<Self, T>,
         pub rel: Rel,
@@ -1816,19 +1772,6 @@ pub mod kinds {
         fn trait_generic(&self, x: T, y: self::U) -> Pair<crate::U, T>;
     }
 
-    /// A module that declares `X`, next to a struct whose generic is named `X`: `B1<X>` of the
-    /// generic is an entry of no module (a type of another module of this crate), and the one of
-    /// the declared `X` is an entry of the module. Both are written `crate::base::B1<X>`.
-    #[prop_leak(id = 9093)]
-    pub mod declared_like_generic {
-        pub struct X(pub u8);
-        pub struct Generic<X>(pub crate::base::B1<X>, pub crate::base::B2<X, u8>);
-        pub struct Declared(pub crate::base::B1<X>);
-        pub mod inner {
-            pub struct Deeper<X>(pub crate::base::B1<X>);
-        }
-    }
-
     // The types in the values of an item (`check_values`, `values = true`): the
     // default of an associated const, a default method, the const, static and function of a
     // module. The Leaker leaks the type in a cast, a `let`, a closure, a turbofish and a qualified
@@ -1863,7 +1806,7 @@ pub mod kinds {
     /// method. The Referrer's crate declares the copy (`ValueTypesCopy`).
     #[prop_leak(
         id = 9141,
-        scope = "mod",
+        scope = "nested",
         prelude = true,
         redeclare = true,
         values = true
@@ -1890,24 +1833,6 @@ pub mod kinds {
             ::core::mem::size_of_val(&h)
                 + ::core::mem::size_of_val(&k) * 100
                 + ::core::mem::size_of::<vals::Holder<T>>() * 10_000
-        }
-    }
-
-    /// The values of a module: a const, a static and a function that read a type the module does
-    /// not declare, and one it does (copied with it).
-    #[prop_leak(id = 9142, prelude = true, values = true)]
-    pub mod values_in_module {
-        pub struct Declared(pub u8);
-
-        pub const SIZE: usize = ::core::mem::size_of::<Declared>()
-            + ::core::mem::size_of::<crate::kinds::vals::Local>();
-
-        pub static TAG: usize = ::core::mem::size_of::<crate::kinds::vals::Holder<u16>>();
-
-        pub fn total() -> usize {
-            let a: crate::kinds::vals::Local = ::core::default::Default::default();
-            let b: Declared = Declared(1);
-            a.count() + b.0 as usize + <crate::kinds::vals::Local>::BYTES
         }
     }
 
@@ -2218,13 +2143,13 @@ pub mod kinds {
         pub fn g(&self, _y: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>) {}
     }
 
-    /// A struct nested in a module (`scope = "mod"`) with a generic whose bound names its `Self`,
+    /// A struct nested in a module (`scope = "nested"`) with a generic whose bound names its `Self`,
     /// and a field that names it too: `NestedSelfInBounds`, an entry for any type, which the copy
     /// writes with its own type. `bare` is an entry beside it.
     #[prop_leak_accept(
         id = 9198,
         prelude = true,
-        scope = "mod",
+        scope = "nested",
         allow = "::type_leak_test_leaker::kinds::Bare"
     )]
     pub struct NestedSelfObject<'a, T: ::core::convert::AsRef<Self>> {
@@ -2259,7 +2184,7 @@ pub mod kinds {
     /// error).
     #[prop_leak_accept(
         id = 9205,
-        scope = "mod",
+        scope = "nested",
         prelude = true,
         redeclare = true,
         values = true,
@@ -2278,7 +2203,12 @@ pub mod kinds {
     /// `Sized` there). `intern_struct()` rejects it (`UnprovableBound`); the nested item has to as
     /// well: the macro's `nested_self_entries` allows only the `NestedSelfInBounds` risk, and the
     /// `UnprovableBound` stays.
-    #[prop_leak(id = 9206, scope = "mod", prelude = true, nested_self_entries = true)]
+    #[prop_leak(
+        id = 9206,
+        scope = "nested",
+        prelude = true,
+        nested_self_entries = true
+    )]
     pub struct LeakedInBound<T: AsRef<Wrap<Self>>> {
         pub rel: Rel,
         pub link: Link<Self, T>,
@@ -2315,7 +2245,7 @@ pub mod kinds {
     /// writes them as they are; the entries are the relative types.
     #[prop_leak(
         id = 9208,
-        scope = "mod",
+        scope = "nested",
         prelude = true,
         redeclare = true,
         values = true,
@@ -2369,7 +2299,7 @@ pub mod kinds {
     /// parameters (E0308). The original and the copy compute the same.
     #[prop_leak(
         id = 9249,
-        scope = "mod",
+        scope = "nested",
         prelude = true,
         redeclare = true,
         values = true
@@ -2436,7 +2366,7 @@ pub mod kinds {
     /// relative paths. The Leaker rejected them (`use absolute path: 'x'`), so the Referrer's crate
     /// lacked `DiscriminantBindings`. The copy writes them as they are, in a crate that has none of
     /// the Leaker's names.
-    #[prop_leak(id = 9215, scope = "mod")]
+    #[prop_leak(id = 9215, scope = "nested")]
     pub enum DiscriminantBindings {
         Let = {
             let x = 3;
@@ -2460,7 +2390,7 @@ pub mod kinds {
     }
 
     /// F56: the default of the const parameter binds a name (`n`). It was rejected as well.
-    #[prop_leak(id = 9216, scope = "mod")]
+    #[prop_leak(id = 9216, scope = "nested")]
     pub struct DefaultBinding<
         const N: usize = {
             let n = 2;
@@ -2478,7 +2408,7 @@ pub mod kinds {
     /// F56: a discriminant that calls a macro of this crate (`rel_two!`) by a relative path. The
     /// Leaker did not report it, and the copy in the Referrer's crate could not resolve the macro.
     /// It is rejected now: the Referrer's macro expands to nothing.
-    #[prop_leak(id = 9217, scope = "mod")]
+    #[prop_leak(id = 9217, scope = "nested")]
     pub enum RelativeMacroDiscriminant {
         Two = rel_two!(),
     }
@@ -2490,7 +2420,7 @@ pub mod kinds {
 
     /// F56: the default of a const parameter that writes a struct of this crate as a literal
     /// (`RelPoint { a: 1 }`). Not reported before, and the copy could not resolve `RelPoint`.
-    #[prop_leak(id = 9218, scope = "mod")]
+    #[prop_leak(id = 9218, scope = "nested")]
     pub struct LiteralDefault<const N: usize = { RelPoint { a: 1 }.a }>(pub [u8; N]);
 
     // F64 (`tests/findings.rs`): a bound that stays in the context of an entry and names its
@@ -2531,7 +2461,7 @@ pub mod kinds {
     /// `Self`. The completion of the arguments found no entry for it and left it as written, a type that
     /// the Referrer's crate does not import (E0412). The trait is not declared again there: the
     /// use site completes the arguments.
-    #[prop_leak(id = 9224, scope = "mod", prelude = true)]
+    #[prop_leak(id = 9224, scope = "nested", prelude = true)]
     pub trait NestedSelfBoundDefault<T: AsRef<Self>, U = Defd<T>> {
         fn get(&self, t: T, u: U);
     }
@@ -2810,7 +2740,7 @@ pub mod kinds {
     /// error (`ignore_risks`), so the entry has no impl and the copy writes the field as it is, with
     /// its own `Self`; `rel` is an entry beside it. (With `nested_self_entries = true`, which only
     /// takes the risk, this crate does not build.)
-    #[prop_leak_accept(id = 9261, prelude = true, scope = "mod", ignore_risks = true)]
+    #[prop_leak_accept(id = 9261, prelude = true, scope = "nested", ignore_risks = true)]
     pub struct IgnoredEntry<T: ::core::convert::AsRef<Self>> {
         pub needs: NeedsClone<Self, T>,
         pub rel: Rel,

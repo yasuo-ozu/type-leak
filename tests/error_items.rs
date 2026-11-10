@@ -369,7 +369,7 @@ fn reason_self_in_default() {
 /// A type that names the `Self` of a nested struct, with a generic whose bound names it too.
 fn nested_self_in_bounds() -> LeakerResult {
     run(leaker_from(allowing_config()), |leaker| {
-        leaker.enter_mod("m", [id("S")], |view| {
+        leaker.enter_generics(&Generics::default(), |view| {
             view.visit_item(&parse_quote!(
                 struct S<T: ::core::convert::AsRef<Self>>(Rel2<Self, T>);
             ))

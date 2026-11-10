@@ -2130,13 +2130,14 @@ mod elided {
                 NOTE, HELP_METHOD
             )
         );
-        // A function item of a module has no receiver either.
-        let item: ItemMod =
-            parse_quote! { mod m { pub fn g<'a, T: 'a>(x: &Rel<T>) -> &u8 { loop {} } } };
-        let mut module_leaker = leaker();
-        module_leaker.intern_mod(&item);
+        // A free function has no receiver either.
+        let item: ItemFn = parse_quote! { pub fn g<'a, T: 'a>(x: &Rel<T>) -> &u8 { loop {} } };
+        let mut fn_leaker = leaker();
+        fn_leaker.enter_generics(&Generics::default(), |view| {
+            view.visit_item(&Item::Fn(item.clone()))
+        });
         assert_eq!(
-            module_leaker.result().errors()[0]
+            fn_leaker.result().errors()[0]
                 .notes
                 .first()
                 .map(|(_, n)| n.as_str()),

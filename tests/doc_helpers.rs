@@ -6,20 +6,16 @@ use syn::*;
 use template_quote::ToTokens;
 use type_leak::*;
 
-/// `repeater_impls()` returns the pieces of an impl, and the module in which to write it.
+/// `repeater_impls()` returns the pieces of an impl.
 #[test]
-fn repeater_impl_pieces_make_the_impl_and_name_its_module() {
-    let item: ItemMod = parse_quote!(
-        mod m {
-            mod inner {
-                struct S {
-                    a: Outside,
-                }
-            }
+fn repeater_impl_pieces_make_the_impl() {
+    let item: ItemStruct = parse_quote!(
+        struct S {
+            a: Outside,
         }
     );
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&item);
+    leaker.intern_struct(&item);
     let result = leaker.result();
 
     let repeater: Path = parse_quote!(crate::Repeater);
@@ -41,16 +37,6 @@ fn repeater_impl_pieces_make_the_impl_and_name_its_module() {
         }
     };
     assert_eq!(imp, expected);
-
-    // `Outside` is a relative path: it means something in `m::inner` only. Write the impl there.
-    let path = match &r.module {
-        Some(ModuleScope::Itself {
-            path: Some(path), ..
-        }) => path,
-        _ => panic!("not a module of intern_mod()"),
-    };
-    assert_eq!(path.len(), 1);
-    assert_eq!(path[0], "inner");
 }
 
 /// The encoder passes the generics by name in the scope of the analysis, and `substitute_args()`

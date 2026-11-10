@@ -288,10 +288,9 @@ fn the_context_of_an_entry_keeps_its_id_and_the_top_level_comes_after() {
 }
 
 /// Every scope of generics has its top-level context declared: a struct, an enum, a union, an impl,
-/// `enter_generics()`, and a scope inside `enter_mod()` (which is in that module too). A module
-/// has none.
+/// `enter_generics()`, and a scope inside another one.
 #[test]
-fn every_scope_of_generics_completes_arguments_and_a_module_does_not() {
+fn every_scope_of_generics_completes_arguments() {
     let given = arguments(&["u8"]);
     let defaulted: Generics = parse_quote!(<T, U = Vec<T>>);
     let complete = |referrer: &Referrer, context: ContextId| -> Vec<String> {
@@ -345,9 +344,9 @@ fn every_scope_of_generics_completes_arguments_and_a_module_does_not() {
                 .0,
         ),
         (
-            "a trait in a module",
+            "a trait in a scope",
             leaker
-                .enter_mod("m", [], |view| {
+                .enter_generics(&Generics::default(), |view| {
                     view.enter_trait(&parse_quote!(Tr), &defaulted, |_| ()).0
                 })
                 .1,
@@ -363,21 +362,6 @@ fn every_scope_of_generics_completes_arguments_and_a_module_does_not() {
             case
         );
     }
-
-    // The context of a module has no generics as declared.
-    let mut leaker = Leaker::new();
-    let module = leaker.intern_mod(&parse_quote!(
-        mod m {}
-    ));
-    let referrer = leaker.result().into_referrer();
-    let result = std::panic::catch_unwind(|| {
-        let _ = referrer.complete_args(
-            module,
-            &[],
-            &Projection::new(repeater(), 0, ImplSelf::Param(parse_quote!(__S))),
-        );
-    });
-    assert!(result.is_err());
 }
 
 /// A default that names `Self` (`U = Rel<Self>`) is a known limit: the Leaker reports it, and the
@@ -535,9 +519,9 @@ fn a_malformed_declaration_is_refused() {
             "expected",
         ),
         (
-            "the declaration of a module",
+            "a module word after the generics as declared",
             "declared < > ; mod { path = [] } ; ()",
-            "has no generics",
+            "expected parentheses",
         ),
         (
             "a declaration twice",

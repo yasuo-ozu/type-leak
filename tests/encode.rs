@@ -1231,26 +1231,6 @@ fn complete_args_fails_for_each_error() {
     }
 }
 
-/// `complete_args()` panics for a context that is not the Referrer's, or has no generics as
-/// declared (a module).
-#[test]
-#[should_panic(expected = "has no generics as declared")]
-fn complete_args_panics_for_a_module() {
-    let mut leaker = Leaker::new();
-    let context = leaker.intern_mod(&parse_quote!(
-        mod m {
-            pub struct S<T>(Rel<T>);
-        }
-    ));
-    let referrer = leaker.result().finish().unwrap();
-    let repeater = repeater();
-    let _ = referrer.complete_args(
-        context,
-        &[],
-        &Projection::new(repeater.clone(), 0, ImplSelf::Param(parse_quote!(__S))),
-    );
-}
-
 #[test]
 #[should_panic(expected = "is not one of this Referrer")]
 fn complete_args_panics_for_a_context_that_is_not_the_referrers() {

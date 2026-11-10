@@ -1220,7 +1220,8 @@ fn test_reduce_roots_reference_with_a_lifetime_the_copy_would_leave_unconstraine
     });
     assert_eq!(leaked, [entry(parse_quote!(&'a dyn RelTr), "< 'a >")]);
     // A method of a trait or of an impl of a trait is checked, the function which is the analyzed
-    // item and a function of a module are not, nor a method of an inherent impl (see paths, F22).
+    // item and a function nested in a scope are not, nor a method of an inherent impl (see paths,
+    // F22).
     let item: ItemFn = parse_quote! { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } };
     let mut leaker = Leaker::new();
     enter_function(&mut leaker, &item.sig);
@@ -1242,11 +1243,9 @@ fn test_reduce_roots_reference_with_a_lifetime_the_copy_would_leave_unconstraine
         view.visit_impl_item_fn(&parse_quote!(#sig { loop {} }))
     });
     assert!(leaker.result().errors().is_empty());
-    let item: ItemMod = parse_quote! {
-        mod m { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } }
-    };
+    let item: Item = parse_quote! { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } };
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&item);
+    leaker.enter_generics(&Generics::default(), |view| view.visit_item(&item));
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
     let item: ItemImpl =
         parse_quote! { impl ::p::W { fn f<'b>(x: &'b dyn RelTr) -> &'b () { loop {} } } };
@@ -2332,7 +2331,7 @@ fn test_reduce_roots_one_cut() {
 fn test_reduce_roots_a_forbidden_type_has_its_components_as_entries() {
     let entries = |config: Rules, item: ItemStruct| -> Vec<String> {
         let mut leaker = Leaker::with_rule(config);
-        leaker.enter_mod("m", [item.ident.clone()], |view| {
+        leaker.enter_generics(&Generics::default(), |view| {
             view.visit_item(&Item::Struct(item.clone()))
         });
         let referrer = leaker.result().finish().unwrap();
@@ -2487,12 +2486,6 @@ fn prune_cases() -> Vec<Item> {
                 B(::ext::Wrap<(R1, R2)>),
             }
         },
-        parse_quote! {
-            mod m {
-                struct A { x: R1 }
-                struct B { y: (R1, R2), z: ::ext::X }
-            }
-        },
     ]
 }
 
@@ -2501,7 +2494,6 @@ fn feed(leaker: &mut Leaker, item: &Item) -> ContextId {
         Item::Struct(item) => leaker.intern_struct(item),
         Item::Enum(item) => leaker.intern_enum(item),
         Item::Trait(item) => leaker.intern_trait(item),
-        Item::Mod(item) => leaker.intern_mod(item),
         _ => unreachable!("not an item of the tests"),
     }
 }
@@ -2527,7 +2519,7 @@ fn referrer_after(item: &Item, reductions: usize) -> Referrer {
 /// the same, serialized too. The entries are what one reduction at the end gives.
 #[test]
 fn test_reduce_roots_changes_nothing_for_result() {
-    let expected: [&[&str]; 6] = [
+    let expected: [&[&str]; 5] = [
         &[
             ":: ext :: Wrap < Rel2 > 0",
             "Rel 0",
@@ -2542,7 +2534,6 @@ fn test_reduce_roots_changes_nothing_for_result() {
             "(Rel , :: ext :: X) 1",
         ],
         &[":: ext :: Wrap < (R1 , R2) > 0"],
-        &["R1 1", "R2 1", ":: ext :: X 2"],
     ];
     for (item, expected) in prune_cases().iter().zip(expected) {
         let once = referrer_after(item, 1);

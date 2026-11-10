@@ -55,53 +55,6 @@ fn intern_impl_skips_the_body() {
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 3);
 }
 
-/// `intern_mod()` copies the declared names, and numbers the scope of a nested module.
-#[test]
-fn intern_mod_does_not_leak_the_names_the_module_declares() {
-    let item: ItemMod = parse_quote! {
-        mod m {
-            struct Local;
-            struct S { a: Local, b: Outside }
-            mod inner { struct T(Outside2); }
-        }
-    };
-    let mut leaker = Leaker::new();
-    leaker.intern_mod(&item);
-    let result = leaker.result();
-    let referrer = result.clone().finish().unwrap();
-    // `Local` is declared in `m`: it is not leaked.
-    assert_eq!(referrer.iter().count(), 2);
-    // The Repeater impl of `Outside2` is written in `inner`.
-    let param: Ident = parse_quote!(__S);
-    let repeater: Path = parse_quote!(crate::Repeater);
-    let r = result
-        .repeater_impls(&Projection::new(
-            repeater.clone(),
-            7,
-            ImplSelf::Param(param.clone()),
-        ))
-        .unwrap()
-        .remove(1);
-    match &r.module {
-        Some(ModuleScope::Itself {
-            path: Some(path), ..
-        }) => assert_eq!(path[0], "inner"),
-        _ => panic!("not the module of an entry"),
-    }
-}
-
-/// `enter_mod()` copies the names given as declared, and leaks the others.
-#[test]
-fn enter_mod_does_not_leak_the_declared_names() {
-    let item: ItemStruct = parse_quote! { struct S { a: Local, b: Outside } };
-    let mut leaker = Leaker::new();
-    let declared = [item.ident.clone(), parse_quote!(Local)]; // the module declares them
-    leaker.enter_mod("my_module", declared, |view| {
-        view.visit_item(&Item::Struct(item.clone()))
-    });
-    assert_eq!(leaker.result().finish().unwrap().iter().count(), 1); // only `Outside`
-}
-
 /// `enter_generics()` records the error of an inner scope, and the outer one goes on.
 #[test]
 fn enter_generics_goes_on_after_an_error_of_an_inner_scope() {
@@ -295,7 +248,7 @@ fn a_nested_type_that_names_self_with_a_self_bound_is_an_entry_with_an_error() {
         pub struct S<T: ::core::convert::AsRef<Self>> { pub b: Rel2<Self, T> }
     };
     let mut leaker = Leaker::with_rule(Rules::new());
-    leaker.enter_mod("m", [parse_quote!(S)], |view| view.visit_item(&item));
+    leaker.enter_generics(&Generics::default(), |view| view.visit_item(&item));
     let result = leaker.result();
     // The risk is an error, with no paths, and the type is an entry all the same.
     assert_eq!(result.errors().len(), 1);
@@ -334,7 +287,7 @@ fn a_nested_type_that_names_self_with_a_self_bound_is_an_entry_with_an_error() {
 
     // The rule of the Leaker drops the error as well, at the end of the call: the entry is the same.
     let mut leaker = Leaker::with_rule(move |c: &Cause, _: Place| *c == cause);
-    leaker.enter_mod("m", [parse_quote!(S)], |view| view.visit_item(&item));
+    leaker.enter_generics(&Generics::default(), |view| view.visit_item(&item));
     let result = leaker.result();
     assert!(result.errors().is_empty());
     assert_eq!(result.finish().unwrap(), referrer);

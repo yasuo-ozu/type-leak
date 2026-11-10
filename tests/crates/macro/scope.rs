@@ -200,7 +200,6 @@ fn ident(name: &str) -> Ident {
 /// The position of the `j`-th type argument, the generics around it being those of the impl.
 fn position(item: &ItemImpl, self_ty: &Type, ty: Type) -> Position {
     Position {
-        mods: Vec::new(),
         layers: vec![item.generics.clone()],
         self_sub: Some(SelfSub {
             ty: self_ty.clone(),

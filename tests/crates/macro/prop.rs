@@ -3,11 +3,10 @@
 //! rewritten type is checked to be exactly the original one.
 //!
 //! In the Leaker's crate, `#[prop_leak(id = 17, ..)]` is put on a struct, an
-//! enum, a union, a trait, an impl or a module (analyzed by the matching `intern_*`). It emits
+//! enum, a union, a trait or an impl (analyzed by the matching `intern_*`). It emits
 //!
 //! - the item itself,
-//! - the Repeater's implementation of each entry, next to the item (inside the module the entry is
-//!   keyed by, for a module),
+//! - the Repeater's implementation of each entry, next to the item,
 //! - a witness `pub fn __tl_w_17_<j><generics>() -> PhantomData<*mut OriginalType>` for each type
 //!   position `j` of the item (a field, a parameter, a return type, ...; the `*mut` makes the types
 //!   invariant, so that a check compares them for equality and not as subtypes), and for the header
@@ -20,22 +19,19 @@
 //! contains the item) expands `__prop_apply!`, which rewrites a copy of the item with
 //! `Referrer::visitor(context, ..)` and emits
 //!
-//! - the copy, for a struct, an enum, a union and a module,
+//! - the copy, for a struct, an enum and a union,
 //! - an implementation of the trait for a host type, with the rewritten signatures, for a trait,
 //! - `fn __tl_chk_17_<j><generics>() -> PhantomData<*mut RewrittenType> { path::__tl_w_17_<j>::<..>() }`
 //!   for each type position, which compiles only if the rewritten type is exactly the original and
 //!   the generics around it have at least the bounds of the original's,
 //! - an impl of `__TlRev_17` for a type of the Referrer's crate with the copy's signatures as
-//!   methods, which compiles only if the copy's bounds are no stronger than the original's,
-//! - for the positions of a module that name what the module declares, which the witness cannot
-//!   be called with: three functions in the copy's module that compare the copy with the original
-//!   written for this crate, both ways ([`Reroot`]).
+//!   methods, which compiles only if the copy's bounds are no stronger than the original's.
 //!
 //! An impl is not emitted (the orphan rules), so only these checks compare it: its positions, and
 //! its header (`header_position()`), unless rustc cannot normalize that (`header_cycles()`).
 //!
 //! The `Self` of a position is the type itself (a struct, an enum or a union), the self type (an
-//! impl) or the host type (a trait). A module cannot name `Self`, so its items do not.
+//! impl) or the host type (a trait).
 //!
 //! The copy replaces every entry through the Repeater, so the Leaker's crate has the impls of all.
 //!
@@ -82,11 +78,11 @@ pub(crate) struct Args {
     /// Allowed crates (`::std`).
     allow: Vec<Path>,
     /// How the item is analyzed: `""` by the `intern_*` method of its kind, or by a scope (see
-    /// [`analyze()`]): `"mod"`, `"generics"`, `"trait"` or `"impl"`.
+    /// [`analyze()`]): `"nested"`, `"generics"`, `"trait"` or `"impl"`.
     scope: String,
     /// The Leaker allows the primitive types (`Rules::primitive()`).
     primitive: bool,
-    /// A trait (analyzed as the item itself, or of a scope `mod`): the Referrer's crate declares
+    /// A trait (analyzed as the item itself, or of a scope `nested`): the Referrer's crate declares
     /// the rewritten trait too (`<Name>Copy`), not only an impl of the Leaker's trait for the host.
     /// Its parameter defaults are rewritten for a declaration, which cannot name the defaulted
     /// parameter itself (E0128): see [`rewrite_defaults()`].
@@ -223,12 +219,12 @@ impl Args {
         quote!(id = #id, prelude = #prelude, scope = #scope, allow = #allow, #marker primitive = #primitive, redeclare = #redeclare, values = #values, bodies = #bodies, nested_self_entries = #nested_self_entries, ignore_risks = #ignore_risks, ignore = #ignore, stages = #stages, accepted = #accepted, stage = #stage, via = #via)
     }
 
-    /// The item is nested in `enter_mod` and has a `Self` of its own: the copy is wrapped in a
-    /// file, and the entries that name its `Self` are finished ([`Finish`]). Not with `via =
-    /// "nested"`, which opens the scope of the type inside the module's: the copy is that of a type
+    /// The item is nested in `enter_generics` and has a `Self` of its own: the copy is wrapped in a
+    /// module for the visitor, and the entries that name its `Self` are finished ([`Finish`]). Not
+    /// with `via = "nested"`, which analyzes the type by `enter_type`: the copy is that of a type
     /// analyzed by itself.
     fn nested(&self) -> bool {
-        self.scope == "mod" && self.via != "nested"
+        self.scope == "nested" && self.via != "nested"
     }
 
     /// The `ID` of the Repeater's impls of the entries: the item's, and for the copy of
@@ -370,7 +366,6 @@ fn kind_name(item: &Item) -> &'static str {
         Item::Trait(_) => "trait",
         Item::Impl(i) if i.trait_.is_some() => "impl-trait",
         Item::Impl(_) => "impl-inherent",
-        Item::Mod(_) => "mod",
         _ => "other",
     }
 }
@@ -384,10 +379,10 @@ fn ident(name: &str) -> Ident {
 /// By the `intern_*` method of its kind, or, with `scope`, through the scopes and the `View` that
 /// a macro with other needs uses:
 ///
-/// - `mod`: a struct, an enum, a union or a trait, as a nested item of `enter_mod(..)`
-///   (`View::visit_item()`), the module declaring its name. Its context is the module's, its
-///   generics are local, and it has a `Self` of its own, whose entries the copy's visitor writes
-///   with `Self` (`Finish` writes them for the Leaker's type).
+/// - `nested`: a struct, an enum, a union or a trait, as a nested item of
+///   `enter_generics(&Generics::default(), ..)` (`View::visit_item()`). Its context is the
+///   scope's, its generics are local, and it has a `Self` of its own, whose entries the copy's
+///   visitor writes with `Self` (`Finish` writes them for the Leaker's type).
 /// - `generics`: a struct, an enum or a union with no `Self`, in `enter_generics(..)`.
 /// - `trait`: a trait without a generic associated type, in `enter_trait(..)`.
 /// - `impl`: an impl in `enter_impl(.., None, ..)`, where only the self type and the arguments of
@@ -507,16 +502,13 @@ fn analyze_config<A: Allow>(
                 })
                 .0
         }
-        // The scope of the type opened in the view of `enter_mod`, which declares its name. The copy
-        // is that of the type analyzed by itself, at the context of the nested scope.
-        ("nested", "mod", Item::Struct(_) | Item::Enum(_) | Item::Union(_)) => {
+        // The type of a nested item analyzed by `enter_type` and the walk, as the item itself: the
+        // copy is that of the type analyzed by itself, and the analysis is that of `intern_*`.
+        ("nested", "nested", Item::Struct(_) | Item::Enum(_) | Item::Union(_)) => {
             let (ident, generics) = adt_head(item);
             leaker
-                .enter_mod(format!("prop{}", args.id), [ident.clone()], |view| {
-                    view.enter_type(ident, generics, |view| walk_adt(view, item))
-                        .0
-                })
-                .1
+                .enter_type(ident, generics, |view| walk_adt(view, item))
+                .0
         }
         // The path of the trait is given to the scope (it is absolute, and checked there).
         ("some", "impl", Item::Impl(i)) if i.trait_.is_some() => {
@@ -571,22 +563,13 @@ fn analyze_config<A: Allow>(
     (result, context, assertions)
 }
 
-/// The analysis of `item` through its scope by the calls that name them: `intern_*`, `enter_mod`,
+/// The analysis of `item` through its scope by the calls that name them: `intern_*`,
 /// `enter_generics`, `enter_trait` and `enter_impl`.
 fn analyze_scope<A: Allow>(leaker: &mut Leaker<A>, item: &Item, args: &Args) -> ContextId {
     match (args.scope.as_str(), item) {
-        ("mod", Item::Struct(_) | Item::Enum(_) | Item::Union(_) | Item::Trait(_)) => {
-            let name = match item {
-                Item::Struct(i) => i.ident.clone(),
-                Item::Enum(i) => i.ident.clone(),
-                Item::Union(i) => i.ident.clone(),
-                Item::Trait(i) => i.ident.clone(),
-                _ => unreachable!(),
-            };
+        ("nested", Item::Struct(_) | Item::Enum(_) | Item::Union(_) | Item::Trait(_)) => {
             leaker
-                .enter_mod(format!("prop{}", args.id), [name], |view| {
-                    view.visit_item(item)
-                })
+                .enter_generics(&Generics::default(), |view| view.visit_item(item))
                 .0
         }
         ("generics", Item::Struct(i)) => {
@@ -628,7 +611,6 @@ fn analyze_scope<A: Allow>(leaker: &mut Leaker<A>, item: &Item, args: &Args) -> 
         ("", Item::Union(i)) => leaker.intern_union(i),
         ("", Item::Trait(i)) => leaker.intern_trait(i),
         ("", Item::Impl(i)) => leaker.intern_impl(i),
-        ("", Item::Mod(i)) => leaker.intern_mod(i),
         _ => panic!("unsupported item"),
     }
 }
@@ -793,8 +775,8 @@ fn type_with_params(name: &Ident, generics: &Generics) -> Type {
 // The Leaker's side: Repeater implementations.
 // ---------------------------------------------------------------------------------------------
 
-/// The impls with the path of the module each is written in.
-type Impls = Vec<(Vec<Ident>, TokenStream)>;
+/// The impls of the Repeater for the entries of an item.
+type Impls = Vec<TokenStream>;
 
 /// What `repeater_impls()` wrote the impls of an item for. The entries that need `Self` are for what
 /// `Self` stands for whatever it is, and under `Bucket` only they are for the parameter.
@@ -824,9 +806,7 @@ fn impl_self_for(referrer: &Referrer, marker: Option<&Type>) -> ImplSelf {
     }
 }
 
-/// The Repeater's implementation of each entry with the path of the module it is keyed by,
-/// relative to the analyzed module (`[]` for it and for the entries of no module), as a downstream
-/// crate writes them.
+/// The Repeater's implementation of each entry, as a downstream crate writes them.
 fn repeater_impls(
     result: &LeakerResult,
     referrer: &Referrer,
@@ -857,9 +837,6 @@ fn repeater_impls(
     for r in targets {
         let ix = r.entry;
         check_impl_pieces(referrer, ix, id, &r, &self_param, used)?;
-        let module = crate::module_path(&r.module)
-            .map(|p| p.to_vec())
-            .unwrap_or_default();
         // `ToTokens` writes the `KEY`: the trait path of the written impl is the one that the
         // copy's side writes.
         let tokens = r.to_token_stream();
@@ -900,7 +877,7 @@ fn repeater_impls(
                 )));
             }
         }
-        impls.push((module, tokens));
+        impls.push(tokens);
     }
     Ok(impls)
 }
@@ -921,9 +898,7 @@ fn generics_text(generics: &Generics) -> String {
     quote!(#params ; #where_clause).to_string()
 }
 
-/// The entries and their helpers agree: `is_empty()` and `iter()`, and the module of the impl of an
-/// entry (`RepeaterImpl::module`) is `Itself` of the module `m` exactly when the context of the
-/// entry is `In(m)`, and `None` otherwise.
+/// The entries and their helpers agree: `is_empty()` and `iter()`, and the entry of each impl.
 fn check_entry_helpers(result: &LeakerResult, referrer: &Referrer) -> Result<()> {
     let n = referrer.iter().count();
     if referrer.is_empty() != (n == 0) {
@@ -937,23 +912,11 @@ fn check_entry_helpers(result: &LeakerResult, referrer: &Referrer) -> Result<()>
         ImplSelf::Param(ident("__S")),
     );
     let impls = result.repeater_impls(&projection).map_err(Error::from)?;
-    for ((ix, _, context), r) in referrer.iter().zip(impls) {
+    for ((ix, _, _), r) in referrer.iter().zip(impls) {
         if r.entry != ix {
             return Err(helpers_disagree(format!(
                 "the impl for the entry {} says it is for the entry {}",
                 ix, r.entry
-            )));
-        }
-        let agree = match (&context.module, &r.module) {
-            (Some(ModuleScope::In(module)), Some(ModuleScope::Itself { id, .. })) => id == module,
-            (Some(ModuleScope::In(_)), _) => false,
-            (_, module) => module.is_none(),
-        };
-        if !agree {
-            return Err(helpers_disagree(format!(
-                "the module of the impl of the entry {} ({:?}) is not the context of the module \
-                 that the context of the entry is in ({:?})",
-                ix, r.module, context.module
             )));
         }
     }
@@ -1129,17 +1092,6 @@ fn check_impl_pieces(
             generics_text(&declared)
         )));
     }
-    // The module of the impl is the module's own context, `Itself`, of the one the context is in.
-    let itself = match &r.module {
-        Some(ModuleScope::Itself { id, .. }) => Some(*id),
-        _ => None,
-    };
-    if itself != crate::in_module(context) || r.module.is_some() != itself.is_some() {
-        return Err(helpers_disagree(format!(
-            "the impl of the entry {} has another module than `Context::module`",
-            ix
-        )));
-    }
     Ok(())
 }
 
@@ -1160,8 +1112,6 @@ pub(crate) struct SelfSub {
 /// A type that the item copies: a field, a parameter, a return type, an associated type or const.
 #[derive(Clone)]
 pub(crate) struct Position {
-    /// The modules from the analyzed one, starting with its own name.
-    pub(crate) mods: Vec<Ident>,
     /// The generics around, outermost first.
     pub(crate) layers: Vec<Generics>,
     pub(crate) self_sub: Option<SelfSub>,
@@ -1176,15 +1126,7 @@ type Host = (Type, Path);
 /// visits are positions: the self type and the arguments of the trait.
 fn collect_positions(item: &Item, host: Option<&Host>, args: &Args) -> Vec<Position> {
     let mut out = Vec::new();
-    collect_item(
-        item,
-        &mut Vec::new(),
-        &mut out,
-        true,
-        host,
-        args.scope == "impl",
-        args.bodies,
-    );
+    collect_item(item, &mut out, host, args.scope == "impl", args.bodies);
     out
 }
 
@@ -1211,9 +1153,9 @@ fn bounds_without_self(
 /// The defaults of the type parameters of `generics`, each with the generics before it: a default
 /// is analyzed with the parameters before it, and the where predicates that name only those (the
 /// context of its entries has them, so the Repeater's impl needs them). The bounds that name `Self`
-/// are left out: a default has no `Self`, and for a struct, an enum or a union nested in a module
-/// the Leaker leaves them out of the context of an entry in a default (the copy cannot write `Self`
-/// there), where the others stay.
+/// are left out: a default has no `Self`, and for a nested struct, enum or union the Leaker leaves
+/// them out of the context of an entry in a default (the copy cannot write `Self` there), where the
+/// others stay.
 fn default_positions(generics: &Generics) -> Vec<(Generics, Type)> {
     fn name(param: &GenericParam) -> String {
         match param {
@@ -1280,16 +1222,13 @@ fn default_positions(generics: &Generics) -> Vec<(Generics, Type)> {
 
 fn collect_item(
     item: &Item,
-    mods: &mut Vec<Ident>,
     out: &mut Vec<Position>,
-    with_self: bool,
     host: Option<&Host>,
     fragments_only: bool,
     bodies: bool,
 ) {
     let mut push = |layers: &[&Generics], sub: &Option<SelfSub>, ty: &Type| {
         out.push(Position {
-            mods: mods.clone(),
             layers: layers.iter().map(|g| (*g).clone()).collect(),
             self_sub: sub.clone(),
             ty: ty.clone(),
@@ -1307,7 +1246,7 @@ fn collect_item(
     };
     match item {
         Item::Struct(i) => {
-            let sub = with_self.then(|| SelfSub {
+            let sub = Some(SelfSub {
                 ty: adt_ty(&i.ident, &i.generics),
                 trait_ref: None,
                 bound: false,
@@ -1320,7 +1259,7 @@ fn collect_item(
             }
         }
         Item::Enum(i) => {
-            let sub = with_self.then(|| SelfSub {
+            let sub = Some(SelfSub {
                 ty: adt_ty(&i.ident, &i.generics),
                 trait_ref: None,
                 bound: false,
@@ -1335,7 +1274,7 @@ fn collect_item(
             }
         }
         Item::Union(i) => {
-            let sub = with_self.then(|| SelfSub {
+            let sub = Some(SelfSub {
                 ty: adt_ty(&i.ident, &i.generics),
                 trait_ref: None,
                 bound: false,
@@ -1348,7 +1287,7 @@ fn collect_item(
             }
         }
         Item::Trait(i) => {
-            let sub = with_self.then(|| {
+            let sub = Some({
                 let (name, args) = (&i.ident, identity_args(&i.generics));
                 match host {
                     Some((host_ty, leaker_path)) => SelfSub {
@@ -1399,7 +1338,7 @@ fn collect_item(
             }
         }
         Item::Impl(i) => {
-            let sub = with_self.then(|| SelfSub {
+            let sub = Some(SelfSub {
                 ty: (*i.self_ty).clone(),
                 trait_ref: i.trait_.as_ref().map(|(_, path, _)| path.clone()),
                 bound: false,
@@ -1446,35 +1385,6 @@ fn collect_item(
                     ImplItem::Type(t) => push(&[&i.generics, &t.generics], &sub, &t.ty),
                     _ => (),
                 }
-            }
-        }
-        Item::Fn(f) => {
-            for ty in sig_types(&f.sig) {
-                push(&[&f.sig.generics], &None, &ty);
-            }
-            for ty in value_types(bodies, |v| v.visit_block(&f.block)) {
-                push(&[&f.sig.generics], &None, &ty);
-            }
-        }
-        Item::Type(t) => push(&[&t.generics], &None, &t.ty),
-        Item::Const(c) => {
-            push(&[], &None, &c.ty);
-            for ty in value_types(bodies, |v| v.visit_expr(&c.expr)) {
-                push(&[], &None, &ty);
-            }
-        }
-        Item::Static(st) => {
-            for ty in value_types(bodies, |v| v.visit_expr(&st.expr)) {
-                push(&[], &None, &ty);
-            }
-        }
-        Item::Mod(m) => {
-            if let Some((_, items)) = &m.content {
-                mods.push(m.ident.clone());
-                for item in items {
-                    collect_item(item, mods, out, false, host, fragments_only, bodies);
-                }
-                mods.pop();
             }
         }
         _ => (),
@@ -1768,98 +1678,6 @@ pub(crate) fn invariant_in(mut ty: Type) -> Type {
     parse_quote!(*mut #ty)
 }
 
-/// The primitive types, as a path of one segment.
-const PRIMITIVES: &[&str] = &[
-    "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize", "f32",
-    "f64", "bool", "char", "str",
-];
-
-/// The names of the standard prelude that the generated items use.
-const PRELUDE: &[&str] = &[
-    "Box",
-    "String",
-    "Vec",
-    "Option",
-    "Result",
-    "Copy",
-    "Send",
-    "Sized",
-    "Sync",
-    "Unpin",
-    "Drop",
-    "Fn",
-    "FnMut",
-    "FnOnce",
-    "Clone",
-    "PartialEq",
-    "PartialOrd",
-    "Eq",
-    "Ord",
-    "AsRef",
-    "AsMut",
-    "Into",
-    "From",
-    "Default",
-    "Iterator",
-    "IntoIterator",
-    "Extend",
-    "DoubleEndedIterator",
-    "ExactSizeIterator",
-    "Some",
-    "None",
-    "Ok",
-    "Err",
-    "ToOwned",
-    "ToString",
-    "drop",
-];
-
-/// Finds the paths that are relative: they mean something else in another crate.
-struct Portable<'a> {
-    generics: &'a HashSet<String>,
-    prelude: bool,
-    ok: bool,
-}
-
-impl Portable<'_> {
-    fn check_path(&mut self, path: &Path) {
-        if path.leading_colon.is_some() {
-            return;
-        }
-        let first = match path.segments.first() {
-            Some(seg) => seg.ident.to_string(),
-            None => return,
-        };
-        let known = self.generics.contains(&first)
-            || PRIMITIVES.contains(&first.as_str())
-            || (self.prelude && PRELUDE.contains(&first.as_str()));
-        if !known {
-            self.ok = false;
-        }
-    }
-}
-
-impl<'ast> Visit<'ast> for Portable<'_> {
-    fn visit_type_path(&mut self, i: &'ast TypePath) {
-        if i.qself.is_none() {
-            self.check_path(&i.path);
-        }
-        syn::visit::visit_type_path(self, i)
-    }
-    fn visit_trait_bound(&mut self, i: &'ast TraitBound) {
-        self.check_path(&i.path);
-        syn::visit::visit_trait_bound(self, i)
-    }
-    fn visit_expr_path(&mut self, i: &'ast ExprPath) {
-        if i.qself.is_none() {
-            self.check_path(&i.path);
-        }
-    }
-    fn visit_type_macro(&mut self, _: &'ast TypeMacro) {
-        self.ok = false;
-    }
-}
-
 /// Finds an elided lifetime that the witness cannot name: one outside the sugar of `Fn` and a
 /// function pointer, where it is the binder's.
 struct Elided(bool);
@@ -2128,14 +1946,7 @@ fn nested_adts(item: &Item) -> Vec<(String, Vec<Ident>)> {
         }
     }
     let mut adts = Adts::default();
-    match item {
-        // The module that is analyzed is the context itself.
-        Item::Mod(ItemMod {
-            content: Some((_, items)),
-            ..
-        }) => items.iter().for_each(|item| adts.visit_item(item)),
-        other => adts.visit_item(other),
-    }
+    adts.visit_item(item);
     adts.found
 }
 
@@ -2207,12 +2018,12 @@ struct Finish<'a> {
 }
 
 impl<'a> Finish<'a> {
-    /// `module_scope`: the Visitor's context is a module, whose items are nested.
-    fn new(projector: &'a Projector<'a>, host: Option<&'a Type>, module_scope: bool) -> Self {
+    /// `nested_item`: the visited item is a nested item of the scope `nested`.
+    fn new(projector: &'a Projector<'a>, host: Option<&'a Type>, nested_item: bool) -> Self {
         Finish {
             projector,
             host,
-            depth: usize::from(module_scope),
+            depth: usize::from(nested_item),
             nested: false,
             error: None,
         }
@@ -2339,6 +2150,34 @@ fn host_type(host: &Ident, dyn_host: bool) -> Type {
     }
 }
 
+/// Visits `item`, a nested item of the scope `nested`, inside a module, where the visitor takes it
+/// for a nested item with a `Self` of its own (it takes the outermost item for the scope itself),
+/// and returns a file of the visited item.
+fn visit_nested(visitor: &mut impl VisitMut, item: Item) -> File {
+    let mut wrapper: ItemMod = parse_quote!(
+        mod __tl_nested {}
+    );
+    wrapper.content = Some((Default::default(), vec![item]));
+    let mut file = File {
+        shebang: None,
+        attrs: Vec::new(),
+        items: vec![Item::Mod(wrapper)],
+    };
+    visitor.visit_file_mut(&mut file);
+    let items = match file.items.remove(0) {
+        Item::Mod(ItemMod {
+            content: Some((_, items)),
+            ..
+        }) => items,
+        _ => unreachable!("the wrapper is a module"),
+    };
+    File {
+        shebang: None,
+        attrs: Vec::new(),
+        items,
+    }
+}
+
 /// The path of the Repeater, from the path of a module of the Leaker's crate.
 fn repeater_path(leaker_path: &Path) -> Path {
     let mut repeater = leaker_path.clone();
@@ -2458,14 +2297,10 @@ fn rewrite_with(
     let error;
     let mut rewritten = item.clone();
     {
-        // The module of the Leaker's crate that the context is in: the module of the item, or the
-        // analyzed module itself.
-        let mut base = leaker_path.clone();
-        if let Item::Mod(m) = item {
-            base.segments.push(m.ident.clone().into());
-        }
+        // The module of the Leaker's crate that the item is in.
+        let base = leaker_path.clone();
         let visitor = referrer.visitor(context, &projector.projection);
-        // The item of a scope `mod` is a nested item, which has a `Self` of its own.
+        // The item of a scope `nested` is a nested item, which has a `Self` of its own.
         let host = match (&self_ty, args.nested()) {
             (Some(self_ty), false) => Some(self_ty),
             _ => None,
@@ -2474,12 +2309,11 @@ fn rewrite_with(
             Some(host) => visitor.with_self(host.clone())?,
             None => visitor,
         };
-        // A struct, an enum, a union or a trait nested in the module (the item of a scope `mod`)
+        // A struct, an enum, a union or a trait nested in the module (the item of a scope `nested`)
         // has a `Self` of its own, whose entries for its own type the hook writes.
         let adts = nested_adts(item);
         let mut visitor = visitor.with_nested_self(nested_self(&projector, &base, &adts));
-        let module_scope = matches!(item, Item::Mod(_)) || args.nested();
-        let mut finish = Finish::new(&projector, host, module_scope);
+        let mut finish = Finish::new(&projector, host, args.nested());
         match &mut rewritten {
             // The item inside a module or a block that declares names (`shadow_check()`).
             other if wrap.is_some() => {
@@ -2496,27 +2330,10 @@ fn rewrite_with(
                 *other = wrap.inside(file.items.remove(0));
             }
             other if args.nested() => {
-                let mut file = File {
-                    shebang: None,
-                    attrs: Vec::new(),
-                    items: vec![std::mem::replace(other, Item::Verbatim(TokenStream::new()))],
-                };
-                visitor.visit_file_mut(&mut file);
+                let item = std::mem::replace(other, Item::Verbatim(TokenStream::new()));
+                let mut file = visit_nested(&mut visitor, item);
                 finish.visit_file_mut(&mut file);
                 *other = file.items.remove(0);
-            }
-            Item::Mod(m) => {
-                if let Some((_, items)) = &mut m.content {
-                    // The items of a module are declared together, as those of a file.
-                    let mut file = File {
-                        shebang: None,
-                        attrs: Vec::new(),
-                        items: std::mem::take(items),
-                    };
-                    visitor.visit_file_mut(&mut file);
-                    finish.visit_file_mut(&mut file);
-                    *items = file.items;
-                }
             }
             other => {
                 visitor.visit_item_mut(other);
@@ -2531,24 +2348,19 @@ fn rewrite_with(
     }
     if let (true, Item::Trait(original), Item::Trait(copy)) = (args.redeclare, item, &mut rewritten)
     {
-        if !matches!(args.scope.as_str(), "" | "mod") {
+        if !matches!(args.scope.as_str(), "" | "nested") {
             return Err(Error::new(
                 Span::call_site(),
-                "test macro: `redeclare` is for a trait analyzed as the item itself and for the traits of a scope `mod`",
+                "test macro: `redeclare` is for a trait analyzed as the item itself and for the traits of a scope `nested`",
             ));
         }
-        let mut base = leaker_path.clone();
-        if let Item::Mod(m) = item {
-            base.segments.push(m.ident.clone().into());
-        }
-        let module_scope = matches!(item, Item::Mod(_)) || args.nested();
         rewrite_defaults(
             referrer,
             context,
             original,
             copy,
             &projector,
-            (&base, module_scope),
+            (leaker_path, args.nested()),
         )?;
     }
     Ok(Rewritten {
@@ -3605,9 +3417,7 @@ fn instance_check_fn(
     let name = ident(&format!("__tl_ins_{}_{}", id, j));
     let witness = witness_name(id, j);
     let ty = invariant_in(ty);
-    let mut path = target.clone();
-    path.segments
-        .extend(pos.mods.iter().cloned().map(PathSegment::from));
+    let path = target;
     Some(quote! {
         #[allow(non_snake_case, dead_code)]
         fn #name<#params>() -> ::core::marker::PhantomData<#ty> #where_clause {
@@ -3755,7 +3565,7 @@ fn check_refusals(
     };
     let mut short = valid.clone();
     short.pop();
-    // A trait nested in a module that `intern_mod()` analyzed has no context of its own.
+    // A nested item (the scope `nested`) has no context of its own.
     if let Some(context) = top_level {
         let complete = |args: &[GenericArgument]| referrer.complete_args(context, args, projection);
         // The defaults of the item, if any, are left as they are.
@@ -3961,8 +3771,8 @@ fn shadow_check(
     dyn_host: bool,
     seed: u64,
 ) -> Result<usize> {
-    // An item of a scope `mod` has entries keyed by a module: a module does not hide them.
-    if args.nested() || args.via == "nested" || args.redeclare || matches!(item, Item::Mod(_)) {
+    // An item of a scope `nested` is copied in a module of its own already.
+    if args.nested() || args.via == "nested" || args.redeclare {
         return Ok(0);
     }
     let mut draw = Draw(seed);
@@ -3983,6 +3793,16 @@ fn shadow_check(
     if names.is_empty() {
         names.push(ident(candidates.iter().next().unwrap()));
     }
+    // The item declares its own name in the module or the block, which declares no other item of
+    // that name, and its own name hides none of its entries inside it.
+    let own = match item {
+        Item::Struct(i) => Some(&i.ident),
+        Item::Enum(i) => Some(&i.ident),
+        Item::Union(i) => Some(&i.ident),
+        Item::Trait(i) => Some(&i.ident),
+        _ => None,
+    };
+    names.retain(|name| Some(name) != own);
     let block = draw.chance(50);
     let plain_wrap = Wrap {
         block,
@@ -4135,10 +3955,7 @@ fn instance_part(
     let host_ty = host.as_ref().map(|(ty, _)| ty);
     let mut out = TokenStream::new();
     let mut positions = 0;
-    for check in comparable(&rewritten.item, item, args, host.as_ref(), path) {
-        if check.expected.is_some() {
-            continue;
-        }
+    for check in comparable(&rewritten.item, item, args, host.as_ref()) {
         if let Some(function) =
             instance_check_fn(args.id, check.j, &check.pos, &inst, path, host_ty)
         {
@@ -4217,15 +4034,22 @@ fn rewrite_defaults(
     let mut shell = original.clone();
     shell.items.clear();
     shell.supertraits.clear();
-    let mut file = File {
-        shebang: None,
-        attrs: Vec::new(),
-        items: vec![Item::Trait(shell)],
+    let mut file = {
+        let mut visitor = referrer
+            .visitor(context, &placeholder.projection)
+            .with_nested_self(nested_self(&placeholder, base, &[]));
+        if module_scope {
+            visit_nested(&mut visitor, Item::Trait(shell))
+        } else {
+            let mut file = File {
+                shebang: None,
+                attrs: Vec::new(),
+                items: vec![Item::Trait(shell)],
+            };
+            visitor.visit_file_mut(&mut file);
+            file
+        }
     };
-    referrer
-        .visitor(context, &placeholder.projection)
-        .with_nested_self(nested_self(&placeholder, base, &[]))
-        .visit_file_mut(&mut file);
     let mut finish = Finish::new(&placeholder, None, module_scope);
     finish.visit_file_mut(&mut file);
     if let Some(e) = finish.error {
@@ -4247,40 +4071,6 @@ fn rewrite_defaults(
     Ok(())
 }
 
-/// Drops the imports of names the Leaker leaks: a copy of a module in another crate cannot resolve
-/// them, and every use of them is rewritten. Imports of absolute paths and of the module's own
-/// items stay.
-///
-/// With `constants` the import of `ILEN` stays: the paths of values and defaults that a rule allows
-/// name it (`clean` copies of `Rules::values()` and `Rules::defaults()`). With `imports` all of
-/// them stay: the config that has the rule wrote every relative path of a value or a default as it
-/// is, whatever it names.
-fn drop_relative_uses(items: &mut Vec<Item>, constants: bool, imports: bool) {
-    fn renames_ilen(tree: &UseTree) -> bool {
-        match tree {
-            UseTree::Path(p) => renames_ilen(&p.tree),
-            UseTree::Rename(r) => r.rename == "ILEN",
-            _ => false,
-        }
-    }
-    items.retain(|item| match item {
-        Item::Use(u) => {
-            u.leading_colon.is_some()
-                || matches!(&u.tree, UseTree::Path(p) if p.ident == "self")
-                || imports
-                || (constants && renames_ilen(&u.tree))
-        }
-        _ => true,
-    });
-    for item in items.iter_mut() {
-        if let Item::Mod(m) = item {
-            if let Some((_, items)) = &mut m.content {
-                drop_relative_uses(items, constants, imports);
-            }
-        }
-    }
-}
-
 /// The value of an associated const of the host, whose type is `ty`.
 fn const_value(ty: &Type) -> Expr {
     if let Type::Path(TypePath { qself: None, path }) = ty {
@@ -4295,7 +4085,7 @@ fn const_value(ty: &Type) -> Expr {
     parse_quote!(0)
 }
 
-/// The host of a trait. For a struct, an enum or a union nested in the module (scope `mod`) it is
+/// The host of a trait. For a struct, an enum or a union of the scope `nested` it is
 /// the Leaker's type: the visitor leaves a `Self` that is not in an entry (`Vec<Self>` as a field,
 /// or in an absolute type, `::p::W<Self>`, which no Referrer replaces: F38), which is the copy's
 /// own type, and the check writes the Leaker's for it, as the witness does. (So the check cannot
@@ -4461,10 +4251,6 @@ pub(crate) struct Check {
     j: usize,
     /// The position in the copy.
     pos: Position,
-    /// `None`: the original is the Leaker's witness. `Some`: the original written for the Referrer's
-    /// crate ([`Reroot`]), a position of a module that names what the module declares, where the
-    /// witness (in the Leaker's module) cannot be called with the copy's own items.
-    expected: Option<Position>,
     /// The header of an impl ([`header_position()`]), not a type position of the item.
     header: bool,
     /// The reverse trait compares it ([`reverse_impls()`]). Not a position of an impl with a
@@ -4513,7 +4299,6 @@ fn header_position(item: &Item, args: &Args) -> Option<Position> {
         return None;
     }
     Some(Position {
-        mods: Vec::new(),
         layers: vec![generics],
         self_sub: Some(SelfSub {
             ty: (*i.self_ty).clone(),
@@ -4606,19 +4391,6 @@ fn header_of_copy(copy: &Item, item: &Item, args: &Args) -> Option<(Position, bo
     }
 }
 
-/// The names of the generics of the layers of a position.
-fn generic_names(pos: &Position) -> HashSet<String> {
-    pos.layers
-        .iter()
-        .flat_map(|g| g.params.iter())
-        .map(|param| match param {
-            GenericParam::Lifetime(l) => l.lifetime.to_string(),
-            GenericParam::Type(t) => t.ident.to_string(),
-            GenericParam::Const(c) => c.ident.to_string(),
-        })
-        .collect()
-}
-
 /// Whether the type or the generics of a position have a projection of `Self` (`Self::A`,
 /// `<Self as Tr>::A`).
 fn projects_self(pos: &Position) -> bool {
@@ -4646,37 +4418,11 @@ fn projects_self(pos: &Position) -> bool {
     projects.0
 }
 
-/// Whether every relative path of a position of a module is a generic, a primitive type or a name
-/// of the prelude: no name that the module declares, nor one that it imports.
-fn portable(pos: &Position, args: &Args) -> bool {
-    let generics = generic_names(pos);
-    let mut portable = Portable {
-        generics: &generics,
-        prelude: args.prelude,
-        ok: true,
-    };
-    portable.visit_type(&pos.ty);
-    for layer in &pos.layers {
-        portable.visit_generics(layer);
-    }
-    portable.ok
-}
-
 /// The type positions of the copy that can be checked, with their index, and the header of an impl.
 ///
-/// `item` is the original, `copy` the rewritten item and `leaker_path` the module of the Leaker's
-/// crate that has the item. A position with an elided lifetime has no witness. In a copy of a
-/// module, the names it declares mean its own items, which the witness (in the Leaker's module)
-/// does not: such a position is compared with the original written for the Referrer's crate
-/// ([`Reroot`]), and is left out only if that cannot be written.
-fn comparable(
-    copy: &Item,
-    item: &Item,
-    args: &Args,
-    host: Option<&Host>,
-    leaker_path: &Path,
-) -> Vec<Check> {
-    let in_module = matches!(copy, Item::Mod(_));
+/// `item` is the original, `copy` the rewritten item. A position with an elided lifetime has no
+/// witness.
+fn comparable(copy: &Item, item: &Item, args: &Args, host: Option<&Host>) -> Vec<Check> {
     let original = collect_positions(item, None, args);
     let copied = collect_positions(copy, host, args);
     assert_eq!(original.len(), copied.len(), "test macro: positions differ");
@@ -4684,325 +4430,26 @@ fn comparable(
         Some((copied, false)) => Some(Check {
             j: original.len(),
             pos: copied,
-            expected: None,
             header: true,
             reverse: true,
         }),
         _ => None,
-    };
-    let reroot = if in_module {
-        Reroot::new(item, leaker_path, args)
-    } else {
-        None
     };
     let mut out = Vec::new();
     for (j, (pos, orig)) in copied.into_iter().zip(original).enumerate() {
         if has_no_witness(&orig) {
             continue;
         }
-        let expected = match &reroot {
-            Some(reroot) if !portable(&pos, args) => match reroot.position(&orig, &pos) {
-                Some(expected) => Some(expected),
-                None => continue,
-            },
-            _ => None,
-        };
         let impl_self = matches!(item, Item::Impl(_)) && projects_self(&orig);
         out.push(Check {
             j,
             pos,
-            expected,
             header: false,
             reverse: !impl_self,
         });
     }
     out.extend(header);
     out
-}
-
-/// The paths of the original in a module, written for the Referrer's crate.
-///
-/// A relative path of a type of a module means an item there (the copy declares it too), an
-/// import, a generic or a name that every crate has. The witness is written in the Leaker's module,
-/// so it names the Leaker's items by the names the module declares; the copy names its own. The
-/// expected type has the names that the module declares as they are, where the copy declares them
-/// (the check is written in the copy's module), and every other path from the root of the Leaker's
-/// crate: `crate::base::B0` is `::tlp_l_000::base::B0`, `super::super::base::B0` too, an import
-/// `I0` is the path it stands for. Nothing is looked up in the copy, so the Visitor's idea of what
-/// the module declares is checked, not assumed.
-struct Reroot<'a> {
-    /// The segments of the path of the module that has the analyzed one (the crate, then modules).
-    outer: Vec<Ident>,
-    /// The analyzed module.
-    module: &'a ItemMod,
-    prelude: bool,
-}
-
-/// The state of the rewriting of one position.
-struct Rerooting<'a, 'b> {
-    reroot: &'a Reroot<'b>,
-    /// The items of each module from the analyzed one down to the module of the position.
-    levels: Vec<&'b [Item]>,
-    generics: HashSet<String>,
-    /// The modules from the analyzed one to the module of the position.
-    mods: Vec<Ident>,
-    /// The names that the module declares are the Leaker's items (inside an entry), not the copy's.
-    leaker: bool,
-    /// The last path was resolved to a name that the module declares.
-    declared: bool,
-    /// An import followed: the depth, against cycles.
-    depth: usize,
-    failed: bool,
-}
-
-/// The names declared by the items (not by `use`).
-fn declares(items: &[Item], name: &str) -> bool {
-    items.iter().any(|item| match item {
-        Item::Struct(ItemStruct { ident, .. })
-        | Item::Enum(ItemEnum { ident, .. })
-        | Item::Union(ItemUnion { ident, .. })
-        | Item::Trait(ItemTrait { ident, .. })
-        | Item::TraitAlias(ItemTraitAlias { ident, .. })
-        | Item::Type(ItemType { ident, .. })
-        | Item::Const(ItemConst { ident, .. })
-        | Item::Static(ItemStatic { ident, .. })
-        | Item::Mod(ItemMod { ident, .. })
-        | Item::Fn(ItemFn {
-            sig: Signature { ident, .. },
-            ..
-        })
-        | Item::Macro(ItemMacro {
-            ident: Some(ident), ..
-        }) => ident == name,
-        _ => false,
-    })
-}
-
-/// The path that `use` items bring `name` in as, if they do.
-fn imported(items: &[Item], name: &str) -> Option<Path> {
-    fn find(
-        tree: &UseTree,
-        prefix: &mut Vec<PathSegment>,
-        colon: bool,
-        name: &str,
-    ) -> Option<Path> {
-        let path = |prefix: &[PathSegment]| Path {
-            leading_colon: colon.then(Default::default),
-            segments: prefix.iter().cloned().collect(),
-        };
-        match tree {
-            UseTree::Path(UsePath { ident, tree, .. }) => {
-                prefix.push(ident.clone().into());
-                let found = find(tree, prefix, colon, name);
-                prefix.pop();
-                found
-            }
-            UseTree::Name(UseName { ident }) => {
-                if ident == "self" {
-                    let last = prefix.last()?;
-                    return (last.ident == name).then(|| path(prefix));
-                }
-                (ident == name).then(|| {
-                    let mut full = prefix.clone();
-                    full.push(ident.clone().into());
-                    path(&full)
-                })
-            }
-            UseTree::Rename(UseRename { ident, rename, .. }) => (rename == name).then(|| {
-                let mut full = prefix.clone();
-                if ident != "self" {
-                    full.push(ident.clone().into());
-                }
-                path(&full)
-            }),
-            UseTree::Group(UseGroup { items, .. }) => items
-                .iter()
-                .find_map(|tree| find(tree, prefix, colon, name)),
-            UseTree::Glob(_) => None,
-        }
-    }
-    items.iter().find_map(|item| match item {
-        Item::Use(u) => find(&u.tree, &mut Vec::new(), u.leading_colon.is_some(), name),
-        _ => None,
-    })
-}
-
-impl<'a> Reroot<'a> {
-    fn new(item: &'a Item, leaker_path: &Path, args: &Args) -> Option<Self> {
-        match item {
-            Item::Mod(module) => Some(Reroot {
-                outer: leaker_path
-                    .segments
-                    .iter()
-                    .map(|s| s.ident.clone())
-                    .collect(),
-                module,
-                // The copy of an item accepted by `allow()` keeps the names that conflict.
-                prelude: args.prelude || args.accepted,
-            }),
-            _ => None,
-        }
-    }
-
-    /// The original position written for the Referrer's crate, walking the copy's position with it
-    /// ([`Rerooting::ty()`]): its type and generics, or `None` if a path in them cannot be resolved,
-    /// or the copy has another shape.
-    fn position(&self, orig: &Position, copy: &Position) -> Option<Position> {
-        let mut levels: Vec<&'a [Item]> = vec![self.module.content.as_ref()?.1.as_slice()];
-        for name in orig.mods.iter().skip(1) {
-            let items = *levels.last()?;
-            let nested = items.iter().find_map(|item| match item {
-                Item::Mod(m) if m.ident == *name => {
-                    m.content.as_ref().map(|(_, items)| items.as_slice())
-                }
-                _ => None,
-            })?;
-            levels.push(nested);
-        }
-        let mut state = Rerooting {
-            reroot: self,
-            levels,
-            generics: generic_names(orig),
-            mods: orig.mods.clone(),
-            leaker: false,
-            declared: false,
-            depth: 0,
-            failed: false,
-        };
-        if orig.layers.len() != copy.layers.len() {
-            return None;
-        }
-        let ty = state.ty(&orig.ty, &copy.ty)?;
-        let layers = orig
-            .layers
-            .iter()
-            .zip(&copy.layers)
-            .map(|(orig, copy)| state.generics(orig, copy))
-            .collect::<Option<Vec<_>>>()?;
-        (!state.failed).then(|| Position {
-            mods: orig.mods.clone(),
-            layers,
-            self_sub: None,
-            ty,
-        })
-    }
-}
-
-impl Rerooting<'_, '_> {
-    /// The path `rest` from the root of the Leaker's crate, below the first `keep` segments of the
-    /// path of the module that has the analyzed one.
-    fn absolute<'p>(&self, keep: usize, rest: impl Iterator<Item = &'p PathSegment>) -> Path {
-        let mut path = Path {
-            leading_colon: Some(Default::default()),
-            segments: self.reroot.outer[..keep]
-                .iter()
-                .cloned()
-                .map(PathSegment::from)
-                .collect(),
-        };
-        path.segments.extend(rest.cloned());
-        path
-    }
-
-    /// The path `p` written in the module `level` (0 is the analyzed module), for the module of the
-    /// position.
-    fn path(&mut self, level: usize, p: &Path) -> Option<Path> {
-        if p.leading_colon.is_some() {
-            return Some(p.clone());
-        }
-        let current = self.levels.len() - 1;
-        match p.segments.first()?.ident.to_string().as_str() {
-            "crate" => Some(self.absolute(1, p.segments.iter().skip(1))),
-            "self" => self.named(level, current, p, 1),
-            "super" => {
-                let up = p.segments.iter().take_while(|s| s.ident == "super").count();
-                if up <= level {
-                    self.named(level - up, current, p, up)
-                } else {
-                    // Out of the analyzed module: `up - level - 1` modules above the one that has it.
-                    let above = up - level - 1;
-                    let kept = self.reroot.outer.len().checked_sub(above)?;
-                    (kept >= 1).then(|| self.absolute(kept, p.segments.iter().skip(up)))
-                }
-            }
-            _ => self.named(level, current, p, 0),
-        }
-    }
-
-    /// The segment `skip` of `p` is a name in the module `level`: what it is, written for the module
-    /// of the position `current`.
-    fn named(&mut self, level: usize, current: usize, p: &Path, skip: usize) -> Option<Path> {
-        let segment = p.segments.get(skip)?;
-        let name = segment.ident.to_string();
-        if skip == 0 && self.generics.contains(&name) {
-            return Some(p.clone());
-        }
-        let items = self.levels[level];
-        if declares(items, &name) {
-            self.declared = true;
-            if self.leaker {
-                return Some(self.leaker_path(level, p.segments.iter().skip(skip).cloned()));
-            }
-            return Some(p.clone());
-        }
-        if let Some(target) = imported(items, &name) {
-            if self.depth >= 8 {
-                return None;
-            }
-            self.depth += 1;
-            let resolved = self.path(level, &target);
-            self.depth -= 1;
-            let mut resolved = resolved?;
-            // A path relative to another module means something else here.
-            if resolved.leading_colon.is_none() && level != current {
-                return None;
-            }
-            if let Some(last) = resolved.segments.last_mut() {
-                last.arguments = segment.arguments.clone();
-            }
-            resolved
-                .segments
-                .extend(p.segments.iter().skip(skip + 1).cloned());
-            return Some(resolved);
-        }
-        let everywhere = PRIMITIVES.contains(&name.as_str())
-            || ["std", "core", "alloc"].contains(&name.as_str())
-            // Inside an entry a name of the prelude means the prelude's, as the Leaker's crate has
-            // it; elsewhere the copy keeps it only if the Leaker allows it.
-            || ((self.reroot.prelude || self.leaker) && PRELUDE.contains(&name.as_str()));
-        (skip == 0 && everywhere).then(|| p.clone())
-    }
-
-    /// Writes the path of a type, an expression or a trait bound for the Referrer's crate.
-    fn rewrite(&mut self, qself: &mut Option<QSelf>, path: &mut Path) {
-        match qself {
-            None => match self.path(self.levels.len() - 1, path) {
-                Some(rewritten) => *path = rewritten,
-                None => self.failed = true,
-            },
-            Some(qself) if qself.position > 0 => {
-                let trait_path = Path {
-                    leading_colon: path.leading_colon,
-                    segments: path.segments.iter().take(qself.position).cloned().collect(),
-                };
-                match self.path(self.levels.len() - 1, &trait_path) {
-                    Some(rewritten) => {
-                        qself.position = rewritten.segments.len();
-                        let rest: Vec<PathSegment> = path
-                            .segments
-                            .iter()
-                            .skip(trait_path.segments.len())
-                            .cloned()
-                            .collect();
-                        *path = rewritten;
-                        path.segments.extend(rest);
-                    }
-                    None => self.failed = true,
-                }
-            }
-            Some(_) => (),
-        }
-    }
 }
 
 /// Whether the copy has an entry here: a projection through the Repeater.
@@ -5012,385 +4459,6 @@ fn is_entry(ty: &Type) -> bool {
             && path.segments.len() > qself.position
             && path.segments[qself.position - 1].ident == "Repeater"
             && path.segments.last().map_or(false, |seg| seg.ident == "Type"))
-}
-
-/// The walk of the original and the copy together, which writes what the copy must be equal to.
-///
-/// The names that the module declares are the copy's own items, except inside an entry: the
-/// Repeater's impl of an entry is written in the Leaker's module, so the type it gives names the
-/// Leaker's items (`Rel<R0>`, `crate::base::B1<R0>` with `R0` declared: the copy of the module
-/// refers to the Leaker's `R0` there, as the docs of `Leaker::enter_mod()` say). The copy says
-/// where its entries are; a bare name that the module declares is none, so it is the copy's.
-impl Rerooting<'_, '_> {
-    /// The path of the module `level` of the position in the Leaker's crate, then `rest`.
-    fn leaker_path(&self, level: usize, rest: impl Iterator<Item = PathSegment>) -> Path {
-        let mut path = self.absolute(self.reroot.outer.len(), std::iter::empty::<&PathSegment>());
-        path.segments
-            .extend(self.mods[..=level].iter().cloned().map(PathSegment::from));
-        path.segments.extend(rest);
-        path
-    }
-
-    /// The original type written for the Referrer's crate, with the names that the module declares
-    /// as the Leaker's items (an entry), or as the copy's.
-    fn whole(&mut self, orig: &Type, leaker: bool) -> Option<Type> {
-        let (saved, mut ty) = (self.leaker, orig.clone());
-        self.leaker = leaker;
-        self.visit_type_mut(&mut ty);
-        self.leaker = saved;
-        (!self.failed).then_some(ty)
-    }
-
-    /// Whether the head of the path is a name that the module declares (a generic is none).
-    fn declared_head(&mut self, path: &Path) -> bool {
-        let current = self.levels.len() - 1;
-        let saved = std::mem::replace(&mut self.declared, false);
-        let _ = self.path(current, path);
-        std::mem::replace(&mut self.declared, saved)
-    }
-
-    /// Whether a constant in the type (a path in an expression, or a bare name written like a
-    /// constant) is a path that is not the module's: an import, or from the crate.
-    fn foreign_const(&mut self, ty: &Type) -> bool {
-        struct Foreign<'r, 'a, 'b> {
-            state: &'r mut Rerooting<'a, 'b>,
-            found: bool,
-        }
-        impl Foreign<'_, '_, '_> {
-            fn check(&mut self, path: &Path) {
-                let current = self.state.levels.len() - 1;
-                let saved = std::mem::replace(&mut self.state.declared, false);
-                let resolved = self.state.path(current, path);
-                self.state.declared = saved;
-                self.found |= resolved.map_or(true, |resolved| resolved != *path);
-            }
-        }
-        impl<'ast> Visit<'ast> for Foreign<'_, '_, '_> {
-            fn visit_expr_path(&mut self, i: &'ast ExprPath) {
-                if i.qself.is_none() {
-                    self.check(&i.path);
-                }
-            }
-            fn visit_generic_argument(&mut self, i: &'ast GenericArgument) {
-                if let GenericArgument::Type(Type::Path(TypePath { qself: None, path })) = i {
-                    if path
-                        .get_ident()
-                        .map_or(false, |ident| written_as_const(&ident.to_string()))
-                    {
-                        return self.check(path);
-                    }
-                }
-                syn::visit::visit_generic_argument(self, i)
-            }
-        }
-        let mut foreign = Foreign {
-            state: self,
-            found: false,
-        };
-        foreign.visit_type(ty);
-        foreign.found
-    }
-
-    fn ty(&mut self, orig: &Type, copy: &Type) -> Option<Type> {
-        if is_entry(copy) {
-            // A type that the module declares is not an entry, unless a constant in it is a path
-            // that is not the module's (`RC<bool, ILEN>`): that cannot be leaked alone, so the
-            // whole type is, and its `RC` is the Leaker's.
-            let declared = match orig {
-                Type::Path(TypePath { qself: None, path }) => {
-                    self.declared_head(path) && !self.foreign_const(orig)
-                }
-                _ => false,
-            };
-            return self.whole(orig, !declared);
-        }
-        Some(match (orig, copy) {
-            (Type::Path(o), Type::Path(c)) if o.qself.is_none() && c.qself.is_none() => {
-                Type::Path(TypePath {
-                    qself: None,
-                    path: self.path_pair(&o.path, &c.path)?,
-                })
-            }
-            (Type::Path(o), Type::Path(c)) if o.qself.is_some() && c.qself.is_some() => {
-                let (oq, cq) = (o.qself.as_ref()?, c.qself.as_ref()?);
-                if oq.position != cq.position {
-                    return None;
-                }
-                let mut qself = oq.clone();
-                qself.ty = Box::new(self.ty(&oq.ty, &cq.ty)?);
-                let path = self.path_pair(&o.path, &c.path)?;
-                // The trait path may be longer now: where the associated item starts.
-                let tail = o.path.segments.len() - oq.position;
-                qself.position = path.segments.len() - tail;
-                Type::Path(TypePath {
-                    qself: Some(qself),
-                    path,
-                })
-            }
-            (Type::Reference(o), Type::Reference(c)) => {
-                let mut ty = o.clone();
-                ty.elem = Box::new(self.ty(&o.elem, &c.elem)?);
-                Type::Reference(ty)
-            }
-            (Type::Ptr(o), Type::Ptr(c)) => {
-                let mut ty = o.clone();
-                ty.elem = Box::new(self.ty(&o.elem, &c.elem)?);
-                Type::Ptr(ty)
-            }
-            (Type::Slice(o), Type::Slice(c)) => {
-                let mut ty = o.clone();
-                ty.elem = Box::new(self.ty(&o.elem, &c.elem)?);
-                Type::Slice(ty)
-            }
-            (Type::Array(o), Type::Array(c)) => {
-                let mut ty = o.clone();
-                ty.elem = Box::new(self.ty(&o.elem, &c.elem)?);
-                self.visit_expr_mut(&mut ty.len);
-                Type::Array(ty)
-            }
-            (Type::Paren(o), Type::Paren(c)) => {
-                let mut ty = o.clone();
-                ty.elem = Box::new(self.ty(&o.elem, &c.elem)?);
-                Type::Paren(ty)
-            }
-            (Type::Group(o), Type::Group(c)) => {
-                let mut ty = o.clone();
-                ty.elem = Box::new(self.ty(&o.elem, &c.elem)?);
-                Type::Group(ty)
-            }
-            (Type::Tuple(o), Type::Tuple(c)) if o.elems.len() == c.elems.len() => {
-                let mut ty = o.clone();
-                for (elem, copy) in ty.elems.iter_mut().zip(&c.elems) {
-                    *elem = self.ty(elem, copy)?;
-                }
-                Type::Tuple(ty)
-            }
-            (Type::BareFn(o), Type::BareFn(c)) if o.inputs.len() == c.inputs.len() => {
-                let mut ty = o.clone();
-                for (input, copy) in ty.inputs.iter_mut().zip(&c.inputs) {
-                    input.ty = self.ty(&input.ty, &copy.ty)?;
-                }
-                if let (ReturnType::Type(_, o), ReturnType::Type(_, c)) = (&o.output, &c.output) {
-                    if let ReturnType::Type(_, out) = &mut ty.output {
-                        **out = self.ty(o, c)?;
-                    }
-                }
-                Type::BareFn(ty)
-            }
-            (Type::TraitObject(o), Type::TraitObject(c)) if o.bounds.len() == c.bounds.len() => {
-                let mut ty = o.clone();
-                self.bounds(&mut ty.bounds, &c.bounds)?;
-                Type::TraitObject(ty)
-            }
-            (Type::ImplTrait(o), Type::ImplTrait(c)) if o.bounds.len() == c.bounds.len() => {
-                let mut ty = o.clone();
-                self.bounds(&mut ty.bounds, &c.bounds)?;
-                Type::ImplTrait(ty)
-            }
-            (Type::Never(_), Type::Never(_)) | (Type::Infer(_), Type::Infer(_)) => orig.clone(),
-            // A shape the copy changed: the original as it is, which the check then compares.
-            _ => return self.whole(orig, false),
-        })
-    }
-
-    /// The path of the original written for the Referrer's crate, with the arguments of each
-    /// segment taken pairwise with the copy's.
-    fn path_pair(&mut self, orig: &Path, copy: &Path) -> Option<Path> {
-        if orig.segments.len() != copy.segments.len() {
-            return None;
-        }
-        let mut path = orig.clone();
-        for (segment, copy) in path.segments.iter_mut().zip(&copy.segments) {
-            segment.arguments = self.arguments(&segment.arguments, &copy.arguments)?;
-        }
-        self.path(self.levels.len() - 1, &path)
-    }
-
-    fn arguments(&mut self, orig: &PathArguments, copy: &PathArguments) -> Option<PathArguments> {
-        Some(match (orig, copy) {
-            (PathArguments::None, PathArguments::None) => PathArguments::None,
-            (PathArguments::AngleBracketed(o), PathArguments::AngleBracketed(c))
-                if o.args.len() == c.args.len() =>
-            {
-                let mut args = o.clone();
-                for (arg, copy) in args.args.iter_mut().zip(&c.args) {
-                    match (&*arg, copy) {
-                        (GenericArgument::Type(o), GenericArgument::Type(c)) => {
-                            let ty = self.ty(o, c)?;
-                            // A constant written bare (`LEN3`) that is a longer path now.
-                            *arg = self.argument(o, ty);
-                        }
-                        (GenericArgument::AssocType(o), GenericArgument::AssocType(c)) => {
-                            let mut assoc = o.clone();
-                            assoc.ty = self.ty(&o.ty, &c.ty)?;
-                            *arg = GenericArgument::AssocType(assoc);
-                        }
-                        (GenericArgument::Lifetime(_), _) => (),
-                        (other, _) => {
-                            let mut other = other.clone();
-                            self.visit_generic_argument_mut(&mut other);
-                            *arg = other;
-                        }
-                    }
-                }
-                PathArguments::AngleBracketed(args)
-            }
-            (PathArguments::Parenthesized(o), PathArguments::Parenthesized(c))
-                if o.inputs.len() == c.inputs.len() =>
-            {
-                let mut args = o.clone();
-                for (input, copy) in args.inputs.iter_mut().zip(&c.inputs) {
-                    *input = self.ty(input, copy)?;
-                }
-                if let (ReturnType::Type(_, o), ReturnType::Type(_, c)) = (&o.output, &c.output) {
-                    if let ReturnType::Type(_, out) = &mut args.output {
-                        **out = self.ty(o, c)?;
-                    }
-                }
-                PathArguments::Parenthesized(args)
-            }
-            _ => return None,
-        })
-    }
-
-    /// The generic argument for the type `ty` that stands for `orig`: braces if a bare name became a
-    /// path of several segments (see [`written_as_const()`]).
-    fn argument(&self, orig: &Type, ty: Type) -> GenericArgument {
-        if let (
-            Type::Path(TypePath {
-                qself: None,
-                path: o,
-            }),
-            Type::Path(TypePath { path, .. }),
-        ) = (orig, &ty)
-        {
-            if o.leading_colon.is_none()
-                && o.segments.len() == 1
-                && o.segments[0].arguments.is_none()
-                && path.segments.len() > 1
-                && written_as_const(&o.segments[0].ident.to_string())
-            {
-                let path = path.clone();
-                return GenericArgument::Const(parse_quote!({ #path }));
-            }
-        }
-        GenericArgument::Type(ty)
-    }
-
-    fn bounds(
-        &mut self,
-        orig: &mut Punctuated<TypeParamBound, Token![+]>,
-        copy: &Punctuated<TypeParamBound, Token![+]>,
-    ) -> Option<()> {
-        if orig.len() != copy.len() {
-            return None;
-        }
-        for (bound, copy) in orig.iter_mut().zip(copy) {
-            if let (TypeParamBound::Trait(o), TypeParamBound::Trait(c)) = (&mut *bound, copy) {
-                // `?Sized` is the language's, whatever the module declares.
-                if !matches!(o.modifier, TraitBoundModifier::Maybe(_)) {
-                    o.path = self.path_pair(&o.path.clone(), &c.path)?;
-                }
-            }
-        }
-        Some(())
-    }
-
-    fn generics(&mut self, orig: &Generics, copy: &Generics) -> Option<Generics> {
-        if orig.params.len() != copy.params.len() {
-            return None;
-        }
-        let mut generics = orig.clone();
-        for (param, copy) in generics.params.iter_mut().zip(&copy.params) {
-            match (param, copy) {
-                (GenericParam::Type(o), GenericParam::Type(c)) => {
-                    o.default = None;
-                    self.bounds(&mut o.bounds, &c.bounds)?;
-                }
-                (GenericParam::Const(o), GenericParam::Const(_)) => {
-                    o.default = None;
-                }
-                (GenericParam::Lifetime(_), GenericParam::Lifetime(_)) => (),
-                _ => return None,
-            }
-        }
-        match (&mut generics.where_clause, copy.where_clause.as_ref()) {
-            (None, None) => (),
-            (Some(clause), Some(copy)) if clause.predicates.len() == copy.predicates.len() => {
-                for (predicate, copy) in clause.predicates.iter_mut().zip(&copy.predicates) {
-                    match (predicate, copy) {
-                        (WherePredicate::Type(p), WherePredicate::Type(c)) => {
-                            p.bounded_ty = self.ty(&p.bounded_ty, &c.bounded_ty)?;
-                            self.bounds(&mut p.bounds, &c.bounds)?;
-                        }
-                        (WherePredicate::Lifetime(_), WherePredicate::Lifetime(_)) => (),
-                        _ => return None,
-                    }
-                }
-            }
-            _ => return None,
-        }
-        Some(generics)
-    }
-}
-
-/// Whether a name is written like a constant (`BLEN`, `LEN3`): upper case, with at least three
-/// letters. The argument of a path is a type or a constant, and only a constant that is a single
-/// identifier can be written without braces.
-fn written_as_const(name: &str) -> bool {
-    name.chars()
-        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        && name.chars().filter(|c| c.is_ascii_uppercase()).count() >= 3
-}
-
-impl VisitMut for Rerooting<'_, '_> {
-    fn visit_generic_argument_mut(&mut self, i: &mut GenericArgument) {
-        // A bare name that is an import of a constant is a longer path now: it needs braces.
-        let bare = match i {
-            GenericArgument::Type(Type::Path(TypePath { qself: None, path }))
-                if path.leading_colon.is_none()
-                    && path.segments.len() == 1
-                    && path.segments[0].arguments.is_none() =>
-            {
-                Some(path.segments[0].ident.to_string())
-            }
-            _ => None,
-        };
-        syn::visit_mut::visit_generic_argument_mut(self, i);
-        if let (Some(name), GenericArgument::Type(Type::Path(TypePath { path, .. }))) = (bare, &*i)
-        {
-            if path.segments.len() > 1 && written_as_const(&name) {
-                let path = path.clone();
-                *i = GenericArgument::Const(parse_quote!({ #path }));
-            }
-        }
-    }
-
-    fn visit_type_path_mut(&mut self, i: &mut TypePath) {
-        self.rewrite(&mut i.qself, &mut i.path);
-        syn::visit_mut::visit_type_path_mut(self, i)
-    }
-
-    fn visit_expr_path_mut(&mut self, i: &mut ExprPath) {
-        self.rewrite(&mut i.qself, &mut i.path);
-        syn::visit_mut::visit_expr_path_mut(self, i)
-    }
-
-    fn visit_trait_bound_mut(&mut self, i: &mut TraitBound) {
-        // `?Sized` is the language's, whatever the module declares.
-        if !matches!(i.modifier, TraitBoundModifier::Maybe(_)) {
-            self.rewrite(&mut None, &mut i.path);
-        }
-        syn::visit_mut::visit_trait_bound_mut(self, i)
-    }
-
-    fn visit_type_macro_mut(&mut self, _: &mut TypeMacro) {
-        self.failed = true;
-    }
-
-    fn visit_expr_macro_mut(&mut self, _: &mut ExprMacro) {
-        self.failed = true;
-    }
 }
 
 pub(crate) fn check_fn(
@@ -5409,9 +4477,7 @@ pub(crate) fn check_fn(
     let name = ident(&format!("__tl_chk_{}_{}", id, j));
     let witness = witness_name(id, j);
     let (params, where_clause) = (&generics.params, &generics.where_clause);
-    let mut path = target.clone();
-    path.segments
-        .extend(pos.mods.iter().cloned().map(PathSegment::from));
+    let path = target;
     // The type is the result: like the parameter of a method, it gives the implied bounds (`T: 'a`
     // for `&'a T`) that the original relies on. It is under a `*mut` as the witness has it
     // (`invariant_in()`), so the two types must be equal, not only one a subtype of the other.
@@ -5457,33 +4523,33 @@ fn type_args(generics: &Generics) -> Vec<TokenStream> {
 /// and the type it returns the same (`*mut`). For a trait the implementor is the host, as in the
 /// checks: the copy is an impl for it.
 fn reverse_impls(id: u64, target: &Path, checks: &[Check], host: Option<&Type>) -> TokenStream {
-    let mut groups: Vec<(Vec<Ident>, Vec<TokenStream>)> = Vec::new();
-    for check in checks.iter().filter(|c| c.expected.is_none() && c.reverse) {
-        let pos = &check.pos;
-        let method = method(id, check.j, pos, Implementor::Fixed, TokenStream::new());
-        match groups.iter_mut().find(|(mods, _)| *mods == pos.mods) {
-            Some((_, methods)) => methods.push(method),
-            None => groups.push((pos.mods.clone(), vec![method])),
+    let methods: Vec<TokenStream> = checks
+        .iter()
+        .filter(|c| c.reverse)
+        .map(|check| {
+            method(
+                id,
+                check.j,
+                &check.pos,
+                Implementor::Fixed,
+                TokenStream::new(),
+            )
+        })
+        .collect();
+    if methods.is_empty() {
+        return TokenStream::new();
+    }
+    let mut trait_path = target.clone();
+    trait_path.segments.push(reverse_trait(id).into());
+    let implementor = host.map(|host| quote!(<#host>));
+    let probe = ident(&format!("__TlProbe_{}_0", id));
+    quote! {
+        #[allow(non_camel_case_types, dead_code)]
+        struct #probe;
+        impl #trait_path #implementor for #probe {
+            #(#methods)*
         }
     }
-    let mut out = TokenStream::new();
-    for (k, (mods, methods)) in groups.into_iter().enumerate() {
-        let mut trait_path = target.clone();
-        trait_path
-            .segments
-            .extend(mods.into_iter().map(PathSegment::from));
-        trait_path.segments.push(reverse_trait(id).into());
-        let implementor = host.map(|host| quote!(<#host>));
-        let probe = ident(&format!("__TlProbe_{}_{}", id, k));
-        out.extend(quote! {
-            #[allow(non_camel_case_types, dead_code)]
-            struct #probe;
-            impl #trait_path #implementor for #probe {
-                #(#methods)*
-            }
-        });
-    }
-    out
 }
 
 /// `ty` with each lifetime of `generics` in it: `(&'a (), &'b (), ty)`. The functions have no
@@ -5505,62 +4571,9 @@ fn pinned(generics: &Generics, ty: Type) -> Type {
     parse_quote!((#(&#lifetimes (),)* #ty))
 }
 
-/// The three functions that compare a position with the original written for the Referrer's crate
-/// (`Check::expected`), in the copy's module, where the names that the module declares are the
-/// copy's: `__tl_ex_<id>_<j>` is the original, `__tl_chk_<id>_<j>` has the copy's generics and type
-/// and returns what the original returns (the original's bounds follow from the copy's), and
-/// `__tl_rv_<id>_<j>` has the original's and returns what the copy returns (the copy's follow from
-/// the original's). The types are under `*mut`, so they must be equal, and each lifetime is in the
-/// type (`pinned()`).
-fn reroot_fns(id: u64, check: &Check) -> TokenStream {
-    let expected = check.expected.as_ref().unwrap();
-    let (ex_generics, ex_ty) = lowered(expected, Implementor::Fixed);
-    let (generics, ty) = lowered(&check.pos, Implementor::Fixed);
-    let (ex_ty, ty) = (invariant_in(ex_ty), invariant_in(ty));
-    let (ex, chk, rv) = (
-        ident(&format!("__tl_ex_{}_{}", id, check.j)),
-        ident(&format!("__tl_chk_{}_{}", id, check.j)),
-        ident(&format!("__tl_rv_{}_{}", id, check.j)),
-    );
-    let targs = type_args(&generics);
-    let (ex_params, ex_where) = (&ex_generics.params, &ex_generics.where_clause);
-    let (params, where_clause) = (&generics.params, &generics.where_clause);
-    quote! {
-        #[allow(non_snake_case, dead_code)]
-        fn #ex<#ex_params>() -> ::core::marker::PhantomData<#ex_ty> #ex_where {
-            ::core::marker::PhantomData
-        }
-        #[allow(non_snake_case, dead_code)]
-        fn #chk<#params>() -> ::core::marker::PhantomData<#ty> #where_clause {
-            #ex::<#(#targs),*>()
-        }
-        #[allow(non_snake_case, dead_code)]
-        fn #rv<#ex_params>() -> ::core::marker::PhantomData<#ex_ty> #ex_where {
-            #chk::<#(#targs),*>()
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
 // Entry points.
 // ---------------------------------------------------------------------------------------------
-
-fn module_items<'a>(m: &'a mut ItemMod, path: &[Ident]) -> Option<&'a mut Vec<Item>> {
-    let items = &mut m.content.as_mut()?.1;
-    match path.split_first() {
-        None => Some(items),
-        Some((first, rest)) => {
-            for item in items.iter_mut() {
-                if let Item::Mod(sub) = item {
-                    if sub.ident == *first {
-                        return module_items(sub, rest);
-                    }
-                }
-            }
-            None
-        }
-    }
-}
 
 fn dollar() -> Punct {
     Punct::new('$', Spacing::Alone)
@@ -5656,15 +4669,18 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
     let (result, context, assertions) = analyze(&original, &args);
     // The results of `View::check()` (`via = "check"`), which the copy must agree with.
     let checked = CHECKED.with(|checked| checked.take());
-    // Another call of the same API gives the same analysis as the plain scope. (Not the scope of
-    // a type opened in the one of a module: its contexts and its `Self` are other ones.)
-    if !args.via.is_empty() && args.via != "nested" {
+    // Another call of the same API gives the same analysis as the plain scope (for `via =
+    // "nested"`, `enter_type` gives that of the type analyzed by itself).
+    if !args.via.is_empty() {
         let mut plain_args = args.clone();
         plain_args.via = if args.via == "check" {
             "unchecked".to_string()
         } else {
             String::new()
         };
+        if args.via == "nested" {
+            plain_args.scope = String::new();
+        }
         let (plain, plain_context, plain_assertions) = analyze(&original, &plain_args);
         same_analysis(
             (&result, context, &assertions),
@@ -5958,9 +4974,9 @@ fn check_against_copy(
     Ok(())
 }
 
-/// The witnesses of the type positions of `original` and of the header of an impl, each with the path
-/// of the module it is written in, and the reverse trait of each module (`reverse_trait()`).
-fn witnesses_of(original: &Item, args: &Args) -> Vec<(Vec<Ident>, TokenStream)> {
+/// The witnesses of the type positions of `original` and of the header of an impl, and the reverse
+/// trait (`reverse_trait()`).
+fn witnesses_of(original: &Item, args: &Args) -> Vec<TokenStream> {
     let mut positions = collect_positions(original, None, args);
     let header = header_position(original, args).filter(|pos| !has_no_witness(pos));
     let n = positions.len();
@@ -5970,68 +4986,33 @@ fn witnesses_of(original: &Item, args: &Args) -> Vec<(Vec<Ident>, TokenStream)> 
         .enumerate()
         .filter(|(j, pos)| *j >= n || !has_no_witness(pos))
         .collect();
-    let mut out: Vec<(Vec<Ident>, TokenStream)> = witnessed
+    let mut out: Vec<TokenStream> = witnessed
         .iter()
-        .map(|(j, pos)| (pos.mods.clone(), witness_fn(args.id, *j, pos)))
+        .map(|(j, pos)| witness_fn(args.id, *j, pos))
         .collect();
-    let mut modules: Vec<&Vec<Ident>> = Vec::new();
-    for (_, pos) in &witnessed {
-        if !modules.contains(&&pos.mods) {
-            modules.push(&pos.mods);
-        }
-    }
-    let name = reverse_trait(args.id);
-    let implementor = matches!(original, Item::Trait(_)).then(|| quote!(<__Self: ?Sized>));
-    for mods in modules {
+    if !witnessed.is_empty() {
+        let name = reverse_trait(args.id);
+        let implementor = matches!(original, Item::Trait(_)).then(|| quote!(<__Self: ?Sized>));
         let methods = witnessed
             .iter()
-            .filter(|(_, pos)| pos.mods == *mods)
             .map(|(j, pos)| method(args.id, *j, pos, Implementor::Where, TokenStream::new()));
-        out.push((
-            mods.clone(),
-            quote!(pub trait #name #implementor { #(#methods)* }),
-        ));
+        out.push(quote!(pub trait #name #implementor { #(#methods)* }));
     }
     out
 }
 
 /// The item and what is written next to it, as the tokens before the item and the tokens after it:
-/// the Repeater's impls (in the module each is keyed by, for a module), the assertions and the
-/// witnesses (in the module they are of).
+/// the Repeater's impls, the assertions and the witnesses.
 fn place(
     original: &Item,
     impls: Impls,
     assertions: &TokenStream,
-    witnesses: Vec<(Vec<Ident>, TokenStream)>,
+    witnesses: Vec<TokenStream>,
 ) -> Result<(TokenStream, TokenStream)> {
-    let mut emitted = original.clone();
-    Ok(match &mut emitted {
-        Item::Mod(m) => {
-            // The Repeater's implementations and the witnesses go into the modules they belong
-            // to. The module's own name is the first of the path of a position.
-            let mut extra: Vec<(Vec<Ident>, TokenStream)> = impls;
-            extra.push((Vec::new(), assertions.clone()));
-            for (mods, tokens) in extra.into_iter().chain(
-                witnesses
-                    .into_iter()
-                    .map(|(mods, t)| (mods[1..].to_vec(), t)),
-            ) {
-                let span = m.ident.span();
-                let items = module_items(m, &mods)
-                    .ok_or_else(|| Error::new(span, "test macro: no such module"))?;
-                items.push(Item::Verbatim(tokens));
-            }
-            (quote!(#m), TokenStream::new())
-        }
-        other => {
-            let impls = impls.into_iter().map(|(_, t)| t);
-            let witnesses = witnesses.into_iter().map(|(_, t)| t);
-            (
-                quote!(#other),
-                quote!(#assertions #(#impls)* #(#witnesses)*),
-            )
-        }
-    })
+    Ok((
+        quote!(#original),
+        quote!(#assertions #(#impls)* #(#witnesses)*),
+    ))
 }
 
 /// What the macro writes for the copy that a Referrer makes of `original` with `result`: the
@@ -6084,14 +5065,13 @@ fn count_copy(
                     host.as_ref(),
                 )?;
             }
-            let checks = comparable(&rewritten.item, original, args, host.as_ref(), &dummy);
+            let checks = comparable(&rewritten.item, original, args, host.as_ref());
             let headers = checks.iter().filter(|c| c.header).count();
             let left_out = usize::from(
                 header_of_copy(&rewritten.item, original, args).is_some_and(|(_, cycles)| cycles),
             );
-            let rerooted = checks.iter().filter(|c| c.expected.is_some()).count();
             format!(
-                "{}|{}|{}|entries={} positions={} checked={} twin={} rerooted={} headers={} header_cycles={}",
+                "{}|{}|{}|entries={} positions={} checked={} twin={} headers={} header_cycles={}",
                 id,
                 kind,
                 status,
@@ -6099,7 +5079,6 @@ fn count_copy(
                 positions.len(),
                 checks.len() - headers,
                 u8::from(twin),
-                rerooted,
                 headers,
                 left_out
             )
@@ -6392,16 +5371,9 @@ fn stage_copy(
             }
         }
     };
-    // `clean` first in the invocation: the copy is made only if no error remains after the rule,
-    // and the module copies drop their imports (`apply()`).
-    let clean = if status == "ok" && matches!(rule, Rule::Values | Rule::Default) {
-        if side == Side::Config {
-            expansion(quote!(, clean, constants, imports))
-        } else {
-            expansion(quote!(, clean, constants))
-        }
-    } else if status == "ok" {
-        expansion(quote!(, clean))
+    // `clean` first in the invocation: the copy is made only if no error remains after the rule.
+    let clean = if status == "ok" {
+        expansion(TokenStream::new())
     } else {
         TokenStream::new()
     };
@@ -6497,16 +5469,6 @@ struct ApplyInput {
     allow: Vec<AllowArg>,
     /// What the invocation ignores of the errors, before it allows.
     ignore: Vec<IgnoreArg>,
-    /// The crate of the invocation has none of the Leaker's names (`allow_stages`): a module copy
-    /// drops its imports as the copy of an ordinary item does, and the names that the rule allows
-    /// are the only ones to resolve.
-    clean: bool,
-    /// With `clean`: the rule allows the paths of values and defaults, so the module copy keeps the
-    /// import of the constant they name (`ILEN`).
-    constants: bool,
-    /// With `clean`: the config wrote every relative path of a value or a default as it is, so the
-    /// module copy keeps all its imports.
-    imports: bool,
     /// `inst(N)`: the copy is also used at an instantiation of the generics of the item, which `N`
     /// seeds ([`Instance`]). The ordinary Referrer's crate only.
     inst: Option<u64>,
@@ -6551,8 +5513,7 @@ impl Parse for ApplyInput {
         let path = Path::parse_mod_style(input)?;
         // Flags after the path: `dyn_host` (the trait is implemented for `dyn Host`, an unsized
         // type, instead of a unit struct), `accept` and `allow(..)`.
-        let (mut dyn_host, mut accept, mut clean) = (false, false, false);
-        let (mut constants, mut imports) = (false, false);
+        let (mut dyn_host, mut accept) = (false, false);
         let (mut inst, mut shadow) = (None, None);
         let mut lifetime_args = false;
         let mut allow = Vec::new();
@@ -6562,9 +5523,6 @@ impl Parse for ApplyInput {
             match keyword.to_string().as_str() {
                 "dyn_host" => dyn_host = true,
                 "accept" => accept = true,
-                "clean" => clean = true,
-                "constants" => constants = true,
-                "imports" => imports = true,
                 "inst" => inst = Some(seed_arg(input)?),
                 "shadow" => shadow = Some(seed_arg(input)?),
                 "lifetime_args" => lifetime_args = true,
@@ -6581,7 +5539,7 @@ impl Parse for ApplyInput {
                 }
                 _ => return Err(Error::new(
                     keyword.span(),
-                    "expected `dyn_host`, `accept`, `clean`, `constants`, `imports`, `inst(..)`, `lifetime_args`, `shadow(..)`, `allow(..)` or `ignore(..)`",
+                    "expected `dyn_host`, `accept`, `inst(..)`, `lifetime_args`, `shadow(..)`, `allow(..)` or `ignore(..)`",
                 )),
             }
         }
@@ -6595,11 +5553,8 @@ impl Parse for ApplyInput {
             accept,
             allow,
             ignore,
-            clean,
-            constants,
             inst,
             shadow,
-            imports,
             lifetime_args,
         })
     }
@@ -6615,7 +5570,6 @@ impl Parse for ApplyInput {
 /// Leaker's crate (`R0`, `self::R1`, `super::base::B1`, `crate::base::B1`, an import `I1`), which
 /// the crate of those items has the modules for (`gen::Case::accept_referrer`). The other crate
 /// has none of them: the copy of an ordinary item that kept such a path would not compile there.
-/// The imports of a copied module stay, as the part that is copied as written may name them.
 ///
 /// The errors of the result (`#[prop_leak_result]`) that `allow(..)` of the invocation does not drop
 /// are reported here, in the Referrer's crate, and the copy is made with the recovered Referrer
@@ -6631,11 +5585,8 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         accept,
         allow,
         ignore,
-        clean,
-        constants,
         inst,
         shadow,
-        imports,
         lifetime_args,
     } = parse2(input)?;
     if args.accepted != accept {
@@ -6681,22 +5632,14 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     )?;
     let id = args.id;
 
-    // The checks call the witnesses by the path of the module of the item, in the Leaker's crate
-    // (the position of an item of a module starts with its name), and the reverse trait of the
-    // witnesses is implemented ([`reverse_impls()`]). The positions of a module that name what it
-    // declares are compared in the copy's module with the original written for this crate
-    // ([`Reroot`]).
+    // The checks call the witnesses by the path of the module of the item, in the Leaker's crate,
+    // and the reverse trait of the witnesses is implemented ([`reverse_impls()`]).
     let host = host_arg(&rewritten, &args, &path);
     let host_ty = host.as_ref().map(|(ty, _)| ty);
-    let all = comparable(&rewritten.item, &item, &args, host.as_ref(), &path);
+    let all = comparable(&rewritten.item, &item, &args, host.as_ref());
     let mut checks = TokenStream::new();
-    let mut in_module: Vec<(Vec<Ident>, TokenStream)> = Vec::new();
     for check in &all {
-        if check.expected.is_some() {
-            in_module.push((check.pos.mods[1..].to_vec(), reroot_fns(id, check)));
-        } else {
-            checks.extend(check_fn(id, check.j, &check.pos, &path, host_ty));
-        }
+        checks.extend(check_fn(id, check.j, &check.pos, &path, host_ty));
     }
     // A trait is the one with a host, and its reverse trait is generic over the implementor.
     checks.extend(reverse_impls(
@@ -6709,7 +5652,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     let body = match &mut copy {
         Item::Trait(t) => {
             let host = rewritten.host.as_ref().unwrap();
-            // The module of a scope `mod` declares the trait: its signatures name it as written
+            // The copy of a scope `nested` writes its own name as written in its signatures
             // (`<Self as Tr<N>>::A`).
             let name = &t.ident;
             let import = args.nested().then(|| quote!(use #path::#name;));
@@ -6730,18 +5673,6 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
             }
         }
         Item::Impl(_) => TokenStream::new(),
-        Item::Mod(m) => {
-            if let (Some((_, items)), false) = (&mut m.content, args.accepted && !clean) {
-                drop_relative_uses(items, constants, imports);
-            }
-            for (mods, tokens) in in_module {
-                let span = m.ident.span();
-                let items = module_items(m, &mods)
-                    .ok_or_else(|| Error::new(span, "test macro: no such module"))?;
-                items.push(Item::Verbatim(tokens));
-            }
-            quote!(#m)
-        }
         other => quote!(#other),
     };
     // Reported last: nothing is emitted (nightly) if the macro fails above.
@@ -7066,89 +5997,6 @@ mod tests {
         assert!((0..100).any(|_| a.chance(50)) && (0..100).any(|_| !a.chance(50)));
     }
 
-    const MODULE: &str = "pub mod mm {
-        use super::base::B0 as I0;
-        use ::krate::base::B1 as J1;
-        use super::base::BLEN as ILEN;
-        pub struct R0;
-        pub struct RC<const N: usize>;
-        pub mod n { use super::super::base::BL as IL; pub struct R1; }
-    }";
-
-    /// What the original type of a position in `mm` (or in `mm::n` with `nested`) must equal in the
-    /// Referrer's crate, when the copy has `copy` there.
-    fn expected(orig: &str, copy: &str, nested: bool) -> Option<String> {
-        let module: Item = parse_str(MODULE).unwrap();
-        let args: Args = parse_str("id = 0, prelude = false").unwrap();
-        let reroot = Reroot::new(&module, &parse_quote!(::krate), &args).unwrap();
-        let mods = if nested {
-            ["mm", "n"].to_vec()
-        } else {
-            ["mm"].to_vec()
-        };
-        let position = |ty: &str| Position {
-            mods: mods.iter().map(|m| ident(m)).collect(),
-            layers: Vec::new(),
-            self_sub: None,
-            ty: parse_str(ty).unwrap(),
-        };
-        let found = reroot.position(&position(orig), &position(copy))?.ty;
-        Some(quote!(#found).to_string().replace(' ', ""))
-    }
-
-    const ENTRY: &str = "<() as ::krate::Repeater<(), 0>>::Type";
-
-    #[test]
-    fn a_declared_name_is_the_copys_and_an_import_is_the_leakers() {
-        assert_eq!(expected("R0", "R0", false).unwrap(), "R0");
-        assert_eq!(expected("self::R0", "self::R0", false).unwrap(), "self::R0");
-        assert_eq!(expected("I0", ENTRY, false).unwrap(), "::krate::base::B0");
-        assert_eq!(
-            expected("J1<R0>", "J1<R0>", false).unwrap(),
-            "::krate::base::B1<R0>"
-        );
-        assert_eq!(
-            expected("crate::base::B2<u8>", "crate::base::B2<u8>", false),
-            Some("::krate::base::B2<u8>".to_string())
-        );
-        // Out of the module by `super`, and into it.
-        assert_eq!(
-            expected("super::super::base::B0", ENTRY, true).unwrap(),
-            "::krate::base::B0"
-        );
-        assert_eq!(
-            expected("super::R0", "super::R0", true).unwrap(),
-            "super::R0"
-        );
-        assert_eq!(
-            expected("IL<u8>", ENTRY, true).unwrap(),
-            "::krate::base::BL<u8>"
-        );
-    }
-
-    #[test]
-    fn a_name_the_module_declares_is_the_leakers_only_inside_an_entry() {
-        // Wrapped by a path of another module: the entry names the Leaker's `R0`.
-        assert_eq!(
-            expected("crate::base::B1<R0>", ENTRY, false).unwrap(),
-            "::krate::base::B1<::krate::mm::R0>"
-        );
-        // A bare name the module declares that the copy replaced: the copy's own, so that the
-        // comparison fails if the Visitor took it for an entry.
-        assert_eq!(expected("R0", ENTRY, false).unwrap(), "R0");
-        assert_eq!(
-            expected("Option<R0>", "Option<R0>", false),
-            None,
-            "a bare name of the prelude is not allowed here"
-        );
-        // A constant that is not the module's makes the whole type the entry, `RC` included.
-        assert_eq!(
-            expected("RC<ILEN>", ENTRY, false).unwrap(),
-            "::krate::mm::RC<{::krate::base::BLEN}>"
-        );
-        assert_eq!(expected("RC<3>", ENTRY, false).unwrap(), "RC<3>");
-    }
-
     #[test]
     fn the_header_of_an_impl_assumes_its_trait_reference() {
         let args: Args = parse_str("id = 0, scope = \"\"").unwrap();
@@ -7228,39 +6076,39 @@ mod tests {
     }
 
     /// The table of `nested_self()` names an item as its requirement does: `S`, not `S<>`, without
-    /// generics (a name that differs leaves the entries as written), and an item in a module of the
-    /// one that is analyzed has the module.
+    /// generics (a name that differs leaves the entries as written), and an item in a module has
+    /// the module.
     #[test]
     fn nested_adts_are_named_as_the_requirement_writes_them() {
-        let item: Item = parse_quote!(
-            mod m {
+        let found = |item: Item| -> Vec<(String, Vec<String>)> {
+            nested_adts(&item)
+                .into_iter()
+                .map(|(name, modules)| (name, modules.iter().map(|m| m.to_string()).collect()))
+                .collect()
+        };
+        assert_eq!(
+            found(parse_quote!(
                 pub struct S;
+            )),
+            [("S".to_string(), vec![])]
+        );
+        assert_eq!(
+            found(parse_quote!(
                 pub enum E<'a, T, const N: usize> {
                     A(&'a T, [u8; N]),
                 }
+            )),
+            [("E < 'a , T , N >".to_string(), vec![])]
+        );
+        assert_eq!(
+            found(parse_quote!(
                 mod inner {
                     pub union U {
                         a: u8,
                     }
                 }
-            }
+            )),
+            [("U".to_string(), vec!["inner".to_string()])]
         );
-        let found: Vec<(String, Vec<String>)> = nested_adts(&item)
-            .into_iter()
-            .map(|(name, modules)| (name, modules.iter().map(|m| m.to_string()).collect()))
-            .collect();
-        assert_eq!(
-            found,
-            [
-                ("S".to_string(), vec![]),
-                ("E < 'a , T , N >".to_string(), vec![]),
-                ("U".to_string(), vec!["inner".to_string()]),
-            ]
-        );
-        // An item that is not a module: itself.
-        let item: Item = parse_quote!(
-            struct S<T>(T);
-        );
-        assert_eq!(nested_adts(&item)[0].0, "S < T >");
     }
 }

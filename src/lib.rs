@@ -24,7 +24,7 @@ mod view;
 pub use syn;
 
 pub use crate::analysis::CheckResult;
-pub use crate::context::{Context, ContextId, ModuleScope, SelfRequirement};
+pub use crate::context::{Context, ContextId, SelfRequirement};
 pub use crate::encode::{substitute_args, EncodeError, Substitute};
 pub use crate::error::{Cause, ErrorItem, Reason};
 pub use crate::leaker::Leaker;

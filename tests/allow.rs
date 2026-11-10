@@ -11,8 +11,8 @@
 //! - Scopes: the errors of an inner `enter_*` of a `View` come once, in place, `Self` without
 //!   meaning and its place among the errors, the other kinds of cause.
 //! - The corrections that no conflict of the type itself makes: an entry that names a `Self`
-//!   without meaning, or whose bounds do (in a type, a bound, a default, a module, a value), and a
-//!   type that leaves a lifetime of its method unconstrained, are copied whole and have no entry.
+//!   without meaning, or whose bounds do (in a type, a bound, a default, a value), and a type that
+//!   leaves a lifetime of its method unconstrained, are copied whole and have no entry.
 //! - What accepting does not make compile (`Self` in a predicate beside a leaked bound).
 //! - `Rules::std_crates()`, `finish()` and `into_referrer()`.
 //! - The list of errors of a Leaker: several calls, nested scopes, a panic.
@@ -344,15 +344,13 @@ fn the_errors_of_the_inner_and_the_outer_scope_are_one_list_in_order() {
 }
 
 #[test]
-fn an_error_in_a_module_is_dropped_by_allowing_its_cause() {
-    let item: ItemMod = parse_quote!(
-        mod m {
-            pub struct S(::p::W<'_, dyn RelTr>, Rel);
-        }
+fn an_error_in_a_struct_is_dropped_by_allowing_its_cause() {
+    let item: ItemStruct = parse_quote!(
+        pub struct S(::p::W<'_, dyn RelTr>, Rel);
     );
     let analyze = || {
         let mut leaker = Leaker::new();
-        leaker.intern_mod(&item);
+        leaker.intern_struct(&item);
         leaker.result()
     };
     assert!(analyze().finish().is_err());
@@ -605,22 +603,6 @@ fn a_default_with_a_self_without_meaning_is_copied_whole() {
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
     assert_eq!(listed(&result.into_referrer()), ["Rel2".to_string()]);
-}
-
-#[test]
-fn a_module_with_a_self_without_meaning_is_copied_as_written() {
-    let mut leaker = Leaker::new();
-    leaker.enter_mod("m", Vec::new(), |view| {
-        view.visit_type(&parse_quote!((Rel, Rel<Self>)));
-        view.visit_type(&parse_quote!(Rel2));
-    });
-    let result = leaker.result();
-    assert_eq!(result.errors().len(), 1);
-    // The tuple is copied as written, `Rel` in it is leaked.
-    assert_eq!(
-        listed(&result.into_referrer()),
-        ["Rel".to_string(), "Rel2".to_string()]
-    );
 }
 
 #[test]
@@ -1643,60 +1625,6 @@ fn a_bound_with_a_binder_is_a_part_as_written() {
         }
     );
     assert_eq!(rewritten(&referrer, context, &item), expected);
-}
-
-#[test]
-fn a_part_of_a_module_is_left_as_written_in_that_module_only() {
-    let item: ItemMod = parse_quote!(
-        mod m {
-            pub trait Fg {
-                fn f(&self, x: ::p::Elided<'_, dyn RelTr>);
-            }
-            pub struct S {
-                pub y: ::core::marker::PhantomData<dyn RelTr>,
-            }
-            mod inner {
-                pub struct T {
-                    pub z: ::core::marker::PhantomData<dyn RelTr>,
-                    pub w: ::p::Elided<'_, dyn RelTr>,
-                }
-            }
-        }
-    );
-    let mut leaker = Leaker::new();
-    let context = leaker.intern_mod(&item);
-    let result = leaker.result();
-    assert_eq!(result.errors().len(), 2);
-    let referrer = result.into_referrer();
-    // `RelTr` is relative, so each module has its own entries and its own parts.
-    let parts = parts_of(&referrer);
-    assert_eq!(parts.len(), 2);
-    assert_ne!(parts[0], parts[1]);
-    let mut items = item.content.unwrap().1;
-    let mut visitor = common::visitor(&referrer, context, |_, ix, _| parse_quote!(Entry<#ix>));
-    for item in &mut items {
-        visitor.visit_item_mut(item);
-    }
-    let expected: ItemMod = parse_quote!(
-        mod m {
-            pub trait Fg {
-                fn f(&self, x: ::p::Elided<'_, dyn RelTr>);
-            }
-            pub struct S {
-                pub y: ::core::marker::PhantomData<Entry<0usize>>,
-            }
-            mod inner {
-                pub struct T {
-                    pub z: ::core::marker::PhantomData<Entry<1usize>>,
-                    pub w: ::p::Elided<'_, dyn RelTr>,
-                }
-            }
-        }
-    );
-    assert_eq!(items, expected.content.unwrap().1);
-    // The parts are written with their modules, and read back.
-    let read: Referrer = parse2(referrer.to_token_stream()).unwrap();
-    assert_eq!(read, referrer);
 }
 
 #[test]

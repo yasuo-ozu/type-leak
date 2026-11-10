@@ -1,7 +1,7 @@
 //! Tests for building a `Leaker` and interning items.
 //!
 //! The methods of the `Leaker` which analyze a whole item (`intern_struct()`, `intern_enum()`,
-//! `intern_union()`, `intern_impl()`, `intern_trait()` and `intern_mod()`) come first. Their
+//! `intern_union()`, `intern_impl()` and `intern_trait()`) come first. Their
 //! expected values are those of the constructors of the Leaker which analyzed an item and which
 //! they replace (`Leaker::from_*()`), taken from the previous version of the crate: the item is
 //! analyzed with its own generics as those of the Leaker, which is what the top-level context has,
@@ -357,56 +357,6 @@ fn intern_impl() {
     let err = result.errors();
     assert_eq!(err.len(), 1);
     assert_eq!(err[0].message, "use absolute path: 'Relative'");
-}
-
-#[test]
-fn intern_mod() {
-    let item: ItemMod = parse_quote!(
-        mod m {
-            pub struct S<T> {
-                x: Rel<T>,
-            }
-            pub type A = Rel2;
-            pub mod inner {
-                pub type B = Rel3;
-                use super::super::Rel4;
-                pub struct C(Rel4);
-            }
-        }
-    );
-    let mut leaker = Leaker::new();
-    let module = leaker.intern_mod(&item);
-    let result = leaker.result();
-    let referrer = result.clone().finish().unwrap();
-    assert_eq!(
-        entries(&referrer),
-        [
-            "Rel < T > | < T > | -",
-            "Rel2 |  | -",
-            "Rel3 |  | -",
-            "Rel4 |  | -",
-        ]
-    );
-    // The module of each: the analyzed one for the first two (its path is `[]`), and `inner`.
-    let paths: Vec<Vec<String>> = (0..4)
-        .map(|ix| {
-            common::entry_module_path(&result, ix)
-                .unwrap()
-                .iter()
-                .map(|i| i.to_string())
-                .collect()
-        })
-        .collect();
-    assert_eq!(paths, [vec![], vec![], vec!["inner"], vec!["inner"]]);
-    // The top-level context is the module: the entry of the module is in it.
-    assert_eq!(common::in_module(common::entry(&referrer, 0)), Some(module));
-    // A module without a content has nothing to analyze.
-    let mut leaker = Leaker::new();
-    leaker.intern_mod(&parse_quote!(
-        mod m;
-    ));
-    let referrer = leaker.result().finish().unwrap();
-    assert!(referrer.is_empty());
 }
 
 #[test]
@@ -1221,15 +1171,17 @@ fn test_bodies_are_not_analyzed() {
     );
 
     // Also those of the nested items.
-    let item: ItemMod = parse_quote! {
-        mod m {
-            const C: RelC = RelCVal::new();
-            static S: RelS = RelSVal::new();
-            fn f() -> RelRet { let x: RelBody = RelBody::new(); x }
-        }
-    };
+    let items: [Item; 3] = [
+        parse_quote! { const C: RelC = RelCVal::new(); },
+        parse_quote! { static S: RelS = RelSVal::new(); },
+        parse_quote! { fn f() -> RelRet { let x: RelBody = RelBody::new(); x } },
+    ];
     let mut leaker = Leaker::new();
-    leaker.intern_mod(&item);
+    leaker.enter_generics(&Generics::default(), |view| {
+        for item in &items {
+            view.visit_item(item);
+        }
+    });
     assert_eq!(
         leaker
             .result()
@@ -1243,4 +1195,165 @@ fn test_bodies_are_not_analyzed() {
             .map(|s| s.to_string())
             .collect::<BTreeSet<_>>()
     );
+}
+
+/// The items with `len` as the length of an array in a bound, a self type, a binder or a field: a
+/// probe of the bounds or of the binder walks it too.
+fn items_with_length(len: &Expr) -> Vec<(&'static str, Item)> {
+    vec![
+        (
+            "struct, a bound",
+            parse_quote!(
+                pub struct S<T>(T)
+                where
+                    T: From<[u8; #len]> + Into<Rel<T>>;
+            ),
+        ),
+        (
+            "impl, a bound",
+            parse_quote!(
+                impl<T: From<[u8; #len]> + Into<Rel<T>>> S<T> {}
+            ),
+        ),
+        (
+            "impl, the self type",
+            parse_quote!(
+                impl<T: Into<Rel<Self>>> S<[u8; #len], T> {}
+            ),
+        ),
+        (
+            "method",
+            parse_quote!(
+                impl S {
+                    fn f<T: From<[u8; #len]> + Into<Rel<T>>>(t: T) {}
+                }
+            ),
+        ),
+        (
+            "trait method",
+            parse_quote!(
+                trait Tr {
+                    fn f<T>(t: T)
+                    where
+                        T: From<[u8; #len]> + Into<Rel<T>>;
+                }
+            ),
+        ),
+        (
+            "binder",
+            parse_quote!(
+                pub struct S(for<'a> fn(&'a [u8; #len]) -> &'a u8, Rel);
+            ),
+        ),
+        ("field", parse_quote!(pub struct S([u8; #len], Rel);)),
+    ]
+}
+
+/// A `mod` in an expression of a type (an array length) goes with the type: the analysis is that
+/// of the same item without it, the serialized result included (no context is made for the
+/// module), whether the item is analyzed by itself or nested in a scope, and nothing panics.
+#[test]
+fn a_mod_in_an_expression_of_a_type_goes_with_the_type() {
+    let with_mod: Expr = parse_quote!({
+        mod m {}
+        1
+    });
+    let without: Expr = parse_quote!({ 1 });
+    // The serialized result (the Referrer and the errors), with the module's tokens left out.
+    let analyze = |item: &Item, nested: bool| -> String {
+        let mut leaker = Leaker::new();
+        match (nested, item) {
+            (true, _) => {
+                leaker.enter_generics(&Generics::default(), |view| view.visit_item(item));
+            }
+            (false, Item::Struct(item)) => {
+                leaker.intern_struct(item);
+            }
+            (false, Item::Trait(item)) => {
+                leaker.intern_trait(item);
+            }
+            (false, Item::Impl(item)) => {
+                leaker.intern_impl(item);
+            }
+            _ => unreachable!("not an item of the table"),
+        }
+        let result = leaker.result();
+        quote!(#result).to_string().replace("mod m { } ", "")
+    };
+    for ((name, with), (_, without)) in items_with_length(&with_mod)
+        .into_iter()
+        .zip(items_with_length(&without))
+    {
+        for nested in [false, true] {
+            assert_eq!(
+                analyze(&with, nested),
+                analyze(&without, nested),
+                "{} (nested: {})",
+                name,
+                nested
+            );
+        }
+    }
+}
+
+/// The items of a `mod` in an expression of a type are nested items: a relative path in them is a
+/// cause of the type, which is leaked whole with the module.
+#[test]
+fn the_items_of_a_mod_in_an_expression_of_a_type_are_nested_items() {
+    let ty: Type = parse_quote!(
+        [u8; {
+            mod m {
+                pub struct N(pub Rel);
+            }
+            1
+        }]
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&parse_quote!(pub struct S(#ty, Rel2);));
+    let referrer = leaker.result().finish().unwrap();
+    let types: Vec<String> = common::types(&referrer).map(|ty| s(&ty)).collect();
+    assert_eq!(types, ["Rel2".to_string(), s(&ty)]);
+}
+
+/// A `mod` item is not analyzed: `View::visit_item()` of one, or a walk of the View that meets
+/// one, gives one `Unreadable` error whose cause is `mod name`, with no paths, and nothing in it
+/// is leaked. `allow()` of the cause accepts it.
+#[test]
+fn a_mod_item_is_one_unreadable_error() {
+    let module: ItemMod = parse_quote!(
+        mod m {
+            pub struct S(Rel);
+        }
+    );
+    let check = |result: type_leak::LeakerResult, case: &str| {
+        let errors = result.errors();
+        assert_eq!(errors.len(), 1, "{}: {}", case, messages(errors));
+        let error = &errors[0];
+        assert_eq!(error.reason, type_leak::Reason::Unreadable, "{}", case);
+        assert_eq!(error.cause, Cause::Unreadable(quote!(mod m)), "{}", case);
+        assert!(error.paths.is_empty(), "{}", case);
+        assert_eq!(
+            messages(errors),
+            "cannot analyze the module `m`",
+            "{}",
+            case
+        );
+        let cause = error.cause.clone();
+        let accepted = result.allow(move |c: &Cause, _: Place| *c == cause);
+        let referrer = accepted
+            .finish()
+            .unwrap_or_else(|errors| panic!("{}: allow() left {}", case, messages(&errors)));
+        assert!(referrer.is_empty(), "{}", case);
+    };
+    let mut leaker = Leaker::new();
+    leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_item(&Item::Mod(module.clone()))
+    });
+    check(leaker.result(), "View::visit_item()");
+    let file: File = parse_quote!(#module);
+    let mut leaker = Leaker::new();
+    leaker.enter_generics(&Generics::default(), |view| {
+        syn::visit::visit_file(view, &file)
+    });
+    check(leaker.result(), "a walk of the View");
 }

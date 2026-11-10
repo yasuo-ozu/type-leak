@@ -389,7 +389,6 @@ fn reported(id: u32, text: &'static str) -> Reported {
         "union",
         "impl-inherent",
         "impl-trait",
-        "mod",
         "trait",
     ]
     .iter()
@@ -479,21 +478,6 @@ fn every_item_kind_is_leaked_across_crates() {
         (9032, __tl_report_9032!(), ok("impl-trait", 2, 5, 5)),
         (9033, __tl_report_9033!(), ok("impl-inherent", 2, 2, 2)),
         (9034, __tl_report_9034!(), ok("impl-trait", 2, 5, 5)),
-        // a module (its own `Local` is declared in it, so the types that name it are compared with the
-        // original written for the Referrer's crate)
-        (9041, __tl_report_9041!(), ok("mod", 4, 6, 6)),
-        // a bare identifier that is a const, in a module, beside a name that the module declares: an
-        // absolute `use` declares it, so it is copied as written; one imported from outside is
-        // rejected
-        (9101, __tl_report_9101!(), ok("mod", 2, 4, 4)),
-        (
-            9102,
-            __tl_report_9102!(),
-            rejected(
-                "mod",
-                "`LEN4`maybeaconst,andthetypethatholdsitcannotbeleakedasawhole",
-            ),
-        ),
         // traits: `Self` not named, and an unsized implementor
         (9051, __tl_report_9051!(), ok("trait", 3, 3, 3)),
         (9053, __tl_report_9053!(), ok("trait", 4, 6, 6)),
@@ -594,9 +578,8 @@ fn every_item_kind_is_leaked_across_crates() {
         (9200, __tl_report_9200!(), ok("trait", 2, 0, 0)),
         (9201, __tl_report_9201!(), ok("impl-trait", 3, 2, 2)),
         // the types in the values of an item (`check_values`): the consts and the default
-        // methods of a trait, and the const, the static and the function of a module
+        // methods of a trait
         (9141, __tl_report_9141!(), ok("trait", 5, 6, 6)),
-        (9142, __tl_report_9142!(), ok("mod", 2, 3, 3)),
         // scopes that share names (the findings of a downstream crate): methods that declare the
         // same generic with different bounds, a generic named like a relative type, a path ending
         // with the name of a generic, a type and a const parameter of one name; a bound that names
@@ -617,10 +600,9 @@ fn every_item_kind_is_leaked_across_crates() {
         ),
         (9077, __tl_report_9077!(), ok("struct", 1, 1, 1)),
         // paths that end with the name of a generic (`self::U`, `crate::U`), in a struct and in a
-        // trait, and a module that declares `X` next to a struct whose generic is `X`
+        // trait
         (9091, __tl_report_9091!(), ok("struct", 4, 5, 5)),
         (9092, __tl_report_9092!(), ok("trait", 5, 8, 8)),
-        (9093, __tl_report_9093!(), ok("mod", 3, 5, 5)),
         // F51: a nested struct whose bound names a leaked type that names `Self`, though the macro
         // accepts the `NestedSelfInBounds` error (`nested_self_entries = true`), is rejected, as
         // `intern_struct()` rejects it. The Referrer's macro expands to nothing (`kinds`, like the
@@ -759,20 +741,9 @@ fn copies_of_items_hold_the_original_types() {
         me: l::Wrap::<l::BitsSelf>(PhantomData),
     };
     let _ = unsafe { bits.me };
-
-    // A module: what it declares (`Local`) is its own, what it uses from outside is the original.
-    let holds = r::nested::Holds::<u8> {
-        rel,
-        wrapped: l::Wrap(PhantomData),
-        pair: l::Pair(rel, 6),
-        local: r::nested::Local(11),
-    };
-    assert_eq!((holds.pair.1, holds.local.0), (6, 11));
-    same(&holds.rel, &rel);
-    assert_eq!(r::nested::deeper::Deep(rel).0, rel);
 }
 
-/// A struct, an enum and a trait nested in a module name their own `Self` in relative types
+/// A nested struct, enum and trait (the scope `nested`) name their own `Self` in relative types
 /// (`Wrap<Self>`), and the copy holds the Leaker's: the closure that the test macro gives to
 /// `Visitor::with_nested_self()` returns `::type_leak_test_leaker::kinds::Links<T>` for the `Self`
 /// of the struct, which the copy's own `Links` could not stand for (the Repeater's impl is for the
@@ -780,7 +751,7 @@ fn copies_of_items_hold_the_original_types() {
 /// The Referrer's crate compares each position with a witness of the original when it compiles; here
 /// the fields go in and out of the Leaker's types, which `same()` and the assignments check.
 #[test]
-fn items_nested_in_a_module_name_their_own_self() {
+fn nested_items_name_their_own_self() {
     use type_leak_test_leaker::kinds as l;
     use type_leak_test_referrer::kinds as r;
 
@@ -1267,22 +1238,6 @@ fn the_types_in_the_values_of_a_trait_are_carried() {
     assert_eq!(r::ValueTypesCopy::<u16>::generic(&Copy, 1u64), original);
 }
 
-/// The same for the const, the static and the function of a module. The module declares `Declared`,
-/// which the copy declares again (`size_of::<Declared>()` is its own); the type that it does not
-/// declare is replaced.
-#[test]
-fn the_types_in_the_values_of_a_module_are_carried() {
-    use type_leak_test_leaker::kinds as l;
-    use type_leak_test_referrer::kinds as r;
-
-    assert_eq!(l::values_in_module::SIZE, 1 + 7);
-    assert_eq!(r::values_in_module::SIZE, l::values_in_module::SIZE);
-    assert_eq!(l::values_in_module::TAG, 2);
-    assert_eq!(r::values_in_module::TAG, l::values_in_module::TAG);
-    assert_eq!(l::values_in_module::total(), 7 + 1 + 7);
-    assert_eq!(r::values_in_module::total(), l::values_in_module::total());
-}
-
 /// The scopes of an item that share names (the findings A, 1, 2, 3, 4 and 7 of a downstream crate,
 /// `tests/downstream_findings.rs`): the Repeater's impl of each entry has the generics of its own
 /// scope, so the Referrer's crate compiles, and the signatures of the copy have the original types
@@ -1373,21 +1328,6 @@ fn names_shared_with_a_generic_keep_the_original_types() {
         <H as l::kinds::PathsLikeGenericTrait<u8>>::wrapped::<u16>;
     let _: fn(&H, u8, l::kinds::U) -> l::kinds::Pair<l::U, u8> =
         <H as l::kinds::PathsLikeGenericTrait<u8>>::trait_generic;
-
-    // The generic `X` of the copy is the parameter of the Leaker's `B1<X>`; the declared `X` is the
-    // Leaker's.
-    use r::declared_like_generic as m;
-    let generic = m::Generic::<u8>(l::base::B1(PhantomData), l::base::B2(1u8, 2u8));
-    same(&generic.0, &l::base::B1::<u8>(PhantomData));
-    assert_eq!((generic.1 .0, generic.1 .1), (1, 2));
-    let declared = m::Declared(l::base::B1(PhantomData));
-    same(
-        &declared.0,
-        &l::base::B1::<l::kinds::declared_like_generic::X>(PhantomData),
-    );
-    let deeper = m::inner::Deeper::<u16>(l::base::B1(PhantomData));
-    same(&deeper.0, &l::base::B1::<u16>(PhantomData));
-    assert_eq!(m::X(7).0, 7);
 }
 
 /// A trait is implemented for an unsized type (`dyn Host`) in the Referrer's crate, with the

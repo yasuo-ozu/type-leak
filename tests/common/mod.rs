@@ -6,8 +6,8 @@ use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
     substitute_args, Allow, Cause, CheckResult, Context, ContextId, EncodeError, EntryId,
-    ErrorItem, ImplSelf, Leaker, LeakerResult, ModuleScope, Place, Projection, Referrer,
-    RepeaterImpl, Rules, SelfRequirement, Substitute, View, Visitor,
+    ErrorItem, ImplSelf, Leaker, LeakerResult, Place, Projection, Referrer, RepeaterImpl, Rules,
+    SelfRequirement, Substitute, View, Visitor,
 };
 
 /// The tokens of `x`, as text.
@@ -700,10 +700,10 @@ pub struct SerializedIds {
 /// The form is the format tag, the groups of parts (`[ .. ]`) if there are any, the number of groups
 /// if there is more than one, and then the groups in the order of the entries. A group is `[# id]`,
 /// then, if the context is not declared yet, its declaration (the items `<generics> where .. ;` or
-/// `declared <params> where .. ;`, then `Self .. ;`, `type G .. ;` and `mod .. ;`, in this order,
-/// each ending with a `;` at the top level of the tokens), then the entries `( Type, .. )`. A group with no `# id` is for the id after that
-/// of the group before. A declared context has a group of entries only. It panics with the tokens
-/// for any other shape.
+/// `declared <params> where .. ;`, then `Self .. ;` and `type G .. ;`, in this order, each ending
+/// with a `;` at the top level of the tokens), then the entries `( Type, .. )`. A group with no
+/// `# id` is for the id after that of the group before. A declared context has a group of entries
+/// only. It panics with the tokens for any other shape.
 #[allow(dead_code)]
 pub fn serialized_ids(referrer: &Referrer) -> SerializedIds {
     let tokens = template_quote::ToTokens::to_token_stream(referrer);
@@ -766,9 +766,8 @@ fn parse_serialized_ids(input: ParseStream) -> syn::Result<SerializedIds> {
             }
         } else {
             declared.push(context);
-            // The declaration: items that end with `;`, in the order of the stages 0 to 4. Only
-            // generics (0) or the generics as declared (1), not both, and a module (4) may come
-            // once.
+            // The declaration: items that end with `;`, in the order of the stages 0 to 3. Only
+            // generics (0) or the generics as declared (1), not both.
             let mut stage = 0;
             while !input.peek(token::Paren) {
                 let at = if input.peek(Token![<]) || input.peek(Token![where]) {
@@ -783,8 +782,6 @@ fn parse_serialized_ids(input: ParseStream) -> syn::Result<SerializedIds> {
                     2
                 } else if input.peek(Token![type]) {
                     3
-                } else if input.peek(Token![mod]) {
-                    4
                 } else {
                     return Err(input.error("expected an item of a declaration or the entries"));
                 };
@@ -793,7 +790,6 @@ fn parse_serialized_ids(input: ParseStream) -> syn::Result<SerializedIds> {
                 }
                 stage = match at {
                     0 | 1 => 2,
-                    4 => 5,
                     _ => at,
                 };
                 loop {
@@ -828,59 +824,6 @@ pub fn entry_id(referrer: &Referrer, ix: usize) -> ContextId {
     match serialized_ids(referrer).entries.get(ix) {
         Some(context) => *context,
         None => panic!("no such entry: {}", ix),
-    }
-}
-
-/// The module that `context` is in (`ModuleScope::In`). It is `None` for a context that depends on
-/// no module and for the context of a module itself.
-#[allow(dead_code)]
-pub fn in_module(context: &Context) -> Option<ContextId> {
-    match &context.module {
-        Some(ModuleScope::In(module)) => Some(*module),
-        _ => None,
-    }
-}
-
-/// The module of the `ix`-th entry, as `LeakerResult::repeater_impls()` gives it in
-/// `RepeaterImpl::module`: the `ModuleScope::Itself` of the module its impl goes in, or `None` if
-/// the entry is in no module.
-#[allow(dead_code)]
-pub fn entry_module(result: &LeakerResult, ix: usize) -> Option<ModuleScope> {
-    let r = result
-        .repeater_impls(&projection(parse_quote!(crate::Repeater), 7))
-        .unwrap_or_else(|error| panic!("the impls: {}", error))
-        .into_iter()
-        .nth(ix)
-        .unwrap_or_else(|| panic!("no such entry: {}", ix));
-    r.module
-}
-
-/// The path from its root of the module of the `ix`-th entry (`ModuleScope::Itself::path`); `None`
-/// if the entry is in no module, or in a module of `enter_mod()`.
-#[allow(dead_code)]
-pub fn entry_module_path(result: &LeakerResult, ix: usize) -> Option<Vec<Ident>> {
-    match entry_module(result, ix) {
-        Some(ModuleScope::Itself { path, .. }) => path,
-        _ => None,
-    }
-}
-
-/// The hint given to `Leaker::enter_mod()` for the module of the `ix`-th entry
-/// (`ModuleScope::Itself::hint`).
-#[allow(dead_code)]
-pub fn entry_module_hint(result: &LeakerResult, ix: usize) -> Option<String> {
-    match entry_module(result, ix) {
-        Some(ModuleScope::Itself { hint, .. }) => hint,
-        _ => None,
-    }
-}
-
-/// The module in which the module of the `ix`-th entry is nested (`ModuleScope::Itself::parent`).
-#[allow(dead_code)]
-pub fn entry_module_parent(result: &LeakerResult, ix: usize) -> Option<ContextId> {
-    match entry_module(result, ix) {
-        Some(ModuleScope::Itself { parent, .. }) => parent,
-        _ => None,
     }
 }
 

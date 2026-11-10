@@ -586,15 +586,22 @@ fn an_associated_const_default_is_read() {
 #[test]
 fn the_note_says_which_value() {
     let notes = |source: &str| -> Vec<String> {
-        let item: Item = parse_str(source).unwrap();
+        let file: File = parse_str(source).unwrap();
         let mut leaker = Leaker::with_rule(config());
         leaker.check_values = true;
-        match &item {
-            Item::Trait(i) => leaker.intern_trait(i),
-            Item::Impl(i) => leaker.intern_impl(i),
-            Item::Mod(i) => leaker.intern_mod(i),
-            _ => unreachable!(),
-        };
+        for item in &file.items {
+            match item {
+                Item::Trait(i) => {
+                    leaker.intern_trait(i);
+                }
+                Item::Impl(i) => {
+                    leaker.intern_impl(i);
+                }
+                _ => {
+                    leaker.enter_generics(&Generics::default(), |view| view.visit_item(item));
+                }
+            }
+        }
         let result = leaker.result();
         assert!(!result.errors().is_empty(), "accepted: {}", source);
         result
@@ -622,57 +629,13 @@ fn the_note_says_which_value() {
         [note("the value of `A`"), note("the body of `f`")]
     );
     assert_eq!(
-        notes(
-            "mod m { pub const A: usize = r1(); pub static B: usize = r2(); pub fn f() { r3() } }"
-        ),
+        notes("pub const A: usize = r1(); pub static B: usize = r2(); pub fn f() { r3() }"),
         [
             note("the value of `A`"),
             note("the value of `B`"),
             note("the body of `f`")
         ]
     );
-}
-
-#[test]
-fn a_module_is_read_with_its_declared_names() {
-    let item: ItemMod = parse_quote! {
-        mod m {
-            pub struct L;
-            impl L {
-                pub const C: usize = 1;
-                pub fn new() -> L { L }
-                pub fn c() -> usize { Self::C + inner::D }
-            }
-            pub const E: usize = L::C;
-            pub static S: usize = E;
-            pub fn f() -> L { let l = L::new(); helper(l) }
-            fn helper(l: L) -> L { l }
-            pub mod inner { pub const D: usize = 2; pub fn g() -> usize { D } }
-        }
-    };
-    let mut leaker = Leaker::with_rule(config());
-    leaker.check_values = true;
-    leaker.intern_mod(&item);
-    assert_eq!(leaker.result().finish().unwrap().iter().count(), 0);
-
-    // The same module with a name that it does not declare.
-    let item: ItemMod = parse_quote! {
-        mod m {
-            pub struct L;
-            pub fn f() -> L { L::new() }
-            pub fn g() -> usize { Other::N }
-        }
-    };
-    let mut leaker = Leaker::with_rule(config());
-    leaker.check_values = true;
-    leaker.intern_mod(&item);
-    let result = leaker.result();
-    let messages: Vec<String> = result
-        .errors()
-        .iter()
-        .map(|item| item.message.clone())
-        .collect();
-    assert_eq!(messages, ["use absolute path: 'Other::N'"]);
 }
 
 #[test]
@@ -773,14 +736,15 @@ fn a_bad_value_is_an_error_of_its_scope_and_the_one_around_it() {
 /// `Self` where it has no meaning is still `SelfWithoutMeaning`, also in a value.
 #[test]
 fn self_without_meaning_in_a_value() {
-    let item: ItemMod = parse_quote!(
-        mod m {
-            pub const X: usize = Self::N;
-        }
+    let item: Item = parse_quote!(
+        pub const X: usize = Self::N;
     );
+    fn analyze<A: Allow>(leaker: &mut Leaker<A>, item: &Item) {
+        leaker.enter_generics(&Generics::default(), |view| view.visit_item(item));
+    }
     let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
-    leaker.intern_mod(&item);
+    analyze(&mut leaker, &item);
     let result = leaker.result();
     let err = result.errors();
     assert!(
@@ -794,7 +758,7 @@ fn self_without_meaning_in_a_value() {
     // The value is not read without the option.
     let plain = Rules::new().primitive();
     let mut leaker = Leaker::with_rule(plain);
-    leaker.intern_mod(&item);
+    analyze(&mut leaker, &item);
     let result = leaker.result();
     assert!(result.finish().is_ok());
 }
@@ -947,8 +911,8 @@ fn check_values_is_read_by_each_call() {
     leaker.check_values = false;
     leaker.intern_trait(&item("Off1", "C"));
     leaker.check_values = true;
-    leaker.enter_mod("m", Vec::new(), |view| {
-        view.visit_item(&Item::Trait(item("OnInMod", "D")));
+    leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_item(&Item::Trait(item("OnInGenerics", "D")));
     });
     leaker.check_values = false;
     leaker.enter_generics(&Generics::default(), |view| {

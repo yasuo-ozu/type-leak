@@ -405,7 +405,7 @@ pub(crate) fn declared_names(item: &Item) -> Vec<Ident> {
 
 /// Adds to `names` what the `use` tree brings into scope: `use a::b::{self}` brings `b`, and
 /// `as _` and a glob bring no name. `parent` is the name before a group.
-pub(crate) fn use_names(tree: &UseTree, parent: Option<&Ident>, names: &mut Vec<Ident>) {
+fn use_names(tree: &UseTree, parent: Option<&Ident>, names: &mut Vec<Ident>) {
     match tree {
         UseTree::Path(UsePath { ident, tree, .. }) => use_names(tree, Some(ident), names),
         UseTree::Name(UseName { ident }) if ident == "self" => names.extend(parent.cloned()),

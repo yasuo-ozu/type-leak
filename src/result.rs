@@ -462,8 +462,8 @@ impl LeakerResult {
 
     /// Describes the Repeater impl of each entry: its generics, trait path and type.
     ///
-    /// It is the Leaker's side that writes the impls: write one for every entry, in
-    /// [`RepeaterImpl::module`] if it is `Some`. They come in the order of the entries
+    /// It is the Leaker's side that writes the impls: write one for every entry, next to the
+    /// analyzed items. They come in the order of the entries
     /// ([`Referrer::iter()`], so without those that [`ignore()`](LeakerResult::ignore) removed),
     /// each with its [`EntryId`] in [`RepeaterImpl::entry`], which the
     /// Repeater's `KEY` ([`Projection::key()`]) and [`Projection::of()`] take.

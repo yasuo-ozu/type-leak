@@ -152,12 +152,6 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9032!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9033!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9034!(path = ::type_leak_test_leaker::kinds);
-    type_leak_test_leaker::__tl_prop_9041!(path = ::type_leak_test_leaker::kinds);
-    // A bare identifier that is a const, in a module: beside a name that the module declares, an
-    // absolute `use` declares it (the copy keeps it), and a relative one is rejected (it expands to
-    // nothing).
-    type_leak_test_leaker::__tl_prop_9101!(path = ::type_leak_test_leaker::kinds);
-    type_leak_test_leaker::__tl_prop_9102!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9051!(path = ::type_leak_test_leaker::kinds);
     // A trait implemented for an unsized type: `dyn Host9053`.
     type_leak_test_leaker::__tl_prop_9053!(path = ::type_leak_test_leaker::kinds, dyn_host);
@@ -264,7 +258,6 @@ pub mod kinds {
     // The types in the values of an item, with `check_values`: the copy compiles only if every
     // type in a value that this crate cannot name is replaced.
     type_leak_test_leaker::__tl_prop_9141!(path = ::type_leak_test_leaker::kinds);
-    type_leak_test_leaker::__tl_prop_9142!(path = ::type_leak_test_leaker::kinds);
     // The names of the prelude of every edition in the values and the bounds (issue 3).
     type_leak_test_leaker::__tl_prop_9208!(path = ::type_leak_test_leaker::kinds);
     // The names that a block declares (`use a::b::{self}`, a `const fn`) hide the entries that
@@ -289,10 +282,9 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9074!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9075!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9077!(path = ::type_leak_test_leaker::kinds);
-    // Paths that end with the name of a generic, and a module that declares one.
+    // Paths that end with the name of a generic.
     type_leak_test_leaker::__tl_prop_9091!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9092!(path = ::type_leak_test_leaker::kinds);
-    type_leak_test_leaker::__tl_prop_9093!(path = ::type_leak_test_leaker::kinds);
     // The cyclic bound is rejected: it expands to nothing.
     type_leak_test_leaker::__tl_prop_9076!(path = ::type_leak_test_leaker::kinds);
     // An optional entry that holds a method lifetime is copied as written, by a strict Referrer too

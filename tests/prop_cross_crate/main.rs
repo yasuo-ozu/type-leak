@@ -1,7 +1,7 @@
 //! A property test of `type-leak` across crate boundaries.
 //!
-//! Each case is a generated Leaker's crate (a module of relative types, and random modules,
-//! structs, enums, unions, traits and impls with `#[prop_leak]` on them, see `gen.rs`) and a
+//! Each case is a generated Leaker's crate (a module of relative types, and random structs, enums,
+//! unions, traits and impls with `#[prop_leak]` on them, in modules, see `gen.rs`) and a
 //! generated Referrer's crate that invokes the macro exported for each item. The macros are those
 //! of `tests/crates/macro/prop.rs`, which analyze the item with the matching `intern_*` (or, for
 //! some, through a scope: see below), emit the Repeater's implementations, and, in the Referrer's
@@ -20,8 +20,7 @@
 //! pass for the original, and it must be the same type, lifetimes included.
 //! `Self` is what it is at the position (the struct, enum or union, the self type of an impl, or
 //! the host type that implements a trait in the Referrer's crate); a position with an elided
-//! lifetime has no witness, and in a copy of a module neither has a type that names what the module
-//! declares, because the copy declares its own.
+//! lifetime has no witness.
 //!
 //! All the cases are built by one `cargo build --workspace`, so that they compile in parallel.
 //! The Leaker's crate must compile by itself: if it does not, it is built again without
@@ -39,7 +38,7 @@
 //!   others), a binary that fails or prints a line that is not a report, and an item with no
 //!   report (`missing_artifacts()`). None of them is read as "rejected".
 //! - The acceptance floor. The Leaker must accept at least a share of the items analyzed of each
-//!   kind (struct, enum, union, trait, inherent impl, trait impl, module), of each scope they
+//!   kind (struct, enum, union, trait, inherent impl, trait impl), of each scope they
 //!   are analyzed through, and of each construct they have (a trait with a generic associated
 //!   type, a const parameter, an `impl Trait` argument, a default, a `for<>` binder, ...: the tags
 //!   `construct:<name>` that the generator puts, `gen::CONSTRUCTS`, counted in a table of the
@@ -65,8 +64,7 @@
 //!
 //! The generator keeps the shapes that the Leaker rejects (a predicate that names a leaked type
 //! that uses a generic, an `impl Trait` argument, ...) in a share of the items (`gen::Gen::cyclic`),
-//! so that most items are accepted: an item is rejected with its first such shape, and a module
-//! with the first of its dozen items.
+//! so that most items are accepted: an item is rejected with its first such shape.
 //!
 //! # Every rejection is explained
 //!
@@ -88,7 +86,7 @@
 //! (the tag `bound_cycle` was on every item of the share that may have a cycle, and a Leaker that
 //! rejected the predicates that an impl proves, `Rel<T>: Default`, as bounds of the environment,
 //! rejected 20 items of 60 cases that it explained). `Gen::note_text()` reads the final text of
-//! each item (and of each part of a module), `Gen::note_bounds()` among the rest:
+//! each item, `Gen::note_bounds()` among the rest:
 //!
 //! - an `UnprovableBound` is a cycle between a type in a predicate and a bound of a generic that
 //!   names a leaked type (`T: Fn(Rel) -> u8`). The note of the error names that bound; it must be
@@ -113,7 +111,7 @@
 //!   `unreadable_value` (a glob import or a `macro_rules!` in a body, with `values`),
 //!   `NestedSelfInBounds` `nested_self_in_bounds` (the shape of `self_bound_adts` where the macro
 //!   does not allow the risk, `nested_self_entries` off; the Leaker must reject it) or
-//!   `nested_self_in_bounds_text` (a bound that names `Self` in an item nested in `enter_mod`
+//!   `nested_self_in_bounds_text` (a bound that names `Self` in an item nested in `enter_generics`
 //!   without it), a cause of the kind `Macro` `macro_path`, a path that holds an array whose
 //!   length is a macro call `macro_call`, and `Rl<'_>` `elided_arg`. Items with the risk not
 //!   allowed are rejected if they have the shape, and with it allowed no rejection has a tag, so a
@@ -122,9 +120,8 @@
 //! What a Leaker leaks is read from the text and from the settings of the Leaker's crate
 //! (`Gen::names_leaked_type()`: a relative path, `Self`, a path of `std` or of the Leaker's crate
 //! that it does not allow, a primitive type if it does not allow them), and not from what the
-//! generator meant. A module has the tags of all its items, and each reason needs one tag: the
-//! rejection of a module is explained by an item of it that has the shape (for an `UnprovableBound`
-//! or an `UnconstrainedLifetime`, by the text that the item wrote).
+//! generator meant. Each reason needs one tag (for an `UnprovableBound` or an
+//! `UnconstrainedLifetime`, the text that the item wrote).
 //!
 //! # Accepting the rejections (`TYPE_LEAK_PROP_ACCEPT`)
 //!
@@ -171,8 +168,7 @@
 //! has none of them, so that the copy of an ordinary item that keeps a relative path by mistake
 //! does not compile there, as before. A separate crate and not a module of the ordinary one,
 //! because `crate::base` is the root of the crate: `base` there would let such a copy resolve.
-//! A copy of a module analyzed as a whole keeps its imports in the crate of their own. (For an item
-//! accepted by `allow()` the test cannot tell a relative path that the Leaker should have leaked
+//! (For an item accepted by `allow()` the test cannot tell a relative path that the Leaker should have leaked
 //! and did not from one it copied as written: both resolve. The witnesses still compare the types.)
 //!
 //! # The copies that do not compile are explained
@@ -262,7 +258,7 @@
 //! - **Other calls of one scope** (`via` in the attribute of an item, `gen::Gen::with_via()`, `Args::via`
 //!   of the macro): a struct, an enum or a union by `enter_type`, with its generics given to the view
 //!   by parts (`visit_type_param_bound`, `visit_where_clause`, `visit_type`), with `View::check()` on its
-//!   types first (a scope for the generics of a method nested in the view), or nested in `enter_mod`
+//!   types first (a scope for the generics of a method nested in the view), or nested in `enter_generics`
 //!   by `View::enter_type`; a trait by `enter_trait` with the parts or the checks; a trait impl by
 //!   `enter_impl` with the path of its trait, and an impl by `enter_impl` and the walk of syn. The
 //!   analysis must equal that of the plain scope (`VIA DIFFERS`), `check()` must record nothing and
@@ -319,21 +315,20 @@
 //!
 //! - The helpers agree: `repeater_impls()` declares the generics of the context of its entry
 //!   without the bounds its arguments encode, and the parameter of the implementor, `is_empty()`
-//!   and `iter()` say the same, and the module of its impl (`RepeaterImpl::module`) is the
-//!   `Itself` of the module its context is in (`HELPERS DISAGREE`).
+//!   and `iter()` say the same, and each impl says the entry it is for (`HELPERS DISAGREE`).
 //! - A fifth of the cases do not allow the primitive types: `u8` is an entry then, and the copy
 //!   keeps none in a type position (`PRIMITIVE KEPT`).
 //!
 //! What the macro analyzes besides `intern_*`: a fifth of the structs, enums and unions are
-//! analyzed nested in `enter_mod` (`View::visit_item`, its generics are local) or in
-//! `enter_generics` (no `Self`), a tenth of the traits nested in `enter_mod`, another tenth with
+//! analyzed nested in `enter_generics` (`View::visit_item`, its generics are local) or in
+//! `enter_generics` (no `Self`), a tenth of the traits nested in `enter_generics`, another tenth with
 //! `enter_trait`, and a third of the impls whose generics name no leaked type with `enter_impl`,
 //! where only the self type and the arguments of the trait are visited (the shape of a macro that
 //! resolves the trait by its name), and only those are compared. What it cannot express: the
-//! impls in `enter_mod` (the rewritten self type is the `Self` of the entries, which the nested
+//! impls nested in `enter_generics` (the rewritten self type is the `Self` of the entries, which the nested
 //! contexts do not give; the macro cannot write a nested impl's own `Self`), and `enter_trait` for a
 //! trait with a generic associated type (the scope does not know its items). A struct, an enum, a
-//! union or a trait nested in `enter_mod` names its own `Self` (`nested_self` below): the macro
+//! union or a trait nested in `enter_generics` names its own `Self` (`nested_self` below): the macro
 //! writes its entries for the Leaker's type with the closure of `Visitor::with_nested_self()`, and
 //! the check writes the Leaker's type for a `Self` that no entry has.
 //!
@@ -341,7 +336,7 @@
 //! a bound (`trait Tr<T: AsRef<Self>, U = Rel<T>>`, `trait_self_defaults` below, F39). The bound
 //! names the trait's `Self` in 58%, and the rest is the control (`T: Clone`; the shape draws 70%,
 //! and only a nested trait or one of the 70% of the items where `Self` is common may name it). Those
-//! traits are nested in `enter_mod` in 45% (the closure of `with_nested_self()` gives the host for
+//! traits are nested in `enter_generics` in 45% (the closure of `with_nested_self()` gives the host for
 //! the default), and analyzed as the item itself by `intern_trait` or `enter_trait`
 //! otherwise (the Visitor finds the default without `Self`, and the macro picks the host as the
 //! implementor for an entry whose bound names `Self`). Of the nested ones, 60% are declared again in
@@ -363,7 +358,7 @@
 //! - `TYPE_LEAK_PROP_MIN_ACCEPT`: the acceptance floors, in percent. A number sets every kind and
 //!   scope, `name=number` one of them, read in order: `0` turns the floors off (the total accepted
 //!   must still be positive, and `TYPE_LEAK_PROP_MIN_CHECKED` still counts), `40,mod=10,enter_impl=70`
-//!   is 40% but 10% for modules and 70% for `enter_impl`. The names are the kinds of the table of the summary and the scopes `enter_mod`,
+//!   is 40% but 10% for modules and 70% for `enter_impl`. The names are the kinds of the table of the summary and the scopes `nested`,
 //!   `enter_generics`, `enter_trait` and `enter_impl`.
 //! - `TYPE_LEAK_PROP_MIN_SAMPLES` (default 12): the fewest items of a kind for its floor to count
 //!   (three times as many for a construct).
@@ -386,33 +381,32 @@
 //!   (`tests/findings.rs` has most of them as a library-level test). `strict_anchors` (F18, about the
 //!   copies that replace optional entries) is fixed, and on by default (`-strict_anchors`: the
 //!   items that have it are not generated on purpose). `unsized_params`,
-//!   `bound_cycles`, `impl_assoc_self`, `method_lifetime_paths`, `module_crate_paths`,
+//!   `bound_cycles`, `impl_assoc_self`, `method_lifetime_paths`,
 //!   `bound_merge_syntax`, `fn_pointer_self`, `elided_fn_generics`, `impl_self_bounds` (F13),
 //!   `impl_pred_leaked` (F14), `self_elision` (F15, F23), `implied_outlives` (F16),
 //!   `strict_cycles` (F17, about the copies that replace optional entries too), `impl_self_bound_cycle` (F19),
 //!   `trait_assoc_bound_cycle` (F20), `iterator_item_cycle` (F21), `supertrait_item` (F25),
 //!   `alias_item` (F26), `impl_trait_args` (F27), `hidden_lifetimes` (F28), `projection_outlives` (F30),
 //!   `item_predicate_cycle` (F33), `self_projection_outlives` (F34), `gat_where_clause` (F35),
-//!   `nested_self` (F36: a struct, an enum, a union or a trait analyzed nested in `enter_mod` that
+//!   `nested_self` (F36: a struct, an enum, a union or a trait analyzed nested in `enter_generics` that
 //!   names its own `Self`, which the Visitor writes with `with_nested_self()`; F37: an entry that
 //!   does not name it, and uses a generic whose bound does, is for any type, and the macro passes
 //!   the copy's own type; one that names it too is the `NestedSelfInBounds` risk, an error unless
 //!   the macro allows it; F38: an absolute type that names it
 //!   is no entry, so the copy writes it as it is, with the copy's own `Self`),
 //!   `trait_self_defaults` (F39: a trait whose parameter defaults use a generic whose bound names
-//!   the trait's `Self`, `trait Tr<T: AsRef<Self>, U = Rel<T>>`, nested in `enter_mod`, where the
+//!   the trait's `Self`, `trait Tr<T: AsRef<Self>, U = Rel<T>>`, nested in `enter_generics`, where the
 //!   Visitor left the default as written, and analyzed as the item itself, where it looks the
 //!   default up without `Self`; with the control whose bound names no `Self`; the traits are
 //!   counted in the statistics: no shape explains a rejection, so none has a tag in `family()`),
-//!   `self_bound_adts` (F41: a struct, an enum or a union nested in `enter_mod` with a generic
+//!   `self_bound_adts` (F41: a struct, an enum or a union nested in `enter_generics` with a generic
 //!   whose bound names its own `Self` and a default that uses it; the Leaker must accept it, which
 //!   `unexplained()` checks) and `nested_self_entries` (F42: the macro asks for
-//!   `nested_self_entries` for half of the items nested in `enter_mod`, and those of
+//!   `nested_self_entries` for half of the items nested in `enter_generics`, and those of
 //!   `self_bound_adts` have a field that names `Self` in a relative type: the Leaker reports
 //!   `NestedSelfInBounds` for it, which stays (and `unexplained()` requires it) unless the macro
 //!   allows it, as the option does),
-//!   `path_named_like_generic` (`self::U` next to a generic `U`), `declared_named_like_generic` (a
-//!   module that declares `X`, and `crate::base::B1<X>` in `fn f<X>`) and
+//!   `path_named_like_generic` (`self::U` next to a generic `U`) and
 //!   `bare_const_in_absolute_path` (a bare `ILEN` next to a leaked argument in a
 //!   path of another crate, which was leaked alone as a type: E0573) are fixed findings,
 //!   each in a share of the items (`gen::Gen::cyclic`): they are on by default (the Leaker encodes
@@ -1863,8 +1857,8 @@ fn family(error: &Rejection) -> Option<Family> {
             "a type in the self type of an impl whose context depends on `Self` through a bound",
             &[gen::TAG_IMPL_HEADER_SELF],
         ),
-        // The same fault in a struct, an enum or a union nested in `enter_mod`, analyzed without
-        // The same fault in a struct, an enum or a union nested in `enter_mod`, where the macro
+        // The same fault in a struct, an enum or a union nested in `enter_generics`, analyzed without
+        // The same fault in a struct, an enum or a union nested in `enter_generics`, where the macro
         // does not allow it (`nested_self_entries` off): the item wrote a type that names `Self`
         // and a generic whose bound does (`gen::TAG_NESTED_SELF_BOUNDS`, put only there).
         "NestedSelfInBounds" => family_of(
@@ -1896,11 +1890,6 @@ fn because_of_macro(note: &str) -> bool {
 fn maybe_const_family(error: &Rejection) -> Option<Family> {
     let tags: &[&str] = if because_of_macro(&error.note) {
         &[gen::TAG_MACRO_CALL]
-    } else if error
-        .note
-        .contains("which the module declares and the copy declares again")
-    {
-        &[gen::TAG_MODULE_SCOPE]
     } else if error.note.contains("because of `'") {
         &[
             gen::TAG_METHOD_LIFETIME,
@@ -2045,7 +2034,7 @@ fn unexplained(tags: &std::collections::BTreeSet<String>, report: &Report) -> Ve
             .any(|error| family(error).map_or(false, |f| f.name.starts_with("a bare trait")))
     {
         problems.push(
-            "SHOULD BE REJECTED WITH NestedSelfInBounds: a struct, enum or union nested in enter_mod \
+            "SHOULD BE REJECTED WITH NestedSelfInBounds: a struct, enum or union nested in enter_generics \
              without nested_self_entries, with a type that names `Self` and a generic whose bound does"
                 .to_string(),
         );
@@ -2301,10 +2290,7 @@ fn explain_copies(
         let item = id.and_then(|id| generated[case].items.iter().find(|item| item.id == id));
         let verdict = match (report, item) {
             (Some(report), Some(item)) => {
-                let mut tags = item.tags.clone();
-                if item.kind == "mod" || item.scope == "mod" {
-                    tags.insert(gen::TAG_MODULE_SCOPE.to_string());
-                }
+                let tags = item.tags.clone();
                 let codes: Vec<&str> = group.iter().map(|f| f.code.as_str()).collect();
                 if stage {
                     // (The errors that came up when the rule dropped one are in the second list only.)
@@ -2576,7 +2562,7 @@ fn missing_artifacts(
 /// What the macros reported over all the cases.
 #[derive(Default)]
 struct Stats {
-    /// The items generated, by kind (a module counts what it holds too).
+    /// The items generated, by kind.
     generated: BTreeMap<&'static str, usize>,
     accepted: BTreeMap<&'static str, usize>,
     rejected: BTreeMap<&'static str, usize>,
@@ -2584,8 +2570,7 @@ struct Stats {
     scope_accepted: BTreeMap<&'static str, usize>,
     scope_rejected: BTreeMap<&'static str, usize>,
     /// The same by the construct an item has (`gen::CONSTRUCTS`): a trait with a generic associated
-    /// type, a const parameter, an `impl Trait` argument, a default, a binder, ... A module is not
-    /// counted (one of its dozen items has it).
+    /// type, a const parameter, an `impl Trait` argument, a default, a binder, ...
     construct_accepted: BTreeMap<&'static str, usize>,
     construct_rejected: BTreeMap<&'static str, usize>,
     /// The reason of each rejection, by kind.
@@ -2865,7 +2850,7 @@ const FORCED: &[Forced] = &[
     },
     // A relative path, the root of a `use`, or a name of the prelude where the Leaker does not allow
     // it, in a body or a constant: it reads them with `check_values` (`values = true`), whatever the
-    // scope but `enter_impl`, and a module as a whole. The note tells a value from the default of a
+    // scope but `enter_impl`. The note tells a value from the default of a
     // const parameter and a discriminant, which have the same reason and cause.
     Forced {
         tag: gen::FORCED_VALUE_PATH,
@@ -2953,7 +2938,7 @@ fn forced_of(item: &gen::Item) -> Vec<&'static Forced> {
     FORCED
         .iter()
         .filter(|forced| item.tags.contains(forced.tag))
-        .filter(|forced| !(forced.in_body && (item.scope == "trait" || item.kind == "mod")))
+        .filter(|forced| !(forced.in_body && item.scope == "trait"))
         .collect()
 }
 
@@ -3006,7 +2991,7 @@ const SELF_DEFAULT_SHAPES: &[(&str, &str)] = &[
 ];
 
 /// The traits of one shape of `trait_self_defaults` that the macro was applied to: how many the
-/// Leaker accepted, and the same for those analyzed nested in `enter_mod`.
+/// Leaker accepted, and the same for those analyzed nested in `enter_generics`.
 #[derive(Default)]
 struct SelfDefaultCount {
     analyzed: usize,
@@ -3028,9 +3013,6 @@ impl Stats {
                 for kind in &item.contents {
                     *stats.generated.entry(kind).or_default() += 1;
                 }
-                if item.kind == "mod" {
-                    *stats.generated.entry("mod").or_default() += 1;
-                }
                 if let Some(report) = reports.get(&(case_index, item.id)) {
                     stats.analyzed += 1;
                     if !case.config.primitive {
@@ -3042,7 +3024,7 @@ impl Stats {
                     for (tag, _) in SELF_DEFAULT_SHAPES {
                         if item.tags.contains(*tag) {
                             let count = stats.self_defaults.entry(tag).or_default();
-                            let nested = item.scope == "mod";
+                            let nested = item.scope == "nested";
                             count.analyzed += 1;
                             count.accepted += usize::from(report.accepted);
                             count.nested_analyzed += usize::from(nested);
@@ -3063,15 +3045,10 @@ impl Stats {
                                         .filter(|(scope, _)| *scope == item.scope)
                                         .map(|(_, api)| *api),
                                 );
-                                if item.kind != "mod" {
-                                    names.extend(CONSTRUCTS.iter().filter(|name| {
-                                        item.tags.contains(&format!(
-                                            "{}{}",
-                                            gen::TAG_CONSTRUCT,
-                                            name
-                                        ))
-                                    }));
-                                }
+                                names.extend(CONSTRUCTS.iter().filter(|name| {
+                                    item.tags
+                                        .contains(&format!("{}{}", gen::TAG_CONSTRUCT, name))
+                                }));
                                 for name in names {
                                     *stats.shape_rejected.entry((tag, name)).or_default() += 1;
                                 }
@@ -3111,12 +3088,10 @@ impl Stats {
                             .filter(|(scope, _)| *scope == item.scope)
                             .map(|(_, api)| *api),
                     );
-                    if item.kind != "mod" {
-                        names.extend(CONSTRUCTS.iter().filter(|name| {
-                            item.tags
-                                .contains(&format!("{}{}", gen::TAG_CONSTRUCT, name))
-                        }));
-                    }
+                    names.extend(CONSTRUCTS.iter().filter(|name| {
+                        item.tags
+                            .contains(&format!("{}{}", gen::TAG_CONSTRUCT, name))
+                    }));
                     for name in names {
                         let all = stats.all.entry(name).or_default();
                         if report.accepted {
@@ -3125,7 +3100,7 @@ impl Stats {
                             all.1 += 1;
                         }
                     }
-                    if counted && item.kind != "mod" {
+                    if counted {
                         for name in CONSTRUCTS {
                             if item
                                 .tags
@@ -3266,7 +3241,7 @@ impl Stats {
 /// - kinds: struct 94.8/96.1 (293) [94.1; 85.9], enum 90.3/95.7 (145) [93.5; 80.9], union 90.8/96.3
 ///   (69) [90.4; 84.4], trait 73.4/77.9 (312) [72.7; 66.3], inherent impl 80.1/87.3 (115) [81.4;
 ///   72.7], trait impl 58.6/69.1 (54) [63.0; 55.4], module 71.6/79.8 (81) [68.9; 71.6];
-/// - scopes: `enter_mod` 89.4/93.8 (124) [89.9; 75.0], `enter_generics` 87.8/93.8 (33) [90.5; 61.0],
+/// - scopes: `nested` (then a module scope) 89.4/93.8 (124) [89.9; 75.0], `enter_generics` 87.8/93.8 (33) [90.5; 61.0],
 ///   `enter_trait` 70.7/81.6 (27) [67.9; 64.4], `enter_impl` 100/100 (34) [100; 100];
 /// - constructs (`gen::CONSTRUCTS`, the items that have it, not the modules): gat 47.5/58.0 (46)
 ///   [50.8; 43.3], const_param 77.5/80.6 (442) [76.5; 72.0], impl_trait_arg 61.3/67.4 (160) [58.9;
@@ -3287,7 +3262,9 @@ impl Stats {
 /// enum, union, `enter_generics`, const_param, param_default, unsized_param, module), so that run has
 /// `VALUES_FLOORS`, which are the lower of the two, measured the same way.
 /// A construct is checked when a run has three times the `MIN_SAMPLES` of it.
-/// `TYPE_LEAK_PROP_MIN_ACCEPT` overrides them.
+/// `TYPE_LEAK_PROP_MIN_ACCEPT` overrides them. The modules analyzed as a whole, and their floor
+/// (58, and 53 for `values`), are gone since the module support of the library went (2026-11-09);
+/// the numbers above count them in the kinds' `generated` and in the lowest of the module.
 const FLOORS: &[(&str, f64)] = &[
     ("struct", 84.0),
     ("enum", 80.0),
@@ -3295,9 +3272,8 @@ const FLOORS: &[(&str, f64)] = &[
     ("trait", 63.0),
     ("impl-inherent", 70.0),
     ("impl-trait", 48.0),
-    ("mod", 58.0),
     // The items analyzed through a scope (`gen::SCOPES`), by the name of its API.
-    ("enter_mod", 79.0),
+    ("nested", 79.0),
     ("enter_generics", 77.0),
     ("enter_trait", 50.0),
     ("enter_impl", 90.0),
@@ -3324,7 +3300,7 @@ const FLOORS: &[(&str, f64)] = &[
 /// `unreadable_value`. Measured on 2026-11-03, the lowest accepted share / pooled (and the fewest
 /// items of a seed): struct 90.6/92.5 (305), enum 88.0/93.0 (152), union 87.3/93.5 (66), trait
 /// 73.7/76.8 (267), inherent impl 86.3/89.4 (86), trait impl 67.3/73.8 (55), module 63.6/78.3 (68),
-/// `enter_mod` 90.8/93.4 (125), `enter_generics` 85.4/91.0 (29), `enter_trait` 68.4/79.2 (23),
+/// `nested` (then a module scope) 90.8/93.4 (125), `enter_generics` 85.4/91.0 (29), `enter_trait` 68.4/79.2 (23),
 /// `enter_impl` 100/100 (29), gat 50.0/59.8 (36), const_param 73.8/77.0 (381), impl_trait_arg
 /// 63.1/67.6 (121), param_default 76.9/79.1 (225), binder 75.6/80.1 (230), dyn_object 81.3/83.9
 /// (462), fn_pointer 82.3/84.1 (403), assoc_const 67.2/72.1 (162), lifetime_param 82.8/84.2 (534),
@@ -3339,8 +3315,7 @@ const VALUES_FLOORS: &[(&str, f64)] = &[
     ("trait", 63.0),
     ("impl-inherent", 70.0),
     ("impl-trait", 48.0),
-    ("mod", 53.0),
-    ("enter_mod", 79.0),
+    ("nested", 79.0),
     ("enter_generics", 75.0),
     ("enter_trait", 50.0),
     ("enter_impl", 90.0),
@@ -3736,23 +3711,14 @@ fn summarize(
         flags
     );
     let total: usize = stats.generated.values().sum();
-    writeln!(
-        s,
-        "  generated items: {} (nested items of a module included)",
-        total
-    )
-    .unwrap();
+    writeln!(s, "  generated items: {}", total).unwrap();
     writeln!(
         s,
         "  {:<14} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6}",
         "kind", "generated", "accepted", "rejected", "accepted%", "all%", "floor"
     )
     .unwrap();
-    for kind in KINDS
-        .iter()
-        .chain(["fn", "alias", "const", "static"].iter())
-        .chain(SCOPES.iter().map(|(_, api)| api))
-    {
+    for kind in KINDS.iter().chain(SCOPES.iter().map(|(_, api)| api)) {
         // An item analyzed through a scope is of a kind too: `generated` counts kinds only.
         let g = if SCOPES.iter().any(|(_, api)| api == kind) {
             stats.accepted_of(kind) + stats.rejected_of(kind)
@@ -3841,7 +3807,7 @@ fn summarize(
         if let Some(count) = stats.self_defaults.get(tag) {
             writeln!(
                 s,
-                "  defaults and `Self` (trait_self_defaults, self_bound_adts) {:<19} {:>4} analyzed, {:>4} accepted; nested in enter_mod: {:>4} analyzed, {:>4} accepted",
+                "  defaults and `Self` (trait_self_defaults, self_bound_adts) {:<19} {:>4} analyzed, {:>4} accepted; nested in enter_generics: {:>4} analyzed, {:>4} accepted",
                 what, count.analyzed, count.accepted, count.nested_analyzed, count.nested_accepted
             )
             .unwrap();
@@ -4492,11 +4458,7 @@ fn random_items_leak_across_crates() {
         if report.accepted {
             continue;
         }
-        let mut tags = item.tags.clone();
-        if item.kind == "mod" || item.scope == "mod" {
-            tags.insert(gen::TAG_MODULE_SCOPE.to_string());
-        }
-        for problem in unexplained(&tags, report) {
+        for problem in unexplained(&item.tags, report) {
             failures.push(Failure::new(*i, Some(*id), "UNEXPLAINED REJECTION: type-leak rejects an item for a reason the generator does not explain", problem));
         }
     }
@@ -4747,7 +4709,7 @@ mod checks {
     #[test]
     fn the_floors_fail_a_run_that_accepts_nothing() {
         // Every `intern_*` fails: all rejected.
-        let all_rejected = stats_of(&[("struct", 0, 40), ("trait", 0, 40), ("mod", 0, 20)]);
+        let all_rejected = stats_of(&[("struct", 0, 40), ("trait", 0, 40), ("impl-trait", 0, 20)]);
         let problems = defaults().problems(&all_rejected);
         assert!(
             problems.iter().any(|p| p.contains("accepted none")),
@@ -4774,26 +4736,26 @@ mod checks {
 
     #[test]
     fn a_kind_below_its_floor_fails_when_it_has_enough_samples() {
-        let rich = stats_of(&[("struct", 90, 10), ("mod", 1, 30)]);
+        let rich = stats_of(&[("struct", 90, 10), ("impl-trait", 1, 30)]);
         let problems = defaults().problems(&rich);
         assert_eq!(problems.len(), 1, "{:?}", problems);
-        assert!(problems[0].starts_with("mod:"), "{:?}", problems);
+        assert!(problems[0].starts_with("impl-trait:"), "{:?}", problems);
         // Too few samples of the kind: not counted.
-        let poor = stats_of(&[("struct", 90, 10), ("mod", 0, MIN_SAMPLES - 1)]);
+        let poor = stats_of(&[("struct", 90, 10), ("impl-trait", 0, MIN_SAMPLES - 1)]);
         assert!(defaults().problems(&poor).is_empty());
         // The floor is a minimum, not a bound on the rate.
-        let ok = stats_of(&[("struct", 100, 0), ("mod", 4, 6)]);
+        let ok = stats_of(&[("struct", 100, 0), ("impl-trait", 4, 6)]);
         assert!(defaults().problems(&ok).is_empty());
     }
 
     #[test]
     fn the_floors_are_overridden_by_the_environment_format() {
-        let floors = Floors::parse("30, mod=5", 7, 55.0).unwrap();
+        let floors = Floors::parse("30, impl-trait=5", 7, 55.0).unwrap();
         assert_eq!(floors.by_kind["struct"], 30.0);
-        assert_eq!(floors.by_kind["mod"], 5.0);
+        assert_eq!(floors.by_kind["impl-trait"], 5.0);
         assert_eq!((floors.min_samples, floors.min_checked), (7, 55.0));
-        let floors = Floors::parse("mod=90", MIN_SAMPLES, MIN_CHECKED).unwrap();
-        assert_eq!(floors.by_kind["mod"], 90.0);
+        let floors = Floors::parse("impl-trait=90", MIN_SAMPLES, MIN_CHECKED).unwrap();
+        assert_eq!(floors.by_kind["impl-trait"], 90.0);
         let default_of = |kind: &str| FLOORS.iter().find(|(k, _)| *k == kind).unwrap().1;
         assert_eq!(floors.by_kind["struct"], default_of("struct"));
         assert_eq!(floors.by_kind["trait"], default_of("trait"));
@@ -4887,7 +4849,7 @@ mod checks {
             let items = selected
                 .iter()
                 .flat_map(|(_, case)| case.items.iter())
-                .filter(|item| item.kind != "mod" && item.tags.contains(&tag));
+                .filter(|item| item.tags.contains(&tag));
             // The items with a forced shape are left out of the floors.
             let items = items.filter(|item| forced_of(item).is_empty());
             let (accepted, rejected) = items.fold((0, 0), |(a, r), item| {
@@ -5703,16 +5665,16 @@ mod checks {
                     .unwrap_or_else(|| panic!("no attribute for item {}", item.id));
                 assert!(!attr.contains("trust"), "{}", attr);
                 assert!(attr.contains(&format!("primitive = {})", case.config.primitive)));
-                // `redeclare` is for a trait nested in `enter_mod`, and only for that.
+                // `redeclare` is for a trait nested in `enter_generics`, and only for that.
                 let redeclare = item.tags.contains(gen::TAG_REDECLARED);
                 assert_eq!(attr.contains("redeclare = true,"), redeclare, "{}", attr);
                 if redeclare {
-                    assert!(item.kind == "trait" && item.scope == "mod", "{}", attr);
+                    assert!(item.kind == "trait" && item.scope == "nested", "{}", attr);
                     redeclared += 1;
                 }
                 if item.tags.contains(gen::TAG_SELF_DEFAULT) {
                     assert!(item.kind == "trait", "{}", attr);
-                    nested_self_default += usize::from(item.scope == "mod");
+                    nested_self_default += usize::from(item.scope == "nested");
                 }
                 plain_default += usize::from(item.tags.contains(gen::TAG_PLAIN_DEFAULT));
                 // A bare `?Sized` is accepted whatever the prelude: it gets no tag.
@@ -6054,11 +6016,10 @@ mod checks {
         };
         for (kind, scope) in [
             ("trait", ""),
-            ("trait", "mod"),
+            ("trait", "nested"),
             ("trait", "trait"),
             ("impl-trait", ""),
             ("impl-inherent", ""),
-            ("mod", ""),
         ] {
             let item = item_with(kind, scope, &[gen::FORCED_VALUE_PATH]);
             let problems = forced_problems(&item, &report_with(true, Vec::new()));
@@ -6260,7 +6221,7 @@ mod checks {
     /// rejects with no error that the shape needs; one rejected for the reason of the shape passes.
     #[test]
     fn an_accepted_forced_item_fails_and_a_rejected_one_passes() {
-        let nested = item_with("struct", "mod", &[gen::TAG_NESTED_SELF_BOUNDS]);
+        let nested = item_with("struct", "nested", &[gen::TAG_NESTED_SELF_BOUNDS]);
         let accepted = report_with(true, Vec::new());
         let problems = forced_problems(&nested, &accepted);
         assert_eq!(problems.len(), 1);
@@ -6283,7 +6244,7 @@ mod checks {
         assert_eq!(problems[0].0, FORCED_OTHER);
         assert!(problems[0].1.contains("RelativePath"), "{}", problems[0].1);
         // An item with no forced shape is not asked.
-        let plain = item_with("struct", "mod", &[gen::TAG_NESTED_SELF_OPTION]);
+        let plain = item_with("struct", "nested", &[gen::TAG_NESTED_SELF_OPTION]);
         assert!(forced_problems(&plain, &accepted).is_empty());
         assert!(forced_problems(&plain, &wrong).is_empty());
     }
@@ -6346,7 +6307,7 @@ mod checks {
         );
         assert_eq!(forced_problems(&cyclic, &elsewhere).len(), 1);
         // `enter_impl` visits the self type and the trait's arguments only: nothing is forced, even if
-        // the item is accepted; `enter_trait` and a module do not read bodies.
+        // the item is accepted; `enter_trait` does not read bodies.
         let through_impl = item_with("impl-trait", "impl", &[gen::FORCED_MACRO_PATH]);
         assert!(forced_of(&through_impl).is_empty());
         assert!(forced_problems(&through_impl, &report_with(true, Vec::new())).is_empty());
@@ -6354,7 +6315,6 @@ mod checks {
         assert_eq!(forced_of(&body("struct", "")).len(), 1);
         assert_eq!(forced_of(&body("trait", "")).len(), 1);
         assert!(forced_of(&body("trait", "trait")).is_empty());
-        assert!(forced_of(&body("mod", "")).is_empty());
     }
 
     /// The floors count the items with no forced shape; the table of all the items counts them too,
@@ -6485,7 +6445,7 @@ mod checks {
     }
 
     /// The structs, enums and unions of `self_bound_adts` (F41, F42) are generated, nested in
-    /// `enter_mod`, and the Leaker must accept them: no reason explains their rejection.
+    /// `enter_generics`, and the Leaker must accept them: no reason explains their rejection.
     #[test]
     fn the_adts_with_a_bound_that_names_their_self_are_generated() {
         let count = |features: Features, tag: &str| -> (usize, usize) {
@@ -6496,7 +6456,8 @@ mod checks {
                 for item in &case.items {
                     if item.tags.contains(gen::TAG_SELF_BOUND_ADT) {
                         assert!(
-                            matches!(item.kind, "struct" | "enum" | "union") && item.scope == "mod",
+                            matches!(item.kind, "struct" | "enum" | "union")
+                                && item.scope == "nested",
                             "{} {}",
                             item.kind,
                             item.scope
@@ -6598,9 +6559,6 @@ mod checks {
                     "{}",
                     lines[0]
                 );
-                // A module has none of the flags: its copy is one module.
-                let flags = lines[0].contains(", inst(") || lines[0].contains(", shadow(");
-                assert!(!(flags && item.kind == "mod"), "{}", lines[0]);
                 inst += usize::from(lines[0].contains(", inst("));
                 shadow += usize::from(lines[0].contains(", shadow("));
                 let carry = format!("tlp_l_000::__tl_carry_{}!(carry(", item.id);
@@ -6662,7 +6620,6 @@ mod checks {
                         open.pop();
                     }
                 }
-                // A module analyzed as a whole declares itself at the root.
                 let expected: Vec<&str> = item.module.iter().map(String::as_str).collect();
                 assert_eq!(open, expected, "{}", line);
                 nested += usize::from(item.module.len() > 1);
@@ -7012,8 +6969,8 @@ mod checks {
     #[test]
     fn turning_the_floors_off_keeps_the_check_of_the_witnesses() {
         let off = Floors::parse("0", MIN_SAMPLES, MIN_CHECKED).unwrap();
-        let mut stats = stats_of(&[("struct", 90, 10), ("mod", 1, 30)]);
-        // A module far below its floor is no problem now.
+        let mut stats = stats_of(&[("struct", 90, 10), ("impl-trait", 1, 30)]);
+        // An impl of a trait far below its floor is no problem now.
         assert!(off.problems(&stats).is_empty());
         stats.checked = 0;
         let problems = off.problems(&stats);

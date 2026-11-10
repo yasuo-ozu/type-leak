@@ -496,30 +496,6 @@ fn the_items_nested_in_a_struct_scope_use_its_generic() {
 }
 
 #[test]
-fn a_module_has_no_self() {
-    // In a module `Self` means nothing, so a bound of an outer scope is rewritten there too. The
-    // entries are those of the module.
-    let mut leaker = Leaker::new();
-    leaker.enter_type(&ident("S"), &bound(), |v| {
-        v.visit_item(&parse_quote!(
-            mod m {
-                fn f(x: Rel<T>) {}
-                struct V {
-                    a: Rel2<T>,
-                }
-            }
-        ));
-    });
-    assert_eq!(
-        entries(&leaker.result().finish().unwrap()),
-        [
-            e("Rel < T >", "< T : :: p :: Tr < S < T > > >", "-"),
-            e("Rel2 < T >", "< T : :: p :: Tr < S < T > > >", "-"),
-        ]
-    );
-}
-
-#[test]
 fn a_rewritten_bound_needs_no_self_so_a_marker_can_have_the_entry() {
     // The bound does not mention `Self` once it is rewritten, so a Repeater for a marker can have
     // it.

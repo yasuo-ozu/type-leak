@@ -3,10 +3,11 @@
 //! The Leaker's crate has a module `base` of types and traits (`B0`, `B1<T>`, `BL<'a, T>`, `BC<T,
 //! N>`, `BB<B>`, `Bl<'a>`, `BT0`, `BT1<T>`, `BT2`, `BLEN`), then
 //!
-//! - modules `m0..` whose items are analyzed one by one (`intern_struct`, `intern_enum`,
-//!   `intern_union`, `intern_trait`, `intern_impl`), some with a nested module, and
-//! - modules `mm0..` analyzed as a whole (`intern_mod`), some with a nested module, and with free
-//!   functions and type aliases besides.
+//! modules `m0..` whose items are analyzed one by one (`intern_struct`, `intern_enum`,
+//! `intern_union`, `intern_trait`, `intern_impl`, or through a scope), some with a nested module.
+//! (The draws of the modules that the test analyzed as a whole, which it makes no more, are
+//! replayed and dropped: see `generate_with()`. The code that writes them, `Gen::module_mode`,
+//! goes with them.)
 //!
 //! Each module declares the same types as `base` under other names (`R0`, `R1<T>`, ...), imports
 //! some of those of `base` with `use` (`I1`, from `super::base` or `crate::base`, or `J1`, from the
@@ -38,7 +39,7 @@
 //! one are made for their defaults (`Gen::gen_self_default_trait()`): `trait Tr<T: AsRef<Self>, U =
 //! Rel<T>>`, a parameter with a bound that names the trait's own `Self` (written in the parameter or
 //! in a where predicate) and trailing parameters whose defaults name it. The control has a bound
-//! that names no `Self` (`T: Clone`). A trait of that shape is nested in `enter_mod` in 45% of the
+//! that names no `Self` (`T: Clone`). A trait of that shape is nested in `enter_generics` in 45% of the
 //! cases, where the Visitor writes the default for the trait's own `Self`; then
 //! 60% are declared again in the Referrer's crate (`redeclare = true` in the attribute), with a body
 //! that names no entry. The others are analyzed by `intern_trait` or `enter_trait`, where the
@@ -47,13 +48,14 @@
 //!
 //! Structs, enums and unions with a generic whose bound names their own `Self` and a default that
 //! uses it (`Features::self_bound_adts`, F41): `struct S<T: Clone + AsRef<Self>, U = Rel<T>>`, nested
-//! in `enter_mod` (`Gen::gen_self_bound_adt()`). With `Features::nested_self_entries` (F42) some
+//! in `enter_generics` (`Gen::gen_self_bound_adt()`). With `Features::nested_self_entries` (F42) some
 //! have a field that names `Self` in a relative type (`Rel2<Self, T>`), which is for any type that
 //! the bound holds for, and the attribute says `nested_self_entries = true` for half of the items
-//! nested in `enter_mod`: the macro allows the `NestedSelfInBounds` risk of such an entry.
+//! nested in `enter_generics`: the macro allows the `NestedSelfInBounds` risk of such an entry.
 //!
-//! Scopes: the macro analyzes some items through `enter_mod`, `enter_generics`, `enter_trait` or
-//! `enter_impl` instead of the `intern_*` of their kind (`Item::scope`, `SCOPES`).
+//! Scopes: the macro analyzes some items through `enter_generics` (as nested items, or with their
+//! generics), `enter_trait` or `enter_impl` instead of the `intern_*` of their kind (`Item::scope`,
+//! `SCOPES`).
 //!
 //! Spellings: the traits of the prelude in bounds (`Sized`, `?Sized`, `Send`, `Fn`, `Into`,
 //! `AsRef`, ...) are bare or in full, and a type parameter has a marker trait or a comparison as a
@@ -75,7 +77,7 @@
 //! `Self` in a struct, an enum or a union analyzed in `enter_generics` (`SelfWithoutMeaning`), in the
 //! default of a parameter of a trait (`SelfInDefault`), in a where predicate of a trait on a type of the
 //! module (`SelfInTraitPredicate`) and in the generics of an impl whose self type uses them
-//! (`SelfInImplSelfType`); half of the items nested in `enter_mod`, where the macro does not allow
+//! (`SelfInImplSelfType`); half of the items nested in `enter_generics`, where the macro does not allow
 //! the risk (`nested_self_entries` off), have the error `NestedSelfInBounds`; with `values`, a glob
 //! import or a `macro_rules!` in a body (`Unreadable`) and a relative `use`; a macro that expands
 //! to an array length (`two!()`, by its bare name: a cause of the kind `Macro`, or by an absolute
@@ -171,7 +173,6 @@ pub const KINDS: &[&str] = &[
     "trait",
     "impl-inherent",
     "impl-trait",
-    "mod",
 ];
 
 /// Constructs that `type-leak` is known to fail on (see the findings in the report of the test):
@@ -213,10 +214,7 @@ pub struct Features {
     /// inherent impl have no trait signature to differ from, so they have such paths whether it
     /// is on or not (F22).
     pub method_lifetime_paths: bool,
-    /// A path relative to the crate (`crate::base::B1<R0>`) in a type of a module analyzed as a
-    /// whole that mentions an item of the module: the entry is keyed by the module (on by default,
-    /// F4), so that the Referrer rewrites it in the copy of the module.
-    pub module_crate_paths: bool,
+
     /// A bound of the generics of an impl that names `Self` (`impl<T: AsRef<Option<Self>>> W<T>`):
     /// the self type is an entry that depends on `Self`, which is the self type itself, so the
     /// copy cannot write it (F13, fixed: the Leaker rejects it, and the rejections are counted, so
@@ -329,8 +327,8 @@ pub struct Features {
     /// `Self: 'c` through it, which the impl of the Repeater of the entry needs (E0309 on `__S`
     /// without it, F35: fixed, on by default).
     pub gat_where_clause: bool,
-    /// `Self` in a struct, an enum, a union or a trait analyzed as an item nested in `enter_mod`
-    /// (`View::visit_item()`, like the items of `intern_mod()`): the entry that names the item's
+    /// `Self` in a struct, an enum, a union or a trait analyzed as an item nested in `enter_generics`
+    /// (`View::visit_item()`): the entry that names the item's
     /// own `Self` is recorded, and the Visitor finds it in the nested item and writes it with
     /// `Self` (F36: fixed, on by default). Before the fix the Visitor never
     /// found it, so the copy kept the leaked type (`Rel<Self>`), which the Referrer's crate cannot
@@ -342,11 +340,7 @@ pub struct Features {
     /// Referrer's crate kept `self::U` (E0425); fixed (the context of a type is computed from the
     /// first segment of a relative path only), on by default.
     pub path_named_like_generic: bool,
-    /// A module analyzed as a whole that declares a type with the name of a generic in scope
-    /// (`mod m { struct X; fn f<X>(a: crate::base::B1<X>) {} }`). The Visitor used to hide the
-    /// entry `crate::base::B1<X>` because the module declares `X`, so the Referrer's crate kept
-    /// `crate::base` (E0433); fixed (a generic of the entry hides the declared item), on by default.
-    pub declared_named_like_generic: bool,
+
     /// A bare identifier that may be a const as an argument of a path of another crate, next to an
     /// argument that is leaked (`::l::BC<Rel<T>, ILEN>`, `::l::W<[Self], ILEN>`,
     /// `::l::BC<super::RC<..>, ILEN>` in a module that declares `RC`): the Leaker used to
@@ -357,14 +351,14 @@ pub struct Features {
     /// trait's own `Self` (`trait Tr<T: AsRef<Self>, U = Rel<T>>`; F39, fixed: on by default), and
     /// the control, where the bound names no `Self` (`T: Clone`). The entry of such a default is
     /// for the implementors of the trait, which the Visitor writes with `with_nested_self()` (the test macro
-    /// writes the host) for a trait nested in `enter_mod`, and finds without `Self` for a
+    /// writes the host) for a trait nested in `enter_generics`, and finds without `Self` for a
     /// trait analyzed as the item itself (`intern_trait`, `enter_trait`). A trait nested in
-    /// `enter_mod` is often declared again in the Referrer's crate (`redeclare`), whose
+    /// `enter_generics` is often declared again in the Referrer's crate (`redeclare`), whose
     /// declaration cannot pass the defaulted parameter to its own default (E0128). Before the fix
     /// the Visitor left the default as written, which the Referrer's crate cannot resolve. Off,
     /// no trait has the shape (the defaults of the other traits are as before).
     pub trait_self_defaults: bool,
-    /// A struct, an enum or a union nested in `enter_mod` with a generic whose bound names its own
+    /// A struct, an enum or a union nested in `enter_generics` with a generic whose bound names its own
     /// `Self` (`T: Clone + AsRef<Self>`, also in a where predicate) and parameters whose defaults
     /// use it (`U = Rel<T>`). The copy cannot write `Self` in a default (E0735), so the entry in the
     /// default has no `Self` and none of the bounds that name it; the Leaker used to reject the
@@ -377,7 +371,7 @@ pub struct Features {
     /// error, with `nested_self_entries = true` in the attribute; the risk is one that the
     /// generator's types do not have (a bound on the parameter of the leaked type that receives
     /// `Self`; rustc before 1.70 and the last field). The attribute has it for half of the items
-    /// nested in `enter_mod` (`Gen::nested_entries`), so the items that name `Self` in a field and
+    /// nested in `enter_generics` (`Gen::nested_entries`), so the items that name `Self` in a field and
     /// have a bound that does are built there, and rejected (`NestedSelfInBounds`, the tag
     /// `nested_self_in_bounds`) in the other half.
     pub nested_self_entries: bool,
@@ -466,7 +460,6 @@ feature_fields!(
     impl_self_outlives,
     fn_pointer_self,
     method_lifetime_paths,
-    module_crate_paths,
     impl_self_bounds,
     impl_pred_leaked,
     self_elision,
@@ -486,7 +479,6 @@ feature_fields!(
     gat_where_clause,
     nested_self,
     path_named_like_generic,
-    declared_named_like_generic,
     bare_const_in_absolute_path,
     trait_self_defaults,
     self_bound_adts,
@@ -507,7 +499,6 @@ impl Features {
             unsized_params: true,
             impl_assoc_self: true,
             method_lifetime_paths: true,
-            module_crate_paths: true,
             bound_merge_syntax: true,
             fn_pointer_self: true,
             elided_fn_generics: true,
@@ -531,7 +522,6 @@ impl Features {
             gat_where_clause: true,
             nested_self: true,
             path_named_like_generic: true,
-            declared_named_like_generic: true,
             bare_const_in_absolute_path: true,
             trait_self_defaults: true,
             self_bound_adts: true,
@@ -655,10 +645,7 @@ pub const TAG_BINDER_NO_ANCHOR: &str = "binder_no_anchor";
 pub const TAG_CONST_DEFAULT: &str = "const_default";
 pub const TAG_METHOD_LIFETIME: &str = "method_lifetime";
 pub const TAG_SELF_IN_BOUNDS: &str = "self_in_bounds";
-/// Not put by the generator: the harness gives it to a module analyzed whole and an item analyzed
-/// in `enter_mod` (`main.rs`), where a path of another crate can hold a name that the module
-/// declares beside a bare name (`::l::B2<I0, R0>`), which the Leaker rejects.
-pub const TAG_MODULE_SCOPE: &str = "module_scope";
+
 /// The shapes of `trait_self_defaults` (F39), which explain no rejection (`family()` lists none of
 /// them): the statistics count the traits that have them. `shape:self_default`: a parameter has a
 /// bound that names the trait's `Self` and a later one has a default; `shape:plain_default`: the
@@ -669,7 +656,7 @@ pub const TAG_PLAIN_DEFAULT: &str = "shape:plain_default";
 pub const TAG_REDECLARED: &str = "shape:redeclared";
 /// The shapes of `self_bound_adts` (F41, F42), which explain no rejection, and the Leaker must accept
 /// (`main.rs`, `unexplained()`): `shape:self_bound_adt`:
-/// a struct, enum or union nested in `enter_mod` whose bound names its `Self` and whose default uses
+/// a struct, enum or union nested in `enter_generics` whose bound names its `Self` and whose default uses
 /// the generic; `shape:self_bound_type`: a field also names `Self` in a relative type, which needs
 /// `nested_self_entries`.
 pub const TAG_SELF_BOUND_ADT: &str = "shape:self_bound_adt";
@@ -686,7 +673,7 @@ pub const TAG_RELATIVE_STD: &str = "relative_std";
 /// do (`main.rs`, `SHAPE_TAGS`). Each is put on what the item writes, and the ones that explain a
 /// rejection are the only tag that does (`family()`):
 ///
-/// - `nested_self_in_bounds`: a struct, an enum or a union analyzed nested in `enter_mod` without
+/// - `nested_self_in_bounds`: a struct, an enum or a union analyzed nested in `enter_generics` without
 ///   `nested_self_entries`, a field of which names `Self` in a relative type next to a generic whose
 ///   bound names it (`Rel2<Self, T>` with `T: AsRef<Self>`): `Reason::NestedSelfInBounds`. With the
 ///   option the macro allows that error and the item is accepted (`nested_self_in_bounds_option`,
@@ -711,7 +698,7 @@ pub const TAG_RELATIVE_STD: &str = "relative_std";
 /// - `wide_const`: a const parameter of a type other than `usize`, `bool`, `i32`, `u8` and `char`.
 pub const TAG_NESTED_SELF_BOUNDS: &str = "nested_self_in_bounds";
 pub const TAG_NESTED_SELF_OPTION: &str = "nested_self_in_bounds_option";
-/// `nested_self_in_bounds_text`: an item nested in `enter_mod` without `nested_self_entries` whose
+/// `nested_self_in_bounds_text`: an item nested in `enter_generics` without `nested_self_entries` whose
 /// generics or where clause have a bound that names `Self`, a shape that may reject it with
 /// `Reason::NestedSelfInBounds` if a type in it names `Self` too. Read from the text, so it also
 /// explains the items that are not of `self_bound_adts` (the Leaker may accept them).
@@ -783,8 +770,8 @@ pub struct Item {
     /// The module that contains it, from the root.
     pub module: Vec<String>,
     /// How the macro analyzes it: `""` by the `intern_*` method of its kind, or through a scope
-    /// (`mod`: `enter_mod`, `generics`: `enter_generics`, `trait`: `enter_trait`, `impl`:
-    /// `enter_impl`, see `SCOPES`).
+    /// (`nested`: `View::visit_item` in `enter_generics`, `generics`: `enter_generics`, `trait`:
+    /// `enter_trait`, `impl`: `enter_impl`, see `SCOPES`).
     pub scope: &'static str,
     /// The kinds of the items in it (for a module), and the item itself otherwise.
     pub contents: Vec<&'static str>,
@@ -846,7 +833,7 @@ const TWO_MACRO: &str = "#[macro_export]\nmacro_rules! two { () => { 2 }; }\n";
 /// The scopes the macro analyzes an item through, and the name of the API of each (the statistics
 /// count them apart, and the acceptance floor applies to each).
 pub const SCOPES: &[(&str, &str)] = &[
-    ("mod", "enter_mod"),
+    ("nested", "nested"),
     ("generics", "enter_generics"),
     ("trait", "enter_trait"),
     ("impl", "enter_impl"),
@@ -874,7 +861,7 @@ const CYCLIC_ITEM_IN_MODULE_PERCENT: u32 = 30;
 const SELF_DEFAULT_PERCENT: u32 = 20;
 /// Of those, the share whose bound names `Self` (the rest is the control: `T: Clone`, or no bound).
 const SELF_DEFAULT_NAMES_SELF_PERCENT: u32 = 70;
-/// ... the share nested in `enter_mod` (the Visitor writes the default through the host), and of
+/// ... the share nested in `enter_generics` (the Visitor writes the default through the host), and of
 /// those the share that the Referrer's crate declares again (`redeclare`).
 const SELF_DEFAULT_NESTED_PERCENT: u32 = 45;
 const SELF_DEFAULT_REDECLARE_PERCENT: u32 = 60;
@@ -1615,7 +1602,7 @@ pub struct Gen {
     /// `values = true`.
     values_used: bool,
     /// The macro takes the `NestedSelfInBounds` risk for the item being generated where it is nested
-    /// in `enter_mod` (`nested_self_entries = true` in the attribute): the feature, and half of the
+    /// in `enter_generics` (`nested_self_entries = true` in the attribute): the feature, and half of the
     /// items.
     nested_entries: bool,
     /// The item being generated has an argument `impl Into<Rel<X>>` already (the plain one of
@@ -3310,7 +3297,7 @@ impl Gen {
     ///
     /// `self_default`: the default may name `Self` (`trait Tr<T = Rel<Self>>`), which a struct, an
     /// enum or a union cannot write (E0735): `Reason::SelfInDefault`. Not for a trait nested in
-    /// `enter_mod`: the Leaker accepts it (an entry for the trait's `Self`, and the copy passes the
+    /// `enter_generics`: the Leaker accepts it (an entry for the trait's `Self`, and the copy passes the
     /// host), and the test macro cannot compare such a default (its witness for a default that
     /// names `Self` is made for the bounds that do, F39).
     fn defaults(&mut self, sk: &mut Skeleton, self_default: bool) {
@@ -4270,7 +4257,7 @@ fn prune(sk: &Skeleton, ty: &Ty) -> Skeleton {
 struct SelfDefault {
     /// A parameter has a bound that names the trait's `Self`; else the control.
     names_self: bool,
-    /// The trait is analyzed nested in `enter_mod`.
+    /// The trait is analyzed nested in `enter_generics`.
     nested: bool,
     /// The Referrer's crate declares the trait again (`redeclare`): only for a nested trait.
     redeclare: bool,
@@ -4322,7 +4309,7 @@ impl Gen {
             } else {
                 ""
             },
-            if scope == "mod" && self.nested_entries {
+            if scope == "nested" && self.nested_entries {
                 "nested_self_entries = true, "
             } else {
                 ""
@@ -4351,7 +4338,8 @@ impl Gen {
     ///   (`visit_type_param_bound`, `visit_where_clause`, `visit_type`);
     /// - `check`: `View::check()` on the types first, in a scope nested in the view for the
     ///   generics of a method; it must record nothing, and say what the copy does;
-    /// - `nested`: a struct, an enum or a union nested in `enter_mod` by `View::enter_type`;
+    /// - `nested`: a struct, an enum or a union of the scope `nested` by `enter_type` (the analysis
+    ///   of the type by itself);
     /// - `some`: the types of a trait impl in `enter_impl` with the path of the trait;
     /// - `visit`: an impl by `enter_impl` and the walk of syn, as `intern_impl` does it.
     ///
@@ -4389,7 +4377,7 @@ impl Gen {
             },
             // Not the shapes that name the own `Self` of a nested item in a bound (`self_bound_adts`).
             _ if adt
-                && scope == "mod"
+                && scope == "nested"
                 && !self.tags.contains(TAG_SELF_BOUND_ADT)
                 && !self.tags.contains(TAG_SELF_BOUND_TYPE) =>
             {
@@ -4469,11 +4457,7 @@ impl Gen {
                 uses += &format!("use ::{}::base::B{} as J{};\n", krate, suffix, suffix);
                 paths.push(format!("J{}", suffix));
             }
-            let skip_crate = self.module_mode && !self.features.module_crate_paths;
             for name in paths {
-                if skip_crate && name.starts_with("crate::") {
-                    continue;
-                }
                 if let Some(shape) = shape {
                     env.heads.push(Head {
                         name,
@@ -4488,36 +4472,26 @@ impl Gen {
             }
         }
         // The types named like the generics of an item or of a method, which the module declares.
-        if !self.module_mode || self.features.declared_named_like_generic {
-            for name in SHADOW_NAMES {
+        for name in SHADOW_NAMES {
+            env.heads.push(Head {
+                name: name.to_string(),
+                shape: Shape::Unit,
+            });
+            if self.features.path_named_like_generic && self.chance(25) {
                 env.heads.push(Head {
-                    name: name.to_string(),
+                    name: format!("self::{}", name),
                     shape: Shape::Unit,
                 });
-                if self.features.path_named_like_generic && self.chance(25) {
-                    env.heads.push(Head {
-                        name: format!("self::{}", name),
-                        shape: Shape::Unit,
-                    });
-                }
             }
         }
         env.consts.push("RLEN".to_string());
         env.consts.push("self::RLEN".to_string());
-        // In a module analyzed as a whole, a constant of another module in a type that names an
-        // item of the module makes an entry that the module keys by itself (`module_crate_paths`,
-        // on by default).
-        let relative_consts = !self.module_mode || self.features.module_crate_paths;
-        if relative_consts {
-            env.consts.push(format!("{}base::BLEN", up));
-            env.consts.push("crate::base::BLEN".to_string());
-        }
+        env.consts.push(format!("{}base::BLEN", up));
+        env.consts.push("crate::base::BLEN".to_string());
         env.consts.push(format!("::{}::base::BLEN", krate));
         if self.chance(30) {
             uses += &format!("use {}base::BLEN as ILEN;\n", up);
-            if relative_consts {
-                env.consts.push("ILEN".to_string());
-            }
+            env.consts.push("ILEN".to_string());
         }
         (env, uses)
     }
@@ -4586,11 +4560,11 @@ impl Gen {
         };
         let name = self.name(prefix);
         let self_common = ann.map_or(true, |(_, a)| a);
-        // A fifth of the items are analyzed through a scope: nested in `enter_mod` (it has a
+        // A fifth of the items are analyzed through a scope: nested in `enter_generics` (it has a
         // `Self` of its own, and the generics are local), or in `enter_generics`, which has no
         // `Self` (so the fields do not name it).
         let scope: &'static str = match (ann.is_some(), self.below(100)) {
-            (true, 0..=9) => "mod",
+            (true, 0..=9) => "nested",
             (true, 10..=19) => "generics",
             _ => "",
         };
@@ -4603,7 +4577,7 @@ impl Gen {
         if names_self_anyway {
             // `enter_generics` gives `Self` no meaning, so a field that names it is an error
             // (`Reason::SelfWithoutMeaning`); the rest name none.
-        } else if scope == "generics" || (scope == "mod" && !self.features.nested_self) {
+        } else if scope == "generics" || (scope == "nested" && !self.features.nested_self) {
             self.self_prob = 0;
         }
         let base = Scope {
@@ -4860,7 +4834,7 @@ impl Gen {
     /// Whether the struct, enum or union about to be generated has the shape of `self_bound_adts` (F41,
     /// F42), and which. Decided by the hash of the state, which draws nothing, as
     /// `Gen::self_default_shape()` does. Only the items that the macro is applied to have it, and
-    /// they are nested in `enter_mod` (`nested_self`), which gives them a `Self` of their own.
+    /// they are nested in `enter_generics` (`nested_self`), which gives them a `Self` of their own.
     fn self_bound_adt_shape(&self, ann: Option<(usize, bool)>) -> Option<SelfBoundAdt> {
         ann?;
         if !self.features.self_bound_adts || !self.features.nested_self || self.module_mode {
@@ -4879,7 +4853,7 @@ impl Gen {
         })
     }
 
-    /// A struct, an enum or a union nested in `enter_mod` whose first parameter has a bound that
+    /// A struct, an enum or a union nested in `enter_generics` whose first parameter has a bound that
     /// names its own `Self` (`T: Clone + AsRef<Self>`, or `AsRef<(Self, ())>`, `AsRef<Option<Self>>`;
     /// in the parameter or in a where predicate), and whose trailing parameters have defaults that
     /// use it (`U = Rel<T>`, `W = Rel2<T, U>`): `self_bound_adts`, F41. A field has the type of the
@@ -4999,7 +4973,7 @@ impl Gen {
         // Leaker does not allow the prelude): the Leaker must accept the item (`main.rs`,
         // `unexplained()`).
         self.tags.insert(TAG_SELF_BOUND_ADT.to_string());
-        let attr = self.attr_with(ann, "mod");
+        let attr = self.attr_with(ann, "nested");
         let (params, wc) = (sk.params_decl(), sk.where_clause());
         let text = match kind {
             AdtKind::Union => {
@@ -5061,7 +5035,7 @@ impl Gen {
         ann: Option<(usize, bool)>,
     ) -> String {
         let name = self.name("S");
-        let attr = self.attr_with(ann, "mod");
+        let attr = self.attr_with(ann, "nested");
         format!("{}pub struct {};\n", attr, name)
     }
 
@@ -5275,10 +5249,10 @@ impl Gen {
         if shape.redeclare {
             self.tags.insert(TAG_REDECLARED.to_string());
         }
-        // Nested in `enter_mod` (it has a `Self` of its own), or analyzed as the item itself: by
+        // Nested in `enter_generics` (it has a `Self` of its own), or analyzed as the item itself: by
         // `intern_trait`, mostly, and by `enter_trait`.
         let scope: &'static str = if shape.nested {
-            "mod"
+            "nested"
         } else if self.chance(25) {
             "trait"
         } else {
@@ -5308,7 +5282,7 @@ impl Gen {
         if !self_common {
             self.self_prob = 6;
         }
-        // A tenth of the traits are analyzed nested in `enter_mod`, and name no `Self`
+        // A tenth of the traits are analyzed nested in `enter_generics`, and name no `Self`
         // (`nested_self`).
         let in_mod = ann.is_some() && self.chance(10);
         let saved_no_self = self.no_self;
@@ -5516,7 +5490,7 @@ impl Gen {
         // Another tenth are analyzed by `enter_trait`, which does not know the generic associated
         // types of the trait.
         let scope: &'static str = match (ann.is_some(), in_mod, self.below(100)) {
-            (true, true, _) => "mod",
+            (true, true, _) => "nested",
             (true, false, 0..=11) if !gat => "trait",
             _ => "",
         };
@@ -6217,7 +6191,7 @@ impl Gen {
         // The flag of the item, `self_common`, is a legacy draw: it was the `allow_self` of the
         // attribute, which the macro does not know any more, and is kept so that the item set stays
         // the same. `false` makes `Self` rarer in the item (`self_prob`), and keeps two shapes that
-        // name `Self` from a trait unless it is nested in `enter_mod` (`self_default_shape()` and
+        // name `Self` from a trait unless it is nested in `enter_generics` (`self_default_shape()` and
         // `self_in_trait_predicate`).
         let ann = if whole {
             None
@@ -6233,7 +6207,7 @@ impl Gen {
             self.plain_ai = false;
             self.skip_trust_draw();
             self.bare_percent = self.item_bare_percent();
-            // Half of the items nested in `enter_mod` have `nested_self_entries = true` (the macro
+            // Half of the items nested in `enter_generics` have `nested_self_entries = true` (the macro
             // allows the `NestedSelfInBounds` risk), the other half not, where a type that names
             // `Self` next to a generic whose bound does is an error that stays
             // (`Reason::NestedSelfInBounds`).
@@ -6285,7 +6259,7 @@ impl Gen {
         if names_self_in_where(&text) {
             self.tags.insert(TAG_SELF_IN_PREDICATE.to_string());
         }
-        if self.last_scope == "mod"
+        if self.last_scope == "nested"
             && ann.is_some()
             && !self.nested_entries
             && bound_clauses(&text).iter().any(|(bounded, bounds)| {
@@ -6338,13 +6312,11 @@ impl Gen {
             // The target of a cast in a value (`value_cast_target()`).
             text += "pub type RA = u8;\n";
         }
-        if !whole || self.features.declared_named_like_generic {
-            for name in SHADOW_NAMES {
-                text += &format!(
-                    "#[derive(Debug, Clone, Copy, Default, PartialEq)] pub struct {};\n",
-                    name
-                );
-            }
+        for name in SHADOW_NAMES {
+            text += &format!(
+                "#[derive(Debug, Clone, Copy, Default, PartialEq)] pub struct {};\n",
+                name
+            );
         }
         for _ in 0..items {
             text += &self.gen_one(path, whole);
@@ -6431,11 +6403,14 @@ pub fn generate_with(
         let body = g.gen_module_body(std::slice::from_ref(&name), false, n, nested);
         lib += &format!("pub mod {} {{\n{}\n}}\n", name, body);
     }
-    // Modules analyzed as a whole.
+    // A replay of the draws of the modules that the test analyzed as a whole, which it no longer
+    // makes: what they write is dropped. The final state of the generator seeds the flags of the
+    // invocations and the crate of the errors (`use_flags()`, `errors_crate()`), so the other items
+    // and their flags stay those of the earlier baselines. (To go with the next baselines.)
     let n_whole = g.range(1, 2);
     for i in 0..n_whole {
         let name = format!("mm{}", i);
-        let id = g.new_id();
+        g.new_id();
         g.no_self = true;
         g.module_mode = true;
         g.cyclic_module = g.chance(CYCLIC_MODULE_PERCENT);
@@ -6447,24 +6422,12 @@ pub fn generate_with(
         g.bare_percent = g.module_bare_percent();
         let n = g.range(4, items_per_module);
         let nested = usize::from(g.chance(60));
-        let body = g.gen_module_body(std::slice::from_ref(&name), true, n, nested);
+        g.gen_module_body(std::slice::from_ref(&name), true, n, nested);
         g.no_self = false;
         g.module_mode = false;
         g.cyclic_module = false;
-        let attr = g.attr(id, "");
-        let module = format!("{}pub mod {} {{\n{}\n}}\n", attr, name, body);
-        lib += &module;
-        let contents = std::mem::take(&mut g.contents);
-        let tags = std::mem::take(&mut g.tags);
-        g.items.push(Item {
-            id,
-            kind: "mod",
-            module: Vec::new(),
-            scope: "",
-            contents,
-            tags,
-            source: module,
-        });
+        g.contents.clear();
+        g.tags.clear();
     }
 
     // The Referrer's crate invokes the macro of each item.
@@ -6525,11 +6488,8 @@ const SHADOW_PERCENT: u64 = 30;
 /// The flags of the invocation of `item` in the ordinary Referrer's crate that ask the macro to do
 /// more with the copy: `, inst(N)` and `, shadow(N)`, where `N` seeds the macro's choices. They
 /// come from the hash of the final state of the generator and the number of the item, which draws
-/// nothing, so the items of a seed do not change. A module has none.
+/// nothing, so the items of a seed do not change.
 fn use_flags(rng: &StableHasher, item: &Item) -> String {
-    if item.kind == "mod" {
-        return String::new();
-    }
     let mut flags = String::new();
     for (word, percent) in [("inst", INST_PERCENT), ("shadow", SHADOW_PERCENT)] {
         let mut state = rng.clone();
@@ -6680,7 +6640,7 @@ fn clean_referrer(
             }
             Names::None => (),
         }
-        for item in items.iter().filter(|i| i.kind != "mod" && i.module == path) {
+        for item in items.iter().filter(|i| i.module == path) {
             *out += &invocation(krate, item, macro_prefix);
         }
         for (sub, _) in mod_uses
@@ -6721,9 +6681,6 @@ fn clean_referrer(
             module(krate, path, mod_uses, items, macro_prefix, names, &mut text);
             text += "}\n";
         }
-        for item in items.iter().filter(|i| i.kind == "mod") {
-            text += &invocation(krate, item, macro_prefix);
-        }
     } else {
         for item in items {
             text += &invocation(krate, item, macro_prefix);
@@ -6753,8 +6710,7 @@ fn clean_referrer(
 /// is in is declared again with the same `use`s and a glob import of the Leaker's module, in the same
 /// place of the module tree (so that `super::` and `self::` mean the same), and the root has `base`,
 /// the glob import of the Leaker's `base` (so that `crate::base::B1` means the same). The items are
-/// copied in the module they are invoked in, as they are in the Leaker's crate (a module analyzed
-/// as a whole declares itself at the root).
+/// copied in the module they are invoked in, as they are in the Leaker's crate.
 ///
 /// It is a crate of its own, not a module of the other Referrer's crate, because `crate::base` is
 /// the root of the crate that has the copy: `base` at the root of the other crate would let an
@@ -6810,7 +6766,7 @@ fn accept_referrer(
             *out += uses;
         }
         *out += &format!("pub use ::{}::{}::*;\n", krate, path.join("::"));
-        for item in items.iter().filter(|i| i.kind != "mod" && i.module == path) {
+        for item in items.iter().filter(|i| i.module == path) {
             *out += &invocation(krate, item, path, macro_prefix);
         }
         for (sub, _) in mod_uses
@@ -6831,10 +6787,6 @@ fn accept_referrer(
         text += &format!("pub mod {} {{\n", path[0]);
         module(krate, path, mod_uses, items, macro_prefix, &mut text);
         text += "}\n";
-    }
-    // A module analyzed as a whole declares itself, at the root.
-    for item in items.iter().filter(|i| i.kind == "mod") {
-        text += &invocation(krate, item, &[], macro_prefix);
     }
     let lines = items
         .iter()

@@ -684,7 +684,6 @@ fn default_entries(source: &str) -> std::result::Result<usize, Vec<String>> {
         Item::Enum(i) => leaker.intern_enum(i),
         Item::Trait(i) => leaker.intern_trait(i),
         Item::Impl(i) => leaker.intern_impl(i),
-        Item::Mod(i) => leaker.intern_mod(i),
         _ => panic!("unsupported item"),
     };
     match leaker.result().finish() {
@@ -755,28 +754,6 @@ fn twelve_a_relaxed_bound_is_copied_as_written() {
             }
         }
     );
-}
-
-/// 12: in a module, a bare `?Sized` does not tie the context of an entry to the module, as a
-/// relative path would: the entries are the same as with `?::core::marker::Sized`.
-#[test]
-fn twelve_a_bare_relaxed_bound_does_not_make_an_entry_of_the_module() {
-    let modules = |item: syn::Item| {
-        let mut leaker = Leaker::new();
-        leaker.enter_mod("m", [], |view| view.visit_item(&item));
-        let referrer = leaker.result().finish().unwrap();
-        (0..referrer.iter().count())
-            .map(|ix| common::in_module(common::entry(&referrer, ix)).is_some())
-            .collect::<Vec<_>>()
-    };
-    let bare = modules(parse_quote! {
-        enum E<T: ?Sized + ::core::fmt::Debug> { A(::p::W<T>) }
-    });
-    let full = modules(parse_quote! {
-        enum E<T: ?::core::marker::Sized + ::core::fmt::Debug> { A(::p::W<T>) }
-    });
-    assert_eq!(bare, [false]);
-    assert_eq!(bare, full);
 }
 
 /// 12: a relaxed bound on anything but `Sized` is no relaxation (rustc rejects it), and the plain
@@ -869,15 +846,17 @@ fn fourteen_values_are_not_read_by_default() {
     let mut leaker = Leaker::with_rule(config());
     leaker.intern_trait(&item);
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 0);
-    // The same with a const and a function of a module.
-    let item: ItemMod = parse_quote! {
-        mod m {
-            pub const N: usize = inner::X;
-            pub fn f() -> usize { inner::helper() }
-        }
-    };
+    // The same with a const and a function nested in a scope.
+    let items: [Item; 2] = [
+        parse_quote! { pub const N: usize = inner::X; },
+        parse_quote! { pub fn f() -> usize { inner::helper() } },
+    ];
     let mut leaker = Leaker::with_rule(config());
-    leaker.intern_mod(&item);
+    leaker.enter_generics(&Generics::default(), |view| {
+        for item in &items {
+            view.visit_item(item);
+        }
+    });
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 0);
 }
 

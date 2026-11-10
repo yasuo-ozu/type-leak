@@ -1,4 +1,4 @@
-//! The context of a leaked type: its generics, what `Self` means, and its module.
+//! The context of a leaked type: its generics and what `Self` means.
 
 use crate::encode::params_as_args;
 use crate::error::Cause;
@@ -203,7 +203,7 @@ pub enum SelfRequirement {
     /// |---|---|
     /// | `struct S<'a, T: Clone, const N: usize = 3> { .. }` | `S<'a, T, N>` |
     /// | `enum E<T> { .. }` | `E<T>` |
-    /// | `mod m { struct N<T> { .. } }` (nested) | `N<T>` |
+    /// | `struct N<T> { .. }` (nested) | `N<T>` |
     /// | `impl<T> MyType<T, u8> { .. }` | `MyType<T, u8>`, as written |
     /// | `impl<T> ::a::W<T> { .. }` | `::a::W<T>`, as written |
     ///
@@ -229,8 +229,7 @@ pub enum SelfRequirement {
     /// name `Self`: `Rel<T>` with `T: AsRef<Self>`.
     ///
     /// This happens for an entry of a struct, enum or union nested in the analyzed code
-    /// ([`View::visit_item()`](crate::View::visit_item), or an item in
-    /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod)). The copy has the same bound on its
+    /// ([`View::visit_item()`](crate::View::visit_item)). The copy has the same bound on its
     /// own type, so it writes `<Self as Repeater<..>>::Type` with its own `Self`
     /// ([`Referrer::visitor()`](crate::Referrer::visitor) does it). The entry may name
     /// `Self` too (`Rel2<Self, T>`), with the error
@@ -630,84 +629,19 @@ fn generics_as_args(generics: &Generics) -> TokenStream {
     quote!(<#(#args),*>)
 }
 
-/// How a context relates to a module ([`Context::module`]).
+/// What a leaked type needs from the place where it is written: its generics and what `Self`
+/// means.
 ///
-/// A module has a context of its own. The id of that context is the id of the module. A context
-/// is either inside a module or is that module. A macro reads the module of an entry from
-/// [`RepeaterImpl::module`](crate::RepeaterImpl::module).
-///
-/// ```ignore
-/// // In crate a, analyzed with `intern_mod()`:
-/// pub mod outer { pub mod inner { pub struct S { a: Rel } } }
-///
-/// // The context of `outer` (context 0):
-/// Some(Itself { id: 0, path: Some([]), hint: None, parent: None })
-/// // The context of `inner` (context 1):
-/// Some(Itself { id: 1, path: Some([inner]), hint: None, parent: Some(0) })
-/// // The context of the entry `Rel` (context 2), which is in `inner`:
-/// Some(In(1))
-/// ```
-///
-/// Two scopes are equal if all their fields are equal. A [`Context`] does not compare them.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ModuleScope {
-    /// The context is inside this module.
-    ///
-    /// The id is that of the module's own context. An entry has it if its type means something
-    /// only in the module (a relative path, a name that the module declares, a type macro).
-    In(ContextId),
-    /// The context is the module's own context.
-    ///
-    /// A module's context has no generics, no `Self` and no entry. Its fields tell where the
-    /// module is, as [`RepeaterImpl::module`](crate::RepeaterImpl::module) gives them for the impl
-    /// of an entry.
-    ///
-    /// With `path: Some([p1, p2])` the module is one of
-    /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod): write its impls in `mod p1 { mod p2 {
-    /// .. } }`. With `path: None` it is a module of
-    /// [`Leaker::enter_mod()`](crate::Leaker::enter_mod): the one you entered.
-    #[non_exhaustive]
-    Itself {
-        /// The id of this context itself.
-        id: ContextId,
-        /// The names from the root module to this one: `[]` for the module of
-        /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod), and the names below it for a
-        /// nested module.
-        ///
-        /// A module that has no module around it is a root: its path starts with its own name. It
-        /// is `None` for a module of [`Leaker::enter_mod()`](crate::Leaker::enter_mod).
-        path: Option<Vec<Ident>>,
-        /// The `hint` given to [`Leaker::enter_mod()`](crate::Leaker::enter_mod), for debugging.
-        hint: Option<String>,
-        /// The module that this one is nested in, if the Leaker saw it.
-        parent: Option<ContextId>,
-    },
-}
-
-impl ModuleScope {
-    /// Returns the id of the module, whichever the variant.
-    pub fn id(&self) -> ContextId {
-        match self {
-            Self::In(module) | Self::Itself { id: module, .. } => *module,
-        }
-    }
-}
-
-/// What a leaked type needs from the place where it is written: its generics, what `Self` means,
-/// and its module.
-///
-/// A leaked type (an entry) may use the generics of its item, `Self`, and the names of its module.
-/// The Repeater impl of the entry must have the same. Entries that need the same share one
-/// context, and a [`ContextId`] names it. The Leaker also makes a context for each item or scope
-/// that it analyzes (the top-level context) and for each module.
+/// A leaked type (an entry) may use the generics of its item and `Self`. The Repeater impl of the
+/// entry must have the same. Entries that need the same share one context, and a [`ContextId`]
+/// names it. The Leaker also makes a context for each item or scope that it analyzes (the
+/// top-level context).
 ///
 /// [`Referrer::iter()`](crate::Referrer::iter) gives the context of each entry. The fields are
 /// public to be read. You cannot build a `Context`, and more fields may come. Two contexts are
-/// equal if all their fields are equal, but the path, hint and parent of a module
-/// ([`ModuleScope::Itself`]) are not compared. The top-level context of a scope also holds the
-/// generics as written (not a public field), so it is never the context of an entry. A Referrer
-/// that is written as tokens and read back keeps every field.
+/// equal if all their fields are equal. The top-level context of a scope also holds the generics
+/// as written (not a public field), so it is never the context of an entry. A Referrer that is
+/// written as tokens and read back keeps every field.
 ///
 /// ```
 /// # use syn::*;
@@ -716,10 +650,10 @@ impl ModuleScope {
 /// leaker.intern_struct(&parse_quote!(struct S<T>(Rel<T>);));
 /// let referrer = leaker.result().finish().unwrap();
 ///
-/// // The context of the entry `Rel<T>` uses the generic `T`, but no `Self` and no module.
+/// // The context of the entry `Rel<T>` uses the generic `T`, but no `Self`.
 /// let (_, _, context) = referrer.iter().next().unwrap();
 /// assert_eq!(context.generics, parse_quote!(<T>));
-/// assert!(context.self_ty.is_none() && context.module.is_none());
+/// assert!(context.self_ty.is_none());
 /// ```
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -753,7 +687,7 @@ pub struct Context {
     /// // In crate a: the entries `Rel<Self>`, `Rel2<Self>` and `Rel3<T>`.
     /// pub struct S { a: Rel<Self> }
     /// pub trait Tr { fn f(&self) -> Rel2<Self>; }
-    /// pub mod m { pub struct N<T: AsRef<Self>>(Rel3<T>); }
+    /// pub struct N<T: AsRef<Self>>(Rel3<T>); // nested: `View::visit_item()`
     ///
     /// // `self_ty` of the context of `Rel<Self>`:
     /// Some(SelfRequirement::Type(S))
@@ -790,24 +724,6 @@ pub struct Context {
     /// The generic associated types of the trait, sorted by name: only in the top-level context of
     /// a trait that has a `self_ty` (see [`Gat`]). Kept in tokens.
     pub(crate) gats: Vec<Gat>,
-    /// The module that the entries of the context are in, or `None` if they do not depend on a
-    /// module.
-    ///
-    /// See [`ModuleScope`].
-    ///
-    /// ```ignore
-    /// // In crate a:
-    /// pub mod m { pub struct S { a: Rel, b: ::p::Abs } }
-    ///
-    /// // `module` of the context of `Rel`, a relative path that means something only in `m`
-    /// // (the id of `m` is 0):
-    /// Some(In(0))
-    /// // `module` of the context of `::p::Abs`, which means the same everywhere:
-    /// None
-    /// ```
-    ///
-    /// A Referrer read back from tokens keeps it.
-    pub module: Option<ModuleScope>,
     /// The generics of the item as written, only in the top-level context of a scope: the
     /// parameters in their order, with their defaults, and the where clause.
     ///
@@ -852,27 +768,9 @@ impl Context {
             self_ty,
             self_outlives: Vec::new(),
             gats: Vec::new(),
-            module: None,
             declared: None,
             substituted: Vec::new(),
         }
-    }
-
-    /// `number` is the index in [`Contexts`], so it is the same in the Referrer.
-    pub(crate) fn module_scope(
-        number: usize,
-        path: Option<Vec<Ident>>,
-        hint: Option<String>,
-        parent: Option<ContextId>,
-    ) -> Self {
-        let mut context = Self::none();
-        context.module = Some(ModuleScope::Itself {
-            id: ContextId::new(number),
-            path,
-            hint,
-            parent,
-        });
-        context
     }
 
     /// Returns `true` if an entry of this context needs what `Self` stands for: the context has a
@@ -916,14 +814,6 @@ impl Context {
         self
     }
 
-    /// Sets the module that the context is in. A module's own context stays itself.
-    pub(crate) fn with_module(mut self, module: Option<ContextId>) -> Self {
-        if !self.is_module_scope() {
-            self.module = module.map(ModuleScope::In);
-        }
-        self
-    }
-
     fn render(&self) -> String {
         let generics = &self.generics;
         let where_clause = &generics.where_clause;
@@ -942,16 +832,6 @@ impl Context {
         if let Some(declared) = &self.declared {
             let where_clause = &declared.where_clause;
             rendered.push_str(&format!(" declared {}", quote!(#declared #where_clause)));
-        }
-        // The path, the hint and the parent of a module are not part of its identity.
-        match &self.module {
-            Some(ModuleScope::In(module)) => {
-                rendered.push_str(&format!(" mod #{}", module.index()))
-            }
-            Some(ModuleScope::Itself { id, .. }) => {
-                rendered.push_str(&format!(" scope #{}", id.index()))
-            }
-            None => (),
         }
         rendered
     }
@@ -1300,32 +1180,11 @@ impl Context {
         Self::new(Generics::default(), None)
     }
 
-    /// No generics and no `Self`, whichever the module.
+    /// No generics and no `Self`.
     pub(crate) fn is_empty(&self) -> bool {
         self.generics.params.is_empty()
             && self.generics.where_clause.is_none()
             && self.self_ty.is_none()
-    }
-
-    /// The module that the context is in; `None` for a module's own context.
-    pub(crate) fn in_module(&self) -> Option<ContextId> {
-        match &self.module {
-            Some(ModuleScope::In(module)) => Some(*module),
-            _ => None,
-        }
-    }
-
-    /// The module that the context is in, or is itself: the module of its scope.
-    pub(crate) fn module_id(&self) -> Option<ContextId> {
-        self.module.as_ref().map(ModuleScope::id)
-    }
-
-    pub(crate) fn is_module_scope(&self) -> bool {
-        matches!(self.module, Some(ModuleScope::Itself { .. }))
-    }
-
-    pub(crate) fn without_module(&self) -> Self {
-        self.clone().with_module(None)
     }
 
     /// Returns `true` if `entry` is this context plus where predicates that name none of the
@@ -1333,10 +1192,7 @@ impl Context {
     /// otherwise, as a type parameter, cannot repeat them.
     pub(crate) fn is_entry_with_extra_self_predicates(&self, entry: &Context) -> bool {
         let show = |tokens: &dyn ToTokens| tokens.to_token_stream().to_string();
-        if self.self_ty != entry.self_ty
-            || self.self_outlives != entry.self_outlives
-            || self.module != entry.module
-        {
+        if self.self_ty != entry.self_ty || self.self_outlives != entry.self_outlives {
             return false;
         }
         let (params, entry_params) = (&self.generics.params, &entry.generics.params);
@@ -1384,14 +1240,14 @@ impl std::hash::Hash for Context {
     }
 }
 
-/// Identifies a context: what gives a leaked type its meaning, which is the generics it uses, what
-/// `Self` is, and the module it is written in.
+/// Identifies a context: what gives a leaked type its meaning, which is the generics it uses and
+/// what `Self` is.
 ///
 /// Every analysis method of the [`Leaker`](crate::Leaker) returns the id of the context of what it
-/// analyzed (keep it: [`Referrer::visitor()`](crate::Referrer::visitor) takes the generics, `Self`
-/// and module of the copy from it, and [`Referrer::complete_args()`](crate::Referrer::complete_args)
-/// the generics as declared). A [`ModuleScope`] has the id of a module. Ids count from 0 in order
-/// of first appearance, and the Referrer may skip some. `ToTokens` writes it as an integer literal,
+/// analyzed (keep it: [`Referrer::visitor()`](crate::Referrer::visitor) takes the generics and
+/// `Self` of the copy from it, and [`Referrer::complete_args()`](crate::Referrer::complete_args)
+/// the generics as declared). Ids count from 0 in order of first appearance, and the Referrer may
+/// skip some. `ToTokens` writes it as an integer literal,
 /// and `Parse` reads one with or without `usize`.
 ///
 /// The generics of a context are the ones its entries use: those the type names, those that their
@@ -1462,16 +1318,6 @@ impl Contexts {
     /// The id of `context`, if it is interned.
     pub(crate) fn find(&self, context: &Context) -> Option<ContextId> {
         self.ids.get(context).copied()
-    }
-
-    /// The module number is the context index, so ids are the same for the same calls.
-    pub(crate) fn intern_module(
-        &mut self,
-        path: Option<Vec<Ident>>,
-        hint: Option<String>,
-        parent: Option<ContextId>,
-    ) -> ContextId {
-        self.intern(Context::module_scope(self.list.len(), path, hint, parent))
     }
 
     pub(crate) fn len(&self) -> usize {

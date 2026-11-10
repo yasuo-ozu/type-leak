@@ -1,10 +1,10 @@
 //! The [`Leaker`], which finds the types depending on the type context.
 
 use crate::analysis::{drop_optional, names_self, Analysis, PartItem};
-use crate::analyze::{module_names, AnalyzeVisitor, Finished, ModuleNames, ScopeSpec, Scopes};
+use crate::analyze::{AnalyzeVisitor, Finished, ScopeSpec, Scopes};
 #[cfg(doc)]
 use crate::context::SelfRequirement;
-use crate::context::{Context, ContextId, Contexts, Gat, ModuleScope};
+use crate::context::{Context, ContextId, Contexts, Gat};
 use crate::error::ErrorItem;
 #[cfg(doc)]
 use crate::error::Reason;
@@ -19,7 +19,6 @@ use safegraph::algo::max_flow::edmonds_karp_with_flows;
 use safegraph::graph::Graph;
 use safegraph::BTreeGraph;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fmt::Display;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use syn::*;
 use template_quote::quote;
@@ -31,6 +30,9 @@ use template_quote::quote;
 /// call [`Leaker::result()`]. Keep the returned [`ContextId`] for [`Referrer::visitor()`]. See the
 /// [quick start](crate#quick-start). `A` is its [`Allow`]: a helper takes a configured Leaker as
 /// `fn g<A: Allow>(leaker: &mut Leaker<A>)`.
+///
+/// Analyze only items written in one module with one Leaker: its Repeater impls go to one place,
+/// where every relative path it saw must resolve.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
@@ -75,6 +77,9 @@ use template_quote::quote;
 ///   are crates like any other (see [`Rules::std_crates()`](crate::Rules::std_crates)).
 /// - A shadowed primitive name (`type u8 = i32;`): emit [`Leaker::assertions()`].
 /// - Values and bodies are not analyzed unless [`Leaker::check_values`] is on.
+/// - A `mod` item is not analyzed: [`View::visit_item()`] of one is an error
+///   ([`Reason::Unreadable`]). A `mod` in an expression of a type (an array length) goes with the
+///   type.
 /// - A type that names the `Self` of a nested struct, enum or union and uses a generic whose bound
 ///   names it (`Rel2<Self, T>` with `T: AsRef<Self>`) is an entry for any type, with the error
 ///   [`Reason::NestedSelfInBounds`]: when you accept it with [`LeakerResult::allow()`], the
@@ -255,9 +260,9 @@ impl<A: Allow> Leaker<A> {
     /// ([`SelfRequirement::Type`]).
     ///
     /// An entry in the self type that depends on `Self` through a bound of the impl (`impl<T> S<T>
-    /// where T: AsRef<Option<Self>>`) is an error, also in an impl that [`View::visit_item()`] or
-    /// [`intern_mod()`](Leaker::intern_mod) visits: use an absolute self type or a bound without
-    /// `Self`. The trait path must not depend on the context.
+    /// where T: AsRef<Option<Self>>`) is an error, also in an impl that [`View::visit_item()`]
+    /// visits: use an absolute self type or a bound without `Self`. The trait path must not depend
+    /// on the context.
     pub fn intern_impl(&mut self, item: &ItemImpl) -> ContextId {
         // The scope checks the path of the trait, and the walk analyzes its arguments.
         let trait_path = item.trait_.as_ref().map(|(_, path, _)| path);
@@ -291,42 +296,6 @@ impl<A: Allow> Leaker<A> {
             syn::visit::visit_item_trait(view, item)
         })
         .0
-    }
-
-    /// Analyzes a module and returns its [`ContextId`].
-    ///
-    /// Every item in it is nested: its generics are local, and `Self` has no meaning. The names
-    /// declared in the module are copied with it, not leaked. Two calls give two modules: rewrite
-    /// the copy of each with its own id.
-    pub fn intern_mod(&mut self, item: &ItemMod) -> ContextId {
-        let names = match &item.content {
-            Some((_, items)) => module_names(items),
-            None => ModuleNames::default(),
-        };
-        let spec = ScopeSpec::Module {
-            names,
-            path: Some(Vec::new()),
-            hint: None,
-        };
-        self.enter_spec(spec, |view| syn::visit::visit_item_mod(view, item))
-            .0
-    }
-
-    /// Analyzes part of a module: runs `f` on a [`View`] inside it, and returns the [`ContextId`]
-    /// of the module and the result of `f`.
-    ///
-    /// `declared` lists the names the module declares, which are copied with it, not leaked. Give
-    /// them first, because a relative path is decided when it is visited. A name counts if it is
-    /// declared directly (unless a generic shadows it), named by `self::` or `super::` within the
-    /// module, or imported with an absolute path (`use super::X` and `use crate::X` are leaked).
-    /// `hint` is for debugging ([`ModuleScope::Itself`]).
-    pub fn enter_mod<R>(
-        &mut self,
-        hint: impl Display,
-        declared: impl IntoIterator<Item = Ident>,
-        f: impl FnOnce(&mut View<'_, '_, A>) -> R,
-    ) -> (ContextId, R) {
-        Scopes::enter_mod(self, hint, declared, f)
     }
 
     /// Analyzes types that use `generics`: runs `f` on a [`View`] in which they are declared, and
@@ -428,22 +397,6 @@ impl<A: Allow> Leaker<A> {
                 .entry(key.context)
                 .or_insert_with(|| context_of(key.context));
             entries.push((key.context, key.ty.ty));
-        }
-        // Keep the modules the contexts depend on, and their parents, for nested lookups.
-        let mut seen = HashSet::new();
-        let mut pending: Vec<ContextId> = Vec::new();
-        for context in context_map.values() {
-            pending.extend(context.module_id());
-        }
-        while let Some(module) = pending.pop() {
-            if seen.insert(module) {
-                let context = context_map
-                    .entry(module)
-                    .or_insert_with(|| context_of(module));
-                if let Some(ModuleScope::Itself { parent, .. }) = &context.module {
-                    pending.extend(*parent);
-                }
-            }
         }
         Referrer::new(entries, BTreeSet::new(), context_map, self.parts)
     }
@@ -556,7 +509,6 @@ impl<A: Allow> Leaker<A> {
         let Finished {
             mut effects,
             top_levels,
-            module,
             not_optional,
         } = finished;
         drop_optional(&mut effects, &not_optional.into_iter().collect());
@@ -579,12 +531,10 @@ impl<A: Allow> Leaker<A> {
         let scope_self = spec
             .declared_self()
             .filter(|declared| names_self(&effects, declared));
-        let top_level = module.unwrap_or_else(|| {
-            let context = Context::new(root.clone(), scope_self)
-                .with_gats(spec.declared_gats())
-                .with_declared(root);
-            self.contexts.intern(context)
-        });
+        let context = Context::new(root.clone(), scope_self)
+            .with_gats(spec.declared_gats())
+            .with_declared(root);
+        let top_level = self.contexts.intern(context);
         self.top_levels.insert(top_level);
         self.top_levels.extend(top_levels);
         top_level

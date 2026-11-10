@@ -2,7 +2,7 @@
 
 use crate::analysis::{PartItem, SignatureFacts, SignatureMark};
 use crate::analyze::{Anchoring, Elision};
-use crate::context::{Context, ContextId, Enclosing, Gat, ModuleScope, Scope, SelfRequirement};
+use crate::context::{Context, ContextId, Enclosing, Gat, Scope, SelfRequirement};
 use crate::elided::{name_elided_in_bare_fn, name_elided_in_bound, SelfWriter, WrittenNames};
 use crate::encode::{
     complete_params, encode_entry_args, encode_self_outlives, params_as_args,
@@ -68,8 +68,7 @@ pub struct Referrer {
     /// [`LeakerResult::ignore()`](crate::LeakerResult::ignore) removed. They keep their place, so
     /// the others keep their indices. They are no entries: the copy writes their types as written.
     removed: BTreeSet<usize>,
-    /// Every context, by id. The context of a module has its path, hint and parent
-    /// (`ModuleScope::Itself`).
+    /// Every context, by id.
     contexts: BTreeMap<ContextId, Context>,
     /// The indices of the entries, keyed by tokens as in the Leaker, so a type in an invisible
     /// group is found too.
@@ -85,9 +84,7 @@ pub struct Referrer {
     parts_by_anchor: HashMap<Cause, Vec<usize>>,
 }
 
-/// The path, hint and parent of a module are no part of the identity of its `Context`, but they are
-/// part of the Referrer. The maps are made from the entries and the parts (`Referrer::new()`), so
-/// they are not compared.
+/// The maps are made from the entries and the parts (`Referrer::new()`), so they are not compared.
 impl PartialEq for Referrer {
     fn eq(&self, other: &Self) -> bool {
         let Self {
@@ -100,10 +97,6 @@ impl PartialEq for Referrer {
         *entries == other.entries
             && *removed == other.removed
             && *contexts == other.contexts
-            && contexts
-                .values()
-                .zip(other.contexts.values())
-                .all(|(a, b)| a.module == b.module)
             && *parts == other.parts
     }
 }
@@ -170,35 +163,6 @@ impl Parse for EntryId {
     }
 }
 
-/// Where a visitor is, among the modules of the Leaker.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ModulePos {
-    /// In no module: the context has none, so only entries with no module match. A `mod` item is
-    /// a module found with no module around it.
-    Outside,
-    In(ContextId),
-    /// In a module no entry depends on: only entries with no module match.
-    Elsewhere,
-}
-
-impl ModulePos {
-    /// Returns the module of the scope of `context`: the context itself if it is a module, else the
-    /// module it was entered in.
-    fn of(context: &Context) -> Self {
-        context.module_id().map_or(Self::Outside, Self::In)
-    }
-
-    /// Returns how well an entry with the context `entry` fits here: `Some(0)` if it is of the
-    /// module, `Some(1)` if it has no module, `None` if it is of another module.
-    fn rank(self, entry: &Context) -> Option<usize> {
-        match (self, entry.in_module()) {
-            (Self::In(module), Some(entry)) if entry == module => Some(0),
-            (_, Some(_)) => None,
-            (_, None) => Some(1),
-        }
-    }
-}
-
 /// How the visitor looks up the default of a type parameter, while it visits the generics of an
 /// item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,8 +183,7 @@ enum Defaults {
     /// has analyzed the default of such a trait without `Self`, as it does for a scope that it
     /// enters ([`Leaker::enter_trait()`](crate::Leaker::enter_trait)), unless the default names
     /// `Self` (`Rhs = Self`): then with the `Self` of the trait
-    /// ([`View::visit_item()`](crate::View::visit_item), the items of
-    /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod)).
+    /// ([`View::visit_item()`](crate::View::visit_item)).
     OwnTrait,
     /// Visiting a default of `OwnTrait`: an entry analyzed without `Self` is preferred, else the
     /// one of the trait's `Self`.
@@ -291,8 +254,6 @@ fn unit_type() -> Type {
 struct Lookup<'a> {
     /// How the context of the type is compared with the entries'.
     matching: Matching<'a>,
-    /// Where the visitor is among the modules.
-    module: ModulePos,
     /// The entries that a visited item hides (see `Visitor::shadow_items()`).
     hidden: Option<&'a HashSet<usize>>,
     /// Where the visited syntax is among the predicates of the item.
@@ -345,9 +306,7 @@ impl Referrer {
         referrer
     }
 
-    /// Returns the entry for `ty` that matches: the first of the best rank, then of the least cost.
-    /// An entry of `module` comes before one with no module, and an entry of another module never
-    /// matches (see [`Referrer::visitor()`]).
+    /// Returns the entry for `ty` that matches: the first of the least cost.
     fn find(
         &self,
         at: Lookup,
@@ -356,13 +315,10 @@ impl Referrer {
         enclosing: &Enclosing,
     ) -> Option<usize> {
         let Lookup {
-            matching,
-            module,
-            hidden,
-            ..
+            matching, hidden, ..
         } = at;
         let no_self = matching.no_self;
-        let mut best: Option<((usize, usize), usize)> = None;
+        let mut best: Option<(usize, usize)> = None;
         for &ix in self.by_tokens.get(&TypeKey::new(ty))? {
             if hidden.map_or(false, |hidden| hidden.contains(&ix)) {
                 continue;
@@ -372,14 +328,9 @@ impl Referrer {
             if no_self && (entry.self_ty.is_some() || type_mentions_self(entry_ty)) {
                 continue;
             }
-            let rank = match module.rank(entry) {
-                Some(rank) => rank,
-                None => continue,
-            };
             if let Some(cost) = Self::cost(matching, ty, scopes, enclosing, entry) {
-                let key = (rank, cost);
-                if best.map_or(true, |(better, _)| key < better) {
-                    best = Some((key, ix));
+                if best.map_or(true, |(better, _)| cost < better) {
+                    best = Some((cost, ix));
                 }
             }
         }
@@ -410,8 +361,7 @@ impl Referrer {
         enclosing: &Enclosing,
     ) -> bool {
         let found = &self.contexts[&context];
-        at.module.rank(found).is_some()
-            && Self::cost(at.matching, ty, scopes, enclosing, found).is_some()
+        Self::cost(at.matching, ty, scopes, enclosing, found).is_some()
     }
 
     /// Returns `true` if the context of `ty` cannot be written at `at`, in `scopes` (see
@@ -545,34 +495,8 @@ impl Referrer {
         }
     }
 
-    /// Returns where a visited `mod ident` is, inside `module`: the module nested in it with that
-    /// name (see [`Referrer::visitor()`]). A module that the Leaker did not see, or one nested in
-    /// such a module, is a module no entry depends on.
-    fn module_in(&self, module: ModulePos, ident: &Ident) -> ModulePos {
-        let parent = match module {
-            ModulePos::Outside => None,
-            ModulePos::In(parent) => Some(parent),
-            ModulePos::Elsewhere => return ModulePos::Elsewhere,
-        };
-        self.contexts
-            .values()
-            .find_map(|context| match &context.module {
-                Some(ModuleScope::Itself {
-                    id,
-                    path: Some(path),
-                    parent: found,
-                    ..
-                }) if *found == parent && path.last() == Some(ident) => Some(ModulePos::In(*id)),
-                _ => None,
-            })
-            .unwrap_or(ModulePos::Elsewhere)
-    }
-
     /// Returns the entries that items declared together with the `names` hide.
-    ///
-    /// For a `module` (or a `File`), only entries with no module are hidden: the others are keyed
-    /// by their module.
-    fn hidden_by(&self, names: &[Ident], module: bool) -> Vec<usize> {
+    fn hidden_by(&self, names: &[Ident]) -> Vec<usize> {
         let mut hidden = Vec::new();
         for (key, entries) in &self.by_tokens {
             if !mentions_names(&key.ty, names.to_vec(), Vec::new()) {
@@ -580,9 +504,6 @@ impl Referrer {
             }
             for &ix in entries {
                 let context = &self.contexts[&self.entries[ix].1];
-                if module && context.in_module().is_some() {
-                    continue;
-                }
                 // A generic of the entry's context is the name in the type wherever the entry is
                 // found, and it hides the item of the same name there (the Leaker does not
                 // take it for the item either: `starts_with_generic()`).
@@ -617,14 +538,13 @@ impl Referrer {
             without_self_first,
             ..
         } = matching;
-        let entry = entry.without_module();
         if without_self_first {
             let mut scopes = scopes.to_vec();
             if let Some(last) = scopes.last_mut() {
                 last.set_self(None);
             }
             let without_self = Context::of(ty, &scopes, None, false, enclosing);
-            if without_self.map_or(false, |context| context == entry) {
+            if without_self.map_or(false, |context| context == *entry) {
                 return Some(0);
             }
         }
@@ -639,9 +559,9 @@ impl Referrer {
         }
         .ok()?;
         let after = usize::from(without_self_first);
-        if context == entry {
+        if context == *entry {
             Some(after)
-        } else if context.is_entry_with_extra_self_predicates(&entry) {
+        } else if context.is_entry_with_extra_self_predicates(entry) {
             Some(after + 1)
         } else {
             None
@@ -894,9 +814,6 @@ impl Referrer {
             self_ty,
             path: repeater_path(&projection.path, &args),
             ty,
-            module: context
-                .in_module()
-                .and_then(|module| self.contexts[&module].module.clone()),
             id: projection.id,
         })
     }
@@ -916,11 +833,8 @@ impl Referrer {
     /// - A struct, enum, union, trait or impl nested in the copy has a `Self` of its own, as in the
     ///   Leaker, so nest the same items. The entries that name it need
     ///   [`Visitor::with_nested_self()`].
-    /// - In a module copy, an entry with a module matches only there
-    ///   ([`Context::module`]), one with none everywhere. A `mod` item is a module
-    ///   nested in that of `context`, found by name. For a module, visit its items: a `mod` that
-    ///   no module of the context is named like is also taken as the module itself, but not one
-    ///   that is.
+    /// - A `mod` in the copy makes its items nested items, where `Self` has no meaning, and the
+    ///   names that it declares hide the entries that name them, as the items of a block do.
     ///
     /// A copy at a use site takes two steps: visit it, then write the arguments of the impl into its
     /// items with the [`Substitute`] that [`complete_args()`](Referrer::complete_args) returns. If a
@@ -972,7 +886,6 @@ impl Referrer {
             .contexts
             .get(&context)
             .unwrap_or_else(|| panic!("the context {} is not one of this Referrer", context));
-        let in_module = found.is_module_scope();
         Visitor {
             referrer: self,
             projection,
@@ -980,17 +893,15 @@ impl Referrer {
             hook: None,
             state: VisitorState {
                 hidden: Rc::default(),
+                shadows: Rc::default(),
                 self_req: found.self_ty.clone(),
                 scopes: vec![Scope::of_context(found)],
                 outer_generics: false,
                 written_self: None,
-                // The items of a module are nested items.
-                item_depth: usize::from(in_module),
+                item_depth: 0,
                 own_self: false,
                 nested: None,
                 defaults: Defaults::Plain,
-                module: ModulePos::of(found),
-                module_scope: in_module,
                 place: PartPlace::default(),
                 signature: None,
             },
@@ -1001,8 +912,8 @@ impl Referrer {
     /// that writes them into the items of the copy.
     ///
     /// `context` is the one that `intern_*` or `enter_*` of the Leaker returned for the item whose
-    /// generics the impl instantiates (a trait, usually; a trait that `intern_mod()` found in a
-    /// module has none: enter its scope with [`View::enter_trait()`](crate::View::enter_trait)),
+    /// generics the impl instantiates (a trait, usually; a trait nested in the analyzed syntax has
+    /// none: enter its scope with [`View::enter_trait()`](crate::View::enter_trait)),
     /// and `given` are the arguments of the impl (`impl Tr<'static, u8> for W`). Lifetimes and types or consts are matched with the
     /// parameters by kind, in the order of the declaration, and a binding (`Item = u8`) is skipped.
     /// A parameter without an argument takes its default, with the arguments before it written in.
@@ -1023,8 +934,8 @@ impl Referrer {
     ///
     /// # Panics
     ///
-    /// If `context` is not a context of this Referrer, or has no generics as declared (a module
-    /// has none), or if the path of `projection` has arguments.
+    /// If `context` is not a context of this Referrer, or has no generics as declared (only the
+    /// top-level context of a scope has them), or if the path of `projection` has arguments.
     ///
     /// ```
     /// # use type_leak::*;
@@ -1072,7 +983,7 @@ impl Referrer {
         let declared = found.declared.clone().unwrap_or_else(|| {
             panic!(
                 "the context {} has no generics as declared: pass the ContextId that an intern_* \
-                 or enter_* method returned for an item, not for a module",
+                 or enter_* method returned for the item",
                 context
             )
         });
@@ -1523,6 +1434,8 @@ impl<'a, 'b, N: FnMut(&SelfRequirement) -> Option<Type>> Fold for EntryFolder<'a
 struct Declares {
     requirement: SelfRequirement,
     adt: bool,
+    /// The name of the item; an impl has none.
+    name: Option<Ident>,
 }
 
 impl Declares {
@@ -1530,6 +1443,7 @@ impl Declares {
         Self {
             requirement: SelfRequirement::of_item(ident, generics),
             adt: true,
+            name: Some(ident.clone()),
         }
     }
 
@@ -1537,6 +1451,7 @@ impl Declares {
         Self {
             requirement: SelfRequirement::of_trait(ident, generics),
             adt: false,
+            name: Some(ident.clone()),
         }
     }
 
@@ -1544,6 +1459,7 @@ impl Declares {
         Self {
             requirement: SelfRequirement::Type(self_ty.clone()),
             adt: false,
+            name: None,
         }
     }
 }
@@ -1561,9 +1477,10 @@ fn shadowing_names<'a>(items: impl IntoIterator<Item = &'a Item>) -> Vec<Ident> 
 /// another ([Outlives bounds](crate::Leaker#outlives-bounds)). A type is replaced only if an entry
 /// has the context that it has there, from the generics in scope. The parts that the Leaker copied
 /// as written ([recovery](crate::Leaker#errors-and-recovery)) are left as they are. Items and
-/// imports declared in a block hide the leaked types that name them there, and those declared in a
-/// module or a `File` hide the entries of no module that name them. Values are visited too: a type
-/// there is an entry only with [`Leaker::check_values`](crate::Leaker::check_values).
+/// imports declared in a block, a module or a `File` hide the leaked types that name them there,
+/// but the name of a nested struct, enum, union or trait hides none inside the item itself (what
+/// the item declares in it hides again). Values are visited too: a type there is an entry only
+/// with [`Leaker::check_values`](crate::Leaker::check_values).
 ///
 /// `N` is the closure of [`Visitor::with_nested_self()`]; there is none by default.
 ///
@@ -1605,6 +1522,9 @@ pub struct Visitor<'r, N = fn(&SelfRequirement) -> Option<Type>> {
 struct VisitorState {
     /// The entries that the items declared in the visited syntax hide (`Visitor::shadow_items()`).
     hidden: Rc<HashSet<usize>>,
+    /// The names that each container around declares (`Visitor::shadow_items()`), outermost first:
+    /// `hidden` is what they hide.
+    shadows: Rc<Vec<Vec<Ident>>>,
     /// What `Self` means here: in the context, or in the nested item that declares it. Each scope
     /// in `scopes` keeps the one in force where it was declared.
     self_req: Option<SelfRequirement>,
@@ -1614,21 +1534,16 @@ struct VisitorState {
     outer_generics: bool,
     /// What replaces `Self` in the copy ([`Visitor::with_self()`]).
     written_self: Option<Type>,
-    /// How many items the visit is in. The outermost item visited is the scope itself (`0`), and
-    /// the items of a module context are nested ones (`1`).
+    /// How many items the visit is in. The outermost item visited is the scope itself (`0`).
     item_depth: usize,
     /// In a nested struct, enum, union, trait or impl, which declare their own `Self`. A function,
     /// type alias, trait alias, const or static keeps the `Self` around, as in the Leaker.
     own_self: bool,
-    /// The nested item that `own_self` is about. `None` in a module inside it, which has no `Self`.
+    /// The nested item that `own_self` is about. `None` in a `mod` inside it, which has no `Self`.
     nested: Option<Rc<Nested>>,
     /// While the generics of a scope that this visit declares are visited: how the defaults of
     /// their parameters are looked up (see `Visitor::visit_type_param_mut()`).
     defaults: Defaults,
-    /// Where the visit is among the modules of the Leaker.
-    module: ModulePos,
-    /// The context is a module: the visited items are its own until the visitor enters one.
-    module_scope: bool,
     /// Where the visited syntax is among the predicates of the item.
     place: PartPlace,
     /// The signature being visited (not its body), for the parts that a signature made.
@@ -1738,10 +1653,12 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> Visitor<'r, N> {
     /// ```
     /// # use type_leak::*;
     /// # use syn::*;
+    /// # use syn::visit::Visit;
     /// # use syn::visit_mut::VisitMut;
-    /// let mut item: ItemMod = parse_quote!(mod m { struct N<T>(Wrap<Self>, Rel<T>); });
+    /// // A struct nested in a scope: it has a `Self` of its own.
+    /// let nested: Item = parse_quote!(struct N<T>(Wrap<Self>, Rel<T>););
     /// let mut leaker = Leaker::new();
-    /// let module = leaker.intern_mod(&item);
+    /// let (scope, ()) = leaker.enter_generics(&Generics::default(), |view| view.visit_item(&nested));
     /// let referrer = leaker.result().finish().unwrap();
     /// let projection = Projection::new(
     ///     parse_quote!(Repeater),
@@ -1749,11 +1666,13 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> Visitor<'r, N> {
     ///     ImplSelf::Param(parse_quote!(__S)),
     /// );
     ///
-    /// // The impl of `Wrap<Self>` is for the Leaker's `N<T>`, which is `::leaker::m::N<T>` here.
+    /// // The copy nests it in a module. The impl of `Wrap<Self>` is for the Leaker's `N<T>`, which
+    /// // is `::leaker::N<T>` here.
+    /// let mut item: ItemMod = parse_quote!(mod m { struct N<T>(Wrap<Self>, Rel<T>); });
     /// referrer
-    ///     .visitor(module, &projection)
+    ///     .visitor(scope, &projection)
     ///     .with_nested_self(|requirement| match requirement {
-    ///         SelfRequirement::Type(ty) => Some(parse_quote!(::leaker::m::#ty)),
+    ///         SelfRequirement::Type(ty) => Some(parse_quote!(::leaker::#ty)),
     ///         _ => None,
     ///     })
     ///     .visit_item_mod_mut(&mut item);
@@ -1761,7 +1680,7 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> Visitor<'r, N> {
     /// assert_eq!(item, parse_quote! {
     ///     mod m {
     ///         struct N<T>(
-    ///             <::leaker::m::N<T> as Repeater<(T,), #wrap>>::Type,
+    ///             <::leaker::N<T> as Repeater<(T,), #wrap>>::Type,
     ///             <Self as Repeater<(T,), #rel>>::Type
     ///         );
     ///     }
@@ -1781,15 +1700,35 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> Visitor<'r, N> {
     }
 
     /// Hides the entries that the `items` declared together hide (`Referrer::hidden_by()`).
-    fn shadow_items<'a>(&mut self, items: impl IntoIterator<Item = &'a Item>, module: bool) {
+    fn shadow_items<'a>(&mut self, items: impl IntoIterator<Item = &'a Item>) {
         let names = shadowing_names(items);
-        if names.is_empty() {
+        if !names.is_empty() {
+            let hidden = self.referrer.hidden_by(&names);
+            if !hidden.is_empty() {
+                Rc::make_mut(&mut self.state.hidden).extend(hidden);
+            }
+        }
+        Rc::make_mut(&mut self.state.shadows).push(names);
+    }
+
+    /// In the nested item `name`, which its container declares, its own name hides none of its
+    /// entries: the container's declaration of `name` is dropped, and the other names hide what
+    /// they hid.
+    fn unshadow_own(&mut self, name: &Ident) {
+        let own = ident_name(name);
+        let declares = |names: &Vec<Ident>| names.iter().any(|n| ident_name(n) == own);
+        if !self.state.shadows.last().map_or(false, declares) {
             return;
         }
-        let hidden = self.referrer.hidden_by(&names, module);
-        if !hidden.is_empty() {
-            Rc::make_mut(&mut self.state.hidden).extend(hidden);
+        let shadows = Rc::make_mut(&mut self.state.shadows);
+        if let Some(names) = shadows.last_mut() {
+            names.retain(|n| ident_name(n) != own);
         }
+        let mut hidden = HashSet::new();
+        for names in shadows.iter().filter(|names| !names.is_empty()) {
+            hidden.extend(self.referrer.hidden_by(names));
+        }
+        self.state.hidden = Rc::new(hidden);
     }
 
     /// Returns `true` if `cause`, a bound whose trait path conflicts, is a part: it is no type.
@@ -1813,7 +1752,7 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> Visitor<'r, N> {
     /// Returns how a type is looked up here.
     fn lookup(&self) -> Lookup<'_> {
         // In a nested item, the entries that name its own `Self` are found, and written with
-        // `Self`. In a module inside it `Self` means nothing: no entry that names it is found.
+        // `Self`. In a `mod` inside it `Self` means nothing: no entry that names it is found.
         Lookup {
             matching: Matching {
                 self_ty: self.state.self_req.as_ref(),
@@ -1821,7 +1760,6 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> Visitor<'r, N> {
                 nested_type: self.nested_type(),
                 without_self_first: self.state.defaults == Defaults::OwnTraitDefault,
             },
-            module: self.state.module,
             hidden: Some(&self.state.hidden),
             place: self.state.place,
             signature: self.state.signature.as_deref(),
@@ -1888,6 +1826,9 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> Visitor<'r, N> {
         let mut own_trait = false;
         if self.state.item_depth > 0 {
             if let Some(declared) = declares {
+                if let Some(name) = &declared.name {
+                    visitor.unshadow_own(name);
+                }
                 own_trait = matches!(declared.requirement, SelfRequirement::Bound(_));
                 visitor.state.own_self = true;
                 visitor.state.nested = Some(Rc::new(Nested {
@@ -2171,24 +2112,12 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> VisitMut for Visitor<'r, N>
         self.visit_attrs(&mut i.attrs);
         if let Some((_, items)) = &mut i.content {
             let mut visitor = self.clone();
-            let found = self.referrer.module_in(self.state.module, &i.ident);
-            // At the top of the module of the context, a `mod` that none of its modules is named
-            // like is the module itself: its items are those of the context, as in a `File`.
-            let itself = self.state.module_scope
-                && self.state.item_depth == 1
-                && found == ModulePos::Elsewhere;
-            if itself {
-                // A `mod` in it is nested in the module, as for its items.
-                visitor.state.module_scope = false;
-            } else {
-                visitor.state.module = found;
-                // A module has no generics: it only makes its items nested. `Self` has no meaning
-                // in it.
-                visitor.state.item_depth += 1;
-                visitor.state.self_req = None;
-                visitor.state.nested = None;
-            }
-            visitor.shadow_items(items.iter(), true);
+            // A module has no generics: it only makes its items nested. `Self` has no meaning in
+            // it.
+            visitor.state.item_depth += 1;
+            visitor.state.self_req = None;
+            visitor.state.nested = None;
+            visitor.shadow_items(items.iter());
             for item in items.iter_mut() {
                 visitor.visit_item_mut(item);
             }
@@ -2223,18 +2152,15 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> VisitMut for Visitor<'r, N>
     fn visit_file_mut(&mut self, i: &mut File) {
         // The items of a file are declared together, as those of a module.
         let mut visitor = self.clone();
-        visitor.shadow_items(i.items.iter(), true);
+        visitor.shadow_items(i.items.iter());
         syn::visit_mut::visit_file_mut(&mut visitor, i)
     }
     fn visit_block_mut(&mut self, i: &mut Block) {
         let mut visitor = self.clone();
-        visitor.shadow_items(
-            i.stmts.iter().filter_map(|stmt| match stmt {
-                Stmt::Item(item) => Some(item),
-                _ => None,
-            }),
-            false,
-        );
+        visitor.shadow_items(i.stmts.iter().filter_map(|stmt| match stmt {
+            Stmt::Item(item) => Some(item),
+            _ => None,
+        }));
         for stmt in i.stmts.iter_mut() {
             visitor.visit_stmt_mut(stmt);
         }
@@ -2255,7 +2181,6 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> VisitMut for Visitor<'r, N>
 //                   [Self : path ; | Self = Type ; | Self ;]
 //                   [Self : 'a + 'b ;]
 //                   [type G < 'b > where Self : 'b ; ..]
-//                   [mod id ; | mod { path = [a, ..], hint = "h", parent = id } ;]
 //
 // - The groups hold the entries in the order of their indices: a group is a run of the entries of
 //   one context. A context is declared by its first group. Its other groups (the entries of a
@@ -2370,6 +2295,9 @@ impl Referrer {
     //      other declarations (`<T, U = u8>` and `<T, U = u16>`) are two contexts: the top-level
     //      context of a scope is no more the context of an entry that has its generics, and the
     //      ids of the contexts that come after it are one more.
+    //    - Modules are no contexts any more: a declaration has no `mod id ;` and no
+    //      `mod { path = [..], hint = "..", parent = id } ;` (2 brought them), and a context is no
+    //      module's, so the entries of 15 that a module keys are not found.
     //    - Not serialized: the Repeater has one `KEY: u128` (`Projection::key()`) instead of
     //      `ID: u64, NTH: usize`, and a `U64` slot instead of the `U128` one (a `u128` const goes
     //      in `KEY`), so the impls and projections of 15 do not match.
@@ -2385,7 +2313,7 @@ impl Referrer {
 ///
 /// Entries keep their indices, and the tokens after the Referrer are not consumed. Fails if the
 /// format tag ([`Referrer::FORMAT_VERSION`]) is missing or differs, or if the contexts are
-/// inconsistent (a module or context used but not declared, a cycle of module parents).
+/// inconsistent (a context used but not declared).
 impl Parse for Referrer {
     fn parse(input: parse::ParseStream) -> Result<Self> {
         read_tag(input)?;
@@ -2478,12 +2406,6 @@ struct Reader {
     removed: BTreeSet<usize>,
     /// The contexts read.
     contexts: BTreeMap<ContextId, Context>,
-    /// The contexts that are modules (`mod { .. }`).
-    modules: HashSet<ContextId>,
-    /// The modules that contexts refer to (`mod 3 ;`).
-    module_refs: ContextRefs,
-    /// The parent of each module, with its span, checked when all the contexts are known.
-    parents: BTreeMap<ContextId, (Span, ContextId)>,
     /// The id of a group that writes no `#`.
     next: usize,
 }
@@ -2512,17 +2434,15 @@ impl Reader {
                     ),
                 ));
             }
-            return self.read_entries(input, context, span);
+            return self.read_entries(input, context);
         }
         let declared = self.declaration(input, context)?;
-        let entries_span = input.span();
         self.contexts.insert(context, declared);
-        self.read_entries(input, context, entries_span)
+        self.read_entries(input, context)
     }
 
     /// Reads what a group has before its entries when it declares `context`.
     fn declaration(&mut self, input: parse::ParseStream, context: ContextId) -> Result<Context> {
-        let generics_span = input.span();
         let has_generics = input.peek(Token![<]) || input.peek(Token![where]);
         let mut generics = Generics::default();
         if has_generics {
@@ -2557,7 +2477,6 @@ impl Reader {
         // `Self: 'a + 'b ;` is told from `Self: path ;` by the lifetime.
         let mut self_ty = None;
         let mut self_outlives = Vec::new();
-        let self_span = input.span();
         while input.peek(Token![Self]) {
             input.parse::<Token![Self]>()?;
             if input.peek(Token![;]) {
@@ -2586,99 +2505,34 @@ impl Reader {
                 "the associated types of a trait need `Self: Trait ;` before them",
             ));
         }
-        let (mut module, mut module_context) = (None, None);
-        if input.parse::<Option<Token![mod]>>()?.is_some() {
-            if input.peek(token::Brace) {
-                module_context = Some(parse_module_info(input, context, &mut self.parents)?);
-            } else {
-                let span = input.span();
-                let referred: ContextId = input.parse()?;
-                self.module_refs.push((span, referred));
-                module = Some(referred);
-            }
-            input.parse::<Token![;]>()?;
-        }
-        match module_context {
-            Some(module_context) => {
-                if has_generics || declared.is_some() {
-                    let span = if declared.is_some() {
-                        declared_span
-                    } else {
-                        generics_span
-                    };
-                    return Err(in_module(context, span, "which has no generics"));
-                }
-                if self_ty.is_some() || !self_outlives.is_empty() {
-                    return Err(in_module(context, self_span, "where `Self` has no meaning"));
-                }
-                self.modules.insert(context);
-                Ok(module_context)
-            }
-            None => {
-                // As the Leaker makes it: `Context::new()` gives the canonical generics.
-                let found = match declared {
-                    Some(declared) => {
-                        Context::new(declared.clone(), self_ty).with_declared(declared)
-                    }
-                    None => Context::new(generics, self_ty),
-                };
-                Ok(found
-                    .with_self_outlives(self_outlives)
-                    .with_gats(gats)
-                    .with_module(module))
-            }
-        }
+        // As the Leaker makes it: `Context::new()` gives the canonical generics.
+        let found = match declared {
+            Some(declared) => Context::new(declared.clone(), self_ty).with_declared(declared),
+            None => Context::new(generics, self_ty),
+        };
+        Ok(found.with_self_outlives(self_outlives).with_gats(gats))
     }
 
-    /// Reads the entries `( Type , .. )` of a group of `context`. `span` is for the error of a
-    /// module that has entries.
-    fn read_entries(
-        &mut self,
-        input: parse::ParseStream,
-        context: ContextId,
-        span: Span,
-    ) -> Result<()> {
+    /// Reads the entries `( Type , .. )` of a group of `context`.
+    fn read_entries(&mut self, input: parse::ParseStream, context: ContextId) -> Result<()> {
         let content: parse::ParseBuffer<'_>;
         parenthesized!(content in input);
         // `Type` or `- Type` (removed), separated by commas.
-        let mut group = Vec::new();
         while !content.is_empty() {
-            let removed = content.parse::<Option<Token![-]>>()?.is_some();
-            group.push((removed, content.parse::<Type>()?));
+            if content.parse::<Option<Token![-]>>()?.is_some() {
+                self.removed.insert(self.entries.len());
+            }
+            self.entries.push((context, content.parse::<Type>()?));
             if !content.is_empty() {
                 content.parse::<Token![,]>()?;
             }
         }
-        if self.modules.contains(&context) && !group.is_empty() {
-            return Err(in_module(context, span, "which has no leaked type"));
-        }
-        for (removed, ty) in group {
-            if removed {
-                self.removed.insert(self.entries.len());
-            }
-            self.entries.push((context, ty));
-        }
         Ok(())
     }
 
-    /// Checks what refers to a context, now that all the contexts are known: the module of a
-    /// context, the contexts of the parts, and the parents of the modules.
+    /// Checks what refers to a context, now that all the contexts are known: the contexts of the
+    /// parts.
     fn check(&self, part_contexts: &[(Span, ContextId)]) -> Result<()> {
-        let unknown = |id: ContextId| {
-            if self.contexts.contains_key(&id) {
-                format!(
-                    "the context {} is not a module (it is not declared as `mod {{ .. }}`)",
-                    id
-                )
-            } else {
-                format!("there is no module {}", id)
-            }
-        };
-        for (span, referred) in &self.module_refs {
-            if !self.modules.contains(referred) {
-                return Err(Error::new(*span, unknown(*referred)));
-            }
-        }
         for (span, context) in part_contexts {
             if !self.contexts.contains_key(context) {
                 return Err(Error::new(
@@ -2690,51 +2544,8 @@ impl Reader {
                 ));
             }
         }
-        for (module, (span, parent)) in &self.parents {
-            if parent == module {
-                return Err(Error::new(
-                    *span,
-                    format!("the module {} is its own parent", module),
-                ));
-            }
-            if !self.modules.contains(parent) {
-                return Err(Error::new(
-                    *span,
-                    format!("the parent of the module {}: {}", module, unknown(*parent)),
-                ));
-            }
-        }
-        for start in self.parents.keys() {
-            let chain = std::iter::successors(Some(*start), |at| {
-                self.parents.get(at).map(|(_, parent)| *parent)
-            });
-            if chain
-                .skip(1)
-                .take(self.parents.len())
-                .any(|at| at == *start)
-            {
-                return Err(Error::new(
-                    self.parents[start].0,
-                    format!(
-                        "the module {} is nested in itself (its parents form a cycle)",
-                        start
-                    ),
-                ));
-            }
-        }
         Ok(())
     }
-}
-
-/// Returns the error of a group of the module `context` that has what a module has not.
-fn in_module(context: ContextId, span: Span, what: &str) -> Error {
-    Error::new(
-        span,
-        format!(
-            "the context {} is a module (`mod {{ .. }}`), {}",
-            context, what
-        ),
-    )
 }
 
 /// Reads a part written by its [`ToTokens`] implementation.
@@ -2869,63 +2680,6 @@ impl ToTokens for SignatureMark {
     }
 }
 
-/// Reads the path, the hint and the parent of the module `context`, and returns its context. Each
-/// key may appear once. The span and id of the parent go to `parents`, to be checked when all the
-/// contexts are known.
-fn parse_module_info(
-    input: parse::ParseStream,
-    context: ContextId,
-    parents: &mut BTreeMap<ContextId, (Span, ContextId)>,
-) -> Result<Context> {
-    let content: parse::ParseBuffer<'_>;
-    braced!(content in input);
-    let (mut module_path, mut hint, mut parent) = (None, None, None);
-    let mut seen: Vec<String> = Vec::new();
-    while !content.is_empty() {
-        let key: Ident = content.parse()?;
-        let name = key.to_string();
-        if seen.contains(&name) {
-            return Err(Error::new(
-                key.span(),
-                format!("`{}` is written twice in the information of a module", name),
-            ));
-        }
-        content.parse::<Token![=]>()?;
-        match name.as_str() {
-            "path" => {
-                let path: parse::ParseBuffer<'_>;
-                bracketed!(path in content);
-                module_path = Some(
-                    Punctuated::<Ident, Token![,]>::parse_terminated(&path)?
-                        .into_iter()
-                        .collect(),
-                );
-            }
-            "hint" => hint = Some(content.parse::<LitStr>()?.value()),
-            "parent" => {
-                let span = content.span();
-                let id: ContextId = content.parse()?;
-                parent = Some(id);
-                parents.insert(context, (span, id));
-            }
-            _ => {
-                return Err(Error::new(
-                    key.span(),
-                    "expected `path`, `hint` or `parent`",
-                ))
-            }
-        }
-        seen.push(name);
-        content.parse::<Option<Token![,]>>()?;
-    }
-    Ok(Context::module_scope(
-        context.index(),
-        module_path,
-        hint,
-        parent,
-    ))
-}
-
 /// Writes the [`Referrer`] as tokens, to be read back by its [`Parse`] implementation.
 ///
 /// The tokens start with the format tag ([`Referrer::FORMAT_VERSION`]). Treat the rest as opaque.
@@ -3019,22 +2773,6 @@ impl Referrer {
         }
         for gat in &found.gats {
             tokens.extend(quote!(#gat));
-        }
-        match &found.module {
-            Some(ModuleScope::Itself {
-                path, hint, parent, ..
-            }) => {
-                let fields = [
-                    path.as_ref()
-                        .map(|path| quote!(path = [#(for ident in path), { #ident }])),
-                    hint.as_ref().map(|hint| quote!(hint = #hint)),
-                    parent.map(|parent| quote!(parent = #parent)),
-                ];
-                tokens
-                    .extend(quote!(mod { #(for field in fields.iter().flatten()), { #field } } ;));
-            }
-            Some(ModuleScope::In(module)) => tokens.extend(quote!(mod #module ;)),
-            None => (),
         }
     }
 }

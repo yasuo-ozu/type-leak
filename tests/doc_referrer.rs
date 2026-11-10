@@ -204,7 +204,7 @@ fn with_self_replaces_self_with_the_host() {
 /// that its closure returns; the others are written with `Self`.
 #[test]
 fn nested_self_writes_the_leakers_type_for_a_relative_self_entry() {
-    // In the module `m` of the crate `leaker`.
+    // A struct nested in a scope of the crate `leaker`.
     let item: ItemStruct = parse_quote!(
         struct S<T> {
             a: Rel<T>,
@@ -212,7 +212,7 @@ fn nested_self_writes_the_leakers_type_for_a_relative_self_entry() {
         }
     );
     let mut leaker = Leaker::new();
-    let (module, ()) = leaker.enter_mod("m", [item.ident.clone()], |view| {
+    let (context, ()) = leaker.enter_generics(&Generics::default(), |view| {
         view.visit_item(&Item::Struct(item.clone()))
     });
     let referrer = leaker.result().finish().unwrap();
@@ -222,22 +222,18 @@ fn nested_self_writes_the_leakers_type_for_a_relative_self_entry() {
         common::key(7, common::entry_id_at(&referrer, 1)),
     );
     let copy = |hook: &mut dyn FnMut(&SelfRequirement) -> Option<Type>| {
-        let mut file = File {
-            shebang: None,
-            attrs: vec![],
-            items: vec![Item::Struct(item.clone())],
-        };
+        let mut module: ItemMod = parse_quote!(mod w { #item });
         referrer
-            .visitor(module, &projection)
+            .visitor(context, &projection)
             .with_nested_self(|requirement| hook(requirement))
-            .visit_file_mut(&mut file);
-        file
+            .visit_item_mod_mut(&mut module);
+        module
     };
 
     // The copy is in another crate. `Self` of the Leaker's `S<T>` is `::leaker::m::S<T>` there. The
     // closure gets the requirement of `S`, once.
     let mut asked = Vec::new();
-    let file = copy(&mut |requirement| {
+    let module = copy(&mut |requirement| {
         asked.push(requirement.clone());
         match requirement {
             SelfRequirement::Type(ty) => Some(parse_quote!(::leaker::m::#ty)),
@@ -245,23 +241,27 @@ fn nested_self_writes_the_leakers_type_for_a_relative_self_entry() {
         }
     });
     assert_eq!(asked, [SelfRequirement::Type(parse_quote!(S<T>))]);
-    let expected: File = parse_quote! {
-        struct S<T> {
-            a: <Self as Repeater<(T,), #key0>>::Type,
-            b: <::leaker::m::S<T> as Repeater<(T,), #key1>>::Type,
+    let expected: ItemMod = parse_quote! {
+        mod w {
+            struct S<T> {
+                a: <Self as Repeater<(T,), #key0>>::Type,
+                b: <::leaker::m::S<T> as Repeater<(T,), #key1>>::Type,
+            }
         }
     };
-    assert_eq!(file, expected);
+    assert_eq!(module, expected);
 
     // With `None` the entry is left as written.
-    let file = copy(&mut |_| None);
-    let expected: File = parse_quote! {
-        struct S<T> {
-            a: <Self as Repeater<(T,), #key0>>::Type,
-            b: Rel2<Self>,
+    let module = copy(&mut |_| None);
+    let expected: ItemMod = parse_quote! {
+        mod w {
+            struct S<T> {
+                a: <Self as Repeater<(T,), #key0>>::Type,
+                b: Rel2<Self>,
+            }
         }
     };
-    assert_eq!(file, expected);
+    assert_eq!(module, expected);
 }
 
 /// Without `with_nested_self()` the entry for the own `Self` of a nested item (`Type`, `Bound`) is
@@ -278,7 +278,11 @@ fn nested_self_entries_are_left_as_written_without_the_hook_but_for_any_type() {
         }
     );
     let mut leaker = Leaker::new();
-    let top = leaker.intern_mod(&module);
+    let (top, ()) = leaker.enter_generics(&Generics::default(), |view| {
+        for item in &module.content.as_ref().unwrap().1 {
+            view.visit_item(item);
+        }
+    });
     let result = leaker.result();
     // `Rel2<Self, T>` is the risk of an entry for any type: the macro takes it.
     let referrer = result
@@ -341,7 +345,7 @@ fn nested_self_passes_the_copys_own_self_for_a_bound_naming_self() {
         struct S<T: ::core::convert::AsRef<Self>> { a: Rel<T>, }
     };
     let mut leaker = Leaker::new();
-    let (module, ()) = leaker.enter_mod("m", [item.ident.clone()], |view| {
+    let (scope, ()) = leaker.enter_generics(&Generics::default(), |view| {
         view.visit_item(&Item::Struct(item.clone()))
     });
     let result = leaker.result();
@@ -373,20 +377,18 @@ fn nested_self_passes_the_copys_own_self_for_a_bound_naming_self() {
     assert_eq!(imp, expected);
 
     // The Referrer's crate: the copy has the bound for its own type, `Self`.
-    let mut file = File {
-        shebang: None,
-        attrs: vec![],
-        items: vec![Item::Struct(item)],
-    };
+    let mut module: ItemMod = parse_quote!(mod w { #item });
     referrer
-        .visitor(module, &common::projection(repeater.clone(), 7))
-        .visit_file_mut(&mut file);
-    let expected: File = parse_quote! {
-        struct S<T: ::core::convert::AsRef<Self>> {
-            a: <Self as Repeater<(T,), #key>>::Type,
+        .visitor(scope, &common::projection(repeater.clone(), 7))
+        .visit_item_mod_mut(&mut module);
+    let expected: ItemMod = parse_quote! {
+        mod w {
+            struct S<T: ::core::convert::AsRef<Self>> {
+                a: <Self as Repeater<(T,), #key>>::Type,
+            }
         }
     };
-    assert_eq!(file, expected);
+    assert_eq!(module, expected);
 }
 
 /// An absolute type that names `Self` stays as written, also if the optional entries are replaced.
@@ -400,37 +402,35 @@ fn nested_self_keeps_an_absolute_self_type_as_written_when_optional_entries_are_
         }
     };
     let mut leaker = Leaker::new();
-    let (module, ()) = leaker.enter_mod("m", [item.ident.clone()], |view| {
+    let (scope, ()) = leaker.enter_generics(&Generics::default(), |view| {
         view.visit_item(&Item::Struct(item.clone()))
     });
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2); // `Rel<Self>`, then `::p::Wrap<T>` (optional)
 
-    let mut file = File {
-        shebang: None,
-        attrs: vec![],
-        items: vec![Item::Struct(item)],
-    };
+    let mut module: ItemMod = parse_quote!(mod w { #item });
     let projection = common::projection(parse_quote!(Repeater), 7);
     referrer
-        .visitor(module, &projection)
+        .visitor(scope, &projection)
         .with_nested_self(|requirement| match requirement {
             SelfRequirement::Type(ty) => Some(parse_quote!(::leaker::m::#ty)),
             _ => None,
         })
-        .visit_file_mut(&mut file);
+        .visit_item_mod_mut(&mut module);
     let (key0, key1) = (
         common::key(7, common::entry_id_at(&referrer, 0)),
         common::key(7, common::entry_id_at(&referrer, 1)),
     );
-    let expected: File = parse_quote! {
-        struct Node<T> {
-            next: ::std::boxed::Box<Self>,
-            other: <Self as Repeater<(T,), #key1>>::Type,
-            leaked: <::leaker::m::Node<T> as Repeater<(T,), #key0>>::Type,
+    let expected: ItemMod = parse_quote! {
+        mod w {
+            struct Node<T> {
+                next: ::std::boxed::Box<Self>,
+                other: <Self as Repeater<(T,), #key1>>::Type,
+                leaked: <::leaker::m::Node<T> as Repeater<(T,), #key0>>::Type,
+            }
         }
     };
-    assert_eq!(file, expected);
+    assert_eq!(module, expected);
 }
 
 /// A macro has a type of another crate copied as written by giving the Leaker
@@ -446,35 +446,33 @@ fn a_leaker_that_allows_the_crates_makes_no_entry_of_their_types() {
         }
     };
     let mut leaker = Leaker::with_rule(Rules::new().external_crates());
-    let (module, ()) = leaker.enter_mod("m", [item.ident.clone()], |view| {
+    let (scope, ()) = leaker.enter_generics(&Generics::default(), |view| {
         view.visit_item(&Item::Struct(item.clone()))
     });
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
 
-    let mut file = File {
-        shebang: None,
-        attrs: vec![],
-        items: vec![Item::Struct(item)],
-    };
+    let mut module: ItemMod = parse_quote!(mod w { #item });
     let projection = common::projection(parse_quote!(Repeater), 7);
     referrer
-        .visitor(module, &projection)
+        .visitor(scope, &projection)
         .with_nested_self(|requirement| match requirement {
             SelfRequirement::Type(ty) => Some(parse_quote!(::leaker::m::#ty)),
             _ => None,
         })
-        .visit_file_mut(&mut file);
+        .visit_item_mod_mut(&mut module);
     let key = common::key(7, common::entry_id_at(&referrer, 0));
-    let expected: File = parse_quote! {
-        struct Node<T> {
-            next: ::std::boxed::Box<Self>,
-            other: ::p::Wrap<T>,
-            more: ::q::Wrap<T>,
-            leaked: <::leaker::m::Node<T> as Repeater<(T,), #key>>::Type,
+    let expected: ItemMod = parse_quote! {
+        mod w {
+            struct Node<T> {
+                next: ::std::boxed::Box<Self>,
+                other: ::p::Wrap<T>,
+                more: ::q::Wrap<T>,
+                leaked: <::leaker::m::Node<T> as Repeater<(T,), #key>>::Type,
+            }
         }
     };
-    assert_eq!(file, expected);
+    assert_eq!(module, expected);
 }
 
 /// The serialized form starts with the `FORMAT_VERSION` tag, and another format is refused.

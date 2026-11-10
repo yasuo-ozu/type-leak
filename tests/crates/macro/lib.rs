@@ -552,14 +552,6 @@ fn type_string(ty: &Type) -> String {
     quote!(#ty).to_string()
 }
 
-/// The module that a context is in: `Some` for a context of an entry that depends on one.
-pub(crate) fn in_module(context: &Context) -> Option<ContextId> {
-    match &context.module {
-        Some(ModuleScope::In(module)) => Some(*module),
-        _ => None,
-    }
-}
-
 /// The name of a generic parameter, as `substitute_args()` asks for it.
 pub(crate) fn param_ident(param: &GenericParam) -> &Ident {
     match param {
@@ -611,14 +603,6 @@ pub(crate) fn entry_context(referrer: &Referrer, ix: EntryId) -> &Context {
 pub(crate) fn entry_type(referrer: &Referrer, ix: EntryId) -> &Type {
     // The entries that `LeakerResult::ignore()` removed have no place in `iter()`.
     referrer.iter().find(|(id, _, _)| *id == ix).unwrap().1
-}
-
-/// The path of a module from its root (`ModuleScope::Itself::path`), from `RepeaterImpl::module`.
-pub(crate) fn module_path(module: &Option<ModuleScope>) -> Option<&[Ident]> {
-    match module {
-        Some(ModuleScope::Itself { path, .. }) => path.as_deref(),
-        _ => None,
-    }
 }
 
 impl Parse for CheckLeakInput {
@@ -677,7 +661,7 @@ impl Parse for CheckLeakInput {
 /// check_leak! {
 ///     { Rel, ::foo::X, Other<u8> }           // the leaked types, sorted, or `error: "message"`
 ///     { allow = ::bar }                      // the config (`Rules::primitive` is always set)
-///     trait Tr { fn f(&self) -> $crate::m::Wrap<Rel>; } // a trait, a struct or a module
+///     trait Tr { fn f(&self) -> $crate::m::Wrap<Rel>; } // a trait or a struct
 /// }
 /// ```
 ///
@@ -693,7 +677,6 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     match &item {
         Item::Trait(item) => leaker.intern_trait(item),
         Item::Struct(item) => leaker.intern_struct(item),
-        Item::Mod(item) => leaker.intern_mod(item),
         _ => return quote!(compile_error!("unsupported item");).into(),
     };
     let got: std::result::Result<Vec<String>, String> = match leaker.result().finish() {

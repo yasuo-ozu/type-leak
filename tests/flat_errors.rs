@@ -327,7 +327,7 @@ fn a_type_in_the_arguments_of_a_bound_with_nothing_wrong_has_no_error() {
 
 #[test]
 fn an_error_without_a_path_has_none() {
-    // `Self` in a module has no meaning: nothing to allow but the cause. (The default of a
+    // `Self` where nothing declares it has no meaning: nothing to allow but the cause. (The default of a
     // parameter that names it is an error for the path of its type, `Wrap`.)
     let item: ItemTrait = parse_quote!(
         trait Tr<T = Wrap<Self>> {}

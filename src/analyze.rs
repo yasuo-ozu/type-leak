@@ -27,15 +27,13 @@ use crate::util::{
     first_self_in_type, generic_param_mentions_self, generic_param_name, has_lifetime_bound,
     ident_name, is_bare_self, is_primitive_name, or_list, path_type, plain_self_head, self_head,
     self_in_param, self_in_predicate, selves_in_generics, tidy, token_names, trait_head,
-    trait_object_of, type_mentions_self, unwrap_type_group, use_names,
-    where_predicate_mentions_self, without_arguments, without_crate_prefix, without_default,
-    without_defaults,
+    trait_object_of, type_mentions_self, unwrap_type_group, where_predicate_mentions_self,
+    without_arguments, without_crate_prefix, without_default, without_defaults,
 };
 use crate::view::View;
 use proc_macro2::TokenStream;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Display;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use syn::parse::ParseStream;
@@ -66,10 +64,6 @@ struct Frame {
     mentions_root: bool,
     /// It names `Self`.
     mentions_self: bool,
-    /// It names an item of the module (see `AnalyzeVisitor::is_module_path()`).
-    module_item: bool,
-    /// The first path in the type that names an item of the module (`module_item` is set by it).
-    module_path: Option<TokenStream>,
     /// The bare identifiers that are arguments of the path being visited (the type, or the trait of
     /// a bound in it), as text: the arguments that may be consts, apart from those that bubbled up
     /// from a type inside.
@@ -77,8 +71,6 @@ struct Frame {
     /// The depth of the shallowest type in it whose own path names an external crate, `usize::MAX`
     /// if none: the Referrer may replace that type (an optional entry).
     optional_depth: usize,
-    /// A cause is a relative path, so the type means something else in another module.
-    relative: bool,
     /// A type not leaked alone because of a binder lifetime: its holder's depth and the advice
     /// (see [`Binder`]).
     binder: Option<(usize, Advice)>,
@@ -109,11 +101,8 @@ impl Frame {
             local_scope: usize::MAX,
             mentions_root: false,
             mentions_self: false,
-            module_item: false,
-            module_path: None,
             bare_args: Vec::new(),
             optional_depth: usize::MAX,
-            relative: false,
             binder: None,
             elision: None,
             unconstrained: None,
@@ -145,9 +134,7 @@ struct Must {
 /// lifetime or reference (and a trait object that takes its lifetime from it) and `impl Trait`.
 /// Any other cause is hard (`push()`, so a new cause is hard unless it is made soft): `Self::A`, a
 /// method lifetime that the copy would leave unconstrained, an expression that cannot be leaked. A type that holds a bare identifier and cannot be leaked
-/// because of a hard cause is an error (see [`AnalyzeVisitor::bare_conflict()`]). So is a path of
-/// another crate that holds one beside an item of the module, which is no cause in this list
-/// ([`AnalyzeVisitor::bare_beside_module_item()`]).
+/// because of a hard cause is an error (see [`AnalyzeVisitor::bare_conflict()`]).
 #[derive(Default)]
 struct Impossibles {
     /// The causes, in order of pushing.
@@ -484,33 +471,14 @@ impl<'ast> Visit<'ast> for RefersToSelf {
     }
 }
 
-/// A module that the analysis is in.
-#[derive(Clone)]
-struct ModuleFrame {
-    /// The context of the module.
-    id: ContextId,
-    /// The path of the module, if it has one. It is kept here, as a probe has the frames of the
-    /// visitor it was made from but not its table of contexts.
-    path: Option<Rc<[Ident]>>,
-    /// What the module declares.
-    names: Rc<ModuleNames>,
-}
-
-pub(crate) enum ScopeSpec {
-    /// A module: `intern_mod` (with its path) or `enter_mod` (with its hint). It has no generics.
-    Module {
-        names: ModuleNames,
-        path: Option<Vec<Ident>>,
-        hint: Option<String>,
-    },
-    Generics {
-        generics: Generics,
-        /// What `Self` is inside, if the scope declares it. `None` keeps the `Self` around.
-        declares: Option<Box<DeclaredSelf>>,
-        /// The trait of an impl, checked on entering the scope like the root of a trait bound: it
-        /// must not depend on the context, but its arguments are analyzed by the walk of the impl.
-        trait_path: Option<Box<Path>>,
-    },
+/// A scope that the Leaker or a [`View`] enters: the generics that it declares.
+pub(crate) struct ScopeSpec {
+    generics: Generics,
+    /// What `Self` is inside, if the scope declares it. `None` keeps the `Self` around.
+    declares: Option<Box<DeclaredSelf>>,
+    /// The trait of an impl, checked on entering the scope like the root of a trait bound: it
+    /// must not depend on the context, but its arguments are analyzed by the walk of the impl.
+    trait_path: Option<Box<Path>>,
 }
 
 pub(crate) struct DeclaredSelf {
@@ -528,32 +496,21 @@ pub(crate) struct DeclaredSelf {
 
 impl ScopeSpec {
     pub(crate) fn declared_generics(&self) -> Generics {
-        match self {
-            Self::Module { .. } => Generics::default(),
-            Self::Generics { generics, .. } => generics.clone(),
-        }
+        self.generics.clone()
     }
 
     /// The generic associated types of the trait that the scope declares, if it sees them.
     pub(crate) fn declared_gats(&self) -> Vec<Gat> {
-        match self {
-            Self::Generics {
-                declares: Some(declared),
-                ..
-            } => declared.gats.clone(),
-            _ => Vec::new(),
-        }
+        self.declares
+            .as_ref()
+            .map_or_else(Vec::new, |declared| declared.gats.clone())
     }
 
     /// What `Self` is in the scope, if it declares it.
     pub(crate) fn declared_self(&self) -> Option<SelfRequirement> {
-        match self {
-            Self::Generics {
-                declares: Some(declared),
-                ..
-            } => Some(declared.requirement.clone()),
-            _ => None,
-        }
+        self.declares
+            .as_ref()
+            .map(|declared| declared.requirement.clone())
     }
 }
 
@@ -569,30 +526,6 @@ pub(crate) trait Scopes {
         f: impl FnOnce(&mut View<'_, '_, Self::Rule>) -> R,
     ) -> (ContextId, R);
 
-    fn enter_mod<R>(
-        &mut self,
-        hint: impl Display,
-        declared: impl IntoIterator<Item = Ident>,
-        f: impl FnOnce(&mut View<'_, '_, Self::Rule>) -> R,
-    ) -> (ContextId, R) {
-        let names = ModuleNames {
-            names: declared
-                .into_iter()
-                .map(|ident| ident_name(&ident))
-                .collect(),
-            modules: HashMap::new(),
-        };
-        let hint = Some(hint.to_string());
-        self.enter_spec(
-            ScopeSpec::Module {
-                names,
-                path: None,
-                hint,
-            },
-            f,
-        )
-    }
-
     fn enter_generics<R>(
         &mut self,
         generics: &Generics,
@@ -600,7 +533,7 @@ pub(crate) trait Scopes {
     ) -> (ContextId, R) {
         let generics = generics.clone();
         self.enter_spec(
-            ScopeSpec::Generics {
+            ScopeSpec {
                 generics,
                 declares: None,
                 trait_path: None,
@@ -616,7 +549,7 @@ pub(crate) trait Scopes {
         trait_path: Option<&Path>,
         f: impl FnOnce(&mut View<'_, '_, Self::Rule>) -> R,
     ) -> (ContextId, R) {
-        let spec = ScopeSpec::Generics {
+        let spec = ScopeSpec {
             generics: generics.clone(),
             declares: Some(Box::new(declares)),
             trait_path: trait_path.map(|path| Box::new(path.clone())),
@@ -758,13 +691,13 @@ impl Records {
 /// What `Self` means where the visitor is: set and put back together by a scope or an item.
 #[derive(Clone, Default)]
 struct SelfScope {
-    /// What `Self` means here, if anything. It has none directly in a module, or in generics that
-    /// no item declaring it encloses, so mentioning it there is an error.
+    /// What `Self` means here, if anything. It has none directly in a `mod` (in a type), or in
+    /// generics that no item declaring it encloses, so mentioning it there is an error.
     ty: Option<SelfRequirement>,
     /// `ty` is the self type of an impl, which the copy writes (see [`DeclaredSelf`]).
     written: bool,
-    /// `ty` is the `Self` of a struct, an enum or a union nested in the analyzed syntax (an item
-    /// of a module, or `View::visit_item()`): the copy declares a type of its own there, so its
+    /// `ty` is the `Self` of a struct, an enum or a union nested in the analyzed syntax
+    /// (`View::visit_item()`): the copy declares a type of its own there, so its
     /// `Self` is not the Leaker's type that the Repeater's impls are for. A type that does not
     /// name `Self` but has a bound that does is for any type (`SelfRequirement::Any`, see
     /// [`AnalyzeVisitor::self_in_bounds()`]), and so is one that names it with such a bound, with
@@ -854,8 +787,6 @@ struct ScopeMark {
     records: RecordsMark,
     /// The number of generics in scope.
     scopes: usize,
-    /// The number of modules.
-    modules: usize,
     /// `AnalyzeVisitor::item_depth`.
     item_depth: usize,
     /// The number of `AnalyzeVisitor::alone_defaults`.
@@ -866,8 +797,6 @@ struct ScopeMark {
     self_type_walk: Option<bool>,
     /// `AnalyzeVisitor::inherent_impl`.
     inherent_impl: bool,
-    /// The module that the scope entered, if it is one.
-    module: Option<ContextId>,
 }
 
 /// The defaults of the type parameters that a scope analyzes alone: without `Self`, with the
@@ -882,9 +811,7 @@ struct AloneDefaults {
     /// or in a nested item, whose generics are other parameters.
     scopes: usize,
     item_depth: usize,
-    /// The parameters of the scope's generics that have a default. Empty for a module, which
-    /// declares no parameter, so that the walk in it does not take a parameter of the scope around
-    /// for one of its own.
+    /// The parameters of the scope's generics that have a default.
     idents: Vec<Ident>,
     /// What the scope declares (`Self` and its generics), if it is the scope of an item: the item
     /// that is nested in the scope with the same generics and `Self` is the item itself, visited
@@ -929,8 +856,6 @@ pub(crate) struct Finished {
     pub(crate) effects: Vec<Effect>,
     /// The top-level contexts of the scopes left, in order.
     pub(crate) top_levels: Vec<ContextId>,
-    /// The module that the scope entered, if it is one.
-    pub(crate) module: Option<ContextId>,
     /// The types, with their contexts, that cannot be optional entries (see
     /// [`AnalyzeVisitor::env_cycle()`]).
     pub(crate) not_optional: Vec<(Context, String)>,
@@ -964,8 +889,6 @@ pub(crate) struct AnalyzeVisitor<'a, A> {
     /// graph not to choose a type in the self type whose bounds are unstable (see
     /// [`AnalyzeVisitor::block_unstable_self_types()`]).
     self_type_walk: Option<bool>,
-    /// The modules that the walk is in, innermost last.
-    modules: Vec<ModuleFrame>,
     /// The causes that depend on the context.
     musts: Vec<Must>,
     /// The causes that stop the type being visited from being leaked whole.
@@ -1050,7 +973,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             alone_defaults: Vec::new(),
             self_scope: SelfScope::default(),
             self_type_walk: None,
-            modules: Vec::new(),
             musts: Vec::new(),
             impossibles: Impossibles::default(),
             frame: Frame::new(0, 0, 0),
@@ -1260,7 +1182,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             path.leading_colon.is_none()
                 && self_head(path).is_none()
                 && !self.starts_with_generic(path)
-                && !self.is_context_free(cause)
+                && !self.is_free_path(cause)
         })
     }
 
@@ -1335,36 +1257,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         } else {
             Context::none()
         };
-        // A type that names an item of the module (`crate::base::B1<R0>` with a declared `R0`) means
-        // something only there, like one with a relative path: the Repeater impl of its entry is
-        // emitted inside the module, where the name resolves, and the copy of the module declares
-        // the name again, so an entry of no module is hidden by the Referrer and left as written.
-        Ok(match self.modules.last() {
-            Some(module)
-                if inner.relative || inner.module_item || self.depends_on_module(&context) =>
-            {
-                context.with_module(Some(module.id))
-            }
-            _ => context,
-        })
-    }
-
-    fn depends_on_module(&self, context: &Context) -> bool {
-        // The tokens of a macro are resolved where the macro is expanded.
-        let mut finder = AnyPath::new(true, |path| {
-            path.leading_colon.is_none()
-                && matches!(path.segments.first(), Some(seg)
-                    if seg.ident != "crate" && seg.ident != "$crate" && seg.ident != "Self")
-                && !self.starts_with_generic(path)
-                && !self.is_free_path(&Cause::Unknown(path.clone()))
-        });
-        finder.visit_generics(&context.generics);
-        match &context.self_ty {
-            Some(SelfRequirement::Bound(path)) => finder.visit_path(path),
-            Some(SelfRequirement::Type(ty)) => finder.visit_type(ty),
-            _ => (),
-        }
-        finder.found
+        Ok(context)
     }
 
     /// Returns `true` if `ty`, with `context`, names the `Self` of a struct, an enum or a union
@@ -1473,13 +1366,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         spec: &ScopeSpec,
         generics: &Generics,
     ) -> (Finished, Vec<ErrorItem>) {
-        let declares_self = matches!(
-            spec,
-            ScopeSpec::Generics {
-                declares: Some(_),
-                ..
-            }
-        );
+        let declares_self = spec.declares.is_some();
         let mut effects = std::mem::take(&mut self.frame.effects);
         for (index, _, default) in defaulted(generics) {
             let root = without_defaults(generics, index);
@@ -1515,13 +1402,12 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         let finished = Finished {
             effects,
             top_levels: std::mem::take(&mut self.records.top_levels),
-            module: self.modules.first().map(|module| module.id),
             not_optional: std::mem::take(&mut self.records.not_optional),
         };
         (finished, errors)
     }
 
-    /// Starts the outermost scope, entering it if it is a module.
+    /// Starts the outermost scope.
     pub(crate) fn start(&mut self, spec: &ScopeSpec) {
         self.enter_scope(spec, true);
     }
@@ -1533,105 +1419,73 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             effects: self.frame.effects.len(),
             records: self.records.mark(),
             scopes: self.scopes.len(),
-            modules: self.modules.len(),
             item_depth: self.item_depth,
             alone_defaults: self.alone_defaults.len(),
             self_scope: self.self_scope.clone(),
             self_type_walk: self.self_type_walk,
             inherent_impl: self.inherent_impl,
-            module: None,
         }
     }
 
     fn enter_scope(&mut self, spec: &ScopeSpec, root: bool) -> ScopeMark {
-        let mut mark = self.mark();
-        match spec {
-            // `Self` has no meaning in a module, only in its items, which may leak it again.
-            ScopeSpec::Module { names, path, hint } => {
-                let parent = self.modules.last().map(|module| module.id);
-                let id = self
-                    .records
-                    .contexts
-                    .intern_module(path.clone(), hint.clone(), parent);
-                self.modules.push(ModuleFrame {
-                    id,
-                    path: path.as_deref().map(Rc::from),
-                    names: Rc::new(names.clone()),
-                });
-                self.self_scope = SelfScope::default();
-                mark.module = Some(id);
-            }
-            ScopeSpec::Generics {
-                generics,
-                declares,
-                trait_path,
-            } => {
-                if let Some(declared) = declares {
-                    self.self_scope.ty = Some(declared.requirement.clone());
-                    self.self_scope.written = declared.written;
-                    self.self_scope.nested = false;
-                    self.self_scope.trait_ =
-                        trait_path.as_deref().map(|path| self.impl_trait(path));
-                    self.inherent_impl = declared.inherent;
-                }
-                let gats = declares
-                    .as_ref()
-                    .map_or_else(Vec::new, |declared| declared.gats.clone());
-                if root {
-                    self.scopes[0].set_self(self.self_scope.ty.clone());
-                    self.scopes[0].set_gats(gats);
-                } else {
-                    self.scopes
-                        .push(Scope::new(generics, self.self_scope.ty.clone()).with_gats(gats));
-                }
-                if declares.is_some() {
-                    self.self_scope.depth = self.scopes.len();
-                }
-                if self.self_scope.ty.is_none() {
-                    let generics = without_defaults(generics, generics.params.len());
-                    let place = self.place();
-                    self.records.self_errors.extend(
-                        selves_in_generics(&generics)
-                            .into_iter()
-                            .map(|cause| SelfMention::new(cause, place)),
-                    );
-                }
-                // Checked like the root of a trait bound, before what the closure visits.
-                if let Some(path) = trait_path.as_deref() {
-                    self.check_bound_path(path, Cause::Trait(path.clone()));
-                }
-            }
+        let mark = self.mark();
+        let ScopeSpec {
+            generics,
+            declares,
+            trait_path,
+        } = spec;
+        if let Some(declared) = declares {
+            self.self_scope.ty = Some(declared.requirement.clone());
+            self.self_scope.written = declared.written;
+            self.self_scope.nested = false;
+            self.self_scope.trait_ = trait_path.as_deref().map(|path| self.impl_trait(path));
+            self.inherent_impl = declared.inherent;
+        }
+        let gats = declares
+            .as_ref()
+            .map_or_else(Vec::new, |declared| declared.gats.clone());
+        if root {
+            self.scopes[0].set_self(self.self_scope.ty.clone());
+            self.scopes[0].set_gats(gats);
+        } else {
+            self.scopes
+                .push(Scope::new(generics, self.self_scope.ty.clone()).with_gats(gats));
+        }
+        if declares.is_some() {
+            self.self_scope.depth = self.scopes.len();
+        }
+        if self.self_scope.ty.is_none() {
+            let generics = without_defaults(generics, generics.params.len());
+            let place = self.place();
+            self.records.self_errors.extend(
+                selves_in_generics(&generics)
+                    .into_iter()
+                    .map(|cause| SelfMention::new(cause, place)),
+            );
+        }
+        // Checked like the root of a trait bound, before what the closure visits.
+        if let Some(path) = trait_path.as_deref() {
+            self.check_bound_path(path, Cause::Trait(path.clone()));
         }
         self.item_depth = self.item_depth.max(1);
-        let alone = match spec {
-            ScopeSpec::Module { .. } => AloneDefaults {
-                scopes: self.scopes.len(),
-                item_depth: self.item_depth,
-                idents: Vec::new(),
-                declared: None,
-            },
-            ScopeSpec::Generics {
-                generics, declares, ..
-            } => AloneDefaults {
-                scopes: self.scopes.len(),
-                item_depth: self.item_depth,
-                idents: defaulted(generics)
-                    .map(|(_, ident, _)| ident.clone())
-                    .collect(),
-                declared: declares
-                    .as_ref()
-                    .map(|declared| (declared.requirement.clone(), generics.clone())),
-            },
+        let alone = AloneDefaults {
+            scopes: self.scopes.len(),
+            item_depth: self.item_depth,
+            idents: defaulted(generics)
+                .map(|(_, ident, _)| ident.clone())
+                .collect(),
+            declared: declares
+                .as_ref()
+                .map(|declared| (declared.requirement.clone(), generics.clone())),
         };
         self.alone_defaults.push(alone);
         mark
     }
 
-    /// Leaves a scope: what it declared (the generics, `Self`, the modules) is gone, and what it
-    /// recorded stays. [`AnalyzeVisitor::roll_back()`] removes that.
+    /// Leaves a scope: what it declared (the generics, `Self`) is gone, and what it recorded
+    /// stays. [`AnalyzeVisitor::roll_back()`] removes that.
     fn leave_scope(&mut self, mark: &ScopeMark) {
         self.scopes.truncate(mark.scopes);
-        self.modules.truncate(mark.modules);
         self.item_depth = mark.item_depth;
         self.alone_defaults.truncate(mark.alone_defaults);
         self.self_scope = mark.self_scope.clone();
@@ -1690,17 +1544,15 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// Leaves a nested scope and returns its top-level context. The scope keeps what it recorded,
     /// and the outermost one reports the errors, in the order found.
     fn end_scope(&mut self, mark: ScopeMark, spec: &ScopeSpec) -> ContextId {
-        if let ScopeSpec::Generics { generics, .. } = spec {
-            for (index, _, default) in defaulted(generics) {
-                self.analyze_default_inline(default, &without_defaults(generics, index));
-            }
+        let generics = &spec.generics;
+        for (index, _, default) in defaulted(generics) {
+            self.analyze_default_inline(default, &without_defaults(generics, index));
         }
         // The entries that name a `Self` without meaning are copied whole instead.
         if !self.records.self_errors.is_empty() {
             let found = self.frame.effects.split_off(mark.effects);
             self.frame.effects.extend(correct_unmeant_self(found));
         }
-        let module = mark.module;
         // A scope that declares nothing keeps the `Self` around, so take it before leaving. It is
         // part of the top-level context only if an entry or a part copied as written names it, or
         // has a bound rewritten for it: nothing else depends on it.
@@ -1721,15 +1573,11 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 .map_or_else(Vec::new, |scope| scope.gats().to_vec())
         });
         self.leave_scope(&mark);
-        let top_level = module.unwrap_or_else(|| {
-            // The scope is in the module around it, if any.
-            let around = self.modules.last().map(|module| module.id);
-            let declared = spec.declared_generics();
-            let context = Context::new(declared.clone(), scope_self)
-                .with_gats(scope_gats)
-                .with_declared(declared);
-            self.records.contexts.intern(context.with_module(around))
-        });
+        let declared = spec.declared_generics();
+        let context = Context::new(declared.clone(), scope_self)
+            .with_gats(scope_gats)
+            .with_declared(declared);
+        let top_level = self.records.contexts.intern(context);
         self.records.top_levels.push(top_level);
         top_level
     }
@@ -1824,11 +1672,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         self.frame.local_scope = self.frame.local_scope.min(inner.local_scope);
         self.frame.mentions_root |= inner.mentions_root;
         self.frame.mentions_self |= inner.mentions_self;
-        self.frame.module_item |= inner.module_item;
-        if self.frame.module_path.is_none() {
-            self.frame.module_path = inner.module_path.clone();
-        }
-        self.frame.relative |= inner.relative;
         if self.frame.assoc_self.is_none() {
             self.frame.assoc_self = inner.assoc_self.clone();
         }
@@ -2003,89 +1846,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     }
 
     /// Returns `true` if a bare identifier argument in `ty` may be a const, so `ty` is to be leaked
-    /// whole. Not so for a type referring to an item of the module (the identifier is leaked as a
-    /// type, or it is an error if the item is beside it: see
-    /// [`AnalyzeVisitor::bare_beside_module_item()`]), a group or parentheses.
+    /// whole. Not so for a group or parentheses.
     fn holds_bare_ident(&self, ty: &Type, inner: &Frame) -> bool {
-        !inner.module_item
-            && !matches!(ty, Type::Group(_) | Type::Paren(_))
-            && has_ambiguous(&inner.effects)
-    }
-
-    /// Returns `true` if the path of `ty`, or the trait of a bound in it (`dyn Tr<..>`), names an
-    /// item of the module: `Local<MY_CONST>`, as opposed to `Other<Local, MY_CONST>`.
-    fn names_module_head(&self, ty: &Type) -> bool {
-        let item = |cause: Cause| {
-            cause.path().map_or(false, |path| {
-                !self.starts_with_generic(path)
-                    && !self.is_free_path(&cause)
-                    && self.is_module_path(path)
-            })
-        };
-        match ty {
-            Type::Path(TypePath { path, .. }) => item(Cause::type_path(path)),
-            Type::TraitObject(TypeTraitObject { bounds, .. })
-            | Type::ImplTrait(TypeImplTrait { bounds, .. }) => bounds.iter().any(|bound| {
-                matches!(bound, TypeParamBound::Trait(bound) if item(Cause::Trait(bound.path.clone())))
-            }),
-            _ => false,
-        }
-    }
-
-    /// Returns `true` if `ty` is a path whose parameters are known to be types: the std prelude
-    /// (`Option<..>`, if allowed) and the paths of `::core`, `::std` and `::alloc`
-    /// (`::core::result::Result<..>`), except for `array` (`IntoIter<T, N>`) and `simd`.
-    fn takes_only_types(&self, ty: &Type) -> bool {
-        let path = match ty {
-            Type::Path(TypePath { qself: None, path }) => path,
-            _ => return false,
-        };
-        let names: Vec<String> = path
-            .segments
-            .iter()
-            .map(|seg| ident_name(&seg.ident))
-            .collect();
-        match (
-            path.leading_colon.is_some(),
-            names.first().map(String::as_str),
-        ) {
-            (true, Some("core" | "std" | "alloc")) => {
-                !names.iter().any(|name| name == "array" || name == "simd")
-            }
-            (false, Some("Box" | "Vec" | "Option" | "Result")) => {
-                names.len() == 1 && self.is_free_path(&Cause::type_path(path))
-            }
-            _ => false,
-        }
-    }
-
-    /// Returns the bare identifiers that may be consts, which `ty` has as arguments of its path,
-    /// if it also names an item of the module that is not its own path (`Other<Local, MY_CONST>`).
-    ///
-    /// `ty` is not leaked whole then, as the copy declares the item again, so the identifiers
-    /// would be leaked as types, which fails if one is a const. Unlike `Local<MY_CONST>`: there the
-    /// module declares the path of the holder, and its parameter is a type, as a rule. Here the
-    /// path is another crate's, whose parameters are not known, so it is an error (see
-    /// [Bare identifiers and consts](crate::Leaker#bare-identifiers-and-consts)), unless it is a
-    /// path of the standard library, which takes types only ([`AnalyzeVisitor::takes_only_types()`]).
-    /// The identifiers of a type inside (`Other<Local<MY_CONST>>`) are not told: their holder is
-    /// decided apart.
-    fn bare_beside_module_item(&self, ty: &Type, inner: &Frame) -> Option<Vec<Type>> {
-        if !inner.module_item
-            || matches!(ty, Type::Group(_) | Type::Paren(_))
-            || self.names_module_head(ty)
-            || self.takes_only_types(ty)
-        {
-            return None;
-        }
-        let idents: Vec<Type> = ambiguous_types(&inner.effects)
-            .into_iter()
-            .filter(|ident| {
-                let text = quote!(#{unwrap_type_group(ident)}).to_string();
-                inner.bare_args.contains(&text)
-            })
-            .collect();
-        Some(idents).filter(|idents| !idents.is_empty())
+        !matches!(ty, Type::Group(_) | Type::Paren(_)) && has_ambiguous(&inner.effects)
     }
 
     /// Returns `true` if a bare identifier argument in `ty` may be a const, and `ty` can be leaked
@@ -2167,13 +1930,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             Ok(conflict) => conflict,
             Err(to) => return self.hand_off(to, inner),
         };
-        let (bare, beside) = self.bare_identifiers(ty, depth, &mut inner);
+        let bare = self.bare_identifiers(ty, depth, &mut inner);
         let mut own = (inner.min_depth == depth).then(|| self.own_context(ty, depth, &inner));
         if let Some(conflict) = self_conflict {
-            own = Some(Err(conflict));
-        }
-        if let Some(path) = beside {
-            let conflict = self.beside_conflict(own.take(), &path, bare.as_deref(), depth, &inner);
             own = Some(Err(conflict));
         }
         if let (Some(idents), Some(Err(conflict))) = (&bare, &own) {
@@ -2238,10 +1997,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     self.frame.effects.extend(primitive_effects(effects));
                 }
             }
-            // Not leaked itself: it depends on local generics, refers to an item of the module
-            // (which the Referrer shadows in the copy) or to `Self` in a default. Its parts can be.
+            // Not leaked itself: it depends on local generics or on `Self` in a default. Its parts
+            // can be.
             None if mentions_local
-                || inner.module_item
                 || (self.position.in_default.is_some() && inner.mentions_self) =>
             {
                 match optional {
@@ -2300,81 +2058,32 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     }
 
     /// A bare identifier argument may be a const, so the type holding it is leaked whole if it
-    /// can be. If it cannot because of an elided lifetime or `impl Trait`, or because its path
-    /// is an item of the module, the identifier is leaked as a type (the copy fails if it is a
-    /// const). Else there is no sound way: it is a conflict, the identifier being the cause.
-    /// Returns those identifiers when the type is a conflict for them, and the path of the
-    /// module's item beside them that the copy declares again, if any. The type owns its causes
-    /// then.
+    /// can be. If it cannot because of an elided lifetime or `impl Trait`, the identifier is leaked
+    /// as a type (the copy fails if it is a const). Else there is no sound way: it is a conflict,
+    /// the identifier being the cause. Returns those identifiers when the type is a conflict for
+    /// them. The type owns its causes then.
     fn bare_identifiers(
         &mut self,
         ty: &Type,
         depth: usize,
         inner: &mut Frame,
-    ) -> (Option<Vec<Type>>, Option<TokenStream>) {
+    ) -> Option<Vec<Type>> {
         let mut bare = None;
-        // A path of another crate that names an item of the module beside the identifier is never
-        // leaked whole (the copy declares the item again): it is a conflict, whatever else stops
-        // it. Its parameters are not known, so the identifier is not assumed to be a type, as it is
-        // for the module's own type.
-        let mut beside = None;
-        if inner.min_depth != depth {
-            if let Some(idents) = self.bare_beside_module_item(ty, inner) {
-                beside = inner.module_path.clone();
-                bare = Some(idents);
-                self.own_causes(inner.must_start, depth);
-                inner.min_depth = depth;
-            } else if self.holds_bare_ident(ty, inner) {
-                match self.own_context(ty, depth, inner) {
-                    Ok(_) => {
-                        self.own_causes(inner.must_start, depth);
-                        inner.min_depth = depth;
-                    }
-                    Err(_) if self.has_hard_cause(inner) => {
-                        bare = Some(ambiguous_types(&inner.effects));
-                        self.own_causes(inner.must_start, depth);
-                        inner.min_depth = depth;
-                    }
-                    Err(_) => (),
+        if inner.min_depth != depth && self.holds_bare_ident(ty, inner) {
+            match self.own_context(ty, depth, inner) {
+                Ok(_) => {
+                    self.own_causes(inner.must_start, depth);
+                    inner.min_depth = depth;
                 }
+                Err(_) if self.has_hard_cause(inner) => {
+                    bare = Some(ambiguous_types(&inner.effects));
+                    self.own_causes(inner.must_start, depth);
+                    inner.min_depth = depth;
+                }
+                Err(_) => (),
             }
         }
-        (bare, beside)
-    }
-
-    /// The conflict of a type that names `path`, an item of the module beside the identifiers
-    /// `bare`: `own` is the conflict that it has already, if any.
-    fn beside_conflict(
-        &self,
-        own: Option<std::result::Result<Context, CheckResult>>,
-        path: &TokenStream,
-        bare: Option<&[Type]>,
-        depth: usize,
-        inner: &Frame,
-    ) -> CheckResult {
-        let mut conflict = match own {
-            Some(Err(conflict)) => conflict,
-            _ => self.conflict_causes(inner.must_start, inner.impossible_start, depth),
-        };
-        if conflict.note.is_none() {
-            conflict.note = Some(format!(
-                "the type names `{}`, which the module declares and the copy declares again, \
-                 so it is not leaked as a whole",
-                tidy(path)
-            ));
-        }
-        // A name that the module declares is not leaked: the way out that only a module has.
-        if conflict.help.is_none() {
-            let name = bare
-                .and_then(|idents| idents.first())
-                .map(|ident| tidy(&quote!(#ident)))
-                .unwrap_or_default();
-            conflict.help = Some(format!(
-                "import `{0}` with an absolute `use` (`use ::my_crate::{0};`)",
-                name
-            ));
-        }
-        conflict
+        bare
     }
 
     /// A type leaked whole for its own path (`own`) cannot use a binder lifetime of the output: the
@@ -2446,11 +2155,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         inner: &mut Frame,
         no_own: bool,
     ) -> std::result::Result<Option<Context>, Handoff> {
-        let optional = if no_own
-            && inner.optional_depth == depth
-            && !inner.module_item
-            && !self.position.in_receiver
-        {
+        let optional = if no_own && inner.optional_depth == depth && !self.position.in_receiver {
             self.own_context(ty, depth, inner).ok()
         } else {
             None
@@ -2780,11 +2485,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             self.self_scope.nested,
             &Enclosing::default(),
         )
-        .ok()
-        .map(|context| match self.modules.last() {
-            Some(module) => context.with_module(Some(module.id)),
-            None => context,
-        });
+        .ok();
         Part {
             cause,
             whole: true,
@@ -3073,14 +2774,12 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         context: &Context,
         visit: impl FnOnce(&mut AnalyzeVisitor<'_, A>) -> R,
     ) -> R {
-        let modules = self.modules.clone();
         Self::throwaway(
             &mut *self.rule,
             &context.generics,
             Place::default(),
             |probe| {
                 probe.mode.check_env = false;
-                probe.modules = modules;
                 probe.self_scope.ty = context.self_ty.clone();
                 visit(probe)
             },
@@ -3519,7 +3218,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             self.records
                 .self_errors
                 .push(SelfMention::new(cause, self.place()));
-        } else if !self.is_context_free(&Cause::Trait(path.clone())) {
+        } else if !self.is_free_path(&Cause::Trait(path.clone())) {
             let paths = vec![Cause::Trait(without_arguments(path))];
             self.relative_path(cause.clone(), cause, paths);
             return true;
@@ -3531,12 +3230,8 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     fn impl_trait(&self, path: &Path) -> ImplTrait {
         ImplTrait {
             path: path.clone(),
-            absolute: self.is_context_free(&Cause::Trait(path.clone())),
+            absolute: self.is_free_path(&Cause::Trait(path.clone())),
         }
-    }
-
-    fn is_context_free(&self, cause: &Cause) -> bool {
-        self.is_free_path(cause) || cause.path().map_or(false, |path| self.is_module_path(path))
     }
 
     /// Returns `true` if `path` starts with `Self` or a generic in scope: the rule is
@@ -3580,86 +3275,8 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         self.rule.allow(&cause.bare(), self.place())
     }
 
-    fn is_relative(&self, cause: &Cause) -> bool {
-        cause.path().map_or(false, |path| {
-            path.leading_colon.is_none()
-                && !matches!(path.segments.first(), Some(seg) if seg.ident == "crate")
-                && !self.is_context_free(cause)
-        })
-    }
-
-    /// Returns `true` if `path` names an item of the analyzed module, as Rust resolves it.
-    fn is_module_path(&self, path: &Path) -> bool {
-        if self.modules.is_empty() || path.leading_colon.is_some() {
-            return false;
-        }
-        let mut current = self.modules.len() - 1;
-        let mut segments = path.segments.iter().peekable();
-        let explicit = match segments.peek() {
-            Some(seg) if seg.ident == "self" => {
-                segments.next();
-                true
-            }
-            Some(seg) if seg.ident == "super" => {
-                while matches!(segments.peek(), Some(seg) if seg.ident == "super") {
-                    segments.next();
-                    match current.checked_sub(1) {
-                        Some(parent) => current = parent,
-                        None => return false,
-                    }
-                }
-                true
-            }
-            _ => false,
-        };
-        let mut module: &ModuleNames = &self.modules[current].names;
-        let mut first = true;
-        loop {
-            let seg = match segments.next() {
-                Some(seg) => seg,
-                None => return false,
-            };
-            let name = ident_name(&seg.ident);
-            if !module.names.contains(&name) || (first && !explicit && self.is_generic(&seg.ident))
-            {
-                return false;
-            }
-            first = false;
-            match module.modules.get(&name) {
-                Some(inner) if segments.peek().is_some() => module = inner,
-                _ => return true,
-            }
-        }
-    }
-
     fn is_generic(&self, ident: &Ident) -> bool {
         self.scope_of(&ident_name(ident)).is_some()
-    }
-
-    fn with_module(&mut self, i: &ItemMod, f: impl FnOnce(&mut Self)) {
-        let items = match &i.content {
-            Some((_, items)) => items,
-            None => return f(self),
-        };
-        let parent = self.modules.last().map(|module| module.id);
-        let mut path = self
-            .modules
-            .last()
-            .and_then(|module| module.path.as_deref())
-            .map(<[Ident]>::to_vec)
-            .unwrap_or_default();
-        path.push(i.ident.clone());
-        let id = self
-            .records
-            .contexts
-            .intern_module(Some(path.clone()), None, parent);
-        self.modules.push(ModuleFrame {
-            id,
-            path: Some(Rc::from(path)),
-            names: Rc::new(module_names(items)),
-        });
-        f(self);
-        self.modules.pop();
     }
 
     fn params(&self) -> impl Iterator<Item = &GenericParam> {
@@ -4221,8 +3838,8 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         self.frame = frame;
         self.musts.truncate(musts);
         self.truncate_impossibles(impossibles);
-        // The contexts too: a module in the binder is interned again by the walk, and its number
-        // is the next one then, as if there was no probe.
+        // The contexts too: what the probe interned the walk interns again, with the numbers that
+        // come next then, as if there was no probe.
         self.records.truncate(&records);
         self.position.binder_probe.take().unwrap_or_default()
     }
@@ -4470,7 +4087,6 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
         let in_type = self.position.type_depth > 0;
         let starts_with_generic = self.starts_with_generic(i);
         let free = self.is_free_path(asked);
-        let in_module = !starts_with_generic && !free && self.is_module_path(i);
         if in_type {
             if starts_with_generic {
                 let first = i.segments.first();
@@ -4481,15 +4097,6 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
             if self_head(i).is_some() {
                 self.frame.mentions_self = true;
                 self.check_self_has_meaning(written.clone());
-            }
-            self.frame.module_item |= in_module;
-            if in_module && self.frame.module_path.is_none() {
-                // Without the arguments: `super::RC`, not `super::RC<u8, 3>`.
-                let mut name = i.clone();
-                for seg in name.segments.iter_mut() {
-                    seg.arguments = PathArguments::None;
-                }
-                self.frame.module_path = Some(quote!(#name));
             }
         }
         if free && !starts_with_generic {
@@ -4502,11 +4109,10 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
             if in_type && self.is_optional_path(asked) {
                 self.frame.optional_depth = self.frame.optional_depth.min(self.position.type_depth);
             }
-        } else if in_type && !starts_with_generic && !in_module {
+        } else if in_type && !starts_with_generic {
             let is_self = plain_self_head(i).is_some();
             if !is_self {
                 self.push_must(written.clone(), Some(asked.bare()));
-                self.frame.relative |= self.is_relative(asked);
             }
         }
         syn::visit::visit_path(self, i)
@@ -4724,9 +4330,28 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
     }
 
     fn visit_item_mod(&mut self, i: &ItemMod) {
-        // A module has no generics and no `Self`; its items are nested items with local generics.
-        self.with_item_of(&Generics::default(), None, false, Vec::new(), |visitor| {
-            visitor.with_module(i, |visitor| syn::visit::visit_item_mod(visitor, i))
+        // In an expression of a type (an array length), the module goes with the type: its items
+        // are nested items with local generics, and it has no `Self`.
+        if self.position.type_depth > 0 {
+            return self.with_item_of(&Generics::default(), None, false, Vec::new(), |visitor| {
+                syn::visit::visit_item_mod(visitor, i)
+            });
+        }
+        // As an item, it is not analyzed: its names would be the copy's own in it.
+        let ident = &i.ident;
+        let cause = Cause::Unreadable(quote!(mod #ident));
+        self.push_error(CheckResult {
+            headline: Some(format!("cannot analyze the module `{}`", ident)),
+            note: Some(
+                "the Leaker analyzes no module: nothing in it is leaked, and the copy writes it as \
+                 it is"
+                    .to_string(),
+            ),
+            help: Some(
+                "analyze each item of the module with its own call, or move it out of the item"
+                    .to_string(),
+            ),
+            ..CheckResult::conflict(vec![cause.clone()], vec![cause], Reason::Unreadable)
         });
     }
 
@@ -4767,8 +4392,6 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
                     .filter(|cause| self.is_relative_path(cause))
                     .map(Cause::bare);
                 self.push_must(Cause::Type(i.clone()), path);
-                // It is expanded in the module where it is written, whatever its path is.
-                self.frame.relative |= !self.modules.is_empty() || self.is_relative(&cause);
                 // The generics (and `Self`) are matched by name.
                 let mut names = HashSet::new();
                 token_names(quote!(#i), &mut names);
@@ -5046,7 +4669,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
                 }
             }
             Type::Path(TypePath { qself: None, path })
-                if self.is_context_free(&Cause::type_path(path)) => {}
+                if self.is_free_path(&Cause::type_path(path)) => {}
             ty => {
                 // The Visitor does not rewrite the type of a const parameter: no part. Its path
                 // is written as it is.
@@ -5230,7 +4853,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
         }
         if (i.qself.is_none() && self.starts_with_generic(&i.path))
             || is_self
-            || self.is_context_free(&causes.0)
+            || self.is_free_path(&causes.0)
         {
             self.walk_expr_path(i, &causes)
         } else {
@@ -5526,7 +5149,7 @@ impl<'ast> Visit<'ast> for Lifetimes {
 struct ImplTrait {
     /// The path as written.
     path: Path,
-    /// The path does not depend on the context (see [`AnalyzeVisitor::is_context_free()`]), so the
+    /// The path does not depend on the context (see [`AnalyzeVisitor::is_free_path()`]), so the
     /// copy can name the trait with it.
     absolute: bool,
 }
@@ -6280,69 +5903,6 @@ fn is_bare_ident(ty: &Type) -> bool {
     }
 }
 
-/// The names that a module declares, and those of the modules inside it.
-#[derive(Clone, Default)]
-pub(crate) struct ModuleNames {
-    /// The names that the module declares.
-    names: HashSet<String>,
-    /// The modules inside it, by name.
-    modules: HashMap<String, ModuleNames>,
-}
-
-/// Returns the names declared directly in `items`: items, `macro_rules!` macros, and names imported
-/// by `use` with an absolute path. Other imports (`use super::X`) are outside the module.
-pub(crate) fn module_names(items: &[Item]) -> ModuleNames {
-    let mut module = ModuleNames::default();
-    let names = &mut module.names;
-    for item in items {
-        match item {
-            Item::Mod(ItemMod {
-                ident,
-                content: Some((_, items)),
-                ..
-            }) => {
-                names.insert(ident_name(ident));
-                module
-                    .modules
-                    .insert(ident_name(ident), module_names(items));
-            }
-            Item::Struct(ItemStruct { ident, .. })
-            | Item::Enum(ItemEnum { ident, .. })
-            | Item::Union(ItemUnion { ident, .. })
-            | Item::Trait(ItemTrait { ident, .. })
-            | Item::TraitAlias(ItemTraitAlias { ident, .. })
-            | Item::Type(ItemType { ident, .. })
-            | Item::Const(ItemConst { ident, .. })
-            | Item::Static(ItemStatic { ident, .. })
-            | Item::Mod(ItemMod { ident, .. })
-            | Item::Fn(ItemFn {
-                sig: Signature { ident, .. },
-                ..
-            })
-            | Item::Macro(ItemMacro {
-                ident: Some(ident), ..
-            }) => {
-                names.insert(ident_name(ident));
-            }
-            Item::Use(ItemUse {
-                leading_colon,
-                tree,
-                ..
-            }) => {
-                let is_absolute = leading_colon.is_some()
-                    || matches!(tree, UseTree::Path(UsePath { ident, .. }) if ident == "$crate");
-                if is_absolute {
-                    let mut imported = Vec::new();
-                    use_names(tree, None, &mut imported);
-                    names.extend(imported.iter().map(ident_name));
-                }
-            }
-            _ => (),
-        }
-    }
-    module
-}
-
 // The check of the values of an item, for
 // [`Leaker::check_values`](crate::Leaker::check_values): the default of an associated const, the
 // value of a const or a static, and the body of a function.
@@ -6551,7 +6111,7 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
         if self.is_local(path) || self.visitor.starts_with_generic(path) {
             return true;
         }
-        if !self.visitor.is_context_free(cause) {
+        if !self.visitor.is_free_path(cause) {
             return false;
         }
         // A primitive name is copied as it is, and may be shadowed: `Leaker::assertions()`.
@@ -6735,7 +6295,7 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
         };
         let path = Path::from(ident.clone());
         let root = Cause::Unknown(path.clone());
-        if !absolute && !self.is_local(&path) && !self.visitor.is_context_free(&root) {
+        if !absolute && !self.is_local(&path) && !self.visitor.is_free_path(&root) {
             // What the root names (a crate, a module, a type, a trait) is not known.
             self.relative_of(Cause::expr_path(&path), Some(root), None);
         }

@@ -26,7 +26,8 @@ fn config() -> Rules<impl Allow + Clone> {
     Rules::new().primitive().prelude()
 }
 
-/// Analyzes a whole item the way a downstream macro does.
+/// Analyzes a whole item the way a downstream macro does. A `mod` stands for the items it holds,
+/// nested in a scope of no generics: each has its own `Self`.
 fn analyze(item: &Item) -> (Referrer, ContextId) {
     let (result, context) = analyze_result(item);
     (result.into_referrer(), context)
@@ -41,7 +42,15 @@ fn analyze_result(item: &Item) -> (LeakerResult, ContextId) {
         Item::Union(i) => leaker.intern_union(i),
         Item::Trait(i) => leaker.intern_trait(i),
         Item::Impl(i) => leaker.intern_impl(i),
-        Item::Mod(i) => leaker.intern_mod(i),
+        Item::Mod(i) => {
+            leaker
+                .enter_generics(&Generics::default(), |view| {
+                    for item in &i.content.as_ref().unwrap().1 {
+                        view.visit_item(item);
+                    }
+                })
+                .0
+        }
         _ => panic!("unsupported item"),
     };
     let result = leaker.result();
@@ -55,8 +64,8 @@ fn analyze_result(item: &Item) -> (LeakerResult, ContextId) {
 }
 
 /// Items with lifetimes and their bounds, consts, `?Sized`, defaults, the three meanings of `Self`
-/// (none, the implementor of a trait, a type), `Self: 'a`, `Self::A` under a reference, a module and
-/// an optional entry.
+/// (none, the implementor of a trait, a type), `Self: 'a`, `Self::A` under a reference, items
+/// nested in a scope and an optional entry.
 fn samples() -> Vec<Item> {
     vec![
         parse_quote! {
@@ -173,8 +182,8 @@ fn a_referrer_with_no_entry_is_empty() {
     assert_eq!(referrer.iter().count(), 1);
 }
 
-/// The impl of an entry for a marker declares nothing: no generics, where clause or module, and
-/// `()` as its arguments.
+/// The impl of an entry for a marker declares nothing: no generics or where clause, and `()` as its
+/// arguments.
 fn assert_declares_nothing(r: &RepeaterImpl) {
     assert!(r.generics.params.is_empty());
     assert!(r
@@ -183,12 +192,11 @@ fn assert_declares_nothing(r: &RepeaterImpl) {
         .as_ref()
         .map_or(true, |clause| clause.predicates.is_empty()));
     assert_eq!(s(&common::impl_args(r)), "()");
-    assert!(r.module.is_none());
 }
 
 /// The sumtype shape: `Leaker::new()` (no allowed path) and `intern_trait(..)` on a trait
 /// whose only entries are the absolute types of external crates. `iter()` counts them, and an impl
-/// of the Repeater for a marker declares nothing (no generics, no `Self`, no module), with the
+/// of the Repeater for a marker declares nothing (no generics, no `Self`), with the
 /// entry as the type. A type that names `Self` makes the call fail and the macro throws the
 /// Leaker away.
 #[test]
@@ -215,7 +223,6 @@ fn a_trait_with_only_external_types_has_entries_that_declare_nothing_for_a_marke
     );
     let marker: Type = parse_quote!(__Marker);
     for (ix, ty) in common::types(&referrer).enumerate() {
-        assert!(common::in_module(common::entry(&referrer, ix)).is_none());
         assert!(common::entry(&referrer, ix).self_ty.is_none());
         assert!(common::entry(&referrer, ix).generics.params.is_empty());
         // The impl for the marker, which is what the macro emits (`type Type = #ty`).
@@ -305,7 +312,6 @@ fn repeater_impl_for_an_entry_that_does_not_name_self() {
         t(parse_quote!((&'a (), T, U, &'a T, &'a U)))
     );
     assert_eq!(s(&r.ty), "& 'a Wrap < T , U >");
-    assert_eq!(r.module, None);
     // For a marker, nothing else is declared.
     let marker: Type = parse_quote!(crate::Marker);
     let r = result
@@ -457,40 +463,6 @@ fn repeater_impl_for_a_type_is_for_the_type() {
         .unwrap()
         .remove(wrap);
     assert_eq!(s(&r.self_ty), "__S");
-}
-
-#[test]
-fn repeater_impl_in_a_module_tells_the_module() {
-    let (result, context) = analyze_result(&parse_quote! {
-        mod m { pub struct S(pub Rel); pub mod n { pub struct T(pub Rel); } }
-    });
-    let param: Ident = parse_quote!(__S);
-    let modules: Vec<Option<ModuleScope>> = result
-        .repeater_impls(&Projection::new(
-            repeater(),
-            7,
-            ImplSelf::Param(param.clone()),
-        ))
-        .unwrap()
-        .into_iter()
-        .map(|r| r.module)
-        .collect();
-    assert_eq!(modules.len(), 2);
-    assert!(modules.iter().all(Option::is_some));
-    assert_ne!(modules[0], modules[1]);
-    // The module's own context: `Itself`, with the path from the root.
-    let paths: Vec<Vec<String>> = modules
-        .iter()
-        .map(|module| match module {
-            Some(ModuleScope::Itself {
-                path: Some(path), ..
-            }) => path.iter().map(|ident| ident.to_string()).collect(),
-            other => panic!("not a module of intern_mod(): {:?}", other),
-        })
-        .collect();
-    assert!(paths.contains(&vec![]), "{:?}", paths);
-    assert!(paths.contains(&vec!["n".to_string()]), "{:?}", paths);
-    let _ = context;
 }
 
 /// A const parameter is encoded into the slots of the Repeater, on both sides: an array length for
@@ -1152,7 +1124,7 @@ fn replace_self(text: &str) -> String {
 }
 
 /// The pieces of the impl of every entry of every sample, for a parameter that stands for the
-/// implementor: the entry and the module, the argument of the Repeater (the one that
+/// implementor: the entry, the argument of the Repeater (the one that
 /// `Projection::of()` writes with the same `Self`), the type (`Self` is the parameter where
 /// the implementor is one), the type it is for, and the generics it declares: the generics of the
 /// context with the parameter for the implementor before the consts, no bound that the argument
@@ -1197,19 +1169,6 @@ fn the_pieces_of_every_repeater_impl_agree_with_the_entry_and_its_projection() {
                 _ => replace_self(&leaked),
             };
             assert_eq!(s(&r.ty), leaked, "{}", what);
-
-            // The module is the module's own context, `Itself`, of the one that the entry is in.
-            assert!(
-                matches!(r.module, None | Some(ModuleScope::Itself { .. })),
-                "{}",
-                what
-            );
-            assert_eq!(
-                r.module.as_ref().map(ModuleScope::id),
-                common::in_module(context),
-                "{}",
-                what
-            );
 
             // The generics: those of the context and the parameter for the implementor.
             let declares_param = r.generics.params.iter().any(
@@ -1439,9 +1398,11 @@ fn display_uses_the_headline_of_the_cause() {
         err,
         "the bound of `T` mentions a `Self` which has no name here",
     );
-    // `Self` in a module.
+    // `Self` in a scope that is not an item.
     let mut leaker = Leaker::new();
-    leaker.enter_mod("m", [], |view| view.visit_type(&parse_quote!(Self)));
+    leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_type(&parse_quote!(Self))
+    });
     let result = leaker.result();
     let err = result.errors();
     check(err, "`Self` has no meaning here");
@@ -1468,7 +1429,7 @@ fn display_uses_the_headline_of_the_cause() {
 
 /// The samples, and the shapes that bucketing tells apart: a trait whose generics name `Self` and
 /// whose default does not, a struct whose bound names its own `Self` (`SelfRequirement::Any`), an
-/// impl and a module with a nested trait.
+/// impl and nested items with a trait.
 fn bucket_samples() -> Vec<Item> {
     let mut items = samples();
     items.extend([

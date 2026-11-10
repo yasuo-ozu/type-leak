@@ -12,8 +12,7 @@ use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::{
-    Cause, ContextId, ImplSelf, Leaker, LeakerResult, ModuleScope, Projection, Referrer,
-    SelfRequirement,
+    Cause, ContextId, ImplSelf, Leaker, LeakerResult, Projection, Referrer, SelfRequirement,
 };
 
 /// The tag of the format of a serialized Referrer, which it starts with.
@@ -321,20 +320,6 @@ fn the_intern_methods_return_the_top_level_context() {
     assert_eq!(top_level, id(2));
     check(leaker, top_level, &["Wrap < T >", "Rel"]);
 
-    let item: ItemMod = parse_quote! {
-        mod m { pub struct S<T> { a: Wrap<T> } pub mod inner { pub struct C { a: Rel } } }
-    };
-    let mut leaker = Leaker::new();
-    let top_level = leaker.intern_mod(&item);
-    // The module is numbered when it is entered, and `inner` when it is found, before the types.
-    assert_eq!(top_level, id(0));
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(leaked(&referrer), ["Wrap < T >", "Rel"]);
-    assert_eq!(ids(&referrer), [0, 1, 2, 3]);
-    let mut again = Leaker::new();
-    assert_eq!(again.intern_mod(&item), top_level);
-    check(again, top_level, &["Wrap < T >", "Rel"]);
-
     // A call with an error returns its id as well, and the error is in the result.
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_struct(&parse_quote! { struct S { a: RelB<'_> } });
@@ -362,7 +347,6 @@ fn ids_of_dropped_contexts_are_gaps() {
     assert_eq!(s(&common::entry(&referrer, 2).generics), "< U >");
     for (_, _, context) in referrer.iter() {
         assert_eq!(context.self_ty.as_ref(), None);
-        assert_eq!(common::in_module(context), None);
     }
     assert_eq!(s(&common::entry(&referrer, 0).generics), "");
 
@@ -403,12 +387,6 @@ fn the_lookups_of_a_context_it_does_not_have_panic() {
             "one context",
             leak(|leaker| {
                 leaker.intern_struct(&parse_quote! { struct S(Rel); });
-            }),
-        ),
-        (
-            "modules",
-            leak(|leaker| {
-                leaker.intern_mod(&parse_quote! { mod m { pub struct A { y: Rel } } });
             }),
         ),
     ];
@@ -472,7 +450,6 @@ fn the_contexts_that_exist_do_not_panic() {
     for (_, _, context) in referrer.iter() {
         assert_eq!(context.self_ty.as_ref(), None);
         assert!(context.self_outlives.as_slice().is_empty());
-        assert_eq!(common::in_module(context), None);
     }
     // `Wrap<U>` uses `<U>`: in `Tr<A, B>` that is `B`.
     let params: Generics = parse_quote!(<T, U>);
@@ -664,29 +641,25 @@ fn serialization_with_gaps() {
 
 #[test]
 fn serialization_with_gaps_keeps_the_requirements() {
-    // The generics, `Self` and the module of a group are those of its id, whichever it is.
+    // The generics and `Self` of a group are those of its id, whichever it is.
     let text = format!(
-        "\"{}\" 6 mod {{ path = [] }} ; () mod 0 ; (Rel) # 4 < T > ; Self : Tr < T > ; \
-         (Wrap < T , Self >) # 6 Self = W ; (Rel2 < Self >) \
-         # 8 mod {{ path = [a , b] , parent = 0 }} ; () mod 8 ; (Rel3)",
+        "\"{}\" 4 # 1 (Rel) # 4 < T > ; Self : Tr < T > ; \
+         (Wrap < T , Self >) # 6 Self = W ; (Rel2 < Self >) # 9 (Rel3)",
         version()
     );
     let result: LeakerResult = parse_str(&text).unwrap();
-    let referrer = result.clone().into_referrer();
-    assert_eq!(ids(&referrer), [0, 1, 4, 6, 8, 9]);
+    let referrer = result.into_referrer();
+    assert_eq!(ids(&referrer), [1, 4, 6, 9]);
     assert_eq!(referrer.to_token_stream().to_string(), text);
     assert_eq!(
         parse2::<Referrer>(referrer.to_token_stream()).unwrap(),
         referrer
     );
-    let [c0, c1, c4, c8, c9] = [id(0), id(1), id(4), id(8), id(9)];
+    let [c1, c4, c9] = [id(1), id(4), id(9)];
     assert_eq!(common::entry_id(&referrer, 0), c1);
     assert_eq!(common::entry_id(&referrer, 1), c4);
     assert_eq!(common::entry_id(&referrer, 3), c9);
     // The entries 0 to 3 are in the contexts 1, 4, 6 and 9.
-    assert_eq!(common::in_module(common::entry(&referrer, 0)), Some(c0));
-    assert_eq!(common::entry_module_path(&result, 0), Some(vec![]));
-    assert_eq!(common::in_module(common::entry(&referrer, 1)), None);
     assert_eq!(s(&common::entry(&referrer, 1).generics), "< T >");
     assert_eq!(s(&common::entry(&referrer, 2).generics), "");
     assert!(matches!(
@@ -698,16 +671,6 @@ fn serialization_with_gaps_keeps_the_requirements() {
         Some(SelfRequirement::Type(_))
     ));
     assert_eq!(common::entry(&referrer, 3).self_ty.as_ref(), None);
-    assert_eq!(common::in_module(common::entry(&referrer, 3)), Some(c8));
-    assert_eq!(
-        common::entry_module_path(&result, 3),
-        Some(vec![parse_quote!(a), parse_quote!(b)])
-    );
-    // The module of an entry is a module's own context, which has the id of the module.
-    assert!(matches!(
-        common::entry_module(&result, 3),
-        Some(ModuleScope::Itself { id, parent: Some(parent), .. }) if id == c8 && parent == c0
-    ));
 
     // The requirements survive the removal of a context (here, one of a trait).
     let tr: ItemTrait = parse_quote! {
@@ -913,41 +876,6 @@ fn the_ids_read_from_the_serialized_form_agree_with_the_referrer() {
     assert_eq!(ids(&text), [0, 1, 2, 3]);
     assert_eq!(entries_of(&text), [0, 2]);
 
-    // Modules: the own context of a module has no entry and declares its path and parent in braces
-    // (a hint too), and the contexts of the entries in it say `mod 1 ;`.
-    let module: ItemMod = parse_quote! {
-        mod m {
-            pub struct A { y: Rel }
-            pub mod inner { pub struct C { y: Rel, z: Wrap<u8> } }
-        }
-    };
-    let mut leaker = Leaker::new();
-    let root = leaker.intern_mod(&module);
-    let (hinted, ()) = leaker.enter_mod("h", [], |view| view.visit_type(&parse_quote!(Rel2)));
-    let result = leaker.result();
-    let modules = result.clone().finish().unwrap();
-    let text = modules.to_token_stream().to_string();
-    assert!(text.contains("mod { path = [] }"), "{}", text);
-    assert!(text.contains("mod { hint = \"h\" }"), "{}", text);
-    assert!(text.contains("parent = "), "{}", text);
-    check_serialized_ids("modules", &modules, &[root, hinted], true);
-    // Each of the three modules has an entry: the module of an entry is the module's own context,
-    // and is listed.
-    let listed = common::context_ids(&modules);
-    let mut own: BTreeSet<ContextId> = BTreeSet::new();
-    for ix in 0..modules.iter().count() {
-        match common::entry_module(&result, ix) {
-            Some(ModuleScope::Itself { id, .. }) => {
-                assert_eq!(common::in_module(common::entry(&modules, ix)), Some(id));
-                assert!(listed.contains(&id), "the entry {}", ix);
-                own.insert(id);
-            }
-            other => panic!("the module of the entry {}: {:?}", ix, other),
-        }
-    }
-    assert_eq!(own.len(), 3, "{:?}", own);
-    assert!(own.contains(&root) && own.contains(&hinted));
-
     // The items of a declaration end at the `;` of the top level, whatever their groups hold: the
     // parentheses of `Fn(u8)`, the brackets of `[T; 3]`, `Self`, its outlives, and a GAT.
     let items: Vec<(&str, Item)> = vec![
@@ -970,15 +898,20 @@ fn the_ids_read_from_the_serialized_form_agree_with_the_referrer() {
         ),
         (
             "Self is any type",
-            parse_quote! { mod m { struct N<T: ::core::convert::AsRef<Self>>(Rel<T>); } },
+            parse_quote! { struct N<T: ::core::convert::AsRef<Self>>(Rel<T>); },
         ),
     ];
     for (shape, item) in items {
         let mut leaker = Leaker::new();
-        let top_level = match &item {
-            Item::Trait(item) => leaker.intern_trait(item),
-            Item::Struct(item) => leaker.intern_struct(item),
-            Item::Mod(item) => leaker.intern_mod(item),
+        let top_level = match (&item, shape) {
+            (Item::Trait(item), _) => leaker.intern_trait(item),
+            // A struct nested in a scope, the only one with this `Self`.
+            (Item::Struct(_), "Self is any type") => {
+                leaker
+                    .enter_generics(&Generics::default(), |view| view.visit_item(&item))
+                    .0
+            }
+            (Item::Struct(item), _) => leaker.intern_struct(item),
             _ => unreachable!(),
         };
         let referrer = leaker.result().finish().unwrap();
@@ -1019,7 +952,6 @@ fn the_reader_of_the_serialized_form_does_not_guess() {
         "(A)".to_string(),
         format!("\"{}\" Self ; < T > ; (A)", tag),
         format!("\"{}\" < T > ; < U > ; (A)", tag),
-        format!("\"{}\" mod 1 ; Self ; (A)", tag),
         format!("\"{}\" < T > (A)", tag),
         format!("\"{}\" < T > ;", tag),
         format!("\"{}\" 2 (A) # 0 < T > ; (B)", tag),

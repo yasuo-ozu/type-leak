@@ -401,45 +401,6 @@ fn check_ty(view: &mut View<'_, '_>, ty: Type) -> CheckResult {
 }
 
 #[test]
-fn check_in_a_module_does_not_report_the_names_it_declares() {
-    let mut leaker = Leaker::new();
-    let local: Type = parse_quote!(Local);
-    // Outside a module it is a cause: the path means something else where the copy is.
-    let outside = check_in(&mut leaker, &local, &Generics::default());
-    assert_eq!(kind(&outside), "MustIntern");
-    assert_eq!(strings(&outside.must), ["Local"]);
-    // In the module that declares it, it is not: the copy has the module's items too.
-    let (_, results) = leaker.enter_mod("m", [parse_quote!(Local)], |view| {
-        [
-            check_ty(view, parse_quote!(Local)),
-            check_ty(view, parse_quote!(self::Local)),
-            check_ty(view, parse_quote!(::p::W<(Local,)>)),
-            check_ty(view, parse_quote!(Other)),
-            check_ty(view, parse_quote!(super::Local)),
-        ]
-    });
-    let kinds: Vec<_> = results.iter().map(kind).collect();
-    assert_eq!(
-        kinds,
-        ["Neutral", "Neutral", "Neutral", "MustIntern", "MustIntern"]
-    );
-    assert_eq!(strings(&results[3].must), ["Other"]);
-    assert_eq!(strings(&results[4].must), ["super :: Local"]);
-    // A module declares only its own names: not the ones of the module around.
-    let (_, inner) = leaker.enter_mod("m", [parse_quote!(Local)], |view| {
-        view.enter_mod("n", [parse_quote!(Deeper)], |view| {
-            [
-                check_ty(view, parse_quote!(Deeper)),
-                check_ty(view, parse_quote!(Local)),
-            ]
-        })
-        .1
-    });
-    assert_eq!(kind(&inner[0]), "Neutral");
-    assert_eq!(kind(&inner[1]), "MustIntern");
-}
-
-#[test]
 fn check_self_in_a_struct_scope() {
     let item: ItemStruct = parse_quote!(
         struct S<T>(T);
@@ -468,7 +429,7 @@ fn check_self_in_a_struct_scope() {
 }
 
 #[test]
-fn check_self_has_no_meaning_in_generics_and_modules() {
+fn check_self_has_no_meaning_in_generics() {
     let generics: Generics = parse_quote!(<T>);
     let mut leaker = Leaker::new();
     let checks = |view: &mut View<'_, '_>| {
@@ -480,33 +441,30 @@ fn check_self_has_no_meaning_in_generics_and_modules() {
             check_ty(view, parse_quote!(())),
         ]
     };
-    let (_, in_generics) = leaker.enter_generics(&generics, checks);
-    let (_, in_module) = leaker.enter_mod("m", [], checks);
-    for results in [in_generics, in_module] {
-        let [own, assoc, in_rel, in_path, plain] = results;
-        // It is an impossible cause, as written, and the note tells why.
-        assert_eq!(kind(&own), "MustNotIntern");
-        assert_eq!(strings(&own.impossible), ["Self"]);
-        let note = own.note.expect("a note");
-        assert!(note.starts_with("`Self` has no meaning here"), "{}", note);
-        // And the help tells what to write.
-        let help = own.help.expect("a help");
-        assert_eq!(help, "write the type instead of `Self`");
-        assert_eq!(strings(&assoc.impossible), ["Self :: Item"]);
-        assert!(assoc.note.is_some());
-        // A type that holds it is a conflict if it is a cause itself, and its parts can be leaked
-        // otherwise.
-        assert_eq!(kind(&in_rel), "Conflict");
-        assert_eq!(in_rel.must.len(), 1);
-        assert_eq!(strings(&in_rel.impossible), ["Self"]);
-        assert!(in_rel.is_own);
-        assert_eq!(kind(&in_path), "MustNotIntern");
-        assert!(!in_path.is_own && in_path.note.is_some());
-        // The types without it are not affected.
-        assert_eq!(kind(&plain), "Neutral");
-        assert!(plain.note.is_none());
-    }
-    // `Self` is that of the item in a scope nested in one, and in a module nested in none.
+    let (_, results) = leaker.enter_generics(&generics, checks);
+    let [own, assoc, in_rel, in_path, plain] = results;
+    // It is an impossible cause, as written, and the note tells why.
+    assert_eq!(kind(&own), "MustNotIntern");
+    assert_eq!(strings(&own.impossible), ["Self"]);
+    let note = own.note.expect("a note");
+    assert!(note.starts_with("`Self` has no meaning here"), "{}", note);
+    // And the help tells what to write.
+    let help = own.help.expect("a help");
+    assert_eq!(help, "write the type instead of `Self`");
+    assert_eq!(strings(&assoc.impossible), ["Self :: Item"]);
+    assert!(assoc.note.is_some());
+    // A type that holds it is a conflict if it is a cause itself, and its parts can be leaked
+    // otherwise.
+    assert_eq!(kind(&in_rel), "Conflict");
+    assert_eq!(in_rel.must.len(), 1);
+    assert_eq!(strings(&in_rel.impossible), ["Self"]);
+    assert!(in_rel.is_own);
+    assert_eq!(kind(&in_path), "MustNotIntern");
+    assert!(!in_path.is_own && in_path.note.is_some());
+    // The types without it are not affected.
+    assert_eq!(kind(&plain), "Neutral");
+    assert!(plain.note.is_none());
+    // `Self` is that of the item in a scope nested in one.
     let item: ItemStruct = parse_quote!(
         struct S<T>(T);
     );
@@ -515,10 +473,6 @@ fn check_self_has_no_meaning_in_generics_and_modules() {
     });
     assert_eq!(kind(&results[0]), "Neutral");
     assert_eq!(kind(&results[4]), "Neutral");
-    let (_, results) = leaker.enter_type(&item.ident, &item.generics, |view| {
-        view.enter_mod("m", [], checks).1
-    });
-    assert_eq!(kind(&results[0]), "MustNotIntern");
 }
 
 #[test]
@@ -578,25 +532,6 @@ fn check_tells_an_optional_entry_of_an_external_crate() {
     let result = check_in(&mut leaker, &parse_quote!(::foo::X), &generics);
     assert_eq!(kind(&result), "Neutral");
     assert!(!result.optional);
-    // The names of the module are not copied by the Referrer, so a type using one is not leaked
-    // alone, and its path is not an optional entry either.
-    let mut leaker = Leaker::new();
-    let (_, results) = leaker.enter_mod("m", [parse_quote!(Local)], |view| {
-        [
-            check_ty(view, parse_quote!(::foo::W<(Local,)>)),
-            check_ty(view, parse_quote!(::foo::W<(Other,)>)),
-        ]
-    });
-    assert!(results[0].must.is_empty() && !results[0].optional);
-    assert_eq!(strings(&results[1].must), ["Other"]);
-    assert!(results[1].optional);
-    let result = check_in(
-        &mut leaker,
-        &parse_quote!(::foo::W<(Local,)>),
-        &Generics::default(),
-    );
-    assert_eq!(strings(&result.must), ["Local"]);
-    assert!(result.optional);
 }
 
 #[test]
@@ -697,8 +632,7 @@ fn check_reports_the_conflict_a_scope_reports() {
 }
 
 /// Types that a visit would record in some way: entries, optional entries, conflicts, errors for
-/// `Self`, the probe of a binder, and a module found in an array length; and `&'static u8`, which it
-/// would not.
+/// `Self` and the probe of a binder; and `&'static u8`, which it would not.
 fn recording_types() -> Vec<Type> {
     vec![
         parse_quote!(Rel),
@@ -714,17 +648,6 @@ fn recording_types() -> Vec<Type> {
         parse_quote!(&'a Rel<T>),
         parse_quote!(&'static u8),
         parse_quote!(for<'x> fn(Rel<'x>, &u8) -> &'x u8),
-        parse_quote!(
-            ::foo::W<
-                [u8; {
-                    mod inner {
-                        pub const N: usize = 1;
-                    }
-                    inner::N
-                }],
-            >
-        ),
-        parse_quote!(Local),
     ]
 }
 
@@ -749,7 +672,7 @@ fn analyze(checked: bool) -> (Vec<ContextId>, Referrer) {
         view.visit_type(&parse_quote!(Rel<T>));
         checks(view);
         view.visit_type(&parse_quote!(::foo::W<(Rel2<T>,)>));
-        let (id, ()) = view.enter_mod("m", [parse_quote!(Local)], |view| {
+        let (id, ()) = view.enter_generics(&Generics::default(), |view| {
             checks(view);
             view.visit_type(&parse_quote!(Rel3));
             checks(view);
@@ -764,7 +687,7 @@ fn analyze(checked: bool) -> (Vec<ContextId>, Referrer) {
     });
     ids.push(id);
     // The scopes after it get the ids that the ones before left free.
-    let (id, ()) = leaker.enter_mod("n", [], |view| {
+    let (id, ()) = leaker.enter_generics(&Generics::default(), |view| {
         checks(view);
         view.visit_type(&parse_quote!(Rel5));
     });
