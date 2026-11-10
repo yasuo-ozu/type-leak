@@ -159,6 +159,17 @@ fn a_generic_named_like_the_parameter_of_the_implementor() {
     assert_eq!(got, Wrap((9, 5)));
 }
 
+/// Fixture 9252 (F90): `Proj9252<T: Iterator>` has `T::Item` in a signature, and the Referrer's
+/// crate implements it for `::std::vec::IntoIter<u8>`. `<IntoIter<u8>>::Item`, which the macro wrote
+/// before the fix, is E0223 ("ambiguous associated type") there.
+#[test]
+fn the_associated_type_of_a_concrete_argument_is_written_with_its_trait() {
+    use type_leak_test_leaker::s::{Proj9252, Wrap};
+    let c = Concrete(Inner);
+    let got: Option<u8> = <Concrete as Proj9252<::std::vec::IntoIter<u8>>>::f(&c, Wrap(7));
+    assert_eq!(got, Some(7));
+}
+
 #[test]
 fn lifetimes_trait_objects_and_projections() {
     use type_leak_test_leaker::s::{DynRoot, Out, RelImpl, Wrap, Q};
@@ -603,6 +614,16 @@ fn every_item_kind_is_leaked_across_crates() {
             __tl_report_9218!(),
             rejected("struct", "useabsolutepath:'RelPoint'"),
         ),
+        // F85: a relative constant in a value in the default of a type parameter is rejected with
+        // `check_values` (the Leaker did not read it, and the copy could not resolve `REL9250`).
+        (
+            9250,
+            __tl_report_9250!(),
+            rejected("struct", "useabsolutepath:'REL9250'"),
+        ),
+        // F89: the argument of a generic associated type replaces its parameter in the relations of its
+        // where clause, also when it is no path (`&'x u8`) and a generic of the method has the name.
+        (9251, __tl_report_9251!(), ok("trait", 1, 2, 2)),
         // F68: the self type of an impl is a type of the Leaker's crate by an absolute path, a bound
         // of a generic names an optional type and another `Self`, and a predicate is on an entry
         // that uses the generic: the self type is no entry, and every copy writes it as it is.
@@ -2061,6 +2082,35 @@ fn the_names_of_the_prelude_of_every_edition_are_accepted_in_a_trait() {
     let items = [1u8, 2, 3];
     assert_eq!(l::PreludeNames::count(&Original, items.iter()), 6);
     assert_eq!(r::PreludeNamesCopy::count(&Copy, items.iter()), 6);
+}
+
+/// Fixture 9249 (F83): the default methods of `BlockNames` declare `Block9249` with `use
+/// a::b::{self}` and `len9249` with a `const fn`, in a block. The types in the body are the local
+/// ones, and the copy keeps them. The Referrer replaced them by the entries of the parameters
+/// (`Block9249`, `[u8; len9249()]`), which is E0308 in the Referrer's crate (the struct for the
+/// enum, an array of 2 for one of 3). The original and the copy compute the same.
+#[test]
+fn a_block_that_imports_with_self_or_declares_a_fn_hides_the_entries_that_name_it() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::kinds as r;
+
+    assert_eq!(
+        reported(9249, __tl_report_9249!()),
+        ok("trait", 2, 4, 4),
+        "{}",
+        __tl_report_9249!()
+    );
+
+    struct Original;
+    impl l::BlockNames for Original {}
+    struct Copy;
+    impl r::BlockNamesCopy for Copy {}
+
+    assert!(l::BlockNames::imported(&Original, l::Block9249(0)));
+    assert!(r::BlockNamesCopy::imported(&Copy, l::Block9249(0)));
+    assert_eq!(l::BlockNames::declared(&Original, [0; 2]), 3);
+    assert_eq!(r::BlockNamesCopy::declared(&Copy, [0; 2]), 3);
 }
 
 /// The impls of the entries that do not name `Self` are for a primitive type that the id and the

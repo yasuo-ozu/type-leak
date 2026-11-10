@@ -50,3 +50,11 @@ pub trait Repo<K> {
 pub trait Bad: Clone {
     fn get(&self, record: Record<'_>);
 }
+
+/// A trait with a lifetime parameter, which the copy must write outside the types too (`&'a self`
+/// and `-> &'a K` name `'a`), and a default that names a type of this crate.
+#[export_trait]
+pub trait Store<'a, K: 'a, D = Page<K>> {
+    fn get(&self, key: &'a K) -> D;
+    fn keep(&'a self) -> &'a K;
+}

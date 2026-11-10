@@ -11,8 +11,8 @@ use crate::graph::TypeKey;
 use crate::repeater::repeater_definition;
 use crate::repeater::{repeater_path, ImplSelf, RepeaterImpl};
 use crate::util::{
-    bound_cause, first_self_in_generics, generic_param_name, ident_name, mentions_names,
-    parenthesize_bounded, path_type, token_names, type_mentions_self, ReplaceSelf,
+    bound_cause, declared_names, first_self_in_generics, generic_param_name, ident_name,
+    mentions_names, parenthesize_bounded, path_type, token_names, type_mentions_self, ReplaceSelf,
 };
 use proc_macro2::{Literal, Punct, Spacing, Span, TokenStream};
 use std::cell::RefCell;
@@ -951,10 +951,12 @@ impl Referrer {
     ///    parameters too (`trait Tr<T, D = MyWrap<T>>` has `D = <Self as R<(T,), KEY>>::Type`).
     /// 2. Complete the arguments of the impl with [`complete_params()`](crate::complete_params), on the
     ///    parameters of the visited trait.
-    /// 3. Write the arguments into the types of the copy, one
-    ///    [`substitute_args()`](crate::substitute_args) pass for each type, which answers each
-    ///    parameter of the trait with its completed argument: `T` in `t: T`, and in the paths
-    ///    through the Repeater (`(T,)` is `(u8,)`).
+    /// 3. Write the arguments into the copy with [`Substitute`](crate::Substitute), a visitor
+    ///    whose closure answers each parameter of the trait with its completed argument: `T` in
+    ///    `t: T`, `'a` in `&'a self` and `T: 'a`, and `T` in the paths through the Repeater
+    ///    (`(T,)` is `(u8,)`). Visit the items or signatures that you copy, not the header of the
+    ///    impl, which declares the generics itself. [`substitute_args()`](crate::substitute_args)
+    ///    does it for single arguments.
     ///
     /// If `type_fn` writes lifetimes into the inputs of a function pointer or `Fn(..)` whose output
     /// takes its elided lifetime from the one lifetime of its inputs, the visitor names that
@@ -1490,41 +1492,10 @@ impl Declares {
     }
 }
 
-/// Returns the names that `items` declare together: types, traits, constants, modules and imports.
+/// Returns the names that `items` declare together: what the Leaker takes for local in the values
+/// of a block ([`declared_names()`]).
 fn shadowing_names<'a>(items: impl IntoIterator<Item = &'a Item>) -> Vec<Ident> {
-    fn shadowing_use_names(tree: &UseTree, names: &mut Vec<Ident>) {
-        match tree {
-            UseTree::Path(UsePath { tree, .. }) => shadowing_use_names(tree, names),
-            UseTree::Name(UseName { ident }) if ident != "self" => names.push(ident.clone()),
-            UseTree::Rename(UseRename { rename, .. }) => names.push(rename.clone()),
-            UseTree::Group(UseGroup { items, .. }) => {
-                for tree in items {
-                    shadowing_use_names(tree, names)
-                }
-            }
-            _ => (),
-        }
-    }
-    let mut names = Vec::new();
-    for item in items {
-        match item {
-            Item::Struct(ItemStruct { ident, .. })
-            | Item::Enum(ItemEnum { ident, .. })
-            | Item::Union(ItemUnion { ident, .. })
-            | Item::Trait(ItemTrait { ident, .. })
-            | Item::TraitAlias(ItemTraitAlias { ident, .. })
-            | Item::Type(ItemType { ident, .. })
-            | Item::Const(ItemConst { ident, .. })
-            | Item::Static(ItemStatic { ident, .. })
-            | Item::Mod(ItemMod { ident, .. }) => names.push(ident.clone()),
-            Item::Use(ItemUse { tree, .. }) => shadowing_use_names(tree, &mut names),
-            Item::ExternCrate(ItemExternCrate { ident, rename, .. }) => {
-                names.push(rename.as_ref().map_or(ident, |(_, rename)| rename).clone())
-            }
-            _ => (),
-        }
-    }
-    names
+    items.into_iter().flat_map(declared_names).collect()
 }
 
 /// Replaces the leaked types in a copy of the analyzed item with what you write for them (usually a
@@ -1664,8 +1635,8 @@ where
     /// A trait whose default names `Self` (`trait Tr<T, U = Rel<Self>>`) is one case: the arguments
     /// of the Repeater include the defaulted parameter, which [`complete_params()`](crate::complete_params)
     /// cannot give to its own default (a declaration cannot name it either, E0128), so answer its
-    /// name with a type in [`substitute_args()`](crate::substitute_args). A default that does not
-    /// name `Self` (`U = Rel<T>`) goes to `type_fn`.
+    /// name with a type in [`Substitute`](crate::Substitute). A default that does not name `Self`
+    /// (`U = Rel<T>`) goes to `type_fn`.
     ///
     /// Without this method the copy keeps the types of these entries as written, which its crate
     /// cannot resolve. For a scope that is not a module (`enter_generics()`, ..), the nested items

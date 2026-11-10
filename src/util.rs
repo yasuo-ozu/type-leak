@@ -51,6 +51,25 @@ pub(crate) fn projection_head(path: &Path) -> Option<&Ident> {
         .map(|seg| &seg.ident)
 }
 
+/// `<value>::A` for the path `T::A` and the type `value` for `T`. `fold` writes the segments after
+/// `T`, whose arguments may name generics too.
+pub(crate) fn projection(value: Type, path: &Path, fold: impl FnOnce(Path) -> Path) -> TypePath {
+    let rest = Path {
+        leading_colon: Some(Default::default()),
+        segments: path.segments.iter().skip(1).cloned().collect(),
+    };
+    TypePath {
+        qself: Some(QSelf {
+            lt_token: Default::default(),
+            ty: Box::new(value),
+            position: 0,
+            as_token: None,
+            gt_token: Default::default(),
+        }),
+        path: fold(rest),
+    }
+}
+
 /// The first segment of `path` if it is `Self` (not after a leading `::`).
 pub(crate) fn self_head(path: &Path) -> Option<&PathSegment> {
     path.segments
@@ -345,6 +364,60 @@ pub(crate) fn mentions_names(ty: &Type, idents: Vec<Ident>, lifetimes: Vec<Lifet
 /// Returns the name of `ident` without `r#`, by which names are compared.
 pub(crate) fn ident_name(ident: &Ident) -> String {
     ident.unraw().to_string()
+}
+
+/// Returns the names that `item` declares in the block or module around it: a type, a trait, a
+/// constant, a static, a function, a module, a `macro_rules!` macro, an extern crate, and what a
+/// `use` brings in ([`use_names()`]). An impl or the call of a macro declares none.
+///
+/// The Leaker reads the values of a block with it, and the Referrer hides the entries that name
+/// them.
+pub(crate) fn declared_names(item: &Item) -> Vec<Ident> {
+    let mut names = Vec::new();
+    match item {
+        Item::Struct(ItemStruct { ident, .. })
+        | Item::Enum(ItemEnum { ident, .. })
+        | Item::Union(ItemUnion { ident, .. })
+        | Item::Trait(ItemTrait { ident, .. })
+        | Item::TraitAlias(ItemTraitAlias { ident, .. })
+        | Item::Type(ItemType { ident, .. })
+        | Item::Const(ItemConst { ident, .. })
+        | Item::Static(ItemStatic { ident, .. })
+        | Item::Mod(ItemMod { ident, .. })
+        | Item::Fn(ItemFn {
+            sig: Signature { ident, .. },
+            ..
+        })
+        | Item::Macro(ItemMacro {
+            ident: Some(ident), ..
+        }) => names.push(ident.clone()),
+        Item::ExternCrate(ItemExternCrate { ident, rename, .. }) => {
+            let name = rename.as_ref().map_or(ident, |(_, rename)| rename);
+            if name != "_" {
+                names.push(name.clone());
+            }
+        }
+        Item::Use(ItemUse { tree, .. }) => use_names(tree, None, &mut names),
+        _ => (),
+    }
+    names
+}
+
+/// Adds to `names` what the `use` tree brings into scope: `use a::b::{self}` brings `b`, and
+/// `as _` and a glob bring no name. `parent` is the name before a group.
+pub(crate) fn use_names(tree: &UseTree, parent: Option<&Ident>, names: &mut Vec<Ident>) {
+    match tree {
+        UseTree::Path(UsePath { ident, tree, .. }) => use_names(tree, Some(ident), names),
+        UseTree::Name(UseName { ident }) if ident == "self" => names.extend(parent.cloned()),
+        UseTree::Name(UseName { ident }) => names.push(ident.clone()),
+        UseTree::Rename(UseRename { rename, .. }) if rename != "_" => names.push(rename.clone()),
+        UseTree::Rename(_) | UseTree::Glob(_) => (),
+        UseTree::Group(UseGroup { items, .. }) => {
+            for tree in items {
+                use_names(tree, parent, names);
+            }
+        }
+    }
 }
 
 /// Collects the names of the identifiers and lifetimes in `tokens`, without `r#`.

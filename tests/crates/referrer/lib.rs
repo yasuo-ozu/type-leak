@@ -71,6 +71,9 @@ type_leak_test_leaker::s::Clash9248!(impl<T> Clash9248<T> for Concrete => 0 {
 type_leak_test_leaker::s::Out!(impl<'x, T> Out<'x, T> for Concrete => 0);
 type_leak_test_leaker::s::DynRoot!(impl<'x> DynRoot<'x> for Concrete => 0);
 type_leak_test_leaker::s::Q!(impl<I: ::core::iter::Iterator> Q<I> for Concrete => 0);
+// `T::Item` of a parameter of the trait, with a concrete type for `T` (F90): the macro writes the
+// trait of the bound, as `<IntoIter<u8>>::Item` is E0223.
+type_leak_test_leaker::s::Proj9252!(impl Proj9252<::std::vec::IntoIter<u8>> for Concrete => 0);
 
 // A trait object inheriting the lifetime of its path, a bare identifier argument which is a const
 // and types in expressions, which are leaked as a whole. The implementors of the last are generic, where a
@@ -261,6 +264,14 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9142!(path = ::type_leak_test_leaker::kinds);
     // The names of the prelude of every edition in the values and the bounds (issue 3).
     type_leak_test_leaker::__tl_prop_9208!(path = ::type_leak_test_leaker::kinds);
+    // The names that a block declares (`use a::b::{self}`, a `const fn`) hide the entries that
+    // name them (F83).
+    type_leak_test_leaker::__tl_prop_9249!(path = ::type_leak_test_leaker::kinds);
+    // The value in the default of a type parameter is read: the relative constant is rejected, and
+    // the macro expands to nothing (F85).
+    type_leak_test_leaker::__tl_prop_9250!(path = ::type_leak_test_leaker::kinds);
+    // The argument of a generic associated type replaces its parameter in its where clause (F89).
+    type_leak_test_leaker::__tl_prop_9251!(path = ::type_leak_test_leaker::kinds);
     // The bindings of a discriminant and of the default of a const parameter are local (F56). The
     // relative macro and struct literal are rejected: they expand to nothing, as they could not be
     // resolved here.

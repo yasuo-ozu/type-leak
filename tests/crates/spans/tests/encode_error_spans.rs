@@ -87,6 +87,12 @@ fn errors() -> Vec<(EncodeError, &'static str, &'static str, usize)> {
             "Wrap<T, Self>",
             0,
         ),
+        (
+            args_error("<T, U = T::Item>", "<::std::vec::IntoIter<u8>>"),
+            "<T, U = T::Item>",
+            "T::Item",
+            0,
+        ),
     ]
 }
 
@@ -98,6 +104,7 @@ fn the_span_of_every_variant_is_the_part_that_is_at_fault() {
     assert!(matches!(all[2].0, EncodeError::MissingArgument(_)));
     assert!(matches!(all[3].0, EncodeError::UnboundedTraitObject(_)));
     assert!(matches!(all[4].0, EncodeError::NeedsSelf(_)));
+    assert!(matches!(all[5].0, EncodeError::AmbiguousAssociatedType(_)));
     for (err, source, needle, nth) in all {
         assert_span_at(err.span(), source, needle, nth);
     }

@@ -43,10 +43,9 @@ A name in Rust means something only where it is written. When a proc macro copie
 
 ```rust
 use syn::visit_mut::VisitMut;
-use syn::{parse_quote, GenericArgument, Ident, ItemImpl, ItemTrait, Path, Type};
+use syn::{parse_quote, Ident, ItemImpl, ItemTrait, Path};
 use type_leak::{
-    complete_params, repeater_key, repeater_projection, slot_const, substitute_args, ImplSelf,
-    Leaker,
+    complete_params, repeater_key, repeater_projection, slot_const, ImplSelf, Leaker, Substitute,
 };
 
 let item: ItemTrait = parse_quote! {
@@ -84,17 +83,14 @@ referrer
     })
     .visit_item_impl_mut(&mut imp);
 
-// One pass writes the arguments of the impl into the types of the copy: the trait's `T` is `U`.
-struct Site(GenericArgument);
-impl VisitMut for Site {
-    fn visit_type_mut(&mut self, ty: &mut Type) {
-        let mut arg = GenericArgument::Type(ty.clone());
-        substitute_args([&mut arg], |name: &Ident| (name == "T").then(|| self.0.clone())).unwrap();
-        *ty = parse_quote!(#arg);
-    }
-}
+// Write the arguments of the impl into the items of the copy, not into its header, which declares
+// the generics itself: the trait's `T` is `U`.
 let completed = complete_params(&item.generics.params, &[parse_quote!(U)]).unwrap();
-Site(completed[0].clone()).visit_item_impl_mut(&mut imp);
+let mut site = Substitute::new(|name: &Ident| (name == "T").then(|| completed[0].clone()));
+for item in &mut imp.items {
+    site.visit_impl_item_mut(item);
+}
+site.finish().unwrap();
 
 let (wrap, my_type) = (repeater_key(42, parse_quote!(0)), repeater_key(42, parse_quote!(1)));
 assert_eq!(
@@ -108,7 +104,7 @@ assert_eq!(
 );
 ```
 
-The visitor rewrites only the entries. The other types of the copy are yours to write: `substitute_args` writes the arguments of the impl into a type, also into the arguments of the paths through the Repeater (`(T,)` is `(U,)`). A trait with defaults (`trait MyLeaker<T, D = MyWrap<T>>`) is visited too, and `complete_params` takes the default of an argument the impl leaves out from the visited parameters.
+The visitor rewrites only the entries. The rest of the copy is yours to write: `Substitute` writes the arguments of the impl into the types and the lifetimes of the items you give it (`&'a self`, `T: 'a`, `where Self: 'a`), also into the arguments of the paths through the Repeater (`(T,)` is `(U,)`); `substitute_args` does it for single arguments. Give it the items or signatures that you copy, not the header of the impl. A trait with defaults (`trait MyLeaker<T, D = MyWrap<T>>`) is visited too, and `complete_params` takes the default of an argument the impl leaves out from the visited parameters. An associated type of a type that is not a type parameter (`T::Item` for `T` as `IntoIter<u8>`) needs its trait: `complete_params` writes it from the bound of the parameter, and `Substitute` and `substitute_args` refuse it (`EncodeError::AmbiguousAssociatedType`) unless the copy has `<T as Iterator>::Item`.
 
 If the item has a part that cannot be leaked (`MyType<'_>`), the `Leaker` copies it as written and records an error: `finish()` is then `Err`, and `into_referrer()` is still the `Referrer` of the rest. Report each with `ErrorItem::emit()` (on nightly, a diagnostic with the notes and the help at their own spans), or all with `to_syn_error()`.
 
@@ -119,7 +115,7 @@ In real macros, crate A passes `referrer` and `top_level` to crate B as tokens (
 - [API docs](https://docs.rs/type-leak/latest/type_leak/). Start with:
   - [`Leaker`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html), which analyzes an item: [`intern_trait`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#method.intern_trait) and the other `intern_*` methods for a whole item, [`enter_impl`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#method.enter_impl) and the other `enter_*` methods for parts of one.
   - [`LeakerResult`](https://docs.rs/type-leak/latest/type_leak/struct.LeakerResult.html), what `Leaker::result()` returns: the `Referrer` and the errors, and [`repeater_impls`](https://docs.rs/type-leak/latest/type_leak/struct.LeakerResult.html#method.repeater_impls) in crate A.
-  - [`Referrer`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html): [`visitor`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.visitor) in crate B, with [`repeater_projection`](https://docs.rs/type-leak/latest/type_leak/fn.repeater_projection.html) for the path through the Repeater, [`complete_params`](https://docs.rs/type-leak/latest/type_leak/fn.complete_params.html) and [`substitute_args`](https://docs.rs/type-leak/latest/type_leak/fn.substitute_args.html) for the arguments of an impl. An entry is named by its [`EntryId`](https://docs.rs/type-leak/latest/type_leak/struct.EntryId.html).
+  - [`Referrer`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html): [`visitor`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.visitor) in crate B, with [`repeater_projection`](https://docs.rs/type-leak/latest/type_leak/fn.repeater_projection.html) for the path through the Repeater, [`complete_params`](https://docs.rs/type-leak/latest/type_leak/fn.complete_params.html), [`Substitute`](https://docs.rs/type-leak/latest/type_leak/struct.Substitute.html) and [`substitute_args`](https://docs.rs/type-leak/latest/type_leak/fn.substitute_args.html) for the arguments of an impl. An entry is named by its [`EntryId`](https://docs.rs/type-leak/latest/type_leak/struct.EntryId.html).
   - [`repeater_definition`](https://docs.rs/type-leak/latest/type_leak/fn.repeater_definition.html), which generates the Repeater trait, and [`repeater_key`](https://docs.rs/type-leak/latest/type_leak/fn.repeater_key.html), its `KEY`.
   - [`ErrorItem`](https://docs.rs/type-leak/latest/type_leak/struct.ErrorItem.html), the error of the `Leaker`. The `Leaker` [recovers from errors](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#errors-and-recovery) and goes on.
 - [Limitations of the `Leaker`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#limitations): what cannot be leaked. An error carries a `help` that says what to write instead.

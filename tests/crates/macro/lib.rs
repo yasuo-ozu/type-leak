@@ -474,68 +474,34 @@ pub(crate) fn substitute_type(
     }
 }
 
-/// Writes what a site answers into the syntax of a copy: one `substitute_args()` pass for each
-/// type, generic argument, expression and lifetime that it visits (what a visited type holds is
-/// substituted with it, not again). The first error is kept in `error`.
-pub(crate) struct Written<F> {
-    f: F,
-    pub(crate) error: Option<EncodeError>,
+/// Writes `T::A` as `<T as Tr>::A` for a parameter `T` of the trait with the trait bound `Tr` (its
+/// first, without the associated types it fixes), which `substitute_args()` needs for a type that is
+/// not a type parameter (`EncodeError::AmbiguousAssociatedType`).
+struct QualifyProjections<'a> {
+    params: &'a Punctuated<GenericParam, Token![,]>,
 }
 
-impl<F: FnMut(&Ident) -> Option<GenericArgument>> Written<F> {
-    pub(crate) fn new(f: F) -> Self {
-        Written { f, error: None }
-    }
-
-    fn write(&mut self, arg: &mut GenericArgument) {
-        if let Err(error) = substitute_args(std::iter::once(arg), &mut self.f) {
-            self.error.get_or_insert(error);
-        }
-    }
-
-    fn misfit(&mut self, arg: GenericArgument) {
-        self.error
-            .get_or_insert(EncodeError::UnexpectedArgument(Box::new(arg)));
-    }
-}
-
-impl<F: FnMut(&Ident) -> Option<GenericArgument>> VisitMut for Written<F> {
+impl VisitMut for QualifyProjections<'_> {
     fn visit_type_mut(&mut self, ty: &mut Type) {
-        let mut arg = GenericArgument::Type(ty.clone());
-        self.write(&mut arg);
-        match arg {
-            GenericArgument::Type(written) => *ty = written,
-            other => self.misfit(other),
-        }
-    }
-
-    // A bare const parameter is parsed as a type argument (`N` in `Foo<N>`), and becomes a const.
-    fn visit_generic_argument_mut(&mut self, arg: &mut GenericArgument) {
-        self.write(arg)
-    }
-
-    fn visit_expr_mut(&mut self, expr: &mut Expr) {
-        let mut arg = GenericArgument::Const(expr.clone());
-        self.write(&mut arg);
-        match arg {
-            GenericArgument::Const(written) => *expr = written,
-            GenericArgument::Type(Type::Path(path)) => {
-                *expr = Expr::Path(ExprPath {
-                    attrs: Vec::new(),
-                    qself: path.qself,
-                    path: path.path,
+        syn::visit_mut::visit_type_mut(self, ty);
+        let (name, rest) = match &*ty {
+            Type::Path(TypePath { qself: None, path }) if path.segments.len() == 2 => {
+                (&path.segments[0].ident, &path.segments[1])
+            }
+            _ => return,
+        };
+        let bound = self.params.iter().find_map(|param| match param {
+            GenericParam::Type(param) if param.ident == *name => {
+                param.bounds.iter().find_map(|bound| match bound {
+                    TypeParamBound::Trait(bound) => Some(bound.path.clone()),
+                    _ => None,
                 })
             }
-            other => self.misfit(other),
-        }
-    }
-
-    fn visit_lifetime_mut(&mut self, lifetime: &mut Lifetime) {
-        let mut arg = GenericArgument::Lifetime(lifetime.clone());
-        self.write(&mut arg);
-        match arg {
-            GenericArgument::Lifetime(written) => *lifetime = written,
-            other => self.misfit(other),
+            _ => None,
+        });
+        if let Some(bound) = bound {
+            let (name, rest) = (name.clone(), rest.clone());
+            *ty = parse_quote!(<#name as #bound>::#rest);
         }
     }
 }
@@ -1103,10 +1069,20 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         // 3. Write the arguments of the impl into the signature, in one pass: the generics of the
         // trait are replaced, also in the paths through the Repeater.
         let mut sig = trait_fn.sig.clone();
-        let mut written = Written::new(answers(params, &completed));
+        let mut written = Substitute::new(answers(params, &completed));
         written.visit_signature_mut(&mut sig);
-        if let Some(e) = written.error {
-            return Err(Error::from(e));
+        if let Err(e) = written.finish() {
+            // `T::A` for a `T` given a type that is not a type parameter is refused (F90): the
+            // macro writes the trait of the parameter's bound, `<T as Tr>::A`, and `T` is
+            // replaced in it.
+            if !matches!(e, EncodeError::AmbiguousAssociatedType(_)) {
+                return Err(Error::from(e));
+            }
+            sig = trait_fn.sig.clone();
+            QualifyProjections { params }.visit_signature_mut(&mut sig);
+            let mut written = Substitute::new(answers(params, &completed));
+            written.visit_signature_mut(&mut sig);
+            written.finish().map_err(Error::from)?;
         }
 
         // Forward to the field: `Trait::<args>::method::<generics>(&self.field, args..)`.

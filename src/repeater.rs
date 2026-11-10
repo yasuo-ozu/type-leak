@@ -137,7 +137,7 @@ pub(crate) fn repeater_trait_path(repeater: &Path, args: &Type, id: u64, ix: Ent
 /// `const_fn(N, param)` ([`array_const`](crate::array_const) or
 /// [`slot_const(&repeater)`](slot_const)), and a bound `T: 'a` or `Self: 'a` adds `&'a T` (with
 /// `self_ty` for `Self`). The copy of a use site gets the arguments of the site by
-/// [`substitute_args()`](crate::substitute_args) afterwards. Fails with the error of `const_fn`, or
+/// [`Substitute`](crate::Substitute) afterwards. Fails with the error of `const_fn`, or
 /// with [`EncodeError::UnboundedTraitObject`] if `self_ty` is a trait object without a lifetime
 /// bound where `Self: 'a` needs one.
 ///

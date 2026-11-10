@@ -495,6 +495,25 @@ pub mod s {
         }
     }
 
+    /// 9252 (F90): the associated type of a parameter of the trait (`T::Item`), for an impl that
+    /// gives a concrete type for `T`. `<IntoIter<u8>>::Item` is E0223 in the Referrer's crate:
+    /// `substitute_args()` refuses to write it, and the macro writes `<T as Iterator>::Item`, in
+    /// which it replaces `T`.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::s,
+    )]
+    pub trait Proj9252<T: ::core::iter::Iterator> {
+        fn f(&self, x: Wrap<T::Item>) -> ::core::option::Option<T::Item>;
+    }
+
+    impl<T: ::core::iter::Iterator> Proj9252<T> for Inner {
+        fn f(&self, x: Wrap<T::Item>) -> ::core::option::Option<T::Item> {
+            Some(x.0)
+        }
+    }
+
     /// A trait object whose lifetime bound defaults to the lifetime of the path it is an argument
     /// of (`Ref<'a, T: 'a>`), so it must not be leaked alone (it would be `dyn RelTr + 'static`):
     /// the path is leaked as a whole if the trait object has to be (it names a relative trait),
@@ -2303,6 +2322,91 @@ pub mod kinds {
         fn count<I: DoubleEndedIterator + ExactSizeIterator>(&self, it: I) -> usize {
             it.len() + it.rev().count()
         }
+    }
+
+    // F83 (`tests/findings.rs`): what a block declares hides the entries that name it, in the copy.
+    // It fails to build on the code before the fix.
+
+    /// A struct of this crate that has the name of the enum that a block of `BlockNames` imports.
+    pub struct Block9249(pub u8);
+
+    /// The enum that the body of `BlockNames::imported` imports as `Block9249`, with `self`.
+    pub mod block9249 {
+        pub enum Block9249 {
+            X,
+        }
+    }
+
+    /// The length of the array of a parameter of `BlockNames::declared`; its body declares `len9249`
+    /// too.
+    pub const fn len9249() -> usize {
+        2
+    }
+
+    /// F83: a block hides the entries that name what it declares. `use a::b::{self}` declares `b`
+    /// and a `const fn` declares its name, so the types in the body are the local ones and the copy
+    /// keeps them. The Referrer did not see either, and replaced them by the entries of the
+    /// parameters (E0308). The original and the copy compute the same.
+    #[prop_leak(
+        id = 9249,
+        scope = "mod",
+        prelude = true,
+        redeclare = true,
+        values = true
+    )]
+    pub trait BlockNames {
+        fn imported(&self, _x: Block9249) -> bool {
+            use ::type_leak_test_leaker::kinds::block9249::Block9249::{self};
+            let y: Block9249 = Block9249::X;
+            match y {
+                Block9249::X => true,
+            }
+        }
+
+        fn declared(&self, _a: [u8; len9249()]) -> usize {
+            const fn len9249() -> usize {
+                3
+            }
+            let a: [u8; len9249()] = [0; 3];
+            a.len()
+        }
+    }
+
+    // F85 (`tests/findings.rs`): `check_values` reads the values in the default of a type parameter.
+    // It fails to build on the code before the fix.
+
+    /// A constant of this crate, which the Referrer's crate does not have.
+    pub const REL9250: usize = 2;
+
+    /// F85: the default of `T` has a block whose constant takes its value from `REL9250`, a relative
+    /// path. The Leaker did not read the values of a default, so it accepted the item, and the copy in
+    /// the Referrer's crate could not resolve `REL9250` (E0425). It is rejected now: the Referrer's
+    /// macro expands to nothing.
+    #[allow(dead_code)]
+    #[prop_leak(id = 9250, values = true)]
+    pub struct ValueInDefault<
+        T = [u8; {
+                const C: usize = REL9250;
+                3
+            }],
+    >(pub T);
+
+    // F89 (`tests/findings.rs`): the arguments of a generic associated type replace its parameters
+    // in the outlives relations of its where clause. It fails to build on the code before the fix.
+
+    /// F89: `G` is declared with the parameter `U` and the relations `U: 'b` and `U::Target: 'b`.
+    /// `f` gives `G` the argument `&'x u8`, which is no path. The relation `U::Target: 'x` was
+    /// written as it was for the impl of the Repeater of the entry `Wrap<&'x Self::G<'x, &'x u8>>`,
+    /// whose generics (`<'x>`) have no `U` (E0223: `U` is the struct of this module). The
+    /// relation of the argument holds without a bound: `<&'x u8 as Deref>::Target` is `u8`.
+    #[prop_leak(id = 9251, prelude = true)]
+    pub trait GatArgument {
+        type G<'b, U: ::core::ops::Deref>
+        where
+            U: 'b,
+            U::Target: 'b;
+
+        fn f<'x, U: ::core::ops::Deref>(&self, u: U, a: Wrap<&'x Self::G<'x, &'x u8>>);
     }
 
     // F56 (`tests/findings.rs`): an enum discriminant and the default of a const parameter are read

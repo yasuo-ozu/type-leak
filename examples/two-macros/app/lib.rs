@@ -23,6 +23,15 @@ impl repo::Repo<u8> for InMemory {
     }
 }
 
+impl<'a> repo::Store<'a, u8> for InMemory {
+    fn get(&self, key: &'a u8) -> repo::Page<u8> {
+        repo::Page(self.0.iter().copied().filter(|b| b == key).collect())
+    }
+    fn keep(&'a self) -> &'a u8 {
+        &self.0[0]
+    }
+}
+
 /// The generics of the trait are the generics of the impl: `impl<K> Repo<K> for Cached`.
 #[forward(repo::Repo)]
 pub struct Cached(InMemory);
@@ -31,10 +40,15 @@ pub struct Cached(InMemory);
 #[forward(repo::Repo<u8>)]
 pub struct Logged(InMemory);
 
+/// A trait with a lifetime parameter, given `'static`: `keep(&'a self) -> &'a K` names `'a`
+/// outside the types, which the macro writes too.
+#[forward(repo::Store<'static, u8>)]
+pub struct Stored(InMemory);
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use repo::{model::Record, Page, Repo};
+    use repo::{model::Record, Page, Repo, Store};
 
     #[test]
     fn the_wrapper_with_the_generics_of_the_trait_forwards() {
@@ -61,5 +75,18 @@ mod tests {
         assert_eq!(failures.0.len(), 1);
         let many: Page<u8> = logged.many(vec![9]);
         assert_eq!(many, Page(vec![9]));
+    }
+
+    #[test]
+    fn a_lifetime_parameter_of_the_trait_is_written_outside_the_types_too() {
+        // `fn keep(&'a self) -> &'a K` with `'a` as `'static`: the receiver and the output name `'a`,
+        // which the impl does not declare, so a copy that wrote only the types would not compile
+        // (E0261).
+        let stored: &'static Stored = Box::leak(Box::new(Stored(InMemory(vec![7, 8]))));
+        let kept: &'static u8 = stored.keep();
+        assert_eq!(*kept, 7);
+        // The default `D = Page<K>` is the page of `u8`.
+        let page: Page<u8> = stored.get(&8);
+        assert_eq!(page, Page(vec![8]));
     }
 }

@@ -88,6 +88,17 @@
 //! | `f77_the_path_of_the_repeater_is_checked_before_it_is_used` | a path of the Repeater with arguments (`crate::Repeater<u8>`) was spliced into `Repeater<u8><(T,)>` by three places, and `parse_quote!` refused it with a message about the tokens (`unexpected token`): in the first item of the iterator of `repeater_impls()` (after the call returned `Ok`), after `const_fn` in `repeater_projection()`, in the first const slot of `slot_const()`; an empty `<>` is the same as none (pinned) | fixed |
 //! | `f78_an_id_that_the_referrer_does_not_have_is_named_in_the_panic` | `visitor()` and `expand()` with a `ContextId` that the Referrer lacks panicked with `no entry found for key`, and `bucket_self()` with an `EntryId` beyond its entries with `index out of bounds: the len is 1 but the index is 5`, and no `# Panics` in the docs of the last: none names the id | fixed |
 //! | `f79_a_rule_on_self_accepts_the_error_of_a_self_without_meaning` | the docs of `Allow` said that the rule is never asked about a path that starts with `Self`, but `Rel<Self>` where `Self` has no meaning is an error with the cause `Self` and no paths, which a rule that allows `Cause::Type(Self)` accepts, given to the Leaker and to `LeakerResult::allow()` (the walk of the analysis does not ask about `Self`, the filter of the errors asks the cause) | fixed |
+//! | `f80_a_mod_in_an_array_length_in_a_bound_is_walked_by_a_probe` | a `mod` in an array length in a bound or the self type of an item in a module (`T: From<[u8; { mod m {} 1 }]> + Into<Rel<T>>`) panicked with "index out of bounds": a probe of the bounds has the module frames of the visitor but not its table of contexts, and `with_module()` read the path of the module around the `mod` from the table; the frame keeps the path | fixed |
+//! | `f81_the_unnameable_self_is_found_in_declaration_order` | the error of a bound that names a `Self` that has no name (`T: AsRef<Self>`, `U: Into<Self>`, `V: From<Self>`) named `T`, `U` or `V` from run to run, and the outer `Self` of a context were listed in a different order: `Context::compute_with()` filled its stack from `HashSet`s; the names are put on it in declaration order | fixed |
+//! | `f82_a_reference_to_a_box_of_self_gives_no_lifetime_to_the_output` | a receiver `self: &Box<Self>` (or `&Rc<Self>`, `&Arc<Self>`) was taken to give its lifetime to the elided output, as rustc does only from 1.81 (the MSRV is 1.56): the copy of `fn m<'a, T: 'a>(self: &Box<Self>, y: &u8, x: Rel<T>) -> &u8` named `'a` in `x` and was E0106 on 1.56 to 1.80; only a reference to `Self` counts, and any other receiver is left out of the count of the lifetimes of the inputs | fixed |
+//! | `f83_a_block_hides_the_entries_that_name_what_it_declares` | the Referrer did not see `use a::b::{self}`, a `fn` and a `macro_rules!` that a block declares (the Leaker did), so it replaced the type in the block (`let _y: b = b::X;`) by the entry of the parameter (`_x: b`): E0308; one function, `declared_names()`, serves both | fixed |
+//! | `f84_a_predicate_on_a_generic_in_parentheses_or_a_group_is_a_bound_of_it` | a where predicate whose bounded type is a generic in parentheses (`where (T): ..`) or an invisible group (`$t:ty`) was not a bound of it: the trait method `where (T): ::p::Bound<&'b dyn RelTr>` was rejected (`UnprovableBound`, no entry) and the context of an entry changed when the Referrer was read back; `bounded_generic()` and `canonicalize()` look through them like `bounded_ident()` | fixed |
+//! | `f85_the_values_in_the_default_of_a_type_parameter_are_read_with_check_values` | with `Leaker::check_values`, a relative path in a value inside the default of a type parameter of an item (`struct S<T = [u8; { const C: usize = rel::N; 3 }]>`) was no error, as it is in a field: the walk of the default did not read values | fixed |
+//! | `f86_the_generics_of_an_item_in_the_default_of_a_type_parameter_are_its_own` | a generic of an item nested in the default of a type parameter (`struct S<T = [u8; { struct Z<U>(U); 3 }]>`) was taken for a relative path (an entry for the array, which a field does not have; with `Self` in the item the error `SelfInDefault`): the visitor of the default started outside every item | fixed |
+//! | `f87_the_probe_of_a_binder_leaves_the_numbers_of_the_contexts_as_they_were` | a `mod` in a `for<'a>` binder (`for<'a> fn(&'a [u8; { mod m {} 3 }]) -> &'a u8`) was interned by the probe of the binder and again by the walk, so the contexts after it were numbered higher than for the same type without the binder; the probe puts back the table of contexts too | fixed |
+//! | `f88_a_self_projection_in_parentheses_or_a_group_has_one_error` | `Self::A` (or `<Self as Tr>::A`, or the bare `Self` of an impl) in parentheses or an invisible group in a bound was an error twice (`UnprovableBound` for `Self::A` and for `(Self::A)`) and a part twice: the check of a type in a predicate that names `Self` ran for the wrapper too | fixed |
+//! | `f89_the_arguments_of_a_generic_associated_type_replace_its_parameters_in_its_where_clause` | the outlives relation on a projection of a parameter in the where clause of a generic associated type (`type G<'b, U: Deref> where U::Target: 'b`) was written for the parameter of the declaration when the argument is no path (`Self::G<'x, &'x u8>`: `U::Target: 'x` in an impl that has no `U`, E0223), and as `T::A::Item` for a path of several segments; any argument but a name gives `<Arg>::Item` | fixed |
+//! | `f90_the_associated_type_of_an_argument_is_written_through_a_bound_or_refused` | `substitute_args()` and `complete_params()` wrote `T::Item` for `T` as `IntoIter<u8>` as `<IntoIter<u8>>::Item`, which rustc rejects (E0223: `<V>::A` resolves only for a type parameter): `complete_params()` writes `<IntoIter<u8> as Iterator>::Item` from the one trait bound of the parameter, and both refuse (`AmbiguousAssociatedType`) where there is none, unless the argument is an identifier | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that the docs of `Leaker` document, or that follows from what rustc accepts). No test
@@ -13460,10 +13471,15 @@ fn f60_a_type_is_written_at_the_use_site() {
         write(&named, parse_quote!(Wrap<N, [u8; N]>)),
         ty(parse_quote!(Wrap<M, [u8; { M }]>))
     );
-    // The projection of a parameter is the projection of its argument.
+    // The projection of a parameter is the projection of its argument, with the trait written, or
+    // of an identifier, which rustc resolves as a type parameter (F90).
     assert_eq!(
-        write(&given, parse_quote!(Option<T::Item>)),
-        ty(parse_quote!(Option<<Vec<u8>>::Item>))
+        write(&given, parse_quote!(Option<<T as Iterator>::Item>)),
+        ty(parse_quote!(Option<<Vec<u8> as Iterator>::Item>))
+    );
+    assert_eq!(
+        write(&named, parse_quote!(Option<T::Item>)),
+        ty(parse_quote!(Option<<T>::Item>))
     );
     // What the site gives no argument stays, and so does what is not a parameter.
     let early = site(&["'static"]);
@@ -13481,17 +13497,13 @@ fn f60_a_type_is_written_at_the_use_site() {
     let hosted = site(&["'static", "u8", "3"]);
     let host: Type = parse_quote!(Host<T>);
     assert_eq!(
-        write_as(
-            &hosted,
-            parse_quote!(&'a (Self, T, Self::A, <Self as Tr>::B)),
-            &host
-        ),
-        ty(parse_quote!(&'static (
-            Host<T>,
-            u8,
-            <Host<T>>::A,
-            <Host<T> as Tr>::B
-        )))
+        write_as(&hosted, parse_quote!(&'a (Self, T, <Self as Tr>::B)), &host),
+        ty(parse_quote!(&'static (Host<T>, u8, <Host<T> as Tr>::B)))
+    );
+    let ident: Type = parse_quote!(H);
+    assert_eq!(
+        write_as(&hosted, parse_quote!(Self::A), &ident),
+        ty(parse_quote!(<H>::A))
     );
     assert_eq!(
         write_as(&hosted, parse_quote!(m!(Self, T)), &host),
@@ -14861,8 +14873,8 @@ fn f69_the_elided_lifetime_of_a_signature_is_named_where_a_use_site_adds_lifetim
     );
     same(
         &site_static,
-        "fn(&U::A) -> &u8",
-        "for<'__tl_s0> fn(&'__tl_s0 <&'static str>::A) -> &'__tl_s0 u8",
+        "fn(&<U as Tr>::A) -> &u8",
+        "for<'__tl_s0> fn(&'__tl_s0 <&'static str as Tr>::A) -> &'__tl_s0 u8",
     );
     // A named lifetime too, and a binder that the signature has already.
     let site_wrap = site("Wrap<'a>");
@@ -14922,8 +14934,8 @@ fn f69_the_elided_lifetime_of_a_signature_is_named_where_a_use_site_adds_lifetim
     same_as(
         &[],
         Some(&with_self),
-        "dyn Fn(&Self::A) -> &u8",
-        "dyn for<'__tl_s0> Fn(&'__tl_s0 <::p::S<'a>>::A) -> &'__tl_s0 u8",
+        "dyn Fn(&<Self as Tr>::A) -> &u8",
+        "dyn for<'__tl_s0> Fn(&'__tl_s0 <::p::S<'a> as Tr>::A) -> &'__tl_s0 u8",
     );
 
     // Unchanged: no lifetime added, the lifetime already named, an output that does not elide, no
@@ -16013,6 +16025,8 @@ fn f75_the_generics_of_a_repeater_impl_have_their_angle_brackets() {
 /// parameters too.
 ///
 /// Limitation, as for `substitute_args()`: a path in an expression (`T::LEN`) is not written so.
+///
+/// F90 changed what is written for an argument that is not an identifier: the trait of the bound.
 #[test]
 fn f74_complete_params_writes_the_associated_type_of_an_earlier_parameter() {
     // The trigger.
@@ -16021,11 +16035,16 @@ fn f74_complete_params_writes_the_associated_type_of_an_earlier_parameter() {
     let completed = complete_params(&params, &f59_args(&["I"])).unwrap();
     let completed: Vec<String> = completed.iter().map(string).collect();
     assert_eq!(completed, ["I", "< I > :: Item", "Vec < < I > :: Item >"]);
+    // An argument that is not an identifier needs the trait (F90): the one bound of `T`.
     let params: Punctuated<GenericParam, Token![,]> = parse_quote!(T: Iterator, U = T::Item);
     let completed = complete_params(&params, &f59_args(&["IntoIter<u8>"])).unwrap();
-    assert_eq!(string(&completed[1]), "< IntoIter < u8 > > :: Item");
+    assert_eq!(
+        string(&completed[1]),
+        "< IntoIter < u8 > as Iterator > :: Item"
+    );
 
-    // Each default is what `substitute_args()` gives for it, whatever the argument.
+    // Each default is what `substitute_args()` gives for it, whatever the argument: the same type,
+    // or the same error (`T` has no bound here).
     let only_t: Punctuated<GenericParam, Token![,]> = parse_quote!(T);
     for written in [
         "T::Item",
@@ -16053,12 +16072,12 @@ fn f74_complete_params_writes_the_associated_type_of_an_earlier_parameter() {
             let default: Type = parse_str(written).unwrap();
             let params: Punctuated<GenericParam, Token![,]> = parse_quote!(T, U = #default);
             let site = f59_args(&[arg]);
-            let completed = complete_params(&params, &site).unwrap();
-            let expected =
-                common::substitute_type(&default, common::answers(&only_t, &site), None).unwrap();
+            let completed = complete_params(&params, &site).map(|completed| string(&completed[1]));
+            let expected = common::substitute_type(&default, common::answers(&only_t, &site), None)
+                .map(|expected| string(&expected));
             assert_eq!(
-                string(&completed[1]),
-                string(&expected),
+                completed.map_err(|error| error.to_string()),
+                expected.map_err(|error| error.to_string()),
                 "{} with {}",
                 written,
                 arg
@@ -16503,4 +16522,1558 @@ fn f79_a_rule_on_self_accepts_the_error_of_a_self_without_meaning() {
     let errors = leaker.result().errors().to_vec();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].cause, Cause::Type(parse_quote!(Self::Item)));
+}
+
+// ── F80 ──────────────────────────────────────────────────────────────────────
+
+/// F80 (fixed): a `mod` in an array length in a bound or a self type was a panic ("index out of
+/// bounds: the len is 0 but the index is 0").
+///
+/// Trigger: `intern_mod(mod outer { pub struct S<T>(T) where T: From<[u8; { mod m {} 1 }]> +
+/// Into<Rel<T>>; })`, and the same in an impl (a bound or the self type), a method and a trait
+/// method, also through `enter_mod()`. The same items outside a module were fine, as was a `mod`
+/// in a bound that the analysis does not probe (`struct S<T: From<[u8; { mod m {} 1 }]>>(Rel<T>)`).
+///
+/// Cause: a bound that names a leaked type makes the analysis look again at the bounds of the
+/// context, with a throwaway visitor (`in_context()`). It has the module frames of the visitor it
+/// was made from but an empty table of contexts, and `with_module()` read the path of the module
+/// around the `mod` from that table.
+///
+/// Fix: the frame of a module keeps its path. The probe numbers `m` in its own table, as the walk
+/// does in its own: the numbers are in the keys that a probe returns, which are matched with the
+/// entries by their tokens and never read. The result is that of the item without the `mod` (the
+/// same errors and entries), with the numbers after `m` shifted by one, as for any `mod` in a type.
+#[test]
+fn f80_a_mod_in_an_array_length_in_a_bound_is_walked_by_a_probe() {
+    // The items, with `len` as the array length.
+    let items = |len: &Expr| -> Vec<(&'static str, Item)> {
+        vec![
+            (
+                "struct",
+                parse_quote!(
+                    pub struct S<T>(T)
+                    where
+                        T: From<[u8; #len]> + Into<Rel<T>>;
+                ),
+            ),
+            (
+                "impl, a bound",
+                parse_quote!(
+                    impl<T: From<[u8; #len]> + Into<Rel<T>>> S<T> {}
+                ),
+            ),
+            (
+                "impl, the self type",
+                parse_quote!(
+                    impl<T: Into<Rel<Self>>> S<[u8; #len], T> {}
+                ),
+            ),
+            (
+                "method",
+                parse_quote!(
+                    impl S {
+                        fn f<T: From<[u8; #len]> + Into<Rel<T>>>(t: T) {}
+                    }
+                ),
+            ),
+            (
+                "trait method",
+                parse_quote!(
+                    trait Tr {
+                        fn f<T>(t: T)
+                        where
+                            T: From<[u8; #len]> + Into<Rel<T>>;
+                    }
+                ),
+            ),
+        ]
+    };
+    // The reasons of the errors and the entries, through `intern_mod()` and `enter_mod()`.
+    let analyze = |item: &Item, enter: bool| -> (Vec<Reason>, Vec<String>) {
+        let mut leaker = Leaker::new();
+        if enter {
+            leaker.enter_mod("outer", [], |view| view.visit_item(item));
+        } else {
+            leaker.intern_mod(&parse_quote!(mod outer { #item }));
+        }
+        let result = leaker.result();
+        let reasons = result.errors().iter().map(|error| error.reason).collect();
+        let entries = result
+            .into_referrer()
+            .iter()
+            .map(|(_, ty, _)| string(ty))
+            .collect();
+        (reasons, entries)
+    };
+    let with_mod: Expr = parse_quote!({
+        mod m {}
+        1
+    });
+    let without: Expr = parse_quote!({ 1 });
+    for ((name, with), (_, without)) in items(&with_mod).into_iter().zip(items(&without)) {
+        for enter in [false, true] {
+            let expected = analyze(&without, enter);
+            assert!(
+                !expected.0.is_empty(),
+                "{} (enter: {}): the item is rejected, as the bound is probed",
+                name,
+                enter
+            );
+            assert_eq!(
+                analyze(&with, enter),
+                expected,
+                "{} (enter: {})",
+                name,
+                enter
+            );
+        }
+    }
+
+    // The first item, as reported, through `intern_mod()`: the bounds are copied as written, and
+    // `Rel<T>` makes a cycle in its own bound.
+    let item = items(&with_mod).remove(0).1;
+    let mut leaker = Leaker::new();
+    leaker.intern_mod(&parse_quote!(mod outer { #item }));
+    let result = leaker.result();
+    assert_eq!(
+        joined_messages(result.errors()),
+        "use absolute path: 'From<[u8 ; { mod m { } 1 }]>'\n\
+         use absolute path: 'Into<Rel<T>>'\n\
+         `Rel<T>` is in a bound or where predicate, and a bound of its generics names a leaked type"
+    );
+}
+
+// ── F81 ──────────────────────────────────────────────────────────────────────
+
+/// F81 (fixed): the error of a bound that names a `Self` that has no name (`UnnameableSelf`) named a
+/// different generic from run to run.
+///
+/// Trigger: `enter_trait(Tr, <T: AsRef<Self>, U: Into<Self>, V: From<Self>>)` with, inside,
+/// `enter_type(N, <>)` and `visit_type(Rel<T, U, V>)`: the headline and the note of the one error
+/// said "the bound of `T`", `U` or `V` (about one run in three each), so the carried `@ [..]` and
+/// the `compile_error!` differed between builds. The list `Context::substituted` of the outer `Self`
+/// that a context depends on (`enter_impl(<T: AsRef<Self>>, S<T>)`, `enter_type(N1, <U: Into<Self>>)`,
+/// `enter_type(N2, <W>)`, `visit_type(Rel<T, U, W>)`: `S<T>` and `N1<U>`) was in a different order
+/// too.
+///
+/// Cause: `Context::compute_with()` walks the generics that the type names, and that their bounds
+/// name, with a stack that it filled from `HashSet`s of names, whose order differs from set to set.
+/// It returns the first failure that it finds, and lists the outer `Self` in the order it finds them.
+///
+/// Fix: the names are put on the stack in the order they are declared (outer scopes first), so the
+/// walk is the same every time: the failure is the first one of a depth-first walk that takes the
+/// generics of each batch in declaration order, and the list is in that order. What was the same
+/// for every order is not changed: for the cases that had one possible failure or one possible
+/// order, the output is the one of before.
+#[test]
+fn f81_the_unnameable_self_is_found_in_declaration_order() {
+    // The messages and the notes of the errors.
+    let unnameable = || {
+        let mut leaker = Leaker::new();
+        let generics: Generics = parse_quote!(<T: AsRef<Self>, U: Into<Self>, V: From<Self>>);
+        leaker.enter_trait(&parse_quote!(Tr), &generics, |view| {
+            view.enter_type(&parse_quote!(N), &Generics::default(), |view| {
+                view.visit_type(&parse_quote!(Rel<T, U, V>))
+            });
+        });
+        let result = leaker.result();
+        (
+            result
+                .errors()
+                .iter()
+                .map(|error| error.message.clone())
+                .collect::<Vec<_>>(),
+            all_notes(result.errors()),
+        )
+    };
+    // The outer `Self` of the context of the entry, in order.
+    let substituted = || {
+        let mut leaker = Leaker::new();
+        let generics: Generics = parse_quote!(<T: AsRef<Self>>);
+        leaker.enter_impl(&generics, &parse_quote!(S<T>), None, |view| {
+            view.enter_type(&parse_quote!(N1), &parse_quote!(<U: Into<Self>>), |view| {
+                view.enter_type(&parse_quote!(N2), &parse_quote!(<W>), |view| {
+                    view.visit_type(&parse_quote!(Rel<T, U, W>))
+                });
+            });
+        });
+        let referrer = leaker.result().into_referrer();
+        referrer
+            .iter()
+            .map(|(_, ty, context)| {
+                let outer: Vec<String> = context
+                    .substituted
+                    .iter()
+                    .map(|requirement| match requirement {
+                        SelfRequirement::Type(ty) => string(ty),
+                        other => panic!("not a type: {:?}", other),
+                    })
+                    .collect();
+                (string(ty), outer)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let first = unnameable();
+    assert_eq!(
+        first.0,
+        ["the bound of `T` mentions a `Self` which has no name here"]
+    );
+    assert_eq!(
+        first.1[0],
+        "the bound of `T` mentions the `Self` of the trait `Tr<T, U, V>`, which has no name \
+         here: `Self` is something else in the item around"
+    );
+    let outer = substituted();
+    assert_eq!(
+        outer,
+        [(
+            ty(parse_quote!(Rel<T, U, W>)),
+            vec![ty(parse_quote!(S<T>)), ty(parse_quote!(N1<U>))]
+        )]
+    );
+    // Each `HashSet` has a hasher of its own: a run in one process shows what runs of many do.
+    for _ in 0..100 {
+        assert_eq!(unnameable(), first);
+        assert_eq!(substituted(), outer);
+    }
+}
+
+// ── F82 ──────────────────────────────────────────────────────────────────────
+
+/// F82 (fixed): a receiver `self: &Box<Self>` (or `&Rc<Self>`, `&Arc<Self>`) was taken to give its
+/// lifetime to the elided output, as rustc does only from 1.81 (the MSRV is 1.56).
+///
+/// Trigger: `impl S { fn m<'a, T: 'a>(self: &Box<Self>, y: &u8, x: Rel<T>) -> &u8 { .. } }`: the
+/// Leaker accepted it with the entry `Rel<T>`, whose copy names `'a` in `x`. rustc 1.56 to 1.80
+/// leaves the receiver out of the count of the lifetimes of the inputs (a receiver gives its lifetime
+/// to the output only if it has a reference to `Self`), so the inputs of the copy have the elided
+/// lifetime of `y` and `'a`: E0106. The original, with only `y`, is fine. Checked with `rustc`
+/// 1.56.0 and 1.80.0 (E0106 for the copy) and 1.81.0 and stable (fine).
+///
+/// Cause: `Elision::of_signature()` took any reference in the type of the receiver for one that
+/// gives its lifetime (`HasReference`), and so tracked no elision for the method.
+///
+/// Fix: only a reference to `Self` counts (`&self`, `self: &mut Self`, `Pin<&Self>`, `Box<&Self>`,
+/// and a reference to another type, which may be the type of the impl, `&S`: the Referrer cannot
+/// tell). The receiver of any other kind is left out of the count, so the method is tracked as one
+/// with a receiver that is `Box<Self>`: the entry `Rel<T>` is the same error. The Referrer reads the
+/// same facts of the signature.
+///
+/// No fixture: on the toolchains of CI (stable) rustc takes the lifetime of the receiver for the
+/// output, and the copy of the item that the Leaker accepted before the fix compiles. The rejection
+/// is for the toolchains from 1.56 to 1.80, which no cross-crate test runs. Limit: `&Box<S>`, the
+/// type of the impl written out in a pointer, is taken for a reference to `S` (a receiver that
+/// gives its lifetime), as the Referrer does not know the type of the impl.
+#[test]
+fn f82_a_reference_to_a_box_of_self_gives_no_lifetime_to_the_output() {
+    let analyze = |receiver: FnArg| -> Vec<String> {
+        let item: ItemImpl = parse_quote!(
+            impl S {
+                fn m<'a, T: 'a>(#receiver, y: &u8, x: Rel<T>) -> &u8 {
+                    loop {}
+                }
+            }
+        );
+        let mut leaker = Leaker::from_config(Rules::new().primitive().std_crates());
+        leaker.intern_impl(&item);
+        let result = leaker.result();
+        result
+            .errors()
+            .iter()
+            .map(|error| error.message.clone())
+            .collect()
+    };
+
+    // The receivers that have a reference to `Self`: it gives its lifetime to the output, so adding
+    // `'a` to `x` is fine (rustc 1.56 and later).
+    let giving: Vec<FnArg> = vec![
+        parse_quote!(&self),
+        parse_quote!(&mut self),
+        parse_quote!(&'a self),
+        parse_quote!(self: &Self),
+        parse_quote!(self: &mut Self),
+        parse_quote!(self: &'a Self),
+        parse_quote!(self: &S),
+        parse_quote!(self: ::std::boxed::Box<&Self>),
+        parse_quote!(self: ::std::rc::Rc<&Self>),
+        parse_quote!(self: ::std::pin::Pin<&Self>),
+        parse_quote!(self: ::std::pin::Pin<&mut Self>),
+        parse_quote!(self: &::std::pin::Pin<&Self>),
+    ];
+    for receiver in giving {
+        let what = string(&receiver);
+        assert_eq!(analyze(receiver), Vec::<String>::new(), "{}", what);
+    }
+
+    // A receiver with no reference: the inputs have `y` and, in the copy, `'a`.
+    let expected = analyze(parse_quote!(self: ::std::boxed::Box<Self>));
+    assert_eq!(expected, ["use absolute path: 'Rel<T>'"]);
+    assert_eq!(analyze(parse_quote!(self)), expected);
+    // A reference to a type that holds `Self`: rustc before 1.81 leaves it out of the count.
+    let leaving: Vec<FnArg> = vec![
+        parse_quote!(self: &::std::boxed::Box<Self>),
+        parse_quote!(self: &::std::rc::Rc<Self>),
+        parse_quote!(self: &::std::sync::Arc<Self>),
+        parse_quote!(self: &mut ::std::boxed::Box<Self>),
+    ];
+    for receiver in leaving {
+        let what = string(&receiver);
+        assert_eq!(analyze(receiver), expected, "{}", what);
+    }
+}
+
+// ── F83 ──────────────────────────────────────────────────────────────────────
+
+/// F83 (fixed): the Referrer did not see every name that a block declares, so it replaced a type in
+/// the block that names it by the entry of the same tokens outside.
+///
+/// Trigger: `impl S { pub fn f(_x: b) { use ::p::m::b::{self}; let _y: b = b::X; } }` with
+/// `check_values`: `b` of the parameter is an entry (a struct of the item's crate), `b` in the body
+/// is the enum that the block imports. The copy wrote `let _y: <H as Repeater<..>>::Type = b::X;`
+/// (E0308). The same for a block with a `const fn n` and `[u8; n()]` (the fixture 9249: the array
+/// of the parameter has the length of another `n`), and with a `macro_rules!` that has the name of
+/// a type. The Leaker counted all of them as declared in the body.
+///
+/// Cause: the Referrer (`shadowing_names()`) left out `self` of `use a::b::{self}`, the name of a
+/// `fn` and of a `macro_rules!`; the Leaker kept its own list (`declare_item()`), which also
+/// counted `as _`.
+///
+/// Fix: one function, `declared_names()` in `src/util.rs`, for both: the name of a type, trait,
+/// constant, static, function, module, `macro_rules!` and extern crate, and what a `use` brings in
+/// (`self` is the name before the group, `as _` and a glob bring none). The namespaces are not told
+/// apart, as for the Leaker (a `macro_rules! m` hides a type `m`). A module or a `File` hides by
+/// the same names, so the entries of no module that name its functions and macros are hidden in it
+/// too. The fixture 9249 builds only with the fix (E0308 before).
+#[test]
+fn f83_a_block_hides_the_entries_that_name_what_it_declares() {
+    let copy = |item: &ItemImpl| -> String {
+        let mut leaker = Leaker::from_config(Rules::new().primitive());
+        leaker.check_values = true;
+        let context = leaker.intern_impl(item);
+        let referrer = leaker.result().into_referrer();
+        let mut copy = item.clone();
+        let mut visitor = referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>));
+        visitor.visit_item_impl_mut(&mut copy);
+        string(&copy)
+    };
+    // Each item has the entry of its first parameter, `P<1usize>` (`P<0usize>` is `S`), and a type
+    // in the block that either is the same tokens or is not.
+    let cases: Vec<(&str, ItemImpl, ItemImpl)> = vec![
+        (
+            "use a::b::{self}",
+            parse_quote!(
+                impl S {
+                    pub fn f(_x: b) {
+                        use ::p::m::b::{self};
+                        let _y: b = b::X;
+                    }
+                }
+            ),
+            parse_quote!(
+                impl P<0usize> {
+                    pub fn f(_x: P<1usize>) {
+                        use ::p::m::b::{self};
+                        let _y: b = b::X;
+                    }
+                }
+            ),
+        ),
+        (
+            "use a::{b::{self}, c}",
+            parse_quote!(
+                impl S {
+                    pub fn f(_x: b) {
+                        use ::p::m::{b::{self}, c};
+                        let _y: b = b::X;
+                    }
+                }
+            ),
+            parse_quote!(
+                impl P<0usize> {
+                    pub fn f(_x: P<1usize>) {
+                        use ::p::m::{b::{self}, c};
+                        let _y: b = b::X;
+                    }
+                }
+            ),
+        ),
+        (
+            "use a::b (the name was seen)",
+            parse_quote!(
+                impl S {
+                    pub fn f(_x: b) {
+                        use ::p::m::b;
+                        let _y: b = b::X;
+                    }
+                }
+            ),
+            parse_quote!(
+                impl P<0usize> {
+                    pub fn f(_x: P<1usize>) {
+                        use ::p::m::b;
+                        let _y: b = b::X;
+                    }
+                }
+            ),
+        ),
+        (
+            "const fn n",
+            parse_quote!(
+                impl S {
+                    pub fn f(_x: [u8; n()]) {
+                        const fn n() -> usize {
+                            3
+                        }
+                        let _a: [u8; n()] = [0; 3];
+                    }
+                }
+            ),
+            parse_quote!(
+                impl P<0usize> {
+                    pub fn f(_x: P<1usize>) {
+                        const fn n() -> usize {
+                            3
+                        }
+                        let _a: [u8; n()] = [0; 3];
+                    }
+                }
+            ),
+        ),
+        (
+            "macro_rules! m, named like a type",
+            parse_quote!(
+                impl S {
+                    pub fn f(_x: Wrap<m>) {
+                        macro_rules! m {
+                            () => {};
+                        }
+                        let _a: Wrap<m> = loop {};
+                    }
+                }
+            ),
+            parse_quote!(
+                impl P<0usize> {
+                    pub fn f(_x: P<1usize>) {
+                        macro_rules! m {
+                            () => {};
+                        }
+                        let _a: Wrap<m> = loop {};
+                    }
+                }
+            ),
+        ),
+        // The names that a `use` does not bring: `self as c` brings `c`, `as _` none.
+        (
+            "use a::b::{self as c}",
+            parse_quote!(
+                impl S {
+                    pub fn f(_x: b) {
+                        use ::p::m::b::{self as c};
+                        let _y: b = c::X;
+                    }
+                }
+            ),
+            parse_quote!(
+                impl P<0usize> {
+                    pub fn f(_x: P<1usize>) {
+                        use ::p::m::b::{self as c};
+                        let _y: P<1usize> = c::X;
+                    }
+                }
+            ),
+        ),
+        (
+            "use a::b as _",
+            parse_quote!(
+                impl S {
+                    pub fn f(_x: b) {
+                        use ::p::m::b as _;
+                        let _y: b = loop {};
+                    }
+                }
+            ),
+            parse_quote!(
+                impl P<0usize> {
+                    pub fn f(_x: P<1usize>) {
+                        use ::p::m::b as _;
+                        let _y: P<1usize> = loop {};
+                    }
+                }
+            ),
+        ),
+    ];
+    for (name, item, expected) in cases {
+        assert_eq!(copy(&item), string(&expected), "{}", name);
+    }
+}
+
+// ── F84 ──────────────────────────────────────────────────────────────────────
+
+/// F84 (fixed): a where predicate whose bounded type is a generic in parentheses (`where (T): ..`)
+/// or in an invisible group (`$t:ty` of a `macro_rules!`) was not a bound of the generic.
+///
+/// Trigger: `trait Tr { fn f<'b, T>(&self, t: T) where (T): ::p::Bound<&'b dyn RelTr>; }` was
+/// rejected (`UnprovableBound`, no entry) where `T: ::p::Bound<&'b dyn RelTr>` has the entry
+/// `&'b dyn RelTr`; `struct S<'a, T>(&'a (), T) where (T): Iterator<Item = Rel<'a>>` (or the same
+/// with the group) got an `UnprovableBound` for `Rel<'a>` too. The context of an entry had the
+/// predicate (`<T> where T: ..`) and not the bound of `T`, so it changed when the Referrer was
+/// written and read back.
+///
+/// Cause: `bounded_generic()`, which tells a bound of the generic from another predicate, and
+/// `canonicalize()`, which moves it to the generic, matched a bounded type that is the path itself;
+/// `bounded_ident()` and the checks of the unstable bounds look through groups and parentheses.
+///
+/// Fix: both use `bounded_ident()`, so the predicate moves to the bare parameter: the same
+/// context, errors and entries as `T: ..`.
+#[test]
+fn f84_a_predicate_on_a_generic_in_parentheses_or_a_group_is_a_bound_of_it() {
+    // Wraps the bounded type of each predicate in an invisible group.
+    struct Group;
+    impl VisitMut for Group {
+        fn visit_predicate_type_mut(&mut self, i: &mut PredicateType) {
+            let inner = std::mem::replace(&mut i.bounded_ty, Type::Verbatim(Default::default()));
+            i.bounded_ty = Type::Group(TypeGroup {
+                group_token: Default::default(),
+                elem: Box::new(inner),
+            });
+        }
+    }
+    // The errors, the entries with their generics, the serialized Referrer, whether it reads back
+    // equal, and the copy with `P<ix>` for each entry.
+    let outcome = |item: &Item| {
+        let mut leaker = new_leaker();
+        let context = intern(&mut leaker, item);
+        let result = leaker.result();
+        let errors = joined_messages(result.errors());
+        let referrer = result.into_referrer();
+        let entries: Vec<(String, String)> = referrer
+            .iter()
+            .map(|(_, ty, context)| (string(ty), string(&context.generics)))
+            .collect();
+        let tokens = string(&referrer);
+        let back: Referrer = syn::parse_str(&tokens).unwrap();
+        assert!(back == referrer, "{} reads back as another", tokens);
+        let mut copy = item.clone();
+        referrer
+            .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
+            .visit_item_mut(&mut copy);
+        (errors, entries, tokens, string(&copy))
+    };
+    // The same item with the predicate written in each way.
+    let forms: Vec<(Item, Item, Item)> = vec![
+        (
+            parse_quote!(
+                trait Tr {
+                    fn f<'b, T>(&self, t: T)
+                    where
+                        T: ::p::Bound<&'b dyn RelTr>;
+                }
+            ),
+            parse_quote!(
+                trait Tr {
+                    fn f<'b, T>(&self, t: T)
+                    where
+                        (T): ::p::Bound<&'b dyn RelTr>;
+                }
+            ),
+            parse_quote!(
+                trait Tr {
+                    fn f<'b, T>(&self, t: T)
+                    where
+                        T: ::p::Bound<P<0usize>>;
+                }
+            ),
+        ),
+        (
+            parse_quote!(
+                struct S<'a, T>(&'a (), T)
+                where
+                    T: Iterator<Item = Rel<'a>>;
+            ),
+            parse_quote!(
+                struct S<'a, T>(&'a (), T)
+                where
+                    (T): Iterator<Item = Rel<'a>>;
+            ),
+            parse_quote!(
+                struct S<'a, T>(&'a (), T)
+                where
+                    T: Iterator<Item = P<0usize>>;
+            ),
+        ),
+    ];
+    for (bare, parenthesized, replaced) in forms {
+        let (errors, entries, tokens, copy) = outcome(&bare);
+        assert_eq!(errors, "", "{}", string(&bare));
+        assert_eq!(entries.len(), 1, "{}", string(&bare));
+        assert_eq!(copy, string(&replaced));
+        let mut grouped = bare.clone();
+        Group.visit_item_mut(&mut grouped);
+        for (form, item) in [("parentheses", &parenthesized), ("group", &grouped)] {
+            let (errors, got, serialized, copied) = outcome(item);
+            assert_eq!(errors, "", "{}: {}", form, string(item));
+            assert_eq!(got, entries, "{}: {}", form, string(item));
+            assert_eq!(serialized, tokens, "{}: {}", form, string(item));
+            // The predicate stays as it was written, with the type replaced.
+            assert_eq!(
+                copied.replace("(T)", "T"),
+                copy,
+                "{}: {}",
+                form,
+                string(item)
+            );
+        }
+    }
+    // The entries: the type of the bound of the method, and `Rel<'a>`, each with its lifetime.
+    let (_, entries, _, _) = outcome(&forms_of_the_method());
+    assert_eq!(
+        entries,
+        [(ty(parse_quote!(&'b dyn RelTr)), "< 'b >".to_string())]
+    );
+    fn forms_of_the_method() -> Item {
+        parse_quote!(
+            trait Tr {
+                fn f<'b, T>(&self, t: T)
+                where
+                    (T): ::p::Bound<&'b dyn RelTr>;
+            }
+        )
+    }
+}
+
+// ── F85 ──────────────────────────────────────────────────────────────────────
+
+/// F85 (fixed): `Leaker::check_values` was ignored in the default of a type parameter of the item
+/// that a scope is for.
+///
+/// Trigger: `struct S<T = [u8; { const C: usize = rel::N; 3 }]>(T)` with `check_values` on: no error
+/// for `rel::N`, which the copy writes as it is in a crate that has no `rel` (`[u8; { const C:
+/// usize = rel::N; 3 }]` as a field is the error `rel::N`). The same for an enum, a union, a trait
+/// and `enter_generics()`.
+///
+/// Cause: the defaults of the type parameters of the root item are analyzed alone, with the
+/// parameters before them, by a visitor of their own, which was made with `check_values` off.
+/// (The defaults of a nested item are visited by the walk, which has the option.)
+///
+/// Fix: that visitor has the option of the visitor that makes it. Not changed: a local name in an
+/// array length (`{ const C: usize = 3; let _v: Option<_> = None::<u8>; C }`) is a relative path
+/// for the visitor of a type, with or without `check_values`, in a field as in a default; it is an
+/// error only where the type cannot be an entry (`_`).
+#[test]
+fn f85_the_values_in_the_default_of_a_type_parameter_are_read_with_check_values() {
+    let default: Type = parse_quote!(
+        [u8; {
+            const C: usize = rel::N;
+            3
+        }]
+    );
+    // The items, with the default in the generics, and the control with the same type in a field.
+    let items: Vec<(&str, Item)> = vec![
+        ("struct", parse_quote!(struct S<T = #default>(T);)),
+        ("enum", parse_quote!(enum E<T = #default> { A(T) })),
+        ("union", parse_quote!(union U<T = #default> { a: T })),
+        ("trait", parse_quote!(trait Tr<T = #default> {})),
+        (
+            "second parameter",
+            parse_quote!(struct S<U, T = #default>(U, T);),
+        ),
+        ("field", parse_quote!(struct S(#default);)),
+    ];
+    // The causes of the errors with `in_value` and `in_default`, and the number of entries.
+    let found = |item: &Item, check_values: bool, config: Rules<()>| {
+        let mut leaker = Leaker::from_config(config);
+        leaker.check_values = check_values;
+        intern(&mut leaker, item);
+        let result = leaker.result();
+        let errors: Vec<(String, bool, bool)> = (result.errors().iter())
+            .map(|error| (string(&error.cause), error.in_value, error.in_default))
+            .collect();
+        let reasons: Vec<Reason> = result.errors().iter().map(|e| e.reason).collect();
+        assert!(
+            reasons.iter().all(|r| *r == Reason::RelativePath),
+            "{:?}",
+            reasons
+        );
+        (errors, result.into_referrer().iter().count())
+    };
+    let config = || Rules::new().primitive().prelude();
+    for (name, item) in &items {
+        let in_default = *name != "field";
+        // Read: the error is in a value, and in a default for the parameters.
+        assert_eq!(
+            found(item, true, config()),
+            (vec![("rel :: N".to_string(), true, in_default)], 0),
+            "{}",
+            name
+        );
+        // Not read: the value is not looked at.
+        assert_eq!(found(item, false, config()), (vec![], 0), "{}", name);
+        // A rule that allows the values accepts it, as the rule is asked at a value.
+        assert_eq!(
+            found(item, true, config().values()),
+            (vec![], 0),
+            "{}",
+            name
+        );
+    }
+    // `enter_generics()` for the generics of an item that a macro analyzes itself.
+    let generics: Generics = parse_quote!(<T = #default>);
+    for (check_values, expected) in [(false, vec![]), (true, vec!["rel :: N".to_string()])] {
+        let mut leaker = Leaker::from_config(config());
+        leaker.check_values = check_values;
+        leaker.enter_generics(&generics, |_| {});
+        let result = leaker.result();
+        let causes: Vec<String> = result.errors().iter().map(|e| string(&e.cause)).collect();
+        assert_eq!(
+            causes, expected,
+            "enter_generics, check_values {}",
+            check_values
+        );
+    }
+    // A default with no relative path in its values is accepted with the option on.
+    let item: Item = parse_quote!(
+        struct S<
+            T = [u8; {
+                    const C: usize = 2;
+                    3
+                }],
+        >(T);
+    );
+    assert_eq!(found(&item, true, config()), (vec![], 0));
+}
+
+// ── F86 ──────────────────────────────────────────────────────────────────────
+
+/// F86 (fixed): a generic of an item nested in the default of a type parameter was taken for a
+/// relative path.
+///
+/// Trigger: `struct S<T = [u8; { struct Z<U>(U); 3 }]>(T)`: an entry for the array (as a field,
+/// `struct S([u8; { struct Z<U>(U); 3 }])`, there is none), and with `Self` in the nested struct
+/// (`struct Z<U>(U, Option<Self>)`) the error `SelfInDefault`. The same for a `fn`, an enum, a
+/// union, a trait or an impl in the block, and for the default of a trait.
+///
+/// Cause: the defaults of the type parameters of the root item are analyzed alone by a visitor of
+/// their own, which started outside every item (`item_depth` 0), where the visitor that the Leaker
+/// makes is inside the scope. The first item that it met was taken for the outermost one, whose
+/// generics are those of the Leaker (already in scope), so `U` was a relative path, and the `Self`
+/// of the item the one of the scope.
+///
+/// Fix: that visitor starts inside the scope (`item_depth` 1): an item in the default is nested,
+/// with its own generics and `Self`, as in a field. The probes of the bounds of a context
+/// (`in_context()`) start at 0 too; none of the shapes tried (an item in an array length of a
+/// bound or of the self type of an impl) shows a difference, so they are left.
+#[test]
+fn f86_the_generics_of_an_item_in_the_default_of_a_type_parameter_are_its_own() {
+    let blocks: Vec<(&str, Expr)> = vec![
+        (
+            "struct",
+            parse_quote!({
+                struct Z<U>(U);
+                3
+            }),
+        ),
+        (
+            "enum",
+            parse_quote!({
+                enum Z<U> {
+                    A(U),
+                }
+                3
+            }),
+        ),
+        (
+            "union",
+            parse_quote!({
+                union Z<U> {
+                    a: U,
+                }
+                3
+            }),
+        ),
+        (
+            "fn",
+            parse_quote!({
+                fn f<U>(_u: U) {}
+                3
+            }),
+        ),
+        (
+            "trait",
+            parse_quote!({
+                trait Tr<U> {
+                    fn f(&self, u: U);
+                }
+                3
+            }),
+        ),
+        (
+            "impl",
+            parse_quote!({
+                impl<U> Z<U> {}
+                3
+            }),
+        ),
+        (
+            "Self of the item",
+            parse_quote!({
+                struct Z<U>(U, Option<Self>);
+                3
+            }),
+        ),
+        (
+            "a relative type in the item",
+            parse_quote!({
+                struct Z<U>(U, Rel);
+                3
+            }),
+        ),
+        (
+            "two generics",
+            parse_quote!({
+                struct Z<U, V: Into<U>>(U, V);
+                3
+            }),
+        ),
+    ];
+    // The reasons and messages of the errors, and the entries.
+    let found = |item: &Item| -> (Vec<(Reason, String)>, Vec<String>) {
+        let mut leaker = new_leaker();
+        intern(&mut leaker, item);
+        let result = leaker.result();
+        let errors = (result.errors().iter())
+            .map(|error| (error.reason, error.message.clone()))
+            .collect();
+        let entries = (result.into_referrer().iter())
+            .map(|(_, ty, _)| string(ty))
+            .collect();
+        (errors, entries)
+    };
+    for (name, block) in &blocks {
+        let ty: Type = parse_quote!([u8; #block]);
+        let field = found(&parse_quote!(struct S(#ty);));
+        for (place, item) in [
+            ("struct", parse_quote!(struct S<T = #ty>(T);)),
+            (
+                "second parameter",
+                parse_quote!(struct S<U, T = #ty>(U, T);),
+            ),
+            ("enum", parse_quote!(enum E<T = #ty> { A(T) })),
+            ("union", parse_quote!(union Un<T = #ty> { a: T })),
+            ("trait", parse_quote!(trait Tr<T = #ty> {})),
+        ] {
+            let default = found(&item);
+            // The default has the same errors as the field, and, if it has entries, the same.
+            assert_eq!(default, field, "{} in the default of a {}", name, place);
+        }
+    }
+    // What they are: no error and no entry for a nested item with generics, and the same for the
+    // one with the `Self` of its own.
+    let plain = found(&parse_quote!(
+        struct S<
+            T = [u8; {
+                    struct Z<U>(U);
+                    3
+                }],
+        >(T);
+    ));
+    assert_eq!(plain, (vec![], vec![]));
+    let own_self = found(&parse_quote!(
+        struct S<
+            T = [u8; {
+                    struct Z<U>(U, Option<Self>);
+                    3
+                }],
+        >(T);
+    ));
+    assert_eq!(own_self, (vec![], vec![]));
+}
+
+// ── F87 ──────────────────────────────────────────────────────────────────────
+
+/// F87 (fixed): the probe of a `for<'a>` binder left the contexts that it interned, so a `mod` in
+/// the binder was numbered twice and the contexts after it were numbered higher.
+///
+/// Trigger: `mod outer { pub struct S(for<'a> fn(&'a [u8; { mod m {} 3 }]) -> &'a u8, Rel); }`
+/// through `intern_mod()`: the entry `Rel` is in the context 3 of the serialized Referrer, and 2 for
+/// the same item without the binder (`fn(&[u8; { mod m {} 3 }]) -> &u8`, which the walk does not
+/// probe). Every `mod` that a probed binder holds shifted the numbers after it by one more (two
+/// modules by two, a module inside a module by two). Nothing but the numbers differs: the entries,
+/// the errors and the contexts are the same.
+///
+/// Cause: `probe_binder()` walks the binder once without effect, to find the types that cannot be
+/// leaked, and puts back the frame and the records it knows (`self_errors`, `env_errors`,
+/// `not_optional`), but not the table of contexts, where `with_module()` interns the module.
+///
+/// Fix: the probe puts back all the records (`Records::truncate()`, as a failed scope does), so
+/// the walk that follows numbers the module as if there had been no probe.
+#[test]
+fn f87_the_probe_of_a_binder_leaves_the_numbers_of_the_contexts_as_they_were() {
+    // The items with a binder, which the walk probes, and without, which it does not. The binder
+    // adds nothing to the types: its lifetime is the one that the elided output takes.
+    let items: Vec<(&str, Item, Item)> = vec![
+        (
+            "a module in the binder",
+            parse_quote!(
+                mod outer {
+                    pub struct S(
+                        for<'a> fn(
+                            &'a [u8; {
+                                    mod m {}
+                                    3
+                                }],
+                        ) -> &'a u8,
+                        Rel,
+                    );
+                }
+            ),
+            parse_quote!(
+                mod outer {
+                    pub struct S(
+                        fn(
+                            &[u8; {
+                                 mod m {}
+                                 3
+                             }],
+                        ) -> &u8,
+                        Rel,
+                    );
+                }
+            ),
+        ),
+        (
+            "two modules, and a module after the binder",
+            parse_quote!(
+                mod outer {
+                    pub struct S(
+                        for<'a> fn(
+                            &'a [u8; {
+                                    mod m {}
+                                    mod n {}
+                                    3
+                                }],
+                        ) -> &'a u8,
+                        Rel,
+                    );
+                    pub struct R(
+                        [u8; {
+                            mod p {}
+                            2
+                        }],
+                        Rel2,
+                    );
+                }
+            ),
+            parse_quote!(
+                mod outer {
+                    pub struct S(
+                        fn(
+                            &[u8; {
+                                 mod m {}
+                                 mod n {}
+                                 3
+                             }],
+                        ) -> &u8,
+                        Rel,
+                    );
+                    pub struct R(
+                        [u8; {
+                            mod p {}
+                            2
+                        }],
+                        Rel2,
+                    );
+                }
+            ),
+        ),
+        (
+            "a module in a module",
+            parse_quote!(
+                mod outer {
+                    pub struct S(
+                        for<'a> fn(
+                            &'a [u8; {
+                                    mod m {
+                                        mod k {}
+                                    }
+                                    3
+                                }],
+                        ) -> &'a u8,
+                        Rel,
+                    );
+                    pub struct R(Rel2);
+                }
+            ),
+            parse_quote!(
+                mod outer {
+                    pub struct S(
+                        fn(
+                            &[u8; {
+                                 mod m {
+                                     mod k {}
+                                 }
+                                 3
+                             }],
+                        ) -> &u8,
+                        Rel,
+                    );
+                    pub struct R(Rel2);
+                }
+            ),
+        ),
+        (
+            "a binder in a bound",
+            parse_quote!(
+                mod outer {
+                    pub struct S<T>(T, Rel)
+                    where
+                        T: for<'a> Fn(
+                            &'a [u8; {
+                                    mod m {}
+                                    3
+                                }],
+                        ) -> &'a u8;
+                    pub struct R(Rel2);
+                }
+            ),
+            parse_quote!(
+                mod outer {
+                    pub struct S<T>(T, Rel)
+                    where
+                        T: Fn(
+                            &[u8; {
+                                 mod m {}
+                                 3
+                             }],
+                        ) -> &u8;
+                    pub struct R(Rel2);
+                }
+            ),
+        ),
+    ];
+    // The serialized Referrer and the errors, through `intern_mod()` and `enter_mod()`.
+    let analyze = |item: &Item, enter: bool| -> (String, Vec<(Reason, String)>, usize) {
+        let mut leaker = new_leaker();
+        if enter {
+            let outer = match item {
+                Item::Mod(item) => item,
+                _ => panic!("a mod"),
+            };
+            let items = outer.content.as_ref().expect("a body").1.clone();
+            leaker.enter_mod("outer", [], |view| {
+                for item in &items {
+                    view.visit_item(item);
+                }
+            });
+        } else {
+            intern(&mut leaker, item);
+        }
+        let result = leaker.result();
+        let errors = (result.errors().iter())
+            .map(|error| (error.reason, error.message.clone()))
+            .collect();
+        let referrer = result.into_referrer();
+        (string(&referrer), errors, referrer.iter().count())
+    };
+    for (name, probed, plain) in &items {
+        for enter in [false, true] {
+            let (text, errors, entries) = analyze(plain, enter);
+            assert!(
+                entries > 0,
+                "{} (enter: {}): there are entries",
+                name,
+                enter
+            );
+            assert_eq!(
+                analyze(probed, enter),
+                (text, errors, entries),
+                "{} (enter: {})",
+                name,
+                enter
+            );
+        }
+    }
+    // The context of `Rel` has the number that the item without a probe gives it (2).
+    let text = analyze(&items[0].1, false).0;
+    assert!(text.contains("# 2 mod 0 ;"), "{}", text);
+}
+
+// ── F88 ──────────────────────────────────────────────────────────────────────
+
+/// F88 (fixed): a `Self` projection in parentheses or an invisible group, in a bound, was reported
+/// twice.
+///
+/// Trigger: `struct S<T: ::p::Bound<(Self::A)>>(T)` gave two `UnprovableBound`, one for `Self::A` and
+/// one for `(Self::A)` (`((Self::A))` three), and the recovered Referrer two parts, where
+/// `Bound<Self::A>` gives one error and one part. A `$t:ty` of a `macro_rules!` is the same with
+/// the group (`Self::A` twice, with the same message). The same for `<Self as Tr>::A`, `Self::A::B`,
+/// one in the arguments of a path, and the bare `Self` in a bound of an impl that has a leaked
+/// type.
+///
+/// Cause: the check of a type in a predicate that names `Self` (`self_in_predicate()`) looks
+/// through the wrappers (`is_self_projection()`, `is_bare_self()`), and it runs for each type that
+/// the walk decides: the one in the parentheses and the parentheses.
+///
+/// Fix: the check skips the wrapper: the type inside has the error, once, as without the wrapper.
+#[test]
+fn f88_a_self_projection_in_parentheses_or_a_group_has_one_error() {
+    // Wraps each type headed by `Self` (`Self`, `Self::A`, `<Self as Tr>::A`) `times` times in
+    // parentheses, or in an invisible group.
+    struct Wrap {
+        group: bool,
+        times: usize,
+        wrapped: usize,
+    }
+    impl VisitMut for Wrap {
+        fn visit_type_mut(&mut self, i: &mut Type) {
+            let headed = match &*i {
+                Type::Path(path) => match &path.qself {
+                    Some(qself) => matches!(&*qself.ty, Type::Path(p) if p.path.is_ident("Self")),
+                    None => path
+                        .path
+                        .segments
+                        .first()
+                        .map_or(false, |s| s.ident == "Self"),
+                },
+                _ => false,
+            };
+            if !headed {
+                return syn::visit_mut::visit_type_mut(self, i);
+            }
+            for _ in 0..self.times {
+                let elem = Box::new(i.clone());
+                *i = if self.group {
+                    Type::Group(TypeGroup {
+                        group_token: Default::default(),
+                        elem,
+                    })
+                } else {
+                    Type::Paren(TypeParen {
+                        paren_token: Default::default(),
+                        elem,
+                    })
+                };
+                self.wrapped += 1;
+            }
+        }
+    }
+    // Replaces `Rel` by the entry that the copy writes for it.
+    struct Replace;
+    impl VisitMut for Replace {
+        fn visit_type_mut(&mut self, i: &mut Type) {
+            if matches!(&*i, Type::Path(p) if p.path.is_ident("Rel")) {
+                *i = parse_quote!(P<0usize>);
+            }
+            syn::visit_mut::visit_type_mut(self, i);
+        }
+    }
+    // The items, and the reasons of the errors of each.
+    let items: Vec<(&str, Item, Vec<Reason>)> = vec![
+        (
+            "a bound",
+            parse_quote!(
+                struct S<T: ::p::Bound<Self::A>>(T);
+            ),
+            vec![Reason::UnprovableBound],
+        ),
+        (
+            "a where predicate",
+            parse_quote!(
+                struct S<T>(T)
+                where
+                    T: ::p::Bound<Self::A>;
+            ),
+            vec![Reason::UnprovableBound],
+        ),
+        (
+            "a qualified path",
+            parse_quote!(
+                struct S<T: ::p::Bound<<Self as ::p::Tr>::A>>(T);
+            ),
+            vec![Reason::UnprovableBound],
+        ),
+        (
+            "two segments after Self",
+            parse_quote!(
+                struct S<T: ::p::Bound<Self::A::B>>(T);
+            ),
+            vec![Reason::UnprovableBound],
+        ),
+        (
+            "in the arguments of a path",
+            parse_quote!(
+                struct S<T: ::p::Bound<Vec<Self::A>>>(T);
+            ),
+            vec![Reason::UnprovableBound],
+        ),
+        (
+            "Self of an impl, and a leaked type",
+            parse_quote!(
+                impl<T: Into<Self> + AsRef<Rel>> S<T> {}
+            ),
+            vec![Reason::SelfInImplSelfType, Reason::UnprovableBound],
+        ),
+    ];
+    // The reasons and messages of the errors, and the entries, and the copy of the item.
+    let analyze = |item: &Item| -> (Vec<(Reason, String)>, Vec<String>, String) {
+        let mut leaker = new_leaker();
+        let context = intern(&mut leaker, item);
+        let result = leaker.result();
+        let errors = (result.errors().iter())
+            .map(|error| (error.reason, error.message.clone()))
+            .collect();
+        let referrer = result.into_referrer();
+        let entries = referrer.iter().map(|(_, ty, _)| string(ty)).collect();
+        let mut copy = item.clone();
+        referrer
+            .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
+            .visit_item_mut(&mut copy);
+        (errors, entries, string(&copy))
+    };
+    for (name, item, reasons) in &items {
+        let (errors, entries, _) = analyze(item);
+        assert_eq!(
+            errors.iter().map(|(reason, _)| *reason).collect::<Vec<_>>(),
+            *reasons,
+            "{}",
+            name
+        );
+        for group in [false, true] {
+            for times in [1, 2] {
+                let mut wrapped = item.clone();
+                let mut wrap = Wrap {
+                    group,
+                    times,
+                    wrapped: 0,
+                };
+                wrap.visit_item_mut(&mut wrapped);
+                assert!(wrap.wrapped >= times, "{}: nothing to wrap", name);
+                let what = format!("{}, group: {}, times: {}", name, group, times);
+                let (got_errors, got_entries, got_copy) = analyze(&wrapped);
+                // The same errors and entries as without the wrapper.
+                assert_eq!(got_errors, errors, "{}", what);
+                assert_eq!(got_entries, entries, "{}", what);
+                // The copy is the item with the wrapper, and the entry replaced.
+                let mut expected = wrapped.clone();
+                Replace.visit_item_mut(&mut expected);
+                assert_eq!(got_copy, string(&expected), "{}", what);
+            }
+        }
+    }
+}
+
+// ── F89 ──────────────────────────────────────────────────────────────────────
+
+/// F89 (fixed): the outlives relations of the where clause of a generic associated type were
+/// written for the wrong generics when the argument for its parameter is not a name.
+///
+/// Trigger: `trait Tr { type G<'b, U: ::core::ops::Deref> where U: 'b, U::Target: 'b; fn f<'x, U: Deref>(&self,
+/// u: U, a: Wrap<&'x Self::G<'x, &'x u8>>); }`: the context of `Wrap<..>` had `<'x>` and the
+/// predicate `U::Target: 'x`, the parameter of `G` where the impl of the Repeater has no `U` (E0412,
+/// or E0223 where a struct `U` is in scope: the fixture 9251 did not build). The same with the
+/// parameter of the trait (`trait Tr<V: Iterator> { type G<'b> where V::Item: 'b; .. <Self as
+/// Tr<&'x mut T>>::G<'x> .. }` gave `V::Item: 'x`, a requirement on a generic that the use does
+/// not mention), and with `T::IntoIter` for `U` (`T: 'x` and not `T::IntoIter: 'x`).
+///
+/// Cause: `Substitution::fold_type()` takes `U::Item` for `U` replaced by the argument `Arg` as the
+/// segments of `Arg` followed by `Item`, which is a projection only if `Arg` is a name that may be a
+/// type parameter (`T::A::Item` for `T::A`, `Vec<u8>::Item`), and left `U::Item` where the argument
+/// is not a path (`&'x u8`).
+///
+/// Fix: a name is replaced as before (`T::Item`), any other argument gives `<Arg>::Item`, as the
+/// encoder writes it (F74), whose parts are what the requirement mentions, as for `<Vec<T> as
+/// IntoIterator>::Item`. Not changed: what that mentions can be stricter than the original (`<T::IntoIter
+/// as Iterator>::Item: 'x` is the relation; the parts are `T::IntoIter: 'x`), since a `Gat` keeps no
+/// trait bound, which `<Arg as Trait>::Item` needs.
+#[test]
+fn f89_the_arguments_of_a_generic_associated_type_replace_its_parameters_in_its_where_clause() {
+    // The context of the entry `Rel<..>` of the method `f` of the trait: its generics and its
+    // predicates.
+    let context_of = |item: ItemTrait| -> String {
+        let mut leaker = Leaker::from_config(Rules::new().primitive().prelude().std_crates());
+        leaker.intern_trait(&item);
+        let result = leaker.result();
+        assert!(result.errors().is_empty(), "{}", string(&item));
+        let referrer = result.into_referrer();
+        let entries: Vec<_> = referrer.iter().collect();
+        assert_eq!(entries.len(), 1, "{}", string(&item));
+        let generics = &entries[0].2.generics;
+        let predicates: Vec<String> = (generics.where_clause.iter())
+            .flat_map(|where_clause| where_clause.predicates.iter())
+            .map(string)
+            .collect();
+        format!("{} where {}", string(generics), predicates.join(" , "))
+    };
+    // Each trait declares `type G` with a relation on a projection of a parameter (of `G`, or of
+    // the trait), and `f` uses it with the argument for the parameter. The context has the
+    // relation of the argument: `X::Item: 'x` for the name `X`, the parts of the argument for a type
+    // that is no name, and none for a type with no generic.
+    let gat = |params: &str, arg: &str| -> ItemTrait {
+        parse_str(&format!(
+            "trait Tr {{ type G<'b, U: Iterator> where U::Item: 'b; \
+             fn f<'x{}>(&self, a: Rel<&'x Self::G<'x, {}>>); }}",
+            params, arg
+        ))
+        .unwrap()
+    };
+    let trait_param = |params: &str, arg: &str| -> ItemTrait {
+        parse_str(&format!(
+            "trait Tr<V: Iterator> {{ type G<'b> where V::Item: 'b; \
+             fn f<'x{}>(&self, a: Rel<&'x <Self as Tr<{}>>::G<'x>>); }}",
+            params, arg
+        ))
+        .unwrap()
+    };
+    let cases: Vec<(&str, ItemTrait, &str)> = vec![
+        // A name: the projection of the generic.
+        (
+            "a generic",
+            gat(", T: Iterator", "T"),
+            "< 'x , T : Iterator > where Self :: G < 'x , T > : 'x , T :: Item : 'x",
+        ),
+        (
+            "the trait parameter, a generic",
+            trait_param(", T: Iterator", "T"),
+            "< 'x , T : Iterator , V : Iterator > where < Self as Tr < T > > :: G < 'x > : 'x , T :: Item : 'x",
+        ),
+        // A type with no generic: nothing to prove.
+        (
+            "a concrete type",
+            gat("", "::std::vec::IntoIter<u8>"),
+            "< 'x > where Self :: G < 'x , :: std :: vec :: IntoIter < u8 > > : 'x",
+        ),
+        (
+            "the trait parameter, a concrete type",
+            trait_param("", "::std::vec::IntoIter<u8>"),
+            "< 'x , V : Iterator > where < Self as Tr < :: std :: vec :: IntoIter < u8 > > > :: G < 'x > : 'x",
+        ),
+        // A type that is no name: its parts, not the parameter of the declaration.
+        (
+            "a reference to a generic",
+            gat(", T: Iterator", "&'x mut T"),
+            "< 'x , T : 'x + Iterator > where Self :: G < 'x , & 'x mut T > : 'x",
+        ),
+        (
+            "the trait parameter, a reference to a generic",
+            trait_param(", T: Iterator", "&'x mut T"),
+            "< 'x , T : 'x + Iterator , V : Iterator > where < Self as Tr < & 'x mut T > > :: G < 'x > : 'x",
+        ),
+        // The same name in the method as the parameter of the declaration: not taken for it.
+        (
+            "a reference to a generic that has the name of the parameter",
+            gat(", U: Iterator", "&'x mut U"),
+            "< 'x , U : 'x + Iterator > where Self :: G < 'x , & 'x mut U > : 'x",
+        ),
+        (
+            "the trait parameter, a reference to a generic with its name",
+            trait_param(", V2: Iterator", "&'x mut V2"),
+            "< 'x , V : Iterator , V2 : 'x + Iterator > where < Self as Tr < & 'x mut V2 > > :: G < 'x > : 'x",
+        ),
+        // A projection of a generic: `<T::IntoIter>::Item` is the projection of `T::IntoIter`, and
+        // names no `T::IntoIter::Item`.
+        (
+            "a projection of a generic",
+            gat(", T: IntoIterator", "T::IntoIter"),
+            "< 'x , T : IntoIterator > where Self :: G < 'x , T :: IntoIter > : 'x , T :: IntoIter : 'x",
+        ),
+    ];
+    for (name, item, expected) in cases {
+        assert_eq!(context_of(item), expected, "{}", name);
+    }
+    // The case of the fixture: the parameter of `G` is named `U` and no generic of the method is.
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            type G<'b, U: ::core::ops::Deref>
+            where
+                U: 'b,
+                U::Target: 'b;
+            fn f<'x, W: ::core::ops::Deref>(&self, u: W, a: Rel<&'x Self::G<'x, &'x u8>>);
+        }
+    );
+    assert_eq!(
+        context_of(item),
+        "< 'x > where Self :: G < 'x , & 'x u8 > : 'x"
+    );
+}
+
+// ── F90 ──────────────────────────────────────────────────────────────────────
+
+/// F90 (fixed): `substitute_args()` and `complete_params()` wrote the associated type of an
+/// argument that is not a type parameter as `<arg>::A`, which rustc rejects.
+///
+/// Trigger: `trait Tr<T: Iterator> { fn f(&self) -> Option<T::Item>; }` and `impl
+/// Tr<::std::vec::IntoIter<u8>> for ..`: the copy of the signature had
+/// `Option<<::std::vec::IntoIter<u8>>::Item>`, E0223 ("ambiguous associated type"), in the
+/// Referrer's crate (fixture 9252). So did a default `U = T::Item` that `complete_params()`
+/// completes (F74; stable rustc takes the shorthand in a default only from 1.101, so no fixture
+/// shows it). `<V>::A` resolves only if `V` is a type parameter: the path `T::A` finds `A` in a
+/// bound of `T`, and nothing finds it for any other type.
+///
+/// Cause: F60 and F74 wrote `<value>::A` for every value.
+///
+/// Fix, by the owner's choice "use the bound, else error" (`<IntoIter<u8>>::Item` is no valid
+/// type, so the call fails instead of writing it): a value that is one identifier keeps `<V>::A`
+/// (it is taken for a type parameter). Otherwise `complete_params()`, which has the parameters,
+/// writes `<value as Trait>::A` if the parameter has exactly one trait bound (a path bound, on the
+/// parameter itself: `?Sized` and lifetimes are not counted, a where clause is not known), without
+/// the associated types it fixes (`Iterator<Item = u8>` is `Iterator`) and with the earlier
+/// parameters replaced in its arguments. Where there is none, or several, or a `for<'a>` binder,
+/// and in `substitute_args()`, which has no bounds, the call fails with
+/// `EncodeError::AmbiguousAssociatedType` (the path as it would be written), and `args` stay as
+/// they are. A macro writes the trait itself for `substitute_args()`: `<T as Iterator>::Item`, in
+/// which `T` is replaced. The qualified form `<T>::A` is the same path as `T::A`. `Self::A` in an
+/// expression is not a type and stays `<value>::A`.
+///
+/// Limitations: the trait of the bound must declare the type itself (`F: FnOnce(u8) -> u8` gives
+/// `<V as FnOnce(u8)>::Output`, but `Fn` has no `Output`: rustc refuses it); one identifier may name
+/// a concrete type, which `<Host>::A` does not resolve either. `Visitor::with_self()` writes
+/// `Self::A` as `<host>::A` and is not changed.
+///
+/// The property test shows it only for an item with such a projection and an `inst(N)` that gives
+/// a type for the parameter.
+#[test]
+fn f90_the_associated_type_of_an_argument_is_written_through_a_bound_or_refused() {
+    let complete = |params: Punctuated<GenericParam, Token![,]>, given: &[&str]| {
+        complete_params(&params, &f59_args(given))
+            .map(|completed| string(completed.last().unwrap()))
+            .map_err(|error| error.to_string())
+    };
+    let ambiguous =
+        |params: Punctuated<GenericParam, Token![,]>, given: &[&str]| match complete_params(
+            &params,
+            &f59_args(given),
+        ) {
+            Err(EncodeError::AmbiguousAssociatedType(ty)) => string(&*ty),
+            other => panic!("{}: {:?}", string(&params), other),
+        };
+    let into_iter = ["::std::vec::IntoIter<u8>"];
+
+    // The trigger, in a default: the one bound of `T`.
+    assert_eq!(
+        complete(parse_quote!(T: Iterator, U = Option<T::Item>), &into_iter),
+        Ok(ty(parse_quote!(
+            Option<<::std::vec::IntoIter<u8> as Iterator>::Item>
+        )))
+    );
+    // The bindings of the bound go; the path, the lifetime and `?Sized` are as they are.
+    for (bound, trait_path) in [
+        ("Iterator<Item = u8>", "Iterator"),
+        (
+            "::core::iter::Iterator<Item = u8>",
+            "::core::iter::Iterator",
+        ),
+        ("'a + ?Sized + Iterator", "Iterator"),
+        ("Iterator<Item: Clone>", "Iterator"),
+        ("Tr<'a, u8, Item = u8>", "Tr<'static, u8>"),
+    ] {
+        let generics: Generics = parse_str(&format!("<'a, T: {}, U = T::Item>", bound)).unwrap();
+        let params = generics.params;
+        let expected = format!("<::std::vec::IntoIter<u8> as {}>::Item", trait_path);
+        assert_eq!(
+            complete(params, &["'static", "::std::vec::IntoIter<u8>"]),
+            Ok(ty(parse_str(&expected).unwrap())),
+            "{}",
+            bound
+        );
+    }
+    // The earlier parameters are replaced in the arguments of the bound and in the path after `T`
+    // (`T::A<U>`), and `<T>::A` is the same path as `T::A`.
+    assert_eq!(
+        complete(parse_quote!(U, T: Tr<U>, V = T::A<U>), &["u8", "Vec<u8>"]),
+        Ok(ty(parse_quote!(<Vec<u8> as Tr<u8>>::A<u8>)))
+    );
+    assert_eq!(
+        complete(parse_quote!(T: Iterator, U = <T>::Item), &into_iter),
+        Ok(ty(parse_quote!(
+            <::std::vec::IntoIter<u8> as Iterator>::Item
+        )))
+    );
+    // An argument that is one identifier keeps `<V>::A`, with a bound or without.
+    for params in [
+        parse_quote!(T: Iterator, U = T::Item),
+        parse_quote!(T, U = T::Item),
+        parse_quote!(T: Clone + Iterator, U = T::Item),
+    ] {
+        assert_eq!(complete(params, &["I"]), Ok(ty(parse_quote!(<I>::Item))));
+    }
+
+    // No bound, several, or a binder: the error has the path as it would be written.
+    for params in [
+        parse_quote!(T, U = T::Item),
+        parse_quote!(T: ?Sized, U = T::Item),
+        parse_quote!(T: 'static, U = T::Item),
+        parse_quote!(T: Clone + Iterator, U = T::Item),
+        parse_quote!(T: for<'a> Tr<'a>, U = T::Item),
+    ] {
+        assert_eq!(
+            ambiguous(params, &into_iter),
+            ty(parse_quote!(<::std::vec::IntoIter<u8>>::Item))
+        );
+    }
+    // The first one in the default is reported.
+    assert_eq!(
+        ambiguous(parse_quote!(T, U = (T::A, T::B)), &into_iter),
+        ty(parse_quote!(<::std::vec::IntoIter<u8>>::A))
+    );
+    // The error converts into a `syn::Error`.
+    let params: Punctuated<GenericParam, Token![,]> = parse_quote!(T, U = T::Item);
+    let error = complete_params(&params, &f59_args(&into_iter)).unwrap_err();
+    assert_eq!(
+        syn::Error::from(error).to_string(),
+        "the associated type '< :: std :: vec :: IntoIter < u8 > > :: Item' needs its trait: \
+         rustc resolves `<Type>::Item` only for a type parameter; write `<Type as Trait>::Item`"
+    );
+
+    // `substitute_args()` has no bounds: a value that is not an identifier is refused, and
+    // nothing is replaced.
+    let into = |_: &Ident| Some(parse_quote!(::std::vec::IntoIter<u8>));
+    for (written, first) in [
+        ("T::Item", "<::std::vec::IntoIter<u8>>::Item"),
+        ("<T>::Item", "<::std::vec::IntoIter<u8>>::Item"),
+        ("(<T>::A, T::B)", "<::std::vec::IntoIter<u8>>::A"),
+    ] {
+        let mut args: Vec<GenericArgument> = vec![parse_str(written).unwrap(), parse_quote!(T)];
+        let before = args.clone();
+        match substitute_args(args.iter_mut(), into) {
+            Err(EncodeError::AmbiguousAssociatedType(found)) => {
+                assert_eq!(
+                    string(&*found),
+                    ty(parse_str(first).unwrap()),
+                    "{}",
+                    written
+                )
+            }
+            other => panic!("{}: {:?}", written, other),
+        }
+        assert_eq!(args, before, "{}", written);
+    }
+    // An identifier is written, and so is the path that has its trait.
+    for (written, expected, value) in [
+        ("T::Item", "<I>::Item", "I"),
+        ("<T>::Item", "<I>::Item", "I"),
+        (
+            "Option<<T as Iterator>::Item>",
+            "Option<<::std::vec::IntoIter<u8> as Iterator>::Item>",
+            "::std::vec::IntoIter<u8>",
+        ),
+        // `Self::A` in an expression is not a type: it stays `<value>::A`.
+        (
+            "[u8; Self::LEN]",
+            "[u8; <::std::vec::IntoIter<u8>>::LEN]",
+            "::std::vec::IntoIter<u8>",
+        ),
+    ] {
+        let value: Type = parse_str(value).unwrap();
+        let mut args: Vec<GenericArgument> = vec![parse_str(written).unwrap()];
+        substitute_args(args.iter_mut(), |name: &Ident| {
+            (name == "T" || name == "Self").then(|| GenericArgument::Type(value.clone()))
+        })
+        .unwrap();
+        let expected: GenericArgument = parse_str(expected).unwrap();
+        assert_eq!(string(&args[0]), string(&expected), "{}", written);
+    }
+    // A value that is not a type is a misfit, as before.
+    let mut args: Vec<GenericArgument> = vec![parse_quote!(T::Item)];
+    let err = substitute_args(args.iter_mut(), |_: &Ident| Some(parse_quote!('a))).unwrap_err();
+    assert!(matches!(err, EncodeError::UnexpectedArgument(_)));
 }

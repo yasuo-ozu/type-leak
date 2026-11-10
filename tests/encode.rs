@@ -8,6 +8,7 @@
 
 mod common;
 
+use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
@@ -337,6 +338,8 @@ fn errors() -> Vec<EncodeError> {
         args_error("<'a, T>", "<u8>"),
         unbounded_self_error("dyn Tr"),
         needs_self_error(NEEDS_SELF_SOURCE),
+        // The default `T::Item` of a parameter whose argument is not an identifier, with no bound.
+        args_error("<T, U = T::Item>", "<::std::vec::IntoIter<u8>>"),
     ]
 }
 
@@ -355,6 +358,8 @@ fn the_text_of_every_variant() {
              'static`)",
             "the type 'Wrap < T , Self >' needs `Self` (it names it, or its generics do), so its \
              Repeater impl cannot be for a marker type; use `ImplSelf::Param`",
+            "the associated type '< :: std :: vec :: IntoIter < u8 > > :: Item' needs its trait: \
+             rustc resolves `<Type>::Item` only for a type parameter; write `<Type as Trait>::Item`",
         ]
     );
     assert!(matches!(all[0], EncodeError::UnsupportedConstType(_)));
@@ -362,6 +367,7 @@ fn the_text_of_every_variant() {
     assert!(matches!(all[2], EncodeError::MissingArgument(_)));
     assert!(matches!(all[3], EncodeError::UnboundedTraitObject(_)));
     assert!(matches!(all[4], EncodeError::NeedsSelf(_)));
+    assert!(matches!(all[5], EncodeError::AmbiguousAssociatedType(_)));
 }
 
 #[test]
@@ -444,6 +450,7 @@ fn text_variant(err: &EncodeError) -> String {
         EncodeError::MissingArgument(_) => "MissingArgument(",
         EncodeError::UnboundedTraitObject(_) => "UnboundedTraitObject(",
         EncodeError::NeedsSelf(_) => "NeedsSelf(",
+        EncodeError::AmbiguousAssociatedType(_) => "AmbiguousAssociatedType(",
         _ => unreachable!(),
     }
     .to_string()
@@ -540,7 +547,7 @@ fn substitute_args_replaces_each_name_by_the_kind_that_fits_its_place() {
             "(Self, Self::A, <Self as Tr>::B)",
             "(Host, <Host>::A, <Host as Tr>::B)",
         ),
-        ("T::Item<N>", "<Vec<u8>>::Item<3>"),
+        ("<T as Tr>::Item<N>", "<Vec<u8> as Tr>::Item<3>"),
         // `Self` in a macro; `Self::A` in an expression; `Self` alone in one is a value.
         ("m!(Self, T)", "m!(Host, T)"),
         ("[u8; Self::LEN]", "[u8; <Host>::LEN]"),
@@ -619,6 +626,330 @@ fn substitute_args_changes_nothing_for_an_empty_list_or_no_answer() {
     let before = args.clone();
     substitute_args(args.iter_mut(), |_: &Ident| None).unwrap();
     assert_eq!(args, before);
+}
+
+// ── Substitute ───────────────────────────────────────────────────────────────────────────────
+
+/// The site that answers each name of `answers` with the argument written after it.
+fn site(
+    answers: &'static [(&'static str, &'static str)],
+) -> impl FnMut(&Ident) -> Option<GenericArgument> {
+    move |name: &Ident| {
+        answers
+            .iter()
+            .find(|(written, _)| name == *written)
+            .map(|(_, value)| parse_str(value).unwrap())
+    }
+}
+
+#[test]
+fn substitute_writes_the_lifetimes_outside_the_types_too() {
+    // The receiver, a lifetime bound of a generic and of a predicate, an outlives predicate, a
+    // lifetime argument of a bound, the types around them.
+    let mut item: ImplItemFn = parse_quote! {
+        fn keep<'b: 'a, V: 'a + Tr<'a, K>>(&'a mut self, key: &'a K, v: V) -> &'a K
+        where
+            Self: 'a,
+            K: 'a,
+            'a: 'b,
+        {
+            todo!()
+        }
+    };
+    let mut visitor = Substitute::new(site(&[("a", "'x"), ("K", "u8")]));
+    visitor.visit_impl_item_fn_mut(&mut item);
+    visitor.finish().unwrap();
+    let expected: ImplItemFn = parse_quote! {
+        fn keep<'b: 'x, V: 'x + Tr<'x, u8>>(&'x mut self, key: &'x u8, v: V) -> &'x u8
+        where
+            Self: 'x,
+            u8: 'x,
+            'x: 'b,
+        {
+            todo!()
+        }
+    };
+    assert_eq!(s(&item), s(&expected));
+
+    // The other forms of the receiver, and a signature without a body, as the trait has it.
+    for (written, expected) in [
+        ("fn f(&'a self)", "fn f(&'x self)"),
+        ("fn f(self: &'a Self)", "fn f(self: &'x Self)"),
+        (
+            "fn f(self: Box<Wrap<'a, K>>)",
+            "fn f(self: Box<Wrap<'x, u8>>)",
+        ),
+        (
+            "fn f<T: Tr<'a>>() -> impl Tr<'a>",
+            "fn f<T: Tr<'x>>() -> impl Tr<'x>",
+        ),
+        (
+            "fn f() where for<'c> &'c K: 'a",
+            "fn f() where for<'c> &'c u8: 'x",
+        ),
+    ] {
+        let mut sig: Signature = parse_str(written).unwrap();
+        let mut visitor = Substitute::new(site(&[("a", "'x"), ("K", "u8")]));
+        visitor.visit_signature_mut(&mut sig);
+        visitor.finish().unwrap();
+        let expected: Signature = parse_str(expected).unwrap();
+        assert_eq!(s(&sig), s(&expected), "{}", written);
+    }
+    // `'static` and `'_` are not names.
+    let mut sig: Signature = parse_quote!(fn f(&'static self, x: &'_ u8) where Self: 'static);
+    let before = sig.clone();
+    let mut visitor = Substitute::new(|name: &Ident| {
+        assert!(name != "static" && name != "_", "{}", name);
+        None
+    });
+    visitor.visit_signature_mut(&mut sig);
+    visitor.finish().unwrap();
+    assert_eq!(s(&sig), s(&before));
+}
+
+/// The audit's case: `trait Store<'a, K: 'a, D = Page<K>>` at `impl Store<'static, u8> for ..`
+/// needs `'a` in `keep(&'a self) -> &'a K`, outside the types a type-only pass reaches.
+#[test]
+fn substitute_writes_the_arguments_of_a_trait_with_a_lifetime_parameter() {
+    let tr: ItemTrait = parse_quote! {
+        trait Store<'a, K: 'a, D = Page<K>> {
+            fn get(&self, key: &'a K) -> D;
+            fn keep(&'a self) -> &'a K;
+        }
+    };
+    let given: Vec<GenericArgument> = vec![parse_quote!('static), parse_quote!(u8)];
+    let completed = complete_params(&tr.generics.params, &given).unwrap();
+    let mut items: Vec<TraitItem> = tr.items.clone();
+    let mut visitor = Substitute::new(common::answers(&tr.generics.params, &completed));
+    for item in &mut items {
+        visitor.visit_trait_item_mut(item);
+    }
+    visitor.finish().unwrap();
+    let expected: Vec<TraitItem> = vec![
+        parse_quote!(
+            fn get(&self, key: &'static u8) -> Page<u8>;
+        ),
+        parse_quote!(
+            fn keep(&'static self) -> &'static u8;
+        ),
+    ];
+    assert_eq!(items, expected);
+}
+
+#[test]
+fn substitute_leaves_the_header_of_the_impl_alone_when_only_the_items_are_visited() {
+    let imp: ItemImpl = parse_quote! {
+        impl<T> Tr<Vec<T>> for Foo<T> {
+            type Out = Option<T>;
+            fn f(&self, t: T) -> Vec<T> {
+                todo!()
+            }
+        }
+    };
+    let answers: &'static [(&str, &str)] = &[("T", "Vec<T>")];
+    let mut items = imp.clone();
+    let mut visitor = Substitute::new(site(answers));
+    for item in &mut items.items {
+        visitor.visit_impl_item_mut(item);
+    }
+    visitor.finish().unwrap();
+    let expected: ItemImpl = parse_quote! {
+        impl<T> Tr<Vec<T>> for Foo<T> {
+            type Out = Option<Vec<T>>;
+            fn f(&self, t: Vec<T>) -> Vec<Vec<T>> {
+                todo!()
+            }
+        }
+    };
+    assert_eq!(s(&items), s(&expected));
+    // The whole impl writes its header too, which declares the generics itself.
+    let mut whole = imp;
+    let mut visitor = Substitute::new(site(answers));
+    visitor.visit_item_impl_mut(&mut whole);
+    visitor.finish().unwrap();
+    let expected: ItemImpl = parse_quote! {
+        impl<T> Tr<Vec<Vec<T>>> for Foo<Vec<T>> {
+            type Out = Option<Vec<T>>;
+            fn f(&self, t: Vec<T>) -> Vec<Vec<T>> {
+                todo!()
+            }
+        }
+    };
+    assert_eq!(s(&whole), s(&expected));
+}
+
+#[test]
+fn substitute_keeps_the_generics_a_method_declares_if_the_site_gives_no_answer() {
+    let mut item: ImplItemFn = parse_quote! {
+        fn get<'b, V: Into<K>>(&'b self, v: V, key: &'a K) -> &'b K {
+            todo!()
+        }
+    };
+    let mut visitor = Substitute::new(site(&[("a", "'x"), ("K", "u8")]));
+    visitor.visit_impl_item_fn_mut(&mut item);
+    visitor.finish().unwrap();
+    let expected: ImplItemFn = parse_quote! {
+        fn get<'b, V: Into<u8>>(&'b self, v: V, key: &'x u8) -> &'b u8 {
+            todo!()
+        }
+    };
+    assert_eq!(s(&item), s(&expected));
+}
+
+#[test]
+fn substitute_asks_for_each_name_once_over_the_whole_visit() {
+    let mut asked: Vec<String> = Vec::new();
+    let mut sigs: Vec<Signature> = vec![
+        parse_quote!(fn f(&'a self, x: T) -> &'a T),
+        parse_quote!(fn g(x: T, n: [u8; N]) where T: 'a),
+    ];
+    let mut visitor = Substitute::new(|name: &Ident| {
+        asked.push(name.to_string());
+        None
+    });
+    for sig in &mut sigs {
+        visitor.visit_signature_mut(sig);
+    }
+    visitor.finish().unwrap();
+    // `u8` is asked as any one-identifier type.
+    assert_eq!(asked, ["a", "T", "u8", "N"]);
+}
+
+#[test]
+fn substitute_writes_a_type_as_substitute_args_does() {
+    // The visited type is one unit: the braces of a const, the parentheses of an object behind a
+    // pointer, and what is written is not substituted again.
+    let mut sig: Signature = parse_quote!(fn f(a: [u8; N], b: &T, c: Wrap<{ N }, T>) -> Wrap<U, T>);
+    let mut visitor = Substitute::new(site(&[
+        ("T", "dyn A + B"),
+        ("N", "M"),
+        ("U", "T"),
+        ("M", "9"),
+    ]));
+    visitor.visit_signature_mut(&mut sig);
+    visitor.finish().unwrap();
+    let expected: Signature = parse_quote!(
+        fn f(a: [u8; { M }], b: &(dyn A + B), c: Wrap<{ M }, dyn A + B>) -> Wrap<T, dyn A + B>
+    );
+    assert_eq!(s(&sig), s(&expected));
+}
+
+#[test]
+fn substitute_writes_a_const_outside_a_type() {
+    // A bare identifier in the arguments of a bound is parsed as a type; an expression of an item.
+    let mut item: ImplItemFn = parse_quote! {
+        fn f<const M: usize>(&self) where T: Tr<N, { N }> {
+            let _ = N;
+        }
+    };
+    let mut visitor = Substitute::new(site(&[("N", "3")]));
+    visitor.visit_impl_item_fn_mut(&mut item);
+    visitor.finish().unwrap();
+    let expected: ImplItemFn = parse_quote! {
+        fn f<const M: usize>(&self) where T: Tr<3, { 3 }> {
+            let _ = 3;
+        }
+    };
+    assert_eq!(s(&item), s(&expected));
+    // A const for a name that is a type alone is a misfit, a type for a const name an identifier.
+    let mut sig: Signature = parse_quote!(fn f(x: N));
+    let before = sig.clone();
+    let mut visitor = Substitute::new(site(&[("N", "3")]));
+    visitor.visit_signature_mut(&mut sig);
+    assert!(matches!(
+        visitor.finish(),
+        Err(EncodeError::UnexpectedArgument(_))
+    ));
+    assert_eq!(s(&sig), s(&before));
+}
+
+#[test]
+fn substitute_writes_self_in_a_macro_and_parenthesizes_the_bounded_type_of_a_predicate() {
+    let mut item: ImplItemFn = parse_quote! {
+        fn f(&self) where Self: 'a {
+            m!(Self, T);
+        }
+    };
+    let mut visitor = Substitute::new(site(&[("Self", "&fn(u8)"), ("a", "'static")]));
+    visitor.visit_impl_item_fn_mut(&mut item);
+    visitor.finish().unwrap();
+    let expected: ImplItemFn = parse_quote! {
+        fn f(&self) where (&fn(u8)): 'static {
+            m!(&fn(u8), T);
+        }
+    };
+    assert_eq!(s(&item), s(&expected));
+}
+
+#[test]
+fn substitute_names_the_elided_lifetime_of_a_signature_inside_a_node() {
+    // A function pointer in a type, `Fn(..)` in a type, and `Fn(..)` as a bound outside a type:
+    // the value adds a lifetime to the inputs, and the output keeps the elided one by its name.
+    let mut item: ImplItemFn = parse_quote! {
+        fn f<F: Fn(&U) -> &u8>(&self, g: fn(&U) -> &u8, h: Box<dyn Fn(&U) -> &u8>, f: F)
+        where
+            F: Fn(&U) -> &u8,
+        {
+            todo!()
+        }
+    };
+    let mut visitor = Substitute::new(site(&[("U", "&'static str")]));
+    visitor.visit_impl_item_fn_mut(&mut item);
+    visitor.finish().unwrap();
+    let expected: ImplItemFn = parse_quote! {
+        fn f<F: for<'__tl_s0> Fn(&'__tl_s0 &'static str) -> &'__tl_s0 u8>(
+            &self,
+            g: for<'__tl_s0> fn(&'__tl_s0 &'static str) -> &'__tl_s0 u8,
+            h: Box<dyn for<'__tl_s0> Fn(&'__tl_s0 &'static str) -> &'__tl_s0 u8>,
+            f: F
+        )
+        where
+            F: for<'__tl_s0> Fn(&'__tl_s0 &'static str) -> &'__tl_s0 u8,
+        {
+            todo!()
+        }
+    };
+    assert_eq!(s(&item), s(&expected));
+}
+
+#[test]
+fn substitute_reports_the_first_error_and_leaves_what_it_could_not_write_as_it_was() {
+    // `T::Item` for a type that is not a type parameter (F90) is first; the lifetime `'b` that
+    // gets a type is the second. What they could not write stays, the rest is written.
+    let mut sig: Signature = parse_quote!(
+        fn f(a: T::Item, b: &T, c: Wrap<T>, d: &'b u8) -> Option<<T as Tr>::A>
+    );
+    let mut visitor = Substitute::new(site(&[("T", "::std::vec::IntoIter<u8>"), ("b", "u8")]));
+    visitor.visit_signature_mut(&mut sig);
+    match visitor.finish() {
+        Err(EncodeError::AmbiguousAssociatedType(ty)) => {
+            assert_eq!(*ty, parse_quote!(<::std::vec::IntoIter<u8>>::Item))
+        }
+        other => panic!("{:?}", other),
+    }
+    let expected: Signature = parse_quote!(
+        fn f(
+            a: T::Item,
+            b: &::std::vec::IntoIter<u8>,
+            c: Wrap<::std::vec::IntoIter<u8>>,
+            d: &'b u8
+        ) -> Option<<::std::vec::IntoIter<u8> as Tr>::A>
+    );
+    assert_eq!(s(&sig), s(&expected));
+
+    // The error is the first one that is met: a lifetime for a type comes before.
+    let mut sig: Signature = parse_quote!(fn f(a: &T, b: T::Item));
+    let mut visitor = Substitute::new(site(&[("T", "'x")]));
+    visitor.visit_signature_mut(&mut sig);
+    assert!(matches!(
+        visitor.finish(),
+        Err(EncodeError::UnexpectedArgument(_))
+    ));
+    // Nothing to report if nothing went wrong.
+    let mut sig: Signature = parse_quote!(fn f(a: T));
+    let mut visitor = Substitute::new(site(&[]));
+    visitor.visit_signature_mut(&mut sig);
+    visitor.finish().unwrap();
 }
 
 // ── repeater_projection() ────────────────────────────────────────────────────────────────────

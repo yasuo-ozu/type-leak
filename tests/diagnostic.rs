@@ -874,7 +874,7 @@ mod two_macros {
             return;
         };
         assert!(success, "{}\n{}", stdout, stderr);
-        assert!(stdout.contains("test result: ok. 2 passed"), "{}", stdout);
+        assert!(stdout.contains("test result: ok. 3 passed"), "{}", stdout);
     }
 
     /// `#[export_trait]` reports each path that cannot be leaked at its own span, with what to write.

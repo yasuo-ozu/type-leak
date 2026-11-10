@@ -22,12 +22,13 @@ use crate::unstable::{
     bindings, equated_generics, hidden_projection, Instability, Projections, Unstable, Why,
 };
 use crate::util::{
-    bound_cause, first_associated_self_in_generics, first_self_in_generics, first_self_in_type,
-    generic_param_mentions_self, generic_param_name, has_lifetime_bound, ident_name, is_bare_self,
-    is_primitive_name, or_list, path_type, plain_self_head, self_head, self_in_param,
-    self_in_predicate, selves_in_generics, tidy, token_names, trait_head, trait_object_of,
-    type_mentions_self, unwrap_type_group, where_predicate_mentions_self, without_arguments,
-    without_crate_prefix, without_default, without_defaults,
+    bound_cause, declared_names, first_associated_self_in_generics, first_self_in_generics,
+    first_self_in_type, generic_param_mentions_self, generic_param_name, has_lifetime_bound,
+    ident_name, is_bare_self, is_primitive_name, or_list, path_type, plain_self_head, self_head,
+    self_in_param, self_in_predicate, selves_in_generics, tidy, token_names, trait_head,
+    trait_object_of, type_mentions_self, unwrap_type_group, use_names,
+    where_predicate_mentions_self, without_arguments, without_crate_prefix, without_default,
+    without_defaults,
 };
 use crate::view::View;
 use proc_macro2::TokenStream;
@@ -350,19 +351,20 @@ impl Elision {
         }
     }
 
-    /// Returns what `Elision::of()` gives for the signature of a method. A receiver that is a
-    /// reference gives its lifetime to the output, whatever the inputs have.
+    /// Returns what `Elision::of()` gives for the signature of a method. A receiver that has a
+    /// reference to `Self` gives its lifetime to the output, whatever the inputs have (`&self`,
+    /// `self: Pin<&mut Self>`). Any other receiver is left out of the count, as rustc before 1.81
+    /// does: `self: &Box<Self>` gives nothing, and its own lifetime is not one of the inputs.
     pub(crate) fn of_signature(sig: &Signature) -> Option<Self> {
         let mut inputs: Vec<&Type> = Vec::new();
         for input in &sig.inputs {
             match input {
                 FnArg::Receiver(receiver) => {
-                    let mut references = HasReference(receiver.reference.is_some());
+                    let mut references = RefersToSelf(receiver.reference.is_some());
                     references.visit_type(&receiver.ty);
                     if references.0 {
                         return None;
                     }
-                    inputs.push(&receiver.ty);
                 }
                 FnArg::Typed(arg) => inputs.push(&arg.ty),
             }
@@ -465,13 +467,18 @@ impl<'ast> Visit<'ast> for InputLifetimes {
     fn visit_parenthesized_generic_arguments(&mut self, _: &'ast ParenthesizedGenericArguments) {}
 }
 
-/// `true` if a type has a reference: a receiver (`self: &Self`, `self: Pin<&mut Self>`) gives its
-/// lifetime to the output.
-struct HasReference(bool);
+/// `true` if the type of a receiver has a reference to `Self` (`self: &Self`, `self: Pin<&mut
+/// Self>`), which rustc gives the lifetime of to the output. A reference to a type that holds
+/// `Self` (`&Box<Self>`) is not one before rustc 1.81. A reference to another type is taken for
+/// one to the type of the impl, which the signature does not name (`&S`), as the Referrer does not
+/// know it either.
+struct RefersToSelf(bool);
 
-impl<'ast> Visit<'ast> for HasReference {
-    fn visit_type_reference(&mut self, _: &'ast TypeReference) {
-        self.0 = true;
+impl<'ast> Visit<'ast> for RefersToSelf {
+    fn visit_type_reference(&mut self, i: &'ast TypeReference) {
+        let elem = unwrap_type_group(&i.elem);
+        self.0 |= is_bare_self(elem) || !type_mentions_self(elem);
+        syn::visit::visit_type_reference(self, i)
     }
 }
 
@@ -480,6 +487,9 @@ impl<'ast> Visit<'ast> for HasReference {
 struct ModuleFrame {
     /// The context of the module.
     id: ContextId,
+    /// The path of the module, if it has one. It is kept here, as a probe has the frames of the
+    /// visitor it was made from but not its table of contexts.
+    path: Option<Rc<[Ident]>>,
     /// What the module declares.
     names: Rc<ModuleNames>,
 }
@@ -1074,14 +1084,20 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     }
 
     /// Analyzes the default `ty` of a type parameter, with the parameters before it as the root
-    /// generics. Returns the effects and the mentions of `Self` that have no meaning.
+    /// generics; the values in it are read if `check_values`. Returns the effects and the mentions
+    /// of `Self` that have no meaning.
     fn analyze_default(
         rule: &mut A,
         ty: &Type,
         generics: &Generics,
         declares_self: bool,
+        check_values: bool,
     ) -> (Vec<Effect>, Vec<SelfMention>) {
         Self::throwaway(rule, generics, Place::default(), |visitor| {
+            visitor.mode.check_values = check_values;
+            // Inside the scope, as the visitor that the Leaker makes is after `enter_scope()`: an
+            // item in the default is nested, so its generics and its `Self` are its own.
+            visitor.item_depth = 1;
             visitor.position.in_default = Some(declares_self);
             visitor.visit_type(ty);
             (
@@ -1466,8 +1482,13 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         let mut effects = std::mem::take(&mut self.frame.effects);
         for (index, _, default) in defaulted(generics) {
             let root = without_defaults(generics, index);
-            let (found, self_errors) =
-                Self::analyze_default(&mut *self.rule, default, &root, declares_self);
+            let (found, self_errors) = Self::analyze_default(
+                &mut *self.rule,
+                default,
+                &root,
+                declares_self,
+                self.mode.check_values,
+            );
             // The mentions and the conflicts of the default come after those found so far.
             let mut found = found;
             shift_seen(&mut found, self.records.self_errors.len());
@@ -1533,6 +1554,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     .intern_module(path.clone(), hint.clone(), parent);
                 self.modules.push(ModuleFrame {
                     id,
+                    path: path.as_deref().map(Rc::from),
                     names: Rc::new(names.clone()),
                 });
                 self.self_scope = SelfScope::default();
@@ -1951,33 +1973,12 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     Reason::SelfInDefault,
                 )
             }),
-            Some(self_path) => Err(CheckResult {
-                note: Some(
-                    "it names the `Self` of an item nested in the analyzed syntax, and so do the \
-                     bounds of its generics: the Repeater's impl of this type is for the \
-                     Leaker's type, but the copy declares a type of its own, which has the bound \
-                     for itself (E0277)"
-                        .to_string(),
-                ),
-                help: Some(format!(
-                    "write the bound of the generics of `{}` without `{}`, write the type \
-                     without `Self`, or write the type with an absolute path (it is copied as \
-                     written, and its `Self` is the copy's own)",
-                    tidy(&quote!(#ty)),
-                    tidy(&self_path.shown())
-                )),
-                // The fault is the bound, not the path of the type that uses it.
-                headline: Some(format!(
-                    "`{}` has a generic whose bound mentions `Self`, which cannot be leaked",
-                    tidy(&quote!(#ty))
-                )),
-                paths: self.own_paths(inner.must_start, depth),
-                ..CheckResult::conflict(
-                    vec![Cause::Type(ty.clone())],
-                    vec![self_path.clone()],
-                    Reason::NestedSelfInBounds,
-                )
-            }),
+            // `self_in_bounds()` is `Some` only in a nested item, and outside a default the `if`
+            // above has returned unless `of_any()` failed. It names fewer generics than the `of()`
+            // that succeeded to give `context` (the entry is for any type, so those of the type
+            // that `Self` is are not named), so it does not fail. The risk is reported by the walk
+            // (`nested_self_error()`).
+            Some(_) => unreachable!("of_any() fails where of() succeeded"),
             None => match self.associated_self_in_bounds(&context) {
                 Some(conflict) => Err(conflict.of(ty, self.own_paths(inner.must_start, depth))),
                 None => Ok(context),
@@ -2503,6 +2504,10 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         inner: &Frame,
         effects: &[Effect],
     ) -> bool {
+        // The type inside parentheses or a group has been decided: it has the error, once.
+        if matches!(ty, Type::Paren(_) | Type::Group(_)) {
+            return false;
+        }
         let projection = is_self_projection(ty);
         if !(projection || (self.self_scope.written && is_bare_self(ty))) {
             return false;
@@ -3618,17 +3623,20 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             None => return f(self),
         };
         let parent = self.modules.last().map(|module| module.id);
-        let mut path = parent
-            .and_then(|parent| self.records.contexts.get(parent).module_path())
+        let mut path = self
+            .modules
+            .last()
+            .and_then(|module| module.path.as_deref())
             .map(<[Ident]>::to_vec)
             .unwrap_or_default();
         path.push(i.ident.clone());
         let id = self
             .records
             .contexts
-            .intern_module(Some(path), None, parent);
+            .intern_module(Some(path.clone()), None, parent);
         self.modules.push(ModuleFrame {
             id,
+            path: Some(Rc::from(path)),
             names: Rc::new(module_names(items)),
         });
         f(self);
@@ -4141,19 +4149,15 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     ) -> HashSet<usize> {
         let frame = self.new_frame();
         let (musts, impossibles) = (self.musts.len(), self.impossibles.len());
-        let self_errors = self.records.self_errors.len();
-        let (env_errors, not_optional) = (
-            self.records.env_errors.len(),
-            self.records.not_optional.len(),
-        );
+        let records = self.records.mark();
         self.position.binder_probe = Some(HashSet::new());
         self.with_scope(Scope::binder(lifetimes), |v| f(v));
         self.frame = frame;
         self.musts.truncate(musts);
         self.truncate_impossibles(impossibles);
-        self.records.self_errors.truncate(self_errors);
-        self.records.env_errors.truncate(env_errors);
-        self.records.not_optional.truncate(not_optional);
+        // The contexts too: a module in the binder is interned again by the walk, and its number
+        // is the next one then, as if there was no probe.
+        self.records.truncate(&records);
         self.position.binder_probe.take().unwrap_or_default()
     }
 
@@ -6220,28 +6224,6 @@ pub(crate) struct ModuleNames {
 /// Returns the names declared directly in `items`: items, `macro_rules!` macros, and names imported
 /// by `use` with an absolute path. Other imports (`use super::X`) are outside the module.
 pub(crate) fn module_names(items: &[Item]) -> ModuleNames {
-    fn module_use_names(tree: &UseTree, last: Option<&Ident>, names: &mut HashSet<String>) {
-        match tree {
-            UseTree::Path(UsePath { ident, tree, .. }) => {
-                module_use_names(tree, Some(ident), names)
-            }
-            UseTree::Name(UseName { ident }) if ident == "self" => {
-                names.extend(last.map(ident_name));
-            }
-            UseTree::Name(UseName { ident }) => {
-                names.insert(ident_name(ident));
-            }
-            UseTree::Rename(UseRename { rename, .. }) if rename != "_" => {
-                names.insert(ident_name(rename));
-            }
-            UseTree::Group(UseGroup { items, .. }) => {
-                for tree in items {
-                    module_use_names(tree, last, names)
-                }
-            }
-            _ => (),
-        }
-    }
     let mut module = ModuleNames::default();
     let names = &mut module.names;
     for item in items {
@@ -6282,7 +6264,9 @@ pub(crate) fn module_names(items: &[Item]) -> ModuleNames {
                 let is_absolute = leading_colon.is_some()
                     || matches!(tree, UseTree::Path(UsePath { ident, .. }) if ident == "$crate");
                 if is_absolute {
-                    module_use_names(tree, None, names);
+                    let mut imported = Vec::new();
+                    use_names(tree, None, &mut imported);
+                    names.extend(imported.iter().map(ident_name));
                 }
             }
             _ => (),
@@ -6589,34 +6573,8 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
     /// Declares the names that `item` introduces in the block around it, where they are visible
     /// from the first statement.
     fn declare_item(&mut self, item: &Item) {
-        match item {
-            Item::Const(i) => self.declare(&i.ident),
-            Item::Enum(i) => self.declare(&i.ident),
-            Item::ExternCrate(i) => match &i.rename {
-                Some((_, rename)) => self.declare(rename),
-                None => self.declare(&i.ident),
-            },
-            Item::Fn(i) => self.declare(&i.sig.ident),
-            Item::Macro(i) => {
-                if let Some(ident) = &i.ident {
-                    self.declare(ident);
-                }
-            }
-            Item::Mod(i) => self.declare(&i.ident),
-            Item::Static(i) => self.declare(&i.ident),
-            Item::Struct(i) => self.declare(&i.ident),
-            Item::Trait(i) => self.declare(&i.ident),
-            Item::TraitAlias(i) => self.declare(&i.ident),
-            Item::Type(i) => self.declare(&i.ident),
-            Item::Union(i) => self.declare(&i.ident),
-            Item::Use(i) => {
-                let mut names = Vec::new();
-                local_use_names(&i.tree, None, &mut names);
-                for name in names {
-                    self.scope().items.insert(name);
-                }
-            }
-            _ => (),
+        for name in declared_names(item) {
+            self.declare(&name);
         }
     }
 
@@ -7072,23 +7030,6 @@ impl<'ast, A: Allow> Visit<'ast> for Scan<'_, '_, '_, A> {
     /// An item in the length of an array declares names this scan does not follow.
     fn visit_item(&mut self, _: &'ast Item) {
         self.unreadable = true;
-    }
-}
-
-/// The names that a `use` tree brings into scope. `parent`: the name before the group
-/// (`use a::b::{self}` brings `b`).
-fn local_use_names(tree: &UseTree, parent: Option<&Ident>, names: &mut Vec<String>) {
-    match tree {
-        UseTree::Path(p) => local_use_names(&p.tree, Some(&p.ident), names),
-        UseTree::Name(n) if n.ident == "self" => names.extend(parent.map(ident_name)),
-        UseTree::Name(n) => names.push(ident_name(&n.ident)),
-        UseTree::Rename(r) => names.push(ident_name(&r.rename)),
-        UseTree::Glob(_) => (),
-        UseTree::Group(g) => {
-            for tree in &g.items {
-                local_use_names(tree, parent, names);
-            }
-        }
     }
 }
 

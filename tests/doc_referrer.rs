@@ -414,8 +414,8 @@ fn format_version_is_the_serialized_tag_and_another_tag_is_refused() {
     assert!(error.to_string().contains("incompatible type-leak"));
 }
 
-/// `visitor()` writes the entries, `complete_params()` completes the arguments of an impl, and one
-/// `substitute_args()` pass writes them into the types of the copy.
+/// `visitor()` writes the entries, `complete_params()` completes the arguments of an impl, and
+/// `Substitute` writes them into the copy.
 #[test]
 fn visitor_then_complete_params_and_substitute_args_give_the_copy_at_a_use_site() {
     let tr: ItemTrait = parse_quote!(
@@ -447,25 +447,72 @@ fn visitor_then_complete_params_and_substitute_args_give_the_copy_at_a_use_site(
     let given: Vec<GenericArgument> = vec![parse_quote!(u8)];
     let completed = complete_params(&tr.generics.params, &given).unwrap();
 
-    // 3. `T` is `u8` in the types of the copy.
-    struct Site(GenericArgument);
-    impl VisitMut for Site {
-        fn visit_type_mut(&mut self, ty: &mut Type) {
-            let mut arg = GenericArgument::Type(ty.clone());
-            substitute_args(std::iter::once(&mut arg), |name: &Ident| {
-                (name == "T").then(|| self.0.clone())
-            })
-            .unwrap();
-            if let GenericArgument::Type(written) = arg {
-                *ty = written;
-            }
-        }
-    }
-    Site(completed[0].clone()).visit_signature_mut(&mut sig);
+    // 3. `T` is `u8` in the copy.
+    let mut site = Substitute::new(|name: &Ident| (name == "T").then(|| completed[0].clone()));
+    site.visit_signature_mut(&mut sig);
+    site.finish().unwrap();
     let expected: Signature = parse_quote!(
         fn f(&self, t: u8) -> <Self as crate::Repeater<(u8,), #key>>::Type
     );
     assert_eq!(sig, expected);
+}
+
+/// The same for a trait with a lifetime parameter: `Substitute` writes `'a` where it is not in a
+/// type (the receiver, a bound), and the items of the impl only, not its header.
+#[test]
+fn visitor_then_complete_params_and_substitute_give_the_items_of_an_impl_with_a_lifetime() {
+    let tr: ItemTrait = parse_quote!(
+        trait Tr<'a, T: 'a> {
+            fn keep(&'a self, t: T) -> Wrap<&'a T>
+            where
+                Self: 'a;
+        }
+    );
+    let mut leaker = Leaker::new();
+    let top_level = leaker.intern_trait(&tr);
+    let referrer = leaker.result().finish().unwrap();
+
+    // The copy of the items in `impl<'x> Tr<'x, u8> for Host`.
+    let mut imp: ItemImpl = parse_quote!(
+        impl<'x> Tr<'x, u8> for Host {
+            fn keep(&'a self, t: T) -> Wrap<&'a T>
+            where
+                Self: 'a,
+            {
+                todo!()
+            }
+        }
+    );
+    let repeater: Path = parse_quote!(crate::Repeater);
+    let self_ty: Type = parse_quote!(Self);
+    referrer
+        .visitor(top_level, |_ty, ix, context| {
+            repeater_projection(&repeater, &self_ty, context, 7, ix, slot_const(&repeater)).unwrap()
+        })
+        .visit_item_impl_mut(&mut imp);
+    let given: Vec<GenericArgument> = vec![parse_quote!('x), parse_quote!(u8)];
+    let completed = complete_params(&tr.generics.params, &given).unwrap();
+    let mut site = Substitute::new(common::answers(&tr.generics.params, &completed));
+    for item in &mut imp.items {
+        site.visit_impl_item_mut(item);
+    }
+    site.finish().unwrap();
+    let (ix, _, _) = referrer.iter().next().unwrap();
+    let key = repeater_key(7, ix);
+    let expected: ItemImpl = parse_quote!(
+        impl<'x> Tr<'x, u8> for Host {
+            fn keep(&'x self, t: u8) -> <Self as crate::Repeater<(&'x (), u8, &'x u8), #key>>::Type
+            where
+                Self: 'x,
+            {
+                todo!()
+            }
+        }
+    );
+    assert_eq!(
+        imp.to_token_stream().to_string(),
+        expected.to_token_stream().to_string()
+    );
 }
 
 /// A `Referrer` and the top-level `ContextId` are written one after the other and read back.

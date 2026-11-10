@@ -5,8 +5,8 @@ use crate::error::Cause;
 use crate::unstable::is_std_trait;
 use crate::util::{
     bound_mentions_self, canonical_bounds, generic_param_mentions_self, generic_param_name,
-    ident_name, projection_head, self_in_param, self_in_predicate, sorted_by_tokens, tidy,
-    token_names, type_contains, type_mentions_self, type_names, unwrap_type_group,
+    ident_name, projection, projection_head, self_in_param, self_in_predicate, sorted_by_tokens,
+    tidy, token_names, type_contains, type_mentions_self, type_names, unwrap_type_group,
     where_predicate_mentions_self, without_default, without_self_bounds, ReplaceSelf, SelfMentions,
 };
 use proc_macro2::{Literal, TokenStream};
@@ -527,23 +527,38 @@ impl Fold for Substitution {
                 if path.segments.len() == 1 {
                     return arg.clone();
                 }
-                // `U::Item` is that of the argument, if it is a path.
-                return match arg {
+                let arg = arg.clone();
+                // `U::Item` for a name (`T`, which may be a type parameter) is `T::Item`. For any
+                // other type it is `<arg>::Item`, whose parts are what the requirement mentions:
+                // `Arg::Item` would not resolve (`T::A::Item` is no projection of `T`).
+                return match &arg {
                     Type::Path(TypePath {
                         qself: None,
                         path: arg_path,
-                    }) => {
+                    }) if arg_path.leading_colon.is_none()
+                        && arg_path.segments.len() == 1
+                        && arg_path.segments[0].arguments.is_none() =>
+                    {
+                        let rest = syn::fold::fold_path(
+                            self,
+                            Path {
+                                leading_colon: None,
+                                segments: path.segments.iter().skip(1).cloned().collect(),
+                            },
+                        );
                         let mut segments = arg_path.segments.clone();
-                        segments.extend(path.segments.iter().skip(1).cloned());
+                        segments.extend(rest.segments);
                         Type::Path(TypePath {
                             qself: None,
                             path: Path {
-                                leading_colon: arg_path.leading_colon,
+                                leading_colon: None,
                                 segments,
                             },
                         })
                     }
-                    _ => ty,
+                    _ => Type::Path(projection(arg, path, |rest| {
+                        syn::fold::fold_path(self, rest)
+                    })),
                 };
             }
         }
@@ -1093,10 +1108,10 @@ impl Context {
         if mentions_self && !free_self {
             names.extend(self_names.iter().cloned());
         }
-        let mut work: Vec<(usize, String)> = names
-            .into_iter()
-            .filter_map(|name| Some((scopes.len().checked_sub(1)?, name)))
-            .collect();
+        let mut work: Vec<(usize, String)> = Vec::new();
+        if let Some(from) = scopes.len().checked_sub(1) {
+            push_names(&mut work, scopes, from, names);
+        }
         // An enclosing lifetime is a generic only if the type has a generic to bound by it.
         let ancestors = enclosing.generic(scopes);
         let self_bound = matches!(self_req, Some(SelfRequirement::Bound(_)));
@@ -1155,7 +1170,7 @@ impl Context {
                                 let mut names = HashSet::new();
                                 token_names(quote!(#predicate), &mut names);
                                 predicates.insert((ix, k), predicate.clone());
-                                work.extend(names.into_iter().map(|name| (ix, name)));
+                                push_names(&mut work, scopes, ix, names);
                             }
                         }
                     }
@@ -1163,14 +1178,7 @@ impl Context {
                 }
                 None => break,
             };
-            let found = (0..=from).rev().find_map(|ix| {
-                scopes[ix]
-                    .params
-                    .iter()
-                    .position(|param| generic_param_name(param) == name)
-                    .map(|pos| (ix, pos))
-            });
-            let (ix, pos) = match found {
+            let (ix, pos) = match declared_at(scopes, from, &name) {
                 Some(found) => found,
                 None => continue,
             };
@@ -1199,7 +1207,7 @@ impl Context {
             }
             let mut names = HashSet::new();
             token_names(quote!(#param), &mut names);
-            work.extend(names.into_iter().map(|name| (ix, name)));
+            push_names(&mut work, scopes, ix, names);
             let mut found_self = generic_param_mentions_self(&param);
             params.insert((ix, pos), param);
             for (k, predicate) in scopes[ix].predicates.iter().enumerate() {
@@ -1233,7 +1241,7 @@ impl Context {
                         names.clear();
                         token_names(quote!(#predicate), &mut names);
                     }
-                    work.extend(names.into_iter().map(|name| (ix, name)));
+                    push_names(&mut work, scopes, ix, names);
                     found_self |= where_predicate_mentions_self(&predicate);
                     predicates.insert((ix, k), predicate);
                 }
@@ -1242,10 +1250,11 @@ impl Context {
                 mentions_self = true;
                 // The impl for any type has no use for the generics of the type that `Self` is.
                 if !free_self {
-                    work.extend(
-                        self_names
-                            .iter()
-                            .map(|name| (scopes.len() - 1, name.clone())),
+                    push_names(
+                        &mut work,
+                        scopes,
+                        scopes.len() - 1,
+                        self_names.iter().cloned(),
                     );
                 }
             }
@@ -1334,14 +1343,6 @@ impl Context {
 
     pub(crate) fn is_module_scope(&self) -> bool {
         matches!(self.module, Some(ModuleScope::Itself { .. }))
-    }
-
-    /// The path of a module's own context (see [`ModuleScope::Itself`]).
-    pub(crate) fn module_path(&self) -> Option<&[Ident]> {
-        match &self.module {
-            Some(ModuleScope::Itself { path, .. }) => path.as_deref(),
-            _ => None,
-        }
     }
 
     pub(crate) fn without_module(&self) -> Self {
@@ -1551,14 +1552,14 @@ fn written_self_outlives(
 }
 
 /// The name of the generic that `predicate` bounds, if it is one that `canonicalize()` moves to the
-/// generic: `T: Tr` and `'a: 'b`, but not `Vec<T>: Tr`, `for<'x> T: Tr<'x>` or `Self: Tr`.
+/// generic: `T: Tr`, `(T): Tr` and `'a: 'b`, but not `Vec<T>: Tr`, `for<'x> T: Tr<'x>` or `Self: Tr`.
 fn bounded_generic(predicate: &WherePredicate) -> Option<String> {
     match predicate {
         WherePredicate::Type(PredicateType {
             lifetimes: None,
-            bounded_ty: Type::Path(TypePath { qself: None, path }),
+            bounded_ty,
             ..
-        }) => path.get_ident().map(ident_name),
+        }) => bounded_ident(bounded_ty),
         WherePredicate::Lifetime(PredicateLifetime { lifetime, .. }) => Some(lifetime.to_string()),
         _ => None,
     }
@@ -1808,6 +1809,36 @@ impl WrittenForSelf for WherePredicate {
     fn rewrite(self, folder: &mut ReplaceSelf<'_>) -> Self {
         folder.fold_where_predicate(self)
     }
+}
+
+/// The scope and the position of the generic `name` that is in scope in `scopes[from]`: the
+/// innermost one that declares it.
+fn declared_at(scopes: &[Scope], from: usize, name: &str) -> Option<(usize, usize)> {
+    (0..=from).rev().find_map(|ix| {
+        scopes[ix]
+            .params
+            .iter()
+            .position(|param| generic_param_name(param) == name)
+            .map(|pos| (ix, pos))
+    })
+}
+
+/// Puts the `names` that are written in `scopes[from]` on `work`, to be taken in the order they are
+/// declared (outer scopes first; what is no generic first). A set gives them in an order that
+/// differs from run to run, and the walk of `compute_with()` reports the first failure it finds
+/// and lists the outer `Self` that it rewrites in the order it finds them.
+fn push_names(
+    work: &mut Vec<(usize, String)>,
+    scopes: &[Scope],
+    from: usize,
+    names: impl IntoIterator<Item = String>,
+) {
+    let mut names: Vec<(Option<(usize, usize)>, String)> = names
+        .into_iter()
+        .map(|name| (declared_at(scopes, from, &name), name))
+        .collect();
+    names.sort();
+    work.extend(names.into_iter().rev().map(|(_, name)| (from, name)));
 }
 
 /// Rewrites `node`, which is written for `outer` as `Self`, for any other `Self`: `Self` becomes
@@ -2494,11 +2525,11 @@ fn canonicalize(generics: Generics) -> Generics {
         let target = match &predicate {
             WherePredicate::Type(PredicateType {
                 lifetimes: None,
-                bounded_ty: Type::Path(TypePath { qself: None, path }),
+                bounded_ty,
                 ..
-            }) => path.get_ident().and_then(|ident| {
+            }) => bounded_ident(bounded_ty).and_then(|name| {
                 params.iter().position(|param| {
-                    matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == ident_name(ident))
+                    matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == name)
                 })
             }),
             WherePredicate::Lifetime(PredicateLifetime { lifetime, .. }) => {

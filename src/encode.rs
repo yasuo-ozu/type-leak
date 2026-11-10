@@ -1,7 +1,10 @@
 //! Encoding generic parameters and arguments into types.
 
 use crate::elided::{fold_bare_fn, fold_bound, FreshLifetimes, Site};
-use crate::util::{parenthesize_pointee, projection_head, unwrap_type_group, ReplaceSelf};
+use crate::util::{
+    parenthesize_bounded, parenthesize_pointee, projection, projection_head, unwrap_type_group,
+    ReplaceSelf,
+};
 use proc_macro2::{Span, TokenStream, TokenTree};
 use std::borrow::Borrow;
 use std::collections::HashMap;
@@ -9,6 +12,7 @@ use std::iter::FromIterator;
 use syn::fold::Fold;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
+use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
 
@@ -47,14 +51,23 @@ pub fn array_const(value: &Expr, param: &ConstParam) -> std::result::Result<Type
 /// [`Referrer::visitor()`](crate::Referrer::visitor) has written its defaults: a leaked type in a
 /// default is already replaced, by a path through the Repeater that names the parameters before
 /// the default. The default of a parameter that has no argument is taken with each of the
-/// parameters before it replaced by its argument, as [`substitute_args()`] does (`T::Item` is
-/// `<arg>::Item`). That copy of the trait is only a step (rustc does not accept `Self` in a
-/// default): the completed arguments go into the impl.
+/// parameters before it replaced by its argument, as [`substitute_args()`] does. That copy of the
+/// trait is only a step (rustc does not accept `Self` in a default): the completed arguments go
+/// into the impl.
+///
+/// An associated type `T::Item` of an earlier parameter with the argument `arg` is `<arg>::Item` if
+/// `arg` is one identifier (rustc resolves `<V>::Item` for a type parameter `V`), else `<arg as
+/// Trait>::Item` with the one trait bound that `T` declares (`T: Iterator<Item = u8>` gives
+/// `Iterator`: the bindings go, and the earlier parameters are replaced in its arguments). A where
+/// clause is not known, and a trait that does not declare the type itself (a supertrait does) is
+/// refused by rustc.
 ///
 /// `given` match `params` by position and kind, lifetimes first: a binding such as `Item = u8` is
 /// skipped, and a bare identifier is a const argument (syn parses it as a type). Fails with
-/// [`EncodeError::UnexpectedArgument`] for an argument of the wrong kind or too many, and with
-/// [`EncodeError::MissingArgument`] for a parameter that has neither an argument nor a default.
+/// [`EncodeError::UnexpectedArgument`] for an argument of the wrong kind or too many, with
+/// [`EncodeError::MissingArgument`] for a parameter that has neither an argument nor a default,
+/// and with [`EncodeError::AmbiguousAssociatedType`] for an associated type of an argument that is
+/// not an identifier, if the parameter has no trait bound or several.
 ///
 /// ```
 /// # use type_leak::*;
@@ -71,6 +84,18 @@ pub fn array_const(value: &Expr, param: &ConstParam) -> std::result::Result<Type
 /// let given: Vec<GenericArgument> = vec![parse_quote!('static)];
 /// let err = complete_params(&generics.params, &given).unwrap_err();
 /// assert!(matches!(err, EncodeError::MissingArgument(_)));
+///
+/// // The default names an associated type of `T`: the trait of its bound is written.
+/// let generics: Generics = parse_quote!(<T: Iterator<Item = u8>, U = Option<T::Item>>);
+/// let given: Vec<GenericArgument> = vec![parse_quote!(std::vec::IntoIter<u8>)];
+/// let completed = complete_params(&generics.params, &given).unwrap();
+/// let expected: GenericArgument = parse_quote!(Option<<std::vec::IntoIter<u8> as Iterator>::Item>);
+/// assert_eq!(completed[1], expected);
+///
+/// // Without a bound it cannot be written.
+/// let generics: Generics = parse_quote!(<T, U = Option<T::Item>>);
+/// let err = complete_params(&generics.params, &given).unwrap_err();
+/// assert!(matches!(err, EncodeError::AmbiguousAssociatedType(_)));
 /// ```
 pub fn complete_params<'p, 'a>(
     params: impl IntoIterator<Item = &'p GenericParam>,
@@ -110,11 +135,20 @@ pub fn complete_params<'p, 'a>(
                         return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())))
                     }
                     None => match &tp.default {
-                        Some(default) => substitute.fold_type(default.clone()),
+                        Some(default) => {
+                            let ty = substitute.fold_type(default.clone());
+                            if let Some(error) = substitute.error.take() {
+                                return Err(error);
+                            }
+                            ty
+                        }
                         None => return Err(EncodeError::MissingArgument(Box::new(param.clone()))),
                     },
                 };
                 substitute.types.insert(tp.ident.clone(), ty.clone());
+                if let Some(bound) = single_bound(tp) {
+                    substitute.bounds.insert(tp.ident.clone(), bound);
+                }
                 completed.push(GenericArgument::Type(ty));
             }
             GenericParam::Const(cp) => {
@@ -124,7 +158,13 @@ pub fn complete_params<'p, 'a>(
                         None => return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone()))),
                     },
                     None => match &cp.default {
-                        Some(default) => substitute.fold_expr(default.clone()),
+                        Some(default) => {
+                            let value = substitute.fold_expr(default.clone());
+                            if let Some(error) = substitute.error.take() {
+                                return Err(error);
+                            }
+                            value
+                        }
                         None => return Err(EncodeError::MissingArgument(Box::new(param.clone()))),
                     },
                 };
@@ -151,6 +191,115 @@ fn const_argument(arg: &GenericArgument) -> Option<Expr> {
         }
         _ => None,
     }
+}
+
+/// The name that `ty` is, if it is one identifier (a type parameter, as far as the syntax tells).
+fn type_name(ty: &Type) -> Option<&Ident> {
+    match unwrap_type_group(ty) {
+        Type::Path(TypePath { qself: None, path }) => path.get_ident(),
+        _ => None,
+    }
+}
+
+/// `<value>`, the start of a path `<value>::A`, at `span` (that of the `T` of `T::A`, so that an
+/// error points at the path).
+fn qself_of(value: Type, span: Span) -> QSelf {
+    QSelf {
+        lt_token: Token![<](span),
+        ty: Box::new(value),
+        position: 0,
+        as_token: None,
+        gt_token: Token![>](span),
+    }
+}
+
+/// `<value as bound>::A..` for the trait path `bound` and the segments `rest` (`A..`, with the
+/// leading `::` that [`parameter_projection()`] writes).
+fn through_bound(value: Type, bound: Path, mut rest: Path, span: Span) -> TypePath {
+    rest.leading_colon = None;
+    let position = bound.segments.len();
+    let mut segments = bound.segments;
+    segments.extend(rest.segments);
+    TypePath {
+        qself: Some(QSelf {
+            position,
+            as_token: Some(Token![as](span)),
+            ..qself_of(value, span)
+        }),
+        path: Path {
+            leading_colon: bound.leading_colon,
+            segments,
+        },
+    }
+}
+
+/// The name `T` and the rest of the path if `ty` is an associated type of it, `T::A..` or
+/// `<T>::A..` (`T` one identifier, with no arguments). The rest has a leading `::`, as
+/// `projection()` writes it.
+fn parameter_projection(ty: &TypePath) -> Option<(&Ident, Path)> {
+    let rest = |segments: Punctuated<PathSegment, Token![::]>| Path {
+        leading_colon: Some(Default::default()),
+        segments,
+    };
+    match &ty.qself {
+        None => {
+            let name = projection_head(&ty.path)?;
+            let segments = ty.path.segments.iter().skip(1).cloned().collect();
+            Some((name, rest(segments)))
+        }
+        Some(QSelf {
+            ty: head,
+            position: 0,
+            as_token: None,
+            ..
+        }) => Some((type_name(head)?, rest(ty.path.segments.clone()))),
+        _ => None,
+    }
+}
+
+/// The one trait bound of the parameter, as a trait path without associated type bindings
+/// (`Iterator` for `T: Iterator<Item = u8>`): the trait that `<value as Trait>::A` names. `None` if
+/// the parameter has none, or has several, or the bound has a `for<'a>` binder. A lifetime bound
+/// and `?Sized` are not counted; a where clause is not known.
+fn single_bound(param: &TypeParam) -> Option<Path> {
+    let mut found = None;
+    for bound in &param.bounds {
+        match bound {
+            TypeParamBound::Lifetime(_) => (),
+            TypeParamBound::Trait(TraitBound {
+                modifier: TraitBoundModifier::Maybe(_),
+                ..
+            }) => (),
+            TypeParamBound::Trait(bound) if found.is_none() && bound.lifetimes.is_none() => {
+                found = Some(bound.path.clone());
+            }
+            _ => return None,
+        }
+    }
+    let mut path = found?;
+    if let Some(last) = path.segments.last_mut() {
+        match &mut last.arguments {
+            PathArguments::AngleBracketed(args) => {
+                args.args = std::mem::take(&mut args.args)
+                    .into_iter()
+                    .filter(|arg| {
+                        !matches!(
+                            arg,
+                            GenericArgument::AssocType(_)
+                                | GenericArgument::AssocConst(_)
+                                | GenericArgument::Constraint(_)
+                        )
+                    })
+                    .collect();
+                if args.args.is_empty() {
+                    last.arguments = PathArguments::None;
+                }
+            }
+            PathArguments::Parenthesized(args) => args.output = ReturnType::Default,
+            PathArguments::None => (),
+        }
+    }
+    Some(path)
 }
 
 /// Primitive types which can be the type of const parameters on stable Rust.
@@ -470,7 +619,7 @@ fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
 
 /// Why the generics of an entry cannot be encoded: the error of the call of
 /// `LeakerResult::repeater_impls()`, of [`repeater_projection()`](crate::repeater_projection), of
-/// [`complete_params()`] and of [`substitute_args()`].
+/// [`complete_params()`], of [`substitute_args()`] and of [`Substitute::finish()`].
 ///
 /// It converts into a `syn::Error` at the offending tokens.
 ///
@@ -489,8 +638,8 @@ pub enum EncodeError {
     /// The type of a const parameter is not a primitive type (e.g. an alias).
     UnsupportedConstType(Box<Type>),
     /// An argument that does not fit: there are more arguments than parameters, one is not of the
-    /// kind of its parameter (a lifetime for a type), or a value that [`substitute_args()`] was
-    /// given for a name is not of a kind that fits the place of the name.
+    /// kind of its parameter (a lifetime for a type), or a value that [`substitute_args()`] or
+    /// [`Substitute`] was given for a name is not of a kind that fits the place of the name.
     UnexpectedArgument(Box<GenericArgument>),
     /// A parameter that has neither an argument nor a default.
     MissingArgument(Box<GenericParam>),
@@ -500,6 +649,14 @@ pub enum EncodeError {
     /// [`ImplSelf::Marker`](crate::ImplSelf::Marker) was given and an entry names `Self`, or its
     /// context's generics do. Use [`ImplSelf::Param`](crate::ImplSelf::Param).
     NeedsSelf(Box<Type>),
+    /// The associated type of a type that is not a type parameter, as written by `T::Item` with
+    /// `T` given as `IntoIter<u8>`: `<IntoIter<u8>>::Item`, which rustc takes only for a type
+    /// parameter (E0223). It needs its trait, `<IntoIter<u8> as Iterator>::Item`.
+    /// [`complete_params()`] writes it from the one trait bound of the parameter (`T: Iterator`),
+    /// and fails if there is not one. [`substitute_args()`] and [`Substitute`] know no bounds:
+    /// write the trait in the copy (`<T as Iterator>::Item`), and `T` is replaced in it. The type
+    /// is the path as it would be written.
+    AmbiguousAssociatedType(Box<Type>),
 }
 
 impl std::fmt::Display for EncodeError {
@@ -526,6 +683,12 @@ impl std::fmt::Display for EncodeError {
                  cannot be for a marker type; use `ImplSelf::Param`",
                 quote!(#ty)
             ),
+            EncodeError::AmbiguousAssociatedType(ty) => write!(
+                f,
+                "the associated type '{}' needs its trait: rustc resolves `<Type>::Item` only for a \
+                 type parameter; write `<Type as Trait>::Item`",
+                quote!(#ty)
+            ),
         }
     }
 }
@@ -541,6 +704,7 @@ impl EncodeError {
             EncodeError::MissingArgument(param) => param.span(),
             EncodeError::UnboundedTraitObject(ty) => ty.span(),
             EncodeError::NeedsSelf(ty) => ty.span(),
+            EncodeError::AmbiguousAssociatedType(ty) => ty.span(),
         }
     }
 }
@@ -568,31 +732,17 @@ fn braced_const(value: &Expr) -> Expr {
     parse_quote!({ #value })
 }
 
-/// `<value>::A` for the path `T::A` and the type `value` for `T`. `fold` writes the segments after
-/// `T`, whose arguments may name generics too.
-fn projection(value: Type, path: &Path, fold: impl FnOnce(Path) -> Path) -> TypePath {
-    let rest = Path {
-        leading_colon: Some(Default::default()),
-        segments: path.segments.iter().skip(1).cloned().collect(),
-    };
-    TypePath {
-        qself: Some(QSelf {
-            lt_token: Default::default(),
-            ty: Box::new(value),
-            position: 0,
-            as_token: None,
-            gt_token: Default::default(),
-        }),
-        path: fold(rest),
-    }
-}
-
 /// The fold of [`complete_params()`]: it writes the default of a parameter with the
 /// arguments of the parameters before it.
 #[derive(Default)]
 pub(crate) struct ParamFold {
     /// The argument of each type parameter completed so far.
     types: HashMap<Ident, Type>,
+    /// The one trait bound of each of those that has exactly one, without its associated type
+    /// bindings (`Iterator` for `T: Iterator<Item = u8>`).
+    bounds: HashMap<Ident, Path>,
+    /// The first associated type that could not be written.
+    error: Option<EncodeError>,
     /// The value of each const parameter completed so far.
     consts: HashMap<Ident, Expr>,
     /// The argument of each lifetime parameter completed so far.
@@ -639,6 +789,38 @@ impl ParamFold {
     fn lifetime(&self, lifetime: Lifetime) -> Lifetime {
         self.lifetimes.get(&lifetime).cloned().unwrap_or(lifetime)
     }
+
+    /// `T::A..` for the earlier parameter `name`, with `value` as its argument and `rest` the path
+    /// after it: `<value>::A` if `value` is an identifier (a type parameter, which rustc resolves),
+    /// else `<value as Trait>::A` with the one bound of the parameter. `original` stays if there is
+    /// none, and the error is kept.
+    fn projected(&mut self, name: &Ident, value: Type, rest: Path, original: Type) -> Type {
+        let rest = syn::fold::fold_path(self, rest);
+        if type_name(&value).is_some() {
+            return Type::Path(TypePath {
+                qself: Some(qself_of(value, name.span())),
+                path: rest,
+            });
+        }
+        match self.bounds.get(name).cloned() {
+            Some(bound) => {
+                // The arguments of the bound may name the earlier parameters.
+                let bound = syn::fold::fold_path(self, bound);
+                Type::Path(through_bound(value, bound, rest, name.span()))
+            }
+            None => {
+                let ambiguous = TypePath {
+                    qself: Some(qself_of(value, name.span())),
+                    path: rest,
+                };
+                self.error
+                    .get_or_insert(EncodeError::AmbiguousAssociatedType(Box::new(Type::Path(
+                        ambiguous,
+                    ))));
+                original
+            }
+        }
+    }
 }
 
 impl syn::fold::Fold for ParamFold {
@@ -647,12 +829,12 @@ impl syn::fold::Fold for ParamFold {
             return arg;
         }
         // `T::A`, for the type `T` of an earlier parameter.
-        if let Type::Path(TypePath { qself: None, path }) = &ty {
-            if let Some(value) = projection_head(path).and_then(|name| self.types.get(name)) {
-                let value = value.clone();
-                return Type::Path(projection(value, path, |rest| {
-                    syn::fold::fold_path(self, rest)
-                }));
+        if let Type::Path(path) = &ty {
+            if let Some((name, rest)) = parameter_projection(path) {
+                let name = name.clone();
+                if let Some(value) = self.types.get(&name).cloned() {
+                    return self.projected(&name, value, rest, ty);
+                }
             }
         }
         syn::fold::fold_type(self, ty)
@@ -694,7 +876,7 @@ impl Site for ParamFold {
 /// order they come in, before anything is replaced; a value is not substituted again. It is
 /// asked for:
 ///
-/// - a type `T`, and `T::A` (`<value>::A`, for a `Type`);
+/// - a type `T`, and `T::A` or `<T>::A` (`<value>::A`, for a `Type`);
 /// - a const `N`, in an expression (`[u8; N]`, `{ N }`) or as an argument;
 /// - a lifetime `'a`, as `a`; `'static` and `'_` are never asked;
 /// - `Self`, in a type and in `Self::A` of an expression (`Self` alone in an expression is a
@@ -705,6 +887,16 @@ impl Site for ParamFold {
 /// `Const` where the name is a whole argument (`T` in `Vec<T>`); a `Type` where it is part of a
 /// type (`&T`, `T::A`) or `Self` in a macro; a `Const`, or a `Type` that is one identifier, in an
 /// expression; a `Lifetime` for a lifetime.
+///
+/// `T::A` in a type is `<value>::A`, which rustc resolves only if `value` is a type parameter
+/// (one identifier). For any other value the call fails with
+/// [`EncodeError::AmbiguousAssociatedType`] and `args` stay as they are: it knows no bounds, so
+/// write the trait in the copy (`<T as Iterator>::A`), where `T` is replaced as any name.
+/// ([`complete_params()`] knows the bounds of the parameters, and writes it.) `Self::A` in an
+/// expression is `<value>::A` for any value.
+///
+/// [`Substitute`] does the same for a whole syntax node (a signature, an impl item), lifetimes
+/// outside the types included.
 ///
 /// A const is braced once (`[u8; { N }]` with `M` is `[u8; { M }]`), a trait object with several
 /// bounds that a reference or pointer points to gets parentheses, and a function pointer or
@@ -731,22 +923,35 @@ impl Site for ParamFold {
 /// let err = substitute_args(args.iter_mut(), |_: &Ident| Some(parse_quote!('a))).unwrap_err();
 /// assert!(matches!(err, EncodeError::UnexpectedArgument(_)));
 /// assert_eq!(args, [parse_quote!(&T)]);
+///
+/// // `T::Item` for `T` as `IntoIter<u8>` needs its trait, which the copy writes.
+/// let into_iter = |_: &Ident| Some(parse_quote!(IntoIter<u8>));
+/// let mut args: Vec<GenericArgument> = vec![parse_quote!(Option<T::Item>)];
+/// let err = substitute_args(args.iter_mut(), into_iter).unwrap_err();
+/// assert!(matches!(err, EncodeError::AmbiguousAssociatedType(_)));
+/// let mut args: Vec<GenericArgument> = vec![parse_quote!(Option<<T as Iterator>::Item>)];
+/// substitute_args(args.iter_mut(), into_iter).unwrap();
+/// assert_eq!(args, [parse_quote!(Option<<IntoIter<u8> as Iterator>::Item>)]);
 /// ```
 pub fn substitute_args<'a>(
     args: impl IntoIterator<Item = &'a mut GenericArgument>,
     f: impl FnMut(&Ident) -> Option<GenericArgument>,
 ) -> std::result::Result<(), EncodeError> {
-    let mut args: Vec<&'a mut GenericArgument> = args.into_iter().collect();
-    let mut answers = Answers {
-        f,
-        known: HashMap::new(),
-    };
+    let mut answers = Answers::new(f);
+    substitute_in(&mut answers, args.into_iter().collect())
+}
+
+/// The substitution of [`substitute_args()`] with the answers that `answers` has and asks for.
+fn substitute_in<F: FnMut(&Ident) -> Option<GenericArgument>>(
+    answers: &mut Answers<F>,
+    mut args: Vec<&mut GenericArgument>,
+) -> std::result::Result<(), EncodeError> {
     // The first pass asks `f` for the names; what it writes is dropped.
     let mut asking = SiteFold {
-        answers: &mut answers,
+        answers: &mut *answers,
         names: FreshLifetimes::default(),
         naming: false,
-        misfit: None,
+        error: None,
     };
     for arg in &args {
         asking.fold_generic_argument((**arg).clone());
@@ -760,22 +965,197 @@ pub fn substitute_args<'a>(
         names.reserve(value);
     }
     let mut writing = SiteFold {
-        answers: &mut answers,
+        answers,
         names,
         naming: true,
-        misfit: None,
+        error: None,
     };
     let written: Vec<GenericArgument> = args
         .iter()
         .map(|arg| writing.fold_generic_argument((**arg).clone()))
         .collect();
-    if let Some(value) = writing.misfit {
-        return Err(EncodeError::UnexpectedArgument(Box::new(value)));
+    if let Some(error) = writing.error {
+        return Err(error);
     }
     for (arg, written) in args.iter_mut().zip(written) {
         **arg = written;
     }
     Ok(())
+}
+
+/// Writes the arguments of a use site into a whole syntax node: [`substitute_args()`] as a
+/// [`VisitMut`].
+///
+/// `f` is the closure of [`substitute_args()`]: it answers the argument that takes the place of a
+/// name (`T`, `N`, `'a` as `a`, `Self`), or `None` to keep the name. It is asked once for each name
+/// over the whole visit.
+///
+/// The visitor writes each type it meets as one unit, as `substitute_args()` does (a const braced
+/// once, a trait object behind a pointer in parentheses, `T::A` by the rules there, the elided
+/// lifetime of a function pointer named where it needs a name, `Self` in a macro), and does not
+/// visit inside it again. It writes every lifetime that is not in a type too: the receiver of
+/// `fn keep(&'a self)`, a bound `T: 'a`, `'a: 'b` or `Self: 'a`, and the lifetime argument of a
+/// bound (`T: Tr<'a>`). So do the generic arguments, the expressions (a const parameter's
+/// default) and the macros outside a type. A bound `F: Fn(&U) -> &u8` outside a type is written
+/// like the type `dyn Fn(&U) -> &u8`.
+///
+/// Visit what you copy, the items of an impl or a signature: the header of the impl declares the
+/// names that the site gives. The visitor knows no scope: a name that the node declares itself, a
+/// method's own `<'b, V>`, is asked like any other, so answer `None` for it to keep it.
+///
+/// A name that does not fit its place, or an associated type that needs its trait
+/// ([`EncodeError::AmbiguousAssociatedType`]), leaves the type or lifetime where it happened as it
+/// is and the visit goes on, so the node may be partly written: [`Substitute::finish()`] returns
+/// the first error, and the node must not be used if it is one.
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// # use syn::visit_mut::VisitMut;
+/// // `impl<'a> Tr<'a, u8> for Host` for `trait Tr<'a, K: 'a> { fn keep(&'a self, k: Option<K>) ->
+/// // &'a K where Self: 'a; }`: the lifetime outside a type is written too.
+/// let mut sig: Signature =
+///     parse_quote!(fn keep(&'a self, k: Option<K>) -> &'a K where Self: 'a);
+/// let mut site = Substitute::new(|name: &Ident| match name.to_string().as_str() {
+///     "a" => Some(parse_quote!('static)),
+///     "K" => Some(parse_quote!(u8)),
+///     _ => None,
+/// });
+/// site.visit_signature_mut(&mut sig);
+/// site.finish().unwrap();
+/// assert_eq!(
+///     sig,
+///     parse_quote!(fn keep(&'static self, k: Option<u8>) -> &'static u8 where Self: 'static)
+/// );
+/// ```
+pub struct Substitute<F> {
+    answers: Answers<F>,
+    /// The first error.
+    error: Option<EncodeError>,
+}
+
+impl<F: FnMut(&Ident) -> Option<GenericArgument>> Substitute<F> {
+    /// Creates the visitor. `f` answers for a name, as in [`substitute_args()`].
+    pub fn new(f: F) -> Self {
+        Substitute {
+            answers: Answers::new(f),
+            error: None,
+        }
+    }
+
+    /// Returns the first error of the visit, if there was one.
+    pub fn finish(self) -> std::result::Result<(), EncodeError> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Substitutes the argument `arg` as a unit: it is left as it is on an error, which is kept.
+    fn write(&mut self, arg: &mut GenericArgument) {
+        if let Err(error) = substitute_in(&mut self.answers, vec![arg]) {
+            self.error.get_or_insert(error);
+        }
+    }
+
+    fn misfit(&mut self, value: GenericArgument) {
+        self.error
+            .get_or_insert(EncodeError::UnexpectedArgument(Box::new(value)));
+    }
+}
+
+impl<F: FnMut(&Ident) -> Option<GenericArgument>> VisitMut for Substitute<F> {
+    fn visit_type_mut(&mut self, ty: &mut Type) {
+        let mut arg = GenericArgument::Type(ty.clone());
+        self.write(&mut arg);
+        match arg {
+            GenericArgument::Type(written) => *ty = written,
+            // A const for a name that stands alone as a type.
+            other => self.misfit(other),
+        }
+    }
+
+    // A bare const parameter is parsed as a type argument (`N` in `Foo<N>`), and becomes a const.
+    fn visit_generic_argument_mut(&mut self, arg: &mut GenericArgument) {
+        self.write(arg)
+    }
+
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        let mut arg = GenericArgument::Const(expr.clone());
+        self.write(&mut arg);
+        match arg {
+            GenericArgument::Const(written) => *expr = written,
+            // An identifier for a const name is a type.
+            GenericArgument::Type(Type::Path(TypePath { qself, path })) => {
+                *expr = Expr::Path(ExprPath {
+                    attrs: Vec::new(),
+                    qself,
+                    path,
+                })
+            }
+            other => self.misfit(other),
+        }
+    }
+
+    fn visit_lifetime_mut(&mut self, lifetime: &mut Lifetime) {
+        let mut arg = GenericArgument::Lifetime(lifetime.clone());
+        self.write(&mut arg);
+        match arg {
+            GenericArgument::Lifetime(written) => *lifetime = written,
+            other => self.misfit(other),
+        }
+    }
+
+    // `&'a self` is `Self` by its form: only its lifetime is written. The type that syn keeps for
+    // it is not printed, unless it is not `&Self` any more: an answer for `Self` would make it
+    // `&'a self: &Host`.
+    fn visit_receiver_mut(&mut self, receiver: &mut Receiver) {
+        if receiver.colon_token.is_some() {
+            return syn::visit_mut::visit_receiver_mut(self, receiver);
+        }
+        for attr in &mut receiver.attrs {
+            self.visit_attribute_mut(attr);
+        }
+        if let (Some((_, Some(lifetime))), Type::Reference(ty)) =
+            (&mut receiver.reference, &mut *receiver.ty)
+        {
+            self.visit_lifetime_mut(lifetime);
+            ty.lifetime = Some(lifetime.clone());
+        }
+    }
+
+    // The bound `Fn(&U) -> &u8` outside a type has an elided lifetime to name, as the type
+    // `dyn Fn(&U) -> &u8` has.
+    fn visit_trait_bound_mut(&mut self, bound: &mut TraitBound) {
+        let object = Type::TraitObject(TypeTraitObject {
+            dyn_token: None,
+            bounds: std::iter::once(TypeParamBound::Trait(bound.clone())).collect(),
+        });
+        let mut arg = GenericArgument::Type(object);
+        self.write(&mut arg);
+        if let GenericArgument::Type(Type::TraitObject(TypeTraitObject { bounds, .. })) = arg {
+            if let Some(TypeParamBound::Trait(written)) = bounds.into_iter().next() {
+                *bound = written;
+            }
+        }
+    }
+
+    fn visit_macro_mut(&mut self, mac: &mut Macro) {
+        let mut arg = GenericArgument::Const(Expr::Macro(ExprMacro {
+            attrs: Vec::new(),
+            mac: mac.clone(),
+        }));
+        self.write(&mut arg);
+        if let GenericArgument::Const(Expr::Macro(ExprMacro { mac: written, .. })) = arg {
+            *mac = written;
+        }
+    }
+
+    // What replaced the bounded type (`Self`) may need parentheses there.
+    fn visit_predicate_type_mut(&mut self, predicate: &mut PredicateType) {
+        syn::visit_mut::visit_predicate_type_mut(self, predicate);
+        parenthesize_bounded(&mut predicate.bounded_ty);
+    }
 }
 
 /// What `f` answered, for each name once.
@@ -785,6 +1165,13 @@ struct Answers<F> {
 }
 
 impl<F: FnMut(&Ident) -> Option<GenericArgument>> Answers<F> {
+    fn new(f: F) -> Self {
+        Answers {
+            f,
+            known: HashMap::new(),
+        }
+    }
+
     fn of(&mut self, name: &Ident) -> Option<GenericArgument> {
         if let Some(answer) = self.known.get(name) {
             return answer.clone();
@@ -801,15 +1188,33 @@ struct SiteFold<'f, F> {
     names: FreshLifetimes,
     /// Whether it names the elided lifetime of a signature. The first pass writes nothing.
     naming: bool,
-    /// The first value that did not fit its place.
-    misfit: Option<GenericArgument>,
+    /// The first value that did not fit its place, or associated type that could not be written.
+    error: Option<EncodeError>,
 }
 
 impl<F: FnMut(&Ident) -> Option<GenericArgument>> SiteFold<'_, F> {
     fn misfit(&mut self, value: GenericArgument) {
-        if self.misfit.is_none() {
-            self.misfit = Some(value);
+        self.error
+            .get_or_insert(EncodeError::UnexpectedArgument(Box::new(value)));
+    }
+
+    /// `T::A..` for the name `T` with `value` and `rest` the path after it: `<value>::A`, which
+    /// rustc takes only if `value` is an identifier (a type parameter). For any other type the
+    /// trait is needed, and the bounds of `T` are not known here: `original` stays, and the error
+    /// is kept.
+    fn projected(&mut self, name: &Ident, value: Type, rest: Path, original: Type) -> Type {
+        let projected = TypePath {
+            qself: Some(qself_of(value.clone(), name.span())),
+            path: self.fold_path(rest),
+        };
+        if type_name(&value).is_some() {
+            return Type::Path(projected);
         }
+        self.error
+            .get_or_insert(EncodeError::AmbiguousAssociatedType(Box::new(Type::Path(
+                projected,
+            ))));
+        original
     }
 
     /// The type for `name`, if there is an answer: only a type fits.
@@ -902,12 +1307,15 @@ impl<F: FnMut(&Ident) -> Option<GenericArgument>> syn::fold::Fold for SiteFold<'
         }
     }
     fn fold_type(&mut self, ty: Type) -> Type {
-        if let Type::Path(TypePath { qself: None, path }) = &ty {
-            if let Some(name) = path.get_ident() {
+        if let Type::Path(path_ty) = &ty {
+            if let (None, Some(name)) = (&path_ty.qself, path_ty.path.get_ident()) {
                 return self.type_for(name).unwrap_or(ty);
             }
-            if let Some(value) = projection_head(path).and_then(|name| self.type_for(name)) {
-                return Type::Path(projection(value, path, |rest| self.fold_path(rest)));
+            if let Some((name, rest)) = parameter_projection(path_ty) {
+                let name = name.clone();
+                if let Some(value) = self.type_for(&name) {
+                    return self.projected(&name, value, rest, ty);
+                }
             }
         }
         match ty {

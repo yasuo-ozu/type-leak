@@ -52,8 +52,8 @@ use syn::{
     ItemStruct, ItemTrait, Path, PathArguments, Token, TraitItem, Type,
 };
 use type_leak::{
-    array_const, complete_params, repeater_projection, substitute_args, Context, ContextId,
-    EncodeError, EntryId, ErrorItem, ImplSelf, Leaker, Referrer,
+    array_const, complete_params, repeater_projection, Context, ContextId, EncodeError, EntryId,
+    ErrorItem, ImplSelf, Leaker, Referrer, Substitute,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -248,8 +248,8 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
     };
 
     // Where the copy is: `impl<K> Repo<K> for W` declares the generics of the trait itself (nothing
-    // is substituted). `impl Repo<u8> for W` gives them arguments, which `substitute_args()` writes
-    // in the types of the copy (`t: K`, and the paths through the Repeater).
+    // is substituted). `impl Repo<u8> for W` gives them arguments, which `Substitute` writes into
+    // the signatures of the copy (`t: K`, `&'a self`, and the paths through the Repeater).
     let explicit: Option<Vec<GenericArgument>> =
         match &trait_path.segments.last().unwrap().arguments {
             PathArguments::AngleBracketed(args) => Some(args.args.iter().cloned().collect()),
@@ -301,9 +301,13 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
                 referrer
                     .visitor(top_level, project)
                     .visit_signature_mut(&mut sig);
-                // 3. Write the arguments of the impl into the types of the signature.
+                // 3. Write the arguments of the impl into the signature: its types, and the lifetimes
+                //    outside them (`&'a self`, `T: 'a`). The names that the method declares itself
+                //    get no answer (`site` knows the trait's parameters only).
                 if explicit.is_some() {
-                    Written(&site).visit_signature_mut(&mut sig);
+                    let mut written = Substitute::new(&site);
+                    written.visit_signature_mut(&mut sig);
+                    enc(written.finish())?;
                 }
                 let receiver = match sig.receiver() {
                     Some(r) if r.reference.is_some() && r.mutability.is_some() => {
@@ -359,21 +363,7 @@ fn own_name(param: &GenericParam) -> GenericArgument {
     }
 }
 
-/// Writes the types that are not leaked as they are at the site: `K` is `u8` in `impl Repo<u8> for
-/// ..`. (The visitor of `type-leak` replaces only leaked types.)
-struct Written<F>(F);
-
-impl<F: Fn(&Ident) -> Option<GenericArgument>> VisitMut for Written<&F> {
-    fn visit_type_mut(&mut self, ty: &mut Type) {
-        let mut arg = GenericArgument::Type(ty.clone());
-        substitute_args(std::iter::once(&mut arg), self.0).expect("a type fits a type");
-        if let GenericArgument::Type(written) = arg {
-            *ty = written;
-        }
-    }
-}
-
-/// The name of a generic parameter, as `substitute_args()` asks for it.
+/// The name of a generic parameter, as `Substitute` asks for it.
 fn param_ident(param: &GenericParam) -> &Ident {
     match param {
         GenericParam::Type(p) => &p.ident,
