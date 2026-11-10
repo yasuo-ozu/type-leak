@@ -844,3 +844,332 @@ fn display_uses_the_headline_of_the_cause() {
     let err = result.errors();
     check(err, "use absolute path: 'Rel < T >'");
 }
+
+// ── bucket_self and ImplSelf::Bucket ─────────────────────────────────────────────────────────
+
+/// The samples, and the shapes that bucketing tells apart: a trait whose generics name `Self` and
+/// whose default does not, a struct whose bound names its own `Self` (`SelfRequirement::Any`), an
+/// impl and a module with a nested trait.
+fn bucket_samples() -> Vec<Item> {
+    let mut items = samples();
+    items.extend([
+        parse_quote! {
+            trait Tr<T: AsRef<Self>, U = Rel<T>> { fn f(&self, t: T) -> U; fn g(&self) -> Wrap<Self>; }
+        },
+        parse_quote! {
+            struct S<T: AsRef<Self>> { a: Wrap<T>, b: Rel, c: ::p::W<Self> }
+        },
+        parse_quote! {
+            impl<T: Clone> ::p::Tr<Rel2<T>> for W<T> { fn f(&self) -> Rel3 { todo!() } }
+        },
+        parse_quote! {
+            mod m {
+                pub trait Tr<T: AsRef<Self>, U = Rel<T>> { fn f(&self) -> Wrap<Self::A>; }
+                pub struct S<'a, T: 'a> { x: &'a Rel<T> }
+            }
+        },
+    ]);
+    items
+}
+
+/// The last segment of the primitive type of a bucket: `f32`.
+fn bucket_name(ty: &Type) -> String {
+    let text = t(ty.clone());
+    let name = text.strip_prefix(":: core :: primitive :: ");
+    name.unwrap_or_else(|| panic!("not a primitive: {}", text))
+        .to_string()
+}
+
+fn names_self(generics: &Generics) -> bool {
+    fn has_self(tokens: proc_macro2::TokenStream) -> bool {
+        tokens.into_iter().any(|tree| match tree {
+            proc_macro2::TokenTree::Ident(ident) => ident == "Self",
+            proc_macro2::TokenTree::Group(group) => has_self(group.stream()),
+            _ => false,
+        })
+    }
+    let where_clause = &generics.where_clause;
+    has_self(quote!(#generics #where_clause))
+}
+
+/// `Referrer::bucket_self()`, `Referrer::needs_self()` and `repeater_impl(.., ImplSelf::Bucket)`
+/// agree for every entry: the impl of an entry that has a bucket is the one for it as for a marker,
+/// any other is the one for a parameter, an entry has a bucket exactly if neither its type nor its
+/// generics name `Self` (`needs_self()` is false), and `ImplSelf::Marker` fails exactly where
+/// `needs_self()` is true.
+#[test]
+fn bucket_self_agrees_with_the_impl_of_every_entry() {
+    let param: Ident = parse_quote!(__S);
+    let (mut bucketed, mut other, mut generic_self) = (0, 0, 0);
+    for item in bucket_samples() {
+        let (referrer, _) = analyze(&item);
+        for ix in 0..referrer.iter().count() {
+            for id in [0, 1, 7, 12345, u64::MAX] {
+                let what = format!("{}: {} ({})", s(&item), ix, id);
+                let context = referrer.context(ix);
+                let bucket = referrer.bucket_self(ix, id);
+                let encode =
+                    |value: &Expr, param: &ConstParam| slots().encode_const(value, &param.ty);
+                let r = referrer
+                    .repeater_impl(ix, ImplSelf::Bucket { id, param: &param }, encode)
+                    .unwrap_or_else(|e| panic!("{}: {}", what, e));
+                let own_self = referrer.context_self(context).is_some();
+                let generics_self = names_self(referrer.context_generics(context));
+                assert_eq!(bucket.is_some(), !own_self && !generics_self, "{}", what);
+                let needs_self = referrer.needs_self(ix);
+                assert_eq!(needs_self, own_self || generics_self, "{}", what);
+                assert_eq!(needs_self, bucket.is_none(), "{}", what);
+                let marker: Type = parse_quote!(crate::Marker);
+                let as_marker = referrer.repeater_impl(ix, ImplSelf::Marker(&marker), encode);
+                assert_eq!(
+                    matches!(as_marker, Err(EncodeError::NeedsSelf(_))),
+                    needs_self,
+                    "{}",
+                    what
+                );
+                assert!(as_marker.is_ok() || needs_self, "{}", what);
+                match bucket {
+                    Some(ty) => {
+                        bucketed += 1;
+                        bucket_name(&ty);
+                        assert_eq!(r.self_ty, ty, "{}", what);
+                        let expected = referrer
+                            .repeater_impl(ix, ImplSelf::Marker(&ty), encode)
+                            .unwrap();
+                        assert_eq!(r, expected, "{}", what);
+                        // No `__S`.
+                        assert!(!with_where(&r.generics).contains("__S"), "{}", what);
+                        // It does not depend on how often it is asked.
+                        assert_eq!(referrer.bucket_self(ix, id), Some(ty), "{}", what);
+                    }
+                    None => {
+                        other += 1;
+                        generic_self += (!own_self) as usize;
+                        let expected = referrer
+                            .repeater_impl(ix, ImplSelf::Param(&param), encode)
+                            .unwrap();
+                        assert_eq!(r, expected, "{}", what);
+                    }
+                }
+            }
+        }
+    }
+    assert!(bucketed > 50 && other > 50, "{} {}", bucketed, other);
+    // The entries of a default whose generics name `Self` while it does not: they were looked for.
+    assert!(generic_self > 0);
+}
+
+/// `trait Tr<T: AsRef<Self>, U = Rel<T>>`: the default `Rel<T>` does not name `Self`, so
+/// `context_self()` is `None`, but the generics of its context do. With a concrete type that
+/// `Self` would be that type, so there is no bucket: the impl is for a parameter, which is the
+/// implementor of the trait in the copy.
+#[test]
+fn a_default_whose_generics_name_self_has_no_bucket() {
+    let (referrer, _) = analyze(&parse_quote! {
+        trait Tr<T: AsRef<Self>, U = Rel<T>> { fn f(&self, t: T) -> U; }
+    });
+    let rel = referrer.iter().position(|ty| s(ty) == "Rel < T >").unwrap();
+    let context = referrer.context(rel);
+    assert!(referrer.context_self(context).is_none());
+    assert!(names_self(referrer.context_generics(context)));
+    assert_eq!(referrer.bucket_self(rel, 7), None);
+    let param: Ident = parse_quote!(__S);
+    let r = referrer
+        .repeater_impl(
+            rel,
+            ImplSelf::Bucket {
+                id: 7,
+                param: &param,
+            },
+            array_const,
+        )
+        .unwrap();
+    assert_eq!(s(&r.self_ty), "__S");
+    assert_eq!(
+        r,
+        referrer
+            .repeater_impl(rel, ImplSelf::Param(&param), array_const)
+            .unwrap()
+    );
+    assert_eq!(
+        with_where(&r.generics),
+        with_where(&parse_quote!(<T: AsRef<Self>, __S: ?::core::marker::Sized>))
+    );
+}
+
+/// The entries of one item do not all share a bucket, and the same entry of other ids does not
+/// either: the type is `splitmix64(id + ix * 0x9E3779B97F4A7C15)` modulo 17 of the list.
+#[test]
+fn bucket_types_follow_the_documented_hash() {
+    const BUCKETS: [&str; 17] = [
+        "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
+        "i128", "isize", "f32", "f64", "str",
+    ];
+    fn splitmix64(x: u64) -> u64 {
+        let mut z = x.wrapping_add(0x9E3779B97F4A7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+    let (referrer, _) = analyze(&parse_quote! {
+        struct S { a: Rel, b: Rel2, c: Rel3, d: Rel4 }
+    });
+    for id in [0u64, 1, 7, 255, 1 << 40, u64::MAX] {
+        for ix in 0..referrer.iter().count() {
+            let h = splitmix64(id.wrapping_add((ix as u64).wrapping_mul(0x9E3779B97F4A7C15)));
+            let expected = BUCKETS[(h % 17) as usize];
+            assert_eq!(
+                bucket_name(&referrer.bucket_self(ix, id).unwrap()),
+                expected,
+                "{} {}",
+                id,
+                ix
+            );
+        }
+    }
+    // The mapping is part of the format: these values must not change without a bump of
+    // `Referrer::FORMAT_VERSION`.
+    for (id, ix, expected) in [
+        (0, 0, "i128"),
+        (1, 0, "i32"),
+        (7, 0, "bool"),
+        (7, 1, "usize"),
+        (0, 1, "i128"),
+        (0, 2, "i16"),
+        (u64::MAX, 0, "f32"),
+        (u64::MAX, 3, "f64"),
+    ] {
+        assert_eq!(
+            bucket_name(&referrer.bucket_self(ix, id).unwrap()),
+            expected,
+            "{} {}",
+            id,
+            ix
+        );
+    }
+}
+
+/// How many entries each of the 17 buckets gets: every one is used, and none gets more than twice
+/// its share.
+fn assert_spread(names: impl Iterator<Item = String>, what: &str) {
+    let mut counts = std::collections::BTreeMap::new();
+    let mut total = 0;
+    for name in names {
+        *counts.entry(name).or_insert(0usize) += 1;
+        total += 1;
+    }
+    assert_eq!(counts.len(), 17, "{}: {:?}", what, counts);
+    let share = total as f64 / 17.0;
+    for (name, count) in &counts {
+        assert!(
+            (*count as f64) <= 2.0 * share,
+            "{}: {} has {} of {}: {:?}",
+            what,
+            name,
+            count,
+            total,
+            counts
+        );
+    }
+}
+
+#[test]
+fn bucket_types_spread_over_ids_and_entries() {
+    let (referrer, _) = analyze(&parse_quote! { struct S { a: Rel } });
+    let bucket = |id: u64| bucket_name(&referrer.bucket_self(0, id).unwrap());
+    assert_spread((0..1000u64).map(bucket), "ids 0..1000");
+    assert_spread((0..1000u64).map(|k| k << 8).map(bucket), "k << 8");
+    assert_spread((0..1000u64).map(|k| k << 16).map(bucket), "k << 16");
+    assert_spread((0..1000u64).map(|k| k << 32).map(bucket), "k << 32");
+    assert_spread((0..1000u64).map(|k| k * 17).map(bucket), "k * 17");
+    // The entries of one item, with one id.
+    let fields: Vec<_> = (0..600)
+        .map(|n| {
+            let (name, ty) = (
+                format_ident(&format!("f{}", n)),
+                format_ident(&format!("R{}", n)),
+            );
+            quote!(#name: #ty,)
+        })
+        .collect();
+    let (referrer, _) = analyze(&parse_quote! { struct Big { #(#fields)* } });
+    assert_eq!(referrer.iter().count(), 600);
+    for id in [0u64, 7, u64::MAX] {
+        assert_spread(
+            (0..600).map(|ix| bucket_name(&referrer.bucket_self(ix, id).unwrap())),
+            "the entries of one item",
+        );
+    }
+}
+
+fn format_ident(name: &str) -> Ident {
+    Ident::new(name, proc_macro2::Span::call_site())
+}
+
+/// `ImplSelf` stays `Clone`, `Copy` and `Debug`.
+#[test]
+fn impl_self_bucket_is_copy_and_debug() {
+    let param: Ident = parse_quote!(__S);
+    let target = ImplSelf::Bucket {
+        id: 3,
+        param: &param,
+    };
+    let copy = target;
+    assert_eq!(format!("{:?}", target), format!("{:?}", copy));
+    assert!(format!("{:?}", target).contains("Bucket"));
+    fn is_clone<T: Clone>() {}
+    is_clone::<ImplSelf<'_>>();
+}
+
+// ── ImplSelf::Marker for an entry whose generics name Self ───────────────────────────────────
+
+/// `Marker` for the entry of `trait Tr<T: AsRef<Self>, U = Rel<T>>`: `context_self()` is `None`, but
+/// the generics of its context name `Self` (`needs_self()`), which in an impl for a marker would be
+/// the marker: `impl<T: AsRef<Self>> Repeater<..> for Marker` bounds `T: AsRef<Marker>`, where the
+/// copy has `T: AsRef<Host>`, so an impl of the copy that instantiates the default (`impl
+/// Tr<String> for Host`) fails with E0277 (`String: AsRef<Marker>`). So it is `NeedsSelf`, as for an
+/// entry that names `Self`; `ImplSelf::Param` (or `Bucket`, which falls back to it) is the choice.
+#[test]
+fn marker_is_refused_for_the_entry_of_a_default_whose_generics_name_self() {
+    let (referrer, _) = analyze(&parse_quote! {
+        trait Tr<T: AsRef<Self>, U = Rel<T>> { fn f(&self, t: T) -> U; }
+    });
+    let rel = referrer.iter().position(|ty| s(ty) == "Rel < T >").unwrap();
+    assert!(referrer.context_self(referrer.context(rel)).is_none());
+    assert!(referrer.needs_self(rel));
+    let marker: Type = parse_quote!(crate::Marker);
+    match referrer.repeater_impl(rel, ImplSelf::Marker(&marker), array_const) {
+        Err(EncodeError::NeedsSelf(ty)) => assert_eq!(s(&*ty), "Rel < T >"),
+        other => panic!("{:?}", other.map(|r| r.self_ty)),
+    }
+    // For a parameter, `Self` of the generics is the parameter.
+    let param: Ident = parse_quote!(__S);
+    let r = referrer
+        .repeater_impl(rel, ImplSelf::Param(&param), array_const)
+        .unwrap();
+    assert_eq!(s(&r.self_ty), "__S");
+    assert_eq!(
+        with_where(&r.generics),
+        with_where(&parse_quote!(<T: AsRef<Self>, __S: ?::core::marker::Sized>))
+    );
+}
+
+/// `needs_self()` is true for an entry that names `Self` and for one whose generics do, not for the
+/// others.
+#[test]
+fn needs_self_for_an_entry_that_names_self_or_whose_generics_do() {
+    let (referrer, _) = analyze(&parse_quote! {
+        trait Tr<T: AsRef<Self>, U = Rel<T>> { fn f(&self, t: T) -> U; fn g(&self) -> Wrap<Self>; }
+    });
+    let wrap = referrer
+        .iter()
+        .position(|ty| s(ty) == "Wrap < Self >")
+        .unwrap();
+    let rel = referrer.iter().position(|ty| s(ty) == "Rel < T >").unwrap();
+    assert!(referrer.needs_self(wrap) && referrer.needs_self(rel));
+    let (referrer, _) = analyze(&parse_quote! {
+        trait Tr<T, U = Rel<T>> { fn f(&self, t: T) -> U; fn g(&self) -> Wrap<T>; }
+    });
+    assert!(referrer.iter().count() > 0);
+    assert!((0..referrer.iter().count()).all(|ix| !referrer.needs_self(ix)));
+}

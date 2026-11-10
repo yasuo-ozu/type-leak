@@ -13,9 +13,10 @@
 //! whose trait and self type are resolved by name, so only their arguments are leaked:
 //! `Leaker::enter_impl(&generics, &self_ty, allow_self, |view| { view.visit_path_arguments(..) .. })`.
 //! If the Referrer has a required entry, it emits the marker type, the Repeater's implementation of
-//! each required entry (`ImplSelf::Marker(&marker)` for an entry which does not name `Self`, and
-//! `ImplSelf::Param(&ident)` for one that does), a witness for each type argument, and the exported
-//! `macro_rules! __scope_apply_7001`, which carries the Referrer and the top-level context.
+//! each required entry (`ImplSelf::Marker(&marker)` for an entry where `Referrer::needs_self()` is
+//! false, and `ImplSelf::Param(&ident)` for one where it is true), a witness for each type argument,
+//! and the exported `macro_rules! __scope_apply_7001`, which carries the Referrer and the top-level
+//! context.
 //!
 //! In the Referrer's crate, `leaker::__scope_apply_7001!(path = ::leaker::m)` expands
 //! `__scope_apply!`: it rewrites the self type, the trait path and the type arguments with
@@ -227,11 +228,13 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     // The head of each impl, as text, for the tests.
     let mut heads: Vec<String> = Vec::new();
     for &ix in &wanted {
-        let target = match referrer.context_self(referrer.context(ix)) {
-            // The entry does not name `Self`: the impl is for the marker.
-            None => ImplSelf::Marker(&marker_ty),
-            // It does: the impl is for the self type, or for a parameter bounded by the trait.
-            Some(_) => ImplSelf::Param(&self_param),
+        let target = if referrer.needs_self(ix) {
+            // The entry, or its generics, name `Self`: the impl is for the self type, or for a
+            // parameter bounded by the trait.
+            ImplSelf::Param(&self_param)
+        } else {
+            // The impl is for the marker.
+            ImplSelf::Marker(&marker_ty)
         };
         crate::check_plain(&referrer, ix, &slots)?;
         let r = referrer
@@ -442,15 +445,16 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     }
 
     // The path of an entry through the Repeater: the impl is for the marker, or for the self type
-    // if the entry names `Self`.
+    // if the entry needs `Self`.
     let error = std::cell::RefCell::new(None);
     let project = |self_ty: Option<&Type>, ix: usize| -> Type {
         let result = (|| -> Result<Type> {
-            let owner: Type = match referrer.context_self(referrer.context(ix)) {
-                None => marker_ty.clone(),
-                Some(_) => self_ty
+            let owner: Type = if referrer.needs_self(ix) {
+                self_ty
                     .cloned()
-                    .ok_or_else(|| Error::new(Span::call_site(), "the self type names `Self`"))?,
+                    .ok_or_else(|| Error::new(Span::call_site(), "the self type names `Self`"))?
+            } else {
+                marker_ty.clone()
             };
             let site = UseSite::identity().with_self(owner.clone());
             let args = referrer.entry_args(ix, &site, |value, param| {

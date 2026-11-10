@@ -1346,6 +1346,39 @@ pub mod kinds {
     pub struct Defd<T: ?Sized>(pub PhantomData<T>);
     pub struct Defd2<A, B>(pub A, pub B);
 
+    /// 9209: the impls of the entries that do not name `Self` (`Rel`, `Defd2<Rel, u8>`, `Defd<V>`)
+    /// are for a primitive type that the id and the index choose (`ImplSelf::Bucket`), and those
+    /// that do (`Wrap<Self>`) are for the implementor. The default `Defd<T>` is one of the first.
+    #[prop_leak(id = 9209, allow_self = true, scope = "mod", prelude = true, redeclare = true)]
+    pub trait BucketMix<T, U = Defd<T>> {
+        fn plain(&self) -> Rel;
+        fn plain_pair(&self) -> Defd2<Rel, u8>;
+        fn own(&self) -> Wrap<Self>;
+        fn generic<V>(&self, v: V) -> Defd<V>;
+    }
+
+    /// The marker type of 9210.
+    pub struct Marker9210;
+
+    /// 9210: the impls of the entries where `Referrer::needs_self()` is false are for a marker type
+    /// of this crate (`ImplSelf::Marker`; `marker = ..`), not a primitive type. The trait is the
+    /// item itself (not nested in a module), so its default `Defd<T>` does not name `Self` while the
+    /// bound of `T` does (`context_self()` is `None`): the entry is for the implementor of the
+    /// trait, which is the host in the copy. For the marker it would bound `T: AsRef<Marker9210>`,
+    /// which the types that the Referrer's crate uses for `T` do not satisfy (`impl
+    /// MarkerDefaultCopy<Owner9210> for Host9210`, E0277).
+    #[prop_leak(
+        id = 9210,
+        allow_self = true,
+        prelude = true,
+        redeclare = true,
+        marker = "::type_leak_test_leaker::kinds::Marker9210"
+    )]
+    pub trait MarkerDefault<T: AsRef<Self>, U = Defd<T>> {
+        fn get(&self, t: T, u: U);
+        fn plain(&self) -> Rel;
+    }
+
     /// One default: the host implements the trait for any `U`, and the default passes `()`.
     #[prop_leak(id = 9131, allow_self = true, scope = "mod", prelude = true, redeclare = true)]
     pub trait SelfDefault<T: AsRef<Self>, U = Defd<T>> {

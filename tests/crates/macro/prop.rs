@@ -84,10 +84,10 @@ pub(crate) struct Args {
     /// whatever the prelude (the `?` applies to the real `Sized` only), `false` if it is a relative
     /// path like any other bare name of the prelude (`gen::BARE_RELAXED_SIZED_ALWAYS_OK`).
     relaxed_sized: bool,
-    /// A trait: the Referrer's crate declares the rewritten trait too (`<Name>Copy`), not only an
-    /// impl of the Leaker's trait for the host. Its parameter defaults are rewritten for a
-    /// declaration, which cannot name the defaulted parameter itself (E0128): see
-    /// [`rewrite_defaults()`].
+    /// A trait (analyzed as the item itself, or of a scope `mod`): the Referrer's crate declares
+    /// the rewritten trait too (`<Name>Copy`), not only an impl of the Leaker's trait for the host.
+    /// Its parameter defaults are rewritten for a declaration, which cannot name the defaulted
+    /// parameter itself (E0128): see [`rewrite_defaults()`].
     redeclare: bool,
     /// The Leaker reads the values of the item (`LeakerConfig::check_values()`): the default of an
     /// associated const, the value of a const or static, the body of a function. A type in a type
@@ -103,6 +103,12 @@ pub(crate) struct Args {
     /// The Leaker accepts an entry that names the own `Self` of a nested item together with a bound
     /// that does (`LeakerConfig::nested_self_entries()`).
     nested_self_entries: bool,
+    /// `marker = "::path::Marker"`: the impls of the entries where `Referrer::needs_self()` is false
+    /// are for this type (`ImplSelf::Marker`) and the Referrer writes it as their owner, where
+    /// they are otherwise for a primitive type that the id and the index choose
+    /// (`ImplSelf::Bucket`). The type is the Leaker's, written by hand, by an absolute path that
+    /// both crates resolve.
+    marker: Option<Type>,
     /// The Referrer's visitor is not given `Visitor::with_nested_self()`: a macro that has no entry
     /// to write for the own `Self` of a nested item does not need it, and the parts of the item
     /// must be left as written all the same.
@@ -135,6 +141,7 @@ impl Parse for Args {
             primitive: true,
             relaxed_sized: false,
             redeclare: false,
+            marker: None,
             values: false,
             bodies: false,
             nested_self_entries: false,
@@ -162,6 +169,7 @@ impl Parse for Args {
                 ("primitive", Lit::Bool(b)) => args.primitive = b.value,
                 ("relaxed_sized", Lit::Bool(b)) => args.relaxed_sized = b.value,
                 ("redeclare", Lit::Bool(b)) => args.redeclare = b.value,
+                ("marker", Lit::Str(s)) => args.marker = Some(s.parse()?),
                 ("values", Lit::Bool(b)) => args.values = b.value,
                 ("bodies", Lit::Bool(b)) => args.bodies = b.value,
                 ("nested_self_entries", Lit::Bool(b)) => args.nested_self_entries = b.value,
@@ -191,6 +199,10 @@ impl Args {
         let no_nested_self = self.no_nested_self;
         let (stages, stage) = (self.stages, self.stage);
         let strict = self.strict.map(|strict| quote!(strict = #strict,));
+        let marker = self.marker.as_ref().map(|marker| {
+            let marker = quote!(#marker).to_string().replace(' ', "");
+            quote!(marker = #marker,)
+        });
         let scope = &self.scope;
         let allow = self
             .allow
@@ -198,7 +210,7 @@ impl Args {
             .map(|p| quote!(#p).to_string().replace(' ', ""))
             .collect::<Vec<_>>()
             .join(",");
-        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict primitive = #primitive, relaxed_sized = #relaxed_sized, redeclare = #redeclare, values = #values, bodies = #bodies, nested_self_entries = #nested_self_entries, no_nested_self = #no_nested_self, stages = #stages, accepted = #accepted, stage = #stage)
+        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #strict #marker primitive = #primitive, relaxed_sized = #relaxed_sized, redeclare = #redeclare, values = #values, bodies = #bodies, nested_self_entries = #nested_self_entries, no_nested_self = #no_nested_self, stages = #stages, accepted = #accepted, stage = #stage)
     }
 
     /// The `ID` of the Repeater's impls of the entries: the item's, and for the copy of
@@ -506,7 +518,12 @@ type Impls = Vec<(Vec<Ident>, TokenStream)>;
 /// An item that a trusting Referrer copies (`strict` is `false`) gets the implementations of the
 /// required entries only, as a downstream crate writes them (`Referrer::required()`): a Referrer
 /// that replaced an optional entry anyway fails to compile. A strict one gets all the entries.
-fn repeater_impls(referrer: &Referrer, id: u64, strict: bool) -> Result<(Impls, usize)> {
+fn repeater_impls(
+    referrer: &Referrer,
+    id: u64,
+    strict: bool,
+    marker: Option<&Type>,
+) -> Result<(Impls, usize)> {
     let repeater: Path = parse_quote!(crate::Repeater);
     let slots = RepeaterSlots::new(repeater.clone());
     // For `Self` bounded by the trait, the implementation is for `__S` (the implementor).
@@ -516,12 +533,21 @@ fn repeater_impls(referrer: &Referrer, id: u64, strict: bool) -> Result<(Impls, 
     let mut skipped = 0;
     for ix in 0..referrer.iter().count() {
         crate::check_plain(referrer, ix, &slots)?;
+        let target = match marker {
+            // The entries that need `Self` are for what it stands for, as under `Bucket`.
+            Some(_) if referrer.needs_self(ix) => ImplSelf::Param(&self_param),
+            Some(marker) => ImplSelf::Marker(marker),
+            None => ImplSelf::Bucket {
+                id,
+                param: &self_param,
+            },
+        };
         let r = referrer
-            .repeater_impl(ix, ImplSelf::Param(&self_param), |value, param| {
+            .repeater_impl(ix, target, |value, param| {
                 slots.encode_const(value, &param.ty)
             })
             .map_err(Error::from)?;
-        check_impl_pieces(referrer, ix, &r, &self_param)?;
+        check_impl_pieces(referrer, ix, id, &r, &self_param, marker)?;
         if !strict && !referrer.must(ix) {
             skipped += 1;
             continue;
@@ -701,17 +727,59 @@ fn declared_generics(generics: &Generics) -> Generics {
 /// its trait arguments encode (`declared_generics()`), with the parameter of the implementor added
 /// (`__S: ?Sized`, and the trait for a `Self` that a trait bounds) unless the impl is for a type;
 /// its module is the context's.
+///
+/// An entry that `Referrer::bucket_self()` gives a type for (and only one that does not name `Self`,
+/// in its type or in the generics of its context) is for that type, and declares no parameter.
 fn check_impl_pieces(
     referrer: &Referrer,
     ix: usize,
+    id: u64,
     r: &RepeaterImpl,
     self_param: &Ident,
+    marker: Option<&Type>,
 ) -> Result<()> {
     let context = referrer.context(ix);
     let declared = declared_generics(referrer.context_generics(context));
     let mut got = r.generics.clone();
-    match referrer.context_self(context) {
-        Some(SelfRequirement::Type(_)) => (),
+    let bucket = referrer.bucket_self(ix, id);
+    let bucketable = referrer.context_self(context).is_none()
+        && !names_self(referrer.context_generics(context));
+    if bucket.is_some() != bucketable {
+        return Err(helpers_disagree(format!(
+            "`bucket_self()` of the entry {} is `{}`, and its context {} `Self`",
+            ix,
+            bucket.as_ref().map_or(String::new(), |ty| quote!(#ty).to_string()),
+            if bucketable { "does not name" } else { "names" }
+        )));
+    }
+    match (&bucket, referrer.context_self(context)) {
+        (Some(ty), _) => {
+            // The marker of the item, if it has one (`Args::marker`), else the bucket.
+            let expected = marker.unwrap_or(ty);
+            if r.self_ty != *expected {
+                let self_ty = &r.self_ty;
+                return Err(helpers_disagree(format!(
+                    "the impl of the entry {} is for `{}` and it should be for `{}`",
+                    ix,
+                    quote!(#self_ty),
+                    quote!(#expected)
+                )));
+            }
+            if marker.is_none()
+                && !matches!(ty, Type::Path(TypePath { qself: None, path })
+                if path.leading_colon.is_some()
+                    && path.segments.len() == 3
+                    && path.segments[0].ident == "core"
+                    && path.segments[1].ident == "primitive")
+            {
+                return Err(helpers_disagree(format!(
+                    "`bucket_self()` of the entry {} is not a primitive type: `{}`",
+                    ix,
+                    quote!(#ty)
+                )));
+            }
+        }
+        (None, Some(SelfRequirement::Type(_))) => (),
         _ => match implementor_param(&mut got) {
             Some(GenericParam::Type(t)) if t.ident == *self_param => {
                 // `?Sized`, and the trait of a `Self` that is bound by it. Any type that the
@@ -1588,6 +1656,8 @@ struct Projector<'a> {
     bound_self: Option<Type>,
     /// `Self` of an entry whose context says what `Self` is: the type, as the Referrer names it.
     type_self: Option<Type>,
+    /// The type that the entries which do not need `Self` are implemented for (`Args::marker`).
+    marker: Option<Type>,
 }
 
 impl Projector<'_> {
@@ -1606,12 +1676,19 @@ impl Projector<'_> {
             // have a bound that names `Self` (`trait Tr<T: AsRef<Self>, U = Rel<T>>`): the
             // Leaker analyzed it without `Self`, and the entry is for any type that the bound holds
             // for. The implementor is the host, which has it (`T: AsRef<Host>`), not `()`.
-            _ if self.bound_self.is_some()
-                && names_self(self.referrer.context_generics(context)) =>
-            {
-                self.bound_self.clone().unwrap()
-            }
-            _ => parse_quote!(()),
+            _ => match (self.referrer.bucket_self(ix, self.id), &self.marker) {
+                // The impl is for the marker of the item (`Args::marker`), or for this primitive
+                // type (`ImplSelf::Bucket`).
+                (Some(_), Some(marker)) => marker.clone(),
+                (Some(bucket), None) => bucket,
+                (None, _)
+                    if self.bound_self.is_some()
+                        && names_self(self.referrer.context_generics(context)) =>
+                {
+                    self.bound_self.clone().unwrap()
+                }
+                (None, _) => parse_quote!(()),
+            },
         };
         self.project_with(ix, self_ty)
     }
@@ -1716,6 +1793,7 @@ fn rewrite(
         root_args: generics.map(identity_args).unwrap_or_default(),
         bound_self: None,
         type_self: None,
+        marker: args.marker.clone(),
     };
     let host = matches!(item, Item::Trait(_)).then(|| ident(&format!("Host{}", args.id)));
     let mut self_ty = None;
@@ -1816,10 +1894,10 @@ fn rewrite(
     }
     if let (true, Item::Trait(original), Item::Trait(copy)) = (args.redeclare, item, &mut rewritten)
     {
-        if args.scope != "mod" {
+        if !matches!(args.scope.as_str(), "" | "mod") {
             return Err(Error::new(
                 Span::call_site(),
-                "test macro: `redeclare` is for the traits of a scope `mod`",
+                "test macro: `redeclare` is for a trait analyzed as the item itself and for the traits of a scope `mod`",
             ));
         }
         let mut base = leaker_path.clone();
@@ -1875,6 +1953,7 @@ fn rewrite_defaults(
         root_args,
         bound_self: projector.bound_self.clone(),
         type_self: projector.type_self.clone(),
+        marker: projector.marker.clone(),
     };
     // The generics only: the same scope, and so the same entries, with no item to rewrite.
     let mut shell = original.clone();
@@ -2488,8 +2567,12 @@ fn count_copy(
     let referrer = &result.clone().into_referrer();
     let (id, kind) = (args.id, kind_name(original));
     check_nested_self_is_required(referrer, original, args)?;
-    let (impls, skipped) =
-        repeater_impls(referrer, args.repeater_id(), args.strict.unwrap_or(true))?;
+    let (impls, skipped) = repeater_impls(
+        referrer,
+        args.repeater_id(),
+        args.strict.unwrap_or(true),
+        args.marker.as_ref(),
+    )?;
     let positions = collect_positions(original, None, args);
     let dummy: Path = parse_quote!(::__dummy);
     let mut counted = result.clone();

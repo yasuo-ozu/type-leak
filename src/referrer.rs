@@ -2350,6 +2350,9 @@ impl Referrer {
     // predicate (`Self: 'x`) keeps whole the bounds of the generics that the description of `Self`
     // names (`Tr<T>`) and leaves out those of the others (15 kept all), which the Referrer
     // computes for a copy.
+    // Not serialized, but both macros must agree on it: the primitive type that `ImplSelf::Bucket`
+    // and `Referrer::bucket_self()` choose from the id and the index of an entry must not change
+    // without a bump.
     pub const FORMAT_VERSION: u32 = 16;
 }
 

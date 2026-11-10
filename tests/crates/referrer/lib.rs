@@ -222,6 +222,24 @@ pub mod kinds {
     // declared here, with the defaults written through the host.
     type_leak_test_leaker::__tl_prop_9131!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9132!(path = ::type_leak_test_leaker::kinds, strict);
+    // The entries that do not name `Self` are for a primitive type, the others for the host.
+    type_leak_test_leaker::__tl_prop_9209!(path = ::type_leak_test_leaker::kinds);
+    // The entries that do not need `Self` are for a marker type, the others for the host. The
+    // default of `MarkerDefaultCopy` is written through the host: an impl that takes it needs
+    // `Owner9210: AsRef<Host9210>` (and would need `AsRef<Marker9210>` if it were the marker).
+    type_leak_test_leaker::__tl_prop_9210!(path = ::type_leak_test_leaker::kinds);
+    pub struct Owner9210;
+    impl AsRef<Host9210> for Owner9210 {
+        fn as_ref(&self) -> &Host9210 {
+            unimplemented!()
+        }
+    }
+    impl MarkerDefaultCopy<Owner9210> for Host9210 {
+        fn get(&self, _t: Owner9210, _u: ::type_leak_test_leaker::kinds::Defd<Owner9210>) {}
+        fn plain(&self) -> ::type_leak_test_leaker::kinds::Rel {
+            ::type_leak_test_leaker::kinds::Rel(0)
+        }
+    }
     // The types in the values of an item, with `check_values()`: the copy compiles only if every
     // type in a value that this crate cannot name is replaced.
     type_leak_test_leaker::__tl_prop_9141!(path = ::type_leak_test_leaker::kinds);

@@ -2311,3 +2311,57 @@ fn the_names_of_the_prelude_of_every_edition_are_accepted_in_a_trait() {
     assert_eq!(l::PreludeNames::count(&Original, items.iter()), 6);
     assert_eq!(r::PreludeNamesCopy::count(&Copy, items.iter()), 6);
 }
+
+/// Fixture 9209: the impls of the entries that do not name `Self` are for a primitive type that the
+/// id and the index choose (`ImplSelf::Bucket`, which `prop_leak` uses for every item), the one that
+/// names it is for the implementor. The copy compiles only if it writes the same type.
+#[test]
+fn the_entries_that_do_not_name_self_are_implemented_for_a_bucket() {
+    use std::any::type_name;
+    use type_leak_test_leaker as l;
+    use type_leak_test_leaker::*;
+
+    assert_eq!(
+        reported(9209, __tl_report_9209!()),
+        ok("trait", 5, 6, 6),
+        "{}",
+        __tl_report_9209!()
+    );
+    // The entries `Defd2<Rel, u8>` and `Rel`, that no generic is used in, are for the primitive
+    // type that `Referrer::bucket_self(ix, 9209)` gives (the bucket is part of the format, so these
+    // do not change without a bump of `Referrer::FORMAT_VERSION`). `Wrap<Self>` has none.
+    assert_eq!(
+        type_name::<<u64 as Repeater<(), 9209, 1>>::Type>(),
+        type_name::<l::kinds::Defd2<l::kinds::Rel, u8>>()
+    );
+    assert_eq!(
+        type_name::<<str as Repeater<(), 9209, 2>>::Type>(),
+        type_name::<l::kinds::Rel>()
+    );
+}
+
+/// Fixture 9210: the impls of the entries where `Referrer::needs_self()` is false are for a marker
+/// type of the Leaker's crate (`ImplSelf::Marker`), the entry whose generics name `Self` (the
+/// default `Defd<T>` of `trait MarkerDefault<T: AsRef<Self>, U = Defd<T>>`, `context_self()` is
+/// `None`) for the implementor, which is the host in the copy. The Referrer's crate has an impl of
+/// the copy that takes the default (`impl MarkerDefaultCopy<Owner9210> for Host9210`): it compiles
+/// only if the default is written through the host (`Owner9210: AsRef<Host9210>`), not through the
+/// marker (E0277, `Owner9210: AsRef<Marker9210>`).
+#[test]
+fn a_marker_is_for_the_entries_that_do_not_need_self_and_the_host_for_the_others() {
+    use std::any::type_name;
+    use type_leak_test_leaker as l;
+    use type_leak_test_leaker::*;
+
+    assert_eq!(
+        reported(9210, __tl_report_9210!()),
+        ok("trait", 2, 4, 4),
+        "{}",
+        __tl_report_9210!()
+    );
+    // `Rel` is for the marker.
+    assert_eq!(
+        type_name::<<l::kinds::Marker9210 as Repeater<(), 9210, 0>>::Type>(),
+        type_name::<l::kinds::Rel>()
+    );
+}

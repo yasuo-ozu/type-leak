@@ -143,12 +143,26 @@ fn param_as_arg(param: &GenericParam) -> TokenStream {
 
 /// Checks `Referrer::is_plain()` of the `ix`-th entry against what the impl needs: an entry is
 /// plain if and only if its impl for a marker type declares nothing (no generics, no where clause,
-/// no argument, no module) and does not name `Self`.
+/// no argument, no module) and does not need `Self`. And checks that `Referrer::needs_self()` is
+/// true exactly where that impl fails with `EncodeError::NeedsSelf`.
 pub(crate) fn check_plain(referrer: &Referrer, ix: usize, slots: &RepeaterSlots) -> Result<()> {
     let marker: Type = parse_quote!(__Marker);
     let r = referrer.repeater_impl(ix, ImplSelf::Marker(&marker), |value, param| {
         slots.encode_const(value, &param.ty)
     });
+    let ty = referrer.iter().nth(ix).unwrap();
+    let needs_self = referrer.needs_self(ix);
+    if matches!(r, Err(EncodeError::NeedsSelf(_))) != needs_self {
+        return Err(Error::new(
+            Span::call_site(),
+            format!(
+                "`Referrer::needs_self({})` is {}, but `NeedsSelf` of the impl for a marker is not: {}",
+                ix,
+                needs_self,
+                quote!(#ty)
+            ),
+        ));
+    }
     let needs_nothing = match r {
         Ok(r) => {
             let predicates = r.generics.where_clause.iter().flat_map(|w| &w.predicates);
@@ -157,14 +171,13 @@ pub(crate) fn check_plain(referrer: &Referrer, ix: usize, slots: &RepeaterSlots)
                 && r.args == parse_quote!(())
                 && r.module.is_none()
         }
-        // The type names `Self`.
+        // The entry needs `Self` (`Referrer::needs_self()`).
         Err(EncodeError::NeedsSelf(_)) => false,
         Err(e) => return Err(e.into()),
     };
     if referrer.is_plain(ix) == needs_nothing {
         return Ok(());
     }
-    let ty = referrer.iter().nth(ix).unwrap();
     Err(Error::new(
         Span::call_site(),
         format!(

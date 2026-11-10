@@ -492,8 +492,8 @@ pub enum EncodeError {
     /// Its bound would default to `'a` in `&'a T` and to another lifetime elsewhere. Write it, e.g.
     /// `dyn Tr + 'static`.
     UnboundedTraitObject(Box<Type>),
-    /// The type of an entry names `Self`, but the Repeater impl was asked for a marker type
-    /// ([`ImplSelf::Marker`](crate::ImplSelf::Marker)).
+    /// An entry needs `Self` ([`Referrer::needs_self()`](crate::Referrer::needs_self)), but the
+    /// Repeater impl was asked for a marker type ([`ImplSelf::Marker`](crate::ImplSelf::Marker)).
     ///
     /// Such an impl is for what `Self` stands for: any implementor of the trait, or the type. Use
     /// [`ImplSelf::Param`](crate::ImplSelf::Param). An entry for which
@@ -521,8 +521,8 @@ impl std::fmt::Display for EncodeError {
             ),
             EncodeError::NeedsSelf(ty) => write!(
                 f,
-                "the type '{}' names `Self`, so its Repeater impl cannot be for a marker type; use \
-                 `ImplSelf::Param`",
+                "the type '{}' needs `Self` (it names it, or its generics do), so its Repeater impl \
+                 cannot be for a marker type; use `ImplSelf::Param`",
                 quote!(#ty)
             ),
         }
