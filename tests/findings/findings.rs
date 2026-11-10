@@ -16533,7 +16533,8 @@ fn f109_a_where_predicate_with_a_binder_is_not_a_single_bound() {
 /// Fix: the walk of an expression in a type keeps the names its blocks declare, as the walk of a
 /// value does: a `let` binds from the next statement, parameters, arms and loops in their bodies,
 /// items and labels in the whole block (not `use`, `extern crate` or `macro_rules!`). A nested item
-/// does not see the bindings around it.
+/// does not see the bindings around it. Since F113 the names of a `use` are local too, and its root
+/// is read.
 #[test]
 fn f110_a_name_that_a_block_in_a_type_declares_is_no_relative_path() {
     let found = |check_values: bool, block: &Block| {
@@ -16769,14 +16770,15 @@ fn f110_a_name_that_a_block_in_a_type_declares_is_no_relative_path() {
             }),
             "x",
         ),
+        // F113: the root of the `use` is the relative path, and the name it brings is local.
         (
-            "a name that a `use` brings in",
+            "the root of a `use`",
             parse_quote!({
                 use rel::N;
                 let _c = || 1;
                 N
             }),
-            "N",
+            "rel",
         ),
     ];
     let without_closure: Block = parse_quote!({
@@ -17020,5 +17022,550 @@ fn f111_an_array_optional_through_its_length_that_keeps_a_method_lifetime_is_wri
         let found = f63_leak(common::std_config(), &item);
         let entries: Vec<String> = entries.into_iter().map(String::from).collect();
         assert_eq!(found, (copy.to_string(), errors, entries), "{}", s(&item));
+    }
+}
+
+// ── F112 ─────────────────────────────────────────────────────────────────────
+
+/// F112 (fixed): a raw identifier was a name of its own, though Rust takes `r#T` for `T`.
+///
+/// Trigger: `struct S<r#T>(T, Rel<r#T>, Rel<T>)` gave two entries; `'r#a` (a raw lifetime, edition
+/// 2021) was not the parameter `'a`, so the impl of `Rel<'a, T>` had no `'a` (E0261);
+/// `?r#Sized` and `const N: r#usize` were errors, `r#Option` and `r#u8` entries under
+/// `Rules::prelude()` and `primitive()`, `::r#std::..` was not allowed by `Rules::std_crates()` and
+/// `::r#core::..` was an optional entry; a body that declares `struct r#Rel` did not hide the entry
+/// `Rel`, so the copy replaced the type of a local (E0308); `Referrer::complete_args()` did not
+/// write `T` for the parameter `r#T`.
+///
+/// Cause: the Leaker and the Referrer compared identifiers by their text, `r#` included: the names
+/// of generics, lifetimes and locals, the prelude, primitive and std names, and the keys of types,
+/// contexts and causes (their token text).
+///
+/// Fix: each comparison takes the name without `r#`, and the keys compare the token text with the
+/// raw identifiers written without it. What is written keeps the spelling: an entry has the first
+/// one met, and the copy and the impls keep `r#`. The serialized form is unchanged, and is read
+/// back with the same keys.
+#[test]
+fn f112_a_raw_identifier_is_its_name_without_r_hash() {
+    // The entries with their generics, and the causes of the errors.
+    let leak = |item: &str, rule: Rules| -> (Vec<(String, String)>, Vec<String>) {
+        let item: Item = parse_str(item).unwrap();
+        let mut leaker = Leaker::with_rule(rule);
+        common::intern_item(&mut leaker, &item);
+        let result = leaker.result();
+        let errors = common::cause_texts(result.errors());
+        (common::entries_with_generics(&result.recovered()), errors)
+    };
+    // An item, the rule, and the entries with their generics.
+    type Case = (&'static str, Rules, Vec<(&'static str, &'static str)>);
+    let cases: Vec<Case> = vec![
+        // One entry, with the spelling met first.
+        (
+            "struct S<r#T>(T, Rel<r#T>, Rel<T>);",
+            Rules::new(),
+            vec![("Rel < r#T >", "< r#T >")],
+        ),
+        (
+            "struct S<T>(Rel<T>, Rel<r#T>);",
+            Rules::new(),
+            vec![("Rel < T >", "< T >")],
+        ),
+        // A raw lifetime is the parameter of its name, and `'r#static` is `'static`.
+        (
+            "struct S<'r#a, T>(Rel<'r#a, T>, Rel<'a, T>, Rel<'r#static, T>);",
+            Rules::new(),
+            vec![
+                ("Rel < 'r#a , T >", "< 'r#a , T >"),
+                ("Rel < 'r#static , T >", "< T >"),
+            ],
+        ),
+        (
+            "struct S<'a, T>(&'r#a T, Rel<'a, T>);",
+            Rules::new(),
+            vec![("Rel < 'a , T >", "< 'a , T >")],
+        ),
+        // `?r#Sized` is `?Sized`, and the rules allow `r#Sized`, `r#Option`, `r#u8` and the
+        // const type `r#usize` as they allow the names.
+        (
+            "struct S<T: ?r#Sized, U: r#Sized, const N: r#usize>(Box<T>, r#Option<U>, r#u8, Rel<T, N>);",
+            common::std_config(),
+            vec![("Rel < T , N >", "< T : ? r#Sized , const N : r#usize >")],
+        ),
+        // `::r#core` is `::core`, which is no entry, and `std_crates()` allows `::r#std`.
+        (
+            "struct S<T>(::r#core::marker::PhantomData<T>, ::r#std::vec::Vec<T>);",
+            Rules::new().std_crates(),
+            vec![],
+        ),
+        // Else `::r#std` is an optional entry, the one of `::std`.
+        (
+            "struct S<T>(::r#std::vec::Vec<T>, ::std::vec::Vec<T>);",
+            Rules::new(),
+            vec![(":: r#std :: vec :: Vec < T >", "< T >")],
+        ),
+        // A control: a keyword of a later edition is a name like any other, written raw.
+        (
+            "struct S<r#async>(r#try<r#async>, Rel<r#async>);",
+            Rules::new(),
+            vec![
+                ("Rel < r#async >", "< r#async >"),
+                ("r#try < r#async >", "< r#async >"),
+            ],
+        ),
+    ];
+    for (item, rule, entries) in cases {
+        let entries: Vec<(String, String)> = entries
+            .into_iter()
+            .map(|(ty, generics)| (ty.to_string(), generics.to_string()))
+            .collect();
+        assert_eq!(leak(item, rule), (entries, Vec::new()), "{}", item);
+    }
+}
+
+/// F112: the copy finds the entry whatever the spelling, also read back from tokens, keeps the
+/// raw identifiers it writes, and a local of a body hides the entry of its name.
+#[test]
+fn f112_the_copy_takes_a_raw_identifier_for_its_name() {
+    let copy = |item: &str, copied: &str| -> (String, String) {
+        let item: Item = parse_str(item).unwrap();
+        let mut leaker = Leaker::with_rule(common::std_config());
+        leaker.check_values = true;
+        leaker.check_bodies = true;
+        let context = common::intern_item(&mut leaker, &item);
+        let referrer = leaker.result().recovered();
+        let read_back: Referrer = parse2(quote!(#referrer)).unwrap();
+        let written = |referrer: &Referrer| {
+            let mut copy: Item = parse_str(copied).unwrap();
+            common::visitor(referrer, context, common::placeholder).visit_item_mut(&mut copy);
+            s(&copy)
+        };
+        assert_eq!(written(&referrer), written(&read_back), "{}", copied);
+        (written(&referrer), quote!(#referrer).to_string())
+    };
+    let cases: Vec<(&str, &str, &str)> = vec![
+        (
+            "struct S<r#T>(T, Rel<r#T>, Rel<T>);",
+            "struct S<r#T>(T, Rel<r#T>, Rel<T>);",
+            "struct S < r#T > (T , P < 0usize > , P < 0usize >) ;",
+        ),
+        // The copy spells the parameter otherwise.
+        (
+            "struct S<r#T>(Rel<r#T>);",
+            "struct S<T>(Rel<T>);",
+            "struct S < T > (P < 0usize >) ;",
+        ),
+        (
+            "struct S<'r#a>(Rel<'a>);",
+            "struct S<'a>(Rel<'r#a>);",
+            "struct S < 'a > (P < 0usize >) ;",
+        ),
+        // The struct that the body declares is the type of `_y`: `P<0usize>` would be E0308.
+        (
+            "impl S { pub fn f(_x: Rel) { struct r#Rel; let _y: Rel = r#Rel; } }",
+            "impl S { pub fn f(_x: Rel) { struct r#Rel; let _y: Rel = r#Rel; } }",
+            "impl P < 1usize > { pub fn f (_x : P < 0usize >) { struct r#Rel ; let _y : Rel = r#Rel ; } }",
+        ),
+    ];
+    for (item, copied, expected) in cases {
+        assert_eq!(copy(item, copied).0, expected, "{}", item);
+    }
+    // The serialized form keeps the spelling.
+    let (_, serialized) = copy(
+        "struct S<r#T>(T, Rel<r#T>, Rel<T>);",
+        "struct S<r#T>(T, Rel<r#T>, Rel<T>);",
+    );
+    assert!(serialized.ends_with("2 < r#T > ; (Rel < r#T >) declared < r#T > ; ()"));
+}
+
+/// F112: a raw lifetime of a method is its parameter, also in the tokens of a macro (a panic
+/// before: `"'r#a" is not a valid lifetime name`). `Rel<'a>` alone keeps `'r#a`, as with `'a`.
+#[test]
+fn f112_a_raw_lifetime_of_a_method_is_its_parameter() {
+    let leak = |item: &str| -> (Vec<Reason>, Vec<String>) {
+        let item: ItemTrait = parse_str(item).unwrap();
+        let mut leaker = Leaker::with_rule(common::std_config());
+        leaker.intern_trait(&item);
+        let result = leaker.result();
+        let reasons = result.errors().iter().map(|error| error.reason).collect();
+        (reasons, common::type_texts(&result.recovered()))
+    };
+    let unconstrained = vec![Reason::UnconstrainedLifetime];
+    assert_eq!(
+        leak("trait Tr { fn f<'r#a>(&self, x: Rel<'r#a>) -> m!('r#a); }"),
+        (unconstrained.clone(), vec!["m ! ('r#a)".to_string()])
+    );
+    assert_eq!(
+        leak("trait Tr { fn f<'r#a>(&self, x: Rel<'a>) -> &'r#a u8; }"),
+        (unconstrained, Vec::new())
+    );
+}
+
+/// F112: the impls and the assertions write the names as the item does, each primitive name once.
+#[test]
+fn f112_the_impls_and_the_assertions_keep_the_spelling() {
+    let item: ItemStruct = parse_quote!(
+        struct S<r#async>(r#try<r#async>, u8, r#u8);
+    );
+    let mut leaker = Leaker::with_rule(common::std_config());
+    leaker.intern_struct(&item);
+    let assertions = leaker.assertions().to_string();
+    assert_eq!(
+        assertions
+            .matches("fn __type_leak_assert_u8_is_primitive")
+            .count(),
+        1,
+        "{}",
+        assertions
+    );
+    let impls = leaker
+        .result()
+        .repeater_impls(&Projection::new(
+            repeater(),
+            7,
+            ImplSelf::Param(parse_quote!(__S)),
+        ))
+        .unwrap();
+    let written: Vec<String> = impls.iter().map(|r| s(&r.ty)).collect();
+    assert_eq!(written, ["r#try < r#async >"]);
+    assert_eq!(
+        s(&impls[0].generics),
+        "< r#async , __S : ? :: core :: marker :: Sized >"
+    );
+}
+
+/// F112: `Referrer::complete_args()` writes the argument of `r#T` for `T`, and `substitute_args()`
+/// asks once for `r#T` and `T`.
+#[test]
+fn f112_the_arguments_of_a_site_replace_a_raw_name_and_its_plain_one() {
+    let item: ItemTrait = parse_quote! {
+        trait Tr<r#T, 'r> { fn f(&'r self, a: Rel<r#T>, b: Option<T>) -> &'r T; }
+    };
+    let mut leaker = Leaker::with_rule(common::std_config());
+    let context = leaker.intern_trait(&item);
+    let referrer = leaker.result().recovered();
+    let given = arguments(&["'static", "u8"]);
+    let projection = Projection::new(repeater(), 1, ImplSelf::Param(parse_quote!(__S)));
+    let mut substitute = referrer
+        .complete_args(context, &given, &projection)
+        .unwrap();
+    let mut method: ImplItemFn = parse_quote! {
+        fn f(&'r self, a: Rel<r#T>, b: Option<T>) -> &'r r#T { todo!() }
+    };
+    substitute.visit_impl_item_fn_mut(&mut method);
+    assert_eq!(
+        s(&method.sig),
+        "fn f (& 'static self , a : Rel < u8 > , b : Option < u8 >) -> & 'static u8"
+    );
+    let mut asked = Vec::new();
+    let mut args: Vec<GenericArgument> = arguments(&["(r#T, T, U)"]);
+    substitute_args(args.iter_mut(), |name: &Ident| {
+        asked.push(name.to_string());
+        Some(parse_quote!(u8)).filter(|_: &GenericArgument| name != "U")
+    })
+    .unwrap();
+    assert_eq!(asked, ["r#T", "U"]);
+    assert_eq!(s(&args[0]), "(u8 , u8 , U)");
+}
+
+// ── F113 ─────────────────────────────────────────────────────────────────────
+
+/// F113 (fixed): the path of a `use` in a block in a type was not read.
+///
+/// Trigger, E0432 in the Referrer's crate: `struct S<T>([rel::Rel<T>; { use rel::N; 3 }])`. The
+/// entry was `rel::Rel<T>` alone, and the copy wrote the length as it is, with `use rel::N;`, which
+/// does not resolve there. No error. The same in a const argument, in the default of a parameter,
+/// and in the value or body of an item there (F101). `{ use rel::N; N }` leaked the whole array
+/// only because `N` was taken for a relative path.
+///
+/// Cause: the walk of a block in a type reads the paths of its expressions, types and items, but
+/// `syn` gives a `use` tree no `Path`, so the walk saw none in it.
+///
+/// Fix: the walk reads the root of each path of a `use` as it reads a path of an expression there,
+/// asked as a path of unknown kind as the walk of a value asks it (`rel` of `rel::N`): a name that
+/// a block around declares is local, but not through the names of that `use` itself (`use
+/// rel::{self}`); an absolute or allowed root is written as it is; else the type is leaked whole,
+/// and outside a type (a const argument of a bound) it is the error `RelativePath`. The names that
+/// a `use` brings are local, like the items of the block: they resolve through the root, which is
+/// read. A glob brings no name. A `use` that `syn` leaves unparsed (`use {::abs::M, rel::N};`) is
+/// taken for a relative path.
+#[test]
+fn f113_the_root_of_a_use_in_a_block_in_a_type_is_read() {
+    // An error: its reason, its cause and its paths.
+    type Reported = (Reason, String, Vec<Cause>);
+    let found = |check_values: bool, crate_paths: bool, item: &Item| {
+        let rule = Rules::new().external_crates().primitive().prelude();
+        let rule = if crate_paths {
+            rule.crate_paths()
+        } else {
+            rule
+        };
+        let mut leaker = Leaker::with_rule(rule);
+        leaker.check_values = check_values;
+        let context = common::intern_item(&mut leaker, item);
+        let result = leaker.result();
+        let errors: Vec<Reported> = (result.errors().iter())
+            .map(|error| (error.reason, s(&error.cause), error.paths.clone()))
+            .collect();
+        let referrer = result.recovered();
+        let copy = s(&copied(&referrer, context, item.clone())).replace(' ', "");
+        (errors, entries_text(&referrer, false), copy)
+    };
+    // Where the block is: the type that holds it with an element, and the item with that type.
+    type Position = (&'static str, fn(&Type, &Block) -> Type, fn(&Type) -> Item);
+    let positions: Vec<Position> = vec![
+        (
+            "an array length",
+            |element, block| parse_quote!([#element; #block]),
+            |ty| parse_quote!(struct S<T>(#ty);),
+        ),
+        (
+            "a const argument",
+            |element, block| parse_quote!(::p::W<#element, #block>),
+            |ty| parse_quote!(struct S<T>(#ty);),
+        ),
+        (
+            "the default of a parameter",
+            |element, block| parse_quote!([#element; #block]),
+            |ty| parse_quote!(struct S<T, U = #ty>(T, U);),
+        ),
+    ];
+    // The blocks, whether `crate` is allowed, and whether the type that holds the block is the
+    // entry (else `rel::Rel<T>` alone is, and the copy writes the block as it is).
+    let blocks: Vec<(&str, Block, bool, bool)> = vec![
+        (
+            "the name it brings is used",
+            parse_quote!({
+                use rel::N;
+                N
+            }),
+            false,
+            true,
+        ),
+        (
+            "the name it brings is not used",
+            parse_quote!({
+                use rel::N;
+                3
+            }),
+            false,
+            true,
+        ),
+        (
+            "a group",
+            parse_quote!({
+                use rel::{M, N};
+                3
+            }),
+            false,
+            true,
+        ),
+        (
+            "a glob",
+            parse_quote!({
+                use rel::*;
+                3
+            }),
+            false,
+            true,
+        ),
+        (
+            "the root is the name it brings",
+            parse_quote!({
+                use rel::{self};
+                rel::N
+            }),
+            false,
+            true,
+        ),
+        (
+            "a block is no module of `self`",
+            parse_quote!({
+                mod m {
+                    pub const X: usize = 1;
+                }
+                use self::m::X;
+                X
+            }),
+            false,
+            true,
+        ),
+        (
+            "`crate` not allowed",
+            parse_quote!({
+                use crate::rel::N;
+                N
+            }),
+            false,
+            true,
+        ),
+        (
+            "in the body of a function of the block",
+            parse_quote!({
+                fn f() -> usize {
+                    use rel::N;
+                    N
+                }
+                f()
+            }),
+            false,
+            true,
+        ),
+        (
+            "in the value of a const of the block",
+            parse_quote!({
+                const C: usize = {
+                    use rel::N;
+                    3
+                };
+                C
+            }),
+            false,
+            true,
+        ),
+        (
+            "in a module of the block",
+            parse_quote!({
+                mod m {
+                    use rel::N;
+                    pub const X: usize = N;
+                }
+                m::X
+            }),
+            false,
+            true,
+        ),
+        (
+            "left unparsed by `syn`",
+            parse_quote!({
+                use {::abs::M, rel::N};
+                3
+            }),
+            false,
+            true,
+        ),
+        (
+            "a relative path in a `let` (control)",
+            parse_quote!({
+                let _x = rel::N;
+                3
+            }),
+            false,
+            true,
+        ),
+        (
+            "a module of the block",
+            parse_quote!({
+                mod m {
+                    pub const X: usize = 1;
+                }
+                use m::X;
+                X
+            }),
+            false,
+            false,
+        ),
+        (
+            "through another `use` of the block",
+            parse_quote!({
+                mod m {
+                    pub mod n {
+                        pub const X: usize = 1;
+                    }
+                }
+                use m::n;
+                use n::X;
+                X
+            }),
+            false,
+            false,
+        ),
+        (
+            "an allowed absolute path",
+            parse_quote!({
+                use ::abs::N;
+                N
+            }),
+            false,
+            false,
+        ),
+        (
+            "`crate` allowed",
+            parse_quote!({
+                use crate::rel::N;
+                N
+            }),
+            true,
+            false,
+        ),
+    ];
+    let element: Type = parse_quote!(rel::Rel<T>);
+    let placeholder: Type = parse_quote!(P<0usize>);
+    for check_values in [false, true] {
+        for (position, holder, item_of) in &positions {
+            for (name, block, crate_paths, whole) in &blocks {
+                let ty = holder(&element, block);
+                let (entry, copy) = if *whole {
+                    (ty.clone(), item_of(&placeholder))
+                } else {
+                    (element.clone(), item_of(&holder(&placeholder, block)))
+                };
+                assert_eq!(
+                    found(check_values, *crate_paths, &item_of(&ty)),
+                    (
+                        vec![],
+                        vec![s(&entry).replace(' ', "")],
+                        s(&copy).replace(' ', "")
+                    ),
+                    "{} in {}, check_values {}",
+                    name,
+                    position,
+                    check_values
+                );
+            }
+        }
+    }
+    // Where the type cannot be leaked whole (a closure), the root is the error, once for the
+    // `use`, and the names it brings are local. Outside a type, in a const argument of a bound, the
+    // same.
+    let rel = || vec![Cause::Unknown(parse_quote!(rel))];
+    let unparsed = || "use { :: abs :: M , rel :: N } ;".to_string();
+    let errors: Vec<(&str, Vec<Reported>)> = vec![
+        (
+            "struct S<T>([rel::Rel<T>; { use rel::{M, N}; let _c = || 1; M + N }]);",
+            vec![(Reason::RelativePath, "rel".to_string(), rel())],
+        ),
+        (
+            "struct S<T>([rel::Rel<T>; { use {::abs::M, rel::N}; let _c = || 1; 3 }]);",
+            vec![(Reason::RelativePath, unparsed(), vec![])],
+        ),
+        (
+            "struct S<T>([rel::Rel<T>; { use ::abs::N; let _c = || 1; N }]);",
+            vec![],
+        ),
+        (
+            "struct S<T: ::p::Tr<{ use rel::N; N }>>(rel::Rel<T>);",
+            vec![(Reason::RelativePath, "rel".to_string(), rel())],
+        ),
+        (
+            "struct S<T: ::p::Tr<{ use {::abs::M, rel::N}; 3 }>>(rel::Rel<T>);",
+            vec![(Reason::RelativePath, unparsed(), vec![])],
+        ),
+        (
+            "struct S<T: ::p::Tr<{ use ::abs::N; N }>>(rel::Rel<T>);",
+            vec![],
+        ),
+    ];
+    for check_values in [false, true] {
+        for (item, expected) in &errors {
+            let item: Item = parse_str(item).unwrap();
+            let (errors, entries, _) = found(check_values, false, &item);
+            assert_eq!(
+                (errors, entries),
+                (expected.clone(), vec!["rel::Rel<T>".to_string()]),
+                "{}, check_values {}",
+                s(&item),
+                check_values
+            );
+        }
     }
 }

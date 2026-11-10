@@ -4,11 +4,12 @@ use crate::error::Cause;
 use crate::unstable::{bound_text, hiding_bounds, trait_bounds};
 use crate::util::{
     binder_lifetimes, bound_mentions_self, bounded_ident, canonical_bounds, first_self_in_generics,
-    generic_param_mentions_self, generic_param_name, ident_name, is_bare_self, is_lifetime_param,
-    is_type_param_named, names_in, plain_self_head, projection, projection_head, push_once,
-    self_in_param, self_in_predicate, sorted_by_tokens, tidy, token_names, type_contains,
+    generic_param_mentions_self, generic_param_name, has_lifetime, ident_name, is_bare_self,
+    is_lifetime_param, is_named, is_type_param_named, lifetime_name, names_in, plain_self_head,
+    projection, projection_head, push_once, same_lifetime, same_name, self_in_param,
+    self_in_predicate, sorted_by_tokens, tidy, token_names, tokens_text, type_contains,
     type_mentions_self, type_names, unwrap_type_group, where_clause, where_predicate_mentions_self,
-    without_default, without_self_bounds, ReplaceSelf, SelfMentions,
+    without_default, without_self_bounds, ReplaceSelf, SelfMentions, Unraw,
 };
 use proc_macro2::{Literal, TokenStream};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -131,8 +132,16 @@ impl Scope {
 
     /// Returns `true` if the generics are the same, whatever `Self` meant where they were declared.
     pub(crate) fn same_generics(&self, other: &Scope) -> bool {
-        self.params == other.params
-            && self.predicates == other.predicates
+        let params = |scope: &Scope| -> Vec<GenericParam> {
+            let unraw = |param: &GenericParam| Unraw.fold_generic_param(param.clone());
+            scope.params.iter().map(unraw).collect()
+        };
+        let predicates = |scope: &Scope| -> Vec<WherePredicate> {
+            let unraw = |predicate: &WherePredicate| Unraw.fold_where_predicate(predicate.clone());
+            scope.predicates.iter().map(unraw).collect()
+        };
+        params(self) == params(other)
+            && predicates(self) == predicates(other)
             && self.is_binder == other.is_binder
     }
 
@@ -292,8 +301,8 @@ impl SelfRequirement {
 
     fn render(&self) -> String {
         match self {
-            Self::Bound(path) => format!(" Self: {}", quote!(#path)),
-            Self::Type(ty) => format!(" Self = {}", quote!(#ty)),
+            Self::Bound(path) => format!(" Self: {}", tokens_text(path)),
+            Self::Type(ty) => format!(" Self = {}", tokens_text(ty)),
             Self::Any => " Self any".to_string(),
         }
     }
@@ -477,7 +486,7 @@ impl Substitution {
             match (param, arg) {
                 (GenericParam::Lifetime(param), GenericArgument::Lifetime(arg)) => {
                     self.lifetimes
-                        .insert(param.lifetime.to_string(), arg.clone());
+                        .insert(lifetime_name(&param.lifetime), arg.clone());
                 }
                 (GenericParam::Type(param), GenericArgument::Type(arg)) => {
                     self.types.insert(ident_name(&param.ident), arg.clone());
@@ -494,7 +503,7 @@ impl Substitution {
 impl Fold for Substitution {
     fn fold_lifetime(&mut self, lifetime: Lifetime) -> Lifetime {
         self.lifetimes
-            .get(&lifetime.to_string())
+            .get(&lifetime_name(&lifetime))
             .cloned()
             .unwrap_or(lifetime)
     }
@@ -579,7 +588,11 @@ fn gat_requirements(
                 return Vec::new();
             }
             let tr = segments[qself.position - 1];
-            if trait_path.segments.last().map(|seg| &seg.ident) != Some(&tr.ident) {
+            let same_trait = trait_path
+                .segments
+                .last()
+                .map_or(false, |seg| same_name(&seg.ident, &tr.ident));
+            if !same_trait {
                 return Vec::new();
             }
             (segments[qself.position], Some(&tr.arguments))
@@ -812,21 +825,22 @@ impl Context {
     fn render(&self) -> String {
         let generics = &self.generics;
         let where_clause = &generics.where_clause;
-        let mut rendered = quote!(#generics #where_clause).to_string();
+        let mut rendered = tokens_text(quote!(#generics #where_clause));
         if let Some(self_ty) = &self.self_ty {
             rendered.push_str(&self_ty.render());
         }
         for (i, lifetime) in self.self_outlives.iter().enumerate() {
             rendered.push_str(if i == 0 { " Self: " } else { " + " });
-            rendered.push_str(&lifetime.to_string());
+            rendered.push_str(&lifetime_name(lifetime));
         }
         for gat in &self.gats {
             rendered.push(' ');
-            rendered.push_str(&gat.to_token_stream().to_string());
+            rendered.push_str(&tokens_text(gat));
         }
         if let Some(declared) = &self.declared {
             let where_clause = &declared.where_clause;
-            rendered.push_str(&format!(" declared {}", quote!(#declared #where_clause)));
+            let declared = tokens_text(quote!(#declared #where_clause));
+            rendered.push_str(&format!(" declared {}", declared));
         }
         rendered
     }
@@ -980,10 +994,13 @@ impl Context {
                 || mentions.types.iter().any(is_type_param)
                 || !mentions.projections.is_empty();
             for (lifetime, depth) in &ancestors {
-                let bounds_something =
-                    bounds_generic || mentions.lifetimes.iter().any(|other| other != lifetime);
+                let bounds_something = bounds_generic
+                    || mentions
+                        .lifetimes
+                        .iter()
+                        .any(|other| !same_lifetime(other, lifetime));
                 if let (true, Some(from)) = (bounds_something, depth.checked_sub(1)) {
-                    gather.work.push((from, lifetime.to_string()));
+                    gather.work.push((from, lifetime_name(lifetime)));
                 }
             }
         }
@@ -1067,8 +1084,11 @@ impl Context {
     /// generics (bounds on `Self` alone, such as `Self: Sized`). A copy that writes `Self`
     /// otherwise, as a type parameter, cannot repeat them.
     pub(crate) fn is_entry_with_extra_self_predicates(&self, entry: &Context) -> bool {
-        let show = |tokens: &dyn ToTokens| tokens.to_token_stream().to_string();
-        if self.self_ty != entry.self_ty || self.self_outlives != entry.self_outlives {
+        let show = |tokens: &dyn ToTokens| tokens_text(tokens.to_token_stream());
+        let outlives = |context: &Context| -> Vec<String> {
+            context.self_outlives.iter().map(lifetime_name).collect()
+        };
+        if self.self_ty != entry.self_ty || outlives(self) != outlives(entry) {
             return false;
         }
         let (params, entry_params) = (&self.generics.params, &entry.generics.params);
@@ -1259,7 +1279,9 @@ fn bounded_generic(predicate: &WherePredicate) -> Option<String> {
             bounded_ty,
             ..
         }) => bounded_ident(bounded_ty),
-        WherePredicate::Lifetime(PredicateLifetime { lifetime, .. }) => Some(lifetime.to_string()),
+        WherePredicate::Lifetime(PredicateLifetime { lifetime, .. }) => {
+            Some(lifetime_name(lifetime))
+        }
         _ => None,
     }
 }
@@ -1668,7 +1690,7 @@ impl Enclosing {
             lifetime: lifetime.clone(),
             depth,
         };
-        if lifetime.ident != "static" && lifetime.ident != "_" {
+        if !is_named(&lifetime.ident, "static") && lifetime.ident != "_" {
             push_once(&mut self.0, link);
         }
     }
@@ -1684,7 +1706,12 @@ impl Enclosing {
                     }
                 }
                 Link::Lifetime { lifetime, depth } => {
-                    push_once(&mut active, (lifetime.clone(), *depth));
+                    let known = active
+                        .iter()
+                        .any(|(other, at)| at == depth && same_lifetime(other, lifetime));
+                    if !known {
+                        active.push((lifetime.clone(), *depth));
+                    }
                 }
             }
         }
@@ -1697,7 +1724,9 @@ impl Enclosing {
         for (lifetime, depth) in self.active(scopes) {
             // The scopes in scope where it is written decide what it names.
             if is_generic_lifetime(visible(scopes, depth), &[], &lifetime)
-                && !generic.iter().any(|(other, _)| *other == lifetime)
+                && !generic
+                    .iter()
+                    .any(|(other, _)| same_lifetime(other, &lifetime))
             {
                 generic.push((lifetime, depth));
             }
@@ -1736,13 +1765,13 @@ enum Bounded {
 /// `lifetime` is a lifetime parameter of the context. `'static`, `'_` and `for<..>` lifetimes are
 /// not, as the impl cannot declare them. An undeclared one is not either.
 fn is_generic_lifetime(scopes: &[Scope], binders: &[Lifetime], lifetime: &Lifetime) -> bool {
-    lifetime.ident != "static"
+    !is_named(&lifetime.ident, "static")
         && lifetime.ident != "_"
-        && !binders.contains(lifetime)
+        && !has_lifetime(binders, lifetime)
         && scopes
             .iter()
             .rev()
-            .find(|scope| scope.declares(&lifetime.to_string()))
+            .find(|scope| scope.declares(&lifetime_name(lifetime)))
             .map_or(false, |scope| !scope.is_binder)
 }
 
@@ -1930,7 +1959,7 @@ impl<'a> Finder<'a> {
                 .params
                 .iter()
                 .any(|param| is_lifetime_param(param, &other));
-            if is_param && &other != lifetime {
+            if is_param && !same_lifetime(&other, lifetime) {
                 self.found
                     .push((Bounded::Lifetime(other), lifetime.clone()));
             }
@@ -2024,7 +2053,7 @@ fn is_writable_projection(ty: &TypePath, scopes: &[Scope], binders: &[Lifetime])
     }
     impl<'a, 'ast> Visit<'ast> for Writable<'a> {
         fn visit_lifetime(&mut self, i: &'ast Lifetime) {
-            if i.ident != "static" && !is_generic_lifetime(self.scopes, self.binders, i) {
+            if !is_named(&i.ident, "static") && !is_generic_lifetime(self.scopes, self.binders, i) {
                 self.writable = false;
             }
         }
@@ -2130,7 +2159,7 @@ impl Binding {
                 let ty = unwrap_type_group(&qself.ty);
                 let segments: Vec<&PathSegment> = projection.path.segments.iter().collect();
                 (
-                    quote!(#ty).to_string(),
+                    tokens_text(ty),
                     segments
                         .get(qself.position - 1)
                         .map(|seg| ident_name(&seg.ident)),
@@ -2185,7 +2214,7 @@ fn add_implied_outlives(
                         .push(TypeParamBound::Lifetime(lifetime.clone()))
                 }
                 (GenericParam::Lifetime(param), Bounded::Lifetime(name))
-                    if &param.lifetime == name =>
+                    if same_lifetime(&param.lifetime, name) =>
                 {
                     param.bounds.push(lifetime.clone())
                 }

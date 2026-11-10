@@ -10,7 +10,8 @@ use crate::graph::{NodeKey, TypeGraph};
 use crate::leaker::Leaker;
 use crate::result::Place;
 use crate::util::{
-    binder_declares, has_lifetime_bound, is_whole_reference, names_in, push_once, trait_object_of,
+    binder_declares, has_lifetime, has_lifetime_bound, is_whole_reference, names_in, push_once,
+    same_lifetime, same_name, tokens_text, trait_object_of,
 };
 #[cfg(doc)]
 use crate::view::View;
@@ -21,7 +22,6 @@ use syn::{
     FnArg, GenericArgument, Ident, Lifetime, Macro, Path, PathArguments, ReturnType, Signature,
     Type, TypeGroup, TypeParamBound, TypeParen, TypePath, TypePtr, TypeSlice,
 };
-use template_quote::quote;
 
 /// What [`View::check()`] found in a type: the causes that force it to be leaked, and the causes
 /// that forbid it.
@@ -323,7 +323,7 @@ impl SignatureFacts {
         SignatureMark::Unconstrained(
             self.unconstrained
                 .iter()
-                .filter(|lifetime| named.contains(lifetime))
+                .filter(|lifetime| has_lifetime(named, lifetime))
                 .cloned()
                 .collect(),
         )
@@ -337,9 +337,11 @@ impl SignatureFacts {
             SignatureMark::Unconstrained(lifetimes) => {
                 lifetimes
                     .iter()
-                    .all(|lifetime| self.unconstrained.contains(lifetime))
+                    .all(|lifetime| has_lifetime(&self.unconstrained, lifetime))
                     && self.in_copy.as_ref().map_or(true, |left| {
-                        lifetimes.iter().any(|lifetime| left.contains(lifetime))
+                        lifetimes
+                            .iter()
+                            .any(|lifetime| has_lifetime(left, lifetime))
                     })
             }
             SignatureMark::Elided => self.elision.as_ref().map_or(false, |elision| {
@@ -412,7 +414,10 @@ pub(crate) fn scan_inputs<'a>(
     for input in inputs {
         match input {
             FnArg::Receiver(receiver) => {
-                if receiver.lifetime() == Some(lifetime) {
+                if receiver
+                    .lifetime()
+                    .map_or(false, |own| same_lifetime(own, lifetime))
+                {
                     used.anchors.push(Vec::new());
                 }
                 scan_anchors(scope, &receiver.ty, &mut used)
@@ -435,7 +440,8 @@ pub(crate) fn scan_anchors(scope: &impl Anchoring, ty: &Type, used: &mut OutputU
     used.chain.push(address);
     match ty {
         Type::Reference(reference) => {
-            if reference.lifetime.as_ref() == Some(&used.lifetime) {
+            let lifetime = reference.lifetime.as_ref();
+            if lifetime.map_or(false, |lifetime| same_lifetime(lifetime, &used.lifetime)) {
                 used.anchors.push(used.chain.clone());
             }
             scan_anchors(scope, &reference.elem, used);
@@ -471,7 +477,9 @@ pub(crate) fn scan_anchors(scope: &impl Anchoring, ty: &Type, used: &mut OutputU
                             scan_arguments(scope, &seg.arguments, used);
                         }
                     }
-                    TypeParamBound::Lifetime(lifetime) if *lifetime == used.lifetime => {
+                    TypeParamBound::Lifetime(lifetime)
+                        if same_lifetime(lifetime, &used.lifetime) =>
+                    {
                         used.anchors.push(used.chain.clone())
                     }
                     _ => (),
@@ -488,7 +496,9 @@ fn scan_arguments(scope: &impl Anchoring, arguments: &PathArguments, used: &mut 
         PathArguments::AngleBracketed(args) => {
             for arg in &args.args {
                 match arg {
-                    GenericArgument::Lifetime(lifetime) if *lifetime == used.lifetime => {
+                    GenericArgument::Lifetime(lifetime)
+                        if same_lifetime(lifetime, &used.lifetime) =>
+                    {
                         used.anchors.push(used.chain.clone())
                     }
                     GenericArgument::Type(ty) => scan_anchors(scope, ty, used),
@@ -600,7 +610,7 @@ pub(crate) fn unconstrained_in_output(sig: &Signature) -> Vec<Lifetime> {
     sig.generics
         .lifetimes()
         .map(|param| param.lifetime.clone())
-        .filter(|lifetime| output.0.contains(lifetime) && !bounded.0.contains(lifetime))
+        .filter(|lifetime| has_lifetime(&output.0, lifetime) && !has_lifetime(&bounded.0, lifetime))
         .collect()
 }
 
@@ -711,7 +721,7 @@ impl PendingType {
     /// The type with its context, as the analysis names an optional entry.
     fn optional_key(&self) -> (Context, String) {
         let ty = &self.ty;
-        (self.context.clone(), quote!(#ty).to_string())
+        (self.context.clone(), tokens_text(ty))
     }
 
     /// The part that the Referrer leaves as written if the type is copied so instead of leaked: a
@@ -1198,7 +1208,7 @@ pub(crate) fn primitive_names(effects: &[Effect]) -> Vec<Ident> {
 fn collect_primitive_names(effects: &[Effect], found: &mut Vec<Ident>) {
     let add = |found: &mut Vec<Ident>, names: &[Ident]| {
         for ident in names {
-            if !found.contains(ident) {
+            if !found.iter().any(|known| same_name(known, ident)) {
                 found.push(ident.clone());
             }
         }

@@ -12,7 +12,8 @@
 //! `T::Item` that a predicate in scope equates (E0275), makes it unstable.
 
 use crate::util::{
-    bounded_ident, ident_name, is_bare_self, names_in, tidy_str, token_names, unwrap_type_group,
+    bounded_ident, ident_name, is_bare_self, is_named, names_in, tidy_str, token_names,
+    tokens_text, unwrap_type_group,
 };
 use proc_macro2::TokenStream;
 use std::collections::HashSet;
@@ -179,7 +180,10 @@ fn may_hide(bound: &TypeParamBound, name: &str) -> bool {
     impl<'ast, 'a> Visit<'ast> for Hides<'a> {
         fn visit_type_path(&mut self, i: &'ast TypePath) {
             let names = names_in(i);
-            let bare = i.qself.is_none() && i.path.is_ident(self.name);
+            let bare = i.qself.is_none()
+                && i.path
+                    .get_ident()
+                    .map_or(false, |ident| is_named(ident, self.name));
             let std = i.qself.is_none() && is_std_root(&i.path);
             if names.contains(self.name) && !bare && !std {
                 self.found = true;
@@ -283,7 +287,7 @@ impl<'a, F: Fn(&str) -> bool> Projections<'a, F> {
                 if !self.rooted_in_param(ty) {
                     return (!self.equated_only).then(|| Why::Projection(shown()));
                 }
-                (quote!(#ty).to_string(), name)
+                (tokens_text(ty), name)
             }
         };
         self.bindings
@@ -382,7 +386,7 @@ pub(crate) fn trait_bounds<'a>(
     let predicates = predicates.filter_map(|predicate| match predicate {
         WherePredicate::Type(predicate) => {
             let ty = unwrap_type_group(&predicate.bounded_ty);
-            Some((quote!(#ty).to_string(), &predicate.bounds))
+            Some((tokens_text(ty), &predicate.bounds))
         }
         _ => None,
     });
@@ -494,7 +498,7 @@ fn is_std_root(path: &Path) -> bool {
 }
 
 pub(crate) fn bound_text(bound: &TypeParamBound) -> String {
-    quote!(#bound).to_string()
+    tokens_text(bound)
 }
 
 /// Returns `true` if `bound` is a trait bound with an equation of an associated type

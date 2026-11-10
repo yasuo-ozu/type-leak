@@ -12,8 +12,8 @@ use crate::analyze::AnalyzeVisitor;
 use crate::context::{Context, Scope};
 use crate::error::Cause;
 use crate::util::{
-    binder_declares, binder_lifetimes, is_bare_self, names_in, push_once, token_names,
-    type_mentions_self, unwrap_type_group, ReplaceSelf,
+    binder_declares, binder_lifetimes, has_lifetime, ident_name, is_bare_self, lifetime_name,
+    names_in, same_lifetime, token_names, type_mentions_self, unwrap_type_group, ReplaceSelf,
 };
 use proc_macro2::Span;
 use std::collections::HashSet;
@@ -118,7 +118,7 @@ impl FreshLifetimes {
     /// Returns `true` if `lifetime` is a name that this made and has not given back: the library's
     /// own binder, which a site is not asked about.
     pub(crate) fn made(&self, lifetime: &Lifetime) -> bool {
-        let ident = lifetime.ident.to_string();
+        let ident = ident_name(&lifetime.ident);
         ident
             .strip_prefix("__tl_s")
             .and_then(|n| n.parse::<usize>().ok())
@@ -143,7 +143,7 @@ impl FreshLifetimes {
             let name = format!("'__tl_s{}", self.next);
             self.next += 1;
             if !self.taken.contains(&name)
-                && !binder_lifetimes(binder).any(|declared| declared.to_string() == name)
+                && !binder_lifetimes(binder).any(|declared| lifetime_name(&declared) == name)
             {
                 return Lifetime::new(&name, Span::call_site());
             }
@@ -348,7 +348,7 @@ impl Elision {
             in_kept: self
                 .kept
                 .as_ref()
-                .map_or(false, |kept| lifetimes.named.contains(kept)),
+                .map_or(false, |kept| has_lifetime(&lifetimes.named, kept)),
             ..self.clone()
         }
     }
@@ -383,8 +383,12 @@ impl Elision {
             .map(|param| &param.lifetime)
             .chain(&context.self_outlives);
         for lifetime in lifetimes {
-            let kept = self.in_kept && Some(lifetime) == self.kept.as_ref();
-            if !kept && !added.contains(lifetime) {
+            let kept = self.in_kept
+                && self
+                    .kept
+                    .as_ref()
+                    .map_or(false, |kept| same_lifetime(kept, lifetime));
+            if !kept && !has_lifetime(&added, lifetime) {
                 added.push(lifetime.clone());
             }
         }
@@ -401,8 +405,12 @@ impl Elision {
             added.push(Lifetime::new("'_", proc_macro2::Span::call_site()));
         }
         for lifetime in lifetimes.named {
-            if Some(&lifetime) != self.kept.as_ref() {
-                push_once(&mut added, lifetime);
+            let kept = self
+                .kept
+                .as_ref()
+                .map_or(false, |kept| same_lifetime(kept, &lifetime));
+            if !kept && !has_lifetime(&added, &lifetime) {
+                added.push(lifetime);
             }
         }
         added
@@ -435,7 +443,7 @@ impl Elision {
         match &self.kept {
             // The lifetime that the inputs named is in what the Visitor wrote (the entry held it),
             // as the site writes it: what the output takes is not known.
-            Some(kept) if !shown.named.contains(kept) => return,
+            Some(kept) if !has_lifetime(&shown.named, kept) => return,
             // Only the one elided lifetime that the original had can be named: what was written
             // may have an elided lifetime of its own (`&str` in an argument), which cannot be told
             // from it, and naming both would make them one.
@@ -521,7 +529,7 @@ impl<'ast> Visit<'ast> for InputLifetimes {
     fn visit_lifetime(&mut self, i: &'ast Lifetime) {
         if i.ident == "_" {
             self.elided += 1;
-        } else if !self.declared.contains(i) && !self.named.contains(i) {
+        } else if !has_lifetime(&self.declared, i) && !has_lifetime(&self.named, i) {
             self.named.push(i.clone());
         }
     }

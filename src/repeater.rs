@@ -8,7 +8,8 @@ use crate::referrer::EntryId;
 #[cfg(doc)]
 use crate::referrer::Referrer;
 use crate::util::{
-    ident_name, names_in, parenthesize_leading_qualified_path, tidy, unwrap_type_group, ReplaceSelf,
+    ident_name, is_named, names_in, parenthesize_leading_qualified_path, same_name, tidy,
+    unwrap_type_group, ReplaceSelf,
 };
 use proc_macro2::{Span, TokenStream};
 use std::borrow::Cow;
@@ -48,7 +49,7 @@ fn const_param_primitive(ty: &Type) -> Option<&'static str> {
             let segs: Vec<_> = path
                 .segments
                 .iter()
-                .map(|seg| seg.ident.to_string())
+                .map(|seg| ident_name(&seg.ident))
                 .collect();
             let name = match (path.leading_colon.is_some(), segs.as_slice()) {
                 (false, [s]) => s,
@@ -791,14 +792,14 @@ fn needs_sized(declared: &Generics, ty: &Type, param: &Ident) -> bool {
     impl Uses<'_> {
         fn is_param(&self, ty: &Type) -> bool {
             matches!(unwrap_type_group(ty), Type::Path(TypePath { qself: None, path })
-                if path.is_ident(self.param))
+                if path.get_ident().map_or(false, |ident| same_name(ident, self.param)))
         }
     }
     impl<'ast> Visit<'ast> for Uses<'_> {
         // A use that the methods below do not skip may need `Sized`: `(__S, u8)`, `[__S]`,
         // `Rel2<__S, T>` (unless `Rel2` relaxes it, which is not seen), `<__S>::A`.
         fn visit_ident(&mut self, ident: &'ast Ident) {
-            if ident == self.param {
+            if same_name(ident, self.param) {
                 self.needs_sized = true;
             }
         }
@@ -848,7 +849,11 @@ fn needs_sized(declared: &Generics, ty: &Type, param: &Ident) -> bool {
                         modifier: TraitBoundModifier::None,
                         path,
                         ..
-                    }) if path.segments.last().map_or(false, |s| s.ident == "Sized") => {
+                    }) if path
+                        .segments
+                        .last()
+                        .map_or(false, |s| is_named(&s.ident, "Sized")) =>
+                    {
                         self.needs_sized = true
                     }
                     bound => self.visit_type_param_bound(bound),
@@ -885,7 +890,7 @@ fn accepts_unsized_argument(path: &Path) -> bool {
     // Taken for what it names in the prelude, which the Leaker accepts only if the prelude is
     // allowed; an item of the same name in the module is not told apart.
     const PRELUDE: &[&str] = &["AsRef", "AsMut", "PartialEq", "PartialOrd", "Box"];
-    let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    let names: Vec<String> = path.segments.iter().map(|s| ident_name(&s.ident)).collect();
     let names: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     match (path.leading_colon.is_some(), &names[..]) {
         (false, [name]) => PRELUDE.contains(name),

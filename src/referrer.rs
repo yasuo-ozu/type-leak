@@ -10,7 +10,7 @@ use crate::graph::TypeKey;
 use crate::repeater::repeater_definition;
 use crate::repeater::{check_repeater_path, ImplSelf, Projection, RepeaterImpl};
 use crate::util::{
-    bound_cause, declared_names, generic_param_name, ident_name, mentions_idents,
+    bound_cause, declared_names, generic_param_name, has_lifetime, ident_name, mentions_idents,
     parenthesize_bounded, parenthesize_leading_qualified_path, path_type, type_mentions_self,
     ReplaceSelf, Sorted,
 };
@@ -619,7 +619,7 @@ impl Referrer {
             && self.parts.iter().any(|item| match &item.mark {
                 Some(SignatureMark::Unconstrained(lifetimes)) => lifetimes
                     .iter()
-                    .all(|lifetime| unconstrained.contains(lifetime)),
+                    .all(|lifetime| has_lifetime(unconstrained, lifetime)),
                 _ => false,
             })
     }
@@ -2299,7 +2299,7 @@ impl Parse for SignatureMark {
         let mut lifetimes: Vec<Lifetime> = Vec::new();
         loop {
             let lifetime: Lifetime = input.parse()?;
-            if lifetimes.contains(&lifetime) {
+            if has_lifetime(&lifetimes, &lifetime) {
                 return Err(Error::new(lifetime.span(), "the lifetime is written twice"));
             }
             lifetimes.push(lifetime);

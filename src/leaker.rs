@@ -11,7 +11,7 @@ use crate::error::Reason;
 use crate::graph::{NodeKey, TypeGraph, TypeKey};
 use crate::referrer::Referrer;
 use crate::result::{filter, Allow, LeakerResult};
-use crate::util::push_once;
+use crate::util::{ident_name, push_once, same_name};
 use crate::view::View;
 use proc_macro2::TokenStream;
 use std::collections::{BTreeMap, BTreeSet};
@@ -248,7 +248,7 @@ impl<A: Allow> Leaker<A> {
         }
         let checks = self.assumed_primitives.iter().map(|ident| {
             let name = Ident::new(
-                &format!("__type_leak_assert_{}_is_primitive", ident),
+                &format!("__type_leak_assert_{}_is_primitive", ident_name(ident)),
                 ident.span(),
             );
             quote_spanned! {ident.span() =>
@@ -549,7 +549,13 @@ impl<A: Allow> Leaker<A> {
         let mut analysis = Analysis::default();
         analysis.apply(&mut self.contexts, &effects, None);
         for ident in analysis.primitives {
-            push_once(&mut self.assumed_primitives, ident);
+            if !self
+                .assumed_primitives
+                .iter()
+                .any(|known| same_name(known, &ident))
+            {
+                self.assumed_primitives.push(ident);
+            }
         }
         for part in analysis.parts {
             push_once(&mut self.parts, part);

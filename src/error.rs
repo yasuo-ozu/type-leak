@@ -5,7 +5,8 @@ use crate::analysis::{CheckResult, Part, SelfMention};
 use crate::context::Context;
 use crate::result::Place;
 use crate::util::{
-    absolute_example, has_lifetime_bound, or_list, path_type, tidy, without_arguments, KNOWN_NAMES,
+    absolute_example, has_lifetime_bound, ident_name, or_list, path_type, same_name, tidy,
+    without_arguments, KNOWN_NAMES,
 };
 use proc_macro2::{Delimiter, Literal, Span, TokenStream, TokenTree};
 use std::hash::{Hash, Hasher};
@@ -126,7 +127,7 @@ impl Cause {
                     .segments
                     .iter()
                     .zip(path.segments.iter())
-                    .all(|(prefix_seg, seg)| prefix_seg.ident == seg.ident)
+                    .all(|(prefix_seg, seg)| same_name(&prefix_seg.ident, &seg.ident))
         })
     }
 
@@ -232,7 +233,8 @@ impl ToTokens for Cause {
     }
 }
 
-/// A token of a cause without its span and its spacing: what two causes are compared by.
+/// A token of a cause without its span and its spacing, an identifier without `r#`: what two causes
+/// are compared by.
 #[derive(PartialEq, Eq, Hash)]
 enum TokenText {
     /// The start of a group, with its opening delimiter.
@@ -271,7 +273,7 @@ impl TokenText {
                     TokenText::collect(group.stream(), tokens);
                     tokens.push(TokenText::Close);
                 }
-                TokenTree::Ident(ident) => tokens.push(TokenText::Ident(ident.to_string())),
+                TokenTree::Ident(ident) => tokens.push(TokenText::Ident(ident_name(&ident))),
                 TokenTree::Punct(punct) => tokens.push(TokenText::Punct(punct.as_char())),
                 TokenTree::Literal(literal) => tokens.push(TokenText::Literal(literal.to_string())),
             }
@@ -945,7 +947,7 @@ fn prelude_help(path: &Path) -> Option<String> {
     if path.leading_colon.is_some() {
         return None;
     }
-    let name = path.segments.iter().next()?.ident.to_string();
+    let name = ident_name(&path.segments.iter().next()?.ident);
     KNOWN_NAMES
         .iter()
         .find(|(n, _, _)| *n == name)

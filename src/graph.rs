@@ -1,7 +1,7 @@
 //! The graph of the types found by the analysis, and its reduction to the entries (a minimum cut).
 
 use crate::context::ContextId;
-use crate::util::is_whole_reference;
+use crate::util::{is_whole_reference, tokens_text};
 use safegraph::algo::max_flow::edmonds_karp_with_flows;
 use safegraph::collection::IndexKey;
 use safegraph::graph::Graph;
@@ -23,8 +23,14 @@ impl TypeKey {
         Self { ty: ty.clone() }
     }
 
-    /// The tokens as a string: what the key compares, hashes and orders.
+    /// The tokens as a string, without `r#` ([`tokens_text()`]): what the key compares, hashes and
+    /// orders.
     pub(crate) fn tokens(&self) -> String {
+        tokens_text(self)
+    }
+
+    /// The tokens as written, `r#` kept: the order of the entries. Two keys of a graph differ in it.
+    fn written(&self) -> String {
         self.to_token_stream().to_string()
     }
 }
@@ -308,7 +314,7 @@ impl TypeGraph {
     /// each.
     fn indexed(&self) -> (Vec<&NodeKey>, Vec<Vec<usize>>, Vec<Vec<usize>>) {
         let mut keys: Vec<&NodeKey> = self.keys().collect();
-        keys.sort_by_cached_key(|key| (key.context, key.ty.tokens()));
+        keys.sort_by_cached_key(|key| (key.context, key.ty.written()));
         let index: HashMap<&NodeKey, usize> =
             keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
         let children: Vec<Vec<usize>> = keys
@@ -330,7 +336,7 @@ impl TypeGraph {
 
 /// Sorts entries by context and tokens: the order of the Referrer's entries.
 fn sorted_entries(mut entries: Vec<NodeKey>) -> Vec<NodeKey> {
-    entries.sort_by_cached_key(|key| (key.context, key.ty.tokens()));
+    entries.sort_by_cached_key(|key| (key.context, key.ty.written()));
     entries
 }
 

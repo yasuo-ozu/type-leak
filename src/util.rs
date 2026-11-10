@@ -244,7 +244,7 @@ pub(crate) fn starts_with_known(path: &Path, known: Known) -> bool {
         && path.segments.first().map_or(false, |seg| {
             KNOWN_NAMES
                 .iter()
-                .any(|(name, _, kind)| seg.ident == name && *kind == known)
+                .any(|(name, _, kind)| is_named(&seg.ident, name) && *kind == known)
         })
 }
 
@@ -253,18 +253,18 @@ const STD_CRATES: &[&str] = &["std", "core", "alloc"];
 
 /// Returns `true` if `path` starts with `std`, `core` or `alloc`, relative or absolute.
 pub(crate) fn is_std_crate_path(path: &Path) -> bool {
-    path.segments
-        .first()
-        .map_or(false, |seg| STD_CRATES.iter().any(|name| seg.ident == name))
+    path.segments.first().map_or(false, |seg| {
+        STD_CRATES.iter().any(|name| is_named(&seg.ident, name))
+    })
 }
 
 pub(crate) fn is_primitive_name(ident: &Ident) -> bool {
     KNOWN_NAMES
         .iter()
-        .any(|(name, _, kind)| ident == name && *kind == Known::Primitive)
+        .any(|(name, _, kind)| is_named(ident, name) && *kind == Known::Primitive)
 }
 
-/// Returns `true` if `ty` is `part` or has it as a component, compared as written.
+/// Returns `true` if `ty` is `part` or has it as a component, compared by [`tokens_text()`].
 pub(crate) fn type_contains(ty: &Type, part: &Type) -> bool {
     struct Contains {
         part: String,
@@ -275,17 +275,15 @@ pub(crate) fn type_contains(ty: &Type, part: &Type) -> bool {
             if self.found {
                 return;
             }
-            let ty = unwrap_type_group(i);
-            if quote!(#ty).to_string() == self.part {
+            if tokens_text(unwrap_type_group(i)) == self.part {
                 self.found = true;
                 return;
             }
             syn::visit::visit_type(self, i)
         }
     }
-    let part = unwrap_type_group(part);
     let mut contains = Contains {
-        part: quote!(#part).to_string(),
+        part: tokens_text(unwrap_type_group(part)),
         found: false,
     };
     contains.visit_type(ty);
@@ -313,7 +311,7 @@ pub(crate) fn type_names(ty: &Type, names: &mut HashSet<String>) {
             syn::visit::visit_path(self, i)
         }
         fn visit_lifetime(&mut self, i: &'ast Lifetime) {
-            self.0.insert(i.to_string());
+            self.0.insert(lifetime_name(i));
         }
         fn visit_macro(&mut self, i: &'ast Macro) {
             self.tokens(&i.tokens);
@@ -362,9 +360,9 @@ pub(crate) fn mentions_idents(ty: &Type, idents: &[Ident]) -> bool {
     impl<'ast> Visit<'ast> for Visitor<'_> {
         fn visit_path(&mut self, i: &'ast Path) {
             if i.leading_colon.is_none()
-                && i.segments
-                    .first()
-                    .map_or(false, |seg| self.idents.contains(&seg.ident))
+                && i.segments.first().map_or(false, |seg| {
+                    self.idents.iter().any(|id| same_name(id, &seg.ident))
+                })
             {
                 self.found = true;
             }
@@ -376,7 +374,7 @@ pub(crate) fn mentions_idents(ty: &Type, idents: &[Ident]) -> bool {
             if self
                 .idents
                 .iter()
-                .any(|ident| names.contains(&ident.to_string()))
+                .any(|ident| names.contains(&ident_name(ident)))
             {
                 self.found = true;
             }
@@ -397,6 +395,79 @@ pub(crate) fn mentions_idents(ty: &Type, idents: &[Ident]) -> bool {
 /// Returns the name of `ident` without `r#`, by which names are compared.
 pub(crate) fn ident_name(ident: &Ident) -> String {
     ident.unraw().to_string()
+}
+
+/// Returns `true` if `ident` is `name`, written raw (`r#Sized`) or not.
+pub(crate) fn is_named(ident: &Ident, name: &str) -> bool {
+    ident.unraw() == name
+}
+
+/// Returns `true` if `a` and `b` are one name, each written raw or not.
+pub(crate) fn same_name(a: &Ident, b: &Ident) -> bool {
+    a.unraw() == b.unraw()
+}
+
+/// Returns the name of `lifetime` with its `'` and without `r#` (`'r#a` is `'a`).
+pub(crate) fn lifetime_name(lifetime: &Lifetime) -> String {
+    format!("'{}", ident_name(&lifetime.ident))
+}
+
+/// Returns `true` if `a` and `b` are one lifetime, each written raw or not.
+pub(crate) fn same_lifetime(a: &Lifetime, b: &Lifetime) -> bool {
+    same_name(&a.ident, &b.ident)
+}
+
+/// Returns `true` if `lifetimes` has `lifetime`, written raw or not.
+pub(crate) fn has_lifetime(lifetimes: &[Lifetime], lifetime: &Lifetime) -> bool {
+    lifetimes.iter().any(|other| same_lifetime(other, lifetime))
+}
+
+/// The text of `tokens` with each identifier without `r#`: by which types, contexts and bounds are
+/// compared. It is the text of the tokens if none is raw.
+pub(crate) fn tokens_text(tokens: impl ToTokens) -> String {
+    let tokens = tokens.into_token_stream();
+    let text = tokens.to_string();
+    // Only a raw identifier or a raw string literal writes `r#`.
+    if text.contains("r#") {
+        unraw_tokens(tokens).to_string()
+    } else {
+        text
+    }
+}
+
+/// Writes each identifier without `r#`, in the syntax and in the tokens of a macro: the syntax that
+/// `==` compares by name.
+pub(crate) struct Unraw;
+
+impl syn::fold::Fold for Unraw {
+    fn fold_ident(&mut self, i: Ident) -> Ident {
+        i.unraw()
+    }
+
+    fn fold_macro(&mut self, i: Macro) -> Macro {
+        let i = syn::fold::fold_macro(self, i);
+        Macro {
+            tokens: unraw_tokens(i.tokens),
+            ..i
+        }
+    }
+}
+
+/// `tokens` with each raw identifier written without `r#`.
+fn unraw_tokens(tokens: TokenStream) -> TokenStream {
+    use proc_macro2::{Group, TokenTree};
+    tokens
+        .into_iter()
+        .map(|tt| match tt {
+            TokenTree::Ident(ident) => TokenTree::Ident(ident.unraw()),
+            TokenTree::Group(group) => {
+                let mut new = Group::new(group.delimiter(), unraw_tokens(group.stream()));
+                new.set_span(group.span());
+                TokenTree::Group(new)
+            }
+            tt => tt,
+        })
+        .collect()
 }
 
 /// Returns the names that `item` declares in the block or module around it, with what a `use`
@@ -456,7 +527,7 @@ pub(crate) fn token_names(tokens: TokenStream, names: &mut HashSet<String>) {
     for tt in tokens {
         match &tt {
             proc_macro2::TokenTree::Ident(ident) if after_quote => {
-                names.insert(format!("'{}", ident));
+                names.insert(format!("'{}", ident_name(ident)));
             }
             proc_macro2::TokenTree::Ident(ident) => {
                 names.insert(ident_name(ident));
@@ -476,9 +547,9 @@ pub(crate) fn is_type_param_named(param: &GenericParam, name: &str) -> bool {
     matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == name)
 }
 
-/// Returns `true` if `param` is the lifetime parameter `lifetime`.
+/// Returns `true` if `param` is the lifetime parameter `lifetime` (without `r#`).
 pub(crate) fn is_lifetime_param(param: &GenericParam, lifetime: &Lifetime) -> bool {
-    matches!(param, GenericParam::Lifetime(param) if param.lifetime == *lifetime)
+    matches!(param, GenericParam::Lifetime(param) if same_lifetime(&param.lifetime, lifetime))
 }
 
 /// The names of the identifiers and lifetimes in `tokens`, as [`token_names()`] collects them.
@@ -488,11 +559,12 @@ pub(crate) fn names_in(tokens: impl ToTokens) -> HashSet<String> {
     names
 }
 
+/// The name of `param` without `r#`, a lifetime with its `'`.
 pub(crate) fn generic_param_name(param: &GenericParam) -> String {
     match param {
         GenericParam::Type(TypeParam { ident, .. })
         | GenericParam::Const(ConstParam { ident, .. }) => ident_name(ident),
-        GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => lifetime.to_string(),
+        GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => lifetime_name(lifetime),
     }
 }
 
@@ -511,7 +583,7 @@ pub(crate) fn binder_lifetimes(
 
 /// Returns `true` if the binder `lifetimes` declares `wanted`.
 pub(crate) fn binder_declares(lifetimes: Option<&BoundLifetimes>, wanted: &Lifetime) -> bool {
-    binder_lifetimes(lifetimes).any(|lifetime| lifetime == *wanted)
+    binder_lifetimes(lifetimes).any(|lifetime| same_lifetime(&lifetime, wanted))
 }
 
 /// Pushes `item` to `items` unless it is there already.
@@ -709,12 +781,12 @@ pub(crate) fn is_whole_reference(ty: &Type) -> bool {
     }
 }
 
-/// Returns `items` sorted by the text of their tokens, the first of equal ones kept: the order that
-/// makes bounds, predicates and lifetimes independent of how they were written.
+/// Returns `items` sorted by the text of their tokens ([`tokens_text()`]), the first of equal ones
+/// kept: the order that makes bounds, predicates and lifetimes independent of how they were written.
 pub(crate) fn sorted_by_tokens<T: ToTokens>(items: impl IntoIterator<Item = T>) -> Vec<T> {
     let mut items: Vec<(String, T)> = items
         .into_iter()
-        .map(|item| (quote!(#item).to_string(), item))
+        .map(|item| (tokens_text(&item), item))
         .collect();
     items.sort_by(|a, b| a.0.cmp(&b.0));
     items.dedup_by(|a, b| a.0 == b.0);

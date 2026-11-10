@@ -664,6 +664,10 @@ fn every_item_kind_is_leaked_across_crates() {
         // F110: the parameter of a closure and the local of a function in the length of an array
         // are local, not relative paths: `Rel` is the entry (the Leaker rejected the item).
         (9271, __tl_report_9271!(), ok("struct", 1, 2, 2)),
+        // F113: the root of a `use` in a block in the length of an array is read: each array is the
+        // entry (the copy of the second, where nothing else names the import, could not resolve
+        // `rel9274`).
+        (9274, __tl_report_9274!(), ok("struct", 2, 2, 2)),
         // F102: the `Self` of a struct in a block in the default of a type parameter is its own: the
         // Leaker rejected the default (`SelfInDefault`).
         (9265, __tl_report_9265!(), ok("struct", 1, 2, 2)),
@@ -2110,6 +2114,27 @@ fn a_block_that_imports_with_self_or_declares_a_fn_hides_the_entries_that_name_i
     assert!(r::BlockNamesCopy::imported(&Copy, l::Block9249(0)));
     assert_eq!(l::BlockNames::declared(&Original, [0; 2]), 3);
     assert_eq!(r::BlockNamesCopy::declared(&Copy, [0; 2]), 3);
+}
+
+/// Fixture 9273 (F112): the default method `local` of `RawNames` declares `r#Raw9273` in its body,
+/// which hides the entry `Raw9273` of its parameter: the copy keeps the type of the local. The
+/// Referrer took `r#Raw9273` for another name and replaced it (E0308 in the Referrer's crate).
+/// `same` names the parameter `r#T` as `T` too: one entry for both.
+#[test]
+fn a_raw_identifier_is_its_name_without_r_hash() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::kinds as r;
+
+    assert_reported!(9273, __tl_report_9273!(), ok("trait", 2, 5, 5));
+
+    struct Original;
+    impl l::RawNames<u8> for Original {}
+    struct Copy;
+    impl r::RawNamesCopy<u8> for Copy {}
+
+    assert_eq!(l::RawNames::local(&Original, l::Raw9273(0)), 3);
+    assert_eq!(r::RawNamesCopy::local(&Copy, l::Raw9273(0)), 3);
 }
 
 /// The impls of the entries that do not name `Self` are for a primitive type that the id and the

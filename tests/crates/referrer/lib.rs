@@ -301,6 +301,12 @@ pub mod kinds {
     // An array that is optional through its length and keeps a method lifetime is written as it
     // is, and the lifetime stays in an input (F111).
     type_leak_test_leaker::__tl_prop_9272!(path = ::type_leak_test_leaker::kinds);
+    // A raw identifier is its name without `r#`: a struct that a body declares as `r#Raw9273`
+    // hides the entry `Raw9273` (F112).
+    type_leak_test_leaker::__tl_prop_9273!(path = ::type_leak_test_leaker::kinds);
+    // The root of a `use` in a block in an array length is read: the arrays are the entries
+    // (F113).
+    type_leak_test_leaker::__tl_prop_9274!(path = ::type_leak_test_leaker::kinds);
     // The `Self` of an item in the default of a type parameter is the item's own (F102).
     type_leak_test_leaker::__tl_prop_9265!(path = ::type_leak_test_leaker::kinds);
     // The argument of a generic associated type replaces its parameter in its where clause (F89).

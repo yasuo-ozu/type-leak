@@ -24,10 +24,11 @@ use crate::unstable::{
 use crate::util::{
     absolute_example, binder_declares, binder_lifetimes, bound_cause, bounded_ident,
     declared_names, first_associated_self_in_generics, first_self_in_generics, first_self_in_type,
-    generic_param_mentions_self, generic_param_name, has_lifetime_bound, ident_name, is_bare_self,
-    is_lifetime_param, is_primitive_name, is_std_crate_path, is_type_param_named,
-    is_whole_reference, names_in, or_list, path_type, plain_self_head, push_once, self_head,
-    self_in_param, self_in_predicate, selves_in_generics, tidy, trait_head, trait_object_of,
+    generic_param_mentions_self, generic_param_name, has_lifetime, has_lifetime_bound, ident_name,
+    is_bare_self, is_lifetime_param, is_named, is_primitive_name, is_std_crate_path,
+    is_type_param_named, is_whole_reference, lifetime_name, names_in, or_list, path_type,
+    plain_self_head, push_once, same_lifetime, same_name, self_head, self_in_param,
+    self_in_predicate, selves_in_generics, tidy, tokens_text, trait_head, trait_object_of,
     type_mentions_self, unwrap_type_group, where_clause, where_predicate_mentions_self,
     without_arguments, without_default, without_defaults,
 };
@@ -1790,9 +1791,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         Ok(
             match optional.filter(|_| optional_binder.is_none() && optional_elision.is_none()) {
                 Some(context) if self.env_blocked(&context, true) => {
-                    self.records
-                        .not_optional
-                        .push((context, quote!(#ty).to_string()));
+                    self.records.not_optional.push((context, tokens_text(ty)));
                     None
                 }
                 // An absolute type that names a nested `Self` is copied as written
@@ -2677,7 +2676,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     fn is_optional_path(&self, cause: &Cause) -> bool {
         cause.path().map_or(false, |path| {
             path.leading_colon.is_some()
-                && !matches!(path.segments.first(), Some(seg) if seg.ident == "core")
+                && !matches!(path.segments.first(), Some(seg) if is_named(&seg.ident, "core"))
                 && !self.call_rule(cause)
         })
     }
@@ -2724,7 +2723,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         self.alone_defaults.last().map_or(false, |alone| {
             alone.scopes == self.scopes.len()
                 && alone.item_depth == self.item_depth
-                && alone.idents.contains(ident)
+                && alone.idents.iter().any(|alone| same_name(alone, ident))
         })
     }
 
@@ -2886,7 +2885,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     fn is_unconstrained(&self, lifetime: &Lifetime, scope: usize) -> bool {
         self.signatures
             .iter()
-            .any(|walk| walk.at == scope && walk.risky.contains(lifetime))
+            .any(|walk| walk.at == scope && has_lifetime(&walk.risky, lifetime))
     }
 
     /// Notes that `ty` is leaked whole, if it names a lifetime of the signature being visited:
@@ -2906,7 +2905,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         let named: Vec<Lifetime> = finder
             .found
             .into_iter()
-            .filter(|lifetime| self.scope_of(&lifetime.to_string()) == Some(walk.at))
+            .filter(|lifetime| self.scope_of(&lifetime_name(lifetime)) == Some(walk.at))
             .collect();
         if named.is_empty() {
             return;
@@ -2975,13 +2974,13 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             // The original constrains it, and in the copy only types leaked whole hold it: the
             // first on the way to each occurrence is what to report, and then the next ones.
             let culprits = unconstraining_types(&used.anchors, |ty| leaked.contains_key(&ty));
-            if risky.contains(lifetime) {
+            if has_lifetime(risky, lifetime) {
                 kept_optional
                     .extend(self.optional_anchors(sig, lifetime, &used, leaked, &culprits));
             }
             for ty in culprits {
                 let (named, conflict) = &leaked[&ty];
-                if named.contains(lifetime) {
+                if has_lifetime(named, lifetime) {
                     let mut conflict = conflict.clone();
                     // Each conflict is one of its own, though the type is the same.
                     conflict.origin = Origin::default();
@@ -3118,7 +3117,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         }
         unconstrained_in_output(sig)
             .into_iter()
-            .filter(|lifetime| mentioned.0.contains(lifetime) && !kept.contains(lifetime))
+            .filter(|lifetime| {
+                has_lifetime(&mentioned.0, lifetime) && !has_lifetime(&kept, lifetime)
+            })
             .collect()
     }
 
@@ -3186,7 +3187,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 .anchors
                 .iter()
                 .any(|anchor| anchor.iter().all(|ty| !own.contains(ty)));
-            if !anchored && !unanchored.contains(&used.lifetime) {
+            if !anchored && !has_lifetime(&unanchored, &used.lifetime) {
                 unanchored.push(used.lifetime.clone());
             }
         }
@@ -3218,7 +3219,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     for input in &group.inputs {
                         match input {
                             BinderInput::Type(ty) => scan_anchors(self, ty, &mut used),
-                            BinderInput::Lifetime(input) if *input == lifetime => {
+                            BinderInput::Lifetime(input) if same_lifetime(input, lifetime) => {
                                 used.anchors.push(Vec::new())
                             }
                             BinderInput::Lifetime(_) => (),
@@ -3507,7 +3508,7 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
             self.visit_attribute(attr);
         }
         if let Some(label) = label {
-            self.position.locals.declare(label.name.to_string());
+            self.position.locals.declare(lifetime_name(&label.name));
             self.visit_label(label);
         }
     }
@@ -3599,13 +3600,65 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
                     Stmt::Item(item) => {
                         let locals = &mut visitor.position.locals;
                         let barrier = std::mem::replace(&mut locals.barrier, locals.scopes.len());
-                        visitor.visit_item(item);
+                        visitor.walk_item(item);
                         visitor.position.locals.barrier = barrier;
                     }
                     _ => visitor.visit_stmt(stmt),
                 }
             }
         })
+    }
+
+    /// Visits `item` of a block or a module in an expression, with the roots of a `use` read. An
+    /// item that `syn` leaves unparsed (`use {a::X, ::b::Y};`) is taken for a relative path.
+    fn walk_item(&mut self, item: &Item) {
+        match item {
+            Item::Use(i) => self.read_use(i),
+            Item::Verbatim(tokens) => {
+                let cause = Cause::Unreadable(tokens.clone());
+                if self.position.type_depth > 0 {
+                    self.push_must(cause, None)
+                } else {
+                    self.push_relative_path(cause.clone(), cause, Vec::new())
+                }
+            }
+            _ => (),
+        }
+        self.visit_item(item)
+    }
+
+    /// Reads each root of the `use` `i` as a path of the expression around is read. A root does
+    /// not resolve through the names that `i` brings (`use rel::{self}`), which the innermost
+    /// scope of `Position::locals` declares: they are hidden meanwhile.
+    fn read_use(&mut self, i: &ItemUse) {
+        let own = declared_names(&Item::Use(i.clone()));
+        let hidden: Vec<String> = match self.position.locals.scopes.last_mut() {
+            Some(scope) => own
+                .iter()
+                .map(ident_name)
+                .filter(|name| scope.items.remove(name))
+                .collect(),
+            None => Vec::new(),
+        };
+        for root in use_tree_roots(&i.tree) {
+            let path = Path {
+                leading_colon: i.leading_colon,
+                segments: Some(PathSegment::from(root.clone())).into_iter().collect(),
+            };
+            let asked = Cause::Unknown(path.clone());
+            let written = Cause::expr_path(&path);
+            // Outside a type (a const argument of a bound) nothing is leaked whole.
+            if self.position.type_depth == 0
+                && !self.is_local(&path, &asked)
+                && self.is_relative_path(&asked)
+            {
+                self.push_relative_path(written.clone(), written.clone(), vec![asked.bare()]);
+            }
+            self.visit_path_of(&path, &asked, &written);
+        }
+        for name in hidden {
+            self.position.locals.declare(name);
+        }
     }
 
     /// Visits the type macro `i` (`m`), which cannot be analyzed: it is leaked whole.
@@ -3634,10 +3687,10 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
     fn reference_hints(&mut self, i: &Type, reference: &TypeReference) {
         match &reference.lifetime {
             Some(lifetime) if lifetime.ident == "_" => self.position.hints.elided_ref = true,
-            Some(lifetime) if lifetime.ident == "static" => (),
+            Some(lifetime) if is_named(&lifetime.ident, "static") => (),
             Some(lifetime) => {
                 let local = self
-                    .scope_of(&lifetime.to_string())
+                    .scope_of(&lifetime_name(lifetime))
                     .filter(|&scope| scope > 0);
                 let bounded = trait_object_of(&reference.elem).map_or(false, has_lifetime_bound);
                 match local {
@@ -3906,7 +3959,11 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
             }
             let outer = std::mem::replace(&mut self.position.locals, locals);
             self.with_item(&Generics::default(), None, false, Vec::new(), |visitor| {
-                syn::visit::visit_item_mod(visitor, i)
+                // As `syn::visit::visit_item_mod()`, with the roots of a `use` read.
+                visitor.visit_head(&i.attrs, &i.vis);
+                for item in i.content.iter().flat_map(|(_, items)| items) {
+                    visitor.walk_item(item);
+                }
             });
             self.position.locals = outer;
             return;
@@ -4022,11 +4079,9 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
         let mut output = output_lifetimes(i.lifetimes.as_ref(), |v| v.visit_return_type(&i.output));
         // An elided output has the only lifetime of the inputs, which the binder may declare.
         let elided = elision.as_ref().and_then(|elision| elision.kept.clone());
-        output.extend(
-            elided.filter(|kept| {
-                binder_declares(i.lifetimes.as_ref(), kept) && !output.contains(kept)
-            }),
-        );
+        output.extend(elided.filter(|kept| {
+            binder_declares(i.lifetimes.as_ref(), kept) && !has_lifetime(&output, kept)
+        }));
         let group = BinderGroup {
             output,
             inputs: i
@@ -4257,9 +4312,10 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
         }
         if i.ident == "_" {
             self.push_elided(Cause::Lifetime(i.clone()));
-        } else if let Some(scope) = self.scope_of(&i.to_string()) {
+        } else if let Some(scope) = self.scope_of(&lifetime_name(i)) {
             self.mention_scope(scope);
-        } else if i.ident != "static" && !self.position.locals.declares(&i.to_string()) {
+        } else if !is_named(&i.ident, "static") && !self.position.locals.declares(&lifetime_name(i))
+        {
             self.push_must(Cause::Lifetime(i.clone()), None);
         }
     }
@@ -4297,7 +4353,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
         for lifetime in &lifetimes {
             if lifetime.ident == "_" {
                 elided = true;
-            } else if let Some(scope) = self.scope_of(&lifetime.to_string()) {
+            } else if let Some(scope) = self.scope_of(&lifetime_name(lifetime)) {
                 // Local lifetimes are generics of the whole path.
                 if scope > 0 && lifetimes.len() > 1 {
                     elided = true;
@@ -4307,7 +4363,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
                         unconstrained_lifetime = Some((*lifetime).clone());
                     }
                 }
-            } else if lifetime.ident != "static" {
+            } else if !is_named(&lifetime.ident, "static") {
                 inherited = true;
             }
         }
@@ -4647,7 +4703,7 @@ fn cut_conflicts(
             }
             if pending.optional {
                 let ty = &pending.ty;
-                not_optional.push((pending.context.clone(), quote!(#ty).to_string()));
+                not_optional.push((pending.context.clone(), tokens_text(ty)));
                 pending.optional = false;
             }
         }
@@ -4702,14 +4758,14 @@ fn declared_self_mention(declared: &Generics, context: &Context) -> Option<Cause
         .where_clause
         .iter()
         .flat_map(|where_clause| where_clause.predicates.iter())
-        .map(|predicate| quote!(#predicate).to_string())
+        .map(tokens_text)
         .collect();
     let predicates: Vec<WherePredicate> = context
         .generics
         .where_clause
         .iter()
         .flat_map(|where_clause| where_clause.predicates.iter())
-        .filter(|predicate| written.contains(&quote!(#predicate).to_string()))
+        .filter(|predicate| written.contains(&tokens_text(predicate)))
         .cloned()
         .collect();
     let own = Generics {
@@ -4735,7 +4791,7 @@ fn declared_self_mention(declared: &Generics, context: &Context) -> Option<Cause
                         if is_bare_self(&predicate.bounded_ty)
                             && predicate.bounds.iter().any(|bound| matches!(bound,
                                 TypeParamBound::Lifetime(lifetime)
-                                    if context.self_outlives.contains(lifetime))))
+                                    if has_lifetime(&context.self_outlives, lifetime))))
                 })
                 .cloned(),
         );
@@ -4756,9 +4812,8 @@ fn self_type_conflict(pending: &PendingType, declared: &Generics) -> Option<Chec
         _ => return None,
     };
     let cause = declared_self_mention(declared, context)?;
-    let plain = quote!(#ty).to_string();
     let shown = tidy(&quote!(#ty));
-    let what = if quote!(#self_ty).to_string() == plain {
+    let what = if tokens_text(self_ty) == tokens_text(ty) {
         format!("`Self` is `{}`, the self type of the impl", shown)
     } else {
         format!(
@@ -4899,7 +4954,7 @@ fn elision_advice(added: &[Lifetime], elision: &Elision, ty: &Type, owned: bool)
     let kept = elision
         .kept
         .as_ref()
-        .map_or(false, |kept| added.contains(kept));
+        .map_or(false, |kept| has_lifetime(added, kept));
     let added: Vec<String> = added
         .iter()
         .map(|lifetime| format!("`{}`", lifetime))
@@ -5161,7 +5216,9 @@ fn bound_group<'a>(
             let kept =
                 Elision::of(0, true, &args.inputs, &args.output).and_then(|elision| elision.kept);
             output.extend(
-                kept.filter(|kept| binder_declares(lifetimes, kept) && !output.contains(kept)),
+                kept.filter(|kept| {
+                    binder_declares(lifetimes, kept) && !has_lifetime(&output, kept)
+                }),
             );
         }
         _ => (),
@@ -5189,9 +5246,9 @@ impl OutputLifetimes {
     }
 
     fn mention(&mut self, lifetime: &Lifetime) {
-        if self.declared.contains(lifetime)
-            && !self.shadowed.contains(lifetime)
-            && !self.found.contains(lifetime)
+        if has_lifetime(&self.declared, lifetime)
+            && !has_lifetime(&self.shadowed, lifetime)
+            && !has_lifetime(&self.found, lifetime)
         {
             self.found.push(lifetime.clone());
         }
@@ -5207,7 +5264,7 @@ impl OutputLifetimes {
     fn scan(&mut self, tokens: TokenStream) {
         let names = names_in(tokens);
         for lifetime in self.declared.clone() {
-            if names.contains(&lifetime.to_string()) {
+            if names.contains(&lifetime_name(&lifetime)) {
                 self.mention(&lifetime);
             }
         }
@@ -5270,7 +5327,7 @@ fn is_relaxed_sized(bound: &TraitBound) -> bool {
         && bound.path.leading_colon.is_none()
         && bound.path.segments.len() == 1
         && matches!(bound.path.segments.first(), Some(seg)
-            if seg.ident == "Sized" && seg.arguments.is_none())
+            if is_named(&seg.ident, "Sized") && seg.arguments.is_none())
 }
 
 /// Returns `true` if `ty` is `Self` or `Self::A`, written as a path: not `<Self as Tr>::A`, whose
@@ -5679,23 +5736,13 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
 
     /// Checks the root of a `use` tree, which names a crate, a module or an item of the value.
     fn use_roots(&mut self, tree: &UseTree, absolute: bool) {
-        let ident = match tree {
-            UseTree::Path(p) => &p.ident,
-            UseTree::Name(n) => &n.ident,
-            UseTree::Rename(r) => &r.ident,
-            UseTree::Glob(_) => return,
-            UseTree::Group(g) => {
-                for tree in &g.items {
-                    self.use_roots(tree, absolute);
-                }
-                return;
+        for ident in use_tree_roots(tree) {
+            let path = Path::from(ident.clone());
+            let root = Cause::Unknown(path.clone());
+            if !absolute && !self.is_local(&path) && !self.visitor.is_free_path(&root) {
+                // What the root names (a crate, a module, a type, a trait) is not known.
+                self.reject_as(Cause::expr_path(&path), Some(root), None);
             }
-        };
-        let path = Path::from(ident.clone());
-        let root = Cause::Unknown(path.clone());
-        if !absolute && !self.is_local(&path) && !self.visitor.is_free_path(&root) {
-            // What the root names (a crate, a module, a type, a trait) is not known.
-            self.reject_as(Cause::expr_path(&path), Some(root), None);
         }
     }
 
@@ -5875,7 +5922,7 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
             match param {
                 GenericParam::Type(param) => self.declare(&param.ident),
                 GenericParam::Const(param) => self.declare(&param.ident),
-                GenericParam::Lifetime(param) => self.declare_name(param.lifetime.to_string()),
+                GenericParam::Lifetime(param) => self.declare_name(lifetime_name(&param.lifetime)),
             }
         }
         syn::visit::visit_generics(self, i)
@@ -5960,7 +6007,7 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
             // `for<'a> |x: &'a u8| ..` declares a lifetime that only the closure knows.
             for param in i.lifetimes.iter().flat_map(|binder| &binder.lifetimes) {
                 if let GenericParam::Lifetime(param) = param {
-                    walk.declare_name(param.lifetime.to_string());
+                    walk.declare_name(lifetime_name(&param.lifetime));
                 }
             }
             for input in &i.inputs {
@@ -6042,7 +6089,7 @@ impl<'ast, A: Allow> Visit<'ast> for Scan<'_, '_, '_, A> {
     }
 
     fn visit_lifetime(&mut self, i: &'ast Lifetime) {
-        self.name(&i.to_string());
+        self.name(&lifetime_name(i));
     }
 
     /// A type macro, or a macro in a length: the names in its tokens are not told apart.
@@ -6100,11 +6147,11 @@ fn is_binding(i: &PatIdent) -> bool {
     i.by_ref.is_some() || i.mutability.is_some() || i.subpat.is_some() || !capital
 }
 
-/// Declares in `locals` the names of the `items` of a block or a module in a type, but those of a
-/// `use`, an `extern crate` and a `macro_rules!`: the visitor does not read what they name.
+/// Declares in `locals` the names of the `items` of a block or a module in a type, but those of an
+/// `extern crate` and a `macro_rules!`: the visitor does not read what they name.
 fn declare_items<'i>(locals: &mut ValueScopes, items: impl IntoIterator<Item = &'i Item>) {
     for item in items {
-        if !matches!(item, Item::Use(_) | Item::ExternCrate(_) | Item::Macro(_)) {
+        if !matches!(item, Item::ExternCrate(_) | Item::Macro(_)) {
             for name in declared_names(item) {
                 locals.declare(ident_name(&name));
             }
@@ -6129,6 +6176,17 @@ fn bindings_of(pat: &Pat) -> Vec<Ident> {
     let mut bindings = Bindings(Vec::new());
     bindings.visit_pat(pat);
     bindings.0
+}
+
+/// The first names of the paths of the `use` tree `tree`, in order: `a` and `b` of `{a::X, b::*}`.
+fn use_tree_roots(tree: &UseTree) -> Vec<&Ident> {
+    match tree {
+        UseTree::Path(p) => vec![&p.ident],
+        UseTree::Name(n) => vec![&n.ident],
+        UseTree::Rename(r) => vec![&r.ident],
+        UseTree::Glob(_) => Vec::new(),
+        UseTree::Group(g) => g.items.iter().flat_map(use_tree_roots).collect(),
+    }
 }
 
 fn has_glob(tree: &UseTree) -> bool {
@@ -6158,7 +6216,7 @@ fn macro_exprs(tokens: &TokenStream) -> Option<Vec<Expr>> {
 /// or `core::cfg!` if `allowed`. (Another path ending in the same name is a macro of its own.)
 fn is_std_macro(path: &Path, names: &[&str], allowed: bool) -> bool {
     let name = match path.segments.last() {
-        Some(seg) => seg.ident.to_string(),
+        Some(seg) => ident_name(&seg.ident),
         None => return false,
     };
     names.contains(&name.as_str())
@@ -6317,8 +6375,12 @@ fn captured_names(format: &str) -> Vec<String> {
 fn macro_help(path: &Path) -> String {
     let name = tidy(&quote!(#path));
     if path.leading_colon.is_none() && path.segments.len() == 1 {
-        if let Some((_, crate_name, _)) = STD_MACROS.iter().find(|(known, _, _)| *known == name) {
-            return format!("use `::{}::{}!` instead of `{}!`", crate_name, name, name);
+        let ident = &path.segments[0].ident;
+        if let Some((known, crate_name, _)) = STD_MACROS
+            .iter()
+            .find(|(known, _, _)| is_named(ident, known))
+        {
+            return format!("use `::{}::{}!` instead of `{}!`", crate_name, known, name);
         }
     }
     format!(

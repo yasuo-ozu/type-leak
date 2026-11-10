@@ -3,12 +3,13 @@
 use crate::elided::{fold_bare_fn, fold_bound, FreshLifetimes, Site};
 use crate::repeater::encode_slot_const;
 use crate::util::{
-    after_head, has_lifetime_bound, parenthesize_bounded, parenthesize_leading_qualified_path,
-    parenthesize_pointee, projection, projection_head, qself_of, unwrap_type_group, ReplaceSelf,
-    Sorted,
+    after_head, has_lifetime_bound, is_named, lifetime_name, parenthesize_bounded,
+    parenthesize_leading_qualified_path, parenthesize_pointee, projection, projection_head,
+    qself_of, same_lifetime, same_name, unwrap_type_group, ReplaceSelf, Sorted,
 };
 use proc_macro2::{Span, TokenStream, TokenTree};
 use std::collections::HashMap;
+use syn::ext::IdentExt;
 use syn::fold::Fold;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
@@ -191,7 +192,9 @@ fn lifetime_bounds(param: &GenericParam) -> Vec<&Lifetime> {
 /// are encoded. `without_encoded_bounds()` keeps the others.
 fn encoded_outliving<'p>(params: &[&'p GenericParam], bound: &Lifetime) -> Option<&'p Lifetime> {
     params.iter().find_map(|param| match param {
-        GenericParam::Lifetime(param) if param.lifetime == *bound => Some(&param.lifetime),
+        GenericParam::Lifetime(param) if same_lifetime(&param.lifetime, bound) => {
+            Some(&param.lifetime)
+        }
         _ => None,
     })
 }
@@ -357,9 +360,11 @@ pub(crate) fn complete_params<'a>(
         match param {
             GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => match lifetime_args.next() {
                 Some(GenericArgument::Lifetime(arg)) => {
-                    substitute.lifetimes.insert(lifetime.clone(), arg.clone());
+                    substitute
+                        .lifetimes
+                        .insert(lifetime_name(lifetime), arg.clone());
                     let arg = GenericArgument::Lifetime(arg.clone());
-                    lifetimes.insert(lifetime.ident.clone(), arg);
+                    lifetimes.insert(lifetime.ident.unraw(), arg);
                 }
                 _ => return Err(missing()),
             },
@@ -372,8 +377,8 @@ pub(crate) fn complete_params<'a>(
                     (None, Some(default)) => substitute.default_of(default, Fold::fold_type)?,
                     (None, None) => return Err(missing()),
                 };
-                substitute.types.insert(tp.ident.clone(), ty.clone());
-                others.insert(tp.ident.clone(), GenericArgument::Type(ty));
+                substitute.types.insert(tp.ident.unraw(), ty.clone());
+                others.insert(tp.ident.unraw(), GenericArgument::Type(ty));
             }
             GenericParam::Const(cp) => {
                 let value: Expr = match (other_args.next(), &cp.default) {
@@ -385,8 +390,8 @@ pub(crate) fn complete_params<'a>(
                     (None, None) => return Err(missing()),
                 };
                 let arg = GenericArgument::Const(normalize_const_arg(&value));
-                others.insert(cp.ident.clone(), arg);
-                substitute.consts.insert(cp.ident.clone(), value);
+                others.insert(cp.ident.unraw(), arg);
+                substitute.consts.insert(cp.ident.unraw(), value);
             }
         }
     }
@@ -508,7 +513,7 @@ fn single_bound(param: &TypeParam, where_clause: Option<&WhereClause>) -> Option
                 bounded_ty,
                 bounds,
                 ..
-            }) if type_name(bounded_ty) == Some(&param.ident) => {
+            }) if type_name(bounded_ty).map_or(false, |name| same_name(name, &param.ident)) => {
                 Some(bounds.iter().map(move |bound| (bound, lifetimes.is_some())))
             }
             _ => None,
@@ -596,17 +601,17 @@ fn unwrap_block(expr: &Expr) -> &Expr {
 /// The fold of [`complete_params()`]: it writes the default of a parameter with the
 /// arguments of the parameters before it.
 struct ParamFold {
-    /// The argument of each type parameter completed so far.
+    /// The argument of each type parameter completed so far, by its name without `r#`.
     types: HashMap<Ident, Type>,
     /// The one trait bound of each type parameter that has exactly one, without its associated type
-    /// bindings (`Iterator` for `T: Iterator<Item = u8>`).
+    /// bindings (`Iterator` for `T: Iterator<Item = u8>`), by its name without `r#`.
     bounds: HashMap<Ident, Path>,
     /// The first associated type that could not be written.
     error: Option<EncodeError>,
-    /// The value of each const parameter completed so far.
+    /// The value of each const parameter completed so far, by its name without `r#`.
     consts: HashMap<Ident, Expr>,
-    /// The argument of each lifetime parameter completed so far.
-    lifetimes: HashMap<Lifetime, Lifetime>,
+    /// The argument of each lifetime parameter completed so far, by its name.
+    lifetimes: HashMap<String, Lifetime>,
     /// The lifetimes that the copy of a signature binds, if the arguments add lifetimes to its
     /// inputs.
     names: FreshLifetimes,
@@ -624,7 +629,7 @@ impl ParamFold {
             .filter_map(|param| match param {
                 GenericParam::Type(param) => {
                     let bound = single_bound(param, generics.where_clause.as_ref())?;
-                    Some((param.ident.clone(), bound))
+                    Some((param.ident.unraw(), bound))
                 }
                 _ => None,
             })
@@ -657,7 +662,7 @@ impl ParamFold {
     fn type_argument(&self, ty: &Type) -> Option<Type> {
         match ty {
             Type::Path(TypePath { qself: None, path }) => {
-                self.types.get(path.get_ident()?).cloned()
+                self.types.get(&path.get_ident()?.unraw()).cloned()
             }
             _ => None,
         }
@@ -669,7 +674,7 @@ impl ParamFold {
         match unwrap_block(expr) {
             Expr::Path(ExprPath {
                 qself: None, path, ..
-            }) => Some(braced_const(self.consts.get(path.get_ident()?)?)),
+            }) => Some(braced_const(self.consts.get(&path.get_ident()?.unraw())?)),
             _ => None,
         }
     }
@@ -679,7 +684,7 @@ impl ParamFold {
     fn const_argument_of(&self, arg: &GenericArgument) -> Option<GenericArgument> {
         match arg {
             GenericArgument::Type(Type::Path(TypePath { qself: None, path })) => {
-                let value = self.consts.get(path.get_ident()?)?;
+                let value = self.consts.get(&path.get_ident()?.unraw())?;
                 Some(GenericArgument::Const(normalize_const_arg(value)))
             }
             _ => None,
@@ -687,7 +692,10 @@ impl ParamFold {
     }
 
     fn lifetime(&self, lifetime: Lifetime) -> Lifetime {
-        self.lifetimes.get(&lifetime).cloned().unwrap_or(lifetime)
+        self.lifetimes
+            .get(&lifetime_name(&lifetime))
+            .cloned()
+            .unwrap_or(lifetime)
     }
 }
 
@@ -700,8 +708,8 @@ impl syn::fold::Fold for ParamFold {
         if let Type::Path(path) = &ty {
             if let Some((name, rest)) = parameter_projection(path) {
                 let name = name.clone();
-                if let Some(value) = self.types.get(&name).cloned() {
-                    let bound = self.bounds.get(&name).cloned();
+                if let Some(value) = self.types.get(&name.unraw()).cloned() {
+                    let bound = self.bounds.get(&name.unraw()).cloned();
                     return match projected(self, &name, value, rest, bound) {
                         Ok(projected) => projected,
                         // `ty` stays, and the error is kept.
@@ -939,7 +947,8 @@ fn substitute_in<F: FnMut(&Ident, Kind) -> Option<GenericArgument>>(
 /// ```
 #[derive(Clone, Debug)]
 pub struct Substitute {
-    /// For `impl Tr<'static, u8> for W` of `trait Tr<'a, K>`: `{ a: 'static }`.
+    /// For `impl Tr<'static, u8> for W` of `trait Tr<'a, K>`: `{ a: 'static }`. Each map is by
+    /// the name without `r#`.
     lifetimes: Sorted<HashMap<Ident, GenericArgument>>,
     /// For the same impl: `{ K: u8 }`. The consts are here too.
     others: Sorted<HashMap<Ident, GenericArgument>>,
@@ -955,7 +964,7 @@ impl Substitute {
                 Kind::Lifetime => &self.lifetimes,
                 Kind::TypeOrConst => &self.others,
             };
-            found.get(name).cloned()
+            found.get(&name.unraw()).cloned()
         };
         // It leaves what does not fit as it is, and never fails.
         let _ = substitute_in(answer, vec![arg], Mode::Impl(&self.bounds));
@@ -1102,6 +1111,7 @@ struct Answers<F> {
     answer: F,
     /// Whether a lifetime and a type of one name are two questions, each asked once.
     by_kind: bool,
+    /// The answers, by kind and name without `r#`.
     known: HashMap<(Kind, Ident), Option<GenericArgument>>,
 }
 
@@ -1121,7 +1131,7 @@ impl<F: FnMut(&Ident, Kind) -> Option<GenericArgument>> Answers<F> {
             } else {
                 Kind::TypeOrConst
             },
-            name.clone(),
+            name.unraw(),
         );
         if let Some(answer) = self.known.get(&key) {
             return answer.clone();
@@ -1300,7 +1310,7 @@ impl<F: FnMut(&Ident, Kind) -> Option<GenericArgument>> syn::fold::Fold for Site
                 let name = name.clone();
                 if let Some(value) = self.type_for(&name) {
                     let bound = match self.mode {
-                        Mode::Impl(bounds) => bounds.get(&name).cloned(),
+                        Mode::Impl(bounds) => bounds.get(&name.unraw()).cloned(),
                         Mode::Args => None,
                     };
                     return match projected(self, &name, value, rest, bound) {
@@ -1367,7 +1377,10 @@ impl<F: FnMut(&Ident, Kind) -> Option<GenericArgument>> syn::fold::Fold for Site
         arm
     }
     fn fold_lifetime(&mut self, lifetime: Lifetime) -> Lifetime {
-        if lifetime.ident == "static" || lifetime.ident == "_" || self.names.made(&lifetime) {
+        if is_named(&lifetime.ident, "static")
+            || lifetime.ident == "_"
+            || self.names.made(&lifetime)
+        {
             return lifetime;
         }
         match self.answers.of(&lifetime.ident, Kind::Lifetime) {

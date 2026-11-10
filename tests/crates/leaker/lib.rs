@@ -2471,6 +2471,77 @@ pub mod kinds {
         ) -> Held<'y>;
     }
 
+    // F112 (`tests/findings/findings.rs`): a raw identifier is its name without `r#`. It fails to
+    // build on the code before the fix.
+
+    /// A struct of this crate that has the name of the struct that the body of `RawNames::local`
+    /// declares as `r#Raw9273`.
+    pub struct Raw9273(pub u8);
+
+    /// F112: the body of `local` declares `r#Raw9273`, which hides the entry `Raw9273` of the
+    /// parameter. The Referrer took `r#Raw9273` for another name, and replaced the type of `y` by
+    /// the entry (E0308). `same` names the parameter `r#T` as `T` too, one entry where there were
+    /// two, and `r#Option<r#u8>` is allowed by the prelude, as `Option<u8>` is.
+    #[prop_leak(
+        id = 9273,
+        scope = "nested",
+        prelude = true,
+        redeclare = true,
+        values = true
+    )]
+    pub trait RawNames<r#T> {
+        fn local(&self, _x: Raw9273) -> u8 {
+            struct r#Raw9273(u8);
+            let y: Raw9273 = r#Raw9273(3);
+            y.0
+        }
+
+        fn same(&self, a: Wrap<r#T>, b: Wrap<T>) -> r#Option<r#u8> {
+            let _ = (a, b);
+            None
+        }
+    }
+
+    // F113 (`tests/findings/findings.rs`): the root of a `use` in a block in an array length is
+    // read. It fails to build on the code before the fix.
+
+    /// The module that the blocks of `UseInLength` import from, which the Referrer's crate does not
+    /// have.
+    pub mod rel9274 {
+        pub const N: usize = 3;
+
+        pub struct Rel<T>(pub T);
+
+        /// A trait whose method a function of a block calls, so that the import is used.
+        pub trait Three {
+            fn three(&self) -> usize {
+                3
+            }
+        }
+
+        impl Three for u8 {}
+    }
+
+    /// F113: the blocks of the lengths import from `rel9274`, a relative path. The Leaker did not
+    /// read the path of a `use`. The first array was the entry only because `N` looked relative; in
+    /// the second nothing else names `rel9274`, so `rel9274::Rel<T>` alone was the entry, and the
+    /// copy in the Referrer's crate could not resolve the import (E0432). Both arrays are the
+    /// entries now.
+    #[prop_leak(id = 9274)]
+    pub struct UseInLength<T>(
+        pub  [rel9274::Rel<T>; {
+            use rel9274::N;
+            N
+        }],
+        pub  [rel9274::Rel<T>; {
+            use rel9274::Three;
+            fn _f() -> usize {
+                0u8.three()
+            }
+            3
+        }],
+    );
+
     // F102 (`tests/findings/findings.rs`): the `Self` of an item in the default of a type parameter
     // is its own. It fails to build on the code before the fix.
 
