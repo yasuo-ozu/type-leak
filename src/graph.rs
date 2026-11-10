@@ -88,6 +88,9 @@ type CompositionGraph =
 ///
 /// A type is a node if it may be a required entry or an optional one (or both). A type that may
 /// be neither is not in it: its components hang on its parent.
+///
+/// [`TypeGraph::kept()`] makes the graph of the entries that a reduction chose, which the next
+/// analysis adds to.
 #[derive(Default)]
 pub(crate) struct TypeGraph {
     /// An edge goes from a type to each internable type it is composed of.
@@ -108,6 +111,12 @@ pub(crate) struct TypeGraph {
     pub(crate) no_required: HashSet<NodeKey>,
     /// The same for the optional entries.
     pub(crate) no_optional: HashSet<NodeKey>,
+    /// The required entries that a reduction chose and kept ([`TypeGraph::kept()`]). Each stays a
+    /// required entry whatever is merged in later, though what made it required is gone.
+    pub(crate) kept_required: HashSet<NodeKey>,
+    /// The optional entries that a reduction chose and kept: the same, but one that a type merged
+    /// in later makes hold a required type becomes a required entry.
+    pub(crate) kept_optional: HashSet<NodeKey>,
 }
 
 impl TypeGraph {
@@ -145,8 +154,44 @@ impl TypeGraph {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+    /// Returns the graph that holds only the entries `required` and `optional`, each a root with
+    /// no components, and kept as the kind it is.
+    ///
+    /// The kept sets mark them, not `must_intern` and `optional`: those say what a type is, and a
+    /// kept entry is a choice, which the types that made it required or optional no longer back.
+    pub(crate) fn kept(required: Vec<NodeKey>, optional: Vec<NodeKey>) -> Self {
+        let mut graph = Self::default();
+        for (key, must) in required
+            .into_iter()
+            .map(|key| (key, true))
+            .chain(optional.into_iter().map(|key| (key, false)))
+        {
+            graph.nodes.insert(key.clone());
+            graph.graph.insert_node(key.clone()).ok().unwrap();
+            graph.roots.insert(key.clone());
+            if must {
+                graph.kept_required.insert(key);
+            } else {
+                graph.kept_optional.insert(key);
+            }
+        }
+        graph
+    }
+
+    /// Returns `true` if the graph holds nothing but kept entries ([`TypeGraph::kept()`]): no type
+    /// has been merged in since, as a type that is added is a candidate of a kind. Reducing it
+    /// gives the same entries.
+    pub(crate) fn is_reduced(&self) -> bool {
+        self.required_candidates.is_empty()
+            && self.optional_candidates.is_empty()
+            && self.nodes.len() == self.kept_required.len() + self.kept_optional.len()
+    }
+
+    /// Returns the kept entries: the required ones, then the optional ones, each sorted by context
+    /// and tokens.
+    pub(crate) fn into_kept_entries(self) -> (Vec<NodeKey>, Vec<NodeKey>) {
+        let sorted = |set: HashSet<NodeKey>| sorted_entries(set.into_iter().collect());
+        (sorted(self.kept_required), sorted(self.kept_optional))
     }
 
     /// Returns the types, in no particular order.
@@ -176,7 +221,15 @@ impl TypeGraph {
         self.optional_candidates.extend(other.optional_candidates);
         self.no_required.extend(other.no_required);
         self.no_optional.extend(other.no_optional);
+        self.kept_required.extend(other.kept_required);
+        self.kept_optional.extend(other.kept_optional);
     }
+}
+
+/// Sorts entries by context and tokens: the order of the Referrer's entries.
+pub(crate) fn sorted_entries(mut entries: Vec<NodeKey>) -> Vec<NodeKey> {
+    entries.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
+    entries
 }
 
 /// Returns `true` for a reference with a lifetime: its components cannot stand for it, as the copy

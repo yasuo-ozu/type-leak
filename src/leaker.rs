@@ -10,7 +10,7 @@ use crate::crates::external_crates;
 use crate::error::ErrorItem;
 #[cfg(doc)]
 use crate::error::Reason;
-use crate::graph::{is_whole_reference, NodeKey, TypeGraph};
+use crate::graph::{is_whole_reference, sorted_entries, NodeKey, TypeGraph};
 use crate::referrer::Referrer;
 use crate::view::View;
 use proc_macro2::{Span, TokenStream};
@@ -128,8 +128,6 @@ pub struct Leaker<A = ()> {
     allow: A,
     /// The types that depend on the context, or that the Referrer may replace.
     types: TypeGraph,
-    /// The result of [`Leaker::reduce_roots()`]: required, then optional. `None` if outdated.
-    reachable_types: Option<(Vec<NodeKey>, Vec<NodeKey>)>,
     contexts: Contexts,
     /// The top-level contexts of the scopes (also of those with errors), which the [`Referrer`]
     /// keeps without an entry too.
@@ -222,7 +220,6 @@ impl<A: Allow> Leaker<A> {
         Self {
             allow,
             types: TypeGraph::default(),
-            reachable_types: None,
             contexts: Contexts::default(),
             top_levels: BTreeSet::new(),
             assumed_primitives: Vec::new(),
@@ -440,8 +437,14 @@ impl<A: Allow> Leaker<A> {
     }
 
     fn referrer(mut self) -> Referrer {
-        self.reduce_roots();
-        let (required, optional) = self.reachable_types.take().unwrap_or_default();
+        // Not `reduce_roots()`: the graph of the kept entries would be built only to be read.
+        let types = std::mem::take(&mut self.types);
+        let (required, optional) = if types.is_reduced() {
+            types.into_kept_entries()
+        } else {
+            let (required, optional) = reduce(&types);
+            (sorted_entries(required), sorted_entries(optional))
+        };
         let contexts = self.contexts;
         let context_of = |id: ContextId| contexts.get(id).clone();
         let mut context_map: BTreeMap<ContextId, Context> = self
@@ -487,15 +490,27 @@ impl<A: Allow> Leaker<A> {
         Referrer::new(entries, context_map, modules, self.parts)
     }
 
-    /// Chooses the fewest entries from which every leaked type can be built;
-    /// [`Leaker::result()`] calls it. `&'a Rel`, a path with a lifetime or bare-identifier argument
-    /// (`Wrap<SIZE>`), a type with a type in an expression (`[u8; size_of::<Big>()]`) and a trait
-    /// object are entries as a whole. One choice covers the required types and the optional ones
-    /// ([`Referrer::must()`]): an entry with a required type in it is required.
+    /// Chooses the fewest entries from which every leaked type can be built, and removes every
+    /// other type from the Leaker; [`Leaker::result()`] calls it. `&'a Rel`, a path with a lifetime
+    /// or bare-identifier argument (`Wrap<SIZE>`), a type with a type in an expression
+    /// (`[u8; size_of::<Big>()]`) and a trait object are entries as a whole. One choice covers the
+    /// required types and the optional ones ([`Referrer::must()`]): an entry with a required type
+    /// in it is required.
+    ///
+    /// Analyzing more afterwards adds to what is left, and the kept entries stay entries and keep
+    /// their kind, so calling it again changes nothing. The price: the result can have more
+    /// entries than one reduction at the end gives (`(Rel1, Rel2)` is kept, then `Rel1` alone is
+    /// an entry too), and a later scope in which a kept entry would make the copy cyclic (where
+    /// its parts would be the entries) still gets it as an entry, so its copy may not compile.
     pub fn reduce_roots(&mut self) {
-        if self.reachable_types.is_none() {
-            self.reachable_types = Some(reduce(&self.types));
+        if self.types.is_reduced() {
+            return;
         }
+        // The graph is dropped before the new one is built.
+        let types = std::mem::take(&mut self.types);
+        let (required, optional) = reduce(&types);
+        drop(types);
+        self.types = TypeGraph::kept(required, optional);
     }
 }
 
@@ -684,9 +699,6 @@ impl<A: Allow> Leaker<A> {
                 self.parts.push(part);
             }
         }
-        if !analysis.types.is_empty() {
-            self.reachable_types = None;
-        }
         self.types.merge(analysis.types);
         // Shares the context of an entry that uses exactly these generics.
         // `Self` is part of the top-level context only if an entry names it, or has a bound
@@ -706,13 +718,16 @@ impl<A: Allow> Leaker<A> {
 
 /// Min vertex cut from the roots to the red types, by max flow (Edmonds-Karp, node-split). Ties go
 /// to the cut closest to the sink, so inner types win. Returns the required entries and the
-/// optional ones, each sorted.
+/// optional ones.
 ///
 /// A type is red if it is `must_intern`, or `optional` and may be an entry. The kind of an entry is
 /// what it covers: required if it is or holds a `must_intern` type, else optional. A type is cut
 /// only as a kind it may be: a candidate of the kind, not in `no_required` or `no_optional` (an
 /// optional type is a candidate of both). An optional type that may not be an entry is not red, and
 /// its parts are.
+///
+/// An entry that an earlier reduction kept is red and cut whatever else the graph says of it, as
+/// the kind it was kept as (or required, if a type merged in later makes it hold a required type).
 fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
     let mut keys: Vec<&NodeKey> = types.keys().collect();
     keys.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
@@ -733,6 +748,7 @@ fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
         flags(&types.optional),
         flags(&types.roots),
     );
+    let (kept_required, kept_optional) = (flags(&types.kept_required), flags(&types.kept_optional));
     let mut parents: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, children) in children.iter().enumerate() {
         for &child in children {
@@ -740,7 +756,7 @@ fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
         }
     }
     // An entry that covers a required type is a required entry.
-    let mut required = must.clone();
+    let mut required: Vec<bool> = (0..n).map(|i| must[i] || kept_required[i]).collect();
     spread(&mut required, &parents);
     // An optional type is an entry anyway, so it is a candidate of either kind.
     let may: Vec<bool> = (0..n)
@@ -754,8 +770,10 @@ fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
             }
         })
         .collect();
-    // An optional type that cannot be an entry is no entry, and its parts are.
-    let red: Vec<bool> = (0..n).map(|i| must[i] || (soft[i] && may[i])).collect();
+    // An optional type that cannot be an entry is no entry, and its parts are. A kept entry is one.
+    let red: Vec<bool> = (0..n)
+        .map(|i| must[i] || kept_required[i] || kept_optional[i] || (soft[i] && may[i]))
+        .collect();
     // A type that must be an entry cannot be forbidden to be one.
     let forbidden: Vec<bool> = (0..n)
         .map(|i| !may[i] && !red[i] && !needs_parent(keys[i]))
@@ -763,8 +781,11 @@ fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
     let mut has_red = red.clone();
     spread(&mut has_red, &parents);
 
-    // A root that must be interned is in every minimum cut, so it is cut without a flow.
-    let cut: Vec<bool> = (0..n).map(|i| red[i] && root[i]).collect();
+    // A root that must be interned is in every minimum cut, so it is cut without a flow. So is a
+    // kept entry, which is a root of the graph it was kept in.
+    let cut: Vec<bool> = (0..n)
+        .map(|i| (red[i] && root[i]) || kept_required[i] || kept_optional[i])
+        .collect();
     let mut kept: Vec<usize> = (0..n).filter(|&i| cut[i]).collect();
 
     // The edges of the network. A parent that its components cannot replace goes to the sink.
@@ -831,13 +852,8 @@ fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
     }
 
     let entries = |kind: bool| {
-        let mut found: Vec<NodeKey> = kept
-            .iter()
-            .filter(|&&i| required[i] == kind)
-            .map(|&i| keys[i].clone())
-            .collect();
-        found.sort_by_cached_key(|key| (key.context, key.ty.to_string()));
-        found
+        let found = kept.iter().filter(|&&i| required[i] == kind);
+        found.map(|&i| keys[i].clone()).collect()
     };
     (entries(true), entries(false))
 }
@@ -901,3 +917,6 @@ fn find(component: &mut [usize], mut i: usize) -> usize {
     }
     i
 }
+
+#[cfg(test)]
+mod tests;

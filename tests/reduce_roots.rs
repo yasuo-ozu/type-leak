@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, ErrorItem, Leaker, Options, Rules};
+use type_leak::{to_syn_error, ContextId, ErrorItem, Leaker, Options, Referrer, Rules};
 
 #[test]
 fn test_reduce_roots_empty_leaker() {
@@ -2698,4 +2698,333 @@ fn test_reduce_roots_optional_entries() {
         .map(|ix| referrer.must(ix))
         .collect();
     assert_eq!(musts, [true, true, false, false]);
+}
+
+// `reduce_roots()` removes every type that is not an entry from the Leaker, and the kept entries
+// stay entries: the tests below.
+
+/// The items for the tests of the pruning: `feed()` interns one.
+fn prune_cases() -> Vec<Item> {
+    vec![
+        // Required and optional entries. `::ext::Wrap<Rel2>` holds a required type, so it is
+        // required, and replaced as a whole.
+        parse_quote! {
+            struct S {
+                a: Rel,
+                b: ::std::string::String,
+                c: ::ext::Wrap<Rel2>,
+                d: ::ext::X,
+            }
+        },
+        // A tuple of two relative types is required through its children, which one cut covers.
+        parse_quote! { struct S { a: (R1, R2) } },
+        // A whole reference with a lifetime, and the type in it, in another context.
+        parse_quote! { struct S<'a> { a: &'a Rel, b: Rel } },
+        parse_quote! {
+            trait Tr<T> {
+                fn f(&self, t: T) -> Wrap<T>;
+                fn g(&self) -> (Rel, ::ext::X);
+                fn h(&self) -> (::ext::X, ::ext::Y, Rel);
+            }
+        },
+        parse_quote! {
+            enum E {
+                A(::ext::Wrap<(R1, R2)>),
+                B(::ext::Wrap<(R1, R2)>),
+            }
+        },
+        parse_quote! {
+            mod m {
+                struct A { x: R1 }
+                struct B { y: (R1, R2), z: ::ext::X }
+            }
+        },
+    ]
+}
+
+fn feed(leaker: &mut Leaker, item: &Item) -> ContextId {
+    match item {
+        Item::Struct(item) => leaker.intern_struct(item, true),
+        Item::Enum(item) => leaker.intern_enum(item, true),
+        Item::Trait(item) => leaker.intern_trait(item, true),
+        Item::Mod(item) => leaker.intern_mod(item),
+        _ => unreachable!("not an item of the tests"),
+    }
+}
+
+/// The entries of `referrer`, in order: the kind, the type and the number of the context.
+fn kept(referrer: &Referrer) -> Vec<String> {
+    referrer
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| {
+            let kind = if referrer.must(ix) {
+                "required"
+            } else {
+                "optional"
+            };
+            format!("{} {} {}", kind, quote!(#ty), referrer.context(ix).index())
+        })
+        .collect()
+}
+
+fn referrer_after(item: &Item, reductions: usize) -> Referrer {
+    let mut leaker = Leaker::new();
+    feed(&mut leaker, item);
+    for _ in 0..reductions {
+        leaker.reduce_roots();
+    }
+    leaker.result().finish().unwrap()
+}
+
+/// `reduce_roots()` is idempotent, and calling it changes nothing for `result()`: the Referrer is
+/// the same, serialized too. The entries are what one reduction at the end gives.
+#[test]
+fn test_reduce_roots_changes_nothing_for_result() {
+    let expected: [&[&str]; 6] = [
+        &[
+            "required :: ext :: Wrap < Rel2 > 0",
+            "required Rel 0",
+            "optional :: ext :: X 0",
+            "optional :: std :: string :: String 0",
+        ],
+        &["required (R1 , R2) 0"],
+        &["required & 'a Rel 0", "required Rel 1"],
+        &[
+            "required Wrap < T > 0",
+            "required (:: ext :: X , :: ext :: Y , Rel) 1",
+            "required (Rel , :: ext :: X) 1",
+        ],
+        &["required :: ext :: Wrap < (R1 , R2) > 0"],
+        &["required R1 1", "required R2 1", "optional :: ext :: X 2"],
+    ];
+    for (item, expected) in prune_cases().iter().zip(expected) {
+        let once = referrer_after(item, 1);
+        assert_eq!(kept(&once), expected, "{}", quote!(#item));
+        for reductions in [0, 2, 3] {
+            let other = referrer_after(item, reductions);
+            assert_eq!(other, once, "{} after {}", quote!(#item), reductions);
+            assert_eq!(quote!(#other).to_string(), quote!(#once).to_string());
+        }
+    }
+}
+
+/// The copy of `item` that the visitor of `referrer` makes in `context`: every entry is `P<ix>`.
+fn copy_of(referrer: &Referrer, context: ContextId, item: &ItemStruct) -> ItemStruct {
+    let mut copy = item.clone();
+    let mut visitor = referrer.visitor(context, |_, ix| parse_quote!(P<#ix>));
+    syn::visit_mut::VisitMut::visit_item_struct_mut(&mut visitor, &mut copy);
+    copy
+}
+
+/// Items interned after `reduce_roots()` add to what is left. The tuple of the first item stays an
+/// entry, required though the relative types that made it so are gone, so the second item, which
+/// names the types of the tuple alone, has them as entries too: three entries, where one reduction
+/// at the end gives two (`R1` and `R2`, and the tuple is built from them).
+#[test]
+fn test_reduce_roots_then_interning_adds_to_the_kept_entries() {
+    let s1: ItemStruct = parse_quote! { struct S1 { a: (R1, R2) } };
+    let s2: ItemStruct = parse_quote! { struct S2 { b: R1, c: R2 } };
+
+    let mut leaker = Leaker::new();
+    let c1 = leaker.intern_struct(&s1, true);
+    leaker.reduce_roots();
+    let c2 = leaker.intern_struct(&s2, true);
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(
+        kept(&referrer),
+        ["required (R1 , R2) 0", "required R1 0", "required R2 0"]
+    );
+    // The tuple is required though its components were pruned.
+    assert!((0..3).all(|ix| referrer.must(ix)));
+    // The copies of both items have no relative path left.
+    let (copy1, copy2): (ItemStruct, ItemStruct) = (
+        parse_quote! { struct S1 { a: P<0usize> } },
+        parse_quote! { struct S2 { b: P<1usize>, c: P<2usize> } },
+    );
+    assert_eq!(copy_of(&referrer, c1, &s1), copy1);
+    assert_eq!(copy_of(&referrer, c2, &s2), copy2);
+
+    // One reduction at the end covers both items with `R1` and `R2`.
+    let mut leaker = Leaker::new();
+    let c1 = leaker.intern_struct(&s1, true);
+    let c2 = leaker.intern_struct(&s2, true);
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(kept(&referrer), ["required R1 0", "required R2 0"]);
+    let (copy1, copy2): (ItemStruct, ItemStruct) = (
+        parse_quote! { struct S1 { a: (P<0usize>, P<1usize>) } },
+        parse_quote! { struct S2 { b: P<0usize>, c: P<1usize> } },
+    );
+    assert_eq!(copy_of(&referrer, c1, &s1), copy1);
+    assert_eq!(copy_of(&referrer, c2, &s2), copy2);
+}
+
+/// The kept entries keep their kind, and the result lists the required ones first, whenever each
+/// was kept. A kept entry is not added twice by a later item that names it again.
+#[test]
+fn test_reduce_roots_kept_entries_keep_their_kind() {
+    let s1: ItemStruct = parse_quote! { struct S1 { a: ::std::string::String, b: (R1, R2) } };
+    let s2: ItemStruct = parse_quote! { struct S2 { c: Rel, d: ::std::string::String } };
+    let s3: ItemStruct = parse_quote! { struct S3 { e: (R1, R2), f: ::ext::X } };
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&s1, true);
+    leaker.reduce_roots();
+    leaker.intern_struct(&s2, true);
+    leaker.reduce_roots();
+    leaker.intern_struct(&s3, true);
+    let referrer = leaker.result().finish().unwrap();
+    // The tuple is required, though what made it so was pruned in the first reduction, and
+    // `String` is optional, though kept before `Rel`, a required entry.
+    assert_eq!(
+        kept(&referrer),
+        [
+            "required (R1 , R2) 0",
+            "required Rel 0",
+            "optional :: ext :: X 0",
+            "optional :: std :: string :: String 0",
+        ]
+    );
+    // The same entries as one reduction at the end gives.
+    let mut leaker = Leaker::new();
+    for item in [&s1, &s2, &s3] {
+        leaker.intern_struct(item, true);
+    }
+    let at_once = leaker.result().finish().unwrap();
+    assert_eq!(
+        kept(&at_once),
+        [
+            "required (R1 , R2) 0",
+            "required Rel 0",
+            "optional :: ext :: X 0",
+            "optional :: std :: string :: String 0",
+        ]
+    );
+}
+
+/// A later parent of a kept entry does not replace it: the entry stays one, and the parent is
+/// built from it (`((R1, R2), R3)`), or is an entry as well if it is leaked whole (`&'a (R1, R2)`,
+/// `::ext::W<(R1, R2)>`, which a Referrer replaces whatever it holds).
+#[test]
+fn test_reduce_roots_a_later_parent_of_a_kept_entry() {
+    let s1: ItemStruct = parse_quote! { struct S1 { a: (R1, R2) } };
+    let s2: ItemStruct = parse_quote! {
+        struct S2<'a> { b: ((R1, R2), R3), c: &'a (R1, R2), d: ::ext::W<(R1, R2)> }
+    };
+    let mut leaker = Leaker::new();
+    let c1 = leaker.intern_struct(&s1, true);
+    leaker.reduce_roots();
+    let c2 = leaker.intern_struct(&s2, true);
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(
+        kept(&referrer),
+        [
+            "required (R1 , R2) 0",
+            "required :: ext :: W < (R1 , R2) > 0",
+            "required R3 0",
+            "required & 'a (R1 , R2) 1",
+        ]
+    );
+    let (copy1, copy2): (ItemStruct, ItemStruct) = (
+        parse_quote! { struct S1 { a: P<0usize> } },
+        parse_quote! {
+            struct S2<'a> { b: (P<0usize>, P<2usize>), c: P<3usize>, d: P<1usize> }
+        },
+    );
+    assert_eq!(copy_of(&referrer, c1, &s1), copy1);
+    assert_eq!(copy_of(&referrer, c2, &s2), copy2);
+    // Nothing differs but the order, for one reduction at the end.
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&s1, true);
+    leaker.intern_struct(&s2, true);
+    assert_eq!(kept(&leaker.result().finish().unwrap()), kept(&referrer));
+}
+
+/// The result does not depend on the hash order of the sets that the Leaker keeps.
+#[test]
+fn test_reduce_roots_interning_after_it_is_deterministic() {
+    let run = || -> String {
+        let mut leaker = Leaker::new();
+        for (ix, item) in prune_cases().iter().enumerate() {
+            feed(&mut leaker, item);
+            if ix % 2 == 0 {
+                leaker.reduce_roots();
+            }
+        }
+        let referrer = leaker.result().finish().unwrap();
+        quote!(#referrer).to_string()
+    };
+    let first = run();
+    for _ in 0..16 {
+        assert_eq!(run(), first);
+    }
+}
+
+/// A kept entry stays one when a later scope forbids it: that scope may get a copy that does not
+/// compile, which is the price of pruning (the doc of `reduce_roots()`).
+///
+/// The type `W2<W1<T, Rel<U>>, Rel3<U>>` is one required entry in a scope of its own (one cut for
+/// two required types). The self type of the impl is the same type in the same context, but the
+/// impl has `Self` in a predicate and a bound of `T` that names a leaked type, so rustc could not
+/// normalize the impl of the Repeater for the whole self type. In that scope the Leaker chooses its
+/// parts, `Rel<U>` and `Rel3<U>`, and does so when it reduces once, at the end.
+#[test]
+fn test_reduce_roots_a_kept_entry_stays_when_a_later_scope_forbids_it() {
+    let generics: Generics = parse_quote! { <T: Fn(Rel2<u8>), U> };
+    let ty: Type = parse_quote! { ::p::W2<::p::W1<T, Rel<U>>, Rel3<U>> };
+    let item: ItemImpl = parse_quote! {
+        impl<T: Fn(Rel2<u8>), U> ::p::Tr<U> for ::p::W2<::p::W1<T, Rel<U>>, Rel3<U>>
+        where
+            Self: Clone,
+        {
+        }
+    };
+    let copy_with = |reduce: bool| {
+        let mut leaker = Leaker::from_config(Rules::new().prelude().primitive(), Options::new());
+        leaker.enter_generics(&generics, |view| view.visit_type(&ty));
+        if reduce {
+            leaker.reduce_roots();
+        }
+        let context = leaker.intern_impl(&item, true);
+        let referrer = leaker.result().finish().unwrap();
+        let mut copy = item.clone();
+        let mut visitor = referrer.visitor(context, |_, ix| parse_quote!(P<#ix>));
+        syn::visit_mut::VisitMut::visit_item_impl_mut(&mut visitor, &mut copy);
+        (kept(&referrer), copy)
+    };
+    let (entries, copy) = copy_with(false);
+    assert_eq!(
+        entries,
+        [
+            "required Rel < U > 1",
+            "required Rel3 < U > 1",
+            "required Rel2 < u8 > 2"
+        ]
+    );
+    let expected: ItemImpl = parse_quote! {
+        impl<T: Fn(P<2usize>), U> ::p::Tr<U> for ::p::W2<::p::W1<T, P<0usize>>, P<1usize>>
+        where
+            Self: Clone,
+        {
+        }
+    };
+    assert_eq!(copy, expected);
+
+    // After `reduce_roots()` the type is kept as the entry that it was. The impl is copied with the
+    // self type replaced as a whole.
+    let (entries, copy) = copy_with(true);
+    assert_eq!(
+        entries,
+        [
+            "required :: p :: W2 < :: p :: W1 < T , Rel < U > > , Rel3 < U > > 0",
+            "required Rel2 < u8 > 2"
+        ]
+    );
+    let expected: ItemImpl = parse_quote! {
+        impl<T: Fn(P<1usize>), U> ::p::Tr<U> for P<0usize>
+        where
+            Self: Clone,
+        {
+        }
+    };
+    assert_eq!(copy, expected);
 }
