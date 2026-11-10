@@ -6,6 +6,7 @@
 #[cfg(type_leak_diagnostic)]
 extern crate proc_macro;
 
+mod allow;
 mod analysis;
 mod analyze;
 mod config;

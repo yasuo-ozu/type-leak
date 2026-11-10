@@ -3,7 +3,7 @@
 //! The generator writes `Sized`, `?Sized`, `Send`, `Fn(..)`, `Into<..>`, `Iterator`, ... in bounds,
 //! where clauses, supertraits and trait objects, sometimes bare and sometimes in full
 //! (`::core::marker::Sized`). The Leaker leaves a bare one as written only if the configuration
-//! allows the names of the prelude (`LeakerConfig::allow_std_prelude()`), so:
+//! allows the names of the prelude (`LeakerConfig::allow_prelude()`), so:
 //!
 //! - With the prelude allowed, the item with the bare spelling and the same item with the absolute
 //!   one (its twin) must give the same entries, the same contexts and the same errors: the spelling

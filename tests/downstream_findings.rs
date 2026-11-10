@@ -53,7 +53,7 @@ fn messages(errors: &[ErrorItem]) -> String {
 
 fn config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     config
 }
 
@@ -859,7 +859,7 @@ fn help_for(path: &str) -> String {
     let example = path.replace(' ', "");
     format!(
         "write `{}` with an absolute path (e.g. `::my_crate::{}`), or allow it with \
-         `LeakerConfig::allowed_paths`",
+         `LeakerConfig::allow_path()`",
         example, example
     )
 }

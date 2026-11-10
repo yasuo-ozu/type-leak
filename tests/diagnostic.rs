@@ -256,13 +256,13 @@ fn every_offending_path_is_an_error_of_its_own() {
             "use absolute path: 'MyType < '_ >'",
             "15:20",
             &[because],
-            &["write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with `LeakerConfig::allowed_paths`"],
+            &["write `MyType` with an absolute path (e.g. `::my_crate::MyType`), or allow it with `LeakerConfig::allow_path()`"],
         ),
         error(
             "use absolute path: 'Other < '_, :: core :: primitive :: u8 >'",
             "15:35",
             &[because],
-            &["write `Other` with an absolute path (e.g. `::my_crate::Other`), or allow it with `LeakerConfig::allowed_paths`"],
+            &["write `Other` with an absolute path (e.g. `::my_crate::Other`), or allow it with `LeakerConfig::allow_path()`"],
         ),
         error(
             "use absolute path: 'Sync'",
@@ -421,9 +421,9 @@ fn position_in_leaker(marker: &str, needle: &str) -> String {
 }
 
 /// The errors of the item `Denied` (`id = 9193` in the Leaker's crate) that the invocation does not
-/// allow are reported in the Referrer's crate, and the one it allows (`Clone`, with `allow(prelude)`)
-/// is not: `core::fmt::Debug` is not the prelude, and `Held<'_>` is no path at all. They are at the
-/// invocation, as rustc has it for the spans of a macro of another crate.
+/// allow are reported in the Referrer's crate, and the one it allows (`Clone`, with `allow(trait
+/// Clone)`) is not: `core::fmt::Debug` and `Held<'_>` are. They are at the invocation, as rustc has
+/// it for the spans of a macro of another crate.
 #[test]
 fn errors_the_referrers_macro_does_not_allow_are_reported_in_its_crate() {
     let built = nested::cargo("diagnostic_result", &["check"], &[]);
@@ -433,13 +433,13 @@ fn errors_the_referrers_macro_does_not_allow_are_reported_in_its_crate() {
             "use absolute path: 'Held < '_ >'",
             "11:1",
             &["it cannot be leaked as a whole because of `'_`"],
-            &["write `Held` with an absolute path (e.g. `::my_crate::Held`), or allow it with `LeakerConfig::allowed_paths`"],
+            &["write `Held` with an absolute path (e.g. `::my_crate::Held`), or allow it with `LeakerConfig::allow_path()`"],
         ),
         error(
             "use absolute path: 'core :: fmt :: Debug'",
             "11:1",
             &[],
-            &["write `core::fmt::Debug` with an absolute path (e.g. `::my_crate::core::fmt::Debug`), or allow it with `LeakerConfig::allowed_paths`"],
+            &["write `core::fmt::Debug` with an absolute path (e.g. `::core::fmt::Debug`), or allow it with `LeakerConfig::allow_path()`"],
         ),
     ];
     let mut got = reported(&built.stderr);

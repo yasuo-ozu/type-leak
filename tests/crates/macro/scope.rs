@@ -155,7 +155,7 @@ impl ScopeInput {
             config.allow_primitive();
         }
         if self.prelude {
-            config.allow_std_prelude();
+            config.allow_prelude();
         }
         let mut leaker = Leaker::from_config(config);
         let visit = |view: &mut View<'_>| {

@@ -11,18 +11,21 @@
 //! The spans of the errors that are read back are checked by `tests/crates/spans`
 //! (`a_serialized_leaker_result_keeps_its_spans`).
 
+mod common;
+
+use common::allow_every_cause;
 use proc_macro2::{Literal, TokenStream, TokenTree};
 use syn::parse::Parser;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
 
-/// A trait and a struct that go wrong in several ways: a trait in a bound, a type with an elided
-/// lifetime, a path of the prelude with one, a trait object, and a trait in an argument. There are
-/// entries, a required one and an optional one.
+/// A trait and a struct that go wrong in several ways: a trait in a bound, a path of the standard
+/// library in a bound, a type with an elided lifetime, a path of the prelude with one, a trait
+/// object, and a trait in an argument. There are entries, a required one and an optional one.
 fn with_errors() -> LeakerResult {
     let tr: ItemTrait = parse_quote!(
-        trait Tr<T>: Clone {
+        trait Tr<T>: Clone + core::fmt::Debug {
             fn f(&self, a: MyType<'_>, b: Vec<Rel<'_>>, c: Box<dyn RelA + RelB<'_>>) -> Wrap<T>;
             fn g(&self, x: ::foo::X) -> Rel;
         }
@@ -69,14 +72,18 @@ fn describe(item: &ErrorItem) -> String {
         .help
         .as_ref()
         .map(|(at, help)| format!("({}) {}", at, help));
+    let paths: Vec<String> = item.paths.iter().map(text).collect();
     format!(
-        "{:?} {} | {:?} | {} | {:?} | {:?}",
+        "{:?} {} | {:?} | {} | {:?} | {:?} | value {} default {} paths {:?}",
         std::mem::discriminant(&item.cause),
         item.cause.to_token_stream(),
         item.reason,
         item.message,
         notes,
-        help
+        help,
+        item.in_value,
+        item.in_default,
+        paths
     )
 }
 
@@ -142,9 +149,9 @@ fn a_result_with_errors_is_written_and_read_back() {
     );
 }
 
-/// `allow(cause)`, `allow_prelude()` and `allow_std_crates()` drop the same errors after the trip as
-/// before it, each step and all of them, and so does writing the rest again. Accepting every cause
-/// leaves a Referrer that `finish()` returns, equal to the original.
+/// `allow(cause)` and `allow_std_crates()` drop the same errors after the trip as before it, each
+/// step and all of them, and so does writing the rest again. Accepting every cause leaves a Referrer
+/// that `finish()` returns, equal to the original.
 #[test]
 fn allowing_after_the_round_trip_drops_the_same_errors() {
     let result = with_errors();
@@ -160,15 +167,12 @@ fn allowing_after_the_round_trip_drops_the_same_errors() {
         assert_eq!(describe_all(&after), describe_all(&before));
     }
     let (mut before, mut after) = (result.clone(), read_back.clone());
-    before.allow_prelude();
-    after.allow_prelude();
-    // `Clone`, `Vec<Rel<'_>>` and `Box<dyn ..>` start with names of the prelude, `MyType<'_>` and
-    // `dyn RelTr` do not.
-    let remaining: Vec<String> = before.errors().iter().map(|e| text(&e.cause)).collect();
-    assert_eq!(remaining, ["MyType < '_ >", "RelTr"]);
-    assert_eq!(describe_all(&after), describe_all(&before));
     before.allow_std_crates();
     after.allow_std_crates();
+    // `core::fmt::Debug` is the only cause that starts with the name of a crate of the library.
+    let remaining: Vec<String> = before.errors().iter().map(|e| text(&e.cause)).collect();
+    assert_eq!(remaining.len(), result.errors().len() - 1);
+    assert!(!remaining.contains(&"core :: fmt :: Debug".to_string()));
     assert_eq!(describe_all(&after), describe_all(&before));
 
     // What remains is written and read again, with the same Referrer.
@@ -177,11 +181,86 @@ fn allowing_after_the_round_trip_drops_the_same_errors() {
     assert_eq!(rest.into_referrer(), referrer);
 
     let mut all = read_back;
-    for cause in causes {
-        all.allow(cause);
-    }
+    allow_every_cause(&mut all);
     assert!(all.errors().is_empty());
     assert_eq!(all.finish().unwrap(), referrer);
+}
+
+/// The path, value and default rules (`LeakerResult::allow_path()` and the others) give the same
+/// errors on the other side of the trip. A path rule leaves the paths it does not allow in the
+/// error, which is serialized with them, so rules given in two macros add up as they do in one.
+#[test]
+fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() {
+    let item: ItemTrait = parse_quote!(
+        trait Tr<U = Rel<'_>>: core::fmt::Debug {
+            const N: usize = inner::N;
+            fn f(&self, a: Vec<Rel2<'_>>, b: my::W<'_, Rel3>) {
+                let _ = inner::f();
+            }
+        }
+    );
+    let mut config = LeakerConfig::new();
+    config.allow_primitive().check_values();
+    let mut leaker = Leaker::from_config(config);
+    leaker.intern_trait(&item, true);
+    let result = leaker.result();
+    assert!(result.errors().iter().any(|e| e.in_value && e.in_default));
+    assert!(result.errors().iter().any(|e| e.paths.len() > 1));
+    let read_back = read(result.to_token_stream()).unwrap();
+    assert_eq!(describe_all(&read_back), describe_all(&result));
+
+    type Rule = fn(&mut LeakerResult);
+    let rules: [(&str, Rule); 7] = [
+        ("path", |r| {
+            r.allow_path(parse_quote!(my));
+        }),
+        ("prelude", |r| {
+            r.allow_prelude();
+        }),
+        ("std crates", |r| {
+            r.allow_std_crates();
+        }),
+        ("crate", |r| {
+            r.allow_crate();
+        }),
+        ("primitive", |r| {
+            r.allow_primitive();
+        }),
+        ("values", |r| {
+            r.allow_values();
+        }),
+        ("default", |r| {
+            r.allow_default();
+        }),
+    ];
+    let mut dropped_something = 0;
+    for (name, rule) in rules {
+        let (mut before, mut after) = (result.clone(), read_back.clone());
+        rule(&mut before);
+        rule(&mut after);
+        assert_eq!(describe_all(&after), describe_all(&before), "{}", name);
+        if before.errors().len() < result.errors().len()
+            || describe_all(&before) != describe_all(&result)
+        {
+            dropped_something += 1;
+        }
+        // The rest is written and read again, and a second rule on the other side of that trip
+        // gives what both rules give on one side.
+        for (second_name, second) in rules {
+            let mut together = before.clone();
+            second(&mut together);
+            let mut trip = read(before.to_token_stream()).unwrap();
+            second(&mut trip);
+            assert_eq!(
+                describe_all(&trip),
+                describe_all(&together),
+                "{} then {}",
+                name,
+                second_name
+            );
+        }
+    }
+    assert!(dropped_something >= 3);
 }
 
 /// The tokens after the result are left for the caller: an ident and a `;` after the errors, and

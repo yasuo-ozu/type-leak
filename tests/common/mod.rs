@@ -2,7 +2,7 @@ use proc_macro2::TokenStream;
 use std::collections::BTreeSet;
 use syn::*;
 use template_quote::quote;
-use type_leak::{CheckResult, ContextId, Leaker, View};
+use type_leak::{Cause, CheckResult, ContextId, Leaker, LeakerConfig, LeakerResult, View};
 
 /// Converts the required types of a `Referrer` (see `Referrer::must()`) to a `BTreeSet<String>`
 /// for order-independent comparison. The optional ones, which only the paths of external crates
@@ -62,4 +62,66 @@ pub fn enter_function(leaker: &mut Leaker, sig: &Signature) -> (ContextId, ()) {
 #[allow(dead_code)]
 pub fn check_in(leaker: &mut Leaker, ty: &Type, generics: &Generics) -> CheckResult {
     leaker.enter_generics(generics, |view| view.check(ty)).1
+}
+
+/// Allows the cause of every error that remains, until none does, and returns how many rounds it took.
+/// Dropping an error puts its nested errors in its place ([`type_leak::ErrorItem::nested`]), whose
+/// causes are not those of the errors that were there, so one round may not be enough.
+#[allow(dead_code)]
+pub fn allow_every_cause(result: &mut LeakerResult) -> usize {
+    let mut rounds = 0;
+    while !result.errors().is_empty() {
+        let causes: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
+        for cause in causes {
+            result.allow(cause);
+        }
+        rounds += 1;
+    }
+    rounds
+}
+
+/// One of the `allow*()` operations that `LeakerConfig` and `LeakerResult` share, so that a test can
+/// give the same rule to either.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub enum Rule {
+    Cause(Cause),
+    Path(Path),
+    Primitive,
+    Prelude,
+    StdCrates,
+    Crate,
+    Values,
+    Default,
+}
+
+#[allow(dead_code)]
+impl Rule {
+    /// Gives the rule to the config: it is applied during the analysis.
+    pub fn on_config(&self, config: &mut LeakerConfig) {
+        match self {
+            Rule::Cause(cause) => config.allow(cause.clone()),
+            Rule::Path(path) => config.allow_path(path.clone()),
+            Rule::Primitive => config.allow_primitive(),
+            Rule::Prelude => config.allow_prelude(),
+            Rule::StdCrates => config.allow_std_crates(),
+            Rule::Crate => config.allow_crate(),
+            Rule::Values => config.allow_values(),
+            Rule::Default => config.allow_default(),
+        };
+    }
+
+    /// Gives the rule to the result: it is applied after the analysis.
+    pub fn on_result(&self, result: &mut LeakerResult) {
+        match self {
+            Rule::Cause(cause) => result.allow(cause.clone()),
+            Rule::Path(path) => result.allow_path(path.clone()),
+            Rule::Primitive => result.allow_primitive(),
+            Rule::Prelude => result.allow_prelude(),
+            Rule::StdCrates => result.allow_std_crates(),
+            Rule::Crate => result.allow_crate(),
+            Rule::Values => result.allow_values(),
+            Rule::Default => result.allow_default(),
+        };
+    }
 }

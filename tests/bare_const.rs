@@ -119,7 +119,7 @@ fn absolute(name: &str) -> String {
     )
 }
 
-const ALLOW: &str = "allow it with `LeakerConfig::allowed_paths`";
+const ALLOW: &str = "allow it with `LeakerConfig::allow_path()`";
 const ALLOW_SELF: &str = "analyze the item with `allow_self = true`";
 
 /// The note that says what the holder cannot be leaked because of.
@@ -174,7 +174,7 @@ fn a_bare_identifier_beside_a_denied_self_is_not_leaked_as_a_type() {
          \n\
          \x20 = note: it cannot be leaked as a whole because of `Self`\n\
          \x20 = help: write `ILEN` with an absolute path (`::my_crate::ILEN`, or \
-         `{ ::my_crate::ILEN }` for a const), allow it with `LeakerConfig::allowed_paths`, or \
+         `{ ::my_crate::ILEN }` for a const), allow it with `LeakerConfig::allow_path()`, or \
          analyze the item with `allow_self = true`\n"
     );
     // With `Self` allowed the path is the entry: it holds `ILEN` for a type and for a const.
@@ -204,7 +204,7 @@ fn a_bare_identifier_beside_a_denied_self_is_not_leaked_as_a_type() {
     }
     // Allowed by the config: left as written, so it is no cause either.
     let mut config = LeakerConfig::new();
-    config.allowed_paths.push(parse_quote!(ILEN));
+    config.allow_path(parse_quote!(ILEN));
     let referrer = analyze_with(Leaker::from_config(config), &item, false).unwrap();
     assert!(entries(&referrer).is_empty());
 }
@@ -918,7 +918,7 @@ fn module_with(nested: bool, ilen: &str, place: &str, holder: &str) -> Item {
 /// The config of the tests of modules: primitives and the prelude (`Vec`, `Box`, ..) are copied.
 fn module_config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     config
 }
 
@@ -982,7 +982,7 @@ fn a_bare_identifier_beside_a_name_the_module_declares_is_not_leaked_as_a_type()
          declares again, so it is not leaked as a whole\n\
          \x20 = help: write `ILEN` with an absolute path (`::my_crate::ILEN`, or \
          `{ ::my_crate::ILEN }` for a const), import `ILEN` with an absolute `use` \
-         (`use ::my_crate::ILEN;`), or allow it with `LeakerConfig::allowed_paths`\n"
+         (`use ::my_crate::ILEN;`), or allow it with `LeakerConfig::allow_path()`\n"
     );
 }
 
@@ -1031,7 +1031,7 @@ fn a_name_the_module_declares_beside_the_identifier_is_no_cause_if_the_identifie
     // Allowed by the config: left as written, so it is no cause either.
     let item = module_with(true, imported(true), place, "::l::BC<$RC<u8, 3>, ILEN>");
     let mut config = module_config();
-    config.allowed_paths.push(parse_quote!(ILEN));
+    config.allow_path(parse_quote!(ILEN));
     let referrer = analyze_with(Leaker::from_config(config), &item, true).unwrap();
     assert!(entries(&referrer).is_empty());
 }

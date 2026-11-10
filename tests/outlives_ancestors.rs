@@ -27,7 +27,7 @@ fn s(x: &impl template_quote::ToTokens) -> String {
 
 fn leaker() -> Leaker {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     Leaker::from_config(config)
 }
 

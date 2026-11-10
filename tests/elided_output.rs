@@ -31,7 +31,7 @@ use type_leak::{to_syn_error, Cause, ErrorItem, Leaker, LeakerConfig, Referrer};
 
 fn leaker() -> Leaker {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     Leaker::from_config(config)
 }
 

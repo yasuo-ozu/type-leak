@@ -33,7 +33,7 @@ fn text<T: ToTokens>(t: &T) -> String {
 
 fn config() -> LeakerConfig {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     config
 }
 

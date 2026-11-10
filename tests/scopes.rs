@@ -927,7 +927,7 @@ fn the_error_of_an_inner_scope_is_part_of_the_outer_one() {
 /// A Leaker that allows the primitive types and the names of the standard prelude.
 fn leaker_with_std() -> Leaker {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
+    config.allow_primitive().allow_prelude();
     Leaker::from_config(config)
 }
 

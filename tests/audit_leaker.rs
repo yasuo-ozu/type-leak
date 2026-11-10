@@ -198,7 +198,7 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
     assert!(
         err.contains(
             "= help: write `RelTr` with an absolute path (e.g. `::my_crate::RelTr`), allow it \
-             with `LeakerConfig::allowed_paths`, or name the lifetime of the trait object (e.g. \
+             with `LeakerConfig::allow_path()`, or name the lifetime of the trait object (e.g. \
              `&'a dyn Trait` or `dyn Trait + 'a`)\n"
         ),
         "{}",
@@ -301,7 +301,7 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
     }
     // Unless it is allowed, as `::core` is.
     let mut allowed = config();
-    allowed.allowed_paths.push(parse_quote!(::p));
+    allowed.allow_path(parse_quote!(::p));
     let referrer = leak_trait_with(
         allowed,
         &parse_quote! { trait Tr { fn f<'a>(&self, x: &'a dyn RelTr, y: &'a dyn ::p::Tr) -> &'a (); } },

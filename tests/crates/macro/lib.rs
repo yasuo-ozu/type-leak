@@ -32,8 +32,10 @@
 //! ```
 
 mod bare;
+mod nested;
 mod prop;
 mod scope;
+mod shared;
 
 use proc_macro2::{Punct, Spacing, Span, TokenStream, TokenTree};
 use std::collections::HashMap;
@@ -173,6 +175,17 @@ pub(crate) fn check_plain(referrer: &Referrer, ix: usize, slots: &RepeaterSlots)
             quote!(#ty)
         ),
     ))
+}
+
+/// Allows the cause of every error that remains, until none does: an error that is dropped puts its
+/// nested errors in its place (`ErrorItem::nested`), which have causes of their own.
+pub(crate) fn allow_every_cause(result: &mut LeakerResult) {
+    while !result.errors().is_empty() {
+        let causes: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
+        for cause in causes {
+            result.allow(cause);
+        }
+    }
 }
 
 /// The errors of the Leaker, reported with `ErrorItem::to_compile_error()` (a `Diagnostic` on
@@ -434,7 +447,9 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let mut leaker = Leaker::from_config({
         let mut config = LeakerConfig::new();
         config.allow_primitive();
-        config.allowed_paths.extend(allowed);
+        for path in allowed {
+            config.allow_path(path);
+        }
         config
     });
     match &item {
@@ -486,8 +501,10 @@ pub fn leak(
 fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let mut leaker = Leaker::from_config({
         let mut config = LeakerConfig::new();
-        config.allow_primitive().allow_std_prelude();
-        config.allowed_paths.extend(args.allow.clone());
+        config.allow_primitive().allow_prelude();
+        if let Some(path) = args.allow.clone() {
+            config.allow_path(path);
+        }
         config
     });
     let context = leaker.intern_trait(&item_trait, true);
@@ -1108,6 +1125,46 @@ pub fn scope_errors(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 #[proc_macro]
 pub fn __scope_apply(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     match scope::apply(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Analyzes types in an impl nested in the scope of a trait, and exports the macro that copies them
+/// in another crate: see `nested.rs`.
+#[proc_macro]
+pub fn nested_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match nested::leak(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// The Referrer's side of `nested_leak!`, invoked through the `macro_rules!` that it exports.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __nested_apply(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match nested::apply(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Analyzes several items with one Leaker, and exports the macro that copies each of them alone in
+/// another crate: see `shared.rs`.
+#[proc_macro]
+pub fn shared_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match shared::leak(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// The Referrer's side of `shared_leak!`, invoked through the `macro_rules!` that it exports.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __shared_apply(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match shared::apply(input.into()) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }

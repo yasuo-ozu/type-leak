@@ -1,5 +1,6 @@
 //! The [`Leaker`], which finds the types depending on the type context.
 
+use crate::allow::Allow;
 use crate::analysis::{drop_optional, names_self, Analysis, PartItem};
 use crate::analyze::{declared_names, AnalyzeVisitor, Finished, ModuleNames, ScopeSpec, Scopes};
 use crate::config::LeakerConfig;
@@ -9,7 +10,7 @@ use crate::error::Reason;
 use crate::error::{Cause, ErrorItem};
 use crate::graph::{is_whole_reference, NodeKey, TypeGraph};
 use crate::referrer::Referrer;
-use crate::util::{ident_name, std_crate_paths, std_prelude_paths, AllowedPaths};
+use crate::util::{ident_name, AllowedPaths};
 use crate::view::View;
 use proc_macro2::{Span, TokenStream};
 use safegraph::algo::max_flow::edmonds_karp_with_flows;
@@ -49,8 +50,13 @@ use template_quote::{quote, ToTokens};
 /// An error does not stop the analysis: the Leaker copies the part that cannot be interned as
 /// written, whole, with nothing in it leaked (`Rel` in `MyType<'_, Rel>` stays as written). The
 /// errors are kept, each once, in the order found (those of nested scopes in place), and read
-/// through [`Leaker::result()`]. If a closure panics, its scope rolls back and records nothing. The
-/// [`Referrer`] does not depend on what is allowed afterwards ([`LeakerResult`]).
+/// through [`Leaker::result()`]. If a closure panics, its scope rolls back and records nothing.
+///
+/// What you allow drops errors, with the same methods on [`LeakerConfig`] (when the outermost call
+/// ends) and on [`LeakerResult`] (after the analysis). The [`Referrer`] does not depend on a cause,
+/// a value or a default being allowed. Allowing a path in the config also makes it context-free
+/// for the analysis: it is not leaked, so there is no entry for it. On the result it only drops
+/// errors, and the entries stay.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
@@ -77,7 +83,7 @@ use template_quote::{quote, ToTokens};
 /// - `MyType<'_>`, `impl Trait`, and a relative trait or value in a bound: write an absolute path.
 ///   (`T: ?Sized` is left as written: rustc allows `?` only on the language's `Sized`. A bound
 ///   `Sized`, as in `Self: Sized`, is a relative trait like `Clone`:
-///   [`allow_std_prelude()`](LeakerConfig::allow_std_prelude).)
+///   [`allow_prelude()`](LeakerConfig::allow_prelude).)
 /// - A path whose definition needs `T: 'a` ([Outlives bounds](#outlives-bounds)).
 /// - An output lifetime that only a leaked type would keep ([Binder](#binder-lifetimes),
 ///   [Elided](#elided-lifetimes) and [Method](#method-lifetimes) lifetimes).
@@ -87,7 +93,7 @@ use template_quote::{quote, ToTokens};
 ///   ([`allow_self`](Leaker::intern_struct)).
 /// - A bare identifier that may be a const ([Bare identifiers](#bare-identifiers-and-consts)).
 /// - An absolute path of another crate, trusted only if both crates have it
-///   ([`allowed_paths`](Leaker::allowed_paths)).
+///   ([`allow_path()`](LeakerConfig::allow_path)).
 /// - A shadowed primitive name (`type u8 = i32;`): emit [`Leaker::assertions()`] to catch it.
 /// - A value: the default of an associated const, the value of a const or static, and the body of a
 ///   function are not analyzed, so a relative path in them (`const N: usize = inner::N;`, or a
@@ -139,12 +145,14 @@ use template_quote::{quote, ToTokens};
 /// An elided output lifetime comes from the only input lifetime, and a leaked type adds more. So
 /// the whole function pointer or trait object is leaked, which is an error in a bound, in `impl
 /// Fn(..)`, under an elided reference, and in a method without a reference receiver. A hidden
-/// lifetime (`Ref<u8>`) is not seen: write `Ref<'_, u8>`.
+/// lifetime (`Ref<u8>`) is not seen: write `Ref<'_, u8>`. rustc counts the lifetimes of each input
+/// apart, so a leaked type adds one even if another input has it.
 ///
 /// ```ignore
 /// fn f(&self, x: Box<dyn Fn(&Rel<T>) -> &u8>);  // good: the trait object is leaked whole
 /// fn f(&self, x: &dyn Fn(&Rel<T>) -> &u8);      // error: elided reference
 /// fn g<'x>(x: &'x Rel<T>) -> &'x u8;            // good: the lifetimes are named
+/// fn g(x: &'a u8, y: Rel<T>) -> &u8;            // error: `Rel<T>` names `'a` too (`T: 'a`)
 /// ```
 ///
 /// ## Trait objects
@@ -167,6 +175,10 @@ use template_quote::{quote, ToTokens};
 /// fn f<'b>(&self, x: Wrap<'b>) -> &'b u8;       // error
 /// fn f<'b>(&'b self, x: Wrap<'b>) -> &'b u8;    // good: `&'b self` keeps `'b`
 /// ```
+///
+/// An absolute type of another crate that is the only one to keep `'b` (`fn f<'b>(&self, x:
+/// ::ext::V<'b>) -> &'b u8`) is no optional entry: every Referrer copies it as written, so its
+/// crate must resolve there.
 ///
 /// ## Bounds that name leaked types
 ///
@@ -197,10 +209,12 @@ use template_quote::{quote, ToTokens};
 /// `T: Iterator<Item = Wrap<T>>`), the bounds of other generics (`U: Fn(T::Item)`: the Leaker still
 /// rejects it where it is written as a projection, and does not see an alias), a bound of a
 /// predicate of an inner scope (a method's where clause) and the other bounds of `T` stay. So do
-/// all the bounds in the context of an entry that depends on `Self` as a type or an implementor
-/// (the self type of the item, `Self::A` of its trait), and of one that writes out the self type of
-/// the item (`impl<T: Iterator<Item = u8> + Fn(T::Item)> S<T>` with the entry `S<T>`): the Leaker
-/// knows that such a type is well-formed only with the bounds that its item declares.
+/// all the bounds in the context of an entry that names `Self` (the self type of the item,
+/// `Self::A` of its trait), and of one that writes out the self type of the item (`impl<T:
+/// Iterator<Item = u8> + Fn(T::Item)> S<T>` with the entry `S<T>`): the Leaker knows that such a
+/// type is well-formed only with the bounds that its item declares. An entry that depends on `Self`
+/// only through a bound or an outlives predicate (`Self: 'x`) keeps whole the bounds of the
+/// generics that the description of `Self` names (`impl<T: ..> S<T>`, `Tr<T>`), and no others.
 ///
 /// The leaked type must not need a bound that is left out: with `struct Rel<T: Fn(Alias<T>)>(T);`
 /// and `T: Iterator<Item = u8> + Fn(Alias<T>)`, the Repeater's impl of `Rel<T>` has only `T:
@@ -232,7 +246,7 @@ use template_quote::{quote, ToTokens};
 /// (`Other<Local, MY_CONST>`: the copy declares `Local` again, so the path is not leaked as a
 /// whole, and the Leaker knows nothing of the parameters of `Other`).
 /// Write the identifier so that it is not leaked: an absolute path, which a const needs in braces,
-/// a name in [`allowed_paths`](Leaker::allowed_paths), or, in a module, a name that the module
+/// a name in [`allow_path()`](LeakerConfig::allow_path), or, in a module, a name that the module
 /// declares (a declaration, or `use` with an absolute path), which is copied as written.
 ///
 /// ```ignore
@@ -247,24 +261,9 @@ use template_quote::{quote, ToTokens};
 /// ```
 #[derive(Default)]
 pub struct Leaker {
-    /// Paths that are left as written instead of being leaked, such as `::serde`.
-    ///
-    /// A path matches if it starts with one of these, and both have a leading `::` or neither:
-    /// `parse_quote!(::serde)` allows `::serde::..` and not `serde::..`. Its generic arguments are
-    /// still analyzed. You promise that an allowed crate is the same on both sides.
-    ///
-    /// Another absolute path, such as `::serde::Wrap<(Rel,)>`, may name a different crate in the
-    /// copy, which the Leaker cannot tell. So it is leaked as an *optional entry*
-    /// ([`Referrer::must()`] is `false`), and the Referrer chooses whether a copy replaces it
-    /// ([`Referrer::allow_ambiguous_crate_name()`]). `::core::..` and `$crate::..` are never
-    /// optional, and `::std` and `::alloc` are like any other crate unless allowed.
-    /// [`Referrer::external_crates_require()`] lists the crates an entry names.
-    ///
-    /// Not so for an absolute type that names the `Self` of a struct, an enum or a union nested in
-    /// the analyzed syntax (`::serde::Wrap<Self>` in [`View::visit_item()`]): it is copied as
-    /// written whatever the Referrer chooses, so that its `Self` is the copy's own type (see
-    /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self)).
-    pub allowed_paths: Vec<Path>,
+    /// What the configuration allows: the paths that are left as written instead of being leaked,
+    /// and the errors that are not recorded.
+    allow: Allow,
     /// The types that depend on the context (the required entries).
     types: TypeGraph,
     /// The types the Referrer may replace (the optional entries).
@@ -290,15 +289,16 @@ pub struct Leaker {
 }
 
 impl Leaker {
-    /// Creates a [`Leaker`] that allows no path, so every relative path is leaked.
+    /// Creates a [`Leaker`] that allows nothing, so every relative path is leaked.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Creates a [`Leaker`] that leaves the paths allowed by `config` as written.
+    /// Creates a [`Leaker`] that leaves the paths allowed by `config` as written, and records
+    /// only the errors that it does not accept.
     pub fn from_config(config: LeakerConfig) -> Self {
         Self {
-            allowed_paths: config.allowed_paths,
+            allow: config.allow,
             check_values: config.check_values,
             nested_self_entries: config.nested_self_entries,
             ..Self::default()
@@ -714,7 +714,7 @@ impl Leaker {
         // The parts are looked up by their contexts too.
         for item in &self.parts {
             let anchor = item.within.iter().map(|(_, id)| *id);
-            for id in std::iter::once(item.context).chain(anchor) {
+            for id in item.context.into_iter().chain(anchor) {
                 context_map.entry(id).or_insert_with(|| context_of(id));
             }
         }
@@ -791,9 +791,21 @@ impl Leaker {
 /// What a [`Leaker`] found: the [`Referrer`], and the errors that remain.
 ///
 /// [`Leaker::result()`] returns it with every error of the analysis
-/// ([recovery](Leaker#errors-and-recovery)). The `allow*` methods drop the errors you accept. They
-/// never change the Referrer, which has every rejected part copied as written either way. Take the
-/// Referrer with [`finish()`](LeakerResult::finish) if no error remains, or with
+/// ([recovery](Leaker#errors-and-recovery)). The `allow*` methods drop the errors you accept, by the
+/// rules of the same methods of [`LeakerConfig`], and never change the Referrer, which has every
+/// rejected part copied as written either way. A path rule drops an error only if every relative
+/// path of it ([`ErrorItem::paths`]) is allowed, and removes the paths it allows from the others:
+/// `Vec<Rel<'_>>` stays after `allow_prelude()`, where a config reports `Rel<'_>`. The
+/// [nested errors](ErrorItem::nested) of an error that is dropped come up in its place, whichever
+/// rule dropped it, and the same rules filter them: allow the causes until `errors()` is empty.
+///
+/// A path rule here only approximates the same rule on a [`LeakerConfig`]: it judges an analysis
+/// made without the rule. So it can leave more errors than the config would, or in rare cases fewer
+/// (a relative bound is copied whole and not looked into), and the entries that the config would
+/// leave as written stay entries, which can make a copy fail to build where the config's builds.
+/// Give a path rule to the config when you can.
+///
+/// Take the Referrer with [`finish()`](LeakerResult::finish) if no error remains, or with
 /// [`into_referrer()`](LeakerResult::into_referrer) whatever remains.
 ///
 /// [`ToTokens`] and [`Parse`] pass it to another macro, which can then decide what to allow.
@@ -804,12 +816,22 @@ pub struct LeakerResult {
 }
 
 impl LeakerResult {
+    /// Drops the errors that the rules in `rules` accept.
+    fn drop_accepted(&mut self, rules: impl FnOnce(&mut Allow)) -> &mut Self {
+        let mut allow = Allow::default();
+        rules(&mut allow);
+        allow.filter(&mut self.errors);
+        self
+    }
+
     /// Drops the remaining errors whose cause equals `cause` (the same kind and tokens, spans
     /// ignored).
     ///
     /// You promise that the part can be written as it is in the copy; if not, the copy fails to
     /// build, in the crate of the copy. The cause may be smaller than the part that is copied: in
-    /// `[u8; { let c = |a: u8| a; 3 }]` the error is about `u8`, and the array is copied whole.
+    /// `[u8; { let c = |a: u8| a; 3 }]` the error is about `u8`, and the array is copied whole. A
+    /// part that the signature of a method made ([`Reason::UnconstrainedLifetime`], an elided
+    /// output) is copied as written in the arguments of a signature with the same fault only.
     ///
     /// ```
     /// # use {syn::*, type_leak::*};
@@ -835,7 +857,7 @@ impl LeakerResult {
     /// - `Self::A`, or `Self` as a type, in a bound or where predicate when a bound in its context
     ///   names a leaked type ([`Reason::UnprovableBound`]): E0277, until the type of the bound is
     ///   written with an absolute path or allowed with
-    ///   [`allowed_paths`](LeakerConfig::allowed_paths). Only the cause is copied as written.
+    ///   [`allow_path()`](LeakerConfig::allow_path). Only the cause is copied as written.
     /// - A trait with a generic whose bound names an associated type that another bound fixes (`T:
     ///   Iterator<Item = (R0, u8)> + Fn(<T as Iterator>::Item) -> u8`), and a method predicate that
     ///   names `Self::A`: rustc cannot implement it with a generic impl at all (E0277). See [Bounds
@@ -845,53 +867,46 @@ impl LeakerResult {
     ///   false`, `struct S<'a>(PhantomData<&'a ()>, fn(::core::slice::Iter<u8>, *mut Self) ->
     ///   &u32)` becomes a function pointer with two input lifetimes.
     pub fn allow(&mut self, cause: Cause) -> &mut Self {
-        self.errors.retain(|error| error.cause != cause);
-        self
+        self.drop_accepted(|allow| allow.cause(cause))
     }
 
-    /// Drops the remaining errors whose cause is a path that starts with a name of the standard
-    /// prelude (`Vec`, `Option`, `Clone`, ..: those of [`LeakerConfig::allow_std_prelude()`]).
+    /// Drops the errors whose relative paths all start with `path`, such as `my_mod::Tr`.
     ///
-    /// It is coarser than that option, by design. Without the option, `fn c(&self, x: Vec<Rel<'_>>)`
-    /// has the cause `Vec<Rel<'_>>`, which this drops because of `Vec`; with the option, the error
-    /// is about `Rel<'_>` and stays. Only a cause with a path can be dropped (not a reference, a
-    /// `dyn`, an array, a tuple or a lifetime). The promise is that of
+    /// An absolute path is no relative path, so it changes nothing here. The promise is that of
     /// [`allow()`](LeakerResult::allow).
-    ///
-    /// ```
-    /// # use {syn::*, type_leak::*};
-    /// let item: ItemTrait = parse_quote!(trait Tr { fn c(&self, x: Vec<Rel<'_>>); });
-    /// let mut leaker = Leaker::new();
-    /// leaker.intern_trait(&item, true);
-    /// let mut result = leaker.result();
-    /// assert!(result.allow_prelude().errors().is_empty()); // the cause is `Vec<Rel<'_>>`
-    ///
-    /// let mut config = LeakerConfig::new();
-    /// config.allow_std_prelude();
-    /// let mut leaker = Leaker::from_config(config);
-    /// leaker.intern_trait(&item, true);
-    /// let mut result = leaker.result();
-    /// assert_eq!(result.allow_prelude().errors().len(), 1); // the cause is `Rel<'_>`
-    /// ```
+    pub fn allow_path(&mut self, path: Path) -> &mut Self {
+        self.drop_accepted(|allow| allow.path(path))
+    }
+
+    /// Drops the errors whose relative paths are all primitive type names.
+    pub fn allow_primitive(&mut self) -> &mut Self {
+        self.drop_accepted(Allow::primitive)
+    }
+
+    /// Drops the errors whose relative paths are all names of the standard prelude (`Clone`, `Vec`).
     pub fn allow_prelude(&mut self) -> &mut Self {
-        self.allow_paths(&std_prelude_paths())
+        self.drop_accepted(Allow::prelude)
     }
 
-    /// Drops the remaining errors whose cause is a path that starts with `std`, `core` or `alloc`,
-    /// like [`allow_prelude()`](LeakerResult::allow_prelude) for the paths of those crates.
+    /// Drops the errors whose relative paths all start with `std`, `core` or `alloc`, such as
+    /// `core::fmt::Debug`.
     pub fn allow_std_crates(&mut self) -> &mut Self {
-        self.allow_paths(&std_crate_paths())
+        self.drop_accepted(Allow::std_crates)
     }
 
-    /// Drops the errors whose cause is a path that starts with one of `paths`, as
-    /// [`LeakerConfig::allowed_paths`] does.
-    fn allow_paths(&mut self, paths: &[Path]) -> &mut Self {
-        let allowed = AllowedPaths::new(paths);
-        self.errors.retain(|error| {
-            let path = error.cause.as_path();
-            !path.map_or(false, |path| allowed.is_allowed_path(path))
-        });
-        self
+    /// Drops the errors whose relative paths all start with `crate`.
+    pub fn allow_crate(&mut self) -> &mut Self {
+        self.drop_accepted(Allow::crate_root)
+    }
+
+    /// Drops the errors found in a value (see [`ErrorItem::in_value`]).
+    pub fn allow_values(&mut self) -> &mut Self {
+        self.drop_accepted(Allow::values)
+    }
+
+    /// Drops the errors found in a default (see [`ErrorItem::in_default`]).
+    pub fn allow_default(&mut self) -> &mut Self {
+        self.drop_accepted(Allow::defaults)
     }
 
     /// Returns the errors that remain, in the order found.
@@ -917,21 +932,20 @@ impl LeakerResult {
 /// Writes the [`LeakerResult`] as tokens: the [`Referrer`] as it writes itself, then one brace group
 /// for each remaining error ([`ErrorItem`]), in the order of [`errors()`](LeakerResult::errors).
 ///
-/// A Leaker's macro can emit the result and let the Referrer's macro decide what to allow, for
-/// example [`allow_prelude()`](LeakerResult::allow_prelude) where the copy's crate does not shadow
-/// those names, and report what remains.
+/// A Leaker's macro can emit the result and let the Referrer's macro decide what to allow and report
+/// what remains.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
 /// # use template_quote::ToTokens;
-/// let item: ItemTrait = parse_quote!(trait Tr { fn c(&self, x: Vec<Rel<'_>>); });
+/// let item: ItemTrait = parse_quote!(trait Tr: core::fmt::Debug { fn c(&self) -> Rel; });
 /// let mut leaker = Leaker::new();
 /// leaker.intern_trait(&item, true);
 /// let tokens = leaker.result().to_token_stream();
 ///
 /// let mut result: LeakerResult = parse2(tokens).unwrap();
 /// assert_eq!(result.errors().len(), 1);
-/// assert!(result.allow_prelude().errors().is_empty());
+/// assert!(result.allow_std_crates().errors().is_empty());
 /// ```
 impl ToTokens for LeakerResult {
     fn to_tokens(&self, tokens: &mut TokenStream) {
@@ -966,7 +980,7 @@ impl Scopes for Leaker {
         f: impl FnOnce(&mut View<'_>) -> R,
     ) -> (ContextId, R) {
         let root = spec.declared_generics();
-        let mut visitor = AnalyzeVisitor::new(AllowedPaths::new(&self.allowed_paths), &root)
+        let mut visitor = AnalyzeVisitor::new(AllowedPaths::new(self.allow.paths()), &root)
             .reading_values(self.check_values)
             .with_nested_self_entries(self.nested_self_entries);
         let mark = self.contexts.len();
@@ -1027,7 +1041,11 @@ impl Scopes for Leaker {
         });
         self.top_levels.insert(top_level);
         self.top_levels.extend(top_levels);
-        // Nothing is recorded if the closure panics: the outcome above resumes the unwind.
+        // Nothing is recorded if the closure panics: the outcome above resumes the unwind. The errors
+        // that the configuration accepts are dropped here, as `LeakerResult` drops them later.
+        let allow = &self.allow;
+        let mut errors = errors;
+        allow.filter(&mut errors);
         self.errors.extend(errors);
         (top_level, result)
     }

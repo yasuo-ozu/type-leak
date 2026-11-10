@@ -4,12 +4,13 @@
 //! why ([`Reason`]), a message, notes and a help. The Leaker copies the part as written and goes
 //! on ([recovery](crate::Leaker#errors-and-recovery)).
 
-use crate::analysis::CheckResult;
+use crate::analysis::{CheckResult, SelfMention};
 use crate::util::{or_list, without_crate_prefix};
 use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use std::hash::{Hash, Hasher};
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
     braced, bracketed, parenthesized, token, Expr, ExprPath, Ident, Lifetime, LitStr, Path, Token,
@@ -461,13 +462,19 @@ impl Reason {
 /// another and are read in a loop (`while !input.is_empty() { items.push(input.parse()?) }`):
 ///
 /// ```text
-/// { KIND ( CAUSE ) REASON "message" [ ( TOKENS ) "note" , .. ] ( TOKENS ) "help" }
+/// { KIND ( CAUSE ) REASON "message" [ ( TOKENS ) "note" , .. ] [ ( TOKENS ) "help" ]
+///   [ value ] [ default ] [ paths [ PATH , .. ] ] [ nested [ ITEM , .. ] ] }
 /// KIND   := type | trait | expr | macro | lifetime | unreadable
 /// REASON := the name of the variant of Reason (RelativePath, ..)
+/// ITEM   := an item as above, brace group included
 /// ```
 ///
 /// - The help is absent if the item has none. The list of notes may be empty (`[]`), and a trailing
 ///   comma is accepted.
+/// - `value`, `default`, `paths` (a list of paths without arguments) and `nested` (a list of items)
+///   follow the help, each only if set ([`in_value`](ErrorItem::in_value),
+///   [`in_default`](ErrorItem::in_default)) or not empty ([`paths`](ErrorItem::paths),
+///   [`nested`](ErrorItem::nested)).
 /// - `CAUSE` is the cause as written, read by its kind: a `macro` has a `!` after its path, and an
 ///   `expr` that is a path with arguments is read as a type has it (`Rel<u8>`). It must be the
 ///   whole content of its parentheses.
@@ -491,6 +498,26 @@ pub struct ErrorItem {
     /// What to write instead, with the tokens it is about (for example "use `::std::vec::Vec`
     /// instead of `Vec`"). Every error has one.
     pub help: Option<(TokenStream, String)>,
+    /// Found while reading a value ([`LeakerConfig::check_values()`](crate::LeakerConfig::check_values)):
+    /// a const or static value, the body of a function, a trait's default value or body.
+    /// [`allow_values()`](crate::LeakerResult::allow_values) accepts it.
+    pub in_value: bool,
+    /// Found in a default: a default body or an associated const default of a trait, or the
+    /// default of a generic parameter (`U = Rel<'_>`).
+    /// [`allow_default()`](crate::LeakerResult::allow_default) accepts it.
+    pub in_default: bool,
+    /// The relative paths that the cause depends on, without their arguments (`Vec<Rel<'_>>` has
+    /// `Vec` and `Rel`), found by the analysis, which knows the generics in scope: a path that is
+    /// not absolute, not `$crate`, not a generic or `Self`, not a name the module declares and not
+    /// [allowed](crate::LeakerConfig::allow_path). A cause that is no path (a lifetime, `Self`
+    /// without meaning, unreadable syntax) may have none. A path rule drops the error if it has
+    /// some and each starts with an allowed path; if only some do, it removes them from the error.
+    pub paths: Vec<Path>,
+    /// What is wrong inside the part if its [`paths`](ErrorItem::paths) are allowed. They take the
+    /// place of this error when a rule of `allow*()` drops it, as the part is then copied as written.
+    /// Each has its own `paths` and `nested`. They are not reported. One that comes up is skipped if
+    /// an error that stays is identical to it, but for the spans.
+    pub nested: Vec<ErrorItem>,
 }
 
 impl ErrorItem {
@@ -640,13 +667,45 @@ impl Parse for ErrorItem {
                 list.parse::<Token![,]>()?;
             }
         }
-        let help = if item.is_empty() {
-            None
-        } else {
+        let help = if item.peek(token::Paren) {
             Some(parse_at(&item)?)
+        } else {
+            None
         };
-        if !item.is_empty() {
-            return Err(item.error("unexpected token after the help"));
+        let (mut in_value, mut in_default, mut paths) = (false, false, Vec::new());
+        let mut nested = Vec::new();
+        while !item.is_empty() {
+            let word = item.call(Ident::parse_any)?;
+            match word.to_string().as_str() {
+                "value" => in_value = true,
+                "default" => in_default = true,
+                "paths" => {
+                    let list;
+                    bracketed!(list in item);
+                    paths = Punctuated::<Path, Token![,]>::parse_terminated_with(
+                        &list,
+                        Path::parse_mod_style,
+                    )?
+                    .into_iter()
+                    .collect();
+                }
+                "nested" => {
+                    let list;
+                    bracketed!(list in item);
+                    while !list.is_empty() {
+                        nested.push(list.parse()?);
+                        if !list.is_empty() {
+                            list.parse::<Token![,]>()?;
+                        }
+                    }
+                }
+                _ => {
+                    return Err(syn::Error::new(
+                        word.span(),
+                        format!("unknown field `{}`", word),
+                    ))
+                }
+            }
         }
         Ok(ErrorItem {
             cause,
@@ -654,6 +713,10 @@ impl Parse for ErrorItem {
             message,
             notes,
             help,
+            in_value,
+            in_default,
+            paths,
+            nested,
         })
     }
 }
@@ -673,8 +736,22 @@ impl ToTokens for ErrorItem {
             .map(|(at, note)| quote!((#at) #note))
             .collect();
         let help = self.help.as_ref().map(|(at, help)| quote!((#at) #help));
+        let value = self
+            .in_value
+            .then(|| Ident::new("value", Span::call_site()));
+        let default = self
+            .in_default
+            .then(|| Ident::new("default", Span::call_site()));
+        let paths = (!self.paths.is_empty()).then(|| {
+            let paths = &self.paths;
+            quote!(paths [#(for path in paths), { #path }])
+        });
+        let nested = (!self.nested.is_empty()).then(|| {
+            let nested = &self.nested;
+            quote!(nested [#(for item in nested), { #item }])
+        });
         tokens.extend(quote!({
-            #kind (#cause) #reason #message [#(for note in &notes), { #note }] #help
+            #kind (#cause) #reason #message [#(for note in &notes), { #note }] #help #value #default #paths #nested
         }));
     }
 }
@@ -688,14 +765,18 @@ pub(crate) const SELF_HELP: &str =
      (`Leaker::enter_type`, `enter_impl` or `enter_trait`)";
 
 /// The error of a mention of `Self` that has no meaning where it is written.
-pub(crate) fn self_without_meaning(cause: &Cause) -> ErrorItem {
-    let tokens = cause.to_token_stream();
+pub(crate) fn self_without_meaning(mention: &SelfMention) -> ErrorItem {
+    let tokens = mention.cause.to_token_stream();
     ErrorItem {
-        cause: cause.clone(),
+        cause: mention.cause.clone(),
         reason: Reason::SelfWithoutMeaning,
         message: "`Self` has no meaning here".to_string(),
         notes: vec![(tokens.clone(), SELF_NOTE.to_string())],
         help: Some((tokens, SELF_HELP.to_string())),
+        in_value: mention.place.value,
+        in_default: mention.place.default,
+        paths: Vec::new(),
+        nested: Vec::new(),
     }
 }
 
@@ -754,6 +835,10 @@ pub(crate) fn report(conflict: &CheckResult) -> Option<ErrorItem> {
             .unwrap_or_else(|| format!("use absolute path: '{}'", tokens)),
         notes,
         help: Some(help),
+        in_value: conflict.place.value,
+        in_default: conflict.place.default,
+        paths: conflict.paths.clone(),
+        nested: conflict.nested.clone(),
     })
 }
 
@@ -830,13 +915,13 @@ fn absolute_path_help(
                     "write `{}` with an absolute path (e.g. `{}`)",
                     name, example
                 ));
-                options.push("allow it with `LeakerConfig::allowed_paths`".to_string());
+                options.push("allow it with `LeakerConfig::allow_path()`".to_string());
             }
             Some(path) => {
                 let (name, _) = path_names(path);
                 options.push(format!(
                     "write `{}` where it is not leaked, or allow it with \
-                     `LeakerConfig::allowed_paths`",
+                     `LeakerConfig::allow_path()`",
                     name
                 ));
             }
@@ -876,9 +961,23 @@ fn path_names(path: &syn::Path) -> (String, String) {
         },
         names(path)
     );
-    // `crate::m::X` and `super::m::X` are `m::X` in the crate.
-    let example = format!("::my_crate::{}", names(&without_crate_prefix(path)));
+    // `core::fmt::Debug` is `::core::fmt::Debug`; `crate::m::X` and `super::m::X` are `m::X` in the
+    // crate.
+    let example = if path.leading_colon.is_none() && path.segments.len() > 1 && is_std_crate(path) {
+        format!("::{}", names(path))
+    } else {
+        format!("::my_crate::{}", names(&without_crate_prefix(path)))
+    };
     (name, example)
+}
+
+/// Returns `true` if `path` starts with the name of `core`, `std` or `alloc`.
+fn is_std_crate(path: &syn::Path) -> bool {
+    path.segments.first().map_or(false, |seg| {
+        ["core", "std", "alloc"]
+            .iter()
+            .any(|name| seg.ident == name)
+    })
 }
 
 /// Absolute paths of the standard prelude items and the primitive types.

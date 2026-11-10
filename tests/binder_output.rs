@@ -36,8 +36,10 @@ fn leaker() -> Leaker {
 
 fn leaker_with(allowed: &[Path]) -> Leaker {
     let mut config = LeakerConfig::new();
-    config.allow_primitive().allow_std_prelude();
-    config.allowed_paths.extend(allowed.iter().cloned());
+    config.allow_primitive().allow_prelude();
+    for path in allowed {
+        config.allow_path(path.clone());
+    }
     Leaker::from_config(config)
 }
 
@@ -1243,7 +1245,7 @@ fn external_crate_types_do_not_anchor_the_lifetime() {
         let (_, note) = error_by(leaker_allowing_nothing(), item.clone());
         assert_eq!(note.as_deref(), Some(NOTE), "{}", s(&item));
     }
-    // It is an anchor where the crate is allowed (an absolute path in `allowed_paths`).
+    // It is an anchor where the crate is allowed (an absolute path given to `allow_path()`).
     assert_eq!(
         leaked_by(leaker_allowing_other(), item.clone()),
         [e("Parser < 'x >", "< 'x >")]
