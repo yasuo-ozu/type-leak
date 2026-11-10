@@ -1,13 +1,9 @@
 //! A seeded generator of random but valid Rust: the Leaker's crate and the Referrer's crate.
 //!
 //! The Leaker's crate has a module `base` of types and traits (`B0`, `B1<T>`, `BL<'a, T>`, `BC<T,
-//! N>`, `BB<B>`, `Bl<'a>`, `BT0`, `BT1<T>`, `BT2`, `BLEN`), then
-//!
-//! modules `m0..` whose items are analyzed one by one (`intern_struct`, `intern_enum`,
-//! `intern_union`, `intern_trait`, `intern_impl`, or through a scope), some with a nested module.
-//! (The draws of the modules that the test analyzed as a whole, which it makes no more, are
-//! replayed and dropped: see `generate_with()`. The code that writes them, `Gen::module_mode`,
-//! goes with them.)
+//! N>`, `BB<B>`, `Bl<'a>`, `BT0`, `BT1<T>`, `BT2`, `BLEN`), then modules `m0..` whose items are
+//! analyzed one by one (`intern_struct`, `intern_enum`, `intern_union`, `intern_trait`,
+//! `intern_impl`, or through a scope), some with a nested module.
 //!
 //! Each module declares the same types as `base` under other names (`R0`, `R1<T>`, ...), imports
 //! some of those of `base` with `use` (`I1`, from `super::base` or `crate::base`, or `J1`, from the
@@ -33,7 +29,7 @@
 //! constrains a default (`T = Vec<u8>`, `U = BTreeMap<T, u8>`, `const N: usize = 3`, `{ RLEN }`),
 //! which the Leaker analyzes with the parameters before it. A constant that is a single
 //! identifier is also written bare as an argument (`R2C<T, RLEN>`: it parses as a type that may be
-//! a const), except in the paths a module analyzed as a whole declares.
+//! a const).
 //!
 //! Defaults of traits (`Features::trait_self_defaults`, F39): a fifth of the traits analyzed one by
 //! one are made for their defaults (`Gen::gen_self_default_trait()`): `trait Tr<T: AsRef<Self>, U =
@@ -120,7 +116,7 @@
 //! What `type-leak` is known to fail on is avoided unless a feature asks for it ([`Features`]):
 //! each is a finding of the test, with a reduced reproduction in the report of the test. The
 //! generator also avoids the constructs that cannot be copied to another crate whatever
-//! `type-leak` does, such as an inherent impl on a type of another module in the copy of a module.
+//! `type-leak` does.
 
 use std::collections::BTreeSet;
 use std::hash::Hasher;
@@ -392,11 +388,11 @@ pub struct Flags {
     /// "std,core,alloc"`), and the rule `std` of `allow_stages` has errors to drop.
     pub relative_std: bool,
     /// `values`: the generated items have values (`Gen::method_body()`, `Gen::value_const()`): the
-    /// bodies of functions, methods and default methods, the values of constants and statics, the
-    /// defaults of associated constants. They have the types of the Leaker's crate in type positions
-    /// (a `let`, a turbofish, a cast), which the Leaker leaks with `check_values`, and some have a
-    /// relative path of a value (`crate::base::bf()`), which it rejects. There are more defaults of
-    /// const parameters that name a relative constant. The rules `values` and `default` of
+    /// bodies of methods and default methods, and the defaults of associated constants. They have
+    /// the types of the Leaker's crate in type positions (a `let`, a turbofish, a cast), which the
+    /// Leaker leaks with `check_values`, and some have a relative path of a value
+    /// (`crate::base::bf()`), which it rejects. There are more defaults of const parameters that
+    /// name a relative constant. The rules `values` and `default` of
     /// `allow_stages` have errors to drop.
     pub values: bool,
 }
@@ -726,11 +722,13 @@ pub const TAG_OPTIONAL_PREDICATE: &str = "optional_predicate";
 /// because the tag above of the same shape is also on items that the Leaker accepts:
 ///
 /// - `forced:self_in_trait_predicate`: a where predicate of a trait is on a type of a path with no
-///   leading `::` that names `Self` in its arguments (`where Rel<Self>: Default`); the tag above is
+///   leading `::` that names `Self` in its arguments (`where Rel<Self>: Default`; not a path of
+///   `std`, `core` or `alloc` that `relative_std` writes, which the Leaker allows); the tag above is
 ///   also on a bound `T: AsRef<Self>`, and on the impls of such traits.
-/// - `forced:impl_header_self`: the self type of an impl is a path with no leading `::` whose
-///   arguments name a generic that a bound of the impl bounds by `Self` (`impl<T: AsRef<Self>>
-///   Rel<T>`); the tag above is also on a self type that no leaked type of it names the generic in.
+/// - `forced:impl_header_self`: the self type of an impl is a path with no leading `::` (nor one of
+///   `std`, `core` or `alloc`) whose arguments name a generic that a bound of the impl bounds by
+///   `Self` (`impl<T: AsRef<Self>> Rel<T>`); the tag above is also on a self type that no leaked
+///   type of it names the generic in.
 /// - `forced:macro_path`: a macro is called by its bare name in the item (`[u8; two!()]`); an impl
 ///   does not write the macro of its type.
 /// - `forced:elided_arg`: `ae: Rel<'_>` in a method, `Rel` a path with no leading `::` (a type of
@@ -773,11 +771,10 @@ pub struct Item {
     /// (`nested`: `View::visit_item` in `enter_generics`, `generics`: `enter_generics`, `trait`:
     /// `enter_trait`, `impl`: `enter_impl`, see `SCOPES`).
     pub scope: &'static str,
-    /// The kinds of the items in it (for a module), and the item itself otherwise.
+    /// The kinds that the statistics count it as: its own.
     pub contents: Vec<&'static str>,
-    /// The shapes in it that justify a rejection of `type-leak` (`bound_cycle`, `bare:Sized`, ...),
-    /// of the module and of all the items in it for a module. A rejection that none of them
-    /// explains fails the run: see `main.rs`.
+    /// The shapes in it that justify a rejection of `type-leak` (`bound_cycle`, `bare:Sized`, ...).
+    /// A rejection that none of them explains fails the run: see `main.rs`.
     pub tags: BTreeSet<String>,
     /// Its source, with the attribute.
     pub source: String,
@@ -842,11 +839,9 @@ pub const SCOPES: &[(&str, &str)] = &[
 /// The share (percent) of the items, analyzed one by one, whose predicates may name a leaked type
 /// that uses a generic (`bound_cycles`). The Leaker rejects them, with one reason, "a leaked type
 /// in a bound or where predicate that rustc cannot normalize": when every item had them, a
-/// trait or an impl was rejected 60% of the time, and a module (which is rejected with any of its
-/// dozen items) 93% (seeds 1 to 8, 60 cases).
+/// trait or an impl was rejected 60% of the time, and a module analyzed as a whole, which the test
+/// made then (rejected with any of its dozen items), 93% (seeds 1 to 8, 60 cases).
 const CYCLIC_ITEM_PERCENT: u32 = 20;
-/// The share of the modules analyzed as a whole that have such items, and of the items of those.
-const CYCLIC_MODULE_PERCENT: u32 = 15;
 /// The share of the structs, enums, unions and traits that have parameters with defaults, if one
 /// can.
 const DEFAULT_PERCENT: u32 = 35;
@@ -855,7 +850,6 @@ const PRIMITIVE_OFF_PERCENT: u32 = 20;
 /// The share of the traits and of the inherent impls that have sibling methods whose generics are
 /// named alike (`Gen::clash_methods()`).
 const CLASH_PERCENT: u32 = 20;
-const CYCLIC_ITEM_IN_MODULE_PERCENT: u32 = 30;
 /// The share of the traits analyzed one by one that have the shape of `trait_self_defaults`: a
 /// parameter with a bound and later ones with defaults that use it.
 const SELF_DEFAULT_PERCENT: u32 = 20;
@@ -1240,9 +1234,8 @@ struct ModEnv {
     up: String,
 }
 
-/// The types every module declares (`prefix` is `R`) and the `base` module has (`B`). `sized` is
-/// how `?Sized` is spelled: `?::core::marker::Sized`, or `?Sized`.
-fn types_template(p: &str, sized: &str) -> String {
+/// The types every module declares (`prefix` is `R`) and the `base` module has (`B`).
+fn types_template(p: &str) -> String {
     let mut s = String::new();
     let phantom = "::core::marker::PhantomData";
     s += &format!("#[derive(Debug, Clone, Copy, Default, PartialEq)] pub struct {p}0;\n");
@@ -1301,17 +1294,7 @@ fn types_template(p: &str, sized: &str) -> String {
     s += &format!("pub trait {p}T1<T: ?::core::marker::Sized> {{}}\n");
     s += &format!("pub trait {p}T2 {{ type Out; }}\n");
     s += &format!("pub const {p}LEN: usize = 2;\n");
-    s.replace("?::core::marker::Sized", sized)
-}
-
-/// Whether `name`, a type of the module environment, is one that a module declares (`R0`, `self::R1`,
-/// `U`, ...) and not one it imports or names by a path of another module.
-fn is_declared(name: &str) -> bool {
-    name.starts_with('R')
-        || name.starts_with("self::R")
-        || name.starts_with("super::R")
-        || is_shadow_name(name)
-        || name.strip_prefix("self::").map_or(false, is_shadow_name)
+    s
 }
 
 /// The types that every module declares with the name of a generic parameter (`T`, `U`: the
@@ -1544,8 +1527,6 @@ pub struct Gen {
     features: Features,
     env: ModEnv,
     no_self: bool,
-    /// A module analyzed as a whole is being generated: its copy declares its own items.
-    module_mode: bool,
     /// Only absolute paths are written (no relative name, nor one of the prelude).
     abs_only: bool,
     /// No `T::Item`: it does not constrain `T` in the self type of an impl.
@@ -1563,8 +1544,6 @@ pub struct Gen {
     /// Structs, enums and unions declared in the module, with the generics they declare.
     adts: Vec<(String, Skeleton)>,
     items: Vec<Item>,
-    /// The kinds of the items in the module analyzed as a whole.
-    contents: Vec<&'static str>,
     /// An elided `fn(&A) -> &R` or `Fn(&A) -> &R` with `Self` in `A` was generated since it was
     /// cleared (`self_elision`).
     elided_self: bool,
@@ -1574,13 +1553,11 @@ pub struct Gen {
     /// `trait_assoc_bound_cycle`), an `impl Trait` argument (`impl_trait_args`), an iterator whose
     /// `Item` a predicate equates to a leaked type (`iterator_item_cycle`, `item_predicate_cycle`,
     /// `supertrait_item`). It is a share of the items, which keeps the shapes generated without
-    /// making most items (and nearly every module) rejected.
+    /// making most items rejected.
     cyclic: bool,
-    /// The module analyzed as a whole that is being generated has items with such predicates.
-    cyclic_module: bool,
     /// The scope of the item that was generated last (`Item::scope`).
     last_scope: &'static str,
-    /// The tags of the item (or of the module analyzed as a whole) being generated.
+    /// The tags of the item being generated.
     tags: BTreeSet<String>,
     /// The share (percent) of the prelude traits in the bounds of the item being generated that
     /// are written bare (`Sized`, `Fn(..)`, `Into<..>`, ...) instead of in full. It is the item's:
@@ -1598,7 +1575,7 @@ pub struct Gen {
     /// The `use`s of each module whose items are analyzed one by one, by its path (the imports that
     /// the names `I1`, `J1`, `ILEN` come from), for `accept_referrer()`. They draw no random number.
     mod_uses: Vec<(Vec<String>, String)>,
-    /// The item (or module) being generated has a value (`Flags::values`): the attribute says
+    /// The item being generated has a value (`Flags::values`): the attribute says
     /// `values = true`.
     values_used: bool,
     /// The macro takes the `NestedSelfInBounds` risk for the item being generated where it is nested
@@ -1647,7 +1624,6 @@ impl Gen {
             features,
             env: ModEnv::default(),
             no_self: false,
-            module_mode: false,
             abs_only: false,
             no_assoc_paths: false,
             self_prob: 30,
@@ -1658,10 +1634,8 @@ impl Gen {
             traits: Vec::new(),
             adts: Vec::new(),
             items: Vec::new(),
-            contents: Vec::new(),
             elided_self: false,
             cyclic: false,
-            cyclic_module: false,
             last_scope: "",
             tags: BTreeSet::new(),
             bare_percent: 0,
@@ -1739,7 +1713,6 @@ impl Gen {
             .heads
             .iter()
             .filter(|head| head.shape == Shape::LOnly && !head.name.starts_with("::"))
-            .filter(|head| !(self.module_mode && is_declared(&head.name)))
             .map(|head| head.name.clone())
             .collect();
         if heads.is_empty() || !self.chance(40) {
@@ -1777,17 +1750,6 @@ impl Gen {
             }
         } else if self.chance(8) {
             40
-        } else {
-            0
-        }
-    }
-
-    /// The same for a module analyzed as a whole, where one bare name rejects the module.
-    fn module_bare_percent(&mut self) -> u32 {
-        if self.cfg.prelude {
-            50
-        } else if self.chance(10) {
-            35
         } else {
             0
         }
@@ -2059,7 +2021,7 @@ impl Gen {
         // Only as the whole type of a position: a holder around it that the Leaker leaks is an
         // error (the array cannot be leaked whole, and the holder's path is relative).
         if depth == 0 && self.hash_percent(b"macro_len", 12) {
-            let text = if self.module_mode || self.hash_percent(b"macro_len which", 50) {
+            let text = if self.hash_percent(b"macro_len which", 50) {
                 format!("::{}::two!()", self.cfg.krate)
             } else {
                 self.tags.insert(TAG_MACRO_PATH.to_string());
@@ -2890,8 +2852,6 @@ impl Gen {
             ..Con::unsized_ok()
         };
         let mut bounded = sc.bounded.clone();
-        // The Repeater of a type with a bound that names an item of the module would be
-        // for the Leaker's item, and the copy of the module has its own.
         let saved_env = self.env.clone();
         // Rewritten, a bound that names a leaked type is a projection, which rustc has to
         // normalize in the environment of the item while the other types of the item need the
@@ -2908,12 +2868,6 @@ impl Gen {
                 .theads
                 .retain(|h| crate_ok && h.name.starts_with("::"));
             self.env.consts.retain(|c| crate_ok && c.starts_with("::"));
-        }
-        if self.module_mode {
-            let declared = is_declared;
-            self.env.heads.retain(|h| !declared(&h.name));
-            self.env.theads.retain(|h| !declared(&h.name));
-            self.env.consts.retain(|c| !declared(c));
         }
         let n = self.below(max + 1);
         for _ in 0..n {
@@ -3301,9 +3255,8 @@ impl Gen {
     /// host), and the test macro cannot compare such a default (its witness for a default that
     /// names `Self` is made for the bounds that do, F39).
     fn defaults(&mut self, sk: &mut Skeleton, self_default: bool) {
-        // `values` asks for more defaults, and more of the constants among them, which are errors
-        // (not in a module analyzed as a whole, which one such error rejects).
-        let more = self.flags.values && !self.module_mode;
+        // `values` asks for more defaults, and more of the constants among them, which are errors.
+        let more = self.flags.values;
         if !self.chance(if more { 60 } else { DEFAULT_PERCENT }) {
             return;
         }
@@ -3442,14 +3395,9 @@ impl Gen {
     /// A const argument of a path: a constant that is a single identifier (`RLEN`) may be written
     /// bare (`R2C<T, RLEN>`, which parses as a type that may be a const: the Leaker leaks the whole
     /// path), or in braces like a path of several segments (`{ self::RLEN }`).
-    ///
-    /// In a module analyzed as a whole, a path that the module declares (or imports) holds the
-    /// identifier as a type, which is the limitation that the `Leaker` docs name ("Bare identifiers
-    /// and consts"): only a path of `base` is written with it.
     fn const_arg(&mut self, head: &str, len: &str, params: &[(String, &'static str)]) -> String {
         let braced = braced_path(len, params);
-        let bare_ok = (!self.module_mode || head.contains("base::"))
-            && (!head.starts_with("::") || self.features.bare_const_in_absolute_path);
+        let bare_ok = !head.starts_with("::") || self.features.bare_const_in_absolute_path;
         if braced != len && !len.contains("::") && bare_ok && self.chance(65) {
             len.to_string()
         } else {
@@ -3778,7 +3726,7 @@ impl Gen {
         }
         // A type of the module with a lifetime, with the elided one (`Rl<'_>`), as an argument: a
         // relative path cannot be leaked whole with it, and one of another crate is written as it is.
-        if !self.module_mode && self.hash_percent(format!("elided_arg {}", name).as_bytes(), 2) {
+        if self.hash_percent(format!("elided_arg {}", name).as_bytes(), 2) {
             let heads: Vec<String> = self
                 .env
                 .heads
@@ -3873,16 +3821,11 @@ impl Gen {
                 .filter(|p| p.sized && !sk.bounded.contains(&(p.name.clone(), "fn")))
                 .map(|p| p.name.clone())
                 .collect();
-            // In a module analyzed as a whole, a bound of an entry that names an item of the module
-            // is the limitation F10, as in `preds()`.
-            let module_mode = self.module_mode;
-            let declared = is_declared;
             let relative = |shape: Shape| -> Vec<String> {
                 self.env
                     .heads
                     .iter()
                     .filter(|head| head.shape == shape && !head.name.starts_with("::"))
-                    .filter(|head| !(module_mode && declared(&head.name)))
                     .filter(|head| !is_shadow_name(&head.name))
                     .map(|head| head.name.clone())
                     .collect()
@@ -3909,13 +3852,11 @@ impl Gen {
             state.write(name.as_bytes());
             state.write(b"impl_trait_plain");
             let draw = state.finish();
-            let module_mode = self.module_mode;
             let heads: Vec<String> = self
                 .env
                 .heads
                 .iter()
                 .filter(|head| head.shape == Shape::T1 && !head.name.starts_with("::"))
-                .filter(|head| !(module_mode && is_declared(&head.name)))
                 .filter(|head| !is_shadow_name(&head.name))
                 .map(|head| head.name.clone())
                 .collect();
@@ -4324,9 +4265,9 @@ impl Gen {
     }
 
     /// The attribute of an item that is analyzed through `scope` (`""` for none).
-    fn attr_with(&mut self, ann: Option<(usize, bool)>, scope: &'static str) -> String {
+    fn attr_with(&mut self, (id, _): (usize, bool), scope: &'static str) -> String {
         self.last_scope = scope;
-        ann.map_or(String::new(), |(id, _)| self.attr(id, scope))
+        self.attr(id, scope)
     }
 
     /// The analysis of an item through other calls of the same API (`via` in the attribute,
@@ -4346,11 +4287,7 @@ impl Gen {
     /// The copy and the checks are those of the scope. The draw is by the hash of the state and
     /// of the number of the item, and it draws nothing, so the items are the same as without it.
     /// The first line of `text` is the attribute.
-    fn with_via(&mut self, kind: &'static str, ann_id: Option<usize>, text: String) -> String {
-        let id = match ann_id {
-            Some(id) => id,
-            None => return text,
-        };
+    fn with_via(&mut self, kind: &'static str, id: usize, text: String) -> String {
         let mut state = self.rng.clone();
         state.write(b"via");
         state.write_u64(id as u64);
@@ -4508,7 +4445,7 @@ impl Gen {
     /// An enum of unit variants with discriminants (`V0 = ..`), which the Leaker reads as values
     /// whether it reads values or not: the types in them are entries (`size_of::<Rel>()`), a
     /// relative constant or macro is an error, and the copy writes the rest as it is.
-    fn gen_discriminant_enum(&mut self, ann: Option<(usize, bool)>) -> String {
+    fn gen_discriminant_enum(&mut self, ann: (usize, bool)) -> String {
         let name = self.name("E");
         let krate = self.cfg.krate.clone();
         let up = self.env.up.clone();
@@ -4521,11 +4458,8 @@ impl Gen {
             ];
             let ty = self.value_type(&Scope::default());
             forms.push(format!("::core::mem::size_of::<*const {}>() as isize", ty));
-            // A relative constant or macro is an error, and it rejects a module analyzed as a
-            // whole.
-            if !self.module_mode
-                && self.hash_percent(format!("relative_variant {}", i).as_bytes(), 30)
-            {
+            // A relative constant or macro is an error.
+            if self.hash_percent(format!("relative_variant {}", i).as_bytes(), 30) {
                 forms.push("RLEN as isize".to_string());
                 forms.push(format!("{}base::BLEN as isize", up));
                 forms.push("two!() as isize".to_string());
@@ -4546,11 +4480,11 @@ impl Gen {
         format!("{}pub enum {} {{ {} }}\n", attr, name, variants.join(", "))
     }
 
-    fn gen_adt(&mut self, kind: AdtKind, ann: Option<(usize, bool)>) -> String {
-        if let Some(shape) = self.self_bound_adt_shape(ann) {
+    fn gen_adt(&mut self, kind: AdtKind, ann: (usize, bool)) -> String {
+        if let Some(shape) = self.self_bound_adt_shape() {
             return self.gen_self_bound_adt(kind, ann, shape);
         }
-        if kind == AdtKind::Enum && ann.is_some() && self.hash_percent(b"discriminant_enum", 12) {
+        if kind == AdtKind::Enum && self.hash_percent(b"discriminant_enum", 12) {
             return self.gen_discriminant_enum(ann);
         }
         let (prefix, kw) = match kind {
@@ -4559,13 +4493,13 @@ impl Gen {
             AdtKind::Union => ("U", "union"),
         };
         let name = self.name(prefix);
-        let self_common = ann.map_or(true, |(_, a)| a);
+        let (_, self_common) = ann;
         // A fifth of the items are analyzed through a scope: nested in `enter_generics` (it has a
         // `Self` of its own, and the generics are local), or in `enter_generics`, which has no
         // `Self` (so the fields do not name it).
-        let scope: &'static str = match (ann.is_some(), self.below(100)) {
-            (true, 0..=9) => "nested",
-            (true, 10..=19) => "generics",
+        let scope: &'static str = match self.below(100) {
+            0..=9 => "nested",
+            10..=19 => "generics",
             _ => "",
         };
         let saved_prob = self.self_prob;
@@ -4833,11 +4767,10 @@ impl Gen {
 
     /// Whether the struct, enum or union about to be generated has the shape of `self_bound_adts` (F41,
     /// F42), and which. Decided by the hash of the state, which draws nothing, as
-    /// `Gen::self_default_shape()` does. Only the items that the macro is applied to have it, and
-    /// they are nested in `enter_generics` (`nested_self`), which gives them a `Self` of their own.
-    fn self_bound_adt_shape(&self, ann: Option<(usize, bool)>) -> Option<SelfBoundAdt> {
-        ann?;
-        if !self.features.self_bound_adts || !self.features.nested_self || self.module_mode {
+    /// `Gen::self_default_shape()` does. The items that have it are nested in `enter_generics`
+    /// (`nested_self`), which gives them a `Self` of their own.
+    fn self_bound_adt_shape(&self) -> Option<SelfBoundAdt> {
+        if !self.features.self_bound_adts || !self.features.nested_self {
             return None;
         }
         let mut state = self.rng.clone();
@@ -4863,7 +4796,7 @@ impl Gen {
     fn gen_self_bound_adt(
         &mut self,
         kind: AdtKind,
-        ann: Option<(usize, bool)>,
+        ann: (usize, bool),
         shape: SelfBoundAdt,
     ) -> String {
         let (prefix, kw) = match kind {
@@ -5029,11 +4962,7 @@ impl Gen {
 
     /// The item of `gen_self_bound_adt()` in a module that declares no type with one and two
     /// parameters: a plain unit struct.
-    fn gen_self_bound_adt_fallback(
-        &mut self,
-        _kind: AdtKind,
-        ann: Option<(usize, bool)>,
-    ) -> String {
+    fn gen_self_bound_adt_fallback(&mut self, _kind: AdtKind, ann: (usize, bool)) -> String {
         let name = self.name("S");
         let attr = self.attr_with(ann, "nested");
         format!("{}pub struct {};\n", attr, name)
@@ -5043,13 +4972,11 @@ impl Gen {
     /// which. Decided by the hash of the state, which draws nothing: the other choices are the same
     /// as without the feature, and a trait that does not have the shape is made as before.
     ///
-    /// Only the items that the macro is applied to have it (a module analyzed as a whole names no
-    /// `Self`), and a parameter bound that names `Self` needs an item that names it freely: a nested
-    /// trait, or one where `Self` is common (`self_common`, see `gen_one()`); the others are the
-    /// control.
-    fn self_default_shape(&self, ann: Option<(usize, bool)>) -> Option<SelfDefault> {
-        let (_, self_common) = ann?;
-        if !self.features.trait_self_defaults || self.module_mode {
+    /// A parameter bound that names `Self` needs an item that names it freely: a nested trait, or one
+    /// where `Self` is common (`self_common`, see `gen_one()`); the others are the control.
+    fn self_default_shape(&self, ann: (usize, bool)) -> Option<SelfDefault> {
+        let (_, self_common) = ann;
+        if !self.features.trait_self_defaults {
             return None;
         }
         let mut state = self.rng.clone();
@@ -5083,9 +5010,9 @@ impl Gen {
     /// that trait name the leading parameters only, because the declaration passes `()` for a
     /// defaulted one (E0128) and the copy of the default must be the original. The trait is not
     /// implemented by the other items of the module.
-    fn gen_self_default_trait(&mut self, ann: Option<(usize, bool)>, shape: SelfDefault) -> String {
+    fn gen_self_default_trait(&mut self, ann: (usize, bool), shape: SelfDefault) -> String {
         let name = self.name("Tr");
-        let self_common = ann.map_or(true, |(_, a)| a);
+        let (_, self_common) = ann;
         let saved_prob = self.self_prob;
         if !self_common {
             self.self_prob = 6;
@@ -5272,19 +5199,19 @@ impl Gen {
         )
     }
 
-    fn gen_trait(&mut self, ann: Option<(usize, bool)>) -> String {
+    fn gen_trait(&mut self, ann: (usize, bool)) -> String {
         if let Some(shape) = self.self_default_shape(ann) {
             return self.gen_self_default_trait(ann, shape);
         }
         let name = self.name("Tr");
-        let self_common = ann.map_or(true, |(_, a)| a);
+        let (_, self_common) = ann;
         let saved_prob = self.self_prob;
         if !self_common {
             self.self_prob = 6;
         }
         // A tenth of the traits are analyzed nested in `enter_generics`, and name no `Self`
         // (`nested_self`).
-        let in_mod = ann.is_some() && self.chance(10);
+        let in_mod = self.chance(10);
         let saved_no_self = self.no_self;
         if in_mod && !self.features.nested_self {
             self.no_self = true;
@@ -5489,9 +5416,9 @@ impl Gen {
 
         // Another tenth are analyzed by `enter_trait`, which does not know the generic associated
         // types of the trait.
-        let scope: &'static str = match (ann.is_some(), in_mod, self.below(100)) {
-            (true, true, _) => "nested",
-            (true, false, 0..=11) if !gat => "trait",
+        let scope: &'static str = match (in_mod, self.below(100)) {
+            (true, _) => "nested",
+            (false, 0..=11) if !gat => "trait",
             _ => "",
         };
         let attr = self.attr_with(ann, scope);
@@ -5549,12 +5476,7 @@ impl Gen {
     }
 
     /// An impl of a trait of this module that is not implemented yet.
-    fn gen_impl_trait(
-        &mut self,
-        ann: Option<(usize, bool)>,
-        path: &[String],
-        whole: bool,
-    ) -> Option<String> {
+    fn gen_impl_trait(&mut self, ann: (usize, bool), path: &[String]) -> Option<String> {
         let candidates: Vec<usize> = (0..self.traits.len())
             .filter(|&i| !self.traits[i].implemented)
             .filter(|&i| !self.traits[i].marker_super)
@@ -5610,7 +5532,7 @@ impl Gen {
         let tr = self.traits[idx].clone();
         self.extend_tags(&tr.sk.tags);
         // The impl has the where clause and the methods of the trait.
-        let self_common = ann.map_or(true, |(_, a)| a);
+        let (_, self_common) = ann;
         let saved_prob = self.self_prob;
         if !self_common {
             self.self_prob = 6;
@@ -5704,15 +5626,11 @@ impl Gen {
         self.self_prob = saved_prob;
         self.bound_by_self(&mut sk, &self_text);
 
-        let tr_path = if whole {
-            format!("{}{}", tr.name, tr.sk.args())
-        } else {
-            let mut p = format!("::{}", self.cfg.krate);
-            for m in path {
-                p += &format!("::{}", m);
-            }
-            format!("{}::{}{}", p, tr.name, tr.sk.args())
-        };
+        let mut tr_path = format!("::{}", self.cfg.krate);
+        for m in path {
+            tr_path += &format!("::{}", m);
+        }
+        let tr_path = format!("{}::{}{}", tr_path, tr.name, tr.sk.args());
         let mut body: Vec<String> = Vec::new();
         for (n, _) in &tr.assoc {
             body.push(format!("type {} = u8;", n));
@@ -5731,10 +5649,7 @@ impl Gen {
             let value = self.method_body(&sc, 35);
             body.push(format!("{} {}", m, value));
         }
-        let scope = self.impl_scope(
-            ann.is_some(),
-            &format!("{}{}", sk.params(), sk.where_clause()),
-        );
+        let scope = self.impl_scope(&format!("{}{}", sk.params(), sk.where_clause()));
         let attr = self.attr_with(ann, scope);
         Some(format!(
             "{}impl{} {} for {}{} {{\n{}\n}}\n",
@@ -5750,7 +5665,7 @@ impl Gen {
     /// Whether an impl with these generics is analyzed through `enter_impl` (a third of those that
     /// can be), which visits the self type and the arguments of the trait only: the generics are
     /// not analyzed, so they must not name a type that the Leaker leaks, nor `Self`.
-    fn impl_scope(&mut self, annotated: bool, generics: &str) -> &'static str {
+    fn impl_scope(&mut self, generics: &str) -> &'static str {
         let relative = self
             .env
             .heads
@@ -5767,7 +5682,7 @@ impl Gen {
                     generics.contains(name.as_str())
                 }
             });
-        if annotated && !relative && !generics.contains("Self") && self.chance(35) {
+        if !relative && !generics.contains("Self") && self.chance(35) {
             "impl"
         } else {
             ""
@@ -5804,15 +5719,12 @@ impl Gen {
         self.tags.insert(TAG_IMPL_HEADER_SELF.to_string());
     }
 
-    fn gen_impl_inherent(&mut self, ann: Option<(usize, bool)>) -> String {
-        let self_common = ann.map_or(true, |(_, a)| a);
+    fn gen_impl_inherent(&mut self, ann: (usize, bool)) -> String {
+        let (_, self_common) = ann;
         let saved_prob = self.self_prob;
         if !self_common {
             self.self_prob = 6;
         }
-        // A copy of a module cannot have an inherent impl on a type of another module, which
-        // the Referrer replaces by a projection.
-        let own_only = self.no_self;
         // The impl has the predicates of the ADT.
         let adts: Vec<(String, Skeleton)> = self
             .adts
@@ -5829,13 +5741,8 @@ impl Gen {
             let text = format!("{}{}", name, sk.args());
             (sk, text)
         } else {
-            // A type of the module or of `base`, with generics all used. In the copy of a module, a
-            // parameter that only a leaked type uses is not constrained by the self type (E0207).
-            let sk = if own_only {
-                Skeleton::default()
-            } else {
-                self.skeleton(Level::Item, &Scope::default(), Bounds::default())
-            };
+            // A type of the module or of `base`, with generics all used.
+            let sk = self.skeleton(Level::Item, &Scope::default(), Bounds::default());
             let sc = sk.scope(&Scope {
                 self_kind: SelfKind::Sized,
                 ..Default::default()
@@ -5843,27 +5750,12 @@ impl Gen {
             let saved_no_self = std::mem::replace(&mut self.no_self, true);
             self.no_assoc_paths = true;
             let mut ty = None;
-            let saved_heads = self.env.heads.clone();
-            let saved_consts = self.env.consts.clone();
-            if own_only {
-                self.env
-                    .heads
-                    .retain(|h| h.name.starts_with('R') || is_shadow_name(&h.name));
-                // A constant of another module (`crate::base::BLEN`, `ILEN`) makes the whole self
-                // type an entry, which the copy replaces by a projection: an inherent impl on it
-                // is E0118 (a limitation, F11).
-                self.env
-                    .consts
-                    .retain(|c| c.starts_with("::") || c == "RLEN" || c == "self::RLEN");
-            }
             for _ in 0..20 {
                 if let Some(t) = self.head_app(&sc, Con::sized(), 0) {
                     ty = Some(t);
                     break;
                 }
             }
-            self.env.heads = saved_heads;
-            self.env.consts = saved_consts;
             self.no_assoc_paths = false;
             self.no_self = saved_no_self;
             let ty = ty.unwrap_or_else(|| Ty::new("R0"));
@@ -5906,10 +5798,7 @@ impl Gen {
             ));
         }
         self.self_prob = saved_prob;
-        let scope = self.impl_scope(
-            ann.is_some(),
-            &format!("{}{}", sk.params(), sk.where_clause()),
-        );
+        let scope = self.impl_scope(&format!("{}{}", sk.params(), sk.where_clause()));
         let attr = self.attr_with(ann, scope);
         format!(
             "{}impl{} {}{} {{\n{}\n}}\n",
@@ -5919,14 +5808,6 @@ impl Gen {
             sk.where_clause(),
             body.join("\n")
         )
-    }
-
-    /// A free function of a module analyzed as a whole.
-    fn gen_fn(&mut self) -> String {
-        let name = self.name("f");
-        let sig = self.method_sig(&Scope::default(), &name, false);
-        let body = self.method_body(&Scope::default(), 70);
-        format!("pub {} {}\n", sig, body)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -5953,8 +5834,7 @@ impl Gen {
 
     /// An expression of type `usize` that a constant can have: a constant or a `const fn` of `base`,
     /// by an absolute path or, if `relative`, a path that the Leaker rejects in a value
-    /// (`crate::base::BLEN`, `super::base::bf()`, `RLEN`). The path of a constant that the module
-    /// of a module analyzed as a whole declares is no error there.
+    /// (`crate::base::BLEN`, `super::base::bf()`, `RLEN`).
     fn value_usize(&mut self, sc: &Scope, relative: bool) -> String {
         let krate = self.cfg.krate.clone();
         let mut paths: Vec<String> = vec![
@@ -5971,16 +5851,14 @@ impl Gen {
             relatives.push(format!("{}base::bf()", up));
             // The constants of the module and its import are not in a copy of an item. The generic
             // `const fn` of `base` has a type in its turbofish, which the path of the value holds.
-            if !self.module_mode {
-                relatives.push("RLEN".to_string());
-                relatives.push("self::RLEN".to_string());
-                if self.env.consts.iter().any(|c| c == "ILEN") {
-                    relatives.push("ILEN".to_string());
-                }
-                let ty = self.value_type(sc);
-                relatives.push(format!("crate::base::bg::<*const {}>()", ty));
-                relatives.push(format!("{}base::bg::<*const {}>()", up, ty));
+            relatives.push("RLEN".to_string());
+            relatives.push("self::RLEN".to_string());
+            if self.env.consts.iter().any(|c| c == "ILEN") {
+                relatives.push("ILEN".to_string());
             }
+            let ty = self.value_type(sc);
+            relatives.push(format!("crate::base::bg::<*const {}>()", ty));
+            relatives.push(format!("{}base::bg::<*const {}>()", up, ty));
             paths = relatives;
         }
         let path = self.pick(&paths).clone();
@@ -6026,13 +5904,13 @@ impl Gen {
             stmts.push(format!("let _c = 1u8 as {};", target));
         }
         if self.chance(40) {
-            let relative = self.chance(if self.module_mode { 4 } else { 20 });
+            let relative = self.chance(20);
             let path = self.value_usize(sc, relative);
             stmts.push(format!("let _d: usize = {} + 1;", path));
         }
         // A path of the prelude with a type in its turbofish: relative if the Leaker does not allow
-        // the prelude (not in a module analyzed as a whole, which one such error rejects).
-        if !self.module_mode && self.chance(15) {
+        // the prelude.
+        if self.chance(15) {
             let ty = self.value_type(sc);
             stmts.push(format!("let _e = Vec::<*const {}>::new();", ty));
             if !self.cfg.prelude {
@@ -6040,8 +5918,8 @@ impl Gen {
             }
         }
         // Syntax the Leaker cannot read in a value: a glob import and a `macro_rules!`
-        // (`Reason::Unreadable`). One of them rejects a module analyzed as a whole, so not there.
-        if !self.module_mode && self.hash_percent(b"unreadable", 3) {
+        // (`Reason::Unreadable`).
+        if self.hash_percent(b"unreadable", 3) {
             stmts.push(if self.hash_percent(b"unreadable which", 50) {
                 "use ::core::mem::*;".to_string()
             } else {
@@ -6049,7 +5927,7 @@ impl Gen {
             });
         }
         // The root of a `use` is a relative path (`Cause::Unknown` as a path of the error).
-        if !self.module_mode && self.hash_percent(b"relative_use", 3) {
+        if self.hash_percent(b"relative_use", 3) {
             let up = self.env.up.clone();
             stmts.push(format!("use {}base::bf as local_bf;", up));
             self.tags.insert(TAG_VALUE_PATH.to_string());
@@ -6090,22 +5968,9 @@ impl Gen {
     fn value_const(&mut self, sc: &Scope) -> String {
         self.values_used = true;
         let ty = self.value_type(sc);
-        let relative = self.chance(if self.module_mode { 4 } else { 20 });
+        let relative = self.chance(20);
         let path = self.value_usize(sc, relative);
         format!("::core::mem::size_of::<*const {}>() + {}", ty, path)
-    }
-
-    /// A constant or a static of a module analyzed as a whole, with a value (`Flags::values`).
-    fn gen_value_item(&mut self) -> String {
-        let name = self.name("KV");
-        let value = self.value_const(&Scope::default());
-        if self.chance(60) {
-            self.contents.push("const");
-            format!("pub const {}: usize = {};\n", name, value)
-        } else {
-            self.contents.push("static");
-            format!("pub static {}: usize = {};\n", name, value)
-        }
     }
 
     /// `relative_std`: writes the paths that start with `::std::`, `::core::` in a third of their
@@ -6113,10 +5978,7 @@ impl Gen {
     /// item, in the items analyzed one by one. The first line of `text` is its attribute, left as it
     /// is.
     pub fn relativize_std(&mut self, text: &str) -> String {
-        // Not in a module analyzed as a whole: a relative path with an argument that the module
-        // declares (`std::boxed::Box<R0>`) is an entry that names the Leaker's `R0`, where the copy
-        // declares its own. The generator avoids that for every relative path (`is_declared()`).
-        if !self.flags.relative_std || self.module_mode {
+        if !self.flags.relative_std {
             return text.to_string();
         }
         let (head, tail) = match text.find('\n') {
@@ -6176,53 +6038,30 @@ impl Gen {
         out
     }
 
-    /// A type alias of a module analyzed as a whole.
-    fn gen_alias(&mut self) -> String {
-        let name = self.name("Al");
-        let sk = self.skeleton(Level::Item, &Scope::default(), Bounds::default());
-        let sc = sk.scope(&Scope::default());
-        let ty = self.ty(&sc, Con::sized(), 0);
-        let sk = prune(&sk, &ty);
-        format!("pub type {}{} = {};\n", name, sk.params(), ty.text)
-    }
-
-    /// One item of the module `path`. `whole`: the module is analyzed as a whole.
-    fn gen_one(&mut self, path: &[String], whole: bool) -> String {
+    /// One item of the module `path`.
+    fn gen_one(&mut self, path: &[String]) -> String {
         // The flag of the item, `self_common`, is a legacy draw: it was the `allow_self` of the
         // attribute, which the macro does not know any more, and is kept so that the item set stays
         // the same. `false` makes `Self` rarer in the item (`self_prob`), and keeps two shapes that
         // name `Self` from a trait unless it is nested in `enter_generics` (`self_default_shape()` and
         // `self_in_trait_predicate`).
-        let ann = if whole {
-            None
-        } else {
-            let id = self.new_id();
-            Some((id, self.chance(70)))
-        };
-        let ann_id = ann.map(|(id, _)| id);
+        let id = self.new_id();
+        let ann = (id, self.chance(70));
         self.last_scope = "";
-        if ann.is_some() {
-            self.tags.clear();
-            self.values_used = false;
-            self.plain_ai = false;
-            self.skip_trust_draw();
-            self.bare_percent = self.item_bare_percent();
-            // Half of the items nested in `enter_generics` have `nested_self_entries = true` (the macro
-            // allows the `NestedSelfInBounds` risk), the other half not, where a type that names
-            // `Self` next to a generic whose bound does is an error that stays
-            // (`Reason::NestedSelfInBounds`).
-            self.nested_entries =
-                self.features.nested_self_entries && self.hash_percent(b"nested_entries", 50);
-        }
-        // A quarter of the items may have predicates that name a leaked type with generics, and
-        // those of a module analyzed as a whole only in some modules: a module is rejected with
-        // its first such item (`bound_cycles`, the Leaker rejects them).
-        let cyclic_percent = match (self.module_mode, self.cyclic_module) {
-            (false, _) => CYCLIC_ITEM_PERCENT,
-            (true, true) => CYCLIC_ITEM_IN_MODULE_PERCENT,
-            (true, false) => 0,
-        };
-        self.cyclic = self.chance(cyclic_percent);
+        self.tags.clear();
+        self.values_used = false;
+        self.plain_ai = false;
+        self.skip_trust_draw();
+        self.bare_percent = self.item_bare_percent();
+        // Half of the items nested in `enter_generics` have `nested_self_entries = true` (the macro
+        // allows the `NestedSelfInBounds` risk), the other half not, where a type that names
+        // `Self` next to a generic whose bound does is an error that stays
+        // (`Reason::NestedSelfInBounds`).
+        self.nested_entries =
+            self.features.nested_self_entries && self.hash_percent(b"nested_entries", 50);
+        // A share of the items may have predicates that name a leaked type with generics
+        // (`bound_cycles`, the Leaker rejects them).
+        self.cyclic = self.chance(CYCLIC_ITEM_PERCENT);
         let pick = self.below(100);
         let (kind, text): (&'static str, String) = match pick {
             0..=21 => ("struct", self.gen_adt(AdtKind::Struct, ann)),
@@ -6230,28 +6069,14 @@ impl Gen {
             37..=43 => ("union", self.gen_adt(AdtKind::Union, ann)),
             44..=63 => ("trait", self.gen_trait(ann)),
             64..=75 => ("impl-inherent", self.gen_impl_inherent(ann)),
-            76..=93 => match self.gen_impl_trait(ann, path, whole) {
+            76..=93 => match self.gen_impl_trait(ann, path) {
                 Some(text) => ("impl-trait", text),
                 None => ("trait", self.gen_trait(ann)),
             },
-            94..=96 if whole => {
-                let text = self.gen_fn();
-                self.contents.push("fn");
-                let text = self.relativize_std(&text);
-                self.note_text(&text);
-                return text;
-            }
-            97..=99 if whole => {
-                let text = self.gen_alias();
-                self.contents.push("alias");
-                let text = self.relativize_std(&text);
-                self.note_text(&text);
-                return text;
-            }
             _ => ("struct", self.gen_adt(AdtKind::Struct, ann)),
         };
         let text = self.relativize_std(&text);
-        let text = self.with_via(kind, ann_id, text);
+        let text = self.with_via(kind, id, text);
         self.note_text(&text);
         if text.contains("Self::") || text.contains("<Self as ") {
             self.tags.insert(TAG_SELF_ASSOC.to_string());
@@ -6260,7 +6085,6 @@ impl Gen {
             self.tags.insert(TAG_SELF_IN_PREDICATE.to_string());
         }
         if self.last_scope == "nested"
-            && ann.is_some()
             && !self.nested_entries
             && bound_clauses(&text).iter().any(|(bounded, bounds)| {
                 has_word(bounds, "Self") || (has_word(bounded, "Self") && bounded.trim() != "Self")
@@ -6268,46 +6092,28 @@ impl Gen {
         {
             self.tags.insert(TAG_NESTED_SELF_TEXT.to_string());
         }
-        if let Some(id) = ann_id {
-            self.items.push(Item {
-                id,
-                kind,
-                module: path.to_vec(),
-                scope: self.last_scope,
-                contents: vec![kind],
-                tags: self.tags.clone(),
-                source: text.clone(),
-            });
-        } else {
-            self.contents.push(kind);
-        }
+        self.items.push(Item {
+            id,
+            kind,
+            module: path.to_vec(),
+            scope: self.last_scope,
+            contents: vec![kind],
+            tags: self.tags.clone(),
+            source: text.clone(),
+        });
         text
     }
 
     /// The body of the module `path`: the `use`s, the types it declares, items and modules.
-    fn gen_module_body(
-        &mut self,
-        path: &[String],
-        whole: bool,
-        items: usize,
-        nested: usize,
-    ) -> String {
+    fn gen_module_body(&mut self, path: &[String], items: usize, nested: usize) -> String {
         let (env, uses) = self.build_env(path);
-        if !whole {
-            self.mod_uses.push((path.to_vec(), uses.clone()));
-        }
+        self.mod_uses.push((path.to_vec(), uses.clone()));
         let saved_env = std::mem::replace(&mut self.env, env);
         let saved_traits = std::mem::take(&mut self.traits);
         let saved_adts = std::mem::take(&mut self.adts);
         let mut text = String::new();
         text += &uses;
-        // A module analyzed as a whole has the `?Sized` of its types in its bounds, bare or not.
-        let sized = if whole && self.bare_percent > 0 && self.chance(70) {
-            "?Sized"
-        } else {
-            "?::core::marker::Sized"
-        };
-        text += &types_template("R", sized);
+        text += &types_template("R");
         if self.flags.values {
             // The target of a cast in a value (`value_cast_target()`).
             text += "pub type RA = u8;\n";
@@ -6319,26 +6125,14 @@ impl Gen {
             );
         }
         for _ in 0..items {
-            text += &self.gen_one(path, whole);
-        }
-        // `values`: constants and statics with values, in a module analyzed as a whole.
-        if whole && self.flags.values {
-            for _ in 0..2 {
-                if self.chance(60) {
-                    let item = self.gen_value_item();
-                    // The constant is no item of `gen_one()`, whose text `note_text()` reads.
-                    self.tags
-                        .extend(forced_in(&item).into_iter().map(String::from));
-                    text += &self.relativize_std(&item);
-                }
-            }
+            text += &self.gen_one(path);
         }
         for i in 0..nested {
             let name = format!("n{}", i);
             let mut sub = path.to_vec();
             sub.push(name.clone());
             let n = self.range(2, items.max(3));
-            let body = self.gen_module_body(&sub, whole, n, 0);
+            let body = self.gen_module_body(&sub, n, 0);
             text += &format!("pub mod {} {{\n{}\n}}\n", name, body);
         }
         self.env = saved_env;
@@ -6378,7 +6172,7 @@ pub fn generate_with(
     // a macro of another crate, written as it is) or bare (`two!()`: a macro that the Referrer's
     // crate cannot name, an error of the cause `Cause::Macro`).
     lib += TWO_MACRO;
-    let mut base = types_template("B", "?::core::marker::Sized");
+    let mut base = types_template("B");
     // The cast target and the function of a value, which the paths of `values` name.
     if flags.values {
         base += "pub type BA = u8;\npub const fn bf() -> usize { 1 }\n";
@@ -6400,34 +6194,8 @@ pub fn generate_with(
         let name = format!("m{}", i);
         let n = g.range(4, items_per_module);
         let nested = usize::from(g.chance(50));
-        let body = g.gen_module_body(std::slice::from_ref(&name), false, n, nested);
+        let body = g.gen_module_body(std::slice::from_ref(&name), n, nested);
         lib += &format!("pub mod {} {{\n{}\n}}\n", name, body);
-    }
-    // A replay of the draws of the modules that the test analyzed as a whole, which it no longer
-    // makes: what they write is dropped. The final state of the generator seeds the flags of the
-    // invocations and the crate of the errors (`use_flags()`, `errors_crate()`), so the other items
-    // and their flags stay those of the earlier baselines. (To go with the next baselines.)
-    let n_whole = g.range(1, 2);
-    for i in 0..n_whole {
-        let name = format!("mm{}", i);
-        g.new_id();
-        g.no_self = true;
-        g.module_mode = true;
-        g.cyclic_module = g.chance(CYCLIC_MODULE_PERCENT);
-        g.contents.clear();
-        g.tags.clear();
-        g.values_used = false;
-        g.plain_ai = false;
-        g.skip_trust_draw();
-        g.bare_percent = g.module_bare_percent();
-        let n = g.range(4, items_per_module);
-        let nested = usize::from(g.chance(60));
-        g.gen_module_body(std::slice::from_ref(&name), true, n, nested);
-        g.no_self = false;
-        g.module_mode = false;
-        g.cyclic_module = false;
-        g.contents.clear();
-        g.tags.clear();
     }
 
     // The Referrer's crate invokes the macro of each item.
@@ -6581,8 +6349,7 @@ fn stage_crates(
 /// - `std`: `extern crate alloc;` (`crate_header()`), the other two are in every crate;
 /// - `crate`: the module `base` at the root, which re-exports the Leaker's;
 /// - `path` (`super::base`): the same, and each item invoked in a module of its own, empty, in the
-///   same place of the module tree as in the Leaker's crate, so that `super::base` is the root's
-///   (the copy of a module analyzed as a whole declares itself, at the root);
+///   same place of the module tree as in the Leaker's crate, so that `super::base` is the root's;
 /// - `values`, `default`: every relative path of a value or of a default is written as it is, so
 ///   every name the module of the item has must resolve. The crate has the modules of `path`, and
 ///   after the config (`side` `cfg`), which writes them all as they are, each module has its `use`s
@@ -7083,7 +6850,9 @@ fn forced_value_path(text: &str) -> bool {
 
 /// The arguments of `ty` if it is a path with no leading `::` applied to arguments, the last segment
 /// of which is a name that starts with a capital (`R1<T>`, `self::R1<T, U>`, `super::base::B1<T>`):
-/// a type that the Leaker leaks, unless it is `Self::A<..>` or a generic.
+/// a type that the Leaker leaks, unless it is `Self::A<..>` or a generic, or a path of `std`, `core`
+/// or `alloc` (`core::marker::PhantomData<Self>`, which `relative_std` writes: the Leaker allows it
+/// by the attribute of that mode, and the generator writes no module of these names).
 fn relative_path_arguments(ty: &str) -> Option<&str> {
     let ty = ty.trim();
     let end = ty
@@ -7095,7 +6864,10 @@ fn relative_path_arguments(ty: &str) -> Option<&str> {
     }
     let mut segments = path.split("::");
     let (first, last) = (segments.next()?, path.rsplit("::").next()?);
-    if first == "Self" || !last.starts_with(|c: char| c.is_ascii_uppercase()) {
+    if first == "Self"
+        || matches!(first, "std" | "core" | "alloc")
+        || !last.starts_with(|c: char| c.is_ascii_uppercase())
+    {
         return None;
     }
     Some(&rest[1..rest.len() - 1])

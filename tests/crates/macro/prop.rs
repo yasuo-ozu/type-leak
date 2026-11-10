@@ -3465,11 +3465,21 @@ fn defaults_check(inst: &Instance, item: &Item, target: &Path, host: Option<&Typ
         Item::Trait(ItemTrait { ident: n, .. }) => {
             let host = host.expect("a trait has a host");
             let (params, where_clause) = with_self(host.clone());
-            // `need` has the bounds of the trait for any `__X` (`T: AsRef<__X>`), and those for the host
-            // that the arguments name (`<Host as Repeater<..>>::Type` for a default); its caller
-            // has the bounds for the host.
+            // `need` has the bounds of the trait for any `__X` (`T: AsRef<__X>`), and, only if the
+            // arguments name the host (`<Host as Repeater<..>>::Type` for a default), those for the
+            // host (`T: AsRef<Host>`): rustc needs them to normalize that projection. Otherwise they
+            // would only repeat the bounds for `__X` with the host in place of `__X`, and a bound with
+            // an associated type fixed (`T: Fn() -> &Self`) would fix it twice (`&__X` and `&Host`,
+            // E0284). Its caller has the bounds for the host.
             let (mut need_params, mut need_where) = with_self(parse_quote!(__X));
-            let (host_params, host_where) = (params.clone(), where_clause.clone());
+            let host_named = completed
+                .iter()
+                .any(|arg| count_name(quote!(#arg), &inst.host().to_string()) > 0);
+            let (host_params, host_where) = if host_named {
+                (params.clone(), where_clause.clone())
+            } else {
+                (Punctuated::new(), None)
+            };
             for param in need_params.iter_mut() {
                 if let GenericParam::Type(t) = param {
                     let more = host_params.iter().find_map(|p| match p {

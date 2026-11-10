@@ -421,9 +421,8 @@
 //!   writes about a third of the paths of `std` and `core` of the items analyzed one by one without
 //!   the leading `::` (some `alloc::`), which the Leaker allows (`allow = "std,core,alloc"`) but for
 //!   the rule `std`, and `extern crate alloc;` is in every crate; `values` gives the items values
-//!   (`gen::Flags::values`): bodies of functions, methods and default methods, the values of
-//!   constants and statics, the defaults of associated constants and of const parameters, with
-//!   the types of the Leaker's crate in a `let`, a turbofish and a cast, which the Leaker leaks with
+//!   (`gen::Flags::values`): bodies of methods and default methods, the defaults of associated
+//!   constants and of const parameters, with the types of the Leaker's crate in a `let`, a turbofish and a cast, which the Leaker leaks with
 //!   `check_values` and the witnesses check (`Args::bodies`), and in a share of them a relative
 //!   path of a value (`crate::base::bf()`, `RLEN`), which it rejects (the tag `value_path`). An item
 //!   whose text writes one, the root of a `use`, or a name of the prelude where its attribute says
@@ -3225,7 +3224,7 @@ impl Stats {
 
 /// The least share of the analyzed items of each kind, scope and construct that the Leaker must
 /// accept, in percent. The items that have a forced shape (`FORCED`, which the run checks apart) are
-/// left out: 7.2% of the items analyzed (5.5% to 8.7% in a seed). The table of the summary has the
+/// left out: 7.7% of the items analyzed (6.1% to 9.2% in a seed). The table of the summary has the
 /// share over all the items too (`all%`).
 ///
 /// A test that counts a rejection as a success passes when the Leaker rejects everything, or when
@@ -3233,102 +3232,105 @@ impl Stats {
 /// 60% of the traits were rejected, and a macro that failed every `intern_*` still printed `ok`).
 /// These floors fail the run then.
 ///
-/// Measured over the seeds 1 to 16 at 60 cases (2026-11-02, with the fixes of F65 to F67), the share
-/// accepted of the items without a forced shape was, lowest over the seeds / pooled (and the fewest
-/// items of a seed); in brackets the lowest before wave 3A, and the lowest over all the items:
+/// Measured over the seeds 1 to 16 at 60 cases (2026-11-10), the share accepted of the items without
+/// a forced shape was, lowest over the seeds / pooled (and the fewest items of a seed); in brackets
+/// the lowest of the measurement before (2026-11-02):
 ///
-/// - kinds: struct 94.8/96.1 (293) [94.1; 85.9], enum 90.3/95.7 (145) [93.5; 80.9], union 90.8/96.3
-///   (69) [90.4; 84.4], trait 73.4/77.9 (312) [72.7; 66.3], inherent impl 80.1/87.3 (115) [81.4;
-///   72.7], trait impl 58.6/69.1 (54) [63.0; 55.4], module 71.6/79.8 (81) [68.9; 71.6];
-/// - scopes: `nested` (then a module scope) 89.4/93.8 (124) [89.9; 75.0], `enter_generics` 87.8/93.8 (33) [90.5; 61.0],
-///   `enter_trait` 70.7/81.6 (27) [67.9; 64.4], `enter_impl` 100/100 (34) [100; 100];
-/// - constructs (`gen::CONSTRUCTS`, the items that have it, not the modules): gat 47.5/58.0 (46)
-///   [50.8; 43.3], const_param 77.5/80.6 (442) [76.5; 72.0], impl_trait_arg 61.3/67.4 (160) [58.9;
-///   54.3], param_default 85.6/88.0 (165) [82.2; 79.8], binder 75.3/79.0 (222) [73.4; 67.0],
-///   dyn_object 79.3/83.0 (394) [78.7; 73.3], fn_pointer 77.0/81.6 (327) [78.5; 70.9], assoc_const
-///   63.6/72.4 (183) [69.6; 57.4], lifetime_param 81.1/85.0 (597) [80.7; 75.9], unsized_param
-///   77.6/81.3 (275) [76.7; 71.6], where_clause 77.6/81.4 (651) [78.1; 70.7].
+/// - kinds: struct 95.3/96.2 (295) [94.8], enum 91.9/95.8 (147) [90.3], union 90.8/96.3 (67)
+///   [90.8], trait 78.7/83.7 (313) [73.4], inherent impl 80.1/87.7 (118) [80.1], trait impl
+///   65.7/74.0 (53) [58.6];
+/// - scopes: `nested` 89.4/93.8 (126) [89.4], `enter_generics` 87.5/94.2 (32) [87.8], `enter_trait`
+///   73.2/84.2 (26) [70.7], `enter_impl` 100/100 (34) [100];
+/// - constructs (`gen::CONSTRUCTS`, the items that have it): gat 61.1/72.5 (47) [47.5], const_param
+///   81.3/83.9 (440) [77.5], impl_trait_arg 66.5/73.0 (161) [61.3], param_default 87.3/89.5 (163)
+///   [85.6], binder 80.3/83.9 (255) [75.3], dyn_object 84.1/87.2 (490) [79.3], fn_pointer 84.0/87.1
+///   (432) [77.0], assoc_const 71.9/79.1 (186) [63.6], lifetime_param 84.7/88.2 (594) [81.1],
+///   unsized_param 82.1/84.8 (276) [77.6], where_clause 81.6/84.8 (668) [77.6].
 ///
-/// A floor is 10 points below the lowest, rounded down (`enter_trait` would be 60 and the module 61,
-/// and they stay at 50 and 58: they have the fewest items, whose rate varies most). They are within
-/// 3 points of the floors before the shapes, but `assoc_const` (59 -> 53). What the Leaker still
-/// rejects there is not forced: bounds that name a leaked type, `Self::A`, the bare traits of the
-/// prelude. The lowest of 16 seeds is a noisy number at 50 items a seed (a spread of 6 points):
-/// with `strict_anchors` off, the shape of wave 3A that the Leaker rejects in some settings, the
-/// pooled rates are the same (trait impl 69.3, assoc_const 73.5) and the lowest are 63.0 and 67.6.
+/// Over all the items (`all%`, the forced shapes counted as rejections) the lowest of the kinds were
+/// struct 86.1, enum 82.7, union 83.7, trait 71.3, inherent impl 72.7 and trait impl 61.8.
 ///
-/// Eight floors of this table are above what the opt-in run of `values` is measured to reach (struct,
-/// enum, union, `enter_generics`, const_param, param_default, unsized_param, module), so that run has
-/// `VALUES_FLOORS`, which are the lower of the two, measured the same way.
-/// A construct is checked when a run has three times the `MIN_SAMPLES` of it.
-/// `TYPE_LEAK_PROP_MIN_ACCEPT` overrides them. The modules analyzed as a whole, and their floor
-/// (58, and 53 for `values`), are gone since the module support of the library went (2026-11-09);
-/// the numbers above count them in the kinds' `generated` and in the lowest of the module.
+/// A floor is 10 points below the lowest, rounded down (`enter_trait` would be 63, and stays at 50:
+/// it has the fewest items, 26 in a seed, whose rate varies most, from 73.2 to 93.3 over the seeds).
+/// Most floors are higher than those of 2026-11-02 (gat 37 -> 51, assoc_const 53 -> 61, trait impl
+/// 48 -> 55, trait 63 -> 68): the library accepts more since its fixes of F68 to F109. What the
+/// Leaker still rejects there is not forced: bounds that name a leaked type, `Self::A`, the bare
+/// traits of the prelude. The lowest of 16 seeds is a noisy number at 50 items a seed (trait impl
+/// 65.7 to 80.0): with `strict_anchors` off, the shape of wave 3A that the Leaker rejects in some
+/// settings, the pooled rates are the same (trait impl 74.6, assoc_const 79.2) and the lowest are
+/// 67.1 and 74.6.
+///
+/// Ten floors of this table are above what the opt-in run of `values` is measured to reach (struct,
+/// enum, union, `enter_generics`, const_param, param_default, binder, dyn_object, fn_pointer,
+/// unsized_param), so that run has `VALUES_FLOORS`, which are the lower of the two, measured the same
+/// way. A construct is checked when a run has three times the `MIN_SAMPLES` of it.
+/// `TYPE_LEAK_PROP_MIN_ACCEPT` overrides them.
 const FLOORS: &[(&str, f64)] = &[
-    ("struct", 84.0),
-    ("enum", 80.0),
+    ("struct", 85.0),
+    ("enum", 81.0),
     ("union", 80.0),
-    ("trait", 63.0),
+    ("trait", 68.0),
     ("impl-inherent", 70.0),
-    ("impl-trait", 48.0),
+    ("impl-trait", 55.0),
     // The items analyzed through a scope (`gen::SCOPES`), by the name of its API.
     ("nested", 79.0),
     ("enter_generics", 77.0),
     ("enter_trait", 50.0),
     ("enter_impl", 90.0),
     // The items that have a construct (`gen::CONSTRUCTS`).
-    ("gat", 37.0),
-    ("const_param", 67.0),
-    ("impl_trait_arg", 51.0),
-    ("param_default", 75.0),
-    ("binder", 65.0),
-    ("dyn_object", 69.0),
-    ("fn_pointer", 67.0),
-    ("assoc_const", 53.0),
-    ("lifetime_param", 71.0),
-    ("unsized_param", 67.0),
-    ("where_clause", 67.0),
+    ("gat", 51.0),
+    ("const_param", 71.0),
+    ("impl_trait_arg", 56.0),
+    ("param_default", 77.0),
+    ("binder", 70.0),
+    ("dyn_object", 74.0),
+    ("fn_pointer", 74.0),
+    ("assoc_const", 61.0),
+    ("lifetime_param", 74.0),
+    ("unsized_param", 72.0),
+    ("where_clause", 71.0),
 ];
 
 /// The floors of the run with `values` (`TYPE_LEAK_PROP_FEATURES=values`), 10 points below the lowest
 /// over the seeds 1 to 16 at 60 cases, rounded down, or the floor of `FLOORS` if that is lower. The
-/// items that have a forced shape are left out as in `FLOORS`: 13.7% of the items analyzed (11.7% to
-/// 15.2% in a seed), 6.8% of them for `forced:value_path`, a relative path, the root of a `use` or a
-/// name of the prelude that the Leaker does not allow, in a body or a constant (all rejected, as the
-/// run checks), and the rest for the other shapes, with the glob imports and the `macro_rules!` of
-/// `unreadable_value`. Measured on 2026-11-03, the lowest accepted share / pooled (and the fewest
-/// items of a seed): struct 90.6/92.5 (305), enum 88.0/93.0 (152), union 87.3/93.5 (66), trait
-/// 73.7/76.8 (267), inherent impl 86.3/89.4 (86), trait impl 67.3/73.8 (55), module 63.6/78.3 (68),
-/// `nested` (then a module scope) 90.8/93.4 (125), `enter_generics` 85.4/91.0 (29), `enter_trait` 68.4/79.2 (23),
-/// `enter_impl` 100/100 (29), gat 50.0/59.8 (36), const_param 73.8/77.0 (381), impl_trait_arg
-/// 63.1/67.6 (121), param_default 76.9/79.1 (225), binder 75.6/80.1 (230), dyn_object 81.3/83.9
-/// (462), fn_pointer 82.3/84.1 (403), assoc_const 67.2/72.1 (162), lifetime_param 82.8/84.2 (534),
-/// unsized_param 76.0/81.0 (232), where_clause 79.5/81.2 (552). With the value paths counted, the
-/// lowest were trait 64.5, inherent impl 76.1, trait impl 57.8, module 54.4 (its floor was 49), gat
-/// 42.0 and assoc_const 56.8. The run with `relative_std` is above `FLOORS` everywhere (the lowest:
-/// trait 73.7, gat 50.0, assoc_const 68.1, impl_trait_arg 58.4), and needs none of its own.
+/// items that have a forced shape are left out as in `FLOORS`: 13.7% of the items analyzed (11.3% to
+/// 15.2% in a seed), 6.2% of the items for `forced:value_path`, a relative path, the root of a `use`
+/// or a name of the prelude that the Leaker does not allow, in a body or a constant (all rejected, as
+/// the run checks), and the rest for the other shapes, with the glob imports and the `macro_rules!` of
+/// `unreadable_value`. Measured on 2026-11-10, the lowest accepted share / pooled (and the fewest
+/// items of a seed): struct 90.9/92.6 (308), enum 88.0/93.1 (156), union 88.3/93.7 (66), trait
+/// 78.7/82.0 (267), inherent impl 86.3/89.6 (86), trait impl 70.4/77.7 (55), `nested` 90.8/93.4
+/// (125), `enter_generics` 85.4/91.0 (29), `enter_trait` 68.4/81.8 (23), `enter_impl` 100/100 (29),
+/// gat 61.1/77.5 (34), const_param 77.1/79.9 (381), impl_trait_arg 67.6/72.3 (121), param_default
+/// 78.3/80.3 (225), binder 78.6/82.5 (233), dyn_object 83.2/86.1 (462), fn_pointer 83.6/86.1 (403),
+/// assoc_const 72.8/78.2 (162), lifetime_param 85.2/86.9 (534), unsized_param 78.0/84.1 (232),
+/// where_clause 82.8/84.1 (564). Over all the items (`all%`, the value paths and the other forced
+/// shapes counted as rejections), the lowest were trait 61.2, inherent impl 64.5 and trait impl 58.8.
+/// The runs with `relative_std` (seeds 1 to 16) are above `FLOORS` everywhere (the lowest: trait
+/// 78.2, trait impl 64.0, gat 59.6, assoc_const 67.7, impl_trait_arg 63.0), and need none of their
+/// own.
 const VALUES_FLOORS: &[(&str, f64)] = &[
     ("struct", 80.0),
-    ("enum", 77.0),
-    ("union", 77.0),
-    ("trait", 63.0),
+    ("enum", 78.0),
+    ("union", 78.0),
+    ("trait", 68.0),
     ("impl-inherent", 70.0),
-    ("impl-trait", 48.0),
+    ("impl-trait", 55.0),
     ("nested", 79.0),
     ("enter_generics", 75.0),
     ("enter_trait", 50.0),
     ("enter_impl", 90.0),
-    ("gat", 37.0),
-    ("const_param", 63.0),
-    ("impl_trait_arg", 51.0),
-    ("param_default", 66.0),
-    ("binder", 65.0),
-    ("dyn_object", 69.0),
-    ("fn_pointer", 67.0),
-    ("assoc_const", 53.0),
-    ("lifetime_param", 71.0),
-    ("unsized_param", 65.0),
-    ("where_clause", 67.0),
+    ("gat", 51.0),
+    ("const_param", 67.0),
+    ("impl_trait_arg", 56.0),
+    ("param_default", 68.0),
+    ("binder", 68.0),
+    ("dyn_object", 73.0),
+    ("fn_pointer", 73.0),
+    ("assoc_const", 61.0),
+    ("lifetime_param", 74.0),
+    ("unsized_param", 68.0),
+    ("where_clause", 71.0),
 ];
 
 /// The fewest analyzed items of a kind for its floor to count (a short run has too few of the
@@ -3340,9 +3342,9 @@ const CONSTRUCT_SAMPLES: usize = 3;
 
 /// The least share of the type positions of the accepted items whose rewritten type was compared
 /// with the original (the rest has an elided lifetime or `impl Trait`), in percent:
-/// `TYPE_LEAK_PROP_MIN_CHECKED`. Without it the oracle could silently check nothing. Measured:
-/// 90.6% to 91.1% over the seeds 1 to 16 at 60 cases (93.5% to 93.8% before the types with an
-/// elided lifetime and a macro in an array length, which have no witness).
+/// `TYPE_LEAK_PROP_MIN_CHECKED`. Without it the oracle could silently check nothing. Measured on
+/// 2026-11-10: 96.8% to 98.5% over the seeds 1 to 16 and 22 at 60 cases, with and without `values`
+/// (90.6% to 91.1% on 2026-11-02).
 const MIN_CHECKED: f64 = 85.0;
 
 /// The least number of times that an instantiation passes an argument that holds a lifetime to a
@@ -3351,23 +3353,24 @@ const MIN_CHECKED: f64 = 85.0;
 /// inst_elided_candidates`): the pairs of a signature and a parameter that the instantiation gives an
 /// argument, that any type fits and that no path hides a lifetime of the signature from. Without it a
 /// generator that stopped making the shape would leave the check vacuous. A candidate gets a type with
-/// a lifetime in about 60% of the instantiations (69% of 2188 measured), and a parameter in two
+/// a lifetime in about 60% of the instantiations (75% of 1945 measured), and a parameter in two
 /// signatures is two candidates, so a run with 16 has none with a probability under 1e-3. Measured at
-/// 60 cases: 36 to 78 candidates and 21 to 57 counted over the seeds 1 to 16 and 22, with and without
-/// `values`.
+/// 60 cases (2026-11-10): 39 to 77 candidates and 24 to 64 counted over the seeds 1 to 16 and 22,
+/// with and without `values`.
 const MIN_ELIDED_LIFETIME_ARGS: usize = 1;
 const MIN_ELIDED_CANDIDATES: usize = 16;
 
 /// The same for the instantiations that pass the argument to a signature that has an entry in its
 /// inputs, which the copy replaced (F70). `plan_instance()` always gives such a candidate a type with
-/// a lifetime, so a run that has one has it counted: the least is exact. Measured at 60 cases: the
-/// counted are the candidates in each of 40 runs, 3 to 26 over the seeds 1 to 16 and 22, with and
-/// without `values` (a run with none passes the least, but see `MIN_ASKED_FOR_CANDIDATES`).
+/// a lifetime, so a run that has one has it counted: the least is exact. Measured at 60 cases
+/// (2026-11-10): the counted are the candidates in each of 34 runs, 5 to 24 over the seeds 1 to 16
+/// and 22, with and without `values` (a run with none passes the least, but see
+/// `MIN_ASKED_FOR_CANDIDATES`).
 const MIN_ELIDED_ENTRY_LIFETIME_ARGS: usize = 1;
 const MIN_ELIDED_ENTRY_CANDIDATES: usize = 1;
 
 /// The fewest items invoked with `inst` for which a run must have candidates of F69 and F70 at all:
-/// at 60 cases (about 500 such items) the fewest F70 candidates in 40 runs was 3.
+/// at 60 cases (426 to 550 such items) the fewest F70 candidates in 34 runs was 5.
 const MIN_ASKED_FOR_CANDIDATES: usize = 100;
 
 #[derive(Debug, PartialEq)]
@@ -5813,6 +5816,13 @@ mod checks {
             ("<T>", "where T: AsRef<Self>"),
             ("<T>", "where Self: Sized, T: Clone"),
             ("<T>", "where ::std::vec::Vec<Self>: Default"),
+            // `relative_std` writes these without the `::`, and the Leaker allows them.
+            (
+                "<T>",
+                "where core::marker::PhantomData<Self>: ::core::clone::Clone",
+            ),
+            ("<T>", "where std::vec::Vec<Self>: Default, T: Clone"),
+            ("<T>", "where alloc::vec::Vec<Self>: Default"),
             ("<T>", "where Self::A0: Clone"),
             ("<T>", "where <Self as Tr1_1<T>>::A0: Clone"),
             ("<T>", "where T: Into<R1<Self>>"),
@@ -5853,6 +5863,9 @@ mod checks {
             "impl<T: Clone> R1<T>",
             "impl<T: AsRef<Self>> ::k::base::B1<T>",
             "impl<E: AsRef<Self>> ::k::m0::Tr for (::core::cell::Cell<bool>, E)",
+            // `relative_std` writes a path of `std`, `core` or `alloc` without the `::`.
+            "impl<E: AsRef<Self>> ::k::m0::Tr for core::cell::Cell<E>",
+            "impl<E: AsRef<Self>> ::k::m0::Tr for alloc::vec::Vec<E>",
             "impl<E: AsRef<Self>, T> R1<T>",
             "impl<T: AsRef<Self>> &'static unsafe fn(i32)",
         ] {
@@ -6931,7 +6944,7 @@ mod checks {
 
     /// `relativize_std()` only drops the leading `::` of `std` and `core` (and says `alloc` where
     /// `alloc` has the item), leaves the attribute, a path that hides a lifetime and an item with
-    /// bounds that name its `Self` alone, and does nothing in a module analyzed as a whole.
+    /// bounds that name its `Self` alone.
     #[test]
     fn the_paths_of_std_are_relativized_where_they_are_safe() {
         let flags = Flags {
