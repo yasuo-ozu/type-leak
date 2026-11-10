@@ -212,7 +212,7 @@ pub enum SelfRequirement {
     /// in front. A proc macro cannot find that path by itself: it must come from the macro's
     /// input. For a nested item, add [`NestedSelf::modules`](crate::NestedSelf::modules). If the
     /// self type of an impl is a relative path, rewrite it like any other type
-    /// ([`Referrer::expand()`](crate::Referrer::expand)).
+    /// ([`Referrer::visitor()`](crate::Referrer::visitor)).
     ///
     /// ```ignore
     /// // In crate a: the entry `Rel<Self>` of a struct.
@@ -299,35 +299,15 @@ impl std::hash::Hash for SelfRequirement {
     }
 }
 
-/// A generic associated type of a trait that has outlives relations (`type G<'b> where Self: 'b;`
-/// or `type G<'b, U: 'b>;`).
-///
-/// The `gats` field of [`Context`] lists them. `Self::G<'x>` is well-formed only if `Self: 'x`.
-/// The signature of the trait implies that. The impl of the Repeater has no signature, so the
-/// entry must require it. Only the outlives relations are kept here. Any other bound must be
-/// written by the method that names the type, as rustc requires.
-///
-/// ```ignore
-/// // In crate a:
-/// pub trait Tr { type G<'b, U: 'b> where Self: 'b; }
-///
-/// // The `Gat` of `G`:
-/// ident: G
-/// generics: <'b, U> where U: 'b, Self: 'b
-/// ```
-///
-/// You cannot build a `Gat`. `ToTokens` writes it as an item (`type G<'b, U> where U: 'b, Self:
-/// 'b ;`), and a Referrer read back from tokens has it.
+/// A generic associated type of a trait with its outlives relations (`type G<'b, U> where U: 'b,
+/// Self: 'b;`): `Self::G<'x>` needs `Self: 'x`, which the trait's signature implies and the impl
+/// of the Repeater must require. Only the top-level context of a trait has them.
 #[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct Gat {
+pub(crate) struct Gat {
     /// The name of the type (`G`).
-    pub ident: Ident,
-    /// The parameters of the type, and a where clause of its outlives relations.
-    ///
-    /// The parameters have no bounds: the bounds move to the where clause. `Self: 'b` is there too
-    /// when the trait writes it.
-    pub generics: Generics,
+    pub(crate) ident: Ident,
+    /// The parameters, without bounds, and a where clause of the outlives relations.
+    pub(crate) generics: Generics,
 }
 
 impl Gat {
@@ -673,8 +653,7 @@ pub enum ModuleScope {
     /// The context is inside this module.
     ///
     /// The id is that of the module's own context. An entry has it if its type means something
-    /// only in the module (a relative path, a name that the module declares, a type macro). So
-    /// does the top-level context of a scope that was entered in a module.
+    /// only in the module (a relative path, a name that the module declares, a type macro).
     In(ContextId),
     /// The context is the module's own context.
     ///
@@ -723,9 +702,9 @@ impl ModuleScope {
 ///
 /// [`Referrer::iter()`](crate::Referrer::iter) gives the context of each entry. The fields are
 /// public to be read. You cannot build a `Context`, and more fields may come. Two contexts are
-/// equal if all their fields are equal, but [`substituted`](Context::substituted) is not compared,
-/// nor are the path, hint and parent of a module ([`ModuleScope::Itself`]). A Referrer that is
-/// written as tokens and read back keeps every field except `substituted`.
+/// equal if all their fields are equal, but the path, hint and parent of a module
+/// ([`ModuleScope::Itself`]) are not compared. A Referrer that is written as tokens and read back
+/// keeps every field.
 ///
 /// ```
 /// # use syn::*;
@@ -783,8 +762,7 @@ pub struct Context {
     /// None
     /// ```
     ///
-    /// A top-level context has it if an entry depends on it, else `None`. A Referrer read back from
-    /// tokens keeps it.
+    /// A Referrer read back from tokens keeps it.
     pub self_ty: Option<SelfRequirement>,
     /// The lifetimes `'a` for which the entries need `Self: 'a`, sorted.
     ///
@@ -806,38 +784,20 @@ pub struct Context {
     ///
     /// A Referrer read back from tokens keeps it.
     pub self_outlives: Vec<Lifetime>,
-    /// The generic associated types of the trait, with their outlives relations, sorted by name.
+    /// The generic associated types of the trait, sorted by name: only in the top-level context of
+    /// a trait that has a `self_ty` (see [`Gat`]). Kept in tokens.
+    pub(crate) gats: Vec<Gat>,
+    /// The module that the entries of the context are in, or `None` if they do not depend on a
+    /// module.
     ///
-    /// Only the top-level context of a trait has them, and only if it has a `self_ty`. The context
-    /// of an entry has none. See [`Gat`].
-    ///
-    /// ```ignore
-    /// // In crate a:
-    /// pub trait Tr {
-    ///     type G<'b, U: 'b> where Self: 'b;
-    ///     fn f<'x>(&'x self) -> Rel<Self::G<'x, u8>>;
-    /// }
-    ///
-    /// // `gats` of the context of the entry `Rel<Self::G<'x, u8>>`:
-    /// []
-    /// // `gats` of the top-level context of `Tr`:
-    /// [type G<'b, U> where U: 'b, Self: 'b;]
-    /// ```
-    ///
-    /// A Referrer read back from tokens keeps it.
-    pub gats: Vec<Gat>,
-    /// The module that the context is in, or is. `None` if the entries do not depend on a module.
-    ///
-    /// See [`ModuleScope`] for the two kinds.
+    /// See [`ModuleScope`].
     ///
     /// ```ignore
     /// // In crate a:
     /// pub mod m { pub struct S { a: Rel, b: ::p::Abs } }
     ///
-    /// // `module` of the context of `m` itself (context 0):
-    /// Some(Itself { id: 0, path: Some([]), hint: None, parent: None })
-    /// // `module` of the context of `Rel` (context 1), a relative path that means something
-    /// // only in `m`:
+    /// // `module` of the context of `Rel`, a relative path that means something only in `m`
+    /// // (the id of `m` is 0):
     /// Some(In(0))
     /// // `module` of the context of `::p::Abs`, which means the same everywhere:
     /// None
@@ -845,28 +805,10 @@ pub struct Context {
     ///
     /// A Referrer read back from tokens keeps it.
     pub module: Option<ModuleScope>,
-    /// The `Self` of the outer scopes that this context depends on through their bounds.
-    ///
-    /// It is empty for most contexts. It is not part of the identity: two contexts that differ
-    /// only here are equal. It lets the scope that declares such a `Self` know that this context
-    /// depends on it, so its top-level context records it in `self_ty`.
-    ///
-    /// ```ignore
-    /// // In crate a: the entry `Wrap<S<T>>` writes the type of `S` out, so it depends on the
-    /// // bounds of `S` and on `Self` of `S`, which is `S<T>`.
-    /// pub struct S<T: Fn(T::Item) + Iterator<Item = u8>> { a: Wrap<S<T>> }
-    ///
-    /// // `substituted` of the context of `Wrap<S<T>>`:
-    /// [SelfRequirement::Type(S<T>)]
-    /// // `self_ty` of the top-level context of `S`:
-    /// Some(SelfRequirement::Type(S<T>))
-    /// ```
-    ///
-    /// It is also set for a scope inside `S` that has a `Self` of its own (a nested impl, struct,
-    /// enum, union or trait). The bound `T: Tr<Self>` of `S` is `T: Tr<S<T>>` in its context.
-    ///
-    /// A Referrer read back from tokens does not keep it: it is empty then.
-    pub substituted: Vec<SelfRequirement>,
+    /// The `Self` of the outer scopes whose bounds this context depends on (`S<T>` for the entry
+    /// `Wrap<S<T>>` of `struct S<T: Fn(T::Item) + Iterator<Item = u8>>`), so that the scope that
+    /// declares it records it in its `self_ty`. Not part of the identity, not kept in tokens.
+    pub(crate) substituted: Vec<SelfRequirement>,
 }
 
 /// A bound that mentions the `Self` of an outer scope, which cannot be written where `Self` is
@@ -1406,14 +1348,13 @@ impl std::hash::Hash for Context {
 }
 
 /// Identifies a context: what gives a leaked type its meaning, which is the generics it uses, what
-/// `Self` is, and the module it is written in. It decides which Repeater impl an entry needs.
+/// `Self` is, and the module it is written in.
 ///
-/// Every analysis method of the [`Leaker`](crate::Leaker) returns the id of the top-level context of
-/// what it analyzed (keep it: [`Referrer::visitor()`](crate::Referrer::visitor) needs it).
-/// [`Referrer::iter()`](crate::Referrer::iter) gives the context of each entry. Ids count from 0 in
-/// order of first appearance and are never renumbered, so the Referrer may skip some. Entries with
-/// the same generics, `Self` and module share an id. `ToTokens` writes it as an integer literal,
-/// and `Parse` reads one with or without `usize`.
+/// Every analysis method of the [`Leaker`](crate::Leaker) returns the id of the context of what it
+/// analyzed (keep it: [`Referrer::visitor()`](crate::Referrer::visitor) takes the generics, `Self`
+/// and module of the copy from it). A [`ModuleScope`] has the id of a module. Ids count from 0 in
+/// order of first appearance, and the Referrer may skip some. `ToTokens` writes it as an integer
+/// literal, and `Parse` reads one with or without `usize`.
 ///
 /// The generics of a context are the ones its entries use: those the type names, those that their
 /// bounds name and, if it names `Self`, those of the description of `Self`. A where predicate on
@@ -1422,10 +1363,6 @@ impl std::hash::Hash for Context {
 /// another bound of it fixes an associated type ([Bounds that name leaked
 /// types](crate::Leaker#bounds-that-name-leaked-types)). The generics are matched with those of the
 /// item by name ([`substitute_args()`](crate::substitute_args)).
-///
-/// The top-level context is that of the item or scope itself, and it differs from the context of an
-/// entry that uses fewer generics. It records what `Self` is if an entry names it and the module of
-/// the scope, so that [`Referrer::visitor()`](crate::Referrer::visitor) knows them from the id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContextId(usize);
 

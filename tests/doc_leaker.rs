@@ -81,8 +81,7 @@ fn intern_mod_does_not_leak_the_names_the_module_declares() {
             array_const,
         )
         .unwrap()
-        .nth(1)
-        .unwrap();
+        .remove(1);
     match &r.module {
         Some(ModuleScope::Itself {
             path: Some(path), ..
@@ -207,22 +206,22 @@ fn allow_changes_no_entry() {
     let replaced: Type = parse_quote!(Replaced);
     let referrer = result.clone().finish().unwrap();
     assert_eq!(
-        referrer.expand(context, ty.clone(), |_, _, _| replaced.clone()),
+        common::expand(&referrer, context, ty.clone(), |_, _, _| replaced.clone()),
         replaced
     );
     let result = result.allow(Rules::new().external_crates());
     let referrer = result.finish().unwrap();
     assert_eq!(
-        referrer.expand(context, ty.clone(), |_, _, _| replaced.clone()),
+        common::expand(&referrer, context, ty.clone(), |_, _, _| replaced.clone()),
         replaced
     );
     // A Leaker that has the rule finds no entry, so the copy writes the type as it is.
-    let mut leaker = Leaker::from_config(Rules::new().external_crates());
+    let mut leaker = Leaker::with_rule(Rules::new().external_crates());
     let context = leaker.intern_struct(&parse_quote! { struct S { a: ::foo::X } });
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer.is_empty());
     assert_eq!(
-        referrer.expand(context, ty.clone(), |_, _, _| replaced.clone()),
+        common::expand(&referrer, context, ty.clone(), |_, _, _| replaced.clone()),
         ty
     );
 }
@@ -250,13 +249,13 @@ fn check_values_leaks_types_in_values_and_rejects_other_relative_paths() {
     };
     // Without the option the value is not read: the copy breaks without an error.
     let config = Rules::new().primitive();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_trait(&item);
     assert!(leaker.result().finish().unwrap().is_empty());
 
     // With it the type is an entry, which the visitor replaces in the copy of the value.
     let config = || Rules::new().primitive();
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
     let context = leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
@@ -278,7 +277,7 @@ fn check_values_leaks_types_in_values_and_rejects_other_relative_paths() {
 
     // A path that is not a type cannot be replaced.
     let item: ItemTrait = parse_quote! { trait Tr { const N: usize = inner::N; } };
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
@@ -297,7 +296,7 @@ fn a_nested_type_that_names_self_with_a_self_bound_is_an_entry_with_an_error() {
     let item: Item = parse_quote! {
         pub struct S<T: ::core::convert::AsRef<Self>> { pub b: Rel2<Self, T> }
     };
-    let mut leaker = Leaker::from_config(Rules::new());
+    let mut leaker = Leaker::with_rule(Rules::new());
     leaker.enter_mod("m", [parse_quote!(S)], |view| view.visit_item(&item));
     let result = leaker.result();
     // The risk is an error, with no paths, and the type is an entry all the same.
@@ -320,8 +319,7 @@ fn a_nested_type_that_names_self_with_a_self_bound_is_an_entry_with_an_error() {
     let r = result
         .repeater_impls(&repeater, 7, ImplSelf::Param(&param), slot_const(&repeater))
         .unwrap()
-        .next()
-        .unwrap();
+        .remove(0);
     // `r.path` has no `KEY`, and `ToTokens` writes the one of the id 7.
     let key = repeater_key(7, r.entry);
     let imp: ItemImpl = parse_quote!(#r);
@@ -333,7 +331,7 @@ fn a_nested_type_that_names_self_with_a_self_bound_is_an_entry_with_an_error() {
     assert_eq!(imp, expected);
 
     // The rule of the Leaker drops the error as well, at the end of the call: the entry is the same.
-    let mut leaker = Leaker::from_config(move |c: &Cause, _: Place| *c == cause);
+    let mut leaker = Leaker::with_rule(move |c: &Cause, _: Place| *c == cause);
     leaker.enter_mod("m", [parse_quote!(S)], |view| view.visit_item(&item));
     let result = leaker.result();
     assert!(result.errors().is_empty());
@@ -365,7 +363,7 @@ fn allow_prelude_leaves_the_names_of_the_prelude_as_written() {
     assert!(leaker.result().finish().is_err());
 
     let config = Rules::new().prelude();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_trait(&item);
     // `Clone` and `Vec` are left as written. The only entry is `Vec<Rel>`: a bare `Rel` may be
     // a const, so the type that holds it is leaked whole.
@@ -382,7 +380,7 @@ fn allow_crate_leaves_crate_paths_as_written() {
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
     // ...and left as written if the copy is in the same crate.
     let config = Rules::new().crate_paths();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_struct(&item);
     assert!(leaker.result().finish().unwrap().is_empty());
 }

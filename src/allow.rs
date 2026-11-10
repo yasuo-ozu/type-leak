@@ -7,7 +7,7 @@ use crate::util::{is_std_crate_path, self_head, starts_with_known, Known};
 use syn::Path;
 
 /// Where in an item a path or an error is. [`Allow::allow()`] is asked at a place; it is
-/// [`ErrorItem::place()`] for an error.
+/// [`ErrorItem::place`] for an error.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Place {
@@ -20,7 +20,7 @@ pub struct Place {
 }
 
 /// What a [`Leaker`](crate::Leaker) may write as it is. Pass it to
-/// [`Leaker::from_config()`](crate::Leaker::from_config), or to
+/// [`Leaker::with_rule()`](crate::Leaker::with_rule), or to
 /// [`LeakerResult::allow()`](crate::LeakerResult::allow).
 ///
 /// `allow()` means "the copy may write `cause` as it is at `place`", and is the one question at both
@@ -49,14 +49,15 @@ pub struct Place {
 /// a path that starts with `Self` is not asked as the analysis walks.
 ///
 /// A closure `Fn(&Cause, Place) -> bool` is a rule, `()` allows nothing, and `(A, B)` allows what
-/// either does. [`Rules`] builds the common ones.
+/// either does. [`Rules`] builds the common ones. A closure must annotate its first parameter
+/// (`|cause: &Cause, _| ..`) wherever it is passed (E0282, E0631); [`Rules::or_if()`] needs none.
 ///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
 /// // You promise that `::serde` is the same crate on both sides.
-/// let allow = Rules::new().or_if(|cause, _| cause.starts_with(&parse_quote!(::serde)));
-/// let mut leaker = Leaker::from_config(allow);
+/// let rule = Rules::new().or_if(|cause, _| cause.starts_with(&parse_quote!(::serde)));
+/// let mut leaker = Leaker::with_rule(rule);
 /// leaker.intern_struct(&parse_quote!(struct S { a: ::serde::Value, b: MyType }));
 /// // Only `MyType` is leaked.
 /// assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
@@ -96,11 +97,14 @@ impl<A: Allow, B: Allow> Allow for (A, B) {
 ///
 /// ```
 /// # use type_leak::*;
+/// # use syn::*;
 /// # let flag = true;
 /// let mut rules = Rules::new().primitive();
 /// if flag {
 ///     rules = rules.prelude(); // the same type
 /// }
+/// let (u8_ty, vec) = (Cause::Type(parse_quote!(u8)), Cause::Type(parse_quote!(Vec)));
+/// assert!(rules.allow(&u8_ty, Place::default()) && rules.allow(&vec, Place::default()));
 /// ```
 ///
 /// [`or()`]: Rules::or
@@ -151,7 +155,7 @@ impl<A> Rules<A> {
     /// a [`LeakerResult`](crate::LeakerResult) it only drops the errors of relative paths.
     ///
     /// You promise that the copy does not shadow the relative names. [`external_crates()`] allows
-    /// the other absolute paths.
+    /// the other absolute paths. A `::core` path needs no rule: it is never an entry.
     ///
     /// [`external_crates()`]: Rules::external_crates
     pub fn std_crates(mut self) -> Self {
@@ -255,7 +259,7 @@ fn allows_entry<A: Allow + ?Sized>(rule: &A, entry: &Cause, place: Place) -> boo
 /// allows each; else it allows the cause. If only some paths are allowed, the error stays without
 /// them ([`filter()`]).
 fn accepts<A: Allow + ?Sized>(rule: &A, error: &ErrorItem) -> bool {
-    let place = error.place();
+    let place = error.place;
     if error.paths.is_empty() {
         rule.allow(&error.cause, place)
     } else {
@@ -272,7 +276,7 @@ fn accepts<A: Allow + ?Sized>(rule: &A, error: &ErrorItem) -> bool {
 pub(crate) fn filter<A: Allow + ?Sized>(rule: &A, errors: &mut Vec<ErrorItem>) {
     errors.retain(|error| !accepts(rule, error));
     for error in errors.iter_mut() {
-        let place = error.place();
+        let place = error.place;
         error
             .paths
             .retain(|entry| !allows_entry(rule, entry, place));

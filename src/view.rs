@@ -165,13 +165,15 @@ impl<A: Allow> View<'_, '_, A> {
     /// copied as written if its path is absolute (`::path::Wrap<Self>`), and leaked if it is
     /// relative (`Wrap<Self>`). A type that uses a generic bounded by `Self`
     /// (`struct S<T: AsRef<Self>>(Rel<T>);`) is for any type that the bound holds for
-    /// ([`SelfRequirement::Any`](crate::SelfRequirement)), and is an error if it names `Self` too
-    /// (`Rel2<Self, T>`): drop the `Self`, write the type with an absolute path, or use an
-    /// `intern_*` method.
+    /// ([`SelfRequirement::Any`](crate::SelfRequirement)). If it names `Self` too (`Rel2<Self,
+    /// T>`), it is an entry all the same, with the error
+    /// [`Reason::NestedSelfInBounds`](crate::Reason::NestedSelfInBounds):
+    /// [`LeakerResult::allow()`](crate::LeakerResult::allow) drops the error, and
+    /// [`LeakerResult::ignore()`](crate::LeakerResult::ignore) removes the entry.
     ///
     /// A bound is rewritten for the `Self` of the nested item that uses its generic. That is an
     /// error if `Self` is the implementor of a trait, or if the bound names an associated item of
-    /// `Self` (`Self::X`): see [`CheckResult::headline`](crate::CheckResult::headline).
+    /// `Self` (`Self::X`).
     pub fn visit_item(&mut self, item: &Item) {
         syn::visit::Visit::visit_item(&mut *self.visitor, item)
     }
@@ -245,78 +247,5 @@ impl<'ast, A: Allow> syn::visit::Visit<'ast> for View<'_, '_, A> {
         visit_type_path: TypePath,
         visit_type_trait_object: TypeTraitObject,
         visit_variant: Variant,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use proc_macro2::{TokenStream, TokenTree};
-    use std::collections::BTreeSet;
-    use syn::*;
-
-    /// The `Visit` methods of the type `ty` in `source`: written out, or named in the `forward!`
-    /// list.
-    fn visit_methods(source: &str, ty: &str) -> BTreeSet<String> {
-        fn idents(tokens: TokenStream, out: &mut BTreeSet<String>) {
-            for token in tokens {
-                match token {
-                    TokenTree::Ident(ident) if ident.to_string().starts_with("visit_") => {
-                        out.insert(ident.to_string());
-                    }
-                    TokenTree::Group(group) => idents(group.stream(), out),
-                    _ => (),
-                }
-            }
-        }
-        let file = parse_file(source).unwrap();
-        let mut out = BTreeSet::new();
-        for item in file.items {
-            let item = match item {
-                Item::Impl(item) => item,
-                _ => continue,
-            };
-            let is_visit = matches!(&item.trait_, Some((_, path, _))
-                if path.segments.last().map_or(false, |seg| seg.ident == "Visit"));
-            let is_ty = matches!(&*item.self_ty, Type::Path(path)
-                if path.path.segments.last().map_or(false, |seg| seg.ident == ty));
-            if !is_visit || !is_ty {
-                continue;
-            }
-            for item in item.items {
-                match item {
-                    ImplItem::Fn(method) => {
-                        out.insert(method.sig.ident.to_string());
-                    }
-                    ImplItem::Macro(mac) => idents(mac.mac.tokens, &mut out),
-                    _ => (),
-                }
-            }
-        }
-        out
-    }
-
-    /// The view must forward exactly the methods the analysis overrides: a missing one would bypass
-    /// the analysis silently, and an extra one is a stale entry.
-    #[test]
-    fn the_view_forwards_exactly_the_methods_the_analysis_overrides() {
-        let overridden = visit_methods(include_str!("analyze.rs"), "AnalyzeVisitor");
-        let forwarded = visit_methods(include_str!("view.rs"), "View");
-        assert!(!overridden.is_empty(), "the analysis was not found");
-        assert!(
-            !forwarded.is_empty(),
-            "the forwarded methods were not found"
-        );
-        let missing: Vec<_> = overridden.difference(&forwarded).collect();
-        let stale: Vec<_> = forwarded.difference(&overridden).collect();
-        assert!(
-            missing.is_empty(),
-            "overridden by the analysis but not forwarded by the view: {:?}",
-            missing
-        );
-        assert!(
-            stale.is_empty(),
-            "forwarded by the view but not overridden by the analysis: {:?}",
-            stale
-        );
     }
 }

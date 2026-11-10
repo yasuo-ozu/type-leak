@@ -4,14 +4,9 @@
 
 mod common;
 
-use common::{check_in, starts_with};
+use common::{check_in, entries_with_generics as entries, s, starts_with, to_syn_error};
 use syn::*;
-use template_quote::quote;
-use type_leak::{to_syn_error, Allow, Leaker, LeakerResult, Referrer, Rules, SelfRequirement};
-
-fn s(x: &impl template_quote::ToTokens) -> String {
-    quote!(#x).to_string()
-}
+use type_leak::{Allow, Leaker, LeakerResult, Referrer, Rules, SelfRequirement};
 
 fn config() -> Rules {
     Rules::new()
@@ -19,7 +14,7 @@ fn config() -> Rules {
 
 /// The Referrer of `item`, or the text of its errors.
 fn leak_trait_with<A: Allow>(config: A, item: &ItemTrait) -> std::result::Result<Referrer, String> {
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_trait(item);
     leaker
         .result()
@@ -34,7 +29,7 @@ fn leak_trait(item: ItemTrait) -> Referrer {
 /// The compile-time checks that the analysis of `item` asks for (`Leaker::assertions()`); it has
 /// no error.
 fn assertions_of<A: Allow>(config: A, item: &ItemTrait) -> String {
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_trait(item);
     let assertions = leaker.assertions().to_string();
     leaker.result().finish().unwrap();
@@ -46,7 +41,7 @@ fn leak_module_result_with<A: Allow>(
     config: A,
     item: &ItemMod,
 ) -> std::result::Result<LeakerResult, String> {
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_mod(item);
     let result = leaker.result();
     if result.errors().is_empty() {
@@ -59,15 +54,6 @@ fn leak_module_result_with<A: Allow>(
 /// The Referrer of the module `item`, or the text of its errors.
 fn leak_module_with<A: Allow>(config: A, item: &ItemMod) -> std::result::Result<Referrer, String> {
     leak_module_result_with(config, item).map(LeakerResult::into_referrer)
-}
-
-/// The leaked types with their generics (and where clause).
-fn entries(referrer: &Referrer) -> Vec<(String, String)> {
-    referrer
-        .iter()
-        .map(|(_, ty, context)| (ty, &context.generics))
-        .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
-        .collect()
 }
 
 /// The path of the module of each entry (see `Referrer::module_path()`).
@@ -469,7 +455,7 @@ fn type_macros() {
     let item: ItemStruct = parse_quote! {
         struct S { f: ::p::Wrap<::p::m!(Self)> }
     };
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::with_rule(config());
     leaker.intern_struct(&item);
     assert!(leaker.result().finish().is_ok());
     // In a module, a macro is expanded where it is written, whatever its path is.
@@ -497,7 +483,7 @@ fn primitives_are_assumed_when_the_type_is_copied() {
     );
     assert!(assertions.contains("__type_leak_assert_u16_is_primitive"));
     // The analysis recovers from an error, so what it found is recorded: `u8` is copied.
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::with_rule(config());
     let item: ItemTrait = parse_quote! { trait Tr: Clone { fn f(&self) -> u8; } };
     leaker.intern_trait(&item);
     assert!(leaker

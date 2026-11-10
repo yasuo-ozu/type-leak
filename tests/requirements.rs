@@ -3,6 +3,8 @@
 
 mod common;
 
+use common::{entries_with_generics as entries, s};
+
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
@@ -11,10 +13,6 @@ use type_leak::{Context, ContextId, EntryId, Leaker, Referrer, SelfRequirement, 
 /// The tag of the format of a serialized Referrer, which it starts with.
 fn tag() -> String {
     format!("type-leak-format-{}", type_leak::Referrer::FORMAT_VERSION)
-}
-
-fn s(x: &impl template_quote::ToTokens) -> String {
-    quote!(#x).to_string()
 }
 
 /// Leaks the types of the traits (one call each).
@@ -34,15 +32,6 @@ fn leak_traits_in(traits: &[ItemTrait]) -> (Referrer, Vec<ContextId>) {
 
 fn leak_trait(item: ItemTrait) -> Referrer {
     leak_traits(&[item])
-}
-
-/// Returns the leaked types with the generics (and the where clause) they use.
-fn entries(referrer: &Referrer) -> Vec<(String, String)> {
-    referrer
-        .iter()
-        .map(|(_, ty, context)| (ty, &context.generics))
-        .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
-        .collect()
 }
 
 fn generics_of(generics: Generics) -> String {
@@ -544,7 +533,7 @@ fn self_in_the_bounds_of_the_generics() {
 }
 
 #[test]
-fn generic_args_of_the_root_and_local_generics() {
+fn the_generics_of_an_entry_are_arguments_with_the_names_of_the_site_substituted() {
     let tr: ItemTrait = parse_quote! {
         trait Tr<'a, T, U> {
             fn f<'b, const B: bool, V>(&self) -> Wrap<'a, 'b, T, B, V>;
@@ -579,14 +568,8 @@ fn generic_args_of_the_root_and_local_generics() {
     )
     .unwrap();
     assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "{ 1 + 2 }"]);
-    // A name with no answer stays, whatever the arguments reach: `N` has none.
-    let args = common::generic_args(
-        &common::entry(&referrer, 0).generics,
-        common::answers(&tr.generics.params, &[]),
-    )
-    .unwrap();
-    assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "N"]);
-    // Without the parameters of the trait, everything is passed by name.
+    // A name with no answer stays: with no site (the scope of the analysis), everything is passed
+    // by name.
     let args =
         common::generic_args(&common::entry(&referrer, 0).generics, common::identity).unwrap();
     assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "N"]);

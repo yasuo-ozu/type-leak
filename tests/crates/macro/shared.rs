@@ -72,7 +72,7 @@ impl Parse for Shared {
 pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let Shared { id, items } = parse2(input)?;
     let config = Rules::new().primitive().prelude();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     let mut contexts = Vec::new();
     for item in &items {
         contexts.push(match item {
@@ -92,10 +92,10 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let self_param = ident("__S");
     let repeater: Path = parse_quote!(crate::Repeater);
     let mut impls = TokenStream::new();
-    let repeater_impls = result
+    for r in result
         .repeater_impls(&repeater, id, ImplSelf::Param(&self_param), array_const)
-        .map_err(Error::from)?;
-    for r in repeater_impls {
+        .map_err(Error::from)?
+    {
         impls.extend(r.to_token_stream());
     }
     let referrer = result.into_referrer();

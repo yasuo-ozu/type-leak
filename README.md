@@ -28,25 +28,23 @@ A name in Rust means something only where it is written. When a proc macro copie
     }
 ```
 
-- The **Leaker** analyzes the item. Its result, the **Referrer**, lists the *entries*: the types that depend on where they are written (`MyType`, `Self`, `MyWrap<T>`). It travels to crate B as tokens.
+- The **Leaker** analyzes the item. Its result, the **Referrer**, lists the *entries*: the types that depend on where they are written (`MyType`, `Wrap<Self>`, `MyWrap<T>`). It travels to crate B as tokens.
 - The **Repeater** is a trait defined once at the root of crate A, not in the proc-macro crate (`repeater_definition()` generates it):
 
   ```rust,ignore
-  pub trait Repeater<T: ?Sized, const KEY: u128, /* one const slot per primitive type */> {
+  pub trait Repeater<T: ?Sized, const KEY: u128, /* one const slot per primitive const type except usize and u128 */> {
       type Type: ?Sized;
   }
   ```
 
-  `KEY` = `repeater_key(ID, NTH)`: `ID` identifies the analyzed item, `NTH` is the `EntryId` of the entry, and `T` encodes the generics the entry uses.
+  `KEY` = `repeater_key(ID, ENTRY)`: `ID` is the Leaker's id (the `id` that `repeater_impls` and `repeater_projection` take), `ENTRY` is the `EntryId` of the entry, and `T` encodes the generics the entry uses.
 
 # Quick start
 
 ```rust
 use syn::visit_mut::VisitMut;
-use syn::{parse_quote, Ident, ItemImpl, ItemTrait, Path};
-use type_leak::{
-    complete_params, repeater_key, repeater_projection, slot_const, ImplSelf, Leaker, Substitute,
-};
+use syn::{parse_quote, ItemImpl, ItemTrait, Path};
+use type_leak::{repeater_key, repeater_projection, slot_const, ImplSelf, Leaker, Substitute};
 
 let item: ItemTrait = parse_quote! {
     pub trait MyLeaker<T> {
@@ -63,6 +61,7 @@ let repeater: Path = parse_quote!(path::Repeater);
 let impls: Vec<ItemImpl> = result
     .repeater_impls(&repeater, 42, ImplSelf::Param(&parse_quote!(__S)), slot_const(&repeater))
     .unwrap()
+    .into_iter()
     .map(|r| parse_quote!(#r))
     .collect();
 assert_eq!(impls.len(), 2);
@@ -79,14 +78,14 @@ let mut imp: ItemImpl = parse_quote! {
 referrer
     .visitor(top_level, |_ty, ix, context| {
         let self_ty = parse_quote!(Self);
+        // With `Self` as the host, the projection cannot fail.
         repeater_projection(&repeater, &self_ty, context, 42, ix, slot_const(&repeater)).unwrap()
     })
     .visit_item_impl_mut(&mut imp);
 
 // Write the arguments of the impl into the items of the copy, not into its header, which declares
 // the generics itself: the trait's `T` is `U`.
-let completed = complete_params(&item.generics.params, &[parse_quote!(U)]).unwrap();
-let mut site = Substitute::new(|name: &Ident| (name == "T").then(|| completed[0].clone()));
+let mut site = Substitute::with_params(&item.generics.params, &[parse_quote!(U)]).unwrap();
 for item in &mut imp.items {
     site.visit_impl_item_mut(item);
 }
@@ -104,9 +103,9 @@ assert_eq!(
 );
 ```
 
-The visitor rewrites only the entries. The rest of the copy is yours to write: `Substitute` writes the arguments of the impl into the types and the lifetimes of the items you give it (`&'a self`, `T: 'a`, `where Self: 'a`), also into the arguments of the paths through the Repeater (`(T,)` is `(U,)`); `substitute_args` does it for single arguments. Give it the items or signatures that you copy, not the header of the impl. A trait with defaults (`trait MyLeaker<T, D = MyWrap<T>>`) is visited too, and `complete_params` takes the default of an argument the impl leaves out from the visited parameters. An associated type of a type that is not a type parameter (`T::Item` for `T` as `IntoIter<u8>`) needs its trait: `complete_params` writes it from the bound of the parameter, and `Substitute` and `substitute_args` refuse it (`EncodeError::AmbiguousAssociatedType`) unless the copy has `<T as Iterator>::Item`.
+The visitor rewrites only the entries. The rest of the copy is yours to write: `Substitute::with_params` takes the generics of the trait and the arguments of the impl, and writes them into the types and the lifetimes of the items you give it (`&'a self`, `T: 'a`, `where Self: 'a`), also into the arguments of the paths through the Repeater (`(T,)` is `(U,)`). Give it the items or signatures that you copy, not the header of the impl. `Substitute::new` takes a closure that answers each name instead (`Self` too), and `substitute_args` does it for single arguments. A trait with defaults (`trait MyLeaker<T, D = MyWrap<T>>`) is visited too, and `complete_params`, which `with_params` calls, takes the default of an argument the impl leaves out from the visited parameters. An associated type of a type that is not a type parameter (`T::Item` for `T` as `IntoIter<u8>`) needs its trait: `complete_params` writes it from the bound of the parameter, and `Substitute` and `substitute_args` refuse it (`EncodeError::AmbiguousAssociatedType`) unless the copy has `<T as Iterator>::Item`.
 
-If the item has a part that cannot be leaked (`MyType<'_>`), the `Leaker` copies it as written and records an error: `finish()` is then `Err`, and `into_referrer()` is still the `Referrer` of the rest. Report each with `ErrorItem::emit()` (on nightly, a diagnostic with the notes and the help at their own spans), or all with `to_syn_error()`.
+If the item has a part that cannot be leaked (`MyType<'_>`), the `Leaker` copies it as written and records an error: `finish()` is then `Err`, and `into_referrer()` is still the `Referrer` of the rest. Report each with `ErrorItem::emit()` (on nightly, a diagnostic with the notes and the help at their own spans), or with `ErrorItem::to_compile_error()`.
 
 In real macros, crate A passes `referrer` and `top_level` to crate B as tokens (`ToTokens` / `Parse`), usually through an exported `macro_rules!`. [`examples/two-macros`](https://github.com/yasuo-ozu/type-leak/tree/main/examples/two-macros) is a complete, tested setup.
 

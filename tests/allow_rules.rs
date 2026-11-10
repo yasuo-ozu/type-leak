@@ -45,7 +45,7 @@ fn paths(error: &ErrorItem) -> Vec<String> {
 
 /// The result of the analysis of the struct `item` with `config`.
 fn analyze<A: Allow>(item: &ItemStruct, config: A) -> LeakerResult {
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_struct(item);
     leaker.result()
 }
@@ -87,24 +87,21 @@ fn a_rule_on_the_place_accepts_what_the_flag_does() {
     // The type of the field and the default are two errors of one cause, one of them in a default.
     assert_eq!(result.errors().len(), 2);
     assert_eq!(result.errors()[0].cause, result.errors()[1].cause);
-    let in_default: Vec<bool> = result.errors().iter().map(|e| e.in_default).collect();
+    let in_default: Vec<bool> = result.errors().iter().map(|e| e.place.in_default).collect();
     assert_eq!(in_default.iter().filter(|&&d| d).count(), 1);
-    for error in result.errors() {
-        assert_eq!(error.place(), place(error.in_value, error.in_default));
-    }
     // A rule on the place drops the one in the default, as `defaults()` does.
     let by_rule = result
         .clone()
         .allow(|_: &Cause, place: Place| place.in_default);
     assert_eq!(by_rule.errors().len(), 1);
-    assert!(!by_rule.errors()[0].in_default);
+    assert!(!by_rule.errors()[0].place.in_default);
     let by_method = result.allow(Rules::new().defaults());
     assert_eq!(texts(by_rule.errors()), texts(by_method.errors()));
     // The same in the config: the default is analyzed with everything allowed, so its path `Rel` is
     // written as it is, and the field stays an error.
     let by_config = analyze(&item, Rules::new().defaults());
     assert_eq!(by_config.errors().len(), 1);
-    assert!(!by_config.errors()[0].in_default);
+    assert!(!by_config.errors()[0].place.in_default);
     assert_eq!(texts(by_config.errors()), texts(by_rule.errors()));
 }
 
@@ -414,7 +411,7 @@ fn all_paths(errors: &[ErrorItem], found: &mut Vec<String>) {
 fn the_rule_is_not_asked_about_self_or_a_generic() {
     for check_values in [false, true] {
         let seen = Rc::new(Seen::default());
-        let mut leaker = Leaker::from_config(Rules::new().or_if(seen.rule()));
+        let mut leaker = Leaker::with_rule(Rules::new().or_if(seen.rule()));
         leaker.check_values = check_values;
         leaker.intern_trait(&own_names());
         let result = leaker.result();
@@ -458,7 +455,7 @@ fn a_rule_that_accepts_self_does_not_hide_an_error_about_it() {
     // be an entry.
     fn by<A: Allow>(source: &str, allow: A) -> LeakerResult {
         let item: ItemStruct = parse_str(source).unwrap();
-        let mut leaker = Leaker::from_config(allow);
+        let mut leaker = Leaker::with_rule(allow);
         leaker.intern_struct(&item);
         leaker.result()
     }
@@ -611,7 +608,7 @@ fn boom(cause: &Cause, _: Place) -> bool {
 
 #[test]
 fn a_rule_that_panics_is_a_panic_of_the_closure() {
-    let mut leaker = Leaker::from_config(Rules::new().or_if(boom));
+    let mut leaker = Leaker::with_rule(Rules::new().or_if(boom));
     let item: ItemStruct = parse_quote!(
         struct S {
             a: Rel,
@@ -637,7 +634,7 @@ fn a_rule_that_panics_is_a_panic_of_the_closure() {
 /// What a rule was asked about `item`, as `kind(path)` in the order asked, without the repeats.
 fn asked_as(item: &ItemTrait, values: bool) -> Vec<String> {
     let seen = Rc::new(Seen::default());
-    let mut leaker = Leaker::from_config(Rules::new().or_if(seen.rule()));
+    let mut leaker = Leaker::with_rule(Rules::new().or_if(seen.rule()));
     leaker.check_values = values;
     leaker.intern_trait(item);
     let _ = leaker.result();
@@ -1062,7 +1059,7 @@ fn values_writes_every_relative_path_in_a_value_as_it_is() {
     assert!(by_flag.errors().is_empty());
     let kept: Vec<String> = entries(&by_flag.into_referrer()).into_iter().collect();
     assert_eq!(kept, ["Sig", "usize"]);
-    // Only the values of the item are read: without `check_values()` the flag changes nothing.
+    // Only the values of the item are read: without `check_values` the flag changes nothing.
     let without = analyze_trait(&item, Rules::new().values(), false);
     let plain_without = analyze_trait(&item, Rules::new(), false);
     assert_eq!(
@@ -1349,6 +1346,7 @@ fn or_if_takes_a_closure_without_annotations_and_or_takes_any_rule() {
 /// compile, instead of being suggested to a user. The table of the library is private, so the help
 /// of each name is asserted, and fails for a name whose path differs from the one here.
 mod names {
+    use crate::common::to_syn_error;
     use std::collections::BTreeSet;
     use syn::*;
     use template_quote::quote;
@@ -1530,7 +1528,7 @@ mod names {
 
     /// The result of the analysis of the trait or struct `source` with `config`.
     fn leak<A: Allow>(config: A, source: &str) -> LeakerResult {
-        let mut leaker = Leaker::from_config(config);
+        let mut leaker = Leaker::with_rule(config);
         match parse_str(source).unwrap() {
             Item::Trait(item) => leaker.intern_trait(&item),
             Item::Struct(item) => leaker.intern_struct(&item),

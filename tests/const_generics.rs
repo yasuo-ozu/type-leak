@@ -321,7 +321,7 @@ fn test_binder_in_type() {
         })
     );
     // Where the Leaker allows the crates, `Rel<L>` is the entry, with `L` only.
-    let mut leaker = Leaker::from_config(Rules::new().external_crates());
+    let mut leaker = Leaker::with_rule(Rules::new().external_crates());
     let context = leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(

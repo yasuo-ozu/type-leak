@@ -8,7 +8,6 @@ mod support;
 
 use support::assert_span_at;
 use syn::*;
-use template_quote::ToTokens;
 use type_leak::*;
 
 fn repeater() -> Path {
@@ -25,14 +24,25 @@ fn args_error(generics: &str, args: &str) -> EncodeError {
 /// The error of writing the path through the Repeater for an entry that needs `Self: 'a`, for the
 /// type in `source` as `Self`, a trait object without a lifetime bound.
 fn unbounded_self_error(source: &str) -> EncodeError {
-    let item: ItemTrait = parse_quote!(trait Tr<'a> { fn f(&self, x: &'a Wrap<Self>); });
+    let item: ItemTrait = parse_quote!(
+        trait Tr<'a> {
+            fn f(&self, x: &'a Wrap<Self>);
+        }
+    );
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     let self_ty: Type = parse_str(source).unwrap();
     let (ix, _, context) = referrer.iter().next().unwrap();
-    repeater_projection(&repeater(), &self_ty, context, 7, ix, slot_const(&repeater()))
-        .unwrap_err()
+    repeater_projection(
+        &repeater(),
+        &self_ty,
+        context,
+        7,
+        ix,
+        slot_const(&repeater()),
+    )
+    .unwrap_err()
 }
 
 /// The error of encoding `generics` itself: the const parameter of the first one.
@@ -59,7 +69,12 @@ fn needs_self_error(source: &str) -> EncodeError {
     let marker: Type = parse_quote!(crate::Marker);
     // The call fails for the first entry that names `Self`, which is `Wrap<T, Self>` here.
     let error = result
-        .repeater_impls(&parse_quote!(crate::Repeater), 7, ImplSelf::Marker(&marker), array_const)
+        .repeater_impls(
+            &parse_quote!(crate::Repeater),
+            7,
+            ImplSelf::Marker(&marker),
+            array_const,
+        )
         .err()
         .unwrap();
     assert!(matches!(&error, EncodeError::NeedsSelf(ty)

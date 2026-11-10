@@ -25,9 +25,11 @@ pub use syn;
 
 pub use crate::allow::{Allow, Place, Rules};
 pub use crate::analysis::CheckResult;
-pub use crate::context::{Context, ContextId, Gat, ModuleScope, SelfRequirement};
-pub use crate::encode::{array_const, complete_params, substitute_args, EncodeError, Substitute};
-pub use crate::error::{to_syn_error, Cause, ErrorItem, Reason};
+pub use crate::context::{Context, ContextId, ModuleScope, SelfRequirement};
+pub use crate::encode::{
+    array_const, complete_params, substitute_args, ByParams, EncodeError, Substitute,
+};
+pub use crate::error::{Cause, ErrorItem, Reason};
 pub use crate::leaker::{Leaker, LeakerResult};
 pub use crate::referrer::{EntryId, NestedSelf, Referrer, Visitor};
 pub use crate::repeater::{

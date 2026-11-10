@@ -1241,8 +1241,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         self.frame.min_depth = self.frame.min_depth.min(self.position.type_depth);
     }
 
-    /// Where the visitor is, for the errors it finds ([`ErrorItem::in_value`],
-    /// [`ErrorItem::in_default`]) and for the rule.
+    /// Where the visitor is, for the errors it finds ([`ErrorItem::place`]) and for the rule.
     fn place(&self) -> Place {
         Place {
             in_value: self.position.in_value || self.mode.outer_place.in_value,

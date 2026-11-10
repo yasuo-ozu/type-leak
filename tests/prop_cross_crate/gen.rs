@@ -47,10 +47,10 @@
 //!
 //! Structs, enums and unions with a generic whose bound names their own `Self` and a default that
 //! uses it (`Features::self_bound_adts`, F41): `struct S<T: Clone + AsRef<Self>, U = Rel<T>>`, nested
-//! in `enter_mod` (`Gen::gen_self_bound_adt()`). With `Features::nested_self_entries` (F42) the
-//! attribute asks for `nested_self_entries` (all the items nested in `enter_mod`),
-//! and some have a field that names `Self` in a relative type (`Rel2<Self, T>`), which is for any
-//! type that the bound holds for.
+//! in `enter_mod` (`Gen::gen_self_bound_adt()`). With `Features::nested_self_entries` (F42) some
+//! have a field that names `Self` in a relative type (`Rel2<Self, T>`), which is for any type that
+//! the bound holds for, and the attribute says `nested_self_entries = true` for half of the items
+//! nested in `enter_mod`: the macro allows the `NestedSelfInBounds` risk of such an entry.
 //!
 //! Scopes: the macro analyzes some items through `enter_mod`, `enter_generics`, `enter_trait` or
 //! `enter_impl` instead of the `intern_*` of their kind (`Item::scope`, `SCOPES`).
@@ -67,8 +67,7 @@
 //! lifetime or without one.
 //!
 //! Settings: the Leaker does not allow the primitive types in a fifth of the cases
-//! (`Config::primitive`), and each item says whether the Referrer keeps the optional entries as
-//! written or replaces them (`Trust`).
+//! (`Config::primitive`).
 //!
 //! Shapes made for the reasons and the causes that random types rarely reach (each a small share of
 //! the items, decided by the hash of the state, which draws nothing, and put as a tag on what the item
@@ -76,12 +75,13 @@
 //! `Self` in a struct, an enum or a union analyzed in `enter_generics` (`SelfWithoutMeaning`), in the
 //! default of a parameter of a trait (`SelfInDefault`), in a where predicate of a trait on a type of the
 //! module (`SelfInTraitPredicate`) and in the generics of an impl whose self type uses them
-//! (`SelfInImplSelfType`); half of the items nested in `enter_mod` without `nested_self_entries`
-//! (`NestedSelfInBounds`); with `values`, a glob import or a `macro_rules!` in a body (`Unreadable`) and
-//! a relative `use`; a macro that expands to an array length (`two!()`, by its bare name: a cause of the
-//! kind `Macro`, or by an absolute path), macro calls in values; `Rl<'_>` as an argument; an enum with
-//! discriminants that are constants, types and macros; `<T>::Item`; and const parameters of the types
-//! that are not `usize`, `bool`, `i32`, `u8` and `char`. Not reachable: `UnnameableSelf` (an item
+//! (`SelfInImplSelfType`); half of the items nested in `enter_mod`, where the macro does not allow
+//! the risk (`nested_self_entries` off), have the error `NestedSelfInBounds`; with `values`, a glob
+//! import or a `macro_rules!` in a body (`Unreadable`) and a relative `use`; a macro that expands
+//! to an array length (`two!()`, by its bare name: a cause of the kind `Macro`, or by an absolute
+//! path), macro calls in values; `Rl<'_>` as an argument; an enum with discriminants that are
+//! constants, types and macros; `<T>::Item`; and const parameters of the types that are not
+//! `usize`, `bool`, `i32`, `u8` and `char`. Not reachable: `UnnameableSelf` (an item
 //! nested in a scope that has a `Self` of its own, under generics that bound the outer one: no valid
 //! item is that, only a macro that nests scopes) and a cause of the kind `Lifetime` (a lifetime that no
 //! scope declares). The paths of kind `Unknown` (the root of a `use`, `<T>::X`) are in the `paths` of the
@@ -371,15 +371,15 @@ pub struct Features {
     /// item (F41: fixed, on by default). A field of the same type is an entry for any type, which the
     /// copy passes its own type for (F37).
     pub self_bound_adts: bool,
-    /// The Leaker is configured with `nested_self_entries` for the items nested in
-    /// `enter_mod` (`nested_self_entries = true` in the attribute), and the structs, enums and unions
-    /// of `self_bound_adts` have a field that names their `Self` in a relative type (`Rel2<Self, T>`
-    /// with `T: AsRef<Self>`), which the Leaker rejects without the option (F42: on by default). The
-    /// option is an opt-in of the Leaker, with risks that the generator's types do not have (a bound
-    /// on the parameter of the leaked type that receives `Self`; rustc before 1.70 and the last
-    /// field). It is on for half of the items nested in `enter_mod` (`Gen::nested_entries`), so the
-    /// items that name `Self` in a field and have a bound that does are built there, and rejected
-    /// (`NestedSelfInBounds`, the tag `nested_self_in_bounds`) in the other half.
+    /// The structs, enums and unions of `self_bound_adts` have a field that names their `Self` in a
+    /// relative type (`Rel2<Self, T>` with `T: AsRef<Self>`), for which the Leaker reports
+    /// `NestedSelfInBounds` (F42: on by default). The test macro takes that risk, and allows the
+    /// error, with `nested_self_entries = true` in the attribute; the risk is one that the
+    /// generator's types do not have (a bound on the parameter of the leaked type that receives
+    /// `Self`; rustc before 1.70 and the last field). The attribute has it for half of the items
+    /// nested in `enter_mod` (`Gen::nested_entries`), so the items that name `Self` in a field and
+    /// have a bound that does are built there, and rejected (`NestedSelfInBounds`, the tag
+    /// `nested_self_in_bounds`) in the other half.
     pub nested_self_entries: bool,
 }
 
@@ -614,7 +614,8 @@ impl Config {
 /// - `const_default`: a relative constant (`{ RLEN }`) is the default of a const parameter.
 /// - `method_lifetime`: a leaked path or trait object names a lifetime of a method, in its
 ///   arguments too (`Rel<&'x str>`): `Gen::note_method_lifetime()`.
-/// - `self_in_bounds`: a predicate names `Self` (`Self: 'x`, `Self: Sized`).
+/// - `self_in_bounds`: a predicate names `Self` (`Self: 'x`, `Self: Sized`). It explains no rejection
+///   now (a `MaybeConst` needs `self_assoc` or `bound_cycle`).
 /// - `bare:<Name>`: the prelude trait `Name` is spelled bare, and the Leaker does not allow the names
 ///   of the prelude. A bare `?Sized` has none: `?` applies to the real `Sized` only, so the Leaker
 ///   accepts it whatever the prelude.
@@ -674,7 +675,7 @@ pub const TAG_REDECLARED: &str = "shape:redeclared";
 pub const TAG_SELF_BOUND_ADT: &str = "shape:self_bound_adt";
 pub const TAG_SELF_BOUND_TYPE: &str = "shape:self_bound_type";
 /// `value_path`: a body, a constant or a default has a relative path of a value (`crate::base::bf()`,
-/// `RLEN`), which `Options::check_values()` rejects (`values`); a discriminant too. It explains the
+/// `RLEN`), which the Leaker rejects when it reads values (`check_values`, `values`); a discriminant too. It explains the
 /// rejection (`family()`), but is no forced shape: `forced:value_path` is, from the text.
 pub const TAG_VALUE_PATH: &str = "value_path";
 /// `relative_std`: a path of `std`, `core` or `alloc` is written without the leading `::` in the item.
@@ -688,7 +689,8 @@ pub const TAG_RELATIVE_STD: &str = "relative_std";
 /// - `nested_self_in_bounds`: a struct, an enum or a union analyzed nested in `enter_mod` without
 ///   `nested_self_entries`, a field of which names `Self` in a relative type next to a generic whose
 ///   bound names it (`Rel2<Self, T>` with `T: AsRef<Self>`): `Reason::NestedSelfInBounds`. With the
-///   option the same item is accepted (`nested_self_in_bounds_option`, no rejection has it).
+///   option the macro allows that error and the item is accepted (`nested_self_in_bounds_option`,
+///   no rejection has it).
 /// - `self_without_meaning`: a struct, an enum or a union analyzed in `enter_generics`, which gives
 ///   `Self` no meaning, names it in a field: `Reason::SelfWithoutMeaning`.
 /// - `self_in_default`: the default of a parameter of a trait names `Self` (`trait Tr<T =
@@ -769,12 +771,9 @@ pub const FORCED_VALUE_PATH: &str = "forced:value_path";
 ///   generics that names a leaked type) makes unprovable;
 /// - `alias_bound`: a bound of an iterator names its `Item` (`T: Fn(<T as Iterator>::Item) -> u8`,
 ///   also through the alias `BIt<T>`) next to a bound or a supertrait that fixes it, which no impl of
-///   a trait can have next to a method predicate that names `Self::A`;
-/// - `hidden_self`: a function pointer or `Fn(..)` whose output has an elided lifetime and whose
-///   inputs name `Self` and a path that hides a lifetime (`fn(Chars, Self) -> &u8`).
+///   a trait can have next to a method predicate that names `Self::A`.
 pub const TAG_SELF_IN_PREDICATE: &str = "self_in_predicate";
 pub const TAG_ALIAS_BOUND: &str = "alias_bound";
-pub const TAG_HIDDEN_SELF: &str = "hidden_self";
 
 /// An item with a macro on it, which the Referrer invokes.
 #[derive(Clone)]
@@ -1615,8 +1614,9 @@ pub struct Gen {
     /// The item (or module) being generated has a value (`Flags::values`): the attribute says
     /// `values = true`.
     values_used: bool,
-    /// The item being generated is analyzed with `nested_self_entries` where it is nested in
-    /// `enter_mod` (`nested_self_entries = true` in the attribute): the feature, and half of the items.
+    /// The macro takes the `NestedSelfInBounds` risk for the item being generated where it is nested
+    /// in `enter_mod` (`nested_self_entries = true` in the attribute): the feature, and half of the
+    /// items.
     nested_entries: bool,
     /// The item being generated has an argument `impl Into<Rel<X>>` already (the plain one of
     /// `impl_trait_args`): one is enough. Two of them in methods whose generics are bounded by the same
@@ -2421,9 +2421,6 @@ impl Gen {
                 && (self.features.self_elision || !a.adds_lts)
             {
                 self.elided_self |= a.uses_self;
-                if hidden && a.uses_self {
-                    self.tags.insert(TAG_HIDDEN_SELF.to_string());
-                }
                 let input = if hidden {
                     format!("{}, {}", self.hidden_path(), a.text)
                 } else {
@@ -2624,9 +2621,6 @@ impl Gen {
                     return self.dyn_bare(sc, depth, false);
                 }
                 self.elided_self |= a.uses_self;
-                if hidden && a.uses_self {
-                    self.tags.insert(TAG_HIDDEN_SELF.to_string());
-                }
                 let input = if hidden {
                     format!("{}, {}", self.hidden_path(), a.text)
                 } else {
@@ -3316,9 +3310,9 @@ impl Gen {
     ///
     /// `self_default`: the default may name `Self` (`trait Tr<T = Rel<Self>>`), which a struct, an
     /// enum or a union cannot write (E0735): `Reason::SelfInDefault`. Not for a trait nested in
-    /// `enter_mod`: the Leaker accepts it with `nested_self_entries` (the copy passes the host),
-    /// and the test macro cannot compare such a default (its witness for a default that names
-    /// `Self` is made for the bounds that do, F39).
+    /// `enter_mod`: the Leaker accepts it (an entry for the trait's `Self`, and the copy passes the
+    /// host), and the test macro cannot compare such a default (its witness for a default that
+    /// names `Self` is made for the bounds that do, F39).
     fn defaults(&mut self, sk: &mut Skeleton, self_default: bool) {
         // `values` asks for more defaults, and more of the constants among them, which are errors
         // (not in a module analyzed as a whole, which one such error rejects).
@@ -4288,7 +4282,8 @@ struct SelfDefault {
 struct SelfBoundAdt {
     /// The bound is a where predicate; else it is written in the parameter.
     in_where: bool,
-    /// A field names `Self` in a relative type (`Rel2<Self, T>`): `nested_self_entries`.
+    /// A field names `Self` in a relative type (`Rel2<Self, T>`): `NestedSelfInBounds`, which the
+    /// macro allows with `nested_self_entries`.
     names_self_in_type: bool,
 }
 
@@ -4590,7 +4585,7 @@ impl Gen {
             AdtKind::Union => ("U", "union"),
         };
         let name = self.name(prefix);
-        let allow_self = ann.map_or(true, |(_, a)| a);
+        let self_common = ann.map_or(true, |(_, a)| a);
         // A fifth of the items are analyzed through a scope: nested in `enter_mod` (it has a
         // `Self` of its own, and the generics are local), or in `enter_generics`, which has no
         // `Self` (so the fields do not name it).
@@ -4600,7 +4595,7 @@ impl Gen {
             _ => "",
         };
         let saved_prob = self.self_prob;
-        if !allow_self {
+        if !self_common {
             self.self_prob = 6;
         }
         let names_self_anyway =
@@ -5076,9 +5071,10 @@ impl Gen {
     ///
     /// Only the items that the macro is applied to have it (a module analyzed as a whole names no
     /// `Self`), and a parameter bound that names `Self` needs an item that names it freely: a nested
-    /// trait, or one whose flag (the old `allow_self` draw) is true; the others are the control.
+    /// trait, or one where `Self` is common (`self_common`, see `gen_one()`); the others are the
+    /// control.
     fn self_default_shape(&self, ann: Option<(usize, bool)>) -> Option<SelfDefault> {
-        let (_, allow_self) = ann?;
+        let (_, self_common) = ann?;
         if !self.features.trait_self_defaults || self.module_mode {
             return None;
         }
@@ -5091,7 +5087,7 @@ impl Gen {
         let percent = |n: u64, limit: u32| (draw / n) % 100 < u64::from(limit);
         let nested = self.features.nested_self && percent(100, SELF_DEFAULT_NESTED_PERCENT);
         Some(SelfDefault {
-            names_self: (allow_self || nested) && percent(10_000, SELF_DEFAULT_NAMES_SELF_PERCENT),
+            names_self: (self_common || nested) && percent(10_000, SELF_DEFAULT_NAMES_SELF_PERCENT),
             nested,
             redeclare: nested && percent(1_000_000, SELF_DEFAULT_REDECLARE_PERCENT),
         })
@@ -5115,9 +5111,9 @@ impl Gen {
     /// implemented by the other items of the module.
     fn gen_self_default_trait(&mut self, ann: Option<(usize, bool)>, shape: SelfDefault) -> String {
         let name = self.name("Tr");
-        let allow_self = ann.map_or(true, |(_, a)| a);
+        let self_common = ann.map_or(true, |(_, a)| a);
         let saved_prob = self.self_prob;
-        if !allow_self {
+        if !self_common {
             self.self_prob = 6;
         }
         let saved_no_self = self.no_self;
@@ -5307,9 +5303,9 @@ impl Gen {
             return self.gen_self_default_trait(ann, shape);
         }
         let name = self.name("Tr");
-        let allow_self = ann.map_or(true, |(_, a)| a);
+        let self_common = ann.map_or(true, |(_, a)| a);
         let saved_prob = self.self_prob;
-        if !allow_self {
+        if !self_common {
             self.self_prob = 6;
         }
         // A tenth of the traits are analyzed nested in `enter_mod`, and name no `Self`
@@ -5405,7 +5401,7 @@ impl Gen {
         // which the copy writes through the Repeater, whose impl is for the implementors of the
         // trait (`Reason::SelfInTraitPredicate`).
         if !self.no_self
-            && (allow_self || in_mod)
+            && (self_common || in_mod)
             && self.hash_percent(b"self_in_trait_predicate", 8)
         {
             let heads: Vec<String> = self
@@ -5640,9 +5636,9 @@ impl Gen {
         let tr = self.traits[idx].clone();
         self.extend_tags(&tr.sk.tags);
         // The impl has the where clause and the methods of the trait.
-        let allow_self = ann.map_or(true, |(_, a)| a);
+        let self_common = ann.map_or(true, |(_, a)| a);
         let saved_prob = self.self_prob;
-        if !allow_self {
+        if !self_common {
             self.self_prob = 6;
         }
         // The impl declares the generics of the trait, and maybe one more.
@@ -5835,9 +5831,9 @@ impl Gen {
     }
 
     fn gen_impl_inherent(&mut self, ann: Option<(usize, bool)>) -> String {
-        let allow_self = ann.map_or(true, |(_, a)| a);
+        let self_common = ann.map_or(true, |(_, a)| a);
         let saved_prob = self.self_prob;
-        if !allow_self {
+        if !self_common {
             self.self_prob = 6;
         }
         // A copy of a module cannot have an inherent impl on a type of another module, which
@@ -6218,9 +6214,11 @@ impl Gen {
 
     /// One item of the module `path`. `whole`: the module is analyzed as a whole.
     fn gen_one(&mut self, path: &[String], whole: bool) -> String {
-        // The flag of the item is the draw that gave `allow_self` of the attribute, which the macro
-        // does not know any more: it is kept (the items stay the same), and `false` makes `Self`
-        // rarer in the item.
+        // The flag of the item, `self_common`, is a legacy draw: it was the `allow_self` of the
+        // attribute, which the macro does not know any more, and is kept so that the item set stays
+        // the same. `false` makes `Self` rarer in the item (`self_prob`), and keeps two shapes that
+        // name `Self` from a trait unless it is nested in `enter_mod` (`self_default_shape()` and
+        // `self_in_trait_predicate`).
         let ann = if whole {
             None
         } else {
@@ -6235,9 +6233,10 @@ impl Gen {
             self.plain_ai = false;
             self.skip_trust_draw();
             self.bare_percent = self.item_bare_percent();
-            // Half of the items nested in `enter_mod` are analyzed with `nested_self_entries`, the
-            // other half without, where a type that names `Self` next to a generic whose bound
-            // does is an error (`Reason::NestedSelfInBounds`).
+            // Half of the items nested in `enter_mod` have `nested_self_entries = true` (the macro
+            // allows the `NestedSelfInBounds` risk), the other half not, where a type that names
+            // `Self` next to a generic whose bound does is an error that stays
+            // (`Reason::NestedSelfInBounds`).
             self.nested_entries =
                 self.features.nested_self_entries && self.hash_percent(b"nested_entries", 50);
         }

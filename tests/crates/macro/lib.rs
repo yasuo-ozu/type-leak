@@ -47,6 +47,16 @@ use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
 
+/// The errors as one `syn::Error`, one for each in order. Panics if there is none.
+pub(crate) fn to_syn_error(items: &[ErrorItem]) -> Error {
+    let mut errors = items.iter().cloned().map(Error::from);
+    let mut combined = errors.next().expect("at least one error");
+    for error in errors {
+        combined.combine(error);
+    }
+    combined
+}
+
 /// Arguments of `#[leak(..)]`.
 struct LeakArgs {
     helper: Path,
@@ -153,7 +163,7 @@ pub(crate) fn check_bucket_self<I>(
     let first = referrer
         .iter()
         .map(|(ix, _, _)| ix)
-        .find(|ix| referrer.bucket_self(*ix, id).is_none());
+        .find(|ix| referrer.bucket_self(id, *ix).is_none());
     match (marked, first) {
         (Ok(_), None) => Ok(()),
         (Ok(_), Some(ix)) => {
@@ -162,8 +172,8 @@ pub(crate) fn check_bucket_self<I>(
                 Span::call_site(),
                 format!(
                     "`Referrer::bucket_self({}, {})` is None, but `NeedsSelf` of the call for a marker is not: {}",
-                    ix,
                     id,
+                    ix,
                     quote!(#ty)
                 ),
             ))
@@ -185,7 +195,7 @@ pub(crate) fn check_bucket_self<I>(
             None => Err(Error::new(
                 Span::call_site(),
                 format!(
-                    "`Referrer::bucket_self(.., {})` is a type for every entry, but the call for a marker fails with `NeedsSelf`: {}",
+                    "`Referrer::bucket_self({}, ..)` is a type for every entry, but the call for a marker fails with `NeedsSelf`: {}",
                     id,
                     quote!(#ty)
                 ),
@@ -347,7 +357,11 @@ pub fn leak_tagged(
         Expr::Lit(ExprLit {
             lit: Lit::Str(tag), ..
         }) => tag.value(),
-        other => return Error::new(other.span(), "expected a string").to_compile_error().into(),
+        other => {
+            return Error::new(other.span(), "expected a string")
+                .to_compile_error()
+                .into()
+        }
     };
     let item_trait = parse_macro_input!(item as ItemTrait);
     let mut leaker = Leaker::new();
@@ -367,13 +381,21 @@ pub fn leak_tagged(
     let version = Referrer::FORMAT_VERSION;
     match tag.as_str() {
         "current" => (),
-        "stale" => tokens[0] = proc_macro2::Literal::string(&format!("{}{}", prefix, version - 1)).into(),
-        "future" => tokens[0] = proc_macro2::Literal::string(&format!("{}{}", prefix, version + 1)).into(),
+        "stale" => {
+            tokens[0] = proc_macro2::Literal::string(&format!("{}{}", prefix, version - 1)).into()
+        }
+        "future" => {
+            tokens[0] = proc_macro2::Literal::string(&format!("{}{}", prefix, version + 1)).into()
+        }
         "garbled" => tokens[0] = proc_macro2::Literal::string("not-a-tag").into(),
         "none" => {
             tokens.remove(0);
         }
-        _ => return Error::new(Span::call_site(), "unknown tag").to_compile_error().into(),
+        _ => {
+            return Error::new(Span::call_site(), "unknown tag")
+                .to_compile_error()
+                .into()
+        }
     }
     let mac_name = Ident::new(&format!("__tagged_{}", item_trait.ident), Span::call_site());
     let tokens: TokenStream = tokens.into_iter().collect();
@@ -405,7 +427,10 @@ pub fn __read_referrer(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
         }
     }
     match syn::parse::<Input>(input) {
-        Ok(Input) => quote!(const _: () = ();).into(),
+        Ok(Input) => quote!(
+            const _: () = ();
+        )
+        .into(),
         Err(e) => e.to_compile_error().into(),
     }
 }
@@ -517,7 +542,6 @@ pub(crate) fn entry_type(referrer: &Referrer, ix: EntryId) -> &Type {
     referrer.iter().find(|(id, _, _)| *id == ix).unwrap().1
 }
 
-
 /// The path of a module from its root (`ModuleScope::Itself::path`), from `RepeaterImpl::module`.
 pub(crate) fn module_path(module: &Option<ModuleScope>) -> Option<&[Ident]> {
     match module {
@@ -594,11 +618,7 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         allowed,
         item,
     } = parse_macro_input!(input as CheckLeakInput);
-    let mut leaker = Leaker::from_config(
-        Rules::new()
-            .primitive()
-            .or_if(starts_with(allowed)),
-    );
+    let mut leaker = Leaker::with_rule(Rules::new().primitive().or_if(starts_with(allowed)));
     match &item {
         Item::Trait(item) => leaker.intern_trait(item),
         Item::Struct(item) => leaker.intern_struct(item),
@@ -607,7 +627,8 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     };
     let got: std::result::Result<Vec<String>, String> = match leaker.result().finish() {
         Ok(referrer) => {
-            let mut types: Vec<String> = referrer.iter().map(|(_, ty, _)| type_string(ty)).collect();
+            let mut types: Vec<String> =
+                referrer.iter().map(|(_, ty, _)| type_string(ty)).collect();
             types.sort();
             Ok(types)
         }
@@ -642,7 +663,7 @@ pub fn leak(
 }
 
 fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
-    let mut leaker = Leaker::from_config(
+    let mut leaker = Leaker::with_rule(
         Rules::new()
             .primitive()
             .prelude()
@@ -976,8 +997,14 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
         // `Self` is what the context says: the implementor of the trait.
         let mut visitor = referrer.visitor(context, |_leaked, ix, entry| {
             // The generics of the trait are passed by their own names.
-            let projection =
-                repeater_projection(&repeater, &self_in_copy, entry, id, ix, slot_const(&repeater));
+            let projection = repeater_projection(
+                &repeater,
+                &self_in_copy,
+                entry,
+                id,
+                ix,
+                slot_const(&repeater),
+            );
             projection.unwrap_or_else(|e| {
                 error = Some(Error::from(e));
                 parse_quote!(())
@@ -989,7 +1016,7 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
         // An impl of the trait declares its parameters again (`impl<'a> Trait<'a> for ..`), with
         // the bounds it needs there, which are not those of the trait: they are the trait's.
         if matches!(item, Item::Impl(_)) && !params.is_empty() {
-            visitor = visitor.with_outermost_generics_as_leakers();
+            visitor = visitor.with_outer_generics();
         }
         visitor.visit_item_mut(&mut item);
         drop(visitor);
@@ -1046,9 +1073,10 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     if let Some(e) = encode_error {
         return Err(Error::from(e));
     }
-    // 2. Complete the arguments: an omitted argument takes its default.
-    let completed =
-        complete_params(&visited.generics.params, &trait_args.args).map_err(Error::from)?;
+    // 2. Complete the arguments (an omitted argument takes its default) and answer each parameter
+    // of the trait with its argument: one site for each signature written.
+    let site =
+        || Substitute::with_params(&visited.generics.params, &trait_args.args).map_err(Error::from);
 
     let mut methods = TokenStream::new();
     for trait_item in &visited.items {
@@ -1064,13 +1092,16 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
             }
         };
         // A method given verbatim is not forwarded.
-        if extra.iter().any(|item| matches!(item, ImplItem::Fn(f) if f.sig.ident == trait_fn.sig.ident)) {
+        if extra
+            .iter()
+            .any(|item| matches!(item, ImplItem::Fn(f) if f.sig.ident == trait_fn.sig.ident))
+        {
             continue;
         }
         // 3. Write the arguments of the impl into the signature, in one pass: the generics of the
         // trait are replaced, also in the paths through the Repeater.
         let mut sig = trait_fn.sig.clone();
-        let mut written = Substitute::new(answers(params, &completed));
+        let mut written = site()?;
         written.visit_signature_mut(&mut sig);
         if let Err(e) = written.finish() {
             // `T::A` for a `T` given a type that is not a type parameter is refused (F90): the
@@ -1081,7 +1112,7 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
             }
             sig = trait_fn.sig.clone();
             QualifyProjections { params }.visit_signature_mut(&mut sig);
-            let mut written = Substitute::new(answers(params, &completed));
+            let mut written = site()?;
             written.visit_signature_mut(&mut sig);
             written.finish().map_err(Error::from)?;
         }

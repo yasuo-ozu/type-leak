@@ -6,8 +6,8 @@
 //! - `every_error_is_written_and_read_back` is a round trip of every error above: the tokens
 //!   that are written again are the same, and so are the fields. `the_serialized_form_is_*` pin
 //!   the grammar, and what the parser refuses.
-//! - `to_compile_error()`, `emit()`, `to_syn_error()`, and the other ways to take an error as a
-//!   whole.
+//! - `to_compile_error()`, `emit()`, `From<ErrorItem> for syn::Error`, and the other ways to take
+//!   an error as a whole.
 //! - The inputs that cannot be leaked on stable Rust, and how the errors for them read (`limits`).
 //! - The help of every kind of error (see the section at the end).
 //!
@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::{allow_every_cause, causes_accepting, starts_with, AcceptCause, Rule};
+use common::{allow_every_cause, causes_accepting, starts_with, to_syn_error, AcceptCause, Rule};
 use std::cell::RefCell;
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -38,9 +38,9 @@ fn configured<A: Allow>(config: A) -> impl Allow {
     })
 }
 
-/// The Leaker of the triggers: `Leaker::from_config(config, ..)` with the rules of `with_rules()`.
+/// The Leaker of the triggers: `Leaker::with_rule()` of `config` and the rules of `with_rules()`.
 fn leaker_from<A: Allow>(config: A) -> Leaker<impl Allow> {
-    Leaker::from_config(configured(config))
+    Leaker::with_rule(configured(config))
 }
 
 /// Runs `f` with `rules` added to the config of the triggers.
@@ -148,7 +148,7 @@ fn help_of(item: &ErrorItem) -> Option<(String, String)> {
 fn trait_result(source: &str, check_values: bool) -> LeakerResult {
     let item: ItemTrait = parse_str(source).unwrap();
     if check_values {
-        let mut leaker = Leaker::from_config(configured(reading_values_config()));
+        let mut leaker = Leaker::with_rule(configured(reading_values_config()));
         leaker.check_values = true;
         run(leaker, |leaker| leaker.intern_trait(&item))
     } else {
@@ -886,8 +886,12 @@ fn assert_same(read: &ErrorItem, item: &ErrorItem) {
     assert_eq!(read.message, item.message);
     assert_eq!(notes_of(read), notes_of(item), "{}", item.message);
     assert_eq!(help_of(read), help_of(item), "{}", item.message);
-    assert_eq!(read.in_value, item.in_value, "{}", item.message);
-    assert_eq!(read.in_default, item.in_default, "{}", item.message);
+    assert_eq!(read.place.in_value, item.place.in_value, "{}", item.message);
+    assert_eq!(
+        read.place.in_default, item.place.in_default,
+        "{}",
+        item.message
+    );
     assert_eq!(read.paths, item.paths, "{}", item.message);
     // What the error is about in the Referrer is read back too, so the errors are equal.
     assert_eq!(*read, *item, "{}", item.message);
@@ -1011,7 +1015,7 @@ fn the_help_is_optional_and_so_are_the_notes() {
 fn the_place_and_the_paths_follow_the_help_and_are_written_only_if_set() {
     // Neither is written for an error that has no place and no path.
     let plain = parse_item(r#"{ type ( A ) RelativePath "m" [] ( B ) "h" }"#).unwrap();
-    assert!(!plain.in_value && !plain.in_default && plain.paths.is_empty());
+    assert!(!plain.place.in_value && !plain.place.in_default && plain.paths.is_empty());
     assert_eq!(
         plain.to_token_stream().to_string(),
         r#"{ type (A) RelativePath "m" [] (B) "h" }"#
@@ -1021,7 +1025,7 @@ fn the_place_and_the_paths_follow_the_help_and_are_written_only_if_set() {
         r#"{ type ( A ) RelativePath "m" [] ( B ) "h" value default paths [ type ( a :: b ) , trait ( :: c ) , expr ( Self ) , macro ( crate :: d ! ) , unknown ( e ) ] }"#,
     )
     .unwrap();
-    assert!(placed.in_value && placed.in_default);
+    assert!(placed.place.in_value && placed.place.in_default);
     let paths: Vec<String> = placed.paths.iter().map(text_of).collect();
     assert_eq!(paths, ["a :: b", ":: c", "Self", "crate :: d !", "e"]);
     assert!(matches!(
@@ -1039,14 +1043,18 @@ fn the_place_and_the_paths_follow_the_help_and_are_written_only_if_set() {
         r#"{ type (A) RelativePath "m" [] (B) "h" value default paths [type (a :: b) , trait (:: c) , expr (Self) , macro (crate :: d !) , unknown (e)] }"#
     );
     let only_default = parse_item(r#"{ type ( A ) RelativePath "m" [] default }"#).unwrap();
-    assert!(!only_default.in_value && only_default.in_default && only_default.help.is_none());
+    assert!(
+        !only_default.place.in_value
+            && only_default.place.in_default
+            && only_default.help.is_none()
+    );
     assert_eq!(
         only_default.to_token_stream().to_string(),
         r#"{ type (A) RelativePath "m" [] default }"#
     );
     // Empty paths are the same as none, in any order of the words.
     let empty = parse_item(r#"{ type ( A ) RelativePath "m" [] paths [] default value }"#).unwrap();
-    assert!(empty.in_value && empty.in_default && empty.paths.is_empty());
+    assert!(empty.place.in_value && empty.place.in_default && empty.paths.is_empty());
     assert_eq!(
         empty.to_token_stream().to_string(),
         r#"{ type (A) RelativePath "m" [] value default }"#
@@ -1248,7 +1256,7 @@ fn to_compile_error_is_the_error_of_syn_and_emit_is_the_same_outside_a_macro() {
 }
 
 #[test]
-fn to_syn_error_combines_the_items_in_order() {
+fn from_error_item_gives_one_syn_error_for_each_item_in_order() {
     let items = errors(relative_path);
     let combined = to_syn_error(&items);
     let errors: Vec<String> = combined.into_iter().map(|e| e.to_string()).collect();
@@ -1262,10 +1270,6 @@ fn to_syn_error_combines_the_items_in_order() {
         .flat_map(|(_, items)| items)
         .collect();
     assert_eq!(to_syn_error(&all).into_iter().count(), all.len());
-    // Nothing to report is an error at the call site, that tells it.
-    let none = to_syn_error(&[]);
-    assert_eq!(none.to_string(), "not internable");
-    assert_eq!(none.into_iter().count(), 1);
 }
 
 #[test]
@@ -1573,6 +1577,7 @@ mod limits {
     //!   (e.g. shadowed primitive names), and how they are detected.
 
     use super::{errors_in, kind, notes_of};
+    use crate::common::{messages, to_syn_error};
     use std::collections::BTreeSet;
     use syn::*;
     use template_quote::{quote, ToTokens};
@@ -1580,15 +1585,6 @@ mod limits {
 
     fn leaker_config() -> Rules<impl Allow + Clone> {
         Rules::new().primitive().crate_paths()
-    }
-
-    /// The messages of the errors, one per line.
-    fn messages(errors: &[ErrorItem]) -> String {
-        errors
-            .iter()
-            .map(|item| item.message.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     /// The errors that `leaker` has after `analyze` ran on it, for a test that expects an error.
@@ -1600,7 +1596,7 @@ mod limits {
 
     /// Runs a Leaker on `item_trait`, returning the leaked types or the error message.
     fn leak_trait(item_trait: &ItemTrait) -> std::result::Result<BTreeSet<String>, String> {
-        let mut leaker = Leaker::from_config(leaker_config());
+        let mut leaker = Leaker::with_rule(leaker_config());
         leaker.intern_trait(item_trait);
         leaker.reduce_roots();
         let referrer = leaker

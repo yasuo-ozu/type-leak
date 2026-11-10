@@ -1,7 +1,7 @@
 //! The `allow*()` operations of `Allow` and `LeakerResult` mean the same thing.
 //!
-//! `Leaker::from_config(config.allow_X()).result()` and
-//! `Leaker::from_config(config).result().allow_X()`:
+//! `Leaker::with_rule(config.allow_X()).result()` and
+//! `Leaker::with_rule(config).result().allow_X()`:
 //!
 //! - the cause, value and default rules give the same errors and an equal Referrer
 //!   (`tests/error_items.rs` checks every trigger of the errors; the cases of a value and of a default
@@ -369,22 +369,22 @@ fn a_trait_default_body_is_a_value_and_a_default() {
     );
     let result = analyze_values(&item, reading_values());
     let error = &result.errors()[0];
-    assert!(error.in_value && error.in_default);
+    assert!(error.place.in_value && error.place.in_default);
     // An impl's value is a value, not a default.
     let item: ItemImpl = parse_quote!(impl ::p::Tr for X { fn f(&self) { let _ = inner::f(); } });
-    let mut leaker = Leaker::from_config(reading_values());
+    let mut leaker = Leaker::with_rule(reading_values());
     leaker.check_values = true;
     leaker.intern_impl(&item);
     let result = leaker.result();
     let error = &result.errors()[0];
-    assert!(error.in_value && !error.in_default);
+    assert!(error.place.in_value && !error.place.in_default);
     // The default of a parameter is a default, not a value.
     let item: ItemTrait = parse_quote!(
         trait Tr<U = Rel<'_>> {}
     );
     let result = analyze_values(&item, reading_values());
     let error = &result.errors()[0];
-    assert!(!error.in_value && error.in_default);
+    assert!(!error.place.in_value && error.place.in_default);
     // `Rules::values()` drops the first two and leaves the third, `Rules::defaults()` the reverse.
     let values = result.clone().allow(Rules::new().values());
     assert_eq!(values.errors().len(), 1);

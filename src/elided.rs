@@ -143,6 +143,18 @@ impl FreshLifetimes {
         collect_lifetimes(tokens.into_token_stream(), &mut self.taken);
     }
 
+    /// Returns `true` if `lifetime` is a name that this made and has not given back: the library's
+    /// own binder, which a site is not asked about.
+    pub(crate) fn made(&self, lifetime: &Lifetime) -> bool {
+        let ident = lifetime.ident.to_string();
+        ident
+            .strip_prefix("__tl_s")
+            .and_then(|n| n.parse::<usize>().ok())
+            .map_or(false, |n| {
+                n < self.next && !self.taken.contains(&format!("'{}", ident))
+            })
+    }
+
     /// Returns the count of the signatures around, to give the names back with
     /// [`FreshLifetimes::release()`] after the signature being copied.
     pub(crate) fn mark(&self) -> usize {

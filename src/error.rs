@@ -345,7 +345,10 @@ pub enum Reason {
     /// A type in a bound or where predicate that the copy cannot write through the Repeater
     /// ([Bounds that name leaked types](crate::Leaker#bounds-that-name-leaked-types)).
     UnprovableBound,
-    /// A type that names `Self` in a bound or where predicate of its trait (E0275).
+    /// A type that names `Self` in a supertrait bound of its trait, or in a where predicate on a
+    /// type that is neither `Self` nor a generic (E0275): `Rel<Self>` in `trait Tr:
+    /// ::p::Tr<Rel<Self>>`. In a bound of `Self` or of a generic (`where Self: ::p::Tr<Rel<Self>>`,
+    /// `T: ::p::Tr<Rel<Self>>`) the same type is [`UnprovableBound`](Reason::UnprovableBound).
     SelfInTraitPredicate,
     /// A type in the self type of an impl whose context depends on `Self` through a bound of the
     /// impl.
@@ -421,10 +424,11 @@ impl Reason {
 /// assert_eq!(item.to_string(), item.message);
 /// ```
 ///
-/// Report an item from a macro with [`emit()`](ErrorItem::emit), or all of them with
-/// [`to_syn_error()`]; [`to_compile_error()`](ErrorItem::to_compile_error) is the same without the
-/// nightly diagnostic. [`ToTokens`] and [`Parse`] serialize an item as one brace group, to pass it
-/// to another macro of the same type-leak version.
+/// Report an item from a macro with [`emit()`](ErrorItem::emit);
+/// [`to_compile_error()`](ErrorItem::to_compile_error) is the same without the nightly diagnostic,
+/// and `syn::Error::from(item)` is a [`syn::Error`] at the span of the cause. [`ToTokens`] and
+/// [`Parse`] serialize an item as one brace group, to pass it to another macro of the same
+/// type-leak version.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ErrorItem {
@@ -444,12 +448,21 @@ pub struct ErrorItem {
     /// What to write instead, with the tokens it is about. The analysis gives every error one; it
     /// is `None` only in an item that [`Parse`] read without.
     pub help: Option<(TokenStream, String)>,
-    /// Found while reading a value ([`Leaker::check_values`](crate::Leaker::check_values)); see
-    /// [`place()`](ErrorItem::place).
-    pub in_value: bool,
-    /// Found in a default: of a trait's method or const, or of a parameter; see
-    /// [`place()`](ErrorItem::place).
-    pub in_default: bool,
+    /// Where it was found: in a value that [`Leaker::check_values`](crate::Leaker::check_values)
+    /// reads, in a default, both or neither. It is the place that an [`Allow`](crate::Allow) rule
+    /// is asked at.
+    ///
+    /// ```ignore
+    /// // In crate a, with the values read.
+    /// trait Tr<U = Rel<'_>> {          // `Rel<'_>`: in_default
+    ///     fn f(&self) { rel::f(); }    // `rel::f`: in_value and in_default
+    /// }
+    /// impl ::a::Tr for X {
+    ///     fn f(&self) { rel::f(); }    // `rel::f`: in_value
+    /// }
+    /// struct S(Rel<'_>);               // `Rel<'_>`: neither
+    /// ```
+    pub place: Place,
     /// The relative paths that the copy writes as they are, each as the cause of its kind (a
     /// [`Cause::Type`], [`Cause::Trait`], [`Cause::Expr`], [`Cause::Macro`] or [`Cause::Unknown`]
     /// that is a path) and without its arguments: `MyType` in `MyType<'_, Rel>`. What is inside
@@ -512,14 +525,6 @@ pub(crate) fn forget_dropped(errors: &mut [ErrorItem]) {
 }
 
 impl ErrorItem {
-    /// Returns where the error was found, as [`Allow::allow()`](crate::Allow::allow) is asked.
-    pub fn place(&self) -> Place {
-        Place {
-            in_value: self.in_value,
-            in_default: self.in_default,
-        }
-    }
-
     /// Returns the span of the cause, where the error is reported.
     pub fn span(&self) -> Span {
         self.cause.to_token_stream().span()
@@ -595,42 +600,6 @@ impl ErrorItem {
     }
 }
 
-/// Converts the errors into one [`syn::Error`], with the notes and the help appended to each
-/// message. Pass at least one: an empty slice gives an error "not internable" at the call site.
-///
-/// ```
-/// # use type_leak::*;
-/// # use syn::*;
-/// // A relative trait in a bound, and a relative type with an elided lifetime.
-/// let item: ItemTrait = parse_quote!(trait Tr: Clone { fn f(&self, a: MyType<'_>); });
-/// let mut leaker = Leaker::new();
-/// leaker.intern_trait(&item);
-/// let errors = leaker.result().finish().unwrap_err();
-/// let messages: Vec<String> = to_syn_error(&errors).into_iter().map(|e| e.to_string()).collect();
-/// // One error for each. The notes and the help follow the message.
-/// assert_eq!(messages.len(), 2);
-/// assert_eq!(
-///     messages[1],
-///     concat!(
-///         "use absolute path: 'MyType<'_>'\n\n",
-///         "  = note: it cannot be leaked as a whole because of `'_`\n",
-///         "  = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`)\n",
-///     )
-/// );
-/// assert_eq!(to_syn_error(&[]).to_string(), "not internable");
-/// ```
-#[must_use]
-pub fn to_syn_error(items: &[ErrorItem]) -> syn::Error {
-    items
-        .iter()
-        .map(ErrorItem::to_syn_error)
-        .reduce(|mut combined, error| {
-            combined.combine(error);
-            combined
-        })
-        .unwrap_or_else(|| syn::Error::new(Span::call_site(), "not internable"))
-}
-
 /// Two errors are equal if every field is: the tokens by their kinds and text, apart from spans
 /// and spacing, and what the error is about in the Referrer.
 impl PartialEq for ErrorItem {
@@ -652,8 +621,7 @@ impl PartialEq for ErrorItem {
                 (None, None) => true,
                 _ => false,
             }
-            && self.in_value == other.in_value
-            && self.in_default == other.in_default
+            && self.place == other.place
             && self.paths == other.paths
             && self.link == other.link
     }
@@ -679,6 +647,22 @@ impl std::fmt::Display for ErrorItem {
 impl std::error::Error for ErrorItem {}
 
 /// Converts into a [`syn::Error`] at the span of the cause, with the notes and the help appended.
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// let mut leaker = Leaker::new();
+/// leaker.intern_trait(&parse_quote!(trait Tr { fn f(&self, a: MyType<'_>); }));
+/// let error: Error = leaker.result().errors()[0].clone().into();
+/// assert_eq!(
+///     error.to_string(),
+///     concat!(
+///         "use absolute path: 'MyType<'_>'\n\n",
+///         "  = note: it cannot be leaked as a whole because of `'_`\n",
+///         "  = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`)\n",
+///     )
+/// );
+/// ```
 impl From<ErrorItem> for syn::Error {
     fn from(item: ErrorItem) -> Self {
         item.to_syn_error()
@@ -719,7 +703,7 @@ impl Parse for ErrorItem {
         } else {
             None
         };
-        let (mut in_value, mut in_default, mut paths) = (false, false, Vec::new());
+        let (mut place, mut paths) = (Place::default(), Vec::new());
         let mut link = Link::default();
         // The words of the link may be written once.
         let mut written: Vec<String> = Vec::new();
@@ -747,8 +731,8 @@ impl Parse for ErrorItem {
                         link.inner.push(id.base10_parse()?);
                     }
                 }
-                "value" => in_value = true,
-                "default" => in_default = true,
+                "value" => place.in_value = true,
+                "default" => place.in_default = true,
                 "paths" => {
                     let list;
                     bracketed!(list in item);
@@ -784,8 +768,7 @@ impl Parse for ErrorItem {
             message,
             notes,
             help,
-            in_value,
-            in_default,
+            place,
             paths,
             link,
         })
@@ -807,9 +790,11 @@ impl ToTokens for ErrorItem {
             .collect();
         let help = self.help.as_ref().map(|(at, help)| quote!((#at) #help));
         let value = self
+            .place
             .in_value
             .then(|| Ident::new("value", Span::call_site()));
         let default = self
+            .place
             .in_default
             .then(|| Ident::new("default", Span::call_site()));
         let paths = (!self.paths.is_empty()).then(|| {
@@ -863,8 +848,7 @@ pub(crate) fn self_without_meaning(mention: &SelfMention) -> ErrorItem {
         message: "`Self` has no meaning here".to_string(),
         notes: vec![(tokens.clone(), SELF_NOTE.to_string())],
         help: Some((tokens, SELF_HELP.to_string())),
-        in_value: mention.place.in_value,
-        in_default: mention.place.in_default,
+        place: mention.place,
         paths: Vec::new(),
         link: Link::default(),
     }
@@ -924,8 +908,7 @@ pub(crate) fn report(conflict: &CheckResult) -> Option<ErrorItem> {
             .unwrap_or_else(|| format!("use absolute path: '{}'", tidy(&tokens))),
         notes,
         help: Some(help),
-        in_value: conflict.place.in_value,
-        in_default: conflict.place.in_default,
+        place: conflict.place,
         paths: conflict.paths.clone(),
         link: Link {
             raw: Raw {

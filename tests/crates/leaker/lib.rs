@@ -26,13 +26,16 @@ pub mod base {
 
 /// Defines a leaked trait using `$crate` paths, which are real tokens since this is a
 /// `macro_rules!`: they resolve to this crate, also from the Referrer's crate.
+// rustfmt does not settle on the indentation of the attribute below (`fmt --check` differs from
+// what `fmt` writes).
+#[rustfmt::skip]
 macro_rules! define_dollar_crate_trait {
     () => {
         #[leak(
-            helper = crate::__macro,
-            repeater = crate::Repeater,
-            module = crate::m,
-        )]
+                                                            helper = crate::__macro,
+                                                            repeater = crate::Repeater,
+                                                            module = crate::m,
+                                                        )]
         pub trait DollarCrate: $crate::m_portable::PortTr {
             /// A `$crate` type in the return type.
             fn d_ret(&self) -> $crate::m_portable::Portable;
@@ -590,10 +593,10 @@ pub mod s {
     macro_rules! define_const_traits {
         () => {
             #[leak(
-                helper = crate::__macro,
-                repeater = crate::Repeater,
-                module = crate::s,
-            )]
+                                                                helper = crate::__macro,
+                                                                repeater = crate::Repeater,
+                                                                module = crate::s,
+                                                            )]
             pub trait ConstArg {
                 fn bare(&self) -> $crate::m_portable::CW<SIZE>;
                 /// Named like a type.
@@ -601,10 +604,10 @@ pub mod s {
             }
 
             #[leak(
-                helper = crate::__macro,
-                repeater = crate::Repeater,
-                module = crate::s,
-            )]
+                                                                helper = crate::__macro,
+                                                                repeater = crate::Repeater,
+                                                                module = crate::s,
+                                                            )]
             pub trait ExprTypes {
                 /// A type in an array length.
                 fn expr_array(&self) -> Option<[u8; ::core::mem::size_of::<Big>()]>;
@@ -1411,13 +1414,14 @@ pub mod kinds {
 
     /// The impls of the entries that name no `Self`, nor do their generics, are for a marker type of
     /// this crate (`ImplSelf::Marker`; `marker = ..`), not a primitive type, if no entry needs
-    /// `Self`. The trait has entries that do (`Wrap<Self>`), so the call for a marker fails and
-    /// every impl is for a parameter, which accepts the marker as the owner in the copy. The trait
-    /// is the item itself (not nested in a module), so its default `Defd<T>` does not name `Self`
-    /// while the bound of `T` does (`Context::self_ty` is `None`): the entry is for the implementor
-    /// of the trait, which is the host in the copy. For the marker it would bound `T:
-    /// AsRef<Marker9210>`, which the types that the Referrer's crate uses for `T` do not satisfy
-    /// (`impl MarkerDefaultCopy<Owner9210> for Host9210`, E0277).
+    /// `Self`. One does here, though no type of the trait names `Self`: the trait is the item
+    /// itself (not nested in a module), so its default `Defd<T>` does not name `Self` while the
+    /// bound of `T` does (`Context::self_ty` is `None`), and that entry is for the implementor of
+    /// the trait, which is the host in the copy. The call for a marker fails (`NeedsSelf`), so
+    /// every impl is for a parameter, which accepts the marker as the owner in the copy. For the
+    /// marker the impl would bound `T: AsRef<Marker9210>`, which the types that the Referrer's
+    /// crate uses for `T` do not satisfy (`impl MarkerDefaultCopy<Owner9210> for Host9210`,
+    /// E0277).
     #[prop_leak(
         id = 9210,
         prelude = true,
@@ -1438,12 +1442,7 @@ pub mod kinds {
     /// Two defaults (the second has an entry of its own, `Defd2<Rel, T>`), for a Referrer that
     /// replaces the optional entries. (A method of the copy cannot name an entry: the declaration
     /// has `T: AsRef<Self>`, and the path through the host needs `T: AsRef<Host>`.)
-    #[prop_leak(
-        id = 9132,
-        scope = "mod",
-        prelude = true,
-        redeclare = true
-    )]
+    #[prop_leak(id = 9132, scope = "mod", prelude = true, redeclare = true)]
     pub trait SelfDefaults<T: AsRef<Self>, U = Defd<T>, V = Defd2<Rel, T>> {
         fn get(&self, t: T, u: U, v: V);
     }
@@ -1480,12 +1479,13 @@ pub mod kinds {
     pub struct TwoDefaults<T: AsRef<Self>, U = Defd<T>, V = Defd2<Rel, U>>(pub T, pub U, pub V);
 
     // Items nested in a module whose generics have a bound that names their own `Self`, and a type
-    // that names it too (`nested_self_entries`, `nested_self_entries = true`). The
-    // entry is for any type that the bound holds for, with `Self` as the implementor in the type
-    // too, and the copy passes its own: the field is `Link<MyStruct<T>, T>`, as in the original.
-    // The Repeater's impl keeps `Sized` (the leaked type may need it). An entry whose bound is
-    // not on `Self` is for the Leaker's type, as without the option. (The same struct without the
-    // option is rejected by the Leaker.)
+    // that names it too. The Leaker reports `NestedSelfInBounds` for it, the risk of an entry for
+    // any type, and the test macro takes the risk (`nested_self_entries = true`: it allows those
+    // errors). The entry is for any type that the bound holds for, with `Self` as the implementor
+    // in the type too, and the copy passes its own: the field is `Link<MyStruct<T>, T>`, as in the
+    // original. The Repeater's impl keeps `Sized` (the leaked type may need it). An entry whose
+    // bound is not on `Self` is for the Leaker's type. (Without the attribute option the errors
+    // stay, and the item is rejected.)
 
     /// The bound is on the parameter. The entry is not the last field: rustc before 1.70 cannot
     /// prove that the copy is `Sized` otherwise (E0275).
@@ -1512,7 +1512,7 @@ pub mod kinds {
     where
         T: AsRef<(Self, u8)>;
 
-    /// No bound names `Self`: the entry is for the Leaker's type, as without the option.
+    /// No bound names `Self`: there is no risk, and the entry is for the Leaker's type.
     #[prop_leak(id = 9164, scope = "mod", prelude = true, nested_self_entries = true)]
     pub struct Unbound<T: Clone> {
         pub link: Link<Self, T>,
@@ -2159,10 +2159,7 @@ pub mod kinds {
     /// `'b` constrained, and then it is written as it is, with `Held<'b>` in it.
     #[prop_leak_accept(id = 9222, prelude = true)]
     pub trait NestedOptionalLifetime {
-        fn f<'b>(
-            &self,
-            x: Two<Leaf, ::type_leak_test_leaker::kinds::Wrap<Held<'b>>>,
-        ) -> &'b u8;
+        fn f<'b>(&self, x: Two<Leaf, ::type_leak_test_leaker::kinds::Wrap<Held<'b>>>) -> &'b u8;
     }
 
     /// The where predicate of the trait names `Self` (`SelfInTraitPredicate`): the type in it is
@@ -2251,14 +2248,10 @@ pub mod kinds {
     /// that uses `T` and so carries the bound. The copy writes the bound as a path through the
     /// Repeater, and rustc cannot prove the bound of the impl of the entry in the environment that
     /// has the rewritten form (E0277, for the entry in the last field: rustc proves the type is
-    /// `Sized` there). `intern_struct()` rejects it (`UnprovableBound`); the nested item with
-    /// `nested_self_entries` has to as well.
-    #[prop_leak(
-        id = 9206,
-        scope = "mod",
-        prelude = true,
-        nested_self_entries = true
-    )]
+    /// `Sized` there). `intern_struct()` rejects it (`UnprovableBound`); the nested item has to as
+    /// well: the macro's `nested_self_entries` allows only the `NestedSelfInBounds` risk, and the
+    /// `UnprovableBound` stays.
+    #[prop_leak(id = 9206, scope = "mod", prelude = true, nested_self_entries = true)]
     pub struct LeakedInBound<T: AsRef<Wrap<Self>>> {
         pub rel: Rel,
         pub link: Link<Self, T>,
@@ -2418,16 +2411,35 @@ pub mod kinds {
     /// the Leaker's names.
     #[prop_leak(id = 9215, scope = "mod")]
     pub enum DiscriminantBindings {
-        Let = { let x = 3; x },
-        Arm = match 5 { y => y + 1 },
-        Pair = { let (a, b) = (1, 2); a * 10 + b },
-        Typed = { let z: u8 = 7; z as isize },
-        Item = { const K: isize = 40; K + 2 },
+        Let = {
+            let x = 3;
+            x
+        },
+        Arm = match 5 {
+            y => y + 1,
+        },
+        Pair = {
+            let (a, b) = (1, 2);
+            a * 10 + b
+        },
+        Typed = {
+            let z: u8 = 7;
+            z as isize
+        },
+        Item = {
+            const K: isize = 40;
+            K + 2
+        },
     }
 
     /// F56: the default of the const parameter binds a name (`n`). It was rejected as well.
     #[prop_leak(id = 9216, scope = "mod")]
-    pub struct DefaultBinding<const N: usize = { let n = 2; n * 2 }>(pub [u8; N]);
+    pub struct DefaultBinding<
+        const N: usize = {
+            let n = 2;
+            n * 2
+        },
+    >(pub [u8; N]);
 
     /// A macro of this crate, which the Referrer's crate does not have.
     macro_rules! rel_two {
@@ -2541,7 +2553,9 @@ pub mod kinds {
     pub trait ObjectUnderTypes {
         fn f<'a>(
             &self,
-            x: ::std::vec::Vec<::std::option::Option<::std::boxed::Box<dyn ::core::ops::Fn(Rel) + 'a>>>,
+            x: ::std::vec::Vec<
+                ::std::option::Option<::std::boxed::Box<dyn ::core::ops::Fn(Rel) + 'a>>,
+            >,
         ) -> &'a u8;
         fn g<'b>(
             &self,

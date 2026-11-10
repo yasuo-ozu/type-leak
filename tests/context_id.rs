@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{panic_message, AcceptCause};
+use common::{panic_message, s, AcceptCause};
 use proc_macro2::{TokenStream, TokenTree};
 use std::collections::BTreeSet;
 use syn::visit_mut::VisitMut;
@@ -30,10 +30,6 @@ fn ids(referrer: &Referrer) -> Vec<usize> {
         .into_iter()
         .map(ContextId::index)
         .collect()
-}
-
-fn s(x: &impl ToTokens) -> String {
-    quote!(#x).to_string()
 }
 
 fn leaked(referrer: &Referrer) -> Vec<String> {
@@ -397,7 +393,12 @@ fn the_lookups_of_a_context_it_does_not_have_panic() {
             let _ = referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>));
         }),
         ("expand", |referrer, context| {
-            let _ = referrer.expand(context, parse_quote!(Rel), |_, ix, _| parse_quote!(P<#ix>));
+            let _ = common::expand(
+                referrer,
+                context,
+                parse_quote!(Rel),
+                |_, ix, _| parse_quote!(P<#ix>),
+            );
         }),
     ];
     for (shape, referrer) in &shapes {
@@ -436,7 +437,12 @@ fn the_contexts_that_exist_do_not_panic() {
     let (referrer, _) = gap_referrer();
     for context in common::context_ids(&referrer) {
         let _ = referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>));
-        let _ = referrer.expand(context, parse_quote!(Rel0), |_, ix, _| parse_quote!(P<#ix>));
+        let _ = common::expand(
+            &referrer,
+            context,
+            parse_quote!(Rel0),
+            |_, ix, _| parse_quote!(P<#ix>),
+        );
     }
     for (_, _, context) in referrer.iter() {
         assert_eq!(context.self_ty.as_ref(), None);
@@ -457,14 +463,16 @@ fn the_contexts_that_exist_do_not_panic() {
 #[test]
 fn lookups_work_with_gaps() {
     let (referrer, top_level) = gap_referrer();
-    let rewritten = referrer.expand(
+    let rewritten = common::expand(
+        &referrer,
         top_level,
         parse_quote!((Rel1, T)),
         |_, ix, _| parse_quote!(P<#ix>),
     );
     let expected: Type = parse_quote!((P<1usize>, T));
     assert_eq!(s(&rewritten), s(&expected));
-    let rewritten = referrer.expand(
+    let rewritten = common::expand(
+        &referrer,
         top_level,
         parse_quote!(Wrap<U>),
         |_, ix, _| parse_quote!(P<#ix>),
@@ -745,8 +753,7 @@ fn the_top_level_generics_do_not_have_the_bounds_the_entries_imply() {
             array_const,
         )
         .unwrap()
-        .nth(ix)
-        .unwrap();
+        .remove(ix);
     assert_eq!(s(&r.generics), "< 'a , T >");
 }
 

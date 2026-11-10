@@ -132,8 +132,8 @@ pub mod scoped {
 /// Items of every kind, copied by the Referrer: each copy has a witness for each type position, so
 /// this crate compiles only if every rewritten type is the original one.
 pub mod kinds {
-    use type_leak_test_leaker::kinds::{Rel, Wrap};
     pub use type_leak_test_leaker::kinds::Pair;
+    use type_leak_test_leaker::kinds::{Rel, Wrap};
     #[allow(unused_imports)]
     use Rel as _;
     #[allow(unused_imports)]
@@ -196,8 +196,9 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9152!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9153!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9154!(path = ::type_leak_test_leaker::kinds);
-    // A type that names the `Self` of such an item too, with `nested_self_entries`: for any type,
-    // and the copy passes its own.
+    // A type that names the `Self` of such an item too (the `NestedSelfInBounds` risk, which the
+    // macro takes with `nested_self_entries = true`): the entry is for any type, and the copy
+    // passes its own.
     type_leak_test_leaker::__tl_prop_9161!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9162!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9163!(path = ::type_leak_test_leaker::kinds);
@@ -306,13 +307,33 @@ pub mod kinds {
     // The copy is used at an instantiation that gives the type parameter a type with a lifetime,
     // where it is in the inputs of a function pointer or `Fn(..)` whose output has an elided
     // lifetime: the use site names that lifetime (F69). The last leaves the default out.
-    type_leak_test_leaker::__tl_prop_9231!(path = ::type_leak_test_leaker::kinds, inst(1), lifetime_args);
-    type_leak_test_leaker::__tl_prop_9232!(path = ::type_leak_test_leaker::kinds, inst(1), lifetime_args);
-    type_leak_test_leaker::__tl_prop_9233!(path = ::type_leak_test_leaker::kinds, inst(2), lifetime_args);
+    type_leak_test_leaker::__tl_prop_9231!(
+        path = ::type_leak_test_leaker::kinds,
+        inst(1),
+        lifetime_args
+    );
+    type_leak_test_leaker::__tl_prop_9232!(
+        path = ::type_leak_test_leaker::kinds,
+        inst(1),
+        lifetime_args
+    );
+    type_leak_test_leaker::__tl_prop_9233!(
+        path = ::type_leak_test_leaker::kinds,
+        inst(2),
+        lifetime_args
+    );
     // The same where an entry is in the inputs, which the strict Referrer replaces: the path through
     // the Repeater names the lifetime (F70).
-    type_leak_test_leaker::__tl_prop_9234!(path = ::type_leak_test_leaker::kinds, inst(1), lifetime_args);
-    type_leak_test_leaker::__tl_prop_9235!(path = ::type_leak_test_leaker::kinds, inst(1), lifetime_args);
+    type_leak_test_leaker::__tl_prop_9234!(
+        path = ::type_leak_test_leaker::kinds,
+        inst(1),
+        lifetime_args
+    );
+    type_leak_test_leaker::__tl_prop_9235!(
+        path = ::type_leak_test_leaker::kinds,
+        inst(1),
+        lifetime_args
+    );
     // A type of a crate that the rule does not allow, in a where predicate that the context of an
     // entry carries, is no entry: the copy writes it as it is (F71). The last is the control, whose
     // type names no generic and stays an entry.

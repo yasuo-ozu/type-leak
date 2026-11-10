@@ -23,11 +23,11 @@
 
 mod common;
 
-use common::{check_in, starts_with};
+use common::{check_in, messages, s, starts_with, to_syn_error};
 use syn::punctuated::Punctuated;
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, Allow, Cause, ContextId, ErrorItem, Leaker, Place, Referrer, Rules};
+use type_leak::{Allow, Cause, ContextId, ErrorItem, Leaker, Place, Referrer, Rules};
 
 /// A Leaker which allows `::p`, standing for an external crate which the Referrer's crate is known
 /// to have as the Leaker's: its types may be an anchor. The types of the other external crates may
@@ -44,20 +44,7 @@ fn leaker_with(allowed: &[Path]) -> Leaker<impl Allow> {
         .or_if(move |cause: &Cause, place: Place| {
             allowed.iter().any(|a| starts_with(a.clone())(cause, place))
         });
-    Leaker::from_config(config)
-}
-
-fn s(x: &impl template_quote::ToTokens) -> String {
-    quote!(#x).to_string()
-}
-
-/// The messages of the errors, one per line.
-fn messages(errors: &[ErrorItem]) -> String {
-    errors
-        .iter()
-        .map(|item| item.message.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
+    Leaker::with_rule(config)
 }
 
 fn analyze(item: &ItemTrait) -> std::result::Result<Referrer, Vec<ErrorItem>> {
@@ -1731,13 +1718,13 @@ mod elided {
     //!
     //! The copies compile as the tests of `tests/findings.rs` (F12) and the property test show.
 
-    use super::{e, messages, s};
+    use super::{e, messages, s, to_syn_error};
     use syn::*;
-    use type_leak::{to_syn_error, Allow, ErrorItem, Leaker, Referrer, Rules};
+    use type_leak::{Allow, ErrorItem, Leaker, Referrer, Rules};
 
     fn leaker() -> Leaker<impl Allow> {
         let config = Rules::new().primitive().prelude();
-        Leaker::from_config(config)
+        Leaker::with_rule(config)
     }
 
     fn analyze(item: &ItemTrait) -> std::result::Result<Referrer, Vec<ErrorItem>> {

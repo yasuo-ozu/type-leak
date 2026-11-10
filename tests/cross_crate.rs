@@ -273,26 +273,26 @@ fn squash(text: &str) -> String {
     text.split_whitespace().collect()
 }
 
-/// The `KEY` of the entry `nth` of the Leaker `id`, as the tokens write it (and `squash()` leaves it).
-fn key_text(id: u64, nth: usize) -> String {
-    let nth: EntryId = parse_quote!(#nth);
-    format!("{}u128", repeater_key(id, nth))
+/// The `KEY` of the entry `entry` of the Leaker `id`, as the tokens write it (and `squash()` leaves it).
+fn key_text(id: u64, entry: usize) -> String {
+    let entry: EntryId = parse_quote!(#entry);
+    format!("{}u128", repeater_key(id, entry))
 }
 
-/// `repeater_key(id, nth)` in a type, where the argument of a path is a const expression.
-const fn key(id: u64, nth: usize) -> u128 {
-    ((id as u128) << 64) | nth as u128
+/// `repeater_key(id, entry)` in a type, where the argument of a path is a const expression.
+const fn key(id: u64, entry: usize) -> u128 {
+    ((id as u128) << 64) | entry as u128
 }
 
 #[test]
 fn the_const_key_is_the_key_of_the_library() {
-    for (id, nth) in [(0, 0), (7, 3), (9209, 2), (u64::MAX, usize::MAX)] {
-        let entry: EntryId = parse_quote!(#nth);
-        assert_eq!(key(id, nth), repeater_key(id, entry));
+    for (id, index) in [(0, 0), (7, 3), (9209, 2), (u64::MAX, usize::MAX)] {
+        let entry: EntryId = parse_quote!(#index);
+        assert_eq!(key(id, index), repeater_key(id, entry));
     }
 }
 
-/// The `(id, nth)` of each `Repeater<(), KEY>` in the squashed `text`, in order.
+/// The `(id, entry)` of each `Repeater<(), KEY>` in the squashed `text`, in order.
 fn repeater_keys(text: &str) -> Vec<(u64, usize)> {
     text.split("Repeater<(),")
         .skip(1)
@@ -1563,8 +1563,8 @@ fn a_leaker_that_allows_a_crate_has_the_copy_name_it_and_the_default_one_does_no
     assert!(allowed.contains("u128>>::Type,)>,y:::type_leak_test_ext::Ext<u8>"));
     let keys = repeater_keys(&allowed);
     assert_eq!(keys.len(), 1, "{}", allowed);
-    let (_, nth) = keys[0];
-    assert_eq!(nth, 0);
+    let (_, entry) = keys[0];
+    assert_eq!(entry, 0);
     assert_eq!(allowed.matches("type_leak_test_ext").count(), 2);
     assert_eq!(allowed.matches("Repeater<").count(), 1);
 
@@ -2129,7 +2129,7 @@ fn the_entries_that_do_not_name_self_are_implemented_for_a_bucket() {
         __tl_report_9209!()
     );
     // The entries `Defd2<Rel, u8>` and `Rel`, that no generic is used in, are for the primitive
-    // type that `Referrer::bucket_self(ix, id)` gives (the bucket is part of the format, so these
+    // type that `Referrer::bucket_self(id, ix)` gives (the bucket is part of the format, so these
     // do not change without a bump of `Referrer::FORMAT_VERSION`). `Wrap<Self>` has none.
     assert_eq!(
         type_name::<<u64 as Repeater<(), { key(9209, 1) }>>::Type>(),

@@ -122,7 +122,7 @@ fn intern_mod_errors_and_bodies() {
 /// standard prelude, and returns the module context too.
 fn referrer_with_prelude(m: &ItemMod) -> (type_leak::Referrer, ContextId) {
     let config = type_leak::Rules::new().primitive().prelude();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     let context = leaker.intern_mod(m);
     (leaker.result().finish().unwrap(), context)
 }
@@ -1103,7 +1103,7 @@ fn the_entry_of_the_module_is_preferred_to_the_one_with_no_module() {
 
 /// `Leaker::enter_mod()` docs: the items of a module are nested items, so their generics are local
 /// even if the visitor is told that the outermost generics are those of the context
-/// (`with_outermost_generics_as_leakers()`). Audit mutants `vis_item_depth_module`,
+/// (`with_outer_generics()`). Audit mutants `vis_item_depth_module`,
 /// `vis_mod_item_not_nested` and `vis_mod_item_self_kept`.
 #[test]
 fn the_items_of_a_module_are_nested_items() {
@@ -1120,7 +1120,7 @@ fn the_items_of_a_module_are_nested_items() {
     );
     referrer
         .visitor(module, |_, ix, _| parse_quote!(P<#ix>))
-        .with_outermost_generics_as_leakers()
+        .with_outer_generics()
         .visit_item_mut(&mut item);
     assert_eq!(
         quote!(#item).to_string(),
@@ -1145,7 +1145,7 @@ fn the_items_of_a_module_are_nested_items() {
     );
     referrer
         .visitor(context, |_, ix, _| parse_quote!(P<#ix>))
-        .with_outermost_generics_as_leakers()
+        .with_outer_generics()
         .visit_item_mut(&mut item);
     assert_eq!(
         quote!(#item).to_string(),

@@ -27,7 +27,7 @@
 
 mod common;
 
-use common::starts_with;
+use common::{messages, starts_with, to_syn_error};
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
@@ -61,7 +61,7 @@ fn analyze(item: &Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
     // The absolute paths are allowed, so the types of `::l` are no entries: the entries are those
     // that depend on the context.
     let config = Rules::new().primitive().external_crates();
-    analyze_with(Leaker::from_config(config), item)
+    analyze_with(Leaker::with_rule(config), item)
 }
 
 /// The entries, as text.
@@ -69,15 +69,6 @@ fn entries(referrer: &Referrer) -> Vec<String> {
     common::types(referrer)
         .map(|ty| quote!(#ty).to_string())
         .collect()
-}
-
-/// The messages of the errors, one per line.
-fn messages(errors: &[ErrorItem]) -> String {
-    errors
-        .iter()
-        .map(|item| item.message.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// What an error says: for each of its errors, the headline, the tokens, the notes and the help.
@@ -216,7 +207,7 @@ fn a_bare_identifier_beside_self_is_leaked_as_a_whole() {
     let config = Rules::new()
         .external_crates()
         .or_if(starts_with(parse_quote!(ILEN)));
-    let referrer = analyze_with(Leaker::from_config(config), &item).unwrap();
+    let referrer = analyze_with(Leaker::with_rule(config), &item).unwrap();
     assert!(entries(&referrer).is_empty());
 }
 
@@ -831,7 +822,7 @@ fn module_config() -> Rules<impl Allow + Clone> {
 }
 
 fn analyze_module(item: &Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
-    analyze_with(Leaker::from_config(module_config()), item)
+    analyze_with(Leaker::with_rule(module_config()), item)
 }
 
 /// `ILEN` imported from outside the module (not declared by it), nested or not.
@@ -938,7 +929,7 @@ fn a_name_the_module_declares_beside_the_identifier_is_no_cause_if_the_identifie
     // Allowed by the config: left as written, so it is no cause either.
     let item = module_with(true, imported(true), place, "::l::BC<$RC<u8, 3>, ILEN>");
     let config = module_config().or_if(starts_with(parse_quote!(ILEN)));
-    let referrer = analyze_with(Leaker::from_config(config), &item).unwrap();
+    let referrer = analyze_with(Leaker::with_rule(config), &item).unwrap();
     assert!(entries(&referrer).is_empty());
 }
 
@@ -1141,7 +1132,7 @@ fn a_name_that_enter_mod_declares_beside_the_identifier_is_an_error_too() {
             .iter()
             .map(|name| Ident::new(name, proc_macro2::Span::call_site()))
             .collect();
-        let mut leaker = Leaker::from_config(module_config());
+        let mut leaker = Leaker::with_rule(module_config());
         leaker.enter_mod("m", declared, |view| view.visit_item(&item));
         leaker.result().finish()
     };

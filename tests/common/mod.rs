@@ -3,12 +3,38 @@ use std::collections::BTreeSet;
 use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::*;
-use template_quote::quote;
+use template_quote::{quote, ToTokens};
 use type_leak::{
     array_const, complete_params, repeater_projection, slot_const, substitute_args, Allow, Cause,
     CheckResult, Context, ContextId, EncodeError, EntryId, ErrorItem, ImplSelf, Leaker,
-    LeakerResult, ModuleScope, Place, Referrer, Rules, View,
+    LeakerResult, ModuleScope, Place, Referrer, RepeaterImpl, Rules, View,
 };
+
+/// The tokens of `x`, as text.
+#[allow(dead_code)]
+pub fn s(x: &impl ToTokens) -> String {
+    quote!(#x).to_string()
+}
+
+/// The messages of the errors, one per line.
+#[allow(dead_code)]
+pub fn messages(errors: &[ErrorItem]) -> String {
+    errors
+        .iter()
+        .map(|item| item.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The leaked types with their generics (and where clause), in the order of the Referrer.
+#[allow(dead_code)]
+pub fn entries_with_generics(referrer: &Referrer) -> Vec<(String, String)> {
+    referrer
+        .iter()
+        .map(|(_, ty, context)| (ty, &context.generics))
+        .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
+        .collect()
+}
 
 /// The message of the panic of `f`.
 #[allow(dead_code)]
@@ -44,12 +70,6 @@ pub fn types(referrer: &Referrer) -> impl Iterator<Item = &Type> {
 #[allow(dead_code)]
 pub fn entry_id_at(referrer: &Referrer, n: usize) -> EntryId {
     referrer.iter().nth(n).expect("no such entry").0
-}
-
-/// The type of the `ix`-th entry (`Referrer::iter()` gives it with its context).
-#[allow(dead_code)]
-pub fn entry_ty(referrer: &Referrer, ix: usize) -> &Type {
-    referrer.iter().nth(ix).expect("no such entry").1
 }
 
 /// The context of the `ix`-th entry (`Referrer::iter()` gives it with the type).
@@ -163,6 +183,35 @@ pub fn projection_args(projection: &Type) -> Type {
     }
 }
 
+/// The errors as one `syn::Error`, one for each in order. Panics if there is none.
+#[allow(dead_code)]
+pub fn to_syn_error(items: &[ErrorItem]) -> syn::Error {
+    let mut errors = items.iter().cloned().map(syn::Error::from);
+    let mut combined = errors.next().expect("at least one error");
+    for error in errors {
+        combined.combine(error);
+    }
+    combined
+}
+
+/// The first argument of the Repeater in the path of an impl, `ARGS` of `Repeater<ARGS>`.
+#[allow(dead_code)]
+pub fn impl_args(r: &RepeaterImpl) -> Type {
+    match &r
+        .path
+        .segments
+        .last()
+        .expect("the path has a segment")
+        .arguments
+    {
+        PathArguments::AngleBracketed(args) => match args.args.first() {
+            Some(GenericArgument::Type(ty)) => ty.clone(),
+            _ => panic!("not a type: {}", quote!(#args)),
+        },
+        other => panic!("not the arguments of a trait: {}", quote!(#other)),
+    }
+}
+
 /// The first argument of the Repeater for an entry with `context`, as written at a site that
 /// answers names with `f`: the one of `repeater_projection()` (the generics of the context by
 /// their own names, encoded), with the site substituted (`substitute_args()`). `self_ty` is what
@@ -185,6 +234,20 @@ pub fn repeater_args(
         const_fn,
     )?;
     substitute_type(&projection_args(&projection), f, None)
+}
+
+/// Replaces the leaked types in the type `ty`, which is inside the scope `context`, with what
+/// `type_fn` returns: the visitor of `context` on the type.
+#[allow(dead_code)]
+pub fn expand(
+    referrer: &Referrer,
+    context: ContextId,
+    mut ty: Type,
+    type_fn: impl FnMut(Type, EntryId, &Context) -> Type,
+) -> Type {
+    use syn::visit_mut::VisitMut;
+    referrer.visitor(context, type_fn).visit_type_mut(&mut ty);
+    ty
 }
 
 /// The trait `tr` as the Referrer's crate visits it to write a copy at `context`, where `type_fn`
@@ -459,6 +522,7 @@ pub fn entry_module(result: &LeakerResult, ix: usize) -> Option<ModuleScope> {
             array_const,
         )
         .unwrap_or_else(|error| panic!("the impls: {}", error))
+        .into_iter()
         .nth(ix)
         .unwrap_or_else(|| panic!("no such entry: {}", ix));
     r.module
@@ -553,10 +617,10 @@ pub fn starts_with(prefix: Path) -> impl Fn(&Cause, Place) -> bool + Clone {
     move |cause: &Cause, _: Place| bare_path(cause).is_some() && cause.starts_with(&prefix)
 }
 
-/// Analyzes the trait `item` (`Self` allowed) with `config`; `check_values` reads the values too.
+/// Analyzes the trait `item` with `config`; `check_values` reads the values too.
 #[allow(dead_code)]
 pub fn analyze_trait<A: Allow>(item: &ItemTrait, config: A, check_values: bool) -> LeakerResult {
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.check_values = check_values;
     leaker.intern_trait(item);
     leaker.result()

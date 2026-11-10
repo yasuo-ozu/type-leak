@@ -25,7 +25,9 @@
 
 mod common;
 
-use common::{accepting, allow_every_cause, causes_accepting, starts_with, AcceptCause, Rule};
+use common::{
+    accepting, allow_every_cause, causes_accepting, starts_with, to_syn_error, AcceptCause, Rule,
+};
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
@@ -86,7 +88,7 @@ fn show(cause: &Cause) -> String {
 }
 
 fn values() -> Leaker<Rules> {
-    let mut leaker = Leaker::from_config(Rules::new());
+    let mut leaker = Leaker::with_rule(Rules::new());
     leaker.check_values = true;
     leaker
 }
@@ -122,7 +124,7 @@ fn a_bound_written_as_it_is_has_the_error_inside_it_after_it() {
     assert_eq!(inside.cause, a0_cause());
     assert_eq!(inside.reason, Reason::UnprovableBound);
     assert!(inside.paths.is_empty());
-    assert!(!inside.in_value && !inside.in_default);
+    assert!(!inside.place.in_value && !inside.place.in_default);
     // The same error as the analysis with an absolute `Into` reports in the first place.
     let absolute: ItemTrait = parse_quote!(
         trait Tr<T: ::p::BT1<String>> {
@@ -343,6 +345,119 @@ fn an_error_without_a_path_has_none() {
     assert!(result.errors()[0].paths.is_empty());
 }
 
+/// Where a part is copied whole.
+enum Whole {
+    Type(Type),
+    Predicate(WhereClause),
+}
+
+/// A part that is copied whole (a reference with a lifetime, a type in a predicate) and names a
+/// `Self` without meaning is written as it is with what is in it: the error is that of `Self`,
+/// with no path, no entry is left inside, and the Visitor leaves the copy as written. A type that
+/// is not whole leaks the types in it that do not name `Self`.
+#[test]
+fn a_whole_part_with_a_self_without_meaning_has_no_entry_inside() {
+    use syn::visit_mut::VisitMut;
+    // The generics, the part, the entries left, and the copy as the Visitor writes it (`None`: as
+    // written).
+    type Case = (Generics, Whole, &'static [&'static str], Option<Whole>);
+    let cases: Vec<Case> = vec![
+        (
+            parse_quote!(<'a>),
+            Whole::Type(parse_quote!(&'a Rel<Self>)),
+            &[],
+            None,
+        ),
+        (
+            parse_quote!(<'a, T>),
+            Whole::Type(parse_quote!(&'a Wrap<T, Self>)),
+            &[],
+            None,
+        ),
+        (
+            parse_quote!(<T>),
+            Whole::Type(parse_quote!(&'static Rel<Self, T>)),
+            &[],
+            None,
+        ),
+        // `Other` would be an entry, and so would `Rel<Wrap>` if `Self` were not there.
+        (
+            parse_quote!(<>),
+            Whole::Type(parse_quote!(&'static (Other, Rel<Self, Wrap>))),
+            &[],
+            None,
+        ),
+        (
+            parse_quote!(<>),
+            Whole::Predicate(parse_quote!(where Rel<Self>: Sized)),
+            &[],
+            None,
+        ),
+        (
+            parse_quote!(<T>),
+            Whole::Predicate(parse_quote!(where Rel<Self, T>: Sized)),
+            &[],
+            None,
+        ),
+        (
+            parse_quote!(<>),
+            Whole::Predicate(parse_quote!(where Rel<Self, Other<u8>>: Sized)),
+            &[],
+            None,
+        ),
+        // Not whole: the types in it that do not name `Self` are leaked.
+        (
+            parse_quote!(<>),
+            Whole::Type(parse_quote!(Rel<Self, Other>)),
+            &["Other"],
+            Some(Whole::Type(parse_quote!(Rel<Self, Entry<0usize>>))),
+        ),
+    ];
+    for (generics, part, entries, copy) in cases {
+        let mut written = match &part {
+            Whole::Type(ty) => text(ty),
+            Whole::Predicate(predicate) => text(predicate),
+        };
+        written.insert_str(0, &format!("{} ", text(&generics)));
+        let mut leaker = Leaker::with_rule(Rules::new().primitive().prelude());
+        let (context, ()) = leaker.enter_generics(&generics, |view| match &part {
+            Whole::Type(ty) => view.visit_type(ty),
+            Whole::Predicate(predicate) => view.visit_where_clause(predicate),
+        });
+        let result = leaker.result();
+        // One error, for `Self`, whose cause is the only thing to allow.
+        assert_eq!(
+            shape(result.errors()),
+            "Self [SelfWithoutMeaning]",
+            "{}",
+            written
+        );
+        assert_eq!(result.errors()[0].message, "`Self` has no meaning here");
+        assert!(result.errors()[0].paths.is_empty(), "{}", written);
+        assert!(allow_every_cause(result.clone()).0.finish().is_ok());
+        let referrer = result.into_referrer();
+        let found: Vec<String> = common::types(&referrer).map(text).collect();
+        assert_eq!(found, entries, "{}", written);
+        // The Visitor writes the part as it is, and the entries it has.
+        let mut visitor = referrer.visitor(context, |_, ix, _| parse_quote!(Entry<#ix>));
+        match (part, copy) {
+            (Whole::Type(mut ty), copy) => {
+                let expected = match copy {
+                    Some(Whole::Type(copy)) => copy,
+                    _ => ty.clone(),
+                };
+                visitor.visit_type_mut(&mut ty);
+                assert_eq!(ty, expected, "{}", written);
+            }
+            (Whole::Predicate(mut predicate), _) => {
+                let expected = predicate.clone();
+                visitor.visit_where_clause_mut(&mut predicate);
+                assert_eq!(predicate, expected, "{}", written);
+            }
+        }
+    }
+}
+
 #[test]
 fn a_type_that_cannot_be_leaked_has_what_is_wrong_inside_it_listed_after_it() {
     // `::p::Tr<Rel<Self::A0>>` is leaked whole, and its entry `Rel<Self::A0>` is unprovable in a
@@ -396,7 +511,7 @@ fn the_arguments_of_a_value_path_are_analyzed_on_their_own() {
         ]
     );
     assert_eq!(paths(&result.errors()[0]), ["inner :: f"]);
-    assert!(result.errors()[0].in_value);
+    assert!(result.errors()[0].place.in_value);
     assert_eq!(paths(&result.errors()[1]), ["Rel"]);
     assert_eq!(paths(&result.errors()[2]), ["Wrap"]);
     assert_eq!(paths(&result.errors()[3]), ["Rel2"]);

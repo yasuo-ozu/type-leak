@@ -83,8 +83,8 @@ fn describe(item: &ErrorItem) -> String {
         item.message,
         notes,
         help,
-        item.in_value,
-        item.in_default,
+        item.place.in_value,
+        item.place.in_default,
         paths
     )
 }
@@ -221,11 +221,14 @@ fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() 
         }
     );
     let config = Rules::new().primitive();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.check_values = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
-    assert!(result.errors().iter().any(|e| e.in_value && e.in_default));
+    assert!(result
+        .errors()
+        .iter()
+        .any(|e| e.place.in_value && e.place.in_default));
     assert!(result.errors().iter().any(|e| e.paths.len() > 1));
     let read_back = read(result.to_token_stream()).unwrap();
     assert_eq!(describe_all(&read_back), describe_all(&result));
@@ -319,7 +322,8 @@ fn the_rules_chain_and_a_rule_may_count() {
         let ix = common::types(&referrer)
             .position(|ty| text(ty) == ":: foo :: X")
             .unwrap();
-        let ty = referrer.expand(
+        let ty = common::expand(
+            &referrer,
             common::entry_id(&referrer, ix),
             parse_quote!(::foo::X),
             |_, ix, _| parse_quote!(P<#ix>),

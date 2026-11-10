@@ -125,15 +125,14 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
         .primitive()
         .prelude()
         .or_if(crate::starts_with(vec![bare]));
-    let mut leaker = Leaker::from_config(config);
-    let (context, ()) =
-        leaker.enter_trait(&nested.trait_ident, &nested.trait_generics, |view| {
-            view.enter_impl(&nested.impl_generics, &nested.self_ty, None, |view| {
-                for (_, ty) in &nested.types {
-                    view.visit_type(ty);
-                }
-            });
+    let mut leaker = Leaker::with_rule(config);
+    let (context, ()) = leaker.enter_trait(&nested.trait_ident, &nested.trait_generics, |view| {
+        view.enter_impl(&nested.impl_generics, &nested.self_ty, None, |view| {
+            for (_, ty) in &nested.types {
+                view.visit_type(ty);
+            }
         });
+    });
     let result = leaker.result();
     // Every error is accepted: the part that conflicts is copied as written.
     let errors: Vec<ErrorItem> = result.errors().to_vec();
@@ -145,10 +144,10 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let self_param = ident("__S");
     let repeater: Path = parse_quote!(crate::Repeater);
     let mut impls = TokenStream::new();
-    let repeater_impls = result
+    for r in result
         .repeater_impls(&repeater, id, ImplSelf::Param(&self_param), array_const)
-        .map_err(Error::from)?;
-    for r in repeater_impls {
+        .map_err(Error::from)?
+    {
         impls.extend(r.to_token_stream());
     }
     let witnesses = nested.types.iter().enumerate().map(|(j, (generics, ty))| {

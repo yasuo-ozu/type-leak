@@ -1882,7 +1882,9 @@ pub mod m {
 }
 
 /// The Referrer's side: implements the traits by forwarding to `Inner`, without importing any of
-/// the types relative to `crate::m`. The copies of the signatures are compiled here.
+/// the types relative to `crate::m`. The copies of the signatures are compiled here, with the
+/// parentheses of the originals (`&'a (dyn Iterator<..>)`).
+#[allow(unused_parens)]
 pub mod user {
     pub struct Wrapper(pub crate::m::Inner);
 
@@ -2074,7 +2076,10 @@ pub mod user {
                 crate::m::ObjectDefaults::<'a>::unrelated(&self.0, x)
             }
             // The method with a lifetime of its own is not part of the point: as the original.
-            fn local<'b>(&'b self, x: Inferred<'b, dyn crate::m::RelTr>) -> Inferred<'b, dyn crate::m::RelTr> {
+            fn local<'b>(
+                &'b self,
+                x: Inferred<'b, dyn crate::m::RelTr>,
+            ) -> Inferred<'b, dyn crate::m::RelTr> {
                 x
             }
         }

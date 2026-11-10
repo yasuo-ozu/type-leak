@@ -29,8 +29,8 @@ const REPEATER_SLOTS: &[(&str, &str, &str)] = &[
     ("isize", "ISIZE", "0"),
 ];
 
-/// The `KEY` argument of the Repeater for the entry `nth` of the Leaker `id`: `id` in the high 64
-/// bits and the [index](EntryId::index) of `nth` in the low ones, so no two entries share a key.
+/// The `KEY` argument of the Repeater for the entry `entry` of the Leaker `id`: `id` in the high 64
+/// bits and the [index](EntryId::index) of `entry` in the low ones, so no two entries share a key.
 ///
 /// ```
 /// # use type_leak::*;
@@ -39,8 +39,8 @@ const REPEATER_SLOTS: &[(&str, &str, &str)] = &[
 /// assert_eq!(repeater_key(7, parse_quote!(3)), (7u128 << 64) | 3);
 /// ```
 #[must_use]
-pub fn repeater_key(id: u64, nth: EntryId) -> u128 {
-    (u128::from(id) << 64) | nth.index() as u128
+pub fn repeater_key(id: u64, entry: EntryId) -> u128 {
+    (u128::from(id) << 64) | entry.index() as u128
 }
 
 /// Returns the definition of the Repeater trait, the one trait that both crates see.
@@ -49,8 +49,8 @@ pub fn repeater_key(id: u64, nth: EntryId) -> u128 {
 /// the item), not in the crate of the proc macros: the impls are for any `Self`, which only a
 /// local trait allows. The copying crate names it through the crate that defines it.
 ///
-/// `T` is the encoding of the generics of an entry and `KEY` is `repeater_key(ID, NTH)` for the
-/// Leaker `ID` and its entry `NTH` ([`repeater_key()`]). A defaulted const slot per other
+/// `T` is the encoding of the generics of an entry and `KEY` is `repeater_key(ID, ENTRY)` for the
+/// Leaker's id and the entry ([`repeater_key()`]). A defaulted const slot per other
 /// primitive type (`BOOL`, `CHAR`, `U8`, .., `ISIZE`) carries the other const generics
 /// ([`slot_const()`]), and `Repeater<T, KEY>` still works. `const N: usize` is `[(); N]`
 /// ([`array_const()`](crate::array_const)) and a `u128` uses `KEY`, so if every const parameter is
@@ -116,30 +116,30 @@ pub(crate) fn repeater_path(repeater: &Path, args: impl ToTokens) -> Path {
     parse_quote!(#path<#args>)
 }
 
-// The path of the Repeater with the arguments of the entry `ix` of the Leaker `id`:
-// `Repeater<args, KEY>` with `KEY` from `repeater_key(id, ix)`. `args` is the first argument, as
+// The path of the Repeater with the arguments of the entry `entry` of the Leaker `id`:
+// `Repeater<args, KEY>` with `KEY` from `repeater_key(id, entry)`. `args` is the first argument, as
 // `encode_entry_args()` writes it.
-pub(crate) fn repeater_trait_path(repeater: &Path, args: &Type, id: u64, ix: EntryId) -> Path {
-    let key = repeater_key(id, ix);
+pub(crate) fn repeater_trait_path(repeater: &Path, args: &Type, id: u64, entry: EntryId) -> Path {
+    let key = repeater_key(id, entry);
     repeater_path(repeater, quote!(#args, #key))
 }
 
-/// Returns `<self_ty as Repeater<ARGS, KEY>>::Type`: the type that stands for the entry `ix` of
+/// Returns `<self_ty as Repeater<ARGS, KEY>>::Type`: the type that stands for the entry `entry` of
 /// the Leaker `id` in the copy.
 ///
 /// `repeater` is the path of the Repeater trait ([`repeater_definition()`]), and `self_ty` is what
 /// the path is written for: `Self` in the copy, or the host. `context` is the [`Context`] of the
 /// entry ([`Referrer::iter()`](crate::Referrer::iter) and the closures of
 /// [`Referrer::visitor()`](crate::Referrer::visitor) give it). `KEY` is
-/// [`repeater_key(id, ix)`](repeater_key), and `ARGS` is made from the generics of the entry, each
-/// by its own name, with the encoding that the Leaker's [`RepeaterImpl::args`] has: a lifetime
+/// [`repeater_key(id, entry)`](repeater_key), and `ARGS` is made from the generics of the entry, each
+/// by its own name, with the encoding that the Leaker's [`RepeaterImpl::path`] has: a lifetime
 /// `'a` is `&'a ()`, a type is itself (`*const T` if it is `?Sized`), a const is
 /// `const_fn(N, param)` ([`array_const`](crate::array_const) or
 /// [`slot_const(&repeater)`](slot_const)), and a bound `T: 'a` or `Self: 'a` adds `&'a T` (with
-/// `self_ty` for `Self`). The copy of a use site gets the arguments of the site by
-/// [`Substitute`](crate::Substitute) afterwards. Fails with the error of `const_fn`, or
-/// with [`EncodeError::UnboundedTraitObject`] if `self_ty` is a trait object without a lifetime
-/// bound where `Self: 'a` needs one.
+/// `self_ty` for `Self`), and `'b: 'a` adds `&'a &'b ()`. The copy of a use site gets the
+/// arguments of the site by [`Substitute`](crate::Substitute) afterwards. Fails with the error of
+/// `const_fn`, or with [`EncodeError::UnboundedTraitObject`] if `self_ty` is a trait object
+/// without a lifetime bound where `Self: 'a` needs one.
 ///
 /// # Panics
 ///
@@ -154,10 +154,10 @@ pub(crate) fn repeater_trait_path(repeater: &Path, args: &Type, id: u64, ix: Ent
 /// let referrer = leaker.result().finish().unwrap();
 ///
 /// // The entry `Wrap<T>`, written with its own generics.
-/// let (ix, _, context) = referrer.iter().next().unwrap();
+/// let (entry, _, context) = referrer.iter().next().unwrap();
 /// let repeater: Path = parse_quote!(crate::Repeater);
-/// let ty = repeater_projection(&repeater, &parse_quote!(Self), context, 42, ix, array_const);
-/// let key = repeater_key(42, ix);
+/// let ty = repeater_projection(&repeater, &parse_quote!(Self), context, 42, entry, array_const);
+/// let key = repeater_key(42, entry);
 /// assert_eq!(ty.unwrap(), parse_quote!(<Self as crate::Repeater<(T,), #key>>::Type));
 /// ```
 pub fn repeater_projection(
@@ -165,7 +165,7 @@ pub fn repeater_projection(
     self_ty: &Type,
     context: &Context,
     id: u64,
-    ix: EntryId,
+    entry: EntryId,
     mut const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
 ) -> std::result::Result<Type, EncodeError> {
     check_repeater_path(repeater);
@@ -177,7 +177,7 @@ pub fn repeater_projection(
             const_fn(&parse_quote!(#ident), param)
         },
     )?;
-    let path = repeater_trait_path(repeater, &args, id, ix);
+    let path = repeater_trait_path(repeater, &args, id, entry);
     Ok(parse_quote!(<#self_ty as #path>::Type))
 }
 
@@ -269,7 +269,7 @@ pub enum ImplSelf<'a> {
     /// need `Self` get [`ImplSelf::Param`] with `param`.
     ///
     /// Cheaper than a blanket impl when there are many entries. The use site must write
-    /// [`bucket_self(ix, id)`](Referrer::bucket_self) as the type of the path through the Repeater
+    /// [`bucket_self(id, entry)`](Referrer::bucket_self) as the type of the path through the Repeater
     /// (what `Self` stands for if it is `None`), or E0277, with the same `id`.
     Bucket {
         /// The parameter for the entries that need `Self`, named as for [`ImplSelf::Param`].
@@ -278,7 +278,7 @@ pub enum ImplSelf<'a> {
 }
 
 /// The pieces of the Repeater impl of an entry, which
-/// [`LeakerResult::repeater_impls()`](crate::LeakerResult::repeater_impls) yields.
+/// [`LeakerResult::repeater_impls()`](crate::LeakerResult::repeater_impls) returns.
 ///
 /// [`ToTokens`] writes the whole impl, `impl #generics #path for #self_ty { type Type = #ty; }`,
 /// with the `KEY` as the last argument of [`path`](RepeaterImpl::path). The `KEY` is
@@ -297,8 +297,7 @@ pub enum ImplSelf<'a> {
 /// let r = result
 ///     .repeater_impls(&repeater, 7, ImplSelf::Param(&parse_quote!(__S)), array_const)
 ///     .unwrap()
-///     .next()
-///     .unwrap();
+///     .remove(0);
 ///
 /// // `ToTokens` writes the `KEY` of the entry 0 of the id 7.
 /// let key = repeater_key(7, r.entry);
@@ -331,12 +330,12 @@ pub struct RepeaterImpl {
     pub generics: Generics,
     /// The type that the impl is for.
     pub self_ty: Type,
-    /// The path of the Repeater with [`args`](RepeaterImpl::args), but not the `KEY`.
+    /// The path of the Repeater with the argument of the entry, but not the `KEY`.
     ///
-    /// [`ToTokens`] writes the `KEY` (`repeater_key(id, entry)`, see [`repeater_key()`]) as its
-    /// second argument, so the caller adds nothing. This path has none: it is for a reader who
-    /// wants the trait. A path put here instead keeps its `<..>`: the `KEY` is appended to the
-    /// arguments of its last segment, and nothing is written if it has none.
+    /// The argument is what [`repeater_projection()`] writes for the entry, but with the self
+    /// type of the impl for `Self` (`&'a __S`, not `&'a Self`, for `Self: 'a`). [`ToTokens`]
+    /// appends the `KEY` (`repeater_key(id, entry)`, see [`repeater_key()`]) to the arguments of
+    /// the last segment, and nothing if it has none, so the caller adds nothing.
     ///
     /// ```ignore
     /// // In crate a, with the Repeater at `crate::Repeater`: the entry `Wrap<T>`.
@@ -346,9 +345,6 @@ pub struct RepeaterImpl {
     /// crate::Repeater<(T,)>
     /// ```
     pub path: Path,
-    /// The first argument of the Repeater: what [`repeater_projection()`] writes for the entry,
-    /// but with the self type of the impl for `Self` (`&'a __S`, not `&'a Self`, for `Self: 'a`).
-    pub args: Type,
     /// The leaked type, which is the `Type` of the impl.
     pub ty: Type,
     /// The module in which to write the impl, if the entry is in one.
@@ -411,8 +407,7 @@ impl RepeaterImpl {
 /// let r = result
 ///     .repeater_impls(&repeater, 7, ImplSelf::Marker(&marker), array_const)
 ///     .unwrap()
-///     .next()
-///     .unwrap();
+///     .remove(0);
 /// let key = repeater_key(7, r.entry);
 /// let expected: ItemImpl =
 ///     parse_quote!(impl crate::Repeater<(), #key> for Marker { type Type = Rel; });

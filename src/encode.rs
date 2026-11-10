@@ -52,8 +52,7 @@ pub fn array_const(value: &Expr, param: &ConstParam) -> std::result::Result<Type
 /// default is already replaced, by a path through the Repeater that names the parameters before
 /// the default. The default of a parameter that has no argument is taken with each of the
 /// parameters before it replaced by its argument, as [`substitute_args()`] does. That copy of the
-/// trait is only a step (rustc does not accept `Self` in a default): the completed arguments go
-/// into the impl.
+/// trait is only a step: the completed arguments go into the impl.
 ///
 /// An associated type `T::Item` of an earlier parameter with the argument `arg` is `<arg>::Item` if
 /// `arg` is one identifier (rustc resolves `<V>::Item` for a type parameter `V`), else `<arg as
@@ -62,12 +61,17 @@ pub fn array_const(value: &Expr, param: &ConstParam) -> std::result::Result<Type
 /// clause is not known, and a trait that does not declare the type itself (a supertrait does) is
 /// refused by rustc.
 ///
-/// `given` match `params` by position and kind, lifetimes first: a binding such as `Item = u8` is
-/// skipped, and a bare identifier is a const argument (syn parses it as a type). Fails with
-/// [`EncodeError::UnexpectedArgument`] for an argument of the wrong kind or too many, with
-/// [`EncodeError::MissingArgument`] for a parameter that has neither an argument nor a default,
-/// and with [`EncodeError::AmbiguousAssociatedType`] for an associated type of an argument that is
-/// not an identifier, if the parameter has no trait bound or several.
+/// `given` match `params` by kind and position: the lifetimes go to the lifetime parameters, the
+/// types and consts to the others, whatever the order between the kinds. A binding such as `Item =
+/// u8` is skipped, and a bare identifier is a const argument (syn parses it as a type).
+///
+/// Fails with [`EncodeError::MissingArgument`] for a parameter that has neither an argument of its
+/// kind nor a default (a type for a lifetime parameter, or a lifetime for a type parameter, is not
+/// an argument of its kind), with [`EncodeError::UnexpectedArgument`] for an argument left over
+/// (too many, or a lifetime for a type parameter that has a default), a const argument for a type
+/// parameter, or a type that is not one identifier for a const parameter, and with
+/// [`EncodeError::AmbiguousAssociatedType`] for an associated type of an argument that is not an
+/// identifier, if the parameter has no trait bound or several.
 ///
 /// ```
 /// # use type_leak::*;
@@ -375,9 +379,9 @@ fn unwrap_block(expr: &Expr) -> &Expr {
 }
 
 /// The first argument of the Repeater for an entry: a tuple type made from the generics `iter` of
-/// the entry, each by its own name. It is `RepeaterImpl::args` for the generics an impl declares and
-/// what `repeater_projection()` writes for the copy. The tuple has an element for each parameter,
-/// then the encoded lifetime bounds:
+/// the entry, each by its own name. It is the argument of `RepeaterImpl::path` for the generics an
+/// impl declares and what `repeater_projection()` writes for the copy. The tuple has an element for
+/// each parameter, then the encoded lifetime bounds:
 ///
 /// - a lifetime `'a` is `&'a ()`, and a type `T` is `T` (`*const T` with a `?Sized` bound, since a
 ///   tuple needs `Sized` elements but the last);
@@ -617,9 +621,10 @@ fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
     }
 }
 
-/// Why the generics of an entry cannot be encoded: the error of the call of
-/// `LeakerResult::repeater_impls()`, of [`repeater_projection()`](crate::repeater_projection), of
-/// [`complete_params()`], of [`substitute_args()`] and of [`Substitute::finish()`].
+/// The error of the functions that encode the generics of an entry or write the arguments of a
+/// trait: `LeakerResult::repeater_impls()`, [`repeater_projection()`](crate::repeater_projection),
+/// [`complete_params()`], [`substitute_args()`], [`Substitute::with_params()`] and
+/// [`Substitute::finish()`].
 ///
 /// It converts into a `syn::Error` at the offending tokens.
 ///
@@ -637,9 +642,9 @@ fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
 pub enum EncodeError {
     /// The type of a const parameter is not a primitive type (e.g. an alias).
     UnsupportedConstType(Box<Type>),
-    /// An argument that does not fit: there are more arguments than parameters, one is not of the
-    /// kind of its parameter (a lifetime for a type), or a value that [`substitute_args()`] or
-    /// [`Substitute`] was given for a name is not of a kind that fits the place of the name.
+    /// An argument that does not fit: there are more arguments than parameters, a const for a type
+    /// parameter, or a value that [`substitute_args()`] or [`Substitute`] was given for a name is
+    /// not of a kind that fits the place of the name.
     UnexpectedArgument(Box<GenericArgument>),
     /// A parameter that has neither an argument nor a default.
     MissingArgument(Box<GenericParam>),
@@ -882,6 +887,11 @@ impl Site for ParamFold {
 /// - `Self`, in a type and in `Self::A` of an expression (`Self` alone in an expression is a
 ///   value), and in the tokens of a macro.
 ///
+/// A type that is one identifier is asked whatever it is (`u8` and `String` too), and so is the
+/// first segment of a longer path (`std` in `std::vec::Vec`, `crate`): answer `None` for what is
+/// not a parameter. The names that the library writes (the `'__tl_s<n>` binder below) are not
+/// asked.
+///
 /// A value must fit the place of its name, or the call fails with
 /// [`EncodeError::UnexpectedArgument`] at the value and `args` stay as they are: a `Type` or a
 /// `Const` where the name is a whole argument (`T` in `Vec<T>`); a `Type` where it is part of a
@@ -942,11 +952,11 @@ pub fn substitute_args<'a>(
 }
 
 /// The substitution of [`substitute_args()`] with the answers that `answers` has and asks for.
-fn substitute_in<F: FnMut(&Ident) -> Option<GenericArgument>>(
-    answers: &mut Answers<F>,
+fn substitute_in<A: Answerer>(
+    answers: &mut Answers<A>,
     mut args: Vec<&mut GenericArgument>,
 ) -> std::result::Result<(), EncodeError> {
-    // The first pass asks `f` for the names; what it writes is dropped.
+    // The first pass asks for the names; what it writes is dropped.
     let mut asking = SiteFold {
         answers: &mut *answers,
         names: FreshLifetimes::default(),
@@ -986,9 +996,10 @@ fn substitute_in<F: FnMut(&Ident) -> Option<GenericArgument>>(
 /// Writes the arguments of a use site into a whole syntax node: [`substitute_args()`] as a
 /// [`VisitMut`].
 ///
-/// `f` is the closure of [`substitute_args()`]: it answers the argument that takes the place of a
-/// name (`T`, `N`, `'a` as `a`, `Self`), or `None` to keep the name. It is asked once for each name
-/// over the whole visit.
+/// [`new()`](Substitute::new) takes the closure of [`substitute_args()`]: it answers the argument
+/// that takes the place of a name (`T`, `N`, `'a` as `a`, `Self`), or `None` to keep the name. It is
+/// asked once for each name over the whole visit.
+/// [`with_params()`](Substitute::with_params) answers for the generics of a trait instead.
 ///
 /// The visitor writes each type it meets as one unit, as `substitute_args()` does (a const braced
 /// once, a trait object behind a pointer in parentheses, `T::A` by the rules there, the elided
@@ -1028,8 +1039,8 @@ fn substitute_in<F: FnMut(&Ident) -> Option<GenericArgument>>(
 ///     parse_quote!(fn keep(&'static self, k: Option<u8>) -> &'static u8 where Self: 'static)
 /// );
 /// ```
-pub struct Substitute<F> {
-    answers: Answers<F>,
+pub struct Substitute<A> {
+    answers: Answers<A>,
     /// The first error.
     error: Option<EncodeError>,
 }
@@ -1042,7 +1053,71 @@ impl<F: FnMut(&Ident) -> Option<GenericArgument>> Substitute<F> {
             error: None,
         }
     }
+}
 
+/// The answers of [`Substitute::with_params()`]: the argument of each parameter of a trait.
+///
+/// It has no public fields or constructor.
+#[derive(Clone, Debug)]
+pub struct ByParams {
+    /// The lifetime parameters, by the name without the apostrophe.
+    lifetimes: Vec<(Ident, GenericArgument)>,
+    /// The type and const parameters.
+    others: Vec<(Ident, GenericArgument)>,
+}
+
+impl Substitute<ByParams> {
+    /// Creates the visitor for the arguments `given` to a trait with the generics `params`.
+    ///
+    /// The arguments are completed by [`complete_params()`], which fails as it does. Each parameter
+    /// is then answered by its name and kind: `'T` gets the lifetime argument and `T` the type or
+    /// const argument. Any other name is left as it is, `Self` too: [`new()`](Substitute::new)
+    /// answers for it.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// # use syn::visit_mut::VisitMut;
+    /// // `impl<'x> Tr<'x, u8> for Host`, for `trait Tr<'T, T> { fn get(&'T self) -> Option<T>; }`.
+    /// let generics: Generics = parse_quote!(<'T, T>);
+    /// let given: Vec<GenericArgument> = vec![parse_quote!('x), parse_quote!(u8)];
+    /// let mut sig: Signature = parse_quote!(fn get(&'T self) -> Option<T>);
+    /// let mut site = Substitute::with_params(&generics.params, &given).unwrap();
+    /// site.visit_signature_mut(&mut sig);
+    /// site.finish().unwrap();
+    /// assert_eq!(sig, parse_quote!(fn get(&'x self) -> Option<u8>));
+    ///
+    /// // `T` has no default.
+    /// let short = Substitute::with_params(&generics.params, &given[..1]);
+    /// assert!(matches!(short, Err(EncodeError::MissingArgument(_))));
+    /// ```
+    pub fn with_params<'p, 'a>(
+        params: impl IntoIterator<Item = &'p GenericParam>,
+        given: impl IntoIterator<Item = &'a GenericArgument>,
+    ) -> std::result::Result<Self, EncodeError> {
+        let params: Vec<&GenericParam> = params.into_iter().collect();
+        let completed = complete_params(params.iter().copied(), given)?;
+        let mut answers = ByParams {
+            lifetimes: Vec::new(),
+            others: Vec::new(),
+        };
+        for (param, arg) in params.into_iter().zip(completed) {
+            match param {
+                GenericParam::Lifetime(param) => {
+                    answers.lifetimes.push((param.lifetime.ident.clone(), arg))
+                }
+                GenericParam::Type(param) => answers.others.push((param.ident.clone(), arg)),
+                GenericParam::Const(param) => answers.others.push((param.ident.clone(), arg)),
+            }
+        }
+        Ok(Substitute {
+            answers: Answers::new(answers),
+            error: None,
+        })
+    }
+}
+
+impl<A: Answerer> Substitute<A> {
     /// Returns the first error of the visit, if there was one.
     pub fn finish(self) -> std::result::Result<(), EncodeError> {
         match self.error {
@@ -1064,7 +1139,7 @@ impl<F: FnMut(&Ident) -> Option<GenericArgument>> Substitute<F> {
     }
 }
 
-impl<F: FnMut(&Ident) -> Option<GenericArgument>> VisitMut for Substitute<F> {
+impl<A: Answerer> VisitMut for Substitute<A> {
     fn visit_type_mut(&mut self, ty: &mut Type) {
         let mut arg = GenericArgument::Type(ty.clone());
         self.write(&mut arg);
@@ -1158,33 +1233,83 @@ impl<F: FnMut(&Ident) -> Option<GenericArgument>> VisitMut for Substitute<F> {
     }
 }
 
-/// What `f` answered, for each name once.
-struct Answers<F> {
-    f: F,
-    known: HashMap<Ident, Option<GenericArgument>>,
+mod sealed {
+    use syn::{GenericArgument, Ident};
+
+    /// What a name is: a lifetime has a name of its own, apart from a type or a const.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Kind {
+        Lifetime,
+        TypeOrConst,
+    }
+
+    /// What [`Substitute`](super::Substitute) asks for the argument of a name: the closure of
+    /// `Substitute::new()` (which ignores the kind) and the answers of `with_params()`. Sealed.
+    pub trait Answerer {
+        /// Whether a lifetime and a type of one name are two questions, each asked once.
+        const BY_KIND: bool;
+
+        fn answer(&mut self, name: &Ident, kind: Kind) -> Option<GenericArgument>;
+    }
 }
 
-impl<F: FnMut(&Ident) -> Option<GenericArgument>> Answers<F> {
-    fn new(f: F) -> Self {
+use sealed::{Answerer, Kind};
+
+impl<F: FnMut(&Ident) -> Option<GenericArgument>> Answerer for F {
+    const BY_KIND: bool = false;
+
+    fn answer(&mut self, name: &Ident, _: Kind) -> Option<GenericArgument> {
+        self(name)
+    }
+}
+
+impl Answerer for ByParams {
+    const BY_KIND: bool = true;
+
+    fn answer(&mut self, name: &Ident, kind: Kind) -> Option<GenericArgument> {
+        let found = match kind {
+            Kind::Lifetime => &self.lifetimes,
+            Kind::TypeOrConst => &self.others,
+        };
+        found
+            .iter()
+            .find(|(param, _)| param == name)
+            .map(|(_, arg)| arg.clone())
+    }
+}
+
+/// What the answerer said, for each name once.
+struct Answers<A> {
+    answerer: A,
+    known: HashMap<(Kind, Ident), Option<GenericArgument>>,
+}
+
+impl<A: Answerer> Answers<A> {
+    fn new(answerer: A) -> Self {
         Answers {
-            f,
+            answerer,
             known: HashMap::new(),
         }
     }
 
-    fn of(&mut self, name: &Ident) -> Option<GenericArgument> {
-        if let Some(answer) = self.known.get(name) {
+    fn of(&mut self, name: &Ident, kind: Kind) -> Option<GenericArgument> {
+        // A closure is asked once for a name, whatever its kind.
+        let key = (
+            if A::BY_KIND { kind } else { Kind::TypeOrConst },
+            name.clone(),
+        );
+        if let Some(answer) = self.known.get(&key) {
             return answer.clone();
         }
-        let answer = (self.f)(name);
-        self.known.insert(name.clone(), answer.clone());
+        let answer = self.answerer.answer(name, kind);
+        self.known.insert(key, answer.clone());
         answer
     }
 }
 
 /// The fold of [`substitute_args()`].
-struct SiteFold<'f, F> {
-    answers: &'f mut Answers<F>,
+struct SiteFold<'f, A> {
+    answers: &'f mut Answers<A>,
     names: FreshLifetimes,
     /// Whether it names the elided lifetime of a signature. The first pass writes nothing.
     naming: bool,
@@ -1192,7 +1317,7 @@ struct SiteFold<'f, F> {
     error: Option<EncodeError>,
 }
 
-impl<F: FnMut(&Ident) -> Option<GenericArgument>> SiteFold<'_, F> {
+impl<A: Answerer> SiteFold<'_, A> {
     fn misfit(&mut self, value: GenericArgument) {
         self.error
             .get_or_insert(EncodeError::UnexpectedArgument(Box::new(value)));
@@ -1219,7 +1344,7 @@ impl<F: FnMut(&Ident) -> Option<GenericArgument>> SiteFold<'_, F> {
 
     /// The type for `name`, if there is an answer: only a type fits.
     fn type_for(&mut self, name: &Ident) -> Option<Type> {
-        match self.answers.of(name)? {
+        match self.answers.of(name, Kind::TypeOrConst)? {
             GenericArgument::Type(ty) => Some(ty),
             value => {
                 self.misfit(value);
@@ -1231,7 +1356,7 @@ impl<F: FnMut(&Ident) -> Option<GenericArgument>> SiteFold<'_, F> {
     /// The const for `name`, if there is an answer, written as the expression `{ value }`: a const,
     /// or a type that is one identifier (a bare const argument is parsed as a type).
     fn braced_const_for(&mut self, name: &Ident) -> Option<Expr> {
-        match self.answers.of(name)? {
+        match self.answers.of(name, Kind::TypeOrConst)? {
             GenericArgument::Const(value) => Some(braced_const(&value)),
             GenericArgument::Type(Type::Path(TypePath { qself: None, path }))
                 if path.get_ident().is_some() =>
@@ -1288,13 +1413,13 @@ fn mentions_self(tokens: &TokenStream) -> bool {
     })
 }
 
-impl<F: FnMut(&Ident) -> Option<GenericArgument>> syn::fold::Fold for SiteFold<'_, F> {
+impl<A: Answerer> syn::fold::Fold for SiteFold<'_, A> {
     fn fold_generic_argument(&mut self, arg: GenericArgument) -> GenericArgument {
         let name = match argument_name(&arg) {
             Some(name) => name,
             None => return syn::fold::fold_generic_argument(self, arg),
         };
-        match self.answers.of(name) {
+        match self.answers.of(name, Kind::TypeOrConst) {
             Some(GenericArgument::Type(ty)) => GenericArgument::Type(ty),
             Some(GenericArgument::Const(value)) => {
                 GenericArgument::Const(normalize_const_arg(&value))
@@ -1349,10 +1474,10 @@ impl<F: FnMut(&Ident) -> Option<GenericArgument>> syn::fold::Fold for SiteFold<'
         syn::fold::fold_expr(self, expr)
     }
     fn fold_lifetime(&mut self, lifetime: Lifetime) -> Lifetime {
-        if lifetime.ident == "static" || lifetime.ident == "_" {
+        if lifetime.ident == "static" || lifetime.ident == "_" || self.names.made(&lifetime) {
             return lifetime;
         }
-        match self.answers.of(&lifetime.ident) {
+        match self.answers.of(&lifetime.ident, Kind::Lifetime) {
             Some(GenericArgument::Lifetime(value)) => value,
             Some(value) => {
                 self.misfit(value);
@@ -1384,7 +1509,7 @@ impl<F: FnMut(&Ident) -> Option<GenericArgument>> syn::fold::Fold for SiteFold<'
     }
 }
 
-impl<F: FnMut(&Ident) -> Option<GenericArgument>> Site for SiteFold<'_, F> {
+impl<A: Answerer> Site for SiteFold<'_, A> {
     fn names(&mut self) -> &mut FreshLifetimes {
         &mut self.names
     }

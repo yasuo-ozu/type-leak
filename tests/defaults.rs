@@ -3,6 +3,8 @@
 
 mod common;
 
+use common::s;
+
 use syn::*;
 use template_quote::quote;
 use type_leak::{ContextId, Leaker, Referrer};
@@ -17,10 +19,6 @@ fn referrer_of(tr: &ItemTrait) -> Referrer {
 /// contexts of the entries.
 fn top_level(referrer: &Referrer) -> ContextId {
     common::context_ids(referrer).last().copied().unwrap()
-}
-
-fn s(x: &impl template_quote::ToTokens) -> String {
-    quote!(#x).to_string()
 }
 
 fn parse_generics(tokens: proc_macro2::TokenStream) -> Generics {

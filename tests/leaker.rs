@@ -9,18 +9,14 @@
 
 mod common;
 
-use common::starts_with;
+use common::{messages, s, starts_with, to_syn_error};
 use std::collections::BTreeSet;
 use syn::*;
-use template_quote::{quote, ToTokens};
+use template_quote::quote;
 use type_leak::{
-    to_syn_error, Allow, Cause, Context, ContextId, EntryId, ErrorItem, Leaker, Place, Referrer,
-    Rules, SelfRequirement, View,
+    Allow, Cause, Context, ContextId, EntryId, Leaker, Place, Referrer, Rules, SelfRequirement,
+    View,
 };
-
-fn s(x: &impl ToTokens) -> String {
-    quote!(#x).to_string()
-}
 
 /// The entries as `type | generics | self`, in the order of the Referrer.
 fn entries(referrer: &Referrer) -> Vec<String> {
@@ -94,6 +90,42 @@ fn test_leaker_construction() {
     }
 }
 
+/// `Leaker::default()` is `Leaker::new()`: it allows nothing and does not read values, so it gives
+/// the same entries and errors as one with the rule `()`.
+#[test]
+fn leaker_default_is_leaker_new() {
+    let item: ItemTrait = parse_quote!(
+        trait Tr<T> {
+            const N: usize = rel();
+            fn f(&self, a: Rel<T>, b: Option<u8>) -> Vec<Rel2>;
+        }
+    );
+    let analyze = |mut leaker: Leaker| {
+        assert!(!leaker.check_values);
+        leaker.intern_trait(&item);
+        leaker.result()
+    };
+    let (default, new) = (analyze(Leaker::default()), analyze(Leaker::new()));
+    assert!(default.errors().is_empty());
+    let (default, new) = (default.into_referrer(), new.into_referrer());
+    assert_eq!(default, new);
+    let mut entries = entries(&default);
+    entries.sort();
+    assert_eq!(
+        entries,
+        [
+            "Option < u8 > |  | -",
+            "Rel < T > | < T > | -",
+            "Vec < Rel2 > |  | -",
+            "usize |  | -"
+        ]
+    );
+    // The same with the rule `()` named: the type of the default is the one of `Leaker::new()`.
+    let mut named: Leaker<()> = Leaker::with_rule(());
+    named.intern_trait(&item);
+    assert_eq!(named.result().into_referrer(), new);
+}
+
 #[test]
 fn intern_struct() {
     let item: ItemStruct = parse_quote!(
@@ -143,20 +175,20 @@ fn intern_struct() {
         parse_quote!(::path::to::Implementor<#ix>)
     };
     assert_eq!(
-        quote!(#{reduced.expand(context, parse_quote!(MyType1),  &mut f)}).to_string(),
+        quote!(#{common::expand(&reduced, context, parse_quote!(MyType1),  &mut f)}).to_string(),
         quote!(::path::to::Implementor<1>).to_string()
     );
     assert_eq!(
-        quote!(#{reduced.expand(context, parse_quote!((MyType2 , MyType3 < MyType1 > , MyType4 , MyType5)),  &mut f)}).to_string(),
+        quote!(#{common::expand(&reduced, context, parse_quote!((MyType2 , MyType3 < MyType1 > , MyType4 , MyType5)),  &mut f)}).to_string(),
         quote!(::path::to::Implementor<0>).to_string()
     );
     assert_eq!(
-        quote!(#{reduced.expand(context, parse_quote!(MyType4),  &mut f)}).to_string(),
+        quote!(#{common::expand(&reduced, context, parse_quote!(MyType4),  &mut f)}).to_string(),
         quote!(::path::to::Implementor<2>).to_string()
     );
     // A type that is not leaked is left as it is.
     assert_eq!(
-        quote!(#{reduced.expand(context, parse_quote!(Other),  &mut f)}).to_string(),
+        quote!(#{common::expand(&reduced, context, parse_quote!(Other),  &mut f)}).to_string(),
         quote!(Other).to_string()
     );
 }
@@ -377,11 +409,11 @@ fn intern_mod() {
 }
 
 #[test]
-fn from_config_and_the_items_accumulate() {
+fn with_rule_and_the_items_accumulate() {
     // A Leaker with a configuration analyzes the items like one without it, and the contexts of
     // the items are numbered in the order they appear.
     let config = Rules::new().primitive().prelude();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     let first: ItemStruct = parse_quote!(
         struct A<T> {
             x: Vec<(Rel, u8)>,
@@ -429,9 +461,9 @@ fn from_config_and_the_items_accumulate() {
     assert_eq!(s(&common::entry(&referrer, 2).generics), "< T >");
     assert_eq!(common::entry_id(&referrer, 0), c);
     assert!(common::entry(&referrer, 0).generics.params.is_empty());
-    // `from_config()` is what `new()` is with the allowed paths.
+    // `with_rule()` is what `new()` is with the allowed paths.
     let config = Rules::new().or_if(starts_with(parse_quote!(Vec)));
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_struct(&first);
     // `Vec` is allowed, and `u8` is not (it is a relative path, as it is not a configured one).
     assert_eq!(
@@ -451,7 +483,7 @@ fn test_config_allows_drop_in_an_array_length_and_the_lists_add_up() {
         struct S([::core::primitive::u8; drop]);
     );
     fn entry_count<A: Allow>(config: A, item: &ItemStruct) -> usize {
-        let mut leaker = Leaker::from_config(config);
+        let mut leaker = Leaker::with_rule(config);
         leaker.intern_struct(item);
         leaker.result().finish().unwrap().iter().count()
     }
@@ -463,10 +495,10 @@ fn test_config_allows_drop_in_an_array_length_and_the_lists_add_up() {
         struct S(crate::A, u8, Vec<crate::B>);
     );
     let all = Rules::new().primitive().prelude().crate_paths();
-    let mut leaker = Leaker::from_config(all);
+    let mut leaker = Leaker::with_rule(all);
     leaker.intern_struct(&item);
     assert!(leaker.result().finish().unwrap().is_empty());
-    let mut leaker = Leaker::from_config(only_prelude());
+    let mut leaker = Leaker::with_rule(only_prelude());
     leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
@@ -489,7 +521,7 @@ fn test_intern() {
     };
     let item: ItemTrait = parse_quote!(#tokens);
     let config = Rules::new().crate_paths();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
 
     leaker.intern_trait(&item);
     leaker.reduce_roots();
@@ -498,18 +530,9 @@ fn test_intern() {
 
 // ── regressions ──────────────────────────────────────────────────────────────
 
-/// The messages of the errors, one per line.
-fn messages(errors: &[ErrorItem]) -> String {
-    errors
-        .iter()
-        .map(|item| item.message.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn leak_struct(item: &ItemStruct) -> Result<BTreeSet<String>> {
     let config = type_leak::Rules::new().primitive().prelude();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_struct(item);
     let referrer = leaker
         .result()
@@ -522,7 +545,7 @@ fn leak_struct(item: &ItemStruct) -> Result<BTreeSet<String>> {
 
 fn leak_trait(item: &ItemTrait) -> Result<BTreeSet<String>> {
     let config = type_leak::Rules::new().primitive().prelude();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_trait(item);
     let referrer = leaker
         .result()
@@ -640,7 +663,7 @@ fn a_scope_that_adds_no_entry_after_reduce_roots_changes_nothing() {
     let plain: ItemStruct = parse_quote! { struct S2 { a: u8 } };
     let again: ItemStruct = parse_quote! { struct S3 { a: (R1, R2) } };
     let run = |later: &[&ItemStruct], reduce_after: bool| -> Referrer {
-        let mut leaker = Leaker::from_config(Rules::new().primitive());
+        let mut leaker = Leaker::with_rule(Rules::new().primitive());
         leaker.intern_struct(&first);
         leaker.reduce_roots();
         for item in later {
@@ -772,7 +795,7 @@ fn a_kept_optional_entry_becomes_required_when_it_holds_a_required_type() {
     let in_field: ItemStruct = parse_quote! { struct S2 { a: ::ext::X<(Rel,)> } };
     let other: ItemStruct = parse_quote! { struct S3 { b: Rel2 } };
     let run = |items: &[&ItemStruct], reduce: bool| -> Vec<String> {
-        let mut leaker = Leaker::from_config(rule);
+        let mut leaker = Leaker::with_rule(rule);
         for (ix, item) in items.iter().enumerate() {
             leaker.intern_struct(item);
             if reduce && ix == 0 {
@@ -942,7 +965,7 @@ fn test_assertions_for_assumed_primitives() {
         }
     };
     let config = type_leak::Rules::new().primitive();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_trait(&item);
     let assertions = leaker.assertions().to_string();
     assert!(leaker.result().errors().is_empty());

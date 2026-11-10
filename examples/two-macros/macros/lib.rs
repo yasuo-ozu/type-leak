@@ -48,12 +48,12 @@ use std::hash::{Hash, Hasher};
 use syn::parse::{Parse, ParseStream};
 use syn::visit_mut::VisitMut;
 use syn::{
-    parse_macro_input, parse_quote, GenericArgument, GenericParam, Ident, ImplItem, ItemImpl,
-    ItemStruct, ItemTrait, Path, PathArguments, Token, TraitItem, Type,
+    parse_macro_input, parse_quote, GenericArgument, GenericParam, ImplItem, ItemStruct, ItemTrait,
+    Path, PathArguments, Token, TraitItem, Type,
 };
 use type_leak::{
-    array_const, complete_params, repeater_projection, Context, ContextId, EncodeError, EntryId,
-    ErrorItem, ImplSelf, Leaker, Referrer, Substitute,
+    array_const, repeater_projection, Context, ContextId, EntryId, ErrorItem, ImplSelf, Leaker,
+    Referrer, Substitute,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -71,28 +71,21 @@ pub fn export_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let top_level = leaker.intern_trait(&item_trait);
     let result = leaker.result();
     if !result.errors().is_empty() {
-        return report(result.errors()).into();
+        // Each path that cannot be leaked, at its own span, with the notes and the help.
+        let errors: TokenStream2 = result.errors().iter().map(ErrorItem::emit).collect();
+        return errors.into();
     }
 
     // 2. One Repeater impl for each entry, written next to the trait, where the relative paths of
-    //    the entries mean what they mean in the trait.
+    //    the entries mean what they mean in the trait. `ToTokens` of each writes its `KEY`.
     let id = id_of(&item_trait);
     let repeater: Path = parse_quote!(crate::Repeater);
     let self_param: syn::Ident = parse_quote!(__S);
-    let mut impls: Vec<ItemImpl> = vec![];
-    let repeater_impls =
+    let impls =
         match result.repeater_impls(&repeater, id, ImplSelf::Param(&self_param), array_const) {
             Ok(impls) => impls,
-            Err(error) => {
-                return syn::Error::new(error.span(), error)
-                    .to_compile_error()
-                    .into()
-            }
+            Err(error) => return syn::Error::from(error).to_compile_error().into(),
         };
-    // `ToTokens` writes each impl with its `KEY`.
-    for r in repeater_impls {
-        impls.push(parse_quote!(#r));
-    }
 
     // The Referrer goes to crate B.
     let referrer = result.into_referrer();
@@ -113,27 +106,6 @@ pub fn export_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
     .into()
-}
-
-/// Reports every offending path of the trait at its own span, with the notes (why) and the help
-/// (what to write instead).
-fn report(items: &[ErrorItem]) -> TokenStream2 {
-    let mut errors: Option<syn::Error> = None;
-    for item in items {
-        let mut message = item.message.clone();
-        for (_at, note) in &item.notes {
-            message += &format!("\n  note: {}", note);
-        }
-        if let Some((_at, help)) = &item.help {
-            message += &format!("\n  help: {}", help);
-        }
-        let error = syn::Error::new(item.span(), message);
-        match &mut errors {
-            Some(errors) => errors.combine(error),
-            None => errors = Some(error),
-        }
-    }
-    errors.expect("the error has items").to_compile_error()
 }
 
 fn id_of(item: &ItemTrait) -> u64 {
@@ -243,8 +215,8 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
     //    generics of the same context.
     let project = |_leaked: Type, ix: EntryId, context: &Context| -> Type {
         let self_ty: Type = parse_quote!(Self);
-        repeater_projection(&repeater, &self_ty, context, id, ix, array_const)
-            .expect("the arguments can be encoded")
+        // With `Self` as the host, the projection cannot fail.
+        repeater_projection(&repeater, &self_ty, context, id, ix, array_const).unwrap()
     };
 
     // Where the copy is: `impl<K> Repo<K> for W` declares the generics of the trait itself (nothing
@@ -255,17 +227,18 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
             PathArguments::AngleBracketed(args) => Some(args.args.iter().cloned().collect()),
             _ => None,
         };
-    let (impl_generics, trait_path, site_args) = match &explicit {
+    let (impl_generics, trait_path, mut site) = match &explicit {
         Some(args) => {
             // 2. Arguments the copy omits take the defaults of the trait, which the visitor writes
-            //    in the trait itself.
+            //    in the trait itself. The site answers each parameter of the trait with its
+            //    argument.
             let mut visited = item_trait.clone();
             visited.items.clear();
             referrer
                 .visitor(top_level, project)
                 .visit_item_trait_mut(&mut visited);
-            let args = enc(complete_params(&visited.generics.params, args))?;
-            (quote!(), trait_path, args)
+            let site = Substitute::with_params(&visited.generics.params, args)?;
+            (quote!(), trait_path, Some(site))
         }
         None => {
             let args: Vec<GenericArgument> = generics.params.iter().map(own_name).collect();
@@ -275,16 +248,8 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
                     PathArguments::AngleBracketed(parse_quote!(<#(#args),*>));
             }
             let (impl_generics, _, _) = generics.split_for_impl();
-            (quote!(#impl_generics), path, Vec::new())
+            (quote!(#impl_generics), path, None)
         }
-    };
-    // What the site answers for a name: the argument of the trait's parameter of that name.
-    let site = |name: &Ident| {
-        let at = generics
-            .params
-            .iter()
-            .position(|param| param_ident(param) == name)?;
-        site_args.get(at).cloned()
     };
 
     let mut items: Vec<ImplItem> = vec![];
@@ -304,10 +269,8 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
                 // 3. Write the arguments of the impl into the signature: its types, and the lifetimes
                 //    outside them (`&'a self`, `T: 'a`). The names that the method declares itself
                 //    get no answer (`site` knows the trait's parameters only).
-                if explicit.is_some() {
-                    let mut written = Substitute::new(&site);
-                    written.visit_signature_mut(&mut sig);
-                    enc(written.finish())?;
+                if let Some(site) = &mut site {
+                    site.visit_signature_mut(&mut sig);
                 }
                 let receiver = match sig.receiver() {
                     Some(r) if r.reference.is_some() && r.mutability.is_some() => {
@@ -333,16 +296,15 @@ fn forward_impl(finish: Finish) -> syn::Result<TokenStream2> {
             _ => {}
         }
     }
+    if let Some(site) = site {
+        site.finish()?;
+    }
     Ok(quote! {
         #wrapper
         impl #impl_generics #trait_path for #name where #inner: #trait_path {
             #(#items)*
         }
     })
-}
-
-fn enc<T>(result: Result<T, EncodeError>) -> syn::Result<T> {
-    result.map_err(|error| syn::Error::new(error.span(), error))
 }
 
 /// The argument that names a generic parameter itself (`K` for `K: Clone`).
@@ -360,14 +322,5 @@ fn own_name(param: &GenericParam) -> GenericArgument {
             let ident = &p.ident;
             parse_quote!(#ident)
         }
-    }
-}
-
-/// The name of a generic parameter, as `Substitute` asks for it.
-fn param_ident(param: &GenericParam) -> &Ident {
-    match param {
-        GenericParam::Type(p) => &p.ident,
-        GenericParam::Lifetime(p) => &p.lifetime.ident,
-        GenericParam::Const(p) => &p.ident,
     }
 }

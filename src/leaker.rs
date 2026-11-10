@@ -75,7 +75,8 @@ use template_quote::{quote, ToTokens};
 ///   an entry. Otherwise, one in a bound or a where predicate that names a generic
 ///   (`T: Into<::foo::W<T>>`, `::foo::W<T>: Clone`) is no entry, whatever the rule: replaced,
 ///   rustc could not prove the predicate for the Repeater's impl (E0277). The copy writes it as it
-///   is, so its crate must resolve there.
+///   is, so its crate must resolve there. A `::core` path is never an entry; `::std` and `::alloc`
+///   are crates like any other (see [`Rules::std_crates()`](crate::Rules::std_crates)).
 /// - A shadowed primitive name (`type u8 = i32;`): emit [`Leaker::assertions()`].
 /// - Values and bodies are not analyzed unless [`Leaker::check_values`] is on.
 /// - A type that names the `Self` of a nested struct, enum or union and uses a generic whose bound
@@ -135,27 +136,23 @@ use template_quote::{quote, ToTokens};
 /// E0747). Write an absolute path (`MyType<{ ::my_crate::MY_CONST }>`) or an [allowed](Allow)
 /// name.
 pub struct Leaker<A = ()> {
-    /// Makes the Leaker read the values of an item too, if it is `true` (it is `false` by default):
-    /// the values of consts and statics, the defaults and values of associated consts, and the
-    /// bodies of functions and methods. Set it before the calls that it should affect.
+    /// Reads the values of an item too, if `true` (default `false`): the values of consts and
+    /// statics, the defaults and values of associated consts, and the bodies of functions and
+    /// methods. Set it before the calls that it should affect.
     ///
-    /// Enum discriminants, the defaults of const parameters and array lengths are read either way
-    /// (the first two as a value is, but their errors are no [`ErrorItem::in_value`]).
+    /// A type in a type position of a value (a cast, a `let`, a closure parameter, the arguments of
+    /// a path or method call) is leaked like any type of the item. Another relative path in a value
+    /// is an error, unless it is [allowed](Allow) ([`Rules::values()`](crate::Rules::values)
+    /// allows all), or starts with a generic, `Self` or a name that the value declares. A macro
+    /// whose arguments are not expressions (`cfg!`, `stringify!` and `matches!` excepted), a
+    /// `macro_rules!`, a glob import and syntax that `syn` does not parse are errors. Without the
+    /// flag the copy breaks on such a path and the Leaker does not tell.
     ///
-    /// Without it a relative path in a value breaks the copy and the Leaker does not tell. The
-    /// types in a type position of a value (a cast, a `let`, a closure parameter or output, the
-    /// generic arguments of a path or method call, the self type of a qualified path) are leaked
-    /// like any type of the item. Another relative path (a function, a constant, a struct literal,
-    /// a variant, the trait of a qualified path) is rejected unless it is absolute or starts with
-    /// `$crate`, is [allowed](Allow) (the types too, by [`Rules::values()`](crate::Rules::values)),
-    /// or starts with a generic or `Self` in scope or a name that the value declares. A macro whose
-    /// arguments are not expressions (`cfg!`, `stringify!` and `matches!` excepted), a
-    /// `macro_rules!`, a glob import and syntax that `syn` does not parse are rejected.
+    /// Enum discriminants, the defaults of const parameters and array lengths are read either way.
     ///
-    /// ```
-    /// # use type_leak::*;
-    /// let mut leaker = Leaker::from_config(Rules::new().prelude());
-    /// leaker.check_values = true;
+    /// ```ignore
+    /// // With `check_values`: `Rel` is an entry, and `helper` is an error.
+    /// pub trait Tr { const LEN: usize = helper::<Rel>(); }
     /// ```
     pub check_values: bool,
     /// What the Leaker leaves as written instead of leaking it, and the errors it does not
@@ -182,7 +179,7 @@ pub struct Leaker<A = ()> {
 impl Leaker {
     /// Creates a [`Leaker`] that allows nothing, so every relative path is leaked.
     pub fn new() -> Self {
-        Self::from_config(())
+        Self::with_rule(())
     }
 }
 
@@ -193,11 +190,12 @@ impl Default for Leaker {
 }
 
 impl<A: Allow> Leaker<A> {
-    /// Creates a [`Leaker`] with the rule `allow`. See [`Leaker::check_values`].
-    pub fn from_config(allow: A) -> Self {
+    /// Creates a [`Leaker`] that asks `rule` what the copy may write as it is. A closure must
+    /// annotate its first parameter (`|cause: &Cause, _| ..`). See [`Leaker::check_values`].
+    pub fn with_rule(rule: A) -> Self {
         Self {
             check_values: false,
-            allow,
+            allow: rule,
             types: TypeGraph::default(),
             contexts: Contexts::default(),
             top_levels: BTreeSet::new(),
@@ -486,7 +484,8 @@ impl<A: Allow> Leaker<A> {
     }
 
     /// Chooses the fewest entries from which every leaked type can be built, and removes every
-    /// other type from the Leaker; [`Leaker::result()`] calls it. `&'a Rel`, a path with a lifetime
+    /// other type from the Leaker. [`Leaker::result()`] makes the same choice without it: call this
+    /// only to go on analyzing on the reduced Leaker. `&'a Rel`, a path with a lifetime
     /// or bare-identifier argument (`Wrap<SIZE>`), a type with a type in an expression
     /// (`[u8; size_of::<Big>()]`) and a trait object are entries as a whole. One choice covers the
     /// types that depend on the context and the types of other crates (`::foo::X`): an entry with a
@@ -513,7 +512,7 @@ impl<A: Allow> Leaker<A> {
 ///
 /// [`allow()`](LeakerResult::allow) takes and returns the result, so it chains. It drops the errors
 /// that an [`Allow`] accepts (you promise that the part compiles as written). It leaves the
-/// entries as they are: to remove entries, give the [`Allow`] to [`Leaker::from_config()`]. A rule
+/// entries as they are: to remove entries, give the [`Allow`] to [`Leaker::with_rule()`]. A rule
 /// here only approximates the one of the Leaker (more errors may remain, and a copy may fail to
 /// build): give rules to the Leaker when you can. [`ignore()`](LeakerResult::ignore) accepts one
 /// error, and has the copy write its whole part as written, or removes its entry.
@@ -548,12 +547,12 @@ impl LeakerResult {
     /// ignored). An absolute path is never an error, so a rule for `::serde` changes no error. It
     /// changes no entry either: to have the copy write a type of another crate as it is, give
     /// [`Rules::external_crates()`](crate::Rules::external_crates) to
-    /// [`Leaker::from_config()`].
+    /// [`Leaker::with_rule()`].
     ///
-    /// See [`Allow`] for what the rule is asked. A closure needs `&Cause` and
-    /// [`Place`](crate::Place) annotated when it is not written in the call
-    /// (`|cause: &Cause, _: Place| ..`); [`Rules::or_if()`](crate::Rules::or_if) needs none. To
-    /// have the copy write the whole part as written, use [`ignore()`](LeakerResult::ignore).
+    /// See [`Allow`] for what the rule is asked. A closure must annotate its first parameter
+    /// (`|cause: &Cause, _| ..`), even written in the call; [`Rules::or_if()`](crate::Rules::or_if)
+    /// needs no annotation. To have the copy write the whole part as written, use
+    /// [`ignore()`](LeakerResult::ignore).
     pub fn allow(mut self, rule: impl Allow) -> Self {
         filter(&rule, &mut self.errors);
         self
@@ -663,7 +662,7 @@ impl LeakerResult {
     /// Describes the Repeater impl of each entry: its generics, trait path and type.
     ///
     /// It is the Leaker's side that writes the impls: write one for every entry, in
-    /// [`RepeaterImpl::module`] if it is `Some`. The items come in the order of the entries
+    /// [`RepeaterImpl::module`] if it is `Some`. They come in the order of the entries
     /// ([`Referrer::iter()`], so without those that [`ignore()`](LeakerResult::ignore) removed),
     /// each with its [`EntryId`] in [`RepeaterImpl::entry`], which the
     /// Repeater's `KEY` ([`repeater_key()`](crate::repeater_key)) and [`Referrer::bucket_self()`]
@@ -678,21 +677,17 @@ impl LeakerResult {
     /// as in [`repeater_projection()`](crate::repeater_projection): it gets the parameter itself
     /// (`N`) as `value`.
     ///
-    /// The call fails, before any item, with the first of these:
+    /// The call fails with the first of these:
     ///
     /// - [`EncodeError::NeedsSelf`], for [`ImplSelf::Marker`], if some entry names `Self`, or its
-    ///   context's generics do. The error has the first such entry.
+    ///   context's generics do. The error has the first such entry, and no impl is made.
     /// - The first error of `const_fn`. It is called once for each const parameter of each entry,
     ///   in the order of the entries and of the parameters.
     ///
-    /// The items do not fail. They are made one at a time as you iterate, and call `const_fn`
-    /// again, so it must give the same answer for the same parameter every time: if it fails for a
-    /// parameter that it accepted in the call, the iterator panics.
-    ///
     /// # Panics
     ///
-    /// If `repeater` has arguments (`crate::Repeater<u8>`), before any item: it names the trait
-    /// alone, or with an empty `<>`.
+    /// If `repeater` has arguments (`crate::Repeater<u8>`): it names the trait alone, or with an
+    /// empty `<>`.
     ///
     /// ```
     /// # use type_leak::*;
@@ -702,14 +697,12 @@ impl LeakerResult {
     /// let result = leaker.result();
     ///
     /// let repeater: Path = parse_quote!(crate::Repeater);
-    /// let r = result
+    /// let impls = result
     ///     .repeater_impls(&repeater, 7, ImplSelf::Param(&parse_quote!(__S)), array_const)
-    ///     .unwrap()
-    ///     .next()
     ///     .unwrap();
-    /// assert_eq!(r.ty, parse_quote!(Wrap<T>));
+    /// assert_eq!(impls[0].ty, parse_quote!(Wrap<T>));
     /// // `path` has no `KEY`, and `ToTokens` writes the one of the id 7.
-    /// assert_eq!(r.path, parse_quote!(crate::Repeater<(T,)>));
+    /// assert_eq!(impls[0].path, parse_quote!(crate::Repeater<(T,)>));
     /// ```
     ///
     /// An entry that names `Self` has no impl for a marker, so the call fails:
@@ -726,33 +719,25 @@ impl LeakerResult {
     /// let err = result.repeater_impls(&repeater, 7, ImplSelf::Marker(&marker), array_const).err();
     /// assert!(matches!(err, Some(EncodeError::NeedsSelf(_))));
     /// ```
-    pub fn repeater_impls<'a>(
-        &'a self,
-        repeater: &'a Path,
+    pub fn repeater_impls(
+        &self,
+        repeater: &Path,
         id: u64,
-        target: ImplSelf<'a>,
-        mut const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError> + 'a,
-    ) -> std::result::Result<impl Iterator<Item = RepeaterImpl> + 'a, EncodeError> {
+        target: ImplSelf<'_>,
+        mut const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
+    ) -> std::result::Result<Vec<RepeaterImpl>, EncodeError> {
         check_repeater_path(repeater);
-        // The entries that no `ignore()` removed.
-        let live: Vec<usize> = self.referrer.live().collect();
-        for &ix in &live {
+        // Every entry first: `NeedsSelf` goes before an error of `const_fn`.
+        for ix in self.referrer.live() {
             self.referrer.check_marker(ix, target)?;
         }
-        for &ix in &live {
-            self.referrer.check_consts(ix, target, &mut const_fn)?;
-        }
-        Ok(live.into_iter().map(move |ix| {
-            self.referrer
-                .repeater_impl(repeater, id, ix, target, &mut const_fn)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "`const_fn` of `repeater_impls()` failed for the entry {} after it had \
-                         not failed in the call: {}",
-                        ix, error
-                    )
-                })
-        }))
+        self.referrer
+            .live()
+            .map(|ix| {
+                self.referrer
+                    .repeater_impl(repeater, id, ix, target, &mut const_fn)
+            })
+            .collect()
     }
 }
 

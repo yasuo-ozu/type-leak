@@ -2,11 +2,11 @@
 
 mod common;
 
-use common::{check_in, enter_function, finish_as_strings, starts_with};
+use common::{check_in, enter_function, finish_as_strings, starts_with, to_syn_error};
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
-use type_leak::{to_syn_error, Context, ContextId, EntryId, Leaker, Referrer, Rules};
+use type_leak::{Context, ContextId, EntryId, Leaker, Referrer, Rules};
 
 /// The entries that `reduce_roots()` leaves for a small item, required ones as they are and
 /// optional ones after `? `, sorted. `quiet` writes the paths of external crates as they are, so
@@ -229,7 +229,7 @@ fn test_reduce_roots_small_cuts() {
 /// A Leaker that writes the paths of external crates as they are, so that the tests of the cut
 /// among the required types see no optional entries (`test_reduce_roots_one_cut` tests both).
 fn quiet() -> Leaker<Rules> {
-    Leaker::from_config(Rules::new().external_crates())
+    Leaker::with_rule(Rules::new().external_crates())
 }
 
 fn leaked_of(item: ItemStruct) -> Vec<String> {
@@ -248,7 +248,7 @@ fn test_reduce_roots_allowed_path_is_neutral() {
     // A type under an explicitly allowed path prefix is neutral → empty.
     let item: ItemStruct = parse_quote! { struct S { a: some_mod::SomeType } };
     let config = Rules::new().or_if(starts_with(parse_quote!(some_mod)));
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_struct(&item);
     leaker.reduce_roots();
     assert!(leaker.result().finish().unwrap().is_empty());
@@ -1400,7 +1400,7 @@ fn test_reduce_roots_reference_with_a_local_lifetime_is_found_in_its_scope() {
     let by_leakers = rewrite(&mut |copy| {
         referrer
             .visitor(top_level, |_, ix, _| parse_quote!(P<#ix>))
-            .with_outermost_generics_as_leakers()
+            .with_outer_generics()
             .visit_item_trait_mut(copy)
     });
     assert_eq!(by_leakers, printed_expected);
@@ -1415,7 +1415,7 @@ fn test_reduce_roots_reference_with_a_local_lifetime_is_found_in_its_scope() {
         let visitor = referrer.visitor(top_level, record);
         if leakers {
             visitor
-                .with_outermost_generics_as_leakers()
+                .with_outer_generics()
                 .visit_item_trait_mut(&mut copy);
         } else {
             let mut visitor = visitor;
@@ -1444,24 +1444,40 @@ fn test_reduce_roots_reference_with_a_local_lifetime_is_found_in_its_scope() {
     );
     // `expand()` knows the lifetime of the context, not that of a method: `'b` is not declared.
     let ty: Type = parse_quote!(&'a mut dyn RelTr);
-    let expanded = referrer.expand(top_level, ty, |_, ix, _| parse_quote!(P<#ix>));
+    let expanded = common::expand(&referrer, top_level, ty, |_, ix, _| parse_quote!(P<#ix>));
     assert_eq!(ty_string(expanded), format!("P < {}usize >", a));
     let ty: Type = parse_quote!(&'b dyn RelTr);
-    let expanded = referrer.expand(top_level, ty.clone(), |_, ix, _| parse_quote!(P<#ix>));
+    let expanded = common::expand(
+        &referrer,
+        top_level,
+        ty.clone(),
+        |_, ix, _| parse_quote!(P<#ix>),
+    );
     assert_eq!(ty_string(expanded), ty_string(ty));
     // A trait object which is not under the reference is not an entry: its default is that of
     // another path or `'static`.
     let ty: Type = parse_quote!(::std::boxed::Box<dyn RelTr>);
-    let expanded = referrer.expand(top_level, ty.clone(), |_, ix, _| parse_quote!(P<#ix>));
+    let expanded = common::expand(
+        &referrer,
+        top_level,
+        ty.clone(),
+        |_, ix, _| parse_quote!(P<#ix>),
+    );
     assert_eq!(ty_string(expanded), ty_string(ty));
     let ty: Type = parse_quote!(&'a ::std::boxed::Box<dyn RelTr>);
-    let expanded = referrer.expand(top_level, ty.clone(), |_, ix, _| parse_quote!(P<#ix>));
+    let expanded = common::expand(
+        &referrer,
+        top_level,
+        ty.clone(),
+        |_, ix, _| parse_quote!(P<#ix>),
+    );
     assert_eq!(ty_string(expanded), ty_string(ty));
     // The Referrer survives the serialization.
     let tokens = quote!(#referrer);
     let parsed: type_leak::Referrer = syn::parse2(tokens).unwrap();
     assert_eq!(parsed, referrer);
-    let again = parsed.expand(
+    let again = common::expand(
+        &parsed,
         top_level,
         parse_quote!(&'a mut dyn RelTr),
         |_, ix, _| parse_quote!(P<#ix>),
@@ -2318,7 +2334,7 @@ fn test_reduce_roots_one_cut() {
 #[test]
 fn test_reduce_roots_a_forbidden_type_has_its_components_as_entries() {
     let entries = |config: Rules, item: ItemStruct| -> Vec<String> {
-        let mut leaker = Leaker::from_config(config);
+        let mut leaker = Leaker::with_rule(config);
         leaker.enter_mod("m", [item.ident.clone()], |view| {
             view.visit_item(&Item::Struct(item.clone()))
         });
@@ -2347,7 +2363,7 @@ fn test_reduce_roots_a_forbidden_type_has_its_components_as_entries() {
     let item: ItemImpl = parse_quote! {
         impl<T: Fn(Rel2<u8>), U> ::p::Tr<U> for ::p::W2<T, Rel<U>> where Self: Clone {}
     };
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_impl(&item);
     let referrer = leaker.result().finish().unwrap();
     let types: Vec<String> = common::types(&referrer)
@@ -2707,7 +2723,7 @@ fn test_reduce_roots_a_kept_entry_stays_when_a_later_scope_forbids_it() {
         }
     };
     let copy_with = |reduce: bool| {
-        let mut leaker = Leaker::from_config(Rules::new().prelude().primitive());
+        let mut leaker = Leaker::with_rule(Rules::new().prelude().primitive());
         leaker.enter_generics(&generics, |view| view.visit_type(&ty));
         if reduce {
             leaker.reduce_roots();

@@ -1,30 +1,18 @@
 //! The scopes of the `Leaker` (`enter_*()`) and the `View` they give to their closure: what each
-//! scope declares, nested scopes, `Self`, and what a scope which fails keeps. The last section pins
-//! that the scopes of the items are a layer around `enter_generics()`.
+//! scope declares, nested scopes, `Self`, and what a scope which fails keeps. One section pins
+//! that the scopes of the items are a layer around `enter_generics()`, and the last one that the
+//! `View` forwards exactly the `Visit` methods that the analysis overrides.
 
 mod common;
 
-use common::{enter_function, visit_function, AcceptCause};
+use common::{enter_function, messages, s, to_syn_error, visit_function, AcceptCause};
 use syn::visit::Visit;
 use syn::*;
-use template_quote::{quote, ToTokens};
+use template_quote::ToTokens;
 use type_leak::{
     Allow, Cause, ContextId, ErrorItem, Leaker, LeakerResult, Reason, Referrer, Rules,
     SelfRequirement, View,
 };
-
-fn s(x: &impl ToTokens) -> String {
-    quote!(#x).to_string()
-}
-
-/// The messages of `errors`, one on each line.
-fn messages(errors: &[ErrorItem]) -> String {
-    errors
-        .iter()
-        .map(|item| item.message.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 /// The result of the calls `f` makes on a new Leaker.
 fn recorded(f: impl FnOnce(&mut Leaker)) -> LeakerResult {
@@ -913,7 +901,7 @@ fn the_error_of_an_inner_scope_is_part_of_the_outer_one() {
 /// A Leaker that allows the primitive types and the names of the standard prelude.
 fn leaker_with_std() -> Leaker<impl Allow> {
     let config = Rules::new().primitive().prelude();
-    Leaker::from_config(config)
+    Leaker::with_rule(config)
 }
 
 /// `Leaker::enter_generics()` docs: a scope keeps what it recorded when it has errors. The
@@ -2154,11 +2142,7 @@ fn the_generics_of_a_method_are_local_and_checked_for_e0195() {
         });
         let err = result.errors();
         assert!(!err.is_empty(), "{}", scope);
-        assert!(
-            type_leak::to_syn_error(err).to_string().contains("E0195"),
-            "{}",
-            scope
-        );
+        assert!(to_syn_error(err).to_string().contains("E0195"), "{}", scope);
     }
     // A function nested in generics, and a method of an inherent impl, are no methods of a trait:
     // nothing to differ from (F22), but their generics are local too.
@@ -2299,14 +2283,14 @@ fn self_without_meaning_is_an_error_of_its_own() {
              or a trait, not by a module or generics"
         )
     );
-    let converted = type_leak::to_syn_error(err);
+    let converted = to_syn_error(err);
     assert_eq!(converted.into_iter().count(), 2);
     assert_eq!(
         err.iter()
             .map(ErrorItem::to_compile_error)
             .collect::<proc_macro2::TokenStream>()
             .to_string(),
-        type_leak::to_syn_error(err).to_compile_error().to_string()
+        to_syn_error(err).to_compile_error().to_string()
     );
     let _ = err[0].span();
     // A scope which has both kinds of errors returns both, in the order in which they were found:
@@ -3369,3 +3353,74 @@ trait, then: ok (1)
 trait, mod, item: ok (1)
 trait, item: ok (1)
 "#;
+
+// ── the View forwards what the analysis overrides ────────────────────────────────────────────
+
+/// The `Visit` methods of the type `ty` in `source`: written out, or named in the `forward!`
+/// list.
+fn visit_methods(source: &str, ty: &str) -> std::collections::BTreeSet<String> {
+    use proc_macro2::{TokenStream, TokenTree};
+    use std::collections::BTreeSet;
+
+    fn idents(tokens: TokenStream, out: &mut BTreeSet<String>) {
+        for token in tokens {
+            match token {
+                TokenTree::Ident(ident) if ident.to_string().starts_with("visit_") => {
+                    out.insert(ident.to_string());
+                }
+                TokenTree::Group(group) => idents(group.stream(), out),
+                _ => (),
+            }
+        }
+    }
+    let file = parse_file(source).unwrap();
+    let mut out = BTreeSet::new();
+    for item in file.items {
+        let item = match item {
+            Item::Impl(item) => item,
+            _ => continue,
+        };
+        let is_visit = matches!(&item.trait_, Some((_, path, _))
+            if path.segments.last().map_or(false, |seg| seg.ident == "Visit"));
+        let is_ty = matches!(&*item.self_ty, Type::Path(path)
+            if path.path.segments.last().map_or(false, |seg| seg.ident == ty));
+        if !is_visit || !is_ty {
+            continue;
+        }
+        for item in item.items {
+            match item {
+                ImplItem::Fn(method) => {
+                    out.insert(method.sig.ident.to_string());
+                }
+                ImplItem::Macro(mac) => idents(mac.mac.tokens, &mut out),
+                _ => (),
+            }
+        }
+    }
+    out
+}
+
+/// The view must forward exactly the methods the analysis overrides: a missing one would bypass
+/// the analysis silently, and an extra one is a stale entry.
+#[test]
+fn the_view_forwards_exactly_the_methods_the_analysis_overrides() {
+    let overridden = visit_methods(include_str!("../src/analyze.rs"), "AnalyzeVisitor");
+    let forwarded = visit_methods(include_str!("../src/view.rs"), "View");
+    assert!(!overridden.is_empty(), "the analysis was not found");
+    assert!(
+        !forwarded.is_empty(),
+        "the forwarded methods were not found"
+    );
+    let missing: Vec<_> = overridden.difference(&forwarded).collect();
+    let stale: Vec<_> = forwarded.difference(&overridden).collect();
+    assert!(
+        missing.is_empty(),
+        "overridden by the analysis but not forwarded by the view: {:?}",
+        missing
+    );
+    assert!(
+        stale.is_empty(),
+        "forwarded by the view but not overridden by the analysis: {:?}",
+        stale
+    );
+}

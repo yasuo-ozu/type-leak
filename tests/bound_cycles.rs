@@ -10,23 +10,9 @@
 
 mod common;
 
-use common::starts_with;
+use common::{entries_with_generics as entries, messages, s, starts_with};
 use syn::*;
-use template_quote::quote;
 use type_leak::{Allow, Cause, ErrorItem, Leaker, Place, Referrer, Rules};
-
-fn s(x: &impl template_quote::ToTokens) -> String {
-    quote!(#x).to_string()
-}
-
-/// The messages of the errors, one per line.
-fn messages(errors: &[ErrorItem]) -> String {
-    errors
-        .iter()
-        .map(|item| item.message.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 fn leaker() -> Leaker<impl Allow> {
     leaker_allowing(&[])
@@ -44,7 +30,7 @@ fn leaker_allowing(allowed: &[&str]) -> Leaker<impl Allow> {
         .or_if(move |cause: &Cause, place: Place| {
             allowed.iter().any(|a| starts_with(a.clone())(cause, place))
         });
-    Leaker::from_config(config)
+    Leaker::with_rule(config)
 }
 
 /// Analyzes `item` with the matching `intern_*`.
@@ -57,15 +43,6 @@ fn leak(item: Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
         _ => panic!("unsupported item"),
     };
     leaker.result().finish()
-}
-
-/// The leaked types, required then optional, with their generics.
-fn entries(referrer: &Referrer) -> Vec<(String, String)> {
-    referrer
-        .iter()
-        .map(|(_, ty, context)| (ty, &context.generics))
-        .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
-        .collect()
 }
 
 fn types(referrer: &Referrer) -> Vec<String> {

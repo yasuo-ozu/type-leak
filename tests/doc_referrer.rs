@@ -21,15 +21,14 @@ fn iter_has_the_types_of_other_crates_and_each_entry_gets_a_repeater_impl() {
     result.clone().finish().unwrap();
     // One impl for each entry, the one of another crate too.
     let param: Ident = parse_quote!(__S);
-    let impls: Vec<RepeaterImpl> = result
+    let impls = result
         .repeater_impls(
             &parse_quote!(crate::Repeater),
             7,
             ImplSelf::Param(&param),
             array_const,
         )
-        .unwrap()
-        .collect();
+        .unwrap();
     assert_eq!(impls.len(), 2);
 }
 
@@ -89,7 +88,7 @@ fn has_self_is_true_if_some_entry_needs_self() {
     ));
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer
-        .bucket_self(common::entry_id_at(&referrer, 0), 7)
+        .bucket_self(7, common::entry_id_at(&referrer, 0))
         .is_none());
     assert!(referrer.has_self());
     let parsed: Referrer = parse2(quote!(#referrer)).unwrap();
@@ -105,7 +104,7 @@ fn has_self_is_true_if_some_entry_needs_self() {
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer
         .iter()
-        .all(|(ix, _, _)| referrer.bucket_self(ix, 7).is_some()));
+        .all(|(ix, _, _)| referrer.bucket_self(7, ix).is_some()));
     assert!(!referrer.has_self());
 }
 
@@ -139,7 +138,7 @@ fn complete_params_fills_the_defaulted_parameter() {
 
 /// A copy that declares `T: Clone` again is rewritten only with this option.
 #[test]
-fn outermost_generics_as_leakers_replaces_despite_other_bounds() {
+fn with_outer_generics_replaces_despite_other_bounds() {
     let tr: ItemTrait = parse_quote!(
         trait MyTrait<T> {
             fn f(&self) -> Wrap<T>;
@@ -167,7 +166,7 @@ fn outermost_generics_as_leakers_replaces_despite_other_bounds() {
     let mut copy = item.clone();
     referrer
         .visitor(context, replace)
-        .with_outermost_generics_as_leakers()
+        .with_outer_generics()
         .visit_item_impl_mut(&mut copy);
     let expected: ItemImpl = parse_quote!(
         impl<T: Clone> MyTrait<T> for W {
@@ -281,8 +280,7 @@ fn nested_self_passes_the_copys_own_self_for_a_bound_naming_self() {
     let r = result
         .repeater_impls(&repeater, 7, ImplSelf::Param(&param), slot_const(&repeater))
         .unwrap()
-        .next()
-        .unwrap();
+        .remove(0);
     // `r.path` has no `KEY`, and `ToTokens` writes the one of the id 7.
     let key = repeater_key(7, r.entry);
     let imp: ItemImpl = parse_quote!(#r);
@@ -375,7 +373,7 @@ fn a_leaker_that_allows_the_crates_makes_no_entry_of_their_types() {
             leaked: Rel<Self>,             // an entry: the macro writes the type
         }
     };
-    let mut leaker = Leaker::from_config(Rules::new().external_crates());
+    let mut leaker = Leaker::with_rule(Rules::new().external_crates());
     let (module, ()) = leaker.enter_mod("m", [item.ident.clone()], |view| {
         view.visit_item(&Item::Struct(item.clone()))
     });
@@ -414,10 +412,10 @@ fn format_version_is_the_serialized_tag_and_another_tag_is_refused() {
     assert!(error.to_string().contains("incompatible type-leak"));
 }
 
-/// `visitor()` writes the entries, `complete_params()` completes the arguments of an impl, and
-/// `Substitute` writes them into the copy.
+/// `visitor()` writes the entries, and `Substitute::with_params()` completes the arguments of an
+/// impl and writes them into the copy.
 #[test]
-fn visitor_then_complete_params_and_substitute_args_give_the_copy_at_a_use_site() {
+fn visitor_then_substitute_with_params_give_the_copy_at_a_use_site() {
     let tr: ItemTrait = parse_quote!(
         trait Tr<T> {
             fn f(&self, t: T) -> Wrap<T>;
@@ -443,12 +441,9 @@ fn visitor_then_complete_params_and_substitute_args_give_the_copy_at_a_use_site(
     );
     assert_eq!(sig, expected);
 
-    // 2. The arguments of the impl.
+    // 2. and 3. The arguments of the impl, written into the copy: `T` is `u8`.
     let given: Vec<GenericArgument> = vec![parse_quote!(u8)];
-    let completed = complete_params(&tr.generics.params, &given).unwrap();
-
-    // 3. `T` is `u8` in the copy.
-    let mut site = Substitute::new(|name: &Ident| (name == "T").then(|| completed[0].clone()));
+    let mut site = Substitute::with_params(&tr.generics.params, &given).unwrap();
     site.visit_signature_mut(&mut sig);
     site.finish().unwrap();
     let expected: Signature = parse_quote!(
@@ -460,7 +455,7 @@ fn visitor_then_complete_params_and_substitute_args_give_the_copy_at_a_use_site(
 /// The same for a trait with a lifetime parameter: `Substitute` writes `'a` where it is not in a
 /// type (the receiver, a bound), and the items of the impl only, not its header.
 #[test]
-fn visitor_then_complete_params_and_substitute_give_the_items_of_an_impl_with_a_lifetime() {
+fn visitor_then_substitute_with_params_give_the_items_of_an_impl_with_a_lifetime() {
     let tr: ItemTrait = parse_quote!(
         trait Tr<'a, T: 'a> {
             fn keep(&'a self, t: T) -> Wrap<&'a T>
@@ -491,8 +486,7 @@ fn visitor_then_complete_params_and_substitute_give_the_items_of_an_impl_with_a_
         })
         .visit_item_impl_mut(&mut imp);
     let given: Vec<GenericArgument> = vec![parse_quote!('x), parse_quote!(u8)];
-    let completed = complete_params(&tr.generics.params, &given).unwrap();
-    let mut site = Substitute::new(common::answers(&tr.generics.params, &completed));
+    let mut site = Substitute::with_params(&tr.generics.params, &given).unwrap();
     for item in &mut imp.items {
         site.visit_impl_item_mut(item);
     }
@@ -564,4 +558,36 @@ fn entry_id_is_written_with_the_usize_suffix_and_read_with_or_without_it() {
     assert_eq!(parse_str::<EntryId>("1").unwrap(), ix);
     assert_eq!(parse_str::<EntryId>("1usize").unwrap(), ix);
     assert!(parse_str::<EntryId>("1u8").is_err());
+}
+
+/// What is not a non-negative integer that fits a `usize` is a parse error, with a message that
+/// says why.
+#[test]
+fn entry_id_parse_errors() {
+    let too_large = format!("{}0", usize::MAX);
+    let cases: [(&str, &str); 8] = [
+        ("", "unexpected end of input, expected integer literal"),
+        ("x", "expected integer literal"),
+        ("'a", "expected integer literal"),
+        ("1.0", "expected integer literal"),
+        ("-1", "invalid digit found in string"),
+        (&too_large, "number too large to fit in target type"),
+        (
+            "1u8",
+            "an entry id is an integer, with no suffix or `usize`",
+        ),
+        ("1 2", "unexpected token"),
+    ];
+    for (text, message) in cases {
+        let err = parse_str::<EntryId>(text).unwrap_err();
+        assert_eq!(err.to_string(), message, "{:?}", text);
+    }
+    // The largest one that fits is read.
+    let largest = usize::MAX.to_string();
+    assert_eq!(
+        parse_str::<EntryId>(&largest).unwrap().index(),
+        usize::MAX,
+        "{}",
+        largest
+    );
 }

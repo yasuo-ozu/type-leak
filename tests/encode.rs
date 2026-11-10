@@ -8,6 +8,8 @@
 
 mod common;
 
+use common::s;
+
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
@@ -226,12 +228,16 @@ fn the_repeater_key_has_the_id_above_the_index() {
     );
     assert_eq!(repeater_key(u64::MAX, entry(u64::MAX as usize)), u128::MAX);
     let ids = [0, 1, 2, 255, 1 << 32, u64::MAX - 1, u64::MAX];
-    let nths = [0, 1, 2, 255, 1 << 31, u32::MAX as usize];
+    let indices = [0, 1, 2, 255, 1 << 31, u32::MAX as usize];
     let keys: HashSet<u128> = ids
         .iter()
-        .flat_map(|&id| nths.iter().map(move |&nth| repeater_key(id, entry(nth))))
+        .flat_map(|&id| {
+            indices
+                .iter()
+                .map(move |&index| repeater_key(id, entry(index)))
+        })
         .collect();
-    assert_eq!(keys.len(), ids.len() * nths.len());
+    assert_eq!(keys.len(), ids.len() * indices.len());
 }
 
 // ── the errors ───────────────────────────────────────────────────────────────────────────────
@@ -341,6 +347,55 @@ fn errors() -> Vec<EncodeError> {
         // The default `T::Item` of a parameter whose argument is not an identifier, with no bound.
         args_error("<T, U = T::Item>", "<::std::vec::IntoIter<u8>>"),
     ]
+}
+
+/// `complete_params()` matches the arguments to the parameters by kind: an argument of the other
+/// kind is no argument of its kind, so the parameter is missing one, and what is left over does not
+/// fit (the docs of `complete_params()`).
+#[test]
+fn complete_params_matches_the_arguments_by_kind() {
+    let outcome = |params: &str, given: &[&str]| -> String {
+        let generics: Generics = parse_str(&format!("<{}>", params)).unwrap();
+        match complete_params(&generics.params, &arguments(given)) {
+            Ok(completed) => format!("ok {}", strings(&completed).join(" ")),
+            Err(EncodeError::MissingArgument(param)) => format!("missing {}", s(&*param)),
+            Err(EncodeError::UnexpectedArgument(arg)) => format!("unexpected {}", s(&*arg)),
+            Err(other) => panic!("{}", other),
+        }
+    };
+    for (params, given, expected) in [
+        // A type for a lifetime parameter, a lifetime for a type parameter.
+        ("'a", &["[u8]"][..], "missing 'a"),
+        ("T", &["'a"], "missing T"),
+        // The type parameter has a default: the lifetime is left over.
+        ("T = u8", &["'a"], "unexpected 'a"),
+        // A const for a type parameter, a type that is not a name for a const parameter.
+        ("T", &["{ 3 }"], "unexpected { 3 }"),
+        ("const N: usize", &["Vec<u8>"], "unexpected Vec < u8 >"),
+        // Too many.
+        ("T", &["u8", "u8"], "unexpected u8"),
+        ("'a", &["'a", "'b"], "unexpected 'b"),
+        // The kinds are matched apart, so their order does not matter.
+        ("'a, T", &["u8", "'a"], "ok 'a u8"),
+        ("T, 'a", &["'a", "u8"], "ok u8 'a"),
+        // With several of each, the lifetimes go to the lifetime parameters in order, the types
+        // after them, and the omitted default is written with the types.
+        (
+            "'a, 'b, T, U = Vec<T>",
+            &["u8", "'static", "'x"],
+            "ok 'static 'x u8 Vec<u8>",
+        ),
+        (
+            "'a, 'b, T, U",
+            &["'static", "u8", "'x", "u16"],
+            "ok 'static 'x u8 u16",
+        ),
+        // A lifetime missing, and one too many, with the types in between.
+        ("'a, 'b, T", &["u8", "'static"], "missing 'b"),
+        ("'a, 'b, T", &["'a", "u8", "'b", "'c"], "unexpected 'c"),
+    ] {
+        assert_eq!(outcome(params, given), expected, "<{}> {:?}", params, given);
+    }
 }
 
 #[test]
@@ -516,6 +571,64 @@ fn substitute_args_asks_for_each_name_once_in_order() {
     // The tokens of a macro are asked for `Self` only if they name it.
     assert_eq!(asked(&["m!(T, 'a)"]), Vec::<String>::new());
     assert_eq!(asked(&["m!((Self))"]), ["Self"]);
+}
+
+/// The binder `'__tl_s<n>` that the library writes for an elided lifetime is its own name: `f` is
+/// not asked about it, in `substitute_args()` and in `Substitute`. A lifetime of the copy that is
+/// named like it is asked.
+#[test]
+fn the_fresh_binder_of_a_substitution_is_not_asked_for() {
+    // `U` adds a lifetime to the inputs of the function pointer, which gets the binder.
+    let mut args = arguments(&["fn(&U) -> &u8"]);
+    let mut asked = Vec::new();
+    substitute_args(args.iter_mut(), |name: &Ident| {
+        asked.push(name.to_string());
+        (name == "U").then(|| parse_quote!(&'static str))
+    })
+    .unwrap();
+    assert_eq!(
+        args,
+        [parse_quote!(
+            for<'__tl_s0> fn(&'__tl_s0 &'static str) -> &'__tl_s0 u8
+        )]
+    );
+    assert_eq!(asked, ["U", "u8"]);
+
+    // A catch-all answer, which would be a misfit for a lifetime, is not applied to the binder.
+    let mut args = arguments(&["dyn Fn(&U) -> &u8"]);
+    substitute_args(args.iter_mut(), |name: &Ident| {
+        (name != "u8").then(|| parse_quote!(&'static str))
+    })
+    .unwrap();
+    assert_eq!(
+        args,
+        [parse_quote!(
+            dyn for<'__tl_s0> Fn(&'__tl_s0 &'static str) -> &'__tl_s0 u8
+        )]
+    );
+
+    // The same in a node. A lifetime of the copy that is named `'__tl_s0` is asked, and kept, and
+    // the binder takes the next name.
+    let mut asked = Vec::new();
+    let mut item: ImplItemFn = parse_quote! {
+        fn f(&self, g: Wrap<'__tl_s0, fn(&U) -> &u8>, h: for<'x> fn(&'x fn(&U) -> &u8)) {}
+    };
+    let mut visitor = Substitute::new(|name: &Ident| {
+        asked.push(name.to_string());
+        (name == "U").then(|| parse_quote!(&'static str))
+    });
+    visitor.visit_impl_item_fn_mut(&mut item);
+    visitor.finish().unwrap();
+    asked.sort();
+    assert_eq!(asked, ["U", "__tl_s0", "u8", "x"]);
+    let expected: ImplItemFn = parse_quote! {
+        fn f(
+            &self,
+            g: Wrap<'__tl_s0, for<'__tl_s1> fn(&'__tl_s1 &'static str) -> &'__tl_s1 u8>,
+            h: for<'x> fn(&'x for<'__tl_s0> fn(&'__tl_s0 &'static str) -> &'__tl_s0 u8)
+        ) {}
+    };
+    assert_eq!(s(&item), s(&expected));
 }
 
 #[test]
@@ -952,6 +1065,181 @@ fn substitute_reports_the_first_error_and_leaves_what_it_could_not_write_as_it_w
     visitor.finish().unwrap();
 }
 
+// ── Substitute::with_params() ────────────────────────────────────────────────────────────────
+
+/// The signature `written`, copied at the site that gives `given` to the trait with `generics`.
+fn at_params(generics: &str, given: &[&str], written: &str) -> Signature {
+    let generics: Generics = parse_str(generics).unwrap();
+    let mut sig: Signature = parse_str(written).unwrap();
+    let mut site = Substitute::with_params(&generics.params, &arguments(given)).unwrap();
+    site.visit_signature_mut(&mut sig);
+    site.finish().unwrap();
+    sig
+}
+
+#[test]
+fn with_params_answers_each_parameter_by_its_name_and_kind() {
+    // (case, the generics of the trait, the arguments given, the signature written, the copy)
+    for (case, generics, given, written, expected) in [
+        (
+            "a lifetime and a type of one name",
+            "<'T, T>",
+            &["'x", "u8"][..],
+            "fn f(&'T self, t: T) -> &'T T",
+            "fn f(&'x self, t: u8) -> &'x u8",
+        ),
+        (
+            "the type comes first",
+            "<T, 'T>",
+            &["'x", "u8"][..],
+            "fn f(&'T self, t: T) -> &'T T",
+            "fn f(&'x self, t: u8) -> &'x u8",
+        ),
+        (
+            "a lifetime and a const of one name",
+            "<'N, const N: usize>",
+            &["'x", "3"][..],
+            "fn f(&'N self, a: [u8; N]) -> &'N u8",
+            "fn f(&'x self, a: [u8; { 3 }]) -> &'x u8",
+        ),
+        (
+            "a lifetime without a type of its name",
+            "<'a, T>",
+            &["'x", "u8"][..],
+            "fn f(&'a self, a: a, t: T)",
+            "fn f(&'x self, a: a, t: u8)",
+        ),
+        (
+            "a type without a lifetime of its name",
+            "<'a, T>",
+            &["'x", "u8"][..],
+            "fn f(&'T self, t: T, b: &'a T)",
+            "fn f(&'T self, t: u8, b: &'x u8)",
+        ),
+        (
+            "a default that uses an earlier parameter",
+            "<'a, T, U = Vec<T>>",
+            &["'x", "u8"][..],
+            "fn f(&'a self, t: T, u: U) -> Option<U>",
+            "fn f(&'x self, t: u8, u: Vec<u8>) -> Option<Vec<u8>>",
+        ),
+        (
+            "a default that names a lifetime and a const",
+            "<'a, const N: usize, T = &'a [u8; N]>",
+            &["'x", "2"][..],
+            "fn f(&self, t: T)",
+            "fn f(&self, t: &'x [u8; { 2 }])",
+        ),
+        (
+            "the default is given",
+            "<T, U = Vec<T>>",
+            &["u8", "String"][..],
+            "fn f(t: T, u: U)",
+            "fn f(t: u8, u: String)",
+        ),
+        (
+            "a name that is not a parameter",
+            "<T>",
+            &["u8"][..],
+            "fn f<'b, V: 'b>(&'b self, t: T, v: V) -> Self where V: Clone",
+            "fn f<'b, V: 'b>(&'b self, t: u8, v: V) -> Self where V: Clone",
+        ),
+        (
+            "no parameters",
+            "<>",
+            &[][..],
+            "fn f<'b, V>(&'b self, v: V) -> Self",
+            "fn f<'b, V>(&'b self, v: V) -> Self",
+        ),
+    ] {
+        let sig = at_params(generics, given, written);
+        let expected: Signature = parse_str(expected).unwrap();
+        assert_eq!(s(&sig), s(&expected), "{}", case);
+    }
+}
+
+/// For names that are not shared by a lifetime and a type, `with_params()` writes what
+/// `complete_params()` and a closure over the parameters write.
+#[test]
+fn with_params_writes_what_the_closure_over_the_completed_arguments_writes() {
+    let tr: ItemTrait = parse_quote! {
+        trait Store<'a, K: 'a, const N: usize, D = Page<K>> {
+            fn get(&'a self, key: &'a K, n: [u8; N]) -> D;
+        }
+    };
+    let given = arguments(&["'static", "u8", "4"]);
+    let completed = complete_params(&tr.generics.params, &given).unwrap();
+    let mut by_closure = tr.clone();
+    let mut visitor = Substitute::new(common::answers(&tr.generics.params, &completed));
+    visitor.visit_item_trait_mut(&mut by_closure);
+    visitor.finish().unwrap();
+    let mut by_params = tr.clone();
+    let mut visitor = Substitute::with_params(&tr.generics.params, &given).unwrap();
+    visitor.visit_item_trait_mut(&mut by_params);
+    visitor.finish().unwrap();
+    assert_eq!(by_params, by_closure);
+    // The signature is written, not left as it is.
+    assert_ne!(by_params, tr);
+}
+
+#[test]
+fn with_params_fails_as_complete_params_does() {
+    // (case, the generics of the trait, the arguments given)
+    for (case, generics, given) in [
+        ("a parameter with no argument", "<T>", &[][..]),
+        ("a lifetime with no argument", "<'a, T>", &["u8"][..]),
+        ("a type for a lifetime", "<'a>", &["u8"][..]),
+        ("a lifetime for a type", "<T>", &["'a"][..]),
+        ("too many arguments", "<T>", &["u8", "u16"][..]),
+        ("a lifetime too many", "<T>", &["u8", "'a"][..]),
+        ("a type for a const", "<const N: usize>", &["Vec<u8>"][..]),
+        (
+            "an associated type of an argument that is not a name",
+            "<T, U = Option<T::Item>>",
+            &["IntoIter<u8>"][..],
+        ),
+    ] {
+        let generics: Generics = parse_str(generics).unwrap();
+        let given = arguments(given);
+        let expected = complete_params(&generics.params, &given).unwrap_err();
+        let found = match Substitute::with_params(&generics.params, &given) {
+            Ok(_) => panic!("{}: no error", case),
+            Err(error) => error,
+        };
+        assert_eq!(
+            format!("{:?}", found),
+            format!("{:?}", expected),
+            "{}",
+            case
+        );
+    }
+}
+
+/// The closure of `new()` cannot tell the kinds apart: it is asked once for `T`, whether it is
+/// `'T` or `T`, and the type that it answers does not fit the lifetime. Its parameter needs no
+/// annotation.
+#[test]
+fn new_asks_for_a_lifetime_and_a_type_of_one_name_once() {
+    let mut sig: Signature = parse_quote!(fn f(&'T self, t: T) -> &'T T);
+    let mut asked = Vec::new();
+    let mut visitor = Substitute::new(|name| {
+        asked.push(name.to_string());
+        (name == "T").then(|| parse_quote!(u8))
+    });
+    visitor.visit_signature_mut(&mut sig);
+    assert!(matches!(
+        visitor.finish(),
+        Err(EncodeError::UnexpectedArgument(_))
+    ));
+    assert_eq!(asked, ["T"]);
+}
+
+#[test]
+fn the_answers_of_with_params_are_clone_and_debug() {
+    fn is_clone_and_debug<T: Clone + std::fmt::Debug>() {}
+    is_clone_and_debug::<ByParams>();
+}
+
 // ── repeater_projection() ────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -995,10 +1283,6 @@ fn repeater_projection_writes_the_generics_of_the_entry_by_their_names() {
 // generic, so the `Context` of the entry has them (`using()`), and `repeater_projection()` encodes
 // them by their own names. A site writes the arguments it gives with `complete_params()`, which
 // takes the defaults, and `substitute_args()` (`at_site()`).
-
-fn s<T: ToTokens>(t: &T) -> String {
-    quote!(#t).to_string()
-}
 
 /// A type written as it is printed, to compare with an encoding.
 fn t(ty: Type) -> String {

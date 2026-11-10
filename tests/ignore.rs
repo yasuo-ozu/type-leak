@@ -101,7 +101,7 @@ fn live(result: &LeakerResult) -> Vec<(usize, Type)> {
 fn impls(result: &LeakerResult) -> Vec<RepeaterImpl> {
     let repeater: Path = parse_quote!(Repeater);
     let param: Ident = parse_quote!(__S);
-    let found: Vec<RepeaterImpl> = result
+    result
         .repeater_impls(
             &repeater,
             1,
@@ -109,8 +109,6 @@ fn impls(result: &LeakerResult) -> Vec<RepeaterImpl> {
             array_const,
         )
         .unwrap()
-        .collect();
-    found
 }
 
 fn copy_after(result: &LeakerResult, top: ContextId, item: &Item) -> Item {
@@ -719,7 +717,7 @@ fn errors_about_the_same_part_go_together() {
         .filter(|error| error.cause == my_type)
         .collect();
     assert_eq!(errors.len(), 2);
-    assert!(!errors[0].in_value && errors[1].in_value);
+    assert!(!errors[0].place.in_value && errors[1].place.in_value);
     let after = result.clone().ignore(errors[1]);
     assert!(after.errors().iter().all(|error| error.cause != my_type));
     // The part is whole in the signature and in the body.
@@ -897,7 +895,7 @@ fn a_removed_entry_keeps_its_place_and_the_others_keep_theirs() {
     // The others keep the primitive type of their impls, the KEY of their impls and their impls.
     let id = 1;
     let bucket =
-        |referrer: &Referrer, n: usize| referrer.bucket_self(common::entry_id_at(referrer, n), id);
+        |referrer: &Referrer, n: usize| referrer.bucket_self(id, common::entry_id_at(referrer, n));
     assert_eq!(bucket(&before, 1), bucket(&after, 0));
     assert_eq!(bucket(&before, 2), bucket(&after, 1));
     let kept: Vec<String> = impls(&result)[1..]
@@ -923,7 +921,7 @@ fn a_removed_entry_keeps_its_place_and_the_others_keep_theirs() {
     let with = |result: &LeakerResult| {
         result
             .repeater_impls(&repeater, 1, ImplSelf::Marker(&marker), array_const)
-            .map(|impls| impls.count())
+            .map(|impls| impls.len())
     };
     assert!(matches!(with(&result), Err(EncodeError::NeedsSelf(_))));
     assert_eq!(with(&removed).ok(), Some(2));
@@ -956,7 +954,7 @@ fn removing_the_only_entry_leaves_a_referrer_with_none() {
     );
     // The index of the removed entry is still one of the Referrer: `bucket_self()` is `None`.
     assert_eq!(
-        referrer.bucket_self(common::entry_id_at(&result.into_referrer(), 0), 1),
+        referrer.bucket_self(1, common::entry_id_at(&result.into_referrer(), 0)),
         None
     );
 }

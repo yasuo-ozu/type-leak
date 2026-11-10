@@ -6,26 +6,14 @@
 
 mod common;
 
+use common::{messages, s, to_syn_error};
+
 use syn::visit_mut::VisitMut;
 use syn::*;
-use template_quote::{quote, ToTokens};
+use template_quote::quote;
 use type_leak::{
-    array_const, Context, EncodeError, EntryId, ErrorItem, ImplSelf, Leaker, Reason, Referrer,
-    SelfRequirement,
+    array_const, Context, EncodeError, EntryId, ImplSelf, Leaker, Reason, Referrer, SelfRequirement,
 };
-
-fn s(x: &impl ToTokens) -> String {
-    quote!(#x).to_string()
-}
-
-/// The messages of `errors`, one on each line.
-fn messages(errors: &[ErrorItem]) -> String {
-    errors
-        .iter()
-        .map(|item| item.message.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 fn ident(name: &str) -> Ident {
     Ident::new(name, proc_macro2::Span::call_site())
@@ -200,7 +188,7 @@ fn the_self_of_a_trait_has_no_name() {
         )
     );
     // The mention of `Self` is a cause too.
-    let message = type_leak::to_syn_error(err).to_string();
+    let message = to_syn_error(err).to_string();
     assert!(message.contains("it cannot be leaked as a whole because of `Self`"));
     // The scope around goes on, with nothing recorded.
     assert_eq!(result.into_referrer().iter().count(), 0);
@@ -300,7 +288,7 @@ fn an_unnameable_self_is_reported_for_the_bound_not_the_path() {
              here: `Self` is something else in the item around"
         )
     );
-    let message = type_leak::to_syn_error(err).to_string();
+    let message = to_syn_error(err).to_string();
     assert!(
         message.starts_with(
             "the bound of `T` mentions a `Self` which has no name here\n\n  \
@@ -540,7 +528,7 @@ fn a_rewritten_bound_needs_no_self_so_a_marker_can_have_the_entry() {
     let impls = result
         .repeater_impls(&repeater, 7, ImplSelf::Marker(&marker), array_const)
         .unwrap();
-    assert_eq!(impls.count(), 1);
+    assert_eq!(impls.len(), 1);
     // Where `Self` is the struct, the bound keeps it, and a marker cannot have the entry.
     let mut leaker = Leaker::new();
     leaker.enter_type(&ident("S"), &bound(), |v| {
@@ -1023,12 +1011,22 @@ fn expand_knows_the_self_of_the_context() {
     });
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
-        s(&referrer.expand(outer, parse_quote!(Rel<T>), replace)),
+        s(&common::expand(
+            &referrer,
+            outer,
+            parse_quote!(Rel<T>),
+            replace
+        )),
         "P < 0 >"
     );
     // `Rel2<T>` is that of the nested impl, which `expand()` does not know.
     assert_eq!(
-        s(&referrer.expand(outer, parse_quote!(Rel2<T>), replace)),
+        s(&common::expand(
+            &referrer,
+            outer,
+            parse_quote!(Rel2<T>),
+            replace
+        )),
         "Rel2 < T >"
     );
 }

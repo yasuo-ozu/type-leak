@@ -34,6 +34,7 @@
 //! `pub const`.
 
 use crate::prop::{check_fn, witness_fn, Position, SelfSub};
+use crate::to_syn_error;
 use proc_macro2::{Span, TokenStream, TokenTree};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
@@ -166,16 +167,14 @@ impl ScopeInput {
         &self,
         config: A,
     ) -> std::result::Result<(LeakerResult, ContextId), Vec<ErrorItem>> {
-        let mut leaker = Leaker::from_config(config);
+        let mut leaker = Leaker::with_rule(config);
         let visit = |view: &mut View<'_, '_, A>| {
             for arguments in self.fragments() {
                 view.visit_path_arguments(arguments);
             }
         };
         let (context, ()) = match self.scope {
-            Scope::Impl => {
-                leaker.enter_impl(&self.item.generics, &self.item.self_ty, None, visit)
-            }
+            Scope::Impl => leaker.enter_impl(&self.item.generics, &self.item.self_ty, None, visit),
             Scope::Generics => leaker.enter_generics(&self.item.generics, visit),
         };
         let result = leaker.result();
@@ -234,7 +233,7 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     // `Self` is for the self type, or for a parameter bounded by the trait.
     let some_need_self = referrer
         .iter()
-        .any(|(ix, _, _)| referrer.bucket_self(ix, *id).is_none());
+        .any(|(ix, _, _)| referrer.bucket_self(*id, ix).is_none());
     crate::check_bucket_self(
         &referrer,
         *id,
@@ -245,7 +244,7 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
             slot_const(&repeater),
         ),
     )?;
-    let targets: Vec<_> = if some_need_self {
+    let targets = if some_need_self {
         result
             .repeater_impls(
                 &repeater,
@@ -254,7 +253,6 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
                 slot_const(&repeater),
             )
             .map_err(Error::from)?
-            .collect()
     } else {
         result
             .repeater_impls(
@@ -264,7 +262,6 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
                 slot_const(&repeater),
             )
             .map_err(Error::from)?
-            .collect()
     };
     for r in targets {
         let tokens = r.to_token_stream();
@@ -455,7 +452,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     let error = std::cell::RefCell::new(None);
     let project = |self_ty: Option<&Type>, ix: EntryId, entry: &Context| -> Type {
         let result = (|| -> Result<Type> {
-            let owner: Type = if referrer.bucket_self(ix, id).is_none() {
+            let owner: Type = if referrer.bucket_self(id, ix).is_none() {
                 self_ty
                     .cloned()
                     .ok_or_else(|| Error::new(Span::call_site(), "the self type names `Self`"))?
@@ -481,8 +478,9 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     referrer
         .visitor(context, |_leaked, ix, entry| project(None, ix, entry))
         .visit_type_mut(&mut self_ty);
-    let mut visitor =
-        referrer.visitor(context, |_leaked, ix, entry| project(Some(&self_ty), ix, entry));
+    let mut visitor = referrer.visitor(context, |_leaked, ix, entry| {
+        project(Some(&self_ty), ix, entry)
+    });
     let mut types = types;
     for ty in &mut types {
         visitor.visit_type_mut(ty);

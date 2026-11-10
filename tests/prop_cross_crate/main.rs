@@ -111,12 +111,13 @@
 //!   the header of a trait or an impl, not as the bounded type), `SelfInImplSelfType`
 //!   `impl_header_self` (the generics or the where clause of an impl name `Self`), `Unreadable`
 //!   `unreadable_value` (a glob import or a `macro_rules!` in a body, with `values`),
-//!   `NestedSelfInBounds` `nested_self_in_bounds` (the shape of `self_bound_adts` without the
-//!   option; the Leaker must reject it) or `nested_self_in_bounds_text` (a bound that names `Self`
-//!   in an item nested in `enter_mod` without the option), a cause of the kind `Macro` `macro_path`,
-//!   a path that holds an array whose length is a macro call `macro_call`, and `Rl<'_>`
-//!   `elided_arg`. Items with the option off are rejected if they have the shape, and with it on
-//!   no rejection has a tag, so a `NestedSelfInBounds` with the option on fails the run.
+//!   `NestedSelfInBounds` `nested_self_in_bounds` (the shape of `self_bound_adts` where the macro
+//!   does not allow the risk, `nested_self_entries` off; the Leaker must reject it) or
+//!   `nested_self_in_bounds_text` (a bound that names `Self` in an item nested in `enter_mod`
+//!   without it), a cause of the kind `Macro` `macro_path`, a path that holds an array whose
+//!   length is a macro call `macro_call`, and `Rl<'_>` `elided_arg`. Items with the risk not
+//!   allowed are rejected if they have the shape, and with it allowed no rejection has a tag, so a
+//!   `NestedSelfInBounds` that the macro allowed fails the run.
 //!
 //! What a Leaker leaks is read from the text and from the settings of the Leaker's crate
 //! (`Gen::names_leaked_type()`: a relative path, `Self`, a path of `std` or of the Leaker's crate
@@ -177,9 +178,9 @@
 //! # The copies that do not compile are explained
 //!
 //! A copy of an item accepted by `allow()` may not build, for the failures that `accept_families()`
-//! lists (i, ii and iii, described there), and the test explains each failure the way it explains a
+//! lists (i and ii, described there), and the test explains each failure the way it explains a
 //! rejection (`unexplained_accept()`): the diagnostic is one of the listed failures, if its error
-//! code (`E0277`, `E0106`), the errors that were allowed (their `Reason` and the kind and tokens of
+//! code (`E0277`), the errors that were allowed (their `Reason` and the kind and tokens of
 //! their cause) and the shapes of the item (its tags) say so. The failure is counted and is no
 //! failure of the run. Anything else fails the run: "ACCEPT: NOT A KNOWN FAILURE" for a diagnostic
 //! that no listed failure explains, and "ACCEPT: NO SHAPE THAT GIVES IT" for a listed one on an item
@@ -338,7 +339,8 @@
 //!
 //! A fifth of the traits analyzed one by one have parameters with defaults that use a parameter with
 //! a bound (`trait Tr<T: AsRef<Self>, U = Rel<T>>`, `trait_self_defaults` below, F39). The bound
-//! names the trait's `Self` in seven of ten, and the rest is the control (`T: Clone`). Those
+//! names the trait's `Self` in 58%, and the rest is the control (`T: Clone`; the shape draws 70%,
+//! and only a nested trait or one of the 70% of the items where `Self` is common may name it). Those
 //! traits are nested in `enter_mod` in 45% (the Visitor writes the default through the host,
 //! `with_nested_self()`), and analyzed as the item itself by `intern_trait` or `enter_trait`
 //! otherwise (the Visitor finds the default without `Self`, and the macro picks the host as the
@@ -394,7 +396,8 @@
 //!   `nested_self` (F36: a struct, an enum, a union or a trait analyzed nested in `enter_mod` that
 //!   names its own `Self`, which the Visitor writes with `with_nested_self()`; F37: an entry that
 //!   does not name it, and uses a generic whose bound does, is for any type, and the macro passes
-//!   the copy's own type; one that names it too is rejected; F38: an absolute type that names it
+//!   the copy's own type; one that names it too is the `NestedSelfInBounds` risk, an error unless
+//!   the macro allows it; F38: an absolute type that names it
 //!   is no entry, so the copy writes it as it is, with the copy's own `Self`),
 //!   `trait_self_defaults` (F39: a trait whose parameter defaults use a generic whose bound names
 //!   the trait's `Self`, `trait Tr<T: AsRef<Self>, U = Rel<T>>`, nested in `enter_mod`, where the
@@ -405,9 +408,9 @@
 //!   whose bound names its own `Self` and a default that uses it; the Leaker must accept it, which
 //!   `unexplained()` checks) and `nested_self_entries` (F42: the macro asks for
 //!   `nested_self_entries` for half of the items nested in `enter_mod`, and those of
-//!   `self_bound_adts` have a field that names `Self` in a relative type: without the option the
-//!   Leaker rejects it with `NestedSelfInBounds`, which `unexplained()` requires, and the option
-//!   makes it accept it),
+//!   `self_bound_adts` have a field that names `Self` in a relative type: the Leaker reports
+//!   `NestedSelfInBounds` for it, which stays (and `unexplained()` requires it) unless the macro
+//!   allows it, as the option does),
 //!   `path_named_like_generic` (`self::U` next to a generic `U`), `declared_named_like_generic` (a
 //!   module that declares `X`, and `crate::base::B1<X>` in `fn f<X>`) and
 //!   `bare_const_in_absolute_path` (a bare `ILEN` next to a leaked argument in a
@@ -1861,8 +1864,9 @@ fn family(error: &Rejection) -> Option<Family> {
             &[gen::TAG_IMPL_HEADER_SELF],
         ),
         // The same fault in a struct, an enum or a union nested in `enter_mod`, analyzed without
-        // `nested_self_entries`: the item wrote a type that names `Self` and a generic whose bound
-        // does (`gen::TAG_NESTED_SELF_BOUNDS`, put only where the option is off).
+        // The same fault in a struct, an enum or a union nested in `enter_mod`, where the macro
+        // does not allow it (`nested_self_entries` off): the item wrote a type that names `Self`
+        // and a generic whose bound does (`gen::TAG_NESTED_SELF_BOUNDS`, put only there).
         "NestedSelfInBounds" => family_of(
             "a type that names the `Self` of a nested item and uses a generic whose bound names it, without nested_self_entries",
             &[gen::TAG_NESTED_SELF_BOUNDS, gen::TAG_NESTED_SELF_TEXT],
@@ -1904,11 +1908,7 @@ fn maybe_const_family(error: &Rejection) -> Option<Family> {
             gen::TAG_ELIDED_ARG,
         ]
     } else {
-        &[
-            gen::TAG_SELF_ASSOC,
-            gen::TAG_SELF_IN_BOUNDS,
-            gen::TAG_BOUND_CYCLE,
-        ]
+        &[gen::TAG_SELF_ASSOC, gen::TAG_BOUND_CYCLE]
     };
     family_of(
         "a bare name that may be a const, in a type that cannot be leaked as a whole",
@@ -6817,7 +6817,6 @@ mod checks {
     fn a_failure_of_an_accepted_copy_needs_a_documented_class_and_a_shape() {
         let unprovable_assoc = allowed_report(vec![allowed("UnprovableBound", "Self :: A0")]);
         let unprovable_self = allowed_report(vec![allowed("UnprovableBound", "Self")]);
-        let relative_self = allowed_report(vec![allowed("RelativePath", "Self")]);
         let classify = |tags_of: &[&str], codes: &[&str], report: &Report| {
             unexplained_accept(&tags(tags_of), codes, report)
         };
@@ -6855,18 +6854,11 @@ mod checks {
         assert!(classify(&["alias_bound"], &["E0277"], &unprovable_self).is_err());
         // Anything else is not a known failure: the lifetime that E0195 was about, another code, an
         // error that was not allowed, every diagnostic of the item counts.
-        let all = &[
-            "bound_cycle",
-            "self_in_predicate",
-            "alias_bound",
-            "hidden_self",
-        ];
+        let all = &["bound_cycle", "self_in_predicate", "alias_bound"];
         let unconstrained = allowed_report(vec![allowed("UnconstrainedLifetime", "Wrap < 'b >")]);
         for (codes, report) in [
             (&["E0195"][..], &unconstrained),
             (&["E0308"][..], &unprovable_assoc),
-            (&["E0277"][..], &relative_self),
-            (&["E0106"][..], &relative_self),
             (&["E0277"][..], &allowed_report(Vec::new())),
             (&["E0277", "E0425"][..], &unprovable_assoc),
         ] {
@@ -6906,18 +6898,14 @@ mod checks {
         for seed in 0..40 {
             let case = generate_with(seed, 0, 6, Features::parse(""), Flags::default());
             for item in &case.items {
-                for tag in [
-                    gen::TAG_SELF_IN_PREDICATE,
-                    gen::TAG_ALIAS_BOUND,
-                    gen::TAG_HIDDEN_SELF,
-                ] {
+                for tag in [gen::TAG_SELF_IN_PREDICATE, gen::TAG_ALIAS_BOUND] {
                     if item.tags.contains(tag) {
                         found.insert(tag);
                     }
                 }
             }
         }
-        assert_eq!(found.len(), 3, "{:?}", found);
+        assert_eq!(found.len(), 2, "{:?}", found);
     }
 
     #[test]

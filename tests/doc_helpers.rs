@@ -27,8 +27,7 @@ fn repeater_impl_pieces_make_the_impl_and_name_its_module() {
     let r = result
         .repeater_impls(&repeater, 7, ImplSelf::Param(&param), slot_const(&repeater))
         .unwrap()
-        .next()
-        .unwrap();
+        .remove(0);
     // `r.path` has no `KEY`, and `ToTokens` writes the one of the id 7.
     let key = repeater_key(7, r.entry);
     let imp: ItemImpl = parse_quote!(#r);
@@ -144,7 +143,7 @@ fn bucket_self_is_none_for_self_in_the_type_or_in_its_context() {
         common::entry_id_at(&referrer, wrap),
         common::entry_id_at(&referrer, rel),
     );
-    assert!(referrer.bucket_self(wrap, 7).is_none() && referrer.bucket_self(rel, 7).is_none());
+    assert!(referrer.bucket_self(7, wrap).is_none() && referrer.bucket_self(7, rel).is_none());
 
     let mut leaker = Leaker::new();
     leaker.intern_trait(&parse_quote!(
@@ -154,7 +153,7 @@ fn bucket_self_is_none_for_self_in_the_type_or_in_its_context() {
     ));
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer
-        .bucket_self(common::entry_id_at(&referrer, 0), 7)
+        .bucket_self(7, common::entry_id_at(&referrer, 0))
         .is_some());
 }
 
@@ -181,26 +180,24 @@ fn bucket_self_is_a_primitive_unless_the_entry_needs_self() {
 
     // `Wrap<T>` does not name `Self`: a primitive type, and no `__S`.
     let bucket = referrer
-        .bucket_self(common::entry_id_at(&referrer, wrap), 7)
+        .bucket_self(7, common::entry_id_at(&referrer, wrap))
         .unwrap();
     let r = result
         .repeater_impls(&parse_quote!(crate::Repeater), 7, target, array_const)
         .unwrap()
-        .nth(wrap)
-        .unwrap();
+        .remove(wrap);
     assert_eq!(r.self_ty, bucket);
     assert_eq!(r.generics, parse_quote!(<T>));
 
     // `Wrap2<Self>` does: the implementors of the trait, as with `ImplSelf::Param`.
     assert_eq!(
-        referrer.bucket_self(common::entry_id_at(&referrer, wrap2), 7),
+        referrer.bucket_self(7, common::entry_id_at(&referrer, wrap2)),
         None
     );
     let r = result
         .repeater_impls(&parse_quote!(crate::Repeater), 7, target, array_const)
         .unwrap()
-        .nth(wrap2)
-        .unwrap();
+        .remove(wrap2);
     assert_eq!(r.self_ty, parse_quote!(__S));
 }
 
@@ -296,10 +293,9 @@ fn repeater_slots_encode_the_consts_of_the_impl_and_of_the_use_site() {
     let r = result
         .repeater_impls(&repeater, 7, ImplSelf::Param(&param), slot_const(&repeater))
         .unwrap()
-        .next()
-        .unwrap();
+        .remove(0);
     assert_eq!(
-        r.args,
+        common::impl_args(&r),
         parse_quote!((
             *const dyn crate::Repeater<(), 0, B, Type = ()>,
             *const dyn crate::Repeater<(), 0, false, C, Type = ()>
@@ -378,8 +374,7 @@ fn impl_self_marker_fails_the_call_if_an_entry_names_self() {
             array_const,
         )
         .unwrap()
-        .next()
-        .unwrap();
+        .remove(0);
     assert_eq!(r.self_ty, marker);
     // `Wrap2<Self>` does: it is for the implementors of the trait, so a marker will not do, and the
     // call fails for it.
@@ -402,8 +397,7 @@ fn impl_self_marker_fails_the_call_if_an_entry_names_self() {
             array_const,
         )
         .unwrap()
-        .nth(wrap2)
-        .unwrap();
+        .remove(wrap2);
     assert_eq!(
         r.generics.params.last().unwrap(),
         &parse_quote!(__S: ?::core::marker::Sized + Tr<T>)
@@ -506,6 +500,7 @@ fn repeater_impl_for_each_entry_of_a_trait() {
             slot_const(&repeater),
         )
         .unwrap()
+        .into_iter()
         .map(|r| parse_quote!(#r))
         .collect();
     let (rel_ix, wrap2_ix) = (

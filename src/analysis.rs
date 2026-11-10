@@ -62,8 +62,8 @@ pub struct CheckResult {
     /// consts](crate::Leaker#bare-identifiers-and-consts)).
     pub is_own: bool,
     /// `true` if the type is an optional entry: it has no cause of its own, and its own path names
-    /// an external crate (`::path::X`), which the Referrer may not share. `must` holds only its
-    /// parts. See [`Allow`](crate::Allow).
+    /// another crate (`::path::X`). It is an entry unless a rule allows the path
+    /// ([`Allow`](crate::Allow)). `must` holds only its parts.
     pub optional: bool,
     /// Explains the conflict if the causes do not (why `Self` cannot be leaked, or has no meaning).
     /// Reported first.
@@ -85,8 +85,7 @@ pub struct CheckResult {
     /// The number of mentions of `Self` without meaning found when this conflict was recorded, to
     /// report them among the conflicts in the order found ([`scope_error()`]).
     pub(crate) seen: usize,
-    /// Where the conflict was found: in a value, in a default ([`ErrorItem::in_value`],
-    /// [`ErrorItem::in_default`]). Set where it is recorded as an error.
+    /// Where the conflict was found ([`ErrorItem::place`]). Set where it is recorded as an error.
     pub(crate) place: Place,
     /// The relative paths that the copy writes as they are, with their kinds and without their
     /// arguments: the heads of the type that conflicts ([`ErrorItem::paths`]).

@@ -8,25 +8,14 @@
 
 mod common;
 
+use common::{messages, s, to_syn_error};
+
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
 
-fn s<T: ToTokens>(t: &T) -> String {
-    quote!(#t).to_string()
-}
-
 fn t(ty: Type) -> String {
     s(&ty)
-}
-
-/// The messages of the errors, one per line.
-fn messages(errors: &[ErrorItem]) -> String {
-    errors
-        .iter()
-        .map(|item| item.message.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn repeater() -> Path {
@@ -45,7 +34,7 @@ fn analyze(item: &Item) -> (Referrer, ContextId) {
 
 /// The same, with the result that writes the impls.
 fn analyze_result(item: &Item) -> (LeakerResult, ContextId) {
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::with_rule(config());
     let context = match item {
         Item::Struct(i) => leaker.intern_struct(i),
         Item::Enum(i) => leaker.intern_enum(i),
@@ -136,7 +125,7 @@ fn the_entries_that_depend_on_the_context_come_first() {
             d: ::bar::Y,
         }
     );
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::with_rule(config());
     leaker.intern_struct(&item);
     let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
@@ -171,13 +160,13 @@ fn a_referrer_with_no_entry_is_empty() {
     );
     // A Leaker that allows the crates finds no entry.
     let rules = config().external_crates();
-    let mut leaker = Leaker::from_config(rules);
+    let mut leaker = Leaker::with_rule(rules);
     leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer.is_empty());
     assert_eq!(referrer.iter().count(), 0);
     // The default one finds the type of the other crate.
-    let mut leaker = Leaker::from_config(config());
+    let mut leaker = Leaker::with_rule(config());
     leaker.intern_struct(&item);
     let referrer = leaker.result().finish().unwrap();
     assert!(!referrer.is_empty());
@@ -193,7 +182,7 @@ fn assert_declares_nothing(r: &RepeaterImpl) {
         .where_clause
         .as_ref()
         .map_or(true, |clause| clause.predicates.is_empty()));
-    assert_eq!(s(&r.args), "()");
+    assert_eq!(s(&common::impl_args(r)), "()");
     assert!(r.module.is_none());
 }
 
@@ -238,8 +227,7 @@ fn a_trait_with_only_external_types_has_entries_that_declare_nothing_for_a_marke
                 slot_const(&repeater()),
             )
             .unwrap()
-            .nth(ix)
-            .unwrap();
+            .remove(ix);
         assert_declares_nothing(&r);
         assert_eq!(s(&r.self_ty), "__Marker");
         assert_eq!(s(&r.ty), s(ty));
@@ -307,8 +295,7 @@ fn repeater_impl_for_an_entry_that_does_not_name_self() {
             array_const,
         )
         .unwrap()
-        .nth(wrap)
-        .unwrap();
+        .remove(wrap);
     assert_eq!(
         with_where(&r.generics),
         with_where(&parse_quote!(
@@ -316,7 +303,10 @@ fn repeater_impl_for_an_entry_that_does_not_name_self() {
         ))
     );
     assert_eq!(s(&r.self_ty), "__S");
-    assert_eq!(s(&r.args), t(parse_quote!((&'a (), T, U, &'a T, &'a U))));
+    assert_eq!(
+        s(&common::impl_args(&r)),
+        t(parse_quote!((&'a (), T, U, &'a T, &'a U)))
+    );
     assert_eq!(s(&r.ty), "& 'a Wrap < T , U >");
     assert_eq!(r.module, None);
     // For a marker, nothing else is declared.
@@ -329,14 +319,16 @@ fn repeater_impl_for_an_entry_that_does_not_name_self() {
             array_const,
         )
         .unwrap()
-        .nth(wrap)
-        .unwrap();
+        .remove(wrap);
     assert_eq!(
         with_where(&r.generics),
         with_where(&parse_quote!(<'a, T: Clone, U: Into<T>>))
     );
     assert_eq!(s(&r.self_ty), "crate :: Marker");
-    assert_eq!(s(&r.args), t(parse_quote!((&'a (), T, U, &'a T, &'a U))));
+    assert_eq!(
+        s(&common::impl_args(&r)),
+        t(parse_quote!((&'a (), T, U, &'a T, &'a U)))
+    );
     // An entry of a context with no generics: nothing is declared.
     let rel = common::types(&referrer)
         .position(|ty| s(ty) == "Rel")
@@ -349,8 +341,7 @@ fn repeater_impl_for_an_entry_that_does_not_name_self() {
             array_const,
         )
         .unwrap()
-        .nth(rel)
-        .unwrap();
+        .remove(rel);
     assert_declares_nothing(&r);
     assert_eq!(s(&r.ty), "Rel");
 }
@@ -377,8 +368,7 @@ fn repeater_impl_for_the_implementor_of_a_trait() {
             array_const,
         )
         .unwrap()
-        .nth(wrap)
-        .unwrap();
+        .remove(wrap);
     assert_eq!(
         with_where(&r.generics),
         with_where(&parse_quote!(<'a, T, __Impl: ?::core::marker::Sized + Tr<'a, T>>))
@@ -414,8 +404,7 @@ fn repeater_impl_for_the_implementor_of_a_trait() {
             array_const,
         )
         .unwrap()
-        .nth(rel)
-        .unwrap();
+        .remove(rel);
     let clause = r.generics.where_clause.as_ref().unwrap();
     assert_eq!(
         s(&clause.predicates.first().unwrap()),
@@ -443,11 +432,13 @@ fn repeater_impl_for_a_type_is_for_the_type() {
             array_const,
         )
         .unwrap()
-        .nth(rel)
-        .unwrap();
+        .remove(rel);
     assert_eq!(s(&r.self_ty), "S < 'a , T >");
     assert_eq!(with_where(&r.generics), with_where(&parse_quote!(<'a, T>)));
-    assert_eq!(s(&r.args), t(parse_quote!((&'a (), T, &'a T, &'a Self))));
+    assert_eq!(
+        s(&common::impl_args(&r)),
+        t(parse_quote!((&'a (), T, &'a T, &'a Self)))
+    );
     assert_eq!(s(&r.ty), "& 'a Rel < Self >");
     // It cannot be for a marker: the call fails for `rel`, the only entry that names `Self`.
     let marker: Type = parse_quote!(crate::Marker);
@@ -475,8 +466,7 @@ fn repeater_impl_for_a_type_is_for_the_type() {
             array_const,
         )
         .unwrap()
-        .nth(wrap)
-        .unwrap();
+        .remove(wrap);
     assert_eq!(s(&r.self_ty), "__S");
 }
 
@@ -494,6 +484,7 @@ fn repeater_impl_in_a_module_tells_the_module() {
             array_const,
         )
         .unwrap()
+        .into_iter()
         .map(|r| r.module)
         .collect();
     assert_eq!(modules.len(), 2);
@@ -529,9 +520,8 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
             array_const,
         )
         .unwrap()
-        .next()
-        .unwrap();
-    assert_eq!(s(&r.args), t(parse_quote!(([(); N],))));
+        .remove(0);
+    assert_eq!(s(&common::impl_args(&r)), t(parse_quote!(([(); N],))));
     let params: punctuated::Punctuated<GenericParam, Token![,]> = parse_quote!(const N: usize);
     let values: Vec<GenericArgument> = vec![parse_quote!(3)];
     // The same closure encodes the parameter in the impl and in the projection.
@@ -548,9 +538,8 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
             &mut encode,
         )
         .unwrap()
-        .next()
-        .unwrap();
-    assert_eq!(s(&r.args), t(parse_quote!((Const<N>,))));
+        .remove(0);
+    assert_eq!(s(&common::impl_args(&r)), t(parse_quote!((Const<N>,))));
     let first = common::entry_id_at(&referrer, 0);
     let args = common::repeater_args(
         common::entry(&referrer, first.index()),
@@ -560,13 +549,11 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
     )
     .unwrap();
     assert_eq!(s(&args), t(parse_quote!((Const<3>,))));
-    // The call checks the parameter before it iterates, the item encodes it again, and so does the
-    // projection: the closure always gets the parameter (`N`), and the argument of the site is
-    // written afterwards.
+    // The call encodes the parameter once, and so does the projection: the closure always gets the
+    // parameter (`N`), and the argument of the site is written afterwards.
     assert_eq!(
         *calls.borrow(),
         [
-            ("N".to_string(), "usize".to_string()),
             ("N".to_string(), "usize".to_string()),
             ("N".to_string(), "usize".to_string())
         ]
@@ -609,8 +596,7 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
     let r = result
         .repeater_impls(&repeater, 7, ImplSelf::Param(&param), slot_const(&repeater))
         .unwrap()
-        .next()
-        .unwrap();
+        .remove(0);
     let args = common::repeater_args(
         common::entry(&referrer, 0),
         common::identity,
@@ -618,7 +604,7 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
         slot_const(&repeater),
     )
     .unwrap();
-    assert_eq!(s(&r.args), s(&args));
+    assert_eq!(s(&common::impl_args(&r)), s(&args));
     assert_eq!(
         s(&args),
         t(parse_quote!((
@@ -627,11 +613,10 @@ fn const_parameters_are_encoded_by_the_closure_or_as_array_lengths() {
     );
 }
 
-/// The call of `repeater_impls()` makes every check before it returns, and iterates lazily: it
-/// calls `const_fn` once for each const parameter of each entry, in order, and stops at the first
-/// error. The items call `const_fn` again, as you take them.
+/// `const_fn` is called once for each const parameter of each entry, in order, and the call stops
+/// at the first error.
 #[test]
-fn repeater_impls_checks_the_const_parameters_before_it_iterates() {
+fn repeater_impls_calls_const_fn_once_for_each_const_parameter() {
     let (result, _) = analyze_result(&parse_quote! {
         trait Tr<const N: usize, const M: usize> {
             fn f(&self) -> Wrap<N>;
@@ -661,19 +646,24 @@ fn repeater_impls_checks_the_const_parameters_before_it_iterates() {
         Err(EncodeError::UnsupportedConstType(_))
     ));
     assert_eq!(*calls.borrow(), ["N", "M"]);
-    // No error: all the parameters are checked, and no item is made until it is taken.
+    // An error of the first entry stops the call: `M` is not asked.
     calls.borrow_mut().clear();
-    let mut impls = result
+    let result_for_n =
+        result.repeater_impls(&repeater, 7, ImplSelf::Param(&param), encode(Some("N")));
+    assert!(matches!(
+        result_for_n,
+        Err(EncodeError::UnsupportedConstType(_))
+    ));
+    assert_eq!(*calls.borrow(), ["N"]);
+    // No error: each parameter is asked once, and the impls are made.
+    calls.borrow_mut().clear();
+    let impls = result
         .repeater_impls(&repeater, 7, ImplSelf::Param(&param), encode(None))
         .unwrap();
     assert_eq!(*calls.borrow(), ["N", "M"]);
-    let first = impls.next().unwrap();
-    assert_eq!(s(&first.ty), "Wrap < N >");
-    assert_eq!(*calls.borrow(), ["N", "M", "N"]);
-    let second = impls.next().unwrap();
-    assert_eq!(s(&second.ty), "Wrap2 < M >");
-    assert_eq!(*calls.borrow(), ["N", "M", "N", "M"]);
-    assert!(impls.next().is_none());
+    assert_eq!(impls.len(), 2);
+    assert_eq!(s(&impls[0].ty), "Wrap < N >");
+    assert_eq!(s(&impls[1].ty), "Wrap2 < M >");
 }
 
 /// The error for a marker comes first: the call makes no call of `const_fn` then.
@@ -719,37 +709,6 @@ fn repeater_impls_checks_a_marker_before_the_const_parameters() {
         assert!(matches!(error, EncodeError::UnsupportedConstType(_)));
     }
     assert_eq!(calls.get(), 2);
-}
-
-/// `const_fn` must give the same answer every time: the items call it again, and panic if it fails
-/// where it did not.
-#[test]
-#[should_panic(expected = "`const_fn` of `repeater_impls()` failed for the entry 0")]
-fn repeater_impls_panics_if_const_fn_changes_its_answer() {
-    let (result, _) = analyze_result(&parse_quote! {
-        trait Tr<const N: usize> { fn f(&self) -> Wrap<N>; }
-    });
-    let param: Ident = parse_quote!(__S);
-    let repeater = repeater();
-    let mut calls = 0;
-    let impls = result
-        .repeater_impls(
-            &repeater,
-            7,
-            ImplSelf::Param(&param),
-            move |_: &Expr, param: &ConstParam| {
-                calls += 1;
-                if calls == 1 {
-                    Ok(parse_quote!([(); 0]))
-                } else {
-                    Err(EncodeError::UnsupportedConstType(Box::new(
-                        param.ty.clone(),
-                    )))
-                }
-            },
-        )
-        .unwrap();
-    for _ in impls {}
 }
 
 /// Asserts that `generics` are declared in the order that every rustc accepts: the lifetimes, then
@@ -821,7 +780,7 @@ fn the_tokens_of_a_repeater_impl_are_the_impl_written_by_hand() {
                 for r in impls {
                     let what = format!("{}: {} {:?}", s(&item), r.entry, target);
                     let (impl_generics, _, where_clause) = r.generics.split_for_impl();
-                    let (args, key) = (&r.args, repeater_key(5, r.entry));
+                    let (args, key) = (common::impl_args(&r), repeater_key(5, r.entry));
                     let path: Path = parse_quote!(#repeater<#args, #key>);
                     let (self_ty, ty) = (&r.self_ty, &r.ty);
                     let by_hand = quote! {
@@ -1013,8 +972,7 @@ fn the_impl_of_an_entry_that_needs_self_outlives_encodes_the_bound_and_never_dec
         let r = result
             .repeater_impls(&repeater(), 7, ImplSelf::Param(&param), array_const)
             .unwrap()
-            .next()
-            .unwrap();
+            .remove(0);
         assert_eq!(
             declared(&r.generics),
             "< 'a , T , __S : ? :: core :: marker :: Sized + Tr > where __S : :: core :: marker :: Sized",
@@ -1022,7 +980,7 @@ fn the_impl_of_an_entry_that_needs_self_outlives_encodes_the_bound_and_never_dec
             what
         );
         assert_eq!(
-            s(&r.args),
+            s(&common::impl_args(&r)),
             t(parse_quote!((&'a (), T, &'a T, &'a __S))),
             "{}",
             what
@@ -1098,11 +1056,10 @@ fn the_impl_declares_the_generics_but_the_bounds_that_the_argument_encodes() {
         let r = result
             .repeater_impls(&repeater(), 7, ImplSelf::Marker(&marker), array_const)
             .unwrap()
-            .next()
-            .unwrap();
+            .remove(0);
         assert_eq!(declared(&r.generics), expected, "{}", what);
         // The argument has an element for each parameter, then one for each bound dropped.
-        let extra = elements(&r.args) - context.generics.params.len();
+        let extra = elements(&common::impl_args(&r)) - context.generics.params.len();
         let dropped = lifetime_bounds(&context.generics) - lifetime_bounds(&r.generics);
         assert_eq!(extra, dropped, "{}", what);
         // Nothing is left to encode in what is declared: a context that has it as its generics
@@ -1139,14 +1096,19 @@ fn the_generics_of_a_top_level_context_are_those_of_the_call() {
         "< 'a , T : 'a >"
     );
     let marker: Type = parse_quote!(crate::Marker);
-    let impls: Vec<RepeaterImpl> = result
+    let impls = result
         .repeater_impls(&repeater(), 7, ImplSelf::Marker(&marker), array_const)
-        .unwrap()
-        .collect();
+        .unwrap();
     assert_eq!(declared(&impls[all].generics), "< 'a , T >");
     assert_eq!(declared(&impls[rel].generics), "< 'a , T >");
-    assert_eq!(s(&impls[all].args), t(parse_quote!((&'a (), T))));
-    assert_eq!(s(&impls[rel].args), t(parse_quote!((&'a (), T, &'a T))));
+    assert_eq!(
+        s(&common::impl_args(&impls[all])),
+        t(parse_quote!((&'a (), T)))
+    );
+    assert_eq!(
+        s(&common::impl_args(&impls[rel])),
+        t(parse_quote!((&'a (), T, &'a T)))
+    );
 }
 
 /// The top-level context that the Leaker returns, and the Referrer, reach the Referrer's side as
@@ -1231,9 +1193,25 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
         )))
     );
 
-    // The arguments fit the context of every entry.
-    for (_, _, context) in parsed.iter() {
-        common::generic_args(&context.generics, site()).unwrap();
+    // The other entries have the arguments for their own generics, which are fewer.
+    let rows: [(&str, &[&str]); 3] = [
+        ("Rel < 'a , T >", &["'q", "u16"]),
+        ("Wrap < N >", &["3"]),
+        (
+            "All < 'a , N , T , U >",
+            &["'q", "u16", ":: core :: primitive :: u8", "3"],
+        ),
+    ];
+    assert_eq!(parsed.iter().count(), rows.len());
+    for (entry, expected) in rows {
+        let (_, _, context) = parsed.iter().find(|(_, ty, _)| s(*ty) == entry).unwrap();
+        let args = common::generic_args(&context.generics, site()).unwrap();
+        assert_eq!(
+            args.iter().map(s).collect::<Vec<_>>(),
+            expected,
+            "{}",
+            entry
+        );
     }
 }
 
@@ -1264,7 +1242,7 @@ fn the_pieces_of_every_repeater_impl_agree_with_the_entry_and_its_projection() {
                 slot_const(&repeater),
             )
             .unwrap_or_else(|e| panic!("{}: {}", s(&item), e));
-        for (n, r) in impls.enumerate() {
+        for (n, r) in impls.into_iter().enumerate() {
             let (entry, ty, context) = referrer.iter().nth(n).unwrap();
             let what = format!("{}: {}", s(&item), s(ty));
             assert_eq!(r.entry, entry, "{}", what);
@@ -1277,9 +1255,8 @@ fn the_pieces_of_every_repeater_impl_agree_with_the_entry_and_its_projection() {
             };
             assert_eq!(s(&r.self_ty), self_ty, "{}", what);
 
-            // The argument is the projection's, and the path has it and no key.
+            // The path has the argument of the projection and no key.
             let args = projected(context, entry, &self_in_impl);
-            assert_eq!(s(&r.args), s(&args), "{}", what);
             let path: Path = parse_quote!(#repeater<#args>);
             assert_eq!(s(&r.path), s(&path), "{}", what);
 
@@ -1350,7 +1327,7 @@ fn the_pieces_of_every_repeater_impl_agree_with_the_entry_and_its_projection() {
                 .filter(|lifetime| lifetimes.contains(lifetime))
                 .count();
             assert_eq!(
-                elements(&r.args) - context.generics.params.len(),
+                elements(&common::impl_args(&r)) - context.generics.params.len(),
                 lifetime_bounds(&context.generics) - lifetime_bounds(&r.generics) + self_elements,
                 "{}",
                 what
@@ -1363,44 +1340,75 @@ fn the_pieces_of_every_repeater_impl_agree_with_the_entry_and_its_projection() {
 
 /// The arguments of the Repeater for an entry at a site are the projection's, with the names that
 /// the site answers replaced: where it answers none (the scope of the analysis) they are the impl's
-/// own arguments, for every entry of every sample; where it answers the generics of the item, and
-/// `Self` is the host, they are the arguments for it, which are written here for some entries.
+/// own arguments, and where it answers the generics of the item, and `Self` is the host, they are
+/// the arguments for it. Both are written here, for some entries.
 #[test]
 fn the_arguments_at_a_site_are_the_projection_with_the_names_of_the_site_replaced() {
-    let self_param: Ident = parse_quote!(__S);
-    let mut checked = 0;
-    for item in samples() {
-        let (result, _) = analyze_result(&item);
-        let referrer = result.clone().into_referrer();
-        let repeater = repeater();
-        let impls: Vec<RepeaterImpl> = result
-            .repeater_impls(
-                &repeater,
-                7,
-                ImplSelf::Param(&self_param),
-                slot_const(&repeater),
-            )
-            .unwrap()
-            .collect();
-        for (n, r) in impls.iter().enumerate() {
-            let (_, ty, context) = referrer.iter().nth(n).unwrap();
-            // The same as the impl, for the generics by their own names.
-            let self_in_impl: Type = match context.self_ty.as_ref() {
-                Some(SelfRequirement::Type(_)) => parse_quote!(Self),
-                _ => parse_quote!(#self_param),
-            };
-            let got = common::repeater_args(
-                context,
-                common::identity,
-                Some(&self_in_impl),
-                slot_const(&repeater),
-            )
+    // The scope of the analysis: a lifetime is `&'a ()`, a type is itself or, if it is `?Sized`,
+    // `*const T`, a const is `[(); N]` or a slot of the Repeater, `T: 'a` is `&'a T`, and `Self:
+    // 'a` is `&'a` and the host.
+    let own_host: Type = parse_quote!(__S);
+    let scope_rows: Vec<(Item, &str, &str)> = vec![
+        (
+            parse_quote!(
+                trait Tr<'a, T: 'a, const N: usize> {
+                    fn f(&self, x: &'a Wrap<T, N>);
+                }
+            ),
+            "& 'a Wrap < T , N >",
+            "(&'a (), T, [(); N], &'a T)",
+        ),
+        (
+            parse_quote!(
+                struct S<T: ?Sized, const N: u8>(Wrap<T, N>);
+            ),
+            "Wrap < T , N >",
+            "(*const T, *const dyn crate::Repeater<(), 0, false, '\\0', N, Type = ()>)",
+        ),
+        (
+            parse_quote!(
+                trait Tr<const B: bool> {
+                    fn f(&self) -> Wrap<B>;
+                }
+            ),
+            "Wrap < B >",
+            "(*const dyn crate::Repeater<(), 0, B, Type = ()>,)",
+        ),
+        (
+            parse_quote!(
+                struct S<'a, T: 'a + Clone> {
+                    f: &'a Rel<Self>,
+                }
+            ),
+            "& 'a Rel < Self >",
+            "(&'a (), T, &'a T, &'a __S)",
+        ),
+        // The generics of a method are those of the entry's context, by their own names.
+        (
+            parse_quote!(
+                trait Tr {
+                    fn f<'a, T: 'a + ?Sized, const N: usize>(&self, x: &'a Rel<T, [u8; N]>);
+                }
+            ),
+            "Rel < T , [u8 ; N] >",
+            "(&'a (), *const T, [(); N], &'a T)",
+        ),
+    ];
+    for (item, entry, expected) in scope_rows {
+        let (referrer, _) = analyze(&item);
+        let ix = common::types(&referrer)
+            .position(|ty| s(ty) == entry)
             .unwrap();
-            assert_eq!(s(&got), s(&r.args), "{}: {}", s(&item), s(ty));
-            checked += 1;
-        }
+        let got = common::repeater_args(
+            common::entry(&referrer, ix),
+            common::identity,
+            Some(&own_host),
+            slot_const(&repeater()),
+        )
+        .unwrap();
+        let expected: Type = parse_str(expected).unwrap();
+        assert_eq!(s(&got), s(&expected), "{}: {}", s(&item), entry);
     }
-    assert!(checked > 20, "{}", checked);
 
     // At a site: the generics of the item take the arguments it gives, those of a method are passed
     // by their own names, and `Self: 'a` names the host.
@@ -1596,7 +1604,7 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
             let marker: Type = parse_quote!(crate::Marker);
             let first_without = referrer
                 .iter()
-                .find(|(entry, _, _)| referrer.bucket_self(*entry, id).is_none());
+                .find(|(entry, _, _)| referrer.bucket_self(id, *entry).is_none());
             let as_marker = result.repeater_impls(
                 &repeater,
                 id,
@@ -1617,7 +1625,7 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
             for ix in 0..referrer.iter().count() {
                 let what = format!("{}: {} ({})", s(&item), ix, id);
                 let entry = common::entry_id_at(&referrer, ix);
-                let bucket = referrer.bucket_self(entry, id);
+                let bucket = referrer.bucket_self(id, entry);
                 let r = result
                     .repeater_impls(
                         &repeater,
@@ -1626,8 +1634,7 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
                         slot_const(&repeater),
                     )
                     .unwrap_or_else(|e| panic!("{}: {}", what, e))
-                    .nth(ix)
-                    .unwrap();
+                    .remove(ix);
                 let own_self = common::entry(&referrer, ix).self_ty.is_some();
                 let generics_self = names_self(&common::entry(&referrer, ix).generics);
                 assert_eq!(bucket.is_some(), !own_self && !generics_self, "{}", what);
@@ -1639,8 +1646,7 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
                         slot_const(&repeater),
                     )
                     .unwrap()
-                    .nth(ix)
-                    .unwrap();
+                    .remove(ix);
                 match bucket {
                     Some(ty) => {
                         bucketed += 1;
@@ -1653,7 +1659,7 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
                             ImplSelf::Marker(&ty),
                             slot_const(&repeater),
                         ) {
-                            assert_eq!(r, impls.nth(ix).unwrap(), "{}", what);
+                            assert_eq!(r, impls.remove(ix), "{}", what);
                         }
                         // The impl for the parameter, for the type and without the parameter.
                         let mut expected = for_param;
@@ -1674,7 +1680,7 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
                         // No `__S`.
                         assert!(!with_where(&r.generics).contains("__S"), "{}", what);
                         // It does not depend on how often it is asked.
-                        assert_eq!(referrer.bucket_self(entry, id), Some(ty), "{}", what);
+                        assert_eq!(referrer.bucket_self(id, entry), Some(ty), "{}", what);
                     }
                     None => {
                         other += 1;
@@ -1721,7 +1727,7 @@ fn bucket_types_follow_the_documented_hash() {
             assert_eq!(
                 bucket_name(
                     &referrer
-                        .bucket_self(common::entry_id_at(&referrer, ix), id)
+                        .bucket_self(id, common::entry_id_at(&referrer, ix))
                         .unwrap()
                 ),
                 expected,
@@ -1746,7 +1752,7 @@ fn bucket_types_follow_the_documented_hash() {
         assert_eq!(
             bucket_name(
                 &referrer
-                    .bucket_self(common::entry_id_at(&referrer, ix), id)
+                    .bucket_self(id, common::entry_id_at(&referrer, ix))
                     .unwrap()
             ),
             expected,
@@ -1785,7 +1791,7 @@ fn assert_spread(names: impl Iterator<Item = String>, what: &str) {
 fn bucket_types_spread_over_ids_and_entries() {
     let (referrer, _) = analyze(&parse_quote! { struct S { a: Rel } });
     let first = common::entry_id_at(&referrer, 0);
-    let bucket = |id: u64| bucket_name(&referrer.bucket_self(first, id).unwrap());
+    let bucket = |id: u64| bucket_name(&referrer.bucket_self(id, first).unwrap());
     assert_spread((0..1000u64).map(bucket), "ids 0..1000");
     assert_spread((0..1000u64).map(|k| k << 8).map(bucket), "k << 8");
     assert_spread((0..1000u64).map(|k| k << 16).map(bucket), "k << 16");
@@ -1807,7 +1813,7 @@ fn bucket_types_spread_over_ids_and_entries() {
         assert_spread(
             referrer
                 .iter()
-                .map(|(ix, _, _)| bucket_name(&referrer.bucket_self(ix, id).unwrap())),
+                .map(|(ix, _, _)| bucket_name(&referrer.bucket_self(id, ix).unwrap())),
             "the entries of one item",
         );
     }
@@ -1856,8 +1862,8 @@ fn the_entry_of_a_default_whose_generics_name_self_is_for_a_parameter() {
         common::entry_id_at(&referrer, wrap),
         common::entry_id_at(&referrer, rel),
     );
-    assert_eq!(referrer.bucket_self(wrap_id, 7), None);
-    assert_eq!(referrer.bucket_self(rel_id, 7), None);
+    assert_eq!(referrer.bucket_self(7, wrap_id), None);
+    assert_eq!(referrer.bucket_self(7, rel_id), None);
     // A bucket falls back to a parameter, for which `Self` of the generics is the parameter.
     let param: Ident = parse_quote!(__S);
     let r = result
@@ -1868,8 +1874,7 @@ fn the_entry_of_a_default_whose_generics_name_self_is_for_a_parameter() {
             array_const,
         )
         .unwrap()
-        .nth(rel)
-        .unwrap();
+        .remove(rel);
     assert_eq!(s(&r.self_ty), "__S");
     assert_eq!(
         r,
@@ -1881,8 +1886,7 @@ fn the_entry_of_a_default_whose_generics_name_self_is_for_a_parameter() {
                 array_const
             )
             .unwrap()
-            .nth(rel)
-            .unwrap()
+            .remove(rel)
     );
     assert_eq!(
         with_where(&r.generics),
@@ -1925,14 +1929,14 @@ fn the_entry_of_a_default_whose_generics_name_self_is_for_a_parameter() {
     assert!(referrer.iter().count() > 0);
     assert!(referrer
         .iter()
-        .all(|(ix, _, _)| referrer.bucket_self(ix, 7).is_some()));
+        .all(|(ix, _, _)| referrer.bucket_self(7, ix).is_some()));
 }
 
-/// The call gives `const_fn` the const parameters that the items give it, also for an entry whose
-/// impl replaces `Self` by the parameter for the implementor. (The default of a const parameter,
-/// which names `Self` here, is not in the context, so the replacement changes no const parameter.)
+/// The call gives `const_fn` the const parameters of the impl, once, also for an entry whose impl
+/// replaces `Self` by the parameter for the implementor. (The default of a const parameter, which
+/// names `Self` here, is not in the context, so the replacement changes no const parameter.)
 #[test]
-fn repeater_impls_checks_the_const_parameters_as_the_items_see_them() {
+fn repeater_impls_gives_const_fn_the_const_parameters_of_the_impl() {
     let (result, _) = analyze_result(&parse_quote! {
         trait Tr<const N: usize = { Self::LEN }> {
             const LEN: usize;
@@ -1953,10 +1957,6 @@ fn repeater_impls_checks_the_const_parameters_as_the_items_see_them() {
             },
         )
         .unwrap();
-    let in_the_call = seen.borrow().clone();
-    for _ in impls {}
-    let all = seen.borrow().clone();
-    assert_eq!(in_the_call, ["const N : usize"]);
-    assert_eq!(all.len(), 2 * in_the_call.len());
-    assert_eq!(all[in_the_call.len()..], in_the_call[..]);
+    assert_eq!(impls.len(), 1);
+    assert_eq!(*seen.borrow(), ["const N : usize"]);
 }

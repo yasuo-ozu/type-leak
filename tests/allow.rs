@@ -151,7 +151,7 @@ fn the_entries_are_those_of_the_item_without_the_conflict() {
 fn allowed_paths_would_change_more() {
     // The trait made context-free everywhere: `g` loses its required entry too.
     let config = Rules::new().or_if(starts_with(parse_quote!(RelTr)));
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_impl(&f_and_g());
     let referrer = leaker.result().finish().unwrap();
     assert!(common::types(&referrer).all(|ty| *ty != parse_quote!(dyn RelTr)));
@@ -630,7 +630,7 @@ fn a_value_with_a_self_without_meaning_is_copied_whole() {
             let b: Rel2 = ::core::default::Default::default();
         }
     );
-    let mut leaker = Leaker::from_config(Rules::new());
+    let mut leaker = Leaker::with_rule(Rules::new());
     leaker.check_values = true;
     leaker.enter_generics(&Generics::default(), |view| {
         view.visit_item(&Item::Fn(item.clone()))
@@ -660,7 +660,7 @@ fn unreadable_syntax_in_a_body_is_accepted_with_check_values() {
         }
     );
     let analyze = || {
-        let mut leaker = Leaker::from_config(Rules::new());
+        let mut leaker = Leaker::with_rule(Rules::new());
         leaker.check_values = true;
         leaker.intern_trait(&item);
         leaker.result()
@@ -802,7 +802,7 @@ fn accepting_self_in_a_predicate_leaves_the_bound_of_its_context_leaked() {
                 X: Into<Self::A0>;
         }
     );
-    let mut leaker = Leaker::from_config(std_config());
+    let mut leaker = Leaker::with_rule(std_config());
     leaker.intern_trait(&item);
     let result = leaker.result();
     assert_eq!(
@@ -829,7 +829,7 @@ fn accepting_a_predicate_in_an_impl_leaves_the_bound_of_its_context_leaked() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(std_config());
+    let mut leaker = Leaker::with_rule(std_config());
     leaker.intern_impl(&on_self);
     let result = leaker.result();
     assert_eq!(
@@ -849,7 +849,7 @@ fn accepting_a_predicate_in_an_impl_leaves_the_bound_of_its_context_leaked() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(std_config());
+    let mut leaker = Leaker::with_rule(std_config());
     leaker.intern_impl(&on_other);
     let result = leaker.result();
     assert_eq!(
@@ -882,7 +882,7 @@ fn a_cause_is_equal_whatever_the_spacing_of_its_punctuation() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(Rules::new());
+    let mut leaker = Leaker::with_rule(Rules::new());
     leaker.check_values = true;
     leaker.intern_trait(&item);
     let mut result = leaker.result();
@@ -1037,7 +1037,7 @@ fn allow_std_crates_reads_the_path_of_a_trait_a_macro_and_a_value() {
     // `u8` in the arguments of the value is a path of it, which a rule has to allow too (F50).
     let analyze = || {
         let config = Rules::new().primitive();
-        let mut leaker = Leaker::from_config(config);
+        let mut leaker = Leaker::with_rule(config);
         leaker.check_values = true;
         leaker.intern_trait(&item);
         leaker.result()
@@ -1068,7 +1068,7 @@ fn no_built_in_flag_drops_an_error_whose_paths_it_does_not_allow() {
             }
         }
     );
-    let mut leaker = Leaker::from_config(Rules::new());
+    let mut leaker = Leaker::with_rule(Rules::new());
     leaker.check_values = true;
     leaker.intern_trait(&in_a_body);
     let in_a_default: ItemTrait = parse_quote!(
@@ -1261,7 +1261,7 @@ fn elided_and_bare() -> ItemTrait {
 
 /// The result of the analysis of `item` and its context.
 fn leak_trait<A: Allow>(config: A, item: &ItemTrait) -> (LeakerResult, ContextId) {
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     let context = leaker.intern_trait(item);
     (leaker.result(), context)
 }
@@ -1334,7 +1334,7 @@ fn the_referrer_carries_the_part_that_is_copied_and_the_entries_beside_it() {
         }
     ));
     assert!(parts_of(&leaker.result().finish().unwrap()).is_empty());
-    assert!(parts_of(&Leaker::from_config(Rules::new()).result().into_referrer()).is_empty());
+    assert!(parts_of(&Leaker::with_rule(Rules::new()).result().into_referrer()).is_empty());
 }
 
 #[test]
@@ -1527,7 +1527,7 @@ fn the_part_is_the_type_that_conflicts_and_the_types_beside_it_stay_entries() {
     // Only `dyn RelTr` is the cause of the error: it is copied as written, in the path that owns
     // the elided lifetime. `Rel` beside it is an entry, and replaced.
     let list = |ty: Type| -> (Entries, Type) {
-        let mut leaker = Leaker::from_config(std_config());
+        let mut leaker = Leaker::with_rule(std_config());
         let (context, ()) =
             leaker.enter_generics(&Generics::default(), |view| view.visit_type(&ty));
         let result = leaker.result();
@@ -1712,7 +1712,7 @@ fn a_path_of_a_value_that_conflicts_is_written_as_it_is_and_the_types_in_it_are_
         }
     );
     let leak = || {
-        let mut leaker = Leaker::from_config(std_config());
+        let mut leaker = Leaker::with_rule(std_config());
         leaker.check_values = true;
         let context = leaker.intern_trait(&item);
         (leaker.result(), context)
@@ -1763,10 +1763,13 @@ fn expand_leaves_a_part_as_written() {
     let (referrer, context) = referrer_of(Rules::new(), &item);
     let replace = |_: Type, ix: EntryId, _: &Context| -> Type { parse_quote!(Entry<#ix>) };
     let part: Type = parse_quote!(::p::Elided<'_, dyn RelTr>);
-    assert_eq!(referrer.expand(context, part.clone(), replace), part);
+    assert_eq!(
+        common::expand(&referrer, context, part.clone(), replace),
+        part
+    );
     let other: Type = parse_quote!(::core::marker::PhantomData<dyn RelTr>);
     let expected: Type = parse_quote!(::core::marker::PhantomData<Entry<0usize>>);
-    assert_eq!(referrer.expand(context, other, replace), expected);
+    assert_eq!(common::expand(&referrer, context, other, replace), expected);
 }
 
 #[test]
@@ -1963,16 +1966,22 @@ fn a_part_with_an_anchor_is_left_as_written_only_inside_a_type_that_matches_it()
     let referrer = read(0);
     let context = common::context_ids(&referrer).into_iter().next().unwrap();
     assert_eq!(
-        referrer.expand(context, anchor.clone(), replace),
+        common::expand(&referrer, context, anchor.clone(), replace),
         anchor.clone()
     );
     let expected: Type = parse_quote!(::core::marker::PhantomData<Entry<0usize>>);
-    assert_eq!(referrer.expand(context, other.clone(), replace), expected);
+    assert_eq!(
+        common::expand(&referrer, context, other.clone(), replace),
+        expected
+    );
     // The anchor has another context (it names `T`): the type is not it, and `dyn RelTr` is the
     // entry it is everywhere else.
     let referrer = read(1);
     let expected: Type = parse_quote!(::p::Elided<'_, Entry<0usize>>);
-    assert_eq!(referrer.expand(context, anchor.clone(), replace), expected);
+    assert_eq!(
+        common::expand(&referrer, context, anchor.clone(), replace),
+        expected
+    );
     // The anchor around a type that is not the part: the other types in it are looked up as usual.
     let referrer: Referrer = parse_str(&format!(
         "{} [type (dyn RelTr) 0 in (::p::Elided<'_, dyn RelTr, Rel>) 0] (dyn RelTr, Rel)",
@@ -1981,11 +1990,11 @@ fn a_part_with_an_anchor_is_left_as_written_only_inside_a_type_that_matches_it()
     .unwrap();
     let ty: Type = parse_quote!(::p::Elided<'_, dyn RelTr, Rel>);
     let expected: Type = parse_quote!(::p::Elided<'_, dyn RelTr, Entry<1usize>>);
-    assert_eq!(referrer.expand(context, ty, replace), expected);
+    assert_eq!(common::expand(&referrer, context, ty, replace), expected);
     // Outside any anchor, the same type in the same context is an entry.
     let ty: Type = parse_quote!(::p::Elided<'_, dyn RelTr, Other>);
     let expected: Type = parse_quote!(::p::Elided<'_, Entry<0usize>, Other>);
-    assert_eq!(referrer.expand(context, ty, replace), expected);
+    assert_eq!(common::expand(&referrer, context, ty, replace), expected);
 }
 
 #[test]

@@ -25,6 +25,16 @@ fn messages(errors: &[ErrorItem]) -> String {
         .join("\n")
 }
 
+/// The errors as one `syn::Error`, one for each in order. Panics if there is none.
+fn to_syn_error(items: &[ErrorItem]) -> syn::Error {
+    let mut errors = items.iter().cloned().map(syn::Error::from);
+    let mut combined = errors.next().expect("at least one error");
+    for error in errors {
+        combined.combine(error);
+    }
+    combined
+}
+
 /// A guard for the others: without a location, every span is at the line 0.
 #[test]
 fn spans_parsed_from_a_string_have_a_location() {
@@ -160,7 +170,7 @@ fn the_span_of_a_conflict_of_a_type_in_a_bound_is_the_type() {
     let source = "trait Tr<T: Fn(Rel)> {\n    fn f(&self, a: Wrap<T>)\n    where\n        Wrap<T>: Sized;\n}";
     let item: ItemTrait = parse_str(source).unwrap();
     let config = Rules::new().primitive().prelude();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();
@@ -319,10 +329,13 @@ fn an_accepted_cause_is_the_same_whatever_its_spans() {
         hasher.finish()
     };
     assert_eq!(hash(&cause), hash(&errors[0].cause));
-    let mut allowed = result.clone();
-    assert!(allowed.allow(|c: &Cause, _: Place| *c == cause).errors().is_empty());
+    let allowed = result.clone();
+    assert!(allowed
+        .allow(|c: &Cause, _: Place| *c == cause)
+        .errors()
+        .is_empty());
     // Another cause drops nothing.
-    let mut other = result.clone();
+    let other = result.clone();
     assert_eq!(
         other
             .allow(|c: &Cause, _: Place| *c == Cause::Trait(parse_quote!(Other)))
@@ -371,7 +384,7 @@ fn assert_in_source(tokens: proc_macro2::TokenStream, source: &str) {
 fn macro_error(source: &str) -> ErrorItem {
     let item: ItemStruct = parse_str(source).unwrap();
     let config = Rules::new().primitive();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.intern_struct(&item);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1, "{}", messages(result.errors()));
@@ -414,7 +427,7 @@ fn the_bang_of_a_macro_cause_is_at_the_name_of_the_macro() {
 }
 
 /// Every way to report the error of a macro cause is at the name of the macro: `span()`,
-/// `syn::Error` (`From` and `to_syn_error()`), `to_compile_error()`, the notes and the help.
+/// `syn::Error` (`From`, also combined), `to_compile_error()`, the notes and the help.
 #[test]
 fn an_error_of_a_macro_cause_is_reported_at_the_name_of_the_macro() {
     let source = "struct S([u8; two!()]);";
@@ -422,11 +435,17 @@ fn an_error_of_a_macro_cause_is_reported_at_the_name_of_the_macro() {
     let (start, end) = location_of(source, "two", 0);
     // `ErrorItem::span()`.
     assert_eq!((error.span().start(), error.span().end()), (start, end));
-    // `From<ErrorItem> for syn::Error`, and `to_syn_error()`.
+    // `From<ErrorItem> for syn::Error`, and the one combined.
     let converted: syn::Error = error.clone().into();
-    assert_eq!((converted.span().start(), converted.span().end()), (start, end));
+    assert_eq!(
+        (converted.span().start(), converted.span().end()),
+        (start, end)
+    );
     let combined = to_syn_error(std::slice::from_ref(&error));
-    assert_eq!((combined.span().start(), combined.span().end()), (start, end));
+    assert_eq!(
+        (combined.span().start(), combined.span().end()),
+        (start, end)
+    );
     // `compile_error!` of `to_compile_error()`: every token of it is in the source.
     assert_in_source(error.to_compile_error(), source);
     // The note is at the call (`two!()`) and the help at the name of the macro.
@@ -451,7 +470,7 @@ fn a_macro_cause_of_a_value_and_of_self_is_in_the_item() {
     let source = "trait Tr {\n    fn f(&self) -> u8 {\n        two!() + 1\n    }\n}";
     let item: ItemTrait = parse_str(source).unwrap();
     let config = Rules::new().primitive();
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.check_values = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
@@ -474,7 +493,9 @@ fn a_macro_cause_of_a_value_and_of_self_is_in_the_item() {
         .filter(|item| item.reason == Reason::SelfWithoutMeaning)
         .collect();
     assert!(!selfs.is_empty(), "{}", messages(result.errors()));
-    assert!(selfs.iter().any(|item| matches!(item.cause, Cause::Macro(_))));
+    assert!(selfs
+        .iter()
+        .any(|item| matches!(item.cause, Cause::Macro(_))));
     for item in selfs {
         assert_in_source(item.cause.to_token_stream(), source);
         assert_in_source(item.to_compile_error(), source);

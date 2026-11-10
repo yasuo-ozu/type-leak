@@ -442,7 +442,7 @@ fn analyze_config<A: Allow>(
     args: &Args,
     config: A,
 ) -> (LeakerResult, ContextId, TokenStream) {
-    let mut leaker = Leaker::from_config(config);
+    let mut leaker = Leaker::with_rule(config);
     leaker.check_values = args.values;
     let scope = args.scope.as_str();
     CHECKED.with(|checked| checked.borrow_mut().clear());
@@ -842,7 +842,7 @@ fn repeater_impls(
     )?;
     let some_need_self = referrer
         .iter()
-        .any(|(ix, _, _)| referrer.bucket_self(ix, id).is_none());
+        .any(|(ix, _, _)| referrer.bucket_self(id, ix).is_none());
     let (used, targets): (Used, Vec<_>) = match marker {
         // Every entry is for the marker, or, if one of them needs `Self`, for the parameter (the
         // blanket impls accept the marker as `Self`, so the copy still compiles).
@@ -855,8 +855,7 @@ fn repeater_impls(
                     ImplSelf::Marker(marker),
                     slot_const(&repeater),
                 )
-                .map_err(Error::from)?
-                .collect(),
+                .map_err(Error::from)?,
         ),
         Some(_) => (
             Used::Param,
@@ -867,8 +866,7 @@ fn repeater_impls(
                     ImplSelf::Param(&self_param),
                     slot_const(&repeater),
                 )
-                .map_err(Error::from)?
-                .collect(),
+                .map_err(Error::from)?,
         ),
         None => (
             Used::Bucket,
@@ -879,8 +877,7 @@ fn repeater_impls(
                     ImplSelf::Bucket { param: &self_param },
                     slot_const(&repeater),
                 )
-                .map_err(Error::from)?
-                .collect(),
+                .map_err(Error::from)?,
         ),
     };
     let mut impls = Vec::new();
@@ -900,8 +897,15 @@ fn repeater_impls(
             _ => r.self_ty.clone(),
         };
         let trait_path = projected_trait_path(
-            &repeater_projection(&repeater, &self_in_impl, context, id, ix, slot_const(&repeater))
-                .map_err(Error::from)?,
+            &repeater_projection(
+                &repeater,
+                &self_in_impl,
+                context,
+                id,
+                ix,
+                slot_const(&repeater),
+            )
+            .map_err(Error::from)?,
         )?;
         let written: ItemImpl = parse2(tokens.clone())?;
         match &written.trait_ {
@@ -1063,13 +1067,15 @@ fn check_impl_pieces(
     let context = crate::entry_context(referrer, ix);
     let declared = declared_generics(&context.generics);
     let mut got = r.generics.clone();
-    let bucket = referrer.bucket_self(ix, id);
+    let bucket = referrer.bucket_self(id, ix);
     let bucketable = context.self_ty.is_none() && !names_self(&context.generics);
     if bucket.is_some() != bucketable {
         return Err(helpers_disagree(format!(
             "`bucket_self()` of the entry {} is `{}`, and its context {} `Self`",
             ix,
-            bucket.as_ref().map_or(String::new(), |ty| quote!(#ty).to_string()),
+            bucket
+                .as_ref()
+                .map_or(String::new(), |ty| quote!(#ty).to_string()),
             if bucketable { "does not name" } else { "names" }
         )));
     }
@@ -1243,12 +1249,7 @@ fn default_positions(generics: &Generics) -> Vec<(Generics, Type)> {
         }) = param
         {
             // A default has no `Self`: the predicates that name it are not in its context either.
-            let later: HashSet<String> = generics
-                .params
-                .iter()
-                .skip(i)
-                .map(name)
-                .collect();
+            let later: HashSet<String> = generics.params.iter().skip(i).map(name).collect();
             let mentions_later = |predicate: &WherePredicate| {
                 let text = quote!(#predicate).to_string();
                 later.iter().any(|name| {
@@ -2081,15 +2082,12 @@ impl Projector<'_> {
             // AsRef<Self>, U = Rel<T>>`): the Leaker analyzed it without `Self`, and the entry is
             // for any type that the bound holds for. The implementor is the host, which has it
             // (`T: AsRef<Host>`), not `()`.
-            _ => match (self.referrer.bucket_self(ix, self.id), &self.marker) {
+            _ => match (self.referrer.bucket_self(self.id, ix), &self.marker) {
                 // The impl is for the marker of the item (`Args::marker`), or for this primitive
                 // type (`ImplSelf::Bucket`).
                 (Some(_), Some(marker)) => marker.clone(),
                 (Some(bucket), None) => bucket,
-                (None, _)
-                    if self.bound_self.is_some()
-                        && names_self(&context.generics) =>
-                {
+                (None, _) if self.bound_self.is_some() && names_self(&context.generics) => {
                     self.bound_self.clone().unwrap()
                 }
                 (None, _) => parse_quote!(()),
@@ -2279,12 +2277,15 @@ fn rewrite_with(
         Item::Impl(i) => {
             // The self type is written in the Leaker's crate: rewrite it like any type.
             let error = std::cell::RefCell::new(None);
-            let rewritten = referrer.expand(context, (*i.self_ty).clone(), |_leaked, ix, entry| {
-                projector.project(ix, entry).unwrap_or_else(|e| {
-                    *error.borrow_mut() = Some(e);
-                    parse_quote!(())
+            let mut rewritten = (*i.self_ty).clone();
+            referrer
+                .visitor(context, |_leaked, ix, entry| {
+                    projector.project(ix, entry).unwrap_or_else(|e| {
+                        *error.borrow_mut() = Some(e);
+                        parse_quote!(())
+                    })
                 })
-            });
+                .visit_type_mut(&mut rewritten);
             if let Some(e) = error.into_inner() {
                 return Err(e);
             }
@@ -2337,10 +2338,9 @@ fn rewrite_with(
                 let mut file = File {
                     shebang: None,
                     attrs: Vec::new(),
-                    items: vec![wrap.around(std::mem::replace(
-                        other,
-                        Item::Verbatim(TokenStream::new()),
-                    ))],
+                    items: vec![
+                        wrap.around(std::mem::replace(other, Item::Verbatim(TokenStream::new())))
+                    ],
                 };
                 visitor.visit_file_mut(&mut file);
                 *other = wrap.inside(file.items.remove(0));
@@ -2641,7 +2641,15 @@ fn concrete_type(traits: &std::collections::BTreeSet<String>, draw: &mut Draw) -
         && traits.iter().all(|t| {
             matches!(
                 t.as_str(),
-                "?Sized" | "Debug" | "PartialEq" | "Eq" | "PartialOrd" | "Ord" | "Send" | "Sync" | "Unpin"
+                "?Sized"
+                    | "Debug"
+                    | "PartialEq"
+                    | "Eq"
+                    | "PartialOrd"
+                    | "Ord"
+                    | "Send"
+                    | "Sync"
+                    | "Unpin"
             )
         });
     if unsized_ok {
@@ -2756,7 +2764,11 @@ impl ElidedSignatures {
         let named: Vec<String> = self
             .names
             .iter()
-            .filter(|name| inputs.clone().any(|input| count_name(quote!(#input), name) > 0))
+            .filter(|name| {
+                inputs
+                    .clone()
+                    .any(|input| count_name(quote!(#input), name) > 0)
+            })
             .cloned()
             .collect();
         if shown == 0 {
@@ -3065,8 +3077,19 @@ fn plan_instance(
     let mut draw = Draw(ask.seed);
     let lifetime_args = ask.lifetime_args;
     let has_default = |param: &GenericParam| {
-        matches!(param, GenericParam::Type(TypeParam { default: Some(_), .. }))
-            || matches!(param, GenericParam::Const(ConstParam { default: Some(_), .. }))
+        matches!(
+            param,
+            GenericParam::Type(TypeParam {
+                default: Some(_),
+                ..
+            })
+        ) || matches!(
+            param,
+            GenericParam::Const(ConstParam {
+                default: Some(_),
+                ..
+            })
+        )
     };
     // The defaults at the end of the list are left out, if nothing else names them.
     let first_default = (0..n).find(|&i| params[i..].iter().all(|p| has_default(p)));
@@ -3204,7 +3227,11 @@ impl<'a> SiteSubst<'a> {
 impl VisitMut for SiteSubst<'_> {
     fn visit_type_mut(&mut self, ty: &mut Type) {
         *ty = crate::substitute_type(ty, self.inst.answers(), self.self_ty).unwrap_or_else(|e| {
-            panic!("test macro: the instance does not fit `{}`: {}", quote!(#ty), e)
+            panic!(
+                "test macro: the instance does not fit `{}`: {}",
+                quote!(#ty),
+                e
+            )
         });
     }
 
@@ -3259,7 +3286,11 @@ fn instance_check_fn(
 ) -> Option<TokenStream> {
     let (generics, ty) = lowered(pos, Implementor::Fixed);
     let ty = crate::substitute_type(&ty, inst.answers(), None).unwrap_or_else(|e| {
-        panic!("test macro: the instance does not fit `{}`: {}", quote!(#ty), e)
+        panic!(
+            "test macro: the instance does not fit `{}`: {}",
+            quote!(#ty),
+            e
+        )
     });
     let mut params: Punctuated<GenericParam, Token![,]> = Punctuated::new();
     let mut targs: Vec<TokenStream> = Vec::new();
@@ -3369,12 +3400,7 @@ fn instance_check_fn(
 /// site left out are the defaults that rustc takes: for a struct, an enum or a union, `S<given>` is
 /// `S<completed>` (a function takes one and returns the other); for a trait, the host that
 /// implements `Tr<given>` implements `Tr<completed>`.
-fn defaults_check(
-    inst: &Instance,
-    item: &Item,
-    target: &Path,
-    host: Option<&Type>,
-) -> TokenStream {
+fn defaults_check(inst: &Instance, item: &Item, target: &Path, host: Option<&Type>) -> TokenStream {
     if inst.given.len() == inst.params.len() {
         return TokenStream::new();
     }
@@ -3421,7 +3447,11 @@ fn defaults_check(
                         _ => None,
                     });
                     for bound in more.into_iter().flatten() {
-                        if !t.bounds.iter().any(|b| quote!(#b).to_string() == quote!(#bound).to_string()) {
+                        if !t
+                            .bounds
+                            .iter()
+                            .any(|b| quote!(#b).to_string() == quote!(#bound).to_string())
+                        {
                             t.bounds.push(bound);
                         }
                     }
@@ -3434,7 +3464,11 @@ fn defaults_check(
                 });
                 for predicate in &host_where.predicates {
                     let text = quote!(#predicate).to_string();
-                    if !need_where.predicates.iter().any(|p| quote!(#p).to_string() == text) {
+                    if !need_where
+                        .predicates
+                        .iter()
+                        .any(|p| quote!(#p).to_string() == text)
+                    {
                         need_where.predicates.push(predicate.clone());
                     }
                 }
@@ -3455,7 +3489,8 @@ fn defaults_check(
                 .collect();
             let need = ident(&format!("__tl_need_{}", inst.id));
             let mut need_params = need_params;
-            need_params.push(parse_quote!(__X: ?::core::marker::Sized + #target::#n<#(#completed),*>));
+            need_params
+                .push(parse_quote!(__X: ?::core::marker::Sized + #target::#n<#(#completed),*>));
             quote! {
                 #[allow(non_snake_case, dead_code)]
                 fn #need<#need_params>() #need_where {}
@@ -3525,7 +3560,11 @@ fn check_refusals(referrer: &Referrer, params: &Punctuated<GenericParam, Token![
             return Err(fail(format!(
                 "the last argument missing in the item (`{}` {}) gives {:?}",
                 param_name(last),
-                if has_default { "has a default" } else { "has none" },
+                if has_default {
+                    "has a default"
+                } else {
+                    "has none"
+                },
                 other.map(|a| a.len())
             )))
         }
@@ -3541,12 +3580,8 @@ fn check_refusals(referrer: &Referrer, params: &Punctuated<GenericParam, Token![
         .map(|(ix, _, context)| (format!("the context of the entry {}", ix), context));
     for (context_name, entry) in entries {
         let substituted = |answers: &[GenericArgument]| {
-            let mut args: Vec<GenericArgument> = entry
-                .generics
-                .params
-                .iter()
-                .map(own_name_arg)
-                .collect();
+            let mut args: Vec<GenericArgument> =
+                entry.generics.params.iter().map(own_name_arg).collect();
             substitute_args(args.iter_mut(), crate::answers(params, answers)).map(|()| args)
         };
         match substituted(&valid) {
@@ -3610,7 +3645,10 @@ fn shadowable(referrer: &Referrer, ix: EntryId) -> std::collections::BTreeSet<St
             syn::visit::visit_path(self, path)
         }
     }
-    let (ty, context) = (crate::entry_type(referrer, ix), crate::entry_context(referrer, ix));
+    let (ty, context) = (
+        crate::entry_type(referrer, ix),
+        crate::entry_context(referrer, ix),
+    );
     let mut heads = Heads(Default::default());
     heads.visit_type(ty);
     for param in &context.generics.params {
@@ -3642,7 +3680,10 @@ impl Wrap {
             Item::Fn(function)
         } else {
             let mut module: ItemMod = parse_quote!(mod #wrapper {});
-            module.content = Some((Default::default(), stubs.chain(std::iter::once(item)).collect()));
+            module.content = Some((
+                Default::default(),
+                stubs.chain(std::iter::once(item)).collect(),
+            ));
             Item::Mod(module)
         }
     }
@@ -3728,16 +3769,23 @@ fn shadow_check(
         Some(&shadowing),
         false,
     )?;
-    let declared: std::collections::HashSet<String> =
-        shadowing.names.iter().map(|name| name.to_string()).collect();
+    let declared: std::collections::HashSet<String> = shadowing
+        .names
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
     let hidden = |ix: &EntryId| {
         shadowable
             .iter()
             .filter(|(id, _)| id == ix)
             .any(|(_, names)| names.iter().any(|name| declared.contains(name)))
     };
-    let expected: std::collections::BTreeSet<EntryId> =
-        control.used.iter().copied().filter(|ix| !hidden(ix)).collect();
+    let expected: std::collections::BTreeSet<EntryId> = control
+        .used
+        .iter()
+        .copied()
+        .filter(|ix| !hidden(ix))
+        .collect();
     let hides = control.used.iter().filter(|ix| hidden(ix)).count();
     if shadowed.used != expected {
         let entry = |ix: &EntryId| {
@@ -3790,7 +3838,9 @@ fn instance_part(
     check_refusals(referrer, &generics.params)?;
     // The copy of the item, with the defaults of its parameters written by their own generics, and
     // the host of the instantiation for `Self`.
-    let visited = rewrite_with(referrer, context, item, args, path, dyn_host, None, None, true)?;
+    let visited = rewrite_with(
+        referrer, context, item, args, path, dyn_host, None, None, true,
+    )?;
     let replaced: Vec<String> = visited
         .used
         .iter()
@@ -3838,7 +3888,9 @@ fn instance_part(
         if check.expected.is_some() {
             continue;
         }
-        if let Some(function) = instance_check_fn(args.id, check.j, &check.pos, &inst, path, host_ty) {
+        if let Some(function) =
+            instance_check_fn(args.id, check.j, &check.pos, &inst, path, host_ty)
+        {
             out.extend(function);
             positions += 1;
         }
@@ -3847,13 +3899,20 @@ fn instance_part(
         (&rewritten.item, item, rewritten.host.as_ref())
     {
         let copy = substituted_trait(copy, &inst);
-        out.extend(host_impl(&copy, original, host, dyn_host, path, false, Some(&inst)));
+        out.extend(host_impl(
+            &copy,
+            original,
+            host,
+            dyn_host,
+            path,
+            false,
+            Some(&inst),
+        ));
     }
     out.extend(defaults_check(&inst, item, path, host_ty));
     let counts = inst.lifetime_args_in_elided_signatures(item, &replaced);
     Ok((out, positions, counts))
 }
-
 
 /// Rewrites the defaults of the type parameters of a trait for a declaration (`Args::redeclare`).
 ///
@@ -3870,9 +3929,15 @@ fn rewrite_defaults(
     projector: &Projector<'_>,
     base: &Path,
 ) -> Result<()> {
-    let first = original.generics.params.iter().position(
-        |param| matches!(param, GenericParam::Type(TypeParam { default: Some(_), .. })),
-    );
+    let first = original.generics.params.iter().position(|param| {
+        matches!(
+            param,
+            GenericParam::Type(TypeParam {
+                default: Some(_),
+                ..
+            })
+        )
+    });
     let first = match first {
         Some(first) => first,
         None => return Ok(()),
@@ -3928,7 +3993,10 @@ fn rewrite_defaults(
     if let Some(e) = error.into_inner() {
         return Err(e);
     }
-    projector.used.borrow_mut().extend(placeholder.used.into_inner());
+    projector
+        .used
+        .borrow_mut()
+        .extend(placeholder.used.into_inner());
     let shell = match file.items.remove(0) {
         Item::Trait(shell) => shell,
         _ => unreachable!(),
@@ -4234,7 +4302,14 @@ impl<'ast> Visit<'ast> for Entries {
         self.names.insert(i.to_string());
     }
     fn visit_type(&mut self, i: &'ast Type) {
-        if let (true, Type::Path(TypePath { qself: Some(qself), path })) = (is_entry(i), i) {
+        if let (
+            true,
+            Type::Path(TypePath {
+                qself: Some(qself),
+                path,
+            }),
+        ) = (is_entry(i), i)
+        {
             self.any = true;
             if let PathArguments::AngleBracketed(a) = &path.segments[qself.position - 1].arguments {
                 if let Some(GenericArgument::Type(Type::Tuple(t))) = a.args.first() {
@@ -4263,13 +4338,17 @@ fn header_cycles(header: &Position) -> bool {
     let predicate = generics.make_where_clause().predicates.pop();
     let mut in_header = Entries::default();
     in_header.visit_type(&header.ty);
-    predicate.iter().for_each(|p| in_header.visit_where_predicate(p.value()));
+    predicate
+        .iter()
+        .for_each(|p| in_header.visit_where_predicate(p.value()));
     let cycles = |visit: &dyn Fn(&mut Entries)| {
         let mut unit = Entries::default();
         visit(&mut unit);
         unit.any && unit.names.intersection(&in_header.args).next().is_some()
     };
-    generics.type_params().any(|p| cycles(&|e| e.visit_type_param(p)))
+    generics
+        .type_params()
+        .any(|p| cycles(&|e| e.visit_type_param(p)))
         || generics
             .where_clause
             .iter()
@@ -4308,9 +4387,7 @@ fn projects_self(pos: &Position) -> bool {
     struct Projects(bool);
     impl<'ast> Visit<'ast> for Projects {
         fn visit_type_path(&mut self, i: &'ast TypePath) {
-            let is_self = |ty: &Type| {
-                matches!(ty, Type::Path(TypePath { qself: None, path }) if path.is_ident("Self"))
-            };
+            let is_self = |ty: &Type| matches!(ty, Type::Path(TypePath { qself: None, path }) if path.is_ident("Self"));
             match &i.qself {
                 Some(qself) => self.0 |= is_self(&qself.ty),
                 None => {
@@ -4516,7 +4593,11 @@ impl<'a> Reroot<'a> {
     fn new(item: &'a Item, leaker_path: &Path, args: &Args) -> Option<Self> {
         match item {
             Item::Mod(module) => Some(Reroot {
-                outer: leaker_path.segments.iter().map(|s| s.ident.clone()).collect(),
+                outer: leaker_path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.clone())
+                    .collect(),
                 module,
                 // The copy of an item accepted by `allow()` keeps the names that conflict.
                 prelude: args.prelude || args.accepted,
@@ -4572,11 +4653,7 @@ impl<'a> Reroot<'a> {
 impl Rerooting<'_, '_> {
     /// The path `rest` from the root of the Leaker's crate, below the first `keep` segments of the
     /// path of the module that has the analyzed one.
-    fn absolute<'p>(
-        &self,
-        keep: usize,
-        rest: impl Iterator<Item = &'p PathSegment>,
-    ) -> Path {
+    fn absolute<'p>(&self, keep: usize, rest: impl Iterator<Item = &'p PathSegment>) -> Path {
         let mut path = Path {
             leading_colon: Some(Default::default()),
             segments: self.reroot.outer[..keep]
@@ -4673,8 +4750,12 @@ impl Rerooting<'_, '_> {
                 match self.path(self.levels.len() - 1, &trait_path) {
                     Some(rewritten) => {
                         qself.position = rewritten.segments.len();
-                        let rest: Vec<PathSegment> =
-                            path.segments.iter().skip(trait_path.segments.len()).cloned().collect();
+                        let rest: Vec<PathSegment> = path
+                            .segments
+                            .iter()
+                            .skip(trait_path.segments.len())
+                            .cloned()
+                            .collect();
                         *path = rewritten;
                         path.segments.extend(rest);
                     }
@@ -4937,8 +5018,13 @@ impl Rerooting<'_, '_> {
     /// The generic argument for the type `ty` that stands for `orig`: braces if a bare name became a
     /// path of several segments (see [`written_as_const()`]).
     fn argument(&self, orig: &Type, ty: Type) -> GenericArgument {
-        if let (Type::Path(TypePath { qself: None, path: o }), Type::Path(TypePath { path, .. })) =
-            (orig, &ty)
+        if let (
+            Type::Path(TypePath {
+                qself: None,
+                path: o,
+            }),
+            Type::Path(TypePath { path, .. }),
+        ) = (orig, &ty)
         {
             if o.leading_colon.is_none()
                 && o.segments.len() == 1
@@ -5033,8 +5119,7 @@ impl VisitMut for Rerooting<'_, '_> {
             _ => None,
         };
         syn::visit_mut::visit_generic_argument_mut(self, i);
-        if let (Some(name), GenericArgument::Type(Type::Path(TypePath { path, .. }))) =
-            (bare, &*i)
+        if let (Some(name), GenericArgument::Type(Type::Path(TypePath { path, .. }))) = (bare, &*i)
         {
             if path.segments.len() > 1 && written_as_const(&name) {
                 let path = path.clone();
@@ -5135,10 +5220,7 @@ fn type_args(generics: &Generics) -> Vec<TokenStream> {
 /// checks: the copy is an impl for it.
 fn reverse_impls(id: u64, target: &Path, checks: &[Check], host: Option<&Type>) -> TokenStream {
     let mut groups: Vec<(Vec<Ident>, Vec<TokenStream>)> = Vec::new();
-    for check in checks
-        .iter()
-        .filter(|c| c.expected.is_none() && c.reverse)
-    {
+    for check in checks.iter().filter(|c| c.expected.is_none() && c.reverse) {
         let pos = &check.pos;
         let method = method(id, check.j, pos, Implementor::Fixed, TokenStream::new());
         match groups.iter_mut().find(|(mods, _)| *mods == pos.mods) {
@@ -5559,7 +5641,8 @@ fn unreplaced(referrer: &Referrer, ty: &Type) -> Type {
             {
                 let at = qself.position;
                 if at > 0 && path.segments.len() == at + 1 && path.segments[at].ident == "Type" {
-                    if let PathArguments::AngleBracketed(arguments) = &path.segments[at - 1].arguments
+                    if let PathArguments::AngleBracketed(arguments) =
+                        &path.segments[at - 1].arguments
                     {
                         if let Some(GenericArgument::Const(Expr::Lit(ExprLit {
                             lit: Lit::Int(key),
@@ -5608,10 +5691,7 @@ fn check_against_copy(
     for c in checked {
         let (o, k) = (&orig[c.j], &copied[c.j]);
         let oty = &o.ty;
-        if c.impossible > 0
-            || has_elided(&o.ty)
-            || tokens_name_self(quote!(#oty))
-        {
+        if c.impossible > 0 || has_elided(&o.ty) || tokens_name_self(quote!(#oty)) {
             continue;
         }
         let same = text(&o.ty) == text(&k.ty);
@@ -5742,7 +5822,14 @@ fn count_copy(
     let dummy: Path = parse_quote!(::__dummy);
     // The result is read back from its tokens, as the Referrer's macro gets it.
     let plain: LeakerResult = parse2(result.to_token_stream())?;
-    let copy = rewrite(&plain.into_referrer(), context, original, args, &dummy, false);
+    let copy = rewrite(
+        &plain.into_referrer(),
+        context,
+        original,
+        args,
+        &dummy,
+        false,
+    );
     let report = match copy {
         Ok(rewritten) => {
             let host = host_arg(&rewritten, args, &dummy);
@@ -5926,8 +6013,8 @@ fn rule_stage(original: &Item, args: &Args, rule: Rule) -> (Vec<StageCopy>, Toke
     };
     let applies = rule != Rule::Values || args.values;
     let same_errors = text(before.errors()) == text(after.errors());
-    let same_referrer = copy_needs(&before.clone().into_referrer())
-        == copy_needs(&after.clone().into_referrer());
+    let same_referrer =
+        copy_needs(&before.clone().into_referrer()) == copy_needs(&after.clone().into_referrer());
     let matters = applies
         && (rule == Rule::Prelude
             || text(plain.errors()) != text(after.errors())
@@ -6390,7 +6477,8 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
             let import = args.nested().then(|| quote!(use #path::#name;));
             match &item {
                 Item::Trait(original) => {
-                    let host_impl = host_impl(t, original, host, dyn_host, &path, args.bodies, None);
+                    let host_impl =
+                        host_impl(t, original, host, dyn_host, &path, args.bodies, None);
                     // The Referrer's crate declares the copy, which has the defaults of the
                     // parameters rewritten (`rewrite_defaults()`).
                     let declared = args.redeclare.then(|| {
@@ -6521,7 +6609,9 @@ pub(crate) fn carry(input: TokenStream) -> Result<TokenStream> {
             .iter()
             .zip(&want)
             .find(|(g, w)| bare(g) != bare(w))
-            .map_or(String::new(), |(g, w)| format!(":\n  read back: {}\n  Leaker's:  {}", g, w));
+            .map_or(String::new(), |(g, w)| {
+                format!(":\n  read back: {}\n  Leaker's:  {}", g, w)
+            });
         return Err(fail(format!(
             "the errors after the round trip differ from the Leaker's: {} against {}{}",
             got.len(),
@@ -6714,7 +6804,9 @@ mod tests {
     /// An item put in a module or a block that declares names is found there again.
     #[test]
     fn a_wrapped_item_is_the_item_inside() {
-        let item: Item = parse_quote!(pub struct S(R0););
+        let item: Item = parse_quote!(
+            pub struct S(R0);
+        );
         for block in [false, true] {
             let wrap = Wrap {
                 block,
@@ -6751,7 +6843,11 @@ mod tests {
         let module: Item = parse_str(MODULE).unwrap();
         let args: Args = parse_str("id = 0, prelude = false").unwrap();
         let reroot = Reroot::new(&module, &parse_quote!(::krate), &args).unwrap();
-        let mods = if nested { ["mm", "n"].to_vec() } else { ["mm"].to_vec() };
+        let mods = if nested {
+            ["mm", "n"].to_vec()
+        } else {
+            ["mm"].to_vec()
+        };
         let position = |ty: &str| Position {
             mods: mods.iter().map(|m| ident(m)).collect(),
             layers: Vec::new(),
@@ -6769,7 +6865,10 @@ mod tests {
         assert_eq!(expected("R0", "R0", false).unwrap(), "R0");
         assert_eq!(expected("self::R0", "self::R0", false).unwrap(), "self::R0");
         assert_eq!(expected("I0", ENTRY, false).unwrap(), "::krate::base::B0");
-        assert_eq!(expected("J1<R0>", "J1<R0>", false).unwrap(), "::krate::base::B1<R0>");
+        assert_eq!(
+            expected("J1<R0>", "J1<R0>", false).unwrap(),
+            "::krate::base::B1<R0>"
+        );
         assert_eq!(
             expected("crate::base::B2<u8>", "crate::base::B2<u8>", false),
             Some("::krate::base::B2<u8>".to_string())
@@ -6779,8 +6878,14 @@ mod tests {
             expected("super::super::base::B0", ENTRY, true).unwrap(),
             "::krate::base::B0"
         );
-        assert_eq!(expected("super::R0", "super::R0", true).unwrap(), "super::R0");
-        assert_eq!(expected("IL<u8>", ENTRY, true).unwrap(), "::krate::base::BL<u8>");
+        assert_eq!(
+            expected("super::R0", "super::R0", true).unwrap(),
+            "super::R0"
+        );
+        assert_eq!(
+            expected("IL<u8>", ENTRY, true).unwrap(),
+            "::krate::base::BL<u8>"
+        );
     }
 
     #[test]
@@ -6809,7 +6914,8 @@ mod tests {
     #[test]
     fn the_header_of_an_impl_assumes_its_trait_reference() {
         let args: Args = parse_str("id = 0, scope = \"\"").unwrap();
-        let item: Item = parse_str("impl<'a, T: Clone> ::krate::m::Tr<'a, T> for &'static fn() {}").unwrap();
+        let item: Item =
+            parse_str("impl<'a, T: Clone> ::krate::m::Tr<'a, T> for &'static fn() {}").unwrap();
         let header = header_position(&item, &args).unwrap();
         let (generics, ty) = lowered(&header, Implementor::Fixed);
         let where_clause = &generics.where_clause;
@@ -6817,7 +6923,10 @@ mod tests {
             quote!(#where_clause).to_string().replace(' ', ""),
             "where(&'staticfn()):::krate::m::Tr<'a,T>"
         );
-        assert_eq!(quote!(#ty).to_string().replace(' ', ""), "(&'a(),&'staticfn())");
+        assert_eq!(
+            quote!(#ty).to_string().replace(' ', ""),
+            "(&'a(),&'staticfn())"
+        );
         // An inherent impl has no trait reference, and the fragments of a scope are not the header.
         let inherent: Item = parse_str("impl Foo {}").unwrap();
         assert!(header_position(&inherent, &args).is_none());
@@ -6860,7 +6969,10 @@ mod tests {
         };
         assert!(!other(&format!("U: {}", entry_bound), ""));
         assert!(other("U", &format!("where T: {}", entry_bound)));
-        let vec_entry = format!("where Vec<(T, {})>: Clone", entry("u64", "()", parse_quote!(1)));
+        let vec_entry = format!(
+            "where Vec<(T, {})>: Clone",
+            entry("u64", "()", parse_quote!(1))
+        );
         assert!(other("U", &vec_entry));
         // The associated types are taken as they are, and so are the bounds without an entry.
         let item = format!("Iterator<Item = {}>", entry("u16", "()", parse_quote!(3)));

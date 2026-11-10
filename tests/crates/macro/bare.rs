@@ -464,7 +464,7 @@ mod tests {
             Item::Mod(m) => m,
             _ => unreachable!("not a module"),
         };
-        let mut leaker = Leaker::from_config(Rules::new().prelude());
+        let mut leaker = Leaker::with_rule(Rules::new().prelude());
         leaker.intern_mod(module);
         leaker.result().into_referrer()
     }

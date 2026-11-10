@@ -2,9 +2,11 @@
 
 mod common;
 
+use common::s;
+
 use syn::visit_mut::VisitMut;
 use syn::*;
-use template_quote::{quote, ToTokens};
+use template_quote::quote;
 use type_leak::{
     array_const, repeater_key, repeater_projection, Context, ContextId, EntryId, ImplSelf, Leaker,
     LeakerResult, ModuleScope, Referrer, SelfRequirement,
@@ -375,7 +377,8 @@ fn test_contexts() {
         expected(parse_quote! { struct X { a: P<0usize>, b: P<2usize>, c: P<1usize> } })
     );
     let expected_ty: Type = parse_quote!(::p::Q<P<0usize>>);
-    let ty = referrer.expand(
+    let ty = common::expand(
+        &referrer,
         context0,
         parse_quote!(::p::Q<RelA>),
         |_, ix, _| parse_quote!(P<#ix>),
@@ -517,7 +520,7 @@ fn test_referrer_followed_by_tokens() {
 }
 
 #[test]
-fn test_outermost_generics_as_leakers() {
+fn test_with_outer_generics() {
     // The Leaker is made from the trait, whose generics are those of the Leaker.
     let tr: ItemTrait = parse_quote! {
         trait MyTrait<T> {
@@ -528,11 +531,11 @@ fn test_outermost_generics_as_leakers() {
     let mut leaker = type_leak::Leaker::new();
     let context = leaker.intern_trait(&tr);
     let referrer = leaker.result().finish().unwrap();
-    let rewrite = |item: &Item, outermost_as_leakers: bool| {
+    let rewrite = |item: &Item, outer_generics: bool| {
         let mut item = item.clone();
         let mut visitor = referrer.visitor(context, |_, ix, _| parse_quote!(P<#ix>));
-        if outermost_as_leakers {
-            visitor = visitor.with_outermost_generics_as_leakers();
+        if outer_generics {
+            visitor = visitor.with_outer_generics();
         }
         visitor.visit_item_mut(&mut item);
         quote!(#item).to_string()
@@ -664,6 +667,7 @@ fn test_repeater_impl_replaces_self() {
             array_const,
         )
         .unwrap()
+        .into_iter()
         .map(|r| {
             // The implementor, `__S`, is the last parameter of the impl.
             let mut generics = r.generics;
@@ -848,6 +852,117 @@ fn test_visitor_with_self_names_the_elided_lifetime() {
         rewrite_with_self(&tr, host.clone(), sig.clone()),
         quote!(#sig).to_string().replace("Self", "Host < 'h >")
     );
+}
+
+/// `with_self()` writes the host for `Self` in the tokens of a macro that the copy keeps as written
+/// (the bound of a generic whose type names `Self` is an error of the Leaker, `UnprovableBound`,
+/// and the Referrer of `into_referrer()` leaves it so): inside groups too, and nothing without it.
+#[test]
+fn with_self_writes_the_host_in_the_tokens_of_a_macro() {
+    let tr: ItemTrait = parse_quote!(
+        trait Tr<T: ::p::Tr<::p::m!(Self, [Self; 2], (u8, (Self,)))>> {
+            fn f(&self, t: T);
+        }
+    );
+    let mut leaker = Leaker::with_rule(type_leak::Rules::new().primitive().prelude());
+    let context = leaker.intern_trait(&tr);
+    let result = leaker.result();
+    assert_eq!(result.errors().len(), 1);
+    assert_eq!(
+        result.errors()[0].reason,
+        type_leak::Reason::UnprovableBound
+    );
+    let referrer = result.into_referrer();
+    assert_eq!(referrer.iter().count(), 0);
+    let written = |host: Option<Type>| -> ItemTrait {
+        let mut copy = tr.clone();
+        let visitor = referrer.visitor(context, |ty, _, _| ty);
+        match host {
+            Some(host) => visitor.with_self(host).visit_item_trait_mut(&mut copy),
+            None => {
+                let mut visitor = visitor;
+                visitor.visit_item_trait_mut(&mut copy)
+            }
+        }
+        copy
+    };
+    assert_eq!(s(&written(None)), s(&tr));
+    let hosts: [Type; 3] = [
+        parse_quote!(__S),
+        parse_quote!(::p::S<'z, u8>),
+        parse_quote!(&'static Host),
+    ];
+    for host in hosts {
+        let expected: ItemTrait = parse_quote!(
+            trait Tr<T: ::p::Tr<::p::m!(#host, [#host; 2], (u8, (#host,)))>> {
+                fn f(&self, t: T);
+            }
+        );
+        assert_eq!(
+            s(&written(Some(host.clone()))),
+            s(&expected),
+            "{}",
+            s(&host)
+        );
+    }
+}
+
+/// A written bound whose inputs show the elided lifetime that its output takes (`Fn(&Rel<u8>) ->
+/// &u8`) gets it named if `type_fn` writes a path with a lifetime into the inputs, in a trait object,
+/// an `impl Trait`, a bound of a generic and a predicate; not if it writes none or the lifetime is
+/// named already.
+#[test]
+fn test_visitor_names_the_elided_lifetime_of_a_bound_where_type_fn_writes_lifetimes() {
+    let tr: ItemTrait = parse_quote!(
+        trait Tr<'q> {
+            fn a(&self, f: Box<dyn Fn(&Rel<u8>) -> &u8>);
+            fn b(&self, f: impl Fn(&Rel<u8>) -> &u8);
+            fn c<F: Fn(&Rel<u8>) -> &u8>(&self, f: F)
+            where
+                F: Fn(&Rel<u8>, u8) -> &u8;
+            fn d(&self, f: Box<dyn Fn(&Rel<u8>) -> &u8 + 'q>);
+            fn e(&self, f: Box<dyn for<'x> Fn(&'x Rel<u8>) -> &'x u8>);
+            fn f(&self, f: Box<dyn Fn(&Rel<u8>) -> u8>);
+        }
+    );
+    let mut leaker = Leaker::with_rule(type_leak::Rules::new().primitive().prelude());
+    let context = leaker.intern_trait(&tr);
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(referrer.iter().count(), 1);
+    // The path that `type_fn` writes has a lifetime of the trait in it, or none.
+    let copy = |written: Type| -> ItemTrait {
+        let mut copy = tr.clone();
+        referrer
+            .visitor(context, |_, _, _| written.clone())
+            .visit_item_trait_mut(&mut copy);
+        copy
+    };
+    let with: Type = parse_quote!(<() as R<(&'q (),), 0usize>>::Type);
+    let expected: ItemTrait = parse_quote!(
+        trait Tr<'q> {
+            fn a(&self, f: Box<dyn for<'__tl_e0> Fn(&'__tl_e0 #with) -> &'__tl_e0 u8>);
+            fn b(&self, f: impl for<'__tl_e0> Fn(&'__tl_e0 #with) -> &'__tl_e0 u8);
+            fn c<F: for<'__tl_e0> Fn(&'__tl_e0 #with) -> &'__tl_e0 u8>(&self, f: F)
+            where F: for<'__tl_e0> Fn(&'__tl_e0 #with, u8) -> &'__tl_e0 u8;
+            fn d(&self, f: Box<dyn for<'__tl_e0> Fn(&'__tl_e0 #with) -> &'__tl_e0 u8 + 'q>);
+            fn e(&self, f: Box<dyn for<'x> Fn(&'x #with) -> &'x u8>);
+            fn f(&self, f: Box<dyn Fn(&#with) -> u8>);
+        }
+    );
+    assert_eq!(s(&copy(with)), s(&expected));
+    // No lifetime is added: the bounds are as they were.
+    let without: Type = parse_quote!(<() as R<(), 0usize>>::Type);
+    let expected: ItemTrait = parse_quote!(
+        trait Tr<'q> {
+            fn a(&self, f: Box<dyn Fn(&#without) -> &u8>);
+            fn b(&self, f: impl Fn(&#without) -> &u8);
+            fn c<F: Fn(&#without) -> &u8>(&self, f: F) where F: Fn(&#without, u8) -> &u8;
+            fn d(&self, f: Box<dyn Fn(&#without) -> &u8 + 'q>);
+            fn e(&self, f: Box<dyn for<'x> Fn(&'x #without) -> &'x u8>);
+            fn f(&self, f: Box<dyn Fn(&#without) -> u8>);
+        }
+    );
+    assert_eq!(s(&copy(without)), s(&expected));
 }
 
 /// `Visitor::with_self()` docs: it names the elided lifetime with a fresh
@@ -1258,7 +1373,7 @@ fn a_visitor_borrows_the_referrer_so_its_closure_may_use_it() {
     let repeater: Path = parse_quote!(crate::Repeater);
     let mut first = referrer.visitor(top_level, |_, ix, context| {
         // The Referrer is usable here, as the context is.
-        assert!(referrer.bucket_self(ix, 7).is_some());
+        assert!(referrer.bucket_self(7, ix).is_some());
         repeater_projection(&repeater, &parse_quote!(Self), context, 7, ix, array_const).unwrap()
     });
     let mut second = referrer.visitor(top_level, |_, ix, _| parse_quote!(P<#ix>));
@@ -1282,13 +1397,9 @@ fn a_visitor_borrows_the_referrer_so_its_closure_may_use_it() {
 
 // ── the context of the visitor ───────────────────────────────────────────────────────────────
 //
-// `Referrer::visitor(context, ..)` and `Referrer::expand(context, ..)`: the context is the scope of
-// the copy, and the visited syntax is inside it. The visitor takes from the context the generics in
-// scope, what `Self` means and the module.
-
-fn s(x: &impl ToTokens) -> String {
-    quote!(#x).to_string()
-}
+// `Referrer::visitor(context, ..)`, on a whole item or on one type (`common::expand()`): the
+// context is the scope of the copy, and the visited syntax is inside it. The visitor takes from the
+// context the generics in scope, what `Self` means and the module.
 
 /// Rewrites each leaked type to `P<index>`.
 fn replace(_: Type, ix: EntryId, _: &Context) -> Type {
@@ -1542,9 +1653,9 @@ fn a_scope_in_a_module_is_in_that_module() {
         leaker.enter_generics(&parse_quote!(<T>), |view| view.visit_type(&parse_quote!(T)));
     let referrer = leaker.result().finish().unwrap();
     let mut ty: Type = parse_quote!(Rel);
-    ty = referrer.expand(outside, ty, replace);
+    ty = common::expand(&referrer, outside, ty, replace);
     assert_eq!(s(&ty), "Rel");
-    ty = referrer.expand(module, parse_quote!(Rel), replace);
+    ty = common::expand(&referrer, module, parse_quote!(Rel), replace);
     assert_eq!(s(&ty), "P < 0 >");
 }
 
@@ -1610,7 +1721,7 @@ fn self_is_taken_from_the_context() {
     assert_eq!(s(&copy), s(&expected));
     // `expand()` takes `Self` from the context too.
     for context in [c1, c2, c3] {
-        let ty = referrer.expand(context, parse_quote!(Rel<Self>), replace);
+        let ty = common::expand(&referrer, context, parse_quote!(Rel<Self>), replace);
         let ix = proc_macro2::Literal::usize_unsuffixed(ix_of(context));
         assert_eq!(s(&ty), s(&parse_quote!(P<#ix>) as &Type));
     }
@@ -1620,7 +1731,7 @@ fn self_is_taken_from_the_context() {
     let (plain, ()) =
         leaker.enter_generics(&parse_quote!(<T>), |view| view.visit_type(&parse_quote!(T)));
     let referrer = leaker.result().finish().unwrap();
-    let ty = referrer.expand(plain, parse_quote!(Rel<Self>), replace);
+    let ty = common::expand(&referrer, plain, parse_quote!(Rel<Self>), replace);
     assert_eq!(s(&ty), "Rel < Self >");
 }
 
@@ -1855,7 +1966,7 @@ fn the_generics_are_taken_from_the_context() {
     );
     assert_eq!(s(&item), s(&expected));
     // (With other bounds, they are declared by the copy and are another `T`, unless the outermost
-    // generics are the context's: see `test_outermost_generics_as_leakers`.)
+    // generics are the context's: see `test_with_outer_generics`.)
 }
 
 #[test]
@@ -1955,7 +2066,7 @@ fn an_entry_context_is_a_scope_too() {
     let referrer = leaker.result().finish().unwrap();
     for ix in 0..referrer.iter().count() {
         let ty = common::types(&referrer).nth(ix).unwrap().clone();
-        let rewritten = referrer.expand(common::entry_id(&referrer, ix), ty, replace);
+        let rewritten = common::expand(&referrer, common::entry_id(&referrer, ix), ty, replace);
         let ix = proc_macro2::Literal::usize_unsuffixed(ix);
         assert_eq!(s(&rewritten), s(&parse_quote!(P<#ix>) as &Type));
     }
@@ -2030,7 +2141,7 @@ fn a_trait_is_rewritten_whole_and_part_by_part() {
 }
 
 /// The docs of `Referrer::visitor()`: a signature visited by itself is a nested item: its generics
-/// are its own, unless `with_outermost_generics_as_leakers()` says they are the context's. So the
+/// are its own, unless `with_outer_generics()` says they are the context's. So the
 /// method `f<T: Clone>` has a `T` of its own, and `Wrap<T>` is not the entry of the trait's `T`,
 /// while with the flag it is. Audit mutant `D5` (`visit_signature_mut` treated as no item).
 #[test]
@@ -2076,7 +2187,7 @@ fn a_signature_visited_by_itself_is_a_nested_item() {
         let expected: Signature = parse_str(expected).unwrap();
         let mut visitor = referrer.visitor(context, replace);
         if as_leakers {
-            visitor = visitor.with_outermost_generics_as_leakers();
+            visitor = visitor.with_outer_generics();
         }
         visitor.visit_signature_mut(&mut sig);
         assert_eq!(
@@ -2121,4 +2232,97 @@ fn the_entries_of_a_context_may_be_in_several_groups() {
     let referrer: Referrer = parse_str(&format!("\"{}\" 3 () (A) # 5 (B)", tag)).unwrap();
     assert_eq!(common::context_ids(&referrer).len(), 3);
     assert_eq!(parse2::<Referrer>(quote!(#referrer)).unwrap(), referrer);
+}
+
+/// The calls of a closure of a visitor: the entry and a clone of the context it was given.
+type Calls = std::cell::RefCell<Vec<(EntryId, Context)>>;
+
+/// Checks that the contexts in `calls` are those of `iter()` for the entries, and that no two of
+/// the `count` calls got the same.
+fn assert_contexts_of_entries(referrer: &Referrer, calls: &[(EntryId, Context)], count: usize) {
+    assert_eq!(calls.len(), count);
+    for (ix, context) in calls {
+        let (_, _, expected) = referrer.iter().find(|(id, _, _)| id == ix).unwrap();
+        assert_eq!(context, expected, "{}", ix);
+        assert_eq!(
+            format!("{:?}", context),
+            format!("{:?}", expected),
+            "{}",
+            ix
+        );
+    }
+    let distinct: std::collections::BTreeSet<String> =
+        calls.iter().map(|(_, c)| format!("{:?}", c)).collect();
+    assert_eq!(distinct.len(), count);
+}
+
+/// The `&Context` that the closures of `visitor()`, `expand()` and `with_nested_self()` get with an
+/// entry is the one `iter()` gives for it, with a context of its own for each entry.
+#[test]
+fn the_context_given_to_the_closures_is_that_of_the_entry() {
+    // `visitor()` and `expand()`: three entries, with the contexts `<'a, T: 'a>`, `<U: Clone>` and
+    // none.
+    let item: ItemTrait = parse_quote!(
+        trait Tr<'a, T: 'a> {
+            fn f(&self, x: &'a Rel<T>) -> Wrap<u8>;
+            fn g<U: ::core::clone::Clone>(&self, u: Rel2<U>);
+        }
+    );
+    let mut leaker = Leaker::with_rule(type_leak::Rules::new().primitive().prelude());
+    let top = leaker.intern_trait(&item);
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(referrer.iter().count(), 3);
+    let calls = Calls::default();
+    let mut copy = item.clone();
+    referrer
+        .visitor(top, |ty, ix, context| {
+            calls.borrow_mut().push((ix, context.clone()));
+            ty
+        })
+        .visit_item_trait_mut(&mut copy);
+    assert_contexts_of_entries(&referrer, &calls.borrow(), 3);
+    // (`Rel2<U>` names a generic of a method, which the scope of the trait does not have.)
+    let calls = Calls::default();
+    for (_, ty, _) in referrer.iter().take(2) {
+        let _ = common::expand(&referrer, top, ty.clone(), |ty, ix, context| {
+            calls.borrow_mut().push((ix, context.clone()));
+            ty
+        });
+    }
+    assert_contexts_of_entries(&referrer, &calls.borrow(), 2);
+
+    // `with_nested_self()`: the entries of two nested items go to its closure, that of the third
+    // one to the ordinary closure, each with the context of its own.
+    let module: ItemMod = parse_quote!(
+        mod m {
+            pub struct A<T: ::core::convert::AsRef<Self>>(pub Wrap<T>);
+            pub struct B(pub Rel<Self>);
+            pub struct C<U: ::core::clone::Clone>(pub Rel2<U>);
+        }
+    );
+    let mut leaker = Leaker::with_rule(type_leak::Rules::new().primitive().prelude());
+    let top = leaker.intern_mod(&module);
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(referrer.iter().count(), 3);
+    let (ordinary, nested) = (Calls::default(), Calls::default());
+    let mut copy = module.clone();
+    referrer
+        .visitor(top, |ty, ix, context| {
+            ordinary.borrow_mut().push((ix, context.clone()));
+            ty
+        })
+        .with_nested_self(|_, leaked, ix, context| {
+            nested.borrow_mut().push((ix, context.clone()));
+            leaked
+        })
+        .visit_item_mod_mut(&mut copy);
+    assert_eq!(ordinary.borrow().len(), 1);
+    let all: Vec<(EntryId, Context)> = ordinary
+        .borrow()
+        .iter()
+        .chain(nested.borrow().iter())
+        .cloned()
+        .collect();
+    assert_eq!(nested.borrow().len(), 2);
+    assert_contexts_of_entries(&referrer, &all, 3);
 }

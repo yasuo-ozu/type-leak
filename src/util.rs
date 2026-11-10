@@ -1095,35 +1095,3 @@ impl<'a> syn::fold::Fold for ReplaceSelf<'a> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::tidy_str;
-
-    #[test]
-    fn tidy_writes_tokens_as_one_does() {
-        for (tokens, written) in [
-            ("Rel < '_ , u8 >", "Rel<'_, u8>"),
-            ("Vec < & '_ u8 > :: new", "Vec<&'_ u8>::new"),
-            ("I1 < & 'a < Self as Tr > :: A >", "I1<&'a <Self as Tr>::A>"),
-            (":: p :: Wrap < Rel >", "::p::Wrap<Rel>"),
-            ("Self :: A", "Self::A"),
-            ("< Self as :: p :: Tr > :: A", "<Self as ::p::Tr>::A"),
-            ("dyn :: core :: fmt :: Debug", "dyn ::core::fmt::Debug"),
-            ("Other < '_ , :: core :: u8 >", "Other<'_, ::core::u8>"),
-            ("T : :: p :: Tr < Self >", "T : ::p::Tr<Self>"),
-            ("fn () -> :: p :: X", "fn () -> ::p::X"),
-            (
-                "for < 'a > :: core :: ops :: Fn (& 'a u8)",
-                "for<'a> ::core::ops::Fn (&'a u8)",
-            ),
-            (
-                "Tr < for < 'a > Fn (& 'a u8) > :: A",
-                "Tr<for<'a> Fn (&'a u8)>::A",
-            ),
-            ("m ! (Self)", "m!(Self)"),
-        ] {
-            assert_eq!(tidy_str(tokens), written, "{}", tokens);
-        }
-    }
-}

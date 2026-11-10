@@ -17,11 +17,12 @@
 //! - an entry in the self type of an impl, whose bound names `Self`;
 //!
 //! and the note of the lifetime that a path hides, where the holder of the signature cannot be
-//! leaked.
+//! leaked. The last test (`tidy_writes_tokens_as_one_does`) pins how the texts write the tokens
+//! they quote.
 
 mod common;
 
-use common::starts_with;
+use common::{messages, starts_with};
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
@@ -32,7 +33,7 @@ fn leaker() -> Leaker<impl Allow> {
         .primitive()
         .prelude()
         .or_if(starts_with(parse_quote!(::p)));
-    Leaker::from_config(config)
+    Leaker::with_rule(config)
 }
 
 /// What an error says.
@@ -68,15 +69,6 @@ fn shown(err: &[ErrorItem]) -> Vec<Shown> {
                 .to_string(),
         })
         .collect()
-}
-
-/// The messages of the errors, one per line.
-fn messages(errors: &[ErrorItem]) -> String {
-    errors
-        .iter()
-        .map(|item| item.message.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// The errors that `leaker` has after `analyze` ran on it (`Leaker::result()`).
@@ -515,4 +507,292 @@ fn the_note_of_a_hidden_lifetime_says_where_the_holder_is_not_leaked() {
              or write `Rel<T>` with an absolute path",
         )]
     );
+}
+
+/// How a row of `TIDY` is analyzed.
+#[derive(Clone, Copy)]
+enum Via {
+    /// A struct, trait or impl, by the `intern_*` of its kind.
+    Item,
+    /// The same, with the values read (`Leaker::check_values`).
+    Values,
+    /// A where predicate on `T` of a trait: an impl nested in it has the entry `Rel<T>`, so the
+    /// predicate is copied, and its `Self` has no name there.
+    Predicate,
+}
+
+/// The rows: the rule of the text, how to analyze, the input, and the renderings that the texts of
+/// the errors (headline, notes and help) must contain.
+const TIDY: &[(&str, Via, &str, &[&str])] = &[
+    (
+        "no space inside `<..>` or before `,`, `'_` before a type",
+        Via::Item,
+        "struct S { a: Rel<'_, u8> }",
+        &["'Rel<'_, u8>'"],
+    ),
+    (
+        "an absolute path as an argument",
+        Via::Item,
+        "struct S { a: Other<'_, ::core::u8> }",
+        &["'Other<'_, ::core::u8>'"],
+    ),
+    (
+        "`::` after the `>` of a type",
+        Via::Item,
+        "struct S { a: Rel<&'_ u8>::Item }",
+        &["'Rel<&'_ u8>::Item'"],
+    ),
+    (
+        "`::<` of a path in a value",
+        Via::Values,
+        "impl S { const X: usize = Rel::<&'_ u8>::new(); }",
+        &["'Rel::<&'_ u8>::new'"],
+    ),
+    (
+        "`<` after a lifetime keeps its space",
+        Via::Item,
+        "struct S<'a> { a: I1<'_, &'a <Self as Tr>::A> }",
+        &["'I1<'_, &'a <Self as Tr>::A>'"],
+    ),
+    (
+        "an absolute path with an argument",
+        Via::Item,
+        "struct S { a: Other<'_, ::p::Wrap<Rel>> }",
+        &["'Other<'_, ::p::Wrap<Rel>>'"],
+    ),
+    (
+        "`Self::A` in a type",
+        Via::Item,
+        "struct S<T>(T, Rel<Self::A>);",
+        &[
+            "instead of `Self::A` in `Rel<Self::A>`:",
+            "because of `Self::A`",
+            "replace `Self::A` with `<Self as SomeTrait>::A`,",
+        ],
+    ),
+    (
+        "`Self::A0` and a Fn sugar in a bound",
+        Via::Item,
+        "trait Tr { type A0; fn m<X>(&self) where X: Fn(&Self::A0) -> u8, Rel<X>: Default; }",
+        &[
+            "a bound of its generics names `Self::A0`",
+            "the bound `X : Fn (&Self::A0) -> u8` of its generics",
+            "write the bound without `Self::A0`,",
+        ],
+    ),
+    (
+        "`<Self as ::p::Tr>::A0` in a bound",
+        Via::Item,
+        "trait Tr { type A0; fn m<X>(&self) \
+         where X: ::core::ops::Fn(&<Self as ::p::Tr>::A0) -> u8, Rel<X>: Default; }",
+        &[
+            "a bound of its generics names `<Self as ::p::Tr>::A0`",
+            "the bound `X : ::core::ops::Fn (&<Self as ::p::Tr>::A0) -> u8` of its generics",
+            "write the bound without `<Self as ::p::Tr>::A0`,",
+        ],
+    ),
+    (
+        "a trait object behind a reference, `dyn ::` and `& dyn`",
+        Via::Item,
+        "trait Tr { fn f(&self) -> Rel<&dyn ::core::fmt::Debug>; }",
+        &[
+            "'Rel<&dyn ::core::fmt::Debug>'",
+            "because of `&dyn ::core::fmt::Debug`",
+            "because of `dyn ::core::fmt::Debug`",
+        ],
+    ),
+    (
+        "`->` of a function pointer, before an absolute path",
+        Via::Item,
+        "struct S { a: Other<'_, fn() -> ::p::X> }",
+        &["'Other<'_, fn () -> ::p::X>'"],
+    ),
+    (
+        "a binder before an absolute path, and a space before a Fn sugar",
+        Via::Item,
+        "trait Tr { fn f(&self, x: Rel<impl for<'a> ::core::ops::Fn(&'a u8)>); }",
+        &[
+            "'Rel<impl for<'a> ::core::ops::Fn (&'a u8)>'",
+            "because of `impl for<'a> ::core::ops::Fn (&'a u8)`",
+        ],
+    ),
+    (
+        "a binder inside the arguments before `::A`",
+        Via::Item,
+        "struct S { a: Other<'_, Tr<dyn for<'a> Fn(&'a u8)>::A> }",
+        &["'Other<'_, Tr<dyn for<'a> Fn (&'a u8)>::A>'"],
+    ),
+    (
+        "`!` of an absolute macro, ` : ` in the trait of the note",
+        Via::Item,
+        "trait Tr: ::p::Sup<::p::m!(Self)> {}",
+        &["`::p::m!(Self)` names `Self`", "(`Self : Tr`)"],
+    ),
+    (
+        "`!` of a relative macro in a type",
+        Via::Item,
+        "trait Tr where Wrap<m!(Self)>: Sized {}",
+        &["`Wrap<m!(Self)>` names `Self`", "`m!(Self)` names `Self`"],
+    ),
+    (
+        "` : ` of a bound that names a leaked type",
+        Via::Item,
+        "struct S<T> where T: ::p::Tr<Rel<T>> { a: T }",
+        &["the bound `T : ::p::Tr<Rel<T>>` of its generics"],
+    ),
+    (
+        "the trait of the note, with arguments",
+        Via::Item,
+        "trait Tr<T> where T: ::p::Tr<Self>, Rel<T>: Clone {}",
+        &["(`Self : Tr<T>`)"],
+    ),
+    (
+        "another path of the same type",
+        Via::Item,
+        "trait Tr { fn f(&self, x: Box<dyn RelA + RelB<'_, ::core::u8>>); }",
+        &[
+            "'RelA'",
+            "`RelB<'_, ::core::u8>` also depends on the type context",
+        ],
+    ),
+    (
+        "a where predicate",
+        Via::Predicate,
+        "T: ::p::Tr<Self>",
+        &[
+            "the where predicate `T : ::p::Tr<Self>` mentions a `Self` which has no name here",
+            "the `Self` of the trait `Tr<'a, T>`,",
+            "write the where predicate `T : ::p::Tr<Self>` without `Self`,",
+        ],
+    ),
+    (
+        "an absolute path with an argument in a predicate",
+        Via::Predicate,
+        "T: ::p::Tr<::p::Wrap<Rel>, Self>",
+        &["`T : ::p::Tr<::p::Wrap<Rel>, Self>`"],
+    ),
+    (
+        "`Self::A` in a predicate",
+        Via::Predicate,
+        "T: ::p::Tr<Self::A>",
+        &["`T : ::p::Tr<Self::A>`", "because of `Self::A`"],
+    ),
+    (
+        "`<Self as ::p::Tr>::A` in a predicate",
+        Via::Predicate,
+        "T: ::p::Tr<<Self as ::p::Tr>::A>",
+        &["`T : ::p::Tr<<Self as ::p::Tr>::A>`"],
+    ),
+    (
+        "a trait object in a predicate",
+        Via::Predicate,
+        "T: ::p::Tr<dyn ::core::fmt::Debug, Self>",
+        &["`T : ::p::Tr<dyn ::core::fmt::Debug, Self>`"],
+    ),
+    (
+        "an elided lifetime and an absolute path in a predicate",
+        Via::Predicate,
+        "T: ::p::Tr<Other<'_, ::core::u8>, Self>",
+        &["`T : ::p::Tr<Other<'_, ::core::u8>, Self>`"],
+    ),
+    (
+        "`->` in a predicate",
+        Via::Predicate,
+        "T: ::p::Tr<fn() -> ::p::X, Self>",
+        &["`T : ::p::Tr<fn () -> ::p::X, Self>`"],
+    ),
+    (
+        "a binder and a Fn sugar in a predicate",
+        Via::Predicate,
+        "T: for<'a> ::core::ops::Fn(&'a u8) + ::p::Tr<Self>",
+        &["`T : for<'a> ::core::ops::Fn (&'a u8) + ::p::Tr<Self>`"],
+    ),
+    (
+        "a binder inside the arguments before `::A` in a predicate",
+        Via::Predicate,
+        "T: ::p::Tr<Tr<dyn for<'a> Fn(&'a u8)>::A, Self>",
+        &["`T : ::p::Tr<Tr<dyn for<'a> Fn (&'a u8)>::A, Self>`"],
+    ),
+    (
+        "a macro in a predicate",
+        Via::Predicate,
+        "T: ::p::Tr<m!(Self)>",
+        &["`T : ::p::Tr<m!(Self)>`"],
+    ),
+    (
+        "`<` after a lifetime in a predicate",
+        Via::Predicate,
+        "T: ::p::Tr<I1<&'a <Self as Tr>::A>>",
+        &["`T : ::p::Tr<I1<&'a <Self as Tr>::A>>`"],
+    ),
+    (
+        "`::` after the `>` of a type in a predicate",
+        Via::Predicate,
+        "T: ::p::Tr<Vec<&'_ u8>::Item, Self>",
+        &["`T : ::p::Tr<Vec<&'_ u8>::Item, Self>`"],
+    ),
+];
+
+/// The errors of `source` (an item), as `via` analyzes it.
+fn tidy_errors(via: Via, source: &str) -> Vec<ErrorItem> {
+    match via {
+        Via::Item | Via::Values => {
+            let item: Item = parse_str(source).unwrap();
+            errors_of(leaker(), |leaker| {
+                leaker.check_values = matches!(via, Via::Values);
+                match &item {
+                    Item::Struct(item) => leaker.intern_struct(item),
+                    Item::Trait(item) => leaker.intern_trait(item),
+                    Item::Impl(item) => leaker.intern_impl(item),
+                    _ => panic!("not a struct, trait or impl: {}", source),
+                };
+            })
+        }
+        Via::Predicate => {
+            let mut generics: Generics = parse_quote!(<'a, T>);
+            generics.where_clause = Some(parse_str(&format!("where {}", source)).unwrap());
+            let tr: Ident = parse_quote!(Tr);
+            errors_of(leaker(), |leaker| {
+                leaker.enter_trait(&tr, &generics, |view| {
+                    view.visit_item(&parse_quote!(
+                        impl ::p::W for X {
+                            fn f(&self, x: Rel<T>) {}
+                        }
+                    ))
+                });
+            })
+        }
+    }
+}
+
+/// The messages tell tokens as one writes them (`Rel<'_, u8>`, `fn () -> ::p::X`, `m!(Self)`), not
+/// with the spaces of a token stream (`Rel < '_ , u8 >`). The rules are those of the private
+/// `tidy_str()`, and each row has a different input for one of them: no space around `<`, `>`,
+/// `::` and `,`; a space after `'_` and `'a`; the binder `for<'a>`; `->`; a space before the `(` of
+/// a Fn sugar; the `!` of a macro; ` : ` of a bound; `dyn ::p::Tr` keeps its space.
+#[test]
+fn tidy_writes_tokens_as_one_does() {
+    for (case, via, source, renderings) in TIDY {
+        let errors = tidy_errors(*via, source);
+        assert!(!errors.is_empty(), "{}: accepted: {}", case, source);
+        let texts: Vec<&str> = errors
+            .iter()
+            .flat_map(|item| {
+                let notes = item.notes.iter().map(|(_, note)| note.as_str());
+                std::iter::once(item.message.as_str())
+                    .chain(notes)
+                    .chain(item.help_text())
+            })
+            .collect();
+        for rendering in *renderings {
+            assert!(
+                texts.iter().any(|text| text.contains(rendering)),
+                "{}: `{}` is not in the texts of `{}`:\n{}",
+                case,
+                rendering,
+                source,
+                texts.join("\n")
+            );
+        }
+    }
 }
