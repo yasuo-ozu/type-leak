@@ -2450,6 +2450,26 @@ pub mod kinds {
         }],
     );
 
+    // F111 (`tests/findings.rs`): an array that is an optional entry only through its length keeps
+    // a method lifetime. It fails to build on the code before the fix.
+
+    /// The length of the arrays below, named by an absolute path that the rule does not allow.
+    pub const LEN9272: usize = 2;
+
+    /// F111: the array is the only input of `f` that holds `'x`, and of `g` one of two with the
+    /// optional `Held<'y>`. Its length made it an optional entry, which the copy replaced: `'x` was
+    /// in projections only, early-bound where the trait has it late-bound (E0195 in the impl of the
+    /// host). The arrays are written as they are now; `Held<'x>` and `Held<'y>` are entries.
+    #[prop_leak(id = 9272, prelude = true)]
+    pub trait ArrayHoldsLifetime {
+        fn f<'x>(&self, a: [&'x String; ::type_leak_test_leaker::kinds::LEN9272]) -> Held<'x>;
+        fn g<'y>(
+            &self,
+            a: [&'y String; ::type_leak_test_leaker::kinds::LEN9272],
+            b: ::type_leak_test_leaker::kinds::Held<'y>,
+        ) -> Held<'y>;
+    }
+
     // F102 (`tests/findings.rs`): the `Self` of an item in the default of a type parameter is its
     // own. It fails to build on the code before the fix.
 

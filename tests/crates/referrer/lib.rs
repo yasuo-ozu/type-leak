@@ -292,6 +292,9 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9264!(path = ::type_leak_test_leaker::kinds);
     // The names that a block in an array length declares are local (F110).
     type_leak_test_leaker::__tl_prop_9271!(path = ::type_leak_test_leaker::kinds);
+    // An array that is optional through its length and keeps a method lifetime is written as it
+    // is, and the lifetime stays in an input (F111).
+    type_leak_test_leaker::__tl_prop_9272!(path = ::type_leak_test_leaker::kinds);
     // The `Self` of an item in the default of a type parameter is the item's own (F102).
     type_leak_test_leaker::__tl_prop_9265!(path = ::type_leak_test_leaker::kinds);
     // The argument of a generic associated type replaces its parameter in its where clause (F89).

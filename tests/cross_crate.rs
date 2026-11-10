@@ -2432,6 +2432,27 @@ fn the_optional_types_around_an_object_bounded_by_a_method_lifetime_are_written_
     under_types::<r::Host9229>();
 }
 
+/// F111: an array whose length names a const by an absolute path that the rule does not allow is
+/// an optional entry. Where it is the only input that holds a method lifetime, alone or beside a
+/// type of that crate, the copy replaced it, so `'x` was in projections only: early-bound where the
+/// trait has it late-bound (E0195 in the impl of the host, in `tests/crates/referrer`). The arrays
+/// are written as they are now. The host implements the trait of the Leaker's crate.
+#[test]
+fn an_array_optional_through_its_length_that_holds_a_method_lifetime_is_written_as_it_is() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::kinds as r;
+
+    assert_eq!(
+        reported(9272, __tl_report_9272!()),
+        ok("trait", 2, 5, 5),
+        "{}",
+        __tl_report_9272!()
+    );
+    fn array_holds_lifetime<T: l::ArrayHoldsLifetime>() {}
+    array_holds_lifetime::<r::Host9272>();
+}
+
 /// Fixture 9236: const generics of type `u64` and `u128` in the arguments of the Repeater. The
 /// slots put a `u128` into `KEY` (so the entry that uses only it has the argument `(*const dyn
 /// Repeater<(), M, Type = ()>,)`) and a `u64` into the slot `U64`; the Referrer's crate compiles

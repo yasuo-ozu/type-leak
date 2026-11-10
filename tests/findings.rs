@@ -19736,3 +19736,177 @@ fn f110_a_name_that_a_block_in_a_type_declares_is_no_relative_path() {
         }
     }
 }
+
+// ── F111 ─────────────────────────────────────────────────────────────────────
+
+/// F111 (fixed): an array that is an optional entry only through its length was replaced, though it
+/// is the only input that keeps a method lifetime.
+///
+/// Trigger, E0195: `fn m<'x>(&self, a0: [&'x String; ::l::base::BLEN]) -> super::base::Bl<'x>` in
+/// a trait, with `::l` not allowed. The length names a const of another crate, so the array is an
+/// optional entry, and the copy was `fn m<'x>(&self, a0: P<1>) -> P<0>`: `'x` only in projections,
+/// which do not constrain it, so the impl of the copy in the Referrer's crate had it early-bound
+/// where the trait has it late-bound. No error. Found by the property test (seed 5, case 10, with
+/// `::l::base::B1<&'x u8>` as a second input that keeps `'x`).
+///
+/// Cause: the check of F18 (the optional types that alone keep a lifetime are written as they are)
+/// runs only for a lifetime that no input keeps as written (`&'x u8`, `&'x self`). That list looked
+/// into an array as into a tuple, and took `&'x String` in it for a keeper, though the Referrer
+/// replaces the array with what is in it. With `::l::base::B1<&'x u8>` in its place it worked, as
+/// the list does not look into a path.
+///
+/// Fix: the list does not look into an array whose length names another crate, as it does not count
+/// a reference to a trait object of another crate. Then the check of F18 makes the array no optional
+/// entry, and the copy writes it as it is (with the path of the const: the Referrer's crate must
+/// name the crate as the Leaker's does); a relative type in it is the entry (`[&'x Rel; ..]` was
+/// one entry, E0195 too). A relative length makes the array a required entry, which the check of F7
+/// reports and the copy writes as it is, as before. Beside such an array, a trait object of this
+/// crate behind `&'x` is now the error `UnconstrainedLifetime` (both were entries, E0195), as beside
+/// a type of another crate. Cross-crate fixture 9272: the Referrer's crate did not build before the
+/// fix (E0195).
+#[test]
+fn f111_an_array_optional_through_its_length_that_keeps_a_method_lifetime_is_written_as_it_is() {
+    // An item, the errors, the entries and the copy (`P<ix>` for an entry).
+    type Case = (
+        ItemTrait,
+        Vec<(Reason, String)>,
+        Vec<&'static str>,
+        &'static str,
+    );
+    let bl = "super :: base :: Bl < 'x >";
+    let cases: Vec<Case> = vec![
+        // The array alone keeps `'x`: it is written as it is.
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(&self, a0: [&'x String; ::l::base::BLEN]) -> super::base::Bl<'x>;
+                }
+            ),
+            vec![],
+            vec![bl],
+            "trait Tr { fn m < 'x > (& self , a0 : [& 'x String ; :: l :: base :: BLEN]) -> P < 0usize > ; }",
+        ),
+        // The element is of another crate too: both are written as they are.
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(
+                        &self,
+                        a0: [::l::base::B1<&'x u8>; ::l::base::BLEN],
+                    ) -> super::base::Bl<'x>;
+                }
+            ),
+            vec![],
+            vec![bl],
+            "trait Tr { fn m < 'x > (& self , a0 : [:: l :: base :: B1 < & 'x u8 > ; :: l :: base :: BLEN] ,) -> P < 0usize > ; }",
+        ),
+        // The element holds a relative type: it is the entry, not the array around it.
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(&self, a0: [&'x Rel; ::l::base::BLEN]) -> super::base::Bl<'x>;
+                }
+            ),
+            vec![],
+            vec![bl, "Rel"],
+            "trait Tr { fn m < 'x > (& self , a0 : [& 'x P < 1usize > ; :: l :: base :: BLEN]) -> P < 0usize > ; }",
+        ),
+        // The shape that the property test found: the array and a type of another crate.
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(
+                        &self,
+                        a0: [&'x String; ::l::base::BLEN],
+                        a1: ::l::base::B1<&'x u8>,
+                    ) -> super::base::Bl<'x>;
+                }
+            ),
+            vec![],
+            vec![bl],
+            "trait Tr { fn m < 'x > (& self , a0 : [& 'x String ; :: l :: base :: BLEN] , a1 : :: l :: base :: B1 < & 'x u8 > ,) -> P < 0usize > ; }",
+        ),
+        // A relative length: the array is a required entry, reported (the cause is the length)
+        // and written as it is.
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(&self, a0: [&'x String; super::base::BLEN]) -> super::base::Bl<'x>;
+                }
+            ),
+            vec![(
+                Reason::UnconstrainedLifetime,
+                "super :: base :: BLEN".to_string(),
+            )],
+            vec![bl],
+            "trait Tr { fn m < 'x > (& self , a0 : [& 'x String ; super :: base :: BLEN]) -> P < 0usize > ; }",
+        ),
+        // Controls: a type of another crate in its place is written as it is, as before (F18);
+        // another input keeps `'x` as written, so the array is an optional entry, as before.
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(&self, a0: ::l::base::B1<&'x u8>) -> super::base::Bl<'x>;
+                }
+            ),
+            vec![],
+            vec![bl],
+            "trait Tr { fn m < 'x > (& self , a0 : :: l :: base :: B1 < & 'x u8 >) -> P < 0usize > ; }",
+        ),
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(
+                        &self,
+                        a0: [&'x String; ::l::base::BLEN],
+                        a1: &'x u8,
+                    ) -> super::base::Bl<'x>;
+                }
+            ),
+            vec![],
+            vec![bl, "[& 'x String ; :: l :: base :: BLEN]"],
+            "trait Tr { fn m < 'x > (& self , a0 : P < 1usize > , a1 : & 'x u8 ,) -> P < 0usize > ; }",
+        ),
+        // A trait object of this crate behind `&'x` beside the array takes its lifetime from the
+        // reference, which only it keeps then: it is the error, and the array stays an optional
+        // entry, as beside a type of another crate.
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(
+                        &self,
+                        a0: [&'x String; ::l::base::BLEN],
+                        a1: &'x dyn Tr0,
+                    ) -> super::base::Bl<'x>;
+                }
+            ),
+            vec![(Reason::UnconstrainedLifetime, "Tr0".to_string())],
+            vec![bl, "[& 'x String ; :: l :: base :: BLEN]"],
+            "trait Tr { fn m < 'x > (& self , a0 : P < 1usize > , a1 : & 'x dyn Tr0 ,) -> P < 0usize > ; }",
+        ),
+        (
+            parse_quote!(
+                trait Tr {
+                    fn m<'x>(
+                        &self,
+                        a0: ::l::base::B1<&'x u8>,
+                        a1: &'x dyn Tr0,
+                    ) -> super::base::Bl<'x>;
+                }
+            ),
+            vec![(Reason::UnconstrainedLifetime, "Tr0".to_string())],
+            vec![bl, ":: l :: base :: B1 < & 'x u8 >"],
+            "trait Tr { fn m < 'x > (& self , a0 : P < 1usize > , a1 : & 'x dyn Tr0 ,) -> P < 0usize > ; }",
+        ),
+    ];
+    for (item, errors, entries, copy) in cases {
+        let found = f63_leak(std_config(), &item);
+        let entries: Vec<String> = entries.into_iter().map(String::from).collect();
+        assert_eq!(
+            found,
+            (copy.to_string(), errors, entries),
+            "{}",
+            string(&item)
+        );
+    }
+}

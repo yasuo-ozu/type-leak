@@ -19,8 +19,7 @@ use std::rc::Rc;
 use syn::visit::Visit;
 use syn::{
     FnArg, GenericArgument, Ident, Lifetime, Macro, Path, PathArguments, ReturnType, Signature,
-    Type, TypeArray, TypeGroup, TypeParamBound, TypeParen, TypePath, TypePtr, TypeSlice,
-    TypeTraitObject,
+    Type, TypeGroup, TypeParamBound, TypeParen, TypePath, TypePtr, TypeSlice,
 };
 use template_quote::quote;
 
@@ -515,30 +514,35 @@ fn scan_output(scope: &impl Anchoring, output: &ReturnType, used: &mut OutputUse
 }
 
 /// Pushes the lifetimes that `ty` (an input) keeps constrained as written in the copy. A
-/// reference to a trait object without a lifetime bound counts only if `not_a_cause` says so.
+/// reference to a trait object without a lifetime bound, or an array, keeps none if `unsure` says
+/// the copy may not write the object or the array as it is.
 pub(crate) fn kept_lifetimes(
     ty: &Type,
     kept: &mut Vec<Lifetime>,
-    not_a_cause: &mut impl FnMut(&TypeTraitObject) -> bool,
+    unsure: &mut impl FnMut(&Type) -> bool,
 ) {
     match ty {
         Type::Reference(reference) => {
-            let unbounded = trait_object_of(&reference.elem).map_or(false, |object| {
-                !has_lifetime_bound(object) && !not_a_cause(object)
-            });
+            let unbounded = trait_object_of(&reference.elem)
+                .map_or(false, |object| !has_lifetime_bound(object))
+                && unsure(&reference.elem);
             if !unbounded {
                 kept.extend(reference.lifetime.clone());
             }
-            kept_lifetimes(&reference.elem, kept, not_a_cause);
+            kept_lifetimes(&reference.elem, kept, unsure);
+        }
+        Type::Array(array) => {
+            if !unsure(ty) {
+                kept_lifetimes(&array.elem, kept, unsure)
+            }
         }
         Type::Ptr(TypePtr { elem, .. })
         | Type::Slice(TypeSlice { elem, .. })
-        | Type::Array(TypeArray { elem, .. })
         | Type::Paren(TypeParen { elem, .. })
-        | Type::Group(TypeGroup { elem, .. }) => kept_lifetimes(elem, kept, not_a_cause),
+        | Type::Group(TypeGroup { elem, .. }) => kept_lifetimes(elem, kept, unsure),
         Type::Tuple(tuple) => {
             for elem in &tuple.elems {
-                kept_lifetimes(elem, kept, not_a_cause);
+                kept_lifetimes(elem, kept, unsure);
             }
         }
         _ => (),

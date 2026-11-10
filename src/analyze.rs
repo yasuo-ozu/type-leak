@@ -3096,7 +3096,14 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 .collect(),
             ..Default::default()
         };
-        let mut not_a_cause = |object: &TypeTraitObject| self.is_not_a_cause(object, &in_scope);
+        // The Referrer may replace an array whose length names another crate (an optional entry),
+        // and a trait object that is a cause or an optional entry with the reference to it.
+        let mut unsure = |ty: &Type| match ty {
+            Type::Array(_) => self.is_optional_type(ty),
+            _ => {
+                trait_object_of(ty).map_or(false, |object| !self.is_not_a_cause(object, &in_scope))
+            }
+        };
         let mut mentioned = Lifetimes::default();
         let mut kept = Vec::new();
         for input in &sig.inputs {
@@ -3104,9 +3111,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             match input {
                 FnArg::Receiver(receiver) => {
                     kept.extend(receiver.lifetime().cloned());
-                    kept_lifetimes(&receiver.ty, &mut kept, &mut not_a_cause);
+                    kept_lifetimes(&receiver.ty, &mut kept, &mut unsure);
                 }
-                FnArg::Typed(arg) => kept_lifetimes(&arg.ty, &mut kept, &mut not_a_cause),
+                FnArg::Typed(arg) => kept_lifetimes(&arg.ty, &mut kept, &mut unsure),
             }
         }
         unconstrained_in_output(sig)
