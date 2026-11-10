@@ -95,7 +95,9 @@ pub struct CheckResult {
 /// A mention of `Self` that has no meaning where it is written ([`Reason::SelfWithoutMeaning`]).
 #[derive(Clone, Debug)]
 pub(crate) struct SelfMention {
+    /// The path or type that names `Self`.
     pub(crate) cause: Cause,
+    /// Where it is written.
     pub(crate) place: Place,
 }
 
@@ -113,7 +115,7 @@ pub(crate) struct Part {
     /// The context that an entry of it would have, or `None` if it cannot be written here (a
     /// bound names a `Self` that has no name: [`Reason::UnnameableSelf`]).
     pub(crate) context: Option<Context>,
-    /// In a bound or where predicate of the item (`AnalyzeVisitor::env_depth > 0`).
+    /// In a bound or where predicate of the item (`Position::env_depth > 0`).
     pub(crate) in_predicate: bool,
     /// The innermost type around it that owns the cause of the conflict, with its context
     /// ([`anchor_parts()`]); the part is left as written only inside it.
@@ -178,13 +180,15 @@ pub(crate) enum SignatureMark {
 /// ([`SignatureFacts::in_copy()`]).
 #[derive(Debug)]
 pub(crate) struct SignatureFacts {
+    /// The method lifetimes that the output names and no bound does.
     unconstrained: Vec<Lifetime>,
     /// Of `unconstrained`, those that the copy leaves unconstrained: no input keeps them as
     /// written once the leaked types are replaced. `None` where it is not known (the Leaker, which
     /// decides it by its own check).
     in_copy: Option<Vec<Lifetime>>,
+    /// What the output keeps by elision, if it relies on it.
     elision: Option<Elision>,
-    /// The facts of a probe ([`SignatureFacts::probe()`]).
+    /// The facts of a probe ([`SignatureFacts::inputs_probe()`]).
     probing: bool,
 }
 
@@ -202,7 +206,7 @@ impl SignatureFacts {
     /// what is left of them ([`SignatureFacts::in_copy()`]): no part that a signature made is left as
     /// written ([`SignatureFacts::covers()`] is `false`), and the visitor takes each for a leaked
     /// type, which it is where the Leaker made it a part.
-    pub(crate) fn probe() -> Self {
+    pub(crate) fn inputs_probe() -> Self {
         Self {
             unconstrained: Vec::new(),
             in_copy: None,
@@ -211,7 +215,7 @@ impl SignatureFacts {
         }
     }
 
-    /// Returns `true` for the facts of a probe ([`SignatureFacts::probe()`]).
+    /// Returns `true` for the facts of a probe ([`SignatureFacts::inputs_probe()`]).
     pub(crate) fn probing(&self) -> bool {
         self.probing
     }
@@ -282,24 +286,28 @@ impl SignatureFacts {
     }
 }
 
+/// A type that may be an entry, which [`Analysis::apply()`] adds to the graph.
 pub(crate) struct PendingType {
+    /// The type.
     pub(crate) ty: Type,
     /// The address of the type in the visited syntax, which `ty` is a copy of.
     pub(crate) origin: usize,
-    pub(crate) is_must_intern: bool,
+    /// A required entry: its own path is a cause, so it is leaked whole.
+    pub(crate) required: bool,
     /// It may be a required entry: it or a part is a cause.
-    pub(crate) in_graph: bool,
+    pub(crate) required_candidate: bool,
     /// An optional entry if the Referrer replaces it: its own path names an external crate.
     pub(crate) optional: bool,
     /// It may be an optional entry: it or a part is `optional`.
-    pub(crate) has_optional: bool,
+    pub(crate) optional_candidate: bool,
+    /// The context that an entry of it would have.
     pub(crate) context: Context,
     /// A bare identifier argument that may be a const. Its parent is leaked whole if possible; if
     /// it cannot be because of a hard cause (see `Impossibles`), it is a conflict.
     pub(crate) ambiguous: bool,
     /// It cannot be a required entry, but its components can: the copy would be cyclic.
-    pub(crate) no_entry: bool,
-    /// Like `no_entry` for an optional entry.
+    pub(crate) no_required_entry: bool,
+    /// Like `no_required_entry` for an optional entry.
     pub(crate) no_optional_entry: bool,
     /// The type names a `Self` without meaning, or a bound of its context does
     /// ([`correct_unmeant_self()`]).
@@ -311,6 +319,7 @@ pub(crate) struct PendingType {
     /// The primitive names in a type that is leaked whole, which `components` does not hold: they
     /// are assumed if the type is copied as written instead ([`Part::primitives`]).
     pub(crate) primitives: Vec<Ident>,
+    /// The effects of the types in it that are leaked on their own.
     pub(crate) components: Vec<Effect>,
     /// For a type leaked whole, the effects of the types in it, which `components` does not hold:
     /// the copy keeps them if the type is copied as written instead.
@@ -325,13 +334,13 @@ impl PendingType {
         Self {
             ty: ty.clone(),
             origin: ty as *const Type as usize,
-            is_must_intern: false,
-            in_graph: false,
+            required: false,
+            required_candidate: false,
             optional: false,
-            has_optional: false,
+            optional_candidate: false,
             context,
             ambiguous: false,
-            no_entry: false,
+            no_required_entry: false,
             no_optional_entry: false,
             unmeant_self: false,
             in_predicate: false,
@@ -343,16 +352,17 @@ impl PendingType {
         }
     }
 
+    /// The type with its context, as the analysis names an optional entry.
+    pub(crate) fn optional_key(&self) -> (Context, String) {
+        let ty = &self.ty;
+        (self.context.clone(), quote!(#ty).to_string())
+    }
+
     /// The part that the Referrer leaves as written if the type is copied so instead of leaked: a
     /// reference is copied whole, as its parts cannot stand for it ([`is_whole_reference()`]), and
     /// so is a type in a predicate and a type that holds one that depends on it.
     pub(crate) fn part(&self) -> Part {
         let whole = self.adopted || self.in_predicate || is_whole_reference(&self.ty);
-        self.part_as(whole)
-    }
-
-    /// Like [`PendingType::part()`], whole or not as `whole` says.
-    pub(crate) fn part_as(&self, whole: bool) -> Part {
         let mut primitives = Vec::new();
         if whole {
             primitives = self.primitives.clone();
@@ -371,24 +381,30 @@ impl PendingType {
 }
 
 impl CheckResult {
-    /// The correction of a part copied as written for a fault that another error tells. It has no
-    /// cause that depends on the context, so `report()` gives no error for it.
-    pub(crate) fn corrected() -> Self {
+    /// The conflict of a type leaked whole, with the causes `must` and `impossible` and the
+    /// `reason`. The caller sets what else it has (`note`, `help`, `headline`, `paths`).
+    pub(crate) fn conflict(must: Vec<Cause>, impossible: Vec<Cause>, reason: Reason) -> Self {
         Self {
-            must: Vec::new(),
-            impossible: Vec::new(),
+            must,
+            impossible,
             is_own: true,
             optional: false,
             note: None,
             help: None,
             headline: None,
             cause: None,
-            reason: Reason::RelativePath,
+            reason,
             part: None,
             seen: 0,
             place: Place::default(),
             paths: Vec::new(),
         }
+    }
+
+    /// The correction of a part copied as written for a fault that another error tells. It has no
+    /// cause that depends on the context, so `report()` gives no error for it.
+    pub(crate) fn corrected() -> Self {
+        Self::conflict(Vec::new(), Vec::new(), Reason::RelativePath)
     }
 }
 
@@ -398,9 +414,12 @@ pub(crate) enum Effect {
     Primitive(Ident),
 }
 
+/// What the effects of the analysis add up to.
 #[derive(Default)]
 pub(crate) struct Analysis {
+    /// The types that may be entries.
     pub(crate) types: TypeGraph,
+    /// The primitive names that the copy writes as they are.
     pub(crate) primitives: Vec<Ident>,
     /// The parts that the Referrer leaves as written, in order and distinct.
     pub(crate) parts: Vec<PartItem>,
@@ -419,7 +438,9 @@ impl Analysis {
         let mut holds_required = false;
         for effect in effects {
             match effect {
-                Effect::Type(pending) if !(pending.in_graph || pending.has_optional) => {
+                Effect::Type(pending)
+                    if !(pending.required_candidate || pending.optional_candidate) =>
+                {
                     // Never an entry: not added, but the assumptions of its components stay.
                     holds_required |= self.apply(contexts, &pending.components, parent);
                 }
@@ -427,24 +448,24 @@ impl Analysis {
                     let context = contexts.intern(pending.context.clone());
                     let key = self.types.add(context, &pending.ty, parent);
                     let types = &mut self.types;
-                    if pending.is_must_intern {
-                        types.must_intern.insert(key.clone());
+                    if pending.required {
+                        types.required.insert(key.clone());
                     }
                     if pending.optional {
                         types.optional.insert(key.clone());
                     }
-                    if pending.in_graph {
+                    if pending.required_candidate {
                         types.required_candidates.insert(key.clone());
                     }
-                    if pending.has_optional {
+                    if pending.optional_candidate {
                         types.optional_candidates.insert(key.clone());
                     }
                     let below = self.apply(contexts, &pending.components, Some(&key));
                     // The kind of the type is what it covers: only the flag of that kind counts.
-                    let required = pending.is_must_intern || below;
+                    let required = pending.required || below;
                     let no_entry = match required {
-                        true => pending.in_graph && pending.no_entry,
-                        false => pending.has_optional && pending.no_optional_entry,
+                        true => pending.required_candidate && pending.no_required_entry,
+                        false => pending.optional_candidate && pending.no_optional_entry,
                     };
                     if no_entry {
                         self.types.no_entry.insert(key);
@@ -597,16 +618,7 @@ pub(crate) fn anchor_parts(effects: &mut [Effect], ty: &Type, context: &Context)
 
 /// Pushes the errors and the primitive names among `effects`; the errors lose their parts.
 fn keep_conflicts(effects: Vec<Effect>, found: &mut Vec<Effect>) {
-    for effect in effects {
-        match effect {
-            Effect::Type(pending) => keep_conflicts(pending.components, found),
-            Effect::Error(mut error) => {
-                error.part = None;
-                found.push(Effect::Error(error));
-            }
-            other => found.push(other),
-        }
-    }
+    written(effects, true, &mut |pending| pending.components, found)
 }
 
 /// Copies as written the outermost type that would be an entry and names a `Self` without
@@ -615,7 +627,8 @@ fn keep_conflicts(effects: Vec<Effect>, found: &mut Vec<Effect>) {
 /// leaked.
 pub(crate) fn correct_unmeant_self(effects: Vec<Effect>) -> Vec<Effect> {
     correct_effects(effects, &|pending| {
-        (pending.unmeant_self && (pending.in_graph || pending.has_optional)).then(|| pending.part())
+        (pending.unmeant_self && (pending.required_candidate || pending.optional_candidate))
+            .then(|| pending.part())
     })
 }
 
@@ -635,7 +648,7 @@ fn collect_errors(effects: &[Effect], errors: &mut Vec<CheckResult>) {
 pub(crate) fn names_self(effects: &[Effect], declared: &SelfRequirement) -> bool {
     effects.iter().any(|effect| match effect {
         Effect::Type(pending) => {
-            ((pending.in_graph || pending.has_optional)
+            ((pending.required_candidate || pending.optional_candidate)
                 && depends_on_self(&pending.context, declared))
                 || names_self(&pending.components, declared)
         }
@@ -660,28 +673,42 @@ pub(crate) fn part_names_self(error: &CheckResult, declared: &SelfRequirement) -
 }
 
 fn depends_on_self(context: &Context, declared: &SelfRequirement) -> bool {
-    context.self_ty().is_some() || context.substitutes(declared)
+    context.self_ty.is_some() || context.substitutes(declared)
 }
 
 /// Makes the types in `keys` (with their contexts) no optional entries.
 pub(crate) fn drop_optional(effects: &mut [Effect], keys: &HashSet<(Context, String)>) {
+    each_pending_mut(effects, &mut |pending| {
+        if pending.optional && keys.contains(&pending.optional_key()) {
+            pending.optional = false;
+        }
+    });
+}
+
+/// Calls `visit` on the types among `effects`, each before the types in its components.
+pub(crate) fn each_pending(effects: &[Effect], visit: &mut impl FnMut(&PendingType)) {
     for effect in effects {
         if let Effect::Type(pending) = effect {
-            if pending.optional {
-                let ty = &pending.ty;
-                if keys.contains(&(pending.context.clone(), quote!(#ty).to_string())) {
-                    pending.optional = false;
-                }
-            }
-            drop_optional(&mut pending.components, keys);
+            visit(pending);
+            each_pending(&pending.components, visit);
         }
     }
 }
 
-pub(crate) fn has_optional(effects: &[Effect]) -> bool {
+/// Like [`each_pending()`], for `visit` that changes the types.
+pub(crate) fn each_pending_mut(effects: &mut [Effect], visit: &mut impl FnMut(&mut PendingType)) {
+    for effect in effects {
+        if let Effect::Type(pending) = effect {
+            visit(pending);
+            each_pending_mut(&mut pending.components, visit);
+        }
+    }
+}
+
+pub(crate) fn has_optional_candidate(effects: &[Effect]) -> bool {
     effects
         .iter()
-        .any(|effect| matches!(effect, Effect::Type(pending) if pending.has_optional))
+        .any(|effect| matches!(effect, Effect::Type(pending) if pending.optional_candidate))
 }
 
 pub(crate) fn has_ambiguous(effects: &[Effect]) -> bool {
@@ -715,30 +742,19 @@ pub(crate) fn ambiguous_types(effects: &[Effect]) -> Vec<Type> {
 /// `paths`, the paths of the error of the syntax ([`CheckResult::paths`]).
 pub(crate) fn as_written(effects: Vec<Effect>, paths: &mut Vec<Cause>) -> Vec<Effect> {
     let mut found = Vec::new();
-    for effect in effects {
-        match effect {
-            Effect::Error(mut error) => {
-                error.part = None;
-                found.push(Effect::Error(error));
-            }
-            Effect::Type(pending) => {
-                if pending.is_must_intern {
-                    for path in &pending.paths {
-                        if !paths.contains(path) {
-                            paths.push(path.clone());
-                        }
-                    }
+    let mut enter = |pending: PendingType| {
+        if pending.required {
+            for path in &pending.paths {
+                if !paths.contains(path) {
+                    paths.push(path.clone());
                 }
-                let PendingType {
-                    components, inside, ..
-                } = *pending;
-                let mut inner = inside;
-                inner.extend(components);
-                found.extend(as_written(inner, paths));
             }
-            Effect::Primitive(_) => (),
         }
-    }
+        let mut inner = pending.inside;
+        inner.extend(pending.components);
+        inner
+    };
+    written(effects, false, &mut enter, &mut found);
     found
 }
 
@@ -746,17 +762,35 @@ pub(crate) fn as_written(effects: Vec<Effect>, paths: &mut Vec<Cause>) -> Vec<Ef
 /// them as written.
 pub(crate) fn error_effects(effects: Vec<Effect>) -> Vec<Effect> {
     let mut found = Vec::new();
+    written(
+        effects,
+        false,
+        &mut |pending| pending.components,
+        &mut found,
+    );
+    found
+}
+
+/// Pushes to `found` the errors among `effects` without their parts (the copy writes the syntax
+/// they are about as it is), and the primitive names if `primitives`. A type is replaced by what
+/// `enter` returns for it: its components, or more.
+fn written(
+    effects: Vec<Effect>,
+    primitives: bool,
+    enter: &mut impl FnMut(PendingType) -> Vec<Effect>,
+    found: &mut Vec<Effect>,
+) {
     for effect in effects {
         match effect {
             Effect::Error(mut error) => {
                 error.part = None;
                 found.push(Effect::Error(error));
             }
-            Effect::Type(pending) => found.extend(error_effects(pending.components)),
+            Effect::Type(pending) => written(enter(*pending), primitives, enter, found),
+            Effect::Primitive(_) if primitives => found.push(effect),
             Effect::Primitive(_) => (),
         }
     }
-    found
 }
 
 /// The primitive names in `effects`, each once, also in the parts and in the types leaked whole:

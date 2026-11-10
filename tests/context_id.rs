@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::AcceptCause;
+use common::{panic_message, AcceptCause};
 use proc_macro2::{TokenStream, TokenTree};
 use std::collections::BTreeSet;
 use syn::visit_mut::VisitMut;
@@ -359,22 +359,8 @@ fn ids_of_dropped_contexts_are_gaps() {
     );
 }
 
-/// The message of the panic of `f`.
-fn panic_message(f: impl FnOnce()) -> String {
-    let payload =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("it did not panic");
-    match payload.downcast_ref::<String>() {
-        Some(message) => message.clone(),
-        None => payload
-            .downcast_ref::<&str>()
-            .expect("the message is a string")
-            .to_string(),
-    }
-}
-
-// The lookups of a context that document `# Panics` panic with the message of the map of the
-// contexts, which does not name the id: the one of a dropped context (`gap_referrer()` has no
-// context 1), and one beyond the last.
+// The lookups of a context that document `# Panics` panic with a message that names the id: the
+// one of a dropped context (`gap_referrer()` has no context 1), and one beyond the last.
 
 #[test]
 fn the_lookups_of_a_context_it_does_not_have_panic() {
@@ -430,7 +416,7 @@ fn the_lookups_of_a_context_it_does_not_have_panic() {
             for (lookup, call) in &lookups {
                 assert_eq!(
                     panic_message(|| call(referrer, id(n))),
-                    "no entry found for key",
+                    format!("the context {} is not one of this Referrer", n),
                     "{} of {} with the context {}",
                     lookup,
                     shape,

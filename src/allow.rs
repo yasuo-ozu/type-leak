@@ -3,7 +3,7 @@
 //! applies it to its errors.
 
 use crate::error::{Cause, ErrorItem};
-use crate::util::{heads_self, starts_with_known, Known, STD_CRATES};
+use crate::util::{is_std_crate_path, self_head, starts_with_known, Known};
 use syn::Path;
 
 /// Where in an item a path or an error is. [`Allow::allow()`] is asked at a place; it is
@@ -30,9 +30,10 @@ pub struct Place {
 /// value a [`Cause::Expr`], the path of a macro a [`Cause::Macro`], a path of unknown kind (the
 /// root of a `use`, a path in the tokens of a macro) a [`Cause::Unknown`]. The paths are bare:
 /// their generic arguments are analyzed on their own. A path that starts with `Self` or a generic
-/// in scope is never asked. An allowed path is not leaked, and you promise that it means the same
-/// in the copy (an absolute path: that the crate is the same on both sides). The rule is called on
-/// every check of a path: keep it cheap. A rule that panics rolls the analysis back.
+/// in scope is not asked as the analysis walks. An allowed path is not leaked, and you promise that
+/// it means the same in the copy (an absolute path: that the crate is the same on both sides). The
+/// rule is called on every check of a path: keep it cheap. A rule that panics rolls the analysis
+/// back.
 ///
 /// After the analysis, [`LeakerResult::allow()`](crate::LeakerResult::allow) accepts an error by
 /// its [`paths`](ErrorItem::paths) if it has any (the rule must allow each, at the error's
@@ -41,6 +42,11 @@ pub struct Place {
 /// accepts an error that has paths. That only drops errors: it changes no entry, and a type of
 /// another crate that the rule allows is still an entry. That is the approximation of the rule of
 /// the Leaker: give the rule to the Leaker when you can.
+///
+/// The Leaker drops the errors of a scope the same way when the scope ends. The error of a `Self`
+/// that has no meaning ([`Reason::SelfWithoutMeaning`](crate::Reason::SelfWithoutMeaning)) has no
+/// paths, so a rule that allows its cause (`Self`, `Self::Item`) accepts it at both stages, though
+/// a path that starts with `Self` is not asked as the analysis walks.
 ///
 /// A closure `Fn(&Cause, Place) -> bool` is a rule, `()` allows nothing, and `(A, B)` allows what
 /// either does. [`Rules`] builds the common ones.
@@ -229,13 +235,6 @@ impl<A: Allow> Allow for Rules<A> {
     }
 }
 
-/// Returns `true` if `path` starts with `std`, `core` or `alloc`, relative or absolute.
-fn is_std_crate_path(path: &Path) -> bool {
-    path.segments
-        .first()
-        .map_or(false, |seg| STD_CRATES.iter().any(|name| seg.ident == name))
-}
-
 /// Returns `true` if `path` is relative and starts with `crate`.
 fn is_crate_path(path: &Path) -> bool {
     path.leading_colon.is_none()
@@ -245,10 +244,11 @@ fn is_crate_path(path: &Path) -> bool {
             .map_or(false, |seg| seg.ident == "crate")
 }
 
-/// Returns `true` if `rule` allows the entry `entry` of [`ErrorItem::paths`] at `place`. It is
-/// never asked about a path that starts with `Self`.
+/// Returns `true` if `rule` allows the entry `entry` of [`ErrorItem::paths`] at `place`. A path
+/// that starts with `Self` is not allowed, and the rule is not asked about it. (The error of a
+/// `Self` without meaning has no paths: `accepts()` asks its cause.)
 fn allows_entry<A: Allow + ?Sized>(rule: &A, entry: &Cause, place: Place) -> bool {
-    entry.path().map_or(false, |path| !heads_self(path)) && rule.allow(entry, place)
+    entry.path().map_or(false, |path| self_head(path).is_none()) && rule.allow(entry, place)
 }
 
 /// Returns `true` if `rule` accepts `error`: if it has relative paths ([`ErrorItem::paths`]), it

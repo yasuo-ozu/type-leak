@@ -2,9 +2,9 @@
 //! impl of an entry (`LeakerResult::repeater_impls()`), the path of an entry through the Repeater
 //! (`repeater_projection()`), and the items of the errors of the analysis (`Vec<ErrorItem>`).
 //!
-//! The impl and the arguments are compared with what a macro wrote by hand before the helpers
-//! (the replacement of `Self`, `without_encoded_bounds()` and the encoders, and the arguments of a
-//! context with the encoders), over all the entries of a set of items, in `src/encode/tests.rs`.
+//! The pieces of the impl and the arguments of an entry are compared with the entry, its context
+//! and `repeater_projection()`, over all the entries of a set of items (the last tests of the
+//! section on the pieces of the impls).
 
 mod common;
 
@@ -929,6 +929,536 @@ fn the_encoder_with_the_defaults_completed() {
     );
 }
 
+// ── The pieces of the impls, against the entry and its projection ────────────────────────────
+
+/// The lifetime bounds written on the parameters of `generics`: on a lifetime or on a type.
+fn lifetime_bounds(generics: &Generics) -> usize {
+    generics
+        .params
+        .iter()
+        .map(|param| match param {
+            GenericParam::Lifetime(param) => param.bounds.len(),
+            GenericParam::Type(param) => param
+                .bounds
+                .iter()
+                .filter(|bound| matches!(bound, TypeParamBound::Lifetime(_)))
+                .count(),
+            GenericParam::Const(_) => 0,
+        })
+        .sum()
+}
+
+/// The elements of a tuple type.
+fn elements(ty: &Type) -> usize {
+    match ty {
+        Type::Tuple(tuple) => tuple.elems.len(),
+        other => panic!("not a tuple: {}", s(other)),
+    }
+}
+
+/// The generics with their where clause, as the impl declares them.
+fn declared(generics: &Generics) -> String {
+    with_where(generics).trim().to_string()
+}
+
+/// The first argument of the Repeater that `repeater_projection()` writes for an entry, with
+/// `self_ty` for `Self` (the entry's own generics, by their names).
+fn projected(context: &Context, entry: EntryId, self_ty: &Type) -> Type {
+    let repeater = repeater();
+    let projection =
+        repeater_projection(&repeater, self_ty, context, 7, entry, slot_const(&repeater)).unwrap();
+    common::projection_args(&projection)
+}
+
+/// An impl of an entry that needs `Self: 'a`, implied by the reference or written, declares the
+/// generics of the context and the parameter for the implementor, but not the bound: the argument
+/// of the Repeater encodes it as `&'a __S`. A predicate of the same where clause stays, with the
+/// parameter for `Self`. The context is checked by `a_written_bound_is_the_same_as_an_implied_one`
+/// in `tests/outlives_bounds.rs`.
+#[test]
+fn the_impl_of_an_entry_that_needs_self_outlives_encodes_the_bound_and_never_declares_it() {
+    let items: Vec<ItemTrait> = vec![
+        parse_quote! {
+            trait Tr {
+                fn f<'a, T>(&self, x: &'a Rel<(Self, T)>) where Self: ::core::marker::Sized;
+            }
+        },
+        parse_quote! {
+            trait Tr {
+                fn f<'a, T: 'a>(&self, x: Rel<'a, (Self, T)>)
+                where Self: ::core::marker::Sized + 'a;
+            }
+        },
+    ];
+    for item in items {
+        let (result, _) = analyze_result(&Item::Trait(item.clone()));
+        let referrer = result.clone().into_referrer();
+        let what = s(&item);
+        let context = common::entry(&referrer, 0);
+        // The context has the bound of `T` and the `Sized`, and `Self: 'a` apart.
+        assert_eq!(
+            declared(&context.generics),
+            "< 'a , T : 'a > where Self : :: core :: marker :: Sized",
+            "{}",
+            what
+        );
+        assert_eq!(
+            context.self_outlives.iter().map(s).collect::<Vec<_>>(),
+            ["'a"],
+            "{}",
+            what
+        );
+        // The impl: neither `T: 'a` nor `Self: 'a` is declared, and `Self` is the parameter.
+        let param: Ident = parse_quote!(__S);
+        let r = result
+            .repeater_impls(&repeater(), 7, ImplSelf::Param(&param), array_const)
+            .unwrap()
+            .next()
+            .unwrap();
+        assert_eq!(
+            declared(&r.generics),
+            "< 'a , T , __S : ? :: core :: marker :: Sized + Tr > where __S : :: core :: marker :: Sized",
+            "{}",
+            what
+        );
+        assert_eq!(
+            s(&r.args),
+            t(parse_quote!((&'a (), T, &'a T, &'a __S))),
+            "{}",
+            what
+        );
+    }
+}
+
+/// The impl declares the generics of the entry's context without the bounds that its argument of the
+/// Repeater encodes: a bound by a lifetime parameter, on a type or on a lifetime. A bound by
+/// `'static` or by a lifetime that is no parameter, a trait bound, a const, and a predicate that is
+/// not on a parameter stay. What is dropped is exactly what the argument adds after the parameters,
+/// and nothing is left to encode in what is declared.
+#[test]
+fn the_impl_declares_the_generics_but_the_bounds_that_the_argument_encodes() {
+    let rows: Vec<(ItemTrait, &str)> = vec![
+        (
+            parse_quote! {
+                trait Tr<
+                    'a, 'b: 'a, T: 'a + ::core::clone::Clone, U: 'static, V: 'c, W: ?Sized + 'b,
+                    const N: usize
+                > {
+                    fn f(&self) -> All<'a, 'b, T, U, V, W, N>;
+                }
+            },
+            "< 'a , 'b , T : :: core :: clone :: Clone , U : 'static , V : 'c , W : ? Sized , const N : usize >",
+        ),
+        // Only the lifetime parameters of the generics count.
+        (
+            parse_quote!(trait Tr<'b: 'b> { fn f(&self) -> All<'b>; }),
+            "< 'b >",
+        ),
+        (
+            parse_quote!(trait Tr<T: 'a> { fn f(&self) -> All<T>; }),
+            "< T : 'a >",
+        ),
+        (
+            parse_quote!(trait Tr<'a, 'b: 'a + 'c, T: 'a> { fn f(&self) -> All<'a, 'b, T>; }),
+            "< 'a , 'b : 'c , T >",
+        ),
+        (
+            parse_quote! {
+                trait Tr<'a, T: ::core::clone::Clone + 'a, U: 'a + 'static> {
+                    fn f(&self) -> All<'a, T, U>;
+                }
+            },
+            "< 'a , T : :: core :: clone :: Clone , U : 'static >",
+        ),
+        (parse_quote!(trait Tr<'a, T> { fn f(&self) -> All<'a, T>; }), "< 'a , T >"),
+        (parse_quote!(trait Tr { fn f(&self) -> All; }), ""),
+        // A where predicate on a parameter is moved to it, so it is encoded as a bound is; one
+        // on another type is not, and is declared.
+        (
+            parse_quote! {
+                trait Tr<'a, T> where T: 'a, ::std::vec::Vec<T>: ::core::clone::Clone {
+                    fn f(&self) -> All<'a, T>;
+                }
+            },
+            "< 'a , T > where :: std :: vec :: Vec < T > : :: core :: clone :: Clone",
+        ),
+        (
+            parse_quote! {
+                trait Tr<'a, T> where ::std::vec::Vec<T>: 'a { fn f(&self) -> All<'a, T>; }
+            },
+            "< 'a , T > where :: std :: vec :: Vec < T > : 'a",
+        ),
+    ];
+    let marker: Type = parse_quote!(crate::Marker);
+    for (item, expected) in rows {
+        let what = s(&item);
+        let (result, _) = analyze_result(&Item::Trait(item));
+        let referrer = result.clone().into_referrer();
+        let (entry, _, context) = referrer.iter().next().unwrap();
+        let r = result
+            .repeater_impls(&repeater(), 7, ImplSelf::Marker(&marker), array_const)
+            .unwrap()
+            .next()
+            .unwrap();
+        assert_eq!(declared(&r.generics), expected, "{}", what);
+        // The argument has an element for each parameter, then one for each bound dropped.
+        let extra = elements(&r.args) - context.generics.params.len();
+        let dropped = lifetime_bounds(&context.generics) - lifetime_bounds(&r.generics);
+        assert_eq!(extra, dropped, "{}", what);
+        // Nothing is left to encode in what is declared: a context that has it as its generics
+        // encodes the parameters only.
+        let mut context = context.clone();
+        context.generics = r.generics.clone();
+        let args = projected(&context, entry, &marker);
+        assert_eq!(elements(&args), r.generics.params.len(), "{}", what);
+    }
+}
+
+/// The generics of the top-level context are those of the call, with the bounds as written (none is
+/// implied there): the entry `All<'a, T>`, which uses all of them, has them, and so has its impl. The
+/// entry `&'a Rel<T>` implies `T: 'a`, which the impl does not declare.
+#[test]
+fn the_generics_of_a_top_level_context_are_those_of_the_call() {
+    let tr: ItemTrait = parse_quote! {
+        trait Tr<'a, T> { fn f(&self, x: &'a Rel<T>); fn g(&self) -> All<'a, T>; }
+    };
+    let (result, _) = analyze_result(&Item::Trait(tr));
+    let referrer = result.clone().into_referrer();
+    let all = common::types(&referrer)
+        .position(|ty| s(ty) == "All < 'a , T >")
+        .unwrap();
+    let rel = common::types(&referrer)
+        .position(|ty| s(ty) == "& 'a Rel < T >")
+        .unwrap();
+    assert_eq!(
+        declared(&common::entry(&referrer, all).generics),
+        "< 'a , T >"
+    );
+    assert_eq!(
+        declared(&common::entry(&referrer, rel).generics),
+        "< 'a , T : 'a >"
+    );
+    let marker: Type = parse_quote!(crate::Marker);
+    let impls: Vec<RepeaterImpl> = result
+        .repeater_impls(&repeater(), 7, ImplSelf::Marker(&marker), array_const)
+        .unwrap()
+        .collect();
+    assert_eq!(declared(&impls[all].generics), "< 'a , T >");
+    assert_eq!(declared(&impls[rel].generics), "< 'a , T >");
+    assert_eq!(s(&impls[all].args), t(parse_quote!((&'a (), T))));
+    assert_eq!(s(&impls[rel].args), t(parse_quote!((&'a (), T, &'a T))));
+}
+
+/// The top-level context that the Leaker returns, and the Referrer, reach the Referrer's side as
+/// tokens, with their generics in the canonical form (sorted by kind and name, no defaults). The
+/// arguments of the trait written at a site are completed for the generics as written (the order
+/// and the defaults are the trait's), and then go by name to the generics of each context (the order
+/// is not: matching them by position would be wrong).
+#[test]
+fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
+    use syn::parse::Parser;
+
+    let tr: ItemTrait = parse_quote! {
+        trait Tr<'a, const N: usize, T: 'a, U = ::core::primitive::u8> {
+            fn f(&self, x: Rel<'a, T>) -> Wrap<N>;
+            fn g(&self) -> All<'a, N, T, U>;
+        }
+    };
+    let mut leaker = Leaker::new();
+    let top_level = leaker.intern_trait(&tr);
+    let referrer = leaker.result().finish().unwrap();
+    // The entry `All` has the generics of the trait: the context of it is the top-level one.
+    let all = common::types(&referrer)
+        .position(|ty| s(ty) == "All < 'a , N , T , U >")
+        .unwrap();
+    let context = common::entry(&referrer, all);
+    assert_eq!(
+        s(&context.generics),
+        "< 'a , T : 'a , U , const N : usize >"
+    );
+    let on_leaker_side = projected(
+        context,
+        common::entry_id_at(&referrer, all),
+        &parse_quote!(Self),
+    );
+    assert_eq!(
+        s(&on_leaker_side),
+        t(parse_quote!((&'a (), T, U, [(); N], &'a T)))
+    );
+
+    // The Referrer and the id are as the Leaker has them, read back from tokens.
+    let tokens = quote!(#referrer, #top_level);
+    let (parsed, parsed_top_level) =
+        (|input: syn::parse::ParseStream| -> Result<(Referrer, ContextId)> {
+            let referrer = input.parse()?;
+            input.parse::<Token![,]>()?;
+            let top_level = input.parse()?;
+            input.parse::<syn::parse::Nothing>()?;
+            Ok((referrer, top_level))
+        })
+        .parse2(tokens)
+        .unwrap();
+    assert_eq!(parsed, referrer);
+    assert_eq!(parsed_top_level, top_level);
+    let context = common::entry(&parsed, all);
+    assert_eq!(
+        s(&context.generics.params),
+        s(&common::entry(&referrer, all).generics.params)
+    );
+
+    // The arguments of the trait, as written at a site: in the order of the trait's generics, and
+    // the default for `U` is omitted. The context's generics are in another order, so they do not
+    // take the arguments by position.
+    let args: AngleBracketedGenericArguments = parse_quote!(<'q, 3, u16>);
+    let err = complete_params(&context.generics.params, &args.args).unwrap_err();
+    assert!(matches!(err, EncodeError::UnexpectedArgument(_)), "{}", err);
+    let completed = complete_params(&tr.generics.params, &args.args).unwrap();
+    let site = || common::answers(&tr.generics.params, &completed);
+    let generic_args = common::generic_args(&context.generics, site()).unwrap();
+    assert_eq!(
+        generic_args.iter().map(s).collect::<Vec<_>>(),
+        ["'q", "u16", ":: core :: primitive :: u8", "3"]
+    );
+    let on_referrer_side = common::repeater_args(context, site(), None, array_const).unwrap();
+    assert_eq!(
+        s(&on_referrer_side),
+        t(parse_quote!((
+            &'q (),
+            u16,
+            ::core::primitive::u8,
+            [(); { 3 }],
+            &'q u16
+        )))
+    );
+
+    // The arguments fit the context of every entry.
+    for (_, _, context) in parsed.iter() {
+        common::generic_args(&context.generics, site()).unwrap();
+    }
+}
+
+/// `Self` replaced by the parameter in the printed tokens of a type: `Self::A` is `<__S>::A`.
+fn replace_self(text: &str) -> String {
+    text.replace("Self ::", "< __S > ::").replace("Self", "__S")
+}
+
+/// The pieces of the impl of every entry of every sample, for a parameter that stands for the
+/// implementor: the entry and the module, the argument of the Repeater (the one that
+/// `repeater_projection()` writes with the same `Self`), the type (`Self` is the parameter where
+/// the implementor is one), the type it is for, and the generics it declares: the generics of the
+/// context with the parameter for the implementor before the consts, no bound that the argument
+/// encodes, and no `Self` left where it is a parameter
+#[test]
+fn the_pieces_of_every_repeater_impl_agree_with_the_entry_and_its_projection() {
+    let self_param: Ident = parse_quote!(__S);
+    let mut checked = 0;
+    for item in samples() {
+        let (result, _) = analyze_result(&item);
+        let referrer = result.clone().into_referrer();
+        let repeater = repeater();
+        let impls = result
+            .repeater_impls(
+                &repeater,
+                7,
+                ImplSelf::Param(&self_param),
+                slot_const(&repeater),
+            )
+            .unwrap_or_else(|e| panic!("{}: {}", s(&item), e));
+        for (n, r) in impls.enumerate() {
+            let (entry, ty, context) = referrer.iter().nth(n).unwrap();
+            let what = format!("{}: {}", s(&item), s(ty));
+            assert_eq!(r.entry, entry, "{}", what);
+
+            // `Self` as the impl writes it, and the type it is for.
+            let is_type = matches!(context.self_ty, Some(SelfRequirement::Type(_)));
+            let (self_ty, self_in_impl): (String, Type) = match context.self_ty.as_ref() {
+                Some(SelfRequirement::Type(self_ty)) => (s(self_ty), parse_quote!(Self)),
+                _ => ("__S".to_string(), parse_quote!(__S)),
+            };
+            assert_eq!(s(&r.self_ty), self_ty, "{}", what);
+
+            // The argument is the projection's, and the path has it and no key.
+            let args = projected(context, entry, &self_in_impl);
+            assert_eq!(s(&r.args), s(&args), "{}", what);
+            let path: Path = parse_quote!(#repeater<#args>);
+            assert_eq!(s(&r.path), s(&path), "{}", what);
+
+            // The leaked type, with the parameter for `Self` where `Self` is the implementor.
+            let leaked = s(ty);
+            let leaked = match context.self_ty {
+                Some(SelfRequirement::Type(_)) | None => leaked,
+                _ => replace_self(&leaked),
+            };
+            assert_eq!(s(&r.ty), leaked, "{}", what);
+
+            // The module is the module's own context, `Itself`, of the one that the entry is in.
+            assert!(
+                matches!(r.module, None | Some(ModuleScope::Itself { .. })),
+                "{}",
+                what
+            );
+            assert_eq!(
+                r.module.as_ref().map(ModuleScope::id),
+                common::in_module(context),
+                "{}",
+                what
+            );
+
+            // The generics: those of the context and the parameter for the implementor.
+            let declares_param = r.generics.params.iter().any(
+                |param| matches!(param, GenericParam::Type(param) if param.ident == self_param),
+            );
+            assert_eq!(declares_param, !is_type, "{}", what);
+            assert_eq!(
+                r.generics.params.len(),
+                context.generics.params.len() + declares_param as usize,
+                "{}",
+                what
+            );
+            if !is_type && context.self_ty.is_some() {
+                assert!(
+                    !with_where(&r.generics).contains("Self"),
+                    "{}: {}",
+                    what,
+                    with_where(&r.generics)
+                );
+            }
+            // No bound is left that the argument encodes, and the argument has an element for each
+            // bound dropped and for each `Self: 'a` of a lifetime of the generics.
+            let lifetimes: Vec<&Lifetime> = r
+                .generics
+                .params
+                .iter()
+                .filter_map(|param| match param {
+                    GenericParam::Lifetime(param) => Some(&param.lifetime),
+                    _ => None,
+                })
+                .collect();
+            let has_lifetime_bound = r.generics.params.iter().any(|param| match param {
+                GenericParam::Lifetime(param) => {
+                    param.bounds.iter().any(|bound| lifetimes.contains(&bound))
+                }
+                GenericParam::Type(param) => param.bounds.iter().any(|bound| {
+                    matches!(bound, TypeParamBound::Lifetime(lifetime) if lifetimes.contains(&lifetime))
+                }),
+                GenericParam::Const(_) => false,
+            });
+            assert!(!has_lifetime_bound, "{}: {}", what, s(&r.generics));
+            let self_elements = context
+                .self_outlives
+                .iter()
+                .filter(|lifetime| lifetimes.contains(lifetime))
+                .count();
+            assert_eq!(
+                elements(&r.args) - context.generics.params.len(),
+                lifetime_bounds(&context.generics) - lifetime_bounds(&r.generics) + self_elements,
+                "{}",
+                what
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 20, "{}", checked);
+}
+
+/// The arguments of the Repeater for an entry at a site are the projection's, with the names that
+/// the site answers replaced: where it answers none (the scope of the analysis) they are the impl's
+/// own arguments, for every entry of every sample; where it answers the generics of the item, and
+/// `Self` is the host, they are the arguments for it, which are written here for some entries.
+#[test]
+fn the_arguments_at_a_site_are_the_projection_with_the_names_of_the_site_replaced() {
+    let self_param: Ident = parse_quote!(__S);
+    let mut checked = 0;
+    for item in samples() {
+        let (result, _) = analyze_result(&item);
+        let referrer = result.clone().into_referrer();
+        let repeater = repeater();
+        let impls: Vec<RepeaterImpl> = result
+            .repeater_impls(
+                &repeater,
+                7,
+                ImplSelf::Param(&self_param),
+                slot_const(&repeater),
+            )
+            .unwrap()
+            .collect();
+        for (n, r) in impls.iter().enumerate() {
+            let (_, ty, context) = referrer.iter().nth(n).unwrap();
+            // The same as the impl, for the generics by their own names.
+            let self_in_impl: Type = match context.self_ty.as_ref() {
+                Some(SelfRequirement::Type(_)) => parse_quote!(Self),
+                _ => parse_quote!(#self_param),
+            };
+            let got = common::repeater_args(
+                context,
+                common::identity,
+                Some(&self_in_impl),
+                slot_const(&repeater),
+            )
+            .unwrap();
+            assert_eq!(s(&got), s(&r.args), "{}: {}", s(&item), s(ty));
+            checked += 1;
+        }
+    }
+    assert!(checked > 20, "{}", checked);
+
+    // At a site: the generics of the item take the arguments it gives, those of a method are passed
+    // by their own names, and `Self: 'a` names the host.
+    let host: Type = parse_quote!(Host<u8>);
+    let items = samples();
+    let rows: Vec<(usize, &str, &str, &str)> = vec![
+        (
+            0,
+            "& 'a Wrap < T , N >",
+            "<'static, u8, 3>",
+            "(&'static (), u8, [(); { 3 }], &'static u8)",
+        ),
+        (0, "Rel2 < U >", "<'static, u8, 3>", "(*const U,)"),
+        (
+            1,
+            "& 'a Rel < Self >",
+            "<'static>",
+            "(&'static (), &'static Host<u8>)",
+        ),
+        (
+            6,
+            "& 'a Rel < Self >",
+            "<'static, u8>",
+            "(&'static (), u8, &'static u8, &'static Host<u8>)",
+        ),
+        // The bound `T: 'a` of the struct is in the context of `Wrap<T>`, with its lifetime.
+        (
+            6,
+            "Wrap < T >",
+            "<'static, u8>",
+            "(&'static (), u8, &'static u8)",
+        ),
+    ];
+    for (which, entry, args, expected) in rows {
+        let item = &items[which];
+        let generics = match item {
+            Item::Trait(item) => &item.generics,
+            Item::Struct(item) => &item.generics,
+            other => panic!("{}", s(other)),
+        };
+        let (referrer, _) = analyze(item);
+        let ix = common::types(&referrer)
+            .position(|ty| s(ty) == entry)
+            .unwrap();
+        let args: AngleBracketedGenericArguments = parse_str(args).unwrap();
+        let completed = complete_params(&generics.params, &args.args).unwrap();
+        let got = common::repeater_args(
+            common::entry(&referrer, ix),
+            common::answers(&generics.params, &completed),
+            Some(&host),
+            slot_const(&repeater()),
+        )
+        .unwrap();
+        let expected: Type = parse_str(expected).unwrap();
+        assert_eq!(s(&got), s(&expected), "{}: {}", s(item), entry);
+    }
+}
+
 // ── The items of the errors ──────────────────────────────────────────────────────────────────
 
 #[test]
@@ -1135,6 +1665,11 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
                             .filter(|p| !matches!(p, GenericParam::Type(t) if t.ident == param))
                             .cloned()
                             .collect();
+                        // No parameter left, no angle brackets (F75).
+                        if expected.generics.params.is_empty() {
+                            expected.generics.lt_token = None;
+                            expected.generics.gt_token = None;
+                        }
                         assert_eq!(r, expected, "{}", what);
                         // No `__S`.
                         assert!(!with_where(&r.generics).contains("__S"), "{}", what);

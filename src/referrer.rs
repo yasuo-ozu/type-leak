@@ -1,20 +1,18 @@
 //! The [`Referrer`], which rewrites copies of the analyzed items.
 
 use crate::analysis::{PartItem, SignatureFacts, SignatureMark};
-use crate::analyze::Anchoring;
+use crate::analyze::{Anchoring, Elision};
 use crate::context::{Context, ContextId, Enclosing, Gat, ModuleScope, Scope, SelfRequirement};
-use crate::elided::{
-    name_elided_in_bare_fn, name_elided_in_bound, Elision, SelfWriter, WrittenNames,
-};
-use crate::encode::{encode_generics_params_with, without_encoded_bounds, EncodeError};
+use crate::elided::{name_elided_in_bare_fn, name_elided_in_bound, SelfWriter, WrittenNames};
+use crate::encode::{encode_entry_args, without_encoded_bounds, EncodeError};
 use crate::error::Cause;
 use crate::graph::TypeKey;
 #[cfg(doc)]
 use crate::repeater::repeater_definition;
-use crate::repeater::{ImplSelf, RepeaterImpl};
+use crate::repeater::{repeater_path, ImplSelf, RepeaterImpl};
 use crate::util::{
     bound_cause, first_self_in_generics, generic_param_name, ident_name, mentions_names,
-    parenthesize_bounded, type_mentions_self, ReplaceSelf,
+    parenthesize_bounded, path_type, token_names, type_mentions_self, ReplaceSelf,
 };
 use proc_macro2::{Literal, Punct, Spacing, Span, TokenStream};
 use std::cell::RefCell;
@@ -194,11 +192,6 @@ impl ModulePos {
     }
 }
 
-/// Returns the generics and what `Self` means in the scope of `context`.
-fn scope_of(context: &Context) -> Scope {
-    Scope::new(context.generics(), context.self_ty().cloned()).with_gats(context.gats().to_vec())
-}
-
 /// How the visitor looks up the default of a type parameter, while it visits the generics of an
 /// item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,6 +225,7 @@ enum Defaults {
 /// The context of the type, computed from the generics in scope and `self_ty`, must be the entry's.
 #[derive(Clone, Copy)]
 struct Matching<'a> {
+    /// What `Self` means here.
     self_ty: Option<&'a SelfRequirement>,
     /// `Self` means something else here, so no entry that names it matches.
     no_self: bool,
@@ -241,7 +235,7 @@ struct Matching<'a> {
     nested_type: bool,
     /// The type is the default of a parameter of a nested trait, whose entry is the one analyzed
     /// without `Self` if there is one (see [`Defaults::OwnTrait`]).
-    alone: bool,
+    without_self_first: bool,
 }
 
 /// Where the visited syntax is in the item, for the parts: among its predicates, in an argument
@@ -257,7 +251,8 @@ struct PartPlace {
 }
 
 /// The generics in scope of a signature that a copy writes, for the scan of its inputs for the
-/// occurrences of a lifetime ([`unconstrained_in_copy()`]).
+/// occurrences of a lifetime
+/// ([`unconstrained_in_copy()`](crate::analyze::unconstrained_in_copy)).
 struct SignatureScopes<'a>(&'a [Scope]);
 
 impl Anchoring for SignatureScopes<'_> {
@@ -270,7 +265,7 @@ impl Anchoring for SignatureScopes<'_> {
     }
 
     /// The copy replaces every entry, so no type is left to the Referrer.
-    fn is_soft_type(&self, _: &Type) -> bool {
+    fn is_optional_type(&self, _: &Type) -> bool {
         false
     }
 }
@@ -287,10 +282,13 @@ fn unit_type() -> Type {
 /// How `Referrer::find()` and `Referrer::part_of()` look a type up.
 #[derive(Clone, Copy)]
 struct Lookup<'a> {
+    /// How the context of the type is compared with the entries'.
     matching: Matching<'a>,
+    /// Where the visitor is among the modules.
     module: ModulePos,
     /// The entries that a visited item hides (see `Visitor::shadow_items()`).
     hidden: Option<&'a HashSet<usize>>,
+    /// Where the visited syntax is among the predicates of the item.
     place: PartPlace,
     /// The signature that the visited syntax is in, for the parts that a signature made.
     signature: Option<&'a SignatureFacts>,
@@ -362,7 +360,7 @@ impl Referrer {
             }
             let (entry_ty, context) = &self.entries[ix];
             let entry = &self.contexts[context];
-            if no_self && (entry.self_ty().is_some() || type_mentions_self(entry_ty)) {
+            if no_self && (entry.self_ty.is_some() || type_mentions_self(entry_ty)) {
                 continue;
             }
             let rank = match module.rank(entry) {
@@ -418,6 +416,22 @@ impl Referrer {
         Context::of(ty, scopes, self_ty, nested_type, enclosing).is_err()
     }
 
+    /// Returns `true` if a part with the `context` that the Leaker recorded (`None`: one that
+    /// cannot be written) is the one that `ty` has at `at`, in `scopes`.
+    fn part_fits(
+        &self,
+        context: Option<ContextId>,
+        ty: &Type,
+        at: Lookup,
+        scopes: &[Scope],
+        enclosing: &Enclosing,
+    ) -> bool {
+        match context {
+            Some(context) => self.fits(context, ty, at, scopes, enclosing),
+            None => Self::unwritable(at, ty, scopes, enclosing),
+        }
+    }
+
     /// Returns what the part is that `ty` is, if it is one: whether it is copied whole (see
     /// [`PartItem::whole`]). A part has the same tokens, is in a predicate as `at` says, and has the
     /// context that `ty` has in `scopes` (none, if `ty` has none there). A part with an anchor counts
@@ -453,10 +467,7 @@ impl Referrer {
                     }
                     (Some(_), None) => false,
                 }
-                && match context {
-                    Some(context) => self.fits(*context, ty, at, scopes, enclosing),
-                    None => Self::unwritable(at, ty, scopes, enclosing),
-                };
+                && self.part_fits(*context, ty, at, scopes, enclosing);
             if matches {
                 found = Some(found.unwrap_or(false) || *whole);
             }
@@ -466,7 +477,7 @@ impl Referrer {
 
     /// Returns `true` if a part that a signature made has the same tokens as `ty` and the context
     /// that `ty` has in `scopes`, whatever signature it was made for: the Leaker leaked `ty` whole
-    /// there, and leaks it here ([`SignatureFacts::probe()`]).
+    /// there, and leaks it here ([`SignatureFacts::inputs_probe()`]).
     fn is_part_of_signature(
         &self,
         ty: &Type,
@@ -487,10 +498,7 @@ impl Referrer {
             } = &self.parts[ix];
             mark.is_some()
                 && *in_predicate == at.place.in_predicate
-                && match context {
-                    Some(context) => self.fits(*context, ty, at, scopes, enclosing),
-                    None => Self::unwritable(at, ty, scopes, enclosing),
-                }
+                && self.part_fits(*context, ty, at, scopes, enclosing)
         })
     }
 
@@ -564,7 +572,7 @@ impl Referrer {
                 let items = names.iter().filter(|name| {
                     let name = ident_name(name);
                     !context
-                        .generics()
+                        .generics
                         .params
                         .iter()
                         .any(|param| generic_param_name(param) == name)
@@ -589,31 +597,31 @@ impl Referrer {
         let Matching {
             self_ty,
             nested_type,
-            alone,
+            without_self_first,
             ..
         } = matching;
         let entry = entry.without_module();
-        if alone {
+        if without_self_first {
             let mut scopes = scopes.to_vec();
             if let Some(last) = scopes.last_mut() {
                 last.set_self(None);
             }
-            let alone = Context::of(ty, &scopes, None, false, enclosing);
-            if alone.map_or(false, |context| context == entry) {
+            let without_self = Context::of(ty, &scopes, None, false, enclosing);
+            if without_self.map_or(false, |context| context == entry) {
                 return Some(0);
             }
         }
         // A bound that has no name here (see `Context::of()`) is in no entry. An entry for any type
         // has the `Self` of a nested struct, enum or union as the implementor, also where its type
         // names it (`Reason::NestedSelfInBounds`).
-        let any = nested_type && matches!(entry.self_ty(), Some(SelfRequirement::Any));
+        let any = nested_type && matches!(entry.self_ty, Some(SelfRequirement::Any));
         let context = if any {
             Context::of_any(ty, scopes, self_ty, nested_type, enclosing)
         } else {
             Context::of(ty, scopes, self_ty, nested_type, enclosing)
         }
         .ok()?;
-        let after = usize::from(alone);
+        let after = usize::from(without_self_first);
         if context == entry {
             Some(after)
         } else if context.is_entry_with_extra_self_predicates(&entry) {
@@ -679,8 +687,18 @@ impl Referrer {
     ///
     /// It is `None` if the entry names `Self`, or its context's generics do: write what `Self` stands
     /// for there.
+    ///
+    /// # Panics
+    ///
+    /// If `ix` is not an entry of this Referrer.
     #[must_use]
     pub fn bucket_self(&self, ix: EntryId, id: u64) -> Option<Type> {
+        assert!(
+            ix.index() < self.entries.len(),
+            "the entry {} is not one of this Referrer ({} entries)",
+            ix,
+            self.entries.len()
+        );
         (!self.needs_self(ix.index())).then(|| bucket_type(id, ix.index()))
     }
 
@@ -727,7 +745,10 @@ impl Referrer {
         // generics of a context have no defaults, and the type of a const parameter is a
         // primitive), but both use `impl_generics()`, so `const_fn` gets the same parameters.
         let self_in_impl: Type = match target {
-            ImplSelf::Param(ident) | ImplSelf::Bucket { param: ident } => parse_quote!(#ident),
+            ImplSelf::Param(ident) | ImplSelf::Bucket { param: ident } => {
+                let ident = self.self_param(ix, ident);
+                parse_quote!(#ident)
+            }
             ImplSelf::Marker(marker) => marker.clone(),
         };
         for param in &self.impl_generics(ix, &self_in_impl).params {
@@ -737,6 +758,34 @@ impl Referrer {
             }
         }
         Ok(())
+    }
+
+    // The name of the parameter that stands for `Self` in the impl of the entry `ix`: `ident`, unless
+    // the type of the entry, the generics of its context or its bound use that name, else the first
+    // of `ident0`, `ident1`, .. that they do not (the declaration would clash, E0403, or the name
+    // would be taken for that generic). `repeater_impl()` and `check_consts()` must agree on it.
+    fn self_param(&self, ix: usize, ident: &Ident) -> Ident {
+        let ty = &self.entries[ix].0;
+        let context = &self.contexts[&self.entries[ix].1];
+        let generics = &context.generics;
+        let where_clause = &generics.where_clause;
+        let bound = match &context.self_ty {
+            Some(SelfRequirement::Bound(path)) => Some(path),
+            _ => None,
+        };
+        // Every identifier counts, those of the tokens of a macro too. A lifetime has its own
+        // names, as `'__S`.
+        let mut used = HashSet::new();
+        token_names(quote!(#ty #generics #where_clause #bound), &mut used);
+        let base = ident_name(ident);
+        if !used.contains(&base) {
+            return ident.clone();
+        }
+        (0..)
+            .map(|n| format!("{}{}", base, n))
+            .find(|name| !used.contains(name))
+            .map(|name| Ident::new(&name, ident.span()))
+            .unwrap()
     }
 
     // The generics of the impl of the entry `ix`, before the bounds are encoded: those of its
@@ -764,7 +813,6 @@ impl Referrer {
     ) -> std::result::Result<RepeaterImpl, EncodeError> {
         let context = &self.contexts[&self.entries[ix].1];
         let bucket;
-        self.check_marker(ix, target)?;
         let target = match target {
             ImplSelf::Bucket { param } => match self.bucket_self(EntryId::new(ix), id) {
                 Some(ty) => {
@@ -775,6 +823,16 @@ impl Referrer {
             },
             target => target,
         };
+        // The impl of a struct, an enum or a union (`SelfRequirement::Type`) declares no parameter.
+        let param_ident;
+        let target = match (target, context.self_ty.as_ref()) {
+            (ImplSelf::Param(_), Some(SelfRequirement::Type(_))) => target,
+            (ImplSelf::Param(ident), _) => {
+                param_ident = self.self_param(ix, ident);
+                ImplSelf::Param(&param_ident)
+            }
+            (target, _) => target,
+        };
         // The type the impl is for, `Self` as the impl writes it, the parameter to declare and its
         // bound.
         let (self_ty, self_in_impl, param, bound): (Type, Type, Option<&Ident>, Option<&Path>) =
@@ -782,7 +840,8 @@ impl Referrer {
                 (Some(SelfRequirement::Type(ty)), ImplSelf::Param(_)) => {
                     (ty.clone(), parse_quote!(Self), None, None)
                 }
-                (Some(_), ImplSelf::Marker(_)) => unreachable!("rejected above"),
+                // `check_marker()` refused it in `repeater_impls()`.
+                (Some(_), ImplSelf::Marker(_)) => unreachable!("rejected by check_marker()"),
                 (Some(SelfRequirement::Bound(path)), ImplSelf::Param(ident)) => (
                     parse_quote!(#ident),
                     parse_quote!(#ident),
@@ -814,9 +873,9 @@ impl Referrer {
             _ => self.entries[ix].0.clone(),
         };
         let generics = self.impl_generics(ix, &self_in_impl);
-        let args = encode_generics_params_with(
+        let args = encode_entry_args(
             &generics.params,
-            Some((&self_in_impl, &context.self_outlives)),
+            (&self_in_impl, &context.self_outlives),
             |param| {
                 let ident = &param.ident;
                 const_fn(&parse_quote!(#ident), param)
@@ -843,13 +902,16 @@ impl Referrer {
                 .position(|param| matches!(param, GenericParam::Const(_)))
                 .unwrap_or(declared.params.len());
             declared.params.insert(at, declaration);
+            // The generics of an entry with none have no angle brackets, which `Generics` compares.
+            declared.lt_token.get_or_insert_with(Default::default);
+            declared.gt_token.get_or_insert_with(Default::default);
         }
         parenthesize_leading_qualified_path(&mut declared);
         Ok(RepeaterImpl {
             entry: EntryId::new(ix),
             generics: declared,
             self_ty,
-            path: parse_quote!(#repeater<#args>),
+            path: repeater_path(repeater, &args),
             args,
             ty,
             module: context
@@ -929,27 +991,32 @@ impl Referrer {
         context: ContextId,
         type_fn: F,
     ) -> Visitor<'r, F> {
-        let found = &self.contexts[&context];
+        let found = self
+            .contexts
+            .get(&context)
+            .unwrap_or_else(|| panic!("the context {} is not one of this Referrer", context));
         let in_module = found.is_module_scope();
         Visitor {
             referrer: self,
-            hidden: Rc::default(),
             type_fn: Rc::new(RefCell::new(type_fn)),
             nested_fn: None,
-            self_requirement: found.self_ty().cloned(),
-            scopes: vec![scope_of(found)],
-            outermost_as_leakers: false,
-            self_ty: None,
-            // The items of a module are nested items.
-            item_depth: usize::from(in_module),
-            own_self: false,
-            nested: None,
-            mod_path: Vec::new(),
-            defaults: Defaults::Plain,
-            module: ModulePos::of(found),
-            module_scope: in_module,
-            place: PartPlace::default(),
-            signature: None,
+            state: VisitorState {
+                hidden: Rc::default(),
+                self_req: found.self_ty.clone(),
+                scopes: vec![Scope::of_context(found)],
+                outermost_as_leakers: false,
+                written_self: None,
+                // The items of a module are nested items.
+                item_depth: usize::from(in_module),
+                own_self: false,
+                nested: None,
+                mod_path: Vec::new(),
+                defaults: Defaults::Plain,
+                module: ModulePos::of(found),
+                module_scope: in_module,
+                place: PartPlace::default(),
+                signature: None,
+            },
         }
     }
 
@@ -996,7 +1063,7 @@ impl Referrer {
         ty: Type,
         type_fn: impl FnMut(Type, EntryId, &Context) -> Type,
     ) -> Type {
-        Folder {
+        EntryFolder {
             referrer: self,
             at,
             scopes,
@@ -1189,7 +1256,7 @@ fn parenthesize_leading_qualified_path(generics: &mut Generics) {
 }
 
 /// Folds a type, replacing the leaked types in it (see `Referrer::expand_with()`).
-struct Folder<'a, 'b, F> {
+struct EntryFolder<'a, 'b, F> {
     referrer: &'a Referrer,
     at: Lookup<'b>,
     scopes: &'a mut Vec<Scope>,
@@ -1200,7 +1267,7 @@ struct Folder<'a, 'b, F> {
     type_fn: F,
 }
 
-impl<'a, 'b, F: FnMut(Type, EntryId, &Context) -> Type> Folder<'a, 'b, F> {
+impl<'a, 'b, F: FnMut(Type, EntryId, &Context) -> Type> EntryFolder<'a, 'b, F> {
     /// The entry that stands for `ty`, unless `ty` is a part, which is left as written, or
     /// is inside a whole part: nothing in it is looked up.
     fn lookup(&mut self, ty: &Type, enclosing: &Enclosing) -> Option<usize> {
@@ -1223,7 +1290,7 @@ impl<'a, 'b, F: FnMut(Type, EntryId, &Context) -> Type> Folder<'a, 'b, F> {
         self.referrer.find(self.at, ty, self.scopes, enclosing)
     }
 
-    /// Returns `true` in the probe of a signature ([`SignatureFacts::probe()`]) if `ty`, which is no
+    /// Returns `true` in the probe of a signature ([`SignatureFacts::inputs_probe()`]) if `ty`, which is no
     /// entry, is a part that a signature made: it is a type leaked whole, replaced.
     fn is_part_of_signature(&self, ty: &Type, enclosing: &Enclosing) -> bool {
         !self.at.place.protected
@@ -1234,7 +1301,7 @@ impl<'a, 'b, F: FnMut(Type, EntryId, &Context) -> Type> Folder<'a, 'b, F> {
     }
 }
 
-impl<'a, 'b, F: FnMut(Type, EntryId, &Context) -> Type> Fold for Folder<'a, 'b, F> {
+impl<'a, 'b, F: FnMut(Type, EntryId, &Context) -> Type> Fold for EntryFolder<'a, 'b, F> {
     fn fold_type(&mut self, ty: Type) -> Type {
         let enclosing = self.enclosing.clone();
         let outer = self.at.place;
@@ -1332,14 +1399,6 @@ impl<'a, 'b, F: FnMut(Type, EntryId, &Context) -> Type> Fold for Folder<'a, 'b, 
     }
 }
 
-/// The path `path` read as a type, which stands for a node that is no type (a bound).
-fn path_type(path: &Path) -> Type {
-    Type::Path(TypePath {
-        qself: None,
-        path: path.clone(),
-    })
-}
-
 /// A struct, enum, union, trait or impl nested in the visited syntax, which has a `Self` of its
 /// own.
 ///
@@ -1396,7 +1455,7 @@ pub struct NestedSelf {
 impl NestedSelf {
     /// Returns `true` for a struct, an enum or a union, and `false` for a trait, which has no type
     /// of its own, and for an impl, which has the self type it is written for. As in the Leaker
-    /// (`AnalyzeVisitor::self_nested`).
+    /// (`SelfScope::nested`).
     fn is_adt(&self) -> bool {
         self.ident.is_some() && matches!(self.requirement, SelfRequirement::Type(_))
     }
@@ -1432,15 +1491,15 @@ impl Declares {
 }
 
 /// Returns the names that `items` declare together: types, traits, constants, modules and imports.
-fn declared_names<'a>(items: impl IntoIterator<Item = &'a Item>) -> Vec<Ident> {
-    fn use_names(tree: &UseTree, names: &mut Vec<Ident>) {
+fn shadowing_names<'a>(items: impl IntoIterator<Item = &'a Item>) -> Vec<Ident> {
+    fn shadowing_use_names(tree: &UseTree, names: &mut Vec<Ident>) {
         match tree {
-            UseTree::Path(UsePath { tree, .. }) => use_names(tree, names),
+            UseTree::Path(UsePath { tree, .. }) => shadowing_use_names(tree, names),
             UseTree::Name(UseName { ident }) if ident != "self" => names.push(ident.clone()),
             UseTree::Rename(UseRename { rename, .. }) => names.push(rename.clone()),
             UseTree::Group(UseGroup { items, .. }) => {
                 for tree in items {
-                    use_names(tree, names)
+                    shadowing_use_names(tree, names)
                 }
             }
             _ => (),
@@ -1458,7 +1517,7 @@ fn declared_names<'a>(items: impl IntoIterator<Item = &'a Item>) -> Vec<Ident> {
             | Item::Const(ItemConst { ident, .. })
             | Item::Static(ItemStatic { ident, .. })
             | Item::Mod(ItemMod { ident, .. }) => names.push(ident.clone()),
-            Item::Use(ItemUse { tree, .. }) => use_names(tree, &mut names),
+            Item::Use(ItemUse { tree, .. }) => shadowing_use_names(tree, &mut names),
             Item::ExternCrate(ItemExternCrate { ident, rename, .. }) => {
                 names.push(rename.as_ref().map_or(ident, |(_, rename)| rename).clone())
             }
@@ -1498,20 +1557,26 @@ fn declared_names<'a>(items: impl IntoIterator<Item = &'a Item>) -> Vec<Ident> {
 #[must_use]
 pub struct Visitor<'r, F, G = fn(&NestedSelf, Type, EntryId, &Context) -> Type> {
     referrer: &'r Referrer,
-    /// The entries that the items declared in the visited syntax hide (`Visitor::shadow_items()`).
-    hidden: Rc<HashSet<usize>>,
     type_fn: Rc<RefCell<F>>,
     /// Writes the replacement of an entry that depends on the own `Self` of a nested item.
     nested_fn: Option<Rc<RefCell<G>>>,
+    state: VisitorState,
+}
+
+/// Where a [`Visitor`] is in the visited syntax; a nested visitor starts from a copy.
+#[derive(Clone, Debug)]
+struct VisitorState {
+    /// The entries that the items declared in the visited syntax hide (`Visitor::shadow_items()`).
+    hidden: Rc<HashSet<usize>>,
     /// What `Self` means here: in the context, or in the nested item that declares it. Each scope
     /// in `scopes` keeps the one in force where it was declared.
-    self_requirement: Option<SelfRequirement>,
+    self_req: Option<SelfRequirement>,
     /// The generics in scope, innermost last. The first are those of the context.
     scopes: Vec<Scope>,
     /// See [`Visitor::with_outermost_generics_as_leakers()`].
     outermost_as_leakers: bool,
     /// What replaces `Self` in the copy ([`Visitor::with_self()`]).
-    self_ty: Option<Type>,
+    written_self: Option<Type>,
     /// How many items the visit is in. The outermost item visited is the scope itself (`0`), and
     /// the items of a module context are nested ones (`1`).
     item_depth: usize,
@@ -1525,6 +1590,7 @@ pub struct Visitor<'r, F, G = fn(&NestedSelf, Type, EntryId, &Context) -> Type> 
     /// While the generics of a scope that this visit declares are visited: how the defaults of
     /// their parameters are looked up (see `Visitor::visit_type_param_mut()`).
     defaults: Defaults,
+    /// Where the visit is among the modules of the Leaker.
     module: ModulePos,
     /// The context is a module: the visited items are its own until the visitor enters one.
     module_scope: bool,
@@ -1538,22 +1604,9 @@ impl<'r, F, G> Clone for Visitor<'r, F, G> {
     fn clone(&self) -> Self {
         Self {
             referrer: self.referrer,
-            hidden: self.hidden.clone(),
             type_fn: self.type_fn.clone(),
             nested_fn: self.nested_fn.clone(),
-            self_requirement: self.self_requirement.clone(),
-            scopes: self.scopes.clone(),
-            outermost_as_leakers: self.outermost_as_leakers,
-            self_ty: self.self_ty.clone(),
-            item_depth: self.item_depth,
-            own_self: self.own_self,
-            nested: self.nested.clone(),
-            mod_path: self.mod_path.clone(),
-            defaults: self.defaults,
-            module: self.module,
-            module_scope: self.module_scope,
-            place: self.place,
-            signature: self.signature.clone(),
+            state: self.state.clone(),
         }
     }
 }
@@ -1569,7 +1622,7 @@ where
     /// (`impl<T: Clone> MyTrait<T> for ..`): a type that names them is replaced if it was leaked,
     /// whatever bounds they have. Deeper generics stay declared, so they must match the entry's.
     pub fn with_outermost_generics_as_leakers(mut self) -> Self {
-        self.outermost_as_leakers = true;
+        self.state.outermost_as_leakers = true;
         self
     }
 
@@ -1592,7 +1645,7 @@ where
     /// (`for<'__tl_e0> fn(&'__tl_e0 ::p::S<'a>) -> &'__tl_e0 u8`). Where it cannot, the type is
     /// leaked whole ([Elided lifetimes](crate::Leaker#elided-lifetimes)).
     pub fn with_self(mut self, self_ty: Type) -> Self {
-        self.self_ty = Some(self_ty);
+        self.state.written_self = Some(self_ty);
         self
     }
 
@@ -1623,41 +1676,28 @@ where
     ) -> Visitor<'r, F, N> {
         Visitor {
             referrer: self.referrer,
-            hidden: self.hidden,
             type_fn: self.type_fn,
             nested_fn: Some(Rc::new(RefCell::new(nested_fn))),
-            self_requirement: self.self_requirement,
-            scopes: self.scopes,
-            outermost_as_leakers: self.outermost_as_leakers,
-            self_ty: self.self_ty,
-            item_depth: self.item_depth,
-            own_self: self.own_self,
-            nested: self.nested,
-            mod_path: self.mod_path,
-            defaults: self.defaults,
-            module: self.module,
-            module_scope: self.module_scope,
-            place: self.place,
-            signature: self.signature,
+            state: self.state,
         }
     }
 
     /// Hides the entries that the `items` declared together hide (`Referrer::hidden_by()`).
     fn shadow_items<'a>(&mut self, items: impl IntoIterator<Item = &'a Item>, module: bool) {
-        let names = declared_names(items);
+        let names = shadowing_names(items);
         if names.is_empty() {
             return;
         }
         let hidden = self.referrer.hidden_by(&names, module);
         if !hidden.is_empty() {
-            Rc::make_mut(&mut self.hidden).extend(hidden);
+            Rc::make_mut(&mut self.state.hidden).extend(hidden);
         }
     }
 
     /// Returns `true` if `cause`, a bound whose trait path conflicts, is a part: it is no type.
     /// `path` stands for it as a type, to give it its context.
     fn is_part_bound(&self, cause: impl FnOnce() -> Cause, path: &Path) -> bool {
-        if self.referrer.parts_by_cause.is_empty() || self.place.protected {
+        if self.referrer.parts_by_cause.is_empty() || self.state.place.protected {
             return false;
         }
         self.referrer
@@ -1665,7 +1705,7 @@ where
                 &cause(),
                 &path_type(path),
                 self.lookup(),
-                &self.scopes,
+                &self.state.scopes,
                 &Enclosing::default(),
                 &[],
             )
@@ -1676,37 +1716,45 @@ where
     fn lookup(&self) -> Lookup<'_> {
         // In a nested item, the entries that name its own `Self` are found, and written by
         // `nested_fn`; with none, `Self` hides the one around and nothing that names it is found.
-        let nested = self.own_self && self.nested.is_some() && self.nested_fn.is_some();
+        let nested = self.state.own_self && self.state.nested.is_some() && self.nested_fn.is_some();
         Lookup {
             matching: Matching {
-                self_ty: self.self_requirement.as_ref(),
-                no_self: self.own_self && !nested,
+                self_ty: self.state.self_req.as_ref(),
+                no_self: self.state.own_self && !nested,
                 nested_type: self.nested_type(),
-                alone: self.defaults == Defaults::OwnTraitDefault,
+                without_self_first: self.state.defaults == Defaults::OwnTraitDefault,
             },
-            module: self.module,
-            hidden: Some(&self.hidden),
-            place: self.place,
-            signature: self.signature.as_deref(),
+            module: self.state.module,
+            hidden: Some(&self.state.hidden),
+            place: self.state.place,
+            signature: self.state.signature.as_deref(),
         }
     }
 
     /// Returns `true` in a nested struct, enum or union (see [`NestedSelf::is_adt()`]).
     fn nested_type(&self) -> bool {
-        self.own_self && self.nested.as_ref().map_or(false, |nested| nested.is_adt())
+        self.state.own_self
+            && self
+                .state
+                .nested
+                .as_ref()
+                .map_or(false, |nested| nested.is_adt())
     }
 
     /// Returns what replaces `Self` here ([`Visitor::with_self()`]), unless a nested item declares
     /// its own `Self`.
     fn replaced_self(&self) -> Option<&Type> {
-        self.self_ty.as_ref().filter(|_| !self.own_self)
+        self.state
+            .written_self
+            .as_ref()
+            .filter(|_| !self.state.own_self)
     }
 
     /// Runs `visit`, which visits a part that is left as written: no entry is looked up in it.
     fn protected(&mut self, visit: impl FnOnce(&mut Self)) {
-        let outer = std::mem::replace(&mut self.place.protected, true);
+        let outer = std::mem::replace(&mut self.state.place.protected, true);
         visit(self);
-        self.place.protected = outer;
+        self.state.place.protected = outer;
     }
 
     fn visit_attrs(&mut self, attrs: &mut [Attribute]) {
@@ -1718,8 +1766,8 @@ where
     /// `generics` are those of the context, in any order and with the bounds anywhere.
     fn is_context_generics(&self, generics: &Generics) -> bool {
         let canonical = Context::new(generics.clone(), None);
-        let canonical = Scope::new(canonical.generics(), None);
-        matches!(self.scopes.first(), Some(first) if first.same_generics(&canonical))
+        let canonical = Scope::new(&canonical.generics, None);
+        matches!(self.state.scopes.first(), Some(first) if first.same_generics(&canonical))
     }
 
     /// Visits the attributes, then returns a nested visitor that has visited `generics` and has
@@ -1735,42 +1783,45 @@ where
     ) -> Self {
         self.visit_attrs(attrs);
         let mut visitor = self.clone();
-        visitor.item_depth += 1;
+        visitor.state.item_depth += 1;
         // Only an item nested in the visited syntax that declares `Self` has one of its own: the
         // Leaker keeps the `Self` around for a function, a type alias or a trait alias. The layer
         // of the item is the Leaker's: entries that name its `Self` exist
         // (`AnalyzeVisitor::with_item_of()`).
         let mut own_trait = false;
-        if self.item_depth > 0 {
+        if self.state.item_depth > 0 {
             if let Some(declared) = declares {
                 own_trait = matches!(declared.requirement, SelfRequirement::Bound(_));
-                visitor.own_self = true;
-                visitor.nested = Some(Rc::new(NestedSelf {
+                visitor.state.own_self = true;
+                visitor.state.nested = Some(Rc::new(NestedSelf {
                     requirement: declared.requirement.clone(),
                     ident: declared.ident,
-                    modules: self.mod_path.clone(),
+                    modules: self.state.mod_path.clone(),
                 }));
-                visitor.self_requirement = Some(declared.requirement);
+                visitor.state.self_req = Some(declared.requirement);
             }
         }
         // Declare before visiting: every parameter is in scope of each other's bounds. The
         // outermost item is the scope itself if it declares the generics of the context as they
         // are, or if `with_outermost_generics_as_leakers()` says so: they are not declared again.
-        let outermost = item && self.item_depth == 0;
+        let outermost = item && self.state.item_depth == 0;
         let declared =
-            !(outermost && (self.outermost_as_leakers || self.is_context_generics(generics)));
+            !(outermost && (self.state.outermost_as_leakers || self.is_context_generics(generics)));
         if declared {
-            let declared_for = visitor.self_requirement.clone();
-            visitor.scopes.push(Scope::new(generics, declared_for));
+            let declared_for = visitor.state.self_req.clone();
+            visitor
+                .state
+                .scopes
+                .push(Scope::new(generics, declared_for));
         }
         // How the defaults of the generics are looked up: see `Defaults`.
-        visitor.defaults = if own_trait {
+        visitor.state.defaults = if own_trait {
             Defaults::OwnTrait
         } else {
             Defaults::WithoutSelf
         };
         visitor.visit_generics_mut(generics);
-        visitor.defaults = Defaults::Plain;
+        visitor.state.defaults = Defaults::Plain;
         visitor
     }
 
@@ -1778,11 +1829,10 @@ where
     /// by `()`, which holds no lifetime: what is left of the types of the inputs where the leaked
     /// types are replaced. That is each entry, and each part that a signature made, which is a type
     /// that the Leaker leaked here too, and left as written for the signature it was in (see
-    /// [`SignatureFacts::probe()`]). No closure is called.
+    /// [`SignatureFacts::inputs_probe()`]). No closure is called.
     fn inputs_without_entries(&self, sig: &Signature) -> Vec<FnArg> {
         let mut probe = Visitor {
             referrer: self.referrer,
-            hidden: self.hidden.clone(),
             type_fn: Rc::new(RefCell::new(
                 (|_, _, _| unit_type()) as fn(Type, EntryId, &Context) -> Type,
             )),
@@ -1791,19 +1841,10 @@ where
                     (|_, _, _, _| unit_type()) as fn(&NestedSelf, Type, EntryId, &Context) -> Type,
                 ))
             }),
-            self_requirement: self.self_requirement.clone(),
-            scopes: self.scopes.clone(),
-            outermost_as_leakers: self.outermost_as_leakers,
-            self_ty: self.self_ty.clone(),
-            item_depth: self.item_depth,
-            own_self: self.own_self,
-            nested: self.nested.clone(),
-            mod_path: self.mod_path.clone(),
-            defaults: self.defaults,
-            module: self.module,
-            module_scope: self.module_scope,
-            place: self.place,
-            signature: Some(Rc::new(SignatureFacts::probe())),
+            state: VisitorState {
+                signature: Some(Rc::new(SignatureFacts::inputs_probe())),
+                ..self.state.clone()
+            },
         };
         sig.inputs
             .iter()
@@ -1829,15 +1870,15 @@ where
         // in.
         if self.referrer.marks_unconstrained(facts.unconstrained()) {
             let copy = visitor.inputs_without_entries(sig);
-            facts = facts.in_copy(&SignatureScopes(&visitor.scopes), sig, &copy);
+            facts = facts.in_copy(&SignatureScopes(&visitor.state.scopes), sig, &copy);
         }
         for input in sig.inputs.iter_mut() {
-            visitor.signature = Some(Rc::new(facts.for_input(input)));
+            visitor.state.signature = Some(Rc::new(facts.for_input(input)));
             visitor.visit_fn_arg_mut(input);
         }
-        visitor.signature = Some(Rc::new(facts));
+        visitor.state.signature = Some(Rc::new(facts));
         visitor.visit_return_type_mut(&mut sig.output);
-        visitor.signature = None;
+        visitor.state.signature = None;
         visitor
     }
 }
@@ -1848,15 +1889,15 @@ where
     G: FnMut(&NestedSelf, Type, EntryId, &Context) -> Type,
 {
     fn visit_type_mut(&mut self, i: &mut Type) {
-        let nested = match (&self.nested, &self.nested_fn) {
-            (Some(nested), Some(nested_fn)) if self.own_self => Some((nested, nested_fn)),
+        let nested = match (&self.state.nested, &self.nested_fn) {
+            (Some(nested), Some(nested_fn)) if self.state.own_self => Some((nested, nested_fn)),
             _ => None,
         };
         let referrer = self.referrer;
         let mut type_fn = self.type_fn.borrow_mut();
         let replace = |ty: Type, ix: EntryId, entry: &Context| -> Type {
             match nested {
-                Some((nested, nested_fn)) if entry.self_ty().is_some() => {
+                Some((nested, nested_fn)) if entry.self_ty.is_some() => {
                     let mut nested_fn = nested_fn.borrow_mut();
                     (*nested_fn)(nested, ty, ix, entry)
                 }
@@ -1864,7 +1905,7 @@ where
             }
         };
         // The lookup reads the rest of the visitor, so the scopes are lent from outside it.
-        let mut scopes = std::mem::take(&mut self.scopes);
+        let mut scopes = std::mem::take(&mut self.state.scopes);
         *i = referrer.expand_with(
             self.lookup(),
             &mut scopes,
@@ -1872,21 +1913,21 @@ where
             i.clone(),
             replace,
         );
-        self.scopes = scopes;
+        self.state.scopes = scopes;
     }
     fn visit_fn_arg_mut(&mut self, i: &mut FnArg) {
         // An `impl Trait` in an argument is a generic of the function, whose bounds are predicates
         // of the item (the Leaker's `in_fn_arg`).
-        let outer = std::mem::replace(&mut self.place.in_fn_arg, true);
+        let outer = std::mem::replace(&mut self.state.place.in_fn_arg, true);
         syn::visit_mut::visit_fn_arg_mut(self, i);
-        self.place.in_fn_arg = outer;
+        self.state.place.in_fn_arg = outer;
     }
     fn visit_type_param_bound_mut(&mut self, i: &mut TypeParamBound) {
         // A bound that is not in a type is a predicate of the item (the Leaker's `env_depth`). A
         // type is visited whole by `visit_type_mut()`, so a bound visited here is not in one.
-        let outer = std::mem::replace(&mut self.place.in_predicate, true);
+        let outer = std::mem::replace(&mut self.state.place.in_predicate, true);
         syn::visit_mut::visit_type_param_bound_mut(self, i);
-        self.place.in_predicate = outer;
+        self.state.place.in_predicate = outer;
     }
     fn visit_receiver_mut(&mut self, i: &mut Receiver) {
         if self.replaced_self().is_none() {
@@ -1896,12 +1937,14 @@ where
         self.visit_attrs(&mut i.attrs);
     }
     fn visit_predicate_type_mut(&mut self, i: &mut PredicateType) {
-        let depth = self.scopes.len();
-        self.scopes.extend(i.lifetimes.as_ref().map(Scope::binder));
-        let outer = std::mem::replace(&mut self.place.in_predicate, true);
+        let depth = self.state.scopes.len();
+        self.state
+            .scopes
+            .extend(i.lifetimes.as_ref().map(Scope::binder));
+        let outer = std::mem::replace(&mut self.state.place.in_predicate, true);
         syn::visit_mut::visit_predicate_type_mut(self, i);
-        self.place.in_predicate = outer;
-        self.scopes.truncate(depth);
+        self.state.place.in_predicate = outer;
+        self.state.scopes.truncate(depth);
         // What replaced the bounded type (`Self`, an entry) may need parentheses there.
         parenthesize_bounded(&mut i.bounded_ty);
     }
@@ -1912,26 +1955,28 @@ where
         if let Some(self_ty) = self.replaced_self() {
             let mut writer = SelfWriter {
                 self_ty,
-                scopes: &self.scopes[..],
+                scopes: &self.state.scopes[..],
             };
             name_elided_in_bound(&mut writer, i);
         }
         let elision = Elision::of_bound(i);
-        let depth = self.scopes.len();
-        self.scopes.extend(i.lifetimes.as_ref().map(Scope::binder));
+        let depth = self.state.scopes.len();
+        self.state
+            .scopes
+            .extend(i.lifetimes.as_ref().map(Scope::binder));
         if part {
             self.protected(|visitor| syn::visit_mut::visit_trait_bound_mut(visitor, i));
         } else {
             syn::visit_mut::visit_trait_bound_mut(self, i);
         }
-        self.scopes.truncate(depth);
+        self.state.scopes.truncate(depth);
         if let Some(elision) = elision {
-            let mut names = WrittenNames::new(&self.scopes[..], &*i);
+            let mut names = WrittenNames::new(&self.state.scopes[..], &*i);
             elision.name_written_bound(&mut names, i);
         }
     }
     fn visit_type_param_mut(&mut self, i: &mut TypeParam) {
-        let defaults = self.defaults;
+        let defaults = self.state.defaults;
         if matches!(defaults, Defaults::Plain | Defaults::OwnTraitDefault) {
             return syn::visit_mut::visit_type_param_mut(self, i);
         }
@@ -1946,25 +1991,25 @@ where
         if defaults == Defaults::OwnTrait {
             // An entry of either kind is found, the one without `Self` first (it is what an impl
             // of the trait can use, for `complete_params()`): see `Defaults::OwnTrait`.
-            self.defaults = Defaults::OwnTraitDefault;
+            self.state.defaults = Defaults::OwnTraitDefault;
             self.visit_type_mut(default);
-            self.defaults = Defaults::OwnTrait;
+            self.state.defaults = Defaults::OwnTrait;
         } else {
             // The default is looked up without `Self`: see `Defaults::WithoutSelf`.
             let nested_type = self.nested_type();
-            let self_requirement = self.self_requirement.take();
-            let own = self.scopes.last().cloned();
-            if let Some(scope) = self.scopes.last_mut() {
-                scope.replace_self(None);
+            let self_req = self.state.self_req.take();
+            let own = self.state.scopes.last().cloned();
+            if let Some(scope) = self.state.scopes.last_mut() {
+                scope.set_self(None);
                 if nested_type {
                     scope.without_self();
                 }
             }
             self.visit_type_mut(default);
-            if let (Some(scope), Some(own)) = (self.scopes.last_mut(), own) {
+            if let (Some(scope), Some(own)) = (self.state.scopes.last_mut(), own) {
                 *scope = own;
             }
-            self.self_requirement = self_requirement;
+            self.state.self_req = self_req;
         }
     }
     fn visit_const_param_mut(&mut self, i: &mut ConstParam) {
@@ -1989,13 +2034,13 @@ where
     fn visit_item_trait_mut(&mut self, i: &mut ItemTrait) {
         let declares = Declares::of_trait(&i.ident, &i.generics);
         let gats = Gat::of_items(&i.items);
-        let depth = self.scopes.len();
+        let depth = self.state.scopes.len();
         let mut visitor = self.enter(&mut i.attrs, &mut i.generics, Some(declares), true);
         // The scope of the trait knows what its generic associated types require, as the Leaker's
         // does. If the trait does not declare its generics (they are those of the context), the
         // scope of the context has them.
-        if visitor.scopes.len() > depth {
-            if let Some(scope) = visitor.scopes.last_mut() {
+        if visitor.state.scopes.len() > depth {
+            if let Some(scope) = visitor.state.scopes.last_mut() {
                 scope.set_gats(gats);
             }
         }
@@ -2048,21 +2093,23 @@ where
         self.visit_attrs(&mut i.attrs);
         if let Some((_, items)) = &mut i.content {
             let mut visitor = self.clone();
-            let found = self.referrer.module_in(self.module, &i.ident);
+            let found = self.referrer.module_in(self.state.module, &i.ident);
             // At the top of the module of the context, a `mod` that none of its modules is named
             // like is the module itself: its items are those of the context, as in a `File`.
-            let itself = self.module_scope && self.item_depth == 1 && found == ModulePos::Elsewhere;
+            let itself = self.state.module_scope
+                && self.state.item_depth == 1
+                && found == ModulePos::Elsewhere;
             if itself {
                 // A `mod` in it is nested in the module, as for its items.
-                visitor.module_scope = false;
+                visitor.state.module_scope = false;
             } else {
-                visitor.module = found;
-                visitor.mod_path.push(i.ident.clone());
+                visitor.state.module = found;
+                visitor.state.mod_path.push(i.ident.clone());
                 // A module has no generics: it only makes its items nested. `Self` has no meaning
                 // in it.
-                visitor.item_depth += 1;
-                visitor.self_requirement = None;
-                visitor.nested = None;
+                visitor.state.item_depth += 1;
+                visitor.state.self_req = None;
+                visitor.state.nested = None;
             }
             visitor.shadow_items(items.iter(), true);
             for item in items.iter_mut() {
@@ -2283,10 +2330,10 @@ fn read_tag(input: parse::ParseStream) -> Result<()> {
 
 /// The contexts that the tokens name, each with its span: they are checked when all the contexts
 /// are known.
-type Mentions = Vec<(Span, ContextId)>;
+type ContextRefs = Vec<(Span, ContextId)>;
 
 /// Reads the parts copied as written, if any, and the contexts they name.
-fn read_parts(input: parse::ParseStream) -> Result<(Vec<PartItem>, Mentions)> {
+fn read_parts(input: parse::ParseStream) -> Result<(Vec<PartItem>, ContextRefs)> {
     let mut parts = Vec::new();
     let mut part_contexts = Vec::new();
     if input.peek(token::Bracket) {
@@ -2309,12 +2356,14 @@ fn read_parts(input: parse::ParseStream) -> Result<(Vec<PartItem>, Mentions)> {
 /// What the parser has read of the groups.
 #[derive(Default)]
 struct Reader {
+    /// The entries read, each with the id of its context.
     entries: Vec<(ContextId, Type)>,
+    /// The contexts read.
     contexts: BTreeMap<ContextId, Context>,
     /// The contexts that are modules (`mod { .. }`).
     modules: HashSet<ContextId>,
     /// The modules that contexts refer to (`mod 3 ;`).
-    module_refs: Mentions,
+    module_refs: ContextRefs,
     /// The parent of each module, with its span, checked when all the contexts are known.
     parents: BTreeMap<ContextId, (Span, ContextId)>,
     /// The id of a group that writes no `#`.

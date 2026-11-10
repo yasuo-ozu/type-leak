@@ -2,7 +2,7 @@
 
 use crate::allow::{filter, Allow};
 use crate::analysis::{drop_optional, names_self, Analysis, PartItem};
-use crate::analyze::{declared_names, AnalyzeVisitor, Finished, ModuleNames, ScopeSpec, Scopes};
+use crate::analyze::{module_names, AnalyzeVisitor, Finished, ModuleNames, ScopeSpec, Scopes};
 #[cfg(doc)]
 use crate::context::SelfRequirement;
 use crate::context::{Context, ContextId, Contexts, Gat, ModuleScope};
@@ -14,7 +14,7 @@ use crate::graph::{is_whole_reference, sorted_entries, NodeKey, TypeGraph};
 #[cfg(doc)]
 use crate::referrer::EntryId;
 use crate::referrer::Referrer;
-use crate::repeater::{ImplSelf, RepeaterImpl};
+use crate::repeater::{check_repeater_path, ImplSelf, RepeaterImpl};
 use crate::view::View;
 use proc_macro2::{Span, TokenStream};
 use safegraph::algo::max_flow::edmonds_karp_with_flows;
@@ -162,10 +162,12 @@ pub struct Leaker<A = ()> {
     allow: A,
     /// The types that depend on the context, or that the Referrer may replace.
     types: TypeGraph,
+    /// The contexts of the scopes and of the entries.
     contexts: Contexts,
     /// The top-level contexts of the scopes (also of those with errors), which the [`Referrer`]
     /// keeps without an entry too.
     top_levels: BTreeSet<ContextId>,
+    /// The primitive names that the copy writes as they are.
     assumed_primitives: Vec<Ident>,
     /// The parts copied as written.
     parts: Vec<PartItem>,
@@ -299,7 +301,7 @@ impl<A: Allow> Leaker<A> {
     /// the copy of each with its own id.
     pub fn intern_mod(&mut self, item: &ItemMod) -> ContextId {
         let names = match &item.content {
-            Some((_, items)) => declared_names(items),
+            Some((_, items)) => module_names(items),
             None => ModuleNames::default(),
         };
         let spec = ScopeSpec::Module {
@@ -490,7 +492,9 @@ impl<A: Allow> Leaker<A> {
 /// ```
 #[derive(Clone, Debug)]
 pub struct LeakerResult {
+    /// The Referrer of the analysis.
     referrer: Referrer,
+    /// The errors that remain.
     errors: Vec<ErrorItem>,
 }
 
@@ -569,6 +573,11 @@ impl LeakerResult {
     /// again, so it must give the same answer for the same parameter every time: if it fails for a
     /// parameter that it accepted in the call, the iterator panics.
     ///
+    /// # Panics
+    ///
+    /// If `repeater` has arguments (`crate::Repeater<u8>`), before any item: it names the trait
+    /// alone, or with an empty `<>`.
+    ///
     /// ```
     /// # use type_leak::*;
     /// # use syn::*;
@@ -608,6 +617,7 @@ impl LeakerResult {
         target: ImplSelf<'a>,
         mut const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError> + 'a,
     ) -> std::result::Result<impl Iterator<Item = RepeaterImpl> + 'a, EncodeError> {
+        check_repeater_path(repeater);
         let count = self.referrer.iter().count();
         for ix in 0..count {
             self.referrer.check_marker(ix, target)?;
@@ -675,8 +685,7 @@ impl<A: Allow> Scopes for Leaker<A> {
         f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
         let root = spec.declared_generics();
-        let mut visitor =
-            AnalyzeVisitor::new(&mut self.allow, &root).reading_values(self.check_values);
+        let mut visitor = AnalyzeVisitor::new(&mut self.allow, &root, self.check_values);
         let mark = self.contexts.len();
         // The visitor owns the table of contexts while it analyzes, so the swap is the only step
         // before `catch_unwind`: no allocation, no user code. Whatever happens next (a result, or a
@@ -686,7 +695,7 @@ impl<A: Allow> Scopes for Leaker<A> {
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             visitor.start(&spec);
             let result = f(&mut View::new(&mut visitor));
-            let (finished, mut errors) = visitor.finish(&root);
+            let (finished, mut errors) = visitor.finish(&spec, &root);
             // The errors that the rule accepts are dropped here, as `LeakerResult` drops
             // them later. It is user code too: if it panics, nothing is recorded.
             filter(visitor.rule(), &mut errors);
@@ -750,8 +759,8 @@ impl<A: Allow> Leaker<A> {
 /// to the cut closest to the sink, so inner types win. Returns the required entries and the
 /// optional ones.
 ///
-/// A type is red if it is `must_intern`, or `optional` and may be an entry. The kind of an entry is
-/// what it covers: required if it is or holds a `must_intern` type, else optional. A type is cut
+/// A type is red if it is in `required`, or in `optional` and may be an entry. The kind of an entry
+/// is what it covers: required if it is or holds a type of `required`, else optional. A type is cut
 /// only as the kind it is: a candidate of the kind, not in `no_entry` (an optional type is a
 /// candidate of both). An optional type that may not be an entry is not red, and its parts are.
 ///
@@ -772,8 +781,8 @@ fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
     let flags = |set: &HashSet<NodeKey>| -> Vec<bool> {
         keys.iter().map(|key| set.contains(*key)).collect()
     };
-    let (must, soft, root, is_kept) = (
-        flags(&types.must_intern),
+    let (is_required, is_optional, root, is_kept) = (
+        flags(&types.required),
         flags(&types.optional),
         flags(&types.roots),
         flags(&types.kept),
@@ -785,13 +794,13 @@ fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
         }
     }
     // An entry that covers a required type is a required entry.
-    let mut required = must.clone();
-    spread(&mut required, &parents);
+    let mut covers_required = is_required.clone();
+    spread(&mut covers_required, &parents);
     // An optional type is an entry anyway, so it is a candidate of either kind.
-    let may: Vec<bool> = (0..n)
+    let may_cut: Vec<bool> = (0..n)
         .map(|i| {
-            let candidate = match required[i] {
-                true => soft[i] || types.required_candidates.contains(keys[i]),
+            let candidate = match covers_required[i] {
+                true => is_optional[i] || types.required_candidates.contains(keys[i]),
                 false => types.optional_candidates.contains(keys[i]),
             };
             candidate && !types.no_entry.contains(keys[i])
@@ -799,16 +808,16 @@ fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
         .collect();
     // An optional type that cannot be an entry is no entry, and its parts are. A kept entry is one.
     let red: Vec<bool> = (0..n)
-        .map(|i| must[i] || is_kept[i] || (soft[i] && may[i]))
+        .map(|i| is_required[i] || is_kept[i] || (is_optional[i] && may_cut[i]))
         .collect();
     // A type that must be an entry cannot be forbidden to be one.
     let forbidden: Vec<bool> = (0..n)
-        .map(|i| !may[i] && !red[i] && !needs_parent(keys[i]))
+        .map(|i| !may_cut[i] && !red[i] && !needs_parent(keys[i]))
         .collect();
     let mut has_red = red.clone();
     spread(&mut has_red, &parents);
 
-    // A root that must be interned is in every minimum cut, so it is cut without a flow. So is a
+    // A red root is in every minimum cut, so it is cut without a flow. So is a
     // kept entry, which is a root of the graph it was kept in.
     let cut: Vec<bool> = (0..n).map(|i| (red[i] && root[i]) || is_kept[i]).collect();
     let mut kept: Vec<usize> = (0..n).filter(|&i| cut[i]).collect();
@@ -821,7 +830,7 @@ fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
         let whole = needs_parent(keys[i]);
         for &child in children[i].iter().filter(|&&child| has_red[child]) {
             if whole {
-                // The parent is interned as a whole, like a must-intern type.
+                // The parent is interned as a whole, like a required type.
                 to_sink[i] = true;
             } else if !cut[child] {
                 next[i].push(child);
@@ -877,7 +886,7 @@ fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
     }
 
     let entries = |kind: bool| {
-        let found = kept.iter().filter(|&&i| required[i] == kind);
+        let found = kept.iter().filter(|&&i| covers_required[i] == kind);
         found.map(|&i| keys[i].clone()).collect()
     };
     (entries(true), entries(false))

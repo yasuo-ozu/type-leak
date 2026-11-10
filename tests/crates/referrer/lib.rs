@@ -22,6 +22,11 @@ type_leak_test_leaker::m::Defaults!(
     impl<const B: bool, const N: usize> Defaults<u16, N> for Generic<B, N> => 0
 );
 
+/// A braced argument for a const parameter whose braced use is in a default (F73): the completed
+/// default is `[u8; { M }]`.
+pub struct G9246<const M: usize>(pub Inner);
+type_leak_test_leaker::m::Braced9246!(impl<const M: usize> Braced9246<{ M }> for G9246<M> => 0);
+
 // Where clauses, typed receivers, argument patterns, HRTB, elided lifetimes and RPITIT.
 type_leak_test_leaker::m::Edge!(impl Edge<u8> for Concrete => 0);
 
@@ -58,6 +63,10 @@ type_leak_test_leaker::s::SelfSized!(impl SelfSized for Concrete => 0 {
 type_leak_test_leaker::s::Assoc!(impl Assoc for Concrete => 0 {
     type Item = u8;
     type G<'a, V: 'a> = &'a V;
+});
+// The trait's generic is named like the parameter of the Repeater's impl for the implementor (F76).
+type_leak_test_leaker::s::Clash9248!(impl<T> Clash9248<T> for Concrete => 0 {
+    type Item = u8;
 });
 type_leak_test_leaker::s::Out!(impl<'x, T> Out<'x, T> for Concrete => 0);
 type_leak_test_leaker::s::DynRoot!(impl<'x> DynRoot<'x> for Concrete => 0);

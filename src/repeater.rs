@@ -4,16 +4,14 @@
 #[cfg(doc)]
 use crate::context::SelfRequirement;
 use crate::context::{Context, ModuleScope};
-use crate::encode::{
-    const_param_primitive, encode_generics_args_with_params, normalize_const_arg, params_as_args,
-    EncodeError,
-};
+use crate::encode::{const_param_primitive, encode_entry_args, normalize_const_arg, EncodeError};
 use crate::referrer::EntryId;
 #[cfg(doc)]
 use crate::referrer::Referrer;
+use crate::util::tidy;
 use proc_macro2::{Span, TokenStream};
 use syn::*;
-use template_quote::ToTokens;
+use template_quote::{quote, ToTokens};
 
 /// Const parameter types with a slot, in slot order. `usize` uses `[(); N]`, and `u128` uses `KEY`.
 const REPEATER_SLOTS: &[(&str, &str, &str)] = &[
@@ -89,12 +87,41 @@ pub fn repeater_definition(vis: &Visibility, ident: &Ident) -> ItemTrait {
     }
 }
 
+// Panics unless `repeater` names the trait without arguments: `Repeater`, or `Repeater<>`.
+pub(crate) fn check_repeater_path(repeater: &Path) {
+    let bare = repeater
+        .segments
+        .last()
+        .map_or(false, |segment| match &segment.arguments {
+            PathArguments::None => true,
+            PathArguments::AngleBracketed(arguments) => arguments.args.is_empty(),
+            PathArguments::Parenthesized(_) => false,
+        });
+    if !bare {
+        panic!(
+            "the path of the Repeater names the trait without arguments: `{}`",
+            tidy(&repeater.to_token_stream())
+        );
+    }
+}
+
+// The path of the Repeater with `args` as the arguments of its last segment (`Repeater<args>`).
+// Panics as `check_repeater_path()` does.
+pub(crate) fn repeater_path(repeater: &Path, args: impl ToTokens) -> Path {
+    check_repeater_path(repeater);
+    let mut path = repeater.clone();
+    if let Some(last) = path.segments.last_mut() {
+        last.arguments = PathArguments::None;
+    }
+    parse_quote!(#path<#args>)
+}
+
 // The path of the Repeater with the arguments of the entry `ix` of the Leaker `id`:
 // `Repeater<args, KEY>` with `KEY` from `repeater_key(id, ix)`. `args` is the first argument, as
-// `encode_generics_args_with_params()` writes it.
+// `encode_entry_args()` writes it.
 pub(crate) fn repeater_trait_path(repeater: &Path, args: &Type, id: u64, ix: EntryId) -> Path {
     let key = repeater_key(id, ix);
-    parse_quote!(#repeater<#args, #key>)
+    repeater_path(repeater, quote!(#args, #key))
 }
 
 /// Returns `<self_ty as Repeater<ARGS, KEY>>::Type`: the type that stands for the entry `ix` of
@@ -113,6 +140,11 @@ pub(crate) fn repeater_trait_path(repeater: &Path, args: &Type, id: u64, ix: Ent
 /// [`substitute_args()`](crate::substitute_args) afterwards. Fails with the error of `const_fn`, or
 /// with [`EncodeError::UnboundedTraitObject`] if `self_ty` is a trait object without a lifetime
 /// bound where `Self: 'a` needs one.
+///
+/// # Panics
+///
+/// If `repeater` has arguments (`crate::Repeater<u8>`): it names the trait alone, or with an empty
+/// `<>`.
 ///
 /// ```
 /// # use type_leak::*;
@@ -134,14 +166,16 @@ pub fn repeater_projection(
     context: &Context,
     id: u64,
     ix: EntryId,
-    const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
+    mut const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
 ) -> std::result::Result<Type, EncodeError> {
-    let args: Vec<GenericArgument> = params_as_args(&context.generics.params);
-    let args = encode_generics_args_with_params(
-        &args,
+    check_repeater_path(repeater);
+    let args = encode_entry_args(
         &context.generics.params,
-        Some((self_ty, &context.self_outlives)),
-        const_fn,
+        (self_ty, &context.self_outlives),
+        |param| {
+            let ident = &param.ident;
+            const_fn(&parse_quote!(#ident), param)
+        },
     )?;
     let path = repeater_trait_path(repeater, &args, id, ix);
     Ok(parse_quote!(<#self_ty as #path>::Type))
@@ -155,6 +189,11 @@ pub fn repeater_projection(
 /// `const N: usize` is `[(); N]`, a `u128` uses `KEY`, and any other primitive type is a trait
 /// object of the Repeater with its slot filled. It fails with [`EncodeError::UnsupportedConstType`]
 /// if the type of `param` is not a primitive type (also an alias of one: it cannot tell the slot).
+///
+/// # Panics
+///
+/// If `repeater` has arguments (`crate::Repeater<u8>`): it names the trait alone, or with an empty
+/// `<>`.
 ///
 /// ```
 /// # use type_leak::*;
@@ -171,6 +210,7 @@ pub fn repeater_projection(
 pub fn slot_const(
     repeater: &Path,
 ) -> impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError> + '_ {
+    check_repeater_path(repeater);
     move |value, param| encode_slot_const(repeater, value, &param.ty)
 }
 
@@ -188,7 +228,8 @@ pub(crate) fn encode_slot_const(
         return Ok(parse_quote!([(); #value]));
     }
     if prim == "u128" {
-        return Ok(parse_quote!(*const dyn #repeater<(), #value, Type = ()>));
+        let path = repeater_path(repeater, quote!((), #value, Type = ()));
+        return Ok(parse_quote!(*const dyn #path));
     }
     let position = REPEATER_SLOTS
         .iter()
@@ -197,7 +238,8 @@ pub(crate) fn encode_slot_const(
     let defaults = REPEATER_SLOTS[..position]
         .iter()
         .map(|(_, _, default)| -> Expr { parse_str(default).unwrap() });
-    Ok(parse_quote!(*const dyn #repeater<(), 0, #(#defaults,)* #value, Type = ()>))
+    let path = repeater_path(repeater, quote!((), 0, #(#defaults,)* #value, Type = ()));
+    Ok(parse_quote!(*const dyn #path))
 }
 
 /// What a Repeater impl is written for: the `target` of
@@ -213,7 +255,9 @@ pub enum ImplSelf<'a> {
     ///
     /// It replaces `Self` where the entry names it, and has the bound of the trait for
     /// [`SelfRequirement::Bound`]. For [`SelfRequirement::Type`] the impl is for that type, and
-    /// declares none.
+    /// declares none. It has the name given, unless the entry's type, the generics of its context
+    /// or the bound use it: then the first of `__S0`, `__S1`, .. (for `__S`) that they do not.
+    /// [`RepeaterImpl::self_ty`] is the name used.
     Param(&'a Ident),
     /// This type, usually a marker of your crate. The impl declares no parameter.
     ///
@@ -228,7 +272,7 @@ pub enum ImplSelf<'a> {
     /// [`bucket_self(ix, id)`](Referrer::bucket_self) as the type of the path through the Repeater
     /// (what `Self` stands for if it is `None`), or E0277, with the same `id`.
     Bucket {
-        /// The parameter for the entries that need `Self`.
+        /// The parameter for the entries that need `Self`, named as for [`ImplSelf::Param`].
         param: &'a Ident,
     },
 }
@@ -291,7 +335,8 @@ pub struct RepeaterImpl {
     ///
     /// [`ToTokens`] writes the `KEY` (`repeater_key(id, entry)`, see [`repeater_key()`]) as its
     /// second argument, so the caller adds nothing. This path has none: it is for a reader who
-    /// wants the trait.
+    /// wants the trait. A path put here instead keeps its `<..>`: the `KEY` is appended to the
+    /// arguments of its last segment, and nothing is written if it has none.
     ///
     /// ```ignore
     /// // In crate a, with the Repeater at `crate::Repeater`: the entry `Wrap<T>`.

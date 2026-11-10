@@ -1332,7 +1332,7 @@ fn or_if_takes_a_closure_without_annotations_and_or_takes_any_rule() {
 // ── the names of the lists ───────────────────────────────────────────────────────────────────
 
 /// The names that `Rules::primitive()` and `Rules::prelude()` allow, and the absolute paths that the
-/// help of an error suggests for them (`KNOWN_NAMES` of `src/util.rs`).
+/// help of an error suggests for them (`KNOWN_NAMES` of `src/util/names.rs`).
 ///
 /// An allowed path is the same on both sides, so it is not leaked: a bound that names it is fine,
 /// and a type that names it has no entry. Without the option the same name is a relative path: an

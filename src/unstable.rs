@@ -40,7 +40,7 @@
 //! (E0275) while it proves its own predicate.
 
 use crate::context::{binds_assoc, bound_text, bounded_ident, hiding_bounds};
-use crate::util::{ident_name, tidy_str, token_names, unwrap_type_group};
+use crate::util::{ident_name, is_bare_self, tidy_str, token_names, unwrap_type_group};
 use proc_macro2::TokenStream;
 use std::collections::HashSet;
 use syn::punctuated::Punctuated;
@@ -354,10 +354,6 @@ impl<'ast, 'a, F: Fn(&str) -> bool> Visit<'ast> for Projections<'a, F> {
         }
         syn::visit::visit_type_path(self, i)
     }
-}
-
-fn is_bare_self(ty: &Type) -> bool {
-    matches!(ty, Type::Path(TypePath { qself: None, path }) if path.is_ident("Self"))
 }
 
 /// The name of a bound that may define any associated type of what it bounds: the bound of a trait

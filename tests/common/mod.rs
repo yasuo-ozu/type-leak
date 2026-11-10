@@ -10,6 +10,20 @@ use type_leak::{
     LeakerResult, ModuleScope, Place, Referrer, Rules, View,
 };
 
+/// The message of the panic of `f`.
+#[allow(dead_code)]
+pub fn panic_message(f: impl FnOnce()) -> String {
+    let payload =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("it did not panic");
+    match payload.downcast_ref::<String>() {
+        Some(message) => message.clone(),
+        None => payload
+            .downcast_ref::<&str>()
+            .expect("the message is a string")
+            .to_string(),
+    }
+}
+
 /// Converts the types of a `Referrer` to a `BTreeSet<String>` for order-independent comparison.
 #[allow(dead_code)]
 pub fn finish_as_strings<A: Allow>(leaker: Leaker<A>) -> BTreeSet<String> {
@@ -130,14 +144,15 @@ pub fn substitute_type(
     }
 }
 
-/// The first argument of the Repeater, `ARGS` of `<S as Repeater<ARGS, KEY>>::Type`.
+/// The first argument of the Repeater, `ARGS` of `<S as Repeater<ARGS, KEY>>::Type` (the Repeater
+/// may be a path of several segments: it is the one before `Type`).
 #[allow(dead_code)]
 pub fn projection_args(projection: &Type) -> Type {
     match projection {
         Type::Path(TypePath {
             qself: Some(_),
             path,
-        }) => match &path.segments[0].arguments {
+        }) => match &path.segments[path.segments.len() - 2].arguments {
             PathArguments::AngleBracketed(args) => match &args.args[0] {
                 GenericArgument::Type(ty) => ty.clone(),
                 other => panic!("not a type: {}", quote!(#other)),

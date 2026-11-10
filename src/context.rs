@@ -1,12 +1,13 @@
 //! The context of a leaked type: its generics, what `Self` means, and its module.
 
+use crate::encode::params_as_args;
 use crate::error::Cause;
 use crate::unstable::is_std_trait;
 use crate::util::{
     bound_mentions_self, canonical_bounds, generic_param_mentions_self, generic_param_name,
-    ident_name, self_in_param, self_in_predicate, tidy, token_names, type_contains,
-    type_mentions_self, type_names, unwrap_type_group, where_predicate_mentions_self,
-    without_self_bounds, ReplaceSelf, SelfMentions,
+    ident_name, projection_head, self_in_param, self_in_predicate, sorted_by_tokens, tidy,
+    token_names, type_contains, type_mentions_self, type_names, unwrap_type_group,
+    where_predicate_mentions_self, without_default, without_self_bounds, ReplaceSelf, SelfMentions,
 };
 use proc_macro2::{Literal, TokenStream};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -36,7 +37,12 @@ impl Scope {
     /// cannot copy them and the type does not depend on them.
     pub(crate) fn new(generics: &Generics, self_ty: Option<SelfRequirement>) -> Self {
         Self {
-            params: generics.params.iter().cloned().map(strip_default).collect(),
+            params: generics
+                .params
+                .iter()
+                .cloned()
+                .map(without_default)
+                .collect(),
             predicates: generics
                 .where_clause
                 .iter()
@@ -46,6 +52,11 @@ impl Scope {
             self_ty,
             gats: Vec::new(),
         }
+    }
+
+    /// The generics and what `Self` means in the scope of `context`.
+    pub(crate) fn of_context(context: &Context) -> Self {
+        Self::new(&context.generics, context.self_ty.clone()).with_gats(context.gats.clone())
     }
 
     pub(crate) fn binder(lifetimes: &BoundLifetimes) -> Self {
@@ -82,14 +93,6 @@ impl Scope {
     /// is known.
     pub(crate) fn set_self(&mut self, self_ty: Option<SelfRequirement>) {
         self.self_ty = self_ty;
-    }
-
-    /// Like [`Scope::set_self()`], returning what `Self` meant before.
-    pub(crate) fn replace_self(
-        &mut self,
-        self_ty: Option<SelfRequirement>,
-    ) -> Option<SelfRequirement> {
-        std::mem::replace(&mut self.self_ty, self_ty)
     }
 
     /// Drops the bounds and where predicates that mention `Self`, and `Self` itself: what the
@@ -626,27 +629,8 @@ fn generics_as_args(generics: &Generics) -> TokenStream {
     if generics.params.is_empty() {
         return TokenStream::new();
     }
-    let args = generics.params.iter().map(|param| match param {
-        GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => quote!(#lifetime),
-        GenericParam::Type(TypeParam { ident, .. })
-        | GenericParam::Const(ConstParam { ident, .. }) => quote!(#ident),
-    });
+    let args: Vec<GenericArgument> = params_as_args(&generics.params);
     quote!(<#(#args),*>)
-}
-
-fn strip_default(mut param: GenericParam) -> GenericParam {
-    match &mut param {
-        GenericParam::Type(param) => {
-            param.eq_token = None;
-            param.default = None;
-        }
-        GenericParam::Const(param) => {
-            param.eq_token = None;
-            param.default = None;
-        }
-        GenericParam::Lifetime(_) => (),
-    }
-    param
 }
 
 /// How a context relates to a module ([`Context::module`]).
@@ -915,17 +899,8 @@ impl Context {
     }
 
     pub(crate) fn with_self_outlives(mut self, lifetimes: Vec<Lifetime>) -> Self {
-        let mut lifetimes: Vec<(String, Lifetime)> = lifetimes
-            .into_iter()
-            .map(|lifetime| (lifetime.to_string(), lifetime))
-            .collect();
-        lifetimes.sort_by(|a, b| a.0.cmp(&b.0));
-        lifetimes.dedup_by(|a, b| a.0 == b.0);
         self.self_outlives = if self.self_ty.is_some() {
-            lifetimes
-                .into_iter()
-                .map(|(_, lifetime)| lifetime)
-                .collect()
+            sorted_by_tokens(lifetimes)
         } else {
             Vec::new()
         };
@@ -1065,7 +1040,7 @@ impl Context {
         let names_self_type = matches!(self_req, Some(SelfRequirement::Type(self_ty))
             if type_contains(ty, self_ty));
         let depends_on_self = matches!(
-            context.self_ty(),
+            context.self_ty,
             Some(SelfRequirement::Type(_)) | Some(SelfRequirement::Bound(_))
         );
         if !(names_self_type || depends_on_self) {
@@ -1344,22 +1319,6 @@ impl Context {
             && self.self_ty.is_none()
     }
 
-    pub(crate) fn generics(&self) -> &Generics {
-        &self.generics
-    }
-
-    pub(crate) fn self_ty(&self) -> Option<&SelfRequirement> {
-        self.self_ty.as_ref()
-    }
-
-    pub(crate) fn self_outlives(&self) -> &[Lifetime] {
-        &self.self_outlives
-    }
-
-    pub(crate) fn gats(&self) -> &[Gat] {
-        &self.gats
-    }
-
     /// The module that the context is in; `None` for a module's own context.
     pub(crate) fn in_module(&self) -> Option<ContextId> {
         match &self.module {
@@ -1548,18 +1507,6 @@ impl Contexts {
             self.ids.remove(&context);
         }
     }
-}
-
-fn sort_bounds<T: template_quote::ToTokens, P: Default>(
-    bounds: Punctuated<T, P>,
-) -> Punctuated<T, P> {
-    let mut bounds: Vec<(String, T)> = bounds
-        .into_iter()
-        .map(|bound| (quote!(#bound).to_string(), bound))
-        .collect();
-    bounds.sort_by(|a, b| a.0.cmp(&b.0));
-    bounds.dedup_by(|a, b| a.0 == b.0);
-    bounds.into_iter().map(|(_, bound)| bound).collect()
 }
 
 /// Moves `Self: 'a` bounds, by a lifetime parameter of `params`, out of `predicates`.
@@ -2009,18 +1956,6 @@ impl Enclosing {
 
 fn visible(scopes: &[Scope], depth: usize) -> &[Scope] {
     &scopes[..depth.min(scopes.len())]
-}
-
-/// The head of `path` if it may start an associated type path (`T::A<X>`): relative, with an item
-/// after it and no arguments. The path does not tell if the head is a type parameter.
-fn projection_head(path: &Path) -> Option<&Ident> {
-    if path.leading_colon.is_some() || path.segments.len() < 2 {
-        return None;
-    }
-    path.segments
-        .first()
-        .filter(|seg| seg.arguments.is_none())
-        .map(|seg| &seg.ident)
 }
 
 /// `name` is a type parameter of the innermost scope that declares it.
@@ -2598,7 +2533,9 @@ fn canonicalize(generics: Generics) -> Generics {
             }
             GenericParam::Lifetime(param) => {
                 param.attrs.clear();
-                param.bounds = sort_bounds(std::mem::take(&mut param.bounds));
+                param.bounds = sorted_by_tokens(std::mem::take(&mut param.bounds))
+                    .into_iter()
+                    .collect();
                 param.colon_token = (!param.bounds.is_empty()).then(Default::default);
             }
             GenericParam::Const(param) => {
@@ -2619,17 +2556,12 @@ fn canonicalize(generics: Generics) -> Generics {
             generic_param_name(param),
         )
     });
-    let mut predicates: Vec<(String, WherePredicate)> = predicates
-        .into_iter()
-        .map(|mut predicate| {
-            if let WherePredicate::Type(predicate) = &mut predicate {
-                predicate.bounds = canonical_bounds(std::mem::take(&mut predicate.bounds));
-            }
-            (quote!(#predicate).to_string(), predicate)
-        })
-        .collect();
-    predicates.sort_by(|a, b| a.0.cmp(&b.0));
-    predicates.dedup_by(|a, b| a.0 == b.0);
+    let predicates = sorted_by_tokens(predicates.into_iter().map(|mut predicate| {
+        if let WherePredicate::Type(predicate) = &mut predicate {
+            predicate.bounds = canonical_bounds(std::mem::take(&mut predicate.bounds));
+        }
+        predicate
+    }));
     let has_params = !params.is_empty();
     Generics {
         lt_token: has_params.then(Default::default),
@@ -2637,7 +2569,7 @@ fn canonicalize(generics: Generics) -> Generics {
         gt_token: has_params.then(Default::default),
         where_clause: (!predicates.is_empty()).then(|| WhereClause {
             where_token: Default::default(),
-            predicates: predicates.into_iter().map(|(_, p)| p).collect(),
+            predicates: predicates.into_iter().collect(),
         }),
     }
 }

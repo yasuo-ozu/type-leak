@@ -39,10 +39,28 @@ pub(crate) fn trait_head(path: &Path, position: usize) -> Path {
     }
 }
 
-/// Returns `true` if `path` starts with `Self`.
-pub(crate) fn heads_self(path: &Path) -> bool {
-    path.leading_colon.is_none()
-        && matches!(path.segments.first(), Some(seg) if seg.ident == "Self")
+/// The head of `path` if it may start an associated type path (`T::A<X>`): relative, with an item
+/// after it and no arguments. The path does not tell if the head is a type parameter.
+pub(crate) fn projection_head(path: &Path) -> Option<&Ident> {
+    if path.leading_colon.is_some() || path.segments.len() < 2 {
+        return None;
+    }
+    path.segments
+        .first()
+        .filter(|seg| seg.arguments.is_none())
+        .map(|seg| &seg.ident)
+}
+
+/// The first segment of `path` if it is `Self` (not after a leading `::`).
+pub(crate) fn self_head(path: &Path) -> Option<&PathSegment> {
+    path.segments
+        .first()
+        .filter(|seg| path.leading_colon.is_none() && seg.ident == "Self")
+}
+
+/// Like [`self_head()`], if the segment has no arguments: `Self` and `Self::A`, not `Self<..>`.
+pub(crate) fn plain_self_head(path: &Path) -> Option<&PathSegment> {
+    self_head(path).filter(|seg| seg.arguments.is_none())
 }
 
 /// Returns `true` if `path` starts with `prefix`, segment by segment by identifier. Both must have
@@ -160,7 +178,14 @@ pub(crate) fn starts_with_known(path: &Path, known: Known) -> bool {
 }
 
 /// The crates that `Rules::std_crates()` allows.
-pub(crate) const STD_CRATES: &[&str] = &["std", "core", "alloc"];
+const STD_CRATES: &[&str] = &["std", "core", "alloc"];
+
+/// Returns `true` if `path` starts with `std`, `core` or `alloc`, relative or absolute.
+pub(crate) fn is_std_crate_path(path: &Path) -> bool {
+    path.segments
+        .first()
+        .map_or(false, |seg| STD_CRATES.iter().any(|name| seg.ident == name))
+}
 
 pub(crate) fn is_primitive_name(ident: &Ident) -> bool {
     KNOWN_NAMES
@@ -351,6 +376,14 @@ pub(crate) fn generic_param_name(param: &GenericParam) -> String {
     }
 }
 
+/// The path `path` read as a type, which stands for a node that is no type (a bound).
+pub(crate) fn path_type(path: &Path) -> Type {
+    Type::Path(TypePath {
+        qself: None,
+        path: path.clone(),
+    })
+}
+
 /// Returns the type inside invisible groups (from `$t:ty` in `macro_rules!`) and parentheses.
 pub(crate) fn unwrap_type_group(ty: &Type) -> &Type {
     match ty {
@@ -422,28 +455,23 @@ fn bound_output_mut(bound: &mut TypeParamBound) -> Option<&mut Type> {
 pub(crate) fn canonical_bounds(
     bounds: Punctuated<TypeParamBound, Token![+]>,
 ) -> Punctuated<TypeParamBound, Token![+]> {
-    let mut bounds: Vec<(String, TypeParamBound)> = bounds
-        .into_iter()
-        .map(|mut bound| {
-            // Parentheses that a trait object needs, or that it does not.
-            if let Some(output) = bound_output_mut(&mut bound) {
-                while let Type::Paren(TypeParen { elem, .. }) = output {
-                    if tail_object(elem).is_none() {
-                        break;
-                    }
-                    *output = std::mem::replace(&mut **elem, Type::Verbatim(TokenStream::new()));
+    let bounds = sorted_by_tokens(bounds.into_iter().map(|mut bound| {
+        // Parentheses that a trait object needs, or that it does not.
+        if let Some(output) = bound_output_mut(&mut bound) {
+            while let Type::Paren(TypeParen { elem, .. }) = output {
+                if tail_object(elem).is_none() {
+                    break;
                 }
+                *output = std::mem::replace(&mut **elem, Type::Verbatim(TokenStream::new()));
             }
-            (quote!(#bound).to_string(), bound)
-        })
-        .collect();
-    bounds.sort_by(|a, b| a.0.cmp(&b.0));
-    bounds.dedup_by(|a, b| a.0 == b.0);
+        }
+        bound
+    }));
     let count = bounds.len();
     bounds
         .into_iter()
         .enumerate()
-        .map(|(ix, (_, mut bound))| {
+        .map(|(ix, mut bound)| {
             let followed = ix + 1 < count;
             if let Some(output) = bound_output_mut(&mut bound) {
                 if tail_object(output).map_or(false, |object| followed || object.len() > 1) {
@@ -511,6 +539,18 @@ pub(crate) fn trait_object_of(ty: &Type) -> Option<&TypeTraitObject> {
         Type::TraitObject(object) => Some(object),
         _ => None,
     }
+}
+
+/// Returns `items` sorted by the text of their tokens, the first of equal ones kept: the order that
+/// makes bounds, predicates and lifetimes independent of how they were written.
+pub(crate) fn sorted_by_tokens<T: ToTokens>(items: impl IntoIterator<Item = T>) -> Vec<T> {
+    let mut items: Vec<(String, T)> = items
+        .into_iter()
+        .map(|item| (quote!(#item).to_string(), item))
+        .collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items.dedup_by(|a, b| a.0 == b.0);
+    items.into_iter().map(|(_, item)| item).collect()
 }
 
 /// Prints tokens of a path or a type as one writes them (`<Self as Tr>::A`, `Wrap<Rel<T>>`,
@@ -636,6 +676,14 @@ pub(crate) fn or_list(options: Vec<String>) -> String {
         [only] => only.clone(),
         [init @ .., last] => format!("{}, or {}", init.join(", "), last),
     }
+}
+
+/// Returns `true` if `ty` is `Self`, also inside groups and parentheses.
+pub(crate) fn is_bare_self(ty: &Type) -> bool {
+    matches!(
+        unwrap_type_group(ty),
+        Type::Path(TypePath { qself: None, path }) if path.is_ident("Self")
+    )
 }
 
 /// Finds the mentions of `Self`: a path starting with it (`Self`, `Self::X`, the self type of
@@ -804,6 +852,22 @@ pub(crate) fn first_associated_self_in_generics(generics: &Generics) -> Option<C
     finder.associated.into_iter().next()
 }
 
+/// Returns `param` without its default.
+pub(crate) fn without_default(mut param: GenericParam) -> GenericParam {
+    match &mut param {
+        GenericParam::Type(param) => {
+            param.eq_token = None;
+            param.default = None;
+        }
+        GenericParam::Const(param) => {
+            param.eq_token = None;
+            param.default = None;
+        }
+        GenericParam::Lifetime(_) => (),
+    }
+    param
+}
+
 /// Returns the first `n` parameters without defaults, and the where predicates that do not name the
 /// others.
 pub(crate) fn without_defaults(generics: &Generics, n: usize) -> Generics {
@@ -812,20 +876,7 @@ pub(crate) fn without_defaults(generics: &Generics, n: usize) -> Generics {
         .iter()
         .take(n)
         .cloned()
-        .map(|mut param| {
-            match &mut param {
-                GenericParam::Type(tp) => {
-                    tp.eq_token = None;
-                    tp.default = None;
-                }
-                GenericParam::Const(cp) => {
-                    cp.eq_token = None;
-                    cp.default = None;
-                }
-                GenericParam::Lifetime(_) => (),
-            }
-            param
-        })
+        .map(without_default)
         .collect();
     let later: HashSet<String> = generics
         .params
@@ -894,10 +945,7 @@ impl<'a> ReplaceSelf<'a> {
 
     // `Some(Some(rest))` for `Self::A::B`, `Some(None)` for `Self` alone.
     fn strip_self(path: &Path) -> Option<Option<Path>> {
-        let first = path.segments.first()?;
-        if path.leading_colon.is_some() || first.ident != "Self" || !first.arguments.is_none() {
-            return None;
-        }
+        plain_self_head(path)?;
         // The `::` after the qualified self type (see `qself()`).
         Some((path.segments.len() > 1).then(|| Path {
             leading_colon: Some(Default::default()),

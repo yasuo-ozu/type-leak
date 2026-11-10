@@ -17,9 +17,10 @@
 use syn::parse_quote;
 use type_leak::{repeater_key, EntryId};
 use type_leak_test_leaker::m::{
-    Consts, Defaulted, Defaults, DollarCrate, Edge, Holder, Inner, Plain, RelDefault, RelType,
+    Braced9246, Consts, Defaulted, Defaults, DollarCrate, Edge, Holder, Inner, Plain, RelDefault,
+    RelType,
 };
-use type_leak_test_referrer::{Concrete, Explicit, Generic, Generic2, Omitted};
+use type_leak_test_referrer::{Concrete, Explicit, Generic, Generic2, Omitted, G9246};
 
 #[test]
 fn concrete_args() {
@@ -85,6 +86,15 @@ fn omitted_relative_default() {
     );
 }
 
+/// Fixture 9246 (F73): the use site gives `{ M }` for `N`, and the default `[u8; { N }]` of `U` is
+/// completed as `[u8; { M }]`. The Referrer's crate does not build with `[u8; { { M } }]`.
+#[test]
+fn braced_argument_for_a_braced_default() {
+    let g = G9246::<3>(Inner);
+    let got: [u8; 3] = <G9246<3> as Braced9246<3>>::get(&g);
+    assert_eq!(got, [3, 3, 3]);
+}
+
 #[test]
 fn edge_cases() {
     let c = Concrete(Inner);
@@ -136,6 +146,17 @@ fn self_and_associated_types() {
     let v = 5u16;
     let g: Wrap<&u16> = c.gat(&v);
     assert_eq!(g, Wrap(&5));
+}
+
+/// Fixture 9248 (F76): the trait `Clash9248<__S>` has a generic named like the parameter that the
+/// Repeater's impl declares for the implementor. The Leaker's crate does not build with
+/// `impl<__S, __S: ?Sized + ..>` (E0403); the Referrer's crate implements the trait for `Concrete`.
+#[test]
+fn a_generic_named_like_the_parameter_of_the_implementor() {
+    use type_leak_test_leaker::s::{Clash9248, Wrap};
+    let c = Concrete(Inner);
+    let got: Wrap<(u8, u16)> = <Concrete as Clash9248<u16>>::f(&c, 5);
+    assert_eq!(got, Wrap((9, 5)));
 }
 
 #[test]
@@ -492,8 +513,9 @@ fn every_item_kind_is_leaked_across_crates() {
         (9152, __tl_report_9152!(), ok("enum", 1, 3, 3)),
         (9153, __tl_report_9153!(), ok("struct", 2, 4, 4)),
         (9154, __tl_report_9154!(), ok("struct", 2, 5, 5)),
-        // a type that names their `Self` too (`nested_self_entries`): for any type, with `Self` in
-        // the type; and the control without a bound that names `Self`
+        // a type that names their `Self` too (the macro accepts the `NestedSelfInBounds` error,
+        // `nested_self_entries = true`): for any type, with `Self` in the type; and the control
+        // without a bound that names `Self`
         (9161, __tl_report_9161!(), ok("struct", 2, 2, 2)),
         (9162, __tl_report_9162!(), ok("enum", 2, 3, 3)),
         (9163, __tl_report_9163!(), ok("struct", 2, 3, 3)),
@@ -556,9 +578,10 @@ fn every_item_kind_is_leaked_across_crates() {
         (9091, __tl_report_9091!(), ok("struct", 4, 5, 5)),
         (9092, __tl_report_9092!(), ok("trait", 5, 8, 8)),
         (9093, __tl_report_9093!(), ok("mod", 3, 5, 5)),
-        // F51: a nested struct whose bound names a leaked type that names `Self`, analyzed with
-        // `nested_self_entries`, is rejected, as `intern_struct()` rejects it. The Referrer's macro
-        // expands to nothing (`kinds`, like the other rejected items).
+        // F51: a nested struct whose bound names a leaked type that names `Self`, though the macro
+        // accepts the `NestedSelfInBounds` error (`nested_self_entries = true`), is rejected, as
+        // `intern_struct()` rejects it. The Referrer's macro expands to nothing (`kinds`, like the
+        // other rejected items).
         (
             9206,
             __tl_report_9206!(),
@@ -1087,10 +1110,11 @@ fn the_default_of_a_nested_struct_whose_bound_names_its_self_is_the_original_typ
 
 /// A type that names the own `Self` of a struct, an enum or a union nested in a module, in an item
 /// whose generic has a bound that names it too (`struct S<T: AsRef<Self>> { link: Link<Self, T> }`),
-/// with `nested_self_entries` (F42 of `tests/findings.rs`). The entry is for any
-/// type that the bound holds for, and the copy passes its own type as the implementor: the field is
-/// `Link<S<T>, T>` with the copy's `S`, as in the original. Without a bound that names `Self`
-/// (`Unbound`), the entry is for the Leaker's type as before, so the field holds the Leaker's.
+/// when the macro accepts the `NestedSelfInBounds` error (F42 of `tests/findings.rs`). The entry is
+/// for any type that the bound holds for, and the copy passes its own type as the implementor: the
+/// field is `Link<S<T>, T>` with the copy's `S`, as in the original. Without a bound that names
+/// `Self` (`Unbound`), the entry is for the Leaker's type as before, so the field holds the
+/// Leaker's.
 #[test]
 fn a_type_that_names_the_own_self_with_a_bound_that_names_it_is_the_copys_own() {
     use type_leak_test_leaker::kinds as l;

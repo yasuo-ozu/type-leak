@@ -1,11 +1,13 @@
 //! The analysis of items and types by the [`Leaker`].
 
 use crate::allow::{Allow, Place};
+#[cfg(doc)]
+use crate::analysis::drop_optional;
 use crate::analysis::{
-    ambiguous_types, anchor_parts, as_written, correct_effects, correct_unmeant_self,
-    error_effects, has_ambiguous, has_error, has_optional, names_self, part_names_self,
-    primitive_effects, primitive_names, scope_error, shift_seen, CheckResult, Effect, Part,
-    PendingType, SelfMention, SignatureFacts, SignatureMark,
+    ambiguous_types, anchor_parts, as_written, correct_effects, correct_unmeant_self, each_pending,
+    each_pending_mut, error_effects, has_ambiguous, has_error, has_optional_candidate, names_self,
+    part_names_self, primitive_effects, primitive_names, scope_error, shift_seen, CheckResult,
+    Effect, Part, PendingType, SelfMention, SignatureFacts, SignatureMark,
 };
 use crate::context::{
     binder_lifetimes, Context, ContextId, Contexts, Enclosing, Gat, Scope, SelfRequirement,
@@ -21,10 +23,11 @@ use crate::unstable::{
 };
 use crate::util::{
     bound_cause, first_associated_self_in_generics, first_self_in_generics, first_self_in_type,
-    generic_param_mentions_self, generic_param_name, has_lifetime_bound, ident_name,
-    is_primitive_name, or_list, self_in_param, self_in_predicate, selves_in_generics, tidy,
-    token_names, trait_head, trait_object_of, type_mentions_self, unwrap_type_group,
-    where_predicate_mentions_self, without_arguments, without_crate_prefix, without_defaults,
+    generic_param_mentions_self, generic_param_name, has_lifetime_bound, ident_name, is_bare_self,
+    is_primitive_name, or_list, path_type, plain_self_head, self_head, self_in_param,
+    self_in_predicate, selves_in_generics, tidy, token_names, trait_head, trait_object_of,
+    type_mentions_self, unwrap_type_group, where_predicate_mentions_self, without_arguments,
+    without_crate_prefix, without_default, without_defaults,
 };
 use crate::view::View;
 use proc_macro2::TokenStream;
@@ -32,22 +35,35 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
+use syn::parse::ParseStream;
+use syn::parse::Parser;
+use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
 
-mod values;
-
+/// What the visit of a type found in it: the type around takes it in (`AnalyzeVisitor::absorb()`),
+/// and `AnalyzeVisitor::decide()` decides the type by it.
 struct Frame {
+    /// The length of `AnalyzeVisitor::musts` when the frame started: the causes of the type are
+    /// those from there on.
     must_start: usize,
+    /// The same for `AnalyzeVisitor::impossibles`.
     impossible_start: usize,
-    /// The length of `AnalyzeVisitor::self_errors` when the frame started: a longer one means a
+    /// The length of `Records::self_errors` when the frame started: a longer one means a
     /// `Self` without meaning.
     self_start: usize,
+    /// The depth of the shallowest type in it that has a cause, `usize::MAX` if none: that type
+    /// owns the causes.
     min_depth: usize,
+    /// The outermost scope below the root that a generic named in it is declared in, `usize::MAX`
+    /// if none (see `AnalyzeVisitor::mention()`).
     local_scope: usize,
+    /// It names a generic of the root scope, the Leaker's own generics.
     mentions_root: bool,
+    /// It names `Self`.
     mentions_self: bool,
+    /// It names an item of the module (see `AnalyzeVisitor::is_module_path()`).
     module_item: bool,
     /// The first path in the type that names an item of the module (`module_item` is set by it).
     module_path: Option<TokenStream>,
@@ -55,7 +71,9 @@ struct Frame {
     /// a bound in it), as text: the arguments that may be consts, apart from those that bubbled up
     /// from a type inside.
     bare_args: Vec<String>,
-    soft_depth: usize,
+    /// The depth of the shallowest type in it whose own path names an external crate, `usize::MAX`
+    /// if none: the Referrer may replace that type (an optional entry).
+    optional_depth: usize,
     /// A cause is a relative path, so the type means something else in another module.
     relative: bool,
     /// A type not leaked alone because of a binder lifetime: its holder's depth and the advice
@@ -64,6 +82,8 @@ struct Frame {
     /// A type not leaked alone because of an elided output lifetime: its holder's depth and the
     /// advice (see [`Elision`]).
     elision: Option<(usize, Advice)>,
+    /// The method lifetime that a trait object in it would take by default, and the copy would
+    /// leave unconstrained (E0195).
     unconstrained: Option<Lifetime>,
     /// The first `Self::A` in the type, where `Self` is a type: the Repeater's impl cannot write it,
     /// so a type that names it is not leaked whole.
@@ -72,6 +92,7 @@ struct Frame {
     /// leaked alone (see [`AnalyzeVisitor::decide_as_owner()`]): its meaning depends on its owner,
     /// so the owner copied as written keeps it whole.
     adopted: Vec<usize>,
+    /// What the types in it add to the graph, in order.
     effects: Vec<Effect>,
 }
 
@@ -88,7 +109,7 @@ impl Frame {
             module_item: false,
             module_path: None,
             bare_args: Vec::new(),
-            soft_depth: usize::MAX,
+            optional_depth: usize::MAX,
             relative: false,
             binder: None,
             elision: None,
@@ -104,6 +125,7 @@ impl Frame {
 struct Must {
     /// The depth of the type that has it.
     depth: usize,
+    /// The path or type that depends on the context.
     cause: Cause,
     /// An entry that is leaked alone has it, so it is no conflict of the type around: see
     /// [`AnalyzeVisitor::conflict_causes()`].
@@ -125,9 +147,11 @@ struct Must {
 /// ([`AnalyzeVisitor::bare_beside_module_item()`]).
 #[derive(Default)]
 struct Impossibles {
+    /// The causes, in order of pushing.
     causes: Vec<Cause>,
+    /// For each cause, whether it is hard.
     hard: Vec<bool>,
-    /// The type depth (`AnalyzeVisitor::type_depth`) when each cause was pushed.
+    /// The type depth (`Position::type_depth`) when each cause was pushed.
     depths: Vec<usize>,
     /// The depth of the type being visited now.
     at: usize,
@@ -184,7 +208,9 @@ impl Impossibles {
 /// Why a type cannot be leaked and what to write instead: the `note` and the `help` of a conflict.
 #[derive(Clone)]
 struct Advice {
+    /// Why the type cannot be leaked.
     note: String,
+    /// What to write instead.
     help: String,
 }
 
@@ -202,13 +228,17 @@ impl Advice {
 struct Binder {
     /// The depth of the type holding the binder, leaked whole instead (0 in a bound).
     owner: usize,
+    /// The lifetimes that the output of the binder names and no input keeps as written.
     output: Vec<Lifetime>,
 }
 
+/// What a scan for the occurrences of a lifetime ([`scan_anchors()`]) found and keeps track of.
 struct OutputUse {
+    /// The lifetime that the scan looks for.
     lifetime: Lifetime,
     /// Each constraining occurrence in the inputs, as the types from the input down to it.
     anchors: Vec<Vec<usize>>,
+    /// The addresses of the types from the input down to the one being scanned.
     chain: Vec<usize>,
     /// An external type that the Leaker does not allow, which the Referrer may replace, holds no
     /// occurrence. Else the occurrences are those that rustc sees as constraining.
@@ -220,8 +250,11 @@ struct OutputUse {
     entered: Vec<usize>,
 }
 
+/// The output and the inputs of a bound of a binder.
 struct BinderGroup<'a> {
+    /// The lifetimes of the binder that the output names.
     output: Vec<Lifetime>,
+    /// The types and lifetimes that the inputs hold.
     inputs: Vec<BinderInput<'a>>,
 }
 
@@ -246,11 +279,11 @@ pub(crate) struct Elision {
     /// bound, which no type holds).
     owner: usize,
     /// The only lifetime of the inputs as written, `None` if it is elided or hidden.
-    kept: Option<Lifetime>,
+    pub(crate) kept: Option<Lifetime>,
     /// The inputs show no lifetime, so the one that the output has is hidden by a path
     /// (`Ref<u8>` for `Ref<'a, u8>`), which the Leaker does not see: any lifetime that the copy adds
     /// to the inputs breaks the elision.
-    hidden: bool,
+    pub(crate) hidden: bool,
     /// The signature of a function pointer or of `Fn(..)`, whose elided lifetime the Referrer can
     /// name with a `for<'e>` binder where `Visitor::with_self()` adds lifetimes to its inputs (see
     /// [`AnalyzeVisitor::self_elision_broken()`]). A method has none.
@@ -266,7 +299,7 @@ impl Elision {
     /// output relies on elision: it has an elided lifetime, and the inputs have exactly one
     /// lifetime (else the original is not valid, or has no elision to keep), or none that is seen,
     /// so that a path hides it. `binder` is `true` for a function pointer or `Fn(..)`.
-    fn of<'a>(
+    pub(crate) fn of<'a>(
         owner: usize,
         binder: bool,
         inputs: impl IntoIterator<Item = &'a Type>,
@@ -342,10 +375,10 @@ impl Elision {
     pub(crate) fn added(&self, context: &Context) -> Vec<Lifetime> {
         let mut added: Vec<Lifetime> = Vec::new();
         let lifetimes = context
-            .generics()
+            .generics
             .lifetimes()
             .map(|param| &param.lifetime)
-            .chain(context.self_outlives());
+            .chain(&context.self_outlives);
         for lifetime in lifetimes {
             let kept = self.in_kept && Some(lifetime) == self.kept.as_ref();
             if !kept && !added.contains(lifetime) {
@@ -384,7 +417,7 @@ pub(crate) fn input_type(input: &FnArg) -> &Type {
 
 /// `true` if an output has an elided lifetime: a reference or a lifetime argument without a name,
 /// or `'_`. A function pointer or `Fn(..)` inside has its own elision.
-pub(crate) struct ElidedOutput(pub(crate) bool);
+struct ElidedOutput(bool);
 
 impl<'ast> Visit<'ast> for ElidedOutput {
     fn visit_type_reference(&mut self, i: &'ast TypeReference) {
@@ -442,9 +475,12 @@ impl<'ast> Visit<'ast> for HasReference {
     }
 }
 
+/// A module that the analysis is in.
 #[derive(Clone)]
 struct ModuleFrame {
+    /// The context of the module.
     id: ContextId,
+    /// What the module declares.
     names: Rc<ModuleNames>,
 }
 
@@ -466,6 +502,7 @@ pub(crate) enum ScopeSpec {
 }
 
 pub(crate) struct DeclaredSelf {
+    /// What `Self` means in the scope.
     requirement: SelfRequirement,
     /// `Self` is a type that the copy writes (the self type of an impl), not the item itself.
     written: bool,
@@ -635,24 +672,189 @@ pub(crate) trait Scopes {
     }
 }
 
-struct ScopeMark {
-    effects: usize,
-    self_errors: usize,
+/// What a visitor is set to when it is made, and keeps.
+struct Mode {
+    /// The place of the visitor that this one is a throwaway copy of ([`AnalyzeVisitor::throwaway()`]):
+    /// the rule is asked at the place of the original.
+    outer_place: Place,
+    /// The values of an item are read too (see
+    /// [`Leaker::check_values`](crate::Leaker::check_values)).
+    check_values: bool,
+    /// Whether [`AnalyzeVisitor::env_cycle()`] is checked. It is not by the probe that it runs.
+    check_env: bool,
+}
+
+/// What a visitor records apart from the effects, which a scope or a check cuts back with
+/// [`Records::truncate()`].
+#[derive(Default)]
+struct Records {
+    /// The Leaker's table while it analyzes (see [`AnalyzeVisitor::swap_contexts()`]), an empty one
+    /// in a throwaway visitor.
+    contexts: Contexts,
+    /// Mentions of `Self` where it has no meaning (see [`Reason::SelfWithoutMeaning`]). Kept apart
+    /// from the effects, because a type leaked whole drops those of its parts.
+    self_errors: Vec<SelfMention>,
+    /// The top-level contexts of the scopes left, in order.
+    top_levels: Vec<ContextId>,
+    /// The types, with the contexts they are in, that were found to be no optional entries.
+    not_optional: Vec<(Context, String)>,
+    /// The cycles that `Self` makes (see [`AnalyzeVisitor::env_cycle()`]). Kept apart from the
+    /// effects, like `self_errors`.
+    env_errors: Vec<CheckResult>,
+}
+
+/// The lengths of the [`Records`].
+struct RecordsMark {
+    /// The length of `Records::contexts`.
     contexts: usize,
+    /// The length of `Records::self_errors`.
+    self_errors: usize,
+    /// The length of `Records::top_levels`.
     top_levels: usize,
-    scopes: usize,
-    modules: usize,
-    item_depth: usize,
-    alone_defaults: usize,
-    self_ty: Option<SelfRequirement>,
-    self_written: bool,
-    self_nested: bool,
-    self_trait: Option<ImplTrait>,
-    self_depth: usize,
-    self_type_walk: Option<bool>,
-    inherent_impl: bool,
+    /// The length of `Records::not_optional`.
     not_optional: usize,
+    /// The length of `Records::env_errors`.
     env_errors: usize,
+}
+
+impl Records {
+    fn mark(&self) -> RecordsMark {
+        RecordsMark {
+            contexts: self.contexts.len(),
+            self_errors: self.self_errors.len(),
+            top_levels: self.top_levels.len(),
+            not_optional: self.not_optional.len(),
+            env_errors: self.env_errors.len(),
+        }
+    }
+
+    /// The cycles recorded since `mark`.
+    fn env_errors_since(&self, mark: &RecordsMark) -> &[CheckResult] {
+        &self.env_errors[mark.env_errors..]
+    }
+
+    /// Removes what was recorded since `mark`.
+    fn truncate(&mut self, mark: &RecordsMark) {
+        self.self_errors.truncate(mark.self_errors);
+        self.contexts.truncate(mark.contexts);
+        self.top_levels.truncate(mark.top_levels);
+        self.not_optional.truncate(mark.not_optional);
+        self.env_errors.truncate(mark.env_errors);
+    }
+}
+
+/// What `Self` means where the visitor is: set and put back together by a scope or an item.
+#[derive(Clone, Default)]
+struct SelfScope {
+    /// What `Self` means here, if anything. It has none directly in a module, or in generics that
+    /// no item declaring it encloses, so mentioning it there is an error.
+    ty: Option<SelfRequirement>,
+    /// `ty` is the self type of an impl, which the copy writes (see [`DeclaredSelf`]).
+    written: bool,
+    /// `ty` is the `Self` of a struct, an enum or a union nested in the analyzed syntax (an item
+    /// of a module, or `View::visit_item()`): the copy declares a type of its own there, so its
+    /// `Self` is not the Leaker's type that the Repeater's impls are for. A type that does not
+    /// name `Self` but has a bound that does is for any type (`SelfRequirement::Any`, see
+    /// [`AnalyzeVisitor::self_in_bounds()`]), and so is one that names it with such a bound, with
+    /// the error [`Reason::NestedSelfInBounds`] (see `nested_self_risk()`). The default of a
+    /// parameter has no entry for `Self` (see `Position::in_nested_default`). An absolute type that
+    /// names `Self` is not an optional entry (see [`AnalyzeVisitor::names_nested_self()`]): it is
+    /// copied as written, so its `Self` is the copy's own. The `Self` of a scope
+    /// (`intern_struct()`, `enter_type()`) is the outermost item's, which the Visitor writes as the
+    /// Leaker's type.
+    nested: bool,
+    /// The trait that the impl declaring `Self` implements, if it is an impl of a trait: what a
+    /// `Self::A` is written through (see [`AssocSelf`]).
+    trait_: Option<ImplTrait>,
+    /// The number of scopes when the scope that declares `Self` is the innermost: 0 if there is no
+    /// `Self`. The predicates of the item that declares `Self` are visited then, not those of its
+    /// methods.
+    depth: usize,
+}
+
+/// What the type or path that holds a type tells it, taken by the type at its start.
+#[derive(Clone, Default)]
+struct ArgHints {
+    /// A referent or path argument that cannot be leaked whole (elided or several local lifetimes,
+    /// or in a bound). A trait object there cannot be leaked alone.
+    elided_ref: bool,
+    /// Like `elided_ref`, for a method lifetime that the copy would leave unconstrained (see
+    /// `signatures`). The conflict has a note of its own.
+    unconstrained_ref: Option<Lifetime>,
+    /// The argument is a bare identifier, which may be a const.
+    ambiguous_arg: bool,
+    /// A referent or path argument whose lifetime is a generic. A trait object there defaults to
+    /// it, and would default to `'static` if leaked alone. What is inside it is not affected.
+    inherits: Option<Inherits>,
+}
+
+/// Where the walk is in a type, a signature or a value: what a check puts back as it was.
+#[derive(Clone, Default)]
+struct Position {
+    /// The number of types being visited, the one at the end included.
+    type_depth: usize,
+    /// The elision of the method whose arguments are being visited.
+    signature: Option<Elision>,
+    /// While a binder is probed: the addresses of the types found to be leaked whole.
+    binder_probe: Option<HashSet<usize>>,
+    /// The type is the default of a parameter, which cannot mention `Self`. It holds whether the
+    /// declaring scope gives `Self` a meaning. `SelfScope::ty` is `None` meanwhile.
+    in_default: Option<bool>,
+    /// The type is the default of a parameter of a struct, an enum or a union nested in the
+    /// analyzed syntax (`SelfScope::nested`): its copy cannot write `Self` there (E0735), so it
+    /// cannot pass its own type for an entry that is for any type. The entry of a type that does
+    /// not name `Self` is then analyzed without `Self` and without the bounds of the generics that
+    /// name it (see [`AnalyzeVisitor::context_of_as()`]), and one that names it is an error if a
+    /// bound does too.
+    in_nested_default: bool,
+    /// The depth of the type owning the expression (array length, const argument) being visited.
+    /// Types in it are not leaked alone: the copy would put an associated type path in a constant.
+    expr_owner: Option<usize>,
+    /// In a receiver (`self: Box<Self>`), where rustc accepts only `Self` and types dereferencing
+    /// to it: no type in it is optional.
+    in_receiver: bool,
+    /// The lifetimes the type being visited must outlive because of the types around it (see
+    /// [`Enclosing`]). The Referrer tracks the same ones to find the entry. Empty outside a type.
+    enclosing: Enclosing,
+    /// The depth of the bounds and where predicates being visited, which are the predicates of the
+    /// item (its environment). See [`AnalyzeVisitor::env_cycle()`].
+    env_depth: usize,
+    /// An argument of a function or method is being visited: an `impl Trait` in it is a generic of
+    /// the function, and its bounds are predicates of the item (see `env_depth`).
+    in_fn_arg: bool,
+    /// A value is being read ([`AnalyzeVisitor::place()`]).
+    in_value: bool,
+    /// The default body or the default value of an associated const of a trait is being read.
+    in_trait_default: bool,
+    /// The default of a generic parameter is being visited, where `in_default` and
+    /// `in_nested_default` do not tell.
+    in_param_default: bool,
+    /// What the type or path around the next type tells it.
+    hints: ArgHints,
+}
+
+/// What a scope marks to leave it ([`AnalyzeVisitor::leave_scope()`]) and to roll it back
+/// ([`AnalyzeVisitor::roll_back()`]).
+struct ScopeMark {
+    /// The number of effects of the frame.
+    effects: usize,
+    /// The lengths of the records.
+    records: RecordsMark,
+    /// The number of generics in scope.
+    scopes: usize,
+    /// The number of modules.
+    modules: usize,
+    /// `AnalyzeVisitor::item_depth`.
+    item_depth: usize,
+    /// The number of `AnalyzeVisitor::alone_defaults`.
+    alone_defaults: usize,
+    /// What `Self` meant.
+    self_scope: SelfScope,
+    /// `AnalyzeVisitor::self_type_walk`.
+    self_type_walk: Option<bool>,
+    /// `AnalyzeVisitor::inherent_impl`.
+    inherent_impl: bool,
+    /// The module that the scope entered, if it is one.
     module: Option<ContextId>,
 }
 
@@ -682,41 +884,40 @@ struct AloneDefaults {
 /// scope, and appends to the causes and, for an expression with an item, to the contexts. `walk`
 /// is the state that only a visit in progress changes, which a panic would leave half-way.
 struct Checkpoint {
+    /// The marks of the scope.
     mark: ScopeMark,
+    /// The frame of the scope, which the visit replaces.
     frame: Frame,
+    /// The number of causes that depend on the context.
     musts: usize,
+    /// The number of causes that stop a type from being leaked whole.
     impossibles: usize,
+    /// The state of the walk.
     walk: Walk,
 }
 
-/// The state of the walk of a type, which is back to what it was when the walk ends.
+/// The state of the walk of a type, which is back to what it was when the walk ends: the position
+/// and the lengths of the stacks.
 struct Walk {
-    type_depth: usize,
+    /// Where the walk is.
+    position: Position,
+    /// The number of `AnalyzeVisitor::binders`.
     binders: usize,
+    /// The number of `AnalyzeVisitor::elisions`.
     elisions: usize,
-    signature: Option<Elision>,
+    /// The number of `AnalyzeVisitor::bound_elided`.
     bound_elided: usize,
+    /// The number of `AnalyzeVisitor::signatures`.
     signatures: usize,
-    probe: Option<HashSet<usize>>,
-    in_default: Option<bool>,
-    in_nested_default: bool,
-    expr_owner: Option<usize>,
-    in_receiver: bool,
-    enclosing: Enclosing,
-    env_depth: usize,
-    in_fn_arg: bool,
-    elided_ref: bool,
-    unconstrained_ref: Option<Lifetime>,
-    ambiguous_arg: bool,
-    inherits: Option<Inherits>,
-    in_value: bool,
-    in_trait_default: bool,
-    in_param_default: bool,
 }
 
+/// What the outermost scope hands over to the Leaker when it ends.
 pub(crate) struct Finished {
+    /// What the scope added to the graph, in order.
     pub(crate) effects: Vec<Effect>,
+    /// The top-level contexts of the scopes left, in order.
     pub(crate) top_levels: Vec<ContextId>,
+    /// The module that the scope entered, if it is one.
     pub(crate) module: Option<ContextId>,
     /// The types, with their contexts, that cannot be optional entries (see
     /// [`AnalyzeVisitor::env_cycle()`]).
@@ -726,126 +927,49 @@ pub(crate) struct Finished {
 pub(crate) struct AnalyzeVisitor<'a, A> {
     /// The Leaker's rule, asked at every check. A throwaway visitor borrows it again.
     rule: &'a mut A,
-    /// The place of the visitor that this one is a throwaway copy of ([`AnalyzeVisitor::alone()`]):
-    /// the rule is asked at the place of the original.
-    outer_place: Place,
-    /// The Leaker's table while it analyzes (see [`AnalyzeVisitor::swap_contexts()`]), an empty one
-    /// in a throwaway visitor.
-    contexts: Contexts,
-    /// Mentions of `Self` where it has no meaning (see [`Reason::SelfWithoutMeaning`]). Kept apart
-    /// from the effects, because a type leaked whole drops those of its parts.
-    self_errors: Vec<SelfMention>,
-    top_levels: Vec<ContextId>,
+    /// What the visitor is set to when it is made.
+    mode: Mode,
+    /// What it records for the Leaker, apart from the effects.
+    records: Records,
     /// The generics in scope, innermost last. The first are the Leaker's.
     scopes: Vec<Scope>,
+    /// The `for<..>` binders being visited, innermost last.
     binders: Vec<Binder>,
     /// The signatures whose inputs are being visited, innermost last: what each keeps from its
     /// inputs (see [`Elision`]). `None` for one that needs nothing, which also hides the ones around
     /// it: lifetimes in a function pointer or `Fn(..)` are not those of the signature around it.
     elisions: Vec<Option<Elision>>,
-    /// The elision of the method whose arguments are being visited.
-    signature: Option<Elision>,
     /// The function pointers and `Fn(..)` being visited, innermost last: the positions in
     /// `impossibles` of the elided lifetimes each binds (see [`AnalyzeVisitor::push_elided()`]).
     bound_elided: Vec<Vec<usize>>,
-    /// While a binder is probed: the addresses of the types found to be leaked whole.
-    probe: Option<HashSet<usize>>,
-    /// The scopes entered, innermost last, and the defaults that each analyzes alone.
+    /// For each scope entered, innermost last, the defaults that it analyzes alone (see
+    /// [`AloneDefaults`]).
     alone_defaults: Vec<AloneDefaults>,
-    /// What `Self` means here, if anything. It has none directly in a module, or in generics that
-    /// no item declaring it encloses, so mentioning it there is an error.
-    self_ty: Option<SelfRequirement>,
-    /// `self_ty` is the self type of an impl, which the copy writes (see [`DeclaredSelf`]).
-    self_written: bool,
-    /// `self_ty` is the `Self` of a struct, an enum or a union nested in the analyzed syntax (an
-    /// item of a module, or `View::visit_item()`): the copy declares a type of its own there, so
-    /// its `Self` is not the Leaker's type that the Repeater's impls are for. A type that does not
-    /// name `Self` but has a bound that does is for any type (`SelfRequirement::Any`, see
-    /// [`AnalyzeVisitor::self_in_bounds()`]), and so is one that names it with such a bound, with
-    /// the error [`Reason::NestedSelfInBounds`] (see `nested_self_risk()`). The default of a
-    /// parameter has no entry for `Self` (see `in_nested_default`). An absolute type that names
-    /// `Self` is not an optional entry (see [`AnalyzeVisitor::names_nested_self()`]): it is copied
-    /// as written, so its `Self` is the copy's own. The `Self` of a scope (`intern_struct()`,
-    /// `enter_type()`) is the outermost item's, which the Visitor writes as the Leaker's type.
-    self_nested: bool,
-    /// The trait that the impl declaring `Self` implements, if it is an impl of a trait: what a
-    /// `Self::A` is written through (see [`AssocSelf`]).
-    self_trait: Option<ImplTrait>,
-    /// The number of scopes when the scope that declares `Self` is the innermost: 0 if there is no
-    /// `Self`. The predicates of the item that declares `Self` are visited then, not those of its
-    /// methods.
-    self_depth: usize,
-    root_declares_self: bool,
+    /// What `Self` means here.
+    self_scope: SelfScope,
     /// Set while the walk of an impl visits it (see [`AnalyzeVisitor::walk_item_impl()`]): whether
     /// a bare `Self` in a bound or where predicate of the impl was found. The walk then tells the
     /// graph not to choose a type in the self type whose bounds are unstable (see
     /// [`AnalyzeVisitor::block_unstable_self_types()`]).
     self_type_walk: Option<bool>,
-    /// The type is the default of a parameter, which cannot mention `Self`. It holds whether the
-    /// declaring scope gives `Self` a meaning. `self_ty` is `None` meanwhile.
-    in_default: Option<bool>,
-    /// The type is the default of a parameter of a struct, an enum or a union nested in the
-    /// analyzed syntax (`self_nested`): its copy cannot write `Self` there (E0735), so it cannot
-    /// pass its own type for an entry that is for any type. The entry of a type that does not
-    /// name `Self` is then analyzed without `Self` and without the bounds of the generics that
-    /// name it (see [`AnalyzeVisitor::context_of_as()`]), and one that names it is an error if a
-    /// bound does too.
-    in_nested_default: bool,
+    /// The modules that the walk is in, innermost last.
     modules: Vec<ModuleFrame>,
     /// The causes that depend on the context.
     musts: Vec<Must>,
+    /// The causes that stop the type being visited from being leaked whole.
     impossibles: Impossibles,
+    /// What the type being visited has found so far.
     frame: Frame,
-    type_depth: usize,
+    /// The number of items the walk is in: 0 outside any, so the outermost item is not nested.
     item_depth: usize,
-    /// A referent or path argument that cannot be leaked whole (elided or several local lifetimes,
-    /// or in a bound). A trait object there cannot be leaked alone.
-    elided_ref: bool,
-    /// Like `elided_ref`, for a method lifetime that the copy would leave unconstrained (see
-    /// `signatures`). The conflict has a note of its own.
-    unconstrained_ref: Option<Lifetime>,
-    ambiguous_arg: bool,
-    /// A referent or path argument whose lifetime is a generic. A trait object there defaults to
-    /// it, and would default to `'static` if leaked alone. What is inside it is not affected.
-    inherits: Option<Inherits>,
     /// The signatures being visited, innermost last. Only those that rustc compares with a trait's
     /// have one (see [`AnalyzeVisitor::with_signature()`]).
     signatures: Vec<SignatureWalk>,
     /// The methods being visited are those of an inherent impl: no trait declares their signature,
     /// so the copy cannot differ from it (E0195). Anywhere else, a method may be one of a trait.
     inherent_impl: bool,
-    /// The depth of the type owning the expression (array length, const argument) being visited.
-    /// Types in it are not leaked alone: the copy would put an associated type path in a constant.
-    expr_owner: Option<usize>,
-    /// In a receiver (`self: Box<Self>`), where rustc accepts only `Self` and types dereferencing
-    /// to it: no type in it is optional.
-    in_receiver: bool,
-    /// The lifetimes the type being visited must outlive because of the types around it (see
-    /// [`Enclosing`]). The Referrer tracks the same ones to find the entry. Empty outside a type.
-    enclosing: Enclosing,
-    /// The depth of the bounds and where predicates being visited, which are the predicates of the
-    /// item (its environment). See [`AnalyzeVisitor::env_cycle()`].
-    env_depth: usize,
-    /// An argument of a function or method is being visited: an `impl Trait` in it is a generic of
-    /// the function, and its bounds are predicates of the item (see `env_depth`).
-    in_fn_arg: bool,
-    /// Whether [`AnalyzeVisitor::env_cycle()`] is checked. It is not by the probe that it runs.
-    check_env: bool,
-    /// The types, with the contexts they are in, that were found to be no optional entries.
-    not_optional: Vec<(Context, String)>,
-    /// The cycles that `Self` makes (see [`AnalyzeVisitor::env_cycle()`]). Kept apart from the
-    /// effects, like `self_errors`.
-    env_errors: Vec<CheckResult>,
-    /// The values of an item are read too (see
-    /// [`Leaker::check_values`](crate::Leaker::check_values)).
-    check_values: bool,
-    /// A value is being read ([`AnalyzeVisitor::place()`]).
-    in_value: bool,
-    /// The default body or the default value of an associated const of a trait is being read.
-    in_trait_default: bool,
-    /// The default of a generic parameter is being visited, where `in_default` and
-    /// `in_nested_default` do not tell.
-    in_param_default: bool,
+    /// Where the walk is in the type, signature or value being visited.
+    position: Position,
 }
 
 /// A method signature being visited (see `AnalyzeVisitor::signatures`).
@@ -886,69 +1010,49 @@ impl Inherits {
     }
 }
 
+/// Where a phase of `decide()` sends the frame instead of deciding the type.
+enum Handoff {
+    /// To the owner at that depth, the type holding the binder or the elision that stops the type.
+    Owner(usize),
+    /// To the parts only: the type is no optional entry, its parts may be.
+    Through,
+}
+
 // `A: 'a` is not implied for the associated functions on rustc 1.56.
 impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
-    pub(crate) fn new(rule: &'a mut A, generics: &Generics) -> Self {
+    /// `check_values`: the values of the items are read too (see
+    /// [`Leaker::check_values`](crate::Leaker::check_values)).
+    pub(crate) fn new(rule: &'a mut A, generics: &Generics, check_values: bool) -> Self {
         Self {
             rule,
-            outer_place: Place::default(),
-            contexts: Contexts::default(),
-            self_errors: Vec::new(),
-            top_levels: Vec::new(),
+            mode: Mode {
+                outer_place: Place::default(),
+                check_values,
+                check_env: true,
+            },
+            records: Records::default(),
             scopes: vec![Scope::new(generics, None)],
             binders: Vec::new(),
             elisions: Vec::new(),
-            signature: None,
             bound_elided: Vec::new(),
-            probe: None,
             alone_defaults: Vec::new(),
-            self_ty: None,
-            self_written: false,
-            self_nested: false,
-            self_trait: None,
-            self_depth: 0,
-            root_declares_self: false,
+            self_scope: SelfScope::default(),
             self_type_walk: None,
-            in_default: None,
-            in_nested_default: false,
             modules: Vec::new(),
             musts: Vec::new(),
             impossibles: Impossibles::default(),
             frame: Frame::new(0, 0, 0),
-            type_depth: 0,
             item_depth: 0,
-            elided_ref: false,
-            unconstrained_ref: None,
-            ambiguous_arg: false,
-            inherits: None,
             signatures: Vec::new(),
             inherent_impl: false,
-            expr_owner: None,
-            in_receiver: false,
-            enclosing: Enclosing::default(),
-            env_depth: 0,
-            in_fn_arg: false,
-            check_env: true,
-            not_optional: Vec::new(),
-            env_errors: Vec::new(),
-            check_values: false,
-            in_value: false,
-            in_trait_default: false,
-            in_param_default: false,
+            position: Position::default(),
         }
-    }
-
-    /// Makes the visitor read the values of the items it visits, or not (see
-    /// [`Leaker::check_values`](crate::Leaker::check_values)).
-    pub(crate) fn reading_values(mut self, check_values: bool) -> Self {
-        self.check_values = check_values;
-        self
     }
 
     /// Exchanges the table of contexts with `other`, which cannot fail. The outermost scope of the
     /// Leaker swaps its table in before the analysis and out after it, whatever the outcome.
     pub(crate) fn swap_contexts(&mut self, other: &mut Contexts) {
-        std::mem::swap(&mut self.contexts, other);
+        std::mem::swap(&mut self.records.contexts, other);
     }
 
     /// Returns the Leaker's rule, for the check that follows the analysis.
@@ -956,16 +1060,16 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         &*self.rule
     }
 
-    /// Runs `f` on a new visitor with the generics `generics`, which asks the rule `rule` at
+    /// Runs `f` on a throwaway visitor with the generics `generics`, which asks the rule `rule` at
     /// `place`.
-    fn alone<'b, R>(
+    fn throwaway<'b, R>(
         rule: &'b mut A,
         generics: &Generics,
         place: Place,
         f: impl FnOnce(&mut AnalyzeVisitor<'b, A>) -> R,
     ) -> R {
-        let mut visitor = AnalyzeVisitor::new(rule, generics);
-        visitor.outer_place = place;
+        let mut visitor = AnalyzeVisitor::new(rule, generics, false);
+        visitor.mode.outer_place = place;
         f(&mut visitor)
     }
 
@@ -977,12 +1081,12 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         generics: &Generics,
         declares_self: bool,
     ) -> (Vec<Effect>, Vec<SelfMention>) {
-        Self::alone(rule, generics, Place::default(), |visitor| {
-            visitor.in_default = Some(declares_self);
+        Self::throwaway(rule, generics, Place::default(), |visitor| {
+            visitor.position.in_default = Some(declares_self);
             visitor.visit_type(ty);
             (
                 std::mem::take(&mut visitor.frame.effects),
-                std::mem::take(&mut visitor.self_errors),
+                std::mem::take(&mut visitor.records.self_errors),
             )
         })
     }
@@ -992,18 +1096,11 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         must.sort_by_key(|must| must.depth);
         CheckResult {
             is_own: must.first().map_or(false, |must| must.depth == depth),
-            must: must.into_iter().map(|must| must.cause.clone()).collect(),
-            impossible: self.impossibles.since(impossible_start).to_vec(),
-            optional: false,
-            note: None,
-            help: None,
-            headline: None,
-            cause: None,
-            reason: Reason::RelativePath,
-            seen: 0,
-            part: None,
-            place: Place::default(),
-            paths: Vec::new(),
+            ..CheckResult::conflict(
+                must.into_iter().map(|must| must.cause.clone()).collect(),
+                self.impossibles.since(impossible_start).to_vec(),
+                Reason::RelativePath,
+            )
         }
     }
 
@@ -1052,7 +1149,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     fn found(&mut self, ty: &Type) -> CheckResult {
         let (must_start, impossible_start) = (self.musts.len(), self.impossibles.len());
         let effects_start = self.frame.effects.len();
-        let depth = self.type_depth + 1;
+        let depth = self.position.type_depth + 1;
         self.visit_type(ty);
         let mut result = self.causes(must_start, impossible_start, depth);
         match &self.frame.effects[effects_start..] {
@@ -1072,7 +1169,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         let frame = Frame::new(
             self.musts.len(),
             self.impossibles.len(),
-            self.self_errors.len(),
+            self.records.self_errors.len(),
         );
         std::mem::replace(&mut self.frame, frame)
     }
@@ -1118,24 +1215,24 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// is the relative path it is, if it is one (an entry of [`ErrorItem::paths`]).
     fn push_must(&mut self, must: Cause, path: Option<Cause>) {
         self.musts.push(Must {
-            depth: self.type_depth,
+            depth: self.position.type_depth,
             cause: must,
             covered: false,
             path,
         });
-        self.frame.min_depth = self.frame.min_depth.min(self.type_depth);
+        self.frame.min_depth = self.frame.min_depth.min(self.position.type_depth);
     }
 
     /// Where the visitor is, for the errors it finds ([`ErrorItem::in_value`],
     /// [`ErrorItem::in_default`]) and for the rule.
     fn place(&self) -> Place {
         Place {
-            in_value: self.in_value || self.outer_place.in_value,
-            in_default: self.in_trait_default
-                || self.in_param_default
-                || self.in_nested_default
-                || self.in_default.is_some()
-                || self.outer_place.in_default,
+            in_value: self.position.in_value || self.mode.outer_place.in_value,
+            in_default: self.position.in_trait_default
+                || self.position.in_param_default
+                || self.position.in_nested_default
+                || self.position.in_default.is_some()
+                || self.mode.outer_place.in_default,
         }
     }
 
@@ -1144,7 +1241,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     fn is_relative_path(&self, cause: &Cause) -> bool {
         cause.path().map_or(false, |path| {
             path.leading_colon.is_none()
-                && self_segment(path).is_none()
+                && self_head(path).is_none()
                 && !self.starts_with_generic(path)
                 && !self.is_context_free(cause)
         })
@@ -1166,13 +1263,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         })
     }
 
-    /// Returns the context of `ty`, or why it cannot be written (see [`Context::of()`]).
-    fn context_of(&self, ty: &Type, inner: &Frame) -> std::result::Result<Context, UnnameableSelf> {
-        self.context_of_as(ty, inner, false)
-    }
-
-    /// Like `context_of()`. `any`: the entry is for any type although `ty` names the `Self` of a
-    /// nested struct, enum or union (see [`Context::of_any()`]).
+    /// Returns the context of `ty`, or why it cannot be written (see [`Context::of()`]). `any`: the
+    /// entry is for any type although `ty` names the `Self` of a nested struct, enum or union (see
+    /// [`Context::of_any()`]).
     fn context_of_as(
         &self,
         ty: &Type,
@@ -1183,7 +1276,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             || inner.mentions_self
             || inner.local_scope < self.scopes.len()
         {
-            if self.in_nested_default && !type_mentions_self(ty) {
+            if self.position.in_nested_default && !type_mentions_self(ty) {
                 // The copy of a nested struct, enum or union cannot write `Self` in the default of
                 // a parameter (E0735), so it cannot pass its own type for an entry that is for any
                 // type. The type does not name `Self`, so the entry has none, and the bounds of the
@@ -1194,20 +1287,22 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     .iter()
                     .map(|scope| {
                         let mut scope = scope.clone();
-                        if scope.self_ty().is_some() && scope.self_ty() == self.self_ty.as_ref() {
+                        if scope.self_ty().is_some()
+                            && scope.self_ty() == self.self_scope.ty.as_ref()
+                        {
                             scope.without_self();
                         }
                         scope
                     })
                     .collect();
-                Context::of(ty, &scopes, None, false, &self.enclosing)?
+                Context::of(ty, &scopes, None, false, &self.position.enclosing)?
             } else if any {
                 Context::of_any(
                     ty,
                     &self.scopes,
-                    self.self_ty.as_ref(),
-                    self.self_nested,
-                    &self.enclosing,
+                    self.self_scope.ty.as_ref(),
+                    self.self_scope.nested,
+                    &self.position.enclosing,
                 )?
             } else {
                 // A type that does not name the `Self` of a nested struct, enum or union, but has
@@ -1215,9 +1310,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 Context::of(
                     ty,
                     &self.scopes,
-                    self.self_ty.as_ref(),
-                    self.self_nested,
-                    &self.enclosing,
+                    self.self_scope.ty.as_ref(),
+                    self.self_scope.nested,
+                    &self.position.enclosing,
                 )?
             }
         } else {
@@ -1246,8 +1341,8 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 && !self.starts_with_generic(path)
                 && !self.is_free_path(&Cause::Unknown(path.clone()))
         });
-        finder.visit_generics(context.generics());
-        match context.self_ty() {
+        finder.visit_generics(&context.generics);
+        match &context.self_ty {
             Some(SelfRequirement::Bound(path)) => finder.visit_path(path),
             Some(SelfRequirement::Type(ty)) => finder.visit_type(ty),
             _ => (),
@@ -1256,14 +1351,14 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     }
 
     /// Returns `true` if `ty`, with `context`, names the `Self` of a struct, an enum or a union
-    /// nested in the analyzed syntax (`self_nested`): the copy's own type, not the Leaker's. (A
-    /// type that does not name it, but has a bound that does, is for any type,
+    /// nested in the analyzed syntax (`SelfScope::nested`): the copy's own type, not the Leaker's.
+    /// (A type that does not name it, but has a bound that does, is for any type,
     /// [`SelfRequirement::Any`]. So is one that names it with such a bound: that is an entry to
     /// be leaked, with an error (see `nested_self_risk()`), and an absolute type of that kind is
     /// still copied as written.)
     fn names_nested_self(&self, ty: &Type, context: &Context) -> bool {
-        self.self_nested
-            && match context.self_ty() {
+        self.self_scope.nested
+            && match &context.self_ty {
                 Some(SelfRequirement::Type(_)) => true,
                 Some(SelfRequirement::Any) => type_mentions_self(ty),
                 _ => false,
@@ -1274,21 +1369,21 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// only in a nested item, where `Self` is not the Leaker's type (a written `Self: 'a` counts:
     /// it is encoded as `&'a Self`, which needs `Self` too).
     ///
-    /// The `Self` of a struct, an enum or a union nested in the analyzed syntax (`self_nested`) is
-    /// the copy's own type there, which is not the Leaker's. A type that does not name it, but has
-    /// a bound that does (`Rel<T>` with `T: AsRef<Self>`), is for any type that the bound holds
-    /// for ([`SelfRequirement::Any`]), and the copy passes its own: that is fine. A type that
-    /// names it too (`Rel2<Self, T>`) is for the Leaker's type, which the bound that the
-    /// environment proves (`T: AsRef<Self>`, `where T: AsRef<(Self, Rel)>`) does not hold for in
-    /// the copy, whose own type has it (E0277), so the impl is for any type, at a risk: what the
-    /// type needs of `Self` to be well-formed is not known ([`Reason::NestedSelfInBounds`]; see
-    /// `own_context()`). A predicate on another type, which an impl proves (`Self: Sized`,
-    /// `Vec<Self>: Clone`), and `Self: 'a` are fine.
+    /// The `Self` of a struct, an enum or a union nested in the analyzed syntax
+    /// (`SelfScope::nested`) is the copy's own type there, which is not the Leaker's. A type that
+    /// does not name it, but has a bound that does (`Rel<T>` with `T: AsRef<Self>`), is for any
+    /// type that the bound holds for ([`SelfRequirement::Any`]), and the copy passes its own: that
+    /// is fine. A type that names it too (`Rel2<Self, T>`) is for the Leaker's type, which the
+    /// bound that the environment proves (`T: AsRef<Self>`, `where T: AsRef<(Self, Rel)>`) does
+    /// not hold for in the copy, whose own type has it (E0277), so the impl is for any type, at a
+    /// risk: what the type needs of `Self` to be well-formed is not known
+    /// ([`Reason::NestedSelfInBounds`]; see `own_context()`). A predicate on another type, which
+    /// an impl proves (`Self: Sized`, `Vec<Self>: Clone`), and `Self: 'a` are fine.
     fn self_in_bounds(&self, context: &Context) -> Option<Cause> {
-        if !self.self_nested {
+        if !self.self_scope.nested {
             return None;
         }
-        match context.self_ty() {
+        match &context.self_ty {
             Some(SelfRequirement::Any) => None,
             _ => self_in_environment_bounds(context),
         }
@@ -1300,7 +1395,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 .output
                 .iter()
                 .find(|lifetime| {
-                    context.generics().params.iter().any(|param| {
+                    context.generics.params.iter().any(|param| {
                         matches!(param, GenericParam::Lifetime(param) if &param.lifetime == *lifetime)
                     })
                 })
@@ -1334,10 +1429,10 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// one that a path hides, and a method has no binder to write: those are broken. See
     /// [`Elision`].
     fn self_elision_broken(&self, ty: &Type) -> Option<(Elision, Vec<Lifetime>)> {
-        if self.in_receiver || self.self_written || !is_self_path(ty) {
+        if self.position.in_receiver || self.self_scope.written || !is_self_path(ty) {
             return None;
         }
-        let self_ty = match &self.self_ty {
+        let self_ty = match &self.self_scope.ty {
             Some(SelfRequirement::Type(self_ty)) => self_ty,
             _ => return None,
         };
@@ -1356,48 +1451,56 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// Finishes the outermost scope and returns what it found, with the errors if any. Defaults of
     /// type parameters are analyzed alone, with the parameters before them, and may not leak
     /// `Self`. On an error the result is kept: the part is copied as written.
-    pub(crate) fn finish(&mut self, generics: &Generics) -> (Finished, Vec<ErrorItem>) {
-        let mut effects = std::mem::take(&mut self.frame.effects);
-        for (index, _, default) in defaulted(generics) {
-            let root = without_defaults(generics, index);
-            let (found, self_errors) =
-                Self::analyze_default(&mut *self.rule, default, &root, self.root_declares_self);
-            // The mentions and the conflicts of the default come after those found so far.
-            let mut found = found;
-            shift_seen(&mut found, self.self_errors.len());
-            effects.extend(found);
-            self.self_errors.extend(self_errors);
-        }
-        if !self.self_errors.is_empty() {
-            effects = correct_unmeant_self(effects);
-        }
-        let errors = scope_error(&effects, &self.self_errors, &self.env_errors);
-        // The types that a cycle left without an entry are parts too: the Referrer leaves them as
-        // written.
-        effects.extend(
-            std::mem::take(&mut self.env_errors)
-                .into_iter()
-                .filter(|error| error.part.is_some())
-                .map(|error| Effect::Error(Box::new(error))),
-        );
-        let finished = Finished {
-            effects,
-            top_levels: std::mem::take(&mut self.top_levels),
-            module: self.modules.first().map(|module| module.id),
-            not_optional: std::mem::take(&mut self.not_optional),
-        };
-        (finished, errors)
-    }
-
-    /// Starts the outermost scope, entering it if it is a module.
-    pub(crate) fn start(&mut self, spec: &ScopeSpec) {
-        self.root_declares_self = matches!(
+    pub(crate) fn finish(
+        &mut self,
+        spec: &ScopeSpec,
+        generics: &Generics,
+    ) -> (Finished, Vec<ErrorItem>) {
+        let declares_self = matches!(
             spec,
             ScopeSpec::Generics {
                 declares: Some(_),
                 ..
             }
         );
+        let mut effects = std::mem::take(&mut self.frame.effects);
+        for (index, _, default) in defaulted(generics) {
+            let root = without_defaults(generics, index);
+            let (found, self_errors) =
+                Self::analyze_default(&mut *self.rule, default, &root, declares_self);
+            // The mentions and the conflicts of the default come after those found so far.
+            let mut found = found;
+            shift_seen(&mut found, self.records.self_errors.len());
+            effects.extend(found);
+            self.records.self_errors.extend(self_errors);
+        }
+        if !self.records.self_errors.is_empty() {
+            effects = correct_unmeant_self(effects);
+        }
+        let errors = scope_error(
+            &effects,
+            &self.records.self_errors,
+            &self.records.env_errors,
+        );
+        // The types that a cycle left without an entry are parts too: the Referrer leaves them as
+        // written.
+        effects.extend(
+            std::mem::take(&mut self.records.env_errors)
+                .into_iter()
+                .filter(|error| error.part.is_some())
+                .map(|error| Effect::Error(Box::new(error))),
+        );
+        let finished = Finished {
+            effects,
+            top_levels: std::mem::take(&mut self.records.top_levels),
+            module: self.modules.first().map(|module| module.id),
+            not_optional: std::mem::take(&mut self.records.not_optional),
+        };
+        (finished, errors)
+    }
+
+    /// Starts the outermost scope, entering it if it is a module.
+    pub(crate) fn start(&mut self, spec: &ScopeSpec) {
         self.enter_scope(spec, true);
     }
 
@@ -1406,22 +1509,14 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     fn mark(&self) -> ScopeMark {
         ScopeMark {
             effects: self.frame.effects.len(),
-            self_errors: self.self_errors.len(),
-            contexts: self.contexts.len(),
-            top_levels: self.top_levels.len(),
+            records: self.records.mark(),
             scopes: self.scopes.len(),
             modules: self.modules.len(),
             item_depth: self.item_depth,
             alone_defaults: self.alone_defaults.len(),
-            self_ty: self.self_ty.clone(),
-            self_written: self.self_written,
-            self_nested: self.self_nested,
-            self_trait: self.self_trait.clone(),
-            self_depth: self.self_depth,
+            self_scope: self.self_scope.clone(),
             self_type_walk: self.self_type_walk,
             inherent_impl: self.inherent_impl,
-            not_optional: self.not_optional.len(),
-            env_errors: self.env_errors.len(),
             module: None,
         }
     }
@@ -1433,17 +1528,14 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             ScopeSpec::Module { names, path, hint } => {
                 let parent = self.modules.last().map(|module| module.id);
                 let id = self
+                    .records
                     .contexts
                     .intern_module(path.clone(), hint.clone(), parent);
                 self.modules.push(ModuleFrame {
                     id,
                     names: Rc::new(names.clone()),
                 });
-                self.self_ty = None;
-                self.self_written = false;
-                self.self_nested = false;
-                self.self_trait = None;
-                self.self_depth = 0;
+                self.self_scope = SelfScope::default();
                 mark.module = Some(id);
             }
             ScopeSpec::Generics {
@@ -1452,29 +1544,30 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 trait_path,
             } => {
                 if let Some(declared) = declares {
-                    self.self_ty = Some(declared.requirement.clone());
-                    self.self_written = declared.written;
-                    self.self_nested = false;
-                    self.self_trait = trait_path.as_deref().map(|path| self.impl_trait(path));
+                    self.self_scope.ty = Some(declared.requirement.clone());
+                    self.self_scope.written = declared.written;
+                    self.self_scope.nested = false;
+                    self.self_scope.trait_ =
+                        trait_path.as_deref().map(|path| self.impl_trait(path));
                     self.inherent_impl = declared.inherent;
                 }
                 let gats = declares
                     .as_ref()
                     .map_or_else(Vec::new, |declared| declared.gats.clone());
                 if root {
-                    self.scopes[0].set_self(self.self_ty.clone());
+                    self.scopes[0].set_self(self.self_scope.ty.clone());
                     self.scopes[0].set_gats(gats);
                 } else {
                     self.scopes
-                        .push(Scope::new(generics, self.self_ty.clone()).with_gats(gats));
+                        .push(Scope::new(generics, self.self_scope.ty.clone()).with_gats(gats));
                 }
                 if declares.is_some() {
-                    self.self_depth = self.scopes.len();
+                    self.self_scope.depth = self.scopes.len();
                 }
-                if self.self_ty.is_none() {
+                if self.self_scope.ty.is_none() {
                     let generics = without_defaults(generics, generics.params.len());
                     let place = self.place();
-                    self.self_errors.extend(
+                    self.records.self_errors.extend(
                         selves_in_generics(&generics)
                             .into_iter()
                             .map(|cause| SelfMention { cause, place }),
@@ -1518,11 +1611,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         self.modules.truncate(mark.modules);
         self.item_depth = mark.item_depth;
         self.alone_defaults.truncate(mark.alone_defaults);
-        self.self_ty = mark.self_ty.clone();
-        self.self_written = mark.self_written;
-        self.self_nested = mark.self_nested;
-        self.self_trait = mark.self_trait.clone();
-        self.self_depth = mark.self_depth;
+        self.self_scope = mark.self_scope.clone();
         self.self_type_walk = mark.self_type_walk;
         self.inherent_impl = mark.inherent_impl;
     }
@@ -1531,38 +1620,18 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// panicked.
     fn roll_back(&mut self, mark: &ScopeMark) {
         self.frame.effects.truncate(mark.effects);
-        self.self_errors.truncate(mark.self_errors);
-        self.contexts.truncate(mark.contexts);
-        self.top_levels.truncate(mark.top_levels);
-        self.not_optional.truncate(mark.not_optional);
-        self.env_errors.truncate(mark.env_errors);
+        self.records.truncate(&mark.records);
     }
 
     /// Starts a check: sets the frame of the scope aside for the visit to use a new one.
     fn checkpoint(&mut self) -> Checkpoint {
         let mark = self.mark();
         let walk = Walk {
-            type_depth: self.type_depth,
+            position: self.position.clone(),
             binders: self.binders.len(),
             elisions: self.elisions.len(),
-            signature: self.signature.clone(),
             bound_elided: self.bound_elided.len(),
             signatures: self.signatures.len(),
-            probe: self.probe.clone(),
-            in_default: self.in_default,
-            in_nested_default: self.in_nested_default,
-            expr_owner: self.expr_owner,
-            in_receiver: self.in_receiver,
-            enclosing: self.enclosing.clone(),
-            env_depth: self.env_depth,
-            in_fn_arg: self.in_fn_arg,
-            elided_ref: self.elided_ref,
-            unconstrained_ref: self.unconstrained_ref.clone(),
-            ambiguous_arg: self.ambiguous_arg,
-            inherits: self.inherits,
-            in_value: self.in_value,
-            in_trait_default: self.in_trait_default,
-            in_param_default: self.in_param_default,
         };
         Checkpoint {
             mark,
@@ -1587,28 +1656,12 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         self.roll_back(&mark);
         self.musts.truncate(musts);
         self.truncate_impossibles(impossibles);
-        self.type_depth = walk.type_depth;
-        self.impossibles.at = walk.type_depth;
+        self.impossibles.at = walk.position.type_depth;
+        self.position = walk.position;
         self.binders.truncate(walk.binders);
         self.elisions.truncate(walk.elisions);
-        self.signature = walk.signature;
         self.bound_elided.truncate(walk.bound_elided);
         self.signatures.truncate(walk.signatures);
-        self.probe = walk.probe;
-        self.in_default = walk.in_default;
-        self.in_nested_default = walk.in_nested_default;
-        self.expr_owner = walk.expr_owner;
-        self.in_receiver = walk.in_receiver;
-        self.enclosing = walk.enclosing;
-        self.env_depth = walk.env_depth;
-        self.in_fn_arg = walk.in_fn_arg;
-        self.elided_ref = walk.elided_ref;
-        self.unconstrained_ref = walk.unconstrained_ref;
-        self.ambiguous_arg = walk.ambiguous_arg;
-        self.inherits = walk.inherits;
-        self.in_value = walk.in_value;
-        self.in_trait_default = walk.in_trait_default;
-        self.in_param_default = walk.in_param_default;
     }
 
     /// Leaves a nested scope and returns its top-level context. The scope keeps what it recorded,
@@ -1620,7 +1673,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             }
         }
         // The entries that name a `Self` without meaning are copied whole instead.
-        if !self.self_errors.is_empty() {
+        if !self.records.self_errors.is_empty() {
             let found = self.frame.effects.split_off(mark.effects);
             self.frame.effects.extend(correct_unmeant_self(found));
         }
@@ -1628,9 +1681,11 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         // A scope that declares nothing keeps the `Self` around, so take it before leaving. It is
         // part of the top-level context only if an entry or a part copied as written names it, or
         // has a bound rewritten for it: nothing else depends on it.
-        let scope_self = self.self_ty.clone().filter(|declared| {
+        let scope_self = self.self_scope.ty.clone().filter(|declared| {
             names_self(&self.frame.effects[mark.effects..], declared)
-                || self.env_errors[mark.env_errors..]
+                || self
+                    .records
+                    .env_errors_since(&mark.records)
                     .iter()
                     .any(|error| part_names_self(error, declared))
         });
@@ -1647,9 +1702,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             // The scope is in the module around it, if any.
             let around = self.modules.last().map(|module| module.id);
             let context = Context::new(spec.declared_generics(), scope_self).with_gats(scope_gats);
-            self.contexts.intern(context.with_module(around))
+            self.records.contexts.intern(context.with_module(around))
         });
-        self.top_levels.push(top_level);
+        self.records.top_levels.push(top_level);
         top_level
     }
 
@@ -1672,11 +1727,11 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         // The root scope is always there.
         let at = self.scopes.len() - 1;
         let scope = std::mem::replace(&mut self.scopes[at], Scope::new(before, None));
-        let self_ty = self.self_ty.take();
-        let in_default = self.in_default.replace(self_ty.is_some());
+        let self_ty = self.self_scope.ty.take();
+        let in_default = self.position.in_default.replace(self_ty.is_some());
         self.visit_type(ty);
-        self.in_default = in_default;
-        self.self_ty = self_ty;
+        self.position.in_default = in_default;
+        self.self_scope.ty = self_ty;
         self.scopes[at] = scope;
     }
 
@@ -1684,7 +1739,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// default of a parameter of a scope that declares nothing.
     fn check_self_has_meaning(&mut self, cause: Cause) {
         if !self.self_has_meaning() {
-            self.self_errors.push(SelfMention {
+            self.records.self_errors.push(SelfMention {
                 cause,
                 place: self.place(),
             });
@@ -1694,15 +1749,17 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// Returns `true` if `Self` means something here: a scope declares it, also in the default of a
     /// parameter of a scope that does (which cannot name it, but is not an error for that).
     fn self_has_meaning(&self) -> bool {
-        self.in_default.unwrap_or_else(|| self.self_ty.is_some())
+        self.position
+            .in_default
+            .unwrap_or_else(|| self.self_scope.ty.is_some())
     }
 
     /// Returns `true` if the type whose frame is `inner`, an entry in `context`, names a `Self`
     /// without meaning, or a bound of `context` does: the impl of the Repeater would read it as its
     /// implementor (see `correct_unmeant_self()`).
     fn names_unmeant_self(&self, inner: &Frame, context: &Context) -> bool {
-        self.self_errors.len() > inner.self_start
-            || (!self.self_has_meaning() && !selves_in_generics(context.generics()).is_empty())
+        self.records.self_errors.len() > inner.self_start
+            || (!self.self_has_meaning() && !selves_in_generics(&context.generics).is_empty())
     }
 
     /// Like `decide()` for a type that cannot be leaked alone (a trait object inheriting a path
@@ -1713,10 +1770,10 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             self.own_causes(inner.must_start, owner);
             inner.min_depth = owner;
         }
-        if inner.soft_depth != usize::MAX {
-            inner.soft_depth = owner;
+        if inner.optional_depth != usize::MAX {
+            inner.optional_depth = owner;
         }
-        if inner.min_depth != usize::MAX || inner.soft_depth != usize::MAX {
+        if inner.min_depth != usize::MAX || inner.optional_depth != usize::MAX {
             inner.adopted.push(owner);
         }
         self.decide_through(inner)
@@ -1729,9 +1786,16 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         self.frame.effects.append(&mut inner.effects);
     }
 
+    fn hand_off(&mut self, to: Handoff, inner: Frame) {
+        match to {
+            Handoff::Owner(owner) => self.decide_as_owner(owner, inner),
+            Handoff::Through => self.decide_through(inner),
+        }
+    }
+
     fn absorb(&mut self, inner: &Frame) {
         self.frame.min_depth = self.frame.min_depth.min(inner.min_depth);
-        self.frame.soft_depth = self.frame.soft_depth.min(inner.soft_depth);
+        self.frame.optional_depth = self.frame.optional_depth.min(inner.optional_depth);
         self.frame.local_scope = self.frame.local_scope.min(inner.local_scope);
         self.frame.mentions_root |= inner.mentions_root;
         self.frame.mentions_self |= inner.mentions_self;
@@ -1745,11 +1809,11 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         }
         // Kept for the enclosing type, unless that is the type holding the binder.
         if self.frame.binder.is_none() {
-            let depth = self.type_depth;
+            let depth = self.position.type_depth;
             self.frame.binder = inner.binder.clone().filter(|(owner, _)| *owner < depth);
         }
         if self.frame.elision.is_none() {
-            let depth = self.type_depth;
+            let depth = self.position.type_depth;
             self.frame.elision = inner.elision.clone().filter(|(owner, _)| *owner < depth);
         }
         for &owner in &inner.adopted {
@@ -1799,9 +1863,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 conflict.reason = Reason::UnconstrainedLifetime;
             }
             if let (Some(cause), Some(SelfRequirement::Type(_))) =
-                (&inner.assoc_self, &self.self_ty)
+                (&inner.assoc_self, &self.self_scope.ty)
             {
-                AssocSelf::new(cause.clone(), self.self_trait.clone()).give(
+                AssocSelf::new(cause.clone(), self.self_scope.trait_.clone()).give(
                     &mut conflict,
                     ty,
                     false,
@@ -1809,14 +1873,10 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             }
             return Err(conflict);
         }
-        if self.in_default == Some(true) && inner.mentions_self {
+        if self.position.in_default == Some(true) && inner.mentions_self {
             // The default is also used to compute the arguments of the trait, so the Repeater impl
             // cannot know what `Self` is.
             return Err(CheckResult {
-                must: vec![first_self_in_type(ty).unwrap_or_else(Cause::self_type)],
-                impossible: vec![Cause::Type(ty.clone())],
-                is_own: true,
-                optional: false,
                 note: Some("a default of a parameter cannot depend on `Self`".to_string()),
                 help: Some(format!(
                     "name the type instead of `Self` in `{}`",
@@ -1829,21 +1889,18 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 )),
                 // The default as a whole is what to change, the note is at the `Self` in it.
                 cause: Some(Cause::Type(ty.clone())),
-                reason: Reason::SelfInDefault,
-                seen: 0,
-                part: None,
-                place: Place::default(),
                 paths: self.own_paths(inner.must_start, depth),
+                ..CheckResult::conflict(
+                    vec![first_self_in_type(ty).unwrap_or_else(Cause::self_type)],
+                    vec![Cause::Type(ty.clone())],
+                    Reason::SelfInDefault,
+                )
             });
         }
-        let context = match self.context_of(ty, inner) {
+        let context = match self.context_of_as(ty, inner, false) {
             Ok(context) => context,
             Err(unnameable) => {
                 return Err(CheckResult {
-                    must: vec![Cause::Type(ty.clone())],
-                    impossible: vec![*unnameable.cause],
-                    is_own: true,
-                    optional: false,
                     note: Some(unnameable.note),
                     help: Some(format!(
                         "{}, or write `{}` with an absolute path, so that it is not leaked",
@@ -1851,12 +1908,12 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                         tidy(&quote!(#ty))
                     )),
                     headline: Some(unnameable.headline),
-                    cause: None,
-                    reason: Reason::UnnameableSelf,
-                    seen: 0,
-                    part: None,
-                    place: Place::default(),
                     paths: self.own_paths(inner.must_start, depth),
+                    ..CheckResult::conflict(
+                        vec![Cause::Type(ty.clone())],
+                        vec![*unnameable.cause],
+                        Reason::UnnameableSelf,
+                    )
                 })
             }
         };
@@ -1865,7 +1922,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         // does is for any type, and the copy passes its own: the type keeps `Self` (the walk reports the
         // risk, see `nested_self_risk()`). Not in a default, where the copy cannot write `Self`
         // (E0735).
-        if self_in_bounds.is_some() && self.self_nested && !self.in_nested_default {
+        if self_in_bounds.is_some() && self.self_scope.nested && !self.position.in_nested_default {
             if let Ok(any) = self.context_of_as(ty, inner, true) {
                 return match self.associated_self_in_bounds(&any) {
                     Some(conflict) => Err(conflict.of(ty, self.own_paths(inner.must_start, depth))),
@@ -1874,11 +1931,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             }
         }
         match self_in_bounds {
-            Some(self_path) if self.in_nested_default => Err(CheckResult {
-                must: vec![Cause::Type(ty.clone())],
-                impossible: vec![self_path.clone()],
-                is_own: true,
-                optional: false,
+            Some(self_path) if self.position.in_nested_default => Err(CheckResult {
                 note: Some(
                     "it names `Self`, which a struct, an enum or a union cannot write in the \
                      default of a parameter (E0735), and the bounds of its generics mention the \
@@ -1891,18 +1944,14 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                      name `Self`",
                     tidy(&quote!(#ty))
                 )),
-                cause: None,
-                reason: Reason::SelfInDefault,
-                seen: 0,
-                part: None,
-                place: Place::default(),
                 paths: self.own_paths(inner.must_start, depth),
+                ..CheckResult::conflict(
+                    vec![Cause::Type(ty.clone())],
+                    vec![self_path.clone()],
+                    Reason::SelfInDefault,
+                )
             }),
             Some(self_path) => Err(CheckResult {
-                must: vec![Cause::Type(ty.clone())],
-                impossible: vec![self_path.clone()],
-                is_own: true,
-                optional: false,
                 note: Some(
                     "it names the `Self` of an item nested in the analyzed syntax, and so do the \
                      bounds of its generics: the Repeater's impl of this type is for the \
@@ -1922,12 +1971,12 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     "`{}` has a generic whose bound mentions `Self`, which cannot be leaked",
                     tidy(&quote!(#ty))
                 )),
-                cause: None,
-                reason: Reason::NestedSelfInBounds,
-                seen: 0,
-                part: None,
-                place: Place::default(),
                 paths: self.own_paths(inner.must_start, depth),
+                ..CheckResult::conflict(
+                    vec![Cause::Type(ty.clone())],
+                    vec![self_path.clone()],
+                    Reason::NestedSelfInBounds,
+                )
             }),
             None => match self.associated_self_in_bounds(&context) {
                 Some(conflict) => Err(conflict.of(ty, self.own_paths(inner.must_start, depth))),
@@ -1940,10 +1989,10 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// type: the Repeater's impl for it would write the bound as it is, and has no trait to take
     /// `A` from. (The impl for the implementor of a trait can write it: `__S::A`.)
     fn associated_self_in_bounds(&self, context: &Context) -> Option<AssocSelf> {
-        match context.self_ty() {
+        match &context.self_ty {
             Some(SelfRequirement::Type(_) | SelfRequirement::Any) => {
-                first_associated_self_in_generics(context.generics())
-                    .map(|cause| AssocSelf::new(cause, self.self_trait.clone()))
+                first_associated_self_in_generics(&context.generics)
+                    .map(|cause| AssocSelf::new(cause, self.self_scope.trait_.clone()))
             }
             _ => None,
         }
@@ -2105,45 +2154,158 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         conflict
     }
 
+    /// Decides the type `ty` at `depth`, whose parts were visited into `inner`: it is leaked whole as
+    /// an entry, copied as written with its parts leaked, or a conflict. The phases run in the order
+    /// of the methods below; one that finds the owner of the type hands the frame over.
     #[allow(clippy::result_large_err)]
     fn decide(&mut self, ty: &Type, depth: usize, ambiguous: bool, mut inner: Frame) {
-        // A type in it is not leaked alone: its meaning depends on this one.
-        let adopted = inner.adopted.contains(&depth);
-        // `Self` (or `Self::A`) that the copy writes as a type with lifetimes, in the inputs of a
-        // signature whose output relies on elision: `Self` is no entry, so it is the type holding
-        // the signature that is leaked whole instead, or a conflict (in a bound or a method). Like
-        // the entries that add lifetimes, below.
-        let mut self_conflict = None;
-        if let Some((elision, added)) = self.self_elision_broken(ty) {
-            if elision.owner > 0 {
-                self.musts.push(Must {
-                    depth: elision.owner,
-                    cause: Cause::Type(ty.clone()),
-                    covered: false,
-                    path: None,
-                });
-                let advice = self_elision_advice(&added, &elision, true);
-                inner.elision = Some((elision.owner, advice));
-                inner.min_depth = inner.min_depth.min(elision.owner);
-                return self.decide_as_owner(elision.owner, inner);
+        let self_conflict = match self.self_elision(ty, depth, &mut inner) {
+            Ok(conflict) => conflict,
+            Err(to) => return self.hand_off(to, inner),
+        };
+        let (bare, beside) = self.bare_identifiers(ty, depth, &mut inner);
+        let mut own = (inner.min_depth == depth).then(|| self.own_context(ty, depth, &inner));
+        if let Some(conflict) = self_conflict {
+            own = Some(Err(conflict));
+        }
+        if let Some(path) = beside {
+            let conflict = self.beside_conflict(own.take(), &path, bare.as_deref(), depth, &inner);
+            own = Some(Err(conflict));
+        }
+        if let (Some(idents), Some(Err(conflict))) = (&bare, &own) {
+            own = Some(Err(self.bare_conflict(conflict.clone(), ty, idents)));
+        }
+        let bare = bare.is_some();
+        let mark = match self.binder_and_elision(ty, depth, &mut inner, &mut own) {
+            Ok(mark) => mark,
+            Err(to) => return self.hand_off(to, inner),
+        };
+        let optional = match self.optional_context(ty, depth, &mut inner, own.is_none()) {
+            Ok(optional) => optional,
+            Err(to) => return self.hand_off(to, inner),
+        };
+        self.absorb(&inner);
+        let has_impossible = self.impossibles.len() > inner.impossible_start;
+        let has_must = inner.min_depth != usize::MAX;
+        let mentions_local = inner.local_scope < self.scopes.len();
+        let effects = std::mem::take(&mut inner.effects);
+
+        if own.is_none()
+            && self.position.env_depth > 0
+            && self.mode.check_env
+            && self.self_in_predicate(ty, depth, &inner, &effects)
+        {
+            return;
+        }
+        match own {
+            Some(Ok(context)) => {
+                self.pending_for_entry(ty, depth, ambiguous, context, &inner, effects)
             }
+            Some(Err(conflict)) => {
+                // The type is copied as written: the Referrer leaves it so. One whose context
+                // cannot be written has none, and is found where the Referrer cannot write it.
+                let context = self.context_of_as(ty, &inner, false).ok();
+                // A bare identifier among the arguments may be a const: it is not leaked alone, and
+                // the errors of the parts are real as well, as the cause of the type is one of them.
+                // In a predicate nothing more is leaked: it would be a projection there that rustc
+                // cannot normalize while it checks the bounds (see `env_cycle()`).
+                let whole = bare
+                    || inner.adopted.contains(&depth)
+                    || self.position.env_depth > 0
+                    || is_whole_reference(ty);
+                let mut conflict = self.with_part(conflict, ty, context, whole, &effects);
+                if let Some(part) = conflict.part.as_mut() {
+                    part.mark = mark;
+                }
+                if bare {
+                    self.frame.effects.extend(error_effects(effects));
+                    return self.push_error(conflict);
+                }
+                self.conflict_inside(conflict, inner.self_start, whole, effects)
+            }
+            None if has_impossible => {
+                if has_must || has_optional_candidate(&effects) {
+                    // Not leaked whole (elided lifetime, `impl Trait`), but its parts can be.
+                    self.push_parts(ty, depth, &inner, effects);
+                } else {
+                    // Cannot and need not be leaked: copied, so primitive names are assumed.
+                    self.frame.effects.extend(primitive_effects(effects));
+                }
+            }
+            // Not leaked itself: it depends on local generics, refers to an item of the module
+            // (which the Referrer shadows in the copy) or to `Self` in a default. Its parts can be.
+            None if mentions_local
+                || inner.module_item
+                || (self.position.in_default.is_some() && inner.mentions_self) =>
+            {
+                match optional {
+                    Some(context) => {
+                        let pending = PendingType {
+                            optional: true,
+                            optional_candidate: true,
+                            ..PendingType::new(ty, context, effects)
+                        };
+                        self.push_pending(pending, None, &inner, depth)
+                    }
+                    None => self.frame.effects.extend(effects),
+                }
+            }
+            None => self.pending_for_parts(ty, depth, optional, has_must, &inner, effects),
+        }
+    }
+
+    /// `Self` (or `Self::A`) that the copy writes as a type with lifetimes, in the inputs of a
+    /// signature whose output relies on elision: `Self` is no entry, so it is the type holding
+    /// the signature that is leaked whole instead (`Err`), or a conflict (in a bound or a method).
+    /// Like the entries that add lifetimes, in [`AnalyzeVisitor::binder_and_elision()`].
+    fn self_elision(
+        &mut self,
+        ty: &Type,
+        depth: usize,
+        inner: &mut Frame,
+    ) -> std::result::Result<Option<CheckResult>, Handoff> {
+        let (elision, added) = match self.self_elision_broken(ty) {
+            Some(broken) => broken,
+            None => return Ok(None),
+        };
+        if elision.owner > 0 {
             self.musts.push(Must {
-                depth,
+                depth: elision.owner,
                 cause: Cause::Type(ty.clone()),
                 covered: false,
                 path: None,
             });
-            inner.min_depth = inner.min_depth.min(depth);
-            let mut conflict =
-                self.conflict_causes(inner.must_start, inner.impossible_start, depth);
-            conflict.impossible.insert(0, elision.output.clone());
-            self_elision_advice(&added, &elision, false).give(&mut conflict);
-            self_conflict = Some(conflict);
+            let advice = self_elision_advice(&added, &elision, true);
+            inner.elision = Some((elision.owner, advice));
+            inner.min_depth = inner.min_depth.min(elision.owner);
+            return Err(Handoff::Owner(elision.owner));
         }
-        // A bare identifier argument may be a const, so the type holding it is leaked whole if it
-        // can be. If it cannot because of an elided lifetime or `impl Trait`, or because its path
-        // is an item of the module, the identifier is leaked as a type (the copy fails if it is a
-        // const). Else there is no sound way: it is a conflict, the identifier being the cause.
+        self.musts.push(Must {
+            depth,
+            cause: Cause::Type(ty.clone()),
+            covered: false,
+            path: None,
+        });
+        inner.min_depth = inner.min_depth.min(depth);
+        let mut conflict = self.conflict_causes(inner.must_start, inner.impossible_start, depth);
+        conflict.impossible.insert(0, elision.output.clone());
+        self_elision_advice(&added, &elision, false).give(&mut conflict);
+        Ok(Some(conflict))
+    }
+
+    /// A bare identifier argument may be a const, so the type holding it is leaked whole if it
+    /// can be. If it cannot because of an elided lifetime or `impl Trait`, or because its path
+    /// is an item of the module, the identifier is leaked as a type (the copy fails if it is a
+    /// const). Else there is no sound way: it is a conflict, the identifier being the cause.
+    /// Returns those identifiers when the type is a conflict for them, and the path of the
+    /// module's item beside them that the copy declares again, if any. The type owns its causes
+    /// then.
+    fn bare_identifiers(
+        &mut self,
+        ty: &Type,
+        depth: usize,
+        inner: &mut Frame,
+    ) -> (Option<Vec<Type>>, Option<TokenStream>) {
         let mut bare = None;
         // A path of another crate that names an item of the module beside the identifier is never
         // leaked whole (the copy declares the item again): it is a conflict, whatever else stops
@@ -2151,18 +2313,18 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         // for the module's own type.
         let mut beside = None;
         if inner.min_depth != depth {
-            if let Some(idents) = self.bare_beside_module_item(ty, &inner) {
+            if let Some(idents) = self.bare_beside_module_item(ty, inner) {
                 beside = inner.module_path.clone();
                 bare = Some(idents);
                 self.own_causes(inner.must_start, depth);
                 inner.min_depth = depth;
-            } else if self.holds_bare_ident(ty, &inner) {
-                match self.own_context(ty, depth, &inner) {
+            } else if self.holds_bare_ident(ty, inner) {
+                match self.own_context(ty, depth, inner) {
                     Ok(_) => {
                         self.own_causes(inner.must_start, depth);
                         inner.min_depth = depth;
                     }
-                    Err(_) if self.has_hard_cause(&inner) => {
+                    Err(_) if self.has_hard_cause(inner) => {
                         bare = Some(ambiguous_types(&inner.effects));
                         self.own_causes(inner.must_start, depth);
                         inner.min_depth = depth;
@@ -2171,53 +2333,67 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 }
             }
         }
-        // A type leaked whole for its own path cannot use a binder lifetime of the output: the type
-        // holding the binder is leaked instead, or it is a conflict (in a bound).
-        let mut own = (inner.min_depth == depth).then(|| self.own_context(ty, depth, &inner));
-        if let Some(conflict) = self_conflict {
-            own = Some(Err(conflict));
+        (bare, beside)
+    }
+
+    /// The conflict of a type that names `path`, an item of the module beside the identifiers
+    /// `bare`: `own` is the conflict that it has already, if any.
+    fn beside_conflict(
+        &self,
+        own: Option<std::result::Result<Context, CheckResult>>,
+        path: &TokenStream,
+        bare: Option<&[Type]>,
+        depth: usize,
+        inner: &Frame,
+    ) -> CheckResult {
+        let mut conflict = match own {
+            Some(Err(conflict)) => conflict,
+            _ => self.conflict_causes(inner.must_start, inner.impossible_start, depth),
+        };
+        if conflict.note.is_none() {
+            conflict.note = Some(format!(
+                "the type names `{}`, which the module declares and the copy declares again, \
+                 so it is not leaked as a whole",
+                tidy(path)
+            ));
         }
-        if let Some(path) = beside {
-            let mut conflict = match own.take() {
-                Some(Err(conflict)) => conflict,
-                _ => self.conflict_causes(inner.must_start, inner.impossible_start, depth),
-            };
-            if conflict.note.is_none() {
-                conflict.note = Some(format!(
-                    "the type names `{}`, which the module declares and the copy declares again, \
-                     so it is not leaked as a whole",
-                    tidy(&path)
-                ));
-            }
-            // A name that the module declares is not leaked: the way out that only a module has.
-            if conflict.help.is_none() {
-                let name = bare
-                    .as_ref()
-                    .and_then(|idents| idents.first())
-                    .map(|ident| tidy(&quote!(#ident)))
-                    .unwrap_or_default();
-                conflict.help = Some(format!(
-                    "import `{0}` with an absolute `use` (`use ::my_crate::{0};`)",
-                    name
-                ));
-            }
-            own = Some(Err(conflict));
+        // A name that the module declares is not leaked: the way out that only a module has.
+        if conflict.help.is_none() {
+            let name = bare
+                .and_then(|idents| idents.first())
+                .map(|ident| tidy(&quote!(#ident)))
+                .unwrap_or_default();
+            conflict.help = Some(format!(
+                "import `{0}` with an absolute `use` (`use ::my_crate::{0};`)",
+                name
+            ));
         }
-        if let (Some(idents), Some(Err(conflict))) = (&bare, &own) {
-            own = Some(Err(self.bare_conflict(conflict.clone(), ty, idents)));
-        }
-        let bare = bare.is_some();
-        if let (Some(_), Some(probe)) = (&own, &mut self.probe) {
+        conflict
+    }
+
+    /// A type leaked whole for its own path (`own`) cannot use a binder lifetime of the output: the
+    /// type holding the binder is leaked instead (`Err`), or it is a conflict (in a bound). The same
+    /// for a type that adds lifetimes to the inputs of a signature whose output relies on elision:
+    /// the type holding the signature is leaked instead, or it is a conflict (in a bound or a
+    /// method). Returns the mark of the part that a method's signature makes the type.
+    fn binder_and_elision(
+        &mut self,
+        ty: &Type,
+        depth: usize,
+        inner: &mut Frame,
+        own: &mut Option<std::result::Result<Context, CheckResult>>,
+    ) -> std::result::Result<Option<SignatureMark>, Handoff> {
+        if let (Some(_), Some(probe)) = (&*own, &mut self.position.binder_probe) {
             probe.insert(ty as *const Type as usize);
         }
-        let binder = match &own {
+        let binder = match &*own {
             Some(Ok(context)) => self.output_binder(context),
             _ => None,
         };
         if let Some((lifetime, owner)) = binder {
             if owner > 0 {
                 inner.binder = Some((owner, binder_advice(&lifetime, ty, true)));
-                return self.decide_as_owner(owner, inner);
+                return Err(Handoff::Owner(owner));
             }
             let mut conflict =
                 self.conflict_causes(inner.must_start, inner.impossible_start, depth);
@@ -2225,12 +2401,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 .impossible
                 .insert(0, Cause::Lifetime(lifetime.clone()));
             binder_advice(&lifetime, ty, false).give(&mut conflict);
-            own = Some(Err(conflict));
+            *own = Some(Err(conflict));
         }
-        // The same for a type that adds lifetimes to the inputs of a signature whose output relies
-        // on elision: the type holding the signature is leaked instead, or it is a conflict (in a
-        // bound or a method).
-        let broken = match &own {
+        let broken = match &*own {
             Some(Ok(context)) => self.elision_broken(context),
             _ => None,
         };
@@ -2241,262 +2414,272 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             if elision.owner > 0 {
                 let advice = elision_advice(&added, &elision, ty, true);
                 inner.elision = Some((elision.owner, advice));
-                return self.decide_as_owner(elision.owner, inner);
+                return Err(Handoff::Owner(elision.owner));
             }
             let mut conflict =
                 self.conflict_causes(inner.must_start, inner.impossible_start, depth);
             conflict.impossible.insert(0, elision.output.clone());
             elision_advice(&added, &elision, ty, false).give(&mut conflict);
-            own = Some(Err(conflict));
+            *own = Some(Err(conflict));
             mark = (!elision.binder).then(|| SignatureMark::Elided);
         }
-        if let Some(Ok(_)) = &own {
-            self.record_leaked(ty, depth, &inner);
+        if let Some(Ok(_)) = own {
+            self.record_leaked(ty, depth, inner);
         }
-        // The same for an external type with such a lifetime: the type holding the binder is the
-        // optional entry instead. Otherwise it is optional if it has no own cause and can be leaked
-        // whole.
-        let soft = if own.is_none()
-            && inner.soft_depth == depth
+        Ok(mark)
+    }
+
+    /// The context of `ty` as an optional entry, if it is one. `no_own`: it has no own decision.
+    /// The same as for a binder or an elision for an external type with such a lifetime: the type
+    /// holding it is the optional entry instead (`Err`, only its parts are leaked here).
+    /// Otherwise it is optional if it has no own cause and can be leaked whole.
+    fn optional_context(
+        &mut self,
+        ty: &Type,
+        depth: usize,
+        inner: &mut Frame,
+        no_own: bool,
+    ) -> std::result::Result<Option<Context>, Handoff> {
+        let optional = if no_own
+            && inner.optional_depth == depth
             && !inner.module_item
-            && !self.in_receiver
+            && !self.position.in_receiver
         {
-            self.own_context(ty, depth, &inner).ok()
+            self.own_context(ty, depth, inner).ok()
         } else {
             None
         };
-        let soft_binder = soft
+        let optional_binder = optional
             .as_ref()
             .and_then(|context| self.output_binder(context));
-        if let Some((_, owner)) = soft_binder {
+        if let Some((_, owner)) = optional_binder {
             if owner > 0 {
-                inner.soft_depth = owner;
-                return self.decide_through(inner);
+                inner.optional_depth = owner;
+                return Err(Handoff::Through);
             }
         }
-        let soft_elision = soft
+        let optional_elision = optional
             .as_ref()
             .and_then(|context| self.elision_broken(context));
-        if let Some((elision, _)) = &soft_elision {
+        if let Some((elision, _)) = &optional_elision {
             if elision.owner > 0 {
-                inner.soft_depth = elision.owner;
-                return self.decide_through(inner);
+                inner.optional_depth = elision.owner;
+                return Err(Handoff::Through);
             }
         }
         // An optional entry that would make a cycle in the copy (see `env_cycle()`) is not one: the
         // Referrer cannot replace it, so it is copied as written. That holds for the type in this
         // context everywhere, as the Referrer finds an entry by its type and context.
-        let optional = match soft.filter(|_| soft_binder.is_none() && soft_elision.is_none()) {
-            Some(context) if self.env_blocked(&context, true) => {
-                self.not_optional.push((context, quote!(#ty).to_string()));
-                None
-            }
-            // An absolute type that names the `Self` of a nested struct, enum or union
-            // (`::std::boxed::Box<Self>`, `::p::Rel2<Self, T>`) is not an optional entry: it is
-            // copied as written, and so `Self` in it is the copy's own type, for a Referrer that
-            // replaces the optional entries as well as for one that does not. As an entry it would
-            // be for the Leaker's type, which the copy cannot name as `Self`. What in it must be
-            // leaked on its own still is (`Rel<T>` in `::p::Rel2<Self, Rel<T>>`), and it is not
-            // replaced as a whole either when that costs fewer entries (`no_entry` and
-            // `no_optional_entry` below).
-            Some(context) if self.names_nested_self(ty, &context) => None,
-            optional => optional,
-        };
-        self.absorb(&inner);
-        let has_impossible = self.impossibles.len() > inner.impossible_start;
-        let has_must = inner.min_depth != usize::MAX;
-        let mentions_local = inner.local_scope < self.scopes.len();
-        let effects = std::mem::take(&mut inner.effects);
-
-        // `Self` and its associated types are resolved by what the copy writes for `Self`, also
-        // where `Self` cannot be leaked. The error is kept apart from the effects, as the type
-        // around may be copied, which drops them.
-        if own.is_none() && self.env_depth > 0 && self.check_env {
-            let projection = is_self_projection(ty);
-            if projection || (self.self_written && is_bare_self(ty)) {
-                if let Ok(context) = self.context_of(ty, &inner) {
-                    // The self type of an impl needs a rewrite only if it names a leaked type.
-                    if projection || self.self_type_names_leaked(&context, false) {
-                        // `Self::A` needs the bounds of the generics of its context. `Self` of an
-                        // impl needs those of the types in the self type that the copy writes as
-                        // paths through the Repeater only: rustc normalizes them in the
-                        // environment, not the bounds of a generic that they do not use. A type
-                        // in the self type that the graph may choose, and whose bounds are
-                        // unstable, is not chosen then: its parts are (see
-                        // `block_unstable_self_types()`), if the walk of the impl can tell the
-                        // graph.
-                        let blockable = !projection && self.self_type_walk.is_some();
-                        if blockable {
-                            self.self_type_walk = Some(true);
-                        }
-                        let needs = if projection {
-                            vec![context.clone()]
-                        } else {
-                            self.self_type_entries(&context, false, blockable)
-                        };
-                        for needed in &needs {
-                            if let Some(conflict) = self.self_env_cycle(ty, needed) {
-                                // The type is left without an entry, and copied as written: `Self`
-                                // or `Self::A` has no types in it to leak.
-                                let mut conflict =
-                                    self.with_part(conflict, ty, Some(context), true, &effects);
-                                conflict.seen = self.self_errors.len();
-                                conflict.place = self.place();
-                                conflict.paths = self.own_paths(inner.must_start, depth);
-                                return self.env_errors.push(conflict);
-                            }
-                        }
-                        if projection {
-                            self.not_optional_in_bounds(&context);
-                        } else {
-                            for context in self.self_type_entries(&context, true, blockable) {
-                                self.not_optional_in_bounds(&context);
-                            }
-                        }
-                        if let Some(impl_context) = self.impl_context(projection) {
-                            self.not_optional_in_bounds(&impl_context);
-                        }
-                    }
-                    if !projection {
-                        self.not_optional_in_self_type(&context);
-                    }
+        Ok(
+            match optional.filter(|_| optional_binder.is_none() && optional_elision.is_none()) {
+                Some(context) if self.env_blocked(&context, true) => {
+                    self.records
+                        .not_optional
+                        .push((context, quote!(#ty).to_string()));
+                    None
                 }
+                // An absolute type that names the `Self` of a nested struct, enum or union
+                // (`::std::boxed::Box<Self>`, `::p::Rel2<Self, T>`) is not an optional entry: it is
+                // copied as written, and so `Self` in it is the copy's own type, for a Referrer that
+                // replaces the optional entries as well as for one that does not. As an entry it would
+                // be for the Leaker's type, which the copy cannot name as `Self`. What in it must be
+                // leaked on its own still is (`Rel<T>` in `::p::Rel2<Self, Rel<T>>`), and it is not
+                // replaced as a whole either when that costs fewer entries (`no_required_entry` and
+                // `no_optional_entry` below).
+                Some(context) if self.names_nested_self(ty, &context) => None,
+                optional => optional,
+            },
+        )
+    }
+
+    /// `Self` and its associated types are resolved by what the copy writes for `Self`, also where
+    /// `Self` cannot be leaked: `ty` is one, in a predicate. Returns whether it recorded the error
+    /// that leaves `ty` without an entry. The error is kept apart from the effects of the parts
+    /// (`effects`), as the type around may be copied, which drops them.
+    fn self_in_predicate(
+        &mut self,
+        ty: &Type,
+        depth: usize,
+        inner: &Frame,
+        effects: &[Effect],
+    ) -> bool {
+        let projection = is_self_projection(ty);
+        if !(projection || (self.self_scope.written && is_bare_self(ty))) {
+            return false;
+        }
+        let context = match self.context_of_as(ty, inner, false) {
+            Ok(context) => context,
+            Err(_) => return false,
+        };
+        // The self type of an impl needs a rewrite only if it names a leaked type.
+        if projection || self.self_type_names_leaked(&context, false) {
+            // `Self::A` needs the bounds of the generics of its context. `Self` of an
+            // impl needs those of the types in the self type that the copy writes as
+            // paths through the Repeater only: rustc normalizes them in the
+            // environment, not the bounds of a generic that they do not use. A type
+            // in the self type that the graph may choose, and whose bounds are
+            // unstable, is not chosen then: its parts are (see
+            // `block_unstable_self_types()`), if the walk of the impl can tell the
+            // graph.
+            let blockable = !projection && self.self_type_walk.is_some();
+            if blockable {
+                self.self_type_walk = Some(true);
+            }
+            let needs = if projection {
+                vec![context.clone()]
+            } else {
+                self.self_type_entries(&context, false, blockable)
+            };
+            for needed in &needs {
+                if let Some(conflict) = self.self_env_cycle(ty, needed) {
+                    // The type is left without an entry, and copied as written: `Self`
+                    // or `Self::A` has no types in it to leak.
+                    let mut conflict = self.with_part(conflict, ty, Some(context), true, effects);
+                    conflict.seen = self.records.self_errors.len();
+                    conflict.place = self.place();
+                    conflict.paths = self.own_paths(inner.must_start, depth);
+                    self.records.env_errors.push(conflict);
+                    return true;
+                }
+            }
+            if projection {
+                self.not_optional_in_bounds(&context);
+            } else {
+                for context in self.self_type_entries(&context, true, blockable) {
+                    self.not_optional_in_bounds(&context);
+                }
+            }
+            if let Some(impl_context) = self.impl_context(projection) {
+                self.not_optional_in_bounds(&impl_context);
             }
         }
+        if !projection {
+            self.not_optional_in_self_type(&context);
+        }
+        false
+    }
+
+    /// `ty` is leaked whole in `context` for its own path: pushes the entry, with the error of the
+    /// risk it has, or a conflict if it would make a cycle.
+    fn pending_for_entry(
+        &mut self,
+        ty: &Type,
+        depth: usize,
+        ambiguous: bool,
+        context: Context,
+        inner: &Frame,
+        effects: Vec<Effect>,
+    ) {
+        let cycle = self
+            .env_cycle(ty, &context)
+            .or_else(|| self.nested_self_cycle(ty, &context, inner));
+        if let Some(conflict) = cycle {
+            // The predicate must not hold a projection through the Repeater, also not in a
+            // part of the type that conflicts (E0277: rustc does not normalize it while it
+            // checks the bounds): nothing in it is leaked.
+            let mut conflict = self.with_part(conflict, ty, Some(context), true, &effects);
+            conflict.paths = self.own_paths(inner.must_start, depth);
+            return self.conflict_inside(conflict, inner.self_start, true, effects);
+        }
+        self.not_optional_in_bounds(&context);
         let mut risk = None;
-        let mut pending = match own {
-            Some(Ok(context)) => {
-                let cycle = self
-                    .env_cycle(ty, &context)
-                    .or_else(|| self.nested_self_cycle(ty, &context, &inner));
-                if let Some(conflict) = cycle {
-                    // The predicate must not hold a projection through the Repeater, also not in a
-                    // part of the type that conflicts (E0277: rustc does not normalize it while it
-                    // checks the bounds): nothing in it is leaked.
-                    let mut conflict = self.with_part(conflict, ty, Some(context), true, &effects);
-                    conflict.paths = self.own_paths(inner.must_start, depth);
-                    return self.conflict_inside(conflict, inner.self_start, true, effects);
-                }
-                self.not_optional_in_bounds(&context);
-                if self.nested_self_risk(ty, &context) {
-                    risk = Some(self.nested_self_error(ty, &inner));
-                }
-                PendingType {
-                    is_must_intern: true,
-                    in_graph: true,
-                    ambiguous: ambiguous && context.is_empty(),
-                    primitives: primitive_names(&effects),
-                    inside: effects,
-                    adopted,
-                    ..PendingType::new(ty, context, Vec::new())
-                }
-            }
-            Some(Err(conflict)) => {
-                // The type is copied as written: the Referrer leaves it so. One whose context
-                // cannot be written has none, and is found where the Referrer cannot write it.
-                let context = self.context_of(ty, &inner).ok();
-                // A bare identifier among the arguments may be a const: it is not leaked alone, and
-                // the errors of the parts are real as well, as the cause of the type is one of them.
-                // In a predicate nothing more is leaked: it would be a projection there that rustc
-                // cannot normalize while it checks the bounds (see `env_cycle()`).
-                let whole = bare || adopted || self.env_depth > 0 || is_whole_reference(ty);
-                let mut conflict = self.with_part(conflict, ty, context, whole, &effects);
-                if let Some(part) = conflict.part.as_mut() {
-                    part.mark = mark;
-                }
-                if bare {
-                    self.frame.effects.extend(error_effects(effects));
-                    return self.push_error(conflict);
-                }
-                return self.conflict_inside(conflict, inner.self_start, whole, effects);
-            }
-            None if has_impossible => {
-                if has_must || has_optional(&effects) {
-                    // Not leaked whole (elided lifetime, `impl Trait`), but its parts can be.
-                    self.push_parts(ty, depth, &inner, effects);
-                } else {
-                    // Cannot and need not be leaked: copied, so primitive names are assumed.
-                    self.frame.effects.extend(primitive_effects(effects));
-                }
-                return;
-            }
-            // Not leaked itself: it depends on local generics, refers to an item of the module
-            // (which the Referrer shadows in the copy) or to `Self` in a default. Its parts can be.
-            None if mentions_local
-                || inner.module_item
-                || (self.in_default.is_some() && inner.mentions_self) =>
-            {
-                match optional {
-                    Some(context) => PendingType {
-                        optional: true,
-                        has_optional: true,
-                        ..PendingType::new(ty, context, effects)
-                    },
-                    None => return self.frame.effects.extend(effects),
-                }
-            }
-            None => {
-                // Not leaked itself if its generics cannot be written (`Self`).
-                let context = match self.context_of(ty, &inner) {
-                    Ok(context)
-                        if self.self_in_bounds(&context).is_none()
-                            && self.associated_self_in_bounds(&context).is_none() =>
-                    {
-                        context
-                    }
-                    _ => return self.frame.effects.extend(effects),
-                };
-                // It may replace its parts as the entry, if the graph finds it cheaper: not if it
-                // adds lifetimes where elision needs none.
-                let in_graph = has_must && self.elision_broken(&context).is_none();
-                // A type that is an entry only if its parts need it makes a cycle too, but its
-                // parts can be the entries instead, unless it is leaked whole in any case.
-                let leaked_whole = has_must && is_whole_reference(ty);
-                if leaked_whole {
-                    if let Some(conflict) = self.env_cycle(ty, &context) {
-                        let mut conflict =
-                            self.with_part(conflict, ty, Some(context), true, &effects);
-                        conflict.paths = self.own_paths(inner.must_start, depth);
-                        return self.push_error(conflict);
-                    }
-                    self.not_optional_in_bounds(&context);
-                }
-                let has_optional = optional.is_some() || has_optional(&effects);
-                // A type that names the `Self` of a nested struct, enum or union, and is copied as
-                // written but for its parts, is not an entry for them either, whatever the graph
-                // finds cheaper: `Self` in it is the copy's own, not the type of an entry.
-                let nested_self = self.names_nested_self(ty, &context);
-                let no_entry = has_must && (nested_self || self.env_blocked(&context, false));
-                if has_must && !no_entry {
-                    self.not_optional_in_bounds(&context);
-                }
-                let no_optional_entry =
-                    has_optional && (nested_self || self.env_blocked(&context, true));
-                // A reference that is an entry is one as a whole, so its parts cannot stand for
-                // it. If it cannot be an entry, the optional entries in it are not either.
-                if no_optional_entry && is_whole_reference(ty) {
-                    self.not_optional.extend(optional_keys(&effects));
-                }
-                PendingType {
-                    in_graph,
-                    optional: optional.is_some(),
-                    has_optional,
-                    no_entry,
-                    no_optional_entry,
-                    ..PendingType::new(ty, context, effects)
-                }
-            }
+        if self.nested_self_risk(ty, &context) {
+            risk = Some(self.nested_self_error(ty, inner));
+        }
+        let pending = PendingType {
+            required: true,
+            required_candidate: true,
+            ambiguous: ambiguous && context.is_empty(),
+            primitives: primitive_names(&effects),
+            inside: effects,
+            // A type in it is not leaked alone: its meaning depends on this one.
+            adopted: inner.adopted.contains(&depth),
+            ..PendingType::new(ty, context, Vec::new())
         };
-        pending.unmeant_self = self.names_unmeant_self(&inner, &pending.context);
-        pending.in_predicate = self.env_depth > 0;
+        self.push_pending(pending, risk, inner, depth)
+    }
+
+    /// `ty` is not leaked for its own path and has no conflict, but its parts have causes or
+    /// optional entries: pushes it as a candidate for an entry (`optional`: an optional entry
+    /// already), or only its parts if its generics cannot be written.
+    fn pending_for_parts(
+        &mut self,
+        ty: &Type,
+        depth: usize,
+        optional: Option<Context>,
+        has_must: bool,
+        inner: &Frame,
+        effects: Vec<Effect>,
+    ) {
+        // Not leaked itself if its generics cannot be written (`Self`).
+        let context = match self.context_of_as(ty, inner, false) {
+            Ok(context)
+                if self.self_in_bounds(&context).is_none()
+                    && self.associated_self_in_bounds(&context).is_none() =>
+            {
+                context
+            }
+            _ => return self.frame.effects.extend(effects),
+        };
+        // It may replace its parts as the entry, if the graph finds it cheaper: not if it
+        // adds lifetimes where elision needs none.
+        let required_candidate = has_must && self.elision_broken(&context).is_none();
+        // A type that is an entry only if its parts need it makes a cycle too, but its
+        // parts can be the entries instead, unless it is leaked whole in any case.
+        let leaked_whole = has_must && is_whole_reference(ty);
+        if leaked_whole {
+            if let Some(conflict) = self.env_cycle(ty, &context) {
+                let mut conflict = self.with_part(conflict, ty, Some(context), true, &effects);
+                conflict.paths = self.own_paths(inner.must_start, depth);
+                return self.push_error(conflict);
+            }
+            self.not_optional_in_bounds(&context);
+        }
+        let optional_candidate = optional.is_some() || has_optional_candidate(&effects);
+        // A type that names the `Self` of a nested struct, enum or union, and is copied as
+        // written but for its parts, is not an entry for them either, whatever the graph
+        // finds cheaper: `Self` in it is the copy's own, not the type of an entry.
+        let nested_self = self.names_nested_self(ty, &context);
+        let no_required_entry = has_must && (nested_self || self.env_blocked(&context, false));
+        if has_must && !no_required_entry {
+            self.not_optional_in_bounds(&context);
+        }
+        let no_optional_entry =
+            optional_candidate && (nested_self || self.env_blocked(&context, true));
+        // A reference that is an entry is one as a whole, so its parts cannot stand for
+        // it. If it cannot be an entry, the optional entries in it are not either.
+        if no_optional_entry && is_whole_reference(ty) {
+            self.records.not_optional.extend(optional_keys(&effects));
+        }
+        let pending = PendingType {
+            required_candidate,
+            optional: optional.is_some(),
+            optional_candidate,
+            no_required_entry,
+            no_optional_entry,
+            ..PendingType::new(ty, context, effects)
+        };
+        self.push_pending(pending, None, inner, depth)
+    }
+
+    /// Pushes `pending`, the effect of the type at `depth`, after `risk`, the error that goes
+    /// before it as a conflict does.
+    fn push_pending(
+        &mut self,
+        mut pending: PendingType,
+        risk: Option<CheckResult>,
+        inner: &Frame,
+        depth: usize,
+    ) {
+        pending.unmeant_self = self.names_unmeant_self(inner, &pending.context);
+        pending.in_predicate = self.position.env_depth > 0;
         // An entry leaked alone covers the paths in it: the type around is not in conflict for them.
-        if pending.in_graph {
+        if pending.required_candidate {
             pending.paths = self.own_paths(inner.must_start, depth);
             for must in &mut self.musts[inner.must_start..] {
                 must.covered = true;
             }
         }
-        // The risk comes first, as a conflict does.
         if let Some(risk) = risk {
             self.frame.effects.push(Effect::Error(Box::new(risk)));
         }
@@ -2508,7 +2691,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// written inside `ty` only: it is their anchor, unless its context cannot be written.
     fn push_parts(&mut self, ty: &Type, depth: usize, inner: &Frame, mut effects: Vec<Effect>) {
         if self.impossibles.own_since(inner.impossible_start, depth) && has_error(&effects) {
-            if let Ok(context) = self.context_of(ty, inner) {
+            if let Ok(context) = self.context_of_as(ty, inner, false) {
                 anchor_parts(&mut effects, ty, &context);
             }
         }
@@ -2530,7 +2713,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             cause: Cause::Type(ty.clone()),
             whole,
             context,
-            in_predicate: self.env_depth > 0,
+            in_predicate: self.position.env_depth > 0,
             within: None,
             mark: None,
             primitives: if whole {
@@ -2568,15 +2751,12 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// copy writes as it is with the types in it. `path` stands for it as a type, to compute the
     /// context, which is `None` if it cannot be written. `primitives`: the primitive names in it.
     fn node_part(&self, cause: Cause, path: &Path, primitives: Vec<Ident>) -> Part {
-        let ty = Type::Path(TypePath {
-            qself: None,
-            path: path.clone(),
-        });
+        let ty = path_type(path);
         let context = Context::of(
             &ty,
             &self.scopes,
-            self.self_ty.as_ref(),
-            self.self_nested,
+            self.self_scope.ty.as_ref(),
+            self.self_scope.nested,
             &Enclosing::default(),
         )
         .ok()
@@ -2588,7 +2768,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             cause,
             whole: true,
             context,
-            in_predicate: self.env_depth > 0,
+            in_predicate: self.position.env_depth > 0,
             within: None,
             mark: None,
             primitives,
@@ -2664,8 +2844,8 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// its type, which the copy writes with its own type. That is a risk
     /// ([`Reason::NestedSelfInBounds`]), which [`AnalyzeVisitor::nested_self_error()`] reports.
     fn nested_self_risk(&self, ty: &Type, context: &Context) -> bool {
-        self.self_nested
-            && matches!(context.self_ty(), Some(SelfRequirement::Any))
+        self.self_scope.nested
+            && matches!(context.self_ty, Some(SelfRequirement::Any))
             && type_mentions_self(ty)
     }
 
@@ -2673,15 +2853,11 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// leaked all the same: nothing in it is copied as written, so the error has no paths.
     fn nested_self_error(&self, ty: &Type, inner: &Frame) -> CheckResult {
         let self_path = self
-            .context_of(ty, inner)
+            .context_of_as(ty, inner, false)
             .ok()
             .and_then(|plain| self.self_in_bounds(&plain))
             .unwrap_or_else(Cause::self_type);
         CheckResult {
-            must: vec![Cause::Type(ty.clone())],
-            impossible: Vec::new(),
-            is_own: true,
-            optional: false,
             note: Some(
                 "it names the `Self` of an item nested in the analyzed syntax, and so do the \
                  bounds of its generics: the entry is for any type that the bound holds for, and \
@@ -2702,12 +2878,13 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 "`{}` names `Self` and has a generic whose bound mentions `Self`",
                 tidy(&quote!(#ty))
             )),
-            cause: None,
-            reason: Reason::NestedSelfInBounds,
             seen: inner.self_start,
-            part: None,
             place: self.place(),
-            paths: Vec::new(),
+            ..CheckResult::conflict(
+                vec![Cause::Type(ty.clone())],
+                Vec::new(),
+                Reason::NestedSelfInBounds,
+            )
         }
     }
 
@@ -2727,7 +2904,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         if !self.nested_self_risk(ty, context) {
             return None;
         }
-        let plain = self.context_of(ty, inner).ok()?;
+        let plain = self.context_of_as(ty, inner, false).ok()?;
         self.env_cycle(ty, &plain)
     }
 
@@ -2788,19 +2965,15 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// Returns the generics of the impl that declares `Self`, if `Self::A` (`projection`) is in
     /// one of its predicates, as a context.
     fn impl_context(&self, projection: bool) -> Option<Context> {
-        if !projection || !self.self_written || self.self_depth == 0 {
+        if !projection || !self.self_scope.written || self.self_scope.depth == 0 {
             return None;
         }
-        let scope = self.scopes.get(self.self_depth - 1)?;
-        Some(Context::new(scope.generics(), self.self_ty.clone()))
+        let scope = self.scopes.get(self.self_scope.depth - 1)?;
+        Some(Context::new(scope.generics(), self.self_scope.ty.clone()))
     }
 
     fn cycle_error(&self, ty: &Type, why: String) -> CheckResult {
         CheckResult {
-            must: vec![Cause::Type(ty.clone())],
-            impossible: Vec::new(),
-            is_own: true,
-            optional: false,
             note: Some(why),
             help: Some(format!(
                 "write the leaked type of the bound with an absolute path, or use `{}` outside \
@@ -2812,12 +2985,11 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                  type",
                 tidy(&quote!(#ty))
             )),
-            cause: None,
-            reason: Reason::UnprovableBound,
-            seen: 0,
-            part: None,
-            place: Place::default(),
-            paths: Vec::new(),
+            ..CheckResult::conflict(
+                vec![Cause::Type(ty.clone())],
+                Vec::new(),
+                Reason::UnprovableBound,
+            )
         }
     }
 
@@ -2829,10 +3001,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             Instability::Named(named) => named,
         };
         CheckResult {
-            must: vec![Cause::Type(ty.clone())],
-            impossible: Vec::new(),
-            is_own: true,
-            optional: false,
             note: Some(why),
             help: Some(format!(
                 "{}, or use `{}` outside the bounds and where predicates",
@@ -2844,26 +3012,25 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 tidy(&quote!(#ty)),
                 named.names()
             )),
-            cause: None,
-            reason: Reason::UnprovableBound,
-            seen: 0,
-            part: None,
-            place: Place::default(),
-            paths: Vec::new(),
+            ..CheckResult::conflict(
+                vec![Cause::Type(ty.clone())],
+                Vec::new(),
+                Reason::UnprovableBound,
+            )
         }
     }
 
     /// Returns `Self: Trait` if a type in `context` names `Self` of a trait, and the predicates of
     /// that trait are being visited (not those of its methods): see `env_cycle()`.
     fn trait_cycle(&self, context: &Context) -> Option<TokenStream> {
-        if self.env_depth == 0
-            || !self.check_env
-            || self.self_depth == 0
-            || self.scopes.len() != self.self_depth
+        if self.position.env_depth == 0
+            || !self.mode.check_env
+            || self.self_scope.depth == 0
+            || self.scopes.len() != self.self_scope.depth
         {
             return None;
         }
-        match context.self_ty() {
+        match &context.self_ty {
             Some(SelfRequirement::Bound(path)) => Some(quote!(Self: #path)),
             _ => None,
         }
@@ -2876,20 +3043,20 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
 
     /// Runs `visit` on a probe visitor that has the generics and the `Self` of `context`, and
     /// checks nothing itself.
-    fn probe<R>(
+    fn in_context<R>(
         &mut self,
         context: &Context,
         visit: impl FnOnce(&mut AnalyzeVisitor<'_, A>) -> R,
     ) -> R {
         let modules = self.modules.clone();
-        Self::alone(
+        Self::throwaway(
             &mut *self.rule,
-            context.generics(),
+            &context.generics,
             Place::default(),
             |probe| {
-                probe.check_env = false;
+                probe.mode.check_env = false;
                 probe.modules = modules;
-                probe.self_ty = context.self_ty().cloned();
+                probe.self_scope.ty = context.self_ty.clone();
                 visit(probe)
             },
         )
@@ -2899,11 +3066,14 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// type that is leaked, so the copy writes it as a path through the Repeater. With `optional`,
     /// a type that the Referrer may replace counts too.
     fn self_type_names_leaked(&mut self, context: &Context, optional: bool) -> bool {
-        match context.self_ty() {
-            Some(SelfRequirement::Type(ty)) if self.env_depth > 0 && self.check_env => {
-                self.probe(context, |probe| {
+        match &context.self_ty {
+            Some(SelfRequirement::Type(ty))
+                if self.position.env_depth > 0 && self.mode.check_env =>
+            {
+                self.in_context(context, |probe| {
                     probe.visit_type(ty);
-                    !probe.musts.is_empty() || (optional && has_optional(&probe.frame.effects))
+                    !probe.musts.is_empty()
+                        || (optional && has_optional_candidate(&probe.frame.effects))
                 })
             }
             _ => false,
@@ -2929,16 +3099,20 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         optional: bool,
         blockable: bool,
     ) -> Vec<Context> {
-        let ty = match context.self_ty() {
-            Some(SelfRequirement::Type(ty)) if self.env_depth > 0 && self.check_env => ty,
+        let ty = match &context.self_ty {
+            Some(SelfRequirement::Type(ty))
+                if self.position.env_depth > 0 && self.mode.check_env =>
+            {
+                ty
+            }
             _ => return Vec::new(),
         };
         let declared = self
             .scopes
-            .get(self.self_depth.wrapping_sub(1))
+            .get(self.self_scope.depth.wrapping_sub(1))
             .map(Scope::generics);
         // `blocked` probes too, so it runs after this probe.
-        let effects = self.probe(context, |probe| {
+        let effects = self.in_context(context, |probe| {
             probe.visit_type(ty);
             std::mem::take(&mut probe.frame.effects)
         });
@@ -2959,10 +3133,10 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// the type being visited is in a predicate of the item. With `optional`, an optional type (one
     /// of another crate, which the Referrer replaces) counts too, and in every where predicate.
     fn env_leaked_bound(&mut self, context: &Context, optional: bool) -> Option<TokenStream> {
-        if self.env_depth == 0 || !self.check_env {
+        if self.position.env_depth == 0 || !self.mode.check_env {
             return None;
         }
-        let generics = context.generics();
+        let generics = &context.generics;
         // Without bounds, nothing is named.
         let bounded = generics.where_clause.is_some()
             || generics.params.iter().any(|param| match param {
@@ -2975,10 +3149,10 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         // A type that must be an entry counts where the environment must prove the bound, and an
         // optional one counts everywhere.
         let mut names_leaked = |visit: &dyn Fn(&mut AnalyzeVisitor<'_, A>), environment: bool| {
-            self.probe(context, |probe| {
+            self.in_context(context, |probe| {
                 visit(probe);
                 (environment && !probe.musts.is_empty())
-                    || (optional && has_optional(&probe.frame.effects))
+                    || (optional && has_optional_candidate(&probe.frame.effects))
             })
         };
         for param in &generics.params {
@@ -3039,10 +3213,10 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 return found;
             }
         }
-        if self.env_depth == 0 || !self.check_env {
+        if self.position.env_depth == 0 || !self.mode.check_env {
             return found;
         }
-        let generics = context.generics();
+        let generics = &context.generics;
         let bounded = generics.where_clause.is_some()
             || generics.params.iter().any(|param| match param {
                 GenericParam::Type(param) => !param.bounds.is_empty(),
@@ -3072,7 +3246,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             whys.extend(projection);
             if (all || !named)
                 && mentions_self
-                && self.self_written
+                && self.self_scope.written
                 && *self_leaked
                     .get_or_insert_with(|| self.self_type_names_leaked(context, optional))
             {
@@ -3158,31 +3332,35 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         let names_self = unstable
             .iter()
             .any(|unstable| matches!(unstable.why, Instability::Named(Why::SelfType)));
-        let keys = self.probe(context, |probe| {
-            probe.visit_generics(context.generics());
+        let keys = self.in_context(context, |probe| {
+            probe.visit_generics(&context.generics);
             // The bound that names `Self` is unstable for the self type that the copy writes.
-            if let (true, Some(SelfRequirement::Type(ty))) = (names_self, context.self_ty()) {
+            if let (true, Some(SelfRequirement::Type(ty))) = (names_self, &context.self_ty) {
                 probe.visit_type(ty);
             }
             optional_keys(&probe.frame.effects)
         });
-        self.not_optional.extend(keys);
+        self.records.not_optional.extend(keys);
     }
 
     /// Like `not_optional_in_bounds()` for the optional entries of the self type of an impl (in
     /// `context`), which `Self` is in a bound or where predicate.
     fn not_optional_in_self_type(&mut self, context: &Context) {
-        let ty = match context.self_ty() {
-            Some(SelfRequirement::Type(ty)) if self.env_depth > 0 && self.check_env => ty,
+        let ty = match &context.self_ty {
+            Some(SelfRequirement::Type(ty))
+                if self.position.env_depth > 0 && self.mode.check_env =>
+            {
+                ty
+            }
             _ => return,
         };
-        let keys = self.probe(context, |probe| {
+        let keys = self.in_context(context, |probe| {
             probe.visit_type(ty);
             optional_keys(&probe.frame.effects)
         });
         for (context, ty) in keys {
             if self.env_leaked_bound(&context, true).is_some() {
-                self.not_optional.push((context, ty));
+                self.records.not_optional.push((context, ty));
             }
         }
     }
@@ -3192,26 +3370,15 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// ([`CheckResult::paths`]).
     fn relative_path(&mut self, cause: Cause, impossible: Cause, paths: Vec<Cause>) {
         self.push_error(CheckResult {
-            must: vec![cause],
-            impossible: vec![impossible],
-            is_own: true,
-            optional: false,
-            note: None,
-            help: None,
-            headline: None,
-            cause: None,
-            reason: Reason::RelativePath,
-            seen: 0,
-            part: None,
-            place: Place::default(),
             paths,
+            ..CheckResult::conflict(vec![cause], vec![impossible], Reason::RelativePath)
         });
     }
 
     /// Records the conflict as an effect, with the number of mentions of `Self` without meaning
     /// found so far (see [`CheckResult::seen`]) and where it was found.
     fn push_error(&mut self, mut conflict: CheckResult) {
-        conflict.seen = self.self_errors.len();
+        conflict.seen = self.records.self_errors.len();
         conflict.place = self.place();
         self.frame.effects.push(Effect::Error(Box::new(conflict)));
     }
@@ -3225,7 +3392,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         }
         let outer = self.self_type_walk.replace(false);
         let trait_ = i.trait_.as_ref().map(|(_, path, _)| self.impl_trait(path));
-        let outer_trait = std::mem::replace(&mut self.self_trait, trait_);
+        let outer_trait = std::mem::replace(&mut self.self_scope.trait_, trait_);
         self.visit_generics(&i.generics);
         if let Some((_, path, _)) = &i.trait_ {
             let cause = Cause::Trait(path.clone());
@@ -3242,7 +3409,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         if self.self_type_walk == Some(true) {
             self.block_unstable_self_types(start, end);
         }
-        self.self_trait = outer_trait;
+        self.self_scope.trait_ = outer_trait;
         self.self_type_walk = outer;
     }
 
@@ -3262,25 +3429,25 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     Effect::Type(pending) => pending,
                     _ => continue,
                 };
-                let candidate = pending.in_graph
-                    && !pending.no_entry
-                    && !pending.is_must_intern
+                let candidate = pending.required_candidate
+                    && !pending.no_required_entry
+                    && !pending.required
                     && !is_whole_reference(&pending.ty);
                 if candidate
                     && visitor
                         .env_unstable_bound(&pending.context, false)
                         .is_some()
                 {
-                    pending.no_entry = true;
+                    pending.no_required_entry = true;
                 }
                 block(visitor, &mut pending.components);
             }
         }
         // The bounds of a type are those of a type in a predicate.
         let mut effects = std::mem::take(&mut self.frame.effects);
-        self.env_depth += 1;
+        self.position.env_depth += 1;
         block(self, &mut effects[start..end]);
-        self.env_depth -= 1;
+        self.position.env_depth -= 1;
         self.frame.effects = effects;
     }
 
@@ -3303,7 +3470,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// an outer scope that names its own `Self` is written for the type that scope knows.
     fn cut_self_cycles(&mut self, start: usize, generics: &Generics) -> usize {
         let mut not_optional = Vec::new();
-        let seen = self.self_errors.len();
+        let seen = self.records.self_errors.len();
         let place = self.place();
         let found = self.frame.effects.split_off(start);
         let found = cut_conflicts(
@@ -3314,7 +3481,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             &mut not_optional,
         );
         self.frame.effects.extend(found);
-        self.not_optional.extend(not_optional);
+        self.records.not_optional.extend(not_optional);
         self.frame.effects.len()
     }
 
@@ -3323,8 +3490,8 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// what the error is reported at ([`bound_cause()`]). Returns `true` if the error is of a
     /// relative path.
     fn check_bound_path(&mut self, path: &Path, cause: Cause) -> bool {
-        if self_segment(path).is_some() && self.self_ty.is_none() {
-            self.self_errors.push(SelfMention {
+        if self_head(path).is_some() && self.self_scope.ty.is_none() {
+            self.records.self_errors.push(SelfMention {
                 cause,
                 place: self.place(),
             });
@@ -3358,7 +3525,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
 
     /// Returns `true` if the path of `cause` is absolute, starts with `$crate`, or is allowed, at
     /// the place of the visitor. A type with an absolute path may still be an optional entry (see
-    /// `is_soft_path()`).
+    /// `is_optional_path()`).
     fn is_free_path(&self, cause: &Cause) -> bool {
         cause.path().map_or(false, |path| {
             path.leading_colon.is_some()
@@ -3375,7 +3542,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
 
     /// Returns `true` for an absolute path to an external crate (not `::core`, not allowed). The
     /// Referrer may replace such a type, so nothing in it is anchored (see `scan_anchors()`).
-    fn is_soft_path(&self, cause: &Cause) -> bool {
+    fn is_optional_path(&self, cause: &Cause) -> bool {
         cause.path().map_or(false, |path| {
             path.leading_colon.is_some()
                 && !matches!(path.segments.first(), Some(seg) if seg.ident == "core")
@@ -3452,14 +3619,17 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         };
         let parent = self.modules.last().map(|module| module.id);
         let mut path = parent
-            .and_then(|parent| self.contexts.get(parent).module_path())
+            .and_then(|parent| self.records.contexts.get(parent).module_path())
             .map(<[Ident]>::to_vec)
             .unwrap_or_default();
         path.push(i.ident.clone());
-        let id = self.contexts.intern_module(Some(path), None, parent);
+        let id = self
+            .records
+            .contexts
+            .intern_module(Some(path), None, parent);
         self.modules.push(ModuleFrame {
             id,
-            names: Rc::new(declared_names(items)),
+            names: Rc::new(module_names(items)),
         });
         f(self);
         self.modules.pop();
@@ -3525,15 +3695,11 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     }
 
     fn with_local_generics(&mut self, generics: &Generics, f: impl FnOnce(&mut Self)) {
-        self.with_scope(Scope::new(generics, self.self_ty.clone()), f)
+        self.with_scope(Scope::new(generics, self.self_scope.ty.clone()), f)
     }
 
-    /// Runs `f` with the generics of an item: the Leaker's if outermost, local otherwise.
-    fn with_item_generics(&mut self, generics: &Generics, f: impl FnOnce(&mut Self)) {
-        self.with_item_generics_of(generics, Vec::new(), f)
-    }
-
-    /// Like `with_item_generics()` for a trait, with its `gats` (see [`Gat`]).
+    /// Runs `f` with the generics of an item: the Leaker's if outermost, local otherwise. `gats`:
+    /// those of a trait (see [`Gat`]).
     fn with_item_generics_of(
         &mut self,
         generics: &Generics,
@@ -3543,7 +3709,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         let nested = self.item_depth > 0;
         self.item_depth += 1;
         if nested {
-            let scope = Scope::new(generics, self.self_ty.clone()).with_gats(gats);
+            let scope = Scope::new(generics, self.self_scope.ty.clone()).with_gats(gats);
             self.with_scope(scope, f);
         } else {
             f(self);
@@ -3551,19 +3717,8 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         self.item_depth -= 1;
     }
 
-    /// Like `with_item_generics()`, with `Self` meaning `self_ty` (`None` in a module). A nested
+    /// Like `with_item_generics_of()`, with `Self` meaning `self_ty` (`None` in a module). A nested
     /// item has its own `Self`, which may be leaked whatever the scope around says.
-    fn with_item(
-        &mut self,
-        generics: &Generics,
-        self_ty: Option<SelfRequirement>,
-        written: bool,
-        f: impl FnOnce(&mut Self),
-    ) {
-        self.with_item_of(generics, self_ty, written, Vec::new(), f)
-    }
-
-    /// Like `with_item()` for a trait, with its `gats` (see [`Gat`]).
     fn with_item_of(
         &mut self,
         generics: &Generics,
@@ -3575,20 +3730,19 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         let declares = self_ty.is_some();
         let nested_type =
             self.item_depth > 0 && !written && matches!(self_ty, Some(SelfRequirement::Type(_)));
-        let outer = std::mem::replace(&mut self.self_ty, self_ty);
-        let outer_written = std::mem::replace(&mut self.self_written, written);
-        let outer_nested = std::mem::replace(&mut self.self_nested, nested_type);
-        let outer_trait = self.self_trait.take();
-        let outer_depth = self.self_depth;
+        let inner = SelfScope {
+            ty: self_ty,
+            written,
+            nested: nested_type,
+            trait_: None,
+            depth: self.self_scope.depth,
+        };
+        let outer = std::mem::replace(&mut self.self_scope, inner);
         self.with_item_generics_of(generics, gats, |visitor| {
-            visitor.self_depth = if declares { visitor.scopes.len() } else { 0 };
+            visitor.self_scope.depth = if declares { visitor.scopes.len() } else { 0 };
             f(visitor)
         });
-        self.self_ty = outer;
-        self.self_written = outer_written;
-        self.self_nested = outer_nested;
-        self.self_trait = outer_trait;
-        self.self_depth = outer_depth;
+        self.self_scope = outer;
     }
 
     /// Visits the attributes and visibility only: the body or value is not analyzed.
@@ -3623,7 +3777,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 }
             };
             if item {
-                visitor.with_item_generics(&sig.generics, walk)
+                visitor.with_item_generics_of(&sig.generics, Vec::new(), walk)
             } else {
                 visitor.with_local_generics(&sig.generics, walk)
             }
@@ -3651,9 +3805,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     /// Runs `f`, which visits the arguments of `sig`, knowing what their elision must keep (see
     /// [`Elision`]).
     fn with_arguments_of(&mut self, sig: &Signature, f: impl FnOnce(&mut Self)) {
-        let outer = std::mem::replace(&mut self.signature, Elision::of_signature(sig));
+        let outer = std::mem::replace(&mut self.position.signature, Elision::of_signature(sig));
         f(self);
-        self.signature = outer;
+        self.position.signature = outer;
     }
 
     fn with_risky(
@@ -3694,7 +3848,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     fn record_leaked(&mut self, ty: &Type, depth: usize, inner: &Frame) {
         // The probe of a binder walks its types again for real, which must leave nothing keyed by
         // their address.
-        if self.probe.is_some() {
+        if self.position.binder_probe.is_some() {
             return;
         }
         let walk = match self.signatures.last() {
@@ -3801,9 +3955,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             let from = start.min(self.frame.effects.len());
             let mut found = Vec::new();
             block_optional(&mut self.frame.effects[from..], &kept_optional, &mut found);
-            self.not_optional.extend(found);
+            self.records.not_optional.extend(found);
         }
-        let seen = self.self_errors.len();
+        let seen = self.records.self_errors.len();
         let place = self.place();
         self.frame
             .effects
@@ -3912,7 +4066,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     fn is_not_a_cause(&mut self, object: &TypeTraitObject, in_scope: &Generics) -> bool {
         let ty = Type::TraitObject(object.clone());
         let place = self.place();
-        let result = Self::alone(&mut *self.rule, in_scope, place, |visitor| {
+        let result = Self::throwaway(&mut *self.rule, in_scope, place, |visitor| {
             visitor.found(&ty)
         });
         // The Referrer may replace an external trait object, with the reference holding it.
@@ -3936,7 +4090,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         let tracked = !output.is_empty();
         if tracked {
             self.binders.push(Binder {
-                owner: self.type_depth,
+                owner: self.position.type_depth,
                 output,
             });
         }
@@ -3955,7 +4109,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         uses: &[OutputUse],
         f: &impl Fn(&mut Self),
     ) -> Vec<Lifetime> {
-        let probing = self.probe.is_some();
+        let probing = self.position.binder_probe.is_some();
         // An anchor with no type in the way (an argument of the bound itself) cannot be lost.
         let to_check = uses
             .iter()
@@ -3987,17 +4141,20 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
     ) -> HashSet<usize> {
         let frame = self.new_frame();
         let (musts, impossibles) = (self.musts.len(), self.impossibles.len());
-        let self_errors = self.self_errors.len();
-        let (env_errors, not_optional) = (self.env_errors.len(), self.not_optional.len());
-        self.probe = Some(HashSet::new());
+        let self_errors = self.records.self_errors.len();
+        let (env_errors, not_optional) = (
+            self.records.env_errors.len(),
+            self.records.not_optional.len(),
+        );
+        self.position.binder_probe = Some(HashSet::new());
         self.with_scope(Scope::binder(lifetimes), |v| f(v));
         self.frame = frame;
         self.musts.truncate(musts);
         self.truncate_impossibles(impossibles);
-        self.self_errors.truncate(self_errors);
-        self.env_errors.truncate(env_errors);
-        self.not_optional.truncate(not_optional);
-        self.probe.take().unwrap_or_default()
+        self.records.self_errors.truncate(self_errors);
+        self.records.env_errors.truncate(env_errors);
+        self.records.not_optional.truncate(not_optional);
+        self.position.binder_probe.take().unwrap_or_default()
     }
 
     fn binder_uses(&self, groups: Vec<BinderGroup>) -> Vec<OutputUse> {
@@ -4012,7 +4169,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                     stopped: Vec::new(),
                     entered: Vec::new(),
                 };
-                if self.probe.is_none() {
+                if self.position.binder_probe.is_none() {
                     for input in &group.inputs {
                         match input {
                             BinderInput::Type(ty) => scan_anchors(self, ty, &mut used),
@@ -4052,7 +4209,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
 
     fn names_external_crate_in_expr(&self, expr: &Expr) -> bool {
         let mut finder = AnyPath::new(false, |path| {
-            self.is_soft_path(&Cause::Unknown(path.clone()))
+            self.is_optional_path(&Cause::Unknown(path.clone()))
         });
         finder.visit_expr(expr);
         finder.found
@@ -4060,7 +4217,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
 
     fn names_external_crate(&self, object: &TypeTraitObject) -> bool {
         object.bounds.iter().any(|bound| {
-            matches!(bound, TypeParamBound::Trait(bound) if self.is_soft_path(&Cause::Trait(bound.path.clone())))
+            matches!(bound, TypeParamBound::Trait(bound) if self.is_optional_path(&Cause::Trait(bound.path.clone())))
         })
     }
 }
@@ -4089,9 +4246,9 @@ fn needs_environment(predicate: &WherePredicate, context: &Context) -> bool {
     };
     match head {
         Some(head) if head == "Self" => {
-            matches!(context.self_ty(), Some(SelfRequirement::Bound(_)))
+            matches!(context.self_ty, Some(SelfRequirement::Bound(_)))
         }
-        Some(head) => context.generics().params.iter().any(
+        Some(head) => context.generics.params.iter().any(
             |param| matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == head),
         ),
         None => false,
@@ -4101,14 +4258,12 @@ fn needs_environment(predicate: &WherePredicate, context: &Context) -> bool {
 /// Returns the first mention of `Self` in a bound of a generic of `context`, or in a where
 /// predicate that the environment must prove (see [`needs_environment()`]).
 fn self_in_environment_bounds(context: &Context) -> Option<Cause> {
-    let generics = context.generics();
+    let generics = &context.generics;
     for param in &generics.params {
         if let GenericParam::Type(param) = param {
             // The default is no bound.
-            let mut bounds = param.clone();
-            bounds.eq_token = None;
-            bounds.default = None;
-            if let Some(first) = self_in_param(&GenericParam::Type(bounds)).first {
+            let bounds = without_default(GenericParam::Type(param.clone()));
+            if let Some(first) = self_in_param(&bounds).first {
                 return Some(first);
             }
         }
@@ -4124,24 +4279,12 @@ fn self_in_environment_bounds(context: &Context) -> Option<Cause> {
 /// Returns the types, with their contexts, that are optional entries in `effects`.
 fn optional_keys(effects: &[Effect]) -> Vec<(Context, String)> {
     let mut keys = Vec::new();
-    for effect in effects {
-        if let Effect::Type(pending) = effect {
-            if pending.optional {
-                let ty = &pending.ty;
-                keys.push((pending.context.clone(), quote!(#ty).to_string()));
-            }
-            keys.extend(optional_keys(&pending.components));
+    each_pending(effects, &mut |pending| {
+        if pending.optional {
+            keys.push(pending.optional_key());
         }
-    }
+    });
     keys
-}
-
-/// Returns `true` if `ty` is `Self`.
-fn is_bare_self(ty: &Type) -> bool {
-    matches!(
-        unwrap_type_group(ty),
-        Type::Path(TypePath { qself: None, path }) if path.is_ident("Self")
-    )
 }
 
 /// Returns `true` if `ty` is `Self::A` or `<Self as Tr>::A`: an associated type of `Self`.
@@ -4182,13 +4325,13 @@ impl<A: Allow> Anchoring for AnalyzeVisitor<'_, A> {
         path.segments.len() > 1 && self.heads_own_name(path)
     }
 
-    fn is_soft_type(&self, ty: &Type) -> bool {
+    fn is_optional_type(&self, ty: &Type) -> bool {
         match ty {
             Type::Reference(reference) => self.is_external_object(&reference.elem),
             Type::Array(array) => self.names_external_crate_in_expr(&array.len),
             Type::Path(TypePath { qself: None, path }) => {
                 !self.is_projection(path)
-                    && (self.is_soft_path(&Cause::type_path(path))
+                    && (self.is_optional_path(&Cause::type_path(path))
                         || self.holds_external_object(path))
             }
             Type::TraitObject(object) => self.names_external_crate(object),
@@ -4207,12 +4350,12 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
     /// after it (see [`Checkpoint`]), also if it panics, which goes on.
     pub(crate) fn check(&mut self, ty: &Type) -> CheckResult {
         let checkpoint = self.checkpoint();
-        let selves = self.self_errors.len();
+        let selves = self.records.self_errors.len();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let mut result = self.found(ty);
             // `Self` without meaning fails the scope, which a check does not: it is told as a cause
             // that cannot be leaked.
-            let without_meaning = &self.self_errors[selves..];
+            let without_meaning = &self.records.self_errors[selves..];
             if !without_meaning.is_empty() {
                 result
                     .impossible
@@ -4254,7 +4397,7 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
     /// syntax that a mention of `Self` that has no meaning, or a relative path that is leaked, is
     /// reported at.
     fn visit_path_of(&mut self, i: &Path, asked: &Cause, written: &Cause) {
-        let in_type = self.type_depth > 0;
+        let in_type = self.position.type_depth > 0;
         let starts_with_generic = self.starts_with_generic(i);
         let free = self.is_free_path(asked);
         let in_module = !starts_with_generic && !free && self.is_module_path(i);
@@ -4265,7 +4408,7 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
                     self.mention(scope);
                 }
             }
-            if self_segment(i).is_some() {
+            if self_head(i).is_some() {
                 self.frame.mentions_self = true;
                 self.check_self_has_meaning(written.clone());
             }
@@ -4286,11 +4429,11 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
                 self.frame.effects.push(Effect::Primitive(ident.clone()));
             }
             // An external crate path is resolved by name, which the Referrer may not share.
-            if in_type && self.is_soft_path(asked) {
-                self.frame.soft_depth = self.frame.soft_depth.min(self.type_depth);
+            if in_type && self.is_optional_path(asked) {
+                self.frame.optional_depth = self.frame.optional_depth.min(self.position.type_depth);
             }
         } else if in_type && !starts_with_generic && !in_module {
-            let is_self = matches!(self_segment(i), Some(seg) if seg.arguments.is_none());
+            let is_self = plain_self_head(i).is_some();
             if !is_self {
                 self.push_must(written.clone(), Some(asked.bare()));
                 self.frame.relative |= self.is_relative(asked);
@@ -4315,21 +4458,25 @@ impl<A: Allow> AnalyzeVisitor<'_, A> {
 impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
     fn visit_type_param(&mut self, i: &TypeParam) {
         if i.default.is_some() && self.is_alone_default(&i.ident) {
-            let mut i = i.clone();
-            i.eq_token = None;
-            i.default = None;
+            let i = TypeParam {
+                eq_token: None,
+                default: None,
+                ..i.clone()
+            };
             return syn::visit::visit_type_param(self, &i);
         }
         match &i.default {
             // The default of a nested struct, enum or union is visited with its `Self`.
-            Some(default) if self.self_nested => {
-                let mut without = i.clone();
-                without.eq_token = None;
-                without.default = None;
+            Some(default) if self.self_scope.nested => {
+                let without = TypeParam {
+                    eq_token: None,
+                    default: None,
+                    ..i.clone()
+                };
                 syn::visit::visit_type_param(self, &without);
-                let outer = std::mem::replace(&mut self.in_nested_default, true);
+                let outer = std::mem::replace(&mut self.position.in_nested_default, true);
                 self.visit_type(default);
-                self.in_nested_default = outer;
+                self.position.in_nested_default = outer;
             }
             // As `syn::visit::visit_type_param()`, with the default marked as one.
             Some(default) => {
@@ -4340,9 +4487,9 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
                 for bound in &i.bounds {
                     self.visit_type_param_bound(bound);
                 }
-                let outer = std::mem::replace(&mut self.in_param_default, true);
+                let outer = std::mem::replace(&mut self.position.in_param_default, true);
                 self.visit_type(default);
-                self.in_param_default = outer;
+                self.position.in_param_default = outer;
             }
             None => syn::visit::visit_type_param(self, i),
         }
@@ -4382,18 +4529,22 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
     }
 
     fn visit_fn_arg(&mut self, i: &FnArg) {
-        let elision = self.signature.as_ref().map(|e| e.for_input(input_type(i)));
+        let elision = self
+            .position
+            .signature
+            .as_ref()
+            .map(|e| e.for_input(input_type(i)));
         self.elisions.push(elision);
-        let outer = std::mem::replace(&mut self.in_fn_arg, true);
+        let outer = std::mem::replace(&mut self.position.in_fn_arg, true);
         syn::visit::visit_fn_arg(self, i);
-        self.in_fn_arg = outer;
+        self.position.in_fn_arg = outer;
         self.elisions.pop();
     }
 
     fn visit_receiver(&mut self, i: &Receiver) {
-        let outer = std::mem::replace(&mut self.in_receiver, true);
+        let outer = std::mem::replace(&mut self.position.in_receiver, true);
         syn::visit::visit_receiver(self, i);
-        self.in_receiver = outer;
+        self.position.in_receiver = outer;
     }
 
     fn visit_trait_item_const(&mut self, i: &TraitItemConst) {
@@ -4444,21 +4595,21 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
 
     fn visit_item_struct(&mut self, i: &ItemStruct) {
         let self_ty = SelfRequirement::of_item(&i.ident, &i.generics);
-        self.with_item(&i.generics, Some(self_ty), false, |visitor| {
+        self.with_item_of(&i.generics, Some(self_ty), false, Vec::new(), |visitor| {
             syn::visit::visit_item_struct(visitor, i)
         });
     }
 
     fn visit_item_enum(&mut self, i: &ItemEnum) {
         let self_ty = SelfRequirement::of_item(&i.ident, &i.generics);
-        self.with_item(&i.generics, Some(self_ty), false, |visitor| {
+        self.with_item_of(&i.generics, Some(self_ty), false, Vec::new(), |visitor| {
             syn::visit::visit_item_enum(visitor, i)
         });
     }
 
     fn visit_item_union(&mut self, i: &ItemUnion) {
         let self_ty = SelfRequirement::of_item(&i.ident, &i.generics);
-        self.with_item(&i.generics, Some(self_ty), false, |visitor| {
+        self.with_item_of(&i.generics, Some(self_ty), false, Vec::new(), |visitor| {
             syn::visit::visit_item_union(visitor, i)
         });
     }
@@ -4489,7 +4640,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
     }
 
     fn visit_item_type(&mut self, i: &ItemType) {
-        self.with_item_generics(&i.generics, |visitor| {
+        self.with_item_generics_of(&i.generics, Vec::new(), |visitor| {
             syn::visit::visit_item_type(visitor, i)
         });
     }
@@ -4504,14 +4655,14 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
 
     fn visit_item_mod(&mut self, i: &ItemMod) {
         // A module has no generics and no `Self`; its items are nested items with local generics.
-        self.with_item(&Generics::default(), None, false, |visitor| {
+        self.with_item_of(&Generics::default(), None, false, Vec::new(), |visitor| {
             visitor.with_module(i, |visitor| syn::visit::visit_item_mod(visitor, i))
         });
     }
 
     fn visit_item_impl(&mut self, i: &ItemImpl) {
         let self_ty = SelfRequirement::Type((*i.self_ty).clone());
-        self.with_item(&i.generics, Some(self_ty), true, |visitor| {
+        self.with_item_of(&i.generics, Some(self_ty), true, Vec::new(), |visitor| {
             // The trait is checked like a trait bound, but its arguments are analyzed in any case.
             if let Some((_, path, _)) = &i.trait_ {
                 visitor.check_bound_path(path, Cause::Trait(path.clone()));
@@ -4521,21 +4672,23 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
     }
 
     fn visit_item_trait_alias(&mut self, i: &ItemTraitAlias) {
-        self.with_item_generics(&i.generics, |visitor| {
+        self.with_item_generics_of(&i.generics, Vec::new(), |visitor| {
             syn::visit::visit_item_trait_alias(visitor, i)
         });
     }
 
     fn visit_type(&mut self, i: &Type) {
         let outer = self.new_frame();
-        let elided_ref = std::mem::take(&mut self.elided_ref);
-        let unconstrained = self.unconstrained_ref.take();
-        let ambiguous = std::mem::take(&mut self.ambiguous_arg);
-        let inherits = self.inherits.take();
-        self.type_depth += 1;
-        self.impossibles.at = self.type_depth;
-        let enclosing = self.enclosing.clone();
-        self.enclosing = enclosing.components_of(i, self.scopes.len());
+        let ArgHints {
+            elided_ref,
+            unconstrained_ref: unconstrained,
+            ambiguous_arg: ambiguous,
+            inherits,
+        } = std::mem::take(&mut self.position.hints);
+        self.position.type_depth += 1;
+        self.impossibles.at = self.position.type_depth;
+        let enclosing = self.position.enclosing.clone();
+        self.position.enclosing = enclosing.components_of(i, self.scopes.len());
         match i {
             Type::Macro(m) => {
                 // A type macro cannot be analyzed: it is leaked whole.
@@ -4561,16 +4714,20 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
                 }
             }
             Type::Paren(_) | Type::Group(_) => {
-                self.elided_ref = elided_ref;
-                self.unconstrained_ref = unconstrained;
-                self.inherits = inherits;
                 // `W<(N)>` is unambiguously a type, unlike `W<N>` (also in an invisible group).
-                self.ambiguous_arg = ambiguous && matches!(i, Type::Group(_));
+                self.position.hints = ArgHints {
+                    elided_ref,
+                    unconstrained_ref: unconstrained,
+                    ambiguous_arg: ambiguous && matches!(i, Type::Group(_)),
+                    inherits,
+                };
                 syn::visit::visit_type(self, i)
             }
             Type::Reference(reference) => {
                 match &reference.lifetime {
-                    Some(lifetime) if lifetime.ident == "_" => self.elided_ref = true,
+                    Some(lifetime) if lifetime.ident == "_" => {
+                        self.position.hints.elided_ref = true
+                    }
                     Some(lifetime) if lifetime.ident == "static" => (),
                     Some(lifetime) => {
                         let local = self
@@ -4581,14 +4738,17 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
                         match local {
                             Some(_) if bounded => {}
                             Some(scope) if self.is_unconstrained(lifetime, scope) => {
-                                self.unconstrained_ref = Some(lifetime.clone())
+                                self.position.hints.unconstrained_ref = Some(lifetime.clone())
                             }
-                            _ => self.inherits = Some(Inherits::Reference(self.type_depth)),
+                            _ => {
+                                self.position.hints.inherits =
+                                    Some(Inherits::Reference(self.position.type_depth))
+                            }
                         }
                     }
                     None => {
                         self.push_elided(Cause::Type(i.clone()));
-                        self.elided_ref = true;
+                        self.position.hints.elided_ref = true;
                     }
                 }
                 syn::visit::visit_type(self, i)
@@ -4616,14 +4776,15 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
                 // `x: impl Tr<Wrap<T>>` is `x: X` with `X: Tr<Wrap<T>>`: the bounds of the
                 // `impl Trait` of an argument are predicates of the item, as those of a generic
                 // are. Not those of a return type, which rustc proves where the body is.
-                let in_env = usize::from(self.in_fn_arg && matches!(i, Type::ImplTrait(_)));
-                self.env_depth += in_env;
+                let in_env =
+                    usize::from(self.position.in_fn_arg && matches!(i, Type::ImplTrait(_)));
+                self.position.env_depth += in_env;
                 syn::visit::visit_type(self, i);
-                self.env_depth -= in_env;
+                self.position.env_depth -= in_env;
             }
             _ => syn::visit::visit_type(self, i),
         }
-        self.enclosing = enclosing;
+        self.position.enclosing = enclosing;
         let mut inner = std::mem::replace(&mut self.frame, outer);
         // Also parentheses and groups. A written bound inherits nothing; the reference carries it.
         let inherits = inherits.filter(|inherits| {
@@ -4631,33 +4792,35 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
                 && matches!(unwrap_type_group(i), Type::TraitObject(object)
                     if matches!(inherits, Inherits::Reference(_)) || !has_lifetime_bound(object))
         });
-        match (self.expr_owner, inherits) {
+        match (self.position.expr_owner, inherits) {
             (Some(owner), _) => self.decide_as_owner(owner, inner),
             // Not leaked alone, but its parts can be, unless the trait object must be: then the
             // reference or path is.
             (None, Some(inherits)) => {
                 let owner = inherits.owner();
-                let own = inner.min_depth == self.type_depth
+                let own = inner.min_depth == self.position.type_depth
                     || inner.min_depth == owner
-                    || self.is_ambiguous_owner(i, self.type_depth, &inner);
+                    || self.is_ambiguous_owner(i, self.position.type_depth, &inner);
                 if own {
                     self.decide_as_owner(owner, inner)
                 } else {
-                    if inner.soft_depth == self.type_depth || inner.soft_depth == owner {
-                        inner.soft_depth = owner;
+                    if inner.optional_depth == self.position.type_depth
+                        || inner.optional_depth == owner
+                    {
+                        inner.optional_depth = owner;
                     }
                     self.decide_through(inner)
                 }
             }
-            (None, None) => self.decide(i, self.type_depth, ambiguous, inner),
+            (None, None) => self.decide(i, self.position.type_depth, ambiguous, inner),
         }
-        self.type_depth -= 1;
-        self.impossibles.at = self.type_depth;
+        self.position.type_depth -= 1;
+        self.impossibles.at = self.position.type_depth;
     }
 
     fn visit_type_bare_fn(&mut self, i: &TypeBareFn) {
         let elision = Elision::of(
-            self.type_depth,
+            self.position.type_depth,
             true,
             i.inputs.iter().map(|arg| &arg.ty),
             &i.output,
@@ -4700,7 +4863,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
     }
 
     fn visit_parenthesized_generic_arguments(&mut self, i: &ParenthesizedGenericArguments) {
-        let elision = Elision::of(self.type_depth, true, &i.inputs, &i.output);
+        let elision = Elision::of(self.position.type_depth, true, &i.inputs, &i.output);
         self.with_bound_elided(|visitor| {
             for input in &i.inputs {
                 let elision = elision.as_ref().map(|e| e.for_input(input));
@@ -4727,10 +4890,10 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
 
     fn visit_type_param_bound(&mut self, i: &TypeParamBound) {
         // A bound that is not in a type is a predicate of the item (`env_depth`).
-        let in_env = usize::from(self.type_depth == 0);
-        self.env_depth += in_env;
+        let in_env = usize::from(self.position.type_depth == 0);
+        self.position.env_depth += in_env;
         syn::visit::visit_type_param_bound(self, i);
-        self.env_depth -= in_env;
+        self.position.env_depth -= in_env;
     }
 
     fn visit_predicate_type(&mut self, i: &PredicateType) {
@@ -4747,11 +4910,11 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
                 _ => None,
             })
             .collect();
-        self.env_depth += 1;
+        self.position.env_depth += 1;
         self.with_bound_lifetimes(i.lifetimes.as_ref(), groups, |v| {
             syn::visit::visit_predicate_type(v, i)
         });
-        self.env_depth -= 1;
+        self.position.env_depth -= 1;
     }
 
     fn visit_trait_bound(&mut self, i: &TraitBound) {
@@ -4769,7 +4932,8 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
         // leaked type, which rustc cannot normalize where an unprovable predicate is accepted (see
         // `env_cycle()`). The conflicts in them are errors of their own.
         let start = self.frame.effects.len();
-        let relative = self.type_depth == 0 && self.check_bound_path(&i.path, bound_cause(i));
+        let relative =
+            self.position.type_depth == 0 && self.check_bound_path(&i.path, bound_cause(i));
         let group = bound_group(i.lifetimes.as_ref(), i, None);
         self.with_bound_lifetimes(i.lifetimes.as_ref(), vec![group], |v| {
             // As `syn::visit::visit_trait_bound()`, with the path told to be that of a trait.
@@ -4830,9 +4994,9 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
             }
         }
         if let Some(expr) = &i.default {
-            let outer = std::mem::replace(&mut self.in_param_default, true);
+            let outer = std::mem::replace(&mut self.position.in_param_default, true);
             self.read_expr(format!("the default of `{}`", i.ident), expr);
-            self.in_param_default = outer;
+            self.position.in_param_default = outer;
         }
     }
 
@@ -4862,8 +5026,8 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
         // `Self::A` where `Self` is a type: a type that names it is not leaked whole.
         if i.qself.is_none()
             && i.path.segments.len() > 1
-            && self_segment(&i.path).is_some()
-            && matches!(self.self_ty, Some(SelfRequirement::Type(_)))
+            && self_head(&i.path).is_some()
+            && matches!(self.self_scope.ty, Some(SelfRequirement::Type(_)))
         {
             let cause = Cause::type_path(&i.path);
             self.impossibles.push(cause.clone());
@@ -4894,14 +5058,15 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
 
     fn visit_qself(&mut self, i: &QSelf) {
         // `<T>::Ty` cannot be leaked, unless `T` is a generic parameter (or `Self`).
-        if self.type_depth > 0 && i.as_token.is_none() && !self.resolves_through_bounds(i) {
+        if self.position.type_depth > 0 && i.as_token.is_none() && !self.resolves_through_bounds(i)
+        {
             self.impossibles.push(Cause::Type((*i.ty).clone()));
         }
         syn::visit::visit_qself(self, i)
     }
 
     fn visit_lifetime(&mut self, i: &Lifetime) {
-        if self.type_depth == 0 {
+        if self.position.type_depth == 0 {
             return;
         }
         if i.ident == "_" {
@@ -4914,19 +5079,19 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
     }
 
     fn visit_expr(&mut self, i: &Expr) {
-        if self.type_depth > 0 {
+        if self.position.type_depth > 0 {
             if let Expr::Closure(_) | Expr::Assign(_) | Expr::Verbatim(_) | Expr::Macro(_) = i {
                 self.impossibles.push(Cause::Expr(i.clone()));
             }
         }
-        let outer = self.expr_owner;
-        if self.type_depth > 0 && outer.is_none() {
-            self.expr_owner = Some(self.type_depth);
+        let outer = self.position.expr_owner;
+        if self.position.type_depth > 0 && outer.is_none() {
+            self.position.expr_owner = Some(self.position.type_depth);
         }
-        let enclosing = std::mem::take(&mut self.enclosing);
+        let enclosing = std::mem::take(&mut self.position.enclosing);
         syn::visit::visit_expr(self, i);
-        self.enclosing = enclosing;
-        self.expr_owner = outer;
+        self.position.enclosing = enclosing;
+        self.position.expr_owner = outer;
     }
 
     fn visit_angle_bracketed_generic_arguments(&mut self, i: &AngleBracketedGenericArguments) {
@@ -4961,17 +5126,18 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
             }
         }
         // The path is leaked whole, which needs a type (not a trait bound).
-        let elided = elided || (inherited && self.type_depth == 0);
+        let elided = elided || (inherited && self.position.type_depth == 0);
         for arg in &i.args {
             if let GenericArgument::Type(ty) = arg {
-                self.elided_ref = elided;
-                self.unconstrained_ref = unconstrained_lifetime.clone().filter(|_| !elided);
+                self.position.hints.elided_ref = elided;
+                self.position.hints.unconstrained_ref =
+                    unconstrained_lifetime.clone().filter(|_| !elided);
                 if inherited && !elided && unconstrained_lifetime.is_none() {
-                    self.inherits = Some(Inherits::Path(self.type_depth));
+                    self.position.hints.inherits = Some(Inherits::Path(self.position.type_depth));
                 }
                 // syn parses a bare identifier that may be a const as a type (see `ambiguous_arg`).
-                self.ambiguous_arg = is_bare_ident(ty);
-                if self.ambiguous_arg {
+                self.position.hints.ambiguous_arg = is_bare_ident(ty);
+                if self.position.hints.ambiguous_arg {
                     self.frame
                         .bare_args
                         .push(quote!(#{unwrap_type_group(ty)}).to_string());
@@ -4983,12 +5149,11 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
 
     fn visit_expr_path(&mut self, i: &ExprPath) {
         let causes = expr_causes(i);
-        if self.type_depth > 0 {
+        if self.position.type_depth > 0 {
             return self.walk_expr_path(i, &causes);
         }
         // Values starting with a generic in scope or `Self` do not depend on the context.
-        let is_self = i.qself.is_none()
-            && matches!(self_segment(&i.path), Some(seg) if seg.arguments.is_none());
+        let is_self = i.qself.is_none() && plain_self_head(&i.path).is_some();
         if is_self {
             self.check_self_has_meaning(Cause::path_expr(i));
         }
@@ -5071,7 +5236,7 @@ pub(crate) trait Anchoring {
     /// Returns `true` if the Referrer may replace `ty` as an optional entry, so a careful scan
     /// finds no anchor in it (a path of an external crate, an external trait object, an array
     /// whose length names a crate, or a reference to such an object).
-    fn is_soft_type(&self, ty: &Type) -> bool;
+    fn is_optional_type(&self, ty: &Type) -> bool;
 }
 
 /// Scans the inputs of a signature for the occurrences of `lifetime` (see [`scan_anchors()`]).
@@ -5110,7 +5275,7 @@ fn scan_inputs<'a>(
 /// lifetimes](crate::Leaker#binder-lifetimes).
 fn scan_anchors(scope: &impl Anchoring, ty: &Type, used: &mut OutputUse) {
     let address = ty as *const Type as usize;
-    if used.careful && !used.entered.contains(&address) && scope.is_soft_type(ty) {
+    if used.careful && !used.entered.contains(&address) && scope.is_optional_type(ty) {
         used.stopped.push(address);
         return;
     }
@@ -5226,9 +5391,13 @@ fn kept_lifetimes(
     }
 }
 
+/// Looks for a path that `pred` accepts.
 struct AnyPath<F> {
+    /// Which paths count.
     pred: F,
+    /// Any macro counts, whatever its tokens.
     macros: bool,
+    /// A path counted, or a macro did.
     found: bool,
 }
 
@@ -5284,6 +5453,7 @@ impl<'ast> Visit<'ast> for Lifetimes {
 /// The trait that an impl implements, as written.
 #[derive(Clone)]
 struct ImplTrait {
+    /// The path as written.
     path: Path,
     /// The path does not depend on the context (see [`AnalyzeVisitor::is_context_free()`]), so the
     /// copy can name the trait with it.
@@ -5309,19 +5479,12 @@ impl AssocSelf {
     /// relative paths of `ty`.
     fn of(self, ty: &Type, paths: Vec<Cause>) -> CheckResult {
         let mut conflict = CheckResult {
-            must: vec![Cause::Type(ty.clone())],
-            impossible: vec![self.cause.clone()],
-            is_own: true,
-            optional: false,
-            note: None,
-            help: None,
-            headline: None,
-            cause: None,
-            reason: Reason::SelfProjection,
-            seen: 0,
-            part: None,
-            place: Place::default(),
             paths,
+            ..CheckResult::conflict(
+                vec![Cause::Type(ty.clone())],
+                vec![self.cause.clone()],
+                Reason::SelfProjection,
+            )
         };
         self.give(&mut conflict, ty, true);
         conflict
@@ -5442,24 +5605,20 @@ fn block_optional(
     origins: &HashSet<usize>,
     found: &mut Vec<(Context, String)>,
 ) {
-    for effect in effects {
-        if let Effect::Type(pending) = effect {
-            if pending.optional && origins.contains(&pending.origin) {
-                let ty = &pending.ty;
-                found.push((pending.context.clone(), quote!(#ty).to_string()));
-                pending.optional = false;
-            }
-            block_optional(&mut pending.components, origins, found);
+    each_pending_mut(effects, &mut |pending| {
+        if pending.optional && origins.contains(&pending.origin) {
+            found.push(pending.optional_key());
+            pending.optional = false;
         }
-    }
+    });
 }
 
 /// Cuts the entries of the self type of an impl for which `conflict` returns the conflict (see
 /// [`AnalyzeVisitor::cut_self_cycles()`]). A type that must be an entry is an error, and so is a
 /// reference with a lifetime that has a part that must be one, as its parts cannot stand for it
 /// (`is_whole_reference()`). Another type cannot be an entry, and an optional one is not (the
-/// optional entries are added to `not_optional`). The error comes first: a type that must be an
-/// entry is copied as written but for the types in it, and a reference is copied whole.
+/// optional entries are added to `Records::not_optional`). The error comes first: a type that must
+/// be an entry is copied as written but for the types in it, and a reference is copied whole.
 fn cut_conflicts(
     effects: Vec<Effect>,
     conflict: &dyn Fn(&PendingType) -> Option<CheckResult>,
@@ -5478,7 +5637,7 @@ fn cut_conflicts(
         };
         if let Some(mut error) = conflict(&pending) {
             let whole = is_whole_reference(&pending.ty);
-            if pending.in_graph && (pending.is_must_intern || whole) {
+            if pending.required_candidate && (pending.required || whole) {
                 // The type is copied as written instead.
                 let part = pending.part();
                 let whole = part.whole;
@@ -5499,9 +5658,9 @@ fn cut_conflicts(
                 found.extend(inner);
                 continue;
             }
-            pending.no_entry |= pending.in_graph;
-            pending.no_optional_entry |= pending.has_optional;
-            if pending.has_optional && whole {
+            pending.no_required_entry |= pending.required_candidate;
+            pending.no_optional_entry |= pending.optional_candidate;
+            if pending.optional_candidate && whole {
                 // The optional entries under a reference cannot stand for it either.
                 not_optional.extend(optional_keys(&pending.components));
             }
@@ -5540,14 +5699,15 @@ fn entry_contexts(
             Effect::Type(pending) => pending,
             _ => continue,
         };
-        if pending.is_must_intern || (pending.in_graph && is_whole_reference(&pending.ty)) {
+        if pending.required || (pending.required_candidate && is_whole_reference(&pending.ty)) {
             push(&pending.context);
             continue;
         }
         let cut = declared.map_or(false, |declared| {
             self_type_conflict(pending, declared).is_some()
         });
-        let entry = pending.in_graph && !pending.no_entry && !blocked(&pending.context);
+        let entry =
+            pending.required_candidate && !pending.no_required_entry && !blocked(&pending.context);
         let optional_entry = optional && pending.optional && !pending.no_optional_entry;
         if (entry || optional_entry) && !cut {
             push(&pending.context);
@@ -5571,7 +5731,7 @@ fn declared_self_mention(declared: &Generics, context: &Context) -> Option<Cause
         .map(|predicate| quote!(#predicate).to_string())
         .collect();
     let predicates: Vec<WherePredicate> = context
-        .generics()
+        .generics
         .where_clause
         .iter()
         .flat_map(|where_clause| where_clause.predicates.iter())
@@ -5580,7 +5740,7 @@ fn declared_self_mention(declared: &Generics, context: &Context) -> Option<Cause
         .collect();
     let own = Generics {
         params: context
-            .generics()
+            .generics
             .params
             .iter()
             .filter(|param| names.contains(&generic_param_name(param)))
@@ -5594,7 +5754,7 @@ fn declared_self_mention(declared: &Generics, context: &Context) -> Option<Cause
     };
     first_self_in_generics(&own).or_else(|| {
         // A written `Self: 'a` moved to `self_outlives`, which is encoded as `&'a Self`.
-        if context.self_outlives().is_empty() {
+        if context.self_outlives.is_empty() {
             return None;
         }
         first_self_in_generics(&Generics {
@@ -5609,7 +5769,7 @@ fn declared_self_mention(declared: &Generics, context: &Context) -> Option<Cause
 fn self_type_conflict(pending: &PendingType, declared: &Generics) -> Option<CheckResult> {
     let ty = &pending.ty;
     let context = &pending.context;
-    let self_ty = match context.self_ty() {
+    let self_ty = match &context.self_ty {
         Some(SelfRequirement::Type(self_ty)) => self_ty,
         _ => return None,
     };
@@ -5631,10 +5791,6 @@ fn self_type_conflict(pending: &PendingType, declared: &Generics) -> Option<Chec
         tidy(&cause.shown())
     );
     Some(CheckResult {
-        must: vec![Cause::Type(ty.clone())],
-        impossible: vec![cause],
-        is_own: true,
-        optional: false,
         note: Some(format!(
             "{}. The copy writes `{}` as a path through the Repeater, whose impl is for `Self`, \
              so the Referrer has no type to write for `Self`: it is the one being replaced",
@@ -5645,12 +5801,12 @@ fn self_type_conflict(pending: &PendingType, declared: &Generics) -> Option<Chec
             "`{}` is in the self type of the impl, and a bound of its generics names `Self`",
             shown
         )),
-        cause: None,
-        reason: Reason::SelfInImplSelfType,
-        seen: 0,
-        part: None,
-        place: Place::default(),
         paths: pending.paths.clone(),
+        ..CheckResult::conflict(
+            vec![Cause::Type(ty.clone())],
+            vec![cause],
+            Reason::SelfInImplSelfType,
+        )
     })
 }
 
@@ -5932,9 +6088,13 @@ fn bound_group<'a>(
     BinderGroup { output, inputs }
 }
 
+/// The lifetimes of a binder that an output names.
 struct OutputLifetimes {
+    /// The lifetimes that the binder declares.
     declared: Vec<Lifetime>,
+    /// The lifetimes that a binder inside declares again, where the walk is.
     shadowed: Vec<Lifetime>,
+    /// The declared lifetimes that the output names, in order.
     found: Vec<Lifetime>,
 }
 
@@ -6029,19 +6189,11 @@ fn is_relaxed_sized(bound: &TraitBound) -> bool {
             if seg.ident == "Sized" && seg.arguments.is_none())
 }
 
-fn self_segment(path: &Path) -> Option<&PathSegment> {
-    path.segments
-        .first()
-        .filter(|seg| path.leading_colon.is_none() && seg.ident == "Self")
-}
-
 /// Returns `true` if `ty` is `Self` or `Self::A`, written as a path: not `<Self as Tr>::A`, whose
 /// `Self` is a type of its own.
 fn is_self_path(ty: &Type) -> bool {
     match ty {
-        Type::Path(TypePath { qself: None, path }) => {
-            matches!(self_segment(path), Some(seg) if seg.arguments.is_none())
-        }
+        Type::Path(TypePath { qself: None, path }) => plain_self_head(path).is_some(),
         _ => false,
     }
 }
@@ -6056,18 +6208,23 @@ fn is_bare_ident(ty: &Type) -> bool {
     }
 }
 
+/// The names that a module declares, and those of the modules inside it.
 #[derive(Clone, Default)]
 pub(crate) struct ModuleNames {
+    /// The names that the module declares.
     names: HashSet<String>,
+    /// The modules inside it, by name.
     modules: HashMap<String, ModuleNames>,
 }
 
 /// Returns the names declared directly in `items`: items, `macro_rules!` macros, and names imported
 /// by `use` with an absolute path. Other imports (`use super::X`) are outside the module.
-pub(crate) fn declared_names(items: &[Item]) -> ModuleNames {
-    fn use_names(tree: &UseTree, last: Option<&Ident>, names: &mut HashSet<String>) {
+pub(crate) fn module_names(items: &[Item]) -> ModuleNames {
+    fn module_use_names(tree: &UseTree, last: Option<&Ident>, names: &mut HashSet<String>) {
         match tree {
-            UseTree::Path(UsePath { ident, tree, .. }) => use_names(tree, Some(ident), names),
+            UseTree::Path(UsePath { ident, tree, .. }) => {
+                module_use_names(tree, Some(ident), names)
+            }
             UseTree::Name(UseName { ident }) if ident == "self" => {
                 names.extend(last.map(ident_name));
             }
@@ -6079,7 +6236,7 @@ pub(crate) fn declared_names(items: &[Item]) -> ModuleNames {
             }
             UseTree::Group(UseGroup { items, .. }) => {
                 for tree in items {
-                    use_names(tree, last, names)
+                    module_use_names(tree, last, names)
                 }
             }
             _ => (),
@@ -6097,7 +6254,7 @@ pub(crate) fn declared_names(items: &[Item]) -> ModuleNames {
                 names.insert(ident_name(ident));
                 module
                     .modules
-                    .insert(ident_name(ident), declared_names(items));
+                    .insert(ident_name(ident), module_names(items));
             }
             Item::Struct(ItemStruct { ident, .. })
             | Item::Enum(ItemEnum { ident, .. })
@@ -6125,11 +6282,1049 @@ pub(crate) fn declared_names(items: &[Item]) -> ModuleNames {
                 let is_absolute = leading_colon.is_some()
                     || matches!(tree, UseTree::Path(UsePath { ident, .. }) if ident == "$crate");
                 if is_absolute {
-                    use_names(tree, None, names);
+                    module_use_names(tree, None, names);
                 }
             }
             _ => (),
         }
     }
     module
+}
+
+// The check of the values of an item, for
+// [`Leaker::check_values`](crate::Leaker::check_values): the default of an associated const, the
+// value of a const or a static, and the body of a function.
+// An enum discriminant and the default of a const parameter are read the same way, whether
+// values are read or not.
+//
+// The copy writes a value as it is, since an expression cannot go through the Repeater. So the
+// check rejects every path of the value that depends on where it is written, with the error of a
+// relative path. It must not reject what is not relative, so it follows the scopes of a body: a
+// `let` binding, the parameter of a function or a closure, the names of a pattern, and the items
+// and `use` declarations of a block are local, and so are the generics and `Self` in scope.
+//
+// A type is not an expression: the Referrer's visitor rewrites it where it stands, through the
+// Repeater. So a type in a *type position* of a value is analyzed as any type of the item is,
+// with the generics and `Self` in scope, and it becomes an entry if it names a relative path (or
+// an optional one, for a path of another crate). The type positions are the ones the visitor
+// walks as types: the target of an `as` cast, the type of a `let` and of the parameters and the
+// output of a closure, the generic arguments of a path and of a method call (the turbofish), and
+// the self type of a qualified path (`<Ty as Trait>::f`, not the trait). A bare identifier there
+// (`size_of::<Local>()`) is read as a type, as in an enum discriminant.
+//
+// What stays rejected, as a relative path:
+//
+// - a path that is not a type position: a function, a constant, a struct literal or an enum
+//   variant (`inner::f()`, `Local::new()`, `Local { .. }`), the trait of a qualified path;
+// - a type that names something the value declares (an item, a `use`, a generic or a lifetime of
+//   an item in a block): the copy writes the value with its declaration, so it cannot be leaked,
+//   and a relative path beside it is rejected as in any other place of the value;
+// - a type in the arguments of a macro, which the visitor does not rewrite, and a type in an item
+//   that a block declares.
+//
+// What the check cannot see it rejects, because it would otherwise accept a path it never read:
+// the arguments of a macro which are not expressions, a `macro_rules!`, a glob import, and syntax
+// that `syn` leaves unparsed.
+
+impl<A: Allow> AnalyzeVisitor<'_, A> {
+    /// Checks the value `expr` of the const or static `name`, if values are read. `default`: it is
+    /// the default of an associated const of a trait.
+    fn check_value(&mut self, name: &Ident, default: bool, expr: &Expr) {
+        if !self.mode.check_values {
+            return;
+        }
+        let what = format!(
+            "the {}value of `{}`",
+            if default { "default " } else { "" },
+            name
+        );
+        let outer = self.reading(default);
+        ValueWalk::new(self, what).visit_expr(expr);
+        self.reading_done(outer);
+    }
+
+    /// Reads the expression `expr` as a value, whether values are read or not: an enum discriminant
+    /// or the default of a const parameter, which the copy writes as it is. `what` says where it
+    /// is, as the notes do. `in_value` is not set for what it finds: that is for the values that
+    /// `check_values` reads.
+    fn read_expr(&mut self, what: String, expr: &Expr) {
+        ValueWalk::new(self, what).visit_expr(expr);
+    }
+
+    /// Checks the body `block` of the function `sig`, if values are read. `default`: it is the
+    /// default body of a method of a trait. The generics of `sig` are in scope.
+    fn check_body(&mut self, sig: &Signature, block: &Block, default: bool) {
+        if !self.mode.check_values {
+            return;
+        }
+        let what = format!(
+            "the {}body of `{}`",
+            if default { "default " } else { "" },
+            sig.ident
+        );
+        let outer = self.reading(default);
+        let mut walk = ValueWalk::new(self, what);
+        for input in &sig.inputs {
+            if let FnArg::Typed(arg) = input {
+                walk.visit_pat(&arg.pat);
+            }
+        }
+        walk.visit_block(block);
+        self.reading_done(outer);
+    }
+
+    /// Starts reading a value, the default of a trait item if `default`: the errors found until
+    /// [`AnalyzeVisitor::reading_done()`] are in a value (and in a default). Returns what to put
+    /// back.
+    fn reading(&mut self, default: bool) -> (bool, bool) {
+        (
+            std::mem::replace(&mut self.position.in_value, true),
+            std::mem::replace(&mut self.position.in_trait_default, default),
+        )
+    }
+
+    /// Ends the reading that [`AnalyzeVisitor::reading()`] started.
+    fn reading_done(&mut self, (value, default): (bool, bool)) {
+        self.position.in_value = value;
+        self.position.in_trait_default = default;
+    }
+}
+
+/// The names that a scope of a value declares.
+#[derive(Default)]
+struct ValueScope {
+    /// The bindings of patterns: a `let`, a parameter, a match arm, a `for`.
+    bindings: HashSet<String>,
+    /// The items, the `use` declarations and the generics of items: named wherever they are seen.
+    items: HashSet<String>,
+}
+
+struct ValueWalk<'a, 'r, A> {
+    visitor: &'a mut AnalyzeVisitor<'r, A>,
+    /// Where the walk is, as the notes say it: "the default value of `N`".
+    what: String,
+    /// Never empty. The first is the scope of the value itself.
+    scopes: Vec<ValueScope>,
+    /// The first scope whose bindings are seen. An item in a block sees the items around it, but not
+    /// the bindings.
+    barrier: usize,
+    /// Greater than 0 where the walk reads a type itself instead of leaking it: in an item that a
+    /// block declares, in the arguments of a macro (the visitor does not rewrite tokens), and in
+    /// a type that names something the value declares.
+    reads: usize,
+    /// While such a type is read: the name it has that the value declares.
+    declared_name: Option<String>,
+}
+
+impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
+    fn new(visitor: &'a mut AnalyzeVisitor<'r, A>, what: String) -> Self {
+        Self {
+            visitor,
+            what,
+            scopes: vec![ValueScope::default()],
+            barrier: 0,
+            reads: 0,
+            declared_name: None,
+        }
+    }
+
+    fn scope(&mut self) -> &mut ValueScope {
+        self.scopes.last_mut().expect("a scope")
+    }
+
+    fn bind(&mut self, ident: &Ident) {
+        self.scope().bindings.insert(ident_name(ident));
+    }
+
+    fn declare(&mut self, ident: &Ident) {
+        self.scope().items.insert(ident_name(ident));
+    }
+
+    /// Declares a name that is not an identifier: a lifetime (`'a`).
+    fn declare_name(&mut self, name: String) {
+        self.scope().items.insert(name);
+    }
+
+    /// Returns `true` if the value declares `name` (an item, a generic, a lifetime or a binding),
+    /// wherever it appears: in a path, a lifetime or the tokens of a macro.
+    fn declares(&self, name: &str) -> bool {
+        self.scopes.iter().any(|scope| scope.items.contains(name))
+            || self.scopes[self.barrier..]
+                .iter()
+                .any(|scope| scope.bindings.contains(name))
+    }
+
+    /// Runs `f` in a new scope.
+    fn scoped(&mut self, f: impl FnOnce(&mut Self)) {
+        self.scopes.push(ValueScope::default());
+        f(self);
+        self.scopes.pop();
+    }
+
+    /// Returns `true` if the path starts with a name that the value declares: an item (a path of
+    /// any length), or a binding (a single name).
+    fn is_local(&self, path: &Path) -> bool {
+        let first = match path
+            .segments
+            .first()
+            .filter(|_| path.leading_colon.is_none())
+        {
+            Some(first) => first,
+            None => return false,
+        };
+        let name = ident_name(&first.ident);
+        self.scopes.iter().any(|scope| scope.items.contains(&name))
+            || (path.segments.len() == 1
+                && first.arguments.is_none()
+                && self.scopes[self.barrier..]
+                    .iter()
+                    .any(|scope| scope.bindings.contains(&name)))
+    }
+
+    /// Returns `true` if the path of `cause` means the same wherever the value is written: it starts
+    /// with `Self`, a generic, a name the value declares, or is absolute or allowed.
+    fn is_known(&mut self, cause: &Cause) -> bool {
+        let path = match cause.path() {
+            Some(path) => path,
+            None => return false,
+        };
+        // The receiver.
+        if path.leading_colon.is_none() && path.get_ident().map_or(false, |ident| ident == "self") {
+            return true;
+        }
+        if self_head(path).is_some() {
+            self.visitor.check_self_has_meaning(Cause::expr_path(path));
+            return true;
+        }
+        if self.is_local(path) || self.visitor.starts_with_generic(path) {
+            return true;
+        }
+        if !self.visitor.is_context_free(cause) {
+            return false;
+        }
+        // A primitive name is copied as it is, and may be shadowed: `Leaker::assertions()`.
+        if path.leading_colon.is_none() {
+            if let Some(seg) = path
+                .segments
+                .first()
+                .filter(|seg| is_primitive_name(&seg.ident))
+            {
+                self.visitor
+                    .frame
+                    .effects
+                    .push(Effect::Primitive(seg.ident.clone()));
+            }
+        }
+        true
+    }
+
+    fn error(&mut self, error: CheckResult) {
+        self.visitor.push_error(error);
+    }
+
+    /// Rejects the relative path `cause`, with `help` for what to write if it has to say more than
+    /// the absolute path. The copy writes the path as it is.
+    fn relative(&mut self, cause: Cause, help: Option<String>) {
+        let entry = cause.path().map(|_| cause.bare());
+        self.relative_of(cause, entry, help)
+    }
+
+    /// Rejects the relative path `path` of a value, copied as written: the types in its arguments
+    /// are analyzed as usual.
+    fn relative_path(&mut self, path: &Path) {
+        self.relative(Cause::expr_path(path), None);
+        syn::visit::visit_path(self, path);
+    }
+
+    /// Like `relative()`. `entry`: the path of `cause`, for
+    /// [`ErrorItem::paths`](crate::ErrorItem::paths).
+    fn relative_of(&mut self, cause: Cause, entry: Option<Cause>, help: Option<String>) {
+        // The error names a macro in its own way, with its `!`, whereas the path of a macro in a
+        // type is shown by its path alone.
+        let headline = match &cause {
+            Cause::Macro(_) => Some(format!("use absolute path: '{}!'", tidy(&cause.shown()))),
+            _ => None,
+        };
+        let mut note = format!("it is in {}, which the copy writes as it is", self.what);
+        if let Some(name) = &self.declared_name {
+            note.push_str(&format!(
+                "; the type names `{}`, which the value declares, so it is not leaked",
+                name
+            ));
+        }
+        // The path is relative: the walk knows no generic, no `Self` and no name of the value by it.
+        let paths: Vec<Cause> = entry.into_iter().collect();
+        self.error(CheckResult {
+            note: Some(note),
+            help,
+            headline,
+            paths,
+            ..CheckResult::conflict(vec![cause.clone()], vec![cause], Reason::RelativePath)
+        });
+    }
+
+    /// Rejects the syntax `tokens`, which the walk cannot read: `why` is what it is.
+    fn cannot_read(&mut self, tokens: TokenStream, why: &str) {
+        let shown = tidy(&tokens);
+        let note = format!(
+            "{}. The Leaker must see every path in {}, which the copy writes as it is",
+            why, self.what
+        );
+        self.error(CheckResult {
+            headline: Some(format!("cannot analyze `{}` in {}", shown, self.what)),
+            note: Some(note),
+            help: Some(
+                "write it with syntax the Leaker can read (paths and expressions), or move it \
+                 out of the item"
+                    .to_string(),
+            ),
+            ..CheckResult::conflict(
+                vec![Cause::Unreadable(tokens.clone())],
+                vec![Cause::Unreadable(tokens)],
+                Reason::Unreadable,
+            )
+        });
+    }
+
+    /// Declares the names that `item` introduces in the block around it, where they are visible
+    /// from the first statement.
+    fn declare_item(&mut self, item: &Item) {
+        match item {
+            Item::Const(i) => self.declare(&i.ident),
+            Item::Enum(i) => self.declare(&i.ident),
+            Item::ExternCrate(i) => match &i.rename {
+                Some((_, rename)) => self.declare(rename),
+                None => self.declare(&i.ident),
+            },
+            Item::Fn(i) => self.declare(&i.sig.ident),
+            Item::Macro(i) => {
+                if let Some(ident) = &i.ident {
+                    self.declare(ident);
+                }
+            }
+            Item::Mod(i) => self.declare(&i.ident),
+            Item::Static(i) => self.declare(&i.ident),
+            Item::Struct(i) => self.declare(&i.ident),
+            Item::Trait(i) => self.declare(&i.ident),
+            Item::TraitAlias(i) => self.declare(&i.ident),
+            Item::Type(i) => self.declare(&i.ident),
+            Item::Union(i) => self.declare(&i.ident),
+            Item::Use(i) => {
+                let mut names = Vec::new();
+                local_use_names(&i.tree, None, &mut names);
+                for name in names {
+                    self.scope().items.insert(name);
+                }
+            }
+            _ => (),
+        }
+    }
+
+    /// Handles a type in a type position of the value: it is leaked as any type of the item is,
+    /// unless it names something the value declares or holds syntax that `syn` leaves unparsed.
+    /// Then it is read here, and a relative path in it is rejected.
+    fn type_position(&mut self, ty: &Type) {
+        let mut scan = Scan {
+            walk: self,
+            declared: None,
+            unreadable: false,
+        };
+        scan.visit_type(ty);
+        let (declared, unreadable) = (scan.declared, scan.unreadable);
+        // A value inside a type (the length of an array) is part of that type, which is leaked
+        // whole or not at all: its types are not entries of their own.
+        let inside_type = self.visitor.position.type_depth > 0;
+        if declared.is_none() && !unreadable && !inside_type {
+            return self.leak(ty);
+        }
+        let outer = std::mem::replace(&mut self.declared_name, declared);
+        self.reads += 1;
+        self.visit_type(ty);
+        self.reads -= 1;
+        self.declared_name = outer;
+    }
+
+    /// Analyzes `ty` as a type of the item, where the visitor is.
+    ///
+    /// The signature around does not apply to a type in its body, whatever lifetime it names: the
+    /// types of the body are no input of the signature, so they do not decide which of its
+    /// lifetimes the copy leaves unconstrained (E0195).
+    fn leak(&mut self, ty: &Type) {
+        let signatures = std::mem::take(&mut self.visitor.signatures);
+        let outcome = catch_unwind(AssertUnwindSafe(|| self.visitor.visit_type(ty)));
+        self.visitor.signatures = signatures;
+        if let Err(payload) = outcome {
+            resume_unwind(payload);
+        }
+    }
+
+    /// Checks a path that is a name alone, as a `use` root, a macro argument or a pattern.
+    fn check_name(&mut self, ident: &Ident) {
+        let cause = Cause::expr_path(&Path::from(ident.clone()));
+        if !self.is_known(&cause) {
+            self.relative(cause, None);
+        }
+    }
+
+    /// Checks the path `<ty as Trait>::A` or `<ty>::A`: the trait and the arguments, and the type.
+    fn qualified<'ast>(&mut self, qself: Option<&'ast QSelf>, path: &'ast Path) {
+        let qself = match qself {
+            Some(qself) => qself,
+            None => return self.visit_path(path),
+        };
+        self.visit_type(&qself.ty);
+        // The first `position` segments are the trait, the others are names of the type's items.
+        let position = if qself.as_token.is_some() {
+            qself.position
+        } else {
+            0
+        };
+        if position > 0 {
+            let cause = Cause::Trait(trait_head(path, position));
+            if !self.is_known(&cause) {
+                self.relative(cause, None);
+            }
+            for seg in path.segments.iter().take(position) {
+                self.visit_path_arguments(&seg.arguments);
+            }
+        }
+        for seg in path.segments.iter().skip(position) {
+            self.visit_path_arguments(&seg.arguments);
+        }
+    }
+
+    /// Checks the root of a `use` tree, which names a crate, a module or an item of the value.
+    fn use_roots(&mut self, tree: &UseTree, absolute: bool) {
+        let ident = match tree {
+            UseTree::Path(p) => &p.ident,
+            UseTree::Name(n) => &n.ident,
+            UseTree::Rename(r) => &r.ident,
+            UseTree::Glob(_) => return,
+            UseTree::Group(g) => {
+                for tree in &g.items {
+                    self.use_roots(tree, absolute);
+                }
+                return;
+            }
+        };
+        let path = Path::from(ident.clone());
+        let root = Cause::Unknown(path.clone());
+        if !absolute && !self.is_local(&path) && !self.visitor.is_context_free(&root) {
+            // What the root names (a crate, a module, a type, a trait) is not known.
+            self.relative_of(Cause::expr_path(&path), Some(root), None);
+        }
+    }
+
+    /// Checks a macro call: the path, then the arguments, which are read as expressions. A type in
+    /// them is read, not leaked: the visitor does not rewrite the tokens of a macro.
+    fn macro_call(&mut self, mac: &Macro) {
+        let path = &mac.path;
+        let cause = Cause::Macro(path.clone());
+        if !self.is_known(&cause) {
+            let help = macro_help(path);
+            self.relative(cause, Some(help));
+        }
+        self.reads += 1;
+        self.macro_arguments_of(mac);
+        self.reads -= 1;
+    }
+
+    fn macro_arguments_of(&mut self, mac: &Macro) {
+        let path = &mac.path;
+        let tokens = &mac.tokens;
+        // These name no item in their arguments (`cfg!(unix)`, `stringify!(a b)`).
+        if is_std_macro(path, &["cfg", "stringify"]) {
+            return;
+        }
+        if is_std_macro(path, &["matches"]) {
+            if let Ok((expr, pat, guard)) = parse_matches.parse2(tokens.clone()) {
+                self.visit_expr(&expr);
+                self.scoped(|walk| {
+                    walk.visit_pat(&pat);
+                    if let Some(guard) = &guard {
+                        walk.visit_expr(guard);
+                    }
+                });
+                return;
+            }
+        }
+        match macro_exprs(tokens) {
+            Some(args) => self.macro_arguments(&args, format_string(path)),
+            None => self.cannot_read(
+                quote!(#path ! (#tokens)),
+                "the arguments of the macro are not expressions",
+            ),
+        }
+    }
+
+    /// Checks the arguments of a macro. A name in `name = value` is the name of an argument, which
+    /// a format string captures as `{name}`, as it captures a variable that is in scope.
+    /// `format` says which string literal is a format string.
+    fn macro_arguments(&mut self, args: &[Expr], format: FormatString) {
+        let named: Vec<String> = args.iter().filter_map(argument_name).collect();
+        for (at, arg) in args.iter().enumerate() {
+            match arg {
+                Expr::Assign(assign) if argument_name(arg).is_some() => {
+                    self.visit_expr(&assign.right)
+                }
+                Expr::Lit(ExprLit {
+                    lit: Lit::Str(literal),
+                    ..
+                }) if format.is_at(at) => {
+                    for name in captured_names(&literal.value()) {
+                        if named.contains(&name) {
+                            continue;
+                        }
+                        self.check_name(&Ident::new(&name, literal.span()));
+                    }
+                }
+                _ => self.visit_expr(arg),
+            }
+        }
+    }
+}
+
+impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, '_, A> {
+    fn visit_attribute(&mut self, _: &'ast Attribute) {}
+
+    fn visit_visibility(&mut self, _: &'ast Visibility) {}
+
+    /// Any path that no other method takes is told as a value, as its error is.
+    fn visit_path(&mut self, i: &'ast Path) {
+        if self.is_known(&Cause::expr_path(i)) {
+            syn::visit::visit_path(self, i)
+        } else {
+            self.relative_path(i)
+        }
+    }
+
+    fn visit_expr_path(&mut self, i: &'ast ExprPath) {
+        self.qualified(i.qself.as_ref(), &i.path)
+    }
+
+    fn visit_type_path(&mut self, i: &'ast TypePath) {
+        self.qualified(i.qself.as_ref(), &i.path)
+    }
+
+    fn visit_macro(&mut self, i: &'ast Macro) {
+        self.macro_call(i)
+    }
+
+    fn visit_expr(&mut self, i: &'ast Expr) {
+        match i {
+            Expr::Verbatim(tokens) => self.cannot_read(tokens.clone(), "syn does not parse it"),
+            _ => syn::visit::visit_expr(self, i),
+        }
+    }
+
+    fn visit_type(&mut self, i: &'ast Type) {
+        if self.reads == 0 {
+            return self.type_position(i);
+        }
+        match i {
+            Type::Verbatim(tokens) => self.cannot_read(tokens.clone(), "syn does not parse it"),
+            _ => syn::visit::visit_type(self, i),
+        }
+    }
+
+    fn visit_type_param_bound(&mut self, i: &'ast TypeParamBound) {
+        match i {
+            TypeParamBound::Verbatim(tokens) => {
+                self.cannot_read(tokens.clone(), "syn does not parse it")
+            }
+            _ => syn::visit::visit_type_param_bound(self, i),
+        }
+    }
+
+    fn visit_pat(&mut self, i: &'ast Pat) {
+        match i {
+            Pat::Verbatim(tokens) => self.cannot_read(tokens.clone(), "syn does not parse it"),
+            _ => syn::visit::visit_pat(self, i),
+        }
+    }
+
+    /// A name in a pattern is a binding, unless it is a path to a constant, a unit struct or a
+    /// variant. Those are written with a capital letter (the lint `non_snake_case` makes a binding
+    /// with one a warning), and a `ref` or `mut` name or one with `@` is a binding for certain.
+    fn visit_pat_ident(&mut self, i: &'ast PatIdent) {
+        let name = ident_name(&i.ident);
+        let capital = name.chars().next().map_or(false, char::is_uppercase);
+        let binding =
+            i.by_ref.is_some() || i.mutability.is_some() || i.subpat.is_some() || !capital;
+        if binding {
+            self.bind(&i.ident);
+        } else {
+            self.check_name(&i.ident);
+        }
+        if let Some((_, pat)) = &i.subpat {
+            self.visit_pat(pat);
+        }
+    }
+
+    fn visit_generics(&mut self, i: &'ast Generics) {
+        for param in &i.params {
+            match param {
+                GenericParam::Type(param) => self.declare(&param.ident),
+                GenericParam::Const(param) => self.declare(&param.ident),
+                GenericParam::Lifetime(param) => self.declare_name(param.lifetime.to_string()),
+            }
+        }
+        syn::visit::visit_generics(self, i)
+    }
+
+    fn visit_block(&mut self, i: &'ast Block) {
+        self.scoped(|walk| {
+            // An item is visible in the whole block.
+            for stmt in &i.stmts {
+                if let Stmt::Item(item) = stmt {
+                    walk.declare_item(item);
+                }
+            }
+            for stmt in &i.stmts {
+                walk.visit_stmt(stmt);
+            }
+        })
+    }
+
+    /// The initializer does not see the bindings of the pattern.
+    fn visit_local(&mut self, i: &'ast Local) {
+        if let Some(init) = &i.init {
+            self.visit_expr(&init.expr);
+            if let Some((_, diverge)) = &init.diverge {
+                self.visit_expr(diverge);
+            }
+        }
+        self.visit_pat(&i.pat);
+    }
+
+    fn visit_item(&mut self, i: &'ast Item) {
+        // The item sees the items around it, and the generics of its own, not the bindings.
+        let outer = std::mem::replace(&mut self.barrier, self.scopes.len());
+        // The types of an item that a block declares are read, not leaked.
+        self.reads += 1;
+        self.scoped(|walk| match i {
+            Item::Use(item) => {
+                if has_glob(&item.tree) {
+                    walk.cannot_read(
+                        quote!(#item),
+                        "a glob import hides which names it brings into scope",
+                    );
+                }
+                walk.use_roots(&item.tree, item.leading_colon.is_some());
+            }
+            Item::Macro(item) => walk.cannot_read(
+                quote!(#item),
+                "a macro in item position may declare any name",
+            ),
+            Item::Verbatim(tokens) => walk.cannot_read(tokens.clone(), "syn does not parse it"),
+            _ => syn::visit::visit_item(walk, i),
+        });
+        self.reads -= 1;
+        self.barrier = outer;
+    }
+
+    fn visit_item_mod(&mut self, i: &'ast ItemMod) {
+        if let Some((_, items)) = &i.content {
+            for item in items {
+                self.declare_item(item);
+            }
+        }
+        syn::visit::visit_item_mod(self, i)
+    }
+
+    fn visit_impl_item(&mut self, i: &'ast ImplItem) {
+        self.scoped(|walk| syn::visit::visit_impl_item(walk, i))
+    }
+
+    fn visit_trait_item(&mut self, i: &'ast TraitItem) {
+        self.scoped(|walk| syn::visit::visit_trait_item(walk, i))
+    }
+
+    fn visit_expr_closure(&mut self, i: &'ast ExprClosure) {
+        self.scoped(|walk| {
+            // `for<'a> |x: &'a u8| ..` declares a lifetime that only the closure knows.
+            for param in i.lifetimes.iter().flat_map(|binder| &binder.lifetimes) {
+                if let GenericParam::Lifetime(param) = param {
+                    walk.declare_name(param.lifetime.to_string());
+                }
+            }
+            for input in &i.inputs {
+                walk.visit_pat(input);
+            }
+            walk.visit_return_type(&i.output);
+            walk.visit_expr(&i.body);
+        })
+    }
+
+    /// The bindings of the pattern are those of the guard and the body.
+    fn visit_arm(&mut self, i: &'ast Arm) {
+        self.scoped(|walk| {
+            walk.visit_pat(&i.pat);
+            if let Some((_, guard)) = &i.guard {
+                walk.visit_expr(guard);
+            }
+            walk.visit_expr(&i.body);
+        })
+    }
+
+    /// The bindings of `if let` are those of the first branch.
+    fn visit_expr_if(&mut self, i: &'ast ExprIf) {
+        self.scoped(|walk| {
+            walk.visit_expr(&i.cond);
+            walk.visit_block(&i.then_branch);
+        });
+        if let Some((_, branch)) = &i.else_branch {
+            self.visit_expr(branch);
+        }
+    }
+
+    fn visit_expr_while(&mut self, i: &'ast ExprWhile) {
+        self.scoped(|walk| {
+            walk.visit_expr(&i.cond);
+            walk.visit_block(&i.body);
+        })
+    }
+
+    fn visit_expr_let(&mut self, i: &'ast ExprLet) {
+        self.visit_expr(&i.expr);
+        self.visit_pat(&i.pat);
+    }
+
+    fn visit_expr_for_loop(&mut self, i: &'ast ExprForLoop) {
+        self.visit_expr(&i.expr);
+        self.scoped(|walk| {
+            walk.visit_pat(&i.pat);
+            walk.visit_block(&i.body);
+        })
+    }
+}
+
+/// What a type of a value names that decides how it is read: a name the value declares, and syntax
+/// that `syn` leaves unparsed.
+struct Scan<'w, 'a, 'r, A> {
+    walk: &'w ValueWalk<'a, 'r, A>,
+    /// The first name that the value declares (an item, a generic or a lifetime of an item in a
+    /// block, a `use`).
+    declared: Option<String>,
+    unreadable: bool,
+}
+
+impl<A: Allow> Scan<'_, '_, '_, A> {
+    fn name(&mut self, name: &str) {
+        if self.declared.is_none() && self.walk.declares(name) {
+            self.declared = Some(name.to_string());
+        }
+    }
+}
+
+impl<'ast, A: Allow> Visit<'ast> for Scan<'_, '_, '_, A> {
+    fn visit_path(&mut self, i: &'ast Path) {
+        if self.declared.is_none() && self.walk.is_local(i) {
+            self.declared = i.segments.first().map(|seg| ident_name(&seg.ident));
+        }
+        syn::visit::visit_path(self, i)
+    }
+
+    fn visit_lifetime(&mut self, i: &'ast Lifetime) {
+        self.name(&i.to_string());
+    }
+
+    /// A type macro, or a macro in a length: the names in its tokens are not told apart.
+    fn visit_macro(&mut self, i: &'ast Macro) {
+        let mut names = HashSet::new();
+        token_names(i.tokens.clone(), &mut names);
+        let mut names: Vec<String> = names.into_iter().collect();
+        names.sort();
+        for name in names {
+            self.name(&name);
+        }
+        syn::visit::visit_macro(self, i)
+    }
+
+    fn visit_type(&mut self, i: &'ast Type) {
+        match i {
+            Type::Verbatim(_) => self.unreadable = true,
+            _ => syn::visit::visit_type(self, i),
+        }
+    }
+
+    fn visit_type_param_bound(&mut self, i: &'ast TypeParamBound) {
+        match i {
+            TypeParamBound::Verbatim(_) => self.unreadable = true,
+            _ => syn::visit::visit_type_param_bound(self, i),
+        }
+    }
+
+    fn visit_expr(&mut self, i: &'ast Expr) {
+        match i {
+            Expr::Verbatim(_) => self.unreadable = true,
+            _ => syn::visit::visit_expr(self, i),
+        }
+    }
+
+    fn visit_pat(&mut self, i: &'ast Pat) {
+        match i {
+            Pat::Verbatim(_) => self.unreadable = true,
+            _ => syn::visit::visit_pat(self, i),
+        }
+    }
+
+    /// An item in the length of an array declares names this scan does not follow.
+    fn visit_item(&mut self, _: &'ast Item) {
+        self.unreadable = true;
+    }
+}
+
+/// The names that a `use` tree brings into scope. `parent`: the name before the group
+/// (`use a::b::{self}` brings `b`).
+fn local_use_names(tree: &UseTree, parent: Option<&Ident>, names: &mut Vec<String>) {
+    match tree {
+        UseTree::Path(p) => local_use_names(&p.tree, Some(&p.ident), names),
+        UseTree::Name(n) if n.ident == "self" => names.extend(parent.map(ident_name)),
+        UseTree::Name(n) => names.push(ident_name(&n.ident)),
+        UseTree::Rename(r) => names.push(ident_name(&r.rename)),
+        UseTree::Glob(_) => (),
+        UseTree::Group(g) => {
+            for tree in &g.items {
+                local_use_names(tree, parent, names);
+            }
+        }
+    }
+}
+
+fn has_glob(tree: &UseTree) -> bool {
+    match tree {
+        UseTree::Path(p) => has_glob(&p.tree),
+        UseTree::Glob(_) => true,
+        UseTree::Group(g) => g.items.iter().any(has_glob),
+        UseTree::Name(_) | UseTree::Rename(_) => false,
+    }
+}
+
+/// The arguments of a macro call as expressions: `a, b` or `a; n` (`vec![0; n]`).
+fn macro_exprs(tokens: &TokenStream) -> Option<Vec<Expr>> {
+    if let Ok(args) = Punctuated::<Expr, Token![,]>::parse_terminated.parse2(tokens.clone()) {
+        return Some(args.into_iter().collect());
+    }
+    let repeat = |input: ParseStream| -> Result<Vec<Expr>> {
+        let value: Expr = input.parse()?;
+        input.parse::<Token![;]>()?;
+        let count: Expr = input.parse()?;
+        Ok(vec![value, count])
+    };
+    repeat.parse2(tokens.clone()).ok()
+}
+
+/// Returns `true` if `path` is the macro of the standard library `names`: `cfg!` or
+/// `::core::cfg!`. (Another path ending in the same name is a macro of its own.)
+fn is_std_macro(path: &Path, names: &[&str]) -> bool {
+    let name = match path.segments.last() {
+        Some(seg) => seg.ident.to_string(),
+        None => return false,
+    };
+    names.contains(&name.as_str())
+        && match path.segments.len() {
+            1 => true,
+            2 => {
+                path.leading_colon.is_some()
+                    && matches!(path.segments.first(), Some(seg) if seg.ident == "core" || seg.ident == "std")
+            }
+            _ => false,
+        }
+}
+
+/// The arguments of `matches!(expr, pattern if guard)`.
+fn parse_matches(input: ParseStream) -> Result<(Expr, Pat, Option<Expr>)> {
+    let expr: Expr = input.parse()?;
+    input.parse::<Token![,]>()?;
+    let pat = Pat::parse_multi_with_leading_vert(input)?;
+    let guard = if input.peek(Token![if]) {
+        input.parse::<Token![if]>()?;
+        Some(input.parse()?)
+    } else {
+        None
+    };
+    input.parse::<Option<Token![,]>>()?;
+    Ok((expr, pat, guard))
+}
+
+/// The name of an argument of the form `name = value`.
+fn argument_name(arg: &Expr) -> Option<String> {
+    match arg {
+        Expr::Assign(assign) => match &*assign.left {
+            Expr::Path(ExprPath {
+                qself: None, path, ..
+            }) => path.get_ident().map(ident_name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Where the format string of a macro is among its arguments.
+#[derive(Clone, Copy)]
+enum FormatString {
+    /// The macro is one of the standard library, and has none (`vec!`, `dbg!`).
+    None,
+    /// The macro is one of the standard library: the argument at this position (`println!("..")`
+    /// is the first, `write!(f, "..")` the second).
+    At(usize),
+    /// Any macro: every string literal among the arguments may be one.
+    Any,
+}
+
+impl FormatString {
+    fn is_at(self, at: usize) -> bool {
+        match self {
+            FormatString::None => false,
+            FormatString::At(position) => position == at,
+            FormatString::Any => true,
+        }
+    }
+}
+
+/// Tells where the format string is in the macro `path`: for the macros of the standard library
+/// that format, the position; for the others of the library, none; for a macro of the user, any
+/// literal may be.
+fn format_string(path: &Path) -> FormatString {
+    const FIRST: &[&str] = &[
+        "print",
+        "println",
+        "eprint",
+        "eprintln",
+        "format",
+        "format_args",
+        "panic",
+        "unreachable",
+        "todo",
+        "unimplemented",
+    ];
+    const SECOND: &[&str] = &["write", "writeln", "assert", "debug_assert"];
+    const THIRD: &[&str] = &[
+        "assert_eq",
+        "assert_ne",
+        "debug_assert_eq",
+        "debug_assert_ne",
+    ];
+    const NONE: &[&str] = &[
+        "dbg",
+        "vec",
+        "concat",
+        "env",
+        "option_env",
+        "include_str",
+        "include_bytes",
+        "file",
+        "line",
+        "column",
+        "module_path",
+        "compile_error",
+    ];
+    if is_std_macro(path, FIRST) {
+        FormatString::At(0)
+    } else if is_std_macro(path, SECOND) {
+        FormatString::At(1)
+    } else if is_std_macro(path, THIRD) {
+        FormatString::At(2)
+    } else if is_std_macro(path, NONE) {
+        FormatString::None
+    } else {
+        FormatString::Any
+    }
+}
+
+/// The names that a format string captures from the scope: `{name}`, `{name:?}`, and the `width`
+/// of `{:width$}`. Only ASCII names are read.
+fn captured_names(format: &str) -> Vec<String> {
+    let chars: Vec<char> = format.chars().collect();
+    let mut names = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        if chars[at] != '{' {
+            at += 1;
+        } else if chars.get(at + 1) == Some(&'{') {
+            at += 2;
+        } else {
+            let end = match chars[at + 1..].iter().position(|&c| c == '}') {
+                Some(n) => at + 1 + n,
+                None => break,
+            };
+            let inner: String = chars[at + 1..end].iter().collect();
+            let (arg, spec) = match inner.find(':') {
+                Some(n) => (&inner[..n], &inner[n + 1..]),
+                None => (&inner[..], ""),
+            };
+            names.push(arg.trim().to_string());
+            let spec: Vec<char> = spec.chars().collect();
+            for n in 0..spec.len() {
+                if spec[n] != '$' {
+                    continue;
+                }
+                let start = spec[..n]
+                    .iter()
+                    .rposition(|&c| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .map_or(0, |p| p + 1);
+                names.push(spec[start..n].iter().collect());
+            }
+            at = end + 1;
+        }
+    }
+    names.retain(|name| {
+        name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && name.chars().next().map_or(false, |c| !c.is_ascii_digit())
+    });
+    names
+}
+
+/// What to write for the relative macro `path`: the absolute path of a macro of the standard
+/// library, else how to write it.
+fn macro_help(path: &Path) -> String {
+    const CORE: &[&str] = &[
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "cfg",
+        "column",
+        "compile_error",
+        "concat",
+        "debug_assert",
+        "debug_assert_eq",
+        "debug_assert_ne",
+        "env",
+        "file",
+        "format_args",
+        "include_bytes",
+        "include_str",
+        "line",
+        "matches",
+        "module_path",
+        "option_env",
+        "panic",
+        "stringify",
+        "todo",
+        "unimplemented",
+        "unreachable",
+        "write",
+        "writeln",
+    ];
+    const STD: &[&str] = &[
+        "dbg", "eprint", "eprintln", "format", "print", "println", "vec",
+    ];
+    let name = tidy(&quote!(#path));
+    if path.leading_colon.is_none() && path.segments.len() == 1 {
+        let crate_name = if CORE.contains(&name.as_str()) {
+            Some("core")
+        } else if STD.contains(&name.as_str()) {
+            Some("std")
+        } else {
+            None
+        };
+        if let Some(crate_name) = crate_name {
+            return format!("use `::{}::{}!` instead of `{}!`", crate_name, name, name);
+        }
+    }
+    format!(
+        "write `{0}!` with an absolute path (e.g. `::my_crate::{0}!`)",
+        name
+    )
 }

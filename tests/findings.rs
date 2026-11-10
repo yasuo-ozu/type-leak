@@ -48,7 +48,7 @@
 //! | `f37_nested_type_with_a_bound_that_names_its_own_self_is_supported` | an entry that uses a generic whose bound names the own `Self` of a struct, enum or union nested in a module: the bound holds for the copy's type, the Repeater's impl needed it for the Leaker's; the impl is for any type now, and the copy passes its own (`SelfRequirement::Any`) | fixed |
 //! | `f38_an_absolute_type_that_names_the_own_self_is_copied_as_written` | an absolute type that names the own `Self` of a struct, enum or union nested in a module (`::std::boxed::Box<Self>`) was an optional entry, which the copy replaced with the Leaker's type, whereas a macro that keeps the types of other crates as they are left the copy's own; it is no entry now, and the copy writes it as written | fixed |
 //! | `f39_the_default_of_a_nested_trait_that_needs_its_self_is_written_through_the_host` | the default of a parameter of a trait (`U = Rel<T>` with `T: AsRef<Self>`) has an entry for the trait's `Self`, and the Visitor left it as written: it is looked up with the trait's own `Self` too, and written by `with_nested_self()`; the default of the trait itself is looked up without `Self`, as it is analyzed | fixed |
-//! | `f40_a_type_in_the_default_of_an_associated_const_is_carried` | a type in a value (the default of an associated const, a function body) was never carried, so the copy kept a relative path: with `Options::check_values()` a type in a type position of a value (a cast, a `let`, a closure, a turbofish, a qualified path) is an entry, which the Visitor replaces; a path that is not a type stays rejected | fixed |
+//! | `f40_a_type_in_the_default_of_an_associated_const_is_carried` | a type in a value (the default of an associated const, a function body) was never carried, so the copy kept a relative path: with `Leaker::check_values` a type in a type position of a value (a cast, a `let`, a closure, a turbofish, a qualified path) is an entry, which the Visitor replaces; a path that is not a type stays rejected | fixed |
 //! | `f41_a_default_that_needs_self_only_through_a_bound_is_accepted` | the default of a parameter of a struct, enum or union nested in a module that uses a generic with a bound that names the own `Self` (`U = Wrap<T>` with `T: Clone + AsRef<Self>`) was rejected: its entry has no `Self` and none of the bounds that name it now, and the copy writes an ordinary default | fixed |
 //! | `f42_a_type_that_names_self_with_a_bound_that_names_it_is_an_entry_with_a_risk` | a type that names the own `Self` of such an item and a bound of the generics it uses does too (`Rel2<Self, T>` with `T: AsRef<Self>`) was rejected: it is an entry for any type, with `Self` as the parameter of the impl, and the copy passes its own type; the error `NestedSelfInBounds` is the risk, which `allow()` accepts | fixed (the risk is an error) |
 //! | `f43_a_type_whose_context_cannot_be_written_is_copied_as_written` | a type whose context cannot be written (a bound names a `Self` that has no name there) is copied as written, and the Referrer replaced the entries inside it: the part has no context (`unwritable`) | fixed |
@@ -81,6 +81,13 @@
 //! | `f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_lifetimes_into_its_inputs` | the Visitor wrote the path through the Repeater of an entry whose arguments name lifetimes (the arguments of a use site, `&'static str` for `T`) into `fn(&Vec<T>) -> &u8` (or `Fn(&Vec<T>) -> &u8`): two lifetimes in the inputs, E0106; the elided one is named after `type_fn` has written | fixed |
 //! | `f71_an_optional_type_in_a_where_predicate_that_a_context_carries_is_written_as_it_is` | an optional type (a type of another crate) in a where predicate that is not a bound of a generic (`::std::vec::Vec<T>: Clone`), carried by the context of an entry, was an optional entry that the copy replaced: the Repeater's impl of the entry needs the predicate, which the copy's environment has only in the form that names the path, so E0277 (the fixture 9005 allowed `::std` to hide it); it is written as it is, as for the bound cycles of F17, F18 and F68 | fixed |
 //! | `f72_a_type_copied_as_written_for_a_method_lifetime_is_left_only_where_the_copy_leaves_it_unconstrained` | the type that an error copies as written for a method (`Wrap<'x>` of `f`, the only input that names the lifetime its output names) was also left so in a method where another input keeps the lifetime (`b: &'x u8`): a relative path in the copy, and the entry unused | fixed |
+//! | `f73_complete_params_braces_a_braced_const_argument_once` | `complete_params()` wrote `[u8; { { M } }]` for the default `[u8; { N }]` when the site gave `{ M }` (rustc rejects it for a generic `M`): it braced the argument as it was given, a block already, where `substitute_args()` braced it once (F66) | fixed |
+//! | `f74_complete_params_writes_the_associated_type_of_an_earlier_parameter` | `complete_params()` left `T::Item` as written in the default `U = T::Item` of a parameter after `T`, where `substitute_args()` writes `<value>::Item`: the impl that leaves `U` out has no `T` (E0433; rustc takes the shorthand in a default from nightly 1.101 only, so no stable fixture); it walked into a path that is not the name of the parameter alone | fixed |
+//! | `f75_the_generics_of_a_repeater_impl_have_their_angle_brackets` | `ItemImpl::from(RepeaterImpl)` for `struct S(Rel)` with `ImplSelf::Param(__S)` had generics with no `<` and `>` (the parameter was pushed into the empty generics of the context), so it was not equal to the same impl parsed by `syn`, though the tokens are the same | fixed |
+//! | `f76_the_parameter_for_self_does_not_clash_with_a_generic_of_the_entry` | the parameter that an impl declares for `Self` (`ImplSelf::Param`, or the `param` of `ImplSelf::Bucket`) had the name it was given, whatever the entry used: `struct S<__S>(Rel<__S>)` gave `impl<__S, __S: ?Sized> ..` (E0403 in the Leaker's crate), and `trait Tr<__S>` the bound `__S: Tr<__S>` | fixed |
+//! | `f77_the_path_of_the_repeater_is_checked_before_it_is_used` | a path of the Repeater with arguments (`crate::Repeater<u8>`) was spliced into `Repeater<u8><(T,)>` by three places, and `parse_quote!` refused it with a message about the tokens (`unexpected token`): in the first item of the iterator of `repeater_impls()` (after the call returned `Ok`), after `const_fn` in `repeater_projection()`, in the first const slot of `slot_const()`; an empty `<>` is the same as none (pinned) | fixed |
+//! | `f78_an_id_that_the_referrer_does_not_have_is_named_in_the_panic` | `visitor()` and `expand()` with a `ContextId` that the Referrer lacks panicked with `no entry found for key`, and `bucket_self()` with an `EntryId` beyond its entries with `index out of bounds: the len is 1 but the index is 5`, and no `# Panics` in the docs of the last: none names the id | fixed |
+//! | `f79_a_rule_on_self_accepts_the_error_of_a_self_without_meaning` | the docs of `Allow` said that the rule is never asked about a path that starts with `Self`, but `Rel<Self>` where `Self` has no meaning is an error with the cause `Self` and no paths, which a rule that allows `Cause::Type(Self)` accepts, given to the Leaker and to `LeakerResult::allow()` (the walk of the analysis does not ask about `Self`, the filter of the errors asks the cause) | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that the docs of `Leaker` document, or that follows from what rustc accepts). No test
@@ -291,7 +298,8 @@ fn plain(text: &str) -> String {
     .fold(text, |text, (from, to)| text.replace(from, to))
 }
 
-/// What the bound that an error of an unstable bound blames names (`Why` of `src/unstable.rs`).
+/// What the bound that an error of an unstable bound blames names (`Why` of
+/// `src/analyze/unstable.rs`).
 #[derive(Clone, Copy)]
 enum Blames<'a> {
     /// A type that is leaked too.
@@ -313,8 +321,8 @@ enum Blames<'a> {
 /// Asserts that the Leaker rejected `item` for the type `ty` (as the error writes it) in a bound or
 /// where predicate, because the bound `bound` of its generics is one that the environment of the
 /// copy cannot prove. The error has the headline, and the one note, that say what the bound
-/// `blames` (`env_cycle()` and `self_env_cycle()` of `src/analyze.rs`). `ty` is `Self` for the
-/// self type of an impl.
+/// `blames` (`env_cycle()` and `self_env_cycle()` of `src/analyze/predicates.rs`). `ty` is `Self`
+/// for the self type of an impl.
 fn assert_unstable<T>(
     item: &impl template_quote::ToTokens,
     result: std::result::Result<T, Vec<ErrorItem>>,
@@ -589,8 +597,8 @@ fn bare_unsized_element(generics: &Generics, encoded: &Type) -> Option<Ident> {
 ///
 /// The assertions: the encoder succeeds, no `?Sized` parameter is a bare element but the last
 /// (the Repeater's argument `T` is `?Sized`, so the last would be fine), and the encoding of the
-/// arguments is that of the parameters. The encoder on generics written by hand is tested in
-/// `src/encode/tests.rs`.
+/// arguments is that of the parameters. The exact encodings, and the arguments of a site, are in
+/// `an_unsized_parameter_is_encoded_as_a_pointer_to_it` in `tests/encode.rs`.
 #[test]
 fn f01_unsized_type_param_encoding() {
     let param: Ident = parse_quote!(__S);
@@ -4147,15 +4155,16 @@ fn f23_self_in_elided_signature_where_referrer_can_rewrite() {
 /// The assertion: the Leaker accepts the impls, with the parts as entries, as the copy that was
 /// checked has them.
 ///
-/// Fixed so that the check and the choice agree: when a bare `Self` is in a bound or where predicate
-/// of an impl, a type in the self type that the graph MAY choose, that no cause forces to be an
-/// entry, and whose context has an unstable bound is marked `no_entry` (`block_unstable_self_types()`
-/// of `src/analyze.rs`), so the graph chooses its parts, and the check looks at the same ones
-/// (`self_type_entries()`). It is an error only if a part that must be an entry has an unstable
-/// bound in its context. The variants below were checked with rustc as the first: the bound as a
-/// where predicate, and a type between the self type and the entry (`W3<W1<Rel<U>>, T, u8>`,
-/// `W2<W1<T>, Rel<U>>`). The impls whose entry uses `T` (`W2<Rel<T>, U>`, `W3<Rel<T>, T, V>`)
-/// are still errors: `Rel<T>` must be an entry, and its Repeater's impl needs `T: Fn(Rel2<u8>)`.
+/// Fixed so that the check and the choice agree: when a bare `Self` is in a bound or where
+/// predicate of an impl, a type in the self type that the graph MAY choose, that no cause forces to
+/// be an entry, and whose context has an unstable bound is marked `no_required_entry`
+/// (`block_unstable_self_types()` of `src/analyze/impl_self.rs`), so the graph chooses its parts,
+/// and the check looks at the same ones (`self_type_entries()`). It is an error only if a part that
+/// must be an entry has an unstable bound in its context. The variants below were checked with
+/// rustc as the first: the bound as a where predicate, and a type between the self type and the
+/// entry (`W3<W1<Rel<U>>, T, u8>`, `W2<W1<T>, Rel<U>>`). The impls whose entry uses `T`
+/// (`W2<Rel<T>, U>`, `W3<Rel<T>, T, V>`) are still errors: `Rel<T>` must be an entry, and its
+/// Repeater's impl needs `T: Fn(Rel2<u8>)`.
 #[test]
 fn f24_self_in_predicate_with_leaked_bound_of_unused_generic() {
     let items: Vec<ItemImpl> = vec![
@@ -5021,9 +5030,9 @@ impl<'ast> Visit<'ast> for ImplTraitMentions {
 /// Into<Wrap<T>>` compiles (checked, the same copy), as its bound is proved where the body is.
 ///
 /// Fixed by extending the rule of F2 to them: the types in the bounds of an `impl Trait` in an
-/// argument of a function or method (`in_fn_arg` of `src/analyze.rs`, anywhere in the type of the
-/// argument, also nested) are in the environment of the item (`env_depth`), as the bounds of a
-/// generic are. The fix rejects each of the items; the test pins that.
+/// argument of a function or method (`in_fn_arg` of `src/analyze/state.rs`, anywhere in the type
+/// of the argument, also nested) are in the environment of the item (`env_depth`), as the bounds of
+/// a generic are. The fix rejects each of the items; the test pins that.
 #[test]
 fn f27_argument_impl_trait_bound_names_leaked_type_env_cycle() {
     let accepted: Vec<Item> = vec![
@@ -11289,7 +11298,7 @@ fn f44_the_self_type_of_an_impl_is_found_when_no_entry_names_self() {
 /// is not an entry to replace, but a copy to protect, and the rule hid it: `fits()` was false
 /// whenever `no_self` was set and the context of the part had `Self`, so `Other` in it was replaced
 /// (`Rel2<Self, T, P<0>>`), where a visitor with the closure left it. A part matches whatever
-/// `no_self` says, in `Folder::lookup()` and `Visitor::is_part_bound()`. (The default of a
+/// `no_self` says, in `EntryFolder::lookup()` and `Visitor::is_part_bound()`. (The default of a
 /// parameter of a nested struct that names `Self`, `SelfInDefault`, is looked up without `Self`, so
 /// its part is not found with the closure either: not this finding.)
 ///
@@ -12859,10 +12868,10 @@ fn f57_assertions(source: &str, check_values: bool) -> Vec<String> {
 /// that is leaked in parts only.
 ///
 /// Fix: a part has the primitive names that it is copied with (`Part::primitives` in
-/// `src/analysis.rs`): those of the effects of the type's components and of the types leaked whole
-/// that it holds (`PendingType::primitives`), and, for a bound or the path of a value, those of
-/// its syntax (`PrimitiveNames`). A type that is replaced by its entry still asserts nothing: its
-/// components are gone, and a type is a part only where the Referrer leaves it as written.
+/// `src/analyze/effects.rs`): those of the effects of the type's components and of the types leaked
+/// whole that it holds (`PendingType::primitives`), and, for a bound or the path of a value, those
+/// of its syntax (`PrimitiveNames`). A type that is replaced by its entry still asserts nothing:
+/// its components are gone, and a type is a part only where the Referrer leaves it as written.
 #[test]
 fn f57_the_primitive_names_in_a_part_copied_as_written_are_asserted() {
     let cases: &[(&str, &[&str])] = &[
@@ -13954,12 +13963,12 @@ fn f63_the_types_that_hold_a_method_lifetime_inside_a_type_written_as_it_is_are_
 /// of `T` (checked with rustc, stable 1.98.1: E0277 for each, and for `Wrap<Self>` and `Wrap<V>`
 /// in a trait, the fixture of this finding).
 ///
-/// Fixed in `env_unstable_bound()` (`hidden_projection()` of `src/unstable.rs`): a bound of a type
-/// parameter of the context that names the parameter in the arguments of its path is unstable, if
-/// another bound of it fixes an associated type, or an equation of the parameter is in a scope
-/// that the item has around the entry (`hiding_bounds()` of `src/context.rs`, the rule of F26 that
-/// leaves such a bound out, so what it leaves out is what this rejects). The error is that of an
-/// unstable bound (`Reason::UnprovableBound`), for `Self`, the entry or `Self::A`.
+/// Fixed in `env_unstable_bound()` (`hidden_projection()` of `src/analyze/unstable.rs`): a bound of
+/// a type parameter of the context that names the parameter in the arguments of its path is
+/// unstable, if another bound of it fixes an associated type, or an equation of the parameter is in
+/// a scope that the item has around the entry (`hiding_bounds()` of `src/bounds.rs`, the rule of
+/// F26 that leaves such a bound out, so what it leaves out is what this rejects). The error is that
+/// of an unstable bound (`Reason::UnprovableBound`), for `Self`, the entry or `Self::A`.
 ///
 /// Sound whatever the path is: an alias of `<U as Iterator>::Item` or of `<U as Tr<X<U>>>::A`, a
 /// struct, a trait object. If it is no alias of a projection that the equation fixes, the
@@ -14404,6 +14413,10 @@ fn f66_a_braced_const_parameter_is_braced_once_at_a_use_site() {
         ("[u8; { N }]", "3", "[u8 ; { 3 }]"),
         ("[u8; { N }]", "{ M }", "[u8 ; { M }]"),
         ("Rel<{ N }>", "{ 1 + 1 }", "Rel < { 1 + 1 } >"),
+        // A block in a block is the parameter braced once too.
+        ("[u8; { { N } }]", "M", "[u8 ; { M }]"),
+        // A block that does not hold the parameter alone is walked as before.
+        ("[u8; { N + 1 }]", "M", "[u8 ; { ({ M }) + 1 }]"),
     ] {
         assert_eq!(
             substituted(&site(arg), written),
@@ -14412,6 +14425,13 @@ fn f66_a_braced_const_parameter_is_braced_once_at_a_use_site() {
             written,
             arg
         );
+        // The default of a parameter that names `N` so is completed the same way
+        // (`complete_params()` and `substitute_args()` replace the parameter alike).
+        let default: Type = parse_str(written).unwrap();
+        let params: Punctuated<GenericParam, Token![,]> =
+            parse_quote!(const N: usize, U = #default);
+        let completed = complete_params(&params, &f59_args(&[arg])).unwrap();
+        assert_eq!(string(&completed[1]), expected, "{} with {}", written, arg);
     }
     // The default of a parameter that names the const parameter the same way is completed once braced.
     let tr: ItemTrait = parse_quote!(
@@ -14785,14 +14805,14 @@ fn f68_every_unstable_bound_keeps_an_optional_self_type_from_being_an_entry() {
 /// Leaker leaks the whole signature, which is why a type that is no entry (of `::core`, as the
 /// `Cell` above) is what shows it.
 ///
-/// Fix: the substitutions (`SubstituteParams` and `SubstituteSite` of `src/encode.rs`) name the
+/// Fix: the substitutions (`ParamFold` and `SiteFold` of `src/encode/substitute.rs`) name the
 /// elided lifetime of a signature that relies on elision, with a `for<'e>` binder, where what they
 /// write for the inputs shows more than its one lifetime: the code that did so for `Self` in the
-/// Visitor (`src/elided.rs`) is shared. The name is `'__tl_s<n>` for the first `n` that no lifetime
-/// of the type, the arguments, the parameters or `Self` is named like, and that no signature around
-/// (nested ones count) took: the site's own generics are not known, and the prefix is not the
-/// Visitor's (`'__tl_e<n>`). A signature whose inputs name their lifetime (`fn(&'a U) -> &u8`)
-/// names it in the output. The output is the same for the same input.
+/// Visitor (`src/signature/naming.rs`) is shared. The name is `'__tl_s<n>` for the first `n` that
+/// no lifetime of the type, the arguments, the parameters or `Self` is named like, and that no
+/// signature around (nested ones count) took: the site's own generics are not known, and the prefix
+/// is not the Visitor's (`'__tl_e<n>`). A signature whose inputs name their lifetime
+/// (`fn(&'a U) -> &u8`) names it in the output. The output is the same for the same input.
 ///
 /// Limitation: a lifetime that a path hides (`fn(::core::cell::Ref<U>) -> &u8`) cannot be named, so
 /// the copy is as written, and E0106 for an argument with lifetimes. The argument that the
@@ -15812,4 +15832,675 @@ fn f72_a_type_copied_as_written_for_a_method_lifetime_is_left_only_where_the_cop
         "trait Tr { fn f < 'x > (& self , a : Wrap < 'x >) -> & 'x u8 ; \
          fn g < 'y > (& self , a : P < 0usize > , b : & 'y u8) -> & 'y u8 ; }"
     );
+}
+
+// ── F73 ──────────────────────────────────────────────────────────────────────
+
+/// F73 (fixed): `complete_params()` braced a braced const argument twice, where
+/// `substitute_args()` braced it once (F66).
+///
+/// Trigger: a trait `Tr<const N: usize, U = [u8; { N }], V = Rel<{ N }>>` and an impl that gives
+/// the braced argument `{ M }` (`impl<const M: usize> Tr<{ M }> for G<M>`; a const expression such
+/// as `{ 1 + 1 }` is braced so too). The completed default was `[u8; { { M } }]`, which rustc
+/// rejects for a generic `M` ("generic parameters may not be used in const operations"; the
+/// fixture 9246 fails to build with it). The property test does not show it: its use sites pass a
+/// const parameter by its own name, bare.
+///
+/// Cause: `ParamFold` kept the value of `N` as it was given (`{ M }`, a block) and braced it as it
+/// was, where `SiteFold` takes the block off first.
+///
+/// Fix: both write the value with one helper (`braced_const()` of `encode/substitute.rs`): the
+/// block that holds the value alone is taken off, then the value is braced once. The test of F66
+/// checks the defaults of `complete_params()` against its table for every argument now.
+#[test]
+fn f73_complete_params_braces_a_braced_const_argument_once() {
+    let params: Punctuated<GenericParam, Token![,]> = parse_quote!(
+        const N: usize,
+        U = [u8; { N }],
+        V = Rel<{ N }>,
+        W = [u8; N],
+        X = Rel<N>,
+        Y = [u8; { N + 1 }]
+    );
+    let defaults: Vec<Type> = params
+        .iter()
+        .filter_map(|param| match param {
+            GenericParam::Type(param) => param.default.clone(),
+            _ => None,
+        })
+        .collect();
+    let only_n: Punctuated<GenericParam, Token![,]> = parse_quote!(const N: usize);
+    for arg in ["{ M }", "M", "3", "{ 3 }", "{ 1 + 1 }", "{ { M } }"] {
+        let site = f59_args(&[arg]);
+        let completed = complete_params(&params, &site).unwrap();
+        assert_eq!(completed.len(), params.len(), "{}", arg);
+        for (default, completed) in defaults.iter().zip(&completed[1..]) {
+            let expected =
+                common::substitute_type(default, common::answers(&only_n, &site), None).unwrap();
+            assert_eq!(
+                string(completed),
+                string(&expected),
+                "{} with {}",
+                string(default),
+                arg
+            );
+        }
+    }
+    // The trigger, with the exact tokens.
+    let completed = complete_params(&params, &f59_args(&["{ M }"])).unwrap();
+    let tokens: Vec<String> = completed.iter().map(string).collect();
+    assert_eq!(tokens[0], "M");
+    assert_eq!(tokens[1], "[u8 ; { M }]");
+    assert_eq!(tokens[2], "Rel < { M } >");
+    assert_eq!(tokens[3], "[u8 ; { M }]");
+    assert_eq!(tokens[4], "Rel < M >");
+    let completed = complete_params(&params, &f59_args(&["{ 1 + 1 }"])).unwrap();
+    assert_eq!(string(&completed[1]), "[u8 ; { 1 + 1 }]");
+    assert_eq!(string(&completed[2]), "Rel < { 1 + 1 } >");
+}
+
+// ── F75 ──────────────────────────────────────────────────────────────────────
+
+/// F75 (fixed): the generics of a `RepeaterImpl` that declared the parameter for the implementor had
+/// no angle brackets, so `ItemImpl::from(r)` was not equal to the impl written by hand.
+///
+/// Trigger: `struct S(Rel)` with `ImplSelf::Param(__S)`: the entry `Rel` has no generics, and the
+/// impl declares `__S` alone. The parameter was pushed into the empty generics of the context,
+/// whose `<` and `>` are `None`. The tokens are the same (`ToTokens for Generics` writes the
+/// brackets when there is a parameter), but `Generics`, and so `ItemImpl`, compares them as
+/// `Option`s: `impl<__S: ?Sized> Repeater<(), KEY> for __S { .. }` parsed by `syn` was not equal.
+///
+/// Cause: the impl took the generics of the context as they are and inserted the parameter.
+///
+/// Fix: `repeater_impl()` sets `lt_token` and `gt_token` when it has inserted the parameter and
+/// they are `None`, so `Generics` of `impl_generics()` that already has them is unchanged.
+#[test]
+fn f75_the_generics_of_a_repeater_impl_have_their_angle_brackets() {
+    let item: ItemStruct = parse_quote!(
+        struct S(Rel);
+    );
+    let mut leaker = new_leaker();
+    leaker.intern_struct(&item);
+    let result = leaker.result();
+    let repeater: Path = parse_quote!(crate::Repeater);
+    let param: Ident = parse_quote!(__S);
+    let r = result
+        .repeater_impls(&repeater, 5, ImplSelf::Param(&param), slot_const(&repeater))
+        .unwrap()
+        .next()
+        .unwrap();
+    let key = repeater_key(5, r.entry);
+    let expected: ItemImpl = parse_quote!(
+        impl<__S: ?::core::marker::Sized> crate::Repeater<(), #key> for __S {
+            type Type = Rel;
+        }
+    );
+    assert_eq!(ItemImpl::from(r), expected);
+
+    // The impl is what `syn` reads from its tokens, whether the context has generics or not, and
+    // for each way to name the implementor.
+    let items: Vec<Item> = vec![
+        parse_quote!(
+            struct S(Rel);
+        ),
+        parse_quote!(
+            struct S<T>(Rel<T>);
+        ),
+        parse_quote!(
+            struct S<'a, T: 'a, const N: usize>(&'a Rel<T, N>);
+        ),
+        parse_quote!(
+            trait Tr {
+                fn f(&self) -> Rel;
+            }
+        ),
+        parse_quote!(
+            trait Tr<T> {
+                fn f(&self) -> Rel<T, Self>;
+            }
+        ),
+    ];
+    let marker: Type = parse_quote!(crate::Marker);
+    let mut compared = 0;
+    for item in items {
+        let mut leaker = new_leaker();
+        match &item {
+            Item::Struct(item) => leaker.intern_struct(item),
+            Item::Trait(item) => leaker.intern_trait(item),
+            _ => unreachable!(),
+        };
+        let result = leaker.result();
+        for target in [
+            ImplSelf::Param(&param),
+            ImplSelf::Marker(&marker),
+            ImplSelf::Bucket { param: &param },
+        ] {
+            let Ok(impls) = result.repeater_impls(&repeater, 5, target, slot_const(&repeater))
+            else {
+                continue;
+            };
+            for r in impls {
+                let what = format!("{}: {} {:?}", string(&item), r.entry, target);
+                let read: ItemImpl = parse2(quote!(#r)).unwrap();
+                assert_eq!(ItemImpl::from(r), read, "{}", what);
+                compared += 1;
+            }
+        }
+    }
+    assert!(compared >= 10, "{}", compared);
+}
+
+// ── F74 ──────────────────────────────────────────────────────────────────────
+
+/// F74 (fixed): `complete_params()` left the associated type of an earlier parameter in a default as
+/// written (`U = T::Item`), where `substitute_args()` writes `<value>::Item`.
+///
+/// Trigger: a trait `Tr<T: Iterator, U = T::Item>` and an impl that leaves `U` out
+/// (`impl<I: Iterator> Tr<I> for G<I>`): the completed arguments were `[I, T::Item]`, and `T` is
+/// not in the header of the impl (E0433). rustc takes the shorthand `T::Item` in a default only
+/// from nightly 1.101 (2026-10-13): stable 1.99, beta 1.100 and 1.56 reject it (E0220, `<T as
+/// Iterator>::Item` is accepted and was completed right), so there is no cross-crate fixture
+/// that builds on stable. On nightly the trait above in a Leaker's crate, with that impl in a
+/// Referrer's crate, did not build before the fix and builds after it. The property test does
+/// not show it either: its generator gives no such default.
+///
+/// Cause: `ParamFold` replaced a type that is the name of an earlier parameter (`T`), and walked
+/// into every other path, so `T::Item` kept its `T`; `SiteFold` also writes `T::A` as `<value>::A`.
+///
+/// Fix: `ParamFold::fold_type()` writes the path `T::A..` with `T` the name of an earlier
+/// parameter as `<value>::A..`, with the one builder that `SiteFold` uses (`projection()` of
+/// `encode/substitute.rs`); the segments after `T` are folded, as their arguments may name earlier
+/// parameters too.
+///
+/// Limitation, as for `substitute_args()`: a path in an expression (`T::LEN`) is not written so.
+#[test]
+fn f74_complete_params_writes_the_associated_type_of_an_earlier_parameter() {
+    // The trigger.
+    let params: Punctuated<GenericParam, Token![,]> =
+        parse_quote!(T, U = T::Item, V = Vec<T::Item>);
+    let completed = complete_params(&params, &f59_args(&["I"])).unwrap();
+    let completed: Vec<String> = completed.iter().map(string).collect();
+    assert_eq!(completed, ["I", "< I > :: Item", "Vec < < I > :: Item >"]);
+    let params: Punctuated<GenericParam, Token![,]> = parse_quote!(T: Iterator, U = T::Item);
+    let completed = complete_params(&params, &f59_args(&["IntoIter<u8>"])).unwrap();
+    assert_eq!(string(&completed[1]), "< IntoIter < u8 > > :: Item");
+
+    // Each default is what `substitute_args()` gives for it, whatever the argument.
+    let only_t: Punctuated<GenericParam, Token![,]> = parse_quote!(T);
+    for written in [
+        "T::Item",
+        "Vec<T::Item>",
+        "Option<(T, T::Item)>",
+        "&'static T::Item",
+        "[T::Item; 3]",
+        "T::A<T>",
+        "T::A<T::B>",
+        "T::A::B",
+        "<T as Iterator>::Item",
+        "Box<dyn Fn(T::Item) -> T::Other>",
+        "fn(T::Item) -> u8",
+        // Not a parameter: left as written.
+        "X::Item",
+        "::T::Item",
+    ] {
+        for arg in [
+            "I",
+            "IntoIter<u8>",
+            "(u8, i8)",
+            "&'static str",
+            "dyn Tr + Send",
+        ] {
+            let default: Type = parse_str(written).unwrap();
+            let params: Punctuated<GenericParam, Token![,]> = parse_quote!(T, U = #default);
+            let site = f59_args(&[arg]);
+            let completed = complete_params(&params, &site).unwrap();
+            let expected =
+                common::substitute_type(&default, common::answers(&only_t, &site), None).unwrap();
+            assert_eq!(
+                string(&completed[1]),
+                string(&expected),
+                "{} with {}",
+                written,
+                arg
+            );
+        }
+    }
+    // A name that is no parameter before the default is not an argument.
+    let params: Punctuated<GenericParam, Token![,]> = parse_quote!(T, U = X::Item);
+    let completed = complete_params(&params, &f59_args(&["I"])).unwrap();
+    assert_eq!(string(&completed[1]), "X :: Item");
+}
+
+// ── F76 ──────────────────────────────────────────────────────────────────────
+
+/// F76 (fixed): the parameter that an impl declares for `Self` (`ImplSelf::Param`, or the `param` of
+/// `ImplSelf::Bucket`) clashed with a generic of the entry that has the same name.
+///
+/// Trigger: `struct S<__S>(Rel<__S>)` with `ImplSelf::Param(__S)`, or a trait `Tr<__S>` whose
+/// method returns `Rel<Self, __S>`: the impl declared `__S` twice (`impl<__S, __S: ?Sized> ..`,
+/// E0403 in the Leaker's crate; for a trait, the bound `__S: Tr<__S>` would also mix the two).
+/// Fixture 9248.
+///
+/// Cause: `repeater_impl()` declared the name it was given, whatever names the type of the entry,
+/// the generics of its context and its bound already used.
+///
+/// Fix: `Referrer::self_param()` takes the given name unless one of them uses it, else the first of
+/// `{name}0`, `{name}1`, .. that none uses; `repeater_impl()` and `check_consts()` both ask it, so
+/// they agree. The name is a function of the entry and the given name only.
+#[test]
+fn f76_the_parameter_for_self_does_not_clash_with_a_generic_of_the_entry() {
+    let repeater: Path = parse_quote!(crate::Repeater);
+    let param: Ident = parse_quote!(__S);
+    let impls_of = |item: Item, target: ImplSelf| -> Vec<ItemImpl> {
+        let mut leaker = new_leaker();
+        intern(&mut leaker, &item);
+        let result = leaker.result();
+        assert!(result.errors().is_empty(), "{}", string(&item));
+        let impls = result
+            .repeater_impls(&repeater, 5, target, slot_const(&repeater))
+            .unwrap();
+        impls.map(ItemImpl::from).collect()
+    };
+    let key0 = repeater_key(5, parse_quote!(0));
+
+    // The trigger: the generic of the entry is `__S`.
+    let item: Item = parse_quote!(
+        struct S<__S>(Rel<__S>);
+    );
+    let expected: ItemImpl = parse_quote!(
+        impl<__S, __S0: ?::core::marker::Sized> crate::Repeater<(__S,), #key0> for __S0 {
+            type Type = Rel<__S>;
+        }
+    );
+    assert_eq!(impls_of(item, ImplSelf::Param(&param)), [expected]);
+    // The bucket's parameter is for the entries that need `Self`: the trait's `Self` is `__S0`, and
+    // the bound names the trait's own `__S`.
+    let item_self: Item = parse_quote!(
+        trait Tr<__S> {
+            fn f(&self) -> Rel<Self, __S>;
+        }
+    );
+    let expected: ItemImpl = parse_quote!(
+        impl<__S, __S0: ?::core::marker::Sized + Tr<__S>> crate::Repeater<(__S,), #key0> for __S0 {
+            type Type = Rel<__S0, __S>;
+        }
+    );
+    let expected = std::slice::from_ref(&expected);
+    assert_eq!(
+        impls_of(item_self.clone(), ImplSelf::Param(&param)),
+        expected
+    );
+    assert_eq!(
+        impls_of(item_self, ImplSelf::Bucket { param: &param }),
+        expected
+    );
+
+    // The next free name: `__S0` is used too. A const parameter keeps its place after the types.
+    let item: Item = parse_quote!(
+        struct S<__S, __S0, const N: usize>(Rel<__S, __S0, N>);
+    );
+    let expected: ItemImpl = parse_quote!(
+        impl<__S, __S0, __S1: ?::core::marker::Sized, const N: usize>
+            crate::Repeater<(__S, __S0, [(); N]), #key0> for __S1
+        {
+            type Type = Rel<__S, __S0, N>;
+        }
+    );
+    assert_eq!(impls_of(item, ImplSelf::Param(&param)), [expected]);
+
+    // A lifetime named like the parameter is no clash, a type of that name that is not declared is.
+    let item: Item = parse_quote!(
+        struct S<'__S>(Rel<'__S>);
+    );
+    let expected: ItemImpl = parse_quote!(
+        impl<'__S, __S: ?::core::marker::Sized> crate::Repeater<(&'__S (),), #key0> for __S {
+            type Type = Rel<'__S>;
+        }
+    );
+    assert_eq!(impls_of(item, ImplSelf::Param(&param)), [expected]);
+    let item: Item = parse_quote!(
+        struct S<T>(Rel<T, __S>);
+    );
+    let expected: ItemImpl = parse_quote!(
+        impl<T, __S0: ?::core::marker::Sized> crate::Repeater<(T,), #key0> for __S0 {
+            type Type = Rel<T, __S>;
+        }
+    );
+    assert_eq!(impls_of(item, ImplSelf::Param(&param)), [expected]);
+
+    // No clash, no change: the name is the one given. A struct that names `Self` declares none, a
+    // marker neither.
+    let item: Item = parse_quote!(
+        struct S<T>(Rel<T>);
+    );
+    let expected: ItemImpl = parse_quote!(
+        impl<T, __S: ?::core::marker::Sized> crate::Repeater<(T,), #key0> for __S {
+            type Type = Rel<T>;
+        }
+    );
+    assert_eq!(impls_of(item, ImplSelf::Param(&param)), [expected]);
+    let item: Item = parse_quote!(
+        struct S<__S>(Rel<Self, __S>);
+    );
+    let expected: ItemImpl = parse_quote!(
+        impl<__S> crate::Repeater<(__S,), #key0> for S<__S> {
+            type Type = Rel<Self, __S>;
+        }
+    );
+    assert_eq!(impls_of(item, ImplSelf::Param(&param)), [expected]);
+    let marker: Type = parse_quote!(crate::Marker);
+    let item: Item = parse_quote!(
+        struct S<__S>(Rel<__S>);
+    );
+    let expected: ItemImpl = parse_quote!(
+        impl<__S> crate::Repeater<(__S,), #key0> for crate::Marker {
+            type Type = Rel<__S>;
+        }
+    );
+    assert_eq!(impls_of(item, ImplSelf::Marker(&marker)), [expected]);
+}
+
+// ── F77 ──────────────────────────────────────────────────────────────────────
+
+/// F77 (fixed): a path of the Repeater that had arguments was not refused. Each place that wrote
+/// the arguments of the trait put them after those of the path.
+///
+/// Trigger: `repeater_impls(&parse_quote!(crate::Repeater<u8>), ..)`, `repeater_projection()` or
+/// `slot_const()` with that path: they wrote `crate::Repeater<u8><(T,)>`, which `parse_quote!`
+/// refused with a message about the tokens, in the first item of the iterator (after the call had
+/// returned `Ok`), in the projection after `const_fn` had run, or in the slot of the first const
+/// parameter.
+///
+/// Cause: three places (`repeater_trait_path()`, the path of `repeater_impl()` and
+/// `encode_slot_const()`) wrote `parse_quote!(#repeater<..>)`.
+///
+/// Fix: one `repeater_path()` appends the arguments to the last segment, and panics, naming the
+/// path, if it has arguments. An empty `<>` is the same as none (it was so, as `syn` does not
+/// print it: the test pins it). `repeater_impls()`, `repeater_projection()` and `slot_const()`
+/// check the path first (`# Panics` in their docs), so the panic comes before any item and before
+/// any call of `const_fn`.
+#[test]
+fn f77_the_path_of_the_repeater_is_checked_before_it_is_used() {
+    let item: Item = parse_quote!(
+        struct S<T, const N: u8, const B: bool, const M: u128>(Rel<T, N, B, M>);
+    );
+    let mut leaker = new_leaker();
+    intern(&mut leaker, &item);
+    let result = leaker.result();
+    let param: Ident = parse_quote!(__S);
+    let marker: Type = parse_quote!(crate::Marker);
+
+    // `<>` is the same as no arguments, for the impls, the projection and the slots.
+    let pairs: [(Path, Vec<Path>); 3] = [
+        (
+            parse_quote!(crate::Repeater),
+            vec![parse_quote!(crate::Repeater), parse_quote!(crate::Repeater)],
+        ),
+        (
+            parse_quote!(::a::Repeater),
+            vec![parse_quote!(::a::Repeater)],
+        ),
+        (parse_quote!(Repeater), vec![parse_quote!(Repeater)]),
+    ];
+    let referrer = result.clone().into_referrer();
+    let (ix, _, context) = referrer.iter().next().unwrap();
+    let mut compared = 0;
+    for (bare, empties) in &pairs {
+        let impls = |repeater: &Path, target: ImplSelf| -> Vec<RepeaterImpl> {
+            result
+                .repeater_impls(repeater, 5, target, slot_const(repeater))
+                .unwrap()
+                .collect()
+        };
+        for empty in empties {
+            for target in [
+                ImplSelf::Param(&param),
+                ImplSelf::Marker(&marker),
+                ImplSelf::Bucket { param: &param },
+            ] {
+                let (without, with) = (impls(bare, target), impls(empty, target));
+                assert_eq!(with, without, "{} {:?}", string(empty), target);
+                // The path of the trait has the one argument of the entry, after no other.
+                let mut expected = bare.clone();
+                let args = &with[0].args;
+                expected.segments.last_mut().unwrap().arguments =
+                    PathArguments::AngleBracketed(parse_quote!(<#args>));
+                assert_eq!(with[0].path, expected);
+                assert_eq!(string(&with[0]), string(&without[0]));
+                compared += 1;
+            }
+            let self_ty: Type = parse_quote!(Self);
+            let projection = |repeater: &Path| {
+                repeater_projection(repeater, &self_ty, context, 5, ix, slot_const(repeater))
+            };
+            assert_eq!(
+                projection(empty).unwrap(),
+                projection(bare).unwrap(),
+                "{}",
+                string(empty)
+            );
+            let params: [(&str, &str); 4] = [
+                ("N", "const N: u8"),
+                ("B", "const B: bool"),
+                ("M", "const M: u128"),
+                ("L", "const L: usize"),
+            ];
+            for (value, param) in params {
+                let (value, param): (Expr, ConstParam) =
+                    (parse_str(value).unwrap(), parse_str(param).unwrap());
+                assert_eq!(
+                    slot_const(empty)(&value, &param).unwrap(),
+                    slot_const(bare)(&value, &param).unwrap(),
+                    "{} {}",
+                    string(empty),
+                    string(&param)
+                );
+            }
+        }
+    }
+    assert_eq!(compared, 3 * 4);
+
+    // Arguments are refused, with a message that names the path.
+    let calls = std::cell::Cell::new(0);
+    let counted = |_: &Expr, _: &ConstParam| -> std::result::Result<Type, EncodeError> {
+        calls.set(calls.get() + 1);
+        Ok(parse_quote!(()))
+    };
+    let empty_result = new_leaker().result();
+    let mut parenthesized: Path = parse_quote!(a::Repeater);
+    parenthesized.segments.last_mut().unwrap().arguments =
+        PathArguments::Parenthesized(parse_quote!((u8)));
+    let bad: [(Path, &str); 4] = [
+        (parse_quote!(crate::Repeater<u8>), "crate::Repeater<u8>"),
+        (
+            parse_quote!(::a::Repeater<(u8, T)>),
+            "::a::Repeater<(u8, T)>",
+        ),
+        (parse_quote!(Repeater<'a>), "Repeater<'a>"),
+        (parenthesized, "a::Repeater (u8)"),
+    ];
+    for (repeater, written) in bad {
+        let message = format!(
+            "the path of the Repeater names the trait without arguments: `{}`",
+            written
+        );
+        // Before any item, though the item has const parameters, and also with no entry.
+        for (what, result) in [("entries", &result), ("no entry", &empty_result)] {
+            for target in [ImplSelf::Param(&param), ImplSelf::Marker(&marker)] {
+                assert_eq!(
+                    common::panic_message(|| {
+                        let _ = result.repeater_impls(&repeater, 5, target, counted);
+                    }),
+                    message,
+                    "repeater_impls of {} with {} for {:?}",
+                    what,
+                    written,
+                    target
+                );
+            }
+        }
+        assert_eq!(
+            common::panic_message(|| {
+                let _ =
+                    repeater_projection(&repeater, &parse_quote!(Self), context, 5, ix, counted);
+            }),
+            message,
+            "repeater_projection with {}",
+            written
+        );
+        assert_eq!(
+            common::panic_message(|| {
+                let _ = slot_const(&repeater);
+            }),
+            message,
+            "slot_const with {}",
+            written
+        );
+    }
+    assert_eq!(calls.get(), 0, "const_fn was called");
+}
+
+// ── F78 ──────────────────────────────────────────────────────────────────────
+
+/// F78 (fixed): the panic for an id that the Referrer does not have did not name it.
+///
+/// Trigger: `visitor()` or `expand()` with a `ContextId` of another Referrer (or a dropped one) was
+/// `no entry found for key`, `bucket_self()` with an `EntryId` of another Referrer was `index out of
+/// bounds: the len is 1 but the index is 5`; neither says which call or id, and `bucket_self()` had
+/// no `# Panics` in its docs. A macro that reads the ids from tokens of another macro meets it.
+///
+/// Cause: the lookups were `self.contexts[&context]` and `self.entries[ix]`.
+///
+/// Fix: `visitor()` (so `expand()`) panics with `the context N is not one of this Referrer`, and
+/// `bucket_self()` first checks the index and panics with `the entry N is not one of this Referrer
+/// (M entries)`, which its `# Panics` documents. `tests/context_id.rs` has the table of the ids a
+/// Referrer lacks for the two lookups of a context.
+#[test]
+fn f78_an_id_that_the_referrer_does_not_have_is_named_in_the_panic() {
+    let items: Vec<(Item, usize)> = vec![
+        (
+            parse_quote!(
+                struct S;
+            ),
+            0,
+        ),
+        (
+            parse_quote!(
+                struct S(Rel);
+            ),
+            1,
+        ),
+        (
+            parse_quote!(
+                struct S<T>(Rel, Wrap<T>, (Rel, T));
+            ),
+            2,
+        ),
+    ];
+    for (item, entries) in items {
+        let mut leaker = new_leaker();
+        intern(&mut leaker, &item);
+        let referrer = leaker.result().into_referrer();
+        assert_eq!(referrer.iter().count(), entries);
+        // Every entry has one; the first index beyond them, and one far away, do not.
+        for ix in 0..entries {
+            let _ = referrer.bucket_self(parse_quote!(#ix), 7);
+        }
+        for ix in [entries, entries + 1, 99] {
+            assert_eq!(
+                common::panic_message(|| {
+                    let _ = referrer.bucket_self(parse_quote!(#ix), 7);
+                }),
+                format!(
+                    "the entry {} is not one of this Referrer ({} entries)",
+                    ix, entries
+                ),
+                "{} with the entry {}",
+                string(&item),
+                ix
+            );
+        }
+        // A context of another Referrer: the ids are small numbers, so one beyond them.
+        let unknown: ContextId = parse_quote!(99);
+        let message = "the context 99 is not one of this Referrer";
+        assert_eq!(
+            common::panic_message(|| {
+                let _ = referrer.visitor(unknown, |ty, _, _| ty);
+            }),
+            message
+        );
+        assert_eq!(
+            common::panic_message(|| {
+                let _ = referrer.expand(unknown, parse_quote!(Rel), |ty, _, _| ty);
+            }),
+            message
+        );
+    }
+}
+
+// ── F79 ──────────────────────────────────────────────────────────────────────
+
+/// F79 (fixed, docs only): the docs said that the rule is never asked about a path that starts
+/// with `Self`, but a rule on `Self` accepts the error of a `Self` that has no meaning.
+///
+/// Trigger: `Rel<Self>` in a scope that gives `Self` no meaning (`enter_generics()` of no
+/// generics) is the error `SelfWithoutMeaning`, with the cause `Self` and no
+/// [`paths`](ErrorItem::paths). A rule that allows `Cause::Type(Self)` drops it, given to
+/// `Leaker::from_config()` and to `LeakerResult::allow()`: both stages filter by the cause for
+/// an error with no paths. The docs of `Allow` and `allows_entry()` read as if the rule were
+/// never asked.
+///
+/// Cause: the sentence was about the walk of the analysis (`heads_own_name()`) and the entries of
+/// `paths`, which are not asked about `Self`; the filter of the errors is another call.
+///
+/// Fix: docs only. `Allow` says that a path that starts with `Self` is not asked as the analysis
+/// walks, and that the cause of the error of a `Self` without meaning is asked at both stages;
+/// `Reason::SelfWithoutMeaning` says so too. The behaviour stays: the rule is asked the cause
+/// `Self` (or `Self::Item`) once for the error, and never as a path of the walk.
+#[test]
+fn f79_a_rule_on_self_accepts_the_error_of_a_self_without_meaning() {
+    let ty: Type = parse_quote!(Rel<Self>);
+    let self_ty = Cause::Type(parse_quote!(Self));
+    let rel = Cause::Type(parse_quote!(Rel));
+    fn scope<A: Allow>(leaker: &mut Leaker<A>, ty: &Type) {
+        leaker.enter_generics(&Generics::default(), |view| view.visit_type(ty));
+    }
+
+    // Without a rule: one error, for `Self`, with no paths.
+    let mut leaker = Leaker::new();
+    scope(&mut leaker, &ty);
+    let result = leaker.result();
+    assert_eq!(result.errors().len(), 1);
+    assert_eq!(result.errors()[0].reason, Reason::SelfWithoutMeaning);
+    assert_eq!(result.errors()[0].cause, self_ty);
+    assert!(result.errors()[0].paths.is_empty());
+
+    // The rule on `Self` drops it at the result.
+    let asked = std::cell::RefCell::new(Vec::new());
+    let on_self = |cause: &Cause, _: Place| {
+        asked.borrow_mut().push(cause.clone());
+        *cause == Cause::Type(parse_quote!(Self))
+    };
+    assert!(result.allow(on_self).finish().is_ok());
+    assert_eq!(asked.borrow().as_slice(), std::slice::from_ref(&self_ty));
+
+    // And in the Leaker: it is asked about `Rel` as the analysis walks (more than once), and about
+    // `Self` once, last, for the error at the end of the scope, not as a path of the walk.
+    asked.borrow_mut().clear();
+    let mut leaker = Leaker::from_config(on_self);
+    scope(&mut leaker, &ty);
+    assert!(leaker.result().finish().is_ok());
+    let asked = asked.borrow();
+    assert!(asked.iter().all(|cause| *cause == rel || *cause == self_ty));
+    assert_eq!(asked.iter().filter(|cause| **cause == self_ty).count(), 1);
+    assert_eq!(asked.last(), Some(&self_ty));
+    drop(asked);
+
+    // `Self::Item` is another cause: a rule on `Self` does not accept it.
+    let item: Type = parse_quote!(Wrap<Self::Item>);
+    let mut leaker = Leaker::from_config(on_self);
+    scope(&mut leaker, &item);
+    let errors = leaker.result().errors().to_vec();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].cause, Cause::Type(parse_quote!(Self::Item)));
 }

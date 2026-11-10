@@ -4,7 +4,8 @@
 use crate::allow::Place;
 use crate::analysis::{CheckResult, SelfMention};
 use crate::util::{
-    or_list, path_starts_with, tidy, without_arguments, without_crate_prefix, KNOWN_NAMES,
+    has_lifetime_bound, is_std_crate_path, or_list, path_starts_with, path_type, tidy,
+    without_arguments, without_crate_prefix, KNOWN_NAMES,
 };
 use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use std::hash::{Hash, Hasher};
@@ -65,10 +66,7 @@ impl Cause {
 
     /// The cause that is the path of a type (`Rel`, `Self::Item`).
     pub(crate) fn type_path(path: &Path) -> Self {
-        Cause::Type(Type::Path(syn::TypePath {
-            qself: None,
-            path: path.clone(),
-        }))
+        Cause::Type(path_type(path))
     }
 
     /// The cause that is a path in an expression.
@@ -302,6 +300,8 @@ pub enum Reason {
     /// `Self` where no scope gives it a meaning: in a module, or in generics that no struct, enum,
     /// union, impl or trait encloses. A macro can enter such a scope
     /// ([`Leaker::enter_type()`](crate::Leaker::enter_type), `enter_impl()`, `enter_trait()`).
+    /// The error has no [`paths`](ErrorItem::paths), so a rule that allows its cause (`Self`,
+    /// `Self::Item`) accepts it ([`Allow`](crate::Allow)).
     SelfWithoutMeaning,
     /// Syntax that the Leaker cannot read, with `check_values`: a macro whose arguments are not
     /// expressions, a `macro_rules!`, a glob import, syntax that `syn` leaves unparsed.
@@ -794,10 +794,7 @@ pub(crate) fn report(conflict: &CheckResult) -> Option<ErrorItem> {
 /// path cannot be leaked (see [Trait objects](crate::Leaker#trait-objects)).
 fn is_default_lifetime_object(cause: &Cause) -> bool {
     match cause {
-        Cause::Type(syn::Type::TraitObject(object)) => !object
-            .bounds
-            .iter()
-            .any(|bound| matches!(bound, syn::TypeParamBound::Lifetime(_))),
+        Cause::Type(syn::Type::TraitObject(object)) => !has_lifetime_bound(object),
         _ => false,
     }
 }
@@ -899,19 +896,11 @@ fn path_names(path: &syn::Path) -> (String, String) {
     );
     // `core::fmt::Debug` is `::core::fmt::Debug`; `crate::m::X` and `super::m::X` are `m::X` in the
     // crate.
-    let example = if path.leading_colon.is_none() && path.segments.len() > 1 && is_std_crate(path) {
-        format!("::{}", names(path))
-    } else {
-        format!("::my_crate::{}", names(&without_crate_prefix(path)))
-    };
+    let example =
+        if path.leading_colon.is_none() && path.segments.len() > 1 && is_std_crate_path(path) {
+            format!("::{}", names(path))
+        } else {
+            format!("::my_crate::{}", names(&without_crate_prefix(path)))
+        };
     (name, example)
-}
-
-/// Returns `true` if `path` starts with the name of `core`, `std` or `alloc`.
-fn is_std_crate(path: &syn::Path) -> bool {
-    path.segments.first().map_or(false, |seg| {
-        ["core", "std", "alloc"]
-            .iter()
-            .any(|name| seg.ident == name)
-    })
 }

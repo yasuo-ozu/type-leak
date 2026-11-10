@@ -1,10 +1,10 @@
-//! Tests for the Repeater definition, `slot_const()` and `array_const()`, and for the errors
+//! Tests for the Repeater definition, `slot_const()` and `array_const()`, for the errors
 //! of the encoders and of the helpers that encode (`EncodeError`): their text, the conversion to
-//! `syn::Error`, and the `std::error::Error` impls. The encoders themselves, and the text of
-//! `UnsupportedConstType`, `UnexpectedArgument` and `MissingArgument`, are tested in
-//! `src/encode/tests.rs`. The spans of the errors are checked in `tests/crates/spans`, which
-//! `tests/diagnostic.rs` runs: they need a feature of `proc-macro2` that the tests of this package
-//! cannot have.
+//! `syn::Error`, and the `std::error::Error` impls, and for the encoding of the generics of an
+//! entry (the last section): `repeater_projection()`, and `complete_params()` and
+//! `substitute_args()` for a site. The spans of the errors are checked in `tests/crates/spans`,
+//! which `tests/diagnostic.rs` runs: they need a feature of `proc-macro2` that the tests of this
+//! package cannot have.
 
 mod common;
 
@@ -656,4 +656,769 @@ fn repeater_projection_writes_the_generics_of_the_entry_by_their_names() {
         "{}",
         err
     );
+}
+
+// ── the encoding of the generics of an entry ─────────────────────────────────────────────────────
+//
+// The Leaker analyzes `trait Tr<generics> { fn f(&self) -> All<..>; }`, whose one entry names every
+// generic, so the `Context` of the entry has them (`using()`), and `repeater_projection()` encodes
+// them by their own names. A site writes the arguments it gives with `complete_params()`, which
+// takes the defaults, and `substitute_args()` (`at_site()`).
+
+fn s<T: ToTokens>(t: &T) -> String {
+    quote!(#t).to_string()
+}
+
+/// A type written as it is printed, to compare with an encoding.
+fn t(ty: Type) -> String {
+    s(&ty)
+}
+
+/// The generics without their defaults, which the context of an entry has none of.
+fn without_defaults(generics: &Generics) -> Generics {
+    let mut generics = generics.clone();
+    for param in generics.params.iter_mut() {
+        match param {
+            GenericParam::Type(param) => {
+                param.eq_token = None;
+                param.default = None;
+            }
+            GenericParam::Const(param) => {
+                param.eq_token = None;
+                param.default = None;
+            }
+            GenericParam::Lifetime(_) => (),
+        }
+    }
+    generics
+}
+
+/// The Referrer of `trait Tr<generics> { fn f(&self) -> All<..>; }`, whose only entry, `All<..>`,
+/// names every generic: its context has all of them, without defaults, sorted (lifetimes, types,
+/// consts, each by name), and the lifetime bounds as written, whatever they bound. If `outlives`
+/// is not empty the trait is `where Self: 'a + ..` and the entry names `Self`: `Self: 'a` is in
+/// `Context::self_outlives`, sorted.
+fn using(generics: &Generics, outlives: &[&str]) -> Referrer {
+    let mut names: Vec<String> = generics
+        .params
+        .iter()
+        .map(|param| match param {
+            GenericParam::Lifetime(param) => s(&param.lifetime),
+            GenericParam::Type(param) => s(&param.ident),
+            GenericParam::Const(param) => s(&param.ident),
+        })
+        .collect();
+    let mut where_clause = String::new();
+    if !outlives.is_empty() {
+        where_clause = format!("where Self: {}", outlives.join(" + "));
+        names.push("Self".to_string());
+    }
+    let entry = if names.is_empty() {
+        "All".to_string()
+    } else {
+        format!("All<{}>", names.join(", "))
+    };
+    let item: ItemTrait = parse_str(&format!(
+        "trait Tr {} {} {{ fn f(&self) -> {}; }}",
+        s(&without_defaults(generics)),
+        where_clause,
+        entry
+    ))
+    .unwrap();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item);
+    let result = leaker.result();
+    assert!(result.errors().is_empty(), "{}", s(&item));
+    result.finish().unwrap()
+}
+
+/// The first argument of the Repeater that `repeater_projection()` writes for the only entry of
+/// `referrer`, `ARGS` of `<self_ty as Repeater<ARGS, KEY>>::Type`: the generics of its context, by
+/// their own names.
+fn args_of(
+    referrer: &Referrer,
+    self_ty: &Type,
+    const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
+) -> std::result::Result<Type, EncodeError> {
+    let (ix, _, context) = referrer.iter().next().unwrap();
+    let projection = repeater_projection(&repeater(), self_ty, context, 7, ix, const_fn)?;
+    Ok(common::projection_args(&projection))
+}
+
+/// The arguments written as `<..>` at a site, with the bindings.
+fn given(args: &str) -> Vec<GenericArgument> {
+    let args: AngleBracketedGenericArguments = parse_str(args).unwrap();
+    args.args.into_iter().collect()
+}
+
+/// The same at a site that gives `args` for the parameters `written` of the item: the arguments are
+/// completed (`complete_params()`), and take the place of the names (`substitute_args()`).
+/// `self_ty` is what `Self: 'a` names (`None`: `Self`).
+fn at_site(
+    referrer: &Referrer,
+    written: &Generics,
+    args: &[GenericArgument],
+    self_ty: Option<&Type>,
+    const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
+) -> std::result::Result<Type, EncodeError> {
+    let completed = complete_params(&written.params, args)?;
+    common::repeater_args(
+        common::entry(referrer, 0),
+        common::answers(&written.params, &completed),
+        self_ty,
+        const_fn,
+    )
+}
+
+/// The `Context` of the only entry of `referrer`, with `Self: 'a` for the lifetimes `outlives`, in
+/// this order. The analysis sorts them, and names only the lifetimes of the generics, so this is the
+/// one input that no item gives (`Context::self_outlives` is a public field of a value that can be
+/// cloned).
+fn with_outlives(referrer: &Referrer, outlives: &[&str]) -> (EntryId, Context) {
+    let (ix, _, context) = referrer.iter().next().unwrap();
+    let mut context = context.clone();
+    context.self_outlives = outlives.iter().map(|l| parse_str(l).unwrap()).collect();
+    (ix, context)
+}
+
+/// Each const type has its slot of the Repeater, for the generics of an entry and for the arguments
+/// of a site. The context sorts the consts by name (`B`, `I`, `M`, `N`, `X`), and a site writes a
+/// const that it gives in braces (`[(); { 3 }]`), as `substitute_args()` does. `array_const` is no
+/// encoding of a `bool`: the slots are.
+#[test]
+fn the_slots_encode_the_consts_of_the_generics_of_an_entry_and_of_a_site() {
+    let repeater = repeater();
+    // The trait as written: `M` has the default `N`.
+    let written: Generics = parse_quote! {
+        <'a, T, const N: usize, const X: u128, const B: bool, const I: i32, const M: usize = N>
+    };
+    let referrer = using(&written, &[]);
+    let encoded = args_of(&referrer, &parse_quote!(Self), slot_const(&repeater)).unwrap();
+    let expected: Type = parse_quote!((
+        &'a (),
+        T,
+        *const dyn crate::Repeater<(), 0, B, Type = ()>,
+        *const dyn crate::Repeater<(), 0, false, '\0', 0, 0, 0, 0, 0, 0, I, Type = ()>,
+        [(); M],
+        [(); N],
+        *const dyn crate::Repeater<(), X, Type = ()>
+    ));
+    assert_eq!(s(&encoded), s(&expected));
+
+    // The arguments of a site: a bare const `B` (the slot keeps it), a negative literal, a skipped
+    // binding, and an omitted default that names a preceding parameter (`M = N` is `3`).
+    let args = given("<'static, u8, 3, 7, B, -5, Item = u8>");
+    let ty = at_site(&referrer, &written, &args, None, slot_const(&repeater)).unwrap();
+    let expected: Type = parse_quote!((
+        &'static (),
+        u8,
+        *const dyn crate::Repeater<(), 0, B, Type = ()>,
+        *const dyn crate::Repeater<(), 0, false, '\0', 0, 0, 0, 0, 0, 0, -5, Type = ()>,
+        [(); { 3 }],
+        [(); { 3 }],
+        *const dyn crate::Repeater<(), 7, Type = ()>
+    ));
+    assert_eq!(s(&ty), s(&expected));
+
+    // A block is a const argument, and a `bool` and a `0` are written as they are.
+    let args = given("<'static, u8, { 1 + 2 }, 7, true, 0>");
+    let ty = at_site(&referrer, &written, &args, None, slot_const(&repeater)).unwrap();
+    let expected: Type = parse_quote!((
+        &'static (),
+        u8,
+        *const dyn crate::Repeater<(), 0, true, Type = ()>,
+        *const dyn crate::Repeater<(), 0, false, '\0', 0, 0, 0, 0, 0, 0, 0, Type = ()>,
+        [(); { 1 + 2 }],
+        [(); { 1 + 2 }],
+        *const dyn crate::Repeater<(), 7, Type = ()>
+    ));
+    assert_eq!(s(&ty), s(&expected));
+
+    // Errors of the arguments: a missing lifetime, an extra lifetime, a missing argument that has no
+    // default.
+    for (args, message) in [
+        ("<u8, 3, 7, B, -5>", "missing generic argument for ''a'"),
+        (
+            "<'static, 'static, u8, 3, 7, B, -5>",
+            "unexpected generic argument: ''static'",
+        ),
+        (
+            "<'static, u8>",
+            "missing generic argument for 'const N : usize'",
+        ),
+    ] {
+        let err = at_site(
+            &referrer,
+            &written,
+            &given(args),
+            None,
+            slot_const(&repeater),
+        );
+        assert_eq!(err.unwrap_err().to_string(), message, "{}", args);
+    }
+    // `array_const` and a `bool`: only the slots encode it (an alias has none:
+    // `the_text_of_every_variant`).
+    let flag: Generics = parse_quote!(<const B: bool>);
+    let flag = using(&flag, &[]);
+    let err = args_of(&flag, &parse_quote!(Self), array_const).unwrap_err();
+    assert!(
+        matches!(err, EncodeError::UnsupportedConstType(_)),
+        "{}",
+        err
+    );
+    let ty = args_of(&flag, &parse_quote!(Self), slot_const(&repeater)).unwrap();
+    assert_eq!(
+        s(&ty),
+        t(parse_quote!((
+            *const dyn crate::Repeater<(), 0, B, Type = ()>,
+        )))
+    );
+
+    // No generics, and a single generic (a one-element tuple).
+    let none = using(&Generics::default(), &[]);
+    let ty = args_of(&none, &parse_quote!(Self), slot_const(&repeater)).unwrap();
+    assert_eq!(s(&ty), t(parse_quote!(())));
+    let single: Generics = parse_quote!(<T>);
+    let ty = args_of(
+        &using(&single, &[]),
+        &parse_quote!(Self),
+        slot_const(&repeater),
+    )
+    .unwrap();
+    assert_eq!(s(&ty), t(parse_quote!((T,))));
+}
+
+/// A default that names a const as a type argument (`IntoIter<u8, N>`: syn parses the `N` as a type)
+/// takes the value of the const when it is completed.
+#[test]
+fn a_default_that_names_a_const_as_a_type_argument_takes_its_value() {
+    let written: Generics = parse_quote!(<const N: usize, U = ::core::array::IntoIter<u8, N>>);
+    let args = given("<3>");
+    let completed = complete_params(&written.params, &args).unwrap();
+    let expected: Vec<GenericArgument> = vec![
+        parse_quote!(3),
+        parse_quote!(::core::array::IntoIter<u8, 3>),
+    ];
+    assert_eq!(completed, expected);
+    // The encoding at the site: the types, then the const, as the context has them.
+    let ty = at_site(&using(&written, &[]), &written, &args, None, array_const).unwrap();
+    assert_eq!(
+        s(&ty),
+        t(parse_quote!((::core::array::IntoIter<u8, 3>, [(); { 3 }])))
+    );
+}
+
+/// The arguments that a site gives are completed for the generics as written (the defaults are
+/// there), and written for the names in the encoding of the generics of the entry. A bare `N` is a
+/// const, bindings are skipped, and too many or too few arguments are the errors of
+/// `complete_params()`. The context sorts the generics, so the arguments go by name.
+#[test]
+fn the_arguments_of_a_site_are_completed_for_the_generics_as_written_and_placed_by_name() {
+    type Row = (
+        Generics,
+        &'static str,
+        std::result::Result<Type, &'static str>,
+    );
+    let rows: Vec<Row> = vec![
+        (
+            parse_quote!(<'a, T, const N: usize>),
+            "<'static, u8, N>",
+            Ok(parse_quote!((&'static (), u8, [(); { N }]))),
+        ),
+        (
+            parse_quote!(<'a, T, const N: usize>),
+            "<'static, u8, { 3 }>",
+            Ok(parse_quote!((&'static (), u8, [(); { 3 }]))),
+        ),
+        (
+            parse_quote!(<'a, T, const N: usize, U = Vec<T>>),
+            "<'static, u8, N, Item = u8>",
+            Ok(parse_quote!((&'static (), u8, Vec<u8>, [(); { N }]))),
+        ),
+        (
+            parse_quote!(<'a, T, const N: usize, U = Vec<T>>),
+            "<'static, u8, 3, u16, u32>",
+            Err("unexpected generic argument: 'u32'"),
+        ),
+        (
+            parse_quote!(<'a, T, const N: usize, U = Vec<T>>),
+            "<'static, u8>",
+            Err("missing generic argument for 'const N : usize'"),
+        ),
+        (
+            parse_quote!(<T>),
+            "<u8, Item = u8>",
+            Ok(parse_quote!((u8,))),
+        ),
+        (
+            parse_quote!(<T, const N: usize, const M: usize = 3>),
+            "<u8, N>",
+            Ok(parse_quote!((u8, [(); { 3 }], [(); { N }]))),
+        ),
+        // The bounds of the generics are encoded, so the arguments are given for the generics as
+        // written, and the arguments of a context's own generics (defaults dropped) are not enough.
+        (
+            parse_quote!(<'a, T: 'a>),
+            "<'static, u8>",
+            Ok(parse_quote!((&'static (), u8, &'static u8))),
+        ),
+        (
+            parse_quote!(<T, U>),
+            "<u8>",
+            Err("missing generic argument for 'U'"),
+        ),
+        // The documented examples.
+        (
+            parse_quote!(<'a, T: 'a, const N: usize>),
+            "<'static, u8, 3>",
+            Ok(parse_quote!((&'static (), u8, [(); { 3 }], &'static u8))),
+        ),
+        (
+            parse_quote!(<T: ?Sized, U>),
+            "<str, u8>",
+            Ok(parse_quote!((*const str, u8))),
+        ),
+    ];
+    for (written, args, expected) in rows {
+        let case = format!("{} with {}", s(&written), args);
+        let referrer = using(&written, &[]);
+        let encoded = at_site(&referrer, &written, &given(args), None, array_const);
+        match (encoded, expected) {
+            (Ok(ty), Ok(expected)) => assert_eq!(s(&ty), s(&expected), "{}", case),
+            (Err(err), Err(expected)) => assert_eq!(err.to_string(), expected, "{}", case),
+            (encoded, expected) => panic!("{}: {:?} against {:?}", case, encoded, expected),
+        }
+    }
+}
+
+/// A lifetime bound `T: 'a` is `&'a T` and `'b: 'a` is `&'a &'b ()`, after the elements of the
+/// parameters, in the order of the parameters and of their bounds. A bound by `'static`, and one by
+/// a lifetime that is not a parameter, is not encoded. The const parameters are encoded by the
+/// closure, which gets the parameters only.
+#[test]
+fn the_lifetime_bounds_of_the_generics_are_encoded_after_the_parameters() {
+    let rows: Vec<(Generics, Type)> = vec![
+        (
+            parse_quote!(<
+                'a, 'b: 'a, T: 'a + ::core::clone::Clone + 'b, U: 'static, V: 'c, const N: usize
+            >),
+            parse_quote!((&'a (), &'b (), T, U, V, [(); N], &'a &'b (), &'a T, &'b T)),
+        ),
+        (
+            parse_quote!(<'a, T: 'a, const N: usize>),
+            parse_quote!((&'a (), T, [(); N], &'a T)),
+        ),
+        // Without the bound, nothing follows the parameters.
+        (
+            parse_quote!(<'a, T, const N: usize>),
+            parse_quote!((&'a (), T, [(); N])),
+        ),
+        (
+            parse_quote!(<'a, 'b: 'a, T: 'a + ::core::clone::Clone, const N: usize>),
+            parse_quote!((&'a (), &'b (), T, [(); N], &'a &'b (), &'a T)),
+        ),
+        // A single parameter and its bound; no bound, no element.
+        (parse_quote!(<'a: 'a>), parse_quote!((&'a (), &'a &'a ()))),
+        (parse_quote!(<T: 'static>), parse_quote!((T,))),
+    ];
+    let repeater = repeater();
+    for (generics, expected) in rows {
+        let referrer = using(&generics, &[]);
+        let ty = args_of(&referrer, &parse_quote!(Self), array_const).unwrap();
+        assert_eq!(s(&ty), s(&expected), "{}", s(&generics));
+        // The slots encode the same, as `usize` is `[(); N]` for both.
+        let ty = args_of(&referrer, &parse_quote!(Self), slot_const(&repeater)).unwrap();
+        assert_eq!(s(&ty), s(&expected), "{}", s(&generics));
+    }
+
+    // The closure for the consts is used for the parameters only: not for the bounds.
+    let generics: Generics = parse_quote!(<'a, T: 'a, const B: bool>);
+    let referrer = using(&generics, &[]);
+    let ty = args_of(&referrer, &parse_quote!(Self), |value, _| {
+        Ok(parse_quote!(::my_crate::ConstBool<#value>))
+    })
+    .unwrap();
+    let expected: Type = parse_quote!((&'a (), T, ::my_crate::ConstBool<B>, &'a T));
+    assert_eq!(s(&ty), s(&expected));
+    let ty = args_of(&referrer, &parse_quote!(Self), slot_const(&repeater)).unwrap();
+    let expected: Type = parse_quote!((
+        &'a (),
+        T,
+        *const dyn crate::Repeater<(), 0, B, Type = ()>,
+        &'a T
+    ));
+    assert_eq!(s(&ty), s(&expected));
+}
+
+/// A site's lifetimes and types replace the names in the encoded bounds as well as in the elements
+/// of the parameters, whatever they are (the lifetimes of the Referrer's generics, a type of another
+/// crate), and a site that gives each generic by its own name changes nothing but the braces of a
+/// const.
+#[test]
+fn the_arguments_of_a_site_replace_the_names_in_the_encoded_bounds() {
+    let written: Generics = parse_quote!(<'a, 'b: 'a, T: 'a + 'b, const N: usize, U = Vec<T>>);
+    let referrer = using(&written, &[]);
+    let repeater = repeater();
+    let expected: Type = parse_quote!((
+        &'static (),
+        &'x (),
+        u8,
+        Vec<u8>,
+        [(); { 3 }],
+        &'static &'x (),
+        &'static u8,
+        &'x u8
+    ));
+    let args = given("<'static, 'x, u8, 3>");
+    let ty = at_site(&referrer, &written, &args, None, array_const).unwrap();
+    assert_eq!(s(&ty), s(&expected));
+    let ty = at_site(&referrer, &written, &args, None, slot_const(&repeater)).unwrap();
+    assert_eq!(s(&ty), s(&expected));
+
+    // The arguments may be any types, and the lifetimes of the Referrer's generics.
+    let args = given("<'p, 'q, ::p::W<&'p u8>, N, ()>");
+    let ty = at_site(&referrer, &written, &args, None, array_const).unwrap();
+    let expected: Type = parse_quote!((
+        &'p (),
+        &'q (),
+        ::p::W<&'p u8>,
+        (),
+        [(); { N }],
+        &'p &'q (),
+        &'p ::p::W<&'p u8>,
+        &'q ::p::W<&'p u8>
+    ));
+    assert_eq!(s(&ty), s(&expected));
+
+    // The encoding of the arguments is that of the parameters they replace: the same type with the
+    // parameters as the arguments (a const is `{ N }` where it is substituted).
+    for generics in [
+        parse_quote!(<'a, 'b: 'a, T: 'a + 'b, const N: usize>),
+        parse_quote!(<'a, T: 'a, U: 'a + ::core::clone::Clone, V: 'static>),
+        parse_quote!(<'a: 'a, 'b: 'a>),
+        parse_quote!(<T>),
+        parse_quote!(<>),
+    ] {
+        let generics: Generics = generics;
+        let referrer = using(&generics, &[]);
+        let own: Vec<GenericArgument> = generics.params.iter().map(common::own_name_arg).collect();
+        let params = args_of(&referrer, &parse_quote!(Self), array_const).unwrap();
+        let replaced = at_site(&referrer, &generics, &own, None, array_const).unwrap();
+        assert_eq!(
+            s(&replaced).replace("{ N }", "N"),
+            s(&params),
+            "{}",
+            s(&generics)
+        );
+    }
+}
+
+/// The closure for the consts gets the const of the entry by its name, and the argument of a site
+/// takes its place in what it wrote: braced where it needs braces, as it is where it does not.
+#[test]
+fn the_consts_a_site_gives_are_braced_in_what_the_closure_wrote() {
+    let written: Generics = parse_quote!(<const A: i32, const B: i32>);
+    let referrer = using(&written, &[]);
+    let flag = |value: &Expr, _: &ConstParam| Ok(parse_quote!(::my_crate::ConstI32<#value>));
+    let own = args_of(&referrer, &parse_quote!(Self), flag).unwrap();
+    assert_eq!(
+        s(&own),
+        t(parse_quote!((
+            ::my_crate::ConstI32<A>,
+            ::my_crate::ConstI32<B>
+        )))
+    );
+    let args = given("<{ i32::MIN }, { N }>");
+    let ty = at_site(&referrer, &written, &args, None, flag).unwrap();
+    let expected: Type =
+        parse_quote!((::my_crate::ConstI32<{ i32::MIN }>, ::my_crate::ConstI32<N>));
+    assert_eq!(s(&ty), s(&expected));
+}
+
+/// A trait object that a site gives for a `?Sized` parameter is a pointer to it in the elements of
+/// the parameters, and the one with several bounds is parenthesized (`&'a dyn A + 'b` is ambiguous).
+/// A parameter that has no bound on a lifetime takes any argument.
+///
+/// A `dyn Tr` with no lifetime bound is written as it is (`&'x dyn Tr` for `&'a T`) by
+/// `substitute_args()`, which has no `UnboundedTraitObject`: that error is the one for the type that
+/// `Self: 'a` names (`unbounded_self_error()`).
+#[test]
+fn a_trait_object_that_a_site_gives_for_an_unsized_parameter_is_a_pointer_to_it() {
+    let written: Generics = parse_quote!(<'a, T: ?Sized + 'a>);
+    let referrer = using(&written, &[]);
+    for object in [
+        parse_quote!(dyn Tr + 'static),
+        parse_quote!((dyn Tr + 'y)),
+        parse_quote!(dyn Tr + Send + 'static),
+    ] {
+        let object: Type = object;
+        let args = vec![parse_quote!('x), GenericArgument::Type(object.clone())];
+        let ty = at_site(&referrer, &written, &args, None, array_const).unwrap();
+        // A parameter that may be unsized is a pointer, so as to be `Sized`.
+        let pointee = match &object {
+            Type::Paren(TypeParen { elem, .. }) => elem.as_ref().clone(),
+            object => object.clone(),
+        };
+        let expected: Type = parse_quote!((&'x (), *const (#pointee), &'x (#pointee)));
+        assert_eq!(s(&ty), s(&expected), "{}", s(&object));
+    }
+    // Without a bound on the parameter, any argument is fine.
+    let written: Generics = parse_quote!(<'a, T: ?Sized>);
+    let args = given("<'x, dyn Tr>");
+    let ty = at_site(&using(&written, &[]), &written, &args, None, array_const).unwrap();
+    assert_eq!(s(&ty), t(parse_quote!((&'x (), *const dyn Tr))));
+}
+
+/// `Self: 'a` follows the lifetime bounds, once for each lifetime of `Context::self_outlives`, with
+/// the type that stands for `Self`; a lifetime that is not a parameter of the generics is skipped.
+/// The arguments of a site replace the lifetimes, `Self` included, and a trait object without a
+/// lifetime bound cannot stand for `Self` there.
+#[test]
+fn self_outlives_is_encoded_after_the_lifetime_bounds_with_the_type_for_self() {
+    let generics: Generics = parse_quote!(<'a, 'b, T: 'a, const N: usize>);
+    let with_self = using(&generics, &["'b", "'a"]);
+    // The analysis sorts the lifetimes.
+    let outlives = |context: &Context| context.self_outlives.iter().map(s).collect::<Vec<_>>();
+    assert_eq!(outlives(common::entry(&with_self, 0)), ["'a", "'b"]);
+    let plain = using(&generics, &[]);
+    assert!(outlives(common::entry(&plain, 0)).is_empty());
+    let self_ty: Type = parse_quote!(__S);
+    let ty = args_of(&with_self, &self_ty, array_const).unwrap();
+    let expected: Type = parse_quote!((&'a (), &'b (), T, [(); N], &'a T, &'a __S, &'b __S));
+    assert_eq!(s(&ty), s(&expected));
+
+    // Without the lifetimes it is the encoding of the generics alone.
+    let alone: Type = parse_quote!((&'a (), &'b (), T, [(); N], &'a T));
+    let ty = args_of(&plain, &self_ty, array_const).unwrap();
+    assert_eq!(s(&ty), s(&alone));
+
+    // The order of the context's list is the order of the elements, and a lifetime which is not a
+    // parameter is skipped.
+    let project = |outlives: &[&str]| {
+        let (ix, context) = with_outlives(&with_self, outlives);
+        let projection =
+            repeater_projection(&repeater(), &self_ty, &context, 7, ix, array_const).unwrap();
+        s(&common::projection_args(&projection))
+    };
+    let reversed: Type = parse_quote!((&'a (), &'b (), T, [(); N], &'a T, &'b __S, &'a __S));
+    assert_eq!(project(&["'b", "'a"]), s(&reversed));
+    assert_eq!(project(&["'c"]), s(&alone));
+    assert_eq!(
+        project(&["'a", "'c"]),
+        t(parse_quote!((&'a (), &'b (), T, [(); N], &'a T, &'a __S)))
+    );
+    assert_eq!(project(&[]), s(&alone));
+
+    // At a site the arguments replace the parameters in the encoding, `Self: 'a` included, and
+    // `Self` stays a name.
+    let args = given("<'p, 'q, ::p::W, N>");
+    let ty = at_site(&with_self, &generics, &args, None, array_const).unwrap();
+    let expected: Type = parse_quote!((
+        &'p (),
+        &'q (),
+        ::p::W,
+        [(); { N }],
+        &'p ::p::W,
+        &'p Self,
+        &'q Self
+    ));
+    assert_eq!(s(&ty), s(&expected));
+
+    // Every const encoding agrees, as `usize` is `[(); N]` for the closure and for the slots,
+    // whatever stands for `Self`.
+    let repeater = repeater();
+    let rows: Vec<(Generics, &[&str])> = vec![
+        (
+            parse_quote!(<'a, 'b: 'a, T: 'a + 'b, const N: usize>),
+            &["'a", "'b"],
+        ),
+        (parse_quote!(<'a, T: 'a, U: 'static>), &["'a"]),
+        (parse_quote!(<'a: 'a, 'b: 'a>), &["'b"]),
+        (parse_quote!(<T, const N: usize>), &[]),
+        (parse_quote!(<>), &[]),
+    ];
+    for (generics, outlives) in rows {
+        let referrer = using(&generics, outlives);
+        for self_ty in [
+            parse_quote!(__S),
+            parse_quote!(Self),
+            parse_quote!(::p::S<T>),
+        ] {
+            let self_ty: Type = self_ty;
+            let by_array = args_of(&referrer, &self_ty, array_const).unwrap();
+            let by_slots = args_of(&referrer, &self_ty, slot_const(&repeater)).unwrap();
+            assert_eq!(s(&by_array), s(&by_slots), "{}", s(&generics));
+        }
+    }
+
+    // A trait object without a lifetime bound is rejected as `Self`, if there is a lifetime to
+    // outlive (`&'a dyn Tr` would default to `&'a (dyn Tr + 'a)`), by the encoding of the entry and
+    // by the one at a site.
+    let generics: Generics = parse_quote!(<'a>);
+    let with_self = using(&generics, &["'a"]);
+    let plain = using(&generics, &[]);
+    let dyn_self: Type = parse_quote!(dyn Tr);
+    let err = args_of(&with_self, &dyn_self, array_const).unwrap_err();
+    assert!(
+        matches!(err, EncodeError::UnboundedTraitObject(_)),
+        "{}",
+        err
+    );
+    let args = given("<'x>");
+    let err = at_site(&with_self, &generics, &args, Some(&dyn_self), array_const).unwrap_err();
+    assert!(
+        matches!(err, EncodeError::UnboundedTraitObject(_)),
+        "{}",
+        err
+    );
+    // but not if there is none, and it is fine with the bound written.
+    let ty = args_of(&plain, &dyn_self, array_const).unwrap();
+    assert_eq!(s(&ty), t(parse_quote!((&'a (),))));
+    let bounded: Type = parse_quote!(dyn Tr + 'static);
+    let ty = args_of(&with_self, &bounded, array_const).unwrap();
+    assert_eq!(s(&ty), t(parse_quote!((&'a (), &'a (dyn Tr + 'static)))));
+}
+
+/// The Repeater impl of the implementor of a trait: the parameters, the bounds and then `Self: 'a`
+/// as `&'a __S`. The encoding of the entry for its own `Self`, for the arguments of a site, and for
+/// an entry that does not name `Self`.
+#[test]
+fn self_outlives_of_a_method_is_encoded_after_the_bounds_the_method_declares() {
+    let item: ItemTrait = parse_quote! {
+        trait Tr { fn f<'a, T>(&self, x: &'a Rel<(Self, T)>); }
+    };
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item);
+    let referrer = leaker.result().finish().unwrap();
+    let context = common::entry(&referrer, 0);
+    let generics = &context.generics;
+    assert_eq!(s(generics), "< 'a , T : 'a >");
+    assert_eq!(
+        context.self_outlives.iter().map(s).collect::<Vec<_>>(),
+        ["'a"]
+    );
+    // The implementor `__S`: the parameters, the bounds and then `&'a __S`.
+    let marker: Type = parse_quote!(__S);
+    let ty = args_of(&referrer, &marker, array_const).unwrap();
+    assert_eq!(s(&ty), t(parse_quote!((&'a (), T, &'a T, &'a __S))));
+    // Without it, the encoding is that of the generics alone: an entry with the same generics that
+    // does not name `Self`, or no lifetime to outlive.
+    let alone = t(parse_quote!((&'a (), T, &'a T)));
+    let ty = args_of(&using(generics, &[]), &marker, array_const).unwrap();
+    assert_eq!(s(&ty), alone);
+    let (ix, context) = with_outlives(&referrer, &[]);
+    let ty = repeater_projection(&repeater(), &marker, &context, 7, ix, array_const).unwrap();
+    assert_eq!(s(&common::projection_args(&ty)), alone);
+    // A lifetime which is not a parameter is skipped, like a bound by one.
+    let (ix, context) = with_outlives(&referrer, &["'z"]);
+    let ty = repeater_projection(&repeater(), &marker, &context, 7, ix, array_const).unwrap();
+    assert_eq!(s(&common::projection_args(&ty)), alone);
+    // At the use site, with the arguments substituted, `Self` being the implementor.
+    for (args, expected) in [
+        ("<'q, u8>", t(parse_quote!((&'q (), u8, &'q u8, &'q Self)))),
+        (
+            "<'static, u8>",
+            t(parse_quote!((&'static (), u8, &'static u8, &'static Self))),
+        ),
+    ] {
+        let ty = at_site(&referrer, generics, &given(args), None, array_const).unwrap();
+        assert_eq!(s(&ty), expected, "{}", args);
+    }
+    // The type that `Self: 'a` names is the one given: the host of a site.
+    let host: Type = parse_quote!(Host);
+    let ty = at_site(
+        &referrer,
+        generics,
+        &given("<'static, u8>"),
+        Some(&host),
+        array_const,
+    )
+    .unwrap();
+    assert_eq!(
+        s(&ty),
+        t(parse_quote!((&'static (), u8, &'static u8, &'static Host)))
+    );
+}
+
+/// The arguments of a site with no closure for the consts (`array_const`): `usize` is an array
+/// length, the elements after the parameters are the bounds, a `?Sized` parameter is a pointer, and
+/// the arguments are those of the parameters when they are the parameters themselves.
+#[test]
+fn the_arguments_of_a_site_are_encoded_as_the_parameters_with_array_const() {
+    let written: Generics =
+        parse_quote!(<'a, 'b: 'a, T: 'a + ::core::clone::Clone, const N: usize, U: ?Sized>);
+    let referrer = using(&written, &[]);
+    let args = given("<'x, 'y, u8, { 1 + 2 }, str>");
+    let ty = at_site(&referrer, &written, &args, None, array_const).unwrap();
+    assert_eq!(
+        s(&ty),
+        t(parse_quote!((
+            &'x (),
+            &'y (),
+            u8,
+            *const str,
+            [(); { 1 + 2 }],
+            &'x &'y (),
+            &'x u8
+        )))
+    );
+    // For the parameters themselves, it is the encoding of the entry.
+    let own: Vec<GenericArgument> = written.params.iter().map(common::own_name_arg).collect();
+    let by_name = at_site(&referrer, &written, &own, None, array_const).unwrap();
+    let params = args_of(&referrer, &parse_quote!(Self), array_const).unwrap();
+    assert_eq!(s(&by_name).replace("{ N }", "N"), s(&params));
+    // Too few and too many arguments.
+    assert!(matches!(
+        at_site(&referrer, &written, &args[..4], None, array_const),
+        Err(EncodeError::MissingArgument(_))
+    ));
+    let too_many: Vec<GenericArgument> = args.iter().chain(&args[..1]).cloned().collect();
+    assert!(matches!(
+        at_site(&referrer, &written, &too_many, None, array_const),
+        Err(EncodeError::UnexpectedArgument(_))
+    ));
+}
+
+/// A `?Sized` type parameter is a pointer to it, not a bare element, which is `Sized` whatever the
+/// parameter is: for the generics of an entry wherever it is (first, in the middle, last, the only
+/// one, with other bounds), and for the arguments of a site, which are any type (F1: see
+/// `f01_unsized_type_param_encoding` in `tests/findings.rs` for the generics in the entries of items).
+#[test]
+fn an_unsized_parameter_is_encoded_as_a_pointer_to_it() {
+    let rows: Vec<(Generics, Type)> = vec![
+        (parse_quote!(<T: ?Sized, U>), parse_quote!((*const T, U))),
+        (
+            parse_quote!(<T, U: ?Sized, V>),
+            parse_quote!((T, *const U, V)),
+        ),
+        (parse_quote!(<T, U: ?Sized>), parse_quote!((T, *const U))),
+        (parse_quote!(<T: ?Sized>), parse_quote!((*const T,))),
+        // Other bounds stay out of the way, and a lifetime bound is encoded as it is for a sized one.
+        (
+            parse_quote!(<'a, T: ::core::clone::Clone + ?Sized + 'a, U>),
+            parse_quote!((&'a (), *const T, U, &'a T)),
+        ),
+        // A sized parameter is encoded as it is.
+        (
+            parse_quote!(<T, U: ::core::marker::Sized>),
+            parse_quote!((T, U)),
+        ),
+    ];
+    for (generics, expected) in rows {
+        let referrer = using(&generics, &[]);
+        let ty = args_of(&referrer, &parse_quote!(Self), array_const).unwrap();
+        assert_eq!(s(&ty), s(&expected), "{}", s(&generics));
+        // The Referrer passes each parameter by its own name: the same encoding.
+        let own: Vec<GenericArgument> = generics.params.iter().map(common::own_name_arg).collect();
+        let by_name = at_site(&referrer, &generics, &own, None, array_const).unwrap();
+        assert_eq!(s(&by_name), s(&ty), "{}", s(&generics));
+    }
+
+    // The arguments of a site: a pointer to the argument, whatever it is.
+    let generics: Generics = parse_quote!(<T: ?Sized, U: ?Sized, V>);
+    let referrer = using(&generics, &[]);
+    let args = given("<str, dyn Tr + Send + 'static, [u8; 2]>");
+    let ty = at_site(&referrer, &generics, &args, None, array_const).unwrap();
+    let expected: Type = parse_quote!((*const str, *const (dyn Tr + Send + 'static), [u8; 2]));
+    assert_eq!(s(&ty), s(&expected));
 }

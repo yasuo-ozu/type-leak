@@ -134,6 +134,18 @@ pub mod m {
         fn get(&self, t: T) -> U;
     }
 
+    /// 9246 (F73): the default of a type parameter names a const parameter in braces. A use site
+    /// that gives the argument in braces too (`Braced9246<{ M }>`) has the default completed
+    /// as `[u8; { M }]`: it was `[u8; { { M } }]`, which rustc rejects for a generic `M`.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::m,
+    )]
+    pub trait Braced9246<const N: usize, U = [u8; { N }]> {
+        fn get(&self) -> U;
+    }
+
     pub struct Pair<V>(pub V, pub V);
 
     /// Where clauses, typed receivers, argument patterns, HRTB, elided lifetimes and RPITIT.
@@ -282,6 +294,12 @@ pub mod m {
         }
     }
 
+    impl<const N: usize> Braced9246<N> for Inner {
+        fn get(&self) -> [u8; { N }] {
+            [N as u8; N]
+        }
+    }
+
     impl<T, const N: usize, const B: bool> Defaults<T, N, B> for Inner {
         fn default_array(&self) -> [RelType; N] {
             [(); N].map(|()| RelType(0))
@@ -398,6 +416,26 @@ pub mod s {
             Self: 'a,
         {
             Wrap(v)
+        }
+    }
+
+    /// 9248 (F76): the generic of the trait is named `__S`, as the parameter that the Repeater's
+    /// impl of the entry `Wrap<(Self::Item, __S)>` declares for the implementor. The impl was
+    /// `impl<__S, __S: ?Sized + Clash9248<__S>> ..`, E0403; the second is now `__S0`.
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::s,
+    )]
+    pub trait Clash9248<__S> {
+        type Item;
+        fn f(&self, s: __S) -> Wrap<(Self::Item, __S)>;
+    }
+
+    impl<__S> Clash9248<__S> for Inner {
+        type Item = u8;
+        fn f(&self, s: __S) -> Wrap<(u8, __S)> {
+            Wrap((9, s))
         }
     }
 

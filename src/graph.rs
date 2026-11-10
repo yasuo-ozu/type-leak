@@ -91,12 +91,13 @@ type CompositionGraph =
 pub(crate) struct TypeGraph {
     /// An edge goes from a type to each internable type it is composed of.
     graph: CompositionGraph,
+    /// The types of the graph.
     nodes: HashSet<NodeKey>,
     /// The types that appear as roots, not as components of another type.
     pub(crate) roots: HashSet<NodeKey>,
-    /// The types that depend on the context: each must be an entry or inside one. The kept
-    /// required entries are in it too.
-    pub(crate) must_intern: HashSet<NodeKey>,
+    /// The required types: they depend on the context, so each must be an entry or inside one. The
+    /// kept required entries are in it too.
+    pub(crate) required: HashSet<NodeKey>,
     /// The types that the Referrer may replace (their own path names an external crate): the same.
     pub(crate) optional: HashSet<NodeKey>,
     /// The types that may be a required entry: a part of them is a cause.
@@ -105,12 +106,12 @@ pub(crate) struct TypeGraph {
     pub(crate) optional_candidates: HashSet<NodeKey>,
     /// The types that cannot be entries because the copy would be cyclic (see
     /// `AnalyzeVisitor::env_cycle()`): their components are entries instead. A type is forbidden
-    /// as the kind it is, required if it is or holds a `must_intern` type, else optional, so one
+    /// as the kind it is, required if it is or holds a type of `required`, else optional, so one
     /// set holds the flag of that kind.
     pub(crate) no_entry: HashSet<NodeKey>,
     /// The entries that a reduction chose and kept ([`TypeGraph::kept()`]). Each stays an entry
     /// whatever is merged in later, though what made it one is gone. A kept required entry is also
-    /// in `must_intern`, so it stays required; a kept optional one becomes required if a type merged
+    /// in `required`, so it stays required; a kept optional one becomes required if a type merged
     /// in later makes it hold a required type.
     pub(crate) kept: HashSet<NodeKey>,
 }
@@ -154,11 +155,11 @@ impl TypeGraph {
     /// no components, and kept as the kind it is.
     ///
     /// `kept` marks them, as a kept entry is a choice, which the types that made it an entry no
-    /// longer back. A required one is also `must_intern`, which keeps its kind; `optional` says
+    /// longer back. A required one is also in `required`, which keeps its kind; `optional` says
     /// what a type is, so an optional entry is not in it.
     pub(crate) fn kept(required: Vec<NodeKey>, optional: Vec<NodeKey>) -> Self {
         let mut graph = Self::default();
-        for (key, must) in required
+        for (key, is_required) in required
             .into_iter()
             .map(|key| (key, true))
             .chain(optional.into_iter().map(|key| (key, false)))
@@ -166,8 +167,8 @@ impl TypeGraph {
             graph.nodes.insert(key.clone());
             graph.graph.insert_node(key.clone()).ok().unwrap();
             graph.roots.insert(key.clone());
-            if must {
-                graph.must_intern.insert(key.clone());
+            if is_required {
+                graph.required.insert(key.clone());
             }
             graph.kept.insert(key);
         }
@@ -186,12 +187,13 @@ impl TypeGraph {
     /// Returns the kept entries: the required ones, then the optional ones, each sorted by context
     /// and tokens.
     pub(crate) fn into_kept_entries(self) -> (Vec<NodeKey>, Vec<NodeKey>) {
-        let Self {
-            kept, must_intern, ..
-        } = self;
-        let (required, optional): (Vec<_>, Vec<_>) =
-            kept.into_iter().partition(|key| must_intern.contains(key));
-        (sorted_entries(required), sorted_entries(optional))
+        let Self { kept, required, .. } = self;
+        let (required_entries, optional_entries): (Vec<_>, Vec<_>) =
+            kept.into_iter().partition(|key| required.contains(key));
+        (
+            sorted_entries(required_entries),
+            sorted_entries(optional_entries),
+        )
     }
 
     /// Returns the types, in no particular order.
@@ -215,7 +217,7 @@ impl TypeGraph {
             }
         }
         self.roots.extend(other.roots);
-        self.must_intern.extend(other.must_intern);
+        self.required.extend(other.required);
         self.optional.extend(other.optional);
         self.required_candidates.extend(other.required_candidates);
         self.optional_candidates.extend(other.optional_candidates);

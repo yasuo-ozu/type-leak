@@ -19,7 +19,7 @@
 //! this handles: those whose inputs show their one lifetime. See
 //! [Elided lifetimes](crate::Leaker#elided-lifetimes).
 
-use crate::analyze::{ElidedOutput, InputLifetimes};
+use crate::analyze::{Elision, InputLifetimes};
 use crate::context::{binder_lifetimes, Scope};
 use crate::util::ReplaceSelf;
 use proc_macro2::{Span, TokenStream, TokenTree};
@@ -128,23 +128,23 @@ fn collect_lifetimes(tokens: TokenStream, names: &mut HashSet<String>) {
 ///
 /// The generics in scope there are not known, so a name is `'__tl_s<n>` for the first `n` that no
 /// lifetime in what the copy is made of (the arguments, what replaces a name) is named
-/// like ([`Names::reserve()`]); the prefix keeps it from the lifetimes that a macro declares and
+/// like ([`FreshLifetimes::reserve()`]); the prefix keeps it from the lifetimes that a macro declares and
 /// from the Visitor's (`'__tl_e<n>`). `n` counts the signatures around, so that a signature inside
 /// the binder of another gets another name (E0496), and the output is the same for the same input.
 #[derive(Default)]
-pub(crate) struct Names {
+pub(crate) struct FreshLifetimes {
     taken: HashSet<String>,
     next: usize,
 }
 
-impl Names {
+impl FreshLifetimes {
     /// Notes the lifetimes that `tokens` name, so that no fresh name is one of them.
     pub(crate) fn reserve(&mut self, tokens: impl ToTokens) {
         collect_lifetimes(tokens.into_token_stream(), &mut self.taken);
     }
 
     /// Returns the count of the signatures around, to give the names back with
-    /// [`Names::release()`] after the signature being copied.
+    /// [`FreshLifetimes::release()`] after the signature being copied.
     pub(crate) fn mark(&self) -> usize {
         self.next
     }
@@ -167,7 +167,7 @@ impl Names {
     }
 }
 
-impl Fresh for Names {
+impl Fresh for FreshLifetimes {
     fn fresh(&mut self, binder: Option<&BoundLifetimes>) -> Lifetime {
         self.next_name(binder)
     }
@@ -177,7 +177,7 @@ impl Fresh for Names {
 /// names the elided lifetime of a signature where that adds lifetimes to its inputs
 /// ([`fold_bare_fn()`], [`fold_bound()`]).
 pub(crate) trait Site: Fold + Sized {
-    fn names(&mut self) -> &mut Names;
+    fn names(&mut self) -> &mut FreshLifetimes;
 }
 
 impl<S: Site> Fresh for S {
@@ -246,7 +246,7 @@ fn name_elided(
     inputs: Vec<&mut Type>,
     output: &mut ReturnType,
 ) {
-    let elision = match Elision::of(inputs.iter().map(|input| &**input), output) {
+    let elision = match Elision::of_copy(inputs.iter().map(|input| &**input), output) {
         Some(elision) => elision,
         None => return,
     };
@@ -267,55 +267,33 @@ fn shows_one(lifetimes: &InputLifetimes) -> bool {
     lifetimes.elided + lifetimes.named.len() == 1
 }
 
-/// A signature that relies on elision, as the original has it, found before it is copied: its output
-/// has an elided lifetime that the one lifetime of its inputs gives.
-///
-/// This is the one place that decides it. A copy that writes the inputs again checks that they
-/// still show that one lifetime ([`name_elided_in_bare_fn()`] before it folds them,
+/// What the copy does with an [`Elision`] (found before it writes the signature): it checks that the
+/// inputs still show their one lifetime ([`name_elided_in_bare_fn()`] before it folds them,
 /// [`Elision::name_written_bare_fn()`] after), and names it if not.
-pub(crate) struct Elision {
-    /// The lifetime that the inputs name, `None` if they show an elided one.
-    kept: Option<Lifetime>,
-}
-
 impl Elision {
     /// The elision of the function pointer `i`, if its signature relies on it.
     pub(crate) fn of_bare_fn(i: &TypeBareFn) -> Option<Self> {
-        Self::of(i.inputs.iter().map(|arg| &arg.ty), &i.output)
+        Self::of_copy(i.inputs.iter().map(|arg| &arg.ty), &i.output)
     }
 
     /// Like [`Elision::of_bare_fn()`], for the signature of `Fn(..) -> R` that `i` binds.
     pub(crate) fn of_bound(i: &TraitBound) -> Option<Self> {
         match i.path.segments.last().map(|seg| &seg.arguments) {
-            Some(PathArguments::Parenthesized(args)) => Self::of(args.inputs.iter(), &args.output),
+            Some(PathArguments::Parenthesized(args)) => {
+                Self::of_copy(args.inputs.iter(), &args.output)
+            }
             _ => None,
         }
     }
 
-    fn of<'a>(inputs: impl IntoIterator<Item = &'a Type>, output: &ReturnType) -> Option<Self> {
-        let output = match output {
-            ReturnType::Type(_, output) => output,
-            ReturnType::Default => return None,
-        };
-        let mut elided = ElidedOutput(false);
-        elided.visit_type(output);
-        if !elided.0 {
-            return None;
-        }
-        // The inputs show their one lifetime. With none, a path hides it (`Ref<u8>`): it cannot be
-        // named, and the Leaker leaks such a signature whole or rejects it. With more, the original
-        // is not valid.
-        let mut lifetimes = InputLifetimes::default();
-        for input in inputs {
-            lifetimes.visit_type(input);
-        }
-        match (lifetimes.elided, lifetimes.named.len()) {
-            (1, 0) => Some(Self { kept: None }),
-            (0, 1) => Some(Self {
-                kept: lifetimes.named.pop(),
-            }),
-            _ => None,
-        }
+    /// The inputs show their one lifetime. With none, a path hides it (`Ref<u8>`): it cannot be
+    /// named, and the Leaker leaks such a signature whole or rejects it. With more, the original is
+    /// not valid.
+    fn of_copy<'a>(
+        inputs: impl IntoIterator<Item = &'a Type>,
+        output: &ReturnType,
+    ) -> Option<Self> {
+        Self::of(0, true, inputs, output).filter(|elision| !elision.hidden)
     }
 
     /// Names the elided lifetime of the function pointer `i`, which the copy has written (what
