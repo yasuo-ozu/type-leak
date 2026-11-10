@@ -315,12 +315,11 @@ fn the_rules_chain_and_a_rule_may_count() {
     assert_eq!(describe_all(&chained), describe_all(&one_by_one));
     let expand = |result: LeakerResult| {
         let referrer = result.into_referrer();
-        let ix = referrer
-            .iter()
+        let ix = common::types(&referrer)
             .position(|ty| text(ty) == ":: foo :: X")
             .unwrap();
         let ty = referrer.expand(
-            referrer.context(ix),
+            common::entry_id(&referrer, ix),
             parse_quote!(::foo::X),
             |_, ix| parse_quote!(P<#ix>),
         );

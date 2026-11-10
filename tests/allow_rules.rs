@@ -22,11 +22,9 @@ fn place(in_value: bool, in_default: bool) -> Place {
     place
 }
 
-fn entries(referrer: &Referrer) -> Vec<(String, bool)> {
-    referrer
-        .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty.to_token_stream().to_string(), referrer.must(ix)))
+fn entries(referrer: &Referrer) -> Vec<String> {
+    common::types(referrer)
+        .map(|ty| ty.to_token_stream().to_string())
         .collect()
 }
 
@@ -60,15 +58,12 @@ fn a_path_rule_leaves_the_paths_it_accepts_as_written() {
             b: ::serde::W,
         }
     );
-    // Without a rule `Vec<u8>` is an entry, and `::serde::W` an optional one.
+    // Without a rule `Vec<u8>` is an entry, and so is `::serde::W`.
     let result = analyze(&item, Rules::new());
     assert!(result.errors().is_empty());
     assert_eq!(
         entries(&result.into_referrer()),
-        [
-            ("Vec < u8 >".to_string(), true),
-            (":: serde :: W".to_string(), false)
-        ]
+        ["Vec < u8 >".to_string(), ":: serde :: W".to_string()]
     );
     // A rule for each of them: nothing is leaked, and there is no error.
     let config = Rules::new()
@@ -544,7 +539,7 @@ fn the_rule_sees_a_path_without_arguments_in_both_forms() {
     assert_eq!(texts(by_exact.errors()), texts(by_prefix.errors()));
     // `Rel` in the arguments is still analyzed: it is the one entry.
     let (by_exact, by_prefix) = (by_exact.into_referrer(), by_prefix.into_referrer());
-    assert_eq!(entries(&by_exact), [("Rel".to_string(), true)]);
+    assert_eq!(entries(&by_exact), ["Rel".to_string()]);
     assert_eq!(entries(&by_exact), entries(&by_prefix));
 
     // A turbofish in a value, which `check_values` reads.
@@ -566,7 +561,7 @@ fn the_rule_sees_a_path_without_arguments_in_both_forms() {
     assert!(by_exact.errors().is_empty());
     assert_eq!(texts(by_exact.errors()), texts(by_prefix.errors()));
     let (by_exact, by_prefix) = (by_exact.into_referrer(), by_prefix.into_referrer());
-    assert_eq!(entries(&by_exact), [("Rel".to_string(), true)]);
+    assert_eq!(entries(&by_exact), ["Rel".to_string()]);
     assert_eq!(entries(&by_exact), entries(&by_prefix));
 
     // Whatever it is given in the analysis has no arguments; on a result it is given the causes of
@@ -636,10 +631,7 @@ fn a_rule_that_panics_is_a_panic_of_the_closure() {
     leaker.intern_struct(&fine, true);
     let result = leaker.result();
     assert!(result.errors().is_empty());
-    assert_eq!(
-        entries(&result.into_referrer()),
-        [("Rel2".to_string(), true)]
-    );
+    assert_eq!(entries(&result.into_referrer()), ["Rel2".to_string()]);
 }
 
 // ── each path is asked about as the cause of its kind ────────────────────────────────────────
@@ -780,10 +772,7 @@ fn a_rule_for_one_kind_leaves_a_path_of_another_kind_leaked() {
     ));
     // Traits allowed: the type `Same` is an entry, and the trait is fine.
     assert!(by_traits.errors().is_empty());
-    assert_eq!(
-        entries(&by_traits.into_referrer()),
-        [("Same".to_string(), true)]
-    );
+    assert_eq!(entries(&by_traits.into_referrer()), ["Same".to_string()]);
 }
 
 #[test]
@@ -1068,7 +1057,6 @@ fn values_writes_every_relative_path_in_a_value_as_it_is() {
     assert!(!plain.errors().is_empty());
     let leaked: Vec<String> = entries(&plain.clone().into_referrer())
         .into_iter()
-        .map(|(ty, _)| ty)
         .collect();
     assert!(
         leaked.contains(&"Local < Arg >".to_string()),
@@ -1080,10 +1068,7 @@ fn values_writes_every_relative_path_in_a_value_as_it_is() {
     // the primitive types are not allowed).
     let by_flag = analyze_trait(&item, Rules::new().values(), true);
     assert!(by_flag.errors().is_empty());
-    let kept: Vec<String> = entries(&by_flag.into_referrer())
-        .into_iter()
-        .map(|(ty, _)| ty)
-        .collect();
+    let kept: Vec<String> = entries(&by_flag.into_referrer()).into_iter().collect();
     assert_eq!(kept, ["Sig", "usize"]);
     // Only the values of the item are read: without `check_values()` the flag changes nothing.
     let without = analyze_trait(&item, Rules::new().values(), false);
@@ -1097,7 +1082,7 @@ fn values_writes_every_relative_path_in_a_value_as_it_is() {
     assert!(on_result.errors().is_empty());
     assert!(entries(&on_result.into_referrer())
         .iter()
-        .any(|(ty, _)| ty == "Local < Arg >"));
+        .any(|ty| ty == "Local < Arg >"));
 }
 
 #[test]
@@ -1110,10 +1095,7 @@ fn defaults_writes_every_relative_path_in_a_default_as_it_is() {
         }
     );
     let plain = analyze(&item, Rules::new());
-    let leaked: Vec<String> = entries(&plain.into_referrer())
-        .into_iter()
-        .map(|(ty, _)| ty)
-        .collect();
+    let leaked: Vec<String> = entries(&plain.into_referrer()).into_iter().collect();
     assert!(
         leaked.contains(&"Rel < Other >".to_string()),
         "{:?}",
@@ -1122,10 +1104,7 @@ fn defaults_writes_every_relative_path_in_a_default_as_it_is() {
     // The types of the defaults are written as they are, and the field `c` is an entry still.
     let by_flag = analyze(&item, Rules::new().defaults());
     assert!(by_flag.errors().is_empty());
-    let kept: Vec<String> = entries(&by_flag.into_referrer())
-        .into_iter()
-        .map(|(ty, _)| ty)
-        .collect();
+    let kept: Vec<String> = entries(&by_flag.into_referrer()).into_iter().collect();
     assert_eq!(kept, ["Plain"]);
 }
 
@@ -1324,10 +1303,7 @@ fn or_if_takes_a_closure_without_annotations_and_or_takes_any_rule() {
         Rules::new().or_if(|cause, _| cause.starts_with(&parse_quote!(Rel))),
         false,
     );
-    assert_eq!(
-        entries(&by_closure.into_referrer()),
-        [("Other".to_string(), true)]
-    );
+    assert_eq!(entries(&by_closure.into_referrer()), ["Other".to_string()]);
     // Rules add up, in any order, and a struct of the user is a rule.
     struct OnlyOther;
     impl Allow for OnlyOther {
@@ -1594,7 +1570,9 @@ mod names {
                 .collect::<Vec<_>>()
                 .join("\n")
         })?;
-        Ok(referrer.iter().map(|ty| quote!(#ty).to_string()).collect())
+        Ok(crate::common::types(&referrer)
+            .map(|ty| quote!(#ty).to_string())
+            .collect())
     }
 
     /// `form` is not allowed by `options`: an error, or an entry for the type.

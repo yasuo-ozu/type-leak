@@ -586,49 +586,48 @@ mod spans {
 }
 
 mod trusting {
-    //! A Referrer which trusts the names of the crates, and one which does not, in a crate that has
-    //! no dependency on the crate of an optional entry (`tests/crates/trusting`).
+    //! A Leaker that allows the crate of a type, and one that does not, in a crate that has no
+    //! dependency on that crate (`tests/crates/trusting`).
     //!
-    //! `type_leak_test_leaker::x::ExtDep` names `::type_leak_test_ext::Ext<..>`. It is an optional
-    //! entry (see `Referrer::must()`): a macro that trusts it (its `type_fn` returns the leaked type,
-    //! which the test macro does unless it is told `strict`) leaves it as written, and the copy then
-    //! names a crate that the Referrer's crate does not have; the strict macro, which trusts nothing,
-    //! replaces the whole type with the Repeater's projection, and the crate does not need it.
-    //! `tests/cross_crate.rs` has the text of both copies. This is the trusting one, which rustc
-    //! rejects, and the same crate with the strict flag, which it accepts and whose own tests (the
-    //! copies of a struct and of a fragment of an impl, and an impl that forwards) pass: the outcome
-    //! differs by that flag alone.
+    //! `type_leak_test_leaker::x::ExtDep` names `::type_leak_test_ext::Ext<..>`. It is an entry
+    //! unless the Leaker allows the crate: `ExtDep` is analyzed by one that does not, so the macro
+    //! replaces the whole type with the Repeater's projection, and the crate does not need it;
+    //! `ExtDepAllowed` is analyzed by one that does, so the copy names a crate that the Referrer's
+    //! crate does not have. `tests/cross_crate.rs` has the text of both copies. This is the
+    //! second, which rustc rejects, and the same crate with the feature `replace`, which it accepts
+    //! and whose own tests (the copies of a struct and of a fragment of an impl, and an impl that
+    //! forwards) pass: the outcome differs by that flag alone.
 
     use super::nested;
 
     #[test]
-    fn a_trusting_referrer_needs_the_dependency() {
+    fn a_crate_that_the_leaker_allows_needs_the_dependency() {
         // The methods that name the crate fail alike (rustc prints the same error once).
-        let trusting = nested::cargo("trusting", &["check"], &[]);
-        assert!(!trusting.success, "{}", trusting.stderr);
+        let allowed = nested::cargo("trusting", &["check"], &[]);
+        assert!(!allowed.success, "{}", allowed.stderr);
         assert_eq!(
-            nested::error_codes(&trusting.stderr),
+            nested::error_codes(&allowed.stderr),
             ["E0433"],
             "{}",
-            trusting.stderr
+            allowed.stderr
         );
         assert!(
-            trusting
+            allowed
                 .stderr
                 .contains("cannot find `type_leak_test_ext` in"),
             "{}",
-            trusting.stderr
+            allowed.stderr
         );
     }
 
     #[test]
-    fn a_strict_referrer_does_not() {
+    fn a_crate_that_it_does_not_allow_does_not() {
         // Nothing else is wrong with the crate, so the flag alone makes the difference.
-        let strict = nested::cargo("trusting", &["check"], &["strict"]);
-        assert!(strict.success, "{}", strict.stderr);
-        assert_eq!(strict.stderr, "");
+        let replaced = nested::cargo("trusting", &["check"], &["replace"]);
+        assert!(replaced.success, "{}", replaced.stderr);
+        assert_eq!(replaced.stderr, "");
         // And what it wrote works.
-        let tests = nested::cargo("trusting", &["test", "--lib"], &["strict"]);
+        let tests = nested::cargo("trusting", &["test", "--lib"], &["replace"]);
         assert!(tests.success, "{}{}", tests.stdout, tests.stderr);
         assert!(
             tests.stdout.contains("test result: ok. 3 passed; 0 failed"),
@@ -687,11 +686,11 @@ mod outlives {
     //!
     //! An anchor in a path of `::core` (`Option<&'x u8>`) stays where it is written, so `Hr<'x>` is leaked
     //! alone as before, but one in the type of an external crate (`::std::boxed::Box<dyn
-    //! Iterator<Item = &'x u8>>`) is not: the Referrer may replace that type as a whole (it is an
-    //! optional entry, see `Referrer::must()`), so the function pointer or the trait object holding the
-    //! binder is leaked as a whole (a bound is an error), and the copies compile whichever the Referrer
-    //! does (`Binders`: `core_*`, `external_*`, and the `check_leak!` next to `AnchoredInside`, where
-    //! `::std` is allowed, so the types of it are no optional entries and anchor as before).
+    //! Iterator<Item = &'x u8>>`) is not: the Referrer replaces that type as a whole (it is an
+    //! entry), so the function pointer or the trait object holding the binder is leaked as a whole
+    //! (a bound is an error), and the copies compile (`Binders`: `core_*`, `external_*`, and the
+    //! `check_leak!` next to `AnchoredInside`, where `::std` is allowed, so the types of it are no
+    //! entries and anchor as before).
     //!
     //! And `Self: 'a`, which a reference implies (`&'a Rel2<Self>`, `&'a Rel2<Self::Item>`, `SelfOutlives`)
     //! and a path with a lifetime does not, so `Rel<'a, Self>` and `Rel<'a, Self::Item>` write it

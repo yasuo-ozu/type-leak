@@ -6,6 +6,8 @@
 //! `tests/diagnostic.rs` runs: they need a feature of `proc-macro2` that the tests of this package
 //! cannot have.
 
+mod common;
+
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
@@ -264,7 +266,7 @@ fn args_error(generics: &str, args: &str) -> EncodeError {
     let generics: Generics = parse_str(generics).unwrap();
     let args: AngleBracketedGenericArguments = parse_str(args).unwrap();
     let empty = Leaker::new().result().into_referrer();
-    let context = empty.contexts().next().unwrap();
+    let context = common::context_ids(&empty).into_iter().next().unwrap();
     let completed = match empty.complete_args(
         context,
         &generics.params,
@@ -315,8 +317,7 @@ fn needs_self_error(source: &str) -> EncodeError {
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
-    let wrap = referrer
-        .iter()
+    let wrap = common::types(&referrer)
         .position(|ty| template_quote::quote!(#ty).to_string() == "Wrap < T , Self >")
         .unwrap();
     let marker: Type = parse_quote!(crate::Marker);

@@ -14,8 +14,9 @@ path = "lib.rs"
 type-leak-test-leaker = { path = "../leaker" }
 
 [features]
-# The Referrer replaces the optional entries too. Without it, the crate does not compile.
-strict = []
+# The Leaker does not allow the crate of the type, so the macro replaces it. Without it, the Leaker
+# allows the crate, the copy names it, and the crate does not compile.
+replace = []
 
 # Built on its own by tests/diagnostic.rs (`trusting`).
 [workspace]

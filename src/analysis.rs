@@ -367,17 +367,19 @@ pub(crate) struct Analysis {
 impl Analysis {
     /// Adds the types among `effects` that may be entries to the graph, and records the parts and
     /// primitive names. A type that may be none is not added; its components hang on `parent`.
+    /// Returns `true` if a type that depends on the context was added, or hangs on `parent`.
     pub(crate) fn apply(
         &mut self,
         contexts: &mut Contexts,
         effects: &[Effect],
         parent: Option<&NodeKey>,
-    ) {
+    ) -> bool {
+        let mut holds_required = false;
         for effect in effects {
             match effect {
                 Effect::Type(pending) if !(pending.in_graph || pending.has_optional) => {
                     // Never an entry: not added, but the assumptions of its components stay.
-                    self.apply(contexts, &pending.components, parent);
+                    holds_required |= self.apply(contexts, &pending.components, parent);
                 }
                 Effect::Type(pending) => {
                     let context = contexts.intern(pending.context.clone());
@@ -391,17 +393,21 @@ impl Analysis {
                     }
                     if pending.in_graph {
                         types.required_candidates.insert(key.clone());
-                        if pending.no_entry {
-                            types.no_required.insert(key.clone());
-                        }
                     }
                     if pending.has_optional {
                         types.optional_candidates.insert(key.clone());
-                        if pending.no_optional_entry {
-                            types.no_optional.insert(key.clone());
-                        }
                     }
-                    self.apply(contexts, &pending.components, Some(&key));
+                    let below = self.apply(contexts, &pending.components, Some(&key));
+                    // The kind of the type is what it covers: only the flag of that kind counts.
+                    let required = pending.is_must_intern || below;
+                    let no_entry = match required {
+                        true => pending.in_graph && pending.no_entry,
+                        false => pending.has_optional && pending.no_optional_entry,
+                    };
+                    if no_entry {
+                        self.types.no_entry.insert(key);
+                    }
+                    holds_required |= required;
                 }
                 Effect::Error(error) => {
                     // The contexts are interned as an entry's is.
@@ -431,6 +437,7 @@ impl Analysis {
                 Effect::Primitive(ident) => self.primitives.push(ident.clone()),
             }
         }
+        holds_required
     }
 }
 

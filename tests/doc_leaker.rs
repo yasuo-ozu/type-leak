@@ -44,7 +44,7 @@ fn intern_union_leaks_the_types_of_the_fields() {
 
 /// `intern_impl()` leaks the trait arguments and the signature, not the body.
 #[test]
-fn intern_impl_skips_the_body_and_makes_another_crate_optional() {
+fn intern_impl_skips_the_body() {
     let item: ItemImpl = parse_quote! {
         impl<T> ::path::MyTrait<Rel<T>> for ::path::Host<T> {
             fn f(&self) -> Rel2<Self> { Skipped::new() } // the body is skipped
@@ -52,8 +52,8 @@ fn intern_impl_skips_the_body_and_makes_another_crate_optional() {
     };
     let mut leaker = Leaker::new();
     leaker.intern_impl(&item, true);
-    // `Rel<T>` and `Rel2<Self>` (`::path::Host<T>` names another crate: it is optional).
-    assert_eq!(leaker.result().finish().unwrap().required().count(), 2);
+    // `Rel<T>` and `Rel2<Self>`, and the self type, which names another crate.
+    assert_eq!(leaker.result().finish().unwrap().iter().count(), 3);
 }
 
 /// `intern_mod()` copies the declared names, and numbers the scope of a nested module.
@@ -72,8 +72,14 @@ fn intern_mod_does_not_leak_the_names_the_module_declares() {
     // `Local` is declared in `m`: it is not leaked.
     assert_eq!(referrer.iter().count(), 2);
     // The Repeater impl of `Outside2` is written in `inner`.
-    let module = referrer.context_module(referrer.context(1)).unwrap();
-    assert_eq!(referrer.module_path(module).unwrap()[0], "inner");
+    let (_, context) = referrer.iter().nth(1).unwrap();
+    let module = context.module.as_ref().unwrap().id();
+    match &referrer.get_context(module).module {
+        Some(ModuleScope::Itself {
+            path: Some(path), ..
+        }) => assert_eq!(path[0], "inner"),
+        _ => panic!("not the module of an entry"),
+    }
 }
 
 /// `enter_mod()` copies the names given as declared, and leaks the others.
@@ -152,18 +158,18 @@ fn enter_trait_leaks_only_the_visited_signature() {
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 1); // `Wrap<T>`
 }
 
-/// `result()` puts the required entries first, then the optional ones.
+/// `result()` puts the entries that depend on the context first, then the types of other crates.
 #[test]
-fn result_lists_required_entries_before_optional_ones() {
+fn result_lists_the_types_of_other_crates_last() {
     let item: ItemTrait = parse_quote! {
         trait Tr { fn f(&self) -> ::foo::X; fn g(&self) -> Rel; }
     };
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
-    // `Rel` is required. `::foo::X` is optional: it names another crate.
-    assert_eq!(referrer.iter().count(), 2);
-    assert!(referrer.must(0) && !referrer.must(1));
+    // `Rel` depends on the context. `::foo::X` names another crate: it comes after.
+    let found: Vec<&Type> = referrer.iter().map(|(ty, _)| ty).collect();
+    assert_eq!(found, [&parse_quote!(Rel), &parse_quote!(::foo::X)]);
 }
 
 /// `LeakerResult::allow()` drops the error, and the part is copied as written either way.
@@ -181,15 +187,16 @@ fn allow_a_cause_copies_that_part_as_written() {
     // The error is about the trait, which is smaller than the type `W<'_, dyn RelTr>` it is in.
     assert_eq!(result.errors()[0].cause, Cause::Trait(parse_quote!(RelTr)));
 
-    // `f` is copied as written either way, and only `g` leaks `dyn RelTr`.
+    // `f` is copied as written either way, and only `g` leaks `dyn RelTr`: the entries are that
+    // type in `g` and the self type.
     result = result.allow(|c: &Cause, _: Place| *c == Cause::Trait(parse_quote!(RelTr)));
-    assert_eq!(result.finish().unwrap().required().count(), 1);
+    assert_eq!(result.finish().unwrap().iter().count(), 2);
 }
 
-/// `allow()` changes no entry: a rule that allows the crate of an optional entry leaves it to the
-/// Referrer, which replaces it unless the macro keeps it in `type_fn` ([`Referrer::must()`]).
+/// `allow()` changes no entry: a rule that allows the crate of a type of another crate leaves it an
+/// entry, which the copy replaces. Given to the Leaker, the rule makes it no entry.
 #[test]
-fn allow_changes_no_optional_entry() {
+fn allow_changes_no_entry() {
     let mut leaker = Leaker::new();
     let context = leaker.intern_struct(&parse_quote! { struct S { a: ::foo::X } }, true);
     let result = leaker.result();
@@ -206,12 +213,13 @@ fn allow_changes_no_optional_entry() {
         referrer.expand(context, ty.clone(), |_, _| replaced.clone()),
         replaced
     );
-    // A `type_fn` that returns the leaked type keeps it.
+    // A Leaker that has the rule finds no entry, so the copy writes the type as it is.
+    let mut leaker = Leaker::from_config(Rules::new().external_crates(), Options::new());
+    let context = leaker.intern_struct(&parse_quote! { struct S { a: ::foo::X } }, true);
+    let referrer = leaker.result().finish().unwrap();
+    assert!(referrer.is_empty());
     assert_eq!(
-        referrer.expand(context, ty.clone(), |leaked, ix| {
-            assert!(!referrer.must(ix));
-            leaked
-        }),
+        referrer.expand(context, ty.clone(), |_, _| replaced.clone()),
         ty
     );
 }
@@ -248,7 +256,7 @@ fn check_values_leaks_types_in_values_and_rejects_other_relative_paths() {
     let mut leaker = Leaker::from_config(config(), Options::new().check_values());
     let context = leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(referrer.required().count(), 1);
+    assert_eq!(referrer.iter().count(), 1);
     let mut copy = item.clone();
     let slots = RepeaterSlots::new(parse_quote!(Repeater));
     referrer
@@ -295,10 +303,8 @@ fn nested_self_entries_accepts_self_in_a_nested_type_with_a_self_bound() {
     nested(&mut leaker);
     let referrer = leaker.result().finish().unwrap();
     // The entry is for any type that the bound holds for, with `Self` as its implementor.
-    assert!(matches!(
-        referrer.context_self(referrer.context(0)),
-        Some(SelfRequirement::Any)
-    ));
+    let (_, context) = referrer.iter().next().unwrap();
+    assert!(matches!(context.self_ty, Some(SelfRequirement::Any)));
     let slots = RepeaterSlots::new(parse_quote!(Repeater));
     let param: Ident = parse_quote!(__S);
     let r = referrer

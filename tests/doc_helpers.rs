@@ -42,7 +42,12 @@ fn repeater_impl_pieces_make_the_impl_and_name_its_module() {
     assert_eq!(imp, expected);
 
     // `Outside` is a relative path: it means something in `m::inner` only. Write the impl there.
-    let path = referrer.module_path(r.module.unwrap()).unwrap();
+    let path = match &referrer.get_context(r.module.unwrap()).module {
+        Some(ModuleScope::Itself {
+            path: Some(path), ..
+        }) => path,
+        _ => panic!("not a module of intern_mod()"),
+    };
     assert_eq!(path.len(), 1);
     assert_eq!(path[0], "inner");
 }
@@ -95,9 +100,9 @@ fn use_site_with_self_names_the_type_in_self_outlives() {
     assert_eq!(args, parse_quote!((&'a (), &'a Host)));
 }
 
-/// `needs_self()` is true for an entry that names `Self` or whose context does, false otherwise.
+/// `bucket_self()` is `None` for an entry that names `Self` or whose context does, a type otherwise.
 #[test]
-fn needs_self_holds_for_self_in_the_type_or_in_its_context() {
+fn bucket_self_is_none_for_self_in_the_type_or_in_its_context() {
     let tr: ItemTrait = parse_quote! {
         trait Tr<T: ::core::convert::AsRef<Self>, U = Rel<T>> {
             fn f(&self, t: T) -> U;
@@ -110,13 +115,13 @@ fn needs_self_holds_for_self_in_the_type_or_in_its_context() {
     // `Wrap<Self>` names `Self`; the context of `Rel<T>` has it in the bound of `T`.
     let wrap = referrer
         .iter()
-        .position(|ty| *ty == parse_quote!(Wrap<Self>))
+        .position(|(ty, _)| *ty == parse_quote!(Wrap<Self>))
         .unwrap();
     let rel = referrer
         .iter()
-        .position(|ty| *ty == parse_quote!(Rel<T>))
+        .position(|(ty, _)| *ty == parse_quote!(Rel<T>))
         .unwrap();
-    assert!(referrer.needs_self(wrap) && referrer.needs_self(rel));
+    assert!(referrer.bucket_self(wrap, 7).is_none() && referrer.bucket_self(rel, 7).is_none());
 
     let mut leaker = Leaker::new();
     leaker.intern_trait(
@@ -128,7 +133,7 @@ fn needs_self_holds_for_self_in_the_type_or_in_its_context() {
         true,
     );
     let referrer = leaker.result().finish().unwrap();
-    assert!(!referrer.needs_self(0));
+    assert!(referrer.bucket_self(0, 7).is_some());
 }
 
 /// `bucket_self()` is a primitive type for an entry without `Self`, and `None` for one with it.
@@ -142,11 +147,11 @@ fn bucket_self_is_a_primitive_unless_the_entry_needs_self() {
     let referrer = leaker.result().finish().unwrap();
     let wrap = referrer
         .iter()
-        .position(|ty| *ty == parse_quote!(Wrap<T>))
+        .position(|(ty, _)| *ty == parse_quote!(Wrap<T>))
         .unwrap();
     let wrap2 = referrer
         .iter()
-        .position(|ty| *ty == parse_quote!(Wrap2<Self>))
+        .position(|(ty, _)| *ty == parse_quote!(Wrap2<Self>))
         .unwrap();
     let param: Ident = parse_quote!(__S);
     let target = ImplSelf::Bucket {
@@ -216,14 +221,9 @@ fn view_visit_item_keeps_the_generics_around_and_adds_the_local_ones() {
     });
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
-    assert_eq!(
-        referrer.context_generics(referrer.context(0)).params.len(),
-        1
-    );
-    assert_eq!(
-        referrer.context_generics(referrer.context(1)).params.len(),
-        1
-    );
+    for (_, context) in referrer.iter() {
+        assert_eq!(context.generics.params.len(), 1);
+    }
 }
 
 /// `View::visit_type()` leaves out the paths of the standard library and leaks the others.
@@ -235,7 +235,13 @@ fn view_visit_type_skips_the_paths_of_the_standard_library() {
     });
     // `Option<..>` is a path of the standard library, which is the same in every crate.
     assert_eq!(
-        leaker.result().finish().unwrap().iter().collect::<Vec<_>>(),
+        leaker
+            .result()
+            .finish()
+            .unwrap()
+            .iter()
+            .map(|(ty, _)| ty)
+            .collect::<Vec<_>>(),
         [&parse_quote!(Wrap<T>)]
     );
 }
@@ -297,8 +303,9 @@ fn context_holds_the_generics_an_entry_uses() {
     let referrer = leaker.result().finish().unwrap();
     // `Rel` uses no generic. `Wrap<T>` uses `T`. `Wrap<U>` uses `U` and, through the bound
     // `U: Into<T>`, `T`.
-    let used: Vec<usize> = (0..3)
-        .map(|ix| referrer.context_generics(referrer.context(ix)).params.len())
+    let used: Vec<usize> = referrer
+        .iter()
+        .map(|(_, context)| context.generics.params.len())
         .collect();
     assert_eq!(used, [0, 1, 2]);
 }
@@ -314,11 +321,11 @@ fn impl_self_marker_serves_an_entry_without_self_only() {
     let referrer = leaker.result().finish().unwrap();
     let wrap = referrer
         .iter()
-        .position(|ty| *ty == parse_quote!(Wrap<T>))
+        .position(|(ty, _)| *ty == parse_quote!(Wrap<T>))
         .unwrap();
     let wrap2 = referrer
         .iter()
-        .position(|ty| *ty == parse_quote!(Wrap2<Self>))
+        .position(|(ty, _)| *ty == parse_quote!(Wrap2<Self>))
         .unwrap();
 
     // `Wrap<T>` does not name `Self`: the impl may be for a marker type of your crate.
@@ -364,12 +371,12 @@ fn self_requirement_is_the_type_in_a_struct_and_the_bound_in_a_trait() {
     );
     let referrer = leaker.result().finish().unwrap();
     // In a struct, `Self` is the struct with its own generics as arguments.
-    match referrer.context_self(in_struct) {
+    match &referrer.get_context(in_struct).self_ty {
         Some(SelfRequirement::Type(ty)) => assert_eq!(*ty, parse_quote!(S<T>)),
         _ => unreachable!(),
     }
     // In a trait, `Self` is any type that implements the trait.
-    match referrer.context_self(in_trait) {
+    match &referrer.get_context(in_trait).self_ty {
         Some(SelfRequirement::Bound(path)) => assert_eq!(*path, parse_quote!(Tr<T>)),
         _ => unreachable!(),
     }
@@ -392,14 +399,15 @@ fn context_id_is_the_top_level_context_and_an_integer_literal() {
     // `Rel` uses no generic, so its context is another one.
     let wrap = referrer
         .iter()
-        .position(|ty| *ty == parse_quote!(Wrap<T>))
+        .position(|(ty, _)| *ty == parse_quote!(Wrap<T>))
         .unwrap();
     let rel = referrer
         .iter()
-        .position(|ty| *ty == parse_quote!(Rel))
+        .position(|(ty, _)| *ty == parse_quote!(Rel))
         .unwrap();
-    assert_eq!(referrer.context(wrap), top_level);
-    assert_ne!(referrer.context(rel), top_level);
+    let top = referrer.get_context(top_level);
+    assert_eq!(referrer.iter().nth(wrap).unwrap().1, top);
+    assert_ne!(referrer.iter().nth(rel).unwrap().1, top);
 
     // It is written as an integer literal, so it travels with the Referrer in a macro call.
     let id: ContextId = parse_str("3usize").unwrap();

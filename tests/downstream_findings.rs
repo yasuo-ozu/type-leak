@@ -75,8 +75,7 @@ fn struct_of(item: ItemStruct) -> Referrer {
 }
 
 fn index(referrer: &Referrer, ty: Type) -> usize {
-    referrer
-        .iter()
+    common::types(referrer)
         .position(|entry| *entry == ty)
         .unwrap_or_else(|| panic!("no entry `{}`", text(&ty)))
 }
@@ -151,10 +150,13 @@ fn a_methods_with_a_same_named_generic_get_the_bounds_of_their_own() {
     // Each entry has a context of its own: a table keyed by the type text alone would merge them.
     let a = index(&referrer, parse_quote!(inner::GC<X>));
     let b = index(&referrer, parse_quote!(inner::G<X>));
-    assert_ne!(referrer.context(a), referrer.context(b));
     assert_ne!(
-        text(&referrer.context_generics(referrer.context(a))),
-        text(&referrer.context_generics(referrer.context(b))),
+        common::entry_id(&referrer, a),
+        common::entry_id(&referrer, b)
+    );
+    assert_ne!(
+        text(&common::entry(&referrer, a).generics),
+        text(&common::entry(&referrer, b).generics),
         "the generics of the contexts differ"
     );
 }
@@ -174,7 +176,12 @@ fn a_the_same_type_under_different_bounds_is_two_entries() {
     let impls: Vec<ItemImpl> = (0..referrer.iter().count())
         .map(|ix| impl_of(&referrer, ix))
         .collect();
-    assert_eq!(impls.len(), 2, "{:?}", referrer.iter().collect::<Vec<_>>());
+    assert_eq!(
+        impls.len(),
+        2,
+        "{:?}",
+        common::types(&referrer).collect::<Vec<_>>()
+    );
     assert!(impls.contains(&parse_quote! {
         impl<X: Clone, __S: ?::core::marker::Sized> crate::Repeater<(X,), #key> for __S {
             type Type = inner::G<X>;
@@ -468,7 +475,7 @@ fn five_array_lengths_are_carried_and_a_relative_macro_is_rejected() {
         let source = format!("trait Tr {{ fn f(&self) -> [u8; {}]; }}", length);
         let referrer = trait_of(parse_str(&source).unwrap());
         assert_eq!(
-            referrer.iter().map(text).collect::<Vec<_>>(),
+            common::types(&referrer).map(text).collect::<Vec<_>>(),
             [entry],
             "{}",
             source
@@ -726,7 +733,7 @@ fn twelve_a_relaxed_bound_is_copied_as_written() {
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
     assert_eq!(
-        text(&referrer.context_generics(context)),
+        text(&referrer.get_context(context).generics),
         "< T : :: core :: fmt :: Debug + ? Sized >",
         "the generics of the context (the predicate moved to the parameter)"
     );
@@ -751,7 +758,7 @@ fn twelve_a_bare_relaxed_bound_does_not_make_an_entry_of_the_module() {
         leaker.enter_mod("m", [], |view| view.visit_item(&item));
         let referrer = leaker.result().finish().unwrap();
         (0..referrer.iter().count())
-            .map(|ix| referrer.context_module(referrer.context(ix)).is_some())
+            .map(|ix| common::in_module(common::entry(&referrer, ix)).is_some())
             .collect::<Vec<_>>()
     };
     let bare = modules(parse_quote! {
@@ -912,10 +919,9 @@ fn fourteen_a_type_in_an_associated_const_default_is_carried() {
     let context = leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
-        referrer.iter().map(text).collect::<Vec<_>>(),
+        common::types(&referrer).map(text).collect::<Vec<_>>(),
         ["inner :: Local"]
     );
-    assert!(referrer.must(0));
     let mut copy = item.clone();
     referrer
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
@@ -1000,7 +1006,7 @@ fn fourteen_a_discriminant_and_an_array_length_are_always_read() {
         leaker.intern_enum(&item, true);
         let referrer = leaker.result().finish().unwrap();
         assert_eq!(
-            referrer.iter().map(text).collect::<Vec<_>>(),
+            common::types(&referrer).map(text).collect::<Vec<_>>(),
             ["inner :: Local"]
         );
 
@@ -1011,7 +1017,7 @@ fn fourteen_a_discriminant_and_an_array_length_are_always_read() {
         leaker.intern_trait(&item, true);
         let referrer = leaker.result().finish().unwrap();
         assert_eq!(
-            referrer.iter().map(text).collect::<Vec<_>>(),
+            common::types(&referrer).map(text).collect::<Vec<_>>(),
             ["[u8 ; :: core :: mem :: size_of :: < inner :: Local > ()]"]
         );
     }
@@ -1277,7 +1283,10 @@ fn issue_four_a_path_that_would_be_leaked_is_in_the_paths_and_not_in_the_notes()
     let mut leaker = Leaker::from_config(crate_only(), Options::new());
     leaker.intern_struct(&item, true);
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(referrer.iter().map(text).collect::<Vec<_>>(), ["Local"]);
+    assert_eq!(
+        common::types(&referrer).map(text).collect::<Vec<_>>(),
+        ["Local"]
+    );
     // A cause of the same type that cannot be leaked either is a note: `RelB<'_>` beside `RelA` in a
     // `dyn` that the lifetime keeps from being leaked as a whole. The error of `Box` has none of
     // them, and the paths have the heads that the copy writes as they are.

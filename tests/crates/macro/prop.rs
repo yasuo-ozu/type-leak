@@ -37,13 +37,7 @@
 //! The `Self` of a position is the type itself (a struct, an enum or a union), the self type (an
 //! impl) or the host type (a trait). A module cannot name `Self`, so its items do not.
 //!
-//! The Referrer's invocation says which optional entries it trusts (`strict`, `trust(none|all|std|leaker)`,
-//! see [`Trust`]), the attribute says it too (`trust = "std", krate = "tlp_l_000"`, or the fixtures'
-//! `strict = true`), and the two must agree if both do. Which entries a mode trusts is written out in
-//! [`Trust::trusts()`] and compared with those the copy replaces ([`trusting_copy()`]). In the
-//! Referrer's crate of the decoy (`decoy(tlp_l_000)`, `tests/prop_cross_crate/gen.rs`) `tlp_l_000` is
-//! another crate and the Leaker's is `real_000`: the invocation names the path of the module through
-//! it, and the macro expands to nothing for a module and for an item whose copy names the decoy.
+//! The copy replaces every entry through the Repeater, so the Leaker's crate has the impls of all.
 //!
 //! With `#[prop_leak_accept]` (`TYPE_LEAK_PROP_ACCEPT`, see `tests/prop_cross_crate/main.rs`), an item
 //! that the Leaker rejects is emitted as an accepted item with the recovered Referrer
@@ -91,14 +85,6 @@ pub(crate) struct Args {
     /// How the item is analyzed: `""` by the `intern_*` method of its kind, or by a scope (see
     /// [`analyze()`]): `"mod"`, `"generics"`, `"trait"` or `"impl"`.
     scope: String,
-    /// Which optional entries the Referrer trusts ([`Trust`]): it writes them as they are, and
-    /// replaces the others through the Repeater, so the Leaker needs the impls of the entries that
-    /// it does not trust, and of the required ones. Not said: the impls of all the entries, for any
-    /// Referrer; the Referrer's invocation says which it is (`strict`, `trust(..)`), and the two
-    /// must agree if both say it.
-    trust: Option<Trust>,
-    /// The name of the Leaker's crate (`tlp_l_000`), which `Trust::Leaker` trusts.
-    krate: String,
     /// The Leaker allows the primitive types (`Rules::primitive()`).
     primitive: bool,
     /// A trait (analyzed as the item itself, or of a scope `mod`): the Referrer's crate declares
@@ -120,9 +106,9 @@ pub(crate) struct Args {
     /// The Leaker accepts an entry that names the own `Self` of a nested item together with a bound
     /// that does ([`Options::nested_self_entries()`]).
     nested_self_entries: bool,
-    /// `marker = "::path::Marker"`: the impls of the entries where `Referrer::needs_self()` is false
-    /// are for this type (`ImplSelf::Marker`) and the Referrer writes it as their owner, where
-    /// they are otherwise for a primitive type that the id and the index choose
+    /// `marker = "::path::Marker"`: the impls of the entries that name no `Self`, nor do their
+    /// generics, are for this type (`ImplSelf::Marker`) and the Referrer writes it as their owner,
+    /// where they are otherwise for a primitive type that the id and the index choose
     /// (`ImplSelf::Bucket`). The type is the Leaker's, written by hand, by an absolute path that
     /// both crates resolve.
     marker: Option<Type>,
@@ -157,8 +143,6 @@ impl Parse for Args {
             prelude: false,
             allow: Vec::new(),
             scope: String::new(),
-            trust: None,
-            krate: String::new(),
             primitive: true,
             redeclare: false,
             marker: None,
@@ -186,17 +170,6 @@ impl Parse for Args {
                 ("allow_self", Lit::Bool(b)) => args.allow_self = b.value,
                 ("prelude", Lit::Bool(b)) => args.prelude = b.value,
                 ("scope", Lit::Str(s)) => args.scope = s.value(),
-                // The fixtures say `strict = true` (nothing is trusted) or `false` (every crate).
-                ("strict", Lit::Bool(b)) => {
-                    args.trust = Some(if b.value { Trust::None } else { Trust::All })
-                }
-                ("trust", Lit::Str(s)) => {
-                    args.trust = Some(
-                        Trust::parse(&s.value())
-                            .ok_or_else(|| Error::new(s.span(), "unknown trust"))?,
-                    )
-                }
-                ("krate", Lit::Str(s)) => args.krate = s.value(),
                 ("primitive", Lit::Bool(b)) => args.primitive = b.value,
                 ("redeclare", Lit::Bool(b)) => args.redeclare = b.value,
                 ("marker", Lit::Str(s)) => args.marker = Some(s.parse()?),
@@ -230,11 +203,6 @@ impl Args {
         let no_nested_self = self.no_nested_self;
         let (stages, stage) = (self.stages, self.stage);
         let via = &self.via;
-        let trust = self.trust.map(|trust| {
-            let trust = trust.name();
-            quote!(trust = #trust,)
-        });
-        let krate = &self.krate;
         let marker = self.marker.as_ref().map(|marker| {
             let marker = quote!(#marker).to_string().replace(' ', "");
             quote!(marker = #marker,)
@@ -246,7 +214,7 @@ impl Args {
             .map(|p| quote!(#p).to_string().replace(' ', ""))
             .collect::<Vec<_>>()
             .join(",");
-        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #trust krate = #krate, #marker primitive = #primitive, redeclare = #redeclare, values = #values, bodies = #bodies, nested_self_entries = #nested_self_entries, no_nested_self = #no_nested_self, stages = #stages, accepted = #accepted, stage = #stage, via = #via)
+        quote!(id = #id, allow_self = #allow_self, prelude = #prelude, scope = #scope, allow = #allow, #marker primitive = #primitive, redeclare = #redeclare, values = #values, bodies = #bodies, nested_self_entries = #nested_self_entries, no_nested_self = #no_nested_self, stages = #stages, accepted = #accepted, stage = #stage, via = #via)
     }
 
     /// The item is nested in `enter_mod` and has a `Self` of its own: the copy is wrapped in a
@@ -261,93 +229,6 @@ impl Args {
     /// has.
     fn repeater_id(&self) -> u64 {
         self.id | (u64::from(self.stage) << 40)
-    }
-}
-
-/// Which optional entries (a type of another crate by an absolute path) a Referrer trusts: the
-/// crates its `type_fn` and `nested_fn` keep as written ([`Keep`]). A trusted entry is written as
-/// it is in the copy and needs no Repeater impl; the others are replaced through the Repeater. A
-/// trusted crate is promised to be the same crate in the Referrer's crate.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) enum Trust {
-    /// Nothing (`strict`): the library's default.
-    None,
-    /// Every crate.
-    All,
-    /// `std`, `alloc` and `core`.
-    Std,
-    /// The Leaker's crate only (`Args::krate`).
-    Leaker,
-}
-
-impl Trust {
-    const ALL: [Trust; 4] = [Trust::None, Trust::All, Trust::Std, Trust::Leaker];
-
-    fn name(self) -> &'static str {
-        match self {
-            Trust::None => "none",
-            Trust::All => "all",
-            Trust::Std => "std",
-            Trust::Leaker => "leaker",
-        }
-    }
-
-    fn parse(word: &str) -> Option<Trust> {
-        Trust::ALL
-            .iter()
-            .copied()
-            .find(|trust| trust.name() == word)
-    }
-
-    /// Whether the mode trusts an optional entry that names `crates`
-    /// (`Referrer::external_crates_require()`): it trusts every one of them. `krate` is the
-    /// Leaker's crate.
-    fn trusts(self, crates: &[String], krate: &str) -> bool {
-        assert!(
-            self != Trust::Leaker || !krate.is_empty(),
-            "test macro: `trust leaker` needs `krate`"
-        );
-        self != Trust::None
-            && crates.iter().all(|name| match self {
-                Trust::None => false,
-                Trust::All => true,
-                Trust::Std => ["std", "alloc", "core"].contains(&name.as_str()),
-                Trust::Leaker => name == krate,
-            })
-    }
-
-    /// The trust that the rule of `allow_stages` gives (`Rule::on_result()`).
-    fn of_rule(rule: Rule) -> Trust {
-        match rule {
-            Rule::StdCrates => Trust::Std,
-            _ => Trust::None,
-        }
-    }
-}
-
-/// What the `type_fn` and `nested_fn` of a Referrer of the mode `trust` keep as written: the
-/// optional entries ([`Referrer::must()`]) whose crates the mode trusts. They return the leaked
-/// type for them and write a path through the Repeater for the others.
-#[derive(Clone, Copy)]
-struct Keep<'a> {
-    trust: Trust,
-    /// The Leaker's crate.
-    krate: &'a str,
-}
-
-impl<'a> Keep<'a> {
-    fn new(trust: Trust, krate: &'a str) -> Self {
-        Keep { trust, krate }
-    }
-
-    /// Keeps nothing: a strict Referrer.
-    fn none() -> Self {
-        Keep::new(Trust::None, "")
-    }
-
-    /// Whether the copy keeps the entry `ix` of `referrer` as written.
-    fn keeps(self, referrer: &Referrer, ix: usize) -> bool {
-        !referrer.must(ix) && self.trust.trusts(referrer.external_crates_require(ix), self.krate)
     }
 }
 
@@ -894,31 +775,20 @@ fn type_with_params(name: &Ident, generics: &Generics) -> Type {
 type Impls = Vec<(Vec<Ident>, TokenStream)>;
 
 /// The Repeater's implementation of each entry with the path of the module it is keyed by,
-/// relative to the analyzed module (`[]` for it and for the entries of no module).
-///
-/// An item that a Referrer of the mode `trust` copies gets the implementations of the required
-/// entries and of the optional ones that the mode does not trust ([`Trust::trusts()`]), as a
-/// downstream crate writes them: a Referrer that replaced a trusted entry anyway fails to compile.
-/// The count is that of the optional entries left without one.
-fn repeater_impls(
-    referrer: &Referrer,
-    id: u64,
-    trust: Trust,
-    krate: &str,
-    marker: Option<&Type>,
-) -> Result<(Impls, usize)> {
+/// relative to the analyzed module (`[]` for it and for the entries of no module), as a downstream
+/// crate writes them.
+fn repeater_impls(referrer: &Referrer, id: u64, marker: Option<&Type>) -> Result<Impls> {
     let repeater: Path = parse_quote!(crate::Repeater);
     let slots = RepeaterSlots::new(repeater.clone());
     // For `Self` bounded by the trait, the implementation is for `__S` (the implementor).
     let self_param = ident("__S");
     check_entry_helpers(referrer)?;
     let mut impls = Vec::new();
-    let mut skipped = 0;
     for ix in 0..referrer.iter().count() {
-        crate::check_plain(referrer, ix, &slots)?;
+        crate::check_bucket_self(referrer, ix, id, &slots)?;
         let target = match marker {
             // The entries that need `Self` are for what it stands for, as under `Bucket`.
-            Some(_) if referrer.needs_self(ix) => ImplSelf::Param(&self_param),
+            Some(_) if referrer.bucket_self(ix, id).is_none() => ImplSelf::Param(&self_param),
             Some(marker) => ImplSelf::Marker(marker),
             None => ImplSelf::Bucket {
                 id,
@@ -929,13 +799,9 @@ fn repeater_impls(
             .repeater_impl(ix, target, slots.const_fn())
             .map_err(Error::from)?;
         check_impl_pieces(referrer, ix, id, &r, &self_param, marker)?;
-        if !referrer.must(ix) && trust.trusts(referrer.external_crates_require(ix), krate) {
-            skipped += 1;
-            continue;
-        }
         let module = r
             .module
-            .and_then(|m| referrer.module_path(m))
+            .and_then(|m| crate::module_path(referrer, m))
             .map(|p| p.to_vec())
             .unwrap_or_default();
         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
@@ -950,35 +816,7 @@ fn repeater_impls(
             },
         ));
     }
-    Ok((impls, skipped))
-}
-
-/// A struct, an enum or a union nested in a module (scope `mod`) has a `Self` of its own: only a
-/// type that must be leaked has it in its context (`SelfRequirement::Type`). An optional entry that
-/// names it (an absolute type, `::p::W<Self>`) would be replaced by a strict Referrer with the
-/// Leaker's type, where a trusting one copies the copy's own `Self`, and the check cannot tell: it
-/// writes the Leaker's type for every `Self` of the copy (`host_arg()`). So it is checked here.
-fn check_nested_self_is_required(referrer: &Referrer, item: &Item, args: &Args) -> Result<()> {
-    if !args.nested() || !matches!(item, Item::Struct(_) | Item::Enum(_) | Item::Union(_)) {
-        return Ok(());
-    }
-    for ix in 0..referrer.iter().count() {
-        let nested_type = matches!(
-            referrer.context_self(referrer.context(ix)),
-            Some(SelfRequirement::Type(_))
-        );
-        if !referrer.must(ix) && nested_type {
-            let ty = referrer.iter().nth(ix).unwrap();
-            return Err(Error::new(
-                Span::call_site(),
-                format!(
-                    "NESTED SELF OPTIONAL: the optional entry `{}` of an item nested in a module names its own `Self`: a strict Referrer would replace it with the Leaker's type, where the copy's `Self` is its own",
-                    quote!(#ty)
-                ),
-            ));
-        }
-    }
-    Ok(())
+    Ok(impls)
 }
 
 fn helpers_disagree(what: String) -> Error {
@@ -997,45 +835,26 @@ fn generics_text(generics: &Generics) -> String {
     quote!(#params ; #where_clause).to_string()
 }
 
-/// The entries and their helpers agree: `required()` is the entries with `must()`, and they are the
-/// first ones; the context of an entry is one of `contexts()`.
+/// The entries and their helpers agree: `is_empty()` and `iter()`, and the module that the context
+/// of an entry is in is the context of a module (`get_context()` finds it, and it is `Itself`).
 fn check_entry_helpers(referrer: &Referrer) -> Result<()> {
     let n = referrer.iter().count();
-    let musts: Vec<usize> = (0..n).filter(|&ix| referrer.must(ix)).collect();
-    let required: Vec<usize> = referrer.required().map(|(ix, _)| ix).collect();
-    if musts != required {
-        return Err(helpers_disagree(format!(
-            "`must()` holds for {:?} and `required()` has {:?}",
-            musts, required
-        )));
-    }
-    if musts != (0..musts.len()).collect::<Vec<_>>() {
-        return Err(helpers_disagree(format!(
-            "the required entries {:?} are not the first {} ones",
-            musts,
-            musts.len()
-        )));
-    }
     if referrer.is_empty() != (n == 0) {
         return Err(helpers_disagree(
             "`is_empty()` and `iter()` differ".to_string(),
         ));
     }
-    for (ix, ty) in referrer.required() {
-        if referrer.iter().nth(ix) != Some(ty) {
-            return Err(helpers_disagree(format!(
-                "`required()` has another type than `iter()` at {}",
-                ix
-            )));
-        }
-    }
-    let contexts: Vec<ContextId> = referrer.contexts().collect();
-    for ix in 0..n {
-        if !contexts.contains(&referrer.context(ix)) {
-            return Err(helpers_disagree(format!(
-                "the context of the entry {} is not in `contexts()`",
-                ix
-            )));
+    for (ix, (_, context)) in referrer.iter().enumerate() {
+        if let Some(ModuleScope::In(module)) = &context.module {
+            match &referrer.get_context(*module).module {
+                Some(ModuleScope::Itself { id, .. }) if id == module => (),
+                _ => {
+                    return Err(helpers_disagree(format!(
+                        "the module {} of the context of the entry {} is not the context of a module",
+                        module, ix
+                    )))
+                }
+            }
         }
     }
     Ok(())
@@ -1125,12 +944,11 @@ fn check_impl_pieces(
     self_param: &Ident,
     marker: Option<&Type>,
 ) -> Result<()> {
-    let context = referrer.context(ix);
-    let declared = declared_generics(referrer.context_generics(context));
+    let context = crate::entry_context(referrer, ix);
+    let declared = declared_generics(&context.generics);
     let mut got = r.generics.clone();
     let bucket = referrer.bucket_self(ix, id);
-    let bucketable = referrer.context_self(context).is_none()
-        && !names_self(referrer.context_generics(context));
+    let bucketable = context.self_ty.is_none() && !names_self(&context.generics);
     if bucket.is_some() != bucketable {
         return Err(helpers_disagree(format!(
             "`bucket_self()` of the entry {} is `{}`, and its context {} `Self`",
@@ -1139,7 +957,7 @@ fn check_impl_pieces(
             if bucketable { "does not name" } else { "names" }
         )));
     }
-    match (&bucket, referrer.context_self(context)) {
+    match (&bucket, context.self_ty.as_ref()) {
         (Some(ty), _) => {
             // The marker of the item, if it has one (`Args::marker`), else the bucket.
             let expected = marker.unwrap_or(ty);
@@ -1172,7 +990,7 @@ fn check_impl_pieces(
                 // `?Sized`, and the trait of a `Self` that is bound by it. Any type that the
                 // bounds hold for is a `Sized` one (a struct, an enum or a union), so it has no
                 // bound if a bound of the generics needs it `Sized`, and `?Sized` if not.
-                let expected = match referrer.context_self(context) {
+                let expected = match context.self_ty.as_ref() {
                     Some(SelfRequirement::Bound(_)) => 2..=2,
                     Some(SelfRequirement::Any) => 0..=1,
                     _ => 1..=1,
@@ -1205,9 +1023,9 @@ fn check_impl_pieces(
             generics_text(&declared)
         )));
     }
-    if r.module != referrer.context_module(context) {
+    if r.module != crate::in_module(context) {
         return Err(helpers_disagree(format!(
-            "the impl of the entry {} has another module than `context_module()`",
+            "the impl of the entry {} has another module than `Context::module`",
             ix
         )));
     }
@@ -2107,8 +1925,8 @@ struct Projector<'a> {
 
 impl Projector<'_> {
     fn project(&self, ix: usize) -> Result<Type> {
-        let context = self.referrer.context(ix);
-        let self_ty: Type = match self.referrer.context_self(context) {
+        let context = crate::entry_context(self.referrer, ix);
+        let self_ty: Type = match context.self_ty.as_ref() {
             Some(SelfRequirement::Bound(_)) => self
                 .bound_self
                 .clone()
@@ -2129,7 +1947,7 @@ impl Projector<'_> {
                 (Some(bucket), None) => bucket,
                 (None, _)
                     if self.bound_self.is_some()
-                        && names_self(self.referrer.context_generics(context)) =>
+                        && names_self(&context.generics) =>
                 {
                     self.bound_self.clone().unwrap()
                 }
@@ -2149,7 +1967,7 @@ impl Projector<'_> {
     /// An entry whose type does not name `Self`, and whose bounds do (`SelfRequirement::Any`), has
     /// an impl for any type that the bounds hold for: the copy passes its own type, `Self`.
     fn project_nested(&self, nested: &NestedSelf, base: &Path, ix: usize) -> Result<Type> {
-        if let Some(SelfRequirement::Any) = self.referrer.context_self(self.referrer.context(ix)) {
+        if let Some(SelfRequirement::Any) = crate::entry_context(self.referrer, ix).self_ty {
             return self.project_with(ix, parse_quote!(Self));
         }
         let self_ty: Type = match &nested.requirement {
@@ -2225,11 +2043,9 @@ fn repeater_path(leaker_path: &Path) -> Path {
     repeater
 }
 
-/// Rewrites a copy of `item`, which is in the module `leaker_path` of the Leaker's crate. The copy
-/// keeps the entries that `keep` says as written.
+/// Rewrites a copy of `item`, which is in the module `leaker_path` of the Leaker's crate.
 fn rewrite(
     referrer: &Referrer,
-    keep: Keep<'_>,
     context: ContextId,
     item: &Item,
     args: &Args,
@@ -2238,7 +2054,6 @@ fn rewrite(
 ) -> Result<Rewritten> {
     rewrite_with(
         referrer,
-        keep,
         context,
         item,
         args,
@@ -2255,7 +2070,6 @@ fn rewrite(
 #[allow(clippy::too_many_arguments)]
 fn rewrite_with(
     referrer: &Referrer,
-    keep: Keep<'_>,
     context: ContextId,
     item: &Item,
     args: &Args,
@@ -2316,10 +2130,7 @@ fn rewrite_with(
         Item::Impl(i) => {
             // The self type is written in the Leaker's crate: rewrite it like any type.
             let error = std::cell::RefCell::new(None);
-            let rewritten = referrer.expand(context, (*i.self_ty).clone(), |leaked, ix| {
-                if keep.keeps(referrer, ix) {
-                    return leaked;
-                }
+            let rewritten = referrer.expand(context, (*i.self_ty).clone(), |_leaked, ix| {
                 projector.project(ix).unwrap_or_else(|e| {
                     *error.borrow_mut() = Some(e);
                     parse_quote!(())
@@ -2345,10 +2156,7 @@ fn rewrite_with(
         if let Item::Mod(m) = item {
             base.segments.push(m.ident.clone().into());
         }
-        let visitor = referrer.visitor(context, |leaked, ix| {
-            if keep.keeps(referrer, ix) {
-                return leaked;
-            }
+        let visitor = referrer.visitor(context, |_leaked, ix| {
             projector.project(ix).unwrap_or_else(|e| {
                 *error.borrow_mut() = Some(e);
                 parse_quote!(())
@@ -2364,10 +2172,7 @@ fn rewrite_with(
         let mut visitor: Box<dyn VisitMut + '_> = if args.no_nested_self {
             Box::new(visitor)
         } else {
-            Box::new(visitor.with_nested_self(|nested, leaked, ix| {
-                if keep.keeps(referrer, ix) {
-                    return leaked;
-                }
+            Box::new(visitor.with_nested_self(|nested, _leaked, ix| {
                 projector
                     .project_nested(nested, &base, ix)
                     .unwrap_or_else(|e| {
@@ -2431,7 +2236,7 @@ fn rewrite_with(
         if let Item::Mod(m) = item {
             base.segments.push(m.ident.clone().into());
         }
-        rewrite_defaults(referrer, keep, context, original, copy, &projector, &base)?;
+        rewrite_defaults(referrer, context, original, copy, &projector, &base)?;
     }
     Ok(Rewritten {
         item: rewritten,
@@ -3513,11 +3318,16 @@ fn defaults_check(
     }
 }
 
-/// Checks `Referrer::context_generic_args()` on the arguments of the generics of the item for every
-/// context of the Referrer: the identity arguments give the generics' own names, and a list with
-/// one argument too many, or one of the other kind in the first place, or the last one missing, is
-/// refused (the last one missing only where the generics of the context name that parameter).
-fn check_refusals(referrer: &Referrer, params: &Punctuated<GenericParam, Token![,]>) -> Result<()> {
+/// Checks `Referrer::context_generic_args()` on the arguments of the generics of the item for the
+/// generics of the top-level context and of every entry: the identity arguments give the generics'
+/// own names, and a list with one argument too many, or one of the other kind in the first place,
+/// or the last one missing, is refused (the last one missing only where the generics name that
+/// parameter).
+fn check_refusals(
+    referrer: &Referrer,
+    top_level: ContextId,
+    params: &Punctuated<GenericParam, Token![,]>,
+) -> Result<()> {
     let (first, last) = match (params.first(), params.last()) {
         (Some(first), Some(last)) => (first, last),
         _ => return Ok(()),
@@ -3537,38 +3347,46 @@ fn check_refusals(referrer: &Referrer, params: &Punctuated<GenericParam, Token![
     };
     let mut short = valid.clone();
     short.pop();
-    for context in referrer.contexts() {
-        let own = referrer.context_generic_args(context, params, &valid);
+    let top = std::iter::once((
+        "the top-level context".to_string(),
+        referrer.get_context(top_level),
+    ));
+    let entries = referrer
+        .iter()
+        .enumerate()
+        .map(|(ix, (_, context))| (format!("the context of the entry {}", ix), context));
+    for (context_name, context) in top.chain(entries) {
+        let generics = &context.generics;
+        let own = referrer.context_generic_args(generics, params, &valid);
         if own.is_err() {
             return Err(fail(format!(
-                "refused the arguments that are the generics' own names in the context {}",
-                context
+                "refused the arguments that are the generics' own names in {}",
+                context_name
             )));
         }
         for (what, args) in [("one too many", &extra), ("one of another kind", &wrong)] {
-            match referrer.context_generic_args(context, params, args) {
+            match referrer.context_generic_args(generics, params, args) {
                 Err(EncodeError::UnexpectedArgument(_)) => (),
                 other => {
                     return Err(fail(format!(
-                        "{} in the context {} is not an `UnexpectedArgument`: {:?}",
+                        "{} in {} is not an `UnexpectedArgument`: {:?}",
                         what,
-                        context,
+                        context_name,
                         other.map(|a| a.len())
                     )))
                 }
             }
         }
-        let needs = referrer
-            .context_generics(context)
+        let needs = generics
             .params
             .iter()
             .any(|param| param_name(param) == param_name(last));
-        match (needs, referrer.context_generic_args(context, params, &short)) {
+        match (needs, referrer.context_generic_args(generics, params, &short)) {
             (true, Err(EncodeError::MissingArgument(_))) | (false, Ok(_)) => (),
             (_, other) => {
                 return Err(fail(format!(
-                    "the last argument missing in the context {} (its generics {} `{}`) gives {:?}",
-                    context,
+                    "the last argument missing in {} (its generics {} `{}`) gives {:?}",
+                    context_name,
                     if needs { "name" } else { "do not name" },
                     param_name(last),
                     other.map(|a| a.len())
@@ -3593,11 +3411,10 @@ fn shadowable(referrer: &Referrer, ix: usize) -> std::collections::BTreeSet<Stri
             syn::visit::visit_path(self, path)
         }
     }
-    let ty = referrer.iter().nth(ix).unwrap();
+    let (ty, context) = referrer.iter().nth(ix).unwrap();
     let mut heads = Heads(Default::default());
     heads.visit_type(ty);
-    let generics = referrer.context_generics(referrer.context(ix));
-    for param in &generics.params {
+    for param in &context.generics.params {
         heads.0.remove(&param_name(param));
     }
     for name in ["Self", "self", "super", "crate"] {
@@ -3655,7 +3472,6 @@ impl Wrap {
 /// entries were hidden.
 fn shadow_check(
     referrer: &Referrer,
-    keep: Keep<'_>,
     context: ContextId,
     item: &Item,
     args: &Args,
@@ -3691,7 +3507,6 @@ fn shadow_check(
     let shadowing = Wrap { block, names };
     let control = rewrite_with(
         referrer,
-        keep,
         context,
         item,
         args,
@@ -3702,7 +3517,6 @@ fn shadow_check(
     )?;
     let shadowed = rewrite_with(
         referrer,
-        keep,
         context,
         item,
         args,
@@ -3719,7 +3533,7 @@ fn shadow_check(
     let hides = control.used.iter().filter(|ix| hidden(ix)).count();
     if shadowed.used != expected {
         let entry = |ix: &usize| {
-            let ty = referrer.iter().nth(*ix).unwrap();
+            let ty = referrer.iter().nth(*ix).unwrap().0;
             quote!(#ty).to_string()
         };
         let list = |set: Vec<&usize>| set.into_iter().map(entry).collect::<Vec<_>>().join(", ");
@@ -3745,7 +3559,6 @@ fn shadow_check(
 /// ([`Instance::lifetime_args_in_elided_signatures()`]).
 fn instance_part(
     referrer: &Referrer,
-    keep: Keep<'_>,
     context: ContextId,
     item: &Item,
     args: &Args,
@@ -3765,7 +3578,7 @@ fn instance_part(
     if generics.params.is_empty() || args.redeclare {
         return Ok((TokenStream::new(), 0, [0; 4]));
     }
-    check_refusals(referrer, &generics.params)?;
+    check_refusals(referrer, context, &generics.params)?;
     let host_name = ident(&format!("Host{}I", args.id));
     let error = std::cell::RefCell::new(None);
     let projector_with = |prefix: Vec<GenericArgument>| Projector {
@@ -3780,11 +3593,11 @@ fn instance_part(
         used: Default::default(),
         at_instance: true,
     };
-    let replaced: Vec<String> = rewrite(referrer, keep, context, item, args, path, dyn_host)?
+    let replaced: Vec<String> = rewrite(referrer, context, item, args, path, dyn_host)?
         .used
         .iter()
         .filter_map(|ix| referrer.iter().nth(*ix))
-        .map(|entry| quote!(#entry).to_string())
+        .map(|(entry, _)| quote!(#entry).to_string())
         .collect();
     let planned = plan_instance(
         referrer,
@@ -3794,13 +3607,8 @@ fn instance_part(
         generics,
         ask,
         &replaced,
-        |leaked, ix, prefix| {
+        |_leaked, ix, prefix| {
             // A default kept as written is not substituted again: write it at the site.
-            if keep.keeps(referrer, ix) {
-                let before: Punctuated<GenericParam, Token![,]> =
-                    generics.params.iter().take(prefix.len()).cloned().collect();
-                return UseSite::substituting(&before, prefix).substitute(&leaked);
-            }
             projector_with(prefix.to_vec())
                 .project(ix)
                 .unwrap_or_else(|e| {
@@ -3819,7 +3627,6 @@ fn instance_part(
     let mut inst = inst;
     let rewritten = rewrite_with(
         referrer,
-        keep,
         context,
         item,
         args,
@@ -3870,7 +3677,6 @@ fn instance_part(
 /// same type: the entry does not depend on them.
 fn rewrite_defaults(
     referrer: &Referrer,
-    keep: Keep<'_>,
     context: ContextId,
     original: &ItemTrait,
     copy: &mut ItemTrait,
@@ -3917,19 +3723,13 @@ fn rewrite_defaults(
         items: vec![Item::Trait(shell)],
     };
     referrer
-        .visitor(context, |leaked, ix| {
-            if keep.keeps(referrer, ix) {
-                return leaked;
-            }
+        .visitor(context, |_leaked, ix| {
             placeholder.project(ix).unwrap_or_else(|e| {
                 *error.borrow_mut() = Some(e);
                 parse_quote!(())
             })
         })
-        .with_nested_self(|nested, leaked, ix| {
-            if keep.keeps(referrer, ix) {
-                return leaked;
-            }
+        .with_nested_self(|nested, _leaked, ix| {
             placeholder
                 .project_nested(nested, base, ix)
                 .unwrap_or_else(|e| {
@@ -4006,8 +3806,7 @@ fn const_value(ty: &Type) -> Expr {
 /// the Leaker's type: the visitor leaves a `Self` that is not in an entry (`Vec<Self>` as a field,
 /// or in an absolute type, `::p::W<Self>`, which no Referrer replaces: F38), which is the copy's
 /// own type, and the check writes the Leaker's for it, as the witness does. (So the check cannot
-/// tell the copy's `Self` from the Leaker's; `check_nested_self_is_required()` and the fixtures of
-/// `tests/cross_crate.rs` do.) The copy of a struct that is not nested has its `Self` replaced
+/// tell the copy's `Self` from the Leaker's; the fixtures of `tests/cross_crate.rs` do.) The copy of a struct that is not nested has its `Self` replaced
 /// (`Visitor::with_self()`).
 fn host_arg(rewritten: &Rewritten, args: &Args, leaker_path: &Path) -> Option<Host> {
     if let Some(host) = &rewritten.host {
@@ -5535,12 +5334,51 @@ fn same_analysis(
     }
 }
 
+/// The type with each projection through the Repeater (`<S as Repeater<ARGS, KEY>>::Type`)
+/// replaced by the entry that its `KEY` names (the index is in the low half).
+fn unreplaced(referrer: &Referrer, ty: &Type) -> Type {
+    struct Back<'a>(&'a Referrer);
+    impl VisitMut for Back<'_> {
+        fn visit_type_mut(&mut self, ty: &mut Type) {
+            if let Type::Path(TypePath {
+                qself: Some(qself),
+                path,
+            }) = ty
+            {
+                let at = qself.position;
+                if at > 0 && path.segments.len() == at + 1 && path.segments[at].ident == "Type" {
+                    if let PathArguments::AngleBracketed(arguments) = &path.segments[at - 1].arguments
+                    {
+                        if let Some(GenericArgument::Const(Expr::Lit(ExprLit {
+                            lit: Lit::Int(key),
+                            ..
+                        }))) = arguments.args.last()
+                        {
+                            let key = key.base10_parse::<u128>().unwrap_or(0);
+                            let ix = (key & u128::from(u64::MAX)) as usize;
+                            if let Some((entry, _)) = self.0.iter().nth(ix) {
+                                *ty = entry.clone();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            syn::visit_mut::visit_type_mut(self, ty);
+        }
+    }
+    let mut back = ty.clone();
+    Back(referrer).visit_type_mut(&mut back);
+    back
+}
+
 /// What `View::check()` said of the positions it checked agrees with the copy of the item: a type
-/// with no cause is as written in the copy; a type leaked whole is a projection; one with causes in
-/// its parts is another type. The copy is that of a Referrer that trusts every crate, which writes
-/// an optional entry as it is. A type with a cause that cannot be leaked, an elided lifetime and
-/// `Self` (the copy replaces it) are not compared.
+/// with no cause is as written in the copy, but for the entries in it (a type of another crate)
+/// that the copy replaces; a type leaked whole is a projection; one with causes in its parts is
+/// another type. A type with a cause that cannot be leaked, an elided lifetime and `Self` (the
+/// copy replaces it) are not compared.
 fn check_against_copy(
+    referrer: &Referrer,
     checked: &[Checked],
     original: &Item,
     copy: &Item,
@@ -5565,7 +5403,8 @@ fn check_against_copy(
         let same = text(&o.ty) == text(&k.ty);
         let whole = matches!(&k.ty, Type::Path(TypePath { qself: Some(_), .. }));
         let says = if c.must == 0 {
-            (!same).then_some("no cause, and the copy changed it")
+            (text(&o.ty) != text(&unreplaced(referrer, &k.ty)))
+                .then_some("no cause, and the copy changed it")
         } else if c.is_own {
             (!whole).then_some("a type leaked whole, and the copy is no projection")
         } else {
@@ -5684,43 +5523,27 @@ fn count_copy(
 ) -> Result<Counted> {
     let referrer = &result.clone().into_referrer();
     let (id, kind) = (args.id, kind_name(original));
-    check_nested_self_is_required(referrer, original, args)?;
-    let krate = args.krate.as_str();
-    let (impls, skipped) = repeater_impls(
-        referrer,
-        args.repeater_id(),
-        args.trust.unwrap_or(Trust::None),
-        krate,
-        args.marker.as_ref(),
-    )?;
+    let impls = repeater_impls(referrer, args.repeater_id(), args.marker.as_ref())?;
     let positions = collect_positions(original, None, args);
     let dummy: Path = parse_quote!(::__dummy);
-    // A Referrer that is not told its mode trusts everything. The result is read back from its
-    // tokens, as the Referrer's macro gets it.
-    let trust = args.trust.unwrap_or(Trust::All);
+    // The result is read back from its tokens, as the Referrer's macro gets it.
     let plain: LeakerResult = parse2(result.to_token_stream())?;
-    let copies = trusting_copy(&plain, context, original, args, &dummy, false, trust, krate)?;
-    // The decoy crate has a copy of the item if its copy does not name the Leaker's crate.
-    let decoyed = !matches!(original, Item::Mod(_))
-        && copies
-            .strict_item
-            .as_ref()
-            .map_or(false, |copy| !names_crate(quote!(#copy), krate));
-    let report = match copies.rewritten {
+    let copy = rewrite(&plain.into_referrer(), context, original, args, &dummy, false);
+    let report = match copy {
         Ok(rewritten) => {
             let host = host_arg(&rewritten, args, &dummy);
             // The copy of an item accepted by `allow()` keeps the part that conflicts as written, and
             // so a primitive in it that the Leaker does not allow.
             if !args.accepted {
                 check_primitives_replaced(&rewritten.item, original, args, host.as_ref())?;
-                // The copy of a Referrer that trusts every crate writes the optional entries as they are.
-                if !checked.is_empty() {
-                    let all = Keep::new(Trust::All, krate);
-                    let referrer = plain.clone().into_referrer();
-                    if let Ok(all) = rewrite(&referrer, all, context, original, args, &dummy, false) {
-                        check_against_copy(checked, original, &all.item, args, host.as_ref())?;
-                    }
-                }
+                check_against_copy(
+                    referrer,
+                    checked,
+                    original,
+                    &rewritten.item,
+                    args,
+                    host.as_ref(),
+                )?;
             }
             let checks = comparable(&rewritten.item, original, args, host.as_ref(), &dummy);
             let headers = checks.iter().filter(|c| c.header).count();
@@ -5729,20 +5552,17 @@ fn count_copy(
             );
             let rerooted = checks.iter().filter(|c| c.expected.is_some()).count();
             format!(
-                "{}|{}|{}|entries={} positions={} checked={} skipped={} twin={} rerooted={} headers={} header_cycles={} decoyed={} {}",
+                "{}|{}|{}|entries={} positions={} checked={} twin={} rerooted={} headers={} header_cycles={}",
                 id,
                 kind,
                 status,
                 referrer.iter().count(),
                 positions.len(),
                 checks.len() - headers,
-                skipped,
                 u8::from(twin),
                 rerooted,
                 headers,
-                left_out,
-                u8::from(decoyed),
-                optional_entries(referrer, trust, krate)
+                left_out
             )
         }
         Err(e) => format!(
@@ -5756,129 +5576,6 @@ fn count_copy(
         ),
     };
     Ok(Counted { impls, report })
-}
-
-/// The optional entries of the Referrer by the crates they name and whether `trust` trusts them, for
-/// the report (`optstd`: `std` only, `optkr`: the Leaker's crate only, `optboth`: both, `optother`;
-/// `trusted`: the ones the mode trusts).
-fn optional_entries(referrer: &Referrer, trust: Trust, krate: &str) -> String {
-    let (mut std, mut leaker, mut both, mut other, mut trusted) = (0, 0, 0, 0, 0);
-    for ix in (0..referrer.iter().count()).filter(|&ix| !referrer.must(ix)) {
-        let crates = referrer.external_crates_require(ix);
-        let is_std = |name: &String| ["std", "alloc", "core"].contains(&name.as_str());
-        let has_std = crates.iter().any(is_std);
-        let has_leaker = crates.iter().any(|name| name == krate);
-        match (
-            has_std,
-            has_leaker,
-            crates.iter().all(|name| is_std(name) || name == krate),
-        ) {
-            (true, false, true) => std += 1,
-            (false, true, true) => leaker += 1,
-            (true, true, true) => both += 1,
-            _ => other += 1,
-        }
-        trusted += usize::from(trust.trusts(crates, krate));
-    }
-    format!(
-        "trust={} optstd={} optkr={} optboth={} optother={} trusted={}",
-        trust.name(),
-        std,
-        leaker,
-        both,
-        other,
-        trusted
-    )
-}
-
-/// The copy of `item` that a Referrer of the mode `trust` makes from `plain`, a result as it is
-/// serialized, and the copy that a strict Referrer makes of the same.
-struct Copies {
-    rewritten: Result<Rewritten>,
-    /// The item of the strict copy, if there is one.
-    strict_item: Option<Item>,
-}
-
-/// Makes the copies of `item` of a Referrer of the mode `trust` ([`Copies`]) and checks the mode:
-/// it replaces the entries that a strict Referrer replaces but for the optional ones that the mode
-/// trusts, written out in [`Trust::trusts()`] from the crates each entry names. A Visitor that asks
-/// `type_fn` for an entry that the strict one does not, or the other way round, differs (`TRUST
-/// DISAGREES`).
-#[allow(clippy::too_many_arguments)]
-fn trusting_copy(
-    plain: &LeakerResult,
-    context: ContextId,
-    item: &Item,
-    args: &Args,
-    path: &Path,
-    dyn_host: bool,
-    trust: Trust,
-    krate: &str,
-) -> Result<Copies> {
-    let strict = plain.clone().into_referrer();
-    let keep = Keep::new(trust, krate);
-    let rewritten = rewrite(&strict, keep, context, item, args, path, dyn_host);
-    let strict_copy = match trust {
-        Trust::None => None,
-        _ => rewrite(&strict, Keep::none(), context, item, args, path, dyn_host).ok(),
-    };
-    if let (Ok(copy), Some(all)) = (&rewritten, &strict_copy) {
-        let expected: Vec<usize> = all
-            .used
-            .iter()
-            .copied()
-            .filter(|&ix| {
-                strict.must(ix) || !trust.trusts(strict.external_crates_require(ix), krate)
-            })
-            .collect();
-        let used: Vec<usize> = copy.used.iter().copied().collect();
-        if expected != used {
-            let entry = |ix: &usize| {
-                let ty = strict.iter().nth(*ix).unwrap();
-                format!(
-                    "`{}` (crates {:?})",
-                    quote!(#ty),
-                    strict.external_crates_require(*ix)
-                )
-            };
-            let list =
-                |only: Vec<&usize>| only.into_iter().map(entry).collect::<Vec<_>>().join(", ");
-            return Err(Error::new(
-                Span::call_site(),
-                format!(
-                    "TRUST DISAGREES (trust {}, crate {}): the Referrer wrote as they are {} that a Referrer of the mode replaces, and replaced {} that it trusts",
-                    trust.name(),
-                    krate,
-                    list(expected.iter().filter(|ix| !used.contains(ix)).collect()),
-                    list(used.iter().filter(|ix| !expected.contains(ix)).collect())
-                ),
-            ));
-        }
-    }
-    let strict_item = match trust {
-        Trust::None => rewritten.as_ref().ok().map(|copy| copy.item.clone()),
-        _ => strict_copy.map(|copy| copy.item),
-    };
-    Ok(Copies {
-        rewritten,
-        strict_item,
-    })
-}
-
-/// Whether the tokens name the crate `name` after a `::` (`::name::`, `'a ::name::`, `dyn
-/// ::name::`). The generated crates have no module of that name.
-fn names_crate(tokens: TokenStream, name: &str) -> bool {
-    let trees: Vec<proc_macro2::TokenTree> = tokens.into_iter().collect();
-    let colon = |tree: Option<&proc_macro2::TokenTree>| {
-        matches!(tree, Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == ':')
-    };
-    trees.iter().enumerate().any(|(at, tree)| match tree {
-        proc_macro2::TokenTree::Group(group) => names_crate(group.stream(), name),
-        proc_macro2::TokenTree::Ident(ident) => {
-            ident == name && at >= 2 && colon(trees.get(at - 1)) && colon(trees.get(at - 2))
-        }
-        _ => false,
-    })
 }
 
 /// What `TYPE_LEAK_PROP_FEATURES=allow_stages` adds to the output of an item for each [`Rule`] and
@@ -6066,14 +5763,6 @@ fn stage_copy(
     copy_args.stages = false;
     copy_args.stage = rule.number(side);
     copy_args.accepted = true;
-    // The Referrer's crate trusts the crates that the rule's stage trusts (`Trust::of_rule()`), which
-    // the Leaker writes the impls for, not the item's own mode. An item invoked with every crate
-    // trusted keeps it: that is also how the generator invokes the items with a shape that breaks
-    // when an optional entry is replaced (`gen::Gen::item_trust()`).
-    copy_args.trust = Some(match args.trust {
-        Some(Trust::All) => Trust::All,
-        _ => Trust::of_rule(rule),
-    });
     let referrer = result.clone().into_referrer();
     let text = rejection_text(&errors);
     let counted = match count_copy(&result, context, original, &copy_args, status, false, &[]) {
@@ -6171,12 +5860,6 @@ struct ApplyInput {
     item: Item,
     /// The module that contains the item, in the Leaker's crate.
     path: Path,
-    /// The mode of the Referrer (`strict`, `trust(..)`): not said, the attribute's, else `Trust::All`.
-    trust: Option<Trust>,
-    /// The Leaker's crate as the dependency `decoy` names it in this Referrer's crate: it is another
-    /// crate of the same name there (`gen::Case::decoy`), so the copy must not name it: an item
-    /// whose copy does, and a module, expand to nothing here.
-    decoy: Option<Ident>,
     /// The host of a trait is `dyn Host`.
     dyn_host: bool,
     /// The invocation is in the Referrer's crate of the items accepted by `allow()` (`accept`),
@@ -6237,10 +5920,8 @@ impl Parse for ApplyInput {
         }
         input.parse::<Token![=]>()?;
         let path = Path::parse_mod_style(input)?;
-        // Flags after the path: `strict` (nothing is trusted), `trust(none|all|std|leaker)`,
-        // `decoy(name)`, `dyn_host` (the trait is implemented for `dyn Host`, an unsized type,
-        // instead of a unit struct), `accept` and `allow(..)`.
-        let (mut trust, mut decoy) = (None, None);
+        // Flags after the path: `dyn_host` (the trait is implemented for `dyn Host`, an unsized
+        // type, instead of a unit struct), `accept` and `allow(..)`.
         let (mut dyn_host, mut accept, mut clean) = (false, false, false);
         let (mut constants, mut imports) = (false, false);
         let (mut inst, mut shadow) = (None, None);
@@ -6249,20 +5930,6 @@ impl Parse for ApplyInput {
         while input.parse::<Option<Token![,]>>()?.is_some() {
             let keyword: Ident = input.parse()?;
             match keyword.to_string().as_str() {
-                "strict" => trust = Some(Trust::None),
-                "trust" => {
-                    let content;
-                    parenthesized!(content in input);
-                    let word: Ident = content.parse()?;
-                    trust = Some(Trust::parse(&word.to_string()).ok_or_else(|| {
-                        Error::new(word.span(), "expected `none`, `all`, `std` or `leaker`")
-                    })?);
-                }
-                "decoy" => {
-                    let content;
-                    parenthesized!(content in input);
-                    decoy = Some(content.parse()?);
-                }
                 "dyn_host" => dyn_host = true,
                 "accept" => accept = true,
                 "clean" => clean = true,
@@ -6278,7 +5945,7 @@ impl Parse for ApplyInput {
                 }
                 _ => return Err(Error::new(
                     keyword.span(),
-                    "expected `strict`, `trust(..)`, `decoy(..)`, `dyn_host`, `accept`, `clean`, `constants`, `imports`, `inst(..)`, `lifetime_args`, `shadow(..)` or `allow(..)`",
+                    "expected `dyn_host`, `accept`, `clean`, `constants`, `imports`, `inst(..)`, `lifetime_args`, `shadow(..)` or `allow(..)`",
                 )),
             }
         }
@@ -6288,8 +5955,6 @@ impl Parse for ApplyInput {
             args,
             item,
             path,
-            trust,
-            decoy,
             dyn_host,
             accept,
             allow,
@@ -6325,8 +5990,6 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         args,
         item,
         path,
-        trust,
-        decoy,
         dyn_host,
         accept,
         allow,
@@ -6348,41 +6011,14 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         };
     }
     let errors = result.errors().to_vec();
-    // The mode of the Referrer: a trust that the invocation says, which the attribute's must agree
-    // with, else the attribute's, else every crate.
-    if trust.is_some() && args.trust.is_some() && trust != args.trust {
-        return Err(Error::new(
-            Span::call_site(),
-            "test macro: the item is invoked with another trust than the one it was analyzed for",
-        ));
-    }
-    let trust = trust.or(args.trust).unwrap_or(Trust::All);
-    let copies = trusting_copy(
-        &result,
+    let rewritten = rewrite(
+        &result.clone().into_referrer(),
         context,
         &item,
         &args,
         &path,
         dyn_host,
-        trust,
-        &args.krate,
     )?;
-    let rewritten = copies.rewritten?;
-    if let Some(decoy) = &decoy {
-        // The crate is trusted not to be the same here, so it is not trusted.
-        if matches!(trust, Trust::All | Trust::Leaker) {
-            return Err(Error::new(
-                Span::call_site(),
-                "test macro: a decoy crate for a Referrer that trusts the Leaker's crate",
-            ));
-        }
-        let named = copies
-            .strict_item
-            .map_or(true, |copy| names_crate(quote!(#copy), &decoy.to_string()));
-        if named || matches!(item, Item::Mod(_)) {
-            return Ok(TokenStream::new());
-        }
-    }
     let id = args.id;
 
     // The checks call the witnesses by the path of the module of the item, in the Leaker's crate
@@ -6447,26 +6083,20 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         }
         other => quote!(#other),
     };
-    // Reported last: nothing is emitted (nightly) if the macro fails above. The decoy's crate
-    // reports none: the ordinary Referrer's crate has.
-    let errors = if decoy.is_some() {
-        TokenStream::new()
-    } else {
-        crate::report(&errors)
-    };
+    // Reported last: nothing is emitted (nightly) if the macro fails above.
+    let errors = crate::report(&errors);
     // The copy at an instantiation of its generics, and inside a module and a block that declare the
-    // names it leaks: the ordinary Referrer's crate only (the others are `accept` and `decoy`).
+    // names it leaks: the ordinary Referrer's crate only (the others do not ask for it).
     let mut more = TokenStream::new();
-    if decoy.is_none() && (inst.is_some() || shadow.is_some()) {
+    if inst.is_some() || shadow.is_some() {
         let referrer = result.clone().into_referrer();
-        let keep = Keep::new(trust, &args.krate);
         if let Some(seed) = inst {
             let ask = InstAsk {
                 seed,
                 lifetime_args,
             };
             let (tokens, n, [elided, entry, elided_pairs, entry_pairs]) =
-                instance_part(&referrer, keep, context, &item, &args, &path, dyn_host, ask)?;
+                instance_part(&referrer, context, &item, &args, &path, dyn_host, ask)?;
             more.extend(tokens);
             counted("inst", id, n);
             counted("inst_elided", id, elided);
@@ -6475,9 +6105,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
             counted("inst_elided_entry_candidates", id, entry_pairs);
         }
         if let Some(seed) = shadow {
-            let hidden = shadow_check(
-                &referrer, keep, context, &item, &args, &path, dyn_host, seed,
-            )?;
+            let hidden = shadow_check(&referrer, context, &item, &args, &path, dyn_host, seed)?;
             counted("shadow", id, hidden);
         }
     }
@@ -6800,40 +6428,6 @@ mod tests {
     }
 
     const ENTRY: &str = "<() as ::krate::Repeater<(), 0>>::Type";
-
-    #[test]
-    fn a_mode_trusts_an_entry_if_it_trusts_every_crate_the_entry_names() {
-        let crates = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        let (std, leaker, both) = (
-            crates(&["std"]),
-            crates(&["krate"]),
-            crates(&["krate", "std"]),
-        );
-        for (trust, expected) in [
-            (Trust::None, [false, false, false]),
-            (Trust::All, [true, true, true]),
-            (Trust::Std, [true, false, false]),
-            (Trust::Leaker, [false, true, false]),
-        ] {
-            let got = [&std, &leaker, &both].map(|names| trust.trusts(names, "krate"));
-            assert_eq!(got, expected, "{}", trust.name());
-            assert_eq!(Trust::parse(trust.name()), Some(trust));
-        }
-        assert_eq!(Trust::of_rule(Rule::StdCrates), Trust::Std);
-        assert_eq!(Trust::of_rule(Rule::Default), Trust::None);
-    }
-
-    #[test]
-    fn the_copy_names_the_decoy_by_an_absolute_path_only() {
-        let names = |src: &str, name: &str| names_crate(src.parse().unwrap(), name);
-        assert!(names("struct S(::krate::base::B0);", "krate"));
-        assert!(names("fn f() where T: Fn(Vec<::krate::base::B0>) {}", "krate"));
-        // After a lifetime or a keyword, and not another crate or a path without the colons.
-        assert!(names("fn f() -> &'b ::krate::base::B0 {}", "krate"));
-        assert!(names("fn f(a: Box<dyn ::krate::Tr>) {}", "krate"));
-        assert!(!names("struct S(::krate2::B0);", "krate"));
-        assert!(!names("struct S(krate::B0);", "krate"));
-    }
 
     #[test]
     fn a_declared_name_is_the_copys_and_an_import_is_the_leakers() {

@@ -75,21 +75,19 @@ fn g_only() -> ItemImpl {
     )
 }
 
-/// The entries of the Referrer of an item: the type, whether it is required, and its generics.
-fn entries(item: &ItemImpl) -> Vec<(String, bool, String)> {
+/// The entries of the Referrer of an item: the type and its generics.
+fn entries(item: &ItemImpl) -> Vec<(String, String)> {
     let referrer = analyzed(item).into_referrer();
     (0..referrer.iter().count())
         .map(|ix| {
             (
-                referrer
-                    .iter()
+                common::types(&referrer)
                     .nth(ix)
                     .unwrap()
                     .to_token_stream()
                     .to_string(),
-                referrer.must(ix),
-                referrer
-                    .context_generics(referrer.context(ix))
+                common::entry(&referrer, ix)
+                    .generics
                     .to_token_stream()
                     .to_string(),
             )
@@ -143,11 +141,10 @@ fn a_cause_written_by_hand_matches_one_that_the_analysis_made() {
 fn the_entries_are_those_of_the_item_without_the_conflict() {
     let accepted = entries(&f_and_g());
     assert_eq!(accepted, entries(&g_only()));
-    // `g` still leaks `::p::X<dyn RelTr>` as a whole, which is required as `dyn RelTr` is in it,
-    // and the self type is optional.
-    let find = |ty: &str| accepted.iter().find(|entry| entry.0 == ty).unwrap();
-    assert!(find(":: p :: X < dyn RelTr >").1);
-    assert!(!find(":: p :: S").1);
+    // `g` still leaks `::p::X<dyn RelTr>` as a whole, as `dyn RelTr` is in it, and the self type.
+    let has = |ty: &str| accepted.iter().any(|entry| entry.0 == ty);
+    assert!(has(":: p :: X < dyn RelTr >"));
+    assert!(has(":: p :: S"));
 }
 
 #[test]
@@ -157,8 +154,13 @@ fn allowed_paths_would_change_more() {
     let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_impl(&f_and_g(), true);
     let referrer = leaker.result().finish().unwrap();
-    assert!(referrer.iter().all(|ty| *ty != parse_quote!(dyn RelTr)));
-    assert!(!referrer.required().next().is_some());
+    assert!(common::types(&referrer).all(|ty| *ty != parse_quote!(dyn RelTr)));
+    // `g` loses its entry too: only the types of the crate `p` are left.
+    let left: Vec<&Type> = common::types(&referrer).collect();
+    assert_eq!(
+        left,
+        [&parse_quote!(::p::S), &parse_quote!(::p::X<dyn RelTr>)]
+    );
 }
 
 #[test]
@@ -247,9 +249,10 @@ fn the_cause_of_an_array_with_a_closure_is_the_type_in_it() {
     let accepted = allowing(result.clone(), &causes);
     assert!(accepted.errors().is_empty());
     let referrer = accepted.finish().unwrap();
-    // `::p::V<u8>` is a required entry, as it is without the array, and nothing is for `a`.
-    let required: Vec<&Type> = referrer.required().map(|(_, ty)| ty).collect();
-    assert_eq!(required, [&parse_quote!(::p::V<u8>)]);
+    // `::p::V<u8>` is an entry, as it is without the array, and nothing is for `a`; so is the self
+    // type.
+    let found: Vec<&Type> = common::types(&referrer).collect();
+    assert_eq!(found, [&parse_quote!(::p::V<u8>), &parse_quote!(::p::S)]);
     let only_g: ItemImpl = parse_quote!(impl ::p::S { fn g(_: ::p::V<u8>) {} });
     assert_eq!(entries(&item), entries(&only_g));
     // `a` alone accepts nothing: it is not the cause of the error.
@@ -290,7 +293,7 @@ fn an_error_in_an_inner_scope_is_recovered_and_recorded_once() {
         // The inner scope keeps what it found: `Rel<T>` and `dyn RelTr` are entries, and the
         // conflict is copied as written, though it holds the same `dyn RelTr`.
         let referrer = result.into_referrer();
-        let required: Vec<&Type> = referrer.required().map(|(_, ty)| ty).collect();
+        let required: Vec<&Type> = common::types(&referrer).collect();
         assert_eq!(required, [&parse_quote!(Rel<T>), &parse_quote!(dyn RelTr)]);
         let mut copy: Vec<Type> = vec![
             conflict(),
@@ -334,7 +337,7 @@ fn the_errors_of_the_inner_and_the_outer_scope_are_one_list_in_order() {
     assert_eq!(result.errors()[0].cause, Cause::Trait(parse_quote!(Other)));
     // The scope keeps `Rel<T>` as well, and the conflicts it recovered from.
     let referrer = result.into_referrer();
-    let required: Vec<&Type> = referrer.required().map(|(_, ty)| ty).collect();
+    let required: Vec<&Type> = common::types(&referrer).collect();
     assert_eq!(required, [&parse_quote!(Rel<T>)]);
 }
 
@@ -352,7 +355,7 @@ fn an_error_in_a_module_is_dropped_by_allowing_its_cause() {
     };
     assert!(analyze().finish().is_err());
     let referrer = allowing(analyze(), &[rel_tr()]).finish().unwrap();
-    let required: Vec<&Type> = referrer.required().map(|(_, ty)| ty).collect();
+    let required: Vec<&Type> = common::types(&referrer).collect();
     assert_eq!(required, [&parse_quote!(Rel)]);
 }
 
@@ -454,15 +457,13 @@ fn a_mention_of_self_is_reported_with_the_other_errors() {
     }
 }
 
-/// The entries of a Referrer, as text, with whether each is required.
-type Entries = Vec<(String, bool)>;
+/// The entries of a Referrer, as text.
+type Entries = Vec<String>;
 
 /// The entries of the Referrer.
 fn listed(referrer: &Referrer) -> Entries {
-    referrer
-        .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty.to_token_stream().to_string(), referrer.must(ix)))
+    common::types(referrer)
+        .map(|ty| ty.to_token_stream().to_string())
         .collect()
 }
 
@@ -492,7 +493,7 @@ fn a_type_with_a_self_without_meaning_is_copied_as_written() {
     ];
     for (ty, cause, expected) in &types {
         let (entries, errors) = entries_without_self(std::slice::from_ref(ty));
-        let expected: Entries = expected.iter().map(|ty| (ty.to_string(), true)).collect();
+        let expected: Entries = expected.iter().map(|ty| ty.to_string()).collect();
         assert_eq!(entries, expected, "{}", ty.to_token_stream());
         // The only error is that of `Self`: the correction reports nothing of its own.
         assert_eq!(errors, [(Reason::SelfWithoutMeaning, cause.to_string())]);
@@ -511,10 +512,10 @@ fn a_type_without_a_self_beside_one_that_has_it_stays_an_entry() {
     });
     assert_eq!(
         listed(&leaker.result().into_referrer()),
-        [("Rel".to_string(), true)]
+        ["Rel".to_string()]
     );
     let (entries, _) = entries_without_self(&[parse_quote!(Rel), parse_quote!(Rel<Self>)]);
-    assert_eq!(entries, [("Rel".to_string(), true)]);
+    assert_eq!(entries, ["Rel".to_string()]);
     // A type that is no entry, as it names a generic of the method: its parts are, those that do not
     // name `Self`.
     let item: ItemFn = parse_quote!(
@@ -526,10 +527,7 @@ fn a_type_without_a_self_beside_one_that_has_it_stays_an_entry() {
     });
     let mut found = listed(&leaker.result().into_referrer());
     found.sort();
-    assert_eq!(
-        found,
-        [("Rel".to_string(), true), ("Vec < U >".to_string(), true)]
-    );
+    assert_eq!(found, ["Rel".to_string(), "Vec < U >".to_string()]);
 }
 
 #[test]
@@ -553,7 +551,7 @@ fn an_entry_whose_bounds_name_a_self_without_meaning_is_copied_whole() {
         );
         // `Rel<T>` would carry the bound with `Self`; `Other<U>` has nothing to do with it.
         let referrer = result.clone().into_referrer();
-        assert_eq!(listed(&referrer), [("Other < U >".to_string(), true)]);
+        assert_eq!(listed(&referrer), ["Other < U >".to_string()]);
         // No entry has the tokens and the context of `Rel<T>`, so it is no part either, and the
         // visitor leaves it, and the optional entry, as written.
         assert!(parts_of(&referrer).is_empty());
@@ -586,10 +584,7 @@ fn an_entry_whose_bounds_name_a_self_without_meaning_is_copied_whole() {
     });
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    assert_eq!(
-        listed(&result.into_referrer()),
-        [("Other < U >".to_string(), true)]
-    );
+    assert_eq!(listed(&result.into_referrer()), ["Other < U >".to_string()]);
 }
 
 #[test]
@@ -600,20 +595,14 @@ fn a_default_with_a_self_without_meaning_is_copied_whole() {
     leaker.enter_generics(&generics, |_| ());
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    assert_eq!(
-        listed(&result.into_referrer()),
-        [("Rel2".to_string(), true)]
-    );
+    assert_eq!(listed(&result.into_referrer()), ["Rel2".to_string()]);
     let mut leaker = Leaker::new();
     leaker.enter_generics(&Generics::default(), |view| {
         view.enter_generics(&generics, |_| ());
     });
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    assert_eq!(
-        listed(&result.into_referrer()),
-        [("Rel2".to_string(), true)]
-    );
+    assert_eq!(listed(&result.into_referrer()), ["Rel2".to_string()]);
 }
 
 #[test]
@@ -628,7 +617,7 @@ fn a_module_with_a_self_without_meaning_is_copied_as_written() {
     // The tuple is copied as written, `Rel` in it is leaked.
     assert_eq!(
         listed(&result.into_referrer()),
-        [("Rel".to_string(), true), ("Rel2".to_string(), true)]
+        ["Rel".to_string(), "Rel2".to_string()]
     );
 }
 
@@ -652,10 +641,7 @@ fn a_value_with_a_self_without_meaning_is_copied_whole() {
         .iter()
         .all(|error| error.reason == Reason::SelfWithoutMeaning));
     let (result, _) = allow_every_cause(result);
-    assert_eq!(
-        listed(&result.finish().unwrap()),
-        [("Rel2".to_string(), true)]
-    );
+    assert_eq!(listed(&result.finish().unwrap()), ["Rel2".to_string()]);
 }
 
 // ── the other kinds of cause ─────────────────────────────────────────────────────────────────
@@ -757,7 +743,7 @@ fn a_type_that_leaves_a_lifetime_unconstrained_is_copied_whole() {
     // Only `u8`: the reference is not leaked whole, and the entry for `Wrap<'b>` is gone.
     assert_eq!(
         listed(&allowing(result, &[cause]).finish().unwrap()),
-        [("u8".to_string(), true)]
+        ["u8".to_string()]
     );
 }
 
@@ -786,10 +772,7 @@ fn every_type_that_leaves_the_lifetime_unconstrained_is_copied_whole() {
     // `Rel` and the optional `::p::Out` do not hold the lifetime.
     assert_eq!(
         listed(&both.finish().unwrap()),
-        [
-            ("Rel".to_string(), true),
-            (":: p :: Out".to_string(), false)
-        ]
+        ["Rel".to_string(), ":: p :: Out".to_string()]
     );
 }
 
@@ -827,7 +810,7 @@ fn accepting_self_in_a_predicate_leaves_the_bound_of_its_context_leaked() {
     let cause = result.errors()[0].cause.clone();
     assert_eq!(
         listed(&allowing(result, &[cause]).finish().unwrap()),
-        [("R0".to_string(), true)]
+        ["R0".to_string()]
     );
 }
 
@@ -853,7 +836,7 @@ fn accepting_a_predicate_in_an_impl_leaves_the_bound_of_its_context_leaked() {
     );
     let cause = result.errors()[0].cause.clone();
     let entries = listed(&allowing(result, &[cause]).finish().unwrap());
-    assert!(entries.contains(&("R0".to_string(), true)));
+    assert!(entries.contains(&"R0".to_string()));
     // A predicate on another type: its own cause is accepted, and `R0` is as before.
     let on_other: ItemImpl = parse_quote!(
         impl<T: Into<R0>> S1<T> {
@@ -873,8 +856,8 @@ fn accepting_a_predicate_in_an_impl_leaves_the_bound_of_its_context_leaked() {
     );
     let cause = result.errors()[0].cause.clone();
     let entries = listed(&allowing(result, &[cause]).finish().unwrap());
-    assert!(entries.contains(&("R0".to_string(), true)));
-    assert!(!entries.iter().any(|(ty, _)| ty.starts_with("R1")));
+    assert!(entries.contains(&"R0".to_string()));
+    assert!(!entries.iter().any(|ty| ty.starts_with("R1")));
 }
 
 // ── the spacing of the tokens of a cause ─────────────────────────────────────────────────────
@@ -1140,8 +1123,8 @@ fn into_referrer_returns_the_recovered_referrer_whatever_remains() {
     assert_eq!(
         listed(&referrer),
         [
-            (":: p :: X < dyn RelTr >".to_string(), true),
-            (":: p :: S".to_string(), false),
+            ":: p :: X < dyn RelTr >".to_string(),
+            ":: p :: S".to_string(),
         ]
     );
     assert_eq!(parts_of(&referrer).len(), 1);
@@ -1333,7 +1316,7 @@ fn the_referrer_carries_the_part_that_is_copied_and_the_entries_beside_it() {
         )]
     );
     // `dyn RelTr` of `g` is an entry.
-    assert_eq!(listed(&referrer), [("dyn RelTr".to_string(), true)]);
+    assert_eq!(listed(&referrer), ["dyn RelTr".to_string()]);
     // Nothing is carried where nothing was copied as written.
     let mut leaker = Leaker::new();
     leaker.intern_trait(
@@ -1436,7 +1419,7 @@ fn a_part_in_a_bound_is_told_from_the_entry_with_the_same_tokens() {
     // `R0` and `R1<Y>` (in the context of the method, which holds `Y`).
     assert_eq!(
         listed(&referrer),
-        [("R0".to_string(), true), ("R1 < Y >".to_string(), true)]
+        ["R0".to_string(), "R1 < Y >".to_string()]
     );
     // The type that conflicts is the `R1<Y>` in the bound of the argument, inside the `impl
     // Into<R1<Y>>` that owns the cause (`impl Trait` cannot be leaked), which has the same
@@ -1445,8 +1428,8 @@ fn a_part_in_a_bound_is_told_from_the_entry_with_the_same_tokens() {
         parts_of(&referrer),
         [format!(
             "type (R1 < Y >) {} whole predicate in (impl Into < R1 < Y > >) {}",
-            referrer.context(1),
-            referrer.context(1)
+            common::entry_id(&referrer, 1),
+            common::entry_id(&referrer, 1)
         )]
     );
     let expected: ItemTrait = parse_quote!(
@@ -1480,7 +1463,7 @@ fn a_part_in_a_predicate_is_not_the_entry_outside_it() {
         parts_of(&referrer),
         [format!(
             "type (R1 < Y >) {} whole predicate",
-            referrer.context(1)
+            common::entry_id(&referrer, 1)
         )]
     );
     let expected: ItemTrait = parse_quote!(
@@ -1556,12 +1539,12 @@ fn the_part_is_the_type_that_conflicts_and_the_types_beside_it_stay_entries() {
         (entries, copy)
     };
     let (entries, copy) = list(parse_quote!(::p::W<'_, dyn RelTr, Rel>));
-    assert_eq!(entries, [("Rel".to_string(), true)]);
+    assert_eq!(entries, ["Rel".to_string()]);
     let expected: Type = parse_quote!(::p::W<'_, dyn RelTr, Entry<0usize>>);
     assert_eq!(copy, expected);
     // A type around the owner is no owner: the anchor is the path that holds the lifetime.
     let (entries, copy) = list(parse_quote!((Rel, ::p::W<'_, dyn RelTr>)));
-    assert_eq!(entries, [("Rel".to_string(), true)]);
+    assert_eq!(entries, ["Rel".to_string()]);
     let expected: Type = parse_quote!((Entry<0usize>, ::p::W<'_, dyn RelTr>));
     assert_eq!(copy, expected);
     // So the same tokens beside the owner are an entry, inside the tuple that is no owner.
@@ -1569,7 +1552,7 @@ fn the_part_is_the_type_that_conflicts_and_the_types_beside_it_stay_entries() {
         ::p::W<'_, dyn RelTr>,
         ::core::marker::PhantomData<dyn RelTr>
     )));
-    assert_eq!(entries[0], ("dyn RelTr".to_string(), true));
+    assert_eq!(entries[0], "dyn RelTr".to_string());
     let expected: Type = parse_quote!((
         ::p::W<'_, dyn RelTr>,
         ::core::marker::PhantomData<Entry<0usize>>
@@ -1581,7 +1564,7 @@ fn the_part_is_the_type_that_conflicts_and_the_types_beside_it_stay_entries() {
     assert_eq!(copy, expected);
     // An elided reference owns its cause too.
     let (entries, copy) = list(parse_quote!((Rel, &dyn RelTr)));
-    assert_eq!(entries, [("Rel".to_string(), true)]);
+    assert_eq!(entries, ["Rel".to_string()]);
     let expected: Type = parse_quote!((Entry<0usize>, &dyn RelTr));
     assert_eq!(copy, expected);
     // The innermost owner is the anchor.
@@ -1612,8 +1595,8 @@ fn a_bound_whose_trait_conflicts_is_a_part_with_the_types_in_it() {
     // Only `R0` of `f` is an entry. The bounds are copied as written, whole, with the `R0` in
     // them: a bound is a predicate of the item, and a leaked type in it may not be normalized. They
     // name no generic, so their context is that of `R0`.
-    assert_eq!(listed(&referrer), [("R0".to_string(), true)]);
-    let none = referrer.context(0);
+    assert_eq!(listed(&referrer), ["R0".to_string()]);
+    let none = common::entry_id(&referrer, 0);
     assert_eq!(
         parts_of(&referrer),
         [
@@ -1738,7 +1721,7 @@ fn a_path_of_a_value_that_conflicts_is_written_as_it_is_and_the_types_in_it_are_
     );
     let (result, context) = leak();
     let referrer = result.into_referrer();
-    assert_eq!(listed(&referrer), [("R0".to_string(), true)]);
+    assert_eq!(listed(&referrer), ["R0".to_string()]);
     assert!(parts_of(&referrer).is_empty());
     let expected: ItemTrait = parse_quote!(
         trait Tr {
@@ -1906,7 +1889,7 @@ fn the_parts_are_checked_when_they_are_read() {
     }
     let anchored =
         read("[type (R) 0 predicate in (Elided<'_, R>) 0, type (R) 0 in (&R) 0] (Rel)").unwrap();
-    let context = anchored.contexts().next().unwrap();
+    let context = common::context_ids(&anchored).into_iter().next().unwrap();
     assert_eq!(
         parts_of(&anchored),
         [
@@ -1982,7 +1965,7 @@ fn a_part_with_an_anchor_is_left_as_written_only_inside_a_type_that_matches_it()
     // The anchor has the context of the type that is visited: the part is left as written in it,
     // and not in a type that is not the anchor.
     let referrer = read(0);
-    let context = referrer.contexts().next().unwrap();
+    let context = common::context_ids(&referrer).into_iter().next().unwrap();
     assert_eq!(
         referrer.expand(context, anchor.clone(), replace),
         anchor.clone()

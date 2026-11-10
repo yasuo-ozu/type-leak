@@ -8,8 +8,8 @@ use crate::analysis::{
     PendingType, SelfMention, SignatureFacts, SignatureMark,
 };
 use crate::context::{
-    binder_lifetimes, Context, ContextId, Contexts, Enclosing, Gat, ModuleInfo, Scope,
-    SelfRequirement, UnnameableSelf,
+    binder_lifetimes, Context, ContextId, Contexts, Enclosing, Gat, Scope, SelfRequirement,
+    UnnameableSelf,
 };
 use crate::encode::is_const_param_ty;
 use crate::error::{report, Cause, ErrorItem, Reason, SELF_HELP, SELF_NOTE};
@@ -1461,11 +1461,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             // `Self` has no meaning in a module, only in its items, which may leak it again.
             ScopeSpec::Module { names, path, hint } => {
                 let parent = self.modules.last().map(|module| module.id);
-                let id = self.contexts.intern_module(ModuleInfo {
-                    path: path.clone(),
-                    hint: hint.clone(),
-                    parent,
-                });
+                let id = self
+                    .contexts
+                    .intern_module(path.clone(), hint.clone(), parent);
                 self.modules.push(ModuleFrame {
                     id,
                     names: Rc::new(names.clone()),
@@ -3446,15 +3444,11 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         };
         let parent = self.modules.last().map(|module| module.id);
         let mut path = parent
-            .and_then(|parent| self.contexts.module(parent))
-            .and_then(|info| info.path.clone())
+            .and_then(|parent| self.contexts.get(parent).module_path())
+            .map(<[Ident]>::to_vec)
             .unwrap_or_default();
         path.push(i.ident.clone());
-        let id = self.contexts.intern_module(ModuleInfo {
-            path: Some(path),
-            hint: None,
-            parent,
-        });
+        let id = self.contexts.intern_module(Some(path), None, parent);
         self.modules.push(ModuleFrame {
             id,
             names: Rc::new(declared_names(items)),

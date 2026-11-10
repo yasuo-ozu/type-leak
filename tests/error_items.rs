@@ -1403,11 +1403,9 @@ fn assert_stages_agree(name: &str, trigger: Trigger, rules: &[Rule]) -> usize {
     let dropped = dropped - after.errors().len();
     assert_eq!(serialized(&before), serialized(&after), "{}", name);
     let (before, after) = (before.into_referrer(), after.into_referrer());
-    let entries = |referrer: &Referrer| -> Vec<(String, bool)> {
-        referrer
-            .iter()
-            .enumerate()
-            .map(|(ix, ty)| (ty.to_token_stream().to_string(), referrer.must(ix)))
+    let entries = |referrer: &Referrer| -> Vec<String> {
+        common::types(referrer)
+            .map(|ty| ty.to_token_stream().to_string())
             .collect()
     };
     assert_eq!(entries(&before), entries(&after), "{}", name);
@@ -1504,7 +1502,7 @@ fn recovery_keeps_the_entries_that_do_not_conflict() {
     assert_eq!(result.errors()[0].cause, Cause::Trait(parse_quote!(RelTr)));
     let referrer = result.clone().into_referrer();
     // `Rel` is an entry, and `dyn RelTr` is copied as written: a part, not an entry.
-    let entries: Vec<String> = referrer.iter().map(text_of).collect();
+    let entries: Vec<String> = common::types(&referrer).map(text_of).collect();
     assert_eq!(entries, ["Rel"]);
     assert!(
         referrer
@@ -1627,7 +1625,9 @@ mod limits {
             .result()
             .finish()
             .map_err(|errors| messages(&errors))?;
-        Ok(referrer.iter().map(|t| quote!(#t).to_string()).collect())
+        Ok(crate::common::types(&referrer)
+            .map(|t| quote!(#t).to_string())
+            .collect())
     }
 
     // ── limitations ──────────────────────────────────────────────────────────────

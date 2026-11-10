@@ -10,7 +10,6 @@ mod allow;
 mod analysis;
 mod analyze;
 mod context;
-mod crates;
 mod elided;
 mod encode;
 mod error;
@@ -27,7 +26,7 @@ pub use syn;
 
 pub use crate::allow::{Allow, Place, Rules};
 pub use crate::analysis::CheckResult;
-pub use crate::context::{ContextId, SelfRequirement};
+pub use crate::context::{Context, ContextId, Gat, ModuleScope, SelfRequirement};
 pub use crate::encode::{array_const, EncodeError};
 pub use crate::error::{to_syn_error, Cause, ErrorItem, Reason};
 pub use crate::helpers::{ImplSelf, RepeaterImpl, UseSite};

@@ -152,44 +152,112 @@ impl Scope {
     }
 }
 
-/// What `Self` means in a context ([`Referrer::context_self()`](crate::Referrer::context_self)):
-/// the Repeater impl of an entry that names `Self` is written for the type described here.
+/// What `Self` means where an entry was found (`Context::self_ty`).
+///
+/// If an entry needs `Self`, its Repeater impl must be for the type that `Self` means. Where
+/// there is no `Self`, there is no requirement, and the impl may be for any type.
+///
+/// ```
+/// # use type_leak::*;
+/// # use syn::*;
+/// // What `Self` means for the first entry of an item.
+/// fn self_of(intern: impl Fn(&mut Leaker)) -> Option<SelfRequirement> {
+///     let mut leaker = Leaker::new();
+///     intern(&mut leaker);
+///     let referrer = leaker.result().finish().unwrap();
+///     let (_, context) = referrer.iter().next().unwrap();
+///     context.self_ty.clone()
+/// }
+/// let tr: ItemTrait = parse_quote!(trait Tr<T> { type A; fn f(&self) -> Rel<Self::A, T>; });
+/// let s: ItemStruct = parse_quote!(struct S<T> { a: Rel<Self, T> });
+/// let m: ItemMod = parse_quote!(mod m { struct N<T: ::core::convert::AsRef<Self>>(Rel<T>); });
+/// let p: ItemStruct = parse_quote!(struct P<T> { a: Rel<T> });
+/// assert!(matches!(self_of(|l| { l.intern_trait(&tr, true); }), Some(SelfRequirement::Bound(_))));
+/// assert!(matches!(self_of(|l| { l.intern_struct(&s, true); }), Some(SelfRequirement::Type(_))));
+/// assert!(matches!(self_of(|l| { l.intern_mod(&m); }), Some(SelfRequirement::Any)));
+/// assert!(self_of(|l| { l.intern_struct(&p, true); }).is_none());
+/// ```
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum SelfRequirement {
-    /// `Self` is any implementor of the trait (`Self: MyTrait<T, U>`).
+    /// `Self` is any type that implements the trait (`Self: MyTrait<T, U>`).
     ///
-    /// The impl is for a parameter that replaces `Self` in the entry (`impl<.., __S: ?Sized +
-    /// MyTrait<T, U>> .. for __S`, with `Self::Item` as `<__S>::Item`). The copy writes
-    /// `<Self as Repeater<..>>::Type` with the implementor as `Self`, so the impl in the other
-    /// crate must provide the associated types that the type uses (`type Item = u8;`).
+    /// The impl is generic: `impl<.., __S: ?Sized + MyTrait<T, U>> .. for __S`. `__S` takes the
+    /// place of `Self`, so `Self::Item` becomes `<__S>::Item`. The copy writes
+    /// `<Self as Repeater<..>>::Type`, where `Self` implements the trait. That type must define
+    /// the associated types that the entry uses (`type Item = u8;`).
+    ///
+    /// ```ignore
+    /// // In crate a: the entry `Rel<Self::A, T>` of a trait.
+    /// pub trait Tr<T> { type A; fn f(&self) -> Rel<Self::A, T>; }
+    /// impl<T, __S: ?Sized + Tr<T>> Repeater<(T,), KEY> for __S { type Type = Rel<<__S>::A, T>; }
+    ///
+    /// // In crate b: `Self` implements `a::Tr<T>`.
+    /// fn f(&self) -> <Self as ::a::Repeater<(T,), KEY>>::Type;
+    /// ```
     Bound(Path),
-    /// `Self` is this type: a struct, an enum, a union or the self type of an impl (`MyStruct<T>`).
+    /// `Self` is one type: a struct, an enum, a union, or the self type of an impl
+    /// (`MyStruct<T>`).
     ///
-    /// In a struct, an enum or a union nested in the analyzed syntax, only a type that must be
-    /// leaked has this context (`Rel2<Self>`). An absolute type that names `Self`
-    /// (`::path::Wrap<Self>`) has none: it is copied as written, with the copy's own `Self`. See
+    /// In a struct, enum or union nested in the analyzed code, only an entry that must be
+    /// replaced has this requirement (`Rel2<Self>`). An absolute type that names `Self`
+    /// (`::path::Wrap<Self>`) has none: the copy keeps it as written, with its own `Self`. See
     /// [`Visitor::with_nested_self()`](crate::Visitor::with_nested_self).
+    ///
+    /// The type is written as `Self` means it in the item's module, without the module path:
+    ///
+    /// | Item | `Type(..)` |
+    /// |---|---|
+    /// | `struct S<'a, T: Clone, const N: usize = 3> { .. }` | `S<'a, T, N>` |
+    /// | `enum E<T> { .. }` | `E<T>` |
+    /// | `mod m { struct N<T> { .. } }` (nested) | `N<T>` |
+    /// | `impl<T> MyType<T, u8> { .. }` | `MyType<T, u8>`, as written |
+    /// | `impl<T> ::a::W<T> { .. }` | `::a::W<T>`, as written |
+    ///
+    /// The impl is for this type. A copy in another crate cannot write `Self` for it, because
+    /// there `Self` is the copy's own type. So the copy writes the item's type with its module path
+    /// in front. A proc macro cannot find that path by itself: it must come from the macro's
+    /// input. For a nested item, add [`NestedSelf::modules`](crate::NestedSelf::modules). If the
+    /// self type of an impl is a relative path, rewrite it like any other type
+    /// ([`Referrer::expand()`](crate::Referrer::expand)).
+    ///
+    /// ```ignore
+    /// // In crate a: the entry `Rel<Self, T>` of a struct.
+    /// pub struct S<T> { a: Rel<Self, T> }
+    /// impl<T> Repeater<(T,), KEY> for S<T> { type Type = Rel<Self, T>; }
+    ///
+    /// // In crate b: `Self` would be the copy's own type, so write `a`'s `S` by its path.
+    /// pub struct S<T> { a: <::a::S<T> as ::a::Repeater<(T,), KEY>>::Type }
+    /// ```
     Type(Type),
-    /// `Self` is any type that the bounds of the generics hold for, and the entry's type does not
-    /// name it: `Rel<T>` with `T: AsRef<Self>`.
+    /// `Self` is any type that the bounds of the generics hold for. The entry itself does not
+    /// name `Self`: `Rel<T>` with `T: AsRef<Self>`.
     ///
-    /// It is the context of such an entry of a struct, an enum or a union nested in the analyzed
-    /// syntax ([`View::visit_item()`](crate::View::visit_item), the items of
-    /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod)). The copy has the same bound for its
-    /// own type, so it writes `<Self as Repeater<..>>::Type` with its own `Self` as the implementor
+    /// This happens for an entry of a struct, enum or union nested in the analyzed code
+    /// ([`View::visit_item()`](crate::View::visit_item), or an item in
+    /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod)). The copy has the same bound on its
+    /// own type, so it writes `<Self as Repeater<..>>::Type` with its own `Self`
     /// ([`Visitor::with_nested_self()`](crate::Visitor::with_nested_self)). With
-    /// [`nested_self_entries()`](crate::Options::nested_self_entries) the type
-    /// may name `Self` too (`Rel2<Self, T>`).
+    /// [`nested_self_entries()`](crate::Options::nested_self_entries), the entry may name `Self`
+    /// too (`Rel2<Self, T>`).
     ///
-    /// The impl is for a parameter (`__S`) that replaces `Self` in the bounds and has no bound of
-    /// its own. It is `?Sized` unless a bound or the type may need it `Sized`. It is no option for
-    /// [`ImplSelf::Marker`](crate::ImplSelf::Marker)
-    /// ([`EncodeError::NeedsSelf`](crate::EncodeError::NeedsSelf)).
+    /// The impl is generic over `__S`, which takes the place of `Self` in the bounds and has no
+    /// bound of its own. `__S` is `?Sized` unless a bound or the type may need `Sized`. A marker
+    /// type cannot be used: [`ImplSelf::Marker`](crate::ImplSelf::Marker) fails with
+    /// [`EncodeError::NeedsSelf`](crate::EncodeError::NeedsSelf).
     ///
-    /// rustc before 1.70 fails with E0275 for a struct whose last field is the path through an impl
-    /// that keeps `Sized` (and for an enum on 1.56). Put the field first, add `where Self: Sized`
-    /// to the item, or use a bound that needs no `Sized`.
+    /// ```ignore
+    /// // In crate a: the entry `Rel<T>` of a struct whose bound names its `Self`.
+    /// pub mod m { pub struct N<T: AsRef<Self>>(Rel<T>); }
+    /// impl<T: AsRef<__S>, __S: ?Sized> Repeater<(T,), KEY> for __S { type Type = Rel<T>; }
+    ///
+    /// // In crate b: the copy's own `Self`; its own bound holds for it.
+    /// pub mod m { pub struct N<T: AsRef<Self>>(<Self as ::a::Repeater<(T,), KEY>>::Type); }
+    /// ```
+    ///
+    /// Before Rust 1.70, rustc fails with E0275 when the last field of a struct is the path
+    /// through an impl that needs `Sized` (on 1.56, also for an enum). Put that field first, add
+    /// `where Self: Sized` to the item, or use a bound that does not need `Sized`.
     Any,
 }
 
@@ -235,19 +303,38 @@ impl std::hash::Hash for SelfRequirement {
     }
 }
 
-/// An associated type of a trait that has outlives bounds in its where clause or on its
-/// parameters (`type G<'b> where Self: 'b;`, `type G<'b, U: 'b>;`), as the Leaker reads it from the
-/// trait it analyzes.
+/// A generic associated type of a trait that has outlives relations (`type G<'b> where Self: 'b;`
+/// or `type G<'b, U: 'b>;`).
 ///
-/// `Self::G<'x>` is well-formed only if `Self: 'x`, which the signature of the original implies and
-/// the impl of the Repeater, which has no signature, does not have: the entry requires it (see
-/// [`implied_outlives()`]). Only the outlives relations are kept: any other predicate must be
-/// written by the method that names the type, as rustc requires. The parameters have no bounds.
+/// The `gats` field of [`Context`] lists them. `Self::G<'x>` is well-formed only if `Self: 'x`.
+/// The signature of the trait implies that. The impl of the Repeater has no signature, so the
+/// entry must require it. Only the outlives relations are kept here. Any other bound must be
+/// written by the method that names the type, as rustc requires.
+///
+/// ```ignore
+/// // In crate a:
+/// pub trait Tr {
+///     type G<'b, U: 'b> where Self: 'b;
+///     fn f<'x, V: 'x>(&'x self) -> Rel<Self::G<'x, V>>;
+/// }
+///
+/// // The `Gat` of `G`:
+/// ident: G
+/// generics: <'b, U> where U: 'b, Self: 'b
+/// ```
+///
+/// You cannot build a `Gat`. `ToTokens` writes it as an item (`type G<'b, U> where U: 'b, Self:
+/// 'b ;`), and a Referrer read back from tokens has it.
 #[derive(Clone, Debug)]
-pub(crate) struct Gat {
-    ident: Ident,
+#[non_exhaustive]
+pub struct Gat {
+    /// The name of the type (`G`).
+    pub ident: Ident,
     /// The parameters of the type, and a where clause of its outlives relations.
-    generics: Generics,
+    ///
+    /// The parameters have no bounds: the bounds move to the where clause. `Self: 'b` is there too
+    /// when the trait writes it.
+    pub generics: Generics,
 }
 
 impl Gat {
@@ -572,26 +659,251 @@ fn strip_default(mut param: GenericParam) -> GenericParam {
     param
 }
 
-/// The context of a leaked type: its generics, what `Self` means, and its module.
-/// The generics are in a canonical form, so equal declarations compare equal.
+/// How a context relates to a module ([`Context::module`]).
+///
+/// A module has a context of its own. The id of that context is the id of the module. A context
+/// is either inside a module or is that module. Read a module's context with
+/// [`Referrer::get_context()`](crate::Referrer::get_context).
+///
+/// ```ignore
+/// // In crate a, analyzed with `intern_mod()`:
+/// pub mod outer {
+///     pub mod inner {
+///         pub struct S { a: Rel }
+///     }
+/// }
+///
+/// // The context of `outer` (context 0):
+/// Some(Itself { id: 0, path: Some([]), hint: None, parent: None })
+/// // The context of `inner` (context 1):
+/// Some(Itself { id: 1, path: Some([inner]), hint: None, parent: Some(0) })
+/// // The context of the entry `Rel` (context 2), which is in `inner`:
+/// Some(In(1))
+/// ```
+///
+/// Two scopes are equal if all their fields are equal. A [`Context`] does not compare them.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ModuleScope {
+    /// The context is inside this module.
+    ///
+    /// The id is that of the module's own context. An entry has it if its type means something
+    /// only in the module (a relative path, a name that the module declares, a type macro). So
+    /// does the top-level context of a scope that was entered in a module.
+    In(ContextId),
+    /// The context is the module's own context.
+    ///
+    /// A module's context has no generics, no `Self` and no entry. Its fields tell where the
+    /// module is.
+    ///
+    /// ```ignore
+    /// // In crate b: the module of an entry, from its context.
+    /// let module = referrer.get_context(id).module;
+    /// match module {
+    ///     // A module of `intern_mod()`: write its impls in `mod p1 { mod p2 { .. } }`.
+    ///     Some(ModuleScope::Itself { path: Some(path), .. }) => { .. }
+    ///     // A module of `enter_mod()`: it is the one you entered.
+    ///     Some(ModuleScope::Itself { path: None, hint, .. }) => { .. }
+    ///     _ => { .. }
+    /// }
+    /// ```
+    #[non_exhaustive]
+    Itself {
+        /// The id of this context itself.
+        id: ContextId,
+        /// The names from the root module to this one: `[]` for the module of
+        /// [`Leaker::intern_mod()`](crate::Leaker::intern_mod), and the names below it for a
+        /// nested module.
+        ///
+        /// A module that has no module around it is a root: its path starts with its own name. It
+        /// is `None` for a module of [`Leaker::enter_mod()`](crate::Leaker::enter_mod).
+        path: Option<Vec<Ident>>,
+        /// The `hint` given to [`Leaker::enter_mod()`](crate::Leaker::enter_mod), for debugging.
+        hint: Option<String>,
+        /// The module that this one is nested in, if the Leaker saw it.
+        parent: Option<ContextId>,
+    },
+}
+
+impl ModuleScope {
+    /// Returns the id of the module, whichever the variant.
+    pub fn id(&self) -> ContextId {
+        match self {
+            Self::In(module) | Self::Itself { id: module, .. } => *module,
+        }
+    }
+}
+
+/// What a leaked type needs from the place where it is written: its generics, what `Self` means,
+/// and its module.
+///
+/// A leaked type (an entry) may use the generics of its item, `Self`, and the names of its module.
+/// The Repeater impl of the entry must have the same. Entries that need the same share one
+/// context, and a [`ContextId`] names it. The Leaker also makes a context for each item or scope
+/// that it analyzes (the top-level context) and for each module.
+///
+/// Read a context with [`Referrer::get_context()`](crate::Referrer::get_context). The fields are
+/// public to be read. You cannot build a `Context`, and more fields may come. Two contexts are
+/// equal if all their fields are equal, but [`substituted`](Context::substituted) is not compared,
+/// nor are the path, hint and parent of a module ([`ModuleScope::Itself`]). A Referrer that is
+/// written as tokens and read back keeps every field except `substituted`.
+///
+/// ```
+/// # use quote::ToTokens;
+/// # use syn::*;
+/// # use type_leak::*;
+/// let item: ItemTrait = parse_quote!(trait Tr<T> { type A; fn f(&self) -> Rel<Self::A, T>; });
+/// let mut leaker = Leaker::new();
+/// leaker.intern_trait(&item, true);
+/// let referrer = leaker.result().finish().unwrap();
+///
+/// // The context of the entry `Rel<Self::A, T>`.
+/// let (_entry, context) = referrer.iter().next().unwrap();
+/// assert_eq!(context.generics.to_token_stream().to_string(), "< T >");
+/// assert!(matches!(&context.self_ty, Some(SelfRequirement::Bound(_))));
+/// assert_eq!(context.module, None);
+/// ```
 #[derive(Clone, Debug)]
-pub(crate) struct Context {
-    generics: Generics,
-    self_ty: Option<SelfRequirement>,
-    /// Lifetimes `'a` with `Self: 'a`, implied or written. Sorted, and empty without `self_ty`.
-    /// They are not in `generics`, because `Self` is not a parameter.
-    self_outlives: Vec<Lifetime>,
-    /// The generic associated types of the trait, for the top-level context of a trait scope whose
-    /// entries depend on them (see [`Gat`]). Sorted by name, and empty in the context of an entry.
-    gats: Vec<Gat>,
-    /// The module scope, if the type depends on its module.
-    module: Option<ContextId>,
-    /// Set for the context of a module scope: it makes each one distinct.
-    scope: Option<usize>,
-    /// The `Self` of the scopes whose bounds were rewritten for another `Self` (see
-    /// [`Context::of()`]). Not part of the identity: it only tells the scope that declares one of
-    /// them that this context depends on it, so its top-level context records it.
-    substituted: Vec<SelfRequirement>,
+#[non_exhaustive]
+pub struct Context {
+    /// The generics that the entries of this context use.
+    ///
+    /// They are in a canonical form, so equal declarations are equal. Lifetimes come first, then
+    /// types, then consts, each sorted by name. The bounds of a generic are sorted. A where
+    /// predicate on one generic (`T: Default`) moves to the generic. Any other predicate stays in
+    /// the where clause (`Vec<T>: Clone`). Defaults are dropped.
+    ///
+    /// ```ignore
+    /// // In crate a: the entries `Rel<T>` and `&'a Rel2<'a, U, N>`.
+    /// pub struct S<'a, T: Clone = u8, U = (), const N: usize = 3>
+    /// where
+    ///     T: Default,
+    ///     Vec<T>: Clone,
+    ///     U: 'a,
+    /// {
+    ///     a: Rel<T>,
+    ///     b: &'a Rel2<'a, U, N>,
+    /// }
+    ///
+    /// // `generics` of the context of `Rel<T>`:
+    /// <T: Clone + Default> where Vec<T>: Clone
+    /// // `generics` of the context of `&'a Rel2<'a, U, N>`:
+    /// <'a, U: 'a, const N: usize>
+    /// // `generics` of the top-level context of `S`, which has all of them:
+    /// <'a, T: Clone + Default, U: 'a, const N: usize> where Vec<T>: Clone
+    /// ```
+    ///
+    /// A Referrer read back from tokens keeps it.
+    pub generics: Generics,
+    /// What `Self` means for the entries of this context, or `None` if they do not depend on it.
+    ///
+    /// See [`SelfRequirement`] for the three kinds.
+    ///
+    /// ```ignore
+    /// // In crate a: the entries `Rel<Self, T>`, `Rel<Self::A, T>` and `Rel<T>`.
+    /// pub struct S<T> { a: Rel<Self, T> }
+    /// pub trait Tr<T> { type A; fn f(&self) -> Rel<Self::A, T>; }
+    /// pub mod m { pub struct N<T: AsRef<Self>>(Rel<T>); }
+    ///
+    /// // `self_ty` of the context of `Rel<Self, T>`:
+    /// Some(SelfRequirement::Type(S<T>))
+    /// // `self_ty` of the context of `Rel<Self::A, T>`:
+    /// Some(SelfRequirement::Bound(Tr<T>))
+    /// // `self_ty` of the context of `Rel<T>` in `N`, whose bound names `Self`:
+    /// Some(SelfRequirement::Any)
+    /// // `self_ty` of the context of any entry that does not need `Self`:
+    /// None
+    /// ```
+    ///
+    /// A top-level context has it if an entry depends on it, else `None`. A Referrer read back from
+    /// tokens keeps it.
+    pub self_ty: Option<SelfRequirement>,
+    /// The lifetimes `'a` for which the entries need `Self: 'a`, sorted.
+    ///
+    /// The entry may imply it (`&'a Self`) or the trait may write it. It is empty if `self_ty` is
+    /// `None`. The lifetimes are not in `generics`, because `Self` is not a parameter. See
+    /// [Outlives bounds](crate::Leaker#outlives-bounds).
+    ///
+    /// ```ignore
+    /// // In crate a: the entry `Rel<&'a Self>` implies `Self: 'a`.
+    /// pub trait Tr { fn f<'a>(&'a self) -> Rel<&'a Self>; }
+    /// // `self_outlives` of the context of `Rel<&'a Self>`:
+    /// ['a]
+    ///
+    /// // In crate a: the trait writes `Self: 'a`.
+    /// pub trait Tr<'a> where Self: 'a { fn f(&self) -> Rel<'a, Self>; }
+    /// // `self_outlives` of the context of `Rel<'a, Self>`:
+    /// ['a]
+    /// // The top-level context of `Tr` keeps the predicate in its generics instead:
+    /// // `generics`: <'a> where Self: 'a
+    /// // `self_outlives`: []
+    /// ```
+    ///
+    /// A Referrer read back from tokens keeps it.
+    pub self_outlives: Vec<Lifetime>,
+    /// The generic associated types of the trait, with their outlives relations, sorted by name.
+    ///
+    /// Only the top-level context of a trait has them, and only if it has a `self_ty`. The context
+    /// of an entry has none. See [`Gat`].
+    ///
+    /// ```ignore
+    /// // In crate a:
+    /// pub trait Tr {
+    ///     type G<'b, U: 'b> where Self: 'b;
+    ///     fn f<'x, V: 'x>(&'x self) -> Rel<Self::G<'x, V>>;
+    /// }
+    ///
+    /// // `gats` of the context of the entry `Rel<Self::G<'x, V>>`:
+    /// []
+    /// // `gats` of the top-level context of `Tr`:
+    /// [type G<'b, U> where U: 'b, Self: 'b;]
+    /// ```
+    ///
+    /// A Referrer read back from tokens keeps it.
+    pub gats: Vec<Gat>,
+    /// The module that the context is in, or is. `None` if the entries do not depend on a module.
+    ///
+    /// See [`ModuleScope`] for the two kinds.
+    ///
+    /// ```ignore
+    /// // In crate a:
+    /// pub mod m {
+    ///     pub struct S { a: Rel, b: ::p::Abs }
+    /// }
+    ///
+    /// // `module` of the context of `m` itself (context 0):
+    /// Some(Itself { id: 0, path: Some([]), hint: None, parent: None })
+    /// // `module` of the context of `Rel` (context 1), a relative path that means something
+    /// // only in `m`:
+    /// Some(In(0))
+    /// // `module` of the context of `::p::Abs`, which means the same everywhere:
+    /// None
+    /// ```
+    ///
+    /// A Referrer read back from tokens keeps it.
+    pub module: Option<ModuleScope>,
+    /// The `Self` of the outer scopes that this context depends on through their bounds.
+    ///
+    /// It is empty for most contexts. It is not part of the identity: two contexts that differ
+    /// only here are equal. It lets the scope that declares such a `Self` know that this context
+    /// depends on it, so its top-level context records it in `self_ty`.
+    ///
+    /// ```ignore
+    /// // In crate a: the entry `Wrap<S<T>>` writes the type of `S` out, so it depends on the
+    /// // bounds of `S` and on `Self` of `S`, which is `S<T>`.
+    /// pub struct S<T: Fn(T::Item) + Iterator<Item = u8>> { a: Wrap<S<T>> }
+    ///
+    /// // `substituted` of the context of `Wrap<S<T>>`:
+    /// [SelfRequirement::Type(S<T>)]
+    /// // `self_ty` of the top-level context of `S`:
+    /// Some(SelfRequirement::Type(S<T>))
+    /// ```
+    ///
+    /// It is also set for a scope inside `S` that has a `Self` of its own (a nested impl, struct,
+    /// enum, union or trait). The bound `T: Tr<Self>` of `S` is `T: Tr<S<T>>` in its context.
+    ///
+    /// A Referrer read back from tokens does not keep it: it is empty then.
+    pub substituted: Vec<SelfRequirement>,
 }
 
 /// A bound that mentions the `Self` of an outer scope, which cannot be written where `Self` is
@@ -617,15 +929,24 @@ impl Context {
             self_outlives: Vec::new(),
             gats: Vec::new(),
             module: None,
-            scope: None,
             substituted: Vec::new(),
         }
     }
 
     /// `number` is the index in [`Contexts`], so it is the same in the Referrer.
-    pub(crate) fn module_scope(number: usize) -> Self {
+    pub(crate) fn module_scope(
+        number: usize,
+        path: Option<Vec<Ident>>,
+        hint: Option<String>,
+        parent: Option<ContextId>,
+    ) -> Self {
         let mut context = Self::none();
-        context.scope = Some(number);
+        context.module = Some(ModuleScope::Itself {
+            id: ContextId::new(number),
+            path,
+            hint,
+            parent,
+        });
         context
     }
 
@@ -666,8 +987,11 @@ impl Context {
         self
     }
 
+    /// Sets the module that the context is in. A module's own context stays itself.
     pub(crate) fn with_module(mut self, module: Option<ContextId>) -> Self {
-        self.module = module;
+        if !self.is_module_scope() {
+            self.module = module.map(ModuleScope::In);
+        }
         self
     }
 
@@ -686,11 +1010,15 @@ impl Context {
             rendered.push(' ');
             rendered.push_str(&gat.render());
         }
-        if let Some(module) = &self.module {
-            rendered.push_str(&format!(" mod #{}", module.index()));
-        }
-        if let Some(scope) = &self.scope {
-            rendered.push_str(&format!(" scope #{}", scope));
+        // The path, the hint and the parent of a module are not part of its identity.
+        match &self.module {
+            Some(ModuleScope::In(module)) => {
+                rendered.push_str(&format!(" mod #{}", module.index()))
+            }
+            Some(ModuleScope::Itself { id, .. }) => {
+                rendered.push_str(&format!(" scope #{}", id.index()))
+            }
+            None => (),
         }
         rendered
     }
@@ -1068,12 +1396,29 @@ impl Context {
         &self.gats
     }
 
-    pub(crate) fn module(&self) -> Option<ContextId> {
-        self.module
+    /// The module that the context is in; `None` for a module's own context.
+    pub(crate) fn in_module(&self) -> Option<ContextId> {
+        match &self.module {
+            Some(ModuleScope::In(module)) => Some(*module),
+            _ => None,
+        }
+    }
+
+    /// The module that the context is in, or is itself: the module of its scope.
+    pub(crate) fn module_id(&self) -> Option<ContextId> {
+        self.module.as_ref().map(ModuleScope::id)
     }
 
     pub(crate) fn is_module_scope(&self) -> bool {
-        self.scope.is_some()
+        matches!(self.module, Some(ModuleScope::Itself { .. }))
+    }
+
+    /// The path of a module's own context (see [`ModuleScope::Itself`]).
+    pub(crate) fn module_path(&self) -> Option<&[Ident]> {
+        match &self.module {
+            Some(ModuleScope::Itself { path, .. }) => path.as_deref(),
+            _ => None,
+        }
     }
 
     pub(crate) fn without_module(&self) -> Self {
@@ -1088,7 +1433,6 @@ impl Context {
         if self.self_ty != entry.self_ty
             || self.self_outlives != entry.self_outlives
             || self.module != entry.module
-            || self.scope != entry.scope
         {
             return false;
         }
@@ -1141,11 +1485,12 @@ impl std::hash::Hash for Context {
 /// `Self` is, and the module it is written in. It decides which Repeater impl an entry needs.
 ///
 /// Every analysis method of the [`Leaker`](crate::Leaker) returns the id of the top-level context of
-/// what it analyzed (keep it: [`Referrer::visitor()`](crate::Referrer::visitor) needs it), and
-/// [`Referrer::context()`](crate::Referrer::context) returns the id of the context of an entry.
-/// Ids count from 0 in order of first appearance and are never renumbered, so the Referrer may skip
-/// some. Entries with the same generics, `Self` and module share an id. `ToTokens` writes it as an
-/// integer literal, and `Parse` reads one with or without `usize`.
+/// what it analyzed (keep it: [`Referrer::visitor()`](crate::Referrer::visitor) needs it).
+/// [`Referrer::get_context()`](crate::Referrer::get_context) reads a context by its id, and
+/// [`Referrer::iter()`](crate::Referrer::iter) gives the context of each entry. Ids count from 0 in
+/// order of first appearance and are never renumbered, so the Referrer may skip some. Entries with
+/// the same generics, `Self` and module share an id. `ToTokens` writes it as an integer literal,
+/// and `Parse` reads one with or without `usize`.
 ///
 /// The generics of a context are the ones its entries use: those the type names, those that their
 /// bounds name and, if it names `Self`, those of the description of `Self`. A where predicate on
@@ -1197,22 +1542,12 @@ impl Parse for ContextId {
     }
 }
 
-/// What is known of a module scope. Its [`ContextId`] is the id of the module.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ModuleInfo {
-    /// `None` for a module that `enter_mod()` enters itself (see `Referrer::module_path()`).
-    pub(crate) path: Option<Vec<Ident>>,
-    pub(crate) hint: Option<String>,
-    pub(crate) parent: Option<ContextId>,
-}
-
 /// The distinct [`Context`]s, numbered in order of first appearance. They are never renumbered,
 /// except by [`Contexts::truncate()`] for a failed scope.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Contexts {
     ids: HashMap<Context, ContextId>,
     list: Vec<Context>,
-    modules: BTreeMap<ContextId, ModuleInfo>,
 }
 
 impl Contexts {
@@ -1227,14 +1562,13 @@ impl Contexts {
     }
 
     /// The module number is the context index, so ids are the same for the same calls.
-    pub(crate) fn intern_module(&mut self, info: ModuleInfo) -> ContextId {
-        let id = self.intern(Context::module_scope(self.list.len()));
-        self.modules.insert(id, info);
-        id
-    }
-
-    pub(crate) fn module(&self, id: ContextId) -> Option<&ModuleInfo> {
-        self.modules.get(&id)
+    pub(crate) fn intern_module(
+        &mut self,
+        path: Option<Vec<Ident>>,
+        hint: Option<String>,
+        parent: Option<ContextId>,
+    ) -> ContextId {
+        self.intern(Context::module_scope(self.list.len(), path, hint, parent))
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -1245,12 +1579,11 @@ impl Contexts {
         &self.list[id.0]
     }
 
-    /// Removes the contexts numbered `len` or more, and their modules (for a failed scope).
+    /// Removes the contexts numbered `len` or more (for a failed scope).
     pub(crate) fn truncate(&mut self, len: usize) {
         for context in self.list.drain(len..) {
             self.ids.remove(&context);
         }
-        self.modules.split_off(&ContextId(len));
     }
 }
 

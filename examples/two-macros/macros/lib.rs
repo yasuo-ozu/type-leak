@@ -34,10 +34,10 @@
 //!   hash of the name of the crate and of the trait. A proc macro does not know the path of the
 //!   item, and it needs only a number that no other exported trait of the crate has. It is written
 //!   into both the impls and the macro of A, so both sides agree.
-//! - The Repeater impls are written for all the entries (`Referrer::iter()`), not only for the
-//!   required ones (`Referrer::required()`), because crate B's macro replaces the optional
-//!   entries too, unless it keeps one as written. The impls of the optional entries cost nothing
-//!   if no one needs them.
+//! - The Repeater impls are written for all the entries (`Referrer::iter()`): crate B's macro
+//!   replaces every one. A type of another crate (`::foo::X`) is an entry too; to have the copy
+//!   write it as it is, give the Leaker `Rules::external_crates()` (the crate must be the same
+//!   crate on both sides).
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;

@@ -207,11 +207,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         let (mut item, context) = (items[n].clone(), contexts[n]);
         let error = std::cell::RefCell::new(None);
         referrer
-            .visitor(context, |leaked, ix| {
-                // A Referrer that trusts every crate: it copies the optional entries as written.
-                if !referrer.must(ix) {
-                    return leaked;
-                }
+            .visitor(context, |_leaked, ix| {
                 match referrer.entry_args(ix, &UseSite::identity(), array_const) {
                     Ok(args) => slots.projection(&parse_quote!(()), &args, id, ix),
                     Err(e) => {

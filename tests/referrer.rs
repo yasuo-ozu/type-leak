@@ -21,7 +21,7 @@ fn tag() -> String {
 fn rewrite(types: proc_macro2::TokenStream, item: Item) -> String {
     let version = tag();
     let referrer: Referrer = parse2(quote!(#version #types)).unwrap();
-    let context = referrer.contexts().next().unwrap();
+    let context = common::context_ids(&referrer).into_iter().next().unwrap();
     rewrite_with(referrer, context, item)
 }
 
@@ -319,19 +319,18 @@ fn test_contexts() {
     let referrer = leaker.result().finish().unwrap();
     // `RelA` uses no generics, so it is shared by the calls, but `Wrap<T>` and `Wrap<U>` are not.
     assert_eq!(
-        referrer
-            .iter()
+        common::types(&referrer)
             .map(|ty| quote!(#ty).to_string())
             .collect::<Vec<_>>(),
         ["RelA", "Wrap < T >", "Wrap < U >"]
     );
     assert_eq!(
         (0..3)
-            .map(|ix| referrer.context(ix).index())
+            .map(|ix| common::entry_id(&referrer, ix).index())
             .collect::<Vec<_>>(),
         [0, 1, 2]
     );
-    assert_eq!(referrer.contexts().count(), 3);
+    assert_eq!(common::context_ids(&referrer).len(), 3);
 
     // The contexts survive a round trip through `ToTokens` and `Parse`.
     let tokens = quote!(#referrer);
@@ -344,7 +343,7 @@ fn test_contexts() {
     );
     let parsed: Referrer = parse2(tokens).unwrap();
     assert_eq!(parsed, referrer);
-    assert_eq!(parsed.context(2).index(), 2);
+    assert_eq!(common::entry_id(&parsed, 2).index(), 2);
 
     // The generics of a scope are those of the Leaker, so only the type with the same requirements
     // is rewritten: `Wrap<U>` is not found in the scope of the first call, nor `Wrap<T>` in the
@@ -389,8 +388,8 @@ fn test_contexts() {
     leaker.intern_struct(&empty, true);
     leaker.intern_struct(&item0, true);
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(referrer.context(0).index(), 0);
-    assert_eq!(referrer.contexts().count(), 2);
+    assert_eq!(common::entry_id(&referrer, 0).index(), 0);
+    assert_eq!(common::context_ids(&referrer).len(), 2);
     assert_eq!(
         quote!(#referrer).to_string(),
         format!("\"{}\" 2 (RelA) < T > ; (Wrap < T >)", tag())
@@ -696,9 +695,7 @@ fn test_repeater_impl_replaces_self() {
         quote!(<T: ::core::cmp::PartialEq<__S> >).to_string()
     );
     // The originals keep `Self`, so a copy of the Leaker's trait is still found.
-    assert!(referrer
-        .iter()
-        .any(|ty| quote!(#ty).to_string() == "Rel < Self >"));
+    assert!(common::types(&referrer).any(|ty| quote!(#ty).to_string() == "Rel < Self >"));
     let mut sig: Signature = parse_quote!(fn a(&self) -> Rel<Self>);
     referrer
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
@@ -714,21 +711,12 @@ fn test_visitor_with_self() {
     });
     let sig: Signature = parse_quote!(fn f(&self, x: Rel<Self>, y: ::p::W<Self>) -> Self::Out);
 
-    // A macro that trusts `p` returns the type of its optional entry, `::p::W<Self>`.
-    let optional = |ty: Type, ix: usize| {
-        if referrer.must(ix) {
-            parse_quote!(P<#ix>)
-        } else {
-            ty
-        }
-    };
-
-    // Without `with_self`, `Self` is kept.
+    // Without `with_self`, `Self` is kept, but for the entries that name it.
     let mut plain = sig.clone();
     referrer
-        .visitor(context, optional)
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
         .visit_signature_mut(&mut plain);
-    let expected: Signature = parse_quote!(fn f(&self, x: P<0usize>, y: ::p::W<Self>) -> Self::Out);
+    let expected: Signature = parse_quote!(fn f(&self, x: P<0usize>, y: P<1usize>) -> Self::Out);
     assert_eq!(quote!(#plain).to_string(), quote!(#expected).to_string());
 
     // With it, the callback receives the type with `Self` replaced, the rest is replaced as well,
@@ -738,9 +726,6 @@ fn test_visitor_with_self() {
     referrer
         .visitor(context, |ty, ix| {
             received.push((quote!(#ty).to_string(), ix));
-            if !referrer.must(ix) {
-                return ty;
-            }
             // Not rewritten again, though it mentions `Self`.
             parse_quote!(<Marker<Self> as R<#ix>>::Type)
         })
@@ -754,7 +739,7 @@ fn test_visitor_with_self() {
         ],
     );
     let expected: Signature = parse_quote!(
-        fn f(&self, x: <Marker<Self> as R<0usize>>::Type, y: ::p::W<__S>) -> <__S>::Out
+        fn f(&self, x: <Marker<Self> as R<0usize>>::Type, y: <Marker<Self> as R<1usize>>::Type) -> <__S>::Out
     );
     assert_eq!(
         quote!(#rewritten).to_string(),
@@ -1000,7 +985,7 @@ fn test_module_items_do_not_shadow_submodules() {
     let referrer = leaker.result().finish().unwrap();
     // Only the `Rel` of `m::inner` is leaked (in its context, which is keyed by the module
     // `inner`, and the module analyzed is another, as the one which contains it).
-    assert_eq!(referrer.contexts().count(), 3);
+    assert_eq!(common::context_ids(&referrer).len(), 3);
     // The copy is the items of `m`, as a file of them, visited in the context of `m`.
     let items = m.content.unwrap().1;
     let mut file = File {
@@ -1086,13 +1071,13 @@ fn the_associated_types_of_a_trait_with_outlives_are_in_its_top_level_context() 
 }
 
 /// What follows the tag is refused with a clear error: the information of a module and what a
-/// module is not, ids that do not ascend, the associated types of a trait, `Self` as a call.
+/// module is not, a context declared twice, the associated types of a trait, `Self` as a call.
 #[test]
 fn malformed_serialized_referrers_are_errors() {
     let tag = tag();
     let parse = |text: &str| parse_str::<Referrer>(&format!("\"{}\" {}", tag, text));
     let integer = "expected integer literal";
-    let ascending = "the ids of the contexts must be in ascending order";
+    let declared = "the context 0 is declared already: expected its entries `( .. )`";
     let not_a_module = "the context 0 is not a module (it is not declared as `mod { .. }`)";
     let is_a_module_without_generics =
         "the context 0 is a module (`mod { .. }`), which has no generics";
@@ -1176,12 +1161,13 @@ fn malformed_serialized_referrers_are_errors() {
             "mod { } ; (Rel)",
             "the context 0 is a module (`mod { .. }`), which has no leaked type",
         ),
-        // The same id twice.
-        ("2 (A) # 0 (B)", ascending),
-        ("2 # 3 (A) # 3 (B)", ascending),
-        // A smaller id.
-        ("2 # 3 (A) # 1 (B)", ascending),
-        ("2 # 3 (A) # 2 (B)", ascending),
+        // A context that is written again has its entries only.
+        ("2 (A) # 0 < T > ; (B)", declared),
+        ("2 (A) # 0 Self ; (B)", declared),
+        (
+            "2 mod { } ; () # 0 (A)",
+            "the context 0 is a module (`mod { .. }`), which has no leaked type",
+        ),
         // Not a number.
         ("# (A)", integer),
         ("# x (A)", integer),
@@ -1241,9 +1227,9 @@ fn malformed_serialized_referrers_are_errors() {
     }
     // The fields of a module are optional, and may be in any order.
     let parsed = parse("2 mod { parent = 1 , hint = \"x\" } ; () mod {} ; ()").unwrap();
-    let contexts: Vec<ContextId> = parsed.contexts().collect();
-    assert_eq!(parsed.module_hint(contexts[0]), Some("x"));
-    assert_eq!(parsed.module_path(contexts[1]), None);
+    let contexts: Vec<ContextId> = common::context_ids(&parsed).into_iter().collect();
+    assert_eq!(common::module_hint(&parsed, contexts[0]), Some("x"));
+    assert_eq!(common::module_path(&parsed, contexts[1]), None);
 }
 
 /// A visitor borrows the Referrer: its closure may use the Referrer it was made from, two visitors
@@ -1308,9 +1294,7 @@ fn items_of(m: &ItemMod) -> Vec<Item> {
 
 /// The module of the entry `ix`.
 fn module_of(referrer: &Referrer, ix: usize) -> ContextId {
-    referrer
-        .context_module(referrer.context(ix))
-        .expect("the entry is in a module")
+    common::in_module(common::entry(referrer, ix)).expect("the entry is in a module")
 }
 
 // ── modules: the visited syntax is inside the module of the context ──────────────────────────
@@ -1343,7 +1327,7 @@ fn two_rels_referrer() -> (Referrer, ContextId, ContextId) {
         .find(|module| *module != m)
         .unwrap();
     assert_eq!(
-        referrer.module_path(inner),
+        common::module_path(&referrer, inner),
         Some(&[parse_quote!(inner)][..])
     );
     (referrer, m, inner)
@@ -1522,8 +1506,8 @@ fn a_scope_in_a_module_is_in_that_module() {
     });
     let referrer = leaker.result().finish().unwrap();
     assert_ne!(module, scope);
-    assert_eq!(referrer.context_module(scope), Some(module));
-    assert_eq!(referrer.context_module(module), None);
+    assert_eq!(common::in_module(referrer.get_context(scope)), Some(module));
+    assert_eq!(common::in_module(referrer.get_context(module)), None);
     let mut sig: Signature = parse_quote!(fn f(x: Wrap<T>, y: Rel));
     referrer
         .visitor(scope, replace)
@@ -1536,7 +1520,7 @@ fn a_scope_in_a_module_is_in_that_module() {
     let (outside, ()) =
         leaker.enter_generics(&parse_quote!(<T>), |view| view.visit_type(&parse_quote!(T)));
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(referrer.context_module(outside), None);
+    assert_eq!(common::in_module(referrer.get_context(outside)), None);
     let mut ty: Type = parse_quote!(Rel);
     ty = referrer.expand(outside, ty, replace);
     assert_eq!(s(&ty), "Rel");
@@ -1573,16 +1557,16 @@ fn self_is_taken_from_the_context() {
     // The scopes differ by what `Self` is, as an entry of each names it.
     assert!(c1 != c2 && c2 != c3 && c1 != c3);
     assert!(matches!(
-        referrer.context_self(c1),
+        referrer.get_context(c1).self_ty.as_ref(),
         Some(SelfRequirement::Bound(_))
     ));
     assert!(matches!(
-        referrer.context_self(c3),
+        referrer.get_context(c3).self_ty.as_ref(),
         Some(SelfRequirement::Type(_))
     ));
     let ix_of = |context: ContextId| {
         (0..3)
-            .find(|&ix| referrer.context(ix) == context)
+            .find(|&ix| common::entry_id(&referrer, ix) == context)
             .expect("the top-level context is the context of the entry")
     };
     let expected = |context: ContextId| {
@@ -1622,11 +1606,10 @@ fn self_is_taken_from_the_context() {
 
 /// What `Self` of the entry that is the type `ty` (as `to_string()` has it) means.
 fn self_of_entry(referrer: &Referrer, ty: &str) -> String {
-    let ix = referrer
-        .iter()
+    let ix = common::types(referrer)
         .position(|entry| s(entry) == ty)
         .unwrap_or_else(|| panic!("no entry {}", ty));
-    match referrer.context_self(referrer.context(ix)) {
+    match common::entry(referrer, ix).self_ty.as_ref() {
         None => "-".to_string(),
         Some(SelfRequirement::Bound(path)) => format!("Self: {}", s(path)),
         Some(SelfRequirement::Type(ty)) => format!("Self = {}", s(ty)),
@@ -1665,7 +1648,11 @@ fn a_nested_function_or_type_alias_keeps_the_self_around() {
     assert_eq!(self_of_entry(&referrer, "Rel2 < Self >"), "Self = W");
     // The struct has its own `Self`, which the entry names.
     assert_eq!(self_of_entry(&referrer, "Rel3 < Self >"), "Self = V");
-    let index = |ty: &str| referrer.iter().position(|entry| s(entry) == ty).unwrap();
+    let index = |ty: &str| {
+        common::types(&referrer)
+            .position(|entry| s(entry) == ty)
+            .unwrap()
+    };
     let (rel, rel2) = (index("Rel < Self >"), index("Rel2 < Self >"));
     let tokens = quote!(#referrer);
     let read_back: Referrer = syn::parse2(tokens).unwrap();
@@ -1773,7 +1760,9 @@ fn a_nested_type_alias_in_a_trait_keeps_the_self_of_the_trait() {
     );
     let ix = |ty: &str| {
         proc_macro2::Literal::usize_unsuffixed(
-            referrer.iter().position(|entry| s(entry) == ty).unwrap(),
+            common::types(&referrer)
+                .position(|entry| s(entry) == ty)
+                .unwrap(),
         )
     };
     let (rel, rel2, rel3) = (ix("Rel < Self >"), ix("Rel2 < Self >"), ix("Rel3 < Self >"));
@@ -1820,7 +1809,9 @@ fn the_generics_are_taken_from_the_context() {
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 2);
     let entry = |context: ContextId| {
-        let ix = (0..2).find(|&ix| referrer.context(ix) == context).unwrap();
+        let ix = (0..2)
+            .find(|&ix| common::entry_id(&referrer, ix) == context)
+            .unwrap();
         proc_macro2::Literal::usize_unsuffixed(ix)
     };
     // (Each context finds its own entry: see `matching_with_the_generics_of_each_scope` in
@@ -1873,12 +1864,7 @@ fn a_bound_on_self_alone_need_not_be_written_by_the_copy() {
         let mut leaker = Leaker::new();
         let context = leaker.intern_trait(tr, true);
         let referrer = leaker.result().finish().unwrap();
-        let predicate = |ix: usize| {
-            referrer
-                .context_generics(referrer.context(ix))
-                .where_clause
-                .is_some()
-        };
+        let predicate = |ix: usize| common::entry(&referrer, ix).generics.where_clause.is_some();
         let mut item = item;
         referrer
             .visitor(context, replace)
@@ -1949,8 +1935,8 @@ fn an_entry_context_is_a_scope_too() {
     leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
     for ix in 0..referrer.iter().count() {
-        let ty = referrer.iter().nth(ix).unwrap().clone();
-        let rewritten = referrer.expand(referrer.context(ix), ty, replace);
+        let ty = common::types(&referrer).nth(ix).unwrap().clone();
+        let rewritten = referrer.expand(common::entry_id(&referrer, ix), ty, replace);
         let ix = proc_macro2::Literal::usize_unsuffixed(ix);
         assert_eq!(s(&rewritten), s(&parse_quote!(P<#ix>) as &Type));
     }
@@ -1983,7 +1969,7 @@ fn a_trait_is_rewritten_whole_and_part_by_part() {
     let referrer = leaker.result().finish().unwrap();
     // The entries, by context and tokens: those without generics, then those with `<T>`.
     assert_eq!(
-        referrer.iter().map(s).collect::<Vec<_>>(),
+        common::types(&referrer).map(s).collect::<Vec<_>>(),
         [
             "Rel",
             "Rel3",
@@ -2082,4 +2068,27 @@ fn a_signature_visited_by_itself_is_a_nested_item() {
             as_leakers
         );
     }
+}
+
+/// The groups follow the entries in the order of their indices: a context whose entries are not
+/// together is written again, with its entries only, and the entries keep their indices.
+#[test]
+fn the_entries_of_a_context_may_be_in_several_groups() {
+    let tag = tag();
+    let text = format!("\"{}\" 4 (A) (B) # 0 (C) # 3 (D)", tag);
+    let referrer: Referrer = parse_str(&text).unwrap();
+    let types: Vec<String> = common::types(&referrer).map(s).collect();
+    assert_eq!(types, ["A", "B", "C", "D"]);
+    let contexts: Vec<usize> = (0..4)
+        .map(|ix| common::entry_id(&referrer, ix).index())
+        .collect();
+    assert_eq!(contexts, [0, 1, 0, 3]);
+    // Written back as it was read, and equal to what is read from it.
+    let written = quote!(#referrer);
+    assert_eq!(written.to_string(), text);
+    assert_eq!(parse2::<Referrer>(written).unwrap(), referrer);
+    // A context with no entry is a group of its own, before the first group of a larger id.
+    let referrer: Referrer = parse_str(&format!("\"{}\" 3 () (A) # 5 (B)", tag)).unwrap();
+    assert_eq!(common::context_ids(&referrer).len(), 3);
+    assert_eq!(parse2::<Referrer>(quote!(#referrer)).unwrap(), referrer);
 }

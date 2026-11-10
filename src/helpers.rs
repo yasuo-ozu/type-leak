@@ -17,8 +17,8 @@ use syn::*;
 
 /// What a Repeater impl is written for: the `target` of [`Referrer::repeater_impl()`].
 ///
-/// An entry that [needs `Self`](Referrer::needs_self) is always implemented for what `Self` stands
-/// for, so the choice only matters for the others.
+/// An entry that names `Self`, or whose context's generics do, is always implemented for what
+/// `Self` stands for, so the choice only matters for the others.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub enum ImplSelf<'a> {
@@ -67,7 +67,7 @@ pub struct RepeaterImpl {
     pub args: Type,
     /// The leaked type, which is the `Type` of the impl.
     pub ty: Type,
-    /// The module in which to write the impl ([`Referrer::context_module()`]).
+    /// The module in which to write the impl: the `In` module of [`Context::module`](crate::Context::module).
     pub module: Option<ContextId>,
 }
 
@@ -172,7 +172,7 @@ impl Referrer {
     /// let mut leaker = Leaker::new();
     /// leaker.intern_trait(&tr, true);
     /// let referrer = leaker.result().finish().unwrap();
-    /// let ix = referrer.iter().position(|ty| *ty == parse_quote!(&'a Wrap<T, N>)).unwrap();
+    /// let ix = referrer.iter().position(|(ty, _)| *ty == parse_quote!(&'a Wrap<T, N>)).unwrap();
     ///
     /// // In the scope of the trait, as in a default method: every generic by its own name.
     /// let args = referrer.entry_args(ix, &UseSite::identity(), array_const).unwrap();
@@ -191,12 +191,13 @@ impl Referrer {
         site: &UseSite,
         const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
     ) -> std::result::Result<Type, EncodeError> {
-        let context = self.contexts[ix];
-        let args = self.context_generic_args(context, &site.root_params, &site.completed_args)?;
+        let context = self.entry_context(ix);
+        let args =
+            self.context_generic_args(&context.generics, &site.root_params, &site.completed_args)?;
         encode_generics_args_with_params(
             &args,
-            &self.context_generics(context).params,
-            Some((&site.self_ty, self.context_self_outlives(context))),
+            &context.generics.params,
+            Some((&site.self_ty, &context.self_outlives)),
             const_fn,
         )
     }
@@ -207,17 +208,16 @@ impl Referrer {
     /// even if it is only in `Self: 'a` (`trait Tr<'a> where Self: 'a`).
     /// Then [`ImplSelf::Marker`] fails and [`Referrer::bucket_self()`] is `None`: the impl is for
     /// [`ImplSelf::Param`], and the use site writes what `Self` stands for (the host or the type).
-    pub fn needs_self(&self, ix: usize) -> bool {
-        let context = self.contexts[ix];
-        self.context_self(context).is_some()
-            || first_self_in_generics(self.context_generics(context)).is_some()
+    pub(crate) fn needs_self(&self, ix: usize) -> bool {
+        let context = self.entry_context(ix);
+        context.self_ty.is_some() || first_self_in_generics(&context.generics).is_some()
     }
 
     /// Returns the primitive type that the `ix`-th entry's impl is for under [`ImplSelf::Bucket`]
     /// with `id`.
     ///
-    /// It is `None` if the entry [needs `Self`](Referrer::needs_self): write what `Self` stands for
-    /// there.
+    /// It is `None` if the entry names `Self`, or its context's generics do: write what `Self` stands
+    /// for there.
     #[must_use]
     pub fn bucket_self(&self, ix: usize, id: u64) -> Option<Type> {
         (!self.needs_self(ix)).then(|| bucket_type(id, ix))
@@ -227,11 +227,10 @@ impl Referrer {
     ///
     /// `target` says what the impl is for ([`ImplSelf`]); `const_fn` is as in
     /// [`Referrer::entry_args()`], but gets the parameter itself (`N`) as `value`. Write the impl
-    /// in [`RepeaterImpl::module`] if it is `Some`, and one for every entry ([`Referrer::iter()`]):
-    /// optional entries need one if some copy replaces them.
+    /// in [`RepeaterImpl::module`] if it is `Some`, and one for every entry ([`Referrer::iter()`]).
     ///
-    /// Fails with [`EncodeError::NeedsSelf`] for [`ImplSelf::Marker`] if the entry
-    /// [needs `Self`](Referrer::needs_self), and with the error of `const_fn`.
+    /// Fails with [`EncodeError::NeedsSelf`] for [`ImplSelf::Marker`] if the entry names `Self`, or
+    /// its context's generics do, and with the error of `const_fn`.
     ///
     /// ```
     /// # use type_leak::*;
@@ -271,9 +270,9 @@ impl Referrer {
         target: ImplSelf<'_>,
         mut const_fn: impl FnMut(&Expr, &ConstParam) -> std::result::Result<Type, EncodeError>,
     ) -> std::result::Result<RepeaterImpl, EncodeError> {
-        let context = self.contexts[ix];
+        let context = self.entry_context(ix);
         let bucket;
-        // An entry that needs `Self` has none for a marker, even if `context_self()` is `None`: the
+        // An entry that needs `Self` has none for a marker, even if `self_ty` is `None`: the
         // `Self` of its generics would be the marker.
         if matches!(target, ImplSelf::Marker(_)) && self.needs_self(ix) {
             return Err(EncodeError::NeedsSelf(Box::new(
@@ -293,7 +292,7 @@ impl Referrer {
         // The type the impl is for, `Self` as the impl writes it, the parameter to declare and its
         // bound.
         let (self_ty, self_in_impl, param, bound): (Type, Type, Option<&Ident>, Option<&Path>) =
-            match (self.context_self(context), target) {
+            match (context.self_ty.as_ref(), target) {
                 (Some(SelfRequirement::Type(ty)), ImplSelf::Param(_)) => {
                     (ty.clone(), parse_quote!(Self), None, None)
                 }
@@ -320,8 +319,8 @@ impl Referrer {
                 (None, ImplSelf::Marker(marker)) => (marker.clone(), marker.clone(), None, None),
                 (_, ImplSelf::Bucket { .. }) => unreachable!("resolved above"),
             };
-        let generics = self.context_generics(context);
-        let (ty, generics) = match self.context_self(context) {
+        let generics = &context.generics;
+        let (ty, generics) = match context.self_ty.as_ref() {
             // The implementor is a parameter, where `Self` of the trait is not available.
             Some(SelfRequirement::Bound(_) | SelfRequirement::Any) => {
                 let mut folder = ReplaceSelf {
@@ -336,7 +335,7 @@ impl Referrer {
         };
         let args = encode_generics_params_with(
             &generics.params,
-            Some((&self_in_impl, self.context_self_outlives(context))),
+            Some((&self_in_impl, &context.self_outlives)),
             |param| {
                 let ident = &param.ident;
                 const_fn(&parse_quote!(#ident), param)
@@ -349,7 +348,7 @@ impl Referrer {
             // `Sized` where they do. Else it is `?Sized`: rustc before 1.70 cannot prove `S<T>:
             // Sized` for the copy of a struct whose last field is the path through this impl, if
             // the impl needs `__S: Sized` (E0275: the type needs the impl, which needs the type).
-            let sized = matches!(self.context_self(context), Some(SelfRequirement::Any))
+            let sized = matches!(context.self_ty, Some(SelfRequirement::Any))
                 && needs_sized(&declared, &ty, ident);
             let declaration = match (bound, sized) {
                 (Some(path), _) => parse_quote!(#ident: ?::core::marker::Sized + #path),
@@ -370,7 +369,7 @@ impl Referrer {
             self_ty,
             args,
             ty,
-            module: self.context_module(context),
+            module: context.in_module(),
         })
     }
 }

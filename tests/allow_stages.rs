@@ -49,7 +49,9 @@ fn causes_text_of(errors: &[ErrorItem]) -> Vec<String> {
 /// The entries of the Referrer, as text.
 fn entries(result: &LeakerResult) -> Vec<String> {
     let referrer = result.clone().into_referrer();
-    referrer.iter().map(|ty| quote!(#ty).to_string()).collect()
+    common::types(&referrer)
+        .map(|ty| quote!(#ty).to_string())
+        .collect()
 }
 
 fn analyze<A: Allow>(item: &ItemTrait, config: A) -> LeakerResult {

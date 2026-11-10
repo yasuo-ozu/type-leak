@@ -815,13 +815,11 @@ fn limit_plain_encoders_usize_only() {
 
 // ── Referrers ────────────────────────────────────────────────────────────────
 
-use crate::{ContextId, Leaker, Referrer};
+use crate::{Context, ContextId, Leaker, ModuleScope, Referrer};
 use proc_macro2::TokenStream;
 
-/// The helpers of the Referrer that tests used to call.
+/// The helper of the Referrer that tests used to call.
 trait ReferrerExt {
-    /// The generics that a Repeater impl declares for the entries of `context`.
-    fn impl_generics(&self, context: crate::ContextId) -> Generics;
     /// The entries with the generics they use, with `Self` replaced by `self_ty`.
     fn iter_with_self<'a>(
         &'a self,
@@ -830,22 +828,36 @@ trait ReferrerExt {
 }
 
 impl ReferrerExt for Referrer {
-    fn impl_generics(&self, context: crate::ContextId) -> Generics {
-        without_encoded_bounds(self.context_generics(context))
-    }
     fn iter_with_self<'a>(
         &'a self,
         self_ty: &'a Type,
     ) -> Box<dyn Iterator<Item = (Type, Generics)> + 'a> {
         use syn::fold::Fold;
-        Box::new(self.iter().enumerate().map(move |(ix, ty)| {
+        Box::new(self.iter().map(move |(ty, context)| {
             let mut folder = crate::util::ReplaceSelf { self_ty };
-            let generics = self.context_generics(self.context(ix));
             (
                 folder.fold_type(ty.clone()),
-                folder.fold_generics(generics.clone()),
+                folder.fold_generics(context.generics.clone()),
             )
         }))
+    }
+}
+
+/// The context of the `ix`-th entry.
+fn context_of(referrer: &Referrer, ix: usize) -> &Context {
+    referrer.iter().nth(ix).unwrap().1
+}
+
+/// The type of the `ix`-th entry.
+fn entry_ty(referrer: &Referrer, ix: usize) -> &Type {
+    referrer.iter().nth(ix).unwrap().0
+}
+
+/// The module that a context is in (not its own, `Itself`).
+fn in_module(context: &Context) -> Option<ContextId> {
+    match &context.module {
+        Some(ModuleScope::In(module)) => Some(*module),
+        _ => None,
     }
 }
 
@@ -872,10 +884,10 @@ fn the_encoders_encode_it_after_the_lifetime_bounds() {
     let referrer = of_trait(parse_quote! {
         trait Tr { fn f<'a, T>(&self, x: &'a Rel<(Self, T)>); }
     });
-    let context = referrer.context(0);
-    let generics = referrer.context_generics(context);
+    let context = context_of(&referrer, 0);
+    let generics = &context.generics;
     assert_eq!(s(generics), "< 'a , T : 'a >");
-    let outlives = referrer.context_self_outlives(context);
+    let outlives: &[Lifetime] = &context.self_outlives;
     // The Repeater's implementation for the implementor `__S`: the parameters, the bounds and then
     // `&'a __S`.
     let marker: Type = parse_quote!(__S);
@@ -921,16 +933,16 @@ fn the_implementation_does_not_declare_it() {
     let referrer = of_trait(parse_quote! {
         trait Tr { fn f<'a, T>(&self, x: &'a Rel<(Self, T)>) where Self: ::core::marker::Sized; }
     });
-    let context = referrer.context(0);
+    let context = context_of(&referrer, 0);
     // The generics of the context do not mention it (`Self` is not a generic, and the predicate
     // `Self: Sized` is the one written), and neither do those the implementation declares.
     let with_where = |g: &Generics| s(&quote!(#g #{&g.where_clause}));
     assert_eq!(
-        with_where(referrer.context_generics(context)),
+        with_where(&context.generics),
         "< 'a , T : 'a > where Self : :: core :: marker :: Sized"
     );
     assert_eq!(
-        with_where(&referrer.impl_generics(context)),
+        with_where(&without_encoded_bounds(&context.generics)),
         "< 'a , T > where Self : :: core :: marker :: Sized"
     );
     // For the generics of `iter_with_self()` as well.
@@ -942,7 +954,7 @@ fn the_implementation_does_not_declare_it() {
     );
 }
 
-/// A written `Self: 'a` is moved to `context_self_outlives()` like an implied one, and the other
+/// A written `Self: 'a` is moved to `Context::self_outlives` like an implied one, and the other
 /// bounds of its predicate are kept (`a_written_bound_is_the_same_as_an_implied_one`).
 #[test]
 fn a_written_bound_is_encoded_and_never_declared() {
@@ -951,18 +963,18 @@ fn a_written_bound_is_encoded_and_never_declared() {
             fn f<'a, T: 'a>(&self, x: Rel<'a, (Self, T)>) where Self: ::core::marker::Sized + 'a;
         }
     });
-    let context = referrer.context(0);
-    let outlives = referrer.context_self_outlives(context);
+    let context = context_of(&referrer, 0);
+    let outlives: &[Lifetime] = &context.self_outlives;
     assert_eq!(outlives, lifetimes(&["'a"]));
     // Neither the generics of the context nor those the implementation declares have it, and
     // `Sized` of the same predicate is kept.
     let with_where = |g: &Generics| s(&quote!(#g #{&g.where_clause}));
     assert_eq!(
-        with_where(referrer.context_generics(context)),
+        with_where(&context.generics),
         "< 'a , T : 'a > where Self : :: core :: marker :: Sized"
     );
     assert_eq!(
-        with_where(&referrer.impl_generics(context)),
+        with_where(&without_encoded_bounds(&context.generics)),
         "< 'a , T > where Self : :: core :: marker :: Sized"
     );
     let marker: Type = parse_quote!(__S);
@@ -973,11 +985,7 @@ fn a_written_bound_is_encoded_and_never_declared() {
     );
     // It is encoded as `&'a __S`, as the implied one is.
     let encoded = slots()
-        .encode_generics_params_to_ty_with_self(
-            &referrer.context_generics(context).params,
-            &marker,
-            outlives,
-        )
+        .encode_generics_params_to_ty_with_self(&context.generics.params, &marker, outlives)
         .unwrap();
     let expected: Type = parse_quote!((&'a (), T, &'a T, &'a __S));
     assert_eq!(s(&encoded), s(&expected));
@@ -1057,7 +1065,12 @@ fn the_generics_of_a_top_level_context_are_declared_as_they_are() {
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(s(&referrer.impl_generics(top_level)), "< 'a , T >");
+    assert_eq!(
+        s(&without_encoded_bounds(
+            &referrer.get_context(top_level).generics
+        )),
+        "< 'a , T >"
+    );
 }
 
 /// Parses `Referrer, ContextId`, as the Referrer's macro receives them from the Leaker's.
@@ -1092,10 +1105,10 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
     let referrer = leaker.result().finish().unwrap();
     // The generics are in the canonical form: sorted by kind and name, without defaults.
     assert_eq!(
-        s(referrer.context_generics(top_level)),
+        s(&referrer.get_context(top_level).generics),
         "< 'a , T : 'a , U , const N : usize >"
     );
-    let leaker_params = &referrer.context_generics(top_level).params;
+    let leaker_params = &referrer.get_context(top_level).generics.params;
     let on_leaker_side = encode_generics_params_to_ty_with(leaker_params, usize_const);
     let expected: Type = parse_quote!((&'a (), T, U, [(); N], &'a T));
     assert_eq!(s(&on_leaker_side), s(&expected));
@@ -1104,7 +1117,7 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
     let (parsed, parsed_top_level) = parse_referrer_and_top_level(tokens);
     assert_eq!(parsed, referrer);
     assert_eq!(parsed_top_level, top_level);
-    let params = &parsed.context_generics(parsed_top_level).params;
+    let params = &parsed.get_context(parsed_top_level).generics.params;
     assert_eq!(s(params), s(leaker_params));
 
     // The arguments of the trait are completed (the generics of a context have no defaults), and
@@ -1123,7 +1136,11 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
         )
         .unwrap();
     let args = parsed
-        .context_generic_args(parsed_top_level, &tr.generics.params, &completed)
+        .context_generic_args(
+            &parsed.get_context(parsed_top_level).generics,
+            &tr.generics.params,
+            &completed,
+        )
         .unwrap();
     assert_eq!(
         args.iter().map(s).collect::<Vec<_>>(),
@@ -1136,9 +1153,9 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
     assert_eq!(s(&on_referrer_side), s(&expected));
 
     // The arguments fit the context of every entry.
-    for ix in 0..parsed.iter().count() {
+    for (_, context) in parsed.iter() {
         parsed
-            .context_generic_args(parsed.context(ix), &tr.generics.params, &completed)
+            .context_generic_args(&context.generics, &tr.generics.params, &completed)
             .unwrap();
     }
 }
@@ -1262,18 +1279,13 @@ fn with_where(generics: &Generics) -> String {
 fn by_hand(referrer: &Referrer, ix: usize, self_param: &Ident) -> (Generics, Type, Type, Type) {
     let marker: Type = parse_quote!(#self_param);
     let replaced: Vec<(Type, Generics)> = referrer.iter_with_self(&marker).collect();
-    let (ty, generics) = referrer
-        .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
-        .nth(ix)
-        .unwrap();
-    let context = referrer.context(ix);
-    let (ty, generics) = match referrer.context_self(context) {
+    let (ty, context) = referrer.iter().nth(ix).unwrap();
+    let generics = &context.generics;
+    let (ty, generics) = match context.self_ty.as_ref() {
         Some(SelfRequirement::Bound(_)) => (&replaced[ix].0, &replaced[ix].1),
         _ => (ty, generics),
     };
-    let self_in_impl: Type = match referrer.context_self(context) {
+    let self_in_impl: Type = match context.self_ty.as_ref() {
         Some(SelfRequirement::Type(_)) => parse_quote!(Self),
         _ => marker.clone(),
     };
@@ -1281,14 +1293,14 @@ fn by_hand(referrer: &Referrer, ix: usize, self_param: &Ident) -> (Generics, Typ
         .encode_generics_params_to_ty_with_self(
             &generics.params,
             &self_in_impl,
-            referrer.context_self_outlives(context),
+            &context.self_outlives,
         )
         .unwrap();
-    let mut declared = match referrer.context_self(context) {
+    let mut declared = match context.self_ty.as_ref() {
         Some(SelfRequirement::Bound(_)) => without_encoded_bounds(generics),
-        _ => referrer.impl_generics(context),
+        _ => without_encoded_bounds(&context.generics),
     };
-    let self_ty = match referrer.context_self(context) {
+    let self_ty = match context.self_ty.as_ref() {
         Some(SelfRequirement::Bound(path)) => {
             declare_before_consts(
                 &mut declared,
@@ -1342,15 +1354,16 @@ fn args_by_hand(
     root_args: &[GenericArgument],
     self_ty: &Type,
 ) -> Type {
+    let context = context_of(referrer, ix);
     let args = referrer
-        .context_generic_args(referrer.context(ix), root_params, root_args)
+        .context_generic_args(&context.generics, root_params, root_args)
         .unwrap();
     slots()
         .encode_generics_args_to_ty_with_self(
             &args,
-            &referrer.context_generics(referrer.context(ix)).params,
+            &context.generics.params,
             self_ty,
-            referrer.context_self_outlives(referrer.context(ix)),
+            &context.self_outlives,
         )
         .unwrap()
 }
@@ -1380,7 +1393,7 @@ fn repeater_impl_is_what_a_macro_writes_by_hand() {
                 .repeater_impl(ix, ImplSelf::Param(&self_param), slots().const_fn())
                 .unwrap_or_else(|e| panic!("{}: {}", s(&item), e));
             let (generics, self_ty, args, ty) = by_hand(&referrer, ix, &self_param);
-            let what = format!("{}: {}", s(&item), s(&referrer.iter().nth(ix)));
+            let what = format!("{}: {}", s(&item), s(entry_ty(&referrer, ix)));
             assert_eq!(
                 with_where(&unparenthesized(r.generics.clone())),
                 with_where(&generics),
@@ -1390,12 +1403,7 @@ fn repeater_impl_is_what_a_macro_writes_by_hand() {
             assert_eq!(s(&r.self_ty), s(&self_ty), "{}", what);
             assert_eq!(s(&r.args), s(&args), "{}", what);
             assert_eq!(s(&r.ty), s(&ty), "{}", what);
-            assert_eq!(
-                r.module,
-                referrer.context_module(referrer.context(ix)),
-                "{}",
-                what
-            );
+            assert_eq!(r.module, in_module(context_of(&referrer, ix)), "{}", what);
             checked += 1;
         }
     }
@@ -1411,7 +1419,7 @@ fn entry_args_is_what_a_macro_writes_by_hand() {
         let generics = generics_of(&item);
         let root_args = arguments_for(&generics);
         for ix in 0..referrer.iter().count() {
-            let what = format!("{}: {}", s(&item), s(&referrer.iter().nth(ix)));
+            let what = format!("{}: {}", s(&item), s(entry_ty(&referrer, ix)));
             let slots = slots();
             // Substituted, with a `Self`.
             let site = UseSite::substituting(&generics.params, &root_args).with_self(host.clone());
@@ -1430,7 +1438,7 @@ fn entry_args_is_what_a_macro_writes_by_hand() {
             let r = referrer
                 .repeater_impl(ix, ImplSelf::Param(&param), slots.const_fn())
                 .unwrap();
-            let self_in_impl = match referrer.context_self(referrer.context(ix)) {
+            let self_in_impl = match context_of(&referrer, ix).self_ty.as_ref() {
                 Some(SelfRequirement::Type(_)) => parse_quote!(Self),
                 _ => parse_quote!(#param),
             };

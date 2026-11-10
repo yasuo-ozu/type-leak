@@ -59,7 +59,9 @@ fn analyze_with<A: Allow>(
 }
 
 fn analyze(item: &Item, allow_self: bool) -> std::result::Result<Referrer, Vec<ErrorItem>> {
-    let config = Rules::new().primitive();
+    // The absolute paths are allowed, so the types of `::l` are no entries: the entries are those
+    // that depend on the context.
+    let config = Rules::new().primitive().external_crates();
     analyze_with(
         Leaker::from_config(config, Options::new()),
         item,
@@ -67,11 +69,10 @@ fn analyze(item: &Item, allow_self: bool) -> std::result::Result<Referrer, Vec<E
     )
 }
 
-/// The required entries, as text.
+/// The entries, as text.
 fn entries(referrer: &Referrer) -> Vec<String> {
-    referrer
-        .required()
-        .map(|(_, ty)| quote!(#ty).to_string())
+    common::types(referrer)
+        .map(|ty| quote!(#ty).to_string())
         .collect()
 }
 
@@ -219,7 +220,9 @@ fn a_bare_identifier_beside_a_denied_self_is_not_leaked_as_a_type() {
         assert!(entries(&referrer).is_empty(), "{}", quote!(#item));
     }
     // Allowed by the config: left as written, so it is no cause either.
-    let config = Rules::new().or_if(starts_with(parse_quote!(ILEN)));
+    let config = Rules::new()
+        .external_crates()
+        .or_if(starts_with(parse_quote!(ILEN)));
     let referrer = analyze_with(Leaker::from_config(config, Options::new()), &item, false).unwrap();
     assert!(entries(&referrer).is_empty());
 }
@@ -926,7 +929,7 @@ fn module_with(nested: bool, ilen: &str, place: &str, holder: &str) -> Item {
 
 /// The config of the tests of modules: primitives and the prelude (`Vec`, `Box`, ..) are copied.
 fn module_config() -> Rules<impl Allow + Clone> {
-    Rules::new().primitive().prelude()
+    Rules::new().primitive().prelude().external_crates()
 }
 
 fn analyze_module(item: &Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {

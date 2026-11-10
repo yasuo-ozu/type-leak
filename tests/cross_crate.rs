@@ -402,8 +402,10 @@ fn every_item_kind_is_leaked_across_crates() {
             rejected("struct", "useabsolutepath:'Wrap<Self>'"),
         ),
         (9004, __tl_report_9004!(), ok("struct", 3, 3, 3)),
-        // a where clause on a type that is not a parameter, in the context of its entry
-        (9005, __tl_report_9005!(), ok("struct", 2, 1, 1)),
+        // a where clause on a type that is not a parameter, in the context of its entry (the Leaker
+        // allows `::std`: the predicate `Vec<T>: Clone` must stay as written, or the impl of the
+        // entry does not hold in the copy)
+        (9005, __tl_report_9005!(), ok("struct", 1, 1, 1)),
         // enums
         (9011, __tl_report_9011!(), ok("enum", 4, 5, 5)),
         (9012, __tl_report_9012!(), ok("enum", 2, 2, 2)),
@@ -489,7 +491,6 @@ fn every_item_kind_is_leaked_across_crates() {
         // the relative types beside it are
         (9121, __tl_report_9121!(), ok("struct", 2, 3, 3)),
         (9122, __tl_report_9122!(), ok("struct", 1, 2, 2)),
-        (9123, __tl_report_9123!(), ok("struct", 2, 3, 3)),
         (9124, __tl_report_9124!(), ok("enum", 2, 3, 3)),
         // the defaults of a nested trait whose generic has a bound that names its `Self`
         (9131, __tl_report_9131!(), ok("trait", 1, 3, 3)),
@@ -867,8 +868,7 @@ fn an_absolute_type_that_names_the_own_self_is_the_copys_in_a_strict_copy() {
     assert_eq!(list.next.as_ref().map(|next| next.rel), Some(rel));
 
     // The bound holds for the copy's own type, not the Leaker's `Pathed<Owner>`, which `Owner`
-    // has no `AsRef` for. The pair holds the copy's type for `Self` (strict), and so does the
-    // one of a Referrer that trusts the names of the crates.
+    // has no `AsRef` for. The pair holds the copy's type for `Self`.
     struct Owner;
     impl AsRef<r::Pathed<Owner>> for Owner {
         fn as_ref(&self) -> &r::Pathed<Owner> {
@@ -883,20 +883,8 @@ fn an_absolute_type_that_names_the_own_self_is_the_copys_in_a_strict_copy() {
     same(&pathed.path.0, &PhantomData::<r::Pathed<Owner>>);
     same(&pathed.wrapped, &l::Wrap::<Owner>(PhantomData));
     same(&pathed.rel, &rel);
-    struct Owner2;
-    impl AsRef<r::PathedTrusting<Owner2>> for Owner2 {
-        fn as_ref(&self) -> &r::PathedTrusting<Owner2> {
-            unimplemented!()
-        }
-    }
-    let trusting = r::PathedTrusting::<Owner2> {
-        path: l::Pair(PhantomData::<r::PathedTrusting<Owner2>>, Owner2),
-        wrapped: l::Wrap(PhantomData),
-        rel,
-    };
-    same(&trusting.path.0, &PhantomData::<r::PathedTrusting<Owner2>>);
 
-    // The enum (strict): the vector holds boxes of the copy's `Tree`.
+    // The enum: the vector holds boxes of the copy's `Tree`.
     let tree = r::Tree::<u8>::Branch(vec![
         Box::new(r::Tree::Leaf(rel)),
         Box::new(r::Tree::Tagged(l::Pair(
@@ -1511,41 +1499,45 @@ fn errors_the_referrers_macro_allows_are_copied_as_written() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// A strict Referrer, in a crate without the dependency of an optional entry.
+// A crate without the dependency of the crate of an entry.
 // ---------------------------------------------------------------------------------------------
 
-/// The type of a crate which the Referrer's crate has no dependency on is an optional entry, if it
-/// has no relative type in it. The trusting Referrer leaves it as written, and the strict one
-/// replaces the whole type: the text of the two copies of the same items differs in that. The type
-/// with a relative type in it is one required entry, which both replace. Only the strict one can be
-/// compiled where the crate is not a dependency (this crate has none on it): the module `trusting`
-/// of `tests/diagnostic.rs` builds both in a crate that has none, and runs the tests of the strict
-/// one.
+/// The type of a crate which the Referrer's crate has no dependency on is an entry, unless the
+/// Leaker allows the crate. After a Leaker that allows it the copy names the crate (the relative
+/// type in it is replaced), and after the default one the copy replaces the whole type, so that the
+/// crate is not named: the text of the two copies of the same items differs in that. Only the
+/// second can be compiled where the crate is not a dependency (this crate has none on it): the
+/// module `trusting` of `tests/diagnostic.rs` builds both in a crate that has none, and runs the
+/// tests of the second.
 #[test]
-fn a_strict_referrer_replaces_the_optional_entries_and_a_trusting_one_does_not() {
-    use type_leak_test_referrer::{STRICT_COPY, TRUSTING_COPY};
-    let (trusting, strict) = (squash(TRUSTING_COPY), squash(STRICT_COPY));
+fn a_leaker_that_allows_a_crate_has_the_copy_name_it_and_the_default_one_does_not() {
+    use type_leak_test_referrer::{ALLOWED_COPY, REPLACED_COPY};
+    let (allowed, replaced) = (squash(ALLOWED_COPY), squash(REPLACED_COPY));
 
-    // Trusting: `Ext<(RelX,)>` is the required entry 0, replaced as a whole; the plain `Ext<u8>` is
-    // an optional one, which it leaves.
-    assert!(trusting.contains("x:<Wrapperas$crate::Repeater<(),"));
-    assert!(trusting.contains("u128>>::Type,y:::type_leak_test_ext::Ext<u8>"));
-    let keys = repeater_keys(&trusting);
-    assert_eq!(keys.len(), 1, "{}", trusting);
-    let (id, nth) = keys[0];
+    // Allowed: `Ext<(RelX,)>` names the crate with the relative type replaced (the entry 0), and
+    // `Ext<u8>` is as written.
+    assert!(allowed.contains("x:::type_leak_test_ext::Ext<(<Wrapperas$crate::Repeater<(),"));
+    assert!(allowed.contains("u128>>::Type,)>,y:::type_leak_test_ext::Ext<u8>"));
+    let keys = repeater_keys(&allowed);
+    assert_eq!(keys.len(), 1, "{}", allowed);
+    let (_, nth) = keys[0];
     assert_eq!(nth, 0);
-    assert_eq!(trusting.matches("type_leak_test_ext").count(), 1);
-    assert_eq!(trusting.matches("Repeater<").count(), 1);
+    assert_eq!(allowed.matches("type_leak_test_ext").count(), 2);
+    assert_eq!(allowed.matches("Repeater<").count(), 1);
 
-    // Strict: both types of the other crate are replaced as a whole, each by its own entry (0 and
+    // Replaced: both types of the other crate are replaced as a whole, each by its own entry (0 and
     // 1), and the crate is not named at all.
-    assert!(!strict.contains("type_leak_test_ext"));
-    assert!(strict.contains("x:<Wrapperas$crate::Repeater<(),"));
-    assert!(strict.contains("u128>>::Type,y:<Wrapperas$crate::Repeater<(),"));
-    assert!(strict.ends_with("u128>>::Type){}"));
-    assert_eq!(repeater_keys(&strict), [(id, 0), (id, 1)]);
-    assert_eq!(strict.matches("Repeater<").count(), 2);
-    assert_ne!(trusting, strict);
+    assert!(!replaced.contains("type_leak_test_ext"));
+    assert!(replaced.contains("x:<Wrapperas$crate::Repeater<(),"));
+    assert!(replaced.contains("u128>>::Type,y:<Wrapperas$crate::Repeater<(),"));
+    assert!(replaced.ends_with("u128>>::Type){}"));
+    let (replaced_id, _) = repeater_keys(&replaced)[0];
+    assert_eq!(
+        repeater_keys(&replaced),
+        [(replaced_id, 0), (replaced_id, 1)]
+    );
+    assert_eq!(replaced.matches("Repeater<").count(), 2);
+    assert_ne!(allowed, replaced);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1553,8 +1545,7 @@ fn a_strict_referrer_replaces_the_optional_entries_and_a_trusting_one_does_not()
 // ---------------------------------------------------------------------------------------------
 
 /// `coinduction`'s shape: `enter_impl(.., false, ..)` with `visit_path_arguments()`, the
-/// Repeater's impls for a marker (`ImplSelf::Marker`) of the required entries only
-/// (`required()`), and the Referrer's copy of the self type, the trait and its
+/// Repeater's impls for a marker (`ImplSelf::Marker`) of the entries, and the Referrer's copy of the self type, the trait and its
 /// arguments with `Referrer::visitor(context, ..)` and `entry_args(ix, &UseSite::identity(),
 /// ..)`. The Referrer's crate checks the copy: each type is the original (a witness), and rustc finds
 /// the Leaker's impl of the trait for the rewritten self type.
@@ -1564,7 +1555,7 @@ fn the_scope_api_with_a_marker() {
     // in the first argument of the Repeater).
     assert_eq!(
         type_leak_test_leaker::__scope_report_7001!(),
-        "7001|entries=3 required=3 impls=3 types=4"
+        "7001|entries=3 impls=3 types=4"
     );
     let (self_ty, trait_path) = (
         squash(type_leak_test_referrer::scoped::SCOPE_7001_SELF),
@@ -1629,7 +1620,7 @@ fn the_scope_api_with_a_marker() {
 fn the_scope_api_with_self() {
     assert_eq!(
         type_leak_test_leaker::__scope_report_7002!(),
-        "7002|entries=2 required=2 impls=2 types=4"
+        "7002|entries=2 impls=2 types=4"
     );
     let trait_path = squash(type_leak_test_referrer::scoped::SCOPE_7002_TRAIT);
     // `Wrap<Self>` is in the impl of the self type itself, `Rel<T>` in the marker's.
@@ -1666,29 +1657,28 @@ fn the_scope_api_with_self() {
     );
 }
 
-/// Entries which need no generics are plain: the impl for the marker declares nothing. With an
-/// optional entry only, `required()` is empty and the macro writes no impl; with the impl of
-/// the optional entry too (`all`), the strict Referrer replaces it where its crate has no dependency
-/// on the crate of the type.
+/// Entries which need no generics are plain: the impl for the marker declares nothing. The type of
+/// another crate is an entry, and has its impl; with a Leaker that allows the absolute paths
+/// (`external`) it is none, and the copy writes it as it is.
 #[test]
 fn the_scope_api_writes_the_impls_that_are_needed() {
     assert_eq!(
         type_leak_test_leaker::__scope_report_7003!(),
-        "7003|entries=2 required=2 impls=2 types=4"
+        "7003|entries=2 impls=2 types=4"
     );
     assert_eq!(
         type_leak_test_leaker::__scope_report_7004!(),
-        "7004|entries=1 required=0 impls=0 types=4"
+        "7004|entries=1 impls=1 types=4"
     );
     assert_eq!(
         type_leak_test_leaker::__scope_report_7005!(),
-        "7005|entries=2 required=1 impls=2 types=4"
+        "7005|entries=2 impls=2 types=4"
     );
     // A where clause on a type that is not a parameter (`Vec<T>: Clone`) is in the context of the
     // entry that needs it (`Cl<T>` is well-formed only with it), so the impl of the Repeater has it.
     assert_eq!(
         type_leak_test_leaker::__scope_report_7006!(),
-        "7006|entries=1 required=1 impls=1 types=4"
+        "7006|entries=1 impls=1 types=4"
     );
     assert_eq!(
         squash(type_leak_test_leaker::__scope_impls_7006!()),
@@ -1697,13 +1687,13 @@ fn the_scope_api_writes_the_impls_that_are_needed() {
             key_text(7006, 0)
         )
     );
-    // Without `all`, a required entry next to an optional one gets the impl of the required one only.
+    // With `external`, the type of the other crate is no entry: only `Rel<u8>` has an impl.
     assert_eq!(
         type_leak_test_leaker::__scope_report_7007!(),
-        "7007|entries=2 required=1 impls=1 types=4"
+        "7007|entries=1 impls=1 types=4"
     );
-    // (The module `trusting` of `tests/diagnostic.rs` applies 7005 as a strict Referrer, in a crate
-    // that has no dependency on the crate of the optional entry.)
+    // (The module `trusting` of `tests/diagnostic.rs` applies 7005 in a crate that has no
+    // dependency on the crate of the second entry.)
 }
 
 /// The errors of the Leaker (`Vec<ErrorItem>`) through a macro: one item for each offending path,
@@ -2064,7 +2054,7 @@ fn the_entries_that_do_not_name_self_are_implemented_for_a_bucket() {
     );
 }
 
-/// The impls of the entries where `Referrer::needs_self()` is false are for a marker type of the
+/// The impls of the entries that name no `Self`, nor do their generics, are for a marker type of the
 /// Leaker's crate (`ImplSelf::Marker`), the entry whose generics name `Self` (the default `Defd<T>`
 /// of `trait MarkerDefault<T: AsRef<Self>, U = Defd<T>>`, `context_self()` is `None`) for the
 /// implementor, which is the host in the copy. The Referrer's crate has an impl of the copy that

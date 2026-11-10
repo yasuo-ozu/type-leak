@@ -1,11 +1,12 @@
-//! Tests for the helpers for macro authors: `Referrer::required()` and `Referrer::is_plain()`,
-//! the description of the Repeater impl of an entry (`Referrer::repeater_impl()`), the arguments of
-//! an entry at a use site (`Referrer::entry_args()`), and the items of the errors of the analysis
-//! (`Vec<ErrorItem>`).
+//! Tests for the helpers for macro authors: the order of the entries, the description of the Repeater
+//! impl of an entry (`Referrer::repeater_impl()`), the arguments of an entry at a use site
+//! (`Referrer::entry_args()`), and the items of the errors of the analysis (`Vec<ErrorItem>`).
 //!
 //! The impl and the arguments are compared with what a macro wrote by hand before the helpers
 //! (the replacement of `Self`, `without_encoded_bounds()` and the encoders, and the arguments of a
 //! context with the encoders), over all the entries of a set of items, in `src/encode/tests.rs`.
+
+mod common;
 
 use syn::*;
 use template_quote::{quote, ToTokens};
@@ -114,10 +115,10 @@ fn samples() -> Vec<Item> {
     ]
 }
 
-// ── required entries ─────────────────────────────────────────────────────────────────────────
+// ── entries ──────────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn required_entries_come_first_and_skip_the_optional_ones() {
+fn the_entries_that_depend_on_the_context_come_first() {
     let item: ItemStruct = parse_quote!(
         struct S {
             a: ::foo::X,
@@ -130,148 +131,67 @@ fn required_entries_come_first_and_skip_the_optional_ones() {
     leaker.intern_struct(&item, true);
     let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
-    let all: Vec<String> = referrer.iter().map(s).collect();
-    assert_eq!(all.len(), 4, "{:?}", all);
+    let all: Vec<String> = common::types(&referrer).map(s).collect();
     assert!(!referrer.is_empty());
-    let required: Vec<(usize, String)> = referrer.required().map(|(ix, ty)| (ix, s(ty))).collect();
-    // The required entries have the smaller indices, and `required()` is `must()` of `iter()`.
-    assert_eq!(required.len(), 2, "{:?}", required);
+    // `Rel` and `Wrap<u8>` depend on the context: they have the smaller indices, each sorted.
     assert_eq!(
-        required.iter().map(|(ix, _)| *ix).collect::<Vec<_>>(),
-        [0, 1]
+        all,
+        ["Rel", "Wrap < u8 >", ":: bar :: Y", ":: foo :: X"],
+        "{:?}",
+        all
     );
-    let mut names: Vec<&str> = required.iter().map(|(_, ty)| ty.as_str()).collect();
-    names.sort();
-    assert_eq!(names, ["Rel", "Wrap < u8 >"]);
-    for (ix, ty) in referrer.iter().enumerate() {
-        assert_eq!(
-            referrer.required().any(|(found, _)| found == ix),
-            referrer.must(ix),
-            "{}",
-            s(ty)
-        );
-    }
-    assert!(referrer.required().next().is_some());
-    // Not affected by a rule that allows the crates of the optional entries.
+    // Not affected by a rule that allows the crates of the types of other crates.
     let allowed = result.allow(Rules::new().external_crates());
     let allowed = allowed.finish().unwrap();
-    assert_eq!(
-        allowed.required().map(|(ix, _)| ix).collect::<Vec<_>>(),
-        [0, 1]
-    );
-    // The serialized Referrer has them too.
+    assert_eq!(allowed.iter().map(|(ty, _)| s(ty)).collect::<Vec<_>>(), all);
+    // The serialized Referrer has them in the same order.
     let parsed: Referrer = parse2(quote!(#referrer)).unwrap();
-    assert_eq!(
-        parsed
-            .required()
-            .map(|(ix, ty)| (ix, s(ty)))
-            .collect::<Vec<_>>(),
-        required
-    );
+    assert_eq!(common::types(&parsed).map(s).collect::<Vec<_>>(), all);
 }
 
 #[test]
-fn a_referrer_with_only_optional_entries_has_no_required_entry() {
+fn a_referrer_with_no_entry_is_empty() {
     let item: ItemStruct = parse_quote!(
         struct S {
             a: ::foo::X,
             b: u8,
         }
     );
+    // A Leaker that allows the crates finds no entry.
+    let rules = config().external_crates();
+    let mut leaker = Leaker::from_config(rules, Options::new());
+    leaker.intern_struct(&item, true);
+    let referrer = leaker.result().finish().unwrap();
+    assert!(referrer.is_empty());
+    assert_eq!(referrer.iter().count(), 0);
+    // The default one finds the type of the other crate.
     let mut leaker = Leaker::from_config(config(), Options::new());
     leaker.intern_struct(&item, true);
     let referrer = leaker.result().finish().unwrap();
     assert!(!referrer.is_empty());
     assert_eq!(referrer.iter().count(), 1);
-    assert!(!referrer.must(0));
-    assert!(!referrer.required().next().is_some());
-    assert_eq!(referrer.required().count(), 0);
-    // Nothing at all.
-    let mut leaker = Leaker::from_config(config(), Options::new());
-    leaker.intern_struct(
-        &parse_quote!(
-            struct S {
-                a: u8,
-            }
-        ),
-        true,
-    );
-    let referrer = leaker.result().finish().unwrap();
-    assert!(referrer.is_empty());
-    assert!(!referrer.required().next().is_some());
-    assert_eq!(referrer.required().count(), 0);
 }
 
-// ── is_plain ─────────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn plain_entries_need_no_generics_self_or_module() {
-    let (referrer, _) = analyze(&parse_quote! {
-        trait Tr<T> {
-            type A;
-            fn f(&self, a: Rel, b: Wrap<T>, c: Rel2<Self::A>) -> Rel3<Self>;
-        }
-    });
-    let plain: Vec<String> = referrer
-        .iter()
-        .enumerate()
-        .filter(|(ix, _)| referrer.is_plain(*ix))
-        .map(|(_, ty)| s(ty))
-        .collect();
-    assert_eq!(plain, ["Rel"]);
-    // A module keys an entry that has a relative path.
-    let (referrer, _) = analyze(&parse_quote! { mod m { pub fn f() -> Rel { todo!() } } });
-    assert_eq!(referrer.iter().count(), 1);
-    assert!(referrer.context_module(referrer.context(0)).is_some());
-    assert!(!referrer.is_plain(0));
-    // An entry that is shared by all the modules is plain: `Vec<u8>` has no relative path.
-    let (referrer, _) = analyze(&parse_quote! {
-        mod m { pub fn f() -> ::p::W<Rel> { todo!() } pub fn g() -> ::q::X<u8> { todo!() } }
-    });
-    for ix in 0..referrer.iter().count() {
-        let module = referrer.context_module(referrer.context(ix));
-        assert_eq!(
-            referrer.is_plain(ix),
-            module.is_none(),
-            "{}",
-            s(referrer.iter().nth(ix).unwrap())
-        );
-    }
-}
-
-#[test]
-fn is_plain_is_what_an_impl_for_a_marker_needs_nothing_for() {
-    // The invariant that the test macros check for every entry they emit, over the samples.
-    let marker: Type = parse_quote!(__Marker);
-    for item in samples() {
-        let (referrer, _) = analyze(&item);
-        for ix in 0..referrer.iter().count() {
-            let needs_nothing =
-                match referrer.repeater_impl(ix, ImplSelf::Marker(&marker), slots().const_fn()) {
-                    Ok(r) => {
-                        r.generics.params.is_empty()
-                            && r.generics
-                                .where_clause
-                                .as_ref()
-                                .map_or(true, |clause| clause.predicates.is_empty())
-                            && s(&r.args) == "()"
-                            && r.module.is_none()
-                    }
-                    Err(EncodeError::NeedsSelf(_)) => false,
-                    Err(e) => panic!("{}", e),
-                };
-            assert_eq!(referrer.is_plain(ix), needs_nothing, "{}: {}", s(&item), ix);
-        }
-    }
+/// The impl of an entry for a marker declares nothing: no generics, where clause or module, and
+/// `()` as its arguments.
+fn assert_declares_nothing(r: &RepeaterImpl) {
+    assert!(r.generics.params.is_empty());
+    assert!(r
+        .generics
+        .where_clause
+        .as_ref()
+        .map_or(true, |clause| clause.predicates.is_empty()));
+    assert_eq!(s(&r.args), "()");
+    assert!(r.module.is_none());
 }
 
 /// The sumtype shape: `Leaker::new()` (no allowed path) and `intern_trait(.., false)` on a trait
-/// whose only entries are the absolute types of external crates, which are optional. `iter()`
-/// counts them, `is_plain()` is true for each, and an impl of the Repeater for a marker is the
-/// plain one (no generics, no `Self`, no module), with the entry as the type. A relative type or
-/// `Self` makes the call fail and the macro throws the Leaker away.
+/// whose only entries are the absolute types of external crates. `iter()` counts them, and an impl
+/// of the Repeater for a marker declares nothing (no generics, no `Self`, no module), with the
+/// entry as the type. A relative type or `Self` makes the call fail and the macro throws the
+/// Leaker away.
 #[test]
-fn a_trait_with_only_optional_external_types_has_plain_entries_for_a_marker() {
+fn a_trait_with_only_external_types_has_entries_that_declare_nothing_for_a_marker() {
     let item: ItemTrait = parse_quote! {
         pub trait Reader {
             fn read(&mut self, buf: &mut [::core::primitive::u8])
@@ -283,43 +203,34 @@ fn a_trait_with_only_optional_external_types_has_plain_entries_for_a_marker() {
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item, false);
     let referrer = leaker.result().finish().unwrap();
-    // `iter()` counts the optional entries, `required()` does not.
     assert!(!referrer.is_empty());
-    assert!(!referrer.required().next().is_some());
-    assert_eq!(referrer.required().count(), 0);
     assert_eq!(
-        referrer.iter().map(s).collect::<Vec<_>>(),
+        common::types(&referrer).map(s).collect::<Vec<_>>(),
         [
             ":: std :: io :: Result < :: core :: primitive :: usize >",
             "dyn :: std :: error :: Error + 'static"
         ]
     );
     let marker: Type = parse_quote!(__Marker);
-    for (ix, ty) in referrer.iter().enumerate() {
-        assert!(!referrer.must(ix));
-        assert!(referrer.is_plain(ix), "{}", s(ty));
-        assert!(referrer.context_module(referrer.context(ix)).is_none());
-        assert!(referrer.context_self(referrer.context(ix)).is_none());
-        assert!(referrer
-            .context_generics(referrer.context(ix))
-            .params
-            .is_empty());
+    for (ix, ty) in common::types(&referrer).enumerate() {
+        assert!(common::in_module(common::entry(&referrer, ix)).is_none());
+        assert!(common::entry(&referrer, ix).self_ty.is_none());
+        assert!(common::entry(&referrer, ix).generics.params.is_empty());
         // The impl for the marker, which is what the macro emits (`type Type = #ty`).
         let r = referrer
             .repeater_impl(ix, ImplSelf::Marker(&marker), slots().const_fn())
             .unwrap();
-        assert!(r.generics.params.is_empty());
-        assert_eq!(s(&r.args), "()");
+        assert_declares_nothing(&r);
         assert_eq!(s(&r.self_ty), "__Marker");
         assert_eq!(s(&r.ty), s(ty));
     }
-    // A relative type is a required entry, which the macro does not emit; a type it cannot leak
-    // is an error, and the macro throws the Leaker away then.
+    // A relative type is an entry that depends on the context, which the macro does not emit; a type
+    // it cannot leak is an error, and the macro throws the Leaker away then.
     let item: ItemTrait = parse_quote! { pub trait Tr { fn f(&self) -> Rel; } };
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item, false);
     let referrer = leaker.result().finish().unwrap();
-    assert!(referrer.required().next().is_some() && referrer.must(0));
+    assert_eq!(referrer.iter().count(), 1);
     let item: ItemTrait = parse_quote! { pub trait Tr { fn f(&self) -> Rel<'_>; } };
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item, false);
@@ -349,8 +260,7 @@ fn repeater_impl_for_an_entry_that_does_not_name_self() {
         }
     });
     let param: Ident = parse_quote!(__S);
-    let wrap = referrer
-        .iter()
+    let wrap = common::types(&referrer)
         .position(|ty| s(ty) == "& 'a Wrap < T , U >")
         .unwrap();
     // Any type implements it: the parameter is declared last, and `T: 'a` is encoded, not
@@ -379,14 +289,14 @@ fn repeater_impl_for_an_entry_that_does_not_name_self() {
     );
     assert_eq!(s(&r.self_ty), "crate :: Marker");
     assert_eq!(s(&r.args), t(parse_quote!((&'a (), T, U, &'a T, &'a U))));
-    // A plain entry: no generics, `()`.
-    let rel = referrer.iter().position(|ty| s(ty) == "Rel").unwrap();
-    assert!(referrer.is_plain(rel));
+    // An entry of a context with no generics: nothing is declared.
+    let rel = common::types(&referrer)
+        .position(|ty| s(ty) == "Rel")
+        .unwrap();
     let r = referrer
         .repeater_impl(rel, ImplSelf::Marker(&marker), array_const)
         .unwrap();
-    assert!(r.generics.params.is_empty());
-    assert_eq!(s(&r.args), "()");
+    assert_declares_nothing(&r);
     assert_eq!(s(&r.ty), "Rel");
 }
 
@@ -399,8 +309,7 @@ fn repeater_impl_for_the_implementor_of_a_trait() {
         }
     });
     let param: Ident = parse_quote!(__Impl);
-    let wrap = referrer
-        .iter()
+    let wrap = common::types(&referrer)
         .position(|ty| s(ty) == "Wrap < T , Self >")
         .unwrap();
     // The parameter has the bound of the trait with its arguments, and replaces `Self`.
@@ -421,8 +330,7 @@ fn repeater_impl_for_the_implementor_of_a_trait() {
     }
     // `&'a Rel<Self::A>` is under a reference: the predicate of `Self::A` is in its where clause,
     // and as the first predicate it is parenthesized, or rustc takes `where <__Impl>` for generics.
-    let rel = referrer
-        .iter()
+    let rel = common::types(&referrer)
         .position(|ty| s(ty) == "& 'a Rel < Self :: A >")
         .unwrap();
     let r = referrer
@@ -442,8 +350,7 @@ fn repeater_impl_for_a_type_is_for_the_type() {
         struct S<'a, T: 'a> { f: &'a Rel<Self>, g: Wrap<T> }
     });
     let param: Ident = parse_quote!(__S);
-    let rel = referrer
-        .iter()
+    let rel = common::types(&referrer)
         .position(|ty| s(ty) == "& 'a Rel < Self >")
         .unwrap();
     // The impl is for the struct, with `Self` as written and as the argument of `Self: 'a`.
@@ -461,8 +368,7 @@ fn repeater_impl_for_a_type_is_for_the_type() {
         Err(EncodeError::NeedsSelf(_))
     ));
     // What does not name `Self` is for any type.
-    let wrap = referrer
-        .iter()
+    let wrap = common::types(&referrer)
         .position(|ty| s(ty) == "Wrap < T >")
         .unwrap();
     let r = referrer
@@ -491,8 +397,7 @@ fn repeater_impl_in_a_module_tells_the_module() {
     let paths: Vec<Vec<String>> = modules
         .iter()
         .map(|module| {
-            referrer
-                .module_path(module.unwrap())
+            common::module_path(&referrer, module.unwrap())
                 .unwrap()
                 .iter()
                 .map(|ident| ident.to_string())
@@ -632,8 +537,7 @@ fn entry_args_substitutes_the_generics_of_the_trait_and_not_those_of_a_method() 
         }
     };
     let (referrer, _) = analyze(&Item::Trait(tr.clone()));
-    let wrap2 = referrer
-        .iter()
+    let wrap2 = common::types(&referrer)
         .position(|ty| s(ty) == "Wrap2 < T , U >")
         .unwrap();
     let args: Vec<GenericArgument> = vec![parse_quote!('static), parse_quote!(Vec<u8>)];
@@ -818,11 +722,10 @@ fn names_self(generics: &Generics) -> bool {
     has_self(quote!(#generics #where_clause))
 }
 
-/// `Referrer::bucket_self()`, `Referrer::needs_self()` and `repeater_impl(.., ImplSelf::Bucket)`
-/// agree for every entry: the impl of an entry that has a bucket is the one for it as for a marker,
-/// any other is the one for a parameter, an entry has a bucket exactly if neither its type nor its
-/// generics name `Self` (`needs_self()` is false), and `ImplSelf::Marker` fails exactly where
-/// `needs_self()` is true.
+/// `Referrer::bucket_self()` and `repeater_impl(.., ImplSelf::Bucket)` agree for every entry: the
+/// impl of an entry that has a bucket is the one for it as for a marker, any other is the one for a
+/// parameter, an entry has a bucket exactly if neither its type nor its generics name `Self`, and
+/// `ImplSelf::Marker` fails exactly where it has none.
 #[test]
 fn bucket_self_agrees_with_the_impl_of_every_entry() {
     let param: Ident = parse_quote!(__S);
@@ -832,28 +735,25 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
         for ix in 0..referrer.iter().count() {
             for id in [0, 1, 7, 12345, u64::MAX] {
                 let what = format!("{}: {} ({})", s(&item), ix, id);
-                let context = referrer.context(ix);
+                let context = common::entry_id(&referrer, ix);
                 let bucket = referrer.bucket_self(ix, id);
                 let slots = slots();
                 let r = referrer
                     .repeater_impl(ix, ImplSelf::Bucket { id, param: &param }, slots.const_fn())
                     .unwrap_or_else(|e| panic!("{}: {}", what, e));
-                let own_self = referrer.context_self(context).is_some();
-                let generics_self = names_self(referrer.context_generics(context));
+                let own_self = referrer.get_context(context).self_ty.is_some();
+                let generics_self = names_self(&referrer.get_context(context).generics);
                 assert_eq!(bucket.is_some(), !own_self && !generics_self, "{}", what);
-                let needs_self = referrer.needs_self(ix);
-                assert_eq!(needs_self, own_self || generics_self, "{}", what);
-                assert_eq!(needs_self, bucket.is_none(), "{}", what);
                 let marker: Type = parse_quote!(crate::Marker);
                 let as_marker =
                     referrer.repeater_impl(ix, ImplSelf::Marker(&marker), slots.const_fn());
                 assert_eq!(
                     matches!(as_marker, Err(EncodeError::NeedsSelf(_))),
-                    needs_self,
+                    bucket.is_none(),
                     "{}",
                     what
                 );
-                assert!(as_marker.is_ok() || needs_self, "{}", what);
+                assert!(as_marker.is_ok() || bucket.is_none(), "{}", what);
                 match bucket {
                     Some(ty) => {
                         bucketed += 1;
@@ -1012,8 +912,8 @@ fn impl_self_bucket_is_copy_and_debug() {
 // ── An entry whose generics name Self ────────────────────────────────────────────────────────
 
 /// The entry of `trait Tr<T: AsRef<Self>, U = Rel<T>>`: the default `Rel<T>` does not name `Self`,
-/// so `context_self()` is `None`, but the generics of its context do (`needs_self()`, like the
-/// entry `Wrap<Self>`). With a concrete type that `Self` would be that type, so there is no bucket
+/// so `context_self()` is `None`, but the generics of its context do (like the entry
+/// `Wrap<Self>`). With a concrete type that `Self` would be that type, so there is no bucket
 /// and `Marker` is refused: `impl<T: AsRef<Self>> Repeater<..> for Marker` bounds `T: AsRef<Marker>`,
 /// where the copy has `T: AsRef<Host>`, so an impl of the copy that instantiates the default
 /// (`impl Tr<String> for Host`) fails with E0277 (`String: AsRef<Marker>`). The impl is for a
@@ -1023,15 +923,16 @@ fn the_entry_of_a_default_whose_generics_name_self_is_for_a_parameter() {
     let (referrer, _) = analyze(&parse_quote! {
         trait Tr<T: AsRef<Self>, U = Rel<T>> { fn f(&self, t: T) -> U; fn g(&self) -> Wrap<Self>; }
     });
-    let rel = referrer.iter().position(|ty| s(ty) == "Rel < T >").unwrap();
-    let wrap = referrer
-        .iter()
+    let rel = common::types(&referrer)
+        .position(|ty| s(ty) == "Rel < T >")
+        .unwrap();
+    let wrap = common::types(&referrer)
         .position(|ty| s(ty) == "Wrap < Self >")
         .unwrap();
-    let context = referrer.context(rel);
-    assert!(referrer.context_self(context).is_none());
-    assert!(names_self(referrer.context_generics(context)));
-    assert!(referrer.needs_self(wrap) && referrer.needs_self(rel));
+    let context = common::entry_id(&referrer, rel);
+    assert!(referrer.get_context(context).self_ty.is_none());
+    assert!(names_self(&referrer.get_context(context).generics));
+    assert_eq!(referrer.bucket_self(wrap, 7), None);
     assert_eq!(referrer.bucket_self(rel, 7), None);
     // A bucket falls back to a parameter, for which `Self` of the generics is the parameter.
     let param: Ident = parse_quote!(__S);
@@ -1066,5 +967,5 @@ fn the_entry_of_a_default_whose_generics_name_self_is_for_a_parameter() {
         trait Tr<T, U = Rel<T>> { fn f(&self, t: T) -> U; fn g(&self) -> Wrap<T>; }
     });
     assert!(referrer.iter().count() > 0);
-    assert!((0..referrer.iter().count()).all(|ix| !referrer.needs_self(ix)));
+    assert!((0..referrer.iter().count()).all(|ix| referrer.bucket_self(ix, 7).is_some()));
 }

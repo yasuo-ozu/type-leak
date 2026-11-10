@@ -21,7 +21,8 @@ fn args_error(generics: &str, args: &str) -> EncodeError {
     let generics: Generics = parse_str(generics).unwrap();
     let args: AngleBracketedGenericArguments = parse_str(args).unwrap();
     let empty = Leaker::new().result().into_referrer();
-    let context = empty.contexts().next().unwrap();
+    // The only context of a Referrer with no entry.
+    let context: ContextId = parse_str("0").unwrap();
     let completed =
         match empty.complete_args(context, &generics.params, &args.args, |_, _, _| {
             unreachable!()
@@ -72,7 +73,7 @@ fn needs_self_error(source: &str) -> EncodeError {
     let referrer = leaker.result().finish().unwrap();
     let wrap = referrer
         .iter()
-        .position(|ty| template_quote::quote!(#ty).to_string() == "Wrap < T , Self >")
+        .position(|(ty, _)| template_quote::quote!(#ty).to_string() == "Wrap < T , Self >")
         .unwrap();
     let marker: Type = parse_quote!(crate::Marker);
     referrer

@@ -199,14 +199,12 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     })
 }
 
-/// Input of `__nested_apply!`: the Referrer and the context, the scopes, `path = ::leaker::mod`,
-/// and `, strict`.
+/// Input of `__nested_apply!`: the Referrer and the context, the scopes, and `path = ::leaker::mod`.
 struct Apply {
     result: LeakerResult,
     context: ContextId,
     nested: Nested,
     path: Path,
-    strict: bool,
 }
 
 impl Parse for Apply {
@@ -222,16 +220,11 @@ impl Parse for Apply {
         keyword(input, "path")?;
         input.parse::<Token![=]>()?;
         let path = Path::parse_mod_style(input)?;
-        let strict = input.parse::<Option<Token![,]>>()?.is_some() && {
-            keyword(input, "strict")?;
-            true
-        };
         Ok(Self {
             result,
             context,
             nested,
             path,
-            strict,
         })
     }
 }
@@ -258,9 +251,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         context,
         nested,
         path,
-        strict,
     } = parse2(input)?;
-    // A Referrer that trusts every crate keeps the optional entries as written.
     let referrer = result.into_referrer();
     let id = nested.id;
     let krate = path
@@ -289,10 +280,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     };
     let error = std::cell::RefCell::new(None);
     referrer
-        .visitor(context, |leaked, ix| {
-            if !strict && !referrer.must(ix) {
-                return leaked;
-            }
+        .visitor(context, |_leaked, ix| {
             let args = referrer.entry_args(ix, &UseSite::identity(), array_const);
             match args {
                 Ok(args) => slots.projection(&parse_quote!(()), &args, id, ix),

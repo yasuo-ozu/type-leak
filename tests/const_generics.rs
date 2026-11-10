@@ -20,8 +20,7 @@ fn leak(item: &ItemTrait) -> (Referrer, ContextId) {
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
         .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+        .map(|(ty, context)| (ty, &context.generics))
         .map(|(ty, generics)| {
             let wc = &generics.where_clause;
             (quote!(#ty).to_string(), quote!(#generics #wc).to_string())
@@ -128,8 +127,7 @@ fn test_local_generics_leaked() {
     let referrer = leaker.result().finish().unwrap();
     let actual: BTreeSet<(String, String)> = referrer
         .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+        .map(|(ty, context)| (ty, &context.generics))
         .map(|(ty, generics)| {
             let wc = &generics.where_clause;
             (quote!(#ty).to_string(), quote!(#generics #wc).to_string())
@@ -172,8 +170,7 @@ fn test_local_generics_keep_self() {
     let referrer = leaker.result().finish().unwrap();
     let (ty, generics) = referrer
         .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+        .map(|(ty, context)| (ty, &context.generics))
         .next()
         .unwrap();
     assert_eq!(quote!(#ty).to_string(), quote!(MyWrap<T>).to_string());
@@ -315,7 +312,6 @@ fn test_binder_in_type() {
             parse_quote!(<L>)
         )]
     );
-    assert!(referrer.must(0));
     assert_eq!(
         rewrite(referrer, context, item.clone()),
         expected(parse_quote! {

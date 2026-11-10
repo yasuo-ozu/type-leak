@@ -12,9 +12,9 @@
 //!
 //! whose trait and self type are resolved by name, so only their arguments are leaked:
 //! `Leaker::enter_impl(&generics, &self_ty, None, allow_self, |view| { view.visit_path_arguments(..) .. })`.
-//! If the Referrer has a required entry, it emits the marker type, the Repeater's implementation of
-//! each required entry (`ImplSelf::Marker(&marker)` for an entry where `Referrer::needs_self()` is
-//! false, and `ImplSelf::Param(&ident)` for one where it is true), a witness for each type argument,
+//! It emits the marker type, the Repeater's implementation of each entry (`ImplSelf::Marker(&marker)`
+//! for an entry that names no `Self`, nor do its generics, and `ImplSelf::Param(&ident)` for the
+//! others), a witness for each type argument,
 //! and the exported `macro_rules! __scope_apply_7001`, which carries the Referrer and the top-level
 //! context.
 //!
@@ -58,8 +58,9 @@ struct ScopeInput {
     allow_self: bool,
     primitive: bool,
     prelude: bool,
-    /// Emit the Repeater's implementation of the optional entries too (for a strict Referrer).
-    all: bool,
+    /// The Leaker allows the absolute paths (`Rules::external_crates()`): a type of another crate is
+    /// no entry, and the copy writes it as it is.
+    external: bool,
     scope: Scope,
     /// The name of the const of `scope_errors!`.
     name: Option<Ident>,
@@ -74,7 +75,7 @@ impl Parse for ScopeInput {
             allow_self: false,
             primitive: true,
             prelude: false,
-            all: false,
+            external: false,
             scope: Scope::Impl,
             name: None,
             item: parse_quote!(impl A for B {}),
@@ -89,7 +90,7 @@ impl Parse for ScopeInput {
                 "allow_self" => parsed.allow_self = input.parse::<LitBool>()?.value,
                 "primitive" => parsed.primitive = input.parse::<LitBool>()?.value,
                 "prelude" => parsed.prelude = input.parse::<LitBool>()?.value,
-                "all" => parsed.all = input.parse::<LitBool>()?.value,
+                "external" => parsed.external = input.parse::<LitBool>()?.value,
                 "scope" => {
                     let scope: Ident = input.parse()?;
                     parsed.scope = match scope.to_string().as_str() {
@@ -158,6 +159,9 @@ impl ScopeInput {
         if self.prelude {
             config = config.prelude();
         }
+        if self.external {
+            config = config.external_crates();
+        }
         self.analyze_with(config)
     }
 
@@ -187,8 +191,8 @@ impl ScopeInput {
     fn pairs(&self) -> TokenStream {
         let (id, marker) = (self.id, &self.marker);
         let (allow_self, primitive, prelude) = (self.allow_self, self.primitive, self.prelude);
-        let all = self.all;
-        quote!(id = #id, marker = #marker, allow_self = #allow_self, primitive = #primitive, prelude = #prelude, all = #all,)
+        let external = self.external;
+        quote!(id = #id, marker = #marker, allow_self = #allow_self, primitive = #primitive, prelude = #prelude, external = #external,)
     }
 }
 
@@ -222,21 +226,13 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let repeater: Path = parse_quote!(crate::Repeater);
     let slots = RepeaterSlots::new(repeater.clone());
 
-    // The Repeater's implementation of each required entry, as `coinduction` writes them: only if
-    // there is one (`required()`). An optional entry (the type of another crate) needs none
-    // unless a strict Referrer replaces it (`all = true`).
-    let wanted: Vec<usize> = if input.all {
-        (0..referrer.iter().count()).collect()
-    } else if referrer.required().next().is_some() {
-        referrer.required().map(|(ix, _)| ix).collect()
-    } else {
-        Vec::new()
-    };
+    // The Repeater's implementation of each entry, as `coinduction` writes them.
+    let wanted: Vec<usize> = (0..referrer.iter().count()).collect();
     let mut impls = TokenStream::new();
     // The head of each impl, as text, for the tests.
     let mut heads: Vec<String> = Vec::new();
     for &ix in &wanted {
-        let target = if referrer.needs_self(ix) {
+        let target = if referrer.bucket_self(ix, *id).is_none() {
             // The entry, or its generics, name `Self`: the impl is for the self type, or for a
             // parameter bounded by the trait.
             ImplSelf::Param(&self_param)
@@ -244,7 +240,7 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
             // The impl is for the marker.
             ImplSelf::Marker(&marker_ty)
         };
-        crate::check_plain(&referrer, ix, &slots)?;
+        crate::check_bucket_self(&referrer, ix, *id, &slots)?;
         let r = referrer
             .repeater_impl(ix, target, slots.const_fn())
             .map_err(Error::from)?;
@@ -272,10 +268,9 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     }
 
     let report = format!(
-        "{}|entries={} required={} impls={} types={}",
+        "{}|entries={} impls={} types={}",
         id,
         referrer.iter().count(),
-        referrer.required().count(),
         n_impls,
         types.len()
     );
@@ -355,7 +350,6 @@ struct ApplyInput {
     context: ContextId,
     scope: ScopeInput,
     path: Path,
-    strict: bool,
 }
 
 impl Parse for ApplyInput {
@@ -378,19 +372,11 @@ impl Parse for ApplyInput {
         }
         input.parse::<Token![=]>()?;
         let path = Path::parse_mod_style(input)?;
-        let strict = input.parse::<Option<Token![,]>>()?.is_some() && {
-            let keyword: Ident = input.parse()?;
-            if keyword != "strict" {
-                return Err(Error::new(keyword.span(), "expected `strict`"));
-            }
-            true
-        };
         Ok(Self {
             result,
             context,
             scope,
             path,
-            strict,
         })
     }
 }
@@ -417,11 +403,8 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         context,
         scope,
         path,
-        strict,
     } = parse2(input)?;
-    // A Referrer that trusts every crate keeps the optional entries as written.
     let referrer = result.into_referrer();
-    let keeps = |ix: usize| !strict && !referrer.must(ix);
     let krate = path
         .segments
         .first()
@@ -454,7 +437,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     let error = std::cell::RefCell::new(None);
     let project = |self_ty: Option<&Type>, ix: usize| -> Type {
         let result = (|| -> Result<Type> {
-            let owner: Type = if referrer.needs_self(ix) {
+            let owner: Type = if referrer.bucket_self(ix, id).is_none() {
                 self_ty
                     .cloned()
                     .ok_or_else(|| Error::new(Span::call_site(), "the self type names `Self`"))?
@@ -473,21 +456,9 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
 
     // The self type first, as `Self` of an entry is written with it.
     referrer
-        .visitor(context, |leaked, ix| {
-            if keeps(ix) {
-                leaked
-            } else {
-                project(None, ix)
-            }
-        })
+        .visitor(context, |_leaked, ix| project(None, ix))
         .visit_type_mut(&mut self_ty);
-    let mut visitor = referrer.visitor(context, |leaked, ix| {
-        if keeps(ix) {
-            leaked
-        } else {
-            project(Some(&self_ty), ix)
-        }
-    });
+    let mut visitor = referrer.visitor(context, |_leaked, ix| project(Some(&self_ty), ix));
     let mut types = types;
     for ty in &mut types {
         visitor.visit_type_mut(ty);

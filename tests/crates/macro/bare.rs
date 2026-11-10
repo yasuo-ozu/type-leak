@@ -275,16 +275,12 @@ fn generics_text(generics: &Generics, only_relaxed_sized: bool) -> String {
 /// What a Referrer is made of, one line per entry, sorted, with the traits spelled bare (the
 /// entries of two spellings of an item are compared with it).
 fn summary(referrer: &Referrer, only_relaxed_sized: bool) -> Vec<String> {
-    let mut lines: Vec<String> = (0..referrer.iter().count())
-        .map(|ix| {
-            let ty = absolute_text(
-                &referrer.iter().nth(ix).unwrap().clone(),
-                only_relaxed_sized,
-                |v, t| v.visit_type_mut(t),
-            );
-            let context = referrer.context(ix);
-            let generics = generics_text(referrer.context_generics(context), only_relaxed_sized);
-            let self_text = match referrer.context_self(context) {
+    let mut lines: Vec<String> = referrer
+        .iter()
+        .map(|(ty, context)| {
+            let ty = absolute_text(&ty.clone(), only_relaxed_sized, |v, t| v.visit_type_mut(t));
+            let generics = generics_text(&context.generics, only_relaxed_sized);
+            let self_text = match context.self_ty.as_ref() {
                 None => "-".to_string(),
                 Some(SelfRequirement::Bound(path)) => format!("bound {}", quote!(#path)),
                 Some(SelfRequirement::Type(ty)) => {
@@ -294,13 +290,12 @@ fn summary(referrer: &Referrer, only_relaxed_sized: bool) -> Vec<String> {
                 Some(_) => "other".to_string(),
             };
             bare_text(&format!(
-                "{} | must={} | {} | self={} | outlives={} | module={}",
+                "{} | {} | self={} | outlives={} | module={}",
                 quote!(#ty),
-                referrer.must(ix),
                 generics,
                 self_text,
-                referrer.context_self_outlives(context).len(),
-                referrer.context_module(context).is_some(),
+                context.self_outlives.len(),
+                crate::in_module(context).is_some(),
             ))
         })
         .collect();

@@ -17,7 +17,7 @@ fn add(graph: &mut TypeGraph, ty: &str, parent: Option<&NodeKey>) -> NodeKey {
 }
 
 /// A type that depends on the context, and may be an entry.
-fn must(graph: &mut TypeGraph, ty: &str, parent: Option<&NodeKey>) -> NodeKey {
+fn depends(graph: &mut TypeGraph, ty: &str, parent: Option<&NodeKey>) -> NodeKey {
     let key = add(graph, ty, parent);
     graph.must_intern.insert(key.clone());
     graph.required_candidates.insert(key.clone());
@@ -28,8 +28,8 @@ fn must(graph: &mut TypeGraph, ty: &str, parent: Option<&NodeKey>) -> NodeKey {
 fn tuple(graph: &mut TypeGraph, parent: Option<&NodeKey>) -> NodeKey {
     let tuple = add(graph, "(R1, R2)", parent);
     graph.required_candidates.insert(tuple.clone());
-    must(graph, "R1", Some(&tuple));
-    must(graph, "R2", Some(&tuple));
+    depends(graph, "R1", Some(&tuple));
+    depends(graph, "R2", Some(&tuple));
     tuple
 }
 
@@ -90,7 +90,7 @@ fn reducing_a_reduced_graph_changes_nothing() {
     tuple(&mut graph, None);
     external(&mut graph, "::ext::X", None);
     let w = external(&mut graph, "::ext::W<R3>", None);
-    must(&mut graph, "R3", Some(&w));
+    depends(&mut graph, "R3", Some(&w));
     let (required, optional) = reduce(&graph);
     let once = TypeGraph::kept(required, optional);
     assert!(once.is_reduced());
@@ -107,7 +107,7 @@ fn reducing_a_reduced_graph_changes_nothing() {
 fn a_kept_required_entry_stays_when_a_later_scope_forbids_it() {
     let mut later = TypeGraph::default();
     let t = tuple(&mut later, None);
-    later.no_required.insert(t);
+    later.no_entry.insert(t);
     // Alone, the later scope has the parts as the entries.
     assert_eq!(entries(&later).0, ["R1", "R2"]);
     let mut graph = pruned();
@@ -115,11 +115,12 @@ fn a_kept_required_entry_stays_when_a_later_scope_forbids_it() {
     assert_eq!(entries(&graph).0, ["(R1 , R2)"]);
 }
 
+/// The same for a kept optional entry: the later scope forbids it as the optional entry it is.
 #[test]
 fn a_kept_optional_entry_stays_when_a_later_scope_forbids_it() {
     let mut later = TypeGraph::default();
     let x = external(&mut later, "::ext::X", None);
-    later.no_optional.insert(x);
+    later.no_entry.insert(x);
     assert_eq!(entries(&later), (strings(&[]), strings(&[])));
     let mut graph = pruned();
     graph.merge(later);
@@ -134,8 +135,8 @@ fn a_kept_entry_stays_when_a_later_type_holds_it() {
     let parent = add(&mut later, "((R1, R2), R3)", None);
     later.required_candidates.insert(parent.clone());
     let t = tuple(&mut later, Some(&parent));
-    later.no_required.insert(t);
-    must(&mut later, "R3", Some(&parent));
+    later.no_entry.insert(t);
+    depends(&mut later, "R3", Some(&parent));
     // Alone, the later scope has the parent as the one entry. With the kept tuple, which it does
     // not replace, it has `R3` and the tuple: more entries, as one reduction at the end has fewer.
     assert_eq!(entries(&later).0, ["((R1 , R2) , R3)"]);
@@ -152,7 +153,7 @@ fn a_kept_entry_stays_when_a_later_type_holds_it() {
 fn a_kept_optional_entry_becomes_required_when_it_holds_a_required_type() {
     let mut later = TypeGraph::default();
     let x = external(&mut later, "::ext::X", None);
-    must(&mut later, "R", Some(&x));
+    depends(&mut later, "R", Some(&x));
     later.required_candidates.insert(x);
     let mut graph = pruned();
     graph.merge(later);

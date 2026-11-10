@@ -17,7 +17,7 @@
 //! ```
 //!
 //! The generics each leaked type uses (those of the trait and those of its methods, see
-//! [`Referrer::context_generics()`]) are encoded into the Repeater's trait arguments with
+//! [`Context::generics`]) are encoded into the Repeater's trait arguments with
 //! [`RepeaterSlots`], so the Repeater (defined by [`repeater_definition()`]) is the only item
 //! shared by the Leaker and the Referrer. The lifetime bounds in them (`T: 'a`) are encoded too
 //! (`&'a T`), so the Repeater's implementations declare the generics without them
@@ -52,7 +52,7 @@ struct LeakArgs {
     helper: Path,
     repeater: Path,
     module: Path,
-    /// An external crate which the Leaker allows (`allow = ::std`), whose types are not optional
+    /// An external crate which the Leaker allows (`allow = ::std`), whose types are no
     /// entries.
     allow: Option<Path>,
 }
@@ -141,51 +141,34 @@ fn param_as_arg(param: &GenericParam) -> TokenStream {
     }
 }
 
-/// Checks `Referrer::is_plain()` of the `ix`-th entry against what the impl needs: an entry is
-/// plain if and only if its impl for a marker type declares nothing (no generics, no where clause,
-/// no argument, no module) and does not need `Self`. And checks that `Referrer::needs_self()` is
-/// true exactly where that impl fails with `EncodeError::NeedsSelf`.
-pub(crate) fn check_plain(referrer: &Referrer, ix: usize, slots: &RepeaterSlots) -> Result<()> {
+/// Checks that `Referrer::bucket_self()` of the `ix`-th entry is `None` exactly where the impl for
+/// a marker type fails with `EncodeError::NeedsSelf`.
+pub(crate) fn check_bucket_self(
+    referrer: &Referrer,
+    ix: usize,
+    id: u64,
+    slots: &RepeaterSlots,
+) -> Result<()> {
     let marker: Type = parse_quote!(__Marker);
     let r = referrer.repeater_impl(ix, ImplSelf::Marker(&marker), slots.const_fn());
-    let ty = referrer.iter().nth(ix).unwrap();
-    let needs_self = referrer.needs_self(ix);
-    if matches!(r, Err(EncodeError::NeedsSelf(_))) != needs_self {
+    let ty = referrer.iter().nth(ix).unwrap().0;
+    let no_bucket = referrer.bucket_self(ix, id).is_none();
+    if matches!(r, Err(EncodeError::NeedsSelf(_))) != no_bucket {
         return Err(Error::new(
             Span::call_site(),
             format!(
-                "`Referrer::needs_self({})` is {}, but `NeedsSelf` of the impl for a marker is not: {}",
+                "`Referrer::bucket_self({}, {})` is {}, but `NeedsSelf` of the impl for a marker is not: {}",
                 ix,
-                needs_self,
+                id,
+                if no_bucket { "None" } else { "a type" },
                 quote!(#ty)
             ),
         ));
     }
-    let needs_nothing = match r {
-        Ok(r) => {
-            let predicates = r.generics.where_clause.iter().flat_map(|w| &w.predicates);
-            r.generics.params.is_empty()
-                && predicates.count() == 0
-                && r.args == parse_quote!(())
-                && r.module.is_none()
-        }
-        // The entry needs `Self` (`Referrer::needs_self()`).
-        Err(EncodeError::NeedsSelf(_)) => false,
-        Err(e) => return Err(e.into()),
-    };
-    if referrer.is_plain(ix) == needs_nothing {
-        return Ok(());
+    match r {
+        Err(EncodeError::NeedsSelf(_)) | Ok(_) => Ok(()),
+        Err(e) => Err(e.into()),
     }
-    Err(Error::new(
-        Span::call_site(),
-        format!(
-            "`Referrer::is_plain({})` is {}, but the impl for a marker needs {}: {}",
-            ix,
-            referrer.is_plain(ix),
-            if needs_nothing { "nothing" } else { "more" },
-            quote!(#ty)
-        ),
-    ))
 }
 
 /// The rule that allows the paths that start with one of `prefixes` (`Cause::starts_with()`): a
@@ -405,7 +388,7 @@ pub fn __read_referrer(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
 
 /// Input of `check_leak!`: `{ expected } { config } item`.
 struct CheckLeakInput {
-    /// The leaked types (an optional entry is preceded by `?`), or the message of the error.
+    /// The leaked types, or the message of the error.
     expected: std::result::Result<Vec<String>, String>,
     /// The paths allowed by the config (`allow = ::foo`).
     allowed: Vec<Path>,
@@ -415,6 +398,27 @@ struct CheckLeakInput {
 /// Prints a type as `to_string()` does, after parsing, so that the spacing is normalized.
 fn type_string(ty: &Type) -> String {
     quote!(#ty).to_string()
+}
+
+/// The module that a context is in: `Some` for a context of an entry that depends on one.
+pub(crate) fn in_module(context: &Context) -> Option<ContextId> {
+    match &context.module {
+        Some(ModuleScope::In(module)) => Some(*module),
+        _ => None,
+    }
+}
+
+/// The context of the `ix`-th entry.
+pub(crate) fn entry_context(referrer: &Referrer, ix: usize) -> &Context {
+    referrer.iter().nth(ix).unwrap().1
+}
+
+/// The path of a module from its root (`ModuleScope::Itself::path`).
+pub(crate) fn module_path(referrer: &Referrer, module: ContextId) -> Option<&[Ident]> {
+    match &referrer.get_context(module).module {
+        Some(ModuleScope::Itself { path, .. }) => path.as_deref(),
+        _ => None,
+    }
 }
 
 impl Parse for CheckLeakInput {
@@ -433,9 +437,8 @@ impl Parse for CheckLeakInput {
                 }
                 let mut types = Vec::new();
                 while !input.is_empty() {
-                    let optional = input.parse::<Option<Token![?]>>()?.is_some();
                     let ty: Type = input.parse()?;
-                    types.push(entry_string(&ty, !optional));
+                    types.push(type_string(&ty));
                     let _: Option<Token![,]> = input.parse()?;
                 }
                 Ok(Ok(types))
@@ -467,28 +470,18 @@ impl Parse for CheckLeakInput {
     }
 }
 
-/// Prints an entry: the type, preceded by `? ` if it is optional.
-fn entry_string(ty: &Type, must: bool) -> String {
-    if must {
-        type_string(ty)
-    } else {
-        format!("? {}", type_string(ty))
-    }
-}
-
 /// Checks the leaked types (or the error) of the Leaker for an item, which may contain real
 /// `$crate` tokens when invoked from a `macro_rules!`:
 ///
 /// ```ignore
 /// check_leak! {
-///     { Rel, ? ::foo::X, Other<u8> }         // the leaked types, sorted, or `error: "message"`
+///     { Rel, ::foo::X, Other<u8> }           // the leaked types, sorted, or `error: "message"`
 ///     { allow = ::bar }                      // the config (`Rules::primitive` is always set)
 ///     trait Tr { fn f(&self) -> $crate::m::Wrap<Rel>; } // a trait, a struct or a module
 /// }
 /// ```
 ///
-/// The optional entries (see `Referrer::must()`) are preceded by `?`. It expands to nothing if the
-/// result is as expected, and to a `compile_error!` otherwise.
+/// It expands to nothing if the result is as expected, and to a `compile_error!` otherwise.
 #[proc_macro]
 pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let CheckLeakInput {
@@ -510,11 +503,7 @@ pub fn check_leak(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     };
     let got: std::result::Result<Vec<String>, String> = match leaker.result().finish() {
         Ok(referrer) => {
-            let mut types: Vec<String> = referrer
-                .iter()
-                .enumerate()
-                .map(|(ix, ty)| entry_string(ty, referrer.must(ix)))
-                .collect();
+            let mut types: Vec<String> = referrer.iter().map(|(ty, _)| type_string(ty)).collect();
             types.sort();
             Ok(types)
         }
@@ -586,7 +575,7 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
         let r = referrer
             .repeater_impl(ix, ImplSelf::Param(&self_param), slots.const_fn())
             .map_err(Error::from)?;
-        check_plain(&referrer, ix, &slots)?;
+        check_bucket_self(&referrer, ix, id, &slots)?;
         let (impl_generics, _, where_clause) = r.generics.split_for_impl();
         let (self_ty, ty) = (&r.self_ty, &r.ty);
         let trait_path = slots.trait_path(&r.args, id, ix);
@@ -645,15 +634,6 @@ struct Header {
     id: LitInt,
     repeater: Path,
     module: Path,
-    /// A Referrer that trusts every crate: it keeps the optional entries as written (its
-    /// `type_fn` returns the leaked type). `strict` replaces them as well.
-    keeps_optional: bool,
-}
-
-/// Whether a Referrer keeps the entry `ix` as written: it trusts every crate (`keeps_optional`),
-/// and the entry is optional.
-fn keeps(referrer: &Referrer, keeps_optional: bool, ix: usize) -> bool {
-    keeps_optional && !referrer.must(ix)
 }
 
 /// `copy [SelfTy] { items }`: the items written with the types of the Leaker (even a free function
@@ -661,8 +641,7 @@ fn keeps(referrer: &Referrer, keeps_optional: bool, ix: usize) -> bool {
 /// rewritten.
 ///
 /// `show NAME [SelfTy] { items }` does not emit the copies, but `pub const NAME: &str`, which holds
-/// their tokens, so that a test can tell what a Referrer wrote (e.g. one that trusts no crate from
-/// one that trusts them all).
+/// their tokens, so that a test can tell what a Referrer wrote.
 struct CopyInput {
     header: Header,
     /// The name of the const of `show`.
@@ -678,7 +657,6 @@ struct ImplementInput {
     id: LitInt,
     repeater: Path,
     module: Path,
-    keeps_optional: bool,
     generics: Generics,
     trait_args: AngleBracketedGenericArguments,
     self_ty: Type,
@@ -707,14 +685,6 @@ impl Parse for Input {
         let id = braced_parse(input)?;
         let repeater = braced_parse::<Path>(input)?;
         let module = braced_parse::<Path>(input)?;
-        // `strict` is a Referrer that trusts no name of a crate: it replaces the optional entries as
-        // well. Else it trusts them all and keeps them as written.
-        let keeps_optional = if input.peek(Ident) && input.fork().parse::<Ident>()? == "strict" {
-            input.parse::<Ident>()?;
-            false
-        } else {
-            true
-        };
         let header = Header {
             item_trait,
             referrer: result.into_referrer(),
@@ -722,7 +692,6 @@ impl Parse for Input {
             id,
             repeater,
             module,
-            keeps_optional,
         };
         if input.peek(Ident) && !input.peek(Token![impl]) {
             let keyword: Ident = input.parse()?;
@@ -764,7 +733,6 @@ impl Parse for Input {
             id,
             repeater,
             module,
-            keeps_optional,
         } = header;
         input.parse::<Token![impl]>()?;
         let mut generics: Generics = input.parse()?;
@@ -806,7 +774,6 @@ impl Parse for Input {
             id,
             repeater,
             module,
-            keeps_optional,
             generics,
             trait_args,
             self_ty,
@@ -956,7 +923,6 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
                 context,
                 id,
                 repeater,
-                keeps_optional,
                 ..
             },
         show,
@@ -975,10 +941,7 @@ fn copy_impl(input: CopyInput) -> Result<TokenStream> {
     let mut copies = TokenStream::new();
     for mut item in items {
         // `Self` is what the context says: the implementor of the trait.
-        let mut visitor = referrer.visitor(context, |leaked, ix| {
-            if keeps(&referrer, keeps_optional, ix) {
-                return leaked;
-            }
+        let mut visitor = referrer.visitor(context, |_leaked, ix| {
             let projection = (|| -> Result<Type> {
                 let site =
                     UseSite::substituting(params, &trait_params).with_self(self_in_copy.clone());
@@ -1020,7 +983,6 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         id,
         repeater,
         module,
-        keeps_optional,
         generics,
         trait_args,
         self_ty,
@@ -1052,13 +1014,9 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
     // are encoded as in the Leaker.
     let mut encode_error = None;
     let completed = referrer
-        .complete_args(context, params, &trait_args.args, |leaked, ix, prefix| {
+        .complete_args(context, params, &trait_args.args, |_leaked, ix, prefix| {
             let before: Punctuated<GenericParam, Token![,]> =
                 params.iter().take(prefix.len()).cloned().collect();
-            // A default kept as written is not substituted again: write it at the site.
-            if keeps(&referrer, keeps_optional, ix) {
-                return UseSite::substituting(&before, prefix).substitute(&leaked);
-            }
             projection(ix, &before, prefix).unwrap_or_else(|e| {
                 encode_error = Some(e);
                 parse_quote!(())
@@ -1119,13 +1077,8 @@ fn implement_impl(input: ImplementInput) -> Result<TokenStream> {
         let mut sig = trait_fn.sig.clone();
         // The context of the trait says what `Self` is (the implementor) and which generics are in
         // scope.
-        let mut visitor = referrer.visitor(context, |leaked, ix| {
-            if keeps(&referrer, keeps_optional, ix) {
-                leaked
-            } else {
-                parse_quote!(__TypeLeakTestPlaceholder<#ix>)
-            }
-        });
+        let mut visitor =
+            referrer.visitor(context, |_leaked, ix| parse_quote!(__TypeLeakTestPlaceholder<#ix>));
         visitor.visit_signature_mut(&mut sig);
         substitute.visit_signature_mut(&mut sig);
         Resolve {

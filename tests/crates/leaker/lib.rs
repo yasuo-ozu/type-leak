@@ -668,14 +668,14 @@ macro_rules! check_dollar_crate {
             { }
             trait N4<const N: $crate::m::Idx> { fn a(&self) -> [u8; $crate::m::LEN]; }
         }
-        // An absolute path of an external crate is an optional entry, unless it is allowed.
+        // An absolute path of an external crate is an entry, unless it is allowed.
         check_leak! {
             { }
             { allow = ::foo }
             trait E1 { fn f(&self) -> ::foo::X; }
         }
         check_leak! {
-            { ? ::foo::X }
+            { ::foo::X }
             { }
             trait E2 { fn f(&self) -> ::foo::X; }
         }
@@ -723,10 +723,10 @@ mod dollar_crate_checks {
 #[doc(hidden)]
 pub use type_leak_test_ext as __ext;
 
-/// Types of a crate which the Referrer's crate has no dependency on: they are optional entries
-/// (`::type_leak_test_ext::Ext<..>`), which a strict Referrer replaces with the Repeater's
-/// projections, so the copy does not name the crate; a trusting one leaves them as written, and its
-/// copy is no use in a crate without the dependency (the module `trusting` of
+/// Types of a crate which the Referrer's crate has no dependency on (`::type_leak_test_ext::Ext<..>`):
+/// the Leaker makes entries of them, which the copy replaces with the Repeater's projections, so
+/// that it does not name the crate; with a Leaker that allows the crate (`ExtDepAllowed`) they are no
+/// entries, and the copy is no use in a crate without the dependency (the module `trusting` of
 /// `tests/diagnostic.rs`).
 pub mod x {
     use type_leak_test_macro::leak;
@@ -741,11 +741,32 @@ pub mod x {
         module = crate::x,
     )]
     pub trait ExtDep {
-        /// An external type with a relative one in it: one required entry, which every Referrer
-        /// replaces whole.
+        /// An external type with a relative one in it: one entry, which the copy replaces whole.
         fn wrapped(&self) -> ::type_leak_test_ext::Ext<(RelX,)>;
-        /// An external type without any relative one: an optional entry only.
+        /// An external type without any relative one: an entry too.
         fn plain(&self, x: ::type_leak_test_ext::Ext<u8>) -> u8;
+    }
+
+    /// The same for a Leaker that allows the crate: its types are no entries, so the copy names
+    /// the crate (and the relative type in it is replaced).
+    #[leak(
+        helper = crate::__macro,
+        repeater = crate::Repeater,
+        module = crate::x,
+        allow = ::type_leak_test_ext,
+    )]
+    pub trait ExtDepAllowed {
+        fn wrapped(&self) -> ::type_leak_test_ext::Ext<(RelX,)>;
+        fn plain(&self, x: ::type_leak_test_ext::Ext<u8>) -> u8;
+    }
+
+    impl ExtDepAllowed for Inner {
+        fn wrapped(&self) -> ::type_leak_test_ext::Ext<(RelX,)> {
+            ::type_leak_test_ext::Ext((RelX(21),))
+        }
+        fn plain(&self, x: ::type_leak_test_ext::Ext<u8>) -> u8 {
+            x.0 + 1
+        }
     }
 
     impl ExtDep for Inner {
@@ -801,26 +822,25 @@ pub mod scoped {
         impl crate::scoped::Tr<Rel2, Rel3> for crate::scoped::Holder<Rel2, Rel3> {}
     }
 
-    // An absolute path of another crate is an optional entry: no `Rel` is in it, so there is no
-    // required entry at all, and `required()` is empty: the macro emits no impl (the report
-    // says `impls=0`). A Referrer which does not replace it needs none.
+    // An absolute path of another crate is an entry: the macro emits its impl (the report says
+    // `entries=1 impls=1`), and the copy replaces it, so that the Referrer's crate needs no
+    // dependency on the crate of the type.
     scope_leak! {
         id = 7004, marker = M7004,
         impl crate::scoped::Tr<::type_leak_test_ext::Ext<u8>, u8> for crate::scoped::Holder<u8, u8> {}
     }
 
-    // The same with the impl of the optional entry (`all = true`), for a strict Referrer, whose
-    // crate has no dependency on the crate of the type.
+    // The same next to a type that depends on the context: two entries and two impls.
     impl Tr<::type_leak_test_ext::Ext<u8>, Rel<u8>> for Holder<u8, u8> {}
     scope_leak! {
-        id = 7005, marker = M7005, all = true,
+        id = 7005, marker = M7005,
         impl crate::scoped::Tr<::type_leak_test_ext::Ext<u8>, Rel<u8>> for crate::scoped::Holder<u8, u8> {}
     }
 
-    // Without `all`, a required entry next to an optional one gets the impl of the required one
-    // only (`required()`).
+    // With a Leaker that allows the absolute paths (`external = true`), the type of the other crate
+    // is no entry: only `Rel<u8>` gets an impl, and the copy writes the other as it is.
     scope_leak! {
-        id = 7007, marker = M7007,
+        id = 7007, marker = M7007, external = true,
         impl crate::scoped::Tr<::type_leak_test_ext::Ext<u8>, Rel<u8>> for crate::scoped::Holder<u8, u8> {}
     }
 
@@ -951,7 +971,7 @@ pub mod kinds {
     where
         ::std::vec::Vec<T>: ::core::clone::Clone;
 
-    #[prop_leak(id = 9005, allow_self = false)]
+    #[prop_leak(id = 9005, allow_self = false, allow = "::std")]
     pub struct Needs<T>
     where
         ::std::vec::Vec<T>: ::core::clone::Clone,
@@ -1298,12 +1318,11 @@ pub mod kinds {
     // Items nested in a module that name their own `Self` in an absolute type of a crate that both
     // crates have (`::type_leak_test_leaker`, `::std`). Such a type is no entry: it is copied as
     // written, and `Self` in it is the copy's own type, also for a Referrer that replaces the
-    // optional entries (`strict`). The relative types beside it are entries.
+    // entries. The relative types beside it are entries.
 
     /// A bound that names `Self`, an absolute type that names it too, and a relative type that uses
-    /// the generic (`Wrap<T>`, for any type that the bound holds for). The Referrer replaces the
-    /// optional entries.
-    #[prop_leak(id = 9121, allow_self = true, scope = "mod", prelude = true, strict = true)]
+    /// the generic (`Wrap<T>`, for any type that the bound holds for).
+    #[prop_leak(id = 9121, allow_self = true, scope = "mod", prelude = true)]
     pub struct Pathed<T: AsRef<Self>> {
         pub path: ::type_leak_test_leaker::kinds::Pair<::core::marker::PhantomData<Self>, T>,
         pub wrapped: Wrap<T>,
@@ -1311,22 +1330,14 @@ pub mod kinds {
     }
 
     /// A recursive type: `Self` in a box.
-    #[prop_leak(id = 9122, allow_self = true, scope = "mod", prelude = true, strict = true)]
+    #[prop_leak(id = 9122, allow_self = true, scope = "mod", prelude = true)]
     pub struct List {
         pub next: Option<::std::boxed::Box<Self>>,
         pub rel: Rel,
     }
 
-    /// The same as `Pathed`, for a Referrer that trusts the names of the crates.
-    #[prop_leak(id = 9123, allow_self = true, scope = "mod", prelude = true, strict = false)]
-    pub struct PathedTrusting<T: AsRef<Self>> {
-        pub path: ::type_leak_test_leaker::kinds::Pair<::core::marker::PhantomData<Self>, T>,
-        pub wrapped: Wrap<T>,
-        pub rel: Rel,
-    }
-
-    /// An enum, strict, with `Self` in a box in a vector, and in a pair next to a relative type.
-    #[prop_leak(id = 9124, allow_self = true, scope = "mod", prelude = true, strict = true)]
+    /// An enum with `Self` in a box in a vector, and in a pair next to a relative type.
+    #[prop_leak(id = 9124, allow_self = true, scope = "mod", prelude = true)]
     pub enum Tree<T> {
         Leaf(Rel),
         Branch(Vec<::std::boxed::Box<Self>>),
@@ -1361,10 +1372,10 @@ pub mod kinds {
     /// The marker type of `MarkerDefault`.
     pub struct Marker9210;
 
-    /// The impls of the entries where `Referrer::needs_self()` is false are for a marker type of
+    /// The impls of the entries that name no `Self`, nor do their generics, are for a marker type of
     /// this crate (`ImplSelf::Marker`; `marker = ..`), not a primitive type. The trait is the item
     /// itself (not nested in a module), so its default `Defd<T>` does not name `Self` while the
-    /// bound of `T` does (`context_self()` is `None`): the entry is for the implementor of the
+    /// bound of `T` does (`Context::self_ty` is `None`): the entry is for the implementor of the
     /// trait, which is the host in the copy. For the marker it would bound `T: AsRef<Marker9210>`,
     /// which the types that the Referrer's crate uses for `T` do not satisfy
     /// (`impl MarkerDefaultCopy<Owner9210> for Host9210`, E0277).
@@ -1394,7 +1405,6 @@ pub mod kinds {
         allow_self = true,
         scope = "mod",
         prelude = true,
-        strict = true,
         redeclare = true
     )]
     pub trait SelfDefaults<T: AsRef<Self>, U = Defd<T>, V = Defd2<Rel, T>> {
@@ -1490,7 +1500,7 @@ pub mod kinds {
     }
 
     /// The same for a strict Referrer, which replaces the alias too: its entry has no cycle.
-    #[prop_leak(id = 9172, allow_self = false, prelude = true, strict = true)]
+    #[prop_leak(id = 9172, allow_self = false, prelude = true)]
     pub trait AliasItemStrict<T: Iterator<Item = u8>>
     where
         T: Fn(::type_leak_test_leaker::kinds::WIt<T>),
@@ -2117,7 +2127,7 @@ pub mod kinds {
     /// The same where an optional entry is on the way to the lifetime: `Wrap<Held<'b>>` of this
     /// crate by its own name is replaced by a strict Referrer unless it is the only one that keeps
     /// `'b` constrained, and then it is written as it is, with `Held<'b>` in it.
-    #[prop_leak_accept(id = 9222, allow_self = true, prelude = true, strict = true)]
+    #[prop_leak_accept(id = 9222, allow_self = true, prelude = true)]
     pub trait NestedOptionalLifetime {
         fn f<'b>(
             &self,
@@ -2240,7 +2250,7 @@ pub mod kinds {
     /// `Self::A0` is resolved by the impl of the host, whose predicate must be the one of the
     /// trait. So the optional entries in the predicate stay as written, as they do beside
     /// `Y: Into<Self::A0>` (E0277 "expected an `Fn(&Wrap<..>)` closure, found `T`" otherwise).
-    #[prop_leak_accept(id = 9207, allow_self = true, prelude = true, strict = true)]
+    #[prop_leak_accept(id = 9207, allow_self = true, prelude = true)]
     pub trait OptionalNextToError<T>
     where
         T: ::core::ops::Fn(

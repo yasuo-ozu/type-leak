@@ -1,6 +1,6 @@
-//! Tests for the types with the absolute path of an external crate (`::foo::X`), which are optional
-//! entries of the Referrer: `Rules::or_if()`, `Referrer::must()`,
-//! `Referrer::external_crates_require()`, and a `type_fn` that keeps an optional entry as written.
+//! Tests for the types with the absolute path of an external crate (`::foo::X`), which are entries of
+//! the Referrer unless the Leaker's rule allows them: `Rules::or_if()`, `Rules::std_crates()` and
+//! `Rules::external_crates()`.
 
 mod common;
 
@@ -43,81 +43,32 @@ fn squash(tokens: impl template_quote::ToTokens) -> String {
     tokens.to_token_stream().to_string().replace(' ', "")
 }
 
-/// Returns the leaked types with `must` and the required crates.
-fn entries(referrer: &Referrer) -> Vec<(String, bool, Vec<String>)> {
-    referrer
-        .iter()
-        .enumerate()
-        .map(|(ix, ty)| {
-            (
-                squash(quote!(#ty)),
-                referrer.must(ix),
-                referrer.external_crates_require(ix).to_vec(),
-            )
-        })
+/// Returns the leaked types.
+fn entries(referrer: &Referrer) -> Vec<String> {
+    common::types(referrer)
+        .map(|ty| squash(quote!(#ty)))
         .collect()
 }
 
-fn entries_of(item: ItemTrait) -> Vec<(String, bool, Vec<String>)> {
+fn entries_of(item: ItemTrait) -> Vec<String> {
     let mut leaker = leaker();
     leaker.intern_trait(&item, true);
     entries(&leaker.result().finish().unwrap())
 }
 
-fn crates(names: &[&str]) -> Vec<String> {
-    names.iter().map(|s| s.to_string()).collect()
-}
-
-fn entry(ty: &str, must: bool, names: &[&str]) -> (String, bool, Vec<String>) {
-    (ty.to_string(), must, crates(names))
-}
-
-/// `Referrer::external_crates_require()`: an entry that names `Self` where the self type is an
-/// external type (`::ext::W`) requires that crate: the entry `Rel<Self>` is replaced by a Referrer
-/// that has `::ext` too, as `Self` is `::ext::W` there. Audit mutant `x_crates_self_off` (the
-/// crates of the self type are not counted for an entry that names `Self`).
-#[test]
-fn an_entry_that_names_self_requires_the_crates_of_the_self_type() {
-    let item: ItemImpl = parse_quote!(
-        impl ::p::Tr for ::ext::W {
-            fn f(&self, x: Rel<Self>) {}
-        }
-    );
-    let mut analyzer = leaker();
-    analyzer.intern_impl(&item, true);
-    let referrer = analyzer.result().finish().unwrap();
-    assert_eq!(
-        entries(&referrer),
-        vec![
-            entry("Rel<Self>", true, &["ext"]),
-            entry("::ext::W", false, &["ext"])
-        ]
-    );
-    // Without `Self` in the entry, no crate is needed.
-    let item: ItemImpl = parse_quote!(
-        impl ::p::Tr for ::ext::W {
-            fn f(&self, x: Rel) {}
-        }
-    );
-    let mut analyzer = leaker();
-    analyzer.intern_impl(&item, true);
-    assert_eq!(
-        entries(&analyzer.result().finish().unwrap()),
-        vec![entry("Rel", true, &[]), entry("::ext::W", false, &["ext"])]
-    );
+fn entry(ty: &str) -> String {
+    ty.to_string()
 }
 
 #[test]
-fn absolute_types_are_optional_entries_by_default() {
-    // Old: nothing was leaked by default (`allow_external_crates` was `true`), and the type was
-    // an optional entry only with it unset. New: always an optional entry, as the Referrer's
-    // crate may not mean the same crate by the name `foo`.
+fn absolute_types_are_entries_by_default() {
+    // The Referrer's crate may not mean the same crate by the name `foo`.
     let item: ItemTrait = parse_quote!(
         trait T {
             fn f(&self) -> ::foo::X;
         }
     );
-    assert_eq!(entries_of(item), vec![entry("::foo::X", false, &["foo"])]);
+    assert_eq!(entries_of(item), vec![entry("::foo::X")]);
     // The types in a tuple (which one entry covers), behind a pointer, in a path of `::core`.
     let item: ItemTrait = parse_quote!(
         trait T {
@@ -132,9 +83,9 @@ fn absolute_types_are_optional_entries_by_default() {
     assert_eq!(
         entries_of(item),
         vec![
-            entry("(::a::A,&'static::b::B)", false, &["a", "b"]),
-            entry("::c::C", false, &["c"]),
-            entry("::d::D", false, &["d"]),
+            entry("(::a::A,&'static::b::B)"),
+            entry("::c::C"),
+            entry("::d::D"),
         ]
     );
 }
@@ -143,8 +94,8 @@ fn absolute_types_are_optional_entries_by_default() {
 fn absolute_paths_which_are_not_types_are_copied() {
     // A trait bound, a value and the type of a const parameter cannot be leaked, so they are
     // copied as they are (old: with `allow_external_crates` unset, `NotPortable`; by default the
-    // same, with nothing leaked). The types in the other positions are optional entries, also a
-    // path in the length of an array (`[u8; ::foo::N]`).
+    // same, with nothing leaked). The types in the other positions are entries, also a path in
+    // the length of an array (`[u8; ::foo::N]`).
     let item: ItemTrait = parse_quote! {
         trait T<const N: ::foo::Idx, U: ::foo::Tr = ::foo::D> : ::foo::Sup where u8: ::foo::Tr {
             fn f(&self, a: [u8; ::foo::N]) -> ::foo::X;
@@ -154,10 +105,10 @@ fn absolute_paths_which_are_not_types_are_copied() {
     assert_eq!(
         entries_of(item),
         vec![
-            entry("::foo::D", false, &["foo"]),
-            entry("::foo::X", false, &["foo"]),
-            entry("::foo::Y", false, &["foo"]),
-            entry("[u8;::foo::N]", false, &["foo"]),
+            entry("::foo::D"),
+            entry("::foo::X"),
+            entry("::foo::Y"),
+            entry("[u8;::foo::N]"),
         ]
     );
 }
@@ -171,7 +122,7 @@ fn core_is_never_a_node() {
         }
     );
     let entries = entries_of(item);
-    assert_eq!(entries, vec![entry("Rel", true, &[])]);
+    assert_eq!(entries, vec![entry("Rel")]);
     // `check()` agrees.
     let mut leaker = leaker();
     let ty: Type = parse_quote!(::core::option::Option<(Rel,)>);
@@ -186,10 +137,7 @@ fn core_is_never_a_node() {
             fn f(&self) -> ::corelike::X;
         }
     );
-    assert_eq!(
-        entries_of(item),
-        vec![entry("::corelike::X", false, &["corelike"])]
-    );
+    assert_eq!(entries_of(item), vec![entry("::corelike::X")]);
 }
 
 #[test]
@@ -204,8 +152,8 @@ fn std_and_alloc_are_nodes() {
     assert_eq!(
         entries_of(item),
         vec![
-            entry("::alloc::string::String", false, &["alloc"]),
-            entry("::std::vec::Vec<u8>", false, &["std"]),
+            entry("::alloc::string::String"),
+            entry("::std::vec::Vec<u8>"),
         ]
     );
     // Unless they are allowed.
@@ -219,7 +167,7 @@ fn std_and_alloc_are_nodes() {
     leaker.intern_trait(&item, true);
     assert_eq!(
         entries(&leaker.result().finish().unwrap()),
-        vec![entry("Rel", true, &[])]
+        vec![entry("Rel")]
     );
 }
 
@@ -236,11 +184,7 @@ fn allowed_absolute_path_is_never_a_node() {
     leaker.intern_trait(&item, true);
     assert_eq!(
         entries(&leaker.result().finish().unwrap()),
-        vec![
-            entry("Rel", true, &[]),
-            entry("foo::Z", true, &[]),
-            entry("::foobar::Y", false, &["foobar"]),
-        ]
+        vec![entry("Rel"), entry("foo::Z"), entry("::foobar::Y"),]
     );
     // An allowed relative path allows the relative paths only: an absolute one is a node.
     let config = Rules::new().or_if(starts_with(parse_quote!(my)));
@@ -253,7 +197,7 @@ fn allowed_absolute_path_is_never_a_node() {
     leaker.intern_trait(&item, true);
     assert_eq!(
         entries(&leaker.result().finish().unwrap()),
-        vec![entry("::my::Y", false, &["my"])]
+        vec![entry("::my::Y")]
     );
     // The more specific path may be allowed alone.
     let config = Rules::new().or_if(starts_with(parse_quote!(::foo::inner)));
@@ -266,7 +210,7 @@ fn allowed_absolute_path_is_never_a_node() {
     leaker.intern_trait(&item, true);
     assert_eq!(
         entries(&leaker.result().finish().unwrap()),
-        vec![entry("::foo::Y", false, &["foo"])]
+        vec![entry("::foo::Y")]
     );
     // `check()` of the same.
     let ty: Type = parse_quote!(::foo::W<(Rel,)>);
@@ -283,19 +227,17 @@ fn allowed_absolute_path_is_never_a_node() {
 }
 
 #[test]
-fn the_context_of_an_optional_entry_is_that_of_its_generics() {
-    // The bound of a local generic is copied with the type using it, so it requires its crates.
+fn absolute_paths_in_the_bounds_of_a_generic_are_no_error() {
+    // The bound of a local generic is copied with the type using it.
     let item: ItemTrait = parse_quote! {
         trait T {
             fn f<U: ::core::convert::Into<::bar::B>>(&self) -> ::foo::W<U>;
         }
     };
-    let entries = entries_of(item);
-    assert_eq!(entries.len(), 2);
-    assert!(entries.iter().all(|e| !e.1));
-    let find = |ty: &str| entries.iter().find(|e| e.0 == ty).unwrap().2.clone();
-    assert_eq!(find("::bar::B"), crates(&["bar"]));
-    assert_eq!(find("::foo::W<U>"), crates(&["bar", "foo"]));
+    assert_eq!(
+        entries_of(item),
+        vec![entry("::bar::B"), entry("::foo::W<U>")]
+    );
 
     // A bound with a path to an external crate is not an error (old, with
     // `allow_external_crates` unset: `NotPortable`), it is copied as it is.
@@ -304,85 +246,55 @@ fn the_context_of_an_optional_entry_is_that_of_its_generics() {
             fn f<U: ::bar::B>(&self) -> ::foo::W<U>;
         }
     };
-    assert_eq!(
-        entries_of(item),
-        vec![entry("::foo::W<U>", false, &["bar", "foo"])]
-    );
+    assert_eq!(entries_of(item), vec![entry("::foo::W<U>")]);
 }
 
 #[test]
-fn crates_are_sorted_and_deduplicated() {
-    let item: ItemTrait = parse_quote!(
-        trait T {
-            fn f(&self) -> (::z::A, ::a::B, ::z::C<::a::D>);
-        }
-    );
-    let entries = entries_of(item);
-    assert!(entries.iter().all(|(_, _, c)| !c.is_empty()));
-    let all: std::collections::BTreeSet<_> = entries.iter().flat_map(|e| e.2.clone()).collect();
-    assert_eq!(all.into_iter().collect::<Vec<_>>(), crates(&["a", "z"]));
-    // One cut covers the tuple (all the three are in it).
+fn one_cut_covers_the_absolute_types_in_an_absolute_type() {
     let item: ItemTrait = parse_quote!(
         trait T {
             fn f(&self) -> ::z::C<::a::D, ::z::A>;
         }
     );
-    assert_eq!(
-        entries_of(item),
-        vec![entry("::z::C<::a::D,::z::A>", false, &["a", "z"])]
-    );
+    assert_eq!(entries_of(item), vec![entry("::z::C<::a::D,::z::A>")]);
 }
 
 #[test]
-fn type_macros_are_required() {
-    // A type macro is a cause itself, so it is required, which names crates.
+fn a_type_macro_is_one_entry() {
+    // A type macro is a cause itself, so it is an entry as a whole.
     let item: ItemTrait = parse_quote!(
         trait T {
             fn f(&self) -> m!(::foo::X, ::core::Y);
         }
     );
-    let entries = entries_of(item);
-    assert_eq!(entries.len(), 1);
-    assert!(entries[0].1);
-    assert_eq!(entries[0].2, crates(&["foo"]));
+    assert_eq!(entries_of(item), vec![entry("m!(::foo::X,::core::Y)")]);
 }
 
 #[test]
 fn an_absolute_type_with_a_relative_type_in_it() {
-    // One cut chooses the entries: `::foo::W<(Rel,)>` has `Rel` in it, so it is the only entry
-    // and it is required, whether the Referrer trusts the name of the crate or not. (It was `Rel`
-    // and the optional entry `::foo::W<(Rel,)>`, which a Referrer that trusts the crate left,
-    // replacing `Rel` in it.)
+    // One cut chooses the entries: `::foo::W<(Rel,)>` has `Rel` in it, so it is the only entry.
+    // (It was `Rel` and the optional entry `::foo::W<(Rel,)>`.)
     let item: ItemTrait = parse_quote!(
         trait T {
             fn f(&self) -> ::foo::W<(Rel,)>;
         }
     );
-    assert_eq!(
-        entries_of(item),
-        vec![entry("::foo::W<(Rel,)>", true, &["foo"])]
-    );
+    assert_eq!(entries_of(item), vec![entry("::foo::W<(Rel,)>")]);
     // A bare identifier in it may be a const, which cannot be leaked alone, so the type is leaked
-    // as a whole (as it is without the crate, and in either case it is required).
+    // as a whole (as it is without the crate).
     let item: ItemTrait = parse_quote!(
         trait T {
             fn f(&self) -> ::foo::W<Rel>;
         }
     );
-    assert_eq!(
-        entries_of(item),
-        vec![entry("::foo::W<Rel>", true, &["foo"])]
-    );
-    // A required entry with an absolute path in it is the only one, which names the crate.
+    assert_eq!(entries_of(item), vec![entry("::foo::W<Rel>")]);
+    // A required entry with an absolute path in it is the only one.
     let item: ItemTrait = parse_quote!(
         trait T {
             fn f(&self) -> Rel<::foo::X>;
         }
     );
-    assert_eq!(
-        entries_of(item),
-        vec![entry("Rel<::foo::X>", true, &["foo"])]
-    );
+    assert_eq!(entries_of(item), vec![entry("Rel<::foo::X>")]);
     // An absolute type which is covered by a required entry is not an entry, and a type that holds
     // both is one entry: the tuple is cheaper than its parts.
     let item: ItemTrait = parse_quote!(
@@ -391,26 +303,20 @@ fn an_absolute_type_with_a_relative_type_in_it() {
             fn g(&self) -> (Rel, ::foo::X);
         }
     );
-    assert_eq!(
-        entries_of(item),
-        vec![entry("(Rel,::foo::X)", true, &["foo"])]
-    );
-    // Beside each other, they keep their kinds.
+    assert_eq!(entries_of(item), vec![entry("(Rel,::foo::X)")]);
+    // Beside each other, they are two entries, the one that depends on the context first.
     let item: ItemTrait = parse_quote!(
         trait T {
             fn f(&self, a: Rel, b: ::foo::X);
         }
     );
-    assert_eq!(
-        entries_of(item),
-        vec![entry("Rel", true, &[]), entry("::foo::X", false, &["foo"])]
-    );
+    assert_eq!(entries_of(item), vec![entry("Rel"), entry("::foo::X")]);
 }
 
 #[test]
 fn a_type_which_cannot_be_leaked_is_not_an_error() {
     // An elided lifetime and `impl Trait` cannot be leaked, which is not an error for a type
-    // which is only an optional entry: it is copied as it is (the Referrer may not replace it).
+    // which is only a type of another crate: it is copied as it is.
     let item: ItemTrait = parse_quote!(
         trait T {
             fn f(&self) -> ::foo::W<'_>;
@@ -420,10 +326,7 @@ fn a_type_which_cannot_be_leaked_is_not_an_error() {
     );
     assert_eq!(
         entries_of(item),
-        vec![
-            entry("::foo::X", false, &["foo"]),
-            entry("::foo::Y", false, &["foo"]),
-        ]
+        vec![entry("::foo::X"), entry("::foo::Y"),]
     );
     // The relative one is, as before.
     let item: ItemTrait = parse_quote!(
@@ -442,15 +345,26 @@ fn a_type_which_cannot_be_leaked_is_not_an_error() {
 /// Entries of the same item with all the crates allowed (a Leaker with no external crates), and
 /// those of the default Leaker: one cut chooses the entries, so the types of the crates only merge
 /// the entries of the Leaker that allows them (an entry with a type of a crate in it takes the
-/// place of the entries in it), and add the optional ones.
-fn optional_entries_only_merge_the_required_ones(item: ItemTrait, allowed: &[&str]) {
+/// place of the entries in it), and add the types of the crates.
+fn the_default_leaker_merges_the_entries_of_the_one_that_allows_the_crates(
+    item: ItemTrait,
+    allowed: &[&str],
+) {
+    // Whether an entry names one of the crates by an absolute path.
+    let names_crate = |entry: &str| {
+        allowed
+            .iter()
+            .any(|name| entry.contains(&format!("::{}", name)))
+    };
     let mut leaker = leaker();
     leaker.intern_trait(&item, true);
     let default = leaker.result().finish().unwrap();
     let mut leaker = leaker_allowing(allowed);
     leaker.intern_trait(&item, true);
     let reference = leaker.result().finish().unwrap();
-    let text = |referrer: &Referrer, ix: usize| squash(quote!(#{referrer.iter().nth(ix).unwrap()}));
+    let text = |referrer: &Referrer, ix: usize| {
+        squash(quote!(#{common::types(referrer).nth(ix).unwrap()}))
+    };
     let default_entries: Vec<String> = (0..default.iter().count())
         .map(|ix| text(&default, ix))
         .collect();
@@ -466,30 +380,20 @@ fn optional_entries_only_merge_the_required_ones(item: ItemTrait, allowed: &[&st
             default_entries
         );
     }
-    // An entry of the default Leaker that the other has not names a crate, and the entries which
-    // are required and have no crate are the same.
-    for (ix, entry) in default_entries.iter().enumerate() {
-        let found = reference.iter().any(|ty| squash(quote!(#ty)) == *entry);
+    // An entry of the default Leaker that the other has not names a crate.
+    for entry in &default_entries {
+        let found = common::types(&reference).any(|ty| squash(quote!(#ty)) == *entry);
         assert!(
-            found || !default.external_crates_require(ix).is_empty(),
+            found || names_crate(entry),
             "`{}` of {}",
             entry,
             quote!(#item)
         );
-        if default.external_crates_require(ix).is_empty() {
-            assert!(default.must(ix), "{}", quote!(#item));
-        }
-    }
-    // The required entries come first, then the optional ones.
-    let mut seen_optional = false;
-    for ix in 0..default.iter().count() {
-        assert!(!(seen_optional && default.must(ix)), "{}", quote!(#item));
-        seen_optional |= !default.must(ix);
     }
 }
 
 #[test]
-fn optional_entries_only_merge_the_required_ones_of_the_leaker_that_allows_the_crates() {
+fn the_types_of_crates_only_merge_the_entries_of_the_leaker_that_allows_the_crates() {
     let items: Vec<ItemTrait> = vec![
         // A cut which covers several types at once is the same with or without the crate.
         parse_quote!(
@@ -539,7 +443,10 @@ fn optional_entries_only_merge_the_required_ones_of_the_leaker_that_allows_the_c
         ),
     ];
     for item in items {
-        optional_entries_only_merge_the_required_ones(item, &["foo", "bar"]);
+        the_default_leaker_merges_the_entries_of_the_one_that_allows_the_crates(
+            item,
+            &["foo", "bar"],
+        );
     }
 }
 
@@ -561,82 +468,21 @@ fn expand(referrer: &Referrer, context: ContextId, ty: Type) -> String {
     quote!(#ty).to_string()
 }
 
-/// Whether a macro that trusts the crates `names` keeps the entry `ix` as written: it is optional
-/// and requires no other crate.
-fn keeps(referrer: &Referrer, names: &[&str], ix: usize) -> bool {
-    !referrer.must(ix)
-        && referrer
-            .external_crates_require(ix)
-            .iter()
-            .all(|name| names.contains(&name.as_str()))
-}
-
-/// The `type_fn` of a macro that trusts the crates `names`: it returns the leaked type of an
-/// optional entry that requires no other crate, and `P<ix>` for the others.
-fn keeping<'a>(referrer: &'a Referrer, names: &'a [&'a str]) -> impl Fn(Type, usize) -> Type + 'a {
-    move |ty, ix| {
-        if keeps(referrer, names, ix) {
-            ty
-        } else {
-            parse_quote!(P<#ix>)
-        }
-    }
-}
-
-/// `ty` as the Referrer expands it for a macro that trusts the crates `names`.
-fn expand_keeping(referrer: &Referrer, context: ContextId, names: &[&str], ty: Type) -> String {
-    let ty = referrer.expand(context, ty, keeping(referrer, names));
-    quote!(#ty).to_string()
-}
-
-/// The result and the top-level context of a trait with the optional entries `::a::X` and `::b::Y`
-/// in the signature of one method each (and so in the context of no generic).
-fn result_with_two_crates() -> (LeakerResult, ContextId) {
-    let item: ItemTrait = parse_quote! {
-        trait T {
-            fn f(&self, a: ::a::X) -> Rel;
-            fn g(&self, b: ::b::Y);
-        }
-    };
-    let mut leaker = leaker();
-    let context = leaker.intern_trait(&item, true);
-    (leaker.result(), context)
-}
-
 /// The index of the entry `ty`.
 fn index_of(referrer: &Referrer, ty: &str) -> usize {
-    referrer
-        .iter()
+    common::types(referrer)
         .position(|t| squash(quote!(#t)) == ty)
         .unwrap_or_else(|| panic!("no entry `{}`", ty))
 }
 
-/// Whether a macro that trusts the crates `names` replaces `ty` (an entry) by `P<ix>`, or leaves
-/// it as written.
-fn replaces(referrer: &Referrer, context: ContextId, names: &[&str], ty: &str) -> bool {
-    let written: Type = parse_str(ty).unwrap();
-    let expanded = expand_keeping(referrer, context, names, written.clone());
-    let ix = index_of(referrer, &squash(quote!(#written)));
-    if expanded == format!("P < {}usize >", ix) {
-        true
-    } else {
-        assert_eq!(expanded, quote!(#written).to_string());
-        false
-    }
-}
-
-/// The Visitor asks `type_fn` for an optional entry as it does for a required one: it replaces
-/// what `type_fn` returns. `allow()` drops errors only: `finish()` and `into_referrer()` give the
-/// Referrer of the result for any rule, also one that allows the crate of an optional entry, and
-/// chained.
+/// `allow()` drops errors only: `finish()` and `into_referrer()` give the Referrer of the result for
+/// any rule, also one that allows the crate of a type of another crate, and chained.
 #[test]
 fn allow_changes_no_entry_in_the_referrer_of_finish_and_into_referrer() {
     let (result, context) = result_with_foo();
     let plain = result.clone().finish().unwrap();
     let ix_foo = index_of(&plain, "::foo::X");
-    assert!(!plain.must(ix_foo));
     let ix_rel = index_of(&plain, "Rel");
-    assert!(plain.must(ix_rel));
     let results = [
         result.clone(),
         result.clone().allow(Rules::new().external_crates()),
@@ -652,7 +498,7 @@ fn allow_changes_no_entry_in_the_referrer_of_finish_and_into_referrer() {
                 expand(&referrer, context, parse_quote!(::foo::X)),
                 format!("P < {}usize >", ix_foo)
             );
-            // A required entry is replaced either way.
+            // So is the other entry.
             assert_eq!(
                 expand(&referrer, context, parse_quote!(Rel)),
                 format!("P < {}usize >", ix_rel)
@@ -662,9 +508,8 @@ fn allow_changes_no_entry_in_the_referrer_of_finish_and_into_referrer() {
 }
 
 #[test]
-fn a_type_of_a_crate_with_a_required_type_in_it_is_replaced_trusted_or_not() {
-    // `::foo::W<(Rel,)>` is one required entry: a macro replaces it as a whole, also if it trusts
-    // the name of the crate (it was an optional entry that it left, replacing `Rel` in it).
+fn a_type_of_a_crate_with_a_relative_type_in_it_is_replaced_as_a_whole() {
+    // `::foo::W<(Rel,)>` is one entry: a macro replaces it as a whole.
     let item: ItemTrait = parse_quote!(
         trait T {
             fn f(&self) -> ::foo::W<(Rel,)>;
@@ -674,20 +519,17 @@ fn a_type_of_a_crate_with_a_required_type_in_it_is_replaced_trusted_or_not() {
     let context = analyzer.intern_trait(&item, true);
     let referrer = analyzer.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
-    assert!(referrer.must(0));
-    for names in [&["foo"][..], &[][..]] {
-        assert_eq!(
-            expand_keeping(&referrer, context, names, parse_quote!(::foo::W<(Rel,)>)),
-            "P < 0usize >"
-        );
-    }
+    assert_eq!(
+        expand(&referrer, context, parse_quote!(::foo::W<(Rel,)>)),
+        "P < 0usize >"
+    );
     // `Rel` alone is no entry: it is in the other one.
     assert_eq!(
         expand(&referrer, context, parse_quote!(Rel)),
         quote!(Rel).to_string()
     );
-    // An optional entry has no type in it that depends on the context, so a macro that trusts both
-    // crates leaves it as it is, and replaces it as a whole otherwise.
+    // A type with no type in it that depends on the context is an entry as a whole too. A Leaker
+    // that allows the crates finds none, so the copy writes it as it is.
     let item: ItemTrait = parse_quote!(
         trait T {
             fn f(&self) -> ::foo::W<::bar::X>;
@@ -696,33 +538,25 @@ fn a_type_of_a_crate_with_a_required_type_in_it_is_replaced_trusted_or_not() {
     let mut analyzer = leaker();
     let context = analyzer.intern_trait(&item, true);
     let referrer = analyzer.result().finish().unwrap();
-    assert!(!referrer.must(0));
     assert_eq!(
-        expand_keeping(
-            &referrer,
-            context,
-            &["foo", "bar"],
-            parse_quote!(::foo::W<::bar::X>)
-        ),
-        ":: foo :: W < :: bar :: X >"
-    );
-    assert_eq!(
-        expand_keeping(
-            &referrer,
-            context,
-            &["foo"],
-            parse_quote!(::foo::W<::bar::X>)
-        ),
+        expand(&referrer, context, parse_quote!(::foo::W<::bar::X>)),
         "P < 0usize >"
+    );
+    let mut analyzer = leaker_allowing(&["foo", "bar"]);
+    let context = analyzer.intern_trait(&item, true);
+    let referrer = analyzer.result().finish().unwrap();
+    assert!(referrer.is_empty());
+    assert_eq!(
+        expand(&referrer, context, parse_quote!(::foo::W<::bar::X>)),
+        ":: foo :: W < :: bar :: X >"
     );
 }
 
-/// The type of a crate that has a relative type in it is a required entry, so the Referrer finds it
-/// in the scope of the item, and must know what `Self` is there when its context needs `Self`
-/// (`X: Into<Self::A1>`, `Self: 'y`): the top-level context of the trait records it, as it does for
-/// any required entry. The type holds only a type that is leaked alone (`Rel<u8>`), so it is no
-/// candidate of the required entries by its own cause, but an optional type is a candidate of
-/// either kind.
+/// The type of a crate that has a relative type in it is an entry, so the Referrer finds it in the
+/// scope of the item, and must know what `Self` is there when its context needs `Self` (`X:
+/// Into<Self::A1>`, `Self: 'y`): the top-level context of the trait records it, as it does for any
+/// entry. The type holds only a type that is leaked alone (`Rel<u8>`), so it is no candidate by its
+/// own cause, but a type of another crate is a candidate of either kind.
 #[test]
 fn a_type_of_a_crate_that_needs_self_is_replaced_by_the_referrer() {
     let item: ItemTrait = parse_quote!(
@@ -738,36 +572,25 @@ fn a_type_of_a_crate_that_needs_self_is_replaced_by_the_referrer() {
     );
     let mut analyzer = leaker();
     let context = analyzer.intern_trait(&item, true);
-    let result = analyzer.result();
-    // A macro that keeps the optional entries as written, and one that keeps none: the entries are
-    // required, so both replace them.
-    for trusting in [true, false] {
-        let referrer = result.clone().finish().unwrap();
-        assert!(referrer.required().count() == 2 && referrer.iter().count() == 2);
-        assert!(referrer.context_self(context).is_some());
-        let mut copy = item.clone();
-        referrer
-            .visitor(context, |ty, ix| {
-                if trusting && !referrer.must(ix) {
-                    ty
-                } else {
-                    parse_quote!(P<#ix>)
-                }
-            })
-            .visit_item_trait_mut(&mut copy);
-        let expected: ItemTrait = parse_quote!(
-            trait T {
-                type A1;
-                fn m<'x, X: 'x>(&self, a: P<0usize>)
-                where
-                    X: ::core::convert::Into<Self::A1>;
-                fn n<'y>(&self, b: P<1usize>)
-                where
-                    Self: 'y;
-            }
-        );
-        assert_eq!(squash(&copy), squash(&expected), "trusting {}", trusting);
-    }
+    let referrer = analyzer.result().finish().unwrap();
+    assert_eq!(referrer.iter().count(), 2);
+    assert!(referrer.get_context(context).self_ty.is_some());
+    let mut copy = item.clone();
+    referrer
+        .visitor(context, |_, ix| parse_quote!(P<#ix>))
+        .visit_item_trait_mut(&mut copy);
+    let expected: ItemTrait = parse_quote!(
+        trait T {
+            type A1;
+            fn m<'x, X: 'x>(&self, a: P<0usize>)
+            where
+                X: ::core::convert::Into<Self::A1>;
+            fn n<'y>(&self, b: P<1usize>)
+            where
+                Self: 'y;
+        }
+    );
+    assert_eq!(squash(&copy), squash(&expected));
 }
 
 #[test]
@@ -780,13 +603,23 @@ fn referrer_visitor_keeps_what_type_fn_returns() {
     let mut replaced = item.clone();
     let (result, context) = result_with_foo();
     let referrer = result.finish().unwrap();
+    let foo = index_of(&referrer, "::foo::X");
     referrer
-        .visitor(context, keeping(&referrer, &["foo"]))
+        .visitor(
+            context,
+            |ty, ix| {
+                if ix == foo {
+                    ty
+                } else {
+                    parse_quote!(P<#ix>)
+                }
+            },
+        )
         .visit_item_trait_mut(&mut item);
     let s = quote!(#item).to_string();
     assert!(s.contains(":: foo :: X"), "{}", s);
     assert!(s.contains("P <"), "{}", s);
-    // A `type_fn` that keeps nothing replaces both.
+    // A `type_fn` that returns `P<ix>` replaces both.
     referrer
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
         .visit_item_trait_mut(&mut replaced);
@@ -796,7 +629,7 @@ fn referrer_visitor_keeps_what_type_fn_returns() {
 }
 
 /// A Referrer, and the result read back from its tokens, are equal, also those of a result whose
-/// rule allows the crate of an optional entry: `allow()` changes nothing serialized.
+/// rule allows the crate of a type of another crate: `allow()` changes nothing serialized.
 #[test]
 fn a_referrer_and_the_result_read_back_from_its_tokens_are_equal() {
     let (result, context) = result_with_foo();
@@ -864,11 +697,9 @@ fn referrer_serialization_round_trip() {
     let result = leaker.result();
     let referrer = result.clone().finish().unwrap();
     let before = entries(&referrer);
-    assert!(before.iter().any(|e| !e.1 && !e.2.is_empty()));
-    assert!(before.iter().any(|e| e.1));
     let tokens = quote!(#referrer);
     let s = tokens.to_string();
-    assert!(s.contains("? @ [foo] :: foo :: X"), "{}", s);
+    assert!(s.contains(":: foo :: X") && !s.contains('?'), "{}", s);
     let parsed: Referrer = parse2(tokens).unwrap();
     assert_eq!(parsed, referrer);
     assert_eq!(entries(&parsed), before);
@@ -879,12 +710,8 @@ fn referrer_serialization_round_trip() {
     assert_eq!(quote!(#allowed).to_string(), s);
     let parsed: Referrer = parse2(quote!(#allowed)).unwrap();
     assert_eq!(parsed, referrer);
-    // The macro that reads it back decides what to keep, from the crates the entry requires.
+    // The macro that reads it back replaces every entry.
     let ix = index_of(&parsed, "::foo::X");
-    assert_eq!(
-        expand_keeping(&parsed, context, &["foo"], parse_quote!(::foo::X)),
-        ":: foo :: X"
-    );
     assert_eq!(
         expand(&parsed, context, parse_quote!(::foo::X)),
         format!("P < {}usize >", ix),
@@ -898,133 +725,8 @@ fn referrer_serialization_round_trip() {
     assert_eq!(reset, allowed);
 }
 
-/// A macro that trusts crates keeps the optional entries that name only them, and not the others.
-#[test]
-fn a_type_fn_keeps_the_entries_of_the_crates_it_trusts() {
-    let (result, context) = result_with_two_crates();
-    let all = result.finish().unwrap();
-    assert_eq!(
-        entries(&all)
-            .iter()
-            .map(|e| (e.0.as_str(), e.1))
-            .collect::<Vec<_>>(),
-        [("Rel", true), ("::a::X", false), ("::b::Y", false)]
-    );
-    let replaced = |names: &[&str], ty: &str| replaces(&all, context, names, ty);
-    // Nothing is trusted: both are replaced.
-    assert!(replaced(&[], "::a::X") && replaced(&[], "::b::Y"));
-    assert!(!replaced(&["a"], "::a::X"));
-    assert!(replaced(&["a"], "::b::Y"));
-    assert!(replaced(&["b"], "::a::X"));
-    assert!(!replaced(&["b"], "::b::Y"));
-    assert!(!replaced(&["a", "b"], "::a::X") && !replaced(&["a", "b"], "::b::Y"));
-    // A required entry is never kept, whatever is trusted.
-    assert!(replaced(&["a", "b"], "Rel"));
-    assert_eq!(all.required().count(), 1);
-}
-
-/// The crates of an entry are the crates of all its paths: a crate that a macro trusts does not
-/// make the entry kept if it requires another.
-#[test]
-fn an_entry_that_names_two_crates_is_kept_only_if_both_are_trusted() {
-    let item: ItemTrait = parse_quote!(
-        trait T {
-            fn f(&self, a: (::a::X, ::b::Y));
-            fn g(&self, c: ::c::W);
-        }
-    );
-    let mut leaker = leaker();
-    let context = leaker.intern_trait(&item, true);
-    let referrer = leaker.result().finish().unwrap();
-    // One entry covers the tuple, which names two crates.
-    assert_eq!(
-        entries(&referrer),
-        vec![
-            entry("(::a::X,::b::Y)", false, &["a", "b"]),
-            entry("::c::W", false, &["c"]),
-        ]
-    );
-    let tuple = "(::a::X,::b::Y)";
-    for (trusted, kept) in [
-        (&["a"][..], false),
-        (&["b"][..], false),
-        (&["c"][..], false),
-        (&["a", "b"][..], true),
-        (&["b", "a"][..], true),
-        (&["a", "b", "c"][..], true),
-    ] {
-        assert_eq!(
-            !replaces(&referrer, context, trusted, tuple),
-            kept,
-            "trusted {:?}",
-            trusted
-        );
-        assert_eq!(
-            !replaces(&referrer, context, trusted, "::c::W"),
-            trusted.contains(&"c"),
-            "trusted {:?}",
-            trusted
-        );
-    }
-}
-
-/// The trait `item` with the entries replaced as a macro that trusts the crates `names` does.
-fn trait_copy(referrer: &Referrer, context: ContextId, names: &[&str], item: &ItemTrait) -> String {
-    let mut copy = item.clone();
-    referrer
-        .visitor(context, keeping(referrer, names))
-        .visit_item_trait_mut(&mut copy);
-    quote!(#copy).to_string()
-}
-
-/// The bounds of the context of an entry count: their crates are required too, and an entry whose
-/// bound names a crate that is not trusted is not kept.
-#[test]
-fn a_bound_in_the_context_of_an_entry_requires_its_crate() {
-    let item: ItemTrait = parse_quote! {
-        trait T {
-            fn f<U: ::bar::B>(&self, u: U) -> ::foo::W<U>;
-        }
-    };
-    let mut leaker = leaker();
-    let context = leaker.intern_trait(&item, true);
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(
-        entries(&referrer),
-        vec![entry("::foo::W<U>", false, &["bar", "foo"])]
-    );
-    // Trusting `::foo` is not enough: the bound names `::bar`.
-    let replaced =
-        |names: &[&str]| !trait_copy(&referrer, context, names, &item).contains(":: foo");
-    assert!(replaced(&[]));
-    assert!(replaced(&["foo"]));
-    assert!(replaced(&["bar"]));
-    assert!(!replaced(&["foo", "bar"]));
-}
-
-/// `::core` paths require no crate: a macro that trusts `foo` alone keeps the entries.
-#[test]
-fn core_paths_require_no_crate() {
-    let item: ItemTrait = parse_quote! {
-        trait T {
-            fn f(&self, a: ::foo::W<::core::option::Option<u8>>, b: ::core::result::Result<::foo::X, u8>);
-        }
-    };
-    let mut leaker = leaker();
-    let context = leaker.intern_trait(&item, true);
-    let referrer = leaker.result().finish().unwrap();
-    assert!(!referrer.is_empty());
-    for ix in 0..referrer.iter().count() {
-        assert_eq!(referrer.external_crates_require(ix), ["foo"]);
-        assert!(keeps(&referrer, &["foo"], ix));
-    }
-    let copy = trait_copy(&referrer, context, &["foo"], &item);
-    assert!(!copy.contains("P <"), "{}", copy);
-}
-
 /// `Rules::std_crates()` allows the absolute paths of `std` and `alloc` too: the Leaker makes no
-/// optional entry of them. On a result it changes no entry: a macro that trusts them keeps the
-/// optional entries of those crates.
+/// entry of them. On a result it changes no entry.
 #[test]
 fn std_crates_allows_the_absolute_paths_of_std_and_alloc() {
     let item: ItemTrait = parse_quote!(
@@ -1032,55 +734,36 @@ fn std_crates_allows_the_absolute_paths_of_std_and_alloc() {
             fn f(&self, a: ::std::vec::Vec<u8>, b: ::alloc::string::String, c: ::foo::X) -> Rel;
         }
     );
-    // As a result: the entries of `::std`, `::alloc` and `::foo` are all optional.
+    // As a result: `::std`, `::alloc` and `::foo` all make entries.
     let mut analyzer = leaker();
-    let context = analyzer.intern_trait(&item, true);
+    analyzer.intern_trait(&item, true);
     let result = analyzer.result();
     let plain = result.clone().finish().unwrap();
     assert_eq!(
-        entries(&plain)
-            .iter()
-            .map(|e| (e.0.clone(), e.1))
-            .collect::<Vec<_>>(),
+        entries(&plain),
         [
-            ("Rel".to_string(), true),
-            ("::alloc::string::String".to_string(), false),
-            ("::foo::X".to_string(), false),
-            ("::std::vec::Vec<u8>".to_string(), false),
+            entry("Rel"),
+            entry("::alloc::string::String"),
+            entry("::foo::X"),
+            entry("::std::vec::Vec<u8>"),
         ]
     );
     // The rule changes no entry.
     let allowed = result.allow(Rules::new().std_crates()).finish().unwrap();
     assert_eq!(allowed, plain);
-    // A macro that trusts `std` and `alloc` keeps their entries, and not `::foo`.
-    let names = ["std", "alloc"];
-    assert!(!replaces(&allowed, context, &names, "::std::vec::Vec<u8>"));
-    assert!(!replaces(
-        &allowed,
-        context,
-        &names,
-        "::alloc::string::String"
-    ));
-    assert!(replaces(&allowed, context, &names, "::foo::X"));
-    // One that trusts none replaces them all.
-    assert!(replaces(&allowed, context, &[], "::std::vec::Vec<u8>"));
-    assert!(replaces(&allowed, context, &[], "::alloc::string::String"));
     // In the Leaker: they are no entries, and the others are.
     let mut analyzer = Leaker::from_config(Rules::new().primitive().std_crates(), Options::new());
     analyzer.intern_trait(&item, true);
     assert_eq!(
-        entries(&analyzer.result().finish().unwrap())
-            .iter()
-            .map(|e| (e.0.clone(), e.1))
-            .collect::<Vec<_>>(),
-        [("Rel".to_string(), true), ("::foo::X".to_string(), false)]
+        entries(&analyzer.result().finish().unwrap()),
+        [entry("Rel"), entry("::foo::X")]
     );
 }
 
-/// `Rules::external_crates()` allows every absolute path: the Leaker makes no optional entry. On a
+/// `Rules::external_crates()` allows every absolute path: the Leaker makes no entry of them. On a
 /// result it changes no entry.
 #[test]
-fn external_crates_makes_no_optional_entry_in_the_leaker() {
+fn external_crates_makes_no_entry_of_a_crate_in_the_leaker() {
     let item: ItemTrait = parse_quote!(
         trait T {
             fn f<U: ::bar::B>(&self, a: ::foo::X, b: ::foo::W<(Rel, U)>, c: [u8; ::n::N]) -> Rel;
@@ -1091,11 +774,8 @@ fn external_crates_makes_no_optional_entry_in_the_leaker() {
     analyzer.intern_trait(&item, true);
     let referrer = analyzer.result().finish().unwrap();
     // The types in the paths are entries, and no absolute path is.
-    assert!(referrer
-        .iter()
-        .all(|ty| !squash(quote!(#ty)).starts_with("::")));
-    assert_eq!(referrer.required().count(), referrer.iter().count());
-    assert!(entries(&referrer).iter().any(|e| e.0 == "Rel"));
+    assert!(common::types(&referrer).all(|ty| !squash(quote!(#ty)).starts_with("::")));
+    assert!(entries(&referrer).iter().any(|e| e == "Rel"));
     // Relative paths are not allowed by it.
     let item: ItemTrait = parse_quote!(
         trait T {
@@ -1110,9 +790,9 @@ fn external_crates_makes_no_optional_entry_in_the_leaker() {
 
 #[test]
 fn referrer_round_trip_keeps_the_indices() {
-    // The required entries come first (so their indices do not depend on the optional ones), and
-    // the optional ones follow, also with several contexts: they are numbered the same by the
-    // Referrer which parses the serialized one.
+    // The entries that depend on the context come first (so their indices do not depend on the
+    // types of other crates), and the others follow, also with several contexts: they are numbered
+    // the same by the Referrer which parses the serialized one.
     let item: ItemTrait = parse_quote! {
         trait T {
             fn a(&self) -> ::z::A;
@@ -1125,18 +805,24 @@ fn referrer_round_trip_keeps_the_indices() {
     leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
     let before = entries(&referrer);
-    let musts: Vec<bool> = before.iter().map(|e| e.1).collect();
-    assert!(musts.iter().any(|m| !m));
-    assert!(musts.windows(2).all(|w| w[0] || !w[1]), "{:?}", before);
-    assert!(referrer.contexts().count() > 2);
+    assert!(common::context_ids(&referrer).len() > 2);
+    // The contexts of the entries are not in ascending order: the later entries are in a context
+    // that an earlier one has.
+    let contexts: Vec<ContextId> = (0..before.len())
+        .map(|ix| common::entry_id(&referrer, ix))
+        .collect();
+    assert!(contexts.windows(2).any(|w| w[0] > w[1]), "{:?}", contexts);
     let parsed: Referrer = parse2(quote!(#referrer)).unwrap();
     assert_eq!(entries(&parsed), before);
     assert_eq!(parsed, referrer);
     for ix in 0..before.len() {
-        assert_eq!(parsed.context(ix), referrer.context(ix));
         assert_eq!(
-            parsed.context_generics(parsed.context(ix)),
-            referrer.context_generics(referrer.context(ix))
+            common::entry_id(&parsed, ix),
+            common::entry_id(&referrer, ix)
+        );
+        assert_eq!(
+            &common::entry(&parsed, ix).generics,
+            &common::entry(&referrer, ix).generics
         );
     }
 }
@@ -1144,21 +830,16 @@ fn referrer_round_trip_keeps_the_indices() {
 #[test]
 fn referrer_plain_entry_syntax() {
     let version = tag();
-    // The required entries come first, whatever order they are written in.
-    let referrer: Referrer =
-        parse2(quote!(#version ([u8; 3], ? @[foo, bar] X<[u8]>, @[a] Y))).unwrap();
+    // The entries keep the order they are written in.
+    let referrer: Referrer = parse2(quote!(#version ([u8; 3], X<[u8]>, Y))).unwrap();
     assert_eq!(
         entries(&referrer),
-        vec![
-            ("[u8;3]".to_string(), true, vec![]),
-            ("Y".to_string(), true, crates(&["a"])),
-            ("X<[u8]>".to_string(), false, crates(&["foo", "bar"])),
-        ]
+        vec![entry("[u8;3]"), entry("X<[u8]>"), entry("Y")]
     );
 }
 
 #[test]
-fn raw_identifier_crates_are_stored_unraw_and_serialized_back() {
+fn raw_identifier_crates_are_serialized_back_and_allowed_by_name() {
     use template_quote::ToTokens;
     let item: ItemTrait = parse_quote! {
         trait T {
@@ -1171,23 +852,20 @@ fn raw_identifier_crates_are_stored_unraw_and_serialized_back() {
     assert_eq!(
         entries(&referrer),
         [
-            entry("::plain::Z", false, &["plain"]),
-            entry("::r#async::X", false, &["async"]),
-            entry("::r#fn::Y", false, &["fn"]),
+            entry("::plain::Z"),
+            entry("::r#async::X"),
+            entry("::r#fn::Y"),
         ]
     );
     // It is serialized with the raw identifiers, and parsed back.
     let tokens = referrer.to_token_stream();
-    assert!(tokens.to_string().contains("@ [r#async]"));
+    assert!(tokens.to_string().contains("r#async"));
     assert_eq!(parse2::<Referrer>(tokens).unwrap(), referrer);
     // Allowed by the Leaker, the crate is not a node, by its name (without `r#`).
     let mut leaker = leaker_allowing(&["r#async"]);
     leaker.intern_trait(&item, true);
     assert_eq!(
         entries(&leaker.result().finish().unwrap()),
-        [
-            entry("::plain::Z", false, &["plain"]),
-            entry("::r#fn::Y", false, &["fn"]),
-        ]
+        [entry("::plain::Z"), entry("::r#fn::Y")]
     );
 }

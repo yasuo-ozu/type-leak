@@ -51,29 +51,12 @@ fn leak_module_with<A: Allow>(config: A, item: &ItemMod) -> std::result::Result<
         .map_err(|e| to_syn_error(&e).to_string())
 }
 
-/// The required leaked types with their generics (and where clause). The optional entries (the
-/// types with the path of an external crate, see `Referrer::must()`) are left out: these tests are
-/// about the required ones, and the optional ones are tested by `optional_entries()`.
+/// The leaked types with their generics (and where clause).
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
         .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
-        .enumerate()
-        .filter(|(ix, _)| referrer.must(*ix))
-        .map(|(_, (ty, generics))| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
-        .collect()
-}
-
-/// The optional leaked types with their generics (and where clause).
-fn optional_entries(referrer: &Referrer) -> Vec<(String, String)> {
-    referrer
-        .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
-        .enumerate()
-        .filter(|(ix, _)| !referrer.must(*ix))
-        .map(|(_, (ty, generics))| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
+        .map(|(ty, context)| (ty, &context.generics))
+        .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
         .collect()
 }
 
@@ -81,9 +64,8 @@ fn optional_entries(referrer: &Referrer) -> Vec<(String, String)> {
 fn modules(referrer: &Referrer) -> Vec<Option<Vec<String>>> {
     (0..referrer.iter().count())
         .map(|ix| {
-            referrer.context_module(referrer.context(ix)).map(|m| {
-                referrer
-                    .module_path(m)
+            common::in_module(common::entry(referrer, ix)).map(|m| {
+                common::module_path(referrer, m)
                     .unwrap()
                     .iter()
                     .map(|i| i.to_string())
@@ -113,7 +95,7 @@ fn self_predicates_are_requirements() {
         )]
     );
     assert!(matches!(
-        referrer.context_self(referrer.context(0)),
+        common::entry(&referrer, 0).self_ty.as_ref(),
         Some(SelfRequirement::Bound(_))
     ));
 
@@ -133,7 +115,7 @@ fn self_predicates_are_requirements() {
     );
     let lifetime: Lifetime = parse_quote!('a);
     assert_eq!(
-        referrer.context_self_outlives(referrer.context(0)),
+        common::entry(&referrer, 0).self_outlives.as_slice(),
         [lifetime]
     );
 
@@ -154,12 +136,11 @@ fn dyn_lifetime_bounds_are_visited() {
             fn f<'a>(&self) -> ::std::boxed::Box<dyn RelTr + 'a>;
         }
     });
-    // The `Box` is a required entry as a whole, with the lifetime among its generics.
+    // The `Box` is an entry as a whole, with the lifetime among its generics.
     assert_eq!(
         entries(&referrer),
         [e(":: std :: boxed :: Box < dyn RelTr + 'a >", "< 'a >")]
     );
-    assert!(optional_entries(&referrer).is_empty());
     // If the Leaker allows the `Box`, only the trait object is leaked.
     let referrer = leak_trait_with(
         config().or_if(starts_with(parse_quote!(::std::boxed::Box))),

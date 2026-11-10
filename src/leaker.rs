@@ -5,8 +5,7 @@ use crate::analysis::{drop_optional, names_self, Analysis, PartItem};
 use crate::analyze::{declared_names, AnalyzeVisitor, Finished, ModuleNames, ScopeSpec, Scopes};
 #[cfg(doc)]
 use crate::context::SelfRequirement;
-use crate::context::{Context, ContextId, Contexts, Gat};
-use crate::crates::external_crates;
+use crate::context::{Context, ContextId, Contexts, Gat, ModuleScope};
 use crate::error::ErrorItem;
 #[cfg(doc)]
 use crate::error::Reason;
@@ -42,8 +41,8 @@ use template_quote::{quote, ToTokens};
 /// let top_level = leaker.intern_trait(&item, true);
 /// let referrer = leaker.result().finish().unwrap();
 /// // `Wrap<T>` and `Rel` depend on where they are written, so each needs a Repeater impl.
-/// assert_eq!(referrer.required().count(), 2);
-/// assert_eq!(referrer.context_generics(top_level).params.len(), 1);
+/// assert_eq!(referrer.iter().count(), 2);
+/// assert_eq!(referrer.get_context(top_level).generics.params.len(), 1);
 /// ```
 ///
 /// # Errors and recovery
@@ -66,11 +65,12 @@ use template_quote::{quote, ToTokens};
 ///
 /// - `MyType<'_>`, `impl Trait`, and a relative trait or value in a bound: write an absolute path
 ///   (`Self: Sized` needs [`Rules::prelude()`](crate::Rules::prelude)).
-/// - An absolute path of another crate (`::foo::X`) is an optional entry: the copy replaces it
-///   through the Repeater unless the macro keeps it as written (the crate is the same on both
-///   sides, see [`Referrer::external_crates_require()`]), or the Leaker's rule allows it and it
-///   makes no entry. With a type that depends on the context in it (`::foo::W<Rel>`) it is
-///   required, and always replaced.
+/// - A type of another crate (`::foo::X`) is an entry, and the copy replaces it through the
+///   Repeater, unless the Leaker's rule allows its path
+///   ([`Rules::external_crates()`](crate::Rules::external_crates)): then it is
+///   no entry, and the copy writes it as it is (you promise that the crate is the same on both
+///   sides). A type that has a type that depends on the context in it (`::foo::W<Rel>`) is always
+///   an entry.
 /// - A shadowed primitive name (`type u8 = i32;`): emit [`Leaker::assertions()`].
 /// - Values and bodies are not analyzed unless [`Options::check_values()`] is on.
 ///
@@ -78,7 +78,7 @@ use template_quote::{quote, ToTokens};
 ///
 /// An entry under `&'a` needs `T: 'a` in its Repeater impl (E0309), and the Leaker records only the
 /// bounds you write: write them (`fn f<'a, T: 'a>(x: Rel<'a, T>)`) and give [`Referrer::visitor()`]
-/// the whole item. For `Self: 'a`, see [`Referrer::context_self_outlives()`].
+/// the whole item. For `Self: 'a`, see `Context::self_outlives`.
 ///
 /// ## Binder lifetimes
 ///
@@ -317,8 +317,8 @@ impl<A: Allow> Leaker<A> {
     /// let mut leaker = Leaker::new();
     /// leaker.intern_trait(&item, true);
     /// let referrer = leaker.result().finish().unwrap();
-    /// let context = referrer.context(0);
-    /// assert!(matches!(referrer.context_self(context), Some(SelfRequirement::Bound(_))));
+    /// let (_, context) = referrer.iter().next().unwrap();
+    /// assert!(matches!(context.self_ty, Some(SelfRequirement::Bound(_))));
     /// ```
     pub fn intern_trait(&mut self, item: &ItemTrait, allow_self: bool) -> ContextId {
         // The scope knows the generic associated types of the trait: what they require is part of
@@ -356,7 +356,7 @@ impl<A: Allow> Leaker<A> {
     /// them first, because a relative path is decided when it is visited. A name counts if it is
     /// declared directly (unless a generic shadows it), named by `self::` or `super::` within the
     /// module, or imported with an absolute path (`use super::X` and `use crate::X` are leaked).
-    /// `hint` is for debugging ([`Referrer::module_hint()`]).
+    /// `hint` is for debugging ([`ModuleScope::Itself`]).
     pub fn enter_mod<R>(
         &mut self,
         hint: impl Display,
@@ -427,8 +427,9 @@ impl<A: Allow> Leaker<A> {
     }
 
     /// Ends the analysis and returns the [`LeakerResult`]: the [`Referrer`] and the errors found.
-    /// Required entries come first, then optional ones ([`Referrer::must()`]), each sorted by
-    /// context (in order of first appearance) and tokens.
+    /// The entries that have a type that depends on the context come first, then those that are
+    /// only a type of another crate (`::foo::X`), each sorted by context (in order of first
+    /// appearance) and tokens.
     pub fn result(mut self) -> LeakerResult {
         let errors = std::mem::take(&mut self.errors);
         LeakerResult {
@@ -460,43 +461,39 @@ impl<A: Allow> Leaker<A> {
                 context_map.entry(id).or_insert_with(|| context_of(id));
             }
         }
+        // The required entries come first, then the optional ones: that is the order of the indices.
         let mut entries = Vec::new();
-        let keys = required.into_iter().map(|key| (key, true));
-        for (key, must) in keys.chain(optional.into_iter().map(|key| (key, false))) {
-            let context = context_map
+        for key in required.into_iter().chain(optional) {
+            context_map
                 .entry(key.context)
                 .or_insert_with(|| context_of(key.context));
-            let crates = external_crates(&key.ty.ty, context);
-            entries.push((key.context, key.ty.ty, must, crates));
+            entries.push((key.context, key.ty.ty));
         }
         // Keep the modules the contexts depend on, and their parents, for nested lookups.
-        let mut modules = BTreeMap::new();
+        let mut seen = HashSet::new();
         let mut pending: Vec<ContextId> = Vec::new();
-        for (id, context) in &context_map {
-            if context.is_module_scope() {
-                pending.push(*id);
-            }
-            pending.extend(context.module());
+        for context in context_map.values() {
+            pending.extend(context.module_id());
         }
         while let Some(module) = pending.pop() {
-            if let Some(info) = contexts.module(module) {
-                if modules.insert(module, info.clone()).is_none() {
-                    context_map
-                        .entry(module)
-                        .or_insert_with(|| context_of(module));
-                    pending.extend(info.parent);
+            if seen.insert(module) {
+                let context = context_map
+                    .entry(module)
+                    .or_insert_with(|| context_of(module));
+                if let Some(ModuleScope::Itself { parent, .. }) = &context.module {
+                    pending.extend(*parent);
                 }
             }
         }
-        Referrer::new(entries, context_map, modules, self.parts)
+        Referrer::new(entries, context_map, self.parts)
     }
 
     /// Chooses the fewest entries from which every leaked type can be built, and removes every
     /// other type from the Leaker; [`Leaker::result()`] calls it. `&'a Rel`, a path with a lifetime
     /// or bare-identifier argument (`Wrap<SIZE>`), a type with a type in an expression
     /// (`[u8; size_of::<Big>()]`) and a trait object are entries as a whole. One choice covers the
-    /// required types and the optional ones ([`Referrer::must()`]): an entry with a required type
-    /// in it is required.
+    /// types that depend on the context and the types of other crates (`::foo::X`): an entry with a
+    /// type that depends on the context in it is of the first kind, and has a smaller index.
     ///
     /// Analyzing more afterwards adds to what is left, and the kept entries stay entries and keep
     /// their kind, so calling it again changes nothing. The price: the result can have more
@@ -553,8 +550,9 @@ impl LeakerResult {
     /// and the array is copied whole. Allowing a [`Reason::UnprovableBound`] does not make the copy
     /// compile (E0277). To allow a cause, compare it with `==` (the same kind and tokens, spans
     /// ignored). An absolute path is never an error, so a rule for `::serde` changes no error. It
-    /// changes no entry either: a copy keeps an optional entry as written in `type_fn`
-    /// ([`Referrer::external_crates_require()`]).
+    /// changes no entry either: to have the copy write a type of another crate as it is, give
+    /// [`Rules::external_crates()`](crate::Rules::external_crates) to
+    /// [`Leaker::from_config()`].
     ///
     /// See [`Allow`] for what the rule is asked. A closure needs `&Cause` and
     /// [`Place`](crate::Place) annotated when it is not written in the call
@@ -714,9 +712,8 @@ impl<A: Allow> Leaker<A> {
 ///
 /// A type is red if it is `must_intern`, or `optional` and may be an entry. The kind of an entry is
 /// what it covers: required if it is or holds a `must_intern` type, else optional. A type is cut
-/// only as a kind it may be: a candidate of the kind, not in `no_required` or `no_optional` (an
-/// optional type is a candidate of both). An optional type that may not be an entry is not red, and
-/// its parts are.
+/// only as the kind it is: a candidate of the kind, not in `no_entry` (an optional type is a
+/// candidate of both). An optional type that may not be an entry is not red, and its parts are.
 ///
 /// An entry that an earlier reduction kept is red and cut whatever else the graph says of it, as
 /// the kind it was kept as (or required, if a type merged in later makes it hold a required type).
@@ -735,12 +732,12 @@ fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
     let flags = |set: &HashSet<NodeKey>| -> Vec<bool> {
         keys.iter().map(|key| set.contains(*key)).collect()
     };
-    let (must, soft, root) = (
+    let (must, soft, root, is_kept) = (
         flags(&types.must_intern),
         flags(&types.optional),
         flags(&types.roots),
+        flags(&types.kept),
     );
-    let (kept_required, kept_optional) = (flags(&types.kept_required), flags(&types.kept_optional));
     let mut parents: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, children) in children.iter().enumerate() {
         for &child in children {
@@ -748,23 +745,21 @@ fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
         }
     }
     // An entry that covers a required type is a required entry.
-    let mut required: Vec<bool> = (0..n).map(|i| must[i] || kept_required[i]).collect();
+    let mut required = must.clone();
     spread(&mut required, &parents);
     // An optional type is an entry anyway, so it is a candidate of either kind.
     let may: Vec<bool> = (0..n)
-        .map(|i| match required[i] {
-            true => {
-                (soft[i] || types.required_candidates.contains(keys[i]))
-                    && !types.no_required.contains(keys[i])
-            }
-            false => {
-                types.optional_candidates.contains(keys[i]) && !types.no_optional.contains(keys[i])
-            }
+        .map(|i| {
+            let candidate = match required[i] {
+                true => soft[i] || types.required_candidates.contains(keys[i]),
+                false => types.optional_candidates.contains(keys[i]),
+            };
+            candidate && !types.no_entry.contains(keys[i])
         })
         .collect();
     // An optional type that cannot be an entry is no entry, and its parts are. A kept entry is one.
     let red: Vec<bool> = (0..n)
-        .map(|i| must[i] || kept_required[i] || kept_optional[i] || (soft[i] && may[i]))
+        .map(|i| must[i] || is_kept[i] || (soft[i] && may[i]))
         .collect();
     // A type that must be an entry cannot be forbidden to be one.
     let forbidden: Vec<bool> = (0..n)
@@ -775,9 +770,7 @@ fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
 
     // A root that must be interned is in every minimum cut, so it is cut without a flow. So is a
     // kept entry, which is a root of the graph it was kept in.
-    let cut: Vec<bool> = (0..n)
-        .map(|i| (red[i] && root[i]) || kept_required[i] || kept_optional[i])
-        .collect();
+    let cut: Vec<bool> = (0..n).map(|i| (red[i] && root[i]) || is_kept[i]).collect();
     let mut kept: Vec<usize> = (0..n).filter(|&i| cut[i]).collect();
 
     // The edges of the network. A parent that its components cannot replace goes to the sink.

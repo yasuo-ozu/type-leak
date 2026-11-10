@@ -41,8 +41,7 @@ fn leak_trait(item: ItemTrait) -> Referrer {
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
         .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+        .map(|(ty, context)| (ty, &context.generics))
         .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
         .collect()
 }
@@ -58,7 +57,7 @@ fn entry(ty: Type, generics: Generics) -> (String, String) {
 /// What `Self` means in each entry, as a string.
 fn selfs(referrer: &Referrer) -> Vec<String> {
     (0..referrer.iter().count())
-        .map(|ix| match referrer.context_self(referrer.context(ix)) {
+        .map(|ix| match common::entry(referrer, ix).self_ty.as_ref() {
             None => "-".to_string(),
             Some(SelfRequirement::Bound(path)) => format!("Self: {}", s(path)),
             Some(SelfRequirement::Type(ty)) => format!("Self = {}", s(ty)),
@@ -89,18 +88,15 @@ fn types_are_shared_by_calls() {
         .collect();
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
-        referrer.iter().map(s).collect::<Vec<_>>(),
+        common::types(&referrer).map(s).collect::<Vec<_>>(),
         ["Rel", "RelA", "RelB < u8 >"]
     );
     // They use no generics, whichever the generics of the calls are: the generics of `A` (none)
     // are the context of the types, and those of `B` are another context without an entry.
-    assert_eq!(
-        referrer.context_generics(referrer.context(0)).params.len(),
-        0
-    );
-    assert_eq!(referrer.contexts().count(), 2);
-    assert_eq!(tops[0], referrer.context(0));
-    assert_eq!(referrer.context_generics(tops[1]).params.len(), 1);
+    assert_eq!(common::entry(&referrer, 0).generics.params.len(), 0);
+    assert_eq!(common::context_ids(&referrer).len(), 2);
+    assert_eq!(tops[0], common::entry_id(&referrer, 0));
+    assert_eq!(referrer.get_context(tops[1]).generics.params.len(), 1);
 }
 
 #[test]
@@ -136,9 +132,12 @@ fn equal_requirements_are_shared_and_different_ones_are_not() {
             entry(parse_quote!(Wrap<T>), parse_quote!(<const T: usize>)),
         ]
     );
-    assert_eq!(referrer.contexts().count(), 2);
+    assert_eq!(common::context_ids(&referrer).len(), 2);
     assert_eq!(
-        (referrer.context(0).index(), referrer.context(1).index()),
+        (
+            common::entry_id(&referrer, 0).index(),
+            common::entry_id(&referrer, 1).index()
+        ),
         (0, 1)
     );
     // The bounds are different.
@@ -167,22 +166,19 @@ fn equal_lifetime_bounds_give_equal_contexts() {
     // The order of the bounds of a lifetime.
     let referrer = leak(&["<'a, 'b, 'c: 'a + 'b>", "<'a, 'b, 'c: 'b + 'a>"]);
     assert_eq!(referrer.iter().count(), 1);
-    assert_eq!(referrer.contexts().count(), 1);
+    assert_eq!(common::context_ids(&referrer).len(), 1);
     assert_eq!(
-        s(referrer.context_generics(referrer.context(0))),
+        s(&common::entry(&referrer, 0).generics),
         "< 'a , 'b , 'c : 'a + 'b >"
     );
     // A where predicate on a lifetime is its bound.
     let referrer = leak(&["<'a, 'b: 'a, 'c>", "<'a, 'b, 'c> where 'b: 'a"]);
     assert_eq!(referrer.iter().count(), 1);
     assert_eq!(
-        s(referrer.context_generics(referrer.context(0))),
+        s(&common::entry(&referrer, 0).generics),
         "< 'a , 'b : 'a , 'c >"
     );
-    assert!(referrer
-        .context_generics(referrer.context(0))
-        .where_clause
-        .is_none());
+    assert!(common::entry(&referrer, 0).generics.where_clause.is_none());
     // Different bounds are different contexts.
     let referrer = leak(&["<'a, 'b: 'a, 'c>", "<'a, 'b, 'c: 'a>"]);
     assert_eq!(referrer.iter().count(), 2);
@@ -210,7 +206,7 @@ fn the_output_of_the_fn_sugar_is_parenthesized_only_where_needed() {
     ]);
     assert_eq!(referrer.iter().count(), 2);
     assert_eq!(
-        s(referrer.context_generics(referrer.context(0))),
+        s(&common::entry(&referrer, 0).generics),
         "< F : :: core :: ops :: Fn () -> & 'static dyn :: p :: A >"
     );
     // Before another bound the parentheses are needed, and kept.
@@ -219,7 +215,7 @@ fn the_output_of_the_fn_sugar_is_parenthesized_only_where_needed() {
         "::zzz::Z + ::core::ops::Fn() -> &'static (dyn ::p::A)",
     ]);
     assert_eq!(
-        s(referrer.context_generics(referrer.context(0))),
+        s(&common::entry(&referrer, 0).generics),
         "< F : :: core :: ops :: Fn () -> (& 'static dyn :: p :: A) + :: zzz :: Z >"
     );
 }
@@ -276,11 +272,14 @@ fn the_gats_are_part_of_the_identity_of_the_top_level_context() {
     assert_ne!(without, other_bound);
     // The same GAT is the same context.
     assert_eq!(with_gat, again);
-    assert_eq!(leaker.result().finish().unwrap().contexts().count(), 3);
+    assert_eq!(
+        common::context_ids(&leaker.result().finish().unwrap()).len(),
+        3
+    );
 }
 
 #[test]
-fn only_the_generics_used_are_required() {
+fn only_the_generics_used_are_needed() {
     let referrer = leak_trait(parse_quote! {
         trait X<T, U> {
             fn f(&self) -> Wrap<T>;
@@ -380,9 +379,12 @@ fn self_of_a_trait() {
     );
     // The two types are in one context, which is also the top-level one: it has the generics of
     // the trait and, as an entry names `Self`, what `Self` is.
-    assert_eq!(referrer.contexts().count(), 2);
-    assert_eq!(referrer.context(0), referrer.context(1));
-    assert_eq!(referrer.context(0), contexts[0]);
+    assert_eq!(common::context_ids(&referrer).len(), 2);
+    assert_eq!(
+        common::entry_id(&referrer, 0),
+        common::entry_id(&referrer, 1)
+    );
+    assert_eq!(common::entry_id(&referrer, 0), contexts[0]);
     assert!(referrer.has_self());
 
     // A trait without parameters.
@@ -412,14 +414,20 @@ fn self_in_different_traits_is_different() {
     ]);
     // `Rel2` is shared, but `Rel<Self>` is not (`Self` is bound by another trait).
     assert_eq!(
-        referrer.iter().map(s).collect::<Vec<_>>(),
+        common::types(&referrer).map(s).collect::<Vec<_>>(),
         ["Rel < Self >", "Rel2", "Rel < Self >"]
     );
     assert_eq!(selfs(&referrer), ["Self: X < T >", "-", "Self: Y < T >"]);
     // The generics of the traits are the same (`<T>`), but the top-level context has `Self` as an
     // entry names it, so it is not shared by the calls: it is the context of `Rel<Self>`.
-    assert_eq!(referrer.contexts().count(), 3);
-    assert_eq!(contexts, [referrer.context(0), referrer.context(2)]);
+    assert_eq!(common::context_ids(&referrer).len(), 3);
+    assert_eq!(
+        contexts,
+        [
+            common::entry_id(&referrer, 0),
+            common::entry_id(&referrer, 2)
+        ]
+    );
 
     // The same trait twice is shared.
     let tr: ItemTrait = parse_quote!(
@@ -578,7 +586,7 @@ fn self_in_the_bounds_of_the_generics() {
             .finish()
             .unwrap()
             .iter()
-            .map(s)
+            .map(|(ty, _)| s(ty))
             .collect::<Vec<_>>(),
         ["Rel"]
     );
@@ -598,7 +606,11 @@ fn generic_args_of_the_root_and_local_generics() {
     let completed: Vec<GenericArgument> =
         vec![parse_quote!('x), parse_quote!(u8), parse_quote!(u16)];
     let args = referrer
-        .context_generic_args(referrer.context(0), &tr.generics.params, &completed)
+        .context_generic_args(
+            &common::entry(&referrer, 0).generics,
+            &tr.generics.params,
+            &completed,
+        )
         .unwrap();
     assert_eq!(
         args.iter().map(s).collect::<Vec<_>>(),
@@ -613,17 +625,29 @@ fn generic_args_of_the_root_and_local_generics() {
     let referrer = leak_trait(tr.clone());
     let completed: Vec<GenericArgument> = vec![parse_quote!({ 1 + 2 }), parse_quote!(u16)];
     let args = referrer
-        .context_generic_args(referrer.context(0), &tr.generics.params, &completed)
+        .context_generic_args(
+            &common::entry(&referrer, 0).generics,
+            &tr.generics.params,
+            &completed,
+        )
         .unwrap();
     assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "{ 1 + 2 }"]);
     // Too few arguments.
     assert!(matches!(
-        referrer.context_generic_args(referrer.context(0), &tr.generics.params, &[]),
+        referrer.context_generic_args(
+            &common::entry(&referrer, 0).generics,
+            &tr.generics.params,
+            &[]
+        ),
         Err(EncodeError::MissingArgument(_))
     ));
     // Without the parameters of the trait, everything is passed by name.
     let args = referrer
-        .context_generic_args(referrer.context(0), &Punctuated::new(), &[])
+        .context_generic_args(
+            &common::entry(&referrer, 0).generics,
+            &Punctuated::new(),
+            &[],
+        )
         .unwrap();
     assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["V", "N"]);
 }
@@ -815,7 +839,7 @@ fn matching_self() {
     let referrer = leaker.result().finish().unwrap();
     // `Rel<Self>` of X, `Rel2`, `Wrap<T>` and `Rel<Self>` of Y.
     assert_eq!(
-        referrer.iter().map(s).collect::<Vec<_>>(),
+        common::types(&referrer).map(s).collect::<Vec<_>>(),
         ["Rel < Self >", "Rel2", "Wrap < T >", "Rel < Self >"]
     );
     let sig = "fn f(&self, a: Rel<Self>, b: Rel2, c: Wrap<T>)";
@@ -913,18 +937,18 @@ fn node_numbers_follow_the_first_appearance() {
         }
     });
     assert_eq!(
-        referrer.iter().map(s).collect::<Vec<_>>(),
+        common::types(&referrer).map(s).collect::<Vec<_>>(),
         ["Zed < U >", "Abc < T >", "Mid"]
     );
     assert_eq!(
         (0..3)
-            .map(|ix| referrer.context(ix).index())
+            .map(|ix| common::entry_id(&referrer, ix).index())
             .collect::<Vec<_>>(),
         [0, 1, 2]
     );
     assert_eq!(
         (0..3)
-            .map(|ix| s(referrer.context_generics(referrer.context(ix))))
+            .map(|ix| s(&common::entry(&referrer, ix).generics))
             .collect::<Vec<_>>(),
         ["< U >", "< T >", ""]
     );
@@ -938,12 +962,12 @@ fn node_numbers_follow_the_first_appearance() {
         }
     });
     assert_eq!(
-        referrer.iter().map(s).collect::<Vec<_>>(),
+        common::types(&referrer).map(s).collect::<Vec<_>>(),
         ["Rel1", "Rel2", "Wrap < T >"]
     );
     assert_eq!(
         (0..3)
-            .map(|ix| referrer.context(ix).index())
+            .map(|ix| common::entry_id(&referrer, ix).index())
             .collect::<Vec<_>>(),
         [0, 0, 1]
     );

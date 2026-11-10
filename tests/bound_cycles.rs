@@ -63,14 +63,13 @@ fn leak(item: Item) -> std::result::Result<Referrer, Vec<ErrorItem>> {
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
         .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+        .map(|(ty, context)| (ty, &context.generics))
         .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
         .collect()
 }
 
 fn types(referrer: &Referrer) -> Vec<String> {
-    referrer.iter().map(s).collect()
+    common::types(referrer).map(s).collect()
 }
 
 /// The error, with its headline.
@@ -308,18 +307,9 @@ fn a_reference_that_is_leaked_whole_in_a_cycle_is_rejected() {
     assert!(headline.contains(HEADLINE), "{}", headline);
 }
 
-/// The leaked types of an accepted item, an optional entry (see `Referrer::must()`) preceded by `?`.
-fn marked_types(referrer: &Referrer) -> Vec<String> {
-    referrer
-        .iter()
-        .enumerate()
-        .map(|(ix, ty)| format!("{}{}", if referrer.must(ix) { "" } else { "? " }, s(ty)))
-        .collect()
-}
-
-/// The types of `::ext`, a crate that the Leaker does not allow, are optional entries (`?`). One
-/// that a cycle needs is copied as written, which is no error: the Referrer may replace it, but its
-/// path through the Repeater would make a cycle with the bound that names it.
+/// The types of `::ext`, a crate that the Leaker does not allow, are entries. One that a cycle needs
+/// is copied as written, which is no error: the Referrer would replace it, but its path through the
+/// Repeater would make a cycle with the bound that names it.
 #[test]
 fn an_optional_entry_that_a_cycle_needs_is_copied_as_written() {
     let rows: Vec<(Item, &[&str])> = vec![
@@ -341,7 +331,7 @@ fn an_optional_entry_that_a_cycle_needs_is_copied_as_written() {
             parse_quote!(
                 pub struct S<T: Clone>(T, ::ext::Wrap<T>);
             ),
-            &["? :: ext :: Wrap < T >"],
+            &[":: ext :: Wrap < T >"],
         ),
         // `Wrap<T>` in the predicate is an entry. The Referrer would write `::ext::X` of the bound
         // through the Repeater, where the impl of `Wrap<T>` needs it as written: it is copied as
@@ -358,7 +348,7 @@ fn an_optional_entry_that_a_cycle_needs_is_copied_as_written() {
             parse_quote!(
                 pub struct S<T: Fn(::ext::X)>(T);
             ),
-            &["? :: ext :: X"],
+            &[":: ext :: X"],
         ),
         // An optional entry in a predicate that names a lifetime is in its own context, and leaked
         // as a whole, so its parts cannot stand for it either. Without the lifetime, it is not in
@@ -383,7 +373,7 @@ fn an_optional_entry_that_a_cycle_needs_is_copied_as_written() {
                     f0: &'a T,
                 }
             ),
-            &["? :: ext :: B0"],
+            &[":: ext :: B0"],
         ),
         // An optional entry in a predicate, with a bound of its context that names an `Item` that
         // is equated, or `Self::A`.
@@ -439,13 +429,13 @@ fn an_optional_entry_that_a_cycle_needs_is_copied_as_written() {
                     }
                 }
             ),
-            &["Rel < X >", "? :: ext :: S"],
+            &["Rel < X >", ":: ext :: S"],
         ),
     ];
     for (item, expected) in rows {
         let text = s(&item);
         let referrer = leak(item).unwrap_or_else(|e| panic!("{}: {}", text, messages(&e)));
-        assert_eq!(marked_types(&referrer), expected, "{}", text);
+        assert_eq!(types(&referrer), expected, "{}", text);
     }
 }
 
@@ -895,7 +885,6 @@ fn bare_self_predicates_stay_accepted() {
         let text = s(&item);
         let referrer = leak(item).unwrap_or_else(|e| panic!("{}: {}", text, messages(&e)));
         assert_eq!(types(&referrer), ["Rel < Self >", "S"], "{}", text);
-        assert!(referrer.must(0) && referrer.must(1), "{}", text);
     }
 }
 
@@ -916,7 +905,6 @@ fn a_predicate_on_a_non_generic_type_with_self_assoc_is_no_unstable_bound() {
     ))
     .unwrap();
     assert_eq!(types(&referrer), ["Rel < Self >"]);
-    assert!(referrer.must(0));
 }
 
 /// The `Leaker` docs, Bounds that name leaked types: the self type of an impl is an optional entry

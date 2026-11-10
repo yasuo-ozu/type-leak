@@ -4,6 +4,8 @@
 //! if `Self` has no name (the implementor of a trait). The Referrer computes the same context from
 //! the scopes of the copy.
 
+mod common;
+
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
@@ -27,7 +29,7 @@ fn ident(name: &str) -> Ident {
 }
 
 fn self_of(referrer: &Referrer, context: ContextId) -> String {
-    match referrer.context_self(context) {
+    match referrer.get_context(context).self_ty.as_ref() {
         None => "-".to_string(),
         Some(SelfRequirement::Bound(path)) => format!("Self: {}", s(path)),
         Some(SelfRequirement::Type(ty)) => format!("Self = {}", s(ty)),
@@ -35,18 +37,17 @@ fn self_of(referrer: &Referrer, context: ContextId) -> String {
     }
 }
 
-/// The required entries as `type | generics | Self`.
+/// The entries as `type | generics | Self`.
 fn entries(referrer: &Referrer) -> Vec<String> {
     (0..referrer.iter().count())
-        .filter(|&ix| referrer.must(ix))
         .map(|ix| {
-            let generics = referrer.context_generics(referrer.context(ix));
+            let generics = &common::entry(referrer, ix).generics;
             let where_clause = &generics.where_clause;
             format!(
                 "{} | {} | {}",
-                s(&referrer.iter().nth(ix).unwrap()),
+                s(&common::types(referrer).nth(ix).unwrap()),
                 s(&quote!(#generics #where_clause)),
-                self_of(referrer, referrer.context(ix))
+                self_of(referrer, common::entry_id(referrer, ix))
             )
         })
         .collect()
@@ -87,10 +88,10 @@ fn a_bound_is_rewritten_for_the_self_of_the_scope_that_declares_it() {
     // The scope that declared the bound is the one the Referrer needs: it records its `Self`
     // although no entry names `Self`. The scope of the impl declares no bound.
     assert_eq!(self_of(&referrer, outer), "Self = S < T >");
-    assert_eq!(s(referrer.context_generics(outer)), s(&bound()));
+    assert_eq!(s(&referrer.get_context(outer).generics), s(&bound()));
     assert_eq!(self_of(&referrer, inner), "-");
     // `Self` is not part of the entry, so the entry is not that of the scope.
-    assert_ne!(referrer.context(0), outer);
+    assert_ne!(common::entry_id(&referrer, 0), outer);
 }
 
 #[test]
@@ -127,7 +128,7 @@ fn the_same_type_in_the_scope_itself_keeps_self() {
         ]
     );
     assert_eq!(self_of(&referrer, outer), "Self = S < T >");
-    assert_eq!(referrer.context(0), outer);
+    assert_eq!(common::entry_id(&referrer, 0), outer);
 }
 
 #[test]
@@ -488,12 +489,16 @@ fn the_items_nested_in_a_struct_scope_use_its_generic() {
                 "< T : :: p :: Tr < Self > >",
                 "Self = S < T >"
             ),
+            e(":: p :: W", "", "-"),
         ]
     );
     // The first four share one context, and the scope records its `Self`.
-    assert_eq!(referrer.context(0), referrer.context(3));
+    assert_eq!(
+        common::entry_id(&referrer, 0),
+        common::entry_id(&referrer, 3)
+    );
     assert_eq!(self_of(&referrer, outer), "Self = S < T >");
-    assert_eq!(referrer.context(4), outer);
+    assert_eq!(common::entry_id(&referrer, 4), outer);
 }
 
 #[test]
@@ -889,7 +894,7 @@ fn the_referrer_takes_the_self_of_each_nested_item() {
         }
     });
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(entries(&referrer).len(), 5);
+    assert_eq!(entries(&referrer).len(), 6);
     let mut copy: ItemImpl = parse_quote!(
         impl<T: ::p::Tr<Self>> Foo for S<T> {
             fn m() {
@@ -911,15 +916,9 @@ fn the_referrer_takes_the_self_of_each_nested_item() {
             }
         }
     );
-    // A macro that trusts the optional entry (`::p::W`) copies it as written.
+    // The type of another crate (`::p::W`) is an entry too, after the others.
     referrer
-        .visitor(outer, |ty, ix| {
-            if referrer.must(ix) {
-                replace(ty, ix)
-            } else {
-                ty
-            }
-        })
+        .visitor(outer, replace)
         .visit_item_impl_mut(&mut copy);
     let expected: ItemImpl = parse_quote!(
         impl<T: ::p::Tr<Self>> Foo for S<T> {
@@ -936,7 +935,7 @@ fn the_referrer_takes_the_self_of_each_nested_item() {
                 trait Q {
                     fn g(x: P<3>);
                 }
-                impl ::p::W {
+                impl P<5> {
                     fn f(x: P<4>) {}
                 }
             }

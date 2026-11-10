@@ -1,24 +1,217 @@
-use proc_macro2::TokenStream;
+use proc_macro2::{TokenStream, TokenTree};
 use std::collections::BTreeSet;
+use syn::parse::{ParseStream, Parser};
 use syn::*;
 use template_quote::quote;
 use type_leak::{
-    Allow, Cause, CheckResult, ContextId, ErrorItem, Leaker, LeakerResult, Options, Place, Rules,
-    View,
+    Allow, Cause, CheckResult, Context, ContextId, ErrorItem, Leaker, LeakerResult, ModuleScope,
+    Options, Place, Referrer, Rules, View,
 };
 
-/// Converts the required types of a `Referrer` (see `Referrer::must()`) to a `BTreeSet<String>`
-/// for order-independent comparison. The optional ones, which only the paths of external crates
-/// (`::std::vec::Vec<..>`) cause, are not among them.
+/// Converts the types of a `Referrer` to a `BTreeSet<String>` for order-independent comparison.
 #[allow(dead_code)]
 pub fn finish_as_strings<A: Allow>(leaker: Leaker<A>) -> BTreeSet<String> {
     let referrer = leaker.result().finish().unwrap();
     referrer
         .iter()
-        .enumerate()
-        .filter(|(ix, _)| referrer.must(*ix))
-        .map(|(_, t)| quote!(#t).to_string())
+        .map(|(t, _)| quote!(#t).to_string())
         .collect()
+}
+
+/// The types of the entries, by index (`Referrer::iter()` gives them with their contexts).
+#[allow(dead_code)]
+pub fn types(referrer: &Referrer) -> impl Iterator<Item = &Type> {
+    referrer.iter().map(|(ty, _)| ty)
+}
+
+/// The type of the `ix`-th entry (`Referrer::iter()` gives it with its context).
+#[allow(dead_code)]
+pub fn entry_ty(referrer: &Referrer, ix: usize) -> &Type {
+    referrer.iter().nth(ix).expect("no such entry").0
+}
+
+/// The context of the `ix`-th entry (`Referrer::iter()` gives it with the type).
+#[allow(dead_code)]
+pub fn entry(referrer: &Referrer, ix: usize) -> &Context {
+    referrer.iter().nth(ix).expect("no such entry").1
+}
+
+/// The context id with the number `n`.
+#[allow(dead_code)]
+pub fn id(n: usize) -> ContextId {
+    parse_str(&n.to_string()).unwrap()
+}
+
+/// The context ids that a Referrer writes in its serialized form ([`serialized_ids()`]).
+#[allow(dead_code)]
+pub struct SerializedIds {
+    /// The contexts that the tokens declare, in the order of their first group.
+    pub declared: Vec<ContextId>,
+    /// The context of each entry, by index.
+    pub entries: Vec<ContextId>,
+}
+
+/// Reads the context ids from `referrer.to_token_stream()`, as `Parse for Referrer` reads them.
+///
+/// The form is the format tag, the groups of parts (`[ .. ]`) if there are any, the number of groups
+/// if there is more than one, and then the groups in the order of the entries. A group is `[# id]`,
+/// then, if the context is not declared yet, its declaration (the items `<generics> where .. ;`,
+/// `Self .. ;`, `type G .. ;` and `mod .. ;`, in this order, each ending with a `;` at the top level
+/// of the tokens), then the entries `( Type, .. )`. A group with no `# id` is for the id after that
+/// of the group before. A declared context has a group of entries only. It panics with the tokens
+/// for any other shape.
+#[allow(dead_code)]
+pub fn serialized_ids(referrer: &Referrer) -> SerializedIds {
+    let tokens = template_quote::ToTokens::to_token_stream(referrer);
+    let read = read_serialized_ids(tokens.clone()).unwrap_or_else(|error| {
+        panic!(
+            "the reader of the serialized form does not know this shape ({}): {}",
+            error, tokens
+        )
+    });
+    assert_eq!(
+        read.entries.len(),
+        referrer.iter().count(),
+        "the number of entries that the serialized form has: {}",
+        tokens
+    );
+    read
+}
+
+/// The reader of [`serialized_ids()`], on tokens: it fails for a shape it does not know, and for
+/// tokens after the groups.
+#[allow(dead_code)]
+pub fn read_serialized_ids(tokens: TokenStream) -> syn::Result<SerializedIds> {
+    parse_serialized_ids.parse2(tokens)
+}
+
+fn parse_serialized_ids(input: ParseStream) -> syn::Result<SerializedIds> {
+    let tag: LitStr = input.parse()?;
+    let expected = format!("type-leak-format-{}", Referrer::FORMAT_VERSION);
+    if tag.value() != expected {
+        return Err(Error::new(
+            tag.span(),
+            format!("the tag is not `{}`", expected),
+        ));
+    }
+    if input.peek(token::Bracket) {
+        let parts: parse::ParseBuffer<'_>;
+        bracketed!(parts in input);
+        parts.parse::<TokenStream>()?;
+    }
+    let n_groups = if input.peek(LitInt) {
+        input.parse::<LitInt>()?.base10_parse::<usize>()?
+    } else {
+        1
+    };
+    let mut declared: Vec<ContextId> = Vec::new();
+    let mut entries = Vec::new();
+    let mut next = 0;
+    for _ in 0..n_groups {
+        let context = if input.peek(Token![#]) {
+            input.parse::<Token![#]>()?;
+            input.parse::<ContextId>()?
+        } else {
+            id(next)
+        };
+        next = context.index() + 1;
+        if declared.contains(&context) {
+            // Another group of a declared context: its entries only.
+            if !input.peek(token::Paren) {
+                return Err(input.error("expected the entries of a declared context"));
+            }
+        } else {
+            declared.push(context);
+            // The declaration: items that end with `;`, in the order of the stages 0 to 3. Only
+            // generics (0) and a module (3) may come once.
+            let mut stage = 0;
+            while !input.peek(token::Paren) {
+                let at = if input.peek(Token![<]) || input.peek(Token![where]) {
+                    0
+                } else if input.peek(Token![Self]) {
+                    1
+                } else if input.peek(Token![type]) {
+                    2
+                } else if input.peek(Token![mod]) {
+                    3
+                } else {
+                    return Err(input.error("expected an item of a declaration or the entries"));
+                };
+                if at < stage {
+                    return Err(input.error("an item of a declaration out of its place"));
+                }
+                stage = if at == 0 || at == 3 { at + 1 } else { at };
+                loop {
+                    let token: TokenTree = input.parse()?;
+                    if matches!(&token, TokenTree::Punct(punct) if punct.as_char() == ';') {
+                        break;
+                    }
+                }
+            }
+        }
+        let content: parse::ParseBuffer<'_>;
+        parenthesized!(content in input);
+        let group = punctuated::Punctuated::<Type, Token![,]>::parse_terminated(&content)?;
+        entries.extend(group.iter().map(|_| context));
+    }
+    Ok(SerializedIds { declared, entries })
+}
+
+/// The ids of the contexts of the Referrer, in ascending order: those that its serialized form
+/// declares ([`serialized_ids()`]), also those with no entry. `get_context()` reads each.
+#[allow(dead_code)]
+pub fn context_ids(referrer: &Referrer) -> Vec<ContextId> {
+    let mut ids = serialized_ids(referrer).declared;
+    ids.sort();
+    ids
+}
+
+/// The id of the context of the `ix`-th entry, as the serialized form of the Referrer says
+/// ([`serialized_ids()`]). `Referrer::iter()` gives the context, not its id.
+#[allow(dead_code)]
+pub fn entry_id(referrer: &Referrer, ix: usize) -> ContextId {
+    match serialized_ids(referrer).entries.get(ix) {
+        Some(context) => *context,
+        None => panic!("no such entry: {}", ix),
+    }
+}
+
+/// The module that `context` is in (`ModuleScope::In`). It is `None` for a context that depends on
+/// no module and for the context of a module itself.
+#[allow(dead_code)]
+pub fn in_module(context: &Context) -> Option<ContextId> {
+    match &context.module {
+        Some(ModuleScope::In(module)) => Some(*module),
+        _ => None,
+    }
+}
+
+/// The path of the module `module` from its root (`ModuleScope::Itself::path`); `None` if it is not
+/// the context of a module of `intern_mod()`.
+#[allow(dead_code)]
+pub fn module_path(referrer: &Referrer, module: ContextId) -> Option<&[Ident]> {
+    match &referrer.get_context(module).module {
+        Some(ModuleScope::Itself { path, .. }) => path.as_deref(),
+        _ => None,
+    }
+}
+
+/// The hint given to `Leaker::enter_mod()` for the module `module` (`ModuleScope::Itself::hint`).
+#[allow(dead_code)]
+pub fn module_hint(referrer: &Referrer, module: ContextId) -> Option<&str> {
+    match &referrer.get_context(module).module {
+        Some(ModuleScope::Itself { hint, .. }) => hint.as_deref(),
+        _ => None,
+    }
+}
+
+/// The module in which the module `module` is nested (`ModuleScope::Itself::parent`).
+#[allow(dead_code)]
+pub fn module_parent(referrer: &Referrer, module: ContextId) -> Option<ContextId> {
+    match &referrer.get_context(module).module {
+        Some(ModuleScope::Itself { parent, .. }) => *parent,
+        _ => None,
+    }
 }
 
 /// Interns the items `items` of a trait `Tr` with the generics `generics` (e.g. `fn f(&self) ->

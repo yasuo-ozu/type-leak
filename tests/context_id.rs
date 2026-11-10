@@ -25,7 +25,10 @@ fn id(n: usize) -> ContextId {
 }
 
 fn ids(referrer: &Referrer) -> Vec<usize> {
-    referrer.contexts().map(ContextId::index).collect()
+    common::context_ids(referrer)
+        .into_iter()
+        .map(ContextId::index)
+        .collect()
 }
 
 fn s(x: &impl ToTokens) -> String {
@@ -33,7 +36,7 @@ fn s(x: &impl ToTokens) -> String {
 }
 
 fn leaked(referrer: &Referrer) -> Vec<String> {
-    referrer.iter().map(s).collect()
+    common::types(referrer).map(s).collect()
 }
 
 /// The Referrer of `struct S<T, U> { a: Rel0, b: (Rel1, T), c: Wrap<U> }`, together with the
@@ -115,12 +118,12 @@ fn the_scopes_return_the_top_level_context() {
     assert_eq!(top_level, id(1));
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(leaked(&referrer), ["Rel"]);
-    assert_eq!(referrer.context(0), id(0));
+    assert_eq!(common::entry_id(&referrer, 0), id(0));
     assert_eq!(ids(&referrer), [0, 1]);
-    assert_eq!(s(referrer.context_generics(top_level)), "< T >");
-    assert_eq!(referrer.context_self(top_level), None);
-    assert_eq!(referrer.context_module(top_level), None);
-    assert_eq!(s(referrer.context_generics(id(0))), "");
+    assert_eq!(s(&referrer.get_context(top_level).generics), "< T >");
+    assert_eq!(referrer.get_context(top_level).self_ty.as_ref(), None);
+    assert_eq!(common::in_module(referrer.get_context(top_level)), None);
+    assert_eq!(s(&referrer.get_context(id(0)).generics), "");
     // It is written as an empty group, and kept by the round trip.
     let tokens = referrer.to_token_stream();
     assert_eq!(
@@ -129,8 +132,8 @@ fn the_scopes_return_the_top_level_context() {
     );
     let parsed: Referrer = parse2(tokens).unwrap();
     assert_eq!(parsed, referrer);
-    assert_eq!(s(parsed.context_generics(top_level)), "< T >");
-    assert_eq!(parsed.context_self(top_level), None);
+    assert_eq!(s(&parsed.get_context(top_level).generics), "< T >");
+    assert_eq!(parsed.get_context(top_level).self_ty.as_ref(), None);
     assert_eq!(ids(&parsed), [0, 1]);
 
     // The generics are in the canonical form of the requirements (the bounds are moved to the
@@ -144,14 +147,14 @@ fn the_scopes_return_the_top_level_context() {
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
-    let generics = referrer.context_generics(top_level);
+    let generics = &referrer.get_context(top_level).generics;
     let where_clause = &generics.where_clause;
     assert_eq!(
         s(&quote!(#generics #where_clause)),
         "< T : :: core :: clone :: Clone , U : :: core :: fmt :: Debug > \
          where Self : :: core :: marker :: Sized"
     );
-    assert_eq!(referrer.context_self(top_level), None);
+    assert_eq!(referrer.get_context(top_level).self_ty.as_ref(), None);
     assert!(!referrer.has_self());
 }
 
@@ -163,7 +166,7 @@ fn top_level_context_is_shared_with_the_entries() {
     let top_level = leaker.intern_struct(&item, true);
     assert_eq!(top_level, id(0));
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(referrer.context(0), top_level);
+    assert_eq!(common::entry_id(&referrer, 0), top_level);
     assert_eq!(ids(&referrer), [0]);
     assert_eq!(
         referrer.to_token_stream().to_string(),
@@ -178,7 +181,7 @@ fn top_level_context_is_shared_with_the_entries() {
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(leaked(&referrer), ["Rel", "Wrap < T >"]);
     assert_eq!(top_level, id(1));
-    assert_eq!(referrer.context(1), top_level);
+    assert_eq!(common::entry_id(&referrer, 1), top_level);
     assert_eq!(ids(&referrer), [0, 1]);
 }
 
@@ -260,7 +263,7 @@ fn a_failed_call_takes_the_ids_it_would_if_its_causes_were_accepted() {
         leaked(&referrer),
         ["RelA", "Wrap < U >", "Wrap < W >", "Wrap < V >"]
     );
-    assert_eq!(s(referrer.context_generics(ids[3])), "< V >");
+    assert_eq!(s(&referrer.get_context(ids[3]).generics), "< V >");
 }
 
 #[test]
@@ -268,10 +271,13 @@ fn the_intern_methods_return_the_top_level_context() {
     fn check(leaker: Leaker, top_level: ContextId, expected: &[&str]) {
         let referrer = leaker.result().finish().unwrap();
         assert_eq!(leaked(&referrer), expected);
-        assert!(referrer.contexts().any(|context| context == top_level));
-        let used: BTreeSet<ContextId> =
-            (0..expected.len()).map(|ix| referrer.context(ix)).collect();
-        assert!(used.len() <= referrer.contexts().count());
+        assert!(common::context_ids(&referrer)
+            .into_iter()
+            .any(|context| context == top_level));
+        let used: BTreeSet<ContextId> = (0..expected.len())
+            .map(|ix| common::entry_id(&referrer, ix))
+            .collect();
+        assert!(used.len() <= common::context_ids(&referrer).len());
     }
     let item: ItemStruct = parse_quote! { struct S<T> { a: Rel, b: Wrap<T> } };
     let mut leaker = Leaker::new();
@@ -309,8 +315,8 @@ fn the_intern_methods_return_the_top_level_context() {
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(leaked(&referrer), ["Wrap < T >", "Rel"]);
     assert_eq!(ids(&referrer), [0, 1, 2, 3]);
-    assert_eq!(s(referrer.context_generics(top_level)), "");
-    assert_eq!(referrer.context_module(top_level), None);
+    assert_eq!(s(&referrer.get_context(top_level).generics), "");
+    assert_eq!(common::in_module(referrer.get_context(top_level)), None);
     let mut again = Leaker::new();
     assert_eq!(again.intern_mod(&item), top_level);
     check(again, top_level, &["Wrap < T >", "Rel"]);
@@ -320,10 +326,7 @@ fn the_intern_methods_return_the_top_level_context() {
     let top_level = leaker.intern_struct(&parse_quote! { struct S { a: RelB<'_> } }, true);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    assert!(result
-        .into_referrer()
-        .contexts()
-        .any(|context| context == top_level));
+    assert!(common::context_ids(&result.into_referrer()).contains(&top_level));
 }
 
 #[test]
@@ -337,19 +340,19 @@ fn ids_of_dropped_contexts_are_gaps() {
     assert_eq!(ids(&referrer), [0, 2, 3]);
     assert_eq!(
         (0..3)
-            .map(|ix| referrer.context(ix).index())
+            .map(|ix| common::entry_id(&referrer, ix).index())
             .collect::<Vec<_>>(),
         [0, 0, 2]
     );
     // The ids are those of the Leaker, not renumbered.
-    assert_eq!(s(referrer.context_generics(referrer.context(2))), "< U >");
-    for context in referrer.contexts() {
-        assert_eq!(referrer.context_self(context), None);
-        assert_eq!(referrer.context_module(context), None);
+    assert_eq!(s(&common::entry(&referrer, 2).generics), "< U >");
+    for context in common::context_ids(&referrer) {
+        assert_eq!(referrer.get_context(context).self_ty.as_ref(), None);
+        assert_eq!(common::in_module(referrer.get_context(context)), None);
     }
-    assert_eq!(s(referrer.context_generics(id(0))), "");
-    assert_eq!(s(referrer.context_generics(id(2))), "< U >");
-    assert_eq!(s(referrer.context_generics(top_level)), "< T , U >");
+    assert_eq!(s(&referrer.get_context(id(0)).generics), "");
+    assert_eq!(s(&referrer.get_context(id(2)).generics), "< U >");
+    assert_eq!(s(&referrer.get_context(top_level).generics), "< T , U >");
 
     // No type is left, but the generics of the call are in the Referrer.
     let item: ItemStruct = parse_quote! { struct S<T> { a: T } };
@@ -359,7 +362,7 @@ fn ids_of_dropped_contexts_are_gaps() {
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer.is_empty());
     assert_eq!(ids(&referrer), [0]);
-    assert_eq!(s(referrer.context_generics(top_level)), "< T >");
+    assert_eq!(s(&referrer.get_context(top_level).generics), "< T >");
     assert_eq!(
         referrer.to_token_stream().to_string(),
         format!("\"{}\" < T > ; ()", version())
@@ -408,22 +411,9 @@ fn the_lookups_of_a_context_it_does_not_have_panic() {
         ),
     ];
     type Lookup = fn(&Referrer, ContextId);
-    let lookups: [(&str, Lookup); 7] = [
-        ("context_generics", |referrer, context| {
-            referrer.context_generics(context);
-        }),
-        ("context_self", |referrer, context| {
-            referrer.context_self(context);
-        }),
-        ("context_self_outlives", |referrer, context| {
-            referrer.context_self_outlives(context);
-        }),
-        ("context_module", |referrer, context| {
-            referrer.context_module(context);
-        }),
-        ("context_generic_args", |referrer, context| {
-            let params: Generics = parse_quote!(<T, U>);
-            let _ = referrer.context_generic_args(context, &params.params, &[]);
+    let lookups: [(&str, Lookup); 3] = [
+        ("get_context", |referrer, context| {
+            referrer.get_context(context);
         }),
         ("visitor", |referrer, context| {
             let _ = referrer.visitor(context, |_, ix| parse_quote!(P<#ix>));
@@ -437,7 +427,11 @@ fn the_lookups_of_a_context_it_does_not_have_panic() {
         // and one far away.
         let last = ids(referrer).into_iter().max().unwrap();
         let mut unknown: Vec<usize> = (0..last)
-            .filter(|n| !referrer.contexts().any(|known| known == id(*n)))
+            .filter(|n| {
+                !common::context_ids(referrer)
+                    .into_iter()
+                    .any(|known| known == id(*n))
+            })
             .collect();
         unknown.extend([last + 1, 99]);
         for n in unknown {
@@ -465,16 +459,24 @@ fn the_lookups_of_a_context_it_does_not_have_panic() {
 fn the_contexts_that_exist_do_not_panic() {
     // The control of the tests above: the same calls on a context of the Referrer.
     let (referrer, top_level) = gap_referrer();
-    for context in referrer.contexts() {
-        assert_eq!(referrer.context_self(context), None);
-        assert!(referrer.context_self_outlives(context).is_empty());
-        assert_eq!(referrer.context_module(context), None);
+    for context in common::context_ids(&referrer) {
+        assert_eq!(referrer.get_context(context).self_ty.as_ref(), None);
+        assert!(referrer
+            .get_context(context)
+            .self_outlives
+            .as_slice()
+            .is_empty());
+        assert_eq!(common::in_module(referrer.get_context(context)), None);
     }
-    assert_eq!(s(referrer.context_generics(top_level)), "< T , U >");
+    assert_eq!(s(&referrer.get_context(top_level).generics), "< T , U >");
     let params: Generics = parse_quote!(<T, U>);
     let args: Vec<GenericArgument> = vec![parse_quote!(A), parse_quote!(B)];
     let args = referrer
-        .context_generic_args(top_level, &params.params, &args)
+        .context_generic_args(
+            &referrer.get_context(top_level).generics,
+            &params.params,
+            &args,
+        )
         .unwrap();
     assert_eq!(args.iter().map(s).collect::<Vec<_>>(), ["A", "B"]);
 }
@@ -499,8 +501,7 @@ fn lookups_work_with_gaps() {
     assert_eq!(
         referrer
             .iter()
-            .enumerate()
-            .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+            .map(|(ty, context)| (ty, &context.generics))
             .map(|(ty, generics)| (s(ty), s(generics)))
             .collect::<Vec<_>>(),
         [
@@ -542,7 +543,7 @@ fn serialization_of_the_simplest_referrer_is_unchanged() {
     let top_level = leaker.intern_struct(&item, true);
     assert_eq!(top_level, id(0));
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(referrer.context(0), top_level);
+    assert_eq!(common::entry_id(&referrer, 0), top_level);
     let tokens = referrer.to_token_stream();
     assert_eq!(tokens.to_string(), format!("\"{}\" (A , B)", version()));
     assert_eq!(parse2::<Referrer>(tokens).unwrap(), referrer);
@@ -567,7 +568,7 @@ fn serialization_of_the_simplest_referrer_is_unchanged() {
     // generics.
     let referrer = Leaker::new().result().finish().unwrap();
     assert_eq!(ids(&referrer), [0]);
-    assert_eq!(s(referrer.context_generics(id(0))), "");
+    assert_eq!(s(&referrer.get_context(id(0)).generics), "");
     assert_eq!(
         referrer.to_token_stream().to_string(),
         format!("\"{}\" ()", version())
@@ -590,9 +591,9 @@ fn serialization_with_gaps() {
     let parsed: Referrer = parse2(tokens).unwrap();
     assert_eq!(parsed, referrer);
     assert_eq!(ids(&parsed), [0, 2, 3]);
-    assert_eq!(parsed.context(2), id(2));
-    assert_eq!(s(parsed.context_generics(id(2))), "< U >");
-    assert_eq!(s(parsed.context_generics(top_level)), "< T , U >");
+    assert_eq!(common::entry_id(&parsed, 2), id(2));
+    assert_eq!(s(&parsed.get_context(id(2)).generics), "< U >");
+    assert_eq!(s(&parsed.get_context(top_level).generics), "< T , U >");
 
     // The first group may not have the id 0 (the first id is not 0 if the context 0 is dropped),
     // and the ids after a gap are expected to follow it.
@@ -603,7 +604,7 @@ fn serialization_with_gaps() {
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(leaked(&referrer), ["Rel"]);
     assert_eq!(ids(&referrer), [1, 2]);
-    assert_eq!(referrer.context(0), id(1));
+    assert_eq!(common::entry_id(&referrer, 0), id(1));
     let tokens = referrer.to_token_stream();
     assert_eq!(
         tokens.to_string(),
@@ -627,7 +628,7 @@ fn serialization_with_gaps() {
     assert_eq!(ids(&referrer), [0, 2, 3, 7]);
     assert_eq!(
         (0..4)
-            .map(|ix| referrer.context(ix).index())
+            .map(|ix| common::entry_id(&referrer, ix).index())
             .collect::<Vec<_>>(),
         [0, 2, 3, 7]
     );
@@ -666,30 +667,30 @@ fn serialization_with_gaps_keeps_the_requirements() {
         referrer
     );
     let [c0, c1, c4, c6, c8, c9] = [id(0), id(1), id(4), id(6), id(8), id(9)];
-    assert_eq!(referrer.context(0), c1);
-    assert_eq!(referrer.context(1), c4);
-    assert_eq!(referrer.context(3), c9);
-    assert_eq!(referrer.context_module(c1), Some(c0));
-    assert_eq!(referrer.module_path(c0), Some(&[][..]));
-    assert_eq!(referrer.context_module(c4), None);
-    assert_eq!(s(referrer.context_generics(c4)), "< T >");
-    assert_eq!(s(referrer.context_generics(c6)), "");
+    assert_eq!(common::entry_id(&referrer, 0), c1);
+    assert_eq!(common::entry_id(&referrer, 1), c4);
+    assert_eq!(common::entry_id(&referrer, 3), c9);
+    assert_eq!(common::in_module(referrer.get_context(c1)), Some(c0));
+    assert_eq!(common::module_path(&referrer, c0), Some(&[][..]));
+    assert_eq!(common::in_module(referrer.get_context(c4)), None);
+    assert_eq!(s(&referrer.get_context(c4).generics), "< T >");
+    assert_eq!(s(&referrer.get_context(c6).generics), "");
     assert!(matches!(
-        referrer.context_self(c4),
+        referrer.get_context(c4).self_ty.as_ref(),
         Some(SelfRequirement::Bound(_))
     ));
     assert!(matches!(
-        referrer.context_self(c6),
+        referrer.get_context(c6).self_ty.as_ref(),
         Some(SelfRequirement::Type(_))
     ));
-    assert_eq!(referrer.context_self(c9), None);
-    assert_eq!(referrer.context_module(c9), Some(c8));
+    assert_eq!(referrer.get_context(c9).self_ty.as_ref(), None);
+    assert_eq!(common::in_module(referrer.get_context(c9)), Some(c8));
     assert_eq!(
-        referrer.module_path(c8),
+        common::module_path(&referrer, c8),
         Some(&[parse_quote!(a), parse_quote!(b)][..])
     );
     // A module has no module of its own.
-    assert_eq!(referrer.context_module(c8), None);
+    assert_eq!(common::in_module(referrer.get_context(c8)), None);
 
     // The requirements survive the removal of a context (here, one of a trait).
     let tr: ItemTrait = parse_quote! {
@@ -704,19 +705,22 @@ fn serialization_with_gaps_keeps_the_requirements() {
     assert_eq!(top_level, id(0));
     assert_eq!(ids(&referrer), [0, 2]);
     assert!(matches!(
-        referrer.context_self(id(0)),
+        referrer.get_context(id(0)).self_ty.as_ref(),
         Some(SelfRequirement::Bound(_))
     ));
-    assert_eq!(referrer.context_self(id(2)), None);
+    assert_eq!(referrer.get_context(id(2)).self_ty.as_ref(), None);
     assert_eq!(
-        referrer.context_self(top_level),
-        referrer.context_self(id(0))
+        referrer.get_context(top_level).self_ty.as_ref(),
+        referrer.get_context(id(0)).self_ty.as_ref()
     );
-    assert_eq!(s(referrer.context_generics(top_level)), "< T , U >");
+    assert_eq!(s(&referrer.get_context(top_level).generics), "< T , U >");
     let parsed: Referrer = parse2(referrer.to_token_stream()).unwrap();
     assert_eq!(parsed, referrer);
-    for context in referrer.contexts() {
-        assert_eq!(parsed.context_self(context), referrer.context_self(context));
+    for context in common::context_ids(&referrer) {
+        assert_eq!(
+            parsed.get_context(context).self_ty.as_ref(),
+            referrer.get_context(context).self_ty.as_ref()
+        );
     }
 }
 
@@ -733,17 +737,13 @@ fn the_top_level_generics_do_not_have_the_bounds_the_entries_imply() {
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
-    let ix = referrer
-        .iter()
+    let ix = common::types(&referrer)
         .position(|ty| s(ty) == "& 'a Rel < T >")
         .unwrap();
-    assert_ne!(referrer.context(ix), top_level);
+    assert_ne!(common::entry_id(&referrer, ix), top_level);
+    assert_eq!(s(&common::entry(&referrer, ix).generics), "< 'a , T : 'a >");
     assert_eq!(
-        s(referrer.context_generics(referrer.context(ix))),
-        "< 'a , T : 'a >"
-    );
-    assert_eq!(
-        s(referrer.context_generics(top_level)),
+        s(&referrer.get_context(top_level).generics),
         "< 'a , T , const N : usize >"
     );
     let marker: Type = parse_quote!(crate::Marker);
@@ -751,4 +751,239 @@ fn the_top_level_generics_do_not_have_the_bounds_the_entries_imply() {
         .repeater_impl(ix, ImplSelf::Marker(&marker), array_const)
         .unwrap();
     assert_eq!(s(&r.generics), "< 'a , T >");
+}
+
+/// What `common::context_ids()` and `common::entry_id()` read from the serialized form agrees with
+/// the Leaker and with `get_context()`: the ids are listed once and in order, those the Leaker
+/// returned are among them, `get_context()` reads each listed id and no other up to past the last,
+/// and the context of an entry is that of its id. `interned`: the contexts come from a Leaker, so
+/// they differ and `==` tells an id from another.
+fn check_serialized_ids(shape: &str, referrer: &Referrer, returned: &[ContextId], interned: bool) {
+    let ids = common::context_ids(referrer);
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "{}", shape);
+    for context in returned {
+        assert!(
+            ids.contains(context),
+            "{}: {} is not listed",
+            shape,
+            context
+        );
+    }
+    let last = ids.last().unwrap().index();
+    for n in 0..=last + 2 {
+        let readable = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            referrer.get_context(id(n));
+        }))
+        .is_ok();
+        assert_eq!(ids.contains(&id(n)), readable, "{}: the id {}", shape, n);
+    }
+    let read = common::serialized_ids(referrer);
+    assert_eq!(read.entries.len(), referrer.iter().count(), "{}", shape);
+    for (ix, (_, context)) in referrer.iter().enumerate() {
+        let entry = common::entry_id(referrer, ix);
+        assert!(ids.contains(&entry), "{}: the entry {}", shape, ix);
+        assert_eq!(
+            referrer.get_context(entry),
+            context,
+            "{}: entry {}",
+            shape,
+            ix
+        );
+    }
+    if interned {
+        for (at, first) in ids.iter().enumerate() {
+            for second in &ids[at + 1..] {
+                assert_ne!(
+                    referrer.get_context(*first),
+                    referrer.get_context(*second),
+                    "{}: {} and {}",
+                    shape,
+                    first,
+                    second
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_ids_read_from_the_serialized_form_agree_with_the_referrer() {
+    let from_text =
+        |text: &str| -> Referrer { parse_str(&format!("\"{}\" {}", version(), text)).unwrap() };
+    let entries_of = |referrer: &Referrer| -> Vec<usize> {
+        (0..referrer.iter().count())
+            .map(|ix| common::entry_id(referrer, ix).index())
+            .collect()
+    };
+
+    // Gaps: the context 1 is dropped, and an id is written where it is not the one after the
+    // group before.
+    let (gaps, top_level) = gap_referrer();
+    check_serialized_ids("gaps", &gaps, &[top_level], true);
+    assert_eq!(ids(&gaps), [0, 2, 3]);
+    assert_eq!(entries_of(&gaps), [0, 0, 2]);
+    // The first id is not 0.
+    let mut leaker = Leaker::new();
+    let top_level = leaker.intern_struct(&parse_quote! { struct S<T, U> { a: (Rel, T) } }, true);
+    let first_dropped = leaker.result().finish().unwrap();
+    check_serialized_ids("first dropped", &first_dropped, &[top_level], true);
+    assert_eq!(ids(&first_dropped), [1, 2]);
+    assert_eq!(entries_of(&first_dropped), [1]);
+    // The ids of a Referrer are not limited by their number.
+    let far = from_text("2 # 70 (A) # 1000 (B)");
+    assert_eq!(ids(&far), [70, 1000]);
+    assert_eq!(entries_of(&far), [70, 1000]);
+
+    // Interleaved groups: the required entries come first, then the optional ones, so the context
+    // 0 is written again (`# 0 (..)`) after the contexts 1 and 2. The last group is the top-level
+    // context, which has no entry.
+    let item: ItemStruct = parse_quote! {
+        struct S<T, U> { a: ::ext::X, b: Wrap<T>, c: ::ext::Z, d: Rel, e: Wrap2<U> }
+    };
+    let mut leaker = Leaker::new();
+    let top_level = leaker.intern_struct(&item, true);
+    let interleaved = leaker.result().finish().unwrap();
+    assert_eq!(
+        interleaved.to_token_stream().to_string(),
+        format!(
+            "\"{}\" 5 (Rel) < T > ; (Wrap < T >) < U > ; (Wrap2 < U >) \
+             # 0 (:: ext :: X , :: ext :: Z) # 3 < T , U > ; ()",
+            version()
+        )
+    );
+    check_serialized_ids("interleaved", &interleaved, &[top_level], true);
+    assert_eq!(top_level, id(3));
+    assert_eq!(ids(&interleaved), [0, 1, 2, 3]);
+    assert_eq!(entries_of(&interleaved), [0, 1, 2, 0, 0]);
+    // The same written by hand. A group has no `#` where its id follows that of the group before,
+    // also if the context is declared already (the last group of the second).
+    let text = from_text("4 (A) (B) # 0 (C) # 3 (D)");
+    check_serialized_ids("text", &text, &[], false);
+    assert_eq!(ids(&text), [0, 1, 3]);
+    assert_eq!(entries_of(&text), [0, 1, 0, 3]);
+    let text = from_text("4 (A) (B) # 0 (C) (D)");
+    assert_eq!(ids(&text), [0, 1]);
+    assert_eq!(entries_of(&text), [0, 1, 0, 1]);
+    // Contexts with no entry, between the others and at the end.
+    let text = from_text("4 (A) () # 2 (B) ()");
+    assert_eq!(ids(&text), [0, 1, 2, 3]);
+    assert_eq!(entries_of(&text), [0, 2]);
+
+    // Modules: the own context of a module has no entry and declares its path and parent in braces
+    // (a hint too), and the contexts of the entries in it say `mod 1 ;`.
+    let module: ItemMod = parse_quote! {
+        mod m {
+            pub struct A { y: Rel }
+            pub mod inner { pub struct C { y: Rel, z: Wrap<u8> } }
+        }
+    };
+    let mut leaker = Leaker::new();
+    let root = leaker.intern_mod(&module);
+    let (hinted, ()) = leaker.enter_mod("h", [], |view| view.visit_type(&parse_quote!(Rel2)));
+    let modules = leaker.result().finish().unwrap();
+    let text = modules.to_token_stream().to_string();
+    assert!(text.contains("mod { path = [] }"), "{}", text);
+    assert!(text.contains("mod { hint = \"h\" }"), "{}", text);
+    assert!(text.contains("parent = "), "{}", text);
+    check_serialized_ids("modules", &modules, &[root, hinted], true);
+    let listed = common::context_ids(&modules);
+    let own: Vec<ContextId> = listed
+        .iter()
+        .copied()
+        .filter(|context| {
+            matches!(
+                modules.get_context(*context).module,
+                Some(type_leak::ModuleScope::Itself { .. })
+            )
+        })
+        .collect();
+    assert_eq!(own.len(), 3, "{:?}", own);
+    assert!(own.contains(&root) && own.contains(&hinted));
+    for ix in 0..modules.iter().count() {
+        let module = common::in_module(common::entry(&modules, ix)).unwrap();
+        assert!(own.contains(&module), "the entry {}", ix);
+    }
+
+    // The items of a declaration end at the `;` of the top level, whatever their groups hold: the
+    // parentheses of `Fn(u8)`, the brackets of `[T; 3]`, `Self`, its outlives, and a GAT.
+    let items: Vec<(&str, Item)> = vec![
+        (
+            "fn bound",
+            parse_quote! { trait Tr<T: ::core::ops::Fn(u8) -> u8> { fn f(&self, t: T) -> Rel<T>; } },
+        ),
+        (
+            "where, Self and GAT",
+            parse_quote! {
+                trait Tr<'a, T> where Self: 'a, [T; 3]: ::core::marker::Sized {
+                    type G<'b> where Self: 'b;
+                    fn f<'x>(&'x self, t: T) -> Rel<&'x Self, T, Self::G<'x>>;
+                }
+            },
+        ),
+        (
+            "Self is a type",
+            parse_quote! { struct S<T> { a: Rel<Self, T>, b: Wrap<(T, u8)> } },
+        ),
+        (
+            "Self is any type",
+            parse_quote! { mod m { struct N<T: ::core::convert::AsRef<Self>>(Rel<T>); } },
+        ),
+    ];
+    for (shape, item) in items {
+        let mut leaker = Leaker::new();
+        let top_level = match &item {
+            Item::Trait(item) => leaker.intern_trait(item, true),
+            Item::Struct(item) => leaker.intern_struct(item, true),
+            Item::Mod(item) => leaker.intern_mod(item),
+            _ => unreachable!(),
+        };
+        let referrer = leaker.result().finish().unwrap();
+        assert!(referrer.iter().count() > 0, "{}", shape);
+        let text = referrer.to_token_stream().to_string();
+        match shape {
+            "fn bound" => assert!(text.contains("Fn (u8)"), "{}", text),
+            "where, Self and GAT" => assert!(text.contains("type G"), "{}", text),
+            "Self is a type" => assert!(text.contains("Self = S < T >"), "{}", text),
+            _ => assert!(text.contains("Self ;"), "{}", text),
+        }
+        check_serialized_ids(shape, &referrer, &[top_level], true);
+    }
+
+    // The parts (`[..]` after the tag), no group count, and no context but the first.
+    let parts = from_text("[type (R) 0 in (& R) 0] (Rel)");
+    check_serialized_ids("parts", &parts, &[], false);
+    assert_eq!(ids(&parts), [0]);
+    assert_eq!(entries_of(&parts), [0]);
+    let empty = Leaker::new().result().into_referrer();
+    check_serialized_ids("empty", &empty, &[], false);
+    assert_eq!(ids(&empty), [0]);
+}
+
+/// The reader fails for a shape it does not know, and for tokens after the groups.
+#[test]
+fn the_reader_of_the_serialized_form_does_not_guess() {
+    let read = |text: &str| common::read_serialized_ids(parse_str(text).unwrap());
+    let tag = version();
+    // What it reads.
+    let ok = read(&format!("\"{}\" 3 (A) < T > ; (B) # 0 (C)", tag)).unwrap();
+    assert_eq!(ok.declared, [id(0), id(1)]);
+    assert_eq!(ok.entries, [id(0), id(1), id(0)]);
+    // What it does not: another tag, none, an item out of its place or twice, no `;`, no entries,
+    // the entries of an undeclared context after a declared one, and trailing tokens.
+    for text in [
+        "\"type-leak-format-1\" (A)".to_string(),
+        "(A)".to_string(),
+        format!("\"{}\" Self ; < T > ; (A)", tag),
+        format!("\"{}\" < T > ; < U > ; (A)", tag),
+        format!("\"{}\" mod 1 ; Self ; (A)", tag),
+        format!("\"{}\" < T > (A)", tag),
+        format!("\"{}\" < T > ;", tag),
+        format!("\"{}\" 2 (A) # 0 < T > ; (B)", tag),
+        format!("\"{}\" (A) (B)", tag),
+        format!("\"{}\" 2 (A) # x (B)", tag),
+        format!("\"{}\" (A, , B)", tag),
+        format!("\"{}\" ({{}})", tag),
+    ] {
+        assert!(read(&text).is_err(), "{}", text);
+    }
 }

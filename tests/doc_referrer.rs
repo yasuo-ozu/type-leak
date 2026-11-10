@@ -5,28 +5,9 @@ use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
 
-/// `external_crates_require()` lists the crates an entry names, sorted; a relative path has none.
+/// `iter()` has a type of another crate too, and `repeater_impl()` writes an impl for each entry.
 #[test]
-fn external_crates_require_lists_sorted_crate_names() {
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(
-        &parse_quote!(
-            struct S {
-                a: ::foo::X<::bar::Y>,
-                b: Rel,
-            }
-        ),
-        true,
-    );
-    let referrer = leaker.result().finish().unwrap();
-    // `Rel` is entry 0, `::foo::X<::bar::Y>` entry 1.
-    assert!(referrer.external_crates_require(0).is_empty());
-    assert_eq!(referrer.external_crates_require(1), ["bar", "foo"]);
-}
-
-/// `required()` skips the optional entries that `iter()` has.
-#[test]
-fn required_skips_optional_entries() {
+fn iter_has_the_types_of_other_crates_and_each_entry_gets_a_repeater_impl() {
     let mut leaker = Leaker::new();
     leaker.intern_struct(
         &parse_quote!(
@@ -38,28 +19,7 @@ fn required_skips_optional_entries() {
         true,
     );
     let referrer = leaker.result().finish().unwrap();
-    // `::foo::X` is optional: another crate may name it differently.
-    assert_eq!(referrer.iter().count(), 2);
-    assert_eq!(referrer.required().count(), 1);
-    let (ix, ty) = referrer.required().next().unwrap();
-    assert_eq!((ix, ty), (0, &parse_quote!(Rel)));
-}
-
-/// `iter()` has the optional entry too, and `repeater_impl()` writes an impl for each.
-#[test]
-fn iter_has_the_optional_entries_and_each_gets_a_repeater_impl() {
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(
-        &parse_quote!(
-            struct S {
-                a: Rel,
-                b: ::foo::X,
-            }
-        ),
-        true,
-    );
-    let referrer = leaker.result().finish().unwrap();
-    // One impl for each entry, the optional one too.
+    // One impl for each entry, the one of another crate too.
     let param: Ident = parse_quote!(__S);
     let impls: Vec<RepeaterImpl> = (0..referrer.iter().count())
         .map(|ix| {
@@ -69,29 +29,6 @@ fn iter_has_the_optional_entries_and_each_gets_a_repeater_impl() {
         })
         .collect();
     assert_eq!(impls.len(), 2);
-}
-
-/// `is_plain()` is false for an entry that uses a generic or names `Self`.
-#[test]
-fn is_plain_holds_only_without_generics_and_self() {
-    let mut leaker = Leaker::new();
-    leaker.intern_trait(
-        &parse_quote!(
-            trait Tr<T> {
-                fn f(&self, a: Rel, b: Wrap<T>) -> Self::A;
-            }
-        ),
-        true,
-    );
-    let referrer = leaker.result().finish().unwrap();
-    let plain: Vec<_> = referrer
-        .iter()
-        .enumerate()
-        .filter(|(ix, _)| referrer.is_plain(*ix))
-        .collect();
-    // `Wrap<T>` uses a generic, and `Self::A` names `Self`.
-    assert_eq!(plain.len(), 1);
-    assert_eq!(plain[0].1, &parse_quote!(Rel));
 }
 
 /// `context_self()` is `Bound` for an entry that names `Self` in a trait, else `None`.
@@ -109,19 +46,13 @@ fn context_self_is_bound_for_self_in_a_trait_and_none_otherwise() {
     );
     let referrer = leaker.result().finish().unwrap();
     // `Wrap<Self>` is written for the implementors of the trait. `Rel` is for any type.
-    let wrap = referrer
-        .iter()
-        .position(|ty| *ty == parse_quote!(Wrap<Self>))
-        .unwrap();
-    let rel = referrer
-        .iter()
-        .position(|ty| *ty == parse_quote!(Rel))
-        .unwrap();
-    assert!(matches!(
-        referrer.context_self(referrer.context(wrap)),
-        Some(SelfRequirement::Bound(_))
-    ));
-    assert!(referrer.context_self(referrer.context(rel)).is_none());
+    for (ty, context) in referrer.iter() {
+        if *ty == parse_quote!(Wrap<Self>) {
+            assert!(matches!(context.self_ty, Some(SelfRequirement::Bound(_))));
+        } else {
+            assert!(*ty == parse_quote!(Rel) && context.self_ty.is_none());
+        }
+    }
 }
 
 /// `has_self()` is true for `Self::A` in a leaked type and false without it.
@@ -150,8 +81,8 @@ fn has_self_tells_whether_an_entry_names_self() {
     assert!(!leaker.result().finish().unwrap().has_self());
 }
 
-/// `has_self()` is true if some entry `needs_self()`, also if its context has `Self` only in
-/// `Self: 'a`, which is not a leaked type nor a generic of the context.
+/// `has_self()` is true if some entry names `Self` or its context's generics do, also if its
+/// context has `Self` only in `Self: 'a`, which is not a leaked type nor a generic of the context.
 #[test]
 fn has_self_is_true_if_some_entry_needs_self() {
     let mut leaker = Leaker::new();
@@ -167,7 +98,7 @@ fn has_self_is_true_if_some_entry_needs_self() {
         true,
     );
     let referrer = leaker.result().finish().unwrap();
-    assert!(referrer.needs_self(0));
+    assert!(referrer.bucket_self(0, 7).is_none());
     assert!(referrer.has_self());
     let parsed: Referrer = parse2(quote!(#referrer)).unwrap();
     assert!(parsed.has_self());
@@ -183,7 +114,7 @@ fn has_self_is_true_if_some_entry_needs_self() {
         true,
     );
     let referrer = leaker.result().finish().unwrap();
-    assert!((0..referrer.iter().count()).all(|ix| !referrer.needs_self(ix)));
+    assert!((0..referrer.iter().count()).all(|ix| referrer.bucket_self(ix, 7).is_some()));
     assert!(!referrer.has_self());
 }
 
@@ -228,8 +159,9 @@ fn context_generic_args_passes_method_generics_by_name() {
     let referrer = leaker.result().finish().unwrap();
     // `impl Tr<u8> for ..`: `T` is `u8`. `U` is a generic of the method, passed by its name.
     let trait_args: Vec<GenericArgument> = vec![parse_quote!(u8)];
+    let (_, context) = referrer.iter().next().unwrap();
     let args = referrer
-        .context_generic_args(referrer.context(0), &tr.generics.params, &trait_args)
+        .context_generic_args(&context.generics, &tr.generics.params, &trait_args)
         .unwrap();
     let expected: Vec<GenericArgument> = vec![parse_quote!(u8), parse_quote!(U)];
     assert_eq!(args, expected);
@@ -357,10 +289,8 @@ fn nested_self_passes_the_copys_own_self_for_a_bound_naming_self() {
         view.visit_item(&Item::Struct(item.clone()))
     });
     let referrer = leaker.result().finish().unwrap();
-    assert!(matches!(
-        referrer.context_self(referrer.context(0)),
-        Some(SelfRequirement::Any)
-    ));
+    let (_, context) = referrer.iter().next().unwrap();
+    assert!(matches!(context.self_ty, Some(SelfRequirement::Any)));
 
     // The Leaker's crate: the impl is for any type `__S` that `T: AsRef<__S>` holds for.
     let slots = RepeaterSlots::new(parse_quote!(Repeater));
@@ -397,7 +327,7 @@ fn nested_self_passes_the_copys_own_self_for_a_bound_naming_self() {
             let args = referrer
                 .entry_args(ix, &UseSite::identity(), slots.const_fn())
                 .unwrap();
-            match referrer.context_self(referrer.context(ix)) {
+            match &referrer.iter().nth(ix).unwrap().1.self_ty {
                 Some(SelfRequirement::Any) => slots.projection(&parse_quote!(Self), &args, 7, ix),
                 _ => unimplemented!("the Leaker's type, from `nested`"),
             }
@@ -448,33 +378,24 @@ fn nested_self_keeps_an_absolute_self_type_as_written_when_optional_entries_are_
     assert_eq!(file, expected);
 }
 
-/// A macro that trusts the crates of an optional entry keeps it as written by returning the leaked
-/// type from `type_fn` and `nested_fn`, and replaces the others (see
-/// [`Referrer::external_crates_require()`]).
+/// A macro has a type of another crate copied as written by giving the Leaker
+/// `Rules::external_crates()`: it is no entry, so `type_fn` and `nested_fn` are not asked.
 #[test]
-fn a_type_fn_keeps_the_optional_entries_of_the_crates_it_trusts() {
+fn a_leaker_that_allows_the_crates_makes_no_entry_of_their_types() {
     let item: ItemStruct = parse_quote! {
         struct Node<T> {
             next: ::std::boxed::Box<Self>, // the copy's `Node<T>`: no entry
-            other: ::p::Wrap<T>,           // an optional entry of `p`
-            more: ::q::Wrap<T>,            // an optional entry of `q`
-            leaked: Rel<Self>,             // a required entry: the macro writes the type
+            other: ::p::Wrap<T>,           // no entry: the Leaker allows the crate
+            more: ::q::Wrap<T>,            // no entry: the Leaker allows the crate
+            leaked: Rel<Self>,             // an entry: the macro writes the type
         }
     };
-    let mut leaker = Leaker::new();
+    let mut leaker = Leaker::from_config(Rules::new().external_crates(), Options::new());
     let (module, ()) = leaker.enter_mod("m", [item.ident.clone()], |view| {
         view.visit_item(&Item::Struct(item.clone()))
     });
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(referrer.iter().count(), 3);
-    let trusted = ["p"];
-    let keeps = |ix: usize| {
-        !referrer.must(ix)
-            && referrer
-                .external_crates_require(ix)
-                .iter()
-                .all(|name| trusted.contains(&name.as_str()))
-    };
+    assert_eq!(referrer.iter().count(), 1);
 
     let mut file = File {
         shebang: None,
@@ -482,26 +403,14 @@ fn a_type_fn_keeps_the_optional_entries_of_the_crates_it_trusts() {
         items: vec![Item::Struct(item)],
     };
     referrer
-        .visitor(module, |leaked, ix| {
-            if keeps(ix) {
-                leaked
-            } else {
-                parse_quote!(Entry<#ix>)
-            }
-        })
-        .with_nested_self(|_nested, leaked, ix| {
-            if keeps(ix) {
-                leaked
-            } else {
-                parse_quote!(LeakersType<#ix>)
-            }
-        })
+        .visitor(module, |_leaked, ix| parse_quote!(Entry<#ix>))
+        .with_nested_self(|_nested, _leaked, ix| parse_quote!(LeakersType<#ix>))
         .visit_file_mut(&mut file);
     let expected: File = parse_quote! {
         struct Node<T> {
             next: ::std::boxed::Box<Self>,
             other: ::p::Wrap<T>,
-            more: Entry<2usize>,
+            more: ::q::Wrap<T>,
             leaked: LeakersType<0usize>,
         }
     };

@@ -38,8 +38,7 @@ fn leaked_allowing_crates(item: ItemTrait) -> Vec<(String, String)> {
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
         .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+        .map(|(ty, context)| (ty, &context.generics))
         .map(|(ty, generics)| (s(ty), s(&quote!(#generics #{&generics.where_clause}))))
         .collect()
 }
@@ -255,18 +254,12 @@ fn a_trait_object_requires_its_arguments_to_outlive_too() {
 fn with_self_outlives(referrer: &Referrer) -> Vec<(String, String, Vec<String>)> {
     referrer
         .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
-        .enumerate()
-        .map(|(ix, (ty, generics))| {
+        .map(|(ty, context)| {
+            let generics = &context.generics;
             (
                 s(ty),
                 s(&quote!(#generics #{&generics.where_clause})),
-                referrer
-                    .context_self_outlives(referrer.context(ix))
-                    .iter()
-                    .map(s)
-                    .collect(),
+                context.self_outlives.iter().map(s).collect(),
             )
         })
         .collect()
@@ -452,38 +445,29 @@ fn bounds_are_part_of_the_context() {
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
-    assert_ne!(referrer.context(0), top_level);
-    assert_eq!(s(referrer.context_generics(top_level)), "< 'a , T >");
-    assert_eq!(
-        s(referrer.context_generics(referrer.context(0))),
-        "< 'a , T : 'a >"
-    );
+    assert_ne!(common::entry_id(&referrer, 0), top_level);
+    assert_eq!(s(&referrer.get_context(top_level).generics), "< 'a , T >");
+    assert_eq!(s(&common::entry(&referrer, 0).generics), "< 'a , T : 'a >");
     // A path with the lifetime implies none, so the context is the top-level one.
     let tr: ItemTrait = parse_quote! { trait Tr<'a, T> { fn f(&self, x: Rel<'a, T>); } };
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(referrer.context(0), top_level);
-    assert_eq!(
-        s(referrer.context_generics(referrer.context(0))),
-        "< 'a , T >"
-    );
+    assert_eq!(common::entry_id(&referrer, 0), top_level);
+    assert_eq!(s(&common::entry(&referrer, 0).generics), "< 'a , T >");
     // A struct with the bound written is the same context as the type.
     let st: ItemStruct = parse_quote! { struct S<'a, T: 'a>(Rel<'a, T>); };
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_struct(&st, true);
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(referrer.context(0), top_level);
+    assert_eq!(common::entry_id(&referrer, 0), top_level);
     // Without it, the context is that of the generics as they are as well: the path implies none.
     let st: ItemStruct = parse_quote! { struct S<'a, T>(Rel<'a, T>); };
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_struct(&st, true);
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(referrer.context(0), top_level);
-    assert_eq!(
-        s(referrer.context_generics(referrer.context(0))),
-        "< 'a , T >"
-    );
+    assert_eq!(common::entry_id(&referrer, 0), top_level);
+    assert_eq!(s(&common::entry(&referrer, 0).generics), "< 'a , T >");
     // Two declarations of the same meaning give the same context (the bound is not duplicated).
     let a: ItemTrait = parse_quote! { trait Tr { fn f<'a, T: 'a>(&self, x: Rel<'a, T>); } };
     let b: ItemTrait = parse_quote! { trait Tr { fn f<'a, T>(&self, x: Rel<'a, T>) where T: 'a; } };
@@ -491,7 +475,7 @@ fn bounds_are_part_of_the_context() {
         let mut leaker = Leaker::new();
         leaker.intern_trait(item, true);
         let referrer = leaker.result().finish().unwrap();
-        vec![referrer.context(0)]
+        vec![common::entry_id(&referrer, 0)]
     };
     assert_eq!(contexts(&a), contexts(&b));
     assert_eq!(leaked(a), leaked(b));
@@ -508,10 +492,7 @@ fn bounds_are_part_of_the_context() {
     leaker.intern_trait(&implied, true);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().count(), 1);
-    assert_eq!(
-        s(referrer.context_generics(referrer.context(0))),
-        "< 'a , T : 'a >"
-    );
+    assert_eq!(s(&common::entry(&referrer, 0).generics), "< 'a , T : 'a >");
     assert_eq!(leaked(written), leaked(implied));
 }
 
@@ -616,7 +597,7 @@ fn impl_and_context(item: ItemTrait) -> (String, String) {
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item, true);
     let referrer = leaker.result().finish().unwrap();
-    let context = referrer.context(0);
+    let context = common::entry_id(&referrer, 0);
     let marker: Type = parse_quote!(crate::Marker);
     let r = referrer
         .repeater_impl(0, ImplSelf::Marker(&marker), array_const)
@@ -624,7 +605,7 @@ fn impl_and_context(item: ItemTrait) -> (String, String) {
     let with_where = |g: &Generics| s(&quote!(#g #{&g.where_clause}));
     (
         with_where(&r.generics),
-        with_where(referrer.context_generics(context)),
+        with_where(&referrer.get_context(context).generics),
     )
 }
 
@@ -722,10 +703,7 @@ fn impl_generics_drop_the_encoded_bounds() {
     leaker.intern_trait(&tr, true);
     let referrer = leaker.result().finish().unwrap();
     // The context generics are not changed.
-    assert_eq!(
-        s(referrer.context_generics(referrer.context(0))),
-        "< 'a , T : 'a >"
-    );
+    assert_eq!(s(&common::entry(&referrer, 0).generics), "< 'a , T : 'a >");
 }
 
 mod ancestors {
@@ -789,8 +767,7 @@ mod ancestors {
     fn contexts_of(referrer: &Referrer, ty: &str) -> Vec<String> {
         referrer
             .iter()
-            .enumerate()
-            .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+            .map(|(ty, context)| (ty, &context.generics))
             .filter(|(leaked, _)| s(leaked) == ty)
             .map(|(_, generics)| s(&quote!(#generics #{&generics.where_clause})))
             .collect()
@@ -1087,10 +1064,12 @@ mod ancestors {
         for ix in 0..referrer.iter().count() {
             assert!(
                 referrer
-                    .context_self_outlives(referrer.context(ix))
+                    .get_context(crate::common::entry_id(&referrer, ix))
+                    .self_outlives
+                    .as_slice()
                     .is_empty(),
                 "{}",
-                s(referrer.iter().nth(ix).unwrap())
+                s(crate::common::types(&referrer).nth(ix).unwrap())
             );
         }
         assert_eq!(
@@ -1206,17 +1185,12 @@ mod ancestors {
         let referrer = referrer_of(&tr);
         let found: Vec<(String, Vec<String>)> = referrer
             .iter()
-            .enumerate()
-            .map(|(ix, _)| {
-                let context = referrer.context(ix);
-                assert!(matches!(
-                    referrer.context_self(context),
-                    Some(SelfRequirement::Bound(_))
-                ));
+            .map(|(_, context)| {
+                assert!(matches!(context.self_ty, Some(SelfRequirement::Bound(_))));
                 (
-                    s(&referrer.context_generics(context).params),
-                    referrer
-                        .context_self_outlives(context)
+                    s(&context.generics.params),
+                    context
+                        .self_outlives
                         .iter()
                         .map(|l| l.to_string())
                         .collect(),
@@ -1255,8 +1229,7 @@ mod ancestors {
     fn entry(referrer: &Referrer, ty: &str, generics: &str) -> usize {
         referrer
             .iter()
-            .enumerate()
-            .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+            .map(|(ty, context)| (ty, &context.generics))
             .position(|(leaked, g)| {
                 s(leaked) == ty && s(&quote!(#g #{&g.where_clause})) == generics
             })
@@ -1734,11 +1707,16 @@ mod ancestors {
             assert_eq!(contexts_of(&referrer, "Rel2 < U >"), ["< U >"]);
             // `Self` is not a generic: `Self::A` mentions `Self`, but the type inside does not.
             let rel2 = (0..referrer.iter().count())
-                .find(|&ix| s(referrer.iter().nth(ix).unwrap()) == "Rel2 < U >")
+                .find(|&ix| s(crate::common::types(&referrer).nth(ix).unwrap()) == "Rel2 < U >")
                 .unwrap();
-            assert!(referrer.context_self(referrer.context(rel2)).is_none());
+            assert!(crate::common::entry(&referrer, rel2)
+                .self_ty
+                .as_ref()
+                .is_none());
             assert!(referrer
-                .context_self_outlives(referrer.context(rel2))
+                .get_context(crate::common::entry_id(&referrer, rel2))
+                .self_outlives
+                .as_slice()
                 .is_empty());
         }
 
@@ -2009,20 +1987,16 @@ mod self_outlives {
 
     /// The lifetimes which `Self` outlives in each context, with the types in it.
     fn outlives(referrer: &Referrer) -> Vec<(Vec<String>, Vec<String>)> {
-        referrer
-            .contexts()
+        common::context_ids(referrer)
+            .into_iter()
             .map(|context| {
+                let found = referrer.get_context(context);
                 let types = referrer
                     .iter()
-                    .enumerate()
-                    .filter(|(ix, _)| referrer.context(*ix) == context)
-                    .map(|(_, ty)| s(ty))
+                    .filter(|(_, other)| *other == found)
+                    .map(|(ty, _)| s(ty))
                     .collect();
-                let outlives = referrer
-                    .context_self_outlives(context)
-                    .iter()
-                    .map(|l| l.to_string())
-                    .collect();
+                let outlives = found.self_outlives.iter().map(|l| l.to_string()).collect();
                 (types, outlives)
             })
             .collect()
@@ -2056,16 +2030,19 @@ mod self_outlives {
             assert_eq!(o, &["'a"], "{}", s(&item));
             assert_eq!(types.len(), 1, "{}", s(&item));
             // `Self` has a meaning in the context.
-            let context = referrer.context(0);
+            let context = common::entry_id(&referrer, 0);
             assert!(
                 matches!(
-                    referrer.context_self(context),
+                    referrer.get_context(context).self_ty.as_ref(),
                     Some(SelfRequirement::Bound(_))
                 ),
                 "{}",
                 s(&item)
             );
-            assert_eq!(referrer.context_self_outlives(context), lifetimes(&["'a"]));
+            assert_eq!(
+                referrer.get_context(context).self_outlives.as_slice(),
+                lifetimes(&["'a"])
+            );
         }
         // Every lifetime, sorted, each once (the reference of a generic lifetime is the type, with the
         // lifetime of the reference inside it too).
@@ -2127,8 +2104,8 @@ mod self_outlives {
                     outlives
                 );
             }
-            let predicates: Vec<String> = referrer
-                .context_generics(referrer.context(0))
+            let predicates: Vec<String> = common::entry(&referrer, 0)
+                .generics
                 .where_clause
                 .iter()
                 .flat_map(|w| &w.predicates)
@@ -2192,12 +2169,15 @@ mod self_outlives {
         let mut leaker = Leaker::new();
         leaker.intern_struct(&item, true);
         let referrer = leaker.result().finish().unwrap();
-        let context = referrer.context(0);
-        match referrer.context_self(context) {
+        let context = common::entry_id(&referrer, 0);
+        match referrer.get_context(context).self_ty.as_ref() {
             Some(SelfRequirement::Type(ty)) => assert_eq!(s(ty), "MyStruct < 'a , T >"),
             other => panic!("{:?}", other),
         }
-        assert_eq!(referrer.context_self_outlives(context), lifetimes(&["'a"]));
+        assert_eq!(
+            referrer.get_context(context).self_outlives.as_slice(),
+            lifetimes(&["'a"])
+        );
         // The encoding in the implementation `impl<'a, T> Repeater<(&'a (), T, &'a Self), ..> for
         // MyStruct<'a, T>`; and `T: 'a` follows from it (`MyStruct<'a, T>: 'a`).
         let param: Ident = parse_quote!(__S);
@@ -2208,7 +2188,7 @@ mod self_outlives {
         let expected: Type = parse_quote!((&'a (), T, &'a Self));
         assert_eq!(s(&encoded), s(&expected));
         // A concrete type in place of `Self` is as good.
-        let self_ty = match referrer.context_self(context) {
+        let self_ty = match referrer.get_context(context).self_ty.as_ref() {
             Some(SelfRequirement::Type(ty)) => ty,
             _ => unreachable!(),
         };
@@ -2242,7 +2222,7 @@ mod self_outlives {
         // Not for a type which does not mention `Self`: no `Self` in its context, so no bound.
         assert!(found.contains(&(vec!["& 'a Rel3".to_string()], vec![])));
         // The ids of the contexts are distinct.
-        let contexts: Vec<ContextId> = referrer.contexts().collect();
+        let contexts: Vec<ContextId> = common::context_ids(&referrer).into_iter().collect();
         assert_eq!(contexts.len(), 3);
     }
 
@@ -2270,22 +2250,28 @@ mod self_outlives {
         .parse()
         .unwrap();
         let parsed: Referrer = parse2(tokens).unwrap();
-        let context = parsed.context(0);
-        assert_eq!(parsed.context_self_outlives(context), lifetimes(&["'a"]));
+        let context = common::entry_id(&parsed, 0);
+        assert_eq!(
+            parsed.get_context(context).self_outlives.as_slice(),
+            lifetimes(&["'a"])
+        );
         assert!(matches!(
-            parsed.context_self(context),
+            parsed.get_context(context).self_ty.as_ref(),
             Some(SelfRequirement::Bound(_))
         ));
-        let module = parsed.context_module(context).unwrap();
+        let module = common::in_module(parsed.get_context(context)).unwrap();
         assert_eq!(module.index(), 0);
-        assert_eq!(parsed.module_path(module), Some(&[][..]));
+        assert_eq!(common::module_path(&parsed, module), Some(&[][..]));
         // A Referrer serialized before the clause existed has none.
         let tokens: proc_macro2::TokenStream =
             format!("\"{}\" Self : Tr ; (Rel < Self >)", version)
                 .parse()
                 .unwrap();
         let parsed: Referrer = parse2(tokens).unwrap();
-        assert!(parsed.context_self_outlives(parsed.context(0)).is_empty());
+        assert!(common::entry(&parsed, 0)
+            .self_outlives
+            .as_slice()
+            .is_empty());
     }
 
     #[test]
@@ -2334,7 +2320,7 @@ mod self_outlives {
 
     /// The generics (with the where clause) of the context of the entry `ix`.
     fn declared(referrer: &Referrer, ix: usize) -> String {
-        let generics = referrer.context_generics(referrer.context(ix));
+        let generics = &common::entry(referrer, ix).generics;
         let where_clause = &generics.where_clause;
         s(&quote!(#generics #where_clause))
     }
@@ -2355,8 +2341,11 @@ mod self_outlives {
         assert_eq!(first, second);
         let referrer = leaker.result().finish().unwrap();
         assert_eq!(referrer.iter().count(), 1);
-        let context = referrer.context(0);
-        assert_eq!(referrer.context_self_outlives(context), lifetimes(&["'a"]));
+        let context = common::entry_id(&referrer, 0);
+        assert_eq!(
+            referrer.get_context(context).self_outlives.as_slice(),
+            lifetimes(&["'a"])
+        );
         assert_eq!(
             declared(&referrer, 0),
             "< 'a > where Self : :: core :: marker :: Sized"
@@ -2380,11 +2369,12 @@ mod self_outlives {
         let by_written_path = of_trait(written_path.clone());
         let by_plain_path = of_trait(plain_path.clone());
         assert_eq!(
-            by_written_path.context_self_outlives(by_written_path.context(0)),
+            common::entry(&by_written_path, 0).self_outlives.as_slice(),
             lifetimes(&["'a"])
         );
-        assert!(by_plain_path
-            .context_self_outlives(by_plain_path.context(0))
+        assert!(common::entry(&by_plain_path, 0)
+            .self_outlives
+            .as_slice()
             .is_empty());
         assert_ne!(by_written_path, by_plain_path);
         assert_eq!(
@@ -2401,7 +2391,10 @@ mod self_outlives {
         }
         let referrer = leaker.result().finish().unwrap();
         assert_eq!(referrer.iter().count(), 2);
-        assert_eq!(referrer.context(0), referrer.context(1));
+        assert_eq!(
+            common::entry_id(&referrer, 0),
+            common::entry_id(&referrer, 1)
+        );
 
         // The predicate may be written in the where clause of the trait, or in several predicates.
         for item in [
@@ -2424,14 +2417,14 @@ mod self_outlives {
             let item: ItemTrait = item;
             let referrer = of_trait(item.clone());
             assert_eq!(referrer.iter().count(), 1, "{}", s(&item));
-            let context = referrer.context(0);
+            let context = common::entry_id(&referrer, 0);
             assert_eq!(
-                referrer.context_self_outlives(context),
+                referrer.get_context(context).self_outlives.as_slice(),
                 lifetimes(&["'a"]),
                 "{}",
                 s(&item)
             );
-            let generics = s(referrer.context_generics(context));
+            let generics = s(&referrer.get_context(context).generics);
             assert!(
                 !generics.contains("Self : 'a"),
                 "{}: {}",
@@ -2456,9 +2449,9 @@ mod self_outlives {
                 fn f<'a, 'c>(&self, x: &'b Rel<Self>) where Self: ::core::marker::Sized + 'c + 'a;
             }
         });
-        let context = referrer.context(0);
+        let context = common::entry_id(&referrer, 0);
         assert_eq!(
-            referrer.context_self_outlives(context),
+            referrer.get_context(context).self_outlives.as_slice(),
             lifetimes(&["'a", "'b", "'c"])
         );
         assert_eq!(
@@ -2471,9 +2464,9 @@ mod self_outlives {
                 fn f<'a, 'c>(&self, x: Rel<'a, 'b, Self>) where Self: ::core::marker::Sized + 'c + 'a;
             }
         });
-        let context = referrer.context(0);
+        let context = common::entry_id(&referrer, 0);
         assert_eq!(
-            referrer.context_self_outlives(context),
+            referrer.get_context(context).self_outlives.as_slice(),
             lifetimes(&["'a", "'c"])
         );
         assert_eq!(
@@ -2485,8 +2478,11 @@ mod self_outlives {
         let referrer = of_trait(parse_quote! {
             trait Tr { fn f<'a, T>(&self, x: Rel<'a, T>) where Self: 'a; }
         });
-        let context = referrer.context(0);
-        assert_eq!(referrer.context_self_outlives(context), lifetimes(&["'a"]));
+        let context = common::entry_id(&referrer, 0);
+        assert_eq!(
+            referrer.get_context(context).self_outlives.as_slice(),
+            lifetimes(&["'a"])
+        );
         assert_eq!(declared(&referrer, 0), "< 'a , T >");
     }
 
@@ -2624,7 +2620,7 @@ mod self_outlives {
             let referrer = of_trait(item.clone());
             assert_eq!(declared(&referrer, 0), declared_generics, "{}", s(&item));
             assert_eq!(
-                referrer.context_self_outlives(referrer.context(0)),
+                common::entry(&referrer, 0).self_outlives.as_slice(),
                 lifetimes(outlived),
                 "{}",
                 s(&item)
@@ -2720,7 +2716,7 @@ mod self_outlives {
             }
             // `expand()` takes the generics and `Self` of the context. A lifetime of a method is not
             // among them, so the entry that has it is not found there: visit the method instead.
-            let ty = referrer.iter().next().unwrap().clone();
+            let ty = common::types(&referrer).next().unwrap().clone();
             let expanded = referrer.expand(top_level, ty.clone(), |_, ix| parse_quote!(P<#ix>));
             if tr.generics.params.is_empty() {
                 assert_eq!(s(&expanded), s(&ty), "{}", s(&tr));
@@ -2750,7 +2746,7 @@ mod self_outlives {
         let top_level = leaker.intern_trait(&other, true);
         let referrer = leaker.result().finish().unwrap();
         assert_eq!(
-            referrer.context_self_outlives(referrer.context(0)),
+            common::entry(&referrer, 0).self_outlives.as_slice(),
             lifetimes(&["'a", "'z"])
         );
         for how in ["declared", "leakers"] {
@@ -2773,7 +2769,7 @@ mod self_outlives {
         let top_level = leaker.intern_trait(&path, true);
         let referrer = leaker.result().finish().unwrap();
         assert_eq!(
-            referrer.context_self_outlives(referrer.context(0)),
+            common::entry(&referrer, 0).self_outlives.as_slice(),
             lifetimes(&["'z"])
         );
         for how in ["declared", "leakers"] {

@@ -98,7 +98,8 @@ pub(crate) struct TypeGraph {
     nodes: HashSet<NodeKey>,
     /// The types that appear as roots, not as components of another type.
     pub(crate) roots: HashSet<NodeKey>,
-    /// The types that depend on the context: each must be an entry or inside one.
+    /// The types that depend on the context: each must be an entry or inside one. The kept
+    /// required entries are in it too.
     pub(crate) must_intern: HashSet<NodeKey>,
     /// The types that the Referrer may replace (their own path names an external crate): the same.
     pub(crate) optional: HashSet<NodeKey>,
@@ -106,17 +107,16 @@ pub(crate) struct TypeGraph {
     pub(crate) required_candidates: HashSet<NodeKey>,
     /// The types that may be an optional entry: they or a part of them is optional.
     pub(crate) optional_candidates: HashSet<NodeKey>,
-    /// The types that cannot be required entries, because the copy would be cyclic (see
-    /// `AnalyzeVisitor::env_cycle()`): their components are entries instead.
-    pub(crate) no_required: HashSet<NodeKey>,
-    /// The same for the optional entries.
-    pub(crate) no_optional: HashSet<NodeKey>,
-    /// The required entries that a reduction chose and kept ([`TypeGraph::kept()`]). Each stays a
-    /// required entry whatever is merged in later, though what made it required is gone.
-    pub(crate) kept_required: HashSet<NodeKey>,
-    /// The optional entries that a reduction chose and kept: the same, but one that a type merged
-    /// in later makes hold a required type becomes a required entry.
-    pub(crate) kept_optional: HashSet<NodeKey>,
+    /// The types that cannot be entries because the copy would be cyclic (see
+    /// `AnalyzeVisitor::env_cycle()`): their components are entries instead. A type is forbidden
+    /// as the kind it is, required if it is or holds a `must_intern` type, else optional, so one
+    /// set holds the flag of that kind.
+    pub(crate) no_entry: HashSet<NodeKey>,
+    /// The entries that a reduction chose and kept ([`TypeGraph::kept()`]). Each stays an entry
+    /// whatever is merged in later, though what made it one is gone. A kept required entry is also
+    /// in `must_intern`, so it stays required; a kept optional one becomes required if a type merged
+    /// in later makes it hold a required type.
+    pub(crate) kept: HashSet<NodeKey>,
 }
 
 impl TypeGraph {
@@ -157,8 +157,9 @@ impl TypeGraph {
     /// Returns the graph that holds only the entries `required` and `optional`, each a root with
     /// no components, and kept as the kind it is.
     ///
-    /// The kept sets mark them, not `must_intern` and `optional`: those say what a type is, and a
-    /// kept entry is a choice, which the types that made it required or optional no longer back.
+    /// `kept` marks them, as a kept entry is a choice, which the types that made it an entry no
+    /// longer back. A required one is also `must_intern`, which keeps its kind; `optional` says
+    /// what a type is, so an optional entry is not in it.
     pub(crate) fn kept(required: Vec<NodeKey>, optional: Vec<NodeKey>) -> Self {
         let mut graph = Self::default();
         for (key, must) in required
@@ -170,10 +171,9 @@ impl TypeGraph {
             graph.graph.insert_node(key.clone()).ok().unwrap();
             graph.roots.insert(key.clone());
             if must {
-                graph.kept_required.insert(key);
-            } else {
-                graph.kept_optional.insert(key);
+                graph.must_intern.insert(key.clone());
             }
+            graph.kept.insert(key);
         }
         graph
     }
@@ -184,14 +184,18 @@ impl TypeGraph {
     pub(crate) fn is_reduced(&self) -> bool {
         self.required_candidates.is_empty()
             && self.optional_candidates.is_empty()
-            && self.nodes.len() == self.kept_required.len() + self.kept_optional.len()
+            && self.nodes.len() == self.kept.len()
     }
 
     /// Returns the kept entries: the required ones, then the optional ones, each sorted by context
     /// and tokens.
     pub(crate) fn into_kept_entries(self) -> (Vec<NodeKey>, Vec<NodeKey>) {
-        let sorted = |set: HashSet<NodeKey>| sorted_entries(set.into_iter().collect());
-        (sorted(self.kept_required), sorted(self.kept_optional))
+        let Self {
+            kept, must_intern, ..
+        } = self;
+        let (required, optional): (Vec<_>, Vec<_>) =
+            kept.into_iter().partition(|key| must_intern.contains(key));
+        (sorted_entries(required), sorted_entries(optional))
     }
 
     /// Returns the types, in no particular order.
@@ -219,10 +223,8 @@ impl TypeGraph {
         self.optional.extend(other.optional);
         self.required_candidates.extend(other.required_candidates);
         self.optional_candidates.extend(other.optional_candidates);
-        self.no_required.extend(other.no_required);
-        self.no_optional.extend(other.no_optional);
-        self.kept_required.extend(other.kept_required);
-        self.kept_optional.extend(other.kept_optional);
+        self.no_entry.extend(other.no_entry);
+        self.kept.extend(other.kept);
     }
 }
 

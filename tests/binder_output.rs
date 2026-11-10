@@ -87,19 +87,13 @@ fn leaked(item: ItemTrait) -> Vec<(String, String)> {
     leaked_by(leaker(), item)
 }
 
-/// The leaked types of a trait with the generics each uses, by the given Leaker. An optional entry
-/// (see `Referrer::must()`) is preceded by `?`.
+/// The leaked types of a trait with the generics each uses, by the given Leaker.
 fn leaked_by<A: Allow>(leaker: Leaker<A>, item: ItemTrait) -> Vec<(String, String)> {
     let referrer = analyze_with(leaker, &item).unwrap_or_else(|e| panic!("{}", to_syn_error(&e)));
     referrer
         .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
-        .enumerate()
-        .map(|(ix, (ty, generics))| {
-            let mark = if referrer.must(ix) { "" } else { "? " };
-            (format!("{}{}", mark, s(ty)), s(generics))
-        })
+        .map(|(ty, context)| (ty, &context.generics))
+        .map(|(ty, generics)| (s(ty), s(generics)))
         .collect()
 }
 
@@ -285,7 +279,7 @@ fn the_type_holding_the_binder_is_leaked_as_a_whole() {
     leaker.intern_struct(&item, true);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
-        referrer.iter().map(s).collect::<Vec<_>>(),
+        common::types(&referrer).map(s).collect::<Vec<_>>(),
         ["for < 'x > fn (Rel < 'x >) -> & 'x u8"]
     );
 }
@@ -651,7 +645,7 @@ fn the_copy_is_rewritten_to_the_type_holding_the_binder() {
     let (referrer, context) = analyze_in(leaker(), &item).unwrap();
     // The entries are ordered by context and then by their tokens.
     assert_eq!(
-        referrer.iter().map(s).collect::<Vec<_>>(),
+        common::types(&referrer).map(s).collect::<Vec<_>>(),
         ["for < 'x > fn (Rel < 'x >) -> & 'x u8", "Rel < 'x >"]
     );
     let mut copy = item.clone();
@@ -1169,8 +1163,7 @@ fn the_types_on_the_way_to_the_anchor_are_never_leaked() {
     let referrer = analyze(&item).unwrap();
     let found: Vec<_> = referrer
         .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+        .map(|(ty, context)| (ty, &context.generics))
         .map(|(ty, generics)| (s(ty), s(generics)))
         .collect();
     assert_eq!(
@@ -1189,7 +1182,11 @@ fn the_types_on_the_way_to_the_anchor_are_never_leaked() {
     }
     let item: ItemTrait = parse_quote! { trait Tr { #(#methods)* } };
     assert_eq!(
-        analyze(&item).unwrap().iter().map(s).collect::<Vec<_>>(),
+        analyze(&item)
+            .unwrap()
+            .iter()
+            .map(|(ty, _)| s(ty))
+            .collect::<Vec<_>>(),
         ["(u8 , Parser , Rel2)"]
     );
     // And the copy keeps `&'x str` where it was.
@@ -1232,7 +1229,7 @@ fn the_copy_keeps_the_trait_object_holding_the_anchor() {
     };
     let (referrer, context) = analyze_in(leaker(), &item).unwrap();
     assert_eq!(
-        referrer.iter().map(s).collect::<Vec<_>>(),
+        common::types(&referrer).map(s).collect::<Vec<_>>(),
         ["Parser < 'x >"]
     );
     let mut copy = item.clone();
@@ -1456,10 +1453,7 @@ fn a_trait_object_of_an_external_crate_with_a_lifetime_bound_is_leaked_alone() {
         assert_eq!(
             leaked_by(leaker_allowing_nothing(), item.clone()),
             [e(
-                &format!(
-                    "? {}",
-                    s(&parse_str::<Type>(&input_without_ref(&input)).unwrap())
-                ),
+                &s(&parse_str::<Type>(&input_without_ref(&input)).unwrap()),
                 "< 'x >"
             )],
             "{}",
@@ -1521,15 +1515,17 @@ fn the_types_which_stay_as_written_still_anchor_the_lifetime() {
         };
         let referrer = analyze_with(leaker_allowing_nothing(), &item)
             .unwrap_or_else(|e| panic!("{}: {}", input, to_syn_error(&e)));
-        // `Parser<'x>` is leaked alone (twice: in each binder, which are the same entry), and the
-        // external types are optional entries with `'x` among their generics, if they use it.
-        let required: Vec<String> = referrer
-            .iter()
-            .enumerate()
-            .filter(|(ix, _)| referrer.must(*ix))
-            .map(|(_, ty)| s(ty))
-            .collect();
-        assert_eq!(required, ["Parser < 'x >"], "{}", input);
+        // `Parser<'x>` is leaked alone (twice: in each binder, which are the same entry), and it
+        // comes first. The external types are entries with `'x` among their generics, if they use
+        // it.
+        let leaked: Vec<String> = common::types(&referrer).map(s).collect();
+        assert_eq!(leaked[0], "Parser < 'x >", "{}", input);
+        assert_eq!(
+            leaked.iter().filter(|ty| *ty == "Parser < 'x >").count(),
+            1,
+            "{}",
+            input
+        );
     }
 }
 
@@ -1547,7 +1543,7 @@ fn an_external_crate_type_which_uses_the_lifetime_of_a_binder_is_leaked_with_its
             }
         ),
         [e(
-            "? for < 'x > fn (:: other :: Wrap < & 'x u8 >) -> & 'x u8",
+            "for < 'x > fn (:: other :: Wrap < & 'x u8 >) -> & 'x u8",
             ""
         )]
     );
@@ -1559,7 +1555,7 @@ fn an_external_crate_type_which_uses_the_lifetime_of_a_binder_is_leaked_with_its
             }
         ),
         [e(
-            "? :: std :: boxed :: Box < dyn for < 'x > Fn (:: other :: Wrap < & 'x u8 >) -> & 'x u8 >",
+            ":: std :: boxed :: Box < dyn for < 'x > Fn (:: other :: Wrap < & 'x u8 >) -> & 'x u8 >",
             ""
         )]
     );
@@ -1594,7 +1590,7 @@ fn an_external_crate_type_which_uses_the_lifetime_of_a_binder_is_leaked_with_its
             }
         ),
         [e(
-            "? for < 'x > fn (:: other :: Wrap < & 'x u8 > , & u8) -> & 'x u8",
+            "for < 'x > fn (:: other :: Wrap < & 'x u8 > , & u8) -> & 'x u8",
             ""
         )]
     );
@@ -1618,7 +1614,7 @@ fn an_external_crate_type_which_uses_the_lifetime_of_a_binder_is_leaked_with_its
     };
     assert_eq!(
         leaked_by(leaker_allowing_nothing(), item),
-        [e("? :: other :: Wrap < u8 >", "")]
+        [e(":: other :: Wrap < u8 >", "")]
     );
     // And one which another input anchors, with `'x` among its generics.
     let item: ItemTrait = parse_quote! {
@@ -1626,7 +1622,7 @@ fn an_external_crate_type_which_uses_the_lifetime_of_a_binder_is_leaked_with_its
     };
     assert_eq!(
         leaked_by(leaker_allowing_nothing(), item),
-        [e("? :: other :: Wrap < & 'x u8 >", "< 'x >")]
+        [e(":: other :: Wrap < & 'x u8 >", "< 'x >")]
     );
     // With `Parser<'x>` beside it, the function pointer is one entry (it was `Parser<'x>` and the
     // optional `Wrap<&'x u8>`).
@@ -1656,18 +1652,6 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     let context = leaker.intern_trait(&item, true);
     let result = leaker.result();
     let referrer = result.finish().unwrap();
-    let mut kept = item.clone();
-    syn::visit_mut::VisitMut::visit_item_trait_mut(
-        &mut referrer.visitor(context, |ty, ix| {
-            if referrer.must(ix) {
-                parse_quote!(P<#ix>)
-            } else {
-                ty
-            }
-        }),
-        &mut kept,
-    );
-    assert_eq!(s(&kept), s(&item));
     // The macro which replaces them: the type is replaced (with its entry), and `&'x u8`
     // anchors `'x`, so the copy is valid.
     let mut replaced = item.clone();
@@ -1699,25 +1683,16 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
         let item: ItemTrait = item;
         let mut leaker = leaker_allowing_nothing();
         let context = leaker.intern_trait(&item, true);
-        let result = leaker.result();
-        for keeps_optional in [true, false] {
-            let mut copy = item.clone();
-            let referrer = result.clone().finish().unwrap();
-            syn::visit_mut::VisitMut::visit_item_trait_mut(
-                &mut referrer.visitor(context, |ty, ix| {
-                    if keeps_optional && !referrer.must(ix) {
-                        ty
-                    } else {
-                        parse_quote!(P<#ix>)
-                    }
-                }),
-                &mut copy,
-            );
-            let expected: ItemTrait = parse_quote! {
-                trait Tr { fn f(&self, f: P<0usize>); }
-            };
-            assert_eq!(s(&copy), s(&expected), "{}", s(&item));
-        }
+        let referrer = leaker.result().finish().unwrap();
+        let mut copy = item.clone();
+        syn::visit_mut::VisitMut::visit_item_trait_mut(
+            &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
+            &mut copy,
+        );
+        let expected: ItemTrait = parse_quote! {
+            trait Tr { fn f(&self, f: P<0usize>); }
+        };
+        assert_eq!(s(&copy), s(&expected), "{}", s(&item));
     }
 }
 
@@ -1778,8 +1753,7 @@ mod elided {
         let referrer = analyze(&item).unwrap_or_else(|e| panic!("{}: {}", s(&item), messages(&e)));
         referrer
             .iter()
-            .enumerate()
-            .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+            .map(|(ty, context)| (ty, &context.generics))
             .map(|(ty, generics)| (s(ty), s(generics)))
             .collect()
     }
@@ -1937,7 +1911,7 @@ mod elided {
         let mut leaker = leaker();
         leaker.intern_struct(&item, true);
         let referrer = leaker.result().finish().unwrap();
-        let mut found: Vec<String> = referrer.iter().map(s).collect();
+        let mut found: Vec<String> = crate::common::types(&referrer).map(s).collect();
         found.sort();
         assert_eq!(
             found,
@@ -2312,7 +2286,7 @@ mod elided {
         let referrer = leaker.result().finish().unwrap();
         // The entries are ordered by context and then by their tokens.
         assert_eq!(
-            referrer.iter().map(s).collect::<Vec<_>>(),
+            crate::common::types(&referrer).map(s).collect::<Vec<_>>(),
             [
                 "Rel < T >",
                 "dyn Fn (& Rel < T >) -> & u8",
@@ -2357,7 +2331,7 @@ mod elided {
                 .finish()
                 .unwrap()
                 .iter()
-                .map(s)
+                .map(|(ty, _)| s(ty))
                 .collect::<Vec<_>>(),
             ["dyn Fn (& Rel < T >) -> & u8"]
         );

@@ -67,7 +67,8 @@
 //! lifetime or without one.
 //!
 //! Settings: the Leaker does not allow the primitive types in a fifth of the cases
-//! (`Config::primitive`), and each item says which optional entries the Referrer trusts (`Trust`).
+//! (`Config::primitive`), and each item says whether the Referrer keeps the optional entries as
+//! written or replaces them (`Trust`).
 //!
 //! Shapes made for the reasons and the causes that random types rarely reach (each a small share of
 //! the items, decided by the hash of the state, which draws nothing, and put as a tag on what the item
@@ -240,17 +241,15 @@ pub struct Features {
     /// witness (no receiver).
     pub implied_outlives: bool,
     /// An optional entry in a where predicate that names a lifetime (`T: Fn(&'a ::ext::W<T,
-    /// ::ext::B0>)`) has the predicate in its context, so a Referrer that replaces it (one that
-    /// does not trust its crate: `Trust::None`, and the partial modes) uses a path that needs
-    /// itself (E0277, F17): `not_optional` of the Leaker misses the type that holds another
-    /// optional type. Fixed (on by default): the Leaker copies it as written. Off, the item that
-    /// has it is invoked with `Trust::All`.
+    /// ::ext::B0>)`) has the predicate in its context, so a copy that replaces it uses a path that
+    /// needs itself (E0277, F17): `not_optional` of the Leaker misses the type that holds another
+    /// optional type. Fixed (on by default): the Leaker copies it as written. Off, the shape is
+    /// not generated on purpose.
     pub strict_cycles: bool,
-    /// A Referrer that replaces an optional entry that holds a lifetime of a method (`fn
-    /// m<'x>(&self, a: ::ext::W<&'x u8>) -> Rel<'x>`): the copy has `'x` in no argument that
-    /// constrains it, so it is early-bound, where it is late-bound in the trait (E0195, F18, fixed:
-    /// the Leaker copies the type as written, on by default). Off, the item that has it is invoked
-    /// with `Trust::All`.
+    /// A copy that replaces an optional entry that holds a lifetime of a method (`fn m<'x>(&self,
+    /// a: ::ext::W<&'x u8>) -> Rel<'x>`): the copy has `'x` in no argument that constrains it, so it
+    /// is early-bound, where it is late-bound in the trait (E0195, F18, fixed: the Leaker copies
+    /// the type as written, on by default). Off, the shape is not generated on purpose.
     pub strict_anchors: bool,
     /// In an impl whose self type is leaked, a method with a bound of a generic that names `Self`
     /// (`X: Fn(&Self) -> u8`) and a leaked type in another predicate that uses the generic
@@ -767,39 +766,6 @@ pub const TAG_SELF_IN_PREDICATE: &str = "self_in_predicate";
 pub const TAG_ALIAS_BOUND: &str = "alias_bound";
 pub const TAG_HIDDEN_SELF: &str = "hidden_self";
 
-/// Which optional entries (a type of another crate by an absolute path) the Referrer of an item
-/// trusts: the rule it gives to `LeakerResult::allow()`. The rest are replaced through the Repeater.
-/// The trusted crates are promised to mean the same in the Referrer's crate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Trust {
-    /// Nothing (the library's default, `strict`).
-    None,
-    /// Every crate (`Rules::external_crates()`).
-    All,
-    /// `std`, `alloc` and `core` (`Rules::std_crates()`).
-    Std,
-    /// The Leaker's crate only (a path rule).
-    Leaker,
-}
-
-impl Trust {
-    pub const ALL: [Trust; 4] = [Trust::None, Trust::All, Trust::Std, Trust::Leaker];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Trust::None => "none",
-            Trust::All => "all",
-            Trust::Std => "std",
-            Trust::Leaker => "leaker",
-        }
-    }
-
-    /// The flag of the Referrer's invocation.
-    fn flag(self) -> String {
-        format!(", trust({})", self.name())
-    }
-}
-
 /// An item with a macro on it, which the Referrer invokes.
 #[derive(Clone)]
 pub struct Item {
@@ -807,8 +773,6 @@ pub struct Item {
     pub kind: &'static str,
     /// The module that contains it, from the root.
     pub module: Vec<String>,
-    /// Which optional entries the Referrer trusts.
-    pub trust: Trust,
     pub allow_self: bool,
     /// How the macro analyzes it: `""` by the `intern_*` method of its kind, or through a scope
     /// (`mod`: `enter_mod`, `generics`: `enter_generics`, `trait`: `enter_trait`, `impl`:
@@ -845,22 +809,6 @@ pub struct Case {
     /// The Referrer's crates of `TYPE_LEAK_PROP_FEATURES=allow_stages` (`stage_crates()`), which the
     /// harness writes with that feature only.
     pub stages: Vec<StageCrate>,
-    /// The decoy crates of the case, if it has them (`decoy_crates()`).
-    pub decoy: Option<Decoy>,
-}
-
-/// A Referrer's crate whose dependency `tlp_l_NNN` is another crate than the Leaker's, with the
-/// same names in `base` and other definitions (`Decoy::lib`), so that an optional entry that the
-/// Referrer trusts although it should replace it resolves to a type of the wrong crate, and the
-/// witness fails. The Leaker's crate is the dependency `real_NNN` of it.
-pub struct Decoy {
-    /// The `lib.rs` of the decoy crate (`tlp_d_NNN`): `base` of the Leaker, defined again.
-    pub lib: String,
-    /// The `lib.rs` of the Referrer's crate (`tlp_x_NNN`), which invokes the macros of the items
-    /// that do not trust the Leaker's crate.
-    pub referrer: String,
-    /// The line of `referrer` where each item is invoked.
-    pub lines: Vec<(usize, usize)>,
 }
 
 /// A Referrer's crate of `TYPE_LEAK_PROP_FEATURES=allow_stages`: it copies each item as the macro of
@@ -884,7 +832,7 @@ pub struct StageCrate {
 pub const ATTR: &str = "@ATTR@";
 
 /// The macro of the Leaker's crate that an array length names (`gen_discriminant_enum()`,
-/// `Gen::array()`, the decoy's crate has it too).
+/// `Gen::array()`).
 const TWO_MACRO: &str = "#[macro_export]\nmacro_rules! two { () => { 2 }; }\n";
 
 /// The scopes the macro analyzes an item through, and the name of the API of each (the statistics
@@ -1444,8 +1392,6 @@ struct Skeleton {
     consts: Vec<(String, &'static str)>,
     preds: Vec<String>,
     bounded: Vec<(String, &'static str)>,
-    /// A where predicate names a lifetime and an external type (`Risk::cycle`).
-    risk_cycle: bool,
     /// The tags of the struct, enum, union or trait that has these generics (`Item::tags`): an
     /// impl of it has its generics, predicates and methods, so its shapes.
     tags: BTreeSet<String>,
@@ -1453,18 +1399,6 @@ struct Skeleton {
     /// usize = 3`). Only the declaration of a struct, enum, union or trait writes them
     /// (`params_decl()`): an impl or a function cannot.
     defaults: Vec<(String, String)>,
-}
-
-/// What makes an item break under a Referrer that replaces optional entries
-/// (`strict_cycles`, `strict_anchors`): the item is invoked with `Trust::All` then, unless a feature
-/// asks for it.
-#[derive(Clone, Copy, Default, Debug)]
-struct Risk {
-    /// A where predicate names a lifetime and an absolute type of a crate that the Leaker does not
-    /// allow.
-    cycle: bool,
-    /// A method names a lifetime of its own inside such a type.
-    anchor: bool,
 }
 
 impl Skeleton {
@@ -1594,7 +1528,6 @@ struct TraitInfo {
     preds_leakable: bool,
     /// An elided `fn(&Self) -> &R` or `Fn(..)` is in it (`self_elision`).
     elided_self: bool,
-    risk: Risk,
 }
 
 pub struct Gen {
@@ -1630,8 +1563,6 @@ pub struct Gen {
     /// An elided `fn(&A) -> &R` or `Fn(&A) -> &R` with `Self` in `A` was generated since it was
     /// cleared (`self_elision`).
     elided_self: bool,
-    /// What the item being generated has that breaks under a strict Referrer.
-    risk: Risk,
     /// The item being generated may have the shapes that the Leaker rejects: a predicate that
     /// names a leaked type that uses a generic (`bound_cycles`), a bound of a generic that names
     /// `Self` with a predicate that uses the generic (`impl_self_bound_cycle`,
@@ -1650,10 +1581,6 @@ pub struct Gen {
     /// are written bare (`Sized`, `Fn(..)`, `Into<..>`, ...) instead of in full. It is the item's:
     /// with the prelude off the bare names are rejected, so few items have any (`bare_trait()`).
     bare_percent: u32,
-    /// The mode the item being generated is invoked with if it can be (`item_trust()`).
-    want_trust: Trust,
-    /// The mode in the attribute of the item generated last.
-    last_trust: Trust,
     /// The self types of the impls of the traits with associated types in the crate: `Self::A0`
     /// is ambiguous (E0223) for a type that two such traits are implemented for, even if they are
     /// in different modules.
@@ -1727,14 +1654,11 @@ impl Gen {
             items: Vec::new(),
             contents: Vec::new(),
             elided_self: false,
-            risk: Risk::default(),
             cyclic: false,
             cyclic_module: false,
             last_scope: "",
             tags: BTreeSet::new(),
             bare_percent: 0,
-            want_trust: Trust::All,
-            last_trust: Trust::All,
             assoc_self_types: Vec::new(),
             in_default: false,
             redeclare: false,
@@ -3193,9 +3117,6 @@ impl Gen {
                 }
                 _ => continue,
             };
-            if names_lifetime(&pred) && self.names_external(&pred) {
-                self.risk.cycle = true;
-            }
             sk.preds.push(pred);
         }
         if self.features.iterator_item_cycle {
@@ -4028,9 +3949,6 @@ impl Gen {
             ret,
             sk.where_clause()
         );
-        if self.external_holds_lifetime(&sig, &sk.lifetimes) {
-            self.risk.anchor = true;
-        }
         sig
     }
 
@@ -4249,126 +4167,15 @@ impl Gen {
         }
     }
 
-    /// Whether `text` names a type of a crate that the Leaker does not allow by an absolute path:
-    /// an optional entry.
-    fn names_external(&self, text: &str) -> bool {
-        (!self.cfg.allow_std && text.contains("::std::"))
-            || (!self.cfg.allow_crate && text.contains(&format!("::{}::", self.cfg.krate)))
-    }
-
-    /// Whether the arguments of an external absolute path in `text` name one of `lifetimes`, or an
-    /// array whose length is an external constant (it is leaked as a whole).
-    fn external_holds_lifetime(&self, text: &str, lifetimes: &[String]) -> bool {
-        if !self.cfg.allow_crate {
-            let length = format!("; ::{}::base::BLEN]", self.cfg.krate);
-            let mut from = 0;
-            while let Some(at) = text[from..].find(&length) {
-                let end = from + at;
-                from = end + length.len();
-                // The `[` that opens the array.
-                let mut depth = 0;
-                let mut start = 0;
-                for (i, c) in text[..end].char_indices().rev() {
-                    match c {
-                        ']' => depth += 1,
-                        '[' if depth == 0 => {
-                            start = i;
-                            break;
-                        }
-                        '[' => depth -= 1,
-                        _ => (),
-                    }
-                }
-                if lifetimes
-                    .iter()
-                    .any(|l| text[start..end].contains(l.as_str()))
-                {
-                    return true;
-                }
-            }
-        }
-        let mut prefixes = Vec::new();
-        if !self.cfg.allow_std {
-            prefixes.push("::std::".to_string());
-        }
-        if !self.cfg.allow_crate {
-            prefixes.push(format!("::{}::", self.cfg.krate));
-        }
-        for prefix in prefixes {
-            let mut from = 0;
-            while let Some(at) = text[from..].find(&prefix) {
-                let start = from + at;
-                from = start + prefix.len();
-                // The type that starts with the path: its arguments, and the bounds of a trait
-                // object (`dyn ::ext::Tr + 'y`), up to the end of the enclosing element.
-                let mut depth = 0;
-                let mut end = text.len();
-                let mut previous = ' ';
-                for (i, c) in text[start..].char_indices() {
-                    match c {
-                        '<' | '(' | '[' => depth += 1,
-                        '>' if previous == '-' => (),
-                        '>' | ')' | ']' if depth == 0 => {
-                            end = start + i;
-                            break;
-                        }
-                        '>' | ')' | ']' => depth -= 1,
-                        ',' | ';' | '{' if depth == 0 => {
-                            end = start + i;
-                            break;
-                        }
-                        _ => (),
-                    }
-                    previous = c;
-                }
-                if lifetimes
-                    .iter()
-                    .any(|l| text[start..end].contains(l.as_str()))
-                {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Whether the item that is generated may be invoked with a Referrer that replaces optional
-    /// entries.
-    fn strict_ok(&self) -> bool {
-        (self.features.strict_cycles || !self.risk.cycle)
-            && (self.features.strict_anchors || !self.risk.anchor)
-    }
-
-    /// The mode the item that is generated is invoked with: the one drawn, or every crate if it
-    /// has a shape that breaks when optional entries are replaced.
-    fn item_trust(&self) -> Trust {
-        if self.strict_ok() {
-            self.want_trust
-        } else {
-            Trust::All
-        }
-    }
-
-    /// Draws the mode of an item (`Trust`): `none` (the library's default) in two fifths, the others
-    /// in a fifth each. A mode that cannot differ from `none` here is not drawn: when the Leaker's
-    /// own rule allows `::std` no optional entry names only `std`, and when it allows its own crate
-    /// none names only that.
-    fn draw_trust(&mut self) -> Trust {
-        let weights = [
-            (Trust::None, 40),
-            (Trust::All, 20),
-            (Trust::Std, if self.cfg.allow_std { 0 } else { 20 }),
-            (Trust::Leaker, if self.cfg.allow_crate { 0 } else { 20 }),
-        ];
-        let total: u32 = weights.iter().map(|(_, weight)| weight).sum();
-        let mut roll = self.below(total as usize) as u32;
-        for (trust, weight) in weights {
-            if roll < weight {
-                return trust;
-            }
-            roll -= weight;
-        }
-        unreachable!()
+    /// Draws what the mode of the Referrer of an item was and discards it: the Referrer replaces
+    /// every entry now, but the draw stays, so that the items are the ones the seeds had. Its
+    /// weights were `none` 40, `all` 20, `std` and `leaker` 20 each, the last three only when the
+    /// Leaker's own rule did not allow `::std` or its crate.
+    fn skip_trust_draw(&mut self) {
+        let all = 20
+            + if self.cfg.allow_std { 0 } else { 20 }
+            + if self.cfg.allow_crate { 0 } else { 20 };
+        let _ = self.below(40 + all);
     }
 }
 
@@ -4482,10 +4289,10 @@ impl Gen {
         id
     }
 
-    fn attr(&self, id: usize, allow_self: bool, scope: &str, trust: Trust) -> String {
+    fn attr(&self, id: usize, allow_self: bool, scope: &str) -> String {
         format!(
             "#[{}(id = {}, allow_self = {}, prelude = {}, scope = \"{}\", allow = \"{}\", \
-             {}{}{}{}trust = \"{}\", krate = \"{}\", primitive = {})]\n",
+             {}{}{}{}primitive = {})]\n",
             ATTR,
             id,
             allow_self,
@@ -4512,20 +4319,14 @@ impl Gen {
             } else {
                 ""
             },
-            trust.name(),
-            self.cfg.krate,
             self.cfg.primitive
         )
     }
 
-    /// The attribute of an item that is analyzed through `scope` (`""` for none). It says which
-    /// optional entries the Referrer of the item trusts: the macro then writes the Repeater's impls
-    /// of the others and of the required entries.
+    /// The attribute of an item that is analyzed through `scope` (`""` for none).
     fn attr_with(&mut self, ann: Option<(usize, bool)>, scope: &'static str) -> String {
         self.last_scope = scope;
-        let trust = self.item_trust();
-        self.last_trust = trust;
-        ann.map_or(String::new(), |(id, a)| self.attr(id, a, scope, trust))
+        ann.map_or(String::new(), |(id, a)| self.attr(id, a, scope))
     }
 
     /// The analysis of an item through other calls of the same API (`via` in the attribute,
@@ -4975,7 +4776,6 @@ impl Gen {
             }
         };
         let _ = kw;
-        sk.risk_cycle = self.risk.cycle;
         if scope == "generics" && has_word(&text, "Self") {
             self.tags.insert(TAG_SELF_NO_MEANING.to_string());
         }
@@ -5690,7 +5490,6 @@ impl Gen {
             self_assoc_in_pred,
             preds_leakable,
             elided_self: self.elided_self,
-            risk: self.risk,
             uses_self_outlives: body.iter().any(|item| {
                 item.contains("Self: '")
                     || ((item.contains("(&'x self") || item.contains("(&'y self"))
@@ -5764,8 +5563,6 @@ impl Gen {
         let tr = self.traits[idx].clone();
         self.extend_tags(&tr.sk.tags);
         // The impl has the where clause and the methods of the trait.
-        self.risk.cycle |= tr.risk.cycle;
-        self.risk.anchor |= tr.risk.anchor;
         let allow_self = ann.map_or(true, |(_, a)| a);
         let saved_prob = self.self_prob;
         if !allow_self {
@@ -5982,7 +5779,6 @@ impl Gen {
             // An ADT of this module, with the generics it declares.
             let (name, sk) = self.pick(&adts).clone();
             self.extend_tags(&sk.tags);
-            self.risk.cycle |= sk.risk_cycle;
             let text = format!("{}{}", name, sk.args());
             (sk, text)
         } else {
@@ -6355,11 +6151,10 @@ impl Gen {
         let ann_id = ann.map(|(id, _)| id);
         self.last_scope = "";
         if ann.is_some() {
-            self.risk = Risk::default();
             self.tags.clear();
             self.values_used = false;
             self.plain_ai = false;
-            self.want_trust = self.draw_trust();
+            self.skip_trust_draw();
             self.bare_percent = self.item_bare_percent();
             // Half of the items nested in `enter_mod` are analyzed with `nested_self_entries`, the
             // other half without, where a type that names `Self` next to a generic whose bound
@@ -6429,7 +6224,6 @@ impl Gen {
                 id,
                 kind,
                 module: path.to_vec(),
-                trust: self.last_trust,
                 allow_self,
                 scope: self.last_scope,
                 contents: vec![kind],
@@ -6572,11 +6366,10 @@ pub fn generate_with(
         g.module_mode = true;
         g.cyclic_module = g.chance(CYCLIC_MODULE_PERCENT);
         g.contents.clear();
-        g.risk = Risk::default();
         g.tags.clear();
         g.values_used = false;
         g.plain_ai = false;
-        g.want_trust = g.draw_trust();
+        g.skip_trust_draw();
         g.bare_percent = g.module_bare_percent();
         let n = g.range(4, items_per_module);
         let nested = usize::from(g.chance(60));
@@ -6584,8 +6377,7 @@ pub fn generate_with(
         g.no_self = false;
         g.module_mode = false;
         g.cyclic_module = false;
-        let trust = g.item_trust();
-        let attr = g.attr(id, true, "", trust);
+        let attr = g.attr(id, true, "");
         let module = format!("{}pub mod {} {{\n{}\n}}\n", attr, name, body);
         lib += &module;
         let contents = std::mem::take(&mut g.contents);
@@ -6594,7 +6386,6 @@ pub fn generate_with(
             id,
             kind: "mod",
             module: Vec::new(),
-            trust,
             allow_self: true,
             scope: "",
             contents,
@@ -6619,12 +6410,11 @@ pub fn generate_with(
         // unions have the names they have in the Leaker's crate), and the names of one item do not
         // clash with those of another. The Referrer's crate has no other name of the Leaker's.
         referrer += &format!(
-            "pub mod c{} {{ {}::__tl_prop_{}!(path = {}{}{}); }}\n",
+            "pub mod c{} {{ {}::__tl_prop_{}!(path = {}{}); }}\n",
             item.id,
             krate,
             item.id,
             path,
-            item.trust.flag(),
             use_flags(&g.rng, item)
         );
         referrer_lines.push((line, item.id));
@@ -6632,7 +6422,6 @@ pub fn generate_with(
     let (accept_referrer, accept_lines) =
         accept_referrer(&krate, &g.mod_uses, &items, "__tl_prop_", flags);
     let stages = stage_crates(&krate, &g.mod_uses, &items, flags);
-    let decoy = decoy_crates(&g.cfg, &items, &base, flags);
     let errors_referrer = errors_crate(&krate, &g.rng, &items, flags);
     Case {
         config: g.cfg.clone(),
@@ -6644,7 +6433,6 @@ pub fn generate_with(
         errors_referrer,
         accept_lines,
         stages,
-        decoy,
     }
 }
 
@@ -6701,65 +6489,6 @@ fn errors_crate(krate: &str, rng: &StableHasher, items: &[Item], flags: Flags) -
         );
     }
     lib
-}
-
-/// The name of the Leaker's crate in the Referrer's crate of the decoy (`Decoy`).
-pub fn real_name(krate: &str) -> String {
-    format!("real_{}", krate.trim_start_matches("tlp_l_"))
-}
-
-/// The decoy crates of a case (`Decoy`), if it has any item for them: the Leaker's own rule must not
-/// allow its crate (it is then promised to be the same crate), and the item's Referrer must not
-/// trust it (`Trust::None` and `Trust::Std`). A module is not copied there (`prop::apply()`), nor an
-/// item whose copy names the Leaker's crate whatever the Referrer trusts, as the header of an impl of
-/// a trait of the module does: the macro expands to nothing for it.
-///
-/// What it tells that the ordinary Referrer's crate cannot: an absolute path always names the same
-/// crate there, so a Referrer that trusts an entry although the crate it names is not trusted still
-/// compiles. Here `::tlp_l_NNN::base::B1` is the decoy's type, and the copy that writes it as it is
-/// does not equal the original.
-fn decoy_crates(cfg: &Config, items: &[Item], base: &str, flags: Flags) -> Option<Decoy> {
-    if cfg.allow_crate {
-        return None;
-    }
-    let krate = &cfg.krate;
-    let real = real_name(krate);
-    let mut referrer = crate_header(flags);
-    let mut lines = Vec::new();
-    for item in items
-        .iter()
-        .filter(|item| item.kind != "mod" && matches!(item.trust, Trust::None | Trust::Std))
-    {
-        let mut path = format!("::{}", real);
-        for m in &item.module {
-            path += &format!("::{}", m);
-        }
-        lines.push((referrer.lines().count() + 1, item.id));
-        referrer += &format!(
-            "{}::__tl_prop_{}!(path = {}{}, decoy({}));\n",
-            real,
-            item.id,
-            path,
-            item.trust.flag(),
-            krate
-        );
-    }
-    if lines.is_empty() {
-        return None;
-    }
-    // The definitions differ: another length, and every type is another type anyway.
-    let base = base.replace("pub const BLEN: usize = 2;", "pub const BLEN: usize = 3;");
-    let lib = format!(
-        "{}{}pub mod base {{\n{}\n}}\n",
-        crate_header(flags),
-        TWO_MACRO,
-        base
-    );
-    Some(Decoy {
-        lib,
-        referrer,
-        lines,
-    })
 }
 
 /// The start of every generated crate: no warnings, and `alloc` (`relative_std`), which the items
@@ -6976,17 +6705,11 @@ fn accept_referrer(
             module += &format!("::{}", m);
         }
         format!(
-            "::{}::{}{}!(path = {}{}{}, accept);\n",
+            "::{}::{}{}!(path = {}{}, accept);\n",
             krate,
             macro_prefix,
             item.id,
             module,
-            // The copies of `allow_stages` have the trust of their rule in their attribute.
-            if macro_prefix == "__tl_prop_" {
-                item.trust.flag()
-            } else {
-                String::new()
-            },
             // The Leaker carries the errors of these items, and the Referrer drops them.
             if macro_prefix == "__tl_prop_" && carries_result(item.id) {
                 ", allow(all)"
@@ -8099,17 +7822,6 @@ fn self_bound_used(preds: &[String], methods: &[String], params: &[String]) -> b
                     .iter()
                     .any(|m| m.find(" where ").map_or(false, |at| has_word(&m[at..], x)))
         })
-}
-
-/// Whether `text` names a lifetime other than `'static`.
-fn names_lifetime(text: &str) -> bool {
-    text.match_indices('\'').any(|(at, _)| {
-        let name: String = text[at + 1..]
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        !name.is_empty() && name != "static"
-    })
 }
 
 /// Whether the predicate `pred` names `Self` in a bound or in a bounded type that is not `Self`.

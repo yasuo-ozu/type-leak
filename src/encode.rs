@@ -519,7 +519,7 @@ pub enum EncodeError {
     /// The argument of a type parameter with a lifetime bound is a trait object without one
     /// (`dyn Tr`). Write it, e.g. `dyn Tr + 'static`.
     UnboundedTraitObject(Box<Type>),
-    /// An entry that [needs `Self`](crate::Referrer::needs_self) was asked for
+    /// An entry that names `Self`, or whose context's generics do, was asked for
     /// [`ImplSelf::Marker`](crate::ImplSelf::Marker). Use
     /// [`ImplSelf::Param`](crate::ImplSelf::Param).
     NeedsSelf(Box<Type>),

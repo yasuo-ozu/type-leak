@@ -20,6 +20,8 @@
 //! The same shapes are copied across crates in `tests/crates/leaker` (`kinds`), where the Repeater
 //! impls and the copies are compiled: `tests/cross_crate.rs`.
 
+mod common;
+
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use syn::visit_mut::VisitMut;
@@ -47,11 +49,9 @@ fn set(indices: &[usize]) -> BTreeSet<usize> {
     indices.iter().copied().collect()
 }
 
-/// The indices of the required entries, which are the ones a visitor replaces.
-fn required(referrer: &Referrer) -> BTreeSet<usize> {
-    (0..referrer.iter().count())
-        .filter(|&ix| referrer.must(ix))
-        .collect()
+/// The indices of the entries, which are the ones a visitor replaces.
+fn all_entries(referrer: &Referrer) -> BTreeSet<usize> {
+    (0..referrer.iter().count()).collect()
 }
 
 /// The index of the entry `ty` with `generics` (as tokens) and the module it has.
@@ -59,10 +59,10 @@ fn index(referrer: &Referrer, ty: &str, generics: &str, in_module: bool) -> usiz
     let (ty, generics) = (text(&parse_str::<Type>(ty).unwrap()), generics.to_string());
     let found: Vec<usize> = (0..referrer.iter().count())
         .filter(|&ix| {
-            text(&referrer.iter().nth(ix).unwrap()) == ty
-                && text(&referrer.context_generics(referrer.context(ix))).replace(' ', "")
+            text(&common::types(referrer).nth(ix).unwrap()) == ty
+                && text(&common::entry(referrer, ix).generics).replace(' ', "")
                     == generics.replace(' ', "")
-                && referrer.context_module(referrer.context(ix)).is_some() == in_module
+                && common::in_module(common::entry(referrer, ix)).is_some() == in_module
         })
         .collect();
     assert_eq!(
@@ -74,8 +74,7 @@ fn index(referrer: &Referrer, ty: &str, generics: &str, in_module: bool) -> usiz
         in_module,
         referrer
             .iter()
-            .enumerate()
-            .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+            .map(|(ty, context)| (ty, &context.generics))
             .map(|(ty, generics)| (text(ty), text(&generics)))
             .collect::<Vec<_>>()
     );
@@ -161,7 +160,7 @@ fn round_trip(source: &str, scope: Scope) {
         messages(errors)
     );
     let referrer = through_tokens(result.finish().unwrap());
-    assert!(!required(&referrer).is_empty(), "{:?} {}", scope, source);
+    assert!(!all_entries(&referrer).is_empty(), "{:?} {}", scope, source);
     let mut copy = item.clone();
     let found = replace(&referrer, context, |visitor| match scope {
         Scope::Mod => {
@@ -177,7 +176,7 @@ fn round_trip(source: &str, scope: Scope) {
     });
     assert_eq!(
         found,
-        required(&referrer),
+        all_entries(&referrer),
         "{:?}: the visitor misses an entry of {}\n  copy: {}",
         scope,
         source,
@@ -346,7 +345,7 @@ fn a_path_named_like_a_generic_is_replaced_in_the_arguments_of_an_impl() {
         let found = replace(&referrer, context, |visitor| {
             visitor.visit_path_mut(&mut copy)
         });
-        assert_eq!(found, required(&referrer), "{}", path);
+        assert_eq!(found, all_entries(&referrer), "{}", path);
         assert!(
             !text(&copy).contains("inner") && !text(&copy).contains("U ::"),
             "{}",
@@ -469,11 +468,10 @@ fn every_entry_that_names_a_generic_of_the_name_of_a_declared_item_is_found() {
                 let found = replace(&referrer, context, |v| v.visit_file_mut(&mut file));
                 assert_eq!(
                     found,
-                    required(&referrer),
+                    all_entries(&referrer),
                     "the visitor misses an entry of {}\n  entries: {:?}",
                     source,
-                    referrer
-                        .iter().enumerate().map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+                    referrer.iter().map(|(ty, context)| (ty, &context.generics))
                         .map(|(ty, generics)| (text(ty), text(&generics)))
                         .collect::<Vec<_>>()
                 );
@@ -549,8 +547,8 @@ fn a_declared_name_still_hides_the_entries_that_do_not_name_a_generic() {
     // The copy without the declaration: replaced.
     let mut file = items(false);
     let found = replace(&referrer, context, |v| v.visit_file_mut(&mut file));
-    assert_eq!(found, required(&referrer));
-    assert!(!required(&referrer).is_empty());
+    assert_eq!(found, all_entries(&referrer));
+    assert!(!all_entries(&referrer).is_empty());
     assert!(!text(&file).contains("base"), "{}", text(&file));
     // The copy that declares `X`: its `X` is not the entry's.
     let mut file = items(true);
@@ -573,9 +571,9 @@ const PREFIXES: &[&str] = &["", "self::", "crate::", "super::", "self::inner::"]
 /// What the Leaker decided about an item, with the prefix taken out of every text.
 #[derive(Clone, Debug, PartialEq)]
 enum Outcome {
-    /// The entries: the type, whether it is required and its generics, and whether each has a module.
+    /// The entries: the type and its generics, and whether each has a module.
     Accepted {
-        entries: Vec<(String, bool, String)>,
+        entries: Vec<(String, String)>,
         modules: Vec<bool>,
     },
     Rejected {
@@ -648,13 +646,10 @@ fn outcome(item: &Item, scope: Scope, declared: &[&str]) -> Outcome {
         Ok(referrer) => Outcome::Accepted {
             entries: referrer
                 .iter()
-                .enumerate()
-                .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
-                .enumerate()
-                .map(|(ix, (ty, generics))| {
+                .map(|(ty, context)| (ty, &context.generics))
+                .map(|(ty, generics)| {
                     (
                         unprefixed(&text(ty)),
-                        referrer.must(ix),
                         unprefixed(&format!(
                             "{} {}",
                             text(&generics),
@@ -664,7 +659,7 @@ fn outcome(item: &Item, scope: Scope, declared: &[&str]) -> Outcome {
                 })
                 .collect(),
             modules: (0..referrer.iter().count())
-                .map(|ix| referrer.context_module(referrer.context(ix)).is_some())
+                .map(|ix| common::in_module(common::entry(&referrer, ix)).is_some())
                 .collect(),
         },
         Err(error) => Outcome::Rejected {

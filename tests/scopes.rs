@@ -69,8 +69,7 @@ fn ident(name: &str) -> Ident {
 fn entries(referrer: &Referrer) -> Vec<(String, String)> {
     referrer
         .iter()
-        .enumerate()
-        .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+        .map(|(ty, context)| (ty, &context.generics))
         .map(|(ty, generics)| (s(ty), s(generics)))
         .collect()
 }
@@ -80,7 +79,7 @@ fn e(ty: &str, generics: &str) -> (String, String) {
 }
 
 fn self_of(referrer: &Referrer, ix: usize) -> String {
-    match referrer.context_self(referrer.context(ix)) {
+    match common::entry(referrer, ix).self_ty.as_ref() {
         None => "-".to_string(),
         Some(SelfRequirement::Bound(path)) => format!("Self: {}", s(path)),
         Some(SelfRequirement::Type(ty)) => format!("Self = {}", s(ty)),
@@ -90,10 +89,9 @@ fn self_of(referrer: &Referrer, ix: usize) -> String {
 
 /// The path of the module of the `ix`-th entry.
 fn module_path_of(referrer: &Referrer, ix: usize) -> Option<Vec<String>> {
-    let module = referrer.context_module(referrer.context(ix))?;
+    let module = common::in_module(common::entry(referrer, ix))?;
     Some(
-        referrer
-            .module_path(module)?
+        common::module_path(referrer, module)?
             .iter()
             .map(|i| i.to_string())
             .collect(),
@@ -124,12 +122,13 @@ fn generics_are_those_of_the_leaker() {
         ]
     );
     // The top-level context is that of the generics, which no entry uses exactly.
-    assert_eq!(s(referrer.context_generics(context)), s(&generics));
-    assert!(!referrer
-        .iter()
+    assert_eq!(s(&referrer.get_context(context).generics), s(&generics));
+    assert!(!common::types(&referrer)
         .enumerate()
-        .any(|(ix, _)| referrer.context(ix) == context));
-    assert!(referrer.contexts().any(|c| c == context));
+        .any(|(ix, _)| common::entry_id(&referrer, ix) == context));
+    assert!(common::context_ids(&referrer)
+        .into_iter()
+        .any(|c| c == context));
     // `Self` is declared by none of them.
     assert_eq!(self_of(&referrer, 0), "-");
 }
@@ -157,13 +156,13 @@ fn a_struct_an_enum_and_a_union_declare_self_as_the_item() {
         );
         // The top-level context has the generics of the item and, as an entry names `Self`, what
         // `Self` is: it is the context of the entry.
-        assert_eq!(s(referrer.context_generics(context)), "< 'a , T >");
-        assert_eq!(context, referrer.context(0));
+        assert_eq!(s(&referrer.get_context(context).generics), "< 'a , T >");
+        assert_eq!(context, common::entry_id(&referrer, 0));
         assert_eq!(
-            referrer.context_self(context),
-            referrer.context_self(referrer.context(0))
+            referrer.get_context(context).self_ty.as_ref(),
+            common::entry(&referrer, 0).self_ty.as_ref()
         );
-        assert!(referrer.context_self(context).is_some());
+        assert!(referrer.get_context(context).self_ty.is_some());
     }
 }
 
@@ -183,7 +182,7 @@ fn an_impl_declares_self_as_the_self_type() {
     );
     assert_eq!(self_of(&referrer, 0), "Self = :: p :: Wrap < T >");
     assert_eq!(self_of(&referrer, 1), "-");
-    assert_eq!(s(referrer.context_generics(context)), "< T >");
+    assert_eq!(s(&referrer.get_context(context).generics), "< T >");
 }
 
 #[test]
@@ -233,20 +232,23 @@ fn a_module_declares_its_names_and_the_module() {
         [e("Other", ""), e("Rel", ""), e("Rel2", "")]
     );
     for ix in 0..3 {
-        assert_eq!(referrer.context_module(referrer.context(ix)), Some(module));
+        assert_eq!(
+            common::in_module(common::entry(&referrer, ix)),
+            Some(module)
+        );
     }
-    assert_eq!(referrer.module_hint(module), Some("my_module"));
-    assert_eq!(referrer.module_path(module), None);
+    assert_eq!(common::module_hint(&referrer, module), Some("my_module"));
+    assert_eq!(common::module_path(&referrer, module), None);
     // The module is the top-level context, which has no generics.
-    assert!(referrer.context_generics(module).params.is_empty());
-    assert!(referrer.contexts().any(|c| c == module));
+    assert!(referrer.get_context(module).generics.params.is_empty());
+    assert!(common::context_ids(&referrer)
+        .into_iter()
+        .any(|c| c == module));
     // The hint is for debugging: any `Display` does.
     let mut leaker = Leaker::new();
     let (other, ()) = leaker.enter_mod(7, [], |_| ());
-    assert_eq!(
-        leaker.result().finish().unwrap().module_hint(other),
-        Some("7")
-    );
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(common::module_hint(&referrer, other), Some("7"));
 }
 
 #[test]
@@ -343,8 +345,8 @@ fn an_item_in_a_scope_has_local_generics() {
     let mut leaker = Leaker::new();
     let top = leaker.intern_struct(&item, true);
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(s(referrer.context_generics(top)), "< T >");
-    assert_eq!(referrer.context(0), top);
+    assert_eq!(s(&referrer.get_context(top).generics), "< T >");
+    assert_eq!(common::entry_id(&referrer, 0), top);
 }
 
 // ── `Self` ───────────────────────────────────────────────────────────────────────────────────
@@ -634,30 +636,27 @@ fn a_module_in_a_module_in_a_scope() {
             .0
     });
     let referrer = leaker.result().finish().unwrap();
-    // The type of an external crate is an optional entry, which does not depend on a module.
-    let found: Vec<(String, String, String, Option<ContextId>, bool)> =
-        (0..referrer.iter().count())
-            .map(|ix| {
-                (
-                    s(referrer.iter().nth(ix).unwrap()),
-                    s(referrer.context_generics(referrer.context(ix))),
-                    self_of(&referrer, ix),
-                    referrer.context_module(referrer.context(ix)),
-                    referrer.must(ix),
-                )
-            })
-            .collect();
+    // The type of an external crate is an entry that does not depend on a module.
+    let found: Vec<(String, String, String, Option<ContextId>)> = (0..referrer.iter().count())
+        .map(|ix| {
+            (
+                s(common::types(&referrer).nth(ix).unwrap()),
+                s(&common::entry(&referrer, ix).generics),
+                self_of(&referrer, ix),
+                common::in_module(common::entry(&referrer, ix)),
+            )
+        })
+        .collect();
     let mut expected = vec![
-        ("Rel < T >", "< T >", "-", Some(outer), true),
+        ("Rel < T >", "< T >", "-", Some(outer)),
         (
             "Rel2 < Self >",
             "< T >",
             "Self = :: p :: W < T >",
             Some(outer),
-            true,
         ),
-        ("Rel3", "", "-", Some(inner), true),
-        (":: q :: Abs", "", "-", None, false),
+        ("Rel3", "", "-", Some(inner)),
+        (":: q :: Abs", "", "-", None),
     ];
     let mut found = found;
     found.sort_by(|a, b| a.0.cmp(&b.0));
@@ -668,11 +667,10 @@ fn a_module_in_a_module_in_a_scope() {
         assert_eq!(found.1, expected.1, "{}", found.0);
         assert_eq!(found.2, expected.2, "{}", found.0);
         assert_eq!(found.3, expected.3, "{}", found.0);
-        assert_eq!(found.4, expected.4, "{}", found.0);
     }
     // `inner` is entered in `outer`, which is the module of the call.
-    assert_eq!(referrer.module_hint(outer), Some("outer"));
-    assert_eq!(referrer.module_hint(inner), Some("inner"));
+    assert_eq!(common::module_hint(&referrer, outer), Some("outer"));
+    assert_eq!(common::module_hint(&referrer, inner), Some("inner"));
     assert_ne!(outer, inner);
 }
 
@@ -687,12 +685,12 @@ fn nested_modules_are_numbered_and_kept() {
     });
     let referrer = leaker.result().finish().unwrap();
     // The module of the entry is the innermost, and each is a module of the Referrer.
-    assert_eq!(referrer.context_module(referrer.context(0)), Some(deeper));
-    assert_eq!(referrer.module_hint(outer), Some("outer"));
-    assert_eq!(referrer.module_hint(inner), Some("inner"));
-    assert_eq!(referrer.module_hint(deeper), Some("deeper"));
+    assert_eq!(common::in_module(common::entry(&referrer, 0)), Some(deeper));
+    assert_eq!(common::module_hint(&referrer, outer), Some("outer"));
+    assert_eq!(common::module_hint(&referrer, inner), Some("inner"));
+    assert_eq!(common::module_hint(&referrer, deeper), Some("deeper"));
     // A module entered by a scope has a hint, and no path.
-    assert_eq!(referrer.module_path(deeper), None);
+    assert_eq!(common::module_path(&referrer, deeper), None);
     // They are numbered in the order they are entered, from the outermost.
     assert_eq!((outer, inner, deeper), (id(0), id(1), id(2)));
 }
@@ -708,8 +706,8 @@ fn the_defaults_of_a_nested_scope_are_analyzed_with_the_parameters_before() {
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(entries(&referrer), [e("Rel < A >", "< A >")]);
     // The default is not among the generics, which are in the canonical form.
-    assert_eq!(s(referrer.context_generics(inner)), "< A , B >");
-    assert_eq!(s(referrer.context_generics(outer)), "< T >");
+    assert_eq!(s(&referrer.get_context(inner).generics), "< A , B >");
+    assert_eq!(s(&referrer.get_context(outer).generics), "< T >");
     // The same for the generics of the Leaker.
     let mut other = Leaker::new();
     other.enter_generics(&parse_quote!(<A, B = Rel<A>>), |_| ());
@@ -802,15 +800,21 @@ fn a_failing_scope_keeps_its_result_and_the_outer_one_goes_on() {
     assert_eq!(failed.first, ok_first);
     assert_ne!(failed.last, ok_last);
     let ids = |referrer: &Referrer| {
-        referrer
-            .contexts()
+        common::context_ids(referrer)
+            .into_iter()
             .map(ContextId::index)
             .collect::<Vec<_>>()
     };
     assert!(ids(&failed_referrer).len() > ids(&ok).len());
     // The ids which were returned are valid, and are the generics of their scopes.
-    assert_eq!(s(failed_referrer.context_generics(failed.first)), "< A >");
-    assert_eq!(s(failed_referrer.context_generics(failed.last)), "< C >");
+    assert_eq!(
+        s(&failed_referrer.get_context(failed.first).generics),
+        "< A >"
+    );
+    assert_eq!(
+        s(&failed_referrer.get_context(failed.last).generics),
+        "< C >"
+    );
     let kept_types: Vec<String> = entries(&failed_referrer)
         .into_iter()
         .map(|(ty, _)| ty)
@@ -821,7 +825,7 @@ fn a_failing_scope_keeps_its_result_and_the_outer_one_goes_on() {
         kept_types
     );
     assert!(kept_types.contains(&"RelM".to_string()), "{:?}", kept_types);
-    assert!(failed_referrer.iter().any(|ty| s(ty) == "RelK"));
+    assert!(common::types(&failed_referrer).any(|ty| s(ty) == "RelK"));
 }
 
 #[test]
@@ -898,7 +902,7 @@ fn the_error_of_an_inner_scope_is_part_of_the_outer_one() {
         entries(&referrer),
         [e("Rel < T >", "< T >"), e("RelU < U >", "< U >")]
     );
-    assert_eq!(s(referrer.context_generics(inner.unwrap())), "< T >");
+    assert_eq!(s(&referrer.get_context(inner.unwrap()).generics), "< T >");
 }
 
 /// A Leaker that allows the primitive types and the names of the standard prelude.
@@ -933,9 +937,11 @@ fn a_failed_scope_keeps_the_top_levels_of_its_inner_scopes() {
     let referrer = result.into_referrer();
     // The outermost context, the failed scope, and its inner scopes: the ids returned. (`Rel2<'_>`,
     // copied as written, is no part of the Referrer, so it has no context.)
-    assert_eq!(referrer.contexts().count(), 4);
+    assert_eq!(common::context_ids(&referrer).len(), 4);
     for id in &ids {
-        assert!(referrer.contexts().any(|context| context == *id));
+        assert!(common::context_ids(&referrer)
+            .into_iter()
+            .any(|context| context == *id));
     }
     assert_eq!(
         entries(&referrer),
@@ -994,7 +1000,7 @@ fn a_failed_inner_scope_keeps_the_optional_entries_it_decided() {
     );
     let referrer = result.into_referrer();
     assert_eq!(
-        referrer.iter().map(s).collect::<Vec<_>>(),
+        common::types(&referrer).map(s).collect::<Vec<_>>(),
         Vec::<String>::new()
     );
 }
@@ -1064,10 +1070,8 @@ fn a_panic_after_a_recovery_rolls_back_the_scope_and_what_it_recovered() {
     let referrer = result.into_referrer();
     assert_eq!(entries(&referrer), [e("Kept", "")]);
     // Nothing of the scope that panicked is left, not its context either.
-    assert!(!referrer
-        .iter()
-        .any(|ty| s(ty).contains("RelLost") || s(ty).contains("Bad")));
-    assert_eq!(referrer.contexts().count(), 1);
+    assert!(!common::types(&referrer).any(|ty| s(ty).contains("RelLost") || s(ty).contains("Bad")));
+    assert_eq!(common::context_ids(&referrer).len(), 1);
 }
 
 // ── the numbers of the modules ───────────────────────────────────────────────────────────────
@@ -1180,16 +1184,15 @@ fn module_path_and_hint() {
     );
     // The module analyzed is the first, and the ones which have no entry are not kept (`m` has
     // one, as it is the top-level context).
-    assert_eq!(referrer.module_path(root), Some(&[][..]));
-    assert_eq!(referrer.module_hint(root), None);
-    assert_eq!(referrer.module_hint(hinted), Some("hinted"));
-    assert_eq!(referrer.module_path(hinted), None);
-    // An id which is not a module has neither.
-    assert_eq!(referrer.module_path(id(99)), None);
-    assert_eq!(referrer.module_hint(id(99)), None);
-    let ctx = referrer.context(0);
+    assert_eq!(common::module_path(&referrer, root), Some(&[][..]));
+    assert_eq!(common::module_hint(&referrer, root), None);
+    assert_eq!(common::module_hint(&referrer, hinted), Some("hinted"));
+    assert_eq!(common::module_path(&referrer, hinted), None);
+    // A context which is not a module has neither. (An id that the Referrer does not have panics in
+    // `get_context()`: tests/context_id.rs.)
+    let ctx = common::entry_id(&referrer, 0);
     assert_ne!(ctx, root);
-    assert_eq!(referrer.module_path(ctx), None);
+    assert_eq!(common::module_path(&referrer, ctx), None);
 }
 
 #[test]
@@ -1212,7 +1215,7 @@ fn the_visitor_enters_the_module_by_its_id() {
         visitor.visit_item_struct_mut(&mut item);
         s(&item)
     };
-    let in_a = referrer.context_module(referrer.context(0)) == Some(a);
+    let in_a = common::in_module(common::entry(&referrer, 0)) == Some(a);
     let (first, second) = if in_a { (a, b) } else { (b, a) };
     assert_eq!(copy(first), "struct C { y : P0 , }");
     assert_eq!(copy(second), "struct C { y : P1 , }");
@@ -1272,7 +1275,7 @@ fn the_visitor_finds_the_modules_found_in_a_module_by_their_names() {
         |text: &str| s(&parse_str::<ItemMod>(&format!("mod outer {{ {} }}", text)).unwrap());
     let wrap = |item: &ItemMod| -> ItemMod { parse_quote!(mod outer { #item }) };
     assert_eq!(copy(&wrap(&inner), outer), wrapped(&rewritten));
-    let inner_id = referrer.context_module(referrer.context(0)).unwrap();
+    let inner_id = common::in_module(common::entry(&referrer, 0)).unwrap();
     assert_ne!(inner_id, outer);
     assert_eq!(copy(&inner, inner_id), rewritten);
 }
@@ -1300,14 +1303,23 @@ fn modules_are_serialized() {
     assert_eq!(parsed, referrer);
     assert_eq!(parsed.to_token_stream().to_string(), tokens.to_string());
     // The modules, their paths and hints, and what depends on them are the same.
-    assert_eq!(parsed.module_hint(hinted), Some("with \"quotes\""));
-    assert_eq!(parsed.module_path(hinted), None);
+    assert_eq!(
+        common::module_hint(&parsed, hinted),
+        Some("with \"quotes\"")
+    );
+    assert_eq!(common::module_path(&parsed, hinted), None);
     for ix in 0..referrer.iter().count() {
-        let module = referrer.context_module(referrer.context(ix));
-        assert_eq!(parsed.context_module(parsed.context(ix)), module);
+        let module = common::in_module(common::entry(&referrer, ix));
+        assert_eq!(common::in_module(common::entry(&parsed, ix)), module);
         if let Some(module) = module {
-            assert_eq!(parsed.module_path(module), referrer.module_path(module));
-            assert_eq!(parsed.module_hint(module), referrer.module_hint(module));
+            assert_eq!(
+                common::module_path(&parsed, module),
+                common::module_path(&referrer, module)
+            );
+            assert_eq!(
+                common::module_hint(&parsed, module),
+                common::module_hint(&referrer, module)
+            );
         }
     }
     // The ids of the modules are written, and the parent of a nested one.
@@ -1438,8 +1450,8 @@ fn a_panic_caught_in_a_nested_scope_leaves_the_outer_scope_as_it_was() {
         ]
     );
     // The top-level context is that of the generics, with no module.
-    assert_eq!(s(referrer.context_generics(top)), "< T >");
-    assert_eq!(referrer.module_hint(top), None);
+    assert_eq!(s(&referrer.get_context(top).generics), "< T >");
+    assert_eq!(common::module_hint(&referrer, top), None);
     assert_eq!(
         referrer.to_token_stream().to_string(),
         expected.to_token_stream().to_string()
@@ -1507,11 +1519,11 @@ fn a_panic_caught_in_a_nested_module_restores_the_module() {
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(entries(&referrer), [e("Lost", "")]);
     assert_eq!(
-        referrer.context_module(referrer.context(0)),
+        common::in_module(common::entry(&referrer, 0)),
         Some(outer),
         "the type is in the outer module"
     );
-    assert_eq!(referrer.module_hint(outer), Some("outer"));
+    assert_eq!(common::module_hint(&referrer, outer), Some("outer"));
     // (A module which panicked takes no number: see the layers of the item scopes, below.)
 }
 
@@ -1527,10 +1539,10 @@ fn a_panic_caught_in_the_outermost_scope_of_a_generics_scope_keeps_the_top_level
         view.visit_type(&parse_quote!(Rel<T>));
     });
     let referrer = leaker.result().finish().unwrap();
-    assert_eq!(s(referrer.context_generics(top)), "< T >");
-    assert_eq!(referrer.module_hint(top), None);
-    assert_eq!(referrer.module_path(top), None);
-    assert_eq!(referrer.context_module(referrer.context(0)), None);
+    assert_eq!(s(&referrer.get_context(top).generics), "< T >");
+    assert_eq!(common::module_hint(&referrer, top), None);
+    assert_eq!(common::module_path(&referrer, top), None);
+    assert_eq!(common::in_module(common::entry(&referrer, 0)), None);
 }
 
 // ── a panic in an outermost scope ────────────────────────────────────────────────────────────
@@ -1627,10 +1639,10 @@ fn a_panic_in_an_outermost_scope_keeps_the_earlier_contexts_and_ids() {
     );
     // The earlier calls, then the new ones in order, and then `<T>` of the trait again.
     assert_eq!(ids, [id(0), id(1), id(2), id(3), id(0)]);
-    assert_eq!(s(referrer.context_generics(ids[0])), "< T >");
-    assert_eq!(s(referrer.context_generics(ids[1])), "< U >");
-    assert_eq!(s(referrer.context_generics(ids[2])), "< W >");
-    assert_eq!(referrer.module_hint(ids[3]), Some("kept"));
+    assert_eq!(s(&referrer.get_context(ids[0]).generics), "< T >");
+    assert_eq!(s(&referrer.get_context(ids[1]).generics), "< U >");
+    assert_eq!(s(&referrer.get_context(ids[2]).generics), "< W >");
+    assert_eq!(common::module_hint(&referrer, ids[3]), Some("kept"));
     assert_eq!(
         entries(&referrer),
         [
@@ -1924,8 +1936,7 @@ fn a_nested_item_has_a_self_of_its_own_whatever_the_scope_around_says() {
         let referrer = result.finish().unwrap();
         // (Each module is another one, so the type is an entry in each of them.)
         assert!(
-            (0..referrer.iter().count())
-                .any(|ix| referrer.context_self(referrer.context(ix)).is_some()),
+            (0..referrer.iter().count()).any(|ix| common::entry(&referrer, ix).self_ty.is_some()),
             "{}",
             text
         );
@@ -2092,7 +2103,7 @@ fn a_function_which_is_the_analyzed_item_is_analyzed_in_a_scope_of_its_generics(
         entries(&referrer),
         [e(":: p :: W < 'b , dyn RelTr >", "< 'b >")]
     );
-    assert_eq!(s(referrer.context_generics(top)), "< 'b >");
+    assert_eq!(s(&referrer.get_context(top).generics), "< 'b >");
     // The lifetime is a generic of the scope: the signature is not compared with a declaration, so
     // it is not checked for E0195, which only the generics of a method or a nested function are.
     // Nor is it when the scope is nested in another one.
@@ -2585,18 +2596,21 @@ fn dump(referrer: &Referrer, ids: &[(&str, ContextId)]) -> String {
     for (name, id) in ids {
         lines.push(format!("id {} = {}", name, id.index()));
     }
-    for context in referrer.contexts() {
-        let self_ty = match referrer.context_self(context) {
+    for context in common::context_ids(referrer) {
+        let self_ty = match referrer.get_context(context).self_ty.as_ref() {
             None => "-".to_string(),
             Some(SelfRequirement::Bound(path)) => format!("Self: {}", s(path)),
             Some(SelfRequirement::Type(ty)) => format!("Self = {}", s(ty)),
             Some(other) => format!("{:?}", other),
         };
-        let module = match referrer.context_module(context) {
+        let module = match common::in_module(referrer.get_context(context)) {
             None => "-".to_string(),
             Some(module) => module.index().to_string(),
         };
-        let info = match (referrer.module_hint(context), referrer.module_path(context)) {
+        let info = match (
+            common::module_hint(referrer, context),
+            common::module_path(referrer, context),
+        ) {
             (None, None) => String::new(),
             (hint, path) => format!(
                 " is module {:?} {:?}",
@@ -2607,18 +2621,18 @@ fn dump(referrer: &Referrer, ids: &[(&str, ContextId)]) -> String {
         lines.push(format!(
             "context {}: {} ; {} ; in module {}{}",
             context.index(),
-            s(referrer.context_generics(context)),
+            s(&referrer.get_context(context).generics),
             self_ty,
             module,
             info
         ));
     }
-    for (ix, ty) in referrer.iter().enumerate() {
+    for (ix, ty) in common::types(referrer).enumerate() {
         lines.push(format!(
             "entry {}: {} in {}",
             ix,
             s(ty),
-            referrer.context(ix)
+            common::entry_id(referrer, ix)
         ));
     }
     lines.join("\n")

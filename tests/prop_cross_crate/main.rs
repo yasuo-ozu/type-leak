@@ -235,10 +235,8 @@
 //!   constants only, and fails as `STAGES CLEAN` if it needs more). A relative type that the rule
 //!   allowed to drop with an error but that the copy kept as written fails to compile there. (Remove
 //!   `pub mod base` from the crate of the rule `crate` and it does.) The copies after the result
-//!   keep the trust that the rule gives (`Rules::std_crates()` trusts the optional entries of
-//!   `std`): the serialized Referrer does not, so the Referrer's crate gives it again. An item
-//!   invoked with `all` keeps it, as the items with a shape that breaks when an optional entry is
-//!   replaced are.
+//!   replace the optional entries too (`allow()` only drops errors, so the rule keeps none as
+//!   written).
 //!
 //! A copy after the result that does not compile is one of
 //!
@@ -307,42 +305,21 @@
 //! applies to the real `Sized`): the Leaker accepts it without the prelude, so it has no tag and
 //! its twin is compared either way.
 //!
-//! # What the Referrer trusts
+//! # What the Referrer replaces
 //!
-//! An optional entry is a type whose own path is absolute into another crate (`::tlp_l_000::base::B1<u8>`,
-//! `::std::rc::Rc<u8>`). A Referrer replaces it through the Repeater unless the rule it gives to
-//! `LeakerResult::allow()` trusts every crate the entry names (its type, the bounds of its context).
-//! Each item is invoked with a mode (`gen::Trust`, drawn per item, 40/20/20/20 of the modes that can
-//! differ from the first in the case): `none` (the library's default, `strict`), `all`
-//! (`Rules::external_crates()`), `std` (`Rules::std_crates()`) and `leaker` (a path rule for the
-//! Leaker's crate), so entries that name two crates (`::tlp_l_000::base::B1<::std::rc::Rc<u8>>`) are
-//! trusted by none of the partial modes. The macro writes the Repeater's impls of the required
-//! entries and of the optional ones the mode does not trust, and nothing for the others: a Referrer
-//! that replaced a trusted entry fails to compile.
-//!
-//! Two checks tell a library that trusts too much or too little:
-//!
-//! - The macro writes out which entries the mode trusts, from the crates each names
-//!   (`Trust::trusts()`, `Referrer::external_crates_require()`), and compares it with the entries the
-//!   copy replaces, in the Leaker's crate and in the Referrer's (`TRUST DISAGREES`). It tells a
-//!   trust that ignores the bounds of the context of an entry, which the crate cannot: the copy has
-//!   those bounds as written whatever is trusted.
-//! - The decoy crate (`gen::Decoy`, `DECOY_COPY`). An absolute path names the same crate in both
-//!   crates, so a Referrer that trusts too much still compiles. In the Referrer's crate
-//!   `tlp_x_NNN`, the dependency `tlp_l_NNN` is another crate with the same names in `base`
-//!   (`tlp_d_NNN`, another `BLEN`), and the Leaker's crate is `real_NNN`: the macros are invoked as
-//!   `real_NNN::__tl_prop_N!(path = ::real_NNN::m0, ..)`, and they name the Repeater and the
-//!   witnesses through that path, so a replaced entry is the Leaker's type, and one written as it is
-//!   is the decoy's, which the witness does not accept. It is for the items of the modes that do not
-//!   trust the Leaker's crate (`none` and `std`) in a case whose Leaker does not allow its crate
-//!   (a promise that it is the same crate); not a module (the original is written again for the
-//!   crate), nor an item whose copy names the crate otherwise (the header of an impl, a bound).
+//! A type whose own path is absolute into another crate (`::tlp_l_000::base::B1<u8>`,
+//! `::std::rc::Rc<u8>`) is an entry like the others, unless the Leaker's rule allows its path
+//! (`allow` in the attribute). The copy replaces every entry through the Repeater, and the macro
+//! writes the Repeater's impl of each. (The generator still makes the draw that chose, per item,
+//! whether a Referrer keeps the optional entries as written, which the library does not offer any
+//! more, so that the items are the ones the seeds had.)
 //!
 //! # Other checks of the macro
 //!
 //! - The helpers agree: `repeater_impl()` declares the generics of the context of its entry
-//!   without the bounds its arguments encode, and the parameter of the implementor, `required()`
-//!   and `must()` say the same, and `required()` comes first (`HELPERS DISAGREE`).
+//!   without the bounds its arguments encode, and the parameter of the implementor, `is_empty()`
+//!   and `iter()` say the same, and the context of an entry is one of `contexts()` (`HELPERS
+//!   DISAGREE`).
 //! - A fifth of the cases do not allow the primitive types: `u8` is an entry then, and the copy
 //!   keeps none in a type position (`PRIMITIVE KEPT`).
 //!
@@ -401,12 +378,12 @@
 //!   every feature on, and the words are read in order (`all,-strict_anchors`). With one of `inferred_outlives`,
 //!   `impl_self_outlives`, or `all`, the test fails with the reproduction of that finding
 //!   (`tests/findings.rs` has most of them as a library-level test). `strict_anchors` (F18, about the
-//!   items whose Referrer replaces optional entries, the modes but `all`) is fixed, and on by
-//!   default (`-strict_anchors`: the items that have it are invoked with `all`). `unsized_params`,
+//!   copies that replace optional entries) is fixed, and on by default (`-strict_anchors`: the
+//!   items that have it are not generated on purpose). `unsized_params`,
 //!   `bound_cycles`, `impl_assoc_self`, `method_lifetime_paths`, `module_crate_paths`,
 //!   `bound_merge_syntax`, `fn_pointer_self`, `elided_fn_generics`, `impl_self_bounds` (F13),
 //!   `impl_pred_leaked` (F14), `self_elision` (F15, F23), `implied_outlives` (F16),
-//!   `strict_cycles` (F17, about the items whose Referrer replaces optional entries too), `impl_self_bound_cycle` (F19),
+//!   `strict_cycles` (F17, about the copies that replace optional entries too), `impl_self_bound_cycle` (F19),
 //!   `trait_assoc_bound_cycle` (F20), `iterator_item_cycle` (F21), `supertrait_item` (F25),
 //!   `alias_item` (F26), `impl_trait_args` (F27), `hidden_lifetimes` (F28), `projection_outlives` (F30),
 //!   `item_predicate_cycle` (F33), `self_projection_outlives` (F34), `gat_where_clause` (F35),
@@ -414,8 +391,7 @@
 //!   names its own `Self`, which the Visitor writes with `with_nested_self()`; F37: an entry that
 //!   does not name it, and uses a generic whose bound does, is for any type, and the macro passes
 //!   the copy's own type; one that names it too is rejected; F38: an absolute type that names it
-//!   is no entry, so a strict Referrer copies it as written, with the copy's own `Self`, as a
-//!   trusting one does: the macro checks that no optional entry of such an item names `Self`),
+//!   is no entry, so the copy writes it as it is, with the copy's own `Self`),
 //!   `trait_self_defaults` (F39: a trait whose parameter defaults use a generic whose bound names
 //!   the trait's `Self`, `trait Tr<T: AsRef<Self>, U = Rel<T>>`, nested in `enter_mod`, where the
 //!   Visitor left the default as written, and analyzed as the item itself, where it looks the
@@ -641,24 +617,6 @@ fn errors_name(i: usize) -> String {
     format!("tlp_e_{:03}", i)
 }
 
-/// The decoy crate of a case (`gen::Decoy`), which `tlp_l_NNN` means in the decoy Referrer's crate.
-fn decoy_dir(i: usize) -> String {
-    format!("c{:03}_d", i)
-}
-
-fn decoy_name(i: usize) -> String {
-    format!("tlp_d_{:03}", i)
-}
-
-/// The Referrer's crate that has the decoy as `tlp_l_NNN` and the Leaker's as `real_NNN`.
-fn decoy_referrer_dir(i: usize) -> String {
-    format!("c{:03}_x", i)
-}
-
-fn decoy_referrer_name(i: usize) -> String {
-    format!("tlp_x_{:03}", i)
-}
-
 /// Which crate of `allow_stages` a failure is in: the rule, the side (`res` or `cfg`) and the layout
 /// (`glob` or `clean`), see `gen::StageCrate`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -736,10 +694,6 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode, stages: bool
             }
             if mode != Mode::Identity {
                 dirs.push(format!("\"{}\"", errors_dir(*i)));
-            }
-            if mode != Mode::Identity && case.decoy.is_some() {
-                dirs.push(format!("\"{}\"", decoy_dir(*i)));
-                dirs.push(format!("\"{}\"", decoy_referrer_dir(*i)));
             }
             if mode != Mode::Identity && stages {
                 for stage in &case.stages {
@@ -854,44 +808,6 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode, stages: bool
         .unwrap();
         std::fs::write(dir.join("src/lib.rs"), &case.referrer).unwrap();
 
-        if let Some(decoy) = &case.decoy {
-            let package = |name: String, dependencies: String| {
-                format!(
-                    "[package]\nname = \"{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
-                     [dependencies]\n{}",
-                    name, dependencies
-                )
-            };
-            let dir = ws.join(decoy_dir(*i));
-            std::fs::create_dir_all(dir.join("src")).unwrap();
-            std::fs::write(
-                dir.join("Cargo.toml"),
-                package(decoy_name(*i), String::new()),
-            )
-            .unwrap();
-            std::fs::write(dir.join("src/lib.rs"), &decoy.lib).unwrap();
-            // The decoy is `tlp_l_NNN` there, and the Leaker's crate is `real_NNN`.
-            let dir = ws.join(decoy_referrer_dir(*i));
-            std::fs::create_dir_all(dir.join("src")).unwrap();
-            std::fs::write(
-                dir.join("Cargo.toml"),
-                package(
-                    decoy_referrer_name(*i),
-                    format!(
-                        "{} = {{ package = \"{}\", path = \"../{}\" }}\n{} = {{ package = \"{}\", path = \"../{}\" }}\n",
-                        leaker_name(*i),
-                        decoy_name(*i),
-                        decoy_dir(*i),
-                        gen::real_name(&leaker_name(*i)),
-                        leaker_name(*i),
-                        leaker_dir(*i)
-                    ),
-                ),
-            )
-            .unwrap();
-            std::fs::write(dir.join("src/lib.rs"), &decoy.referrer).unwrap();
-        }
-
         {
             let dir = ws.join(errors_dir(*i));
             std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -951,13 +867,6 @@ fn write_workspace(ws: &Path, cases: &[(usize, &Case)], mode: Mode, stages: bool
 /// `accept_families()` explains if they are the failures it lists.
 const ACCEPT_COPY: &str =
     "ACCEPT: the copy of an item accepted by allow() does not compile in the Referrer's crate";
-
-/// The class of the diagnostics of the decoy Referrer's crate (`gen::Decoy`): the copies of the items
-/// that do not trust the Leaker's crate, in a crate where `::tlp_l_NNN` is another crate. One that
-/// does not compile is a Referrer that wrote an entry as it is although it should have replaced it,
-/// or a copy that names the Leaker's crate by a path the macro did not skip.
-const DECOY_COPY: &str =
-    "DECOY: the copy in the Referrer's crate where the Leaker's crate name is another crate does not compile";
 
 /// The class of the diagnostics of a copy of `allow_stages` (the analysis without the rule, the
 /// result with the rule and the causes of the errors that remain; or the analysis of a config that
@@ -1196,17 +1105,8 @@ struct Report {
     /// (`prop::header_cycles()`).
     headers: usize,
     header_cycles: usize,
-    /// The optional entries whose Repeater impl the macro did not write (the mode of the Referrer
-    /// trusts them).
-    skipped: usize,
     /// The item has bare traits of the prelude and was compared with its twin.
     twin: bool,
-    /// The optional entries by the crates they name: `std` only, the Leaker's crate only, both,
-    /// another; and how many of them the Referrer's mode trusts (`prop::optional_entries()`).
-    optional: [usize; 4],
-    trusted: usize,
-    /// The decoy crate has a copy of the item, if its mode lets it (`prop::apply()`).
-    decoyed: bool,
     /// `allow_stages`: the rule does not matter for the item, and the macro made no copy (`skip`).
     skip: bool,
     /// `allow_stages`: the errors of the analysis without the rule, which the rule drops or leaves.
@@ -1255,16 +1155,9 @@ fn parse_report(line: &str) -> Option<(usize, Report)> {
                 Some(("entries", n)) => report.entries = n.parse().unwrap_or(0),
                 Some(("positions", n)) => report.positions = n.parse().unwrap_or(0),
                 Some(("checked", n)) => report.checked = n.parse().unwrap_or(0),
-                Some(("skipped", n)) => report.skipped = n.parse().unwrap_or(0),
                 Some(("headers", n)) => report.headers = n.parse().unwrap_or(0),
                 Some(("header_cycles", n)) => report.header_cycles = n.parse().unwrap_or(0),
                 Some(("twin", n)) => report.twin = n == "1",
-                Some(("optstd", n)) => report.optional[0] = n.parse().unwrap_or(0),
-                Some(("optkr", n)) => report.optional[1] = n.parse().unwrap_or(0),
-                Some(("optboth", n)) => report.optional[2] = n.parse().unwrap_or(0),
-                Some(("optother", n)) => report.optional[3] = n.parse().unwrap_or(0),
-                Some(("trusted", n)) => report.trusted = n.parse().unwrap_or(0),
-                Some(("decoyed", n)) => report.decoyed = n == "1",
                 _ => (),
             }
         }
@@ -2613,9 +2506,6 @@ fn case_packages(cases: &[Case]) -> HashSet<String> {
                 errors_name(i),
             ];
             names.extend(case.stages.iter().map(|stage| stage_name(i, stage)));
-            if case.decoy.is_some() {
-                names.extend([decoy_name(i), decoy_referrer_name(i)]);
-            }
             names
         })
         .collect()
@@ -2716,9 +2606,6 @@ struct Stats {
     /// The impl headers compared, and those left out (`Report::header_cycles`).
     headers: usize,
     header_cycles: usize,
-    /// The Repeater impls of optional entries that were not written, for the items whose Referrer
-    /// trusts them.
-    skipped: usize,
     /// The items with a bare trait of the prelude that were compared with their twin (the
     /// prelude is allowed), and the rejections for a bare trait (it is not).
     twins: usize,
@@ -3178,7 +3065,6 @@ impl Stats {
                     if !case.config.primitive {
                         stats.primitive_off += 1;
                     }
-                    stats.skipped += report.skipped;
                     stats.headers += report.headers;
                     stats.header_cycles += report.header_cycles;
                     stats.twins += usize::from(report.twin);
@@ -3861,57 +3747,6 @@ fn use_summary(cases: &[(usize, &Case)], build: &Build) -> (String, Vec<String>)
     (text, problems)
 }
 
-/// The modes of the Referrers (`gen::Trust`) over the analyzed items: how many items have each, the
-/// optional entries they have by the crates they name, and how many the mode trusts (written as they
-/// are in the copy, with no Repeater impl) or replaces. `decoy`: the items copied in the Referrer's
-/// crate where the Leaker's crate name is another crate (`gen::Decoy`).
-fn trust_summary(cases: &[(usize, &Case)], reports: &BTreeMap<(usize, usize), Report>) -> String {
-    let mut s = String::new();
-    writeln!(
-        s,
-        "  optional entries by the mode of the Referrer (trust): items (copied in the decoy crate), entries that name std only / the Leaker's crate only / both / another, and how many are trusted"
-    )
-    .unwrap();
-    for trust in gen::Trust::ALL {
-        let (mut items, mut optional, mut trusted, mut decoyed) = (0, [0; 4], 0, 0);
-        for &(i, case) in cases {
-            for item in case.items.iter().filter(|item| item.trust == trust) {
-                if let Some(report) = reports.get(&(i, item.id)) {
-                    if report.accepted || report.allowed {
-                        items += 1;
-                        for (total, n) in optional.iter_mut().zip(report.optional) {
-                            *total += n;
-                        }
-                        trusted += report.trusted;
-                        // Only the cases with a decoy crate invoke the item there.
-                        decoyed += usize::from(
-                            report.decoyed
-                                && case.decoy.is_some()
-                                && trust != gen::Trust::All
-                                && trust != gen::Trust::Leaker,
-                        );
-                    }
-                }
-            }
-        }
-        writeln!(
-            s,
-            "  trust {:<7} {:>5} items ({:>4}); optional entries {:>5} / {:>5} / {:>5} / {:>5}, trusted {:>5}, replaced {:>5}",
-            trust.name(),
-            items,
-            decoyed,
-            optional[0],
-            optional[1],
-            optional[2],
-            optional[3],
-            trusted,
-            optional.iter().sum::<usize>() - trusted
-        )
-        .unwrap();
-    }
-    s
-}
-
 fn summarize(
     stats: &Stats,
     floors: &Floors,
@@ -4027,8 +3862,8 @@ fn summarize(
     .unwrap();
     writeln!(
         s,
-        "  bare traits of the prelude: {} items compared with their twin, {} errors of rejections; optional entries without an impl (trusted): {}; items without allow_primitive: {}",
-        stats.twins, stats.bare_rejected, stats.skipped, stats.primitive_off
+        "  bare traits of the prelude: {} items compared with their twin, {} errors of rejections; items without allow_primitive: {}",
+        stats.twins, stats.bare_rejected, stats.primitive_off
     )
     .unwrap();
     for (tag, what) in SELF_DEFAULT_SHAPES {
@@ -4149,7 +3984,6 @@ fn failure_crates(failure: &Failure, ws: &Path) -> Vec<String> {
     let i = failure.case;
     let referrer = match failure.stage {
         Some(key) => key.dir(i),
-        None if failure.class == DECOY_COPY => decoy_referrer_dir(i),
         None if failure.class == ACCEPT_CLASSES.unknown
             || failure.class == ACCEPT_CLASSES.no_shape =>
         {
@@ -4311,15 +4145,6 @@ fn random_items_leak_across_crates() {
                 None,
             ),
         ];
-        if let Some(decoy) = &case.decoy {
-            crates.push((
-                decoy_referrer_name(i),
-                decoy_referrer_dir(i),
-                &decoy.lines,
-                DECOY_COPY,
-                None,
-            ));
-        }
         if stages_on {
             for stage in &case.stages {
                 crates.push((
@@ -4363,21 +4188,12 @@ fn random_items_leak_across_crates() {
             }
         }
         // A crate that reported no error must have been built, whatever the others did.
-        let mut missing = missing_artifacts(
+        let missing = missing_artifacts(
             &build,
             i,
             accept,
             if stages_on { &case.stages } else { &[] },
         );
-        if case.decoy.is_some() {
-            for name in [decoy_name(i), decoy_referrer_name(i)] {
-                if !build.diags.iter().any(|d| d.package == name)
-                    && !build.artifacts.contains(&name)
-                {
-                    missing.push(format!("`{}` was not built, and reported no error", name));
-                }
-            }
-        }
         if !missing.is_empty() {
             unbuilt.push(i);
             failures.push(Failure::new(
@@ -4744,7 +4560,6 @@ fn random_items_leak_across_crates() {
     let mut stats = Stats::collect(&selected, &reports);
     stats.documented = documented;
     let mut summary = summarize(&stats, &floors, &run, features, flags);
-    summary.push_str(&trust_summary(&selected, &reports));
     for (rule, run) in &runs {
         let result = &results[rule];
         let copies = StageCopies {
@@ -4823,12 +4638,11 @@ fn random_items_leak_across_crates() {
             if let Some(item) = case.items.iter().find(|i| Some(i.id) == failure.item) {
                 writeln!(
                     message,
-                    "item {} ({}, in {:?}, allow_self {}, trust {}):\n{}",
+                    "item {} ({}, in {:?}, allow_self {}):\n{}",
                     item.id,
                     item.kind,
                     item.module,
                     item.allow_self,
-                    item.trust.name(),
                     excerpt(&item.source, 60)
                 )
                 .unwrap();
@@ -5907,55 +5721,7 @@ mod checks {
     }
 
     #[test]
-    fn the_decoy_crate_is_for_the_items_that_do_not_trust_the_leaker() {
-        let mut with_decoy = 0;
-        for seed in 0..12 {
-            let case = generate_with(seed, 0, 6, Features::parse(""), Flags::default());
-            let wanted: Vec<&gen::Item> = case
-                .items
-                .iter()
-                .filter(|item| {
-                    item.kind != "mod" && matches!(item.trust, gen::Trust::None | gen::Trust::Std)
-                })
-                .collect();
-            // The Leaker's own rule allowing its crate is a promise that it is the same crate.
-            let expected = !case.config.allow_crate && !wanted.is_empty();
-            assert_eq!(case.decoy.is_some(), expected, "{:?}", case.config);
-            let Some(decoy) = &case.decoy else { continue };
-            with_decoy += 1;
-            assert_eq!(decoy.lines.len(), wanted.len());
-            assert!(
-                decoy.lib.contains("pub const BLEN: usize = 3;"),
-                "{}",
-                decoy.lib
-            );
-            assert!(!decoy.lib.contains("tlp_l_000"), "{}", decoy.lib);
-            for item in wanted {
-                let call = format!("real_000::__tl_prop_{}!(", item.id);
-                let lines: Vec<(usize, &str)> = decoy
-                    .referrer
-                    .lines()
-                    .enumerate()
-                    .filter(|(_, line)| line.contains(&call))
-                    .collect();
-                assert_eq!(lines.len(), 1, "{}", decoy.referrer);
-                let (at, line) = lines[0];
-                assert!(line.contains("path = ::real_000"), "{}", line);
-                assert!(
-                    line.contains(&format!("trust({})", item.trust.name())),
-                    "{}",
-                    line
-                );
-                assert!(line.ends_with(", decoy(tlp_l_000));"), "{}", line);
-                assert!(decoy.lines.contains(&(at + 1, item.id)));
-            }
-        }
-        assert!(with_decoy > 0, "no case has a decoy in 12 cases");
-    }
-
-    #[test]
     fn the_generated_cases_say_what_the_macro_needs() {
-        let mut trusts = std::collections::BTreeMap::new();
         // The traits of `trait_self_defaults` (F39): needing `Self` and nested, and declared again.
         let (mut nested_self_default, mut redeclared, mut plain_default) = (0, 0, 0);
         for seed in 0..12 {
@@ -5966,21 +5732,8 @@ mod checks {
                     .lines()
                     .find(|line| line.contains(&format!("(id = {},", item.id)))
                     .unwrap_or_else(|| panic!("no attribute for item {}", item.id));
-                assert!(
-                    attr.contains(&format!(
-                        "trust = \"{}\", krate = \"{}\",",
-                        item.trust.name(),
-                        case.config.krate
-                    )),
-                    "{} {}",
-                    attr,
-                    item.trust.name()
-                );
+                assert!(!attr.contains("trust"), "{}", attr);
                 assert!(attr.contains(&format!("primitive = {})", case.config.primitive)));
-                *trusts.entry(item.trust.name()).or_insert(0) += 1;
-                // A mode that nothing could tell from `none` is not drawn.
-                assert!(item.trust != gen::Trust::Std || !case.config.allow_std);
-                assert!(item.trust != gen::Trust::Leaker || !case.config.allow_crate);
                 // `redeclare` is for a trait nested in `enter_mod`, and only for that.
                 let redeclare = item.tags.contains(gen::TAG_REDECLARED);
                 assert_eq!(attr.contains("redeclare = true,"), redeclare, "{}", attr);
@@ -6003,14 +5756,6 @@ mod checks {
                     );
                 }
             }
-        }
-        for trust in gen::Trust::ALL {
-            assert!(
-                trusts.contains_key(trust.name()),
-                "no item has the trust {} in 12 cases: {:?}",
-                trust.name(),
-                trusts
-            );
         }
         assert!(
             nested_self_default > 0 && redeclared > 0 && plain_default > 0,
@@ -6090,7 +5835,6 @@ mod checks {
             id: 0,
             kind,
             module: Vec::new(),
-            trust: gen::Trust::None,
             allow_self,
             scope,
             contents: vec![kind],
@@ -6934,11 +6678,7 @@ mod checks {
                 assert_eq!(lines.len(), 1, "{}", text);
                 let (at, line) = lines[0];
                 assert!(line.ends_with(", accept);"), "{}", line);
-                assert!(
-                    line.contains(&format!(", trust({})", item.trust.name())),
-                    "{}",
-                    line
-                );
+                assert!(!line.contains("trust"), "{}", line);
                 assert!(case.accept_lines.contains(&(at + 1, item.id)));
                 // The path is the module, and the invocation is in that module: the modules above
                 // it are open (`pub mod`) and not closed again before it.
@@ -6999,16 +6739,11 @@ mod checks {
                 }
                 if !stage.clean {
                     // Only the macros differ: the modules and imports are those of the accepted items.
-                    // The mode of the Referrer is the rule's, which the attribute of the copy says,
-                    // so the invocation does not.
                     // (The accepted items that the Leaker carries drop their errors: `allow(all)`.)
-                    let mut accepted = case
+                    let accepted = case
                         .accept_referrer
                         .replace("__tl_prop_", &prefix)
                         .replace(", allow(all)", "");
-                    for trust in gen::Trust::ALL {
-                        accepted = accepted.replace(&format!(", trust({})", trust.name()), "");
-                    }
                     assert_eq!(accepted, stage.lib);
                 } else {
                     // None of the Leaker's names but the ones the rule allows: no glob import (but for
@@ -7635,10 +7370,9 @@ mod checks {
         );
         // An accepted item has no errors, and says what the macro wrote.
         let (_, r) =
-            parse_report("3|struct|ok|entries=2 positions=5 checked=4 skipped=1 twin=1\u{1e}")
-                .unwrap();
+            parse_report("3|struct|ok|entries=2 positions=5 checked=4 twin=1\u{1e}").unwrap();
         assert!(r.accepted && r.rejections.is_empty());
-        assert_eq!((r.skipped, r.twin), (1, true));
+        assert!(r.twin);
         let (id, r) = parse_report("8|mod|rej|use absolute path: 'X'").unwrap();
         assert_eq!((id, r.accepted), (8, false));
         // The errors of a rejection follow the report.
@@ -7655,7 +7389,7 @@ mod checks {
         assert_eq!(r.rejections[0].reason, "");
         // `acc` is not accepted as it is, and has the errors and what the macro wrote.
         let line = format!(
-            "5|trait|acc|entries=3 positions=7 checked=2 skipped=1 twin=0\u{1e}{}",
+            "5|trait|acc|entries=3 positions=7 checked=2 twin=0\u{1e}{}",
             "use absolute path: 'Rel'\u{1f}Rel\u{1f}a note\u{1f}RelativePath\u{1f}Type"
         );
         let (id, r) = parse_report(&line).unwrap();

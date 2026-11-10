@@ -76,7 +76,7 @@ pub struct GenericExpr<const B: bool>(pub Inner);
 type_leak_test_leaker::s::ExprTypes!(impl<const B: bool> ExprTypes for GenericExpr<B> => 0);
 
 /// The types of external crates are optional entries: the Referrer leaves them as written, or
-/// replaces them with the Repeater's projections (`strict`, the Referrer does not trust the names
+/// replaces them with the Repeater's projections (the Referrer does not trust the names
 /// of the crates), with the relative types in them replaced either way.
 pub struct Trusting(pub Inner);
 type_leak_test_leaker::m::External!(impl<T> External<T> for Trusting => 0 {
@@ -87,21 +87,20 @@ type_leak_test_leaker::m::External!(impl<T> External<T> for Trusting => 0 {
 
 /// The same, replacing the optional entries as well.
 pub struct Strict(pub Inner);
-type_leak_test_leaker::m::External!(strict impl<T> External<T> for Strict => 0 {
+type_leak_test_leaker::m::External!(impl<T> External<T> for Strict => 0 {
     fn receiver(self: ::std::boxed::Box<Self>) -> usize {
         type_leak_test_leaker::m::External::<T>::receiver(::std::boxed::Box::new(self.0))
     }
 });
 
-// What the two Referrers write for the same items, as text: the trusting one names the crate (for
-// `Ext<u8>`, which has nothing relative in it), the strict one replaces the whole type of it. The
-// type with a relative one in it is replaced whole by both. This crate has no dependency on that
-// crate (`type_leak_test_ext`), so it cannot compile either copy: the strict one is compiled in
-// `tests/crates/trusting`, which has the feature `strict` for it.
-type_leak_test_leaker::x::ExtDep!(show TRUSTING_COPY [Wrapper] {
+// What the macro writes for the same items after a Leaker that allows the crate and one that does
+// not, as text: the first names the crate, the second replaces the whole type of it. This crate has
+// no dependency on that crate (`type_leak_test_ext`), so it cannot compile either copy: the second
+// is compiled in `tests/crates/trusting`, which has the feature `replace` for it.
+type_leak_test_leaker::x::ExtDepAllowed!(show ALLOWED_COPY [Wrapper] {
     pub fn f(x: ::type_leak_test_ext::Ext<(RelX,)>, y: ::type_leak_test_ext::Ext<u8>) {}
 });
-type_leak_test_leaker::x::ExtDep!(strict show STRICT_COPY [Wrapper] {
+type_leak_test_leaker::x::ExtDep!(show REPLACED_COPY [Wrapper] {
     pub fn f(x: ::type_leak_test_ext::Ext<(RelX,)>, y: ::type_leak_test_ext::Ext<u8>) {}
 });
 
@@ -181,10 +180,9 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9127!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9128!(path = ::type_leak_test_leaker::kinds);
     // An absolute type that names their own `Self` is copied as written, by a strict Referrer too.
-    type_leak_test_leaker::__tl_prop_9121!(path = ::type_leak_test_leaker::kinds, strict);
-    type_leak_test_leaker::__tl_prop_9122!(path = ::type_leak_test_leaker::kinds, strict);
-    type_leak_test_leaker::__tl_prop_9123!(path = ::type_leak_test_leaker::kinds);
-    type_leak_test_leaker::__tl_prop_9124!(path = ::type_leak_test_leaker::kinds, strict);
+    type_leak_test_leaker::__tl_prop_9121!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9122!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9124!(path = ::type_leak_test_leaker::kinds);
     // The defaults of a struct and an enum nested in a module, whose generic has a bound that names
     // their `Self`: the entry has no `Self`, and the copy writes the default through the Repeater.
     type_leak_test_leaker::__tl_prop_9151!(path = ::type_leak_test_leaker::kinds);
@@ -203,7 +201,7 @@ pub mod kinds {
     // A bound of a generic that names it, next to one that fixes an associated type: left out of
     // the Repeater's impls of the entries. The one invoked as `strict` replaces the alias too.
     type_leak_test_leaker::__tl_prop_9171!(path = ::type_leak_test_leaker::kinds);
-    type_leak_test_leaker::__tl_prop_9172!(path = ::type_leak_test_leaker::kinds, strict);
+    type_leak_test_leaker::__tl_prop_9172!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9173!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9174!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9175!(path = ::type_leak_test_leaker::kinds);
@@ -234,7 +232,7 @@ pub mod kinds {
     // The defaults of a nested trait whose generic has a bound that names its `Self`: the copy is
     // declared here, with the defaults written through the host.
     type_leak_test_leaker::__tl_prop_9131!(path = ::type_leak_test_leaker::kinds);
-    type_leak_test_leaker::__tl_prop_9132!(path = ::type_leak_test_leaker::kinds, strict);
+    type_leak_test_leaker::__tl_prop_9132!(path = ::type_leak_test_leaker::kinds);
     // The entries that do not name `Self` are for a primitive type, the others for the host.
     type_leak_test_leaker::__tl_prop_9209!(path = ::type_leak_test_leaker::kinds);
     // The entries that do not need `Self` are for a marker type, the others for the host. The
@@ -281,15 +279,15 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9076!(path = ::type_leak_test_leaker::kinds);
     // An optional entry that holds a method lifetime is copied as written, by a strict Referrer too
     // (F18): the path of this crate resolves here.
-    type_leak_test_leaker::__tl_prop_9194!(path = ::type_leak_test_leaker::kinds, strict);
+    type_leak_test_leaker::__tl_prop_9194!(path = ::type_leak_test_leaker::kinds);
     // The types of `::std` around a trait object bounded by a method lifetime are written as they
     // are, and the lifetime stays in an input (F67).
-    type_leak_test_leaker::__tl_prop_9228!(path = ::type_leak_test_leaker::kinds, strict);
-    type_leak_test_leaker::__tl_prop_9229!(path = ::type_leak_test_leaker::kinds, strict);
+    type_leak_test_leaker::__tl_prop_9228!(path = ::type_leak_test_leaker::kinds);
+    type_leak_test_leaker::__tl_prop_9229!(path = ::type_leak_test_leaker::kinds);
     // The optional self type of an impl is written as it is, though a strict Referrer replaces
     // the optional entries: a bound that names `Self` is next to one that names an optional type
     // (F68).
-    type_leak_test_leaker::__tl_prop_9230!(path = ::type_leak_test_leaker::kinds, strict);
+    type_leak_test_leaker::__tl_prop_9230!(path = ::type_leak_test_leaker::kinds);
     // The copy is used at an instantiation that gives the type parameter a type with a lifetime,
     // where it is in the inputs of a function pointer or `Fn(..)` whose output has an elided
     // lifetime: the use site names that lifetime (F69). The last leaves the default out.
@@ -298,8 +296,8 @@ pub mod kinds {
     type_leak_test_leaker::__tl_prop_9233!(path = ::type_leak_test_leaker::kinds, inst(2), lifetime_args);
     // The same where an entry is in the inputs, which the strict Referrer replaces: the path through
     // the Repeater names the lifetime (F70).
-    type_leak_test_leaker::__tl_prop_9234!(path = ::type_leak_test_leaker::kinds, strict, inst(1), lifetime_args);
-    type_leak_test_leaker::__tl_prop_9235!(path = ::type_leak_test_leaker::kinds, strict, inst(1), lifetime_args);
+    type_leak_test_leaker::__tl_prop_9234!(path = ::type_leak_test_leaker::kinds, inst(1), lifetime_args);
+    type_leak_test_leaker::__tl_prop_9235!(path = ::type_leak_test_leaker::kinds, inst(1), lifetime_args);
     // Const generics of type `u64` and `u128`: the slot `U64` and the `KEY` of the Repeater.
     type_leak_test_leaker::__tl_prop_9236!(path = ::type_leak_test_leaker::kinds);
 }
@@ -329,7 +327,7 @@ pub mod accepted {
     #[allow(unused_imports)]
     use type_leak_test_leaker::kinds::GenTr;
 
-    type_leak_test_leaker::__tl_prop_9207!(path = ::type_leak_test_leaker::kinds, strict, accept);
+    type_leak_test_leaker::__tl_prop_9207!(path = ::type_leak_test_leaker::kinds, accept);
 
     type_leak_test_leaker::__tl_prop_9190!(
         path = ::type_leak_test_leaker::kinds,
@@ -358,7 +356,7 @@ pub mod accepted {
     type_leak_test_leaker::__tl_prop_9220!(path = ::type_leak_test_leaker::kinds, accept);
     // The types in a type written as it is that hold a lifetime of a method are written as they are.
     type_leak_test_leaker::__tl_prop_9221!(path = ::type_leak_test_leaker::kinds, accept);
-    type_leak_test_leaker::__tl_prop_9222!(path = ::type_leak_test_leaker::kinds, strict, accept);
+    type_leak_test_leaker::__tl_prop_9222!(path = ::type_leak_test_leaker::kinds, accept);
 
     // The traits of two items analyzed together: `f` keeps the type as written, `Held` and `Wrap`
     // are named here (F48).

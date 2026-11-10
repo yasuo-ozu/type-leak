@@ -874,7 +874,7 @@ pub mod m {
     // (`'x` would be only in a projection): the function pointer holding the binder is leaked
     // instead, as an optional entry, and a bound, which is not a type, is copied as it is (no error).
     check_leak! {
-        { ? for<'x> fn(::std::boxed::Box<dyn ::core::iter::Iterator<Item = &'x u8>>) -> &'x u8 }
+        { for<'x> fn(::std::boxed::Box<dyn ::core::iter::Iterator<Item = &'x u8>>) -> &'x u8 }
         { }
         trait ExternalOnly {
             fn pointer(&self, f: for<'x> fn(::std::boxed::Box<dyn ::core::iter::Iterator<Item = &'x u8>>) -> &'x u8) -> usize;
@@ -1884,57 +1884,6 @@ pub mod m {
 /// The Referrer's side: implements the traits by forwarding to `Inner`, without importing any of
 /// the types relative to `crate::m`. The copies of the signatures are compiled here.
 pub mod user {
-    /// The Referrer which does not trust the names of the external crates: it replaces their types
-    /// (the optional entries) as well, so the function pointers and the trait objects of `Binders`
-    /// which hold an anchor of an external crate, and the `::std::vec::Vec<..>` of `Around`, are
-    /// copied by the Repeater too, and compile.
-    pub struct StrictWrapper(pub crate::m::Inner);
-
-    crate::m::Binders!(strict impl Binders for StrictWrapper => 0);
-    crate::m::Around!(strict impl Around for StrictWrapper => 0);
-    crate::m::Dyns!(strict impl<'a> Dyns<'a> for StrictWrapper => 0);
-    crate::m::Locals!(strict impl Locals for StrictWrapper => 0);
-    crate::m::LocalBinders!(strict impl LocalBinders for StrictWrapper => 0);
-
-    /// The `::std::vec::Vec<..>` of `Around` has `Rel2<..>` in it, so it is an entry, replaced
-    /// whether the Referrer trusts the crate or not, and a copy as the field of a struct writes the
-    /// bound as the strict one does (`strict_copies`).
-    pub mod trusting_copies {
-        use crate::m::Rel2;
-
-        crate::m::Around!(copy [super::Wrapper] {
-            pub struct GatNested<'a, T: ::type_leak_test_outlives::Gat, U>(
-                pub &'a ::std::vec::Vec<T::A<Rel2<U>>>,
-            )
-            where
-                T::A<Rel2<U>>: 'a;
-        });
-    }
-
-    /// The copies as the fields of structs, with the `::std::vec::Vec<..>` replaced by its entry,
-    /// which has the bounds that the struct writes (`T: 'a`, as `Ref<'a, X>` requires it, E0309
-    /// otherwise).
-    pub mod strict_copies {
-        use crate::m::Rel2;
-
-        crate::m::Around!(strict copy [StrictWrapper] {
-            pub struct Nested<'a, T: 'a>(pub ::core::cell::Ref<'a, ::std::vec::Vec<Rel2<T>>>);
-            // The entry `Vec<T::A<Rel2<U>>>` has the where predicate `T::A<Rel2<U>>: 'a` (the
-            // projection is a unit, which the original gets by RFC 2093 from its field). The
-            // copy of the field does not infer it through the projection of the Repeater: write it
-            // (with `Rel2` in scope, as the predicate is not rewritten, being no entry's context).
-            pub struct GatNested<'a, T: ::type_leak_test_outlives::Gat, U>(
-                pub &'a ::std::vec::Vec<T::A<Rel2<U>>>,
-            )
-            where
-                T::A<Rel2<U>>: 'a;
-            pub struct GatNestedCore<'a, T: ::type_leak_test_outlives::Gat, U>(
-                pub &'a ::core::option::Option<T::A<Rel2<U>>>,
-            );
-        });
-        pub struct StrictWrapper;
-    }
-
     pub struct Wrapper(pub crate::m::Inner);
 
     crate::m::Bounds!(impl Bounds for Wrapper => 0);
@@ -1979,8 +1928,8 @@ pub mod user {
         pub struct GatCell<'a, T: ::type_leak_test_outlives::Gat, U>(
             pub ::core::cell::Ref<'a, T::A<Rel2<U>>>,
         );
-        // A path of `::core` is no entry, so the copy infers the bound from the field (the `Vec`
-        // of an external crate is, see `trusting_copies`).
+        // A path of `::core` is no entry, so the copy infers the bound from the field (the `Vec` of
+        // an external crate is, see `gat_nested`).
         pub struct GatNestedCore<'a, T: ::type_leak_test_outlives::Gat, U>(
             pub &'a ::core::option::Option<T::A<Rel2<U>>>,
         );
@@ -1998,6 +1947,21 @@ pub mod user {
             Alone(Rel2<T>),
         }
     });
+    /// The entry `Vec<T::A<Rel2<U>>>` of an external crate has the where predicate `T::A<Rel2<U>>:
+    /// 'a` (the projection is a unit, which the original gets by RFC 2093 from its field). The copy
+    /// of the field does not infer it through the projection of the Repeater: write it (with `Rel2`
+    /// in scope, as the predicate is not rewritten, being no entry's context).
+    pub mod gat_nested {
+        use crate::m::Rel2;
+
+        crate::m::Around!(copy [super::Wrapper] {
+            pub struct GatNested<'a, T: ::type_leak_test_outlives::Gat, U>(
+                pub &'a ::std::vec::Vec<T::A<Rel2<U>>>,
+            )
+            where
+                T::A<Rel2<U>>: 'a;
+        });
+    }
     // The field of a struct without the bound written, disabled as it does not compile (E0309, see
     // `m::UnboundedAround`): `Rel2<T>` has the generics `<T>` of its signature, and the copy
     // `Ref<'a, <Wrapper as Repeater<(T,), ..>>::Type>` is well-formed only with `T: 'a`, which the
