@@ -5,8 +5,7 @@ use crate::analysis::{CheckResult, Part, SelfMention};
 use crate::context::Context;
 use crate::result::Place;
 use crate::util::{
-    has_lifetime_bound, is_std_crate_path, or_list, path_type, tidy, without_arguments,
-    without_crate_prefix, KNOWN_NAMES,
+    absolute_example, has_lifetime_bound, or_list, path_type, tidy, without_arguments, KNOWN_NAMES,
 };
 use proc_macro2::{Delimiter, Literal, Span, TokenStream, TokenTree};
 use std::hash::{Hash, Hasher};
@@ -46,8 +45,9 @@ pub enum Cause {
     Lifetime(Lifetime),
     /// A path whose kind is not known: the root of a `use`, a path in the tokens of a macro.
     Unknown(Path),
-    /// Syntax that the Leaker cannot read (`macro_rules!`, `use inner::*;`) or that no node of the
-    /// syntax holds: a bound with a binder (`for<'a> Fn(&'a u8)`) or in parentheses.
+    /// Syntax that the Leaker cannot read (`macro_rules!`, `use inner::*;`), a `mod` met as an item
+    /// (the cause is `mod name`, without its items), or syntax that no node of the syntax holds: a
+    /// bound with a binder (`for<'a> Fn(&'a u8)`) or in parentheses.
     Unreadable(TokenStream),
 }
 
@@ -316,8 +316,8 @@ pub enum Reason {
     /// Syntax that the Leaker cannot read, with `check_values`: a macro whose arguments are not
     /// expressions, a `macro_rules!`, a glob import, syntax that `syn` leaves unparsed. Also a
     /// `mod` item given to [`View::visit_item()`](crate::View::visit_item) or met in an item there
-    /// (the cause is `mod name`, with no paths): the Leaker analyzes no module, and nothing in it is
-    /// leaked.
+    /// (the cause is `mod name`, with no paths): the Leaker analyzes no module, and nothing in it
+    /// is leaked.
     Unreadable,
     /// A bare identifier among the arguments of a path, which may be a const, in a type that cannot
     /// be leaked whole ([Bare identifiers and consts](crate::Leaker#bare-identifiers-and-consts)).
@@ -341,8 +341,8 @@ pub enum Reason {
     /// copy passes its own type.
     ///
     /// The error has no [`paths`](ErrorItem::paths).
-    /// [`LeakerResult::ignore()`](crate::LeakerResult::ignore) removes the entry, so the copy writes
-    /// the type as it is, and none of the following matters.
+    /// [`LeakerResult::ignore()`](crate::LeakerResult::ignore) removes the entry, so the copy
+    /// writes the type as it is, and none of the following matters.
     /// [`LeakerResult::allow()`](crate::LeakerResult::allow) drops the error if the rule allows its
     /// cause, and keeps the entry, and then you promise two things. The declaration of the leaked
     /// type has no trait bound on the parameter that receives `Self` (`struct Wrap<A: Clone, B>`),
@@ -444,7 +444,8 @@ impl Reason {
 pub struct ErrorItem {
     /// The part of the item that cannot be interned, as written, and where the error is reported
     /// ([`ErrorItem::span()`]). Compare it with `==` in an [`Allow`](crate::Allow) rule: a rule
-    /// accepts an error that has [`paths`](ErrorItem::paths) by them, and one that has none by this.
+    /// accepts an error that has [`paths`](ErrorItem::paths) by them, and one that has none by
+    /// this.
     pub cause: Cause,
     /// Why it cannot be interned.
     pub reason: Reason,
@@ -536,7 +537,8 @@ impl ErrorItem {
     }
 
     /// Returns a `compile_error!` that reports the error, with the notes and the help in its
-    /// message. Pure: use it to build or compare tokens; a macro reports with [`emit()`](ErrorItem::emit).
+    /// message. Pure: use it to build or compare tokens; a macro reports with
+    /// [`emit()`](ErrorItem::emit).
     #[must_use]
     pub fn to_compile_error(&self) -> TokenStream {
         self.to_syn_error().to_compile_error()
@@ -569,7 +571,7 @@ impl ErrorItem {
             }
             message.push('\n');
         }
-        syn::Error::new(self.span(), message)
+        syn::Error::new_spanned(&self.cause, message)
     }
 }
 
@@ -998,29 +1000,6 @@ fn absolute_path_help(cause: &Cause, default_object: bool) -> (TokenStream, Stri
 
 /// The path as it is written, without its arguments, and an example of its absolute form.
 fn path_names(path: &syn::Path) -> (String, String) {
-    let names = |path: &syn::Path| {
-        path.segments
-            .iter()
-            .map(|seg| seg.ident.to_string())
-            .collect::<Vec<_>>()
-            .join("::")
-    };
-    let name = format!(
-        "{}{}",
-        if path.leading_colon.is_some() {
-            "::"
-        } else {
-            ""
-        },
-        names(path)
-    );
-    // `core::fmt::Debug` is `::core::fmt::Debug`; `crate::m::X` and `super::m::X` are `m::X` in the
-    // crate.
-    let example =
-        if path.leading_colon.is_none() && path.segments.len() > 1 && is_std_crate_path(path) {
-            format!("::{}", names(path))
-        } else {
-            format!("::my_crate::{}", names(&without_crate_prefix(path)))
-        };
-    (name, example)
+    let path = without_arguments(path);
+    (tidy(&path.to_token_stream()), absolute_example(&path))
 }

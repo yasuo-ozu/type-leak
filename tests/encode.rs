@@ -394,7 +394,7 @@ fn the_text_of_every_variant() {
             "the trait object 'dyn Tr' has no lifetime bound, which defaults to different \
              lifetimes in the encoding of a type with a lifetime bound; write it (e.g. `+ \
              'static`)",
-            "the type 'Wrap < T , Self >' needs `Self` (it names it, or its generics do), so its \
+            "the type 'Wrap < T , Self >' needs `Self` (it names it, or its context does), so its \
              Repeater impl cannot be for a marker type; use `ImplSelf::Param`",
             "the associated type '< :: std :: vec :: IntoIter < u8 > > :: Item' needs its trait: \
              rustc resolves `<Type>::Item` only for a type parameter; write `<Type as Trait>::Item`",

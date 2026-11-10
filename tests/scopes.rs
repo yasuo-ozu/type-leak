@@ -967,7 +967,7 @@ fn the_format_of_the_previous_version_is_rejected() {
             assert_eq!(
                 err.to_string(),
                 format!(
-                    "this Referrer was serialized by an incompatible type-leak (format {}, \
+                    "this data was serialized by an incompatible type-leak (format {}, \
                      expected {}): the macros which emit and parse it must use the same version \
                      of type-leak",
                     version,

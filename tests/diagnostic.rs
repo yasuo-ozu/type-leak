@@ -27,7 +27,9 @@
 //! - `Self` where no scope declares it (`NoSelf`, `Leaker::enter_generics()`): one for each
 //!   mention, and
 //! - a Referrer that a macro cannot read, because it was serialized by another version of
-//!   `type-leak` (`Tag*`), whatever it carries as the format tag.
+//!   `type-leak` (`Tag*`), whatever it carries as the format tag, and
+//! - tokens that the compiler prints as `ty! (Self)` and `use inner::* ;` (`MacroInDefault`,
+//!   `StatementInDefault`): the texts write `ty!(Self)` and `use inner::*;`.
 //!
 //! The build must report exactly these errors, and no other.
 //!
@@ -142,7 +144,7 @@ fn error(headline: &str, at: &str, notes: &[&str], helps: &[&str]) -> Reported {
 fn format_error(found: &str, at: &str) -> Reported {
     error(
         &format!(
-            "this Referrer was serialized by an incompatible type-leak ({}, expected {}): the \
+            "this data was serialized by an incompatible type-leak ({}, expected {}): the \
              macros which emit and parse it must use the same version of type-leak",
             found,
             Referrer::FORMAT_VERSION
@@ -225,10 +227,14 @@ error: use absolute path: 'Clone'
 2 | pub trait Prelude: Clone {}
   |                    ^^^^^
 ",
+            // The whole bound is underlined: the error is at its first and its last token.
             "
          = help: use `::core::ops::Fn` instead of `Fn`
 
  --> lib.rs:5:18
+  |
+5 | pub trait Bound: for<'a> Fn(&'a u8) {}
+  |                  ^^^^^^^^^^^^^^^^^^
 ",
             // The notes (why) come first, then the help (what to write).
             "\
@@ -276,6 +282,8 @@ fn every_offending_path_is_an_error_of_its_own() {
     let because = "it cannot be leaked as a whole because of `'_`";
     let self_note = "`Self` has no meaning here: it is declared only by a struct, an enum, a union, an impl or a trait, not by a module or generics";
     let self_help = "write the type instead of `Self`";
+    const GLOB_NOTE: &str = "a glob import hides which names it brings into scope. Every path in the default of `N` must be readable, since the copy writes it as it is";
+    const GLOB_HELP: &str = "write it with paths and expressions only, or move it out of the item";
     let expected_notes_of_multi = [
         error("use absolute path: 'Clone'", "14:18", &[], &[clone_help]),
         error(
@@ -315,7 +323,8 @@ fn every_offending_path_is_an_error_of_its_own() {
     }
 
     // Every error of the fixture, and no other: the three single ones and the trait object in the
-    // second, the five of `Multi`, the two mentions of `Self`, and the four unreadable Referrers.
+    // second, the five of `Multi`, the two mentions of `Self`, the four unreadable Referrers, and
+    // the three of the macro call and the statement.
     let mut expected = vec![
         error("use absolute path: 'Clone'", "2:20", &[], &[clone_help]),
         error(
@@ -352,6 +361,27 @@ fn every_offending_path_is_an_error_of_its_own() {
         format_error("format 9", "39:1"),
         format_error("no format tag", "45:1"),
         format_error("an unrecognized tag \"not-a-tag\"", "51:1"),
+        error(
+            "`ty!(Self)` is in the default of a parameter, and names `Self`",
+            "60:30",
+            &[
+                "a default of a parameter cannot depend on `Self`",
+                "it cannot be leaked as a whole because of `ty!(Self)`",
+            ],
+            &["name the type instead of `Self` in `ty!(Self)`"],
+        ),
+        error(
+            "cannot analyze `use inner::*;` in the default of `N`",
+            "65:9",
+            &[GLOB_NOTE],
+            &[GLOB_HELP],
+        ),
+        error(
+            "use absolute path: 'inner'",
+            "65:13",
+            &["it is in the default of `N`, which the copy writes as it is"],
+            &["write `inner` with an absolute path (e.g. `::my_crate::inner`)"],
+        ),
     ];
     // Not the "format 7" of the previous version, but the one that is, whatever the version is.
     expected[6] = format_error(&format!("format {}", Referrer::FORMAT_VERSION - 1), "33:1");
@@ -369,6 +399,20 @@ fn every_offending_path_is_an_error_of_its_own() {
         "{}",
         stderr
     );
+}
+
+/// The texts quote a macro call and a statement as one writes them: the compiler prints the tokens
+/// as `ty! (Self)` and `use inner::* ;`, and the texts join them to `ty!(Self)` and `use
+/// inner::*;`. The other tests compare the errors without whitespace.
+#[test]
+fn a_macro_call_and_a_statement_are_quoted_as_one_writes_them() {
+    let stderr = build_fixture();
+    for quoted in ["`ty!(Self)`", "`use inner::*;`"] {
+        assert!(stderr.contains(quoted), "{} is not in:\n{}", quoted, stderr);
+    }
+    for spaced in ["ty! (", "ty !(", "* ;"] {
+        assert!(!stderr.contains(spaced), "{} is in:\n{}", spaced, stderr);
+    }
 }
 
 /// The diagnostics of the output of rustc for the first `lines` lines of the source, as text, in
@@ -578,9 +622,9 @@ mod spans {
         let stdout = String::from_utf8(output.stdout).unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(output.status.success(), "{}\n{}", stdout, stderr);
-        // The tests ran (the other targets of the package have none): 13 of the Leaker (its errors
+        // The tests ran (the other targets of the package have none): 15 of the Leaker (its errors
         // and its assertions), and 2 of `EncodeError`.
-        assert!(stdout.contains("test result: ok. 13 passed"), "{}", stdout);
+        assert!(stdout.contains("test result: ok. 15 passed"), "{}", stdout);
         assert!(stdout.contains("test result: ok. 2 passed"), "{}", stdout);
     }
 }

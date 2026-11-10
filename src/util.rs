@@ -737,21 +737,30 @@ pub(crate) fn tidy_str(text: &str) -> String {
         (" >", ">"),
         ("& ", "&"),
         (" ,", ","),
+        (" ;", ";"),
     ] {
         text = text.replace(from, to);
     }
-    // A macro call: `m ! (..)` is `m!(..)`, but `a && ! (b)` keeps its space.
+    // A macro call: `m ! (..)` and `m! (..)` (how the compiler prints it) are `m!(..)`, but `a && !
+    // (b)` keeps its space.
     for open in ['(', '[', '{'] {
-        let (from, to) = (format!(" ! {}", open), format!("!{}", open));
+        let from = format!("! {}", open);
         let mut joined = String::with_capacity(text.len());
         let mut rest = text.as_str();
         while let Some(at) = rest.find(&from) {
             joined.push_str(&rest[..at]);
-            let after_name = joined
+            let name = joined.trim_end_matches(' ').len();
+            let after_name = joined[..name]
                 .chars()
                 .next_back()
                 .map_or(false, |c| c.is_alphanumeric() || c == '_');
-            joined.push_str(if after_name { &to } else { &from });
+            if after_name {
+                joined.truncate(name);
+                joined.push('!');
+                joined.push(open);
+            } else {
+                joined.push_str(&from);
+            }
             rest = &rest[at + from.len()..];
         }
         joined.push_str(rest);
@@ -822,9 +831,9 @@ fn ends_with_binder(text: &str) -> bool {
     false
 }
 
-/// The path without the segments that name a place in the crate (`crate`, `self`, `super`), for
-/// the example of the absolute path in a message. At least one segment stays.
-pub(crate) fn without_crate_prefix(path: &Path) -> Path {
+/// The path without the segments that name a place in the crate (`crate`, `self`, `super`). At
+/// least one segment stays.
+fn without_crate_prefix(path: &Path) -> Path {
     let skip = path
         .segments
         .iter()
@@ -834,6 +843,22 @@ pub(crate) fn without_crate_prefix(path: &Path) -> Path {
     Path {
         leading_colon: None,
         segments: path.segments.iter().skip(skip).cloned().collect(),
+    }
+}
+
+/// An example of the absolute form of the relative `path`, for a message: `core::fmt::Debug` is
+/// `::core::fmt::Debug`, and any other path is in the crate (`crate::m::Tr<u8>` is
+/// `::my_crate::m::Tr<u8>`). The arguments stay.
+pub(crate) fn absolute_example(path: &Path) -> String {
+    if path.leading_colon.is_none() && path.segments.len() > 1 && is_std_crate_path(path) {
+        let absolute = Path {
+            leading_colon: Some(Default::default()),
+            segments: path.segments.clone(),
+        };
+        tidy(&quote!(#absolute))
+    } else {
+        let rest = without_crate_prefix(path);
+        format!("::my_crate::{}", tidy(&quote!(#rest)))
     }
 }
 

@@ -22,14 +22,14 @@ use crate::unstable::{
     Unstable, Why,
 };
 use crate::util::{
-    binder_declares, binder_lifetimes, bound_cause, bounded_ident, declared_names,
-    first_associated_self_in_generics, first_self_in_generics, first_self_in_type,
+    absolute_example, binder_declares, binder_lifetimes, bound_cause, bounded_ident,
+    declared_names, first_associated_self_in_generics, first_self_in_generics, first_self_in_type,
     generic_param_mentions_self, generic_param_name, has_lifetime_bound, ident_name, is_bare_self,
     is_lifetime_param, is_primitive_name, is_type_param_named, is_whole_reference, names_in,
     or_list, path_type, plain_self_head, push_once, self_head, self_in_param, self_in_predicate,
     selves_in_generics, tidy, trait_head, trait_object_of, type_mentions_self, unwrap_type_group,
-    where_clause, where_predicate_mentions_self, without_arguments, without_crate_prefix,
-    without_default, without_defaults,
+    where_clause, where_predicate_mentions_self, without_arguments, without_default,
+    without_defaults,
 };
 use crate::view::View;
 use proc_macro2::TokenStream;
@@ -2137,8 +2137,8 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                  bounds of its generics: the entry is for any type that the bound holds for, and \
                  the copy passes its own type as `Self`. That is right only if the declaration of \
                  the type has no trait bound on the parameter that receives `Self` (E0277 in the \
-                 Leaker's crate), and, on rustc before 1.70, if the copy's field is not the last \
-                 field of a struct (E0275)"
+                 impl of the Repeater), and, on rustc before 1.70, if the copy's field is not the \
+                 last field of a struct (E0275)"
                     .to_string(),
             ),
             help: Some(format!(
@@ -3736,7 +3736,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
         self.push_error(CheckResult {
             headline: Some(format!("cannot analyze the module `{}`", ident)),
             note: Some(
-                "the Leaker analyzes no module: nothing in it is leaked, and the copy writes it as \
+                "a module is not analyzed: nothing in it is leaked, and the copy writes it as \
                  it is"
                     .to_string(),
             ),
@@ -4362,12 +4362,6 @@ impl AssocSelf {
     }
 }
 
-/// An absolute path for the example of a relative one: `Tr` is `::my_crate::Tr`.
-fn absolute_example(path: &Path) -> String {
-    let rest = without_crate_prefix(path);
-    format!("::my_crate::{}", tidy(&quote!(#rest)))
-}
-
 /// The types to report for a method lifetime that the copy would leave unconstrained: while every
 /// way in `anchors` (types by address, from an input down to an occurrence) meets a type that
 /// `leaked` tells, the next such type on each way. A culprit is copied by its own path only.
@@ -4551,11 +4545,22 @@ fn declared_self_mention(declared: &Generics, context: &Context) -> Option<Cause
     };
     first_self_in_generics(&own).or_else(|| {
         // A written `Self: 'a` moved to `self_outlives`, which is encoded as `&'a Self`.
-        if context.self_outlives.is_empty() {
-            return None;
-        }
+        let outlives = where_clause(
+            declared
+                .where_clause
+                .iter()
+                .flat_map(|where_clause| where_clause.predicates.iter())
+                .filter(|predicate| {
+                    matches!(predicate, WherePredicate::Type(predicate)
+                        if is_bare_self(&predicate.bounded_ty)
+                            && predicate.bounds.iter().any(|bound| matches!(bound,
+                                TypeParamBound::Lifetime(lifetime)
+                                    if context.self_outlives.contains(lifetime))))
+                })
+                .cloned(),
+        );
         first_self_in_generics(&Generics {
-            where_clause: declared.where_clause.clone(),
+            where_clause: outlives,
             ..Generics::default()
         })
     })
@@ -4590,7 +4595,7 @@ fn self_type_conflict(pending: &PendingType, declared: &Generics) -> Option<Chec
     Some(CheckResult {
         note: Some(format!(
             "{}. The copy writes `{}` as a path through the Repeater, whose impl is for `Self`, \
-             so the Referrer has no type to write for `Self`: it is the one being replaced",
+             so no type can be written for `Self`: it is the one being replaced",
             what, shown
         )),
         help: Some(help),
@@ -4680,7 +4685,7 @@ fn binder_advice(lifetime: &Lifetime, ty: &Type, owned: bool) -> Advice {
 /// Where the elided lifetime of the output comes from, as the notes say it.
 fn elision_source(elision: &Elision) -> &'static str {
     if elision.hidden {
-        "the only lifetime of the inputs, which a path hides (the Leaker does not see it)"
+        "the only lifetime of the inputs, which a path hides (the syntax does not show it)"
     } else {
         "the only lifetime of the inputs"
     }
@@ -5340,16 +5345,14 @@ impl<'a, 'r, A: Allow> ValueWalk<'a, 'r, A> {
     fn cannot_read(&mut self, tokens: TokenStream, why: &str) {
         let shown = tidy(&tokens);
         let note = format!(
-            "{}. The Leaker must see every path in {}, which the copy writes as it is",
+            "{}. Every path in {} must be readable, since the copy writes it as it is",
             why, self.what
         );
         self.visitor.push_error(CheckResult {
             headline: Some(format!("cannot analyze `{}` in {}", shown, self.what)),
             note: Some(note),
             help: Some(
-                "write it with syntax the Leaker can read (paths and expressions), or move it \
-                 out of the item"
-                    .to_string(),
+                "write it with paths and expressions only, or move it out of the item".to_string(),
             ),
             ..CheckResult::conflict(
                 vec![Cause::Unreadable(tokens.clone())],
@@ -5922,6 +5925,7 @@ const STD_MACROS: &[(&str, &str, FormatString)] = &[
     ("env", "core", FormatString::None),
     ("file", "core", FormatString::None),
     ("format_args", "core", FormatString::At(0)),
+    ("include", "core", FormatString::None),
     ("include_bytes", "core", FormatString::None),
     ("include_str", "core", FormatString::None),
     ("line", "core", FormatString::None),
@@ -5939,6 +5943,7 @@ const STD_MACROS: &[(&str, &str, FormatString)] = &[
     ("eprint", "std", FormatString::At(0)),
     ("eprintln", "std", FormatString::At(0)),
     ("format", "std", FormatString::At(0)),
+    ("is_x86_feature_detected", "std", FormatString::None),
     ("print", "std", FormatString::At(0)),
     ("println", "std", FormatString::At(0)),
     ("vec", "std", FormatString::None),
@@ -6007,7 +6012,8 @@ fn macro_help(path: &Path) -> String {
         }
     }
     format!(
-        "write `{0}!` with an absolute path (e.g. `::my_crate::{0}!`)",
-        name
+        "write `{}!` with an absolute path (e.g. `{}!`)",
+        name,
+        absolute_example(path)
     )
 }

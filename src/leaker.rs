@@ -50,10 +50,10 @@ use template_quote::{quote, quote_spanned};
 /// relative paths in them are paths of their error: a bound or a type in a predicate of the item
 /// (a leaked type there may be unprovable), a bare identifier that may be a const, a reference, a
 /// type that holds a trait object that takes its lifetime from it. A panic in a closure rolls its
-/// scope back and records nothing. A panicking [`Allow`] is treated alike: the call is rolled back and
-/// panics. [`LeakerResult::allow()`] drops the errors you accept, and [`LeakerResult::ignore()`]
-/// accepts one and has the copy write the whole part that it is about as written.
-/// [`LeakerResult::finish()`] gives the [`Referrer`] only when no error remains.
+/// scope back and records nothing. A panicking [`Allow`] is treated alike: the call is rolled back
+/// and panics. [`LeakerResult::allow()`] drops the errors you accept, and
+/// [`LeakerResult::ignore()`] accepts one and has the copy write the whole part that it is about as
+/// written. [`LeakerResult::finish()`] gives the [`Referrer`] only when no error remains.
 ///
 /// # Limitations
 ///
@@ -88,7 +88,7 @@ use template_quote::{quote, quote_spanned};
 ///
 /// An entry under `&'a` needs `T: 'a` in its Repeater impl (E0309), and the Leaker records only the
 /// bounds you write: write them (`fn f<'a, T: 'a>(x: Rel<'a, T>)`) and give [`Referrer::visitor()`]
-/// the whole item. For `Self: 'a`, see `Context::self_outlives`.
+/// the whole item. For `Self: 'a`, see [`Context::self_outlives`](crate::Context::self_outlives).
 ///
 /// ## Binder lifetimes
 ///
@@ -205,9 +205,9 @@ impl<A: Allow> Leaker<A> {
     }
 
     /// Returns a compile-time check that the primitive names copied as written (`u8` in `const N:
-    /// u8`, or by [`Rules::primitive()`](crate::Rules::primitive)) are not shadowed, also those in a
-    /// part that an error makes copied as written. Emit it in the Leaker's crate. It is empty if none
-    /// was copied. Each check has the span of its name, so rustc reports a shadowed one there.
+    /// u8`, or by [`Rules::primitive()`](crate::Rules::primitive)) are not shadowed, also those in
+    /// a part that an error makes copied as written. Emit it in the Leaker's crate. It is empty if
+    /// none was copied. Each check has the span of its name, so rustc reports a shadowed one there.
     #[must_use]
     pub fn assertions(&self) -> TokenStream {
         if self.assumed_primitives.is_empty() {
@@ -331,8 +331,8 @@ impl<A: Allow> Leaker<A> {
     /// checked here (a relative path is an error), not its arguments: `f` visits them. The methods
     /// of an inherent impl are not compared with a trait's
     /// ([Method lifetimes](Leaker#method-lifetimes)), and the help for `Self::A` names the trait.
-    /// A caller that resolves the trait by its name elsewhere passes the path and [allows it](Allow),
-    /// or `None` if it visits no method.
+    /// A caller that resolves the trait by its name elsewhere passes the path and
+    /// [allows it](Allow), or `None` if it visits no method.
     pub fn enter_impl<R>(
         &mut self,
         generics: &Generics,

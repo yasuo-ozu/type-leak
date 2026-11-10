@@ -17,8 +17,10 @@ use syn::*;
 use template_quote::quote;
 
 /// The error of the functions that encode the generics of an entry or write the arguments of a
-/// trait: `LeakerResult::repeater_impls()`, [`Projection::of()`](crate::Projection::of),
-/// [`Referrer::complete_args()`](crate::Referrer::complete_args) and [`substitute_args()`].
+/// trait: [`LeakerResult::repeater_impls()`](crate::LeakerResult::repeater_impls),
+/// [`Projection::of()`](crate::Projection::of),
+/// [`Referrer::complete_args()`](crate::Referrer::complete_args),
+/// [`Visitor::with_self()`](crate::Visitor::with_self) and [`substitute_args()`].
 ///
 /// It converts into a `syn::Error` at the offending tokens.
 ///
@@ -52,19 +54,19 @@ pub enum EncodeError {
     /// Tr`). Write it, e.g. `dyn Tr + 'static`.
     UnboundedTraitObject(Box<Type>),
     /// [`ImplSelf::Marker`](crate::ImplSelf::Marker) was given and an entry names `Self`, or its
-    /// context's generics do. Use [`ImplSelf::Param`](crate::ImplSelf::Param).
+    /// context does. Use [`ImplSelf::Param`](crate::ImplSelf::Param).
     ///
-    /// The type is the leaked type of the entry, or, from [`Projection::of()`](crate::Projection::of),
-    /// the type that it would write.
+    /// The type is the leaked type of the entry, or, from
+    /// [`Projection::of()`](crate::Projection::of), the type that it would write.
     NeedsSelf(Box<Type>),
     /// The associated type of a type that is not a type parameter, as written by `T::Item` with
     /// `T` given as `IntoIter<u8>`: `<IntoIter<u8>>::Item`, which rustc takes only for a type
     /// parameter (E0223). It needs its trait, `<IntoIter<u8> as Iterator>::Item`.
     /// [`Referrer::complete_args()`](crate::Referrer::complete_args) writes it in a default from
     /// the one trait bound of the parameter (`T: Iterator`), and fails if there is not one.
-    /// [`substitute_args()`] knows no bounds: write the trait in the copy (`<T as Iterator>::Item`),
-    /// and `T` is replaced in it. ([`Substitute`] writes it through the bound, and leaves a failure
-    /// to rustc.) The type is the path as it would be written.
+    /// [`substitute_args()`] knows no bounds: write the trait in the copy
+    /// (`<T as Iterator>::Item`), and `T` is replaced in it. ([`Substitute`] writes it through the
+    /// bound, and leaves a failure to rustc.) The type is the path as it would be written.
     AmbiguousAssociatedType(Box<Type>),
 }
 
@@ -88,8 +90,8 @@ impl std::fmt::Display for EncodeError {
             ),
             EncodeError::NeedsSelf(ty) => write!(
                 f,
-                "the type '{}' needs `Self` (it names it, or its generics do), so its Repeater impl \
-                 cannot be for a marker type; use `ImplSelf::Param`",
+                "the type '{}' needs `Self` (it names it, or its context does), so its Repeater \
+                 impl cannot be for a marker type; use `ImplSelf::Param`",
                 quote!(#ty)
             ),
             EncodeError::AmbiguousAssociatedType(ty) => write!(

@@ -53,3 +53,18 @@ pub trait TagGarbled {
     fn f(&self) -> Rel;
 }
 __tagged_TagGarbled!();
+
+// Tokens that the compiler prints with a space after the `!` of a macro call and before a `;`
+// (`ty! (Self)`, `use inner::* ;`): the messages write `ty!(Self)` and `use inner::*;`.
+#[type_leak_test_macro::leak_strict]
+pub trait MacroInDefault<T = ty!(Self)> {}
+
+#[type_leak_test_macro::leak_strict]
+pub trait StatementInDefault<
+    const N: usize = {
+        use inner::*;
+        1
+    },
+>
+{
+}

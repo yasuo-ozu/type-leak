@@ -37,9 +37,9 @@ pub struct Place {
 /// [`Leaker::with_rule()`](crate::Leaker::with_rule), or to
 /// [`LeakerResult::allow()`](crate::LeakerResult::allow).
 ///
-/// `allow()` means "the copy may write `cause` as it is at `place`", and is the one question at both
-/// stages. The analysis asks it about each relative path, and about each absolute path in a type
-/// (`::core::..` and `$crate::..` excepted), as the cause of its kind: a path in a type is a
+/// `allow()` means "the copy may write `cause` as it is at `place`", and is the one question at
+/// both stages. The analysis asks it about each relative path, and about each absolute path in a
+/// type (`::core::..` and `$crate::..` excepted), as the cause of its kind: a path in a type is a
 /// [`Cause::Type`], the trait of a bound or of a qualified path a [`Cause::Trait`], a path in a
 /// value a [`Cause::Expr`], the path of a macro a [`Cause::Macro`], a path of unknown kind (the
 /// root of a `use`, a path in the tokens of a macro) a [`Cause::Unknown`]. The paths are bare:
@@ -310,8 +310,8 @@ fn forget_dropped(errors: &mut [ErrorItem]) {
 /// What a [`Leaker`] found: the [`Referrer`] and the errors that remain.
 ///
 /// [`finish()`](LeakerResult::finish) gives the Referrer only when no error remains: accept each
-/// error with [`allow()`](LeakerResult::allow) or [`ignore()`](LeakerResult::ignore), and report the
-/// others ([`ErrorItem::emit()`]).
+/// error with [`allow()`](LeakerResult::allow) or [`ignore()`](LeakerResult::ignore), and report
+/// the others ([`ErrorItem::emit()`]).
 ///
 /// [`allow()`](LeakerResult::allow) takes and returns the result, so it chains. It drops the errors
 /// that an [`Allow`] accepts (you promise that the part compiles as written). It leaves the
@@ -534,14 +534,14 @@ impl LeakerResult {
     /// `projection` is the one that the copy's side uses too ([`Projection::of()`]): its
     /// [`path`](Projection::path) becomes [`RepeaterImpl::path`], with the first argument, and its
     /// [`id`](Projection::id) is in the `KEY` that `ToTokens` of the item writes
-    /// ([`Projection::key(entry)`](Projection::key)); [`ImplSelf::Bucket`] chooses the type from the
-    /// same `id`. Its [`impl_self`](Projection::impl_self) says what every impl is for
+    /// ([`Projection::key(entry)`](Projection::key)); [`ImplSelf::Bucket`] chooses the type from
+    /// the same `id`. Its [`impl_self`](Projection::impl_self) says what every impl is for
     /// ([`ImplSelf`]). The consts of the entries are encoded as [`Projection::of()`] does.
     ///
     /// The call fails with the first of these:
     ///
     /// - [`EncodeError::NeedsSelf`], for [`ImplSelf::Marker`], if some entry names `Self`, or its
-    ///   context's generics do. The error has the first such entry, and no impl is made.
+    ///   context does. The error has the first such entry, and no impl is made.
     /// - The first [`EncodeError::UnsupportedConstType`], in the order of the entries and of their
     ///   parameters.
     ///

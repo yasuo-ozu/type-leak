@@ -515,7 +515,7 @@ fn what_the_leaker_cannot_read_is_rejected() {
         ),
         (
             "use ::core::fmt::*;",
-            "cannot analyze `use::core::fmt::* ;` in the default body of `f`",
+            "cannot analyze `use::core::fmt::*;` in the default body of `f`",
         ),
     ] {
         assert_eq!(body_messages(body), [headline], "{}", body);
@@ -535,16 +535,13 @@ fn what_the_leaker_cannot_read_is_rejected() {
     assert_eq!(
         err[0].notes.first().map(|(_, n)| n.as_str()),
         Some(
-            "the arguments of the macro are not expressions. The Leaker must see every path in \
-             the default body of `f`, which the copy writes as it is"
+            "the arguments of the macro are not expressions. Every path in the default body of \
+             `f` must be readable, since the copy writes it as it is"
         )
     );
     assert_eq!(
         err[0].help_text(),
-        Some(
-            "write it with syntax the Leaker can read (paths and expressions), or move it out of \
-             the item"
-        )
+        Some("write it with paths and expressions only, or move it out of the item")
     );
 }
 

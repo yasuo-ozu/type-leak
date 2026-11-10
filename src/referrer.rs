@@ -383,7 +383,7 @@ impl Referrer {
         })
     }
 
-    /// Returns `true` if some entry names `Self`, or its context's generics do.
+    /// Returns `true` if some entry names `Self`, or its context does.
     ///
     /// `Self::Item` and `<Self as ::p::Tr>::X` count, `::p::Self` does not. A top-level context
     /// with no entry is not looked at, nor is a removed entry.
@@ -2003,7 +2003,7 @@ fn read_tag(input: parse::ParseStream) -> Result<()> {
         return Err(Error::new(
             tag.map_or(span, |tag| tag.span()),
             format!(
-                "this Referrer was serialized by an incompatible type-leak ({}, expected {}): \
+                "this data was serialized by an incompatible type-leak ({}, expected {}): \
                  the macros which emit and parse it must use the same version of type-leak",
                 found,
                 Referrer::FORMAT_VERSION

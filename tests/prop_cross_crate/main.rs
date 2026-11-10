@@ -5252,7 +5252,7 @@ mod checks {
             ),
             tokens: tokens.to_string(),
             note: format!(
-                "`Self` is the self type of the impl, which the copy writes with its leaked types as paths through the Repeater, and the bound `{g} : 'a + Iterator<Item = u8> + {b}` of their generics names `{g}` in the arguments of the bound `{b}`, whose path may be a type alias of a projection that another bound of `{g}` equates, which the Leaker cannot tell from a struct: rustc normalizes it in the impl of the Repeater, but not yet in the environment (E0277)",
+                "`Self` is the self type of the impl, which the copy writes with its leaked types as paths through the Repeater, and the bound `{g} : 'a + Iterator<Item = u8> + {b}` of their generics names `{g}` in the arguments of the bound `{b}`, whose path may be a type alias of a projection that another bound of `{g}` equates (an alias is not told from a struct): rustc normalizes it in the impl of the Repeater, but not yet in the environment (E0277)",
                 g = generic,
                 b = bound
             ),

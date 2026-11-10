@@ -469,7 +469,7 @@ pub(crate) fn encode_slot_const(
 /// What the Repeater impls are written for: the [`impl_self`](Projection::impl_self) of the
 /// [`Projection`].
 ///
-/// An entry that names `Self`, or whose context's generics do, is always implemented for what
+/// An entry that names `Self`, or whose context does, is always implemented for what
 /// `Self` stands for, so the choice only matters for the others. [`ImplSelf::Marker`] has no such
 /// impl: [`LeakerResult::repeater_impls()`](crate::LeakerResult::repeater_impls) fails if there is
 /// one.

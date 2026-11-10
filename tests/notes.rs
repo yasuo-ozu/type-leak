@@ -176,11 +176,14 @@ fn a_relative_trait_of_the_impl_is_written_as_an_absolute_path() {
              absolute path",
         )
     );
-    // A longer path, with arguments, and one from the crate: the example is the path in the crate.
+    // A longer path, with arguments, and one from the crate: the example is the path in the crate,
+    // and a path of a standard crate is the crate itself.
     for (written, example) in [
         ("m::Tr<u8>", "::my_crate::m::Tr<u8>"),
         ("crate::m::Tr", "::my_crate::m::Tr"),
         ("super::Tr", "::my_crate::Tr"),
+        ("core::ops::Add<u8>", "::core::ops::Add<u8>"),
+        ("std::fmt::Display", "::std::fmt::Display"),
     ] {
         let tr: Path = parse_str(written).unwrap();
         let item: ItemImpl = parse_quote!(
@@ -381,15 +384,14 @@ fn self_in_a_predicate_has_a_note_on_the_self_type_of_the_impl() {
     );
 }
 
-/// An entry in the self type of an impl, whose bound names `Self`: the Referrer has no type to
-/// write for `Self`, which is the one being replaced. The note starts with what `Self` is: the
+/// An entry in the self type of an impl, whose bound names `Self`: no type can be written for
+/// `Self`, which is the one being replaced. The note starts with what `Self` is: the
 /// entry itself, or the self type that contains it. The `Self` in the bound is an error of its own,
 /// with the advice to write the bound without it.
 #[test]
 fn the_self_type_of_an_impl_is_named_in_the_note() {
     let rest = "The copy writes `S<T>` as a path through the Repeater, whose impl is for \
-                `Self`, so the Referrer has no type to write for `Self`: it is the one being \
-                replaced";
+                `Self`, so no type can be written for `Self`: it is the one being replaced";
     let item: ItemImpl = parse_quote!(
         impl<T> S<T> where T: AsRef<Option<Self>> {}
     );
@@ -446,8 +448,8 @@ fn the_self_type_of_an_impl_is_named_in_the_note() {
             &[
                 "`Self` is the self type `::p::W<Rel<T>, U>` of the impl, which \
                  contains `Rel<T>`. The copy writes `Rel<T>` as a path through the \
-                 Repeater, whose impl is for `Self`, so the Referrer has no type to write for \
-                 `Self`: it is the one being replaced",
+                 Repeater, whose impl is for `Self`, so no type can be written for `Self`: it \
+                 is the one being replaced",
                 "it cannot be leaked as a whole because of `Self`",
             ],
             "write `Rel<T>` with an absolute path, or the bound of its generics without `Self`",
@@ -491,7 +493,7 @@ fn the_note_of_a_hidden_lifetime_says_where_the_holder_is_not_leaked() {
             "Rel < T >",
             &[
                 "the output `&u8` has an elided lifetime, which elision takes from the only \
-                 lifetime of the inputs, which a path hides (the Leaker does not see it), but a \
+                 lifetime of the inputs, which a path hides (the syntax does not show it), but a \
                  leaked type in the inputs has `'a` among its generics, and the copy names it \
                  in the arguments of its projection, so the inputs have more than one lifetime \
                  (E0106), so a type using them cannot be leaked alone, and the type holding the \
@@ -555,6 +557,12 @@ const TIDY: &[(&str, Via, &str, &[&str])] = &[
         Via::Item,
         "struct S { a: Other<'_, ::p::Wrap<Rel>> }",
         &["'Other<'_, ::p::Wrap<Rel>>'"],
+    ),
+    (
+        "no space before the `;` of a statement",
+        Via::Values,
+        "trait Tr { const N: usize = { use inner::*; 1 }; }",
+        &["cannot analyze `use inner::*;` in the default"],
     ),
     (
         "`Self::A` in a type",
@@ -765,7 +773,9 @@ fn tidy_errors(via: Via, source: &str) -> Vec<ErrorItem> {
 /// with the spaces of a token stream (`Rel < '_ , u8 >`). The rules are those of the private
 /// `tidy_str()`, and each row has a different input for one of them: no space around `<`, `>`,
 /// `::` and `,`; a space after `'_` and `'a`; the binder `for<'a>`; `->`; a space before the `(` of
-/// a Fn sugar; the `!` of a macro; ` : ` of a bound; `dyn ::p::Tr` keeps its space.
+/// a Fn sugar; the `!` of a macro; ` : ` of a bound; no space before a `;`; `dyn ::p::Tr` keeps its
+/// space. The tokens of the compiler print a macro call as `m! (..)`, which a test cannot build
+/// (the tokens of a string print `m ! (..)`): `tests/diagnostic.rs` checks it.
 #[test]
 fn tidy_writes_tokens_as_one_does() {
     for (case, via, source, renderings) in TIDY {

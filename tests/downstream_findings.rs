@@ -33,10 +33,10 @@
 //! Then come the findings 12 and 14: a bare `?Sized` and the values of an item (a type in a value
 //! is carried since F40 of `tests/findings.rs`, a path that is no type is rejected).
 //!
-//! The last tests are the four issues that announce found when it ported to the error-recovery
-//! branch (1 to 4 of `ISSUES-from-announce.md`, named `issue_one_`, ..): what an error shows to the
-//! user, not the entries; and the issue 9, the error of `finish()` for `?`. The test of issue 10
-//! (`issue_ten_`) is after them: a Referrer without entries takes `Projection::unused()`.
+//! The last tests are the issues that announce found when it ported to the error-recovery branch
+//! (1 to 4 of `ISSUES-from-announce.md`, named `issue_one_`, ..) and to `api-reduction` (5, 6, 8,
+//! 9 and 10, `issue_five_`, ..): what an error shows to the user, not the entries; the error of
+//! `finish()` for `?` (9); and a Referrer without entries, which takes `Projection::unused()` (10).
 
 mod common;
 
@@ -1391,4 +1391,214 @@ fn issue_ten_a_referrer_without_entries_takes_an_unused_projection() {
     substitute.visit_type_mut(&mut ty);
     let expected: Type = parse_quote!((W, u8));
     assert_eq!(text(&ty), text(&expected));
+}
+
+// ── issues of the api-reduction branch ───────────────────────────────────────────────────────
+
+/// Issue 5: the texts quote a statement and a macro call as one writes them: `use inner::*;` and
+/// `m!(..)`, not `use inner::* ;` and `m! (..)`, which is how the tokens of a proc macro print.
+/// The tokens of a string print `m ! (..)`, so only the compiler shows the second: the fixture of
+/// `tests/diagnostic.rs` (`a_macro_call_and_a_statement_are_quoted_as_one_writes_them`). Here: no
+/// space before a `;`, in a statement and in the length of an array type.
+#[test]
+fn issue_five_a_semicolon_is_joined_to_what_it_ends() {
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            const N: usize = {
+                use inner::*;
+                1
+            };
+        }
+    );
+    let mut leaker = Leaker::with_rule(config());
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
+    let result = leaker.result();
+    assert_eq!(
+        result.errors()[0].message,
+        "cannot analyze `use inner::*;` in the default value of `N`"
+    );
+    let item: ItemStruct = parse_quote!(
+        struct S {
+            a: Rel<'_, [u8; 3]>,
+        }
+    );
+    let mut leaker = Leaker::with_rule(config());
+    leaker.intern_struct(&item);
+    let result = leaker.result();
+    assert_eq!(
+        result.errors()[0].message,
+        "use absolute path: 'Rel<'_, [u8; 3]>'"
+    );
+}
+
+/// The errors that `run` makes of a Leaker with `rule`.
+fn errors_with<A: Allow>(
+    rule: A,
+    check_values: bool,
+    run: impl FnOnce(&mut Leaker<A>),
+) -> Vec<ErrorItem> {
+    let mut leaker = Leaker::with_rule(rule);
+    leaker.check_values = check_values;
+    run(&mut leaker);
+    leaker.result().errors().to_vec()
+}
+
+/// Issue 6: a user of a crate built on `type-leak` has never met a `Leaker` or a `Referrer`, and the
+/// texts said "the Leaker analyzes no module", "the Leaker must see every path", "which the Leaker
+/// cannot tell from a struct" and so on. Each says it without the name now, with the same meaning.
+#[test]
+fn issue_six_the_texts_name_neither_the_leaker_nor_the_referrer() {
+    let outside = || config().or_if(starts_with(parse_quote!(::p)));
+    let mut cases: Vec<(&str, Vec<ErrorItem>, &str)> = Vec::new();
+    cases.push((
+        "a module met as an item",
+        errors_with(config(), false, |leaker| {
+            leaker.enter_generics(&Generics::default(), |view| {
+                view.visit_item(&parse_quote!(
+                    mod m {}
+                ))
+            });
+        }),
+        "a module is not analyzed",
+    ));
+    cases.push((
+        "a glob import in a value",
+        errors_with(config(), true, |leaker| {
+            leaker.intern_trait(&parse_quote!(
+                trait Tr {
+                    const N: usize = {
+                        use inner::*;
+                        1
+                    };
+                }
+            ));
+        }),
+        "must be readable, since the copy writes it as it is",
+    ));
+    cases.push((
+        "a macro that is no expression",
+        errors_with(outside(), true, |leaker| {
+            leaker.intern_trait(&parse_quote!(
+                trait Tr {
+                    fn f(&self) {
+                        ::p::mac!(a b c);
+                    }
+                }
+            ));
+        }),
+        "write it with paths and expressions only",
+    ));
+    cases.push((
+        "a lifetime that a path hides",
+        errors_with(outside(), false, |leaker| {
+            leaker.intern_trait(&parse_quote!(
+                trait Tr<'a, T: 'a> {
+                    fn f(&self, x: impl Fn(::p::WRef<u8>, Rel<T>) -> &u8);
+                }
+            ));
+        }),
+        "(the syntax does not show it)",
+    ));
+    cases.push((
+        "a bound that may name an alias of a projection",
+        errors_with(outside(), false, |leaker| {
+            leaker.intern_impl(&parse_quote!(
+                impl<T, U: Iterator<Item = u8>> S<T, U>
+                where
+                    U: Fn(::p::WIt<U>) -> u8,
+                {
+                    fn m(&self, a: u8)
+                    where
+                        T: Fn(&Self) -> u8,
+                    {
+                    }
+                }
+            ));
+        }),
+        "(an alias is not told from a struct)",
+    ));
+    cases.push((
+        "a nested type that names Self with a bound that names it",
+        errors_with(Rules::new(), false, |leaker| {
+            leaker.enter_generics(&Generics::default(), |view| {
+                view.visit_item(&parse_quote!(
+                    pub struct S<T: ::core::convert::AsRef<Self>> {
+                        pub b: Rel2<Self, T>,
+                    }
+                ))
+            });
+        }),
+        "(E0277 in the impl of the Repeater)",
+    ));
+    cases.push((
+        "an entry in the self type of an impl, whose bound names Self",
+        errors_with(config(), false, |leaker| {
+            leaker.intern_impl(&parse_quote!(
+                impl<T> S<T> where T: AsRef<Option<Self>> {}
+            ));
+        }),
+        "so no type can be written for `Self`",
+    ));
+    for (what, errors, phrase) in cases {
+        let texts: Vec<&str> = errors
+            .iter()
+            .flat_map(|error| {
+                std::iter::once(error.message.as_str())
+                    .chain(error.notes.iter().map(|(_, note)| note.as_str()))
+                    .chain(error.help_text())
+            })
+            .collect();
+        assert!(!texts.is_empty(), "{}", what);
+        for text in &texts {
+            for name in ["Leaker", "Referrer"] {
+                assert!(!text.contains(name), "{}: {}", what, text);
+            }
+        }
+        assert!(
+            texts.iter().any(|text| text.contains(phrase)),
+            "{}: `{}` is not in {:?}",
+            what,
+            phrase,
+            texts
+        );
+    }
+    // The error of a serialized `Referrer` that another version of `type-leak` wrote.
+    let error = parse2::<Referrer>(quote!()).err().unwrap().to_string();
+    assert!(
+        error.starts_with("this data was serialized by an incompatible type-leak ("),
+        "{}",
+        error
+    );
+    assert!(!error.contains("Referrer"), "{}", error);
+}
+
+/// Issue 8: `syn::Error::from(item)` was `syn::Error::new(item.span(), ..)`, and the span of an item
+/// is the first token of its cause on stable, where `Span::join` is not available, so rustc
+/// underlined `inner` of `inner::Base`. It is `syn::Error::new_spanned(cause, ..)` now: the first
+/// and the last token of the cause. The spans are tested in `tests/crates/spans/tests/spans.rs`
+/// (`proc-macro2` needs `span-locations`), and the underline that rustc draws in the fixture of
+/// `tests/diagnostic.rs` (`note_is_rendered`, on stable). Here: `to_compile_error()` and
+/// `emit()`, which a macro uses beside the conversion, are the same tokens.
+#[test]
+fn issue_eight_every_way_to_report_an_error_gives_the_same_tokens() {
+    let item: ItemTrait = parse_quote!(
+        trait Tr<T: inner::Base> {}
+    );
+    let mut leaker = Leaker::with_rule(config());
+    leaker.intern_trait(&item);
+    let result = leaker.result();
+    let errors = result.errors();
+    assert_eq!(errors.len(), 1, "{}", messages(errors));
+    let direct = errors[0].to_compile_error().to_string();
+    let converted = syn::Error::from(errors[0].clone())
+        .to_compile_error()
+        .to_string();
+    assert_eq!(direct, converted);
+    assert_eq!(errors[0].emit().to_string(), direct);
+    assert!(
+        direct.contains("use absolute path: 'inner::Base'"),
+        "{}",
+        direct
+    );
 }

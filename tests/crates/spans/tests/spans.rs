@@ -544,3 +544,79 @@ fn the_check_of_a_primitive_name_is_at_the_name() {
     }
     assert_eq!(names, ["u8", "u16"]);
 }
+
+/// The error of a `Self` in the self type of an impl is at the `Self` of `Self: 'a`, which ties the
+/// entry to `Self`, not at the first `Self` of the where clause (`Self::Y`, whose predicate has
+/// nothing to do with the entry).
+#[test]
+fn the_span_of_the_self_that_ties_an_entry_is_the_one_of_its_outlives_predicate() {
+    let source = "impl<'a, T, U> Tr<U> for W<'a, Rel<'a, T>> where U: Into<Self::Y>, Self: 'a {}";
+    let item: ItemImpl = parse_str(source).unwrap();
+    let mut leaker = Leaker::new();
+    leaker.intern_impl(&item);
+    let result = leaker.result();
+    let selfs: Vec<&ErrorItem> = result
+        .errors()
+        .iter()
+        .filter(|item| item.reason == Reason::SelfInImplSelfType)
+        .collect();
+    assert!(!selfs.is_empty(), "{}", messages(result.errors()));
+    for item in selfs {
+        // The headline is about the type, and the last note, which says what stops the type from
+        // being leaked whole, about the `Self` that ties it.
+        let (at, note) = item.notes.last().unwrap();
+        assert_eq!(note, "it cannot be leaked as a whole because of `Self`");
+        assert_span_at(at.span(), source, "Self", 1);
+    }
+}
+
+/// A `syn::Error` of an item (and the `compile_error!` of it) starts at the first token of the
+/// cause and ends at the last, so that rustc underlines the whole cause on stable, where the
+/// `Span::join` of the span of the item is not available: `new_spanned()`, not `new()` with one
+/// span.
+#[test]
+fn the_syn_error_starts_at_the_first_token_of_the_cause_and_ends_at_the_last() {
+    let source = "trait Tr<T: inner::Base> {}";
+    let item: ItemTrait = parse_str(source).unwrap();
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&item);
+    let result = leaker.result();
+    let items = result.errors();
+    assert_eq!(items.len(), 1, "{}", messages(items));
+    let (first, last) = (
+        location_of(source, "inner", 0),
+        location_of(source, "Base", 0),
+    );
+    let at = |(start, end): (proc_macro2::LineColumn, proc_macro2::LineColumn)| {
+        ((start.line, start.column), (end.line, end.column))
+    };
+    for compile_error in [
+        items[0].to_compile_error(),
+        syn::Error::from(items[0].clone()).to_compile_error(),
+    ] {
+        // `compile_error ! { "message" }` with the two colons before it: the name and the `!` are
+        // at the first token of the cause, and the braces at the last.
+        let places = token_places(compile_error);
+        let name = places
+            .iter()
+            .position(|place| place.0 == "compile_error")
+            .unwrap_or_else(|| panic!("{:?}", places));
+        for place in &places[name..name + 2] {
+            assert_eq!((place.1, place.2), at(first), "{:?}", places);
+        }
+        assert_eq!(places[name + 1].0, "!", "{:?}", places);
+        assert_eq!(
+            (places[name + 2].1, places[name + 2].2),
+            at(last),
+            "{:?}",
+            places
+        );
+    }
+    // `syn::Error::span()` joins them: the whole cause.
+    assert_span_at(
+        syn::Error::from(items[0].clone()).span(),
+        source,
+        "inner::Base",
+        0,
+    );
+}

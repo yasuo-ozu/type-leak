@@ -254,7 +254,7 @@ fn format_version_is_checked() {
     assert_eq!(
         message,
         format!(
-            "this Referrer was serialized by an incompatible type-leak (format {}, expected {}): \
+            "this data was serialized by an incompatible type-leak (format {}, expected {}): \
              the macros which emit and parse it must use the same version of type-leak",
             Referrer::FORMAT_VERSION + 1,
             Referrer::FORMAT_VERSION
@@ -267,7 +267,7 @@ fn format_version_is_checked() {
     assert_eq!(
         message,
         format!(
-            "this Referrer was serialized by an incompatible type-leak (an unrecognized tag \
+            "this data was serialized by an incompatible type-leak (an unrecognized tag \
              \"0.8.0\", expected {}): the macros which emit and parse it must use the same \
              version of type-leak",
             Referrer::FORMAT_VERSION
@@ -291,7 +291,7 @@ fn data_without_the_format_tag_is_rejected() {
     assert_eq!(
         message,
         format!(
-            "this Referrer was serialized by an incompatible type-leak (no format tag, expected \
+            "this data was serialized by an incompatible type-leak (no format tag, expected \
              {}): the macros which emit and parse it must use the same version of type-leak",
             Referrer::FORMAT_VERSION
         )
@@ -300,7 +300,7 @@ fn data_without_the_format_tag_is_rejected() {
     assert_eq!(
         parse_error(quote!()),
         format!(
-            "this Referrer was serialized by an incompatible type-leak (no format tag, expected \
+            "this data was serialized by an incompatible type-leak (no format tag, expected \
              {}): the macros which emit and parse it must use the same version of type-leak",
             Referrer::FORMAT_VERSION
         )

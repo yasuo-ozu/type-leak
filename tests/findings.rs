@@ -301,6 +301,7 @@ fn plain(text: &str) -> String {
         (" >", ">"),
         ("& ", "&"),
         (" ,", ","),
+        (" ;", ";"),
     ]
     .iter()
     .fold(text, |text, (from, to)| text.replace(from, to))
@@ -360,8 +361,8 @@ fn assert_unstable<T, E: std::ops::Deref<Target = [ErrorItem]>>(
         ),
         Blames::Hidden(generic, hiding) => format!(
             "names `{}` in the arguments of the bound `{}`, whose path may be a type alias of a \
-             projection that another bound of `{}` equates, which the Leaker cannot tell from a \
-             struct: rustc normalizes it in the impl of the Repeater, but not yet in the \
+             projection that another bound of `{}` equates (an alias is not told from a \
+             struct): rustc normalizes it in the impl of the Repeater, but not yet in the \
              environment (E0277)",
             generic,
             plain(hiding),
@@ -1996,7 +1997,7 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
         let (shown, note) = (joined_messages(err), first_note(&err[0]));
         assert!(shown.contains(headline), "{}: {}", string(item), shown);
         assert!(
-            note.contains("has no type to write for `Self`"),
+            note.contains("no type can be written for `Self`"),
             "{}: {}",
             string(item),
             note
@@ -5126,7 +5127,7 @@ fn f28_hidden_lifetime_in_elided_signature_with_generics() {
             all_notes(&err),
             [
                 "the output `&u8` has an elided lifetime, which elision takes from the only \
-                 lifetime of the inputs, which a path hides (the Leaker does not see it), but a \
+                 lifetime of the inputs, which a path hides (the syntax does not show it), but a \
                  leaked type in the inputs has `'a` among its generics, and the copy names it in \
                  the arguments of its projection, so the inputs have more than one lifetime \
                  (E0106)",
@@ -8136,8 +8137,8 @@ fn f37_a_type_that_names_self_with_a_bound_that_names_it_is_a_risk_error_with_it
                  bounds of its generics: the entry is for any type that the bound holds for, and \
                  the copy passes its own type as `Self`. That is right only if the declaration of \
                  the type has no trait bound on the parameter that receives `Self` (E0277 in the \
-                 Leaker's crate), and, on rustc before 1.70, if the copy's field is not the last \
-                 field of a struct (E0275)",
+                 impl of the Repeater), and, on rustc before 1.70, if the copy's field is not the \
+                 last field of a struct (E0275)",
                 "{:?} `{}`",
                 nest,
                 string(item)
@@ -18426,4 +18427,208 @@ fn f97_the_head_of_a_path_in_an_expression_is_substituted() {
         "{:?}",
         err
     );
+}
+
+// ── F98 ──────────────────────────────────────────────────────────────────────
+
+/// F98 (fixed): the help of a relative path wrote an absolute example that its own error text
+/// disagreed with: `crate::m!` gave `::my_crate::crate::m!`, `super::m!` gave
+/// `::my_crate::super::m!`, `std::line!` gave `::my_crate::std::line!`, `include!` (a macro of the
+/// standard library that the table lacked) gave `::my_crate::include!`, and the help of
+/// `Self::Output` in `impl core::ops::Add` replaced it with
+/// `<Self as ::my_crate::core::ops::Add>::Output`, where the help of the path itself said
+/// `::core::ops::Add`.
+///
+/// Trigger: `check_values` with `crate::m!(1)`, `super::m!()`, `std::line!()`, `include!("x.rs")`
+/// or `is_x86_feature_detected!("avx2")` in the value of a const, and `impl<T:
+/// core::ops::Add<Output = Self::Output>> core::ops::Add for W<Rel<T>>`.
+///
+/// Cause: three functions wrote the example (the help of a type or a trait in `error.rs`, the one
+/// of a macro and the one of `Self::A` in `analyze.rs`), each its own way.
+///
+/// Fix: one `util::absolute_example()`: `::{path}` for a path of two segments or more that starts
+/// with `std`, `core` or `alloc`, else `::my_crate::{path}` without `crate`, `self` and `super`,
+/// with the arguments. `include` and `is_x86_feature_detected` are in the table of the macros.
+#[test]
+fn f98_the_example_of_an_absolute_path_is_the_same_for_every_help() {
+    let help_of = |value: &str| -> Vec<String> {
+        let item: ItemImpl =
+            parse_str(&format!("impl S {{ const C: usize = {}; }}", value)).unwrap();
+        let mut leaker = Leaker::new();
+        leaker.check_values = true;
+        leaker.intern_impl(&item);
+        all_helps(leaker.result().errors())
+    };
+    for (value, help) in [
+        (
+            "crate::m!(1)",
+            "write `crate::m!` with an absolute path (e.g. `::my_crate::m!`)",
+        ),
+        (
+            "super::m!()",
+            "write `super::m!` with an absolute path (e.g. `::my_crate::m!`)",
+        ),
+        (
+            "m::n!()",
+            "write `m::n!` with an absolute path (e.g. `::my_crate::m::n!`)",
+        ),
+        (
+            "std::line!()",
+            "write `std::line!` with an absolute path (e.g. `::std::line!`)",
+        ),
+        (
+            "core::line!()",
+            "write `core::line!` with an absolute path (e.g. `::core::line!`)",
+        ),
+        (
+            "include!(\"x.rs\")",
+            "use `::core::include!` instead of `include!`",
+        ),
+        (
+            "is_x86_feature_detected!(\"avx2\")",
+            "use `::std::is_x86_feature_detected!` instead of `is_x86_feature_detected!`",
+        ),
+    ] {
+        // The macro is the one error, and an `include!` is no format string.
+        assert_eq!(help_of(value), [help], "{}", value);
+    }
+    // A path of the trait of an impl, which `Self::Output` is replaced through.
+    let item: ItemImpl = parse_quote!(
+        impl<T: core::ops::Add<Output = Self::Output>> core::ops::Add for W<Rel<T>> {
+            type Output = u8;
+            fn add(self, other: Self) -> Self::Output {
+                0
+            }
+        }
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_impl(&item);
+    let helps = all_helps(leaker.result().errors());
+    assert!(
+        helps.contains(
+            &"replace `Self::Output` with `<Self as ::core::ops::Add>::Output`, with \
+              `core::ops::Add` written as an absolute path"
+                .to_string()
+        ),
+        "{:?}",
+        helps
+    );
+    assert!(
+        helps.iter().all(|help| !help.contains("::my_crate::core")),
+        "{:?}",
+        helps
+    );
+}
+
+// ── F99 ──────────────────────────────────────────────────────────────────────
+
+/// F99 (fixed): the help and the span of `SelfInImplSelfType` blamed the first `Self` in the where
+/// clause of the impl, not the `Self: 'a` that ties the entry to `Self`.
+///
+/// Trigger: `impl<'a, T, U> Tr<U> for W<'a, Rel<'a, T>> where U: Into<Self::Y>, Self: 'a {}`. The
+/// context of `Rel<'a, T>` has no `U`, so `U: Into<Self::Y>` is not what makes its context depend
+/// on `Self`: `Self: 'a` is. The help said "or the bound of its generics without `Self::Y`".
+///
+/// Cause: a `Self: 'a` that the context has moves into `self_outlives`, so the search for the
+/// mention of `Self` fell back to the first `Self` anywhere in the where clause.
+///
+/// Fix: the fallback looks only at the predicates `Self: 'a` whose lifetime is in `self_outlives`.
+/// The span (the `Self` of that predicate) is checked in `tests/crates/spans`.
+#[test]
+fn f99_the_self_that_ties_the_entry_is_the_one_in_the_outlives_predicate() {
+    let item: ItemImpl = parse_quote!(
+        impl<'a, T, U> Tr<U> for W<'a, Rel<'a, T>>
+        where
+            U: Into<Self::Y>,
+            Self: 'a,
+        {
+        }
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_impl(&item);
+    let result = leaker.result();
+    let errors: Vec<&ErrorItem> = result
+        .errors()
+        .iter()
+        .filter(|e| e.reason == Reason::SelfInImplSelfType)
+        .collect();
+    assert!(!errors.is_empty(), "{}", joined_messages(result.errors()));
+    for error in errors {
+        let help = error.help_text().unwrap();
+        assert!(
+            help.ends_with("or the bound of its generics without `Self`"),
+            "{}",
+            help
+        );
+    }
+    // Without `Self: 'a` the bound of `U` is not tied to the entry either, so there is no error.
+    let item: ItemImpl = parse_quote!(
+        impl<'a, T, U> Tr<U> for W<'a, Rel<'a, T>> where U: Into<Self::Y> {}
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_impl(&item);
+    assert!(leaker
+        .result()
+        .errors()
+        .iter()
+        .all(|e| e.reason != Reason::SelfInImplSelfType),);
+}
+
+// ── F100 ─────────────────────────────────────────────────────────────────────
+
+/// F100 (fixed): the text of `EncodeError::NeedsSelf` said that the entry "names `Self`, or its
+/// generics do". The entry of `trait Tr<'a> where Self: 'a { fn f(&self) -> Rel<'a>; }` names no
+/// `Self`, and neither do the generics `<'a>` of its context: the context has the self type and
+/// `Self: 'a`, which is why the impl of the entry cannot be for a marker. The docs of `ImplSelf`,
+/// of `Referrer::has_self()` and of `LeakerResult::repeater_impls()` said the same.
+///
+/// Fix: "(it names it, or its context does)", and the same in the docs.
+#[test]
+fn f100_the_error_for_an_entry_that_needs_self_names_its_context() {
+    let marker = Projection::new(
+        parse_quote!(Repeater),
+        7,
+        ImplSelf::Marker(parse_quote!(crate::Marker)),
+    );
+    for (what, item, ty) in [
+        (
+            "the context has `Self: 'a`",
+            parse_quote!(
+                trait Tr<'a>
+                where
+                    Self: 'a,
+                {
+                    fn f(&self) -> Rel<'a>;
+                }
+            ),
+            "Rel < 'a >",
+        ),
+        (
+            "the entry names `Self`",
+            parse_quote!(
+                trait Tr {
+                    fn f(&self) -> Rel<Self>;
+                }
+            ),
+            "Rel < Self >",
+        ),
+    ] {
+        let mut leaker = Leaker::new();
+        leaker.intern_trait(&item);
+        let error = match leaker.result().repeater_impls(&marker) {
+            Err(error) => error,
+            Ok(impls) => panic!("{}: {} impls", what, impls.len()),
+        };
+        assert!(matches!(&error, EncodeError::NeedsSelf(_)), "{}", what);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the type '{}' needs `Self` (it names it, or its context does), so its Repeater \
+                 impl cannot be for a marker type; use `ImplSelf::Param`",
+                ty
+            ),
+            "{}",
+            what
+        );
+    }
 }

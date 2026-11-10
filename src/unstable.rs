@@ -73,8 +73,8 @@ impl Why {
             ),
             Why::Hidden { generic, bound } => format!(
                 "names `{}` in the arguments of the bound `{}`, whose path may be a type alias of \
-                 a projection that another bound of `{}` equates, which the Leaker cannot tell \
-                 from a struct: rustc normalizes it in the impl of the Repeater, but not yet in \
+                 a projection that another bound of `{}` equates (an alias is not told from a \
+                 struct): rustc normalizes it in the impl of the Repeater, but not yet in \
                  the environment (E0277)",
                 generic,
                 tidy_str(bound),
