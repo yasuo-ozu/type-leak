@@ -11,9 +11,8 @@
 //! - Without it, the bare spelling is a relative path that cannot be leaked: the item is rejected,
 //!   and for every bare name in it there is a "use absolute path" error that names it.
 //!
-//! A bare `?Sized` is the exception (`?` only applies to the real
-//! `Sized`): with `relaxed_sized` it is accepted whatever the prelude, so its twin is compared too
-//! (see `gen::BARE_RELAXED_SIZED_ALWAYS_OK`).
+//! A bare `?Sized` is the exception (`?` only applies to the real `Sized`): the Leaker accepts it
+//! whatever the prelude, so its twin is compared too.
 
 use std::collections::BTreeSet;
 use syn::punctuated::Punctuated;
@@ -349,12 +348,12 @@ fn disagree(why: String) -> Error {
 /// item was compared with its twin.
 ///
 /// `analyze` runs the analysis of the item with the arguments of the macro (the item it is given is
-/// the item itself, or its twin). `prelude`: the Leaker allows the names of the prelude.
+/// the item itself, or its twin). `prelude`: the Leaker allows the names of the prelude. A bare
+/// `?Sized` is always accepted.
 pub(crate) fn check(
     item: &Item,
     fragments_only: bool,
     prelude: bool,
-    relaxed_sized: bool,
     result: &Analysis,
     analyze: impl Fn(&Item) -> Analysis,
 ) -> Result<bool> {
@@ -368,7 +367,7 @@ pub(crate) fn check(
     let denied: BTreeSet<&String> = found
         .bounds
         .iter()
-        .filter(|name| !prelude && !(relaxed_sized && name.as_str() == "?Sized"))
+        .filter(|name| !prelude && name.as_str() != "?Sized")
         .collect();
     if !denied.is_empty() {
         let error = match result {

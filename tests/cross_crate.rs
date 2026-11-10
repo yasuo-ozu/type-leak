@@ -335,8 +335,8 @@ fn allowed(kind: &'static str, entries: usize, positions: usize, checked: usize)
 /// A struct, an enum, a union, an impl, a module and a trait are each analyzed by the matching
 /// `intern_*` and accepted (or rejected, for a `Self` that is denied) as the Leaker's crate says, and
 /// the Referrer's crate checked every copied type against the original: `checked` is the number of
-/// type positions of the item which have a witness (all but the ones of a module that name what it
-/// declares, which the copy declares again).
+/// type positions of the item which have a witness, or in a module name what it declares and are
+/// compared with the original written for the Referrer's crate.
 #[test]
 fn every_item_kind_is_leaked_across_crates() {
     use type_leak_test_leaker::*;
@@ -412,11 +412,12 @@ fn every_item_kind_is_leaked_across_crates() {
             reported(9034, __tl_report_9034!()),
             ok("impl-trait", 2, 5, 5),
         ),
-        // a module (its own `Local` is declared in it, so the types that name it have no witness)
+        // a module (its own `Local` is declared in it, so the types that name it are compared with the
+        // original written for the Referrer's crate)
         (
             9041,
             reported(9041, __tl_report_9041!()),
-            ok("mod", 4, 6, 5),
+            ok("mod", 4, 6, 6),
         ),
         // a bare identifier that is a const, in a module, beside a name that the module declares: an
         // absolute `use` declares it, so it is copied as written; one imported from outside is
@@ -424,7 +425,7 @@ fn every_item_kind_is_leaked_across_crates() {
         (
             9101,
             reported(9101, __tl_report_9101!()),
-            ok("mod", 2, 4, 3),
+            ok("mod", 2, 4, 4),
         ),
         (
             9102,

@@ -1252,7 +1252,7 @@ pub fn prop_leak_accept(
 /// Like `prop_leak_accept`, but the Leaker leaves the errors to the Referrer: an item that has some
 /// is emitted as an accepted item whose macro carries the `LeakerResult` (the Referrer, then the
 /// errors, as tokens). `__prop_apply!` drops the errors that its invocation allows
-/// (`allow(prelude, std_crates, trait Path, type Ty)`), reports the others with
+/// (`allow(std_crates, trait Path, type Ty)`), reports the others with
 /// `ErrorItem::emit()`, and copies the item with the recovered Referrer. See `prop.rs`.
 #[proc_macro_attribute]
 pub fn prop_leak_result(
