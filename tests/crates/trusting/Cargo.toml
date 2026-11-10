@@ -3,7 +3,7 @@ name = "type-leak-test-trusting"
 version = "0.0.0"
 edition = "2018"
 publish = false
-description = "A Referrer's crate without the dependency of an optional entry, for tests/trusting.rs"
+description = "A Referrer's crate without the dependency of an optional entry, for tests/diagnostic.rs (`trusting`)"
 
 [lib]
 path = "lib.rs"
@@ -17,5 +17,5 @@ type-leak-test-leaker = { path = "../leaker" }
 # The Referrer replaces the optional entries too. Without it, the crate does not compile.
 strict = []
 
-# Built on its own by tests/trusting.rs.
+# Built on its own by tests/diagnostic.rs (`trusting`).
 [workspace]

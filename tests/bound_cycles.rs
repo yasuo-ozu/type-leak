@@ -104,27 +104,8 @@ const HEADLINE: &str =
 fn an_entry_in_a_predicate_whose_generic_has_a_leaked_bound_is_rejected() {
     // The Repeater's impl for `Wrap<T>` has `T: Fn(Rel)`, the copy `T: Fn(<..>::Type)`: the
     // predicate `<..>::Type: Sized` of the copy needs the first with the second in the environment.
+    // (The struct and the two traits with that predicate are F2 of `tests/findings.rs`.)
     let items: Vec<Item> = vec![
-        parse_quote!(
-            pub struct S<T: Fn(Rel)>(Wrap<T>)
-            where
-                Wrap<T>: Sized;
-        ),
-        // A method of a trait, with the generic of the trait or of the method.
-        parse_quote!(
-            pub trait Tr<T: Fn(Rel)> {
-                fn f(&self, a: Wrap<T>)
-                where
-                    Wrap<T>: Sized;
-            }
-        ),
-        parse_quote!(
-            pub trait Tr {
-                fn f<T: Fn(Rel)>(&self, a: Wrap<T>)
-                where
-                    Wrap<T>: Sized;
-            }
-        ),
         // The bound of another generic, as the where predicate was: it is in the environment too.
         parse_quote!(
             pub struct S<T: Fn(Rel), U: Into<Wrap<T>>>(T, U);
@@ -178,32 +159,6 @@ fn an_entry_in_a_predicate_whose_generic_has_a_leaked_bound_is_rejected() {
 }
 
 #[test]
-fn the_error_names_the_type_and_the_bound() {
-    let item: Item = parse_quote!(
-        pub struct S<T: Fn(Rel)>(Wrap<T>)
-        where
-            Wrap<T>: Sized;
-    );
-    let help = help_of(item.clone());
-    let (headline, note) = rejected(item);
-    assert_eq!(
-        headline,
-        "`Wrap<T>` is in a bound or where predicate, and a bound of its generics names a leaked type"
-    );
-    let note = note.unwrap();
-    assert!(
-        note.contains("the bound `T : Fn (Rel)` of its generics"),
-        "{}",
-        note
-    );
-    assert_eq!(
-        help,
-        "write the leaked type of the bound with an absolute path, or use `Wrap<T>` outside the \
-         bounds and where predicates"
-    );
-}
-
-#[test]
 fn what_needs_no_environment_is_accepted() {
     let items: Vec<Item> = vec![
         // The entry is in a field only: the environment is built before the field is normalized.
@@ -215,13 +170,6 @@ fn what_needs_no_environment_is_accepted() {
             pub struct S<T: Fn(Rel), U: Into<Rel>>(T, U)
             where
                 Rel: Sized;
-        ),
-        parse_quote!(
-            pub trait Tr {
-                fn f<T: Fn(Rel)>(&self, a: Wrap<T>)
-                where
-                    T: Sized;
-            }
         ),
         // The generic has no bound that names a leaked type.
         parse_quote!(
@@ -250,6 +198,23 @@ fn what_needs_no_environment_is_accepted() {
             pub struct S<T: Fn(Rel)>(T)
             where
                 Vec<Self>: Clone;
+        ),
+        // A bound of a generic names `Self`, but the self type is not leaked, or `Self` is the
+        // struct, which the copy declares itself.
+        parse_quote!(
+            impl Vec<u8> {
+                fn m<X>(&self)
+                where
+                    X: Fn(Self) -> u8,
+                    Rel<X>: Default,
+                {
+                }
+            }
+        ),
+        parse_quote!(
+            pub struct S<X: Fn(Self) -> u8>(X)
+            where
+                Rel<X>: Default;
         ),
     ];
     for item in items {
@@ -343,77 +308,145 @@ fn a_reference_that_is_leaked_whole_in_a_cycle_is_rejected() {
     assert!(headline.contains(HEADLINE), "{}", headline);
 }
 
-/// A Leaker for which the types of `::ext`, a crate that it does not allow, are optional entries.
-fn ext_leaker() -> Leaker<impl Allow> {
-    leaker()
+/// The leaked types of an accepted item, an optional entry (see `Referrer::must()`) preceded by `?`.
+fn marked_types(referrer: &Referrer) -> Vec<String> {
+    referrer
+        .iter()
+        .enumerate()
+        .map(|(ix, ty)| format!("{}{}", if referrer.must(ix) { "" } else { "? " }, s(ty)))
+        .collect()
 }
 
+/// The types of `::ext`, a crate that the Leaker does not allow, are optional entries (`?`). One
+/// that a cycle needs is copied as written, which is no error: the Referrer may replace it, but its
+/// path through the Repeater would make a cycle with the bound that names it.
 #[test]
-fn an_optional_entry_in_a_cycle_is_copied_as_written() {
-    // `::ext::Wrap<T>` may be replaced by the Referrer, but then its path through the Repeater
-    // would make a cycle with the bound that names it: it is copied as written, which is no error.
-    let mut leaker = ext_leaker();
-    leaker.intern_struct(
-        &parse_quote!(
-            pub struct S<T: Into<::ext::Wrap<T>>>(T);
+fn an_optional_entry_that_a_cycle_needs_is_copied_as_written() {
+    let rows: Vec<(Item, &[&str])> = vec![
+        // The bound names `::ext::Wrap<T>`, and so does a field (the Referrer finds an entry by the
+        // type and its context, wherever it is); without the bound it is an optional entry as ever.
+        (
+            parse_quote!(
+                pub struct S<T: Into<::ext::Wrap<T>>>(T);
+            ),
+            &[],
         ),
-        true,
-    );
-    assert_eq!(
-        types(&leaker.result().finish().unwrap()),
-        Vec::<String>::new()
-    );
-    // That holds where the type is also out of the bounds: the Referrer finds an entry by the type
-    // and its context, wherever it is.
-    let mut leaker = ext_leaker();
-    leaker.intern_struct(
-        &parse_quote!(
-            pub struct S<T: Into<::ext::Wrap<T>>>(T, ::ext::Wrap<T>);
+        (
+            parse_quote!(
+                pub struct S<T: Into<::ext::Wrap<T>>>(T, ::ext::Wrap<T>);
+            ),
+            &[],
         ),
-        true,
-    );
-    assert_eq!(
-        types(&leaker.result().finish().unwrap()),
-        Vec::<String>::new()
-    );
-    // Without the bound, it is an optional entry as ever.
-    let mut leaker = ext_leaker();
-    leaker.intern_struct(
-        &parse_quote!(
-            pub struct S<T: Clone>(T, ::ext::Wrap<T>);
+        (
+            parse_quote!(
+                pub struct S<T: Clone>(T, ::ext::Wrap<T>);
+            ),
+            &["? :: ext :: Wrap < T >"],
         ),
-        true,
-    );
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(types(&referrer), [":: ext :: Wrap < T >"]);
-    assert!(!referrer.must(0));
-}
-
-#[test]
-fn an_optional_entry_in_the_bound_of_a_generic_that_a_predicate_uses() {
-    // `Wrap<T>` in the predicate is an entry. The Referrer would write `::ext::X` of the bound
-    // through the Repeater, where the impl of `Wrap<T>` needs it as written: it is copied as
-    // written instead, which is no error.
-    let mut leaker = ext_leaker();
-    leaker.intern_struct(
-        &parse_quote!(
-            pub struct S<T: Fn(::ext::X)>(T)
-            where
-                Wrap<T>: Sized;
+        // `Wrap<T>` in the predicate is an entry. The Referrer would write `::ext::X` of the bound
+        // through the Repeater, where the impl of `Wrap<T>` needs it as written: it is copied as
+        // written instead. Without the predicate, it is an optional entry.
+        (
+            parse_quote!(
+                pub struct S<T: Fn(::ext::X)>(T)
+                where
+                    Wrap<T>: Sized;
+            ),
+            &["Wrap < T >"],
         ),
-        true,
-    );
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(types(&referrer), ["Wrap < T >"]);
-    // Without the predicate, it is an optional entry.
-    let mut leaker = ext_leaker();
-    leaker.intern_struct(
-        &parse_quote!(
-            pub struct S<T: Fn(::ext::X)>(T);
+        (
+            parse_quote!(
+                pub struct S<T: Fn(::ext::X)>(T);
+            ),
+            &["? :: ext :: X"],
         ),
-        true,
-    );
-    assert_eq!(types(&leaker.result().finish().unwrap()), [":: ext :: X"]);
+        // An optional entry in a predicate that names a lifetime is in its own context, and leaked
+        // as a whole, so its parts cannot stand for it either. Without the lifetime, it is not in
+        // its own context, and `B0` is an optional entry.
+        (
+            parse_quote!(
+                pub struct S<'a, T: 'a>
+                where
+                    T: Fn(&'a ::ext::W<T, ::ext::B0>) -> u8,
+                {
+                    f0: u8,
+                }
+            ),
+            &[],
+        ),
+        (
+            parse_quote!(
+                pub struct S<'a, T: 'a>
+                where
+                    T: Fn(::ext::W<T, ::ext::B0>) -> u8,
+                {
+                    f0: &'a T,
+                }
+            ),
+            &["? :: ext :: B0"],
+        ),
+        // An optional entry in a predicate, with a bound of its context that names an `Item` that
+        // is equated, or `Self::A`.
+        (
+            parse_quote!(
+                impl<T: Iterator> S<T>
+                where
+                    T: Fn(T::Item),
+                {
+                    fn m(&self)
+                    where
+                        T: Iterator<Item = ::ext::W<T>>,
+                    {
+                    }
+                }
+            ),
+            &["S < T >"],
+        ),
+        (
+            parse_quote!(
+                pub trait Tr {
+                    type A0;
+                    fn m<X>(&self)
+                    where
+                        X: Fn(&Self::A0) -> u8,
+                        ::ext::Rel<X>: Default;
+                }
+            ),
+            &[],
+        ),
+        // The optional types of a self type that a bound of an entry names (`Self`); without a
+        // predicate that names the entry, the self type is an optional entry as ever.
+        (
+            parse_quote!(
+                impl ::ext::S {
+                    fn m<X>(&self)
+                    where
+                        X: Fn(Self) -> u8,
+                        Rel<X>: Default,
+                    {
+                    }
+                }
+            ),
+            &["Rel < X >"],
+        ),
+        (
+            parse_quote!(
+                impl ::ext::S {
+                    fn m<X>(&self, a: Rel<X>)
+                    where
+                        X: Fn(Self) -> u8,
+                    {
+                    }
+                }
+            ),
+            &["Rel < X >", "? :: ext :: S"],
+        ),
+    ];
+    for (item, expected) in rows {
+        let text = s(&item);
+        let referrer = leak(item).unwrap_or_else(|e| panic!("{}: {}", text, messages(&e)));
+        assert_eq!(marked_types(&referrer), expected, "{}", text);
+    }
 }
 
 #[test]
@@ -635,7 +668,8 @@ fn a_bound_that_names_an_associated_type_that_rustc_normalizes_is_unstable() {
     // The `Item` is equated, so rustc normalizes it as it proves the impl of the Repeater for
     // `Wrap<T>` (`T: Fn(u8)`), and the environment has it as written (`T: Fn(T::Item)`).
     for item in [
-        // By a predicate of a method, which is not in the context of the entry (F21).
+        // By a predicate of a method, which is not in the context of the entry (F21, which has the
+        // trait with `<T as Iterator>::Item` too).
         parse_quote!(
             impl<T: Iterator> S<T>
             where
@@ -646,16 +680,6 @@ fn a_bound_that_names_an_associated_type_that_rustc_normalizes_is_unstable() {
                     T: Iterator<Item = Rel<T>>,
                 {
                 }
-            }
-        ),
-        parse_quote!(
-            pub trait Tr<T: Iterator>
-            where
-                T: Fn(<T as Iterator>::Item),
-            {
-                fn m(&self)
-                where
-                    T: Iterator<Item = Rel<T>>;
             }
         ),
         // A projection that an impl defines.
@@ -781,266 +805,34 @@ fn a_bound_that_names_an_associated_type_that_rustc_normalizes_is_unstable() {
 }
 
 #[test]
-fn self_and_its_associated_types_in_a_bound_are_unstable() {
-    // F19: the self type is leaked, and the bound of the generic names `Self`.
-    let (headline, note) = unstable(parse_quote!(
-        impl S {
-            fn m<X>(&self)
+fn self_a_in_a_predicate_of_an_impl_is_unstable_with_a_leaked_bound_of_the_impl() {
+    // F14 has the same with a predicate on a generic of the method, and the controls: the context
+    // of `Self::A1` of an impl has no generics, but the impl of the trait that rustc proves has all
+    // those of the impl. Here the predicate is on a type that is not a generic, and no entry is in
+    // a position.
+    let item: Item = parse_quote!(
+        impl<T: Fn(Rel)> ::p::Tr<T> for u8 {
+            type A1 = u8;
+            fn m(&self)
             where
-                X: Fn(Self) -> u8,
-                Rel<X>: Default,
+                u8: Into<Self::A1>,
             {
             }
         }
-    ));
-    assert_eq!(
-        headline,
-        "`Rel<X>` is in a bound or where predicate, and a bound of its generics names `Self`, which is a leaked type"
     );
+    let (headline, note) = unstable(item);
     assert!(
-        note.contains("the bound `X : Fn (Self) -> u8` of its generics names `Self`"),
-        "{}",
-        note
-    );
-    // F20: the bound names `Self::A0` of a trait.
-    let item: Item = parse_quote!(
-        pub trait Tr {
-            type A0;
-            fn m<X>(&self)
-            where
-                X: Fn(&Self::A0) -> u8,
-                Rel<X>: Default;
-        }
-    );
-    let help = help_of(item.clone());
-    let (headline, _note) = unstable(item);
-    assert!(
-        headline.ends_with("a bound of its generics names `Self::A0`"),
+        headline.starts_with("`Self::A1` is in a bound or where predicate")
+            && headline.ends_with("names a leaked type"),
         "{}",
         headline
     );
-    assert_eq!(
-        help,
-        "write the bound without `Self::A0`, or use `Rel<X>` outside the bounds and where \
-         predicates"
+    assert!(
+        note.contains("resolves `Self::A1` by the impl of the trait")
+            && note.contains("of the impl"),
+        "{}",
+        note
     );
-    // The self type is not leaked, or the entry is in a position, or `Self` is the struct, which
-    // the copy declares itself.
-    for item in [
-        parse_quote!(
-            impl Vec<u8> {
-                fn m<X>(&self)
-                where
-                    X: Fn(Self) -> u8,
-                    Rel<X>: Default,
-                {
-                }
-            }
-        ),
-        parse_quote!(
-            impl S {
-                fn m<X>(&self, a: Rel<X>)
-                where
-                    X: Fn(Self) -> u8,
-                {
-                }
-            }
-        ),
-        parse_quote!(
-            pub struct S<X: Fn(Self) -> u8>(X)
-            where
-                Rel<X>: Default;
-        ),
-    ] {
-        let text = s(&item);
-        if let Err(err) = leak(item) {
-            panic!("{} is rejected: {}", text, messages(&err));
-        }
-    }
-}
-
-#[test]
-fn self_a_in_a_predicate_of_an_impl_is_unstable_with_a_leaked_bound_of_the_impl() {
-    // F14: the context of `Self::A1` of an impl has no generics, but the impl of the trait that
-    // rustc proves has all those of the impl.
-    for item in [
-        parse_quote!(
-            impl<T> ::p::Tr<T> for u8
-            where
-                T: Fn(Rel),
-            {
-                type A1 = u8;
-                fn m<X>(&self, a: Rel)
-                where
-                    X: Into<Self::A1>,
-                {
-                }
-            }
-        ),
-        parse_quote!(
-            impl<T: Fn(Rel)> ::p::Tr<T> for u8 {
-                type A1 = u8;
-                fn m(&self)
-                where
-                    u8: Into<Self::A1>,
-                {
-                }
-            }
-        ),
-    ] {
-        let text = s(&item);
-        let (headline, note) = unstable(item);
-        assert!(
-            headline.starts_with("`Self::A1` is in a bound or where predicate")
-                && headline.ends_with("names a leaked type"),
-            "{}: {}",
-            text,
-            headline
-        );
-        assert!(
-            note.contains("resolves `Self::A1` by the impl of the trait")
-                && note.contains("of the impl"),
-            "{}: {}",
-            text,
-            note
-        );
-    }
-    for item in [
-        parse_quote!(
-            impl<T: Clone> ::p::Tr<T> for u8 {
-                type A1 = u8;
-                fn m<X>(&self, a: Rel)
-                where
-                    X: Into<Self::A1>,
-                {
-                }
-            }
-        ),
-        // `Self::A1` and the leaked type are in positions only.
-        parse_quote!(
-            impl<T> ::p::Tr<T> for u8
-            where
-                T: Fn(Rel),
-            {
-                type A1 = u8;
-                fn m<X>(&self, a: Self::A1, b: Rel)
-                where
-                    X: Into<Rel>,
-                {
-                }
-            }
-        ),
-    ] {
-        let text = s(&item);
-        if let Err(err) = leak(item) {
-            panic!("{} is rejected: {}", text, messages(&err));
-        }
-    }
-}
-
-#[test]
-fn an_optional_entry_that_an_unstable_bound_makes_cyclic_is_copied_as_written() {
-    // F17: `&'a ::ext::W<T, ::ext::B0>` is in a predicate that names `'a`, so it is in its own
-    // context. It is leaked as a whole, so its parts cannot stand for it either.
-    let mut leaker = ext_leaker();
-    leaker.intern_struct(
-        &parse_quote!(
-            pub struct S<'a, T: 'a>
-            where
-                T: Fn(&'a ::ext::W<T, ::ext::B0>) -> u8,
-            {
-                f0: u8,
-            }
-        ),
-        true,
-    );
-    assert_eq!(
-        types(&leaker.result().finish().unwrap()),
-        Vec::<String>::new()
-    );
-    // Without the lifetime, it is not in its own context, and `B0` is an optional entry.
-    let mut leaker = ext_leaker();
-    leaker.intern_struct(
-        &parse_quote!(
-            pub struct S<'a, T: 'a>
-            where
-                T: Fn(::ext::W<T, ::ext::B0>) -> u8,
-            {
-                f0: &'a T,
-            }
-        ),
-        true,
-    );
-    assert_eq!(types(&leaker.result().finish().unwrap()), [":: ext :: B0"]);
-    // An optional entry in a predicate, with a bound of its context that names an `Item` that is
-    // equated, or `Self::A`.
-    let mut leaker = ext_leaker();
-    leaker.intern_impl(
-        &parse_quote!(
-            impl<T: Iterator> S<T>
-            where
-                T: Fn(T::Item),
-            {
-                fn m(&self)
-                where
-                    T: Iterator<Item = ::ext::W<T>>,
-                {
-                }
-            }
-        ),
-        true,
-    );
-    assert_eq!(types(&leaker.result().finish().unwrap()), ["S < T >"]);
-    let mut leaker = ext_leaker();
-    leaker.intern_trait(
-        &parse_quote!(
-            pub trait Tr {
-                type A0;
-                fn m<X>(&self)
-                where
-                    X: Fn(&Self::A0) -> u8,
-                    ::ext::Rel<X>: Default;
-            }
-        ),
-        true,
-    );
-    assert_eq!(
-        types(&leaker.result().finish().unwrap()),
-        Vec::<String>::new()
-    );
-    // The optional types of a self type that a bound of an entry names (`Self`).
-    let mut leaker = ext_leaker();
-    leaker.intern_impl(
-        &parse_quote!(
-            impl ::ext::S {
-                fn m<X>(&self)
-                where
-                    X: Fn(Self) -> u8,
-                    Rel<X>: Default,
-                {
-                }
-            }
-        ),
-        true,
-    );
-    assert_eq!(types(&leaker.result().finish().unwrap()), ["Rel < X >"]);
-    // Without a predicate that names the entry, the self type is an optional entry as ever.
-    let mut leaker = ext_leaker();
-    leaker.intern_impl(
-        &parse_quote!(
-            impl ::ext::S {
-                fn m<X>(&self, a: Rel<X>)
-                where
-                    X: Fn(Self) -> u8,
-                {
-                }
-            }
-        ),
-        true,
-    );
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(types(&referrer), ["Rel < X >", ":: ext :: S"]);
-    assert!(referrer.must(0) && !referrer.must(1));
 }
 
 /// The `Leaker` docs, Bounds that name leaked types: `<Self as ::p::Tr>::A0` in a bound names the

@@ -18,6 +18,8 @@
 //! `Parser<'x>` is leaked alone, but `&'x str` of `Fn(Rel2<&'x str>) -> &'x str` is not, as
 //! `Rel2` is leaked as a whole. Which positions constrain was checked with rustc (stable and
 //! nightly, from 1.61 on), for the inputs of function pointers and of `Fn(..)` and other bounds.
+//!
+//! The module `elided` has the same for an output with an elided lifetime (E0106).
 
 mod common;
 
@@ -107,15 +109,7 @@ fn e(ty: &str, generics: &str) -> (String, String) {
 
 /// The message and the first note of the error of a trait.
 fn error(item: ItemTrait) -> (String, Option<String>) {
-    let err = analyze(&item).expect_err("expected an error");
-    (
-        messages(&err),
-        err[0]
-            .notes
-            .first()
-            .map(|(_, n)| n.as_str())
-            .map(str::to_string),
-    )
+    error_by(leaker(), item)
 }
 
 /// The note of an error in a bound or a predicate, where there is no type holding the binder.
@@ -393,22 +387,14 @@ fn the_binders_are_independent() {
 fn the_type_holding_the_binder_which_cannot_be_leaked_is_an_error() {
     // A function pointer with a trait object under an elided reference cannot be leaked as a
     // whole, so `Rel<'x>` has to be, which cannot be leaked alone: it is an error, not a copy
-    // rustc rejects. (An elided lifetime of its own would not stop it, see
-    // `tests/elided_output.rs`.)
-    assert_eq!(
-        error(parse_quote! {
-            trait Tr { fn f(&self, f: for<'x> fn(Rel<'x>, &dyn ::core::fmt::Debug) -> &'x u8); }
-        }),
-        (
-            "use absolute path: 'Rel<'x>'".to_string(),
-            Some(NOTE_OWNED.to_string())
-        )
-    );
+    // rustc rejects. (An elided lifetime of its own would not stop it, see the module `elided`.)
+    // The one error, then its text: the first note is that of `NOTE_OWNED`.
     let err = analyze(&parse_quote! {
         trait Tr { fn f(&self, f: for<'x> fn(Rel<'x>, &dyn ::core::fmt::Debug) -> &'x u8); }
     })
     .err()
     .unwrap();
+    assert_eq!(messages(&err), "use absolute path: 'Rel<'x>'");
     assert_eq!(
         to_syn_error(&err).to_string(),
         format!(
@@ -472,35 +458,187 @@ fn the_type_holding_the_binder_which_cannot_be_leaked_is_an_error() {
     );
 }
 
+/// A Leaker which allows the paths `allowed`.
+fn leaker_allowing(allowed: &[&str]) -> Leaker<impl Allow> {
+    let allowed: Vec<Path> = allowed
+        .iter()
+        .map(|path| parse_str(path).unwrap())
+        .collect();
+    leaker_with(&allowed)
+}
+
+/// A row of `check_tells_whether_the_holder_is_interned()`: the paths the Leaker allows, the
+/// generics, the type, `must` (if it is asserted), `is_own` and `impossible`.
+type CheckRow = (
+    &'static [&'static str],
+    &'static str,
+    &'static str,
+    Option<&'static [&'static str]>,
+    bool,
+    &'static [&'static str],
+);
+
+/// `View::check()` of a type that holds a binder or a signature tells which causes are leaked,
+/// whether the type is interned itself, and which are impossible.
 #[test]
-fn check_tells_the_type_holding_the_binder_is_interned() {
-    let mut leaker = leaker();
-    let mut check = |ty: Type| check_in(&mut leaker, &ty, &Generics::default());
-    let tokens = |causes: &[Cause]| -> Vec<String> {
-        causes
-            .iter()
-            .map(|cause| quote!(#cause).to_string())
-            .collect()
-    };
-    // `Rel<'x>` alone is leaked (as a component), unless the return type mentions `'x`.
-    let result = check(parse_quote!(for<'x> fn(Rel<'x>)));
-    assert_eq!(tokens(&result.must), ["Rel < 'x >"]);
-    assert!(!result.is_own && result.impossible.is_empty());
-    let result = check(parse_quote!(for<'x> fn(Rel<'x>) -> &'x u8));
-    assert_eq!(tokens(&result.must), ["Rel < 'x >"]);
-    assert!(result.is_own && result.impossible.is_empty());
-    // The elided lifetime of the function pointer is its own, so it does not stop it from being
-    // leaked as a whole.
-    let result = check(parse_quote!(for<'x> fn(Rel<'x>, &u8) -> &'x u8));
-    assert_eq!(tokens(&result.must), ["Rel < 'x >"]);
-    assert!(result.is_own && result.impossible.is_empty());
-    // Which is a conflict if it cannot be: a trait object under an elided reference takes its
-    // lifetime from it.
-    let result = check(parse_quote!(
-        for<'x> fn(Rel<'x>, &dyn ::core::fmt::Debug) -> &'x u8
-    ));
-    assert!(result.is_own);
-    assert_eq!(tokens(&result.impossible), ["dyn :: core :: fmt :: Debug"]);
+fn check_tells_whether_the_holder_is_interned() {
+    let rows: Vec<CheckRow> = vec![
+        // `Rel<'x>` alone is leaked (as a component), unless the return type mentions `'x`.
+        (
+            &["::p"],
+            "",
+            "for<'x> fn(Rel<'x>)",
+            Some(&["Rel < 'x >"]),
+            false,
+            &[],
+        ),
+        (
+            &["::p"],
+            "",
+            "for<'x> fn(Rel<'x>) -> &'x u8",
+            Some(&["Rel < 'x >"]),
+            true,
+            &[],
+        ),
+        // The elided lifetime of the function pointer is its own, so it does not stop it from being
+        // leaked as a whole.
+        (
+            &["::p"],
+            "",
+            "for<'x> fn(Rel<'x>, &u8) -> &'x u8",
+            Some(&["Rel < 'x >"]),
+            true,
+            &[],
+        ),
+        // Which is a conflict if it cannot be: a trait object under an elided reference takes its
+        // lifetime from it.
+        (
+            &["::p"],
+            "",
+            "for<'x> fn(Rel<'x>, &dyn ::core::fmt::Debug) -> &'x u8",
+            None,
+            true,
+            &["dyn :: core :: fmt :: Debug"],
+        ),
+        // `Rel<'x>` stays a component of the function pointer, which is not interned.
+        (
+            &["::p"],
+            "",
+            "for<'x> fn(&'x u8) -> Rel<'x>",
+            Some(&["Rel < 'x >"]),
+            false,
+            &[],
+        ),
+        // The anchor is lost if it is in a type interned itself.
+        (
+            &["::p"],
+            "",
+            "for<'x> fn(Rel2<&'x u8>) -> Rel<'x>",
+            None,
+            true,
+            &[],
+        ),
+        // An associated type binding in a trait object anchors it, unless the trait object is.
+        (
+            &["::p"],
+            "",
+            "for<'x> fn(Box<dyn Iterator<Item = &'x u8>>) -> Rel<'x>",
+            Some(&["Rel < 'x >"]),
+            false,
+            &[],
+        ),
+        (
+            &["::p"],
+            "",
+            "for<'x> fn(Box<dyn RelIter<Item = &'x u8>>) -> Rel<'x>",
+            None,
+            true,
+            &[],
+        ),
+        // The function pointer holding `'x` is interned as a whole instead of `Parser<'x>`, unless
+        // the crate of the type that anchors is allowed; a path of `::core` anchors.
+        (
+            &[],
+            "",
+            "for<'x> fn(::other::Wrap<&'x u8>) -> Parser<'x>",
+            None,
+            true,
+            &[],
+        ),
+        (
+            &["::other"],
+            "",
+            "for<'x> fn(::other::Wrap<&'x u8>) -> Parser<'x>",
+            None,
+            false,
+            &[],
+        ),
+        (
+            &[],
+            "",
+            "for<'x> fn(::core::option::Option<&'x u8>) -> Parser<'x>",
+            None,
+            false,
+            &[],
+        ),
+        // The holder of an elided output is the cause of its own, and it has no impossible one: its
+        // elided lifetimes are its own. A box holds it: the cause is the trait object, and not the
+        // box.
+        (
+            &[],
+            "<'a, T: 'a>",
+            "dyn Fn(&Rel<T>) -> &u8",
+            Some(&["Rel < T >"]),
+            true,
+            &[],
+        ),
+        (
+            &[],
+            "<'a, T: 'a>",
+            "fn(&Rel<T>) -> &u8",
+            Some(&["Rel < T >"]),
+            true,
+            &[],
+        ),
+        (
+            &[],
+            "<'a, T: 'a>",
+            "Box<dyn Fn(&Rel<T>) -> &u8>",
+            Some(&["Rel < T >"]),
+            false,
+            &[],
+        ),
+        // Not where the entry has no lifetimes.
+        (
+            &[],
+            "<T>",
+            "dyn Fn(&Rel<T>) -> &u8",
+            Some(&["Rel < T >"]),
+            false,
+            &[],
+        ),
+    ];
+    for (allowed, generics, ty, must, is_own, impossible) in rows {
+        let generics: Generics = if generics.is_empty() {
+            Generics::default()
+        } else {
+            parse_str(generics).unwrap()
+        };
+        let ty: Type = parse_str(ty).unwrap();
+        let text = s(&ty);
+        let tokens = |causes: &[Cause]| -> Vec<String> {
+            causes
+                .iter()
+                .map(|cause| quote!(#cause).to_string())
+                .collect()
+        };
+        let result = check_in(&mut leaker_allowing(allowed), &ty, &generics);
+        if let Some(must) = must {
+            assert_eq!(tokens(&result.must), must, "{}", text);
+        }
+        assert_eq!(result.is_own, is_own, "{}", text);
+        assert_eq!(tokens(&result.impossible), impossible, "{}", text);
+    }
 }
 
 #[test]
@@ -1186,35 +1324,6 @@ fn the_anchor_is_checked_for_each_binder() {
     assert_eq!(leaked(item), [e("Rel < 'a0 >", "< 'a0 >")]);
 }
 
-#[test]
-fn check_tells_the_anchored_type_is_interned_alone() {
-    let mut leaker = leaker();
-    let mut check = |ty: Type| check_in(&mut leaker, &ty, &Generics::default());
-    let tokens = |causes: &[Cause]| -> Vec<String> {
-        causes
-            .iter()
-            .map(|cause| quote!(#cause).to_string())
-            .collect()
-    };
-    // `Rel<'x>` stays a component of the function pointer, which is not interned.
-    let result = check(parse_quote!(for<'x> fn(&'x u8) -> Rel<'x>));
-    assert_eq!(tokens(&result.must), ["Rel < 'x >"]);
-    assert!(!result.is_own && result.impossible.is_empty());
-    // The anchor is lost if it is in a type interned itself.
-    let result = check(parse_quote!(for<'x> fn(Rel2<&'x u8>) -> Rel<'x>));
-    assert!(result.is_own && result.impossible.is_empty());
-    // An associated type binding in a trait object anchors it, unless the trait object is.
-    let result = check(parse_quote!(
-        for<'x> fn(Box<dyn Iterator<Item = &'x u8>>) -> Rel<'x>
-    ));
-    assert_eq!(tokens(&result.must), ["Rel < 'x >"]);
-    assert!(!result.is_own && result.impossible.is_empty());
-    let result = check(parse_quote!(
-        for<'x> fn(Box<dyn RelIter<Item = &'x u8>>) -> Rel<'x>
-    ));
-    assert!(result.is_own && result.impossible.is_empty());
-}
-
 /// The Leaker which allows `::other`, as `::p` is allowed by `leaker()`.
 fn leaker_allowing_other() -> Leaker<impl Allow> {
     leaker_with(&[parse_quote!(::other)])
@@ -1534,31 +1643,6 @@ fn an_external_crate_type_which_uses_the_lifetime_of_a_binder_is_leaked_with_its
 }
 
 #[test]
-fn the_anchor_of_an_external_crate_type_is_checked_by_check() {
-    let mut leaker = leaker_allowing_nothing();
-    let result = check_in(
-        &mut leaker,
-        &parse_quote!(for<'x> fn(::other::Wrap<&'x u8>) -> Parser<'x>),
-        &Generics::default(),
-    );
-    // The function pointer holding `'x` is interned as a whole instead of `Parser<'x>`.
-    assert!(result.is_own && result.impossible.is_empty());
-    let result = check_in(
-        &mut leaker_allowing_other(),
-        &parse_quote!(for<'x> fn(::other::Wrap<&'x u8>) -> Parser<'x>),
-        &Generics::default(),
-    );
-    assert!(!result.is_own && result.impossible.is_empty());
-    // A path of `::core` anchors.
-    let result = check_in(
-        &mut leaker,
-        &parse_quote!(for<'x> fn(::core::option::Option<&'x u8>) -> Parser<'x>),
-        &Generics::default(),
-    );
-    assert!(!result.is_own && result.impossible.is_empty());
-}
-
-#[test]
 fn the_copy_keeps_what_anchors_with_external_crate_types() {
     // A macro that keeps the optional entries as written keeps the type of the external crate where
     // it is written (it is as anchored as the Leaker's was), and the one which replaces it has the
@@ -1598,59 +1682,42 @@ fn the_copy_keeps_what_anchors_with_external_crate_types() {
     };
     assert_eq!(s(&replaced), s(&expected));
     // With a type to leak beside it, one entry covers all: the function pointer, replaced as a
-    // whole by both (it was `Parser<'x>` and the optional `Wrap<&'x u8>`).
-    let item: ItemTrait = parse_quote! {
-        trait Tr {
-            fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, &'x u8, Parser<'x>) -> &'x u8);
+    // whole by both (it was `Parser<'x>` and the optional `Wrap<&'x u8>`). The same where the
+    // function pointer is leaked as a whole for the other input.
+    for item in [
+        parse_quote! {
+            trait Tr {
+                fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, &'x u8, Parser<'x>) -> &'x u8);
+            }
+        },
+        parse_quote! {
+            trait Tr {
+                fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, Parser<'x>) -> &'x u8);
+            }
+        },
+    ] {
+        let item: ItemTrait = item;
+        let mut leaker = leaker_allowing_nothing();
+        let context = leaker.intern_trait(&item, true);
+        let result = leaker.result();
+        for keeps_optional in [true, false] {
+            let mut copy = item.clone();
+            let referrer = result.clone().finish().unwrap();
+            syn::visit_mut::VisitMut::visit_item_trait_mut(
+                &mut referrer.visitor(context, |ty, ix| {
+                    if keeps_optional && !referrer.must(ix) {
+                        ty
+                    } else {
+                        parse_quote!(P<#ix>)
+                    }
+                }),
+                &mut copy,
+            );
+            let expected: ItemTrait = parse_quote! {
+                trait Tr { fn f(&self, f: P<0usize>); }
+            };
+            assert_eq!(s(&copy), s(&expected), "{}", s(&item));
         }
-    };
-    let mut leaker = leaker_allowing_nothing();
-    let context = leaker.intern_trait(&item, true);
-    let result = leaker.result();
-    for keeps_optional in [true, false] {
-        let mut copy = item.clone();
-        let referrer = result.clone().finish().unwrap();
-        syn::visit_mut::VisitMut::visit_item_trait_mut(
-            &mut referrer.visitor(context, |ty, ix| {
-                if keeps_optional && !referrer.must(ix) {
-                    ty
-                } else {
-                    parse_quote!(P<#ix>)
-                }
-            }),
-            &mut copy,
-        );
-        let expected: ItemTrait = parse_quote! {
-            trait Tr { fn f(&self, f: P<0usize>); }
-        };
-        assert_eq!(s(&copy), s(&expected));
-    }
-    // The one whose function pointer is leaked as a whole is replaced by it in both.
-    let item: ItemTrait = parse_quote! {
-        trait Tr {
-            fn f(&self, f: for<'x> fn(::other::Wrap<&'x u8>, Parser<'x>) -> &'x u8);
-        }
-    };
-    let mut leaker = leaker_allowing_nothing();
-    let context = leaker.intern_trait(&item, true);
-    let result = leaker.result();
-    for keeps_optional in [true, false] {
-        let mut copy = item.clone();
-        let referrer = result.clone().finish().unwrap();
-        syn::visit_mut::VisitMut::visit_item_trait_mut(
-            &mut referrer.visitor(context, |ty, ix| {
-                if keeps_optional && !referrer.must(ix) {
-                    ty
-                } else {
-                    parse_quote!(P<#ix>)
-                }
-            }),
-            &mut copy,
-        );
-        let expected: ItemTrait = parse_quote! {
-            trait Tr { fn f(&self, f: P<0usize>); }
-        };
-        assert_eq!(s(&copy), s(&expected));
     }
 }
 
@@ -1664,4 +1731,678 @@ fn error_by<A: Allow>(leaker: Leaker<A>, item: ItemTrait) -> (String, Option<Str
             .map(|(_, n)| n.as_str())
             .map(str::to_string),
     )
+}
+
+mod elided {
+    //! The elided lifetime in the output of a signature, next to a leaked type that has lifetimes.
+    //!
+    //! `Box<dyn Fn(&Rel<T>) -> &u8>` has one lifetime in the inputs of the sugar, the elided one of
+    //! `&`, which elision gives to the output. A leaked type that has lifetimes (`Rel<T>` in a trait
+    //! with `'a, T: 'a` has `<'a, T: 'a>`) is replaced by a projection that names them in its
+    //! arguments (`<S as Repeater<(&'a (), T, &'a T), ..>>::Type`), so the inputs of the copy have
+    //! several lifetimes, and rustc cannot resolve the output (E0106). rustc counts the lifetimes that
+    //! are distinct in the inputs: each elided one, and each name once. A function pointer or `Fn(..)`
+    //! inside an input has its own signature. A method takes the lifetime of its output from a
+    //! receiver that is a reference, else it counts the inputs like the others.
+    //!
+    //! So a type that adds lifetimes to such inputs is not leaked alone: the type holding the signature
+    //! (a function pointer, a trait object, or a reference to one that takes its lifetime) is leaked
+    //! as a whole instead, which keeps the elision as written in the impl of the Repeater. Where
+    //! nothing holds the signature (a bound, `impl Fn(..)`, a method that has no receiver which is a
+    //! reference), or it cannot be leaked (a trait object under an elided reference, which takes its
+    //! lifetime from it), it is an error.
+    //!
+    //! The elided lifetimes inside a function pointer or `Fn(..)` are its own (rustc makes them
+    //! lifetimes of its binder), so they do not stop it from being leaked as a whole. They stop the
+    //! types inside it, which are not the holder.
+    //!
+    //! The copies compile as the tests of `tests/findings.rs` (F12) and the property test show.
+
+    use super::{e, messages, s};
+    use syn::*;
+    use type_leak::{to_syn_error, Allow, ErrorItem, Leaker, Options, Referrer, Rules};
+
+    fn leaker() -> Leaker<impl Allow> {
+        let config = Rules::new().primitive().prelude();
+        Leaker::from_config(config, Options::new())
+    }
+
+    fn analyze(item: &ItemTrait) -> std::result::Result<Referrer, Vec<ErrorItem>> {
+        let mut leaker = leaker();
+        leaker.intern_trait(item, true);
+        leaker.result().finish()
+    }
+
+    /// The leaked types of a trait with the generics each uses.
+    fn leaked(item: ItemTrait) -> Vec<(String, String)> {
+        let referrer = analyze(&item).unwrap_or_else(|e| panic!("{}: {}", s(&item), messages(&e)));
+        referrer
+            .iter()
+            .enumerate()
+            .map(|(ix, ty)| (ty, referrer.context_generics(referrer.context(ix))))
+            .map(|(ty, generics)| (s(ty), s(generics)))
+            .collect()
+    }
+
+    /// The message and the first note of the error of a trait.
+    fn error(item: ItemTrait) -> (String, String) {
+        let err = match analyze(&item) {
+            Ok(_) => panic!("{} is accepted", s(&item)),
+            Err(err) => err,
+        };
+        (
+            messages(&err),
+            err[0]
+                .notes
+                .first()
+                .map(|(_, n)| n.as_str())
+                .unwrap()
+                .to_string(),
+        )
+    }
+
+    /// The help of the error of a trait.
+    fn help(item: &ItemTrait) -> String {
+        match analyze(item) {
+            Ok(_) => panic!("{} is accepted", s(item)),
+            Err(err) => err[0].help_text().unwrap().to_string(),
+        }
+    }
+
+    /// The note of the error where nothing holds the signature.
+    const NOTE: &str =
+        "the output `&u8` has an elided lifetime, which elision takes from the only \
+                        lifetime of the inputs, but a leaked type in the inputs has `'a` among its \
+                        generics, and the copy names it in the arguments of its projection, so the \
+                        inputs have more than one lifetime (E0106)";
+
+    /// What to write for the error of `NOTE` in `Fn(..)` or a function pointer.
+    const HELP: &str =
+        "name the lifetime of the inputs and of the output, or write `Rel<T>` with an \
+                        absolute path";
+
+    /// What to write for the error of `NOTE` in a method: it can have a receiver too.
+    const HELP_METHOD: &str =
+        "name the lifetime of the inputs and of the output, give the method a \
+                               receiver (`&self`), or write `Rel<T>` with an absolute path";
+
+    /// The note of the error where the holder cannot be leaked.
+    const NOTE_OWNED: &str = "the output `&u8` has an elided lifetime, which elision takes from the \
+                              only lifetime of the inputs, but a leaked type in the inputs has `'a` \
+                              among its generics, and the copy names it in the arguments of its \
+                              projection, so the inputs have more than one lifetime (E0106), so a \
+                              type using them cannot be leaked alone, and the type holding the \
+                              signature would be leaked as a whole instead";
+
+    #[test]
+    fn the_holder_is_leaked_as_a_whole() {
+        // The sugar of `Fn(..)` in a trait object, in a box, behind a reference, with other bounds.
+        for (item, holder) in [
+            (
+                parse_quote! { trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn Fn(&Rel<T>) -> &u8>); } },
+                "dyn Fn (& Rel < T >) -> & u8",
+            ),
+            (
+                parse_quote! {
+                    trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn FnMut(&Rel<T>) -> &u8 + Send>); }
+                },
+                "dyn FnMut (& Rel < T >) -> & u8 + Send",
+            ),
+            (
+                parse_quote! { trait Tr<'a, T: 'a> { fn f(&self, x: Vec<Box<dyn Fn(&Rel<T>) -> &u8>>); } },
+                "dyn Fn (& Rel < T >) -> & u8",
+            ),
+            // The reference takes the lifetime of the trait object, so it is leaked with it.
+            (
+                parse_quote! { trait Tr<'a, T: 'a> { fn f(&self, x: &'a dyn Fn(&Rel<T>) -> &u8); } },
+                "& 'a dyn Fn (& Rel < T >) -> & u8",
+            ),
+            (
+                parse_quote! {
+                    trait Tr<'a, T: 'a> { fn f(&self, x: &'a (dyn Fn(&Rel<T>) -> &u8 + 'a)); }
+                },
+                "& 'a (dyn Fn (& Rel < T >) -> & u8 + 'a)",
+            ),
+            // A function pointer.
+            (
+                parse_quote! { trait Tr<'a, T: 'a> { fn f(&self, x: fn(&Rel<T>) -> &u8); } },
+                "fn (& Rel < T >) -> & u8",
+            ),
+            (
+                parse_quote! {
+                    trait Tr<'a, T: 'a> { fn f(&self, x: unsafe extern "C" fn(&Rel<T>) -> &u8); }
+                },
+                "unsafe extern \"C\" fn (& Rel < T >) -> & u8",
+            ),
+            // Other elided lifetimes in the output, and a lifetime argument in the input.
+            (
+                parse_quote! {
+                    trait Tr<'a, T: 'a> { fn f(&self, x: fn(&Rel<T>) -> ::p::Ref<'_, u8>); }
+                },
+                "fn (& Rel < T >) -> :: p :: Ref < '_ , u8 >",
+            ),
+            (
+                parse_quote! {
+                    trait Tr<'a, T: 'a> {
+                        fn f(&self, x: Box<dyn Fn(&Rel<T>) -> Box<dyn Iterator<Item = &u8> + '_>>);
+                    }
+                },
+                "dyn Fn (& Rel < T >) -> Box < dyn Iterator < Item = & u8 > + '_ >",
+            ),
+            // The input is the only lifetime, whatever it is: the entry adds `'a` to it.
+            (
+                parse_quote! {
+                    trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn Fn(&'static Rel<T>) -> &u8>); }
+                },
+                "dyn Fn (& 'static Rel < T >) -> & u8",
+            ),
+            (
+                parse_quote! {
+                    trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn for<'x> Fn(&'x Rel<T>) -> &u8>); }
+                },
+                "dyn for < 'x > Fn (& 'x Rel < T >) -> & u8",
+            ),
+        ] {
+            let item: ItemTrait = item;
+            let found = leaked(item.clone());
+            assert_eq!(found.len(), 1, "{}: {:?}", s(&item), found);
+            assert_eq!(found[0].0, holder, "{}", s(&item));
+            assert!(found[0].1.contains("'a"), "{}: {:?}", s(&item), found);
+        }
+        // The generics are those of the whole: the lifetimes and the parameters the holder uses.
+        assert_eq!(
+            leaked(parse_quote! {
+                trait Tr<'a, 'b, T: 'a, U: 'b> { fn f(&self, x: Box<dyn Fn(&Rel<T>) -> &u8>, y: &'b U); }
+            }),
+            [e("dyn Fn (& Rel < T >) -> & u8", "< 'a , T : 'a >")]
+        );
+        // What else is in it is covered, so it is not leaked on its own.
+        assert_eq!(
+            leaked(parse_quote! {
+                trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn Fn(&Rel<T>, u8) -> &Rel2>); }
+            }),
+            [e("dyn Fn (& Rel < T > , u8) -> & Rel2", "< 'a , T : 'a >")]
+        );
+        // `Self` in an entry: the holder is leaked with it.
+        assert_eq!(
+            leaked(parse_quote! {
+                trait Tr<'a> where Self: Sized + 'a { fn f(&self, x: Box<dyn Fn(&Rel<Self>) -> &u8>); }
+            }),
+            [e("dyn Fn (& Rel < Self >) -> & u8", "< 'a >")]
+        );
+        // The fields of a struct.
+        let item: ItemStruct = parse_quote! {
+            struct S<'a, T: 'a> { f: fn(&Rel<T>) -> &u8, g: Box<dyn Fn(&Rel<T>) -> &u8>, h: &'a Rel<T> }
+        };
+        let mut leaker = leaker();
+        leaker.intern_struct(&item, true);
+        let referrer = leaker.result().finish().unwrap();
+        let mut found: Vec<String> = referrer.iter().map(s).collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "& 'a Rel < T >",
+                "dyn Fn (& Rel < T >) -> & u8",
+                "fn (& Rel < T >) -> & u8"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_holder_inside_a_signature_is_the_entry_for_the_one_around() {
+        // The inner one is the holder of `Rel<T>`, and it adds `'a` to the inputs of the outer one,
+        // which is the entry in turn.
+        assert_eq!(
+            leaked(parse_quote! {
+                trait Tr<'a, T: 'a> {
+                    fn f(&self, x: Box<dyn Fn(&Box<dyn Fn(&Rel<T>) -> &u8>) -> &u8>);
+                }
+            }),
+            [e(
+                "dyn Fn (& Box < dyn Fn (& Rel < T >) -> & u8 >) -> & u8",
+                "< 'a , T : 'a >"
+            )]
+        );
+        // The lifetimes in a signature inside an input are not those of the one around: the outer one
+        // has only `&`, and the inner one names its own lifetime, so `Rel<T>` is leaked alone.
+        assert_eq!(
+            leaked(parse_quote! {
+                trait Tr<'a, T: 'a> {
+                    fn f(&self, x: Box<dyn Fn(&Box<dyn for<'x> Fn(&'x Rel<T>) -> &'x u8>) -> &u8>);
+                }
+            }),
+            [e("Rel < T >", "< 'a , T : 'a >")]
+        );
+        // The output of a signature is not in its inputs: an inner one there is its own holder.
+        assert_eq!(
+            leaked(parse_quote! {
+                trait Tr<'a, T: 'a> {
+                    fn f(&self, x: Box<dyn Fn(&u8) -> Box<dyn Fn(&Rel<T>) -> &u8>>);
+                }
+            }),
+            [e("dyn Fn (& Rel < T >) -> & u8", "< 'a , T : 'a >")]
+        );
+        // A method with a receiver that is a reference: its own elision is not at stake.
+        assert_eq!(
+            leaked(parse_quote! {
+                trait Tr<'a, T: 'a> {
+                    fn f(&self, x: &Rel<T>, y: Box<dyn Fn(&Rel<T>) -> &u8>) -> &u8;
+                }
+            }),
+            [
+                e("Rel < T >", "< 'a , T : 'a >"),
+                e("dyn Fn (& Rel < T >) -> & u8", "< 'a , T : 'a >")
+            ]
+        );
+    }
+
+    /// The `Leaker` docs, Elided lifetimes: "a function pointer or `Fn(..)` inside an input has its
+    /// own signature". The same holds for one in the OUTPUT of the sugar: its elided lifetimes are its
+    /// own and do not count for the outer one, whose only lifetime is that of `&`. So `Rel<T>` is
+    /// leaked alone, whatever the signature in the output elides. Audit mutant
+    /// `e_output_barefn_not_own` (a bare function pointer in the output counts for the outer
+    /// signature, and the whole object is leaked).
+    #[test]
+    fn an_inner_signature_in_the_output_has_its_own_elision() {
+        for output in [
+            // A function pointer, an `Fn(..)`, and one with a binder in the inputs.
+            "fn(&u8) -> &u8",
+            "Box<dyn Fn(&u8) -> &u8>",
+            "for<'y> fn(&'y u8) -> &'y u8",
+            // In a tuple with another type, and behind a reference.
+            "(u8, fn(&u8) -> &u8)",
+            "Box<fn(&u8) -> &u8>",
+        ] {
+            let tr: ItemTrait = parse_str(&format!(
+                "trait Tr<'a, T: 'a> {{ fn f(&self, x: Box<dyn Fn(&Rel<T>) -> {}>); }}",
+                output
+            ))
+            .unwrap();
+            assert_eq!(
+                leaked(tr),
+                [e("Rel < T >", "< 'a , T : 'a >")],
+                "{}",
+                output
+            );
+        }
+        // An inner signature in the inputs that names its lifetimes is its own too: `Rel<T>` is leaked
+        // alone. Without the names, the inner one is the holder of `Rel<T>`, and adds `'a` to the
+        // inputs of the one around, which is the entry in turn (see the test above).
+        assert_eq!(
+            leaked(parse_quote! {
+                trait Tr<'a, T: 'a> {
+                    fn f(&self, x: Box<dyn Fn(for<'y> fn(&'y Rel<T>) -> &'y u8, &u8) -> &u8>);
+                }
+            }),
+            [e("Rel < T >", "< 'a , T : 'a >")]
+        );
+        assert_eq!(
+            leaked(parse_quote! {
+                trait Tr<'a, T: 'a> {
+                    fn f(&self, x: Box<dyn Fn(fn(&Rel<T>) -> &u8, &u8) -> &u8>);
+                }
+            }),
+            [e(
+                "dyn Fn (fn (& Rel < T >) -> & u8 , & u8) -> & u8",
+                "< 'a , T : 'a >"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_type_with_no_lifetime_is_leaked_alone() {
+        // No lifetime among the generics of the entry, so the copy has only the elided one.
+        for item in [
+            parse_quote! { trait Tr<T> { fn f(&self, x: Box<dyn Fn(&Rel<T>) -> &u8>); } },
+            parse_quote! { trait Tr<'a, T> { fn f(&self, x: Box<dyn Fn(&Rel<T>) -> &u8>); } },
+            parse_quote! { trait Tr<T> { fn f(&self, x: fn(&Rel<T>) -> &u8); } },
+            parse_quote! { trait Tr { fn f(&self, x: Box<dyn Fn(&Rel) -> &u8>); } },
+            parse_quote! { trait Tr<T> { fn g(x: &Rel<T>) -> &u8; } },
+            parse_quote! { trait Tr<T, F: Fn(&Rel<T>) -> &u8> {} },
+        ] {
+            let item: ItemTrait = item;
+            let found = leaked(item.clone());
+            assert_eq!(found.len(), 1, "{}: {:?}", s(&item), found);
+            assert!(found[0].0.starts_with("Rel"), "{}: {:?}", s(&item), found);
+            assert!(!found[0].1.contains("'a"), "{}: {:?}", s(&item), found);
+        }
+    }
+
+    #[test]
+    fn the_elision_is_not_at_stake_if_the_output_does_not_rely_on_it() {
+        let alone = [e("Rel < T >", "< 'a , T : 'a >")];
+        for item in [
+            // The output has no lifetime, or names it.
+            parse_quote! { trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn Fn(&Rel<T>) -> u8>); } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn Fn(&Rel<T>) -> Rel<T>>); } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn Fn(&Rel<T>) -> &'a u8>); } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn f(&self, x: fn(&Rel<T>) -> &'static u8); } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn f(&self, x: fn(&Rel<T>)); } },
+            // The output of an inner signature is its own.
+            parse_quote! {
+                trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn Fn(&Rel<T>) -> Box<dyn Fn(&u8) -> &u8>>); }
+            },
+            // The output names the lifetime of the input.
+            parse_quote! {
+                trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn for<'x> Fn(&'x Rel<T>) -> &'x u8>); }
+            },
+            parse_quote! { trait Tr<'a, T: 'a> { fn f(&self, x: for<'x> fn(&'x Rel<T>) -> &'x u8); } },
+            // The entry is in the output.
+            parse_quote! { trait Tr<'a, T: 'a> { fn f(&self, x: Box<dyn Fn(&u8) -> &Rel<T>>); } },
+            // More than one lifetime in the inputs, or none: there is no elision to keep.
+            parse_quote! { trait Tr<'a, T: 'a> { fn f(&self, x: fn(&u8, &Rel<T>) -> u8); } },
+            // A method takes the lifetime of the output from the receiver that is a reference.
+            parse_quote! { trait Tr<'a, T: 'a> { fn g(&self, x: &Rel<T>) -> &u8; } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn g(&mut self, x: &Rel<T>) -> &u8; } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn g(&'a self, x: &Rel<T>) -> &u8; } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn g(self: &Self, x: &Rel<T>) -> &u8; } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn g(self: &mut Self, x: &Rel<T>) -> &u8; } },
+            parse_quote! {
+                trait Tr<'a, T: 'a> { fn g(self: ::core::pin::Pin<&mut Self>, x: &Rel<T>) -> &u8; }
+            },
+            // Or it has no elided lifetime.
+            parse_quote! { trait Tr<'a, T: 'a> { fn g(x: &Rel<T>) -> &'a u8; } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn g(x: &Rel<T>) -> u8; } },
+        ] {
+            let item: ItemTrait = item;
+            assert_eq!(leaked(item.clone()), alone, "{}", s(&item));
+        }
+        // The only lifetime in the inputs is the one the entry has: nothing is added.
+        assert_eq!(
+            leaked(parse_quote! { trait Tr<'a, T: 'a> { fn g(x: &'a Rel<T>) -> &u8; } }),
+            [e("& 'a Rel < T >", "< 'a , T : 'a >")]
+        );
+        assert_eq!(
+            leaked(parse_quote! { trait Tr<'a, T: 'a> { fn g(x: Rel2<'a>, y: &'a u8) -> &u8; } }),
+            [e("Rel2 < 'a >", "< 'a >")]
+        );
+    }
+
+    #[test]
+    fn a_method_with_no_lifetime_from_its_receiver_is_an_error() {
+        // Nothing holds a method, so the type that adds the lifetime is an error.
+        for item in [
+            parse_quote! { trait Tr<'a, T: 'a> { fn g(x: &Rel<T>) -> &u8; } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn g(x: &Rel<T>, y: u8) -> &u8; } },
+            // A receiver that is not a reference.
+            parse_quote! { trait Tr<'a, T: 'a>: Sized { fn g(self, x: &Rel<T>) -> &u8; } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn g(self: Box<Self>, x: &Rel<T>) -> &u8; } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn g(self: ::std::rc::Rc<Self>, x: &Rel<T>) -> &u8; } },
+            // The type is not at the top of the input.
+            parse_quote! { trait Tr<'a, T: 'a> { fn g(x: &(u8, Rel<T>)) -> &u8; } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn g(x: &[Rel<T>]) -> &u8; } },
+        ] {
+            let item: ItemTrait = item;
+            let (message, note) = error(item.clone());
+            assert_eq!(message, "use absolute path: 'Rel<T>'", "{}", s(&item));
+            assert_eq!(note, NOTE, "{}", s(&item));
+            assert_eq!(help(&item), HELP_METHOD, "{}", s(&item));
+        }
+        // Another output with an elided lifetime.
+        for (item, output) in [
+            (
+                parse_quote! { trait Tr<'a, T: 'a> { fn g(x: &Rel<T>) -> ::p::Ref<'_, u8>; } },
+                "::p::Ref<'_, u8>",
+            ),
+            (
+                parse_quote! { trait Tr<'a, T: 'a> { fn g(x: &Rel<T>) -> Box<dyn Iterator<Item = &u8>>; } },
+                "Box<dyn Iterator<Item = &u8>>",
+            ),
+        ] {
+            let item: ItemTrait = item;
+            let (_, note) = error(item.clone());
+            assert_eq!(
+                note,
+                NOTE.replace("`&u8`", &format!("`{}`", output)),
+                "{}",
+                s(&item)
+            );
+        }
+        // The message, as rustc shows it: the lifetime that is elided is the cause.
+        let err = analyze(&parse_quote! { trait Tr<'a, T: 'a> { fn g(x: &Rel<T>) -> &u8; } })
+            .err()
+            .unwrap();
+        assert_eq!(
+            to_syn_error(&err).to_string(),
+            format!(
+                "use absolute path: 'Rel<T>'\n\n  = note: {}\n  = note: it cannot be leaked as a \
+                 whole because of `&u8`\n  = help: {}\n",
+                NOTE, HELP_METHOD
+            )
+        );
+        // A function item of a module has no receiver either.
+        let item: ItemMod =
+            parse_quote! { mod m { pub fn g<'a, T: 'a>(x: &Rel<T>) -> &u8 { loop {} } } };
+        let mut module_leaker = leaker();
+        module_leaker.intern_mod(&item);
+        assert_eq!(
+            module_leaker.result().errors()[0]
+                .notes
+                .first()
+                .map(|(_, n)| n.as_str()),
+            Some(NOTE)
+        );
+        // And an impl.
+        let item: ItemImpl = parse_quote! {
+            impl<'a, T: 'a> ::p::Tr<'a, T> for u8 { fn g(x: &Rel<T>) -> &u8 { loop {} } }
+        };
+        let mut impl_leaker = leaker();
+        impl_leaker.intern_impl(&item, true);
+        assert_eq!(
+            impl_leaker.result().errors()[0]
+                .notes
+                .first()
+                .map(|(_, n)| n.as_str()),
+            Some(NOTE)
+        );
+    }
+
+    #[test]
+    fn a_bound_with_the_elision_is_an_error() {
+        // Nothing holds a bound: it is not a type.
+        for item in [
+            parse_quote! { trait Tr<'a, T: 'a, F: Fn(&Rel<T>) -> &u8> {} },
+            parse_quote! { trait Tr<'a, T: 'a, F> where F: Fn(&Rel<T>) -> &u8 {} },
+            parse_quote! { trait Tr<'a, T: 'a>: Fn(&Rel<T>) -> &u8 {} },
+            parse_quote! { trait Tr<'a, T: 'a> { type A: Fn(&Rel<T>) -> &u8; } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn f<F: Fn(&Rel<T>) -> &u8>(&self, f: F); } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn f<F>(&self, f: F) where F: Fn(&Rel<T>) -> &u8; } },
+            parse_quote! { trait Tr<'a, T: 'a> { fn f<F>(&self, f: F) where Box<F>: Fn(&Rel<T>) -> &u8; } },
+        ] {
+            let item: ItemTrait = item;
+            let (message, note) = error(item.clone());
+            assert_eq!(message, "use absolute path: 'Rel<T>'", "{}", s(&item));
+            assert_eq!(note, NOTE, "{}", s(&item));
+            assert_eq!(help(&item), HELP, "{}", s(&item));
+        }
+        // No lifetime in the entry, or no elision: fine.
+        assert_eq!(
+            leaked(parse_quote! { trait Tr<T, F: Fn(&Rel<T>) -> &u8> {} }),
+            [e("Rel < T >", "< T >")]
+        );
+        assert_eq!(
+            leaked(parse_quote! { trait Tr<'a, T: 'a, F: for<'x> Fn(&'x Rel<T>) -> &'x u8> {} }),
+            [e("Rel < T >", "< 'a , T : 'a >")]
+        );
+    }
+
+    #[test]
+    fn a_holder_that_cannot_be_leaked_is_an_error() {
+        // `impl Trait` cannot be leaked at all.
+        let (message, note) = error(parse_quote! {
+            trait Tr<'a, T: 'a> { fn f(&self, x: impl Fn(&Rel<T>) -> &u8); }
+        });
+        assert_eq!(message, "use absolute path: 'Rel<T>'");
+        assert_eq!(note, NOTE_OWNED);
+        // A trait object under an elided reference takes its lifetime from it, so it cannot be leaked
+        // alone, and the reference has no lifetime to name.
+        let err = analyze(&parse_quote! {
+            trait Tr<'a, T: 'a> { fn f(&self, x: &dyn Fn(&Rel<T>) -> &u8); }
+        })
+        .err()
+        .unwrap();
+        assert_eq!(
+            to_syn_error(&err).to_string(),
+            format!(
+                "use absolute path: 'Rel<T>'\n\n  = note: {}\n  = note: it cannot be leaked as a \
+                 whole because of `dyn Fn (&Rel<T>) -> &u8`\n  = note: the lifetime of the trait \
+                 object defaults to that of the enclosing reference or path\n  = help: {}\n",
+                NOTE_OWNED, HELP
+            )
+        );
+        // Naming it is the fix.
+        assert_eq!(
+            leaked(parse_quote! {
+                trait Tr<'a, T: 'a> { fn f(&self, x: &'a dyn Fn(&Rel<T>) -> &u8); }
+            }),
+            [e("& 'a dyn Fn (& Rel < T >) -> & u8", "< 'a , T : 'a >")]
+        );
+    }
+
+    #[test]
+    fn an_elided_lifetime_of_the_holder_is_its_own() {
+        // `&u8` is a lifetime of the function pointer (rustc makes it one of its binder), so it does
+        // not stop it from being leaked as a whole: the impl of the Repeater writes it as it is.
+        assert_eq!(
+            leaked(parse_quote! {
+                trait Tr { fn f(&self, f: for<'x> fn(Rel<'x>, &u8) -> &'x u8); }
+            }),
+            [e("for < 'x > fn (Rel < 'x > , & u8) -> & 'x u8", "")]
+        );
+        assert_eq!(
+            leaked(parse_quote! {
+                trait Tr { fn f(&self, f: Box<dyn for<'x> Fn(Rel<'x>, &u8) -> &'x u8>); }
+            }),
+            [e("dyn for < 'x > Fn (Rel < 'x > , & u8) -> & 'x u8", "")]
+        );
+        assert_eq!(
+            leaked(parse_quote! {
+                trait Tr { fn f(&self, f: for<'x> fn(Rel<'x>, ::p::Ref<'_, u8>) -> &'x u8); }
+            }),
+            [e(
+                "for < 'x > fn (Rel < 'x > , :: p :: Ref < '_ , u8 >) -> & 'x u8",
+                ""
+            )]
+        );
+        // The types inside it are not the holder: a lifetime that is elided in them is not theirs, so
+        // they cannot be leaked on their own.
+        let (message, note) = error(parse_quote! {
+            trait Tr { fn f(&self, f: Box<dyn Fn(Rel<&Rel2>) -> u8>); }
+        });
+        assert_eq!(message, "use absolute path: 'Rel<&Rel2>'");
+        assert_eq!(note, "it cannot be leaked as a whole because of `&Rel2`");
+        // The holder is not an entry for that reason alone: with no cause in it, it is copied.
+        let referrer = analyze(&parse_quote! {
+            trait Tr { fn f(&self, f: Box<dyn Fn(&u8) -> &u8>, g: for<'x> fn(&'x u8, &u8)); }
+        })
+        .unwrap();
+        assert_eq!(referrer.iter().count(), 0);
+    }
+
+    #[test]
+    fn the_copy_is_rewritten_to_the_holder() {
+        let item: ItemTrait = parse_quote! {
+            trait Tr<'a, T: 'a> {
+                fn f(&self, a: Box<dyn Fn(&Rel<T>) -> &u8>, b: fn(&Rel<T>) -> &u8, c: &Rel<T>);
+            }
+        };
+        let mut leaker = leaker();
+        let context = leaker.intern_trait(&item, true);
+        let referrer = leaker.result().finish().unwrap();
+        // The entries are ordered by context and then by their tokens.
+        assert_eq!(
+            referrer.iter().map(s).collect::<Vec<_>>(),
+            [
+                "Rel < T >",
+                "dyn Fn (& Rel < T >) -> & u8",
+                "fn (& Rel < T >) -> & u8"
+            ]
+        );
+        let mut copy = item.clone();
+        syn::visit_mut::VisitMut::visit_item_trait_mut(
+            &mut referrer.visitor(context, |_, ix| parse_quote!(P<#ix>)),
+            &mut copy,
+        );
+        let expected: ItemTrait = parse_quote! {
+            trait Tr<'a, T: 'a> {
+                fn f(&self, a: Box<P<1usize>>, b: P<2usize>, c: &P<0usize>);
+            }
+        };
+        assert_eq!(s(&copy), s(&expected));
+    }
+
+    #[test]
+    fn a_view_walks_the_signature_like_the_leaker() {
+        use syn::visit::Visit;
+        // `visit_signature` of the view analyzes the arguments of a method with its elision.
+        let sig: Signature = parse_quote!(fn g(x: &Rel<T>) -> &u8);
+        let generics: Generics = parse_quote!(<'a, T: 'a>);
+        let mut leaker = leaker();
+        leaker.enter_generics(&generics, |view| view.visit_signature(&sig));
+        assert_eq!(
+            leaker.result().errors()[0]
+                .notes
+                .first()
+                .map(|(_, n)| n.as_str()),
+            Some(NOTE)
+        );
+        // And the sugar and the function pointers in a type visited alone.
+        let ty: Type = parse_quote!(Box<dyn Fn(&Rel<T>) -> &u8>);
+        let mut leaker = self::leaker();
+        leaker.enter_generics(&generics, |view| view.visit_type(&ty));
+        assert_eq!(
+            leaker
+                .result()
+                .finish()
+                .unwrap()
+                .iter()
+                .map(s)
+                .collect::<Vec<_>>(),
+            ["dyn Fn (& Rel < T >) -> & u8"]
+        );
+    }
+
+    #[test]
+    fn an_elided_output_may_take_the_lifetime_of_the_binder() {
+        // The output has the only lifetime of the inputs, `'x` of the binder, which `Rel<'x>` leaked
+        // alone would have only in a projection: rustc rejects the copy (E0581, E0582) as it does for
+        // an output that names `'x` (see the tests of the binder), so the holder is the entry.
+        assert_eq!(
+            leaked(parse_quote! { trait Tr { fn f(&self, f: for<'x> fn(Rel<'x>) -> &u8); } }),
+            [e("for < 'x > fn (Rel < 'x >) -> & u8", "")]
+        );
+        assert_eq!(
+            leaked(
+                parse_quote! { trait Tr { fn f(&self, f: Box<dyn for<'x> Fn(Rel<'x>) -> &u8>); } }
+            ),
+            [e("dyn for < 'x > Fn (Rel < 'x >) -> & u8", "")]
+        );
+        // An input that keeps `'x` anchors it, whatever the output is.
+        assert_eq!(
+            leaked(
+                parse_quote! { trait Tr { fn f(&self, f: for<'x> fn(&'x u8, Rel<'x>) -> &u8); } }
+            ),
+            [e("Rel < 'x >", "< 'x >")]
+        );
+        // A bound or a where predicate cannot be leaked, so it is an error.
+        for item in [
+            parse_quote! { trait Tr { fn f<F: for<'x> Fn(Rel<'x>) -> &u8>(&self, f: F); } },
+            parse_quote! { trait Tr { fn f<F>(&self, f: F) where F: for<'x> Fn(Rel<'x>) -> &u8; } },
+            parse_quote! { trait Tr { fn f<F>(&self, f: F) where for<'x> F: Fn(Rel<'x>) -> &u8; } },
+        ] {
+            let item: ItemTrait = item;
+            let (message, _) = error(item.clone());
+            assert_eq!(message, "use absolute path: 'Rel<'x>'", "{}", s(&item));
+        }
+        // The lifetime of the trait is not declared by the binder, so it is not at stake.
+        assert_eq!(
+            leaked(parse_quote! { trait Tr<'a> { fn f(&self, f: fn(Rel<'a>) -> &u8); } }),
+            [e("Rel < 'a >", "< 'a >")]
+        );
+        assert_eq!(
+            leaked(parse_quote! { trait Tr { fn f(&self, f: for<'x> fn(Rel<'x>, u8) -> u8); } }),
+            [e("Rel < 'x >", "< 'x >")]
+        );
+    }
 }

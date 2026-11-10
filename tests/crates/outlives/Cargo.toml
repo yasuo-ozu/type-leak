@@ -3,7 +3,7 @@ name = "type-leak-test-outlives"
 version = "0.0.0"
 edition = "2018"
 publish = false
-description = "Crate with outlives bounds in the Repeater's implementations and copies, for tests/outlives.rs"
+description = "Crate with outlives bounds in the Repeater's implementations and copies, for tests/diagnostic.rs (`outlives`)"
 
 [lib]
 path = "lib.rs"
@@ -12,12 +12,13 @@ path = "lib.rs"
 type-leak-test-macro = { path = "../macro" }
 
 # The negative controls of lib.rs: each feature enables items which do not compile (the error is
-# in the comment above them), and tests/outlives.rs builds each one and checks the error.
+# in the comment above them), and tests/diagnostic.rs (`outlives`) builds each one and checks the
+# error.
 [features]
 negative-unbounded = []
 negative-unbounded-self = []
 negative-unbounded-around = []
 negative-alone = []
 
-# Built on its own by tests/outlives.rs.
+# Built on its own by tests/diagnostic.rs (`outlives`).
 [workspace]

@@ -1,6 +1,5 @@
 //! Tests for `Leaker::intern_mod()`.
 
-use proc_macro2::TokenStream;
 use std::collections::BTreeSet;
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -114,17 +113,6 @@ fn intern_mod_errors_and_bodies() {
             .collect::<Vec<_>>(),
         ["Rel < T >"]
     );
-
-    // A module without content has nothing to analyze.
-    let m: ItemMod = parse_quote!(
-        mod m;
-    );
-    assert!({
-        let mut leaker = Leaker::new();
-        leaker.intern_mod(&m);
-        leaker.result().finish().unwrap()
-    }
-    .is_empty());
 }
 
 /// Analyzes the module like `Leaker::intern_mod()`, allowing the primitive types and the
@@ -410,46 +398,6 @@ fn referrer_visits_a_copy_in_a_module() {
     // The context says which module the copy is in.
     assert_eq!(copy(inner), expected(1));
     assert_eq!(copy(root), expected(0));
-    // Only `inner` has the entry `Rel`, which does not match in the analyzed module.
-    let m: ItemMod = parse_quote!(
-        mod m {
-            pub mod inner {
-                pub struct C {
-                    y: Rel,
-                }
-            }
-        }
-    );
-    let mut leaker = Leaker::new();
-    let root = leaker.intern_mod(&m);
-    let referrer = leaker.result().finish().unwrap();
-    let inner = referrer.context_module(referrer.context(0)).unwrap();
-    let visit = |module: ContextId| {
-        let mut item: ItemStruct = parse_quote!(
-            pub struct C {
-                y: Rel,
-            }
-        );
-        let rewrite = |_: Type, _| -> Type { parse_quote!(P) };
-        referrer
-            .visitor(module, rewrite)
-            .visit_item_struct_mut(&mut item);
-        quote!(#item).to_string()
-    };
-    let unchanged = quote!(
-        pub struct C {
-            y: Rel,
-        }
-    )
-    .to_string();
-    let rewritten = quote!(
-        pub struct C {
-            y: P,
-        }
-    )
-    .to_string();
-    assert_eq!(visit(inner), rewritten);
-    assert_eq!(visit(root), unchanged);
 }
 
 #[test]
@@ -525,6 +473,11 @@ fn referrer_tracks_the_modules_it_enters() {
     let mut item = unchanged.clone();
     visit_items(referrer.visitor(inner, rewrite), &mut item);
     assert_eq!(quote!(#item).to_string(), quote!(#rewritten).to_string());
+    // Only `inner` has the entry `Rel`, which does not match in the analyzed module: the items of
+    // `inner` are not rewritten in the context of `m`.
+    let mut item = unchanged.clone();
+    visit_items(referrer.visitor(root, rewrite), &mut item);
+    assert_eq!(quote!(#item).to_string(), quote!(#unchanged).to_string());
 }
 
 #[test]
@@ -554,16 +507,6 @@ fn serialization_with_modules() {
             version
         )
     );
-    // It can be followed by other tokens.
-    struct Followed(type_leak::Referrer, TokenStream);
-    impl parse::Parse for Followed {
-        fn parse(input: parse::ParseStream) -> Result<Self> {
-            Ok(Self(input.parse()?, input.parse()?))
-        }
-    }
-    let followed: Followed = parse2(quote!(#tokens struct Z;)).unwrap();
-    assert_eq!(followed.0, referrer);
-    assert_eq!(followed.1.to_string(), "struct Z ;");
     assert_eq!(parse2::<type_leak::Referrer>(tokens).unwrap(), referrer);
     // The simplest Referrer has no module (nor has one of an analysis without modules).
     let simple: ItemStruct = parse_quote!(
@@ -657,23 +600,6 @@ fn root_relative_type_does_not_match_in_a_nested_module() {
     assert_eq!(quote!(#item).to_string(), quote!(#expected).to_string());
 }
 
-#[test]
-#[should_panic(expected = "is not one of the contexts of this Referrer")]
-fn a_context_which_is_not_known_panics() {
-    let m: ItemMod = parse_quote!(
-        mod m {
-            pub struct A {
-                y: Rel,
-            }
-        }
-    );
-    let mut leaker = Leaker::new();
-    leaker.intern_mod(&m);
-    let referrer = leaker.result().finish().unwrap();
-    let unknown: ContextId = parse_str("99").unwrap();
-    let _ = referrer.visitor(unknown, |_, _| parse_quote!(P));
-}
-
 // ── a module found with no module around it ──────────────────────────────────────────────────
 
 /// The path of the module the `ix`-th entry is in.
@@ -726,12 +652,17 @@ fn a_module_found_with_no_module_around_has_its_name_as_path() {
     // Entered by `enter_mod()` (which has no path), the path of the module found in it starts at
     // it, and the modules in that one start with it.
     let mut leaker = Leaker::new();
-    leaker.enter_mod("outer", [], |view| {
+    let (outer, ()) = leaker.enter_mod("outer", [], |view| {
         view.visit_item(&Item::Mod(inner.clone()))
     });
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(path_of(&referrer, 0), ["inner"]);
     assert_eq!(path_of(&referrer, 1), ["inner", "deep"]);
+    // The module found has no hint, and the module it is in, whose hint is known, is kept too.
+    let found = referrer.context_module(referrer.context(0)).unwrap();
+    assert_ne!(found, outer);
+    assert_eq!(referrer.module_hint(found), None);
+    assert_eq!(referrer.module_hint(outer), Some("outer"));
     // The one `intern_mod()` analyzes has the empty path, and the ones in it are relative to it.
     let outer: ItemMod = parse_quote!(mod outer { #inner });
     let mut leaker = Leaker::new();

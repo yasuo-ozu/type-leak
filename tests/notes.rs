@@ -4,9 +4,9 @@
 //! `ErrorItem::help`); the notes say why the item cannot be leaked, and the help says what to write
 //! so that it can. Their words are the only advice that a user of a macro gets, and a test that
 //! only looks for a part of one (`contains("E0106")`) does not see a wrong name, a missing advice,
-//! or a sentence that is cut. The tests of `tests/errors.rs` pin the help that suggests an absolute
-//! path, and those of `tests/bound_cycles.rs`, `tests/binder_output.rs` and
-//! `tests/elided_output.rs` the notes and helps of their rules. Here are those of the rules for
+//! or a sentence that is cut. The table of the help in `tests/error_items.rs` pins the help that
+//! suggests an absolute path, and those of `tests/bound_cycles.rs` and `tests/binder_output.rs`
+//! (also its module `elided`) the notes and helps of their rules. Here are those of the rules for
 //! `Self`:
 //!
 //! - an associated item of `Self` in an entry, where `Self` is a type (E0220), in an impl of a

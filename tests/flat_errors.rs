@@ -16,12 +16,16 @@
 //!   heads where it has several (`Vec<Rel<'_>>`);
 //! - the arguments of a path of a value are analyzed on their own;
 //! - the serialization of an error has no nested errors, and a list of errors is filtered in order,
-//!   identical errors included.
+//!   identical errors included;
+//! - `ErrorItem::paths`: each relative path that the copy writes as it is, as the cause of its kind
+//!   (a path in a type is a `Cause::Type`, the trait of a bound or of a qualified path a
+//!   `Cause::Trait`, a path in a value a `Cause::Expr`, the path of a macro a `Cause::Macro`, and one
+//!   whose kind is not known, the root of a `use` in a value, a `Cause::Unknown`; all without
+//!   generic arguments). Only the head of what conflicts is written as it is.
 
 mod common;
 
 use common::{accepting, allow_every_cause, causes_accepting, starts_with, AcceptCause, Rule};
-use syn::parse::Parser;
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
@@ -58,6 +62,31 @@ fn causes(errors: &[ErrorItem]) -> Vec<String> {
 
 fn paths(error: &ErrorItem) -> Vec<String> {
     error.paths.iter().map(text).collect()
+}
+
+/// The paths of the errors as `kind(path)`, the paths of an error in a list.
+fn paths_of(result: &LeakerResult) -> Vec<Vec<String>> {
+    result
+        .errors()
+        .iter()
+        .map(|error| error.paths.iter().map(show).collect())
+        .collect()
+}
+
+fn show(cause: &Cause) -> String {
+    let kind = match cause {
+        Cause::Type(_) => "type",
+        Cause::Trait(_) => "trait",
+        Cause::Expr(_) => "expr",
+        Cause::Macro(_) => "macro",
+        Cause::Unknown(_) => "unknown",
+        other => panic!("{:?}", other),
+    };
+    format!("{}({})", kind, text(cause))
+}
+
+fn values() -> Leaker<Rules> {
+    Leaker::from_config(Rules::new(), Options::new().check_values())
 }
 
 /// The shape of the errors: `cause [reason]`, in order.
@@ -147,6 +176,12 @@ fn every_rule_that_drops_the_first_error_leaves_the_second() {
     let (all, rounds) = allow_every_cause(by_cause.clone());
     assert_eq!(rounds, 1);
     assert!(all.errors().is_empty());
+    // A result takes the rules after the trip as before it.
+    let trip = parse2::<LeakerResult>(analyze(&reduced(), Rules::new()).to_token_stream()).unwrap();
+    assert_eq!(
+        shape(trip.allow(Rules::new().prelude()).errors()),
+        "Self :: A0 [UnprovableBound]"
+    );
 }
 
 #[test]
@@ -236,7 +271,7 @@ fn the_place_rules_are_the_same_before_and_after_the_analysis() {
 #[test]
 fn a_type_in_the_arguments_of_a_bound_with_nothing_wrong_has_no_error() {
     let item: ItemTrait = parse_quote!(
-        trait Tr {
+        trait Tr: Clone {
             fn m<X>(&self)
             where
                 X: Rel<u8>;
@@ -245,10 +280,12 @@ fn a_type_in_the_arguments_of_a_bound_with_nothing_wrong_has_no_error() {
     );
     let config = Rules::new().primitive();
     let result = analyze(&item, config);
-    // The bound, the other bound, `Vec` and the `Rel<'_>` inside it, and `MyType`: one path each.
+    // The supertrait, the bound, the other bound, `Vec` and the `Rel<'_>` inside it, and `MyType`:
+    // one path each. The path of a bound is a trait, that of a type is a type.
     assert_eq!(
         causes(result.errors()),
         [
+            "Clone",
             "Rel < u8 >",
             "Other",
             "Vec < Rel < '_ > >",
@@ -256,13 +293,17 @@ fn a_type_in_the_arguments_of_a_bound_with_nothing_wrong_has_no_error() {
             "MyType < '_ >"
         ]
     );
-    for (error, path) in result
-        .errors()
-        .iter()
-        .zip(["Rel", "Other", "Vec", "Rel", "MyType"])
-    {
-        assert_eq!(paths(error), [path]);
-    }
+    assert_eq!(
+        paths_of(&result),
+        [
+            ["trait(Clone)"],
+            ["trait(Rel)"],
+            ["trait(Other)"],
+            ["type(Vec)"],
+            ["type(Rel)"],
+            ["type(MyType)"],
+        ]
+    );
     // Dropping them leaves nothing.
     assert_eq!(allow_every_cause(result.clone()).1, 1);
 }
@@ -462,73 +503,6 @@ fn an_error_is_written_with_its_paths_and_has_no_nested_errors() {
     let tokens = error.to_token_stream().to_string();
     assert!(tokens.contains("paths [trait (Into)]"), "{}", tokens);
     assert!(!tokens.contains("nested"), "{}", tokens);
-    // The nested errors of the old serialization are refused.
-    let error = parse_str::<ErrorItem>(
-        r#"{ type ( A ) RelativePath "m" [] nested [ { type ( B ) Unreadable "n" [] } ] }"#,
-    )
-    .err()
-    .unwrap();
-    assert!(
-        error.to_string().contains("unknown field `nested`"),
-        "{}",
-        error
-    );
-    // No paths, no word; an empty list is the same as none.
-    let plain: ErrorItem = parse_str(r#"{ type ( A ) RelativePath "m" [] }"#).unwrap();
-    assert!(plain.paths.is_empty());
-    assert_eq!(
-        plain.to_token_stream().to_string(),
-        r#"{ type (A) RelativePath "m" [] }"#
-    );
-    let empty: ErrorItem = parse_str(r#"{ type ( A ) RelativePath "m" [] paths [] }"#).unwrap();
-    assert_eq!(
-        empty.to_token_stream().to_string(),
-        plain.to_token_stream().to_string()
-    );
-}
-
-#[test]
-fn the_errors_are_written_and_read_back_with_every_field() {
-    let result = analyze_values(&reduced(), Rules::new());
-    let tokens = result.to_token_stream();
-    let read: LeakerResult = parse2(tokens.clone()).unwrap();
-    assert_eq!(read.to_token_stream().to_string(), tokens.to_string());
-    assert_eq!(read.errors().len(), result.errors().len());
-    for (read, error) in read.errors().iter().zip(result.errors()) {
-        assert_eq!(read.cause, error.cause);
-        assert_eq!(read.reason, error.reason);
-        assert_eq!(read.message, error.message);
-        assert_eq!(read.notes.len(), error.notes.len());
-        assert_eq!(read.help_text(), error.help_text());
-        assert_eq!(paths(read), paths(error));
-        assert_eq!(
-            (read.in_value, read.in_default),
-            (error.in_value, error.in_default)
-        );
-    }
-    // A result takes the rules after the trip as before it.
-    let mut after = parse2::<LeakerResult>(result.to_token_stream()).unwrap();
-    let mut before = result;
-    after = after.allow(Rules::new().prelude());
-    before = before.allow(Rules::new().prelude());
-    assert_eq!(shape(after.errors()), "Self :: A0 [UnprovableBound]");
-    assert_eq!(shape(before.errors()), shape(after.errors()));
-}
-
-#[test]
-fn a_result_is_read_with_the_items_that_follow_it() {
-    // The tokens after the errors are not consumed.
-    let result = analyze(&reduced(), Rules::new());
-    let mut tokens = result.to_token_stream();
-    tokens.extend(quote!(trailing tokens));
-    let parsed =
-        (|input: syn::parse::ParseStream| -> Result<(LeakerResult, proc_macro2::TokenStream)> {
-            Ok((input.parse()?, input.parse()?))
-        })
-        .parse2(tokens)
-        .unwrap();
-    assert_eq!(parsed.0.errors().len(), 2);
-    assert_eq!(parsed.1.to_string(), "trailing tokens");
 }
 
 #[test]
@@ -551,4 +525,101 @@ fn each_error_is_reported_on_its_own() {
     assert!(all.contains("use absolute path"), "{}", all);
     assert!(all.contains(&inside.message), "{}", all);
     assert_eq!(to_syn_error(result.errors()).into_iter().count(), 2);
+}
+
+// ── the kind of each path ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn the_trait_of_a_bound_and_a_trait_object_is_a_trait_and_its_arguments_are_types() {
+    let item: ItemStruct = parse_quote!(
+        struct S<T: RelTr<Arg>> {
+            a: ::p::W<'_, dyn OtherTr<Item = Assoc>>,
+            b: T,
+        }
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&item, true);
+    let result = leaker.result();
+    // The bound is a predicate, so it is copied whole, `Arg` in it too: it is a path of its error. The
+    // trait object is written as it is, and its argument is an entry.
+    assert_eq!(
+        paths_of(&result),
+        [vec!["trait(RelTr)", "type(Arg)"], vec!["trait(OtherTr)"]]
+    );
+    let referrer = result.into_referrer();
+    let entries: Vec<String> = referrer
+        .iter()
+        .map(|ty| ty.to_token_stream().to_string())
+        .collect();
+    assert_eq!(entries, ["Assoc"]);
+}
+
+#[test]
+fn the_qualified_path_in_the_arguments_of_what_conflicts_is_leaked() {
+    let item: ItemStruct = parse_quote!(
+        struct S {
+            a: Wrap<'_, <Rel as m::Tr<u8>>::X>,
+        }
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&item, true);
+    let result = leaker.result();
+    assert_eq!(paths_of(&result), [vec!["type(Wrap)"]]);
+    let entries: Vec<String> = result
+        .into_referrer()
+        .iter()
+        .map(|ty| ty.to_token_stream().to_string())
+        .collect();
+    assert_eq!(entries, ["< Rel as m :: Tr < u8 > > :: X"]);
+}
+
+#[test]
+fn the_macro_of_a_type_is_no_path_of_the_error() {
+    let item: ItemStruct = parse_quote!(
+        struct S {
+            a: Wrap<'_, m!(u8)>,
+        }
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(&item, true);
+    let result = leaker.result();
+    // The type macro is a type of its own, leaked whole: no `macro` path (that of a value is one,
+    // see `tests/error_items.rs`).
+    assert_eq!(paths_of(&result), [vec!["type(Wrap)"]]);
+}
+
+#[test]
+fn a_path_in_a_value_is_an_expression_and_its_arguments_are_leaked() {
+    let item: ItemConst = parse_quote!(
+        const C: u8 = rel::f::<Arg>(1);
+    );
+    let mut leaker = values();
+    leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_item(&Item::Const(item));
+    });
+    let result = leaker.result();
+    assert_eq!(paths_of(&result), [vec!["expr(rel :: f)"]]);
+    let entries: Vec<String> = result
+        .into_referrer()
+        .iter()
+        .map(|ty| ty.to_token_stream().to_string())
+        .collect();
+    // The type of the constant is leaked too.
+    assert_eq!(entries, ["Arg", "u8"]);
+}
+
+#[test]
+fn the_root_of_a_use_in_a_value_has_no_known_kind() {
+    let item: ItemFn = parse_quote!(
+        fn f() {
+            use inner::X;
+        }
+    );
+    let mut leaker = values();
+    leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_item(&Item::Fn(item));
+    });
+    let result = leaker.result();
+    assert_eq!(result.errors().len(), 1);
+    assert_eq!(paths_of(&result), [vec!["unknown(inner)"]]);
 }

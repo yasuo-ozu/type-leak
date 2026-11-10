@@ -363,193 +363,109 @@ fn allowed(kind: &'static str, entries: usize, positions: usize, checked: usize)
     }
 }
 
+/// The errors of the report `text` of `__tl_errors_<id>!()`: the reason, the kind of the cause and
+/// its tokens without whitespace.
+fn errors(text: &str) -> Vec<(String, String, String)> {
+    text.split('\u{1d}')
+        .map(|error| {
+            let fields: Vec<&str> = error.split('\u{1f}').collect();
+            (
+                fields[3].to_string(),
+                fields[4].to_string(),
+                squash(fields[1]),
+            )
+        })
+        .collect()
+}
+
+fn error(reason: &str, cause: &str, tokens: &str) -> (String, String, String) {
+    (reason.to_string(), cause.to_string(), tokens.to_string())
+}
+
 /// A struct, an enum, a union, an impl, a module and a trait are each analyzed by the matching
 /// `intern_*` and accepted (or rejected, for a `Self` that is denied) as the Leaker's crate says, and
 /// the Referrer's crate checked every copied type against the original: `checked` is the number of
 /// type positions of the item which have a witness, or in a module name what it declares and are
-/// compared with the original written for the Referrer's crate.
+/// compared with the original written for the Referrer's crate. The fixtures of some findings
+/// (F51, F56, F68 to F70) only report, and are rows too.
 #[test]
 fn every_item_kind_is_leaked_across_crates() {
     use type_leak_test_leaker::*;
     let table = [
         // structs: `Self`, a denied `Self` that is not named, a denied `Self` that is named, and an
         // optional entry (a type of another crate)
-        (
-            9001,
-            reported(9001, __tl_report_9001!()),
-            ok("struct", 5, 5, 5),
-        ),
-        (
-            9002,
-            reported(9002, __tl_report_9002!()),
-            ok("struct", 3, 3, 3),
-        ),
+        (9001, __tl_report_9001!(), ok("struct", 5, 5, 5)),
+        (9002, __tl_report_9002!(), ok("struct", 3, 3, 3)),
         (
             9003,
-            reported(9003, __tl_report_9003!()),
+            __tl_report_9003!(),
             rejected("struct", "useabsolutepath:'Wrap<Self>'"),
         ),
-        (
-            9004,
-            reported(9004, __tl_report_9004!()),
-            ok("struct", 3, 3, 3),
-        ),
+        (9004, __tl_report_9004!(), ok("struct", 3, 3, 3)),
         // a where clause on a type that is not a parameter, in the context of its entry
-        (
-            9005,
-            reported(9005, __tl_report_9005!()),
-            ok("struct", 2, 1, 1),
-        ),
+        (9005, __tl_report_9005!(), ok("struct", 2, 1, 1)),
         // enums
-        (
-            9011,
-            reported(9011, __tl_report_9011!()),
-            ok("enum", 4, 5, 5),
-        ),
-        (
-            9012,
-            reported(9012, __tl_report_9012!()),
-            ok("enum", 2, 2, 2),
-        ),
+        (9011, __tl_report_9011!(), ok("enum", 4, 5, 5)),
+        (9012, __tl_report_9012!(), ok("enum", 2, 2, 2)),
         // unions
-        (
-            9021,
-            reported(9021, __tl_report_9021!()),
-            ok("union", 3, 3, 3),
-        ),
-        (
-            9022,
-            reported(9022, __tl_report_9022!()),
-            ok("union", 2, 2, 2),
-        ),
+        (9021, __tl_report_9021!(), ok("union", 3, 3, 3)),
+        (9022, __tl_report_9022!(), ok("union", 2, 2, 2)),
         // impls: inherent, of a trait (also with a relative argument), and with `Self` denied
-        (
-            9031,
-            reported(9031, __tl_report_9031!()),
-            ok("impl-inherent", 6, 6, 6),
-        ),
-        (
-            9032,
-            reported(9032, __tl_report_9032!()),
-            ok("impl-trait", 2, 5, 5),
-        ),
-        (
-            9033,
-            reported(9033, __tl_report_9033!()),
-            ok("impl-inherent", 2, 2, 2),
-        ),
-        (
-            9034,
-            reported(9034, __tl_report_9034!()),
-            ok("impl-trait", 2, 5, 5),
-        ),
+        (9031, __tl_report_9031!(), ok("impl-inherent", 6, 6, 6)),
+        (9032, __tl_report_9032!(), ok("impl-trait", 2, 5, 5)),
+        (9033, __tl_report_9033!(), ok("impl-inherent", 2, 2, 2)),
+        (9034, __tl_report_9034!(), ok("impl-trait", 2, 5, 5)),
         // a module (its own `Local` is declared in it, so the types that name it are compared with the
         // original written for the Referrer's crate)
-        (
-            9041,
-            reported(9041, __tl_report_9041!()),
-            ok("mod", 4, 6, 6),
-        ),
+        (9041, __tl_report_9041!(), ok("mod", 4, 6, 6)),
         // a bare identifier that is a const, in a module, beside a name that the module declares: an
         // absolute `use` declares it, so it is copied as written; one imported from outside is
         // rejected
-        (
-            9101,
-            reported(9101, __tl_report_9101!()),
-            ok("mod", 2, 4, 4),
-        ),
+        (9101, __tl_report_9101!(), ok("mod", 2, 4, 4)),
         (
             9102,
-            reported(9102, __tl_report_9102!()),
+            __tl_report_9102!(),
             rejected(
                 "mod",
                 "`LEN4`maybeaconst,andthetypethatholdsitcannotbeleakedasawhole",
             ),
         ),
         // traits: `Self` denied and not named, denied and named, and an unsized implementor
-        (
-            9051,
-            reported(9051, __tl_report_9051!()),
-            ok("trait", 3, 3, 3),
-        ),
+        (9051, __tl_report_9051!(), ok("trait", 3, 3, 3)),
         (
             9052,
-            reported(9052, __tl_report_9052!()),
+            __tl_report_9052!(),
             rejected("trait", "useabsolutepath:'Wrap<Self>'"),
         ),
-        (
-            9053,
-            reported(9053, __tl_report_9053!()),
-            ok("trait", 4, 6, 6),
-        ),
+        (9053, __tl_report_9053!(), ok("trait", 4, 6, 6)),
         // a bare identifier that is a const (`LEN`): the path that holds it is an entry as a whole,
         // also with `Self` in it; with `Self` denied the Leaker rejects it, as the const would not
         // be a type; a bare identifier that is a type is leaked alone where the path cannot be
-        (
-            9081,
-            reported(9081, __tl_report_9081!()),
-            ok("struct", 2, 2, 2),
-        ),
+        (9081, __tl_report_9081!(), ok("struct", 2, 2, 2)),
         (
             9082,
-            reported(9082, __tl_report_9082!()),
+            __tl_report_9082!(),
             rejected(
                 "struct",
                 "`LEN`maybeaconst,andthetypethatholdsitcannotbeleakedasawhole",
             ),
         ),
-        (
-            9083,
-            reported(9083, __tl_report_9083!()),
-            ok("trait", 3, 3, 3),
-        ),
-        (
-            9084,
-            reported(9084, __tl_report_9084!()),
-            ok("trait", 1, 5, 1),
-        ),
+        (9083, __tl_report_9083!(), ok("trait", 3, 3, 3)),
+        (9084, __tl_report_9084!(), ok("trait", 1, 5, 1)),
         // items nested in a module, which name their own `Self`
-        (
-            9061,
-            reported(9061, __tl_report_9061!()),
-            ok("struct", 5, 5, 5),
-        ),
-        (
-            9062,
-            reported(9062, __tl_report_9062!()),
-            ok("enum", 4, 4, 4),
-        ),
-        (
-            9063,
-            reported(9063, __tl_report_9063!()),
-            ok("trait", 5, 5, 5),
-        ),
+        (9061, __tl_report_9061!(), ok("struct", 5, 5, 5)),
+        (9062, __tl_report_9062!(), ok("enum", 4, 4, 4)),
+        (9063, __tl_report_9063!(), ok("trait", 5, 5, 5)),
         // structs, an enum and a union nested in a module, with a bound that names their own
         // `Self` (`T: AsRef<Self>`), also in the where clause: the entry that does not name `Self`
         // is for any type, and the copy passes its own; one that names it too is rejected
-        (
-            9111,
-            reported(9111, __tl_report_9111!()),
-            ok("struct", 3, 3, 3),
-        ),
-        (
-            9112,
-            reported(9112, __tl_report_9112!()),
-            ok("struct", 1, 2, 2),
-        ),
-        (
-            9113,
-            reported(9113, __tl_report_9113!()),
-            ok("enum", 2, 1, 1),
-        ),
-        (
-            9114,
-            reported(9114, __tl_report_9114!()),
-            ok("union", 2, 2, 2),
-        ),
+        (9111, __tl_report_9111!(), ok("struct", 3, 3, 3)),
+        (9112, __tl_report_9112!(), ok("struct", 1, 2, 2)),
+        (9113, __tl_report_9113!(), ok("enum", 2, 1, 1)),
+        (9114, __tl_report_9114!(), ok("union", 2, 2, 2)),
         (
             9115,
-            reported(9115, __tl_report_9115!()),
+            __tl_report_9115!(),
             rejected(
                 "struct",
                 "`Wrap<Self>`hasagenericwhoseboundmentions`Self`,whichcannotbeleaked",
@@ -557,222 +473,66 @@ fn every_item_kind_is_leaked_across_crates() {
         ),
         // the entry is in a bound of another generic, in a where predicate, keeps a lifetime, and
         // is for a `Self` that is outlived or bounded by `Sized`
-        (
-            9116,
-            reported(9116, __tl_report_9116!()),
-            ok("struct", 1, 2, 2),
-        ),
-        (
-            9117,
-            reported(9117, __tl_report_9117!()),
-            ok("struct", 1, 1, 1),
-        ),
-        (
-            9118,
-            reported(9118, __tl_report_9118!()),
-            ok("struct", 1, 2, 2),
-        ),
-        (
-            9119,
-            reported(9119, __tl_report_9119!()),
-            ok("struct", 1, 2, 2),
-        ),
-        (
-            9120,
-            reported(9120, __tl_report_9120!()),
-            ok("struct", 1, 2, 2),
-        ),
+        (9116, __tl_report_9116!(), ok("struct", 1, 2, 2)),
+        (9117, __tl_report_9117!(), ok("struct", 1, 1, 1)),
+        (9118, __tl_report_9118!(), ok("struct", 1, 2, 2)),
+        (9119, __tl_report_9119!(), ok("struct", 1, 2, 2)),
+        (9120, __tl_report_9120!(), ok("struct", 1, 2, 2)),
         // the entry for any type is the last field of a struct or a field of an enum, with a bound
         // that needs no `Sized` or that does: the Repeater's impl is `?Sized` in the first case
         // only
-        (
-            9125,
-            reported(9125, __tl_report_9125!()),
-            ok("struct", 2, 2, 2),
-        ),
-        (
-            9126,
-            reported(9126, __tl_report_9126!()),
-            ok("enum", 1, 2, 2),
-        ),
-        (
-            9127,
-            reported(9127, __tl_report_9127!()),
-            ok("struct", 1, 2, 2),
-        ),
-        (
-            9128,
-            reported(9128, __tl_report_9128!()),
-            ok("struct", 1, 2, 2),
-        ),
+        (9125, __tl_report_9125!(), ok("struct", 2, 2, 2)),
+        (9126, __tl_report_9126!(), ok("enum", 1, 2, 2)),
+        (9127, __tl_report_9127!(), ok("struct", 1, 2, 2)),
+        (9128, __tl_report_9128!(), ok("struct", 1, 2, 2)),
         // an absolute type that names their own `Self` is no entry (the copy has it as written);
         // the relative types beside it are
-        (
-            9121,
-            reported(9121, __tl_report_9121!()),
-            ok("struct", 2, 3, 3),
-        ),
-        (
-            9122,
-            reported(9122, __tl_report_9122!()),
-            ok("struct", 1, 2, 2),
-        ),
-        (
-            9123,
-            reported(9123, __tl_report_9123!()),
-            ok("struct", 2, 3, 3),
-        ),
-        (
-            9124,
-            reported(9124, __tl_report_9124!()),
-            ok("enum", 2, 3, 3),
-        ),
+        (9121, __tl_report_9121!(), ok("struct", 2, 3, 3)),
+        (9122, __tl_report_9122!(), ok("struct", 1, 2, 2)),
+        (9123, __tl_report_9123!(), ok("struct", 2, 3, 3)),
+        (9124, __tl_report_9124!(), ok("enum", 2, 3, 3)),
         // the defaults of a nested trait whose generic has a bound that names its `Self`
-        (
-            9131,
-            reported(9131, __tl_report_9131!()),
-            ok("trait", 1, 3, 3),
-        ),
-        (
-            9132,
-            reported(9132, __tl_report_9132!()),
-            ok("trait", 2, 5, 5),
-        ),
+        (9131, __tl_report_9131!(), ok("trait", 1, 3, 3)),
+        (9132, __tl_report_9132!(), ok("trait", 2, 5, 5)),
         // the same, not declared again: the use site that leaves the default out completes it (F65)
-        (
-            9224,
-            reported(9224, __tl_report_9224!()),
-            ok("trait", 1, 3, 3),
-        ),
+        (9224, __tl_report_9224!(), ok("trait", 1, 3, 3)),
         // a braced const parameter in a type that is no entry, at a use site (F66)
-        (
-            9225,
-            reported(9225, __tl_report_9225!()),
-            ok("struct", 1, 3, 3),
-        ),
-        (
-            9226,
-            reported(9226, __tl_report_9226!()),
-            ok("struct", 1, 3, 3),
-        ),
-        (
-            9227,
-            reported(9227, __tl_report_9227!()),
-            ok("struct", 1, 4, 4),
-        ),
+        (9225, __tl_report_9225!(), ok("struct", 1, 3, 3)),
+        (9226, __tl_report_9226!(), ok("struct", 1, 3, 3)),
+        (9227, __tl_report_9227!(), ok("struct", 1, 4, 4)),
         // the default of a parameter of a struct and an enum nested in a module, when a bound of
         // an earlier parameter names their `Self`: the entry has no `Self`
-        (
-            9151,
-            reported(9151, __tl_report_9151!()),
-            ok("struct", 1, 3, 3),
-        ),
-        (
-            9152,
-            reported(9152, __tl_report_9152!()),
-            ok("enum", 1, 3, 3),
-        ),
-        (
-            9153,
-            reported(9153, __tl_report_9153!()),
-            ok("struct", 2, 4, 4),
-        ),
-        (
-            9154,
-            reported(9154, __tl_report_9154!()),
-            ok("struct", 2, 5, 5),
-        ),
+        (9151, __tl_report_9151!(), ok("struct", 1, 3, 3)),
+        (9152, __tl_report_9152!(), ok("enum", 1, 3, 3)),
+        (9153, __tl_report_9153!(), ok("struct", 2, 4, 4)),
+        (9154, __tl_report_9154!(), ok("struct", 2, 5, 5)),
         // a type that names their `Self` too (`nested_self_entries`): for any type, with `Self` in
         // the type; and the control without a bound that names `Self`
-        (
-            9161,
-            reported(9161, __tl_report_9161!()),
-            ok("struct", 2, 2, 2),
-        ),
-        (
-            9162,
-            reported(9162, __tl_report_9162!()),
-            ok("enum", 2, 3, 3),
-        ),
-        (
-            9163,
-            reported(9163, __tl_report_9163!()),
-            ok("struct", 2, 3, 3),
-        ),
-        (
-            9164,
-            reported(9164, __tl_report_9164!()),
-            ok("struct", 2, 2, 2),
-        ),
+        (9161, __tl_report_9161!(), ok("struct", 2, 2, 2)),
+        (9162, __tl_report_9162!(), ok("enum", 2, 3, 3)),
+        (9163, __tl_report_9163!(), ok("struct", 2, 3, 3)),
+        (9164, __tl_report_9164!(), ok("struct", 2, 2, 2)),
         // a bound of a generic that names it, next to a bound that fixes an associated type, is left
         // out of the Repeater's impls of the entries: through an alias that hides the projection
         // (also for a strict Referrer, which replaces the alias too), written, through a struct, a
         // supertrait or an associated type of a trait, in a struct, for the bound that names the
         // leaked type itself, and for the impl of F19; a rigid `Item` keeps the bound; a bound of
         // another generic is not left out, and the Leaker rejects it
-        (
-            9171,
-            reported(9171, __tl_report_9171!()),
-            ok("trait", 2, 0, 0),
-        ),
-        (
-            9172,
-            reported(9172, __tl_report_9172!()),
-            ok("trait", 2, 0, 0),
-        ),
-        (
-            9173,
-            reported(9173, __tl_report_9173!()),
-            ok("trait", 1, 0, 0),
-        ),
-        (
-            9174,
-            reported(9174, __tl_report_9174!()),
-            ok("trait", 2, 0, 0),
-        ),
-        (
-            9175,
-            reported(9175, __tl_report_9175!()),
-            ok("trait", 2, 0, 0),
-        ),
-        (
-            9176,
-            reported(9176, __tl_report_9176!()),
-            ok("trait", 1, 0, 0),
-        ),
-        (
-            9177,
-            reported(9177, __tl_report_9177!()),
-            ok("struct", 3, 1, 1),
-        ),
-        (
-            9178,
-            reported(9178, __tl_report_9178!()),
-            ok("struct", 1, 1, 1),
-        ),
-        (
-            9179,
-            reported(9179, __tl_report_9179!()),
-            ok("impl-inherent", 1, 2, 2),
-        ),
-        (
-            9180,
-            reported(9180, __tl_report_9180!()),
-            ok("trait", 1, 0, 0),
-        ),
-        (
-            9182,
-            reported(9182, __tl_report_9182!()),
-            ok("impl-inherent", 3, 2, 2),
-        ),
-        (
-            9183,
-            reported(9183, __tl_report_9183!()),
-            ok("struct", 3, 3, 3),
-        ),
+        (9171, __tl_report_9171!(), ok("trait", 2, 0, 0)),
+        (9172, __tl_report_9172!(), ok("trait", 2, 0, 0)),
+        (9173, __tl_report_9173!(), ok("trait", 1, 0, 0)),
+        (9174, __tl_report_9174!(), ok("trait", 2, 0, 0)),
+        (9175, __tl_report_9175!(), ok("trait", 2, 0, 0)),
+        (9176, __tl_report_9176!(), ok("trait", 1, 0, 0)),
+        (9177, __tl_report_9177!(), ok("struct", 3, 1, 1)),
+        (9178, __tl_report_9178!(), ok("struct", 1, 1, 1)),
+        (9179, __tl_report_9179!(), ok("impl-inherent", 1, 2, 2)),
+        (9180, __tl_report_9180!(), ok("trait", 1, 0, 0)),
+        (9182, __tl_report_9182!(), ok("impl-inherent", 3, 2, 2)),
+        (9183, __tl_report_9183!(), ok("struct", 3, 3, 3)),
         (
             9181,
-            reported(9181, __tl_report_9181!()),
+            __tl_report_9181!(),
             rejected(
                 "trait",
                 "`Wrap<U>`isinaboundorwherepredicate,andaboundofitsgenericsnames`T::Item`",
@@ -780,91 +540,78 @@ fn every_item_kind_is_leaked_across_crates() {
         ),
         // `Self: 'x` brings `Self` into the context of an entry that does not name it: the bound
         // that is left out stays out, for a trait and for an impl (F47)
-        (
-            9200,
-            reported(9200, __tl_report_9200!()),
-            ok("trait", 2, 0, 0),
-        ),
-        (
-            9201,
-            reported(9201, __tl_report_9201!()),
-            ok("impl-trait", 3, 2, 2),
-        ),
+        (9200, __tl_report_9200!(), ok("trait", 2, 0, 0)),
+        (9201, __tl_report_9201!(), ok("impl-trait", 3, 2, 2)),
         // the types in the values of an item (`check_values`): the consts and the default
         // methods of a trait, and the const, the static and the function of a module
-        (
-            9141,
-            reported(9141, __tl_report_9141!()),
-            ok("trait", 5, 6, 6),
-        ),
-        (
-            9142,
-            reported(9142, __tl_report_9142!()),
-            ok("mod", 2, 3, 3),
-        ),
+        (9141, __tl_report_9141!(), ok("trait", 5, 6, 6)),
+        (9142, __tl_report_9142!(), ok("mod", 2, 3, 3)),
         // scopes that share names (the findings of a downstream crate): methods that declare the
         // same generic with different bounds, a generic named like a relative type, a path ending
         // with the name of a generic, a type and a const parameter of one name; a bound that names
         // a parameter or a lifetime the entry does not use; a where clause; a cyclic bound; a
         // `for<'b>` binder
-        (
-            9071,
-            reported(9071, __tl_report_9071!()),
-            ok("trait", 7, 13, 13),
-        ),
-        (
-            9072,
-            reported(9072, __tl_report_9072!()),
-            ok("struct", 1, 2, 2),
-        ),
-        (
-            9073,
-            reported(9073, __tl_report_9073!()),
-            ok("trait", 1, 2, 2),
-        ),
-        (
-            9074,
-            reported(9074, __tl_report_9074!()),
-            ok("struct", 1, 2, 2),
-        ),
-        (
-            9075,
-            reported(9075, __tl_report_9075!()),
-            ok("struct", 1, 1, 1),
-        ),
+        (9071, __tl_report_9071!(), ok("trait", 7, 13, 13)),
+        (9072, __tl_report_9072!(), ok("struct", 1, 2, 2)),
+        (9073, __tl_report_9073!(), ok("trait", 1, 2, 2)),
+        (9074, __tl_report_9074!(), ok("struct", 1, 2, 2)),
+        (9075, __tl_report_9075!(), ok("struct", 1, 1, 1)),
         (
             9076,
-            reported(9076, __tl_report_9076!()),
+            __tl_report_9076!(),
             rejected(
                 "struct",
                 "`Wrap<T>`isinaboundorwherepredicate,andaboundofitsgenericsnamesaleakedtype",
             ),
         ),
-        (
-            9077,
-            reported(9077, __tl_report_9077!()),
-            ok("struct", 1, 1, 1),
-        ),
+        (9077, __tl_report_9077!(), ok("struct", 1, 1, 1)),
         // paths that end with the name of a generic (`self::U`, `crate::U`), in a struct and in a
         // trait, and a module that declares `X` next to a struct whose generic is `X`
+        (9091, __tl_report_9091!(), ok("struct", 4, 5, 5)),
+        (9092, __tl_report_9092!(), ok("trait", 5, 8, 8)),
+        (9093, __tl_report_9093!(), ok("mod", 3, 5, 5)),
+        // F51: a nested struct whose bound names a leaked type that names `Self`, analyzed with
+        // `nested_self_entries`, is rejected, as `intern_struct()` rejects it. The Referrer's macro
+        // expands to nothing (`kinds`, like the other rejected items).
         (
-            9091,
-            reported(9091, __tl_report_9091!()),
-            ok("struct", 4, 5, 5),
+            9206,
+            __tl_report_9206!(),
+            rejected(
+                "struct",
+                "`Wrap<Self>`isinaboundorwherepredicate,andaboundofitsgenericsnamesaleakedtype",
+            ),
+        ),
+        // F56: a macro and a struct literal that are relative paths, in a discriminant and in the
+        // default of a const parameter, are rejected (the Leaker did not report them, and the copy
+        // could not resolve `rel_two!` and `RelPoint`).
+        (
+            9217,
+            __tl_report_9217!(),
+            rejected("enum", "useabsolutepath:'rel_two!'"),
         ),
         (
-            9092,
-            reported(9092, __tl_report_9092!()),
-            ok("trait", 5, 8, 8),
+            9218,
+            __tl_report_9218!(),
+            rejected("struct", "useabsolutepath:'RelPoint'"),
         ),
-        (
-            9093,
-            reported(9093, __tl_report_9093!()),
-            ok("mod", 3, 5, 5),
-        ),
+        // F68: the self type of an impl is a type of the Leaker's crate by an absolute path, a bound
+        // of a generic names an optional type and another `Self`, and a predicate is on an entry
+        // that uses the generic: the self type is no entry, and every copy writes it as it is.
+        (9230, __tl_report_9230!(), ok("impl-inherent", 1, 2, 2)),
+        // F69: the copy is used at an instantiation that gives the type parameter a type with a
+        // lifetime, where it is in the inputs of a function pointer or `Fn(..)` whose output has an
+        // elided lifetime: a struct, the arguments of a trait's method, and the default of a
+        // parameter that `Referrer::complete_args()` completes. The elided one is named.
+        (9231, __tl_report_9231!(), ok("struct", 1, 4, 4)),
+        (9232, __tl_report_9232!(), ok("trait", 1, 3, 2)),
+        (9233, __tl_report_9233!(), ok("struct", 1, 4, 4)),
+        // F70: the same where an entry is in the inputs (`Vec<T>` of `::std`, an optional entry that
+        // a strict Referrer replaces by a path that names the lifetime of the site).
+        (9234, __tl_report_9234!(), ok("struct", 2, 2, 2)),
+        (9235, __tl_report_9235!(), ok("struct", 2, 2, 2)),
     ];
-    for (id, got, expected) in table {
-        assert_eq!(got, expected, "item {}", id);
+    for (id, text, expected) in table {
+        assert_eq!(reported(id, text), expected, "item {}: {}", id, text);
     }
 }
 
@@ -1621,65 +1368,29 @@ fn accepted_conflicts_are_copied_as_written() {
     let table = [
         // (a) `Held<'b>` leaves the lifetime of the method unconstrained (E0195 in the host's
         // impl): copied as written. Nothing is leaked (`u8` is allowed). Both types are compared.
-        (
-            9184,
-            reported(9184, __tl_report_9184!()),
-            allowed("trait", 0, 2, 2),
-        ),
+        (9184, __tl_report_9184!(), allowed("trait", 0, 2, 2)),
         // (b) the parameter of `f` has an elided lifetime in the generics of a path, and `g`'s
         // `dyn PlainTr` is an entry (the path around it is allowed by the Leaker). Only `g`'s
         // parameter is compared (`f`'s has an elided lifetime, which a witness cannot name).
-        (
-            9185,
-            reported(9185, __tl_report_9185!()),
-            allowed("trait", 1, 2, 1),
-        ),
+        (9185, __tl_report_9185!(), allowed("trait", 1, 2, 1)),
         // (c) `Wrap<Self>`, where `Self` has no meaning, is copied as written; `Rel` is the entry.
-        (
-            9186,
-            reported(9186, __tl_report_9186!()),
-            allowed("struct", 1, 2, 2),
-        ),
+        (9186, __tl_report_9186!(), allowed("struct", 1, 2, 2)),
         // (d) the same trait object in `f` and `g`: in `f` it is in the part that is copied as
         // written (the path with the elided lifetime), in `g` it is the entry. The Visitor finds
         // the entry by its tokens and its context, and must leave the part alone.
-        (
-            9187,
-            reported(9187, __tl_report_9187!()),
-            allowed("trait", 1, 2, 1),
-        ),
+        (9187, __tl_report_9187!(), allowed("trait", 1, 2, 1)),
         // (e) `Wrap<Y>` is an entry in `a1`, and in the bound of `ai` it is in the part that is
         // copied as written (`impl Into<Wrap<Y>>`): the same tokens and context.
-        (
-            9188,
-            reported(9188, __tl_report_9188!()),
-            allowed("trait", 2, 2, 1),
-        ),
+        (9188, __tl_report_9188!(), allowed("trait", 2, 2, 1)),
         // (f) the same as (d), with a relative type beside the trait object in the path of `f`: it
         // is an entry, and replaced, whereas the Referrer's crate does not name it.
-        (
-            9189,
-            reported(9189, __tl_report_9189!()),
-            allowed("trait", 2, 2, 1),
-        ),
+        (9189, __tl_report_9189!(), allowed("trait", 2, 2, 1)),
     ];
-    for (id, got, expected) in table {
-        assert_eq!(got, expected, "{}", id);
+    for (id, text, expected) in table {
+        assert_eq!(reported(id, text), expected, "item {}: {}", id, text);
     }
 
     // The errors that were allowed.
-    let errors = |text: &'static str| -> Vec<(String, String, String)> {
-        text.split('\u{1d}')
-            .map(|error| {
-                let fields: Vec<&str> = error.split('\u{1f}').collect();
-                let tokens = fields[1].split_whitespace().collect::<String>();
-                (fields[3].to_string(), fields[4].to_string(), tokens)
-            })
-            .collect()
-    };
-    let error = |reason: &str, cause: &str, tokens: &str| {
-        (reason.to_string(), cause.to_string(), tokens.to_string())
-    };
     assert_eq!(
         errors(__tl_errors_9184!()),
         [error("UnconstrainedLifetime", "Type", "Held<'b>")]
@@ -1748,36 +1459,15 @@ fn errors_the_referrers_macro_allows_are_copied_as_written() {
     // one of `ExplicitCauses` that has an elided lifetime (`Held<'_>`), which a witness cannot
     // name.
     let table = [
-        (
-            9190,
-            reported(9190, __tl_report_9190!()),
-            allowed("trait", 2, 4, 4),
-        ),
-        (
-            9191,
-            reported(9191, __tl_report_9191!()),
-            allowed("trait", 2, 4, 4),
-        ),
-        (
-            9192,
-            reported(9192, __tl_report_9192!()),
-            allowed("trait", 2, 4, 3),
-        ),
+        (9190, __tl_report_9190!(), allowed("trait", 2, 4, 4)),
+        (9191, __tl_report_9191!(), allowed("trait", 2, 4, 4)),
+        (9192, __tl_report_9192!(), allowed("trait", 2, 4, 3)),
     ];
-    for (id, got, expected) in table {
-        assert_eq!(got, expected, "{}", id);
+    for (id, text, expected) in table {
+        assert_eq!(reported(id, text), expected, "item {}: {}", id, text);
     }
 
     // The errors of the Leaker's analysis: every one has the reason `RelativePath`.
-    let errors = |text: &'static str| -> Vec<(String, String, String)> {
-        text.split('\u{1d}')
-            .map(|error| {
-                let fields: Vec<&str> = error.split('\u{1f}').collect();
-                let tokens = fields[1].split_whitespace().collect::<String>();
-                (fields[3].to_string(), fields[4].to_string(), tokens)
-            })
-            .collect()
-    };
     let relative = |cause: &str, tokens: &[&str]| -> Vec<(String, String, String)> {
         tokens
             .iter()
@@ -1828,8 +1518,9 @@ fn errors_the_referrers_macro_allows_are_copied_as_written() {
 /// has no relative type in it. The trusting Referrer leaves it as written, and the strict one
 /// replaces the whole type: the text of the two copies of the same items differs in that. The type
 /// with a relative type in it is one required entry, which both replace. Only the strict one can be
-/// compiled where the crate is not a dependency (this crate has none on it): `tests/trusting.rs`
-/// builds both in a crate that has none, and runs the tests of the strict one.
+/// compiled where the crate is not a dependency (this crate has none on it): the module `trusting`
+/// of `tests/diagnostic.rs` builds both in a crate that has none, and runs the tests of the strict
+/// one.
 #[test]
 fn a_strict_referrer_replaces_the_optional_entries_and_a_trusting_one_does_not() {
     use type_leak_test_referrer::{STRICT_COPY, TRUSTING_COPY};
@@ -2011,8 +1702,8 @@ fn the_scope_api_writes_the_impls_that_are_needed() {
         type_leak_test_leaker::__scope_report_7007!(),
         "7007|entries=2 required=1 impls=1 types=4"
     );
-    // (`tests/trusting.rs` applies 7005 as a strict Referrer, in a crate that has no dependency on
-    // the crate of the optional entry.)
+    // (The module `trusting` of `tests/diagnostic.rs` applies 7005 as a strict Referrer, in a crate
+    // that has no dependency on the crate of the optional entry.)
 }
 
 /// The errors of the Leaker (`Vec<ErrorItem>`) through a macro: one item for each offending path,
@@ -2124,44 +1815,16 @@ fn parts_that_name_self_are_left_as_written() {
     use type_leak_test_referrer::accepted as r;
 
     let table = [
-        (
-            9195,
-            reported(9195, __tl_report_9195!()),
-            allowed("trait", 1, 2, 2),
-        ),
-        (
-            9196,
-            reported(9196, __tl_report_9196!()),
-            allowed("trait", 1, 1, 1),
-        ),
-        (
-            9197,
-            reported(9197, __tl_report_9197!()),
-            allowed("impl-inherent", 1, 2, 2),
-        ),
-        (
-            9198,
-            reported(9198, __tl_report_9198!()),
-            allowed("struct", 1, 2, 2),
-        ),
+        (9195, __tl_report_9195!(), allowed("trait", 1, 2, 2)),
+        (9196, __tl_report_9196!(), allowed("trait", 1, 1, 1)),
+        (9197, __tl_report_9197!(), allowed("impl-inherent", 1, 2, 2)),
+        (9198, __tl_report_9198!(), allowed("struct", 1, 2, 2)),
     ];
-    for (id, got, expected) in table {
-        assert_eq!(got, expected, "{}", id);
+    for (id, text, expected) in table {
+        assert_eq!(reported(id, text), expected, "item {}: {}", id, text);
     }
 
     // The errors that were allowed: the reason, the kind of the cause and its tokens.
-    let errors = |text: &'static str| -> Vec<(String, String, String)> {
-        text.split('\u{1d}')
-            .map(|error| {
-                let fields: Vec<&str> = error.split('\u{1f}').collect();
-                let tokens = fields[1].split_whitespace().collect::<String>();
-                (fields[3].to_string(), fields[4].to_string(), tokens)
-            })
-            .collect()
-    };
-    let error = |reason: &str, cause: &str, tokens: &str| {
-        (reason.to_string(), cause.to_string(), tokens.to_string())
-    };
     let obj = "::type_leak_test_leaker::kinds::ObjOf<'a,T,dynSharedTr>";
     assert_eq!(
         errors(__tl_errors_9195!()),
@@ -2318,21 +1981,6 @@ fn a_rule_after_the_analysis_drops_the_error_for_the_path_of_a_value_and_leaks_i
     assert_eq!(Copy.size(), core::mem::size_of::<*const l::Rel>());
 }
 
-/// F51: a nested struct whose bound names a leaked type that names `Self`, analyzed with
-/// `nested_self_entries`, is rejected, as `intern_struct()` rejects it. The Referrer's macro
-/// expands to nothing (`kinds`, like the other rejected items).
-#[test]
-fn a_nested_item_with_a_bound_that_names_a_leaked_type_is_rejected() {
-    use type_leak_test_leaker::*;
-    assert_eq!(
-        reported(9206, __tl_report_9206!()),
-        rejected(
-            "struct",
-            "`Wrap<Self>`isinaboundorwherepredicate,andaboundofitsgenericsnamesaleakedtype"
-        )
-    );
-}
-
 /// F52: the optional entries in the where predicate of a trait stay as written beside an unrelated
 /// error whose part copies `Self::A0` as written, as they do without the error. The strict Referrer
 /// (`accepted`) has no entry for them, and the host implements the trait.
@@ -2344,13 +1992,10 @@ fn optional_entries_in_a_predicate_stay_as_written_beside_an_unrelated_error() {
         allowed("trait", 0, 0, 0)
     );
     // The one error is the unrelated one, accepted by its cause: the bound copied as written.
-    let errors: Vec<Vec<&str>> = __tl_errors_9207!()
-        .split('\u{1d}')
-        .map(|error| error.split('\u{1f}').collect())
-        .collect();
-    assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0][3..5], ["RelativePath", "Trait"]);
-    assert_eq!(squash(errors[0][1]), "GenTr<Self::A0>");
+    assert_eq!(
+        errors(__tl_errors_9207!()),
+        [error("RelativePath", "Trait", "GenTr<Self::A0>")]
+    );
 }
 
 /// Issue 3 of `tests/downstream_findings.rs`: `None`, `Some`, `Ok` and `Err` in the values of a
@@ -2491,24 +2136,6 @@ fn the_bindings_in_a_discriminant_and_in_the_default_of_a_const_parameter_are_lo
     assert_eq!(copy.0, original.0);
 }
 
-/// F56: a macro and a struct literal that are relative paths, in a discriminant and in the default
-/// of a const parameter, are rejected. The Leaker did not report them, and the copy in the
-/// Referrer's crate could not resolve `rel_two!` and `RelPoint`. The Referrer's macro expands to
-/// nothing (`kinds`, like the other rejected items).
-#[test]
-fn a_relative_macro_and_struct_literal_in_a_discriminant_or_a_default_are_rejected() {
-    use type_leak_test_leaker::*;
-
-    assert_eq!(
-        reported(9217, __tl_report_9217!()),
-        rejected("enum", "useabsolutepath:'rel_two!'")
-    );
-    assert_eq!(
-        reported(9218, __tl_report_9218!()),
-        rejected("struct", "useabsolutepath:'RelPoint'")
-    );
-}
-
 /// Flat recovery: a type whose own path conflicts is written as it is, and the types in it are
 /// leaked as usual. `Two<T, Leaf>` is a conflict (`DeniedSelfInBounds` in a trait that denies
 /// `Self`, `SelfInImplSelfType` in an impl whose bound names it), copied with `Two` as written, and
@@ -2529,8 +2156,9 @@ fn a_type_whose_own_path_conflicts_is_written_as_it_is_and_the_types_in_it_are_l
         allowed("impl-inherent", 1, 2, 2)
     );
     let reasons = |text: &'static str| -> Vec<String> {
-        text.split('\u{1d}')
-            .map(|error| error.split('\u{1f}').nth(3).unwrap().to_string())
+        errors(text)
+            .into_iter()
+            .map(|(reason, _, _)| reason)
             .collect()
     };
     assert_eq!(reasons(__tl_errors_9219!()), ["DeniedSelfInBounds"]);
@@ -2562,11 +2190,9 @@ fn the_types_that_hold_a_method_lifetime_in_a_type_written_as_it_is_are_written_
         __tl_report_9221!()
     );
     let causes = |text: &'static str| -> Vec<(String, String)> {
-        text.split('\u{1d}')
-            .map(|error| {
-                let fields: Vec<&str> = error.split('\u{1f}').collect();
-                (fields[3].to_string(), squash(fields[1]))
-            })
+        errors(text)
+            .into_iter()
+            .map(|(reason, _, tokens)| (reason, tokens))
             .collect()
     };
     let unconstrained = |causes: &[&str]| -> Vec<(String, String)> {
@@ -2672,82 +2298,6 @@ fn the_optional_types_around_an_object_bounded_by_a_method_lifetime_are_written_
     in_vec::<r::Host9228>();
     fn under_types<T: l::ObjectUnderTypes>() {}
     under_types::<r::Host9229>();
-}
-
-/// F68: the self type of an impl is a type of the Leaker's crate by an absolute path (`OptSelf<0>`,
-/// an optional entry), a bound of a generic names an optional type and another `Self`, and a
-/// predicate is on an entry that uses the generic (`Wrap<X>: Default`). The check that keeps the
-/// self type from being an entry looked at the first unstable bound only, which was the one that
-/// names the optional type, so a strict Referrer replaced the self type and had E0277 in the copy
-/// (in `tests/crates/referrer`, where it is invoked as `strict`). The self type is no entry now,
-/// and every copy writes it as it is.
-#[test]
-fn an_optional_self_type_that_a_bound_names_is_written_as_it_is() {
-    use type_leak_test_leaker::*;
-
-    assert_eq!(
-        reported(9230, __tl_report_9230!()),
-        ok("impl-inherent", 1, 2, 2),
-        "{}",
-        __tl_report_9230!()
-    );
-}
-
-/// F69: the copy is used at an instantiation that gives the type parameter a type with a lifetime
-/// (`&'static str`, `(&'static str, u8)`, ..), where it is in the inputs of a function pointer or
-/// `Fn(..)` whose output has an elided lifetime: `fn(&Cell<[T; 1]>) -> &u8` of a struct, `&dyn
-/// Fn(&T) -> &u8` and `fn(&T) -> &u8` in the arguments of a trait's method, and the default of a
-/// parameter (`U = fn(&T) -> &u8`) that `Referrer::complete_args()` completes. The use site wrote
-/// the argument into them and the inputs had two lifetimes, so rustc could not tell which one the
-/// output has (E0106, in `tests/crates/referrer`, where they are invoked with `inst(..)` and
-/// `lifetime_args`). It names the lifetime with a binder now: the copies compare equal to the
-/// original at the arguments.
-#[test]
-fn an_elided_output_is_named_where_the_use_site_gives_a_type_with_a_lifetime() {
-    use type_leak_test_leaker::*;
-
-    assert_eq!(
-        reported(9231, __tl_report_9231!()),
-        ok("struct", 1, 4, 4),
-        "{}",
-        __tl_report_9231!()
-    );
-    assert_eq!(
-        reported(9232, __tl_report_9232!()),
-        ok("trait", 1, 3, 2),
-        "{}",
-        __tl_report_9232!()
-    );
-    assert_eq!(
-        reported(9233, __tl_report_9233!()),
-        ok("struct", 1, 4, 4),
-        "{}",
-        __tl_report_9233!()
-    );
-}
-
-/// F70: the same where an entry is in the inputs: `Vec<T>` of `::std`, an optional entry, in `fn(&Vec<T>)
-/// -> &u8` and in the `Fn(..)` of a trait object. A strict Referrer replaces it, and the path through
-/// the Repeater that `entry_args()` writes names the lifetime that the use site gives `T`
-/// (`&'static str`, ..): the inputs had two lifetimes, and rustc could not tell which one the output
-/// has (E0106, in `tests/crates/referrer`, where they are invoked as `strict`, with `inst(..)` and
-/// `lifetime_args`). The Visitor names the elided lifetime after `type_fn` has written the path.
-#[test]
-fn an_elided_output_is_named_where_the_entry_that_replaces_a_type_names_a_lifetime() {
-    use type_leak_test_leaker::*;
-
-    assert_eq!(
-        reported(9234, __tl_report_9234!()),
-        ok("struct", 2, 2, 2),
-        "{}",
-        __tl_report_9234!()
-    );
-    assert_eq!(
-        reported(9235, __tl_report_9235!()),
-        ok("struct", 2, 2, 2),
-        "{}",
-        __tl_report_9235!()
-    );
 }
 
 /// Fixture 9236: const generics of type `u64` and `u128` in the arguments of the Repeater. The

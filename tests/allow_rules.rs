@@ -1,7 +1,8 @@
 //! `Allow` and `Rules`: closures, tuples and the flags, which the convenience methods are made
-//! of. The last tests are about what the rule is asked (each path as the cause of its kind, never
+//! of. The tests are about what the rule is asked (each path as the cause of its kind, never
 //! `Self` or a generic, never arguments in the analysis) and about a rule that panics (on a result,
-//! and inside the closure of a scope).
+//! and inside the closure of a scope). The last section, the module `names`, is about the names
+//! that `Rules::primitive()` and `Rules::prelude()` allow, one by one.
 
 mod common;
 
@@ -190,14 +191,7 @@ fn an_error_is_accepted_by_its_paths_if_it_has_any_and_by_its_cause_if_it_has_no
 
 #[test]
 fn the_rules_may_borrow_what_is_around() {
-    let item: ItemStruct = parse_quote!(
-        struct S<'a> {
-            a: Rel<'a, '_>,
-            b: MyType<'_>,
-            c: Other<'_>,
-        }
-    );
-    let result = analyze(&item, Rules::new());
+    let result = three_errors();
     let causes: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
     assert_eq!(causes.len(), 3);
     // A rule of a result borrows a list of paths that is not 'static.
@@ -216,15 +210,14 @@ fn the_rules_may_borrow_what_is_around() {
     let config = Rules::new().or_if(|cause: &Cause, place: Place| {
         allowed.iter().any(|a| starts_with(a.clone())(cause, place)) || own.contains(cause)
     });
-    let by_config = analyze(&item, config);
+    let by_config = analyze(&three_errors_item(), config);
     assert_eq!(by_config.errors().len(), 1);
     assert_eq!(by_config.errors()[0].cause, causes[2]);
 }
 
 #[test]
-fn a_rule_that_accepts_everything_leaves_no_error_and_dropping_the_bound_leaves_the_one_inside() {
-    // The bound `Into<Self::A0>` is written as it is, and `Self::A0` in it has an error of its own,
-    // which stays when the bound is dropped.
+fn a_rule_that_accepts_everything_drops_the_bound_and_the_error_inside_it() {
+    // The bound `Into<Self::A0>` is written as it is, and `Self::A0` in it has an error of its own.
     let item: ItemTrait = parse_quote!(
         trait Tr<T: ::p::BT1<String>> {
             type A0;
@@ -237,12 +230,7 @@ fn a_rule_that_accepts_everything_leaves_no_error_and_dropping_the_bound_leaves_
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 2);
-    let all = result.clone().allow(|_: &Cause, _: Place| true);
-    assert!(all.errors().is_empty());
-    // Dropping the bound alone leaves the error of `Self::A0`.
-    let left = result.accept_cause(&Cause::Trait(parse_quote!(Into<Self::A0>)));
-    assert_eq!(left.errors().len(), 1);
-    assert_eq!(left.errors()[0].reason, Reason::UnprovableBound);
+    assert!(result.allow(|_: &Cause, _: Place| true).errors().is_empty());
 }
 
 #[test]
@@ -337,16 +325,20 @@ impl Seen {
     }
 }
 
-/// Three errors, each of a relative trait or type, with the paths `Rel`, `MyType` and `Other`.
-fn three_errors() -> LeakerResult {
-    let item: ItemStruct = parse_quote!(
+/// The item of [`three_errors()`].
+fn three_errors_item() -> ItemStruct {
+    parse_quote!(
         struct S<'a> {
             a: Rel<'a, '_>,
             b: MyType<'_>,
             c: Other<'_>,
         }
-    );
-    let result = analyze(&item, Rules::new());
+    )
+}
+
+/// Three errors, each of a relative trait or type, with the paths `Rel`, `MyType` and `Other`.
+fn three_errors() -> LeakerResult {
+    let result = analyze(&three_errors_item(), Rules::new());
     assert_eq!(paths_of(&result), [["Rel"], ["MyType"], ["Other"]]);
     result
 }
@@ -653,7 +645,7 @@ fn a_rule_that_panics_is_a_panic_of_the_closure() {
 // ── each path is asked about as the cause of its kind ────────────────────────────────────────
 
 /// What a rule was asked about `item`, as `kind(path)` in the order asked, without the repeats.
-fn asked_as(item: &ItemTrait, values: bool, nested: bool) -> Vec<String> {
+fn asked_as(item: &ItemTrait, values: bool) -> Vec<String> {
     let seen = Rc::new(Seen::default());
     let mut leaker = Leaker::from_config(
         Rules::new().or_if(seen.rule()),
@@ -663,11 +655,7 @@ fn asked_as(item: &ItemTrait, values: bool, nested: bool) -> Vec<String> {
             Options::new()
         },
     );
-    if nested {
-        leaker.enter_mod("m", [], |view| view.visit_item(&Item::Trait(item.clone())));
-    } else {
-        leaker.intern_trait(item, true);
-    }
+    leaker.intern_trait(item, true);
     let _ = leaker.result();
     let mut found: Vec<String> = Vec::new();
     for (cause, _) in seen.asked.borrow().iter() {
@@ -689,57 +677,83 @@ fn asked_as(item: &ItemTrait, values: bool, nested: bool) -> Vec<String> {
 }
 
 #[test]
-fn the_rule_is_asked_about_a_type_a_trait_a_value_and_a_macro_each_as_its_kind() {
-    let item: ItemTrait = parse_quote!(
-        trait Tr: SuperTr {
-            fn f(&self, a: TyArg, b: Box<dyn ObjTr>, c: ty_mac!(u8)) -> <Rel as QualTr>::X
-            where
-                Rel: WhereTr;
-            fn g(&self) {
-                let _: LetTy = val_mod::func(ValArg);
-                mac_path!();
-            }
+fn the_rule_is_asked_about_each_path_as_its_kind() {
+    // A type, a trait, a value and a macro each as its kind. A qualified path is asked as its
+    // trait, or as unknown if it has none.
+    type Case<'a> = (&'a str, ItemTrait, bool, &'a [&'a str], &'a [&'a str]);
+    let cases: [Case; 2] = [
+        (
+            "a type, a trait, a value and a macro",
+            parse_quote!(
+                trait Tr: SuperTr {
+                    fn f(&self, a: TyArg, b: Box<dyn ObjTr>, c: ty_mac!(u8)) -> <Rel as QualTr>::X
+                    where
+                        Rel: WhereTr;
+                    fn g(&self) {
+                        let _: LetTy = val_mod::func(ValArg);
+                        mac_path!();
+                    }
+                }
+            ),
+            true,
+            &[
+                "trait(SuperTr)",
+                "type(TyArg)",
+                "type(Box)",
+                "trait(ObjTr)",
+                "macro(ty_mac !)",
+                "type(Rel)",
+                "trait(QualTr)",
+                "trait(WhereTr)",
+                "type(LetTy)",
+                "expr(val_mod :: func)",
+                "macro(mac_path !)",
+                "expr(ValArg)",
+            ],
+            // Never as another kind: a trait is not asked about as a type.
+            &[
+                "type(SuperTr)",
+                "type(ObjTr)",
+                "type(QualTr)",
+                "type(WhereTr)",
+                "trait(Rel)",
+                "type(val_mod :: func)",
+                "type(ValArg)",
+                "trait(TyArg)",
+            ],
+        ),
+        (
+            "a qualified path",
+            parse_quote!(
+                trait Tr {
+                    fn f(&self, a: <Rel as QualTr<u8>>::X, b: <Other>::Y);
+                }
+            ),
+            false,
+            &["trait(QualTr)", "unknown(:: Y)"],
+            &["type(:: Y)", "trait(:: Y)", "unknown(QualTr)", "unknown(X)"],
+        ),
+    ];
+    for (name, item, values, expected, unexpected) in cases {
+        let asked = asked_as(&item, values);
+        for expected in expected {
+            assert!(
+                asked.iter().any(|a| a == expected),
+                "{}: {}: {:?}",
+                name,
+                expected,
+                asked
+            );
         }
-    );
-    let asked = asked_as(&item, true, false);
-    for expected in [
-        "trait(SuperTr)",
-        "type(TyArg)",
-        "type(Box)",
-        "trait(ObjTr)",
-        "macro(ty_mac !)",
-        "type(Rel)",
-        "trait(QualTr)",
-        "trait(WhereTr)",
-        "type(LetTy)",
-        "expr(val_mod :: func)",
-        "macro(mac_path !)",
-        "expr(ValArg)",
-    ] {
-        assert!(
-            asked.iter().any(|a| a == expected),
-            "{}: {:?}",
-            expected,
-            asked
-        );
-    }
-    // Never as another kind: a trait is not asked about as a type.
-    for unexpected in [
-        "type(SuperTr)",
-        "type(ObjTr)",
-        "type(QualTr)",
-        "type(WhereTr)",
-        "trait(Rel)",
-        "type(val_mod :: func)",
-        "type(ValArg)",
-        "trait(TyArg)",
-    ] {
-        assert!(
-            !asked.iter().any(|a| a == unexpected),
-            "{}: {:?}",
-            unexpected,
-            asked
-        );
+        for unexpected in unexpected {
+            assert!(
+                !asked.iter().any(|a| a == unexpected),
+                "{}: {}: {:?}",
+                name,
+                unexpected,
+                asked
+            );
+        }
     }
 }
 
@@ -841,32 +855,6 @@ fn a_path_of_unknown_kind_is_asked_as_unknown_and_no_other_kind() {
         assert_eq!(result.clone().allow(only_traits).errors().len(), 1);
         assert_eq!(result.clone().allow(only_types).errors().len(), 1);
         assert_eq!(result.allow(only_macros).errors().len(), 1);
-    }
-}
-
-#[test]
-fn a_qualified_path_is_asked_as_its_trait_or_as_unknown_without_one() {
-    let item: ItemTrait = parse_quote!(
-        trait Tr {
-            fn f(&self, a: <Rel as QualTr<u8>>::X, b: <Other>::Y);
-        }
-    );
-    let asked = asked_as(&item, false, false);
-    for expected in ["trait(QualTr)", "unknown(:: Y)"] {
-        assert!(
-            asked.iter().any(|a| a == expected),
-            "{}: {:?}",
-            expected,
-            asked
-        );
-    }
-    for unexpected in ["type(:: Y)", "trait(:: Y)", "unknown(QualTr)", "unknown(X)"] {
-        assert!(
-            !asked.iter().any(|a| a == unexpected),
-            "{}: {:?}",
-            unexpected,
-            asked
-        );
     }
 }
 
@@ -1371,4 +1359,401 @@ fn or_if_takes_a_closure_without_annotations_and_or_takes_any_rule() {
         .errors()
         .is_empty());
     assert!(result.allow((OnlyOther, trait_rel)).errors().is_empty());
+}
+
+// ── the names of the lists ───────────────────────────────────────────────────────────────────
+
+/// The names that `Rules::primitive()` and `Rules::prelude()` allow, and the absolute paths that the
+/// help of an error suggests for them (`KNOWN_NAMES` of `src/util.rs`).
+///
+/// An allowed path is the same on both sides, so it is not leaked: a bound that names it is fine,
+/// and a type that names it has no entry. Without the option the same name is a relative path: an
+/// error in a bound or a const expression, with a help that says what to write (``use
+/// `::std::vec::Vec` instead of `Vec` ``), and an entry in a type. Dropping a name from a list
+/// makes the Leaker leak a type that the Referrer's crate has anyway, so everything compiles still
+/// and only the entries tell. So each name is checked in every form, with its option and without
+/// it (audit mutants `cfg_primitive_f64`, `cfg_primitive_f32`, `cfg_primitive_i128`,
+/// `cfg_prelude_drop`, `cfg_prelude_toowned` and `cfg_prelude_ord` drop one name of a list).
+///
+/// The table is written once, by the macro `absolute_paths!`, which makes both what the tests
+/// compare with (the bare name, the absolute path as a string and the option that allows it) and
+/// the code that uses the path, as a type, a trait bound or a value: a path with a typo fails to
+/// compile, instead of being suggested to a user. The table of the library is private, so the help
+/// of each name is asserted, and fails for a name whose path differs from the one here.
+mod names {
+    use std::collections::BTreeSet;
+    use syn::*;
+    use template_quote::quote;
+    use type_leak::*;
+
+    /// The option that allows a name: `Rules::primitive()`, `Rules::prelude()` (the prelude of every
+    /// edition, rustc 1.56), or none (a later prelude, 2021, 2024, rustc 1.80: the crate of the
+    /// copy may be of another edition or version).
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Group {
+        Primitive,
+        Prelude,
+        Later,
+    }
+
+    /// `name = path, group, kind [what follows the path]`: `kind` is how the path is used, to check
+    /// that it is what the name is: `ty` (a type), `trait` (a bound), or `value` (a function or a
+    /// constructor).
+    macro_rules! absolute_paths {
+        ($($name:ident = $($seg:ident)::+, $group:ident, $kind:ident [$($rest:tt)*];)*) => {
+            /// The bare names, the absolute path of each as the help writes it, and the option.
+            fn table() -> Vec<(&'static str, String, Group)> {
+                vec![$((
+                    stringify!($name),
+                    format!("::{}", [$(stringify!($seg)),+].join("::")),
+                    Group::$group,
+                )),*]
+            }
+
+            /// Every path used as what the name is. It only has to compile.
+            #[test]
+            #[allow(unused, drop_bounds)]
+            fn every_absolute_path_is_valid() {
+                $( absolute_paths!(@check $kind ($($seg)::+) [$($rest)*]); )*
+            }
+        };
+        (@check ty ($($seg:ident)::+) [$($rest:tt)*]) => {{
+            fn check(_: &::$($seg)::+ $($rest)*) {}
+        }};
+        (@check trait ($($seg:ident)::+) [$($rest:tt)*]) => {{
+            fn check<T: ::$($seg)::+ $($rest)*>() {}
+        }};
+        (@check value ($($seg:ident)::+) [$($rest:tt)*]) => {{
+            let _ = ::$($seg)::+ $($rest)*;
+        }};
+    }
+
+    absolute_paths! {
+        Box = std::boxed::Box, Prelude, ty [<u8>];
+        String = std::string::String, Prelude, ty [];
+        Vec = std::vec::Vec, Prelude, ty [<u8>];
+        Option = core::option::Option, Prelude, ty [<u8>];
+        Result = core::result::Result, Prelude, ty [<u8, u8>];
+        Copy = core::marker::Copy, Prelude, trait [];
+        Send = core::marker::Send, Prelude, trait [];
+        Sized = core::marker::Sized, Prelude, trait [];
+        Sync = core::marker::Sync, Prelude, trait [];
+        Unpin = core::marker::Unpin, Prelude, trait [];
+        Drop = core::ops::Drop, Prelude, trait [];
+        Fn = core::ops::Fn, Prelude, trait [(u8)];
+        FnMut = core::ops::FnMut, Prelude, trait [(u8)];
+        FnOnce = core::ops::FnOnce, Prelude, trait [(u8)];
+        Clone = core::clone::Clone, Prelude, trait [];
+        PartialEq = core::cmp::PartialEq, Prelude, trait [];
+        PartialOrd = core::cmp::PartialOrd, Prelude, trait [];
+        Eq = core::cmp::Eq, Prelude, trait [];
+        Ord = core::cmp::Ord, Prelude, trait [];
+        AsRef = core::convert::AsRef, Prelude, trait [<str>];
+        AsMut = core::convert::AsMut, Prelude, trait [<str>];
+        Into = core::convert::Into, Prelude, trait [<u8>];
+        From = core::convert::From, Prelude, trait [<u8>];
+        Default = core::default::Default, Prelude, trait [];
+        Iterator = core::iter::Iterator, Prelude, trait [];
+        IntoIterator = core::iter::IntoIterator, Prelude, trait [];
+        DoubleEndedIterator = core::iter::DoubleEndedIterator, Prelude, trait [];
+        ExactSizeIterator = core::iter::ExactSizeIterator, Prelude, trait [];
+        Extend = core::iter::Extend, Prelude, trait [<u8>];
+        FromIterator = core::iter::FromIterator, Later, trait [<u8>];
+        ToOwned = std::borrow::ToOwned, Prelude, trait [];
+        ToString = std::string::ToString, Prelude, trait [];
+        drop = core::mem::drop, Prelude, value [::<u8>];
+        TryFrom = core::convert::TryFrom, Later, trait [<u8>];
+        TryInto = core::convert::TryInto, Later, trait [<u8>];
+        Future = core::future::Future, Later, trait [];
+        // From rustc 1.64.
+        IntoFuture = core::future::IntoFuture, Later, trait [];
+        size_of = core::mem::size_of, Later, value [::<u8>];
+        size_of_val = core::mem::size_of_val, Later, value [::<u8>];
+        align_of = core::mem::align_of, Later, value [::<u8>];
+        align_of_val = core::mem::align_of_val, Later, value [::<u8>];
+        Some = core::option::Option::Some, Prelude, value [::<u8>];
+        None = core::option::Option::None, Prelude, value [::<u8>];
+        Ok = core::result::Result::Ok, Prelude, value [::<u8, u8>];
+        Err = core::result::Result::Err, Prelude, value [::<u8, u8>];
+        bool = core::primitive::bool, Primitive, ty [];
+        char = core::primitive::char, Primitive, ty [];
+        str = core::primitive::str, Primitive, ty [];
+        u8 = core::primitive::u8, Primitive, ty [];
+        u16 = core::primitive::u16, Primitive, ty [];
+        u32 = core::primitive::u32, Primitive, ty [];
+        u64 = core::primitive::u64, Primitive, ty [];
+        u128 = core::primitive::u128, Primitive, ty [];
+        usize = core::primitive::usize, Primitive, ty [];
+        i8 = core::primitive::i8, Primitive, ty [];
+        i16 = core::primitive::i16, Primitive, ty [];
+        i32 = core::primitive::i32, Primitive, ty [];
+        i64 = core::primitive::i64, Primitive, ty [];
+        i128 = core::primitive::i128, Primitive, ty [];
+        isize = core::primitive::isize, Primitive, ty [];
+        f32 = core::primitive::f32, Primitive, ty [];
+        f64 = core::primitive::f64, Primitive, ty [];
+    }
+
+    /// The names of the option `group`.
+    fn names(group: Group) -> Vec<&'static str> {
+        table()
+            .into_iter()
+            .filter(|(_, _, other)| *other == group)
+            .map(|(name, _, _)| name)
+            .collect()
+    }
+
+    /// Whether the config allows the primitive types and the prelude.
+    type Names = (bool, bool);
+
+    /// Where the name is written, and the headline of the error where that is one.
+    struct Form {
+        label: &'static str,
+        source: String,
+        /// The headline of the error without the option.
+        headline: Option<String>,
+        /// The entry without the option, if it is no error.
+        entry: Option<String>,
+    }
+
+    fn forms(name: &str) -> Vec<Form> {
+        vec![
+            // The value of a const argument of a bound.
+            Form {
+                label: "const expression",
+                source: format!("trait Tr: ::p::Sup<{{ {} }}> {{}}", name),
+                headline: Some(format!("use absolute path: '{}'", name)),
+                entry: None,
+            },
+            // The path of a const expression with more segments.
+            Form {
+                label: "path of a const expression",
+                source: format!("trait Tr: ::p::Sup<{{ {}::X }}> {{}}", name),
+                headline: Some(format!("use absolute path: '{}::X'", name)),
+                entry: None,
+            },
+            Form {
+                label: "supertrait",
+                source: format!("trait Tr: {} {{}}", name),
+                headline: Some(format!("use absolute path: '{}'", name)),
+                entry: None,
+            },
+            // A type with an elided lifetime in an argument, which cannot be leaked as a whole.
+            Form {
+                label: "type with an elided lifetime",
+                source: format!("trait Tr {{ fn f(&self, x: {}<&'_ ()>); }}", name),
+                headline: Some(format!("use absolute path: '{}<&'_ ()>'", name)),
+                entry: None,
+            },
+            Form {
+                label: "type",
+                source: format!("trait Tr {{ fn f(&self, x: {}<()>); }}", name),
+                headline: None,
+                entry: Some(format!("{} < () >", name)),
+            },
+            Form {
+                label: "bare type",
+                source: format!("struct S({});", name),
+                headline: None,
+                entry: Some(name.to_string()),
+            },
+        ]
+    }
+
+    /// The result of the analysis of the trait or struct `source` with `config`.
+    fn leak<A: Allow>(config: A, source: &str) -> LeakerResult {
+        let mut leaker = Leaker::from_config(config, Options::new());
+        match parse_str(source).unwrap() {
+            Item::Trait(item) => leaker.intern_trait(&item, true),
+            Item::Struct(item) => leaker.intern_struct(&item, true),
+            other => panic!("{}", quote!(#other)),
+        };
+        leaker.result()
+    }
+
+    /// The entries of the Referrer, or the headline of the error, with the options of `options`.
+    fn analyze(options: Names, source: &str) -> std::result::Result<Vec<String>, String> {
+        let (primitive, prelude) = options;
+        let mut config = Rules::new();
+        if primitive {
+            config = config.primitive();
+        }
+        if prelude {
+            config = config.prelude();
+        }
+        analyze_config(config, source)
+    }
+
+    fn analyze_config<A: Allow>(
+        config: A,
+        source: &str,
+    ) -> std::result::Result<Vec<String>, String> {
+        let referrer = leak(config, source).finish().map_err(|err| {
+            err.iter()
+                .map(|item| item.message.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })?;
+        Ok(referrer.iter().map(|ty| quote!(#ty).to_string()).collect())
+    }
+
+    /// `form` is not allowed by `options`: an error, or an entry for the type.
+    fn assert_not_allowed(options: Names, form: &Form, context: &str) {
+        let result = analyze(options, &form.source);
+        match (&form.headline, &form.entry) {
+            (Some(headline), _) => assert_eq!(
+                result.as_ref().err(),
+                Some(headline),
+                "{} is not allowed",
+                context
+            ),
+            (_, Some(entry)) => assert_eq!(
+                result.as_ref().ok(),
+                Some(&vec![entry.clone()]),
+                "{} is not allowed",
+                context
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    /// `names` are allowed by the config `allowing`, and not by the other config, nor by none.
+    fn check(names: &[&str], allowing: Names, others: &[Names]) {
+        for name in names {
+            for form in forms(name) {
+                let context = format!("{} in {}: {}", name, form.label, form.source);
+                // Allowed: no error, and nothing leaked.
+                assert_eq!(
+                    analyze(allowing, &form.source),
+                    Ok(Vec::new()),
+                    "{}",
+                    context
+                );
+                for options in others.iter().copied().chain([(false, false)]) {
+                    assert_not_allowed(options, &form, &context);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn allow_primitive_allows_every_primitive_type() {
+        let names = names(Group::Primitive);
+        assert_eq!(names.len(), 17);
+        check(&names, (true, false), &[(false, true)]);
+    }
+
+    #[test]
+    fn allow_prelude_allows_every_name_of_the_prelude() {
+        let names = names(Group::Prelude);
+        assert_eq!(names.len(), 36);
+        check(&names, (false, true), &[(true, false)]);
+    }
+
+    #[test]
+    fn the_names_of_a_later_prelude_and_other_names_are_not_allowed_by_both_options() {
+        // The names of a later prelude are not allowed by either option, nor by both: a crate of an
+        // earlier edition has no such name. Another name is a relative path still, with both options.
+        let later = names(Group::Later);
+        assert_eq!(later.len(), 9);
+        for name in later.into_iter().chain(["Foo", "Local", "Rel", "tryfrom"]) {
+            for form in forms(name) {
+                let context = format!("{} in {}: {}", name, form.label, form.source);
+                assert_not_allowed((true, true), &form, &context);
+            }
+        }
+    }
+
+    /// The help gives the absolute path of every name of the prelude, of a later prelude and of a
+    /// primitive type (`DoubleEndedIterator` had "e.g. `::my_crate::DoubleEndedIterator`"), in each
+    /// form that is an error, as the help of the first error and not as a note.
+    #[test]
+    fn a_bare_name_gets_the_help_with_its_absolute_path() {
+        let table = table();
+        assert_eq!(table.len(), 62);
+        assert_eq!(
+            table
+                .iter()
+                .map(|(name, _, _)| name)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            62
+        );
+        for (name, absolute, _) in table {
+            let help = format!("use `{}` instead of `{}`", absolute, name);
+            for form in forms(name).iter().filter(|form| form.headline.is_some()) {
+                let message = form.headline.as_ref().unwrap();
+                let result = leak((), &form.source);
+                let err = result.errors();
+                let context = format!("{} as a {}: {}", name, form.label, form.source);
+                assert_eq!(err.len(), 1, "{}", context);
+                assert_eq!(&err[0].message, message, "{}", context);
+                // It is the help of the error. It is no note: the notes say why.
+                assert_eq!(err[0].help_text(), Some(help.as_str()), "{}", context);
+                assert!(
+                    err[0].notes.iter().all(|(_, note)| *note != help),
+                    "{}",
+                    context
+                );
+                // And it is in the `syn::Error`, which stable Rust gets: the notes follow the
+                // headline, then the help.
+                let rendered = to_syn_error(err).to_string();
+                assert!(rendered.starts_with(message), "{}: {}", context, rendered);
+                assert!(
+                    rendered.ends_with(&format!("\n  = help: {}\n", help)),
+                    "{}: {}",
+                    context,
+                    rendered
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn allow_crate_and_allow_std_crates_allow_the_paths_that_start_with_their_roots() {
+        // In a supertrait and in a type: the root decides, and the rest of the path does not.
+        let analyze_with = |root: &str, source: &str| {
+            let config = Rules::new();
+            match root {
+                "crate" => analyze_config(config.crate_paths(), source),
+                "std crates" => analyze_config(config.std_crates(), source),
+                _ => analyze_config(config, source),
+            }
+        };
+        let roots: [(&str, &[&str]); 2] = [
+            ("crate", &["crate::Foo", "crate::a::b::Foo"]),
+            (
+                "std crates",
+                &["std::fmt::Debug", "core::fmt::Debug", "alloc::vec::Vec"],
+            ),
+        ];
+        for (label, paths) in roots {
+            for path in paths {
+                for source in [
+                    format!("trait Tr: {} {{}}", path),
+                    format!("trait Tr {{ fn f(&self, x: {}<()>); }}", path),
+                ] {
+                    // Allowed: no error, and nothing leaked.
+                    assert_eq!(analyze_with(label, &source), Ok(Vec::new()), "{}", source);
+                    // Not by another root, nor by none.
+                    let none = analyze_with("none", &source);
+                    assert!(
+                        none != Ok(Vec::new()),
+                        "{} ({}) is leaked or an error",
+                        source,
+                        label
+                    );
+                }
+            }
+        }
+        // A root decides by its first segment only: `my::core::X` is not `core::X`, and the absolute
+        // `::core::X` is context-free whatever is allowed.
+        let relative = analyze_config(
+            Rules::new().std_crates().crate_paths(),
+            "trait Tr { fn f(&self, x: my::core::X<()>); }",
+        );
+        assert_eq!(relative, Ok(vec!["my :: core :: X < () >".to_string()]));
+        let absolute = analyze((false, false), "trait Tr: ::core::fmt::Debug {}");
+        assert_eq!(absolute, Ok(Vec::new()));
+    }
 }

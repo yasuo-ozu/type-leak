@@ -1,5 +1,17 @@
-//! Checks how rustc renders the errors of the Leaker (`ErrorItem`) reported by a proc macro with
-//! `ErrorItem::emit()`, by building `tests/crates/diagnostic` (which fails to compile).
+//! The tests that build a crate outside this package with a nested `cargo` and check what comes
+//! out: the crates under `tests/crates` and the example `examples/two-macros`, which the published
+//! package has not (see `exclude` of `Cargo.toml`). The fixtures are built on their own
+//! (`tests/common/nested.rs`), so that a failure of one does not break the other tests. They are
+//! in this one binary, in a module each:
+//!
+//! - the top level: how rustc renders the errors of the Leaker (below);
+//! - `spans`: the spans of the errors, by the tests of `tests/crates/spans`;
+//! - `trusting`: a Referrer in a crate without the dependency of an optional entry;
+//! - `outlives`: the outlives bounds in the Repeater's implementations and the copies;
+//! - `two_macros`: the example of the README, with a macro in each of two crates.
+//!
+//! The top level checks how rustc renders the errors of the Leaker (`ErrorItem`) reported by a proc
+//! macro with `ErrorItem::emit()`, by building `tests/crates/diagnostic` (which fails to compile).
 //! The first items of `tests/crates/diagnostic_serialized` are the same, but the macro writes its
 //! errors as tokens, reads them back and then reports them: rustc renders them in the same way, at
 //! the same places.
@@ -27,16 +39,23 @@
 //! default rustc points an error at the invocation, as it does for every span inside a macro of
 //! another crate; on nightly with `-Zmacro-backtrace` it points at the cause, in the Leaker's crate.
 
+use std::sync::OnceLock;
 use type_leak::Referrer;
 
 #[path = "common/nested.rs"]
 mod nested;
 
-/// Builds the fixture crate, returning the rendered diagnostics.
-fn build_fixture() -> String {
-    let built = nested::cargo("diagnostic", &["check"], &[]);
-    assert!(!built.success, "{}", built.stderr);
-    built.stderr
+/// Builds the fixture crate (once: a build that fails is made again by every `cargo check`),
+/// returning the rendered diagnostics. The tests are not built with the MSRV (the job of the MSRV
+/// builds the library only).
+#[allow(clippy::incompatible_msrv)]
+fn build_fixture() -> &'static str {
+    static STDERR: OnceLock<String> = OnceLock::new();
+    STDERR.get_or_init(|| {
+        let built = nested::cargo("diagnostic", &["check"], &[]);
+        assert!(!built.success, "{}", built.stderr);
+        built.stderr
+    })
 }
 
 /// An error as rustc printed it.
@@ -233,7 +252,7 @@ error: use absolute path: 'RelA'
     };
     // The lines that rustc pads with spaces (the empty line between a message and its notes) are
     // compared without them.
-    let stderr = trimmed(&stderr);
+    let stderr = trimmed(stderr);
     for expected in expected {
         let expected = trimmed(expected);
         assert!(
@@ -251,7 +270,7 @@ error: use absolute path: 'RelA'
 #[test]
 fn every_offending_path_is_an_error_of_its_own() {
     let stderr = build_fixture();
-    let got = reported(&stderr);
+    let got = reported(stderr);
 
     let clone_help = "use `::core::clone::Clone` instead of `Clone`";
     let because = "it cannot be leaked as a whole because of `'_`";
@@ -390,7 +409,7 @@ fn diagnostics_up_to(stderr: &str, lines: usize) -> Vec<String> {
 /// rustc points at the same places, with the same text.
 #[test]
 fn serialized_errors_are_reported_at_the_same_places() {
-    let direct = diagnostics_up_to(&build_fixture(), 23);
+    let direct = diagnostics_up_to(build_fixture(), 23);
     let built = nested::cargo("diagnostic_serialized", &["check"], &[]);
     assert!(!built.success, "{}", built.stderr);
     let serialized = diagnostics_up_to(&built.stderr, 23);
@@ -523,5 +542,371 @@ fn the_copy_is_made_when_an_error_remains() {
         "fnshow<U:core::fmt::Debug>(&self,",
     ] {
         assert!(expanded.contains(part), "{} in:\n{}", part, built.stdout);
+    }
+}
+
+mod spans {
+    //! Runs the tests of the spans of the errors, `tests/crates/spans`.
+    //!
+    //! The spans of the errors are where a macro reports them (`ErrorItem::span()`, the tokens of its
+    //! notes and help, `EncodeError::span()`), and only a test that knows the line and the column of
+    //! a span can tell a wrong one. Code parsed from a string has them if `proc-macro2` is built with
+    //! the feature `span-locations`. A feature is shared by the whole build of a package, and this one
+    //! makes the spans larger, which is enough for the deep recursion of other tests
+    //! (`tests/binder_output.rs`) to overflow the stack of a test thread. So the tests are a package of
+    //! their own, built on its own as the other fixtures are.
+
+    use std::process::Command;
+
+    #[test]
+    fn the_spans_of_the_errors_are_at_the_offending_tokens() {
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/crates/spans/Cargo.toml");
+        // The published package has no `tests/crates` (see `exclude` of `Cargo.toml`).
+        if !std::path::Path::new(manifest).exists() {
+            return;
+        }
+        let output = Command::new(env!("CARGO"))
+            .args(["test", "--quiet", "--manifest-path"])
+            .arg(manifest)
+            .env(
+                "CARGO_TARGET_DIR",
+                concat!(env!("CARGO_TARGET_TMPDIR"), "/spans"),
+            )
+            .env("CARGO_TERM_COLOR", "never")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{}\n{}", stdout, stderr);
+        // The tests ran (the other targets of the package have none): 12 of the errors of the Leaker,
+        // and 2 of `EncodeError`.
+        assert!(stdout.contains("test result: ok. 12 passed"), "{}", stdout);
+        assert!(stdout.contains("test result: ok. 2 passed"), "{}", stdout);
+    }
+}
+
+mod trusting {
+    //! A Referrer which trusts the names of the crates, and one which does not, in a crate that has
+    //! no dependency on the crate of an optional entry (`tests/crates/trusting`).
+    //!
+    //! `type_leak_test_leaker::x::ExtDep` names `::type_leak_test_ext::Ext<..>`. It is an optional
+    //! entry (see `Referrer::must()`): a macro that trusts it (its `type_fn` returns the leaked type,
+    //! which the test macro does unless it is told `strict`) leaves it as written, and the copy then
+    //! names a crate that the Referrer's crate does not have; the strict macro, which trusts nothing,
+    //! replaces the whole type with the Repeater's projection, and the crate does not need it.
+    //! `tests/cross_crate.rs` has the text of both copies. This is the trusting one, which rustc
+    //! rejects, and the same crate with the strict flag, which it accepts and whose own tests (the
+    //! copies of a struct and of a fragment of an impl, and an impl that forwards) pass: the outcome
+    //! differs by that flag alone.
+
+    use super::nested;
+
+    #[test]
+    fn a_trusting_referrer_needs_the_dependency() {
+        // The methods that name the crate fail alike (rustc prints the same error once).
+        let trusting = nested::cargo("trusting", &["check"], &[]);
+        assert!(!trusting.success, "{}", trusting.stderr);
+        assert_eq!(
+            nested::error_codes(&trusting.stderr),
+            ["E0433"],
+            "{}",
+            trusting.stderr
+        );
+        assert!(
+            trusting
+                .stderr
+                .contains("cannot find `type_leak_test_ext` in"),
+            "{}",
+            trusting.stderr
+        );
+    }
+
+    #[test]
+    fn a_strict_referrer_does_not() {
+        // Nothing else is wrong with the crate, so the flag alone makes the difference.
+        let strict = nested::cargo("trusting", &["check"], &["strict"]);
+        assert!(strict.success, "{}", strict.stderr);
+        assert_eq!(strict.stderr, "");
+        // And what it wrote works.
+        let tests = nested::cargo("trusting", &["test", "--lib"], &["strict"]);
+        assert!(tests.success, "{}{}", tests.stdout, tests.stderr);
+        assert!(
+            tests.stdout.contains("test result: ok. 3 passed; 0 failed"),
+            "{}{}",
+            tests.stdout,
+            tests.stderr
+        );
+    }
+}
+
+mod outlives {
+    //! Builds `tests/crates/outlives`, a crate with the Leaker's side and the Referrer's side of types
+    //! whose generics carry an outlives bound, or are lifetimes of `for<..>` binders, and checks that
+    //! it compiles.
+    //!
+    //! Only the bounds which are exact are encoded: those which are written (`T: 'a`, `where Self:
+    //! 'a`) and those which a reference implies (`&'a X` requires `X: 'a`, whatever `X` is, and what
+    //! a reference to a type must satisfy is passed on to the types inside it). A path with a lifetime
+    //! argument is not assumed to require anything: `Rel<'a, T>`, where `struct Rel<'a, T>(&'a T)` gets
+    //! `T: 'a` inferred (RFC 2093), is interned as a whole, with the generics `<'a, T>` it uses, but
+    //! `struct Unrelated<'a, T>(&'a (), T)` does not tie `T` to `'a`, and the definition cannot be
+    //! seen. An assumed bound would make the copy stricter than the original (a caller whose `T` is
+    //! shorter than `'a` would be rejected). So where the definition needs `T: 'a`, the signature
+    //! writes it, as `fn f<'a, T: 'a>(&self, x: Rel<'a, T>)`: the Repeater's implementation which the
+    //! downstream macro emits is
+    //!
+    //! ```ignore
+    //! impl<'a, T> Repeater<(&'a (), T, &'a T), KEY> for S { type Type = Rel<'a, T>; }
+    //! ```
+    //!
+    //! whose header encodes `'a` as `&'a ()`, `T` as `T` and the written bound as `&'a T`, which
+    //! implies `T: 'a` wherever it is written (the copy of the signature
+    //! `<S as Repeater<(&'a (), T, &'a T), ..>>::Type` has the same encoding). Without the bound
+    //! written (`fn f<'a, T>(&self, x: Rel<'a, T>)`) the header implies nothing about `T: 'a`, and
+    //! rustc rejects the implementation with `error[E0309]: the parameter type `T` may not live long
+    //! enough`. The fixture has this failing case disabled (the feature `negative-unbounded`, `m::
+    //! Unbounded`), and the same for `Self` (`negative-unbounded-self`, `m::UnboundedSelf`, E0309 for
+    //! `__S`) and for the field of a struct (`negative-unbounded-around`, `m::UnboundedAround`, see
+    //! below). Each is built here with its feature, and must fail with exactly the error written
+    //! above it (E0309 on stable and nightly); so must the alternative that is not taken for a trait
+    //! object (`negative-alone`, E0308 or E0478, and E0521).
+    //!
+    //! The fixture also has the cases around it: the control `Loose<'a, T>` (which does not require
+    //! the bound, so nothing is written and the copy is the same as the original), references and
+    //! paths with a lifetime around a relative type (`&'a Rel2<T>`, `Ref<'a, Rel2<T>>`), and trait
+    //! objects as arguments of a path with a lifetime (`Ref<'a, dyn Iterator<Item = Plain>>`, of which
+    //! only `Plain` is leaked, and `Ref<'a, dyn RelTr>`, which is leaked as a whole) and the
+    //! references to them (`&'a dyn Iterator<Item = Plain>`, likewise), with the implementations of
+    //! the Referrer's side in the same crate.
+    //!
+    //! And the lifetimes of `for<..>` binders: `Hr<'x>` is leaked with `'x` if the output of the binder
+    //! does not mention it, or if an input keeps it where it is written (`&'x u8` of `Fn(&'x u8,
+    //! Hr<'x>) -> &'x u8`), and the function pointer or the trait object holding the binder is leaked
+    //! as a whole otherwise, as the copy `for<'x> fn(<..>::Type) -> &'x u8` is rejected (E0581, or
+    //! E0582 for a bound or a trait object).
+    //!
+    //! An anchor in a path of `::core` (`Option<&'x u8>`) stays where it is written, so `Hr<'x>` is leaked
+    //! alone as before, but one in the type of an external crate (`::std::boxed::Box<dyn
+    //! Iterator<Item = &'x u8>>`) is not: the Referrer may replace that type as a whole (it is an
+    //! optional entry, see `Referrer::must()`), so the function pointer or the trait object holding the
+    //! binder is leaked as a whole (a bound is an error), and the copies compile whichever the Referrer
+    //! does (`Binders`: `core_*`, `external_*`, and the `check_leak!` next to `AnchoredInside`, where
+    //! `::std` is allowed, so the types of it are no optional entries and anchor as before).
+    //!
+    //! And `Self: 'a`, which a reference implies (`&'a Rel2<Self>`, `&'a Rel2<Self::Item>`, `SelfOutlives`)
+    //! and a path with a lifetime does not, so `Rel<'a, Self>` and `Rel<'a, Self::Item>` write it
+    //! (`where Self: 'a`, `SelfBound`): the trait arguments of the Repeater encode it as `&'a __S`,
+    //! which implies it in the implementation (E0309 otherwise, "the parameter type `__S` may not live
+    //! long enough"), in the copy of a method, a free function and the field of a struct (the
+    //! implementation must not declare `__S: 'a`, which nothing proves there).
+    //!
+    //! And the lifetimes of the references around a type leaked alone (`Around`, `SelfAround`):
+    //! `Rel2<T>` of `&'a (u8, [Rel2<T>; 2])` is leaked with `<'a, T: 'a>`, so that the copy of the
+    //! field of a struct `<S as Repeater<(&'a (), T, &'a T), ..>>::Type` has the `T: 'a` which the
+    //! original has inferred (RFC 2093), whereas the one without is rejected with E0309: around a
+    //! reference, a tuple, an array, a path, a function pointer and a trait object, in the field of a
+    //! struct and in the variant of an enum, and for `Self`. Not across a projection (`<X as Tr>::A<..>`,
+    //! and a path starting with a type parameter, `T::A<..>`, which the copy of the field of a struct
+    //! must not require `U: 'a` for either, as the original is well-formed without it), nor for
+    //! `'static` (which the struct declares as the original does, RFC 2093 infers no such bound) or
+    //! the lifetime of a `for<..>` binder, whose copies compile as they are. A path with a lifetime
+    //! (`Ref<'a, Rel2<T>>`) passes on nothing, so `Rel2<T>` of it is leaked with the generics which
+    //! are written (`<'a, T: 'a>` if the signature and the struct write `T: 'a`, and `<T>` if not,
+    //! where the copy of the field of the struct is rejected with E0309, `m::UnboundedAround`).
+    //!
+    //! And a trait object borrowed through a lifetime of the method (`Locals`, `LocalBinders`): `&'b
+    //! dyn RelTr` is leaked as a whole, with `'b` among its generics, so rustc gives the trait object
+    //! its default where the Repeater is implemented, and the copy is `<Self as Repeater<(&'b (),),
+    //! ..>>::Type`, which has `'b` only in a projection: the return type may mention `'b` only if
+    //! another argument keeps it as written (`&'b self`, or `y: &'b dyn ::core::fmt::Debug`, a
+    //! reference which is not leaked as a whole), a bound makes it early-bound in both, or no argument
+    //! mentions it (E0195 where the method is implemented otherwise, which is an error of the Leaker), with the
+    //! forwarding implementations called through `&dyn Locals`. A path `Ref<'b, dyn RelTr>` is the
+    //! same. And a trait with a lifetime bound of its own (`StaticTr: 'static`, `Statics`), whose
+    //! default is `'static` whatever the reference is, which leaking the trait object alone with the
+    //! lifetime of the reference written out would get wrong (E0478).
+    //!
+    //! And a `Self: 'a` which the item writes (`SelfBound`, `SelfBoundTrait`): it is encoded like the
+    //! implied one and never declared, so a free function and the field of a struct, where nothing
+    //! proves it but the header, compile as well.
+    //!
+    //! The fixture is built on its own, so that a failure of it does not break the other cross-crate
+    //! tests (the Leaker's crate in `tests/crates/leaker` is a dependency of all of them). The tests
+    //! check what rustc printed, not only whether it succeeded: the warnings of the good build, and
+    //! the errors of each negative control.
+
+    use super::nested;
+
+    /// The good build compiles, with no warning but the ones the fixture is known to have: a
+    /// parenthesized trait object (`&'a (dyn Iterator<Item = Plain>)`) in the copy of `Dyns`, which the
+    /// copy keeps as it is written. Any other lint (an unused lifetime or import, a dead item) in a
+    /// copy or in a Repeater's implementation would be new.
+    #[test]
+    fn implied_outlives_bounds_are_kept() {
+        let built = nested::cargo("outlives", &["build"], &[]);
+        assert!(built.success, "{}", built.stderr);
+        assert!(
+            nested::headlines(&built.stderr, "error").is_empty(),
+            "{}",
+            built.stderr
+        );
+        for warning in nested::headlines(&built.stderr, "warning") {
+            assert_eq!(
+                warning, "warning: unnecessary parentheses around type",
+                "{}",
+                built.stderr
+            );
+        }
+    }
+
+    /// Builds the fixture with a negative control, which must fail to compile with exactly these
+    /// errors (their codes, and the headline of the first).
+    fn negative(feature: &str, codes: &[&str], headline: &str) {
+        let built = nested::cargo("outlives", &["check"], &[feature]);
+        assert!(
+            !built.success,
+            "`{}` compiles, but is a negative control:\n{}",
+            feature, built.stderr
+        );
+        let mut got = nested::error_codes(&built.stderr);
+        // The error of a trait object whose lifetime was written where the path makes it `'static` is
+        // E0308 (`method not compatible with trait`) on stable, and E0478 (`lifetime bound not
+        // satisfied`) on nightly.
+        for code in &mut got {
+            if code == "E0478" {
+                *code = "E0308".to_string();
+            }
+        }
+        got.sort();
+        assert_eq!(got, codes, "`{}`:\n{}", feature, built.stderr);
+        assert!(
+            built.stderr.contains(headline),
+            "`{}` has no `{}`:\n{}",
+            feature,
+            headline,
+            built.stderr
+        );
+    }
+
+    /// The negative controls: each feature of the fixture enables an item that does not compile, which
+    /// must fail with exactly these errors (the codes, and the headline of the first), because
+    ///
+    /// - `Rel<'a, T>` without `T: 'a` written: the Repeater's implementation, whose header encodes `T`
+    ///   but implies nothing about `'a`, is rejected (`m::Unbounded`);
+    /// - the same for `Self` (`m::UnboundedSelf`): `Rel<'a, Self>` needs `Self: 'a`, and the header
+    ///   encodes `__S` only;
+    /// - the field of a struct (`m::UnboundedAround`): `Rel2<T>` is leaked with the generics `<T>` its
+    ///   signature writes, so the copy `Ref<'a, <Wrapper as Repeater<(T,), ..>>::Type>` is not
+    ///   well-formed without `T: 'a`, which nothing infers through the projection;
+    /// - the alternative which is not taken for a trait object without a lifetime bound as the argument
+    ///   of a path with a lifetime: leaking it alone with `+ 'a` written, and keeping the path around
+    ///   the projection in the copy. The object lifetime of `Inferred` and `Unrelated` is `'static`, so
+    ///   the copy returns another type (E0308 on stable, E0478 on nightly, for each of the two), and
+    ///   the forwarding body hands out a borrow that does not live that long (E0521).
+    #[test]
+    fn the_negative_controls_fail_with_their_errors() {
+        for (feature, codes, headline) in [
+            (
+                "negative-unbounded",
+                &["E0309"][..],
+                "error[E0309]: the parameter type `T` may not live long enough",
+            ),
+            (
+                "negative-unbounded-self",
+                &["E0309"][..],
+                "error[E0309]: the parameter type `__S` may not live long enough",
+            ),
+            (
+                "negative-unbounded-around",
+                &["E0309"][..],
+                "error[E0309]: the parameter type `T` may not live long enough",
+            ),
+            (
+                "negative-alone",
+                &["E0308", "E0308", "E0521", "E0521"][..],
+                "borrowed data escapes outside of method",
+            ),
+        ] {
+            negative(feature, codes, headline);
+        }
+    }
+}
+
+mod two_macros {
+    //! Builds and tests the two-macro example, `examples/two-macros`: a trait that a crate exports with
+    //! one proc macro and another crate implements with a second one, with `type-leak` between them as
+    //! the README describes. Its crates are not part of this package, so they are built on their own,
+    //! as the fixtures of `tests/crates` are.
+
+    use std::path::Path;
+    use std::process::Command;
+
+    /// Runs `cargo <args> --quiet` on the workspace of the example, if this package has it (the
+    /// published one does not: see `exclude` of `Cargo.toml`). Returns `(success, stdout, stderr)`.
+    fn cargo(args: &[&str]) -> Option<(bool, String, String)> {
+        let manifest = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/two-macros/Cargo.toml"
+        );
+        if !Path::new(manifest).exists() {
+            return None;
+        }
+        let output = Command::new(env!("CARGO"))
+            .args(args)
+            .args(["--quiet", "--manifest-path", manifest])
+            .env(
+                "CARGO_TARGET_DIR",
+                concat!(env!("CARGO_TARGET_TMPDIR"), "/two-macros"),
+            )
+            .env("CARGO_TERM_COLOR", "never")
+            .output()
+            .unwrap();
+        Some((
+            output.status.success(),
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        ))
+    }
+
+    /// The wrappers of `app` forward, with the types of `repo` that `app` never names.
+    #[test]
+    fn the_example_builds_and_its_wrappers_forward() {
+        let Some((success, stdout, stderr)) = cargo(&["test", "--workspace"]) else {
+            return;
+        };
+        assert!(success, "{}\n{}", stdout, stderr);
+        assert!(stdout.contains("test result: ok. 2 passed"), "{}", stdout);
+    }
+
+    /// `#[export_trait]` reports each path that cannot be leaked at its own span, with what to write.
+    #[test]
+    fn the_example_reports_what_cannot_be_exported() {
+        let Some((success, _, stderr)) = cargo(&["check", "-p", "repo", "--features", "bad"])
+        else {
+            return;
+        };
+        assert!(!success, "{}", stderr);
+        assert!(
+            stderr.contains("error: use absolute path: 'Clone'"),
+            "{}",
+            stderr
+        );
+        assert!(
+            stderr.contains("error: use absolute path: 'Record<'_>'"),
+            "{}",
+            stderr
+        );
+        assert!(stderr.contains("repo/lib.rs:50:16"), "{}", stderr);
+        // The help says what to write.
+        assert!(
+            stderr.contains("help: use `::core::clone::Clone` instead of `Clone`"),
+            "{}",
+            stderr
+        );
+        assert!(
+            stderr.contains("help: write `Record` with an absolute path"),
+            "{}",
+            stderr
+        );
     }
 }

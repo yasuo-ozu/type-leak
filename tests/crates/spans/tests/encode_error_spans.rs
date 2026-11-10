@@ -1,8 +1,8 @@
 //! The spans of `EncodeError`, and of the `syn::Error` made of it.
 //!
-//! The code is parsed from a string, so that it has a place (see `tests/spans.rs`), and the span of
-//! the error is compared with the place of the part of the string that is at fault. The text of
-//! the errors is in `tests/encode_errors.rs` of `type-leak`.
+//! The code is parsed from a string, so that it has a place (see `tests/diagnostic.rs`), and the
+//! span of the error is compared with the place of the part of the string that is at fault. The text
+//! of the errors is in `tests/encode.rs` of `type-leak`.
 
 mod support;
 

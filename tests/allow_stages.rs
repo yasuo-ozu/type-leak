@@ -133,6 +133,10 @@ fn allow_primitive_drops_a_primitive_path_in_a_const_expression_at_both_stages()
     );
 }
 
+/// A path rule drops an error only if every relative path of it is allowed. `std::vec::Vec<Rel<'_>>`
+/// is written as it is, with an error for `std::vec::Vec`, and `Rel<'_>` in it has an error of its
+/// own: the rule drops the first, as the config makes `std::vec::Vec` context-free and reports
+/// `Rel<'_>`.
 #[test]
 fn allow_std_crates_reports_the_same_error_before_and_after() {
     let item: ItemTrait = parse_quote!(
@@ -145,6 +149,40 @@ fn allow_std_crates_reports_the_same_error_before_and_after() {
     assert_eq!(causes(&before), ["Rel < '_ >"]);
     assert_eq!(causes(&after), ["Rel < '_ >"]);
     assert_eq!(before.errors().len(), after.errors().len());
+    // Without the rule: an error for the head of each path, and the one inside `Vec`.
+    let plain = analyze(&item, Rules::new());
+    assert_eq!(
+        causes(&plain),
+        [
+            "core :: fmt :: Debug",
+            "std :: vec :: Vec < Rel < '_ > >",
+            "Rel < '_ >",
+            "std :: fmt :: Formatter < '_ >"
+        ]
+    );
+    let paths: Vec<Vec<String>> = plain
+        .errors()
+        .iter()
+        .map(|error| error.paths.iter().map(|p| quote!(#p).to_string()).collect())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            vec!["core :: fmt :: Debug"],
+            vec!["std :: vec :: Vec"],
+            vec!["Rel"],
+            vec!["std :: fmt :: Formatter"]
+        ]
+    );
+    // The rule alone, after the analysis and as the config, leaves the same.
+    assert_eq!(
+        causes(&plain.allow(Rules::new().std_crates())),
+        ["Rel < '_ >"]
+    );
+    assert_eq!(
+        causes(&analyze(&item, Rules::new().std_crates())),
+        ["Rel < '_ >"]
+    );
 }
 
 #[test]
@@ -234,22 +272,6 @@ fn an_absolute_path_is_no_path_of_an_error() {
         .allow(Rules::new().std_crates())
         .allow(Rules::new().crate_paths());
     assert_eq!(kept.errors().len(), 1);
-}
-
-#[test]
-fn a_cause_that_is_no_path_has_none_and_no_path_rule_drops_it() {
-    let item: ItemTrait = parse_quote!(
-        trait Tr<T = Wrap<Self>> {}
-    );
-    let result = analyze(&item, Rules::new());
-    assert_eq!(result.errors().len(), 1);
-    let mut after = result.clone();
-    after = after
-        .allow(Rules::new().prelude())
-        .allow(Rules::new().primitive())
-        .allow(Rules::new().std_crates())
-        .allow(Rules::new().crate_paths());
-    assert_eq!(after.errors().len(), 1);
 }
 
 // ── values and defaults ──────────────────────────────────────────────────────────────────────

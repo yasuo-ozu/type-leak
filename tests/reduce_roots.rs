@@ -3,175 +3,233 @@
 mod common;
 
 use common::{check_in, enter_function, finish_as_strings, starts_with};
-use std::collections::BTreeSet;
 use syn::visit::Visit;
 use syn::*;
 use template_quote::quote;
 use type_leak::{to_syn_error, ContextId, ErrorItem, Leaker, Options, Referrer, Rules};
 
+/// The entries that `reduce_roots()` leaves for a small item, required ones as they are and
+/// optional ones after `? `, sorted. `quiet` writes the paths of external crates as they are, so
+/// no optional entry changes the cut (`test_reduce_roots_one_cut` tests both).
 #[test]
-fn test_reduce_roots_empty_leaker() {
+fn test_reduce_roots_small_cuts() {
     // A fresh Leaker with nothing interned produces an empty Referrer.
     let mut leaker = Leaker::new();
     leaker.reduce_roots();
     assert!(leaker.result().finish().unwrap().is_empty());
-}
 
-#[test]
-fn test_reduce_roots_neutral_generics() {
-    // All fields are the struct's own generic params → all neutral → empty.
-    let item: ItemStruct = parse_quote! { struct S<T, U> { a: T, b: U } };
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
-    leaker.reduce_roots();
-    assert!(leaker.result().finish().unwrap().is_empty());
-}
-
-#[test]
-fn test_reduce_roots_absolute_paths_only() {
-    // Absolute-path field types are neutral → nothing is required (old: nothing interned at all;
-    // now the type of an external crate is an optional entry, see `Referrer::must()`).
-    let item: ItemStruct = parse_quote! {
-        struct S { a: ::std::string::String }
-    };
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
-    leaker.reduce_roots();
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(referrer.iter().count(), 1);
-    assert!(!referrer.must(0));
-    // `::core` is never leaked.
-    let item: ItemStruct = parse_quote! {
-        struct S { a: ::core::option::Option<(::core::primitive::u8, ::core::primitive::bool)> }
-    };
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
-    leaker.reduce_roots();
-    assert!(leaker.result().finish().unwrap().is_empty());
-}
-
-#[test]
-fn test_reduce_roots_single_must_intern() {
-    // A single relative-path field is a must-intern root and must be kept.
-    let item: ItemStruct = parse_quote! { struct S { a: RelType } };
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
-    leaker.reduce_roots();
-    let expected: Type = parse_quote!(RelType);
-    assert_eq!(
-        finish_as_strings(leaker),
-        BTreeSet::from([quote!(#expected).to_string()])
-    );
-}
-
-#[test]
-fn test_reduce_roots_multiple_must_intern() {
-    // Two independent must-intern roots: both survive reduction.
-    let item: ItemStruct = parse_quote! { struct S { a: TypeA, b: TypeB } };
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
-    leaker.reduce_roots();
-    let ta: Type = parse_quote!(TypeA);
-    let tb: Type = parse_quote!(TypeB);
-    assert_eq!(
-        finish_as_strings(leaker),
-        BTreeSet::from([quote!(#ta).to_string(), quote!(#tb).to_string()])
-    );
-}
-
-#[test]
-fn test_reduce_roots_neutral_root_without_must_intern_dropped() {
-    // A neutral root whose children are all neutral is dropped entirely (but for the type of an
-    // external crate in it, which is an optional entry: the inner one, as it is the cut closest to
-    // the sink, see below).
-    let item: ItemStruct = parse_quote! {
-        struct S<T> { a: (T, ::std::string::String), b: (T, ::core::primitive::u8) }
-    };
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
-    leaker.reduce_roots();
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(
-        referrer
+    fn entries<A: type_leak::Allow>(mut leaker: Leaker<A>, item: &Item) -> Vec<String> {
+        match item {
+            Item::Struct(item) => leaker.intern_struct(item, true),
+            Item::Trait(item) => leaker.intern_trait(item, true),
+            _ => unreachable!(),
+        };
+        leaker.reduce_roots();
+        let referrer = leaker.result().finish().unwrap();
+        let mut entries: Vec<String> = referrer
             .iter()
-            .map(|t| ty_string(t.clone()))
-            .collect::<Vec<_>>(),
-        [":: std :: string :: String"]
-    );
-    assert!(!referrer.must(0));
-    let item: ItemStruct = parse_quote! {
-        struct S<T> { a: (T, ::core::string::String) }
-    };
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
-    leaker.reduce_roots();
-    assert!(leaker.result().finish().unwrap().is_empty());
-}
-
-#[test]
-fn test_reduce_roots_root_covers_descendant() {
-    // A must-intern type nested inside a compound wrapper: the inner type is interned (it
-    // is the innermost minimum cut), and the wrapper is rebuilt around it.
-    let item: ItemStruct = parse_quote! {
-        struct S { a: (RelType, ::std::string::String) }
-    };
-    let mut leaker = quiet();
-    leaker.intern_struct(&item, true);
-    leaker.reduce_roots();
-    let expected: Type = parse_quote!(RelType);
-    let result = finish_as_strings(leaker);
-    assert_eq!(result, BTreeSet::from([quote!(#expected).to_string()]));
-}
-
-#[test]
-fn test_reduce_roots_mixed_neutral_and_must_intern() {
-    // Generic field (neutral root) alongside a relative-path field (must-intern root):
-    // only the must-intern root survives.
-    let item: ItemStruct = parse_quote! { struct S<T> { a: T, b: RelType } };
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
-    leaker.reduce_roots();
-    let expected: Type = parse_quote!(RelType);
-    assert_eq!(
-        finish_as_strings(leaker),
-        BTreeSet::from([quote!(#expected).to_string()])
-    );
-}
-
-#[test]
-fn test_reduce_roots_deep_nesting() {
-    // A relative type three levels deep: only the inner type is kept; neither the intermediate
-    // Vec wrapper nor the tuples appear as a separate entry. (A bare `Vec<RelInner>` would be
-    // interned as a whole: see `test_reduce_roots_bare_identifier_argument`.)
-    let item: ItemStruct = parse_quote! {
-        struct S { a: (::std::vec::Vec<(RelInner,)>, ::std::string::String) }
-    };
-    let mut leaker = quiet();
-    leaker.intern_struct(&item, true);
-    leaker.reduce_roots();
-    let expected: Type = parse_quote!(RelInner);
-    let result = finish_as_strings(leaker);
-    assert_eq!(result, BTreeSet::from([quote!(#expected).to_string()]));
-}
-
-#[test]
-fn test_reduce_roots_type_in_both_positions() {
-    // A type appears as a direct must-intern root (field a) AND as a must-intern
-    // descendant inside a compound root (field b). Interning it covers both.
-    let item: ItemStruct = parse_quote! {
-        struct S {
-            a: RelType,
-            b: (RelType, ::std::string::String),
-        }
-    };
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
-    leaker.reduce_roots();
-    let ta: Type = parse_quote!(RelType);
-    assert_eq!(
-        finish_as_strings(leaker),
-        BTreeSet::from([quote!(#ta).to_string()])
-    );
+            .enumerate()
+            .map(|(ix, ty)| {
+                let mark = if referrer.must(ix) { "" } else { "? " };
+                format!("{}{}", mark, ty_string(ty.clone()))
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+    let cases: Vec<(&str, bool, Item, Vec<&str>)> = vec![
+        (
+            // All fields are the struct's own generic params: all neutral.
+            "neutral generics",
+            false,
+            parse_quote! { struct S<T, U> { a: T, b: U } },
+            vec![],
+        ),
+        (
+            // The type of an external crate is an optional entry (old: nothing interned at all),
+            // see `Referrer::must()`.
+            "an absolute path is optional",
+            false,
+            parse_quote! { struct S { a: ::std::string::String } },
+            vec!["? :: std :: string :: String"],
+        ),
+        (
+            "`::core` is never leaked",
+            false,
+            parse_quote! {
+                struct S {
+                    a: ::core::option::Option<(::core::primitive::u8, ::core::primitive::bool)>
+                }
+            },
+            vec![],
+        ),
+        (
+            // A single relative-path field is a must-intern root and must be kept.
+            "single must-intern",
+            false,
+            parse_quote! { struct S { a: RelType } },
+            vec!["RelType"],
+        ),
+        (
+            "two independent must-intern roots both survive",
+            false,
+            parse_quote! { struct S { a: TypeA, b: TypeB } },
+            vec!["TypeA", "TypeB"],
+        ),
+        (
+            // A neutral root whose children are all neutral is dropped entirely, but for the type
+            // of an external crate in it, an optional entry: the inner one, as it is the cut
+            // closest to the sink.
+            "neutral root is dropped, the external type in it stays optional",
+            false,
+            parse_quote! {
+                struct S<T> { a: (T, ::std::string::String), b: (T, ::core::primitive::u8) }
+            },
+            vec!["? :: std :: string :: String"],
+        ),
+        (
+            "neutral root is dropped",
+            false,
+            parse_quote! { struct S<T> { a: (T, ::core::string::String) } },
+            vec![],
+        ),
+        (
+            // A must-intern type nested inside a compound wrapper: the inner type is interned (it
+            // is the innermost minimum cut), and the wrapper is rebuilt around it.
+            "root covers descendant",
+            true,
+            parse_quote! { struct S { a: (RelType, ::std::string::String) } },
+            vec!["RelType"],
+        ),
+        (
+            // Generic field (neutral root) alongside a relative-path field (must-intern root).
+            "mixed neutral and must-intern",
+            false,
+            parse_quote! { struct S<T> { a: T, b: RelType } },
+            vec!["RelType"],
+        ),
+        (
+            // A relative type three levels deep: only the inner type is kept; neither the
+            // intermediate Vec wrapper nor the tuples appear as a separate entry. (A bare
+            // `Vec<RelInner>` would be interned as a whole: see
+            // `test_reduce_roots_bare_identifier_argument`.)
+            "deep nesting",
+            true,
+            parse_quote! {
+                struct S { a: (::std::vec::Vec<(RelInner,)>, ::std::string::String) }
+            },
+            vec!["RelInner"],
+        ),
+        (
+            // A type appears as a direct must-intern root (field a) AND as a must-intern
+            // descendant inside a compound root (field b). Interning it covers both.
+            "type in both positions",
+            false,
+            parse_quote! {
+                struct S {
+                    a: RelType,
+                    b: (RelType, ::std::string::String),
+                }
+            },
+            vec!["? :: std :: string :: String", "RelType"],
+        ),
+        (
+            // Four wrappers of the same type: interning it takes one implementation, not four.
+            // (The type is not a bare identifier as an argument, which may be a const, see
+            // `test_reduce_roots_bare_identifier_argument`.)
+            "wrappers of one type",
+            true,
+            parse_quote! {
+                struct S {
+                    a: ::std::vec::Vec<(Rel,)>,
+                    b: ::core::option::Option<(Rel,)>,
+                    c: (Rel, ::std::string::String),
+                    d: ::std::boxed::Box<(Rel,)>,
+                }
+            },
+            vec!["Rel"],
+        ),
+        (
+            "wrappers of one type and the bare type",
+            true,
+            parse_quote! {
+                struct S {
+                    a: ::std::vec::Vec<(Rel,)>,
+                    b: ::core::option::Option<(Rel,)>,
+                    c: (Rel, ::std::string::String),
+                    d: ::std::boxed::Box<(Rel,)>,
+                    e: Rel,
+                }
+            },
+            vec!["Rel"],
+        ),
+        (
+            // The same tuple of three types twice: the tuple (1) is cheaper than its parts (3).
+            "common ancestor",
+            true,
+            parse_quote! {
+                struct S {
+                    a: (RelA, RelB, RelC),
+                    b: ::std::vec::Vec<(RelA, RelB, RelC)>,
+                }
+            },
+            vec!["(RelA , RelB , RelC)"],
+        ),
+        (
+            // Two tuples sharing a part: the two tuples (2) are cheaper than the three parts (3).
+            "two tuples sharing a part",
+            true,
+            parse_quote! { struct S { a: (RelA, RelB), b: (RelA, RelC) } },
+            vec!["(RelA , RelB)", "(RelA , RelC)"],
+        ),
+        (
+            // `Vec<(Rel,)>`, `(Rel,)` and `Rel` cover the only path equally; the inner one is
+            // taken.
+            "the inner type is preferred on a tie",
+            true,
+            parse_quote! { struct S { a: ::std::vec::Vec<(Rel,)> } },
+            vec!["Rel"],
+        ),
+        (
+            "a red root is interned itself",
+            true,
+            parse_quote! { struct S { a: Rel } },
+            vec!["Rel"],
+        ),
+        (
+            // Self::AssocType in a trait method return position is neutral (concrete to each
+            // implementor).
+            "Self::Assoc is neutral",
+            false,
+            parse_quote! {
+                trait MyTrait {
+                    type Assoc;
+                    fn method() -> Self::Assoc;
+                }
+            },
+            vec![],
+        ),
+        (
+            // S::Item where S is a method-level generic is neutral: the caller provides S
+            // directly so its associated types are also concrete.
+            "S::Item of a method generic is neutral",
+            false,
+            parse_quote! {
+                trait MyTrait {
+                    fn method<S: ::core::iter::Iterator>() -> S::Item;
+                }
+            },
+            vec![],
+        ),
+    ];
+    for (name, is_quiet, item, expected) in &cases {
+        let got = if *is_quiet {
+            entries(quiet(), item)
+        } else {
+            entries(Leaker::new(), item)
+        };
+        assert_eq!(got, *expected, "{}: {}", name, quote!(#item));
+    }
 }
 
 /// A Leaker that writes the paths of external crates as they are, so that the tests of the cut
@@ -192,106 +250,12 @@ fn ty_string(ty: Type) -> String {
 }
 
 #[test]
-fn test_reduce_roots_wrappers_of_one_type() {
-    // Four wrappers of the same type: interning it takes one implementation, not four. (The type
-    // is not a bare identifier as an argument, which may be a const, see
-    // `test_reduce_roots_bare_identifier_argument`.)
-    let leaked = leaked_of(parse_quote! {
-        struct S {
-            a: ::std::vec::Vec<(Rel,)>,
-            b: ::core::option::Option<(Rel,)>,
-            c: (Rel, ::std::string::String),
-            d: ::std::boxed::Box<(Rel,)>,
-        }
-    });
-    assert_eq!(leaked, [ty_string(parse_quote!(Rel))]);
-    // With the bare type as well.
-    let leaked = leaked_of(parse_quote! {
-        struct S {
-            a: ::std::vec::Vec<(Rel,)>,
-            b: ::core::option::Option<(Rel,)>,
-            c: (Rel, ::std::string::String),
-            d: ::std::boxed::Box<(Rel,)>,
-            e: Rel,
-        }
-    });
-    assert_eq!(leaked, [ty_string(parse_quote!(Rel))]);
-}
-
-#[test]
-fn test_reduce_roots_common_ancestor() {
-    // The same tuple of three types twice: the tuple (1) is cheaper than its parts (3).
-    let leaked = leaked_of(parse_quote! {
-        struct S {
-            a: (RelA, RelB, RelC),
-            b: ::std::vec::Vec<(RelA, RelB, RelC)>,
-        }
-    });
-    assert_eq!(leaked, [ty_string(parse_quote!((RelA, RelB, RelC)))]);
-    // Two tuples sharing a part: the two tuples (2) are cheaper than the three parts (3).
-    let leaked = leaked_of(parse_quote! {
-        struct S {
-            a: (RelA, RelB),
-            b: (RelA, RelC),
-        }
-    });
-    assert_eq!(
-        leaked,
-        [
-            ty_string(parse_quote!((RelA, RelB))),
-            ty_string(parse_quote!((RelA, RelC))),
-        ]
-    );
-}
-
-#[test]
-fn test_reduce_roots_prefers_inner_type_on_a_tie() {
-    // `Vec<(Rel,)>`, `(Rel,)` and `Rel` cover the only path equally; the inner one is taken.
-    let leaked = leaked_of(parse_quote! { struct S { a: ::std::vec::Vec<(Rel,)> } });
-    assert_eq!(leaked, [ty_string(parse_quote!(Rel))]);
-    // A red root is interned itself.
-    let leaked = leaked_of(parse_quote! { struct S { a: Rel } });
-    assert_eq!(leaked, [ty_string(parse_quote!(Rel))]);
-}
-
-#[test]
 fn test_reduce_roots_allowed_path_is_neutral() {
     // A type under an explicitly allowed path prefix is neutral → empty.
     let item: ItemStruct = parse_quote! { struct S { a: some_mod::SomeType } };
     let config = Rules::new().or_if(starts_with(parse_quote!(some_mod)));
     let mut leaker = Leaker::from_config(config, Options::new());
     leaker.intern_struct(&item, true);
-    leaker.reduce_roots();
-    assert!(leaker.result().finish().unwrap().is_empty());
-}
-
-#[test]
-fn test_reduce_roots_self_assoc_type_neutral() {
-    // Self::AssocType in a trait method return position is neutral (concrete to each
-    // implementor).
-    let item: ItemTrait = parse_quote! {
-        trait MyTrait {
-            type Assoc;
-            fn method() -> Self::Assoc;
-        }
-    };
-    let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
-    leaker.reduce_roots();
-    assert!(leaker.result().finish().unwrap().is_empty());
-}
-
-#[test]
-fn test_reduce_roots_generic_assoc_type_neutral() {
-    // S::Item where S is a method-level generic is neutral: the caller provides S
-    // directly so its associated types are also concrete.
-    let item: ItemTrait = parse_quote! {
-        trait MyTrait {
-            fn method<S: ::core::iter::Iterator>() -> S::Item;
-        }
-    };
-    let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
     leaker.reduce_roots();
     assert!(leaker.result().finish().unwrap().is_empty());
 }
@@ -466,20 +430,19 @@ fn test_reduce_roots_trait_object_inheriting_the_lifetime_of_its_path() {
     // `Ref<'a, T: 'a>` makes the lifetime bound of `dyn RelTr` `'a`, which `dyn RelTr` alone
     // (`dyn RelTr + 'static`) does not have, so the trait object cannot be interned alone. It has
     // to be (it names a relative trait), so the whole path is interned.
-    let group = Type::Group(TypeGroup {
-        group_token: Default::default(),
-        elem: Box::new(parse_quote!(dyn RelTr)),
-    });
+    let rel_object = group(parse_quote!(dyn RelTr));
+    let tr_object = group(parse_quote!(dyn ::p::Tr<Rel>));
     for (ty, generics) in [
         (parse_quote!(::core::cell::Ref<'a, dyn RelTr>), "< 'a >"),
         (parse_quote!(::core::cell::Ref<'a, (dyn RelTr)>), "< 'a >"),
-        (parse_quote!(::core::cell::Ref<'a, #group>), "< 'a >"),
+        (parse_quote!(::core::cell::Ref<'a, #rel_object>), "< 'a >"),
         (parse_quote!(::p::W<'a, dyn RelTr<Rel>>), "< 'a >"),
         (parse_quote!(::p::W<'a, (), dyn RelTr>), "< 'a >"),
         // `Rel` may be a const (a bare identifier as an argument), which cannot be interned
         // alone, so the type containing it has to be interned: the trait object, and so the path.
         (parse_quote!(::p::W<'a, dyn ::p::Tr<Rel>>), "< 'a >"),
         (parse_quote!(::p::W<'a, (dyn ::p::Tr<Rel>)>), "< 'a >"),
+        (parse_quote!(::p::W<'a, #tr_object>), "< 'a >"),
         // A lifetime which the type context provides.
         (parse_quote!(::p::W<'x, dyn RelTr>), ""),
     ] {
@@ -735,6 +698,7 @@ fn test_reduce_roots_reference_to_a_trait_object() {
     // cannot be written out either), so the whole reference is. The same with a lifetime bound
     // written, as before: the reference is the type that carries the bound `'b: 'a` it implies.
     let rel_object = group(parse_quote!(dyn RelTr));
+    let tr_object = group(parse_quote!(dyn ::p::Tr<Rel>));
     let wholes: Vec<Type> = vec![
         parse_quote!(&'a dyn RelTr),
         parse_quote!(&'a (dyn RelTr)),
@@ -743,6 +707,7 @@ fn test_reduce_roots_reference_to_a_trait_object() {
         parse_quote!(&'a #rel_object),
         parse_quote!(&'a dyn ::p::Tr<Rel>),
         parse_quote!(&'a (dyn ::p::Tr<Rel>)),
+        parse_quote!(&'a #tr_object),
         parse_quote!(&'a (dyn RelTr + 'static)),
         parse_quote!(&'a (dyn RelTr + 'a)),
         parse_quote!(&'a (dyn ::p::Tr<Rel> + 'static)),
@@ -1054,65 +1019,6 @@ fn test_reduce_roots_path_with_a_lifetime_the_copy_would_leave_unconstrained() {
         leaked,
         [entry(parse_quote!(::p::W<'a, dyn RelTr>), "< 'a >")]
     );
-    // A function which is the analyzed item (its generics are those of the scope) is not affected
-    // either: the lifetime is a generic of the Leaker, and local for a nested one, as for a
-    // method.
-    let item: ItemFn = parse_quote! { fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () { loop {} } };
-    let mut leaker = Leaker::new();
-    enter_function(&mut leaker, &item.sig);
-    assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
-    // As local generics it is checked in a method of a trait or of an impl of a trait (a method
-    // that the walk reaches alone, in `enter_impl()` given a trait). A function nested in a scope
-    // or in a module, and a method of an inherent impl (`enter_impl()` given none), have no
-    // signature to differ from, so the copy compiles with `'b` early-bound (F22).
-    let trait_: Path = parse_quote!(::p::Tr);
-    let sig = &item.sig;
-    let mut leaker = Leaker::new();
-    leaker.enter_impl(
-        &Generics::default(),
-        &parse_quote!(::p::W),
-        Some(&trait_),
-        true,
-        |view| view.visit_impl_item_fn(&parse_quote!(#sig { loop {} })),
-    );
-    let result = leaker.result();
-    let err = result.errors();
-    assert!(to_syn_error(err).to_string().contains("E0195"));
-    let mut leaker = Leaker::new();
-    leaker.enter_impl(
-        &Generics::default(),
-        &parse_quote!(::p::W),
-        None,
-        true,
-        |view| view.visit_impl_item_fn(&parse_quote!(#sig { loop {} })),
-    );
-    assert!(leaker.result().errors().is_empty());
-    let of_trait: ItemImpl = parse_quote! { impl ::p::Tr for ::p::W { #sig { loop {} } } };
-    let mut leaker = Leaker::new();
-    leaker.enter_generics(&Generics::default(), |view| {
-        view.visit_item(&Item::Impl(of_trait.clone()))
-    });
-    let result = leaker.result();
-    let err = result.errors();
-    assert!(to_syn_error(err).to_string().contains("E0195"));
-    let inherent: ItemImpl = parse_quote! { impl ::p::W { #sig { loop {} } } };
-    let mut leaker = Leaker::new();
-    leaker.enter_generics(&Generics::default(), |view| {
-        view.visit_item(&Item::Impl(inherent.clone()))
-    });
-    // The self type (an external path) and the path.
-    assert_eq!(leaker.result().finish().unwrap().iter().count(), 2);
-    let mut leaker = Leaker::new();
-    leaker.enter_generics(&Generics::default(), |view| {
-        view.visit_item(&Item::Fn(item.clone()))
-    });
-    assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
-    let item: ItemMod = parse_quote! {
-        mod m { fn f<'b>(x: ::p::W<'b, dyn RelTr>) -> &'b () { loop {} } }
-    };
-    let mut leaker = Leaker::new();
-    leaker.intern_mod(&item);
-    assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
 }
 
 /// The signature of the trait, for the messages.
@@ -1794,6 +1700,13 @@ fn test_reduce_roots_bare_identifier_is_a_type_if_the_path_cannot_be_interned() 
         leaked_returning(&parse_quote!(::p::W<'_, Rel>)),
         [entry(parse_quote!(Rel), "")]
     );
+    assert_eq!(
+        leaked_trait(&parse_quote! { trait Tr { fn f<T: ::p::Sup<Size>>(&self); } }),
+        [entry(parse_quote!(Size), "")]
+    );
+    // A const in braces, which cannot be leaked on its own, is still an error.
+    let err = error_of(&parse_quote! { trait Tr: ::p::Sup<{ SIZE }> {} });
+    assert!(err.contains("use absolute path: 'SIZE'"), "{}", err);
     // A group is transparent.
     let size = group(parse_quote!(SIZE));
     assert_eq!(
@@ -1913,60 +1826,6 @@ fn test_reduce_roots_bare_identifier_in_other_positions_is_a_type() {
             ty_string(ty.clone())
         );
     }
-}
-
-#[test]
-fn test_reduce_roots_bare_identifier_in_a_trait_object_inheriting_a_lifetime() {
-    // The whole path is interned, also with parentheses or a group around the trait object, which
-    // are not interned (nor are the types around the identifier).
-    let object = group(parse_quote!(dyn ::p::Tr<SIZE>));
-    for ty in [
-        parse_quote!(::p::W<'a, dyn ::p::Tr<SIZE>>),
-        parse_quote!(::p::W<'a, (dyn ::p::Tr<SIZE>)>),
-        parse_quote!(::p::W<'a, #object>),
-    ] {
-        let ty: Type = ty;
-        let item: ItemTrait = parse_quote! { trait Tr<'a> { fn f(&self, x: #ty); } };
-        assert_eq!(
-            leaked_trait(&item),
-            [entry(ty.clone(), "< 'a >")],
-            "{}",
-            ty_string(ty.clone())
-        );
-    }
-    // The referent of a reference makes the reference to be interned as a whole.
-    let ty: Type = parse_quote!(&'a dyn ::p::Tr<SIZE>);
-    let paren: Type = parse_quote!(&'a (dyn ::p::Tr<SIZE>));
-    let grouped: Type = parse_quote!(&'a #object);
-    for ty in [ty, paren, grouped] {
-        let item: ItemTrait = parse_quote! { trait Tr<'a> { fn f(&self, x: #ty); } };
-        assert_eq!(
-            leaked_trait(&item),
-            [entry(ty.clone(), "< 'a >")],
-            "{}",
-            ty_string(ty.clone())
-        );
-    }
-}
-
-#[test]
-fn test_reduce_roots_bare_identifier_in_a_bound_is_not_an_error() {
-    // At the root, `SIZE` is leaked as a type, whatever it is.
-    assert_eq!(
-        leaked_trait(&parse_quote! { trait Tr: ::p::Sup<SIZE> {} }),
-        [entry(parse_quote!(SIZE), "")]
-    );
-    assert_eq!(
-        leaked_trait(&parse_quote! { trait Tr { fn f<T: ::p::Sup<SIZE>>(&self); } }),
-        [entry(parse_quote!(SIZE), "")]
-    );
-    assert_eq!(
-        leaked_trait(&parse_quote! { trait Tr { fn f<T: ::p::Sup<Size>>(&self); } }),
-        [entry(parse_quote!(Size), "")]
-    );
-    // A const in braces, which cannot be leaked on its own, is still an error.
-    let err = error_of(&parse_quote! { trait Tr: ::p::Sup<{ SIZE }> {} });
-    assert!(err.contains("use absolute path: 'SIZE'"), "{}", err);
 }
 
 #[test]

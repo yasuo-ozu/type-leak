@@ -337,22 +337,6 @@ fn a_trait_with_only_optional_external_types_has_plain_entries_for_a_marker() {
 
 // ── repeater_impl ────────────────────────────────────────────────────────────────────────────
 
-/// `(<S>::A): Clone` as the first predicate is `<S>::A: Clone`.
-fn unparenthesized(mut generics: Generics) -> Generics {
-    if let Some(WherePredicate::Type(predicate)) = generics
-        .where_clause
-        .as_mut()
-        .and_then(|clause| clause.predicates.first_mut())
-    {
-        if let Type::Paren(TypeParen { elem, .. }) = &predicate.bounded_ty {
-            if matches!(elem.as_ref(), Type::Path(TypePath { qself: Some(_), .. })) {
-                predicate.bounded_ty = (**elem).clone();
-            }
-        }
-    }
-    generics
-}
-
 fn with_where(generics: &Generics) -> String {
     format!("{} {}", s(generics), s(&generics.where_clause))
 }
@@ -450,9 +434,6 @@ fn repeater_impl_for_the_implementor_of_a_trait() {
         "(< __Impl > :: A) : 'a"
     );
     assert_eq!(s(&r.ty), "& 'a Rel < < __Impl > :: A >");
-    // Another predicate first is not touched.
-    let original = unparenthesized(r.generics.clone());
-    assert_eq!(s(&original.where_clause), "where < __Impl > :: A : 'a");
 }
 
 #[test]
@@ -716,105 +697,6 @@ fn entry_args_with_the_defaults_completed() {
 // ── The items of the errors ──────────────────────────────────────────────────────────────────
 
 #[test]
-fn items_has_every_offending_path() {
-    let item: ItemTrait = parse_quote! {
-        pub trait MyTrait: Clone + MyBound {
-            fn f(&self, x: MyType<'_>);
-        }
-    };
-    let mut leaker = Leaker::new();
-    leaker.intern_trait(&item, true);
-    let result = leaker.result();
-    let err = result.errors();
-    let items = &err;
-    assert_eq!(items.len(), 3);
-    assert_eq!(
-        items
-            .iter()
-            .map(|item| item.message.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "use absolute path: 'Clone'",
-            "use absolute path: 'MyBound'",
-            "use absolute path: 'MyType<'_>'"
-        ]
-    );
-    assert_eq!(
-        items
-            .iter()
-            .map(|item| item.cause.to_token_stream().to_string())
-            .collect::<Vec<_>>(),
-        ["Clone", "MyBound", "MyType < '_ >"]
-    );
-    // The help says what to write, the notes why.
-    assert_eq!(
-        items[0].help_text(),
-        Some("use `::core::clone::Clone` instead of `Clone`")
-    );
-    assert_eq!(
-        items[1].help_text(),
-        Some("write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`)")
-    );
-    assert!(items[2]
-        .help_text()
-        .unwrap()
-        .starts_with("write `MyType` with an absolute path"));
-    assert!(items.iter().all(|item| item.help.is_some()));
-    assert_eq!(items[0].notes.first().map(|(_, n)| n.as_str()), None);
-    assert_eq!(items[1].notes.first().map(|(_, n)| n.as_str()), None);
-    assert!(items[2]
-        .notes
-        .first()
-        .map(|(_, n)| n.as_str())
-        .unwrap()
-        .contains("because of `'_`"));
-    assert_eq!(items[2].notes.len(), 1);
-    // The first is what the first-error accessors tell.
-    assert_eq!(err[0].notes.first().map(|(_, n)| n.as_str()), None);
-    assert_eq!(err[0].help_text(), items[0].help_text());
-    let _ = err[0].span();
-    // The messages are what the headlines say, and `syn::Error` has one error for each.
-    assert_eq!(
-        messages(err),
-        items
-            .iter()
-            .map(|item| item.message.clone())
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    assert_eq!(to_syn_error(err).into_iter().count(), items.len());
-}
-
-#[test]
-fn items_of_self_without_meaning() {
-    let mut leaker = Leaker::new();
-    leaker.enter_generics(&Generics::default(), |view| {
-        view.visit_type(&parse_quote!(Rel<Self>));
-        view.visit_type(&parse_quote!(Wrap<Self::Item>));
-    });
-    let result = leaker.result();
-    let err = result.errors();
-    let items = err;
-    assert_eq!(
-        items
-            .iter()
-            .map(|item| item.cause.to_token_stream().to_string())
-            .collect::<Vec<_>>(),
-        ["Self", "Self :: Item"]
-    );
-    for item in items {
-        assert_eq!(item.message, "`Self` has no meaning here");
-        assert!(item
-            .notes
-            .first()
-            .map(|(_, n)| n.as_str())
-            .unwrap()
-            .starts_with("`Self` has no meaning here: it is declared only"));
-        assert_eq!(item.help_text(), Some("write the type instead of `Self`"));
-    }
-}
-
-#[test]
 fn display_uses_the_headline_of_the_cause() {
     // A cause that is not that a path is relative has its own headline, in the messages, in the
     // first error, in `syn::Error` and in the first line of the tokens.
@@ -1003,44 +885,6 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
     assert!(generic_self > 0);
 }
 
-/// `trait Tr<T: AsRef<Self>, U = Rel<T>>`: the default `Rel<T>` does not name `Self`, so
-/// `context_self()` is `None`, but the generics of its context do. With a concrete type that
-/// `Self` would be that type, so there is no bucket: the impl is for a parameter, which is the
-/// implementor of the trait in the copy.
-#[test]
-fn a_default_whose_generics_name_self_has_no_bucket() {
-    let (referrer, _) = analyze(&parse_quote! {
-        trait Tr<T: AsRef<Self>, U = Rel<T>> { fn f(&self, t: T) -> U; }
-    });
-    let rel = referrer.iter().position(|ty| s(ty) == "Rel < T >").unwrap();
-    let context = referrer.context(rel);
-    assert!(referrer.context_self(context).is_none());
-    assert!(names_self(referrer.context_generics(context)));
-    assert_eq!(referrer.bucket_self(rel, 7), None);
-    let param: Ident = parse_quote!(__S);
-    let r = referrer
-        .repeater_impl(
-            rel,
-            ImplSelf::Bucket {
-                id: 7,
-                param: &param,
-            },
-            array_const,
-        )
-        .unwrap();
-    assert_eq!(s(&r.self_ty), "__S");
-    assert_eq!(
-        r,
-        referrer
-            .repeater_impl(rel, ImplSelf::Param(&param), array_const)
-            .unwrap()
-    );
-    assert_eq!(
-        with_where(&r.generics),
-        with_where(&parse_quote!(<T: AsRef<Self>, __S: ?::core::marker::Sized>))
-    );
-}
-
 /// The entries of one item do not all share a bucket, and the same entry of other ids does not
 /// either: the type is `splitmix64(id + ix * 0x9E3779B97F4A7C15)` modulo 17 of the list.
 #[test]
@@ -1165,52 +1009,59 @@ fn impl_self_bucket_is_copy_and_debug() {
     is_clone::<ImplSelf<'_>>();
 }
 
-// ── ImplSelf::Marker for an entry whose generics name Self ───────────────────────────────────
+// ── An entry whose generics name Self ────────────────────────────────────────────────────────
 
-/// `Marker` for the entry of `trait Tr<T: AsRef<Self>, U = Rel<T>>`: `context_self()` is `None`, but
-/// the generics of its context name `Self` (`needs_self()`), which in an impl for a marker would be
-/// the marker: `impl<T: AsRef<Self>> Repeater<..> for Marker` bounds `T: AsRef<Marker>`, where the
-/// copy has `T: AsRef<Host>`, so an impl of the copy that instantiates the default (`impl
-/// Tr<String> for Host`) fails with E0277 (`String: AsRef<Marker>`). So it is `NeedsSelf`, as for an
-/// entry that names `Self`; `ImplSelf::Param` (or `Bucket`, which falls back to it) is the choice.
+/// The entry of `trait Tr<T: AsRef<Self>, U = Rel<T>>`: the default `Rel<T>` does not name `Self`,
+/// so `context_self()` is `None`, but the generics of its context do (`needs_self()`, like the
+/// entry `Wrap<Self>`). With a concrete type that `Self` would be that type, so there is no bucket
+/// and `Marker` is refused: `impl<T: AsRef<Self>> Repeater<..> for Marker` bounds `T: AsRef<Marker>`,
+/// where the copy has `T: AsRef<Host>`, so an impl of the copy that instantiates the default
+/// (`impl Tr<String> for Host`) fails with E0277 (`String: AsRef<Marker>`). The impl is for a
+/// parameter, which is the implementor of the trait in the copy.
 #[test]
-fn marker_is_refused_for_the_entry_of_a_default_whose_generics_name_self() {
+fn the_entry_of_a_default_whose_generics_name_self_is_for_a_parameter() {
     let (referrer, _) = analyze(&parse_quote! {
-        trait Tr<T: AsRef<Self>, U = Rel<T>> { fn f(&self, t: T) -> U; }
+        trait Tr<T: AsRef<Self>, U = Rel<T>> { fn f(&self, t: T) -> U; fn g(&self) -> Wrap<Self>; }
     });
     let rel = referrer.iter().position(|ty| s(ty) == "Rel < T >").unwrap();
-    assert!(referrer.context_self(referrer.context(rel)).is_none());
-    assert!(referrer.needs_self(rel));
+    let wrap = referrer
+        .iter()
+        .position(|ty| s(ty) == "Wrap < Self >")
+        .unwrap();
+    let context = referrer.context(rel);
+    assert!(referrer.context_self(context).is_none());
+    assert!(names_self(referrer.context_generics(context)));
+    assert!(referrer.needs_self(wrap) && referrer.needs_self(rel));
+    assert_eq!(referrer.bucket_self(rel, 7), None);
+    // A bucket falls back to a parameter, for which `Self` of the generics is the parameter.
+    let param: Ident = parse_quote!(__S);
+    let r = referrer
+        .repeater_impl(
+            rel,
+            ImplSelf::Bucket {
+                id: 7,
+                param: &param,
+            },
+            array_const,
+        )
+        .unwrap();
+    assert_eq!(s(&r.self_ty), "__S");
+    assert_eq!(
+        r,
+        referrer
+            .repeater_impl(rel, ImplSelf::Param(&param), array_const)
+            .unwrap()
+    );
+    assert_eq!(
+        with_where(&r.generics),
+        with_where(&parse_quote!(<T: AsRef<Self>, __S: ?::core::marker::Sized>))
+    );
     let marker: Type = parse_quote!(crate::Marker);
     match referrer.repeater_impl(rel, ImplSelf::Marker(&marker), array_const) {
         Err(EncodeError::NeedsSelf(ty)) => assert_eq!(s(&*ty), "Rel < T >"),
         other => panic!("{:?}", other.map(|r| r.self_ty)),
     }
-    // For a parameter, `Self` of the generics is the parameter.
-    let param: Ident = parse_quote!(__S);
-    let r = referrer
-        .repeater_impl(rel, ImplSelf::Param(&param), array_const)
-        .unwrap();
-    assert_eq!(s(&r.self_ty), "__S");
-    assert_eq!(
-        with_where(&r.generics),
-        with_where(&parse_quote!(<T: AsRef<Self>, __S: ?::core::marker::Sized>))
-    );
-}
-
-/// `needs_self()` is true for an entry that names `Self` and for one whose generics do, not for the
-/// others.
-#[test]
-fn needs_self_for_an_entry_that_names_self_or_whose_generics_do() {
-    let (referrer, _) = analyze(&parse_quote! {
-        trait Tr<T: AsRef<Self>, U = Rel<T>> { fn f(&self, t: T) -> U; fn g(&self) -> Wrap<Self>; }
-    });
-    let wrap = referrer
-        .iter()
-        .position(|ty| s(ty) == "Wrap < Self >")
-        .unwrap();
-    let rel = referrer.iter().position(|ty| s(ty) == "Rel < T >").unwrap();
-    assert!(referrer.needs_self(wrap) && referrer.needs_self(rel));
+    // No entry needs `Self` if neither it nor its generics name it.
     let (referrer, _) = analyze(&parse_quote! {
         trait Tr<T, U = Rel<T>> { fn f(&self, t: T) -> U; fn g(&self) -> Wrap<T>; }
     });

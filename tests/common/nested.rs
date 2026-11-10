@@ -1,5 +1,5 @@
 //! Builds a fixture crate of `tests/crates` with a nested `cargo`, for the tests which check what
-//! rustc says about it (tests/outlives.rs, tests/diagnostic.rs, tests/trusting.rs).
+//! rustc says about it (tests/diagnostic.rs).
 //!
 //! The fixtures are built on their own, so that a failure of one does not break the other
 //! tests (the crates they depend on are shared by all of them). They share one target directory,

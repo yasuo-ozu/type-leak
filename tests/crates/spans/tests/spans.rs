@@ -6,7 +6,7 @@
 //! `syn::parse_str()`, so that every token has a line and a column, and compare the span of an
 //! error with the place of the offending path in the string. They need the feature
 //! `span-locations` of `proc-macro2`, which the package of these tests asks for, and the others
-//! cannot have (see `Cargo.toml`): `tests/spans.rs` of `type-leak` runs them.
+//! cannot have (see `Cargo.toml`): `tests/diagnostic.rs` of `type-leak` runs them.
 
 mod support;
 

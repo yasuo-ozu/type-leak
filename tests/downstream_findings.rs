@@ -973,24 +973,22 @@ fn fourteen_a_relative_path_in_a_default_method_body_is_rejected() {
     );
 }
 
-/// 14: an enum discriminant is always read: a relative path in it is rejected, and a type in it is
-/// leaked (as in an array length), with the option or without it.
+/// 14: an enum discriminant and an array length are always read, with the option or without it: a
+/// relative path in a discriminant is rejected, a type in it is leaked (as in an array length), and
+/// the whole array is leaked with a type in its length.
 #[test]
-fn fourteen_a_discriminant_is_always_read() {
+fn fourteen_a_discriminant_and_an_array_length_are_always_read() {
     for check_values in [false, true] {
+        let options = if check_values {
+            Options::new().check_values()
+        } else {
+            Options::new()
+        };
         let item: ItemEnum = parse_quote! { enum E { A = inner::X, B = 2 } };
-        let mut leaker = Leaker::from_config(
-            config(),
-            if check_values {
-                Options::new().check_values()
-            } else {
-                Options::new()
-            },
-        );
+        let mut leaker = Leaker::from_config(config(), options);
         leaker.intern_enum(&item, true);
         let result = leaker.result();
-        let err = result.errors();
-        let items = err;
+        let items = result.errors();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].message, "use absolute path: 'inner::X'");
         assert_eq!(items[0].help_text(), Some(help_for("inner::X").as_str()));
@@ -998,38 +996,18 @@ fn fourteen_a_discriminant_is_always_read() {
         let item: ItemEnum = parse_quote! {
             enum E { A = ::core::mem::size_of::<inner::Local>() as isize }
         };
-        let mut leaker = Leaker::from_config(
-            config(),
-            if check_values {
-                Options::new().check_values()
-            } else {
-                Options::new()
-            },
-        );
+        let mut leaker = Leaker::from_config(config(), options);
         leaker.intern_enum(&item, true);
         let referrer = leaker.result().finish().unwrap();
         assert_eq!(
             referrer.iter().map(text).collect::<Vec<_>>(),
             ["inner :: Local"]
         );
-    }
-}
 
-/// 14: an array length in a type is read, and the whole array is leaked.
-#[test]
-fn fourteen_an_array_length_is_always_read() {
-    for check_values in [false, true] {
         let item: ItemTrait = parse_quote! {
             trait Tr { fn f(&self) -> [u8; ::core::mem::size_of::<inner::Local>()]; }
         };
-        let mut leaker = Leaker::from_config(
-            config(),
-            if check_values {
-                Options::new().check_values()
-            } else {
-                Options::new()
-            },
-        );
+        let mut leaker = Leaker::from_config(config(), options);
         leaker.intern_trait(&item, true);
         let referrer = leaker.result().finish().unwrap();
         assert_eq!(
@@ -1045,7 +1023,8 @@ fn fourteen_an_array_length_is_always_read() {
 /// on `two!` in `[u8; two!()]` spanned from the path to the attribute of the proc macro. It has the
 /// span of the last name of the path now, so every token of a cause is in the item. The spans are
 /// tested in `tests/crates/spans/tests/spans.rs` (`proc-macro2` needs `span-locations` for that;
-/// `tests/spans.rs` runs them). Here: the cause is still `two !`, and it is read back as written.
+/// the module `spans` of `tests/diagnostic.rs` runs them). Here: the cause is still `two !`, and it
+/// is read back as written.
 #[test]
 fn issue_one_a_macro_cause_is_written_with_its_bang() {
     let item: ItemStruct = parse_quote!(
@@ -1069,33 +1048,8 @@ fn issue_one_a_macro_cause_is_written_with_its_bang() {
 /// type instead of `Self` in `ty ! (Self)`", so a tool that prints "message: help" on one line had
 /// two colons, and the headline and the help printed the macro call with the spaces of a token
 /// stream. The help is "name the type instead of `Self` in `ty!(Self)`" now, and `tidy` joins a
-/// macro call.
-#[test]
-fn issue_two_the_help_of_a_default_that_names_self_has_no_colon_of_its_own() {
-    let item: ItemStruct = parse_quote!(
-        struct S<T = ty!(Self)>(T);
-    );
-    let mut leaker = Leaker::from_config(config(), Options::new());
-    leaker.intern_struct(&item, true);
-    let result = leaker.result();
-    let errors = result.errors();
-    assert_eq!(errors.len(), 1, "{}", messages(errors));
-    assert_eq!(errors[0].reason, Reason::SelfInDefault);
-    assert_eq!(
-        errors[0].message,
-        "`ty!(Self)` is in the default of a parameter, and names `Self`"
-    );
-    assert_eq!(
-        errors[0].help_text(),
-        Some("name the type instead of `Self` in `ty!(Self)`")
-    );
-    // On one line: one colon.
-    let line = format!("{}: {}", errors[0].message, errors[0].help_text().unwrap());
-    assert_eq!(line.matches(':').count(), 1, "{}", line);
-}
-
-/// Issue 2: the macro call is joined (`m!(..)`, `m![..]`, `m!{..}`) after a name, in every message
-/// that prints tokens as one writes them, and an unrelated `!` keeps its space.
+/// macro call (`m!(..)`, `m![..]`, `m!{..}`) after a name, in every message that prints tokens as
+/// one writes them; an unrelated `!` keeps its space.
 #[test]
 fn issue_two_a_macro_call_is_printed_as_one_writes_it() {
     for (default, shown) in [
@@ -1110,6 +1064,7 @@ fn issue_two_a_macro_call_is_printed_as_one_writes_it() {
         let result = leaker.result();
         let errors = result.errors();
         assert_eq!(errors.len(), 1, "{}: {}", default, messages(errors));
+        assert_eq!(errors[0].reason, Reason::SelfInDefault, "{}", default);
         assert_eq!(
             errors[0].message,
             format!(
@@ -1163,7 +1118,7 @@ fn prose(help: &str) -> String {
 }
 
 /// Issue 2: no help is a lead clause, a colon and an instruction. This covers the helps of the
-/// table of `tests/help.rs` (`every_kind_of_error_has_a_help` checks it for every row) and those of
+/// table of `tests/error_items.rs` (`every_kind_of_error_has_a_help` checks it for every row) and those of
 /// the examples here: the headline and the help join with one colon.
 #[test]
 fn issue_two_a_help_has_no_colon_in_its_words() {

@@ -3,7 +3,7 @@
 //! encoders and of the Referrer that tests used to call, written over the encoders of this crate.
 
 use super::*;
-use crate::{repeater_definition, RepeaterSlots};
+use crate::RepeaterSlots;
 
 fn encode_generics_params_to_ty<'a>(iter: impl IntoIterator<Item = &'a GenericParam>) -> Type {
     encode_generics_params_to_ty_with(iter, |ConstParam { ident, .. }| parse_quote!([(); #ident]))
@@ -133,65 +133,8 @@ impl RepeaterSlots {
 }
 
 #[test]
-fn test_encode_generics_const() {
-    let generics: Generics = parse_quote!(<'a, T, const N: usize>);
-    let ty = encode_generics_params_to_ty(&generics.params);
-    assert_eq!(
-        quote!(#ty).to_string(),
-        quote!((&'a (), T, [(); N])).to_string()
-    );
-
-    // `N` is parsed as a type argument; `params` disambiguates it.
-    let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8, N>);
-    let ty = encode_generics_args_to_ty_with(
-        &args.args,
-        &generics.params,
-        |expr, _| parse_quote!([(); #expr]),
-    )
-    .unwrap();
-    assert_eq!(
-        quote!(#ty).to_string(),
-        quote!((&'static (), u8, [(); N])).to_string()
-    );
-
-    let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8, { 3 }>);
-    let ty = encode_generics_args_to_ty_with(
-        &args.args,
-        &generics.params,
-        |expr, _| parse_quote!([(); #expr]),
-    )
-    .unwrap();
-    assert_eq!(
-        quote!(#ty).to_string(),
-        quote!((&'static (), u8, [(); 3])).to_string()
-    );
-}
-
-#[test]
 fn test_repeater_slots() {
     let to_string = |ty: &Type| quote!(#ty).to_string();
-
-    // The Repeater's definition: T, KEY and 12 defaulted const slots.
-    let def = repeater_definition(&parse_quote!(pub), &parse_quote!(Repeater));
-    let params: Vec<String> = def
-        .generics
-        .params
-        .iter()
-        .map(|p| quote!(#p).to_string())
-        .collect();
-    assert_eq!(params.len(), 14);
-    assert_eq!(
-        params[1],
-        quote!(const KEY: ::core::primitive::u128).to_string()
-    );
-    assert_eq!(
-        params[2],
-        quote!(const BOOL: ::core::primitive::bool = false).to_string()
-    );
-    assert_eq!(
-        params[13],
-        quote!(const ISIZE: ::core::primitive::isize = 0).to_string()
-    );
 
     let slots = RepeaterSlots::new(parse_quote!(crate::Repeater));
     let generics: Generics = parse_quote! {
@@ -298,55 +241,67 @@ fn test_defaults_substitute_const_type_arguments() {
 }
 
 #[test]
-fn test_encode_generics_params_to_ty_with() {
-    let generics: Generics = parse_quote!(<'a, T, const B: bool>);
-    let ty = encode_generics_params_to_ty_with(
-        &generics.params,
-        |ConstParam { ident, .. }| parse_quote!(::my_crate::ConstBool<#ident>),
-    );
-    let expected: Type = parse_quote!((&'a (), T, ::my_crate::ConstBool<B>));
-    assert_eq!(quote!(#ty).to_string(), quote!(#expected).to_string());
-}
-
-#[test]
 fn test_plain_args_encoder_with_params() {
     let to_string = |ty: &Type| quote!(#ty).to_string();
-    let encode = |args: &AngleBracketedGenericArguments, generics: &Generics| {
-        encode_generics_args_to_ty_with(
+    // A bare `N` (parsed by syn as a type argument) is a const, and omitted arguments take the
+    // parameters' defaults (a const default as well), which the arguments alone cannot tell, so the
+    // parameters are required and the result is that of `encode_generics_params_to_ty()`.
+    // Bindings are skipped (they used to panic), too many or missing arguments are reported.
+    type Row = (
+        Generics,
+        AngleBracketedGenericArguments,
+        std::result::Result<Type, &'static str>,
+    );
+    let rows: Vec<Row> = vec![
+        (
+            parse_quote!(<'a, T, const N: usize>),
+            parse_quote!(<'static, u8, N>),
+            Ok(parse_quote!((&'static (), u8, [(); N]))),
+        ),
+        (
+            parse_quote!(<'a, T, const N: usize>),
+            parse_quote!(<'static, u8, { 3 }>),
+            Ok(parse_quote!((&'static (), u8, [(); 3]))),
+        ),
+        (
+            parse_quote!(<'a, T, const N: usize, U = Vec<T>>),
+            parse_quote!(<'static, u8, N, Item = u8>),
+            Ok(parse_quote!((&'static (), u8, [(); N], Vec<u8>))),
+        ),
+        (
+            parse_quote!(<'a, T, const N: usize, U = Vec<T>>),
+            parse_quote!(<'static, u8, 3, u16, u32>),
+            Err("unexpected generic argument: 'u32'"),
+        ),
+        (
+            parse_quote!(<'a, T, const N: usize, U = Vec<T>>),
+            parse_quote!(<'static, u8>),
+            Err("missing generic argument for 'const N : usize'"),
+        ),
+        (
+            parse_quote!(<T>),
+            parse_quote!(<u8, Item = u8>),
+            Ok(parse_quote!((u8,))),
+        ),
+        (
+            parse_quote!(<T, const N: usize, const M: usize = 3>),
+            parse_quote!(<u8, N>),
+            Ok(parse_quote!((u8, [(); N], [(); 3]))),
+        ),
+    ];
+    for (generics, args, expected) in rows {
+        let case = format!("{} with {}", s(&generics), s(&args));
+        let encoded = encode_generics_args_to_ty_with(
             &args.args,
             &generics.params,
             |expr, _| parse_quote!([(); #expr]),
-        )
-    };
-
-    // Omitted defaults are filled, a bare `N` is a const, and bindings are skipped.
-    let generics: Generics = parse_quote!(<'a, T, const N: usize, U = Vec<T>>);
-    let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8, N, Item = u8>);
-    let expected: Type = parse_quote!((&'static (), u8, [(); N], Vec<u8>));
-    assert_eq!(
-        to_string(&encode(&args, &generics).unwrap()),
-        to_string(&expected)
-    );
-
-    // Too many or missing arguments are reported.
-    let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8, 3, u16, u32>);
-    assert_eq!(
-        encode(&args, &generics).unwrap_err().to_string(),
-        "unexpected generic argument: 'u32'"
-    );
-    let args: AngleBracketedGenericArguments = parse_quote!(<'static, u8>);
-    assert_eq!(
-        encode(&args, &generics).unwrap_err().to_string(),
-        "missing generic argument for 'const N : usize'"
-    );
-
-    // Bindings are skipped (they used to panic).
-    let generics: Generics = parse_quote!(<T>);
-    let args: AngleBracketedGenericArguments = parse_quote!(<u8, Item = u8>);
-    assert_eq!(
-        to_string(&encode(&args, &generics).unwrap()),
-        to_string(&parse_quote!((u8,)))
-    );
+        );
+        match (encoded, expected) {
+            (Ok(ty), Ok(expected)) => assert_eq!(to_string(&ty), to_string(&expected), "{}", case),
+            (Err(err), Err(expected)) => assert_eq!(err.to_string(), expected, "{}", case),
+            (encoded, expected) => panic!("{}: {:?} against {:?}", case, encoded, expected),
+        }
+    }
 }
 
 #[test]
@@ -661,7 +616,7 @@ fn test_free_encoders_with_self() {
     }
 
     // A trait object without a lifetime bound is rejected as `Self`, if there is a lifetime
-    // to outlive, with either function.
+    // to outlive, with either function (`&'a dyn Tr` would default to `&'a (dyn Tr + 'a)`).
     let generics: Generics = parse_quote!(<'a>);
     let dyn_self: Type = parse_quote!(dyn Tr);
     let err = encode_generics_params_to_ty_with_self(
@@ -753,6 +708,10 @@ fn test_the_documented_examples() {
     assert_eq!(ty, parse_quote!((&'static (), u8, [(); 3], &'static u8)));
     let ty = encode_generics_params_to_ty(&generics.params);
     assert_eq!(ty, parse_quote!((&'a (), T, [(); N], &'a T)));
+    // Without the bound, nothing follows the parameters.
+    let generics: Generics = parse_quote!(<'a, T, const N: usize>);
+    let ty = encode_generics_params_to_ty(&generics.params);
+    assert_eq!(ty, parse_quote!((&'a (), T, [(); N])));
 
     // The bounds follow the parameters.
     let generics: Generics = parse_quote!(<'a, 'b: 'a, T: 'a + Clone, const N: usize>);
@@ -810,16 +769,6 @@ fn test_the_documented_examples() {
     );
 }
 
-#[test]
-fn test_without_encoded_bounds() {
-    let generics: Generics = parse_quote!(<'a, 'b: 'a, T: 'a + Clone, U: 'static, V: 'c>);
-    let declared = without_encoded_bounds(&generics);
-    assert_eq!(
-        declared,
-        parse_quote!(<'a, 'b, T: Clone, U: 'static, V: 'c>)
-    );
-}
-
 fn ty_string(ty: &Type) -> String {
     quote!(#ty).to_string()
 }
@@ -862,21 +811,6 @@ fn limit_plain_encoders_usize_only() {
             (*const dyn crate::Repeater<(), 0, true, Type = ()>,)
         ))
     );
-}
-
-#[test]
-fn limit_plain_args_encoder_needs_params() {
-    // A bare `N` (parsed by syn as a type argument) is a const, and omitted arguments take the
-    // parameters' defaults, which the arguments alone cannot tell, so the parameters are required
-    // and the result is that of `encode_generics_params_to_ty()`.
-    let generics: Generics = parse2(quote!(<T, const N: usize, const M: usize = 3>)).unwrap();
-    let args: AngleBracketedGenericArguments = parse2(quote!(<u8, N>)).unwrap();
-
-    let ty = encode_generics_args_to_ty_with(&args.args, &generics.params, |expr, _| {
-        parse2(quote!([(); #expr])).unwrap()
-    })
-    .unwrap();
-    assert_eq!(ty_string(&ty), expected_ty(quote!((u8, [(); N], [(); 3]))));
 }
 
 // ── Referrers ────────────────────────────────────────────────────────────────
@@ -983,28 +917,6 @@ fn the_encoders_encode_it_after_the_lifetime_bounds() {
 }
 
 #[test]
-fn a_trait_object_without_a_lifetime_bound_cannot_be_encoded() {
-    let generics: Generics = parse_quote!(<'a>);
-    let outlives = lifetimes(&["'a"]);
-    // `&'a dyn Tr` would default to `&'a (dyn Tr + 'a)`.
-    let unbounded: Type = parse_quote!(dyn Tr);
-    assert!(matches!(
-        slots().encode_generics_params_to_ty_with_self(&generics.params, &unbounded, &outlives),
-        Err(EncodeError::UnboundedTraitObject(_))
-    ));
-    // Nothing to encode: no error.
-    assert!(slots()
-        .encode_generics_params_to_ty_with_self(&generics.params, &unbounded, &[])
-        .is_ok());
-    let bounded: Type = parse_quote!(dyn Tr + 'static);
-    let encoded = slots()
-        .encode_generics_params_to_ty_with_self(&generics.params, &bounded, &outlives)
-        .unwrap();
-    let expected: Type = parse_quote!((&'a (), &'a (dyn Tr + 'static)));
-    assert_eq!(s(&encoded), s(&expected));
-}
-
-#[test]
 fn the_implementation_does_not_declare_it() {
     let referrer = of_trait(parse_quote! {
         trait Tr { fn f<'a, T>(&self, x: &'a Rel<(Self, T)>) where Self: ::core::marker::Sized; }
@@ -1028,24 +940,10 @@ fn the_implementation_does_not_declare_it() {
         with_where(&without_encoded_bounds(&replaced)),
         "< 'a , T > where __S : :: core :: marker :: Sized"
     );
-    // A bound `Self: 'a` which is written is the same as one which is implied: it is moved to
-    // `context_self_outlives()`, and the other bounds of the predicate are kept (see
-    // `a_written_bound_is_the_same_as_an_implied_one`).
-    let referrer = of_trait(parse_quote! {
-        trait Tr { fn f<'a>(&self, x: Rel<'a, Self>) where Self: ::core::marker::Sized + 'a; }
-    });
-    let context = referrer.context(0);
-    assert_eq!(
-        with_where(referrer.context_generics(context)),
-        "< 'a > where Self : :: core :: marker :: Sized"
-    );
-    assert_eq!(
-        with_where(&referrer.impl_generics(context)),
-        "< 'a > where Self : :: core :: marker :: Sized"
-    );
-    assert_eq!(referrer.context_self_outlives(context), lifetimes(&["'a"]));
 }
 
+/// A written `Self: 'a` is moved to `context_self_outlives()` like an implied one, and the other
+/// bounds of its predicate are kept (`a_written_bound_is_the_same_as_an_implied_one`).
 #[test]
 fn a_written_bound_is_encoded_and_never_declared() {
     let referrer = of_trait(parse_quote! {
@@ -1237,22 +1135,11 @@ fn the_top_level_context_reaches_the_referrer_side_through_tokens() {
     let expected: Type = parse_quote!((&'q (), u16, ::core::primitive::u8, [(); 3], &'q u16));
     assert_eq!(s(&on_referrer_side), s(&expected));
 
-    // It is `generic_args()` of an entry for the context of the entry.
+    // The arguments fit the context of every entry.
     for ix in 0..parsed.iter().count() {
-        assert_eq!(
-            parsed
-                .context_generic_args(parsed.context(ix), &tr.generics.params, &completed)
-                .unwrap()
-                .iter()
-                .map(s)
-                .collect::<Vec<_>>(),
-            parsed
-                .context_generic_args(parsed.context(ix), &tr.generics.params, &completed)
-                .unwrap()
-                .iter()
-                .map(s)
-                .collect::<Vec<_>>()
-        );
+        parsed
+            .context_generic_args(parsed.context(ix), &tr.generics.params, &completed)
+            .unwrap();
     }
 }
 

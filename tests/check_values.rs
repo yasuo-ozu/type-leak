@@ -901,6 +901,11 @@ fn the_option_is_off_by_default() {
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     assert!(result.finish().is_ok());
+    // Nothing is leaked where the types are allowed: like method bodies, the defaults of associated
+    // consts are not analyzed.
+    let mut leaker = Leaker::from_config(Rules::new().primitive().prelude(), Options::new());
+    leaker.intern_trait(&item, true);
+    assert!(leaker.result().finish().unwrap().is_empty());
     let mut leaker = Leaker::from_config(Rules::new(), Options::new().check_values());
     leaker.intern_trait(&item, true);
     let result = leaker.result();

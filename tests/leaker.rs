@@ -1,15 +1,101 @@
 //! Tests for building a `Leaker` and interning items.
+//!
+//! The methods of the `Leaker` which analyze a whole item (`intern_struct()`, `intern_enum()`,
+//! `intern_union()`, `intern_impl()`, `intern_trait()` and `intern_mod()`) come first. Their
+//! expected values are those of the constructors of the Leaker which analyzed an item and which
+//! they replace (`Leaker::from_*()`), taken from the previous version of the crate: the item is
+//! analyzed with its own generics as those of the Leaker, which is what the top-level context is
+//! that of. Then come the configuration, the other ways to build a Leaker, and the regressions.
 
 mod common;
 
+use common::starts_with;
 use std::collections::BTreeSet;
 use syn::*;
-use template_quote::quote;
-use type_leak::{to_syn_error, Allow, ErrorItem, Leaker, Options, Rules};
+use template_quote::{quote, ToTokens};
+use type_leak::{
+    to_syn_error, Allow, ContextId, ErrorItem, Leaker, Options, Referrer, Rules, SelfRequirement,
+};
+
+fn s(x: &impl ToTokens) -> String {
+    quote!(#x).to_string()
+}
+
+/// The entries as `type | generics | self`, in the order of the Referrer.
+fn entries(referrer: &Referrer) -> Vec<String> {
+    (0..referrer.iter().count())
+        .map(|ix| {
+            let ty = referrer.iter().nth(ix).unwrap();
+            let context = referrer.context(ix);
+            let generics = referrer.context_generics(context);
+            let self_ty = match referrer.context_self(context) {
+                None => "-".to_string(),
+                Some(SelfRequirement::Bound(path)) => format!("Self: {}", s(path)),
+                Some(SelfRequirement::Type(ty)) => format!("Self = {}", s(ty)),
+                Some(other) => format!("{:?}", other),
+            };
+            format!("{} | {} | {}", s(ty), s(generics), self_ty)
+        })
+        .collect()
+}
+
+fn ids(referrer: &Referrer) -> Vec<usize> {
+    (0..referrer.iter().count())
+        .map(|ix| referrer.context(ix).index())
+        .collect()
+}
+
+fn id(n: usize) -> ContextId {
+    parse_str(&n.to_string()).unwrap()
+}
+
+/// Whether the item is analyzed without an error.
+fn is_accepted(item: Item) -> bool {
+    let mut leaker = Leaker::new();
+    match &item {
+        Item::Struct(item) => leaker.intern_struct(item, true),
+        Item::Trait(item) => leaker.intern_trait(item, true),
+        Item::Union(item) => leaker.intern_union(item, true),
+        other => panic!("{}", s(other)),
+    };
+    leaker.result().finish().is_ok()
+}
+
+/// A bound and a supertrait must use an absolute path, in a struct, a trait and a union.
+#[test]
+fn test_leaker_construction() {
+    let cases: [(Item, bool); 7] = [
+        (
+            parse_quote! { struct MyStruct<T: path::to::MyTrait>(); },
+            false,
+        ),
+        (
+            parse_quote! { struct MyStruct<T: ::path::to::MyTrait>(); },
+            true,
+        ),
+        (parse_quote! { trait MyTrait: MyTrait2 {} }, false),
+        (
+            parse_quote! { trait MyTrait: ::path::to::MyTrait2 {} },
+            true,
+        ),
+        (
+            parse_quote! { trait MyTrait: ::path::to::MyTrait2<{<Self as ::path::to::MyTrait3>::N}> {} },
+            true,
+        ),
+        (
+            parse_quote! { trait MyTrait: ::path::to::MyTrait2<{<Self as MyTrait3>::N}> {} },
+            false,
+        ),
+        (parse_quote! { union MyUnion<T: Copy> { a: T } }, false),
+    ];
+    for (item, accepted) in cases {
+        assert_eq!(is_accepted(item.clone()), accepted, "{}", s(&item));
+    }
+}
 
 #[test]
-fn test_leaker() {
-    let test_struct: ItemStruct = parse_quote!(
+fn intern_struct() {
+    let item: ItemStruct = parse_quote!(
         pub struct MyStruct<'a, T1, T2: ::path::to::MyType1<MyType4>> {
             field1: MyType1,
             field2: (MyType2, MyType3<MyType1>, MyType4, MyType5),
@@ -17,23 +103,43 @@ fn test_leaker() {
         }
     );
     let mut leaker = Leaker::new();
-    let context = leaker.intern_struct(&test_struct, true);
-    leaker.reduce_roots();
+    let top_level = leaker.intern_struct(&item, true);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(
-        referrer
-            .iter()
-            .map(|i| quote!(#i).to_string())
-            .collect::<BTreeSet<_>>(),
+        entries(&referrer),
         [
-            "(MyType2 , MyType3 < MyType1 > , MyType4 , MyType5)",
-            "MyType1",
-            "MyType4"
+            "(MyType2 , MyType3 < MyType1 > , MyType4 , MyType5) |  | -",
+            "MyType1 |  | -",
+            "MyType4 |  | -",
         ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<BTreeSet<_>>()
     );
+    assert_eq!(ids(&referrer), [0, 0, 0]);
+    assert_eq!(top_level.index(), 1);
+    assert_eq!(
+        s(referrer.context_generics(top_level)),
+        "< 'a , T1 , T2 : :: path :: to :: MyType1 < MyType4 > >"
+    );
+    assert_eq!(referrer.contexts().count(), 2);
+    assert!(!referrer.has_self());
+    // A type that does not mention `Self` is not affected by `allow_self`, and `Self` alone is
+    // never leaked.
+    let mut leaker = Leaker::new();
+    leaker.intern_struct(
+        &parse_quote!(
+            pub struct MyStruct<T1> {
+                a: Rel<T1>,
+                b: Self,
+            }
+        ),
+        false,
+    );
+    assert!(leaker.result().finish().is_ok());
+    // `reduce_roots()` changes nothing here.
+    let mut leaker = Leaker::new();
+    let context = leaker.intern_struct(&item, true);
+    leaker.reduce_roots();
+    let reduced = leaker.result().finish().unwrap();
+    assert_eq!(entries(&reduced), entries(&referrer));
     // `expand()` replaces a leaked type by what the callback returns for its index, and nothing
     // else (the entries are sorted by tokens: the tuple, `MyType1`, `MyType4`).
     let mut f = |_, ix: usize| -> Type {
@@ -41,174 +147,329 @@ fn test_leaker() {
         parse_quote!(::path::to::Implementor<#ix>)
     };
     assert_eq!(
-        quote!(#{referrer.expand(context, parse_quote!(MyType1),  &mut f)}).to_string(),
+        quote!(#{reduced.expand(context, parse_quote!(MyType1),  &mut f)}).to_string(),
         quote!(::path::to::Implementor<1>).to_string()
     );
     assert_eq!(
-        quote!(#{referrer.expand(context, parse_quote!((MyType2 , MyType3 < MyType1 > , MyType4 , MyType5)),  &mut f)}).to_string(),
+        quote!(#{reduced.expand(context, parse_quote!((MyType2 , MyType3 < MyType1 > , MyType4 , MyType5)),  &mut f)}).to_string(),
         quote!(::path::to::Implementor<0>).to_string()
     );
     assert_eq!(
-        quote!(#{referrer.expand(context, parse_quote!(MyType4),  &mut f)}).to_string(),
+        quote!(#{reduced.expand(context, parse_quote!(MyType4),  &mut f)}).to_string(),
         quote!(::path::to::Implementor<2>).to_string()
     );
     // A type that is not leaked is left as it is.
     assert_eq!(
-        quote!(#{referrer.expand(context, parse_quote!(Other),  &mut f)}).to_string(),
+        quote!(#{reduced.expand(context, parse_quote!(Other),  &mut f)}).to_string(),
         quote!(Other).to_string()
     );
 }
 
 #[test]
-fn test_leaker_construction() {
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(
-        &parse_quote! {
-            struct MyStruct<T: path::to::MyTrait>();
-        },
-        true,
+fn intern_enum() {
+    let item: ItemEnum = parse_quote!(
+        pub enum MyEnum<T, U: ::core::marker::Copy> {
+            A(Rel, T),
+            B { x: Wrap<U>, y: Self2 },
+            C(Rel2<Self>),
+        }
     );
-    let result = leaker.result();
-    assert!(result.finish().is_err());
     let mut leaker = Leaker::new();
-    leaker.intern_struct(
-        &parse_quote! {
-            struct MyStruct<T: ::path::to::MyTrait>();
-        },
-        true,
+    let top_level = leaker.intern_enum(&item, true);
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(
+        entries(&referrer),
+        [
+            "Rel |  | -",
+            "Self2 |  | -",
+            "Wrap < U > | < U : :: core :: marker :: Copy > | -",
+            "Rel2 < Self > | < T , U : :: core :: marker :: Copy > | Self = MyEnum < T , U >",
+        ]
     );
-    let result = leaker.result();
-    assert!(result.finish().is_ok());
+    assert_eq!(ids(&referrer), [0, 0, 1, 2]);
+    // The top-level context has the generics of the enum and, as `Rel2<Self>` names `Self`, what
+    // `Self` is: it is the context of that entry.
+    assert_eq!(top_level.index(), 2);
+    assert_eq!(top_level, referrer.context(3));
+    assert!(referrer.has_self());
+    // Without `Self` it is an error to leak `Rel2<Self>`, and the others are not.
     let mut leaker = Leaker::new();
-    leaker.intern_trait(
-        &parse_quote! {
-            trait MyTrait: MyTrait2 {}
-        },
-        true,
-    );
-    let result = leaker.result();
-    assert!(result.finish().is_err());
-    let mut leaker = Leaker::new();
-    leaker.intern_trait(
-        &parse_quote! {
-            trait MyTrait: ::path::to::MyTrait2 {}
-        },
-        true,
-    );
-    let result = leaker.result();
-    assert!(result.finish().is_ok());
-    let mut leaker = Leaker::new();
-    leaker.intern_trait(
-        &parse_quote! {
-            trait MyTrait: ::path::to::MyTrait2<{<Self as ::path::to::MyTrait3>::N}> {}
-        },
-        true,
-    );
-    let result = leaker.result();
-    assert!(result.finish().is_ok());
-    let mut leaker = Leaker::new();
-    leaker.intern_trait(
-        &parse_quote! {
-            trait MyTrait: ::path::to::MyTrait2<{<Self as MyTrait3>::N}> {}
-        },
-        true,
-    );
+    leaker.intern_enum(&item, false);
     let result = leaker.result();
     assert!(result.finish().is_err());
 }
 
-/// The number of entries of `struct S(<ty>);` with the Leaker `leaker` (`ty` is a path written
-/// the relative way, which is leaked unless it is allowed).
-fn entries_of_a_field<A: Allow>(leaker: Leaker<A>, ty: &str) -> usize {
-    let item: ItemStruct = parse_str(&format!("struct S({});", ty)).unwrap();
-    let mut leaker = leaker;
-    leaker.intern_struct(&item, true);
-    leaker.result().finish().unwrap().iter().count()
-}
-
-/// The docs of `Allow`: `Rules::primitive()` allows the primitive types, and
-/// `Rules::prelude()` the names of the standard prelude: a relative path with such a name is not
-/// leaked, while `Leaker::new()` allows no path and leaks it. Audit mutants `cfg_primitive_f64`,
-/// `cfg_primitive_f32`, `cfg_primitive_i128`, `cfg_prelude_drop`, `cfg_prelude_toowned` and
-/// `cfg_prelude_ord`.
 #[test]
-fn test_config_allows_the_documented_names() {
-    let primitives = [
-        "bool", "char", "str", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32",
-        "i64", "i128", "isize", "f32", "f64",
-    ];
-    let prelude = [
-        "Box",
-        "String",
-        "Vec",
-        "Option",
-        "Result",
-        "Copy",
-        "Send",
-        "Sized",
-        "Sync",
-        "Unpin",
-        "Drop",
-        "Fn",
-        "FnMut",
-        "FnOnce",
-        "Clone",
-        "PartialEq",
-        "PartialOrd",
-        "Eq",
-        "Ord",
-        "AsRef",
-        "AsMut",
-        "Into",
-        "From",
-        "Default",
-        "Iterator",
-        "IntoIterator",
-        "Extend",
-        "DoubleEndedIterator",
-        "ExactSizeIterator",
-        "Some",
-        "None",
-        "Ok",
-        "Err",
-        "ToOwned",
-        "ToString",
-    ];
+fn intern_union() {
+    let item: ItemUnion = parse_quote!(
+        pub union MyUnion<T: ::core::marker::Copy> {
+            a: T,
+            b: MyType,
+        }
+    );
+    let mut leaker = Leaker::new();
+    let top_level = leaker.intern_union(&item, true);
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(entries(&referrer), ["MyType |  | -"]);
+    assert_eq!(ids(&referrer), [0]);
+    assert_eq!(top_level.index(), 1);
+    assert_eq!(
+        s(referrer.context_generics(top_level)),
+        "< T : :: core :: marker :: Copy >"
+    );
+    // A union with a lifetime, a reference, a tuple and the type of an external crate.
+    let item: ItemUnion = parse_quote! {
+        pub union MyUnion<'a, T: ::core::marker::Copy> {
+            a: ::core::mem::ManuallyDrop<MyType1>,
+            b: &'a T,
+            c: (MyType2, u8),
+        }
+    };
+    let mut leaker = Leaker::new();
+    leaker.intern_union(&item, true);
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(
+        referrer
+            .iter()
+            .map(|i| quote!(#i).to_string())
+            .collect::<BTreeSet<_>>(),
+        // `MyType1` is a bare identifier as an argument, which may be a const, so the path is
+        // leaked as a whole.
+        [
+            ":: core :: mem :: ManuallyDrop < MyType1 >",
+            "(MyType2 , u8)"
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<BTreeSet<_>>()
+    );
+}
+
+#[test]
+fn intern_trait() {
+    let item: ItemTrait = parse_quote!(
+        pub trait MyTrait<T, U = Rel<T>> {
+            type Out: ::core::fmt::Debug;
+            fn f(&self, t: T) -> Rel2<Self>;
+            fn g<V: ::core::marker::Copy>(&self, v: V) -> Wrap<V, U>;
+        }
+    );
+    let mut leaker = Leaker::new();
+    let top_level = leaker.intern_trait(&item, true);
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(
+        entries(&referrer),
+        [
+            "Rel2 < Self > | < T , U > | Self: MyTrait < T , U >",
+            "Wrap < V , U > | < U , V : :: core :: marker :: Copy > | -",
+            "Rel < T > | < T > | -",
+        ]
+    );
+    assert_eq!(ids(&referrer), [0, 1, 2]);
+    // The top-level context has the generics of the trait and, as `Rel2<Self>` names `Self`, what
+    // `Self` is: it is the context of that entry.
+    assert_eq!(top_level.index(), 0);
+    assert_eq!(top_level, referrer.context(0));
+    assert_eq!(s(referrer.context_generics(top_level)), "< T , U >");
+}
+
+#[test]
+fn intern_impl() {
+    let item: ItemImpl = parse_quote!(
+        impl<T> ::path::MyTrait<Rel<T>> for MyType<T> {
+            type Out = Rel2<T>;
+            fn f(&self, x: Rel3) -> Self::Out {
+                todo!()
+            }
+        }
+    );
+    let mut leaker = Leaker::new();
+    let top_level = leaker.intern_impl(&item, true);
+    let referrer = leaker.result().finish().unwrap();
+    // The self type, the trait with its arguments and the signatures are analyzed, and the bodies
+    // are not.
+    assert_eq!(
+        entries(&referrer),
+        [
+            "MyType < T > | < T > | -",
+            "Rel < T > | < T > | -",
+            "Rel2 < T > | < T > | -",
+            "Rel3 |  | -",
+        ]
+    );
+    assert_eq!(ids(&referrer), [0, 0, 0, 1]);
+    // The generics of the impl are those of the Leaker, which entries use exactly.
+    assert_eq!(top_level.index(), 0);
+    assert_eq!(s(referrer.context_generics(top_level)), "< T >");
+
+    // `Self` is the self type, which is leaked as a whole with it.
+    let item: ItemImpl = parse_quote!(
+        impl<T> ::path::MyTrait for ::path::W<T> {
+            fn f(&self) -> Rel<Self> {
+                todo!()
+            }
+        }
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_impl(&item, true);
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(
+        entries(&referrer),
+        [
+            "Rel < Self > | < T > | Self = :: path :: W < T >",
+            // An optional entry: the type of an external crate.
+            ":: path :: W < T > | < T > | -",
+        ]
+    );
+    // The trait must not depend on the type context, as a bound.
+    let item: ItemImpl = parse_quote!(
+        impl Relative for ::path::W {}
+    );
+    let mut leaker = Leaker::new();
+    leaker.intern_impl(&item, true);
+    let result = leaker.result();
+    let err = result.errors();
+    assert_eq!(err.len(), 1);
+    assert_eq!(err[0].message, "use absolute path: 'Relative'");
+}
+
+#[test]
+fn intern_mod() {
+    let item: ItemMod = parse_quote!(
+        mod m {
+            pub struct S<T> {
+                x: Rel<T>,
+            }
+            pub type A = Rel2;
+            pub mod inner {
+                pub type B = Rel3;
+                use super::super::Rel4;
+                pub struct C(Rel4);
+            }
+        }
+    );
+    let mut leaker = Leaker::new();
+    let module = leaker.intern_mod(&item);
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(
+        entries(&referrer),
+        [
+            "Rel < T > | < T > | -",
+            "Rel2 |  | -",
+            "Rel3 |  | -",
+            "Rel4 |  | -",
+        ]
+    );
+    // The module of each: the analyzed one for the first two (its path is `[]`), and `inner`.
+    let paths: Vec<Vec<String>> = (0..4)
+        .map(|ix| {
+            let module = referrer.context_module(referrer.context(ix)).unwrap();
+            referrer
+                .module_path(module)
+                .unwrap()
+                .iter()
+                .map(|i| i.to_string())
+                .collect()
+        })
+        .collect();
+    assert_eq!(paths, [vec![], vec![], vec!["inner"], vec!["inner"]]);
+    // The top-level context is the module, which has no generics, and is in no module.
+    assert_eq!(referrer.context_module(referrer.context(0)), Some(module));
+    assert!(referrer.context_generics(module).params.is_empty());
+    assert_eq!(referrer.context_module(module), None);
+    // A module without a content has nothing to analyze.
+    let mut leaker = Leaker::new();
+    let module = leaker.intern_mod(&parse_quote!(
+        mod m;
+    ));
+    let referrer = leaker.result().finish().unwrap();
+    assert!(referrer.is_empty());
+    assert_eq!(referrer.module_path(module), Some(&[][..]));
+}
+
+#[test]
+fn from_config_and_the_items_accumulate() {
+    // A Leaker with a configuration analyzes the items like one without it, and the contexts of
+    // the items are numbered in the order they appear.
+    let config = Rules::new().primitive().prelude();
+    let mut leaker = Leaker::from_config(config, Options::new());
+    let first: ItemStruct = parse_quote!(
+        struct A<T> {
+            x: Vec<(Rel, u8)>,
+            y: T,
+        }
+    );
+    let second: ItemTrait = parse_quote!(
+        trait Tr<T> {
+            fn f(&self) -> Option<Wrap<T>>;
+        }
+    );
+    let third: ItemEnum = parse_quote!(
+        enum E {
+            A(Rel),
+            B(Rel2),
+        }
+    );
+    let a = leaker.intern_struct(&first, true);
+    let b = leaker.intern_trait(&second, true);
+    let c = leaker.intern_enum(&third, true);
+    // The next generics take the next id.
+    let d = leaker.intern_struct(
+        &parse_quote!(
+            struct D<V> {
+                x: Wrap<V>,
+            }
+        ),
+        true,
+    );
+    assert_eq!(d, id(2));
+    let referrer = leaker.result().finish().unwrap();
+    // `Rel` is leaked once, in the context of no generics, which is that of `E`.
+    assert_eq!(
+        entries(&referrer),
+        [
+            "Rel |  | -",
+            "Rel2 |  | -",
+            "Wrap < T > | < T > | -",
+            "Wrap < V > | < V > | -"
+        ]
+    );
+    assert_eq!(a, id(1));
+    // The same generics are the same context, whichever item they are the generics of.
+    assert_eq!(b, a);
+    assert_eq!(c, id(0));
+    assert_eq!(s(referrer.context_generics(a)), "< T >");
+    assert_eq!(s(referrer.context_generics(b)), "< T >");
+    assert!(referrer.context_generics(c).params.is_empty());
+    // `from_config()` is what `new()` is with the allowed paths.
+    let config = Rules::new().or_if(starts_with(parse_quote!(Vec)));
+    let mut leaker = Leaker::from_config(config, Options::new());
+    leaker.intern_struct(&first, true);
+    // `Vec` is allowed, and `u8` is not (it is a relative path, as it is not a configured one).
+    assert_eq!(
+        entries(&leaker.result().finish().unwrap()),
+        ["(Rel , u8) |  | -"]
+    );
+}
+
+/// `Rules::prelude()` allows the function `drop` in an array length, `Rules::primitive()` does
+/// not, and the lists of `Rules` add up with `crate_paths()`. The names of each list are checked
+/// one by one in the module `names` of `tests/allow_rules.rs`.
+#[test]
+fn test_config_allows_drop_in_an_array_length_and_the_lists_add_up() {
     let only_primitives = || Rules::new().primitive();
     let only_prelude = || Rules::new().prelude();
-    for name in primitives.iter().chain(prelude.iter()) {
-        // Nothing is allowed by default.
-        assert_eq!(entries_of_a_field(Leaker::new(), name), 1, "{}", name);
-        // Each list allows its names, and not the other list's.
-        let (own, other) = if primitives.contains(name) {
-            let own =
-                entries_of_a_field(Leaker::from_config(only_primitives(), Options::new()), name);
-            (
-                own,
-                entries_of_a_field(Leaker::from_config(only_prelude(), Options::new()), name),
-            )
-        } else {
-            let own = entries_of_a_field(Leaker::from_config(only_prelude(), Options::new()), name);
-            (
-                own,
-                entries_of_a_field(Leaker::from_config(only_primitives(), Options::new()), name),
-            )
-        };
-        assert_eq!(own, 0, "{}", name);
-        assert_eq!(other, 1, "{}", name);
-    }
-    // The function `drop` is a name of the prelude too (here in an array length).
     let item: ItemStruct = parse_quote!(
         struct S([::core::primitive::u8; drop]);
     );
-    fn entries<A: Allow>(config: A, item: &ItemStruct) -> usize {
+    fn entry_count<A: Allow>(config: A, item: &ItemStruct) -> usize {
         let mut leaker = Leaker::from_config(config, Options::new());
         leaker.intern_struct(item, true);
         leaker.result().finish().unwrap().iter().count()
     }
-    assert_eq!(entries(Rules::new(), &item), 1);
-    assert_eq!(entries(only_primitives(), &item), 1);
-    assert_eq!(entries(only_prelude(), &item), 0);
+    assert_eq!(entry_count(Rules::new(), &item), 1);
+    assert_eq!(entry_count(only_primitives(), &item), 1);
+    assert_eq!(entry_count(only_prelude(), &item), 0);
     // `Rules::crate_paths()` allows the paths that start with `crate`, and the lists add up.
     let item: ItemStruct = parse_quote!(
         struct S(crate::A, u8, Vec<crate::B>);
@@ -481,18 +742,6 @@ fn test_type_macros_are_leaked_whole() {
 }
 
 #[test]
-fn test_trait_const_defaults_are_ignored() {
-    // Like method bodies, defaults of associated consts are not analyzed.
-    let item: ItemTrait = parse_quote! {
-        trait Tr {
-            const X: usize = helper();
-            fn f(&self) { helper(); }
-        }
-    };
-    assert_eq!(leak_trait(&item).unwrap(), BTreeSet::<String>::new());
-}
-
-#[test]
 fn test_assertions_for_assumed_primitives() {
     // Primitive names in const parameter types, and in types where they are allowed, are
     // checked once each; absolute paths and leaked (not allowed) primitives are not.
@@ -534,45 +783,6 @@ fn test_assertions_for_assumed_primitives() {
     leaker.intern_struct(&item, true);
     assert!(leaker.assertions().is_empty());
     assert!(leaker.result().errors().is_empty());
-}
-
-#[test]
-fn test_leaker_intern_union() {
-    let item: ItemUnion = parse_quote! {
-        pub union MyUnion<'a, T: ::core::marker::Copy> {
-            a: ::core::mem::ManuallyDrop<MyType1>,
-            b: &'a T,
-            c: (MyType2, u8),
-        }
-    };
-    let mut leaker = Leaker::new();
-    leaker.intern_union(&item, true);
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(
-        referrer
-            .iter()
-            .map(|i| quote!(#i).to_string())
-            .collect::<BTreeSet<_>>(),
-        // `MyType1` is a bare identifier as an argument, which may be a const, so the path is
-        // leaked as a whole.
-        [
-            ":: core :: mem :: ManuallyDrop < MyType1 >",
-            "(MyType2 , u8)"
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<BTreeSet<_>>()
-    );
-    // Bounds must use absolute paths as for structs.
-    let mut leaker = Leaker::new();
-    leaker.intern_union(
-        &parse_quote! {
-            union MyUnion<T: Copy> { a: T }
-        },
-        true,
-    );
-    let result = leaker.result();
-    assert!(result.finish().is_err());
 }
 
 #[test]

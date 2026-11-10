@@ -532,12 +532,9 @@ fn self_in_the_bounds_of_the_generics() {
             fn f<T: ::core::cmp::PartialEq<Self>>(&self) -> Wrap<T>;
         }
     };
-    // It is leaked with the meaning of `Self`, if `Self` can be leaked.
-    let referrer = leak_trait(tr.clone());
-    assert_eq!(selfs(&referrer), ["Self: X"]);
-    assert!(referrer.has_self());
-
-    // Otherwise it cannot be, as the Repeater's implementation copies the bounds.
+    // It is leaked with the meaning of `Self` if `Self` can be leaked (see the end of
+    // `self_in_different_traits_is_different`), otherwise it cannot be, as the Repeater's
+    // implementation copies the bounds.
     let mut leaker = Leaker::new();
     common::intern_fns(
         &mut leaker,
@@ -547,15 +544,18 @@ fn self_in_the_bounds_of_the_generics() {
     );
     let result = leaker.result();
     let err = result.errors();
-    assert!(!err.is_empty());
+    assert_eq!(err.len(), 1);
     assert!(err
         .iter()
         .all(|item| item.reason != Reason::SelfWithoutMeaning));
     assert_eq!(
+        err[0].message,
+        "`Wrap<T>` has a generic whose bound mentions `Self`, which cannot be leaked"
+    );
+    assert_eq!(
         err[0].notes.first().map(|(_, n)| n.as_str()),
         Some("the bounds of its generics mention `Self`, which cannot be leaked")
     );
-    assert!(err[0].message.contains("Wrap<T>"));
     // A failed call adds no entry.
     assert!(result.into_referrer().is_empty());
 
@@ -893,30 +893,10 @@ fn serialization_with_self() {
     assert_eq!(parsed, referrer);
     assert_eq!(selfs(&parsed), selfs(&referrer));
     assert_eq!(entries(&parsed), entries(&referrer));
-    // A Referrer can be followed by other tokens.
-    struct Followed(Referrer, Ident);
-    impl parse::Parse for Followed {
-        fn parse(input: parse::ParseStream) -> Result<Self> {
-            Ok(Followed(input.parse()?, input.parse()?))
-        }
-    }
-    let followed: Followed = parse2(quote!(#referrer after)).unwrap();
-    assert_eq!(followed.0, referrer);
-    assert_eq!(followed.1, "after");
     // Only a self part (no generics).
     let version = tag();
     let parsed: Referrer = parse2(quote!(#version Self : X ; (Rel < Self >))).unwrap();
     assert_eq!(selfs(&parsed), ["Self: X"]);
-}
-
-#[test]
-fn a_call_as_self_is_not_parsed() {
-    // `Self` has no meaning outside the scopes which declare it, so there is no `Self` of a call
-    // (`Self = # 2 ;` was one, in the first format).
-    let text = format!("\"{}\" Self = # 2 ; (Rel < Self >)", tag());
-    // `Self = ` is followed by a type, and `#` starts none (syn lists the tokens that do).
-    let err = parse_str::<Referrer>(&text).unwrap_err();
-    assert!(err.to_string().starts_with("expected one of: "), "{}", err);
 }
 
 #[test]

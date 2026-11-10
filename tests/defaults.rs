@@ -5,15 +5,13 @@ use syn::*;
 use template_quote::quote;
 use type_leak::{ContextId, Leaker, Referrer, UseSite};
 
-fn referrer(tr: &ItemTrait) -> Referrer {
-    {
-        let mut leaker = Leaker::new();
-        leaker.intern_trait(tr, true);
-        leaker.result().finish().unwrap()
-    }
+fn referrer_of(tr: &ItemTrait) -> Referrer {
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(tr, true);
+    leaker.result().finish().unwrap()
 }
 
-/// The context of the trait that `referrer()` analyzed: the top-level one, numbered after the
+/// The context of the trait that `referrer_of()` analyzed: the top-level one, numbered after the
 /// contexts of the entries.
 fn top_level(referrer: &Referrer) -> ContextId {
     referrer.contexts().last().unwrap()
@@ -141,7 +139,7 @@ fn test_default_is_analyzed_with_the_parameters_before_it() {
     let tr: ItemTrait = parse_quote! {
         trait Tr<T, U = Rel<T>> where T: ::p::Conv<U> { fn f(&self); }
     };
-    let referrer = referrer(&tr);
+    let referrer = referrer_of(&tr);
     assert_eq!(
         referrer
             .iter()
@@ -223,14 +221,6 @@ fn test_default_cannot_depend_on_self() {
         let referrer = referrer_of(&tr);
         assert_eq!(referrer.iter().count(), leaked, "{}", s(&default));
         assert!(!referrer.has_self());
-    }
-}
-
-fn referrer_of(tr: &ItemTrait) -> Referrer {
-    {
-        let mut leaker = Leaker::new();
-        leaker.intern_trait(tr, true);
-        leaker.result().finish().unwrap()
     }
 }
 
@@ -336,7 +326,7 @@ fn test_default_const_is_kept() {
     let tr: ItemTrait = parse_quote!(
         trait Tr<T, const N: usize = 3, const M: usize = { 1 + 2 }> {}
     );
-    let referrer = referrer(&tr);
+    let referrer = referrer_of(&tr);
     let completed = complete(&referrer, &tr.generics.params, &args(parse_quote!(<u8>))).unwrap();
     assert_eq!(completed, ["u8", "3", "{ 1 + 2 }"]);
 }
@@ -348,7 +338,7 @@ fn test_complete_args() {
             fn f(&self) -> RelC;
         }
     };
-    let referrer = referrer(&tr);
+    let referrer = referrer_of(&tr);
     let params = &tr.generics.params;
 
     // Omitted arguments take the defaults, rewritten with the entries which use the preceding
@@ -413,7 +403,7 @@ fn test_complete_args_const_bare_ident_and_errors() {
             fn f(&self);
         }
     );
-    let referrer = referrer(&tr);
+    let referrer = referrer_of(&tr);
     let params = &tr.generics.params;
     // A bare identifier for a const parameter is a const argument.
     let completed = complete(&referrer, params, &args(parse_quote!(<u8, M, u16>))).unwrap();
@@ -428,12 +418,12 @@ fn test_complete_args_const_bare_ident_and_errors() {
 }
 
 #[test]
-fn test_complete_args_nested_leaked_types() {
+fn test_complete_args_substitutes_the_copied_part_only() {
     // A leaked type inside a type which is copied (it cannot be leaked as a whole), twice.
     let tr: ItemTrait = parse_quote!(
         trait Tr<T, U = ::p::W<Rel<T>, &'_ T, Rel<T>>> {}
     );
-    let referrer = referrer(&tr);
+    let referrer = referrer_of(&tr);
     let completed = referrer
         .complete_args(
             top_level(&referrer),
@@ -455,16 +445,8 @@ fn test_complete_args_nested_leaked_types() {
             ":: p :: W < P < Rel < u8 > > , & '_ Rel < u8 > , P < Rel < u8 > > >"
         ]
     );
-}
-
-#[test]
-fn test_complete_args_no_substitution_in_projections() {
-    // The result of `type_fn` mentions the parameter `T`, which is not substituted, unlike the
-    // copied part of the default.
-    let tr: ItemTrait = parse_quote!(
-        trait Tr<T, U = ::p::W<Rel<T>, &'_ T>> {}
-    );
-    let referrer = referrer(&tr);
+    // The result of `type_fn` may mention the parameter `T` too, and is not substituted either,
+    // unlike the copied part of the default.
     let completed = referrer
         .complete_args(
             top_level(&referrer),
@@ -475,6 +457,6 @@ fn test_complete_args_no_substitution_in_projections() {
         .unwrap();
     assert_eq!(
         s(&completed[1]),
-        ":: p :: W < < T as Proj > :: Type , & '_ u8 >"
+        ":: p :: W < < T as Proj > :: Type , & '_ u8 , < T as Proj > :: Type >"
     );
 }

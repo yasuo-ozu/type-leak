@@ -206,15 +206,6 @@ fn reference_to_dyn_defaults_to_its_lifetime() {
         "{}",
         err
     );
-    // The help says how to name it, among the other fixes.
-    assert!(
-        err.contains(
-            "= help: write `RelTr` with an absolute path (e.g. `::my_crate::RelTr`), or name the lifetime of the trait object (e.g. \
-             `&'a dyn Trait` or `dyn Trait + 'a`)\n"
-        ),
-        "{}",
-        err
-    );
     for ty in ["&mut dyn RelTr", "&(dyn RelTr)", "&'_ dyn RelTr"] {
         let ty: Type = syn::parse_str(ty).unwrap();
         let item: ItemTrait = parse_quote! { trait Tr { fn f(&self) -> #ty; } };
@@ -602,15 +593,7 @@ fn parameters_are_ordered_by_kind() {
 }
 
 #[test]
-fn notes_of_defaults_and_impl_trait() {
-    let err = leak_trait_with(config(), &parse_quote! { trait Tr<T = Rel<Self>> {} })
-        .err()
-        .unwrap();
-    assert!(
-        err.contains("a default of a parameter cannot depend on `Self`"),
-        "{}",
-        err
-    );
+fn the_note_of_an_impl_trait_in_an_argument() {
     let err = leak_trait_with(
         config(),
         &parse_quote! { trait Tr { fn f(&self) -> Wrap<impl Into<u8>>; } },

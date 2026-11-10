@@ -1,5 +1,5 @@
 //! A Leaker's crate whose leaked types have outlives bounds, and the Referrer's side of them, for
-//! tests/outlives.rs.
+//! tests/diagnostic.rs (`outlives`).
 //!
 //! Only the bounds which are exact are encoded: the ones which are written (`T: 'a`, `where Self:
 //! 'a`) and the ones which a reference implies (`&'a X` requires `X: 'a`, which a type inside it
@@ -11,7 +11,7 @@
 //! the encoding of the generics (`&'a T` in the trait arguments), and is rejected with E0309
 //! without it, as is the copy of a field of a struct. See `Bounds`, `Around` and `SelfBound`, and
 //! `Unbounded`, `UnboundedSelf` and `UnboundedAround` (disabled by features, as they do not
-//! compile, and built by tests/outlives.rs to check the error).
+//! compile, and built by tests/diagnostic.rs to check the error).
 //!
 //! It does not compile if the encoding of a bound is lost (E0309 in the Repeater's
 //! implementations or in the copies of the signatures), nor if a type is leaked with the lifetime
@@ -250,7 +250,7 @@ pub mod m {
     /// projection (nothing infers `T: 'a` from `&'a <Rel2<T> as Deref>::Target` in the original
     /// either, and the same goes for a path starting with a type parameter, `&'a
     /// T::A<Rel2<U>>`), nor across the lifetime of a `for<..>` binder or `'static`, which are not
-    /// generics. See `tests/outlives_ancestors.rs` for the contexts of each.
+    /// generics. See the module `ancestors` of `tests/outlives_bounds.rs` for the contexts of each.
     #[leak(
         helper = crate::__macro,
         repeater = crate::Repeater,
@@ -1262,11 +1262,12 @@ pub mod m {
         }
     }
 
-    // What the bounds which are written above avoid, disabled (a feature of the crate that tests/
-    // outlives.rs enables, one at a time, to check the error) as it does not compile: a path
-    // with a lifetime (`Rel<'a, T>`, `Ref<'a, Rel2<T>>`) is not assumed to require `T: 'a`, so
-    // the Repeater's implementation does not have it, unless the signature writes it. Enabling
-    // these gives the errors of the comments (each checked on stable and nightly).
+    // What the bounds which are written above avoid, disabled (a feature of the crate that the
+    // module `outlives` of tests/diagnostic.rs enables, one at a time, to check the error) as it
+    // does not compile: a path with a lifetime (`Rel<'a, T>`, `Ref<'a, Rel2<T>>`) is not assumed to
+    // require `T: 'a`, so the Repeater's implementation does not have it, unless the signature
+    // writes it. Enabling these gives the errors of the comments (each checked on stable and
+    // nightly).
 
     /// `error[E0309]: the parameter type `T` may not live long enough`, at the implementation
     /// `impl<'a, T> Repeater<(&'a (), T), ..> for __S { type Type = Rel<'a, T>; }`: `T: 'a` is

@@ -180,19 +180,6 @@ fn top_level_context_is_shared_with_the_entries() {
     assert_eq!(top_level, id(1));
     assert_eq!(referrer.context(1), top_level);
     assert_eq!(ids(&referrer), [0, 1]);
-
-    // A struct without generics: the context of the types of no generics is its own, and the
-    // Referrer is the simplest one.
-    let item: ItemStruct = parse_quote! { struct S { a: A, b: B } };
-    let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&item, true);
-    assert_eq!(top_level, id(0));
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(referrer.context(0), top_level);
-    assert_eq!(
-        referrer.to_token_stream().to_string(),
-        format!("\"{}\" (A , B)", version())
-    );
 }
 
 #[test]
@@ -364,16 +351,6 @@ fn ids_of_dropped_contexts_are_gaps() {
     assert_eq!(s(referrer.context_generics(id(2))), "< U >");
     assert_eq!(s(referrer.context_generics(top_level)), "< T , U >");
 
-    // The first id is not 0 if the context 0 is dropped.
-    let item: ItemStruct = parse_quote! { struct S<T, U> { a: (Rel, T) } };
-    let mut leaker = Leaker::new();
-    let top_level = leaker.intern_struct(&item, true);
-    assert_eq!(top_level, id(2));
-    let referrer = leaker.result().finish().unwrap();
-    assert_eq!(leaked(&referrer), ["Rel"]);
-    assert_eq!(ids(&referrer), [1, 2]);
-    assert_eq!(referrer.context(0), id(1));
-
     // No type is left, but the generics of the call are in the Referrer.
     let item: ItemStruct = parse_quote! { struct S<T> { a: T } };
     let mut leaker = Leaker::new();
@@ -387,57 +364,101 @@ fn ids_of_dropped_contexts_are_gaps() {
         referrer.to_token_stream().to_string(),
         format!("\"{}\" < T > ; ()", version())
     );
-
-    // Without any call, there is the context of the types which use no generics.
-    let referrer = Leaker::new().result().finish().unwrap();
-    assert_eq!(ids(&referrer), [0]);
-    assert_eq!(s(referrer.context_generics(id(0))), "");
 }
 
-#[test]
-#[should_panic(expected = "the context 1 is not one of the contexts of this Referrer")]
-fn context_of_a_dropped_id_panics() {
-    let (referrer, _) = gap_referrer();
-    let _ = referrer.context_generics(id(1));
+/// The message of the panic of `f`.
+fn panic_message(f: impl FnOnce()) -> String {
+    let payload =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("it did not panic");
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .expect("the message is a String")
 }
 
 // The lookups of a context that document `# Panics` panic with the same message, which names the
 // id: the one of a dropped context (`gap_referrer()` has no context 1), and one beyond the last.
-
 #[test]
-#[should_panic(expected = "the context 1 is not one of the contexts of this Referrer")]
-fn context_self_of_a_dropped_id_panics() {
-    let (referrer, _) = gap_referrer();
-    let _ = referrer.context_self(id(1));
-}
-
-#[test]
-#[should_panic(expected = "the context 99 is not one of the contexts of this Referrer")]
-fn context_self_outlives_of_an_unknown_id_panics() {
-    let (referrer, _) = gap_referrer();
-    let _ = referrer.context_self_outlives(id(99));
-}
-
-#[test]
-#[should_panic(expected = "the context 1 is not one of the contexts of this Referrer")]
-fn context_module_of_a_dropped_id_panics() {
-    let (referrer, _) = gap_referrer();
-    let _ = referrer.context_module(id(1));
-}
-
-#[test]
-#[should_panic(expected = "the context 99 is not one of the contexts of this Referrer")]
-fn context_generics_of_an_unknown_id_panics() {
-    let (referrer, _) = gap_referrer();
-    let _ = referrer.context_generics(id(99));
-}
-
-#[test]
-#[should_panic(expected = "the context 1 is not one of the contexts of this Referrer")]
-fn context_generic_args_of_a_dropped_id_panics() {
-    let (referrer, _) = gap_referrer();
-    let params: Generics = parse_quote!(<T, U>);
-    let _ = referrer.context_generic_args(id(1), &params.params, &[]);
+fn the_lookups_of_a_context_it_does_not_have_panic() {
+    fn leak(f: impl FnOnce(&mut Leaker)) -> Referrer {
+        let mut leaker = Leaker::new();
+        f(&mut leaker);
+        leaker.result().finish().unwrap()
+    }
+    let shapes: Vec<(&str, Referrer)> = vec![
+        ("gaps", gap_referrer().0),
+        // The context 0 is dropped: the ids start at 1.
+        (
+            "the first id dropped",
+            leak(|leaker| {
+                leaker.intern_struct(&parse_quote! { struct S<T, U> { a: (Rel, T) } }, true);
+            }),
+        ),
+        (
+            "one context",
+            leak(|leaker| {
+                leaker.intern_struct(&parse_quote! { struct S(Rel); }, true);
+            }),
+        ),
+        (
+            "modules",
+            leak(|leaker| {
+                leaker.intern_mod(&parse_quote! { mod m { pub struct A { y: Rel } } });
+            }),
+        ),
+    ];
+    type Lookup = fn(&Referrer, ContextId);
+    let lookups: [(&str, Lookup); 7] = [
+        ("context_generics", |referrer, context| {
+            referrer.context_generics(context);
+        }),
+        ("context_self", |referrer, context| {
+            referrer.context_self(context);
+        }),
+        ("context_self_outlives", |referrer, context| {
+            referrer.context_self_outlives(context);
+        }),
+        ("context_module", |referrer, context| {
+            referrer.context_module(context);
+        }),
+        ("context_generic_args", |referrer, context| {
+            let params: Generics = parse_quote!(<T, U>);
+            let _ = referrer.context_generic_args(context, &params.params, &[]);
+        }),
+        ("visitor", |referrer, context| {
+            let _ = referrer.visitor(context, |_, ix| parse_quote!(P<#ix>));
+        }),
+        ("expand", |referrer, context| {
+            let _ = referrer.expand(context, parse_quote!(Rel), |_, ix| parse_quote!(P<#ix>));
+        }),
+    ];
+    for (shape, referrer) in &shapes {
+        // Every id below the largest that the Referrer does not have, the first one beyond it,
+        // and one far away.
+        let last = ids(referrer).into_iter().max().unwrap();
+        let mut unknown: Vec<usize> = (0..last)
+            .filter(|n| !referrer.contexts().any(|known| known == id(*n)))
+            .collect();
+        unknown.extend([last + 1, 99]);
+        for n in unknown {
+            for (lookup, call) in &lookups {
+                assert_eq!(
+                    panic_message(|| call(referrer, id(n))),
+                    format!(
+                        "the context {} is not one of the contexts of this Referrer",
+                        n
+                    ),
+                    "{} of {} with the context {}",
+                    lookup,
+                    shape,
+                    n
+                );
+            }
+        }
+    }
+    // The first two have the ids that the tests are about.
+    assert_eq!(ids(&shapes[0].1), [0, 2, 3]);
+    assert_eq!(ids(&shapes[1].1), [1, 2]);
 }
 
 #[test]
@@ -514,12 +535,14 @@ fn lookups_work_with_gaps() {
 
 #[test]
 fn serialization_of_the_simplest_referrer_is_unchanged() {
-    // One context, with the id 0: no number of groups, no id.
+    // One context, with the id 0: no number of groups, no id. A struct without generics: the
+    // context of the types of no generics is its own.
     let item: ItemStruct = parse_quote! { struct S { a: A, b: B } };
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_struct(&item, true);
     assert_eq!(top_level, id(0));
     let referrer = leaker.result().finish().unwrap();
+    assert_eq!(referrer.context(0), top_level);
     let tokens = referrer.to_token_stream();
     assert_eq!(tokens.to_string(), format!("\"{}\" (A , B)", version()));
     assert_eq!(parse2::<Referrer>(tokens).unwrap(), referrer);
@@ -540,8 +563,11 @@ fn serialization_of_the_simplest_referrer_is_unchanged() {
     );
     assert_eq!(parse2::<Referrer>(tokens).unwrap(), referrer);
 
-    // Neither has a Referrer without any context.
+    // Neither has a Referrer without any call: there is the context of the types which use no
+    // generics.
     let referrer = Leaker::new().result().finish().unwrap();
+    assert_eq!(ids(&referrer), [0]);
+    assert_eq!(s(referrer.context_generics(id(0))), "");
     assert_eq!(
         referrer.to_token_stream().to_string(),
         format!("\"{}\" ()", version())
@@ -568,11 +594,16 @@ fn serialization_with_gaps() {
     assert_eq!(s(parsed.context_generics(id(2))), "< U >");
     assert_eq!(s(parsed.context_generics(top_level)), "< T , U >");
 
-    // The first group may not have the id 0, and the ids after a gap are expected to follow it.
+    // The first group may not have the id 0 (the first id is not 0 if the context 0 is dropped),
+    // and the ids after a gap are expected to follow it.
     let item: ItemStruct = parse_quote! { struct S<T, U> { a: (Rel, T) } };
     let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
+    let top_level = leaker.intern_struct(&item, true);
+    assert_eq!(top_level, id(2));
     let referrer = leaker.result().finish().unwrap();
+    assert_eq!(leaked(&referrer), ["Rel"]);
+    assert_eq!(ids(&referrer), [1, 2]);
+    assert_eq!(referrer.context(0), id(1));
     let tokens = referrer.to_token_stream();
     assert_eq!(
         tokens.to_string(),
@@ -613,35 +644,9 @@ fn serialization_with_gaps() {
     assert_eq!(parsed, parse_str::<Referrer>(&implicit).unwrap());
     assert_eq!(parsed.to_token_stream().to_string(), implicit);
 
-    // A Referrer with gaps can be followed by other tokens, also one starting with `#`.
-    struct Followed(Referrer, TokenStream);
-    impl parse::Parse for Followed {
-        fn parse(input: parse::ParseStream) -> Result<Self> {
-            Ok(Self(input.parse()?, input.parse()?))
-        }
-    }
-    let pound_group: TokenStream = "# 5 (X)".parse().unwrap();
-    for rest in [
-        quote!(
-            struct Z;
-        ),
-        quote!(
-            #[derive(Debug)]
-            struct Z;
-        ),
-        pound_group,
-    ] {
-        let (referrer, _) = gap_referrer();
-        let tokens = referrer.to_token_stream();
-        let followed: Followed = parse2(quote!(#tokens #rest)).unwrap();
-        assert_eq!(followed.0, referrer);
-        assert_eq!(followed.1.to_string(), rest.to_string());
-    }
+    // (It can be followed by other tokens, see `tests/referrer.rs`.)
     let one: Referrer = parse_str(&format!("\"{}\" # 3 (A)", version())).unwrap();
     assert_eq!(ids(&one), [3]);
-    let tokens = one.to_token_stream();
-    let followed: Followed = parse2(quote!(#tokens #[derive(Debug)] struct Z;)).unwrap();
-    assert_eq!(followed.0, one);
 }
 
 #[test]
@@ -712,41 +717,6 @@ fn serialization_with_gaps_keeps_the_requirements() {
     assert_eq!(parsed, referrer);
     for context in referrer.contexts() {
         assert_eq!(parsed.context_self(context), referrer.context_self(context));
-    }
-}
-
-#[test]
-fn ids_must_ascend() {
-    let version = version();
-    let ascending = "the ids of the contexts must be in ascending order";
-    let integer = "expected integer literal";
-    for (text, message) in [
-        // The same id twice.
-        (format!("\"{}\" 2 (A) # 0 (B)", version), ascending),
-        (format!("\"{}\" 2 # 3 (A) # 3 (B)", version), ascending),
-        // A smaller id.
-        (format!("\"{}\" 2 # 3 (A) # 1 (B)", version), ascending),
-        (format!("\"{}\" 2 # 3 (A) # 2 (B)", version), ascending),
-        // Not a number.
-        (format!("\"{}\" # (A)", version), integer),
-        (format!("\"{}\" # x (A)", version), integer),
-        (
-            format!("\"{}\" # 1u8 (A)", version),
-            "a context id is an integer, with no suffix or `usize`",
-        ),
-        // A group is missing.
-        (
-            format!("\"{}\" 2 # 3 (A)", version),
-            "unexpected end of input, expected parentheses",
-        ),
-        // The largest id cannot be followed by another one.
-        (
-            format!("\"{}\" # {} (A)", version, usize::MAX),
-            "the id of the context is too large",
-        ),
-    ] {
-        let err = parse_str::<Referrer>(&text).unwrap_err();
-        assert_eq!(err.to_string(), message, "{}", text);
     }
 }
 

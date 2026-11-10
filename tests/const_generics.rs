@@ -80,12 +80,6 @@ fn test_const_generic_param_ty_not_interned() {
     leaker.intern_trait(&item, true);
     leaker.reduce_roots();
     assert!(leaker.result().finish().unwrap().is_empty());
-
-    // A type alias cannot be leaked as the type of a const parameter.
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&parse_quote! { struct S<const N: MyIdx>; }, true);
-    let result = leaker.result();
-    assert!(result.finish().is_err());
 }
 
 #[test]
@@ -187,139 +181,119 @@ fn test_local_generics_keep_self() {
     assert_eq!(quote!(#generics).to_string(), quote!(#expected).to_string());
 }
 
+/// The entries (type and generics) of a trait, and the trait with each entry replaced by `P<ix>`.
+/// A type is an entry of the context of the local generics it depends on, in the order of the
+/// contexts' first appearance.
 #[test]
-fn test_same_type_with_different_local_generics() {
-    // The same tokens depending on different local generics are separate entries, and each copy
-    // is rewritten to its own.
-    let item: ItemTrait = parse_quote! {
-        trait MyTrait {
-            fn f<const B: bool>(&self) -> Wrap<B>;
-            fn g<const B: u8>(&self) -> Wrap<B>;
-        }
-    };
-    let (referrer, context) = leak(&item);
-    assert_eq!(
-        entries(&referrer),
-        [
-            entry(parse_quote!(Wrap<B>), parse_quote!(<const B: bool>)),
-            entry(parse_quote!(Wrap<B>), parse_quote!(<const B: u8>)),
-        ]
-    );
-    assert_eq!(
-        rewrite(referrer, context, item),
-        expected(parse_quote! {
-            trait MyTrait {
-                fn f<const B: bool>(&self) -> P<0usize>;
-                fn g<const B: u8>(&self) -> P<1usize>;
-            }
-        })
-    );
-}
-
-#[test]
-fn test_same_local_generics_share_an_entry() {
-    let item: ItemTrait = parse_quote! {
-        trait MyTrait {
-            fn f<const B: bool>(&self) -> Wrap<B>;
-            fn g<const B: bool>(&self, x: Wrap<B>);
-        }
-    };
-    let (referrer, context) = leak(&item);
-    assert_eq!(
-        entries(&referrer),
-        [entry(parse_quote!(Wrap<B>), parse_quote!(<const B: bool>))]
-    );
-    assert_eq!(
-        rewrite(referrer, context, item),
-        expected(parse_quote! {
-            trait MyTrait {
-                fn f<const B: bool>(&self) -> P<0usize>;
-                fn g<const B: bool>(&self, x: P<0usize>);
-            }
-        })
-    );
-}
-
-#[test]
-fn test_type_with_and_without_local_generics() {
-    // Here `B` is a type in `g`, which the Leaker's item does not declare.
-    let item: ItemTrait = parse_quote! {
-        trait MyTrait {
-            fn f<const B: bool>(&self) -> Wrap<B>;
-            fn g(&self) -> Wrap<B>;
-        }
-    };
-    let (referrer, context) = leak(&item);
-    // The contexts are numbered in the order of their first appearance.
-    assert_eq!(
-        entries(&referrer),
-        [
-            entry(parse_quote!(Wrap<B>), parse_quote!(<const B: bool>)),
-            entry(parse_quote!(Wrap<B>), Generics::default()),
-        ]
-    );
-    assert_eq!(
-        rewrite(referrer, context, item),
-        expected(parse_quote! {
-            trait MyTrait {
-                fn f<const B: bool>(&self) -> P<0usize>;
-                fn g(&self) -> P<1usize>;
-            }
-        })
-    );
-}
-
-#[test]
-fn test_equivalent_local_generics_share_an_entry() {
-    // The order of the parameters and the bounds, and the place of the bounds, do not matter.
-    let item: ItemTrait = parse_quote! {
-        trait MyTrait {
-            fn f<T: ::core::fmt::Debug + ::core::clone::Clone, U>(&self) -> Wrap<T, U>;
-            fn g<U, T>(&self) -> Wrap<T, U> where T: ::core::clone::Clone + ::core::fmt::Debug;
-        }
-    };
-    let (referrer, context) = leak(&item);
-    assert_eq!(
-        entries(&referrer),
-        [entry(
-            parse_quote!(Wrap<T, U>),
-            parse_quote!(<T: ::core::clone::Clone + ::core::fmt::Debug, U>)
-        )]
-    );
-    assert_eq!(
-        rewrite(referrer, context, item),
-        expected(parse_quote! {
-            trait MyTrait {
-                fn f<T: ::core::fmt::Debug + ::core::clone::Clone, U>(&self) -> P<0usize>;
-                fn g<U, T>(&self) -> P<0usize> where T: ::core::clone::Clone + ::core::fmt::Debug;
-            }
-        })
-    );
-}
-
-#[test]
-fn test_local_generics_include_those_in_bounds() {
-    let item: ItemTrait = parse_quote! {
-        trait MyTrait {
-            fn f<T, U: ::core::cmp::PartialEq<T>>(&self) -> Wrap<U>;
-        }
-    };
-    let (referrer, context) = leak(&item);
-    assert_eq!(
-        entries(&referrer),
-        [entry(
-            parse_quote!(Wrap<U>),
-            parse_quote!(<T, U: ::core::cmp::PartialEq<T>>)
-        )]
-    );
-    assert_eq!(
-        rewrite(referrer, context, item),
-        expected(parse_quote! {
-            trait MyTrait {
-                fn f<T, U: ::core::cmp::PartialEq<T>>(&self) -> P<0usize>;
-            }
-        })
-    );
+fn test_entries_depend_on_the_local_generics_they_use() {
+    type Case = (&'static str, ItemTrait, Vec<(String, String)>, ItemTrait);
+    let cases: Vec<Case> = vec![
+        (
+            // The same tokens depending on different local generics are separate entries, and each
+            // copy is rewritten to its own.
+            "the same type with different local generics",
+            parse_quote! {
+                trait MyTrait {
+                    fn f<const B: bool>(&self) -> Wrap<B>;
+                    fn g<const B: u8>(&self) -> Wrap<B>;
+                }
+            },
+            vec![
+                entry(parse_quote!(Wrap<B>), parse_quote!(<const B: bool>)),
+                entry(parse_quote!(Wrap<B>), parse_quote!(<const B: u8>)),
+            ],
+            parse_quote! {
+                trait MyTrait {
+                    fn f<const B: bool>(&self) -> P<0usize>;
+                    fn g<const B: u8>(&self) -> P<1usize>;
+                }
+            },
+        ),
+        (
+            "the same local generics",
+            parse_quote! {
+                trait MyTrait {
+                    fn f<const B: bool>(&self) -> Wrap<B>;
+                    fn g<const B: bool>(&self, x: Wrap<B>);
+                }
+            },
+            vec![entry(parse_quote!(Wrap<B>), parse_quote!(<const B: bool>))],
+            parse_quote! {
+                trait MyTrait {
+                    fn f<const B: bool>(&self) -> P<0usize>;
+                    fn g<const B: bool>(&self, x: P<0usize>);
+                }
+            },
+        ),
+        (
+            // Here `B` is a type in `g`, which the Leaker's item does not declare.
+            "a type with and without local generics",
+            parse_quote! {
+                trait MyTrait {
+                    fn f<const B: bool>(&self) -> Wrap<B>;
+                    fn g(&self) -> Wrap<B>;
+                }
+            },
+            vec![
+                entry(parse_quote!(Wrap<B>), parse_quote!(<const B: bool>)),
+                entry(parse_quote!(Wrap<B>), Generics::default()),
+            ],
+            parse_quote! {
+                trait MyTrait {
+                    fn f<const B: bool>(&self) -> P<0usize>;
+                    fn g(&self) -> P<1usize>;
+                }
+            },
+        ),
+        (
+            // The order of the parameters and the bounds, and the place of the bounds, do not
+            // matter.
+            "equivalent local generics",
+            parse_quote! {
+                trait MyTrait {
+                    fn f<T: ::core::fmt::Debug + ::core::clone::Clone, U>(&self) -> Wrap<T, U>;
+                    fn g<U, T>(&self) -> Wrap<T, U> where T: ::core::clone::Clone + ::core::fmt::Debug;
+                }
+            },
+            vec![entry(
+                parse_quote!(Wrap<T, U>),
+                parse_quote!(<T: ::core::clone::Clone + ::core::fmt::Debug, U>),
+            )],
+            parse_quote! {
+                trait MyTrait {
+                    fn f<T: ::core::fmt::Debug + ::core::clone::Clone, U>(&self) -> P<0usize>;
+                    fn g<U, T>(&self) -> P<0usize> where T: ::core::clone::Clone + ::core::fmt::Debug;
+                }
+            },
+        ),
+        (
+            "local generics used in the bounds",
+            parse_quote! {
+                trait MyTrait {
+                    fn f<T, U: ::core::cmp::PartialEq<T>>(&self) -> Wrap<U>;
+                }
+            },
+            vec![entry(
+                parse_quote!(Wrap<U>),
+                parse_quote!(<T, U: ::core::cmp::PartialEq<T>>),
+            )],
+            parse_quote! {
+                trait MyTrait {
+                    fn f<T, U: ::core::cmp::PartialEq<T>>(&self) -> P<0usize>;
+                }
+            },
+        ),
+    ];
+    for (what, item, entries_expected, rewritten) in cases {
+        let (referrer, context) = leak(&item);
+        assert_eq!(entries(&referrer), entries_expected, "{}", what);
+        assert_eq!(
+            rewrite(referrer, context, item),
+            expected(rewritten),
+            "{}",
+            what
+        );
+    }
 }
 
 #[test]

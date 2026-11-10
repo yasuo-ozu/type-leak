@@ -331,25 +331,128 @@ fn the_rules_chain_and_a_rule_may_count() {
     assert_eq!(expand(one_by_one), (ix, replaced));
 }
 
-/// The tokens after the result are left for the caller: an ident and a `;` after the errors, and
-/// the same after a result without errors.
+/// The tokens after the result are left for the caller, whatever they are. A result with errors
+/// and one without, and a Referrer (which parses as a result without errors), are each followed by
+/// tokens: an ident, a brace group (`#result { item }`, which is no error: only an `@` and a
+/// bracket group are read), a group that has the shape of an error (it was read as one without the
+/// `@`), an `@` with anything but a bracket group after it, and an empty list.
 #[test]
-fn the_tokens_after_the_result_are_not_consumed() {
-    /// A result, then the `;` and the ident that follow it, and nothing else.
-    fn then_semi_and_ident(input: parse::ParseStream) -> Result<(LeakerResult, Ident)> {
+fn the_tokens_after_the_result_are_left_to_the_caller() {
+    /// A result, then the rest.
+    fn then_rest(input: parse::ParseStream) -> Result<(LeakerResult, String)> {
         let result: LeakerResult = input.parse()?;
-        input.parse::<Token![;]>()?;
-        let ident: Ident = input.parse()?;
-        assert!(input.is_empty());
-        Ok((result, ident))
+        let rest: TokenStream = input.parse()?;
+        Ok((result, rest.to_string()))
     }
-    for result in [with_errors(), without_errors()] {
-        let mut tokens = result.to_token_stream();
-        tokens.extend(quote!(; after));
-        let (read, ident) = then_semi_and_ident.parse2(tokens).unwrap();
-        assert_eq!(ident, "after");
-        assert_eq!(describe_all(&read), describe_all(&result));
-        assert_eq!(read.into_referrer(), result.into_referrer());
+    // The errors and the Referrer that are read back.
+    struct Expected(Vec<String>, Referrer);
+    let of_result = |result: LeakerResult| {
+        let tokens = result.to_token_stream();
+        (
+            tokens,
+            Expected(describe_all(&result), result.into_referrer()),
+        )
+    };
+    let of_referrer = |result: LeakerResult| {
+        let referrer = result.into_referrer();
+        (referrer.to_token_stream(), Expected(Vec::new(), referrer))
+    };
+    let error_group = with_errors().errors()[0].to_token_stream();
+    // The label, the result as tokens with what it reads back as, what follows it, and what is left
+    // of that (all of it, unless the result takes some).
+    type Row = (
+        &'static str,
+        (TokenStream, Expected),
+        TokenStream,
+        Option<&'static str>,
+    );
+    let rows: Vec<Row> = vec![
+        (
+            "an ident and a `;` after the errors",
+            of_result(with_errors()),
+            quote!(; after),
+            None,
+        ),
+        (
+            "an ident and a `;` after a result without errors",
+            of_result(without_errors()),
+            quote!(; after),
+            None,
+        ),
+        (
+            "a brace group after the errors",
+            of_result(with_errors()),
+            quote!({
+                struct Copy;
+            }),
+            None,
+        ),
+        (
+            "a brace group after a result without errors",
+            of_result(without_errors()),
+            quote!({
+                struct Copy;
+            }),
+            None,
+        ),
+        (
+            "a group that has the shape of an error",
+            of_result(without_errors()),
+            error_group.clone(),
+            None,
+        ),
+        (
+            "a brace group after the Referrer of a result with errors",
+            of_referrer(with_errors()),
+            quote!({ item }),
+            None,
+        ),
+        (
+            "a brace group after a Referrer",
+            of_referrer(without_errors()),
+            quote!({ item }),
+            None,
+        ),
+        ("an `@` alone", of_referrer(with_errors()), quote!(@), None),
+        (
+            "an `@` and an ident before a bracket group",
+            of_referrer(with_errors()),
+            quote!(@ x [ y ]),
+            None,
+        ),
+        (
+            "an `@` and a brace group",
+            of_referrer(with_errors()),
+            quote!(@ { }),
+            None,
+        ),
+        (
+            "an `@` and a paren group",
+            of_referrer(with_errors()),
+            quote!(@ ( )),
+            None,
+        ),
+        (
+            "a bracket group without an `@`",
+            of_referrer(with_errors()),
+            quote!([]),
+            None,
+        ),
+        (
+            "an empty list of errors",
+            of_result(without_errors()),
+            quote!(@ [ ] after),
+            Some("after"),
+        ),
+    ];
+    for (label, (mut tokens, Expected(errors, referrer)), after, rest) in rows {
+        tokens.extend(after.clone());
+        let (read, left) = then_rest.parse2(tokens).unwrap();
+        assert_eq!(describe_all(&read), errors, "{}", label);
+        assert_eq!(read.into_referrer(), referrer, "{}", label);
+        // What follows is left as it is, unless the result takes some of it.
+        let rest = rest.map_or_else(|| after.to_string(), str::to_string);
+        assert_eq!(left, rest, "{}", label);
     }
     // Two results one after the other: the first stops where the second starts.
     let (first, second) = (without_errors(), with_errors());
@@ -394,40 +497,8 @@ fn a_wrong_format_tag_fails_as_the_referrer_does() {
     }
 }
 
-/// A result and then a brace group (`#result { item }`): the group is left to the caller, with
-/// errors or without, and the errors are those of the result.
-#[test]
-fn a_brace_group_after_the_result_is_left_to_the_caller() {
-    /// A result, then a brace group with its content, and nothing else.
-    fn result_then_group(input: parse::ParseStream) -> Result<(LeakerResult, String)> {
-        let result: LeakerResult = input.parse()?;
-        let group;
-        braced!(group in input);
-        let content: TokenStream = group.parse()?;
-        assert!(input.is_empty());
-        Ok((result, content.to_string()))
-    }
-    for result in [with_errors(), without_errors()] {
-        let tokens = quote!(#result { struct Copy; });
-        let (read, item) = result_then_group.parse2(tokens).unwrap();
-        assert_eq!(item, "struct Copy ;");
-        assert_eq!(describe_all(&read), describe_all(&result));
-        assert_eq!(read.into_referrer(), result.into_referrer());
-    }
-    // A group that has the shape of an error is left too (it was read as one without the `@`).
-    let error = with_errors().errors()[0].to_token_stream();
-    let mut tokens = without_errors().to_token_stream();
-    tokens.extend(error.clone());
-    let (read, item) = (|input: parse::ParseStream| -> Result<(LeakerResult, TokenStream)> {
-        Ok((input.parse()?, input.parse()?))
-    })
-    .parse2(tokens)
-    .unwrap();
-    assert!(read.errors().is_empty());
-    assert_eq!(item.to_string(), error.to_string());
-}
-
-/// A Referrer parses as a result without errors, alone or with tokens after it.
+/// A Referrer parses as a result without errors, and is written again as it was (the tokens after
+/// it are left to the caller: see `the_tokens_after_the_result_are_left_to_the_caller`).
 #[test]
 fn a_referrer_parses_as_a_result_without_errors() {
     for result in [with_errors(), without_errors()] {
@@ -437,44 +508,7 @@ fn a_referrer_parses_as_a_result_without_errors() {
         assert!(read.errors().is_empty());
         assert_eq!(text(&read), text(&tokens));
         assert_eq!(read.into_referrer(), referrer);
-        let (read, rest) = (|input: parse::ParseStream| -> Result<(LeakerResult, TokenStream)> {
-            Ok((input.parse()?, input.parse()?))
-        })
-        .parse2(quote!(#referrer { item }))
-        .unwrap();
-        assert!(read.errors().is_empty());
-        assert_eq!(rest.to_string(), "{ item }");
     }
-}
-
-/// Only an `@` followed by a bracket group is read as the errors: an `@` with anything else after
-/// it is left to the caller, as are the tokens when there is no `@`.
-#[test]
-fn an_at_without_a_bracket_group_is_left_to_the_caller() {
-    fn then_rest(input: parse::ParseStream) -> Result<(LeakerResult, String)> {
-        let result: LeakerResult = input.parse()?;
-        let rest: TokenStream = input.parse()?;
-        Ok((result, rest.to_string()))
-    }
-    for rest in [
-        quote!(@),
-        quote!(@ x [ y ]),
-        quote!(@ { }),
-        quote!(@ ( )),
-        quote!([]),
-    ] {
-        let mut tokens = with_errors().into_referrer().to_token_stream();
-        tokens.extend(rest.clone());
-        let (read, left) = then_rest.parse2(tokens).unwrap();
-        assert!(read.errors().is_empty(), "{}", rest);
-        assert_eq!(left, rest.to_string());
-    }
-    // An empty list is a list without errors.
-    let mut tokens = without_errors().to_token_stream();
-    tokens.extend(quote!(@ [ ] after));
-    let (read, left) = then_rest.parse2(tokens).unwrap();
-    assert!(read.errors().is_empty());
-    assert_eq!(left, "after");
 }
 
 /// An `@ [ .. ]` that holds a token which is not a brace group fails with a message that says what

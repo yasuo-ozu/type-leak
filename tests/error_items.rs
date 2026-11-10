@@ -8,9 +8,12 @@
 //!   the grammar, and what the parser refuses.
 //! - `to_compile_error()`, `emit()`, `to_syn_error()`, and the other ways to take an error as a
 //!   whole.
+//! - The inputs that cannot be leaked on stable Rust, and how the errors for them read (`limits`).
+//! - The help of every kind of error (see the section at the end).
 //!
 //! The errors are reported at the same places after the round trip: see `tests/diagnostic.rs` (a
-//! macro that does it, and rustc) and `tests/crates/spans` (the lines and the columns).
+//! macro that does it, and rustc, with the nightly layout of a `help`, which has its own span) and
+//! `tests/crates/spans` (the lines and the columns).
 
 mod common;
 
@@ -82,6 +85,14 @@ fn errors(trigger: Trigger) -> Vec<ErrorItem> {
     trigger().errors().to_vec()
 }
 
+/// The errors that `leaker` has after `analyze` ran on it.
+fn errors_in<A: Allow, R>(
+    leaker: Leaker<A>,
+    analyze: impl FnOnce(&mut Leaker<A>) -> R,
+) -> Vec<ErrorItem> {
+    run(leaker, analyze).errors().to_vec()
+}
+
 fn id(name: &str) -> Ident {
     Ident::new(name, proc_macro2::Span::call_site())
 }
@@ -119,6 +130,11 @@ fn notes_of(item: &ErrorItem) -> Vec<(String, String)> {
         .iter()
         .map(|(at, note)| (at.to_string(), note.clone()))
         .collect()
+}
+
+/// The text of the notes of an item.
+fn note_texts(item: &ErrorItem) -> Vec<&str> {
+    item.notes.iter().map(|(_, note)| note.as_str()).collect()
 }
 
 /// The help of an item, as the text of the tokens it is about and the help.
@@ -193,13 +209,23 @@ fn reason_self_without_meaning() {
         "type",
         "Self :: Item",
     );
-    assert_eq!(items[0].message, "`Self` has no meaning here");
     // The note and the help are about the mention.
     assert_eq!(items[1].notes[0].0.to_string(), "Self :: Item");
     assert_eq!(
         items[1].help.as_ref().unwrap().0.to_string(),
         "Self :: Item"
     );
+    for item in &items {
+        assert_eq!(item.message, "`Self` has no meaning here");
+        assert!(
+            item.notes[0]
+                .1
+                .starts_with("`Self` has no meaning here: it is declared only"),
+            "{}",
+            item.notes[0].1
+        );
+        assert_eq!(item.help_text(), Some("write the type instead of `Self`"));
+    }
 }
 
 /// Syntax that the Leaker cannot read in a body, read with `check_values`.
@@ -250,10 +276,6 @@ fn reason_maybe_const() {
     assert_eq!(items.len(), 1);
     // The bare identifier is the cause.
     assert_item(&items[0], Reason::MaybeConst, "type", "LEN");
-    assert_eq!(
-        items[0].message,
-        "`LEN` may be a const, and the type that holds it cannot be leaked as a whole"
-    );
 }
 
 /// A lifetime of a method that the copy would leave unconstrained.
@@ -278,6 +300,12 @@ fn reason_unconstrained_lifetime() {
         items[0].message.ends_with("(E0195)"),
         "{}",
         items[0].message
+    );
+    // The note says why.
+    assert!(
+        items[0].notes[0].1.starts_with("it names `'b`"),
+        "{}",
+        items[0].notes[0].1
     );
 }
 
@@ -304,13 +332,6 @@ fn reason_self_projection() {
         "type",
         "Wrap < Self :: A >",
     );
-    assert!(
-        items[0]
-            .message
-            .starts_with("write `<Self as ::p::Tr>::A` instead of `Self::A`"),
-        "{}",
-        items[0].message
-    );
 }
 
 /// A bound of an outer trait that names its `Self`, for a type in an item nested in it.
@@ -331,10 +352,6 @@ fn reason_unnameable_self() {
     let items = errors(unnameable_self);
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::UnnameableSelf, "type", "Rel < T >");
-    assert_eq!(
-        items[0].message,
-        "the bound of `T` mentions a `Self` which has no name here"
-    );
 }
 
 /// `Self` in the default of a parameter.
@@ -349,10 +366,6 @@ fn reason_self_in_default() {
     // The cause is the whole default, the note is at the `Self` in it.
     assert_item(&items[0], Reason::SelfInDefault, "type", "Wrap < Self >");
     assert_eq!(items[0].notes[0].0.to_string(), "Self");
-    assert_eq!(
-        items[0].message,
-        "`Wrap<Self>` is in the default of a parameter, and names `Self`"
-    );
 }
 
 /// A generic whose bound mentions a `Self` that is denied.
@@ -372,6 +385,10 @@ fn reason_denied_self_in_bounds() {
     let items = errors(denied_self_in_bounds);
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::DeniedSelfInBounds, "type", "Wrap < T >");
+    assert_eq!(
+        note_texts(&items[0]).first(),
+        Some(&"the bounds of its generics mention `Self`, which cannot be leaked")
+    );
 }
 
 /// A type that names the `Self` of a nested struct, with a generic whose bound names it too.
@@ -564,6 +581,13 @@ fn the_trait_of_a_dyn_type_is_a_trait() {
     let items = result.errors();
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::UnconstrainedLifetime, "trait", "RelTr");
+    assert!(
+        items[0].notes[0]
+            .1
+            .starts_with("the lifetime of the trait object defaults to `'b`"),
+        "{}",
+        items[0].notes[0].1
+    );
 }
 
 #[test]
@@ -696,7 +720,8 @@ fn the_part_reported_may_be_smaller_than_the_type_that_cannot_be_leaked() {
         note_at(&items[0], "a"),
         Some("`a` also depends on the type context")
     );
-    // Where `u8` is allowed, `a` is the first.
+    // Where `u8` is allowed, `a` is the first. A closure cannot be written in the impl of the
+    // Repeater, so it is an error naming the closure, and the array type is no entry.
     let mut leaker = allowing();
     leaker.intern_trait(&item, true);
     let result = leaker.result();
@@ -704,6 +729,26 @@ fn the_part_reported_may_be_smaller_than_the_type_that_cannot_be_leaked() {
     assert_eq!(items.len(), 1);
     assert_item(&items[0], Reason::RelativePath, "expr", "a");
     assert_eq!(note_at(&items[0], "a"), None);
+    assert_eq!(items[0].message, "use absolute path: 'a'");
+    assert_eq!(
+        note_texts(&items[0]),
+        ["it cannot be leaked as a whole because of `| a : u8 | a`"]
+    );
+    // Without the closure the array type is an entry.
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(
+                &self,
+                x: [u8; {
+                    let c = 3;
+                    c
+                }],
+            );
+        }
+    );
+    let mut leaker = allowing();
+    leaker.intern_trait(&item, true);
+    assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
 }
 
 #[test]
@@ -755,16 +800,18 @@ fn a_lifetime_is_a_lifetime() {
 fn the_path_of_a_qualified_type_is_unreadable() {
     // `Tr<u8>::X` is the trait with the name that follows the `>`: a path that is no node, and not
     // a type (`syn` has the `qself` and the path apart).
-    let mut leaker = Leaker::new();
-    leaker.enter_impl(
-        &Generics::default(),
-        &parse_quote!(B),
-        None,
-        false,
-        |view| view.visit_type(&parse_quote!(<Self as super::Tr<u8>>::X)),
-    );
-    let result = leaker.result();
-    let items = result.errors();
+    let leak = |ty: Type| {
+        let mut leaker = Leaker::new();
+        leaker.enter_impl(
+            &Generics::default(),
+            &parse_quote!(B),
+            None,
+            false,
+            |view| view.visit_type(&ty),
+        );
+        leaker.result().errors().to_vec()
+    };
+    let items = leak(parse_quote!(<Self as super::Tr<u8>>::X));
     assert_eq!(items.len(), 1);
     assert_item(
         &items[0],
@@ -772,6 +819,28 @@ fn the_path_of_a_qualified_type_is_unreadable() {
         "unreadable",
         "super :: Tr < u8 > :: X",
     );
+    // `Self` cannot be leaked here, so the type cannot be leaked as a whole, and its trait is
+    // relative. `u8` in the arguments of the trait is leaked alone: the notes do not name it.
+    assert_eq!(items[0].message, "use absolute path: 'super::Tr<u8>::X'");
+    assert_eq!(
+        note_texts(&items[0]),
+        ["it cannot be leaked as a whole because of `Self`"]
+    );
+    // The type around it is written as it is, `Rel` with it, and what it holds has an error of its
+    // own (`Tr`, with `Self`).
+    let items = leak(parse_quote!(Rel<<Self as Tr<u8>>::X>));
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0].message,
+        "use absolute path: 'Rel<<Self as Tr<u8>>::X>'"
+    );
+    assert_eq!(items[1].message, "use absolute path: 'Tr<u8>::X'");
+    for item in &items {
+        assert_eq!(
+            note_texts(item),
+            ["it cannot be leaked as a whole because of `Self`"]
+        );
+    }
     let items = type_errors(allowing(), parse_quote!(<T as RelTrait<'_>>::Ty));
     assert_eq!(items.len(), 1);
     assert_item(
@@ -842,14 +911,46 @@ fn assert_same(read: &ErrorItem, item: &ErrorItem) {
 }
 
 #[test]
+fn the_triggers_have_every_reason_and_every_kind_of_cause() {
+    let items: Vec<ErrorItem> = every_error()
+        .into_iter()
+        .flat_map(|(_, items)| items)
+        .collect();
+    for reason in [
+        Reason::RelativePath,
+        Reason::SelfWithoutMeaning,
+        Reason::Unreadable,
+        Reason::MaybeConst,
+        Reason::UnconstrainedLifetime,
+        Reason::SelfProjection,
+        Reason::UnnameableSelf,
+        Reason::SelfInDefault,
+        Reason::DeniedSelfInBounds,
+        Reason::NestedSelfInBounds,
+        Reason::UnprovableBound,
+        Reason::SelfInTraitPredicate,
+        Reason::SelfInImplSelfType,
+    ] {
+        assert!(
+            items.iter().any(|item| item.reason == reason),
+            "{:?}",
+            reason
+        );
+    }
+    for expected in ["type", "trait", "expr", "macro", "lifetime", "unreadable"] {
+        assert!(
+            items.iter().any(|item| kind(&item.cause) == expected),
+            "{}",
+            expected
+        );
+    }
+}
+
+#[test]
 fn every_error_is_written_and_read_back() {
-    let mut reasons = Vec::new();
-    let mut kinds = Vec::new();
     for (name, items) in every_error() {
         assert!(!items.is_empty(), "{}", name);
         for item in &items {
-            reasons.push(item.reason);
-            kinds.push(kind(&item.cause));
             let tokens = item.to_token_stream();
             let read: ErrorItem =
                 parse2(tokens.clone()).unwrap_or_else(|e| panic!("{}: {}: {}", name, tokens, e));
@@ -871,27 +972,6 @@ fn every_error_is_written_and_read_back() {
         }
         let again: proc_macro2::TokenStream = read.iter().map(ToTokens::to_token_stream).collect();
         assert_eq!(again.to_string(), all.to_string(), "{}", name);
-    }
-    // The triggers have every reason and every kind of cause.
-    for reason in [
-        Reason::RelativePath,
-        Reason::SelfWithoutMeaning,
-        Reason::Unreadable,
-        Reason::MaybeConst,
-        Reason::UnconstrainedLifetime,
-        Reason::SelfProjection,
-        Reason::UnnameableSelf,
-        Reason::SelfInDefault,
-        Reason::DeniedSelfInBounds,
-        Reason::NestedSelfInBounds,
-        Reason::UnprovableBound,
-        Reason::SelfInTraitPredicate,
-        Reason::SelfInImplSelfType,
-    ] {
-        assert!(reasons.contains(&reason), "{:?}", reason);
-    }
-    for kind in ["type", "trait", "expr", "macro", "lifetime", "unreadable"] {
-        assert!(kinds.contains(&kind), "{}", kind);
     }
 }
 
@@ -989,19 +1069,6 @@ fn the_place_and_the_paths_follow_the_help_and_are_written_only_if_set() {
         empty.to_token_stream().to_string(),
         r#"{ type (A) RelativePath "m" [] value default }"#
     );
-    // A word that is none of them, or an entry that is no path or has arguments, is refused.
-    let error = parse_item(r#"{ type ( A ) RelativePath "m" [] values }"#).unwrap_err();
-    assert!(
-        error.to_string().contains("unknown field `values`"),
-        "{}",
-        error
-    );
-    assert!(
-        parse_item(r#"{ type ( A ) RelativePath "m" [] paths [ type ( a < b > ) ] }"#).is_err()
-    );
-    assert!(parse_item(r#"{ type ( A ) RelativePath "m" [] paths [ a ] }"#).is_err());
-    assert!(parse_item(r#"{ type ( A ) RelativePath "m" [] paths [ lifetime ( 'a ) ] }"#).is_err());
-    assert!(parse_item(r#"{ type ( A ) RelativePath "m" [] paths a }"#).is_err());
 }
 
 #[test]
@@ -1080,37 +1147,73 @@ fn every_kind_of_cause_is_read_whole() {
 }
 
 #[test]
-fn a_cause_that_is_not_the_whole_content_is_refused() {
-    for (kind, cause) in [
-        ("type", "A B"),
-        ("trait", "A < B > C"),
-        ("macro", "mac"),
-        ("macro", "mac ! x"),
-        ("unknown", "a b"),
-    ] {
-        let source = format!(r#"{{ {} ( {} ) RelativePath "m" [] }}"#, kind, cause);
-        assert!(parse_item(&source).is_err(), "{}", source);
+fn a_malformed_item_is_refused() {
+    // The source, and a part of the message where the error says what is wrong.
+    let refused: &[(&str, Option<&str>)] = &[
+        // A cause that is not the whole content of its group.
+        (r#"{ type ( A B ) RelativePath "m" [] }"#, None),
+        (r#"{ trait ( A < B > C ) RelativePath "m" [] }"#, None),
+        (r#"{ macro ( mac ) RelativePath "m" [] }"#, None),
+        (r#"{ macro ( mac ! x ) RelativePath "m" [] }"#, None),
+        (r#"{ unknown ( a b ) RelativePath "m" [] }"#, None),
+        // An unknown kind, reason or field (`nested` was a field of the old serialization).
+        (
+            r#"{ statement ( A ) RelativePath "m" [] }"#,
+            Some("unknown kind `statement`"),
+        ),
+        (
+            r#"{ type ( A ) Nonsense "m" [] }"#,
+            Some("unknown reason `Nonsense`"),
+        ),
+        (
+            r#"{ type ( A ) RelativePath "m" [] values }"#,
+            Some("unknown field `values`"),
+        ),
+        (
+            r#"{ type ( A ) RelativePath "m" [] nested [ { type ( B ) Unreadable "n" [] } ] }"#,
+            Some("unknown field `nested`"),
+        ),
+        // Something after the help, a message that is no string, no group around the item.
+        (r#"{ type ( A ) RelativePath "m" [] ( B ) "h" "x" }"#, None),
+        (r#"{ type ( A ) RelativePath m [] }"#, None),
+        (r#"type ( A ) RelativePath "m" []"#, None),
+        // A path of the list that has arguments, or is no path, or is of a kind with no path.
+        (
+            r#"{ type ( A ) RelativePath "m" [] paths [ type ( a < b > ) ] }"#,
+            None,
+        ),
+        (
+            r#"{ type ( A ) RelativePath "m" [] paths [ unknown ( a < b > ) ] }"#,
+            None,
+        ),
+        (
+            r#"{ type ( A ) RelativePath "m" [] paths [ unknown ( & a ) ] }"#,
+            None,
+        ),
+        (r#"{ type ( A ) RelativePath "m" [] paths [ a ] }"#, None),
+        (
+            r#"{ type ( A ) RelativePath "m" [] paths [ unreadable ( a ) ] }"#,
+            None,
+        ),
+        (
+            r#"{ type ( A ) RelativePath "m" [] paths [ lifetime ( 'a ) ] }"#,
+            None,
+        ),
+        (r#"{ type ( A ) RelativePath "m" [] paths a }"#, None),
+    ];
+    for (source, message) in refused {
+        let error = parse_item(source).expect_err(source);
+        if let Some(message) = message {
+            assert!(error.to_string().contains(message), "{}: {}", source, error);
+        }
     }
-}
-
-#[test]
-fn an_unknown_kind_or_reason_is_named() {
-    let error = parse_item(r#"{ statement ( A ) RelativePath "m" [] }"#).unwrap_err();
-    assert!(
-        error.to_string().contains("unknown kind `statement`"),
-        "{}",
-        error
-    );
-    let error = parse_item(r#"{ type ( A ) Nonsense "m" [] }"#).unwrap_err();
-    assert!(
-        error.to_string().contains("unknown reason `Nonsense`"),
-        "{}",
-        error
-    );
-    // Something after the help, or a message that is no string.
-    assert!(parse_item(r#"{ type ( A ) RelativePath "m" [] ( B ) "h" "x" }"#).is_err());
-    assert!(parse_item(r#"{ type ( A ) RelativePath m [] }"#).is_err());
-    assert!(parse_item(r#"type ( A ) RelativePath "m" []"#).is_err());
+    // A path of the list that is a path is read.
+    for source in [
+        r#"{ type ( A ) RelativePath "m" [] paths [ type ( a ) ] }"#,
+        r#"{ type ( A ) RelativePath "m" [] paths [ unknown ( a ) ] }"#,
+    ] {
+        assert!(parse_item(source).is_ok(), "{}", source);
+    }
 }
 
 // ── the report ───────────────────────────────────────────────────────────────────────────────
@@ -1141,8 +1244,11 @@ fn an_item_has_a_message_notes_and_help_and_is_an_error() {
     );
 }
 
+/// `to_compile_error()` is the error of `syn`, and it is pure; `emit()` is the same outside a proc
+/// macro, on every toolchain (inside one, nightly's `emit()` reports a `Diagnostic` instead:
+/// `tests/diagnostic.rs`).
 #[test]
-fn to_compile_error_is_the_error_of_syn() {
+fn to_compile_error_is_the_error_of_syn_and_emit_is_the_same_outside_a_macro() {
     let items = errors(relative_path);
     for item in &items {
         let tokens = item.to_compile_error();
@@ -1154,17 +1260,8 @@ fn to_compile_error_is_the_error_of_syn() {
             "{}",
             tokens
         );
-    }
-}
-
-/// `to_compile_error()` is pure and `emit()` is the same outside a proc macro, on every toolchain
-/// (inside one, nightly's `emit()` reports a `Diagnostic` instead: `tests/diagnostic.rs`).
-#[test]
-fn emit_is_to_compile_error_outside_a_macro() {
-    for item in &errors(relative_path) {
-        let tokens = item.to_compile_error().to_string();
-        assert_eq!(item.to_compile_error().to_string(), tokens);
-        assert_eq!(item.emit().to_string(), tokens);
+        assert_eq!(item.to_compile_error().to_string(), tokens.to_string());
+        assert_eq!(item.emit().to_string(), tokens.to_string());
     }
 }
 
@@ -1225,17 +1322,41 @@ fn allowing_causes(trigger: Trigger, causes: &[Cause]) -> LeakerResult {
     result
 }
 
+/// The causes of the errors, to give to `LeakerResult::allow()`.
+fn causes_of(errors: &[ErrorItem]) -> Vec<Cause> {
+    errors.iter().map(|error| error.cause.clone()).collect()
+}
+
+/// Asserts that two Referrers are the same, as values and as tokens.
+#[track_caller]
+fn assert_same_referrer(recovered: &Referrer, allowed: &Referrer, what: &str) {
+    assert_eq!(recovered, allowed, "{}", what);
+    assert_eq!(
+        recovered.to_token_stream().to_string(),
+        allowed.to_token_stream().to_string(),
+        "{}",
+        what
+    );
+}
+
 #[test]
-fn allowing_the_causes_of_the_errors_of_each_reason_accepts_the_item() {
-    let mut reasons = Vec::new();
+fn allowing_the_causes_of_every_trigger_accepts_the_item_and_leaves_the_recovered_referrer() {
     for (name, trigger) in every_trigger() {
-        let items = errors(trigger);
-        reasons.extend(items.iter().map(|item| item.reason));
-        let causes: Vec<Cause> = items.iter().map(|item| item.cause.clone()).collect();
-        let (result, _) = allow_every_cause(allowing_causes(trigger, &causes));
-        if !result.errors().is_empty() {
-            panic!("{}: {:?} are left", name, messages(result.errors()));
+        let result = trigger();
+        let items = result.errors().to_vec();
+        let causes = causes_of(&items);
+        assert!(!causes.is_empty(), "{}", name);
+        let referrer = result.into_referrer();
+        // The same analysis with the causes allowed reports nothing, and has the same entries and
+        // parts: allowing drops errors only.
+        let (allowed, _) = allow_every_cause(allowing_causes(trigger, &causes));
+        if !allowed.errors().is_empty() {
+            panic!("{}: {:?} are left", name, messages(allowed.errors()));
         }
+        assert_same_referrer(&referrer, &allowed.into_referrer(), name);
+        // And it is a Referrer like any other: it round-trips.
+        let parsed: Referrer = parse2(referrer.to_token_stream()).unwrap();
+        assert_eq!(parsed, referrer, "{}", name);
         // Each cause is needed: without it, its errors, and only they, are reported.
         for cause in &causes {
             let others: Vec<Cause> = causes.iter().filter(|c| *c != cause).cloned().collect();
@@ -1253,24 +1374,6 @@ fn allowing_the_causes_of_the_errors_of_each_reason_accepts_the_item() {
                 text(cause)
             );
         }
-    }
-    // The triggers have every reason.
-    for reason in [
-        Reason::RelativePath,
-        Reason::SelfWithoutMeaning,
-        Reason::Unreadable,
-        Reason::MaybeConst,
-        Reason::UnconstrainedLifetime,
-        Reason::SelfProjection,
-        Reason::UnnameableSelf,
-        Reason::SelfInDefault,
-        Reason::DeniedSelfInBounds,
-        Reason::NestedSelfInBounds,
-        Reason::UnprovableBound,
-        Reason::SelfInTraitPredicate,
-        Reason::SelfInImplSelfType,
-    ] {
-        assert!(reasons.contains(&reason), "{:?}", reason);
     }
 }
 
@@ -1386,44 +1489,6 @@ fn a_path_rule_leaves_the_errors_that_have_a_path_it_does_not_allow() {
 
 // ── recovery ─────────────────────────────────────────────────────────────────────────────────
 
-/// The causes of the errors, to give to `LeakerResult::allow()`.
-fn causes_of(errors: &[ErrorItem]) -> Vec<Cause> {
-    errors.iter().map(|error| error.cause.clone()).collect()
-}
-
-/// Asserts that two Referrers are the same, as values and as tokens.
-#[track_caller]
-fn assert_same_referrer(recovered: &Referrer, allowed: &Referrer, what: &str) {
-    assert_eq!(recovered, allowed, "{}", what);
-    assert_eq!(
-        recovered.to_token_stream().to_string(),
-        allowed.to_token_stream().to_string(),
-        "{}",
-        what
-    );
-}
-
-#[test]
-fn allowing_the_causes_of_every_trigger_leaves_the_recovered_referrer() {
-    let mut recovered_some = 0;
-    for (name, trigger) in every_trigger() {
-        let result = trigger();
-        let causes = causes_of(result.errors());
-        assert!(!causes.is_empty(), "{}", name);
-        let referrer = result.clone().into_referrer();
-        // The same analysis with the causes allowed reports nothing, and has the same entries and
-        // parts: allowing drops errors only.
-        let (allowed, _) = allow_every_cause(allowing_causes(trigger, &causes));
-        assert!(allowed.errors().is_empty(), "{}", name);
-        assert_same_referrer(&referrer, &allowed.into_referrer(), name);
-        // And it is a Referrer like any other: it round-trips.
-        let parsed: Referrer = parse2(referrer.to_token_stream()).unwrap();
-        assert_eq!(parsed, referrer, "{}", name);
-        recovered_some += 1;
-    }
-    assert_eq!(recovered_some, every_trigger().len());
-}
-
 #[test]
 fn recovery_keeps_the_entries_that_do_not_conflict() {
     let item: ItemStruct = parse_quote!(
@@ -1515,4 +1580,1054 @@ fn the_errors_of_self_are_reported_with_the_others() {
     let left = analyze().accept_cause(&errors[1].cause);
     assert_eq!(left.errors().len(), 1);
     assert_eq!(left.errors()[0].reason, Reason::RelativePath);
+}
+
+// ── inputs that cannot be leaked ────────────────────────────────────────────────────────────
+
+mod limits {
+    //! Inputs that cannot be leaked, and how the errors for them read.
+    //!
+    //! - `limit_*`: inputs which cannot be leaked on stable Rust. `type-leak` must reject them with
+    //!   [`ErrorItem`]s.
+    //! - `limit_*`, recording behavior: inputs which cannot be handled exactly without name resolution
+    //!   (e.g. shadowed primitive names), and how they are detected.
+
+    use super::{errors_in, kind, notes_of};
+    use std::collections::BTreeSet;
+    use syn::*;
+    use template_quote::{quote, ToTokens};
+    use type_leak::*;
+
+    fn leaker_config() -> Rules<impl Allow + Clone> {
+        Rules::new().primitive().crate_paths()
+    }
+
+    /// The messages of the errors, one per line.
+    fn messages(errors: &[ErrorItem]) -> String {
+        errors
+            .iter()
+            .map(|item| item.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The errors that `leaker` has after `analyze` ran on it, for a test that expects an error.
+    fn expect_errors<R>(leaker: Leaker, analyze: impl FnOnce(&mut Leaker) -> R) -> Vec<ErrorItem> {
+        let errors = errors_in(leaker, analyze);
+        assert!(!errors.is_empty(), "accepted");
+        errors
+    }
+
+    /// Runs a Leaker on `item_trait`, returning the leaked types or the error message.
+    fn leak_trait(item_trait: &ItemTrait) -> std::result::Result<BTreeSet<String>, String> {
+        let mut leaker = Leaker::from_config(leaker_config(), Options::new());
+        leaker.intern_trait(item_trait, true);
+        leaker.reduce_roots();
+        let referrer = leaker
+            .result()
+            .finish()
+            .map_err(|errors| messages(&errors))?;
+        Ok(referrer.iter().map(|t| quote!(#t).to_string()).collect())
+    }
+
+    // ── limitations ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn limit_const_in_bound() {
+        // A relative const in a trait bound cannot be leaked, because a const cannot be recovered
+        // from an associated type in a generic context on stable Rust.
+        let item: ItemTrait = parse2(quote! {
+            pub trait MyTrait: crate::l::Sup<{ SIZE }> {
+                fn f(&self);
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            leak_trait(&item),
+            Err("use absolute path: 'SIZE'".to_string())
+        );
+
+        // The suggested fix works: an absolute path does not need to be leaked.
+        let item: ItemTrait = parse2(quote! {
+            pub trait MyTrait: crate::l::Sup<{ ::my_crate::SIZE }> {
+                fn f(&self);
+            }
+        })
+        .unwrap();
+        assert_eq!(leak_trait(&item), Ok(BTreeSet::new()));
+    }
+
+    #[test]
+    fn limit_const_param_ty_alias() {
+        // The type of a const parameter cannot be a projection, so a relative type alias cannot be
+        // leaked there.
+        let item: ItemTrait = parse2(quote! {
+            pub trait MyTrait<const N: Idx> {
+                fn f(&self) -> RelType;
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            leak_trait(&item),
+            Err("use absolute path: 'Idx'".to_string())
+        );
+
+        // The suggested fix works: an absolute path to the alias does not need to be leaked.
+        let abs_item: ItemTrait = parse2(quote! {
+            pub trait MyTrait<const N: ::my_crate::Idx> {
+                fn f(&self) -> RelType;
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            leak_trait(&abs_item),
+            Ok(vec!["RelType".to_string()].into_iter().collect())
+        );
+
+        // `RepeaterSlots` cannot encode an alias (relative or absolute), because it cannot know which
+        // slot to use.
+        let slots = RepeaterSlots::new(parse2(quote!(crate::Repeater)).unwrap());
+        let alias = match &abs_item.generics.params[0] {
+            GenericParam::Const(param) => param,
+            _ => unreachable!(),
+        };
+        let err = slots.encode_const(&parse_quote!(N), &alias.ty).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unsupported type of const parameter: ':: my_crate :: Idx'"
+        );
+    }
+
+    // ── holes ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bare_identifier_in_bound_is_leaked_as_a_type() {
+        // A bare relative identifier in a trait bound (e.g. `SIZE` in `Sup<SIZE>`) is parsed as a
+        // type by syn, though it may be a const. There is no type to intern it in (unlike
+        // `Wrap<SIZE>`, which is interned as a whole, see `tests/reduce_roots.rs`), so it is leaked as
+        // a type whatever its name is. If it is a const, the result does not compile: it should be
+        // written as `Sup<{ SIZE }>`, which is an error (see `limit_const_in_bound`), or with an
+        // absolute path.
+        for item in [
+            parse2::<ItemTrait>(quote! {
+                pub trait MyTrait: crate::l::Sup<SIZE> {
+                    fn f(&self);
+                }
+            })
+            .unwrap(),
+            parse2::<ItemTrait>(quote! {
+                pub trait MyTrait {
+                    fn f<T: crate::l::Sup<SIZE>>(&self);
+                }
+            })
+            .unwrap(),
+        ] {
+            assert_eq!(
+                leak_trait(&item),
+                Ok(vec!["SIZE".to_string()].into_iter().collect())
+            );
+        }
+
+        // So is a relative type.
+        let item: ItemTrait = parse2(quote! {
+            pub trait MyTrait: crate::l::Sup<MyType> {
+                fn f(&self);
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            leak_trait(&item),
+            Ok(vec!["MyType".to_string()].into_iter().collect())
+        );
+
+        // The suggested fix works.
+        let item: ItemTrait = parse2(quote! {
+            pub trait MyTrait: crate::l::Sup<{ ::my_crate::SIZE }> {
+                fn f(&self);
+            }
+        })
+        .unwrap();
+        assert_eq!(leak_trait(&item), Ok(BTreeSet::new()));
+    }
+
+    #[test]
+    fn limit_shadowed_primitive() {
+        // The type of a const parameter is recognized as a primitive only by its name, so a shadowed
+        // primitive name (e.g. `type u8 = i32;` in the Leaker's context) is accepted and copied as it
+        // is into the Referrer, where it means the real `u8`. This cannot be known without name
+        // resolution, so `Leaker::assertions()` checks it at compile time in the Leaker's context
+        // (it fails with "mismatched types" if the name is shadowed).
+        let item: ItemTrait = parse2(quote! {
+            pub trait MyTrait {
+                fn f<const M: u8>(&self);
+            }
+        })
+        .unwrap();
+        assert_eq!(leak_trait(&item), Ok(BTreeSet::new()));
+
+        let mut leaker = Leaker::new();
+        leaker.intern_trait(&item, true);
+        let expected = quote! {
+            #[allow(dead_code, non_snake_case)]
+            const _: () = {
+                fn __type_leak_assert_u8_is_primitive(x: &u8) -> &::core::primitive::u8 { x }
+            };
+        };
+        let (actual, expected): (Item, Item) = (
+            parse2(leaker.assertions()).unwrap(),
+            parse2(expected).unwrap(),
+        );
+        assert_eq!(quote!(#actual).to_string(), quote!(#expected).to_string());
+        assert!(leaker.result().errors().is_empty());
+    }
+
+    #[test]
+    fn all_relative_paths_are_reported() {
+        // Every relative path which cannot be leaked is reported at once, each as an error.
+        let item: ItemTrait = parse2(quote! {
+            pub trait MyTrait: Clone + MyBound {
+                fn f(&self, x: MyType<'_>);
+            }
+        })
+        .unwrap();
+        let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true));
+        assert!(err.iter().all(|item| item.reason == Reason::RelativePath));
+        // The cause of each is the whole bound or type that is a conflict (a trait is its own path:
+        // it needs no note), and what stops the type from being leaked as a whole is a note.
+        assert_eq!(
+            err.iter()
+                .map(|item| (
+                    kind(&item.cause),
+                    item.cause.to_token_stream().to_string(),
+                    notes_of(item)
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("trait", "Clone".to_string(), vec![]),
+                ("trait", "MyBound".to_string(), vec![]),
+                (
+                    "type",
+                    "MyType < '_ >".to_string(),
+                    vec![(
+                        "'_".to_string(),
+                        "it cannot be leaked as a whole because of `'_`".to_string()
+                    )]
+                ),
+            ]
+        );
+        assert_eq!(
+            messages(&err),
+            "use absolute path: 'Clone'\nuse absolute path: 'MyBound'\nuse absolute path: 'MyType<'_>'"
+        );
+        // The first error and its help.
+        assert_eq!(
+            err[0].help_text(),
+            Some("use `::core::clone::Clone` instead of `Clone`")
+        );
+        // Each error is a separate `syn::Error`, with its own notes and help.
+        let syn_err = to_syn_error(&err);
+        assert_eq!(
+            syn_err.into_iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+            vec![
+                "use absolute path: 'Clone'\n\n  = help: use `::core::clone::Clone` instead of `Clone`\n",
+                "use absolute path: 'MyBound'\n\n  = help: write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`)\n",
+                "use absolute path: 'MyType<'_>'\n\n  = note: it cannot be leaked as a whole because of `'_`\n  = help: write `MyType` with an absolute path (e.g. `::my_crate::MyType`)\n",
+            ]
+        );
+    }
+
+    #[test]
+    fn notes_explain_conflicts() {
+        // The notes of an error tell why the path cannot be leaked as a whole, and which other paths
+        // of the same type depend on the type context (`RelA + RelB<'_>`: the two bounds of a trait
+        // object). The types inside have errors of their own. The help tells what to write.
+        let item: ItemTrait = parse2(quote! {
+            pub trait MyTrait {
+                fn f(&self, x: Box<dyn RelA + RelB<'_>>);
+            }
+        })
+        .unwrap();
+        let err = expect_errors(Leaker::new(), |leaker| leaker.intern_trait(&item, true));
+        // The suggestion of the absolute path is the help.
+        assert_eq!(
+            err[0].help_text(),
+            Some("use `::std::boxed::Box` instead of `Box`")
+        );
+        assert_eq!(
+            err[0].notes.first().map(|(_, n)| n.as_str()),
+            Some("it cannot be leaked as a whole because of `'_`")
+        );
+        assert_eq!(err.len(), 2);
+        assert_eq!(
+            to_syn_error(&err[..1]).to_string(),
+            "use absolute path: 'Box<dyn RelA + RelB<'_>>'\n\n\
+             \x20 = note: it cannot be leaked as a whole because of `'_`\n\
+             \x20 = help: use `::std::boxed::Box` instead of `Box`\n"
+        );
+        // The trait object is written as it is too, with its two traits, in an error of its own.
+        assert_eq!(err[1].paths.len(), 2);
+        assert_eq!(
+            to_syn_error(&err[1..]).to_string(),
+            "use absolute path: 'RelA'\n\n\
+             \x20 = note: it cannot be leaked as a whole because of `'_`\n\
+             \x20 = note: `RelB<'_>` also depends on the type context\n\
+             \x20 = help: write `RelA` with an absolute path (e.g. `::my_crate::RelA`)\n"
+        );
+    }
+}
+
+// ── the help of every kind of error ──────────────────────────────────────────────────────────
+
+// An error says what is wrong (`ErrorItem::message`), why (`ErrorItem::notes`) and what to write
+// instead (`ErrorItem::help`). The help is the only part of an error that a user can act on, so
+// every kind of error has one, with the tokens of the error in it:
+//
+// - `every_kind_of_error_has_a_help` is a table with one row per kind of error (the kinds of
+//   `Reason`, and the ways to write a path): the headline and the exact help of each error of the
+//   row;
+// - `a_help_is_rendered_after_the_notes` asserts how the stable layout (`syn::Error`, which
+//   `ErrorItem::to_compile_error()` renders as `compile_error!`) shows it, as `= help: ..` after
+//   the `= note: ..`s.
+
+/// One row: the kind of error, how to make it, and the headline and help of each of its errors.
+struct Row {
+    kind: &'static str,
+    error: fn() -> Vec<ErrorItem>,
+    items: &'static [(&'static str, &'static str)],
+}
+
+const ROWS: &[Row] = &[
+    // ── a path that depends on the context ───────────────────────────────────────────────────
+    Row {
+        kind: "a relative name of the prelude",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr: Clone {}
+            );
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'Clone'",
+            "use `::core::clone::Clone` instead of `Clone`",
+        )],
+    },
+    Row {
+        kind: "a primitive type in a const expression",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr: ::my_crate::Sup<{ usize::MAX }> {}
+            );
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'usize::MAX'",
+            "use `::core::primitive::usize` instead of `usize`",
+        )],
+    },
+    Row {
+        kind: "a relative path that is not in the prelude",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr: MyBound {}
+            );
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'MyBound'",
+            "write `MyBound` with an absolute path (e.g. `::my_crate::MyBound`)",
+        )],
+    },
+    Row {
+        // `crate::`, `self::` and `super::` name a place in the crate: the example leaves them out.
+        kind: "a path of the crate",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr: crate::m::Bound + super::Other {}
+            );
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[
+            (
+                "use absolute path: 'crate::m::Bound'",
+                "write `crate::m::Bound` with an absolute path (e.g. `::my_crate::m::Bound`)",
+            ),
+            (
+                "use absolute path: 'super::Other'",
+                "write `super::Other` with an absolute path (e.g. `::my_crate::Other`)",
+            ),
+        ],
+    },
+    Row {
+        kind: "a prelude name as the second segment of a relative path",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr: my_mod::Clone {}
+            );
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'my_mod::Clone'",
+            "write `my_mod::Clone` with an absolute path (e.g. `::my_crate::my_mod::Clone`)",
+        )],
+    },
+    Row {
+        kind: "a prelude trait in a bound of a method, with a binding",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr {
+                    fn f<T: Iterator<Item = u8>>(&self, t: T);
+                }
+            );
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'Iterator<Item = u8>'",
+            "use `::core::iter::Iterator` instead of `Iterator`",
+        )],
+    },
+    Row {
+        kind: "a prelude trait of a later edition, with an argument",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr: TryFrom<u8> {}
+            );
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'TryFrom<u8>'",
+            "use `::core::convert::TryFrom` instead of `TryFrom`",
+        )],
+    },
+    Row {
+        // The relative part of an `impl Trait` is reported, not the whole `impl Trait`.
+        kind: "a prelude trait in an `impl Trait`",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr {
+                    fn f(&self, x: impl Clone);
+                }
+            );
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'Clone'",
+            "use `::core::clone::Clone` instead of `Clone`",
+        )],
+    },
+    Row {
+        // The offending tokens are a whole trait bound, not a path.
+        kind: "a bound with a binder",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr: for<'a> Fn(&'a u8) {}
+            );
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'for<'a> Fn (&'a u8)'",
+            "use `::core::ops::Fn` instead of `Fn`",
+        )],
+    },
+    Row {
+        kind: "a bound in parentheses",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr: (Clone) {}
+            );
+            errors_in(Leaker::new(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: '(Clone)'",
+            "use `::core::clone::Clone` instead of `Clone`",
+        )],
+    },
+    Row {
+        kind: "a type with an elided lifetime",
+        error: || {
+            let item: ItemStruct = parse_quote!(
+                struct S {
+                    a: MyType<'_>,
+                }
+            );
+            errors_in(Leaker::new(), |leaker| leaker.intern_struct(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'MyType<'_>'",
+            "write `MyType` with an absolute path (e.g. `::my_crate::MyType`)",
+        )],
+    },
+    Row {
+        kind: "the type of a const parameter",
+        error: || {
+            let item: ItemStruct = parse_quote!(
+                struct S<const N: Idx>(u8);
+            );
+            errors_in(Leaker::new(), |leaker| leaker.intern_struct(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'Idx'",
+            "write `Idx` with an absolute path (e.g. `::my_crate::Idx`)",
+        )],
+    },
+    Row {
+        kind: "a trait object that takes its lifetime from the reference around it",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr {
+                    fn f(&self) -> &dyn RelTr;
+                }
+            );
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'RelTr'",
+            "write `RelTr` with an absolute path (e.g. `::my_crate::RelTr`), or name the lifetime of the trait object (e.g. \
+             `&'a dyn Trait` or `dyn Trait + 'a`)",
+        )],
+    },
+    Row {
+        kind: "a type that names `Self`, where `Self` is denied",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr {
+                    fn f(&self) -> Rel<Self>;
+                }
+            );
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item, false))
+        },
+        items: &[(
+            "use absolute path: 'Rel<Self>'",
+            "write `Rel` with an absolute path (e.g. `::my_crate::Rel`)",
+        )],
+    },
+    // ── a bare identifier that may be a const ────────────────────────────────────────────────
+    Row {
+        kind: "a bare identifier that may be a const, in a path that names `Self`, which is denied",
+        error: || errors(maybe_const),
+        items: &[(
+            "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
+            "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
+             const)",
+        )],
+    },
+    Row {
+        kind: "a bare identifier that may be a const, in a path that names `Self::A`",
+        error: || {
+            let item: ItemStruct = parse_quote!(
+                struct S {
+                    a: ::p::W<Self::A, LEN>,
+                }
+            );
+            errors_in(allowing(), |leaker| leaker.intern_struct(&item, true))
+        },
+        items: &[(
+            "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
+            "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
+             const), or replace `Self::A` with `<Self as SomeTrait>::A`, naming the trait that \
+             defines `A` with its absolute path",
+        )],
+    },
+    Row {
+        kind: "a bare identifier that may be a const, in the default of a parameter that names \
+               `Self`",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr<T = ::p::W<Self, LEN>> {}
+            );
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
+            "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
+             const), or name the type instead of `Self` in `::p::W<Self, LEN>`",
+        )],
+    },
+    Row {
+        kind: "a bare identifier that may be a const, in a path whose bound names `Self`",
+        error: || {
+            let item: ItemStruct = parse_quote!(
+                struct S<T: ::core::convert::AsRef<Self>> {
+                    a: ::p::W<T, LEN>,
+                }
+            );
+            errors_in(allowing(), |leaker| leaker.intern_struct(&item, false))
+        },
+        items: &[(
+            "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
+            "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
+             const), or write the bound of the generics of `::p::W<T, LEN>` without `Self`",
+        )],
+    },
+    Row {
+        kind: "a bare identifier that may be a const, in a type that leaves a method lifetime \
+               unconstrained",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr {
+                    fn f<'b>(&self, y: &'b dyn ::core::convert::AsRef<LEN>) -> &'b u8;
+                }
+            );
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
+            "keep `'b` in another argument of the method (for example `&'b self`), write `LEN` \
+             with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a const), or \
+             write the bound of the trait object (`dyn Trait + 'b`)",
+        )],
+    },
+    Row {
+        kind: "a bare identifier that may be a const, in a path with an expression that cannot be \
+               leaked",
+        error: || {
+            let item: ItemStruct = parse_quote!(
+                struct S {
+                    a: ::p::W<{ ::p::m!() }, LEN>,
+                }
+            );
+            errors_in(allowing(), |leaker| leaker.intern_struct(&item, true))
+        },
+        items: &[(
+            "`LEN` may be a const, and the type that holds it cannot be leaked as a whole",
+            "write `LEN` with an absolute path (`::my_crate::LEN`, or `{ ::my_crate::LEN }` for a \
+             const)",
+        )],
+    },
+    // ── `Self` ───────────────────────────────────────────────────────────────────────────────
+    Row {
+        kind: "`Self` where no scope declares it",
+        error: || errors(self_without_meaning),
+        items: &[
+            (
+                "`Self` has no meaning here",
+                "write the type instead of `Self`",
+            ),
+            (
+                "`Self` has no meaning here",
+                "write the type instead of `Self`",
+            ),
+        ],
+    },
+    Row {
+        kind: "`Self::A` in an impl of a trait",
+        error: || errors(self_projection),
+        items: &[(
+            "write `<Self as ::p::Tr>::A` instead of `Self::A` in `Wrap<Self::A>`: the copy \
+             cannot tell which trait `A` comes from",
+            "replace `Self::A` with `<Self as ::p::Tr>::A`",
+        )],
+    },
+    Row {
+        kind: "`Self::A` in an impl of a trait written relative",
+        error: || {
+            let item: ItemImpl = parse_quote!(
+                impl Tr for S {
+                    type A = u8;
+                    fn f(&self, x: Wrap<Self::A>) {}
+                }
+            );
+            errors_in(allowing(), |leaker| leaker.intern_impl(&item, true))
+        },
+        items: &[
+            (
+                "use absolute path: 'Tr'",
+                "write `Tr` with an absolute path (e.g. `::my_crate::Tr`)",
+            ),
+            (
+                "write `<Self as Tr>::A` instead of `Self::A` in `Wrap<Self::A>`: the copy \
+                 cannot tell which trait `A` comes from",
+                "replace `Self::A` with `<Self as ::my_crate::Tr>::A`, with `Tr` written as an \
+                 absolute path",
+            ),
+        ],
+    },
+    Row {
+        kind: "`Self::A` in a struct",
+        error: || {
+            let item: ItemStruct = parse_quote!(
+                struct S<T>(T, Wrap<Self::A>);
+            );
+            errors_in(allowing(), |leaker| leaker.intern_struct(&item, true))
+        },
+        items: &[(
+            "write `<Self as SomeTrait>::A` instead of `Self::A` in `Wrap<Self::A>`: the copy \
+             cannot tell which trait `A` comes from",
+            "replace `Self::A` with `<Self as SomeTrait>::A`, naming the trait that defines `A` \
+             with its absolute path",
+        )],
+    },
+    Row {
+        kind: "`Self::A` in an inherent impl",
+        error: || {
+            let item: ItemImpl = parse_quote!(
+                impl S {
+                    fn f(&self, x: Wrap<Self::A>) {}
+                }
+            );
+            errors_in(allowing(), |leaker| leaker.intern_impl(&item, true))
+        },
+        items: &[(
+            "write `<Self as SomeTrait>::A` instead of `Self::A` in `Wrap<Self::A>`: the copy \
+             cannot tell which trait `A` comes from",
+            "replace `Self::A` with `<Self as SomeTrait>::A`, naming the trait that defines `A` \
+             with its absolute path",
+        )],
+    },
+    Row {
+        kind: "`Self::A` in a bound of the generics of an entry",
+        error: || {
+            let item: ItemStruct = parse_quote!(
+                struct S<T: ::p::Tr<Self::A>>(Wrap<T>);
+            );
+            errors_in(allowing(), |leaker| leaker.intern_struct(&item, true))
+        },
+        items: &[
+            (
+                "write `<Self as SomeTrait>::A` instead of `Self::A` in a bound of the generics \
+                 of `Wrap<T>`: the copy cannot tell which trait `A` comes from",
+                "replace `Self::A` with `<Self as SomeTrait>::A`, naming the trait that defines \
+                 `A` with its absolute path",
+            ),
+            // The bound is an error of its own: rustc cannot prove it while it checks the bounds.
+            (
+                "`Self::A` is in a bound or where predicate, and a bound of its generics names \
+                 `Self::A`",
+                "write the bound without `Self::A`, or use `Self::A` outside the bounds and \
+                 where predicates",
+            ),
+        ],
+    },
+    Row {
+        kind: "`Self` in the default of a parameter",
+        error: || errors(self_in_default),
+        items: &[(
+            "`Wrap<Self>` is in the default of a parameter, and names `Self`",
+            "name the type instead of `Self` in `Wrap<Self>`",
+        )],
+    },
+    Row {
+        kind: "a bound of an outer trait that names its `Self`",
+        error: || errors(unnameable_self),
+        items: &[(
+            "the bound of `T` mentions a `Self` which has no name here",
+            "write the bound of `T` without `Self`, or write `Rel<T>` with an absolute path, so \
+             that it is not leaked",
+        )],
+    },
+    Row {
+        kind: "a bound of an outer type that names an associated item of its `Self`",
+        error: || {
+            errors_in(allowing(), |leaker| {
+                leaker.enter_type(&id("S"), &parse_quote!(<T: AsRef<Self::X>>), true, |view| {
+                    view.visit_item(&parse_quote!(
+                        impl ::p::W for X {
+                            fn f(&self, x: Rel<T>) {}
+                        }
+                    ))
+                })
+            })
+        },
+        items: &[(
+            "the bound of `T` mentions `Self::X`, which has no name here",
+            "write the bound of `T` without `Self::X`, or write `Rel<T>` with an absolute path, \
+             so that it is not leaked",
+        )],
+    },
+    Row {
+        kind: "a generic whose bound mentions a `Self` that is denied",
+        error: || errors(denied_self_in_bounds),
+        items: &[(
+            "`Wrap<T>` has a generic whose bound mentions `Self`, which cannot be leaked",
+            "write the bound of the generics of `Wrap<T>` without `Self`",
+        )],
+    },
+    Row {
+        kind: "the self type of an impl whose bound names `Self`",
+        error: || errors(self_in_impl_self_type),
+        items: &[
+            (
+                "`S<T>` is in the self type of the impl, and a bound of its generics names \
+                 `Self`",
+                "write `S<T>` with an absolute path, or the bound of its generics without `Self`",
+            ),
+            (
+                "`Self` is in a bound or where predicate, and a bound of its generics names \
+                 `Self`, which is a leaked type",
+                "write the bound without `Self`, or use `Self` outside the bounds and where \
+                 predicates",
+            ),
+        ],
+    },
+    // ── bounds that name leaked types ────────────────────────────────────────────────────────
+    Row {
+        kind: "a leaked type in a predicate whose generic has a leaked bound",
+        error: || errors(unprovable_bound),
+        items: &[(
+            "`Wrap<T>` is in a bound or where predicate, and a bound of its generics names a \
+             leaked type",
+            "write the leaked type of the bound with an absolute path, or use `Wrap<T>` outside \
+             the bounds and where predicates",
+        )],
+    },
+    Row {
+        kind: "a bound that names an associated type of `Self`",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr {
+                    type A0;
+                    fn m<X>(&self)
+                    where
+                        X: Fn(&Self::A0) -> u8,
+                        Rel<X>: Default;
+                }
+            );
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "`Rel<X>` is in a bound or where predicate, and a bound of its generics names \
+             `Self::A0`",
+            "write the bound without `Self::A0`, or use `Rel<X>` outside the bounds and where \
+             predicates",
+        )],
+    },
+    Row {
+        kind: "a type that names `Self` in a predicate of its trait",
+        error: || errors(self_in_trait_predicate),
+        items: &[(
+            "`Rel<Self>` names `Self` in a bound or where predicate of its trait",
+            "write the predicate of the trait without `Rel<Self>`, or use `Rel<Self>` outside \
+             the predicates of the trait (in a method, a field or a signature)",
+        )],
+    },
+    // ── lifetimes ────────────────────────────────────────────────────────────────────────────
+    Row {
+        kind: "a lifetime of a method that the copy would leave unconstrained",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr {
+                    fn f<'b>(&self, x: Wrap<'b>) -> &'b u8;
+                    fn g<'c>(&self, x: &'c dyn RelTrait) -> &'c u8;
+                }
+            );
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[
+            (
+                "`Wrap<'b>` leaves the lifetime `'b` of the method unconstrained in the copy \
+                 (E0195)",
+                "keep `'b` in another argument of the method (for example `&'b self`), or write \
+                 `Wrap<'b>` with an absolute path",
+            ),
+            (
+                "`RelTrait` leaves the lifetime `'c` of the method unconstrained in the copy \
+                 (E0195)",
+                "keep `'c` in another argument of the method (for example `&'c self`), write \
+                 `RelTrait` with an absolute path, or write the bound of the trait object \
+                 (`dyn Trait + 'c`)",
+            ),
+        ],
+    },
+    Row {
+        kind: "a `for<..>` lifetime of an output that no input keeps",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr {
+                    fn f<F: for<'x> Fn(Rel<'x>) -> &'x u8>(&self, f: F);
+                }
+            );
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'Rel<'x>'",
+            "keep an input that names `'x` as written (for example `&'x u8`), or write \
+             `Rel<'x>` with an absolute path",
+        )],
+    },
+    Row {
+        kind: "an elided output lifetime of a method with no receiver",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr<'a, T: 'a> {
+                    fn g(x: &Rel<T>) -> &u8;
+                }
+            );
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'Rel<T>'",
+            "name the lifetime of the inputs and of the output, give the method a receiver \
+             (`&self`), or write `Rel<T>` with an absolute path",
+        )],
+    },
+    Row {
+        kind: "an elided output lifetime of `Fn(..)` in a bound",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr<'a, T: 'a, F: Fn(&Rel<T>) -> &u8> {}
+            );
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'Rel<T>'",
+            "name the lifetime of the inputs and of the output, or write `Rel<T>` with an \
+             absolute path",
+        )],
+    },
+    Row {
+        kind: "an elided output lifetime that a path hides",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr<'a, T: 'a, F: Fn(::p::WRef<u8>, Rel<T>) -> &u8> {}
+            );
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'Rel<T>'",
+            "write the lifetime that the path hides (`Ref<'x, u8>`), and name it in the output, \
+             or write `Rel<T>` with an absolute path",
+        )],
+    },
+    Row {
+        kind: "an elided output lifetime whose holder cannot be leaked",
+        error: || {
+            let item: ItemTrait = parse_quote!(
+                trait Tr<'a, T: 'a> {
+                    fn f(&self, x: &dyn Fn(&Rel<T>) -> &u8);
+                }
+            );
+            errors_in(allowing(), |leaker| leaker.intern_trait(&item, true))
+        },
+        items: &[(
+            "use absolute path: 'Rel<T>'",
+            "name the lifetime of the inputs and of the output, or write `Rel<T>` with an \
+             absolute path",
+        )],
+    },
+    Row {
+        kind: "an elided output lifetime, where `Self` has lifetimes and is denied",
+        error: || {
+            let item: ItemStruct = parse_quote!(
+                pub struct S<'a>(fn(::core::slice::Iter<u8>, Self) -> &u8, &'a u8);
+            );
+            errors_in(allowing(), |leaker| leaker.intern_struct(&item, false))
+        },
+        items: &[(
+            "use absolute path: 'Self'",
+            "write the lifetime that the path hides (`Ref<'x, u8>`), and name it in the output",
+        )],
+    },
+];
+
+#[test]
+fn every_kind_of_error_has_a_help() {
+    for row in ROWS {
+        let err = (row.error)();
+        let items = &err;
+        let got: Vec<(String, String)> = items
+            .iter()
+            .map(|item| {
+                (
+                    item.message.clone(),
+                    item.help_text().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let expected: Vec<(String, String)> = row
+            .items
+            .iter()
+            .map(|(message, help)| (message.to_string(), help.to_string()))
+            .collect();
+        assert_eq!(got, expected, "{}", row.kind);
+        for item in items {
+            let (_, help) = item.help.as_ref().expect(row.kind);
+            // The help says what to write, the notes why: it is none of them, and not the headline.
+            assert!(!help.is_empty(), "{}", row.kind);
+            assert_ne!(*help, item.message, "{}", row.kind);
+            assert!(
+                item.notes.iter().all(|(_, note)| note != help),
+                "{}: {}",
+                row.kind,
+                help
+            );
+            // It starts like a sentence of rustc's help: in lower case, and with no full stop.
+            assert!(
+                help.starts_with(|c: char| c.is_lowercase()) && !help.ends_with('.'),
+                "{}: {}",
+                row.kind,
+                help
+            );
+            // It has no colon of its own outside the code in backticks (a lead clause, a colon and
+            // the instruction): a tool that prints "message: help" on one line would show two.
+            assert!(
+                help.split('`').step_by(2).all(|words| !words.contains(':')),
+                "{}: {}",
+                row.kind,
+                help
+            );
+        }
+        // The first error's help is what the accessors of the error tell.
+        assert_eq!(err[0].help_text(), items[0].help_text(), "{}", row.kind);
+    }
+}
+
+#[test]
+fn a_help_is_rendered_after_the_notes() {
+    for row in ROWS {
+        let err = (row.error)();
+        let items = &err;
+        let errors: Vec<syn::Error> = to_syn_error(&err).into_iter().collect();
+        assert_eq!(errors.len(), items.len(), "{}", row.kind);
+        for (error, item) in errors.iter().zip(items) {
+            let rendered = error.to_string();
+            let help = item.help_text().unwrap();
+            // The headline, a blank line, the notes (`= note: ..`), the help (`= help: ..`).
+            let mut expected = format!("{}\n", item.message);
+            expected += "\n";
+            for (_, note) in &item.notes {
+                expected += &format!("  = note: {}\n", note);
+            }
+            expected += &format!("  = help: {}\n", help);
+            assert_eq!(rendered, expected, "{}", row.kind);
+        }
+        // And `to_compile_error()` renders the same errors, as `compile_error!`s.
+        let tokens = err
+            .iter()
+            .map(ErrorItem::to_compile_error)
+            .collect::<proc_macro2::TokenStream>()
+            .to_string();
+        assert_eq!(
+            tokens.matches("compile_error").count(),
+            items.len(),
+            "{}: {}",
+            row.kind,
+            tokens
+        );
+        for item in items {
+            assert!(
+                tokens.contains(&format!("= help: {}", item.help_text().unwrap())),
+                "{}: {}",
+                row.kind,
+                tokens
+            );
+        }
+    }
+}
+
+/// The notes keep their words when a help is added: why, not what to write.
+#[test]
+fn a_note_that_is_not_about_the_fix_has_no_advice() {
+    for row in ROWS {
+        let err = (row.error)();
+        for item in &err {
+            for (_, note) in &item.notes {
+                assert!(
+                    !note.contains("Write the")
+                        && !note.contains("name the lifetime of the inputs"),
+                    "{}: {}",
+                    row.kind,
+                    note
+                );
+            }
+        }
+    }
 }

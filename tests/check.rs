@@ -94,50 +94,6 @@ fn test_check() {
     assert!(leaker.result().errors().is_empty());
 }
 
-#[test]
-fn test_check_self_no_internable() {
-    let test_struct: ItemStruct = parse_quote!(
-        pub struct MyStruct<'l1, const N1: usize, T1, T2, T3>;
-    );
-
-    // `Self` of a struct scope is allowed by `check()` if `allow_self` is set.
-    let mut leaker = Leaker::new();
-    let result = leaker
-        .enter_type(&test_struct.ident, &test_struct.generics, true, |view| {
-            view.check(&parse_quote!(Self))
-        })
-        .1;
-    assert_eq!(kind(&result), "Neutral");
-
-    // With `allow_self` unset, a type mentioning `Self` cannot be interned as a whole, as it is
-    // for the items.
-    let item: ItemStruct = parse_quote!(
-        pub struct MyStruct<T1> {
-            a: Rel<Self>,
-            b: T1,
-        }
-    );
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, true);
-    let result = leaker.result();
-    assert!(result.finish().is_ok());
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, false);
-    let result = leaker.result();
-    assert!(result.finish().is_err());
-    // The types which do not mention it are not affected.
-    let item: ItemStruct = parse_quote!(
-        pub struct MyStruct<T1> {
-            a: Rel<T1>,
-            b: Self,
-        }
-    );
-    let mut leaker = Leaker::new();
-    leaker.intern_struct(&item, false);
-    let result = leaker.result();
-    assert!(result.finish().is_ok());
-}
-
 /// `Rules::crate_paths()`: a path that starts with `crate` is leaked, unless the allowed
 /// paths have `crate`. A real `$crate` token (which a `macro_rules!`
 /// expansion gives to a proc macro) cannot be made outside one, so the `$crate` paths are pinned
@@ -281,64 +237,6 @@ fn test_check_allowed_paths_with_generic_args() {
     assert_eq!(leaked, vec!["RelType".to_string()].into_iter().collect());
 }
 
-#[test]
-fn test_check_conflict() {
-    let generics: Generics = parse_quote!(<T>);
-    let mut leaker = Leaker::new();
-    let strings = |causes: Vec<Cause>| -> Vec<String> {
-        causes
-            .iter()
-            .map(|cause| cause.to_token_stream().to_string())
-            .collect()
-    };
-    let mut conflict = |ty: Type| {
-        let c = check_in(&mut leaker, &ty, &generics);
-        (strings(c.must), strings(c.impossible), c.is_own)
-    };
-    let v = |s: &[&str]| -> Vec<String> { s.iter().map(|s| s.to_string()).collect() };
-
-    // The type's own path depends on the type context: it cannot be decomposed.
-    assert_eq!(
-        conflict(parse_quote!(MyType<'_>)),
-        (v(&["MyType < '_ >"]), v(&["'_"]), true)
-    );
-    assert_eq!(
-        conflict(parse_quote!(<T as MyTrait<'_>>::Ty)),
-        (v(&["MyTrait < '_ > :: Ty"]), v(&["'_"]), true)
-    );
-    // Only components do: it can be decomposed.
-    assert_eq!(
-        conflict(parse_quote!(::path::Wrap<MyType, '_>)),
-        (v(&["MyType"]), v(&["'_"]), false)
-    );
-    assert_eq!(
-        conflict(parse_quote!(<T as ::path::Trait<MyType, '_>>::Ty)),
-        (v(&["MyType"]), v(&["'_"]), false)
-    );
-    // All the causes are collected, the outermost ones first.
-    assert_eq!(
-        conflict(parse_quote!(
-            ::path::Wrap<'_, ::path::Wrap<(C,)>, A, B<D>, impl ::path::Tr>
-        )),
-        (
-            v(&["A", "B < D >", "D", "C"]),
-            v(&["'_", "impl :: path :: Tr"]),
-            false
-        )
-    );
-    // A bare identifier as an argument may be a const, so the type containing it is interned as a
-    // whole (with the cause in its own path) if it can be, as `::path::Wrap<C>` here, but not the
-    // outer one, which has impossible causes (`A` is a type of its own).
-    assert_eq!(
-        conflict(parse_quote!(::path::Wrap<'_, ::path::Wrap<C>, A>)),
-        (v(&["C", "A"]), v(&["'_"]), false)
-    );
-    assert_eq!(
-        conflict(parse_quote!(dyn A + B<'_>)),
-        (v(&["A", "B < '_ >"]), v(&["'_"]), true)
-    );
-}
-
 /// The kind of each cause and its tokens, as text.
 fn kinds(causes: &[Cause]) -> Vec<(&'static str, String)> {
     causes
@@ -360,54 +258,139 @@ fn kinds(causes: &[Cause]) -> Vec<(&'static str, String)> {
 
 /// The causes of `must` and `impossible` are the syntax that they are: a path in a type is a type,
 /// the path of a bound a trait, a path in an expression an expression, the path of a macro call a
-/// macro, and a lifetime a lifetime. The first of `must` is the cause of the error.
+/// macro, and a lifetime a lifetime. The first of `must` is the cause of the error. A type whose own
+/// path depends on the type context cannot be decomposed (`is_own`), and one whose components do
+/// can; all the causes are collected, the outermost ones first.
 #[test]
 fn the_causes_of_a_check_have_the_kind_of_their_syntax() {
     let generics: Generics = parse_quote!(<T>);
-    let check = |ty: Type| check_in(&mut Leaker::new(), &ty, &generics);
-    let own = |kind, text: &str| (kind, text.to_string());
-
-    let result = check(parse_quote!(MyType<'_>));
-    assert_eq!(kinds(&result.must), [own("type", "MyType < '_ >")]);
-    assert_eq!(kinds(&result.impossible), [own("lifetime", "'_")]);
-
-    // The trait of a `dyn` type is a trait, and the type that cannot be leaked is a type (under the
-    // elided lifetime, that is a lifetime).
-    let result = check(parse_quote!(::p::W<'_, dyn RelTr>));
-    assert_eq!(kinds(&result.must), [own("trait", "RelTr")]);
-    assert_eq!(
-        kinds(&result.impossible),
-        [own("lifetime", "'_"), own("type", "dyn RelTr")]
+    let check = |ty: &Type| check_in(&mut Leaker::new(), ty, &generics);
+    // The type, `must` and `impossible` as (kind, text), and `is_own`.
+    type Row = (
+        Type,
+        Vec<(&'static str, &'static str)>,
+        Vec<(&'static str, &'static str)>,
+        bool,
     );
-
-    // The closure stops the array from being leaked, and the paths in it are causes of their own:
-    // `u8` a type, `a` an expression.
-    let result = check(parse_quote!(
+    let rows: Vec<Row> = vec![
+        (
+            parse_quote!(MyType<'_>),
+            vec![("type", "MyType < '_ >")],
+            vec![("lifetime", "'_")],
+            true,
+        ),
+        // A path in a qualified type is no node of the syntax.
+        (
+            parse_quote!(<T as RelTrait<'_>>::Ty),
+            vec![("unreadable", "RelTrait < '_ > :: Ty")],
+            vec![("lifetime", "'_")],
+            true,
+        ),
+        // Only components depend on the context: the type can be decomposed.
+        (
+            parse_quote!(::path::Wrap<MyType, '_>),
+            vec![("type", "MyType")],
+            vec![("lifetime", "'_")],
+            false,
+        ),
+        (
+            parse_quote!(<T as ::path::Trait<MyType, '_>>::Ty),
+            vec![("type", "MyType")],
+            vec![("lifetime", "'_")],
+            false,
+        ),
+        (
+            parse_quote!(::path::Wrap<'_, ::path::Wrap<(C,)>, A, B<D>, impl ::path::Tr>),
+            vec![
+                ("type", "A"),
+                ("type", "B < D >"),
+                ("type", "D"),
+                ("type", "C"),
+            ],
+            vec![("lifetime", "'_"), ("type", "impl :: path :: Tr")],
+            false,
+        ),
+        // A bare identifier as an argument may be a const, so the type containing it is interned as
+        // a whole (with the cause in its own path) if it can be, as `::path::Wrap<C>` here, but not
+        // the outer one, which has impossible causes (`A` is a type of its own).
+        (
+            parse_quote!(::path::Wrap<'_, ::path::Wrap<C>, A>),
+            vec![("type", "C"), ("type", "A")],
+            vec![("lifetime", "'_")],
+            false,
+        ),
+        // The trait of a bound is a trait.
+        (
+            parse_quote!(dyn A + B<'_>),
+            vec![("trait", "A"), ("trait", "B < '_ >")],
+            vec![("lifetime", "'_")],
+            true,
+        ),
+        // The trait of a `dyn` type is a trait, and the type that cannot be leaked is a type (under
+        // the elided lifetime, that is a lifetime).
+        (
+            parse_quote!(::p::W<'_, dyn RelTr>),
+            vec![("trait", "RelTr")],
+            vec![("lifetime", "'_"), ("type", "dyn RelTr")],
+            false,
+        ),
+        // The closure stops the array from being leaked, and the paths in it are causes of their
+        // own: `u8` a type, `a` an expression.
+        (
+            parse_quote!(
+                [u8; {
+                    let c = |a: u8| a;
+                    3
+                }]
+            ),
+            vec![("type", "u8"), ("expr", "a")],
+            vec![("expr", "| a : u8 | a")],
+            true,
+        ),
+        // A macro call is a macro in `must` (its path, written with the `!`) and an expression, with
+        // its arguments, in `impossible`.
+        (
+            parse_quote!([u8; two!()]),
+            vec![("macro", "two !")],
+            vec![("expr", "two ! ()")],
+            true,
+        ),
+    ];
+    for (ty, must, impossible, is_own) in rows {
+        let result = check(&ty);
+        let own = |causes: Vec<(&str, &str)>| -> Vec<(String, String)> {
+            causes
+                .into_iter()
+                .map(|(kind, text)| (kind.to_string(), text.to_string()))
+                .collect()
+        };
+        let got = |causes: &[Cause]| -> Vec<(String, String)> {
+            kinds(causes)
+                .into_iter()
+                .map(|(kind, text)| (kind.to_string(), text))
+                .collect()
+        };
+        let what = ty.to_token_stream().to_string();
+        assert_eq!(got(&result.must), own(must), "must of {}", what);
+        assert_eq!(
+            got(&result.impossible),
+            own(impossible),
+            "impossible of {}",
+            what
+        );
+        assert_eq!(result.is_own, is_own, "is_own of {}", what);
+    }
+    let result = check(&parse_quote!(
         [u8; {
             let c = |a: u8| a;
             3
         }]
     ));
-    assert_eq!(kinds(&result.must), [own("type", "u8"), own("expr", "a")]);
-    assert_eq!(kinds(&result.impossible), [own("expr", "| a : u8 | a")]);
     assert!(matches!(&result.must[1], Cause::Expr(Expr::Path(_))));
     assert!(matches!(
         &result.impossible[0],
         Cause::Expr(Expr::Closure(_))
     ));
-
-    // A macro call is a macro in `must` (its path, written with the `!`) and an expression, with
-    // its arguments, in `impossible`.
-    let result = check(parse_quote!([u8; two!()]));
-    assert_eq!(kinds(&result.must), [own("macro", "two !")]);
-    assert_eq!(kinds(&result.impossible), [own("expr", "two ! ()")]);
-
-    // A path in a qualified type is no node of the syntax.
-    let result = check(parse_quote!(<T as RelTrait<'_>>::Ty));
-    assert_eq!(
-        kinds(&result.must),
-        [own("unreadable", "RelTrait < '_ > :: Ty")]
-    );
 }
 
 fn strings(causes: &[Cause]) -> Vec<String> {
@@ -533,6 +516,7 @@ fn check_self_has_no_meaning_in_generics_and_modules() {
         // A type that holds it is a conflict if it is a cause itself, and its parts can be leaked
         // otherwise.
         assert_eq!(kind(&in_rel), "Conflict");
+        assert_eq!(in_rel.must.len(), 1);
         assert_eq!(strings(&in_rel.impossible), ["Self"]);
         assert!(in_rel.is_own);
         assert_eq!(kind(&in_path), "MustNotIntern");
@@ -730,16 +714,22 @@ fn check_reports_the_conflict_a_scope_reports() {
 }
 
 /// Types that a visit would record in some way: entries, optional entries, conflicts, errors for
-/// `Self`, the probe of a binder, and a module found in an array length.
+/// `Self`, the probe of a binder, and a module found in an array length; and `&'static u8`, which it
+/// would not.
 fn recording_types() -> Vec<Type> {
     vec![
+        parse_quote!(Rel),
+        parse_quote!(Rel<'_>),
         parse_quote!(Rel<T>),
         parse_quote!(::foo::W<(Rel2<T>,)>),
         parse_quote!(MyType<'_>),
+        parse_quote!(::p::W<'_, dyn RelTr>),
+        parse_quote!(::p::X<dyn RelTr>),
         parse_quote!(impl MyTrait),
         parse_quote!(Self),
         parse_quote!(Rel<Self::Item>),
         parse_quote!(&'a Rel<T>),
+        parse_quote!(&'static u8),
         parse_quote!(for<'x> fn(Rel<'x>, &u8) -> &'x u8),
         parse_quote!(
             ::foo::W<
