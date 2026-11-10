@@ -35,8 +35,10 @@ pub enum Cause {
     /// qualified path in a value (`<u8 as Rel>::f()`).
     Trait(Path),
     /// An expression: a path in a const expression (an array length, a discriminant) or, with
-    /// [`Leaker::check_values`](crate::Leaker::check_values), in a value; also an expression that
-    /// cannot be leaked (a closure in an array length). A path is an [`Expr::Path`], as written.
+    /// [`Leaker::check_values`](crate::Leaker::check_values) or
+    /// [`Leaker::check_bodies`](crate::Leaker::check_bodies), in a value or a body; also an
+    /// expression that cannot be leaked (a closure in an array length). A path is an
+    /// [`Expr::Path`], as written.
     Expr(Expr),
     /// The path of a macro call, written with its `!` (`two!` in `[u8; two!()]`). A macro that is a
     /// type is a [`Cause::Type`].
@@ -313,11 +315,11 @@ pub enum Reason {
     /// The error has no [`paths`](ErrorItem::paths), so a rule that allows its cause (`Self`,
     /// `Self::Item`) accepts it ([`Allow`](crate::Allow)).
     SelfWithoutMeaning,
-    /// Syntax that the Leaker cannot read, with `check_values`: a macro whose arguments are not
-    /// expressions, a `macro_rules!`, a glob import, syntax that `syn` leaves unparsed. Also a
-    /// `mod` item given to [`View::visit_item()`](crate::View::visit_item) or met in an item there
-    /// (the cause is `mod name`, with no paths): the Leaker analyzes no module, and nothing in it
-    /// is leaked.
+    /// Syntax that the Leaker cannot read, with `check_values` or `check_bodies`: a macro whose
+    /// arguments are not expressions, a `macro_rules!`, a glob import, syntax that `syn` leaves
+    /// unparsed. Also a `mod` item given to [`View::visit_item()`](crate::View::visit_item) or met
+    /// in an item there (the cause is `mod name`, with no paths): the Leaker analyzes no module,
+    /// and nothing in it is leaked.
     Unreadable,
     /// A bare identifier among the arguments of a path, which may be a const, in a type that cannot
     /// be leaked whole ([Bare identifiers and consts](crate::Leaker#bare-identifiers-and-consts)).
@@ -459,12 +461,13 @@ pub struct ErrorItem {
     /// What to write instead, with the tokens it is about. The analysis gives every error one; it
     /// is `None` only in an item that [`Parse`] read without.
     pub help: Option<(TokenStream, String)>,
-    /// Where it was found: in a value that [`Leaker::check_values`](crate::Leaker::check_values)
-    /// reads, in a default, both or neither. It is the place that an [`Allow`](crate::Allow) rule
-    /// is asked at.
+    /// Where it was found: in a value or a body that
+    /// [`Leaker::check_values`](crate::Leaker::check_values) or
+    /// [`Leaker::check_bodies`](crate::Leaker::check_bodies) reads, in a default, both or neither.
+    /// It is the place that an [`Allow`](crate::Allow) rule is asked at.
     ///
     /// ```ignore
-    /// // In crate a, with the values read.
+    /// // In crate a, with the values and the bodies read.
     /// trait Tr<U = Rel<'_>> {          // `Rel<'_>`: in_default
     ///     fn f(&self) { rel::f(); }    // `rel::f`: in_value and in_default
     /// }

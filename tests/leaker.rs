@@ -101,7 +101,7 @@ fn leaker_default_is_leaker_new() {
         }
     );
     let analyze = |mut leaker: Leaker| {
-        assert!(!leaker.check_values);
+        assert!(!leaker.check_values && !leaker.check_bodies);
         leaker.intern_trait(&item);
         leaker.result()
     };

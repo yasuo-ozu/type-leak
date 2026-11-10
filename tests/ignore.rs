@@ -747,6 +747,7 @@ fn ignore_if_asks_about_the_errors_in_the_order_found() {
     );
     let mut leaker = Leaker::new();
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
     let found = causes(&result);
@@ -858,6 +859,7 @@ fn errors_about_the_same_part_go_together() {
     );
     let mut leaker = Leaker::new();
     leaker.check_values = true;
+    leaker.check_bodies = true;
     let top = leaker.intern_trait(&item);
     let result = leaker.result();
     let my_type = Cause::Type(parse_quote!(MyType<'_, Rel>));
@@ -907,6 +909,7 @@ fn an_error_that_is_about_no_part_is_only_dropped() {
     // `Self` where it has no meaning, a path in a value, and syntax that cannot be read.
     let mut leaker = Leaker::new();
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.enter_generics(&Generics::default(), |view| {
         view.visit_type(&parse_quote!(Rel<Self>));
     });

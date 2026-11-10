@@ -35,12 +35,13 @@
 //!
 //! The last tests are the issues that announce found when it ported to the error-recovery branch
 //! (1 to 4 of `ISSUES-from-announce.md`, named `issue_one_`, ..) and to `api-reduction` (5, 6, 8,
-//! 9 and 10, `issue_five_`, ..): what an error shows to the user, not the entries; the error of
-//! `finish()` for `?` (9); and a Referrer without entries, which takes `Projection::unused()` (10).
+//! 9, 10 and 14, `issue_five_`, ..): what an error shows to the user, not the entries; the error of
+//! `finish()` for `?` (9); a Referrer without entries, which takes `Projection::unused()` (10); and
+//! `Leaker::check_bodies`, apart from `check_values` (14).
 
 mod common;
 
-use common::{messages, starts_with};
+use common::{messages, starts_with, Recovered};
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::{quote, ToTokens};
@@ -861,12 +862,13 @@ fn fourteen_values_are_not_read_by_default() {
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 0);
 }
 
-/// The errors of `source` (a trait) with `check_values`: the message, the note and the help of
-/// each.
+/// The errors of `source` (a trait) with `check_values` and `check_bodies`: the message, the note
+/// and the help of each.
 fn value_errors(source: &str) -> Vec<(String, String, String)> {
     let item: ItemTrait = parse_str(source).unwrap();
     let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
     let err = result.errors();
@@ -1081,6 +1083,7 @@ fn issue_two_a_macro_call_is_printed_as_one_writes_it() {
     );
     let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
     assert_eq!(
@@ -1101,6 +1104,7 @@ fn issue_two_a_macro_call_is_printed_as_one_writes_it() {
     );
     let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
     let message = &result.errors()[0].message;
@@ -1167,6 +1171,7 @@ fn issue_three_allow_prelude_accepts_the_names_of_every_edition() {
     );
     let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
     assert_eq!(messages(result.errors()), "");
@@ -1174,6 +1179,7 @@ fn issue_three_allow_prelude_accepts_the_names_of_every_edition() {
     let config = Rules::new().primitive();
     let mut leaker = Leaker::with_rule(config);
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
     let shown = messages(result.errors());
@@ -1440,6 +1446,7 @@ fn errors_with<A: Allow>(
 ) -> Vec<ErrorItem> {
     let mut leaker = Leaker::with_rule(rule);
     leaker.check_values = check_values;
+    leaker.check_bodies = check_values;
     run(&mut leaker);
     leaker.result().errors().to_vec()
 }
@@ -1600,5 +1607,71 @@ fn issue_eight_every_way_to_report_an_error_gives_the_same_tokens() {
         direct.contains("use absolute path: 'inner::Base'"),
         "{}",
         direct
+    );
+}
+
+// ── issues of the check of values ────────────────────────────────────────────────────────────
+
+/// Issue 14: with `check_values`, the body of a provided method was read along with the defaults of
+/// the consts, so `trait WithBody { const N: usize = 1; fn f() -> usize { inner::N } }` was an
+/// error ("it is in the default body of `f`"), and announce, whose users do not copy bodies across
+/// crates, cloned the trait with the bodies taken off. `check_values` reads the values and
+/// `check_bodies` the bodies now (the doc of `Leaker::check_bodies` and
+/// `tests/check_values.rs` have the other items): the trait is accepted with `check_values` alone,
+/// and the default of its const is still read.
+#[test]
+fn issue_fourteen_check_values_reads_the_const_defaults_and_not_the_bodies() {
+    let item: ItemTrait = parse_quote! {
+        pub trait WithBody { const N: usize = 1; fn f() -> usize { inner::N } }
+    };
+    let errors_with = |values: bool, bodies: bool| {
+        let mut leaker = Leaker::with_rule(config());
+        leaker.check_values = values;
+        leaker.check_bodies = bodies;
+        leaker.intern_trait(&item);
+        let result = leaker.result();
+        result
+            .errors()
+            .iter()
+            .map(|error| {
+                let note = error.notes.first().map(|(_, note)| note.as_str());
+                (error.message.clone(), note.unwrap_or_default().to_string())
+            })
+            .collect::<Vec<_>>()
+    };
+    let body = vec![(
+        "use absolute path: 'inner::N'".to_string(),
+        "it is in the default body of `f`, which the copy writes as it is".to_string(),
+    )];
+    // Neither is on by default; the values alone read only the const.
+    assert_eq!(errors_with(false, false), vec![]);
+    assert_eq!(errors_with(true, false), vec![]);
+    assert_eq!(errors_with(false, true), body);
+    assert_eq!(errors_with(true, true), body);
+
+    // The default of a const is read all the same with `check_values`: a relative path in it is an
+    // error, and a type in it is an entry, while the body next to it is not read.
+    let item: ItemTrait = parse_quote! {
+        pub trait WithBody {
+            const N: usize = inner::N;
+            const M: usize = ::core::mem::size_of::<inner::Local>();
+            fn f() -> usize { inner::N + ::core::mem::size_of::<inner::Other>() }
+        }
+    };
+    let mut leaker = Leaker::with_rule(config());
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
+    let result = leaker.result();
+    let errors = result.errors();
+    assert_eq!(errors.len(), 1, "{}", messages(errors));
+    assert_eq!(errors[0].message, "use absolute path: 'inner::N'");
+    assert_eq!(
+        errors[0].notes.first().map(|(_, note)| note.as_str()),
+        Some("it is in the default value of `N`, which the copy writes as it is")
+    );
+    let referrer = result.recovered();
+    assert_eq!(
+        common::types(&referrer).map(text).collect::<Vec<_>>(),
+        ["inner :: Local"]
     );
 }

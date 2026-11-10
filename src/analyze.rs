@@ -396,6 +396,9 @@ struct Mode {
     /// The values of an item are read too (see
     /// [`Leaker::check_values`](crate::Leaker::check_values)).
     check_values: bool,
+    /// The bodies of functions are read too (see
+    /// [`Leaker::check_bodies`](crate::Leaker::check_bodies)).
+    check_bodies: bool,
     /// Whether [`AnalyzeVisitor::env_cycle()`] is checked. It is not by the probe that it runs.
     check_env: bool,
 }
@@ -717,14 +720,21 @@ enum Handoff {
 
 // `A: 'a` is not implied for the associated functions on rustc 1.56.
 impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
-    /// `check_values`: the values of the items are read too (see
-    /// [`Leaker::check_values`](crate::Leaker::check_values)).
-    pub(crate) fn new(rule: &'a mut A, generics: &Generics, check_values: bool) -> Self {
+    /// `check_values` and `check_bodies`: the values and the bodies of the items are read too (see
+    /// [`Leaker::check_values`](crate::Leaker::check_values) and
+    /// [`Leaker::check_bodies`](crate::Leaker::check_bodies)).
+    pub(crate) fn new(
+        rule: &'a mut A,
+        generics: &Generics,
+        check_values: bool,
+        check_bodies: bool,
+    ) -> Self {
         Self {
             rule,
             mode: Mode {
                 outer_place: Place::default(),
                 check_values,
+                check_bodies,
                 check_env: true,
             },
             records: Records::default(),
@@ -764,23 +774,25 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         place: Place,
         f: impl FnOnce(&mut AnalyzeVisitor<'b, A>) -> R,
     ) -> R {
-        let mut visitor = AnalyzeVisitor::new(rule, generics, false);
+        let mut visitor = AnalyzeVisitor::new(rule, generics, false, false);
         visitor.mode.outer_place = place;
         f(&mut visitor)
     }
 
     /// Analyzes the default `ty` of a type parameter, with the parameters before it as the root
-    /// generics; the values in it are read if `check_values`. Returns the effects and the mentions
-    /// of `Self` that have no meaning.
+    /// generics; the values and bodies in it are read if `check_values` and `check_bodies`. Returns
+    /// the effects and the mentions of `Self` that have no meaning.
     fn analyze_default(
         rule: &mut A,
         ty: &Type,
         generics: &Generics,
         declares_self: bool,
         check_values: bool,
+        check_bodies: bool,
     ) -> (Vec<Effect>, Vec<SelfMention>) {
         Self::throwaway(rule, generics, Place::default(), |visitor| {
             visitor.mode.check_values = check_values;
+            visitor.mode.check_bodies = check_bodies;
             // Inside the scope, as the visitor that the Leaker makes is after `enter_scope()`: an
             // item in the default is nested, so its generics and its `Self` are its own.
             visitor.item_depth = 1;
@@ -1101,6 +1113,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 &root,
                 declares_self,
                 self.mode.check_values,
+                self.mode.check_bodies,
             );
             // The mentions and the conflicts of the default come after those found so far.
             shift_seen(&mut found, self.records.self_errors.len());
@@ -3724,7 +3737,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<'_, A> {
         for attr in &i.attrs {
             self.visit_attribute(attr);
         }
-        // The default body is read only with `check_values`.
+        // The default body is read only with `check_bodies`.
         self.method_signature(&i.sig, |visitor| {
             if let Some(block) = &i.default {
                 visitor.check_body(&i.sig, block, true);
@@ -5278,17 +5291,17 @@ fn is_bare_ident(ty: &Type) -> bool {
     }
 }
 
-// The check of the values of an item (`Leaker::check_values`): const and static values, default
-// consts and function bodies; enum discriminants and const parameter defaults always. The copy
-// writes a value as it is, so a path in it that depends on where it is written is an error of a
-// relative path. The walk follows the scopes of a body (`scopes`, `barrier`): bindings, block
-// items, `use`s and generics are local. `Self` is known too: it is the scope's, or the `Self` of
-// an item that a block declares (`self_items`). A type in a type position (cast, `let`, closure,
-// turbofish, qualified self type) is leaked as any type of the item, unless it names what the
-// value declares or is in a macro or a block item (`reads`). What the walk cannot read (macro
-// arguments that are no expressions, `macro_rules!`, a glob `use`, unparsed syntax) is rejected.
-// None of this is done in a type (an array length): there the value of a nested item is part of
-// the type, which the visitor reads like the rest of the length, whatever `check_values` says. The
+// The check of the values and bodies of an item (`Leaker::check_values`: const and static values and
+// default consts; `Leaker::check_bodies`: function bodies); enum discriminants and const parameter
+// defaults always. The copy writes a value as it is, so a path in it that depends on where it is
+// written is an error of a relative path. The walk follows the scopes of a body (`scopes`,
+// `barrier`): bindings, block items, `use`s and generics are local. `Self` is known too: it is the
+// scope's, or the `Self` of an item that a block declares (`self_items`). A type in a type position
+// (cast, `let`, closure, turbofish, qualified self type) is leaked as any type of the item, unless
+// it names what the value declares or is in a macro or a block item (`reads`). What the walk cannot
+// read (macro arguments that are no expressions, `macro_rules!`, a glob `use`, unparsed syntax) is
+// rejected. None of this is done in a type (an array length): there the value of a nested item is
+// part of the type, which the visitor reads like the rest of the length, whatever the two say. The
 // visitor knows the names that the blocks there declare (`Position::locals`).
 
 impl<'r, A: Allow> AnalyzeVisitor<'r, A> {
@@ -5298,12 +5311,15 @@ impl<'r, A: Allow> AnalyzeVisitor<'r, A> {
         if self.position.type_depth > 0 {
             return self.visit_expr(expr);
         }
+        if !self.mode.check_values {
+            return;
+        }
         self.read_value("value", name, default, |walk| walk.visit_expr(expr));
     }
 
     /// Reads `expr` as a value, whether values are read or not: an enum discriminant or a const
     /// parameter default. `what` says where it is, as the notes do. `in_value` is not set: it marks
-    /// only the values that `check_values` reads.
+    /// only the values and bodies that `check_values` and `check_bodies` read.
     fn read_expr(&mut self, what: String, expr: &Expr) {
         if self.position.type_depth > 0 {
             return self.visit_expr(expr);
@@ -5311,7 +5327,7 @@ impl<'r, A: Allow> AnalyzeVisitor<'r, A> {
         ValueWalk::new(self, what).visit_expr(expr);
     }
 
-    /// Checks the body `block` of the function `sig`, if values are read. `default`: it is the
+    /// Checks the body `block` of the function `sig`, if bodies are read. `default`: it is the
     /// default body of a method of a trait. The generics of `sig` are in scope.
     fn check_body(&mut self, sig: &Signature, block: &Block, default: bool) {
         if self.position.type_depth > 0 {
@@ -5330,6 +5346,9 @@ impl<'r, A: Allow> AnalyzeVisitor<'r, A> {
                 visitor.walk_block(block)
             });
         }
+        if !self.mode.check_bodies {
+            return;
+        }
         self.read_value("body", &sig.ident, default, |walk| {
             for input in &sig.inputs {
                 if let FnArg::Typed(arg) = input {
@@ -5340,8 +5359,8 @@ impl<'r, A: Allow> AnalyzeVisitor<'r, A> {
         });
     }
 
-    /// Reads the `kind` of `name` ("value", "body") with `walk`, if values are read: what it finds
-    /// is in a value, and in the default of a trait item if `default`.
+    /// Reads the `kind` of `name` ("value", "body") with `walk`: what it finds is in a value, and
+    /// in the default of a trait item if `default`.
     fn read_value(
         &mut self,
         kind: &str,
@@ -5349,9 +5368,6 @@ impl<'r, A: Allow> AnalyzeVisitor<'r, A> {
         default: bool,
         walk: impl FnOnce(&mut ValueWalk<'_, 'r, A>),
     ) {
-        if !self.mode.check_values {
-            return;
-        }
         let what = format!(
             "the {}{} of `{}`",
             if default { "default " } else { "" },

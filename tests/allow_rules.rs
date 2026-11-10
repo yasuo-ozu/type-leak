@@ -413,6 +413,7 @@ fn the_rule_is_not_asked_about_self_or_a_generic() {
         let seen = Rc::new(Seen::default());
         let mut leaker = Leaker::with_rule(Rules::new().or_if(seen.rule()));
         leaker.check_values = check_values;
+        leaker.check_bodies = check_values;
         leaker.intern_trait(&own_names());
         let result = leaker.result();
         let what = format!("check_values {}", check_values);
@@ -636,6 +637,7 @@ fn asked_as(item: &ItemTrait, values: bool) -> Vec<String> {
     let seen = Rc::new(Seen::default());
     let mut leaker = Leaker::with_rule(Rules::new().or_if(seen.rule()));
     leaker.check_values = values;
+    leaker.check_bodies = values;
     leaker.intern_trait(item);
     let _ = leaker.result();
     let mut found: Vec<String> = Vec::new();

@@ -1109,8 +1109,9 @@ impl<'a, 'b, N: FnMut(&SelfRequirement) -> Option<Type>> Fold for EntryFolder<'a
 /// as written ([recovery](crate::Leaker#errors-and-recovery)) are left as they are. Items and
 /// imports declared in a block, a module or a `File` hide the leaked types that name them there,
 /// but the name of a nested struct, enum, union or trait hides none inside the item itself (what
-/// the item declares in it hides again). Values are visited too: a type there is an entry only
-/// with [`Leaker::check_values`](crate::Leaker::check_values).
+/// the item declares in it hides again). Values and bodies are visited too: a type there is an
+/// entry only with [`Leaker::check_values`](crate::Leaker::check_values) or
+/// [`Leaker::check_bodies`](crate::Leaker::check_bodies).
 ///
 /// `N` is the closure of [`Visitor::with_nested_self()`]; there is none by default.
 ///

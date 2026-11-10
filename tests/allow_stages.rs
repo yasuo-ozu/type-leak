@@ -374,6 +374,7 @@ fn a_trait_default_body_is_a_value_and_a_default() {
     let item: ItemImpl = parse_quote!(impl ::p::Tr for X { fn f(&self) { let _ = inner::f(); } });
     let mut leaker = Leaker::with_rule(reading_values());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_impl(&item);
     let result = leaker.result();
     let error = &result.errors()[0];

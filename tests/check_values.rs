@@ -1,7 +1,7 @@
-//! `check_values`: the Leaker reads the values of an item (the default of an
-//! associated const, the value of a const or a static, the body of a function), and rejects a path
-//! that depends on where it is written. A value is copied as written, so it leaks nothing but the
-//! types in a type position (a cast, a `let`, a closure, a turbofish, a qualified path), which the
+//! `check_values` and `check_bodies`: the Leaker reads the values of an item (the default of an
+//! associated const, the value of a const or a static) with the first and the bodies of its
+//! functions with the second, and rejects a path that depends on where it is written. A value is
+//! copied as written, so it leaks nothing but the types in a type position (a cast, a `let`, a closure, a turbofish, a qualified path), which the
 //! Visitor replaces: see `types_in_type_positions_are_leaked()` and, for the copy,
 //! `tests/findings.rs` (F40).
 //!
@@ -17,7 +17,8 @@ use syn::*;
 use template_quote::quote;
 use type_leak::*;
 
-/// The rules of the tests below, which all read the values (`check_values`) unless they say not.
+/// The rules of the tests below, which all read the values and the bodies (`check_values` and
+/// `check_bodies`) unless they say not.
 fn config() -> Rules<impl Allow + Clone> {
     Rules::new().primitive().prelude()
 }
@@ -39,6 +40,7 @@ fn messages_of<A: Allow>(config: A, source: &str) -> Vec<String> {
     let item: ItemTrait = parse_str(source).unwrap_or_else(|e| panic!("{}: {}", source, e));
     let mut leaker = Leaker::with_rule(config);
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     leaker
         .result()
@@ -185,6 +187,7 @@ fn body_entries(body: &str) -> Vec<String> {
     let item: ItemTrait = parse_str(&source).unwrap_or_else(|e| panic!("{}: {}", source, e));
     let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     let referrer = leaker
         .result()
@@ -261,6 +264,7 @@ fn the_std_prelude_and_the_primitives_are_allowed_only_if_asked() {
         let item: ItemTrait = parse_str(source).unwrap();
         let mut leaker = Leaker::with_rule(config);
         leaker.check_values = true;
+        leaker.check_bodies = true;
         leaker.intern_trait(&item);
         let mut entries: Vec<String> = leaker
             .result()
@@ -350,6 +354,7 @@ fn the_names_of_a_later_prelude_are_relative_in_a_value() {
             parse_str(&format!("trait Tr {{ fn f(&self, p: u8) {{ {} }} }}", body)).unwrap();
         let mut leaker = Leaker::with_rule(config());
         leaker.check_values = true;
+        leaker.check_bodies = true;
         leaker.intern_trait(&item);
         let result = leaker.result();
         assert_eq!(
@@ -360,6 +365,7 @@ fn the_names_of_a_later_prelude_are_relative_in_a_value() {
         let config = config().or_if(starts_with(parse_str(first).unwrap()));
         let mut leaker = Leaker::with_rule(config);
         leaker.check_values = true;
+        leaker.check_bodies = true;
         leaker.intern_trait(&item);
         assert!(leaker.result().finish().is_ok(), "{}", body);
     }
@@ -420,6 +426,7 @@ fn a_relative_macro_path_says_what_to_write() {
     );
     let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
     let err = result.errors();
@@ -440,6 +447,7 @@ fn a_relative_macro_path_says_what_to_write() {
     );
     let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
     let err = result.errors();
@@ -529,6 +537,7 @@ fn what_the_leaker_cannot_read_is_rejected() {
     );
     let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
     let err = result.errors();
@@ -586,6 +595,7 @@ fn the_note_says_which_value() {
         let file: File = parse_str(source).unwrap();
         let mut leaker = Leaker::with_rule(config());
         leaker.check_values = true;
+        leaker.check_bodies = true;
         for item in &file.items {
             match item {
                 Item::Trait(i) => {
@@ -646,6 +656,7 @@ fn an_impl_is_read() {
     };
     let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_impl(&item);
     assert!(leaker.result().errors().is_empty());
 
@@ -657,6 +668,7 @@ fn an_impl_is_read() {
     };
     let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_impl(&item);
     let result = leaker.result();
     let messages: Vec<String> = result
@@ -674,6 +686,7 @@ fn an_impl_is_read() {
 fn a_nested_item_is_read_through_the_view() {
     let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.enter_generics(&parse_quote!(<T: ::core::default::Default>), |view| {
         view.visit_item(&parse_quote!(
             const N: usize = 1;
@@ -687,6 +700,7 @@ fn a_nested_item_is_read_through_the_view() {
     assert!(leaker.result().errors().is_empty());
     let mut leaker = Leaker::with_rule(config());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.enter_generics(&parse_quote!(<T>), |view| {
         view.visit_item(&parse_quote!(
             fn f<V>() -> usize {
@@ -774,6 +788,7 @@ fn the_types_are_leaked_as_ever() {
     fn entries<A: Allow>(config: A, check_values: bool, source: &ItemTrait) -> Vec<String> {
         let mut leaker = Leaker::with_rule(config);
         leaker.check_values = check_values;
+        leaker.check_bodies = check_values;
         leaker.intern_trait(source);
         leaker
             .result()
@@ -849,12 +864,13 @@ fn ordinary_bodies_are_accepted() {
     });
     let mut leaker = Leaker::with_rule(config);
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     // The types of the signatures are in the prelude: nothing is leaked.
     assert_eq!(leaker.result().finish().unwrap().iter().count(), 0);
 }
 
-/// `check_values` is off by default, whatever rules the Leaker is given.
+/// `check_values` and `check_bodies` are off by default, whatever rules the Leaker is given.
 #[test]
 fn check_values_is_off_by_default() {
     let item: ItemTrait = parse_quote!(
@@ -866,10 +882,12 @@ fn check_values_is_off_by_default() {
         }
     );
     let mut leaker = Leaker::new();
+    assert!(!leaker.check_values && !leaker.check_bodies);
     leaker.intern_trait(&item);
     let result = leaker.result();
     assert!(result.finish().is_ok());
     let mut leaker = Leaker::with_rule(Rules::new());
+    assert!(!leaker.check_values && !leaker.check_bodies);
     leaker.intern_trait(&item);
     let result = leaker.result();
     assert!(result.finish().is_ok());
@@ -884,6 +902,7 @@ fn check_values_is_off_by_default() {
     assert!(leaker.result().finish().unwrap().is_empty());
     let mut leaker = Leaker::with_rule(Rules::new());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
     assert!(result.finish().is_err());
@@ -901,17 +920,21 @@ fn check_values_is_read_by_each_call() {
         .unwrap()
     };
     let mut leaker = Leaker::with_rule(config());
-    assert!(!leaker.check_values);
+    assert!(!leaker.check_values && !leaker.check_bodies);
     leaker.intern_trait(&item("Off0", "A"));
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item("On", "B"));
     leaker.check_values = false;
+    leaker.check_bodies = false;
     leaker.intern_trait(&item("Off1", "C"));
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.enter_generics(&Generics::default(), |view| {
         view.visit_item(&Item::Trait(item("OnInGenerics", "D")));
     });
     leaker.check_values = false;
+    leaker.check_bodies = false;
     leaker.enter_generics(&Generics::default(), |view| {
         view.visit_item(&Item::Trait(item("OffInGenerics", "E")));
     });
@@ -933,4 +956,187 @@ fn check_values_is_read_by_each_call() {
         .collect();
     entries.sort();
     assert_eq!(entries, ["EntryB", "EntryD"]);
+}
+
+// ── the two switches ─────────────────────────────────────────────────────────────────────────
+
+/// The notes of the errors of the items of `source`, analyzed with `check_values` and
+/// `check_bodies` as given.
+fn notes_with(source: &str, values: bool, bodies: bool) -> Vec<String> {
+    let file: File = parse_str(source).unwrap();
+    let mut leaker = Leaker::with_rule(config());
+    leaker.check_values = values;
+    leaker.check_bodies = bodies;
+    for item in &file.items {
+        match item {
+            Item::Trait(i) => {
+                leaker.intern_trait(i);
+            }
+            Item::Impl(i) => {
+                leaker.intern_impl(i);
+            }
+            _ => {
+                leaker.enter_generics(&Generics::default(), |view| view.visit_item(item));
+            }
+        }
+    }
+    let result = leaker.result();
+    result
+        .errors()
+        .iter()
+        .map(|item| {
+            let (_, note) = item.notes.first().unwrap();
+            note.clone()
+        })
+        .collect()
+}
+
+/// `check_values` reads the values (the default of an associated const, the value of an impl
+/// const, of a const and of a static) and `check_bodies` the bodies of the functions (the default
+/// body of a method, an impl method, a function): each reads only its own, in the order of the
+/// items.
+#[test]
+fn check_values_reads_the_values_and_check_bodies_the_bodies() {
+    let note = |what: &str| format!("it is in {}, which the copy writes as it is", what);
+    // (the items, what the values give, what the bodies give)
+    let cases = [
+        (
+            "trait Tr { const N: usize = inner::N; fn f() -> usize { inner::N } }",
+            vec![note("the default value of `N`")],
+            vec![note("the default body of `f`")],
+        ),
+        (
+            "impl ::p::Tr for ::p::S { const N: usize = r1(); fn f() { r2() } }",
+            vec![note("the value of `N`")],
+            vec![note("the body of `f`")],
+        ),
+        (
+            "impl ::p::S { const N: usize = r1(); fn f() { r2() } }",
+            vec![note("the value of `N`")],
+            vec![note("the body of `f`")],
+        ),
+        (
+            "pub static S: usize = r1(); pub const C: usize = r2(); pub fn g() { r3() }",
+            vec![note("the value of `S`"), note("the value of `C`")],
+            vec![note("the body of `g`")],
+        ),
+        (
+            "trait Tr { const N: usize = r1(); fn f() { r2() } fn g() { r3() } }",
+            vec![note("the default value of `N`")],
+            vec![
+                note("the default body of `f`"),
+                note("the default body of `g`"),
+            ],
+        ),
+    ];
+    for (source, values, bodies) in cases {
+        let both: Vec<String> = notes_with(source, true, true);
+        // The notes come in the order of the items: the values first here, the bodies after.
+        let mut expected = values.clone();
+        expected.extend(bodies.clone());
+        let mut sorted = both.clone();
+        sorted.sort();
+        expected.sort();
+        assert_eq!(sorted, expected, "both, {}", source);
+        assert_eq!(
+            notes_with(source, true, false),
+            values,
+            "values, {}",
+            source
+        );
+        assert_eq!(
+            notes_with(source, false, true),
+            bodies,
+            "bodies, {}",
+            source
+        );
+        assert_eq!(
+            notes_with(source, false, false),
+            Vec::<String>::new(),
+            "neither, {}",
+            source
+        );
+    }
+}
+
+/// A type in a type position is an entry in a value with `check_values` and in a body with
+/// `check_bodies`, and in neither without them.
+#[test]
+fn the_types_of_a_value_and_of_a_body_are_leaked_by_their_own_switch() {
+    let item: ItemTrait = parse_quote! {
+        trait Tr {
+            const N: usize = ::core::mem::size_of::<inner::Local>();
+            fn f(&self) -> usize { ::core::mem::size_of::<inner::Other>() }
+        }
+    };
+    let entries = |values: bool, bodies: bool| -> Vec<String> {
+        let mut leaker = Leaker::with_rule(config());
+        leaker.check_values = values;
+        leaker.check_bodies = bodies;
+        leaker.intern_trait(&item);
+        let referrer = leaker.result().finish().unwrap();
+        let mut entries: Vec<String> = common::types(&referrer)
+            .map(|ty| quote!(#ty).to_string())
+            .collect();
+        entries.sort();
+        entries
+    };
+    assert_eq!(entries(false, false), Vec::<String>::new());
+    assert_eq!(entries(true, false), ["inner :: Local"]);
+    assert_eq!(entries(false, true), ["inner :: Other"]);
+    assert_eq!(entries(true, true), ["inner :: Local", "inner :: Other"]);
+}
+
+/// What is inside a type is read whatever the switches say: a value or a body of a nested item in
+/// the length of an array makes the whole array an entry (F101), and an enum discriminant is read
+/// as a value.
+#[test]
+fn what_a_type_holds_is_read_with_neither_switch() {
+    let item: ItemStruct = parse_quote! {
+        struct S([u8; { const X: usize = rel::N; fn g() -> usize { rel::M } static Y: usize = rel::K; 3 }]);
+    };
+    let enum_item: ItemEnum = parse_quote! { enum E { A = inner::X } };
+    for (values, bodies) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut leaker = Leaker::with_rule(config());
+        leaker.check_values = values;
+        leaker.check_bodies = bodies;
+        leaker.intern_struct(&item);
+        leaker.intern_enum(&enum_item);
+        let result = leaker.result();
+        let messages: Vec<&str> = result.errors().iter().map(|e| e.message.as_str()).collect();
+        let what = format!("values {}, bodies {}", values, bodies);
+        // Only the discriminant is an error: the array is the entry, with no error.
+        assert_eq!(messages, ["use absolute path: 'inner::X'"], "{}", what);
+        let referrer = result.recovered();
+        let entries: Vec<String> = common::types(&referrer)
+            .map(|ty| quote!(#ty).to_string())
+            .collect();
+        assert_eq!(entries.len(), 1, "{}", what);
+        assert!(entries[0].starts_with("[u8 ;"), "{}: {}", what, entries[0]);
+    }
+}
+
+/// `Rules::values()` allows what is in a body as well as what is in a value: both are `in_value`.
+/// It has an effect only where the matching switch reads them.
+#[test]
+fn the_values_rule_allows_the_bodies_too() {
+    let item: ItemTrait = parse_quote! {
+        trait Tr { const N: usize = inner::N; fn f() -> usize { inner::N } }
+    };
+    let count = |rule: Rules<()>, values: bool, bodies: bool| {
+        let mut leaker = Leaker::with_rule(rule);
+        leaker.check_values = values;
+        leaker.check_bodies = bodies;
+        leaker.intern_trait(&item);
+        leaker.result().errors().len()
+    };
+    for (values, bodies, read) in [
+        (false, false, 0),
+        (true, false, 1),
+        (false, true, 1),
+        (true, true, 2),
+    ] {
+        assert_eq!(count(Rules::new(), values, bodies), read);
+        assert_eq!(count(Rules::new().values(), values, bodies), 0);
+    }
 }

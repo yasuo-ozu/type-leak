@@ -73,7 +73,8 @@ use template_quote::{quote, quote_spanned};
 ///   is, so its crate must resolve there. A `::core` path is never an entry; `::std` and `::alloc`
 ///   are crates like any other (see [`Rules::std_crates()`](crate::Rules::std_crates)).
 /// - A shadowed primitive name (`type u8 = i32;`): emit [`Leaker::assertions()`].
-/// - Values and bodies are not analyzed unless [`Leaker::check_values`] is on.
+/// - Values are not analyzed unless [`Leaker::check_values`] is on, nor function bodies unless
+///   [`Leaker::check_bodies`] is.
 /// - A `mod` item is not analyzed: [`View::visit_item()`] of one is an error
 ///   ([`Reason::Unreadable`]). A `mod` in an expression of a type (an array length) goes with the
 ///   type.
@@ -135,8 +136,8 @@ use template_quote::{quote, quote_spanned};
 /// name.
 pub struct Leaker<A = ()> {
     /// Reads the values of an item too, if `true` (default `false`): the values of consts and
-    /// statics, the defaults and values of associated consts, and the bodies of functions and
-    /// methods. Set it before the calls that it should affect.
+    /// statics, and the defaults and values of associated consts. Function bodies are read with
+    /// [`check_bodies`](Leaker::check_bodies). Set it before the calls that it should affect.
     ///
     /// A type in a type position of a value (a cast, a `let`, a closure parameter, the arguments of
     /// a path or method call) is leaked like any type of the item. Another relative path in a value
@@ -153,6 +154,37 @@ pub struct Leaker<A = ()> {
     /// pub trait Tr { const LEN: usize = helper::<Rel>(); }
     /// ```
     pub check_values: bool,
+    /// Reads the bodies of functions too, if `true` (default `false`): the default bodies of the
+    /// methods of a trait, the bodies of impl methods, and of the functions that a scope visits.
+    /// Values are read with [`check_values`](Leaker::check_values). A body is checked as a value
+    /// is. Set it before the calls that it should affect.
+    ///
+    /// ```
+    /// # use {syn::*, type_leak::*};
+    /// let item: ItemTrait = parse_quote! {
+    ///     pub trait Tr { const N: usize = inner::N; fn f() -> usize { inner::N } }
+    /// };
+    /// let note_of = |values, bodies| {
+    ///     let mut leaker = Leaker::new();
+    ///     leaker.check_values = values;
+    ///     leaker.check_bodies = bodies;
+    ///     leaker.intern_trait(&item);
+    ///     let errors = leaker.result().errors().to_vec();
+    ///     assert_eq!(errors.len(), values as usize + bodies as usize);
+    ///     errors.into_iter().map(|error| error.notes[0].1.clone()).collect::<Vec<_>>()
+    /// };
+    /// assert_eq!(note_of(false, false), Vec::<String>::new());
+    /// // The default of the const is read with `check_values`, the body of `f` with `check_bodies`.
+    /// assert_eq!(
+    ///     note_of(true, false),
+    ///     ["it is in the default value of `N`, which the copy writes as it is"],
+    /// );
+    /// assert_eq!(
+    ///     note_of(false, true),
+    ///     ["it is in the default body of `f`, which the copy writes as it is"],
+    /// );
+    /// ```
+    pub check_bodies: bool,
     /// What the Leaker leaves as written instead of leaking it, and the errors it does not
     /// record.
     allow: A,
@@ -193,6 +225,7 @@ impl<A: Allow> Leaker<A> {
     pub fn with_rule(rule: A) -> Self {
         Self {
             check_values: false,
+            check_bodies: false,
             allow: rule,
             types: TypeGraph::default(),
             contexts: Contexts::default(),
@@ -467,7 +500,8 @@ impl<A: Allow> Scopes for Leaker<A> {
         f: impl FnOnce(&mut View<'_, '_, A>) -> R,
     ) -> (ContextId, R) {
         let root = spec.declared_generics();
-        let mut visitor = AnalyzeVisitor::new(&mut self.allow, &root, self.check_values);
+        let mut visitor =
+            AnalyzeVisitor::new(&mut self.allow, &root, self.check_values, self.check_bodies);
         let mark = self.contexts.len();
         // The visitor owns the table of contexts while it analyzes, so the swap is the only step
         // before `catch_unwind`: no allocation, no user code. Whatever happens next (a result, or a

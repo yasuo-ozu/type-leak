@@ -9228,12 +9228,13 @@ fn f39_a_nested_struct_has_no_self_in_the_entry_of_the_default() {
 
 // ── F40 ──────────────────────────────────────────────────────────────────────
 
-/// A Leaker that reads the values (`check_values`), as the
+/// A Leaker that reads the values and the bodies (`check_values`, `check_bodies`), as the
 /// downstream crate of F40 has it: primitive types and the names of the standard prelude are
 /// allowed.
 fn values_leaker() -> Leaker<impl Allow> {
     let mut leaker = Leaker::with_rule(Rules::new().primitive().prelude());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker
 }
 
@@ -9578,6 +9579,7 @@ fn f40_an_absolute_type_of_a_value_is_an_optional_entry() {
     // With the crate allowed by the rule of the Leaker it is no entry: the copy writes it as it is.
     let mut leaker = Leaker::with_rule(Rules::new().primitive().prelude().external_crates());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     let context = leaker.intern_trait(&item);
     let referrer = leaker.result().finish().unwrap();
     assert!(referrer.is_empty());
@@ -10605,6 +10607,7 @@ fn f43_analyze<A: Allow>(
 ) -> (LeakerResult, ContextId) {
     let mut leaker = Leaker::with_rule(config);
     leaker.check_values = check_values;
+    leaker.check_bodies = check_values;
     let generics: Generics = parse_quote!(<T: AsRef<Self>>);
     let (context, ()) = leaker.enter_trait(&parse_quote!(Tr), &generics, |view| {
         for ty in direct {
@@ -11591,6 +11594,7 @@ fn f50_analyze(item: &ItemTrait, rule: Option<&str>) -> LeakerResult {
     fn run<A: Allow>(item: &ItemTrait, config: A) -> LeakerResult {
         let mut leaker = Leaker::with_rule(config);
         leaker.check_values = true;
+        leaker.check_bodies = true;
         leaker.intern_trait(item);
         leaker.result()
     }
@@ -12320,6 +12324,7 @@ fn f57_assertions(source: &str, check_values: bool) -> Vec<String> {
     for _ in 0..2 {
         let mut leaker = Leaker::with_rule(Rules::new().primitive());
         leaker.check_values = check_values;
+        leaker.check_bodies = check_values;
         intern(&mut leaker, &item);
         texts.push(leaker.assertions().to_string());
         let config = Rules::new()
@@ -12327,6 +12332,7 @@ fn f57_assertions(source: &str, check_values: bool) -> Vec<String> {
             .or_if(|cause, _| common::bare_path(cause).is_none());
         let mut leaker = Leaker::with_rule(config);
         leaker.check_values = check_values;
+        leaker.check_bodies = check_values;
         intern(&mut leaker, &item);
         texts.push(leaker.assertions().to_string());
     }
@@ -16235,6 +16241,7 @@ fn f83_a_block_hides_the_entries_that_name_what_it_declares() {
     let copy = |item: &ItemImpl| -> String {
         let mut leaker = Leaker::with_rule(Rules::new().primitive());
         leaker.check_values = true;
+        leaker.check_bodies = true;
         let context = leaker.intern_impl(item);
         let referrer = leaker.result().recovered();
         let mut copy = item.clone();
@@ -17978,6 +17985,7 @@ fn f101_a_value_in_a_block_in_an_array_length_is_part_of_the_type() {
         let item: Item = parse_quote!(struct S<T>(#array););
         let mut leaker = Leaker::with_rule(Rules::new().primitive());
         leaker.check_values = check_values;
+        leaker.check_bodies = check_values;
         intern(&mut leaker, &item);
         let result = leaker.result();
         let errors: Vec<(Reason, String)> = (result.errors().iter())
@@ -18187,6 +18195,7 @@ fn f101_a_value_in_a_block_in_an_array_length_is_part_of_the_type() {
         for check_values in [false, true] {
             let mut leaker = Leaker::with_rule(Rules::new().primitive());
             leaker.check_values = check_values;
+            leaker.check_bodies = check_values;
             match item {
                 Item::Trait(item) => {
                     leaker.intern_trait(item);
@@ -18854,6 +18863,7 @@ fn f104_the_self_of_an_item_that_a_value_declares_is_its_own() {
     let analyze = |item: &Item| -> Vec<(Reason, String)> {
         let mut leaker = Leaker::with_rule(Rules::new().primitive().prelude());
         leaker.check_values = true;
+        leaker.check_bodies = true;
         leaker.enter_generics(&Generics::default(), |view| view.visit_item(item));
         let result = leaker.result();
         (result.errors().iter())
@@ -19010,6 +19020,7 @@ fn f105_a_macro_of_alloc_or_a_relative_std_macro_is_one_of_the_library() {
     fn messages<A: Allow>(rule: A, item: &Item) -> Vec<String> {
         let mut leaker = Leaker::with_rule(rule);
         leaker.check_values = true;
+        leaker.check_bodies = true;
         leaker.enter_generics(&Generics::default(), |view| view.visit_item(item));
         let result = leaker.result();
         (result.errors().iter())
@@ -19098,6 +19109,7 @@ fn f106_a_qualified_struct_literal_or_pattern_is_checked_like_a_qualified_path()
         let item: Item = parse_str(&source).unwrap();
         let mut leaker = Leaker::with_rule(Rules::new().primitive().prelude());
         leaker.check_values = true;
+        leaker.check_bodies = true;
         leaker.enter_generics(&Generics::default(), |view| view.visit_item(&item));
         let result = leaker.result();
         let errors = result.errors();
@@ -19149,6 +19161,7 @@ fn f106_a_qualified_struct_literal_or_pattern_is_checked_like_a_qualified_path()
         let item: Item = parse_str(&source).unwrap();
         let mut leaker = Leaker::with_rule(Rules::new().primitive().prelude());
         leaker.check_values = true;
+        leaker.check_bodies = true;
         leaker.enter_generics(&Generics::default(), |view| view.visit_item(&item));
         let referrer = leaker.result().finish().unwrap();
         let entries: Vec<String> = referrer.iter().map(|(_, ty, _)| string(ty)).collect();

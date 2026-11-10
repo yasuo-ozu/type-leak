@@ -226,6 +226,7 @@ fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() 
     let config = Rules::new().primitive();
     let mut leaker = Leaker::with_rule(config);
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
     assert!(result

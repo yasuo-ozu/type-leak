@@ -152,6 +152,7 @@ fn trait_result(source: &str, check_values: bool) -> LeakerResult {
     if check_values {
         let mut leaker = Leaker::with_rule(configured(reading_values_config()));
         leaker.check_values = true;
+        leaker.check_bodies = true;
         run(leaker, |leaker| leaker.intern_trait(&item))
     } else {
         run(leaker_from(allowing_config()), |leaker| {

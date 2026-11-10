@@ -892,6 +892,7 @@ pub fn starts_with(prefix: Path) -> impl Fn(&Cause, Place) -> bool + Clone {
 pub fn analyze_trait<A: Allow>(item: &ItemTrait, config: A, check_values: bool) -> LeakerResult {
     let mut leaker = Leaker::with_rule(config);
     leaker.check_values = check_values;
+    leaker.check_bodies = check_values;
     leaker.intern_trait(item);
     leaker.result()
 }

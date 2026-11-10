@@ -25,8 +25,9 @@ use template_quote::{quote, ToTokens};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Place {
-    /// While a value is read ([`Leaker::check_values`](crate::Leaker::check_values)): the value
-    /// of a const or static, the body of a function, a trait's default value or body.
+    /// While a value or a body is read ([`Leaker::check_values`](crate::Leaker::check_values),
+    /// [`Leaker::check_bodies`](crate::Leaker::check_bodies)): the value of a const or static, the
+    /// body of a function, a trait's default value or body.
     pub in_value: bool,
     /// In a default: a default body or an associated const default of a trait, and the default of
     /// a generic parameter (`U = Rel<'_>`, `T = Wrap<Self>`).
@@ -197,9 +198,10 @@ impl<A> Rules<A> {
         self
     }
 
-    /// Allows everything found in a value (see [`Place::in_value`]): the Leaker writes every
-    /// relative path in a value as it is, also the type of a `let`, instead of leaking it. It has
-    /// an effect only with [`Leaker::check_values`](crate::Leaker::check_values).
+    /// Allows everything found in a value or a body (see [`Place::in_value`]): the Leaker writes
+    /// every relative path in them as it is, also the type of a `let`, instead of leaking it. It
+    /// has an effect only with [`Leaker::check_values`](crate::Leaker::check_values) or
+    /// [`Leaker::check_bodies`](crate::Leaker::check_bodies).
     pub fn values(mut self) -> Self {
         self.values = true;
         self

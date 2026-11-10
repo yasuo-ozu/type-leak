@@ -463,7 +463,7 @@ fn an_error_of_a_macro_cause_is_reported_at_the_name_of_the_macro() {
     assert_eq!(read[0].cause, error.cause);
 }
 
-/// The macro cause of a value (`check_values`), and of a mention of `Self` that has no meaning
+/// The macro cause of a body (`check_bodies`), and of a mention of `Self` that has no meaning
 /// (`Self::m!()`), has no token at the call site either.
 #[test]
 fn a_macro_cause_of_a_value_and_of_self_is_in_the_item() {
@@ -471,7 +471,7 @@ fn a_macro_cause_of_a_value_and_of_self_is_in_the_item() {
     let item: ItemTrait = parse_str(source).unwrap();
     let config = Rules::new().primitive();
     let mut leaker = Leaker::with_rule(config);
-    leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     let result = leaker.result();
     let items = result.errors();

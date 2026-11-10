@@ -91,6 +91,7 @@ fn show(cause: &Cause) -> String {
 fn values() -> Leaker<Rules> {
     let mut leaker = Leaker::with_rule(Rules::new());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker
 }
 

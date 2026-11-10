@@ -617,6 +617,7 @@ fn a_value_with_a_self_without_meaning_is_copied_whole() {
     );
     let mut leaker = Leaker::with_rule(Rules::new());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.enter_generics(&Generics::default(), |view| {
         view.visit_item(&Item::Fn(item.clone()))
     });
@@ -647,6 +648,7 @@ fn unreadable_syntax_in_a_body_is_accepted_with_check_values() {
     let analyze = || {
         let mut leaker = Leaker::with_rule(Rules::new());
         leaker.check_values = true;
+        leaker.check_bodies = true;
         leaker.intern_trait(&item);
         leaker.result()
     };
@@ -869,6 +871,7 @@ fn a_cause_is_equal_whatever_the_spacing_of_its_punctuation() {
     );
     let mut leaker = Leaker::with_rule(Rules::new());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&item);
     let mut result = leaker.result();
     assert_eq!(result.errors().len(), 1);
@@ -1024,6 +1027,7 @@ fn allow_std_crates_reads_the_path_of_a_trait_a_macro_and_a_value() {
         let config = Rules::new().primitive();
         let mut leaker = Leaker::with_rule(config);
         leaker.check_values = true;
+        leaker.check_bodies = true;
         leaker.intern_trait(&item);
         leaker.result()
     };
@@ -1055,6 +1059,7 @@ fn no_built_in_flag_drops_an_error_whose_paths_it_does_not_allow() {
     );
     let mut leaker = Leaker::with_rule(Rules::new());
     leaker.check_values = true;
+    leaker.check_bodies = true;
     leaker.intern_trait(&in_a_body);
     let in_a_default: ItemTrait = parse_quote!(
         trait Tr<T = Wrap<Self>> {}
@@ -1638,6 +1643,7 @@ fn a_path_of_a_value_that_conflicts_is_written_as_it_is_and_the_types_in_it_are_
     let leak = || {
         let mut leaker = Leaker::with_rule(std_config());
         leaker.check_values = true;
+        leaker.check_bodies = true;
         let context = leaker.intern_trait(&item);
         (leaker.result(), context)
     };

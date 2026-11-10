@@ -87,11 +87,12 @@ pub(crate) struct Args {
     /// Its parameter defaults are rewritten for a declaration, which cannot name the defaulted
     /// parameter itself (E0128): see [`rewrite_defaults()`].
     redeclare: bool,
-    /// The Leaker reads the values of the item (`check_values`): the default of an
-    /// associated const, the value of a const or static, the body of a function. A type in a type
-    /// position of a value is an entry, and the copy replaces it. The witnesses compare the types
-    /// of the signatures only; the copy of a value compiles in the Referrer's crate only if every
-    /// type in it that the crate cannot name is replaced, and the tests compare what it computes.
+    /// The Leaker reads the values and bodies of the item (`check_values` and `check_bodies`): the
+    /// default of an associated const, the value of a const or static, the body of a function. A
+    /// type in a type position of a value is an entry, and the copy replaces it. The witnesses
+    /// compare the types of the signatures only; the copy of a value compiles in the Referrer's
+    /// crate only if every type in it that the crate cannot name is replaced, and the tests compare
+    /// what it computes.
     values: bool,
     /// The values of the item are checked as its signatures are (`TYPE_LEAK_PROP_FEATURES=values`): the
     /// types in the type positions of a body, a constant and a default are positions, with a witness
@@ -433,6 +434,7 @@ fn analyze_config<A: Allow>(
 ) -> (LeakerResult, ContextId, TokenStream) {
     let mut leaker = Leaker::with_rule(config);
     leaker.check_values = args.values;
+    leaker.check_bodies = args.values;
     let scope = args.scope.as_str();
     CHECKED.with(|checked| checked.borrow_mut().clear());
     let context = match (args.via.as_str(), scope, item) {
