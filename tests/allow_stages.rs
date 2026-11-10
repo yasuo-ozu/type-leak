@@ -9,12 +9,12 @@
 //! - the path rules (`Rules::or_if()`, `Rules::primitive()`, `Rules::prelude()`, `Rules::std_crates()`,
 //!   `Rules::crate_paths()`) make a path context-free during the analysis, which a result cannot do. So
 //!   the errors that remain are those of the paths that are not allowed, and a cause can be wider
-//!   after the analysis (`Vec<Rel<'_>>` where the config reports `Rel<'_>`), the Referrer may keep
-//!   entries that the config does not make (`Vec<u8>`), and an error can remain that the config does
-//!   not have (the last test);
-//! - what is wrong inside a part that the analysis copies whole is found for the paths of its error
-//!   (`ErrorItem::nested`), and comes up when a rule drops the error (`tests/nested_errors.rs`). The
-//!   config, where those paths are context-free, finds it in the first place.
+//!   after the analysis, the Referrer may keep entries that the config does not make (`Vec<u8>`),
+//!   and an error can remain that the config does not have (`Self::A` in a predicate beside a leaked
+//!   `String`);
+//! - the errors are a flat list: a type whose own path conflicts is written as it is and what is in it
+//!   is analyzed on its own (`tests/flat_errors.rs`), so `Vec<Rel<'_>>` is an error for `Vec` and
+//!   another for `Rel<'_>`, and a rule on `Vec` after the analysis leaves what the config reports.
 //!
 //! The property test builds the copies after the result and after the config
 //! (`TYPE_LEAK_PROP_FEATURES=allow_stages`, `tests/prop_cross_crate/main.rs`): what the tests below
@@ -74,7 +74,7 @@ fn stages<A: Allow>(
 }
 
 #[test]
-fn allow_prelude_reports_the_part_before_and_the_whole_after() {
+fn allow_prelude_reports_the_same_error_before_and_after() {
     let item: ItemTrait = parse_quote!(
         trait Tr<T: Clone> {
             fn a(&self, x: Vec<u8>);
@@ -83,9 +83,14 @@ fn allow_prelude_reports_the_part_before_and_the_whole_after() {
     );
     let (before, after) = stages(&item, |c| c.primitive(), Rule::Prelude);
     // `Clone` is dropped by both. The config does not leak `Vec`, so `Rel<'_>` is the error; the
-    // result has `Vec<Rel<'_>>` and drops it only if `Rel` were allowed too.
+    // result has the errors of `Vec` and of `Rel<'_>`, and the rule drops the first.
     assert_eq!(causes(&before), ["Rel < '_ >"]);
-    assert_eq!(causes(&after), ["Vec < Rel < '_ > >"]);
+    assert_eq!(causes(&after), ["Rel < '_ >"]);
+    let analyzed = analyze(&item, Rules::new().primitive());
+    assert_eq!(
+        causes(&analyzed),
+        ["Clone", "Vec < Rel < '_ > >", "Rel < '_ >"]
+    );
     assert_eq!(before.errors().len(), after.errors().len());
     // The config leaves `Vec<u8>` and `Vec<Rel<'_>>` as written. After the analysis the Referrer
     // still has the entry `Vec<u8>`, which a Referrer replaces as it does any entry.
@@ -129,7 +134,7 @@ fn allow_primitive_drops_a_primitive_path_in_a_const_expression_at_both_stages()
 }
 
 #[test]
-fn allow_std_crates_reports_the_part_before_and_the_whole_after() {
+fn allow_std_crates_reports_the_same_error_before_and_after() {
     let item: ItemTrait = parse_quote!(
         trait Tr: core::fmt::Debug {
             fn s(&self, x: std::vec::Vec<Rel<'_>>);
@@ -138,7 +143,7 @@ fn allow_std_crates_reports_the_part_before_and_the_whole_after() {
     );
     let (before, after) = stages(&item, |c| c.primitive(), Rule::StdCrates);
     assert_eq!(causes(&before), ["Rel < '_ >"]);
-    assert_eq!(causes(&after), ["std :: vec :: Vec < Rel < '_ > >"]);
+    assert_eq!(causes(&after), ["Rel < '_ >"]);
     assert_eq!(before.errors().len(), after.errors().len());
 }
 
@@ -151,7 +156,8 @@ fn allow_crate_agrees_where_every_path_of_an_error_is_allowed_or_not() {
         }
     );
     let (before, after) = stages(&item, |c| c.primitive(), Rule::Crate);
-    // `Vec` is not allowed: it is leaked whole in `c` and cannot be, at both stages.
+    // `Vec` is not allowed: it is written as it is in `c`, at both stages, and `crate::Foo<'_>` in
+    // it has no error.
     assert_eq!(causes(&before), ["Vec < crate :: Foo < '_ > >"]);
     assert_eq!(causes(&after), causes(&before));
 }
@@ -167,8 +173,8 @@ fn allow_path_agrees_where_every_path_of_an_error_is_allowed_or_not() {
     let (before, after) = stages(&item, |c| c.primitive(), Rule::Path(parse_quote!(my)));
     assert_eq!(causes(&before), ["Wrap < my :: Foo < '_ > >"]);
     assert_eq!(causes(&after), causes(&before));
-    // `my::Foo` is a path of the cause too, so allowing `Wrap` only is not enough, and the rules
-    // add up in any order: the second one drops the error, as one config with both does.
+    // `my::Foo<'_>` in it is an error of its own, so allowing `Wrap` only is not enough, and the
+    // rules add up in any order: the second one drops the error, as one config with both does.
     let plain = analyze(&item, Rules::new().primitive());
     let texts = |error: &ErrorItem| -> Vec<String> {
         error.paths.iter().map(|p| quote!(#p).to_string()).collect()
@@ -181,11 +187,14 @@ fn allow_path_agrees_where_every_path_of_an_error_is_allowed_or_not() {
             .find(|e| causes_text(e).starts_with("Wrap"))?;
         Some(texts(error))
     };
-    assert_eq!(plain.errors().len(), 2);
-    assert_eq!(wrapped(&plain).unwrap(), ["Wrap", "my :: Foo"]);
+    assert_eq!(plain.errors().len(), 3);
+    assert_eq!(wrapped(&plain).unwrap(), ["Wrap"]);
     assert_eq!(wrapped(&after).unwrap(), ["Wrap"]);
     let wrap_only = plain.clone().allow(starts_with(parse_quote!(Wrap)));
-    assert_eq!(wrapped(&wrap_only).unwrap(), ["my :: Foo"]);
+    assert_eq!(
+        causes_text_of(wrap_only.errors()),
+        ["my :: Sup", "my :: Foo < '_ >"]
+    );
     let wrap_only = wrap_only.allow(starts_with(parse_quote!(my)));
     assert!(wrap_only.errors().is_empty());
     let both = plain
@@ -292,10 +301,9 @@ fn reading_values() -> Rules<impl Allow + Clone> {
 #[test]
 fn the_values_and_defaults_rules_give_the_same_errors_and_entries_at_both_stages() {
     // The config is asked about each path of a value or of a default, so it writes them as they
-    // are: no error is found, and no part is recorded for the Referrer. The result finds the errors
-    // and drops them, and keeps the parts that were copied as written.
+    // are: no error is found. The result finds the errors and drops them; a path of a value is no
+    // part, so the Referrers are equal.
     let mut dropped = 0;
-    let mut fewer_parts = 0;
     for (name, item) in places() {
         for rule in [Rule::Values, Rule::Default] {
             let before = rule.analyze_with(&item, reading_values(), true);
@@ -311,16 +319,10 @@ fn the_values_and_defaults_rules_give_the_same_errors_and_entries_at_both_stages
             };
             assert_eq!(ser(&before), ser(&after), "{}", name);
             assert_eq!(entries(&before), entries(&after), "{}", name);
-            let (before, after) = (before.into_referrer(), after.into_referrer());
-            if before != after {
-                fewer_parts += 1;
-                let serialized = |r: &Referrer| r.to_token_stream().to_string().len();
-                assert!(serialized(&before) < serialized(&after), "{}", name);
-            }
+            assert_eq!(before.into_referrer(), after.into_referrer(), "{}", name);
         }
     }
     assert!(dropped > 0);
-    assert!(fewer_parts > 0);
 }
 
 #[test]
@@ -359,11 +361,10 @@ fn a_trait_default_body_is_a_value_and_a_default() {
 // ── what the result cannot do ────────────────────────────────────────────────────────────────
 
 #[test]
-fn an_error_can_remain_after_the_analysis_that_the_config_does_not_have() {
+fn an_error_for_the_head_of_a_type_is_dropped_by_the_rule_and_leaves_what_is_in_it_leaked() {
     // With `crate` allowed, the config leaves `crate::Foo` as written, and `Rel`, a bare
-    // identifier, is leaked alone. The result has leaked `crate::Foo<'_, Rel>` whole as a part
-    // (nothing in it is leaked), so `Rel` is written as it is in the copy: it is a path that the
-    // rule does not allow, and the error stays.
+    // identifier, is leaked alone. The result writes `crate::Foo` as it is, in an error whose path
+    // the rule allows, and leaks `Rel` as well: the same errors and the same entries.
     let item: ItemTrait = parse_quote!(
         trait Tr {
             fn c(&self, x: crate::Foo<'_, Rel>);
@@ -372,8 +373,10 @@ fn an_error_can_remain_after_the_analysis_that_the_config_does_not_have() {
     let (before, after) = stages(&item, |c| c.primitive(), Rule::Crate);
     assert!(before.errors().is_empty());
     assert_eq!(entries(&before), ["Rel"]);
-    assert_eq!(causes(&after), ["crate :: Foo < '_ , Rel >"]);
-    assert!(entries(&after).is_empty());
+    assert!(after.errors().is_empty());
+    assert_eq!(entries(&after), ["Rel"]);
+    let plain = analyze(&item, Rules::new().primitive());
+    assert_eq!(causes(&plain), ["crate :: Foo < '_ , Rel >"]);
 }
 
 /// The result is the analysis without the option, whose errors it filters. The property test
@@ -382,12 +385,12 @@ fn an_error_can_remain_after_the_analysis_that_the_config_does_not_have() {
 /// fails to build where the one after the config builds for (B): `Self::A` is unprovable (E0277,
 /// the documented limitation of `LeakerResult::allow()`). Where (B) meets (C), in `trait Tr<T:
 /// ::p::BT1<String>> { type A0; fn m<X>(&self) where X: Into<Self::A0>; }`, the relative `String`
-/// stays an entry (the config leaves it as written), and the relative `Into<Self::A0>` is copied
-/// whole: the error of the bound has the unprovable `Self::A0` as a nested error, which
-/// `Rules::prelude()` brings up (it left no error before nested errors, and the copy failed with
-/// E0277 all the same).
+/// stays an entry (the config leaves it as written), and the relative `Into<Self::A0>`
+/// is copied whole: the unprovable `Self::A0` in it has an error of its own, which
+/// `Rules::prelude()` leaves (it left no error before, and the copy failed with E0277 all the
+/// same).
 #[test]
-fn a_bound_with_a_relative_path_in_its_arguments_is_copied_whole_and_stays_an_error() {
+fn a_bound_with_a_relative_path_is_copied_whole_and_stays_an_error() {
     // (A) With the prelude allowed, `Fn` is context-free and `R0` is leaked as an entry. Without
     // it, the relative `Fn(R0) -> u8` is copied as written whole, `R0` in it too, so the paths of
     // the error are `Fn` and `R0`: the rule removes `Fn`, and `R0` stays an error.
@@ -429,11 +432,11 @@ fn a_prelude_type_that_stays_leaked_makes_a_projection_unprovable_after_the_anal
 }
 
 #[test]
-fn an_error_inside_a_bound_that_the_analysis_copied_whole_comes_up_when_it_is_dropped() {
-    // (C) The relative `Fn(&Self::A0) -> u8` is copied whole, so what is in it is not analyzed:
+fn an_error_inside_a_bound_that_is_written_as_it_is_stays_when_it_is_dropped() {
+    // (C) The relative `Fn(&Self::A0) -> u8` is written as it is, and what is in it is analyzed:
     // the config, where `Fn` is context-free, finds that `Self::A0` is unprovable beside `I1<T>`.
-    // The analysis without the prelude finds it too, as a nested error of the error of the bound,
-    // so `Rules::prelude()` brings it up. (Neither copy builds, though: both fail with E0275.)
+    // The analysis without the prelude finds it too, an error after that of the bound, which
+    // `Rules::prelude()` leaves. (Neither copy builds, though: both fail with E0275.)
     let item: ItemTrait = parse_quote!(
         trait Tr<T: Fn(&Self::A0) -> u8> {
             type A0;
@@ -443,24 +446,26 @@ fn an_error_inside_a_bound_that_the_analysis_copied_whole_comes_up_when_it_is_dr
         }
     );
     let (before, after) = stages(&item, |c| c.primitive(), Rule::Prelude);
-    // The same two errors, in the order of the bound that has `Self::A0` nested, which comes first.
+    // The same two errors, in the same order.
     assert_eq!(causes(&before), ["I1 < T >", "Self :: A0"]);
-    assert_eq!(causes(&after), ["Self :: A0", "I1 < T >"]);
+    assert_eq!(causes(&after), causes(&before));
     let plain = analyze(&item, Rules::new().primitive());
-    assert_eq!(causes(&plain), ["Fn (& Self :: A0) -> u8", "I1 < T >"]);
-    assert_eq!(causes_text_of(&plain.errors()[0].nested), ["Self :: A0"]);
-    assert_eq!(plain.errors()[0].nested[0].reason, Reason::UnprovableBound);
+    assert_eq!(
+        causes(&plain),
+        ["Fn (& Self :: A0) -> u8", "I1 < T >", "Self :: A0"]
+    );
+    assert_eq!(plain.errors()[2].reason, Reason::UnprovableBound);
 }
 
 #[test]
-fn an_entry_that_the_config_does_not_make_and_a_bound_copied_whole_leave_an_error_and_a_copy_that_fails(
+fn an_entry_that_the_config_does_not_make_and_a_bound_written_as_it_is_leave_an_error_and_a_copy_that_fails(
 ) {
     // (D) (B) meets (C). The crate `::p` is allowed. The config allows `String` and `Into`, so
     // `::p::BT1<String>` is context-free and `Self::A0` is provable. Without them `String` is a
     // relative name, which `Rules::prelude()` drops the error of and leaves as an entry. A bound that
     // names a leaked type makes `Self::A0` unprovable in a predicate, but `Into<Self::A0>` is relative
-    // and copied whole: the analysis finds the problem inside it as a nested error, and
-    // `Rules::prelude()` brings it up. The copy fails to build in the Referrer's crate (E0277:
+    // and written as it is: the analysis finds the problem inside it, an error of its own, which
+    // `Rules::prelude()` leaves. The copy fails to build in the Referrer's crate (E0277:
     // `T: BT1<String>` is not satisfied by the host of the trait), as the error says it does.
     let item: ItemTrait = parse_quote!(
         trait Tr<T: ::p::BT1<String>> {

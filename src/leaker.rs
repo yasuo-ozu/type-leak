@@ -49,8 +49,14 @@ use template_quote::{quote, ToTokens};
 /// # Errors and recovery
 ///
 /// An error does not stop the analysis: the part that cannot be leaked is copied as written, and
-/// the error is kept (once, in the order found). A panic in a closure rolls its scope back and
-/// records nothing. A panicking [`Allow`] is treated alike: the call is rolled back and panics,
+/// the error is kept (once, in the order found, in one flat list). A type whose own path conflicts
+/// is written as it is, with an error for the path, and the types in its arguments are analyzed on
+/// their own, so they are entries or have errors after it (`MyType<'_, Rel>`: an error for
+/// `MyType`, an entry `Rel`). Some parts are copied whole, with nothing in them leaked, and the
+/// relative paths in them are paths of their error: a bound or a type in a predicate of the item
+/// (a leaked type there may be unprovable), a bare identifier that may be a const, a reference, a
+/// type that holds a trait object that takes its lifetime from it. A panic in a closure rolls its
+/// scope back and records nothing. A panicking [`Allow`] is treated alike: the call is rolled back and panics,
 /// even if the closure caught the panic of the rule. [`LeakerResult::allow()`] drops the errors
 /// you accept.
 ///
@@ -532,9 +538,7 @@ impl State {
 /// returns the result, so it chains. It only drops errors and leaves the entries as they are (you
 /// promise that the part compiles as written): to remove entries, give the [`Allow`] to
 /// [`Leaker::from_config()`]. A rule here only approximates the one of the Leaker (more errors may
-/// remain, and a copy may fail to build): give rules to the Leaker when you can. The [nested
-/// errors](ErrorItem::nested) of a dropped error come up in its place, so allow until
-/// [`errors()`](LeakerResult::errors) is empty.
+/// remain, and a copy may fail to build): give rules to the Leaker when you can.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
@@ -558,7 +562,8 @@ pub struct LeakerResult {
 
 impl LeakerResult {
     /// Drops the errors that `rule` accepts: the part is copied as written. An error is accepted
-    /// by its [`paths`](ErrorItem::paths) if it has any, else by its cause.
+    /// by its [`paths`](ErrorItem::paths) if it has any, else by its cause. The other errors stay,
+    /// in order.
     ///
     /// You promise that the part can be written as it is in the copy. The cause may be smaller
     /// than the part that is copied: in `[u8; { let c = |a: u8| a; 3 }]` the error is about `u8`,
@@ -566,8 +571,8 @@ impl LeakerResult {
     /// compile (E0277). To allow a cause, compare it with `==` (the same kind and tokens, spans
     /// ignored). An absolute path is never an error, so a rule for `::serde` changes nothing here.
     ///
-    /// See [`Allow`] for what the rule is asked (also for the nested errors that come up). A closure needs
-    /// `&Cause` and [`Place`](crate::Place) annotated when it is not written in the call
+    /// See [`Allow`] for what the rule is asked. A closure needs `&Cause` and
+    /// [`Place`](crate::Place) annotated when it is not written in the call
     /// (`|cause: &Cause, _: Place| ..`); [`Rules::or_if()`](crate::Rules::or_if) needs none.
     pub fn allow(mut self, rule: impl Allow) -> Self {
         filter(&rule, &mut self.errors);

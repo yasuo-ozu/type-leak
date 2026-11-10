@@ -114,18 +114,23 @@ fn a_rule_on_the_place_accepts_what_the_flag_does() {
 
 #[test]
 fn rules_add_up_on_a_result() {
+    // The three traits of the trait object are written as they are: they are the paths of its one
+    // error.
     let item: ItemStruct = parse_quote!(
         struct S<'a> {
-            a: &'a Rel<'_, Vec<u8>>,
+            a: &'a (dyn Rel<'_> + Send + std::fmt::Debug),
         }
     );
     let result = analyze(&item, Rules::new());
     assert_eq!(result.errors().len(), 1);
-    assert_eq!(paths(&result.errors()[0]), ["Rel", "Vec", "u8"]);
+    assert_eq!(
+        paths(&result.errors()[0]),
+        ["Rel", "Send", "std :: fmt :: Debug"]
+    );
     // The rules take the paths off one by one, as the rule of one call that accepts them all.
     let result = result.allow(Rules::new().prelude());
-    assert_eq!(paths(&result.errors()[0]), ["Rel", "u8"]);
-    let result = result.allow(Rules::new().primitive());
+    assert_eq!(paths(&result.errors()[0]), ["Rel", "std :: fmt :: Debug"]);
+    let result = result.allow(Rules::new().std_crates());
     assert_eq!(paths(&result.errors()[0]), ["Rel"]);
     // The error goes with the last.
     let result = result.allow(starts_with(parse_quote!(Rel)));
@@ -135,8 +140,8 @@ fn rules_add_up_on_a_result() {
 #[test]
 fn an_error_is_accepted_by_its_paths_if_it_has_any_and_by_its_cause_if_it_has_none() {
     let item: ItemStruct = parse_quote!(
-        struct S {
-            a: Base<'_, Local>,
+        struct S<'a> {
+            a: &'a (dyn Base<'_> + Local),
         }
     );
     let result = analyze(&item, Rules::new());
@@ -217,9 +222,9 @@ fn the_rules_may_borrow_what_is_around() {
 }
 
 #[test]
-fn a_rule_that_accepts_everything_leaves_no_error_and_no_nested_error() {
-    // The bound `Into<Self::A0>` is copied whole, with an error inside it that comes up when the
-    // bound is dropped.
+fn a_rule_that_accepts_everything_leaves_no_error_and_dropping_the_bound_leaves_the_one_inside() {
+    // The bound `Into<Self::A0>` is written as it is, and `Self::A0` in it has an error of its own,
+    // which stays when the bound is dropped.
     let item: ItemTrait = parse_quote!(
         trait Tr<T: ::p::BT1<String>> {
             type A0;
@@ -231,12 +236,13 @@ fn a_rule_that_accepts_everything_leaves_no_error_and_no_nested_error() {
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item, true);
     let result = leaker.result();
-    assert!(result.errors().iter().any(|error| !error.nested.is_empty()));
+    assert_eq!(result.errors().len(), 2);
     let all = result.clone().allow(|_: &Cause, _: Place| true);
     assert!(all.errors().is_empty());
-    // Dropping the bound alone brings the nested error up.
-    let brought_up = result.accept_cause(&Cause::Trait(parse_quote!(Into<Self::A0>)));
-    assert_eq!(brought_up.errors().len(), 1);
+    // Dropping the bound alone leaves the error of `Self::A0`.
+    let left = result.accept_cause(&Cause::Trait(parse_quote!(Into<Self::A0>)));
+    assert_eq!(left.errors().len(), 1);
+    assert_eq!(left.errors()[0].reason, Reason::UnprovableBound);
 }
 
 #[test]
@@ -324,14 +330,7 @@ impl Seen {
     /// Whether the rule was asked about a cause that is a path with generic arguments, but for the
     /// causes of `errors` (and the errors in them), which the filter asks about as written.
     fn with_arguments(&self, errors: &[ErrorItem]) -> bool {
-        fn causes(errors: &[ErrorItem], found: &mut Vec<Cause>) {
-            for error in errors {
-                found.push(error.cause.clone());
-                causes(&error.nested, found);
-            }
-        }
-        let mut errors_causes = Vec::new();
-        causes(errors, &mut errors_causes);
+        let errors_causes: Vec<Cause> = errors.iter().map(|error| error.cause.clone()).collect();
         self.asked.borrow().iter().any(|(cause, _)| {
             cause.path().is_some() && bare_path(cause).is_none() && !errors_causes.contains(cause)
         })
@@ -417,11 +416,10 @@ fn own_names() -> ItemTrait {
     )
 }
 
-/// The paths of `errors` and of the errors inside them, as tokens.
+/// The paths of `errors`, as tokens.
 fn all_paths(errors: &[ErrorItem], found: &mut Vec<String>) {
     for error in errors {
         found.extend(paths(error));
-        all_paths(&error.nested, found);
     }
 }
 

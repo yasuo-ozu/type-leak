@@ -422,14 +422,13 @@ context 5:  ; - ; in module - is module Some("kept") None
 context 6: < C > ; Self = L < C > ; in module 0
 context 7:  ; - ; in module 0
 context 8:  ; - ; in module 2
-context 9: < A > ; - ; in module 0
-context 10:  ; - ; in module 5
+context 9:  ; - ; in module 5
 entry 0: RelA < Self , A > in 1
 entry 1: RelU < Self , A > in 4
 entry 2: RelC < Self , C > in 6
 entry 3: Rel in 7
 entry 4: RelM in 8
-entry 5: RelK in 10
+entry 5: RelK in 9
 "#;
 
 const FAILING_OK: &str = r#"
@@ -494,8 +493,8 @@ fn a_failing_outermost_scope_keeps_its_corrected_result() {
         tokens
     );
     // The ids and the module are those of the corrected results, whatever is accepted afterwards.
-    assert_eq!(ids, [1, 1, 1, 10, 13, 15]);
-    assert_eq!(module.index(), 19);
+    assert_eq!(ids, [1, 1, 1, 8, 11, 13]);
+    assert_eq!(module.index(), 17);
     pin(
         "outermost errors",
         &messages(result.errors()),
@@ -653,7 +652,7 @@ use absolute path: 'Wrap2<Self>'
 --
 entry 0: Rel < T > in 1
 entry 1: Wrap < U , Lost > in 2
-entry 2: RelK in 4
+entry 2: RelK in 3
 "#;
 
 // ── the generics are declared once ───────────────────────────────────────────────────────────

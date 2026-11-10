@@ -212,7 +212,8 @@ fn a_serialized_error_keeps_its_spans() {
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     let items = result.errors();
-    assert_eq!(items.len(), 3, "{}", messages(items));
+    // `Box` and the trait object in it, which has an error of its own.
+    assert_eq!(items.len(), 4, "{}", messages(items));
     let tokens: proc_macro2::TokenStream =
         items.iter().map(|item| item.to_token_stream()).collect();
     let parsed = parse_items(tokens);
@@ -240,7 +241,8 @@ fn a_serialized_error_keeps_its_spans() {
     assert_span_at(parsed[1].span(), source, "MyType<'_>", 0);
     assert_span_at(parsed[2].span(), source, "Box<dyn RelA + RelB<'_>>", 0);
     assert_span_at(parsed[2].help.as_ref().unwrap().0.span(), source, "Box", 0);
-    assert_span_at(parsed[2].notes[1].0.span(), source, "RelA", 0);
+    assert_span_at(parsed[3].span(), source, "RelA", 0);
+    assert_span_at(parsed[3].notes[1].0.span(), source, "RelB<'_>", 0);
     let direct: Vec<_> = to_syn_error(items).into_iter().collect();
     let again: Vec<_> = to_syn_error(&parsed).into_iter().collect();
     assert_eq!(direct.len(), again.len());
@@ -263,9 +265,9 @@ fn a_serialized_leaker_result_keeps_its_spans() {
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item, true);
     let result = leaker.result();
-    assert_eq!(result.errors().len(), 3, "{}", messages(result.errors()));
+    assert_eq!(result.errors().len(), 4, "{}", messages(result.errors()));
     let read: LeakerResult = parse2(result.to_token_stream()).unwrap();
-    assert_eq!(read.errors().len(), 3);
+    assert_eq!(read.errors().len(), 4);
     for (read, item) in read.errors().iter().zip(result.errors()) {
         assert_eq!(read.message, item.message);
         assert_eq!(
@@ -287,6 +289,7 @@ fn a_serialized_leaker_result_keeps_its_spans() {
         "Box",
         0,
     );
+    assert_span_at(read.errors()[3].span(), source, "RelA", 0);
 }
 
 /// A cause is the same whatever its spans: the one that is written elsewhere (other lines and

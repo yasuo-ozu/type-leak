@@ -5,7 +5,7 @@ use crate::allow::Place;
 use crate::analyze::{input_type, unconstrained_in_output, Elision};
 use crate::context::{Context, ContextId, Contexts, SelfRequirement};
 use crate::error::{report, self_without_meaning, Cause, ErrorItem, Reason};
-use crate::graph::{NodeKey, TypeGraph};
+use crate::graph::{is_whole_reference, NodeKey, TypeGraph};
 #[cfg(doc)]
 use crate::leaker::Leaker;
 #[cfg(doc)]
@@ -96,12 +96,9 @@ pub struct CheckResult {
     /// Where the conflict was found: in a value, in a default ([`ErrorItem::in_value`],
     /// [`ErrorItem::in_default`]). Set where it is recorded as an error.
     pub(crate) place: Place,
-    /// The relative paths that the conflict depends on, with their kinds and without their
-    /// arguments, in the order of `must` ([`ErrorItem::paths`]).
+    /// The relative paths that the copy writes as they are, with their kinds and without their
+    /// arguments: the heads of the type that conflicts ([`ErrorItem::paths`]).
     pub(crate) paths: Vec<Cause>,
-    /// What the analysis finds inside the part if `paths` are allowed ([`ErrorItem::nested`]).
-    /// Only a conflict with a part has some.
-    pub(crate) nested: Vec<ErrorItem>,
 }
 
 /// A mention of `Self` that has no meaning where it is written ([`Reason::SelfWithoutMeaning`]).
@@ -111,12 +108,17 @@ pub(crate) struct SelfMention {
     pub(crate) place: Place,
 }
 
-/// A part of the item that the Leaker copies as written, whole, which the Referrer must leave so.
-/// It becomes a [`PartItem`] when its effect is applied.
+/// A type that the Leaker copies as written, which the Referrer must not look up as an entry. It
+/// becomes a [`PartItem`] when its effect is applied, if it is [`recorded()`](Part::recorded).
 #[derive(Clone, Debug)]
 pub(crate) struct Part {
-    /// The part: a [`Cause::Type`], the cause of a bound, or the path of a value.
+    /// The type, as a [`Cause::Type`], or the bound whose trait path conflicts (it is no type, and
+    /// whole).
     pub(crate) cause: Cause,
+    /// Nothing in it is leaked (`Wrap<N>` with a bare `N` that may be a const, a reference, a type
+    /// in a predicate of the item, a type that holds a trait object that takes its lifetime from
+    /// it). Else only its own path is written as it is, and the analysis went on inside it.
+    pub(crate) whole: bool,
     /// The context that an entry of it would have, or `None` if it cannot be written here (a
     /// bound names a `Self` that has no name: [`Reason::UnnameableSelf`]).
     pub(crate) context: Option<Context>,
@@ -127,17 +129,33 @@ pub(crate) struct Part {
     pub(crate) within: Option<(Type, Context)>,
     /// The signature that made it a part, if one did.
     pub(crate) mark: Option<SignatureMark>,
-    /// The primitive names in it, which the copy writes as they are ([`Leaker::assertions()`]).
+    /// The primitive names in a whole part, which the copy writes as they are
+    /// ([`Leaker::assertions()`]).
     pub(crate) primitives: Vec<Ident>,
 }
 
-/// A part that the Referrer leaves as written, with its contexts interned. Serialized as `KIND (
-/// CAUSE ) CONTEXT [sig ( MARK )] [predicate] [in ( TYPE ) CONTEXT]`, with `unwritable` for a
+impl Part {
+    /// Returns `true` if the Referrer needs to know the part. A part that is not whole, with no
+    /// anchor and no mark, has the same conflict wherever its tokens and context are found, so no
+    /// entry has them and the visitor finds nothing to replace at its head; the types in it are
+    /// entries as any are. A whole part (nothing in it may be replaced), or one that only a position
+    /// tells from an entry (an anchor, a signature), is needed.
+    pub(crate) fn recorded(&self) -> bool {
+        self.whole || self.within.is_some() || self.mark.is_some()
+    }
+}
+
+/// A part that the Referrer leaves as written, with its contexts interned (see
+/// [`Part::recorded()`]). Serialized as `KIND (
+/// CAUSE ) CONTEXT [whole] [sig ( MARK )] [predicate] [in ( TYPE ) CONTEXT]`, with `unwritable` for a
 /// `CONTEXT` of `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PartItem {
-    /// A [`Cause::Type`], the cause of a bound, or the path of a value.
+    /// A [`Cause::Type`].
     pub(crate) part: Cause,
+    /// No entry is looked up in it. Else only the type itself is not looked up, and the types in
+    /// it are.
+    pub(crate) whole: bool,
     /// The context that an entry of it would have. `None`: it cannot be written, so the part is
     /// the one at a place where the Referrer cannot write its context either.
     pub(crate) context: Option<ContextId>,
@@ -251,6 +269,12 @@ pub(crate) struct PendingType {
     /// are assumed if the type is copied as written instead ([`Part::primitives`]).
     pub(crate) primitives: Vec<Ident>,
     pub(crate) components: Vec<Effect>,
+    /// For a type leaked whole, the effects of the types in it, which `components` does not hold:
+    /// the copy keeps them if the type is copied as written instead.
+    pub(crate) inside: Vec<Effect>,
+    /// A type in it is not leaked alone, and its meaning depends on this type (a trait object that
+    /// takes its lifetime from the path): copied as written, this type is whole.
+    pub(crate) adopted: bool,
 }
 
 impl PendingType {
@@ -271,15 +295,29 @@ impl PendingType {
             paths: Vec::new(),
             primitives: Vec::new(),
             components,
+            inside: Vec::new(),
+            adopted: false,
         }
     }
 
-    /// The part that the Referrer leaves as written if the type is copied so instead of leaked.
+    /// The part that the Referrer leaves as written if the type is copied so instead of leaked: a
+    /// reference is copied whole, as its parts cannot stand for it ([`is_whole_reference()`]), and
+    /// so is a type in a predicate and a type that holds one that depends on it.
     pub(crate) fn part(&self) -> Part {
-        let mut primitives = self.primitives.clone();
-        primitives.extend(primitive_names(&self.components));
+        let whole = self.adopted || self.in_predicate || is_whole_reference(&self.ty);
+        self.part_as(whole)
+    }
+
+    /// Like [`PendingType::part()`], whole or not as `whole` says.
+    pub(crate) fn part_as(&self, whole: bool) -> Part {
+        let mut primitives = Vec::new();
+        if whole {
+            primitives = self.primitives.clone();
+            primitives.extend(primitive_names(&self.components));
+        }
         Part {
             cause: Cause::Type(self.ty.clone()),
+            whole,
             context: Some(self.context.clone()),
             in_predicate: self.in_predicate,
             within: None,
@@ -290,8 +328,8 @@ impl PendingType {
 }
 
 impl CheckResult {
-    /// The correction of a part copied as written, whole, for a fault that another error tells. It
-    /// has no cause that depends on the context, so `report()` gives no error for it.
+    /// The correction of a part copied as written for a fault that another error tells. It has no
+    /// cause that depends on the context, so `report()` gives no error for it.
     pub(crate) fn corrected() -> Self {
         Self {
             must: Vec::new(),
@@ -307,7 +345,6 @@ impl CheckResult {
             seen: 0,
             place: Place::default(),
             paths: Vec::new(),
-            nested: Vec::new(),
         }
     }
 }
@@ -355,8 +392,12 @@ impl Analysis {
                     // The contexts are interned as an entry's is.
                     if let Some(part) = &error.part {
                         self.primitives.extend(part.primitives.iter().cloned());
+                        if !part.recorded() {
+                            continue;
+                        }
                         let item = PartItem {
                             part: part.cause.clone(),
+                            whole: part.whole,
                             context: part
                                 .context
                                 .as_ref()
@@ -441,27 +482,19 @@ pub(crate) fn shift_seen(effects: &mut [Effect], by: usize) {
     for effect in effects {
         match effect {
             Effect::Error(error) => error.seen += by,
-            Effect::Type(pending) => shift_seen(&mut pending.components, by),
+            Effect::Type(pending) => {
+                shift_seen(&mut pending.components, by);
+                shift_seen(&mut pending.inside, by);
+            }
             Effect::Primitive(_) => (),
         }
     }
 }
 
-/// Takes `by` off the count of mentions of `Self` that the conflicts in `effects` have seen: the
-/// reverse of [`shift_seen()`], for what a probe found after `by` mentions.
-pub(crate) fn unshift_seen(effects: &mut [Effect], by: usize) {
-    for effect in effects {
-        match effect {
-            Effect::Error(error) => error.seen = error.seen.saturating_sub(by),
-            Effect::Type(pending) => unshift_seen(&mut pending.components, by),
-            Effect::Primitive(_) => (),
-        }
-    }
-}
-
-/// Copies as written, whole, the types among `effects` (outermost first) that `corrected` gives a
-/// part: each becomes an `Effect::Error` that reports nothing and holds the type as its part. The
-/// conflicts and the primitive names in it stay.
+/// Copies as written the types among `effects` (outermost first) that `corrected` gives a part:
+/// each becomes an `Effect::Error` that reports nothing and holds the type as its part. Only a
+/// whole part loses what is in it but the conflicts and the primitive names; else the types in the
+/// type stay, corrected in turn.
 pub(crate) fn correct_effects(
     effects: Vec<Effect>,
     corrected: &dyn Fn(&PendingType) -> Option<Part>,
@@ -471,11 +504,20 @@ pub(crate) fn correct_effects(
         match effect {
             Effect::Type(mut pending) => match corrected(&pending) {
                 Some(part) => {
+                    let whole = part.whole;
                     let mut error = CheckResult::corrected();
                     error.part = Some(part);
                     found.push(Effect::Error(Box::new(error)));
-                    let PendingType { components, .. } = *pending;
-                    keep_conflicts(components, &mut found);
+                    let PendingType {
+                        components, inside, ..
+                    } = *pending;
+                    let mut inner = inside;
+                    inner.extend(components);
+                    if whole {
+                        keep_conflicts(inner, &mut found);
+                    } else {
+                        found.extend(correct_effects(inner, corrected));
+                    }
                 }
                 None => {
                     let components = std::mem::take(&mut pending.components);
@@ -528,9 +570,10 @@ fn keep_conflicts(effects: Vec<Effect>, found: &mut Vec<Effect>) {
     }
 }
 
-/// Copies as written, whole, the outermost type that would be an entry and names a `Self` without
+/// Copies as written the outermost type that would be an entry and names a `Self` without
 /// meaning, or has a bound in its context that does: the impl of the Repeater would read that
-/// `Self` as its implementor ([`Reason::SelfWithoutMeaning`]).
+/// `Self` as its implementor ([`Reason::SelfWithoutMeaning`]). The types in it that do not are
+/// leaked.
 pub(crate) fn correct_unmeant_self(effects: Vec<Effect>) -> Vec<Effect> {
     correct_effects(effects, &|pending| {
         (pending.unmeant_self && (pending.in_graph || pending.has_optional)).then(|| pending.part())
@@ -565,11 +608,15 @@ pub(crate) fn names_self(effects: &[Effect], declared: &SelfRequirement) -> bool
 /// because a bound names a `Self` that has no name: the Referrer finds it by that, so it needs to
 /// know what `Self` is.
 pub(crate) fn part_names_self(error: &CheckResult, declared: &SelfRequirement) -> bool {
-    error.part.as_ref().map_or(false, |part| {
-        part.context
-            .as_ref()
-            .map_or(true, |context| depends_on_self(context, declared))
-    })
+    error
+        .part
+        .as_ref()
+        .filter(|part| part.recorded())
+        .map_or(false, |part| {
+            part.context
+                .as_ref()
+                .map_or(true, |context| depends_on_self(context, declared))
+        })
 }
 
 fn depends_on_self(context: &Context, declared: &SelfRequirement) -> bool {
@@ -617,6 +664,39 @@ pub(crate) fn ambiguous_types(effects: &[Effect]) -> Vec<Type> {
             } else if matches!(pending.ty, Type::Group(_)) {
                 found.extend(ambiguous_types(&pending.components));
             }
+        }
+    }
+    found
+}
+
+/// What `effects` become if the copy writes the syntax they are about as it is, whole: no type
+/// among them is leaked, so only the errors stay, without their parts (the syntax is the part). The
+/// relative paths of the types that would be entries are written as they are, so they are pushed to
+/// `paths`, the paths of the error of the syntax ([`CheckResult::paths`]).
+pub(crate) fn as_written(effects: Vec<Effect>, paths: &mut Vec<Cause>) -> Vec<Effect> {
+    let mut found = Vec::new();
+    for effect in effects {
+        match effect {
+            Effect::Error(mut error) => {
+                error.part = None;
+                found.push(Effect::Error(error));
+            }
+            Effect::Type(pending) => {
+                if pending.is_must_intern {
+                    for path in &pending.paths {
+                        if !paths.contains(path) {
+                            paths.push(path.clone());
+                        }
+                    }
+                }
+                let PendingType {
+                    components, inside, ..
+                } = *pending;
+                let mut inner = inside;
+                inner.extend(components);
+                found.extend(as_written(inner, paths));
+            }
+            Effect::Primitive(_) => (),
         }
     }
     found

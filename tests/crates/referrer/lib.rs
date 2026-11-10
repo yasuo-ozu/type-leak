@@ -277,7 +277,7 @@ pub mod kinds {
 /// replaced as usual.
 pub mod accepted {
     #[allow(unused_imports)]
-    use type_leak_test_leaker::kinds::{ElidedTr, Held, SharedTr, Wrap};
+    use type_leak_test_leaker::kinds::{ElidedTr, Held, Leaf, SharedTr, Two, Wrap};
 
     type_leak_test_leaker::__tl_prop_9184!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__tl_prop_9185!(path = ::type_leak_test_leaker::kinds, accept);
@@ -320,6 +320,9 @@ pub mod accepted {
     type_leak_test_leaker::__tl_prop_9197!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__tl_prop_9198!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__nested_apply_9199!(path = ::type_leak_test_leaker::kinds);
+    // Flat recovery: the types in what is written as it is are entries (9219, 9220).
+    type_leak_test_leaker::__tl_prop_9219!(path = ::type_leak_test_leaker::kinds, accept);
+    type_leak_test_leaker::__tl_prop_9220!(path = ::type_leak_test_leaker::kinds, accept);
 
     // The traits of two items analyzed together: `f` keeps the type as written, `Held` and `Wrap`
     // are named here (F48).

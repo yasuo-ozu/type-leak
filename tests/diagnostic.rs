@@ -167,28 +167,31 @@ help: use `::core::ops::Fn` instead of `Fn`
   |                          ^^
 ",
             // Each note has its own span: why the type cannot be leaked as a whole, and the other
-            // paths inside it. The help comes last.
+            // paths of the same type (`RelB<'_>`, beside `RelA`, in the error of the trait object).
+            // The help comes last.
             "\
 note: it cannot be leaked as a whole because of `'_`
  --> lib.rs:9:40
   |
 9 |     fn f(&self, x: Box<dyn RelA + RelB<'_>>);
   |                                        ^^
-note: `RelA` also depends on the type context
- --> lib.rs:9:28
-  |
-9 |     fn f(&self, x: Box<dyn RelA + RelB<'_>>);
-  |                            ^^^^
-note: `RelB<'_>` also depends on the type context
- --> lib.rs:9:35
-  |
-9 |     fn f(&self, x: Box<dyn RelA + RelB<'_>>);
-  |                                   ^^^^^^^^
 help: use `::std::boxed::Box` instead of `Box`
  --> lib.rs:9:20
   |
 9 |     fn f(&self, x: Box<dyn RelA + RelB<'_>>);
   |                    ^^^
+",
+            "\
+note: `RelB<'_>` also depends on the type context
+ --> lib.rs:9:35
+  |
+9 |     fn f(&self, x: Box<dyn RelA + RelB<'_>>);
+  |                                   ^^^^^^^^
+help: write `RelA` with an absolute path (e.g. `::my_crate::RelA`)
+ --> lib.rs:9:28
+  |
+9 |     fn f(&self, x: Box<dyn RelA + RelB<'_>>);
+  |                            ^^^^
 ",
         ]
     } else {
@@ -213,11 +216,18 @@ error: use absolute path: 'Clone'
 error: use absolute path: 'Box<dyn RelA + RelB<'_>>'
 
          = note: it cannot be leaked as a whole because of `'_`
-         = note: `RelA` also depends on the type context
-         = note: `RelB<'_>` also depends on the type context
          = help: use `::std::boxed::Box` instead of `Box`
 
  --> lib.rs:9:20
+",
+            "\
+error: use absolute path: 'RelA'
+
+         = note: it cannot be leaked as a whole because of `'_`
+         = note: `RelB<'_>` also depends on the type context
+         = help: write `RelA` with an absolute path (e.g. `::my_crate::RelA`)
+
+ --> lib.rs:9:28
 ",
         ]
     };
@@ -285,8 +295,8 @@ fn every_offending_path_is_an_error_of_its_own() {
         assert_eq!(*got, expected, "{}", stderr);
     }
 
-    // Every error of the fixture, and no other: the three single ones, the five of `Multi`, the two
-    // mentions of `Self`, and the four unreadable Referrers.
+    // Every error of the fixture, and no other: the three single ones and the trait object in the
+    // second, the five of `Multi`, the two mentions of `Self`, and the four unreadable Referrers.
     let mut expected = vec![
         error("use absolute path: 'Clone'", "2:20", &[], &[clone_help]),
         error(
@@ -298,12 +308,14 @@ fn every_offending_path_is_an_error_of_its_own() {
         error(
             "use absolute path: 'Box<dyn RelA + RelB<'_>>'",
             "9:20",
-            &[
-                because,
-                "`RelA` also depends on the type context",
-                "`RelB<'_>` also depends on the type context",
-            ],
+            &[because],
             &["use `::std::boxed::Box` instead of `Box`"],
+        ),
+        error(
+            "use absolute path: 'RelA'",
+            "9:28",
+            &[because, "`RelB<'_>` also depends on the type context"],
+            &["write `RelA` with an absolute path (e.g. `::my_crate::RelA`)"],
         ),
         error(
             "`Self` has no meaning here",
@@ -323,8 +335,8 @@ fn every_offending_path_is_an_error_of_its_own() {
         format_error("an unrecognized tag \"not-a-tag\"", "51:1"),
     ];
     // Not the "format 7" of the previous version, but the one that is, whatever the version is.
-    expected[5] = format_error(&format!("format {}", Referrer::FORMAT_VERSION - 1), "33:1");
-    expected[6] = format_error(&format!("format {}", Referrer::FORMAT_VERSION + 1), "39:1");
+    expected[6] = format_error(&format!("format {}", Referrer::FORMAT_VERSION - 1), "33:1");
+    expected[7] = format_error(&format!("format {}", Referrer::FORMAT_VERSION + 1), "39:1");
     expected.extend(expected_notes_of_multi);
     // The first lines of a nightly diagnostic differ, but not its headline, position and notes.
     let mut got = got;
@@ -382,8 +394,9 @@ fn serialized_errors_are_reported_at_the_same_places() {
     let built = nested::cargo("diagnostic_serialized", &["check"], &[]);
     assert!(!built.success, "{}", built.stderr);
     let serialized = diagnostics_up_to(&built.stderr, 23);
-    // The three items with one error, the five of `Multi`, and the two mentions of `Self`.
-    assert_eq!(direct.len(), 10, "{}", direct.join("\n"));
+    // The three items with one error and the trait object in the second, the five of `Multi`, and
+    // the two mentions of `Self`.
+    assert_eq!(direct.len(), 11, "{}", direct.join("\n"));
     assert_eq!(serialized, direct);
     // And no other error: the fixture is the first lines of the other.
     let errors = built

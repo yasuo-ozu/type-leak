@@ -2201,26 +2201,26 @@ fn a_lifetime_that_another_input_keeps_breaks_the_elision_of_the_copy() {
 }
 
 /// F50, fixture 9205 (`stages = true`): `core::mem::size_of::<*const Rel>()` in a default method.
-/// `Rules::std_crates()` given to the result after the analysis leaves the error, whose path is
-/// `Rel` now: the copy is made in a module that names it (`stage_copies`), and in no crate that does
-/// not (`clean`, where the macro makes the copy only if the rule left no error: it would write
-/// `Rel` as written, E0412). The config that allows the crates leaks `Rel` and has no error.
+/// The path of the value is written as it is and `Rel` in its arguments is an entry, so
+/// `Rules::std_crates()` given to the result after the analysis drops the only error, as the config
+/// that allows the crates has none: the copy is made in the `clean` crate too, which names no `Rel`
+/// (it would be E0412 if the copy wrote `Rel` as written).
 #[test]
-fn a_rule_after_the_analysis_keeps_the_error_for_a_relative_type_in_the_arguments_of_a_value() {
+fn a_rule_after_the_analysis_drops_the_error_for_the_path_of_a_value_and_leaks_its_arguments() {
     use type_leak_test_leaker::kinds as l;
     use type_leak_test_leaker::*;
     use type_leak_test_referrer::stage_copies as r;
 
     // What the stages leave: the rule matters, one error without it, none in the config (`Rel` is
-    // an entry), one after it in the result (the path of the value); not the same errors, not the
-    // same Referrer.
+    // an entry) and none after it in the result (the path of the value is dropped, `Rel` is an
+    // entry too): the same errors, the same Referrer.
     let fields: Vec<&str> = __tl_stages_std_9205!().split('\u{1f}').collect();
-    assert_eq!(fields[..4], ["1", "1", "0", "1"]);
+    assert_eq!(fields[..4], ["1", "1", "0", "0"]);
     assert_eq!(fields[4], "");
-    assert_eq!(squash(fields[5]), "core::mem::size_of::<*constRel>");
-    assert_eq!(fields[6..], ["0", "0"]);
+    assert_eq!(fields[5], "");
+    assert_eq!(fields[6..], ["1", "1"]);
 
-    // The copy after the rule is one with the causes allowed, which is not a clean one.
+    // The copy after the rule is a clean one: no error is left.
     let report = __tl_st_std_res_report_9205!();
     let status: Vec<&str> = report
         .split('\u{1e}')
@@ -2228,7 +2228,7 @@ fn a_rule_after_the_analysis_keeps_the_error_for_a_relative_type_in_the_argument
         .unwrap()
         .splitn(4, '|')
         .collect();
-    assert_eq!(status[..3], ["9205", "trait", "acc"]);
+    assert_eq!(status[..3], ["9205", "trait", "ok"]);
 
     // The copy is an implementation of the Leaker's trait, and its default method is the original.
     fn implements<T: l::ValuePathArguments>() {}
@@ -2429,4 +2429,37 @@ fn a_relative_macro_and_struct_literal_in_a_discriminant_or_a_default_are_reject
         reported(9218, __tl_report_9218!()),
         rejected("struct", "useabsolutepath:'RelPoint'")
     );
+}
+
+/// Flat recovery, fixtures 9219 and 9220: a type whose own path conflicts is written as it is, and
+/// the types in it are leaked as usual. `Two<T, Leaf>` is a conflict (`DeniedSelfInBounds` in a
+/// trait that denies `Self`, `SelfInImplSelfType` in an impl whose bound names it), copied with `Two`
+/// as written, and `Leaf` in it is the entry that `g` has too: the Referrer's crate replaces it
+/// (`Two<T, <..>::Type>`), and the host implements the trait of the Leaker's crate.
+#[test]
+fn a_type_whose_own_path_conflicts_is_written_as_it_is_and_the_types_in_it_are_leaked() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::accepted as r;
+
+    assert_eq!(
+        reported(9219, __tl_report_9219!()),
+        allowed("trait", 1, 2, 2)
+    );
+    assert_eq!(
+        reported(9220, __tl_report_9220!()),
+        allowed("impl-inherent", 1, 2, 2)
+    );
+    let reasons = |text: &'static str| -> Vec<String> {
+        text.split('\u{1d}')
+            .map(|error| error.split('\u{1f}').nth(3).unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(reasons(__tl_errors_9219!()), ["DeniedSelfInBounds"]);
+    assert_eq!(
+        reasons(__tl_errors_9220!()),
+        ["SelfInImplSelfType", "UnprovableBound"]
+    );
+    fn denied<T: l::DeniedSelfFlat>() {}
+    denied::<r::Host9219>();
 }

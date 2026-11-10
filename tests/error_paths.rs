@@ -1,8 +1,10 @@
-//! `ErrorItem::paths`: each relative path of an error as the cause of its kind.
+//! `ErrorItem::paths`: each relative path that the copy writes as it is, as the cause of its kind.
 //!
 //! - A path in a type is a `Cause::Type`, the trait of a bound or of a qualified path a
 //!   `Cause::Trait`, a path in a value a `Cause::Expr`, the path of a macro a `Cause::Macro`; all
 //!   without generic arguments.
+//! - Only the head of what conflicts is written as it is: what is in its arguments is analyzed on
+//!   its own, so it is an entry or has an error of its own.
 //! - A path whose kind is not known (the root of a `use` in a value) is a `Cause::Unreadable`.
 //! - The kinds survive the serialization of the error.
 
@@ -46,9 +48,10 @@ fn a_path_in_a_type_is_a_type_and_the_trait_of_a_bound_a_trait() {
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item, true);
     let result = leaker.result();
+    // `Vec` is written as it is, and `Rel<'_>` in it has an error of its own.
     assert_eq!(
         paths_of(&result),
-        [vec!["trait(Clone)"], vec!["type(Vec)", "type(Rel)"]]
+        [vec!["trait(Clone)"], vec!["type(Vec)"], vec!["type(Rel)"]]
     );
 }
 
@@ -63,17 +66,22 @@ fn the_trait_of_a_bound_and_a_trait_object_is_a_trait_and_its_arguments_are_type
     let mut leaker = Leaker::new();
     leaker.intern_struct(&item, true);
     let result = leaker.result();
+    // The bound is a predicate, so it is copied whole, `Arg` in it too: it is a path of its error. The
+    // trait object is written as it is, and its argument is an entry.
     assert_eq!(
         paths_of(&result),
-        [
-            vec!["trait(RelTr)", "type(Arg)"],
-            vec!["trait(OtherTr)", "type(Assoc)"]
-        ]
+        [vec!["trait(RelTr)", "type(Arg)"], vec!["trait(OtherTr)"]]
     );
+    let referrer = result.into_referrer();
+    let entries: Vec<String> = referrer
+        .iter()
+        .map(|ty| ty.to_token_stream().to_string())
+        .collect();
+    assert_eq!(entries, ["Assoc"]);
 }
 
 #[test]
-fn the_trait_of_a_qualified_path_is_a_trait_and_its_type_a_type() {
+fn the_qualified_path_in_the_arguments_of_what_conflicts_is_leaked() {
     let item: ItemStruct = parse_quote!(
         struct S {
             a: Wrap<'_, <Rel as m::Tr<u8>>::X>,
@@ -82,15 +90,13 @@ fn the_trait_of_a_qualified_path_is_a_trait_and_its_type_a_type() {
     let mut leaker = Leaker::new();
     leaker.intern_struct(&item, true);
     let result = leaker.result();
-    assert_eq!(
-        paths_of(&result),
-        [vec![
-            "type(Wrap)",
-            "trait(m :: Tr)",
-            "type(Rel)",
-            "type(u8)"
-        ]]
-    );
+    assert_eq!(paths_of(&result), [vec!["type(Wrap)"]]);
+    let entries: Vec<String> = result
+        .into_referrer()
+        .iter()
+        .map(|ty| ty.to_token_stream().to_string())
+        .collect();
+    assert_eq!(entries, ["< Rel as m :: Tr < u8 > > :: X"]);
 }
 
 #[test]
@@ -103,11 +109,12 @@ fn the_path_of_a_macro_is_a_macro() {
     let mut leaker = Leaker::new();
     leaker.intern_struct(&item, true);
     let result = leaker.result();
-    assert_eq!(paths_of(&result), [vec!["type(Wrap)", "macro(m !)"]]);
+    // The type macro is a type of its own, leaked whole, and the macro of a value is a `macro` path.
+    assert_eq!(paths_of(&result), [vec!["type(Wrap)"]]);
 }
 
 #[test]
-fn a_path_in_a_value_is_an_expression_and_its_arguments_are_types() {
+fn a_path_in_a_value_is_an_expression_and_its_arguments_are_leaked() {
     let item: ItemConst = parse_quote!(
         const C: u8 = rel::f::<Arg>(1);
     );
@@ -116,7 +123,14 @@ fn a_path_in_a_value_is_an_expression_and_its_arguments_are_types() {
         view.visit_item(&Item::Const(item));
     });
     let result = leaker.result();
-    assert_eq!(paths_of(&result), [vec!["expr(rel :: f)", "type(Arg)"]]);
+    assert_eq!(paths_of(&result), [vec!["expr(rel :: f)"]]);
+    let entries: Vec<String> = result
+        .into_referrer()
+        .iter()
+        .map(|ty| ty.to_token_stream().to_string())
+        .collect();
+    // The type of the constant is leaked too.
+    assert_eq!(entries, ["Arg", "u8"]);
 }
 
 #[test]

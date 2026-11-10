@@ -1280,11 +1280,12 @@ fn issue_three_the_help_knows_the_traits_of_the_prelude_it_allows() {
 }
 
 /// Issue 4: the notes of an error are the note of the reason, the causes that stop the type from
-/// being leaked as a whole, and the other causes that cannot be leaked either. A relative path that
-/// would be leaked once the cause is fixed is in `paths`, not in the notes: the doc of `notes` said
-/// that the notes include the other paths "which would be reported once the first is fixed". For
-/// `struct S<T: Base<Local>>(T);` there is no note, and `Local` becomes an entry when `Base` is
-/// absolute.
+/// being leaked as a whole, and the other causes of the same type that cannot be leaked either. A
+/// relative path that would be leaked once the cause is fixed is in `paths`, not in the notes: the
+/// doc of `notes` said that the notes include the other paths "which would be reported once the
+/// first is fixed". For `struct S<T: Base<Local>>(T);` there is no note, and `Local` becomes an
+/// entry when `Base` is absolute (the bound is copied whole, `Local` in it too, so it is a path of
+/// the error).
 #[test]
 fn issue_four_a_path_that_would_be_leaked_is_in_the_paths_and_not_in_the_notes() {
     let paths = |item: &ErrorItem| -> Vec<String> { item.paths.iter().map(text).collect() };
@@ -1309,8 +1310,9 @@ fn issue_four_a_path_that_would_be_leaked_is_in_the_paths_and_not_in_the_notes()
     leaker.intern_struct(&item, true);
     let referrer = leaker.result().finish().unwrap();
     assert_eq!(referrer.iter().map(text).collect::<Vec<_>>(), ["Local"]);
-    // A cause that cannot be leaked either is a note: `RelA` and `RelB<'_>` in a `dyn` that the
-    // lifetime keeps from being leaked as a whole. The paths have them all.
+    // A cause of the same type that cannot be leaked either is a note: `RelB<'_>` beside `RelA` in a
+    // `dyn` that the lifetime keeps from being leaked as a whole. The error of `Box` has none of
+    // them, and the paths have the heads that the copy writes as they are.
     let item: ItemTrait = parse_quote!(
         trait Tr {
             fn f(&self, x: Box<dyn RelA + RelB<'_>>);
@@ -1320,21 +1322,23 @@ fn issue_four_a_path_that_would_be_leaked_is_in_the_paths_and_not_in_the_notes()
     leaker.intern_trait(&item, true);
     let result = leaker.result();
     let errors = result.errors();
-    assert_eq!(errors.len(), 1, "{}", messages(errors));
-    let notes: Vec<&str> = errors[0]
-        .notes
-        .iter()
-        .map(|(_, note)| note.as_str())
-        .collect();
+    assert_eq!(errors.len(), 2, "{}", messages(errors));
+    let notes_of = |item: &ErrorItem| -> Vec<String> {
+        item.notes.iter().map(|(_, note)| note.clone()).collect()
+    };
     assert_eq!(
-        notes,
+        notes_of(&errors[0]),
+        ["it cannot be leaked as a whole because of `'_`"]
+    );
+    assert_eq!(
+        notes_of(&errors[1]),
         [
             "it cannot be leaked as a whole because of `'_`",
-            "`RelA` also depends on the type context",
             "`RelB<'_>` also depends on the type context",
         ]
     );
-    assert_eq!(paths(&errors[0]), ["Box", "RelA", "RelB"]);
+    assert_eq!(paths(&errors[0]), ["Box"]);
+    assert_eq!(paths(&errors[1]), ["RelA", "RelB"]);
     // The note of the reason comes first, then the causes.
     let item: ItemStruct = parse_quote!(
         struct S<T = Rel<Self>>(T);

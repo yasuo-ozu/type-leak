@@ -4,9 +4,7 @@
 
 use crate::error::{Cause, ErrorItem};
 use crate::util::{heads_self, starts_with_known, without_arguments, Known, PathOf, STD_CRATES};
-use proc_macro2::TokenStream;
 use syn::Path;
-use template_quote::ToTokens;
 
 /// Where in an item a path or an error is. [`Allow::allow()`] is asked at a place; it is
 /// [`ErrorItem::place()`] for an error.
@@ -272,104 +270,15 @@ fn accepts<A: Allow + ?Sized>(rule: &A, error: &ErrorItem) -> bool {
     }
 }
 
-/// Drops the errors that `rule` accepts, and puts their nested errors in their place
-/// ([`ErrorItem::nested`]): the part is copied as written, so what is wrong inside it is real
-/// whichever rule accepted it. The nested errors are filtered the same way, down to the last. An
-/// error that stays loses the paths that the rule allows, so that rules given one after the other
-/// add up as they do in one set (and in the serialization of the error, which carries its paths);
-/// its nested errors are filtered too, for when it is dropped later.
-///
-/// A nested error that comes up is skipped if it is identical but for its spans to an error that
-/// stays, before it or after it ([`same()`]). Errors that did not come up, and errors that come
-/// up, are never merged with each other.
+/// Drops the errors that `rule` accepts. An error that stays loses the paths that the rule allows,
+/// so that rules given one after the other add up as they do in one set (and in the serialization of
+/// the error, which carries its paths).
 pub(crate) fn filter<A: Allow + ?Sized>(rule: &A, errors: &mut Vec<ErrorItem>) {
-    // The errors that stay, and for each group that comes up the number of those before it.
-    let mut stays = Vec::new();
-    let mut ups = Vec::new();
-    for mut error in std::mem::take(errors) {
-        if accepts(rule, &error) {
-            ups.push((stays.len(), error.nested));
-        } else {
-            trim(rule, &mut error);
-            stays.push(error);
-        }
+    errors.retain(|error| !accepts(rule, error));
+    for error in errors.iter_mut() {
+        let place = error.place();
+        error
+            .paths
+            .retain(|entry| !allows_entry(rule, entry, place));
     }
-    let mut came_up = Vec::new();
-    for (before, nested) in ups {
-        for error in nested {
-            raise(rule, error, before, &stays, &mut came_up);
-        }
-    }
-    // Back in the order of the input: what came up goes where its outer error was.
-    let mut came_up = came_up.into_iter().peekable();
-    for (ix, error) in stays.into_iter().enumerate() {
-        while let Some((_, up)) = came_up.next_if(|(before, _)| *before <= ix) {
-            errors.push(up);
-        }
-        errors.push(error);
-    }
-    errors.extend(came_up.map(|(_, up)| up));
-}
-
-/// Removes from `error`, which stays, the paths that `rule` allows, and filters its nested errors.
-fn trim<A: Allow + ?Sized>(rule: &A, error: &mut ErrorItem) {
-    let place = error.place();
-    error
-        .paths
-        .retain(|entry| !allows_entry(rule, entry, place));
-    filter(rule, &mut error.nested);
-}
-
-/// Puts `error`, which came up, in `came_up` after `before` errors that stay if `rule` does not
-/// accept it and it is not `same()` as one of `stays`, else its nested errors that it does not
-/// accept.
-fn raise<A: Allow + ?Sized>(
-    rule: &A,
-    mut error: ErrorItem,
-    before: usize,
-    stays: &[ErrorItem],
-    came_up: &mut Vec<(usize, ErrorItem)>,
-) {
-    if accepts(rule, &error) {
-        for nested in error.nested {
-            raise(rule, nested, before, stays, came_up);
-        }
-    } else {
-        // Trimmed like the errors that stay, so that what is compared is what would be listed.
-        trim(rule, &mut error);
-        if !stays.iter().any(|other| same(other, &error)) {
-            came_up.push((before, error));
-        }
-    }
-}
-
-/// Returns `true` if the errors are identical but for their spans, which cannot be compared
-/// reliably: the same cause ([`Cause`] equality), reason, message, place, paths, notes, help and
-/// nested errors, the tokens compared as text. So that a skipped error is never one that a rule
-/// would treat differently from the one it equals.
-fn same(left: &ErrorItem, right: &ErrorItem) -> bool {
-    fn text(tokens: &impl ToTokens) -> String {
-        tokens.to_token_stream().to_string()
-    }
-    fn note(left: &(TokenStream, String), right: &(TokenStream, String)) -> bool {
-        left.1 == right.1 && text(&left.0) == text(&right.0)
-    }
-    left.cause == right.cause
-        && left.reason == right.reason
-        && left.message == right.message
-        && left.place() == right.place()
-        && left.paths == right.paths
-        && left.notes.len() == right.notes.len()
-        && left.notes.iter().zip(&right.notes).all(|(l, r)| note(l, r))
-        && match (&left.help, &right.help) {
-            (Some(left), Some(right)) => note(left, right),
-            (None, None) => true,
-            _ => false,
-        }
-        && left.nested.len() == right.nested.len()
-        && left
-            .nested
-            .iter()
-            .zip(&right.nested)
-            .all(|(l, r)| same(l, r))
 }

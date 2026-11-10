@@ -427,15 +427,12 @@ pub struct ErrorItem {
     /// Found in a default: of a trait's method or const, or of a parameter; see
     /// [`place()`](ErrorItem::place).
     pub in_default: bool,
-    /// The relative paths that the cause depends on, each as the cause of its kind (a
+    /// The relative paths that the copy writes as they are, each as the cause of its kind (a
     /// [`Cause::Type`], [`Cause::Trait`], [`Cause::Expr`] or [`Cause::Macro`] that is a path) and
-    /// without its arguments: `Vec<Rel<'_>>` has the types `Vec` and `Rel`. A path of unknown kind
-    /// (in a `use`, in the tokens of a macro) is a [`Cause::Unreadable`]. A rule drops the error if
-    /// it accepts all of them.
+    /// without its arguments: `MyType` in `MyType<'_, Rel>`. What is inside the arguments is
+    /// analyzed on its own, so it has its own errors and entries. There are several where one cause
+    /// holds several paths (`dyn A + B`). A rule drops the error if it accepts all of them.
     pub paths: Vec<Cause>,
-    /// What is wrong inside the part if its [`paths`](ErrorItem::paths) are allowed. They take the
-    /// place of this error when [`LeakerResult::allow()`](crate::LeakerResult::allow) drops it.
-    pub nested: Vec<ErrorItem>,
 }
 
 impl ErrorItem {
@@ -587,7 +584,6 @@ impl Parse for ErrorItem {
             None
         };
         let (mut in_value, mut in_default, mut paths) = (false, false, Vec::new());
-        let mut nested = Vec::new();
         while !item.is_empty() {
             let word = item.call(Ident::parse_any)?;
             match word.to_string().as_str() {
@@ -614,16 +610,6 @@ impl Parse for ErrorItem {
                         }
                     }
                 }
-                "nested" => {
-                    let list;
-                    bracketed!(list in item);
-                    while !list.is_empty() {
-                        nested.push(list.parse()?);
-                        if !list.is_empty() {
-                            list.parse::<Token![,]>()?;
-                        }
-                    }
-                }
                 _ => {
                     return Err(syn::Error::new(
                         word.span(),
@@ -641,7 +627,6 @@ impl Parse for ErrorItem {
             in_value,
             in_default,
             paths,
-            nested,
         })
     }
 }
@@ -677,12 +662,8 @@ impl ToTokens for ErrorItem {
                 .collect();
             quote!(paths [#(for path in &paths), { #path }])
         });
-        let nested = (!self.nested.is_empty()).then(|| {
-            let nested = &self.nested;
-            quote!(nested [#(for item in nested), { #item }])
-        });
         tokens.extend(quote!({
-            #kind (#cause) #reason #message [#(for note in &notes), { #note }] #help #value #default #paths #nested
+            #kind (#cause) #reason #message [#(for note in &notes), { #note }] #help #value #default #paths
         }));
     }
 }
@@ -705,7 +686,6 @@ pub(crate) fn self_without_meaning(mention: &SelfMention) -> ErrorItem {
         in_value: mention.place.in_value,
         in_default: mention.place.in_default,
         paths: Vec::new(),
-        nested: Vec::new(),
     }
 }
 
@@ -766,7 +746,6 @@ pub(crate) fn report(conflict: &CheckResult) -> Option<ErrorItem> {
         in_value: conflict.place.in_value,
         in_default: conflict.place.in_default,
         paths: conflict.paths.clone(),
-        nested: conflict.nested.clone(),
     })
 }
 

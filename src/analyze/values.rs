@@ -34,9 +34,9 @@
 
 use super::{self_segment, AnalyzeVisitor};
 use crate::allow::{Allow, Place};
-use crate::analysis::{CheckResult, Effect, Part};
+use crate::analysis::{CheckResult, Effect};
 use crate::error::{Cause, Reason};
-use crate::util::{ident_name, is_primitive_name, tidy, token_names, Kinded, PathFinder, PathOf};
+use crate::util::{ident_name, is_primitive_name, tidy, token_names, PathOf};
 use proc_macro2::TokenStream;
 use std::collections::HashSet;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -246,42 +246,22 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
     }
 
     /// Rejects the relative path `cause`, with `help` for what to write if it has to say more than
-    /// the absolute path.
+    /// the absolute path. The copy writes the path as it is.
     fn relative(&mut self, cause: Cause, help: Option<String>) {
         let of = PathOf::of_entry(&cause);
-        self.relative_part(cause, of, help, None)
+        self.relative_of(cause, of, help)
     }
 
-    /// Rejects the relative path `path` of a value, copied as written with the types in its
-    /// arguments (see [`Part`]), whose relative paths are paths of the error too.
+    /// Rejects the relative path `path` of a value, copied as written: the types in its arguments
+    /// are analyzed as usual.
     fn relative_path(&mut self, path: &Path) {
-        let cause = Cause::expr_path(path);
-        let part = self.visitor.node_part(cause.clone(), path, PathOf::Value);
-        let of = PathOf::of_entry(&cause);
-        self.relative_part(cause, of, None, Some(part));
-        // What is wrong in the arguments of the path if it were allowed, with the paths in them: they
-        // are written as they are with it, and the walk reads them again.
-        if let Some(mut conflict) = self.visitor.pop_error() {
-            if let Some(probe) = self.visitor.begin_probe(&conflict) {
-                self.visit_path(path);
-                conflict.nested = self.visitor.end_probe(probe);
-            }
-            self.visitor
-                .frame
-                .effects
-                .push(Effect::Error(Box::new(conflict)));
-        }
+        self.relative_of(Cause::expr_path(path), PathOf::Value, None);
+        syn::visit::visit_path(self, path);
     }
 
-    /// Like `relative()`, for a node that the Referrer leaves as written: `part`. `of`: what the
-    /// path of `cause` is the path of, for [`ErrorItem::paths`](crate::ErrorItem::paths).
-    fn relative_part(
-        &mut self,
-        cause: Cause,
-        of: PathOf,
-        help: Option<String>,
-        part: Option<Part>,
-    ) {
+    /// Like `relative()`. `of`: what the path of `cause` is the path of, for
+    /// [`ErrorItem::paths`](crate::ErrorItem::paths).
+    fn relative_of(&mut self, cause: Cause, of: PathOf, help: Option<String>) {
         // The error names a macro in its own way, with its `!`, whereas the path of a macro in a
         // type is shown by its path alone.
         let headline = match &cause {
@@ -296,20 +276,11 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
             ));
         }
         // The path is relative: the walk knows no generic, no `Self` and no name of the value by it.
-        // It is copied as written with its arguments, so the relative paths in them are written too.
-        let paths = match cause.path() {
-            Some(path) => {
-                // A path that starts with `Self` is no relative path (no rule is asked about it).
-                let mut paths = Vec::new();
-                Kinded(ArgumentPaths {
-                    walk: self,
-                    found: &mut paths,
-                })
-                .path_of(path, of);
-                paths
-            }
-            None => Vec::new(),
-        };
+        let paths: Vec<Cause> = cause
+            .path()
+            .map(|path| of.entry(path))
+            .into_iter()
+            .collect();
         self.error(CheckResult {
             must: vec![cause.clone()],
             impossible: vec![cause],
@@ -321,10 +292,9 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
             cause: None,
             reason: Reason::RelativePath,
             seen: 0,
-            part,
+            part: None,
             place: Place::default(),
             paths,
-            nested: Vec::new(),
         });
     }
 
@@ -343,7 +313,6 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
             part: None,
             place: Place::default(),
             paths: Vec::new(),
-            nested: Vec::new(),
             must: vec![Cause::Unreadable(tokens.clone())],
             impossible: vec![Cause::Unreadable(tokens)],
             is_own: true,
@@ -455,12 +424,11 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
                 leading_colon: path.leading_colon,
                 segments: path.segments.iter().take(position).cloned().collect(),
             };
-            if self.is_known(&trait_path, PathOf::Trait) {
-                for seg in path.segments.iter().take(position) {
-                    self.visit_path_arguments(&seg.arguments);
-                }
-            } else {
+            if !self.is_known(&trait_path, PathOf::Trait) {
                 self.relative(Cause::Trait(trait_path), None);
+            }
+            for seg in path.segments.iter().take(position) {
+                self.visit_path_arguments(&seg.arguments);
             }
         }
         for seg in path.segments.iter().skip(position) {
@@ -488,7 +456,7 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
             && !self.visitor.is_context_free(&path, PathOf::Unknown)
         {
             // What the root names (a crate, a module, a type, a trait) is not known.
-            self.relative_part(Cause::expr_path(&path), PathOf::Unknown, None, None);
+            self.relative_of(Cause::expr_path(&path), PathOf::Unknown, None);
         }
     }
 
@@ -498,7 +466,7 @@ impl<'a, A: Allow> ValueWalk<'a, A> {
         let path = &mac.path;
         if !self.is_known(path, PathOf::Macro) {
             let help = macro_help(path);
-            return self.relative(Cause::Macro(path.clone()), Some(help));
+            self.relative(Cause::Macro(path.clone()), Some(help));
         }
         self.reads += 1;
         self.macro_arguments_of(mac);
@@ -772,25 +740,6 @@ impl<'ast, A: Allow> Visit<'ast> for ValueWalk<'_, A> {
             walk.visit_pat(&i.pat);
             walk.visit_block(&i.body);
         })
-    }
-}
-
-/// Collects the relative paths in a path of a value and in its arguments, without their arguments,
-/// each once: those that mean something else wherever they are written, and that the value does
-/// not declare ([`CheckResult::paths`]). `found` has the path itself.
-struct ArgumentPaths<'w, 'a, A> {
-    walk: &'w ValueWalk<'a, A>,
-    found: &'w mut Vec<Cause>,
-}
-
-impl<A: Allow> PathFinder for ArgumentPaths<'_, '_, A> {
-    fn path(&mut self, path: &Path, of: PathOf) {
-        if self.walk.visitor.is_relative_path(path, of) && !self.walk.is_local(path) {
-            let entry = of.entry(path);
-            if !self.found.contains(&entry) {
-                self.found.push(entry);
-            }
-        }
     }
 }
 

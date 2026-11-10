@@ -3489,19 +3489,42 @@ fn f19_impl_self_in_bound_of_entry_in_predicate() {
                 if referrer.iter().any(|entry| type_contains(self_ty, &string(entry)))
         )
     };
-    // Each is rejected: no copy of it exists whose predicate names such an entry.
+    // Each is rejected: no copy of it exists whose predicate names such an entry. The type is copied
+    // as written whole, and a type in it that conflicts for the same reason has an error of its own
+    // after it (`Rel2<X>` in `Rel<Rel2<X>>`).
     let blamed = [
-        ("Rel < X >", "X : Fn (Self) -> u8", Blames::SelfType),
+        ("Rel < X >", "X : Fn (Self) -> u8", Blames::SelfType, vec![]),
         (
             "Rel < Rel2 < X > >",
             "X : for < 'h > Fn (& 'h Self) -> & 'h Result < Self , f64 >",
             Blames::SelfType,
+            vec!["Rel2<X>"],
         ),
-        ("Rel < X >", "X : Fn (& Self) -> u8", Blames::SelfType),
+        (
+            "Rel < X >",
+            "X : Fn (& Self) -> u8",
+            Blames::SelfType,
+            vec![],
+        ),
     ];
     assert_eq!(items.len(), blamed.len());
-    for (item, (ty, bound, blames)) in items.iter().zip(blamed) {
-        assert_unstable(item, f19_copy(item), ty, bound, blames);
+    for (item, (ty, bound, blames, inside)) in items.iter().zip(blamed) {
+        let result = f19_copy(item).map_err(|mut errors| {
+            let rest = errors.split_off(1);
+            let expected: Vec<String> = inside
+                .iter()
+                .map(|ty| {
+                    format!(
+                        "`{}` is in a bound or where predicate, and a bound of its generics names \
+                         `Self`, which is a leaked type",
+                        ty
+                    )
+                })
+                .collect();
+            assert_eq!(joined_messages(&rest), expected.join("\n"));
+            errors
+        });
+        assert_unstable(item, result, ty, bound, blames);
     }
     for item in &controls {
         let (referrer, copy) = f19_copy(item).unwrap_or_else(|e| {
@@ -11467,20 +11490,22 @@ fn f43_copy(
 }
 
 /// F43 (fixed): the Leaker copies as written a type whose context cannot be written
-/// ([`Reason::UnnameableSelf`]), and the Referrer did not know it, so the visitor replaced the
-/// types inside it.
+/// ([`Reason::UnnameableSelf`]), and the Referrer did not know it, so the visitor looked it up as
+/// an entry of the same tokens. (Until flat recovery nothing in the type was leaked, and the visitor
+/// replaced the entries inside it. Now only its own path is written as it is, the types in it are
+/// analyzed and replaced as any entry is.)
 ///
 /// Trigger: a scope that declares a `Self` (`enter_trait(Tr<T: AsRef<Self>>)`) and an item nested in
 /// it that has a `Self` of its own (`view.visit_item(impl ::p::W for X { fn f(&self, x: Rel<T,
 /// Other>) {} .. })`). The bound of `T` names the `Self` of the trait, which has no name in the
-/// impl, so `Rel<T, Other>` has no context: it is a conflict, copied as written, whole. The part
-/// was recorded only if its context could be written (`AnalyzeVisitor::node_part()` and the
-/// conflicts of `decide()` dropped it), so it was left out. The comment of `decide()` said that
-/// such a type "is found nowhere", which is false: the visitor finds it by its tokens, and
-/// replaced the entries inside it that are entries elsewhere (`Other` of `g`). That breaks the
-/// copy where the entry is position-sensitive: `::p::W<'a, T, dyn RelTr>` has `dyn RelTr + 'a`
-/// (the default of the trait object comes from the path around it), and the entry `dyn RelTr` of
-/// `Bare<dyn RelTr>` is `+ 'static` (E0308 "lifetime mismatch" in the Referrer's crate).
+/// impl, so `Rel<T, Other>` has no context: it is a conflict, copied as written. The part was
+/// recorded only if its context could be written (the conflicts of `decide()` dropped it), so it
+/// was left out. The comment of `decide()` said that such a type "is found nowhere", which is
+/// false: the visitor finds it by its tokens, and replaced the entries inside it that are entries
+/// elsewhere (`Other` of `g`). That breaks the copy where the type holds one that is
+/// position-sensitive: `::p::W<'a, T, dyn RelTr>` has `dyn RelTr + 'a` (the default of the trait
+/// object comes from the path around it), and the entry `dyn RelTr` of `Bare<dyn RelTr>` is `+
+/// 'static` (E0308 "lifetime mismatch" in the Referrer's crate): that part is whole.
 ///
 /// The fix: the part has no context (`PartItem::context` is `None`, serialized as `unwritable`
 /// where the number of the context would be, before `predicate` and `in (..)`), and the visitor
@@ -11507,15 +11532,16 @@ fn f43_a_type_whose_context_cannot_be_written_is_copied_as_written() {
     );
     assert_eq!(result.errors()[0].reason, Reason::UnnameableSelf);
     let referrer = result.into_referrer();
-    assert_eq!(parts_of(&referrer), ["type (Rel < T , Other >) unwritable"]);
+    // Not whole, and no entry has its tokens and context: no part.
+    assert!(parts_of(&referrer).is_empty());
     let (other, outer) = (
         entry(&referrer, "Other"),
         entry(&referrer, "Rel < T , Other >"),
     );
-    // The part is left as written; `Other` is an entry in `g`, and `Rel<T, Other>` of the trait
-    // (a context that can be written) is one as ever.
+    // The part is left as written, and `Other` in it is an entry as in `g`; `Rel<T, Other>` of the
+    // trait (a context that can be written) is one as ever.
     let expected = format!(
-        "trait Tr < T : AsRef < Self > > {{ fn direct (& self , x0 : P < {outer}usize >) ; fn nested () {{ impl :: p :: W for P < {x}usize > {{ fn f (& self , x : Rel < T , Other >) {{ }} fn g (& self , y : P < {other}usize >) {{ }} }} }} }}",
+        "trait Tr < T : AsRef < Self > > {{ fn direct (& self , x0 : P < {outer}usize >) ; fn nested () {{ impl :: p :: W for P < {x}usize > {{ fn f (& self , x : Rel < T , P < {other}usize > >) {{ }} fn g (& self , y : P < {other}usize >) {{ }} }} }} }}",
         outer = outer,
         other = other,
         x = entry(&referrer, "X"),
@@ -11524,18 +11550,8 @@ fn f43_a_type_whose_context_cannot_be_written_is_copied_as_written() {
         f43_copy(&referrer, context, &direct, &nested, false),
         expected
     );
-    // The top-level context has the `Self` of the scope: that is how the visitor can tell that
-    // the context of the nested type has none.
+    // The top-level context has the `Self` of the scope (an entry of the trait names it).
     assert!(referrer.context_self(context).is_some());
-    // Without the part, the visitor replaced `Other` inside it.
-    let before = without_parts(&referrer);
-    assert_eq!(
-        f43_copy(&before, context, &direct, &nested, false),
-        expected.replace(
-            "x : Rel < T , Other >",
-            &format!("x : Rel < T , P < {}usize > >", other)
-        )
-    );
     // It is written and read back.
     let again: Referrer = parse2(quote!(#referrer)).unwrap();
     assert_eq!(again, referrer);
@@ -11559,7 +11575,7 @@ fn f43_the_entry_inside_the_part_is_not_replaced() {
     let referrer = result.clone().into_referrer();
     assert_eq!(
         parts_of(&referrer),
-        ["type (:: p :: W < 'a , T , dyn RelTr >) unwritable"]
+        ["type (:: p :: W < 'a , T , dyn RelTr >) unwritable whole"]
     );
     let (object, x) = (entry(&referrer, "dyn RelTr"), entry(&referrer, "X"));
     let bare = entry(&referrer, ":: p :: Bare < dyn RelTr >");
@@ -11588,9 +11604,11 @@ fn f43_the_entry_inside_the_part_is_not_replaced() {
 
 /// F43: the same for a bound whose trait path conflicts (`Rel<T, Other>` in `U: RelTrait<T,
 /// Other>`, a node that is no type) and for the path of a value (`inner::make::<T, Other>()`, with
-/// `check_values`): their contexts cannot be written either.
+/// `check_values`): their contexts cannot be written either. The bound is a part, whole; the path
+/// of a value is no part: it is written as it is, and the types in the arguments are analyzed and
+/// replaced as any entry is.
 #[test]
-fn f43_a_bound_and_a_value_whose_context_cannot_be_written_are_copied_as_written() {
+fn f43_a_bound_and_a_value_whose_context_cannot_be_written_are_written_as_they_are() {
     let nested: Item = parse_quote!(
         impl<U: RelTrait<T, Other>> ::p::W for ::p::Host {
             fn f(&self, y: Other) -> usize {
@@ -11607,32 +11625,14 @@ fn f43_a_bound_and_a_value_whose_context_cannot_be_written_are_copied_as_written
     let referrer = result.into_referrer();
     assert_eq!(
         parts_of(&referrer),
-        [
-            "trait (RelTrait < T , Other >) unwritable predicate",
-            "expr (inner :: make :: < T , Other >) unwritable"
-        ]
+        ["trait (RelTrait < T , Other >) unwritable whole predicate"]
     );
     let other = entry(&referrer, "Other");
     let expected = format!(
-        "trait Tr < T : AsRef < Self > > {{ fn direct (& self ,) ; fn nested () {{ impl < U : RelTrait < T , Other > > :: p :: W for :: p :: Host {{ fn f (& self , y : P < {}usize >) -> usize {{ inner :: make :: < T , Other > () }} }} }} }}",
-        other
+        "trait Tr < T : AsRef < Self > > {{ fn direct (& self ,) ; fn nested () {{ impl < U : RelTrait < T , Other > > :: p :: W for :: p :: Host {{ fn f (& self , y : P < {other}usize >) -> usize {{ inner :: make :: < T , P < {other}usize > > () }} }} }} }}",
+        other = other
     );
     assert_eq!(f43_copy(&referrer, context, &[], &nested, false), expected);
-    // Without the parts the bound and the path were rewritten.
-    let before = f43_copy(&without_parts(&referrer), context, &[], &nested, false);
-    let entry = format!("P < {}usize >", other);
-    assert_eq!(
-        before,
-        expected
-            .replace(
-                "RelTrait < T , Other >",
-                &format!("RelTrait < T , {} >", entry)
-            )
-            .replace(
-                "make :: < T , Other >",
-                &format!("make :: < T , {} >", entry)
-            )
-    );
 }
 
 /// F43: the serialized part. `unwritable` stands where the number of the context would be, before
@@ -11647,6 +11647,7 @@ fn f43_an_unwritable_part_is_serialized_and_read_back() {
     for parts in [
         "type (R<T>) unwritable",
         "trait (RelTr<T>) unwritable predicate",
+        "type (R<T>) unwritable whole in (Wrap<R<T>>) 1",
         "type (R<T>) unwritable in (Wrap<R<T>>) 1",
         "type (R<T>) unwritable predicate in (Wrap<R<T>>) 0",
         "expr (f::<T>) unwritable, type (R) 1, type (R<T>) 0 predicate",
@@ -11669,7 +11670,7 @@ fn f43_an_unwritable_part_is_serialized_and_read_back() {
         ("type (R) nothing", "expected a context or `unwritable`"),
         (
             "type (R) unwritable nope",
-            "expected `sig`, `predicate`, `in` or `,`",
+            "expected `whole`, `sig`, `predicate`, `in` or `,`",
         ),
         ("type (R) unwritable in (&R)", "expected integer literal"),
         (
@@ -11678,7 +11679,7 @@ fn f43_an_unwritable_part_is_serialized_and_read_back() {
         ),
         (
             "type (R) unwritable unwritable",
-            "expected `sig`, `predicate`, `in` or `,`",
+            "expected `whole`, `sig`, `predicate`, `in` or `,`",
         ),
     ] {
         let error = read(parts)
@@ -11736,7 +11737,7 @@ fn f44_copies(referrer: &Referrer, context: ContextId, item: &ItemTrait) -> [Str
 #[test]
 fn f44_a_part_that_names_self_is_found_when_no_entry_does() {
     // DeniedSelfInBounds, SelfInTraitPredicate; the entry beside is `Other`, in `g`.
-    let items: [(ItemTrait, bool, &str, Reason, &str); 2] = [
+    let items: [(ItemTrait, bool, Option<&str>, Reason, &str); 2] = [
         (
             parse_quote!(
                 trait Tr {
@@ -11745,9 +11746,10 @@ fn f44_a_part_that_names_self_is_found_when_no_entry_does() {
                 }
             ),
             false,
-            "type (Wrap < T , Other >)",
+            // Not whole: no part, as no entry has its tokens and context.
+            None,
             Reason::DeniedSelfInBounds,
-            "trait Tr { fn f < T : :: core :: cmp :: PartialEq < SELF > > (& self , x : Wrap < T , Other >) ; fn g (& self , y : P < 0usize >) ; }",
+            "trait Tr { fn f < T : :: core :: cmp :: PartialEq < SELF > > (& self , x : Wrap < T , P < 0usize > >) ; fn g (& self , y : P < 0usize >) ; }",
         ),
         (
             parse_quote!(
@@ -11759,7 +11761,8 @@ fn f44_a_part_that_names_self_is_found_when_no_entry_does() {
                 }
             ),
             true,
-            "type (Rel < Self , Other >)",
+            // In a predicate: whole.
+            Some("type (Rel < Self , Other >)"),
             Reason::SelfInTraitPredicate,
             "trait Tr where Rel < SELF , Other > : Sized , { fn g (& self , y : P < 0usize >) ; }",
         ),
@@ -11772,19 +11775,22 @@ fn f44_a_part_that_names_self_is_found_when_no_entry_does() {
         assert_eq!(result.errors().len(), 1, "{}", what);
         assert_eq!(result.errors()[0].reason, *reason, "{}", what);
         let referrer = result.into_referrer();
-        // The top-level context has the `Self` of the trait.
-        assert!(
-            matches!(
-                referrer.context_self(context),
-                Some(SelfRequirement::Bound(_))
-            ),
-            "{}",
-            what
-        );
         let parts = parts_of(&referrer);
-        assert_eq!(parts.len(), 1, "{}", what);
-        assert!(parts[0].starts_with(part), "{}: {}", what, parts[0]);
-        // The part is as written, with `Self` or the host; the entry beside it is replaced.
+        assert_eq!(parts.len(), part.iter().count(), "{}", what);
+        if let Some(part) = part {
+            // The top-level context has the `Self` of the trait, which the visitor needs to find it.
+            assert!(
+                matches!(
+                    referrer.context_self(context),
+                    Some(SelfRequirement::Bound(_))
+                ),
+                "{}",
+                what
+            );
+            assert!(parts[0].starts_with(part), "{}: {}", what, parts[0]);
+        }
+        // The part is as written, with `Self` or the host; the entries beside it and in it are
+        // replaced (but for the part of a predicate, which is whole: the second item).
         let [plain, hosted] = f44_copies(&referrer, context, item);
         assert_eq!(plain, expected.replace("SELF", "Self"), "{}", what);
         assert_eq!(hosted, expected.replace("SELF", "Host"), "{}", what);
@@ -11819,13 +11825,15 @@ fn f44_the_self_type_of_an_impl_is_found_when_no_entry_names_self() {
         referrer.context_self(context),
         Some(SelfRequirement::Type(_))
     ));
-    assert_eq!(parts_of(&referrer).len(), 2);
+    // The self type is no part (not whole); the `Self` of the bound, in a predicate, is whole.
+    assert_eq!(parts_of(&referrer).len(), 1);
     let mut copy = item.clone();
     referrer
         .visitor(context, |_, ix| parse_quote!(P<#ix>))
         .visit_item_impl_mut(&mut copy);
+    // The self type is as written but for `Other`, which is an entry in it as in the method.
     let expected: ItemImpl = parse_quote!(
-        impl<T> S<T, Other>
+        impl<T> S<T, P<0usize>>
         where
             T: AsRef<Option<Self>>,
         {
@@ -11856,7 +11864,7 @@ fn f44_the_self_type_of_an_impl_is_found_when_no_entry_names_self() {
 /// The cross-crate fixture is 9198 (`tests/cross_crate.rs`).
 #[test]
 fn f45_a_part_in_a_nested_item_is_left_without_with_nested_self() {
-    let items: Vec<(Item, &str, &str)> = vec![
+    let items: Vec<(Item, &str, &str, usize)> = vec![
         (
             parse_quote!(
                 pub struct S<T: ::core::convert::AsRef<Self>> {
@@ -11865,7 +11873,8 @@ fn f45_a_part_in_a_nested_item_is_left_without_with_nested_self() {
                 }
             ),
             "S",
-            "pub struct S < T : :: core :: convert :: AsRef < Self > > { pub a : Rel2 < Self , T , Other > , pub b : P < 0usize > , }",
+            "pub struct S < T : :: core :: convert :: AsRef < Self > > { pub a : Rel2 < Self , T , P < 0usize > > , pub b : P < 0usize > , }",
+            0,
         ),
         (
             parse_quote!(
@@ -11878,6 +11887,7 @@ fn f45_a_part_in_a_nested_item_is_left_without_with_nested_self() {
             ),
             "Tr",
             "pub trait Tr where Rel < Self , Other > : Sized , { fn g (& self , y : P < 0usize >) ; }",
+            1,
         ),
         // The same for a bound whose trait path conflicts, which is a node and no type.
         (
@@ -11889,9 +11899,10 @@ fn f45_a_part_in_a_nested_item_is_left_without_with_nested_self() {
             ),
             "Tr",
             "pub trait Tr < T : :: core :: convert :: AsRef < Self > > { fn m < U : RelTrait < T , Other > > (& self , u : U) ; fn g (& self , y : P < 0usize >) ; }",
+            1,
         ),
     ];
-    for (item, name, expected) in &items {
+    for (item, name, expected, parts) in &items {
         for nest in NESTS {
             for nested in [false, true] {
                 let what = format!("{:?} `{}`, with_nested_self {}", nest, string(item), nested);
@@ -11900,7 +11911,7 @@ fn f45_a_part_in_a_nested_item_is_left_without_with_nested_self() {
                 assert_eq!(string(&copy), *expected, "{}", what);
                 // The part is no entry, so the closure of `with_nested_self()` is not called.
                 assert!(calls.is_empty(), "{}: {:?}", what, calls);
-                assert_eq!(parts_of(&referrer).len(), 1, "{}", what);
+                assert_eq!(parts_of(&referrer).len(), *parts, "{}", what);
             }
         }
     }
@@ -12360,7 +12371,15 @@ fn f48_a_mark_is_serialized_and_read_back() {
         ("type (R) 0 predicate sig ('x)", "expected `,`"),
         (
             "type (R) 0 nope",
+            "expected `whole`, `sig`, `predicate`, `in` or `,`",
+        ),
+        (
+            "type (R) 0 whole nope",
             "expected `sig`, `predicate`, `in` or `,`",
+        ),
+        (
+            "type (R) 0 sig ('x) whole",
+            "expected `predicate`, `in` or `,`",
         ),
     ] {
         let error = read(parts)
@@ -12557,40 +12576,38 @@ fn f50_paths(result: &LeakerResult, at: usize) -> Vec<String> {
     result.errors()[at].paths.iter().map(string).collect()
 }
 
-/// F50 (fixed): the paths of the error of a path of a value left out the relative types in its
-/// arguments.
+/// F50 (fixed): a path rule after the analysis dropped the error of a path of a value and left the
+/// relative types in its arguments written as they are.
 ///
 /// Trigger: `core::mem::size_of::<*const Rel>()` in a default method, with `check_values`.
-/// Cause: the error of a relative path of a value (`ValueWalk::relative_part()`) had its own path
-/// alone (`core::mem::size_of`), where the error of a type or a bound has all the relative paths in
-/// it. The whole path is copied as written, `Rel` too, but a path rule after the analysis
-/// (`Rules::std_crates()`) dropped the error: `Rel` stayed relative in a copy that no crate can
-/// resolve, whereas the config that allows the crates leaks it (the entry `Rel`). The same for
-/// `Vec::<Rel>::new()` with `Rules::prelude()` and `crate::base::bg::<*const R0>()` with
-/// `Rules::crate_paths()`.
+/// Cause: the whole path was copied as written, `Rel` too, and the error had its own path alone
+/// (`core::mem::size_of`), so a path rule after the analysis (`Rules::std_crates()`) dropped it:
+/// `Rel` stayed relative in a copy that no crate can resolve, whereas the config that allows the
+/// crates leaks it (the entry `Rel`). The same for `Vec::<Rel>::new()` with `Rules::prelude()` and
+/// `crate::base::bg::<*const R0>()` with `Rules::crate_paths()`.
 ///
-/// Fix: the paths of the error have the relative paths of the arguments, at any depth (not a
-/// generic, `Self`, or a name the value declares). The probe for the nested errors allows them
-/// with the path, so the arguments are nothing wrong inside it (`tests/nested_errors.rs`).
+/// Fix (first the paths of the error had the relative paths of the arguments, so the rule left the
+/// error until they were allowed too): only the path of the value is written as it is, and the
+/// types in its arguments are analyzed and leaked as in any type position of a value, so the rule
+/// drops the error and the result and the config agree (`tests/flat_errors.rs`).
 ///
 /// The cross-crate fixture is 9205 (`stages = true`: the copy after the rule is made in a crate that
 /// does not name `Rel` only if the rule left no error), checked in `tests/cross_crate.rs`.
 #[test]
-fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_error() {
+fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_leaked() {
     // The value, the rule (`std`, `crate` or `prelude`) given to the result and to the config, the
-    // paths of the error, the paths the rule leaves, and the entries of the config that has the rule.
+    // paths of the error, and the entries of the config that has the rule, which are those of the
+    // result.
     struct Case {
         item: ItemTrait,
         rule: &'static str,
         paths: &'static [&'static str],
-        left: &'static [&'static str],
         entries: &'static [&'static str],
     }
-    let case = |item, rule, paths, left, entries| Case {
+    let case = |item, rule, paths, _left: &[&str], entries| Case {
         item,
         rule,
         paths,
-        left,
         entries,
     };
     let cases = vec![
@@ -12603,8 +12620,8 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_erro
                 }
             ),
             "std",
-            &["core :: mem :: size_of", "Rel"],
-            &["Rel"],
+            &["core :: mem :: size_of"],
+            &[],
             &["Rel"],
         ),
         case(
@@ -12616,11 +12633,11 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_erro
                 }
             ),
             "crate",
-            &["crate :: base :: bg", "R0"],
-            &["R0"],
+            &["crate :: base :: bg"],
+            &[],
             &["R0"],
         ),
-        // Deeper: the paths of the arguments of the arguments.
+        // Deeper: the arguments of the arguments.
         case(
             parse_quote!(
                 trait Tr {
@@ -12630,8 +12647,8 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_erro
                 }
             ),
             "prelude",
-            &["Vec :: new", "Option", "Rel"],
-            &["Rel"],
+            &["Vec :: new"],
+            &[],
             &["Option < Rel >"],
         ),
         // The default of an associated const.
@@ -12642,8 +12659,8 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_erro
                 }
             ),
             "std",
-            &["core :: mem :: size_of", "Rel"],
-            &["Rel"],
+            &["core :: mem :: size_of"],
+            &[],
             &["Rel"],
         ),
         // The trait of a qualified path.
@@ -12656,8 +12673,8 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_erro
                 }
             ),
             "std",
-            &["core :: convert :: From", "Rel"],
-            &["Rel"],
+            &["core :: convert :: From"],
+            &[],
             &["Rel"],
         ),
     ];
@@ -12665,7 +12682,6 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_erro
         item,
         rule,
         paths,
-        left,
         entries,
     } in cases
     {
@@ -12673,27 +12689,21 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_paths_of_its_erro
         let result = f50_analyze(&item, None);
         assert_eq!(result.errors().len(), 1, "{}", what);
         assert_eq!(f50_paths(&result, 0), paths, "{}", what);
-        // The rule leaves the error, with the paths it does not allow.
+        // The result has the entries of the config already: the arguments are leaked, not written as
+        // they are.
+        let found: Vec<String> = result.clone().into_referrer().iter().map(string).collect();
+        assert_eq!(found, entries, "{}", what);
+        // The rule drops the error, as the config that has it has none.
         let after = result.clone();
         let after = match rule {
             "std" => after.allow(Rules::new().std_crates()),
             "crate" => after.allow(Rules::new().crate_paths()),
             _ => after.allow(Rules::new().prelude()),
         };
-        assert_eq!(after.errors().len(), 1, "{}", what);
-        assert_eq!(f50_paths(&after, 0), left, "{}", what);
-        // The config that has the rule leaks the types in the arguments: no error, and the entries.
+        assert!(after.errors().is_empty(), "{}", what);
         let config = f50_analyze(&item, Some(rule));
         assert!(config.errors().is_empty(), "{}", what);
-        let referrer = config.into_referrer();
-        let found: Vec<String> = referrer.iter().map(string).collect();
-        assert_eq!(found, entries, "{}", what);
-        // Allowing them too drops the error, and nothing is left inside the part.
-        let mut all = after.clone();
-        for path in left {
-            all = all.allow(starts_with(syn::parse_str(path).unwrap()));
-        }
-        assert!(all.errors().is_empty(), "{}", what);
+        assert_eq!(config.into_referrer(), after.into_referrer(), "{}", what);
     }
 
     // Not paths of the error: a generic, and what the value declares.
@@ -13326,10 +13336,12 @@ fn f56_a_discriminant_and_the_default_of_a_const_parameter_are_read_like_a_value
         ),
         ("enum E { B = 1 as Rel }", &[], &["Rel"]),
         ("enum E { B = <Rel as ::p::Tr>::N }", &[], &["Rel"]),
+        // The path is written as it is, and the type in its arguments is leaked, as it is of an
+        // absolute path (the next case).
         (
             "enum E { B = rel_fn::<Rel2>() }",
             &["rel_fn :: < Rel2 >"],
-            &[],
+            &["Rel2"],
         ),
         ("enum E { B = ::p::f::<Rel2>() }", &[], &["Rel2"]),
         (

@@ -1224,14 +1224,11 @@ fn allowing_the_causes_of_the_errors_of_each_reason_accepts_the_item() {
         let items = errors(trigger);
         reasons.extend(items.iter().map(|item| item.reason));
         let causes: Vec<Cause> = items.iter().map(|item| item.cause.clone()).collect();
-        // What a dropped error has nested comes up, and its cause is allowed in turn.
         let (result, _) = allow_every_cause(allowing_causes(trigger, &causes));
         if !result.errors().is_empty() {
             panic!("{}: {:?} are left", name, messages(result.errors()));
         }
-        // Each cause is needed: without it, its errors, and only they, are reported. (No error of a
-        // trigger has nested errors, which would come up in place of an error that is dropped.)
-        assert!(items.iter().all(|item| item.nested.is_empty()), "{}", name);
+        // Each cause is needed: without it, its errors, and only they, are reported.
         for cause in &causes {
             let others: Vec<Cause> = causes.iter().filter(|c| *c != cause).cloned().collect();
             let result = allowing_causes(trigger, &others);

@@ -74,7 +74,9 @@ pub struct Referrer {
     pub(crate) modules: BTreeMap<ContextId, ModuleInfo>,
     /// Keyed by tokens as in the Leaker, so a type in an invisible group is found too.
     pub(crate) map: HashMap<TypeKey, Vec<usize>>,
-    /// The parts copied as written, which the visitor leaves so. Serialized after the format tag.
+    /// The types copied as written that a position tells from an entry of the same tokens and
+    /// context: a part is whole (nothing in it is looked up), or has an anchor or a signature
+    /// mark. Serialized after the format tag.
     pub(crate) parts: Vec<PartItem>,
     /// The indices in `parts`, by the part.
     pub(crate) part_map: HashMap<Cause, Vec<usize>>,
@@ -300,11 +302,11 @@ impl Referrer {
         }
     }
 
-    /// Returns `true` if `cause`, which `ty` stands for, is a part: a part has the same tokens, is
-    /// in a predicate as `at` says, and has the context that `ty` has in `scopes` (none, if `ty`
-    /// has none there). A part with an anchor counts only if its anchor is one of the `active` ones
-    /// ([`Referrer::anchors()`]).
-    fn is_part(
+    /// Returns what the part is that `ty` is, if it is one: whether it is copied whole (see
+    /// [`PartItem::whole`]). A part has the same tokens, is in a predicate as `at` says, and has the
+    /// context that `ty` has in `scopes` (none, if `ty` has none there). A part with an anchor counts
+    /// only if its anchor is one of the `active` ones ([`Referrer::anchors()`]).
+    fn part_of(
         &self,
         cause: &Cause,
         ty: &Type,
@@ -312,20 +314,19 @@ impl Referrer {
         scopes: &[Scope],
         enclosing: &Enclosing,
         active: &[usize],
-    ) -> bool {
-        let items = match self.part_map.get(cause) {
-            Some(items) => items,
-            None => return false,
-        };
-        items.iter().any(|&ix| {
+    ) -> Option<bool> {
+        let items = self.part_map.get(cause)?;
+        let mut found = None;
+        for &ix in items {
             let PartItem {
                 context,
                 in_predicate,
                 within,
                 mark,
+                whole,
                 ..
             } = &self.parts[ix];
-            *in_predicate == at.place.in_predicate
+            let matches = *in_predicate == at.place.in_predicate
                 && (within.is_none() || active.contains(&ix))
                 && match (mark, at.signature) {
                     (None, _) => true,
@@ -339,21 +340,12 @@ impl Referrer {
                 && match context {
                     Some(context) => self.fits(*context, ty, at, scopes, enclosing),
                     None => Self::unwritable(at, ty, scopes, enclosing),
-                }
-        })
-    }
-
-    /// Returns `true` if the type `ty` is a part that the Leaker copied as written.
-    fn is_part_type(
-        &self,
-        ty: &Type,
-        at: Lookup,
-        scopes: &[Scope],
-        enclosing: &Enclosing,
-        active: &[usize],
-    ) -> bool {
-        !self.part_map.is_empty()
-            && self.is_part(&Cause::Type(ty.clone()), ty, at, scopes, enclosing, active)
+                };
+            if matches {
+                found = Some(found.unwrap_or(false) || *whole);
+            }
+        }
+        found
     }
 
     /// Pushes onto `active` the parts whose anchor `ty` is, as an entry would be found: they are
@@ -903,18 +895,24 @@ impl Referrer {
             type_fn: F,
         }
         impl<'a, 'b, F: FnMut(Type, usize) -> Type> Folder<'a, 'b, F> {
-            /// The entry that stands for `ty`, unless `ty` is, or is inside, a part: that is left
-            /// as written.
+            /// The entry that stands for `ty`, unless `ty` is a part, which is left as written, or
+            /// is inside a whole part: nothing in it is looked up.
             fn lookup(&mut self, ty: &Type, enclosing: &Enclosing) -> Option<usize> {
                 if self.at.place.protected {
                     return None;
                 }
-                if self
-                    .referrer
-                    .is_part_type(ty, self.at, self.scopes, enclosing, &self.active)
-                {
-                    self.at.place.protected = true;
-                    return None;
+                if !self.referrer.part_map.is_empty() {
+                    if let Some(whole) = self.referrer.part_of(
+                        &Cause::Type(ty.clone()),
+                        ty,
+                        self.at,
+                        self.scopes,
+                        enclosing,
+                        &self.active,
+                    ) {
+                        self.at.place.protected = whole;
+                        return None;
+                    }
                 }
                 self.referrer.find(self.at, ty, self.scopes, enclosing)
             }
@@ -1005,7 +1003,7 @@ impl Referrer {
     }
 }
 
-/// The path `path` read as a type, which stands for a node that is no type (a bound, a value).
+/// The path `path` read as a type, which stands for a node that is no type (a bound).
 fn path_type(path: &Path) -> Type {
     Type::Path(TypePath {
         qself: None,
@@ -1393,8 +1391,8 @@ where
         }
     }
 
-    /// Returns `true` if `cause`, a node that is no type (a bound whose trait path conflicts, a
-    /// path of a value), is a part. `path` stands for it as a type, to give it its context.
+    /// Returns `true` if `cause`, a bound whose trait path conflicts, is a part: it is no type.
+    /// `path` stands for it as a type, to give it its context.
     fn is_part_node(&self, cause: impl FnOnce() -> Cause, path: &Path) -> bool {
         if self.referrer.part_map.is_empty() || self.place.protected {
             return false;
@@ -1415,14 +1413,16 @@ where
             place: self.place,
             signature: self.signature.as_deref(),
         };
-        self.referrer.is_part(
-            &cause(),
-            &path_type(path),
-            at,
-            &self.scopes,
-            &Enclosing::default(),
-            &[],
-        )
+        self.referrer
+            .part_of(
+                &cause(),
+                &path_type(path),
+                at,
+                &self.scopes,
+                &Enclosing::default(),
+                &[],
+            )
+            .is_some()
     }
 
     /// Runs `visit`, which visits a part that is left as written: no entry is looked up in it.
@@ -1583,13 +1583,6 @@ where
         let outer = std::mem::replace(&mut self.place.in_predicate, true);
         syn::visit_mut::visit_type_param_bound_mut(self, i);
         self.place.in_predicate = outer;
-    }
-    fn visit_path_mut(&mut self, i: &mut Path) {
-        // A path of a value that the Leaker copied as written holds types that are no entries.
-        if self.is_part_node(|| Cause::expr_path(i), i) {
-            return self.protected(|visitor| syn::visit_mut::visit_path_mut(visitor, i));
-        }
-        syn::visit_mut::visit_path_mut(self, i)
     }
     fn visit_receiver_mut(&mut self, i: &mut Receiver) {
         if self.self_ty.is_none() || self.own_self {
@@ -1866,10 +1859,13 @@ impl Referrer {
     // the Referrer finds too. 15: the context of an entry leaves out a bound of a generic that
     // names the generic in the arguments of its path (`T: Fn(Alias<T>)`), if another bound of it
     // fixes an associated type (`T: Iterator<Item = u8>`), which the Referrer computes for a copy,
-    // so the entries of 14 are not found the same way. 16: the Referrer carries the parts that the
-    // Leaker copies as written, after the tag (`[KIND (CAUSE) CONTEXT [sig (MARK)] [predicate]
-    // [in (TYPE) CONTEXT], ..]`, `unwritable` for a context that cannot be written), and the
-    // visitor leaves each as written: no entry is looked up in it. A part that a signature made
+    // so the entries of 14 are not found the same way. 16: the Referrer carries the types that the
+    // Leaker copies as written, after the tag (`[KIND (CAUSE) CONTEXT [whole] [sig (MARK)]
+    // [predicate] [in (TYPE) CONTEXT], ..]`, `unwritable` for a context that cannot be written),
+    // and the visitor does not look each up as an entry; in a `whole` one nothing is looked up.
+    // Only a part that is whole, has an anchor or a mark is carried: a type copied as written whose
+    // head alone conflicts is no part (an entry of its tokens and context would have the same
+    // conflict), and the types in it are replaced as any entry is. A part that a signature made
     // has a mark (`sig ('x)`: the method lifetimes of the type that the output names and no bound
     // does, E0195; `sig (elided)`: the signature relies on elision, E0106) and is left only in the
     // arguments of a signature that has the same fault, which the Referrer computes at each. Also
@@ -2132,8 +2128,8 @@ impl Parse for Referrer {
     }
 }
 
-/// Reads a part written by its [`ToTokens`] implementation: `KIND ( CAUSE ) CONTEXT [sig ( MARK
-/// )] [predicate] [in ( TYPE ) CONTEXT]`, with the `KIND ( CAUSE )` of an
+/// Reads a part written by its [`ToTokens`] implementation: `KIND ( CAUSE ) CONTEXT [whole] [sig (
+/// MARK )] [predicate] [in ( TYPE ) CONTEXT]`, with the `KIND ( CAUSE )` of an
 /// [`ErrorItem`](crate::ErrorItem), `unwritable` for a `CONTEXT` that cannot be written, and a
 /// `MARK` that is `elided` or lifetimes (`'x , 'y`).
 impl Parse for PartItem {
@@ -2155,27 +2151,34 @@ impl Parse for PartItem {
             Some(input.parse()?)
         };
         let mut mark = None;
-        let mut in_predicate = false;
-        if input.peek(Ident) {
-            let mut word: Ident = input.parse()?;
-            if word == "sig" {
-                let content;
-                parenthesized!(content in input);
-                mark = Some(content.parse()?);
-                if input.peek(Ident) {
-                    word = input.parse()?;
-                    if word != "predicate" {
-                        return Err(Error::new(word.span(), "expected `predicate`, `in` or `,`"));
-                    }
-                    in_predicate = true;
+        let (mut whole, mut in_predicate) = (false, false);
+        // `whole`, `sig (..)` and `predicate`, in this order: what the words so far allow is next.
+        let mut stage = 0;
+        while stage < 3 && input.peek(Ident) {
+            let word: Ident = input.parse()?;
+            match (word.to_string().as_str(), stage) {
+                ("whole", 0) => {
+                    whole = true;
+                    stage = 1;
                 }
-            } else if word == "predicate" {
-                in_predicate = true;
-            } else {
-                return Err(Error::new(
-                    word.span(),
-                    "expected `sig`, `predicate`, `in` or `,`",
-                ));
+                ("sig", 0 | 1) => {
+                    let content;
+                    parenthesized!(content in input);
+                    mark = Some(content.parse()?);
+                    stage = 2;
+                }
+                ("predicate", 0..=2) => {
+                    in_predicate = true;
+                    stage = 3;
+                }
+                _ => {
+                    let expected = match stage {
+                        0 => "expected `whole`, `sig`, `predicate`, `in` or `,`",
+                        1 => "expected `sig`, `predicate`, `in` or `,`",
+                        _ => "expected `predicate`, `in` or `,`",
+                    };
+                    return Err(Error::new(word.span(), expected));
+                }
             }
         }
         // The anchor: the type that owns the cause of the conflict, in its context.
@@ -2187,6 +2190,7 @@ impl Parse for PartItem {
         }
         Ok(PartItem {
             part,
+            whole,
             context,
             in_predicate,
             within,
@@ -2200,6 +2204,7 @@ impl ToTokens for PartItem {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let PartItem {
             part,
+            whole,
             context,
             in_predicate,
             within,
@@ -2212,6 +2217,7 @@ impl ToTokens for PartItem {
         };
         tokens.extend(quote! {
             #kind (#part) #context
+            #(if *whole) { whole }
             #(if let Some(mark) = mark) { sig (#mark) }
             #(if *in_predicate) { predicate }
             #(if let Some((anchor, anchor_context)) = within) {

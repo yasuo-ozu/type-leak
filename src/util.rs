@@ -100,66 +100,6 @@ fn trait_head(path: &Path, position: usize) -> Path {
     }
 }
 
-/// A visitor of the paths of some syntax, which is told what each is the path of.
-pub(crate) trait PathFinder {
-    fn path(&mut self, path: &Path, of: PathOf);
-}
-
-/// Walks syntax and tells `F` each path with what it is the path of. A path reached from a node
-/// that it does not tell apart is [`PathOf::Unknown`].
-pub(crate) struct Kinded<F>(pub(crate) F);
-
-impl<F: PathFinder> Kinded<F> {
-    /// Tells `F` the path `path`, then walks its arguments.
-    pub(crate) fn path_of(&mut self, path: &Path, of: PathOf) {
-        self.0.path(path, of);
-        syn::visit::visit_path(self, path)
-    }
-}
-
-impl<'ast, F: PathFinder> Visit<'ast> for Kinded<F> {
-    fn visit_path(&mut self, i: &'ast Path) {
-        self.path_of(i, PathOf::Unknown)
-    }
-
-    fn visit_type_path(&mut self, i: &'ast TypePath) {
-        match &i.qself {
-            None => self.path_of(&i.path, PathOf::Type),
-            Some(qself) => {
-                self.visit_qself(qself);
-                let position = if qself.as_token.is_some() {
-                    qself.position
-                } else {
-                    0
-                };
-                self.path_of(&i.path, PathOf::Qualified(position))
-            }
-        }
-    }
-
-    fn visit_trait_bound(&mut self, i: &'ast TraitBound) {
-        self.visit_trait_bound_modifier(&i.modifier);
-        if let Some(lifetimes) = &i.lifetimes {
-            self.visit_bound_lifetimes(lifetimes);
-        }
-        self.path_of(&i.path, PathOf::Trait)
-    }
-
-    fn visit_expr_path(&mut self, i: &'ast ExprPath) {
-        for attr in &i.attrs {
-            self.visit_attribute(attr);
-        }
-        if let Some(qself) = &i.qself {
-            self.visit_qself(qself);
-        }
-        self.path_of(&i.path, PathOf::Value)
-    }
-
-    fn visit_macro(&mut self, i: &'ast Macro) {
-        self.path_of(&i.path, PathOf::Macro)
-    }
-}
-
 /// Returns `true` if `path` starts with `Self`.
 pub(crate) fn heads_self(path: &Path) -> bool {
     path.leading_colon.is_none()
@@ -187,11 +127,10 @@ impl Drop for Unwound<'_> {
     }
 }
 
-/// The paths a Leaker treats as context-free: those its [`Allow`] allows and the paths a probe
-/// adds, shared by the throwaway visitors of an analysis. The rule is called at every check.
+/// The paths a Leaker treats as context-free: those its [`Allow`] allows, shared by the throwaway
+/// visitors of an analysis. The rule is called at every check.
 pub(crate) struct AllowedPaths<A> {
     rule: Rc<A>,
-    extra: Rc<[Path]>,
     /// Set if the rule panicked: shared by the clones, which are all of one analysis.
     panicked: Rc<Cell<bool>>,
 }
@@ -200,7 +139,6 @@ impl<A> Clone for AllowedPaths<A> {
     fn clone(&self) -> Self {
         Self {
             rule: self.rule.clone(),
-            extra: self.extra.clone(),
             panicked: self.panicked.clone(),
         }
     }
@@ -210,17 +148,7 @@ impl<A: Allow> AllowedPaths<A> {
     pub(crate) fn new(rule: Rc<A>) -> Self {
         Self {
             rule,
-            extra: Rc::from(Vec::new()),
             panicked: Rc::new(Cell::new(false)),
-        }
-    }
-
-    /// The allowed paths and `more`, whatever they are the paths of.
-    pub(crate) fn with(&self, more: &[Path]) -> Self {
-        Self {
-            rule: self.rule.clone(),
-            extra: self.extra.iter().chain(more).cloned().collect(),
-            panicked: self.panicked.clone(),
         }
     }
 
@@ -251,15 +179,10 @@ impl<A: Allow> AllowedPaths<A> {
             || self.is_allowed_path(path, of, place, ask)
     }
 
-    /// Returns `true` if the rule allows `path`, the path of `of` at `place`, or it starts with a
-    /// path that a probe allowed. `ask` is `false` for a path that starts with `Self` or a generic
-    /// in scope, which the rule never sees.
+    /// Returns `true` if the rule allows `path`, the path of `of` at `place`. `ask` is `false` for
+    /// a path that starts with `Self` or a generic in scope, which the rule never sees.
     pub(crate) fn is_allowed_path(&self, path: &Path, of: PathOf, place: Place, ask: bool) -> bool {
-        (ask && self.call_rule(path, of, place))
-            || self
-                .extra
-                .iter()
-                .any(|allowed| path_starts_with(path, allowed))
+        ask && self.call_rule(path, of, place)
     }
 
     /// Returns `true` for an absolute path to an external crate (not `::core`, not allowed). The

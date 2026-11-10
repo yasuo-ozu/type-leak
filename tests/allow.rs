@@ -475,28 +475,25 @@ fn entries_without_self(types: &[Type]) -> (Entries, Vec<(Reason, String)>) {
 
 /// An accepted `Self` without meaning is not left in an entry: its impl of the Repeater would read
 /// it as its own implementor. The outermost type that would be an entry and names it is copied as
-/// written, whole, with nothing in it leaked, and the error stays the one it was.
+/// written, and the types in it that do not name it are leaked as usual (`Rel` in `(Rel,
+/// Rel<Self>)`); the error stays the one it was.
 #[test]
-fn a_type_with_a_self_without_meaning_is_copied_whole() {
-    let types: [(Type, &str); 8] = [
-        (parse_quote!(Rel<Self>), "Self"),
-        (parse_quote!((Rel, Rel<Self>)), "Self"),
-        (parse_quote!(::p::W<Rel, Self>), "Self"),
-        (parse_quote!(Rel<[Self; 2]>), "Self"),
-        (parse_quote!(Vec<Rel<Self>>), "Self"),
-        (parse_quote!(Wrap<Self::Item>), "Self :: Item"),
-        (parse_quote!(Wrap<m!(Self)>), "m ! (Self)"),
+fn a_type_with_a_self_without_meaning_is_copied_as_written() {
+    let types: [(Type, &str, &[&str]); 8] = [
+        (parse_quote!(Rel<Self>), "Self", &[]),
+        (parse_quote!((Rel, Rel<Self>)), "Self", &["Rel"]),
+        (parse_quote!(::p::W<Rel, Self>), "Self", &["Rel"]),
+        (parse_quote!(Rel<[Self; 2]>), "Self", &[]),
+        (parse_quote!(Vec<Rel<Self>>), "Self", &[]),
+        (parse_quote!(Wrap<Self::Item>), "Self :: Item", &[]),
+        (parse_quote!(Wrap<m!(Self)>), "m ! (Self)", &[]),
         // An optional entry: the Referrer may replace a path of another crate.
-        (parse_quote!(::p::X<Self>), "Self"),
+        (parse_quote!(::p::X<Self>), "Self", &[]),
     ];
-    for (ty, cause) in &types {
+    for (ty, cause, expected) in &types {
         let (entries, errors) = entries_without_self(std::slice::from_ref(ty));
-        assert!(
-            entries.is_empty(),
-            "{}: {:?}",
-            ty.to_token_stream(),
-            entries
-        );
+        let expected: Entries = expected.iter().map(|ty| (ty.to_string(), true)).collect();
+        assert_eq!(entries, expected, "{}", ty.to_token_stream());
         // The only error is that of `Self`: the correction reports nothing of its own.
         assert_eq!(errors, [(Reason::SelfWithoutMeaning, cause.to_string())]);
     }
@@ -620,7 +617,7 @@ fn a_default_with_a_self_without_meaning_is_copied_whole() {
 }
 
 #[test]
-fn a_module_with_a_self_without_meaning_is_copied_whole() {
+fn a_module_with_a_self_without_meaning_is_copied_as_written() {
     let mut leaker = Leaker::new();
     leaker.enter_mod("m", Vec::new(), |view| {
         view.visit_type(&parse_quote!((Rel, Rel<Self>)));
@@ -628,9 +625,10 @@ fn a_module_with_a_self_without_meaning_is_copied_whole() {
     });
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
+    // The tuple is copied as written, `Rel` in it is leaked.
     assert_eq!(
         listed(&result.into_referrer()),
-        [("Rel2".to_string(), true)]
+        [("Rel".to_string(), true), ("Rel2".to_string(), true)]
     );
 }
 
@@ -1060,11 +1058,18 @@ fn causes(result: &LeakerResult) -> Vec<String> {
 fn allow_std_crates_drops_the_causes_that_start_with_std_core_or_alloc() {
     let mut result = result_of_paths();
     let referrer = result.clone().into_referrer();
-    // `Clone` and `Vec<..>` are prelude names, not paths of a crate.
+    // `Clone` and `Vec<..>` are prelude names, not paths of a crate. `Rel<'_>` is the error of the
+    // type in `Vec<Rel<'_>>`, and of the one in the absolute `::std::vec::Vec<Rel<'_>>`.
     result = result.allow(Rules::new().std_crates());
     assert_eq!(
         causes(&result),
-        ["Clone", "Vec < Rel < '_ > >", "Rel < '_ >", "MyType < '_ >"]
+        [
+            "Clone",
+            "Vec < Rel < '_ > >",
+            "Rel < '_ >",
+            "Rel < '_ >",
+            "MyType < '_ >"
+        ]
     );
     assert_eq!(result.into_referrer(), referrer);
 }
@@ -1076,7 +1081,13 @@ fn allow_std_crates_chains_with_allow() {
     result = result.allow(Rules::new().std_crates());
     assert_eq!(
         causes(&result),
-        ["Clone", "Vec < Rel < '_ > >", "Rel < '_ >", "MyType < '_ >"]
+        [
+            "Clone",
+            "Vec < Rel < '_ > >",
+            "Rel < '_ >",
+            "Rel < '_ >",
+            "MyType < '_ >"
+        ]
     );
     result = result
         .accept_cause(&Cause::Trait(parse_quote!(Clone)))
@@ -1087,10 +1098,12 @@ fn allow_std_crates_chains_with_allow() {
     assert_eq!(result.finish().unwrap(), referrer);
 }
 
-/// A path rule drops an error only if every relative path of it is allowed: `std::vec::Vec<Rel<'_>>`
-/// has `Rel` too. The config makes `std::vec::Vec` context-free and reports `Rel<'_>` instead.
+/// A path rule drops an error only if every relative path of it is allowed. `std::vec::Vec<Rel<'_>>`
+/// is written as it is, with an error for `std::vec::Vec`, and `Rel<'_>` in it has an error of its
+/// own: the rule drops the first, as the config makes `std::vec::Vec` context-free and reports
+/// `Rel<'_>`.
 #[test]
-fn allow_std_crates_needs_every_relative_path_of_the_cause() {
+fn allow_std_crates_drops_the_error_of_the_head_and_leaves_that_of_what_is_in_it() {
     let item: ItemTrait = parse_quote!(
         trait Tr {
             fn s(&self, x: std::vec::Vec<Rel<'_>>);
@@ -1107,6 +1120,7 @@ fn allow_std_crates_needs_every_relative_path_of_the_cause() {
         causes(&result),
         [
             "std :: vec :: Vec < Rel < '_ > >",
+            "Rel < '_ >",
             "std :: fmt :: Formatter < '_ >"
         ]
     );
@@ -1118,13 +1132,14 @@ fn allow_std_crates_needs_every_relative_path_of_the_cause() {
     assert_eq!(
         paths,
         [
-            vec!["std :: vec :: Vec", "Rel"],
+            vec!["std :: vec :: Vec"],
+            vec!["Rel"],
             vec!["std :: fmt :: Formatter"]
         ]
     );
     result = result.allow(Rules::new().std_crates());
-    assert_eq!(causes(&result), ["std :: vec :: Vec < Rel < '_ > >"]);
-    // The config reports the part that is not allowed.
+    assert_eq!(causes(&result), ["Rel < '_ >"]);
+    // The config reports the same.
     let config = Rules::new().std_crates();
     assert_eq!(causes(&analyze(config, &item)), ["Rel < '_ >"]);
 }
@@ -1233,14 +1248,12 @@ fn the_errors_of_the_calls_are_one_list_in_the_order_found_each_once() {
     let found: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
     assert_eq!(found, [rel.clone(), rel_tr(), rel_tr(), rel.clone()]);
     // The parts are distinct: the same tokens in the same place are one. `Rel<'_>` holds its own
-    // lifetime and no type owns it around, whereas the trait object is in a path that does.
+    // lifetime and is the same conflict wherever it is, so it is no part, whereas the trait object
+    // is in a path that owns the cause, which tells it from the entry of the same tokens.
     let referrer = result.into_referrer();
     assert_eq!(
         parts_of(&referrer),
-        [
-            "type (Rel < '_ >) 0",
-            "type (dyn RelTr) 0 in (:: p :: W < '_ , dyn RelTr >) 0"
-        ]
+        ["type (dyn RelTr) 0 in (:: p :: W < '_ , dyn RelTr >) 0"]
     );
     // Two outermost calls are one list, in the order of the calls.
     let mut leaker = Leaker::new();
@@ -1526,7 +1539,7 @@ fn a_part_in_a_bound_is_told_from_the_entry_with_the_same_tokens() {
     assert_eq!(
         parts_of(&referrer),
         [format!(
-            "type (R1 < Y >) {} predicate in (impl Into < R1 < Y > >) {}",
+            "type (R1 < Y >) {} whole predicate in (impl Into < R1 < Y > >) {}",
             referrer.context(1),
             referrer.context(1)
         )]
@@ -1560,7 +1573,10 @@ fn a_part_in_a_predicate_is_not_the_entry_outside_it() {
     // No type around it owns a cause of the conflict: no anchor.
     assert_eq!(
         parts_of(&referrer),
-        [format!("type (R1 < Y >) {} predicate", referrer.context(1))]
+        [format!(
+            "type (R1 < Y >) {} whole predicate",
+            referrer.context(1)
+        )]
     );
     let expected: ItemTrait = parse_quote!(
         trait Tr {
@@ -1576,8 +1592,9 @@ fn a_part_in_a_predicate_is_not_the_entry_outside_it() {
 /// The errors of two scopes are one list, and the parts they copy as written follow the errors in
 /// the Referrer, each once.
 #[test]
-fn a_silent_correction_is_a_part_and_the_error_it_comes_with_is_the_only_error() {
-    // (1) `Self` has no meaning: the type that names it is copied whole instead of being an entry.
+fn a_silent_correction_is_no_error_of_its_own_and_a_signature_makes_it_a_part() {
+    // (1) `Self` has no meaning: the type that names it is copied as written instead of being an
+    // entry. No entry has its tokens and context, so the Referrer has no part for it.
     let mut leaker = Leaker::new();
     let (context, ()) = leaker.enter_generics(&Generics::default(), |view| {
         view.visit_type(&parse_quote!(Rel));
@@ -1589,10 +1606,7 @@ fn a_silent_correction_is_a_part_and_the_error_it_comes_with_is_the_only_error()
         [(Reason::SelfWithoutMeaning, "Self".to_string())]
     );
     let referrer = result.into_referrer();
-    assert_eq!(
-        parts_of(&referrer),
-        [format!("type (Wrap < Self >) {}", context)]
-    );
+    assert!(parts_of(&referrer).is_empty());
     let mut copy: Vec<Type> = vec![parse_quote!(Rel), parse_quote!(Wrap<Self>)];
     let mut visitor = referrer
         .visitor(context, |_, ix| parse_quote!(Entry<#ix>))
@@ -1620,20 +1634,15 @@ fn a_silent_correction_is_a_part_and_the_error_it_comes_with_is_the_only_error()
 }
 
 #[test]
-fn an_entry_whose_bounds_name_a_self_without_meaning_is_a_part() {
+fn an_entry_whose_bounds_name_a_self_without_meaning_is_copied_as_written() {
     let mut leaker = Leaker::new();
     let (context, ()) = leaker.enter_generics(&parse_quote!(<T: AsRef<Self>, U>), |view| {
         view.visit_type(&parse_quote!(Rel<T>));
         view.visit_type(&parse_quote!(Other<U>));
     });
     let referrer = leaker.result().into_referrer();
-    assert_eq!(parts_of(&referrer).len(), 1);
-    // The context of the part holds the bound that names `Self`.
-    assert!(referrer.contexts().any(|part_context| referrer
-        .context_generics(part_context)
-        .to_token_stream()
-        .to_string()
-        .contains("AsRef")));
+    // No entry has the tokens and the context of `Rel<T>`, so it is no part either.
+    assert!(parts_of(&referrer).is_empty());
     let mut copy: Vec<Type> = vec![parse_quote!(Rel<T>), parse_quote!(Other<U>)];
     let mut visitor = referrer.visitor(context, |_, ix| parse_quote!(Entry<#ix>));
     for ty in &mut copy {
@@ -1707,15 +1716,16 @@ fn a_bound_whose_trait_conflicts_is_a_part_with_the_types_in_it() {
         ]
     );
     let (referrer, context) = referrer_of(std_config(), &item);
-    // Only `R0` of `f` is an entry. The bounds are copied as written, with the `R0` in them. They
+    // Only `R0` of `f` is an entry. The bounds are copied as written, whole, with the `R0` in
+    // them: a bound is a predicate of the item, and a leaked type in it may not be normalized. They
     // name no generic, so their context is that of `R0`.
     assert_eq!(listed(&referrer), [("R0".to_string(), true)]);
     let none = referrer.context(0);
     assert_eq!(
         parts_of(&referrer),
         [
-            format!("trait (RelTrait < R0 >) {} predicate", none),
-            format!("trait (Other < R0 >) {} predicate", none)
+            format!("trait (RelTrait < R0 >) {} whole predicate", none),
+            format!("trait (Other < R0 >) {} whole predicate", none)
         ]
     );
     let expected: ItemTrait = parse_quote!(
@@ -1749,7 +1759,7 @@ fn a_bound_with_a_binder_is_a_part_as_written() {
     assert_eq!(parts.len(), 1);
     assert!(
         parts[0].starts_with("unreadable (for < 'a > RelTrait < 'a , R0 >)")
-            && parts[0].ends_with("predicate"),
+            && parts[0].ends_with("whole predicate"),
         "{}",
         parts[0]
     );
@@ -1816,7 +1826,7 @@ fn a_part_of_a_module_is_left_as_written_in_that_module_only() {
 }
 
 #[test]
-fn a_path_of_a_value_that_conflicts_is_a_part_with_the_types_in_it() {
+fn a_path_of_a_value_that_conflicts_is_written_as_it_is_and_the_types_in_it_are_leaked() {
     let item: ItemTrait = parse_quote!(
         trait Tr {
             fn f(&self, x: R0) -> R0 {
@@ -1836,17 +1846,11 @@ fn a_path_of_a_value_that_conflicts_is_a_part_with_the_types_in_it() {
     let (result, context) = leak();
     let referrer = result.into_referrer();
     assert_eq!(listed(&referrer), [("R0".to_string(), true)]);
-    let parts = parts_of(&referrer);
-    assert_eq!(parts.len(), 1);
-    assert!(
-        parts[0].starts_with("expr (inner :: make :: < R0 >)"),
-        "{}",
-        parts[0]
-    );
+    assert!(parts_of(&referrer).is_empty());
     let expected: ItemTrait = parse_quote!(
         trait Tr {
             fn f(&self, x: Entry<0usize>) -> Entry<0usize> {
-                inner::make::<R0>(x)
+                inner::make::<Entry<0usize>>(x)
             }
         }
     );
@@ -1899,13 +1903,16 @@ fn the_parts_are_serialized_with_the_referrer() {
         }
     );
     let (referrer, context) = referrer_of(std_config(), &item);
-    // The three kinds of cause of a part, in a predicate or not, with an anchor or not.
+    // The two kinds of cause of a part (the path of a value is no part: it is written as it is, and
+    // the types in it are analyzed), in a predicate or not, with an anchor or not, whole or not.
     let parts = parts_of(&referrer);
     assert!(parts.iter().any(|part| part.starts_with("trait (")));
     assert!(parts.iter().any(|part| part.starts_with("type (")));
-    assert!(parts.iter().any(|part| part.ends_with("predicate")));
+    assert!(parts.iter().any(|part| part.contains(" predicate")));
     assert!(parts.iter().any(|part| part.contains(" in (")));
     assert!(parts.iter().any(|part| !part.contains("predicate")));
+    assert!(parts.iter().any(|part| part.contains(" whole ")));
+    assert!(parts.iter().any(|part| !part.contains(" whole ")));
     let tokens = quote!(#referrer, #context);
     let text = tokens.to_string();
     // The list follows the tag, and has neither `part` nor `cause` in front of an item.
@@ -2019,6 +2026,7 @@ fn the_parts_are_checked_when_they_are_read() {
     );
     // The tokens of a cause are all of the parentheses; a trailing comma is accepted.
     assert!(read("[trait (RelTr) 0,] (Rel)").is_ok());
+    assert!(read("[type (R) 0 whole sig ('a) predicate in (&R) 0] (Rel)").is_ok());
     assert!(read("[] (Rel)").is_ok());
     for (text, message) in [
         // The words `cause` and `part` of the first form of the list are not read any more.
@@ -2030,7 +2038,7 @@ fn the_parts_are_checked_when_they_are_read() {
         ("[type (R)] (Rel)", "expected integer literal"),
         (
             "[type (R) 0 nope] (Rel)",
-            "expected `sig`, `predicate`, `in` or `,`",
+            "expected `whole`, `sig`, `predicate`, `in` or `,`",
         ),
         (
             "[type (R) 3] (Rel)",

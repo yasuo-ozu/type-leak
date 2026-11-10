@@ -2,10 +2,10 @@
 
 use crate::allow::{Allow, Place};
 use crate::analysis::{
-    ambiguous_types, anchor_parts, correct_effects, correct_unmeant_self, error_effects,
-    has_ambiguous, has_error, has_optional, names_self, part_names_self, primitive_effects,
-    primitive_names, scope_error, shift_seen, unshift_seen, CheckResult, Effect, Part, PendingType,
-    SelfMention, SignatureFacts, SignatureMark,
+    ambiguous_types, anchor_parts, as_written, correct_effects, correct_unmeant_self,
+    error_effects, has_ambiguous, has_error, has_optional, names_self, part_names_self,
+    primitive_effects, primitive_names, scope_error, shift_seen, CheckResult, Effect, Part,
+    PendingType, SelfMention, SignatureFacts, SignatureMark,
 };
 use crate::context::{
     binder_lifetimes, Context, ContextId, Contexts, Enclosing, Gat, ModuleInfo, Scope,
@@ -22,8 +22,7 @@ use crate::util::{
     generic_param_mentions_self, generic_param_name, has_lifetime_bound, ident_name,
     is_primitive_name, or_list, self_in_param, self_in_predicate, selves_in_generics, tidy,
     token_names, trait_object_of, type_mentions_self, unwrap_type_group,
-    where_predicate_mentions_self, without_crate_prefix, without_defaults, AllowedPaths, Kinded,
-    PathFinder, PathOf,
+    where_predicate_mentions_self, without_crate_prefix, without_defaults, AllowedPaths, PathOf,
 };
 use crate::view::View;
 use proc_macro2::TokenStream;
@@ -67,6 +66,10 @@ struct Frame {
     /// The first `Self::A` in the type, where `Self` is a type: the Repeater's impl cannot write it,
     /// so a type that names it is not leaked whole.
     assoc_self: Option<Cause>,
+    /// The depths of the types, enclosing the type, that are the owner of a type in it that is not
+    /// leaked alone (see [`AnalyzeVisitor::decide_as_owner()`]): its meaning depends on its owner,
+    /// so the owner copied as written keeps it whole.
+    adopted: Vec<usize>,
     effects: Vec<Effect>,
 }
 
@@ -89,6 +92,7 @@ impl Frame {
             elision: None,
             unconstrained: None,
             assoc_self: None,
+            adopted: Vec::new(),
             effects: Vec::new(),
         }
     }
@@ -688,27 +692,6 @@ struct Checkpoint {
     walk: Walk,
 }
 
-/// What a probe for nested errors puts back when it ends ([`AnalyzeVisitor::begin_probe()`]).
-struct Probe<A> {
-    allowed: AllowedPaths<A>,
-    checkpoint: Checkpoint,
-    probing: bool,
-    /// The mentions of `Self` and the cycles that the visitor had when the probe began.
-    selves: usize,
-    cycles: usize,
-    /// The length of `probe_kept` when the probe began.
-    kept: usize,
-}
-
-/// What `AnalyzeVisitor::visit_type()` finds set when it starts, and takes: a visit of the same
-/// type starts from it again ([`AnalyzeVisitor::revisit()`]).
-struct TypeEntry {
-    elided_ref: bool,
-    unconstrained: Option<Lifetime>,
-    ambiguous: bool,
-    inherits: Option<Inherits>,
-}
-
 /// The state of the walk of a type, which is back to what it was when the walk ends.
 struct Walk {
     type_depth: usize,
@@ -770,15 +753,6 @@ pub(crate) struct AnalyzeVisitor<A> {
     bound_elided: Vec<Vec<usize>>,
     /// While a binder is probed: the addresses of the types found to be leaked whole.
     probe: Option<HashSet<usize>>,
-    /// A probe for nested errors is running ([`AnalyzeVisitor::begin_probe()`]): it records nothing
-    /// that outlives it, but for `probe_kept`.
-    probing: bool,
-    /// The types, with the contexts they are in, that a running probe found to be no optional
-    /// entries because of `Self` or `Self::A` in a predicate of the part it visits. The part is
-    /// copied as written, and rustc resolves them there with the bounds of the generics as they
-    /// are: the types that those bounds name stay as written too, wherever the error comes from.
-    /// The end of the probe gives them to the visitor ([`AnalyzeVisitor::end_probe()`]).
-    probe_kept: Vec<(Context, String)>,
     /// The scopes entered, innermost last, and the defaults that each analyzes alone.
     alone_defaults: Vec<AloneDefaults>,
     /// What `Self` means here, if anything. It has none directly in a module, or in generics that
@@ -933,8 +907,6 @@ impl<A: Allow> AnalyzeVisitor<A> {
             signature: None,
             bound_elided: Vec::new(),
             probe: None,
-            probing: false,
-            probe_kept: Vec::new(),
             alone_defaults: Vec::new(),
             self_ty: None,
             self_written: false,
@@ -1047,13 +1019,13 @@ impl<A: Allow> AnalyzeVisitor<A> {
             part: None,
             place: Place::default(),
             paths: Vec::new(),
-            nested: Vec::new(),
         }
     }
 
     /// Like [`AnalyzeVisitor::causes()`] for a conflict of a type at `depth` that cannot be leaked
-    /// whole. A path in it that is leaked alone is no cause, and no error once the first cause is
-    /// fixed (`u8` in `<Self as Tr<u8>>::X`).
+    /// whole. What it is about is the causes that the type owns, the heads that the copy writes as
+    /// they are: a cause of a type inside has an error of its own, and a path in it that is leaked
+    /// alone is no cause (`u8` in `<Self as Tr<u8>>::X`).
     fn conflict_causes(
         &self,
         must_start: usize,
@@ -1066,21 +1038,26 @@ impl<A: Allow> AnalyzeVisitor<A> {
             .filter(|must| !must.covered)
             .collect();
         must.sort_by_key(|must| must.depth);
+        let own = must.iter().filter(|must| must.depth == depth).count();
+        if own > 0 {
+            must.truncate(own);
+        }
         if !must.is_empty() {
             result.is_own = must.first().map_or(false, |must| must.depth == depth);
             result.must = must.iter().map(|must| must.cause.clone()).collect();
         }
-        result.paths = self.paths_since(must_start);
+        result.paths = self.own_paths(must_start, depth);
         result
     }
 
-    /// The relative paths of the causes from `must_start` on, outermost first, also those that an
-    /// entry covers: the type that conflicts is copied as written whole, so every path in it is
-    /// written in the copy ([`CheckResult::paths`]).
-    fn paths_since(&self, must_start: usize) -> Vec<Cause> {
-        let mut must: Vec<&Must> = self.musts[must_start..].iter().collect();
-        must.sort_by_key(|must| must.depth);
-        paths_of(must.into_iter())
+    /// The relative paths of the causes from `must_start` on that the type at `depth` owns: the
+    /// heads that the copy writes as they are ([`CheckResult::paths`]).
+    fn own_paths(&self, must_start: usize, depth: usize) -> Vec<Cause> {
+        paths_of(
+            self.musts[must_start..]
+                .iter()
+                .filter(|must| must.depth == depth),
+        )
     }
 
     /// Visits `ty` and returns what it found at its own depth: the causes, whether it is an
@@ -1094,9 +1071,10 @@ impl<A: Allow> AnalyzeVisitor<A> {
         self.visit_type(ty);
         let mut result = self.causes(must_start, impossible_start, depth);
         match &self.frame.effects[effects_start..] {
-            // The type is decided at its own depth, so the only effect of a type with a cause of
-            // its own is its own: the conflict is what a scope reports (with the note).
-            [Effect::Error(conflict)] if result.is_own => result = (**conflict).clone(),
+            // The type is decided at its own depth, so the first effect of a type with a cause of
+            // its own is its own (what is inside it follows): the conflict is what a scope reports
+            // (with the note).
+            [Effect::Error(conflict), ..] if result.is_own => result = (**conflict).clone(),
             [Effect::Type(pending)] if pending.optional && pending.ty == *ty => {
                 result.optional = true
             }
@@ -1530,7 +1508,7 @@ impl<A: Allow> AnalyzeVisitor<A> {
                 }
                 // Checked like the root of a trait bound, before what the closure visits.
                 if let Some(path) = trait_path.as_deref() {
-                    self.check_bound_path(path, Cause::Trait(path.clone()), false);
+                    self.check_bound_path(path, Cause::Trait(path.clone()));
                 }
             }
         }
@@ -1660,158 +1638,6 @@ impl<A: Allow> AnalyzeVisitor<A> {
         self.in_param_default = walk.in_param_default;
     }
 
-    /// Starts a probe for the errors inside the part that `conflict` copies as written
-    /// ([`ErrorItem::nested`]): the paths it depends on are allowed from now on, and what the visit
-    /// records goes into a new frame. Returns `None` if there is nothing to probe: no part, no
-    /// cause, or no path that is not allowed (each probe allows at least one more, which ends the
-    /// nesting). The caller visits the syntax of the part again where the visitor is, then calls
-    /// [`AnalyzeVisitor::end_probe()`].
-    fn begin_probe(&mut self, conflict: &CheckResult) -> Option<Probe<A>> {
-        let paths: Vec<(Path, PathOf)> = conflict
-            .paths
-            .iter()
-            .filter_map(|entry| Some((entry.entry_path()?, PathOf::of_entry(entry))))
-            .collect();
-        let open = conflict.part.is_some()
-            && !conflict.must.is_empty()
-            && paths
-                .iter()
-                .any(|(path, of)| !self.is_allowed_path(path, *of));
-        if !open {
-            return None;
-        }
-        let paths: Vec<Path> = paths.into_iter().map(|(path, _)| path).collect();
-        let more = self.allowed.with(&paths);
-        let allowed = std::mem::replace(&mut self.allowed, more);
-        let checkpoint = self.checkpoint();
-        Some(Probe {
-            allowed,
-            checkpoint,
-            probing: std::mem::replace(&mut self.probing, true),
-            selves: self.self_errors.len(),
-            cycles: self.env_errors.len(),
-            kept: self.probe_kept.len(),
-        })
-    }
-
-    /// Ends a probe, and returns the errors it found. Nothing it recorded stays, but the types that
-    /// `Self` or `Self::A` in the part keeps as written (`probe_kept`).
-    fn end_probe(&mut self, probe: Probe<A>) -> Vec<ErrorItem> {
-        let Probe {
-            allowed,
-            checkpoint,
-            probing,
-            selves,
-            cycles,
-            kept,
-        } = probe;
-        let mut effects = std::mem::take(&mut self.frame.effects);
-        let mentions = self.self_errors.split_off(selves);
-        let conflicts: Vec<CheckResult> = self
-            .env_errors
-            .split_off(cycles)
-            .into_iter()
-            .map(|mut conflict| {
-                conflict.seen = conflict.seen.saturating_sub(selves);
-                conflict
-            })
-            .collect();
-        unshift_seen(&mut effects, selves);
-        let nested = scope_error(&effects, &mentions, &conflicts);
-        let kept = self.probe_kept.split_off(kept);
-        self.restore(checkpoint);
-        self.allowed = allowed;
-        self.probing = probing;
-        // What the part needs stays, though what the probe recorded is gone.
-        self.not_optional.extend(kept.iter().cloned());
-        if self.probing {
-            self.probe_kept.extend(kept);
-        }
-        nested
-    }
-
-    /// The errors that `visit` finds if the paths of `conflict`, which copies a part as written,
-    /// are allowed ([`ErrorItem::nested`]). `visit` visits the part again, where the visitor is.
-    fn nested_errors(
-        &mut self,
-        conflict: &CheckResult,
-        visit: impl FnOnce(&mut Self),
-    ) -> Vec<ErrorItem> {
-        match self.begin_probe(conflict) {
-            Some(probe) => {
-                visit(self);
-                self.end_probe(probe)
-            }
-            None => Vec::new(),
-        }
-    }
-
-    /// Takes the error that the visit just recorded, if it is the last effect.
-    fn pop_error(&mut self) -> Option<CheckResult> {
-        match self.frame.effects.pop() {
-            Some(Effect::Error(error)) => Some(*error),
-            Some(other) => {
-                self.frame.effects.push(other);
-                None
-            }
-            None => None,
-        }
-    }
-
-    /// Gives the error that the visit just recorded, if it is the last effect and copies a part as
-    /// written, its nested errors: `visit` visits that part again.
-    fn nest_last(&mut self, visit: impl FnOnce(&mut Self)) {
-        if let Some(mut conflict) = self.pop_error() {
-            conflict.nested = self.nested_errors(&conflict, visit);
-            self.frame.effects.push(Effect::Error(Box::new(conflict)));
-        }
-    }
-
-    /// Visits `ty` again, where `visit_type()` was when it started with `entry`: the visit is
-    /// at the end of `decide()`, which has the same state but for what the visit takes.
-    fn revisit(&mut self, ty: &Type, entry: &TypeEntry) {
-        self.type_depth -= 1;
-        self.impossibles.at = self.type_depth;
-        self.elided_ref = entry.elided_ref;
-        self.unconstrained_ref = entry.unconstrained.clone();
-        self.ambiguous_arg = entry.ambiguous;
-        self.inherits = entry.inherits;
-        self.visit_type(ty);
-    }
-
-    /// Gives `conflict`, about the type `ty` copied as written, its nested errors.
-    fn nested_in_type(
-        &mut self,
-        mut conflict: CheckResult,
-        ty: &Type,
-        entry: &TypeEntry,
-    ) -> CheckResult {
-        conflict.nested = self.nested_errors(&conflict, |visitor| visitor.revisit(ty, entry));
-        conflict
-    }
-
-    /// Gives the errors among `effects` that `cut_conflicts()` made, copying a type of the self type
-    /// of an impl as written, their nested errors. The type is visited at the start of the walk of
-    /// the impl, as the state of the type inside the self type is gone.
-    fn nest_self_type_conflicts(&mut self, effects: &mut [Effect]) {
-        for effect in effects {
-            match effect {
-                Effect::Error(error) if error.reason == Reason::SelfInImplSelfType => {
-                    let ty = match &error.part {
-                        Some(Part {
-                            cause: Cause::Type(ty),
-                            ..
-                        }) => ty.clone(),
-                        _ => continue,
-                    };
-                    error.nested = self.nested_errors(error, |visitor| visitor.visit_type(&ty));
-                }
-                Effect::Type(pending) => self.nest_self_type_conflicts(&mut pending.components),
-                _ => (),
-            }
-        }
-    }
-
     /// Leaves a nested scope and returns its top-level context. The scope keeps what it recorded,
     /// and the outermost one reports the errors, in the order found.
     fn end_scope(&mut self, mark: ScopeMark, spec: &ScopeSpec) -> ContextId {
@@ -1902,6 +1728,9 @@ impl<A: Allow> AnalyzeVisitor<A> {
         if inner.soft_depth != usize::MAX {
             inner.soft_depth = owner;
         }
+        if inner.min_depth != usize::MAX || inner.soft_depth != usize::MAX {
+            inner.adopted.push(owner);
+        }
         self.decide_through(inner)
     }
 
@@ -1934,6 +1763,11 @@ impl<A: Allow> AnalyzeVisitor<A> {
         if self.frame.elision.is_none() {
             let depth = self.type_depth;
             self.frame.elision = inner.elision.clone().filter(|(owner, _)| *owner < depth);
+        }
+        for &owner in &inner.adopted {
+            if !self.frame.adopted.contains(&owner) {
+                self.frame.adopted.push(owner);
+            }
         }
     }
 
@@ -2011,8 +1845,7 @@ impl<A: Allow> AnalyzeVisitor<A> {
                 seen: 0,
                 part: None,
                 place: Place::default(),
-                paths: self.paths_since(inner.must_start),
-                nested: Vec::new(),
+                paths: self.own_paths(inner.must_start, depth),
             });
         }
         let context = match self.context_of(ty, inner) {
@@ -2035,8 +1868,7 @@ impl<A: Allow> AnalyzeVisitor<A> {
                     seen: 0,
                     part: None,
                     place: Place::default(),
-                    paths: self.paths_since(inner.must_start),
-                    nested: Vec::new(),
+                    paths: self.own_paths(inner.must_start, depth),
                 })
             }
         };
@@ -2051,7 +1883,7 @@ impl<A: Allow> AnalyzeVisitor<A> {
         {
             if let Ok(any) = self.context_of_as(ty, inner, true) {
                 return match self.associated_self_in_bounds(&any) {
-                    Some(conflict) => Err(conflict.of(ty, self.paths_since(inner.must_start))),
+                    Some(conflict) => Err(conflict.of(ty, self.own_paths(inner.must_start, depth))),
                     None => Ok(any),
                 };
             }
@@ -2079,8 +1911,7 @@ impl<A: Allow> AnalyzeVisitor<A> {
                 seen: 0,
                 part: None,
                 place: Place::default(),
-                paths: self.paths_since(inner.must_start),
-                nested: Vec::new(),
+                paths: self.own_paths(inner.must_start, depth),
             }),
             Some(self_path) if self.self_nested => Err(CheckResult {
                 must: vec![Cause::Type(ty.clone())],
@@ -2111,8 +1942,7 @@ impl<A: Allow> AnalyzeVisitor<A> {
                 seen: 0,
                 part: None,
                 place: Place::default(),
-                paths: self.paths_since(inner.must_start),
-                nested: Vec::new(),
+                paths: self.own_paths(inner.must_start, depth),
             }),
             Some(self_path) => Err(CheckResult {
                 must: vec![Cause::Type(ty.clone())],
@@ -2137,11 +1967,10 @@ impl<A: Allow> AnalyzeVisitor<A> {
                 seen: 0,
                 part: None,
                 place: Place::default(),
-                paths: self.paths_since(inner.must_start),
-                nested: Vec::new(),
+                paths: self.own_paths(inner.must_start, depth),
             }),
             None => match self.associated_self_in_bounds(&context) {
-                Some(conflict) => Err(conflict.of(ty, self.paths_since(inner.must_start))),
+                Some(conflict) => Err(conflict.of(ty, self.own_paths(inner.must_start, depth))),
                 None => Ok(context),
             },
         }
@@ -2315,7 +2144,9 @@ impl<A: Allow> AnalyzeVisitor<A> {
     }
 
     #[allow(clippy::result_large_err)]
-    fn decide(&mut self, ty: &Type, depth: usize, entry: &TypeEntry, mut inner: Frame) {
+    fn decide(&mut self, ty: &Type, depth: usize, ambiguous: bool, mut inner: Frame) {
+        // A type in it is not leaked alone: its meaning depends on this one.
+        let adopted = inner.adopted.contains(&depth);
         // `Self` (or `Self::A`) that the copy writes as a type with lifetimes, in the inputs of a
         // signature whose output relies on elision: `Self` is no entry, so it is the type holding
         // the signature that is leaked whole instead, or a conflict (in a bound or a method). Like
@@ -2543,17 +2374,16 @@ impl<A: Allow> AnalyzeVisitor<A> {
                         };
                         for needed in &needs {
                             if let Some(conflict) = self.self_env_cycle(ty, needed) {
-                                // The type is left without an entry, and copied as written.
+                                // The type is left without an entry, and copied as written: `Self`
+                                // or `Self::A` has no types in it to leak.
                                 let mut conflict =
-                                    self.with_part(conflict, ty, Some(context), &effects);
+                                    self.with_part(conflict, ty, Some(context), true, &effects);
                                 conflict.seen = self.self_errors.len();
                                 conflict.place = self.place();
-                                conflict.paths = self.paths_since(inner.must_start);
-                                let conflict = self.nested_in_type(conflict, ty, entry);
+                                conflict.paths = self.own_paths(inner.must_start, depth);
                                 return self.env_errors.push(conflict);
                             }
                         }
-                        let kept = self.not_optional.len();
                         if projection {
                             self.not_optional_in_bounds(&context);
                         } else {
@@ -2564,12 +2394,9 @@ impl<A: Allow> AnalyzeVisitor<A> {
                         if let Some(impl_context) = self.impl_context(projection) {
                             self.not_optional_in_bounds(&impl_context);
                         }
-                        self.keep_in_probe(kept);
                     }
                     if !projection {
-                        let kept = self.not_optional.len();
                         self.not_optional_in_self_type(&context);
-                        self.keep_in_probe(kept);
                     }
                 }
             }
@@ -2580,17 +2407,21 @@ impl<A: Allow> AnalyzeVisitor<A> {
                     .env_cycle(ty, &context)
                     .or_else(|| self.nested_self_cycle(ty, &context, &inner));
                 if let Some(conflict) = cycle {
-                    let mut conflict = self.with_part(conflict, ty, Some(context), &effects);
-                    conflict.paths = self.paths_since(inner.must_start);
-                    let conflict = self.nested_in_type(conflict, ty, entry);
-                    return self.push_error(conflict);
+                    // The predicate must not hold a projection through the Repeater, also not in a
+                    // part of the type that conflicts (E0277: rustc does not normalize it while it
+                    // checks the bounds): nothing in it is leaked.
+                    let mut conflict = self.with_part(conflict, ty, Some(context), true, &effects);
+                    conflict.paths = self.own_paths(inner.must_start, depth);
+                    return self.conflict_inside(conflict, inner.self_start, true, effects);
                 }
                 self.not_optional_in_bounds(&context);
                 PendingType {
                     is_must_intern: true,
                     in_graph: true,
-                    ambiguous: entry.ambiguous && context.is_empty(),
+                    ambiguous: ambiguous && context.is_empty(),
                     primitives: primitive_names(&effects),
+                    inside: effects,
+                    adopted,
                     ..PendingType::new(ty, context, Vec::new())
                 }
             }
@@ -2598,16 +2429,20 @@ impl<A: Allow> AnalyzeVisitor<A> {
                 // The type is copied as written: the Referrer leaves it so. One whose context
                 // cannot be written has none, and is found where the Referrer cannot write it.
                 let context = self.context_of(ty, &inner).ok();
-                let mut conflict = self.with_part(conflict, ty, context, &effects);
+                // A bare identifier among the arguments may be a const: it is not leaked alone, and
+                // the errors of the parts are real as well, as the cause of the type is one of them.
+                // In a predicate nothing more is leaked: it would be a projection there that rustc
+                // cannot normalize while it checks the bounds (see `env_cycle()`).
+                let whole = bare || adopted || self.env_depth > 0 || is_whole_reference(ty);
+                let mut conflict = self.with_part(conflict, ty, context, whole, &effects);
                 if let Some(part) = conflict.part.as_mut() {
                     part.mark = mark;
                 }
-                // The errors of the parts are real as well, if the cause of the type is one of them.
                 if bare {
                     self.frame.effects.extend(error_effects(effects));
+                    return self.push_error(conflict);
                 }
-                let conflict = self.nested_in_type(conflict, ty, entry);
-                return self.push_error(conflict);
+                return self.conflict_inside(conflict, inner.self_start, whole, effects);
             }
             None if has_impossible => {
                 if has_must || has_optional(&effects) {
@@ -2653,9 +2488,9 @@ impl<A: Allow> AnalyzeVisitor<A> {
                 let leaked_whole = has_must && is_whole_reference(ty);
                 if leaked_whole {
                     if let Some(conflict) = self.env_cycle(ty, &context) {
-                        let mut conflict = self.with_part(conflict, ty, Some(context), &effects);
-                        conflict.paths = self.paths_since(inner.must_start);
-                        let conflict = self.nested_in_type(conflict, ty, entry);
+                        let mut conflict =
+                            self.with_part(conflict, ty, Some(context), true, &effects);
+                        conflict.paths = self.own_paths(inner.must_start, depth);
                         return self.push_error(conflict);
                     }
                     self.not_optional_in_bounds(&context);
@@ -2690,7 +2525,7 @@ impl<A: Allow> AnalyzeVisitor<A> {
         pending.in_predicate = self.env_depth > 0;
         // An entry leaked alone covers the paths in it: the type around is not in conflict for them.
         if pending.in_graph {
-            pending.paths = self.paths_since(inner.must_start);
+            pending.paths = self.own_paths(inner.must_start, depth);
             for must in &mut self.musts[inner.must_start..] {
                 must.covered = true;
             }
@@ -2711,31 +2546,58 @@ impl<A: Allow> AnalyzeVisitor<A> {
     }
 
     /// Gives `conflict`, about `ty` in `context` (`None`: it cannot be written), the part that the
-    /// Referrer leaves as written: the whole type (see [`Part`]). `effects` are those of the
-    /// components of `ty`, whose primitive names the copy writes.
+    /// Referrer leaves as written (see [`Part`]). `whole`: nothing in `ty` is leaked, so the copy
+    /// writes the primitive names of `effects`, those of its components.
     fn with_part(
         &self,
         mut conflict: CheckResult,
         ty: &Type,
         context: Option<Context>,
+        whole: bool,
         effects: &[Effect],
     ) -> CheckResult {
         conflict.part = Some(Part {
             cause: Cause::Type(ty.clone()),
+            whole,
             context,
             in_predicate: self.env_depth > 0,
             within: None,
             mark: None,
-            primitives: primitive_names(effects),
+            primitives: if whole {
+                primitive_names(effects)
+            } else {
+                Vec::new()
+            },
         });
         conflict
     }
 
-    /// Returns the part for a node copied as written, whole, though types are in it: a bound whose
-    /// trait path conflicts (`Rel<R0>` in `T: Rel<R0>`), or a path of a value. `path` stands for it
-    /// as a type, to compute the context, which is `None` if it cannot be written. `of`: what
-    /// `path` is the path of.
-    fn node_part(&self, cause: Cause, path: &Path, of: PathOf) -> Part {
+    /// Records `conflict`, about a type copied as written, and what the analysis found inside it
+    /// (`effects`): the types in it are leaked as usual, and only its own path is written as it is.
+    /// A `whole` part has nothing leaked in it: its conflicts stay. The conflict comes first, with
+    /// the mentions of `Self` that the type holds after it (`self_start`).
+    fn conflict_inside(
+        &mut self,
+        mut conflict: CheckResult,
+        self_start: usize,
+        whole: bool,
+        effects: Vec<Effect>,
+    ) {
+        conflict.seen = self_start;
+        conflict.place = self.place();
+        let effects = if whole {
+            as_written(effects, &mut conflict.paths)
+        } else {
+            effects
+        };
+        self.frame.effects.push(Effect::Error(Box::new(conflict)));
+        self.frame.effects.extend(effects);
+    }
+
+    /// Returns the part for a bound whose trait path conflicts (`Rel<R0>` in `T: Rel<R0>`), which the
+    /// copy writes as it is with the types in it. `path` stands for it as a type, to compute the
+    /// context, which is `None` if it cannot be written. `primitives`: the primitive names in it.
+    fn node_part(&self, cause: Cause, path: &Path, primitives: Vec<Ident>) -> Part {
         let ty = Type::Path(TypePath {
             qself: None,
             path: path.clone(),
@@ -2752,18 +2614,14 @@ impl<A: Allow> AnalyzeVisitor<A> {
             Some(module) => context.with_module(Some(module.id)),
             None => context,
         });
-        let mut names = Kinded(PrimitiveNames {
-            visitor: self,
-            found: Vec::new(),
-        });
-        names.path_of(path, of);
         Part {
             cause,
+            whole: true,
             context,
             in_predicate: self.env_depth > 0,
             within: None,
             mark: None,
-            primitives: names.0.found,
+            primitives,
         }
     }
 
@@ -2939,7 +2797,6 @@ impl<A: Allow> AnalyzeVisitor<A> {
             part: None,
             place: Place::default(),
             paths: Vec::new(),
-            nested: Vec::new(),
         }
     }
 
@@ -2972,7 +2829,6 @@ impl<A: Allow> AnalyzeVisitor<A> {
             part: None,
             place: Place::default(),
             paths: Vec::new(),
-            nested: Vec::new(),
         }
     }
 
@@ -3235,15 +3091,6 @@ impl<A: Allow> AnalyzeVisitor<A> {
         self.not_optional.extend(keys);
     }
 
-    /// Called after `Self` or `Self::A` in a predicate made `not_optional[start..]`: while a probe
-    /// visits a part copied as written, it is the part that depends on them (`probe_kept`).
-    fn keep_in_probe(&mut self, start: usize) {
-        if self.probing {
-            self.probe_kept
-                .extend(self.not_optional[start..].iter().cloned());
-        }
-    }
-
     /// Like `not_optional_in_bounds()` for the optional entries of the self type of an impl (in
     /// `context`), which `Self` is in a bound or where predicate.
     fn not_optional_in_self_type(&mut self, context: &Context) {
@@ -3263,16 +3110,9 @@ impl<A: Allow> AnalyzeVisitor<A> {
     }
 
     /// Records the conflict of a relative path `cause`, which cannot be leaked as a whole because
-    /// of `impossible`. `part`: the node copied as written, if the Referrer has to leave it so.
-    /// `paths`: the relative paths the conflict depends on ([`CheckResult::paths`]), see
-    /// [`AnalyzeVisitor::relative_paths_in()`].
-    fn relative_path(
-        &mut self,
-        cause: Cause,
-        impossible: Cause,
-        part: Option<Part>,
-        paths: Vec<Cause>,
-    ) {
+    /// of `impossible`. `paths`: the relative paths that the copy writes as they are
+    /// ([`CheckResult::paths`]).
+    fn relative_path(&mut self, cause: Cause, impossible: Cause, paths: Vec<Cause>) {
         self.push_error(CheckResult {
             must: vec![cause],
             impossible: vec![impossible],
@@ -3284,26 +3124,10 @@ impl<A: Allow> AnalyzeVisitor<A> {
             cause: None,
             reason: Reason::RelativePath,
             seen: 0,
-            part,
+            part: None,
             place: Place::default(),
             paths,
-            nested: Vec::new(),
         });
-    }
-
-    /// The relative paths in the syntax that `visit` walks, without their arguments, each once, in
-    /// order: those that mean something else wherever they are written ([`AnalyzeVisitor::is_relative_path()`]).
-    /// A cause that is copied as written holds them all, also those in the arguments of its path.
-    fn relative_paths_in(
-        &self,
-        visit: impl FnOnce(&mut Kinded<RelativePaths<'_, A>>),
-    ) -> Vec<Cause> {
-        let mut finder = Kinded(RelativePaths {
-            visitor: self,
-            found: Vec::new(),
-        });
-        visit(&mut finder);
-        finder.0.found
     }
 
     /// Records the conflict as an effect, with the number of mentions of `Self` without meaning
@@ -3330,8 +3154,7 @@ impl<A: Allow> AnalyzeVisitor<A> {
         }
         let start = self.frame.effects.len();
         self.visit_type(&i.self_ty);
-        let end = self.frame.effects.len();
-        self.cut_self_cycles(start, &i.generics);
+        let end = self.cut_self_cycles(start, &i.generics);
         let inherent = std::mem::replace(&mut self.inherent_impl, i.trait_.is_none());
         for item in &i.items {
             self.visit_impl_item(item);
@@ -3383,7 +3206,7 @@ impl<A: Allow> AnalyzeVisitor<A> {
     }
 
     /// Called after the self type of an impl with `generics` is visited, with `start` the first
-    /// effect it made.
+    /// effect it made. Returns the end of the effects of the self type.
     ///
     /// The Repeater's impl of an entry whose context depends on `Self` (a bound of the generics of
     /// the impl names it) is for the self type, so the copy writes `<Self as Repeater<..>>::Type`
@@ -3399,54 +3222,39 @@ impl<A: Allow> AnalyzeVisitor<A> {
     /// is copied as written, which the Referrer cannot do if it replaces them (see
     /// [`AnalyzeVisitor::env_cycle()`]). Only a bound that `generics` declare counts: a bound of
     /// an outer scope that names its own `Self` is written for the type that scope knows.
-    fn cut_self_cycles(&mut self, start: usize, generics: &Generics) {
+    fn cut_self_cycles(&mut self, start: usize, generics: &Generics) -> usize {
         let mut not_optional = Vec::new();
         let seen = self.self_errors.len();
         let place = self.place();
-        cut_conflicts(
-            &mut self.frame.effects[start..],
+        let found = self.frame.effects.split_off(start);
+        let found = cut_conflicts(
+            found,
             &|pending| self_type_conflict(pending, generics),
             seen,
             place,
             &mut not_optional,
         );
-        self.not_optional.extend(not_optional);
-        let mut found = self.frame.effects.split_off(start);
-        self.nest_self_type_conflicts(&mut found);
         self.frame.effects.extend(found);
+        self.not_optional.extend(not_optional);
+        self.frame.effects.len()
     }
 
     /// Records an error if a trait path depends on the context or starts with `Self` without a
-    /// meaning. Returns `true` if so. `cause` is what the error is reported at ([`bound_cause()`]).
-    /// `whole`: the caller copies the bound as written, so a relative path is a part, not a `Self`.
-    fn check_bound_path(&mut self, path: &Path, cause: Cause, whole: bool) -> bool {
+    /// meaning: the path is written as it is, and the caller goes on with its arguments. `cause` is
+    /// what the error is reported at ([`bound_cause()`]). Returns `true` if the error is of a
+    /// relative path.
+    fn check_bound_path(&mut self, path: &Path, cause: Cause) -> bool {
         if self_segment(path).is_some() && self.self_ty.is_none() {
-            // The mention of `Self` is the error; the bound is copied as written, whole.
-            let part = whole.then(|| self.node_part(cause.clone(), path, PathOf::Trait));
-            if let Some(part) = part {
-                let mut corrected = CheckResult::corrected();
-                corrected.part = Some(part);
-                self.frame.effects.push(Effect::Error(Box::new(corrected)));
-            }
             self.self_errors.push(SelfMention {
                 cause,
                 place: self.place(),
             });
-            true
         } else if !self.is_context_free(path, PathOf::Trait) {
-            let part = whole.then(|| self.node_part(cause.clone(), path, PathOf::Trait));
-            // A bound that is copied as written holds the paths in its arguments too; the
-            // arguments of the trait of an impl are analyzed on their own.
-            let paths = if whole {
-                self.relative_paths_in(|finder| finder.path_of(path, PathOf::Trait))
-            } else {
-                self.relative_paths_in(|finder| finder.0.path(path, PathOf::Trait))
-            };
-            self.relative_path(cause.clone(), cause, part, paths);
-            true
-        } else {
-            false
+            let paths = vec![PathOf::Trait.entry(path)];
+            self.relative_path(cause.clone(), cause, paths);
+            return true;
         }
+        false
     }
 
     /// The trait `path` of an impl, for the messages that name it.
@@ -3474,12 +3282,6 @@ impl<A: Allow> AnalyzeVisitor<A> {
     fn is_free_path(&self, path: &Path, of: PathOf) -> bool {
         self.allowed
             .is_context_free_path(path, of, self.place(), !self.heads_own_name(path))
-    }
-
-    /// [`AllowedPaths::is_allowed_path()`] for `path`, the path of `of`.
-    fn is_allowed_path(&self, path: &Path, of: PathOf) -> bool {
-        self.allowed
-            .is_allowed_path(path, of, self.place(), !self.heads_own_name(path))
     }
 
     /// [`AllowedPaths::is_soft_path()`] for `path`, the path of `of`.
@@ -3797,9 +3599,9 @@ impl<A: Allow> AnalyzeVisitor<A> {
     /// Notes that `ty` is leaked whole, if it names a lifetime of the signature being visited:
     /// `check_leaked_lifetimes()` needs it. `inner` and `depth` are those of its decision.
     fn record_leaked(&mut self, ty: &Type, depth: usize, inner: &Frame) {
-        // The probe of a binder walks its types again for real, and a probe for nested errors
-        // walks them again to see, which must leave nothing keyed by their address.
-        if self.probe.is_some() || self.probing {
+        // The probe of a binder walks its types again for real, which must leave nothing keyed by
+        // their address.
+        if self.probe.is_some() {
             return;
         }
         let walk = match self.signatures.last() {
@@ -4716,7 +4518,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<A> {
         self.with_item(&i.generics, Some(self_ty), true, |visitor| {
             // The trait is checked like a trait bound, but its arguments are analyzed in any case.
             if let Some((_, path, _)) = &i.trait_ {
-                visitor.check_bound_path(path, Cause::Trait(path.clone()), false);
+                visitor.check_bound_path(path, Cause::Trait(path.clone()));
             }
             visitor.walk_item_impl(i)
         });
@@ -4734,12 +4536,6 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<A> {
         let unconstrained = self.unconstrained_ref.take();
         let ambiguous = std::mem::take(&mut self.ambiguous_arg);
         let inherits = self.inherits.take();
-        let entry = TypeEntry {
-            elided_ref,
-            unconstrained: unconstrained.clone(),
-            ambiguous,
-            inherits,
-        };
         self.type_depth += 1;
         self.impossibles.at = self.type_depth;
         let enclosing = self.enclosing.clone();
@@ -4860,7 +4656,7 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<A> {
                     self.decide_through(inner)
                 }
             }
-            (None, None) => self.decide(i, self.type_depth, &entry, inner),
+            (None, None) => self.decide(i, self.type_depth, ambiguous, inner),
         }
         self.type_depth -= 1;
         self.impossibles.at = self.type_depth;
@@ -4973,12 +4769,14 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<A> {
         if is_relaxed_sized(i) {
             return;
         }
-        // A trait bound with a relative path cannot be leaked. The error is about the path, not
-        // the modifier (`Rel`, not `? Rel`).
-        if self.type_depth == 0 && self.check_bound_path(&i.path, bound_cause(i), true) {
-            self.nest_last(|visitor| visitor.visit_trait_bound(i));
-            return;
-        }
+        // A trait bound with a relative path cannot be leaked: it is written as it is, with an
+        // error (not for the modifier: `Rel`, not `? Rel`). A bound is a predicate of the item, so
+        // the types in its arguments are written as they are too, whole, and their relative paths
+        // are paths of the error: a leaked type in it would make the bounds of its generics name a
+        // leaked type, which rustc cannot normalize where an unprovable predicate is accepted (see
+        // `env_cycle()`). The conflicts in them are errors of their own.
+        let start = self.frame.effects.len();
+        let relative = self.type_depth == 0 && self.check_bound_path(&i.path, bound_cause(i));
         let group = bound_group(i.lifetimes.as_ref(), i, None);
         self.with_bound_lifetimes(i.lifetimes.as_ref(), vec![group], |v| {
             // As `syn::visit::visit_trait_bound()`, with the path told to be that of a trait.
@@ -4987,7 +4785,23 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<A> {
                 v.visit_bound_lifetimes(lifetimes);
             }
             v.visit_path_of(&i.path, PathOf::Trait);
-        })
+        });
+        if relative && start < self.frame.effects.len() {
+            let inside = self.frame.effects.split_off(start + 1);
+            let primitives = primitive_names(&inside);
+            let mut paths = Vec::new();
+            let inside = as_written(inside, &mut paths);
+            let part = self.node_part(bound_cause(i), &i.path, primitives);
+            if let Some(Effect::Error(head)) = self.frame.effects.last_mut() {
+                for path in paths {
+                    if !head.paths.contains(&path) {
+                        head.paths.push(path);
+                    }
+                }
+                head.part = Some(part);
+            }
+            self.frame.effects.extend(inside);
+        }
     }
 
     fn visit_const_param(&mut self, i: &ConstParam) {
@@ -5004,13 +4818,16 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<A> {
             }
             Type::Path(TypePath { qself: None, path })
                 if self.is_context_free(path, PathOf::Type) => {}
-            _ => {
-                // The Visitor does not rewrite the type of a const parameter: no part.
-                let paths = self.relative_paths_in(|finder| finder.visit_type(&i.ty));
+            ty => {
+                // The Visitor does not rewrite the type of a const parameter: no part. Its path
+                // is written as it is.
+                let paths = match ty {
+                    Type::Path(TypePath { qself: None, path }) => vec![PathOf::Type.entry(path)],
+                    _ => Vec::new(),
+                };
                 self.relative_path(
                     Cause::Type(i.ty.clone()),
                     Cause::Unreadable(quote!(#i)),
-                    None,
                     paths,
                 );
                 return;
@@ -5183,14 +5000,10 @@ impl<'ast, A: Allow> Visit<'ast> for AnalyzeVisitor<A> {
         {
             self.walk_expr_path(i)
         } else {
-            // A path with a qualified self type is not told from the paths of the Visitor's.
-            let part = match i.qself {
-                None => Some(self.node_part(Cause::expr_path(&i.path), &i.path, PathOf::Value)),
-                Some(_) => None,
-            };
-            let paths = self.relative_paths_in(|finder| finder.path_of(&i.path, expr_path_of(i)));
-            self.relative_path(Cause::path_expr(i), Cause::path_expr(i), part, paths);
-            self.nest_last(|visitor| visitor.visit_expr_path(i));
+            // The path is written as it is, and its arguments are analyzed as usual.
+            let paths = vec![expr_path_of(i).entry(&i.path)];
+            self.relative_path(Cause::path_expr(i), Cause::path_expr(i), paths);
+            self.walk_expr_path(i);
         }
     }
 }
@@ -5214,44 +5027,6 @@ fn primitive_head(path: &Path) -> Option<&Ident> {
         .first()
         .map(|seg| &seg.ident)
         .filter(|ident| path.leading_colon.is_none() && is_primitive_name(ident))
-}
-
-/// Collects the primitive names in the syntax it visits that the copy writes as they are, each
-/// once: those that `AnalyzeVisitor::visit_path_of()` records in a type, for the syntax that is a
-/// part copied as written without the visit of its types (a bound, the path of a value).
-struct PrimitiveNames<'a, A> {
-    visitor: &'a AnalyzeVisitor<A>,
-    found: Vec<Ident>,
-}
-
-impl<A: Allow> PathFinder for PrimitiveNames<'_, A> {
-    fn path(&mut self, path: &Path, of: PathOf) {
-        if self.visitor.is_free_path(path, of) && !self.visitor.starts_with_generic(path) {
-            if let Some(ident) = primitive_head(path) {
-                if !self.found.contains(ident) {
-                    self.found.push(ident.clone());
-                }
-            }
-        }
-    }
-}
-
-/// Collects the relative paths in the syntax it visits ([`AnalyzeVisitor::relative_paths_in()`]).
-struct RelativePaths<'a, A> {
-    visitor: &'a AnalyzeVisitor<A>,
-    found: Vec<Cause>,
-}
-
-impl<A: Allow> PathFinder for RelativePaths<'_, A> {
-    /// Records `path` alone, if it is relative.
-    fn path(&mut self, path: &Path, of: PathOf) {
-        if self.visitor.is_relative_path(path, of) {
-            let entry = of.entry(path);
-            if !self.found.contains(&entry) {
-                self.found.push(entry);
-            }
-        }
-    }
 }
 
 /// The distinct paths of the types among `types` that are paths (bare identifiers), without
@@ -5407,7 +5182,6 @@ impl AssocSelf {
             part: None,
             place: Place::default(),
             paths,
-            nested: Vec::new(),
         };
         self.give(&mut conflict, ty, true);
         conflict
@@ -5515,27 +5289,45 @@ fn block_optional(
 /// [`AnalyzeVisitor::cut_self_cycles()`]). A type that must be an entry is an error, and so is a
 /// reference with a lifetime that has a part that must be one, as its parts cannot stand for it
 /// (`is_whole_reference()`). Another type cannot be an entry, and an optional one is not (the
-/// optional entries are added to `not_optional`).
+/// optional entries are added to `not_optional`). The error comes first: a type that must be an
+/// entry is copied as written but for the types in it, and a reference is copied whole.
 fn cut_conflicts(
-    effects: &mut [Effect],
+    effects: Vec<Effect>,
     conflict: &dyn Fn(&PendingType) -> Option<CheckResult>,
     seen: usize,
     place: Place,
     not_optional: &mut Vec<(Context, String)>,
-) {
-    for effect in effects.iter_mut() {
-        let pending = match &mut *effect {
+) -> Vec<Effect> {
+    let mut found = Vec::new();
+    for effect in effects {
+        let mut pending = match effect {
             Effect::Type(pending) => pending,
-            _ => continue,
+            other => {
+                found.push(other);
+                continue;
+            }
         };
-        if let Some(mut error) = conflict(pending) {
+        if let Some(mut error) = conflict(&pending) {
             let whole = is_whole_reference(&pending.ty);
             if pending.in_graph && (pending.is_must_intern || whole) {
                 // The type is copied as written instead.
-                error.part = Some(pending.part());
+                let part = pending.part();
+                let whole = part.whole;
+                error.part = Some(part);
                 error.seen = seen;
                 error.place = place;
-                *effect = Effect::Error(Box::new(error));
+                let PendingType {
+                    components, inside, ..
+                } = *pending;
+                let mut inner = inside;
+                inner.extend(components);
+                let inner = if whole {
+                    as_written(inner, &mut error.paths)
+                } else {
+                    cut_conflicts(inner, conflict, seen, place, not_optional)
+                };
+                found.push(Effect::Error(Box::new(error)));
+                found.extend(inner);
                 continue;
             }
             pending.no_entry |= pending.in_graph;
@@ -5550,8 +5342,11 @@ fn cut_conflicts(
                 pending.optional = false;
             }
         }
-        cut_conflicts(&mut pending.components, conflict, seen, place, not_optional);
+        let components = std::mem::take(&mut pending.components);
+        pending.components = cut_conflicts(components, conflict, seen, place, not_optional);
+        found.push(Effect::Type(pending));
     }
+    found
 }
 
 /// Adds the contexts of the types in `effects` that may be entries of the copy to `found` (see
@@ -5687,7 +5482,6 @@ fn self_type_conflict(pending: &PendingType, declared: &Generics) -> Option<Chec
         part: None,
         place: Place::default(),
         paths: pending.paths.clone(),
-        nested: Vec::new(),
     })
 }
 

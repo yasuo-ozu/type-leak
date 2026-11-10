@@ -215,7 +215,7 @@ fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() 
     let item: ItemTrait = parse_quote!(
         trait Tr<U = Rel<'_>>: core::fmt::Debug {
             const N: usize = inner::N;
-            fn f(&self, a: Vec<Rel2<'_>>, b: my::W<'_, Rel3>) {
+            fn f(&self, a: Box<dyn Rel2<'_> + Send>, b: my::W<'_, Rel3>) {
                 let _ = inner::f();
             }
         }

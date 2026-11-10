@@ -500,7 +500,8 @@ fn all_relative_paths_are_reported() {
 #[test]
 fn notes_explain_conflicts() {
     // The notes of an error tell why the path cannot be leaked as a whole, and which other paths
-    // inside it depend on the type context. The help tells what to write.
+    // of the same type depend on the type context (`RelA + RelB<'_>`: the two bounds of a trait
+    // object). The types inside have errors of their own. The help tells what to write.
     let item: ItemTrait = parse2(quote! {
         pub trait MyTrait {
             fn f(&self, x: Box<dyn RelA + RelB<'_>>);
@@ -517,13 +518,21 @@ fn notes_explain_conflicts() {
         err[0].notes.first().map(|(_, n)| n.as_str()),
         Some("it cannot be leaked as a whole because of `'_`")
     );
+    assert_eq!(err.len(), 2);
     assert_eq!(
-        to_syn_error(&err).to_string(),
+        to_syn_error(&err[..1]).to_string(),
         "use absolute path: 'Box<dyn RelA + RelB<'_>>'\n\n\
          \x20 = note: it cannot be leaked as a whole because of `'_`\n\
-         \x20 = note: `RelA` also depends on the type context\n\
-         \x20 = note: `RelB<'_>` also depends on the type context\n\
          \x20 = help: use `::std::boxed::Box` instead of `Box`\n"
+    );
+    // The trait object is written as it is too, with its two traits, in an error of its own.
+    assert_eq!(err[1].paths.len(), 2);
+    assert_eq!(
+        to_syn_error(&err[1..]).to_string(),
+        "use absolute path: 'RelA'\n\n\
+         \x20 = note: it cannot be leaked as a whole because of `'_`\n\
+         \x20 = note: `RelB<'_>` also depends on the type context\n\
+         \x20 = help: write `RelA` with an absolute path (e.g. `::my_crate::RelA`)\n"
     );
 }
 
@@ -622,22 +631,25 @@ fn a_type_that_is_leaked_alone_is_no_cause_of_the_conflict_around_it() {
             .collect::<Vec<_>>(),
         ["it cannot be leaked as a whole because of `Self`"]
     );
-    // The paths that are no entry on their own are still listed: the type around `u8` is leaked
-    // whole (`Rel`, relative), and what it holds cannot be (`Tr`, with `Self`).
+    // The type around it is written as it is, `Rel` with it, and what it holds has an error of its
+    // own (`Tr`, with `Self`).
     let err = leak(parse_quote!(Rel<<Self as Tr<u8>>::X>));
     let items = &err;
-    assert_eq!(items.len(), 1);
+    assert_eq!(items.len(), 2);
     assert_eq!(
-        items[0]
-            .notes
-            .iter()
-            .map(|(_, note)| note.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "it cannot be leaked as a whole because of `Self`",
-            "`Tr<u8>::X` also depends on the type context"
-        ]
+        items[0].message,
+        "use absolute path: 'Rel<<Self as Tr<u8>>::X>'"
     );
+    assert_eq!(items[1].message, "use absolute path: 'Tr<u8>::X'");
+    for item in items {
+        assert_eq!(
+            item.notes
+                .iter()
+                .map(|(_, note)| note.as_str())
+                .collect::<Vec<_>>(),
+            ["it cannot be leaked as a whole because of `Self`"]
+        );
+    }
 }
 
 /// The `Leaker` docs, Bare identifiers and consts: a type with an expression that cannot be leaked

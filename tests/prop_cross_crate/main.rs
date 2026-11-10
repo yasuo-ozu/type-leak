@@ -149,9 +149,8 @@
 //!
 //! - after the result: the item is analyzed without the rule (the primitive types and the names of
 //!   the prelude allowed, but for the rule `prelude`), the result is given the rule, then
-//!   `allow(cause)` for the cause of each error that remains until none does (the nested errors of
-//!   an error that was dropped come up: `ErrorItem::nested`; the failures of those are those of the
-//!   accepted copies above), and its Referrer copies the item (`__tl_st_<rule>_res_<id>!`);
+//!   `allow(cause)` for the cause of each error that remains until none does (the errors are a flat
+//!   list, so once), and its Referrer copies the item (`__tl_st_<rule>_res_<id>!`);
 //! - after the config: the item is analyzed with a config that has the rule, the causes of the
 //!   errors that remain are allowed, and its Referrer copies the item (`__tl_st_<rule>_cfg_<id>!`).
 //!

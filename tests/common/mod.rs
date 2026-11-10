@@ -124,21 +124,15 @@ pub fn causes_to_allow(error: &ErrorItem) -> Vec<Cause> {
     found
 }
 
-/// The causes that accept the errors of `errors` (and of the errors inside them) whose cause is
-/// `cause`, by their paths or by the cause (`causes_to_allow()`). If there is no such error, `cause`
-/// alone: a rule that changes nothing.
+/// The causes that accept the errors of `errors` whose cause is `cause`, by their paths or by the
+/// cause (`causes_to_allow()`). If there is no such error, `cause` alone: a rule that changes
+/// nothing.
 #[allow(dead_code)]
 pub fn causes_accepting(errors: &[ErrorItem], cause: &Cause) -> Vec<Cause> {
-    fn collect(errors: &[ErrorItem], cause: &Cause, found: &mut Vec<Cause>) {
-        for error in errors {
-            if error.cause == *cause {
-                found.extend(causes_to_allow(error));
-            }
-            collect(&error.nested, cause, found);
-        }
-    }
     let mut found = Vec::new();
-    collect(errors, cause, &mut found);
+    for error in errors.iter().filter(|error| error.cause == *cause) {
+        found.extend(causes_to_allow(error));
+    }
     if found.is_empty() {
         found.push(cause.clone());
     }
@@ -167,9 +161,8 @@ impl AcceptCause for LeakerResult {
 }
 
 /// Allows every error that remains, until none does, and returns how many rounds it took: each by
-/// its paths, or by its cause if it has none (`causes_to_allow()`). Dropping an error puts its nested
-/// errors in its place ([`type_leak::ErrorItem::nested`]), which are other errors, so one round may
-/// not be enough.
+/// its paths, or by its cause if it has none (`causes_to_allow()`). The errors are a flat list, so
+/// one round is enough.
 #[allow(dead_code)]
 pub fn allow_every_cause(mut result: LeakerResult) -> (LeakerResult, usize) {
     let mut rounds = 0;

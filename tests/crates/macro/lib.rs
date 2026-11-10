@@ -223,15 +223,12 @@ fn causes_to_allow(error: &ErrorItem) -> Vec<Cause> {
     found
 }
 
-/// Allows every error that remains, until none does: each by its paths, or by its cause if it has
-/// none. An error that is dropped puts its nested errors in its place (`ErrorItem::nested`), which
-/// are other errors.
+/// Allows every error that remains: each by its paths, or by its cause if it has none. The errors
+/// are a flat list, so the result has none left.
 pub(crate) fn allow_every_cause(mut result: LeakerResult) -> LeakerResult {
-    while !result.errors().is_empty() {
-        let each: Vec<Vec<Cause>> = result.errors().iter().map(causes_to_allow).collect();
-        for allowed in each {
-            result = result.allow(move |c: &Cause, _: Place| allowed.contains(c));
-        }
+    let each: Vec<Vec<Cause>> = result.errors().iter().map(causes_to_allow).collect();
+    for allowed in each {
+        result = result.allow(move |c: &Cause, _: Place| allowed.contains(c));
     }
     result
 }

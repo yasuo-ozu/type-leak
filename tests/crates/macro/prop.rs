@@ -2364,8 +2364,8 @@ pub(crate) enum Mode {
 /// With `accept`, an item that the Leaker rejects is emitted with the recovered Referrer
 /// (`LeakerResult::into_referrer()`) as an accepted item (the Repeater's impls, the witnesses, the
 /// macro of the Referrer, which copies the part that conflicts as written), with the status `acc`,
-/// if `LeakerResult::allow(cause)` for the cause of every error, and then of the nested errors that
-/// come up, drops every error ([`crate::allow_every_cause()`]; else `accfail`, and the remaining
+/// if `LeakerResult::allow(cause)` for the cause of every error drops every error
+/// ([`crate::allow_every_cause()`]; else `accfail`, and the remaining
 /// errors follow the first ones: it cannot happen). The errors are what the
 /// report says (and what `family()` of the harness explains).
 ///

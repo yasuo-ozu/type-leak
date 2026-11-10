@@ -2057,6 +2057,29 @@ pub mod kinds {
         fn g(&self, y: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>);
     }
 
+    /// Flat recovery (9219, 9220): a type whose own path conflicts is written as it is, and the types
+    /// in it are leaked as usual (`Leaf` in `Two<T, Leaf>`, beside the entry `Leaf` of `g`). `Two` is
+    /// relative, so the Referrer's crate names it. Nothing in it is a trait object that takes its
+    /// lifetime from the path, so the part is not whole.
+    pub struct Two<A: ?Sized, B: ?Sized>(pub PhantomData<(*const A, *const B)>);
+    pub struct Leaf;
+
+    /// `Self` is denied and `T: PartialEq<Self>` names it (`DeniedSelfInBounds`): `Two<T, Leaf>` is
+    /// written as it is, `Two` with it, and `Leaf` in it is an entry, as in `g`.
+    #[prop_leak_accept(id = 9219, allow_self = false, prelude = true)]
+    pub trait DeniedSelfFlat {
+        fn f<T: PartialEq<Self>>(&self, x: Two<T, Leaf>);
+        fn g(&self, y: Leaf);
+    }
+
+    /// The self type of the impl has a bound that names `Self` (`SelfInImplSelfType`, and the `Self`
+    /// of the bound, `UnprovableBound`): `Two<T, Leaf>` is written as it is, and `Leaf` in it is an
+    /// entry, as in the method.
+    #[prop_leak_accept(id = 9220, allow_self = true, prelude = true)]
+    impl<T: ::core::convert::AsRef<Option<Self>>> Two<T, Leaf> {
+        pub fn g(&self, _y: Leaf) {}
+    }
+
     /// The where predicate of the trait names `Self` (`SelfInTraitPredicate`): the type in it is
     /// copied as written, and the impl of the host must satisfy the predicate with the
     /// original types (F44).
@@ -2114,11 +2137,10 @@ pub mod kinds {
     // unrelated error used to get wrong. Each fails to build on the code before its fix.
 
     /// F50, 9205: the path of the value is relative (`core::mem::size_of`, no leading `::`), and
-    /// `Rel` is in its arguments. `Rules::std_crates()` after the analysis drops the path, and the
-    /// copy writes it with `Rel` as written: a crate that does not name `Rel` cannot build it. The
-    /// error must stay until `Rel` is allowed too (`stages = true`: the macro makes the copy after
-    /// each rule, in a crate of the Referrer that invokes it `clean`, and gets it only if the rule
-    /// left no error).
+    /// `Rel` is in its arguments. The path is written as it is and `Rel` is an entry, so
+    /// `Rules::std_crates()` after the analysis drops the only error, and the copy builds in a crate
+    /// that does not name `Rel` (`stages = true`: the macro makes the copy after each rule, in a
+    /// crate of the Referrer that invokes it `clean`, and gets it only if the rule left no error).
     #[prop_leak_accept(
         id = 9205,
         allow_self = true,

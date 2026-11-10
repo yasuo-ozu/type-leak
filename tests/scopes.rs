@@ -974,9 +974,9 @@ fn a_failed_scope_keeps_the_top_levels_of_its_inner_scopes() {
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
     let referrer = result.into_referrer();
-    // The outermost context, the failed scope, and its inner scopes: the ids returned. And the
-    // context of the part that is copied as written, `Rel2<'_>`.
-    assert_eq!(referrer.contexts().count(), 5);
+    // The outermost context, the failed scope, and its inner scopes: the ids returned. (`Rel2<'_>`,
+    // copied as written, is no part of the Referrer, so it has no context.)
+    assert_eq!(referrer.contexts().count(), 4);
     for id in &ids {
         assert!(referrer.contexts().any(|context| context == *id));
     }
@@ -1075,7 +1075,7 @@ fn a_failing_outermost_scope_keeps_its_corrected_result() {
         tokens
     );
     // The calls took the ids they take if the cause is accepted, and the next ones follow them.
-    assert_eq!((module, item), (id(2), id(7)));
+    assert_eq!((module, item), (id(2), id(6)));
     // The entries of the calls are kept, and so are the modules they entered.
     assert!(tokens.contains("RelKept"), "{}", tokens);
     assert!(tokens.contains("RelKept2"), "{}", tokens);
