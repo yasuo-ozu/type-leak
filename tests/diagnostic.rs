@@ -578,9 +578,9 @@ mod spans {
         let stdout = String::from_utf8(output.stdout).unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(output.status.success(), "{}\n{}", stdout, stderr);
-        // The tests ran (the other targets of the package have none): 12 of the errors of the Leaker,
-        // and 2 of `EncodeError`.
-        assert!(stdout.contains("test result: ok. 12 passed"), "{}", stdout);
+        // The tests ran (the other targets of the package have none): 13 of the Leaker (its errors
+        // and its assertions), and 2 of `EncodeError`.
+        assert!(stdout.contains("test result: ok. 13 passed"), "{}", stdout);
         assert!(stdout.contains("test result: ok. 2 passed"), "{}", stdout);
     }
 }

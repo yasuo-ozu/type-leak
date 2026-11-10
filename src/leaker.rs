@@ -15,11 +15,11 @@ use crate::referrer::Referrer;
 use crate::result::{filter, Allow, LeakerResult};
 use crate::util::push_once;
 use crate::view::View;
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::TokenStream;
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use syn::*;
-use template_quote::quote;
+use template_quote::{quote, quote_spanned};
 
 /// Finds the types of an item that depend on where they are written, and collects them in a
 /// [`Referrer`].
@@ -207,22 +207,27 @@ impl<A: Allow> Leaker<A> {
     }
 
     /// Returns a compile-time check that the primitive names copied as written (`u8` in `const N:
-    /// u8`, or by [`Rules::primitive()`](crate::Rules::primitive)) are not shadowed, also those in a part that an error
-    /// makes copied as written. Emit it in the Leaker's crate. It is empty if none was copied.
+    /// u8`, or by [`Rules::primitive()`](crate::Rules::primitive)) are not shadowed, also those in a
+    /// part that an error makes copied as written. Emit it in the Leaker's crate. It is empty if none
+    /// was copied. Each check has the span of its name, so rustc reports a shadowed one there.
     #[must_use]
     pub fn assertions(&self) -> TokenStream {
         if self.assumed_primitives.is_empty() {
             return TokenStream::new();
         }
+        let checks = self.assumed_primitives.iter().map(|ident| {
+            let name = Ident::new(
+                &format!("__type_leak_assert_{}_is_primitive", ident),
+                ident.span(),
+            );
+            quote_spanned! {ident.span() =>
+                fn #name(x: &#ident) -> &::core::primitive::#ident { x }
+            }
+        });
         quote! {
             #[allow(dead_code, non_snake_case)]
             const _: () = {
-                #(for ident in &self.assumed_primitives) {
-                    fn #{Ident::new(
-                        &format!("__type_leak_assert_{}_is_primitive", ident),
-                        Span::call_site(),
-                    )}(x: &#ident) -> &::core::primitive::#ident { x }
-                }
+                #(#checks)*
             };
         }
     }

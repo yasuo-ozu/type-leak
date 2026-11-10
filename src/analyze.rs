@@ -1539,6 +1539,9 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         let has_impossible = self.impossibles.len() > inner.impossible_start;
         let has_must = inner.min_depth != usize::MAX;
         let mentions_local = inner.local_scope < self.scopes.len();
+        // A conflict that holds a bare identifier, which may be a const, is copied whole, as
+        // `bare_identifiers()` makes one without a cause of its own.
+        let holds_bare = holds_bare_ident(ty, &inner) && self.has_hard_cause(&inner);
         let effects = std::mem::take(&mut inner.effects);
 
         if own.is_none() && self.checks_env() && self.self_in_predicate(ty, depth, &inner, &effects)
@@ -1557,6 +1560,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 // of the parts stay), and in a predicate (a leaked type there is a projection that
                 // rustc cannot normalize while it checks the bounds, `env_cycle()`).
                 let whole = bare
+                    || holds_bare
                     || inner.adopted.contains(&depth)
                     || self.in_predicate()
                     || is_whole_reference(ty);

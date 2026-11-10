@@ -1965,6 +1965,19 @@ pub mod kinds {
         fn g(&self, x: ::type_leak_test_leaker::kinds::Bare<dyn SharedTr>);
     }
 
+    /// A const of the module, and a type of the module with a const parameter.
+    pub const LEN95: usize = 3;
+    pub struct ConstHolder<const N: usize, T>(pub PhantomData<T>);
+
+    /// `x` holds the bare identifier `LEN95`, a const, in a relative path whose other argument
+    /// cannot be leaked (a closure in an array length), so the type has errors of its own. Accepted,
+    /// `ConstHolder<LEN95, ..>` is copied as written, whole: `LEN95` leaked alone would be written
+    /// as a type (E0573 in the Repeater's impl). `y` is leaked as usual (F95).
+    #[prop_leak_accept(id = 9256, prelude = true)]
+    pub trait BareConstHolder {
+        fn f(&self, x: ConstHolder<LEN95, [u8; { let _f = || 0; 3 }]>, y: Rel);
+    }
+
     /// `a1` is an entry (`Wrap<Y>`, with the bound `Y: Fn(Rel)` in its context). In `ai`, `impl
     /// Into<Wrap<Y>>` is a generic of the method whose bound names it, and the copy would write the
     /// entry as a path through the Repeater there, in a predicate of the method, where rustc cannot

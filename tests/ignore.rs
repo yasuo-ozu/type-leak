@@ -341,11 +341,11 @@ fn rows() -> Vec<Row> {
             item: parse_quote!(
                 impl ::p::Tr for u8 {
                     type A = u8;
-                    fn f(&self, x: Wrap<Self::A, Rel>, y: Rel) {}
+                    fn f(&self, x: Wrap<Self::A, Rel<u8>>, y: Rel<u8>) {}
                 }
             ),
-            errors: vec![rt(SelfProjection, parse_quote!(Wrap<Self::A, Rel>))],
-            live: vec![(0, parse_quote!(Rel)), (1, parse_quote!(u8))],
+            errors: vec![rt(SelfProjection, parse_quote!(Wrap<Self::A, Rel<u8>>))],
+            live: vec![(0, parse_quote!(Rel<u8>)), (1, parse_quote!(u8))],
             copy: parse_quote!(
                 impl ::p::Tr for E1 {
                     type A = E1;
@@ -355,12 +355,12 @@ fn rows() -> Vec<Row> {
             ignored: vec![Ignored {
                 error: 0,
                 left: vec![],
-                live: vec![(0, parse_quote!(Rel)), (1, parse_quote!(u8))],
+                live: vec![(0, parse_quote!(Rel<u8>)), (1, parse_quote!(u8))],
                 impls: 2,
                 copy: parse_quote!(
                     impl ::p::Tr for E1 {
                         type A = E1;
-                        fn f(&self, x: Wrap<Self::A, Rel>, y: E0) {}
+                        fn f(&self, x: Wrap<Self::A, Rel<u8>>, y: E0) {}
                     }
                 ),
             }],
@@ -368,12 +368,12 @@ fn rows() -> Vec<Row> {
         Row {
             name: "Self in a default",
             item: parse_quote!(
-                trait Tr<T, U = Rel<Self, Other>> {
-                    fn f(&self, x: Rel2, y: Other);
+                trait Tr<T, U = Rel<Self, Other<u8>>> {
+                    fn f(&self, x: Rel2, y: Other<u8>);
                 }
             ),
-            errors: vec![rt(SelfInDefault, parse_quote!(Rel<Self, Other>))],
-            live: vec![(0, parse_quote!(Other)), (1, parse_quote!(Rel2))],
+            errors: vec![rt(SelfInDefault, parse_quote!(Rel<Self, Other<u8>>))],
+            live: vec![(0, parse_quote!(Other<u8>)), (1, parse_quote!(Rel2))],
             copy: parse_quote!(
                 trait Tr<T, U = Rel<Self, E0>> {
                     fn f(&self, x: E1, y: E0);
@@ -382,10 +382,10 @@ fn rows() -> Vec<Row> {
             ignored: vec![Ignored {
                 error: 0,
                 left: vec![],
-                live: vec![(0, parse_quote!(Other)), (1, parse_quote!(Rel2))],
+                live: vec![(0, parse_quote!(Other<u8>)), (1, parse_quote!(Rel2))],
                 impls: 2,
                 copy: parse_quote!(
-                    trait Tr<T, U = Rel<Self, Other>> {
+                    trait Tr<T, U = Rel<Self, Other<u8>>> {
                         fn f(&self, x: E1, y: E0);
                     }
                 ),

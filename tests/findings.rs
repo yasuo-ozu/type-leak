@@ -10654,17 +10654,18 @@ fn f43_copy(referrer: &Referrer, context: ContextId, direct: &[Type], nested: &I
 /// entry as before (`Rel<T, Other>` of the method of the trait itself). The top-level context
 /// records the `Self` of the scope, or the visitor would write the bound of `T` there too.
 ///
-/// There is a cross-crate fixture in `tests/cross_crate.rs`.
+/// There is a cross-crate fixture in `tests/cross_crate.rs`. The test writes `Other<u8>`: a bare
+/// `Other` may be a const, which makes the part whole (F95).
 #[test]
 fn f43_a_type_whose_context_cannot_be_written_is_copied_as_written() {
     let nested: Item = parse_quote!(
         impl ::p::W for X {
-            fn f(&self, x: Rel<T, Other>) {}
-            fn g(&self, y: Other) {}
+            fn f(&self, x: Rel<T, Other<u8>>) {}
+            fn g(&self, y: Other<u8>) {}
         }
     );
     // The same tokens where the context can be written: in the trait itself.
-    let direct: Vec<Type> = vec![parse_quote!(Rel<T, Other>)];
+    let direct: Vec<Type> = vec![parse_quote!(Rel<T, Other<u8>>)];
     let (result, context) = f43_analyze(std_config(), false, &direct, &nested);
     assert_eq!(
         joined_messages(result.errors()),
@@ -10674,13 +10675,16 @@ fn f43_a_type_whose_context_cannot_be_written_is_copied_as_written() {
     let referrer = result.recovered();
     // Not whole, and no entry has its tokens and context: a part that the visitor does not look at,
     // which is there because the error is about it.
-    assert_eq!(parts_of(&referrer), ["type (Rel < T , Other >) unwritable"]);
-    let (other, outer) = (
-        entry(&referrer, "Other"),
-        entry(&referrer, "Rel < T , Other >"),
+    assert_eq!(
+        parts_of(&referrer),
+        ["type (Rel < T , Other < u8 > >) unwritable"]
     );
-    // The part is left as written, and `Other` in it is an entry as in `g`; `Rel<T, Other>` of the
-    // trait (a context that can be written) is one as ever.
+    let (other, outer) = (
+        entry(&referrer, "Other < u8 >"),
+        entry(&referrer, "Rel < T , Other < u8 > >"),
+    );
+    // The part is left as written, and `Other<u8>` in it is an entry as in `g`; `Rel<T, Other<u8>>`
+    // of the trait (a context that can be written) is one as ever.
     let expected = format!(
         "trait Tr < T : AsRef < Self > > {{ fn direct (& self , x0 : P < {outer}usize >) ; fn nested () {{ impl :: p :: W for P < {x}usize > {{ fn f (& self , x : Rel < T , P < {other}usize > >) {{ }} fn g (& self , y : P < {other}usize >) {{ }} }} }} }}",
         outer = outer,
@@ -17649,4 +17653,293 @@ fn f93_the_debug_of_the_public_types_is_the_same_in_every_run() {
         "the Debug text of the same input differs between builds: {:?}",
         differ
     );
+}
+
+// ── F95 ──────────────────────────────────────────────────────────────────────
+
+/// F95 (fixed): a type with an error of its own that holds a bare identifier (`N`, which may be a
+/// const) was copied with its parts leaked, so `allow()` of every cause on the result made `N` an
+/// entry, and the copy wrote a type where rustc may expect a const (E0747). The same rule given to
+/// the Leaker copies the type whole (`MaybeConst`): the two stages disagreed.
+///
+/// Trigger: `struct S(Rel<N, [u8; { let _f = || 0; 3 }]>)` (a closure in an array length is a hard
+/// cause, and the relative `Rel` is the type's own cause) or `Rel<N, Self::A>` in an impl, with
+/// `Leaker::new()`, then `allow()` of every cause and `finish()`.
+///
+/// Cause: `bare_identifiers()` returns early for a type that has a cause of its own, so `decide()`
+/// did not make the conflict whole.
+///
+/// Fix: `decide()` copies a conflict whole when it holds a bare identifier under a hard cause, as
+/// `bare_identifiers()` does for a type without a cause of its own. The identifier is then one of
+/// the paths of the error, so `allow()` must accept it too. Fixture 9256 (`BareConstHolder`, a
+/// const `LEN95`) did not build before the fix: E0573 in the Repeater's impl of the entry `LEN95`.
+#[test]
+fn f95_a_conflict_that_holds_a_bare_identifier_is_copied_whole() {
+    fn intern<A: Allow>(leaker: &mut Leaker<A>, item: &Item) {
+        match item {
+            Item::Struct(item) => {
+                leaker.intern_struct(item);
+            }
+            Item::Impl(item) => {
+                leaker.intern_impl(item);
+            }
+            _ => unreachable!(),
+        }
+    }
+    let items: Vec<Item> = vec![
+        parse_quote!(
+            struct S(
+                Rel<
+                    N,
+                    [u8; {
+                        let _f = || 0;
+                        3
+                    }],
+                >,
+            );
+        ),
+        parse_quote!(impl Tr for X { type A = u8; fn f(&self, _x: Rel<N, Self::A>) {} }),
+    ];
+    for item in &items {
+        let case = string(item);
+        // The rule given to the Leaker: `N` may be a const, so the type is copied whole.
+        let mut early = Leaker::with_rule(|cause: &Cause, _: Place| {
+            cause
+                .path()
+                .map_or(false, |path| path.is_ident("Rel") || path.is_ident("Tr"))
+        });
+        intern(&mut early, item);
+        let early = early.result();
+        assert_eq!(
+            early.errors().iter().map(|e| e.reason).collect::<Vec<_>>(),
+            [Reason::MaybeConst],
+            "{}",
+            case
+        );
+        // The rule given to the result: the type has errors of its own, and `N` is among the paths
+        // of the one of the part.
+        let mut late = Leaker::new();
+        intern(&mut late, item);
+        let late = late.result();
+        assert!(
+            late.errors().iter().any(|e| e
+                .paths
+                .iter()
+                .any(|path| path.path().map_or(false, |path| path.is_ident("N")))),
+            "{}: {}",
+            case,
+            joined_messages(late.errors())
+        );
+        let (early, late) = (early.recovered(), late.recovered());
+        assert!(
+            !entries_text(&late, true).contains(&"N".to_string()),
+            "{}",
+            case
+        );
+        assert!(
+            parts_of(&late).iter().all(|part| part.ends_with("whole")),
+            "{}: {:?}",
+            case,
+            parts_of(&late)
+        );
+        assert_eq!(late, early, "{}", case);
+    }
+}
+
+// ── F94 ──────────────────────────────────────────────────────────────────────
+
+/// F94 (fixed): `Visitor::with_self()` refused a host that is a trait object without a lifetime
+/// bound (`dyn Shape`) because of an entry that the host is never written for: an entry of another
+/// top-level item that the same Leaker analyzed, or of an item nested in the visited one, each with
+/// `Self: 'a` in its context.
+///
+/// Trigger: one Leaker analyzes `trait Borrowing<'a> where Self: 'a { fn get(&self) -> Ref<'a,
+/// Self>; }` and then `trait Plain { fn name(&self) -> Name<Self>; }`, and `visitor(plain, ..)
+/// .with_self(dyn Shape)` was `Err(UnboundedTraitObject)`. The same for a scope from
+/// `enter_generics()` that visits `trait Inner<'a> where Self: 'a { .. Rel<'a, Self> .. }`, and for a
+/// trait whose default method declares that `Inner` in its body (`check_values`).
+///
+/// Cause: `with_self()` looked at every live entry of the Referrer. The host is written only for the
+/// `Self` of the visited item: the visitor finds an entry by its type and its context, and the
+/// context has the `Self` requirement of the visited item, so an entry of another `Self` is never
+/// written with the host (inside a nested item the host is not used at all).
+///
+/// Fix: `with_self()` checks only the entries whose `self_ty` is the requirement of the visited
+/// context. With a scope that has none (`enter_generics()`), no entry is checked. An entry of the
+/// visited `Self` with `Self: 'a` still refuses `dyn Shape`, and `dyn Shape + 'static` fits.
+#[test]
+fn f94_with_self_checks_only_the_entries_of_the_visited_self() {
+    let projection = common::projection(parse_quote!(Repeater), 7);
+    let bare: Type = parse_quote!(dyn Shape);
+    let bounded: Type = parse_quote!(dyn Shape + 'static);
+    let refused = |referrer: &Referrer, context: ContextId, host: &Type| match referrer
+        .visitor(context, &projection)
+        .with_self(host.clone())
+    {
+        Ok(_) => None,
+        Err(EncodeError::UnboundedTraitObject(ty)) => Some(*ty),
+        Err(error) => panic!("another error: {:?}", error),
+    };
+    // The copy of `item` that the visitor writes with the host.
+    let written = |referrer: &Referrer, context: ContextId, host: &Type, mut item: Item| {
+        referrer
+            .visitor(context, &projection)
+            .with_self(host.clone())
+            .unwrap()
+            .visit_item_mut(&mut item);
+        string(&item)
+    };
+    // Some entry with `Self: 'a` in its context is in the Referrer.
+    let has_outlives = |referrer: &Referrer, ty: &str| {
+        referrer
+            .iter()
+            .any(|(_, t, context)| string(t) == ty && !context.self_outlives.is_empty())
+    };
+
+    // (1) An entry of another top-level item of the same Leaker.
+    let borrowing: ItemTrait = parse_quote!(
+        pub trait Borrowing<'a>
+        where
+            Self: 'a,
+        {
+            fn get(&self) -> Ref<'a, Self>;
+        }
+    );
+    let plain: ItemTrait = parse_quote!(
+        pub trait Plain {
+            fn name(&self) -> Name<Self>;
+        }
+    );
+    let mut leaker = Leaker::new();
+    let borrowing_id = leaker.intern_trait(&borrowing);
+    let plain_id = leaker.intern_trait(&plain);
+    let referrer = leaker.result().finish().unwrap();
+    assert!(has_outlives(&referrer, "Ref < 'a , Self >"));
+    let key = projection.key(common::entry_id_at(
+        &referrer,
+        entry(&referrer, "Name < Self >"),
+    ));
+    for host in [&bare, &bounded] {
+        assert_eq!(refused(&referrer, plain_id, host), None, "{}", string(host));
+        let expected: ItemTrait = parse_quote!(
+            pub trait Plain {
+                fn name(&self) -> <#host as Repeater<(), #key>>::Type;
+            }
+        );
+        assert_eq!(
+            written(&referrer, plain_id, host, Item::Trait(plain.clone())),
+            string(&expected),
+            "{}",
+            string(host)
+        );
+    }
+    // The entry of the visited item itself still refuses the host without a bound.
+    assert_eq!(refused(&referrer, borrowing_id, &bare), Some(bare.clone()));
+    assert_eq!(refused(&referrer, borrowing_id, &bounded), None);
+
+    // (2) An entry of an item nested in the visited syntax: it has a `Self` of its own.
+    let inner: Item = parse_quote!(
+        trait Inner<'a>
+        where
+            Self: 'a,
+        {
+            fn f(&self) -> Rel<'a, Self>;
+        }
+    );
+    let mut leaker = Leaker::new();
+    let (scope, ()) = leaker.enter_generics(&Generics::default(), |view| view.visit_item(&inner));
+    let referrer = leaker.result().finish().unwrap();
+    assert!(has_outlives(&referrer, "Rel < 'a , Self >"));
+    for host in [&bare, &bounded] {
+        assert_eq!(refused(&referrer, scope, host), None, "{}", string(host));
+    }
+    // Inside an impl, whose context has a `Self` of its own: the nested trait is a nested item, the
+    // host is not written in it and its entry stays as written.
+    let mut leaker = Leaker::new();
+    let (_, context) = leaker.enter_generics(&Generics::default(), |view| {
+        view.enter_impl(&Generics::default(), &parse_quote!(::p::W), None, |view| {
+            view.visit_item(&inner)
+        })
+        .0
+    });
+    let referrer = leaker.result().finish().unwrap();
+    assert!(has_outlives(&referrer, "Rel < 'a , Self >"));
+    let imp: ItemImpl = parse_quote!(
+        impl ::p::W {
+            fn m(&self) {
+                trait Inner<'a>
+                where
+                    Self: 'a,
+                {
+                    fn f(&self) -> Rel<'a, Self>;
+                }
+            }
+        }
+    );
+    for host in [&bare, &bounded] {
+        assert_eq!(refused(&referrer, context, host), None, "{}", string(host));
+        assert_eq!(
+            written(&referrer, context, host, Item::Impl(imp.clone())),
+            string(&imp),
+            "{}",
+            string(host)
+        );
+    }
+
+    // The same in a trait: the item nested in the body of a method has a `Self` of its own.
+    let mut leaker = Leaker::new();
+    let (outer_id, ()) = leaker.enter_trait(&parse_quote!(Outer), &Generics::default(), |view| {
+        view.visit_type(&parse_quote!(Name<Self>));
+        view.visit_item(&inner);
+    });
+    let referrer = leaker.result().finish().unwrap();
+    assert!(has_outlives(&referrer, "Rel < 'a , Self >"));
+    let key = projection.key(common::entry_id_at(
+        &referrer,
+        entry(&referrer, "Name < Self >"),
+    ));
+    for host in [&bare, &bounded] {
+        assert_eq!(refused(&referrer, outer_id, host), None, "{}", string(host));
+        let expected: ItemTrait = parse_quote!(
+            pub trait Outer {
+                fn name(&self) -> <#host as Repeater<(), #key>>::Type;
+                fn make(&self) {
+                    trait Inner<'a>
+                    where
+                        Self: 'a,
+                    {
+                        fn f(&self) -> Rel<'a, Self>;
+                    }
+                }
+            }
+        );
+        let outer: ItemTrait = parse_quote!(
+            pub trait Outer {
+                fn name(&self) -> Name<Self>;
+                fn make(&self) {
+                    trait Inner<'a>
+                    where
+                        Self: 'a,
+                    {
+                        fn f(&self) -> Rel<'a, Self>;
+                    }
+                }
+            }
+        );
+        assert_eq!(
+            written(&referrer, outer_id, host, Item::Trait(outer)),
+            string(&expected),
+            "{}",
+            string(host)
+        );
+    }
+
+    // A scope with no `Self` has no entry of the visited `Self`: always Ok.
+    let mut leaker = Leaker::new();
+    leaker.intern_trait(&borrowing);
+    let (scope, ()) = leaker.enter_generics(&Generics::default(), |view| {
+        view.visit_type(&parse_quote!(Rel<u8>))
+    });
+    let referrer = leaker.result().finish().unwrap();
+    assert_eq!(refused(&referrer, scope, &bare), None);
 }

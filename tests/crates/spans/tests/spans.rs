@@ -504,3 +504,43 @@ fn a_macro_cause_of_a_value_and_of_self_is_in_the_item() {
         }
     }
 }
+
+/// `Leaker::assertions()` writes the check of each primitive name at the name, so that rustc
+/// reports a shadowed one (`struct u8;`) at the type in the item, not at the macro.
+#[test]
+fn the_check_of_a_primitive_name_is_at_the_name() {
+    let source = "struct S {\n    a: u8,\n    b: u16,\n    c: u8,\n}";
+    let item: ItemStruct = parse_str(source).unwrap();
+    let mut leaker = Leaker::with_rule(Rules::new().primitive());
+    leaker.intern_struct(&item);
+    let checks: ItemConst = parse2(leaker.assertions()).unwrap();
+    let block = match &*checks.expr {
+        Expr::Block(block) => &block.block,
+        other => panic!("{}", other.to_token_stream()),
+    };
+    let mut names = Vec::new();
+    for stmt in &block.stmts {
+        let check = match stmt {
+            Stmt::Item(Item::Fn(check)) => check,
+            other => panic!("{}", other.to_token_stream()),
+        };
+        let name = check.sig.ident.to_string();
+        let primitive = name
+            .trim_start_matches("__type_leak_assert_")
+            .trim_end_matches("_is_primitive")
+            .to_string();
+        // The first place that names it.
+        let (start, end) = location_of(source, &primitive, 0);
+        for (token, at_start, at_end) in token_places(check.to_token_stream()) {
+            assert_eq!(
+                (at_start, at_end),
+                ((start.line, start.column), (end.line, end.column)),
+                "`{}` in the check of `{}`",
+                token,
+                primitive
+            );
+        }
+        names.push(primitive);
+    }
+    assert_eq!(names, ["u8", "u16"]);
+}

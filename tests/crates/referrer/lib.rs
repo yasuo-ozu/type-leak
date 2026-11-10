@@ -365,6 +365,9 @@ pub mod accepted {
     type_leak_test_leaker::__tl_prop_9187!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__tl_prop_9188!(path = ::type_leak_test_leaker::kinds, accept);
     type_leak_test_leaker::__tl_prop_9189!(path = ::type_leak_test_leaker::kinds, accept);
+    #[allow(unused_imports)]
+    use type_leak_test_leaker::kinds::{ConstHolder, LEN95};
+    type_leak_test_leaker::__tl_prop_9256!(path = ::type_leak_test_leaker::kinds, accept);
     // Items whose macro carries the errors (`prop_leak_result`) and whose invocation says what it
     // allows: all the errors are dropped, or the crate would not compile. The copies keep `Clone`,
     // `core::fmt::Debug`, `PlainTr` and `Held<'_>` as written (the crate names the last two).

@@ -422,8 +422,9 @@ impl Referrer {
     /// a fresh binder (`for<'__tl_e0> fn(&'__tl_e0 ..) -> &'__tl_e0 u8`).
     ///
     /// If `Projection::of()` fails for an entry, the visitor leaves its type as written, for rustc to
-    /// report. With the same `projection` as crate A it cannot, except for a host
-    /// ([`Visitor::with_self()`]).
+    /// report. With the same `projection` as crate A it cannot, except for a type that the closure of
+    /// [`Visitor::with_nested_self()`] returns (`dyn Inner<'a>` without `+ 'a`, for an entry of a
+    /// nested item).
     ///
     /// # Panics
     ///
@@ -1272,9 +1273,9 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> Visitor<'r, N> {
     /// leaked whole ([Elided lifetimes](crate::Leaker#elided-lifetimes)).
     ///
     /// Fails with [`EncodeError::UnboundedTraitObject`] if `self_ty` is a trait object without a
-    /// lifetime bound (`dyn Tr`) and an entry has `Self: 'a` in its context: write `dyn Tr +
-    /// 'static`. That is the only failure that [`Projection::of()`] can have in the copy when both
-    /// crates use the same [`Projection`].
+    /// lifetime bound (`dyn Tr`) and an entry of the visited item's `Self` has `Self: 'a` in its
+    /// context: write `dyn Tr + 'static`. The entries of nested items are written for the closure of
+    /// [`with_nested_self()`](Visitor::with_nested_self) instead.
     ///
     /// ```
     /// # use type_leak::*;
@@ -1302,7 +1303,9 @@ impl<'r, N: FnMut(&SelfRequirement) -> Option<Type>> Visitor<'r, N> {
     pub fn with_self(mut self, self_ty: Type) -> std::result::Result<Self, EncodeError> {
         for ix in self.referrer.live() {
             let (_, context) = self.referrer.entry(ix);
-            if !context.self_outlives.is_empty() {
+            // The host is written only for the `Self` of the visited context: an entry of another
+            // `Self` (another item of the Leaker, a nested item) is never found with it.
+            if context.self_ty == self.state.self_req && !context.self_outlives.is_empty() {
                 let params: Vec<&GenericParam> = context.generics.params.iter().collect();
                 encode_self_outlives(&params, &self_ty, &context.self_outlives)?;
             }

@@ -1411,6 +1411,9 @@ fn accepted_conflicts_are_copied_as_written() {
         // (f) the same as (d), with a relative type beside the trait object in the path of `f`: it
         // is an entry, and replaced, whereas the Referrer's crate does not name it.
         (9189, __tl_report_9189!(), allowed("trait", 2, 2, 1)),
+        // (g) `ConstHolder<LEN95, ..>` holds a bare identifier that is a const and has errors of
+        // its own: copied as written, whole, and `y`'s `Rel` is the entry (F95).
+        (9256, __tl_report_9256!(), allowed("trait", 1, 2, 2)),
     ];
     for (id, text, expected) in table {
         assert_eq!(reported(id, text), expected, "item {}: {}", id, text);
@@ -1441,6 +1444,15 @@ fn accepted_conflicts_are_copied_as_written() {
         errors(__tl_errors_9189!()),
         [error("RelativePath", "Trait", "SharedTr")]
     );
+    // The report writes the closure's `|` as a space (its separator), which `squash()` drops.
+    assert_eq!(
+        errors(__tl_errors_9256!()),
+        [error(
+            "RelativePath",
+            "Type",
+            "ConstHolder<LEN95,[u8;{let_f=0;3}]>"
+        )]
+    );
 
     // (a) The host implements the trait, with `Held<'b>` in the signature as written.
     fn held_input<T: l::HeldInput>() {}
@@ -1458,6 +1470,9 @@ fn accepted_conflicts_are_copied_as_written() {
     // (f) `f` keeps `dyn SharedTr`, and the relative type beside it is an entry, like `g`'s.
     fn elided_with_sibling<T: l::ElidedWithSibling>() {}
     elided_with_sibling::<r::Host9189>();
+    // (g) `f` keeps `ConstHolder<LEN95, ..>` as written, and `y` takes the entry.
+    fn bare_const_holder<T: l::BareConstHolder>() {}
+    bare_const_holder::<r::Host9256>();
     // (c) The copy holds the original types: `Self` is replaced by the Visitor with the Leaker's
     // type, as it is for any struct.
     let copy = r::NoSelfMeaning {
