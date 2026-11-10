@@ -80,6 +80,7 @@
 //! | `f69_the_elided_lifetime_of_a_signature_is_named_where_a_use_site_adds_lifetimes` | `substitute_args()` and `complete_params()` wrote an argument with lifetimes into `fn(&Cell<[U; 1]>) -> &u8` (or `Fn(&U) -> &u8`, `Self` with lifetimes): two lifetimes in the inputs, E0106; the elided one is named with a `for<'e>` binder | fixed |
 //! | `f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_lifetimes_into_its_inputs` | the Visitor wrote the path through the Repeater of an entry whose arguments name lifetimes (the arguments of a use site, `&'static str` for `T`) into `fn(&Vec<T>) -> &u8` (or `Fn(&Vec<T>) -> &u8`): two lifetimes in the inputs, E0106; the elided one is named after `type_fn` has written | fixed |
 //! | `f71_an_optional_type_in_a_where_predicate_that_a_context_carries_is_written_as_it_is` | an optional type (a type of another crate) in a where predicate that is not a bound of a generic (`::std::vec::Vec<T>: Clone`), carried by the context of an entry, was an optional entry that the copy replaced: the Repeater's impl of the entry needs the predicate, which the copy's environment has only in the form that names the path, so E0277 (the fixture 9005 allowed `::std` to hide it); it is written as it is, as for the bound cycles of F17, F18 and F68 | fixed |
+//! | `f72_a_type_copied_as_written_for_a_method_lifetime_is_left_only_where_the_copy_leaves_it_unconstrained` | the type that an error copies as written for a method (`Wrap<'x>` of `f`, the only input that names the lifetime its output names) was also left so in a method where another input keeps the lifetime (`b: &'x u8`): a relative path in the copy, and the entry unused | fixed |
 //!
 //! No finding is a `bug` any more: each is `fixed` (a regression test) or a `limitation` (it pins
 //! behaviour that the docs of `Leaker` document, or that follows from what rustc accepts). No test
@@ -15740,4 +15741,245 @@ fn f71_an_optional_type_in_a_where_predicate_that_a_context_carries_is_written_a
     );
     let (_, entries, _) = f71_copy(Rules::new().primitive().prelude(), &primitive);
     assert_eq!(entries, ["Cl < T >"]);
+}
+
+// ── F72 ──────────────────────────────────────────────────────────────────────
+
+/// The type of the first typed argument of the method `name` of `copy`, as tokens.
+fn f72_first_input(copy: &ItemTrait, name: &str) -> String {
+    let sig = copy
+        .items
+        .iter()
+        .find_map(|item| match item {
+            TraitItem::Fn(method) if method.sig.ident == name => Some(&method.sig),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no method `{}`", name));
+    sig.inputs
+        .iter()
+        .find_map(|input| match input {
+            FnArg::Typed(arg) => Some(string(&*arg.ty)),
+            FnArg::Receiver(_) => None,
+        })
+        .unwrap_or_else(|| panic!("`{}` has no typed input", name))
+}
+
+/// F72 (fixed): a type that an error copies as written for a method lifetime was copied so in every
+/// method that names the lifetime in its output, also where another input keeps it as written.
+///
+/// Trigger, a relative path left in the copy (E0412 in a crate that does not name it): `trait Tr {
+/// fn f<'x>(&self, a: Wrap<'x>) -> &'x u8; fn g<'x>(&self, a: Wrap<'x>, b: &'x u8) -> &'x u8; }`.
+/// In `f` the only input that names `'x` is `Wrap<'x>`, so a copy with the entry would have `'x`
+/// in a projection only, early-bound where the trait has it late-bound (F7, E0195): the Leaker
+/// reports `Wrap<'x>` (`UnconstrainedLifetime`) and the Referrer leaves it as written there (`sig
+/// ('x)`, F48). In `g` the input `b: &'x u8` keeps `'x`, no error is reported, and `Wrap<'x>` is
+/// the entry 0, which the copy of `g` alone replaces: `fn g<'x>(&self, a: E0, b: &'x E1) -> &'x
+/// E1`. Together the copy was `fn g<'x>(&self, a: Wrap<'x>, b: &'x E1) -> &'x E1`: the entry
+/// unused, and the type of the Leaker's crate written in the Referrer's. Found while reading
+/// `SignatureFacts::covers()`; the property test did not show it: its items rarely have a method
+/// with a type that is an error in one signature and an entry in another.
+///
+/// Cause: the Visitor took a signature for one with the same fault when the output names the
+/// lifetime and no bound does (`unconstrained_in_output()`), which is the Leaker's first gate
+/// (`facts.unconstrained()`), but not the check itself: the lifetime is unconstrained in the copy
+/// only if every way to it in the inputs meets a type leaked whole (`unconstraining_types()`), and
+/// an input that keeps it (`&'x u8`, `Option<&'x u8>` where `Option` is allowed, `(u8, &'x u8)`,
+/// `&'x self`, `Box<dyn Fn(&'x u8)>`) is a way that meets none.
+///
+/// Fix: where a part with such a mark may apply (the signature names a lifetime that a mark has),
+/// the Visitor visits the inputs once without calling its closures, each entry replaced by `()`,
+/// and scans the result for the lifetime with the Leaker's own scan (`scan_anchors()`, shared:
+/// `unconstrained_in_copy()`). A lifetime that an input of the original constrains and no input
+/// of the copy does is unconstrained in the copy, and the mark applies if the signature has one
+/// that it names (`SignatureFacts::covers()`); one of two lifetimes that the type names may be kept
+/// by another input. The copy of `f` is as it was. There is a cross-crate fixture in
+/// `tests/cross_crate.rs` (9245): it failed to build on the code before the fix.
+///
+/// Limitation: the decision is made for the signature, not for each place in it. A type inside a
+/// culprit, which the Leaker leaves an entry because another way keeps the lifetime
+/// (`R2<Rel<'x>, &'x u8>`), is written as it is if it has a part of its own from another
+/// signature and an entry (`R2` is an entry of a third signature): the Leaker decides by the
+/// rounds of `unconstraining_types()`, which the Visitor does not follow.
+#[test]
+fn f72_a_type_copied_as_written_for_a_method_lifetime_is_left_only_where_the_copy_leaves_it_unconstrained(
+) {
+    let unconstrained = Reason::UnconstrainedLifetime;
+    let wrap = "Wrap < 'x >";
+    let as_written = wrap.to_string();
+    let entry = "P < 0usize >".to_string();
+
+    // The trigger: `f` has the error and keeps the type, `g` has the entry.
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f<'x>(&self, a: Wrap<'x>) -> &'x u8;
+            fn g<'x>(&self, a: Wrap<'x>, b: &'x u8) -> &'x u8;
+        }
+    );
+    let (copy, errors, entries) = f63_leak(std_config(), &item);
+    assert_eq!(errors, [(unconstrained, wrap.to_string())]);
+    assert_eq!(entries, [wrap]);
+    assert_eq!(
+        copy,
+        "trait Tr { fn f < 'x > (& self , a : Wrap < 'x >) -> & 'x u8 ; \
+         fn g < 'x > (& self , a : P < 0usize > , b : & 'x u8) -> & 'x u8 ; }"
+    );
+    // `g` alone, as it was.
+    let item_g: ItemTrait = parse_quote!(
+        trait Tr {
+            fn g<'x>(&self, a: Wrap<'x>, b: &'x u8) -> &'x u8;
+        }
+    );
+    let (copy_g, errors, _) = f63_leak(std_config(), &item_g);
+    assert_eq!(errors, []);
+    assert_eq!(
+        copy_g,
+        "trait Tr { fn g < 'x > (& self , a : P < 0usize > , b : & 'x u8) -> & 'x u8 ; }"
+    );
+
+    // The same for a macro that writes the methods one by one (`visit_signature_mut()`).
+    let mut leaker = new_leaker();
+    let context = leaker.intern_trait(&item, true);
+    let referrer = leaker.result().into_referrer();
+    let replace = |_: Type, ix: EntryId, _: &Context| -> Type { parse_quote!(P<#ix>) };
+    let signatures: [(Signature, &str); 2] = [
+        (
+            parse_quote!(fn f<'x>(&self, a: Wrap<'x>) -> &'x u8),
+            "fn f < 'x > (& self , a : Wrap < 'x >) -> & 'x u8",
+        ),
+        (
+            parse_quote!(fn g<'x>(&self, a: Wrap<'x>, b: &'x u8) -> &'x u8),
+            "fn g < 'x > (& self , a : P < 0usize > , b : & 'x u8) -> & 'x u8",
+        ),
+    ];
+    for (sig, expected) in signatures {
+        let mut copy = sig.clone();
+        referrer
+            .visitor(context, replace)
+            .visit_signature_mut(&mut copy);
+        assert_eq!(string(&copy), expected, "{}", string(&sig));
+    }
+
+    // The input that keeps the lifetime, in other positions: the type is the entry in `g`.
+    let keepers = [
+        "&'x u8",
+        "&'x mut u8",
+        "Option<&'x u8>",
+        "(u8, &'x u8)",
+        "[&'x u8; 2]",
+        "Box<&'x u8>",
+        "fn(&'x u8)",
+        "Box<dyn Fn(&'x u8)>",
+        "*const &'x u8",
+    ];
+    for keeper in keepers {
+        let keeper: Type = syn::parse_str(keeper).unwrap();
+        let item: ItemTrait = parse_quote!(
+            trait Tr {
+                fn f<'x>(&self, a: Wrap<'x>) -> &'x u8;
+                fn g<'x>(&self, a: Wrap<'x>, b: #keeper) -> &'x u8;
+            }
+        );
+        let (copy, errors, _) = f63_leak(std_config(), &item);
+        let copy: ItemTrait = syn::parse_str(&copy).unwrap();
+        let what = string(&keeper);
+        assert_eq!(errors, [(unconstrained, wrap.to_string())], "{}", what);
+        assert_eq!(f72_first_input(&copy, "f"), as_written, "{}", what);
+        assert_eq!(f72_first_input(&copy, "g"), entry, "{}", what);
+    }
+    // The receiver keeps it: the type is the entry in `h`.
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f<'x>(&self, a: Wrap<'x>) -> &'x u8;
+            fn h<'x>(&'x self, a: Wrap<'x>) -> &'x u8;
+        }
+    );
+    let (copy, errors, _) = f63_leak(std_config(), &item);
+    let copy: ItemTrait = syn::parse_str(&copy).unwrap();
+    assert_eq!(errors, [(unconstrained, wrap.to_string())]);
+    assert_eq!(f72_first_input(&copy, "f"), as_written);
+    assert_eq!(f72_first_input(&copy, "h"), entry);
+
+    // Both signatures are errors, so both keep the type as written: `f2` and `f3` (two ways, each
+    // through a `Wrap<'x>`) and `f4` (a lifetime that only a projection of the trait keeps, which
+    // constrains nothing); `g` has the entry. The projection is a `Self::A<'x>` of a GAT.
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            type A<'a>;
+            fn f<'x>(&self, a: Wrap<'x>) -> &'x u8;
+            fn f2<'x>(&self, a: Wrap<'x>) -> &'x u8;
+            fn f3<'x>(&self, a: Wrap<'x>, b: *mut Wrap<'x>) -> &'x u8;
+            fn f4<'x>(&self, a: Wrap<'x>, b: Self::A<'x>) -> &'x u8;
+            fn g<'x>(&self, a: Wrap<'x>, b: &'x u8) -> &'x u8;
+        }
+    );
+    let (copy, errors, entries) = f63_leak(std_config(), &item);
+    let copy: ItemTrait = syn::parse_str(&copy).unwrap();
+    assert_eq!(errors, vec![(unconstrained, wrap.to_string()); 5]);
+    assert_eq!(entries, [wrap]);
+    for name in ["f", "f2", "f3", "f4"] {
+        assert_eq!(f72_first_input(&copy, name), as_written, "{}", name);
+    }
+    assert_eq!(f72_first_input(&copy, "g"), entry);
+    let sig = copy.items.iter().find_map(|item| match item {
+        TraitItem::Fn(method) if method.sig.ident == "f3" => Some(method.sig.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        string(&sig.unwrap()),
+        "fn f3 < 'x > (& self , a : Wrap < 'x > , b : * mut Wrap < 'x >) -> & 'x u8"
+    );
+
+    // A rule that allows no `Option`: it is leaked too, so `g` has two errors, and both types stay
+    // as written there; `k` keeps the lifetime in a reference, and has the entry.
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f<'x>(&self, a: Wrap<'x>) -> &'x u8;
+            fn g<'x>(&self, a: Wrap<'x>, b: Option<&'x u8>) -> &'x u8;
+            fn k<'x>(&self, a: Wrap<'x>, b: &'x u8) -> &'x u8;
+        }
+    );
+    let (copy, errors, entries) = f63_leak(Rules::new().primitive(), &item);
+    let causes: Vec<String> = errors.iter().map(|(_, cause)| cause.clone()).collect();
+    assert_eq!(causes, [wrap, wrap, "Option < & 'x u8 >"].map(String::from));
+    assert_eq!(entries, [wrap]);
+    let copy: ItemTrait = syn::parse_str(&copy).unwrap();
+    assert_eq!(f72_first_input(&copy, "f"), as_written);
+    assert_eq!(f72_first_input(&copy, "g"), as_written);
+    assert_eq!(f72_first_input(&copy, "k"), entry);
+
+    // The mark names two lifetimes, and one of them is kept: `f` and `h` have the error for `'x`
+    // (`Wrap2<'x, 'y>` is the only input that names it), so the type stays as written; in `g` every
+    // input keeps one of them, so it is the entry.
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f<'x, 'y>(&self, a: Wrap2<'x, 'y>, b: &'y u8) -> (&'x u8, &'y u8);
+            fn g<'x, 'y>(&self, a: Wrap2<'x, 'y>, b: &'x u8, c: &'y u8) -> (&'x u8, &'y u8);
+            fn h<'x, 'y>(&self, a: Wrap2<'x, 'y>, b: &'y u8) -> (&'x u8, &'y u8);
+        }
+    );
+    let (copy, errors, entries) = f63_leak(std_config(), &item);
+    let copy: ItemTrait = syn::parse_str(&copy).unwrap();
+    assert_eq!(
+        errors,
+        vec![(unconstrained, "Wrap2 < 'x , 'y >".to_string()); 2]
+    );
+    assert_eq!(entries, ["Wrap2 < 'x , 'y >"]);
+    assert_eq!(f72_first_input(&copy, "f"), "Wrap2 < 'x , 'y >");
+    assert_eq!(f72_first_input(&copy, "g"), entry);
+    assert_eq!(f72_first_input(&copy, "h"), "Wrap2 < 'x , 'y >");
+
+    // Another lifetime name is another type: the part of `f` is not the one of `g`.
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f<'x>(&self, a: Wrap<'x>) -> &'x u8;
+            fn g<'y>(&self, a: Wrap<'y>, b: &'y u8) -> &'y u8;
+        }
+    );
+    let (copy, _, entries) = f63_leak(std_config(), &item);
+    assert_eq!(entries, ["Wrap < 'y >"]);
+    assert_eq!(
+        copy,
+        "trait Tr { fn f < 'x > (& self , a : Wrap < 'x >) -> & 'x u8 ; \
+         fn g < 'y > (& self , a : P < 0usize > , b : & 'y u8) -> & 'y u8 ; }"
+    );
 }

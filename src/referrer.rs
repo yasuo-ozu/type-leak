@@ -1,6 +1,7 @@
 //! The [`Referrer`], which rewrites copies of the analyzed items.
 
 use crate::analysis::{PartItem, SignatureFacts, SignatureMark};
+use crate::analyze::Anchoring;
 use crate::context::{Context, ContextId, Enclosing, Gat, ModuleScope, Scope, SelfRequirement};
 use crate::elided::{
     name_elided_in_bare_fn, name_elided_in_bound, Elision, SelfWriter, WrittenNames,
@@ -255,6 +256,34 @@ struct PartPlace {
     protected: bool,
 }
 
+/// The generics in scope of a signature that a copy writes, for the scan of its inputs for the
+/// occurrences of a lifetime ([`unconstrained_in_copy()`]).
+struct SignatureScopes<'a>(&'a [Scope]);
+
+impl Anchoring for SignatureScopes<'_> {
+    fn is_projection(&self, path: &Path) -> bool {
+        path.segments.len() > 1
+            && path.leading_colon.is_none()
+            && matches!(path.segments.first(), Some(seg)
+                if seg.ident == "Self"
+                    || self.0.iter().any(|scope| scope.declares(&ident_name(&seg.ident))))
+    }
+
+    /// The copy replaces every entry, so no type is left to the Referrer.
+    fn is_soft_type(&self, _: &Type) -> bool {
+        false
+    }
+}
+
+/// The type `()`, which stands for a type that is replaced where only what is left of the types
+/// around matters.
+fn unit_type() -> Type {
+    Type::Tuple(TypeTuple {
+        paren_token: Default::default(),
+        elems: Punctuated::new(),
+    })
+}
+
 /// How `Referrer::find()` and `Referrer::part_of()` look a type up.
 #[derive(Clone, Copy)]
 struct Lookup<'a> {
@@ -350,6 +379,18 @@ impl Referrer {
         Some(best?.1)
     }
 
+    /// Returns `true` if a part is left as written in a signature where the method lifetimes
+    /// `unconstrained` are unconstrained ([`SignatureFacts::covers()`], before it knows the copy).
+    fn marks_unconstrained(&self, unconstrained: &[Lifetime]) -> bool {
+        !unconstrained.is_empty()
+            && self.parts.iter().any(|item| match &item.mark {
+                Some(SignatureMark::Unconstrained(lifetimes)) => lifetimes
+                    .iter()
+                    .all(|lifetime| unconstrained.contains(lifetime)),
+                _ => false,
+            })
+    }
+
     /// Returns `true` if `ty` has the context `context` at `at`, in `scopes`, as an entry of that
     /// context would be found ([`Referrer::find()`]). `Self` that means something else here
     /// (`no_self`) does not matter: a part is protected, not replaced.
@@ -421,6 +462,36 @@ impl Referrer {
             }
         }
         found
+    }
+
+    /// Returns `true` if a part that a signature made has the same tokens as `ty` and the context
+    /// that `ty` has in `scopes`, whatever signature it was made for: the Leaker leaked `ty` whole
+    /// there, and leaks it here ([`SignatureFacts::probe()`]).
+    fn is_part_of_signature(
+        &self,
+        ty: &Type,
+        at: Lookup,
+        scopes: &[Scope],
+        enclosing: &Enclosing,
+    ) -> bool {
+        let items = match self.parts_by_cause.get(&Cause::Type(ty.clone())) {
+            Some(items) => items,
+            None => return false,
+        };
+        items.iter().any(|&ix| {
+            let PartItem {
+                context,
+                in_predicate,
+                mark,
+                ..
+            } = &self.parts[ix];
+            mark.is_some()
+                && *in_predicate == at.place.in_predicate
+                && match context {
+                    Some(context) => self.fits(*context, ty, at, scopes, enclosing),
+                    None => Self::unwritable(at, ty, scopes, enclosing),
+                }
+        })
     }
 
     /// Pushes onto `active` the parts whose anchor `ty` is, as an entry would be found: they are
@@ -1151,6 +1222,16 @@ impl<'a, 'b, F: FnMut(Type, EntryId, &Context) -> Type> Folder<'a, 'b, F> {
         }
         self.referrer.find(self.at, ty, self.scopes, enclosing)
     }
+
+    /// Returns `true` in the probe of a signature ([`SignatureFacts::probe()`]) if `ty`, which is no
+    /// entry, is a part that a signature made: it is a type leaked whole, replaced.
+    fn is_part_of_signature(&self, ty: &Type, enclosing: &Enclosing) -> bool {
+        !self.at.place.protected
+            && self.at.signature.map_or(false, SignatureFacts::probing)
+            && self
+                .referrer
+                .is_part_of_signature(ty, self.at, self.scopes, enclosing)
+    }
 }
 
 impl<'a, 'b, F: FnMut(Type, EntryId, &Context) -> Type> Fold for Folder<'a, 'b, F> {
@@ -1159,7 +1240,8 @@ impl<'a, 'b, F: FnMut(Type, EntryId, &Context) -> Type> Fold for Folder<'a, 'b, 
         let outer = self.at.place;
         let active = self.active.len();
         let found = self.lookup(&ty, &enclosing);
-        if found.is_none() {
+        let leaked = found.is_none() && self.is_part_of_signature(&ty, &enclosing);
+        if found.is_none() && !leaked {
             self.enclosing = enclosing.components_of(&ty, self.scopes.len());
             // A type that owns the cause of a conflict is the anchor of the part in it.
             if !self.at.place.protected {
@@ -1173,6 +1255,7 @@ impl<'a, 'b, F: FnMut(Type, EntryId, &Context) -> Type> Fold for Folder<'a, 'b, 
         }
         let referrer = self.referrer;
         let folded = match (found, self.replace_self) {
+            (None, _) if leaked => unit_type(),
             (Some(ix), None) => {
                 let entry = &referrer.contexts[&referrer.entries[ix].1];
                 (self.type_fn)(ty, EntryId::new(ix), entry)
@@ -1693,6 +1776,47 @@ where
         visitor
     }
 
+    /// Returns the inputs of `sig` as the copy writes them, but with each type leaked whole replaced
+    /// by `()`, which holds no lifetime: what is left of the types of the inputs where the leaked
+    /// types are replaced. That is each entry, and each part that a signature made, which is a type
+    /// that the Leaker leaked here too, and left as written for the signature it was in (see
+    /// [`SignatureFacts::probe()`]). No closure is called.
+    fn inputs_without_entries(&self, sig: &Signature) -> Vec<FnArg> {
+        let mut probe = Visitor {
+            referrer: self.referrer,
+            hidden: self.hidden.clone(),
+            type_fn: Rc::new(RefCell::new(
+                (|_, _, _| unit_type()) as fn(Type, EntryId, &Context) -> Type,
+            )),
+            nested_fn: self.nested_fn.as_ref().map(|_| {
+                Rc::new(RefCell::new(
+                    (|_, _, _, _| unit_type()) as fn(&NestedSelf, Type, EntryId, &Context) -> Type,
+                ))
+            }),
+            self_requirement: self.self_requirement.clone(),
+            scopes: self.scopes.clone(),
+            outermost_as_leakers: self.outermost_as_leakers,
+            self_ty: self.self_ty.clone(),
+            item_depth: self.item_depth,
+            own_self: self.own_self,
+            nested: self.nested.clone(),
+            mod_path: self.mod_path.clone(),
+            defaults: self.defaults,
+            module: self.module,
+            module_scope: self.module_scope,
+            place: self.place,
+            signature: Some(Rc::new(SignatureFacts::probe())),
+        };
+        sig.inputs
+            .iter()
+            .cloned()
+            .map(|mut input| {
+                probe.visit_fn_arg_mut(&mut input);
+                input
+            })
+            .collect()
+    }
+
     /// Visits the signature and returns the visitor for its body.
     fn enter_signature(
         &mut self,
@@ -1701,7 +1825,14 @@ where
         item: bool,
     ) -> Self {
         let mut visitor = self.enter(attrs, &mut sig.generics, None, item);
-        let facts = SignatureFacts::of(sig);
+        let mut facts = SignatureFacts::of(sig);
+        // A part with a mark is left as written where the copy leaves the lifetime unconstrained,
+        // not where an input keeps it: that is found out for the signatures that such a part may be
+        // in.
+        if self.referrer.marks_unconstrained(facts.unconstrained()) {
+            let copy = visitor.inputs_without_entries(sig);
+            facts = facts.in_copy(&SignatureScopes(&visitor.scopes), sig, &copy);
+        }
         for input in sig.inputs.iter_mut() {
             visitor.signature = Some(Rc::new(facts.for_input(input)));
             visitor.visit_fn_arg_mut(input);
@@ -2071,9 +2202,11 @@ impl Referrer {
     //      type copied as written whose head alone conflicts is no part (an entry of its tokens
     //      and context would have the same conflict), and the types in it are replaced as any
     //      entry is. A part that a signature made has a mark (`sig ('x)`: the method lifetimes of
-    //      the type that the output names and no bound does, E0195; `sig (elided)`: the signature
-    //      relies on elision, E0106) and is left only in the arguments of a signature that has
-    //      the same fault, which the Referrer computes at each.
+    //      the type that the output names and no bound does, E0195, where the copy leaves one
+    //      unconstrained: only types leaked whole hold it, and no input keeps it as written;
+    //      `sig (elided)`: the signature relies on elision, E0106) and is left only in the
+    //      arguments of a signature that has the same fault, which the Referrer computes at
+    //      each.
     //    - The context of an entry that depends on `Self` only through a bound or an outlives
     //      predicate (`Self: 'x`) keeps whole the bounds of the generics that the description of
     //      `Self` names (`Tr<T>`) and leaves out those of the others (15 kept all), which the

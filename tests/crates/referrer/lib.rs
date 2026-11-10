@@ -374,14 +374,22 @@ pub mod accepted {
     type_leak_test_leaker::__shared_apply_9202!(path = ::type_leak_test_leaker::kinds, copy(0));
     type_leak_test_leaker::__shared_apply_9203!(path = ::type_leak_test_leaker::kinds, copy(0));
     type_leak_test_leaker::__shared_apply_9204!(path = ::type_leak_test_leaker::kinds, copy(0));
+    // The traits with the culprits keep `Held` as written, where an input keeps no `'b` (F72).
+    type_leak_test_leaker::__shared_apply_9245!(
+        path = ::type_leak_test_leaker::kinds,
+        copy(0),
+        copy(2)
+    );
 }
 
 /// The structs of the two items analyzed together: this module names neither `Held` nor `Wrap`
-/// (E0412 if a copy kept them), the entry is written through the Repeater (F48).
+/// (E0412 if a copy kept them), the entry is written through the Repeater (F48). So is `Held` in
+/// the methods that keep their lifetime in another input (F72).
 pub mod unnamed {
     type_leak_test_leaker::__shared_apply_9202!(path = ::type_leak_test_leaker::kinds, copy(1));
     type_leak_test_leaker::__shared_apply_9203!(path = ::type_leak_test_leaker::kinds, copy(1));
     type_leak_test_leaker::__shared_apply_9204!(path = ::type_leak_test_leaker::kinds, copy(1));
+    type_leak_test_leaker::__shared_apply_9245!(path = ::type_leak_test_leaker::kinds, copy(1));
 }
 
 /// The copies that `stages = true` makes after `Rules::std_crates()` given to the result (F50): the

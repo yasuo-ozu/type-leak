@@ -1951,6 +1951,34 @@ fn a_lifetime_that_another_input_keeps_breaks_the_elision_of_the_copy() {
     same(&copy.1, &l::Wrap::<u8>(PhantomData));
 }
 
+/// F72 (E0195): three traits analyzed together. `f` has `Held<'b>` as the only input that names the
+/// lifetime of its output: it is copied as written, in the module that names `Held` (`accepted`).
+/// `g` and `h` keep it in another input (`&'b u8`, `Option<&'b u8>`), so `Held` is an entry there,
+/// written through the Repeater in a module that names no `Held` (`unnamed`): the part of `f` was
+/// copied as written in any signature whose output names the lifetime. The third trait has a
+/// method with two culprits (`Held<'b>` in each input) and another with one, all copied as
+/// written.
+#[test]
+fn a_type_copied_as_written_for_a_lifetime_is_left_only_where_the_copy_leaves_it_unconstrained() {
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_leaker::*;
+    use type_leak_test_referrer::{accepted, unnamed};
+
+    assert_eq!(
+        __shared_report_9245!(),
+        "9245|entries=1|errors=UnconstrainedLifetime,UnconstrainedLifetime,\
+         UnconstrainedLifetime,UnconstrainedLifetime"
+    );
+
+    // The copies of the traits are implementations of the Leaker's: rustc compares the signatures.
+    fn culprit<T: l::HeldCulprit>() {}
+    culprit::<accepted::Host9245x0>();
+    fn kept<T: l::HeldKept>() {}
+    kept::<unnamed::Host9245x1>();
+    fn twice<T: l::HeldCulpritTwice>() {}
+    twice::<accepted::Host9245x2>();
+}
+
 /// F50 (`stages = true`): `core::mem::size_of::<*const Rel>()` in a default method. The path of the
 /// value is written as it is and `Rel` in its arguments is an entry, so `Rules::std_crates()` given
 /// to the result after the analysis drops the only error, as the config that allows the crates has

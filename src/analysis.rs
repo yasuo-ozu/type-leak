@@ -2,7 +2,9 @@
 //! visiting it, which the [`Analysis`] turns into the graph of the entries.
 
 use crate::allow::Place;
-use crate::analyze::{input_type, unconstrained_in_output, Elision};
+use crate::analyze::{
+    input_type, unconstrained_in_copy, unconstrained_in_output, Anchoring, Elision,
+};
 use crate::context::{Context, ContextId, Contexts, SelfRequirement};
 use crate::error::{report, self_without_meaning, Cause, ErrorItem, Reason};
 use crate::graph::{is_whole_reference, NodeKey, TypeGraph};
@@ -163,7 +165,8 @@ pub(crate) struct PartItem {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SignatureMark {
     /// The method lifetimes of the type that the output names and no bound does (E0195): the copy
-    /// would leave them unconstrained.
+    /// would leave one of them unconstrained, because only types leaked whole hold it in the inputs
+    /// ([`unconstrained_in_copy()`]).
     Unconstrained(Vec<Lifetime>),
     /// The output relies on elision, and the type adds lifetimes to the inputs (E0106).
     Elided,
@@ -171,19 +174,46 @@ pub(crate) enum SignatureMark {
 
 /// The facts about a signature that a [`SignatureMark`] is about. It is computed from the
 /// signature alone, by the Leaker where it makes a part and by the Referrer at each signature it
-/// visits.
+/// visits; the Referrer also tells which of the lifetimes the copy leaves unconstrained
+/// ([`SignatureFacts::in_copy()`]).
 #[derive(Debug)]
 pub(crate) struct SignatureFacts {
     unconstrained: Vec<Lifetime>,
+    /// Of `unconstrained`, those that the copy leaves unconstrained: no input keeps them as
+    /// written once the leaked types are replaced. `None` where it is not known (the Leaker, which
+    /// decides it by its own check).
+    in_copy: Option<Vec<Lifetime>>,
     elision: Option<Elision>,
+    /// The facts of a probe ([`SignatureFacts::probe()`]).
+    probing: bool,
 }
 
 impl SignatureFacts {
     pub(crate) fn of(sig: &Signature) -> Self {
         Self {
             unconstrained: unconstrained_in_output(sig),
+            in_copy: None,
             elision: Elision::of_signature(sig),
+            probing: false,
         }
+    }
+
+    /// The facts for the probe of the inputs of a signature, which replaces the leaked types to see
+    /// what is left of them ([`SignatureFacts::in_copy()`]): no part that a signature made is left as
+    /// written ([`SignatureFacts::covers()`] is `false`), and the visitor takes each for a leaked
+    /// type, which it is where the Leaker made it a part.
+    pub(crate) fn probe() -> Self {
+        Self {
+            unconstrained: Vec::new(),
+            in_copy: None,
+            elision: None,
+            probing: true,
+        }
+    }
+
+    /// Returns `true` for the facts of a probe ([`SignatureFacts::probe()`]).
+    pub(crate) fn probing(&self) -> bool {
+        self.probing
     }
 
     /// The facts for the types in `input`, an argument of the signature: elision counts the
@@ -191,11 +221,26 @@ impl SignatureFacts {
     pub(crate) fn for_input(&self, input: &FnArg) -> Self {
         Self {
             unconstrained: self.unconstrained.clone(),
+            in_copy: self.in_copy.clone(),
             elision: self
                 .elision
                 .as_ref()
                 .map(|elision| elision.for_input(input_type(input))),
+            probing: self.probing,
         }
+    }
+
+    /// The facts with the lifetimes that the copy leaves unconstrained, from `copy`: the inputs of
+    /// the signature with the leaked types replaced ([`unconstrained_in_copy()`]). A lifetime that
+    /// an input keeps as written is not one, whatever other types hold it.
+    pub(crate) fn in_copy(
+        mut self,
+        scope: &impl Anchoring,
+        sig: &Signature,
+        copy: &[FnArg],
+    ) -> Self {
+        self.in_copy = Some(unconstrained_in_copy(scope, sig, copy));
+        self
     }
 
     /// The method lifetimes that the output names and no bound does.
@@ -216,12 +261,20 @@ impl SignatureFacts {
     }
 
     /// Returns `true` if the part with `mark` and `context` is copied as written in the arguments
-    /// of this signature: it has the same fault here.
+    /// of this signature: it has the same fault here. For the lifetimes of the mark (all that the
+    /// output names and no bound does here) the copy must leave one unconstrained where it is
+    /// known ([`SignatureFacts::in_copy()`]): where an input keeps the lifetime as written, the
+    /// type is an entry, not a part.
     pub(crate) fn covers(&self, mark: &SignatureMark, context: Option<&Context>) -> bool {
         match mark {
-            SignatureMark::Unconstrained(lifetimes) => lifetimes
-                .iter()
-                .all(|lifetime| self.unconstrained.contains(lifetime)),
+            SignatureMark::Unconstrained(lifetimes) => {
+                lifetimes
+                    .iter()
+                    .all(|lifetime| self.unconstrained.contains(lifetime))
+                    && self.in_copy.as_ref().map_or(true, |left| {
+                        lifetimes.iter().any(|lifetime| left.contains(lifetime))
+                    })
+            }
             SignatureMark::Elided => self.elision.as_ref().map_or(false, |elision| {
                 context.map_or(true, |context| !elision.added(context).is_empty())
             }),

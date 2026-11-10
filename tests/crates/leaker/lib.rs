@@ -2008,6 +2008,30 @@ pub mod kinds {
         ];
     }
 
+    // E0195 and F72: a type that is copied as written for a signature that leaves a method lifetime
+    // unconstrained is an entry in a signature where an input keeps the lifetime as written. `f`
+    // has `Held<'b>` as the only input that names `'b`, which its output names too. In the second
+    // item `g` keeps `'b` in `y: &'b u8` and `h` in `y: Option<&'b u8>` (`Option` is allowed), so
+    // `Held<'b>` is an entry there; the Referrer copies the item in a module that names no `Held`.
+    // The third item has two culprits in one signature (`k` has one `Held<'b>` in each input), and
+    // a second method with one: all stay as written.
+    type_leak_test_macro::shared_leak! {
+        id = 9245;
+        items [
+            pub trait HeldCulprit {
+                fn f<'b>(&self, x: Held<'b>) -> &'b u8;
+            }
+            pub trait HeldKept {
+                fn g<'b>(&self, x: Held<'b>, y: &'b u8) -> &'b u8;
+                fn h<'b>(&self, x: Held<'b>, y: Option<&'b u8>) -> &'b u8;
+            }
+            pub trait HeldCulpritTwice {
+                fn k<'b>(&self, x: Held<'b>, y: Held<'b>) -> &'b u8;
+                fn m<'d>(&self, x: Held<'d>) -> &'d u8;
+            }
+        ];
+    }
+
     // Errors that the Leaker does not decide on (`prop_leak_result`): its macro carries them with the
     // Referrer, and the Referrer's macro allows some (`allow(..)`), reports the others, and copies
     // the item either way. The Leaker does not allow the prelude, so a relative `Clone` or

@@ -3755,7 +3755,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         for lifetime in facts.unconstrained() {
             // The occurrences that constrain the lifetime as written. An external type that the
             // Leaker does not allow stays as written unless the Referrer replaces it, so it counts.
-            let used = self.scan_inputs(sig, lifetime, false, &[]);
+            let used = scan_inputs(self, &sig.inputs, lifetime, false, &[]);
             // The original constrains it, and in the copy only types leaked whole hold it: the
             // first on the way to each occurrence is what to report, and then the next ones.
             let culprits = unconstraining_types(&used.anchors, |ty| leaked.contains_key(&ty));
@@ -3820,37 +3820,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             }));
     }
 
-    /// Scans the inputs of `sig` for the occurrences of `lifetime` (see
-    /// [`AnalyzeVisitor::scan_anchors()`]).
-    fn scan_inputs(
-        &self,
-        sig: &Signature,
-        lifetime: &Lifetime,
-        careful: bool,
-        entered: &[usize],
-    ) -> OutputUse {
-        let mut used = OutputUse {
-            lifetime: lifetime.clone(),
-            anchors: Vec::new(),
-            chain: Vec::new(),
-            careful,
-            stopped: Vec::new(),
-            entered: entered.to_vec(),
-        };
-        for input in &sig.inputs {
-            match input {
-                FnArg::Receiver(receiver) => {
-                    if receiver.lifetime() == Some(lifetime) {
-                        used.anchors.push(Vec::new());
-                    }
-                    self.scan_anchors(&receiver.ty, &mut used)
-                }
-                FnArg::Typed(arg) => self.scan_anchors(&arg.ty, &mut used),
-            }
-        }
-        used
-    }
-
     /// Returns the optional types that hold `lifetime`, if only they keep it constrained in the
     /// copy: a Referrer that replaces them would leave it in a projection only (E0195, F18). They
     /// are made no optional entries, and so are those inside them on the way to the lifetime
@@ -3873,7 +3842,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         // The scan goes on inside the types that stopped it, now that they are no entries.
         let mut blocked: Vec<usize> = Vec::new();
         loop {
-            let careful = self.scan_inputs(sig, lifetime, true, &blocked);
+            let careful = scan_inputs(self, &sig.inputs, lifetime, true, &blocked);
             if careful.anchors.iter().any(|anchor| kept(&anchor)) {
                 break;
             }
@@ -4052,7 +4021,7 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
                 if self.probe.is_none() {
                     for input in &group.inputs {
                         match input {
-                            BinderInput::Type(ty) => self.scan_anchors(ty, &mut used),
+                            BinderInput::Type(ty) => scan_anchors(self, ty, &mut used),
                             BinderInput::Lifetime(input) if *input == lifetime => {
                                 used.anchors.push(Vec::new())
                             }
@@ -4064,114 +4033,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
             }
         }
         uses
-    }
-
-    /// Finds the occurrences of `used.lifetime` in `ty` that constrain it as rustc sees it (all but
-    /// in an associated type path, an array length, `impl Trait` or a type macro). One anchors only
-    /// if no type on its chain is leaked whole. When in doubt it does not. See [Binder
-    /// lifetimes](crate::Leaker#binder-lifetimes).
-    fn scan_anchors(&self, ty: &Type, used: &mut OutputUse) {
-        let address = ty as *const Type as usize;
-        if used.careful && !used.entered.contains(&address) && self.is_soft_type(ty) {
-            used.stopped.push(address);
-            return;
-        }
-        used.chain.push(address);
-        match ty {
-            Type::Reference(reference) => {
-                if reference.lifetime.as_ref() == Some(&used.lifetime) {
-                    used.anchors.push(used.chain.clone());
-                }
-                self.scan_anchors(&reference.elem, used);
-            }
-            Type::Ptr(TypePtr { elem, .. })
-            | Type::Slice(TypeSlice { elem, .. })
-            | Type::Paren(TypeParen { elem, .. })
-            | Type::Group(TypeGroup { elem, .. }) => self.scan_anchors(elem, used),
-            Type::Array(array) => self.scan_anchors(&array.elem, used),
-            Type::Tuple(tuple) => {
-                for elem in &tuple.elems {
-                    self.scan_anchors(elem, used);
-                }
-            }
-            Type::Path(TypePath { qself: None, path }) if !self.is_projection(path) => {
-                if let Some(seg) = path.segments.last() {
-                    self.scan_arguments(&seg.arguments, used);
-                }
-            }
-            Type::BareFn(f) if !declares(f.lifetimes.as_ref(), &used.lifetime) => {
-                for arg in &f.inputs {
-                    self.scan_anchors(&arg.ty, used);
-                }
-                self.scan_output(&f.output, used);
-            }
-            Type::TraitObject(object) => {
-                for bound in &object.bounds {
-                    match bound {
-                        TypeParamBound::Trait(bound)
-                            if !declares(bound.lifetimes.as_ref(), &used.lifetime) =>
-                        {
-                            if let Some(seg) = bound.path.segments.last() {
-                                self.scan_arguments(&seg.arguments, used);
-                            }
-                        }
-                        TypeParamBound::Lifetime(lifetime) if *lifetime == used.lifetime => {
-                            used.anchors.push(used.chain.clone())
-                        }
-                        _ => (),
-                    }
-                }
-            }
-            _ => (),
-        }
-        used.chain.pop();
-    }
-
-    /// Returns `true` if the Referrer may replace `ty` as an optional entry, so a careful scan
-    /// finds no anchor in it (a path of an external crate, an external trait object, an array
-    /// whose length names a crate, or a reference to such an object).
-    fn is_soft_type(&self, ty: &Type) -> bool {
-        match ty {
-            Type::Reference(reference) => self.is_external_object(&reference.elem),
-            Type::Array(array) => self.names_external_crate_in_expr(&array.len),
-            Type::Path(TypePath { qself: None, path }) => {
-                !self.is_projection(path)
-                    && (self.is_soft_path(&Cause::type_path(path))
-                        || self.holds_external_object(path))
-            }
-            Type::TraitObject(object) => self.names_external_crate(object),
-            _ => false,
-        }
-    }
-
-    fn scan_arguments(&self, arguments: &PathArguments, used: &mut OutputUse) {
-        match arguments {
-            PathArguments::AngleBracketed(args) => {
-                for arg in &args.args {
-                    match arg {
-                        GenericArgument::Lifetime(lifetime) if *lifetime == used.lifetime => {
-                            used.anchors.push(used.chain.clone())
-                        }
-                        GenericArgument::Type(ty) => self.scan_anchors(ty, used),
-                        GenericArgument::AssocType(binding) => self.scan_anchors(&binding.ty, used),
-                        _ => (),
-                    }
-                }
-            }
-            PathArguments::Parenthesized(args) => {
-                for ty in &args.inputs {
-                    self.scan_anchors(ty, used);
-                }
-                self.scan_output(&args.output, used);
-            }
-            PathArguments::None => (),
-        }
-    }
-
-    fn scan_output(&self, output: &ReturnType, used: &mut OutputUse) {
-        if let ReturnType::Type(_, ty) = output {
-            self.scan_anchors(ty, used);
-        }
     }
 
     /// Returns `true` if `ty` is an external trait object without a lifetime bound, so the Referrer
@@ -4207,11 +4068,6 @@ impl<'a, A: Allow + 'a> AnalyzeVisitor<'a, A> {
         object.bounds.iter().any(|bound| {
             matches!(bound, TypeParamBound::Trait(bound) if self.is_soft_path(&Cause::Trait(bound.path.clone())))
         })
-    }
-
-    /// Returns `true` if `path` is an associated item of a generic in scope or of `Self` (`T::A`).
-    fn is_projection(&self, path: &Path) -> bool {
-        path.segments.len() > 1 && self.heads_own_name(path)
     }
 }
 
@@ -4325,6 +4181,26 @@ fn defaulted(generics: &Generics) -> impl Iterator<Item = (usize, &Ident, &Type)
             }) => Some((index, ident, default)),
             _ => None,
         })
+}
+
+impl<A: Allow> Anchoring for AnalyzeVisitor<'_, A> {
+    fn is_projection(&self, path: &Path) -> bool {
+        path.segments.len() > 1 && self.heads_own_name(path)
+    }
+
+    fn is_soft_type(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Reference(reference) => self.is_external_object(&reference.elem),
+            Type::Array(array) => self.names_external_crate_in_expr(&array.len),
+            Type::Path(TypePath { qself: None, path }) => {
+                !self.is_projection(path)
+                    && (self.is_soft_path(&Cause::type_path(path))
+                        || self.holds_external_object(path))
+            }
+            Type::TraitObject(object) => self.names_external_crate(object),
+            _ => false,
+        }
+    }
 }
 
 /// What a [`View`] asks of the analysis it wraps. The view forwards the `visit_*` methods the
@@ -5197,6 +5073,139 @@ fn paths_of<'a>(musts: impl Iterator<Item = &'a Must>) -> Vec<Cause> {
     paths
 }
 
+/// What a scan for the occurrences of a lifetime ([`scan_anchors()`]) asks about the place it is
+/// made in: the analysis of the Leaker, or the scopes of the signature that a Referrer writes.
+pub(crate) trait Anchoring {
+    /// Returns `true` if `path` is an associated item of a generic in scope or of `Self` (`T::A`).
+    fn is_projection(&self, path: &Path) -> bool;
+
+    /// Returns `true` if the Referrer may replace `ty` as an optional entry, so a careful scan
+    /// finds no anchor in it (a path of an external crate, an external trait object, an array
+    /// whose length names a crate, or a reference to such an object).
+    fn is_soft_type(&self, ty: &Type) -> bool;
+}
+
+/// Scans the inputs of a signature for the occurrences of `lifetime` (see [`scan_anchors()`]).
+fn scan_inputs<'a>(
+    scope: &impl Anchoring,
+    inputs: impl IntoIterator<Item = &'a FnArg>,
+    lifetime: &Lifetime,
+    careful: bool,
+    entered: &[usize],
+) -> OutputUse {
+    let mut used = OutputUse {
+        lifetime: lifetime.clone(),
+        anchors: Vec::new(),
+        chain: Vec::new(),
+        careful,
+        stopped: Vec::new(),
+        entered: entered.to_vec(),
+    };
+    for input in inputs {
+        match input {
+            FnArg::Receiver(receiver) => {
+                if receiver.lifetime() == Some(lifetime) {
+                    used.anchors.push(Vec::new());
+                }
+                scan_anchors(scope, &receiver.ty, &mut used)
+            }
+            FnArg::Typed(arg) => scan_anchors(scope, &arg.ty, &mut used),
+        }
+    }
+    used
+}
+
+/// Finds the occurrences of `used.lifetime` in `ty` that constrain it as rustc sees it (all but
+/// in an associated type path, an array length, `impl Trait` or a type macro). One anchors only
+/// if no type on its chain is leaked whole. When in doubt it does not. See [Binder
+/// lifetimes](crate::Leaker#binder-lifetimes).
+fn scan_anchors(scope: &impl Anchoring, ty: &Type, used: &mut OutputUse) {
+    let address = ty as *const Type as usize;
+    if used.careful && !used.entered.contains(&address) && scope.is_soft_type(ty) {
+        used.stopped.push(address);
+        return;
+    }
+    used.chain.push(address);
+    match ty {
+        Type::Reference(reference) => {
+            if reference.lifetime.as_ref() == Some(&used.lifetime) {
+                used.anchors.push(used.chain.clone());
+            }
+            scan_anchors(scope, &reference.elem, used);
+        }
+        Type::Ptr(TypePtr { elem, .. })
+        | Type::Slice(TypeSlice { elem, .. })
+        | Type::Paren(TypeParen { elem, .. })
+        | Type::Group(TypeGroup { elem, .. }) => scan_anchors(scope, elem, used),
+        Type::Array(array) => scan_anchors(scope, &array.elem, used),
+        Type::Tuple(tuple) => {
+            for elem in &tuple.elems {
+                scan_anchors(scope, elem, used);
+            }
+        }
+        Type::Path(TypePath { qself: None, path }) if !scope.is_projection(path) => {
+            if let Some(seg) = path.segments.last() {
+                scan_arguments(scope, &seg.arguments, used);
+            }
+        }
+        Type::BareFn(f) if !declares(f.lifetimes.as_ref(), &used.lifetime) => {
+            for arg in &f.inputs {
+                scan_anchors(scope, &arg.ty, used);
+            }
+            scan_output(scope, &f.output, used);
+        }
+        Type::TraitObject(object) => {
+            for bound in &object.bounds {
+                match bound {
+                    TypeParamBound::Trait(bound)
+                        if !declares(bound.lifetimes.as_ref(), &used.lifetime) =>
+                    {
+                        if let Some(seg) = bound.path.segments.last() {
+                            scan_arguments(scope, &seg.arguments, used);
+                        }
+                    }
+                    TypeParamBound::Lifetime(lifetime) if *lifetime == used.lifetime => {
+                        used.anchors.push(used.chain.clone())
+                    }
+                    _ => (),
+                }
+            }
+        }
+        _ => (),
+    }
+    used.chain.pop();
+}
+
+fn scan_arguments(scope: &impl Anchoring, arguments: &PathArguments, used: &mut OutputUse) {
+    match arguments {
+        PathArguments::AngleBracketed(args) => {
+            for arg in &args.args {
+                match arg {
+                    GenericArgument::Lifetime(lifetime) if *lifetime == used.lifetime => {
+                        used.anchors.push(used.chain.clone())
+                    }
+                    GenericArgument::Type(ty) => scan_anchors(scope, ty, used),
+                    GenericArgument::AssocType(binding) => scan_anchors(scope, &binding.ty, used),
+                    _ => (),
+                }
+            }
+        }
+        PathArguments::Parenthesized(args) => {
+            for ty in &args.inputs {
+                scan_anchors(scope, ty, used);
+            }
+            scan_output(scope, &args.output, used);
+        }
+        PathArguments::None => (),
+    }
+}
+
+fn scan_output(scope: &impl Anchoring, output: &ReturnType, used: &mut OutputUse) {
+    if let ReturnType::Type(_, ty) = output {
+        scan_anchors(scope, ty, used);
+    }
+}
+
 /// Pushes the lifetimes that `ty` (an input) keeps constrained as written in the copy. A reference
 /// to a trait object without a lifetime bound counts only if `not_a_cause` says so.
 fn kept_lifetimes(
@@ -5689,6 +5698,34 @@ pub(crate) fn unconstrained_in_output(sig: &Signature) -> Vec<Lifetime> {
         .lifetimes()
         .map(|param| param.lifetime.clone())
         .filter(|lifetime| output.0.contains(lifetime) && !bounded.0.contains(lifetime))
+        .collect()
+}
+
+/// The lifetimes of the method `sig` that its copy leaves unconstrained, where `copy` are its inputs
+/// with the leaked types replaced by types that hold no lifetime: those of
+/// `unconstrained_in_output()` that some input of `sig` constrains as written (an anchor, see
+/// [`scan_anchors()`]) and no input of `copy` does. The Leaker asks the same of the types that it
+/// leaks whole (`check_leaked_lifetimes()`): the lifetime is unconstrained where every way to it
+/// meets one.
+pub(crate) fn unconstrained_in_copy(
+    scope: &impl Anchoring,
+    sig: &Signature,
+    copy: &[FnArg],
+) -> Vec<Lifetime> {
+    fn anchored<'a>(
+        scope: &impl Anchoring,
+        inputs: impl IntoIterator<Item = &'a FnArg>,
+        lifetime: &Lifetime,
+    ) -> bool {
+        !scan_inputs(scope, inputs, lifetime, false, &[])
+            .anchors
+            .is_empty()
+    }
+    unconstrained_in_output(sig)
+        .into_iter()
+        .filter(|lifetime| {
+            anchored(scope, &sig.inputs, lifetime) && !anchored(scope, copy, lifetime)
+        })
         .collect()
 }
 
