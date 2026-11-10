@@ -1,28 +1,21 @@
-//! The copy of a signature whose elided lifetime the types written in its inputs would break.
+//! The elided lifetime of a signature ([`Elision`]): what the Leaker keeps of it, and how a copy
+//! names it where what it writes in the inputs adds lifetimes (E0106).
 //!
-//! The output of a function pointer or of `Fn(..) -> R` may have an elided lifetime, which
-//! elision takes from the only lifetime of the inputs. A name in the inputs that the copy writes as
-//! a type with lifetimes adds some, and rustc cannot tell which one the output has (E0106). That is
-//! `Self` for `Visitor::with_self()`: `fn(&Self) -> &u8` is valid in `struct S<'a>`, but
-//! `fn(&::p::S<'a>) -> &u8` has two lifetimes in its inputs. It is a type parameter that
-//! `substitute_args()` or `Substitute` replaces, too: `fn(&U) -> &u8` with
-//! `U := &'static str`. And it is the path through the Repeater that replaces an entry, whose
-//! arguments name the lifetimes of the site: `fn(&Vec<U>) -> &u8` with the entry `Vec<U>` is
-//! `fn(&<X as Repeater<(&'static str,), ..>>::Type) -> &u8`, which the Visitor cannot know until
-//! the path is written. The copy names the lifetime that elision gives instead, with a fresh
-//! `for<'e>` binder: `for<'e> fn(&'e ::p::S<'a>) -> &'e u8`.
-//!
-//! What the copy writes is known before it folds the signature for `Self` and the type parameters
-//! (the lifetimes are named first), and after for the entries (they are named once written, in the
-//! signature that the original relied on: [`Elision`]). The Leaker does not count such a signature as
-//! broken for `Self` (`AnalyzeVisitor::self_elision_broken()`), so the two agree on which signatures
-//! this handles: those whose inputs show their one lifetime. See
+//! A copy writes the host for `Self`, an argument for a type parameter and a path through the
+//! Repeater for an entry: with the host `::p::S<'a>`, `fn(&Self) -> &u8` becomes
+//! `for<'e> fn(&'e ::p::S<'a>) -> &'e u8`. Only a signature whose inputs show their one lifetime
+//! is named, as the Leaker expects ([`AnalyzeVisitor::self_elision_broken()`]). See
 //! [Elided lifetimes](crate::Leaker#elided-lifetimes).
 
-use crate::analyze::{Elision, InputLifetimes};
-use crate::context::{binder_lifetimes, Scope};
-use crate::util::ReplaceSelf;
-use proc_macro2::{Span, TokenStream, TokenTree};
+#[cfg(doc)]
+use crate::analyze::AnalyzeVisitor;
+use crate::context::{Context, Scope};
+use crate::error::Cause;
+use crate::util::{
+    binder_declares, binder_lifetimes, is_bare_self, names_in, push_once, token_names,
+    type_mentions_self, unwrap_type_group, ReplaceSelf,
+};
+use proc_macro2::Span;
 use std::collections::HashSet;
 use syn::fold::Fold;
 use syn::visit::Visit;
@@ -43,9 +36,9 @@ pub(crate) trait Writer: Fresh {
     fn written(&mut self, ty: &Type) -> Type;
 }
 
-/// The first lifetime `'__tl_e<n>` that none of the generics in `scopes` declares, nor `binder`, and
-/// that is not in `taken`: what the Visitor binds.
-fn visitor_name(
+/// The first lifetime `'__tl_e<n>` that none of the generics in `scopes` declares, nor `binder`,
+/// and that is not in `taken`: what the Visitor binds.
+fn visitor_lifetime(
     scopes: &[Scope],
     taken: &HashSet<String>,
     binder: Option<&BoundLifetimes>,
@@ -56,21 +49,21 @@ fn visitor_name(
             let text = name.to_string();
             !scopes.iter().any(|scope| scope.declares(&text))
                 && !taken.contains(&text)
-                && !binder_lifetimes(binder).any(|declared| declared == *name)
+                && !binder_declares(binder, name)
         })
         .expect("an unbounded range")
 }
 
 /// The `Writer` of `Visitor::with_self()`: `Self` is `self_ty`, and the generics in `scopes` are in
 /// scope, whose lifetimes the binder must not shadow.
-pub(crate) struct SelfWriter<'a> {
-    pub(crate) self_ty: &'a Type,
-    pub(crate) scopes: &'a [Scope],
+struct SelfWriter<'a> {
+    self_ty: &'a Type,
+    scopes: &'a [Scope],
 }
 
 impl Fresh for SelfWriter<'_> {
     fn fresh(&mut self, binder: Option<&BoundLifetimes>) -> Lifetime {
-        visitor_name(self.scopes, &HashSet::new(), binder)
+        visitor_lifetime(self.scopes, &HashSet::new(), binder)
     }
 }
 
@@ -86,40 +79,24 @@ impl Writer for SelfWriter<'_> {
 /// The fresh lifetimes of a signature that the Visitor has written, with the paths through the
 /// Repeater in it: `'__tl_e<n>` as for `Self`, and none that the signature names already (what the
 /// Visitor wrote may name any: a binder inside it is not in `scopes`).
-pub(crate) struct WrittenNames<'a> {
+struct WrittenNames<'a> {
     scopes: &'a [Scope],
     taken: HashSet<String>,
 }
 
 impl<'a> WrittenNames<'a> {
     /// Names for the signature `written` in `scopes`.
-    pub(crate) fn new(scopes: &'a [Scope], written: impl ToTokens) -> Self {
-        let mut taken = HashSet::new();
-        collect_lifetimes(written.into_token_stream(), &mut taken);
-        Self { scopes, taken }
+    fn new(scopes: &'a [Scope], written: impl ToTokens) -> Self {
+        Self {
+            scopes,
+            taken: names_in(written),
+        }
     }
 }
 
 impl Fresh for WrittenNames<'_> {
     fn fresh(&mut self, binder: Option<&BoundLifetimes>) -> Lifetime {
-        visitor_name(self.scopes, &self.taken, binder)
-    }
-}
-
-/// Adds the lifetimes that `tokens` name to `names`.
-fn collect_lifetimes(tokens: TokenStream, names: &mut HashSet<String>) {
-    let mut tokens = tokens.into_iter().peekable();
-    while let Some(tree) = tokens.next() {
-        match tree {
-            // A lifetime is a `'` joined to the identifier after it.
-            TokenTree::Punct(punct) if punct.as_char() == '\'' => {
-                if let Some(TokenTree::Ident(ident)) = tokens.peek() {
-                    names.insert(format!("'{}", ident));
-                }
-            }
-            TokenTree::Group(group) => collect_lifetimes(group.stream(), names),
-            _ => (),
-        }
+        visitor_lifetime(self.scopes, &self.taken, binder)
     }
 }
 
@@ -127,10 +104,11 @@ fn collect_lifetimes(tokens: TokenStream, names: &mut HashSet<String>) {
 /// `Substitute`).
 ///
 /// The generics in scope there are not known, so a name is `'__tl_s<n>` for the first `n` that no
-/// lifetime in what the copy is made of (the arguments, what replaces a name) is named
-/// like ([`FreshLifetimes::reserve()`]); the prefix keeps it from the lifetimes that a macro declares and
-/// from the Visitor's (`'__tl_e<n>`). `n` counts the signatures around, so that a signature inside
-/// the binder of another gets another name (E0496), and the output is the same for the same input.
+/// lifetime in what the copy is made of (the arguments, what replaces a name) is named like
+/// ([`FreshLifetimes::reserve()`]); the prefix keeps it from the lifetimes that a macro declares
+/// and from the Visitor's (`'__tl_e<n>`). `n` counts the signatures around, so that a signature
+/// inside the binder of another gets another name (E0496), and the output is the same for the same
+/// input.
 #[derive(Default)]
 pub(crate) struct FreshLifetimes {
     taken: HashSet<String>,
@@ -140,7 +118,7 @@ pub(crate) struct FreshLifetimes {
 impl FreshLifetimes {
     /// Notes the lifetimes that `tokens` name, so that no fresh name is one of them.
     pub(crate) fn reserve(&mut self, tokens: impl ToTokens) {
-        collect_lifetimes(tokens.into_token_stream(), &mut self.taken);
+        token_names(tokens.into_token_stream(), &mut self.taken);
     }
 
     /// Returns `true` if `lifetime` is a name that this made and has not given back: the library's
@@ -157,11 +135,11 @@ impl FreshLifetimes {
 
     /// Returns the count of the signatures around, to give the names back with
     /// [`FreshLifetimes::release()`] after the signature being copied.
-    pub(crate) fn mark(&self) -> usize {
+    fn mark(&self) -> usize {
         self.next
     }
 
-    pub(crate) fn release(&mut self, mark: usize) {
+    fn release(&mut self, mark: usize) {
         self.next = mark;
     }
 
@@ -176,12 +154,6 @@ impl FreshLifetimes {
                 return Lifetime::new(&name, Span::call_site());
             }
         }
-    }
-}
-
-impl Fresh for FreshLifetimes {
-    fn fresh(&mut self, binder: Option<&BoundLifetimes>) -> Lifetime {
-        self.next_name(binder)
     }
 }
 
@@ -211,7 +183,7 @@ impl<S: Site> Writer for S {
 /// Folds the function pointer `i` for [`Site`], with its elided lifetime named if needed.
 pub(crate) fn fold_bare_fn(site: &mut impl Site, mut i: TypeBareFn) -> TypeBareFn {
     let mark = site.names().mark();
-    name_elided_in_bare_fn(site, &mut i);
+    name_elided(site, &mut i);
     let i = syn::fold::fold_type_bare_fn(site, i);
     site.names().release(mark);
     i
@@ -220,84 +192,241 @@ pub(crate) fn fold_bare_fn(site: &mut impl Site, mut i: TypeBareFn) -> TypeBareF
 /// Like [`fold_bare_fn()`], for a bound that may be the sugar of `Fn(..) -> R`.
 pub(crate) fn fold_bound(site: &mut impl Site, mut i: TraitBound) -> TraitBound {
     let mark = site.names().mark();
-    name_elided_in_bound(site, &mut i);
+    name_elided(site, &mut i);
     let i = syn::fold::fold_trait_bound(site, i);
     site.names().release(mark);
     i
 }
 
-/// Names the elided lifetime of the signature of the function pointer `i`, if what `writer` writes
-/// for its inputs adds lifetimes to them.
-pub(crate) fn name_elided_in_bare_fn(writer: &mut impl Writer, i: &mut TypeBareFn) {
-    name_elided(
-        writer,
-        &mut i.lifetimes,
-        i.inputs.iter_mut().map(|arg| &mut arg.ty).collect(),
-        &mut i.output,
-    )
+/// The binder, the inputs and the output of a signature.
+type SigParts<'a> = (
+    &'a mut Option<BoundLifetimes>,
+    Vec<&'a mut Type>,
+    &'a mut ReturnType,
+);
+
+/// A function pointer, or a bound that may be `Fn(..) -> R`: a signature whose output may take its
+/// elided lifetime from its inputs.
+pub(crate) trait FnSig: ToTokens {
+    /// The lifetimes that it binds.
+    fn binder(&self) -> Option<&BoundLifetimes>;
+
+    /// Its parts, or `None` for a bound that is not `Fn(..) -> R`.
+    fn parts(&mut self) -> Option<SigParts<'_>>;
 }
 
-/// Like [`name_elided_in_bare_fn()`], for the signature of `Fn(..) -> R` (the last segment of the
-/// path of `i` has parenthesized arguments), which `i` binds.
-pub(crate) fn name_elided_in_bound(writer: &mut impl Writer, i: &mut TraitBound) {
-    if let Some(PathArguments::Parenthesized(args)) =
-        i.path.segments.last_mut().map(|seg| &mut seg.arguments)
-    {
-        name_elided(
-            writer,
-            &mut i.lifetimes,
-            args.inputs.iter_mut().collect(),
-            &mut args.output,
-        )
+impl FnSig for TypeBareFn {
+    fn binder(&self) -> Option<&BoundLifetimes> {
+        self.lifetimes.as_ref()
+    }
+
+    fn parts(&mut self) -> Option<SigParts<'_>> {
+        let inputs = self.inputs.iter_mut().map(|arg| &mut arg.ty).collect();
+        Some((&mut self.lifetimes, inputs, &mut self.output))
     }
 }
 
-fn name_elided(
-    writer: &mut impl Writer,
-    binder: &mut Option<BoundLifetimes>,
-    inputs: Vec<&mut Type>,
-    output: &mut ReturnType,
-) {
+impl FnSig for TraitBound {
+    fn binder(&self) -> Option<&BoundLifetimes> {
+        self.lifetimes.as_ref()
+    }
+
+    fn parts(&mut self) -> Option<SigParts<'_>> {
+        match self.path.segments.last_mut().map(|seg| &mut seg.arguments) {
+            Some(PathArguments::Parenthesized(args)) => Some((
+                &mut self.lifetimes,
+                args.inputs.iter_mut().collect(),
+                &mut args.output,
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Before the Visitor folds `sig` in `scopes`: names its elided lifetime if the host `self_ty` adds
+/// lifetimes to its inputs, and returns the elision of the original for [`after_fold()`], found
+/// before the entries are written.
+pub(crate) fn before_fold(
+    sig: &mut impl FnSig,
+    self_ty: Option<&Type>,
+    scopes: &[Scope],
+) -> Option<Elision> {
+    if let Some(self_ty) = self_ty {
+        name_elided(&mut SelfWriter { self_ty, scopes }, sig);
+    }
+    let (_, inputs, output) = sig.parts()?;
+    Elision::of_copy(inputs.iter().map(|input| &**input), output)
+}
+
+/// After the Visitor folded `sig` in `scopes`: names the elided lifetime of `elision` if the inputs
+/// as written show more than their one lifetime.
+pub(crate) fn after_fold(sig: &mut impl FnSig, elision: Option<Elision>, scopes: &[Scope]) {
+    if let Some(elision) = elision {
+        let mut names = WrittenNames::new(scopes, &*sig);
+        elision.name_written(&mut names, sig);
+    }
+}
+
+/// Names the elided lifetime of `sig`, if what `writer` writes for its inputs adds lifetimes to
+/// them.
+fn name_elided(writer: &mut impl Writer, sig: &mut impl FnSig) {
+    let (binder, inputs, output) = match sig.parts() {
+        Some(parts) => parts,
+        None => return,
+    };
     let elision = match Elision::of_copy(inputs.iter().map(|input| &**input), output) {
         Some(elision) => elision,
         None => return,
     };
     // The copy's inputs show that lifetime and no other.
-    let mut written = InputLifetimes::default();
-    for input in &inputs {
-        written.visit_type(&writer.written(input));
-    }
-    if shows_one(&written) {
+    let written: Vec<Type> = inputs.iter().map(|input| writer.written(input)).collect();
+    if InputLifetimes::of(&written).is_one() {
         return;
     }
     elision.name(writer, binder, inputs, output)
 }
 
-/// `true` if the lifetimes of the inputs are one, as elision counts them: an elided one, or a name
-/// (used any number of times).
-fn shows_one(lifetimes: &InputLifetimes) -> bool {
-    lifetimes.elided + lifetimes.named.len() == 1
+/// A signature (a function pointer, the sugar of `Fn(..) -> R`, or a method) whose output has an
+/// elided lifetime that elision takes from the only lifetime of the inputs (which a path may hide:
+/// `Ref<u8>`, so it is the one that the inputs do not show). The copy of a type with lifetimes in
+/// the inputs names them in the arguments of its projection, so the inputs have more lifetimes and
+/// elision fails (E0106). Such a type is not leaked alone: the type holding the signature is leaked
+/// as a whole instead if it can be, and it is an error otherwise. The same holds for `Self`, which
+/// the copy of a struct, an enum or a union writes as the type itself, but there the Referrer names
+/// the lifetime where it can (see [`AnalyzeVisitor::self_elision_broken()`]). rustc counts the
+/// lifetimes of each input apart, so the one that another input keeps (`x: &'a u8, y: Rel<T>` with
+/// `T: 'a`) is one more. See [Elided lifetimes](crate::Leaker#elided-lifetimes).
+#[derive(Clone, Debug)]
+pub(crate) struct Elision {
+    /// The depth of the type holding the signature, leaked whole instead (0 for a method or a
+    /// bound, which no type holds).
+    pub(crate) owner: usize,
+    /// The only lifetime of the inputs as written, `None` if it is elided or hidden.
+    pub(crate) kept: Option<Lifetime>,
+    /// The inputs show no lifetime, so the one that the output has is hidden by a path
+    /// (`Ref<u8>` for `Ref<'a, u8>`), which the Leaker does not see: any lifetime that the copy
+    /// adds to the inputs breaks the elision.
+    pub(crate) hidden: bool,
+    /// The signature of a function pointer or of `Fn(..)`, whose elided lifetime the Referrer can
+    /// name with a `for<'e>` binder where `Visitor::with_self()` adds lifetimes to its inputs (see
+    /// [`AnalyzeVisitor::self_elision_broken()`]). A method has none.
+    pub(crate) binder: bool,
+    /// The input being visited names `kept` ([`Elision::for_input()`]).
+    in_kept: bool,
+    /// The output, which has the elided lifetime.
+    pub(crate) output: Cause,
 }
 
-/// What the copy does with an [`Elision`] (found before it writes the signature): it checks that the
-/// inputs still show their one lifetime ([`name_elided_in_bare_fn()`] before it folds them,
-/// [`Elision::name_written_bare_fn()`] after), and names it if not.
 impl Elision {
-    /// The elision of the function pointer `i`, if its signature relies on it.
-    pub(crate) fn of_bare_fn(i: &TypeBareFn) -> Option<Self> {
-        Self::of_copy(i.inputs.iter().map(|arg| &arg.ty), &i.output)
+    /// Returns what the copy must keep for a signature with these `inputs` and `output`, if its
+    /// output relies on elision: it has an elided lifetime, and the inputs have exactly one
+    /// lifetime (else the original is not valid, or has no elision to keep), or none that is seen,
+    /// so that a path hides it. `binder` is `true` for a function pointer or `Fn(..)`.
+    pub(crate) fn of<'a>(
+        owner: usize,
+        binder: bool,
+        inputs: impl IntoIterator<Item = &'a Type>,
+        output: &ReturnType,
+    ) -> Option<Self> {
+        let output = match output {
+            ReturnType::Type(_, output) => output,
+            ReturnType::Default => return None,
+        };
+        // The output has an elided lifetime (a function pointer or `Fn(..)` inside has its own).
+        if InputLifetimes::of(std::iter::once(&**output)).elided == 0 {
+            return None;
+        }
+        let mut lifetimes = InputLifetimes::of(inputs);
+        let (kept, hidden) = match (lifetimes.elided, lifetimes.named.len()) {
+            (1, 0) => (None, false),
+            (0, 1) => (lifetimes.named.pop(), false),
+            // An elided output with no lifetime in the inputs: the one a path hides.
+            (0, 0) => (None, true),
+            _ => return None,
+        };
+        Some(Self {
+            owner,
+            kept,
+            hidden,
+            binder,
+            in_kept: false,
+            output: Cause::Type((**output).clone()),
+        })
     }
 
-    /// Like [`Elision::of_bare_fn()`], for the signature of `Fn(..) -> R` that `i` binds.
-    pub(crate) fn of_bound(i: &TraitBound) -> Option<Self> {
-        match i.path.segments.last().map(|seg| &seg.arguments) {
-            Some(PathArguments::Parenthesized(args)) => {
-                Self::of_copy(args.inputs.iter(), &args.output)
-            }
-            _ => None,
+    /// Returns this for the types in `input`, an input of the signature. rustc counts the
+    /// lifetimes of each input apart, so `kept` in the copy of a type in another input is one more.
+    pub(crate) fn for_input(&self, input: &Type) -> Self {
+        let lifetimes = InputLifetimes::of(std::iter::once(input));
+        Self {
+            in_kept: self
+                .kept
+                .as_ref()
+                .map_or(false, |kept| lifetimes.named.contains(kept)),
+            ..self.clone()
         }
     }
 
+    /// Returns what `Elision::of()` gives for the signature of a method. A receiver that has a
+    /// reference to `Self` gives its lifetime to the output, whatever the inputs have (`&self`,
+    /// `self: Pin<&mut Self>`). Any other receiver is left out of the count, as rustc before 1.81
+    /// does: `self: &Box<Self>` gives nothing, and its own lifetime is not one of the inputs.
+    pub(crate) fn of_signature(sig: &Signature) -> Option<Self> {
+        let mut inputs: Vec<&Type> = Vec::new();
+        for input in &sig.inputs {
+            match input {
+                FnArg::Receiver(receiver) => {
+                    let mut references = RefersToSelf(receiver.reference.is_some());
+                    references.visit_type(&receiver.ty);
+                    if references.0 {
+                        return None;
+                    }
+                }
+                FnArg::Typed(arg) => inputs.push(&arg.ty),
+            }
+        }
+        Self::of(0, false, inputs, &sig.output)
+    }
+
+    /// Returns the lifetimes that the copy of a type with `context` adds to the input it is in
+    /// ([`Elision::for_input()`]): those it names, not `kept` in the input that names it.
+    pub(crate) fn added(&self, context: &Context) -> Vec<Lifetime> {
+        let mut added: Vec<Lifetime> = Vec::new();
+        let lifetimes = context
+            .generics
+            .lifetimes()
+            .map(|param| &param.lifetime)
+            .chain(&context.self_outlives);
+        for lifetime in lifetimes {
+            let kept = self.in_kept && Some(lifetime) == self.kept.as_ref();
+            if !kept && !added.contains(lifetime) {
+                added.push(lifetime.clone());
+            }
+        }
+        added
+    }
+
+    /// Returns the lifetimes that a copy adds to the inputs by writing `self_ty` for `Self`
+    /// (`Visitor::with_self()`): those it names, or an elided one (`'_`), not the one the inputs
+    /// keep.
+    pub(crate) fn added_by_self(&self, self_ty: &Type) -> Vec<Lifetime> {
+        let lifetimes = InputLifetimes::of(std::iter::once(self_ty));
+        let mut added: Vec<Lifetime> = Vec::new();
+        if lifetimes.elided > 0 {
+            added.push(Lifetime::new("'_", proc_macro2::Span::call_site()));
+        }
+        for lifetime in lifetimes.named {
+            if Some(&lifetime) != self.kept.as_ref() {
+                push_once(&mut added, lifetime);
+            }
+        }
+        added
+    }
+}
+
+/// The copy's side of an [`Elision`]: it names the lifetime where the inputs as written do not show
+/// it alone ([`before_fold()`], [`after_fold()`]).
+impl Elision {
     /// The inputs show their one lifetime. With none, a path hides it (`Ref<u8>`): it cannot be
     /// named, and the Leaker leaks such a signature whole or rejects it. With more, the original is
     /// not valid.
@@ -308,43 +437,15 @@ impl Elision {
         Self::of(0, true, inputs, output).filter(|elision| !elision.hidden)
     }
 
-    /// Names the elided lifetime of the function pointer `i`, which the copy has written (what
-    /// the paths through the Repeater are in it), if its inputs show more than their one lifetime.
-    pub(crate) fn name_written_bare_fn(&self, fresh: &mut impl Fresh, i: &mut TypeBareFn) {
-        self.name_written(
-            fresh,
-            &mut i.lifetimes,
-            i.inputs.iter_mut().map(|arg| &mut arg.ty).collect(),
-            &mut i.output,
-        )
-    }
-
-    /// Like [`Elision::name_written_bare_fn()`], for the signature of `Fn(..) -> R` that `i` binds.
-    pub(crate) fn name_written_bound(&self, fresh: &mut impl Fresh, i: &mut TraitBound) {
-        if let Some(PathArguments::Parenthesized(args)) =
-            i.path.segments.last_mut().map(|seg| &mut seg.arguments)
-        {
-            self.name_written(
-                fresh,
-                &mut i.lifetimes,
-                args.inputs.iter_mut().collect(),
-                &mut args.output,
-            )
-        }
-    }
-
-    fn name_written(
-        &self,
-        fresh: &mut impl Fresh,
-        binder: &mut Option<BoundLifetimes>,
-        inputs: Vec<&mut Type>,
-        output: &mut ReturnType,
-    ) {
-        let mut shown = InputLifetimes::default();
-        for input in &inputs {
-            shown.visit_type(input);
-        }
-        if shows_one(&shown) {
+    /// Names the elided lifetime of `sig`, which the copy has written (what the paths through the
+    /// Repeater are in it), if its inputs show more than their one lifetime.
+    fn name_written(&self, fresh: &mut impl Fresh, sig: &mut impl FnSig) {
+        let (binder, inputs, output) = match sig.parts() {
+            Some(parts) => parts,
+            None => return,
+        };
+        let shown = InputLifetimes::of(inputs.iter().map(|input| &**input));
+        if shown.is_one() {
             return;
         }
         match &self.kept {
@@ -396,6 +497,80 @@ impl Elision {
             }
         };
         Name(&name).visit_type_mut(output);
+    }
+}
+
+/// The type of an argument of a signature (of a receiver, the type it stands for).
+pub(crate) fn input_type(input: &FnArg) -> &Type {
+    match input {
+        FnArg::Receiver(receiver) => &receiver.ty,
+        FnArg::Typed(arg) => &arg.ty,
+    }
+}
+
+/// The lifetimes of the inputs of a signature as elision counts them: each elided one is its own,
+/// the named ones count once. A function pointer or `Fn(..)` inside has its own, and so has a
+/// bound with a `for<..>` binder for the lifetimes it declares.
+#[derive(Default)]
+struct InputLifetimes {
+    elided: usize,
+    named: Vec<Lifetime>,
+    declared: Vec<Lifetime>,
+}
+
+impl InputLifetimes {
+    /// The lifetimes of `inputs`.
+    fn of<'a>(inputs: impl IntoIterator<Item = &'a Type>) -> Self {
+        let mut lifetimes = Self::default();
+        for input in inputs {
+            lifetimes.visit_type(input);
+        }
+        lifetimes
+    }
+
+    /// `true` if the lifetimes are one, as elision counts them: an elided one, or a name (used any
+    /// number of times).
+    fn is_one(&self) -> bool {
+        self.elided + self.named.len() == 1
+    }
+}
+
+impl<'ast> Visit<'ast> for InputLifetimes {
+    fn visit_type_reference(&mut self, i: &'ast TypeReference) {
+        if i.lifetime.is_none() {
+            self.elided += 1;
+        }
+        syn::visit::visit_type_reference(self, i)
+    }
+    fn visit_lifetime(&mut self, i: &'ast Lifetime) {
+        if i.ident == "_" {
+            self.elided += 1;
+        } else if !self.declared.contains(i) && !self.named.contains(i) {
+            self.named.push(i.clone());
+        }
+    }
+    fn visit_trait_bound(&mut self, i: &'ast TraitBound) {
+        let outer = self.declared.len();
+        self.declared.extend(binder_lifetimes(i.lifetimes.as_ref()));
+        syn::visit::visit_trait_bound(self, i);
+        self.declared.truncate(outer);
+    }
+    fn visit_type_bare_fn(&mut self, _: &'ast TypeBareFn) {}
+    fn visit_parenthesized_generic_arguments(&mut self, _: &'ast ParenthesizedGenericArguments) {}
+}
+
+/// `true` if the type of a receiver has a reference to `Self` (`self: &Self`, `self: Pin<&mut
+/// Self>`), which rustc gives the lifetime of to the output. A reference to a type that holds
+/// `Self` (`&Box<Self>`) is not one before rustc 1.81. A reference to another type is taken for
+/// one to the type of the impl, which the signature does not name (`&S`), as the Referrer does not
+/// know it either.
+struct RefersToSelf(bool);
+
+impl<'ast> Visit<'ast> for RefersToSelf {
+    fn visit_type_reference(&mut self, i: &'ast TypeReference) {
+        let elem = unwrap_type_group(&i.elem);
+        self.0 |= is_bare_self(elem) || !type_mentions_self(elem);
+        syn::visit::visit_type_reference(self, i)
     }
 }
 

@@ -1,14 +1,14 @@
 //! The context of a leaked type: its generics and what `Self` means.
 
-use crate::encode::params_as_args;
 use crate::error::Cause;
-use crate::unstable::is_std_trait;
+use crate::unstable::{bound_text, hiding_bounds, trait_bounds};
 use crate::util::{
-    bound_mentions_self, canonical_bounds, first_self_in_generics, generic_param_mentions_self,
-    generic_param_name, ident_name, projection, projection_head, self_in_param, self_in_predicate,
-    sorted_by_tokens, tidy, token_names, type_contains, type_mentions_self, type_names,
-    unwrap_type_group, where_predicate_mentions_self, without_default, without_self_bounds,
-    ReplaceSelf, SelfMentions,
+    binder_lifetimes, bound_mentions_self, bounded_ident, canonical_bounds, first_self_in_generics,
+    generic_param_mentions_self, generic_param_name, ident_name, is_bare_self, is_lifetime_param,
+    is_type_param_named, names_in, plain_self_head, projection, projection_head, push_once,
+    self_in_param, self_in_predicate, sorted_by_tokens, tidy, token_names, type_contains,
+    type_mentions_self, type_names, unwrap_type_group, where_clause, where_predicate_mentions_self,
+    without_default, without_self_bounds, ReplaceSelf, SelfMentions,
 };
 use proc_macro2::{Literal, TokenStream};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -24,7 +24,7 @@ use template_quote::{quote, ToTokens};
 pub(crate) struct Scope {
     params: Vec<GenericParam>,
     predicates: Vec<WherePredicate>,
-    binder: bool,
+    is_binder: bool,
     /// What `Self` meant where the generics were declared, which their bounds and where predicates
     /// are written for. `None` where it has no meaning. See [`Context::of()`].
     self_ty: Option<SelfRequirement>,
@@ -49,7 +49,7 @@ impl Scope {
                 .iter()
                 .flat_map(|wc| wc.predicates.iter().cloned())
                 .collect(),
-            binder: false,
+            is_binder: false,
             self_ty,
             gats: Vec::new(),
         }
@@ -64,7 +64,7 @@ impl Scope {
         Self {
             params: lifetimes.lifetimes.iter().cloned().collect(),
             predicates: Vec::new(),
-            binder: true,
+            is_binder: true,
             self_ty: None,
             gats: Vec::new(),
         }
@@ -122,7 +122,7 @@ impl Scope {
     pub(crate) fn same_generics(&self, other: &Scope) -> bool {
         self.params == other.params
             && self.predicates == other.predicates
-            && self.binder == other.binder
+            && self.is_binder == other.is_binder
     }
 
     pub(crate) fn params(&self) -> impl Iterator<Item = &GenericParam> {
@@ -137,10 +137,7 @@ impl Scope {
     pub(crate) fn generics(&self) -> Generics {
         Generics {
             params: self.params.iter().cloned().collect(),
-            where_clause: (!self.predicates.is_empty()).then(|| WhereClause {
-                where_token: Default::default(),
-                predicates: self.predicates.iter().cloned().collect(),
-            }),
+            where_clause: where_clause(self.predicates.iter().cloned()),
             ..Default::default()
         }
     }
@@ -306,9 +303,9 @@ impl std::hash::Hash for SelfRequirement {
 #[derive(Clone, Debug)]
 pub(crate) struct Gat {
     /// The name of the type (`G`).
-    pub(crate) ident: Ident,
+    ident: Ident,
     /// The parameters, without bounds, and a where clause of the outlives relations.
-    pub(crate) generics: Generics,
+    generics: Generics,
 }
 
 impl Gat {
@@ -325,7 +322,7 @@ impl Gat {
 
     /// Returns the outlives relations of `generics` (the bounds of the parameters and the where
     /// clause) as the where clause of an associated type, or `None` if it has none.
-    pub(crate) fn new(ident: &Ident, generics: &Generics) -> Option<Self> {
+    fn new(ident: &Ident, generics: &Generics) -> Option<Self> {
         let lifetimes = |bounds: &Punctuated<TypeParamBound, Token![+]>| -> Vec<TypeParamBound> {
             bounds
                 .iter()
@@ -389,16 +386,13 @@ impl Gat {
             ident: ident.clone(),
             generics: Generics {
                 params,
-                where_clause: Some(WhereClause {
-                    where_token: Default::default(),
-                    predicates: predicates.into_iter().collect(),
-                }),
+                where_clause: where_clause(predicates),
                 ..Default::default()
             },
         })
     }
 
-    /// Reads `type G<'b> where Self: 'b ;` (see [`ToTokens`]).
+    /// Reads what [`ToTokens`] writes (the grammar is above `FORMAT_TAG_PREFIX` in referrer.rs).
     pub(crate) fn parse(input: ParseStream) -> Result<Self> {
         let span = input.span();
         input.parse::<Token![type]>()?;
@@ -414,18 +408,9 @@ impl Gat {
         })
     }
 
-    fn render(&self) -> String {
-        let (ident, generics) = (&self.ident, &self.generics);
-        let where_clause = &generics.where_clause;
-        quote!(type #ident #generics #where_clause ;).to_string()
-    }
-
-    /// Returns the outlives relations that `G<..>` requires, as where predicates of the context:
-    /// those of the where clause of the type, with its parameters substituted by `args`, the
-    /// arguments of the projection, and the `trait_params` of the trait by `trait_args`, the
-    /// arguments of the trait in the path (the parameters are kept if there are none). There are
-    /// none if the arguments are not those of the parameters (a lifetime that is elided in the
-    /// path): nothing can be written for them.
+    /// The where clause of `G<..>` with its parameters replaced by `args`, and the trait's
+    /// `trait_params` by `trait_args` unless that is empty. Empty if the arguments do not fit the
+    /// parameters (a lifetime elided in the path).
     fn requirements(
         &self,
         args: &[GenericArgument],
@@ -547,11 +532,9 @@ impl Fold for Substitution {
     }
 }
 
-/// Returns the outlives relations that the generic associated type named by `projection` requires
-/// (see [`Gat`]), if it is one of the trait that `self_req` is the implementor of: `Self::G<..>`,
-/// or `<Self as Tr<..>>::G<..>` where `Tr` is that trait. The Leaker sees it if it analyzed the
-/// trait with its items. The type of a supertrait, and that of a generic (`T::G<'x>`), are not
-/// seen: nothing is recorded for them.
+/// The outlives relations that `projection` requires if it is `Self::G<..>` or `<Self as
+/// Tr<..>>::G<..>` for a [`Gat`] of the trait that `self_req` bounds. Those of a supertrait or of
+/// a generic (`T::G<'x>`) are not seen.
 fn gat_requirements(
     projection: &TypePath,
     scopes: &[Scope],
@@ -568,20 +551,15 @@ fn gat_requirements(
     let (gat, trait_args) = match &projection.qself {
         // `Self::G<..>`
         None => match segments[..] {
-            [first, gat]
-                if projection.path.leading_colon.is_none()
-                    && first.ident == "Self"
-                    && first.arguments.is_none() =>
-            {
-                (gat, None)
-            }
+            [_, gat] if plain_self_head(&projection.path).is_some() => (gat, None),
             _ => return Vec::new(),
         },
         // `<Self as Tr<..>>::G<..>`
         Some(qself) => {
-            let is_self = matches!(unwrap_type_group(&qself.ty),
-                Type::Path(TypePath { qself: None, path }) if path.is_ident("Self"));
-            if !is_self || qself.position == 0 || segments.len() != qself.position + 1 {
+            if !is_bare_self(&qself.ty)
+                || qself.position == 0
+                || segments.len() != qself.position + 1
+            {
                 return Vec::new();
             }
             let tr = segments[qself.position - 1];
@@ -625,8 +603,27 @@ fn generics_as_args(generics: &Generics) -> TokenStream {
     if generics.params.is_empty() {
         return TokenStream::new();
     }
-    let args: Vec<GenericArgument> = params_as_args(&generics.params);
+    let args = params_as_args(&generics.params);
     quote!(<#(#args),*>)
+}
+
+// The arguments that pass `params` on, each by its own name: `'a` is `'a`, `T` is `T`, and
+// `const N: usize` is the `Const` argument `N` (syn parses a bare `N` as a type).
+fn params_as_args(params: &Punctuated<GenericParam, Token![,]>) -> Vec<GenericArgument> {
+    params.iter().map(param_as_arg).collect()
+}
+
+/// The argument that passes `param` on by its own name.
+fn param_as_arg(param: &GenericParam) -> GenericArgument {
+    match param {
+        GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
+            GenericArgument::Lifetime(lifetime.clone())
+        }
+        GenericParam::Type(TypeParam { ident, .. }) => GenericArgument::Type(parse_quote!(#ident)),
+        GenericParam::Const(ConstParam { ident, .. }) => {
+            GenericArgument::Const(parse_quote!(#ident))
+        }
+    }
 }
 
 /// What a leaked type needs from the place where it is written: its generics and what `Self`
@@ -724,26 +721,14 @@ pub struct Context {
     /// The generic associated types of the trait, sorted by name: only in the top-level context of
     /// a trait that has a `self_ty` (see [`Gat`]). Kept in tokens.
     pub(crate) gats: Vec<Gat>,
-    /// The generics of the item as written, only in the top-level context of a scope: the
-    /// parameters in their order, with their defaults, and the where clause.
-    ///
-    /// ```ignore
-    /// // In crate a:
-    /// pub trait Store<'a, K: 'a, D = Page<K>> where K: Clone { fn get(&self, key: &'a K) -> D; }
-    ///
-    /// // `generics` of the top-level context of `Store`:
-    /// <'a, D, K: 'a + Clone>
-    /// // `declared` of it:
-    /// <'a, K: 'a, D = Page<K>> where K: Clone
-    /// ```
-    ///
-    /// It is part of the identity: two scopes with equal `generics` and other `declared` are two
-    /// contexts. The context of an entry has none.
+    /// The generics of the item as written (order, defaults, where clause), only in the top-level
+    /// context of a scope. Part of the identity: equal `generics` declared otherwise are two
+    /// contexts.
     pub(crate) declared: Option<Generics>,
     /// The `Self` of the outer scopes whose bounds this context depends on (`S<T>` for the entry
     /// `Wrap<S<T>>` of `struct S<T: Fn(T::Item) + Iterator<Item = u8>>`), so that the scope that
     /// declares it records it in its `self_ty`. Not part of the identity, not kept in tokens.
-    pub(crate) substituted: Vec<SelfRequirement>,
+    substituted: Vec<SelfRequirement>,
 }
 
 /// A bound that mentions the `Self` of an outer scope, which cannot be written where `Self` is
@@ -827,7 +812,7 @@ impl Context {
         }
         for gat in &self.gats {
             rendered.push(' ');
-            rendered.push_str(&gat.render());
+            rendered.push_str(&gat.to_token_stream().to_string());
         }
         if let Some(declared) = &self.declared {
             let where_clause = &declared.where_clause;
@@ -836,27 +821,9 @@ impl Context {
         rendered
     }
 
-    /// Returns the context of `ty` in `scopes` (outermost first). Names match by name only, which
-    /// is harmless: the Referrer computes the same. But a type has to name a generic by a name
-    /// that can mean it (the first segment of a path, a lifetime: see [`type_names()`]), not by the
-    /// name of an item that happens to be the same (`U` in `inner::U`): the Leaker finds no
-    /// mention of a generic there and does not ask for a context at all, so the Referrer must not
-    /// find one either. `enclosing` lifetimes become generics even if `ty` does not name them.
-    ///
-    /// `nested_type`: `self_req` is the `Self` of a struct, an enum or a union nested in the
-    /// analyzed syntax, which the copy declares as a type of its own. A `ty` that does not name
-    /// `Self`, but has generics with a bound that does, is then for any type
-    /// ([`SelfRequirement::Any`]), and does not need the generics that `Self` has as arguments:
-    /// the impl is not for the type that `Self` is.
-    ///
-    /// `self_req` is what `Self` means where `ty` is written. The bounds and where predicates of a
-    /// generic are written for the `Self` of the scope that declares it. If that is not `self_req`
-    /// (a nested impl, struct or trait has a `Self` of its own), the bounds that mention `Self` are
-    /// rewritten for the one that declared them: `T: Tr<Self>` of `struct S<T: Tr<Self>>` is
-    /// `T: Tr<S<T>>` where `Self` is something else, and the context does not depend on `Self`.
-    /// That is impossible if the `Self` of the scope is an implementor of a trait, or if the
-    /// bound names an associated item of `Self` (`Self::X`): it fails with [`UnnameableSelf`]. The
-    /// Referrer has the same scopes with the same `Self`, so it computes the same context.
+    /// Returns the context of `ty` in `scopes` (outermost first), where `Self` is `self_req`. A
+    /// bound written for another `Self` is rewritten (see [`for_self_of()`]). With `nested_type`,
+    /// `self_req` is a nested struct, enum or union, and `ty` may be for any type.
     pub(crate) fn of(
         ty: &Type,
         scopes: &[Scope],
@@ -867,12 +834,9 @@ impl Context {
         Self::compute(ty, scopes, self_req, nested_type, false, enclosing)
     }
 
-    /// Like [`Context::of()`], for an entry of a struct, an enum or a union nested in the analyzed
-    /// syntax (`nested_type`) that is for any type although its type names `Self`
-    /// ([`Reason::NestedSelfInBounds`](crate::Reason::NestedSelfInBounds)): `Self`
-    /// in the type and in the bounds is the implementor of the impl, and the impl does not need the
-    /// generics that `Self` has as arguments. Not so with `nested_type` unset, or a `Self` that is
-    /// not a type. It is `of()` for a type that does not name `Self`.
+    /// Like [`Context::of()`], but with `nested_type` a `ty` that names `Self` is for any type too
+    /// ([`Reason::NestedSelfInBounds`](crate::Reason::NestedSelfInBounds)): `Self` is then the
+    /// implementor of the impl.
     pub(crate) fn of_any(
         ty: &Type,
         scopes: &[Scope],
@@ -883,15 +847,24 @@ impl Context {
         Self::compute(ty, scopes, self_req, nested_type, true, enclosing)
     }
 
-    /// Leaves out the bounds of the generics that the Repeater's impl cannot carry (see
-    /// [`LeftOut`]), except for a type that names `Self` or writes out the self type of its scope:
-    /// the self type of an item, or the associated type of its trait, is well-formed only with the
-    /// bounds that the item declares, which the impl needs whole (`struct S<T: Fn(T::Item) +
-    /// Iterator<Item = u8>>` and the entry `Wrap<S<T>>`, or `impl<T: Fn(T::Item) + Iterator<Item =
-    /// u8>> S<T>` and the entry `S<T>`: E0277 in the Leaker's crate otherwise). A type that
-    /// depends on `Self` only through a bound or an outlives predicate (`Self: 'x`) keeps whole
-    /// the bounds of the generics that the description of `Self` names (`impl<T: ..> S<T>`,
-    /// `Tr<T>`), and no others.
+    /// [`Context::of_any()`] if `any`, else [`Context::of()`].
+    pub(crate) fn of_as(
+        ty: &Type,
+        scopes: &[Scope],
+        self_req: Option<&SelfRequirement>,
+        nested_type: bool,
+        any: bool,
+        enclosing: &Enclosing,
+    ) -> std::result::Result<Self, UnnameableSelf> {
+        if any {
+            Self::of_any(ty, scopes, self_req, nested_type, enclosing)
+        } else {
+            Self::of(ty, scopes, self_req, nested_type, enclosing)
+        }
+    }
+
+    /// Computes the context without the bounds that [`LeftOut`] leaves out, except where `ty`
+    /// depends on `Self` or writes out the self type of its scope.
     fn compute(
         ty: &Type,
         scopes: &[Scope],
@@ -907,7 +880,7 @@ impl Context {
             nested_type,
             any,
             enclosing,
-            &Whole::Nothing,
+            Whole::Nothing,
         )?;
         // The self type of an impl, a struct, an enum or a union, written out (`impl<T: Fn(T::Item)>
         // S<T> { .. }` with the entry `S<T>`), is declared with the bounds of the item.
@@ -920,6 +893,9 @@ impl Context {
         if !(names_self_type || depends_on_self) {
             return Ok(context);
         }
+        // The self type, or an associated type of its trait, is well-formed only with the bounds
+        // that the item declares (E0277 in the Leaker's crate otherwise). A type that depends on
+        // `Self` only through a bound or `Self: 'x` keeps those of the generics `Self` names.
         let keep = if names_self_type || type_mentions_self(ty) {
             Whole::Everything
         } else {
@@ -930,7 +906,7 @@ impl Context {
             Whole::Named(names)
         };
         let mut whole =
-            Self::compute_with(ty, scopes, self_req, nested_type, any, enclosing, &keep)?;
+            Self::compute_with(ty, scopes, self_req, nested_type, any, enclosing, keep)?;
         // The Referrer knows the self type of the scope only if the top-level context records it:
         // it does if the context depends on it (`substituted`, see `names_self()`), which it does
         // when keeping the bounds makes a difference.
@@ -952,7 +928,7 @@ impl Context {
         nested_type: bool,
         any: bool,
         enclosing: &Enclosing,
-        whole: &Whole,
+        whole: Whole,
     ) -> std::result::Result<Self, UnnameableSelf> {
         let mut names = HashSet::new();
         type_names(ty, &mut names);
@@ -967,72 +943,51 @@ impl Context {
         if mentions_self && !free_self {
             names.extend(self_names.iter().cloned());
         }
-        let mut work: Vec<(usize, String)> = Vec::new();
+        let mut gather = Gather {
+            scopes,
+            self_req,
+            work: Vec::new(),
+            params: BTreeMap::new(),
+            predicates: BTreeMap::new(),
+            substituted: Vec::new(),
+            left_out: LeftOut::new(whole),
+        };
         if let Some(from) = scopes.len().checked_sub(1) {
-            push_names(&mut work, scopes, from, names);
+            push_names(&mut gather.work, scopes, from, names);
         }
         // An enclosing lifetime is a generic only if the type has a generic to bound by it.
         let ancestors = enclosing.generic(scopes);
-        let self_bound = matches!(self_req, Some(SelfRequirement::Bound(_)));
-        let mentions = Mentions::of(ty, scopes, self_bound, !ancestors.is_empty());
-        for (lifetime, depth) in &ancestors {
+        if !ancestors.is_empty() {
+            let self_bound = matches!(self_req, Some(SelfRequirement::Bound(_)));
+            let mentions = Mentions::of(ty, scopes, self_bound);
             let is_type_param = |name: &String| {
-                scopes.iter().any(|scope| {
-                    scope.params().any(|param| {
-                        matches!(param, GenericParam::Type(param) if &ident_name(&param.ident) == name)
-                    })
-                })
+                scopes
+                    .iter()
+                    .any(|scope| scope.params().any(|param| is_type_param_named(param, name)))
             };
-            let bounds_something = (self_req.is_some()
+            let bounds_generic = (self_req.is_some()
                 && mentions.types.iter().any(|name| name == "Self"))
                 || mentions.types.iter().any(is_type_param)
-                || !mentions.projections.is_empty()
-                || mentions.lifetimes.iter().any(|other| other != lifetime);
-            if let (true, Some(from)) = (bounds_something, depth.checked_sub(1)) {
-                work.push((from, lifetime.to_string()));
+                || !mentions.projections.is_empty();
+            for (lifetime, depth) in &ancestors {
+                let bounds_something =
+                    bounds_generic || mentions.lifetimes.iter().any(|other| other != lifetime);
+                if let (true, Some(from)) = (bounds_something, depth.checked_sub(1)) {
+                    gather.work.push((from, lifetime.to_string()));
+                }
             }
         }
         let ancestors: Vec<Lifetime> = ancestors
             .into_iter()
             .map(|(lifetime, _)| lifetime)
             .collect();
-        let mut params = BTreeMap::new();
-        let mut predicates = BTreeMap::new();
         let mut swept_self = false;
-        // The `Self` of the scope `ix`, if it is not the one where `ty` is written.
-        let foreign = |ix: usize| {
-            scopes[ix]
-                .self_ty()
-                .filter(|outer| Some(*outer) != self_req)
-        };
-        let mut substituted: Vec<SelfRequirement> = Vec::new();
-        let mut left_out = LeftOut::new(whole.clone());
         loop {
-            let (from, name) = match work.pop() {
+            let (from, name) = match gather.work.pop() {
                 Some(item) => item,
                 None if mentions_self && !swept_self => {
-                    // `where Self: Sized` belongs to the context: the impl must declare it too.
                     swept_self = true;
-                    for (ix, scope) in scopes.iter().enumerate() {
-                        // What bounds another `Self` is no business of this one.
-                        if foreign(ix).is_some() {
-                            continue;
-                        }
-                        for (k, predicate) in scope.predicates.iter().enumerate() {
-                            let bounds_self = match predicate {
-                                WherePredicate::Type(predicate) => {
-                                    type_mentions_self(&predicate.bounded_ty)
-                                }
-                                _ => false,
-                            };
-                            if bounds_self && !predicates.contains_key(&(ix, k)) {
-                                let mut names = HashSet::new();
-                                token_names(quote!(#predicate), &mut names);
-                                predicates.insert((ix, k), predicate.clone());
-                                push_names(&mut work, scopes, ix, names);
-                            }
-                        }
-                    }
+                    gather.sweep_self();
                     continue;
                 }
                 None => break,
@@ -1041,76 +996,15 @@ impl Context {
                 Some(found) => found,
                 None => continue,
             };
-            if params.contains_key(&(ix, pos)) {
+            if gather.params.contains_key(&(ix, pos)) {
                 continue;
             }
-            // The bounds are written for the `Self` of the scope, which may not be this one.
-            let outer = foreign(ix);
-            let mut param = scopes[ix].params[pos].clone();
-            if let GenericParam::Type(param) = &mut param {
-                let left_out = left_out.of(scopes, ix, &name);
-                if !left_out.is_empty() {
-                    param.bounds = param
-                        .bounds
-                        .iter()
-                        .filter(|bound| !left_out.contains(&bound_text(bound)))
-                        .cloned()
-                        .collect();
-                }
-            }
-            if let Some(outer) = outer.filter(|_| generic_param_mentions_self(&param)) {
-                param = for_self_of(outer, &param)?;
-                if !substituted.contains(outer) {
-                    substituted.push(outer.clone());
-                }
-            }
-            let mut names = HashSet::new();
-            token_names(quote!(#param), &mut names);
-            push_names(&mut work, scopes, ix, names);
-            let mut found_self = generic_param_mentions_self(&param);
-            params.insert((ix, pos), param);
-            for (k, predicate) in scopes[ix].predicates.iter().enumerate() {
-                if predicates.contains_key(&(ix, k)) {
-                    continue;
-                }
-                // The bounds of a generic that the context leaves out are not its predicates.
-                let predicate = &match left_out.without(scopes, ix, predicate) {
-                    Some(predicate) => predicate,
-                    None => continue,
-                };
-                let mut names = HashSet::new();
-                token_names(quote!(#predicate), &mut names);
-                // A predicate on a generic of the scope is a bound of it, as `canonicalize()` makes
-                // it: it is in the context of what uses that generic, not of what its arguments
-                // name. So `T: Iterator<Item = Rel<'a>>` is no more in the context of `Rel<'a>`
-                // than the inline bound is, which the Referrer sees. Any other predicate belongs to
-                // each generic it names.
-                let belongs = match bounded_generic(predicate) {
-                    Some(bounded) if scopes[ix].declares(&bounded) => bounded == name,
-                    _ => names.contains(&name),
-                };
-                if belongs {
-                    let mut predicate = predicate.clone();
-                    if let Some(outer) = outer.filter(|_| where_predicate_mentions_self(&predicate))
-                    {
-                        predicate = for_self_of(outer, &predicate)?;
-                        if !substituted.contains(outer) {
-                            substituted.push(outer.clone());
-                        }
-                        names.clear();
-                        token_names(quote!(#predicate), &mut names);
-                    }
-                    push_names(&mut work, scopes, ix, names);
-                    found_self |= where_predicate_mentions_self(&predicate);
-                    predicates.insert((ix, k), predicate);
-                }
-            }
-            if found_self && !mentions_self {
+            if gather.take(ix, pos, &name)? && !mentions_self {
                 mentions_self = true;
                 // The impl for any type has no use for the generics of the type that `Self` is.
                 if !free_self {
                     push_names(
-                        &mut work,
+                        &mut gather.work,
                         scopes,
                         scopes.len() - 1,
                         self_names.iter().cloned(),
@@ -1118,61 +1012,33 @@ impl Context {
                 }
             }
         }
-        let mut params: Vec<GenericParam> = params.into_values().collect();
-        let mut predicates: Vec<WherePredicate> = predicates.into_values().collect();
+        let mut params: Vec<GenericParam> = gather.params.into_values().collect();
+        let mut predicates: Vec<WherePredicate> = gather.predicates.into_values().collect();
         let mut self_outlives = Vec::new();
         // A written `Self: 'a` moves into `self_outlives`, so written and implied give one context.
         if self_req.is_some() {
             self_outlives.extend(written_self_outlives(&mut predicates, &params));
         }
-        let env = Binding::of(&params, &predicates);
-        for (bounded, lifetime) in implied_outlives(ty, scopes, &params, &env, self_req, &ancestors)
-        {
-            match bounded {
-                Bounded::SelfTy => {
-                    self_outlives.push(lifetime);
-                    continue;
-                }
-                Bounded::Projection(projection) => {
-                    predicates.push(parse_quote!(#projection: #lifetime));
-                    continue;
-                }
-                _ => (),
-            }
-            for param in params.iter_mut() {
-                match (param, &bounded) {
-                    (GenericParam::Type(param), Bounded::Type(name))
-                        if &ident_name(&param.ident) == name =>
-                    {
-                        param
-                            .bounds
-                            .push(TypeParamBound::Lifetime(lifetime.clone()))
-                    }
-                    (GenericParam::Lifetime(param), Bounded::Lifetime(name))
-                        if &param.lifetime == name =>
-                    {
-                        param.bounds.push(lifetime.clone())
-                    }
-                    _ => (),
-                }
-            }
-        }
-        let mut generics = Generics {
+        add_implied_outlives(
+            ty,
+            scopes,
+            self_req,
+            &ancestors,
+            &mut params,
+            &mut predicates,
+            &mut self_outlives,
+        );
+        let generics = Generics {
             params: params.into_iter().collect(),
+            where_clause: where_clause(predicates),
             ..Default::default()
         };
-        if !predicates.is_empty() {
-            generics.where_clause = Some(WhereClause {
-                where_token: Default::default(),
-                predicates: predicates.into_iter().collect(),
-            });
-        }
         let self_ty = match self_req.filter(|_| mentions_self) {
             Some(_) if free_self => Some(SelfRequirement::Any),
             self_req => self_req.cloned(),
         };
         let mut context = Self::new(generics, self_ty).with_self_outlives(self_outlives);
-        context.substituted = substituted;
+        context.substituted = gather.substituted;
         Ok(context)
     }
 
@@ -1218,8 +1084,7 @@ impl Context {
         mine.iter()
             .all(|(text, _)| theirs.iter().any(|(other, _)| other == text))
             && theirs.iter().all(|(text, predicate)| {
-                let mut used = HashSet::new();
-                token_names(predicate.to_token_stream(), &mut used);
+                let used = names_in(predicate);
                 mine.iter().any(|(other, _)| other == text)
                     || !used.iter().any(|name| names.contains(name))
             })
@@ -1343,18 +1208,16 @@ fn written_self_outlives(
     params: &[GenericParam],
 ) -> Vec<Lifetime> {
     let is_param = |lifetime: &Lifetime| {
-        params.iter().any(
-            |param| matches!(param, GenericParam::Lifetime(param) if &param.lifetime == lifetime),
-        )
+        params
+            .iter()
+            .any(|param| is_lifetime_param(param, lifetime))
     };
     let mut moved = Vec::new();
     let mut remaining = Vec::with_capacity(predicates.len());
     for predicate in std::mem::take(predicates) {
         match predicate {
             WherePredicate::Type(mut predicate)
-                if predicate.lifetimes.is_none()
-                    && matches!(unwrap_type_group(&predicate.bounded_ty),
-                        Type::Path(TypePath { qself: None, path }) if path.is_ident("Self")) =>
+                if predicate.lifetimes.is_none() && is_bare_self(&predicate.bounded_ty) =>
             {
                 let mut kept: Punctuated<TypeParamBound, Token![+]> = Punctuated::new();
                 for bound in std::mem::take(&mut predicate.bounds) {
@@ -1391,27 +1254,140 @@ fn bounded_generic(predicate: &WherePredicate) -> Option<String> {
     }
 }
 
-/// The bounds that a context leaves out, by the scope and the type parameter that they bound.
-///
-/// The Repeater's impl of an entry carries the bounds of the generics that its type uses, and rustc
-/// has to prove them whenever the copy names the entry in a predicate of an item (`fn m(&self)
-/// where <() as Repeater<(T,), ..>>::Type: Default`), in the environment of the item, in which the
-/// bounds are not normalized yet. A bound of `T` that names `T` through a projection that another
-/// bound of `T` fixes (`T: Iterator<Item = u8> + Fn(<T as Iterator>::Item)`: the impl needs `T:
-/// Fn(u8)`, the environment has `T: Fn(<T as Iterator>::Item)`) is not proved then (E0277
-/// "expected an `Fn(u8)` closure, found `T`"), and neither is one that hides the projection behind
-/// a type alias (`T: Fn(Alias<T>)`), which the Leaker cannot tell from a struct. The impl does not
-/// need that bound to name the entry, so the context leaves out such a bound, the Leaker and the
-/// Referrer alike (see [`left_out_bounds()`]), except for the generics that [`Whole`] keeps (see
-/// `Context::compute()`). The Leaker rejects an entry in a predicate if such a bound stays
-/// (`hidden_projection()` in the `unstable` module, which follows [`hiding_bounds()`]).
+/// The generics and where predicates that `Context::compute_with()` gathers from the scopes.
+struct Gather<'a> {
+    scopes: &'a [Scope],
+    /// What `Self` means where the type is written.
+    self_req: Option<&'a SelfRequirement>,
+    /// The names still to take, each with the scope where it is written (see [`push_names()`]).
+    work: Vec<(usize, String)>,
+    /// The generics taken, by scope and position.
+    params: BTreeMap<(usize, usize), GenericParam>,
+    /// The where predicates taken, by scope and position.
+    predicates: BTreeMap<(usize, usize), WherePredicate>,
+    /// The outer `Self`s that a bound was rewritten for, in the order found.
+    substituted: Vec<SelfRequirement>,
+    left_out: LeftOut,
+}
+
+impl<'a> Gather<'a> {
+    /// The `Self` of the scope `ix`, if it is not the one where the type is written.
+    fn foreign(&self, ix: usize) -> Option<&'a SelfRequirement> {
+        let self_req = self.self_req;
+        self.scopes[ix]
+            .self_ty()
+            .filter(|outer| Some(*outer) != self_req)
+    }
+
+    /// Takes the where predicates on `Self` (`where Self: Sized`): the impl must declare them too.
+    fn sweep_self(&mut self) {
+        let scopes = self.scopes;
+        for (ix, scope) in scopes.iter().enumerate() {
+            // What bounds another `Self` is no business of this one.
+            if self.foreign(ix).is_some() {
+                continue;
+            }
+            for (k, predicate) in scope.predicates.iter().enumerate() {
+                let bounds_self = match predicate {
+                    WherePredicate::Type(predicate) => type_mentions_self(&predicate.bounded_ty),
+                    _ => false,
+                };
+                if bounds_self && !self.predicates.contains_key(&(ix, k)) {
+                    let names = names_in(predicate);
+                    self.predicates.insert((ix, k), predicate.clone());
+                    push_names(&mut self.work, scopes, ix, names);
+                }
+            }
+        }
+    }
+
+    /// Takes the generic `name`, the parameter `pos` of `scopes[ix]`, and the where predicates of
+    /// that scope that belong to it, and puts the names they write on `work`. Returns `true` if
+    /// they mention `Self`.
+    fn take(
+        &mut self,
+        ix: usize,
+        pos: usize,
+        name: &str,
+    ) -> std::result::Result<bool, UnnameableSelf> {
+        let scopes = self.scopes;
+        // The bounds are written for the `Self` of the scope, which may not be this one.
+        let outer = self.foreign(ix);
+        let mut param = scopes[ix].params[pos].clone();
+        if let GenericParam::Type(param) = &mut param {
+            let left_out = self.left_out.of(scopes, ix, name);
+            if !left_out.is_empty() {
+                param.bounds = param
+                    .bounds
+                    .iter()
+                    .filter(|bound| !left_out.contains(&bound_text(bound)))
+                    .cloned()
+                    .collect();
+            }
+        }
+        if let Some(outer) = outer.filter(|_| generic_param_mentions_self(&param)) {
+            param = self.substitute(outer, &param)?;
+        }
+        let names = names_in(&param);
+        push_names(&mut self.work, scopes, ix, names);
+        let mut found_self = generic_param_mentions_self(&param);
+        self.params.insert((ix, pos), param);
+        for (k, predicate) in scopes[ix].predicates.iter().enumerate() {
+            if self.predicates.contains_key(&(ix, k)) {
+                continue;
+            }
+            // The bounds of a generic that the context leaves out are not its predicates.
+            let predicate = &match self.left_out.without(scopes, ix, predicate) {
+                Some(predicate) => predicate,
+                None => continue,
+            };
+            let mut names = names_in(predicate);
+            // A predicate on a generic of the scope is a bound of it, as `canonicalize()` makes
+            // it: it is in the context of what uses that generic, not of what its arguments
+            // name. So `T: Iterator<Item = Rel<'a>>` is no more in the context of `Rel<'a>`
+            // than the inline bound is, which the Referrer sees. Any other predicate belongs to
+            // each generic it names.
+            let belongs = match bounded_generic(predicate) {
+                Some(bounded) if scopes[ix].declares(&bounded) => bounded == name,
+                _ => names.contains(name),
+            };
+            if belongs {
+                let mut predicate = predicate.clone();
+                if let Some(outer) = outer.filter(|_| where_predicate_mentions_self(&predicate)) {
+                    predicate = self.substitute(outer, &predicate)?;
+                    names = names_in(&predicate);
+                }
+                push_names(&mut self.work, scopes, ix, names);
+                found_self |= where_predicate_mentions_self(&predicate);
+                self.predicates.insert((ix, k), predicate);
+            }
+        }
+        Ok(found_self)
+    }
+
+    /// Rewrites `node` of a scope whose `Self` is `outer` (see [`for_self_of()`]), and records
+    /// `outer` in `substituted`.
+    fn substitute<T: WrittenForSelf>(
+        &mut self,
+        outer: &SelfRequirement,
+        node: &T,
+    ) -> std::result::Result<T, UnnameableSelf> {
+        let node = for_self_of(outer, node)?;
+        if !self.substituted.contains(outer) {
+            self.substituted.push(outer.clone());
+        }
+        Ok(node)
+    }
+}
+
+/// The bounds that a context leaves out (see [`left_out_bounds()`]), by scope and type parameter,
+/// except for the generics that [`Whole`] keeps.
 struct LeftOut {
     whole: Whole,
     cache: HashMap<(usize, String), HashSet<String>>,
 }
 
 /// The generics of a context that keep every bound.
-#[derive(Clone)]
 enum Whole {
     Nothing,
     /// The generics with these names.
@@ -1438,7 +1414,7 @@ impl LeftOut {
     }
 
     /// The texts of the bounds of the type parameter `name` of `scopes[ix]` that the context
-    /// leaves out. Empty if `scopes[ix]` declares no such parameter.
+    /// leaves out.
     fn of(&mut self, scopes: &[Scope], ix: usize, name: &str) -> &HashSet<String> {
         let kept = self.whole.keeps(name);
         self.cache.entry((ix, name.to_string())).or_insert_with(|| {
@@ -1488,71 +1464,9 @@ impl LeftOut {
     }
 }
 
-pub(crate) fn bound_text(bound: &TypeParamBound) -> String {
-    quote!(#bound).to_string()
-}
-
-/// The name of the generic that a where predicate's bounded type is, if it is a bare name.
-pub(crate) fn bounded_ident(ty: &Type) -> Option<String> {
-    match unwrap_type_group(ty) {
-        Type::Path(TypePath { qself: None, path }) => path.get_ident().map(ident_name),
-        _ => None,
-    }
-}
-
-/// Returns `true` if `bound` is a trait bound with an equation of an associated type
-/// (`Iterator<Item = u8>`).
-pub(crate) fn binds_assoc(bound: &TypeParamBound) -> bool {
-    match bound {
-        TypeParamBound::Trait(bound) => matches!(
-            bound.path.segments.last().map(|seg| &seg.arguments),
-            Some(PathArguments::AngleBracketed(args))
-                if args.args.iter().any(|arg| matches!(arg, GenericArgument::AssocType(_)))
-        ),
-        _ => false,
-    }
-}
-
-/// Returns `true` if `bound` is a trait bound with the name `name` in the arguments of its path
-/// (`Fn(Wrap<T>)`, `Tr<<T as Iterator>::Item>`, `PartialEq<Wrap<T>>`).
-fn arguments_mention(bound: &TypeParamBound, name: &str) -> bool {
-    match bound {
-        TypeParamBound::Trait(bound) => {
-            let mut names = HashSet::new();
-            for seg in &bound.path.segments {
-                let arguments = &seg.arguments;
-                token_names(quote!(#arguments), &mut names);
-            }
-            names.contains(name)
-        }
-        _ => false,
-    }
-}
-
-/// Returns `true` if the trait of `bound` is not one of the standard library, so a supertrait of
-/// it may equate an associated type that the Leaker cannot read (`trait Tr: Iterator<Item = u8>`).
-fn may_define_assoc(bound: &TypeParamBound) -> bool {
-    match bound {
-        TypeParamBound::Trait(bound) => !is_std_trait(&bound.path),
-        _ => false,
-    }
-}
-
-/// Returns the texts of the bounds of the type parameter `name` of `scope` that its context leaves
-/// out: the bounds that name `name` in the arguments of their path (`T: Fn(X<T>)`, `T:
-/// Tr<<T as Iterator>::Item>`, `T: PartialEq<Wrap<T>>`, as a bound or a where predicate of the
-/// scope), if another bound of `name` fixes an associated type: an equation (`T: Iterator<Item =
-/// u8>`, `T: Tr<A = X>`), or a trait that is not one of the standard library and does not name
-/// `name` (`T: ::p::WIter`, which may have a supertrait that equates an `Item`).
-///
-/// A bound that is an equation stays, even if it names `name` (`T: Iterator<Item = Wrap<T>>`), as
-/// does every other bound. The rule is about `name` alone: a bound of `T` that names another
-/// generic `U` through a projection that `U: Iterator<Item = u8>` fixes (`T: Fn(<U as
-/// Iterator>::Item)`) stays, as does a bound of `T` in an inner scope (a method's where clause).
-///
-/// The type that is leaked may need the bound that is left out (`struct Rel<T: Fn(X<T>)>`), which
-/// the Leaker cannot see: the Repeater's impl is then rejected by rustc in the crate of the Leaker
-/// (E0277). See [`Leaker`](crate::Leaker#bounds-that-name-leaked-types).
+/// The texts of the bounds of the type parameter `name` of `scope` that its context leaves out
+/// (see [`hiding_bounds()`]). The leaked type may need one (`struct Rel<T: Fn(X<T>)>`): then
+/// rustc rejects the Repeater's impl (E0277).
 fn left_out_bounds(scope: &Scope, name: &str) -> HashSet<String> {
     let mut bounds: Vec<&TypeParamBound> = Vec::new();
     for param in scope.params() {
@@ -1562,9 +1476,6 @@ fn left_out_bounds(scope: &Scope, name: &str) -> HashSet<String> {
             }
             _ => (),
         }
-    }
-    if bounds.is_empty() && !scope.declares(name) {
-        return HashSet::new();
     }
     for predicate in scope.predicates() {
         match predicate {
@@ -1576,32 +1487,12 @@ fn left_out_bounds(scope: &Scope, name: &str) -> HashSet<String> {
             _ => (),
         }
     }
+    // rustc proves the impl's bounds where the copy names the entry in a predicate, before it
+    // normalizes them: `T: Fn(<T as Iterator>::Item)` is no `T: Fn(u8)` there (E0277), and the
+    // impl does not need such a bound to name the entry.
     hiding_bounds(&bounds, name, false)
         .into_iter()
         .map(bound_text)
-        .collect()
-}
-
-/// Returns the bounds among `bounds`, all those of the type parameter `name`, that name `name` in
-/// the arguments of their path and may hide a projection of it (`T: Fn(X<T>)`), because another
-/// one fixes an associated type (see [`left_out_bounds()`]), or `equated` says that an equation of
-/// `name` is in scope elsewhere (the where clause of a method). An equation is no such bound.
-pub(crate) fn hiding_bounds<'b>(
-    bounds: &[&'b TypeParamBound],
-    name: &str,
-    equated: bool,
-) -> Vec<&'b TypeParamBound> {
-    let fixes = equated
-        || bounds.iter().any(|bound| {
-            binds_assoc(bound) || (may_define_assoc(bound) && !arguments_mention(bound, name))
-        });
-    if !fixes {
-        return Vec::new();
-    }
-    bounds
-        .iter()
-        .copied()
-        .filter(|bound| !binds_assoc(bound) && arguments_mention(bound, name))
         .collect()
 }
 
@@ -1649,10 +1540,8 @@ fn declared_at(scopes: &[Scope], from: usize, name: &str) -> Option<(usize, usiz
     })
 }
 
-/// Puts the `names` that are written in `scopes[from]` on `work`, to be taken in the order they are
-/// declared (outer scopes first; what is no generic first). A set gives them in an order that
-/// differs from run to run, and the walk of `compute_with()` reports the first failure it finds
-/// and lists the outer `Self` that it rewrites in the order it finds them.
+/// Puts the `names` written in `scopes[from]` on `work`, to be taken in the order they are
+/// declared (outer scopes first, what is no generic first).
 fn push_names(
     work: &mut Vec<(usize, String)>,
     scopes: &[Scope],
@@ -1663,61 +1552,60 @@ fn push_names(
         .into_iter()
         .map(|name| (declared_at(scopes, from, &name), name))
         .collect();
+    // Not the order of the set: the walk reports the first failure it finds and lists the outer
+    // `Self`s that it rewrites in the order found.
     names.sort();
     work.extend(names.into_iter().rev().map(|(_, name)| (from, name)));
 }
 
-/// Rewrites `node`, which is written for `outer` as `Self`, for any other `Self`: `Self` becomes
-/// the type that `outer` is. It fails if `outer` is the implementor of a trait, or if `node` names
-/// an associated item of `Self`, which have no name where `Self` is something else (`S::X` of a
-/// type is ambiguous).
+/// Rewrites `node`, written where `Self` is `outer`, with `Self` replaced by the type `outer` is.
+/// Fails if `outer` is the implementor of a trait or `node` names an associated item of `Self`
+/// (`S::X` of a type is ambiguous).
 fn for_self_of<T: WrittenForSelf>(
     outer: &SelfRequirement,
     node: &T,
 ) -> std::result::Result<T, UnnameableSelf> {
     let mentions = node.self_mentions();
-    match outer {
+    let note = match outer {
         // No scope declares an `Any` `Self`: it is the context of an entry.
-        SelfRequirement::Any => Err(UnnameableSelf {
-            cause: Box::new(mentions.first.unwrap_or_else(Cause::self_type)),
-            headline: format!("{} mentions a `Self` which has no name here", node.what()),
-            note: format!(
-                "{} mentions a `Self` of no type, which has no name here",
-                node.what()
-            ),
-            help: format!("write {} without `Self`", node.what()),
-        }),
-        SelfRequirement::Bound(path) => Err(UnnameableSelf {
-            cause: Box::new(mentions.first.unwrap_or_else(Cause::self_type)),
-            headline: format!("{} mentions a `Self` which has no name here", node.what()),
-            note: format!(
-                "{} mentions the `Self` of the trait `{}`, which has no name here: `Self` is \
-                 something else in the item around",
-                node.what(),
-                tidy(&quote!(#path))
-            ),
-            help: format!("write {} without `Self`", node.what()),
-        }),
-        SelfRequirement::Type(ty) => match mentions.associated {
-            Some(cause) => Err(UnnameableSelf {
-                headline: format!(
-                    "{} mentions `{}`, which has no name here",
-                    node.what(),
-                    tidy(&cause.shown())
-                ),
-                note: format!(
-                    "{} mentions `{}`, an associated item of the `Self` of `{}`, which has no \
-                     name here: `Self` is something else in the item around",
-                    node.what(),
-                    tidy(&cause.shown()),
-                    tidy(&quote!(#ty))
-                ),
-                help: format!("write {} without `{}`", node.what(), tidy(&cause.shown())),
-                cause: Box::new(cause),
-            }),
-            None => Ok(node.clone().rewrite(&mut ReplaceSelf { self_ty: ty })),
-        },
-    }
+        SelfRequirement::Any => format!(
+            "{} mentions a `Self` of no type, which has no name here",
+            node.what()
+        ),
+        SelfRequirement::Bound(path) => format!(
+            "{} mentions the `Self` of the trait `{}`, which has no name here: `Self` is \
+             something else in the item around",
+            node.what(),
+            tidy(&quote!(#path))
+        ),
+        SelfRequirement::Type(ty) => {
+            return match mentions.associated {
+                Some(cause) => Err(UnnameableSelf {
+                    headline: format!(
+                        "{} mentions `{}`, which has no name here",
+                        node.what(),
+                        tidy(&cause.shown())
+                    ),
+                    note: format!(
+                        "{} mentions `{}`, an associated item of the `Self` of `{}`, which has \
+                         no name here: `Self` is something else in the item around",
+                        node.what(),
+                        tidy(&cause.shown()),
+                        tidy(&quote!(#ty))
+                    ),
+                    help: format!("write {} without `{}`", node.what(), tidy(&cause.shown())),
+                    cause: Box::new(cause),
+                }),
+                None => Ok(node.clone().rewrite(&mut ReplaceSelf { self_ty: ty })),
+            }
+        }
+    };
+    Err(UnnameableSelf {
+        cause: Box::new(mentions.first.unwrap_or_else(Cause::self_type)),
+        headline: format!("{} mentions a `Self` which has no name here", node.what()),
+        note,
+        help: format!("write {} without `Self`", node.what()),
+    })
 }
 
 /// The lifetimes a type must outlive because of the types around it, as in `&'a Vec<Rel2<T>>` (see
@@ -1770,8 +1658,8 @@ impl Enclosing {
             lifetime: lifetime.clone(),
             depth,
         };
-        if lifetime.ident != "static" && lifetime.ident != "_" && !self.0.contains(&link) {
-            self.0.push(link);
+        if lifetime.ident != "static" && lifetime.ident != "_" {
+            push_once(&mut self.0, link);
         }
     }
 
@@ -1786,10 +1674,7 @@ impl Enclosing {
                     }
                 }
                 Link::Lifetime { lifetime, depth } => {
-                    let entry = (lifetime.clone(), *depth);
-                    if !active.contains(&entry) {
-                        active.push(entry);
-                    }
+                    push_once(&mut active, (lifetime.clone(), *depth));
                 }
             }
         }
@@ -1797,7 +1682,7 @@ impl Enclosing {
     }
 
     /// The generic lifetimes among them, outermost first, each with its depth.
-    pub(crate) fn generic(&self, scopes: &[Scope]) -> Vec<(Lifetime, usize)> {
+    fn generic(&self, scopes: &[Scope]) -> Vec<(Lifetime, usize)> {
         let mut generic: Vec<(Lifetime, usize)> = Vec::new();
         for (lifetime, depth) in self.active(scopes) {
             // The scopes in scope where it is written decide what it names.
@@ -1822,9 +1707,7 @@ fn is_type_parameter(name: &str, scopes: &[Scope]) -> bool {
         .rev()
         .find(|scope| scope.declares(name))
         .map_or(false, |scope| {
-            scope.params().any(
-                |param| matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == name),
-            )
+            scope.params().any(|param| is_type_param_named(param, name))
         })
 }
 
@@ -1850,7 +1733,7 @@ fn is_generic_lifetime(scopes: &[Scope], binders: &[Lifetime], lifetime: &Lifeti
             .iter()
             .rev()
             .find(|scope| scope.declares(&lifetime.to_string()))
-            .map_or(false, |scope| !scope.binder)
+            .map_or(false, |scope| !scope.is_binder)
 }
 
 /// The generics a type mentions, which `X: 'a` bounds (see [`implied_outlives()`]).
@@ -1874,11 +1757,9 @@ struct Mentions<'a> {
 }
 
 impl<'a> Mentions<'a> {
-    fn of(ty: &Type, scopes: &'a [Scope], self_bound: bool, wanted: bool) -> Self {
+    fn of(ty: &Type, scopes: &'a [Scope], self_bound: bool) -> Self {
         let mut mentions = Self::new(scopes, self_bound, &[], Vec::new());
-        if wanted {
-            mentions.visit_type(ty);
-        }
+        mentions.visit_type(ty);
         mentions
     }
 
@@ -1919,6 +1800,9 @@ impl<'a, 'ast> Visit<'ast> for Mentions<'a> {
                     return;
                 }
                 Some(_) => (),
+                // Not the bounds of its parts: the copy knows only that the projection outlives
+                // `'a` (E0309). So `Self::A` of a trait brings no `Self: 'a`, which would be
+                // stricter than the original.
                 None if is_writable_projection(i, self.scopes, &self.binders) => {
                     self.projections.push(i.clone());
                     return;
@@ -1965,12 +1849,116 @@ impl<'a, 'ast> Visit<'ast> for Mentions<'a> {
     fn visit_macro(&mut self, _: &'ast Macro) {}
 }
 
-/// Returns `true` if `ty` is an associated type path of a generic, which `&'a ty` makes outlive
-/// `'a` as a whole: `T::A` and `<T as Tr<..>>::A` with `T` a type parameter in `scopes`, or such a
-/// path in place of `T` (`<T::A as Tr2>::B`). `Self` counts as a type parameter where it is the
-/// implementor of a trait (`self_bound`): `Self::A`, `<Self as Tr<..>>::A` and `Self::A<'b>` are
-/// the same. An associated type of a type that is not a type parameter (`<Vec<T> as
-/// IntoIterator>::Item`) is not one: rustc normalizes it, so what it becomes is what outlives `'a`.
+/// Finds the outlives bounds that a type implies (see [`implied_outlives()`]).
+struct Finder<'a> {
+    scopes: &'a [Scope],
+    self_bound: bool,
+    env: &'a [Binding],
+    params: &'a [GenericParam],
+    self_req: Option<&'a SelfRequirement>,
+    binders: Vec<Lifetime>,
+    found: Vec<(Bounded, Lifetime)>,
+}
+
+impl<'a> Finder<'a> {
+    fn require(&mut self, lifetime: &Lifetime, referent: &Type) {
+        if !is_generic_lifetime(self.scopes, &self.binders, lifetime) {
+            return;
+        }
+        self.require_generic(lifetime, referent)
+    }
+
+    /// A projection that names a generic associated type of the trait requires what its where
+    /// clause says, wherever it is written (see [`Gat`]).
+    fn require_gat(&mut self, projection: &TypePath) {
+        for predicate in gat_requirements(projection, self.scopes, self.self_req) {
+            match predicate {
+                WherePredicate::Type(predicate) => {
+                    for bound in &predicate.bounds {
+                        if let TypeParamBound::Lifetime(lifetime) = bound {
+                            self.require(lifetime, &predicate.bounded_ty);
+                        }
+                    }
+                }
+                WherePredicate::Lifetime(predicate) => {
+                    // `'a: 'x` is what `&'x &'a ()` requires.
+                    let outlived = &predicate.lifetime;
+                    let referent: Type = parse_quote!(&#outlived ());
+                    for lifetime in &predicate.bounds {
+                        self.require(lifetime, &referent);
+                    }
+                }
+                _ => (),
+            }
+        }
+    }
+
+    fn require_generic(&mut self, lifetime: &Lifetime, referent: &Type) {
+        let mut mentions =
+            Mentions::new(self.scopes, self.self_bound, self.env, self.binders.clone());
+        mentions.visit_type(referent);
+        if self.self_req.is_some() && mentions.types.iter().any(|name| name == "Self") {
+            self.found.push((Bounded::SelfTy, lifetime.clone()));
+        }
+        self.found.extend(
+            mentions
+                .projections
+                .into_iter()
+                .map(|projection| (Bounded::Projection(projection), lifetime.clone())),
+        );
+        for name in mentions.types {
+            let is_param = self
+                .params
+                .iter()
+                .any(|param| is_type_param_named(param, &name));
+            if is_param {
+                self.found.push((Bounded::Type(name), lifetime.clone()));
+            }
+        }
+        for other in mentions.lifetimes {
+            let is_param = self
+                .params
+                .iter()
+                .any(|param| is_lifetime_param(param, &other));
+            if is_param && &other != lifetime {
+                self.found
+                    .push((Bounded::Lifetime(other), lifetime.clone()));
+            }
+        }
+    }
+}
+
+impl<'a, 'ast> Visit<'ast> for Finder<'a> {
+    fn visit_type_reference(&mut self, i: &'ast TypeReference) {
+        if let Some(lifetime) = &i.lifetime {
+            self.require(lifetime, &i.elem);
+        }
+        syn::visit::visit_type_reference(self, i)
+    }
+    fn visit_type_path(&mut self, i: &'ast TypePath) {
+        // A lifetime argument implies nothing: a guessed bound could make the copy stricter.
+        self.require_gat(i);
+        syn::visit::visit_type_path(self, i)
+    }
+    fn visit_type_bare_fn(&mut self, i: &'ast TypeBareFn) {
+        let outer = self.binders.len();
+        self.binders.extend(binder_lifetimes(i.lifetimes.as_ref()));
+        syn::visit::visit_type_bare_fn(self, i);
+        self.binders.truncate(outer);
+    }
+    fn visit_trait_bound(&mut self, i: &'ast TraitBound) {
+        let outer = self.binders.len();
+        self.binders.extend(binder_lifetimes(i.lifetimes.as_ref()));
+        syn::visit::visit_trait_bound(self, i);
+        self.binders.truncate(outer);
+    }
+    fn visit_expr(&mut self, _: &'ast Expr) {}
+    fn visit_macro(&mut self, _: &'ast Macro) {}
+}
+
+/// Returns `true` if `ty` is an associated type of a generic (`T::A`, `<T as Tr>::A`, `<T::A as
+/// Tr2>::B`, and `Self::A` with `self_bound`), which `&'a ty` makes outlive `'a` as a whole. Not
+/// `<Vec<T> as IntoIterator>::Item`, which rustc normalizes.
 fn is_generic_projection(ty: &TypePath, scopes: &[Scope], self_bound: bool) -> bool {
     // The type parameter, `Self` of a trait, or the projection that the associated type belongs to.
     fn is_base(name: &str, scopes: &[Scope], self_bound: bool) -> bool {
@@ -2015,11 +2003,9 @@ fn is_generic_projection(ty: &TypePath, scopes: &[Scope], self_bound: bool) -> b
     }
 }
 
-/// Returns `true` if the associated type path `ty` (see [`is_generic_projection()`]) can be the
-/// bounded type of a where predicate of the context: it names no lifetime other than `'static` and
-/// the lifetime parameters of the context (not a binder's, `'_` or an elided one in a reference),
-/// and no `impl Trait`, `_`, type macro, function pointer or `Fn(..)` sugar. Otherwise its parts
-/// are mentioned as before.
+/// Returns `true` if the projection `ty` can be the bounded type of a where predicate of the
+/// context: its lifetimes are `'static` or the context's (none elided), and it has no `impl
+/// Trait`, `_`, type macro, function pointer or `Fn(..)` sugar.
 fn is_writable_projection(ty: &TypePath, scopes: &[Scope], binders: &[Lifetime]) -> bool {
     struct Writable<'a> {
         scopes: &'a [Scope],
@@ -2065,11 +2051,9 @@ fn is_writable_projection(ty: &TypePath, scopes: &[Scope], binders: &[Lifetime])
     writable.writable
 }
 
-/// An associated type that a bound of the context equates: `T: Iterator<Item = X>`, or `F: Fn(A)
-/// -> B`, which equates `Output`. rustc normalizes the path (`T::Item`) to the type in the
-/// environment of an impl that declares the bound, and in the signature of the original, so what
-/// `&'a T::Item` requires is that of `X`, whatever the predicate `T::Item: 'a` says: the
-/// environment of the impl has it as `X: 'a`, and it is no help if `X` is not a parameter.
+/// An associated type that a bound of the context equates (`T: Iterator<Item = X>`, or `Output`
+/// of `F: Fn(A) -> B`). rustc normalizes `T::Item` to `X`, so `&'a T::Item` requires what `X`
+/// requires.
 #[derive(Clone, Debug)]
 struct Binding {
     /// The bounded type as written, the part before `::` of the path: `T`, or `T :: A`.
@@ -2084,52 +2068,36 @@ impl Binding {
     /// The bindings of the bounds of `params` and of `predicates`.
     fn of(params: &[GenericParam], predicates: &[WherePredicate]) -> Vec<Self> {
         let mut found = Vec::new();
-        let mut collect = |bounded: String, bounds: &Punctuated<TypeParamBound, Token![+]>| {
-            for bound in bounds {
-                let seg = match bound {
-                    TypeParamBound::Trait(bound) => match bound.path.segments.last() {
-                        Some(seg) => seg,
-                        None => continue,
-                    },
-                    _ => continue,
-                };
-                match &seg.arguments {
-                    PathArguments::AngleBracketed(args) => {
-                        for arg in &args.args {
-                            if let GenericArgument::AssocType(assoc) = arg {
-                                if assoc.generics.is_none() {
-                                    found.push(Self {
-                                        bounded: bounded.clone(),
-                                        of_trait: Some(ident_name(&seg.ident)),
-                                        name: ident_name(&assoc.ident),
-                                        value: assoc.ty.clone(),
-                                    });
-                                }
+        for (bounded, bound) in trait_bounds(params.iter(), predicates.iter()) {
+            let seg = match bound.path.segments.last() {
+                Some(seg) => seg,
+                None => continue,
+            };
+            match &seg.arguments {
+                PathArguments::AngleBracketed(args) => {
+                    for arg in &args.args {
+                        if let GenericArgument::AssocType(assoc) = arg {
+                            if assoc.generics.is_none() {
+                                found.push(Self {
+                                    bounded: bounded.clone(),
+                                    of_trait: Some(ident_name(&seg.ident)),
+                                    name: ident_name(&assoc.ident),
+                                    value: assoc.ty.clone(),
+                                });
                             }
                         }
                     }
-                    PathArguments::Parenthesized(sugar) => found.push(Self {
-                        bounded: bounded.clone(),
-                        of_trait: None,
-                        name: "Output".to_string(),
-                        value: match &sugar.output {
-                            ReturnType::Type(_, ty) => (**ty).clone(),
-                            ReturnType::Default => parse_quote!(()),
-                        },
-                    }),
-                    PathArguments::None => (),
                 }
-            }
-        };
-        for param in params {
-            if let GenericParam::Type(param) = param {
-                collect(ident_name(&param.ident), &param.bounds);
-            }
-        }
-        for predicate in predicates {
-            if let WherePredicate::Type(predicate) = predicate {
-                let ty = unwrap_type_group(&predicate.bounded_ty);
-                collect(quote!(#ty).to_string(), &predicate.bounds);
+                PathArguments::Parenthesized(sugar) => found.push(Self {
+                    bounded,
+                    of_trait: None,
+                    name: "Output".to_string(),
+                    value: match &sugar.output {
+                        ReturnType::Type(_, ty) => (**ty).clone(),
+                        ReturnType::Default => parse_quote!(()),
+                    },
+                }),
+                PathArguments::None => (),
             }
         }
         found
@@ -2173,35 +2141,53 @@ impl Binding {
     }
 }
 
+/// Adds the outlives bounds that `ty` implies (see [`implied_outlives()`]) to `params`, the where
+/// predicates `predicates` and `self_outlives`.
+fn add_implied_outlives(
+    ty: &Type,
+    scopes: &[Scope],
+    self_req: Option<&SelfRequirement>,
+    ancestors: &[Lifetime],
+    params: &mut [GenericParam],
+    predicates: &mut Vec<WherePredicate>,
+    self_outlives: &mut Vec<Lifetime>,
+) {
+    let env = Binding::of(params, predicates);
+    for (bounded, lifetime) in implied_outlives(ty, scopes, params, &env, self_req, ancestors) {
+        match bounded {
+            Bounded::SelfTy => {
+                self_outlives.push(lifetime);
+                continue;
+            }
+            Bounded::Projection(projection) => {
+                predicates.push(parse_quote!(#projection: #lifetime));
+                continue;
+            }
+            _ => (),
+        }
+        for param in params.iter_mut() {
+            match (param, &bounded) {
+                (GenericParam::Type(param), Bounded::Type(name))
+                    if &ident_name(&param.ident) == name =>
+                {
+                    param
+                        .bounds
+                        .push(TypeParamBound::Lifetime(lifetime.clone()))
+                }
+                (GenericParam::Lifetime(param), Bounded::Lifetime(name))
+                    if &param.lifetime == name =>
+                {
+                    param.bounds.push(lifetime.clone())
+                }
+                _ => (),
+            }
+        }
+    }
+}
+
 /// Returns the outlives bounds `ty` implies on `params`: `&'a X` requires `X: 'a`, as does each of
-/// `ancestors` for `ty`. A path with a lifetime argument adds none, as a guessed bound could make
-/// the copy stricter than the original. See [Outlives bounds](crate::Leaker#outlives-bounds).
-///
-/// An associated type path of a generic (`T::A`, `<T as Tr<'b>>::A`: see [`is_generic_projection()`])
-/// requires `T::A: 'a`, which the original gets from the well-formedness of its signature, and the
-/// Repeater's impl has no signature. It is returned as itself and not as the bounds of its
-/// components (`T` and the arguments of the trait): the copy, where only the projection is known to
-/// outlive `'a`, could not prove those. The signature of a trait gives `T::A: 'a` and not `T: 'a`,
-/// so an impl for another type, whose signature has the encoded `T: 'a`, could not prove it
-/// (E0309).
-///
-/// The same holds for the associated types of `Self` of a trait (`self_req` is its bound):
-/// `Self::A`, `<Self as Tr<'b, U>>::A` and `Self::A<'b>` are returned as themselves, and bring no
-/// `Self: 'a` (it would be stricter than the original, as `T: 'a` is: the copy for a generic host
-/// `Gen<H>` needs `&'a Gen<H>`, where the original needs `H::Item: 'a`), nor `'b: 'a` or `U: 'a`
-/// for the arguments of the trait. `Self` mentioned elsewhere in the type does require `Self: 'a`.
-///
-/// If a bound of the context equates the associated type (`T: Iterator<Item = X>`, `where Self:
-/// Iterator<Item = X>`, see [`Binding`]), rustc normalizes the path in the signature and in the
-/// environment of the impl, where the predicate would be `X: 'a`, which is not decomposed into the
-/// bounds of the parts of `X`: the parts of `X` are mentioned instead. A supertrait that equates it
-/// (`trait Tr: Iterator<Item = X>`) is not seen, since the Referrer's copy has none.
-///
-/// A projection that names a generic associated type of the trait (`Self::G<'x>`, `<Self as
-/// Tr>::G<'x>`: see [`Gat`]) also requires what its where clause says (`type G<'b> where Self: 'b`
-/// gives `Self: 'x`), with the arguments of the projection for its parameters, wherever it is
-/// written: the well-formedness of the signature gives the original those bounds, and the impl
-/// of the Repeater has no signature.
+/// `ancestors` for `ty`, and a projection of a generic is one unit (`T::A: 'a`). See [Outlives
+/// bounds](crate::Leaker#outlives-bounds).
 fn implied_outlives(
     ty: &Type,
     scopes: &[Scope],
@@ -2210,106 +2196,6 @@ fn implied_outlives(
     self_req: Option<&SelfRequirement>,
     ancestors: &[Lifetime],
 ) -> Vec<(Bounded, Lifetime)> {
-    struct Finder<'a> {
-        scopes: &'a [Scope],
-        self_bound: bool,
-        env: &'a [Binding],
-        params: &'a [GenericParam],
-        self_req: Option<&'a SelfRequirement>,
-        binders: Vec<Lifetime>,
-        found: Vec<(Bounded, Lifetime)>,
-    }
-    impl<'a> Finder<'a> {
-        fn require(&mut self, lifetime: &Lifetime, referent: &Type) {
-            if !is_generic_lifetime(self.scopes, &self.binders, lifetime) {
-                return;
-            }
-            self.require_generic(lifetime, referent)
-        }
-
-        /// A projection that names a generic associated type of the trait requires what its where
-        /// clause says, wherever it is written (see [`Gat`]).
-        fn require_gat(&mut self, projection: &TypePath) {
-            for predicate in gat_requirements(projection, self.scopes, self.self_req) {
-                match predicate {
-                    WherePredicate::Type(predicate) => {
-                        for bound in &predicate.bounds {
-                            if let TypeParamBound::Lifetime(lifetime) = bound {
-                                self.require(lifetime, &predicate.bounded_ty);
-                            }
-                        }
-                    }
-                    WherePredicate::Lifetime(predicate) => {
-                        // `'a: 'x` is what `&'x &'a ()` requires.
-                        let outlived = &predicate.lifetime;
-                        let referent: Type = parse_quote!(&#outlived ());
-                        for lifetime in &predicate.bounds {
-                            self.require(lifetime, &referent);
-                        }
-                    }
-                    _ => (),
-                }
-            }
-        }
-
-        fn require_generic(&mut self, lifetime: &Lifetime, referent: &Type) {
-            let mut mentions =
-                Mentions::new(self.scopes, self.self_bound, self.env, self.binders.clone());
-            mentions.visit_type(referent);
-            if self.self_req.is_some() && mentions.types.iter().any(|name| name == "Self") {
-                self.found.push((Bounded::SelfTy, lifetime.clone()));
-            }
-            self.found.extend(
-                mentions
-                    .projections
-                    .into_iter()
-                    .map(|projection| (Bounded::Projection(projection), lifetime.clone())),
-            );
-            for name in mentions.types {
-                let is_param = self.params.iter().any(|param| {
-                    matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == name)
-                });
-                if is_param {
-                    self.found.push((Bounded::Type(name), lifetime.clone()));
-                }
-            }
-            for other in mentions.lifetimes {
-                let is_param = self.params.iter().any(
-                    |param| matches!(param, GenericParam::Lifetime(param) if param.lifetime == other),
-                );
-                if is_param && &other != lifetime {
-                    self.found
-                        .push((Bounded::Lifetime(other), lifetime.clone()));
-                }
-            }
-        }
-    }
-    impl<'a, 'ast> Visit<'ast> for Finder<'a> {
-        fn visit_type_reference(&mut self, i: &'ast TypeReference) {
-            if let Some(lifetime) = &i.lifetime {
-                self.require(lifetime, &i.elem);
-            }
-            syn::visit::visit_type_reference(self, i)
-        }
-        fn visit_type_path(&mut self, i: &'ast TypePath) {
-            self.require_gat(i);
-            syn::visit::visit_type_path(self, i)
-        }
-        fn visit_type_bare_fn(&mut self, i: &'ast TypeBareFn) {
-            let outer = self.binders.len();
-            self.binders.extend(binder_lifetimes(i.lifetimes.as_ref()));
-            syn::visit::visit_type_bare_fn(self, i);
-            self.binders.truncate(outer);
-        }
-        fn visit_trait_bound(&mut self, i: &'ast TraitBound) {
-            let outer = self.binders.len();
-            self.binders.extend(binder_lifetimes(i.lifetimes.as_ref()));
-            syn::visit::visit_trait_bound(self, i);
-            self.binders.truncate(outer);
-        }
-        fn visit_expr(&mut self, _: &'ast Expr) {}
-        fn visit_macro(&mut self, _: &'ast Macro) {}
-    }
     let mut finder = Finder {
         scopes,
         self_bound: matches!(self_req, Some(SelfRequirement::Bound(_))),
@@ -2326,18 +2212,6 @@ fn implied_outlives(
     finder.found
 }
 
-pub(crate) fn binder_lifetimes(
-    lifetimes: Option<&BoundLifetimes>,
-) -> impl Iterator<Item = Lifetime> + '_ {
-    lifetimes
-        .into_iter()
-        .flat_map(|lifetimes| lifetimes.lifetimes.iter())
-        .filter_map(|param| match param {
-            GenericParam::Lifetime(param) => Some(param.lifetime.clone()),
-            _ => None,
-        })
-}
-
 /// Returns the canonical form of `generics`: predicates on one parameter move to it, everything is
 /// sorted, and defaults and attributes (which an impl cannot have) are removed.
 fn canonicalize(generics: Generics) -> Generics {
@@ -2348,23 +2222,11 @@ fn canonicalize(generics: Generics) -> Generics {
         .into_iter()
         .flat_map(|wc| wc.predicates)
     {
-        let target = match &predicate {
-            WherePredicate::Type(PredicateType {
-                lifetimes: None,
-                bounded_ty,
-                ..
-            }) => bounded_ident(bounded_ty).and_then(|name| {
-                params.iter().position(|param| {
-                    matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == name)
-                })
-            }),
-            WherePredicate::Lifetime(PredicateLifetime { lifetime, .. }) => {
-                params.iter().position(|param| {
-                    matches!(param, GenericParam::Lifetime(param) if &param.lifetime == lifetime)
-                })
-            }
-            _ => None,
-        };
+        let target = bounded_generic(&predicate).and_then(|name| {
+            params.iter().position(|param| {
+                !matches!(param, GenericParam::Const(_)) && generic_param_name(param) == name
+            })
+        });
         match (target, predicate) {
             (Some(pos), WherePredicate::Type(predicate)) => {
                 if let GenericParam::Type(param) = &mut params[pos] {
@@ -2424,9 +2286,6 @@ fn canonicalize(generics: Generics) -> Generics {
         lt_token: has_params.then(Default::default),
         params: params.into_iter().collect(),
         gt_token: has_params.then(Default::default),
-        where_clause: (!predicates.is_empty()).then(|| WhereClause {
-            where_token: Default::default(),
-            predicates: predicates.into_iter().collect(),
-        }),
+        where_clause: where_clause(predicates),
     }
 }

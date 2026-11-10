@@ -17422,9 +17422,14 @@ fn f91_a_qualified_path_at_the_start_of_a_where_predicate_is_parenthesized() {
             "where u8: Copy, T::Item: ::core::clone::Clone",
             "where u8 : Copy , < I > :: Item : :: core :: clone :: Clone",
         ),
+        // `where <T>::Item` does not parse (as rustc, syn reads `<T>` as generics of the `where`).
         (
-            "where <T>::Item: ::core::clone::Clone",
+            "where (<T>::Item): ::core::clone::Clone",
             "where (< I > :: Item) : :: core :: clone :: Clone",
+        ),
+        (
+            "where u8: Copy, <T>::Item: ::core::clone::Clone",
+            "where u8 : Copy , < I > :: Item : :: core :: clone :: Clone",
         ),
         (
             "where for<'a> T::Item: Tr2<'a>",

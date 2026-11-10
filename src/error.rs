@@ -5,11 +5,10 @@ use crate::analysis::{CheckResult, Part, SelfMention};
 use crate::context::Context;
 use crate::result::Place;
 use crate::util::{
-    has_lifetime_bound, is_std_crate_path, or_list, path_starts_with, path_type, tidy,
-    without_arguments, without_crate_prefix, KNOWN_NAMES,
+    has_lifetime_bound, is_std_crate_path, or_list, path_type, tidy, without_arguments,
+    without_crate_prefix, KNOWN_NAMES,
 };
 use proc_macro2::{Delimiter, Literal, Span, TokenStream, TokenTree};
-use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
@@ -82,7 +81,7 @@ impl Cause {
     }
 
     /// The cause that is the path expression `path`.
-    pub(crate) fn path_expr(path: &ExprPath) -> Self {
+    pub(crate) fn of_expr_path(path: &ExprPath) -> Self {
         Cause::Expr(Expr::Path(path.clone()))
     }
 
@@ -160,20 +159,17 @@ impl Cause {
                 Cause::Trait(path)
             }
             "expr" => {
-                // A path is an expression path, also one that is not that of an expression (`Rel<u8>`
-                // in a pattern), which is a path as a type has it. Else it is any expression.
+                // A path is an expression path, also one that is not that of an expression
+                // (`Rel<u8>` in a pattern), which is a path as a type has it. Else it is any
+                // expression.
                 let tokens: TokenStream = input.parse()?;
-                Cause::Expr(match syn::parse2::<ExprPath>(tokens.clone()) {
-                    Ok(path) => Expr::Path(path),
+                match syn::parse2::<ExprPath>(tokens.clone()) {
+                    Ok(path) => Cause::Expr(Expr::Path(path)),
                     Err(_) => match syn::parse2::<Path>(tokens.clone()) {
-                        Ok(path) => Expr::Path(ExprPath {
-                            attrs: Vec::new(),
-                            qself: None,
-                            path,
-                        }),
-                        Err(_) => syn::parse2(tokens)?,
+                        Ok(path) => Cause::expr_path(&path),
+                        Err(_) => Cause::Expr(syn::parse2(tokens)?),
                     },
-                })
+                }
             }
             "macro" => {
                 let path = input.parse()?;
@@ -198,12 +194,24 @@ impl Cause {
     }
 }
 
+/// Returns `true` if `path` starts with `prefix`, segment by segment by identifier. Both must have
+/// a leading `::` or neither; the generic arguments of the segments are ignored.
+fn path_starts_with(path: &Path, prefix: &Path) -> bool {
+    prefix.leading_colon.is_some() == path.leading_colon.is_some()
+        && prefix.segments.len() <= path.segments.len()
+        && prefix
+            .segments
+            .iter()
+            .zip(path.segments.iter())
+            .all(|(prefix_seg, seg)| prefix_seg.ident == seg.ident)
+}
+
 /// Writes the syntax as it was written, with its spans (a [`Cause::Macro`] with its `!`).
 impl ToTokens for Cause {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         match self {
             Cause::Type(ty) => ty.to_tokens(tokens),
-            Cause::Trait(path) => path.to_tokens(tokens),
+            Cause::Trait(path) | Cause::Unknown(path) => path.to_tokens(tokens),
             // A path that a type holds (`Rel<u8>` in a pattern) is written as it is, whereas an
             // expression path would write its arguments with a turbofish (`Rel::<u8>`).
             Cause::Expr(Expr::Path(path)) if path.qself.is_none() => {
@@ -222,7 +230,6 @@ impl ToTokens for Cause {
                 token::Not(span).to_tokens(tokens);
             }
             Cause::Lifetime(lifetime) => lifetime.to_tokens(tokens),
-            Cause::Unknown(path) => path.to_tokens(tokens),
             Cause::Unreadable(unreadable) => unreadable.to_tokens(tokens),
         }
     }
@@ -230,7 +237,7 @@ impl ToTokens for Cause {
 
 /// A token of a cause without its span and its spacing: what two causes are compared by.
 #[derive(PartialEq, Eq, Hash)]
-enum Token {
+enum TokenText {
     /// The start of a group, with its opening delimiter.
     Open(char),
     /// The end of the group.
@@ -240,10 +247,17 @@ enum Token {
     Literal(String),
 }
 
-impl Token {
+impl TokenText {
+    /// The tokens of `stream`.
+    fn of(stream: TokenStream) -> Vec<TokenText> {
+        let mut tokens = Vec::new();
+        TokenText::collect(stream, &mut tokens);
+        tokens
+    }
+
     /// Appends the tokens of `stream`. A group without delimiters (what a macro leaves around a
     /// fragment) is no token: its content is.
-    fn collect(stream: TokenStream, tokens: &mut Vec<Token>) {
+    fn collect(stream: TokenStream, tokens: &mut Vec<TokenText>) {
         for tree in stream {
             match tree {
                 TokenTree::Group(group) => {
@@ -252,17 +266,17 @@ impl Token {
                         Delimiter::Brace => '{',
                         Delimiter::Bracket => '[',
                         Delimiter::None => {
-                            Token::collect(group.stream(), tokens);
+                            TokenText::collect(group.stream(), tokens);
                             continue;
                         }
                     };
-                    tokens.push(Token::Open(open));
-                    Token::collect(group.stream(), tokens);
-                    tokens.push(Token::Close);
+                    tokens.push(TokenText::Open(open));
+                    TokenText::collect(group.stream(), tokens);
+                    tokens.push(TokenText::Close);
                 }
-                TokenTree::Ident(ident) => tokens.push(Token::Ident(ident.to_string())),
-                TokenTree::Punct(punct) => tokens.push(Token::Punct(punct.as_char())),
-                TokenTree::Literal(literal) => tokens.push(Token::Literal(literal.to_string())),
+                TokenTree::Ident(ident) => tokens.push(TokenText::Ident(ident.to_string())),
+                TokenTree::Punct(punct) => tokens.push(TokenText::Punct(punct.as_char())),
+                TokenTree::Literal(literal) => tokens.push(TokenText::Literal(literal.to_string())),
             }
         }
     }
@@ -270,10 +284,8 @@ impl Token {
 
 impl Cause {
     /// The tokens of the cause, apart from their spans and their spacing.
-    fn canonical(&self) -> Vec<Token> {
-        let mut tokens = Vec::new();
-        Token::collect(self.to_token_stream(), &mut tokens);
-        tokens
+    fn canonical(&self) -> Vec<TokenText> {
+        TokenText::of(self.to_token_stream())
     }
 }
 
@@ -478,10 +490,9 @@ pub struct ErrorItem {
     pub(crate) link: Link,
 }
 
-/// What an error is about, so that [`LeakerResult::ignore()`](crate::LeakerResult::ignore) can
-/// find it in the Referrer. The analysis gives the data it has (`raw`); the Leaker resolves it to
-/// indices when it makes the result. Serialized after the paths of the error, each word only if it
-/// is set: `id N`, `part N`, `entry N`, `inner [N, ..]`.
+/// What an error is about, for [`LeakerResult::ignore()`](crate::LeakerResult::ignore): the
+/// analysis gives `raw`, which the Leaker resolves to indices. Serialized after the paths, each
+/// word if it is set: `id N`, `part N`, `entry N`, `inner [N, ..]`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Link {
     /// The number that the errors held in `inner` are known by: set only for an error that some
@@ -515,15 +526,6 @@ impl Link {
         for id in &mut self.inner {
             *id += by;
         }
-    }
-}
-
-/// Makes each error hold only the errors inside its part that are in `errors`: after errors were
-/// dropped, the others do not hold them.
-pub(crate) fn forget_dropped(errors: &mut [ErrorItem]) {
-    let present: HashSet<usize> = errors.iter().filter_map(|error| error.link.id).collect();
-    for error in errors {
-        error.link.inner.retain(|id| present.contains(id));
     }
 }
 
@@ -634,10 +636,7 @@ impl Eq for ErrorItem {}
 
 /// Returns `true` if the streams have the same tokens, apart from spans and spacing.
 fn same_tokens(a: &TokenStream, b: &TokenStream) -> bool {
-    let (mut left, mut right) = (Vec::new(), Vec::new());
-    Token::collect(a.clone(), &mut left);
-    Token::collect(b.clone(), &mut right);
-    left == right
+    TokenText::of(a.clone()) == TokenText::of(b.clone())
 }
 
 /// The message of the error.
@@ -684,6 +683,21 @@ impl Parse for ErrorItem {
             let text: LitStr = input.parse()?;
             Ok((tokens, text.value()))
         }
+        /// `kind ( PATH )`: one of the paths, without arguments.
+        fn parse_path_entry(input: ParseStream) -> syn::Result<Cause> {
+            let kind = input.call(Ident::parse_any)?;
+            let cause;
+            parenthesized!(cause in input);
+            let span = cause.span();
+            let entry = Cause::parse(&kind, &cause)?;
+            let bare = entry.path().map_or(false, |path| {
+                path.segments.iter().all(|seg| seg.arguments.is_none())
+            });
+            if !bare {
+                return Err(syn::Error::new(span, "expected a path without arguments"));
+            }
+            Ok(entry)
+        }
         let item;
         braced!(item in input);
         let kind = item.call(Ident::parse_any)?;
@@ -694,13 +708,7 @@ impl Parse for ErrorItem {
         let message = item.parse::<LitStr>()?.value();
         let list;
         bracketed!(list in item);
-        let mut notes = Vec::new();
-        while !list.is_empty() {
-            notes.push(parse_at(&list)?);
-            if !list.is_empty() {
-                list.parse::<Token![,]>()?;
-            }
-        }
+        let notes = Punctuated::<_, Token![,]>::parse_terminated_with(&list, parse_at)?;
         let help = if item.peek(token::Paren) {
             Some(parse_at(&item)?)
         } else {
@@ -739,23 +747,9 @@ impl Parse for ErrorItem {
                 "paths" => {
                     let list;
                     bracketed!(list in item);
-                    while !list.is_empty() {
-                        let kind = list.call(Ident::parse_any)?;
-                        let cause;
-                        parenthesized!(cause in list);
-                        let span = cause.span();
-                        let entry = Cause::parse(&kind, &cause)?;
-                        let bare = entry.path().map_or(false, |path| {
-                            path.segments.iter().all(|seg| seg.arguments.is_none())
-                        });
-                        if !bare {
-                            return Err(syn::Error::new(span, "expected a path without arguments"));
-                        }
-                        paths.push(entry);
-                        if !list.is_empty() {
-                            list.parse::<Token![,]>()?;
-                        }
-                    }
+                    let entries =
+                        Punctuated::<_, Token![,]>::parse_terminated_with(&list, parse_path_entry)?;
+                    paths.extend(entries);
                 }
                 _ => {
                     return Err(syn::Error::new(
@@ -769,7 +763,7 @@ impl Parse for ErrorItem {
             cause,
             reason,
             message,
-            notes,
+            notes: notes.into_iter().collect(),
             help,
             place,
             paths,
@@ -813,18 +807,17 @@ impl ToTokens for ErrorItem {
         });
         let link = &self.link;
         let number = |n: usize| Literal::usize_unsuffixed(n);
-        let id = link.id.map(|id| {
-            let id = number(id);
-            quote!(id #id)
-        });
-        let part = link.part.map(|part| {
-            let part = number(part);
-            quote!(part #part)
-        });
-        let entry = link.entry.map(|entry| {
-            let entry = number(entry);
-            quote!(entry #entry)
-        });
+        // `name N`, if the number is set.
+        let word = |name: &str, n: Option<usize>| {
+            let name = Ident::new(name, Span::call_site());
+            n.map(|n| {
+                let n = number(n);
+                quote!(#name #n)
+            })
+        };
+        let id = word("id", link.id);
+        let part = word("part", link.part);
+        let entry = word("entry", link.entry);
         let inner = (!link.inner.is_empty()).then(|| {
             let ids: Vec<Literal> = link.inner.iter().map(|&id| number(id)).collect();
             quote!(inner [#(for id in &ids), { #id }])

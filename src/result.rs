@@ -4,7 +4,7 @@
 use crate::encode::EncodeError;
 #[cfg(doc)]
 use crate::error::Reason;
-use crate::error::{forget_dropped, Cause, ErrorItem};
+use crate::error::{Cause, ErrorItem};
 #[cfg(doc)]
 use crate::leaker::Leaker;
 #[cfg(doc)]
@@ -12,11 +12,10 @@ use crate::referrer::EntryId;
 use crate::referrer::Referrer;
 #[cfg(doc)]
 use crate::repeater::ImplSelf;
-use crate::repeater::{check_repeater_path, Projection, RepeaterImpl};
+use crate::repeater::{Projection, RepeaterImpl};
 use crate::util::{is_std_crate_path, self_head, starts_with_known, Known};
 use proc_macro2::{Span, TokenStream};
 use std::collections::HashSet;
-use std::result::Result;
 use syn::parse::{Parse, ParseStream};
 use syn::*;
 use template_quote::{quote, ToTokens};
@@ -52,7 +51,7 @@ pub struct Place {
 ///
 /// After the analysis, [`LeakerResult::allow()`](crate::LeakerResult::allow) accepts an error by
 /// its [`paths`](ErrorItem::paths) if it has any (the rule must allow each, at the error's
-/// [`place()`](ErrorItem::place); the error stays without those it allows), else by its cause,
+/// field [`place`](ErrorItem::place); the error stays without those it allows), else by its cause,
 /// asked as written, with its generic arguments. A rule on a whole cause (`Wrap<Rel>`) never
 /// accepts an error that has paths. That only drops errors: it changes no entry, and a type of
 /// another crate that the rule allows is still an entry. That is the approximation of the rule of
@@ -263,11 +262,11 @@ fn is_crate_path(path: &Path) -> bool {
             .map_or(false, |seg| seg.ident == "crate")
 }
 
-/// Returns `true` if `rule` allows the entry `entry` of [`ErrorItem::paths`] at `place`. A path
-/// that starts with `Self` is not allowed, and the rule is not asked about it. (The error of a
-/// `Self` without meaning has no paths: `accepts()` asks its cause.)
-fn allows_entry<A: Allow + ?Sized>(rule: &A, entry: &Cause, place: Place) -> bool {
-    entry.path().map_or(false, |path| self_head(path).is_none()) && rule.allow(entry, place)
+/// Returns `true` if `rule` allows `path`, one of [`ErrorItem::paths`], at `place`. A path that
+/// starts with `Self` is not allowed, and the rule is not asked about it. (The error of a `Self`
+/// without meaning has no paths: `accepts()` asks its cause.)
+fn allows_listed_path<A: Allow + ?Sized>(rule: &A, path: &Cause, place: Place) -> bool {
+    path.path().map_or(false, |p| self_head(p).is_none()) && rule.allow(path, place)
 }
 
 /// Returns `true` if `rule` accepts `error`: if it has relative paths ([`ErrorItem::paths`]), it
@@ -281,22 +280,31 @@ fn accepts<A: Allow + ?Sized>(rule: &A, error: &ErrorItem) -> bool {
         error
             .paths
             .iter()
-            .all(|entry| allows_entry(rule, entry, place))
+            .all(|path| allows_listed_path(rule, path, place))
     }
 }
 
 /// Drops the errors that `rule` accepts. An error that stays loses the paths that the rule allows,
-/// so that rules given one after the other add up as they do in one set (and in the serialization of
-/// the error, which carries its paths), and the errors inside its part that are dropped.
+/// so that rules given one after the other add up as they do in one set (also in the serialized
+/// error, which carries its paths), and the errors inside its part that are dropped.
 pub(crate) fn filter<A: Allow + ?Sized>(rule: &A, errors: &mut Vec<ErrorItem>) {
     errors.retain(|error| !accepts(rule, error));
     for error in errors.iter_mut() {
         let place = error.place;
         error
             .paths
-            .retain(|entry| !allows_entry(rule, entry, place));
+            .retain(|path| !allows_listed_path(rule, path, place));
     }
     forget_dropped(errors);
+}
+
+/// Makes each error hold only the errors inside its part that are in `errors`: after errors were
+/// dropped, the others do not hold them.
+fn forget_dropped(errors: &mut [ErrorItem]) {
+    let present: HashSet<usize> = errors.iter().filter_map(|error| error.link.id).collect();
+    for error in errors {
+        error.link.inner.retain(|id| present.contains(id));
+    }
 }
 
 /// What a [`Leaker`] found: the [`Referrer`] and the errors that remain.
@@ -447,8 +455,8 @@ impl LeakerResult {
         self
     }
 
-    /// Ignores `errors[at]` and what goes with it. Returns for each error, as it was before, whether
-    /// it was dropped.
+    /// Ignores `errors[at]` and what goes with it. Returns whether each error, as they were
+    /// before, was dropped.
     fn ignore_at(&mut self, at: usize) -> Vec<bool> {
         let (part, entry) = (self.errors[at].link.part, self.errors[at].link.entry);
         // The errors about the same part, or entry, go together.
@@ -479,11 +487,8 @@ impl LeakerResult {
                 ix == at || same(known) || revealed
             })
             .collect();
-        let mut ix = 0;
-        self.errors.retain(|_| {
-            ix += 1;
-            !gone[ix - 1]
-        });
+        let mut dropped = gone.iter();
+        self.errors.retain(|_| dropped.next() != Some(&true));
         forget_dropped(&mut self.errors);
         gone
     }
@@ -497,7 +502,7 @@ impl LeakerResult {
     ///
     /// It is the only way to the Referrer: drop each error with [`allow()`](LeakerResult::allow)
     /// or [`ignore()`](LeakerResult::ignore) first, and report the others.
-    pub fn finish(self) -> Result<Referrer, Vec<ErrorItem>> {
+    pub fn finish(self) -> std::result::Result<Referrer, Vec<ErrorItem>> {
         if self.errors.is_empty() {
             Ok(self.referrer)
         } else {
@@ -573,15 +578,7 @@ impl LeakerResult {
         &self,
         projection: &Projection,
     ) -> std::result::Result<Vec<RepeaterImpl>, EncodeError> {
-        check_repeater_path(&projection.path);
-        // Every entry first: `NeedsSelf` goes before an error of a const.
-        for ix in self.referrer.live() {
-            self.referrer.check_marker(ix, &projection.impl_self)?;
-        }
-        self.referrer
-            .live()
-            .map(|ix| self.referrer.repeater_impl(projection, ix))
-            .collect()
+        self.referrer.repeater_impls(projection)
     }
 }
 

@@ -8,17 +8,15 @@ use crate::context::{Context, ContextId, Contexts, Gat};
 use crate::error::ErrorItem;
 #[cfg(doc)]
 use crate::error::Reason;
-use crate::graph::{is_whole_reference, sorted_entries, NodeKey, TypeGraph, TypeKey};
+use crate::graph::{sorted_entries, NodeKey, TypeGraph, TypeKey};
 #[cfg(doc)]
 use crate::referrer::EntryId;
 use crate::referrer::Referrer;
 use crate::result::{filter, Allow, LeakerResult};
+use crate::util::push_once;
 use crate::view::View;
 use proc_macro2::{Span, TokenStream};
-use safegraph::algo::max_flow::edmonds_karp_with_flows;
-use safegraph::graph::Graph;
-use safegraph::BTreeGraph;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use syn::*;
 use template_quote::quote;
@@ -373,7 +371,7 @@ impl<A: Allow> Leaker<A> {
         let (required, optional) = if types.is_reduced() {
             types.into_kept_entries()
         } else {
-            let (required, optional) = reduce(&types);
+            let (required, optional) = types.reduce();
             (sorted_entries(required), sorted_entries(optional))
         };
         self.resolve_links(errors, required.iter().chain(&optional));
@@ -391,7 +389,7 @@ impl<A: Allow> Leaker<A> {
                 context_map.entry(id).or_insert_with(|| context_of(id));
             }
         }
-        // The required entries come first, then the optional ones: that is the order of the indices.
+        // The required entries come first, then the optional ones: the order of the indices.
         let mut entries = Vec::new();
         for key in required.into_iter().chain(optional) {
             context_map
@@ -452,9 +450,9 @@ impl<A: Allow> Leaker<A> {
         }
         // The graph is dropped before the new one is built.
         let types = std::mem::take(&mut self.types);
-        let (required, optional) = reduce(&types);
+        let (required, optional) = types.reduce();
         drop(types);
-        self.types = TypeGraph::kept(required, optional);
+        self.types = TypeGraph::of_kept(required, optional);
     }
 }
 
@@ -477,7 +475,7 @@ impl<A: Allow> Scopes for Leaker<A> {
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             visitor.start(&spec);
             let result = f(&mut View::new(&mut visitor));
-            let (finished, mut errors) = visitor.finish(&spec, &root);
+            let (finished, mut errors) = visitor.finish(&spec);
             let found = errors.len();
             // The errors that the rule accepts are dropped here, as `LeakerResult` drops
             // them later. It is user code too: if it panics, nothing is recorded.
@@ -516,17 +514,12 @@ impl<A: Allow> Leaker<A> {
         let mut analysis = Analysis::default();
         analysis.apply(&mut self.contexts, &effects, None);
         for ident in analysis.primitives {
-            if !self.assumed_primitives.contains(&ident) {
-                self.assumed_primitives.push(ident);
-            }
+            push_once(&mut self.assumed_primitives, ident);
         }
         for part in analysis.parts {
-            if !self.parts.contains(&part) {
-                self.parts.push(part);
-            }
+            push_once(&mut self.parts, part);
         }
         self.types.merge(analysis.types);
-        // Shares the context of an entry that uses exactly these generics.
         // `Self` is part of the top-level context only if an entry names it, or has a bound
         // rewritten for it (see `Context::of()`).
         let scope_self = spec
@@ -540,201 +533,4 @@ impl<A: Allow> Leaker<A> {
         self.top_levels.extend(top_levels);
         top_level
     }
-}
-
-/// Min vertex cut from the roots to the red types, by max flow (Edmonds-Karp, node-split). Ties go
-/// to the cut closest to the sink, so inner types win. Returns the required entries and the
-/// optional ones.
-///
-/// A type is red if it is in `required`, or in `optional` and may be an entry. The kind of an entry
-/// is what it covers: required if it is or holds a type of `required`, else optional. A type is cut
-/// only as the kind it is: a candidate of the kind, not in `no_entry` (an optional type is a
-/// candidate of both). An optional type that may not be an entry is not red, and its parts are.
-///
-/// An entry that an earlier reduction kept is red and cut whatever else the graph says of it, as
-/// the kind it was kept as (or required, if a type merged in later makes it hold a required type).
-fn reduce(types: &TypeGraph) -> (Vec<NodeKey>, Vec<NodeKey>) {
-    let mut keys: Vec<&NodeKey> = types.keys().collect();
-    keys.sort_by_cached_key(|key| (key.context, key.ty.tokens()));
-    let index: HashMap<&NodeKey, usize> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
-    let n = keys.len();
-    let children: Vec<Vec<usize>> = keys
-        .iter()
-        .map(|key| {
-            let children = types.children(key).into_iter();
-            children.filter_map(|c| index.get(&c).copied()).collect()
-        })
-        .collect();
-    let flags = |set: &HashSet<NodeKey>| -> Vec<bool> {
-        keys.iter().map(|key| set.contains(*key)).collect()
-    };
-    let (is_required, is_optional, root, is_kept) = (
-        flags(&types.required),
-        flags(&types.optional),
-        flags(&types.roots),
-        flags(&types.kept),
-    );
-    let mut parents: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (i, children) in children.iter().enumerate() {
-        for &child in children {
-            parents[child].push(i);
-        }
-    }
-    // An entry that covers a required type is a required entry.
-    let mut covers_required = is_required.clone();
-    spread(&mut covers_required, &parents);
-    // An optional type is an entry anyway, so it is a candidate of either kind.
-    let may_cut: Vec<bool> = (0..n)
-        .map(|i| {
-            let candidate = match covers_required[i] {
-                true => is_optional[i] || types.required_candidates.contains(keys[i]),
-                false => types.optional_candidates.contains(keys[i]),
-            };
-            candidate && !types.no_entry.contains(keys[i])
-        })
-        .collect();
-    // An optional type that cannot be an entry is no entry, and its parts are. A kept entry is one.
-    let red: Vec<bool> = (0..n)
-        .map(|i| is_required[i] || is_kept[i] || (is_optional[i] && may_cut[i]))
-        .collect();
-    // A type that must be an entry cannot be forbidden to be one.
-    let forbidden: Vec<bool> = (0..n)
-        .map(|i| !may_cut[i] && !red[i] && !needs_parent(keys[i]))
-        .collect();
-    let mut has_red = red.clone();
-    spread(&mut has_red, &parents);
-
-    // A red root is in every minimum cut, so it is cut without a flow. So is a
-    // kept entry, which is a root of the graph it was kept in.
-    let cut: Vec<bool> = (0..n).map(|i| (red[i] && root[i]) || is_kept[i]).collect();
-    let mut kept: Vec<usize> = (0..n).filter(|&i| cut[i]).collect();
-
-    // The edges of the network. A parent that its components cannot replace goes to the sink.
-    let mut next: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut to_sink = vec![false; n];
-    for i in (0..n).filter(|&i| has_red[i] && !cut[i]) {
-        to_sink[i] = red[i];
-        let whole = needs_parent(keys[i]);
-        for &child in children[i].iter().filter(|&&child| has_red[child]) {
-            if whole {
-                // The parent is interned as a whole, like a required type.
-                to_sink[i] = true;
-            } else if !cut[child] {
-                next[i].push(child);
-            }
-        }
-    }
-    let mut reached: Vec<bool> = (0..n).map(|i| root[i] && has_red[i] && !red[i]).collect();
-    spread(&mut reached, &next);
-
-    // Components are independent. Solving each alone keeps the quadratic max flow small.
-    let mut component: Vec<usize> = (0..n).collect();
-    for i in (0..n).filter(|&i| reached[i]) {
-        for &child in &next[i] {
-            let (a, b) = (find(&mut component, i), find(&mut component, child));
-            component[a.max(b)] = a.min(b);
-        }
-    }
-    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    let mut local = vec![0; n];
-    for i in (0..n).filter(|&i| reached[i]) {
-        let members = groups.entry(find(&mut component, i)).or_default();
-        local[i] = members.len();
-        members.push(i);
-    }
-    for members in groups.values() {
-        // The nodes: `v_in` is `2 * v`, `v_out` is `2 * v + 1`.
-        let m = members.len();
-        let (source, sink) = (2 * m, 2 * m + 1);
-        // Larger than all node capacities together, so never the bottleneck.
-        let infinite = m + 1;
-        let mut edges = Vec::new();
-        for &i in members {
-            let (v_in, v_out) = (2 * local[i], 2 * local[i] + 1);
-            // The capacity of a type is what cutting it costs: one entry, or none if it cannot be
-            // one.
-            edges.push((v_in, v_out, if forbidden[i] { infinite } else { 1 }));
-            for &child in &next[i] {
-                edges.push((v_out, 2 * local[child], infinite));
-            }
-            if root[i] {
-                edges.push((source, v_in, infinite));
-            }
-            if to_sink[i] {
-                edges.push((v_out, sink, infinite));
-            }
-        }
-        let reaches_sink = sink_side(2 * m + 2, &edges, source, sink);
-        // The cut closest to the sink: `v_in` cannot reach it, `v_out` can.
-        kept.extend(members.iter().copied().filter(|&i| {
-            let v_in = 2 * local[i];
-            reaches_sink[v_in + 1] && !reaches_sink[v_in]
-        }));
-    }
-
-    let entries = |kind: bool| {
-        let found = kept.iter().filter(|&&i| covers_required[i] == kind);
-        found.map(|&i| keys[i].clone()).collect()
-    };
-    (entries(true), entries(false))
-}
-
-/// Marks every node reachable from a marked one.
-fn spread(marked: &mut [bool], edges: &[Vec<usize>]) {
-    let mut stack: Vec<usize> = (0..marked.len()).filter(|&i| marked[i]).collect();
-    while let Some(i) = stack.pop() {
-        for &j in &edges[i] {
-            if !marked[j] {
-                marked[j] = true;
-                stack.push(j);
-            }
-        }
-    }
-}
-
-/// See [`is_whole_reference()`].
-fn needs_parent(parent: &NodeKey) -> bool {
-    is_whole_reference(&parent.ty.ty)
-}
-
-/// Runs max flow from `source` to `sink` and returns the nodes that can still reach the sink.
-fn sink_side(
-    nodes: usize,
-    edges: &[(usize, usize, usize)],
-    source: usize,
-    sink: usize,
-) -> Vec<bool> {
-    let mut network = BTreeGraph::<usize, usize>::default();
-    for node in 0..nodes {
-        network.insert_node(node).unwrap();
-    }
-    for (eix, &(from, to, _)) in edges.iter().enumerate() {
-        network.insert_edge(eix, [from, to]).unwrap();
-    }
-    let (_, flows) = edmonds_karp_with_flows(&network, source, sink, |eix| edges[*eix].2);
-
-    // Residual edges: forward with spare capacity, backward to cancel flow.
-    let mut into: Vec<Vec<usize>> = vec![Vec::new(); nodes];
-    for (eix, &(from, to, capacity)) in edges.iter().enumerate() {
-        let flow = flows.get(&eix).copied().unwrap_or(0);
-        if flow < capacity {
-            into[to].push(from);
-        }
-        if flow > 0 {
-            into[from].push(to);
-        }
-    }
-    let mut reaches_sink = vec![false; nodes];
-    reaches_sink[sink] = true;
-    spread(&mut reaches_sink, &into);
-    reaches_sink
-}
-
-/// Union-find: returns the representative of the set of `i`.
-fn find(component: &mut [usize], mut i: usize) -> usize {
-    while component[i] != i {
-        component[i] = component[component[i]];
-        i = component[i];
-    }
-    i
 }

@@ -1,20 +1,26 @@
 //! What the analysis of the [`Leaker`] found: the [`CheckResult`] of a type, and the effects of
 //! visiting it, which the [`Analysis`] turns into the graph of the entries.
 
-use crate::analyze::{
-    input_type, unconstrained_in_copy, unconstrained_in_output, Anchoring, Elision,
-};
 use crate::context::{Context, ContextId, Contexts, SelfRequirement};
+use crate::elided::{input_type, Elision};
 use crate::error::{report, self_without_meaning, Cause, ErrorItem, Reason};
-use crate::graph::{is_whole_reference, NodeKey, TypeGraph};
+use crate::graph::{NodeKey, TypeGraph};
 #[cfg(doc)]
 use crate::leaker::Leaker;
 use crate::result::Place;
+use crate::util::{
+    binder_declares, has_lifetime_bound, is_whole_reference, names_in, push_once, trait_object_of,
+};
 #[cfg(doc)]
 use crate::view::View;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use syn::{FnArg, Ident, Lifetime, Signature, Type};
+use syn::visit::Visit;
+use syn::{
+    FnArg, GenericArgument, Ident, Lifetime, Macro, Path, PathArguments, ReturnType, Signature,
+    Type, TypeArray, TypeGroup, TypeParamBound, TypeParen, TypePath, TypePtr, TypeSlice,
+    TypeTraitObject,
+};
 use template_quote::quote;
 
 /// What [`View::check()`] found in a type: the causes that force it to be leaked, and the causes
@@ -83,7 +89,7 @@ pub struct CheckResult {
     /// The part that the conflict leaves as written, if the Referrer has to know it.
     pub(crate) part: Option<Part>,
     /// The number of mentions of `Self` without meaning found when this conflict was recorded, to
-    /// report them among the conflicts in the order found ([`scope_error()`]).
+    /// report them among the conflicts in the order found ([`scope_errors()`]).
     pub(crate) seen: usize,
     /// Where the conflict was found ([`ErrorItem::place`]). Set where it is recorded as an error.
     pub(crate) place: Place,
@@ -157,6 +163,25 @@ pub(crate) struct Part {
 }
 
 impl Part {
+    /// A part with no anchor and no mark.
+    pub(crate) fn new(
+        cause: Cause,
+        whole: bool,
+        context: Option<Context>,
+        in_predicate: bool,
+        primitives: Vec<Ident>,
+    ) -> Self {
+        Self {
+            cause,
+            whole,
+            context,
+            in_predicate,
+            within: None,
+            mark: None,
+            primitives,
+        }
+    }
+
     /// The part as the Referrer carries it, with its contexts interned.
     pub(crate) fn item(&self, contexts: &mut Contexts) -> PartItem {
         PartItem {
@@ -175,24 +200,17 @@ impl Part {
         }
     }
 
-    /// Returns `true` if the Referrer needs to know the part. A part that is not whole, with no
-    /// anchor and no mark, has the same conflict wherever its tokens and context are found, so no
-    /// entry has them and the visitor finds nothing to replace at its head; the types in it are
-    /// entries as any are. A whole part (nothing in it may be replaced), or one that only a position
-    /// tells from an entry (an anchor, a signature), is needed.
-    pub(crate) fn recorded(&self) -> bool {
+    /// Returns `true` if the Referrer needs to know the part: it is whole, or only its anchor or
+    /// signature tells it from an entry. Any other part has no entry of the same tokens and
+    /// context, so the visitor finds nothing to replace at its head anyway.
+    fn recorded(&self) -> bool {
         self.whole || self.within.is_some() || self.mark.is_some()
     }
 }
 
-/// A part that the Referrer leaves as written, with its contexts interned (see
-/// [`Part::recorded()`]). Serialized as `KIND (
-/// CAUSE ) CONTEXT [whole] [sig ( MARK )] [predicate] [in ( TYPE ) CONTEXT]`, with `unwritable` for a
-/// `CONTEXT` of `None`.
-///
-/// A part that is not whole, has no anchor and no mark is there only because an error is about
-/// it ([`LeakerResult::ignore()`](crate::LeakerResult::ignore) makes it whole): the visitor does
-/// not look at it before.
+/// A part that the Referrer leaves as written, with its contexts interned ([`Part::recorded()`];
+/// the grammar is above `FORMAT_TAG_PREFIX` in referrer.rs). One that is not recorded is there for
+/// an error only, and the visitor skips it until `LeakerResult::ignore()` makes it whole.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PartItem {
     /// A [`Cause::Type`].
@@ -213,22 +231,20 @@ pub(crate) struct PartItem {
 }
 
 /// What a signature must have for a part to be copied as written in it: the fault that the
-/// signature gives the type (see [`SignatureFacts`]). Serialized as `sig ( 'x , .. )` and `sig (
-/// elided )`.
+/// signature gives the type ([`SignatureFacts`]; the grammar is above `FORMAT_TAG_PREFIX` in
+/// referrer.rs).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SignatureMark {
-    /// The method lifetimes of the type that the output names and no bound does (E0195): the copy
-    /// would leave one of them unconstrained, because only types leaked whole hold it in the inputs
-    /// ([`unconstrained_in_copy()`]).
+    /// The method lifetimes of the type that the output names and no bound does: the copy would
+    /// leave one unconstrained (E0195, [`unconstrained_in_copy()`]).
     Unconstrained(Vec<Lifetime>),
     /// The output relies on elision, and the type adds lifetimes to the inputs (E0106).
     Elided,
 }
 
-/// The facts about a signature that a [`SignatureMark`] is about. It is computed from the
-/// signature alone, by the Leaker where it makes a part and by the Referrer at each signature it
-/// visits; the Referrer also tells which of the lifetimes the copy leaves unconstrained
-/// ([`SignatureFacts::in_copy()`]).
+/// The facts about a signature that a [`SignatureMark`] is about, from the signature alone: the
+/// Leaker computes them where it makes a part, the Referrer at each signature it visits, adding
+/// [`SignatureFacts::in_copy()`].
 #[derive(Debug)]
 pub(crate) struct SignatureFacts {
     /// The method lifetimes that the output names and no bound does.
@@ -253,10 +269,9 @@ impl SignatureFacts {
         }
     }
 
-    /// The facts for the probe of the inputs of a signature, which replaces the leaked types to see
-    /// what is left of them ([`SignatureFacts::in_copy()`]): no part that a signature made is left as
-    /// written ([`SignatureFacts::covers()`] is `false`), and the visitor takes each for a leaked
-    /// type, which it is where the Leaker made it a part.
+    /// The facts for the probe of the inputs of a signature ([`SignatureFacts::in_copy()`]): it
+    /// covers no part ([`SignatureFacts::covers()`]), so the visitor takes a part that a signature
+    /// made for a leaked type.
     pub(crate) fn inputs_probe() -> Self {
         Self {
             unconstrained: Vec::new(),
@@ -286,8 +301,7 @@ impl SignatureFacts {
     }
 
     /// The facts with the lifetimes that the copy leaves unconstrained, from `copy`: the inputs of
-    /// the signature with the leaked types replaced ([`unconstrained_in_copy()`]). A lifetime that
-    /// an input keeps as written is not one, whatever other types hold it.
+    /// the signature with the leaked types replaced ([`unconstrained_in_copy()`]).
     pub(crate) fn in_copy(
         mut self,
         scope: &impl Anchoring,
@@ -315,11 +329,9 @@ impl SignatureFacts {
         )
     }
 
-    /// Returns `true` if the part with `mark` and `context` is copied as written in the arguments
-    /// of this signature: it has the same fault here. For the lifetimes of the mark (all that the
-    /// output names and no bound does here) the copy must leave one unconstrained where it is
-    /// known ([`SignatureFacts::in_copy()`]): where an input keeps the lifetime as written, the
-    /// type is an entry, not a part.
+    /// Returns `true` if the part with `mark` and `context` has the same fault in this signature,
+    /// so it is copied as written in its arguments. Where `in_copy` is known, the copy must leave
+    /// one of the mark's lifetimes unconstrained.
     pub(crate) fn covers(&self, mark: &SignatureMark, context: Option<&Context>) -> bool {
         match mark {
             SignatureMark::Unconstrained(lifetimes) => {
@@ -337,12 +349,279 @@ impl SignatureFacts {
     }
 }
 
+/// What a scan for the occurrences of a lifetime ([`scan_anchors()`]) found and keeps track of.
+pub(crate) struct OutputUse {
+    /// The lifetime that the scan looks for.
+    pub(crate) lifetime: Lifetime,
+    /// Each constraining occurrence in the inputs, as the types from the input down to it.
+    pub(crate) anchors: Vec<Vec<usize>>,
+    /// The addresses of the types from the input down to the one being scanned.
+    chain: Vec<usize>,
+    /// An external type that the Leaker does not allow, which the Referrer may replace, holds no
+    /// occurrence. Else the occurrences are those that rustc sees as constraining.
+    careful: bool,
+    /// With `careful`: the types that the scan did not enter, by address.
+    pub(crate) stopped: Vec<usize>,
+    /// With `careful`: the types that the scan enters although the Referrer may replace them,
+    /// because they are no optional entries, by address.
+    entered: Vec<usize>,
+}
+
+impl OutputUse {
+    pub(crate) fn new(lifetime: Lifetime, careful: bool, entered: Vec<usize>) -> Self {
+        Self {
+            lifetime,
+            anchors: Vec::new(),
+            chain: Vec::new(),
+            careful,
+            stopped: Vec::new(),
+            entered,
+        }
+    }
+}
+
+/// What a scan for the occurrences of a lifetime ([`scan_anchors()`]) asks about the place it is
+/// made in: the analysis of the Leaker, or the scopes of the signature that a Referrer writes.
+pub(crate) trait Anchoring {
+    /// Returns `true` if `path` is an associated item of a generic in scope or of `Self` (`T::A`).
+    fn is_projection(&self, path: &Path) -> bool;
+
+    /// Returns `true` if the Referrer may replace `ty` as an optional entry, so a careful scan
+    /// finds no anchor in it (a path of an external crate, an external trait object, an array
+    /// whose length names a crate, or a reference to such an object).
+    fn is_optional_type(&self, ty: &Type) -> bool;
+}
+
+/// Scans the inputs of a signature for the occurrences of `lifetime` (see [`scan_anchors()`]).
+pub(crate) fn scan_inputs<'a>(
+    scope: &impl Anchoring,
+    inputs: impl IntoIterator<Item = &'a FnArg>,
+    lifetime: &Lifetime,
+    careful: bool,
+    entered: &[usize],
+) -> OutputUse {
+    let mut used = OutputUse::new(lifetime.clone(), careful, entered.to_vec());
+    for input in inputs {
+        match input {
+            FnArg::Receiver(receiver) => {
+                if receiver.lifetime() == Some(lifetime) {
+                    used.anchors.push(Vec::new());
+                }
+                scan_anchors(scope, &receiver.ty, &mut used)
+            }
+            FnArg::Typed(arg) => scan_anchors(scope, &arg.ty, &mut used),
+        }
+    }
+    used
+}
+
+/// Finds the occurrences of `used.lifetime` in `ty` that constrain it (not in an associated type
+/// path, an array length, `impl Trait` or a type macro), each with its chain of types: it anchors
+/// only if no type on it is leaked whole. See [Binder lifetimes](crate::Leaker#binder-lifetimes).
+pub(crate) fn scan_anchors(scope: &impl Anchoring, ty: &Type, used: &mut OutputUse) {
+    let address = ty as *const Type as usize;
+    if used.careful && !used.entered.contains(&address) && scope.is_optional_type(ty) {
+        used.stopped.push(address);
+        return;
+    }
+    used.chain.push(address);
+    match ty {
+        Type::Reference(reference) => {
+            if reference.lifetime.as_ref() == Some(&used.lifetime) {
+                used.anchors.push(used.chain.clone());
+            }
+            scan_anchors(scope, &reference.elem, used);
+        }
+        Type::Ptr(TypePtr { elem, .. })
+        | Type::Slice(TypeSlice { elem, .. })
+        | Type::Paren(TypeParen { elem, .. })
+        | Type::Group(TypeGroup { elem, .. }) => scan_anchors(scope, elem, used),
+        Type::Array(array) => scan_anchors(scope, &array.elem, used),
+        Type::Tuple(tuple) => {
+            for elem in &tuple.elems {
+                scan_anchors(scope, elem, used);
+            }
+        }
+        Type::Path(TypePath { qself: None, path }) if !scope.is_projection(path) => {
+            if let Some(seg) = path.segments.last() {
+                scan_arguments(scope, &seg.arguments, used);
+            }
+        }
+        Type::BareFn(f) if !binder_declares(f.lifetimes.as_ref(), &used.lifetime) => {
+            for arg in &f.inputs {
+                scan_anchors(scope, &arg.ty, used);
+            }
+            scan_output(scope, &f.output, used);
+        }
+        Type::TraitObject(object) => {
+            for bound in &object.bounds {
+                match bound {
+                    TypeParamBound::Trait(bound)
+                        if !binder_declares(bound.lifetimes.as_ref(), &used.lifetime) =>
+                    {
+                        if let Some(seg) = bound.path.segments.last() {
+                            scan_arguments(scope, &seg.arguments, used);
+                        }
+                    }
+                    TypeParamBound::Lifetime(lifetime) if *lifetime == used.lifetime => {
+                        used.anchors.push(used.chain.clone())
+                    }
+                    _ => (),
+                }
+            }
+        }
+        _ => (),
+    }
+    used.chain.pop();
+}
+
+fn scan_arguments(scope: &impl Anchoring, arguments: &PathArguments, used: &mut OutputUse) {
+    match arguments {
+        PathArguments::AngleBracketed(args) => {
+            for arg in &args.args {
+                match arg {
+                    GenericArgument::Lifetime(lifetime) if *lifetime == used.lifetime => {
+                        used.anchors.push(used.chain.clone())
+                    }
+                    GenericArgument::Type(ty) => scan_anchors(scope, ty, used),
+                    GenericArgument::AssocType(binding) => scan_anchors(scope, &binding.ty, used),
+                    _ => (),
+                }
+            }
+        }
+        PathArguments::Parenthesized(args) => {
+            for ty in &args.inputs {
+                scan_anchors(scope, ty, used);
+            }
+            scan_output(scope, &args.output, used);
+        }
+        PathArguments::None => (),
+    }
+}
+
+fn scan_output(scope: &impl Anchoring, output: &ReturnType, used: &mut OutputUse) {
+    if let ReturnType::Type(_, ty) = output {
+        scan_anchors(scope, ty, used);
+    }
+}
+
+/// Pushes the lifetimes that `ty` (an input) keeps constrained as written in the copy. A
+/// reference to a trait object without a lifetime bound counts only if `not_a_cause` says so.
+pub(crate) fn kept_lifetimes(
+    ty: &Type,
+    kept: &mut Vec<Lifetime>,
+    not_a_cause: &mut impl FnMut(&TypeTraitObject) -> bool,
+) {
+    match ty {
+        Type::Reference(reference) => {
+            let unbounded = trait_object_of(&reference.elem).map_or(false, |object| {
+                !has_lifetime_bound(object) && !not_a_cause(object)
+            });
+            if !unbounded {
+                kept.extend(reference.lifetime.clone());
+            }
+            kept_lifetimes(&reference.elem, kept, not_a_cause);
+        }
+        Type::Ptr(TypePtr { elem, .. })
+        | Type::Slice(TypeSlice { elem, .. })
+        | Type::Array(TypeArray { elem, .. })
+        | Type::Paren(TypeParen { elem, .. })
+        | Type::Group(TypeGroup { elem, .. }) => kept_lifetimes(elem, kept, not_a_cause),
+        Type::Tuple(tuple) => {
+            for elem in &tuple.elems {
+                kept_lifetimes(elem, kept, not_a_cause);
+            }
+        }
+        _ => (),
+    }
+}
+
+/// The lifetimes that a visit finds, in order, also those in the tokens of a macro.
+#[derive(Default)]
+pub(crate) struct Lifetimes(pub(crate) Vec<Lifetime>);
+
+impl<'ast> Visit<'ast> for Lifetimes {
+    fn visit_lifetime(&mut self, i: &'ast Lifetime) {
+        self.0.push(i.clone());
+    }
+    fn visit_macro(&mut self, i: &'ast Macro) {
+        let names = names_in(&i.tokens);
+        self.0.extend(
+            names
+                .iter()
+                .filter(|name| name.starts_with('\''))
+                .map(|name| Lifetime::new(name, proc_macro2::Span::call_site())),
+        );
+    }
+}
+
+/// Returns the lifetimes that the return type of `sig` mentions, and those that a bound names:
+/// `'b: 'c` (both), `T: 'b` and `T: Tr<'b>`. A lifetime in a bound is early-bound.
+fn output_and_bounded(sig: &Signature) -> (Lifetimes, Lifetimes) {
+    let mut output = Lifetimes::default();
+    output.visit_return_type(&sig.output);
+    let mut bounded = Lifetimes::default();
+    for param in sig.generics.lifetimes() {
+        if !param.bounds.is_empty() {
+            bounded.0.push(param.lifetime.clone());
+        }
+        for bound in &param.bounds {
+            bounded.visit_lifetime(bound);
+        }
+    }
+    for param in sig.generics.type_params() {
+        for bound in &param.bounds {
+            bounded.visit_type_param_bound(bound);
+        }
+    }
+    if let Some(where_clause) = &sig.generics.where_clause {
+        bounded.visit_where_clause(where_clause);
+    }
+    (output, bounded)
+}
+
+/// The lifetimes of the method `sig` that its output names and no bound does: where only types
+/// leaked whole hold them in the inputs, the copy leaves them unconstrained (E0195).
+pub(crate) fn unconstrained_in_output(sig: &Signature) -> Vec<Lifetime> {
+    let (output, bounded) = output_and_bounded(sig);
+    sig.generics
+        .lifetimes()
+        .map(|param| param.lifetime.clone())
+        .filter(|lifetime| output.0.contains(lifetime) && !bounded.0.contains(lifetime))
+        .collect()
+}
+
+/// The lifetimes of `unconstrained_in_output()` that some input of the method `sig` anchors
+/// ([`scan_anchors()`]) and no input of `copy` does: `copy` is the inputs with the leaked types
+/// replaced by types that hold no lifetime.
+pub(crate) fn unconstrained_in_copy(
+    scope: &impl Anchoring,
+    sig: &Signature,
+    copy: &[FnArg],
+) -> Vec<Lifetime> {
+    fn anchored<'a>(
+        scope: &impl Anchoring,
+        inputs: impl IntoIterator<Item = &'a FnArg>,
+        lifetime: &Lifetime,
+    ) -> bool {
+        !scan_inputs(scope, inputs, lifetime, false, &[])
+            .anchors
+            .is_empty()
+    }
+    unconstrained_in_output(sig)
+        .into_iter()
+        .filter(|lifetime| {
+            anchored(scope, &sig.inputs, lifetime) && !anchored(scope, copy, lifetime)
+        })
+        .collect()
+}
+
 /// A type that may be an entry, which [`Analysis::apply()`] adds to the graph.
 pub(crate) struct PendingType {
     /// The type.
     pub(crate) ty: Type,
     /// The address of the type in the visited syntax, which `ty` is a copy of.
-    pub(crate) origin: usize,
+    pub(crate) address: usize,
     /// A required entry: its own path is a cause, so it is leaked whole.
     pub(crate) required: bool,
     /// It may be a required entry: it or a part is a cause.
@@ -356,7 +635,8 @@ pub(crate) struct PendingType {
     /// A bare identifier argument that may be a const. Its parent is leaked whole if possible; if
     /// it cannot be because of a hard cause (see `Impossibles`), it is a conflict.
     pub(crate) ambiguous: bool,
-    /// It cannot be a required entry, but its components can: the copy would be cyclic.
+    /// It cannot be a required entry, but its components can: the copy would be cyclic, or the
+    /// type names the `Self` of a nested item.
     pub(crate) no_required_entry: bool,
     /// Like `no_required_entry` for an optional entry.
     pub(crate) no_optional_entry: bool,
@@ -384,7 +664,7 @@ impl PendingType {
     pub(crate) fn new(ty: &Type, context: Context, components: Vec<Effect>) -> Self {
         Self {
             ty: ty.clone(),
-            origin: ty as *const Type as usize,
+            address: ty as *const Type as usize,
             required: false,
             required_candidate: false,
             optional: false,
@@ -403,6 +683,13 @@ impl PendingType {
         }
     }
 
+    /// The effects of the types in it: `inside`, then `components`.
+    pub(crate) fn into_inner(self) -> Vec<Effect> {
+        let mut inner = self.inside;
+        inner.extend(self.components);
+        inner
+    }
+
     /// The type with its context, as the analysis names an optional entry.
     pub(crate) fn optional_key(&self) -> (Context, String) {
         let ty = &self.ty;
@@ -419,15 +706,13 @@ impl PendingType {
             primitives = self.primitives.clone();
             primitives.extend(primitive_names(&self.components));
         }
-        Part {
-            cause: Cause::Type(self.ty.clone()),
+        Part::new(
+            Cause::Type(self.ty.clone()),
             whole,
-            context: Some(self.context.clone()),
-            in_predicate: self.in_predicate,
-            within: None,
-            mark: None,
+            Some(self.context.clone()),
+            self.in_predicate,
             primitives,
-        }
+        )
     }
 }
 
@@ -455,7 +740,7 @@ impl CheckResult {
 
     /// The correction of a part copied as written for a fault that another error tells. It has no
     /// cause that depends on the context, so `report()` gives no error for it.
-    pub(crate) fn corrected() -> Self {
+    fn corrected() -> Self {
         Self::conflict(Vec::new(), Vec::new(), Reason::RelativePath)
     }
 }
@@ -531,10 +816,7 @@ impl Analysis {
                         if !part.recorded() {
                             continue;
                         }
-                        let item = part.item(contexts);
-                        if !self.parts.contains(&item) {
-                            self.parts.push(item);
-                        }
+                        push_once(&mut self.parts, part.item(contexts));
                     }
                 }
                 Effect::Primitive(ident) => self.primitives.push(ident.clone()),
@@ -546,8 +828,8 @@ impl Analysis {
 
 /// Returns the errors of an analysis in the order found: the conflicts among `effects`, then the
 /// cycles in `conflicts`, with the mentions of `Self` without meaning placed by
-/// [`CheckResult::seen`]. Each is linked to the errors revealed inside its part ([`link_errors()`]).
-pub(crate) fn scope_error(
+/// [`CheckResult::seen`]. Each is linked to the errors inside its part ([`link_errors()`]).
+pub(crate) fn scope_errors(
     effects: &[Effect],
     self_errors: &[SelfMention],
     conflicts: &[CheckResult],
@@ -653,12 +935,11 @@ pub(crate) fn shift_seen(effects: &mut [Effect], by: usize) {
 }
 
 /// Copies as written the types among `effects` (outermost first) that `corrected` gives a part:
-/// each becomes an `Effect::Error` that reports nothing and holds the type as its part. Only a
-/// whole part loses what is in it but the conflicts and the primitive names; else the types in the
-/// type stay, corrected in turn.
+/// each becomes an error that reports nothing and holds the part. A whole part keeps only the
+/// conflicts and primitive names inside it; else the types inside are corrected in turn.
 pub(crate) fn correct_effects(
     effects: Vec<Effect>,
-    corrected: &dyn Fn(&PendingType) -> Option<Part>,
+    corrected: &mut impl FnMut(&PendingType) -> Option<Part>,
 ) -> Vec<Effect> {
     let mut found = Vec::new();
     for effect in effects {
@@ -669,11 +950,7 @@ pub(crate) fn correct_effects(
                     let mut error = CheckResult::corrected();
                     error.part = Some(part);
                     found.push(Effect::Error(Box::new(error)));
-                    let PendingType {
-                        components, inside, ..
-                    } = *pending;
-                    let mut inner = inside;
-                    inner.extend(components);
+                    let inner = pending.into_inner();
                     if whole {
                         keep_conflicts(inner, &mut found);
                     } else {
@@ -722,12 +999,11 @@ fn keep_conflicts(effects: Vec<Effect>, found: &mut Vec<Effect>) {
     written(effects, true, &mut |pending| pending.components, found)
 }
 
-/// Copies as written the outermost type that would be an entry and names a `Self` without
-/// meaning, or has a bound in its context that does: the impl of the Repeater would read that
-/// `Self` as its implementor ([`Reason::SelfWithoutMeaning`]). The types in it that do not are
-/// leaked.
+/// Copies as written the outermost entries that name a `Self` without meaning, or whose context
+/// has a bound that does: the Repeater's impl would read it as its implementor
+/// ([`Reason::SelfWithoutMeaning`]). The types in them that do not are leaked.
 pub(crate) fn correct_unmeant_self(effects: Vec<Effect>) -> Vec<Effect> {
-    correct_effects(effects, &|pending| {
+    correct_effects(effects, &mut |pending| {
         (pending.unmeant_self && (pending.required_candidate || pending.optional_candidate))
             .then(|| pending.part())
     })
@@ -758,10 +1034,9 @@ pub(crate) fn names_self(effects: &[Effect], declared: &SelfRequirement) -> bool
     })
 }
 
-/// Returns `true` if the part of `error`, if any, has a context that depends on `Self`, or none
-/// because a bound names a `Self` that has no name: the Referrer finds it by that, so it needs to
-/// know what `Self` is. That holds for a part that is not recorded too (see
-/// [`Part::recorded()`]): it is, if its error is not dropped, and `ignore()` makes it whole.
+/// Returns `true` if the part of `error`, if any, has a context that depends on `Self`, or none (a
+/// bound names a `Self` without a name): the Referrer then needs `Self` to find it. That holds for
+/// a part that is not recorded too, as `ignore()` may make it whole.
 pub(crate) fn part_names_self(error: &CheckResult, declared: &SelfRequirement) -> bool {
     error.part.as_ref().map_or(false, |part| {
         part.context
@@ -778,6 +1053,32 @@ fn depends_on_self(context: &Context, declared: &SelfRequirement) -> bool {
 pub(crate) fn drop_optional(effects: &mut [Effect], keys: &HashSet<(Context, String)>) {
     each_pending_mut(effects, &mut |pending| {
         if pending.optional && keys.contains(&pending.optional_key()) {
+            pending.optional = false;
+        }
+    });
+}
+
+/// Returns the types, with their contexts, that are optional entries in `effects`.
+pub(crate) fn optional_keys(effects: &[Effect]) -> Vec<(Context, String)> {
+    let mut keys = Vec::new();
+    each_pending(effects, &mut |pending| {
+        if pending.optional {
+            keys.push(pending.optional_key());
+        }
+    });
+    keys
+}
+
+/// Makes the optional entries among `effects` whose type is at one of `addresses` no optional
+/// entries, and adds their keys to `found` ([`drop_optional()`]).
+pub(crate) fn block_optional(
+    effects: &mut [Effect],
+    addresses: &HashSet<usize>,
+    found: &mut Vec<(Context, String)>,
+) {
+    each_pending_mut(effects, &mut |pending| {
+        if pending.optional && addresses.contains(&pending.address) {
+            found.push(pending.optional_key());
             pending.optional = false;
         }
     });
@@ -809,17 +1110,7 @@ pub(crate) fn has_optional_candidate(effects: &[Effect]) -> bool {
         .any(|effect| matches!(effect, Effect::Type(pending) if pending.optional_candidate))
 }
 
-pub(crate) fn has_ambiguous(effects: &[Effect]) -> bool {
-    effects.iter().any(|effect| match effect {
-        Effect::Type(pending) => {
-            pending.ambiguous
-                || (matches!(pending.ty, Type::Group(_)) && has_ambiguous(&pending.components))
-        }
-        _ => false,
-    })
-}
-
-/// Returns the bare identifiers among `effects` that may be consts: those of `has_ambiguous()`.
+/// Returns the bare identifiers among `effects` that may be consts, also those in a group.
 pub(crate) fn ambiguous_types(effects: &[Effect]) -> Vec<Type> {
     let mut found = Vec::new();
     for effect in effects {
@@ -834,10 +1125,9 @@ pub(crate) fn ambiguous_types(effects: &[Effect]) -> Vec<Type> {
     found
 }
 
-/// What `effects` become if the copy writes the syntax they are about as it is, whole: no type
-/// among them is leaked, so only the errors stay, without their parts (the syntax is the part). The
-/// relative paths of the types that would be entries are written as they are, so they are pushed to
-/// `paths`, the paths of the error of the syntax ([`CheckResult::paths`]).
+/// What `effects` become if the copy writes their syntax whole, as it is: only the errors stay,
+/// without their parts. The relative paths of the required entries are pushed to `paths`, the
+/// paths of the error of the syntax ([`CheckResult::paths`]).
 pub(crate) fn as_written(effects: Vec<Effect>, paths: &mut Vec<Cause>) -> Vec<Effect> {
     let mut found = Vec::new();
     let mut enter = |pending: PendingType| {
@@ -848,9 +1138,7 @@ pub(crate) fn as_written(effects: Vec<Effect>, paths: &mut Vec<Cause>) -> Vec<Ef
                 }
             }
         }
-        let mut inner = pending.inside;
-        inner.extend(pending.components);
-        inner
+        pending.into_inner()
     };
     written(effects, false, &mut enter, &mut found);
     found
@@ -900,7 +1188,7 @@ pub(crate) fn primitive_names(effects: &[Effect]) -> Vec<Ident> {
 }
 
 fn collect_primitive_names(effects: &[Effect], found: &mut Vec<Ident>) {
-    let mut add = |names: &[Ident]| {
+    let add = |found: &mut Vec<Ident>, names: &[Ident]| {
         for ident in names {
             if !found.contains(ident) {
                 found.push(ident.clone());
@@ -909,14 +1197,14 @@ fn collect_primitive_names(effects: &[Effect], found: &mut Vec<Ident>) {
     };
     for effect in effects {
         match effect {
-            Effect::Primitive(ident) => add(std::slice::from_ref(ident)),
+            Effect::Primitive(ident) => add(found, std::slice::from_ref(ident)),
             Effect::Type(pending) => {
-                add(&pending.primitives);
-                add(&primitive_names(&pending.components));
+                add(found, &pending.primitives);
+                collect_primitive_names(&pending.components, found);
             }
             Effect::Error(error) => {
                 if let Some(part) = &error.part {
-                    add(&part.primitives);
+                    add(found, &part.primitives);
                 }
             }
         }

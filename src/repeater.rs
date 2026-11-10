@@ -1,15 +1,18 @@
-//! The definition of the Repeater trait, encoding generics into its const slots, and the pieces of
-//! its impls ([`RepeaterImpl`], [`ImplSelf`]).
+//! The Repeater trait ([`repeater_definition()`], its const slots) and both ends of a path through
+//! it: the [`Projection`] that a copy writes for an entry, and the entry's impl ([`RepeaterImpl`],
+//! [`ImplSelf`]).
 
-use crate::context::Context;
-#[cfg(doc)]
-use crate::context::SelfRequirement;
-use crate::encode::{const_param_primitive, encode_entry_args, EncodeError};
+use crate::context::{Context, SelfRequirement};
+use crate::encode::{encode_entry_args, without_encoded_bounds, EncodeError};
+use crate::referrer::EntryId;
 #[cfg(doc)]
 use crate::referrer::Referrer;
-use crate::referrer::{bucket_type, EntryId};
-use crate::util::tidy;
+use crate::util::{
+    ident_name, names_in, parenthesize_leading_qualified_path, tidy, unwrap_type_group, ReplaceSelf,
+};
 use proc_macro2::{Span, TokenStream};
+use std::borrow::Cow;
+use syn::fold::Fold;
 use syn::*;
 use template_quote::{quote, ToTokens};
 
@@ -28,6 +31,40 @@ const REPEATER_SLOTS: &[(&str, &str, &str)] = &[
     ("i128", "I128", "0"),
     ("isize", "ISIZE", "0"),
 ];
+
+/// A primitive that can type a const parameter, so it is context-free.
+pub(crate) fn is_const_param_ty(ty: &Type) -> bool {
+    const_param_primitive(ty).is_some()
+}
+
+/// The primitive type that `ty` names if a const parameter can have it on stable Rust: one with a
+/// slot, `usize` or `u128`.
+fn const_param_primitive(ty: &Type) -> Option<&'static str> {
+    match unwrap_type_group(ty) {
+        Type::Path(TypePath { qself: None, path }) => {
+            if path.segments.iter().any(|seg| !seg.arguments.is_none()) {
+                return None;
+            }
+            let segs: Vec<_> = path
+                .segments
+                .iter()
+                .map(|seg| seg.ident.to_string())
+                .collect();
+            let name = match (path.leading_colon.is_some(), segs.as_slice()) {
+                (false, [s]) => s,
+                (_, [c, p, s]) if (c == "core" || c == "std") && p == "primitive" => s,
+                _ => return None,
+            };
+            let slots = REPEATER_SLOTS.iter().map(|(prim, _, _)| *prim);
+            ["usize", "u128"]
+                .iter()
+                .copied()
+                .chain(slots)
+                .find(|prim| *prim == name.as_str())
+        }
+        _ => None,
+    }
+}
 
 /// How the macros of both crates write the Repeater of one Leaker: its path, the Leaker's id and
 /// what the impls are for.
@@ -199,21 +236,19 @@ impl Projection {
         // The impl of an entry that needs `Self` is for what `Self` is in the copy, whatever the
         // Leaker chose; the others for a bucket or the marker.
         let needs_self = context.needs_self();
-        let bucket;
-        let impl_for = match &self.impl_self {
-            ImplSelf::Bucket { .. } if !needs_self => {
-                bucket = bucket_type(self.id, entry.index());
-                &bucket
-            }
+        let target = self.impl_self.for_entry(self.id, entry, needs_self);
+        let impl_for = match &*target {
             ImplSelf::Marker(marker) if !needs_self => marker,
             _ => self_ty,
         };
         let args = encode_entry_args(
             &context.generics.params,
-            (impl_for, &context.self_outlives),
+            impl_for,
+            &context.self_outlives,
             &self.path,
         )?;
-        let path = repeater_trait_path(&self.path, &args, self.id, entry);
+        let key = key_of(self.id, entry);
+        let path = repeater_path(&self.path, quote!(#args, #key));
         let written: Type = parse_quote!(<#impl_for as #path>::Type);
         match &self.impl_self {
             ImplSelf::Marker(_) if needs_self => Err(EncodeError::NeedsSelf(Box::new(written))),
@@ -222,9 +257,31 @@ impl Projection {
     }
 }
 
-// The `KEY` argument of the Repeater for the entry `entry` of the Leaker `id` (`Projection::key()`).
-pub(crate) fn key_of(id: u64, entry: EntryId) -> u128 {
+// The `KEY` of the Repeater for the entry `entry` of the Leaker `id` (`Projection::key()`).
+fn key_of(id: u64, entry: EntryId) -> u128 {
     (u128::from(id) << 64) | entry.index() as u128
+}
+
+/// The primitive type of the entry `entry` for `id`: 17 of them, chosen by a hash so that ids and
+/// indices that are close spread. `ImplSelf::Bucket` of the Leaker's macro and the paths of the
+/// Referrer's must agree on it, so it is part of [`Referrer::FORMAT_VERSION`].
+fn bucket_type(id: u64, entry: usize) -> Type {
+    const BUCKETS: [&str; 17] = [
+        "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
+        "i128", "isize", "f32", "f64", "str",
+    ];
+    // The finalizer of splitmix64.
+    let mut z = id
+        .wrapping_add((entry as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    let name = Ident::new(
+        BUCKETS[(z % BUCKETS.len() as u64) as usize],
+        Span::call_site(),
+    );
+    parse_quote!(::core::primitive::#name)
 }
 
 /// Returns the definition of the Repeater trait, the one trait that both crates see.
@@ -299,17 +356,9 @@ pub(crate) fn repeater_path(repeater: &Path, args: impl ToTokens) -> Path {
     parse_quote!(#path<#args>)
 }
 
-// The path of the Repeater with the arguments of the entry `entry` of the Leaker `id`:
-// `Repeater<args, KEY>` with `KEY` from `key_of(id, entry)`. `args` is the first argument, as
-// `encode_entry_args()` writes it.
-pub(crate) fn repeater_trait_path(repeater: &Path, args: &Type, id: u64, entry: EntryId) -> Path {
-    let key = key_of(id, entry);
-    repeater_path(repeater, quote!(#args, #key))
-}
-
 /// Encodes the const parameter `value` of type `ty` into the const slots of the Repeater at the
-/// path `repeater`: `const N: usize` is `[(); N]`, a `u128` uses `KEY`, and any other primitive type
-/// is a trait object of the Repeater with its slot filled. Fails with
+/// path `repeater`: `const N: usize` is `[(); N]`, a `u128` uses `KEY`, and any other primitive
+/// type is a trait object of the Repeater with its slot filled. Fails with
 /// [`EncodeError::UnsupportedConstType`] if `ty` is not a primitive type (an alias of one is not:
 /// the slot cannot be told).
 pub(crate) fn encode_slot_const(
@@ -326,6 +375,7 @@ pub(crate) fn encode_slot_const(
         let path = repeater_path(repeater, quote!((), #value, Type = ()));
         return Ok(parse_quote!(*const dyn #path));
     }
+    // `const_param_primitive()` takes the other names from `REPEATER_SLOTS`.
     let position = REPEATER_SLOTS
         .iter()
         .position(|(ty, _, _)| *ty == prim)
@@ -369,6 +419,18 @@ pub enum ImplSelf {
         /// The parameter for the entries that need `Self`, named as for [`ImplSelf::Param`].
         param: Ident,
     },
+}
+
+impl ImplSelf {
+    /// What the impl of the entry `entry` of the Leaker `id` is for: [`ImplSelf::Bucket`] is the
+    /// bucket type as a marker, or [`ImplSelf::Param`] with `param` for an entry that `needs_self`.
+    pub(crate) fn for_entry(&self, id: u64, entry: EntryId, needs_self: bool) -> Cow<'_, Self> {
+        match self {
+            ImplSelf::Bucket { param } if needs_self => Cow::Owned(ImplSelf::Param(param.clone())),
+            ImplSelf::Bucket { .. } => Cow::Owned(ImplSelf::Marker(bucket_type(id, entry.index()))),
+            target => Cow::Borrowed(target),
+        }
+    }
 }
 
 /// The pieces of the Repeater impl of an entry, which
@@ -513,5 +575,250 @@ impl From<RepeaterImpl> for ItemImpl {
             brace_token: Default::default(),
             items: vec![parse_quote!(type Type = #ty;)],
         }
+    }
+}
+
+impl Projection {
+    // The Repeater impl of `entry`, whose type is `entry_ty` and whose context is `context`:
+    // `Referrer::repeater_impls()` makes one for each entry, after `check_marker()`, so it fails
+    // only for a const of a type that has no slot.
+    pub(crate) fn impl_of(
+        &self,
+        entry: EntryId,
+        entry_ty: &Type,
+        context: &Context,
+    ) -> std::result::Result<RepeaterImpl, EncodeError> {
+        // A bucket is the type that `Projection::of()` writes for an entry that does not need
+        // `Self`.
+        let target = self
+            .impl_self
+            .for_entry(self.id, entry, context.needs_self());
+        // The type the impl is for, `Self` as the impl writes it, and the parameter to declare with
+        // its bound.
+        let (self_ty, self_in_impl, param): (Type, Type, Option<(Ident, Option<&Path>)>) =
+            match (context.self_ty.as_ref(), &*target) {
+                // The impl of a struct, an enum or a union declares no parameter.
+                (Some(SelfRequirement::Type(ty)), ImplSelf::Param(_)) => {
+                    (ty.clone(), parse_quote!(Self), None)
+                }
+                // `check_marker()` refused it in `repeater_impls()`.
+                (Some(_), ImplSelf::Marker(_)) => unreachable!("rejected by check_marker()"),
+                (None, ImplSelf::Marker(marker)) => (marker.clone(), marker.clone(), None),
+                (requirement, ImplSelf::Param(ident)) => {
+                    let ident = self_param(entry_ty, context, ident);
+                    // Any type that the bounds hold for (`SelfRequirement::Any`), or any type at
+                    // all: the parameter has no bound of its own.
+                    let bound = match requirement {
+                        Some(SelfRequirement::Bound(path)) => Some(path),
+                        _ => None,
+                    };
+                    (
+                        parse_quote!(#ident),
+                        parse_quote!(#ident),
+                        Some((ident, bound)),
+                    )
+                }
+                (_, ImplSelf::Bucket { .. }) => unreachable!("resolved above"),
+            };
+        // The implementor is a parameter, where `Self` of the trait is not available: the type and
+        // the generics of the context have `self_in_impl` for it before the bounds are encoded.
+        let (ty, generics) = match context.self_ty.as_ref() {
+            Some(SelfRequirement::Bound(_) | SelfRequirement::Any) => {
+                let mut replace = ReplaceSelf {
+                    self_ty: &self_in_impl,
+                };
+                let ty = replace.fold_type(entry_ty.clone());
+                (ty, replace.fold_generics(context.generics.clone()))
+            }
+            _ => (entry_ty.clone(), context.generics.clone()),
+        };
+        let args = encode_entry_args(
+            &generics.params,
+            &self_in_impl,
+            &context.self_outlives,
+            &self.path,
+        )?;
+        let mut declared = without_encoded_bounds(&generics);
+        if let Some((ident, bound)) = param {
+            // The `Self` of a struct, an enum or a union is a `Sized` type, and the bounds may need
+            // it (`(Self, u8)`, `Vec<Self>`), so the parameter of `SelfRequirement::Any` is
+            // `Sized` where they do. Else it is `?Sized`: rustc before 1.70 cannot prove `S<T>:
+            // Sized` for the copy of a struct whose last field is the path through this impl, if
+            // the impl needs `__S: Sized` (E0275: the type needs the impl, which needs the type).
+            let sized = matches!(context.self_ty, Some(SelfRequirement::Any))
+                && needs_sized(&declared, &ty, &ident);
+            let declaration = match (bound, sized) {
+                (Some(path), _) => parse_quote!(#ident: ?::core::marker::Sized + #path),
+                (None, true) => parse_quote!(#ident),
+                (None, false) => parse_quote!(#ident: ?::core::marker::Sized),
+            };
+            // Before the first const: rustc before 1.59 wants the types before the consts.
+            let at = declared
+                .params
+                .iter()
+                .position(|param| matches!(param, GenericParam::Const(_)))
+                .unwrap_or(declared.params.len());
+            declared.params.insert(at, declaration);
+            // The generics of an entry with none have no angle brackets, which `Generics` compares.
+            declared.lt_token.get_or_insert_with(Default::default);
+            declared.gt_token.get_or_insert_with(Default::default);
+        }
+        // rustc reads a first predicate on `<__S>::A` as generics of the `where`.
+        if let Some(clause) = &mut declared.where_clause {
+            parenthesize_leading_qualified_path(clause);
+        }
+        Ok(RepeaterImpl {
+            entry,
+            generics: declared,
+            self_ty,
+            path: repeater_path(&self.path, &args),
+            ty,
+            id: self.id,
+        })
+    }
+}
+
+// The name of the parameter that stands for `Self` in the impl of an entry of the type `ty` and
+// the context `context`: `ident`, unless the type, the generics of the context or its bound use
+// that name, else the first of `ident0`, `ident1`, .. that they do not (the declaration would
+// clash, E0403, or the name would be taken for that generic).
+fn self_param(ty: &Type, context: &Context, ident: &Ident) -> Ident {
+    let generics = &context.generics;
+    let where_clause = &generics.where_clause;
+    let bound = match &context.self_ty {
+        Some(SelfRequirement::Bound(path)) => Some(path),
+        _ => None,
+    };
+    // Every identifier counts, those of the tokens of a macro too. A lifetime has its own
+    // names, as `'__S`.
+    let used = names_in(quote!(#ty #generics #where_clause #bound));
+    let base = ident_name(ident);
+    if !used.contains(&base) {
+        return ident.clone();
+    }
+    (0..)
+        .map(|n| format!("{}{}", base, n))
+        .find(|name| !used.contains(name))
+        .map(|name| Ident::new(&name, ident.span()))
+        .unwrap()
+}
+
+/// Returns `true` if the impl may need `param: Sized`, and `false` if it is well-formed without:
+/// it errs on the side of `Sized`. `declared` are the generics of the impl without `param`, which
+/// replaced `Self` in them, and `ty` is the type of the impl.
+fn needs_sized(declared: &Generics, ty: &Type, param: &Ident) -> bool {
+    use syn::visit::Visit;
+    struct Uses<'a> {
+        param: &'a Ident,
+        needs_sized: bool,
+    }
+    impl Uses<'_> {
+        fn is_param(&self, ty: &Type) -> bool {
+            matches!(unwrap_type_group(ty), Type::Path(TypePath { qself: None, path })
+                if path.is_ident(self.param))
+        }
+    }
+    impl<'ast> Visit<'ast> for Uses<'_> {
+        // A use that the methods below do not skip may need `Sized`: `(__S, u8)`, `[__S]`,
+        // `Rel2<__S, T>` (unless `Rel2` relaxes it, which is not seen), `<__S>::A`.
+        fn visit_ident(&mut self, ident: &'ast Ident) {
+            if ident == self.param {
+                self.needs_sized = true;
+            }
+        }
+        // Tokens that are not parsed: any `Self` is out of reach.
+        fn visit_macro(&mut self, _: &'ast Macro) {
+            self.needs_sized = true;
+        }
+        // `&'a __S` and `*const __S` need no `Sized`.
+        fn visit_type_reference(&mut self, node: &'ast TypeReference) {
+            if !self.is_param(&node.elem) {
+                syn::visit::visit_type_reference(self, node);
+            }
+        }
+        fn visit_type_ptr(&mut self, node: &'ast TypePtr) {
+            if !self.is_param(&node.elem) {
+                syn::visit::visit_type_ptr(self, node);
+            }
+        }
+        // Nor does a direct argument of a path that accepts an unsized one (`AsRef<__S>`).
+        fn visit_path(&mut self, path: &'ast Path) {
+            if !accepts_unsized_argument(path) {
+                return syn::visit::visit_path(self, path);
+            }
+            for segment in &path.segments {
+                match &segment.arguments {
+                    PathArguments::AngleBracketed(arguments) => {
+                        for argument in &arguments.args {
+                            match argument {
+                                GenericArgument::Type(ty) if self.is_param(ty) => (),
+                                argument => self.visit_generic_argument(argument),
+                            }
+                        }
+                    }
+                    arguments => self.visit_path_arguments(arguments),
+                }
+            }
+        }
+        // Nor does the bounded type of a predicate that does not say `Sized` (`__S: 'a`).
+        fn visit_predicate_type(&mut self, node: &'ast PredicateType) {
+            if !self.is_param(&node.bounded_ty) {
+                return syn::visit::visit_predicate_type(self, node);
+            }
+            for bound in &node.bounds {
+                match bound {
+                    // `__S: Sized`
+                    TypeParamBound::Trait(TraitBound {
+                        modifier: TraitBoundModifier::None,
+                        path,
+                        ..
+                    }) if path.segments.last().map_or(false, |s| s.ident == "Sized") => {
+                        self.needs_sized = true
+                    }
+                    bound => self.visit_type_param_bound(bound),
+                }
+            }
+        }
+    }
+    let mut uses = Uses {
+        param,
+        needs_sized: false,
+    };
+    uses.visit_generics(declared);
+    uses.visit_type(ty);
+    uses.needs_sized
+}
+
+/// Returns `true` if `path` is a trait or a type of `core`, `std` or `alloc` whose type parameter
+/// is `?Sized`: `AsRef<__S>` is well-formed with `__S: ?Sized`.
+///
+/// It is written with an absolute path (`::core::convert::AsRef`), or with the name of the prelude
+/// (`AsRef`, `Box`), which is taken for what it names there: the Leaker accepts it only if the
+/// prelude is allowed. A module that declares an item of the same name is not told apart (the impl
+/// would then not compile in the Leaker's crate).
+fn accepts_unsized_argument(path: &Path) -> bool {
+    // (the crates, the module, the items): `::core::convert::AsRef`, `::std::convert::AsRef`..
+    const ABSOLUTE: &[(&[&str], &str, &[&str])] = &[
+        (&["core", "std"], "convert", &["AsRef", "AsMut"]),
+        (
+            &["core", "std", "alloc"],
+            "borrow",
+            &["Borrow", "BorrowMut"],
+        ),
+        (&["core", "std"], "cmp", &["PartialEq", "PartialOrd"]),
+        (&["core", "std"], "marker", &["PhantomData"]),
+        (&["std", "alloc"], "boxed", &["Box"]),
+        (&["std", "alloc"], "rc", &["Rc"]),
+        (&["std", "alloc"], "sync", &["Arc"]),
+    ];
+    const PRELUDE: &[&str] = &["AsRef", "AsMut", "PartialEq", "PartialOrd", "Box"];
+    let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    let names: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    match (path.leading_colon.is_some(), &names[..]) {
+        (false, [name]) => PRELUDE.contains(name),
+        (true, [root, module, item]) => ABSOLUTE
+            .iter()
+            .any(|(roots, m, items)| roots.contains(root) && m == module && items.contains(item)),
+        _ => false,
     }
 }

@@ -1,46 +1,19 @@
-//! The bounds that the environment of the copy cannot prove for an impl: see
-//! [`AnalyzeVisitor::env_cycle()`](crate::analyze::AnalyzeVisitor).
+//! The bounds that the environment of the copy cannot prove for an impl (see
+//! [`AnalyzeVisitor::env_cycle()`](crate::analyze::AnalyzeVisitor)).
 //!
-//! rustc normalizes a path through the Repeater (and `Self::A`, which the impl of a trait defines)
-//! in a predicate of an item while it builds the environment of the item. It selects an impl, and
-//! needs the bounds of that impl, normalized, in the environment, which has the bounds of the item
-//! as the copy writes them, not normalized yet. They match only if the copy writes a bound as the
-//! impl has it, and rustc does not normalize anything in it. A bound is *unstable* if it names
-//!
-//! - a leaked type, which the copy writes as a path through the Repeater;
-//! - `Self`, if the copy writes the self type of an impl that names a leaked type;
-//! - `Self::A`, which the impl of the trait for the host defines;
-//! - an associated type that rustc normalizes: `T::Item` if a predicate in scope defines it
-//!   (`T: Iterator<Item = ..>`), and `<u8 as Tr>::A`, which an impl defines. `T::Item` of a
-//!   generic whose bounds are all traits of the standard library, and none defines it, stays as
-//!   it is. A bound of another trait may define it by a supertrait (`trait Tr:
-//!   Iterator<Item = u8>`), which the Leaker cannot read, so `T::Item` of a generic with such a
-//!   bound counts too.
-//!
-//! The context of a leaked type leaves out some of these bounds before they are looked at: a bound
-//! of a generic `T` that names `T` in the arguments of its path, if another bound of `T` fixes an
-//! associated type (`T: Iterator<Item = u8> + Fn(T::Item)`, also behind an alias that hides the
-//! projection), is not a bound of the Repeater's impl (see the context module,
-//! `left_out_bounds()`), so it is not unstable. The `T::Item` that a bound of another generic names
-//! (`U: Fn(T::Item)`), and one that an equation of a method defines, still are.
-//!
-//! The bounds that the context keeps whole (an entry that names `Self`, or writes out the self type
-//! of its scope) are not left out, so a bound of `T` that names `T` in the arguments of its path
-//! (`T: Iterator<Item = u8> + Fn(X<T>)`) stays, and `X` may be a type alias of the projection that
-//! the equation fixes, which the Leaker cannot tell from a struct: such a bound is unstable too, if
-//! an equation of `T` is in scope (`hidden_projection()`).
-//!
-//! A where predicate that is not a bound of a generic (`Vec<T::Item>: Default`, `u8:
-//! Into<T::Item>`) is proved by an impl, so it names no unstable bound as far as a leaked type,
-//! `Self` or an associated type of an impl goes; an optional type in it does, as the Leaker cannot
-//! tell that an impl proves it (`::std::vec::Vec<T>: Clone` holds only because the predicate says
-//! so, F71), and is no entry. It is not so for the `T::Item` that a predicate in scope defines (an
-//! enclosing item or a method equates it: `T: Iterator<Item = Rel<T>>`): rustc normalizes it with
-//! that predicate, which names the type whose impl needs the predicate, so the impl overflows
-//! (E0275) while it proves its own predicate.
+//! rustc normalizes a path through the Repeater (or `Self::A`) in a predicate of an item while it
+//! builds the item's environment: the impl it selects needs its bounds there, but the environment
+//! has them only as the copy writes them, not normalized yet. A bound is *unstable* if it names a
+//! leaked type, `Self` that the copy writes as a leaked self type, `Self::A`, or an associated type
+//! that rustc normalizes (`<u8 as Tr>::A`, or `T::Item` that a predicate in scope or a bound of a
+//! trait outside the standard library may define). The bounds that the context leaves out are not
+//! looked at; one that it keeps whole may hide a projection (`hidden_projection()`). A where
+//! predicate that is no bound of a generic is proved by an impl: only an optional type in it, or a
+//! `T::Item` that a predicate in scope equates (E0275), makes it unstable.
 
-use crate::context::{binds_assoc, bound_text, bounded_ident, hiding_bounds};
-use crate::util::{ident_name, is_bare_self, tidy_str, token_names, unwrap_type_group};
+use crate::util::{
+    bounded_ident, ident_name, is_bare_self, names_in, tidy_str, token_names, unwrap_type_group,
+};
 use proc_macro2::TokenStream;
 use std::collections::HashSet;
 use syn::punctuated::Punctuated;
@@ -139,10 +112,8 @@ impl Why {
     }
 }
 
-/// Returns the first bound of a type parameter of `generics` (the generics of a context) that may
-/// hide a projection of the parameter: one that names it in the arguments of its path, if another
-/// bound of it fixes an associated type, or `equated` has it (see [`equated_generics()`]). See
-/// `hiding_bounds()`, the rule that the context follows to leave such a bound out.
+/// Returns the first bound of a type parameter of the context's `generics` that may hide a
+/// projection of it (see [`hiding_bounds()`]; `equated` is from [`equated_generics()`]).
 pub(crate) fn hidden_projection(
     generics: &Generics,
     equated: &HashSet<String>,
@@ -197,10 +168,9 @@ pub(crate) fn hidden_projection(
     None
 }
 
-/// Returns `true` if the path of `bound` has a path in its arguments that names `name` and may be
-/// a type alias of a projection of it: not `name` itself (`From<T>`), a type that syntax builds
-/// (`&T`, `(T,)`), nor an absolute path of the standard library (`::core::option::Option<T>`),
-/// which are no aliases of a projection of `T`. A path inside them still counts.
+/// Returns `true` if the arguments of `bound` have a path that names `name` and may alias a
+/// projection of it: not `name` itself (`From<T>`), `&T`, `(T,)` or a path of the standard library
+/// (`::core::option::Option<T>`), though a path inside them counts.
 fn may_hide(bound: &TypeParamBound, name: &str) -> bool {
     struct Hides<'a> {
         name: &'a str,
@@ -208,14 +178,9 @@ fn may_hide(bound: &TypeParamBound, name: &str) -> bool {
     }
     impl<'ast, 'a> Visit<'ast> for Hides<'a> {
         fn visit_type_path(&mut self, i: &'ast TypePath) {
-            let mut names = HashSet::new();
-            token_names(quote!(#i), &mut names);
+            let names = names_in(i);
             let bare = i.qself.is_none() && i.path.is_ident(self.name);
-            let std = i.qself.is_none()
-                && i.path.leading_colon.is_some()
-                && i.path.segments.first().map_or(false, |seg| {
-                    matches!(ident_name(&seg.ident).as_str(), "core" | "std" | "alloc")
-                });
+            let std = i.qself.is_none() && is_std_root(&i.path);
             if names.contains(self.name) && !bare && !std {
                 self.found = true;
             }
@@ -263,7 +228,7 @@ pub(crate) struct Projections<'a, F> {
     /// `(bounded type, ANY_NAME)` for a bound that may define any (see [`bindings()`]).
     bindings: &'a [(String, String)],
     /// Only the associated types that an equation in scope defines count: not `Self::A`, and not
-    /// the projection of a type that an impl defines (see [`Projections::equated()`]).
+    /// the projection of a type that an impl defines (see [`Projections::equated_only()`]).
     equated_only: bool,
     pub(crate) found: Option<Why>,
 }
@@ -278,11 +243,9 @@ impl<'a, F: Fn(&str) -> bool> Projections<'a, F> {
         }
     }
 
-    /// Like `new()`, for a type that rustc proves by an impl (the bounded type of a where
-    /// predicate, and the types of its bounds, if it is not a bound of a generic): the impl
-    /// normalizes `Self::A` and the projection of a type that an impl defines to what it needs,
-    /// and the projection of a generic only by the equation that a predicate in scope gives.
-    pub(crate) fn equated(is_param: F, bindings: &'a [(String, String)]) -> Self {
+    /// Like `new()`, for a where predicate that is no bound of a generic, which an impl proves:
+    /// only a projection of a generic that an equation in scope defines counts.
+    pub(crate) fn equated_only(is_param: F, bindings: &'a [(String, String)]) -> Self {
         Self {
             equated_only: true,
             ..Self::new(is_param, bindings)
@@ -356,57 +319,87 @@ impl<'ast, 'a, F: Fn(&str) -> bool> Visit<'ast> for Projections<'a, F> {
     }
 }
 
+/// The projection in `predicate` that rustc normalizes for the impl that needs it (see
+/// [`Projections`]), where `on_environment` says that the environment must prove it.
+pub(crate) fn predicate_projection(
+    predicate: &WherePredicate,
+    on_environment: bool,
+    is_param: &impl Fn(&str) -> bool,
+    bindings: &[(String, String)],
+) -> Option<Why> {
+    // What the predicate bounds is not a bound of it: only the bounds are normalized for the impl
+    // that needs them (`Self::A: Clone` is proved by an impl).
+    let mut finder = Projections::new(is_param, bindings);
+    if let (true, WherePredicate::Type(predicate)) = (on_environment, predicate) {
+        for bound in &predicate.bounds {
+            finder.visit_type_param_bound(bound);
+        }
+    }
+    if finder.found.is_some() {
+        return finder.found;
+    }
+    // An impl proves the predicate, and normalizes the `Item` that a predicate in scope equates,
+    // wherever it is named: the bounded type, and the bounds of a predicate that is not on a
+    // generic.
+    let mut finder = Projections::equated_only(is_param, bindings);
+    finder.visit_where_predicate(predicate);
+    finder.found
+}
+
 /// The name of a bound that may define any associated type of what it bounds: the bound of a trait
 /// that the Leaker cannot read, whose supertrait may equate an associated type of another trait
 /// (`trait Tr: Iterator<Item = u8>`). It is not an identifier, so it is no name.
 const ANY_NAME: &str = "*";
 
-/// Returns the `(bounded type, name)` of the equations of associated types in the bounds of
-/// `params` and in `predicates`: `T: Iterator<Item = ..>` is `("T", "Item")`, and `F: Fn(A) -> B` is
-/// `("F", "Output")`. A bound of a trait that is not one of the standard library (`T: ::p::Tr`) is
-/// `("T", ANY_NAME)`.
+/// The `(bounded type, name)` of each equation in the bounds of `params` and `predicates`:
+/// `("T", "Item")` for `T: Iterator<Item = ..>`, `("F", "Output")` for `F: Fn(A) -> B`, and
+/// `("T", ANY_NAME)` for `T: ::p::Tr`, a trait outside the standard library.
 pub(crate) fn bindings<'a>(
     params: impl Iterator<Item = &'a GenericParam>,
     predicates: impl Iterator<Item = &'a WherePredicate>,
 ) -> Vec<(String, String)> {
     let mut found = Vec::new();
-    for param in params {
-        if let GenericParam::Type(param) = param {
-            let bounded = ident_name(&param.ident);
-            for bound in &param.bounds {
-                found.extend(
-                    names_of(bound)
-                        .into_iter()
-                        .map(|name| (bounded.clone(), name)),
-                );
-            }
-        }
-    }
-    for predicate in predicates {
-        if let WherePredicate::Type(predicate) = predicate {
-            let ty = unwrap_type_group(&predicate.bounded_ty);
-            let bounded = quote!(#ty).to_string();
-            for bound in &predicate.bounds {
-                found.extend(
-                    names_of(bound)
-                        .into_iter()
-                        .map(|name| (bounded.clone(), name)),
-                );
-            }
-        }
+    for (bounded, bound) in trait_bounds(params, predicates) {
+        found.extend(
+            names_of(bound)
+                .into_iter()
+                .map(|name| (bounded.clone(), name)),
+        );
     }
     found
 }
 
+/// The trait bounds of the type parameters `params` and of the where predicates `predicates`, in
+/// order, each with what it bounds: the name of the parameter, or the bounded type as written.
+pub(crate) fn trait_bounds<'a>(
+    params: impl Iterator<Item = &'a GenericParam>,
+    predicates: impl Iterator<Item = &'a WherePredicate>,
+) -> impl Iterator<Item = (String, &'a TraitBound)> {
+    let params = params.filter_map(|param| match param {
+        GenericParam::Type(param) => Some((ident_name(&param.ident), &param.bounds)),
+        _ => None,
+    });
+    let predicates = predicates.filter_map(|predicate| match predicate {
+        WherePredicate::Type(predicate) => {
+            let ty = unwrap_type_group(&predicate.bounded_ty);
+            Some((quote!(#ty).to_string(), &predicate.bounds))
+        }
+        _ => None,
+    });
+    params.chain(predicates).flat_map(|(bounded, bounds)| {
+        bounds.iter().filter_map(move |bound| match bound {
+            TypeParamBound::Trait(bound) => Some((bounded.clone(), bound)),
+            _ => None,
+        })
+    })
+}
+
 /// The associated types that a trait bound equates, and `ANY_NAME` if a supertrait of the trait may
 /// equate any.
-fn names_of(bound: &TypeParamBound) -> Vec<String> {
-    let (path, seg) = match bound {
-        TypeParamBound::Trait(bound) => match bound.path.segments.last() {
-            Some(seg) => (&bound.path, seg),
-            None => return Vec::new(),
-        },
-        _ => return Vec::new(),
+fn names_of(bound: &TraitBound) -> Vec<String> {
+    let seg = match bound.path.segments.last() {
+        Some(seg) => seg,
+        None => return Vec::new(),
     };
     let mut names: Vec<String> = match &seg.arguments {
         PathArguments::AngleBracketed(args) => args
@@ -420,7 +413,7 @@ fn names_of(bound: &TypeParamBound) -> Vec<String> {
         PathArguments::Parenthesized(_) => vec!["Output".to_string()],
         PathArguments::None => Vec::new(),
     };
-    if !is_std_trait(path) {
+    if !is_std_trait(&bound.path) {
         names.push(ANY_NAME.to_string());
     }
     names
@@ -485,13 +478,81 @@ const STD_TRAITS: &[&str] = &[
 /// Returns `true` if `path` is a trait of the standard library: an absolute path in `::core`,
 /// `::std` or `::alloc`, or a bare name of `STD_TRAITS`. Another path may be a trait of the analyzed
 /// code, or of a crate that the Leaker cannot read.
-pub(crate) fn is_std_trait(path: &Path) -> bool {
-    let first = match path.segments.first() {
-        Some(first) => ident_name(&first.ident),
-        None => return false,
-    };
+fn is_std_trait(path: &Path) -> bool {
     if path.leading_colon.is_some() {
-        return matches!(first.as_str(), "core" | "std" | "alloc");
+        return is_std_root(path);
     }
-    path.segments.len() == 1 && STD_TRAITS.contains(&first.as_str())
+    path.segments.len() == 1 && STD_TRAITS.contains(&ident_name(&path.segments[0].ident).as_str())
+}
+
+/// Returns `true` if `path` is an absolute path in `::core`, `::std` or `::alloc`.
+fn is_std_root(path: &Path) -> bool {
+    path.leading_colon.is_some()
+        && path.segments.first().map_or(false, |seg| {
+            matches!(ident_name(&seg.ident).as_str(), "core" | "std" | "alloc")
+        })
+}
+
+pub(crate) fn bound_text(bound: &TypeParamBound) -> String {
+    quote!(#bound).to_string()
+}
+
+/// Returns `true` if `bound` is a trait bound with an equation of an associated type
+/// (`Iterator<Item = u8>`).
+fn binds_assoc(bound: &TypeParamBound) -> bool {
+    match bound {
+        TypeParamBound::Trait(bound) => matches!(
+            bound.path.segments.last().map(|seg| &seg.arguments),
+            Some(PathArguments::AngleBracketed(args))
+                if args.args.iter().any(|arg| matches!(arg, GenericArgument::AssocType(_)))
+        ),
+        _ => false,
+    }
+}
+
+/// Returns `true` if `bound` is a trait bound with the name `name` in the arguments of its path
+/// (`Fn(Wrap<T>)`, `Tr<<T as Iterator>::Item>`, `PartialEq<Wrap<T>>`).
+fn arguments_mention(bound: &TypeParamBound, name: &str) -> bool {
+    match bound {
+        TypeParamBound::Trait(bound) => {
+            let mut names = HashSet::new();
+            for seg in &bound.path.segments {
+                let arguments = &seg.arguments;
+                token_names(quote!(#arguments), &mut names);
+            }
+            names.contains(name)
+        }
+        _ => false,
+    }
+}
+
+/// Returns `true` if the trait of `bound` is not one of the standard library, so a supertrait of
+/// it may equate an associated type that the Leaker cannot read (`trait Tr: Iterator<Item = u8>`).
+fn may_define_assoc(bound: &TypeParamBound) -> bool {
+    match bound {
+        TypeParamBound::Trait(bound) => !is_std_trait(&bound.path),
+        _ => false,
+    }
+}
+
+/// Returns those of `bounds` (all of the type parameter `name`) that are no equation and name
+/// `name` in their path's arguments (`T: Fn(X<T>)`), if another fixes an associated type (an
+/// equation, or a non-std trait that does not name `name`) or `equated` says one is in scope.
+pub(crate) fn hiding_bounds<'b>(
+    bounds: &[&'b TypeParamBound],
+    name: &str,
+    equated: bool,
+) -> Vec<&'b TypeParamBound> {
+    let fixes = equated
+        || bounds.iter().any(|bound| {
+            binds_assoc(bound) || (may_define_assoc(bound) && !arguments_mention(bound, name))
+        });
+    if !fixes {
+        return Vec::new();
+    }
+    bounds
+        .iter()
+        .copied()
+        .filter(|bound| !binds_assoc(bound) && arguments_mention(bound, name))
+        .collect()
 }

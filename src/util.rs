@@ -1,7 +1,7 @@
 //! Helpers for inspecting paths and types.
 
 use crate::error::Cause;
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -102,22 +102,33 @@ pub(crate) fn projection_head(path: &Path) -> Option<&Ident> {
         .map(|seg| &seg.ident)
 }
 
+/// `<value>`, the start of a path `<value>::A`, at `span` (that of the `T` of `T::A`, so that an
+/// error points at the path).
+pub(crate) fn qself_of(value: Type, span: Span) -> QSelf {
+    QSelf {
+        lt_token: Token![<](span),
+        ty: Box::new(value),
+        position: 0,
+        as_token: None,
+        gt_token: Token![>](span),
+    }
+}
+
+/// The segments of `path` after the first, with a leading `::`: `::A` of `T::A`, the path after
+/// `<value>` in `<value>::A`.
+pub(crate) fn after_head(path: &Path) -> Path {
+    Path {
+        leading_colon: Some(Default::default()),
+        segments: path.segments.iter().skip(1).cloned().collect(),
+    }
+}
+
 /// `<value>::A` for the path `T::A` and the type `value` for `T`. `fold` writes the segments after
 /// `T`, whose arguments may name generics too.
 pub(crate) fn projection(value: Type, path: &Path, fold: impl FnOnce(Path) -> Path) -> TypePath {
-    let rest = Path {
-        leading_colon: Some(Default::default()),
-        segments: path.segments.iter().skip(1).cloned().collect(),
-    };
     TypePath {
-        qself: Some(QSelf {
-            lt_token: Default::default(),
-            ty: Box::new(value),
-            position: 0,
-            as_token: None,
-            gt_token: Default::default(),
-        }),
-        path: fold(rest),
+        qself: Some(qself_of(value, Span::call_site())),
+        path: fold(after_head(path)),
     }
 }
 
@@ -133,18 +144,6 @@ pub(crate) fn plain_self_head(path: &Path) -> Option<&PathSegment> {
     self_head(path).filter(|seg| seg.arguments.is_none())
 }
 
-/// Returns `true` if `path` starts with `prefix`, segment by segment by identifier. Both must have
-/// a leading `::` or neither; the generic arguments of the segments are ignored.
-pub(crate) fn path_starts_with(path: &Path, prefix: &Path) -> bool {
-    prefix.leading_colon.is_some() == path.leading_colon.is_some()
-        && prefix.segments.len() <= path.segments.len()
-        && prefix
-            .segments
-            .iter()
-            .zip(path.segments.iter())
-            .all(|(prefix_seg, seg)| prefix_seg.ident == seg.ident)
-}
-
 /// How the Leaker treats a name of [`KNOWN_NAMES`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Known {
@@ -157,8 +156,9 @@ pub(crate) enum Known {
     Newer,
 }
 
-/// The names that the help gives an absolute path for, and the option that allows each. The one
-/// source of `Rules::primitive()`, `Rules::prelude()` and the help (`use ::core::.. instead of ..`).
+/// The names that the help gives an absolute path for (`use ::core::.. instead of ..`), and the
+/// option that allows each: the one source of the help, `Rules::primitive()` and
+/// `Rules::prelude()`.
 pub(crate) const KNOWN_NAMES: &[(&str, &str, Known)] = &[
     // The prelude of every edition (`std::prelude::v1`).
     ("Copy", "::core::marker::Copy", Known::Prelude),
@@ -291,16 +291,9 @@ pub(crate) fn type_contains(ty: &Type, part: &Type) -> bool {
     contains.found
 }
 
-/// Collects the names by which `ty` can refer to a generic of the scopes it is written in: the
-/// first segment of each relative path, the lifetimes, and the names in the tokens that are not
-/// parsed (a macro, syntax that `syn` leaves verbatim).
-///
-/// A later segment (`U` in `inner::U`), the name of an associated type binding (`Item` in
-/// `Iterator<Item = u8>`) and the name of a function pointer argument name an item, not a
-/// generic. The Leaker finds the generics a type mentions the same way (`AnalyzeVisitor`
-/// records a mention at `starts_with_generic()`), so the context of the type it chooses is the
-/// one that the Referrer computes by this function: a segment named like a generic must not add
-/// the generic to the context (`inner::U` in `fn f<U>(&self) -> inner::U`).
+/// Collects the names by which `ty` can refer to a generic: the first segment of each relative
+/// path, the lifetimes, and the names in unparsed tokens. The Leaker finds the generics of a type
+/// the same way (`starts_with_generic()`), so the Referrer computes the same contexts by it.
 pub(crate) fn type_names(ty: &Type, names: &mut HashSet<String>) {
     struct Names<'a>(&'a mut HashSet<String>);
     impl Names<'_> {
@@ -310,6 +303,7 @@ pub(crate) fn type_names(ty: &Type, names: &mut HashSet<String>) {
     }
     impl<'ast> Visit<'ast> for Names<'_> {
         fn visit_path(&mut self, i: &'ast Path) {
+            // A later segment (`U` in `inner::U`) names an item, not a generic.
             if i.leading_colon.is_none() {
                 if let Some(seg) = i.segments.first() {
                     self.0.insert(ident_name(&seg.ident));
@@ -358,15 +352,13 @@ pub(crate) fn type_names(ty: &Type, names: &mut HashSet<String>) {
     Names(names).visit_type(ty)
 }
 
-/// Returns `true` if `ty` refers to `idents` (as the first segment of a relative path) or
-/// `lifetimes`.
-pub(crate) fn mentions_names(ty: &Type, idents: Vec<Ident>, lifetimes: Vec<Lifetime>) -> bool {
-    struct Visitor {
-        idents: Vec<Ident>,
-        lifetimes: Vec<Lifetime>,
+/// Returns `true` if `ty` refers to `idents` (as the first segment of a relative path).
+pub(crate) fn mentions_idents(ty: &Type, idents: &[Ident]) -> bool {
+    struct Visitor<'a> {
+        idents: &'a [Ident],
         found: bool,
     }
-    impl<'ast> Visit<'ast> for Visitor {
+    impl<'ast> Visit<'ast> for Visitor<'_> {
         fn visit_path(&mut self, i: &'ast Path) {
             if i.leading_colon.is_none()
                 && i.segments
@@ -377,37 +369,26 @@ pub(crate) fn mentions_names(ty: &Type, idents: Vec<Ident>, lifetimes: Vec<Lifet
             }
             syn::visit::visit_path(self, i)
         }
-        fn visit_lifetime(&mut self, i: &'ast Lifetime) {
-            if self.lifetimes.contains(i) {
-                self.found = true;
-            }
-        }
         fn visit_macro(&mut self, i: &'ast Macro) {
             // The tokens of a macro are not parsed, so they are matched by name.
-            let mut names = HashSet::new();
-            token_names(i.tokens.clone(), &mut names);
+            let names = names_in(&i.tokens);
             if self
                 .idents
                 .iter()
                 .any(|ident| names.contains(&ident.to_string()))
-                || self
-                    .lifetimes
-                    .iter()
-                    .any(|lt| names.contains(&lt.to_string()))
             {
                 self.found = true;
             }
             syn::visit::visit_macro(self, i)
         }
     }
-    let mut visitor = Visitor {
-        idents,
-        lifetimes,
-        found: false,
-    };
-    if visitor.idents.is_empty() && visitor.lifetimes.is_empty() {
+    if idents.is_empty() {
         return false;
     }
+    let mut visitor = Visitor {
+        idents,
+        found: false,
+    };
     visitor.visit_type(ty);
     visitor.found
 }
@@ -417,12 +398,9 @@ pub(crate) fn ident_name(ident: &Ident) -> String {
     ident.unraw().to_string()
 }
 
-/// Returns the names that `item` declares in the block or module around it: a type, a trait, a
-/// constant, a static, a function, a module, a `macro_rules!` macro, an extern crate, and what a
-/// `use` brings in ([`use_names()`]). An impl or the call of a macro declares none.
-///
-/// The Leaker reads the values of a block with it, and the Referrer hides the entries that name
-/// them.
+/// Returns the names that `item` declares in the block or module around it, with what a `use`
+/// brings in ([`use_names()`]); an impl or a macro call declares none. The Leaker reads the values
+/// of a block with it, and the Referrer hides the entries that name them.
 pub(crate) fn declared_names(item: &Item) -> Vec<Ident> {
     let mut names = Vec::new();
     match item {
@@ -492,11 +470,53 @@ pub(crate) fn token_names(tokens: TokenStream, names: &mut HashSet<String>) {
     }
 }
 
+/// Returns `true` if `param` is a type parameter named `name` (without `r#`).
+pub(crate) fn is_type_param_named(param: &GenericParam, name: &str) -> bool {
+    matches!(param, GenericParam::Type(param) if ident_name(&param.ident) == name)
+}
+
+/// Returns `true` if `param` is the lifetime parameter `lifetime`.
+pub(crate) fn is_lifetime_param(param: &GenericParam, lifetime: &Lifetime) -> bool {
+    matches!(param, GenericParam::Lifetime(param) if param.lifetime == *lifetime)
+}
+
+/// The names of the identifiers and lifetimes in `tokens`, as [`token_names()`] collects them.
+pub(crate) fn names_in(tokens: impl ToTokens) -> HashSet<String> {
+    let mut names = HashSet::new();
+    token_names(tokens.into_token_stream(), &mut names);
+    names
+}
+
 pub(crate) fn generic_param_name(param: &GenericParam) -> String {
     match param {
         GenericParam::Type(TypeParam { ident, .. })
         | GenericParam::Const(ConstParam { ident, .. }) => ident_name(ident),
         GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => lifetime.to_string(),
+    }
+}
+
+/// The lifetimes that the binder `for<..>` declares.
+pub(crate) fn binder_lifetimes(
+    lifetimes: Option<&BoundLifetimes>,
+) -> impl Iterator<Item = Lifetime> + '_ {
+    lifetimes
+        .into_iter()
+        .flat_map(|lifetimes| lifetimes.lifetimes.iter())
+        .filter_map(|param| match param {
+            GenericParam::Lifetime(param) => Some(param.lifetime.clone()),
+            _ => None,
+        })
+}
+
+/// Returns `true` if the binder `lifetimes` declares `wanted`.
+pub(crate) fn binder_declares(lifetimes: Option<&BoundLifetimes>, wanted: &Lifetime) -> bool {
+    binder_lifetimes(lifetimes).any(|lifetime| lifetime == *wanted)
+}
+
+/// Pushes `item` to `items` unless it is there already.
+pub(crate) fn push_once<T: PartialEq>(items: &mut Vec<T>, item: T) {
+    if !items.contains(&item) {
+        items.push(item);
     }
 }
 
@@ -527,12 +547,9 @@ fn parenthesize(ty: &mut Type) {
     });
 }
 
-/// Returns the bounds of the trait object (or `impl Trait`) that `ty` ends in, through the pointee
-/// of a reference or a pointer and the output of a function pointer. A parenthesized type ends the
-/// search: nothing in it can be joined by what follows it.
-///
-/// A `+` after such a type joins the bounds: `Fn() -> &dyn A + B` bounds the trait object by `B`,
-/// and rustc rejects it (E0225, "ambiguous `+` in a type").
+/// Returns the bounds of the trait object (or `impl Trait`) that `ty` ends in, through pointees and
+/// function pointer outputs: rustc rejects a `+` after `ty`, which would join them
+/// (`Fn() -> &dyn A + B`, E0225). A parenthesized type ends the search.
 fn tail_object(ty: &Type) -> Option<&Punctuated<TypeParamBound, Token![+]>> {
     match ty {
         Type::Reference(TypeReference { elem, .. }) | Type::Ptr(TypePtr { elem, .. }) => {
@@ -567,20 +584,14 @@ fn bound_output_mut(bound: &mut TypeParamBound) -> Option<&mut Type> {
     }
 }
 
-/// Returns the bounds in the form that rustc reads as they mean, whichever way they were written.
-///
-/// The output of the sugar of `Fn` (`Fn(A) -> R`) is parsed without a `+`, so a bare trait object
-/// there cannot be followed by a bound (`Fn() -> &dyn A + B`), nor have several bounds
-/// (`Fn() -> dyn A + B`): they need parentheses. Merging the bounds of a parameter with its where
-/// predicates, and sorting them, decides what follows a bound, so this adds the parentheses that
-/// the order needs, and removes those that it does not, to make the result independent of how the
-/// bounds were written before. The bounds are sorted without the parentheses, so that it is
-/// idempotent.
+/// Returns the bounds sorted, with parentheses around a trait object in the output of `Fn(A) -> R`
+/// exactly where it needs them, so that the result does not depend on how they were written.
 pub(crate) fn canonical_bounds(
     bounds: Punctuated<TypeParamBound, Token![+]>,
 ) -> Punctuated<TypeParamBound, Token![+]> {
+    // Sorted without the parentheses, so that it is idempotent.
     let bounds = sorted_by_tokens(bounds.into_iter().map(|mut bound| {
-        // Parentheses that a trait object needs, or that it does not.
+        // Takes off the parentheses around a type that ends in a trait object.
         if let Some(output) = bound_output_mut(&mut bound) {
             while let Type::Paren(TypeParen { elem, .. }) = output {
                 if tail_object(elem).is_none() {
@@ -597,6 +608,8 @@ pub(crate) fn canonical_bounds(
         .enumerate()
         .map(|(ix, mut bound)| {
             let followed = ix + 1 < count;
+            // The output of `Fn(A) -> R` is parsed without a `+`: a trait object there needs
+            // parentheses if a bound follows it (`Fn() -> &dyn A + B`) or it has several bounds.
             if let Some(output) = bound_output_mut(&mut bound) {
                 if tail_object(output).map_or(false, |object| followed || object.len() > 1) {
                     parenthesize(output);
@@ -623,11 +636,9 @@ pub(crate) fn parenthesize_pointee(mut ty: Type) -> Type {
     ty
 }
 
-/// Parenthesizes the bounded type of a where predicate that rustc cannot parse as it is.
-///
-/// A function pointer without an output that is reached through a reference or a pointer
-/// (`&fn(A): 'a`) takes the `:` for the start of its output (rustc: "return types are denoted
-/// using `->`"). A type that replaces `Self` can be one: `where Self: 'a`.
+/// Parenthesizes the bounded type of a where predicate if it is a function pointer without an
+/// output behind a reference or a pointer (`&fn(A): 'a`), whose `:` rustc takes for the start of
+/// an output. A type that replaces `Self` can be one.
 pub(crate) fn parenthesize_bounded(ty: &mut Type) {
     let mut under_pointer = false;
     let mut current = &*ty;
@@ -651,12 +662,10 @@ pub(crate) fn parenthesize_bounded(ty: &mut Type) {
 }
 
 /// Parenthesizes the bounded type of the first predicate of `clause` if it is a qualified path
-/// without `as` (`where (<Host>::A): Clone`).
-///
-/// rustc reads `where <Host>::A: Clone` as generics of the `where` ("reserved for future use").
-/// Only the first predicate comes right after the `where`, and a binder (`for<'a> <Host>::A`) comes
-/// first. A type that replaces `Self` or a parameter can be a path of this form: `Self::A`.
+/// without `as` (`where (<Host>::A): Clone`): rustc reads `where <Host>` as generics of the
+/// `where`. A type that replaces `Self` or a parameter can be one.
 pub(crate) fn parenthesize_leading_qualified_path(clause: &mut WhereClause) {
+    // Only the first predicate follows the `where`, and a binder (`for<'a>`) would come between.
     if let Some(WherePredicate::Type(PredicateType {
         lifetimes: None,
         bounded_ty,
@@ -682,6 +691,20 @@ pub(crate) fn trait_object_of(ty: &Type) -> Option<&TypeTraitObject> {
     match unwrap_type_group(ty) {
         Type::TraitObject(object) => Some(object),
         _ => None,
+    }
+}
+
+/// Returns `true` for a reference with a lifetime, which its components cannot stand for: the copy
+/// needs a bound (`Rel: 'static`) that its referent's copy may lack. Only `'static` needs it, but
+/// every lifetime gets it; a trait object referent is exempt (see `Inherits::Reference`).
+pub(crate) fn is_whole_reference(ty: &Type) -> bool {
+    match unwrap_type_group(ty) {
+        Type::Reference(TypeReference {
+            lifetime: Some(_),
+            elem,
+            ..
+        }) => !matches!(unwrap_type_group(elem), Type::TraitObject(_)),
+        _ => false,
     }
 }
 
@@ -830,6 +853,14 @@ pub(crate) fn is_bare_self(ty: &Type) -> bool {
     )
 }
 
+/// The name of the generic that a where predicate's bounded type is, if it is a bare name.
+pub(crate) fn bounded_ident(ty: &Type) -> Option<String> {
+    match unwrap_type_group(ty) {
+        Type::Path(TypePath { qself: None, path }) => path.get_ident().map(ident_name),
+        _ => None,
+    }
+}
+
 /// Finds the mentions of `Self`: a path starting with it (`Self`, `Self::X`, the self type of
 /// `<Self as ..>`), or the name in the tokens of a macro. `::p::Self` is not one.
 #[derive(Default)]
@@ -843,9 +874,7 @@ struct SelfFinder {
 impl SelfFinder {
     /// Scans tokens that are not parsed, such as those of a macro, for the name.
     fn scan(&mut self, tokens: TokenStream) {
-        let mut names = HashSet::new();
-        token_names(tokens, &mut names);
-        if names.contains("Self") {
+        if names_in(tokens).contains("Self") {
             self.found.push(Cause::self_type());
         }
     }
@@ -853,9 +882,7 @@ impl SelfFinder {
     /// Records `path` if it starts with `Self`, as the syntax `cause` makes of it, then visits its
     /// arguments.
     fn path<'ast>(&mut self, path: &'ast Path, cause: fn(&Path) -> Cause) {
-        if path.leading_colon.is_none()
-            && path.segments.first().map_or(false, |s| s.ident == "Self")
-        {
+        if self_head(path).is_some() {
             self.found.push(cause(path));
             if path.segments.len() > 1 {
                 self.associated.push(cause(path));
@@ -895,28 +922,31 @@ impl<'ast> Visit<'ast> for SelfFinder {
     }
 }
 
-pub(crate) fn type_mentions_self(ty: &Type) -> bool {
+/// The [`SelfFinder`] after `visit`.
+fn find_self(visit: impl FnOnce(&mut SelfFinder)) -> SelfFinder {
     let mut finder = SelfFinder::default();
-    finder.visit_type(ty);
-    !finder.found.is_empty()
+    visit(&mut finder);
+    finder
+}
+
+pub(crate) fn type_mentions_self(ty: &Type) -> bool {
+    !find_self(|f| f.visit_type(ty)).found.is_empty()
 }
 
 pub(crate) fn generic_param_mentions_self(param: &GenericParam) -> bool {
-    let mut finder = SelfFinder::default();
-    finder.visit_generic_param(param);
-    !finder.found.is_empty()
+    !find_self(|f| f.visit_generic_param(param)).found.is_empty()
 }
 
 pub(crate) fn where_predicate_mentions_self(predicate: &WherePredicate) -> bool {
-    let mut finder = SelfFinder::default();
-    finder.visit_where_predicate(predicate);
-    !finder.found.is_empty()
+    !find_self(|f| f.visit_where_predicate(predicate))
+        .found
+        .is_empty()
 }
 
 pub(crate) fn bound_mentions_self(bound: &TypeParamBound) -> bool {
-    let mut finder = SelfFinder::default();
-    finder.visit_type_param_bound(bound);
-    !finder.found.is_empty()
+    !find_self(|f| f.visit_type_param_bound(bound))
+        .found
+        .is_empty()
 }
 
 /// Returns `predicate` without the bounds that mention `Self`, or `None` if nothing is left: a
@@ -961,15 +991,11 @@ impl From<SelfFinder> for SelfMentions {
 }
 
 pub(crate) fn self_in_param(param: &GenericParam) -> SelfMentions {
-    let mut finder = SelfFinder::default();
-    finder.visit_generic_param(param);
-    finder.into()
+    find_self(|f| f.visit_generic_param(param)).into()
 }
 
 pub(crate) fn self_in_predicate(predicate: &WherePredicate) -> SelfMentions {
-    let mut finder = SelfFinder::default();
-    finder.visit_where_predicate(predicate);
-    finder.into()
+    find_self(|f| f.visit_where_predicate(predicate)).into()
 }
 
 pub(crate) fn first_self_in_generics(generics: &Generics) -> Option<Cause> {
@@ -978,22 +1004,19 @@ pub(crate) fn first_self_in_generics(generics: &Generics) -> Option<Cause> {
 
 /// Returns the mentions of `Self` in the bounds, defaults and where predicates of `generics`.
 pub(crate) fn selves_in_generics(generics: &Generics) -> Vec<Cause> {
-    let mut finder = SelfFinder::default();
-    finder.visit_generics(generics);
-    finder.found
+    find_self(|f| f.visit_generics(generics)).found
 }
 
 pub(crate) fn first_self_in_type(ty: &Type) -> Option<Cause> {
-    let mut finder = SelfFinder::default();
-    finder.visit_type(ty);
-    finder.found.into_iter().next()
+    find_self(|f| f.visit_type(ty)).found.into_iter().next()
 }
 
 /// Returns the first `Self::X` in the bounds, defaults and where predicates of `generics`.
 pub(crate) fn first_associated_self_in_generics(generics: &Generics) -> Option<Cause> {
-    let mut finder = SelfFinder::default();
-    finder.visit_generics(generics);
-    finder.associated.into_iter().next()
+    find_self(|f| f.visit_generics(generics))
+        .associated
+        .into_iter()
+        .next()
 }
 
 /// Returns `param` without its default.
@@ -1012,6 +1035,17 @@ pub(crate) fn without_default(mut param: GenericParam) -> GenericParam {
     param
 }
 
+/// The where clause of `predicates`, or `None` if there is none.
+pub(crate) fn where_clause(
+    predicates: impl IntoIterator<Item = WherePredicate>,
+) -> Option<WhereClause> {
+    let predicates: Punctuated<WherePredicate, Token![,]> = predicates.into_iter().collect();
+    (!predicates.is_empty()).then(|| WhereClause {
+        where_token: Default::default(),
+        predicates,
+    })
+}
+
 /// Returns the first `n` parameters without defaults, and the where predicates that do not name the
 /// others.
 pub(crate) fn without_defaults(generics: &Generics, n: usize) -> Generics {
@@ -1028,38 +1062,18 @@ pub(crate) fn without_defaults(generics: &Generics, n: usize) -> Generics {
         .skip(n)
         .map(generic_param_name)
         .collect();
-    let predicates: Punctuated<WherePredicate, Token![,]> = generics
+    let predicates = generics
         .where_clause
         .iter()
         .flat_map(|wc| wc.predicates.iter())
-        .filter(|predicate| {
-            let mut names = HashSet::new();
-            token_names(quote!(#predicate), &mut names);
-            names.is_disjoint(&later)
-        })
-        .cloned()
-        .collect();
+        .filter(|predicate| names_in(predicate).is_disjoint(&later))
+        .cloned();
     let has_params = !params.is_empty();
     Generics {
-        lt_token: if has_params {
-            Some(Default::default())
-        } else {
-            None
-        },
+        lt_token: has_params.then(Default::default),
         params,
-        gt_token: if has_params {
-            Some(Default::default())
-        } else {
-            None
-        },
-        where_clause: if predicates.is_empty() {
-            None
-        } else {
-            Some(WhereClause {
-                where_token: Default::default(),
-                predicates,
-            })
-        },
+        gt_token: has_params.then(Default::default),
+        where_clause: where_clause(predicates),
     }
 }
 
@@ -1087,57 +1101,35 @@ impl<'a> ReplaceSelf<'a> {
             .collect()
     }
 
-    // `Some(Some(rest))` for `Self::A::B`, `Some(None)` for `Self` alone.
-    fn strip_self(path: &Path) -> Option<Option<Path>> {
-        plain_self_head(path)?;
-        // The `::` after the qualified self type (see `qself()`).
-        Some((path.segments.len() > 1).then(|| Path {
-            leading_colon: Some(Default::default()),
-            segments: path.segments.iter().skip(1).cloned().collect(),
-        }))
-    }
-
-    fn qself(&self) -> QSelf {
-        QSelf {
-            lt_token: Default::default(),
-            ty: Box::new(self.self_ty.clone()),
-            position: 0,
-            as_token: None,
-            gt_token: Default::default(),
-        }
-    }
-
     pub(crate) fn fold_type_with(&self, folder: &mut impl syn::fold::Fold, ty: Type) -> Type {
-        let stripped = match &ty {
-            Type::Path(TypePath { qself: None, path }) => Self::strip_self(path),
-            _ => None,
-        };
-        match (ty, stripped) {
-            (_, Some(None)) => self.self_ty.clone(),
-            (_, Some(Some(rest))) => Type::Path(TypePath {
-                qself: Some(self.qself()),
-                path: folder.fold_path(rest),
-            }),
-            (Type::Verbatim(tokens), _) => Type::Verbatim(self.replace_tokens(tokens)),
-            (ty, _) => parenthesize_pointee(syn::fold::fold_type(folder, ty)),
+        match ty {
+            Type::Path(TypePath { qself: None, path }) if plain_self_head(&path).is_some() => {
+                if path.segments.len() > 1 {
+                    let value = self.self_ty.clone();
+                    Type::Path(projection(value, &path, |rest| folder.fold_path(rest)))
+                } else {
+                    self.self_ty.clone()
+                }
+            }
+            Type::Verbatim(tokens) => Type::Verbatim(self.replace_tokens(tokens)),
+            ty => parenthesize_pointee(syn::fold::fold_type(folder, ty)),
         }
     }
 
     /// `Self` alone in an expression is a value, so only `Self::A` is replaced.
     pub(crate) fn fold_expr_with(&self, folder: &mut impl syn::fold::Fold, expr: Expr) -> Expr {
-        let stripped = match &expr {
+        match expr {
             Expr::Path(ExprPath {
-                qself: None, path, ..
-            }) => Self::strip_self(path),
-            _ => None,
-        };
-        match (expr, stripped) {
-            (Expr::Path(path), Some(Some(rest))) => Expr::Path(ExprPath {
-                qself: Some(self.qself()),
-                path: folder.fold_path(rest),
-                ..path
-            }),
-            (expr, _) => syn::fold::fold_expr(folder, expr),
+                attrs,
+                qself: None,
+                path,
+            }) if plain_self_head(&path).is_some() && path.segments.len() > 1 => {
+                let value = self.self_ty.clone();
+                let TypePath { qself, path } =
+                    projection(value, &path, |rest| folder.fold_path(rest));
+                Expr::Path(ExprPath { attrs, qself, path })
+            }
+            expr => syn::fold::fold_expr(folder, expr),
         }
     }
 }

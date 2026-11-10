@@ -196,8 +196,8 @@ impl<A: Allow> View<'_, '_, A> {
 }
 
 // Forwards only the methods the analysis overrides, so walking the view walks the analysis. The
-// default walk of the other methods reaches the forwarded ones through the view. The test below
-// keeps this list in sync with the overrides of the analysis.
+// default walk of the other methods reaches the forwarded ones through the view. A test in
+// tests/scopes.rs keeps this list in sync with the overrides of the analysis.
 impl<'ast, A: Allow> syn::visit::Visit<'ast> for View<'_, '_, A> {
     forward! {
         visit_angle_bracketed_generic_arguments: AngleBracketedGenericArguments,

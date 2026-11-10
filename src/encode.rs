@@ -1,585 +1,20 @@
-//! Encoding generic parameters and arguments into types.
+//! Encoding generic parameters and arguments into types, and the arguments of a use site.
 
 use crate::elided::{fold_bare_fn, fold_bound, FreshLifetimes, Site};
 use crate::repeater::encode_slot_const;
 use crate::util::{
-    parenthesize_bounded, parenthesize_leading_qualified_path, parenthesize_pointee, projection,
-    projection_head, unwrap_type_group, ReplaceSelf, Sorted,
+    after_head, has_lifetime_bound, parenthesize_bounded, parenthesize_leading_qualified_path,
+    parenthesize_pointee, projection, projection_head, qself_of, unwrap_type_group, ReplaceSelf,
+    Sorted,
 };
 use proc_macro2::{Span, TokenStream, TokenTree};
-use std::borrow::Borrow;
 use std::collections::HashMap;
-use std::iter::FromIterator;
 use syn::fold::Fold;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
-
-/// Completes the arguments `given` for an impl of a scope whose generics as declared are
-/// `generics`, with the leaked types of their defaults already written: one argument for each
-/// parameter, in its order, as a [`Substitute`].
-///
-/// `given` match the parameters by kind: the lifetimes go to the lifetime parameters, the types and
-/// consts to the others, whatever the order between the kinds. A binding such as `Item = u8` is
-/// skipped, and a bare identifier is a const argument (syn parses it as a type). The default of a
-/// parameter that has no argument is taken with each parameter before it replaced by its argument.
-///
-/// `T::A` in a default is `<arg>::A` if the argument `arg` is one identifier, else `<arg as
-/// Trait>::A` with the one trait bound of `T` (inline or in the where clause, without its
-/// associated type bindings, its arguments written with the earlier parameters replaced).
-///
-/// Fails with [`EncodeError::MissingArgument`] for a parameter that has neither an argument of its
-/// kind nor a default, with [`EncodeError::UnexpectedArgument`] for an argument left over, a const
-/// argument for a type parameter, or a type that is not one identifier for a const parameter, and
-/// with [`EncodeError::AmbiguousAssociatedType`] for an associated type of an argument that is not an
-/// identifier if `T` has no trait bound or several.
-pub(crate) fn complete_params<'a>(
-    generics: &Generics,
-    given: impl IntoIterator<Item = &'a GenericArgument>,
-) -> std::result::Result<Substitute, EncodeError> {
-    let params: Vec<&GenericParam> = generics.params.iter().collect();
-    let mut substitute = ParamFold::new(generics);
-    let mut lifetime_args = Vec::new();
-    let mut other_args = Vec::new();
-    for arg in given {
-        substitute.names.reserve(arg);
-        match arg {
-            GenericArgument::Lifetime(_) => lifetime_args.push(arg),
-            GenericArgument::Type(_) | GenericArgument::Const(_) => other_args.push(arg),
-            _ => (),
-        }
-    }
-    let mut lifetime_args = lifetime_args.into_iter();
-    let mut other_args = other_args.into_iter();
-    let mut completed = Vec::<GenericArgument>::new();
-    for param in &params {
-        match param {
-            GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => match lifetime_args.next() {
-                Some(GenericArgument::Lifetime(arg)) => {
-                    substitute.lifetimes.insert(lifetime.clone(), arg.clone());
-                    completed.push(GenericArgument::Lifetime(arg.clone()));
-                }
-                _ => return Err(EncodeError::MissingArgument(Box::new((*param).clone()))),
-            },
-            GenericParam::Type(tp) => {
-                let ty: Type = match other_args.next() {
-                    Some(GenericArgument::Type(ty)) => ty.clone(),
-                    Some(arg) => {
-                        return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())))
-                    }
-                    None => match &tp.default {
-                        Some(default) => {
-                            let ty = substitute.fold_type(default.clone());
-                            if let Some(error) = substitute.error.take() {
-                                return Err(error);
-                            }
-                            ty
-                        }
-                        None => {
-                            return Err(EncodeError::MissingArgument(Box::new((*param).clone())))
-                        }
-                    },
-                };
-                substitute.types.insert(tp.ident.clone(), ty.clone());
-                completed.push(GenericArgument::Type(ty));
-            }
-            GenericParam::Const(cp) => {
-                let value: Expr = match other_args.next() {
-                    Some(arg) => match const_argument(arg) {
-                        Some(value) => value,
-                        None => return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone()))),
-                    },
-                    None => match &cp.default {
-                        Some(default) => {
-                            let value = substitute.fold_expr(default.clone());
-                            if let Some(error) = substitute.error.take() {
-                                return Err(error);
-                            }
-                            value
-                        }
-                        None => {
-                            return Err(EncodeError::MissingArgument(Box::new((*param).clone())))
-                        }
-                    },
-                };
-                substitute.consts.insert(cp.ident.clone(), value.clone());
-                completed.push(GenericArgument::Const(normalize_const_arg(&value)));
-            }
-        }
-    }
-    if let Some(arg) = lifetime_args.next().or_else(|| other_args.next()) {
-        return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())));
-    }
-    let (mut lifetimes, mut others) = (HashMap::new(), HashMap::new());
-    for (param, arg) in params.into_iter().zip(completed) {
-        match param {
-            GenericParam::Lifetime(param) => lifetimes.insert(param.lifetime.ident.clone(), arg),
-            GenericParam::Type(param) => others.insert(param.ident.clone(), arg),
-            GenericParam::Const(param) => others.insert(param.ident.clone(), arg),
-        };
-    }
-    Ok(Substitute {
-        lifetimes: Sorted(lifetimes),
-        others: Sorted(others),
-        bounds: Sorted(substitute.bounds),
-    })
-}
-
-/// The value that `arg` gives to a const parameter: a const argument, or a bare identifier, which
-/// is parsed as a type.
-fn const_argument(arg: &GenericArgument) -> Option<Expr> {
-    match arg {
-        GenericArgument::Const(expr) => Some(expr.clone()),
-        GenericArgument::Type(Type::Path(TypePath { qself: None, path }))
-            if path.get_ident().is_some() =>
-        {
-            Some(parse_quote!(#path))
-        }
-        _ => None,
-    }
-}
-
-/// The name that `ty` is, if it is one identifier (a type parameter, as far as the syntax tells).
-fn type_name(ty: &Type) -> Option<&Ident> {
-    match unwrap_type_group(ty) {
-        Type::Path(TypePath { qself: None, path }) => path.get_ident(),
-        _ => None,
-    }
-}
-
-/// `<value>`, the start of a path `<value>::A`, at `span` (that of the `T` of `T::A`, so that an
-/// error points at the path).
-fn qself_of(value: Type, span: Span) -> QSelf {
-    QSelf {
-        lt_token: Token![<](span),
-        ty: Box::new(value),
-        position: 0,
-        as_token: None,
-        gt_token: Token![>](span),
-    }
-}
-
-/// `<value as bound>::A..` for the trait path `bound` and the segments `rest` (`A..`, with the
-/// leading `::` that [`parameter_projection()`] writes).
-fn through_bound(value: Type, bound: Path, mut rest: Path, span: Span) -> TypePath {
-    rest.leading_colon = None;
-    let position = bound.segments.len();
-    let mut segments = bound.segments;
-    segments.extend(rest.segments);
-    TypePath {
-        qself: Some(QSelf {
-            position,
-            as_token: Some(Token![as](span)),
-            ..qself_of(value, span)
-        }),
-        path: Path {
-            leading_colon: bound.leading_colon,
-            segments,
-        },
-    }
-}
-
-/// The name `T` and the rest of the path if `ty` is an associated type of it, `T::A..` or
-/// `<T>::A..` (`T` one identifier, with no arguments). The rest has a leading `::`, as
-/// `projection()` writes it.
-fn parameter_projection(ty: &TypePath) -> Option<(&Ident, Path)> {
-    let rest = |segments: Punctuated<PathSegment, Token![::]>| Path {
-        leading_colon: Some(Default::default()),
-        segments,
-    };
-    match &ty.qself {
-        None => {
-            let name = projection_head(&ty.path)?;
-            let segments = ty.path.segments.iter().skip(1).cloned().collect();
-            Some((name, rest(segments)))
-        }
-        Some(QSelf {
-            ty: head,
-            position: 0,
-            as_token: None,
-            ..
-        }) => Some((type_name(head)?, rest(ty.path.segments.clone()))),
-        _ => None,
-    }
-}
-
-/// The one trait bound of the parameter, inline or in a where predicate on it, as a trait path
-/// without associated type bindings (`Iterator` for `T: Iterator<Item = u8>`): the trait that
-/// `<value as Trait>::A` names. `None` if the parameter has none, or has several, or the bound has a
-/// `for<'a>` binder. A lifetime bound and `?Sized` are not counted.
-fn single_bound(param: &TypeParam, where_clause: Option<&WhereClause>) -> Option<Path> {
-    let predicates = where_clause
-        .into_iter()
-        .flat_map(|where_clause| where_clause.predicates.iter())
-        .filter_map(|predicate| match predicate {
-            WherePredicate::Type(PredicateType {
-                lifetimes: None,
-                bounded_ty,
-                bounds,
-                ..
-            }) if type_name(bounded_ty) == Some(&param.ident) => Some(bounds.iter()),
-            _ => None,
-        })
-        .flatten();
-    let mut found = None;
-    for bound in param.bounds.iter().chain(predicates) {
-        match bound {
-            TypeParamBound::Lifetime(_) => (),
-            TypeParamBound::Trait(TraitBound {
-                modifier: TraitBoundModifier::Maybe(_),
-                ..
-            }) => (),
-            TypeParamBound::Trait(bound) if found.is_none() && bound.lifetimes.is_none() => {
-                found = Some(bound.path.clone());
-            }
-            _ => return None,
-        }
-    }
-    let mut path = found?;
-    if let Some(last) = path.segments.last_mut() {
-        match &mut last.arguments {
-            PathArguments::AngleBracketed(args) => {
-                args.args = std::mem::take(&mut args.args)
-                    .into_iter()
-                    .filter(|arg| {
-                        !matches!(
-                            arg,
-                            GenericArgument::AssocType(_)
-                                | GenericArgument::AssocConst(_)
-                                | GenericArgument::Constraint(_)
-                        )
-                    })
-                    .collect();
-                if args.args.is_empty() {
-                    last.arguments = PathArguments::None;
-                }
-            }
-            PathArguments::Parenthesized(args) => args.output = ReturnType::Default,
-            PathArguments::None => (),
-        }
-    }
-    Some(path)
-}
-
-/// Primitive types which can be the type of const parameters on stable Rust.
-const CONST_PARAM_PRIMITIVES: &[&str] = &[
-    "bool", "char", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128",
-    "isize",
-];
-
-/// A primitive that can type a const parameter, so it is context-free.
-pub(crate) fn is_const_param_ty(ty: &Type) -> bool {
-    const_param_primitive(ty).is_some()
-}
-
-pub(crate) fn const_param_primitive(ty: &Type) -> Option<&'static str> {
-    match unwrap_type_group(ty) {
-        Type::Path(TypePath { qself: None, path }) => {
-            if path.segments.iter().any(|seg| !seg.arguments.is_none()) {
-                return None;
-            }
-            let segs: Vec<_> = path
-                .segments
-                .iter()
-                .map(|seg| seg.ident.to_string())
-                .collect();
-            let name = match (path.leading_colon.is_some(), segs.as_slice()) {
-                (false, [s]) => s,
-                (_, [c, p, s]) if (c == "core" || c == "std") && p == "primitive" => s,
-                _ => return None,
-            };
-            CONST_PARAM_PRIMITIVES
-                .iter()
-                .find(|prim| **prim == name.as_str())
-                .copied()
-        }
-        _ => None,
-    }
-}
-
-/// Braces everything but a literal or an identifier, or it could parse as a type.
-pub(crate) fn normalize_const_arg(expr: &Expr) -> Expr {
-    let inner = unwrap_block(expr);
-    let is_simple = match inner {
-        Expr::Lit(_) => true,
-        Expr::Path(ExprPath {
-            qself: None, path, ..
-        }) => path.get_ident().is_some(),
-        Expr::Unary(ExprUnary {
-            op: UnOp::Neg(_),
-            expr,
-            ..
-        }) => matches!(expr.as_ref(), Expr::Lit(_)),
-        _ => false,
-    };
-    if is_simple {
-        inner.clone()
-    } else {
-        parse_quote!({ #inner })
-    }
-}
-
-fn unwrap_block(expr: &Expr) -> &Expr {
-    match expr {
-        Expr::Block(ExprBlock {
-            attrs,
-            label: None,
-            block,
-        }) if attrs.is_empty() && block.stmts.len() == 1 => match &block.stmts[0] {
-            Stmt::Expr(inner, None) => unwrap_block(inner),
-            _ => expr,
-        },
-        _ => expr,
-    }
-}
-
-/// The first argument of the Repeater for an entry: a tuple type made from the generics `iter` of
-/// the entry, each by its own name. It is the argument of `RepeaterImpl::path` for the generics an
-/// impl declares and what `Projection::of()` writes for the copy. The tuple has an element for
-/// each parameter, then the encoded lifetime bounds:
-///
-/// - a lifetime `'a` is `&'a ()`, and a type `T` is `T` (`*const T` with a `?Sized` bound, since a
-///   tuple needs `Sized` elements but the last);
-/// - a const is encoded into the slots of the Repeater (`encode_slot_const()`);
-/// - each bound of a generic on a lifetime is `&'a T` for `T: 'a` and `&'a &'b ()` for `'b: 'a`, and
-///   each lifetime `'a` of `self_outlives` (`Context::self_outlives`) adds `&'a Self`, with `Self`
-///   the type `self_ty` that stands for it.
-///
-/// Fails with `UnboundedTraitObject` if `self_ty` is a trait object without the lifetime bound that
-/// `Self: 'a` needs, and with `UnsupportedConstType` for a const of a type that has no slot.
-/// `repeater` is the path of the Repeater.
-pub(crate) fn encode_entry_args<'a>(
-    iter: impl IntoIterator<Item = &'a GenericParam>,
-    (self_ty, lifetimes): (&Type, &[Lifetime]),
-    repeater: &Path,
-) -> std::result::Result<Type, EncodeError> {
-    let params: Vec<&'a GenericParam> = iter.into_iter().collect();
-    let mut elems = params
-        .iter()
-        .map(|param| -> std::result::Result<Type, EncodeError> {
-            Ok(match param {
-                GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
-                    parse_quote!(& #lifetime ())
-                }
-                GenericParam::Const(ConstParam { ident, ty, .. }) => {
-                    encode_slot_const(repeater, ident, ty)?
-                }
-                GenericParam::Type(tp) if is_maybe_unsized(tp) => unsized_element(&tp.ident),
-                GenericParam::Type(TypeParam { ident, .. }) => parse_quote!(#ident),
-            })
-        })
-        .collect::<std::result::Result<Punctuated<Type, Token![,]>, _>>()?;
-    let args: Vec<GenericArgument> = params_as_args(params.iter().copied());
-    elems.extend(encode_outlives_bounds(&params, &args)?);
-    elems.extend(encode_self_outlives(&params, &args, self_ty, lifetimes)?);
-    Ok(Type::Tuple(TypeTuple {
-        paren_token: Default::default(),
-        elems: with_trailing_comma(elems),
-    }))
-}
-
-// The arguments that pass `params` on, each by its own name: `'a` is `'a`, `T` is `T`, and
-// `const N: usize` is the `Const` argument `N` (syn parses a bare `N` as a type).
-pub(crate) fn params_as_args<I, C>(params: I) -> C
-where
-    I: IntoIterator,
-    I::Item: Borrow<GenericParam>,
-    C: FromIterator<GenericArgument>,
-{
-    params
-        .into_iter()
-        .map(|param| param_as_arg(param.borrow()))
-        .collect()
-}
-
-/// The argument that passes `param` on by its own name.
-fn param_as_arg(param: &GenericParam) -> GenericArgument {
-    match param {
-        GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
-            GenericArgument::Lifetime(lifetime.clone())
-        }
-        GenericParam::Type(TypeParam { ident, .. }) => GenericArgument::Type(parse_quote!(#ident)),
-        GenericParam::Const(ConstParam { ident, .. }) => {
-            GenericArgument::Const(parse_quote!(#ident))
-        }
-    }
-}
-
-/// The lifetime bounds written on `param`, in order. A where predicate is not one.
-fn lifetime_bounds(param: &GenericParam) -> Vec<&Lifetime> {
-    match param {
-        GenericParam::Lifetime(param) => param.bounds.iter().collect(),
-        GenericParam::Type(param) => param
-            .bounds
-            .iter()
-            .filter_map(|bound| match bound {
-                TypeParamBound::Lifetime(lifetime) => Some(lifetime),
-                _ => None,
-            })
-            .collect(),
-        GenericParam::Const(_) => Vec::new(),
-    }
-}
-
-/// The only rule that decides which bounds are encoded. `without_encoded_bounds()` keeps the
-/// others.
-fn encoded_bound_position(params: &[&GenericParam], bound: &Lifetime) -> Option<usize> {
-    params.iter().position(
-        |param| matches!(param, GenericParam::Lifetime(param) if &param.lifetime == bound),
-    )
-}
-
-/// Returns `generics` without the lifetime bounds that the encoding of the generics encodes: a bound
-/// by a lifetime parameter of `generics`, on a type parameter (`T: 'a`) or a lifetime parameter
-/// (`'b: 'a`). Other bounds (`T: 'static`, trait bounds), const parameters and the where clause
-/// stay. These are the generics a Repeater impl declares.
-pub(crate) fn without_encoded_bounds(generics: &Generics) -> Generics {
-    let params: Vec<&GenericParam> = generics.params.iter().collect();
-    let mut declared = generics.clone();
-    for param in declared.params.iter_mut() {
-        match param {
-            GenericParam::Lifetime(param) => {
-                param.bounds = param
-                    .bounds
-                    .iter()
-                    .filter(|bound| encoded_bound_position(&params, bound).is_none())
-                    .cloned()
-                    .collect();
-                if param.bounds.is_empty() {
-                    param.colon_token = None;
-                }
-            }
-            GenericParam::Type(param) => {
-                param.bounds = param
-                    .bounds
-                    .iter()
-                    .filter(|bound| {
-                        !matches!(bound, TypeParamBound::Lifetime(lifetime)
-                            if encoded_bound_position(&params, lifetime).is_some())
-                    })
-                    .cloned()
-                    .collect();
-                if param.bounds.is_empty() {
-                    param.colon_token = None;
-                }
-            }
-            GenericParam::Const(_) => (),
-        }
-    }
-    declared
-}
-
-/// The elements encoding the lifetime bounds of `params`, after those of the parameters.
-pub(crate) fn encode_outlives_bounds(
-    params: &[&GenericParam],
-    args: &[GenericArgument],
-) -> std::result::Result<Vec<Type>, EncodeError> {
-    let mut elems = Vec::new();
-    for (param, arg) in params.iter().zip(args) {
-        for bound in lifetime_bounds(param) {
-            let outliving =
-                encoded_bound_position(params, bound).and_then(|pos| match args.get(pos) {
-                    Some(GenericArgument::Lifetime(outliving)) => Some(outliving),
-                    _ => None,
-                });
-            let outliving = match outliving {
-                Some(outliving) => outliving,
-                None => continue,
-            };
-            let referent: Type = match arg {
-                GenericArgument::Lifetime(lifetime) => parse_quote!(& #lifetime ()),
-                GenericArgument::Type(ty) => referent_of_reference(ty)?,
-                _ => continue,
-            };
-            elems.push(Type::Reference(TypeReference {
-                and_token: Default::default(),
-                lifetime: Some(outliving.clone()),
-                mutability: None,
-                elem: Box::new(referent),
-            }));
-        }
-    }
-    Ok(elems)
-}
-
-/// `&'a __S` implies `__S: 'a` wherever it is written. A declared `__S: 'a` would fail where
-/// nothing proves it, such as in a free function signature.
-pub(crate) fn encode_self_outlives(
-    params: &[&GenericParam],
-    args: &[GenericArgument],
-    self_ty: &Type,
-    lifetimes: &[Lifetime],
-) -> std::result::Result<Vec<Type>, EncodeError> {
-    let mut elems = Vec::new();
-    for lifetime in lifetimes {
-        let outliving =
-            encoded_bound_position(params, lifetime).and_then(|pos| match args.get(pos) {
-                Some(GenericArgument::Lifetime(outliving)) => Some(outliving),
-                _ => None,
-            });
-        if let Some(outliving) = outliving {
-            elems.push(Type::Reference(TypeReference {
-                and_token: Default::default(),
-                lifetime: Some(outliving.clone()),
-                mutability: None,
-                elem: Box::new(referent_of_reference(self_ty)?),
-            }));
-        }
-    }
-    Ok(elems)
-}
-
-/// Whether `param` may be unsized: it has a `?Sized` bound, as the generics of a context do (the
-/// Leaker moves a where predicate `T: ?Sized` to the parameter).
-pub(crate) fn is_maybe_unsized(param: &TypeParam) -> bool {
-    param.bounds.iter().any(|bound| {
-        matches!(
-            bound,
-            TypeParamBound::Trait(TraitBound {
-                modifier: TraitBoundModifier::Maybe(_),
-                ..
-            })
-        )
-    })
-}
-
-/// The element of the trait arguments for the `?Sized` parameter `ident`: `*const ident`.
-///
-/// A tuple is well-formed only if the elements but the last are `Sized`, and a raw pointer is
-/// `Sized` whatever it points to.
-fn unsized_element(ident: &Ident) -> Type {
-    Type::Ptr(TypePtr {
-        star_token: Default::default(),
-        const_token: Some(Default::default()),
-        mutability: None,
-        elem: Box::new(parse_quote!(#ident)),
-    })
-}
-
-/// Returns `ty` as the referent of a reference. A trait object is parenthesized, and needs a
-/// lifetime bound, or it would default to the lifetime of the reference. Only the type of `Self`
-/// that the caller of `Projection::of()` gives can be one: the generics are named by their
-/// own names.
-fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
-    match unwrap_type_group(ty) {
-        Type::TraitObject(object) => {
-            if !object
-                .bounds
-                .iter()
-                .any(|bound| matches!(bound, TypeParamBound::Lifetime(_)))
-            {
-                return Err(EncodeError::UnboundedTraitObject(Box::new(ty.clone())));
-            }
-            Ok(Type::Paren(TypeParen {
-                paren_token: Default::default(),
-                elem: Box::new(Type::TraitObject(object.clone())),
-            }))
-        }
-        _ => Ok(ty.clone()),
-    }
-}
 
 /// The error of the functions that encode the generics of an entry or write the arguments of a
 /// trait: `LeakerResult::repeater_impls()`, [`Projection::of()`](crate::Projection::of),
@@ -673,12 +108,12 @@ impl EncodeError {
     /// Returns the span of the offending parameter, argument or type.
     pub fn span(&self) -> Span {
         match self {
-            EncodeError::UnsupportedConstType(ty) => ty.span(),
+            EncodeError::UnsupportedConstType(ty)
+            | EncodeError::UnboundedTraitObject(ty)
+            | EncodeError::NeedsSelf(ty)
+            | EncodeError::AmbiguousAssociatedType(ty) => ty.span(),
             EncodeError::UnexpectedArgument(arg) => arg.span(),
             EncodeError::MissingArgument(param) => param.span(),
-            EncodeError::UnboundedTraitObject(ty) => ty.span(),
-            EncodeError::NeedsSelf(ty) => ty.span(),
-            EncodeError::AmbiguousAssociatedType(ty) => ty.span(),
         }
     }
 }
@@ -689,26 +124,473 @@ impl From<EncodeError> for syn::Error {
     }
 }
 
+/// The first argument of the Repeater for an entry: a tuple type made from the generics `iter` of
+/// the entry, each by its own name. It is the argument of `RepeaterImpl::path` for the generics an
+/// impl declares and what `Projection::of()` writes for the copy. The tuple has an element for
+/// each parameter, then the encoded lifetime bounds:
+///
+/// - a lifetime `'a` is `&'a ()`, and a type `T` is `T` (`*const T` with a `?Sized` bound, since a
+///   tuple needs `Sized` elements but the last);
+/// - a const is encoded into the slots of the Repeater (`encode_slot_const()`);
+/// - each bound of a generic on a lifetime is `&'a T` for `T: 'a` and `&'a &'b ()` for `'b: 'a`,
+///   and each lifetime `'a` of `lifetimes` (`Context::self_outlives`) adds `&'a Self`, with `Self`
+///   the type `self_ty` that stands for it.
+///
+/// Fails with `UnboundedTraitObject` if `self_ty` is a trait object without the lifetime bound that
+/// `Self: 'a` needs, and with `UnsupportedConstType` for a const of a type that has no slot.
+/// `repeater` is the path of the Repeater.
+pub(crate) fn encode_entry_args<'a>(
+    iter: impl IntoIterator<Item = &'a GenericParam>,
+    self_ty: &Type,
+    lifetimes: &[Lifetime],
+    repeater: &Path,
+) -> std::result::Result<Type, EncodeError> {
+    let params: Vec<&'a GenericParam> = iter.into_iter().collect();
+    let mut elems = params
+        .iter()
+        .map(|param| -> std::result::Result<Type, EncodeError> {
+            Ok(match param {
+                GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
+                    parse_quote!(& #lifetime ())
+                }
+                GenericParam::Const(ConstParam { ident, ty, .. }) => {
+                    encode_slot_const(repeater, ident, ty)?
+                }
+                GenericParam::Type(tp) if is_maybe_unsized(tp) => unsized_element(&tp.ident),
+                GenericParam::Type(TypeParam { ident, .. }) => parse_quote!(#ident),
+            })
+        })
+        .collect::<std::result::Result<Punctuated<Type, Token![,]>, _>>()?;
+    elems.extend(encode_outlives_bounds(&params));
+    elems.extend(encode_self_outlives(&params, self_ty, lifetimes)?);
+    Ok(Type::Tuple(TypeTuple {
+        paren_token: Default::default(),
+        elems: with_trailing_comma(elems),
+    }))
+}
+
+/// The lifetime bounds written on `param`, in order. A where predicate is not one.
+fn lifetime_bounds(param: &GenericParam) -> Vec<&Lifetime> {
+    match param {
+        GenericParam::Lifetime(param) => param.bounds.iter().collect(),
+        GenericParam::Type(param) => param
+            .bounds
+            .iter()
+            .filter_map(|bound| match bound {
+                TypeParamBound::Lifetime(lifetime) => Some(lifetime),
+                _ => None,
+            })
+            .collect(),
+        GenericParam::Const(_) => Vec::new(),
+    }
+}
+
+/// The lifetime parameter of `params` that `bound` names. The only rule that decides which bounds
+/// are encoded. `without_encoded_bounds()` keeps the others.
+fn encoded_outliving<'p>(params: &[&'p GenericParam], bound: &Lifetime) -> Option<&'p Lifetime> {
+    params.iter().find_map(|param| match param {
+        GenericParam::Lifetime(param) if param.lifetime == *bound => Some(&param.lifetime),
+        _ => None,
+    })
+}
+
+/// The generics a Repeater impl declares: `generics` without the bounds by one of its lifetime
+/// parameters (`T: 'a`, `'b: 'a`), which the encoding has. Other bounds (`T: 'static`, trait
+/// bounds) and the where clause stay.
+pub(crate) fn without_encoded_bounds(generics: &Generics) -> Generics {
+    let params: Vec<&GenericParam> = generics.params.iter().collect();
+    let mut declared = generics.clone();
+    for param in declared.params.iter_mut() {
+        match param {
+            GenericParam::Lifetime(param) => {
+                param.bounds = param
+                    .bounds
+                    .iter()
+                    .filter(|bound| encoded_outliving(&params, bound).is_none())
+                    .cloned()
+                    .collect();
+                if param.bounds.is_empty() {
+                    param.colon_token = None;
+                }
+            }
+            GenericParam::Type(param) => {
+                param.bounds = param
+                    .bounds
+                    .iter()
+                    .filter(|bound| {
+                        !matches!(bound, TypeParamBound::Lifetime(lifetime)
+                            if encoded_outliving(&params, lifetime).is_some())
+                    })
+                    .cloned()
+                    .collect();
+                if param.bounds.is_empty() {
+                    param.colon_token = None;
+                }
+            }
+            GenericParam::Const(_) => (),
+        }
+    }
+    declared
+}
+
+/// The elements encoding the lifetime bounds of `params`, after those of the parameters.
+fn encode_outlives_bounds(params: &[&GenericParam]) -> Vec<Type> {
+    let mut elems = Vec::new();
+    for param in params {
+        for bound in lifetime_bounds(param) {
+            let outliving = match encoded_outliving(params, bound) {
+                Some(outliving) => outliving,
+                None => continue,
+            };
+            let referent: Type = match param {
+                GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => {
+                    parse_quote!(& #lifetime ())
+                }
+                GenericParam::Type(TypeParam { ident, .. }) => parse_quote!(#ident),
+                GenericParam::Const(_) => continue,
+            };
+            elems.push(reference(outliving, referent));
+        }
+    }
+    elems
+}
+
+/// `&'a __S` implies `__S: 'a` wherever it is written. A declared `__S: 'a` would fail where
+/// nothing proves it, such as in a free function signature.
+pub(crate) fn encode_self_outlives(
+    params: &[&GenericParam],
+    self_ty: &Type,
+    lifetimes: &[Lifetime],
+) -> std::result::Result<Vec<Type>, EncodeError> {
+    let mut elems = Vec::new();
+    for lifetime in lifetimes {
+        if let Some(outliving) = encoded_outliving(params, lifetime) {
+            elems.push(reference(outliving, referent_of_reference(self_ty)?));
+        }
+    }
+    Ok(elems)
+}
+
+/// The reference type `&'lifetime referent`.
+fn reference(lifetime: &Lifetime, referent: Type) -> Type {
+    Type::Reference(TypeReference {
+        and_token: Default::default(),
+        lifetime: Some(lifetime.clone()),
+        mutability: None,
+        elem: Box::new(referent),
+    })
+}
+
+/// Whether `param` may be unsized: it has a `?Sized` bound, as the generics of a context do (the
+/// Leaker moves a where predicate `T: ?Sized` to the parameter).
+fn is_maybe_unsized(param: &TypeParam) -> bool {
+    param.bounds.iter().any(|bound| {
+        matches!(
+            bound,
+            TypeParamBound::Trait(TraitBound {
+                modifier: TraitBoundModifier::Maybe(_),
+                ..
+            })
+        )
+    })
+}
+
+/// The element for the `?Sized` parameter `ident`: `*const ident`, which is `Sized` whatever it
+/// points to, as a tuple needs for every element but the last.
+fn unsized_element(ident: &Ident) -> Type {
+    Type::Ptr(TypePtr {
+        star_token: Default::default(),
+        const_token: Some(Default::default()),
+        mutability: None,
+        elem: Box::new(parse_quote!(#ident)),
+    })
+}
+
+/// Returns `ty` as the referent of a reference: a trait object is parenthesized, and needs a
+/// lifetime bound, or it would take that of the reference. Only the `Self` that the caller of
+/// `Projection::of()` gives can be one.
+fn referent_of_reference(ty: &Type) -> std::result::Result<Type, EncodeError> {
+    match unwrap_type_group(ty) {
+        Type::TraitObject(object) => {
+            if !has_lifetime_bound(object) {
+                return Err(EncodeError::UnboundedTraitObject(Box::new(ty.clone())));
+            }
+            Ok(Type::Paren(TypeParen {
+                paren_token: Default::default(),
+                elem: Box::new(Type::TraitObject(object.clone())),
+            }))
+        }
+        _ => Ok(ty.clone()),
+    }
+}
+
 /// Adds a trailing comma to a single-element tuple, so that `(T,)` is not parsed as `(T)`.
-pub(crate) fn with_trailing_comma(
-    mut elems: Punctuated<Type, Token![,]>,
-) -> Punctuated<Type, Token![,]> {
+fn with_trailing_comma(mut elems: Punctuated<Type, Token![,]>) -> Punctuated<Type, Token![,]> {
     if elems.len() == 1 && !elems.trailing_punct() {
         elems.push_punct(Default::default());
     }
     elems
 }
 
-/// `value` in braces, once: a block that holds it alone (`{ M }`) is taken off first, as rustc
-/// rejects `{ { M } }` for a generic `M`.
-fn braced_const(value: &Expr) -> Expr {
-    let value = unwrap_block(value);
-    parse_quote!({ #value })
+/// Completes the arguments `given` for the generics as declared `generics`, whose leaked defaults
+/// are written already, as a [`Substitute`]: see
+/// [`Referrer::complete_args()`](crate::Referrer::complete_args) for the rules and the errors.
+pub(crate) fn complete_params<'a>(
+    generics: &Generics,
+    given: impl IntoIterator<Item = &'a GenericArgument>,
+) -> std::result::Result<Substitute, EncodeError> {
+    let mut substitute = ParamFold::new(generics);
+    let mut lifetime_args = Vec::new();
+    let mut other_args = Vec::new();
+    for arg in given {
+        substitute.names.reserve(arg);
+        match arg {
+            GenericArgument::Lifetime(_) => lifetime_args.push(arg),
+            GenericArgument::Type(_) | GenericArgument::Const(_) => other_args.push(arg),
+            _ => (),
+        }
+    }
+    let mut lifetime_args = lifetime_args.into_iter();
+    let mut other_args = other_args.into_iter();
+    let (mut lifetimes, mut others) = (HashMap::new(), HashMap::new());
+    for param in &generics.params {
+        let missing = || EncodeError::MissingArgument(Box::new(param.clone()));
+        match param {
+            GenericParam::Lifetime(LifetimeParam { lifetime, .. }) => match lifetime_args.next() {
+                Some(GenericArgument::Lifetime(arg)) => {
+                    substitute.lifetimes.insert(lifetime.clone(), arg.clone());
+                    let arg = GenericArgument::Lifetime(arg.clone());
+                    lifetimes.insert(lifetime.ident.clone(), arg);
+                }
+                _ => return Err(missing()),
+            },
+            GenericParam::Type(tp) => {
+                let ty: Type = match (other_args.next(), &tp.default) {
+                    (Some(GenericArgument::Type(ty)), _) => ty.clone(),
+                    (Some(arg), _) => {
+                        return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())))
+                    }
+                    (None, Some(default)) => substitute.default_of(default, Fold::fold_type)?,
+                    (None, None) => return Err(missing()),
+                };
+                substitute.types.insert(tp.ident.clone(), ty.clone());
+                others.insert(tp.ident.clone(), GenericArgument::Type(ty));
+            }
+            GenericParam::Const(cp) => {
+                let value: Expr = match (other_args.next(), &cp.default) {
+                    (Some(arg), _) => match const_argument(arg) {
+                        Some(value) => value,
+                        None => return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone()))),
+                    },
+                    (None, Some(default)) => substitute.default_of(default, Fold::fold_expr)?,
+                    (None, None) => return Err(missing()),
+                };
+                let arg = GenericArgument::Const(normalize_const_arg(&value));
+                others.insert(cp.ident.clone(), arg);
+                substitute.consts.insert(cp.ident.clone(), value);
+            }
+        }
+    }
+    if let Some(arg) = lifetime_args.next().or_else(|| other_args.next()) {
+        return Err(EncodeError::UnexpectedArgument(Box::new(arg.clone())));
+    }
+    Ok(Substitute {
+        lifetimes: Sorted(lifetimes),
+        others: Sorted(others),
+        bounds: Sorted(substitute.bounds),
+    })
+}
+
+/// The value that `arg` gives to a const parameter: a const argument, or a bare identifier, which
+/// is parsed as a type.
+fn const_argument(arg: &GenericArgument) -> Option<Expr> {
+    match arg {
+        GenericArgument::Const(expr) => Some(expr.clone()),
+        GenericArgument::Type(Type::Path(TypePath { qself: None, path }))
+            if path.get_ident().is_some() =>
+        {
+            Some(parse_quote!(#path))
+        }
+        _ => None,
+    }
+}
+
+/// The name that `ty` is, if it is one identifier (a type parameter, as far as the syntax tells).
+fn type_name(ty: &Type) -> Option<&Ident> {
+    match unwrap_type_group(ty) {
+        Type::Path(TypePath { qself: None, path }) => path.get_ident(),
+        _ => None,
+    }
+}
+
+/// `<value as bound>::A..` for the trait path `bound` and the segments `rest` (`A..`, with the
+/// leading `::` that [`parameter_projection()`] writes).
+fn through_bound(value: Type, bound: Path, mut rest: Path, span: Span) -> TypePath {
+    rest.leading_colon = None;
+    let position = bound.segments.len();
+    let mut segments = bound.segments;
+    segments.extend(rest.segments);
+    TypePath {
+        qself: Some(QSelf {
+            position,
+            as_token: Some(Token![as](span)),
+            ..qself_of(value, span)
+        }),
+        path: Path {
+            leading_colon: bound.leading_colon,
+            segments,
+        },
+    }
+}
+
+/// `T::A..` for the parameter `name` with the argument `value`, `rest` the path after `T`:
+/// `<value>::A` for one identifier, else `<value as Trait>::A` with `bound`, the one trait bound
+/// of `T`, or `Err(<value>::A)` without one. `fold` writes `rest`, then `bound`.
+fn projected<F: Fold>(
+    fold: &mut F,
+    name: &Ident,
+    value: Type,
+    rest: Path,
+    bound: Option<Path>,
+) -> std::result::Result<Type, Box<Type>> {
+    let rest = fold.fold_path(rest);
+    let span = name.span();
+    // rustc resolves `<value>::A` only for a type parameter.
+    if type_name(&value).is_none() {
+        if let Some(bound) = bound {
+            // The arguments of the bound may name the parameters.
+            let bound = fold.fold_path(bound);
+            return Ok(Type::Path(through_bound(value, bound, rest, span)));
+        }
+        return Err(Box::new(Type::Path(TypePath {
+            qself: Some(qself_of(value, span)),
+            path: rest,
+        })));
+    }
+    Ok(Type::Path(TypePath {
+        qself: Some(qself_of(value, span)),
+        path: rest,
+    }))
+}
+
+/// The name `T` and the rest of the path if `ty` is an associated type of it, `T::A..` or
+/// `<T>::A..` (`T` one identifier, with no arguments). The rest has a leading `::`, as
+/// `projection()` writes it.
+fn parameter_projection(ty: &TypePath) -> Option<(&Ident, Path)> {
+    match &ty.qself {
+        None => Some((projection_head(&ty.path)?, after_head(&ty.path))),
+        Some(QSelf {
+            ty: head,
+            position: 0,
+            as_token: None,
+            ..
+        }) => Some((
+            type_name(head)?,
+            Path {
+                leading_colon: Some(Default::default()),
+                segments: ty.path.segments.clone(),
+            },
+        )),
+        _ => None,
+    }
+}
+
+/// The one trait bound of `param`, inline or in a where predicate, without associated type
+/// bindings (`Iterator` for `T: Iterator<Item = u8>`). `None` for none, several, or one with a
+/// `for<'a>` binder; lifetime bounds and `?Sized` do not count.
+fn single_bound(param: &TypeParam, where_clause: Option<&WhereClause>) -> Option<Path> {
+    let predicates = where_clause
+        .into_iter()
+        .flat_map(|where_clause| where_clause.predicates.iter())
+        .filter_map(|predicate| match predicate {
+            WherePredicate::Type(PredicateType {
+                lifetimes: None,
+                bounded_ty,
+                bounds,
+                ..
+            }) if type_name(bounded_ty) == Some(&param.ident) => Some(bounds.iter()),
+            _ => None,
+        })
+        .flatten();
+    let mut found = None;
+    for bound in param.bounds.iter().chain(predicates) {
+        match bound {
+            TypeParamBound::Lifetime(_)
+            | TypeParamBound::Trait(TraitBound {
+                modifier: TraitBoundModifier::Maybe(_),
+                ..
+            }) => (),
+            TypeParamBound::Trait(bound) if found.is_none() && bound.lifetimes.is_none() => {
+                found = Some(bound.path.clone());
+            }
+            _ => return None,
+        }
+    }
+    let mut path = found?;
+    if let Some(last) = path.segments.last_mut() {
+        match &mut last.arguments {
+            PathArguments::AngleBracketed(args) => {
+                args.args = std::mem::take(&mut args.args)
+                    .into_iter()
+                    .filter(|arg| {
+                        !matches!(
+                            arg,
+                            GenericArgument::AssocType(_)
+                                | GenericArgument::AssocConst(_)
+                                | GenericArgument::Constraint(_)
+                        )
+                    })
+                    .collect();
+                if args.args.is_empty() {
+                    last.arguments = PathArguments::None;
+                }
+            }
+            PathArguments::Parenthesized(args) => args.output = ReturnType::Default,
+            PathArguments::None => (),
+        }
+    }
+    Some(path)
+}
+
+/// Braces everything but a literal or an identifier, or it could parse as a type.
+fn normalize_const_arg(expr: &Expr) -> Expr {
+    let inner = unwrap_block(expr);
+    let is_simple = match inner {
+        Expr::Lit(_) => true,
+        Expr::Path(ExprPath {
+            qself: None, path, ..
+        }) => path.get_ident().is_some(),
+        Expr::Unary(ExprUnary {
+            op: UnOp::Neg(_),
+            expr,
+            ..
+        }) => matches!(expr.as_ref(), Expr::Lit(_)),
+        _ => false,
+    };
+    if is_simple {
+        inner.clone()
+    } else {
+        parse_quote!({ #inner })
+    }
+}
+
+fn unwrap_block(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Block(ExprBlock {
+            attrs,
+            label: None,
+            block,
+        }) if attrs.is_empty() && block.stmts.len() == 1 => match &block.stmts[0] {
+            Stmt::Expr(inner, None) => unwrap_block(inner),
+            _ => expr,
+        },
+        _ => expr,
+    }
 }
 
 /// The fold of [`complete_params()`]: it writes the default of a parameter with the
 /// arguments of the parameters before it.
-pub(crate) struct ParamFold {
+struct ParamFold {
     /// The argument of each type parameter completed so far.
     types: HashMap<Ident, Type>,
     /// The one trait bound of each type parameter that has exactly one, without its associated type
@@ -752,6 +634,20 @@ impl ParamFold {
         }
     }
 
+    /// The `default` of a parameter written by `fold` with the arguments so far, or the first
+    /// associated type in it that could not be written.
+    fn default_of<T: Clone>(
+        &mut self,
+        default: &T,
+        fold: impl FnOnce(&mut Self, T) -> T,
+    ) -> std::result::Result<T, EncodeError> {
+        let value = fold(self, default.clone());
+        match self.error.take() {
+            Some(error) => Err(error),
+            None => Ok(value),
+        }
+    }
+
     /// The argument that `ty` is the parameter of.
     fn type_argument(&self, ty: &Type) -> Option<Type> {
         match ty {
@@ -788,38 +684,6 @@ impl ParamFold {
     fn lifetime(&self, lifetime: Lifetime) -> Lifetime {
         self.lifetimes.get(&lifetime).cloned().unwrap_or(lifetime)
     }
-
-    /// `T::A..` for the earlier parameter `name`, with `value` as its argument and `rest` the path
-    /// after it: `<value>::A` if `value` is an identifier (a type parameter, which rustc resolves),
-    /// else `<value as Trait>::A` with the one bound of the parameter. `original` stays if there is
-    /// none, and the error is kept.
-    fn projected(&mut self, name: &Ident, value: Type, rest: Path, original: Type) -> Type {
-        let rest = syn::fold::fold_path(self, rest);
-        if type_name(&value).is_some() {
-            return Type::Path(TypePath {
-                qself: Some(qself_of(value, name.span())),
-                path: rest,
-            });
-        }
-        match self.bounds.get(name).cloned() {
-            Some(bound) => {
-                // The arguments of the bound may name the earlier parameters.
-                let bound = syn::fold::fold_path(self, bound);
-                Type::Path(through_bound(value, bound, rest, name.span()))
-            }
-            None => {
-                let ambiguous = TypePath {
-                    qself: Some(qself_of(value, name.span())),
-                    path: rest,
-                };
-                self.error
-                    .get_or_insert(EncodeError::AmbiguousAssociatedType(Box::new(Type::Path(
-                        ambiguous,
-                    ))));
-                original
-            }
-        }
-    }
 }
 
 impl syn::fold::Fold for ParamFold {
@@ -832,7 +696,16 @@ impl syn::fold::Fold for ParamFold {
             if let Some((name, rest)) = parameter_projection(path) {
                 let name = name.clone();
                 if let Some(value) = self.types.get(&name).cloned() {
-                    return self.projected(&name, value, rest, ty);
+                    let bound = self.bounds.get(&name).cloned();
+                    return match projected(self, &name, value, rest, bound) {
+                        Ok(projected) => projected,
+                        // `ty` stays, and the error is kept.
+                        Err(ambiguous) => {
+                            let error = EncodeError::AmbiguousAssociatedType(ambiguous);
+                            self.error.get_or_insert(error);
+                            ty
+                        }
+                    };
                 }
             }
         }
@@ -868,6 +741,13 @@ impl Site for ParamFold {
     fn names(&mut self) -> &mut FreshLifetimes {
         &mut self.names
     }
+}
+
+/// `value` in braces, once: a block that holds it alone (`{ M }`) is taken off first, as rustc
+/// rejects `{ { M } }` for a generic `M`.
+fn braced_const(value: &Expr) -> Expr {
+    let value = unwrap_block(value);
+    parse_quote!({ #value })
 }
 
 /// Replaces the names in `args` by what `f` gives for them: the arguments of a use site.
@@ -942,23 +822,34 @@ pub fn substitute_args<'a>(
     args: impl IntoIterator<Item = &'a mut GenericArgument>,
     mut f: impl FnMut(&Ident) -> Option<GenericArgument>,
 ) -> std::result::Result<(), EncodeError> {
-    let mut answers = Answers::new(|name: &Ident, _: Kind| f(name), false);
-    substitute_in(&mut answers, args.into_iter().collect(), None)
+    let answer = |name: &Ident, _: Kind| f(name);
+    substitute_in(answer, args.into_iter().collect(), Mode::Args)
 }
 
-/// The substitution of [`substitute_args()`] with the answers that `answers` has and asks for.
-/// With `bounds` it is that of a [`Substitute`]: it writes `T::A` through them, and never fails.
+/// What [`substitute_in()`] writes.
+#[derive(Clone, Copy)]
+enum Mode<'b> {
+    /// The arguments of [`substitute_args()`]: a name is asked once whatever its kind, and what
+    /// does not fit is an error.
+    Args,
+    /// The items of an impl, for a [`Substitute`]: a lifetime and a type of one name are two
+    /// questions, `T::A` is written through the one trait bound of `T`, and nothing fails.
+    Impl(&'b HashMap<Ident, Path>),
+}
+
+/// The substitution of [`substitute_args()`], with the answers of `answer`, as `mode` says.
 fn substitute_in<F: FnMut(&Ident, Kind) -> Option<GenericArgument>>(
-    answers: &mut Answers<F>,
+    answer: F,
     mut args: Vec<&mut GenericArgument>,
-    bounds: Option<&HashMap<Ident, Path>>,
+    mode: Mode,
 ) -> std::result::Result<(), EncodeError> {
+    let mut answers = Answers::new(answer, matches!(mode, Mode::Impl(_)));
     // The first pass asks for the names; what it writes is dropped.
     let mut asking = SiteFold {
-        answers: &mut *answers,
+        answers: &mut answers,
         names: FreshLifetimes::default(),
         naming: false,
-        bounds,
+        mode,
         error: None,
     };
     for arg in &args {
@@ -973,10 +864,10 @@ fn substitute_in<F: FnMut(&Ident, Kind) -> Option<GenericArgument>>(
         names.reserve(value);
     }
     let mut writing = SiteFold {
-        answers,
+        answers: &mut answers,
         names,
         naming: true,
-        bounds,
+        mode,
         error: None,
     };
     let written: Vec<GenericArgument> = args
@@ -984,7 +875,7 @@ fn substitute_in<F: FnMut(&Ident, Kind) -> Option<GenericArgument>>(
         .map(|arg| writing.fold_generic_argument((**arg).clone()))
         .collect();
     // A `Substitute` leaves what does not fit as it is: rustc reports it.
-    if let Some(error) = writing.error.filter(|_| bounds.is_none()) {
+    if let Some(error) = writing.error.filter(|_| matches!(mode, Mode::Args)) {
         return Err(error);
     }
     for (arg, written) in args.iter_mut().zip(written) {
@@ -1052,18 +943,15 @@ pub struct Substitute {
 impl Substitute {
     /// Substitutes the argument `arg` as a unit.
     fn write(&self, arg: &mut GenericArgument) {
-        let mut answers = Answers::new(
-            |name: &Ident, kind: Kind| {
-                let found = match kind {
-                    Kind::Lifetime => &self.lifetimes,
-                    Kind::TypeOrConst => &self.others,
-                };
-                found.get(name).cloned()
-            },
-            true,
-        );
+        let answer = |name: &Ident, kind: Kind| {
+            let found = match kind {
+                Kind::Lifetime => &self.lifetimes,
+                Kind::TypeOrConst => &self.others,
+            };
+            found.get(name).cloned()
+        };
         // It leaves what does not fit as it is, and never fails.
-        let _ = substitute_in(&mut answers, vec![arg], Some(&self.bounds));
+        let _ = substitute_in(answer, vec![arg], Mode::Impl(&self.bounds));
     }
 }
 
@@ -1233,9 +1121,8 @@ struct SiteFold<'f, F> {
     names: FreshLifetimes,
     /// Whether it names the elided lifetime of a signature. The first pass writes nothing.
     naming: bool,
-    /// The one trait bound of each type parameter, for the fold of a [`Substitute`]: `T::A` is
-    /// written through it, and never refused.
-    bounds: Option<&'f HashMap<Ident, Path>>,
+    /// What it writes: the arguments of [`substitute_args()`], or the items for a [`Substitute`].
+    mode: Mode<'f>,
     /// The first value that did not fit its place, or associated type that could not be written.
     error: Option<EncodeError>,
 }
@@ -1244,37 +1131,6 @@ impl<F: FnMut(&Ident, Kind) -> Option<GenericArgument>> SiteFold<'_, F> {
     fn misfit(&mut self, value: GenericArgument) {
         self.error
             .get_or_insert(EncodeError::UnexpectedArgument(Box::new(value)));
-    }
-
-    /// `T::A..` for the name `T` with `value` and `rest` the path after it: `<value>::A`, which
-    /// rustc takes only if `value` is an identifier (a type parameter). For any other type the
-    /// trait is needed: a `Substitute` writes it from the bound of `T` (and `<value>::A` if there is
-    /// none), else the bounds of `T` are not known: `original` stays, and the error is kept.
-    fn projected(&mut self, name: &Ident, value: Type, rest: Path, original: Type) -> Type {
-        let rest = self.fold_path(rest);
-        let span = name.span();
-        if type_name(&value).is_none() {
-            if let Some(bounds) = self.bounds {
-                if let Some(bound) = bounds.get(name).cloned() {
-                    let bound = self.fold_path(bound);
-                    return Type::Path(through_bound(value, bound, rest, span));
-                }
-            } else {
-                let ambiguous = TypePath {
-                    qself: Some(qself_of(value, span)),
-                    path: rest,
-                };
-                self.error
-                    .get_or_insert(EncodeError::AmbiguousAssociatedType(Box::new(Type::Path(
-                        ambiguous,
-                    ))));
-                return original;
-            }
-        }
-        Type::Path(TypePath {
-            qself: Some(qself_of(value, span)),
-            path: rest,
-        })
     }
 
     /// The type for `name`, if there is an answer: only a type fits.
@@ -1291,15 +1147,11 @@ impl<F: FnMut(&Ident, Kind) -> Option<GenericArgument>> SiteFold<'_, F> {
     /// The const for `name`, if there is an answer, written as the expression `{ value }`: a const,
     /// or a type that is one identifier (a bare const argument is parsed as a type).
     fn braced_const_for(&mut self, name: &Ident) -> Option<Expr> {
-        match self.answers.of(name, Kind::TypeOrConst)? {
-            GenericArgument::Const(value) => Some(braced_const(&value)),
-            GenericArgument::Type(Type::Path(TypePath { qself: None, path }))
-                if path.get_ident().is_some() =>
-            {
-                Some(parse_quote!({ #path }))
-            }
-            value => {
-                self.misfit(value);
+        let answer = self.answers.of(name, Kind::TypeOrConst)?;
+        match const_argument(&answer) {
+            Some(value) => Some(braced_const(&value)),
+            None => {
+                self.misfit(answer);
                 None
             }
         }
@@ -1374,7 +1226,21 @@ impl<F: FnMut(&Ident, Kind) -> Option<GenericArgument>> syn::fold::Fold for Site
             if let Some((name, rest)) = parameter_projection(path_ty) {
                 let name = name.clone();
                 if let Some(value) = self.type_for(&name) {
-                    return self.projected(&name, value, rest, ty);
+                    let bound = match self.mode {
+                        Mode::Impl(bounds) => bounds.get(&name).cloned(),
+                        Mode::Args => None,
+                    };
+                    return match projected(self, &name, value, rest, bound) {
+                        Ok(projected) => projected,
+                        // A `Substitute` writes it, and leaves the failure to rustc.
+                        Err(ambiguous) if matches!(self.mode, Mode::Impl(_)) => *ambiguous,
+                        // The bounds of `T` are not known: `ty` stays, and the error is kept.
+                        Err(ambiguous) => {
+                            let error = EncodeError::AmbiguousAssociatedType(ambiguous);
+                            self.error.get_or_insert(error);
+                            ty
+                        }
+                    };
                 }
             }
         }
