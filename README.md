@@ -9,9 +9,14 @@
 
 <p align="center"><img src="https://raw.githubusercontent.com/yasuo-ozu/type-leak/main/logo.png" alt="type-leak" width="240"></p>
 
-A name in Rust means something only where it is written. When a proc macro copies `fn get(&self) -> MyType` from crate A into code that crate B expands, the copy looks up `MyType` in crate B and finds nothing, or the wrong type.
+A path in Rust means something only where it is written. Say a proc macro copies
+`fn get(&self) -> MyType` from crate A into crate B. In crate B, the copy looks up `MyType` again.
+It finds nothing, or another type.
 
-`type-leak` fixes this for proc-macro authors. In crate A, it finds the types that depend on where they are written, and describes for each a small impl of a shared trait, the *Repeater*, which your macro emits. In crate B, it rewrites the copy so that each such type is written `<Self as Repeater<..>>::Type`.
+`type-leak` solves this for proc-macro authors. In crate A, it finds the types that depend on where
+they are written. Your macro writes an impl of one shared trait, the Repeater, for each of them. In
+crate B, `type-leak` rewrites the copy to reach each type through that trait:
+`<Self as Repeater<..>>::Type`.
 
 # How it works
 
@@ -22,73 +27,98 @@ A name in Rust means something only where it is written. When a proc macro copie
  1. Analyze the item:                         3. Rewrite the copy:
     Leaker --> Referrer ------ as tokens --->    fn f(&self) -> MyType
                                                  becomes
- 2. Emit the Repeater impls:                     fn f(&self) -> <Self as Repeater<..>>::Type
+ 2. Write the Repeater impls:                    fn f(&self) -> <Self as Repeater<..>>::Type
     impl Repeater<..> for .. {                                         |
         type Type = MyType;  <-----------------------------------------+
     }
 ```
 
-- The **Leaker** analyzes the item. Its result, the **Referrer**, lists the *entries*: the types that depend on where they are written (`MyType`, `Wrap<Self>`, `MyWrap<T>`). It travels to crate B as tokens.
-- The **Repeater** is a trait defined once at the root of crate A, not in the proc-macro crate (`repeater_definition()` generates it):
+- **Crate A** defines the item, and **crate B** copies it, each with a proc macro. The **copy** is
+  what crate B's macro writes.
+- An **entry** is a type of the item that depends on where it is written (`MyType`, `MyWrap<T>`,
+  `Wrap<Self>`). `type-leak` *leaks* it: crate B reaches it through the Repeater. By default every
+  relative path is an entry, even `u8`, and so is a type of another crate (`::serde::Value`). Give
+  the Leaker [`Rules`] to have the copy write such paths as they are, if they mean the same in
+  crate B.
+- The **Leaker** analyzes the item in crate A. Its result holds the **Referrer**, the list of the
+  entries. Crate A's macro writes one Repeater impl for each entry, and passes the Referrer to
+  crate B as tokens. There, the Referrer rewrites the copy.
+- The **Repeater** is the one trait that both crates see. Define it once, at the root of crate A
+  ([`repeater_definition()`] writes it). It cannot be in the proc-macro crate: its impls are for
+  any type, and only a local trait allows that.
 
   ```rust,ignore
-  pub trait Repeater<T: ?Sized, const KEY: u128, /* one const slot per primitive const type except usize and u128 */> {
+  pub trait Repeater<T: ?Sized, const KEY: u128, /* const slots */> {
       type Type: ?Sized;
   }
   ```
 
-  `KEY` = `Projection::key(ENTRY)`: its high half is the Leaker's id (the `id` of the `Projection` that both crates build, which `repeater_impls` and `Projection::of` take), its low half is the `EntryId` of the entry, and `T` encodes the generics the entry uses.
+  `T` encodes the generics that the entry uses. `KEY` holds the Leaker's id and the [`EntryId`] of
+  the entry, so each entry has its own impl.
+- A [`Projection`] says how to write the Repeater: its path, the Leaker's id, and what the impls
+  are for. Both crates need the same id and `impl_self`.
 
 # Quick start
 
 ```rust
 use syn::visit_mut::VisitMut;
-use syn::{parse_quote, ItemImpl, ItemTrait, Path};
+use syn::{parse_quote, ItemImpl, ItemTrait};
 use type_leak::{ImplSelf, Leaker, Projection};
 
 let item: ItemTrait = parse_quote! {
-    pub trait MyLeaker<T> {
+    pub trait MyTrait<T> {
         fn f(&self, t: T) -> MyWrap<T>;
         fn g(&self) -> MyType;
     }
 };
 
-// Crate A: analyze the trait, and write one Repeater impl per entry (`42` is the ID).
+// Crate A: analyze the trait. Keep its `ContextId`: crate B needs it.
 let mut leaker = Leaker::new();
 let top_level = leaker.intern_trait(&item);
 let result = leaker.result();
-let projection = Projection::new(parse_quote!(path::Repeater), 42, ImplSelf::Param(parse_quote!(__S)));
+
+// Write one Repeater impl for each entry. The Repeater is `path::Repeater`, `42` is the id of
+// this Leaker (each Leaker of crate A needs its own), and the impls are for any type `__S`.
+let projection = Projection::new(
+    parse_quote!(path::Repeater),
+    42,
+    ImplSelf::Param(parse_quote!(__S)),
+);
 let impls: Vec<ItemImpl> = result
     .repeater_impls(&projection)
     .unwrap()
     .into_iter()
     .map(|r| parse_quote!(#r))
     .collect();
+// The entries are `MyWrap<T>` (0) and `MyType` (1). The `KEY` tells them apart.
+let (wrap, my_type) = (projection.key(parse_quote!(0)), projection.key(parse_quote!(1)));
 assert_eq!(impls.len(), 2);
-let referrer = result.finish().unwrap();
+assert_eq!(impls[1], parse_quote! {
+    impl<__S: ?::core::marker::Sized> path::Repeater<(), #my_type> for __S {
+        type Type = MyType;
+    }
+});
+let referrer = result.finish().unwrap(); // `Ok`: there are no errors.
 
-// Crate B: copy the methods of the trait into `impl<U> MyLeaker<U> for Foo`. The visitor writes
-// each entry as `<Self as Repeater<..>>::Type`, by the names of its own generics.
+// Crate B: copy the methods into `impl<U> MyTrait<U> for Foo`.
 let mut imp: ItemImpl = parse_quote! {
-    impl<U> MyLeaker<U> for Foo {
+    impl<U> MyTrait<U> for Foo {
         fn f(&self, t: T) -> MyWrap<T> { todo!() }
         fn g(&self) -> MyType { todo!() }
     }
 };
+// Replace each entry with its path through the Repeater.
 referrer.visitor(top_level, &projection).visit_item_impl_mut(&mut imp);
-
-// Write the arguments of the impl into its items, not into its header, which declares the
-// generics itself: the trait's `T` is `U`.
+// Write the arguments of the impl into its items: the trait's `T` is `U` here.
 let mut substitute = referrer
     .complete_args(top_level, &[parse_quote!(U)], &projection)
     .unwrap();
 substitute.visit_item_impl_mut(&mut imp);
 
-let (wrap, my_type) = (projection.key(parse_quote!(0)), projection.key(parse_quote!(1)));
 assert_eq!(
     imp,
     parse_quote! {
-        impl<U> MyLeaker<U> for Foo {
+        impl<U> MyTrait<U> for Foo {
             fn f(&self, t: U) -> <Self as path::Repeater<(U,), #wrap>>::Type { todo!() }
             fn g(&self) -> <Self as path::Repeater<(), #my_type>>::Type { todo!() }
         }
@@ -96,19 +126,69 @@ assert_eq!(
 );
 ```
 
-The visitor rewrites only the entries. The rest of the copy is yours to write: `Referrer::complete_args` takes the arguments of the impl, completes the omitted ones with the defaults of the parameters of the trait (a leaked type in a default is written through the Repeater too), and returns a `Substitute`. That visitor writes the arguments into the types and the lifetimes of the items you give it (`&'a self`, `T: 'a`, `where Self: 'a`), also into the arguments of the paths through the Repeater (`(T,)` is `(U,)`). Give it the items or the whole impl: it leaves the header, which declares the generics itself, and the items nested in a body. `substitute_args` does the same for single arguments, with a closure that answers each name (`Self` too). An associated type of a type that is not a type parameter (`T::Item` for `T` as `IntoIter<u8>`) needs its trait: `complete_args` and `Substitute` write `<IntoIter<u8> as Iterator>::Item` from the bound of the parameter, inline or in the where clause, and `substitute_args` refuses it (`EncodeError::AmbiguousAssociatedType`) unless the copy has `<T as Iterator>::Item`.
+The visitor replaces only the entries. [`Referrer::complete_args()`] pairs the parameters of the
+trait with the arguments of the impl, and uses the defaults for missing arguments. The
+[`Substitute`] that it returns writes the arguments into the items (`T` and `(T,)` become `U` and
+`(U,)`). Skip this step if the copy declares the generics of the trait itself, with the same names
+and bounds (`impl<T> MyTrait<T> for Foo`).
 
-If the item has a part that cannot be leaked (`MyType<'_>`), the `Leaker` copies it as written and records an error: `finish()` is then `Err` until every error is accepted with `allow()` (the part is copied as written) or `ignore()`. The `Err` is a `LeakerResultError`: it reads as a slice of `ErrorItem`s, writes a `compile_error!` for each with `ToTokens`, and becomes one `syn::Error` with `?`. Report the errors one by one with `ErrorItem::emit()` (on nightly, a diagnostic with the notes and the help at their own spans), or with `ErrorItem::to_compile_error()`.
+# Errors and recovery
 
-In real macros, crate A passes `referrer` and `top_level` to crate B as tokens (`ToTokens` / `Parse`), usually through an exported `macro_rules!`. [`examples/two-macros`](https://github.com/yasuo-ozu/type-leak/tree/main/examples/two-macros) is a complete, tested setup.
+Some parts cannot be leaked. `MyType<'_>` is one: its path depends on where it is written, and its
+elided lifetime cannot be leaked. The Leaker records an error for it and goes on, and the copy
+writes that part as written. Each error has a help that says what to write instead.
+
+[`finish()`] returns the Referrer only when no error remains. So your macro either:
+
+- reports the errors, with `finish()?` (one `syn::Error` for all of them) or with
+  [`ErrorItem::emit()`] for each error; or
+- accepts them first, with [`allow()`], [`ignore()`] or [`ignore_if()`]. You promise that the part
+  compiles as written in crate B.
+
+See [errors and recovery] and the [limitations] in the docs of the `Leaker`.
+
+# In real macros
+
+Crate A's macro cannot see the input of crate B's macro. So it usually exports a `macro_rules!`
+for crate B to call. That macro adds the Referrer, the `ContextId`, the Leaker's id and
+`$crate::Repeater` to the input (as tokens: `ToTokens` and `Parse`), and calls crate B's proc
+macro. Both macros must use the same version of `type-leak`. [`examples/two-macros`] is a
+complete, tested setup.
 
 # Learn more
 
-- [API docs](https://docs.rs/type-leak/latest/type_leak/). Start with:
-  - [`Leaker`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html), which analyzes an item: [`intern_trait`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#method.intern_trait) and the other `intern_*` methods for a whole item, [`enter_impl`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#method.enter_impl) and the other `enter_*` methods for parts of one.
-  - [`LeakerResult`](https://docs.rs/type-leak/latest/type_leak/struct.LeakerResult.html), what `Leaker::result()` returns: the `Referrer` and the errors, and [`repeater_impls`](https://docs.rs/type-leak/latest/type_leak/struct.LeakerResult.html#method.repeater_impls) in crate A.
-  - [`Referrer`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html): [`visitor`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.visitor) in crate B, which writes the path through the Repeater ([`Projection::of`](https://docs.rs/type-leak/latest/type_leak/struct.Projection.html#method.of)) for each entry, and [`complete_args`](https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.complete_args), [`Substitute`](https://docs.rs/type-leak/latest/type_leak/struct.Substitute.html) and [`substitute_args`](https://docs.rs/type-leak/latest/type_leak/fn.substitute_args.html) for the arguments of an impl. An entry is named by its [`EntryId`](https://docs.rs/type-leak/latest/type_leak/struct.EntryId.html).
-  - [`repeater_definition`](https://docs.rs/type-leak/latest/type_leak/fn.repeater_definition.html), which generates the Repeater trait, and [`Projection`](https://docs.rs/type-leak/latest/type_leak/struct.Projection.html), which says how both crates name it (its path, the Leaker's id, what its impls are for) and gives its `KEY`.
-  - [`ErrorItem`](https://docs.rs/type-leak/latest/type_leak/struct.ErrorItem.html), the error of the `Leaker`. The `Leaker` [recovers from errors](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#errors-and-recovery) and goes on. [`LeakerResultError`](https://docs.rs/type-leak/latest/type_leak/struct.LeakerResultError.html) holds the errors that `finish()` returns.
-- [Limitations of the `Leaker`](https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#limitations): what cannot be leaked. An error carries a `help` that says what to write instead.
-- [`examples/two-macros`](https://github.com/yasuo-ozu/type-leak/tree/main/examples/two-macros): a complete, tested pair of proc macros.
+- [`Leaker`]: the `intern_*` methods analyze a whole item ([`intern_trait()`]), and the `enter_*`
+  methods parts of one ([`enter_impl()`]). [`Leaker::with_rule()`] takes the [`Rules`].
+- [`LeakerResult`]: [`repeater_impls()`] in crate A, and [`finish()`] for the Referrer.
+- [`Referrer`]: its [`Visitor`] rewrites the copy. [`complete_args()`], [`Substitute`] and
+  [`substitute_args()`] write the arguments of an impl.
+- [`Projection`] and [`repeater_definition()`]: the Repeater.
+- [`ErrorItem`] and [`LeakerResultError`]: the errors.
+- [`examples/two-macros`]: a complete, tested pair of proc macros.
+
+[`Leaker`]: https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html
+[`intern_trait()`]: https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#method.intern_trait
+[`enter_impl()`]: https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#method.enter_impl
+[`Leaker::with_rule()`]: https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#method.with_rule
+[errors and recovery]: https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#errors-and-recovery
+[limitations]: https://docs.rs/type-leak/latest/type_leak/struct.Leaker.html#limitations
+[`Rules`]: https://docs.rs/type-leak/latest/type_leak/struct.Rules.html
+[`LeakerResult`]: https://docs.rs/type-leak/latest/type_leak/struct.LeakerResult.html
+[`repeater_impls()`]: https://docs.rs/type-leak/latest/type_leak/struct.LeakerResult.html#method.repeater_impls
+[`finish()`]: https://docs.rs/type-leak/latest/type_leak/struct.LeakerResult.html#method.finish
+[`allow()`]: https://docs.rs/type-leak/latest/type_leak/struct.LeakerResult.html#method.allow
+[`ignore()`]: https://docs.rs/type-leak/latest/type_leak/struct.LeakerResult.html#method.ignore
+[`ignore_if()`]: https://docs.rs/type-leak/latest/type_leak/struct.LeakerResult.html#method.ignore_if
+[`LeakerResultError`]: https://docs.rs/type-leak/latest/type_leak/struct.LeakerResultError.html
+[`ErrorItem`]: https://docs.rs/type-leak/latest/type_leak/struct.ErrorItem.html
+[`ErrorItem::emit()`]: https://docs.rs/type-leak/latest/type_leak/struct.ErrorItem.html#method.emit
+[`Referrer`]: https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html
+[`complete_args()`]: https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.complete_args
+[`Referrer::complete_args()`]: https://docs.rs/type-leak/latest/type_leak/struct.Referrer.html#method.complete_args
+[`Visitor`]: https://docs.rs/type-leak/latest/type_leak/struct.Visitor.html
+[`Substitute`]: https://docs.rs/type-leak/latest/type_leak/struct.Substitute.html
+[`substitute_args()`]: https://docs.rs/type-leak/latest/type_leak/fn.substitute_args.html
+[`EntryId`]: https://docs.rs/type-leak/latest/type_leak/struct.EntryId.html
+[`Projection`]: https://docs.rs/type-leak/latest/type_leak/struct.Projection.html
+[`repeater_definition()`]: https://docs.rs/type-leak/latest/type_leak/fn.repeater_definition.html
+[`examples/two-macros`]: https://github.com/yasuo-ozu/type-leak/tree/main/examples/two-macros

@@ -7,35 +7,35 @@ use crate::result::Allow;
 
 use syn::*;
 
-/// The handle that a scope of the [`Leaker`](crate::Leaker) gives to its closure. Pass it the
+/// The handle that a scope of the [`Leaker`](crate::Leaker) gives to its closure: give it the
 /// syntax to analyze.
 ///
-/// The `visit_*` methods analyze one kind of syntax each, and [`View::check()`] looks at a type
+/// The `visit_*` methods analyze one kind of syntax each, and [`View::check()`] tests a type
 /// without recording anything. The `enter_*` methods open a nested scope: its generics are local,
-/// and the generics around stay in scope. `Self` is what the scope declares: `enter_generics()`
-/// keeps the one around, so naming it is an error only where none is (at the top). A nested scope
-/// returns the id and the result, but no errors: the outermost call records them
-/// ([`Leaker::result()`](crate::Leaker::result)).
+/// and the generics around stay in scope. `Self` is what the scope declares (`enter_generics()`
+/// keeps the `Self` around). A nested scope returns its context and the result of the closure,
+/// but no errors: the outermost call records them.
 ///
-/// `View` also implements [`Visit`](syn::visit::Visit): `syn::visit::visit_item_struct(view,
+/// `A` is the [`Allow`] rule of the Leaker. A helper takes a `View` as
+/// `fn f<A: Allow>(view: &mut View<'_, '_, A>)`.
+///
+/// `View` implements [`Visit`](syn::visit::Visit) too. In the scope of
+/// [`Leaker::enter_type()`](crate::Leaker::enter_type), `syn::visit::visit_item_struct(view,
 /// &item)` does what [`Leaker::intern_struct()`](crate::Leaker::intern_struct) does. The walk
-/// declares nothing, so walk the item the scope is for. For an impl, `enter_impl()` with
-/// `syn::visit::visit_item_impl(view, &item)` does what
-/// [`Leaker::intern_impl()`](crate::Leaker::intern_impl) does, except that it does not cut the
-/// entries in the self type if a bound of the impl names `Self` (`intern_impl()` rejects or copies
-/// them as written): use `intern_impl()` for such an impl. `visit_signature` analyzes the
-/// signature in a scope of its own for its generics, and reports a method lifetime that the copy
-/// would leave unconstrained (E0195, [Method lifetimes](crate::Leaker#method-lifetimes), not in an
-/// inherent impl) and an elided output lifetime that it could not resolve (E0106, [Elided
-/// lifetimes](crate::Leaker#elided-lifetimes)).
-/// `visit_path` at the root analyzes only the arguments of the path: to check the root too, use
-/// [`View::visit_type_param_bound()`].
+/// declares nothing, so walk only the item that the scope is for. For an impl, use
+/// [`Leaker::intern_impl()`](crate::Leaker::intern_impl): `visit_item_impl` in `enter_impl()` is
+/// the same, but does not report the entries in the self type when a bound of the impl names
+/// `Self`. Also:
 ///
-/// `A` is the [`Allow`] of the Leaker: a helper takes a `View` as `fn f<A: Allow>(view: &mut
-/// View<'_, '_, A>)`.
+/// - `visit_signature` analyzes the signature in its own scope for its generics. It reports a
+///   method lifetime that the copy leaves unconstrained (E0195, not in an inherent impl; see
+///   [Method lifetimes](crate::Leaker#method-lifetimes)), and an elided output lifetime that the
+///   copy cannot resolve (E0106; see [Elided lifetimes](crate::Leaker#elided-lifetimes)).
+/// - `visit_path` outside a type analyzes only the arguments of the path. To check the path too,
+///   use [`View::visit_type_param_bound()`].
 ///
-/// A function that is itself the analyzed item has no local generics, so do not visit its
-/// signature. Enter a scope that declares its generics, and visit its types and where clause:
+/// For a function that is the analyzed item, do not visit its signature: its generics would be
+/// local to it. Enter a scope that declares its generics, and visit its types and where clause:
 ///
 /// ```
 /// # use type_leak::*;
@@ -57,11 +57,10 @@ impl<'v, 'a, A: Allow> View<'v, 'a, A> {
         Self { visitor }
     }
 
-    /// Checks whether `ty` must become an entry, and whether it can ([`CheckResult`]), without
-    /// recording anything.
+    /// Tells whether `ty` must be leaked, and whether it can be ([`CheckResult`]).
     ///
-    /// It finds what [`View::visit_type()`] finds in `ty` here, and leaves no entry, context or
-    /// error in the Leaker.
+    /// It finds what [`View::visit_type()`] would find in `ty` here, but leaves no entry, context
+    /// or error in the Leaker.
     pub fn check(&mut self, ty: &Type) -> CheckResult {
         self.visitor.check(ty)
     }
@@ -143,30 +142,29 @@ impl<A: Allow> View<'_, '_, A> {
         self.visitor.walk_item_impl(item)
     }
 
-    /// Analyzes a nested item (a struct, trait, impl, function, ..).
+    /// Analyzes a nested item (a struct, a trait, an impl, a function, ..).
     ///
-    /// Its generics are local and the generics around stay in scope; to make the generics of an
-    /// item the root, use an `intern_*` method. A struct, enum, union, trait or impl declares its
-    /// own `Self` ([`Referrer::visitor()`](crate::Referrer::visitor) finds its
-    /// entries); the other items keep the one around. The copy must nest the same scopes as the
-    /// Leaker did.
+    /// Its generics are local, and the generics around stay in scope. To make the generics of an
+    /// item the root, use an `intern_*` method instead. A struct, enum, union, trait or impl
+    /// declares its own `Self`, and [`Referrer::visitor()`](crate::Referrer::visitor) finds its
+    /// entries; other items keep the `Self` around. The copy must nest the same scopes.
     ///
-    /// In a nested struct, enum or union, `Self` is the copy's own type. A type that names it is
-    /// copied as written if its path is absolute (`::path::Wrap<Self>`), and leaked if it is
-    /// relative (`Wrap<Self>`). A type that uses a generic bounded by `Self`
-    /// (`struct S<T: AsRef<Self>>(Rel<T>);`) is for any type that the bound holds for
-    /// ([`SelfRequirement::Any`](crate::SelfRequirement)). If it names `Self` too (`Rel2<Self,
-    /// T>`), it is an entry all the same, with the error
-    /// [`Reason::NestedSelfInBounds`](crate::Reason::NestedSelfInBounds):
-    /// [`LeakerResult::allow()`](crate::LeakerResult::allow) drops the error, and
-    /// [`LeakerResult::ignore()`](crate::LeakerResult::ignore) removes the entry.
+    /// In a nested struct, enum or union, `Self` is the copy's own type:
     ///
-    /// A bound is rewritten for the `Self` of the nested item that uses its generic. That is an
-    /// error if `Self` is the implementor of a trait, or if the bound names an associated item of
-    /// `Self` (`Self::X`).
+    /// - A type that names `Self` is leaked if its path is relative (`Wrap<Self>`), and kept as
+    ///   written if it is absolute (`::path::Wrap<Self>`).
+    /// - A type that uses a generic whose bound names `Self` (`Rel<T>` in
+    ///   `struct S<T: AsRef<Self>>(Rel<T>);`) is an entry for any type that the bound holds for
+    ///   ([`SelfRequirement::Any`](crate::SelfRequirement::Any)). If it names `Self` too, see
+    ///   [`Reason::NestedSelfInBounds`](crate::Reason::NestedSelfInBounds).
     ///
-    /// A `mod` is not analyzed: it is an error ([`Reason::Unreadable`](crate::Reason::Unreadable)),
-    /// and nothing in it is visited. Analyze each item of the module with its own call.
+    /// If the nested item uses a generic of the scope whose bound names the outer `Self`, the bound
+    /// is written with the outer self type. This is an error
+    /// ([`Reason::UnnameableSelf`](crate::Reason::UnnameableSelf)) if the outer `Self` is the
+    /// implementor of a trait, or if the bound names `Self::X`.
+    ///
+    /// A `mod` is an error ([`Reason::Unreadable`](crate::Reason::Unreadable)), and nothing in it
+    /// is visited: analyze each item of the module with its own call.
     pub fn visit_item(&mut self, item: &Item) {
         syn::visit::Visit::visit_item(&mut *self.visitor, item)
     }
@@ -176,8 +174,8 @@ impl<A: Allow> View<'_, '_, A> {
         syn::visit::Visit::visit_type(&mut *self.visitor, ty)
     }
 
-    /// Analyzes the arguments of a path whose name is resolved elsewhere (`<Rel>` of `Wrap<Rel>`),
-    /// not the path itself.
+    /// Analyzes the arguments of a path (`<Rel>` in `Wrap<Rel>`), not the path itself. Use it for a
+    /// path that your macro resolves itself.
     pub fn visit_path_arguments(&mut self, arguments: &PathArguments) {
         syn::visit::Visit::visit_path_arguments(&mut *self.visitor, arguments)
     }
@@ -189,8 +187,8 @@ impl<A: Allow> View<'_, '_, A> {
 
     /// Analyzes a bound, such as a bound of a generic parameter of the scope.
     ///
-    /// The path of a trait bound must not depend on the context, nor start with `Self` where it has
-    /// no meaning: that is an error.
+    /// A relative trait path is an error, and so is a path that starts with `Self` where `Self`
+    /// has no meaning.
     pub fn visit_type_param_bound(&mut self, bound: &TypeParamBound) {
         syn::visit::Visit::visit_type_param_bound(&mut *self.visitor, bound)
     }

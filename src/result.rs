@@ -20,57 +20,62 @@ use syn::parse::{Parse, ParseStream};
 use syn::*;
 use template_quote::{quote, ToTokens};
 
-/// Where in an item a path or an error is. [`Allow::allow()`] is asked at a place; it is
-/// [`ErrorItem::place`] for an error.
+/// Where in an item a path or an error is: [`Allow::allow()`] is asked at a place, and
+/// [`ErrorItem::place`] is the place of an error. See the example there.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Place {
-    /// While a value or a body is read ([`Leaker::check_values`](crate::Leaker::check_values),
-    /// [`Leaker::check_bodies`](crate::Leaker::check_bodies)): the value of a const or static, the
-    /// body of a function, a trait's default value or body.
+    /// In a value or a body that [`Leaker::check_values`](crate::Leaker::check_values) or
+    /// [`Leaker::check_bodies`](crate::Leaker::check_bodies) reads: the value of a const or a
+    /// static, the body of a function, a default value or body of a trait. Not an enum
+    /// discriminant.
     pub in_value: bool,
-    /// In a default: a default body or an associated const default of a trait, and the default of
-    /// a generic parameter (`U = Rel<'_>`, `T = Wrap<Self>`).
+    /// In a default: a default value or body of a trait, or the default of a generic parameter
+    /// (`U = Rel<'_>`).
     pub in_default: bool,
 }
 
-/// What a [`Leaker`] may write as it is. Pass it to
-/// [`Leaker::with_rule()`](crate::Leaker::with_rule), or to
+/// A rule that says which paths the copy may write as written. Give it to
+/// [`Leaker::with_rule()`](crate::Leaker::with_rule) or to
 /// [`LeakerResult::allow()`](crate::LeakerResult::allow).
 ///
-/// `allow()` means "the copy may write `cause` as it is at `place`", and is the one question at
-/// both stages. The analysis asks it about each relative path, and about each absolute path in a
-/// type (`::core::..` and `$crate::..` excepted), as the cause of its kind: a path in a type is a
-/// [`Cause::Type`], the trait of a bound or of a qualified path a [`Cause::Trait`], a path in a
-/// value a [`Cause::Expr`], the path of a macro a [`Cause::Macro`], a path of unknown kind (the
-/// root of a `use`, a path in the tokens of a macro) a [`Cause::Unknown`]. The paths are bare:
-/// their generic arguments are analyzed on their own. A path that starts with `Self` or a generic
-/// in scope is not asked as the analysis walks. An allowed path is not leaked, and you promise that
-/// it means the same in the copy (an absolute path: that the crate is the same on both sides). The
-/// rule is called on every check of a path: keep it cheap. A rule that panics rolls the analysis
-/// back.
+/// `allow(cause, place)` returns `true` if the copy may write `cause` as written at `place`. You
+/// promise that the path means the same in the copy: for an absolute path, that the crate is the
+/// same in crate B.
 ///
-/// After the analysis, [`LeakerResult::allow()`](crate::LeakerResult::allow) accepts an error by
-/// its [`paths`](ErrorItem::paths) if it has any (the rule must allow each, at the error's
-/// field [`place`](ErrorItem::place); the error stays without those it allows), else by its cause,
-/// asked as written, with its generic arguments. A rule on a whole cause (`Wrap<Rel>`) never
-/// accepts an error that has paths. That only drops errors: it changes no entry, and a type of
-/// another crate that the rule allows is still an entry. That is the approximation of the rule of
-/// the Leaker: give the rule to the Leaker when you can.
+/// The Leaker asks the rule about each relative path, and about each absolute path in a type
+/// (except `::core::..` and `$crate::..`). It asks with the path alone, without its generic
+/// arguments (they are analyzed on their own), as a [`Cause`] of its kind:
 ///
-/// The Leaker drops the errors of a scope the same way when the scope ends. The error of a `Self`
-/// that has no meaning ([`Reason::SelfWithoutMeaning`]) has no
-/// paths, so a rule that allows its cause (`Self`, `Self::Item`) accepts it at both stages, though
-/// a path that starts with `Self` is not asked as the analysis walks.
+/// - [`Cause::Type`]: a path in a type.
+/// - [`Cause::Trait`]: the trait of a bound or of a qualified path.
+/// - [`Cause::Expr`]: a path in a value.
+/// - [`Cause::Macro`]: the path of a macro.
+/// - [`Cause::Unknown`]: a path of unknown kind (the root of a `use`, a path in the tokens of a
+///   macro, a path that an attribute names).
 ///
-/// A closure `Fn(&Cause, Place) -> bool` is a rule, `()` allows nothing, and `(A, B)` allows what
-/// either does. [`Rules`] builds the common ones. A closure must annotate its first parameter
-/// (`|cause: &Cause, _| ..`) wherever it is passed (E0282, E0631); [`Rules::or_if()`] needs none.
+/// It does not ask about a path that starts with `Self`, a generic in scope, or a name that a
+/// block declares. It does not leak an allowed path. It calls the rule for every check of a path,
+/// so keep the rule cheap. If the rule panics, the call to the Leaker is rolled back and panics.
+///
+/// [`LeakerResult::allow()`](crate::LeakerResult::allow) asks the rule at the
+/// [`place`](ErrorItem::place) of each error. It drops an error with [`paths`](ErrorItem::paths)
+/// if the rule allows each path (never one that starts with `Self`); else the error stays without
+/// the allowed paths. It drops an error without paths if the rule allows its cause, as written,
+/// with its generic arguments, so a rule on a whole cause (`Wrap<Rel>`) never drops an error with
+/// paths. The Leaker drops errors in the same way when its outermost call returns. The error of
+/// `Self` without a meaning ([`Reason::SelfWithoutMeaning`]) has no paths, so a rule that allows
+/// its cause (`Self`, `Self::Item`) drops it in both places.
+///
+/// `()` allows nothing, a closure `Fn(&Cause, Place) -> bool` is a rule, and `(A, B)` allows what
+/// either allows. [`Rules`] builds the common rules. A closure needs the type of its first
+/// parameter (`|cause: &Cause, _| ..`) wherever you give it (E0282, E0631);
+/// [`Rules::or_if()`] needs none.
 ///
 /// ```
 /// # use type_leak::*;
 /// # use syn::*;
-/// // You promise that `::serde` is the same crate on both sides.
+/// // You promise that `::serde` is the same crate in crate B.
 /// let rule = Rules::new().or_if(|cause, _| cause.starts_with(&parse_quote!(::serde)));
 /// let mut leaker = Leaker::with_rule(rule);
 /// leaker.intern_struct(&parse_quote!(struct S { a: ::serde::Value, b: MyType }));
@@ -78,7 +83,7 @@ pub struct Place {
 /// assert_eq!(leaker.result().finish().unwrap().iter().count(), 1);
 /// ```
 pub trait Allow {
-    /// Returns `true` if the copy may write `cause` as it is, at `place`.
+    /// Returns `true` if the copy may write `cause` as written at `place`.
     fn allow(&self, cause: &Cause, place: Place) -> bool;
 }
 
@@ -102,13 +107,11 @@ impl<A: Allow, B: Allow> Allow for (A, B) {
     }
 }
 
-/// The built-in rules and your own, as one [`Allow`]. Rules add up: it allows what any of them
-/// does.
+/// The built-in rules and your own, as one [`Allow`]: it allows what any of them allows.
 ///
-/// The methods set a flag and return the same type, so a choice at run time keeps it; [`or()`] and
-/// [`or_if()`] add a rule of your own and change `A`. The built-in path rules allow a cause that
-/// is a path without generic arguments ([`Cause::path()`]). On a result, an error is accepted by
-/// its paths, or by its cause if it has none.
+/// Each method sets a flag and returns the same type, so a choice at run time keeps one type.
+/// [`or()`] and [`or_if()`] add a rule of your own and change `A`. The built-in path rules allow
+/// only a cause that is a path without generic arguments ([`Cause::path()`]), as the Leaker asks.
 ///
 /// ```
 /// # use type_leak::*;
@@ -145,45 +148,49 @@ impl Rules {
 }
 
 impl<A> Rules<A> {
-    /// Allows the primitive types (`u8`, `bool`, `str`, ...).
+    /// Allows the paths that start with a primitive type (`bool`, `char`, `str`, `u8` to `u128`,
+    /// `usize`, `i8` to `i128`, `isize`, `f32`, `f64`). You promise that the copy does not shadow
+    /// them; [`Leaker::assertions()`] checks crate A.
     pub fn primitive(mut self) -> Self {
         self.primitive = true;
         self
     }
 
-    /// Allows the names of the standard prelude (`Vec`, `Option`, `Clone`, ...).
+    /// Allows the paths that start with a name of the prelude of every edition, as of Rust 1.56:
+    /// `Box`, `Option`, `Some`, `None`, `Result`, `Ok`, `Err`, `String`, `Vec`, `drop`, `Copy`,
+    /// `Send`, `Sized`, `Sync`, `Unpin`, `Drop`, `Fn`, `FnMut`, `FnOnce`, `Clone`, `PartialEq`,
+    /// `PartialOrd`, `Eq`, `Ord`, `AsRef`, `AsMut`, `Into`, `From`, `Default`, `Iterator`,
+    /// `Extend`, `IntoIterator`, `DoubleEndedIterator`, `ExactSizeIterator`, `ToOwned`, `ToString`.
+    /// You promise that the copy does not shadow them.
     ///
-    /// Without it, a relative `Clone` in `trait Tr: Clone` is an error, and `Vec<T>` is leaked
-    /// whole. You promise that the copy does not shadow the names.
+    /// The names of later preludes are not allowed, as the copy may use an older edition or Rust:
+    /// `TryFrom`, `TryInto`, `FromIterator`, `Future`, `IntoFuture`, `size_of`, `size_of_val`,
+    /// `align_of`, `align_of_val`. The help of their errors gives their absolute paths.
     ///
-    /// The names are those of the prelude of every edition, as of Rust 1.56. A name that a later
-    /// prelude added is left out, as the copy may be older: `TryFrom`, `TryInto`, `FromIterator`,
-    /// `Future`, `IntoFuture`, `size_of`, `size_of_val`, `align_of` and `align_of_val`. The help
-    /// gives their absolute paths. `Sized` is allowed as a bound; `?Sized` needs no rule.
+    /// A derive is a name like any other: this allows `#[derive(Clone, Copy, Default, Eq, Ord,
+    /// PartialEq, PartialOrd)]`, but not `Debug` or `Hash`, whose traits are not in the prelude.
+    /// Without this rule, `Clone` in `trait Tr: Clone` and `Sized` in `Self: Sized` are errors (a
+    /// bare `?Sized` needs no rule).
     pub fn prelude(mut self) -> Self {
         self.prelude = true;
         self
     }
 
-    /// Allows the paths that start with `std`, `core` or `alloc`, also those with a leading `::`
-    /// (`::std::vec::Vec`), which are no entry in the Leaker: the copy writes them as they are. On
-    /// a [`LeakerResult`] it only drops the errors of relative paths.
+    /// Allows the paths that start with `std`, `core` or `alloc`, relative (`std::vec::Vec`) or
+    /// absolute (`::std::vec::Vec`). In the Leaker, they are then no entries, and the copy writes
+    /// them as written.
     ///
-    /// You promise that the copy does not shadow the relative names. [`external_crates()`] allows
-    /// the other absolute paths. A `::core` path needs no rule: it is never an entry.
-    ///
-    /// [`external_crates()`]: Rules::external_crates
+    /// You promise that the copy does not shadow the relative names. An absolute `::core` path
+    /// needs no rule: it is never an entry. [`external_crates()`](Rules::external_crates) allows
+    /// every absolute path.
     pub fn std_crates(mut self) -> Self {
         self.std_crates = true;
         self
     }
 
-    /// Allows every absolute path (`::foo::X`), `::std` included.
-    ///
-    /// In a Leaker, a type of another crate (`::foo::X`) is no entry: the copy writes it as it is,
-    /// and not through the Repeater. Without it, such a type is an entry and is replaced. On a
-    /// [`LeakerResult`] it changes no entry, as `allow()` only drops errors.
-    /// You promise that each crate is the same crate on both sides.
+    /// Allows every absolute path (`::foo::X`), `::std` included. In the Leaker, a type of another
+    /// crate is then no entry, and the copy writes it as written. You promise that each crate is
+    /// the same crate in crate B.
     pub fn external_crates(mut self) -> Self {
         self.external_crates = true;
         self
@@ -191,32 +198,31 @@ impl<A> Rules<A> {
 
     /// Allows the paths that start with `crate`.
     ///
-    /// Use it only if the copy is in the same crate as the item: `crate::Foo` names another type
-    /// in another crate.
+    /// Use it only if the copy is in the same crate as the item: in another crate, `crate::Foo`
+    /// names another type.
     pub fn crate_paths(mut self) -> Self {
         self.crate_paths = true;
         self
     }
 
-    /// Allows everything found in a value or a body (see [`Place::in_value`]): the Leaker writes
-    /// every relative path in them as it is, also the type of a `let`, instead of leaking it. It
-    /// has an effect only with [`Leaker::check_values`](crate::Leaker::check_values) or
-    /// [`Leaker::check_bodies`](crate::Leaker::check_bodies).
+    /// Allows everything in a value or a body ([`Place::in_value`]): the copy writes every relative
+    /// path there as written, the type of a `let` too, instead of leaking it. It changes nothing
+    /// unless [`Leaker::check_values`](crate::Leaker::check_values) or
+    /// [`Leaker::check_bodies`](crate::Leaker::check_bodies) is on.
     pub fn values(mut self) -> Self {
         self.values = true;
         self
     }
 
-    /// Allows everything found in a default (see [`Place::in_default`]): the Leaker writes every
-    /// relative path in a default as it is (`U = Rel<'_>`, `T = Wrap<Self>`) instead of leaking
-    /// it.
+    /// Allows everything in a default ([`Place::in_default`]): the copy writes every relative path
+    /// in a default as written (`U = Rel<'_>`, `T = Wrap<Self>`) instead of leaking it.
     pub fn defaults(mut self) -> Self {
         self.defaults = true;
         self
     }
 
-    /// Adds `rule`: the rules allow what it allows too. Pass a closure to
-    /// [`or_if()`](Rules::or_if), which needs no annotations.
+    /// Adds `rule`: the rules then allow what it allows too. For a closure, use
+    /// [`or_if()`](Rules::or_if), which needs no type annotations.
     pub fn or<B: Allow>(self, rule: B) -> Rules<(A, B)> {
         Rules {
             primitive: self.primitive,
@@ -230,7 +236,7 @@ impl<A> Rules<A> {
         }
     }
 
-    /// Adds the closure `rule` like [`or()`](Rules::or).
+    /// Adds the closure `rule`, like [`or()`](Rules::or).
     pub fn or_if<F: Fn(&Cause, Place) -> bool>(self, rule: F) -> Rules<(A, F)> {
         self.or(rule)
     }
@@ -311,17 +317,15 @@ fn forget_dropped(errors: &mut [ErrorItem]) {
 
 /// What a [`Leaker`] found: the [`Referrer`] and the errors that remain.
 ///
-/// [`finish()`](LeakerResult::finish) gives the Referrer only when no error remains: accept each
-/// error with [`allow()`](LeakerResult::allow) or [`ignore()`](LeakerResult::ignore), and report
-/// the others ([`ErrorItem::emit()`]).
+/// [`finish()`](LeakerResult::finish) returns the Referrer only when no error remains. First
+/// accept the errors that you can, and report the others ([`ErrorItem::emit()`]):
 ///
-/// [`allow()`](LeakerResult::allow) takes and returns the result, so it chains. It drops the errors
-/// that an [`Allow`] accepts (you promise that the part compiles as written). It leaves the
-/// entries as they are: to remove entries, give the [`Allow`] to [`Leaker::with_rule()`]. A rule
-/// here only approximates the one of the Leaker (more errors may remain, and a copy may fail to
-/// build): give rules to the Leaker when you can. [`ignore()`](LeakerResult::ignore) accepts one
-/// error, and has the copy write its whole part as written, or removes its entry;
-/// [`ignore_if()`](LeakerResult::ignore_if) does it for each error that a closure picks.
+/// - [`allow()`](LeakerResult::allow) drops the errors that an [`Allow`] rule accepts.
+/// - [`ignore()`](LeakerResult::ignore) drops one error, and the copy writes its whole part as
+///   written. [`ignore_if()`](LeakerResult::ignore_if) does this for each error that a closure
+///   chooses.
+///
+/// [`repeater_impls()`](LeakerResult::repeater_impls) returns the Repeater impls for crate A.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
@@ -330,7 +334,8 @@ fn forget_dropped(errors: &mut [ErrorItem]) {
 /// let result = leaker.result();
 /// assert_eq!(result.errors()[0].cause, Cause::Trait(parse_quote!(RelTr)));
 /// // Allowing the error copies the part as written, and `finish()` is `Ok`.
-/// let result = result.allow(|cause: &Cause, _: Place| *cause == Cause::Trait(parse_quote!(RelTr)));
+/// let rel_tr = Cause::Trait(parse_quote!(RelTr));
+/// let result = result.allow(|cause: &Cause, _: Place| *cause == rel_tr);
 /// assert!(result.finish().is_ok());
 /// ```
 #[derive(Clone, Debug)]
@@ -342,46 +347,48 @@ pub struct LeakerResult {
 }
 
 impl LeakerResult {
-    /// Drops the errors that `rule` accepts: the part is copied as written. An error is accepted
-    /// by its [`paths`](ErrorItem::paths) if it has any, else by its cause. The other errors stay,
-    /// in order.
+    /// Drops the errors that `rule` accepts, and keeps the others in order. The copy writes the
+    /// part of each dropped error as written.
     ///
-    /// You promise that the part can be written as it is in the copy. The cause may be smaller
-    /// than the part that is copied: in `[u8; { let c = |a: u8| a; 3 }]` the error is about `u8`,
-    /// and the array is copied whole. Allowing a [`Reason::UnprovableBound`] does not make the copy
-    /// compile (E0277). To allow a cause, compare it with `==` (the same kind and tokens, spans
-    /// ignored). An absolute path is never an error, so a rule for `::serde` changes no error. It
-    /// changes no entry either: to have the copy write a type of another crate as it is, give
-    /// [`Rules::external_crates()`](crate::Rules::external_crates) to
-    /// [`Leaker::with_rule()`].
+    /// The rule accepts an error by its [`paths`](ErrorItem::paths), or by its cause if it has
+    /// none: see [`Allow`]. Compare a cause with `==`, which compares the kind and the tokens, not
+    /// the spans. A closure needs the type of its first parameter, also when written in the call.
+    /// You promise that the part compiles as written in the copy.
     ///
-    /// See [`Allow`] for what the rule is asked. A closure must annotate its first parameter
-    /// (`|cause: &Cause, _| ..`), even written in the call; [`Rules::or_if()`](crate::Rules::or_if)
-    /// needs no annotation. To have the copy write the whole part as written, use
-    /// [`ignore()`](LeakerResult::ignore).
+    /// - The part may be larger than the cause: in `[u8; { let c = |a: u8| a; 3 }]`, the error is
+    ///   about `u8`, and the copy writes the whole array as written.
+    /// - Allowing some errors does not make the copy compile ([`Reason::UnprovableBound`]).
+    /// - It changes no entry. An absolute path is never an error, so a rule for `::serde` here
+    ///   changes nothing. To have the copy write a type of another crate as written, give
+    ///   [`Rules::external_crates()`](crate::Rules::external_crates) to [`Leaker::with_rule()`].
+    /// - A rule here only approximates the same rule given to the Leaker: more errors may remain,
+    ///   and the copy may fail to compile. Give rules to the Leaker when you can.
+    ///
+    /// To have the copy write the whole part as written, use [`ignore()`](LeakerResult::ignore).
     pub fn allow(mut self, rule: impl Allow) -> Self {
         filter(&rule, &mut self.errors);
         self
     }
 
-    /// Accepts `error`, one of [`errors()`](LeakerResult::errors): the copy writes the part that it
-    /// is about as written, whole, and nothing is looked up in it. The error goes, and so do the
-    /// errors revealed inside that part and the errors about the same part.
+    /// Accepts `error`, one of [`errors()`](LeakerResult::errors): the copy writes the whole part
+    /// of the error as written, and finds no entry in it.
     ///
-    /// [`allow()`](LeakerResult::allow) writes only the head that is wrong as written (`MyType` in
-    /// `MyType<'_, Rel>`) and replaces the entries in the arguments; `ignore()` writes all of
-    /// `MyType<'_, Rel>` as written, so `Rel` is not replaced there. An entry that is used at
-    /// another place is still one there. You promise that the part compiles as written.
+    /// The errors about the same part go too, and so do the errors found inside the part. For
+    /// `MyType<'_, Rel>`, [`allow()`](LeakerResult::allow) has the copy write `MyType` as written
+    /// and replace the entry `Rel`; `ignore()` has it write all of `MyType<'_, Rel>` as written.
+    /// An entry that is also used at another place is still replaced there. You promise that the
+    /// part compiles as written.
     ///
-    /// The error of an entry ([`Reason::NestedSelfInBounds`]) removes the entry instead: it gets no
-    /// impl ([`repeater_impls()`](LeakerResult::repeater_impls)), [`Referrer::iter()`] skips it,
-    /// and the copy writes its type as written wherever it would have been replaced. The other
-    /// entries keep their [`EntryId`]s, so it can be called before or after the impls are written.
+    /// For the error of an entry ([`Reason::NestedSelfInBounds`]), it removes the entry instead.
+    /// The entry gets no impl ([`repeater_impls()`](LeakerResult::repeater_impls)),
+    /// [`Referrer::iter()`] skips it, and the copy writes its type as written. The other entries
+    /// keep their [`EntryId`]s, so you can call it before or after you write the impls.
     ///
-    /// An error that is about no part (a `Self` without meaning, a path in a value) is only
-    /// dropped. An error about an entry inside the part stays: the entry may be used elsewhere, so
-    /// ignore it on its own. If `error` is not one of the errors, nothing changes, so calling it
-    /// again is harmless. Call it before [`allow()`](LeakerResult::allow) for the same error.
+    /// - An error about no part (`Self` without a meaning, a path in a value) is only dropped.
+    /// - An error about an entry inside the part stays: the entry may be used elsewhere, so ignore
+    ///   that error on its own.
+    /// - If `error` is not one of the errors, nothing changes.
+    /// - Call it before [`allow()`](LeakerResult::allow) for the same error.
     ///
     /// ```
     /// # use {syn::*, type_leak::*};
@@ -422,11 +429,11 @@ impl LeakerResult {
         self
     }
 
-    /// Calls `f` for each error that remains, in the order found, and ignores the ones it returns
-    /// `true` for, as [`ignore()`](LeakerResult::ignore) does.
+    /// Calls `f` for each error that remains, in the order found, and ignores each error for which
+    /// it returns `true`, as [`ignore()`](LeakerResult::ignore) does.
     ///
-    /// The errors that go with an ignored one (the same part or entry, and those inside its part)
-    /// are dropped and not asked about.
+    /// `f` is not called for the errors that go with an ignored one (about the same part or entry,
+    /// or inside its part).
     ///
     /// ```
     /// # use {syn::*, type_leak::*};
@@ -500,12 +507,11 @@ impl LeakerResult {
         &self.errors
     }
 
-    /// Returns the Referrer if no error remains, else the errors that remain, in the order found,
-    /// as a [`LeakerResultError`].
+    /// Returns the Referrer if no error remains, else the errors that remain, in the order found.
     ///
-    /// It is the only way to the Referrer: drop each error with [`allow()`](LeakerResult::allow)
-    /// or [`ignore()`](LeakerResult::ignore) first, and report the others. In a proc macro,
-    /// `?` turns the error into a [`syn::Error`] that holds each of them.
+    /// It is the only way to get the Referrer: first drop the errors that you accept with
+    /// [`allow()`](LeakerResult::allow) or [`ignore()`](LeakerResult::ignore), and report the
+    /// others. In a proc macro, `?` turns the errors into one [`syn::Error`] that holds them all.
     ///
     /// ```
     /// # use {syn::*, type_leak::*};
@@ -525,33 +531,29 @@ impl LeakerResult {
         }
     }
 
-    /// Describes the Repeater impl of each entry: its generics, trait path and type.
+    /// Returns the Repeater impl of each entry, for crate A.
     ///
-    /// It is the Leaker's side that writes the impls: write one for every entry, next to the
-    /// analyzed items. They come in the order of the entries
-    /// ([`Referrer::iter()`], so without those that [`ignore()`](LeakerResult::ignore) removed),
-    /// each with its [`EntryId`] in [`RepeaterImpl::entry`], which the
-    /// Repeater's `KEY` ([`Projection::key()`]) and [`Projection::of()`] take.
+    /// Write one impl for every entry, next to the analyzed items. The impls come in the order of
+    /// [`Referrer::iter()`], so without the entries that [`ignore()`](LeakerResult::ignore)
+    /// removed. Each has its [`EntryId`] in [`RepeaterImpl::entry`].
     ///
-    /// `projection` is the one that the copy's side uses too ([`Projection::of()`]): its
-    /// [`path`](Projection::path) becomes [`RepeaterImpl::path`], with the first argument, and its
-    /// [`id`](Projection::id) is in the `KEY` that `ToTokens` of the item writes
-    /// ([`Projection::key(entry)`](Projection::key)); [`ImplSelf::Bucket`] chooses the type from
-    /// the same `id`. Its [`impl_self`](Projection::impl_self) says what every impl is for
-    /// ([`ImplSelf`]). The consts of the entries are encoded as [`Projection::of()`] does.
+    /// Give the same `projection` that crate B gives to [`Projection::of()`]. Its
+    /// [`path`](Projection::path) and [`id`](Projection::id) give the trait path and the `KEY` of
+    /// each impl ([`RepeaterImpl`]), and its [`impl_self`](Projection::impl_self) says what type
+    /// each impl is for ([`ImplSelf`]).
     ///
-    /// The call fails with the first of these:
+    /// Fails with the first of these errors, and returns no impl:
     ///
-    /// - [`EncodeError::NeedsSelf`], for [`ImplSelf::Marker`], if some entry names `Self`, or its
-    ///   context does. The error has the first such entry, and no impl is made.
-    /// - The first [`EncodeError::UnsupportedConstType`], in the order of the entries and of their
-    ///   parameters.
+    /// - [`EncodeError::NeedsSelf`] for [`ImplSelf::Marker`], if an entry or its context names
+    ///   `Self`. The error holds the first such entry.
+    /// - [`EncodeError::UnsupportedConstType`] for the first const parameter whose type is not a
+    ///   primitive type, in the order of the entries and of their parameters.
     ///
     /// # Panics
     ///
-    /// If the path of `projection` has arguments (`crate::Repeater<u8>`): it names the trait alone,
-    /// or with an empty `<>`. Also if `projection` is [`Projection::unused()`] and there is an
-    /// entry.
+    /// If the path of `projection` has arguments (`crate::Repeater<u8>`): it must name the trait
+    /// alone, or with an empty `<>`. Also if `projection` is [`Projection::unused()`] and there is
+    /// an entry.
     ///
     /// ```
     /// # use type_leak::*;
@@ -598,8 +600,8 @@ impl LeakerResult {
     }
 }
 
-/// Writes the [`Referrer`], then, if errors remain, `@ [ {error} {error} .. ]`: one brace group for
-/// each [`ErrorItem`], in the order found, in one bracket group after an `@`.
+/// Writes the [`Referrer`], then, if errors remain, `@ [ {error} {error} .. ]`: an `@` and one
+/// bracket group with a brace group for each [`ErrorItem`], in the order found.
 impl ToTokens for LeakerResult {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         self.referrer.to_tokens(tokens);
@@ -611,11 +613,11 @@ impl ToTokens for LeakerResult {
     }
 }
 
-/// Reads a [`Referrer`], then the errors of `@ [ {error} .. ]` if that follows. Anything else
-/// after the Referrer is left to the caller: only an `@` followed by a bracket group is read, so a
-/// brace group after the result is not an error. Fails as the [`Referrer`] does (a missing or
-/// different format tag), and on an `@ [ .. ]` that holds something else than error groups. A
-/// serialized Referrer parses with no errors.
+/// Reads a [`Referrer`], then the errors of `@ [ {error} .. ]` if they follow, and leaves any
+/// other tokens (a brace group, for example). A Referrer alone reads as a result with no errors.
+/// Fails as the [`Referrer`] does (a missing or different format tag), on an `@ [ .. ]` that holds
+/// something else than errors, and on an error that names a part, an entry or an error that is
+/// not there.
 impl Parse for LeakerResult {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let referrer: Referrer = input.parse()?;
@@ -671,10 +673,11 @@ fn check_links(referrer: &Referrer, errors: &[ErrorItem], spans: &[Span]) -> syn
 
 /// The errors that [`LeakerResult::finish()`] returns: at least one, in the order found.
 ///
-/// It reads as a slice of [`ErrorItem`]s (`len()`, `[0]`, `iter()`), or as a `Vec` with
-/// [`into_vec()`](LeakerResultError::into_vec). It is a `std::error::Error` whose text is the
-/// messages of the errors, one per line. [`ToTokens`] writes a `compile_error!` for each error,
-/// and `From` makes one [`syn::Error`] of them, so a proc macro can use `?`.
+/// - It reads as a slice of [`ErrorItem`]s (`len()`, `[0]`, `iter()`), or as a `Vec` with
+///   [`into_vec()`](LeakerResultError::into_vec).
+/// - It is a `std::error::Error` whose text is the messages of the errors, one per line.
+/// - [`ToTokens`] writes a `compile_error!` for each error.
+/// - `From` makes one [`syn::Error`] of them, so a proc macro can use `?`.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
@@ -806,7 +809,7 @@ impl std::fmt::Display for LeakerResultError {
     }
 }
 
-/// Lets `finish()` go through `?` in a function that returns a `Box<dyn Error>`.
+/// Lets `?` pass the errors of `finish()` on as a `Box<dyn Error>`.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
@@ -820,9 +823,8 @@ impl std::fmt::Display for LeakerResultError {
 /// ```
 impl std::error::Error for LeakerResultError {}
 
-/// Writes the [`ErrorItem::to_compile_error()`] of each error, in the order found. It is pure; to
-/// report from a proc macro with a diagnostic on nightly, call [`ErrorItem::emit()`] for each
-/// error.
+/// Writes the [`ErrorItem::to_compile_error()`] of each error, in the order found. To report the
+/// errors from a proc macro with the nightly diagnostic, call [`ErrorItem::emit()`] for each.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
@@ -842,8 +844,8 @@ impl ToTokens for LeakerResultError {
     }
 }
 
-/// Makes one [`syn::Error`] of the errors, with [`syn::Error::combine()`]: each error is
-/// converted as [`ErrorItem`] is, in order.
+/// Makes one [`syn::Error`] of the errors: each error is converted as an [`ErrorItem`] is, and
+/// they are joined in order with [`syn::Error::combine()`].
 ///
 /// ```
 /// # use {syn::*, type_leak::*};

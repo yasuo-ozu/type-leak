@@ -17,13 +17,13 @@ use syn::visit_mut::VisitMut;
 use syn::*;
 use template_quote::quote;
 
-/// The error of the functions that encode the generics of an entry or write the arguments of a
-/// trait: [`LeakerResult::repeater_impls()`](crate::LeakerResult::repeater_impls),
+/// An error of writing a path through the Repeater, or the arguments of an impl.
+///
+/// [`LeakerResult::repeater_impls()`](crate::LeakerResult::repeater_impls),
 /// [`Projection::of()`](crate::Projection::of),
 /// [`Referrer::complete_args()`](crate::Referrer::complete_args),
-/// [`Visitor::with_self()`](crate::Visitor::with_self) and [`substitute_args()`].
-///
-/// It converts into a `syn::Error` at the offending tokens.
+/// [`Visitor::with_self()`](crate::Visitor::with_self) and [`substitute_args()`] return it.
+/// `syn::Error::from()` puts it at the tokens that it holds.
 ///
 /// ```
 /// # use type_leak::*;
@@ -33,41 +33,43 @@ use template_quote::quote;
 /// let referrer = leaker.result().finish().unwrap();
 /// let (entry, _, context) = referrer.iter().next().unwrap();
 ///
-/// // A const slot cannot be told for the type `Alias`, which may be an alias of any primitive type.
+/// // `Alias` may be an alias of any primitive type, so its const slot cannot be known.
 /// let projection = Projection::new(parse_quote!(Repeater), 1, ImplSelf::Param(parse_quote!(__S)));
 /// let err = projection.of(&parse_quote!(Self), context, entry).unwrap_err();
-/// assert!(matches!(&err, EncodeError::UnsupportedConstType(ty) if **ty == parse_quote!(::my_crate::Alias)));
+/// let alias: Type = parse_quote!(::my_crate::Alias);
+/// assert!(matches!(&err, EncodeError::UnsupportedConstType(ty) if **ty == alias));
 /// let error: syn::Error = err.into();
 /// assert_eq!(error.to_string(), "unsupported type of const parameter: ':: my_crate :: Alias'");
 /// ```
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum EncodeError {
-    /// The type of a const parameter is not a primitive type (e.g. an alias).
+    /// The type of a const parameter is not a primitive type (`const N: MyAlias`). A type alias
+    /// is refused too: its const slot cannot be known.
     UnsupportedConstType(Box<Type>),
-    /// An argument that does not fit: there are more arguments than parameters, a const for a type
-    /// parameter, or a value that [`substitute_args()`] was given for a name is not of a kind that
-    /// fits the place of the name.
+    /// An argument does not fit: one too many, a const for a type parameter, or a value of
+    /// [`substitute_args()`] that does not fit the place of its name.
     UnexpectedArgument(Box<GenericArgument>),
-    /// A parameter that has neither an argument nor a default.
+    /// A parameter has no argument and no default.
     MissingArgument(Box<GenericParam>),
-    /// `Self: 'a` is encoded for a `Self` that is a trait object without a lifetime bound (`dyn
-    /// Tr`). Write it, e.g. `dyn Tr + 'static`.
+    /// `Self` is a trait object with no lifetime bound (`dyn Tr`), and an entry needs `Self: 'a`.
+    /// Write a bound: `dyn Tr + 'static`.
     UnboundedTraitObject(Box<Type>),
-    /// [`ImplSelf::Marker`](crate::ImplSelf::Marker) was given and an entry names `Self`, or its
-    /// context does. Use [`ImplSelf::Param`](crate::ImplSelf::Param).
+    /// [`ImplSelf::Marker`](crate::ImplSelf::Marker) is used, but an entry needs `Self` (the entry
+    /// or its context names `Self`). Use [`ImplSelf::Param`](crate::ImplSelf::Param) or
+    /// [`ImplSelf::Bucket`](crate::ImplSelf::Bucket).
     ///
-    /// The type is the leaked type of the entry, or, from
-    /// [`Projection::of()`](crate::Projection::of), the type that it would write.
+    /// The type is the leaked type of the entry. From [`Projection::of()`](crate::Projection::of),
+    /// it is the type that `of()` would write.
     NeedsSelf(Box<Type>),
-    /// The associated type of a type that is not a type parameter, as written by `T::Item` with
-    /// `T` given as `IntoIter<u8>`: `<IntoIter<u8>>::Item`, which rustc takes only for a type
-    /// parameter (E0223). It needs its trait, `<IntoIter<u8> as Iterator>::Item`.
-    /// [`Referrer::complete_args()`](crate::Referrer::complete_args) writes it in a default from
-    /// the one trait bound of the parameter (`T: Iterator`), and fails if there is not one.
-    /// [`substitute_args()`] knows no bounds: write the trait in the copy
-    /// (`<T as Iterator>::Item`), and `T` is replaced in it. ([`Substitute`] writes it through the
-    /// bound, and leaves a failure to rustc.) The type is the path as it would be written.
+    /// `T::A`, where the argument of `T` is not one identifier (`T` is `IntoIter<u8>`).
+    ///
+    /// rustc reads `<IntoIter<u8>>::Item` only for a type parameter (E0223). It needs the trait:
+    /// `<IntoIter<u8> as Iterator>::Item`.
+    /// [`Referrer::complete_args()`](crate::Referrer::complete_args) writes that in a default from
+    /// the one trait bound of `T`, and fails without one. [`substitute_args()`] knows no bounds,
+    /// so it fails: write `<T as Iterator>::Item` in the copy instead. The type is the path that
+    /// would be written.
     AmbiguousAssociatedType(Box<Type>),
 }
 
@@ -108,7 +110,7 @@ impl std::fmt::Display for EncodeError {
 impl std::error::Error for EncodeError {}
 
 impl EncodeError {
-    /// Returns the span of the offending parameter, argument or type.
+    /// Returns the span of the parameter, argument or type that the error holds.
     pub fn span(&self) -> Span {
         match self {
             EncodeError::UnsupportedConstType(ty)
@@ -763,47 +765,47 @@ fn braced_const(value: &Expr) -> Expr {
     parse_quote!({ #value })
 }
 
-/// Replaces the names in `args` by what `f` gives for them: the arguments of a use site.
+/// Writes the arguments of a use site into `args`: each name becomes what `f` returns for it.
 ///
-/// `f` is asked for a name and answers the argument that takes its place, or `None` to leave the
-/// name as written (a generic the copy declares itself). It is asked once for each name, in the
-/// order they come in, before anything is replaced; a value is not substituted again. It is
-/// asked for:
+/// `f` gets a name and returns the argument for it, or `None` to keep the name (a generic that
+/// the copy declares itself). It is called once for each name, in order, before anything is
+/// replaced. A returned value is not substituted again. `f` is asked for:
 ///
-/// - a type `T`, and `T::A` or `<T>::A` (`<value>::A`, for a `Type`);
-/// - the first segment of a longer path in an expression (`T::LEN`, `T::f()`), written
-///   `<value>::LEN` for a `Type`; any other answer leaves the path as it is;
+/// - a type `T`, also in `T::A` and `<T>::A`;
+/// - the first segment of a longer path in an expression (`T::LEN`, `T::f()`);
 /// - a const `N`, in an expression (`[u8; N]`, `{ N }`) or as an argument;
-/// - a lifetime `'a`, as `a`; `'static` and `'_` are never asked;
-/// - `Self`, in a type and as the first segment in an expression (`Self::A`; `Self` alone in an
-///   expression is a value), and in the tokens of a macro.
+/// - a lifetime `'a`, as `a` (never `'static` or `'_`);
+/// - `Self` in a type, as the first segment in an expression (`Self::A`), and in the tokens of a
+///   macro. `Self` alone in an expression is a value, and is not asked.
 ///
-/// A type that is one identifier is asked whatever it is (`u8` and `String` too), and so is the
-/// first segment of a longer path, in a type or in an expression (`std` in `std::vec::Vec` or in
-/// `std::mem::drop(x)`, `crate`): answer `None` for what is not a parameter. The names that the
-/// library writes (the `'__tl_s<n>` binder below) are not asked.
+/// `f` is also asked for names that are not parameters: a type of one identifier (`u8`,
+/// `String`) and the first segment of a longer path (`std` in `std::vec::Vec`, `crate`). Return
+/// `None` for them. The names that this crate writes (the binder `'__tl_s0`) are not asked.
 ///
-/// A value must fit the place of its name, or the call fails with
-/// [`EncodeError::UnexpectedArgument`] at the value and `args` stay as they are: a `Type` or a
-/// `Const` where the name is a whole argument (`T` in `Vec<T>`); a `Type` where it is part of a
-/// type (`&T`, `T::A`) or `Self` in a macro; a `Const`, or a `Type` that is one identifier, in an
-/// expression; a `Lifetime` for a lifetime.
+/// It also:
 ///
-/// `T::A` in a type is `<value>::A`, which rustc resolves only if `value` is a type parameter
-/// (one identifier). For any other value the call fails with
-/// [`EncodeError::AmbiguousAssociatedType`] and `args` stay as they are: it knows no bounds, so
-/// write the trait in the copy (`<T as Iterator>::A`), where `T` is replaced as any name.
-/// ([`Substitute`] knows the bounds of the parameters, and writes it.) `T::A` in an expression is
-/// `<value>::A` for any value.
+/// - writes `T::LEN` in an expression as `<value>::LEN` for any `Type` value (another kind of
+///   value keeps the path);
+/// - braces a const once (`[u8; { N }]` with `M` is `[u8; { M }]`);
+/// - puts parentheses around a trait object with several bounds behind a reference or a pointer;
+/// - keeps the elided output lifetime of a `fn(..)` or `Fn(..)` when a value adds lifetimes to
+///   its inputs, with a `for<'__tl_s0>` binder: `fn(&U) -> &u8` with `&'static str` is
+///   `for<'__tl_s0> fn(&'__tl_s0 &'static str) -> &'__tl_s0 u8`. A lifetime that a path hides
+///   cannot be named.
 ///
-/// [`Substitute`] does the same for the items of an impl, lifetimes outside the types included.
+/// [`Substitute`] does the same for the items of an impl.
 ///
-/// A const is braced once (`[u8; { N }]` with `M` is `[u8; { M }]`), a trait object with several
-/// bounds that a reference or pointer points to gets parentheses, and a function pointer or
-/// `Fn(..)` whose output takes an elided lifetime from the one lifetime of its inputs keeps it
-/// where a value adds lifetimes to them: its elided lifetime is named by a `for<'__tl_s0>` binder
-/// (`fn(&U) -> &u8` with `&'static str` is `for<'__tl_s0> fn(&'__tl_s0 &'static str) ->
-/// &'__tl_s0 u8`). A lifetime that a path hides cannot be named.
+/// # Errors
+///
+/// On an error, `args` stay as they were.
+///
+/// - [`EncodeError::UnexpectedArgument`]: a value does not fit the place of its name. A whole
+///   argument (`T` in `Vec<T>`) takes a `Type` or a `Const`. A part of a type (`&T`, `T::A`) and
+///   `Self` in a macro take a `Type`. An expression takes a `Const`, or a `Type` that is one
+///   identifier. A lifetime takes a `Lifetime`.
+/// - [`EncodeError::AmbiguousAssociatedType`]: `T::A` in a type, and the value of `T` is not one
+///   identifier. rustc would refuse `<value>::A` (E0223), and this function knows no bounds.
+///   Write the trait in the copy (`<T as Iterator>::A`): `T` is replaced in it as usual.
 ///
 /// ```
 /// # use type_leak::*;
@@ -899,21 +901,21 @@ fn substitute_in<F: FnMut(&Ident, Kind) -> Option<GenericArgument>>(
     Ok(())
 }
 
-/// Writes the arguments of an impl into the items it copies: [`substitute_args()`] as a
-/// [`VisitMut`].
+/// Writes the arguments of an impl into the items of the copy, as [`substitute_args()`] does.
 ///
-/// [`Referrer::complete_args()`](crate::Referrer::complete_args) makes it. Visit an impl or a
-/// trait to write its items, never its header (generics, trait path, self type, supertraits), which
-/// declares the generics itself; an item nested in a body is left too, it has a scope of its own.
-/// A signature or a type may be visited alone.
+/// [`Referrer::complete_args()`](crate::Referrer::complete_args) returns it. Visit an impl or a
+/// trait with it: it writes the items, but not the header (generics, trait path, self type,
+/// supertraits), which declares the generics itself. It also leaves an item nested in a body,
+/// which has its own scope. A signature or a type can be visited alone.
 ///
-/// Each type is written as one unit, as `substitute_args()` does, and so is each lifetime outside a
-/// type (`&'a self`, `T: 'a`, `where Self: 'a`). A parameter is told by its name and kind, so
-/// `'T` and `T` are two. `Self` and the names that are no parameter stay.
+/// It writes the types (also the arguments of the paths through the Repeater: `(T,)` becomes
+/// `(u8,)`) and the lifetimes outside types (`&'a self`, `T: 'a`, `where Self: 'a`). It finds a
+/// parameter by name and kind, so `'T` and `T` are two parameters. `Self` and other names stay.
 ///
-/// It cannot fail: what does not fit stays as written. `T::A` for an argument that is not one
-/// identifier is `<arg as Trait>::A` with the one trait bound of `T`, else `<arg>::A`, which rustc
-/// reports (E0223).
+/// `T::A`, for an argument `V` that is not one identifier, becomes `<V as Trait>::A` with the one
+/// trait bound of `T` (inline or in the where clause). Without exactly one bound, it is `<V>::A`,
+/// which rustc refuses (E0223). It never fails: what does not fit stays as written, for rustc to
+/// report.
 ///
 /// ```
 /// # use type_leak::*;

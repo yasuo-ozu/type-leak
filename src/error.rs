@@ -20,37 +20,37 @@ use syn::{
 };
 use template_quote::{quote, ToTokens};
 
-/// The part of an item that an [`ErrorItem`] is about, as written.
+/// A piece of syntax, as written, by its kind: what an [`Allow`](crate::Allow) rule is asked
+/// about, and what an [`ErrorItem`] is about.
 ///
-/// It is usually the whole syntax that cannot be accepted (`MyType<'_, Rel>`, not `MyType`). Causes
-/// are equal if they have the same kind and tokens (spans and spacing ignored), so a cause written
-/// by hand (`Cause::Trait(parse_quote!(RelTr))`) can be compared with `==` in an
-/// [`Allow`](crate::Allow) rule.
+/// The cause of an error is usually the whole syntax with the error (`MyType<'_, Rel>`, not
+/// `MyType`). Two causes are equal if they have the same kind and tokens. Spans and spacing do
+/// not count, and `r#T` is `T`. So a rule can compare a cause with `==` to one written by hand
+/// (`Cause::Trait(parse_quote!(RelTr))`).
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Cause {
-    /// A type that must be leaked whole and cannot (`MyType<'_, Rel>`), the type of a const
+    /// A type that must be leaked whole and cannot be (`MyType<'_, Rel>`), the type of a const
     /// parameter, `Self` where it has no meaning, or a type macro.
     Type(Type),
-    /// The trait of a bound, a supertrait, a where predicate, an impl, a `dyn` or `impl` type, or a
-    /// qualified path in a value (`<u8 as Rel>::f()`).
+    /// The trait of a bound, a supertrait, a where predicate, an impl, a `dyn` or `impl` type, or
+    /// of a qualified path in a value (`<u8 as Rel>::f()`).
     Trait(Path),
-    /// An expression: a path in a const expression (an array length, a discriminant) or, with
-    /// [`Leaker::check_values`](crate::Leaker::check_values) or
-    /// [`Leaker::check_bodies`](crate::Leaker::check_bodies), in a value or a body; also an
-    /// expression that cannot be leaked (a closure in an array length). A path is an
-    /// [`Expr::Path`], as written.
+    /// An expression: a path in a const expression (an array length, a discriminant), or in a
+    /// value or a body that the Leaker reads; or an expression that cannot be leaked (a closure in
+    /// an array length). A path is an [`Expr::Path`], as written.
     Expr(Expr),
-    /// The path of a macro call, written with its `!` (`two!` in `[u8; two!()]`). A macro that is a
-    /// type is a [`Cause::Type`].
+    /// The path of a macro call, with its `!` (`two!` in `[u8; two!()]`). A macro in the place of
+    /// a type is a [`Cause::Type`].
     Macro(Path),
     /// A lifetime: an elided one (`'_`), one of a method, or one that no scope declares.
     Lifetime(Lifetime),
-    /// A path whose kind is not known: the root of a `use`, a path in the tokens of a macro.
+    /// A path of unknown kind: the root of a `use`, a path in the tokens of a macro, a path that
+    /// an attribute names.
     Unknown(Path),
-    /// Syntax that the Leaker cannot read (`macro_rules!`, `use inner::*;`), a `mod` met as an item
-    /// (the cause is `mod name`, without its items), or syntax that no node of the syntax holds: a
-    /// bound with a binder (`for<'a> Fn(&'a u8)`) or in parentheses.
+    /// Syntax that the Leaker cannot read (`macro_rules!`, `use inner::*;`), a `mod` item (`mod
+    /// name`, without its items), or syntax that no node holds: a bound with a binder
+    /// (`for<'a> Fn(&'a u8)`) or in parentheses.
     Unreadable(TokenStream),
 }
 
@@ -101,9 +101,10 @@ impl Cause {
         }
     }
 
-    /// Returns the path of a [`Cause::Type`] that is a path without a qualified self type, of a
-    /// [`Cause::Trait`], of a [`Cause::Macro`], of a [`Cause::Unknown`] and of a [`Cause::Expr`]
-    /// that is a path, as written (with its generic arguments, if it has any).
+    /// Returns the path of the cause, as written, with its generic arguments.
+    ///
+    /// It is `Some` for a [`Cause::Trait`], a [`Cause::Macro`], a [`Cause::Unknown`], and a
+    /// [`Cause::Type`] or [`Cause::Expr`] that is a path without a qualified self type.
     pub fn path(&self) -> Option<&Path> {
         match self {
             Cause::Type(Type::Path(TypePath { qself: None, path }))
@@ -117,8 +118,8 @@ impl Cause {
         }
     }
 
-    /// Returns `true` if [`path()`](Cause::path) starts with `prefix`, segment by segment by
-    /// identifier. Both must have a leading `::` or neither; generic arguments are ignored.
+    /// Returns `true` if [`path()`](Cause::path) starts with `prefix`, compared segment by segment
+    /// by name. Both must have a leading `::`, or neither. Generic arguments do not count.
     pub fn starts_with(&self, prefix: &Path) -> bool {
         self.path().map_or(false, |path| {
             prefix.leading_colon.is_some() == path.leading_colon.is_some()
@@ -204,7 +205,7 @@ impl Cause {
     }
 }
 
-/// Writes the syntax as it was written, with its spans (a [`Cause::Macro`] with its `!`).
+/// Writes the syntax as written, with its spans (a [`Cause::Macro`] with its `!`).
 impl ToTokens for Cause {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         match self {
@@ -303,69 +304,83 @@ impl Hash for Cause {
     }
 }
 
-/// Why a part of an item cannot be interned: the rule that it breaks.
+/// Why a part of an item cannot be leaked: the rule that it breaks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Reason {
-    /// A path or type that depends on the context but cannot be leaked, so it must be written in
-    /// full (`MyType` in `MyType<'_>`, a trait in a bound), or a relative path in a value. A macro
-    /// can accept a path with an [`Allow`](crate::Allow) rule.
+    /// A relative path that the copy must write as written, because the type around it cannot be
+    /// leaked (`MyType` in `MyType<'_>`, a trait in a bound), or a relative path in a value. Write
+    /// an absolute path, or allow the path with an [`Allow`](crate::Allow) rule.
     RelativePath,
     /// `Self` where no scope gives it a meaning: in generics that no struct, enum, union, impl or
-    /// trait encloses, or in a `mod` in a type (an array length). A macro can enter such a scope
-    /// ([`Leaker::enter_type()`](crate::Leaker::enter_type), `enter_impl()`, `enter_trait()`).
-    /// The error has no [`paths`](ErrorItem::paths), so a rule that allows its cause (`Self`,
-    /// `Self::Item`) accepts it ([`Allow`](crate::Allow)).
+    /// trait encloses, or in a `mod` inside a type (an array length). Analyze it in a scope that
+    /// declares `Self` ([`Leaker::enter_type()`](crate::Leaker::enter_type), `enter_impl()`,
+    /// `enter_trait()`), or write the type instead of `Self`. The error has no
+    /// [`paths`](ErrorItem::paths), so a rule that allows its cause (`Self`, `Self::Item`) accepts
+    /// it.
     SelfWithoutMeaning,
-    /// Syntax that the Leaker cannot read, with `check_values` or `check_bodies`: a macro whose
-    /// arguments are not expressions, a `macro_rules!`, a glob import, syntax that `syn` leaves
-    /// unparsed. Also a `mod` item given to [`View::visit_item()`](crate::View::visit_item) or met
-    /// in an item there (the cause is `mod name`, with no paths): the Leaker analyzes no module,
-    /// and nothing in it is leaked.
+    /// Syntax that the Leaker cannot read. In a value or a body that it reads: a macro whose
+    /// arguments are not expressions, a macro in item position, a glob import, or syntax that `syn`
+    /// does not parse; move it out of the item. Or a `mod` item given to
+    /// [`View::visit_item()`](crate::View::visit_item), or met in an item there (the cause is
+    /// `mod name`, with no paths): the Leaker analyzes no module, so give each of its items its own
+    /// call.
     Unreadable,
-    /// A bare identifier among the arguments of a path, which may be a const, in a type that cannot
-    /// be leaked whole ([Bare identifiers and consts](crate::Leaker#bare-identifiers-and-consts)).
+    /// A bare identifier argument (`N` in `Wrap<N>`), which may be a const, in a type that another
+    /// cause keeps from being leaked whole: the copy writes the type as written. Write an absolute
+    /// path (`{ ::my_crate::N }` for a const), or remove the other cause
+    /// ([Bare identifiers and consts](crate::Leaker#bare-identifiers-and-consts)).
     MaybeConst,
-    /// A leaked type that names a method lifetime the copy would leave unconstrained (`Wrap<'x>` in
-    /// `fn f<'x>(&self, a: Wrap<'x>) -> &'x u8`, E0195). The fault is the lifetime, not the path.
+    /// A leaked type that names a method lifetime that the copy would leave unconstrained
+    /// (`Wrap<'x>` in `fn f<'x>(&self, a: Wrap<'x>) -> &'x u8`, E0195): the fault is the lifetime.
+    /// Keep it in an input that is not leaked (`&'x self`; see
+    /// [Method lifetimes](crate::Leaker#method-lifetimes)).
     UnconstrainedLifetime,
-    /// A leaked type that names `Self::A` where `Self` is a type: write `<Self as Tr>::A`.
+    /// A leaked type that names `Self::A` where `Self` is a type: the copy cannot tell the trait
+    /// of `A`. Write `<Self as Tr>::A`.
     SelfProjection,
-    /// A type with a generic whose bound names the `Self` of a trait, where `Self` is something
-    /// else. The fault is that bound.
+    /// A leaked type in an item that [`View::visit_item()`](crate::View::visit_item) visits uses a
+    /// generic of the scope around, whose bound names a `Self` that has no name in that item: a
+    /// trait's implementor, or `Self::X` of a type. Write the bound without `Self`, or the type
+    /// with an absolute path.
     UnnameableSelf,
-    /// A type in the default of a parameter that names `Self`: the cause is the type of the
-    /// default, and the note is at the `Self`. In a nested struct, enum or union it is an error
-    /// only if a bound of the generics names `Self` too (E0735).
+    /// A type in the default of a parameter that names `Self` (`trait Tr<U = Wrap<Self>>`). The
+    /// cause is the whole default, and the note is at the `Self`. In a nested struct, enum or
+    /// union, it is an error only if a bound of the generics names `Self` too (E0735). Write the
+    /// default without `Self`.
     SelfInDefault,
-    /// A risk, not a part copied as written: the type is an entry all the same. It names the `Self`
-    /// of a nested struct, enum or union and uses a generic whose bound names it too
-    /// (`Wrap<Self, T>` in `struct S<T: AsRef<Self>>(Wrap<Self, T>);`). The entry is for any type
-    /// that the bound holds for ([`SelfRequirement::Any`](crate::SelfRequirement::Any)), and the
-    /// copy passes its own type.
-    ///
+    /// A risk, not a part that the copy writes as written: the type is an entry all the same. It
+    /// names the `Self` of a nested struct, enum or union, and uses a generic whose bound names
+    /// that `Self` too (`Wrap<Self, T>` in `struct S<T: AsRef<Self>>(Wrap<Self, T>);`). The entry
+    /// is for any type that the bound holds for
+    /// ([`SelfRequirement::Any`](crate::SelfRequirement::Any)), and the copy passes its own type.
     /// The error has no [`paths`](ErrorItem::paths).
-    /// [`LeakerResult::ignore()`](crate::LeakerResult::ignore) removes the entry, so the copy
-    /// writes the type as it is, and none of the following matters.
-    /// [`LeakerResult::allow()`](crate::LeakerResult::allow) drops the error if the rule allows its
-    /// cause, and keeps the entry, and then you promise two things. The declaration of the leaked
-    /// type has no trait bound on the parameter that receives `Self` (`struct Wrap<A: Clone, B>`),
-    /// else the impl fails in the Leaker's crate (E0277): write the type with an absolute path or
-    /// give the item its own `intern_*` call. And rustc before 1.70 fails with E0275 if the copy's
-    /// field is the last field of a struct: put it first, or add `where Self: Sized` to the item. A
-    /// default of a parameter is not changed (E0735), and a bound that names a leaked type that
-    /// names `Self` is still an error.
+    ///
+    /// - [`LeakerResult::ignore()`](crate::LeakerResult::ignore) removes the entry: the copy
+    ///   writes the type as written.
+    /// - [`LeakerResult::allow()`](crate::LeakerResult::allow) with a rule that allows the cause
+    ///   keeps the entry. Then you promise two things. The declaration of the leaked type has no
+    ///   trait bound on the parameter that receives `Self` (`struct Wrap<A: Clone, B>`), else the
+    ///   impl fails in crate A (E0277): write the type with an absolute path, or give the item its
+    ///   own `intern_*` call. And on rustc before 1.70, the copy fails (E0275) if its field is the
+    ///   last field of a struct: put it first, or add `where Self: Sized` to the item.
+    ///
+    /// The same type in a default of a parameter (E0735), or in a bound, is still an error.
     NestedSelfInBounds,
-    /// A type in a bound or where predicate that the copy cannot write through the Repeater
-    /// ([Bounds that name leaked types](crate::Leaker#bounds-that-name-leaked-types)).
+    /// A type in a bound or a where predicate that the copy cannot write through the Repeater
+    /// ([Bounds that name leaked types](crate::Leaker#bounds-that-name-leaked-types)). Write the
+    /// type with an absolute path, or use it outside the bounds: allowing the error does not make
+    /// the copy compile.
     UnprovableBound,
     /// A type that names `Self` in a supertrait bound of its trait, or in a where predicate on a
-    /// type that is neither `Self` nor a generic (E0275): `Rel<Self>` in `trait Tr:
-    /// ::p::Tr<Rel<Self>>`. In a bound of `Self` or of a generic (`where Self: ::p::Tr<Rel<Self>>`,
-    /// `T: ::p::Tr<Rel<Self>>`) the same type is [`UnprovableBound`](Reason::UnprovableBound).
+    /// type that is neither `Self` nor a generic (E0275): `Rel<Self>` in
+    /// `trait Tr: ::p::Tr<Rel<Self>>`. Write the type with an absolute path. In a bound of `Self`
+    /// or of a generic (`where Self: ::p::Tr<Rel<Self>>`), the same type is
+    /// [`UnprovableBound`](Reason::UnprovableBound).
     SelfInTraitPredicate,
-    /// A type in the self type of an impl whose context depends on `Self` through a bound of the
-    /// impl.
+    /// A type in the self type of an impl, whose context depends on `Self` through a bound of the
+    /// impl (`impl<T> S<T> where T: AsRef<Self>`). Write an absolute self type, or a bound without
+    /// `Self`.
     SelfInImplSelfType,
 }
 
@@ -415,11 +430,12 @@ impl Reason {
     }
 }
 
-/// One error of the analysis: a part of an item that cannot be interned.
+/// One error of the analysis: a part of an item that cannot be leaked.
 ///
-/// [`LeakerResult::errors()`](crate::LeakerResult::errors) lists them in the order found. The
-/// `message` says what is wrong, the `notes` why, and the `help` what to write instead, each with
-/// the tokens it is about, so it can be reported at its own span.
+/// [`LeakerResult::errors()`](crate::LeakerResult::errors) lists them in the order found.
+/// `message` says what is wrong, `notes` say why, and `help` says what to write instead. Each note
+/// and the help come with the tokens that they are about, so a macro can report them at their own
+/// spans.
 ///
 /// ```
 /// # use type_leak::*;
@@ -438,35 +454,33 @@ impl Reason {
 /// assert_eq!(item.to_string(), item.message);
 /// ```
 ///
-/// Report an item from a macro with [`emit()`](ErrorItem::emit);
-/// [`to_compile_error()`](ErrorItem::to_compile_error) is the same without the nightly diagnostic,
-/// and `syn::Error::from(item)` is a [`syn::Error`] at the span of the cause. [`ToTokens`] and
-/// [`Parse`] serialize an item as one brace group, to pass it to another macro of the same
-/// type-leak version.
+/// Report an error from a macro with [`emit()`](ErrorItem::emit).
+/// [`to_compile_error()`](ErrorItem::to_compile_error) does the same without the nightly
+/// diagnostic, and `syn::Error::from(error)` is a [`syn::Error`] at the span of the cause.
+/// [`ToTokens`] and [`Parse`] write and read an error as one brace group, to pass it to another
+/// macro that uses the same version of type-leak.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ErrorItem {
-    /// The part of the item that cannot be interned, as written, and where the error is reported
-    /// ([`ErrorItem::span()`]). Compare it with `==` in an [`Allow`](crate::Allow) rule: a rule
-    /// accepts an error that has [`paths`](ErrorItem::paths) by them, and one that has none by
-    /// this.
+    /// The syntax with the error, as written. The error is reported at its span
+    /// ([`ErrorItem::span()`]). An [`Allow`](crate::Allow) rule accepts an error without
+    /// [`paths`](ErrorItem::paths) by its cause.
     pub cause: Cause,
-    /// Why it cannot be interned.
+    /// Why it cannot be leaked.
     pub reason: Reason,
-    /// What is wrong: `use absolute path: '..'` for a relative path, else the reason's headline.
+    /// What is wrong: `use absolute path: '..'` for a relative path, else the headline of the
+    /// reason.
     pub message: String,
-    /// Why, each with the tokens it is about, the most useful first: the note of the reason, then
-    /// the causes that stop the type from being leaked whole or depend on the context. A relative
-    /// path that would be leaked once the cause is fixed is no note (`Local` in `Base<Local>`): it
-    /// is in [`paths`](ErrorItem::paths).
+    /// Why, the most useful first, each with the tokens that it is about: the note of the reason,
+    /// then the causes that keep the type from being leaked whole, then the other paths that
+    /// depend on where they are written. A relative path that would be leaked once the cause is
+    /// fixed (`Local` in `Base<Local>`) is no note: it is in [`paths`](ErrorItem::paths).
     pub notes: Vec<(TokenStream, String)>,
-    /// What to write instead, with the tokens it is about. The analysis gives every error one; it
-    /// is `None` only in an item that [`Parse`] read without.
+    /// What to write instead, with the tokens that it is about. Every error of the analysis has
+    /// one: it is `None` only if [`Parse`] read an error without it.
     pub help: Option<(TokenStream, String)>,
-    /// Where it was found: in a value or a body that
-    /// [`Leaker::check_values`](crate::Leaker::check_values) or
-    /// [`Leaker::check_bodies`](crate::Leaker::check_bodies) reads, in a default, both or neither.
-    /// It is the place that an [`Allow`](crate::Allow) rule is asked at.
+    /// Where the error is: in a value or a body that the Leaker reads, in a default, in both or in
+    /// neither. An [`Allow`](crate::Allow) rule is asked at this place.
     ///
     /// ```ignore
     /// // In crate a, with the values and the bodies read.
@@ -479,12 +493,10 @@ pub struct ErrorItem {
     /// struct S(Rel<'_>);               // `Rel<'_>`: neither
     /// ```
     pub place: Place,
-    /// The relative paths that the copy writes as they are, each as the cause of its kind (a
-    /// [`Cause::Type`], [`Cause::Trait`], [`Cause::Expr`], [`Cause::Macro`] or [`Cause::Unknown`]
-    /// that is a path) and without its arguments: `MyType` in `MyType<'_, Rel>`. What is inside
-    /// the arguments is analyzed on its own, so it has its own errors and entries. There are
-    /// several where one cause holds several paths (`dyn A + B`). A rule drops the error if it
-    /// accepts all of them.
+    /// The relative paths that the copy writes as written, each as a [`Cause`] of its kind,
+    /// without generic arguments: `MyType` for `MyType<'_, Rel>`. What is inside the arguments is
+    /// analyzed on its own, with its own errors and entries. A part written whole, or `dyn A + B`,
+    /// has several paths. A rule drops the error if it allows all of them.
     pub paths: Vec<Cause>,
     /// What the error is about in the Referrer, for
     /// [`LeakerResult::ignore()`](crate::LeakerResult::ignore).
@@ -536,22 +548,23 @@ impl ErrorItem {
         self.cause.to_token_stream().span()
     }
 
-    /// Returns the text of the help, which says what to write instead.
+    /// Returns the text of the help.
     pub fn help_text(&self) -> Option<&str> {
         self.help.as_ref().map(|(_, help)| help.as_str())
     }
 
-    /// Returns a `compile_error!` that reports the error, with the notes and the help in its
-    /// message. Pure: use it to build or compare tokens; a macro reports with
+    /// Returns a `compile_error!` with the message, the notes and the help. It reports nothing by
+    /// itself: use it to build or compare tokens. A macro reports with
     /// [`emit()`](ErrorItem::emit).
     #[must_use]
     pub fn to_compile_error(&self) -> TokenStream {
         self.to_syn_error().to_compile_error()
     }
 
-    /// Reports the error from a proc macro, and returns the tokens to give back. On nightly it
-    /// emits a `Diagnostic` with the notes and the help at their own spans and returns no tokens;
-    /// elsewhere it returns [`to_compile_error()`](ErrorItem::to_compile_error).
+    /// Reports the error from a proc macro, and returns the tokens to give back. On nightly,
+    /// inside a proc macro, it emits a `Diagnostic` with the notes and the help at their own spans,
+    /// and returns no tokens. Elsewhere it returns
+    /// [`to_compile_error()`](ErrorItem::to_compile_error).
     #[must_use]
     pub fn emit(&self) -> TokenStream {
         // Only compiled on nightly, so the MSRV does not apply.
@@ -607,8 +620,9 @@ impl ErrorItem {
     }
 }
 
-/// Two errors are equal if every field is: the tokens by their kinds and text, apart from spans
-/// and spacing, and what the error is about in the Referrer.
+/// Two errors are equal if all their fields are equal. Tokens are compared by kind and text, not by
+/// span or spacing. The part or entry of the Referrer that the error is about (hidden, for
+/// [`LeakerResult::ignore()`](crate::LeakerResult::ignore)) must be equal too.
 impl PartialEq for ErrorItem {
     fn eq(&self, other: &Self) -> bool {
         let same_at = |a: &(TokenStream, String), b: &(TokenStream, String)| {
@@ -650,7 +664,8 @@ impl std::fmt::Display for ErrorItem {
 
 impl std::error::Error for ErrorItem {}
 
-/// Converts into a [`syn::Error`] at the span of the cause, with the notes and the help appended.
+/// Converts into a [`syn::Error`] at the span of the cause, with the notes and the help after the
+/// message.
 ///
 /// ```
 /// # use type_leak::*;
@@ -673,8 +688,8 @@ impl From<ErrorItem> for syn::Error {
     }
 }
 
-/// Reads an [`ErrorItem`] written by its [`ToTokens`]; the tokens after it are not consumed. Fails
-/// on an unknown kind or reason, and on a cause that is not the whole content of its parentheses.
+/// Reads an [`ErrorItem`] that its [`ToTokens`] wrote, and leaves the tokens after it. Fails on an
+/// unknown kind or reason, and on a cause that is not all of the content of its parentheses.
 impl Parse for ErrorItem {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         /// `( TOKENS ) "text"`.
@@ -772,8 +787,8 @@ impl Parse for ErrorItem {
     }
 }
 
-/// Writes the [`ErrorItem`] as one brace group, to be read by its [`Parse`]: a serialization, not a
-/// report (see [`emit()`](ErrorItem::emit)).
+/// Writes the [`ErrorItem`] as one brace group for its [`Parse`]. This does not report the error:
+/// see [`emit()`](ErrorItem::emit).
 impl ToTokens for ErrorItem {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let kind = Ident::new(self.cause.kind(), Span::call_site());
