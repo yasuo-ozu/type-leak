@@ -364,43 +364,19 @@ pub(crate) fn messages(errors: &[ErrorItem]) -> String {
     messages.join("\n")
 }
 
-/// Reports the errors of the Leaker as `report()` does, or, with `serialized`, after they were
-/// written as tokens (their `ToTokens`) and read back (their `Parse`) through a
-/// `proc_macro::TokenStream`, as a macro does that hands its errors to another one (the attribute
-/// of `leak_strict` and `leak_generics`: `#[leak_strict(serialized)]`).
-fn report_errors(errors: &[ErrorItem], serialized: bool) -> proc_macro::TokenStream {
-    if !serialized {
-        return report(errors).into();
-    }
-    let written: TokenStream = errors.iter().map(ToTokens::to_token_stream).collect();
-    let read = |input: ParseStream| -> Result<Vec<ErrorItem>> {
-        let mut items = Vec::new();
-        while !input.is_empty() {
-            items.push(input.parse()?);
-        }
-        Ok(items)
-    };
-    match syn::parse::Parser::parse(read, proc_macro::TokenStream::from(written)) {
-        Ok(items) => report(&items).into(),
-        Err(e) => e.to_compile_error().into(),
-    }
-}
-
 /// Analyzes a trait without allowing any relative path, reporting the errors with
-/// `ErrorItem::emit()` (for tests/diagnostic.rs). `#[leak_strict(serialized)]` reports
-/// them after the serialization (`report_errors()`).
+/// `ErrorItem::emit()` (for tests/diagnostic.rs).
 #[proc_macro_attribute]
 pub fn leak_strict(
-    attr: proc_macro::TokenStream,
+    _attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    let serialized = attr.to_string() == "serialized";
     let item_trait = parse_macro_input!(item as ItemTrait);
     let mut leaker = Leaker::new();
     leaker.intern_trait(&item_trait);
     match leaker.result().finish() {
         Ok(_) => quote!(#item_trait).into(),
-        Err(e) => report_errors(&e, serialized),
+        Err(e) => report(&e).into(),
     }
 }
 
@@ -429,13 +405,12 @@ pub fn leak_discard(
 /// Like `leak_strict`, but enters only the generics of the trait (`Leaker::enter_generics()`), where
 /// `Self` has no meaning, and visits the types of its methods: a mention of `Self` is an error
 /// with the reason `SelfWithoutMeaning`, reported with `ErrorItem::emit()` (for
-/// tests/diagnostic.rs). `#[leak_generics(serialized)]` reports them after the serialization.
+/// tests/diagnostic.rs).
 #[proc_macro_attribute]
 pub fn leak_generics(
-    attr: proc_macro::TokenStream,
+    _attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    let serialized = attr.to_string() == "serialized";
     let item_trait = parse_macro_input!(item as ItemTrait);
     let mut leaker = Leaker::new();
     leaker.enter_generics(&item_trait.generics, |view| {
@@ -454,7 +429,7 @@ pub fn leak_generics(
     });
     match leaker.result().finish() {
         Ok(_) => quote!(#item_trait).into(),
-        Err(e) => report_errors(&e, serialized),
+        Err(e) => report(&e).into(),
     }
 }
 

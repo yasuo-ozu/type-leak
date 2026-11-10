@@ -849,8 +849,8 @@ pub use type_leak_test_ext as __ext;
 /// Types of a crate which the Referrer's crate has no dependency on (`::type_leak_test_ext::Ext<..>`):
 /// the Leaker makes entries of them, which the copy replaces with the Repeater's projections, so
 /// that it does not name the crate; with a Leaker that allows the crate (`ExtDepAllowed`) they are no
-/// entries, and the copy is no use in a crate without the dependency (the module `trusting` of
-/// `tests/diagnostic.rs`).
+/// entries, and the copy is no use in a crate without the dependency (`NoDependency` in
+/// `tests/crates/referrer`).
 pub mod x {
     use type_leak_test_macro::leak;
 

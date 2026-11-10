@@ -1567,9 +1567,9 @@ fn errors_the_referrers_macro_allows_are_copied_as_written() {
 /// Leaker allows the crate. After a Leaker that allows it the copy names the crate (the relative
 /// type in it is replaced), and after the default one the copy replaces the whole type, so that the
 /// crate is not named: the text of the two copies of the same items differs in that. Only the
-/// second can be compiled where the crate is not a dependency (this crate has none on it): the
-/// module `trusting` of `tests/diagnostic.rs` builds both in a crate that has none, and runs the
-/// tests of the second.
+/// second can be compiled where the crate is not a dependency (the Referrer's crate has none on
+/// it): `NoDependency`, `kinds::Holds` and `scoped`'s 7005 are compiled there, and the tests below
+/// them run.
 #[test]
 fn a_leaker_that_allows_a_crate_has_the_copy_name_it_and_the_default_one_does_not() {
     use type_leak_test_referrer::{ALLOWED_COPY, REPLACED_COPY};
@@ -1599,6 +1599,53 @@ fn a_leaker_that_allows_a_crate_has_the_copy_name_it_and_the_default_one_does_no
     );
     assert_eq!(replaced.matches("Repeater<").count(), 2);
     assert_ne!(allowed, replaced);
+}
+
+/// The impl in a crate without the dependency (`NoDependency`) works: it forwards, and the types it
+/// takes and returns are the original ones.
+#[test]
+fn the_impl_in_a_crate_without_the_dependency_forwards() {
+    use type_leak_test_leaker::__ext::Ext;
+    use type_leak_test_leaker::x::{ExtDep, RelX};
+    let strict = type_leak_test_referrer::NoDependency(Inner);
+    let wrapped: Ext<(RelX,)> = strict.wrapped();
+    assert_eq!((wrapped.0).0 .0, 21);
+    assert_eq!(strict.plain(Ext(4)), 5);
+}
+
+/// The copy of a struct in a crate without the dependency has the original types in its fields,
+/// the type of the crate included.
+#[test]
+fn the_copy_of_a_struct_in_a_crate_without_the_dependency_has_the_original_types() {
+    use type_leak_test_leaker::__ext::Ext;
+    use type_leak_test_leaker::kinds as l;
+    use type_leak_test_referrer::kinds as r;
+    let rel = l::Rel(7);
+    let holds = r::Holds {
+        wrapped: Ext((rel,)),
+        plain: Ext(5u8),
+        rel,
+    };
+    assert_eq!(holds.wrapped, Ext((l::Rel(7),)));
+    assert_eq!(holds.plain, Ext(5));
+}
+
+/// The copy of the types of a fragment does not name the crate: the entry is replaced.
+#[test]
+fn the_copy_of_a_fragment_in_a_crate_without_the_dependency_does_not_name_it() {
+    let trait_path = squash(type_leak_test_referrer::scoped::SCOPE_7005_TRAIT);
+    assert!(!trait_path.contains("type_leak_test_ext"), "{}", trait_path);
+    // The type of the crate is the entry 1, after the other.
+    assert!(
+        trait_path.contains(&format!("{}>>::Type,", key_text(7005, 1))),
+        "{}",
+        trait_path
+    );
+    assert!(
+        trait_path.ends_with(&format!("{}>>::Type>", key_text(7005, 0))),
+        "{}",
+        trait_path
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1756,8 +1803,8 @@ fn the_scope_api_writes_the_impls_that_are_needed() {
         type_leak_test_leaker::__scope_report_7007!(),
         "7007|entries=1 impls=1 types=4"
     );
-    // (The module `trusting` of `tests/diagnostic.rs` applies 7005 in a crate that has no
-    // dependency on the crate of the second entry.)
+    // (The Referrer's crate applies 7005 without a dependency on the crate of the second entry: see
+    // `the_copy_of_a_fragment_in_a_crate_without_the_dependency_does_not_name_it`.)
 }
 
 /// The errors of the Leaker (`Vec<ErrorItem>`) through a macro: one item for each offending path,

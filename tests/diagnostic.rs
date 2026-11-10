@@ -6,15 +6,18 @@
 //!
 //! - the top level: how rustc renders the errors of the Leaker (below);
 //! - `spans`: the spans of the errors, by the tests of `tests/crates/spans`;
-//! - `trusting`: a Referrer in a crate without the dependency of an optional entry;
 //! - `outlives`: the outlives bounds in the Repeater's implementations and the copies;
 //! - `two_macros`: the example of the README, with a macro in each of two crates.
 //!
+//! Every test here is `#[ignore]`d, as each builds a crate with a nested `cargo` (about a minute and
+//! 1.4 GB of `target/tmp` on a fresh target, and a rebuild after any change of the library). Run
+//! them with `cargo test --test diagnostic -- --ignored` (CI does, on stable and nightly). Do not
+//! use `--include-ignored` on the whole suite: it would start the property test.
+//!
 //! The top level checks how rustc renders the errors of the Leaker (`ErrorItem`) reported by a proc
 //! macro with `ErrorItem::emit()`, by building `tests/crates/diagnostic` (which fails to compile).
-//! The first items of `tests/crates/diagnostic_serialized` are the same, but the macro writes its
-//! errors as tokens, reads them back and then reports them: rustc renders them in the same way, at
-//! the same places.
+//! (The errors that a macro writes as tokens, reads back and reports keep their spans: the package
+//! of `spans` checks that in-process.)
 //!
 //! On nightly, the notes and the help are those of the diagnostic, each with its own span and
 //! source preview; on stable, they are appended to the message (`= note: ..`, then `= help: ..`, as
@@ -156,6 +159,7 @@ fn format_error(found: &str, at: &str) -> Reported {
 }
 
 #[test]
+#[ignore = "builds crates with a nested cargo; run with `cargo test --test diagnostic -- --ignored`"]
 fn note_is_rendered() {
     let stderr = build_fixture();
     let expected: &[&str] = if nested::rustc_is_nightly() {
@@ -274,6 +278,7 @@ error: use absolute path: 'RelA'
 /// at its own span (an item with five has five, in the order of the source), and the notes of each
 /// are its own.
 #[test]
+#[ignore = "builds crates with a nested cargo; run with `cargo test --test diagnostic -- --ignored`"]
 fn every_offending_path_is_an_error_of_its_own() {
     let stderr = build_fixture();
     let got = reported(stderr);
@@ -405,6 +410,7 @@ fn every_offending_path_is_an_error_of_its_own() {
 /// as `ty! (Self)` and `use inner::* ;`, and the texts join them to `ty!(Self)` and `use
 /// inner::*;`. The other tests compare the errors without whitespace.
 #[test]
+#[ignore = "builds crates with a nested cargo; run with `cargo test --test diagnostic -- --ignored`"]
 fn a_macro_call_and_a_statement_are_quoted_as_one_writes_them() {
     let stderr = build_fixture();
     for quoted in ["`ty!(Self)`", "`use inner::*;`"] {
@@ -415,64 +421,10 @@ fn a_macro_call_and_a_statement_are_quoted_as_one_writes_them() {
     }
 }
 
-/// The diagnostics of the output of rustc for the first `lines` lines of the source, as text, in
-/// order. What differs in the two fixtures is left out: the note that names the macro, and the
-/// summary of cargo.
-fn diagnostics_up_to(stderr: &str, lines: usize) -> Vec<String> {
-    let mut found: Vec<String> = Vec::new();
-    let mut current: Option<Vec<&str>> = None;
-    for line in stderr.lines().map(str::trim_end) {
-        if line.starts_with("error") || line.starts_with("warning") {
-            found.extend(current.take().map(|block| block.join("\n")));
-            if !line.starts_with("error: could not compile") {
-                current = Some(Vec::new());
-            }
-        }
-        if let Some(block) = &mut current {
-            if !line.contains("this error originates") {
-                block.push(line);
-            }
-        }
-    }
-    found.extend(current.map(|block| block.join("\n")));
-    // The place of a diagnostic is the first `--> lib.rs:<line>:` in it.
-    found
-        .into_iter()
-        .filter(|block| {
-            block
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("--> lib.rs:"))
-                .and_then(|place| place.split(':').next()?.parse::<usize>().ok())
-                .map_or(false, |line| line <= lines)
-        })
-        .collect()
-}
-
-/// The errors that a macro writes as tokens, reads back and reports are reported as those it
-/// reports directly: the tokens of the cause, of the notes and of the help keep their spans, so
-/// rustc points at the same places, with the same text.
-#[test]
-fn serialized_errors_are_reported_at_the_same_places() {
-    let direct = diagnostics_up_to(build_fixture(), 23);
-    let built = nested::cargo("diagnostic_serialized", &["check"], &[]);
-    assert!(!built.success, "{}", built.stderr);
-    let serialized = diagnostics_up_to(&built.stderr, 23);
-    // The three items with one error and the trait object in the second, the five of `Multi`, and
-    // the two mentions of `Self`.
-    assert_eq!(direct.len(), 11, "{}", direct.join("\n"));
-    assert_eq!(serialized, direct);
-    // And no other error: the fixture is the first lines of the other.
-    let errors = built
-        .stderr
-        .lines()
-        .filter(|line| line.starts_with("error") && !line.starts_with("error: could not compile"))
-        .count();
-    assert_eq!(errors, direct.len(), "{}", built.stderr);
-}
-
 /// `ErrorItem::to_compile_error()` only builds tokens: a macro that drops them reports nothing,
 /// also on nightly, where `emit()` reports a `Diagnostic` as a side effect.
 #[test]
+#[ignore = "builds crates with a nested cargo; run with `cargo test --test diagnostic -- --ignored`"]
 fn to_compile_error_alone_reports_nothing() {
     let built = nested::cargo("diagnostic_pure", &["check"], &[]);
     assert!(built.success, "{}", built.stderr);
@@ -513,6 +465,7 @@ fn position_in_leaker(marker: &str, needle: &str) -> String {
 /// not: `core::fmt::Debug` and `Held<'_>` are. They are at the invocation, as rustc has it for the
 /// spans of a macro of another crate.
 #[test]
+#[ignore = "builds crates with a nested cargo; run with `cargo test --test diagnostic -- --ignored`"]
 fn errors_the_referrers_macro_does_not_allow_are_reported_in_its_crate() {
     let built = nested::cargo("diagnostic_result", &["check"], &[]);
     assert!(!built.success, "{}", built.stderr);
@@ -545,6 +498,7 @@ fn errors_the_referrers_macro_does_not_allow_are_reported_in_its_crate() {
 /// the causes in the Leaker's crate, which the serialization and the `macro_rules!` of the other
 /// crate kept. Stable has no such flag; the test above is what it can check.
 #[test]
+#[ignore = "builds crates with a nested cargo; run with `cargo test --test diagnostic -- --ignored`"]
 fn the_spans_of_the_causes_survive_the_trip_between_the_crates() {
     if !nested::rustc_is_nightly() {
         return;
@@ -572,6 +526,7 @@ fn the_spans_of_the_causes_survive_the_trip_between_the_crates() {
 /// the expansion that reported an error, so nothing but the expansion shows it; `-Zunpretty` is
 /// nightly's.)
 #[test]
+#[ignore = "builds crates with a nested cargo; run with `cargo test --test diagnostic -- --ignored`"]
 fn the_copy_is_made_when_an_error_remains() {
     if !nested::rustc_is_nightly() {
         return;
@@ -603,6 +558,7 @@ mod spans {
     use std::process::Command;
 
     #[test]
+    #[ignore = "builds crates with a nested cargo; run with `cargo test --test diagnostic -- --ignored`"]
     fn the_spans_of_the_errors_are_at_the_offending_tokens() {
         let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/crates/spans/Cargo.toml");
         // The published package has no `tests/crates` (see `exclude` of `Cargo.toml`).
@@ -626,59 +582,6 @@ mod spans {
         // and its assertions), and 2 of `EncodeError`.
         assert!(stdout.contains("test result: ok. 15 passed"), "{}", stdout);
         assert!(stdout.contains("test result: ok. 2 passed"), "{}", stdout);
-    }
-}
-
-mod trusting {
-    //! A Leaker that allows the crate of a type, and one that does not, in a crate that has no
-    //! dependency on that crate (`tests/crates/trusting`).
-    //!
-    //! `type_leak_test_leaker::x::ExtDep` names `::type_leak_test_ext::Ext<..>`. It is an entry
-    //! unless the Leaker allows the crate: `ExtDep` is analyzed by one that does not, so the macro
-    //! replaces the whole type with the Repeater's projection, and the crate does not need it;
-    //! `ExtDepAllowed` is analyzed by one that does, so the copy names a crate that the Referrer's
-    //! crate does not have. `tests/cross_crate.rs` has the text of both copies. This is the
-    //! second, which rustc rejects, and the same crate with the feature `replace`, which it accepts
-    //! and whose own tests (the copies of a struct and of a fragment of an impl, and an impl that
-    //! forwards) pass: the outcome differs by that flag alone.
-
-    use super::nested;
-
-    #[test]
-    fn a_crate_that_the_leaker_allows_needs_the_dependency() {
-        // The methods that name the crate fail alike (rustc prints the same error once).
-        let allowed = nested::cargo("trusting", &["check"], &[]);
-        assert!(!allowed.success, "{}", allowed.stderr);
-        assert_eq!(
-            nested::error_codes(&allowed.stderr),
-            ["E0433"],
-            "{}",
-            allowed.stderr
-        );
-        assert!(
-            allowed
-                .stderr
-                .contains("cannot find `type_leak_test_ext` in"),
-            "{}",
-            allowed.stderr
-        );
-    }
-
-    #[test]
-    fn a_crate_that_it_does_not_allow_does_not() {
-        // Nothing else is wrong with the crate, so the flag alone makes the difference.
-        let replaced = nested::cargo("trusting", &["check"], &["replace"]);
-        assert!(replaced.success, "{}", replaced.stderr);
-        assert_eq!(replaced.stderr, "");
-        // And what it wrote works.
-        let tests = nested::cargo("trusting", &["test", "--lib"], &["replace"]);
-        assert!(tests.success, "{}{}", tests.stdout, tests.stderr);
-        assert!(
-            tests.stdout.contains("test result: ok. 3 passed; 0 failed"),
-            "{}{}",
-            tests.stdout,
-            tests.stderr
-        );
     }
 }
 
@@ -710,9 +613,8 @@ mod outlives {
     //! enough`. The fixture has this failing case disabled (the feature `negative-unbounded`, `m::
     //! Unbounded`), and the same for `Self` (`negative-unbounded-self`, `m::UnboundedSelf`, E0309 for
     //! `__S`) and for the field of a struct (`negative-unbounded-around`, `m::UnboundedAround`, see
-    //! below). Each is built here with its feature, and must fail with exactly the error written
-    //! above it (E0309 on stable and nightly); so must the alternative that is not taken for a trait
-    //! object (`negative-alone`, E0308 or E0478, and E0521).
+    //! below). The three are built here at once (rustc reports the errors of the items together), and
+    //! the build must fail with exactly the error written above each (E0309 on stable and nightly).
     //!
     //! The fixture also has the cases around it: the control `Loose<'a, T>` (which does not require
     //! the bound, so nothing is written and the copy is the same as the original), references and
@@ -776,7 +678,7 @@ mod outlives {
     //! The fixture is built on its own, so that a failure of it does not break the other cross-crate
     //! tests (the Leaker's crate in `tests/crates/leaker` is a dependency of all of them). The tests
     //! check what rustc printed, not only whether it succeeded: the warnings of the good build, and
-    //! the errors of each negative control.
+    //! the errors of the negative controls.
 
     use super::nested;
 
@@ -785,6 +687,7 @@ mod outlives {
     /// copy keeps as it is written. Any other lint (an unused lifetime or import, a dead item) in a
     /// copy or in a Repeater's implementation would be new.
     #[test]
+    #[ignore = "builds crates with a nested cargo; run with `cargo test --test diagnostic -- --ignored`"]
     fn implied_outlives_bounds_are_kept() {
         let built = nested::cargo("outlives", &["build"], &[]);
         assert!(built.success, "{}", built.stderr);
@@ -802,37 +705,9 @@ mod outlives {
         }
     }
 
-    /// Builds the fixture with a negative control, which must fail to compile with exactly these
-    /// errors (their codes, and the headline of the first).
-    fn negative(feature: &str, codes: &[&str], headline: &str) {
-        let built = nested::cargo("outlives", &["check"], &[feature]);
-        assert!(
-            !built.success,
-            "`{}` compiles, but is a negative control:\n{}",
-            feature, built.stderr
-        );
-        let mut got = nested::error_codes(&built.stderr);
-        // The error of a trait object whose lifetime was written where the path makes it `'static` is
-        // E0308 (`method not compatible with trait`) on stable, and E0478 (`lifetime bound not
-        // satisfied`) on nightly.
-        for code in &mut got {
-            if code == "E0478" {
-                *code = "E0308".to_string();
-            }
-        }
-        got.sort();
-        assert_eq!(got, codes, "`{}`:\n{}", feature, built.stderr);
-        assert!(
-            built.stderr.contains(headline),
-            "`{}` has no `{}`:\n{}",
-            feature,
-            headline,
-            built.stderr
-        );
-    }
-
-    /// The negative controls: each feature of the fixture enables an item that does not compile, which
-    /// must fail with exactly these errors (the codes, and the headline of the first), because
+    /// The negative controls: each feature of the fixture enables an item that does not compile.
+    /// The three are built at once, and the build must fail with exactly three E0309, one for each
+    /// feature (told by the headline and by the line of the source that rustc shows with it), because
     ///
     /// - `Rel<'a, T>` without `T: 'a` written: the Repeater's implementation, whose header encodes `T`
     ///   but implies nothing about `'a`, is rejected (`m::Unbounded`);
@@ -840,37 +715,58 @@ mod outlives {
     ///   encodes `__S` only;
     /// - the field of a struct (`m::UnboundedAround`): `Rel2<T>` is leaked with the generics `<T>` its
     ///   signature writes, so the copy `Ref<'a, <Wrapper as Repeater<(T,), ..>>::Type>` is not
-    ///   well-formed without `T: 'a`, which nothing infers through the projection;
-    /// - the alternative which is not taken for a trait object without a lifetime bound as the argument
-    ///   of a path with a lifetime: leaking it alone with `+ 'a` written, and keeping the path around
-    ///   the projection in the copy. The object lifetime of `Inferred` and `Unrelated` is `'static`, so
-    ///   the copy returns another type (E0308 on stable, E0478 on nightly, for each of the two), and
-    ///   the forwarding body hands out a borrow that does not live that long (E0521).
+    ///   well-formed without `T: 'a`, which nothing infers through the projection.
+    ///
+    /// (The alternative that is not taken for a trait object without a lifetime bound as the argument
+    /// of a path with a lifetime, leaking it alone with `+ 'a` written, is no negative control any
+    /// more: the copies of `ObjectDefaults` in the good build return the path as the original does.)
     #[test]
+    #[ignore = "builds crates with a nested cargo; run with `cargo test --test diagnostic -- --ignored`"]
     fn the_negative_controls_fail_with_their_errors() {
-        for (feature, codes, headline) in [
+        // The feature, the headline, and the line of the source that rustc shows for the error.
+        let controls = [
             (
                 "negative-unbounded",
-                &["E0309"][..],
                 "error[E0309]: the parameter type `T` may not live long enough",
+                "fn by_ref<'a, T>(&self, x: Rel<'a, T>) -> usize;",
             ),
             (
                 "negative-unbounded-self",
-                &["E0309"][..],
                 "error[E0309]: the parameter type `__S` may not live long enough",
+                "fn me<'a>(&'a self) -> Rel<'a, Self>",
             ),
             (
                 "negative-unbounded-around",
-                &["E0309"][..],
                 "error[E0309]: the parameter type `T` may not live long enough",
+                "pub struct Unbounded<'a, T>(pub ::core::cell::Ref<'a, Rel2<T>>);",
             ),
-            (
-                "negative-alone",
-                &["E0308", "E0308", "E0521", "E0521"][..],
-                "borrowed data escapes outside of method",
-            ),
-        ] {
-            negative(feature, codes, headline);
+        ];
+        let features: Vec<&str> = controls.iter().map(|(feature, ..)| *feature).collect();
+        let built = nested::cargo("outlives", &["check"], &features);
+        assert!(
+            !built.success,
+            "{:?} compile, but are negative controls:\n{}",
+            features, built.stderr
+        );
+        assert_eq!(
+            nested::error_codes(&built.stderr),
+            ["E0309"; 3],
+            "{:?}:\n{}",
+            features,
+            built.stderr
+        );
+        // A diagnostic is a block of lines up to a blank one.
+        let blocks: Vec<&str> = built.stderr.split("\n\n").collect();
+        for (feature, headline, shown) in controls {
+            let found = blocks
+                .iter()
+                .filter(|block| block.starts_with(headline) && block.contains(shown))
+                .count();
+            assert_eq!(
+                found, 1,
+                "`{}` has no `{}` at `{}`:\n{}",
+                feature, headline, shown, built.stderr
+            );
         }
     }
 }
@@ -913,6 +809,7 @@ mod two_macros {
 
     /// The wrappers of `app` forward, with the types of `repo` that `app` never names.
     #[test]
+    #[ignore = "builds crates with a nested cargo; run with `cargo test --test diagnostic -- --ignored`"]
     fn the_example_builds_and_its_wrappers_forward() {
         let Some((success, stdout, stderr)) = cargo(&["test", "--workspace"]) else {
             return;
@@ -923,6 +820,7 @@ mod two_macros {
 
     /// `#[export_trait]` reports each path that cannot be leaked at its own span, with what to write.
     #[test]
+    #[ignore = "builds crates with a nested cargo; run with `cargo test --test diagnostic -- --ignored`"]
     fn the_example_reports_what_cannot_be_exported() {
         let Some((success, _, stderr)) = cargo(&["check", "-p", "repo", "--features", "bad"])
         else {

@@ -117,14 +117,22 @@ type_leak_test_leaker::m::External!(impl<T> External<T> for Strict => 0 {
 
 // What the macro writes for the same items after a Leaker that allows the crate and one that does
 // not, as text: the first names the crate, the second replaces the whole type of it. This crate has
-// no dependency on that crate (`type_leak_test_ext`), so it cannot compile either copy: the second
-// is compiled in `tests/crates/trusting`, which has the feature `replace` for it.
+// no dependency on that crate (`type_leak_test_ext`), so it cannot compile either text: the
+// second is compiled below (`NoDependency`, `kinds::Holds`, `scoped`'s 7005), which only builds
+// because the copy does not name the crate.
 type_leak_test_leaker::x::ExtDepAllowed!(show ALLOWED_COPY [Wrapper] {
     pub fn f(x: ::type_leak_test_ext::Ext<(RelX,)>, y: ::type_leak_test_ext::Ext<u8>) {}
 });
 type_leak_test_leaker::x::ExtDep!(show REPLACED_COPY [Wrapper] {
     pub fn f(x: ::type_leak_test_ext::Ext<(RelX,)>, y: ::type_leak_test_ext::Ext<u8>) {}
 });
+
+/// The Leaker's traits `ExtDep` name a type of a crate that this crate does not depend on
+/// (`type_leak_test_ext`). The Leaker does not allow the crate, so the type is an entry and the
+/// macro replaces it with the Repeater's projection: the impl compiles without the dependency
+/// (a Leaker that allows the crate, `ExtDepAllowed`, has the copy name it: `ALLOWED_COPY`).
+pub struct NoDependency(pub type_leak_test_leaker::x::Inner);
+type_leak_test_leaker::x::ExtDep!(impl ExtDep for NoDependency => 0);
 
 /// Fragments of impls analyzed with the scope API (`Leaker::enter_impl()`): the Referrer's copy of
 /// each is checked against the original with a witness, and by finding the impl of the Leaker's
@@ -137,6 +145,9 @@ pub mod scoped {
     type_leak_test_leaker::__scope_apply_7003!(path = ::type_leak_test_leaker::scoped);
     // A where clause of the impl, which the Repeater's impl has too.
     type_leak_test_leaker::__scope_apply_7006!(path = ::type_leak_test_leaker::scoped);
+    // The type of a crate that this crate does not depend on is an entry next to another one: the
+    // copy does not name the crate (the Leaker's macro wrote the impl of both).
+    type_leak_test_leaker::__scope_apply_7005!(path = ::type_leak_test_leaker::scoped);
 }
 
 /// Items of every kind, copied by the Referrer: each copy has a witness for each type position, so
@@ -151,6 +162,9 @@ pub mod kinds {
 
     type_leak_test_leaker::__tl_prop_9001!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9002!(path = ::type_leak_test_leaker::kinds);
+    // The fields have a type of a crate that this crate does not depend on: its copy has the
+    // original types.
+    type_leak_test_leaker::__tl_prop_9004!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9005!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9011!(path = ::type_leak_test_leaker::kinds);
     type_leak_test_leaker::__tl_prop_9012!(path = ::type_leak_test_leaker::kinds);

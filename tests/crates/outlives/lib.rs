@@ -507,11 +507,10 @@ pub mod m {
     /// The return types are the ones which matter: an argument of the copy may be wider than the
     /// original's (`+ 'a` where the trait has `+ 'static` is accepted for the caller's `'static`,
     /// by covariance), but a return type may not, so a wrong object lifetime in the copy is
-    /// rejected there. Leaking `dyn RelTr + 'a` alone, the alternative written out in
-    /// `user::alone` (disabled), is rejected for `Inferred` and `Unrelated`, whose real default is
-    /// `'static`: the copy returns `Inferred<'a, dyn RelTr + 'a>` where the trait returns
-    /// `Inferred<'a, dyn RelTr + 'static>` (E0308 on stable, E0478 on nightly). It is right for
-    /// `Explicit` only, so the trait object is never leaked alone.
+    /// rejected there. Leaking `dyn RelTr + 'a` alone would be rejected for `Inferred` and
+    /// `Unrelated`, whose real default is `'static`: the copy would return `Inferred<'a, dyn RelTr
+    /// + 'a>` where the trait returns `Inferred<'a, dyn RelTr + 'static>` (E0308 on stable, E0478
+    /// on nightly). It is right for `Explicit` only, so the trait object is never leaked alone.
     #[leak(
         helper = crate::__macro,
         repeater = crate::Repeater,
@@ -2038,52 +2037,6 @@ pub mod user {
             Unrelated(Unrelated<'a, dyn RelTr>),
         }
     });
-    // The alternative which is NOT taken, written out and disabled: leaking the trait object `dyn
-    // RelTr + 'a` alone, and keeping the path around `<Self as Repeater<..>>::Type` in the copy.
-    // `Inferred<'a, dyn RelTr>` and `Unrelated<'a, dyn RelTr>` are `+ 'static` (their definitions
-    // do not write `T: 'a`), so the copy returns a type whose object lifetime is `'a` where the
-    // trait returns `'static`, which rustc rejects (E0308 `method not compatible with trait` on
-    // stable, E0478 `lifetime bound not satisfied` on nightly, for `inferred` and `unrelated`, and
-    // E0521 in the forwarding body); it compiles for `explicit` only. The Repeater's whole path
-    // above is read by rustc from the real definition instead.
-    #[cfg(feature = "negative-alone")]
-    mod alone {
-        use crate::m::{Explicit, Inferred, Unrelated};
-
-        pub struct Alone(pub crate::m::Inner);
-
-        impl<'a, __S: ?Sized> crate::Repeater<(&'a (),), 0> for __S {
-            type Type = dyn crate::m::RelTr + 'a;
-        }
-
-        impl<'a> crate::m::ObjectDefaults<'a> for Alone {
-            fn explicit(
-                &self,
-                x: Explicit<'a, <Self as crate::Repeater<(&'a (),), 0>>::Type>,
-            ) -> Explicit<'a, <Self as crate::Repeater<(&'a (),), 0>>::Type> {
-                crate::m::ObjectDefaults::<'a>::explicit(&self.0, x)
-            }
-            fn inferred(
-                &self,
-                x: Inferred<'a, <Self as crate::Repeater<(&'a (),), 0>>::Type>,
-            ) -> Inferred<'a, <Self as crate::Repeater<(&'a (),), 0>>::Type> {
-                crate::m::ObjectDefaults::<'a>::inferred(&self.0, x)
-            }
-            fn unrelated(
-                &self,
-                x: Unrelated<'a, <Self as crate::Repeater<(&'a (),), 0>>::Type>,
-            ) -> Unrelated<'a, <Self as crate::Repeater<(&'a (),), 0>>::Type> {
-                crate::m::ObjectDefaults::<'a>::unrelated(&self.0, x)
-            }
-            // The method with a lifetime of its own is not part of the point: as the original.
-            fn local<'b>(
-                &'b self,
-                x: Inferred<'b, dyn crate::m::RelTr>,
-            ) -> Inferred<'b, dyn crate::m::RelTr> {
-                x
-            }
-        }
-    }
     /// The forwarding implementations are called through `&dyn Locals`, and the explicit
     /// lifetime arguments of the original are late-bound (not allowed for the original and the copy
     /// alike, E0794), so the call is the same.

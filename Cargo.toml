@@ -26,6 +26,15 @@ exclude = [
   "CLAUDE.md",
 ]
 
+# src/ has no unit tests; the doctests still run (`doctest` is separate).
+[lib]
+test = false
+
+# No debug info in the dev and test builds: about a third less compile CPU and half the size of
+# `target`. A number: `"line-tables-only"` is refused by cargo before 1.71 (the MSRV is 1.56).
+[profile.dev]
+debug = 0
+
 [dependencies]
 safegraph = { version = "0.3.0", default-features = false }
 proc-macro2 = "1.0"

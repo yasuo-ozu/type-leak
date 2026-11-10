@@ -20,6 +20,8 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+    - name: Run the tests that build crates with a nested cargo (ignored by default)
+      run: cargo test --verbose --test diagnostic -- --ignored
 
   nightly:
 
@@ -31,6 +33,8 @@ jobs:
       run: rustup toolchain install nightly --profile minimal
     - name: Run tests (with notes emitted as diagnostics with their own spans)
       run: cargo +nightly test --verbose
+    - name: Run the tests that build crates with a nested cargo (ignored by default)
+      run: cargo +nightly test --verbose --test diagnostic -- --ignored
 
   msrv:
 
