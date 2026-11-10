@@ -22,7 +22,7 @@
 
 mod common;
 
-use common::{starts_with, Rule};
+use common::{starts_with, Recovered, Rule};
 use syn::*;
 use template_quote::{quote, ToTokens};
 use type_leak::*;
@@ -48,7 +48,7 @@ fn causes_text_of(errors: &[ErrorItem]) -> Vec<String> {
 
 /// The entries of the Referrer, as text.
 fn entries(result: &LeakerResult) -> Vec<String> {
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().recovered();
     common::types(&referrer)
         .map(|ty| quote!(#ty).to_string())
         .collect()
@@ -345,7 +345,7 @@ fn the_values_and_defaults_rules_give_the_same_errors_and_entries_at_both_stages
             // The entries and their contexts are the same. The parts are not: the result has the
             // part that each error it dropped was about, which the config never found.
             let seen = |result: LeakerResult| {
-                let referrer = result.into_referrer();
+                let referrer = result.recovered();
                 let found: Vec<_> = referrer
                     .iter()
                     .map(|(ix, ty, context)| (ix, ty.clone(), context.clone()))

@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{starts_with, to_syn_error};
+use common::{starts_with, to_syn_error, Recovered};
 use syn::*;
 use template_quote::quote;
 use type_leak::*;
@@ -726,7 +726,7 @@ fn a_bad_value_is_an_error_of_its_scope_and_the_one_around_it() {
     assert_eq!(result.errors()[0].message, "use absolute path: 'rel'");
     // `Other<u8>` of the scope with the bad value stays, like `Wrap<u8>`.
     let entries: Vec<String> = result
-        .into_referrer()
+        .recovered()
         .iter()
         .map(|(_, ty, _)| quote!(#ty).to_string())
         .collect();
@@ -930,7 +930,7 @@ fn check_values_is_read_by_each_call() {
         errors,
         ["use absolute path: 'relB'", "use absolute path: 'relD'"]
     );
-    let referrer = result.into_referrer();
+    let referrer = result.recovered();
     let mut entries: Vec<String> = common::types(&referrer)
         .map(|ty| quote!(#ty).to_string())
         .collect();

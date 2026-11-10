@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{enter_function, messages, s, to_syn_error, visit_function, AcceptCause};
+use common::{enter_function, messages, s, to_syn_error, visit_function, AcceptCause, Recovered};
 use syn::visit::Visit;
 use syn::*;
 use template_quote::ToTokens;
@@ -343,7 +343,7 @@ fn self_has_no_meaning_in_generics_and_in_the_items_that_do_not_declare_it() {
         err[0].notes.first().map(|(_, n)| n.as_str())
     );
     // No entry is left: the scopes recovered, and had none.
-    assert!(result.into_referrer().is_empty());
+    assert!(result.recovered().is_empty());
 
     // The same in a type alias and in a function that a scope without generics visits (not in the
     // items which declare it).
@@ -636,7 +636,7 @@ fn a_failing_scope_keeps_its_result_and_the_outer_one_goes_on() {
     assert!(accepted.errors().is_empty());
     let accepted = accepted.finish().unwrap();
     let ok = ok.result.finish().unwrap();
-    let failed_referrer = failed.result.into_referrer();
+    let failed_referrer = failed.result.recovered();
     // What it recorded is kept: the entries and the contexts, and so are the ids that the scopes
     // returned.
     assert_eq!(failed_referrer, accepted);
@@ -713,7 +713,7 @@ fn the_error_of_an_inner_scope_is_part_of_the_outer_one() {
     let result = leaker.result();
     assert_eq!(messages(result.errors()).lines().count(), 1);
     assert_eq!(messages(result.errors()), "use absolute path: 'Bad<'_>'");
-    assert_eq!(result.into_referrer().iter().count(), 1);
+    assert_eq!(result.recovered().iter().count(), 1);
 
     // With nothing else in the outer scope, it has the error all the same.
     let mut leaker = Leaker::new();
@@ -724,7 +724,7 @@ fn the_error_of_an_inner_scope_is_part_of_the_outer_one() {
     });
     let result = leaker.result();
     assert_eq!(messages(result.errors()), "use absolute path: 'Bad<'_>'");
-    assert!(result.into_referrer().is_empty());
+    assert!(result.recovered().is_empty());
 
     // The errors come in the order in which they were found, those of the inner scopes among the
     // errors of the outer one: before it entered them, in them, after.
@@ -768,7 +768,7 @@ fn the_error_of_an_inner_scope_is_part_of_the_outer_one() {
     assert_ne!(next, inner.unwrap());
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    let referrer = result.into_referrer();
+    let referrer = result.recovered();
     assert_eq!(
         entries(&referrer),
         [e("Rel < T >", "< T >"), e("RelU < U >", "< U >")]
@@ -808,7 +808,7 @@ fn a_failed_scope_keeps_the_top_levels_of_its_inner_scopes() {
     ids.push(top);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    let referrer = result.into_referrer();
+    let referrer = result.recovered();
     // The outermost context, the failed scope, and its inner scopes: the ids returned; the
     // contexts of the two entries, which are not those of the scopes that made them; and the
     // context of `Rel2<'_>`, which is copied as written and is a part, as its error is about it.
@@ -872,7 +872,7 @@ fn a_failed_inner_scope_keeps_the_optional_entries_it_decided() {
         result.errors()[0].cause,
         Cause::Type(parse_quote!(Rel2<'_>))
     );
-    let referrer = result.into_referrer();
+    let referrer = result.recovered();
     assert_eq!(
         common::types(&referrer).map(s).collect::<Vec<_>>(),
         Vec::<String>::new()
@@ -905,7 +905,7 @@ fn a_failing_outermost_scope_keeps_its_corrected_result() {
     let cause = Cause::Type(parse_quote!(Bad<'_>));
     assert_eq!(result.errors().len(), 2);
     assert!(result.errors().iter().all(|error| error.cause == cause));
-    let tokens = result.clone().into_referrer().to_token_stream().to_string();
+    let tokens = result.clone().recovered().to_token_stream().to_string();
     let accepted = result.clone().accept_cause(&cause);
     assert!(accepted.errors().is_empty());
     assert_eq!(
@@ -944,7 +944,7 @@ fn a_panic_after_a_recovery_rolls_back_the_scope_and_what_it_recovered() {
     let err = result.errors();
     assert_eq!(err.len(), 1);
     assert!(messages(err).contains("Bad2"));
-    let referrer = result.into_referrer();
+    let referrer = result.recovered();
     assert_eq!(entries(&referrer), [e("Kept", "")]);
     // Nothing of the scope that panicked is left, not its context either: the contexts are
     // that of `Kept` and the outer scope's own.
@@ -1038,7 +1038,7 @@ fn a_panic_caught_in_a_nested_scope_leaves_the_outer_scope_as_it_was() {
     }
     let (top, result) = run(true);
     let (expected_top, expected) = run(false);
-    let (referrer, expected) = (result.clone().into_referrer(), expected.into_referrer());
+    let (referrer, expected) = (result.clone().finish().unwrap(), expected.finish().unwrap());
     assert_eq!(top, expected_top);
     assert_eq!(referrer, expected);
     assert_eq!(
@@ -1193,7 +1193,7 @@ fn after_a_panic(panic: bool) -> (Vec<ContextId>, LeakerResult) {
 fn a_panic_in_an_outermost_scope_keeps_the_earlier_contexts_and_ids() {
     let (ids, result) = after_a_panic(true);
     let (expected_ids, expected) = after_a_panic(false);
-    let (referrer, expected) = (result.clone().into_referrer(), expected.into_referrer());
+    let (referrer, expected) = (result.clone().finish().unwrap(), expected.finish().unwrap());
     assert_eq!(ids, expected_ids);
     assert_eq!(referrer, expected);
     assert_eq!(
@@ -1371,7 +1371,7 @@ fn self_in_the_generics_of_a_scope_which_has_none_is_an_error() {
             text
         );
         assert_eq!(
-            entries(&result.into_referrer()),
+            entries(&result.recovered()),
             [e("Rel", ""), e("Wrap", "")],
             "{}",
             text
@@ -1936,7 +1936,7 @@ fn visit_type_param_bound_checks_the_root_of_a_trait_bound() {
         );
         // The bound has no entry: the scope keeps the context of its generics only.
         if path.segments.last().unwrap().arguments.is_none() {
-            assert!(result.into_referrer().is_empty(), "{}", s(&path));
+            assert!(result.recovered().is_empty(), "{}", s(&path));
         }
     }
     // `Self` at the root is an error where it has no meaning, and in the scope of an item it is a
@@ -2098,7 +2098,7 @@ fn outcome(errors: &[ErrorItem]) -> String {
 /// the calls returned. A context that no entry has (a scope's with no entry in it) is not seen, but
 /// for its id, which the ids of the others skip.
 fn dump(result: &LeakerResult, ids: &[(&str, ContextId)]) -> String {
-    let referrer = &result.clone().into_referrer();
+    let referrer = &result.clone().recovered();
     let mut lines = Vec::new();
     for (name, id) in ids {
         lines.push(format!("id {} = {}", name, id.index()));
@@ -2467,12 +2467,12 @@ fn a_failing_outermost_scope_of_each_kind_keeps_its_corrected_result() {
     // The scope which is entered after them takes the id after theirs.
     let (later, ()) = leaker.enter_generics(&parse_quote!(<L>), |_| ());
     let result = leaker.result();
-    let tokens = result.clone().into_referrer().to_token_stream().to_string();
+    let tokens = result.clone().recovered().to_token_stream().to_string();
     // Accepting the causes drops the errors only.
     let accepted = accept_failing(result.clone());
     assert!(accepted.errors().is_empty());
     assert_eq!(
-        accepted.into_referrer().to_token_stream().to_string(),
+        accepted.finish().unwrap().to_token_stream().to_string(),
         tokens
     );
     // The ids are those of the corrected results, whatever is accepted afterwards. The first
@@ -2678,7 +2678,7 @@ fn a_scope_of_an_item_adds_no_scope_of_its_own() {
         run(&mut leaker);
         let result = leaker.result();
         let outcome = outcome(result.errors());
-        let count = result.into_referrer().iter().count();
+        let count = result.recovered().iter().count();
         lines.push(format!("{}: {} ({})", name, outcome, count));
     };
     for kind in ["struct", "impl", "trait"] {
@@ -2719,7 +2719,7 @@ fn self_in_the_generics_of_a_scope() {
         run(&mut leaker);
         let result = leaker.result();
         let outcome = outcome(result.errors());
-        let count = result.into_referrer().iter().count();
+        let count = result.recovered().iter().count();
         lines.push(format!("{}: {} ({})", name, outcome, count));
     };
     let none = Generics::default();

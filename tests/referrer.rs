@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::s;
+use common::{s, Recovered};
 
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -583,7 +583,7 @@ fn test_with_outer_generics() {
 /// The Referrer of the trait, and its top-level context: the scope of its copies.
 fn referrer_of(tr: ItemTrait) -> (Referrer, ContextId) {
     let (result, context) = result_of(tr);
-    (result.into_referrer(), context)
+    (result.finish().unwrap(), context)
 }
 
 /// The result of the analysis of the trait (it has no error), and its top-level context.
@@ -652,7 +652,7 @@ fn test_repeater_impl_replaces_self() {
             fn h(&self, a: Rel6<[u8; Self::N]>);
         }
     });
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().finish().unwrap();
     let marker: Ident = parse_quote!(__S);
     let repeater: Path = parse_quote!(crate::Repeater);
     let items: Vec<(String, String)> = result
@@ -846,7 +846,7 @@ fn test_visitor_with_self_names_the_elided_lifetime() {
 
 /// `with_self()` writes the host for `Self` in the tokens of a macro that the copy keeps as written
 /// (the bound of a generic whose type names `Self` is an error of the Leaker, `UnprovableBound`,
-/// and the Referrer of `into_referrer()` leaves it so): inside groups too, and nothing without it.
+/// and the Referrer after `allow()` leaves it so): inside groups too, and nothing without it.
 #[test]
 fn with_self_writes_the_host_in_the_tokens_of_a_macro() {
     let tr: ItemTrait = parse_quote!(
@@ -862,7 +862,7 @@ fn with_self_writes_the_host_in_the_tokens_of_a_macro() {
         result.errors()[0].reason,
         type_leak::Reason::UnprovableBound
     );
-    let referrer = result.into_referrer();
+    let referrer = result.recovered();
     assert_eq!(referrer.iter().count(), 0);
     let written = |host: Option<Type>| -> ItemTrait {
         let mut copy = tr.clone();

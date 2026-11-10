@@ -30,7 +30,7 @@ fn config() -> Rules<impl Allow + Clone> {
 /// nested in a scope of no generics: each has its own `Self`.
 fn analyze(item: &Item) -> (Referrer, ContextId) {
     let (result, context) = analyze_result(item);
-    (result.into_referrer(), context)
+    (result.finish().unwrap(), context)
 }
 
 /// The same, with the result that writes the impls.
@@ -285,7 +285,7 @@ fn repeater_impl_for_an_entry_that_does_not_name_self() {
             fn f(&self, x: &'a Wrap<T, U>) -> Rel;
         }
     });
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().finish().unwrap();
     let param: Ident = parse_quote!(__S);
     let wrap = common::types(&referrer)
         .position(|ty| s(ty) == "& 'a Wrap < T , U >")
@@ -355,7 +355,7 @@ fn repeater_impl_for_the_implementor_of_a_trait() {
             fn f(&self, x: &'a Rel<Self::A>) -> Wrap<T, Self>;
         }
     });
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().finish().unwrap();
     let param: Ident = parse_quote!(__Impl);
     let wrap = common::types(&referrer)
         .position(|ty| s(ty) == "Wrap < T , Self >")
@@ -416,7 +416,7 @@ fn repeater_impl_for_a_type_is_for_the_type() {
     let (result, _) = analyze_result(&parse_quote! {
         struct S<'a, T: 'a> { f: &'a Rel<Self>, g: Wrap<T> }
     });
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().finish().unwrap();
     let param: Ident = parse_quote!(__S);
     let rel = common::types(&referrer)
         .position(|ty| s(ty) == "& 'a Rel < Self >")
@@ -472,7 +472,7 @@ fn const_parameters_are_encoded_into_the_slots_of_the_repeater() {
     let (result, _) = analyze_result(&parse_quote! {
         trait Tr<const N: usize> { fn f(&self) -> Wrap<N>; }
     });
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().finish().unwrap();
     let r = result
         .repeater_impls(&common::projection(repeater(), 7))
         .unwrap()
@@ -494,7 +494,7 @@ fn const_parameters_are_encoded_into_the_slots_of_the_repeater() {
     let (alias_result, _) = analyze_result(&parse_quote! {
         trait Tr<const B: ::my_crate::Idx> { fn f(&self) -> Wrap<B>; }
     });
-    let alias_referrer = alias_result.clone().into_referrer();
+    let alias_referrer = alias_result.clone().finish().unwrap();
     let err = alias_result
         .repeater_impls(&common::projection(repeater(), 7))
         .err()
@@ -523,7 +523,7 @@ fn const_parameters_are_encoded_into_the_slots_of_the_repeater() {
     let (result, _) = analyze_result(&parse_quote! {
         trait Tr<const B: bool> { fn f(&self) -> Wrap<B>; }
     });
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().finish().unwrap();
     let r = result
         .repeater_impls(&common::projection(repeater(), 7))
         .unwrap()
@@ -843,7 +843,7 @@ fn the_impl_of_an_entry_that_needs_self_outlives_encodes_the_bound_and_never_dec
     ];
     for item in items {
         let (result, _) = analyze_result(&Item::Trait(item.clone()));
-        let referrer = result.clone().into_referrer();
+        let referrer = result.clone().finish().unwrap();
         let what = s(&item);
         let context = common::entry(&referrer, 0);
         // The context has the bound of `T` and the `Sized`, and `Self: 'a` apart.
@@ -947,7 +947,7 @@ fn the_impl_declares_the_generics_but_the_bounds_that_the_argument_encodes() {
     for (item, expected) in rows {
         let what = s(&item);
         let (result, _) = analyze_result(&Item::Trait(item));
-        let referrer = result.clone().into_referrer();
+        let referrer = result.clone().finish().unwrap();
         let (entry, _, context) = referrer.iter().next().unwrap();
         let r = result
             .repeater_impls(&Projection::new(
@@ -980,7 +980,7 @@ fn the_generics_of_a_top_level_context_are_those_of_the_call() {
         trait Tr<'a, T> { fn f(&self, x: &'a Rel<T>); fn g(&self) -> All<'a, T>; }
     };
     let (result, _) = analyze_result(&Item::Trait(tr));
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().finish().unwrap();
     let all = common::types(&referrer)
         .position(|ty| s(ty) == "All < 'a , T >")
         .unwrap();
@@ -1135,7 +1135,7 @@ fn the_pieces_of_every_repeater_impl_agree_with_the_entry_and_its_projection() {
     let mut checked = 0;
     for item in samples() {
         let (result, _) = analyze_result(&item);
-        let referrer = result.clone().into_referrer();
+        let referrer = result.clone().finish().unwrap();
         let repeater = repeater();
         let impls = result
             .repeater_impls(&Projection::new(
@@ -1488,7 +1488,7 @@ fn bucket_self_agrees_with_the_impl_of_every_entry() {
     let (mut marked_ok, mut marked_err) = (0, 0);
     for item in bucket_samples() {
         let (result, _) = analyze_result(&item);
-        let referrer = result.clone().into_referrer();
+        let referrer = result.clone().finish().unwrap();
         for id in [0, 1, 7, 12345, u64::MAX] {
             let what = format!("{}: ({})", s(&item), id);
             // The call for a marker fails exactly if some entry has no bucket.
@@ -1613,7 +1613,7 @@ fn projection_of_writes_the_self_type_of_the_impl_of_every_entry() {
     let mut counts = [0; 5];
     for item in bucket_samples() {
         let (result, _) = analyze_result(&item);
-        let referrer = result.clone().into_referrer();
+        let referrer = result.clone().finish().unwrap();
         for id in [0, 7, 12345] {
             for target in [
                 ImplSelf::Param(param.clone()),
@@ -1718,7 +1718,7 @@ fn projection_of_with_a_marker_refuses_an_entry_that_needs_self() {
     for (item, first) in items {
         let what = s(&item);
         let (result, _) = analyze_result(&Item::Trait(item));
-        let referrer = result.clone().into_referrer();
+        let referrer = result.clone().finish().unwrap();
         // `repeater_impls()` fails for the first entry that needs `Self`.
         match result.repeater_impls(&projection) {
             Err(EncodeError::NeedsSelf(ty)) => assert_eq!(s(&*ty), first, "{}", what),
@@ -1903,7 +1903,7 @@ fn the_entry_of_a_default_whose_generics_name_self_is_for_a_parameter() {
     let (result, _) = analyze_result(&parse_quote! {
         trait Tr<T: AsRef<Self>, U = Rel<T>> { fn f(&self, t: T) -> U; fn g(&self) -> Wrap<Self>; }
     });
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().finish().unwrap();
     let rel = common::types(&referrer)
         .position(|ty| s(ty) == "Rel < T >")
         .unwrap();

@@ -57,6 +57,7 @@ use template_quote::quote;
 /// scope back and records nothing. A panicking [`Allow`] is treated alike: the call is rolled back and
 /// panics. [`LeakerResult::allow()`] drops the errors you accept, and [`LeakerResult::ignore()`]
 /// accepts one and has the copy write the whole part that it is about as written.
+/// [`LeakerResult::finish()`] gives the [`Referrer`] only when no error remains.
 ///
 /// # Limitations
 ///

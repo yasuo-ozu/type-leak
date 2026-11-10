@@ -78,7 +78,7 @@ fn index(referrer: &Referrer, ty: Type) -> usize {
 
 /// The key of the entry 0 of the Leaker 7, which `impl_of()` writes whatever the entry is.
 fn key_of_first(result: &LeakerResult) -> u128 {
-    common::key(7, common::entry_id_at(&result.clone().into_referrer(), 0))
+    common::key(7, common::entry_id_at(&result.clone().finish().unwrap(), 0))
 }
 
 /// The Repeater impl of the entry `ix`, for any type `__S`, as a macro writes it from
@@ -86,7 +86,7 @@ fn key_of_first(result: &LeakerResult) -> u128 {
 /// impls are compared by what they declare, so the entry that `ToTokens` writes the key of is the
 /// first.
 fn impl_of(result: &LeakerResult, ix: usize) -> ItemImpl {
-    let first = common::entry_id_at(&result.clone().into_referrer(), 0);
+    let first = common::entry_id_at(&result.clone().finish().unwrap(), 0);
     let param: Ident = parse_quote!(__S);
     let repeater: Path = parse_quote!(crate::Repeater);
     let mut r = result
@@ -104,7 +104,7 @@ fn impl_of(result: &LeakerResult, ix: usize) -> ItemImpl {
 /// The impl of the entry `ty`, and the arguments that a use site in the scope of the analysis
 /// writes: they are the same tokens, so a copy and its impl cannot disagree.
 fn impl_and_args(result: &LeakerResult, ty: Type) -> ItemImpl {
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().finish().unwrap();
     let ix = index(&referrer, ty);
     let param: Ident = parse_quote!(__S);
     let repeater: Path = parse_quote!(crate::Repeater);

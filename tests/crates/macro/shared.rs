@@ -98,7 +98,7 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     for r in result.repeater_impls(&projection).map_err(Error::from)? {
         impls.extend(r.to_token_stream());
     }
-    let referrer = result.into_referrer();
+    let referrer = result.finish().unwrap();
     let reasons: Vec<String> = errors.iter().map(|e| format!("{:?}", e.reason)).collect();
     let report = format!(
         "{}|entries={}|errors={}",
@@ -144,7 +144,9 @@ impl Parse for Apply {
         let content;
         braced!(content in input);
         let result: LeakerResult = content.parse()?;
-        let referrer = result.into_referrer();
+        let referrer = result
+            .finish()
+            .map_err(|errors| crate::to_syn_error(&errors))?;
         let content;
         braced!(content in input);
         let contexts = content

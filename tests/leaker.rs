@@ -107,7 +107,7 @@ fn leaker_default_is_leaker_new() {
     };
     let (default, new) = (analyze(Leaker::default()), analyze(Leaker::new()));
     assert!(default.errors().is_empty());
-    let (default, new) = (default.into_referrer(), new.into_referrer());
+    let (default, new) = (default.finish().unwrap(), new.finish().unwrap());
     assert_eq!(default, new);
     let mut entries = entries(&default);
     entries.sort();
@@ -123,7 +123,7 @@ fn leaker_default_is_leaker_new() {
     // The same with the rule `()` named: the type of the default is the one of `Leaker::new()`.
     let mut named: Leaker<()> = Leaker::with_rule(());
     named.intern_trait(&item);
-    assert_eq!(named.result().into_referrer(), new);
+    assert_eq!(named.result().finish().unwrap(), new);
 }
 
 #[test]

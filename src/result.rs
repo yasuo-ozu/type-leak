@@ -301,12 +301,17 @@ pub(crate) fn filter<A: Allow + ?Sized>(rule: &A, errors: &mut Vec<ErrorItem>) {
 
 /// What a [`Leaker`] found: the [`Referrer`] and the errors that remain.
 ///
+/// [`finish()`](LeakerResult::finish) gives the Referrer only when no error remains: accept each
+/// error with [`allow()`](LeakerResult::allow) or [`ignore()`](LeakerResult::ignore), and report the
+/// others ([`ErrorItem::emit()`]).
+///
 /// [`allow()`](LeakerResult::allow) takes and returns the result, so it chains. It drops the errors
 /// that an [`Allow`] accepts (you promise that the part compiles as written). It leaves the
 /// entries as they are: to remove entries, give the [`Allow`] to [`Leaker::with_rule()`]. A rule
 /// here only approximates the one of the Leaker (more errors may remain, and a copy may fail to
 /// build): give rules to the Leaker when you can. [`ignore()`](LeakerResult::ignore) accepts one
-/// error, and has the copy write its whole part as written, or removes its entry.
+/// error, and has the copy write its whole part as written, or removes its entry;
+/// [`ignore_if()`](LeakerResult::ignore_if) does it for each error that a closure picks.
 ///
 /// ```
 /// # use {syn::*, type_leak::*};
@@ -401,10 +406,50 @@ impl LeakerResult {
     /// });
     /// ```
     pub fn ignore(mut self, error: &ErrorItem) -> Self {
-        let at = match self.errors.iter().position(|known| known == error) {
-            Some(at) => at,
-            None => return self,
-        };
+        if let Some(at) = self.errors.iter().position(|known| known == error) {
+            self.ignore_at(at);
+        }
+        self
+    }
+
+    /// Calls `f` for each error that remains, in the order found, and ignores the ones it returns
+    /// `true` for, as [`ignore()`](LeakerResult::ignore) does.
+    ///
+    /// The errors that go with an ignored one (the same part or entry, and those inside its part)
+    /// are dropped and not asked about.
+    ///
+    /// ```
+    /// # use {syn::*, type_leak::*};
+    /// let item: Item = parse_quote!(
+    ///     struct N<T: ::core::convert::AsRef<Self>>(Rel2<Self, T>, Wrap<T>);
+    /// );
+    /// let mut leaker = Leaker::new();
+    /// leaker.enter_generics(&Generics::default(), |view| view.visit_item(&item));
+    /// let result = leaker.result();
+    /// assert_eq!(result.errors()[0].reason, Reason::NestedSelfInBounds);
+    /// assert!(result.clone().finish().is_err());
+    ///
+    /// // The entry `Rel2<Self, T>` is removed, and the error with it.
+    /// let result = result.ignore_if(|error| error.reason == Reason::NestedSelfInBounds);
+    /// assert!(result.errors().is_empty());
+    /// assert_eq!(result.finish().unwrap().iter().count(), 1);
+    /// ```
+    pub fn ignore_if<F: FnMut(&ErrorItem) -> bool>(mut self, mut f: F) -> Self {
+        // `asked[ix]`: `errors[ix]` was asked about. The errors that remain keep their order.
+        let mut asked = vec![false; self.errors.len()];
+        while let Some(at) = asked.iter().position(|asked| !asked) {
+            asked[at] = true;
+            if f(&self.errors[at]) {
+                let mut gone = self.ignore_at(at).into_iter();
+                asked.retain(|_| !gone.next().unwrap_or(false));
+            }
+        }
+        self
+    }
+
+    /// Ignores `errors[at]` and what goes with it. Returns for each error, as it was before, whether
+    /// it was dropped.
+    fn ignore_at(&mut self, at: usize) -> Vec<bool> {
         let (part, entry) = (self.errors[at].link.part, self.errors[at].link.entry);
         // The errors about the same part, or entry, go together.
         let same = |known: &ErrorItem| {
@@ -424,15 +469,23 @@ impl LeakerResult {
             }
         }
         // An error about an entry inside the part stays: the entry may be used elsewhere.
+        let gone: Vec<bool> = self
+            .errors
+            .iter()
+            .enumerate()
+            .map(|(ix, known)| {
+                let revealed = known.link.entry.is_none()
+                    && known.link.id.map_or(false, |id| inside.contains(&id));
+                ix == at || same(known) || revealed
+            })
+            .collect();
         let mut ix = 0;
-        self.errors.retain(|known| {
+        self.errors.retain(|_| {
             ix += 1;
-            let revealed = known.link.entry.is_none()
-                && known.link.id.map_or(false, |id| inside.contains(&id));
-            !(ix - 1 == at || same(known) || revealed)
+            !gone[ix - 1]
         });
         forget_dropped(&mut self.errors);
-        self
+        gone
     }
 
     /// Returns the errors that remain, in the order found.
@@ -440,18 +493,10 @@ impl LeakerResult {
         &self.errors
     }
 
-    /// Returns the Referrer, whatever errors remain: a part that conflicts is copied as written.
-    pub fn into_referrer(self) -> Referrer {
-        self.referrer
-    }
-
-    /// Returns the Referrer as [`into_referrer()`](LeakerResult::into_referrer) does, and the
-    /// errors that remain, in the order found.
-    pub fn into_parts(self) -> (Referrer, Vec<ErrorItem>) {
-        (self.referrer, self.errors)
-    }
-
-    /// Returns the Referrer if no error remains, else the errors that remain.
+    /// Returns the Referrer if no error remains, else the errors that remain, in the order found.
+    ///
+    /// It is the only way to the Referrer: drop each error with [`allow()`](LeakerResult::allow)
+    /// or [`ignore()`](LeakerResult::ignore) first, and report the others.
     pub fn finish(self) -> Result<Referrer, Vec<ErrorItem>> {
         if self.errors.is_empty() {
             Ok(self.referrer)

@@ -14,7 +14,7 @@
 
 mod common;
 
-use common::{allow_every_cause, starts_with, AcceptCause};
+use common::{allow_every_cause, starts_with, AcceptCause, Recovered};
 use proc_macro2::{Delimiter, Literal, TokenStream, TokenTree};
 use std::cell::{Cell, RefCell};
 use syn::parse::Parser;
@@ -122,7 +122,7 @@ fn a_result_without_errors_is_written_and_read_back() {
 fn a_result_with_errors_is_written_and_read_back() {
     let result = with_errors();
     assert!(result.errors().len() >= 5, "{:?}", describe_all(&result));
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().recovered();
 
     // The form: the Referrer, then `@`, then one bracket group with one brace group for each error,
     // in the order of `errors()`.
@@ -161,7 +161,7 @@ fn a_result_with_errors_is_written_and_read_back() {
     for (read, error) in read.errors().iter().zip(result.errors()) {
         assert_eq!(read.cause, error.cause);
     }
-    assert_eq!(read.clone().into_referrer(), referrer);
+    assert_eq!(read.clone().recovered(), referrer);
     assert_eq!(text(&read), text(&tokens));
     // `finish()` returns the errors, in order, when some remain.
     let errors = read.finish().unwrap_err();
@@ -177,7 +177,7 @@ fn a_result_with_errors_is_written_and_read_back() {
 #[test]
 fn allowing_after_the_round_trip_drops_the_same_errors() {
     let result = with_errors();
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().recovered();
     let read_back = read(result.to_token_stream()).unwrap();
     let causes: Vec<Cause> = result.errors().iter().map(|e| e.cause.clone()).collect();
 
@@ -200,7 +200,7 @@ fn allowing_after_the_round_trip_drops_the_same_errors() {
     // What remains is written and read again, with the same Referrer.
     let rest = read(after.to_token_stream()).unwrap();
     assert_eq!(describe_all(&rest), describe_all(&before));
-    assert_eq!(rest.into_referrer(), referrer);
+    assert_eq!(rest.recovered(), referrer);
 
     let (all, _) = allow_every_cause(read_back);
     assert!(all.errors().is_empty());
@@ -269,21 +269,39 @@ fn the_path_value_and_default_rules_give_the_same_errors_after_the_round_trip() 
     assert!(dropped_something >= 3);
 }
 
-/// `into_parts()` is `into_referrer()` and `errors()` in one call.
+/// `finish()` is the only way to the Referrer, and `allow()` drops errors and changes no entry:
+/// with every error allowed, `finish()` gives the Referrer that the result wrote before, whatever
+/// errors the analysis found.
 #[test]
-fn into_parts_returns_the_referrer_and_the_errors_that_remain() {
+fn allowing_every_error_gives_the_referrer_of_the_analysis() {
     let result = with_errors();
     assert!(!result.errors().is_empty());
-    let (referrer, errors) = result.clone().into_parts();
-    assert_eq!(referrer, result.clone().into_referrer());
-    assert_eq!(errors.len(), result.errors().len());
-    let described: Vec<String> = errors.iter().map(describe).collect();
-    assert_eq!(described, describe_all(&result));
-    // With every error dropped, the errors are none and the Referrer is the same.
-    let (all, _) = allow_every_cause(result);
-    let (again, none) = all.into_parts();
-    assert!(none.is_empty());
-    assert_eq!(again, referrer);
+    let errors = result.clone().finish().unwrap_err();
+    assert_eq!(
+        describe_all(&result),
+        errors.iter().map(describe).collect::<Vec<_>>()
+    );
+    // The tokens of the result start with the tokens of the Referrer.
+    let written = result.to_token_stream().to_string();
+    let (all, _) = allow_every_cause(result.clone());
+    assert!(all.errors().is_empty());
+    let referrer = all.clone().finish().unwrap();
+    let own = referrer.to_token_stream().to_string();
+    assert!(
+        written.starts_with(&own) && written[own.len()..].trim_start().starts_with('@'),
+        "{}\n{}",
+        written,
+        own
+    );
+    assert_eq!(referrer, result.clone().recovered());
+    // The same holds when only some of the errors are allowed first.
+    for error in result.errors() {
+        let rest = result
+            .clone()
+            .allow(common::accepting(result.errors(), &error.cause));
+        let (rest, _) = allow_every_cause(rest);
+        assert_eq!(rest.finish().unwrap(), referrer);
+    }
 }
 
 /// `allow()` takes and returns the result, so it chains; a rule is applied at once, so it may count
@@ -318,7 +336,7 @@ fn the_rules_chain_and_a_rule_may_count() {
         .allow(Rules::new().external_crates());
     assert_eq!(describe_all(&chained), describe_all(&one_by_one));
     let expand = |result: LeakerResult| {
-        let referrer = result.into_referrer();
+        let referrer = result.recovered();
         let ix = common::types(&referrer)
             .position(|ty| text(ty) == ":: foo :: X")
             .unwrap();
@@ -352,13 +370,10 @@ fn the_tokens_after_the_result_are_left_to_the_caller() {
     struct Expected(Vec<String>, Referrer);
     let of_result = |result: LeakerResult| {
         let tokens = result.to_token_stream();
-        (
-            tokens,
-            Expected(describe_all(&result), result.into_referrer()),
-        )
+        (tokens, Expected(describe_all(&result), result.recovered()))
     };
     let of_referrer = |result: LeakerResult| {
-        let referrer = result.into_referrer();
+        let referrer = result.recovered();
         (referrer.to_token_stream(), Expected(Vec::new(), referrer))
     };
     let error_group = with_errors().errors()[0].to_token_stream();
@@ -453,7 +468,7 @@ fn the_tokens_after_the_result_are_left_to_the_caller() {
         tokens.extend(after.clone());
         let (read, left) = then_rest.parse2(tokens).unwrap();
         assert_eq!(describe_all(&read), errors, "{}", label);
-        assert_eq!(read.into_referrer(), referrer, "{}", label);
+        assert_eq!(read.recovered(), referrer, "{}", label);
         // What follows is left as it is, unless the result takes some of it.
         let rest = rest.map_or_else(|| after.to_string(), str::to_string);
         assert_eq!(left, rest, "{}", label);
@@ -506,12 +521,12 @@ fn a_wrong_format_tag_fails_as_the_referrer_does() {
 #[test]
 fn a_referrer_parses_as_a_result_without_errors() {
     for result in [with_errors(), without_errors()] {
-        let referrer = result.into_referrer();
+        let referrer = result.recovered();
         let tokens = referrer.to_token_stream();
         let read = read(tokens.clone()).unwrap();
         assert!(read.errors().is_empty());
         assert_eq!(text(&read), text(&tokens));
-        assert_eq!(read.into_referrer(), referrer);
+        assert_eq!(read.finish().unwrap(), referrer);
     }
 }
 
@@ -520,7 +535,7 @@ fn a_referrer_parses_as_a_result_without_errors() {
 #[test]
 fn a_malformed_error_list_is_refused() {
     let result = with_errors();
-    let referrer = result.clone().into_referrer().to_token_stream();
+    let referrer = result.clone().recovered().to_token_stream();
     let first = result.errors()[0].to_token_stream();
     let with = |list: TokenStream| -> TokenStream {
         let mut tokens = referrer.clone();

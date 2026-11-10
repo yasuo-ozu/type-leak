@@ -2282,7 +2282,7 @@ mod self_outlives {
         .parse()
         .unwrap();
         let result: LeakerResult = parse2(tokens).unwrap();
-        let parsed = result.into_referrer();
+        let parsed = result.finish().unwrap();
         assert_eq!(
             common::entry(&parsed, 0).self_outlives.as_slice(),
             lifetimes(&["'a"])

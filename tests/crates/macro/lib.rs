@@ -338,6 +338,20 @@ pub(crate) fn allow_every_cause(mut result: LeakerResult) -> LeakerResult {
     result
 }
 
+/// The Referrer of `result` after `allow()` of the cause of every error: the parts that conflict are
+/// copied as written. `allow()` changes no entry, so it is the Referrer of the analysis. The errors
+/// are a flat list, so none is left; if one is, the macro panics (`ALLOW LEFT ERRORS`, which
+/// `tests/prop_cross_crate` reads).
+pub(crate) fn recovered(result: LeakerResult) -> Referrer {
+    allow_every_cause(result).finish().unwrap_or_else(|errors| {
+        panic!(
+            "ALLOW LEFT ERRORS: allow() of the cause of every error left {}: {}",
+            errors.len(),
+            messages(&errors).replace('\n', " ; ")
+        )
+    })
+}
+
 /// The errors of the Leaker, reported with `ErrorItem::emit()` (a `Diagnostic` on nightly), one by
 /// one.
 pub(crate) fn report(errors: &[ErrorItem]) -> TokenStream {
@@ -728,10 +742,10 @@ fn leak_impl(args: LeakArgs, item_trait: ItemTrait) -> Result<TokenStream> {
     let assertions = leaker.assertions();
     leaker.reduce_roots();
     let result = leaker.result();
-    if !result.errors().is_empty() {
-        return Err(to_syn_error(result.errors()));
-    }
-    let referrer = result.clone().into_referrer();
+    let referrer = result
+        .clone()
+        .finish()
+        .map_err(|errors| to_syn_error(&errors))?;
 
     let LeakArgs {
         helper,
@@ -856,9 +870,10 @@ impl Parse for Input {
         let id = braced_parse::<LitInt>(input)?.base10_parse()?;
         let repeater = braced_parse::<Path>(input)?;
         let module = braced_parse::<Path>(input)?;
+        let referrer = result.finish().map_err(|errors| to_syn_error(&errors))?;
         let header = Header {
             item_trait,
-            referrer: result.into_referrer(),
+            referrer,
             context,
             projection: Projection::new(repeater, id, ImplSelf::Param(parse_quote!(__S))),
             module,

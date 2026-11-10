@@ -21,7 +21,7 @@ fn args_error(generics: &str, args: &str) -> EncodeError {
     // The scope of the generics, where every path is written as it is: the defaults are what they say.
     let mut leaker = Leaker::with_rule(|_: &Cause, _: Place| true);
     let (context, ()) = leaker.enter_generics(&generics, |_| ());
-    let referrer = leaker.result().into_referrer();
+    let referrer = leaker.result().finish().unwrap();
     referrer
         .complete_args(
             context,
@@ -56,7 +56,7 @@ fn params_error(generics: &str) -> EncodeError {
     leaker.enter_generics(&generics, |view| {
         view.visit_type(&parse_quote!(Wrap<{ N }>))
     });
-    let referrer = leaker.result().into_referrer();
+    let referrer = leaker.result().finish().unwrap();
     let (entry, _, context) = referrer.iter().next().unwrap();
     projection(ImplSelf::Param(parse_quote!(__S)))
         .of(&parse_quote!(Self), context, entry)

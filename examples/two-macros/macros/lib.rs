@@ -67,11 +67,18 @@ pub fn export_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut leaker = Leaker::new();
     let top_level = leaker.intern_trait(&item_trait);
     let result = leaker.result();
-    if !result.errors().is_empty() {
-        // Each path that cannot be leaked, at its own span, with the notes and the help.
-        let errors: TokenStream2 = result.errors().iter().map(ErrorItem::emit).collect();
-        return errors.into();
-    }
+    // This macro accepts no error (`allow()` or `ignore()` would drop it), so `finish()` is the
+    // Referrer or the errors. The Referrer goes to crate B.
+    let referrer = match result.clone().finish() {
+        Ok(referrer) => referrer,
+        Err(errors) => {
+            // Each path that cannot be leaked, at its own span, with the notes and the help. The
+            // trait is still written as it is, which the crate needs. No copy is made of it: crate
+            // B gets neither the impls nor the macro.
+            let errors: TokenStream2 = errors.iter().map(ErrorItem::emit).collect();
+            return quote!(#item_trait #errors).into();
+        }
+    };
 
     // 2. One Repeater impl for each entry, written next to the trait, where the relative paths of
     //    the entries mean what they mean in the trait. `ToTokens` of each writes its `KEY`.
@@ -85,9 +92,6 @@ pub fn export_trait(_attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(impls) => impls,
         Err(error) => return syn::Error::from(error).to_compile_error().into(),
     };
-
-    // The Referrer goes to crate B.
-    let referrer = result.into_referrer();
 
     // 3. The macro that crate B calls. `$crate` is crate A, whatever the name B gives it.
     let macro_name = format_ident!("__tl_{}", item_trait.ident);

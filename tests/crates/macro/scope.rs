@@ -214,7 +214,7 @@ fn position(item: &ItemImpl, self_ty: &Type, ty: Type) -> Position {
 pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
     let input: ScopeInput = parse2(input)?;
     let (result, context) = input.analyze().map_err(|errors| to_syn_error(&errors))?;
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().finish().unwrap();
     let ScopeInput {
         id, marker, item, ..
     } = &input;
@@ -399,7 +399,9 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         scope,
         path,
     } = parse2(input)?;
-    let referrer = result.into_referrer();
+    let referrer = result
+        .finish()
+        .map_err(|errors| crate::to_syn_error(&errors))?;
     let krate = path
         .segments
         .first()

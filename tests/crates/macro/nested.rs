@@ -160,7 +160,7 @@ pub(crate) fn leak(input: TokenStream) -> Result<TokenStream> {
             }
         }
     });
-    let referrer = result.into_referrer();
+    let referrer = result.finish().unwrap();
     let reasons: Vec<String> = errors.iter().map(|e| format!("{:?}", e.reason)).collect();
     let report = format!(
         "{}|entries={}|errors={}",
@@ -244,7 +244,9 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
         nested,
         path,
     } = parse2(input)?;
-    let referrer = result.into_referrer();
+    let referrer = result
+        .finish()
+        .map_err(|errors| crate::to_syn_error(&errors))?;
     let id = nested.id;
     let krate = path
         .segments

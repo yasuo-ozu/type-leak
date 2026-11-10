@@ -12,6 +12,8 @@
 
 mod common;
 
+use common::Recovered;
+
 use quote::ToTokens;
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -95,7 +97,7 @@ fn causes(result: &LeakerResult) -> Vec<Cause> {
 
 /// The `EntryId` and the type of each entry that is left.
 fn live(result: &LeakerResult) -> Vec<(usize, Type)> {
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().recovered();
     let found: Vec<(usize, Type)> = referrer
         .iter()
         .map(|(ix, ty, _)| (ix.index(), ty.clone()))
@@ -119,7 +121,7 @@ fn impls(result: &LeakerResult) -> Vec<RepeaterImpl> {
 }
 
 fn copy_after(result: &LeakerResult, top: ContextId, item: &Item) -> Item {
-    copy_of(&result.clone().into_referrer(), top, item)
+    copy_of(&result.clone().recovered(), top, item)
 }
 
 fn tokens(result: &LeakerResult) -> String {
@@ -626,6 +628,147 @@ fn ignore_of_every_error_in_turn_leaves_none() {
     }
 }
 
+/// `ignore_if()` with a closure that is true for every error is `ignore()` of the first error that
+/// remains, until none does: the same Referrer and the same errors, in each row of the table.
+#[test]
+fn ignore_if_of_all_is_ignore_of_each_error_in_turn() {
+    for row in rows() {
+        let (result, top) = analyze(&row.item);
+        let mut turn = result.clone();
+        while let Some(error) = turn.errors().first().cloned() {
+            turn = turn.ignore(&error);
+        }
+        let all = result.clone().ignore_if(|_| true);
+        assert_eq!(tokens(&all), tokens(&turn), "{}", row.name);
+        assert_eq!(all.errors(), turn.errors(), "{}", row.name);
+        assert!(all.errors().is_empty(), "{}", row.name);
+        assert_eq!(
+            copy_after(&all, top, &row.item),
+            copy_after(&turn, top, &row.item),
+            "{}",
+            row.name
+        );
+        assert_eq!(live(&all), live(&turn), "{}", row.name);
+        assert!(all.finish().is_ok(), "{}", row.name);
+    }
+}
+
+/// A closure that is false for every error changes nothing, and is asked about each error once.
+#[test]
+fn ignore_if_of_none_changes_nothing() {
+    for row in rows() {
+        let (result, _) = analyze(&row.item);
+        let mut asked = 0;
+        let same = result.clone().ignore_if(|_| {
+            asked += 1;
+            false
+        });
+        assert_eq!(asked, result.errors().len(), "{}", row.name);
+        assert_eq!(tokens(&same), tokens(&result), "{}", row.name);
+        assert_eq!(same.errors(), result.errors(), "{}", row.name);
+    }
+    // No error: the closure is not called.
+    let none = Leaker::new()
+        .result()
+        .ignore_if(|_| panic!("no error to ask about"));
+    assert!(none.errors().is_empty());
+}
+
+/// A closure that picks one error is `ignore()` of it.
+#[test]
+fn ignore_if_of_one_error_is_ignore_of_it() {
+    for row in rows() {
+        let (result, _) = analyze(&row.item);
+        for (at, error) in result.errors().iter().enumerate() {
+            let name = format!("{}: the error {}", row.name, at);
+            let picked = result.clone().ignore_if(|known| known == error);
+            let ignored = result.clone().ignore(error);
+            assert_eq!(tokens(&picked), tokens(&ignored), "{}", name);
+            assert_eq!(picked.errors(), ignored.errors(), "{}", name);
+        }
+    }
+}
+
+/// The causes that `ignore_if()` asks about, the closure picking what `pick` says, and the causes
+/// that remain.
+fn ignore_if_asked(
+    result: &LeakerResult,
+    pick: impl Fn(&Cause) -> bool,
+) -> (Vec<Cause>, Vec<Cause>) {
+    let mut asked = Vec::new();
+    let left = result.clone().ignore_if(|error| {
+        asked.push(error.cause.clone());
+        pick(&error.cause)
+    });
+    (asked, causes(&left))
+}
+
+/// The errors inside the part of an ignored one, and those about the same part, go with it and are
+/// not asked about.
+#[test]
+fn ignore_if_does_not_ask_about_the_errors_that_go_with_an_ignored_one() {
+    let (result, _) = analyze(&parse_quote!(
+        struct S(Outer<'_, Middle<'_, Deep<'_>>>, Deep<'_>);
+    ));
+    let outer = Cause::Type(parse_quote!(Outer<'_, Middle<'_, Deep<'_>>>));
+    let middle = Cause::Type(parse_quote!(Middle<'_, Deep<'_>>));
+    let deep = Cause::Type(parse_quote!(Deep<'_>));
+    assert_eq!(
+        causes(&result),
+        [outer.clone(), middle.clone(), deep.clone(), deep.clone()]
+    );
+    // The outer error drops the two inside it. The `Deep<'_>` of the other field is asked about.
+    let (asked, left) = ignore_if_asked(&result, |c| *c == outer);
+    assert_eq!(asked, [outer.clone(), deep.clone()]);
+    assert_eq!(left, std::slice::from_ref(&deep));
+    // The middle one: the `Deep<'_>` inside it goes, and the outer error stays.
+    let (asked, left) = ignore_if_asked(&result, |c| *c == middle);
+    assert_eq!(asked, [outer.clone(), middle.clone(), deep.clone()]);
+    assert_eq!(left, [outer.clone(), deep.clone()]);
+    // The deep one makes its part whole wherever it is: the other error about it goes too.
+    let (asked, left) = ignore_if_asked(&result, |c| *c == deep);
+    assert_eq!(asked, [outer.clone(), middle.clone(), deep.clone()]);
+    assert_eq!(left, [outer.clone(), middle.clone()]);
+    // For all: the error of the second field is asked about, as it is not inside the part.
+    let (asked, left) = ignore_if_asked(&result, |_| true);
+    assert_eq!(asked, [outer, deep]);
+    assert!(left.is_empty());
+}
+
+/// The closure is asked about each error that remains, once, in the order found.
+#[test]
+fn ignore_if_asks_about_the_errors_in_the_order_found() {
+    let item: ItemTrait = parse_quote!(
+        trait Tr {
+            fn f(&self, a: MyType<'_, Rel>, b: Other<'_>) -> Rel {
+                let c: Last<'_> = loop {};
+            }
+        }
+    );
+    let mut leaker = Leaker::new();
+    leaker.check_values = true;
+    leaker.intern_trait(&item);
+    let result = leaker.result();
+    let found = causes(&result);
+    assert!(found.len() >= 3, "{:?}", found);
+    // A closure that picks nothing is asked about each error, in the order of `errors()`.
+    let (asked, left) = ignore_if_asked(&result, |_| false);
+    assert_eq!(asked, found);
+    assert_eq!(left, found);
+    // What it picks is gone, and the other questions are about the errors that remain.
+    let other = Cause::Type(parse_quote!(Other<'_>));
+    let (asked, left) = ignore_if_asked(&result, |c| *c == other);
+    assert_eq!(asked, found);
+    let without: Vec<Cause> = found.iter().filter(|c| **c != other).cloned().collect();
+    assert_eq!(left, without);
+    // It may keep state, and its answers decide: only the first error is picked.
+    let mut first = true;
+    let rest = result
+        .clone()
+        .ignore_if(|_| std::mem::replace(&mut first, false));
+    assert_eq!(causes(&rest), found[1..]);
+}
+
 #[test]
 fn an_error_that_is_none_of_the_errors_changes_nothing() {
     let (result, _) = analyze(&parse_quote!(
@@ -788,8 +931,7 @@ fn an_error_that_is_about_no_part_is_only_dropped() {
         ]
     );
     // The Referrer is the same whichever is ignored, and the error goes.
-    let referrer =
-        |result: &LeakerResult| result.clone().into_referrer().to_token_stream().to_string();
+    let referrer = |result: &LeakerResult| result.clone().recovered().to_token_stream().to_string();
     for error in result.errors() {
         let after = result.clone().ignore(error);
         assert_eq!(after.errors().len(), 2);
@@ -895,10 +1037,7 @@ fn a_removed_entry_keeps_its_place_and_the_others_keep_theirs() {
         live(&removed),
         [(1, parse_quote!(Other)), (2, parse_quote!(Third))]
     );
-    let (before, after) = (
-        result.clone().into_referrer(),
-        removed.clone().into_referrer(),
-    );
+    let (before, after) = (result.clone().recovered(), removed.clone().recovered());
     // The others keep the primitive type of their impls, the KEY of their impls and their impls.
     let id = 1;
     let bucket = |referrer: &Referrer, n: usize| {
@@ -949,10 +1088,10 @@ fn a_removed_entry_keeps_its_place_and_the_others_keep_theirs() {
 #[test]
 fn removing_the_only_entry_leaves_a_referrer_with_none() {
     let (item, result, top) = analyze_entry();
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().recovered();
     assert!(!referrer.is_empty() && referrer.iter().count() == 1);
     let after = result.clone().ignore(&result.errors()[0].clone());
-    let referrer = after.clone().into_referrer();
+    let referrer = after.clone().finish().unwrap();
     assert!(referrer.is_empty());
     assert_eq!(referrer.iter().count(), 0);
     assert!(impls(&after).is_empty());
@@ -966,11 +1105,7 @@ fn removing_the_only_entry_leaves_a_referrer_with_none() {
     );
     // The index of the removed entry is still one of the Referrer: the bucket helper has none.
     assert_eq!(
-        common::bucket_self(
-            &referrer,
-            1,
-            common::entry_id_at(&result.into_referrer(), 0)
-        ),
+        common::bucket_self(&referrer, 1, common::entry_id_at(&result.recovered(), 0)),
         None
     );
 }

@@ -467,7 +467,7 @@ mod tests {
                 _ => unreachable!("not a struct"),
             };
         }
-        leaker.result().into_referrer()
+        leaker.result().finish().unwrap()
     }
 
     /// Two items spell the same bound differently, so the bare items have two contexts with the

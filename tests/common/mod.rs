@@ -324,7 +324,7 @@ pub fn slot(repeater: &Path, value: &Expr, ty: &Type) -> std::result::Result<Typ
     leaker.enter_generics(&generics, |view| {
         view.visit_type(&parse_quote!(Wrap<{ N }>))
     });
-    let referrer = leaker.result().into_referrer();
+    let referrer = leaker.result().finish().unwrap();
     let (entry, _, context) = referrer.iter().next().expect("the entry Wrap<{ N }>");
     let own = projection(repeater.clone(), 0).of(&parse_quote!(Self), context, entry)?;
     let site = |name: &Ident| (name == "N").then(|| GenericArgument::Const(value.clone()));
@@ -591,7 +591,7 @@ pub fn substitute_for(
 ) -> std::result::Result<Substitute, EncodeError> {
     let mut leaker = Leaker::with_rule(|_: &Cause, _: Place| true);
     let (context, ()) = leaker.enter_generics(generics, |_| ());
-    let referrer = leaker.result().into_referrer();
+    let referrer = leaker.result().finish().unwrap();
     referrer.complete_args(context, given, &projection(parse_quote!(Repeater), 0))
 }
 
@@ -957,6 +957,23 @@ pub fn allow_every_cause(mut result: LeakerResult) -> (LeakerResult, usize) {
         rounds += 1;
     }
     (result, rounds)
+}
+
+/// `result.recovered()`: the Referrer of a result after every error is allowed: the part of each
+/// is copied as written. `allow()` drops errors and changes no entry, so it is the Referrer that the
+/// analysis made.
+#[allow(dead_code)]
+pub trait Recovered {
+    fn recovered(self) -> Referrer;
+}
+
+impl Recovered for LeakerResult {
+    #[track_caller]
+    fn recovered(self) -> Referrer {
+        self.allow(|_: &Cause, _: Place| true)
+            .finish()
+            .unwrap_or_else(|errors| panic!("errors left: {}", messages(&errors)))
+    }
 }
 
 /// One of the rules that a config and a result can be given, so that a test can give the same rule

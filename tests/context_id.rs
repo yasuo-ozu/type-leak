@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{panic_message, s, AcceptCause};
+use common::{panic_message, s, AcceptCause, Recovered};
 use proc_macro2::{TokenStream, TokenTree};
 use std::collections::BTreeSet;
 use syn::visit_mut::VisitMut;
@@ -256,7 +256,7 @@ fn a_failed_call_takes_the_ids_it_would_if_its_causes_were_accepted() {
     let cause = Cause::Type(parse_quote!(RelB<'_>));
     assert_eq!(result.errors().len(), 2);
     assert!(result.errors().iter().all(|error| error.cause == cause));
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().recovered();
     // Accepting the causes drops the errors, and neither the ids nor the Referrer change.
     let accepted = result.clone().accept_cause(&cause);
     assert!(accepted.errors().is_empty());
@@ -325,7 +325,7 @@ fn the_intern_methods_return_the_top_level_context() {
     let top_level = leaker.intern_struct(&parse_quote! { struct S { a: RelB<'_> } });
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    assert!(common::context_ids(&result.into_referrer()).contains(&top_level));
+    assert!(common::context_ids(&result.recovered()).contains(&top_level));
 }
 
 #[test]
@@ -648,7 +648,7 @@ fn serialization_with_gaps_keeps_the_requirements() {
         version()
     );
     let result: LeakerResult = parse_str(&text).unwrap();
-    let referrer = result.into_referrer();
+    let referrer = result.finish().unwrap();
     assert_eq!(ids(&referrer), [1, 4, 6, 9]);
     assert_eq!(referrer.to_token_stream().to_string(), text);
     assert_eq!(
@@ -931,7 +931,7 @@ fn the_ids_read_from_the_serialized_form_agree_with_the_referrer() {
     check_serialized_ids("parts", &parts, &[], false);
     assert_eq!(ids(&parts), [0]);
     assert_eq!(entries_of(&parts), [0]);
-    let empty = Leaker::new().result().into_referrer();
+    let empty = Leaker::new().result().finish().unwrap();
     check_serialized_ids("empty", &empty, &[], false);
     assert_eq!(ids(&empty), [0]);
 }
@@ -962,4 +962,24 @@ fn the_reader_of_the_serialized_form_does_not_guess() {
     ] {
         assert!(read(&text).is_err(), "{}", text);
     }
+}
+
+/// `Referrer::has_context()` is `true` for the contexts that the Referrer keeps, and `false` for a
+/// gap in the numbering or an id it never had.
+#[test]
+fn has_context_is_true_for_the_contexts_of_the_referrer_only() {
+    let (referrer, top_level) = gap_referrer();
+    assert!(referrer.has_context(top_level));
+    let known = ids(&referrer);
+    for &n in &known {
+        assert!(referrer.has_context(id(n)), "context {}", n);
+    }
+    let gap = (0..).find(|n| !known.contains(n)).unwrap();
+    assert!(
+        gap < *known.iter().max().unwrap(),
+        "a gap below the last id"
+    );
+    assert!(!referrer.has_context(id(gap)), "the gap {}", gap);
+    let beyond = known.iter().max().unwrap() + 1;
+    assert!(!referrer.has_context(id(beyond)), "the id {}", beyond);
 }

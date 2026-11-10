@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::s;
+use common::{s, Recovered};
 
 use syn::*;
 use template_quote::quote;
@@ -240,7 +240,7 @@ fn test_defaults_of_several_calls_are_shared() {
     leaker.intern_trait(&bad);
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    let referrer = result.into_referrer();
+    let referrer = result.recovered();
     // The types use no generics, so they are in one context, whichever call found them. The
     // default of `U`, the type of an external crate, is an optional entry (after the required
     // ones), which uses `T`: it is in the context `<T>` that the generics of `S<T>` have too. The

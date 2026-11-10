@@ -133,7 +133,7 @@
 
 mod common;
 
-use common::starts_with;
+use common::{starts_with, Recovered};
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
@@ -186,7 +186,7 @@ fn analyze_in<A: Allow>(
     leaker: Leaker<A>,
     item: &Item,
 ) -> std::result::Result<(ContextId, Referrer), Vec<ErrorItem>> {
-    analyze_result_in(leaker, item).map(|(context, result)| (context, result.into_referrer()))
+    analyze_result_in(leaker, item).map(|(context, result)| (context, result.finish().unwrap()))
 }
 
 /// Like `analyze_in()`, with the result that writes the impls.
@@ -943,7 +943,7 @@ fn f06_impl_assoc_type_of_self_in_repeater() {
         "accepted, with the entries {:?}",
         result
             .clone()
-            .into_referrer()
+            .recovered()
             .iter()
             .map(|(_, ty, _)| string(ty))
             .collect::<Vec<_>>()
@@ -1991,7 +1991,7 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
             "`{}` is accepted, and the entries {:?} are their own `Self`: the Referrer has no \
              type to write for it",
             string(item),
-            self_referential_entries(&result.clone().into_referrer())
+            self_referential_entries(&result.clone().recovered())
         );
         let headline = "is in the self type of the impl, and a bound of its generics names `Self`";
         let (shown, note) = (joined_messages(err), first_note(&err[0]));
@@ -2004,7 +2004,7 @@ fn f13_impl_bound_names_self_of_leaked_self_type() {
         );
         // The recovered Referrer has the rest of the item, and the entries that the error is about
         // are not among them.
-        let referrer = result.into_referrer();
+        let referrer = result.recovered();
         assert!(
             self_referential_entries(&referrer).is_empty(),
             "{}: {:?}",
@@ -4347,7 +4347,10 @@ fn repeater_impl_item(result: &LeakerResult, ix: usize, id: u64) -> ItemImpl {
 
 /// The Repeater key of the entry `n` of the Leaker `id`, as `result` numbers its entries.
 fn key_of(result: &LeakerResult, id: u64, n: usize) -> u128 {
-    common::key(id, common::entry_id_at(&result.clone().into_referrer(), n))
+    common::key(
+        id,
+        common::entry_id_at(&result.clone().finish().unwrap(), n),
+    )
 }
 
 /// The copy of `item` (nested in the scope `context`, held by a `mod`) that a macro makes: each
@@ -7161,7 +7164,7 @@ fn nested_copy_accepting(nest: Nest, item: &Item) -> (Item, Referrer) {
 }
 
 /// Like `nested_copy_in()`; with `recover` the errors of the Leaker do not fail the copy:
-/// the part that conflicts is copied as written (`LeakerResult::into_referrer()`). With `accept`
+/// the part that conflicts is copied as written (every error is allowed first). With `accept`
 /// the `NestedSelfInBounds` errors are accepted first ([`accept_nested_self()`]).
 fn nested_copy_recovering<A: Allow>(
     leaker: Leaker<A>,
@@ -7191,7 +7194,7 @@ fn nested_run<A: Allow>(
         result = accept_nested_self(result);
     }
     let referrer = if recover {
-        result.into_referrer()
+        result.recovered()
     } else {
         result.finish().unwrap()
     };
@@ -8100,7 +8103,7 @@ fn f37_a_default_that_names_self_with_a_bound_that_names_it_is_rejected() {
 /// impl cannot be for the Leaker's type (what `Self` is in the type is what the Leaker saw, and the
 /// bound that the copy proves is for its own type), so it is for any type, and what the type needs
 /// of `Self` to be well-formed is not known (F42). The error stays until the macro accepts it with
-/// `allow()` (`finish()` fails, `into_referrer()` has the entry). As the item itself (`intern_*`),
+/// `allow()` (`finish()` fails until then). As the item itself (`intern_*`),
 /// `Self` is written as the Leaker's type, which has the bound: accepted. Written with an absolute
 /// path (the help says so) the type is no entry, and the copy has it as written, with its own
 /// `Self`: accepted (F38).
@@ -8117,7 +8120,7 @@ fn f37_a_type_that_names_self_with_a_bound_that_names_it_is_a_risk_error_with_it
             );
             assert_eq!(err[0].reason, Reason::NestedSelfInBounds);
             // The recovered Referrer has the entry: the error is the risk of it.
-            let referrer = result.into_referrer();
+            let referrer = result.recovered();
             let entries: Vec<String> = common::types(&referrer).map(string).collect();
             assert!(
                 entries.iter().any(|entry| entry == ty),
@@ -10668,7 +10671,7 @@ fn f43_a_type_whose_context_cannot_be_written_is_copied_as_written() {
         "the bound of `T` mentions a `Self` which has no name here"
     );
     assert_eq!(result.errors()[0].reason, Reason::UnnameableSelf);
-    let referrer = result.into_referrer();
+    let referrer = result.recovered();
     // Not whole, and no entry has its tokens and context: a part that the visitor does not look at,
     // which is there because the error is about it.
     assert_eq!(parts_of(&referrer), ["type (Rel < T , Other >) unwritable"]);
@@ -10708,7 +10711,7 @@ fn f43_the_entry_inside_the_part_is_not_replaced() {
     let (result, context) = f43_analyze(std_config(), false, &[], &nested);
     assert_eq!(result.errors().len(), 1);
     assert_eq!(result.errors()[0].reason, Reason::UnnameableSelf);
-    let referrer = result.into_referrer();
+    let referrer = result.recovered();
     assert_eq!(
         parts_of(&referrer),
         ["type (:: p :: W < 'a , T , dyn RelTr >) unwritable whole"]
@@ -10743,7 +10746,7 @@ fn f43_a_bound_and_a_value_whose_context_cannot_be_written_are_written_as_they_a
         .iter()
         .all(|error| error.reason == Reason::RelativePath));
     assert_eq!(result.errors().len(), 2);
-    let referrer = result.into_referrer();
+    let referrer = result.recovered();
     assert_eq!(
         parts_of(&referrer),
         ["trait (RelTrait < T , Other >) unwritable whole predicate"]
@@ -10862,7 +10865,7 @@ fn f44_a_part_that_names_self_is_found_when_no_entry_does() {
         let result = leaker.result();
         assert_eq!(result.errors().len(), 1, "{}", what);
         assert_eq!(result.errors()[0].reason, *reason, "{}", what);
-        let referrer = result.into_referrer();
+        let referrer = result.recovered();
         let parts = parts_of(&referrer);
         assert_eq!(parts.len(), part.iter().count(), "{}", what);
         if let Some(part) = part {
@@ -10899,7 +10902,7 @@ fn f44_the_self_type_of_an_impl_is_found_when_no_entry_names_self() {
         result.errors().iter().map(|e| e.reason).collect::<Vec<_>>(),
         [Reason::SelfInImplSelfType, Reason::UnprovableBound]
     );
-    let referrer = result.into_referrer();
+    let referrer = result.recovered();
     // The `Self` of the bound, in a predicate, is whole. The self type is not: it is a part that
     // the visitor does not look at, there because its error is about it (the last part).
     let parts = parts_of(&referrer);
@@ -11198,7 +11201,7 @@ fn f48_leak(items: &[Item]) -> (Referrer, Vec<ContextId>, Vec<Reason>) {
     let contexts = items.iter().map(|item| intern(&mut leaker, item)).collect();
     let result = leaker.result();
     let reasons = result.errors().iter().map(|e| e.reason).collect();
-    (result.into_referrer(), contexts, reasons)
+    (result.recovered(), contexts, reasons)
 }
 
 /// The copies of `items`, each with the entries replaced by `P<ix>`.
@@ -11331,7 +11334,7 @@ fn f48_a_marked_part_is_left_in_the_arguments_of_a_signature_only() {
     let struct_context = leaker.intern_struct(&parse_quote!(
         struct S<'x>(Wrap<'x>);
     ));
-    let referrer = leaker.result().into_referrer();
+    let referrer = leaker.result().recovered();
     let replace = |_: Type, ix: EntryId, _: &Context| -> Type { parse_quote!(P<#ix>) };
     let ty: Type = parse_quote!(Wrap<'x>);
     let sig: Signature = parse_quote!(fn f<'x>(&self, a: Wrap<'x>) -> &'x u8);
@@ -11713,7 +11716,7 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_leaked() {
         // they are.
         let found: Vec<String> = result
             .clone()
-            .into_referrer()
+            .recovered()
             .iter()
             .map(|(_, ty, _)| string(ty))
             .collect();
@@ -11728,7 +11731,12 @@ fn f50_the_relative_types_in_the_arguments_of_a_value_path_are_leaked() {
         assert!(after.errors().is_empty(), "{}", what);
         let config = f50_analyze(&item, Some(rule));
         assert!(config.errors().is_empty(), "{}", what);
-        assert_eq!(config.into_referrer(), after.into_referrer(), "{}", what);
+        assert_eq!(
+            config.finish().unwrap(),
+            after.finish().unwrap(),
+            "{}",
+            what
+        );
     }
 
     // Not paths of the error: a generic, and what the value declares.
@@ -11877,7 +11885,7 @@ fn f52_an_unrelated_error_does_not_make_an_optional_entry_of_the_predicate() {
         let result = leaker.result();
         (
             result.errors().len(),
-            entries_text(&result.into_referrer(), true),
+            entries_text(&result.recovered(), true),
         )
     };
     // The error is `RelTr<Self::A0>`, and `Self::A0` in it is resolved by the host: no entry.
@@ -11906,14 +11914,14 @@ fn f52_an_unrelated_error_does_not_make_an_optional_entry_of_the_predicate() {
     leaker.intern_trait(&item("fn m<Y>(&self) where Y: RelTr<Self::A0>;"));
     let result = leaker.result();
     assert!(result.errors().is_empty());
-    assert!(entries_text(&result.into_referrer(), true).is_empty());
+    assert!(entries_text(&result.finish().unwrap(), true).is_empty());
 }
 
 // ── F53 ──────────────────────────────────────────────────────────────────────
 
 /// The generics of the Repeater impl of the entry `entry` of `referrer`, and its type, as text.
 fn f53_declared(result: &LeakerResult, entry: &str, target: ImplSelf) -> (String, String) {
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().finish().unwrap();
     let ix = common::types(&referrer)
         .position(|ty| string(ty) == entry)
         .unwrap();
@@ -12054,7 +12062,7 @@ fn f54_an_entry_headed_by_a_path_keyword_serializes() {
             leaker.intern_struct(&item);
             let result = leaker.result();
             let tokens = template_quote::ToTokens::to_token_stream(&result);
-            let referrer = result.into_referrer();
+            let referrer = result.finish().unwrap();
             assert!(!referrer.is_empty(), "{}", what);
             // The tokens parse back to the same Referrer, both as a Referrer and as a result.
             assert_eq!(
@@ -12064,7 +12072,7 @@ fn f54_an_entry_headed_by_a_path_keyword_serializes() {
                 what
             );
             let read = parse2::<LeakerResult>(tokens).unwrap();
-            assert_eq!(read.into_referrer(), referrer, "{}", what);
+            assert_eq!(read.finish().unwrap(), referrer, "{}", what);
         }
     }
 }
@@ -12101,7 +12109,7 @@ fn f56_read(source: &str) -> (Vec<(String, bool, bool)>, Vec<String>) {
             })
             .collect();
         let entries = result
-            .into_referrer()
+            .recovered()
             .iter()
             .map(|(_, ty, _)| string(ty))
             .collect();
@@ -12510,7 +12518,8 @@ fn f58_enter_impl_is_told_the_trait_of_the_impl() {
     let result = leaker.result();
     assert!(result.errors().is_empty(), "{}", string(&result));
     let entries: Vec<String> = result
-        .into_referrer()
+        .finish()
+        .unwrap()
         .iter()
         .map(|(_, ty, _)| string(ty))
         .collect();
@@ -12683,7 +12692,7 @@ fn f58_the_walk_in_the_scope_does_not_cut_the_self_type_of_the_impl() {
         impl<T> ::p::S<T> where T: AsRef<Self> {}
     );
     let entries = |interned: bool| -> Vec<String> {
-        entries_text(&analyze(&item, interned).into_referrer(), true)
+        entries_text(&analyze(&item, interned).finish().unwrap(), true)
     };
     assert!(entries(true).is_empty());
     assert_eq!(entries(false), [":: p :: S < T >"]);
@@ -13143,11 +13152,13 @@ fn f62_the_impl_written_through_the_path_is_the_impl_written_by_hand() {
 fn f63_leak<A: Allow>(config: A, item: &ItemTrait) -> (String, Vec<(Reason, String)>, Vec<String>) {
     let mut leaker = Leaker::with_rule(config);
     let context = leaker.intern_trait(item);
-    let (referrer, errors) = leaker.result().into_parts();
-    let errors = errors
+    let result = leaker.result();
+    let errors = result
+        .errors()
         .iter()
         .map(|error| (error.reason, string(&error.cause)))
         .collect();
+    let referrer = result.recovered();
     let mut copy = item.clone();
     common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>))
         .visit_item_trait_mut(&mut copy);
@@ -13222,7 +13233,7 @@ fn f63_the_types_that_hold_a_method_lifetime_inside_a_type_written_as_it_is_are_
     );
     // `Result<RU<255>, I0>` is the only entry: both heads are written as they are, in this
     // signature only (`sig ('x)`).
-    let referrer = result.into_referrer();
+    let referrer = result.recovered();
     assert_eq!(
         common::types(&referrer).map(string).collect::<Vec<_>>(),
         ["Result < RU < 255 > , I0 >"]
@@ -14004,15 +14015,13 @@ fn f67_the_optional_types_on_the_way_to_a_method_lifetime_are_all_written_as_the
 fn f68_copy<A: Allow>(config: A, item: &ItemImpl) -> (Vec<Reason>, Vec<String>, String) {
     let mut leaker = Leaker::with_rule(config);
     let context = leaker.intern_impl(item);
-    let (referrer, errors) = leaker.result().into_parts();
+    let result = leaker.result();
+    let reasons = result.errors().iter().map(|e| e.reason).collect();
+    let referrer = result.recovered();
     let entries = common::types(&referrer).map(string).collect();
     let mut copy = item.clone();
     common::visitor(&referrer, context, replaced).visit_item_impl_mut(&mut copy);
-    (
-        errors.iter().map(|e| e.reason).collect(),
-        entries,
-        string(&*copy.self_ty),
-    )
+    (reasons, entries, string(&*copy.self_ty))
 }
 
 /// F68 (fixed): an optional self type of an impl was an optional entry where a bound that names a
@@ -14654,15 +14663,13 @@ fn f70_the_elided_lifetime_of_a_signature_is_named_where_the_visitor_writes_life
 fn f71_copy<A: Allow>(config: A, item: &Item) -> (Vec<Reason>, Vec<String>, String) {
     let mut leaker = Leaker::with_rule(config);
     let context = intern(&mut leaker, item);
-    let (referrer, errors) = leaker.result().into_parts();
+    let result = leaker.result();
+    let reasons = result.errors().iter().map(|e| e.reason).collect();
+    let referrer = result.finish().unwrap();
     let entries = common::types(&referrer).map(string).collect();
     let mut copy = item.clone();
     common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>)).visit_item_mut(&mut copy);
-    (
-        errors.iter().map(|e| e.reason).collect(),
-        entries,
-        string(&copy),
-    )
+    (reasons, entries, string(&copy))
 }
 
 /// F71 (fixed): an optional type in a where predicate that the context of an entry carries was an
@@ -15087,7 +15094,7 @@ fn f72_a_type_copied_as_written_for_a_method_lifetime_is_left_only_where_the_cop
     // The same for a macro that writes the methods one by one (`visit_signature_mut()`).
     let mut leaker = new_leaker();
     let context = leaker.intern_trait(&item);
-    let referrer = leaker.result().into_referrer();
+    let referrer = leaker.result().recovered();
     let replace = |_: Type, ix: EntryId, _: &Context| -> Type { parse_quote!(P<#ix>) };
     let signatures: [(Signature, &str); 2] = [
         (
@@ -15722,7 +15729,7 @@ fn f76_the_name_in_the_tokens_of_a_macro_is_taken_and_so_is_the_one_of_an_any_en
     );
     for nest in NESTS {
         let result = nested_analysis(nest, &item);
-        let referrer = result.clone().into_referrer();
+        let referrer = result.clone().finish().unwrap();
         assert!(
             matches!(
                 common::entry(&referrer, 0).self_ty.as_ref(),
@@ -15795,7 +15802,7 @@ fn f77_the_path_of_the_repeater_is_checked_before_it_is_used() {
             (bare, empties)
         })
         .collect();
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().finish().unwrap();
     let (ix, _, context) = referrer.iter().next().unwrap();
     let mut compared = 0;
     for (bare, empties) in &pairs {
@@ -15940,7 +15947,7 @@ fn f78_an_id_that_the_referrer_does_not_have_is_named_in_the_panic() {
     for (item, entries) in items {
         let mut leaker = new_leaker();
         intern(&mut leaker, &item);
-        let referrer = leaker.result().into_referrer();
+        let referrer = leaker.result().finish().unwrap();
         assert_eq!(referrer.iter().count(), entries);
         // A context of another Referrer: the ids are small numbers, so one beyond them.
         let unknown: ContextId = parse_quote!(99);
@@ -16081,7 +16088,7 @@ fn f81_the_unnameable_self_is_found_in_declaration_order() {
                 });
             });
         });
-        let referrer = leaker.result().into_referrer();
+        let referrer = leaker.result().finish().unwrap();
         referrer
             .iter()
             .map(|(_, ty, context)| (string(ty), format!("{:?}", context)))
@@ -16227,7 +16234,7 @@ fn f83_a_block_hides_the_entries_that_name_what_it_declares() {
         let mut leaker = Leaker::with_rule(Rules::new().primitive());
         leaker.check_values = true;
         let context = leaker.intern_impl(item);
-        let referrer = leaker.result().into_referrer();
+        let referrer = leaker.result().recovered();
         let mut copy = item.clone();
         let mut visitor = common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>));
         visitor.visit_item_impl_mut(&mut copy);
@@ -16422,7 +16429,7 @@ fn f84_a_predicate_on_a_generic_in_parentheses_or_a_group_is_a_bound_of_it() {
         let context = intern(&mut leaker, item);
         let result = leaker.result();
         let errors = joined_messages(result.errors());
-        let referrer = result.into_referrer();
+        let referrer = result.finish().unwrap();
         let entries: Vec<(String, String)> = referrer
             .iter()
             .map(|(_, ty, context)| (string(ty), string(&context.generics)))
@@ -16588,7 +16595,7 @@ fn f85_the_values_in_the_default_of_a_type_parameter_are_read_with_check_values(
             "{:?}",
             reasons
         );
-        (errors, result.into_referrer().iter().count())
+        (errors, result.recovered().iter().count())
     };
     let config = || Rules::new().primitive().prelude();
     for (name, item) in &items {
@@ -16737,7 +16744,7 @@ fn f86_the_generics_of_an_item_in_the_default_of_a_type_parameter_are_its_own() 
         let errors = (result.errors().iter())
             .map(|error| (error.reason, error.message.clone()))
             .collect();
-        let entries = (result.into_referrer().iter())
+        let entries = (result.finish().unwrap().iter())
             .map(|(_, ty, _)| string(ty))
             .collect();
         (errors, entries)
@@ -16906,7 +16913,7 @@ fn f88_a_self_projection_in_parentheses_or_a_group_has_one_error() {
         let errors = (result.errors().iter())
             .map(|error| (error.reason, error.message.clone()))
             .collect();
-        let referrer = result.into_referrer();
+        let referrer = result.recovered();
         let entries = referrer.iter().map(|(_, ty, _)| string(ty)).collect();
         let mut copy = item.clone();
         common::visitor(&referrer, context, |_, ix, _| parse_quote!(P<#ix>))
@@ -16977,7 +16984,7 @@ fn f89_the_arguments_of_a_generic_associated_type_replace_its_parameters_in_its_
         leaker.intern_trait(&item);
         let result = leaker.result();
         assert!(result.errors().is_empty(), "{}", string(&item));
-        let referrer = result.into_referrer();
+        let referrer = result.finish().unwrap();
         let entries: Vec<_> = referrer.iter().collect();
         assert_eq!(entries.len(), 1, "{}", string(&item));
         let generics = &entries[0].2.generics;

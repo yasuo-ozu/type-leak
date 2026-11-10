@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{entries_with_generics as entries, messages, s, starts_with};
+use common::{entries_with_generics as entries, messages, s, starts_with, Recovered};
 use syn::*;
 use type_leak::{Allow, Cause, ErrorItem, Leaker, Place, Referrer, Rules};
 
@@ -623,7 +623,7 @@ fn a_scope_that_fails_leaves_no_trace_of_its_cycle() {
     // The first scope has the only error, and the entry is that of the second.
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    assert_eq!(types(&result.into_referrer()), ["Wrap < T >"]);
+    assert_eq!(types(&result.recovered()), ["Wrap < T >"]);
 }
 
 /// The headline and the note of an error, as `rejected()` gives them.

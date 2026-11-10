@@ -26,7 +26,8 @@
 mod common;
 
 use common::{
-    accepting, allow_every_cause, causes_accepting, starts_with, to_syn_error, AcceptCause, Rule,
+    accepting, allow_every_cause, causes_accepting, starts_with, to_syn_error, AcceptCause,
+    Recovered, Rule,
 };
 use syn::*;
 use template_quote::{quote, ToTokens};
@@ -152,8 +153,8 @@ fn a_bound_written_as_it_is_has_the_error_inside_it_after_it() {
     assert_eq!(same.help_text(), inside.help_text());
     // The Referrer is the one of the absolute bound.
     assert_eq!(
-        result.clone().into_referrer().iter().count(),
-        direct.into_referrer().iter().count()
+        result.clone().recovered().iter().count(),
+        direct.recovered().iter().count()
     );
 }
 
@@ -435,7 +436,7 @@ fn a_whole_part_with_a_self_without_meaning_has_no_entry_inside() {
         assert_eq!(result.errors()[0].message, "`Self` has no meaning here");
         assert!(result.errors()[0].paths.is_empty(), "{}", written);
         assert!(allow_every_cause(result.clone()).0.finish().is_ok());
-        let referrer = result.into_referrer();
+        let referrer = result.recovered();
         let found: Vec<String> = common::types(&referrer).map(text).collect();
         assert_eq!(found, entries, "{}", written);
         // The Visitor writes the part as it is, and the entries it has.
@@ -676,7 +677,7 @@ fn the_trait_of_a_bound_and_a_trait_object_is_a_trait_and_its_arguments_are_type
         paths_of(&result),
         [vec!["trait(RelTr)", "type(Arg)"], vec!["trait(OtherTr)"]]
     );
-    let referrer = result.into_referrer();
+    let referrer = result.recovered();
     let entries: Vec<String> = common::types(&referrer)
         .map(|ty| ty.to_token_stream().to_string())
         .collect();
@@ -695,7 +696,7 @@ fn the_qualified_path_in_the_arguments_of_what_conflicts_is_leaked() {
     let result = leaker.result();
     assert_eq!(paths_of(&result), [vec!["type(Wrap)"]]);
     let entries: Vec<String> = result
-        .into_referrer()
+        .recovered()
         .iter()
         .map(|(_, ty, _)| ty.to_token_stream().to_string())
         .collect();
@@ -729,7 +730,7 @@ fn a_path_in_a_value_is_an_expression_and_its_arguments_are_leaked() {
     let result = leaker.result();
     assert_eq!(paths_of(&result), [vec!["expr(rel :: f)"]]);
     let entries: Vec<String> = result
-        .into_referrer()
+        .recovered()
         .iter()
         .map(|(_, ty, _)| ty.to_token_stream().to_string())
         .collect();

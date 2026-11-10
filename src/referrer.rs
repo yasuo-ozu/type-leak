@@ -574,6 +574,22 @@ impl Referrer {
         self.entries.len() == self.removed.len()
     }
 
+    /// Returns `true` if `context` is one of the contexts of this Referrer.
+    /// [`visitor()`](Referrer::visitor) and [`complete_args()`](Referrer::complete_args) panic for
+    /// any other.
+    ///
+    /// ```
+    /// # use type_leak::*;
+    /// # use syn::*;
+    /// let mut leaker = Leaker::new();
+    /// let context = leaker.intern_struct(&parse_quote!(struct S<T>(Rel<T>);));
+    /// let referrer = leaker.result().finish().unwrap();
+    /// assert!(referrer.has_context(context));
+    /// ```
+    pub fn has_context(&self, context: ContextId) -> bool {
+        self.contexts.contains_key(&context)
+    }
+
     /// The number of entries, with the removed ones: the indices are below it.
     pub(crate) fn entry_count(&self) -> usize {
         self.entries.len()

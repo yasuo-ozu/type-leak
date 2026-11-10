@@ -128,9 +128,8 @@
 //! The Leaker copies what conflicts as written and goes on: of a type that cannot be leaked, the
 //! path of its head (what is in its arguments is analyzed on its own, see `tests/flat_errors.rs`),
 //! and whole the trait bounds, the types in predicates, the references and the holders of a bare
-//! name that may be a const. The recovered Referrer (`LeakerResult::into_referrer()`) has the
-//! correction it makes, and `LeakerResult::allow(cause)` accepts the conflict by dropping its
-//! error. This test did not compile those corrections. With `TYPE_LEAK_PROP_ACCEPT=1` it compiles
+//! name that may be a const. `LeakerResult::allow(cause)` accepts the conflict by dropping its
+//! error, and `finish()` then gives the Referrer, which has the correction. This test did not compile those corrections. With `TYPE_LEAK_PROP_ACCEPT=1` it compiles
 //! them, by accepting the causes of the errors:
 //!
 //! 1. The macro (`prop_leak_accept`) analyzes an item as always. If the Leaker rejects it, it

@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{messages, s, to_syn_error};
+use common::{messages, s, to_syn_error, Recovered};
 
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -195,7 +195,7 @@ fn the_self_of_a_trait_has_no_name() {
     let message = to_syn_error(err).to_string();
     assert!(message.contains("it cannot be leaked as a whole because of `Self`"));
     // The scope around goes on, with nothing recorded.
-    assert_eq!(result.into_referrer().iter().count(), 0);
+    assert_eq!(result.recovered().iter().count(), 0);
     // So is it for the items of the scope, and for a where predicate.
     let bound_headline = "the bound of `T` mentions a `Self` which has no name here";
     let predicate_headline = "the where predicate `T : ::p::Tr<Self>` mentions a `Self` \
@@ -657,7 +657,7 @@ fn a_default_with_an_outer_bound_on_the_self_of_a_trait_is_an_error() {
         "{:?}",
         err[0].notes.first().map(|(_, n)| n.as_str())
     );
-    assert_eq!(result.into_referrer().iter().count(), 0);
+    assert_eq!(result.recovered().iter().count(), 0);
     // A scope that declares no `Self` keeps the one of the trait, but a default has none.
     let mut leaker = Leaker::new();
     leaker.enter_trait(&ident("Tr"), &bound(), |v| {

@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{analyze_trait, bare_path, starts_with, AcceptCause};
+use common::{analyze_trait, bare_path, starts_with, AcceptCause, Recovered};
 use std::cell::{Cell, RefCell};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
@@ -62,7 +62,7 @@ fn a_path_rule_leaves_the_paths_it_accepts_as_written() {
     let result = analyze(&item, Rules::new());
     assert!(result.errors().is_empty());
     assert_eq!(
-        entries(&result.into_referrer()),
+        entries(&result.finish().unwrap()),
         ["Vec < u8 >".to_string(), ":: serde :: W".to_string()]
     );
     // A rule for each of them: nothing is leaked, and there is no error.
@@ -72,7 +72,7 @@ fn a_path_rule_leaves_the_paths_it_accepts_as_written() {
         .or_if(starts_with(parse_quote!(::serde)));
     let result = analyze(&item, config);
     assert!(result.errors().is_empty());
-    assert!(entries(&result.into_referrer()).is_empty());
+    assert!(entries(&result.finish().unwrap()).is_empty());
 }
 
 #[test]
@@ -465,7 +465,7 @@ fn a_rule_that_accepts_self_does_not_hide_an_error_about_it() {
     ] {
         let plain = by(source, Rules::new());
         assert_eq!(plain.errors().len(), 1, "{}", source);
-        assert!(plain.clone().into_referrer().is_empty());
+        assert!(plain.clone().recovered().is_empty());
         // A rule for every path of one segment but the relative one accepts `Self` and a generic
         // too, if it is asked: it is not, neither in the analysis nor as a path of the error.
         let seen = Rc::new(Seen::default());
@@ -478,7 +478,7 @@ fn a_rule_that_accepts_self_does_not_hide_an_error_about_it() {
         };
         let by_rule = by(source, Rules::new().or_if(short));
         assert_eq!(texts(by_rule.errors()), texts(plain.errors()), "{}", source);
-        assert!(by_rule.into_referrer().is_empty(), "{}", source);
+        assert!(by_rule.recovered().is_empty(), "{}", source);
         assert!(!seen.starts_with("Self"), "{}: {:?}", source, seen.paths());
         // Accepting the paths of `Self` only, on a result.
         let on_result = plain.clone().allow(|cause: &Cause, _: Place| {
@@ -502,7 +502,7 @@ fn the_filter_does_not_ask_the_rule_about_a_path_of_self() {
     let base = three_errors();
     let mut error = base.errors()[0].clone();
     error.paths = vec![Cause::Type(parse_quote!(Self::A))];
-    let mut tokens = base.into_referrer().to_token_stream();
+    let mut tokens = base.recovered().to_token_stream();
     tokens.extend(quote!(@ [#error]));
     let result: LeakerResult = parse2(tokens).unwrap();
     assert_eq!(paths_of(&result), [["Self :: A"]]);
@@ -533,7 +533,7 @@ fn the_rule_sees_a_path_without_arguments_in_both_forms() {
     assert!(by_exact.errors().is_empty());
     assert_eq!(texts(by_exact.errors()), texts(by_prefix.errors()));
     // `Rel` in the arguments is still analyzed: it is the one entry.
-    let (by_exact, by_prefix) = (by_exact.into_referrer(), by_prefix.into_referrer());
+    let (by_exact, by_prefix) = (by_exact.finish().unwrap(), by_prefix.finish().unwrap());
     assert_eq!(entries(&by_exact), ["Rel".to_string()]);
     assert_eq!(entries(&by_exact), entries(&by_prefix));
 
@@ -555,7 +555,7 @@ fn the_rule_sees_a_path_without_arguments_in_both_forms() {
     let by_prefix = analyze_trait(&item, Rules::new().or_if(prefix), true);
     assert!(by_exact.errors().is_empty());
     assert_eq!(texts(by_exact.errors()), texts(by_prefix.errors()));
-    let (by_exact, by_prefix) = (by_exact.into_referrer(), by_prefix.into_referrer());
+    let (by_exact, by_prefix) = (by_exact.finish().unwrap(), by_prefix.finish().unwrap());
     assert_eq!(entries(&by_exact), ["Rel".to_string()]);
     assert_eq!(entries(&by_exact), entries(&by_prefix));
 
@@ -626,7 +626,7 @@ fn a_rule_that_panics_is_a_panic_of_the_closure() {
     leaker.intern_struct(&fine);
     let result = leaker.result();
     assert!(result.errors().is_empty());
-    assert_eq!(entries(&result.into_referrer()), ["Rel2".to_string()]);
+    assert_eq!(entries(&result.finish().unwrap()), ["Rel2".to_string()]);
 }
 
 // ── each path is asked about as the cause of its kind ────────────────────────────────────────
@@ -753,7 +753,7 @@ fn a_rule_for_one_kind_leaves_a_path_of_another_kind_leaked() {
     let by_traits = analyze_trait(&item, Rules::new().primitive().or_if(only_traits), false);
     let by_types = analyze_trait(&item, Rules::new().primitive().or_if(only_types), false);
     // Types allowed: no entry for `Same`; the trait `Same2` is an error.
-    assert!(entries(&by_types.clone().into_referrer()).is_empty());
+    assert!(entries(&by_types.clone().recovered()).is_empty());
     assert_eq!(by_types.errors().len(), 1);
     assert!(matches!(
         by_types.errors()[0].cause,
@@ -761,7 +761,7 @@ fn a_rule_for_one_kind_leaves_a_path_of_another_kind_leaked() {
     ));
     // Traits allowed: the type `Same` is an entry, and the trait is fine.
     assert!(by_traits.errors().is_empty());
-    assert_eq!(entries(&by_traits.into_referrer()), ["Same".to_string()]);
+    assert_eq!(entries(&by_traits.finish().unwrap()), ["Same".to_string()]);
 }
 
 #[test]
@@ -1044,9 +1044,7 @@ fn values_writes_every_relative_path_in_a_value_as_it_is() {
     // Values are read: a relative type in a `let` is an entry, and the paths of the value are errors.
     let plain = analyze_trait(&item, Rules::new(), true);
     assert!(!plain.errors().is_empty());
-    let leaked: Vec<String> = entries(&plain.clone().into_referrer())
-        .into_iter()
-        .collect();
+    let leaked: Vec<String> = entries(&plain.clone().recovered()).into_iter().collect();
     assert!(
         leaked.contains(&"Local < Arg >".to_string()),
         "{:?}",
@@ -1057,7 +1055,7 @@ fn values_writes_every_relative_path_in_a_value_as_it_is() {
     // the primitive types are not allowed).
     let by_flag = analyze_trait(&item, Rules::new().values(), true);
     assert!(by_flag.errors().is_empty());
-    let kept: Vec<String> = entries(&by_flag.into_referrer()).into_iter().collect();
+    let kept: Vec<String> = entries(&by_flag.finish().unwrap()).into_iter().collect();
     assert_eq!(kept, ["Sig", "usize"]);
     // Only the values of the item are read: without `check_values` the flag changes nothing.
     let without = analyze_trait(&item, Rules::new().values(), false);
@@ -1069,7 +1067,7 @@ fn values_writes_every_relative_path_in_a_value_as_it_is() {
     // After the analysis it only drops the errors, and leaves the entries.
     let on_result = plain.allow(Rules::new().values());
     assert!(on_result.errors().is_empty());
-    assert!(entries(&on_result.into_referrer())
+    assert!(entries(&on_result.finish().unwrap())
         .iter()
         .any(|ty| ty == "Local < Arg >"));
 }
@@ -1084,7 +1082,7 @@ fn defaults_writes_every_relative_path_in_a_default_as_it_is() {
         }
     );
     let plain = analyze(&item, Rules::new());
-    let leaked: Vec<String> = entries(&plain.into_referrer()).into_iter().collect();
+    let leaked: Vec<String> = entries(&plain.finish().unwrap()).into_iter().collect();
     assert!(
         leaked.contains(&"Rel < Other >".to_string()),
         "{:?}",
@@ -1093,7 +1091,7 @@ fn defaults_writes_every_relative_path_in_a_default_as_it_is() {
     // The types of the defaults are written as they are, and the field `c` is an entry still.
     let by_flag = analyze(&item, Rules::new().defaults());
     assert!(by_flag.errors().is_empty());
-    let kept: Vec<String> = entries(&by_flag.into_referrer()).into_iter().collect();
+    let kept: Vec<String> = entries(&by_flag.finish().unwrap()).into_iter().collect();
     assert_eq!(kept, ["Plain"]);
 }
 
@@ -1292,7 +1290,10 @@ fn or_if_takes_a_closure_without_annotations_and_or_takes_any_rule() {
         Rules::new().or_if(|cause, _| cause.starts_with(&parse_quote!(Rel))),
         false,
     );
-    assert_eq!(entries(&by_closure.into_referrer()), ["Other".to_string()]);
+    assert_eq!(
+        entries(&by_closure.finish().unwrap()),
+        ["Other".to_string()]
+    );
     // Rules add up, in any order, and a struct of the user is a rule.
     struct OnlyOther;
     impl Allow for OnlyOther {
@@ -1306,7 +1307,7 @@ fn or_if_takes_a_closure_without_annotations_and_or_takes_any_rule() {
         .primitive();
     let result = analyze_trait(&item, both, false);
     assert!(result.errors().is_empty());
-    assert!(result.into_referrer().is_empty());
+    assert!(result.finish().unwrap().is_empty());
     // And on a result: an annotated closure, a function, a tuple, `()`.
     let errored: ItemTrait = parse_quote!(
         trait Tr: Rel {}

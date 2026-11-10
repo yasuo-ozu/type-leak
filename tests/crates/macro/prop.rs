@@ -36,9 +36,9 @@
 //! The copy replaces every entry through the Repeater, so the Leaker's crate has the impls of all.
 //!
 //! With `#[prop_leak_accept]` (`TYPE_LEAK_PROP_ACCEPT`, see `tests/prop_cross_crate/main.rs`), an item
-//! that the Leaker rejects is emitted as an accepted item with the recovered Referrer
-//! (`LeakerResult::into_referrer()`: the report says `acc`, and has the errors) if
-//! `LeakerResult::allow(cause)` for the cause of every error drops every error. Its copy is made in
+//! that the Leaker rejects is emitted as an accepted item with the Referrer of `finish()` (the report
+//! says `acc`, and has the errors) if `LeakerResult::allow(cause)` for the cause of every error drops
+//! every error. Its copy is made in
 //! the Referrer's crate of the accepted items only (`accept` in the invocation, [`apply()`]), where
 //! the parts that it keeps as written resolve.
 //!
@@ -4647,11 +4647,10 @@ pub(crate) enum Mode {
 
 /// `#[prop_leak(..)]`, and, with `accept`, `#[prop_leak_accept(..)]` (`TYPE_LEAK_PROP_ACCEPT`).
 ///
-/// With `accept`, an item that the Leaker rejects is emitted with the recovered Referrer
-/// (`LeakerResult::into_referrer()`) as an accepted item (the Repeater's impls, the witnesses, the
-/// macro of the Referrer, which copies the part that conflicts as written), with the status `acc`.
-/// `LeakerResult::allow(cause)` for the cause of every error must drop every error
-/// ([`allow_all()`]: the macro panics otherwise). The errors are what the report says (and what
+/// With `accept`, an item that the Leaker rejects is emitted with the Referrer of `finish()` as an
+/// accepted item (the Repeater's impls, the witnesses, the macro of the Referrer, which copies the
+/// part that conflicts as written), with the status `acc`. `LeakerResult::allow(cause)` for the
+/// cause of every error must drop every error ([`allow_all()`]: the macro panics otherwise). The errors are what the report says (and what
 /// `family()` of the harness explains).
 ///
 /// With `Mode::Result` the same item is emitted whatever the errors, and the macro of the Referrer
@@ -4796,8 +4795,9 @@ pub(crate) fn leak(attr: TokenStream, item: TokenStream, mode: Mode) -> Result<T
     };
     // What the macro of the Referrer carries: the result with its errors, or the Referrer.
     let carried = (mode == Mode::Result).then(|| result.to_token_stream());
-    // The recovered Referrer: the parts that conflict are copied as written.
-    let referrer = result.clone().into_referrer();
+    // The recovered Referrer: the parts that conflict are copied as written. `finish()` of the
+    // result with every error allowed: if one stays, the macro panics (`ALLOW LEFT ERRORS`).
+    let referrer = crate::recovered(result.clone());
     let carried = carried.unwrap_or_else(|| referrer.to_token_stream());
 
     let status = if args.accepted { "acc" } else { "ok" };
@@ -4861,7 +4861,7 @@ fn same_analysis(
     };
     let what = if got.1 != plain.1 {
         Some("the context")
-    } else if got.0.clone().into_referrer() != plain.0.clone().into_referrer() {
+    } else if crate::recovered(got.0.clone()) != crate::recovered(plain.0.clone()) {
         Some("the Referrer")
     } else if errors(got.0) != errors(plain.0) {
         Some("the errors")
@@ -5034,7 +5034,7 @@ fn count_copy(
     twin: bool,
     checked: &[Checked],
 ) -> Result<Counted> {
-    let referrer = &result.clone().into_referrer();
+    let referrer = &crate::recovered(result.clone());
     let (id, kind) = (args.id, kind_name(original));
     let impls = repeater_impls(result, referrer, args.repeater_id(), args.marker.as_ref())?;
     let positions = collect_positions(original, None, args);
@@ -5042,7 +5042,7 @@ fn count_copy(
     // The result is read back from its tokens, as the Referrer's macro gets it.
     let plain: LeakerResult = parse2(result.to_token_stream())?;
     let copy = rewrite(
-        &plain.into_referrer(),
+        &crate::recovered(plain),
         context,
         original,
         args,
@@ -5230,8 +5230,8 @@ fn rule_stage(original: &Item, args: &Args, rule: Rule) -> (Vec<StageCopy>, Toke
     };
     let applies = rule != Rule::Values || args.values;
     let same_errors = text(before.errors()) == text(after.errors());
-    let same_referrer =
-        copy_needs(&before.clone().into_referrer()) == copy_needs(&after.clone().into_referrer());
+    let same_referrer = copy_needs(&crate::recovered(before.clone()))
+        == copy_needs(&crate::recovered(after.clone()));
     let matters = applies
         && (rule == Rule::Prelude
             || text(plain.errors()) != text(after.errors())
@@ -5343,7 +5343,7 @@ fn stage_copy(
     copy_args.stages = false;
     copy_args.stage = rule.number(side);
     copy_args.accepted = true;
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().finish().unwrap();
     let text = rejection_text(&errors);
     let counted = match count_copy(&result, context, original, &copy_args, status, false, &[]) {
         Ok(counted) => counted,
@@ -5623,7 +5623,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     }
     let errors = result.errors().to_vec();
     let rewritten = rewrite(
-        &result.clone().into_referrer(),
+        &crate::recovered(result.clone()),
         context,
         &item,
         &args,
@@ -5681,7 +5681,7 @@ pub(crate) fn apply(input: TokenStream) -> Result<TokenStream> {
     // names it leaks: the ordinary Referrer's crate only (the others do not ask for it).
     let mut more = TokenStream::new();
     if inst.is_some() || shadow.is_some() {
-        let referrer = result.clone().into_referrer();
+        let referrer = crate::recovered(result.clone());
         if let Some(seed) = inst {
             let ask = InstAsk {
                 seed,

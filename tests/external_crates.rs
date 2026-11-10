@@ -472,10 +472,10 @@ fn index_of(referrer: &Referrer, ty: &str) -> EntryId {
     common::entry_id_at(referrer, n)
 }
 
-/// `allow()` drops errors only: `finish()` and `into_referrer()` give the Referrer of the result for
-/// any rule, also one that allows the crate of a type of another crate, and chained.
+/// `allow()` drops errors only: `finish()` gives the Referrer of the result for any rule, also one
+/// that allows the crate of a type of another crate, and chained.
 #[test]
-fn allow_changes_no_entry_in_the_referrer_of_finish_and_into_referrer() {
+fn allow_changes_no_entry_in_the_referrer_of_finish() {
     let (result, context) = result_with_foo();
     let plain = result.clone().finish().unwrap();
     let ix_foo = index_of(&plain, "::foo::X");
@@ -488,19 +488,18 @@ fn allow_changes_no_entry_in_the_referrer_of_finish_and_into_referrer() {
             .allow(Rules::new().external_crates()),
     ];
     for result in results {
-        for referrer in [result.clone().finish().unwrap(), result.into_referrer()] {
-            assert_eq!(referrer, plain);
-            assert_eq!(entries(&referrer), entries(&plain));
-            assert_eq!(
-                expand(&referrer, context, parse_quote!(::foo::X)),
-                format!("P < {}usize >", ix_foo)
-            );
-            // So is the other entry.
-            assert_eq!(
-                expand(&referrer, context, parse_quote!(Rel)),
-                format!("P < {}usize >", ix_rel)
-            );
-        }
+        let referrer = result.finish().unwrap();
+        assert_eq!(referrer, plain);
+        assert_eq!(entries(&referrer), entries(&plain));
+        assert_eq!(
+            expand(&referrer, context, parse_quote!(::foo::X)),
+            format!("P < {}usize >", ix_foo)
+        );
+        // So is the other entry.
+        assert_eq!(
+            expand(&referrer, context, parse_quote!(Rel)),
+            format!("P < {}usize >", ix_rel)
+        );
     }
 }
 
@@ -627,7 +626,7 @@ fn a_referrer_and_the_result_read_back_from_its_tokens_are_equal() {
         assert!(parsed.errors().is_empty());
         for read in [
             parsed.clone().finish().unwrap(),
-            parsed.clone().into_referrer(),
+            parsed.clone().finish().unwrap(),
         ] {
             assert_eq!(read, referrer);
             assert_eq!(expand(&read, context, parse_quote!(::foo::X)), replaced);
@@ -645,14 +644,14 @@ fn a_referrer_and_the_result_read_back_from_its_tokens_are_equal() {
     .parse2(quote!(#referrer ,))
     .unwrap();
     assert!(read.errors().is_empty());
-    for referrer in [allowed.clone().finish().unwrap(), allowed.into_referrer()] {
+    for referrer in [allowed.clone().finish().unwrap(), allowed.finish().unwrap()] {
         let parsed: Referrer = parse2(quote!(#referrer)).unwrap();
         assert_eq!(referrer, parsed);
         assert_eq!(parsed, referrer);
         assert_eq!(referrer, referrer.clone());
         // Through a result too.
         let again: LeakerResult = parse2(quote!(#referrer)).unwrap();
-        assert_eq!(again.into_referrer(), referrer);
+        assert_eq!(again.finish().unwrap(), referrer);
     }
     // Anything that the serialization keeps is still compared.
     let mut leaker = leaker();

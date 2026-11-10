@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::s;
+use common::{s, Recovered};
 use syn::parse::Parser;
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -352,7 +352,7 @@ fn every_scope_of_generics_completes_arguments() {
                 .1,
         ),
     ];
-    let referrer = leaker.result().into_referrer();
+    let referrer = leaker.result().finish().unwrap();
     for (case, context) in contexts {
         // `Vec` is allowed, so the default is as written, with `T` replaced.
         assert_eq!(
@@ -378,7 +378,7 @@ fn a_default_that_names_self_is_left_as_written() {
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
     assert_eq!(result.errors()[0].reason, Reason::SelfInDefault);
-    let referrer = result.into_referrer();
+    let referrer = result.recovered();
     assert_eq!(
         completed(&referrer, context, &tr.generics, &["u8"]).unwrap(),
         ["u8", "Rel < Self >"]
@@ -473,8 +473,8 @@ fn the_declaration_of_a_scope_with_errors_is_carried_by_the_result() {
     assert_eq!(result.errors().len(), 1);
     let parsed: LeakerResult = parse2(quote!(#result)).unwrap();
     assert_eq!(parsed.errors().len(), 1);
-    let (referrer, _) = result.into_parts();
-    let (read, _) = parsed.into_parts();
+    let referrer = result.recovered();
+    let read = parsed.recovered();
     assert_eq!(read, referrer);
     assert_eq!(
         completed(&read, context, &tr.generics, &["u8"]).unwrap(),
@@ -482,7 +482,7 @@ fn the_declaration_of_a_scope_with_errors_is_carried_by_the_result() {
     );
     // A `Referrer` that was serialized alone reads as a `LeakerResult` with no error, and keeps
     // the declaration too.
-    let referrer = Leaker::new().result().into_referrer();
+    let referrer = Leaker::new().result().finish().unwrap();
     let parsed: LeakerResult = parse2(quote!(#referrer)).unwrap();
     assert!(parsed.errors().is_empty());
 }

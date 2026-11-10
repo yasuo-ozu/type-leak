@@ -3,6 +3,8 @@
 
 mod common;
 
+use common::Recovered;
+
 use syn::*;
 use type_leak::*;
 
@@ -68,7 +70,7 @@ fn enter_generics_goes_on_after_an_error_of_an_inner_scope() {
     });
     let result = leaker.result();
     assert_eq!(result.errors().len(), 1);
-    assert_eq!(result.into_referrer().iter().count(), 1);
+    assert_eq!(result.recovered().iter().count(), 1);
 }
 
 /// `enter_type()` leaks only what the closure visits.
@@ -255,7 +257,7 @@ fn a_nested_type_that_names_self_with_a_self_bound_is_an_entry_with_an_error() {
     assert_eq!(result.errors()[0].reason, Reason::NestedSelfInBounds);
     assert!(result.errors()[0].paths.is_empty());
     assert!(result.clone().finish().is_err());
-    assert_eq!(result.clone().into_referrer().iter().count(), 1);
+    assert_eq!(result.clone().recovered().iter().count(), 1);
 
     // A rule that allows the cause of the error accepts the risk.
     let cause = result.errors()[0].cause.clone();

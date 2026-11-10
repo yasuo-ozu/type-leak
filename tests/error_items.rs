@@ -17,7 +17,9 @@
 
 mod common;
 
-use common::{allow_every_cause, causes_accepting, starts_with, to_syn_error, AcceptCause, Rule};
+use common::{
+    allow_every_cause, causes_accepting, starts_with, to_syn_error, AcceptCause, Recovered, Rule,
+};
 use std::cell::RefCell;
 use syn::visit_mut::VisitMut;
 use syn::*;
@@ -1332,14 +1334,14 @@ fn allowing_the_causes_of_every_trigger_accepts_the_item_and_leaves_the_recovere
         let items = result.errors().to_vec();
         let causes = causes_of(&items);
         assert!(!causes.is_empty(), "{}", name);
-        let referrer = result.into_referrer();
+        let referrer = result.recovered();
         // The same analysis with the causes allowed reports nothing, and has the same entries and
         // parts: allowing drops errors only.
         let (allowed, _) = allow_every_cause(allowing_causes(trigger, &causes));
         if !allowed.errors().is_empty() {
             panic!("{}: {:?} are left", name, messages(allowed.errors()));
         }
-        assert_same_referrer(&referrer, &allowed.into_referrer(), name);
+        assert_same_referrer(&referrer, &allowed.finish().unwrap(), name);
         // And it is a Referrer like any other: it round-trips.
         let parsed: Referrer = parse2(referrer.to_token_stream()).unwrap();
         assert_eq!(parsed, referrer, "{}", name);
@@ -1388,7 +1390,7 @@ fn assert_stages_agree(name: &str, trigger: Trigger, rules: &[Rule]) -> usize {
     }
     let dropped = dropped - after.errors().len();
     assert_eq!(serialized(&before), serialized(&after), "{}", name);
-    let (before, after) = (before.into_referrer(), after.into_referrer());
+    let (before, after) = (before.recovered(), after.recovered());
     let entries = |referrer: &Referrer| -> Vec<String> {
         common::types(referrer)
             .map(|ty| ty.to_token_stream().to_string())
@@ -1486,7 +1488,7 @@ fn recovery_keeps_the_entries_that_do_not_conflict() {
     let mut result = leaker.result();
     assert_eq!(result.errors().len(), 1);
     assert_eq!(result.errors()[0].cause, Cause::Trait(parse_quote!(RelTr)));
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().recovered();
     // `Rel` is an entry, and `dyn RelTr` is copied as written: a part, not an entry.
     let entries: Vec<String> = common::types(&referrer).map(text_of).collect();
     assert_eq!(entries, ["Rel"]);
@@ -1547,7 +1549,7 @@ fn the_errors_of_self_are_reported_with_the_others() {
             (Reason::SelfWithoutMeaning, "Self".to_string())
         ]
     );
-    let referrer = result.clone().into_referrer();
+    let referrer = result.clone().recovered();
     // The conflict is copied as written, and so is the type that names `Self`: no entry is left.
     assert_eq!(referrer.iter().count(), 0);
     let mut allowed = analyze();
@@ -1555,7 +1557,7 @@ fn the_errors_of_self_are_reported_with_the_others() {
         allowed = allowed.accept_cause(&cause);
     }
     assert!(allowed.errors().is_empty());
-    assert_same_referrer(&referrer, &allowed.into_referrer(), "Self");
+    assert_same_referrer(&referrer, &allowed.finish().unwrap(), "Self");
     // Allowing the conflict leaves the mention, and the other way round.
     let left = analyze().accept_cause(&errors[0].cause);
     assert_eq!(left.errors().len(), 1);
